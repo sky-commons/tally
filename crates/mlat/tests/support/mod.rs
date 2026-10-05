@@ -190,30 +190,46 @@ pub async fn start_server() -> Result<(SocketAddr, mpsc::Receiver<Result<Heard>>
     Ok((address, heard))
 }
 
+/// A running engine.
+pub type Running = tokio::task::JoinHandle<Result>;
+
 /// Starts a real engine with a fresh key, reading `relay` and bridging to `server`. Returns its
-/// public key and the directory holding the key file.
+/// public key, the directory holding the key file, and the running engine.
 pub fn start_engine(
     relay: RelayAddress,
     server: SocketAddr,
     region: Region,
-) -> Result<(PublicKey, PathBuf)> {
+) -> Result<(PublicKey, PathBuf, Running)> {
     let mut name = [0; 8];
     name.copy_from_slice(&Identity::generate().map_err(text)?.public().as_bytes()[..8]);
     let dir = std::env::temp_dir().join(format!("tally-mlat-e2e-{}", u64::from_be_bytes(name)));
     std::fs::create_dir_all(&dir).map_err(text)?;
+    let (engine, running) = start_engine_in(&dir, relay, server, region)?;
+    Ok((engine, dir, running))
+}
+
+/// Starts a real engine with the key in `dir` (made if it is missing). Aborting the handle stops
+/// the engine, as ending its process would.
+pub fn start_engine_in(
+    dir: &std::path::Path,
+    relay: RelayAddress,
+    server: SocketAddr,
+    region: Region,
+) -> Result<(PublicKey, Running)> {
     let key_file = dir.join("key");
     tally_mlat::keygen(&key_file)?;
     let engine = Identity::from_base64(&std::fs::read_to_string(&key_file).map_err(text)?)
         .map_err(text)?
         .public();
-    tokio::spawn(tally_mlat::run(Config {
+    let running = tokio::spawn(tally_mlat::run(Config {
         key_file,
         relays: vec![relay],
         server: server.to_string(),
         regions: vec![region],
         delay: Duration::from_millis(DELAY_MS),
+        max_receivers: tally_mlat::engine::DEFAULT_MAX_RECEIVERS,
     }));
-    Ok((engine, dir))
+    Ok((engine, running))
 }
 
 /// The handshake was mlat-client's for this receiver, and its DF17 pair became a sync message

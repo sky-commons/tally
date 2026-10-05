@@ -8,8 +8,10 @@ How Tally's binaries are installed on a Linux box with systemd (248 or later).
   checked against the `.sha256` published beside it; finds readsb's BEAST output (`127.0.0.1:30005`)
   and dump978-fa's raw output (`127.0.0.1:30978`, added as `--uat`); reads the antenna's location
   from `TALLY_LAT`, `TALLY_LON`, `TALLY_ALT`, or an adsb.im / ultrafeeder `.env`, or
-  `/etc/default/readsb`; makes `/etc/tally/key` if missing (root, mode 600); writes
-  `/etc/default/tally-feed` if missing; and starts the service. Run again, it upgrades the binary
+  `/etc/default/readsb`; takes the relays to start from from `RELAYS` at the top of the script
+  (filled at release) or `TALLY_RELAYS`, and stops before installing anything if both are empty;
+  makes `/etc/tally/key` if missing (root, mode 600); writes
+  `/etc/default/tally-feed` if missing, with those relays as `--relay` flags; and starts the service. Run again, it upgrades the binary
   and keeps the key and the defaults file. It installs no updater: the feeder never updates itself
   (RFC-0166 §3.5). The checksum guards a broken download, not a compromised release.
 - `systemd/tally-feed.service` runs the feeder as a dynamic user with no listening socket, at most

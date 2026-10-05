@@ -3,6 +3,8 @@
 //! its own deduplicated stream, and serves plain BEAST on loopback for a local decoder. It decides
 //! nothing about aircraft: it reads frames only to compare their bytes.
 
+pub mod bounded;
+pub mod ceiling;
 pub mod config;
 pub mod deduplicated;
 pub mod hub;
@@ -17,7 +19,8 @@ use tokio::net::TcpListener;
 
 use crate::hub::Hub;
 
-/// Accepts connections on `listener`, and signs the deduplicated stream with the newest key
+/// Accepts connections on `listener` up to the hub's connection caps, the relay's and each source
+/// address's (beyond either, a connection is closed before its handshake), and signs the deduplicated stream with the newest key
 /// (`identities[0]`), for as long as the relay runs.
 pub async fn serve(listener: TcpListener, identities: Vec<Identity>, hub: Arc<Hub>) -> ! {
     if let Some(newest) = identities.first() {
@@ -27,9 +30,14 @@ pub async fn serve(listener: TcpListener, identities: Vec<Identity>, hub: Arc<Hu
     loop {
         match listener.accept().await {
             Ok((stream, peer)) => {
+                let Some(slot) = hub.connection(peer.ip()) else {
+                    drop(stream);
+                    continue;
+                };
                 let identities = Arc::clone(&identities);
                 let hub = Arc::clone(&hub);
                 tokio::spawn(async move {
+                    let _slot = slot;
                     if let Err(error) = link::inbound(stream, &identities, hub).await {
                         eprintln!("tally-relay: {peer}: {error}");
                     }

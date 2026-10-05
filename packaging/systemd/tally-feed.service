@@ -8,7 +8,7 @@
 [Unit]
 Description=Tally feeder: publishes this receiver's receptions to Tally relays
 Documentation=https://github.com/flightlines/tally
-After=network-online.target
+After=network-online.target time-sync.target
 Wants=network-online.target
 
 [Service]
@@ -53,7 +53,9 @@ CapabilityBoundingSet=
 AmbientCapabilities=
 SystemCallArchitectures=native
 SystemCallFilter=@system-service
-SystemCallFilter=~@privileged @resources
+# @resources stays allowed: the async runtime may set a thread's affinity or priority, and a
+# denied call kills the process.
+SystemCallFilter=~@privileged
 # It never listens: binding any socket is refused outright.
 SocketBindDeny=any
 MemoryMax=64M

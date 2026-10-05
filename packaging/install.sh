@@ -14,9 +14,15 @@
 # The location comes from TALLY_LAT, TALLY_LON and TALLY_ALT (metres) if set, else from readsb's or
 # an ultrafeeder / adsb.im configuration. It is published exactly unless TALLY_PRECISION (metres)
 # is set, or --precision is added to /etc/default/tally-feed afterwards.
+#
+# The relays it starts from are RELAYS below, or TALLY_RELAYS if set: space-separated
+# HOST:PORT=KEY, written into /etc/default/tally-feed as --relay flags. From there tally-feed learns
+# more relays from relays.
 set -euo pipefail
 
 VERSION="v0.1.0"
+# Relays run by several independent operators, filled at release: HOST:PORT=KEY, space-separated.
+RELAYS=""
 RELEASES="https://github.com/flightlines/tally/releases/download/$VERSION"
 BIN=/usr/local/bin/tally-feed
 KEY=/etc/tally/key
@@ -84,6 +90,11 @@ flag_in() {
     grep -oE -- '-?[0-9]+(\.[0-9]+)?$' || true
 }
 
+# HOST:PORT=KEY, the key a 32-byte base64 public key.
+is_relay() {
+  [[ $1 =~ ^[^=[:space:]]+:[0-9]+=[A-Za-z0-9+/]{43}=$ ]]
+}
+
 is_number() {
   [[ $1 =~ ^-?[0-9]+(\.[0-9]+)?$ ]]
 }
@@ -108,6 +119,16 @@ main() {
     command -v "$tool" >/dev/null || stop "$tool is required"
   done
 
+  # A feeder that knows no relay publishes nothing, so this is settled before anything is installed.
+  relays="${TALLY_RELAYS:-$RELAYS}"
+  read -ra relay_list <<<"$relays"
+  if [[ ${#relay_list[@]} -eq 0 ]]; then
+    stop "no relays to publish to: set TALLY_RELAYS to HOST:PORT=KEY (space-separated) and run this again; nothing was installed"
+  fi
+  for relay in "${relay_list[@]}"; do
+    is_relay "$relay" || stop "$relay is not HOST:PORT=KEY; nothing was installed"
+  done
+
   case "$(uname -m)" in
     x86_64 | amd64) ARCH=x86_64 ;;
     aarch64 | arm64) ARCH=aarch64 ;;
@@ -129,6 +150,9 @@ main() {
   install -m 0755 "$work/tally-feed-$ARCH-linux" "$BIN"
 
   args=()
+  for relay in "${relay_list[@]}"; do
+    args+=(--relay "$relay")
+  done
   if listening 127.0.0.1 30005; then
     say "found BEAST (1090 MHz) on 127.0.0.1:30005"
   else
@@ -195,11 +219,16 @@ main() {
 
   if [[ -f $DEFAULTS ]]; then
     say "keeping $DEFAULTS as it is (found here: ${args[*]:-nothing to add})"
+    if ! grep -qE -- '--(relay|home)[ =]' "$DEFAULTS"; then
+      say "$DEFAULTS names no relay, so tally-feed publishes only to relays it learned before;"
+      say "add --relay HOST:PORT=KEY to it, or remove it and run this again"
+    fi
   else
     {
       printf '# Arguments for tally-feed, read by tally-feed.service; tally-feed --help lists them.\n'
       printf '# Written by install.sh. The location here is published exactly as written unless\n'
       printf '# --precision M says how many metres it may be off by.\n'
+      printf '# --relay HOST:PORT=KEY names a relay to start from; it learns more from relays.\n'
       printf 'TALLY_FEED_ARGS="%s"\n' "${args[*]}"
     } >"$DEFAULTS"
     chmod 0644 "$DEFAULTS"

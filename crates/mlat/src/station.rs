@@ -9,13 +9,13 @@
 //! about the server's configuration has to change. Its other outputs (`--basestation-*`,
 //! `--write-csv`) were the alternative; they carry no covariance and need a flag on the server.
 
+use std::future::Future;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tally_wire::Observation;
 use tally_wire::backoff::Backoff;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
-use tokio::net::tcp::OwnedWriteHalf;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 
@@ -29,14 +29,16 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 /// `JsonServerConnection.inactivity_timeout`: the server heartbeats every 30 s.
 const SERVER_SILENCE: Duration = Duration::from_secs(60);
-/// A write the server does not take in this long means it has stopped reading.
+/// A write the server does not take in this long means it has stopped reading: the session ends
+/// and another is dialled. The engine never waits on it meanwhile (it hands batches over with
+/// `try_send`, and a full inbox loses the batch).
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 /// The coordinator's heartbeat period.
 const TICK: Duration = Duration::from_millis(500);
 /// `ReceiverConnection.inactivity_timeout`: a receiver silent this long is a closed input.
 const INPUT_SILENCE: Duration = Duration::from_secs(150);
 /// A receiver silent this long is gone: its session ends, and a new one starts if it returns.
-const GONE: Duration = Duration::from_secs(600);
+pub(crate) const GONE: Duration = Duration::from_secs(600);
 /// mlat-server's lines are short; the longest is the motd.
 const MAX_LINE: usize = 64 * 1024;
 
@@ -71,11 +73,50 @@ enum Ended {
 }
 
 /// Runs the receiver's session until the engine drops it or the receiver goes silent.
-pub async fn run(station: Station, shared: Shared, mut inbox: mpsc::Receiver<Received>) {
+pub async fn run(station: Station, shared: Shared, inbox: mpsc::Receiver<Received>) {
+    let server = shared.server.clone();
+    let dial = move || {
+        let server = server.clone();
+        async move {
+            tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(server))
+                .await
+                .map_err(|_| "connect timed out".to_owned())?
+                .map_err(|error| error.to_string())
+        }
+    };
+    run_with(station, shared, inbox, dial).await;
+}
+
+/// `run`, over whatever `dial` connects to.
+async fn run_with<F, D, S>(
+    station: Station,
+    shared: Shared,
+    mut inbox: mpsc::Receiver<Received>,
+    mut dial: F,
+) where
+    F: FnMut() -> D,
+    D: Future<Output = Result<S, String>>,
+    S: AsyncRead + AsyncWrite + Send + 'static,
+{
     let mut backoff = Backoff::new();
-    let mut state = Input::default();
+    // The engine starts a session for a batch it is handing over, so the receiver was heard now.
+    let mut state = Input::heard_at(Instant::now());
     loop {
-        match session(&station, &shared, &mut inbox, &mut state, &mut backoff).await {
+        let outcome = match dial().await {
+            Ok(stream) => {
+                session(
+                    stream,
+                    &station,
+                    &shared,
+                    &mut inbox,
+                    &mut state,
+                    &mut backoff,
+                )
+                .await
+            }
+            Err(error) => Err(error),
+        };
+        match outcome {
             Ok(Ended::Finished) => return,
             Ok(Ended::Retry(wait)) => backoff.at_least(wait),
             Err(error) => eprintln!("tally-mlat: {} at {}: {error}", station.user, shared.server),
@@ -101,16 +142,24 @@ pub async fn run(station: Station, shared: Shared, mut inbox: mpsc::Receiver<Rec
 }
 
 /// What is known of the receiver's input across server sessions.
-#[derive(Default)]
 struct Input {
-    last_heard: Option<Instant>,
+    last_heard: Instant,
     counter_epoch: Option<u32>,
 }
 
 impl Input {
+    /// A receiver heard at `at`. Without it, a session's first tick could come before the batch
+    /// that started it was taken from the inbox, and find the receiver gone.
+    fn heard_at(at: Instant) -> Self {
+        Self {
+            last_heard: at,
+            counter_epoch: None,
+        }
+    }
+
     /// Notes a batch; true when its counter epoch differs from the last one seen.
     fn heard(&mut self, received: &Received) -> bool {
-        self.last_heard = Some(received.arrival);
+        self.last_heard = received.arrival;
         let restarted = self
             .counter_epoch
             .is_some_and(|epoch| epoch != received.counter_epoch);
@@ -119,23 +168,22 @@ impl Input {
     }
 
     fn silent_for(&self, now: Instant) -> Duration {
-        self.last_heard
-            .map_or(Duration::MAX, |heard| now.duration_since(heard))
+        now.saturating_duration_since(self.last_heard)
     }
 }
 
-async fn session(
+async fn session<S>(
+    stream: S,
     station: &Station,
     shared: &Shared,
     inbox: &mut mpsc::Receiver<Received>,
     input: &mut Input,
     backoff: &mut Backoff,
-) -> Result<Ended, String> {
-    let stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(&shared.server))
-        .await
-        .map_err(|_| "connect timed out".to_owned())?
-        .map_err(|error| error.to_string())?;
-    let (read, mut write) = stream.into_split();
+) -> Result<Ended, String>
+where
+    S: AsyncRead + AsyncWrite + Send + 'static,
+{
+    let (read, mut write) = tokio::io::split(stream);
     let mut read = BufReader::new(read);
     send(&mut write, &station.handshake()).await?;
     let mut first = String::new();
@@ -186,13 +234,13 @@ async fn session(
     })
 }
 
-async fn serve(
+async fn serve<W: AsyncWrite + Unpin>(
     station: &Station,
     shared: &Shared,
     inbox: &mut mpsc::Receiver<Received>,
     input: &mut Input,
     lines: &mut mpsc::Receiver<Result<String, String>>,
-    write: &mut OwnedWriteHalf,
+    write: &mut W,
     split_sync: bool,
 ) -> Result<Ended, String> {
     let now = shared.now(Instant::now());
@@ -229,7 +277,9 @@ async fn serve(
                     client.input_connected();
                     input_up = true;
                 }
-                playout.push(shared.now(received.arrival), received.observations);
+                // A batch too late to be replayed in time (a replay, or one held up past the
+                // delay) is dropped by the playout rather than sent to the server as live.
+                let _ = playout.push(shared.now(received.arrival), received.observations);
             }
             () = sleep_until(due), if due.is_some() => {
                 let now = shared.now(Instant::now());
@@ -288,7 +338,8 @@ async fn sleep_until(at: Option<Instant>) {
     }
 }
 
-async fn send(write: &mut OwnedWriteHalf, text: &str) -> Result<(), String> {
+/// A timed-out write has left a line half sent, so the session ends with it.
+async fn send<W: AsyncWrite + Unpin>(write: &mut W, text: &str) -> Result<(), String> {
     tokio::time::timeout(WRITE_TIMEOUT, write.write_all(text.as_bytes()))
         .await
         .map_err(|_| "the server stopped reading".to_owned())?
@@ -341,4 +392,100 @@ fn jitter() -> f64 {
     let mut bytes = [0; 4];
     let _ = getrandom::getrandom(&mut bytes);
     f64::from(u32::from_be_bytes(bytes)) / (f64::from(u32::MAX) + 1.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+    use tally_wire::{Clock, Identity, Location};
+
+    fn text(error: impl std::fmt::Display) -> String {
+        error.to_string()
+    }
+
+    /// An mlat-server that accepts the handshake, then sends a heartbeat every five seconds (so
+    /// it is never silent) and never reads again.
+    async fn stops_reading(stream: tokio::io::DuplexStream) {
+        let (read, mut write) = tokio::io::split(stream);
+        let mut read = BufReader::new(read);
+        let mut handshake = String::new();
+        if read_line(&mut read, &mut handshake).await.is_err() {
+            return;
+        }
+        let welcome = "{\"compress\":\"none\",\"reconnect_in\":0.5,\"selective_traffic\":true,\
+                       \"heartbeat\":true,\"return_results\":true}\n";
+        if write.write_all(welcome.as_bytes()).await.is_err() {
+            return;
+        }
+        loop {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            if write
+                .write_all(b"{\"heartbeat\":{\"server_time\":1}}\n")
+                .await
+                .is_err()
+            {
+                return;
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_server_that_stops_reading_ends_the_session_and_another_is_dialled()
+    -> Result<(), String> {
+        let receiver = Identity::generate().map_err(text)?;
+        let location = Location {
+            lat_e7: 374_100_000,
+            lon_e7: -1_221_000_000,
+            alt_m: 10,
+            precision_m: 0,
+        };
+        let station = Station::of(&receiver.public(), Some(location), Clock::Dump1090)
+            .ok_or_else(|| "no station".to_owned())?;
+        let (results, _solutions) = mpsc::channel(1);
+        let shared = Shared {
+            server: String::new(),
+            delay: Duration::from_millis(100),
+            start: Instant::now(),
+            results,
+        };
+        let began = Instant::now();
+        let dials = Arc::new(Mutex::new(Vec::new()));
+        let dial = {
+            let dials = Arc::clone(&dials);
+            move || {
+                if let Ok(mut dials) = dials.lock() {
+                    dials.push(began.elapsed());
+                }
+                // A pipe far smaller than the lines the client sends once it is connected.
+                let (near, far) = tokio::io::duplex(64);
+                tokio::spawn(stops_reading(far));
+                async move { Ok::<_, String>(near) }
+            }
+        };
+        let (inbox, receiving) = mpsc::channel(4);
+        let running = tokio::spawn(run_with(station, shared, receiving, dial));
+        // The engine's side: a batch a second, handed over without ever waiting.
+        let mut every = tokio::time::interval(Duration::from_secs(1));
+        for _ in 0..40 {
+            every.tick().await;
+            let _ = inbox.try_send(Received {
+                arrival: Instant::now(),
+                counter_epoch: 0,
+                observations: Vec::new(),
+            });
+        }
+        running.abort();
+        let dials = dials.lock().map(|dials| dials.clone()).map_err(text)?;
+        let [first, second, ..] = dials.as_slice() else {
+            return Err(format!("dialled only {dials:?}"));
+        };
+        assert_eq!(*first, Duration::ZERO);
+        // The stalled write's deadline ended the first session, not the server's silence.
+        assert!(
+            *second >= WRITE_TIMEOUT && *second < SERVER_SILENCE,
+            "{dials:?}"
+        );
+        Ok(())
+    }
 }

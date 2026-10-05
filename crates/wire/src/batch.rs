@@ -20,6 +20,9 @@ pub const BATCH_FORMAT: u8 = 1;
 pub const RECEIVER_INFO_FORMAT: u8 = 1;
 
 const BATCH_DOMAIN: &[u8] = b"tally batch";
+/// What a relay signs its own deduplicated stream under. A separate domain, so a relay's batch can
+/// never verify as a receiver's: the signature, not the record kind, says who claims what.
+const RELAY_BATCH_DOMAIN: &[u8] = b"tally relay batch";
 const RECEIVER_INFO_DOMAIN: &[u8] = b"tally receiver";
 
 /// Format, key, boot id, sequence: the part of a batch fixed across every format version.
@@ -127,7 +130,21 @@ pub struct Batch {
 }
 
 impl Batch {
+    /// A receiver's batch of its own receptions.
     pub fn sign(identity: &Identity, content: &BatchContent) -> Result<Self, WireError> {
+        Self::sign_in(BATCH_DOMAIN, identity, content)
+    }
+
+    /// A relay's batch of its deduplicated stream (`Record::RelayBatch`).
+    pub fn sign_as_relay(identity: &Identity, content: &BatchContent) -> Result<Self, WireError> {
+        Self::sign_in(RELAY_BATCH_DOMAIN, identity, content)
+    }
+
+    fn sign_in(
+        label: &[u8],
+        identity: &Identity,
+        content: &BatchContent,
+    ) -> Result<Self, WireError> {
         let mut bytes = Vec::new();
         bytes.push(BATCH_FORMAT);
         bytes.extend_from_slice(identity.public().as_bytes());
@@ -143,7 +160,7 @@ impl Batch {
         for observation in &content.observations {
             observation.encode(&mut bytes)?;
         }
-        let signature = identity.sign(&domain(BATCH_DOMAIN, &bytes));
+        let signature = identity.sign(&domain(label, &bytes));
         bytes.extend_from_slice(&signature);
         Ok(Self { bytes })
     }
@@ -185,10 +202,19 @@ impl Batch {
         Blake2s256::digest(&self.bytes).into()
     }
 
+    /// True when the receiver it names signed it as its own receptions.
     pub fn verify(&self) -> Result<(), WireError> {
+        self.verify_in(BATCH_DOMAIN)
+    }
+
+    /// True when the relay it names signed it as its deduplicated stream.
+    pub fn verify_as_relay(&self) -> Result<(), WireError> {
+        self.verify_in(RELAY_BATCH_DOMAIN)
+    }
+
+    fn verify_in(&self, label: &[u8]) -> Result<(), WireError> {
         let (signed, signature) = split_signature(&self.bytes)?;
-        self.receiver()?
-            .verify(&domain(BATCH_DOMAIN, signed), &signature)
+        self.receiver()?.verify(&domain(label, signed), &signature)
     }
 
     /// The content, for a format this build reads.
@@ -489,6 +515,17 @@ mod tests {
                 "byte {at}"
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn a_relay_batch_never_verifies_as_a_receivers_and_back() -> Result<(), WireError> {
+        let relay = Identity::generate()?;
+        let derived = Batch::sign_as_relay(&relay, &content()?)?;
+        derived.verify_as_relay()?;
+        assert!(derived.verify().is_err());
+        let own = Batch::sign(&relay, &content()?)?;
+        assert!(own.verify_as_relay().is_err());
         Ok(())
     }
 

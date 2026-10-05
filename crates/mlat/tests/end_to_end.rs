@@ -1,5 +1,5 @@
 //! The engine end to end over real sockets against a stand-in relay: it serves one receiver's
-//! signed batches to an `Engine` subscriber, checks the subscription, and takes the engine's
+//! signed batches to an `Engine` subscriber, checks the subscription that came with its Hello, and takes the engine's
 //! positions back. The stand-in mlat-server is `support`'s.
 
 mod support;
@@ -29,10 +29,9 @@ async fn relay(
         if accepted.role != Role::Engine {
             return Err(format!("connected as {:?}", accepted.role));
         }
+        // The subscription comes in the same message as the engine's Hello.
         let mut session = accepted.session;
-        let mut records = Vec::new();
-        session.reader.recv(&mut records).await.map_err(text)?;
-        match records.first() {
+        match accepted.first.first() {
             Some(Record::Subscribe { streams, regions })
                 if *streams == Streams::RAW && *regions == vec![region] => {}
             other => return Err(format!("expected the engine's subscription, got {other:?}")),
@@ -86,7 +85,7 @@ async fn a_receivers_messages_reach_mlat_server_as_mlat_client_sends_them_and_re
         positions_out,
     ));
     let (server, mut heard) = support::start_server().await?;
-    let (engine, dir) = support::start_engine(
+    let (engine, dir, _running) = support::start_engine(
         RelayAddress {
             key: relay_identity.public(),
             address: relay_address.to_string(),

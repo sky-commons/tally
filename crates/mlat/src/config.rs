@@ -14,10 +14,18 @@ usage: tally-mlat --key FILE --relay HOST:PORT=KEY --server HOST:PORT [options]
   --relay HOST:PORT=KEY  a relay to read raw batches from and publish positions to; repeatable
   --server HOST:PORT     the mlat-server's client port (wiedehopf/mlat-server, unmodified)
   --region CELL          an H3 cell (decimal, or hex as H3 writes it) whose receivers this engine
-                         covers; repeatable; none means every receiver the relays carry
+                         covers; repeatable, at most 64; none means every receiver the relays
+                         carry
   --delay MS             how long after a reception is heard it is replayed to the server, so
                          every receiver's copy arrives together (default 2000)
+  --max-receivers N      mlat-server sessions held at once, one per receiver; up to four times as
+                         many beyond it wait, and a place goes to the most active (default 1000)
 ";
+
+/// Regions one subscription may name (the protocol's limit): a relay ends a session that
+/// subscribes to more with `Goodbye { Protocol }` and a day's wait, so more is refused here,
+/// before any relay is dialled.
+pub use tally_wire::record::MAX_REGIONS;
 
 pub enum Command {
     Keygen(PathBuf),
@@ -32,6 +40,7 @@ pub struct Config {
     pub server: String,
     pub regions: Vec<Region>,
     pub delay: Duration,
+    pub max_receivers: usize,
 }
 
 pub fn parse(args: impl Iterator<Item = String>) -> Result<Command, String> {
@@ -45,6 +54,7 @@ pub fn parse(args: impl Iterator<Item = String>) -> Result<Command, String> {
     let mut server = None;
     let mut regions = Vec::new();
     let mut delay = Duration::from_millis(2_000);
+    let mut max_receivers = crate::engine::DEFAULT_MAX_RECEIVERS;
     while let Some(flag) = args.next() {
         let mut value = || args.next().ok_or_else(|| format!("{flag} needs a value"));
         match flag.as_str() {
@@ -58,6 +68,14 @@ pub fn parse(args: impl Iterator<Item = String>) -> Result<Command, String> {
                     .parse()
                     .map_err(|_| format!("--delay: {text} is not a number"))?;
                 delay = Duration::from_millis(ms);
+            }
+            "--max-receivers" => {
+                let text = value()?;
+                max_receivers = text
+                    .parse()
+                    .ok()
+                    .filter(|count| *count > 0)
+                    .ok_or_else(|| format!("--max-receivers: {text} is not a positive number"))?;
             }
             "-h" | "--help" => {
                 print!("{USAGE}");
@@ -74,12 +92,29 @@ pub fn parse(args: impl Iterator<Item = String>) -> Result<Command, String> {
         return Err(format!("at least one --relay is required\n{USAGE}"));
     }
     let server = server.ok_or_else(|| format!("--server is required\n{USAGE}"))?;
+    // The same cell named twice is one region, and counts once against the relays' limit.
+    let mut distinct = Vec::with_capacity(regions.len());
+    for region in regions {
+        if !distinct.contains(&region) {
+            distinct.push(region);
+        }
+    }
+    let regions = distinct;
+    if regions.len() > MAX_REGIONS {
+        return Err(format!(
+            "--region: {} regions named, and a relay serves at most {MAX_REGIONS} per engine \
+             (it would end the session); run one engine per {MAX_REGIONS} regions, or name \
+             coarser cells",
+            regions.len()
+        ));
+    }
     Ok(Command::Run(Box::new(Config {
         key_file,
         relays,
         server,
         regions,
         delay,
+        max_receivers,
     })))
 }
 
@@ -158,7 +193,71 @@ mod tests {
             return Err("not a run".to_owned());
         };
         assert_eq!(config.delay, Duration::from_millis(500));
+        assert_eq!(config.max_receivers, crate::engine::DEFAULT_MAX_RECEIVERS);
+        let Command::Run(config) = parse(args(&format!(
+            "--key k --relay r:1={key} --server s:1 --max-receivers 20"
+        )))?
+        else {
+            return Err("not a run".to_owned());
+        };
+        assert_eq!(config.max_receivers, 20);
+        assert!(
+            parse(args(&format!(
+                "--key k --relay r:1={key} --server s:1 --max-receivers 0"
+            )))
+            .is_err()
+        );
         assert!(matches!(parse(args("keygen --key k"))?, Command::Keygen(_)));
+        Ok(())
+    }
+
+    #[test]
+    fn more_regions_than_a_relay_serves_are_refused_before_any_relay_is_dialled()
+    -> Result<(), String> {
+        let key = tally_wire::Identity::generate()
+            .map_err(|error| error.to_string())?
+            .public();
+        // Two degrees of longitude apart along the tenth parallel: every cell differs.
+        let cells = (0..=MAX_REGIONS)
+            .map(|step| {
+                let step = i32::try_from(step).map_err(|error| error.to_string())?;
+                Region::containing(
+                    &Location {
+                        lat_e7: 100_000_000,
+                        lon_e7: -1_700_000_000 + step * 20_000_000,
+                        alt_m: 0,
+                        precision_m: 0,
+                    },
+                    3,
+                )
+                .map_err(|error| error.to_string())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let line = |cells: &[Region]| {
+            let mut line = format!("--key k --relay r:1={key} --server s:1");
+            for cell in cells {
+                line.push_str(&format!(" --region {}", cell.as_u64()));
+            }
+            line
+        };
+        assert!(
+            cells
+                .iter()
+                .enumerate()
+                .all(|(at, cell)| !cells[..at].contains(cell)),
+            "the cells must differ"
+        );
+        let error = parse(args(&line(&cells)))
+            .err()
+            .ok_or("65 regions were accepted")?;
+        assert!(error.contains("at most 64"), "{error}");
+        // Exactly the limit is fine, and a cell named twice counts once.
+        let mut at_limit = cells[..MAX_REGIONS].to_vec();
+        at_limit.push(cells[0]);
+        let Command::Run(config) = parse(args(&line(&at_limit)))? else {
+            return Err("not a run".to_owned());
+        };
+        assert_eq!(config.regions, cells[..MAX_REGIONS]);
         Ok(())
     }
 }

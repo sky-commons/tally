@@ -16,7 +16,10 @@
 //! the smallest offset of the last minute is the estimate. The same offsets give the check
 //! mlat-client makes on every counter against its own clock (`timestamp_check` in
 //! modes_reader.c): a counter that runs ahead of the engine's clock by more than its 1.25 s
-//! tolerance has jumped.
+//! tolerance has jumped. A batch whose newest reception, placed on the timeline by the
+//! estimate, is due before the batch arrived is stale: replayed, it would reach the server's
+//! clock synchronisation as if live, so it is dropped (a batch delayed that long in transit could
+//! not have joined its message's group anyway).
 
 use std::collections::VecDeque;
 
@@ -69,8 +72,9 @@ impl Playout {
         self.queue.clear();
     }
 
-    /// Queues a batch's receptions that arrived at `arrival` (engine seconds).
-    pub fn push(&mut self, arrival: f64, observations: Vec<Observation>) {
+    /// Queues a batch's receptions that arrived at `arrival` (engine seconds). False when the
+    /// batch is stale and was dropped instead.
+    pub fn push(&mut self, arrival: f64, observations: Vec<Observation>) -> bool {
         let newest = observations
             .iter()
             .filter(|observation| observation.timestamp != 0)
@@ -86,12 +90,14 @@ impl Playout {
             {
                 self.offsets.pop_front();
             }
-            if self
-                .smallest()
-                .is_some_and(|smallest| offset < smallest - JUMP_SECS)
-            {
-                self.offsets.clear();
-                self.enqueue(arrival, Item::ClockJump);
+            if let Some(smallest) = self.smallest() {
+                if newest + smallest + self.delay_secs < arrival {
+                    return false;
+                }
+                if offset < smallest - JUMP_SECS {
+                    self.offsets.clear();
+                    self.enqueue(arrival, Item::ClockJump);
+                }
             }
             self.offsets.push_back((arrival, offset));
             offset_estimate = self.smallest();
@@ -107,6 +113,7 @@ impl Playout {
             };
             self.enqueue(release, Item::Observation(observation));
         }
+        true
     }
 
     fn smallest(&self) -> Option<f64> {
@@ -181,10 +188,25 @@ mod tests {
     #[test]
     fn nothing_is_held_longer_than_the_delay_or_released_before_it_arrived() {
         let mut playout = Playout::new(Mode::Beast, 1.0);
-        playout.push(10.0, vec![observation(5.0)]);
-        // Eleven seconds later on the engine, five on the receiver: late, released on arrival.
-        playout.push(21.0, vec![observation(10.0)]);
-        assert_eq!(releases(&mut playout), vec![11.0, 21.0]);
+        assert!(playout.push(10.0, vec![observation(5.0)]));
+        // Its newest reception is due at 30.5; the older one was due at 26 and goes on arrival.
+        assert!(playout.push(30.0, vec![observation(20.0), observation(24.5)]));
+        assert_eq!(releases(&mut playout), vec![11.0, 30.0, 30.5]);
+    }
+
+    #[test]
+    fn a_batch_due_before_it_arrived_is_stale_and_dropped() {
+        let mut playout = Playout::new(Mode::Beast, 1.0);
+        assert!(playout.push(10.0, vec![observation(5.0)]));
+        assert!(playout.push(11.0, vec![observation(6.0)]));
+        // Eleven seconds later on the engine, five on the receiver: due at 16, arrived at 21.
+        assert!(!playout.push(21.0, vec![observation(10.0)]));
+        // Batch 0 again, later still: its reception was due at 11, long before it arrived.
+        assert!(!playout.push(50.0, vec![observation(5.0)]));
+        assert_eq!(releases(&mut playout), vec![11.0, 12.0]);
+        // A stale batch says nothing of the offset: the next live one is placed as before.
+        assert!(playout.push(51.5, vec![observation(46.5)]));
+        assert_eq!(playout.next_release(), Some(52.5));
     }
 
     #[test]

@@ -71,6 +71,10 @@ impl Role {
     }
 }
 
+/// The most regions one `Subscribe` may name. A relay ends a session that names more; a subscriber
+/// refuses to send more. Part of the protocol, so both sides read it from here.
+pub const MAX_REGIONS: usize = 64;
+
 /// Which of a relay's streams a subscriber wants (RFC-0166 §3.6), as bits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Streams(pub u8);

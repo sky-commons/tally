@@ -23,9 +23,11 @@ usage: tally-feed --key FILE [options]
   --home HOST:PORT=KEY   a relay always in the set (your own, if you run one)
   --relays N             how many relays to publish to (default 4)
   --state DIR            where learned relays and the anchor are kept (default /var/lib/tally-feed)
-  --lat DEG --lon DEG --alt M
+  --lat DEG --lon DEG --alt ALT
                          the antenna's position, published exactly unless --precision says
-                         otherwise (MLAT needs it exact)
+                         otherwise (MLAT needs it exact); ALT is metres above the ellipsoid,
+                         as a bare number or with a unit, as mlat-client takes it: 34, 34m,
+                         112ft (feet are converted to the nearest metre)
   --precision M          how far the published position may be from the antenna (default 0)
   --clock NAME           the receiver's clock: dump1090 (RTL-SDR, the default), beast,
                          radarcape_12mhz, radarcape_gps
@@ -43,7 +45,10 @@ pub struct Config {
     pub key_file: PathBuf,
     pub source: String,
     pub uat: Option<String>,
+    /// The relays the owner named with `--relay`.
     pub relays: Vec<RelayAddress>,
+    /// The relays shipped in the binary (`SEEDS`).
+    pub seeds: Vec<RelayAddress>,
     pub home: Option<RelayAddress>,
     pub relay_count: usize,
     pub state_dir: PathBuf,
@@ -64,6 +69,7 @@ pub fn parse(args: impl Iterator<Item = String>) -> Result<Command, String> {
         source: "127.0.0.1:30005".to_owned(),
         uat: None,
         relays: Vec::new(),
+        seeds: Vec::new(),
         home: None,
         relay_count: 4,
         state_dir: PathBuf::from("/var/lib/tally-feed"),
@@ -84,7 +90,7 @@ pub fn parse(args: impl Iterator<Item = String>) -> Result<Command, String> {
             "--state" => config.state_dir = PathBuf::from(value()?),
             "--lat" => lat = Some(degrees(&flag, &value()?, 90.0)?),
             "--lon" => lon = Some(degrees(&flag, &value()?, 180.0)?),
-            "--alt" => alt = Some(number(&flag, &value()?)?),
+            "--alt" => alt = Some(altitude(&flag, &value()?)?),
             "--precision" => precision = number(&flag, &value()?)?,
             "--clock" => {
                 let name = value()?;
@@ -105,7 +111,7 @@ pub fn parse(args: impl Iterator<Item = String>) -> Result<Command, String> {
     }
     config.key_file = key_file;
     for seed in SEEDS {
-        config.relays.push(parse_relay(seed)?);
+        config.seeds.push(parse_relay(seed)?);
     }
     config.location = match (lat, lon) {
         (Some(lat_e7), Some(lon_e7)) => Some(Location {
@@ -139,6 +145,25 @@ fn number<T: std::str::FromStr>(flag: &str, text: &str) -> Result<T, String> {
         .map_err(|_| format!("{flag}: {text} is not a number"))
 }
 
+/// An altitude to whole metres: a bare number or `<n>m` is metres, `<n>ft` is feet, each rounded
+/// to the nearest metre (mlat-client's `--alt` format, so one value serves both).
+fn altitude(flag: &str, text: &str) -> Result<i32, String> {
+    let (number_text, metres_per_unit) = match text.trim() {
+        feet if feet.ends_with("ft") => (&feet[..feet.len() - 2], 0.3048),
+        metres if metres.ends_with('m') => (&metres[..metres.len() - 1], 1.0),
+        metres => (metres, 1.0),
+    };
+    let value: f64 = number_text
+        .trim()
+        .parse()
+        .map_err(|_| format!("{flag}: {text} is not an altitude (34, 34m or 112ft)"))?;
+    let metres = (value * metres_per_unit).round();
+    if !metres.is_finite() || metres < f64::from(i32::MIN) || metres > f64::from(i32::MAX) {
+        return Err(format!("{flag}: {text} is out of range"));
+    }
+    Ok(metres as i32)
+}
+
 /// Degrees to the wire's degrees times 10^7, exactly as entered.
 fn degrees(flag: &str, text: &str, limit: f64) -> Result<i32, String> {
     let value: f64 = number(flag, text)?;
@@ -170,7 +195,42 @@ mod tests {
     #[test]
     fn seeds_join_the_relays_the_owner_named() -> Result<(), String> {
         let config = run(&["--key", "k"])?;
-        assert_eq!(config.relays.len(), SEEDS.len());
+        assert_eq!((config.relays.len(), config.seeds.len()), (0, SEEDS.len()));
+        Ok(())
+    }
+
+    fn alt(text: &str) -> Result<i32, String> {
+        run(&[
+            "--key", "k", "--lat", "33.9", "--lon", "-118.4", "--alt", text,
+        ])?
+        .location
+        .map(|location| location.alt_m)
+        .ok_or_else(|| "no location".to_owned())
+    }
+
+    #[test]
+    fn alt_takes_metres_bare_or_suffixed_and_feet() -> Result<(), String> {
+        assert_eq!(alt("34")?, 34);
+        assert_eq!(alt("34m")?, 34);
+        assert_eq!(alt("-12m")?, -12);
+        assert_eq!(alt("34.6")?, 35);
+        // 112 ft is 34.1376 m; 100 ft is 30.48 m.
+        assert_eq!(alt("112ft")?, 34);
+        assert_eq!(alt("100ft")?, 30);
+        assert_eq!(alt("-50ft")?, -15);
+        for bad in [
+            "",
+            "m",
+            "ft",
+            "34 metres",
+            "34M",
+            "34feet",
+            "nan",
+            "infm",
+            "1e10",
+        ] {
+            assert!(alt(bad).is_err(), "{bad} was taken");
+        }
         Ok(())
     }
 

@@ -29,6 +29,11 @@ ConfigurationDirectory=tally
 UMask=0077
 # One descriptor per feeder and subscriber.
 LimitNOFILE=65536
+# A relay under memory pressure is throttled past MemoryHigh and, past MemoryMax, killed by the
+# kernel's OOM killer inside its own cgroup and restarted (Restart=always), rather than taking the
+# host down with it.
+MemoryHigh=3G
+MemoryMax=4G
 
 NoNewPrivileges=yes
 ProtectSystem=strict
@@ -56,7 +61,9 @@ CapabilityBoundingSet=
 AmbientCapabilities=
 SystemCallArchitectures=native
 SystemCallFilter=@system-service
-SystemCallFilter=~@privileged @resources
+# @resources stays allowed: the async runtime may set a thread's affinity or priority, and a
+# denied call kills the process.
+SystemCallFilter=~@privileged
 
 [Install]
 WantedBy=multi-user.target

@@ -7,7 +7,7 @@
 use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hasher};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tally_wire::batch::Hash;
 use tally_wire::noise::MAX_PLAINTEXT;
@@ -16,6 +16,8 @@ use tally_wire::{Batch, BatchContent, Identity, Observation, Record};
 use crate::hub::Hub;
 
 const EVERY: Duration = Duration::from_secs(1);
+/// How often messages left out for want of room are reported, at most.
+const REPORT_EVERY: Duration = Duration::from_secs(60);
 /// The most observations tried in one batch before it is measured; halved until it fits a
 /// message.
 const FIRST_TRY: usize = 2_048;
@@ -69,7 +71,7 @@ impl Signer {
 
     /// The signed batch, or `None` when it would not fit one message.
     fn try_sign(&self, observations: &[Observation]) -> Option<Batch> {
-        let batch = Batch::sign(
+        let batch = Batch::sign_as_relay(
             &self.identity,
             &BatchContent {
                 boot_id: self.boot_id,
@@ -104,9 +106,20 @@ fn wall_ms() -> u64 {
 pub async fn run(hub: Arc<Hub>, identity: Identity) {
     let mut signer = Signer::new(identity);
     let mut every = tokio::time::interval(EVERY);
+    let mut skipped = 0u64;
+    let mut reported = Instant::now();
     loop {
         every.tick().await;
-        let gathered = hub.take_deduplicated();
+        let (gathered, left_out) = hub.take_deduplicated();
+        skipped += left_out;
+        if skipped > 0 && reported.elapsed() >= REPORT_EVERY {
+            eprintln!(
+                "tally-relay: {skipped} new messages in the last minute were forwarded raw but \
+                 left out of the deduplicated stream: it was holding as much as it may"
+            );
+            skipped = 0;
+            reported = Instant::now();
+        }
         if gathered.is_empty() {
             continue;
         }

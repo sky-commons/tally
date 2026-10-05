@@ -27,6 +27,7 @@ use std::time::Duration;
 
 use tally_wire::Identity;
 use tokio::sync::{broadcast, mpsc};
+use tokio::task::JoinSet;
 use tokio::time::Instant;
 
 use crate::config::Config;
@@ -87,8 +88,10 @@ pub async fn run(config: Config) -> Result<(), String> {
     eprintln!("tally-mlat: engine {}", identity.public());
     let (inbound, mut records) = mpsc::channel(INBOUND_BACKLOG);
     let (outbound, _) = broadcast::channel(POSITIONS_BACKLOG);
+    // The links live as long as this call: dropped, it ends them with it.
+    let mut links = JoinSet::new();
     for relay in config.relays {
-        tokio::spawn(relays::link(
+        links.spawn(relays::link(
             relay,
             identity.clone(),
             config.regions.clone(),
@@ -104,12 +107,14 @@ pub async fn run(config: Config) -> Result<(), String> {
         start: Instant::now(),
         results,
     };
-    let mut engine = Engine::new(identity, config.regions, shared);
+    let mut engine = Engine::new(identity, config.regions, config.max_receivers, shared);
     let mut publish = tokio::time::interval(PUBLISH_EVERY);
     loop {
         tokio::select! {
             record = records.recv() => match record {
-                Some(record) => engine.ingest(record),
+                Some(record) => {
+                    engine.ingest(record);
+                }
                 None => return Err("every relay link ended".to_owned()),
             },
             solution = solutions.recv() => {
@@ -118,8 +123,9 @@ pub async fn run(config: Config) -> Result<(), String> {
                 }
             }
             _ = publish.tick() => {
+                engine.tick();
                 for record in engine.flush(wall_ms())? {
-                    // An error only means no relay session is up right now.
+                    // Never waits for a relay. An error only means no relay session is up now.
                     let _ = outbound.send(Arc::new(record));
                 }
             }

@@ -10,7 +10,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tally_wire::backoff::Backoff;
 use tally_wire::batch::Hash;
 use tally_wire::beast::Decoder;
-use tally_wire::{Batch, BatchContent, Frame, Identity, Observation, Record};
+use tally_wire::noise;
+use tally_wire::{Batch, BatchContent, Clock, Frame, Identity, Observation, Record};
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
 use tokio::sync::{broadcast, mpsc};
@@ -21,42 +22,55 @@ use crate::uat::{self, Lines};
 const SEAL_EVERY: Duration = Duration::from_secs(1);
 /// A batch is sealed early once its receptions reach this, well inside one Noise message.
 const MAX_BATCH_BYTES: usize = 48 * 1024;
-/// A counter that runs backwards by more than a second of 12 MHz ticks means the receiver's clock
-/// restarted, so later counters must not be compared with earlier ones.
+/// A signed batch as a record: the record's header (kind and length), the batch's fixed fields
+/// (format, key, boot id, sequence, epoch, wall clock, dropped, previous hash, count) and its
+/// signature. `a_batch_record_costs_its_overhead` checks it against the wire's own encoding.
+pub const BATCH_OVERHEAD: usize = 3 + (1 + 32 + 8 + 8 + 4 + 8 + 4 + 32 + 4) + 64;
+/// The most one batch's receptions may come to: what makes the signed batch, as a record, exactly
+/// one Noise message. The batcher never seals more, so no batch is ever too big to send.
+const MAX_OBSERVATION_BYTES: usize = noise::MAX_PLAINTEXT - BATCH_OVERHEAD;
+/// A free-running counter that runs backwards by more than a second of 12 MHz ticks means the
+/// receiver's clock restarted, so later counters must not be compared with earlier ones.
 const COUNTER_RESTART: u64 = 12_000_000;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Receptions waiting for the batcher. It only falls this far behind if the box is starved, and
 /// then what does not fit is dropped and counted like anything over the ceiling.
 const INPUT_BACKLOG: usize = 4096;
 
-/// The feeder's upload ceiling: a token bucket that drops what is over budget and never buffers
-/// (§3.5). One second of budget is the most it lets through at once.
+/// A token bucket that drops what is over budget and never buffers (§3.5). It starts full.
 pub struct TokenBucket {
     rate: f64,
+    burst: f64,
     tokens: f64,
     filled: Instant,
 }
 
 impl TokenBucket {
+    /// The owner's upload ceiling: one second of budget is the most it lets through at once.
     pub fn new(bytes_per_sec: u32) -> Self {
+        Self::with_burst(bytes_per_sec, bytes_per_sec)
+    }
+
+    /// `bytes_per_sec`, and at most `burst` bytes at once.
+    pub fn with_burst(bytes_per_sec: u32, burst: u32) -> Self {
         Self {
             rate: f64::from(bytes_per_sec),
-            tokens: f64::from(bytes_per_sec),
+            burst: f64::from(burst),
+            tokens: f64::from(burst),
             filled: Instant::now(),
         }
     }
 
-    pub fn set_rate(&mut self, bytes_per_sec: u32) {
-        self.rate = f64::from(bytes_per_sec);
-        self.tokens = self.tokens.min(self.rate);
-    }
-
     /// True if `cost` bytes fit, and takes them.
     pub fn take(&mut self, cost: usize) -> bool {
-        let now = Instant::now();
-        let elapsed = now.duration_since(self.filled).as_secs_f64();
-        self.filled = now;
-        self.tokens = (self.tokens + elapsed * self.rate).min(self.rate);
+        self.take_at(cost, Instant::now())
+    }
+
+    /// As `take`, at `now` (which never runs backwards for one bucket).
+    pub fn take_at(&mut self, cost: usize, now: Instant) -> bool {
+        let elapsed = now.saturating_duration_since(self.filled).as_secs_f64();
+        self.filled = self.filled.max(now);
+        self.tokens = (self.tokens + elapsed * self.rate).min(self.burst);
         let cost = cost as f64;
         if cost > self.tokens {
             return false;
@@ -69,6 +83,7 @@ impl TokenBucket {
 /// Builds one boot's chain of signed batches.
 pub struct Batcher {
     identity: Identity,
+    clock: Clock,
     boot_id: u64,
     sequence: u64,
     counter_epoch: u32,
@@ -81,7 +96,8 @@ pub struct Batcher {
 }
 
 impl Batcher {
-    pub fn new(identity: Identity, ceiling: u32) -> Self {
+    /// `clock` is the receiver's, which says whether a counter that runs backwards restarted.
+    pub fn new(identity: Identity, ceiling: u32, clock: Clock) -> Self {
         let mut boot = [0; 8];
         // A boot id only has to differ from this receiver's other boots; failing that, the
         // clock does.
@@ -90,6 +106,7 @@ impl Batcher {
         }
         Self {
             identity,
+            clock,
             boot_id: u64::from_be_bytes(boot),
             sequence: 0,
             counter_epoch: 0,
@@ -106,40 +123,49 @@ impl Batcher {
     pub fn take(&mut self, input: Input) -> Result<Option<Batch>, String> {
         match input {
             Input::Frame(frame) => self.observe(&frame),
-            Input::Observation(observation) => {
-                self.push(observation);
-                Ok(None)
-            }
+            Input::Observation(observation) => self.push(observation),
             Input::CounterRestarted => self.counter_restarted(),
         }
     }
 
-    /// A 1090 MHz frame. A counter that ran backwards seals what came before it, so a batch never
-    /// holds counters from two epochs.
+    /// A 1090 MHz frame. A free-running counter that ran backwards seals what came before it, so
+    /// a batch never holds counters from two epochs. A Radarcape's GPS counter is time of day and
+    /// runs back every UTC midnight by design, so for it only a reconnect starts an epoch. A frame
+    /// with no timestamp (0) says nothing about the counter.
     pub fn observe(&mut self, frame: &Frame) -> Result<Option<Batch>, String> {
         let counter = frame.timestamp();
-        let sealed = if self
-            .last_counter
-            .is_some_and(|last| last > counter && last - counter > COUNTER_RESTART)
-        {
-            self.counter_restarted()?
+        let mut sealed = None;
+        if counter != 0 {
+            if free_running(self.clock)
+                && self
+                    .last_counter
+                    .is_some_and(|last| last > counter && last - counter > COUNTER_RESTART)
+            {
+                sealed = self.counter_restarted()?;
+            }
+            self.last_counter = Some(counter);
+        }
+        // After a restart the batch is empty, so this reception cannot seal a second one.
+        let pushed = self.push(Observation::from_beast(frame))?;
+        Ok(sealed.or(pushed))
+    }
+
+    /// A reception of any format, under the ceiling or dropped and counted. If it would take the
+    /// batch past what one message carries, what gathered before it is sealed first and returned.
+    pub fn push(&mut self, observation: Observation) -> Result<Option<Batch>, String> {
+        let cost = 1 + 6 + 1 + 2 + observation.data.len();
+        if cost > MAX_OBSERVATION_BYTES || !self.bucket.take(cost) {
+            self.dropped = self.dropped.saturating_add(1);
+            return Ok(None);
+        }
+        let sealed = if self.bytes + cost > MAX_OBSERVATION_BYTES {
+            self.seal()?
         } else {
             None
         };
-        self.last_counter = Some(counter);
-        self.push(Observation::from_beast(frame));
-        Ok(sealed)
-    }
-
-    /// A reception of any format, under the ceiling or dropped and counted.
-    pub fn push(&mut self, observation: Observation) {
-        let cost = 1 + 6 + 1 + 2 + observation.data.len();
-        if !self.bucket.take(cost) {
-            self.dropped = self.dropped.saturating_add(1);
-            return;
-        }
         self.bytes += cost;
         self.observations.push(observation);
+        Ok(sealed)
     }
 
     /// Receptions dropped before they reached the batcher, counted with the ceiling's own.
@@ -181,6 +207,14 @@ impl Batcher {
         self.dropped = 0;
         Ok(Some(batch))
     }
+}
+
+/// Whether the counter runs freely from power-on, so that one running backwards means it restarted.
+fn free_running(clock: Clock) -> bool {
+    matches!(
+        clock,
+        Clock::Dump1090 | Clock::Beast | Clock::Radarcape12Mhz | Clock::Unknown
+    )
 }
 
 pub fn wall_ms() -> u64 {
@@ -407,10 +441,19 @@ mod tests {
     }
 
     fn batcher(ceiling: u32) -> Result<Batcher, String> {
+        clocked(ceiling, Clock::Dump1090)
+    }
+
+    fn clocked(ceiling: u32, clock: Clock) -> Result<Batcher, String> {
         Ok(Batcher::new(
             Identity::generate().map_err(|error| error.to_string())?,
             ceiling,
+            clock,
         ))
+    }
+
+    fn content(batch: &Batch) -> Result<BatchContent, String> {
+        batch.content().map_err(|error| error.to_string())
     }
 
     #[test]
@@ -510,5 +553,130 @@ mod tests {
         assert_eq!(content.observations.len(), 4);
         assert_eq!(content.dropped, 16);
         Ok(())
+    }
+
+    #[test]
+    fn a_gps_counter_falling_back_at_midnight_starts_no_epoch() -> Result<(), String> {
+        let gps = |seconds: u64, nanos: u64| (seconds << 30) | nanos;
+        let mut batcher = clocked(1_000_000, Clock::RadarcapeGps)?;
+        assert!(
+            batcher
+                .observe(&frame(gps(86_399, 999_000_000))?)?
+                .is_none()
+        );
+        assert!(batcher.observe(&frame(gps(0, 1_000))?)?.is_none());
+        let only = content(&batcher.seal()?.ok_or("no batch")?)?;
+        assert_eq!((only.counter_epoch, only.observations.len()), (0, 2));
+        // A reconnect is still a new epoch.
+        batcher.observe(&frame(gps(5, 0))?)?;
+        let before = batcher.counter_restarted()?.ok_or("no batch")?;
+        batcher.observe(&frame(gps(6, 0))?)?;
+        let after = batcher.seal()?.ok_or("no batch")?;
+        assert_eq!(
+            (
+                content(&before)?.counter_epoch,
+                content(&after)?.counter_epoch
+            ),
+            (0, 1)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn every_free_running_clock_restarts_when_its_counter_runs_back() -> Result<(), String> {
+        for clock in [
+            Clock::Dump1090,
+            Clock::Beast,
+            Clock::Radarcape12Mhz,
+            Clock::Unknown,
+        ] {
+            let mut batcher = clocked(1_000_000, clock)?;
+            batcher.observe(&frame(500_000_000)?)?;
+            assert!(batcher.observe(&frame(1_000)?)?.is_some(), "{clock:?}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_frame_without_a_timestamp_neither_moves_nor_restarts_the_counter() -> Result<(), String> {
+        let mut batcher = batcher(1_000_000)?;
+        batcher.observe(&frame(500_000_000)?)?;
+        assert!(batcher.observe(&frame(0)?)?.is_none(), "0 started an epoch");
+        // Had 0 become the last counter, this would read as a jump forward and the next one as a
+        // fall of more than a second; it is neither.
+        assert!(batcher.observe(&frame(499_999_000)?)?.is_none());
+        let only = content(&batcher.seal()?.ok_or("no batch")?)?;
+        assert_eq!((only.counter_epoch, only.observations.len()), (0, 3));
+        Ok(())
+    }
+
+    #[test]
+    fn a_batch_record_costs_its_overhead() -> Result<(), String> {
+        let mut batcher = batcher(1_000_000)?;
+        batcher.add_dropped(1);
+        let empty = batcher.seal()?.ok_or("no batch")?;
+        let mut encoded = Vec::new();
+        Record::Batch(empty)
+            .encode(&mut encoded)
+            .map_err(|error| error.to_string())?;
+        assert_eq!(encoded.len(), BATCH_OVERHEAD);
+        Ok(())
+    }
+
+    #[test]
+    fn no_sealed_batch_is_too_big_for_one_message() -> Result<(), String> {
+        let mut batcher = batcher(u32::MAX)?;
+        let big = |size: usize| Observation {
+            format: tally_wire::batch::format::UAT_UPLINK,
+            timestamp: 1,
+            signal: 0,
+            data: vec![0; size],
+        };
+        let mut sealed = Vec::new();
+        // Receptions the early seal never sees, since none is offered between them.
+        for _ in 0..12 {
+            sealed.extend(batcher.push(big(20_000))?);
+        }
+        assert!(batcher.push(big(noise::MAX_PLAINTEXT))?.is_none());
+        sealed.extend(batcher.seal()?);
+        assert!(sealed.len() >= 4);
+        let (mut total, mut dropped) = (0, 0);
+        for batch in &sealed {
+            let mut encoded = Vec::new();
+            Record::Batch(batch.clone())
+                .encode(&mut encoded)
+                .map_err(|error| error.to_string())?;
+            assert!(encoded.len() <= noise::MAX_PLAINTEXT, "{}", encoded.len());
+            let content = content(batch)?;
+            total += content.observations.len();
+            dropped += content.dropped;
+        }
+        // The one reception bigger than a message is dropped and counted, never sent.
+        assert_eq!((total, dropped), (12, 1));
+        Ok(())
+    }
+
+    #[test]
+    fn a_reception_too_big_for_any_batch_is_dropped_and_counted() -> Result<(), String> {
+        let mut batcher = batcher(u32::MAX)?;
+        batcher.push(Observation {
+            format: tally_wire::batch::format::UAT_UPLINK,
+            timestamp: 1,
+            signal: 0,
+            data: vec![0; MAX_OBSERVATION_BYTES],
+        })?;
+        let content = content(&batcher.seal()?.ok_or("no batch")?)?;
+        assert_eq!((content.dropped, content.observations.len()), (1, 0));
+        Ok(())
+    }
+
+    #[test]
+    fn a_relay_bucket_lets_through_its_burst_then_its_rate() {
+        let mut bucket = TokenBucket::with_burst(1_000, 10_000);
+        let start = Instant::now();
+        assert!(bucket.take_at(10_000, start));
+        assert!(!bucket.take_at(1, start));
+        assert!(!bucket.take_at(5_000, start + Duration::from_secs(4)));
+        assert!(bucket.take_at(5_000, start + Duration::from_secs(5)));
     }
 }

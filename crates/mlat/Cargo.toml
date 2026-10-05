@@ -23,6 +23,8 @@ tally-wire.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
+# `test-util` pauses time, so a test of a 30 s write deadline waits no real seconds.
+tokio = { workspace = true, features = ["test-util"] }
 tally-relay = { path = "../relay" }
 
 [lints]

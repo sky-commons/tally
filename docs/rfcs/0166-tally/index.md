@@ -174,7 +174,15 @@ Version 1 carries, and freezes:
 - obeying `Redirect`, `RateLimit` and `Goodbye`, with exponential backoff and jitter that a relay
   can lengthen and never shorten, so a relay restart is not 20,000 boxes reconnecting at once;
 - during an outage, retrying the anchor rather than rushing to fresh relays, the classic eclipse
-  path;
+  path, within fixed bounds: a random slot gives up a relay it has not reached (no session got to
+  `Welcome`) for an hour, the anchor after seven days (when it was last reached is kept with it,
+  across restarts), and the home relay never;
+- every send with a deadline (30 s), and a session that ends at once on its reader's failure
+  even while a send is pending, so a relay that wedges cannot hold a slot;
+- relays a relay suggests weighed as one source each when it picks (capped per source and in
+  total), and never two relays on the same host, so one relay's hints cannot fill its set;
+- the owner's ceiling enforced once, in the batcher; a relay that asks for less (`RateLimit`) is
+  sent fewer batches, alone;
 - a hard upload ceiling (a token bucket that drops, never a buffer), counted in each batch;
 - the owner's location exactly as entered, with a precision field the owner may set to round it
   (§8.3), a periodic wall-clock sample and its clock class.
@@ -213,6 +221,22 @@ only its server; what it sends out is its own budget to set.
 
 A slow subscriber is dropped, never waited for: per subscriber a bounded queue, and a full queue
 disconnects it (readsb's keep-latest rule, RFC-0119 §3.3).
+
+What a relay holds is bounded, and what it trusts is narrow, because keys cost nothing to make:
+
+- A peer may claim the relay role only if the operator accepted its key (`--accept-relay`);
+  any other key claiming it is refused. Accepted relays carry whole regions and are not held to
+  a feeder's intake ceiling; every other inbound peer is (`--max-feeder-bytes-per-sec`, 256 KiB/s
+  by default), and connections are capped (`--max-connections`).
+- A batch is forwarded once: new by hash, and with a sequence above the highest already forwarded
+  for that receiver's boot, less a small reorder allowance, so a signed batch replayed after its
+  hash is forgotten is still refused. Positions follow the same rule per engine boot. The table of
+  streams is capped and forgets the least recently active (a stream's activity is a forwarded
+  batch), so a flood of new streams pushes out its own oldest first.
+- Receiver descriptions are capped and forget the receiver least recently active; a subscription names at
+  most 64 regions; a `Subscribe` sent with `Hello` decides the first byte a subscriber receives.
+- A relay signs its deduplicated stream under its own signature domain, so a relay's batch can
+  never verify as a receiver's.
 
 ### §3.7 Discovery is peer to peer, and the feeder holds the rules
 
@@ -295,7 +319,20 @@ what a receiver signed. It does not guarantee completeness or truth. A relay can
 multi-relay rule and sequence gaps bound and expose it); a receiver with a real antenna can report
 lies (corroboration across separate receivers bounds it, and an area covered by one receiver
 cannot be checked without outside data). A well-funded attacker can make some feeders' data go
-missing for a while before it is caught. That is accepted (§8.1). RFC-0119 §4's ceiling on what
+missing for a while before it is caught. That is accepted (§8.1).
+
+The residuals two adversarial sweeps left on purpose, each bounded and none able to forge data:
+one operator running relays under many host names passes the feeder's distinct-host rule (it
+compares names, not networks, since a feeder resolves nothing it need not); each hostile relay a
+feeder reaches counts as one more source in its pick, so reaching many dilutes the honest share;
+throwaway keys that keep publishing real-looking batches can occupy relay intake and an MLAT
+engine's receiver slots, within the per-address, per-feeder and per-engine caps; and because a
+feeder may publish only its own batches, replaying another receiver's old batch into a relay
+needs a peer that relay's operator accepted (an accepted relay or an upstream link), and then
+succeeds only once that relay has forgotten the stream, which it does least recently active
+first, so a receiver that keeps publishing is the last a flood can push out. The stronger
+defences of §3.7 (standing by map cell, delivery receipts) are the answer if any becomes an
+attack, and the feeder already carries what they need. RFC-0119 §4's ceiling on what
 Flightlines trusts ADS-B to mean is unchanged.
 
 ## §5 Bandwidth and cost (estimates until step 4 measures them)

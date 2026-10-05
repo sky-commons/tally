@@ -12,7 +12,8 @@ use crate::record::Body;
 
 pub const POSITIONS_FORMAT: u8 = 1;
 const POSITIONS_DOMAIN: &[u8] = b"tally positions";
-const PREFIX_LEN: usize = 1 + KEY_LEN + 8;
+/// Format, engine key, boot id, sequence: fixed across every format version.
+const PREFIX_LEN: usize = 1 + KEY_LEN + 8 + 8;
 /// `alt_ft` when the engine solved no altitude of its own.
 const NO_ALTITUDE: i32 = i32::MIN;
 
@@ -35,7 +36,10 @@ pub struct Position {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PositionsContent {
-    /// 0, 1, 2, ... for one engine key; a gap is results some hop did not deliver.
+    /// Random per engine process start. With `sequence`, names this record uniquely for its
+    /// engine, so a restarted engine starts a new stream instead of being refused as a replay.
+    pub boot_id: u64,
+    /// 0, 1, 2, ... within one boot; a gap is results some hop did not deliver.
     pub sequence: u64,
     pub issued_ms: u64,
     pub positions: Vec<Position>,
@@ -51,6 +55,7 @@ impl Positions {
         let mut bytes = Vec::new();
         bytes.push(POSITIONS_FORMAT);
         bytes.extend_from_slice(identity.public().as_bytes());
+        bytes.extend_from_slice(&content.boot_id.to_be_bytes());
         bytes.extend_from_slice(&content.sequence.to_be_bytes());
         bytes.extend_from_slice(&content.issued_ms.to_be_bytes());
         let count = u32::try_from(content.positions.len())
@@ -89,8 +94,12 @@ impl Positions {
         PublicKey::from_slice(&self.bytes[1..1 + KEY_LEN])
     }
 
-    pub fn sequence(&self) -> u64 {
+    pub fn boot_id(&self) -> u64 {
         u64_at(&self.bytes, 1 + KEY_LEN)
+    }
+
+    pub fn sequence(&self) -> u64 {
+        u64_at(&self.bytes, 1 + KEY_LEN + 8)
     }
 
     pub fn hash(&self) -> Hash {
@@ -112,6 +121,7 @@ impl Positions {
         }
         let (signed, _) = split_signature(&self.bytes)?;
         let mut reader = Body::new(&signed[1 + KEY_LEN..]);
+        let boot_id = reader.u64()?;
         let sequence = reader.u64()?;
         let issued_ms = reader.u64()?;
         let count = reader.u32()?;
@@ -129,6 +139,7 @@ impl Positions {
             })
             .collect::<Result<_, WireError>>()?;
         Ok(PositionsContent {
+            boot_id,
             sequence,
             issued_ms,
             positions,
@@ -144,6 +155,7 @@ mod tests {
     fn positions_round_trip_and_verify_and_refuse_tampering() -> Result<(), WireError> {
         let engine = Identity::generate()?;
         let content = PositionsContent {
+            boot_id: 0xb007,
             sequence: 3,
             issued_ms: 1_791_220_000_000,
             positions: vec![
@@ -171,7 +183,10 @@ mod tests {
         let back = Positions::from_bytes(signed.as_bytes().to_vec())?;
         back.verify()?;
         assert_eq!(back.content()?, content);
-        assert_eq!((back.engine()?, back.sequence()), (engine.public(), 3));
+        assert_eq!(
+            (back.engine()?, back.boot_id(), back.sequence()),
+            (engine.public(), 0xb007, 3)
+        );
         let mut bytes = signed.as_bytes().to_vec();
         bytes[60] ^= 1;
         assert!(Positions::from_bytes(bytes)?.verify().is_err());
