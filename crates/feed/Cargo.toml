@@ -14,13 +14,16 @@ path = "src/lib.rs"
 
 [[bin]]
 name = "tally-feed"
-description = "Publishes a receiver's BEAST output to Tally relays (RFC-0166 §3.5)."
 path = "src/main.rs"
 
 [dependencies]
 getrandom.workspace = true
 tally-wire.workspace = true
 tokio.workspace = true
+
+[dev-dependencies]
+# `test-util` pauses time, so a test of a ten-minute wait waits no real seconds.
+tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true

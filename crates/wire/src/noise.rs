@@ -27,6 +27,10 @@ pub const PATTERN: &str = "Noise_IK_25519_ChaChaPoly_BLAKE2s";
 /// How long a connection may take from the first byte to `Welcome`.
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// How long one `Writer::send` may wait on a peer that is not reading. A peer that takes longer is
+/// treated as gone, so a stalled reader can never hold a writer, and with it a session, forever.
+pub const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// The largest Noise message, ciphertext and tag together.
 pub const MAX_MESSAGE: usize = 65_535;
 const TAG_LEN: usize = 16;
@@ -60,6 +64,9 @@ pub struct Accepted<S> {
     pub session: Session<S>,
     pub peer: PublicKey,
     pub role: Role,
+    /// Records the initiator sent in the same message as its `Hello` (a subscriber's `Subscribe`),
+    /// to act on before anything is sent its way.
+    pub first: Vec<Record>,
 }
 
 /// Dials a responder whose key is known, says who we are and what we speak.
@@ -72,9 +79,28 @@ pub async fn connect<S>(
 where
     S: AsyncRead + AsyncWrite + Send,
 {
-    tokio::time::timeout(HANDSHAKE_TIMEOUT, initiate(stream, local, remote, role))
-        .await
-        .map_err(|_| WireError::Timeout)?
+    connect_with(stream, local, remote, role, &[]).await
+}
+
+/// As `connect`, also sending `first` in the same message as `Hello`, so the responder has it
+/// before it sends anything: a subscriber's `Subscribe`, so it is never sent what it did not ask
+/// for.
+pub async fn connect_with<S>(
+    stream: S,
+    local: &Identity,
+    remote: &PublicKey,
+    role: Role,
+    first: &[Record],
+) -> Result<Session<S>, WireError>
+where
+    S: AsyncRead + AsyncWrite + Send,
+{
+    tokio::time::timeout(
+        HANDSHAKE_TIMEOUT,
+        initiate(stream, local, remote, role, first),
+    )
+    .await
+    .map_err(|_| WireError::Timeout)?
 }
 
 async fn initiate<S>(
@@ -82,6 +108,7 @@ async fn initiate<S>(
     local: &Identity,
     remote: &PublicKey,
     role: Role,
+    first: &[Record],
 ) -> Result<Session<S>, WireError>
 where
     S: AsyncRead + AsyncWrite + Send,
@@ -104,7 +131,9 @@ where
     let transport = Arc::new(handshake.into_stateless_transport_mode()?);
     let mut reader = Reader::new(read, Arc::clone(&transport));
     let mut writer = Writer::new(write, transport);
-    writer.send(&[Record::hello(role)]).await?;
+    let mut opening = vec![Record::hello(role)];
+    opening.extend_from_slice(first);
+    writer.send(&opening).await?;
     let mut records = Vec::new();
     reader.recv(&mut records).await?;
     match records.first() {
@@ -226,6 +255,7 @@ where
         },
         peer,
         role,
+        first: records.split_off(1),
     })
 }
 
@@ -282,7 +312,19 @@ impl<S: AsyncWrite> Writer<S> {
 
     /// Sends the records, in order, in one or more messages, and flushes.
     /// `R` is `Record` or anything that lends one (an `Arc<Record>` shared by many subscribers).
+    ///
+    /// Fails with `Timeout` after `WRITE_TIMEOUT`; the writer is then mid-frame and the session must
+    /// end.
     pub async fn send<R>(&mut self, records: &[R]) -> Result<(), WireError>
+    where
+        R: Borrow<Record> + Sync,
+    {
+        tokio::time::timeout(WRITE_TIMEOUT, self.send_now(records))
+            .await
+            .map_err(|_| WireError::Timeout)?
+    }
+
+    async fn send_now<R>(&mut self, records: &[R]) -> Result<(), WireError>
     where
         R: Borrow<Record> + Sync,
     {
@@ -398,6 +440,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn records_sent_with_hello_reach_the_responder_before_anything_else()
+    -> Result<(), WireError> {
+        let relay = Identity::generate()?;
+        let subscriber = Identity::generate()?;
+        let (near, far) = tokio::io::duplex(1 << 16);
+        let relay_key = relay.public();
+        let dial = tokio::spawn(async move {
+            connect_with(
+                near,
+                &subscriber,
+                &relay_key,
+                Role::Subscriber,
+                &[Record::Heartbeat],
+            )
+            .await
+        });
+        let accepted = accept(far, &[relay]).await?;
+        join(dial.await)??;
+        assert_eq!(accepted.first, vec![Record::Heartbeat]);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn a_relay_answers_on_whichever_of_its_keys_was_dialled() -> Result<(), WireError> {
         let old = Identity::generate()?;
         let new = Identity::generate()?;
@@ -424,6 +489,28 @@ mod tests {
             );
         assert!(accept(far, &[relay]).await.is_err());
         assert!(join(dial.await)?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_send_to_a_peer_that_never_reads_times_out() -> Result<(), WireError> {
+        let relay = Identity::generate()?;
+        let feeder = Identity::generate()?;
+        let (near, far) = tokio::io::duplex(1 << 12);
+        let relay_key = relay.public();
+        let dial =
+            tokio::spawn(async move { connect(near, &feeder, &relay_key, Role::Feeder).await });
+        let accepted = accept(far, &[relay]).await?;
+        let mut theirs = join(dial.await)??;
+        tokio::time::pause();
+        // The relay never reads again; the pipe fills, and the send gives up instead of waiting.
+        let big = Record::RelayList(Vec::new());
+        let many: Vec<Record> = std::iter::repeat_n(big, 20_000).collect();
+        assert!(matches!(
+            theirs.writer.send(&many).await,
+            Err(WireError::Timeout)
+        ));
+        drop(accepted);
         Ok(())
     }
 

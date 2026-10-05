@@ -39,6 +39,14 @@ rust_binary(
     ],
 )
 
+rust_test(
+    name = "relay_test",
+    size = "small",
+    crate = ":relay",
+    edition = "2024",
+    lint_config = ":cargo_lints",
+)
+
 # A stand-in readsb, a real feeder, this relay and its subscribers, over loopback sockets.
 rust_test(
     name = "end_to_end",
@@ -59,6 +67,7 @@ rustfmt_test(
     targets = [
         ":end_to_end",
         ":relay",
+        ":relay_test",
         ":tally-relay",
     ],
 )

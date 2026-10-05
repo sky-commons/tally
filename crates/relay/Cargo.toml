@@ -22,6 +22,8 @@ tokio.workspace = true
 
 [dev-dependencies]
 tally-feed = { path = "../feed" }
+# `test-util` pauses time, so a deadline test waits no real seconds.
+tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true

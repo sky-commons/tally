@@ -34,6 +34,9 @@ Your receiver's location is published as you enter it, because multilateration (
 that do not broadcast a position) needs it exact. Pass `--precision <metres>` to say you rounded it;
 you then contribute less to multilateration.
 
+If the receiver also runs dump978-fa for 978 MHz UAT, `--uat 127.0.0.1:30978` publishes its raw
+output too, in the same signed batches.
+
 `--ceiling` caps what the feeder sends each relay per second (64 KB by default). Over the cap,
 receptions are dropped and counted, never buffered.
 

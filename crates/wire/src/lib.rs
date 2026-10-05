@@ -7,13 +7,17 @@ pub mod batch;
 pub mod beast;
 pub mod key;
 pub mod noise;
+pub mod positions;
 pub mod record;
+pub mod region;
 
 pub use batch::{Batch, BatchContent, Clock, Location, Observation, ReceiverInfo};
 pub use beast::{Frame, FrameKind};
 pub use key::{Identity, PublicKey};
 pub use noise::{Accepted, Reader, Session, Writer};
-pub use record::{Reason, Record, RelayAddress, Role};
+pub use positions::{Position, Positions, PositionsContent};
+pub use record::{Reason, Record, RelayAddress, Role, Streams};
+pub use region::Region;
 
 /// Everything that can go wrong on the wire. Any of these ends the connection.
 #[derive(Debug, thiserror::Error)]
