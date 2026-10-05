@@ -5,12 +5,20 @@ use std::path::PathBuf;
 
 use tally_wire::{Clock, Location, PublicKey, RelayAddress};
 
+/// Relays shipped in the binary, as `HOST:PORT=KEY`, known like any `--relay`. Before the public
+/// release this lists relays run by several independent operators, never one: a single built-in
+/// seed is a party that can steer every new feeder (RFC-0166 §3.5, §3.7). It is only a starting
+/// point; the feeder learns relays from relays and keeps what it learned.
+pub const SEEDS: &[&str] = &[];
+
 const USAGE: &str = "\
 usage: tally-feed --key FILE [options]
        tally-feed init --key FILE      create the key file if it is missing, print its public key
 
   --key FILE             this receiver's identity (keep it: it is the antenna's name forever)
   --source HOST:PORT     readsb's BEAST output (default 127.0.0.1:30005)
+  --uat HOST:PORT        dump978-fa's raw output, for 978 MHz UAT (none by default; it is
+                         usually 127.0.0.1:30978)
   --relay HOST:PORT=KEY  a relay to know of; repeatable
   --home HOST:PORT=KEY   a relay always in the set (your own, if you run one)
   --relays N             how many relays to publish to (default 4)
@@ -34,6 +42,7 @@ pub enum Command {
 pub struct Config {
     pub key_file: PathBuf,
     pub source: String,
+    pub uat: Option<String>,
     pub relays: Vec<RelayAddress>,
     pub home: Option<RelayAddress>,
     pub relay_count: usize,
@@ -53,6 +62,7 @@ pub fn parse(args: impl Iterator<Item = String>) -> Result<Command, String> {
     let mut config = Config {
         key_file: PathBuf::new(),
         source: "127.0.0.1:30005".to_owned(),
+        uat: None,
         relays: Vec::new(),
         home: None,
         relay_count: 4,
@@ -67,6 +77,7 @@ pub fn parse(args: impl Iterator<Item = String>) -> Result<Command, String> {
         match flag.as_str() {
             "--key" => key_file = Some(PathBuf::from(value()?)),
             "--source" => config.source = value()?,
+            "--uat" => config.uat = Some(value()?),
             "--relay" => config.relays.push(parse_relay(&value()?)?),
             "--home" => config.home = Some(parse_relay(&value()?)?),
             "--relays" => config.relay_count = number(&flag, &value()?)?,
@@ -93,6 +104,9 @@ pub fn parse(args: impl Iterator<Item = String>) -> Result<Command, String> {
         return Ok(Command::Init(key_file));
     }
     config.key_file = key_file;
+    for seed in SEEDS {
+        config.relays.push(parse_relay(seed)?);
+    }
     config.location = match (lat, lon) {
         (Some(lat_e7), Some(lon_e7)) => Some(Location {
             lat_e7,
@@ -111,7 +125,7 @@ pub fn parse(args: impl Iterator<Item = String>) -> Result<Command, String> {
 
 pub fn parse_relay(text: &str) -> Result<RelayAddress, String> {
     let (address, key) = text
-        .rsplit_once('=')
+        .split_once('=')
         .ok_or_else(|| format!("{text}: expected HOST:PORT=KEY"))?;
     let key = PublicKey::from_base64(key).map_err(|error| format!("{text}: {error}"))?;
     Ok(RelayAddress {
@@ -132,4 +146,62 @@ fn degrees(flag: &str, text: &str, limit: f64) -> Result<i32, String> {
         return Err(format!("{flag}: {text} is out of range"));
     }
     Ok((value * 1e7).round() as i32)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn run(args: &[&str]) -> Result<Config, String> {
+        match parse(args.iter().map(|arg| (*arg).to_owned()))? {
+            Command::Run(config) => Ok(*config),
+            _ => Err("not a run".to_owned()),
+        }
+    }
+
+    #[test]
+    fn every_seed_is_a_relay_address() -> Result<(), String> {
+        for seed in SEEDS {
+            parse_relay(seed)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn seeds_join_the_relays_the_owner_named() -> Result<(), String> {
+        let config = run(&["--key", "k"])?;
+        assert_eq!(config.relays.len(), SEEDS.len());
+        Ok(())
+    }
+
+    #[test]
+    fn uat_is_off_unless_named() -> Result<(), String> {
+        assert_eq!(run(&["--key", "k"])?.uat, None);
+        let config = run(&["--key", "k", "--uat", "127.0.0.1:30978"])?;
+        assert_eq!(config.uat.as_deref(), Some("127.0.0.1:30978"));
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod relay_address_tests {
+    use super::*;
+
+    #[test]
+    fn a_relay_key_ending_in_padding_parses() -> Result<(), String> {
+        let key = tally_wire::Identity::generate()
+            .map_err(|error| error.to_string())?
+            .public();
+        let text = format!("relay.example:10900={key}");
+        assert!(
+            text.ends_with('='),
+            "a 32-byte key in base64 ends in padding"
+        );
+        let relay = parse_relay(&text)?;
+        assert_eq!(
+            (relay.address.as_str(), relay.key),
+            ("relay.example:10900", key)
+        );
+        Ok(())
+    }
 }

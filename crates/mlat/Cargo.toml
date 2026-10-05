@@ -1,0 +1,29 @@
+[package]
+name = "tally-mlat"
+description = "A Tally MLAT engine: bridges a region's receivers to an unmodified mlat-server (RFC-0166 §3.8)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lib]
+name = "tally_mlat"
+path = "src/lib.rs"
+
+[[bin]]
+name = "tally-mlat"
+path = "src/main.rs"
+
+[dependencies]
+getrandom.workspace = true
+serde_json.workspace = true
+tally-wire.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tally-relay = { path = "../relay" }
+
+[lints]
+workspace = true

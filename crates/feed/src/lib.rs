@@ -5,6 +5,7 @@
 pub mod config;
 pub mod relays;
 pub mod source;
+pub mod uat;
 
 use std::sync::Arc;
 
@@ -90,11 +91,12 @@ pub async fn run(config: Config) -> Result<(), String> {
             config.ceiling,
         ));
     }
-    source::run(
-        config.source,
-        Batcher::new(identity, config.ceiling),
-        batches,
-    )
-    .await;
+    let (inputs, intake) = source::channel();
+    tokio::spawn(source::read_beast(config.source, inputs.clone()));
+    if let Some(uat) = config.uat {
+        tokio::spawn(source::read_uat(uat, inputs.clone()));
+    }
+    drop(inputs);
+    source::batch(Batcher::new(identity, config.ceiling), intake, batches).await;
     Ok(())
 }

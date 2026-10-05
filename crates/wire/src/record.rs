@@ -10,6 +10,8 @@
 use crate::WireError;
 use crate::batch::{Batch, ReceiverInfo};
 use crate::key::{KEY_LEN, PublicKey};
+use crate::positions::Positions;
+use crate::region::Region;
 
 /// The wire versions this build speaks. A relay answers every version a feeder ever shipped.
 pub const MIN_VERSION: u16 = 1;
@@ -27,6 +29,9 @@ const KIND_REDIRECT: u8 = 0x06;
 const KIND_RELAY_LIST: u8 = 0x07;
 const KIND_RATE_LIMIT: u8 = 0x08;
 const KIND_GOODBYE: u8 = 0x09;
+const KIND_SUBSCRIBE: u8 = 0x0a;
+const KIND_RELAY_BATCH: u8 = 0x0b;
+const KIND_POSITIONS: u8 = 0x0c;
 
 const HEADER_LEN: usize = 3;
 
@@ -39,6 +44,8 @@ pub enum Role {
     Subscriber,
     /// Another relay.
     Relay,
+    /// An MLAT engine: subscribes like a subscriber and publishes its own signed `Positions`.
+    Engine,
     Other(u8),
 }
 
@@ -48,6 +55,7 @@ impl Role {
             Self::Feeder => 1,
             Self::Subscriber => 2,
             Self::Relay => 3,
+            Self::Engine => 4,
             Self::Other(byte) => byte,
         }
     }
@@ -57,8 +65,30 @@ impl Role {
             1 => Self::Feeder,
             2 => Self::Subscriber,
             3 => Self::Relay,
+            4 => Self::Engine,
             other => Self::Other(other),
         }
+    }
+}
+
+/// Which of a relay's streams a subscriber wants (RFC-0166 §3.6), as bits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Streams(pub u8);
+
+impl Streams {
+    /// Receivers' own signed batches: every copy, for MLAT and research.
+    pub const RAW: Self = Self(1);
+    /// One copy of each message, in batches the relay signs.
+    pub const DEDUPLICATED: Self = Self(2);
+    /// Positions MLAT engines solved.
+    pub const POSITIONS: Self = Self(4);
+
+    pub fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+
+    pub fn with(self, other: Self) -> Self {
+        Self(self.0 | other.0)
     }
 }
 
@@ -146,6 +176,17 @@ pub enum Record {
         reason: Reason,
         retry_after_secs: u32,
     },
+    /// What a subscriber wants from here on: streams, and regions by the receivers' declared
+    /// locations (none means the whole world). A subscriber that never sends one gets every
+    /// receiver's raw batches, as wire version 1's first subscribers did.
+    Subscribe {
+        streams: Streams,
+        regions: Vec<Region>,
+    },
+    /// A batch the relay itself signed: its deduplicated stream.
+    RelayBatch(Batch),
+    /// Positions an MLAT engine solved and signed.
+    Positions(Positions),
 }
 
 impl Record {
@@ -168,6 +209,9 @@ impl Record {
             Self::RelayList(_) => KIND_RELAY_LIST,
             Self::RateLimit { .. } => KIND_RATE_LIMIT,
             Self::Goodbye { .. } => KIND_GOODBYE,
+            Self::Subscribe { .. } => KIND_SUBSCRIBE,
+            Self::RelayBatch(_) => KIND_RELAY_BATCH,
+            Self::Positions(_) => KIND_POSITIONS,
         }
     }
 
@@ -212,6 +256,17 @@ impl Record {
                 out.push(reason.byte());
                 out.extend_from_slice(&retry_after_secs.to_be_bytes());
             }
+            Self::Subscribe { streams, regions } => {
+                out.push(streams.0);
+                let count =
+                    u16::try_from(regions.len()).map_err(|_| WireError::Oversize(regions.len()))?;
+                out.extend_from_slice(&count.to_be_bytes());
+                for region in regions {
+                    out.extend_from_slice(&region.as_u64().to_be_bytes());
+                }
+            }
+            Self::RelayBatch(batch) => out.extend_from_slice(batch.as_bytes()),
+            Self::Positions(positions) => out.extend_from_slice(positions.as_bytes()),
         }
         let body = out.len() - start - HEADER_LEN;
         let length = u16::try_from(body).map_err(|_| WireError::Oversize(body))?;
@@ -267,6 +322,16 @@ impl Record {
                 reason: Reason::from_byte(reader.u8()?),
                 retry_after_secs: reader.u32()?,
             },
+            KIND_SUBSCRIBE => {
+                let streams = Streams(reader.u8()?);
+                let count = reader.u16()?;
+                let regions = (0..count)
+                    .map(|_| Region::from_u64(reader.u64()?))
+                    .collect::<Result<_, _>>()?;
+                Self::Subscribe { streams, regions }
+            }
+            KIND_RELAY_BATCH => Self::RelayBatch(Batch::from_bytes(body.to_vec())?),
+            KIND_POSITIONS => Self::Positions(Positions::from_bytes(body.to_vec())?),
             critical if critical & CRITICAL != 0 => return Err(WireError::UnknownCritical(kind)),
             _ => return Ok((None, HEADER_LEN + length)),
         };
@@ -394,6 +459,23 @@ mod tests {
             Record::Goodbye {
                 reason: Reason::Other(200),
                 retry_after_secs: 0,
+            },
+            Record::hello(Role::Engine),
+            Record::Subscribe {
+                streams: Streams::RAW.with(Streams::POSITIONS),
+                regions: vec![Region::containing(
+                    &crate::batch::Location {
+                        lat_e7: 374_400_000,
+                        lon_e7: -1_221_400_000,
+                        alt_m: 0,
+                        precision_m: 0,
+                    },
+                    3,
+                )?],
+            },
+            Record::Subscribe {
+                streams: Streams::DEDUPLICATED,
+                regions: Vec::new(),
             },
         ])
     }

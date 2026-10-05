@@ -28,6 +28,22 @@ const INFO_PREFIX_LEN: usize = 1 + KEY_LEN;
 
 pub type Hash = [u8; 32];
 
+/// What an `Observation`'s bytes are. The 1090 MHz forms are BEAST's own type bytes, so a BEAST
+/// frame converts without a table; a reader forwards a format it does not know untouched.
+pub mod format {
+    /// Mode A/C, 2 bytes.
+    pub const MODE_AC: u8 = b'1';
+    /// Mode-S short, 7 bytes.
+    pub const MODE_S_SHORT: u8 = b'2';
+    /// Mode-S long (ADS-B extended squitter among them), 14 bytes.
+    pub const MODE_S_LONG: u8 = b'3';
+    /// A 978 MHz UAT downlink from an aircraft, 18 (basic) or 34 (long) bytes. Its timestamp is
+    /// the receiver's wall clock in microseconds, modulo 2^48, as dump978 reports it.
+    pub const UAT_DOWNLINK: u8 = b'D';
+    /// A 978 MHz UAT ground uplink (FIS-B weather, TIS-B), 432 bytes, timestamped as a downlink.
+    pub const UAT_UPLINK: u8 = b'U';
+}
+
 /// What a receiver's decoder emitted for one reception, unchanged.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Observation {
@@ -392,7 +408,7 @@ impl ReceiverInfo {
     }
 }
 
-fn domain(label: &[u8], signed: &[u8]) -> Vec<u8> {
+pub(crate) fn domain(label: &[u8], signed: &[u8]) -> Vec<u8> {
     let mut message = Vec::with_capacity(label.len() + 1 + signed.len());
     message.extend_from_slice(label);
     message.push(0);
@@ -400,7 +416,7 @@ fn domain(label: &[u8], signed: &[u8]) -> Vec<u8> {
     message
 }
 
-fn split_signature(bytes: &[u8]) -> Result<(&[u8], [u8; SIGNATURE_LEN]), WireError> {
+pub(crate) fn split_signature(bytes: &[u8]) -> Result<(&[u8], [u8; SIGNATURE_LEN]), WireError> {
     let at = bytes
         .len()
         .checked_sub(SIGNATURE_LEN)
@@ -413,7 +429,7 @@ fn split_signature(bytes: &[u8]) -> Result<(&[u8], [u8; SIGNATURE_LEN]), WireErr
     Ok((&bytes[..at], signature))
 }
 
-fn u64_at(bytes: &[u8], at: usize) -> u64 {
+pub(crate) fn u64_at(bytes: &[u8], at: usize) -> u64 {
     let mut array = [0; 8];
     array.copy_from_slice(&bytes[at..at + 8]);
     u64::from_be_bytes(array)

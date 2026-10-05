@@ -1,6 +1,6 @@
 //! The relay's command line. Everything a relay is told comes from its operator, here.
 
-use tally_wire::{Identity, PublicKey};
+use tally_wire::{Identity, PublicKey, RelayAddress};
 
 const USAGE: &str = "\
 usage: tally-relay --key FILE [--key FILE]... [options]
@@ -12,6 +12,9 @@ usage: tally-relay --key FILE [--key FILE]... [options]
                          (bind it to loopback: it is unauthenticated)
   --upstream HOST:PORT=KEY
                          a parent relay to exchange batches with; repeatable
+  --advertise HOST:PORT=KEY
+                         another relay to offer feeders and turned-away subscribers as a hint,
+                         beside the upstreams; repeatable
   --max-subscribers N    subscribers served before new ones are turned away (default 64)
 ";
 
@@ -27,6 +30,7 @@ pub struct Config {
     pub listen: String,
     pub beast_out: Option<String>,
     pub upstreams: Vec<Upstream>,
+    pub advertise: Vec<RelayAddress>,
     pub max_subscribers: usize,
 }
 
@@ -38,6 +42,7 @@ impl Config {
             listen: "0.0.0.0:10900".to_owned(),
             beast_out: None,
             upstreams: Vec::new(),
+            advertise: Vec::new(),
             max_subscribers: 64,
         };
         let mut args = args.peekable();
@@ -54,6 +59,10 @@ impl Config {
                 "--listen" => config.listen = value()?,
                 "--beast-out" => config.beast_out = Some(value()?),
                 "--upstream" => config.upstreams.push(parse_upstream(&value()?)?),
+                "--advertise" => {
+                    let Upstream { address, key } = parse_upstream(&value()?)?;
+                    config.advertise.push(RelayAddress { key, address });
+                }
                 "--max-subscribers" => {
                     config.max_subscribers = value()?
                         .parse()
@@ -69,7 +78,26 @@ impl Config {
         if config.key_files.is_empty() {
             return Err(format!("--key is required\n{USAGE}"));
         }
+        // A relay list carries a one-byte count.
+        if config.hints().len() > usize::from(u8::MAX) {
+            return Err("at most 255 advertised relays and upstreams together".to_owned());
+        }
         Ok(Some(config))
+    }
+
+    /// The relays offered as hints (RFC-0166 §3.7): those advertised, then the upstreams.
+    pub fn hints(&self) -> Vec<RelayAddress> {
+        let upstreams = self.upstreams.iter().map(|upstream| RelayAddress {
+            key: upstream.key,
+            address: upstream.address.clone(),
+        });
+        let mut hints: Vec<RelayAddress> = Vec::new();
+        for hint in self.advertise.iter().cloned().chain(upstreams) {
+            if !hints.iter().any(|known| known.key == hint.key) {
+                hints.push(hint);
+            }
+        }
+        hints
     }
 
     pub fn identities(&self) -> Result<Vec<Identity>, String> {
@@ -86,11 +114,29 @@ impl Config {
 
 pub fn parse_upstream(text: &str) -> Result<Upstream, String> {
     let (address, key) = text
-        .rsplit_once('=')
+        .split_once('=')
         .ok_or_else(|| format!("{text}: expected HOST:PORT=KEY"))?;
     let key = PublicKey::from_base64(key).map_err(|error| format!("{text}: {error}"))?;
     Ok(Upstream {
         address: address.to_owned(),
         key,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_upstream_key_ending_in_padding_parses() -> Result<(), String> {
+        let key = Identity::generate()
+            .map_err(|error| error.to_string())?
+            .public();
+        let upstream = parse_upstream(&format!("parent.example:10900={key}"))?;
+        assert_eq!(
+            (upstream.address.as_str(), upstream.key),
+            ("parent.example:10900", key)
+        );
+        Ok(())
+    }
 }

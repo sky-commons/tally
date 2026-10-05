@@ -1,18 +1,21 @@
-//! One relay connection of each kind: a feeder publishing its own batches, a subscriber taking the
-//! stream, another relay exchanging both ways, and the loopback BEAST output.
+//! One relay connection of each kind: a feeder publishing its own batches, a subscriber taking
+//! the streams it asked for, an MLAT engine doing both with its own positions, another relay
+//! exchanging both ways, and the loopback BEAST output.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use tally_wire::backoff::Backoff;
 use tally_wire::noise::{self, Reader, Writer};
-use tally_wire::{Identity, PublicKey, Reason, ReceiverInfo, Record, Role};
+use tally_wire::{Identity, PublicKey, Reason, Record, Role};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::broadcast::{self, error::RecvError, error::TryRecvError};
+use tokio::sync::watch;
 
 use crate::config::Upstream;
 use crate::hub::{Hub, Item};
+use crate::subscription::{Subscription, peer_wants};
 
 /// A peer that says nothing for this long is gone. Every side heartbeats well inside it.
 const READ_TIMEOUT: Duration = Duration::from_secs(120);
@@ -20,16 +23,73 @@ const HEARTBEAT: Duration = Duration::from_secs(30);
 /// The most records gathered into one send.
 const SEND_BATCH: usize = 256;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long a subscriber turned away at capacity is asked to stay away.
+const FULL_RETRY_SECS: u32 = 600;
 
-/// Whose batches a connection may publish.
+/// Who is on the other end, and so what it may publish.
 #[derive(Clone, Copy)]
-enum Accepts {
-    /// A feeder publishes only its own.
-    Own(PublicKey),
-    /// A relay forwards anyone's, each still signed by its receiver.
-    Any,
+enum Peer {
+    /// A feeder publishes only its own batches and description.
+    Feeder(PublicKey),
+    /// A relay forwards anyone's batches and positions, each still signed by its author.
+    Relay,
     /// A subscriber publishes nothing.
-    Nothing,
+    Subscriber,
+    /// An engine publishes only its own positions.
+    Engine(PublicKey),
+}
+
+impl Peer {
+    fn may_publish_batch(self, receiver: PublicKey) -> bool {
+        match self {
+            Self::Feeder(peer) => receiver == peer,
+            Self::Relay => true,
+            Self::Subscriber | Self::Engine(_) => false,
+        }
+    }
+
+    fn may_publish_positions(self, engine: PublicKey) -> bool {
+        match self {
+            Self::Engine(peer) => engine == peer,
+            Self::Relay => true,
+            Self::Subscriber | Self::Feeder(_) => false,
+        }
+    }
+}
+
+/// Which records on the fan-out a link is sent.
+enum Wants {
+    /// Another relay: everything but the deduplicated stream.
+    Peer,
+    /// A subscriber or engine: what it last subscribed to.
+    Subscription(watch::Receiver<Subscription>),
+}
+
+impl Wants {
+    fn wants(&self, item: &Item) -> bool {
+        match self {
+            Self::Peer => peer_wants(item),
+            Self::Subscription(subscription) => subscription.borrow().wants(item),
+        }
+    }
+
+    /// Resolves with the new subscription when it changes; a relay's never does.
+    async fn changed(&mut self) -> Subscription {
+        if let Self::Subscription(subscription) = self
+            && subscription.changed().await.is_ok()
+        {
+            return subscription.borrow_and_update().clone();
+        }
+        std::future::pending().await
+    }
+}
+
+/// A link's place in the fan-out: the stream, the descriptions known when it joined, and its
+/// filter.
+struct FanOut {
+    out: broadcast::Receiver<Item>,
+    infos: Vec<Item>,
+    wants: Wants,
 }
 
 pub async fn inbound<S>(stream: S, identities: &[Identity], hub: Arc<Hub>) -> Result<(), String>
@@ -43,13 +103,23 @@ where
     let source = hub.connection_id();
     match accepted.role {
         Role::Feeder => {
+            // Relays it may also choose, as hints (RFC-0166 §3.7).
+            let greeting = if hub.hints().is_empty() {
+                Vec::new()
+            } else {
+                vec![Record::RelayList(hub.hints().to_vec())]
+            };
             exchange(
                 &mut session.reader,
                 &mut session.writer,
                 &hub,
                 source,
-                Accepts::Own(accepted.peer),
-                None,
+                Peer::Feeder(accepted.peer),
+                Serving {
+                    greeting,
+                    fan_out: None,
+                    subscribe: None,
+                },
             )
             .await
         }
@@ -60,29 +130,51 @@ where
                 &mut session.writer,
                 &hub,
                 source,
-                Accepts::Any,
-                Some((out, infos)),
+                Peer::Relay,
+                Serving {
+                    greeting: Vec::new(),
+                    fan_out: Some(FanOut {
+                        out,
+                        infos,
+                        wants: Wants::Peer,
+                    }),
+                    subscribe: None,
+                },
             )
             .await
         }
-        Role::Subscriber => {
+        Role::Subscriber | Role::Engine => {
+            let peer = match accepted.role {
+                Role::Engine => Peer::Engine(accepted.peer),
+                _ => Peer::Subscriber,
+            };
+            // An engine is served as a subscriber is, and counts against the same cap.
             let Some((out, infos, _slot)) = hub.subscribe() else {
                 let _ = session
                     .writer
-                    .send(&[Record::Goodbye {
-                        reason: Reason::Full,
-                        retry_after_secs: 600,
+                    .send(&[Record::Redirect {
+                        retry_after_secs: FULL_RETRY_SECS,
+                        hints: hub.hints().to_vec(),
                     }])
                     .await;
                 return Err("at subscriber capacity".to_owned());
             };
+            let (subscribe, subscription) = watch::channel(Subscription::default());
             exchange(
                 &mut session.reader,
                 &mut session.writer,
                 &hub,
                 source,
-                Accepts::Nothing,
-                Some((out, infos)),
+                peer,
+                Serving {
+                    greeting: Vec::new(),
+                    fan_out: Some(FanOut {
+                        out,
+                        infos,
+                        wants: Wants::Subscription(subscription),
+                    }),
+                    subscribe: Some(&subscribe),
+                },
             )
             .await
         }
@@ -130,10 +222,27 @@ async fn upstream_once(
         &mut session.writer,
         hub,
         source,
-        Accepts::Any,
-        Some((out, infos)),
+        Peer::Relay,
+        Serving {
+            greeting: Vec::new(),
+            fan_out: Some(FanOut {
+                out,
+                infos,
+                wants: Wants::Peer,
+            }),
+            subscribe: None,
+        },
     )
     .await
+}
+
+/// What a connection is told and given, beside what it publishes.
+struct Serving<'a> {
+    /// Sent once, first.
+    greeting: Vec<Record>,
+    fan_out: Option<FanOut>,
+    /// Where a subscriber's or engine's `Subscribe` records go, to steer its own fan-out.
+    subscribe: Option<&'a watch::Sender<Subscription>>,
 }
 
 /// Runs a connection's two directions until either ends.
@@ -142,15 +251,20 @@ async fn exchange<S>(
     writer: &mut Writer<S>,
     hub: &Hub,
     source: u64,
-    accepts: Accepts,
-    fan_out: Option<(broadcast::Receiver<Item>, Vec<ReceiverInfo>)>,
+    peer: Peer,
+    serving: Serving<'_>,
 ) -> Result<(), String>
 where
     S: AsyncRead + AsyncWrite + Send,
 {
+    let Serving {
+        greeting,
+        fan_out,
+        subscribe,
+    } = serving;
     tokio::select! {
-        result = read_loop(reader, hub, source, accepts) => result,
-        result = write_loop(writer, source, fan_out) => result,
+        result = read_loop(reader, hub, source, peer, subscribe) => result,
+        result = write_loop(writer, hub, source, greeting, fan_out) => result,
     }
 }
 
@@ -158,7 +272,8 @@ async fn read_loop<S: AsyncRead>(
     reader: &mut Reader<S>,
     hub: &Hub,
     source: u64,
-    accepts: Accepts,
+    peer: Peer,
+    subscribe: Option<&watch::Sender<Subscription>>,
 ) -> Result<(), String> {
     let mut records = Vec::new();
     loop {
@@ -168,36 +283,54 @@ async fn read_loop<S: AsyncRead>(
             .map_err(|_| "silent too long".to_owned())?
             .map_err(|error| error.to_string())?;
         for record in records.drain(..) {
-            ingest(record, hub, source, accepts)?;
+            ingest(record, hub, source, peer, subscribe)?;
         }
     }
 }
 
-fn ingest(record: Record, hub: &Hub, source: u64, accepts: Accepts) -> Result<(), String> {
-    let allowed = |receiver: PublicKey| match accepts {
-        Accepts::Own(peer) => receiver == peer,
-        Accepts::Any => true,
-        Accepts::Nothing => false,
-    };
+fn ingest(
+    record: Record,
+    hub: &Hub,
+    source: u64,
+    peer: Peer,
+    subscribe: Option<&watch::Sender<Subscription>>,
+) -> Result<(), String> {
     match record {
         Record::Batch(batch) => {
             let receiver = batch.receiver().map_err(|error| error.to_string())?;
-            if !allowed(receiver) {
+            if !peer.may_publish_batch(receiver) {
                 return Err(format!("published a batch signed by {receiver}"));
             }
             batch.verify().map_err(|error| error.to_string())?;
-            hub.publish_batch(source, batch);
+            hub.publish_batch(source, batch, receiver);
         }
         Record::ReceiverInfo(info) => {
             let receiver = info.receiver().map_err(|error| error.to_string())?;
-            if !allowed(receiver) {
+            if !peer.may_publish_batch(receiver) {
                 return Err(format!("published receiver info signed by {receiver}"));
             }
             info.verify().map_err(|error| error.to_string())?;
-            // A format this build cannot read still forwards; it just never replaces a known one.
-            let issued_ms = info.content().map_or(0, |content| content.issued_ms);
-            hub.publish_info(source, info, receiver, issued_ms);
+            // A format this build cannot read still forwards; it just never replaces a known one,
+            // and places its receiver nowhere.
+            let (issued_ms, place) = info
+                .content()
+                .map_or((0, None), |content| (content.issued_ms, content.location));
+            hub.publish_info(source, info, receiver, issued_ms, place);
         }
+        Record::Positions(positions) => {
+            let engine = positions.engine().map_err(|error| error.to_string())?;
+            if !peer.may_publish_positions(engine) {
+                return Err(format!("published positions signed by {engine}"));
+            }
+            positions.verify().map_err(|error| error.to_string())?;
+            hub.publish_positions(source, positions);
+        }
+        Record::Subscribe { streams, regions } => {
+            if let Some(subscribe) = subscribe {
+                subscribe.send_replace(Subscription { streams, regions });
+            }
+        }
+        // Another relay's deduplicated stream is its own claim; this relay derives its own.
         _ => {}
     }
     Ok(())
@@ -205,11 +338,22 @@ fn ingest(record: Record, hub: &Hub, source: u64, accepts: Accepts) -> Result<()
 
 async fn write_loop<S: AsyncWrite>(
     writer: &mut Writer<S>,
+    hub: &Hub,
     source: u64,
-    fan_out: Option<(broadcast::Receiver<Item>, Vec<ReceiverInfo>)>,
+    greeting: Vec<Record>,
+    fan_out: Option<FanOut>,
 ) -> Result<(), String> {
     let mut heartbeat = tokio::time::interval(HEARTBEAT);
-    let Some((mut out, infos)) = fan_out else {
+    writer
+        .send(&greeting)
+        .await
+        .map_err(|error| error.to_string())?;
+    let Some(FanOut {
+        mut out,
+        infos,
+        mut wants,
+    }) = fan_out
+    else {
         loop {
             heartbeat.tick().await;
             writer
@@ -218,7 +362,11 @@ async fn write_loop<S: AsyncWrite>(
                 .map_err(|error| error.to_string())?;
         }
     };
-    let infos: Vec<Record> = infos.into_iter().map(Record::ReceiverInfo).collect();
+    let infos: Vec<Arc<Record>> = infos
+        .into_iter()
+        .filter(|item| wants.wants(item))
+        .map(|item| item.record)
+        .collect();
     writer
         .send(&infos)
         .await
@@ -228,13 +376,13 @@ async fn write_loop<S: AsyncWrite>(
         tokio::select! {
             item = out.recv() => {
                 match item {
-                    Ok(item) => keep(&mut pending, item, source),
+                    Ok(item) => keep(&mut pending, item, source, &wants),
                     Err(RecvError::Lagged(_)) => return fell_behind(writer).await,
                     Err(RecvError::Closed) => return Ok(()),
                 }
                 while pending.len() < SEND_BATCH {
                     match out.try_recv() {
-                        Ok(item) => keep(&mut pending, item, source),
+                        Ok(item) => keep(&mut pending, item, source, &wants),
                         Err(TryRecvError::Lagged(_)) => return fell_behind(writer).await,
                         Err(_) => break,
                     }
@@ -244,6 +392,18 @@ async fn write_loop<S: AsyncWrite>(
                     .await
                     .map_err(|error| error.to_string())?;
                 pending.clear();
+            }
+            subscription = wants.changed() => {
+                // Describe the receivers the new subscription covers before any of their batches.
+                let infos: Vec<Arc<Record>> = hub
+                    .infos_for(&subscription)
+                    .into_iter()
+                    .map(|item| item.record)
+                    .collect();
+                writer
+                    .send(&infos)
+                    .await
+                    .map_err(|error| error.to_string())?;
             }
             _ = heartbeat.tick() => {
                 writer
@@ -255,9 +415,9 @@ async fn write_loop<S: AsyncWrite>(
     }
 }
 
-/// Never send a record back down the connection it came in on.
-fn keep(pending: &mut Vec<Arc<Record>>, item: Item, source: u64) {
-    if item.source != source {
+/// Never send a record back down the connection it came in on, nor one the link did not ask for.
+fn keep(pending: &mut Vec<Arc<Record>>, item: Item, source: u64, wants: &Wants) {
+    if item.source != source && wants.wants(&item) {
         pending.push(item.record);
     }
 }

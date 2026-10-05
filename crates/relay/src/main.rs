@@ -20,7 +20,7 @@ async fn run() -> Result<(), String> {
         return Ok(());
     };
     let identities = config.identities()?;
-    let hub = Arc::new(Hub::new(config.max_subscribers));
+    let hub = Arc::new(Hub::new(config.max_subscribers).advertising(config.hints()));
     eprintln!(
         "tally-relay: key {} listening on {}",
         identities[0].public(),

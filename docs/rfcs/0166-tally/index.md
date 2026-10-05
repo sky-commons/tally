@@ -159,6 +159,11 @@ sent back (readsb re-emits them with the counter `0xFF004D4C4154`), and a stream
 than one receiver in `0xe3` receiver-id frames (an aggregate; the feeder refuses to publish it
 under one key).
 
+A second, optional source is 978 MHz UAT from dump978-fa's raw output (port 30978), where most
+small US aircraft below 18,000 ft broadcast. Its receptions go into the same signed chain as
+1090's (formats `D` and `U`, timestamped with dump978's wall clock in microseconds), and a UAT
+reconnect does not start a new 1090 counter epoch.
+
 Version 1 carries, and freezes:
 
 - the signed, numbered, chained batches of §3.1 and a signed `ReceiverInfo` listing the relays it
@@ -190,6 +195,15 @@ signature, drops duplicates by hash, and forwards. It decodes no frame. It serve
    most consumers, signed by the relay as its own claim. It is about 30 Mbps for the whole world at
    20,000 receivers, against roughly 1 to 2 Gbps of raw receptions.
 3. **MLAT results:** positions published by MLAT engines (§3.8), signed by the engine.
+
+A subscriber chooses with `Subscribe { streams, regions }`, which it may send at any time and which
+replaces the last one; before any, it gets raw batches for the whole world. Regions are H3 cells of
+any resolution (`wire::region`, the one place that says whether a receiver is inside one), matched
+against the location in the receiver's newest signed `ReceiverInfo`; a receiver with no location
+reaches only whole-world subscriptions. In wire version 1 the deduplicated stream is whole-world
+only: it mixes every receiver, so it is not cut by region. A relay derives its own deduplicated
+stream and never forwards another relay's; positions travel between relays like batches, verified
+and forwarded once by hash.
 
 Relays form a tree: regional relays pass their region up to a few top relays that hold the world,
 and a whole-world consumer subscribes once to a top relay. Each relay caps how many full-world
@@ -237,6 +251,17 @@ identities used.
 - A receiver's clock error is shared by everything it hears, so a solver models it as one bias per
   receiver, never as independent noise per observation.
 - Consumers trust a target confirmed by receivers in separate places more than one heard once.
+
+The first engine, `tally-mlat`, runs no solver of its own. It bridges Tally to an unmodified
+mlat-server (wiedehopf's, the one the open aggregators run) by speaking mlat-client's protocol to
+it on behalf of each receiver in its regions: one session per receiver with an exact location and
+a known clock, the handshake mlat-client sends, the sync and mlat messages mlat-client's selection
+logic would send, and the positions the server returns on those sessions, signed as `Positions`
+and published back through the relay. Because Tally delivers a receiver's receptions in batches
+of about a second and the server groups copies of one message only within 0.9 s, the engine replays
+every receiver on one timeline, a fixed delay (2 s by default) behind each reception's estimated
+time. Whether that grouping holds across many real receivers, and what delay it needs, only a run
+against a real server shows.
 
 ### §3.9 Our own use, and the production rule
 
@@ -363,7 +388,16 @@ roughly $200 to $700 a month on budget hosting; today it is one server.
    signed and unchanged and the loopback BEAST output decoded and unchanged; a feeder publishing
    another receiver's batch is cut off and nothing in that name is forwarded; a batch arriving by
    two relays is forwarded once; a stalled subscriber is dropped while another keeps every batch.
-5. **On our hardware.** Our relays, one feeder per box on the master, the consumer readsb moved to
-   our relay. Verified by the consumer's own counters and the live map; bandwidth measured.
-6. **Public launch.** Static aarch64 and x86_64 builds, the installer, the adsb.im pull request.
-7. **MLAT engines**, then **978 MHz**, then **the Bridge as a receiver** (its own RFC).
+5. **On our hardware.** `infra/prod-host/tally`: our relay on loopback, one feeder per box in the
+   feeder roster, the consumer readsb moved to the relay's output, every Tally process on
+   loopback by the egress policy. Verified by the consumer's own counters; bandwidth measured.
+6. **Public launch.** Built: aarch64 and x86_64 binaries against the pinned sysroot (glibc 2.25 or
+   newer, no C++ runtime; the aarch64 build is checked as an ELF but has not yet run on a Pi), the
+   systemd units and the one-line installer (`tally/packaging`). Owed: a public relay on a host
+   with a public address, seeds from more than one operator, release builds published to
+   `flightlines/tally`, and the adsb.im pull request.
+7. **Streams, engines and 978 MHz.** Built: subscriptions by region, the relay-signed deduplicated
+   stream, engines publishing positions, peer exchange and redirects at capacity; `tally-mlat`
+   over mlat-server; the feeder's 978 MHz input from dump978-fa, in the same signed chain as
+   1090. Owed: a run against a real mlat-server with real receivers. Then **the Bridge as a
+   receiver** (its own RFC).
