@@ -1,0 +1,29 @@
+# The public repository's module (github.com/flightlines/tally, RFC-0166 §3.10). In the monorepo
+# Bazel ignores this nested file and the root MODULE.bazel includes tally.MODULE.bazel instead;
+# the mirror moves tally/ to the root and rewrites //tally to //, which makes this the root module.
+
+module(name = "tally")
+
+bazel_dep(name = "platforms", version = "1.1.0")
+bazel_dep(name = "rules_rust", version = "0.74.0")
+
+rust = use_extension("@rules_rust//rust:extensions.bzl", "rust")
+rust.toolchain(
+    edition = "2024",
+    versions = ["1.96.0"],
+)
+use_repo(rust, "rust_toolchains")
+
+register_toolchains("@rust_toolchains//:all")
+
+# A pinned C toolchain for linking, so the build needs nothing installed beyond Bazel itself. (The
+# monorepo builds tally/ on its build service's worker image, which carries its own.)
+bazel_dep(name = "toolchains_llvm", version = "1.9.1")
+
+llvm = use_extension("@toolchains_llvm//toolchain/extensions:llvm.bzl", "llvm")
+llvm.toolchain(llvm_version = "22.1.8")
+use_repo(llvm, "llvm_toolchain")
+
+register_toolchains("@llvm_toolchain//:all")
+
+include("//tally:tally.MODULE.bazel")

@@ -1,0 +1,25 @@
+[package]
+name = "tally-wire"
+description = "Tally's records, its Noise transport and the BEAST parser: the only code that speaks the wire."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+base64.workspace = true
+blake2.workspace = true
+ed25519-dalek.workspace = true
+getrandom.workspace = true
+snow.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+# `test-util` pauses time, so a timeout test waits no real seconds.
+tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true

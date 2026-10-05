@@ -1,0 +1,37 @@
+# Tally (RFC-0166): a receiver publishes its raw receptions once, and anyone may run a relay.
+# This directory is self-contained: it builds with Cargo or Bazel on its own, references nothing
+# outside itself, and is mirrored to github.com/flightlines/tally with `//tally/` rewritten to `//`.
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/flightlines/tally"
+publish = false
+
+[workspace.dependencies]
+base64 = "0.22"
+blake2 = "0.10"
+ed25519-dalek = "2"
+# The version snow already uses, so the tree carries one getrandom.
+getrandom = "0.2"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "time", "macros", "sync"] }
+# Pure Rust, no C: snow's `std` feature turns on `ring/std` unconditionally (0.10.0), which drags
+# ring and a C toolchain into every build, so the resolver's crates are named one by one instead.
+snow = { version = "0.10", default-features = false, features = [
+  "default-resolver",
+  "use-chacha20poly1305",
+  "use-blake2",
+  "use-curve25519",
+  "use-getrandom",
+] }
+tally-wire = { path = "crates/wire" }
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"

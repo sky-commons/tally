@@ -1,0 +1,27 @@
+[package]
+name = "tally-relay"
+description = "A Tally relay: takes in feeders and peers, fans out to subscribers (RFC-0166 §3.6)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lib]
+name = "tally_relay"
+path = "src/lib.rs"
+
+[[bin]]
+name = "tally-relay"
+path = "src/main.rs"
+
+[dependencies]
+tally-wire.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tally-feed = { path = "../feed" }
+
+[lints]
+workspace = true

@@ -1,0 +1,46 @@
+load("@rules_rust//cargo:defs.bzl", "extract_cargo_lints")
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test", "rustfmt_test")
+
+package(default_visibility = ["//tally:__subpackages__"])
+
+exports_files(["Cargo.toml"])
+
+extract_cargo_lints(
+    name = "cargo_lints",
+    manifest = "Cargo.toml",
+    workspace = "//tally:Cargo.toml",
+)
+
+rust_library(
+    name = "wire",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "tally_wire",
+    edition = "2024",
+    lint_config = ":cargo_lints",
+    version = "0.1.0",
+    deps = [
+        "@tally_crates//:base64",
+        "@tally_crates//:blake2",
+        "@tally_crates//:ed25519-dalek",
+        "@tally_crates//:getrandom",
+        "@tally_crates//:snow",
+        "@tally_crates//:thiserror",
+        "@tally_crates//:tokio",
+    ],
+)
+
+rust_test(
+    name = "wire_test",
+    size = "small",
+    crate = ":wire",
+    edition = "2024",
+    lint_config = ":cargo_lints",
+)
+
+rustfmt_test(
+    name = "rustfmt",
+    targets = [
+        ":wire",
+        ":wire_test",
+    ],
+)

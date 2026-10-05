@@ -1,0 +1,455 @@
+//! Records (RFC-0166 §3.4): a kind byte, a two-byte big-endian body length, the body. A Noise
+//! message carries whole records only.
+//!
+//! Feeders never update, so the format is built to be extended without them (§3.4's rules):
+//! - an unknown kind is skipped, unless its high bit marks it critical, which ends the session;
+//! - a body may carry bytes after the fields a reader knows, and they are ignored, so a field is
+//!   added by appending it;
+//! - an enum value a reader does not know is kept as `Other`, never an error.
+
+use crate::WireError;
+use crate::batch::{Batch, ReceiverInfo};
+use crate::key::{KEY_LEN, PublicKey};
+
+/// The wire versions this build speaks. A relay answers every version a feeder ever shipped.
+pub const MIN_VERSION: u16 = 1;
+pub const MAX_VERSION: u16 = 1;
+
+/// The bit of a kind byte that says "a reader that does not know this kind must stop".
+pub const CRITICAL: u8 = 0x80;
+
+const KIND_HELLO: u8 = 0x01;
+const KIND_WELCOME: u8 = 0x02;
+const KIND_BATCH: u8 = 0x03;
+const KIND_RECEIVER_INFO: u8 = 0x04;
+const KIND_HEARTBEAT: u8 = 0x05;
+const KIND_REDIRECT: u8 = 0x06;
+const KIND_RELAY_LIST: u8 = 0x07;
+const KIND_RATE_LIMIT: u8 = 0x08;
+const KIND_GOODBYE: u8 = 0x09;
+
+const HEADER_LEN: usize = 3;
+
+/// What the initiator of a connection is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Role {
+    /// A receiver publishing its own batches.
+    Feeder,
+    /// A consumer reading a relay's streams.
+    Subscriber,
+    /// Another relay.
+    Relay,
+    Other(u8),
+}
+
+impl Role {
+    fn byte(self) -> u8 {
+        match self {
+            Self::Feeder => 1,
+            Self::Subscriber => 2,
+            Self::Relay => 3,
+            Self::Other(byte) => byte,
+        }
+    }
+
+    fn from_byte(byte: u8) -> Self {
+        match byte {
+            1 => Self::Feeder,
+            2 => Self::Subscriber,
+            3 => Self::Relay,
+            other => Self::Other(other),
+        }
+    }
+}
+
+/// Why a relay closes a session. A feeder backs off by `retry_after_secs` whatever the reason.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Reason {
+    /// No version in the initiator's range.
+    Version,
+    /// The relay is at capacity.
+    Full,
+    /// The relay is shutting down or retiring.
+    Leaving,
+    /// The relay refuses this key.
+    Refused,
+    /// The peer broke the protocol.
+    Protocol,
+    Other(u8),
+}
+
+impl Reason {
+    fn byte(self) -> u8 {
+        match self {
+            Self::Version => 1,
+            Self::Full => 2,
+            Self::Leaving => 3,
+            Self::Refused => 4,
+            Self::Protocol => 5,
+            Self::Other(byte) => byte,
+        }
+    }
+
+    fn from_byte(byte: u8) -> Self {
+        match byte {
+            1 => Self::Version,
+            2 => Self::Full,
+            3 => Self::Leaving,
+            4 => Self::Refused,
+            5 => Self::Protocol,
+            other => Self::Other(other),
+        }
+    }
+}
+
+/// A relay a feeder may dial: where, and the key it must answer with.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RelayAddress {
+    pub key: PublicKey,
+    /// `host:port`.
+    pub address: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Record {
+    /// The initiator's first record: the versions it speaks and what it is.
+    Hello {
+        min_version: u16,
+        max_version: u16,
+        role: Role,
+    },
+    /// The responder's answer: the version both will speak from here on.
+    Welcome {
+        version: u16,
+    },
+    /// A receiver's signed receptions (`batch.rs`). Relays forward it byte for byte.
+    Batch(Batch),
+    /// A receiver's signed description of itself. Sent at start and whenever it changes.
+    ReceiverInfo(ReceiverInfo),
+    Heartbeat,
+    /// "Leave me", from a relay. The relays named are hints; the feeder still chooses by its
+    /// own rules, so a redirect can never steer a feeder somewhere it would not go.
+    Redirect {
+        retry_after_secs: u32,
+        hints: Vec<RelayAddress>,
+    },
+    /// Relays this relay knows of, offered as hints for a feeder's list.
+    RelayList(Vec<RelayAddress>),
+    /// The most the relay wants from this feeder. A feeder may go lower, never higher than its
+    /// owner's own ceiling.
+    RateLimit {
+        bytes_per_sec: u32,
+        burst: u32,
+    },
+    /// The relay is closing the session.
+    Goodbye {
+        reason: Reason,
+        retry_after_secs: u32,
+    },
+}
+
+impl Record {
+    pub fn hello(role: Role) -> Self {
+        Self::Hello {
+            min_version: MIN_VERSION,
+            max_version: MAX_VERSION,
+            role,
+        }
+    }
+
+    fn kind(&self) -> u8 {
+        match self {
+            Self::Hello { .. } => KIND_HELLO,
+            Self::Welcome { .. } => KIND_WELCOME,
+            Self::Batch(_) => KIND_BATCH,
+            Self::ReceiverInfo(_) => KIND_RECEIVER_INFO,
+            Self::Heartbeat => KIND_HEARTBEAT,
+            Self::Redirect { .. } => KIND_REDIRECT,
+            Self::RelayList(_) => KIND_RELAY_LIST,
+            Self::RateLimit { .. } => KIND_RATE_LIMIT,
+            Self::Goodbye { .. } => KIND_GOODBYE,
+        }
+    }
+
+    /// Appends the record to `out`.
+    pub fn encode(&self, out: &mut Vec<u8>) -> Result<(), WireError> {
+        let start = out.len();
+        out.push(self.kind());
+        out.extend_from_slice(&[0, 0]);
+        match self {
+            Self::Hello {
+                min_version,
+                max_version,
+                role,
+            } => {
+                out.extend_from_slice(&min_version.to_be_bytes());
+                out.extend_from_slice(&max_version.to_be_bytes());
+                out.push(role.byte());
+            }
+            Self::Welcome { version } => out.extend_from_slice(&version.to_be_bytes()),
+            Self::Batch(batch) => out.extend_from_slice(batch.as_bytes()),
+            Self::ReceiverInfo(info) => out.extend_from_slice(info.as_bytes()),
+            Self::Heartbeat => {}
+            Self::Redirect {
+                retry_after_secs,
+                hints,
+            } => {
+                out.extend_from_slice(&retry_after_secs.to_be_bytes());
+                encode_relays(hints, out)?;
+            }
+            Self::RelayList(relays) => encode_relays(relays, out)?,
+            Self::RateLimit {
+                bytes_per_sec,
+                burst,
+            } => {
+                out.extend_from_slice(&bytes_per_sec.to_be_bytes());
+                out.extend_from_slice(&burst.to_be_bytes());
+            }
+            Self::Goodbye {
+                reason,
+                retry_after_secs,
+            } => {
+                out.push(reason.byte());
+                out.extend_from_slice(&retry_after_secs.to_be_bytes());
+            }
+        }
+        let body = out.len() - start - HEADER_LEN;
+        let length = u16::try_from(body).map_err(|_| WireError::Oversize(body))?;
+        out[start + 1..start + HEADER_LEN].copy_from_slice(&length.to_be_bytes());
+        Ok(())
+    }
+
+    /// Decodes every record in one message's plaintext. Unknown non-critical kinds are skipped
+    /// and counted in the return value.
+    pub fn decode_message(mut bytes: &[u8], out: &mut Vec<Record>) -> Result<usize, WireError> {
+        let mut skipped = 0;
+        while !bytes.is_empty() {
+            let (record, used) = Self::decode(bytes)?;
+            match record {
+                Some(record) => out.push(record),
+                None => skipped += 1,
+            }
+            bytes = &bytes[used..];
+        }
+        Ok(skipped)
+    }
+
+    /// Decodes one record from the front of `bytes`: `None` for a kind this build does not know
+    /// and may skip.
+    pub fn decode(bytes: &[u8]) -> Result<(Option<Record>, usize), WireError> {
+        let header = take(bytes, 0, HEADER_LEN)?;
+        let kind = header[0];
+        let length = usize::from(u16::from_be_bytes([header[1], header[2]]));
+        let body = take(bytes, HEADER_LEN, length)?;
+        let mut reader = Body::new(body);
+        let record = match kind {
+            KIND_HELLO => Self::Hello {
+                min_version: reader.u16()?,
+                max_version: reader.u16()?,
+                role: Role::from_byte(reader.u8()?),
+            },
+            KIND_WELCOME => Self::Welcome {
+                version: reader.u16()?,
+            },
+            KIND_BATCH => Self::Batch(Batch::from_bytes(body.to_vec())?),
+            KIND_RECEIVER_INFO => Self::ReceiverInfo(ReceiverInfo::from_bytes(body.to_vec())?),
+            KIND_HEARTBEAT => Self::Heartbeat,
+            KIND_REDIRECT => Self::Redirect {
+                retry_after_secs: reader.u32()?,
+                hints: decode_relays(&mut reader)?,
+            },
+            KIND_RELAY_LIST => Self::RelayList(decode_relays(&mut reader)?),
+            KIND_RATE_LIMIT => Self::RateLimit {
+                bytes_per_sec: reader.u32()?,
+                burst: reader.u32()?,
+            },
+            KIND_GOODBYE => Self::Goodbye {
+                reason: Reason::from_byte(reader.u8()?),
+                retry_after_secs: reader.u32()?,
+            },
+            critical if critical & CRITICAL != 0 => return Err(WireError::UnknownCritical(kind)),
+            _ => return Ok((None, HEADER_LEN + length)),
+        };
+        Ok((Some(record), HEADER_LEN + length))
+    }
+}
+
+fn encode_relays(relays: &[RelayAddress], out: &mut Vec<u8>) -> Result<(), WireError> {
+    let count = u8::try_from(relays.len()).map_err(|_| WireError::Oversize(relays.len()))?;
+    out.push(count);
+    for relay in relays {
+        out.extend_from_slice(relay.key.as_bytes());
+        let address = relay.address.as_bytes();
+        let length = u8::try_from(address.len()).map_err(|_| WireError::Oversize(address.len()))?;
+        out.push(length);
+        out.extend_from_slice(address);
+    }
+    Ok(())
+}
+
+fn decode_relays(reader: &mut Body<'_>) -> Result<Vec<RelayAddress>, WireError> {
+    let count = reader.u8()?;
+    (0..count)
+        .map(|_| {
+            let key = PublicKey::from_slice(reader.bytes(KEY_LEN)?)?;
+            let length = usize::from(reader.u8()?);
+            let address = std::str::from_utf8(reader.bytes(length)?)
+                .map_err(|_| WireError::Invalid {
+                    field: "relay address",
+                    value: length as u64,
+                })?
+                .to_owned();
+            Ok(RelayAddress { key, address })
+        })
+        .collect()
+}
+
+fn take(bytes: &[u8], at: usize, len: usize) -> Result<&[u8], WireError> {
+    bytes.get(at..at + len).ok_or(WireError::Truncated {
+        needed: at + len,
+        had: bytes.len(),
+    })
+}
+
+/// Reads fields from the front of a body. What is left after the known fields is ignored.
+pub(crate) struct Body<'a> {
+    bytes: &'a [u8],
+    at: usize,
+}
+
+impl<'a> Body<'a> {
+    pub(crate) fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, at: 0 }
+    }
+
+    pub(crate) fn bytes(&mut self, len: usize) -> Result<&'a [u8], WireError> {
+        let slice = take(self.bytes, self.at, len)?;
+        self.at += len;
+        Ok(slice)
+    }
+
+    pub(crate) fn array<const N: usize>(&mut self) -> Result<[u8; N], WireError> {
+        let mut array = [0; N];
+        array.copy_from_slice(self.bytes(N)?);
+        Ok(array)
+    }
+
+    pub(crate) fn u8(&mut self) -> Result<u8, WireError> {
+        Ok(self.array::<1>()?[0])
+    }
+
+    pub(crate) fn u16(&mut self) -> Result<u16, WireError> {
+        Ok(u16::from_be_bytes(self.array()?))
+    }
+
+    pub(crate) fn u32(&mut self) -> Result<u32, WireError> {
+        Ok(u32::from_be_bytes(self.array()?))
+    }
+
+    pub(crate) fn i32(&mut self) -> Result<i32, WireError> {
+        Ok(i32::from_be_bytes(self.array()?))
+    }
+
+    pub(crate) fn u64(&mut self) -> Result<u64, WireError> {
+        Ok(u64::from_be_bytes(self.array()?))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::key::Identity;
+
+    fn relay(port: u16) -> Result<RelayAddress, WireError> {
+        Ok(RelayAddress {
+            key: Identity::generate()?.public(),
+            address: format!("relay.example:{port}"),
+        })
+    }
+
+    fn every_record() -> Result<Vec<Record>, WireError> {
+        Ok(vec![
+            Record::hello(Role::Feeder),
+            Record::Hello {
+                min_version: 1,
+                max_version: 9,
+                role: Role::Other(42),
+            },
+            Record::Welcome { version: 1 },
+            Record::Heartbeat,
+            Record::Redirect {
+                retry_after_secs: 30,
+                hints: vec![relay(1)?, relay(2)?],
+            },
+            Record::RelayList(vec![relay(3)?]),
+            Record::RelayList(Vec::new()),
+            Record::RateLimit {
+                bytes_per_sec: 64_000,
+                burst: 128_000,
+            },
+            Record::Goodbye {
+                reason: Reason::Full,
+                retry_after_secs: 600,
+            },
+            Record::Goodbye {
+                reason: Reason::Other(200),
+                retry_after_secs: 0,
+            },
+        ])
+    }
+
+    #[test]
+    fn every_record_kind_round_trips_in_one_message() -> Result<(), WireError> {
+        let records = every_record()?;
+        let mut message = Vec::new();
+        for record in &records {
+            record.encode(&mut message)?;
+        }
+        let mut back = Vec::new();
+        assert_eq!(Record::decode_message(&message, &mut back)?, 0);
+        assert_eq!(back, records);
+        Ok(())
+    }
+
+    #[test]
+    fn an_unknown_kind_is_skipped_and_the_rest_still_decode() -> Result<(), WireError> {
+        let mut message = vec![0x7f, 0, 2, 9, 9];
+        Record::Heartbeat.encode(&mut message)?;
+        let mut back = Vec::new();
+        assert_eq!(Record::decode_message(&message, &mut back)?, 1);
+        assert_eq!(back, vec![Record::Heartbeat]);
+        Ok(())
+    }
+
+    #[test]
+    fn an_unknown_critical_kind_ends_the_session() {
+        assert!(matches!(
+            Record::decode_message(&[CRITICAL | 0x7f, 0, 0], &mut Vec::new()),
+            Err(WireError::UnknownCritical(_))
+        ));
+    }
+
+    #[test]
+    fn a_field_appended_by_a_later_version_is_ignored() -> Result<(), WireError> {
+        let mut message = Vec::new();
+        Record::Welcome { version: 1 }.encode(&mut message)?;
+        message[2] += 3;
+        message.extend_from_slice(&[1, 2, 3]);
+        let mut back = Vec::new();
+        Record::decode_message(&message, &mut back)?;
+        assert_eq!(back, vec![Record::Welcome { version: 1 }]);
+        Ok(())
+    }
+
+    #[test]
+    fn a_message_ending_mid_record_is_an_error() -> Result<(), WireError> {
+        let mut message = Vec::new();
+        Record::hello(Role::Subscriber).encode(&mut message)?;
+        message.pop();
+        assert!(matches!(
+            Record::decode_message(&message, &mut Vec::new()),
+            Err(WireError::Truncated { .. })
+        ));
+        Ok(())
+    }
+}
