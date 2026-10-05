@@ -20,6 +20,9 @@ pub const BATCH_FORMAT: u8 = 1;
 pub const RECEIVER_INFO_FORMAT: u8 = 1;
 
 const BATCH_DOMAIN: &[u8] = b"tally batch";
+/// What a relay signs its own deduplicated stream under. A separate domain, so a relay's batch can
+/// never verify as a receiver's: the signature, not the record kind, says who claims what.
+const RELAY_BATCH_DOMAIN: &[u8] = b"tally relay batch";
 const RECEIVER_INFO_DOMAIN: &[u8] = b"tally receiver";
 
 /// Format, key, boot id, sequence: the part of a batch fixed across every format version.
@@ -27,6 +30,22 @@ const BATCH_PREFIX_LEN: usize = 1 + KEY_LEN + 8 + 8;
 const INFO_PREFIX_LEN: usize = 1 + KEY_LEN;
 
 pub type Hash = [u8; 32];
+
+/// What an `Observation`'s bytes are. The 1090 MHz forms are BEAST's own type bytes, so a BEAST
+/// frame converts without a table; a reader forwards a format it does not know untouched.
+pub mod format {
+    /// Mode A/C, 2 bytes.
+    pub const MODE_AC: u8 = b'1';
+    /// Mode-S short, 7 bytes.
+    pub const MODE_S_SHORT: u8 = b'2';
+    /// Mode-S long (ADS-B extended squitter among them), 14 bytes.
+    pub const MODE_S_LONG: u8 = b'3';
+    /// A 978 MHz UAT downlink from an aircraft, 18 (basic) or 34 (long) bytes. Its timestamp is
+    /// the receiver's wall clock in microseconds, modulo 2^48, as dump978 reports it.
+    pub const UAT_DOWNLINK: u8 = b'D';
+    /// A 978 MHz UAT ground uplink (FIS-B weather, TIS-B), 432 bytes, timestamped as a downlink.
+    pub const UAT_UPLINK: u8 = b'U';
+}
 
 /// What a receiver's decoder emitted for one reception, unchanged.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -111,7 +130,21 @@ pub struct Batch {
 }
 
 impl Batch {
+    /// A receiver's batch of its own receptions.
     pub fn sign(identity: &Identity, content: &BatchContent) -> Result<Self, WireError> {
+        Self::sign_in(BATCH_DOMAIN, identity, content)
+    }
+
+    /// A relay's batch of its deduplicated stream (`Record::RelayBatch`).
+    pub fn sign_as_relay(identity: &Identity, content: &BatchContent) -> Result<Self, WireError> {
+        Self::sign_in(RELAY_BATCH_DOMAIN, identity, content)
+    }
+
+    fn sign_in(
+        label: &[u8],
+        identity: &Identity,
+        content: &BatchContent,
+    ) -> Result<Self, WireError> {
         let mut bytes = Vec::new();
         bytes.push(BATCH_FORMAT);
         bytes.extend_from_slice(identity.public().as_bytes());
@@ -127,7 +160,7 @@ impl Batch {
         for observation in &content.observations {
             observation.encode(&mut bytes)?;
         }
-        let signature = identity.sign(&domain(BATCH_DOMAIN, &bytes));
+        let signature = identity.sign(&domain(label, &bytes));
         bytes.extend_from_slice(&signature);
         Ok(Self { bytes })
     }
@@ -169,10 +202,19 @@ impl Batch {
         Blake2s256::digest(&self.bytes).into()
     }
 
+    /// True when the receiver it names signed it as its own receptions.
     pub fn verify(&self) -> Result<(), WireError> {
+        self.verify_in(BATCH_DOMAIN)
+    }
+
+    /// True when the relay it names signed it as its deduplicated stream.
+    pub fn verify_as_relay(&self) -> Result<(), WireError> {
+        self.verify_in(RELAY_BATCH_DOMAIN)
+    }
+
+    fn verify_in(&self, label: &[u8]) -> Result<(), WireError> {
         let (signed, signature) = split_signature(&self.bytes)?;
-        self.receiver()?
-            .verify(&domain(BATCH_DOMAIN, signed), &signature)
+        self.receiver()?.verify(&domain(label, signed), &signature)
     }
 
     /// The content, for a format this build reads.
@@ -392,7 +434,7 @@ impl ReceiverInfo {
     }
 }
 
-fn domain(label: &[u8], signed: &[u8]) -> Vec<u8> {
+pub(crate) fn domain(label: &[u8], signed: &[u8]) -> Vec<u8> {
     let mut message = Vec::with_capacity(label.len() + 1 + signed.len());
     message.extend_from_slice(label);
     message.push(0);
@@ -400,7 +442,7 @@ fn domain(label: &[u8], signed: &[u8]) -> Vec<u8> {
     message
 }
 
-fn split_signature(bytes: &[u8]) -> Result<(&[u8], [u8; SIGNATURE_LEN]), WireError> {
+pub(crate) fn split_signature(bytes: &[u8]) -> Result<(&[u8], [u8; SIGNATURE_LEN]), WireError> {
     let at = bytes
         .len()
         .checked_sub(SIGNATURE_LEN)
@@ -413,7 +455,7 @@ fn split_signature(bytes: &[u8]) -> Result<(&[u8], [u8; SIGNATURE_LEN]), WireErr
     Ok((&bytes[..at], signature))
 }
 
-fn u64_at(bytes: &[u8], at: usize) -> u64 {
+pub(crate) fn u64_at(bytes: &[u8], at: usize) -> u64 {
     let mut array = [0; 8];
     array.copy_from_slice(&bytes[at..at + 8]);
     u64::from_be_bytes(array)
@@ -473,6 +515,17 @@ mod tests {
                 "byte {at}"
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn a_relay_batch_never_verifies_as_a_receivers_and_back() -> Result<(), WireError> {
+        let relay = Identity::generate()?;
+        let derived = Batch::sign_as_relay(&relay, &content()?)?;
+        derived.verify_as_relay()?;
+        assert!(derived.verify().is_err());
+        let own = Batch::sign(&relay, &content()?)?;
+        assert!(own.verify_as_relay().is_err());
         Ok(())
     }
 

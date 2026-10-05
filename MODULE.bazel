@@ -10,6 +10,8 @@ bazel_dep(name = "rules_rust", version = "0.74.0")
 rust = use_extension("@rules_rust//rust:extensions.bzl", "rust")
 rust.toolchain(
     edition = "2024",
+    # A feeder runs on a Raspberry Pi: aarch64 is a release target beside the host's.
+    extra_target_triples = ["aarch64-unknown-linux-gnu"],
     versions = ["1.96.0"],
 )
 use_repo(rust, "rust_toolchains")
@@ -54,7 +56,12 @@ http_archive(
 )
 
 llvm = use_extension("@toolchains_llvm//toolchain/extensions:llvm.bzl", "llvm")
-llvm.toolchain(llvm_version = "22.1.8")
+llvm.toolchain(
+    llvm_version = "22.1.8",
+    # The aarch64 sysroot carries only a shared libstdc++. Tally is Rust and uses no C++, so with
+    # --as-needed the binaries do not end up depending on it.
+    stdlib = {"linux-aarch64": "dynamic-stdc++"},
+)
 llvm.sysroot(
     name = "llvm_toolchain",
     label = "@sysroot_linux_x86_64//:sysroot",

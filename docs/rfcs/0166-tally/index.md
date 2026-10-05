@@ -159,6 +159,11 @@ sent back (readsb re-emits them with the counter `0xFF004D4C4154`), and a stream
 than one receiver in `0xe3` receiver-id frames (an aggregate; the feeder refuses to publish it
 under one key).
 
+A second, optional source is 978 MHz UAT from dump978-fa's raw output (port 30978), where most
+small US aircraft below 18,000 ft broadcast. Its receptions go into the same signed chain as
+1090's (formats `D` and `U`, timestamped with dump978's wall clock in microseconds), and a UAT
+reconnect does not start a new 1090 counter epoch.
+
 Version 1 carries, and freezes:
 
 - the signed, numbered, chained batches of §3.1 and a signed `ReceiverInfo` listing the relays it
@@ -169,7 +174,15 @@ Version 1 carries, and freezes:
 - obeying `Redirect`, `RateLimit` and `Goodbye`, with exponential backoff and jitter that a relay
   can lengthen and never shorten, so a relay restart is not 20,000 boxes reconnecting at once;
 - during an outage, retrying the anchor rather than rushing to fresh relays, the classic eclipse
-  path;
+  path, within fixed bounds: a random slot gives up a relay it has not reached (no session got to
+  `Welcome`) for an hour, the anchor after seven days (when it was last reached is kept with it,
+  across restarts), and the home relay never;
+- every send with a deadline (30 s), and a session that ends at once on its reader's failure
+  even while a send is pending, so a relay that wedges cannot hold a slot;
+- relays a relay suggests weighed as one source each when it picks (capped per source and in
+  total), and never two relays on the same host, so one relay's hints cannot fill its set;
+- the owner's ceiling enforced once, in the batcher; a relay that asks for less (`RateLimit`) is
+  sent fewer batches, alone;
 - a hard upload ceiling (a token bucket that drops, never a buffer), counted in each batch;
 - the owner's location exactly as entered, with a precision field the owner may set to round it
   (§8.3), a periodic wall-clock sample and its clock class.
@@ -191,6 +204,15 @@ signature, drops duplicates by hash, and forwards. It decodes no frame. It serve
    20,000 receivers, against roughly 1 to 2 Gbps of raw receptions.
 3. **MLAT results:** positions published by MLAT engines (§3.8), signed by the engine.
 
+A subscriber chooses with `Subscribe { streams, regions }`, which it may send at any time and which
+replaces the last one; before any, it gets raw batches for the whole world. Regions are H3 cells of
+any resolution (`wire::region`, the one place that says whether a receiver is inside one), matched
+against the location in the receiver's newest signed `ReceiverInfo`; a receiver with no location
+reaches only whole-world subscriptions. In wire version 1 the deduplicated stream is whole-world
+only: it mixes every receiver, so it is not cut by region. A relay derives its own deduplicated
+stream and never forwards another relay's; positions travel between relays like batches, verified
+and forwarded once by hash.
+
 Relays form a tree: regional relays pass their region up to a few top relays that hold the world,
 and a whole-world consumer subscribes once to a top relay. Each relay caps how many full-world
 downstreams it serves; beyond the cap it redirects, so a heavy consumer runs its own relay and
@@ -199,6 +221,22 @@ only its server; what it sends out is its own budget to set.
 
 A slow subscriber is dropped, never waited for: per subscriber a bounded queue, and a full queue
 disconnects it (readsb's keep-latest rule, RFC-0119 §3.3).
+
+What a relay holds is bounded, and what it trusts is narrow, because keys cost nothing to make:
+
+- A peer may claim the relay role only if the operator accepted its key (`--accept-relay`);
+  any other key claiming it is refused. Accepted relays carry whole regions and are not held to
+  a feeder's intake ceiling; every other inbound peer is (`--max-feeder-bytes-per-sec`, 256 KiB/s
+  by default), and connections are capped (`--max-connections`).
+- A batch is forwarded once: new by hash, and with a sequence above the highest already forwarded
+  for that receiver's boot, less a small reorder allowance, so a signed batch replayed after its
+  hash is forgotten is still refused. Positions follow the same rule per engine boot. The table of
+  streams is capped and forgets the least recently active (a stream's activity is a forwarded
+  batch), so a flood of new streams pushes out its own oldest first.
+- Receiver descriptions are capped and forget the receiver least recently active; a subscription names at
+  most 64 regions; a `Subscribe` sent with `Hello` decides the first byte a subscriber receives.
+- A relay signs its deduplicated stream under its own signature domain, so a relay's batch can
+  never verify as a receiver's.
 
 ### §3.7 Discovery is peer to peer, and the feeder holds the rules
 
@@ -238,6 +276,17 @@ identities used.
   receiver, never as independent noise per observation.
 - Consumers trust a target confirmed by receivers in separate places more than one heard once.
 
+The first engine, `tally-mlat`, runs no solver of its own. It bridges Tally to an unmodified
+mlat-server (wiedehopf's, the one the open aggregators run) by speaking mlat-client's protocol to
+it on behalf of each receiver in its regions: one session per receiver with an exact location and
+a known clock, the handshake mlat-client sends, the sync and mlat messages mlat-client's selection
+logic would send, and the positions the server returns on those sessions, signed as `Positions`
+and published back through the relay. Because Tally delivers a receiver's receptions in batches
+of about a second and the server groups copies of one message only within 0.9 s, the engine replays
+every receiver on one timeline, a fixed delay (2 s by default) behind each reception's estimated
+time. Whether that grouping holds across many real receivers, and what delay it needs, only a run
+against a real server shows.
+
 ### §3.9 Our own use, and the production rule
 
 We run our own relays (top relays, on our hardware), and our boxes' feeders pin them as home. The
@@ -270,7 +319,20 @@ what a receiver signed. It does not guarantee completeness or truth. A relay can
 multi-relay rule and sequence gaps bound and expose it); a receiver with a real antenna can report
 lies (corroboration across separate receivers bounds it, and an area covered by one receiver
 cannot be checked without outside data). A well-funded attacker can make some feeders' data go
-missing for a while before it is caught. That is accepted (§8.1). RFC-0119 §4's ceiling on what
+missing for a while before it is caught. That is accepted (§8.1).
+
+The residuals two adversarial sweeps left on purpose, each bounded and none able to forge data:
+one operator running relays under many host names passes the feeder's distinct-host rule (it
+compares names, not networks, since a feeder resolves nothing it need not); each hostile relay a
+feeder reaches counts as one more source in its pick, so reaching many dilutes the honest share;
+throwaway keys that keep publishing real-looking batches can occupy relay intake and an MLAT
+engine's receiver slots, within the per-address, per-feeder and per-engine caps; and because a
+feeder may publish only its own batches, replaying another receiver's old batch into a relay
+needs a peer that relay's operator accepted (an accepted relay or an upstream link), and then
+succeeds only once that relay has forgotten the stream, which it does least recently active
+first, so a receiver that keeps publishing is the last a flood can push out. The stronger
+defences of §3.7 (standing by map cell, delivery receipts) are the answer if any becomes an
+attack, and the feeder already carries what they need. RFC-0119 §4's ceiling on what
 Flightlines trusts ADS-B to mean is unchanged.
 
 ## §5 Bandwidth and cost (estimates until step 4 measures them)
@@ -363,7 +425,16 @@ roughly $200 to $700 a month on budget hosting; today it is one server.
    signed and unchanged and the loopback BEAST output decoded and unchanged; a feeder publishing
    another receiver's batch is cut off and nothing in that name is forwarded; a batch arriving by
    two relays is forwarded once; a stalled subscriber is dropped while another keeps every batch.
-5. **On our hardware.** Our relays, one feeder per box on the master, the consumer readsb moved to
-   our relay. Verified by the consumer's own counters and the live map; bandwidth measured.
-6. **Public launch.** Static aarch64 and x86_64 builds, the installer, the adsb.im pull request.
-7. **MLAT engines**, then **978 MHz**, then **the Bridge as a receiver** (its own RFC).
+5. **On our hardware.** `infra/prod-host/tally`: our relay on loopback, one feeder per box in the
+   feeder roster, the consumer readsb moved to the relay's output, every Tally process on
+   loopback by the egress policy. Verified by the consumer's own counters; bandwidth measured.
+6. **Public launch.** Built: aarch64 and x86_64 binaries against the pinned sysroot (glibc 2.25 or
+   newer, no C++ runtime; the aarch64 build is checked as an ELF but has not yet run on a Pi), the
+   systemd units and the one-line installer (`tally/packaging`). Owed: a public relay on a host
+   with a public address, seeds from more than one operator, release builds published to
+   `flightlines/tally`, and the adsb.im pull request.
+7. **Streams, engines and 978 MHz.** Built: subscriptions by region, the relay-signed deduplicated
+   stream, engines publishing positions, peer exchange and redirects at capacity; `tally-mlat`
+   over mlat-server; the feeder's 978 MHz input from dump978-fa, in the same signed chain as
+   1090. Owed: a run against a real mlat-server with real receivers. Then **the Bridge as a
+   receiver** (its own RFC).

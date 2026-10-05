@@ -5,6 +5,7 @@
 pub mod config;
 pub mod relays;
 pub mod source;
+pub mod uat;
 
 use std::sync::Arc;
 
@@ -65,6 +66,7 @@ pub async fn run(config: Config) -> Result<(), String> {
     let directory = Directory::new(
         config.state_dir.clone(),
         config.relays.clone(),
+        config.seeds.clone(),
         config.relay_count,
         identity.clone(),
         config.location,
@@ -74,11 +76,23 @@ pub async fn run(config: Config) -> Result<(), String> {
     if let Some(home) = config.home.clone() {
         kinds.push((SlotKind::Home, Some(home)));
     }
-    kinds.push((SlotKind::Anchor, directory.saved_anchor()));
+    // An anchor is never the home relay's own machine: two slots on one host are one network.
+    let anchor = directory.saved_anchor().filter(|anchor| {
+        config
+            .home
+            .as_ref()
+            .is_none_or(|home| !relays::same_host(home, anchor))
+    });
+    kinds.push((SlotKind::Anchor, anchor));
     while kinds.len() < config.relay_count {
         kinds.push((SlotKind::Random, None));
     }
     kinds.truncate(config.relay_count);
+    // The owner's and the saved relays are held before any slot picks, so none picks their host.
+    for (index, (_, relay)) in kinds.iter().enumerate() {
+        directory.hold(index, relay.as_ref());
+    }
+    tokio::spawn(relays::keep_saved(Arc::clone(&directory)));
     for (index, (kind, relay)) in kinds.into_iter().enumerate() {
         tokio::spawn(relays::slot(
             index,
@@ -90,9 +104,15 @@ pub async fn run(config: Config) -> Result<(), String> {
             config.ceiling,
         ));
     }
-    source::run(
-        config.source,
-        Batcher::new(identity, config.ceiling),
+    let (inputs, intake) = source::channel();
+    tokio::spawn(source::read_beast(config.source, inputs.clone()));
+    if let Some(uat) = config.uat {
+        tokio::spawn(source::read_uat(uat, inputs.clone()));
+    }
+    drop(inputs);
+    source::batch(
+        Batcher::new(identity, config.ceiling, config.clock),
+        intake,
         batches,
     )
     .await;

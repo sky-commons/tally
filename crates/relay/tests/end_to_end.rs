@@ -1,6 +1,11 @@
 //! A receiver's frames, end to end, over real sockets: a stand-in readsb serving BEAST, a real
 //! feeder reading it, a real relay, and subscribers on both of the relay's outputs (RFC-0166 §10
-//! steps 3 and 4).
+//! steps 3 and 4); then the relay's streams, regions, engines and redirects (§3.6 to §3.8).
+//!
+//! Nothing here is timed. A test waits for what it is looking for, and the test runner's own
+//! deadline is what fails one that never comes. That something did *not* happen is shown by order,
+//! not by waiting a while: the relay's fan-out is in order, so a sentinel published after the
+//! event is heard after anything the event let through.
 
 use std::collections::HashSet;
 use std::net::SocketAddr;
@@ -10,18 +15,18 @@ use std::time::Duration;
 use tally_feed::config::Config;
 use tally_relay::hub::Hub;
 use tally_relay::link;
+use tally_wire::batch::ReceiverInfoContent;
 use tally_wire::beast::Decoder;
 use tally_wire::noise::{self, Session};
 use tally_wire::{
-    Batch, BatchContent, Clock, Frame, FrameKind, Identity, Location, Record, RelayAddress, Role,
+    Batch, BatchContent, Clock, Frame, FrameKind, Identity, Location, Observation, Position,
+    Positions, PositionsContent, PublicKey, ReceiverInfo, Record, Region, RelayAddress, Role,
+    Streams,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::time::timeout;
 
 type Result<T = ()> = std::result::Result<T, String>;
-
-const WAIT: Duration = Duration::from_secs(20);
 
 fn text(error: impl std::fmt::Display) -> String {
     error.to_string()
@@ -131,10 +136,12 @@ async fn a_receivers_frames_reach_both_outputs_signed_and_unchanged() -> Result 
     tokio::spawn(tally_feed::run(Config {
         key_file,
         source: source.to_string(),
+        uat: None,
         relays: vec![RelayAddress {
             key: relay.key,
             address: relay.address.to_string(),
         }],
+        seeds: Vec::new(),
         home: None,
         relay_count: 1,
         state_dir: dir.clone(),
@@ -146,7 +153,7 @@ async fn a_receivers_frames_reach_both_outputs_signed_and_unchanged() -> Result 
     // The subscriber gets the receiver's signed description and its batches, verified.
     let mut heard = Vec::new();
     let mut described = false;
-    timeout(WAIT, async {
+    {
         let mut records = Vec::new();
         while heard.len() < sent.len() {
             records.clear();
@@ -169,10 +176,7 @@ async fn a_receivers_frames_reach_both_outputs_signed_and_unchanged() -> Result 
                 }
             }
         }
-        Ok::<_, String>(())
-    })
-    .await
-    .map_err(|_| format!("only {} of {} frames arrived", heard.len(), sent.len()))??;
+    }
     assert_eq!(heard, sent);
     assert!(described, "no receiver info arrived");
 
@@ -180,18 +184,17 @@ async fn a_receivers_frames_reach_both_outputs_signed_and_unchanged() -> Result 
     let mut decoder = Decoder::new();
     let mut decoded = Vec::new();
     let mut buffer = vec![0; 64 * 1024];
-    timeout(WAIT, async {
-        while decoded.len() < sent.len() {
-            let length = beast.read(&mut buffer).await.map_err(text)?;
-            if length == 0 {
-                return Err("beast-out closed".to_owned());
-            }
-            decoder.push(&buffer[..length], |frame| decoded.push(frame));
+    while decoded.len() < sent.len() {
+        let length = beast.read(&mut buffer).await.map_err(text)?;
+        if length == 0 {
+            return Err(format!(
+                "beast-out closed after {} of {} frames",
+                decoded.len(),
+                sent.len()
+            ));
         }
-        Ok(())
-    })
-    .await
-    .map_err(|_| format!("beast-out gave {} of {} frames", decoded.len(), sent.len()))??;
+        decoder.push(&buffer[..length], |frame| decoded.push(frame));
+    }
     assert_eq!(decoded, sent);
 
     // The feeder remembered the relay it anchored to.
@@ -237,82 +240,53 @@ async fn a_feeder_publishing_someone_elses_batch_is_cut_off_and_nothing_is_forwa
         .await
         .map_err(text)?;
     // The relay ends the session: the impostor's reads fail once what was in flight is read.
-    let ended = timeout(WAIT, async {
-        let mut records = Vec::new();
-        while session.reader.recv(&mut records).await.is_ok() {}
-    })
-    .await;
-    assert!(ended.is_ok(), "the relay kept the session");
-    // The subscriber saw the impostor's own batch, signed by it, and nothing in the victim's name.
-    let mut seen = Vec::new();
-    timeout(Duration::from_secs(2), async {
-        loop {
-            let mut got = Vec::new();
-            if subscriber.reader.recv(&mut got).await.is_err() {
-                return;
-            }
-            seen.extend(got.into_iter().filter_map(|record| match record {
-                Record::Batch(batch) => Some(batch),
-                _ => None,
-            }));
-        }
-    })
-    .await
-    .ok();
-    assert_eq!(seen, vec![honest]);
+    ended(&mut session).await;
+    // The subscriber saw the impostor's own batch, signed by it, and nothing in the victim's name
+    // before a batch published after the session ended.
+    let (_later, last) = sentinel(&relay).await?;
+    let seen = batches_until(&mut subscriber, &last).await?;
+    assert_eq!(seen, vec![honest, last]);
     Ok(())
 }
 
 #[tokio::test]
 async fn a_batch_arriving_twice_is_forwarded_once() -> Result {
-    let relay = relay(Hub::new(8)).await?;
+    let relays = [
+        Identity::generate().map_err(text)?,
+        Identity::generate().map_err(text)?,
+    ];
+    let relay = relay(Hub::new(8).accepting_relays(relays.iter().map(Identity::public))).await?;
     let mut subscriber = subscribe(&relay).await?;
     let receiver = Identity::generate().map_err(text)?;
     let once = batch(&receiver, 0)?;
-    // Two relays forwarding the same batch: two Relay-role sessions publishing it.
-    for _ in 0..2 {
-        let stream = TcpStream::connect(relay.address).await.map_err(text)?;
-        let mut session = noise::connect(
-            stream,
-            &Identity::generate().map_err(text)?,
-            &relay.key,
-            Role::Relay,
-        )
-        .await
-        .map_err(text)?;
+    let next = batch(&receiver, 1)?;
+    // Two relays forwarding the same batch: two Relay-role sessions publishing it, the second once
+    // the first's copy is through, and the second following it with the receiver's next batch.
+    let mut sessions = Vec::new();
+    let mut heard = Vec::new();
+    for (relay_identity, sent) in relays
+        .iter()
+        .zip([vec![once.clone()], vec![once.clone(), next.clone()]])
+    {
+        let mut session = connect(&relay, relay_identity, Role::Relay).await?;
+        let last = sent.last().cloned().ok_or("nothing to send")?;
         session
             .writer
-            .send(&[Record::Batch(once.clone())])
+            .send(&sent.into_iter().map(Record::Batch).collect::<Vec<_>>())
             .await
             .map_err(text)?;
-        std::mem::forget(session);
+        heard.extend(batches_until(&mut subscriber, &last).await?);
+        sessions.push(session);
     }
-    let mut hashes = HashSet::new();
-    let mut count = 0;
-    timeout(Duration::from_secs(2), async {
-        loop {
-            let mut got = Vec::new();
-            if subscriber.reader.recv(&mut got).await.is_err() {
-                return;
-            }
-            for record in got {
-                if let Record::Batch(batch) = record {
-                    count += 1;
-                    hashes.insert(batch.hash());
-                }
-            }
-        }
-    })
-    .await
-    .ok();
-    assert_eq!((count, hashes.len()), (1, 1));
+    assert_eq!(heard, vec![once, next]);
     Ok(())
 }
 
 #[tokio::test]
 async fn a_stalled_subscriber_is_dropped_and_the_others_keep_every_batch() -> Result {
-    // A small fan-out slack, so a subscriber that stops reading falls behind quickly.
-    let relay = relay(Hub::with_capacity(8, 16)).await?;
+    // A small fan-out slack, so a subscriber that stops reading falls behind quickly, and an
+    // ingest ceiling far above the flood this feeder sends to make that happen.
+    let relay = relay(Hub::with_capacity(8, 16).max_feeder_bytes_per_sec(1 << 30)).await?;
     let mut fast = subscribe(&relay).await?;
     let stalled = subscribe(&relay).await?;
     let receiver = Identity::generate().map_err(text)?;
@@ -326,6 +300,7 @@ async fn a_stalled_subscriber_is_dropped_and_the_others_keep_every_batch() -> Re
         .map(tally_wire::Observation::from_beast)
         .collect();
     let total = 400u64;
+    let (heard, mut done) = tokio::sync::mpsc::channel::<()>(1);
     let sending = tokio::spawn(async move {
         for sequence in 0..total {
             let signed = Batch::sign(
@@ -346,50 +321,792 @@ async fn a_stalled_subscriber_is_dropped_and_the_others_keep_every_batch() -> Re
                 .send(&[Record::Batch(signed)])
                 .await
                 .map_err(text)?;
-            // Paced so the reading subscriber keeps up and only the stalled one falls behind.
-            tokio::time::sleep(Duration::from_millis(2)).await;
+            // In step with the reading subscriber, so only the stalled one falls behind.
+            if done.recv().await.is_none() {
+                return Err("the reading subscriber stopped".to_owned());
+            }
         }
         Ok::<_, String>(feeder)
     });
     let mut sequences = Vec::new();
-    timeout(Duration::from_secs(60), async {
-        while sequences.len() < usize::try_from(total).unwrap_or(usize::MAX) {
-            let mut got = Vec::new();
-            fast.reader.recv(&mut got).await.map_err(text)?;
-            sequences.extend(got.into_iter().filter_map(|record| match record {
-                Record::Batch(batch) => Some(batch.sequence()),
-                _ => None,
-            }));
+    while sequences.len() < usize::try_from(total).unwrap_or(usize::MAX) {
+        let mut got = Vec::new();
+        fast.reader.recv(&mut got).await.map_err(text)?;
+        for record in got {
+            if let Record::Batch(batch) = record {
+                sequences.push(batch.sequence());
+                let _ = heard.send(()).await;
+            }
         }
-        Ok::<_, String>(())
-    })
-    .await
-    .map_err(|_| format!("the fast subscriber got {} of {total}", sequences.len()))??;
+    }
     assert_eq!(sequences, (0..total).collect::<Vec<_>>());
     sending.await.map_err(text)??;
 
     // The stalled one was told it fell behind (or simply cut off) rather than slowing anyone.
     let mut stalled = stalled;
-    let mut ended = false;
-    timeout(Duration::from_secs(20), async {
-        loop {
-            let mut got = Vec::new();
-            match stalled.reader.recv(&mut got).await {
-                Err(_) => break,
-                Ok(())
-                    if got
-                        .iter()
-                        .any(|record| matches!(record, Record::Goodbye { .. })) =>
-                {
-                    break;
+    loop {
+        let mut got = Vec::new();
+        match stalled.reader.recv(&mut got).await {
+            Err(_) => break,
+            Ok(())
+                if got
+                    .iter()
+                    .any(|record| matches!(record, Record::Goodbye { .. })) =>
+            {
+                break;
+            }
+            Ok(()) => {}
+        }
+    }
+    Ok(())
+}
+
+async fn connect(relay: &Relay, identity: &Identity, role: Role) -> Result<Session<TcpStream>> {
+    let stream = TcpStream::connect(relay.address).await.map_err(text)?;
+    noise::connect(stream, identity, &relay.key, role)
+        .await
+        .map_err(text)
+}
+
+/// Reads whole messages until one holds a record `done` accepts; returns every record read.
+async fn until(
+    session: &mut Session<TcpStream>,
+    what: &str,
+    mut done: impl FnMut(&Record) -> bool,
+) -> Result<Vec<Record>> {
+    let mut all = Vec::new();
+    loop {
+        let mut got = Vec::new();
+        session
+            .reader
+            .recv(&mut got)
+            .await
+            .map_err(|error| format!("waiting for {what}: {error}"))?;
+        let found = got.iter().any(&mut done);
+        all.extend(got);
+        if found {
+            return Ok(all);
+        }
+    }
+}
+
+/// Reads until the relay ends the session.
+async fn ended(session: &mut Session<TcpStream>) {
+    let mut records = Vec::new();
+    while session.reader.recv(&mut records).await.is_ok() {
+        records.clear();
+    }
+}
+
+/// A fresh feeder's own batch, published now: anything published before it reaches a subscriber
+/// before it does.
+async fn sentinel(relay: &Relay) -> Result<(Session<TcpStream>, Batch)> {
+    let identity = Identity::generate().map_err(text)?;
+    let mut session = connect(relay, &identity, Role::Feeder).await?;
+    let last = batch(&identity, 0)?;
+    session
+        .writer
+        .send(&[Record::Batch(last.clone())])
+        .await
+        .map_err(text)?;
+    Ok((session, last))
+}
+
+/// Every batch a subscriber is sent, up to and including `last`.
+async fn batches_until(session: &mut Session<TcpStream>, last: &Batch) -> Result<Vec<Batch>> {
+    let heard = until(session, "the last batch", |record| {
+        *record == Record::Batch(last.clone())
+    })
+    .await?;
+    Ok(heard
+        .into_iter()
+        .filter_map(|record| match record {
+            Record::Batch(batch) => Some(batch),
+            _ => None,
+        })
+        .collect())
+}
+
+/// The receiver a batch or description is from.
+fn author(record: &Record) -> Option<PublicKey> {
+    match record {
+        Record::Batch(batch) => batch.receiver().ok(),
+        Record::ReceiverInfo(info) => info.receiver().ok(),
+        _ => None,
+    }
+}
+
+fn describes(record: &Record, receiver: PublicKey) -> bool {
+    matches!(record, Record::ReceiverInfo(_)) && author(record) == Some(receiver)
+}
+
+fn info(identity: &Identity, location: Option<Location>) -> Result<ReceiverInfo> {
+    ReceiverInfo::sign(
+        identity,
+        &ReceiverInfoContent {
+            issued_ms: 1,
+            location,
+            clock: Clock::Dump1090,
+            software: "test".to_owned(),
+            relays: Vec::new(),
+        },
+    )
+    .map_err(text)
+}
+
+/// A feeder session that has published its own description.
+async fn described_feeder(
+    relay: &Relay,
+    identity: &Identity,
+    location: Option<Location>,
+) -> Result<Session<TcpStream>> {
+    let mut session = connect(relay, identity, Role::Feeder).await?;
+    session
+        .writer
+        .send(&[Record::ReceiverInfo(info(identity, location)?)])
+        .await
+        .map_err(text)?;
+    Ok(session)
+}
+
+/// A subscriber whose `Subscribe` the relay has certainly applied: `beacon` is a receiver the
+/// relay knows and the subscription covers, and the relay answers a `Subscribe` by describing the
+/// receivers it covers, so the beacon's description arriving again is the acknowledgement. Also
+/// returns that answer.
+async fn subscribed(
+    relay: &Relay,
+    role: Role,
+    streams: Streams,
+    regions: Vec<Region>,
+    beacon: PublicKey,
+) -> Result<(Session<TcpStream>, Vec<Record>)> {
+    let mut session = connect(relay, &Identity::generate().map_err(text)?, role).await?;
+    until(&mut session, "the beacon", |record| {
+        describes(record, beacon)
+    })
+    .await?;
+    session
+        .writer
+        .send(&[Record::Subscribe { streams, regions }])
+        .await
+        .map_err(text)?;
+    let answer = until(&mut session, "the subscription's answer", |record| {
+        describes(record, beacon)
+    })
+    .await?;
+    Ok((session, answer))
+}
+
+fn at(lat: f64, lon: f64) -> Location {
+    Location {
+        lat_e7: (lat * 1e7) as i32,
+        lon_e7: (lon * 1e7) as i32,
+        alt_m: 0,
+        precision_m: 0,
+    }
+}
+
+#[tokio::test]
+async fn a_regional_subscriber_hears_only_receivers_inside_its_region() -> Result {
+    let relay = relay(Hub::new(8)).await?;
+    let palo_alto = at(37.44, -122.14);
+    let inside = Identity::generate().map_err(text)?;
+    let outside = Identity::generate().map_err(text)?;
+    let nowhere = Identity::generate().map_err(text)?;
+    let mut inside_feed = described_feeder(&relay, &inside, Some(palo_alto)).await?;
+    let mut outside_feed = described_feeder(&relay, &outside, Some(at(51.5, -0.12))).await?;
+    let mut nowhere_feed = connect(&relay, &nowhere, Role::Feeder).await?;
+    // A whole-world subscriber, to know when the relay has taken in what was published.
+    let mut world = subscribe(&relay).await?;
+    let mut described = HashSet::new();
+    until(&mut world, "both descriptions", |record| {
+        if let (Record::ReceiverInfo(_), Some(key)) = (record, author(record)) {
+            described.insert(key);
+        }
+        described.len() == 2
+    })
+    .await?;
+
+    let region = Region::containing(&palo_alto, 3).map_err(text)?;
+    let (mut regional, answer) = subscribed(
+        &relay,
+        Role::Subscriber,
+        Streams::RAW,
+        vec![region],
+        inside.public(),
+    )
+    .await?;
+    for (session, identity) in [(&mut outside_feed, &outside), (&mut nowhere_feed, &nowhere)] {
+        session
+            .writer
+            .send(&[Record::Batch(batch(identity, 0)?)])
+            .await
+            .map_err(text)?;
+    }
+    let mut published = HashSet::new();
+    until(&mut world, "the outside batches", |record| {
+        if let (Record::Batch(_), Some(key)) = (record, author(record)) {
+            published.insert(key);
+        }
+        published.len() == 2
+    })
+    .await?;
+    inside_feed
+        .writer
+        .send(&[Record::Batch(batch(&inside, 0)?)])
+        .await
+        .map_err(text)?;
+    // The fan-out is in order, so anything from outside would have arrived before this.
+    let mut heard = until(&mut regional, "the inside batch", |record| {
+        matches!(record, Record::Batch(_)) && author(record) == Some(inside.public())
+    })
+    .await?;
+    heard.extend(answer);
+    let strangers: Vec<_> = heard
+        .iter()
+        .filter_map(author)
+        .filter(|key| *key != inside.public())
+        .collect();
+    assert!(strangers.is_empty(), "heard from outside the region");
+    Ok(())
+}
+
+#[tokio::test]
+async fn two_receivers_hearing_one_message_are_one_copy_in_the_relays_signed_stream() -> Result {
+    let relay = relay(Hub::new(8)).await?;
+    let beacon = Identity::generate().map_err(text)?;
+    let _beacon_feed = described_feeder(&relay, &beacon, None).await?;
+    let (mut subscriber, _) = subscribed(
+        &relay,
+        Role::Subscriber,
+        Streams::RAW.with(Streams::DEDUPLICATED),
+        Vec::new(),
+        beacon.public(),
+    )
+    .await?;
+    let message = frames(1)?[0].message().to_vec();
+    // A different message, heard after both copies: the deduplicated stream is gathered in the
+    // order heard, so any second copy would be signed no later than this one.
+    let after = frames(2)?[1].message().to_vec();
+    let mut feeds = Vec::new();
+    let mut receivers = HashSet::new();
+    for (counter, data) in [(10, &message), (20, &message), (30, &after)] {
+        if data == &after {
+            // Both copies through the relay before the later message is sent.
+            until(&mut subscriber, "both copies raw", |record| {
+                if let (Record::Batch(_), Some(key)) = (record, author(record)) {
+                    receivers.insert(key);
                 }
-                Ok(()) => {}
+                receivers.len() == 2
+            })
+            .await?;
+        }
+        let receiver = Identity::generate().map_err(text)?;
+        let mut feed = connect(&relay, &receiver, Role::Feeder).await?;
+        let signed = Batch::sign(
+            &receiver,
+            &BatchContent {
+                boot_id: 1,
+                sequence: 0,
+                counter_epoch: 0,
+                wall_ms: 0,
+                dropped: 0,
+                previous: [0; 32],
+                observations: vec![Observation {
+                    format: b'3',
+                    timestamp: counter,
+                    signal: 50,
+                    data: data.clone(),
+                }],
+            },
+        )
+        .map_err(text)?;
+        feed.writer
+            .send(&[Record::Batch(signed)])
+            .await
+            .map_err(text)?;
+        feeds.push(feed);
+    }
+    let copies = |records: &[Record], message: &[u8]| -> Result<(usize, Vec<Batch>)> {
+        let mut copies = 0;
+        let mut signed = Vec::new();
+        for record in records {
+            if let Record::RelayBatch(batch) = record {
+                // Signed as the relay's own claim, which never passes as a receiver's batch.
+                batch.verify_as_relay().map_err(text)?;
+                assert!(
+                    batch.verify().is_err(),
+                    "a relay batch verified as a receiver's"
+                );
+                assert_eq!(batch.receiver().map_err(text)?, relay.key);
+                let content = batch.content().map_err(text)?;
+                copies += content
+                    .observations
+                    .iter()
+                    .filter(|observation| observation.data == message)
+                    .count();
+                signed.push(batch.clone());
             }
         }
-        ended = true;
+        Ok((copies, signed))
+    };
+    let heard = until(
+        &mut subscriber,
+        "the later message, deduplicated",
+        |record| {
+            matches!(record, Record::RelayBatch(batch)
+            if batch.content().is_ok_and(|content| {
+                content.observations.iter().any(|observation| observation.data == after)
+            }))
+        },
+    )
+    .await?;
+    let (total, signed) = copies(&heard, &message)?;
+    assert_eq!(signed.first().map(Batch::sequence), Some(0));
+    assert_eq!(total, 1);
+    assert_eq!(copies(&heard, &after)?.0, 1);
+    Ok(())
+}
+
+fn positions(engine: &Identity, sequence: u64) -> Result<Positions> {
+    Positions::sign(
+        engine,
+        &PositionsContent {
+            boot_id: 1,
+            sequence,
+            issued_ms: 1_791_220_000_000,
+            positions: vec![Position {
+                address: 0xa1b2c3,
+                time_ms: 1_791_219_999_000,
+                lat_e7: 374_100_000,
+                lon_e7: -1_221_000_000,
+                alt_ft: Some(4_500),
+                sigma_m: 60,
+                receivers: 5,
+            }],
+        },
+    )
+    .map_err(text)
+}
+
+#[tokio::test]
+async fn an_engines_positions_reach_subscribers_and_a_forger_is_cut_off() -> Result {
+    let relay = relay(Hub::new(8)).await?;
+    let beacon = Identity::generate().map_err(text)?;
+    let _beacon_feed = described_feeder(&relay, &beacon, None).await?;
+    let (mut subscriber, _) = subscribed(
+        &relay,
+        Role::Subscriber,
+        Streams::RAW.with(Streams::POSITIONS),
+        Vec::new(),
+        beacon.public(),
+    )
+    .await?;
+    let engine = Identity::generate().map_err(text)?;
+    let mut session = connect(&relay, &engine, Role::Engine).await?;
+    let solved = positions(&engine, 0)?;
+    session
+        .writer
+        .send(&[Record::Positions(solved.clone())])
+        .await
+        .map_err(text)?;
+    until(&mut subscriber, "the engine's positions", |record| {
+        *record == Record::Positions(solved.clone())
     })
+    .await?;
+
+    // Positions in another engine's name end the session, and are forwarded to no one.
+    let forged = positions(&Identity::generate().map_err(text)?, 0)?;
+    session
+        .writer
+        .send(&[Record::Positions(forged.clone())])
+        .await
+        .map_err(text)?;
+    ended(&mut session).await;
+    let mut again = connect(&relay, &engine, Role::Engine).await?;
+    let next = positions(&engine, 1)?;
+    again
+        .writer
+        .send(&[Record::Positions(next.clone())])
+        .await
+        .map_err(text)?;
+    let heard = until(&mut subscriber, "the engine's next positions", |record| {
+        *record == Record::Positions(next.clone())
+    })
+    .await?;
+    assert!(!heard.contains(&Record::Positions(forged)));
+    Ok(())
+}
+
+#[tokio::test]
+async fn at_capacity_a_subscriber_is_redirected_to_the_advertised_relays() -> Result {
+    let hints = vec![
+        RelayAddress {
+            key: Identity::generate().map_err(text)?.public(),
+            address: "relay-a.example:10900".to_owned(),
+        },
+        RelayAddress {
+            key: Identity::generate().map_err(text)?.public(),
+            address: "relay-b.example:10900".to_owned(),
+        },
+    ];
+    let relay = relay(Hub::new(1).advertising(hints.clone())).await?;
+    let beacon = Identity::generate().map_err(text)?;
+    // A feeder is offered the same relays as soon as it connects.
+    let mut feed = described_feeder(&relay, &beacon, None).await?;
+    let offered = until(&mut feed, "a relay list", |record| {
+        matches!(record, Record::RelayList(_))
+    })
+    .await?;
+    assert!(offered.contains(&Record::RelayList(hints.clone())));
+    // The one slot is certainly taken once its holder has been sent what the relay knows.
+    let mut first = subscribe(&relay).await?;
+    until(&mut first, "the beacon", |record| {
+        describes(record, beacon.public())
+    })
+    .await?;
+    let mut second = subscribe(&relay).await?;
+    let told = until(&mut second, "a redirect", |record| {
+        matches!(record, Record::Redirect { .. })
+    })
+    .await?;
+    assert!(told.contains(&Record::Redirect {
+        retry_after_secs: 600,
+        hints,
+    }));
+    ended(&mut second).await;
+    Ok(())
+}
+
+/// Reads until the session ends; returns the goodbye it was told, if any.
+async fn told(session: &mut Session<TcpStream>) -> Result<Option<Record>> {
+    let mut goodbye = None;
+    loop {
+        let mut got = Vec::new();
+        if session.reader.recv(&mut got).await.is_err() {
+            return Ok(goodbye);
+        }
+        if let Some(record) = got
+            .into_iter()
+            .find(|record| matches!(record, Record::Goodbye { .. }))
+        {
+            goodbye = Some(record);
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_key_the_operator_did_not_accept_as_a_relay_is_refused() -> Result {
+    let accepted = Identity::generate().map_err(text)?;
+    let relay = relay(Hub::new(8).accepting_relays([accepted.public()])).await?;
+    let mut subscriber = subscribe(&relay).await?;
+    let stranger = Identity::generate().map_err(text)?;
+    let mut session = connect(&relay, &stranger, Role::Relay).await?;
+    // Anyone's batch, as a relay would forward it: the stranger may not.
+    let _ = session
+        .writer
+        .send(&[Record::Batch(batch(
+            &Identity::generate().map_err(text)?,
+            0,
+        )?)])
+        .await;
+    assert_eq!(
+        told(&mut session).await?,
+        Some(Record::Goodbye {
+            reason: tally_wire::Reason::Refused,
+            retry_after_secs: 86_400,
+        })
+    );
+    // The accepted key is served as a relay, forwarding a batch it did not sign; the subscriber
+    // hears it and nothing of the stranger's before it.
+    let mut trusted = connect(&relay, &accepted, Role::Relay).await?;
+    let forwarded = batch(&Identity::generate().map_err(text)?, 0)?;
+    trusted
+        .writer
+        .send(&[Record::Batch(forwarded.clone())])
+        .await
+        .map_err(text)?;
+    assert_eq!(
+        batches_until(&mut subscriber, &forwarded).await?,
+        vec![forwarded]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_batch_replayed_after_its_hash_is_forgotten_is_not_forwarded() -> Result {
+    // A hash window short enough to pass several times inside the test.
+    let window = Duration::from_millis(50);
+    let relay = relay(Hub::new(8).remembering_hashes_for(window)).await?;
+    let mut subscriber = subscribe(&relay).await?;
+    let receiver = Identity::generate().map_err(text)?;
+    let mut feed = connect(&relay, &receiver, Role::Feeder).await?;
+    let old = batch(&receiver, 0)?;
+    // Each send after a window rotates the hashes; two rotations forget the first batch's.
+    for signed in [old.clone(), batch(&receiver, 100)?, batch(&receiver, 200)?] {
+        feed.writer
+            .send(&[Record::Batch(signed.clone())])
+            .await
+            .map_err(text)?;
+        until(&mut subscriber, "a fresh batch", |record| {
+            *record == Record::Batch(signed.clone())
+        })
+        .await?;
+        tokio::time::sleep(window * 3).await;
+    }
+    let next = batch(&receiver, 201)?;
+    feed.writer
+        .send(&[Record::Batch(old.clone()), Record::Batch(next.clone())])
+        .await
+        .map_err(text)?;
+    // The fan-out is in order, so the replay would have arrived before the next batch.
+    let heard = until(&mut subscriber, "the next batch", |record| {
+        *record == Record::Batch(next.clone())
+    })
+    .await?;
+    assert!(
+        !heard.contains(&Record::Batch(old)),
+        "the replay was forwarded"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_relays_own_batch_is_never_forwarded_as_a_receivers() -> Result {
+    let relay = relay(Hub::new(8)).await?;
+    let mut subscriber = subscribe(&relay).await?;
+    let feeder = Identity::generate().map_err(text)?;
+    let mut session = connect(&relay, &feeder, Role::Feeder).await?;
+    // Its own key, its own content, but signed in the relay domain.
+    let derived = Batch::sign_as_relay(
+        &feeder,
+        &BatchContent {
+            boot_id: 1,
+            sequence: 0,
+            counter_epoch: 0,
+            wall_ms: 0,
+            dropped: 0,
+            previous: [0; 32],
+            observations: vec![Observation::from_beast(&frames(1)?[0])],
+        },
+    )
+    .map_err(text)?;
+    derived.verify_as_relay().map_err(text)?;
+    assert!(derived.verify().is_err());
+    session
+        .writer
+        .send(&[Record::Batch(derived)])
+        .await
+        .map_err(text)?;
+    told(&mut session).await?;
+    let (_later, last) = sentinel(&relay).await?;
+    assert_eq!(batches_until(&mut subscriber, &last).await?, vec![last]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_subscribe_naming_too_many_regions_ends_the_session() -> Result {
+    let relay = relay(Hub::new(8)).await?;
+    let mut session = subscribe(&relay).await?;
+    let regions = (0..65)
+        .map(|n| Region::containing(&at(f64::from(n) - 32.0, 0.0), 3).map_err(text))
+        .collect::<Result<Vec<_>>>()?;
+    session
+        .writer
+        .send(&[Record::Subscribe {
+            streams: Streams::RAW,
+            regions,
+        }])
+        .await
+        .map_err(text)?;
+    assert_eq!(
+        told(&mut session).await?,
+        Some(Record::Goodbye {
+            reason: tally_wire::Reason::Protocol,
+            retry_after_secs: 86_400,
+        })
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_feeder_over_its_ingest_ceiling_is_told_the_relay_is_full_and_dropped() -> Result {
+    let relay = relay(Hub::new(8).max_feeder_bytes_per_sec(1)).await?;
+    let receiver = Identity::generate().map_err(text)?;
+    let mut feed = connect(&relay, &receiver, Role::Feeder).await?;
+    let big: Vec<Observation> = frames(2_000)?.iter().map(Observation::from_beast).collect();
+    // Just past the least burst and no further, so the relay has read everything sent when it
+    // closes, and its goodbye is not lost to a reset.
+    let mut sent = 0;
+    let mut sequence = 0;
+    while sent as u64 <= tally_relay::ceiling::MIN_BURST {
+        let signed = Record::Batch(
+            Batch::sign(
+                &receiver,
+                &BatchContent {
+                    boot_id: 1,
+                    sequence,
+                    counter_epoch: 0,
+                    wall_ms: 0,
+                    dropped: 0,
+                    previous: [0; 32],
+                    observations: big.clone(),
+                },
+            )
+            .map_err(text)?,
+        );
+        let mut encoded = Vec::new();
+        signed.encode(&mut encoded).map_err(text)?;
+        sent += encoded.len();
+        sequence += 1;
+        feed.writer.send(&[signed]).await.map_err(text)?;
+    }
+    assert_eq!(
+        told(&mut feed).await?,
+        Some(Record::Goodbye {
+            reason: tally_wire::Reason::Full,
+            retry_after_secs: 60,
+        })
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn beyond_the_connection_cap_a_connection_is_closed_before_its_handshake() -> Result {
+    let relay = relay(Hub::new(8).max_connections(1)).await?;
+    let beacon = Identity::generate().map_err(text)?;
+    let mut held = described_feeder(&relay, &beacon, None).await?;
+    held.writer.send(&[Record::Heartbeat]).await.map_err(text)?;
+    let mut second = TcpStream::connect(relay.address).await.map_err(text)?;
+    let mut byte = [0; 1];
+    let read = second.read(&mut byte).await;
+    assert!(matches!(read, Ok(0) | Err(_)), "the relay answered");
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_subscribe_sent_with_hello_decides_the_first_byte() -> Result {
+    let relay = relay(Hub::new(8)).await?;
+    let palo_alto = at(37.44, -122.14);
+    let outside = Identity::generate().map_err(text)?;
+    let mut outside_feed = described_feeder(&relay, &outside, Some(at(51.5, -0.12))).await?;
+    let mut world = subscribe(&relay).await?;
+    until(&mut world, "the outside description", |record| {
+        describes(record, outside.public())
+    })
+    .await?;
+    let region = Region::containing(&palo_alto, 3).map_err(text)?;
+    let stream = TcpStream::connect(relay.address).await.map_err(text)?;
+    let mut regional = noise::connect_with(
+        stream,
+        &Identity::generate().map_err(text)?,
+        &relay.key,
+        Role::Subscriber,
+        &[Record::Subscribe {
+            streams: Streams::RAW,
+            regions: vec![region],
+        }],
+    )
     .await
-    .ok();
-    assert!(ended, "the stalled subscriber was never dropped");
+    .map_err(text)?;
+    outside_feed
+        .writer
+        .send(&[Record::Batch(batch(&outside, 0)?)])
+        .await
+        .map_err(text)?;
+    until(&mut world, "the outside batch", |record| {
+        matches!(record, Record::Batch(_)) && author(record) == Some(outside.public())
+    })
+    .await?;
+    let inside = Identity::generate().map_err(text)?;
+    let mut inside_feed = described_feeder(&relay, &inside, Some(palo_alto)).await?;
+    inside_feed
+        .writer
+        .send(&[Record::Batch(batch(&inside, 0)?)])
+        .await
+        .map_err(text)?;
+    // Everything the regional subscriber was ever sent, up to the inside receiver's batch.
+    let heard = until(&mut regional, "the inside batch", |record| {
+        matches!(record, Record::Batch(_)) && author(record) == Some(inside.public())
+    })
+    .await?;
+    assert!(
+        heard
+            .iter()
+            .filter_map(author)
+            .all(|key| key == inside.public()),
+        "heard from outside the region"
+    );
+    assert!(
+        heard
+            .iter()
+            .any(|record| describes(record, inside.public()))
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn beyond_its_addresss_cap_a_connection_is_closed_before_its_handshake_and_others_connect()
+-> Result {
+    let relay = relay(Hub::new(8)).await?;
+    // Sixteen connections from one address that never begin a handshake hold its whole share.
+    let mut held = Vec::new();
+    for _ in 0..tally_relay::hub::DEFAULT_MAX_CONNECTIONS_PER_ADDRESS {
+        held.push(TcpStream::connect(relay.address).await.map_err(text)?);
+    }
+    let mut seventeenth = TcpStream::connect(relay.address).await.map_err(text)?;
+    let mut byte = [0; 1];
+    let read = seventeenth.read(&mut byte).await;
+    assert!(matches!(read, Ok(0) | Err(_)), "the relay answered");
+    // Another address is still served, handshake and all.
+    let socket = tokio::net::TcpSocket::new_v4().map_err(text)?;
+    socket
+        .bind("127.0.0.2:0".parse().map_err(text)?)
+        .map_err(text)?;
+    let stream = socket.connect(relay.address).await.map_err(text)?;
+    let mut other = noise::connect(
+        stream,
+        &Identity::generate().map_err(text)?,
+        &relay.key,
+        Role::Feeder,
+    )
+    .await
+    .map_err(text)?;
+    until(&mut other, "the other address's greeting", |record| {
+        matches!(record, Record::RateLimit { .. })
+    })
+    .await?;
+    drop(held);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_feeder_is_told_its_rate_limit_and_the_relays_hints_first() -> Result {
+    let hint = RelayAddress {
+        key: Identity::generate().map_err(text)?.public(),
+        address: "other.example:10900".to_owned(),
+    };
+    let ceiling = 100_000;
+    let relay = relay(
+        Hub::new(8)
+            .advertising(vec![hint.clone()])
+            .max_feeder_bytes_per_sec(ceiling),
+    )
+    .await?;
+    let mut feed = connect(&relay, &Identity::generate().map_err(text)?, Role::Feeder).await?;
+    let mut first = Vec::new();
+    feed.reader.recv(&mut first).await.map_err(text)?;
+    let (bytes_per_sec, burst) = tally_relay::ceiling::advertised(ceiling);
+    assert!(bytes_per_sec < 100_000 && bytes_per_sec > 90_000);
+    assert_eq!(
+        first,
+        vec![
+            Record::RateLimit {
+                bytes_per_sec,
+                burst
+            },
+            Record::RelayList(vec![hint]),
+        ]
+    );
     Ok(())
 }
