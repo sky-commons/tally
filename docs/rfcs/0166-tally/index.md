@@ -335,9 +335,14 @@ defences of §3.7 (standing by map cell, delivery receipts) are the answer if an
 attack, and the feeder already carries what they need. RFC-0119 §4's ceiling on what
 Flightlines trusts ADS-B to mean is unchanged.
 
-## §5 Bandwidth and cost (estimates until step 4 measures them)
+## §5 Bandwidth and cost
 
-A feeder uploads about 50 kbps to each of its relays. At 20,000 receivers, raw receptions are about
+Measured on 2026-10-06 (step 5): box-01, near KLAX, at night, uploads 7.9 KB/s (about 64 kbps,
+4.8 MB in 607 s, counted by systemd's IP accounting on the relay) for 73 aircraft with position,
+signing and framing included. Below, the network-wide figures are still estimates from that
+per-feeder rate.
+
+A feeder uploads about 50 to 100 kbps to each of its relays. At 20,000 receivers, raw receptions are about
 1 to 2 Gbps in total, the deduplicated world about 30 Mbps, MLAT results about 1 Mbps. One relay on
 a 1 Gbps server serves about 25 whole-world deduplicated consumers or hundreds of regional ones; a
 whole-world consumer costs about $10 a month in metered bandwidth. Our cost at that scale is
@@ -425,9 +430,13 @@ roughly $200 to $700 a month on budget hosting; today it is one server.
    signed and unchanged and the loopback BEAST output decoded and unchanged; a feeder publishing
    another receiver's batch is cut off and nothing in that name is forwarded; a batch arriving by
    two relays is forwarded once; a stalled subscriber is dropped while another keeps every batch.
-5. **On our hardware.** `infra/prod-host/tally`: our relay on loopback, one feeder per box in the
-   feeder roster, the consumer readsb moved to the relay's output, every Tally process on
-   loopback by the egress policy. Verified by the consumer's own counters; bandwidth measured.
+5. **On our hardware.** Done 2026-10-06: `infra/prod-host/tally` installed on the master (our relay
+   on loopback, the box-01 feeder, the consumer readsb moved to the relay's output, the egress
+   policy loaded for the first time, after making it reloadable and letting mlat-client read its
+   own box). The consumer, dark since `out.adsb.lol` went off, holds the same 73 positioned
+   aircraft as box-01's own readsb; the adsb.lol feed and MLAT stayed connected throughout. The
+   server does not read Tally yet: production reads re-api, and switching it is a server change
+   that waits for the deploy freeze to lift.
 6. **Public launch.** Built: aarch64 and x86_64 binaries against the pinned sysroot (glibc 2.25 or
    newer, no C++ runtime; the aarch64 build is checked as an ELF but has not yet run on a Pi), the
    systemd units and the one-line installer (`tally/packaging`). Owed: a public relay on a host
