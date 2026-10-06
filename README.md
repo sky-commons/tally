@@ -50,6 +50,12 @@ tally-relay --key /etc/tally/relay.key --listen 0.0.0.0:10900 --beast-out 127.0.
 `--beast-out` serves every reception as plain BEAST for a local decoder such as readsb. It is
 unauthenticated: bind it to loopback.
 
+A relay trusts narrowly by default. Only keys you name with `--accept-relay KEY` may connect as
+another relay; `--upstream HOST:PORT=KEY` links it to a parent. Each feeder is held to
+`--max-feeder-bytes-per-sec` (256 KiB/s by default, told to the feeder in advance), and
+connections are capped overall (`--max-connections`) and per address
+(`--max-connections-per-address`). `tally-relay --help` lists the rest.
+
 ## Build
 
 ```sh
