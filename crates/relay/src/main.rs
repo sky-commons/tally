@@ -1,4 +1,4 @@
-//! `tally-relay`: the relay's command line (RFC-0166 §3.6).
+//! `tally-relay`: the relay's command line (RFC-0171 §3.6).
 
 use std::sync::Arc;
 

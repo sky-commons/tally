@@ -13,7 +13,7 @@ How Tally's binaries are installed on a Linux box with systemd (248 or later).
   makes `/etc/tally/key` if missing (root, mode 600); writes
   `/etc/default/tally-feed` if missing, with those relays as `--relay` flags; and starts the service. Run again, it upgrades the binary
   and keeps the key and the defaults file. It installs no updater: the feeder never updates itself
-  (RFC-0166 §3.5). The checksum guards a broken download, not a compromised release.
+  (RFC-0171 §3.5). The checksum guards a broken download, not a compromised release.
 - `systemd/tally-feed.service` runs the feeder as a dynamic user with no listening socket, at most
   64 MB and 20% of one CPU. The key reaches it through `LoadCredential`, so it stays root's. The
   owner's arguments are `TALLY_FEED_ARGS` in `/etc/default/tally-feed`.

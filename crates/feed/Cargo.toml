@@ -1,6 +1,6 @@
 [package]
 name = "tally-feed"
-description = "Publishes a receiver's BEAST output to Tally relays (RFC-0166 §3.5)."
+description = "Publishes a receiver's BEAST output to Tally relays (RFC-0171 §3.5)."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

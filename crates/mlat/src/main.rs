@@ -1,4 +1,4 @@
-//! `tally-mlat`: the MLAT engine's command line (RFC-0166 §3.8).
+//! `tally-mlat`: the MLAT engine's command line (RFC-0171 §3.8).
 
 use tally_mlat::config::{self, Command};
 

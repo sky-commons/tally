@@ -1,5 +1,5 @@
 //! The engine's centre: which receivers it multilaterates for, one mlat-server session per
-//! receiver, and the signed positions it publishes (RFC-0166 §3.8).
+//! receiver, and the signed positions it publishes (RFC-0171 §3.8).
 //!
 //! A receiver is used only on its own signed word: its `ReceiverInfo` verifies, gives an exact
 //! location inside the engine's regions, and names a clock mlat-client knows. Nothing is kept for
@@ -10,7 +10,7 @@
 //! sent no batch for `IDLE` yields its place to a waiting one that has. So which receivers hold
 //! the places follows who is publishing, not who described itself first, and a receiver turned
 //! away is admitted later without reconnecting. Throwaway keys that keep publishing real-looking
-//! batches can still hold places: bounded by the cap, not prevented (RFC-0166 §4's residuals,
+//! batches can still hold places: bounded by the cap, not prevented (RFC-0171 §4's residuals,
 //! accepted by the ruling of §8.1). Each of an admitted receiver's batches must verify too, and is used once: a batch that arrives through two relays, or is replayed at any
 //! later time, carries a (boot, sequence) already used or too far behind that boot's newest
 //! (§3.1). Results from the server are deduplicated (each comes back on the session of every

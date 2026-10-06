@@ -1,4 +1,4 @@
-//! Which relays a feeder publishes to, and each session with one (RFC-0166 §3.5, §3.7).
+//! Which relays a feeder publishes to, and each session with one (RFC-0171 §3.5, §3.7).
 //!
 //! The rules are fixed here and no relay can change them: a home relay the owner pinned, an
 //! anchor kept across restarts, the rest picked at random from relays the feeder knows of. A relay

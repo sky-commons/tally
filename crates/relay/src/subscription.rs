@@ -1,4 +1,4 @@
-//! What a subscriber or engine asked for (RFC-0166 §3.6), and the one rule for whether a record
+//! What a subscriber or engine asked for (RFC-0171 §3.6), and the one rule for whether a record
 //! on the fan-out is in it.
 
 use std::ops::RangeInclusive;

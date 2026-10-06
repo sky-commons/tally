@@ -1,4 +1,4 @@
-//! How much one connection may send a relay (RFC-0166 §3.6: taking data in costs a relay only its
+//! How much one connection may send a relay (RFC-0171 §3.6: taking data in costs a relay only its
 //! server, so the relay sets what that is). Every byte read off a connection is counted at the
 //! socket, before decryption or decoding, and held to a rate with a burst.
 

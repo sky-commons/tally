@@ -1,4 +1,4 @@
-# Tally (RFC-0166): a receiver publishes its raw receptions once, and anyone may run a relay.
+# Tally (RFC-0171): a receiver publishes its raw receptions once, and anyone may run a relay.
 # This directory is self-contained: it builds with Cargo or Bazel on its own, references nothing
 # outside itself, and is mirrored to github.com/flightlines/tally with `//tally/` rewritten to `//`.
 [workspace]
@@ -19,7 +19,7 @@ blake2 = "0.10"
 ed25519-dalek = "2"
 # The version snow already uses, so the tree carries one getrandom.
 getrandom = "0.2"
-# H3 cells name regions (RFC-0166 §3.6); pure Rust.
+# H3 cells name regions (RFC-0171 §3.6); pure Rust.
 h3o = "0.11"
 # mlat-server's client protocol is JSON lines (tally-mlat).
 serde_json = "1"

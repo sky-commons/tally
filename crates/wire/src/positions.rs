@@ -1,4 +1,4 @@
-//! What an MLAT engine publishes (RFC-0166 §3.8): positions it solved, signed by the engine's own
+//! What an MLAT engine publishes (RFC-0171 §3.8): positions it solved, signed by the engine's own
 //! key, with the uncertainty of each and how many receivers it used. Like a batch it is immutable
 //! once signed, keeps a fixed prefix in every format version (format, engine key, sequence), and
 //! is forwarded by relays byte for byte.

@@ -1,5 +1,5 @@
 //! The feeder's command line. Everything a feeder does is decided here, by its owner, or by the
-//! fixed rules in this binary: nothing on the network can reconfigure it (RFC-0166 §3.5).
+//! fixed rules in this binary: nothing on the network can reconfigure it (RFC-0171 §3.5).
 
 use std::path::PathBuf;
 
@@ -7,7 +7,7 @@ use tally_wire::{Clock, Location, PublicKey, RelayAddress};
 
 /// Relays shipped in the binary, as `HOST:PORT=KEY`, known like any `--relay`. Before the public
 /// release this lists relays run by several independent operators, never one: a single built-in
-/// seed is a party that can steer every new feeder (RFC-0166 §3.5, §3.7). It is only a starting
+/// seed is a party that can steer every new feeder (RFC-0171 §3.5, §3.7). It is only a starting
 /// point; the feeder learns relays from relays and keeps what it learned.
 pub const SEEDS: &[&str] = &[];
 

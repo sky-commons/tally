@@ -253,7 +253,7 @@ where
                 bytes_per_sec,
                 burst,
             }];
-            // Relays it may also choose, as hints (RFC-0166 §3.7).
+            // Relays it may also choose, as hints (RFC-0171 §3.7).
             if !hub.hints().is_empty() {
                 greeting.push(Record::RelayList(hub.hints().to_vec()));
             }

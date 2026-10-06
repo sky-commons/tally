@@ -1,5 +1,5 @@
 //! A receiver's frames, end to end, over real sockets: a stand-in readsb serving BEAST, a real
-//! feeder reading it, a real relay, and subscribers on both of the relay's outputs (RFC-0166 §10
+//! feeder reading it, a real relay, and subscribers on both of the relay's outputs (RFC-0171 §10
 //! steps 3 and 4); then the relay's streams, regions, engines and redirects (§3.6 to §3.8).
 //!
 //! Nothing here is timed. A test waits for what it is looking for, and the test runner's own

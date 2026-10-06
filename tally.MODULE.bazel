@@ -1,4 +1,4 @@
-# Tally's third-party crates (RFC-0166 §3.10), resolved by crate_universe from tally's own
+# Tally's third-party crates (RFC-0171 §3.10), resolved by crate_universe from tally's own
 # Cargo.toml and Cargo.lock. The monorepo's root MODULE.bazel includes this file; the public
 # repository's MODULE.bazel (tally/MODULE.bazel here, the root there) includes the same file, so
 # both builds resolve one dependency set. Labels say //tally:, which the mirror rewrites to //:.
