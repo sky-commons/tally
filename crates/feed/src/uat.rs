@@ -1,4 +1,4 @@
-//! Reading dump978-fa's raw output, the 978 MHz UAT receptions (RFC-0166 §3.4, §3.5).
+//! Reading dump978-fa's raw output, the 978 MHz UAT receptions (RFC-0171 §3.4, §3.5).
 //!
 //! dump978-fa (github.com/flightaware/dump978, `uat_message.cc`, `operator<<` on `RawMessage`)
 //! writes one reception per line on its raw port (30978 in its Debian defaults):

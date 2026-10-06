@@ -1,4 +1,4 @@
-//! Regions are H3 cells (RFC-0166 §3.6). A subscriber names the cells it wants, at any resolution;
+//! Regions are H3 cells (RFC-0171 §3.6). A subscriber names the cells it wants, at any resolution;
 //! a relay routes a receiver's batches by the cell the receiver's own declared location falls in,
 //! never by where any aircraft is, so a relay decodes nothing to route. This module is the one
 //! place that says whether a receiver is inside a region, so relays and consumers cannot disagree.

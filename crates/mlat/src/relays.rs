@@ -1,4 +1,4 @@
-//! The engine's sessions with Tally relays (RFC-0166 §3.8): it dials each as an `Engine`, asks
+//! The engine's sessions with Tally relays (RFC-0171 §3.8): it dials each as an `Engine`, asks
 //! for its regions' raw stream in the same message as its Hello, and publishes its signed positions back on the same session. The
 //! relays it uses are the operator's to name; a relay that says "leave me" is only left for as
 //! long as it asks.

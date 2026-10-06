@@ -1,4 +1,4 @@
-//! Reading the receiver's own decoders and turning what they heard into signed batches (RFC-0166
+//! Reading the receiver's own decoders and turning what they heard into signed batches (RFC-0171
 //! §3.1, §3.5). Each decoder's port is read as one more client; nothing about readsb or dump978 is
 //! changed. Each source has its own reader, and every reader feeds the one batcher that owns the
 //! chain.

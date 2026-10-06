@@ -6,7 +6,7 @@
 //! one) are skipped, never forwarded: the network carries receptions, not a decoder's chatter.
 //!
 //! Two things on a feeder's port are not this receiver's receptions, and the decoder keeps them out
-//! (RFC-0166 §3.5): positions an MLAT server sent back, which readsb re-emits with a magic counter,
+//! (RFC-0171 §3.5): positions an MLAT server sent back, which readsb re-emits with a magic counter,
 //! and a stream merging several receivers, which readsb marks with `0xe3` receiver-id frames.
 
 use crate::WireError;

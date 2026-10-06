@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Installs the Tally feeder on a receiver (RFC-0166 §3.5):
+# Installs the Tally feeder on a receiver (RFC-0171 §3.5):
 #
 #   curl -fsSL https://github.com/flightlines/tally/releases/download/v0.1.0/install.sh | sudo bash
 #

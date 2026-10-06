@@ -1,4 +1,4 @@
-//! What a receiver signs (RFC-0166 §3.2, §4): batches of its receptions, and a description of
+//! What a receiver signs (RFC-0171 §3.2, §4): batches of its receptions, and a description of
 //! itself. Both are immutable once signed. Relays forward them byte for byte and never repack
 //! them, so anyone downstream can check that a receiver really published what arrives.
 //!
@@ -310,7 +310,7 @@ impl Clock {
 }
 
 /// Where the antenna is: degrees times 10^7, metres above the WGS84 ellipsoid, and how precise
-/// the owner chose to be. Published exactly unless the owner rounds it (RFC-0166 §8.3); a rounded
+/// the owner chose to be. Published exactly unless the owner rounds it (RFC-0171 §8.3); a rounded
 /// location says so here, and an MLAT engine gives it less weight.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Location {

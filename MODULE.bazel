@@ -1,4 +1,4 @@
-# The public repository's module (github.com/flightlines/tally, RFC-0166 §3.10). In the monorepo
+# The public repository's module (github.com/flightlines/tally, RFC-0171 §3.10). In the monorepo
 # Bazel ignores this nested file and the root MODULE.bazel includes tally.MODULE.bazel instead;
 # the mirror moves tally/ to the root and rewrites //tally to //, which makes this the root module.
 

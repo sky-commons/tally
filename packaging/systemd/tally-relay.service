@@ -1,4 +1,4 @@
-# A Tally relay (RFC-0166 §3.6): accepts feeders, subscribers and other relays on one port, checks
+# A Tally relay (RFC-0171 §3.6): accepts feeders, subscribers and other relays on one port, checks
 # each batch's signature and forwards it. Its arguments (where it listens, its upstreams, how many
 # subscribers it serves) are the operator's, in /etc/default/tally-relay as TALLY_RELAY_ARGS;
 # `tally-relay --help` lists them.
