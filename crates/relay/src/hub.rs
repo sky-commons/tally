@@ -20,7 +20,7 @@ use crate::bounded::Bounded;
 use crate::subscription::{Described, Subscription};
 
 /// How many records a subscriber may fall behind before it is dropped. readsb's rule: drop the
-/// slow consumer, never slow the producers (RFC-0166 §3.6). Sized with the other defaults to the
+/// slow consumer, never slow the producers (RFC-0171 §3.6). Sized with the other defaults to the
 /// relay unit's memory (see `DEFAULT_MAX_CONNECTIONS`).
 pub const FAN_OUT_CAPACITY: usize = 4096;
 

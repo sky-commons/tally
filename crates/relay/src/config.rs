@@ -141,7 +141,7 @@ impl Config {
         Ok(Some(config))
     }
 
-    /// The relays offered as hints (RFC-0166 §3.7): those advertised, then the upstreams.
+    /// The relays offered as hints (RFC-0171 §3.7): those advertised, then the upstreams.
     pub fn hints(&self) -> Vec<RelayAddress> {
         let upstreams = self.upstreams.iter().map(|upstream| RelayAddress {
             key: upstream.key,

@@ -1,4 +1,4 @@
-//! `tally-feed`: the feeder's command line (RFC-0166 §3.5).
+//! `tally-feed`: the feeder's command line (RFC-0171 §3.5).
 
 use tally_feed::config::{self, Command};
 

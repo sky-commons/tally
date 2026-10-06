@@ -1,4 +1,4 @@
-//! Every hop is Noise IK over a byte stream (RFC-0166 §3.3).
+//! Every hop is Noise IK over a byte stream (RFC-0171 §3.3).
 //!
 //! A connection opens with a 16-byte plaintext preamble: `TALY`, the preamble version, the
 //! handshake pattern, two reserved bytes, and a hint naming which of the responder's keys the

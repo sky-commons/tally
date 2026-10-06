@@ -1,4 +1,4 @@
-# RFC-0166: Tally, where a receiver publishes once and nobody owns the network
+# RFC-0171: Tally, where a receiver publishes once and nobody owns the network
 
 - Status: **accepted 2026-10-05; the wire crate is built, the feeder and relay are next.** Founder
   direction, the same day, after §1's probe found adsb.lol's raw stream off for every client and

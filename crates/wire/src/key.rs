@@ -1,4 +1,4 @@
-//! A receiver's or relay's identity is one Ed25519 key (RFC-0166 §3.2). It signs what the holder
+//! A receiver's or relay's identity is one Ed25519 key (RFC-0171 §3.2). It signs what the holder
 //! publishes, and the X25519 key the Noise handshake uses is derived from it (the libsodium
 //! `sk_to_curve25519` conversion), so one key is the identity everywhere and forever. Keys are
 //! written as base64 on one line, the way WireGuard writes them.

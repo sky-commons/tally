@@ -1,4 +1,4 @@
-# Tally (RFC-0166): the manifests crate_universe and the crates' lint configuration read.
+# Tally (RFC-0171): the manifests crate_universe and the crates' lint configuration read.
 exports_files(
     [
         "Cargo.lock",

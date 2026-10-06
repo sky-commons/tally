@@ -1,4 +1,4 @@
-//! The deduplicated stream (RFC-0166 §3.6): every second, the first copies of each message the
+//! The deduplicated stream (RFC-0171 §3.6): every second, the first copies of each message the
 //! hub gathered across all receivers, signed by this relay as its own claim. It is a batch like a
 //! receiver's (its own random boot id, sequence from 0, hash chain), sent as `RelayBatch` so no
 //! one mistakes it for a receiver's reception, and never passed to another relay: each relay
