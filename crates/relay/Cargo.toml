@@ -1,6 +1,6 @@
 [package]
 name = "tally-relay"
-description = "A Tally relay: takes in feeders and peers, fans out to subscribers (RFC-0166 §3.6)."
+description = "A Tally relay: takes in feeders and peers, fans out to subscribers (RFC-0171 §3.6)."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

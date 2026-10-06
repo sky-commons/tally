@@ -1,4 +1,4 @@
-//! How a feeder or relay waits before trying a peer again (RFC-0166 §3.5): doubling from one
+//! How a feeder or relay waits before trying a peer again (RFC-0171 §3.5): doubling from one
 //! second to five minutes, with up to half again of random jitter so a relay restart is not every
 //! feeder reconnecting in the same second. A peer can lengthen the wait (`Goodbye`, `Redirect`)
 //! and never shorten it.

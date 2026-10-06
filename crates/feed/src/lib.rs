@@ -1,4 +1,4 @@
-//! A Tally feeder (RFC-0166 §3.5): reads a receiver's own decoder, signs what it heard, and
+//! A Tally feeder (RFC-0171 §3.5): reads a receiver's own decoder, signs what it heard, and
 //! publishes it to a few relays. It listens on no port, takes no orders from the network, and
 //! changes nothing about the receiver's other feeds.
 

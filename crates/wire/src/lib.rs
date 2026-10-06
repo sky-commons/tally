@@ -1,4 +1,4 @@
-//! The only code that speaks Tally's wire (RFC-0166 §3): the BEAST frames a receiver's decoder
+//! The only code that speaks Tally's wire (RFC-0171 §3): the BEAST frames a receiver's decoder
 //! emits, the signed batches that carry them, the records that move between feeders, relays and
 //! subscribers, and the Noise transport every hop runs over. Every binary goes through this crate.
 

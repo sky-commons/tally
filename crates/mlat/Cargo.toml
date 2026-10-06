@@ -1,6 +1,6 @@
 [package]
 name = "tally-mlat"
-description = "A Tally MLAT engine: bridges a region's receivers to an unmodified mlat-server (RFC-0166 §3.8)."
+description = "A Tally MLAT engine: bridges a region's receivers to an unmodified mlat-server (RFC-0171 §3.8)."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

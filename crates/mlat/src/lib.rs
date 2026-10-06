@@ -1,4 +1,4 @@
-//! A Tally MLAT engine (RFC-0166 §3.8) that solves nothing itself. It subscribes to its regions'
+//! A Tally MLAT engine (RFC-0171 §3.8) that solves nothing itself. It subscribes to its regions'
 //! raw batches and speaks mlat-client's protocol to a local, unmodified mlat-server
 //! (github.com/wiedehopf/mlat-server, the server adsb.lol and others run) on behalf of every
 //! receiver in them: one connection per receiver, the same handshake, and the same sync and mlat

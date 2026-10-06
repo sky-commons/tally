@@ -1,4 +1,4 @@
-//! A Tally relay (RFC-0166 §3.6): accepts feeders, subscribers, MLAT engines and other relays on
+//! A Tally relay (RFC-0171 §3.6): accepts feeders, subscribers, MLAT engines and other relays on
 //! one port, checks every signature, forwards each batch and each engine's positions once, signs
 //! its own deduplicated stream, and serves plain BEAST on loopback for a local decoder. It decides
 //! nothing about aircraft: it reads frames only to compare their bytes.

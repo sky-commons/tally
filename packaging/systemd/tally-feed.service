@@ -1,4 +1,4 @@
-# The Tally feeder (RFC-0166 §3.5): reads this receiver's own decoders and publishes what they heard
+# The Tally feeder (RFC-0171 §3.5): reads this receiver's own decoders and publishes what they heard
 # to a few Tally relays. It only connects out: it listens on no port and takes no orders from the
 # network. Its arguments (location, the UAT source, a home relay) are the owner's, in
 # /etc/default/tally-feed as TALLY_FEED_ARGS; `tally-feed --help` lists them.
