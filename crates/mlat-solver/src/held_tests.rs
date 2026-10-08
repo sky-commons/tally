@@ -174,7 +174,7 @@ fn fill(receptions: &[Reception], opens: &mut [Open], owner: impl Fn(&PublicKey)
     }
 }
 
-/// RFC-0178 invariant 4: sealing the raw of a bin split among owners by receiver, in any split,
+/// RFC-0181 invariant 4: sealing the raw of a bin split among owners by receiver, in any split,
 /// on any number of threads, gives the bin one whole holder seals, byte for byte.
 #[test]
 fn sealing_any_split_by_receiver_gives_the_whole_holders_bin() {
@@ -413,7 +413,7 @@ fn stamped(
         .map_err(|undecodable| undecodable.error.to_string())
 }
 
-/// Late by the stamp (RFC-0178 invariants 2 and 3): a holder that closes by its stamps takes the
+/// Late by the stamp (RFC-0181 invariants 2 and 3): a holder that closes by its stamps takes the
 /// raw stamped before the step that takes its bin and refuses as late the raw stamped at or after
 /// it, whether that raw arrived before the step ran or after; so what it seals is the same however
 /// the arrivals and the step interleave.

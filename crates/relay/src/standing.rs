@@ -5,7 +5,7 @@
 //! that reads the same records as a client holds the same standing as it.
 //!
 //! It holds no raw of its own: it reads the hosted MLAT engine's sealed bins
-//! ([`Standing::read_bins`], one store of raw per relay, RFC-0178 §5), so raw later than the
+//! ([`Standing::read_bins`], one store of raw per relay, RFC-0181 §5), so raw later than the
 //! engine's settling is missing for both alike. It is scoped to the areas this relay holds raw for
 //! (the hosted MLAT's areas and their border band, [`Standing::set_areas`]): a relay cannot hold
 //! the world's raw, and relays are regional. A receiver outside them, or any receiver of a relay

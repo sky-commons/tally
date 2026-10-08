@@ -1,4 +1,4 @@
-//! Every deployed relay's configuration admits feeders (RFC-0178 §9). A relay's memory is its
+//! Every deployed relay's configuration admits feeders (RFC-0181 §9). A relay's memory is its
 //! `--memory`, or else its cgroup's limit (a systemd unit's `MemoryMax=`, a Kubernetes container's
 //! `limits.memory`); the budget takes the relay's base (`budget::Plan::base`) of it first, and a
 //! relay whose budget holds no feeder refuses to start (`Budget::check`). Each deployed configuration is read here as

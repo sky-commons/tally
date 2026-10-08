@@ -13,7 +13,7 @@
 //! In the first three tests the host is pinned to the simulator's areas, so they test the hosting
 //! and nothing else. The first phase is the past, fed at once, so the relays' ingest clock
 //! ([`TestClock`]) is held before it while it is fed: raw is late by its stamp, never by when a
-//! step ran (RFC-0178), and a batch of the past stamped by the wall clock would be late for its
+//! step ran (RFC-0181), and a batch of the past stamped by the wall clock would be late for its
 //! bin. Once every batch of the first phase is in every engine the clock is the wall clock again,
 //! and the scenario's first window is due at once. The first step is held until then too, so no
 //! step runs on a clock a slow machine has not caught up with.

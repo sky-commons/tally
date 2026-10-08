@@ -1,4 +1,4 @@
-//! A holder of raw reports the bytes it really allocated (RFC-0178 §5 and invariant 8): admission is
+//! A holder of raw reports the bytes it really allocated (RFC-0181 §5 and invariant 8): admission is
 //! sized on `Held::bytes`, so it must count what is in memory, never an estimate below it. Measured
 //! by an allocator that counts every byte asked of it, the only test in this binary so nothing
 //! else allocates while it measures.

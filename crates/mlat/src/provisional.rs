@@ -26,7 +26,7 @@
 //! - **Checked**: every one is read back and verified with the model carried (`verify_reach`)
 //!   against the receptions it was solved from, as any checker would
 //!   (`publish::solve_published`); one that fails is dropped and counted.
-//! - **Sharded by aircraft** (RFC-0178 §3): everything but the models belongs to one aircraft, so
+//! - **Sharded by aircraft** (RFC-0181 §3): everything but the models belongs to one aircraft, so
 //!   it is held in [`SHARDS`] address shards over a keyed hash of the address ([`shard_of`]), each
 //!   weighed and stepped on its own; the models ([`Book`]) are the engine's, shared read-only with
 //!   every shard. The due work of all shards, ascending by aircraft, is one job ([`Plan::job`]), so
@@ -616,7 +616,7 @@ impl Note {
 /// What a batch says to provisional solving, in the batch's order: each aircraft whose ADS-B
 /// airborne position it carries (once: every reception of a batch has its wall clock, so a second
 /// says nothing more), and each reply MLAT solves, by index. A function of the batch alone, so the
-/// thread that holds the batch reads it (a relay's raw shard, RFC-0178 §5) and the address shards
+/// thread that holds the batch reads it (a relay's raw shard, RFC-0181 §5) and the address shards
 /// only weigh what it says (`Shard::read`).
 pub fn notes_of(batch: &Decoded) -> Vec<Note> {
     let mut notes = Vec::new();

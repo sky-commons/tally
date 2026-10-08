@@ -472,7 +472,7 @@ fn wall_ms() -> u64 {
 /// is the wall clock again (a 30 s scenario, a window after it and its settling).
 const SCENARIO_AGO_MS: u64 = 150_000;
 /// What the relays' ingest clock is held at while the scenario is fed: before its first bin, so
-/// every batch is stamped before the step that takes its bin (RFC-0178: raw is late by its stamp,
+/// every batch is stamped before the step that takes its bin (RFC-0181: raw is late by its stamp,
 /// never by when a step ran), and few enough steps before now that the first step is soon.
 const HELD_AGO_MS: u64 = 180_000;
 

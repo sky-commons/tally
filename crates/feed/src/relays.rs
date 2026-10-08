@@ -1969,7 +1969,7 @@ mod tests {
     #[test]
     fn the_ledger_keeps_names_for_the_window_and_bytes_only_of_audited_batches()
     -> Result<(), String> {
-        // RFC-0178's feeder: a batch of about 8 KB a second, to two relays, audited now and then.
+        // RFC-0181's feeder: a batch of about 8 KB a second, to two relays, audited now and then.
         // Before, the ledger kept 512 whole batches (some 4 MiB); now it keeps each batch's name
         // and relays, and the bytes of the audited ones alone.
         let feeder = Identity::generate().map_err(|error| error.to_string())?;

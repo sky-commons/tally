@@ -6,7 +6,7 @@
 //! after its second with MLAT by provisional fixes, and precise as `WorldPrecise`, sealed
 //! `WORLD_PRECISE_SETTLE_MS` after with MLAT by final fixes only.
 //!
-//! # Who does what (RFC-0178)
+//! # Who does what (RFC-0181)
 //!
 //! Nothing here is on the per-reception path. Which reception is an area's first copy is decided
 //! by the message exchange's one deduplication (`exchange::MessageShard`), at each epoch's close,
@@ -28,7 +28,7 @@
 //! watermark's, never by which queue it waited in or which thread's word came first. A record
 //! handed in after the sealer has taken in a watermark is stamped no earlier than it.
 //!
-//! The sealer is one thread that decides, and a pool that works (RFC-0178 §4, "a sealer pool"):
+//! The sealer is one thread that decides, and a pool that works (RFC-0181 §4, "a sealer pool"):
 //! each epoch's areas are made into records in parallel (their observations gathered, cut to
 //! fit a record, signed, and their ADS-B fixes derived), on threads started with the sealer (so a
 //! thread that cannot be started fails the relay at its start, never an epoch), as many as the
@@ -183,7 +183,7 @@ pub struct ProductsReport {
     /// Peers' regional batches forwarded.
     pub regional_forwarded: u64,
     /// Epochs refused whole, every product of them (the sealer was behind, or its records were
-    /// not taken, or the epoch was past the budget): RFC-0178 §10.
+    /// not taken, or the epoch was past the budget): RFC-0181 §10.
     pub epochs_refused: u64,
     /// Epoch parts (one message thread's share of one epoch) lost on the way to the sealer, its
     /// queue full: each refuses its epoch, counted above when another thread held any of it.
@@ -1393,7 +1393,7 @@ fn cut((cell, mut copies): (Region, Vec<Kept>), boot_id: u64, wall_ms: u64) -> C
 /// A job for the sealer's pool.
 type Job = Box<dyn FnOnce() + Send>;
 
-/// The sealer's pool (RFC-0178 §4): threads of its own, started with the sealer and stopped with
+/// The sealer's pool (RFC-0181 §4): threads of its own, started with the sealer and stopped with
 /// it, that work beside the sealer's thread. Started whole or not at all (`start`), so a thread
 /// that cannot be started fails the relay at its start; none for a sealer that runs inline.
 #[derive(Default)]

@@ -29,7 +29,7 @@ impl PublicKey {
     /// The key in `bytes` as a decompressed point: the one decompression a holder that verifies
     /// by the key more than once does (a `Batch` keeps it), checking the key as `from_slice` does.
     /// There is no way to decompress a `PublicKey` already checked into a point, so no reader
-    /// checks a key and then decompresses it again (RFC-0178 §2).
+    /// checks a key and then decompresses it again (RFC-0181 §2).
     pub(crate) fn point_of(bytes: &[u8]) -> Result<VerifyingKey, WireError> {
         let array: [u8; KEY_LEN] = bytes.try_into().map_err(|_| {
             WireError::Key(format!("expected {KEY_LEN} bytes, got {}", bytes.len()))

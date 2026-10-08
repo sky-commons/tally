@@ -1,4 +1,4 @@
-//! The staged relay's invariants (RFC-0178, "Invariants the tests hold"), on the relay's own
+//! The staged relay's invariants (RFC-0181, "Invariants the tests hold"), on the relay's own
 //! threads: the same stamped trace gives byte-identical products and stream on 1, 2 and 8
 //! threads; no consumer reads a clock (batches stamped by the relay's own ingest clock, with
 //! delays injected inside every stage, make the same bytes as with none); a message heard by many
@@ -322,7 +322,7 @@ fn the_same_stamped_trace_makes_the_same_bytes_on_any_number_of_threads() -> Res
     Ok(())
 }
 
-/// RFC-0178 invariant 2 at the relay's own clock (the audit's 5.1): the stamps come from the
+/// RFC-0181 invariant 2 at the relay's own clock (the audit's 5.1): the stamps come from the
 /// ingest clock as a relay's do, not from a trace, and delays are injected inside every stage
 /// (after the stamp, in the message threads, in the sealer and its pool), not between batches.
 /// The bytes made are the same as with no delay at all, on any number of threads: what is in
@@ -702,7 +702,7 @@ fn busy_batch(receiver: &Identity, sequence: u64, count: u32) -> Result<Batch> {
     .map_err(text)
 }
 
-/// RFC-0178 invariant 8, for the stages that can stall: a stage that never lets go cannot grow
+/// RFC-0181 invariant 8, for the stages that can stall: a stage that never lets go cannot grow
 /// the relay's memory past its budget. Here the epoch never closes (every batch is stamped in one
 /// second and the ingest clock stands still), so the message exchange holds everything it is
 /// given, and nobody reads the one subscriber's queue. Ten times what the budget gives the epochs
