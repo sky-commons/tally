@@ -23,7 +23,9 @@ pub mod rendezvous;
 pub mod sharing;
 mod signed;
 
-pub use batch::{Batch, BatchContent, Clock, Codec, Location, Observation, ReceiverInfo};
+pub use batch::{
+    Batch, BatchContent, BatchDraft, Clock, Codec, Location, Observation, ReceiverInfo,
+};
 pub use beast::{Frame, FrameKind};
 /// The shared byte buffer batches are held in, so a crate reading them needs no dependency of its own.
 pub use bytes::Bytes;

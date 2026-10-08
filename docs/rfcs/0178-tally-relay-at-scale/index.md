@@ -46,9 +46,9 @@ Measured on main (tally-load, commit b3e3571809 on branch tally-load):
    once, when the batch is read (`Batch::from_bytes`), and kept; there is no call that checks a key
    and decompresses it again. The regional products are signed from the receptions where their batches
    hold them (`RegionalBatch::sign_draft`, one encoder for a borrowed or an owned reception), so a
-   regional record copies nothing. One allocation per kept reception remains, in the deduplicated
-   stream: the sealer hands each epoch's stream to the signer that runs each second, and that hold
-   outlives the epoch's batches, so it is an owned copy, charged to `Store::Products`.
+   regional record copies nothing, and so is the relay's deduplicated stream
+   (`Batch::sign_relay_draft`): the sealer signs each epoch's stream in its pool while it still holds
+   the epoch's batches (§4), so no kept reception is ever copied out of its batch.
 2. **Ingest stage on a dedicated CPU pool**, not Tokio workers. Connection tasks do I/O only, with a
    credit of k=2 batches in flight per connection; out of credit, stop reading the socket (TCP
    pushes back; the feeder's signed `dropped` records its own loss). Workers: verify, hash, admit
@@ -106,6 +106,12 @@ Measured on main (tally-load, commit b3e3571809 on branch tally-load):
    fit (`RegionalBatch::fits`, decided without signing; the sequence is a fixed-width field), the
    records are numbered in cell order by the one thread, then signed and their ADS-B fixes derived on
    as many threads as the message exchange has, and applied in sequence order by the one thread.
+   The deduplicated stream is signed in the same pool, one job beside the areas' cuts: its hash chain
+   makes its batches one sequence, so one job signs them all in canonical order
+   (`deduplicated::Stream::sign`), each batch timed the epoch's end as the regional records are, and
+   its batches go out first among the epoch's records. Before this it was gathered as owned copies
+   for a signer that ran once a second on the wall clock; now the same stamped batches sign the same
+   stream bytes on any number of threads, as the regional products' do.
    Records that are not epochs (positions, clock models, peers' world and regional records) wait in
    a queue of their own (`products::Records`, bounded in count and bytes), so a flood of them refuses
    records, counted, never an epoch. Before sealing an epoch or advancing the watermark the sealer
@@ -236,12 +242,15 @@ Measured on main (tally-load, commit b3e3571809 on branch tally-load):
    byte store, `Held`, the fingerprints (as if every reception were new, with the tables' room to
    double), the fan-out, the delivery tags, the ingest stage's credit, the epochs' decoded batches
    between ingest and the sealer (`seal::EPOCHS_HELD`, 3 epochs), and what the products hold until
-   the hub takes it (`products::OUTBOX_EPOCHS`, 2). Each store has a gauge whose limit is its share
+   the hub takes it (`products::OUTBOX_EPOCHS`, 2: the signed records only, every reception as an
+   encoded observation in two of them, its stream's batch and its area's regional batch: 48 bytes a
+   reception, where the owned copy the stream used to hold was planned at 54 alone). Each store has a gauge whose limit is its share
    at the ceiling, charged for what the store really holds and released when it lets go (a decoded
    batch by `Decoded::footprint`, a record by `Record::encoded_len`, the one size of either). What
    a full gauge does is the store's policy: the ingest stage waits (the connection's socket unread);
    an epoch past its share is refused whole by the message thread that holds it, and the sealer
-   counts it; the products refuse an epoch's records or stream whole, and a peer's record alone; the
+   counts it; the products refuse an epoch's records (its stream's batches among them) whole, and a
+   peer's record alone; the
    fan-out lets go the subscriber holding most until the item fits. A sharing member reserves the
    feeders its ingest ceiling is worth (`--max-member-bytes-per-sec` over a planned feeder's rate)
    for as long as it is a member. A relay whose memory admits no feeder refuses to start
@@ -323,7 +332,41 @@ times that, and with it a relay given 1 GiB, or the public relay's 640 MiB, admi
 refused to start (`Budget::check`). It is 272 MiB: 256 MiB and the pool's 16 MiB
 (`noise::POOL_IDLE x MAX_MESSAGE`), above the measured 260 MiB, and safe at any load because each
 feeder's reservation (about 0.7 MB with the three dedup generations) is well above the 247 KiB the
-relay measured adding. It is 272 MiB (`budget::BASE_BYTES`). What hosted MLAT adds to the base (its engine's tables, not its raw, which
-`Held` reserves per feeder) is not yet measured; a deployment that hosts MLAT leaves room for it
-between its `--memory` and its cgroup limit (the public relay leaves 64 MiB,
-`infra/kubernetes/tally/relay.yaml`) until it is.
+relay measured adding. It is 272 MiB (`budget::BASE_BYTES`).
+
+**What hosting MLAT costs** (measured 2026-10-08, `tally-load` built `-c opt`, the relay on cores
+0-9 and the harness on 10-31, the relay started by hand with `--memory 14G --mlat-threads 4`, two
+areas taken, `801ffffffffffff` and `8027fffffffffff`, the cells at the centres of the simulation's
+two clusters, and itself advertised so it is chosen to solve them; resident memory at the end of a
+60 s ramp, 30 s warm-up and 60 s measured, with the same relay with `--mlat-threads 0` beside it):
+
+| Feeders           | MLAT off  | MLAT on    | On less off | `Notes` held (its limit 829 MiB) |
+| ----------------- | --------- | ---------- | ----------- | -------------------------------- |
+| none (idle, 10 s) | 17.3 MiB  | 19.8 MiB   | 2.5 MiB     | 0                                |
+| 500               | 416 MiB   | 1,981 MiB  | 1,565 MiB   | 4 MiB (peak 369)                 |
+| 2,000             | 1,140 MiB | 8,201 MiB  | 7,061 MiB   | 2,451 MiB                        |
+| 5,000             | 2,209 MiB | 17,070 MiB | 14,861 MiB  | 5,270 MiB (peak 8,727)           |
+
+A line through the MLAT runs (least squares) is 843 MiB and 3.30 MiB a feeder, and through their
+differences from the runs without it 569 MiB and 2.90 MiB a feeder; through the 500 and 2,000
+points alone it meets zero feeders below zero. None of these intercepts is a base: what MLAT holds
+grows faster than any line where the engine falls behind, and is still rising at the end of each
+run. Its base is what it holds before any feeder, 2.5 MiB, and `budget::MLAT_BASE_BYTES` is 4 MiB,
+in the relay's base (`budget::Plan::base`) when it hosts MLAT.
+
+What the runs show instead is that MLAT's memory is not held to the budget. At 5,000 feeders the
+relay was 17 GB resident under a 14 GiB `--memory`. Its notes to provisional solving are charged
+by force (`Gauge::force`, `mlat_host::Shared::tell`): one step interval's notes are bounded by
+count, but nothing bounds how many intervals wait for a step that is behind, so with four threads
+the `Notes` store held six times its share at 2,000 feeders and ten at its peak at 5,000, keeping
+4.9 GB of decoded batches alive. `Held` is charged by force too. At 500 feeders, with every store
+inside its share, the relay was still 1.1 GB above what its stores and base account for: the
+engine's own tables, which no store charges.
+
+The public relay's shape (`infra/kubernetes/tally/relay.yaml`: `--memory 576M`,
+`--mlat-threads 1`, its ceiling of 167 feeders, two areas, 300 s measured) was 712 MiB resident and
+still rising, past its 640 MiB limit: `Held` peaked at 211 MiB of its 179 and `Notes` at 66 of
+its 18. It does not fit, and the 64 MiB it left under its limit was not standing in for a base.
+Separately, taking the 122 resolution-0 areas costs 530 MiB and a whole core with no feeder at all
+(the per-area work of every 100 ms network tick, on `main` as here), so the deployed relay does not
+fit its node however MLAT is sized.

@@ -16,12 +16,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tally_wire::batch::Hash;
 use tally_wire::{
-    Batch, ClockModel, ClockModelPart, Decoded, FaultProof, Location, Observation, Positions,
-    PublicKey, ReceiverInfo, Record, Region, RelayAddress,
+    Batch, ClockModel, ClockModelPart, Decoded, FaultProof, Location, Positions, PublicKey,
+    ReceiverInfo, Record, Region, RelayAddress,
 };
 
 use crate::bounded::Bounded;
-use crate::budget::{Budget, PerFeeder, Store};
+use crate::budget::{Budget, Plan, Store};
 use crate::egress::{Cap, Egress};
 use crate::exchange::{Gauges, SHARDS, Sink, raw_shard};
 use crate::fanout::{BEHIND_MS, Bounds, Filter, Listener, Router};
@@ -786,7 +786,7 @@ impl Hub {
     /// As `new`, its ingest clock `clock`.
     pub fn clocked(max_subscribers: usize, clock: Clock) -> Self {
         let network = Network::new();
-        let budget = Budget::of_memory(DEFAULT_MEMORY, PerFeeder::planned(false));
+        let budget = Budget::of_memory(DEFAULT_MEMORY, Plan::planned(false));
         network.charge_to(&budget);
         let stages = Stages::inline(
             Arc::clone(&clock),
@@ -865,14 +865,19 @@ impl Hub {
         Ok(self)
     }
 
-    /// The regional product's stream under `boot_id` instead of a random one: what two runs of
-    /// one trace compare byte for byte by. Built before the hub is shared or staged.
-    pub fn regional_boot(mut self, boot_id: u64) -> Self {
+    /// The relay's own streams under fixed boot ids instead of random ones (the regional product
+    /// under `boot_id`, the deduplicated stream under the next): what two runs of one trace
+    /// compare byte for byte by. Built before the hub is shared or staged.
+    pub fn product_boots(mut self, boot_id: u64) -> Self {
         let clock = self.stages.clock();
         let unused: Sink = Arc::new(|_| true);
         let gauges = Gauges::of(&self.budget);
         self.stages = Stages::inline(Arc::clone(&clock), unused, gauges.clone());
-        self.network.products = Arc::new(crate::products::Products::with_boot(boot_id, 1));
+        self.network.products = Arc::new(crate::products::Products::with_boots(
+            boot_id,
+            boot_id.wrapping_add(1),
+            1,
+        ));
         self.network.charge_to(&self.budget);
         self.stages = Stages::inline(clock, self.network.products.sink(), gauges);
         self
@@ -882,7 +887,7 @@ impl Hub {
     /// queue's share of it (each store's gauge, resized in place). `holds_raw`: the relay hosts
     /// MLAT.
     pub fn memory(mut self, memory: usize, holds_raw: bool) -> Self {
-        self.budget.resize(memory, PerFeeder::planned(holds_raw));
+        self.budget.resize(memory, Plan::planned(holds_raw));
         self.fanout = Arc::new(router(&self.budget));
         self.network.charge_to(&self.budget);
         self
@@ -1674,24 +1679,6 @@ impl Hub {
         new
     }
 
-    /// The first copies the message exchange decided since the last call, for the relay to sign,
-    /// in canonical order (`exchange`), and how many epochs were refused whole since then.
-    pub fn take_deduplicated(&self) -> (Vec<Observation>, u64) {
-        self.network.products.take_stream()
-    }
-
-    /// Broadcasts a batch the relay signed itself.
-    pub fn publish_relay_batch(&self, batch: Batch) {
-        self.fanout.publish(Item {
-            source: RELAY_ITSELF,
-            record: Arc::new(Record::RelayBatch(batch)),
-            cell: None,
-            points: None,
-            decoded: None,
-            stamp_ms: self.now_ms(),
-        });
-    }
-
     /// A place among the subscribers, with the known receiver descriptions `subscription` covers
     /// to send first, or `None` when the relay is serving as many subscribers as it will.
     ///
@@ -1809,7 +1796,7 @@ fn described(mut report: StationReport, known: Option<&Known>) -> StationReport 
 mod tests {
     use super::*;
     use tally_wire::batch::ReceiverInfoContent;
-    use tally_wire::{BatchContent, Clock, Identity};
+    use tally_wire::{BatchContent, Clock, Identity, Observation};
 
     /// A bundle index a peer sent is passed on once, however often it comes back: three relays
     /// once passed one round a loop of their one-hop raw links for ever, thousands a second.
@@ -2005,11 +1992,26 @@ mod tests {
             heard.push(observation(100 + n as u8));
             assert!(hub.publish_batch(1, signed_batch(&receiver, 0, heard)?, receiver_key));
         }
+        // The relay's own stream, signed as the relay: the batches it made since the last call.
+        let relay = Identity::from_seed([77; 32]);
+        hub.network().adopt_identity(relay.clone());
+        let stream = || -> Result<Vec<Observation>, String> {
+            let mut stream = Vec::new();
+            for record in hub.network().products.tick(None) {
+                if let Record::RelayBatch(batch) = record {
+                    batch.verify_as_relay().map_err(|error| error.to_string())?;
+                    assert_eq!(batch.receiver().ok(), Some(relay.public()));
+                    stream.extend(batch.content().map_err(|e| e.to_string())?.observations);
+                }
+            }
+            Ok(stream)
+        };
         // The epoch is open: nothing yet.
-        assert_eq!(hub.take_deduplicated().0.len(), 0);
+        assert_eq!(stream()?.len(), 0);
         clock.store(11_000, Ordering::Relaxed);
         hub.advance(11_000);
-        let (stream, refused) = hub.take_deduplicated();
+        let stream = stream()?;
+        let refused = hub.network().products.report().stream_refused;
         assert_eq!((stream.len(), refused), (5 + 4, 0));
         let mut data: Vec<Vec<u8>> = stream.iter().map(|o| o.data.clone()).collect();
         data.sort_unstable();

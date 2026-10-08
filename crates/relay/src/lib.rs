@@ -46,11 +46,11 @@ use crate::hub::Hub;
 
 /// Accepts connections on `listener` up to the hub's connection caps, the relay's and each source
 /// address's (beyond either, a connection is closed before its handshake), each counted and capped
-/// from its first byte (`egress::Socket`); and signs the deduplicated stream with the newest key
-/// (`identities[0]`), for as long as the relay runs.
+/// from its first byte (`egress::Socket`); and signs its own records (its products, the
+/// deduplicated stream among them, and its network records) with the newest key (`identities[0]`),
+/// for as long as the relay runs.
 pub async fn serve(listener: TcpListener, identities: Vec<Identity>, hub: Arc<Hub>) -> ! {
     if let Some(newest) = identities.first() {
-        tokio::spawn(deduplicated::run(Arc::clone(&hub), newest.clone()));
         hub.network().adopt_identity(newest.clone());
     }
     tokio::spawn(network::run(Arc::clone(&hub)));
