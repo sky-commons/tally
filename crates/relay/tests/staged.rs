@@ -1,19 +1,20 @@
 //! The staged relay's invariants (RFC-0178, "Invariants the tests hold"), on the relay's own
 //! threads: the same stamped trace gives byte-identical products and stream on 1, 2 and 8
-//! threads, and byte-identical MLAT (clock models, positions, provisional positions: the raw held
-//! once, in the raw shards, sealed from them) which is also what the reference engine makes of
-//! the same raw; no consumer reads a clock (delays injected anywhere change nothing); a message heard
-//! by many receivers on many workers is kept once a window; each receiver's batches reach a
-//! subscriber in admitted order, described first; and what is let go is let go whole, counted.
+//! threads; no consumer reads a clock (batches stamped by the relay's own ingest clock, with
+//! delays injected inside every stage, make the same bytes as with none); a message heard by many
+//! receivers on many workers is kept once a window, and copies up to two seconds apart are one;
+//! each receiver's batches reach a subscriber in admitted order, described first; and what is let
+//! go is let go whole, counted. The hosted MLAT's are in `staged_mlat.rs`.
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use tally_mlat_solver::modes::{self, LatLon};
 use tally_relay::fanout::{Fell, Filter};
 use tally_relay::hub::{Hub, Inbound, Item, Origin};
-use tally_relay::ingest::{Stamp, Threads};
+use tally_relay::ingest::{Pause, Stage, Stamp, Threads};
 use tally_wire::batch::{ReceiverInfoContent, format};
 use tally_wire::{
     Batch, BatchContent, Clock, Identity, Location, Observation, ReceiverInfo, Record, Streams,
@@ -159,14 +160,9 @@ struct Made {
     stream: Vec<(u8, Vec<u8>)>,
 }
 
-/// A relay on `threads` (its ingest clock stopped, so only the trace's stamps say when), shown the
-/// trace: each batch waiting `delay(n)` first.
-fn run(trace: &Trace, threads: Threads, delay: impl Fn(usize) -> Duration) -> Result<Made> {
-    let hub = Arc::new(
-        Hub::clocked(8, Arc::new(|| 0))
-            .regional_boot(42)
-            .staged(threads),
-    );
+/// The relay's key, the trace's world switched on and its feeders described: as the trace's
+/// relay starts.
+fn start(hub: &Hub, trace: &Trace) {
     hub.network().adopt_identity(trace.relay.clone());
     hub.network().products.set_world(true);
     for (identity, info, location) in &trace.feeders {
@@ -179,27 +175,31 @@ fn run(trace: &Trace, threads: Threads, delay: impl Fn(usize) -> Duration) -> Re
             true,
         );
     }
-    for (n, (batch, stamp)) in trace.batches.iter().enumerate() {
-        std::thread::sleep(delay(n));
-        hub.ingest(Inbound {
-            source: 2,
-            batch: batch.clone(),
-            origin: Origin::Elsewhere,
-            verify: true,
-            stamp: Some(*stamp),
-            permit: None,
-            refusal: None,
-        });
+}
+
+/// A trace's batch, as a link hands it in: stamped `stamp`, or by the ingest clock when `None`.
+fn inbound(batch: &Batch, stamp: Option<Stamp>) -> Inbound {
+    Inbound {
+        source: 2,
+        batch: batch.clone(),
+        origin: Origin::Elsewhere,
+        verify: true,
+        stamp,
+        permit: None,
+        refusal: None,
     }
-    hub.advance(trace.end_ms);
+}
+
+/// Every worker ticks at `end_ms`, and once the products have sealed to it: what they made.
+fn made(hub: &Hub, end_ms: u64) -> Result<Made> {
+    hub.advance(end_ms);
     let products = &hub.network().products;
     let started = Instant::now();
-    while products.watermark_ms() < trace.end_ms {
+    while products.watermark_ms() < end_ms {
         if started.elapsed() > Duration::from_secs(60) {
             return Err(format!(
-                "the products reached {} of {}",
-                products.watermark_ms(),
-                trace.end_ms
+                "the products reached {} of {end_ms}",
+                products.watermark_ms()
             ));
         }
         std::thread::sleep(Duration::from_millis(5));
@@ -226,6 +226,65 @@ fn run(trace: &Trace, threads: Threads, delay: impl Fn(usize) -> Duration) -> Re
     Ok(made)
 }
 
+/// A relay on `threads` (its ingest clock stopped, so only the trace's stamps say when), shown the
+/// trace: each batch waiting `delay(n)` first.
+fn run(trace: &Trace, threads: Threads, delay: impl Fn(usize) -> Duration) -> Result<Made> {
+    let hub = Arc::new(
+        Hub::clocked(8, Arc::new(|| 0))
+            .regional_boot(42)
+            .staged(threads)?,
+    );
+    start(&hub, trace);
+    for (n, (batch, stamp)) in trace.batches.iter().enumerate() {
+        std::thread::sleep(delay(n));
+        hub.ingest(inbound(batch, Some(*stamp)));
+    }
+    made(&hub, trace.end_ms)
+}
+
+/// A relay on `threads` whose batches are stamped by its own ingest clock, never by the trace:
+/// the clock reads each second of the trace while that second's batches are handed in (and
+/// moves on once the ingest stage has taken them all, as a second passes once its batches have
+/// arrived), and every stage is held up inside by `pause`: a worker between a batch's stamp and
+/// its routing, a message thread before each envelope, the sealer and its pool before each
+/// command and job.
+fn run_clocked(trace: &Trace, threads: Threads, pause: Option<Pause>) -> Result<Made> {
+    let clock = Arc::new(AtomicU64::new(BASE_MS));
+    let reading = Arc::clone(&clock);
+    let hub = Arc::new(
+        Hub::clocked(8, Arc::new(move || reading.load(Ordering::SeqCst)))
+            .regional_boot(42)
+            .staged_pausing(threads, pause)?,
+    );
+    start(&hub, trace);
+    for (second, batches) in trace.batches.chunks(FEEDERS).enumerate() {
+        clock.store(BASE_MS + second as u64 * 1_000 + 100, Ordering::SeqCst);
+        for (batch, _) in batches {
+            hub.ingest(inbound(batch, None));
+        }
+        hub.flush();
+    }
+    clock.store(trace.end_ms, Ordering::SeqCst);
+    made(&hub, trace.end_ms)
+}
+
+/// Pseudorandom delays inside every stage, up to `most_us` microseconds each, differing by stage
+/// and by call: the workers, the shards and the sealer each fall behind and catch up at different
+/// moments.
+fn jitter(most_us: u64) -> Pause {
+    let calls = Arc::new(AtomicU64::new(0));
+    Arc::new(move |stage| {
+        let n = calls.fetch_add(1, Ordering::Relaxed);
+        let salt = match stage {
+            Stage::Ingest => 1,
+            Stage::Message => 2,
+            Stage::Sealer => 3,
+        };
+        let us = n.wrapping_mul(2_654_435_761).wrapping_add(salt * 40_503) % most_us;
+        std::thread::sleep(Duration::from_micros(us));
+    })
+}
+
 #[test]
 fn the_same_stamped_trace_makes_the_same_bytes_on_any_number_of_threads() -> Result {
     let trace = trace()?;
@@ -247,6 +306,106 @@ fn the_same_stamped_trace_makes_the_same_bytes_on_any_number_of_threads() -> Res
             "{ingest} ingest and {message} message threads differ"
         );
     }
+    Ok(())
+}
+
+/// RFC-0178 invariant 2 at the relay's own clock (the audit's 5.1): the stamps come from the
+/// ingest clock as a relay's do, not from a trace, and delays are injected inside every stage
+/// (after the stamp, in the message threads, in the sealer and its pool), not between batches.
+/// The bytes made are the same as with no delay at all, on any number of threads: what is in
+/// which epoch, and which copy is kept, follows the stamps and the batches alone, never which
+/// worker took a batch first or when a stage got to it.
+#[test]
+fn stamped_by_the_ingest_clock_with_delays_inside_every_stage_the_bytes_are_the_same() -> Result {
+    let trace = trace()?;
+    let steady = run_clocked(
+        &trace,
+        Threads {
+            ingest: 1,
+            message: 1,
+        },
+        None,
+    )?;
+    assert!(!steady.regional.is_empty(), "no regional product");
+    assert!(!steady.world.is_empty(), "no world product");
+    assert!(!steady.stream.is_empty(), "no deduplicated stream");
+    for (ingest, message) in [(4, 4), (8, 3)] {
+        let delayed = run_clocked(&trace, Threads { ingest, message }, Some(jitter(2_000)))?;
+        assert_eq!(
+            steady, delayed,
+            "{ingest} ingest and {message} message threads, delayed inside, differ"
+        );
+    }
+    Ok(())
+}
+
+/// The deduplication's window, by stamps (`exchange::DEDUP_WINDOW_MS`, the old relay's two 2 s
+/// generations): copies of a message stamped up to two seconds after the copy kept are not kept
+/// again, whichever epochs they fall in and whichever workers took them; one stamped past the
+/// window is. With one epoch and the one before, the copy two seconds on was kept again.
+#[test]
+fn copies_of_a_message_up_to_two_seconds_apart_are_kept_once() -> Result {
+    let hub = Arc::new(Hub::clocked(8, Arc::new(|| 0)).staged(Threads {
+        ingest: 4,
+        message: 4,
+    })?);
+    let message = airborne(
+        0x00a0_0001,
+        LatLon {
+            lat_deg: 33.0,
+            lon_deg: -84.6,
+        },
+        false,
+    );
+    // After the first copy: at once, 0.999 s, 2 s (each the same message), then 3.5 s (past it).
+    for (n, after_ms) in [0u64, 999, 2_000, 3_500].into_iter().enumerate() {
+        let receiver = Identity::from_seed([n as u8 + 60; 32]);
+        let batch = Batch::sign(
+            &receiver,
+            &BatchContent {
+                boot_id: 1,
+                sequence: 0,
+                counter_epoch: 0,
+                wall_ms: BASE_MS,
+                dropped: 0,
+                previous: [0; 32],
+                observations: vec![Observation {
+                    format: format::MODE_S_LONG,
+                    timestamp: n as u64,
+                    signal: 1,
+                    data: message.clone(),
+                }],
+            },
+        )
+        .map_err(text)?;
+        let stamp = Stamp {
+            stamp_ms: BASE_MS + 400 + after_ms,
+            ingest_seq: n as u64,
+        };
+        hub.ingest(inbound(&batch, Some(stamp)));
+    }
+    let end_ms = BASE_MS + 10_000;
+    hub.advance(end_ms);
+    let products = &hub.network().products;
+    let started = Instant::now();
+    while products.watermark_ms() < end_ms {
+        if started.elapsed() > Duration::from_secs(60) {
+            return Err("the epochs never closed".to_owned());
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let (stream, refused) = hub.take_deduplicated();
+    assert_eq!(refused, 0);
+    let kept: Vec<u64> = stream
+        .iter()
+        .filter(|observation| observation.data == message)
+        .map(|observation| observation.timestamp)
+        .collect();
+    assert_eq!(
+        kept,
+        vec![0, 3],
+        "kept: the first copy, and the one past the window"
+    );
     Ok(())
 }
 
@@ -318,7 +477,7 @@ async fn each_receivers_batches_reach_a_subscriber_in_order_described_first() ->
     let hub = Arc::new(Hub::clocked(8, Arc::new(|| 0)).staged(Threads {
         ingest: 8,
         message: 2,
-    }));
+    })?);
     let listener = hub.listen(
         999,
         Filter::Subscription(tally_relay::subscription::Subscription {
@@ -424,7 +583,7 @@ async fn a_subscriber_that_falls_behind_is_let_go_whole_and_the_stream_refused_w
             .staged(Threads {
                 ingest: 2,
                 message: 2,
-            }),
+            })?,
     );
     let raw = || {
         Filter::Subscription(tally_relay::subscription::Subscription {
@@ -492,373 +651,6 @@ async fn a_subscriber_that_falls_behind_is_let_go_whole_and_the_stream_refused_w
     Ok(())
 }
 
-/// The areas within about 150 km of the simulator's centre, where its receivers and aircraft are.
-fn mlat_areas() -> Result<Vec<tally_wire::Region>> {
-    let (lat, lon) = tally_mlat_solver::sim::CENTRE;
-    let mut areas = Vec::new();
-    for north in -2..=2 {
-        for east in -2..=2 {
-            let location = Location {
-                lat_e7: ((lat + f64::from(north) * 0.6) * 1e7) as i32,
-                lon_e7: ((lon + f64::from(east) * 1.0) * 1e7) as i32,
-                alt_m: 0,
-                precision_m: 0,
-            };
-            let area =
-                tally_wire::Region::containing(&location, tally_wire::rendezvous::AREA_RESOLUTION)
-                    .map_err(text)?;
-            if !areas.contains(&area) {
-                areas.push(area);
-            }
-        }
-    }
-    Ok(areas)
-}
-
-const MLAT_BOOT: u64 = 0xb007;
-
-fn mlat_settings(threads: usize) -> tally_mlat::engine::Settings {
-    tally_mlat::engine::Settings {
-        regions: Vec::new(),
-        settle_ms: tally_relay::mlat_host::SETTLE_MS,
-        threads,
-        capacity: tally_mlat::engine::Capacity::default(),
-    }
-}
-
-/// How the receivers' descriptions reach a relay in `mlat_run`.
-#[derive(Clone, Copy, Debug)]
-enum Describing {
-    /// Each at its place in the trace, between the batches.
-    Inline,
-    /// All before the first batch, in the trace's order or reversed.
-    Before { reversed: bool },
-    /// All before the first batch, from several threads at once, each pausing pseudorandomly
-    /// between them: an interleaving nobody chose.
-    Racing { seed: u64 },
-}
-
-/// Hands every description of `arrivals` to `hub` as `describing` says (not `Inline`).
-fn describe_all(hub: &Arc<Hub>, arrivals: &[(u64, Record)], describing: Describing) -> Result {
-    let mut infos: Vec<tally_wire::ReceiverInfo> = arrivals
-        .iter()
-        .filter_map(|(_, record)| match record {
-            Record::ReceiverInfo(info) => Some(info.clone()),
-            _ => None,
-        })
-        .collect();
-    let publish = |hub: &Hub, info: &tally_wire::ReceiverInfo| -> Result {
-        let content = info.content().map_err(text)?;
-        hub.publish_info(
-            1,
-            info.clone(),
-            info.receiver().map_err(text)?,
-            content.issued_ms,
-            content.location,
-            true,
-        );
-        Ok(())
-    };
-    match describing {
-        Describing::Inline => {}
-        Describing::Before { reversed } => {
-            if reversed {
-                infos.reverse();
-            }
-            for info in &infos {
-                publish(hub, info)?;
-            }
-        }
-        Describing::Racing { seed } => {
-            const RACERS: usize = 4;
-            std::thread::scope(|scope| -> Result {
-                let handles: Vec<_> = (0..RACERS)
-                    .map(|racer| {
-                        let infos = &infos;
-                        let publish = &publish;
-                        scope.spawn(move || -> Result {
-                            for (n, info) in infos.iter().enumerate().skip(racer).step_by(RACERS) {
-                                let pause = (n as u64 ^ seed).wrapping_mul(2_654_435_761) % 700;
-                                std::thread::sleep(Duration::from_micros(pause));
-                                publish(hub, info)?;
-                            }
-                            Ok(())
-                        })
-                    })
-                    .collect();
-                for handle in handles {
-                    handle.join().map_err(|_| "a racer panicked".to_owned())??;
-                }
-                Ok(())
-            })?;
-        }
-    }
-    Ok(())
-}
-
-/// What a staged relay on `threads` hosting MLAT for `areas` (on `settings`) signs from `arrivals`
-/// (each record at its time, a batch stamped so, the descriptions as `describing` says): every
-/// `STEP_MS` of the trace's clock what has arrived is ingested and every worker has taken it, then
-/// the host is asked and waited on. Its records, provisional ones apart from the rest, each
-/// encoded in order, and its report.
-fn mlat_run_with(
-    arrivals: &[(u64, Record)],
-    areas: &[tally_wire::Region],
-    threads: Threads,
-    settings: tally_mlat::engine::Settings,
-    describing: Describing,
-) -> Result<(
-    Signed,
-    tally_relay::mlat_host::MlatReport,
-    Vec<tally_wire::PublicKey>,
-)> {
-    use tally_relay::mlat_host::{HostedMlat, MlatHost, STEP_MS};
-    let hub = Arc::new(Hub::clocked(8, Arc::new(|| 0)).staged(threads));
-    let host = Arc::new(HostedMlat::new(
-        Identity::from_seed([5; 32]),
-        MLAT_BOOT,
-        settings,
-    ));
-    hub.network()
-        .host_mlat(Arc::clone(&host) as Arc<dyn MlatHost>);
-    host.set_areas(areas.to_vec(), Vec::new());
-    describe_all(&hub, arrivals, describing)?;
-    let first = arrivals.first().map(|(at, _)| *at).ok_or("no raw")?;
-    let until = arrivals.last().map_or(0, |(at, _)| *at) + 60_000;
-    let mut published = Vec::new();
-    let mut next = 0;
-    let mut now = first;
-    while now <= until {
-        while let Some((at, record)) = arrivals.get(next).filter(|(at, _)| *at <= now) {
-            match record {
-                Record::ReceiverInfo(_) if !matches!(describing, Describing::Inline) => {}
-                Record::ReceiverInfo(info) => {
-                    // A description reaches the shards at once: what was handed in before it is
-                    // taken first, as one connection's records are.
-                    hub.flush();
-                    let content = info.content().map_err(text)?;
-                    hub.publish_info(
-                        1,
-                        info.clone(),
-                        info.receiver().map_err(text)?,
-                        content.issued_ms,
-                        content.location,
-                        true,
-                    );
-                }
-                Record::Batch(batch) => {
-                    hub.ingest(Inbound {
-                        source: 2,
-                        batch: batch.clone(),
-                        origin: Origin::Elsewhere,
-                        verify: true,
-                        stamp: Some(Stamp {
-                            stamp_ms: *at,
-                            ingest_seq: next as u64,
-                        }),
-                        permit: None,
-                        refusal: None,
-                    });
-                }
-                _ => {}
-            }
-            next += 1;
-        }
-        hub.advance(now);
-        hub.flush();
-        published.extend(host.take_published(now));
-        let started = Instant::now();
-        while host.in_flight() > 0 {
-            if started.elapsed() > Duration::from_secs(120) {
-                return Err("the hosted MLAT never settled".to_owned());
-            }
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        published.extend(host.take_signed());
-        now += STEP_MS;
-    }
-    assert_eq!(host.refused(), 0);
-    // The receivers whose raw the engine held, by the sealed bins it kept.
-    let sealed = host.sealed_bins().ok_or("no sealed bins")?;
-    let mut held: Vec<tally_wire::PublicKey> = sealed
-        .bins(i64::MIN, i64::MAX)
-        .iter()
-        .flat_map(|bin| bin.receivers.clone())
-        .collect();
-    held.sort_unstable();
-    held.dedup();
-    Ok((encoded(&published), host.report(), held))
-}
-
-/// `mlat_run_with` on `threads` and as many MLAT threads, the descriptions inline.
-fn mlat_run(
-    arrivals: &[(u64, Record)],
-    areas: &[tally_wire::Region],
-    threads: Threads,
-) -> Result<Signed> {
-    let (signed, _, _) = mlat_run_with(
-        arrivals,
-        areas,
-        threads,
-        mlat_settings(threads.ingest),
-        Describing::Inline,
-    )?;
-    Ok(signed)
-}
-
-/// Records as bytes, in order: provisional positions, and the rest.
-type Signed = (Vec<Vec<u8>>, Vec<Vec<u8>>);
-
-/// Each record's bytes, provisional positions apart from the rest, each in order.
-fn encoded(records: &[Record]) -> Signed {
-    let mut provisional = Vec::new();
-    let mut rest = Vec::new();
-    for record in records {
-        let mut bytes = Vec::new();
-        if record.encode(&mut bytes).is_err() {
-            continue;
-        }
-        if matches!(record, Record::Provisional(_)) {
-            provisional.push(bytes);
-        } else {
-            rest.push(bytes);
-        }
-    }
-    (provisional, rest)
-}
-
-/// RFC-0178 §3, §5 and invariant 1: the relay holds MLAT's raw once, in its raw shards, taken there
-/// by the ingest workers and sealed from them (`held::Bin::seal_from`), and its provisional state
-/// in address shards, weighed and stepped in parallel; the hosted engine solves those sealed bins.
-/// The same stamped trace makes the same clock models, positions and provisional positions, byte
-/// for byte, on 1, 2 and 8 ingest workers and as many MLAT threads, and they are what the
-/// reference engine, holding all the raw and every address shard itself on two threads, makes of
-/// the same raw at the same clocks (`tally_mlat::replay`).
-#[test]
-fn hosted_mlat_makes_the_same_bytes_on_any_number_of_threads_and_the_reference_engines() -> Result {
-    use tally_mlat::replay::{arrivals, replay, scenario};
-    let mut simulation = tally_mlat_solver::sim::run(&scenario(17, 60.0));
-    let delivered = arrivals(&mut simulation, 3)?;
-    let areas = mlat_areas()?;
-    let one = mlat_run(
-        &delivered,
-        &areas,
-        Threads {
-            ingest: 1,
-            message: 1,
-        },
-    )?;
-    assert!(!one.0.is_empty(), "no provisional positions");
-    let positions = one
-        .1
-        .iter()
-        .filter_map(|bytes| Record::decode(bytes).ok().and_then(|(record, _)| record))
-        .filter(|record| matches!(record, Record::Positions(_)))
-        .count();
-    assert!(positions > 0, "no positions");
-    for (ingest, message) in [(2, 2), (8, 8), (8, 3)] {
-        let many = mlat_run(&delivered, &areas, Threads { ingest, message })?;
-        assert_eq!(
-            one.1, many.1,
-            "{ingest} ingest threads: models and positions differ"
-        );
-        assert_eq!(
-            one.0, many.0,
-            "{ingest} ingest threads: provisionals differ"
-        );
-    }
-    let first = delivered.first().map(|(at, _)| *at).ok_or("no raw")?;
-    let until = delivered.last().map_or(0, |(at, _)| *at) + 60_000;
-    let mut engine =
-        tally_mlat::engine::Engine::new(Identity::from_seed([5; 32]), MLAT_BOOT, mlat_settings(2));
-    engine.set_scope(tally_mlat::area::border_band(&areas), areas.clone());
-    let reference: Vec<Record> = replay(
-        &mut engine,
-        &delivered,
-        tally_relay::mlat_host::STEP_MS,
-        until,
-    )?
-    .into_iter()
-    .filter(|(at, _)| *at >= first)
-    .map(|(_, record)| record)
-    .collect();
-    let reference = encoded(&reference);
-    assert_eq!(
-        one.1, reference.1,
-        "models and positions differ from the reference"
-    );
-    assert_eq!(one.0, reference.0, "provisionals differ from the reference");
-    Ok(())
-}
-
-/// RFC-0178 §9 and invariant 1 at capacity: a relay whose MLAT seats fewer receivers than are
-/// described refuses the same ones, whole, whatever order the descriptions came in, however they
-/// raced, and on any number of threads: the best ranked are seated (`tally_mlat::intake::Seats`,
-/// taking part first, then key), every other one refused and counted, and the same records signed
-/// byte for byte.
-#[test]
-fn at_capacity_the_same_receivers_are_refused_whatever_the_order_and_the_threads() -> Result {
-    use tally_mlat::replay::{arrivals, scenario};
-    let mut simulation = tally_mlat_solver::sim::run(&scenario(17, 60.0));
-    let delivered = arrivals(&mut simulation, 3)?;
-    let areas = mlat_areas()?;
-    let mut keys: Vec<tally_wire::PublicKey> = delivered
-        .iter()
-        .filter_map(|(_, record)| match record {
-            Record::ReceiverInfo(info) => info.receiver().ok(),
-            _ => None,
-        })
-        .collect();
-    keys.sort_unstable();
-    // Two seats short: every receiver of the trace takes part (they are all inside the areas), so
-    // the two with the greatest keys are the ones refused.
-    const SHORT: usize = 2;
-    assert!(keys.len() > SHORT + 3, "{} receivers", keys.len());
-    let seats = keys.len() - SHORT;
-    let settings = |threads: usize| tally_mlat::engine::Settings {
-        capacity: tally_mlat::engine::Capacity {
-            receivers: seats,
-            rates: tally_mlat_solver::held::Rates::MEASURED,
-        },
-        ..mlat_settings(threads)
-    };
-    let mut runs = Vec::new();
-    for (ingest, describing) in [
-        (1, Describing::Before { reversed: false }),
-        (2, Describing::Before { reversed: true }),
-        (8, Describing::Before { reversed: false }),
-        (1, Describing::Racing { seed: 1 }),
-        (2, Describing::Racing { seed: 2 }),
-        (8, Describing::Racing { seed: 3 }),
-    ] {
-        let threads = Threads {
-            ingest,
-            message: ingest,
-        };
-        let (signed, report, held) =
-            mlat_run_with(&delivered, &areas, threads, settings(ingest), describing)?;
-        assert_eq!(
-            report.receivers_refused, SHORT as u64,
-            "{ingest} threads, {describing:?}: {report:?}"
-        );
-        assert_eq!(
-            held,
-            keys[..seats].to_vec(),
-            "{ingest} threads, {describing:?}: other receivers held"
-        );
-        runs.push((ingest, describing, signed));
-    }
-    let (_, _, first) = &runs[0];
-    assert!(!first.0.is_empty(), "no provisional positions");
-    for (ingest, describing, signed) in &runs[1..] {
-        assert_eq!(
-            first, signed,
-            "{ingest} threads, {describing:?}: the records differ"
-        );
-    }
-    Ok(())
-}
-
 /// A batch of `count` distinct receptions from `receiver`, its sequence `sequence`.
 fn busy_batch(receiver: &Identity, sequence: u64, count: u32) -> Result<Batch> {
     Batch::sign(
@@ -905,7 +697,7 @@ async fn a_stalled_stage_never_grows_past_the_budget() -> Result {
             .staged(Threads {
                 ingest: 2,
                 message: 2,
-            }),
+            })?,
     );
     let stalled = hub.listen(
         998,

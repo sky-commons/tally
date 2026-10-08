@@ -28,7 +28,8 @@ struct Signer {
     boot_id: u64,
     sequence: u64,
     previous: Hash,
-    /// Observations too large for any message since the last report: never sent, and said.
+    /// Observations too large for any message since the last report: never sent, counted
+    /// (`ProductsReport::stream_oversized`) and said.
     oversized: u64,
 }
 
@@ -45,54 +46,62 @@ impl Signer {
         }
     }
 
-    /// Signs the observations as one or more batches, each small enough for one message.
-    fn sign(&mut self, observations: Vec<Observation>) -> Vec<Batch> {
+    /// Signs the observations as one or more batches, each small enough for one message. Each
+    /// observation is moved, never copied: into its chunk, its batch's content, and back when a
+    /// chunk is halved. Returns the batches and how many observations were too large for any.
+    fn sign(&mut self, mut observations: Vec<Observation>) -> (Vec<Batch>, u64) {
         let mut signed = Vec::new();
-        let mut todo: Vec<Vec<Observation>> = observations
-            .chunks(FIRST_TRY)
-            .rev()
-            .map(<[Observation]>::to_vec)
-            .collect();
+        let mut oversized = 0;
+        if observations.is_empty() {
+            return (signed, oversized);
+        }
+        let mut todo: Vec<Vec<Observation>> = Vec::new();
+        while observations.len() > FIRST_TRY {
+            let rest = observations.split_off(FIRST_TRY);
+            todo.push(std::mem::replace(&mut observations, rest));
+        }
+        todo.push(observations);
+        todo.reverse();
         while let Some(chunk) = todo.pop() {
-            match self.try_sign(&chunk) {
-                Some(batch) => {
+            match self.try_sign(chunk) {
+                Ok(batch) => {
                     self.previous = batch.hash();
                     self.sequence += 1;
                     signed.push(batch);
                 }
                 // One observation too large for any message is not deliverable: counted.
-                None if chunk.len() <= 1 => self.oversized += chunk.len() as u64,
-                None => {
-                    let (first, second) = chunk.split_at(chunk.len() / 2);
-                    todo.push(second.to_vec());
-                    todo.push(first.to_vec());
+                Err(chunk) if chunk.len() <= 1 => oversized += chunk.len() as u64,
+                Err(mut first) => {
+                    let second = first.split_off(first.len() / 2);
+                    todo.push(second);
+                    todo.push(first);
                 }
             }
         }
-        signed
+        self.oversized += oversized;
+        (signed, oversized)
     }
 
-    /// The signed batch, or `None` when it would not fit one message.
-    fn try_sign(&self, observations: &[Observation]) -> Option<Batch> {
-        let batch = Batch::sign_as_relay(
-            &self.identity,
-            &BatchContent {
-                boot_id: self.boot_id,
-                sequence: self.sequence,
-                counter_epoch: 0,
-                wall_ms: wall_ms(),
-                dropped: 0,
-                previous: self.previous,
-                observations: observations.to_vec(),
-            },
-        )
-        .ok()?;
+    /// The signed batch, or the observations back when it would not fit one message.
+    fn try_sign(&self, observations: Vec<Observation>) -> Result<Batch, Vec<Observation>> {
+        let content = BatchContent {
+            boot_id: self.boot_id,
+            sequence: self.sequence,
+            counter_epoch: 0,
+            wall_ms: wall_ms(),
+            dropped: 0,
+            previous: self.previous,
+            observations,
+        };
+        let Ok(batch) = Batch::sign_as_relay(&self.identity, &content) else {
+            return Err(content.observations);
+        };
         let record = Record::RelayBatch(batch);
         let mut encoded = Vec::new();
-        record.encode(&mut encoded).ok()?;
+        let fits = record.encode(&mut encoded).is_ok() && encoded.len() <= MAX_PLAINTEXT;
         match record {
-            Record::RelayBatch(batch) if encoded.len() <= MAX_PLAINTEXT => Some(batch),
-            _ => None,
+            Record::RelayBatch(batch) if fits => Ok(batch),
+            _ => Err(content.observations),
         }
     }
 }
@@ -121,7 +130,7 @@ pub async fn run(hub: Arc<Hub>, identity: Identity) {
                  since the last report, each with every message first heard in it (their batches \
                  were forwarded raw): the products were behind or past their budget \
                  (`stream_refused` in GET /products); {} observations were too large for any \
-                 message",
+                 message (`stream_oversized`)",
                 signer.oversized
             );
             refused = 0;
@@ -131,7 +140,9 @@ pub async fn run(hub: Arc<Hub>, identity: Identity) {
         if gathered.is_empty() {
             continue;
         }
-        for batch in signer.sign(gathered) {
+        let (signed, oversized) = signer.sign(gathered);
+        hub.network().products.stream_oversized(oversized);
+        for batch in signed {
             hub.publish_relay_batch(batch);
         }
     }

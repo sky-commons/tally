@@ -57,8 +57,13 @@ pub const KIND_PROVISIONAL: u8 = 0x10;
 // RFC-0174 §2.10, version 2. Non-critical, as every new kind is unless ignoring it would be wrong.
 pub const KIND_ECHO: u8 = 0x11;
 pub const KIND_ECHO_REPLY: u8 = 0x12;
-pub const KIND_DELIVERY_QUERY: u8 = 0x13;
-pub const KIND_DELIVERY_ANSWER: u8 = 0x14;
+/// Retired (RFC-0178 §7): the delivery check's first form, a proof of possession over the feeder's
+/// nonce, which needs the member to hold every batch's bytes until it is asked. A build that knows
+/// the tagged form reads these two kinds as `Record::Retired` and nothing of their bodies, and
+/// answers the query with `Record::refusal`; it never writes either. The kind bytes are never
+/// reused, so no build reads one form as the other.
+pub const KIND_POSSESSION_QUERY: u8 = 0x13;
+pub const KIND_POSSESSION_ANSWER: u8 = 0x14;
 pub const KIND_PROVIDER_OFFER: u8 = 0x15;
 pub const KIND_PROVIDER_QUERY: u8 = 0x16;
 pub const KIND_STRIPE_ASSIGNMENT: u8 = 0x17;
@@ -72,6 +77,14 @@ pub const KIND_REGIONAL_BATCH: u8 = 0x1e;
 pub const KIND_PARITY: u8 = 0x1f;
 pub const KIND_BUNDLE_INDEX: u8 = 0x20;
 pub const KIND_WORLD_PRECISE: u8 = 0x21;
+// RFC-0178 §7: the delivery check by tags made on arrival. Kinds of their own, not the retired
+// ones' bytes, so a build that predates them skips them as unknown (non-critical) rather than
+// misreading one form as the other, and an answer's signed record is a format of its own too.
+pub const KIND_DELIVERY_QUERY: u8 = 0x22;
+pub const KIND_DELIVERY_ANSWER: u8 = 0x23;
+
+/// Kinds this build knows were retired: read as `Record::Retired`, never written.
+pub const RETIRED_KINDS: [u8; 2] = [KIND_POSSESSION_QUERY, KIND_POSSESSION_ANSWER];
 
 /// Every kind this build reads and writes, in kind order: what a table over kinds is checked
 /// against, so a kind added here and nowhere else is a failing test.
@@ -94,8 +107,6 @@ pub const KINDS: [u8; 33] = [
     KIND_PROVISIONAL,
     KIND_ECHO,
     KIND_ECHO_REPLY,
-    KIND_DELIVERY_QUERY,
-    KIND_DELIVERY_ANSWER,
     KIND_PROVIDER_OFFER,
     KIND_PROVIDER_QUERY,
     KIND_STRIPE_ASSIGNMENT,
@@ -109,6 +120,8 @@ pub const KINDS: [u8; 33] = [
     KIND_PARITY,
     KIND_BUNDLE_INDEX,
     KIND_WORLD_PRECISE,
+    KIND_DELIVERY_QUERY,
+    KIND_DELIVERY_ANSWER,
 ];
 
 const HEADER_LEN: usize = 3;
@@ -162,7 +175,12 @@ impl Role {
     /// responder's to decide, by the keys that signed it.
     pub fn may_send(self, record: &Record) -> bool {
         match self {
-            Self::Probe => matches!(record, Record::Echo(_) | Record::DeliveryQuery(_)),
+            // A retired delivery query too: an old feeder's probe is answered with a refusal
+            // (`Record::refusal`), not ended as a breach of the protocol.
+            Self::Probe => matches!(
+                record,
+                Record::Echo(_) | Record::DeliveryQuery(_) | Record::Retired(KIND_POSSESSION_QUERY)
+            ),
             _ => true,
         }
     }
@@ -238,6 +256,11 @@ pub enum Reason {
     /// the relay is full: the subscriber may come back at once. A reader that predates it reads
     /// `Other(6)`.
     FellBehind,
+    /// The peer sent a record of a form this build has retired (`RETIRED_KINDS`) and will never
+    /// answer: an old feeder's delivery query (RFC-0178 §7). A reader that predates it reads
+    /// `Other(7)`, and a feeder that predates the tagged check takes any `Goodbye` to its query as
+    /// no answer, never as evidence.
+    Retired,
     Other(u8),
 }
 
@@ -250,6 +273,7 @@ impl Reason {
             Self::Refused => 4,
             Self::Protocol => 5,
             Self::FellBehind => 6,
+            Self::Retired => 7,
             Self::Other(byte) => byte,
         }
     }
@@ -262,6 +286,7 @@ impl Reason {
             4 => Self::Refused,
             5 => Self::Protocol,
             6 => Self::FellBehind,
+            7 => Self::Retired,
             other => Self::Other(other),
         }
     }
@@ -353,11 +378,14 @@ pub enum Record {
     Echo(Echo),
     /// A relay's signed answer to an `Echo`, with its headroom.
     EchoReply(EchoReply),
-    /// A feeder asking a sharing group member to prove it holds some of its batches.
+    /// A feeder giving a sharing group member its tag keys, and in an audit asking it for the
+    /// tags it made of some of its batches (RFC-0178 §7).
     DeliveryQuery(DeliveryQuery),
-    /// A member's signed answer: a proof of possession per batch, or that it does not take the
-    /// area.
+    /// A member's signed answer: the tag it made per batch, or that it does not take the area.
     DeliveryAnswer(DeliveryAnswer),
+    /// A record of a kind this build knows was retired (`RETIRED_KINDS`): nothing of its body is
+    /// read, it is never written, and a responder answers it with `refusal`.
+    Retired(u8),
     /// A relay's signed offer of a cell (RFC-0174 §2.6).
     ProviderOffer(ProviderOffer),
     /// "Who offers this cell?"
@@ -431,6 +459,21 @@ impl Record {
             Self::Parity(_) => KIND_PARITY,
             Self::BundleIndex(_) => KIND_BUNDLE_INDEX,
             Self::WorldPrecise(_) => KIND_WORLD_PRECISE,
+            Self::Retired(kind) => *kind,
+        }
+    }
+
+    /// What a responder sends back for a record of a retired form: for an old feeder's delivery
+    /// query, a `Goodbye` saying the form is retired (the session ends; the feeder reads it as no
+    /// answer from this member, never as evidence either way). Nothing for any other record.
+    pub fn refusal(&self) -> Option<Record> {
+        match self {
+            Self::Retired(KIND_POSSESSION_QUERY) => Some(Self::Goodbye {
+                reason: Reason::Retired,
+                // This relay will never answer that form.
+                retry_after_secs: 86_400,
+            }),
+            _ => None,
         }
     }
 
@@ -542,6 +585,13 @@ impl Record {
             Self::Parity(chunk) => chunk.encode(out)?,
             Self::BundleIndex(signed) => out.extend_from_slice(signed.as_bytes()),
             Self::WorldPrecise(signed) => out.extend_from_slice(signed.as_bytes()),
+            Self::Retired(kind) => {
+                out.truncate(start);
+                return Err(WireError::Invalid {
+                    field: "retired record kind",
+                    value: u64::from(*kind),
+                });
+            }
         }
         let body = out.len() - start - HEADER_LEN;
         let length = u16::try_from(body).map_err(|_| WireError::Oversize(body))?;
@@ -638,6 +688,7 @@ impl Record {
             KIND_PARITY => Self::Parity(ParityChunk::from_body(body)?),
             KIND_BUNDLE_INDEX => Self::BundleIndex(BundleIndex::from_bytes(body.to_vec())?),
             KIND_WORLD_PRECISE => Self::WorldPrecise(WorldPrecise::from_bytes(body.to_vec())?),
+            KIND_POSSESSION_QUERY | KIND_POSSESSION_ANSWER => Self::Retired(kind),
             critical if critical & CRITICAL != 0 => return Err(WireError::UnknownCritical(kind)),
             _ => return Ok((None, HEADER_LEN + length)),
         };
@@ -1094,6 +1145,142 @@ mod tests {
         for other in every_record()? {
             assert!(!Role::Probe.may_send(&other), "{other:?}");
             assert!(Role::Feeder.may_send(&other));
+        }
+        Ok(())
+    }
+
+    /// The kinds every version 2 build before the tagged delivery check knew (RFC-0178 §7): the
+    /// first through `KIND_WORLD_PRECISE`, the possession check's 0x13 and 0x14 among them.
+    const KINDS_BEFORE_TAGS: std::ops::RangeInclusive<u8> = KIND_HELLO..=KIND_WORLD_PRECISE;
+
+    /// What a build before the tagged check does with one record of a message: reads it when it
+    /// knows the kind, skips it when it does not and the kind is not critical (§3.4).
+    fn read_before_tags(record: &[u8]) -> Option<bool> {
+        let kind = record[0];
+        if KINDS_BEFORE_TAGS.contains(&kind) {
+            Some(true)
+        } else if kind & CRITICAL == 0 {
+            Some(false)
+        } else {
+            None
+        }
+    }
+
+    #[test]
+    fn a_build_before_the_tagged_delivery_check_skips_it_as_unknown() -> Result<(), WireError> {
+        use crate::delivery::{DeliveryAnswerContent, Possession, SequenceRange, TagKey};
+        use crate::delivery::{TagKeys, TagKeysContent};
+        let feeder = Identity::generate()?;
+        let member = Identity::generate()?;
+        let keys = TagKeys::sign(
+            &feeder,
+            &TagKeysContent {
+                member: member.public(),
+                current: TagKey {
+                    id: 1,
+                    key: [1; 32],
+                },
+                next: TagKey {
+                    id: 2,
+                    key: [2; 32],
+                },
+                switch_in_ms: 1,
+            },
+        )?;
+        let query = Record::DeliveryQuery(DeliveryQuery {
+            nonce: [1; 32],
+            receiver: feeder.public(),
+            boot_id: 1,
+            ranges: vec![SequenceRange { first: 4, last: 4 }],
+            keys: Some(keys),
+        });
+        let answer = Record::DeliveryAnswer(DeliveryAnswer::sign(
+            &member,
+            &DeliveryAnswerContent {
+                nonce: [1; 32],
+                receiver: feeder.public(),
+                boot_id: 1,
+                issued_ms: 2,
+                takes_area: true,
+                entries: vec![(
+                    4,
+                    Possession::Proved {
+                        key: 1,
+                        tag: [3; 16],
+                    },
+                )],
+            },
+        )?);
+        for record in [query, answer] {
+            let mut bytes = Vec::new();
+            record.encode(&mut bytes)?;
+            // Unknown to it, and not critical: skipped, never read as the possession check.
+            assert_eq!(read_before_tags(&bytes), Some(false), "{record:?}");
+            assert!(!RETIRED_KINDS.contains(&bytes[0]));
+            assert_eq!(Record::decode(&bytes)?.0, Some(record));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_query_of_the_retired_form_is_refused_clearly_and_never_read() -> Result<(), WireError> {
+        // An old feeder's possession query: nonce, receiver, boot, one range, and no keys flag
+        // (it had none). Read by this build as a retired kind, its body untouched.
+        let mut body = Vec::new();
+        body.extend_from_slice(&[9; 32]);
+        body.extend_from_slice(Identity::generate()?.public().as_bytes());
+        body.extend_from_slice(&3u64.to_be_bytes());
+        body.extend_from_slice(&1u16.to_be_bytes());
+        body.extend_from_slice(&40u64.to_be_bytes());
+        body.extend_from_slice(&41u64.to_be_bytes());
+        let mut message = vec![KIND_POSSESSION_QUERY];
+        message.extend_from_slice(&(body.len() as u16).to_be_bytes());
+        message.extend_from_slice(&body);
+        // An old member's answer under its old kind, even one whose body is nothing this build
+        // reads: retired, never parsed.
+        message.extend_from_slice(&[KIND_POSSESSION_ANSWER, 0, 2, 0xff, 0xff]);
+        Record::Heartbeat.encode(&mut message)?;
+        let mut back = Vec::new();
+        assert_eq!(Record::decode_message(&message, &mut back)?, 0);
+        assert_eq!(
+            back,
+            vec![
+                Record::Retired(KIND_POSSESSION_QUERY),
+                Record::Retired(KIND_POSSESSION_ANSWER),
+                Record::Heartbeat,
+            ]
+        );
+        // A probe may send the old query, and is answered with a refusal that names it, which an
+        // old reader reads as `Other(7)` and an old feeder as no answer.
+        let old_query = &back[0];
+        assert!(Role::Probe.may_send(old_query));
+        let refusal = old_query.refusal().ok_or(WireError::Invalid {
+            field: "no refusal of an old query",
+            value: 0,
+        })?;
+        assert!(matches!(
+            refusal,
+            Record::Goodbye {
+                reason: Reason::Retired,
+                ..
+            }
+        ));
+        let mut bytes = Vec::new();
+        refusal.encode(&mut bytes)?;
+        assert_eq!(bytes[3], 7);
+        assert_eq!(Record::decode(&bytes)?.0, Some(refusal));
+        // Nothing answers an old answer, nor any current record.
+        assert_eq!(back[1].refusal(), None);
+        assert!(!Role::Probe.may_send(&back[1]));
+        for record in every_record()? {
+            assert_eq!(record.refusal(), None);
+        }
+        // A retired kind is never written.
+        for kind in RETIRED_KINDS {
+            let mut out = vec![1];
+            assert!(Record::Retired(kind).encode(&mut out).is_err());
+            assert_eq!(out, vec![1]);
+            assert!(!KINDS.contains(&kind));
         }
         Ok(())
     }

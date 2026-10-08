@@ -24,6 +24,7 @@ rust_library(
     deps = [
         "//tally/crates/feed",
         "//tally/crates/mlat-solver",
+        "//tally/crates/relay",
         "//tally/crates/wire",
         "@tally_crates//:libc",
         "@tally_crates//:serde_json",

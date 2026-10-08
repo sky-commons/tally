@@ -17,9 +17,12 @@
 //! ciphertext, plaintext and the records packed into it are written in buffers taken from one
 //! process-wide pool ([`Buffer`]) for as long as that message is in hand, and given back after:
 //! at most `POOL_IDLE` are kept idle, so the pool holds what the busiest moment needed, not two
-//! zeroed 64 KiB buffers for every connection, idle or not.
+//! zeroed 64 KiB buffers for every connection, idle or not. A buffer given back is zeroed over
+//! every byte any holder wrote before the pool keeps it, so no session's plaintext outlives its
+//! message in memory, and a holder reads zeros wherever it has not written.
 
 use std::borrow::Borrow;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -53,53 +56,130 @@ const PREAMBLE_LEN: usize = 4 + 1 + 1 + 2 + KEY_HINT_LEN;
 /// The most message buffers the pool keeps idle; past it a buffer given back is freed.
 pub const POOL_IDLE: usize = 256;
 
-static POOL: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
+static POOL: Pool = Pool::new(POOL_IDLE);
 
-/// A buffer of `MAX_MESSAGE` bytes' capacity from the pool, given back when dropped. Its contents
-/// are whatever the last holder left: every user writes before it reads, and reads only what it
-/// wrote.
-pub struct Buffer(Vec<u8>);
+/// Message buffers kept idle for the next message, at most `keep` of them, each `MAX_MESSAGE`
+/// bytes and zero in every byte it holds. One per process (`POOL`); a test makes its own, so what
+/// it counts is only its own.
+pub(crate) struct Pool {
+    idle: Mutex<Vec<Vec<u8>>>,
+    keep: usize,
+    /// Buffers allocated because none was idle, ever.
+    made: AtomicUsize,
+    /// Buffers taken and not yet given back.
+    out: AtomicUsize,
+}
+
+impl Pool {
+    pub(crate) const fn new(keep: usize) -> Self {
+        Self {
+            idle: Mutex::new(Vec::new()),
+            keep,
+            made: AtomicUsize::new(0),
+            out: AtomicUsize::new(0),
+        }
+    }
+
+    #[cfg(test)]
+    /// Buffers idle now.
+    fn idle(&self) -> usize {
+        self.idle.lock().map_or(0, |idle| idle.len())
+    }
+}
+
+/// A buffer of `MAX_MESSAGE` bytes from a pool, given back when dropped. Its bytes are reached only
+/// through `space` (to write) and `written` (to read), and the plaintext a writer packs through
+/// `append`, so the buffer knows the most bytes any holder may have written (`dirty`), and zeroes
+/// exactly those when it goes back: the cost of a message is the bytes it used, never 64 KiB.
+pub struct Buffer {
+    bytes: Vec<u8>,
+    /// No byte at or past this has been written since the buffer was last zeroed; the bytes
+    /// before it may hold a holder's plaintext. Only ever rises while the buffer is held.
+    dirty: usize,
+    pool: &'static Pool,
+}
 
 impl Buffer {
-    /// One from the pool, or a new one when the pool is empty.
+    /// One from the process's pool, or a new one when the pool is empty.
     pub fn take() -> Self {
-        let pooled = POOL.lock().ok().and_then(|mut pool| pool.pop());
-        Self(pooled.unwrap_or_else(|| Vec::with_capacity(MAX_MESSAGE)))
+        Self::take_from(&POOL)
     }
 
-    /// The first `len` bytes, at most `MAX_MESSAGE`, to be written: zeroed only where no holder
-    /// has written before.
+    fn take_from(pool: &'static Pool) -> Self {
+        let pooled = pool.idle.lock().ok().and_then(|mut idle| idle.pop());
+        pool.out.fetch_add(1, Ordering::Relaxed);
+        let bytes = pooled.unwrap_or_else(|| {
+            pool.made.fetch_add(1, Ordering::Relaxed);
+            Vec::with_capacity(MAX_MESSAGE)
+        });
+        // A pooled buffer is zero in every byte it holds: nothing in it is anyone's yet.
+        Self {
+            bytes,
+            dirty: 0,
+            pool,
+        }
+    }
+
+    /// The first `len` bytes, at most `MAX_MESSAGE`, to be written: zero where this holder has not
+    /// written.
     fn space(&mut self, len: usize) -> &mut [u8] {
         let len = len.min(MAX_MESSAGE);
-        if self.0.len() < len {
-            self.0.resize(len, 0);
+        if self.bytes.len() < len {
+            self.bytes.resize(len, 0);
         }
-        &mut self.0[..len]
+        self.dirty = self.dirty.max(len);
+        &mut self.bytes[..len]
     }
 
-    /// Buffers idle in the pool now.
-    pub fn idle() -> usize {
-        POOL.lock().map_or(0, |pool| pool.len())
+    /// The first `len` bytes, as written: never past what this holder made room for (`space`) or
+    /// packed (`append`), and zero wherever it made room and did not write.
+    fn written(&self, len: usize) -> &[u8] {
+        &self.bytes[..len.min(self.dirty).min(self.bytes.len())]
+    }
+
+    /// The plaintext packed so far (a writer's), as bytes.
+    fn packed(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Appends what `write` writes to the plaintext packed so far. `write` only appends (it is a
+    /// record's `encode`), so the length after it bounds every byte it touched.
+    fn append<T>(&mut self, write: impl FnOnce(&mut Vec<u8>) -> T) -> T {
+        let result = write(&mut self.bytes);
+        self.dirty = self.dirty.max(self.bytes.len());
+        result
+    }
+
+    /// Cuts the packed plaintext back to `len` bytes: the cut bytes stay counted as written, and
+    /// are zeroed when the buffer goes back.
+    fn truncate(&mut self, len: usize) {
+        self.bytes.truncate(len);
     }
 }
 
 impl Drop for Buffer {
     fn drop(&mut self) {
-        let Some(buffer) = poolable(std::mem::take(&mut self.0)) else {
+        let mut bytes = std::mem::take(&mut self.bytes);
+        // Every byte written, zero: those still in the buffer's length and those past it a holder
+        // wrote and cut back (a resize writes zeros over the stretch it regrows).
+        bytes.clear();
+        bytes.resize(self.dirty, 0);
+        self.pool.out.fetch_sub(1, Ordering::Relaxed);
+        let Some(buffer) = poolable(bytes) else {
             return;
         };
-        if let Ok(mut pool) = POOL.lock()
-            && pool.len() < POOL_IDLE
+        if let Ok(mut idle) = self.pool.idle.lock()
+            && idle.len() < self.pool.keep
         {
-            pool.push(buffer);
+            idle.push(buffer);
         }
     }
 }
 
 /// What of a buffer given back the pool keeps: one of `MAX_MESSAGE` bytes' capacity, never more.
-/// A writer's plaintext can outgrow a message while a record that will not fit is moved to the next
-/// (`send_now`); it is cut back here, so the pool holds at most `POOL_IDLE` messages' worth
-/// whatever passed through it.
+/// A writer packs no more than a message's plaintext (`send_now` measures a record before it
+/// writes it), so a buffer never grows past a message; one that did is cut back here, so the pool
+/// holds at most `POOL_IDLE` messages' worth whatever passed through it.
 fn poolable(mut buffer: Vec<u8>) -> Option<Vec<u8>> {
     if buffer.capacity() < MAX_MESSAGE {
         return None;
@@ -170,6 +250,7 @@ where
             remote,
             (role, first),
             (MIN_VERSION, MAX_VERSION),
+            &POOL,
         ),
     )
     .await
@@ -177,13 +258,15 @@ where
 }
 
 /// Dials and says `Hello` with the versions `speaking` (this build's own range, except in a
-/// test of how an older initiator is answered).
+/// test of how an older initiator is answered), its messages in buffers from `pool` (the
+/// process's, except in a test that counts them).
 async fn initiate<S>(
     stream: S,
     local: &Identity,
     remote: &PublicKey,
     (role, first): (Role, &[Record]),
     (min_version, max_version): (u16, u16),
+    pool: &'static Pool,
 ) -> Result<Session<S>, WireError>
 where
     S: AsyncRead + AsyncWrite + Send,
@@ -198,16 +281,16 @@ where
         .local_private_key(&local_noise)?
         .remote_public_key(&remote_noise)?
         .build_initiator()?;
-    let mut buffer = Buffer::take();
+    let mut buffer = Buffer::take_from(pool);
     let length = handshake.write_message(local.public().as_bytes(), buffer.space(MAX_MESSAGE))?;
-    write_frame(&mut write, &buffer.0[..length]).await?;
-    let mut reply = Buffer::take();
+    write_frame(&mut write, buffer.written(length)).await?;
+    let mut reply = Buffer::take_from(pool);
     let reply_len = read_frame(&mut read, &mut reply).await?;
-    handshake.read_message(&reply.0[..reply_len], buffer.space(MAX_MESSAGE))?;
+    handshake.read_message(reply.written(reply_len), buffer.space(MAX_MESSAGE))?;
     drop((buffer, reply));
     let transport = Arc::new(handshake.into_stateless_transport_mode()?);
-    let mut reader = Reader::new(read, Arc::clone(&transport));
-    let mut writer = Writer::new(write, transport);
+    let mut reader = Reader::new(read, Arc::clone(&transport), pool);
+    let mut writer = Writer::new(write, transport, pool);
     let mut opening = vec![Record::Hello {
         min_version,
         max_version,
@@ -245,12 +328,16 @@ pub async fn accept<S>(stream: S, identities: &[Identity]) -> Result<Accepted<S>
 where
     S: AsyncRead + AsyncWrite + Send,
 {
-    tokio::time::timeout(HANDSHAKE_TIMEOUT, respond(stream, identities))
+    tokio::time::timeout(HANDSHAKE_TIMEOUT, respond(stream, identities, &POOL))
         .await
         .map_err(|_| WireError::Timeout)?
 }
 
-async fn respond<S>(stream: S, identities: &[Identity]) -> Result<Accepted<S>, WireError>
+async fn respond<S>(
+    stream: S,
+    identities: &[Identity],
+    pool: &'static Pool,
+) -> Result<Accepted<S>, WireError>
 where
     S: AsyncRead + AsyncWrite + Send,
 {
@@ -278,17 +365,17 @@ where
         .prologue(&prologue)?
         .local_private_key(&local_noise)?
         .build_responder()?;
-    let mut buffer = Buffer::take();
-    let mut first = Buffer::take();
+    let mut buffer = Buffer::take_from(pool);
+    let mut first = Buffer::take_from(pool);
     let first_len = read_frame(&mut read, &mut first).await?;
-    let length = handshake.read_message(&first.0[..first_len], buffer.space(MAX_MESSAGE))?;
+    let length = handshake.read_message(first.written(first_len), buffer.space(MAX_MESSAGE))?;
     if length != KEY_LEN {
         return Err(WireError::Truncated {
             needed: KEY_LEN,
             had: length,
         });
     }
-    let peer = PublicKey::from_slice(&buffer.0[..KEY_LEN])?;
+    let peer = PublicKey::from_slice(buffer.written(KEY_LEN))?;
     let authenticated = handshake
         .get_remote_static()
         .ok_or(WireError::Preamble("the initiator sent no static key"))?;
@@ -298,11 +385,11 @@ where
         ));
     }
     let length = handshake.write_message(&[], buffer.space(MAX_MESSAGE))?;
-    write_frame(&mut write, &buffer.0[..length]).await?;
+    write_frame(&mut write, buffer.written(length)).await?;
     drop((buffer, first));
     let transport = Arc::new(handshake.into_stateless_transport_mode()?);
-    let mut reader = Reader::new(read, Arc::clone(&transport));
-    let mut writer = Writer::new(write, transport);
+    let mut reader = Reader::new(read, Arc::clone(&transport), pool);
+    let mut writer = Writer::new(write, transport, pool);
     let mut records = Vec::new();
     reader.recv(&mut records).await?;
     let Some(Record::Hello {
@@ -349,14 +436,20 @@ pub struct Reader<S> {
     read: ReadHalf<S>,
     transport: Arc<StatelessTransportState>,
     nonce: u64,
+    pool: &'static Pool,
 }
 
 impl<S: AsyncRead> Reader<S> {
-    fn new(read: ReadHalf<S>, transport: Arc<StatelessTransportState>) -> Self {
+    fn new(
+        read: ReadHalf<S>,
+        transport: Arc<StatelessTransportState>,
+        pool: &'static Pool,
+    ) -> Self {
         Self {
             read,
             transport,
             nonce: 0,
+            pool,
         }
     }
 
@@ -365,15 +458,19 @@ impl<S: AsyncRead> Reader<S> {
     pub async fn recv(&mut self, out: &mut Vec<Record>) -> Result<(), WireError> {
         let mut length = [0; 2];
         self.read.read_exact(&mut length).await?;
-        let mut message = Buffer::take();
-        let frame = message.space(usize::from(u16::from_be_bytes(length)));
-        self.read.read_exact(frame).await?;
-        let mut plaintext = Buffer::take();
-        let length =
-            self.transport
-                .read_message(self.nonce, frame, plaintext.space(MAX_MESSAGE))?;
+        let length = usize::from(u16::from_be_bytes(length));
+        let mut message = Buffer::take_from(self.pool);
+        self.read.read_exact(message.space(length)).await?;
+        // The plaintext is shorter than its frame: room for the frame's length is room enough,
+        // and is all a message makes the buffer zero again.
+        let mut plaintext = Buffer::take_from(self.pool);
+        let length = self.transport.read_message(
+            self.nonce,
+            message.written(length),
+            plaintext.space(length),
+        )?;
         self.nonce += 1;
-        Record::decode_message(&plaintext.0[..length], out)?;
+        Record::decode_message(plaintext.written(length), out)?;
         Ok(())
     }
 
@@ -393,14 +490,20 @@ pub struct Writer<S> {
     write: WriteHalf<S>,
     transport: Arc<StatelessTransportState>,
     nonce: u64,
+    pool: &'static Pool,
 }
 
 impl<S: AsyncWrite> Writer<S> {
-    fn new(write: WriteHalf<S>, transport: Arc<StatelessTransportState>) -> Self {
+    fn new(
+        write: WriteHalf<S>,
+        transport: Arc<StatelessTransportState>,
+        pool: &'static Pool,
+    ) -> Self {
         Self {
             write,
             transport,
             nonce: 0,
+            pool,
         }
     }
 
@@ -431,30 +534,33 @@ impl<S: AsyncWrite> Writer<S> {
     where
         R: Borrow<Record> + Sync,
     {
-        let mut plaintext = Buffer::take();
-        let mut ciphertext = Buffer::take();
-        plaintext.0.clear();
+        let mut plaintext = Buffer::take_from(self.pool);
+        let mut ciphertext = Buffer::take_from(self.pool);
+        plaintext.truncate(0);
         for record in records {
-            // Encoded in place at the end of the message; moved to a message of its own when it
-            // does not fit after what is there.
-            let start = plaintext.0.len();
-            record.borrow().encode(&mut plaintext.0)?;
-            let len = plaintext.0.len() - start;
+            let record = record.borrow();
+            // Measured before it is written, and the message sealed first when it would not fit
+            // after what is there: a message's plaintext never passes `MAX_PLAINTEXT`, so the
+            // buffer never grows past a message and nothing is moved.
+            let len = record.encoded_len();
             if len > MAX_PLAINTEXT {
-                plaintext.0.truncate(start);
                 return Err(WireError::Oversize(len));
             }
-            if plaintext.0.len() > MAX_PLAINTEXT {
-                let encoded = plaintext.0.split_off(start);
-                self.seal(&plaintext.0, &mut ciphertext).await?;
-                plaintext.0.clear();
-                plaintext.0.extend_from_slice(&encoded);
+            if plaintext.packed().len() + len > MAX_PLAINTEXT {
+                self.seal(plaintext.packed(), &mut ciphertext).await?;
+                plaintext.truncate(0);
+            }
+            plaintext.append(|out| record.encode(out))?;
+            // `encoded_len` is the one measure of a record (`Record::encoded_len`); were it ever
+            // short, the message is refused rather than sent over-long.
+            if plaintext.packed().len() > MAX_PLAINTEXT {
+                return Err(WireError::Oversize(plaintext.packed().len()));
             }
         }
-        if !plaintext.0.is_empty() {
-            self.seal(&plaintext.0, &mut ciphertext).await?;
+        if !plaintext.packed().is_empty() {
+            self.seal(plaintext.packed(), &mut ciphertext).await?;
         }
-        plaintext.0.clear();
+        drop((plaintext, ciphertext));
         self.write.flush().await?;
         Ok(())
     }
@@ -463,7 +569,7 @@ impl<S: AsyncWrite> Writer<S> {
         let space = ciphertext.space(plaintext.len() + TAG_LEN);
         let length = self.transport.write_message(self.nonce, plaintext, space)?;
         self.nonce += 1;
-        write_frame(&mut self.write, &ciphertext.0[..length]).await
+        write_frame(&mut self.write, ciphertext.written(length)).await
     }
 }
 
@@ -490,6 +596,7 @@ async fn read_frame<R: AsyncRead + Unpin>(
 mod tests {
     use super::*;
     use crate::batch::{Batch, BatchContent};
+    use crate::record::RelayAddress;
 
     fn join<T>(result: Result<T, tokio::task::JoinError>) -> Result<T, WireError> {
         result.map_err(|error| WireError::Key(error.to_string()))
@@ -586,7 +693,15 @@ mod tests {
         let (near, far) = tokio::io::duplex(1 << 16);
         let relay_key = relay.public();
         let dial = tokio::spawn(async move {
-            initiate(near, &feeder, &relay_key, (Role::Feeder, &[]), (1, 1)).await
+            initiate(
+                near,
+                &feeder,
+                &relay_key,
+                (Role::Feeder, &[]),
+                (1, 1),
+                &POOL,
+            )
+            .await
         });
         assert!(accept(far, &[relay]).await.is_err());
         assert!(matches!(
@@ -602,7 +717,7 @@ mod tests {
         let (near, far) = tokio::io::duplex(1 << 16);
         let relay_key = relay.public();
         let dial = tokio::spawn(async move {
-            initiate(near, &feeder, &relay_key, (Role::Probe, &[]), (1, 2)).await
+            initiate(near, &feeder, &relay_key, (Role::Probe, &[]), (1, 2), &POOL).await
         });
         let accepted = accept(far, &[relay]).await?;
         assert_eq!((accepted.session.version, accepted.role), (2, Role::Probe));
@@ -690,6 +805,12 @@ mod tests {
         assert!(poolable(Vec::with_capacity(MAX_MESSAGE / 2)).is_none());
     }
 
+    /// A pool of the test's own, so what it counts is only what the test did: the process's pool
+    /// is shared by every test running beside it.
+    fn own_pool(keep: usize) -> &'static Pool {
+        Box::leak(Box::new(Pool::new(keep)))
+    }
+
     #[tokio::test]
     async fn a_session_holds_no_message_buffer_between_messages() -> Result<(), WireError> {
         // What a connection costs while idle is its two halves and the shared transport: no
@@ -697,7 +818,7 @@ mod tests {
         type Half = tokio::io::DuplexStream;
         let halves = std::mem::size_of::<Reader<Half>>() + std::mem::size_of::<Writer<Half>>();
         assert!(halves < 1024, "{halves} bytes");
-        // Many sessions, each carrying messages both ways, leave at most the pool's idle bound.
+        let pool = own_pool(16);
         let relay = Identity::generate()?;
         let feeder = Identity::generate()?;
         let mut sessions = Vec::new();
@@ -706,9 +827,19 @@ mod tests {
             let relay_key = relay.public();
             let dial = tokio::spawn({
                 let feeder = feeder.clone();
-                async move { connect(near, &feeder, &relay_key, Role::Feeder).await }
+                async move {
+                    initiate(
+                        near,
+                        &feeder,
+                        &relay_key,
+                        (Role::Feeder, &[]),
+                        (MIN_VERSION, MAX_VERSION),
+                        pool,
+                    )
+                    .await
+                }
             });
-            let mut accepted = accept(far, std::slice::from_ref(&relay)).await?;
+            let mut accepted = respond(far, std::slice::from_ref(&relay), pool).await?;
             let mut theirs = join(dial.await)??;
             // Two messages' worth, so a send packs and splits.
             let records: Vec<Record> = (0..7_000)
@@ -723,11 +854,99 @@ mod tests {
             assert_eq!(got, records);
             sessions.push((accepted, theirs));
         }
-        assert!(Buffer::idle() <= POOL_IDLE);
-        // A buffer taken again is one given back, not a new allocation of its own.
-        let mut buffer = Buffer::take();
-        assert!(buffer.0.capacity() >= MAX_MESSAGE);
-        assert_eq!(buffer.space(MAX_MESSAGE + 1).len(), MAX_MESSAGE);
+        // Eight open sessions, every one idle between messages, hold no buffer at all.
+        assert_eq!(pool.out.load(Ordering::Relaxed), 0);
+        // And every message, handshakes included, was written in buffers given back by the one
+        // before: never more allocated than one moment had in hand (a handshake's two sides, two
+        // each), whatever the sessions and messages.
+        let made = pool.made.load(Ordering::Relaxed);
+        assert!(made <= 4, "{made} buffers allocated for 8 sessions");
+        assert_eq!(pool.idle(), made);
+        drop(sessions);
+        Ok(())
+    }
+
+    #[test]
+    fn a_buffer_given_back_is_zero_in_every_byte_any_holder_wrote() {
+        let pool = own_pool(4);
+        let mut buffer = Buffer::take_from(pool);
+        buffer.space(100).fill(0xab);
+        // A writer's plaintext packed past that, then cut back: the cut bytes were written too.
+        buffer.truncate(0);
+        buffer.append(|out| out.extend_from_slice(&[0xcd; 300]));
+        buffer.truncate(10);
+        let at = buffer.packed().as_ptr();
+        drop(buffer);
+        assert_eq!(pool.idle(), 1);
+        let again = Buffer::take_from(pool);
+        // The same allocation, not a new one...
+        assert_eq!(again.bytes.as_ptr(), at);
+        assert_eq!(pool.made.load(Ordering::Relaxed), 1);
+        // ...and nothing of the last holder's in it: every byte written, zero.
+        assert_eq!(again.bytes.len(), 300);
+        assert!(again.bytes.iter().all(|byte| *byte == 0));
+        assert!(again.written(MAX_MESSAGE).is_empty());
+    }
+
+    #[test]
+    fn the_pool_keeps_at_most_its_idle_bound() {
+        let pool = own_pool(2);
+        let held: Vec<Buffer> = (0..5).map(|_| Buffer::take_from(pool)).collect();
+        assert_eq!(pool.out.load(Ordering::Relaxed), 5);
+        assert_eq!(pool.made.load(Ordering::Relaxed), 5);
+        drop(held);
+        assert_eq!(pool.out.load(Ordering::Relaxed), 0);
+        assert_eq!(pool.idle(), 2);
+        let mut taken = Buffer::take_from(pool);
+        assert!(taken.bytes.capacity() >= MAX_MESSAGE);
+        assert_eq!(taken.space(MAX_MESSAGE + 1).len(), MAX_MESSAGE);
+        assert_eq!(pool.made.load(Ordering::Relaxed), 5);
+    }
+
+    #[tokio::test]
+    async fn a_send_seals_a_message_before_the_record_that_would_overflow_it()
+    -> Result<(), WireError> {
+        let relay = Identity::generate()?;
+        let feeder = Identity::generate()?;
+        let (near, far) = tokio::io::duplex(1 << 20);
+        let relay_key = relay.public();
+        let dial =
+            tokio::spawn(async move { connect(near, &feeder, &relay_key, Role::Feeder).await });
+        let mut accepted = accept(far, std::slice::from_ref(&relay)).await?;
+        let mut theirs = join(dial.await)??;
+        // Records of which three fit a message and four do not.
+        let list: Vec<RelayAddress> = (0..70)
+            .map(|index| RelayAddress {
+                key: relay.public(),
+                address: format!("{index:0>255}"),
+            })
+            .collect();
+        let record = Record::RelayList(list);
+        let len = record.encoded_len();
+        assert!(3 * len <= MAX_PLAINTEXT && 4 * len > MAX_PLAINTEXT, "{len}");
+        let records: Vec<Record> = std::iter::repeat_n(record, 12).collect();
+        theirs.writer.send(&records).await?;
+        let mut got = Vec::new();
+        let mut messages = 0;
+        while got.len() < records.len() {
+            accepted.session.reader.recv(&mut got).await?;
+            messages += 1;
+        }
+        assert_eq!(got, records);
+        assert_eq!(messages, 4);
+        // One record larger than a message is refused before a byte of it is written.
+        let huge = Record::RelayList(vec![
+            RelayAddress {
+                key: relay.public(),
+                address: "x".repeat(255),
+            };
+            255
+        ]);
+        assert!(huge.encoded_len() > MAX_PLAINTEXT);
+        assert!(matches!(
+            theirs.writer.send(&[huge]).await,
+            Err(WireError::Oversize(_))
+        ));
         Ok(())
     }
 }

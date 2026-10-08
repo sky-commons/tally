@@ -75,12 +75,31 @@ rust_test(
 )
 
 # The staged relay's invariants (RFC-0178) on its own threads: the same stamped trace makes the
-# same bytes on 1, 2 and 8 threads (products, stream and hosted MLAT), delays change nothing, a message is kept once a window, each
-# receiver's batches reach a subscriber in order, and what is let go is let go whole.
+# same bytes on 1, 2 and 8 threads (products and stream), batches stamped by the relay's own clock
+# with delays inside every stage make the same bytes as with none, a message is kept once a window
+# (copies up to two seconds apart are one), each receiver's batches reach a subscriber in order,
+# and what is let go is let go whole.
 rust_test(
     name = "staged",
     size = "medium",
     srcs = ["tests/staged.rs"],
+    edition = "2024",
+    lint_config = ":cargo_lints",
+    deps = [
+        ":relay",
+        "//tally/crates/mlat-solver",
+        "//tally/crates/wire",
+        "@tally_crates//:tokio",
+    ],
+)
+
+# The same invariants for the hosted MLAT (RFC-0178 §3, §5, §9): the same stamped trace makes the
+# same clock models, positions and provisional positions on any number of threads, and at
+# capacity the same receivers are refused whole whatever the order.
+rust_test(
+    name = "staged_mlat",
+    size = "medium",
+    srcs = ["tests/staged_mlat.rs"],
     edition = "2024",
     lint_config = ":cargo_lints",
     deps = [
@@ -140,12 +159,14 @@ rust_test(
     size = "small",
     srcs = ["tests/deployed.rs"],
     data = [
+        "//infra/kubernetes:tally/public-keys.yaml",
+        "//infra/kubernetes:tally/relay.yaml",
         "//infra/prod-host:tally/units/tally-relay.service",
         "//tally/packaging/systemd:tally-relay.service",
     ],
     edition = "2024",
     env = {
-        "TALLY_RELAY_DEPLOYED": "$(rootpaths //infra/prod-host:tally/units/tally-relay.service) $(rootpaths //tally/packaging/systemd:tally-relay.service)",
+        "TALLY_RELAY_DEPLOYED": "$(rootpaths //infra/prod-host:tally/units/tally-relay.service) $(rootpaths //tally/packaging/systemd:tally-relay.service) $(rootpaths //infra/kubernetes:tally/relay.yaml) $(rootpaths //infra/kubernetes:tally/public-keys.yaml)",
     },
     lint_config = ":cargo_lints",
     deps = [":relay"],
@@ -160,6 +181,7 @@ rustfmt_test(
         ":relay",
         ":relay_test",
         ":staged",
+        ":staged_mlat",
         ":tally-relay",
     ],
 )

@@ -48,7 +48,7 @@ pub use positions::{
 };
 pub use probe::{Echo, EchoReply, EchoReplyContent, Headroom};
 pub use products::{
-    RegionalBatch, RegionalBatchContent, WorldCandidate, WorldFix, WorldPositions,
+    RegionalBatch, RegionalBatchContent, RegionalDraft, WorldCandidate, WorldFix, WorldPositions,
     WorldPositionsContent, WorldPrecise,
 };
 pub use record::{Reason, Record, RelayAddress, Role, Streams};

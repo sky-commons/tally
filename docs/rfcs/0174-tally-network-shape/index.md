@@ -242,8 +242,9 @@ the border band of the areas it is an MLAT relay for, and is held to a feeder's 
   and Europe's are, about 320 wanted receptions a second each and about 5,400 targets a window,
   takes 41 cores to keep up (3,800 tile fits a 40 s stride, 0.35 s each, and the solves, on 32
   threads) and holds 8.7 GB of raw for a window (30 bytes an observation, index included), about
-  12 GB with the open bins and the bins standing settles in (`held::Rates::cost` reserves 0.85 MB
-  a receiver). One 32-core relay no longer carries the whole world; a 32-core relay carries about
+  12 GB with the open bins and the bins standing settles in. What a relay reserves for it is a bound,
+  not that mean: `held::Rates::cost` reserves about 1.1 MB a receiver (open raw at five times the
+  mean rate, and 25 sealed bins of thinned raw), 22.5 GB at 20,000 (RFC-0178 §5). One 32-core relay no longer carries the whole world; a 32-core relay carries about
   three quarters of it, and a 16-core relay about a third. (The 27 cores and 1.6 GB first
   measured were at an eighth of the real rate.)
 - Raw travels at most a hop, never worldwide. Only positions travel far.
@@ -412,7 +413,7 @@ kinds skips it:
 | --- | --- | --- |
 | 0x10 | `Provisional` | A provisional MLAT position (§2.4), with the `PROVISIONAL` bit on `Streams` (16). |
 | 0x11, 0x12 | `Echo`, `EchoReply` | Round-trip measurement: a nonce; the reply signed, with the relay's spare capacity and network. |
-| 0x13, 0x14 | `DeliveryQuery`, `DeliveryAnswer` | The feeder's signed grant of tag keys to the member asked, and, in an audit, a nonce and a few batches named by boot and sequence; per batch, the member's tag made on arrival and its key's id, or "not seen", signed (§2.2, RFC-0178 §7). |
+| 0x13, 0x14 | retired | The first delivery check, a proof of possession over the feeder's nonce. Read as retired and never written; a relay answers an old query with `Goodbye{Retired}` (RFC-0178 §7). |
 | 0x15, 0x16 | `ProviderOffer`, `ProviderQuery` | The directory (§2.6): cells, stripes, MLAT cores, address and network, signed. |
 | 0x17 to 0x1a | `StripeAssignment`, `PieceManifest`, `HaveSummary`, `StripeReceipt` | Sharing groups (§2.5). |
 | 0x1b, 0x1c | `FirehoseCredential`, `EvidenceBundle` | Credit (§2.1): the credential, and feeders' descriptions and children's receipts. |
@@ -421,6 +422,7 @@ kinds skips it:
 | 0x1f | `Parity` | A stripe's XOR parity slice, chunked under the body limit (§2.5), unsigned. |
 | 0x20 | `BundleIndex` | A parent cell's bundle for one second: its children's digests, signed (§2.6). |
 | 0x21 | `WorldPrecise` | The precise world product (§2.11), the `WORLD_PRECISE` bit (128). |
+| 0x22, 0x23 | `DeliveryQuery`, `DeliveryAnswer` | The feeder's signed grant of tag keys to the member asked, and, in an audit, a nonce and a few batches named by boot and sequence; per batch, the member's tag made on arrival and its key's id, or "not seen", signed, answer format 2 (§2.2, RFC-0178 §7). Kinds of their own, not 0x13 and 0x14 read differently, so no build reads one form as the other. |
 
 A batch may be compressed (format 2, raw DEFLATE, inflating at most 1 MiB); a feeder compresses
 whenever it shrinks the batch, since every version 2 reader inflates it.

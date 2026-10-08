@@ -399,3 +399,71 @@ fn a_bin_sealed_within_its_room_refuses_the_busiest_receivers_whole_whatever_the
     let (all, none) = Bin::seal_within(0, whole(&[0, 1, 2, 3, 4, 5], 1), 1, cost);
     assert_eq!((all, none), (unbounded, 0));
 }
+
+/// A signed batch of `receiver`, decoded and stamped `stamp_ms` by the ingest clock.
+fn stamped(
+    receiver: &Identity,
+    sequence: u64,
+    batch: BatchContent,
+    stamp_ms: u64,
+) -> Result<Arc<Decoded>, String> {
+    let signed = tally_wire::Batch::sign(receiver, &BatchContent { sequence, ..batch })
+        .map_err(|error| error.to_string())?;
+    Decoded::from_verified(signed, stamp_ms, sequence)
+        .map_err(|undecodable| undecodable.error.to_string())
+}
+
+/// Late by the stamp (RFC-0178 invariants 2 and 3): a holder that closes by its stamps takes the
+/// raw stamped before the step that takes its bin and refuses as late the raw stamped at or after
+/// it, whether that raw arrived before the step ran or after; so what it seals is the same however
+/// the arrivals and the step interleave.
+#[test]
+fn raw_stamped_after_its_bins_step_is_late_whether_it_raced_ahead_or_not() -> Result<(), String> {
+    let closing = Closing {
+        step_ms: 1_000,
+        settle_ms: 2_000,
+    };
+    // Bin 0 ends at 5,000; settled 2,000 later, at 7,000, a multiple of the step.
+    assert_eq!(closing.close_at(0), 7_000);
+    assert_eq!(closing.close_at(1), 12_000);
+    assert_eq!(
+        Closing {
+            step_ms: 3_000,
+            settle_ms: 2_000
+        }
+        .close_at(0),
+        9_000
+    );
+    let receiver = Identity::from_seed([7; 32]);
+    let early = stamped(&receiver, 0, content(1_000, &replies(3, 0)), 6_999)?;
+    let after = stamped(&receiver, 1, content(2_000, &replies(2, 10)), 7_000)?;
+    let sealed_with = |order: &[&Arc<Decoded>], step_first: bool| {
+        let mut open = Open::new(Limits::UNBOUNDED).closing(closing);
+        let mut late = 0;
+        let mut fragments = Vec::new();
+        if step_first {
+            // The step ran before anything came: what came after is late.
+            fragments.extend(open.take_through(0));
+        }
+        for batch in order {
+            late += open.add_decoded(batch).late;
+        }
+        if !step_first {
+            // Everything came before the step ran, the batch stamped at the step's time included.
+            fragments.extend(open.take_through(0));
+        }
+        let bin = Bin::seal_from(0, fragments, 1);
+        (bin.records.len(), late)
+    };
+    // The batch stamped before the step is in the bin, whichever came first; the one stamped at
+    // the step is late either way.
+    assert_eq!(sealed_with(&[&early, &after], false), (3, 2));
+    assert_eq!(sealed_with(&[&after, &early], false), (3, 2));
+    // After the step (which a holder stepping by the watermark never does to raw stamped before
+    // it): late by what was taken.
+    assert_eq!(sealed_with(&[&after, &early], true), (0, 5));
+    // A holder with no closing decides by what it took alone.
+    let mut open = Open::new(Limits::UNBOUNDED);
+    assert_eq!(open.add_decoded(&after).new, 2);
+    Ok(())
+}

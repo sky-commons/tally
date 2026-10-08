@@ -7,10 +7,13 @@
 //!   whole second, which would make every reception of a transmission arrive together), and each
 //!   batch reaches the engine after a delay of its receiver's path (40 to 250 ms) and a little
 //!   jitter.
-//! - **The engine as it runs** (`replay`): every `tick_ms` of the virtual clock, what has arrived
-//!   is ingested, provisional work is solved and published, and a due window is stepped. Each
-//!   record published is returned with the clock it was published at. The relay runs the two
-//!   off the ingesting thread; here they run in line, which only makes them faster.
+//! - **The engine as it runs** (`replay`): at every multiple of `tick_ms` of the virtual clock (a
+//!   step), what arrived before it is ingested, provisional work is solved and published, and a due
+//!   window is stepped. Each record published is returned with its step. These are the hosted
+//!   MLAT's steps (`tally_relay::mlat_host`: the multiples of its `STEP_MS` the stamp watermark
+//!   passes, each weighing the batches stamped before it), so this is the reference the relay is
+//!   held to byte for byte. The relay runs the two off the ingesting thread; here they run in
+//!   line, which only makes them faster.
 
 use tally_mlat_solver::sim::{self, Rng, Simulation};
 use tally_wire::Record;
@@ -74,8 +77,9 @@ pub fn transmitted_ms(simulation: &Simulation, source: usize) -> u64 {
     start_ms + (simulation.transmissions[source].time.max(0.0) * 1000.0) as u64
 }
 
-/// Drives `engine` over `arrivals` from the first to `until_ms` (module docs). Every record it
-/// published, with when.
+/// Drives `engine` over `arrivals` on the steps from the first arrival to `until_ms` (module docs):
+/// every multiple of `tick_ms` after the first arrival, each taking what arrived before it. Every
+/// record it published, with its step.
 pub fn replay(
     engine: &mut Engine,
     arrivals: &[(u64, Record)],
@@ -85,11 +89,12 @@ pub fn replay(
     let Some(first) = arrivals.first().map(|(at, _)| *at) else {
         return Ok(Vec::new());
     };
+    let tick_ms = tick_ms.max(1);
     let mut next = 0;
     let mut published = Vec::new();
-    let mut now = first;
+    let mut now = (first / tick_ms + 1) * tick_ms;
     while now <= until_ms {
-        while let Some((at, record)) = arrivals.get(next).filter(|(at, _)| *at <= now) {
+        while let Some((at, record)) = arrivals.get(next).filter(|(at, _)| *at < now) {
             engine.ingest(record, *at)?;
             next += 1;
         }

@@ -23,6 +23,17 @@
 //!   ([`tag_keys_for`]), so a tag made under an old key (a replay) proves nothing.
 //! - `TAG_WINDOW_MS` is the one window both sides use: a member keeps tags that long after
 //!   arrival, and a feeder asks only about batches it sent less than that long ago.
+//!
+//! # The form it replaced
+//!
+//! The first delivery check proved possession by a keyed hash of the feeder's nonce over the
+//! batch's bytes, under record kinds 0x13 and 0x14 and a format 1 `DeliveryAnswer`. This form is
+//! not that one read differently: its query and answer travel under kinds of their own
+//! (`KIND_DELIVERY_QUERY`, `KIND_DELIVERY_ANSWER`), which a build that predates them skips as
+//! unknown, and its answer is format `ANSWER_FORMAT`, whose content a reader of format 1 refuses
+//! and whose reader refuses format 1 (an old answer carried in an `EvidenceBundle` included). A
+//! relay reads an old query as `Record::Retired` and answers it with a `Goodbye` of reason
+//! `Retired`, which an old feeder takes as no answer.
 
 use std::ops::RangeInclusive;
 
@@ -333,6 +344,11 @@ pub struct DeliveryAnswerContent {
     pub entries: Vec<(u64, Possession)>,
 }
 
+/// The format of a `DeliveryAnswer` this build writes and reads: 2, the tagged form. Format 1 was
+/// the proof of possession it replaced, whose `Proved` entry was a 32-byte hash under the same
+/// possession tag byte; the format, not the tag, is what tells the two apart.
+pub const ANSWER_FORMAT: u8 = 2;
+
 /// A `Possession`'s tag on the wire. Only these two are defined: any other byte is an error,
 /// never read as a proof (RFC-0171 §3.4's `Other` rule does not apply: an answer is evidence, and
 /// a tag this build cannot read proves nothing either way).
@@ -435,7 +451,7 @@ signed_record!(
     DeliveryAnswer,
     DeliveryAnswerContent,
     b"tally delivery answer",
-    1,
+    ANSWER_FORMAT,
     1 + KEY_LEN + 32 + KEY_LEN + 8 + 8 + 1 + 2 + MAX_SEQUENCES as usize * ENTRY_MAX + 64
 );
 
@@ -656,6 +672,66 @@ mod tests {
             *flag = 2;
         }
         assert!(DeliveryQuery::from_body(&body).is_err());
+        Ok(())
+    }
+
+    /// A format 1 answer's body, as a build before the tagged check wrote it: `Proved` was the
+    /// possession tag and a 32-byte proof.
+    fn old_answer_body(receiver: PublicKey) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&[1; 32]);
+        body.extend_from_slice(receiver.as_bytes());
+        body.extend_from_slice(&3u64.to_be_bytes());
+        body.extend_from_slice(&5u64.to_be_bytes());
+        body.push(1);
+        body.extend_from_slice(&1u16.to_be_bytes());
+        body.extend_from_slice(&41u64.to_be_bytes());
+        body.push(TAG_PROVED);
+        body.extend_from_slice(&[7; 32]);
+        body
+    }
+
+    #[test]
+    fn an_answer_of_the_retired_form_is_never_read_as_this_one_nor_this_one_as_it()
+    -> Result<(), WireError> {
+        let member = Identity::generate()?;
+        let feeder = Identity::generate()?.public();
+        // An old member's answer (format 1), as an old `EvidenceBundle` would still carry it. Its
+        // body parses as this form's fields (a key id and a tag out of the old 32-byte proof):
+        // only the format keeps it from being read as one.
+        let old = crate::signed::Signed::sign(
+            DeliveryAnswer::DOMAIN,
+            1,
+            &member,
+            &old_answer_body(feeder),
+            DeliveryAnswer::MAX_LEN,
+        )?;
+        let old = DeliveryAnswer::from_bytes(old.as_bytes().to_vec())?;
+        old.verify()?;
+        assert!(DeliveryAnswerContent::from_body(&old_answer_body(feeder)).is_ok());
+        assert!(matches!(
+            old.content(),
+            Err(WireError::Invalid {
+                field: "record format",
+                value: 1
+            })
+        ));
+        // This form's answer is format 2, which an old reader (one that reads format 1) refuses.
+        let new = DeliveryAnswer::sign(
+            &member,
+            &DeliveryAnswerContent {
+                nonce: [1; 32],
+                receiver: feeder,
+                boot_id: 3,
+                issued_ms: 5,
+                takes_area: true,
+                entries: vec![(41, Possession::NotSeen)],
+            },
+        )?;
+        assert_eq!(new.format(), ANSWER_FORMAT);
+        assert_ne!(ANSWER_FORMAT, 1);
+        let as_signed = crate::signed::Signed::from_bytes(new.as_bytes().to_vec())?;
+        assert!(as_signed.body(1).is_err());
         Ok(())
     }
 

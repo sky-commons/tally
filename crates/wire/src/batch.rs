@@ -98,14 +98,7 @@ impl Observation {
     }
 
     pub(crate) fn encode(&self, out: &mut Vec<u8>) -> Result<(), WireError> {
-        out.push(self.format);
-        out.extend_from_slice(&self.timestamp.to_be_bytes()[2..]);
-        out.push(self.signal);
-        let length =
-            u16::try_from(self.data.len()).map_err(|_| WireError::Oversize(self.data.len()))?;
-        out.extend_from_slice(&length.to_be_bytes());
-        out.extend_from_slice(&self.data);
-        Ok(())
+        crate::decoded::ObsView::from(self).encode(out)
     }
 
     pub(crate) fn decode(reader: &mut Body<'_>) -> Result<Self, WireError> {
@@ -233,7 +226,7 @@ impl Batch {
         bytes.extend_from_slice(&signature);
         Ok(Self {
             bytes: Bytes::from(bytes),
-            signer: std::sync::Arc::new(identity.public().point()?),
+            signer: std::sync::Arc::new(identity.point()),
         })
     }
 
@@ -246,7 +239,8 @@ impl Batch {
                 had: bytes.len(),
             });
         }
-        let signer = std::sync::Arc::new(PublicKey::from_slice(&bytes[1..1 + KEY_LEN])?.point()?);
+        // The one decompression of the signer's key, on the link task that read the batch.
+        let signer = std::sync::Arc::new(PublicKey::point_of(&bytes[1..1 + KEY_LEN])?);
         Ok(Self { bytes, signer })
     }
 

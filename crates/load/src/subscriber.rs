@@ -70,8 +70,8 @@ counts!(
 
 /// Each distinct message (by its format and bytes) the client read this window, in the raw stream
 /// and in the deduplicated one: every message heard raw is in the deduplicated stream at least once
-/// a few seconds when the relay loses nothing (its rule keeps a message at least every other
-/// second), so one heard raw and never deduplicated is a message the relay lost.
+/// a few seconds when the relay loses nothing (its rule keeps a message at least once every
+/// `DEDUP_GENERATIONS` seconds), so one heard raw and never deduplicated is a message the relay lost.
 #[derive(Default)]
 pub struct Heard {
     /// Bumped when a window begins: a decoder's own messages of an older window are let go.

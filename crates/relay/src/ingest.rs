@@ -13,8 +13,11 @@
 //!
 //! Every batch is stamped here ([`Stamp`]): the ingest clock's reading and the batch's place in the
 //! ingest order, never going back on one worker. Every later decision (which epoch a reception is
-//! in, when a shard may seal) reads the stamp and never a clock of its own, so the same stamped
-//! trace gives the same output on any number of threads (RFC-0178, invariants 1 and 2). Each worker
+//! in, when a shard may seal, which copy of a message is kept) reads the stamp's time and the batch
+//! itself (`seal::canonical`), never a clock of its own and never the ingest order the workers
+//! raced to, so the same stamped batches give the same output on any number of threads and whatever
+//! a stage's delays (RFC-0178, invariants 1 and 2). A stage is held up only by a test's [`Pause`],
+//! at the points [`Stage`] names. Each worker
 //! ticks the message exchange (`exchange::Envelope::Tick`) as its stamps advance and when idle, so
 //! epochs close whether or not batches flow.
 //!
@@ -57,6 +60,22 @@ pub struct Stamp {
 
 /// What reads the ingest clock: the system's wall clock in a relay, a script in a test.
 pub type Clock = Arc<dyn Fn() -> u64 + Send + Sync>;
+
+/// A stage that a [`Pause`] holds up, at the point where it holds it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Stage {
+    /// An ingest worker, after a batch is stamped and before it is admitted and routed.
+    Ingest,
+    /// A message thread, before each envelope it takes.
+    Message,
+    /// The sealer, before each command it takes, and its pool, before each job.
+    Sealer,
+}
+
+/// What holds a stage up, inside it: a test's injected delay or stall (RFC-0178 invariant 2, "no
+/// consumer reads a clock": what a stage is given, not when, decides its output). A relay runs with
+/// none.
+pub type Pause = Arc<dyn Fn(Stage) + Send + Sync>;
 
 /// How many threads each stage runs on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -174,6 +193,7 @@ struct Core {
     /// Per producer: when it last ticked.
     ticked: Box<[AtomicU64]>,
     message: MessageExchange,
+    pause: Option<Pause>,
 }
 
 impl Core {
@@ -238,23 +258,46 @@ impl Stages {
                 last: vec![AtomicU64::new(0)].into_boxed_slice(),
                 ticked: vec![AtomicU64::new(0)].into_boxed_slice(),
                 message: MessageExchange::inline(sink, gauges),
+                pause: None,
             }),
             pool: Pool::Inline(Mutex::new(())),
         }
     }
 
-    /// The stages on `threads`, closed epochs going to `sink`.
-    pub fn threaded(clock: Clock, threads: Threads, sink: &Sink, gauges: &Gauges) -> Self {
+    /// The stages on `threads`, closed epochs going to `sink`, each stage held up by `pause` (a
+    /// test's; none in a relay). Every thread is running or the stages are not made: a worker
+    /// that cannot be started fails the relay at its start, since every message thread waits for
+    /// every worker's tick and one missing would close no epoch ever.
+    pub fn threaded(
+        clock: Clock,
+        threads: Threads,
+        sink: &Sink,
+        gauges: &Gauges,
+        pause: Option<Pause>,
+    ) -> Result<Self, String> {
         let workers = threads.ingest.max(1);
         let core = Arc::new(Core {
             clock,
             next: AtomicU64::new(0),
             last: (0..workers).map(|_| AtomicU64::new(0)).collect(),
             ticked: (0..workers).map(|_| AtomicU64::new(0)).collect(),
-            message: MessageExchange::threads(threads.message, workers, sink, gauges),
+            message: MessageExchange::threads(
+                threads.message,
+                workers,
+                sink,
+                gauges,
+                pause.as_ref(),
+            )?,
+            pause,
         });
-        let mut senders = Vec::with_capacity(workers);
-        let mut handles = Vec::with_capacity(workers);
+        // Dropping `stages` on a failure stops and joins the workers already started.
+        let mut stages = Self {
+            core: Arc::clone(&core),
+            pool: Pool::Threads {
+                senders: Vec::with_capacity(workers),
+                handles: Vec::with_capacity(workers),
+            },
+        };
         for producer in 0..workers {
             let (sender, receiver) = channel::<Work>();
             let core = Arc::clone(&core);
@@ -272,20 +315,20 @@ impl Stages {
                         }
                     }
                 });
-            match spawned {
-                Ok(handle) => {
-                    senders.push(sender);
-                    handles.push(handle);
-                }
-                Err(error) => {
-                    eprintln!("tally-relay: ingest thread {producer}: {error}");
-                    break;
-                }
+            let handle = spawned
+                .map_err(|error| format!("ingest thread {producer} of {workers}: {error}"))?;
+            if let Pool::Threads { senders, handles } = &mut stages.pool {
+                senders.push(sender);
+                handles.push(handle);
             }
         }
-        Self {
-            core,
-            pool: Pool::Threads { senders, handles },
+        Ok(stages)
+    }
+
+    /// Holds the calling stage up as the test's [`Pause`] says; nothing in a relay.
+    pub fn pause(&self, stage: Stage) {
+        if let Some(pause) = &self.core.pause {
+            pause(stage);
         }
     }
 
@@ -452,30 +495,82 @@ mod tests {
         assert_eq!(credit.available(), 1);
     }
 
-    /// The 99th percentile of a batch's time from being handed in to being routed, with a
-    /// sealer that takes `seal` over each closed epoch.
-    fn ingest_p99(seal: Duration) -> Result<Duration, String> {
-        use std::sync::mpsc::sync_channel;
-        let (to_sealer, sealing) = sync_channel::<crate::exchange::Frozen>(4);
-        let sealer = std::thread::spawn(move || {
-            while sealing.recv().is_ok() {
-                std::thread::sleep(seal);
+    /// Opens a stalled stage's gate when dropped, so a test that fails never leaves a thread
+    /// waiting at it.
+    struct Gate(Arc<(Mutex<bool>, std::sync::Condvar)>);
+
+    impl Gate {
+        fn closed() -> Self {
+            Self(Arc::new((Mutex::new(false), std::sync::Condvar::new())))
+        }
+
+        /// A pause that holds `stage` until the gate opens.
+        fn holding(&self, stage: Stage) -> Pause {
+            let gate = Arc::clone(&self.0);
+            Arc::new(move |at| {
+                if at != stage {
+                    return;
+                }
+                let (open, opened) = &*gate;
+                let Ok(mut held) = open.lock() else {
+                    return;
+                };
+                while !*held {
+                    match opened.wait(held) {
+                        Ok(again) => held = again,
+                        Err(_) => return,
+                    }
+                }
+            })
+        }
+
+        fn open(&self) {
+            let (open, opened) = &*self.0;
+            if let Ok(mut held) = open.lock() {
+                *held = true;
             }
-        });
-        let sink: Sink = Arc::new(move |frozen| crate::exchange::offer(&to_sealer, frozen));
+            opened.notify_all();
+        }
+    }
+
+    impl Drop for Gate {
+        fn drop(&mut self) {
+            self.open();
+        }
+    }
+
+    /// RFC-0178 invariant 9: no lock is held across a seal and nothing on the ingest path waits for
+    /// the sealer. The real sealer is stalled outright (held at its first command until the test
+    /// lets it go) while twenty epochs of batches are handed in by a scripted ingest clock: every
+    /// one is decoded and routed all the same, and once the sealer runs again it catches up to the
+    /// last epoch. Decided by what completes while the sealer stands still, never by timing: had
+    /// any batch waited on the sealer, its routing could not finish (the deadline below only turns
+    /// that hang into a failure).
+    #[test]
+    fn ingest_never_waits_for_a_stalled_sealer() -> Result<(), String> {
+        let gate = Gate::closed();
+        let pause = gate.holding(Stage::Sealer);
+        let products = Arc::new(crate::products::Products::with_boot(1, 1));
+        let threads = Threads {
+            ingest: 2,
+            message: 2,
+        };
+        products.on_thread(threads.message, Some(&pause))?;
+        let sink = products.sink();
+        let clock = Arc::new(AtomicU64::new(0));
+        let reading = Arc::clone(&clock);
         let stages = Arc::new(Stages::threaded(
-            Arc::new(crate::network::wall_ms),
-            Threads {
-                ingest: 2,
-                message: 2,
-            },
+            Arc::new(move || reading.load(Ordering::Relaxed)),
+            threads,
             &sink,
             &Gauges::unlimited(),
-        ));
+            Some(pause),
+        )?);
         drop(sink);
         let identity = tally_wire::Identity::generate().map_err(|error| error.to_string())?;
-        let (done, finished) = channel::<Duration>();
-        const BATCHES: u64 = 1_500;
+        let (done, finished) = channel::<()>();
+        const BATCHES: u64 = 2_000;
+        const MS_APART: u64 = 10;
         for sequence in 0..BATCHES {
             let batch = Batch::sign(
                 &identity,
@@ -486,7 +581,7 @@ mod tests {
                     wall_ms: 0,
                     dropped: 0,
                     previous: [0; 32],
-                    observations: (0..200u32)
+                    observations: (0..50u32)
                         .map(|n| tally_wire::Observation {
                             format: b'3',
                             timestamp: u64::from(n),
@@ -501,46 +596,52 @@ mod tests {
                 },
             )
             .map_err(|error| error.to_string())?;
-            let handed = std::time::Instant::now();
+            // The ingest clock moves on as the batches come: twenty epochs of them.
+            clock.store(sequence * MS_APART, Ordering::Relaxed);
             let done = done.clone();
             let working = Arc::clone(&stages);
             stages.run_on(
                 sequence as usize,
                 Box::new(move |producer| {
-                    if batch.verify().is_ok() {
-                        let stamp = working.stamp(producer);
-                        if let Ok(decoded) = Stages::decode(batch, stamp) {
-                            working.message().route(producer, &decoded, None);
-                        }
+                    let stamp = working.stamp(producer);
+                    if let Ok(decoded) = Stages::decode(batch, stamp) {
+                        working.message().route(producer, &decoded, None);
                     }
-                    let _ = done.send(handed.elapsed());
+                    let _ = done.send(());
                 }),
             );
-            // About 2,000 batches a second, for three quarters of a second: several epochs close.
-            std::thread::sleep(Duration::from_micros(500));
         }
         drop(done);
-        let mut took: Vec<Duration> = finished.iter().collect();
-        if took.len() != BATCHES as usize {
-            return Err(format!("{} of {BATCHES} routed", took.len()));
+        for routed in 0..BATCHES {
+            match finished.recv_timeout(Duration::from_secs(120)) {
+                Ok(()) => {}
+                Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => {
+                    return Err(format!(
+                        "{routed} of {BATCHES} routed: ingest waits for the stalled sealer"
+                    ));
+                }
+            }
         }
-        took.sort_unstable();
+        // Everything is routed and the sealer has sealed nothing: it still stands at its gate.
+        assert_eq!(products.watermark_ms(), 0);
+        let end_ms = BATCHES * MS_APART + crate::seal::EPOCH_MS;
+        stages.advance(end_ms);
+        stages.flush();
+        gate.open();
+        // Let go, it takes everything the shards closed while it stood: up to the last epoch.
+        let due = (end_ms / crate::seal::EPOCH_MS) * crate::seal::EPOCH_MS;
+        let mut waited = 0;
+        while products.watermark_ms() < due {
+            waited += 1;
+            if waited > 24_000 {
+                return Err(format!(
+                    "the sealer reached {} of {due} once let go",
+                    products.watermark_ms()
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
         drop(stages);
-        let _ = sealer.join();
-        Ok(took[took.len() * 99 / 100])
-    }
-
-    /// RFC-0178 invariant 9: no lock is held across a seal, so a sealer slowed to a second an
-    /// epoch leaves ingest as fast as one that takes no time (it refuses the epochs it cannot
-    /// take, whole; it never holds a shard back).
-    #[test]
-    fn ingest_stays_fast_with_the_sealer_slowed_to_a_second() -> Result<(), String> {
-        let fast = ingest_p99(Duration::ZERO)?;
-        let slow = ingest_p99(Duration::from_secs(1))?;
-        assert!(
-            slow <= fast * 3 + Duration::from_millis(20),
-            "p99 {slow:?} with a slow sealer, {fast:?} with a fast one"
-        );
         Ok(())
     }
 

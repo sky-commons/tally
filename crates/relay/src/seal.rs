@@ -5,8 +5,9 @@
 //! across a seal, so a slow seal (Ed25519, CPR, a canonical sort) never stalls ingest. A sealer
 //! that is behind refuses the epoch whole, counted ([`Coordinator`]), never part of it.
 //!
-//! An epoch is decided by stamps alone (`ingest::Stamp`), never by a clock read at seal time, so
-//! the same stamped trace closes the same epochs with the same contents on any number of threads.
+//! An epoch is decided by stamps alone (`ingest::Stamp`), never by a clock read at seal time, and in
+//! one order ([`canonical`]) that no thread, worker or queue chooses, so the same stamped batches
+//! close the same epochs with the same contents on any number of threads, whatever the delays.
 //! The [`Coordinator`] gathers an epoch's frozen parts from every message thread and merges them:
 //! the hub's deduplicated stream and each area's copies, each in canonical order. Regional products
 //! are then signed area by area in cell order; the world seals at watermark plus
@@ -15,7 +16,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use tally_wire::{Decoded, ObsRef, Region};
+use tally_wire::{Decoded, ObsRef, PublicKey, Region};
 
 use crate::budget::Charge;
 use crate::exchange::Frozen;
@@ -34,7 +35,26 @@ pub const EPOCHS_HELD: u64 = 3;
 
 /// The epoch a stamp falls in.
 pub fn epoch_of(stamp: Stamp) -> Epoch {
-    stamp.stamp_ms / EPOCH_MS
+    epoch_of_ms(stamp.stamp_ms)
+}
+
+/// The epoch a stamp's milliseconds fall in.
+pub fn epoch_of_ms(stamp_ms: u64) -> Epoch {
+    stamp_ms / EPOCH_MS
+}
+
+/// The canonical order of batches: by stamp, then by the batch itself (its receiver, boot and
+/// sequence, which admission makes unique). Never by the ingest order (`Stamp::ingest_seq`), which
+/// is the order the workers happened to take batches in: two batches stamped in one millisecond on
+/// two workers are ordered the same however the workers raced, so which copy of a message is kept
+/// (and so the stream's and the regional product's bytes) follows the stamps and the batches alone.
+pub fn canonical(decoded: &Decoded) -> (u64, PublicKey, u64, u64) {
+    (
+        decoded.stamp_ms(),
+        decoded.receiver(),
+        decoded.boot_id(),
+        decoded.sequence(),
+    )
 }
 
 /// The first stamp after epoch `epoch`: the watermark at which it is closed.
@@ -68,6 +88,11 @@ impl Closer {
         self.open_from = closing.end;
         closing
     }
+
+    /// Whether `epoch` has closed: a slice for it now is late.
+    pub fn closed(&self, epoch: Epoch) -> bool {
+        self.started && epoch < self.open_from
+    }
 }
 
 /// One reception kept: its batch, shared, and its index there.
@@ -82,13 +107,9 @@ impl Copy {
         &self.decoded.observations()[self.index as usize]
     }
 
-    /// The canonical order: by stamp, then place in the ingest order, then index in the batch.
-    fn key(&self) -> (u64, u64, u32) {
-        (
-            self.decoded.stamp_ms(),
-            self.decoded.ingest_seq(),
-            self.index,
-        )
+    /// The canonical order: by batch ([`canonical`]), then index in the batch.
+    fn key(&self) -> ((u64, PublicKey, u64, u64), u32) {
+        (canonical(&self.decoded), self.index)
     }
 }
 
@@ -150,6 +171,9 @@ pub struct Ready {
     pub merged: Vec<Merged>,
     /// Epoch parts lost on the way since the last word (each one thread's part of one epoch).
     pub parts_lost: u64,
+    /// Receptions a thread let go since its last word, their epoch closed before they came
+    /// (`exchange::Frozen::late`).
+    pub late: u64,
     /// Every epoch before this is closed on every thread.
     pub watermark: Option<Epoch>,
 }
@@ -168,6 +192,7 @@ impl Coordinator {
     /// One thread's word: the epochs it completes, merged or refused, oldest first, and the
     /// watermark every thread has closed to (every epoch before it is done).
     pub fn take(&mut self, frozen: Frozen) -> Ready {
+        let frozen_late = frozen.late;
         let thread = frozen.thread.min(self.closed.len() - 1);
         let mut parts_lost = 0;
         if frozen.seq > self.expected[thread] {
@@ -199,6 +224,7 @@ impl Coordinator {
         Ready {
             merged,
             parts_lost,
+            late: frozen_late,
             watermark,
         }
     }

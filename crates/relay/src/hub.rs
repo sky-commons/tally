@@ -25,7 +25,7 @@ use crate::budget::{Budget, PerFeeder, Store};
 use crate::egress::{Cap, Egress};
 use crate::exchange::{Gauges, SHARDS, Sink, raw_shard};
 use crate::fanout::{BEHIND_MS, Bounds, Filter, Listener, Router};
-use crate::ingest::{Clock, InFlight, Refusal, Stages, Stamp, Threads};
+use crate::ingest::{Clock, InFlight, Pause, Refusal, Stage, Stages, Stamp, Threads};
 use crate::network::{Asker, Network};
 use crate::parts::Parts;
 use crate::stations::{STATIONS_REMEMBERED, StationReport, Stations, StationsReport};
@@ -62,21 +62,30 @@ pub const HASHES_REMEMBERED: usize = 100_000;
 pub const REORDER_ALLOWANCE: u64 = 64;
 const _: () = assert!(REORDER_ALLOWANCE <= u64::BITS as u64);
 
-/// How many streams (a receiver's boot, an engine's boot) the relay remembers the newest sequence
-/// of, per table. At about 150 bytes each this is some 30 MB, ten times the network's planned
-/// 20,000 receivers with room for their reboots. When full, the stream that published least
-/// recently is forgotten (`Bounded`: a new stream counts as publishing when it is first seen), so a
-/// churn of fresh boots forgets itself oldest first, a stream publishing at least once per table's
-/// worth of new streams keeps its place, and a new honest boot is remembered as soon as it starts.
-/// A forgotten stream is again bounded only by the hash window.
+/// How many authors (a receiver, an engine) the relay remembers the streams of, per table, each
+/// with up to `BOOTS_PER_AUTHOR` boots' newest sequences. At about 250 bytes each this is some
+/// 25 MB, five times the network's planned 20,000 receivers. When full, the author that published
+/// least recently is forgotten (`Bounded`: a new author counts as publishing when it is first
+/// seen), so a churn of fresh keys forgets itself oldest first, an author publishing at least once
+/// per table's worth of new keys keeps its place, and a new honest author is remembered as soon as
+/// it starts. A forgotten stream is again bounded only by the hash window. The batches' table is
+/// split across the raw shards (`exchange::raw_shard`), whose key no feeder knows, so filling any
+/// shard's part takes as many keys as filling the whole.
 ///
 /// Who can make use of a forgotten stream: a feeder may publish only its own batches and an engine
 /// only its own positions (`link::Peer`), so a record of *another* author reaches this relay only
 /// from a member (`Hub::relay_trust`: a relay whose offer this one verified at its address) or a
 /// member link this relay dialled. A replay across authors therefore needs a relay that answers
-/// at an address of its own; churning its own streams lets a stranger replay nothing but its own
-/// records.
-pub const STREAMS_REMEMBERED: usize = 200_000;
+/// at an address of its own; churning its own boots lets a stranger forget nothing but its own
+/// older boots (`BOOTS_PER_AUTHOR`).
+pub const AUTHORS_REMEMBERED: usize = 100_000;
+
+/// The boots of one author whose windows are remembered: the one it publishes under and the last
+/// few before it. An author churning boot ids forgets only its own oldest boots, never another
+/// author's window, so it cannot reopen anyone else's stream to a replay. A boot older than these
+/// is again bounded only by the hash window, and only the author (or a member relaying it) can
+/// send its records.
+pub const BOOTS_PER_AUTHOR: usize = 4;
 
 /// What a relay's session is trusted with (`Hub::relay_trust`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -104,30 +113,30 @@ pub const DESCRIPTION_BYTES_HELD: usize = 64 * 1024 * 1024;
 
 /// The default ceilings an operator may change (`config`).
 ///
-/// With the other defaults these fit the relay unit's `MemoryMax=4G` (`MemoryHigh=3G`) at their
-/// worst, every buffer full, with headroom:
+/// What the relay holds is not sized here: the admission budget (`budget`) is, from the memory the
+/// relay is given (`--memory`, by default its cgroup's `MemoryMax` or the host's). Every store that
+/// grows with what feeders send (subscriber queues, deduplication, the epochs between ingest and
+/// the sealer, the products, MLAT's raw, the batch store) is charged to its gauge and held to its
+/// share at the feeder ceiling, and a Hello past the ceiling is refused; a relay whose memory
+/// admits no feeder refuses to start. What every relay holds whatever its feeders (`BASE_BYTES`)
+/// covers the tables below, which are bounded by count and so need no feeder's reservation:
 ///
-/// | what                                                         | worst case |
+/// | what                                                         | at most    |
 /// | ------------------------------------------------------------ | ---------- |
-/// | 2,048 connections x ~320 KiB (Noise buffers, a decoded read) | 640 MiB    |
-/// | kernel socket buffers charged to the unit, ~100 fan-out links x 4 MiB | 400 MiB |
-/// | subscriber queues (`fanout`, from the admission budget)      | per feeder |
-/// | records a link has gathered but not sent, ~100 x 320 KiB     | 32 MiB     |
-/// | deduplication (`exchange`, from the admission budget)        | per feeder |
 /// | descriptions (`DESCRIPTION_BYTES_HELD`) and their index      | 80 MiB     |
-/// | streams, three tables x 200,000 x ~150 B                     | 90 MiB     |
+/// | streams, three tables x 100,000 authors x ~250 B             | 75 MiB     |
 /// | hashes, four tables x two generations x 100,000              | 36 MiB     |
 /// | clock model parts awaiting manifests, and manifests' lists    | 96 MiB     |
-/// | total                                                        | ~1.9 GiB   |
 ///
-/// The earlier defaults (4,096 connections, an 8,192-record ring, descriptions bounded only by
-/// count) reached past 5 GB.
+/// A connection's Noise buffers come from one pool and an idle connection holds none
+/// (`tally_wire::noise`), so the connection cap bounds sockets and handshakes, not buffers; the
+/// kernel's socket buffers for the fan-out's links are charged to the relay's cgroup beside it.
 ///
-/// A sharing member at its ceiling (`DEFAULT_MAX_MEMBER_BYTES_PER_SEC`) adds no row: what it
-/// sends passes through the ring and the parts table above, which are bounded whatever arrives,
-/// and its connection's buffers are one of the 2,048. What it costs is bandwidth in: up to its
-/// ceiling, from each member of the relay's groups, whose count the directory bounds; an operator
-/// sizes `--max-member-bytes-per-sec` to the host's link.
+/// A sharing member at its ceiling (`DEFAULT_MAX_MEMBER_BYTES_PER_SEC`) reserves the feeders that
+/// ceiling is worth (`budget::Budget::reserve_feeders`), so what it sends is admitted the same way
+/// as a feeder's. What it costs beyond that is bandwidth in: up to its ceiling, from each member of
+/// the relay's groups, whose count the directory bounds; an operator sizes
+/// `--max-member-bytes-per-sec` to the host's link.
 pub const DEFAULT_MAX_CONNECTIONS: usize = 2048;
 /// Per IPv4 address, or per IPv6 /64 (what one host is usually given), so one host cannot take
 /// the whole connection cap with handshakes it never finishes.
@@ -215,7 +224,7 @@ impl Seen {
 }
 
 /// One stream's newest sequence forwarded, and which of the `REORDER_ALLOWANCE` before it were.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 struct Sequences {
     newest: u64,
     /// Bit `n` is set when `newest - n` was forwarded.
@@ -265,6 +274,8 @@ impl Sequences {
 ///
 /// A stream is its author and its boot id, for batches and positions alike, so an author that
 /// restarts begins a new stream at sequence 0 instead of being refused as a replay of its last boot.
+/// The streams are held by author, each author's boots bounded apart (`BOOTS_PER_AUTHOR`), so one
+/// author's churn of boots never forgets another author's window.
 /// Positions held until the models they cite have gone out, at most, and for at most how long.
 const AWAITING_MAX: usize = 4_096;
 const AWAITING_MS: Duration = Duration::from_secs(10);
@@ -297,30 +308,56 @@ fn cited_models(record: &Record) -> Vec<Hash> {
     cited
 }
 
-struct Forwarded<K> {
-    seen: Seen,
-    newest: Bounded<K, Sequences>,
-}
+/// One author's boots and each one's window, the boot forwarded most recently last.
+#[derive(Clone, Debug, Default)]
+struct Boots(Vec<(u64, Sequences)>);
 
-impl<K: std::hash::Hash + Eq + Clone> Forwarded<K> {
-    fn new(window: Duration) -> Self {
-        Self::bounded(window, STREAMS_REMEMBERED, HASHES_REMEMBERED)
+impl Boots {
+    fn window(&self, boot: u64) -> Option<Sequences> {
+        self.0
+            .iter()
+            .find(|(held, _)| *held == boot)
+            .map(|(_, window)| *window)
     }
 
-    fn bounded(window: Duration, streams: usize, hashes: usize) -> Self {
+    /// `boot`'s window is now `window`, and it is the boot forwarded most recently; the author's
+    /// oldest boot is forgotten if that is one too many.
+    fn set(&mut self, boot: u64, window: Sequences) {
+        self.0.retain(|(held, _)| *held != boot);
+        if self.0.len() >= BOOTS_PER_AUTHOR {
+            self.0.remove(0);
+        }
+        self.0.push((boot, window));
+    }
+}
+
+struct Forwarded<A> {
+    seen: Seen,
+    newest: Bounded<A, Boots>,
+}
+
+impl<A: std::hash::Hash + Eq + Clone> Forwarded<A> {
+    fn new(window: Duration) -> Self {
+        Self::bounded(window, AUTHORS_REMEMBERED, HASHES_REMEMBERED)
+    }
+
+    fn bounded(window: Duration, authors: usize, hashes: usize) -> Self {
         Self {
             seen: Seen::new(window, hashes),
-            newest: Bounded::new(streams),
+            newest: Bounded::new(authors),
         }
     }
 
-    /// True, and remembered, when the record is new.
-    fn admit(&mut self, hash: Hash, stream: K, sequence: u64) -> bool {
+    /// True, and remembered, when the record (`author`'s, under `boot`) is new.
+    fn admit(&mut self, hash: Hash, author: A, boot: u64, sequence: u64) -> bool {
         self.seen.rotate();
         if self.seen.contains(&hash) {
             return false;
         }
-        let known = self.newest.get(&stream).copied();
+        let known = self
+            .newest
+            .get(&author)
+            .and_then(|boots| boots.window(boot));
         let window = match known {
             Some(window) => window.admit(sequence),
             None => Some(Sequences::first(sequence)),
@@ -329,9 +366,24 @@ impl<K: std::hash::Hash + Eq + Clone> Forwarded<K> {
             return false;
         };
         self.seen.insert(hash);
-        // Every record forwarded is the stream publishing, new stream or known.
-        self.newest.insert_active(stream, window);
+        // Every record forwarded is its author publishing, new author or known.
+        match self.newest.get_mut(&author) {
+            Some(boots) => {
+                boots.set(boot, window);
+                self.newest.touch(&author);
+            }
+            None => {
+                self.newest
+                    .insert_active(author, Boots(vec![(boot, window)]));
+            }
+        }
         true
+    }
+
+    /// The streams (author and boot) remembered.
+    #[cfg(test)]
+    fn streams(&self) -> usize {
+        self.newest.values().map(|boots| boots.0.len()).sum()
     }
 }
 
@@ -364,7 +416,7 @@ impl Known {
 /// counters. Owned by the ingest worker of the shard, which alone takes it on the batch path; the
 /// lock is for the reports and a feeder's arrival and departure.
 struct RawShard {
-    batches: Forwarded<(PublicKey, u64)>,
+    batches: Forwarded<PublicKey>,
     stations: Stations,
 }
 
@@ -373,7 +425,7 @@ impl RawShard {
         Self {
             batches: Forwarded::bounded(
                 window,
-                STREAMS_REMEMBERED.div_ceil(SHARDS),
+                AUTHORS_REMEMBERED.div_ceil(SHARDS),
                 HASHES_REMEMBERED.div_ceil(SHARDS),
             ),
             stations: Stations::new(STATIONS_REMEMBERED.div_ceil(SHARDS)),
@@ -444,6 +496,54 @@ impl Inbound {
     }
 }
 
+/// One raw shard's receivers described (`exchange::raw_shard`), each with its cell, in the order
+/// they are forgotten, and the bytes of their descriptions: held to a count and to bytes, each a
+/// `SHARDS`th of the relay's. The batch path takes only its receiver's shard, so no lock is shared
+/// by every batch; and the shard's key is one no feeder knows, so filling a shard takes as many
+/// keys as filling the relay.
+struct ReceiverShard {
+    held: Bounded<PublicKey, Option<Region>>,
+    bytes: usize,
+    max_bytes: usize,
+}
+
+/// The receivers described, sharded by receiver: what the batch path reads (a cell to route by)
+/// and marks (the receiver is publishing), O(1) each under one shard's lock.
+struct Receivers {
+    shards: Box<[Mutex<ReceiverShard>]>,
+}
+
+impl Receivers {
+    /// `shards` shards (`SHARDS` in a relay; a test may hold one), each of `count` receivers and
+    /// `bytes` of descriptions at most.
+    fn new(shards: usize, count: usize, bytes: usize) -> Self {
+        Self {
+            shards: (0..shards.max(1))
+                .map(|_| {
+                    Mutex::new(ReceiverShard {
+                        held: Bounded::new(count),
+                        bytes: 0,
+                        max_bytes: bytes,
+                    })
+                })
+                .collect(),
+        }
+    }
+
+    fn shard(&self, receiver: &PublicKey) -> &Mutex<ReceiverShard> {
+        &self.shards[usize::from(raw_shard(receiver).0) % self.shards.len()]
+    }
+
+    /// Receivers held.
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.shards
+            .iter()
+            .filter_map(|shard| shard.lock().ok().map(|shard| shard.held.len()))
+            .sum()
+    }
+}
+
 /// Every description held, for joining subscribers, under a lock the batch path never takes.
 /// Which receivers are held, and which is forgotten first, is `Hub::receivers`; this follows it
 /// key for key.
@@ -454,7 +554,6 @@ struct Directory {
     /// region, never a test of every receiver.
     by_point: BTreeMap<u64, Vec<PublicKey>>,
     bytes: usize,
-    max_bytes: usize,
 }
 
 /// The descriptions a subscription covers, and how many index entries were read to find them.
@@ -467,12 +566,11 @@ struct Answer {
 }
 
 impl Directory {
-    fn new(max_bytes: usize) -> Self {
+    fn new() -> Self {
         Self {
             known: HashMap::new(),
             by_point: BTreeMap::new(),
             bytes: 0,
-            max_bytes,
         }
     }
 
@@ -553,12 +651,12 @@ pub struct Hub {
     /// How long a forwarded batch's hash is remembered.
     window: Duration,
     budget: Budget,
-    positions: Mutex<Forwarded<(PublicKey, u64)>>,
+    positions: Mutex<Forwarded<PublicKey>>,
     /// An engine's provisional positions: a stream per engine boot, sequenced apart from its
     /// final positions.
-    provisional: Mutex<Forwarded<(PublicKey, u64)>>,
+    provisional: Mutex<Forwarded<PublicKey>>,
     /// An engine's clock models: a stream per engine boot, sequenced apart from its positions.
-    clock_models: Mutex<Forwarded<(PublicKey, u64)>>,
+    clock_models: Mutex<Forwarded<PublicKey>>,
     /// Clock model parts held for their manifests, and forwarded manifests' lists (`parts`).
     parts: Mutex<Parts>,
     /// Positions held until the clock models they cite have gone out (`awaiting`).
@@ -572,11 +670,12 @@ pub struct Hub {
     /// index read on a one-hop raw link, passed on, read back) went round for ever, thousands a
     /// second, and every link behind the fan-out fell behind it.
     passed_on: Mutex<Seen>,
-    /// The receivers described, each with its cell, in the order they are forgotten: what the
-    /// batch path reads (a cell to route by) and marks (the receiver is publishing), O(1) each.
-    receivers: Mutex<Bounded<PublicKey, Option<Region>>>,
-    /// Their descriptions. Taken by `publish_info` (then `receivers`, in that order) and by a
-    /// joining subscriber, never by the batch path, so no scan ever stalls a batch.
+    /// The receivers described, each with its cell, in the order they are forgotten, sharded by
+    /// receiver: what the batch path reads (a cell to route by) and marks (the receiver is
+    /// publishing), under its receiver's shard's lock alone.
+    receivers: Receivers,
+    /// Their descriptions. Taken by `publish_info` (then a receiver's shard, in that order) and by
+    /// a joining subscriber, never by the batch path, so no scan ever stalls a batch.
     directory: Mutex<Directory>,
     next_connection: AtomicU64,
     subscribers: Arc<AtomicUsize>,
@@ -709,8 +808,12 @@ impl Hub {
             awaiting: Mutex::new(VecDeque::new()),
             fault_proofs: Mutex::new(Seen::new(SEEN_WINDOW, HASHES_REMEMBERED)),
             passed_on: Mutex::new(Seen::new(SEEN_WINDOW, HASHES_REMEMBERED)),
-            receivers: Mutex::new(Bounded::new(RECEIVERS_REMEMBERED)),
-            directory: Mutex::new(Directory::new(DESCRIPTION_BYTES_HELD)),
+            receivers: Receivers::new(
+                SHARDS,
+                RECEIVERS_REMEMBERED.div_ceil(SHARDS),
+                DESCRIPTION_BYTES_HELD.div_ceil(SHARDS),
+            ),
+            directory: Mutex::new(Directory::new()),
             next_connection: AtomicU64::new(RELAY_ITSELF + 1),
             subscribers: Arc::new(AtomicUsize::new(0)),
             max_subscribers,
@@ -731,18 +834,35 @@ impl Hub {
     }
 
     /// The stages on threads of their own (`threads`), the sealer on its own: what a relay runs.
-    /// Built before the hub is shared, so nothing has been ingested yet.
-    pub fn staged(mut self, threads: Threads) -> Self {
+    /// Built before the hub is shared, so nothing has been ingested yet. Every thread starts or
+    /// this fails, and the relay with it: a stage short of a thread would close no epoch ever, or
+    /// refuse every one.
+    pub fn staged(self, threads: Threads) -> Result<Self, String> {
+        self.staged_pausing(threads, None)
+    }
+
+    /// As `staged`, each stage held up inside by `pause` (`ingest::Stage`): a test's delays, to
+    /// show that they change nothing a relay makes.
+    pub fn staged_pausing(
+        mut self,
+        threads: Threads,
+        pause: Option<Pause>,
+    ) -> Result<Self, String> {
         let clock = self.stages.clock();
-        // The inline stages hold the products' sink; let them go first.
-        let unused: Sink = Arc::new(|_| true);
         let gauges = Gauges::of(&self.budget);
-        self.stages = Stages::inline(Arc::clone(&clock), unused, gauges.clone());
-        if let Some(products) = Arc::get_mut(&mut self.network.products) {
-            products.on_thread(threads.message.max(1));
-        }
-        self.stages = Stages::threaded(clock, threads, &self.network.products.sink(), &gauges);
-        self
+        // The sealer moves onto its thread wherever it is held: no exclusive hold is needed, so
+        // it can never be left inline behind threaded stages.
+        self.network
+            .products
+            .on_thread(threads.message.max(1), pause.as_ref())?;
+        self.stages = Stages::threaded(
+            clock,
+            threads,
+            &self.network.products.sink(),
+            &gauges,
+            pause,
+        )?;
+        Ok(self)
     }
 
     /// The regional product's stream under `boot_id` instead of a random one: what two runs of
@@ -1086,11 +1206,13 @@ impl Hub {
             Some(stamp) => self.stages.stamped(producer, stamp),
             None => self.stages.stamp(producer),
         };
+        // A test's delay, between the stamp and everything after it.
+        self.stages.pause(Stage::Ingest);
         let shard = &self.raw[usize::from(raw_shard(&receiver).0)];
         let new = shard.lock().is_ok_and(|mut shard| {
             shard
                 .batches
-                .admit(batch.hash(), (receiver, batch.boot_id()), batch.sequence())
+                .admit(batch.hash(), receiver, batch.boot_id(), batch.sequence())
         });
         if !new {
             // Not forwarded again, but a member that sent it still sent it (sharing's receipts).
@@ -1117,10 +1239,13 @@ impl Hub {
                 shard.stations.fed_by(&receiver, source);
             }
         }
+        // The receiver is publishing, so its description is the last to be forgotten: one lock,
+        // its shard's, for the mark and the cell to route by.
+        let mut described = self.publishing(&receiver);
         // A feeder's description pushed out while it was not yet publishing comes back now that
         // it is, as one that is, before the batch: a subscriber is told who a receiver is first.
-        if let Origin::Feeder(Some(own)) = &origin
-            && !self.describes(&receiver)
+        if described.is_none()
+            && let Origin::Feeder(Some(own)) = &origin
         {
             self.publish_info(
                 source,
@@ -1130,12 +1255,9 @@ impl Hub {
                 own.place,
                 true,
             );
+            described = self.publishing(&receiver);
         }
-        // The receiver is publishing, so its description is the last to be forgotten.
-        let cell = self.receivers.lock().ok().and_then(|mut receivers| {
-            receivers.touch(&receiver);
-            receivers.get(&receiver).copied().flatten()
-        });
+        let cell = described.flatten();
         if let Some(decoded) = &decoded {
             let area = self.network.products.area_for(&receiver);
             self.stages.message().route(producer, decoded, area);
@@ -1250,8 +1372,17 @@ impl Hub {
     /// Whether the relay holds a description of `receiver`.
     pub fn describes(&self, receiver: &PublicKey) -> bool {
         self.receivers
+            .shard(receiver)
             .lock()
-            .is_ok_and(|receivers| receivers.get(receiver).is_some())
+            .is_ok_and(|shard| shard.held.get(receiver).is_some())
+    }
+
+    /// `receiver` is publishing: marked so in its shard, and its cell, `None` when it is not
+    /// described.
+    fn publishing(&self, receiver: &PublicKey) -> Option<Option<Region>> {
+        let mut shard = self.receivers.shard(receiver).lock().ok()?;
+        shard.held.touch(receiver);
+        shard.held.get(receiver).copied()
     }
 
     /// Keeps a verified receiver description if it is the newest for its key, and forwards it.
@@ -1276,7 +1407,7 @@ impl Hub {
         if !newer {
             return;
         }
-        let Ok(mut receivers) = self.receivers.lock() else {
+        let Ok(mut shard) = self.receivers.shard(&receiver).lock() else {
             return;
         };
         // Projected once, here; every region test after is integer work.
@@ -1285,6 +1416,11 @@ impl Hub {
         let software = info.content().ok().map(|content| content.software);
         self.network.on_info(&info, now_ms());
         let record = Arc::new(Record::ReceiverInfo(info));
+        let replaced = directory
+            .known
+            .get(&receiver)
+            .map_or(0, |known| known.bytes);
+        shard.bytes = shard.bytes.saturating_sub(replaced) + bytes;
         directory.insert(
             receiver,
             Known {
@@ -1297,21 +1433,30 @@ impl Hub {
             },
         );
         let forgotten = if publishing {
-            receivers.insert_active(receiver, cell)
+            shard.held.insert_active(receiver, cell)
         } else {
-            receivers.insert(receiver, cell)
+            shard.held.insert(receiver, cell)
+        };
+        // What the shard forgets, the directory forgets with it, and its bytes.
+        let mut forget = |shard: &mut ReceiverShard, forgotten: &PublicKey| {
+            let bytes = directory
+                .known
+                .get(forgotten)
+                .map_or(0, |known| known.bytes);
+            shard.bytes = shard.bytes.saturating_sub(bytes);
+            directory.remove(forgotten);
         };
         if let Some(forgotten) = forgotten {
-            directory.remove(&forgotten);
+            forget(&mut shard, &forgotten);
         }
         // Held to bytes as well as count, forgetting in the same order.
-        while directory.bytes > directory.max_bytes {
-            let Some(forgotten) = receivers.forget_first() else {
+        while shard.bytes > shard.max_bytes {
+            let Some(forgotten) = shard.held.forget_first() else {
                 break;
             };
-            directory.remove(&forgotten);
+            forget(&mut shard, &forgotten);
         }
-        drop(receivers);
+        drop(shard);
         drop(directory);
         // A link joining reads its descriptions first and takes its place in the fan-out only once
         // it has sent them (see `subscribe`), so one changed in between reaches it at its
@@ -1332,12 +1477,13 @@ impl Hub {
         let new = self.positions.lock().is_ok_and(|mut forwarded| {
             forwarded.admit(
                 positions.hash(),
-                (engine, positions.boot_id()),
+                engine,
+                positions.boot_id(),
                 positions.sequence(),
             )
         });
         if new {
-            self.network.on_positions(&positions, now_ms());
+            self.network.on_positions(&positions, self.now_ms());
             self.forward_positions(source, Record::Positions(positions));
         }
         new
@@ -1417,12 +1563,13 @@ impl Hub {
         let new = self.provisional.lock().is_ok_and(|mut forwarded| {
             forwarded.admit(
                 positions.hash(),
-                (engine, positions.boot_id()),
+                engine,
+                positions.boot_id(),
                 positions.sequence(),
             )
         });
         if new {
-            self.network.on_positions(&positions, now_ms());
+            self.network.on_positions(&positions, self.now_ms());
             self.forward_positions(source, Record::Provisional(positions));
         }
         new
@@ -1434,7 +1581,7 @@ impl Hub {
     /// was new.
     pub fn publish_clock_model(&self, source: u64, model: ClockModel, engine: PublicKey) -> bool {
         let new = self.clock_models.lock().is_ok_and(|mut forwarded| {
-            forwarded.admit(model.id(), (engine, model.boot_id()), model.sequence())
+            forwarded.admit(model.id(), engine, model.boot_id(), model.sequence())
         });
         if new {
             // A manifest this build cannot read lists nothing: its parts are never forwarded.
@@ -1458,7 +1605,7 @@ impl Hub {
                 });
             }
             let record = Record::ClockModel(model);
-            self.network.on_clock_model(&record, now_ms());
+            self.network.on_clock_model(&record, self.now_ms());
             let points = crate::network::points_of(&record);
             self.fanout.publish(Item {
                 source,
@@ -1486,7 +1633,7 @@ impl Hub {
             return false;
         };
         self.network
-            .on_clock_model(&Record::ClockModelPart(part.clone()), now_ms());
+            .on_clock_model(&Record::ClockModelPart(part.clone()), self.now_ms());
         self.fanout.publish(Item {
             source,
             record: Arc::new(Record::ClockModelPart(part)),
@@ -1548,8 +1695,8 @@ impl Hub {
     /// A place among the subscribers, with the known receiver descriptions `subscription` covers
     /// to send first, or `None` when the relay is serving as many subscribers as it will.
     ///
-    /// The link joins the fan-out (`listen`) only once it has sent these, so the ring does not
-    /// fill behind a large first send and drop it as fallen behind. A description that changes
+    /// The link joins the fan-out (`listen`) only once it has sent these, so its queue does not
+    /// fill behind a large first send and let it go as fallen behind. A description that changes
     /// between this read and that join is not in either; it reaches the subscriber when its
     /// receiver next describes itself, which a feeder does every ten minutes
     /// (`INFO_EVERY` in `tally_feed`'s relays).
@@ -1704,32 +1851,32 @@ mod tests {
     #[test]
     fn a_record_is_forwarded_once_and_never_far_behind_its_stream() {
         let mut forwarded = Forwarded::new(Duration::from_secs(60));
-        assert!(forwarded.admit([1; 32], "engine", 100));
+        assert!(forwarded.admit([1; 32], "engine", 0, 100));
         // The same hash again, by another path.
-        assert!(!forwarded.admit([1; 32], "engine", 100));
+        assert!(!forwarded.admit([1; 32], "engine", 0, 100));
         // Reordered a little: still forwarded.
-        assert!(forwarded.admit([2; 32], "engine", 100 - REORDER_ALLOWANCE + 1));
+        assert!(forwarded.admit([2; 32], "engine", 0, 100 - REORDER_ALLOWANCE + 1));
         // Older than the allowance, with a hash never seen: a replay, dropped.
-        assert!(!forwarded.admit([3; 32], "engine", 100 - REORDER_ALLOWANCE));
+        assert!(!forwarded.admit([3; 32], "engine", 0, 100 - REORDER_ALLOWANCE));
         // Another stream has its own sequence.
-        assert!(forwarded.admit([3; 32], "other", 0));
+        assert!(forwarded.admit([3; 32], "other", 0, 0));
     }
 
     #[test]
     fn a_replay_inside_the_reorder_allowance_is_dropped_after_its_hash_is_forgotten() {
         let mut forwarded = Forwarded::new(Duration::ZERO);
-        assert!(forwarded.admit([1; 32], "receiver", 10));
-        assert!(forwarded.admit([2; 32], "receiver", 12));
+        assert!(forwarded.admit([1; 32], "receiver", 0, 10));
+        assert!(forwarded.admit([2; 32], "receiver", 0, 12));
         // Reordered, never forwarded: still taken.
-        assert!(forwarded.admit([3; 32], "receiver", 11));
-        assert!(forwarded.admit([4; 32], "receiver", 13));
+        assert!(forwarded.admit([3; 32], "receiver", 0, 11));
+        assert!(forwarded.admit([4; 32], "receiver", 0, 13));
         assert!(!forwarded.seen.contains(&[1; 32]));
         // Its hash forgotten and only three sequences behind, it was still forwarded once.
-        assert!(!forwarded.admit([1; 32], "receiver", 10));
+        assert!(!forwarded.admit([1; 32], "receiver", 0, 10));
         // Far ahead, the window starts again and the newest is taken once.
-        assert!(forwarded.admit([5; 32], "receiver", 1_000));
-        assert!(!forwarded.admit([6; 32], "receiver", 1_000));
-        assert!(forwarded.admit([7; 32], "receiver", 1_000 - REORDER_ALLOWANCE + 1));
+        assert!(forwarded.admit([5; 32], "receiver", 0, 1_000));
+        assert!(!forwarded.admit([6; 32], "receiver", 0, 1_000));
+        assert!(forwarded.admit([7; 32], "receiver", 0, 1_000 - REORDER_ALLOWANCE + 1));
     }
 
     fn signed_info(identity: &Identity) -> Result<ReceiverInfo, String> {
@@ -1776,7 +1923,7 @@ mod tests {
     fn a_flood_of_descriptions_never_forgets_a_receiver_that_is_publishing() -> Result<(), String> {
         const CAP: usize = 200;
         let mut hub = Hub::new(8);
-        hub.receivers = Mutex::new(Bounded::new(CAP));
+        hub.receivers = Receivers::new(1, CAP, DESCRIPTION_BYTES_HELD);
         let hub = Arc::new(hub);
         let (honest, honest_key) = key()?;
         hub.publish_info(1, signed_info(&honest)?, honest_key, 1, None, false);
@@ -1804,7 +1951,7 @@ mod tests {
 
     /// How many receivers the batch path knows, and how many descriptions the directory holds.
     fn held(hub: &Hub) -> Result<(usize, usize), String> {
-        let receivers = hub.receivers.lock().map_err(|e| e.to_string())?.len();
+        let receivers = hub.receivers.len();
         let directory = hub.directory.lock().map_err(|e| e.to_string())?.known.len();
         Ok((receivers, directory))
     }
@@ -1812,7 +1959,7 @@ mod tests {
     #[test]
     fn when_full_the_receiver_least_recently_active_is_forgotten() -> Result<(), String> {
         let mut hub = Hub::new(8);
-        hub.receivers = Mutex::new(Bounded::new(2));
+        hub.receivers = Receivers::new(1, 2, DESCRIPTION_BYTES_HELD);
         let (stranger, _) = key()?;
         let info = signed_info(&stranger)?;
         let (_, first) = key()?;
@@ -1901,21 +2048,21 @@ mod tests {
     #[test]
     fn a_replay_is_dropped_after_its_hash_is_forgotten() {
         let mut forwarded = Forwarded::new(Duration::ZERO);
-        assert!(forwarded.admit([1; 32], "engine", 0));
-        assert!(forwarded.admit([2; 32], "engine", 200));
-        assert!(forwarded.admit([4; 32], "engine", 201));
+        assert!(forwarded.admit([1; 32], "engine", 0, 0));
+        assert!(forwarded.admit([2; 32], "engine", 0, 200));
+        assert!(forwarded.admit([4; 32], "engine", 0, 201));
         // Two rotations later the first hash is gone, and only its sequence refuses it.
         assert!(!forwarded.seen.contains(&[1; 32]));
-        assert!(!forwarded.admit([1; 32], "engine", 0));
+        assert!(!forwarded.admit([1; 32], "engine", 0, 0));
     }
 
     #[test]
     fn descriptions_are_held_to_bytes_as_well_as_count() -> Result<(), String> {
-        let hub = Hub::new(8);
+        let mut hub = Hub::new(8);
         let (stranger, _) = key()?;
         let info = signed_info(&stranger)?;
         let size = info.as_bytes().len();
-        hub.directory.lock().map_err(|e| e.to_string())?.max_bytes = 3 * size;
+        hub.receivers = Receivers::new(1, RECEIVERS_REMEMBERED, 3 * size);
         let keys = (0..5)
             .map(|_| key().map(|(_, public)| public))
             .collect::<Result<Vec<_>, _>>()?;
@@ -1961,13 +2108,13 @@ mod tests {
         };
         // Every stream held has published more than once.
         for stream in 0..STREAMS {
-            assert!(forwarded.admit(next(), ("old", stream), 0));
-            assert!(forwarded.admit(next(), ("old", stream), 1));
+            assert!(forwarded.admit(next(), stream, 0, 0));
+            assert!(forwarded.admit(next(), stream, 0, 1));
         }
         // A new boot's first batch is remembered, so a replay of it is refused by sequence.
-        assert!(forwarded.admit(next(), ("new", 0), 5));
-        assert!(forwarded.newest.get(&("new", 0)).is_some());
-        assert!(!forwarded.admit(next(), ("new", 0), 5));
+        assert!(forwarded.admit(next(), STREAMS, 0, 5));
+        assert!(forwarded.newest.get(&STREAMS).is_some());
+        assert!(!forwarded.admit(next(), STREAMS, 0, 5));
         assert!(forwarded.newest.len() <= STREAMS);
     }
 
@@ -1983,20 +2130,57 @@ mod tests {
             hash
         };
         // An established stream: it has published twice.
-        assert!(forwarded.admit(next(), ("honest", 0), 0));
-        assert!(forwarded.admit(next(), ("honest", 0), 1));
-        // A stranger churning boots, each its own new stream, many times the table's size; the
+        assert!(forwarded.admit(next(), "honest", 0, 0));
+        assert!(forwarded.admit(next(), "honest", 0, 1));
+        // Strangers churning keys, each its own new author, many times the table's size; the
         // honest stream publishing only now and then.
-        for boot in 0..(20 * STREAMS as u64) {
-            assert!(forwarded.admit(next(), ("stranger", boot), 0));
-            // Publishing once per half a table's worth of new streams.
-            if boot % (STREAMS as u64 / 2) == 0 {
-                assert!(forwarded.admit(next(), ("honest", 0), 2 + boot / (STREAMS as u64 / 2)));
+        let strangers: Vec<String> = (0..20 * STREAMS).map(|n| format!("stranger {n}")).collect();
+        for (n, stranger) in strangers.iter().enumerate() {
+            assert!(forwarded.admit(next(), stranger.as_str(), 0, 0));
+            // Publishing once per half a table's worth of new authors.
+            if n % (STREAMS / 2) == 0 {
+                let sequence = 2 + (n / (STREAMS / 2)) as u64;
+                assert!(forwarded.admit(next(), "honest", 0, sequence));
             }
         }
         assert!(forwarded.newest.len() <= STREAMS);
         // Still remembered: a replay of an old sequence, under a hash never seen, is refused.
-        assert!(!forwarded.admit(next(), ("honest", 0), 1));
+        assert!(!forwarded.admit(next(), "honest", 0, 1));
+    }
+
+    /// RFC-0178 §9 against a churn of boots (the audit's 2.2): one author churning boot ids, each a
+    /// new stream, in a table as small as a raw shard's, forgets only its own oldest boots. Every
+    /// other author's window stays, however long the churn, so no replay into another stream is
+    /// reopened.
+    #[test]
+    fn a_churn_of_one_authors_boots_forgets_only_its_own() {
+        const AUTHORS: usize = 4;
+        let mut forwarded = Forwarded::bounded(Duration::from_secs(3_600), AUTHORS, 1_000_000);
+        let mut hashes = 0u32;
+        let mut next = || {
+            hashes += 1;
+            let mut hash = [0; 32];
+            hash[..4].copy_from_slice(&hashes.to_be_bytes());
+            hash
+        };
+        for honest in 0..AUTHORS - 1 {
+            assert!(forwarded.admit(next(), honest, 0, 0));
+            assert!(forwarded.admit(next(), honest, 0, 1));
+        }
+        // The churning author starts after them, so it is the most recently active throughout.
+        for boot in 0..10_000u64 {
+            assert!(forwarded.admit(next(), AUTHORS, boot, 0));
+        }
+        assert!(forwarded.streams() <= AUTHORS - 1 + BOOTS_PER_AUTHOR);
+        for honest in 0..AUTHORS - 1 {
+            // Still remembered: a replay under a hash never seen is refused by its sequence.
+            assert!(
+                !forwarded.admit(next(), honest, 0, 1),
+                "author {honest} forgotten"
+            );
+        }
+        // Its own oldest boots are what it forgot: an old boot starts afresh.
+        assert!(forwarded.admit(next(), AUTHORS, 0, 0));
     }
 
     fn signed_positions(
@@ -2263,7 +2447,10 @@ mod tests {
         use std::sync::mpsc;
         use tally_wire::Streams;
         const RECEIVERS: usize = RECEIVERS_REMEMBERED;
-        let hub = Arc::new(Hub::new(8));
+        // One shard of them all, so every one is held.
+        let mut hub = Hub::new(8);
+        hub.receivers = Receivers::new(1, RECEIVERS, DESCRIPTION_BYTES_HELD);
+        let hub = Arc::new(hub);
         let (stranger, _) = key()?;
         let info = signed_info(&stranger)?;
         // Receivers spread over a few degrees, one in a hundred declaring no location.
@@ -2321,7 +2508,7 @@ mod tests {
         let expected = brute_force(&hub, &subscription)?;
         assert!(!expected.is_empty() && expected.len() < RECEIVERS);
         // The batch path's lock held throughout: the answer is read without it, or never.
-        let batch_lock = hub.receivers.lock().map_err(|e| e.to_string())?;
+        let batch_lock = hub.receivers.shards[0].lock().map_err(|e| e.to_string())?;
         let (answered, answer) = mpsc::channel();
         let asking = Arc::clone(&hub);
         let asked = subscription.clone();
@@ -2350,7 +2537,10 @@ mod tests {
     #[test]
     fn a_new_receiver_is_described_in_a_table_full_of_receivers_that_publish() -> Result<(), String>
     {
-        let hub = Arc::new(Hub::new(8));
+        // One shard of them all: the order of forgetting, apart from the sharding.
+        let mut hub = Hub::new(8);
+        hub.receivers = Receivers::new(1, RECEIVERS_REMEMBERED, DESCRIPTION_BYTES_HELD);
+        let hub = Arc::new(hub);
         let (stranger, _) = key()?;
         let info = signed_info(&stranger)?;
         // Every receiver held has had batches forwarded.
@@ -2360,8 +2550,10 @@ mod tests {
         for receiver in publishing {
             hub.publish_info(2, info.clone(), *receiver, 1, None, false);
             hub.receivers
+                .shard(receiver)
                 .lock()
                 .map_err(|e| e.to_string())?
+                .held
                 .touch(receiver);
         }
         assert_eq!(held(&hub)?, (RECEIVERS_REMEMBERED, RECEIVERS_REMEMBERED));

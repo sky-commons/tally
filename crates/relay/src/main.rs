@@ -38,7 +38,8 @@ async fn run() -> Result<(), String> {
             .max_member_bytes_per_sec(config.max_member_bytes_per_sec)
             .max_upload(config.max_upload)
             .memory(config.memory, hosts_mlat)
-            .staged(config.threads),
+            // A stage short of a thread would close no epoch: the relay fails to start instead.
+            .staged(config.threads)?,
     );
     // A relay whose memory admits no feeder would refuse every Hello: it refuses to start instead.
     hub.budget().check()?;
@@ -65,7 +66,8 @@ async fn run() -> Result<(), String> {
         .admission
         .configure(config.network, config.relay_duties);
     network.credit.set_upload_cap(config.max_upload.rate());
-    if let Some(host) = tally_relay::mlat_host::host_for(&config, identities[0].clone(), boot_id()?)
+    if let Some(host) =
+        tally_relay::mlat_host::host_for(&config, identities[0].clone(), boot_id()?, hub.budget())?
     {
         eprintln!(
             "tally-relay: hosting MLAT on {} threads for the areas it is chosen to solve",

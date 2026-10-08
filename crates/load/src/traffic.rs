@@ -81,33 +81,49 @@ pub struct Calibration {
     /// heard a second, by anyone.
     pub contents_per_sec: f64,
     /// What the relay's deduplicated stream carries a second when it loses nothing
-    /// ([`expected_deduplicated`]): the receptions its rule keeps from this traffic.
+    /// ([`expected_deduplicated`]): the receptions its rule keeps from this traffic, each second's
+    /// stamped in one of the relay's seconds.
     pub deduplicated_per_sec: f64,
 }
 
 /// The receptions a second the relay's deduplicated stream keeps from `heard`, each second's
 /// distinct messages (by their bytes), the run's loop of them repeating for ever: the relay's rule
-/// (`tally_relay::exchange::MessageShard`), by the second. A message is kept in a second when the
-/// second before did not keep it, so one heard every second is kept every other second, and one
-/// heard once a loop, once a loop. The relay closes its seconds by its own clock, not the
-/// harness's, so a second's receptions reach it spread over two of its seconds; the rule keeps the
-/// same count either way (a message heard in two adjacent seconds is kept in the first).
+/// (`tally_relay::exchange::MessageShard`), by the second. A message kept in a second is remembered
+/// for that second and the `DEDUP_GENERATIONS - 1` after it, so one heard every second is kept once
+/// every `DEDUP_GENERATIONS` seconds, and one heard once a loop, once a loop.
+///
+/// It is the count with each second's receptions stamped in one of the relay's seconds. The relay
+/// stamps by arrival: a feeder holds a reception up to a second before its batch is sealed and its
+/// second does not begin with the relay's, so one second's receptions are stamped across two or
+/// three of the relay's, and which copy of a message falls in which window moves with them. The
+/// stream then carries somewhat more or fewer than this; what it lost is the coverage line
+/// (`subscriber::Heard`), never this rate.
 pub fn expected_deduplicated(heard: &[std::collections::HashSet<u32>]) -> f64 {
+    const { assert!(tally_relay::seal::EPOCH_MS == 1_000) };
+    let remembered = tally_relay::exchange::DEDUP_GENERATIONS - 1;
     if heard.is_empty() {
         return 0.0;
     }
-    let mut kept_before: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    // What each of the last `remembered` seconds kept, oldest first.
+    let mut kept_before: std::collections::VecDeque<std::collections::HashSet<u32>> =
+        std::collections::VecDeque::new();
     let mut last_loop = 0usize;
     // The first loop starts from nothing; by the third, every second's keep is the loop's own.
     for round in 0..3 {
         last_loop = 0;
         for second in heard {
-            let kept: std::collections::HashSet<u32> =
-                second.difference(&kept_before).copied().collect();
+            let kept: std::collections::HashSet<u32> = second
+                .iter()
+                .filter(|message| !kept_before.iter().any(|before| before.contains(message)))
+                .copied()
+                .collect();
             if round == 2 {
                 last_loop += kept.len();
             }
-            kept_before = kept;
+            kept_before.push_back(kept);
+            if kept_before.len() > remembered {
+                kept_before.pop_front();
+            }
         }
     }
     last_loop as f64 / heard.len() as f64

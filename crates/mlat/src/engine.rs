@@ -33,6 +33,7 @@
 //!   decides only whether late raw makes it in, never what the same raw solves to.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use tally_mlat_solver::Site;
 use tally_mlat_solver::held::{Bin, Fragment, Limits, RAW_SPARE_BINS, Rates, SealedBins};
@@ -43,8 +44,11 @@ use crate::intake::{Intake, Seats};
 use crate::provisional::{self, Provisional};
 use crate::window::{Job, Outcome, Report};
 
-/// The fewest receivers an engine is sized for: a region's whole receiver population at the
-/// founder's requirement (RFC-0178: one relay, 20,000 feeders).
+/// What an engine is sized for when its host does not say (`Capacity::default`, an engine run on
+/// its own or in a test): a region's whole receiver population at the founder's requirement
+/// (RFC-0178: one relay, 20,000 feeders). A relay's hosted engine is sized by the relay's feeder
+/// ceiling instead (`Capacity::for_receivers`), with no floor: its seats come from the same budget
+/// as everything else it holds.
 pub const MIN_RECEIVERS: usize = 20_000;
 
 /// How much an engine holds, derived from what its host admits (RFC-0178 §9).
@@ -60,10 +64,12 @@ pub struct Capacity {
 }
 
 impl Capacity {
-    /// Sized for `receivers` at the measured rates, never fewer than `MIN_RECEIVERS`.
+    /// Sized for exactly `receivers` at the measured rates: a relay's feeder ceiling (RFC-0178 §9,
+    /// "MLAT receiver limit comes from the same F"), so the raw it may hold (`Settings::limits`)
+    /// is what the budget reserved for it, and never more.
     pub fn for_receivers(receivers: usize) -> Self {
         Self {
-            receivers: receivers.max(MIN_RECEIVERS),
+            receivers,
             rates: Rates::MEASURED,
         }
     }
@@ -174,9 +180,9 @@ impl Engine {
     }
 
     /// An engine whose host holds its receivers and their raw (`intake::Intake`, split by
-    /// receiver) and seals it into `sealed`: it is handed what each batch says to provisional
-    /// solving (`hear`), the sites and the sealed bins at each step (`prepare_sealed`), and solves
-    /// them as `new`'s engine solves the same raw.
+    /// receiver) and seals it into `sealed`: its host weighs what each batch says to provisional
+    /// solving (`provisional::Shard::read`) and hands it the sites and the sealed bins at each
+    /// step (`prepare_sealed`), and it solves them as `new`'s engine solves the same raw.
     pub fn hosted(
         identity: Identity,
         boot_id: u64,
@@ -303,12 +309,12 @@ impl Engine {
     /// (`tally_wire::Decoded`), at `now_ms` by the engine's clock: a relay hosting this engine
     /// hands it what its own ingest checked, so nothing is verified or decoded twice. As `ingest`
     /// otherwise: used once per (boot, sequence), held only from a receiver that takes part.
-    pub fn ingest_verified(&mut self, batch: &Decoded, now_ms: u64) -> Ingested {
+    pub fn ingest_verified(&mut self, batch: &Arc<Decoded>, now_ms: u64) -> Ingested {
         let Some(intake) = self.intake.as_mut() else {
             return Ingested::Ignored;
         };
         let (ingested, notes) = intake.ingest_verified(batch);
-        self.provisional.hear_notes(batch, &notes, now_ms);
+        self.provisional.hear_notes(batch, notes, now_ms);
         ingested
     }
 

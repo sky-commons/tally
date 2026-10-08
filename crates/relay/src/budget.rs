@@ -37,7 +37,10 @@ pub enum Store {
     Batches,
     /// MLAT's raw (`Held`), shared by the engine and standing.
     Held,
-    /// The message exchange's two generations of fingerprints.
+    /// What batches told hosted MLAT's provisional solving and its step has not yet weighed: the
+    /// decoded batches the notes keep alive, and the notes (`mlat_host::NOTES_PER_RECEIVER_STEP`).
+    Notes,
+    /// The message exchange's generations of fingerprints (`exchange::DEDUP_GENERATIONS`).
     Dedup,
     /// Subscriber queues' share of one feeder's inbound.
     Fanout,
@@ -56,9 +59,10 @@ pub enum Store {
 }
 
 impl Store {
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::Batches,
         Self::Held,
+        Self::Notes,
         Self::Dedup,
         Self::Fanout,
         Self::Delivery,
@@ -78,6 +82,7 @@ impl Store {
 pub struct PerFeeder {
     pub batches: usize,
     pub held: usize,
+    pub notes: usize,
     pub dedup: usize,
     pub fanout: usize,
     pub delivery: usize,
@@ -92,6 +97,7 @@ impl PerFeeder {
         match store {
             Store::Batches => self.batches,
             Store::Held => self.held,
+            Store::Notes => self.notes,
             Store::Dedup => self.dedup,
             Store::Fanout => self.fanout,
             Store::Delivery => self.delivery,
@@ -129,8 +135,21 @@ impl PerFeeder {
             } else {
                 0
             },
-            // Two generations of fingerprints, one epoch each (`exchange`), as if no reception
-            // were a copy of another's, with the tables' room to grow.
+            // Provisional solving's notes, where MLAT is hosted: a batch told is held (its decode
+            // kept alive, and its notes) until the step after its stamp's interval weighs it, so
+            // two step intervals of decoded batches, and the notes a step admits a seat
+            // (`mlat_host::NOTES_PER_RECEIVER_STEP`) for each.
+            notes: if holds_raw {
+                let step = crate::mlat_host::STEP_MS as usize;
+                2 * (decoded * step / 1_000
+                    + crate::mlat_host::NOTES_PER_RECEIVER_STEP
+                        * std::mem::size_of::<tally_mlat::provisional::Note>())
+            } else {
+                0
+            },
+            // `exchange::DEDUP_GENERATIONS` generations of fingerprints, one epoch each, the
+            // deduplication's window (`exchange::DEDUP_WINDOW_MS`), as if no reception were a copy
+            // of another's, with the tables' room to grow.
             dedup: receptions
                 * crate::exchange::DEDUP_SLOTS_PER_RECEPTION
                 * crate::exchange::DEDUP_ENTRY_BYTES
@@ -168,11 +187,15 @@ const DECODED_BYTES_PER_RECEPTION: usize =
 /// One reception as a product holds it before it is sent: an owned observation (the struct and its
 /// message) in a record's list.
 const PRODUCT_BYTES_PER_RECEPTION: usize = std::mem::size_of::<tally_wire::Observation>() + 14;
-/// What the relay holds whatever its feeders: descriptions, stream tables, the runtime, the
-/// connection buffers the Noise pool keeps idle (`noise::POOL_IDLE` messages), and the one batch
-/// each ingest worker is decoding.
+/// What the relay holds whatever its feeders: descriptions, stream tables, the runtime and the one
+/// batch each ingest worker is decoding (256 MiB), and the connection buffers the Noise pool keeps
+/// idle (`noise::POOL_IDLE` messages). Measured (RFC-0178, "Sizing", 2026-10-07): resident memory
+/// grew 247 KiB a feeder from 1,000 to 5,000 feeders and about 100 KiB from 5,000 to 20,000, so the
+/// cost of a feeder falls as feeders are added and the 1k/5k line taken back to no feeders (260 MiB)
+/// is an upper bound on the base. A feeder's reservation (`PerFeeder::planned`) is several times
+/// that measured growth, so this base is safe at any load.
 pub const BASE_BYTES: usize =
-    (1 << 30) + tally_wire::noise::POOL_IDLE * tally_wire::noise::MAX_MESSAGE;
+    (256 << 20) + tally_wire::noise::POOL_IDLE * tally_wire::noise::MAX_MESSAGE;
 /// The bytes this relay may use, unless told (`--memory`): its cgroup's limit when it has one,
 /// else the host's memory.
 pub fn memory_available() -> usize {
@@ -625,9 +648,11 @@ mod tests {
         let without = PerFeeder::planned(false);
         let with = PerFeeder::planned(true);
         assert_eq!(without.held, 0);
+        assert_eq!(without.notes, 0);
         assert!(with.held > 0);
+        assert!(with.notes > 0);
         for store in Store::ALL {
-            if !matches!(store, Store::Held | Store::Buffers) {
+            if !matches!(store, Store::Held | Store::Notes | Store::Buffers) {
                 assert!(without.of(store) > 0, "{store:?}");
             }
         }
