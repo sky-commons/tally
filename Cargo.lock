@@ -880,6 +880,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "tally-load"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "serde_json",
+ "tally-feed",
+ "tally-mlat-solver",
+ "tally-wire",
+ "tokio",
+]
+
+[[package]]
 name = "tally-merge"
 version = "0.1.0"
 dependencies = [

@@ -266,8 +266,10 @@ pub fn channel() -> (Inputs, Intake) {
 
 impl Inputs {
     /// A reception. If the batcher is behind it is dropped and counted, never waited for: a
-    /// reader that waited would buffer in the socket instead, which the ceiling forbids.
-    fn offer(&self, input: Input) {
+    /// reader that waited would buffer in the socket instead, which the ceiling forbids. Public
+    /// for a source that is not a decoder's port: the load harness (`tally-load`) offers a
+    /// simulated receiver's receptions here, so its batches are this batcher's own.
+    pub fn offer(&self, input: Input) {
         if let Err(mpsc::error::TrySendError::Full(_)) = self.sender.try_send(input) {
             self.overflow.fetch_add(1, Ordering::Relaxed);
         }

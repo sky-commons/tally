@@ -24,6 +24,9 @@ ed25519-dalek = "2"
 getrandom = "0.2"
 # H3 cells name regions (RFC-0171 §3.6); pure Rust.
 h3o = "0.11"
+# The load harness (tally-load) raises its own open file limit and ties the relay it starts to its
+# own life (PR_SET_PDEATHSIG): already in the tree under tokio.
+libc = "0.2"
 # Pure Rust transcendental functions, the same bits on every platform (tally-mlat-solver).
 libm = "0.2"
 # tally-api serves HTTP/1.1 with hyper's own connection builder (header deadline, connection cap),
