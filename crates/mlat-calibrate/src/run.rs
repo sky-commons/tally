@@ -346,6 +346,7 @@ pub fn run(
                 regions: Vec::new(),
                 settle_ms: SETTLE_MS,
                 threads: settings.threads.max(1),
+                capacity: tally_mlat::engine::Capacity::default(),
             },
         ),
         feeds,

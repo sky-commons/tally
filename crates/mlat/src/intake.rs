@@ -12,14 +12,17 @@
 //!   location no coarser than it allows (`tally_mlat_solver::obs::MAX_SITE_PRECISION_M`).
 //! - A batch is used once: from a receiver that takes part, with a (boot, sequence) not already used
 //!   and not too far behind that boot's newest (§3.1).
-//! - **Room is shared and refusal is whole.** The receivers described across every intake of one
-//!   engine are bounded by one count ([`Seats`], `Capacity::receivers`): a new receiver beyond it
-//!   is refused whole and counted. A receiver's raw of a bin beyond its share is refused whole
-//!   (`held::Limits`).
+//! - **Room is shared, refusal is whole, and neither depends on order** (RFC-0177 §9). The
+//!   receivers seated across every intake of one engine are bounded by one count ([`Seats`],
+//!   `Capacity::receivers`), and who is seated is a function of who is described: the best ranked
+//!   (taking part first, then key), whatever order they came in and whichever intake took them. A
+//!   receiver outranked is refused whole (none of its raw held) and counted, and one that loses its
+//!   seat to a better ranked one is let go whole. A receiver's raw of a bin beyond its share is
+//!   refused whole (`held::Limits`); the holder's bytes are checked on each whole bin as it is
+//!   sealed (`held::Bin::seal_within`), never on arrival.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::sync::{Arc, Mutex};
 
 use tally_mlat_solver::held::{Fragment, Limits, Open};
 use tally_mlat_solver::obs::MAX_SITE_PRECISION_M;
@@ -36,42 +39,157 @@ const REORDER: u64 = 64;
 /// this within one window only weakens its own replay protection.
 const BOOTS_PER_RECEIVER: usize = 8;
 
-/// The places for described receivers, shared by every intake of one engine: a receiver takes one
-/// when it is first described and gives it back when it is forgotten.
+/// Where a described receiver stands for room.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Place {
+    /// It has a seat: it takes part if its own word places it inside the engine's regions.
+    Seated,
+    /// Described, but outranked for a seat: it takes no part, and is seated when it ranks among
+    /// the best again.
+    Waiting,
+    /// Outranked even among the waiting: forgotten (its description too).
+    Gone,
+}
+
+/// What decides who is seated: receivers that take part before those that do not, then by key.
+/// A receiver's rank is its own (its key and its own word), never when it came.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct Rank {
+    idle: bool,
+    key: PublicKey,
+}
+
+#[derive(Default)]
+struct Places {
+    seated: BTreeSet<Rank>,
+    waiting: BTreeSet<Rank>,
+    ranks: HashMap<PublicKey, Rank>,
+}
+
+impl Places {
+    fn place(&self, key: &PublicKey) -> Place {
+        match self.ranks.get(key) {
+            Some(rank) if self.seated.contains(rank) => Place::Seated,
+            Some(_) => Place::Waiting,
+            None => Place::Gone,
+        }
+    }
+}
+
+/// The seats for described receivers, shared by every intake of one engine (RFC-0177 §9). Who is
+/// seated is a function of who is described, never of the order they came in or of which intake
+/// took them: the `limit` best ranked ([`Rank`]: taking part first, then key), and up to `limit`
+/// more waiting; beyond that the worst ranked are forgotten with their descriptions, which bounds
+/// what is remembered. A change re-settles every place, and says whose place changed, so each
+/// intake holding one of them settles it ([`Intake::settle`]). One limit: a receiver forgotten is
+/// not brought back when the ranks above it change later (a description moving another out of the
+/// regions); only its next description, or the relay's own on a change of areas, ranks it again.
 #[derive(Debug)]
 pub struct Seats {
-    taken: AtomicUsize,
     limit: usize,
+    places: Mutex<Places>,
+}
+
+impl std::fmt::Debug for Places {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Places")
+            .field("seated", &self.seated.len())
+            .field("waiting", &self.waiting.len())
+            .finish()
+    }
 }
 
 impl Seats {
     pub fn new(limit: usize) -> Arc<Self> {
         Arc::new(Self {
-            taken: AtomicUsize::new(0),
             limit,
+            places: Mutex::new(Places::default()),
         })
     }
 
-    /// A place, if one is free.
-    fn take(&self) -> bool {
-        self.taken
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |taken| {
-                (taken < self.limit).then_some(taken + 1)
-            })
-            .is_ok()
+    fn places(&self) -> std::sync::MutexGuard<'_, Places> {
+        self.places
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    fn give_back(&self, places: usize) {
-        let _ = self
-            .taken
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |taken| {
-                Some(taken.saturating_sub(places))
-            });
+    /// Ranks `key` (taking part or `idle`) among the described and settles every place. Every
+    /// other receiver whose place changed (its holder settles `key` itself).
+    fn rank(&self, key: PublicKey, idle: bool) -> Vec<PublicKey> {
+        let mut places = self.places();
+        let seated = match places.ranks.remove(&key) {
+            Some(old) => {
+                places.waiting.remove(&old);
+                places.seated.remove(&old)
+            }
+            None => false,
+        };
+        let rank = Rank { idle, key };
+        places.ranks.insert(key, rank);
+        if seated {
+            places.seated.insert(rank);
+        } else {
+            places.waiting.insert(rank);
+        }
+        let mut changed = self.settle(&mut places);
+        changed.retain(|other| *other != key);
+        changed
     }
 
-    /// Places taken now.
+    /// Forgets `keys` (their intake is gone) and settles every place: whose changed.
+    fn remove(&self, keys: impl Iterator<Item = PublicKey>) -> Vec<PublicKey> {
+        let mut places = self.places();
+        for key in keys {
+            if let Some(rank) = places.ranks.remove(&key) {
+                places.seated.remove(&rank);
+                places.waiting.remove(&rank);
+            }
+        }
+        self.settle(&mut places)
+    }
+
+    /// Seats the best ranked waiting while there is a seat or they outrank someone seated, and
+    /// forgets the worst waiting beyond `limit` of them. Whose place changed.
+    fn settle(&self, places: &mut Places) -> Vec<PublicKey> {
+        let mut changed = Vec::new();
+        while let Some(best) = places.waiting.first().copied() {
+            if places.seated.len() < self.limit {
+                places.waiting.remove(&best);
+                places.seated.insert(best);
+                changed.push(best.key);
+                continue;
+            }
+            match places.seated.last().copied() {
+                Some(worst) if best < worst => {
+                    places.waiting.remove(&best);
+                    places.seated.remove(&worst);
+                    places.seated.insert(best);
+                    places.waiting.insert(worst);
+                    changed.extend([best.key, worst.key]);
+                }
+                _ => break,
+            }
+        }
+        while places.waiting.len() > self.limit {
+            let Some(worst) = places.waiting.pop_last() else {
+                break;
+            };
+            places.ranks.remove(&worst.key);
+            changed.push(worst.key);
+        }
+        changed.sort_unstable();
+        changed.dedup();
+        changed
+    }
+
+    /// Where `key` stands now.
+    pub fn place(&self, key: &PublicKey) -> Place {
+        self.places().place(key)
+    }
+
+    /// Seats taken now.
     pub fn taken(&self) -> usize {
-        self.taken.load(Ordering::Acquire)
+        self.places().seated.len()
     }
 
     pub fn limit(&self) -> usize {
@@ -88,7 +206,10 @@ struct Described {
     /// What it declared, so a change of the engine's regions re-decides whether it takes part.
     location: Option<Location>,
     clock: Clock,
+    /// Its site, if its own word places it inside the engine's regions with a usable clock.
     site: Option<Site>,
+    /// Whether it holds a seat ([`Seats`]): it takes part when it is seated and has a site.
+    seated: bool,
     /// The sequences used per boot, most recent boot first.
     boots: VecDeque<(u64, Sequences)>,
 }
@@ -154,12 +275,15 @@ impl Described {
     }
 }
 
-/// What a description did: what it was, and whether its receiver stopped taking part (what it
-/// heard is then forgotten here, and its holder forgets it in the sealed bins).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// What a description or a change of regions did: what it was, the receivers here that stopped
+/// taking part (what they heard is forgotten here, and their holder forgets them in the sealed
+/// bins), and the receivers whose seat changed that this intake does not hold (their own intakes
+/// settle them, [`Intake::settle`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Description {
     pub ingested: Ingested,
-    pub left: bool,
+    pub left: Vec<PublicKey>,
+    pub moved: Vec<PublicKey>,
 }
 
 /// One holder's receivers and their open raw (module docs).
@@ -169,22 +293,25 @@ pub struct Intake {
     /// location). `None`: no engine runs, and no receiver takes part.
     regions: Option<Vec<Region>>,
     receivers: BTreeMap<PublicKey, Described>,
-    /// Receivers refused for room, at most as many as there are places.
-    refused: BTreeSet<PublicKey>,
     open: Open,
     dropped: Dropped,
 }
 
+impl Described {
+    fn taking_part(&self) -> bool {
+        self.seated && self.site.is_some()
+    }
+}
+
 impl Intake {
-    /// Receivers placed in `seats`, raw bounded by `limits` (its byte bound is the open raw's own;
-    /// a holder that seals passes what is left of its whole bound to each batch), taking part in
-    /// `regions`.
+    /// Receivers seated in `seats`, raw bounded by `limits` (its byte bound is the open raw's own;
+    /// a holder whose raw is split checks its whole bound when it seals, `Bin::seal_within`),
+    /// taking part in `regions`.
     pub fn new(seats: Arc<Seats>, limits: Limits, regions: Option<Vec<Region>>) -> Self {
         Self {
             seats,
             regions,
             receivers: BTreeMap::new(),
-            refused: BTreeSet::new(),
             open: Open::new(limits),
             dropped: Dropped::default(),
         }
@@ -204,26 +331,26 @@ impl Intake {
         self.open.bytes()
     }
 
-    /// Whether `receiver` is described, and whether it takes part (one refused for room is
+    /// Whether `receiver` is described, and whether it takes part (one waiting for a seat is
     /// described, and takes no part).
     pub fn described(&self, receiver: &PublicKey) -> Option<bool> {
-        self.receivers
-            .get(receiver)
-            .map(|described| described.site.is_some())
-            .or_else(|| self.refused.contains(receiver).then_some(false))
+        self.receivers.get(receiver).map(Described::taking_part)
     }
 
     /// Receivers taking part now.
     pub fn taking_part(&self) -> usize {
         self.receivers
             .values()
-            .filter(|described| described.site.is_some())
+            .filter(|described| described.taking_part())
             .count()
     }
 
     /// The sites of the receivers taking part, in key order.
     pub fn sites(&self) -> impl Iterator<Item = Site> + '_ {
-        self.receivers.values().filter_map(|known| known.site)
+        self.receivers
+            .values()
+            .filter(|known| known.seated)
+            .filter_map(|known| known.site)
     }
 
     /// What was refused since the last call.
@@ -236,7 +363,8 @@ impl Intake {
     pub fn describe(&mut self, info: &ReceiverInfo) -> Result<Description, String> {
         let ignored = Description {
             ingested: Ingested::Ignored,
-            left: false,
+            left: Vec::new(),
+            moved: Vec::new(),
         };
         let key = info.receiver().map_err(|error| error.to_string())?;
         info.verify()
@@ -251,77 +379,139 @@ impl Intake {
             return Ok(ignored);
         }
         let site = self.site(key, content.location, content.clock);
-        if !self.receivers.contains_key(&key) && !self.seats.take() {
-            // Full: a receiver that takes part displaces the first here that does not (its place
-            // passes to it); otherwise it is refused whole, and counted.
-            let Some(idle) = self
-                .receivers
-                .iter()
-                .find(|(_, known)| known.site.is_none())
-                .map(|(key, _)| *key)
-                .filter(|_| site.is_some())
-            else {
-                self.dropped.receivers += 1;
-                if self.refused.len() < self.seats.limit() {
-                    self.refused.insert(key);
-                }
-                return Ok(Description {
-                    ingested: Ingested::Refused,
-                    left: false,
-                });
-            };
-            self.receivers.remove(&idle);
-        }
-        self.refused.remove(&key);
+        let fresh = !self.receivers.contains_key(&key);
         let known = self.receivers.entry(key).or_insert_with(|| Described {
             issued_ms: 0,
             bytes: Vec::new(),
             location: None,
             clock: content.clock,
             site: None,
+            seated: false,
             boots: VecDeque::new(),
         });
+        let was = known.taking_part();
         known.issued_ms = content.issued_ms;
         known.bytes = info.as_bytes().to_vec();
         known.location = content.location;
         known.clock = content.clock;
-        let left = known.site.is_some() && site.is_none();
         known.site = site;
-        if left {
-            // It left the regions or became unusable: what it heard is no longer used.
-            known.boots.clear();
-            self.open.forget_receiver(&key);
+        let changed = self.seats.rank(key, site.is_none());
+        let mut description = self.settle_all(changed);
+        if self.settle_was(&key, was) {
+            description.left.push(key);
         }
-        Ok(Description {
-            ingested: Ingested::Described,
-            left,
-        })
+        let seated = self.receivers.get(&key).is_some_and(|known| known.seated);
+        if fresh && !seated {
+            // Beyond the seats and outranked: refused whole, and counted.
+            self.dropped.receivers += 1;
+        }
+        description.ingested = if seated {
+            Ingested::Described
+        } else {
+            Ingested::Refused
+        };
+        Ok(description)
+    }
+
+    /// Settles every receiver of `changed` this intake holds; the rest are another intake's.
+    fn settle_all(&mut self, changed: Vec<PublicKey>) -> Description {
+        let mut description = Description {
+            ingested: Ingested::Ignored,
+            left: Vec::new(),
+            moved: Vec::new(),
+        };
+        for other in changed {
+            if self.receivers.contains_key(&other) {
+                if self.settle(&other) {
+                    description.left.push(other);
+                }
+            } else {
+                description.moved.push(other);
+            }
+        }
+        description
+    }
+
+    /// Brings `receiver` to the place the seats give it now: seated or waiting, or forgotten
+    /// with its description. True when it stopped taking part (what it heard is forgotten here,
+    /// and its holder forgets it in the sealed bins). A receiver that loses its seat is refused
+    /// whole from then on, and counted. Settling twice, or late, is settling once: it reads where
+    /// the receiver stands now.
+    pub fn settle(&mut self, receiver: &PublicKey) -> bool {
+        let was = self
+            .receivers
+            .get(receiver)
+            .is_some_and(Described::taking_part);
+        self.settle_was(receiver, was)
+    }
+
+    fn settle_was(&mut self, receiver: &PublicKey, was: bool) -> bool {
+        let place = self.seats.place(receiver);
+        let Some(known) = self.receivers.get_mut(receiver) else {
+            return false;
+        };
+        let seated = place == Place::Seated;
+        if known.seated && !seated {
+            self.dropped.receivers += 1;
+        }
+        known.seated = seated;
+        let now = known.taking_part();
+        if place == Place::Gone {
+            self.receivers.remove(receiver);
+        }
+        let left = was && !now;
+        if left || place == Place::Gone {
+            // It stopped taking part: what it heard is no longer used.
+            if let Some(known) = self.receivers.get_mut(receiver) {
+                known.boots.clear();
+            }
+            self.open.forget_receiver(receiver);
+        }
+        left
     }
 
     /// The engine's regions are now `regions` (`None`: no engine runs). Every receiver described
-    /// is decided again on its own signed word; the receivers that stopped taking part, whose raw
-    /// here is forgotten (their holder forgets them in the sealed bins).
-    pub fn set_scope(&mut self, regions: Option<Vec<Region>>) -> Vec<PublicKey> {
+    /// is decided again on its own signed word, and ranked again for its seat: the receivers here
+    /// that stopped taking part, whose raw here is forgotten (their holder forgets them in the
+    /// sealed bins), and those of other intakes whose seat changed.
+    pub fn set_scope(&mut self, regions: Option<Vec<Region>>) -> Description {
         self.regions = regions;
-        let decided: Vec<(PublicKey, Option<Site>)> = self
+        let decided: Vec<(PublicKey, Option<Site>, bool)> = self
             .receivers
             .iter()
-            .map(|(key, known)| (*key, self.site(*key, known.location, known.clock)))
+            .map(|(key, known)| {
+                (
+                    *key,
+                    self.site(*key, known.location, known.clock),
+                    known.taking_part(),
+                )
+            })
             .collect();
-        let mut left = Vec::new();
-        for (key, site) in decided {
-            let Some(known) = self.receivers.get_mut(&key) else {
-                continue;
-            };
-            let gone = known.site.is_some() && site.is_none();
-            known.site = site;
-            if gone {
-                known.boots.clear();
-                self.open.forget_receiver(&key);
-                left.push(key);
+        let mut changed = Vec::new();
+        for (key, site, _) in &decided {
+            if let Some(known) = self.receivers.get_mut(key) {
+                known.site = *site;
+            }
+            changed.extend(self.seats.rank(*key, site.is_none()));
+        }
+        changed.sort_unstable();
+        changed.dedup();
+        let mut description = Description {
+            ingested: Ingested::Ignored,
+            left: Vec::new(),
+            moved: Vec::new(),
+        };
+        for other in changed {
+            if !self.receivers.contains_key(&other) {
+                description.moved.push(other);
             }
         }
-        left
+        for (key, _, was) in decided {
+            if self.settle_was(&key, was) {
+                description.left.push(key);
+            }
+        }
+        description
     }
 
     /// A new engine begins: nothing it holds is the old one's. The descriptions stay (they are the
@@ -348,22 +538,22 @@ impl Intake {
     }
 
     /// Takes a batch whose signature its holder verified and which it decoded once: used once per
-    /// (boot, sequence), held only from a receiver that takes part, its open raw growing to `room`
-    /// bytes at most. What it did, and what it says to provisional solving (nothing unless it was
-    /// taken).
-    pub fn ingest_verified(&mut self, batch: &Decoded, room: usize) -> (Ingested, Vec<Note>) {
+    /// (boot, sequence), held only from a receiver that takes part, within its own share of a bin
+    /// (`Limits::per_receiver_bin`; the holder's whole bound is checked when it seals). What it
+    /// did, and what it says to provisional solving (nothing unless it was taken).
+    pub fn ingest_verified(&mut self, batch: &Decoded) -> (Ingested, Vec<Note>) {
         let key = batch.receiver();
         let Some(known) = self.receivers.get_mut(&key) else {
             return (Ingested::Ignored, Vec::new());
         };
-        if known.site.is_none() {
+        if !known.taking_part() {
             return (Ingested::Ignored, Vec::new());
         }
         if !known.admit(batch.boot_id(), batch.sequence()) {
             return (Ingested::Replayed, Vec::new());
         }
         let notes = notes_of(batch);
-        let added = self.open.add_decoded_within(batch, room);
+        let added = self.open.add_decoded(batch);
         self.dropped.late += added.late as u64;
         self.dropped.refused += added.refused as u64;
         (
@@ -378,7 +568,7 @@ impl Intake {
     /// A batch of a format this build cannot read: it uses its sequence and holds nothing.
     pub fn use_sequence(&mut self, receiver: &PublicKey, boot: u64, sequence: u64) -> Ingested {
         match self.receivers.get_mut(receiver) {
-            Some(known) if known.site.is_some() => {
+            Some(known) if known.taking_part() => {
                 if known.admit(boot, sequence) {
                     Ingested::Ignored
                 } else {
@@ -402,6 +592,73 @@ impl Intake {
 
 impl Drop for Intake {
     fn drop(&mut self) {
-        self.seats.give_back(self.receivers.len());
+        // The intakes of one engine go together; the places this frees settle whoever is left.
+        let _ = self.seats.remove(self.receivers.keys().copied());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tally_wire::Identity;
+
+    /// Who is seated, waiting and forgotten is a function of who is described: the same in any
+    /// order of arrival, taking part ranked before idle, then by key. While nobody is forgotten
+    /// (at most twice the seats described), changes of rank on the way change nothing either.
+    #[test]
+    fn who_is_seated_depends_on_who_is_described_never_on_the_order() {
+        let keys: Vec<PublicKey> = (0..12u8)
+            .map(|seed| Identity::from_seed([seed; 32]).public())
+            .collect();
+        // Every third idle.
+        let idle = |n: usize| n.is_multiple_of(3);
+        let outcome = |order: &[usize], limit: usize, detour: bool| -> Vec<Place> {
+            let seats = Seats::new(limit);
+            for n in order {
+                if detour {
+                    // Described first as taking part, then decided: a change of rank on the way.
+                    let _ = seats.rank(keys[*n], !idle(*n));
+                }
+                let _ = seats.rank(keys[*n], idle(*n));
+            }
+            keys.iter().map(|key| seats.place(key)).collect()
+        };
+        let mut ranked: Vec<(bool, PublicKey)> =
+            (0..keys.len()).map(|n| (idle(n), keys[n])).collect();
+        ranked.sort_unstable();
+        let expected = |limit: usize| -> Vec<Place> {
+            keys.iter()
+                .map(|key| {
+                    let at = ranked.iter().position(|(_, k)| k == key).unwrap_or(0);
+                    if at < limit {
+                        Place::Seated
+                    } else if at < 2 * limit {
+                        Place::Waiting
+                    } else {
+                        Place::Gone
+                    }
+                })
+                .collect()
+        };
+        let mut order: Vec<usize> = (0..keys.len()).collect();
+        for round in 0..20u64 {
+            // A pseudorandom permutation each round.
+            for i in (1..order.len()).rev() {
+                let j = ((round + 1) * 2_654_435_761 * (i as u64 + 7) % (i as u64 + 1)) as usize;
+                order.swap(i, j);
+            }
+            let reversed: Vec<usize> = order.iter().rev().copied().collect();
+            for order in [&order, &reversed] {
+                // Four seats, four waiting, the rest forgotten.
+                assert_eq!(outcome(order, 4, false), expected(4), "{order:?}");
+                // Seven seats: nobody forgotten, so ranks may change on the way.
+                assert_eq!(outcome(order, 7, false), expected(7), "{order:?}");
+                assert_eq!(
+                    outcome(order, 7, true),
+                    expected(7),
+                    "{order:?} with detours"
+                );
+            }
+        }
     }
 }

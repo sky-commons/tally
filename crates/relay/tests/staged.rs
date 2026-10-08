@@ -513,34 +513,112 @@ fn mlat_areas() -> Result<Vec<tally_wire::Region>> {
 
 const MLAT_BOOT: u64 = 0xb007;
 
-fn mlat_settings() -> tally_mlat::engine::Settings {
+fn mlat_settings(threads: usize) -> tally_mlat::engine::Settings {
     tally_mlat::engine::Settings {
         regions: Vec::new(),
         settle_ms: tally_relay::mlat_host::SETTLE_MS,
-        threads: 2,
+        threads,
         capacity: tally_mlat::engine::Capacity::default(),
     }
 }
 
-/// What a staged relay on `threads` hosting MLAT for `areas` signs from `arrivals` (each record
-/// at its time, a batch stamped so): every `STEP_MS` of the trace's clock what has arrived is
-/// ingested and every worker has taken it, then the host is asked and waited on. Its records,
-/// provisional ones apart from the rest, each encoded in order.
-fn mlat_run(
+/// How the receivers' descriptions reach a relay in `mlat_run`.
+#[derive(Clone, Copy, Debug)]
+enum Describing {
+    /// Each at its place in the trace, between the batches.
+    Inline,
+    /// All before the first batch, in the trace's order or reversed.
+    Before { reversed: bool },
+    /// All before the first batch, from several threads at once, each pausing pseudorandomly
+    /// between them: an interleaving nobody chose.
+    Racing { seed: u64 },
+}
+
+/// Hands every description of `arrivals` to `hub` as `describing` says (not `Inline`).
+fn describe_all(hub: &Arc<Hub>, arrivals: &[(u64, Record)], describing: Describing) -> Result {
+    let mut infos: Vec<tally_wire::ReceiverInfo> = arrivals
+        .iter()
+        .filter_map(|(_, record)| match record {
+            Record::ReceiverInfo(info) => Some(info.clone()),
+            _ => None,
+        })
+        .collect();
+    let publish = |hub: &Hub, info: &tally_wire::ReceiverInfo| -> Result {
+        let content = info.content().map_err(text)?;
+        hub.publish_info(
+            1,
+            info.clone(),
+            info.receiver().map_err(text)?,
+            content.issued_ms,
+            content.location,
+            true,
+        );
+        Ok(())
+    };
+    match describing {
+        Describing::Inline => {}
+        Describing::Before { reversed } => {
+            if reversed {
+                infos.reverse();
+            }
+            for info in &infos {
+                publish(hub, info)?;
+            }
+        }
+        Describing::Racing { seed } => {
+            const RACERS: usize = 4;
+            std::thread::scope(|scope| -> Result {
+                let handles: Vec<_> = (0..RACERS)
+                    .map(|racer| {
+                        let infos = &infos;
+                        let publish = &publish;
+                        scope.spawn(move || -> Result {
+                            for (n, info) in infos.iter().enumerate().skip(racer).step_by(RACERS) {
+                                let pause = (n as u64 ^ seed).wrapping_mul(2_654_435_761) % 700;
+                                std::thread::sleep(Duration::from_micros(pause));
+                                publish(hub, info)?;
+                            }
+                            Ok(())
+                        })
+                    })
+                    .collect();
+                for handle in handles {
+                    handle.join().map_err(|_| "a racer panicked".to_owned())??;
+                }
+                Ok(())
+            })?;
+        }
+    }
+    Ok(())
+}
+
+/// What a staged relay on `threads` hosting MLAT for `areas` (on `settings`) signs from `arrivals`
+/// (each record at its time, a batch stamped so, the descriptions as `describing` says): every
+/// `STEP_MS` of the trace's clock what has arrived is ingested and every worker has taken it, then
+/// the host is asked and waited on. Its records, provisional ones apart from the rest, each
+/// encoded in order, and its report.
+fn mlat_run_with(
     arrivals: &[(u64, Record)],
     areas: &[tally_wire::Region],
     threads: Threads,
-) -> Result<Signed> {
+    settings: tally_mlat::engine::Settings,
+    describing: Describing,
+) -> Result<(
+    Signed,
+    tally_relay::mlat_host::MlatReport,
+    Vec<tally_wire::PublicKey>,
+)> {
     use tally_relay::mlat_host::{HostedMlat, MlatHost, STEP_MS};
     let hub = Arc::new(Hub::clocked(8, Arc::new(|| 0)).staged(threads));
     let host = Arc::new(HostedMlat::new(
         Identity::from_seed([5; 32]),
         MLAT_BOOT,
-        mlat_settings(),
+        settings,
     ));
     hub.network()
         .host_mlat(Arc::clone(&host) as Arc<dyn MlatHost>);
     host.set_areas(areas.to_vec(), Vec::new());
+    describe_all(&hub, arrivals, describing)?;
     let first = arrivals.first().map(|(at, _)| *at).ok_or("no raw")?;
     let until = arrivals.last().map_or(0, |(at, _)| *at) + 60_000;
     let mut published = Vec::new();
@@ -549,6 +627,7 @@ fn mlat_run(
     while now <= until {
         while let Some((at, record)) = arrivals.get(next).filter(|(at, _)| *at <= now) {
             match record {
+                Record::ReceiverInfo(_) if !matches!(describing, Describing::Inline) => {}
                 Record::ReceiverInfo(info) => {
                     // A description reaches the shards at once: what was handed in before it is
                     // taken first, as one connection's records are.
@@ -595,7 +674,32 @@ fn mlat_run(
         now += STEP_MS;
     }
     assert_eq!(host.refused(), 0);
-    Ok(encoded(&published))
+    // The receivers whose raw the engine held, by the sealed bins it kept.
+    let sealed = host.sealed_bins().ok_or("no sealed bins")?;
+    let mut held: Vec<tally_wire::PublicKey> = sealed
+        .bins(i64::MIN, i64::MAX)
+        .iter()
+        .flat_map(|bin| bin.receivers.clone())
+        .collect();
+    held.sort_unstable();
+    held.dedup();
+    Ok((encoded(&published), host.report(), held))
+}
+
+/// `mlat_run_with` on `threads` and as many MLAT threads, the descriptions inline.
+fn mlat_run(
+    arrivals: &[(u64, Record)],
+    areas: &[tally_wire::Region],
+    threads: Threads,
+) -> Result<Signed> {
+    let (signed, _, _) = mlat_run_with(
+        arrivals,
+        areas,
+        threads,
+        mlat_settings(threads.ingest),
+        Describing::Inline,
+    )?;
+    Ok(signed)
 }
 
 /// Records as bytes, in order: provisional positions, and the rest.
@@ -619,12 +723,13 @@ fn encoded(records: &[Record]) -> Signed {
     (provisional, rest)
 }
 
-/// RFC-0177 §5 and invariant 1: the relay holds MLAT's raw once, in its raw shards, taken there by
-/// the ingest workers and sealed from them (`held::Bin::seal_from`), and the hosted engine solves
-/// those sealed bins. The same stamped trace makes the same clock models, positions and
-/// provisional positions, byte for byte, on 1, 2 and 8 ingest workers, and they are what the
-/// reference engine, holding all the raw itself, makes of the same raw at the same clocks
-/// (`tally_mlat::replay`).
+/// RFC-0177 §3, §5 and invariant 1: the relay holds MLAT's raw once, in its raw shards, taken there
+/// by the ingest workers and sealed from them (`held::Bin::seal_from`), and its provisional state
+/// in address shards, weighed and stepped in parallel; the hosted engine solves those sealed bins.
+/// The same stamped trace makes the same clock models, positions and provisional positions, byte
+/// for byte, on 1, 2 and 8 ingest workers and as many MLAT threads, and they are what the
+/// reference engine, holding all the raw and every address shard itself on two threads, makes of
+/// the same raw at the same clocks (`tally_mlat::replay`).
 #[test]
 fn hosted_mlat_makes_the_same_bytes_on_any_number_of_threads_and_the_reference_engines() -> Result {
     use tally_mlat::replay::{arrivals, replay, scenario};
@@ -647,7 +752,7 @@ fn hosted_mlat_makes_the_same_bytes_on_any_number_of_threads_and_the_reference_e
         .filter(|record| matches!(record, Record::Positions(_)))
         .count();
     assert!(positions > 0, "no positions");
-    for (ingest, message) in [(2, 2), (8, 3)] {
+    for (ingest, message) in [(2, 2), (8, 8), (8, 3)] {
         let many = mlat_run(&delivered, &areas, Threads { ingest, message })?;
         assert_eq!(
             one.1, many.1,
@@ -661,7 +766,7 @@ fn hosted_mlat_makes_the_same_bytes_on_any_number_of_threads_and_the_reference_e
     let first = delivered.first().map(|(at, _)| *at).ok_or("no raw")?;
     let until = delivered.last().map_or(0, |(at, _)| *at) + 60_000;
     let mut engine =
-        tally_mlat::engine::Engine::new(Identity::from_seed([5; 32]), MLAT_BOOT, mlat_settings());
+        tally_mlat::engine::Engine::new(Identity::from_seed([5; 32]), MLAT_BOOT, mlat_settings(2));
     engine.set_scope(tally_mlat::area::border_band(&areas), areas.clone());
     let reference: Vec<Record> = replay(
         &mut engine,
@@ -679,5 +784,73 @@ fn hosted_mlat_makes_the_same_bytes_on_any_number_of_threads_and_the_reference_e
         "models and positions differ from the reference"
     );
     assert_eq!(one.0, reference.0, "provisionals differ from the reference");
+    Ok(())
+}
+
+/// RFC-0177 §9 and invariant 1 at capacity: a relay whose MLAT seats fewer receivers than are
+/// described refuses the same ones, whole, whatever order the descriptions came in, however they
+/// raced, and on any number of threads: the best ranked are seated (`tally_mlat::intake::Seats`,
+/// taking part first, then key), every other one refused and counted, and the same records signed
+/// byte for byte.
+#[test]
+fn at_capacity_the_same_receivers_are_refused_whatever_the_order_and_the_threads() -> Result {
+    use tally_mlat::replay::{arrivals, scenario};
+    let mut simulation = tally_mlat_solver::sim::run(&scenario(17, 60.0));
+    let delivered = arrivals(&mut simulation, 3)?;
+    let areas = mlat_areas()?;
+    let mut keys: Vec<tally_wire::PublicKey> = delivered
+        .iter()
+        .filter_map(|(_, record)| match record {
+            Record::ReceiverInfo(info) => info.receiver().ok(),
+            _ => None,
+        })
+        .collect();
+    keys.sort_unstable();
+    // Two seats short: every receiver of the trace takes part (they are all inside the areas), so
+    // the two with the greatest keys are the ones refused.
+    const SHORT: usize = 2;
+    assert!(keys.len() > SHORT + 3, "{} receivers", keys.len());
+    let seats = keys.len() - SHORT;
+    let settings = |threads: usize| tally_mlat::engine::Settings {
+        capacity: tally_mlat::engine::Capacity {
+            receivers: seats,
+            rates: tally_mlat_solver::held::Rates::MEASURED,
+        },
+        ..mlat_settings(threads)
+    };
+    let mut runs = Vec::new();
+    for (ingest, describing) in [
+        (1, Describing::Before { reversed: false }),
+        (2, Describing::Before { reversed: true }),
+        (8, Describing::Before { reversed: false }),
+        (1, Describing::Racing { seed: 1 }),
+        (2, Describing::Racing { seed: 2 }),
+        (8, Describing::Racing { seed: 3 }),
+    ] {
+        let threads = Threads {
+            ingest,
+            message: ingest,
+        };
+        let (signed, report, held) =
+            mlat_run_with(&delivered, &areas, threads, settings(ingest), describing)?;
+        assert_eq!(
+            report.receivers_refused, SHORT as u64,
+            "{ingest} threads, {describing:?}: {report:?}"
+        );
+        assert_eq!(
+            held,
+            keys[..seats].to_vec(),
+            "{ingest} threads, {describing:?}: other receivers held"
+        );
+        runs.push((ingest, describing, signed));
+    }
+    let (_, _, first) = &runs[0];
+    assert!(!first.0.is_empty(), "no provisional positions");
+    for (ingest, describing, signed) in &runs[1..] {
+        assert_eq!(
+            first, signed,
+            "{ingest} threads, {describing:?}: the records differ"
+        );
+    }
     Ok(())
 }

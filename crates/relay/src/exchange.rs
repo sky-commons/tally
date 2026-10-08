@@ -13,8 +13,9 @@
 //!   ([`MessageShard`]): the hub's stream and each area's first-heard.
 //! - [`Exchange::Raw`]: by receiver. Admission, station counters and each receiver's place, owned
 //!   by the ingest worker of the receiver's shard (`ingest::Stages`).
-//! - [`Exchange::Address`]: by ICAO address. Named for the world and provisional candidates, which
-//!   one sealer owns whole today (`products::Sealer`): they arrive per record, not per reception.
+//! - [`Exchange::Address`]: by ICAO address. The hosted MLAT's provisional state is held in these
+//!   shards (`mlat_host`, `tally_mlat::provisional::shard_of`); the world candidates arrive per
+//!   record, not per reception, and one sealer owns them whole (`products::Sealer`).
 //!
 //! Every producer sends [`Envelope::Tick`] down every queue as its stamps advance; a thread's
 //! watermark ([`Watermark`]) is the least of its producers' ticks, and it closes an epoch once its
@@ -66,11 +67,11 @@ pub fn raw_shard(receiver: &PublicKey) -> ShardId {
     ShardId((u16::from_le_bytes([bytes[0], bytes[1]]) as usize % SHARDS) as u16)
 }
 
-/// The shard of an ICAO address, mixed (Fibonacci hashing) so the registries' consecutive blocks
-/// spread across shards.
+/// The shard of an ICAO address: provisional solving's own (`tally_mlat::provisional::shard_of`),
+/// one hash for every state kept by aircraft.
 pub fn address_shard(address: u32) -> ShardId {
-    let mixed = address.wrapping_mul(0x9E37_79B9);
-    ShardId(((mixed >> 16) as usize % SHARDS) as u16)
+    const { assert!(tally_mlat::provisional::SHARDS == SHARDS) };
+    ShardId(tally_mlat::provisional::shard_of(address) as u16)
 }
 
 /// The thread of `threads` a shard runs on.
