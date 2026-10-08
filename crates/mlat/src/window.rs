@@ -27,8 +27,8 @@ use tally_mlat_solver::{
 };
 use tally_wire::batch::Hash;
 use tally_wire::{
-    ClockModel, ClockModelContent, Identity, Location, Positions, Record, Region, SolutionsContent,
-    WireError,
+    ClockModel, ClockModelContent, Identity, Location, Positions, Record, Regions,
+    SolutionsContent, WireError,
 };
 
 /// A step's work, owned.
@@ -38,9 +38,9 @@ pub struct Job {
     pub issued_ms: u64,
     pub threads: usize,
     /// The H3 cells the engine covers; empty is the whole world.
-    pub regions: Vec<Region>,
+    pub regions: Regions,
     /// The areas whose tiles it fits (`owns`); empty is every tile `regions` cover.
-    pub owned: Vec<Region>,
+    pub owned: Regions,
     /// The windows to solve, ascending.
     pub windows: Vec<Window>,
     /// Every receiver taking part.
@@ -123,7 +123,7 @@ pub struct Outcome {
 /// the footprint's radius about the centre, on rings 20 km apart every 10 degrees (a region is
 /// an H3 cell, tens of kilometres across at the resolutions engines are given), is in a region.
 /// Empty regions are the whole world.
-pub fn covers(regions: &[Region], tile: Tile) -> bool {
+pub fn covers(regions: &Regions, tile: Tile) -> bool {
     if regions.is_empty() {
         return true;
     }
@@ -142,7 +142,7 @@ pub fn covers(regions: &[Region], tile: Tile) -> bool {
             alt_m: 0,
             precision_m: 0,
         };
-        regions.iter().any(|region| region.covers(&location))
+        regions.covers(&location)
     };
     if !inside(ground) {
         return false;
@@ -172,12 +172,12 @@ pub fn covers(regions: &[Region], tile: Tile) -> bool {
 /// Whether a tile is one of `owned`'s: its centre, on the ground, is in one of them (RFC-0174
 /// §2.3: each tile is fitted by the MLAT relays of the area its centre is in, so an area's k relays
 /// fit its tiles and no others, however wide the band of raw they hold). Empty owns every tile.
-pub fn owns(owned: &[Region], tile: Tile) -> bool {
+pub fn owns(owned: &Regions, tile: Tile) -> bool {
     if owned.is_empty() {
         return true;
     }
     let location = crate::area::centre(tile);
-    owned.iter().any(|area| area.covers(&location))
+    owned.covers(&location)
 }
 
 /// A tile fitted: its model's encoding and inputs hash, and the model and calibration solving

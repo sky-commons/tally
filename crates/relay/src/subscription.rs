@@ -283,8 +283,8 @@ mod tests {
         let directory = Directory::new();
         directory.hold_verified(offer(&engine, atlanta, 8)?, Group::V4(1), NOW)?;
         directory.hold_verified(offer(&other, sydney, 8)?, Group::V4(2), NOW)?;
-        let band = tally_mlat::area::border_band(&[atlanta]);
-        let edge = *band.last().ok_or("an empty band")?;
+        let band = tally_mlat::area::border_band(&tally_wire::Regions::new([atlanta]));
+        let edge = *band.cells().last().ok_or("an empty band")?;
         let asked = Subscription {
             streams: Streams::RAW.with(Streams::POSITIONS).with(Streams::WORLD),
             regions: vec![atlanta, edge, sydney],
@@ -355,13 +355,13 @@ mod tests {
                 }
             }
         }
-        let band = tally_mlat::area::border_band(&areas);
+        let band = tally_mlat::area::border_band(&tally_wire::Regions::new(areas.clone()));
         assert!(
             band.iter()
                 .any(|region| region.resolution() < AREA_RESOLUTION - 1)
         );
         let started = std::time::Instant::now();
-        for chunk in band.chunks(tally_wire::record::MAX_REGIONS) {
+        for chunk in band.cells().chunks(tally_wire::record::MAX_REGIONS) {
             let asked = Subscription {
                 streams: Streams::RAW,
                 regions: chunk.to_vec(),
@@ -404,6 +404,8 @@ mod tests {
             record: Arc::new(provisional()?),
             cell: None,
             points: None,
+            decoded: None,
+            stamp_ms: 0,
         };
         let asked = |streams: Streams| {
             Subscription {

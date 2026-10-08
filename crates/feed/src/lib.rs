@@ -66,6 +66,27 @@ fn load(path: &std::path::Path) -> Result<Identity, String> {
 pub async fn run(config: Config) -> Result<(), String> {
     let identity = load(&config.key_file)?;
     eprintln!("tally-feed: receiver {}", identity.public());
+    let (inputs, batching) = start(identity, &config)?;
+    tokio::spawn(source::read_beast(config.source, inputs.clone()));
+    if let Some(uat) = config.uat {
+        tokio::spawn(source::read_uat(uat, inputs.clone()));
+    }
+    drop(inputs);
+    batching.await;
+    Ok(())
+}
+
+/// Everything a feeder runs but its sources: the relay directory and its saving, the publisher
+/// (probing, choosing, the sessions, the delivery checks) and the batcher that owns the chain.
+/// Reads every field of `config` but `key_file`, `source` and `uat`, which are the caller's.
+/// Returns the batcher's input, which the sources offer their receptions to, and the batcher
+/// itself, which runs until every clone of the input is dropped. `run` feeds it from the
+/// receiver's decoders; the load harness (`tally-load`) from the MLAT simulator, so each of its
+/// feeders is this feeder.
+pub fn start(
+    identity: Identity,
+    config: &Config,
+) -> Result<(source::Inputs, impl Future<Output = ()> + Send + 'static), String> {
     let (batches, _) = broadcast::channel(BATCH_BACKLOG);
     let directory = Directory::new(
         config.state_dir.clone(),
@@ -86,16 +107,10 @@ pub async fn run(config: Config) -> Result<(), String> {
         prober: probe::measure,
     }));
     let (inputs, intake) = source::channel();
-    tokio::spawn(source::read_beast(config.source, inputs.clone()));
-    if let Some(uat) = config.uat {
-        tokio::spawn(source::read_uat(uat, inputs.clone()));
-    }
-    drop(inputs);
-    source::batch(
+    let batching = source::batch(
         Batcher::new(identity, config.ceiling, config.clock),
         intake,
         batches,
-    )
-    .await;
-    Ok(())
+    );
+    Ok((inputs, batching))
 }

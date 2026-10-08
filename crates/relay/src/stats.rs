@@ -34,6 +34,7 @@ pub fn router(hub: Arc<Hub>) -> Router {
         .route("/egress", get(egress))
         .route("/mlat", get(mlat))
         .route("/products", get(products))
+        .route("/memory", get(memory))
         .with_state(hub)
 }
 
@@ -56,6 +57,12 @@ async fn mlat(State(hub): State<Arc<Hub>>) -> Response {
 
 async fn products(State(hub): State<Arc<Hub>>) -> Response {
     axum::Json(hub.network().products.report()).into_response()
+}
+
+/// The budget and every store's gauge, with what the stores that count their own bytes hold
+/// (the batch byte store, the delivery tags) and the decoded batches alive in all.
+async fn memory(State(hub): State<Arc<Hub>>) -> Response {
+    axum::Json(hub.memory_report()).into_response()
 }
 
 async fn stations(State(hub): State<Arc<Hub>>) -> Response {
@@ -213,11 +220,12 @@ mod tests {
             Identity::from_seed([3; 32]),
             1,
             tally_mlat::engine::Settings {
-                regions: Vec::new(),
+                regions: tally_wire::Regions::default(),
                 settle_ms: crate::mlat_host::SETTLE_MS,
                 threads: 1,
+                capacity: tally_mlat::engine::Capacity::default(),
             },
-        ));
+        )?);
         let hub = Arc::new(Hub::new(8));
         hub.network().host_mlat(hosted);
         let listener = TcpListener::bind("127.0.0.1:0").await.map_err(text)?;

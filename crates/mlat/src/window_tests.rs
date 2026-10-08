@@ -6,7 +6,7 @@ use crate::engine::{Engine, Settings};
 use std::collections::{BTreeMap, BTreeSet};
 use tally_mlat_solver::scope::{AFTER, GRID_MS, STRIDE, bin_of};
 use tally_mlat_solver::sim::{self, Rng, Scenario, Simulation};
-use tally_wire::{EnuCovariance, ObservationSet, Reception as WireReception, TransmitTime};
+use tally_wire::{EnuCovariance, ObservationSet, Reception as WireReception, Region, TransmitTime};
 
 fn text(error: impl std::fmt::Display) -> String {
     error.to_string()
@@ -19,9 +19,10 @@ fn engine(seed: u8, regions: Vec<Region>, threads: usize) -> Engine {
         Identity::from_seed([seed; 32]),
         0xb007,
         Settings {
-            regions,
+            regions: regions.into_iter().collect(),
             settle_ms: SETTLE_MS,
             threads,
+            capacity: crate::engine::Capacity::default(),
         },
     )
 }
@@ -94,21 +95,24 @@ fn the_same_raw_signs_the_same_bytes_whatever_the_order_copies_and_threads() -> 
     for record in infos.iter().chain(&batches) {
         first.ingest(record, 0)?;
     }
-    let mut rng = Rng::new(77);
-    let mut second = engine(9, Vec::new(), 4);
-    for record in infos.iter().rev() {
-        second.ingest(record, 0)?;
-    }
-    for record in delivered(&batches, &mut rng) {
-        second.ingest(record, 0)?;
-    }
     let (one, report) = first.step(now, now);
-    let (two, _) = second.step(now, now);
     assert!(report.solved >= 100, "{report:?}");
     assert_eq!(report.rejected, 0, "{report:?}");
     assert!(one.iter().any(|r| matches!(r, Record::ClockModel(_))));
     assert!(one.iter().any(|r| matches!(r, Record::Positions(_))));
-    assert_eq!(encoded(&one)?, encoded(&two)?);
+    // Sealing and solving spread over 2, 8 and 32 threads (RFC-0181 invariant 1).
+    for threads in [2, 8, 32] {
+        let mut rng = Rng::new(77 + threads as u64);
+        let mut second = engine(9, Vec::new(), threads);
+        for record in infos.iter().rev() {
+            second.ingest(record, 0)?;
+        }
+        for record in delivered(&batches, &mut rng) {
+            second.ingest(record, 0)?;
+        }
+        let (two, _) = second.step(now, now);
+        assert_eq!(encoded(&one)?, encoded(&two)?, "{threads} threads");
+    }
     // Each window is solved once: the same clock again publishes nothing.
     let (none, _) = first.step(now + 1, now + 1);
     assert!(none.is_empty());

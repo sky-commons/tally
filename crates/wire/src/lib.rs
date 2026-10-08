@@ -7,6 +7,7 @@ pub mod batch;
 pub mod beast;
 pub mod clock_model;
 pub mod credit;
+pub mod decoded;
 pub mod delivery;
 pub mod directory;
 pub mod fault_proof;
@@ -22,17 +23,22 @@ pub mod rendezvous;
 pub mod sharing;
 mod signed;
 
-pub use batch::{Batch, BatchContent, Clock, Codec, Location, Observation, ReceiverInfo};
+pub use batch::{
+    Batch, BatchContent, BatchDraft, Clock, Codec, Location, Observation, ReceiverInfo,
+};
 pub use beast::{Frame, FrameKind};
+/// The shared byte buffer batches are held in, so a crate reading them needs no dependency of its own.
+pub use bytes::Bytes;
 pub use clock_model::{
     Assembler, ClockModel, ClockModelContent, ClockModelPart, Manifest, SignedClockModel,
 };
 pub use credit::{
     EvidenceBundle, EvidenceBundleContent, FirehoseCredential, FirehoseCredentialContent,
 };
+pub use decoded::{Decoded, FingerprintKey, ObsRef, ObsView, Undecodable};
 pub use delivery::{
-    DeliveryAnswer, DeliveryAnswerContent, DeliveryQuery, Possession, SequenceRange,
-    possession_proof,
+    DeliveryAnswer, DeliveryAnswerContent, DeliveryQuery, Possession, SequenceRange, Tag, TagKey,
+    TagKeys, TagKeysContent, delivery_tag,
 };
 pub use directory::{ProviderOffer, ProviderOfferContent, ProviderQuery};
 pub use fault_proof::{Fault, FaultProof, ModelFault, SolutionFault, Tolerance};
@@ -44,11 +50,11 @@ pub use positions::{
 };
 pub use probe::{Echo, EchoReply, EchoReplyContent, Headroom};
 pub use products::{
-    RegionalBatch, RegionalBatchContent, WorldCandidate, WorldFix, WorldPositions,
+    RegionalBatch, RegionalBatchContent, RegionalDraft, WorldCandidate, WorldFix, WorldPositions,
     WorldPositionsContent, WorldPrecise,
 };
 pub use record::{Reason, Record, RelayAddress, Role, Streams};
-pub use region::Region;
+pub use region::{Region, Regions};
 pub use sharing::{
     BundleIndex, BundleIndexContent, HaveSummary, ParityChunk, PieceManifest, PieceManifestContent,
     StripeAssignment, StripeReceipt, StripeReceiptContent,

@@ -1,6 +1,7 @@
 load("@rules_rust//cargo:defs.bzl", "extract_cargo_lints")
 load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test", "rustfmt_test")
 load("//tally/build:opt.bzl", "opt_test")
+load("//tally/build:resources.bzl", "test_size")
 
 package(default_visibility = ["//tally:__subpackages__"])
 
@@ -27,12 +28,13 @@ rust_library(
         "//tally/crates/mlat-solver",
         "//tally/crates/wire",
         "@tally_crates//:axum",
+        "@tally_crates//:libc",
         "@tally_crates//:serde",
         "@tally_crates//:tokio",
     ],
 )
 
-# Public: what is deployed packs it (the Flightlines repository's images of the public relay).
+# Public: an operator packs it and checks its deploy against it (`tally-relay check`).
 rust_binary(
     name = "tally-relay",
     srcs = ["src/main.rs"],
@@ -67,6 +69,75 @@ rust_test(
     deps = [
         ":relay",
         "//tally/crates/feed",
+        "//tally/crates/mlat-solver",
+        "//tally/crates/wire",
+        "@tally_crates//:tokio",
+    ],
+)
+
+# The staged relay's invariants (RFC-0181) on its own threads: the same stamped trace makes the
+# same bytes on 1, 2 and 8 threads (products and stream), batches stamped by the relay's own clock
+# with delays inside every stage make the same bytes as with none, a message is kept once a window
+# (copies up to two seconds apart are one), each receiver's batches reach a subscriber in order,
+# and what is let go is let go whole.
+rust_test(
+    name = "staged",
+    size = "medium",
+    srcs = ["tests/staged.rs"],
+    edition = "2024",
+    lint_config = ":cargo_lints",
+    deps = [
+        ":relay",
+        "//tally/crates/mlat-solver",
+        "//tally/crates/wire",
+        "@tally_crates//:tokio",
+    ],
+)
+
+# RFC-0181 invariant 8 over real sockets: four times the feeders the budget admits connect at once,
+# exactly the ceiling is admitted, and while those flood and a subscriber never reads, every store
+# stays within its share and every decoded batch alive is one a store holds. One test in its own
+# binary: it measures the process's decoded batches.
+rust_test(
+    name = "flood",
+    size = "medium",
+    srcs = ["tests/flood.rs"],
+    edition = "2024",
+    lint_config = ":cargo_lints",
+    deps = [
+        ":relay",
+        "//tally/crates/wire",
+        "@tally_crates//:tokio",
+    ],
+)
+
+# The relay's one panic mechanism (`tally_relay::abort_on_any_panic`): a panicking tokio task or
+# thread ends the process. Each case runs the test binary again as the process that panics.
+rust_test(
+    name = "panic",
+    size = "small",
+    srcs = ["tests/panic.rs"],
+    edition = "2024",
+    lint_config = ":cargo_lints",
+    deps = [
+        ":relay",
+        "@tally_crates//:tokio",
+    ],
+)
+
+# The same invariants for the hosted MLAT (RFC-0181 §3, §5, §9): the same stamped trace makes the
+# same clock models, positions and provisional positions on any number of threads, and at
+# capacity the same receivers are refused whole whatever the order.
+rust_test(
+    name = "staged_mlat",
+    size = "medium",
+    srcs = ["tests/staged_mlat.rs"],
+    edition = "2024",
+    lint_config = ":cargo_lints",
+    deps = [
+        ":relay",
+        "//tally/crates/mlat",
+        "//tally/crates/mlat-solver",
         "//tally/crates/wire",
         "@tally_crates//:tokio",
     ],
@@ -75,15 +146,16 @@ rust_test(
 # One program: the simulator's receivers feed a relay hosting MLAT (and, apart, a relay that
 # passes their raw one hop to it), and a client verifies what it publishes; then three relays as
 # RFC-0174 runs them, with sharing, selection and both world products (about 3 minutes: the
-# precise world seals a second 90 s after it). The relays run in real time, which a debug build
-# cannot keep up with, so the binary is built optimised (`mlat_host`, below) and runs only so.
+# precise world seals a second 90 s after it). The relays' clock walks a scenario no faster than
+# they keep up and no faster than the wall clock, whose pace a debug build cannot keep, so the
+# binary is built optimised (`mlat_host_*`, below) and runs only so.
 rust_test(
     name = "mlat_host_binary",
     srcs = ["tests/mlat_host.rs"],
     crate_root = "tests/mlat_host.rs",
     edition = "2024",
     lint_config = ":cargo_lints",
-    # Run through `mlat_host`, built optimised; never on its own at the command line's mode.
+    # Run through `mlat_host_*`, built optimised; never on its own at the command line's mode.
     tags = ["manual"],
     deps = [
         ":relay",
@@ -94,32 +166,107 @@ rust_test(
     ],
 )
 
-# What it needs, measured (2026-10-07, release build, the three-relay test alone): 276 s of CPU in
-# 183 s, 1.5 cores on average, with three hosted engines of two solver threads each stepping at
-# once (six threads at the peak) beside the eight-thread runtime; 425 MiB resident. Declared as 4
-# cores and 1 GiB, to the local scheduler (`resources:` tags) and the remote one (`test.` exec
-# properties), as //tools/build/platforms:resources.bzl declares a test's size.
-opt_test(
-    name = "mlat_host",
-    size = "large",
-    exec_properties = {
-        "test.cpu_count": "4",
-        "test.memory_mb": "1024",
-    },
-    tags = [
-        "resources:cpu:4",
-        "resources:memory:1024",
+# Each test of the binary is its own target, so each runs alone and declares what it alone needs,
+# measured (2026-10-08, release build, `/usr/bin/time -v`, each test alone): the three
+# single-network tests are a relay or two over a 45 s scenario, the relays' clock walking it a step
+# at a time (`TestClock`): at most 25 MiB resident and under a second of CPU each, up to 16 s (the
+# first waits for a window to come due). The three-relay test runs three relays through 2.5 min of
+# scenario: 76 MiB resident, 6 s of CPU in 150 s. The four-relay test waits out a dead relay's
+# offers (`directory::OFFER_LIFETIME_MS`, 3 min), its relays idle. Each declared at twice its
+# resident peak or more and a core or two, to the local scheduler and the remote one alike
+# (//tally/build:resources.bzl); the binary's two threads of tokio and the hosts' solver threads
+# run in short bursts.
+_MLAT_HOST_TESTS = {
+    "mlat_host_feeders": (
+        "feeders_of_a_relay_hosting_mlat_give_its_clients_verifiable_positions_and_provisionals",
+        "medium",
+        test_size(
+            cpu = 2,
+            memory_mb = 256,
+        ),
+    ),
+    "mlat_host_seed_53": (
+        "every_final_a_relay_publishes_passes_the_verifier_seed_53",
+        "small",
+        test_size(
+            cpu = 2,
+            memory_mb = 256,
+        ),
+    ),
+    "mlat_host_one_hop": (
+        "raw_from_a_relay_that_solves_nothing_reaches_the_relay_that_solves_its_area_in_one_hop",
+        "small",
+        test_size(
+            cpu = 2,
+            memory_mb = 256,
+        ),
+    ),
+    "mlat_host_three_relays": (
+        "three_relays_share_solve_and_serve_verifiable_positions_and_both_world_products",
+        "large",
+        test_size(
+            cpu = 2,
+            memory_mb = 512,
+        ),
+    ),
+    "mlat_host_four_relays": (
+        "of_four_relays_three_solve_an_area_and_a_dead_one_is_replaced_by_the_next",
+        "large",
+        test_size(
+            cpu = 2,
+            memory_mb = 512,
+        ),
+    ),
+}
+
+[
+    opt_test(
+        name = name,
+        size = size,
+        args = [
+            "--exact",
+            test,
+            "--test-threads=1",
+        ],
+        exec_properties = resources.exec_properties,
+        tags = resources.tags,
+        test = ":mlat_host_binary",
+    )
+    for name, (test, size, resources) in _MLAT_HOST_TESTS.items()
+]
+
+# `tally-relay check` refuses what a start refuses and prints the memory plan (RFC-0181 §9), run
+# against the built binary with the test's own arguments and with the packaged unit's: what Tally
+# publishes starts a relay that admits feeders. An operator checks its own deploy the same way, by
+# asking the relay it runs (RFC-0180 §3).
+rust_test(
+    name = "check",
+    size = "small",
+    srcs = ["tests/check.rs"],
+    data = [
+        ":tally-relay",
+        "//tally/packaging/systemd:tally-relay.service",
     ],
-    test = ":mlat_host_binary",
+    edition = "2024",
+    env = {
+        "TALLY_RELAY_BIN": "$(rootpath :tally-relay)",
+        "TALLY_RELAY_UNIT": "$(rootpath //tally/packaging/systemd:tally-relay.service)",
+    },
+    lint_config = ":cargo_lints",
 )
 
 rustfmt_test(
     name = "rustfmt",
     targets = [
+        ":check",
         ":end_to_end",
+        ":flood",
         ":mlat_host_binary",
+        ":panic",
         ":relay",
         ":relay_test",
+        ":staged",
+        ":staged_mlat",
         ":tally-relay",
     ],
 )

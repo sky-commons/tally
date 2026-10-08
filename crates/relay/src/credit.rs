@@ -1094,7 +1094,13 @@ mod tests {
                 boot_id: 1,
                 issued_ms,
                 takes_area: true,
-                entries: vec![(1, Possession::Proved([2; 32]))],
+                entries: vec![(
+                    1,
+                    Possession::Proved {
+                        key: 2,
+                        tag: [2; 16],
+                    },
+                )],
             },
         )
         .map_err(text)

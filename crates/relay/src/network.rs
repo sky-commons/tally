@@ -25,8 +25,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use tally_wire::{
-    Batch, ClockModel, ClockModelPart, Identity, Positions, PublicKey, ReceiverInfo, Record,
-    Region, RelayAddress,
+    Batch, ClockModel, ClockModelPart, Decoded, Identity, Positions, PublicKey, ReceiverInfo,
+    Record, Region, Regions, RelayAddress,
 };
 
 use crate::admission::Admission;
@@ -94,12 +94,12 @@ pub struct Network {
     pub selection: Selection,
     pub sharing: Sharing,
     pub credit: Credit,
-    pub products: Products,
+    pub products: Arc<Products>,
     pub standing: Standing,
     pub peers: Peers,
     mlat: OnceLock<Arc<dyn MlatHost>>,
-    /// The areas last handed the hosted MLAT.
-    mlat_areas: Mutex<Vec<Region>>,
+    /// The areas last handed the hosted MLAT, and the generation of the choice they came from.
+    mlat_areas: Mutex<(u64, Regions)>,
     corroborated_ms: AtomicU64,
     /// Recent clock models, oldest first.
     models: Mutex<std::collections::VecDeque<HeldModel>>,
@@ -127,17 +127,28 @@ impl Network {
             selection: Selection::new(),
             sharing: Sharing::new(),
             credit: Credit::new(),
-            products: Products::new(),
+            products: Arc::new(Products::new()),
             standing: Standing::new(),
             peers: Peers::new(),
             mlat: OnceLock::new(),
-            mlat_areas: Mutex::new(Vec::new()),
+            mlat_areas: Mutex::new((0, Regions::default())),
             corroborated_ms: AtomicU64::new(0),
             models: Mutex::new(std::collections::VecDeque::new()),
             shared_in: AtomicU64::new(0),
             data_on_directory_links: AtomicU64::new(0),
             dials: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// Every duty's store charged to its gauge of `budget` (`budget::Store`), the gauge's limit its
+    /// share and its only bound: the one batch byte store (sharing), the delivery tags, and what
+    /// the products hold. Called again when the budget is resized; the gauges are the budget's own
+    /// for its life, so whoever holds one sees the new limit.
+    pub fn charge_to(&self, budget: &crate::budget::Budget) {
+        use crate::budget::Store;
+        self.sharing.charge_to(budget.gauge(Store::Batches));
+        self.delivery.charge_to(budget.gauge(Store::Delivery));
+        self.products.charge_to(budget.gauge(Store::Products));
     }
 
     /// Group records members have sent this relay.
@@ -163,6 +174,7 @@ impl Network {
     /// The key the relay signs its network records with (its newest), once it serves.
     pub fn adopt_identity(&self, identity: Identity) {
         self.credit.adopt_identity(identity.public());
+        self.products.adopt_identity(&identity);
         let _ = self.identity.set(identity);
     }
 
@@ -172,6 +184,10 @@ impl Network {
 
     /// The MLAT this relay runs (one program); none when its MLAT duty is off.
     pub fn host_mlat(&self, host: Arc<dyn MlatHost>) {
+        // Standing reads the engine's raw: one store of raw per relay (RFC-0181 §5).
+        if let Some(sealed) = host.sealed_bins() {
+            self.standing.read_bins(sealed);
+        }
         let _ = self.mlat.set(host);
     }
 
@@ -192,9 +208,16 @@ impl Network {
                 .collect(),
             Record::DeliveryQuery(query) => {
                 let point = hub.point_of(&query.receiver);
-                // A relay's own answer is its own word, never credit evidence (`credit`).
+                // A relay's own answer is its own word, never credit evidence (`credit`). By the
+                // ingest clock, the clock delivery held each batch by (`on_batch`).
                 self.delivery
-                    .answer_at(&self.selection, identity, &query, point, now_ms)
+                    .answer_at(
+                        &self.selection,
+                        identity,
+                        &query,
+                        (point, asker.source),
+                        hub.now_ms(),
+                    )
                     .map(Record::DeliveryAnswer)
                     .into_iter()
                     .collect()
@@ -233,12 +256,14 @@ impl Network {
                 self.credit.evidence(asker, bundle, now_ms);
                 Vec::new()
             }
-            Record::WorldPositions(world) => self.products.world_from(asker, world, now_ms),
-            Record::WorldPrecise(world) => self.products.precise_from(asker, world, now_ms),
+            // The products take a record in by its stamp against their watermark, so it is
+            // stamped by the ingest clock their watermark comes from (`products::Records`).
+            Record::WorldPositions(world) => self.products.world_from(asker, world, hub.now_ms()),
+            Record::WorldPrecise(world) => self.products.precise_from(asker, world, hub.now_ms()),
             Record::RegionalBatch(regional) => {
                 let record = Record::RegionalBatch(regional.clone());
                 self.from_peer(hub, asker, &record, now_ms);
-                self.products.regional_from(asker, regional, now_ms)
+                self.products.regional_from(asker, regional, hub.now_ms())
             }
             Record::Parity(chunk) => self.sharing.parity_chunk(asker, chunk, now_ms),
             // A bundler's index: checked, and passed on to whoever reads the parent cell.
@@ -253,26 +278,30 @@ impl Network {
         }
     }
 
-    /// A receiver's description the hub kept (newer than what it held, verified).
+    /// A receiver's description the hub kept (newer than what it held, verified). The hosted
+    /// MLAT is offered it by the hub, through the ingest stage, stamped there as the receiver's
+    /// batches are (`Hub::describe`).
     pub fn on_info(&self, info: &ReceiverInfo, now_ms: u64) {
         self.credit.described(info.clone(), now_ms);
         self.products.described(info);
+    }
+
+    /// The one decode of a receiver's batch the hub forwarded (new, verified), when this build
+    /// reads its format, stamped `stamp_ms` by the ingest clock: MLAT reads the decode and nothing
+    /// else (and standing reads MLAT's sealed bins). The regional product reads it through the
+    /// message exchange (`exchange`), not here, and delivery tags the batch where its receiver's
+    /// place is read, as it is shared (`originate`, `from_peer`), so the batch is not passed here.
+    pub fn on_batch(&self, decoded: Option<&Arc<Decoded>>, stamp_ms: u64) {
+        let Some(decoded) = decoded else {
+            return;
+        };
         if let Some(mlat) = self.mlat() {
-            mlat.offer(&Record::ReceiverInfo(info.clone()), now_ms);
+            mlat.offer_batch(decoded, stamp_ms);
         }
     }
 
-    /// A receiver's batch the hub forwarded (new, verified).
-    pub fn on_batch(&self, batch: &Batch, receiver: &PublicKey, now_ms: u64) {
-        self.delivery.hold(batch, now_ms);
-        self.products.batch(batch, receiver, now_ms);
-        self.standing.batch(batch, now_ms);
-        if let Some(mlat) = self.mlat() {
-            mlat.offer(&Record::Batch(batch.clone()), now_ms);
-        }
-    }
-
-    /// Final or provisional positions the hub forwarded (new, verified).
+    /// Final or provisional positions the hub forwarded (new, verified), at `now_ms` by the
+    /// ingest clock (the products take them in by it).
     pub fn on_positions(&self, positions: &Positions, now_ms: u64) {
         self.products.positions(positions, now_ms);
         self.standing.positions(positions, now_ms);
@@ -290,8 +319,9 @@ impl Network {
     /// own MLAT's positions and models, its own regional batches, a fault proof brought to it):
     /// it is the origin, and seeds it into the record's sharing group.
     pub fn originate(&self, hub: &Hub, record: &Record, now_ms: u64) {
-        if let Some((cell, product)) = crate::sharing::group_of(record, self.point_for(hub, record))
-        {
+        let point = self.point_for(hub, record);
+        self.tag(record, point, now_ms);
+        if let Some((cell, product)) = crate::sharing::group_of(record, point) {
             self.sharing.originate(record, cell, product, now_ms);
         }
     }
@@ -299,6 +329,15 @@ impl Network {
     /// A batch this relay's own feeder published.
     pub fn from_feeder(&self, hub: &Hub, batch: &Batch, now_ms: u64) {
         self.originate(hub, &Record::Batch(batch.clone()), now_ms);
+    }
+
+    /// A batch from a feeder or a peer, its receiver's place `point` (as its group is reckoned
+    /// from it), at `now_ms` by the ingest clock: delivery tags it if its receiver is of the
+    /// areas this relay takes (`delivery`).
+    fn tag(&self, record: &Record, point: Option<Region>, now_ms: u64) {
+        if let Record::Batch(batch) = record {
+            self.delivery.hold(&self.selection, batch, point, now_ms);
+        }
     }
 
     /// Where a record's group is reckoned from, when the record does not say: a batch's
@@ -407,6 +446,7 @@ impl Network {
     /// stripes, and the sender corroborated first-hand.
     pub fn from_peer(&self, hub: &Hub, asker: &Asker, record: &Record, now_ms: u64) {
         let point = self.point_for(hub, record);
+        self.tag(record, point, now_ms);
         let Some((cell, product)) = crate::sharing::group_of(record, point) else {
             return;
         };
@@ -429,8 +469,10 @@ impl Network {
         let mut out = Vec::new();
         out.extend(self.directory.tick(hub, identity, now_ms));
         out.extend(self.sharing.tick(hub, identity, now_ms));
-        out.extend(self.products.tick(identity, now_ms));
-        self.standing.tick(now_ms);
+        // The products seal by the watermark as epochs close (`products::Sealer`); this takes
+        // what they signed.
+        out.extend(self.products.tick(identity));
+        self.standing.tick(self.products.watermark_ms());
         let last = self.corroborated_ms.load(Ordering::Relaxed);
         if now_ms.saturating_sub(last) >= CORROBORATE_EVERY_MS {
             self.corroborated_ms.store(now_ms, Ordering::Relaxed);
@@ -439,20 +481,28 @@ impl Network {
             }
         }
         if let Some(mlat) = self.mlat() {
-            let areas = self.selection.mlat_areas(&self.directory, now_ms);
+            // The choice is recomputed only when what it follows moved (`Selection::solved`), and
+            // handed on only when it came out different.
+            let (generation, areas) = self.selection.solved(&self.directory, now_ms);
             let changed = self
                 .mlat_areas
                 .lock()
                 .map(|mut held| {
-                    let changed = *held != areas;
-                    held.clone_from(&areas);
+                    if held.0 == generation {
+                        return false;
+                    }
+                    held.0 = generation;
+                    let changed = held.1 != areas;
+                    held.1 = areas.clone();
                     changed
                 })
                 .unwrap_or(false);
             if changed {
+                // Standing holds raw for the areas the hosted MLAT does, and for no other.
+                self.standing.set_areas(&areas);
                 mlat.set_areas(areas, hub.descriptions());
             }
-            let published = mlat.take_published(now_ms);
+            let published = mlat.take_published(self.products.watermark_ms());
             // A model's parts come before its manifest; held first, they place it.
             for record in &published {
                 match record {
@@ -517,6 +567,7 @@ pub async fn run(hub: Arc<Hub>) {
     let mut raw_ms = 0;
     loop {
         tick.tick().await;
+        hub.idle();
         let now_ms = wall_ms();
         for record in hub.network().tick(&hub, now_ms) {
             hub.publish_own(record);
@@ -610,7 +661,7 @@ mod tests {
                     let routed = tile_point(&tile.bytes()).ok_or("no point")?;
                     let area = area_of_cell(routed).ok_or("no area")?;
                     assert!(
-                        tally_mlat::window::owns(&[area], tile),
+                        tally_mlat::window::owns(&Regions::new([area]), tile),
                         "{tile:?} routed to {area:?}, which does not fit it"
                     );
                     checked += 1;

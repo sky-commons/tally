@@ -292,9 +292,15 @@ async fn a_batch_arriving_twice_is_forwarded_once() -> Result {
 
 #[tokio::test]
 async fn a_stalled_subscriber_is_dropped_and_the_others_keep_every_batch() -> Result {
-    // A small fan-out slack, so a subscriber that stops reading falls behind quickly, and an
-    // ingest ceiling far above the flood this feeder sends to make that happen.
-    let relay = relay(Hub::with_capacity(8, 16).max_feeder_bytes_per_sec(1 << 30)).await?;
+    // A small subscriber queue (a megabyte, some dozen of these batches), so a subscriber that
+    // stops reading falls behind quickly, and an ingest ceiling far above the flood this feeder
+    // sends to make that happen.
+    let relay = relay(
+        Hub::new(8)
+            .queue_bytes(1 << 20)
+            .max_feeder_bytes_per_sec(1 << 30),
+    )
+    .await?;
     let mut fast = subscribe(&relay).await?;
     let stalled = subscribe(&relay).await?;
     let receiver = Identity::generate().map_err(text)?;
@@ -598,16 +604,21 @@ async fn two_receivers_hearing_one_message_are_one_copy_in_the_relays_signed_str
     let after = frames(2)?[1].message().to_vec();
     let mut feeds = Vec::new();
     let mut receivers = HashSet::new();
+    // Everything the subscriber is sent from here on: an epoch may seal (and its signed batch
+    // arrive) while the raw copies are still being read.
+    let mut heard = Vec::new();
     for (counter, data) in [(10, &message), (20, &message), (30, &after)] {
         if data == &after {
             // Both copies through the relay before the later message is sent.
-            until(&mut subscriber, "both copies raw", |record| {
-                if let (Record::Batch(_), Some(key)) = (record, author(record)) {
-                    receivers.insert(key);
-                }
-                receivers.len() == 2
-            })
-            .await?;
+            heard.extend(
+                until(&mut subscriber, "both copies raw", |record| {
+                    if let (Record::Batch(_), Some(key)) = (record, author(record)) {
+                        receivers.insert(key);
+                    }
+                    receivers.len() == 2
+                })
+                .await?,
+            );
         }
         let receiver = Identity::generate().map_err(text)?;
         let mut feed = connect(&relay, &receiver, Role::Feeder).await?;
@@ -658,17 +669,19 @@ async fn two_receivers_hearing_one_message_are_one_copy_in_the_relays_signed_str
         }
         Ok((copies, signed))
     };
-    let heard = until(
-        &mut subscriber,
-        "the later message, deduplicated",
-        |record| {
-            matches!(record, Record::RelayBatch(batch)
-            if batch.content().is_ok_and(|content| {
-                content.observations.iter().any(|observation| observation.data == after)
-            }))
-        },
-    )
-    .await?;
+    heard.extend(
+        until(
+            &mut subscriber,
+            "the later message, deduplicated",
+            |record| {
+                matches!(record, Record::RelayBatch(batch)
+                if batch.content().is_ok_and(|content| {
+                    content.observations.iter().any(|observation| observation.data == after)
+                }))
+            },
+        )
+        .await?,
+    );
     let (total, signed) = copies(&heard, &message)?;
     assert_eq!(signed.first().map(Batch::sequence), Some(0));
     assert_eq!(total, 1);
@@ -696,9 +709,15 @@ impl Scripted {
 }
 
 impl MlatHost for Scripted {
-    fn set_areas(&self, _: Vec<Region>, _: Vec<ReceiverInfo>) {}
+    fn set_areas(&self, _: tally_wire::Regions, _: Vec<ReceiverInfo>) {}
 
-    fn offer(&self, _: &Record, _: u64) {}
+    fn offer_description(&self, _: &ReceiverInfo, _: u64) {}
+
+    fn offer_batch(&self, _: &Arc<tally_wire::Decoded>, _: u64) {}
+
+    fn sealed_bins(&self) -> Option<tally_mlat_solver::held::SealedBins> {
+        None
+    }
 
     fn take_published(&self, _: u64) -> Vec<Record> {
         self.ready
@@ -1339,6 +1358,52 @@ async fn a_feeder_is_told_its_rate_limit_and_the_relays_hints_first() -> Result 
     Ok(())
 }
 
+/// Capacity is admission (RFC-0181 §9): a relay whose memory holds one feeder's share of every
+/// store takes the first feeder and turns the second away at its Hello, pointed at the relays it
+/// knows, before anything it sent is taken in; the first is served on, and leaving frees its slot.
+#[tokio::test]
+async fn a_feeder_beyond_the_memory_budget_is_refused_at_its_hello() -> Result {
+    let hint = RelayAddress {
+        key: Identity::generate().map_err(text)?.public(),
+        address: "other.example:10900".to_owned(),
+    };
+    let hub = Hub::new(8)
+        .advertising(vec![hint.clone()])
+        .memory_for_feeders(1, false);
+    assert_eq!(hub.budget().ceiling(), 1);
+    let relay = relay(hub).await?;
+    let mut first = connect(&relay, &Identity::generate().map_err(text)?, Role::Feeder).await?;
+    let mut greeting = Vec::new();
+    first.reader.recv(&mut greeting).await.map_err(text)?;
+    assert!(matches!(greeting.first(), Some(Record::RateLimit { .. })));
+    let mut second = connect(&relay, &Identity::generate().map_err(text)?, Role::Feeder).await?;
+    let mut refused = Vec::new();
+    second.reader.recv(&mut refused).await.map_err(text)?;
+    assert_eq!(
+        refused.first(),
+        Some(&Record::Redirect {
+            retry_after_secs: 600,
+            hints: vec![hint],
+        })
+    );
+    // The first leaves; its slot is free for the next.
+    drop(first);
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let mut third = connect(&relay, &Identity::generate().map_err(text)?, Role::Feeder).await?;
+        let mut answer = Vec::new();
+        third.reader.recv(&mut answer).await.map_err(text)?;
+        if matches!(answer.first(), Some(Record::RateLimit { .. })) {
+            break;
+        }
+        if std::time::Instant::now() > deadline {
+            return Err("the first feeder's slot was never freed".to_owned());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    Ok(())
+}
+
 /// Two engines' clock models of the same inputs that differ: a fault anyone proves with the two
 /// manifests, which the relay checks and forwards; two that agree prove nothing.
 #[tokio::test]
@@ -1422,11 +1487,29 @@ async fn a_probe_and_a_delivery_query_are_answered_signed_by_the_relay() -> Resu
     assert_eq!(reply.signer().map_err(text)?, relay.key);
     assert_eq!(reply.content().map_err(text)?.nonce, 7);
 
+    // The query carries the feeder's signed grant of tag keys to this relay, as every one does.
+    let keys = tally_wire::TagKeys::sign(
+        &feeder,
+        &tally_wire::TagKeysContent {
+            member: relay.key,
+            current: tally_wire::TagKey {
+                id: 1,
+                key: [1; 32],
+            },
+            next: tally_wire::TagKey {
+                id: 2,
+                key: [2; 32],
+            },
+            switch_in_ms: 1_000,
+        },
+    )
+    .map_err(text)?;
     let query = tally_wire::DeliveryQuery {
         nonce: [3; 32],
         receiver: feeder.public(),
         boot_id: 1,
         ranges: vec![tally_wire::SequenceRange { first: 0, last: 3 }],
+        keys: Some(keys),
     };
     session
         .writer
@@ -1451,4 +1534,164 @@ async fn a_probe_and_a_delivery_query_are_answered_signed_by_the_relay() -> Resu
         ([3; 32], feeder.public())
     );
     Ok(())
+}
+
+/// A relay that takes `areas`, advertising its own address so its offers can be verified, on
+/// network `asn`, accepting `relays` on directory links.
+async fn taking(
+    identity: Identity,
+    areas: &[Region],
+    asn: u32,
+    relays: &[PublicKey],
+) -> Result<(Relay, Arc<Hub>)> {
+    let listener = TcpListener::bind("127.0.0.1:0").await.map_err(text)?;
+    let address = listener.local_addr().map_err(text)?;
+    let hub = Arc::new(
+        Hub::new(8)
+            .advertising(vec![RelayAddress {
+                key: identity.public(),
+                address: address.to_string(),
+            }])
+            .accepting_relays(relays.iter().copied())
+            .max_connections_per_address(256)
+            .taking(areas.to_vec()),
+    );
+    hub.network().admission.configure(asn, true);
+    let key = identity.public();
+    tokio::spawn(tally_relay::serve(
+        listener,
+        vec![identity],
+        Arc::clone(&hub),
+    ));
+    Ok((
+        Relay {
+            address,
+            // No BEAST output here.
+            beast_out: address,
+            key,
+        },
+        hub,
+    ))
+}
+
+/// RFC-0174 §2.5, "A relay's members are bounded": three relays take one area. The first holds
+/// every member session its plan admits, so when the third's link brings it the group's data it
+/// is turned away with `Reason::Full`. The third takes that as "this provider is full": it routes
+/// what it would have sent the full relay to the next members of the area's trees, so its
+/// feeder's batches reach the second relay and its subscriber all the same, and it does not dial
+/// the full relay again for the wait it was given (so the full relay turns it away once, never in
+/// a loop).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_relay_whose_members_are_full_is_routed_around_and_the_data_still_arrives() -> Result {
+    let place = at(33.749, -84.388);
+    let area = tally_wire::rendezvous::area_of(&place).map_err(text)?;
+    let [full, next, third] = [
+        Identity::generate().map_err(text)?,
+        Identity::generate().map_err(text)?,
+        Identity::generate().map_err(text)?,
+    ];
+    let joining = [next.public(), third.public()];
+    let (_, full_hub) = taking(full.clone(), &[area], 64_531, &joining).await?;
+    let (next_relay, next_hub) = taking(next.clone(), &[area], 64_532, &[]).await?;
+    let (third_relay, third_hub) = taking(third.clone(), &[area], 64_533, &[]).await?;
+    // The full relay's member pool, every session its plan admits, held.
+    let mut held = Vec::new();
+    while let Some(membership) = full_hub.budget().reserve_member() {
+        held.push(membership);
+    }
+    assert_eq!(held.len(), full_hub.budget().members());
+    let full_address = {
+        let advertised = full_hub.hints();
+        advertised.first().ok_or("no address")?.address.clone()
+    };
+    for (identity, hub) in [(&next, &next_hub), (&third, &third_hub)] {
+        tokio::spawn(link::upstream(
+            tally_relay::config::Upstream {
+                address: full_address.clone(),
+                key: full.public(),
+            },
+            identity.clone(),
+            Arc::clone(hub),
+        ));
+    }
+    let keys = [full.public(), next.public(), third.public()];
+    let hubs = [&full_hub, &next_hub, &third_hub];
+    tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            let found = hubs.iter().zip(keys).all(|(hub, own)| {
+                keys.iter()
+                    .filter(|key| **key != own)
+                    .all(|key| hub.network().directory.knows(key))
+            });
+            if found {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .map_err(|_| "the relays never verified one another's offers".to_owned())?;
+
+    // A feeder of the area on the third relay, and a subscriber to its raw on the second.
+    let feeder = Identity::generate().map_err(text)?;
+    let mut feed = described_feeder(&third_relay, &feeder, Some(place)).await?;
+    let mut subscriber = subscribe(&next_relay).await?;
+    let sent = 40;
+    let author = feeder.public();
+    let heard = tokio::spawn(async move {
+        let mut sequences = std::collections::BTreeSet::new();
+        let _ = until(&mut subscriber, "the third relay's batches", |record| {
+            if let Record::Batch(batch) = record
+                && batch.receiver().ok() == Some(author)
+            {
+                sequences.insert(batch.sequence());
+            }
+            sequences.len() == sent
+        })
+        .await;
+        sequences.len()
+    });
+    for sequence in 0..sent as u64 {
+        let now = tally_relay::network::wall_ms();
+        feed.writer
+            .send(&[Record::Batch(fresh_batch(&feeder, sequence, now)?)])
+            .await
+            .map_err(text)?;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let got = tokio::time::timeout(Duration::from_secs(60), heard)
+        .await
+        .map_err(|_| "the third relay's batches never all reached the second".to_owned())?
+        .map_err(text)?;
+    assert_eq!(got, sent);
+    // The full relay said so, and the third took it as full: routed around, not dialled again.
+    let now = tally_relay::network::wall_ms();
+    assert!(
+        third_hub.network().peers.full(now).contains(&full.public()),
+        "the third relay does not hold the first as full"
+    );
+    let refused = full_hub.memory_report().members_refused;
+    assert!(
+        (1..=2).contains(&refused),
+        "the full relay turned links away {refused} times"
+    );
+    drop(held);
+    Ok(())
+}
+
+/// A batch of `identity`'s stamped `wall_ms`, as a live feeder sends one.
+fn fresh_batch(identity: &Identity, sequence: u64, wall_ms: u64) -> Result<Batch> {
+    Batch::sign(
+        identity,
+        &BatchContent {
+            boot_id: 1,
+            sequence,
+            counter_epoch: 0,
+            wall_ms,
+            dropped: 0,
+            previous: [0; 32],
+            observations: vec![tally_wire::Observation::from_beast(&frames(1)?[0])],
+        },
+    )
+    .map_err(text)
 }

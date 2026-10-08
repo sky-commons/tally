@@ -1,7 +1,8 @@
 //! Sharing group membership (RFC-0174 §2.5): per (area cell, product), the relays that take the
 //! cell. A relay is a member while it has a live `ProviderOffer` for the cell and product (from
 //! `directory`), or while it recently asked a member for stripes (`StripeAssignment`), and this
-//! relay is always a member of the groups of the areas it takes. A member that offers no stripes
+//! relay is always a member of the groups of the areas it takes (without an entry: a group only
+//! this relay is in has no book). A member that offers no stripes
 //! withdrew from forwarding and is a leaf in every tree. A member its children report as starving
 //! them is demoted: out of every tree, for [`DEMOTION_MS`].
 
@@ -47,12 +48,26 @@ impl PartialOrd for GroupKey {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 struct Entry {
-    until_ms: u64,
-    leaf_only: bool,
-    /// Admitted by a verified offer (until `offered_until_ms`), not only by an ask.
-    offered_until_ms: u64,
+    /// A member by asking until then (0: never asked, or lapsed).
+    asked_until_ms: u64,
+    /// A leaf, as its ask said (a newcomer's only).
+    asked_leaf: bool,
+    /// A member by its verified offers, held now: `Some(leaf)`, a leaf when any of them forwards
+    /// nothing here. Kept exactly what the directory holds (`Groups::set_offers`), so it lapses
+    /// when the offers do.
+    offered: Option<bool>,
+}
+
+impl Entry {
+    fn leaf_only(&self) -> bool {
+        self.offered.unwrap_or(self.asked_leaf)
+    }
+
+    fn lapsed(&self, now_ms: u64) -> bool {
+        self.offered.is_none() && self.asked_until_ms <= now_ms
+    }
 }
 
 #[derive(Default)]
@@ -61,9 +76,20 @@ struct Book {
     demoted: BTreeMap<PublicKey, u64>,
 }
 
+impl Book {
+    fn is_empty(&self) -> bool {
+        self.members.is_empty() && self.demoted.is_empty()
+    }
+}
+
+/// The books of the groups some other relay is in. This relay is in every group of the areas it
+/// takes without an entry here (`Sharing` adds it to each tree it lays out): a group no other relay
+/// is in has no book, so holding the whole world costs nothing per area.
 #[derive(Default)]
 pub struct Groups {
     books: RwLock<BTreeMap<GroupKey, Book>>,
+    /// The soonest an ask lapses or a demotion ends: `expire` does nothing before it.
+    next_expiry_ms: RwLock<u64>,
 }
 
 impl Groups {
@@ -84,44 +110,34 @@ impl Groups {
             .members
             .entry(member)
             .or_insert(Entry {
-                until_ms,
-                leaf_only,
-                offered_until_ms: 0,
+                asked_leaf: leaf_only,
+                ..Entry::default()
             });
-        entry.until_ms = entry.until_ms.max(until_ms);
+        entry.asked_until_ms = entry.asked_until_ms.max(until_ms);
+        self.expires_at(until_ms);
     }
 
-    /// `member`'s verified offers cover the group until `until_ms`; `leaf_only` when any of them
-    /// forwards nothing there. What the offers say replaces what an ask said: the offers are the
-    /// member's own signed word, and every relay that holds them reads them alike.
-    pub fn offered(&self, group: GroupKey, member: PublicKey, until_ms: u64, leaf_only: bool) {
+    /// The members whose verified offers cover the group now, each a leaf when any of its offers
+    /// forwards nothing here: what the offers say replaces what an ask said, and a member whose
+    /// offers are gone is a member by its ask alone, if it asked. The offers are the members' own
+    /// signed word, and every relay that holds them reads them alike.
+    pub fn set_offers(&self, group: GroupKey, offers: &BTreeMap<PublicKey, bool>) {
         let mut books = write(&self.books);
-        let entry = books
-            .entry(group)
-            .or_default()
-            .members
-            .entry(member)
-            .or_insert(Entry {
-                until_ms,
-                leaf_only,
-                offered_until_ms: until_ms,
-            });
-        entry.until_ms = entry.until_ms.max(until_ms);
-        entry.offered_until_ms = until_ms;
-        entry.leaf_only = leaf_only;
-    }
-
-    /// This relay itself: in the group until `until_ms`, a leaf exactly when `leaf_only` (its own
-    /// withdrawal, which nothing else overrides).
-    pub fn own(&self, group: GroupKey, member: PublicKey, until_ms: u64, leaf_only: bool) {
-        write(&self.books).entry(group).or_default().members.insert(
-            member,
-            Entry {
-                until_ms,
-                leaf_only,
-                offered_until_ms: until_ms,
-            },
-        );
+        if offers.is_empty() && !books.contains_key(&group) {
+            return;
+        }
+        let book = books.entry(group).or_default();
+        for entry in book.members.values_mut() {
+            entry.offered = None;
+        }
+        for (member, leaf) in offers {
+            book.members.entry(*member).or_default().offered = Some(*leaf);
+        }
+        book.members
+            .retain(|_, entry| entry.offered.is_some() || entry.asked_until_ms > 0);
+        if book.is_empty() {
+            books.remove(&group);
+        }
     }
 
     /// Out of the group's trees until `until_ms`.
@@ -130,6 +146,7 @@ impl Groups {
         let demoted = books.entry(group).or_default().demoted.entry(member);
         let until = demoted.or_insert(until_ms);
         *until = (*until).max(until_ms);
+        self.expires_at(until_ms);
     }
 
     pub fn is_demoted(&self, group: GroupKey, member: &PublicKey) -> bool {
@@ -138,14 +155,42 @@ impl Groups {
             .is_some_and(|book| book.demoted.contains_key(member))
     }
 
-    /// Forgets members and demotions whose time is up, and groups left empty.
-    pub fn expire(&self, now_ms: u64) {
-        let mut books = write(&self.books);
-        for book in books.values_mut() {
-            book.members.retain(|_, entry| entry.until_ms > now_ms);
-            book.demoted.retain(|_, until| *until > now_ms);
+    /// Forgets asks and demotions whose time is up, and groups left empty: nothing to do, and no
+    /// scan, before the soonest is due. The groups whose trees changed (a demotion ended).
+    pub fn expire(&self, now_ms: u64) -> Vec<GroupKey> {
+        if *read(&self.next_expiry_ms) > now_ms {
+            return Vec::new();
         }
-        books.retain(|_, book| !book.members.is_empty() || !book.demoted.is_empty());
+        let mut books = write(&self.books);
+        let mut changed = Vec::new();
+        let mut next = u64::MAX;
+        for (key, book) in books.iter_mut() {
+            for entry in book.members.values_mut() {
+                if entry.asked_until_ms <= now_ms {
+                    entry.asked_until_ms = 0;
+                } else {
+                    next = next.min(entry.asked_until_ms);
+                }
+            }
+            book.members.retain(|_, entry| !entry.lapsed(now_ms));
+            let before = book.demoted.len();
+            book.demoted.retain(|_, until| *until > now_ms);
+            if book.demoted.len() != before {
+                changed.push(*key);
+            }
+            next = book
+                .demoted
+                .values()
+                .fold(next, |next, until| next.min(*until));
+        }
+        books.retain(|_, book| !book.is_empty());
+        *write(&self.next_expiry_ms) = next;
+        changed
+    }
+
+    fn expires_at(&self, until_ms: u64) {
+        let mut next = write(&self.next_expiry_ms);
+        *next = (*next).min(until_ms);
     }
 
     /// The members of a cell's product group, sorted by key, demoted members left out: who may
@@ -154,21 +199,19 @@ impl Groups {
         self.book(GroupKey::new(cell, product), |_| true)
     }
 
-    /// The members the group's trees are laid out over at `now_ms`: those whose verified offers
-    /// (or, for this relay, its own word) cover the group now, demoted members left out, and
-    /// of them the ones that forward nothing. A function of the offers held, so two relays that
-    /// hold the same offers lay out the same trees.
-    pub fn tree(&self, group: GroupKey, now_ms: u64) -> (Vec<PublicKey>, Vec<PublicKey>) {
-        let members = self.book(group, |entry| entry.offered_until_ms > now_ms);
-        let leaves = self.book(group, |entry| {
-            entry.offered_until_ms > now_ms && entry.leaf_only
-        });
+    /// The members the group's trees are laid out over: those whose verified offers cover the
+    /// group now, demoted members left out, and of them the ones that forward nothing. A function
+    /// of the offers held, so two relays that hold the same offers lay out the same trees. This
+    /// relay is not among them (`Sharing` adds it).
+    pub fn tree(&self, group: GroupKey) -> (Vec<PublicKey>, Vec<PublicKey>) {
+        let members = self.book(group, |entry| entry.offered.is_some());
+        let leaves = self.book(group, |entry| entry.offered == Some(true));
         (members, leaves)
     }
 
     /// The members that forward nothing.
     pub fn leaves_only(&self, group: GroupKey) -> Vec<PublicKey> {
-        self.book(group, |entry| entry.leaf_only)
+        self.book(group, Entry::leaf_only)
     }
 
     /// Every group with a member.

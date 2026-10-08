@@ -130,10 +130,11 @@ also widens `Streams` to two bytes, so products after the eighth have bits.
 **The roles** a `Hello` names: feeder, subscriber, relay, engine (another relay's MLAT taking raw
 one hop, RFC-0174 §2.3; it publishes nothing), and **probe**. A probe is a
 measurement session (RFC-0174 §2.2's round-trip probing and delivery check): it may send only
-`Echo` and `DeliveryQuery` (`Role::may_send`), is answered, and is never admitted as a feeder or
+`Echo` and `DeliveryQuery` (`Role::may_send`; a query also carries the feeder's tag keys for the
+member, RFC-0181 §7), is answered, and is never admitted as a feeder or
 a subscriber, so measuring a relay takes none of its feeder slots and is sent none of its streams.
-A probe that sends anything else is ended with `Goodbye{Protocol}`. A full relay still answers a
-probe.
+A probe that sends a delivery query of the retired form is ended with `Goodbye{Retired}`; one that
+sends anything else, with `Goodbye{Protocol}`. A full relay still answers a probe.
 
 ### §3.4 Records, and the rules that let them change without the feeder
 
@@ -158,7 +159,7 @@ record is a kind byte, a two-byte length, a body; a Noise message carries whole 
 | 0x0e | `FaultProof`   | two signed solutions of one inputs that disagree, or two signed models of one inputs that differ; checked before forwarding |
 | 0x0f | `ClockModelPart` | one part of a clock model too large for its manifest, checked against it (§3.8.1) |
 | 0x10 | `Provisional`  | a relay's signed provisional solutions (`Positions` format 4), superseded by final ones; only to subscribers that asked (`PROVISIONAL`, §3.8.1) |
-| 0x11 to 0x21 | RFC-0174's records | echo, delivery check, provider directory, sharing groups, credit, the regional and the two world products, parity and bundle index (RFC-0174 §2.10); transport version 2, the minimum |
+| 0x11 to 0x23 | RFC-0174's records | echo, delivery check, provider directory, sharing groups, credit, the regional and the two world products, parity and bundle index (RFC-0174 §2.10); transport version 2, the minimum. 0x13 and 0x14 are retired (the first delivery check), read as retired and never written; the delivery check is 0x22 and 0x23 (RFC-0181 §7) |
 
 The extension rules, which are what a frozen feeder relies on:
 
@@ -166,8 +167,12 @@ The extension rules, which are what a frozen feeder relies on:
   cleanly. New records are therefore non-critical unless ignoring them would be wrong.
 - A body may carry bytes after the fields a reader knows; they are ignored, so fields are appended.
 - An enum value a reader does not know is kept as `Other`, never an error. The exception is
-  evidence: a delivery answer's possession tag a reader does not know is an error, never read as
-  a proof.
+  evidence: a delivery answer's possession kind a reader does not know is an error, never read
+  as a proof.
+- A record whose meaning changes takes a new kind, and a signed one a new format; its old kind is
+  retired, never reused. The appended-field rule cannot carry a change of meaning: a reader that
+  ignores the new bytes reads the old meaning into them. The delivery check's two forms are the
+  case (RFC-0181 §7).
 - Every record body has one check of what makes it well formed (ranges ascending and exact,
   spans bounded, a position on the globe, one product where one is named), and the codec runs it
   on every encode and every decode (`tally_wire::Check`), so no value that breaks it is written or
@@ -177,6 +182,17 @@ The extension rules, which are what a frozen feeder relies on:
   before it, so a relay can verify, route and deduplicate a format it does not otherwise read.
 - An `Observation`'s format is BEAST's own type byte for 1090 MHz; 978 MHz UAT takes a new value
   and needs no new record, and relays forward formats they do not know.
+- A compressed batch (format 2, RFC-0174 §2.2) states the length its receptions inflate to, and
+  that length is at most 8 times its DEFLATE stream (`tally_wire::batch::MAX_INFLATION`) and at
+  most 1 MiB. Every reader refuses a stated length past either before it inflates anything, and
+  stops inflating at the stated length, so a relay's work on a batch is at most 8 times its wire
+  bytes; a writer whose batch would be denser writes it plain (format 1), so no honest batch is
+  refused. Why 8: the densest batch of honest 1090 MHz receptions the encoder makes is about 5
+  times (one aircraft's identical Mode-S short replies at a steady counter and signal level; real
+  extended squitters are about 1.5), because no receiver hears two receptions at one counter
+  value. Only zero-filled UAT uplinks go past it, and they lose only their compression. A relay
+  charges a batch by its inflated bytes and its receptions, never by its wire bytes alone
+  (`Batch::inflated_len`, `Batch::receptions_at_most`, `Decoded::receptions`).
 
 ### §3.5 The feeder: what version 1 is, and what it must never do
 
@@ -546,18 +562,29 @@ over it. As built:
   passes through the fan-out ring and the parts table, both bounded, and goes out again to every
   subscriber of positions or clock models, a slow one dropped. MLAT links count against the
   subscriber cap, so an operator sizes that cap and the MLAT ceiling to the host's link.
-- What the whole world costs one relay is set by the tile, the stride and the targets, and
-  measured in release by the simulator at 20,000 receivers (about 5,400 targets a window, on
-  3,800 tiles): 27 cores keep up (a tile fit 0.28 s a core, 1,050 core-seconds of fits and 22 of
-  solving a 40 s stride, on 32 threads) and the raw for one window is 1.6 GB (118 million
-  receptions made a minute, 70 million held after thinning, 34 bytes an observation with the
-  index). Indexing a window takes 43 ms and assigning every target 0.4 s on 32 threads. A tile's
+- What the whole world costs one relay is set by the tile, the stride, the targets and the
+  reception rate, and measured in release by the simulator at 20,000 receivers (about 5,400
+  targets a window, on 3,800 tiles; `world_scale_one_node`, re-measured 2026-10-08 for RFC-0181).
+  At the real rate, about 320 wanted receptions a second a receiver (a real receiver hears about
+  600 a second, 60% of them wanted; the simulator comes nearest with every receiver in reach
+  hearing every transmission), 41 cores keep up: 1,300 core-seconds of fits (a tile fit 0.35 s a
+  core) and 300 of solving, every solution verified, a 40 s stride, on 32 threads. One window (20
+  bins, 100 s) holds 289 million observations after thinning (145 a receiver a second of the 324
+  wanted), 8.7 GB at 30 bytes an observation with the index, every byte counted as allocated;
+  sealing a bin of the whole world (65 million receptions) takes 2.0 s on 32 threads, at most 13
+  cores more. The first measurement, at a rate an eighth of the real one (39 wanted a receiver a
+  second), gave 29 cores and 1.6 GB a window (46 million observations at 35 bytes; the 70 million
+  it once named were held over the 30 bins of its run, not the 20 of a window), and that figure is
+  superseded: the fits barely change with the rate, since a tile's events are capped, but the
+  solves and the raw grow with it. Indexing a window takes 40 ms and assigning every target 0.8 s
+  on 32 threads. A tile's
   fit plus its folded calibration takes 71, 95 and 107 ms at 100, 300 and 1,000 receivers, and an
   outside verifier checks it in 23 to 34 ms. Each choice that sets this was measured, and the
   trade is stated:
   - *Stride 8.* Fits a solved bin cost 21.4, 11.0, 5.7 and 2.9 at stride 1, 2, 4 and 8 (0.86,
     0.45, 0.24 and 0.13 s), at the same coverage (0.958 to 0.963), for a final position 14.5,
-    17, 22 and 32 s late on average; the world needs 34 cores at stride 4 and 27 at 8. The cost
+    17, 22 and 32 s late on average; at the first measurement's rate the world needed 34 cores
+    at stride 4 and 27 at 8 (41 at 8 at the real rate). The cost
     of the eighth is latency: a final MLAT position arrives 7 to 47 s after it was heard.
   - *Sixteen sync aircraft a tile.* At 8, 16, 32 and every one, coverage is 0.964, 0.946, 0.949
     and 0.953 and the median error 52.6, 36.1, 33.6 and 36.1 m, for 20, 31, 45 and 49 s of fits
@@ -743,6 +770,45 @@ over it. As built:
   it, stating `position_source` (`adsb` or `mlat`) and, for MLAT, the horizontal sigma, the check
   it passed (`model`, `signature` or `resolved`) and its `kind` (`final`, or `provisional` while
   later than every final fix).
+
+#### §3.8.2 Who checks a position
+
+Verification is delegated, not universal. No one checks every fix against raw, and nothing here
+needs anyone to; each fix is checked by whoever is placed to, and says which check it passed.
+
+- **The relay that signs it.** A relay's MLAT verifies every solution it signs as any checker
+  would, from the raw it holds (`publish::solve_published`, every one; one that fails is dropped
+  and counted). It does not verify its own clock model: that is for others.
+- **The other relays holding the area.** Every relay that covers an area's tiles holds the same raw
+  (§3.8.1) and computes the same positions to the same bytes. Two signatures over the same inputs
+  that disagree are a fault proof (`FaultProof`), which anyone checks with the two signed records
+  alone, no raw needed, and which travels to every reader of positions.
+- **A client holding raw** (the API with `--mlat-raw`) checks a fix itself: the model by the model
+  verifier and the solution by the solution verifier.
+- **A client holding no raw** relies on the signatures and content addresses: the solution and the
+  model it cites are signed, whole, and agree with each other. The API reports which of these each
+  fix passed (`MlatCheck`: `model`, `signature`, or `resolved` when it solved the fix itself from
+  two engines' raw).
+
+**The weak spot.** An area that one relay holds, or that only one operator's relays hold, has no
+independent check: nobody else computes its positions, so no disagreement can be signed, and a
+client without raw has only that operator's word. Several keys prove nothing here, since one
+operator can run any number.
+
+**The rule (decided 2026-10-08).** A fix counts as cross-checked only when at least two relays of
+different operators signed the same solution of the same inputs: agreeing signatures (two
+solutions of one inputs hash within the verifier's tolerance, which merge as one, §3.8.1) from
+signers whose declared networks differ (`ProviderOffer::network`, the same proxy for independence
+the delivery check uses, RFC-0174 §2.2). The API reports, per fix, the count of independent
+agreeing signers beside `MlatCheck`, so a client can require two and a map can mark a fix that has
+one. Nothing is refused for having one: a lone relay's fixes are served, counted as one. The
+directory aims to place at least two relays of different operators on every area (RFC-0174 §2.9),
+and the count is how a client sees where it has not yet.
+
+Open, to build: the merge already joins a duplicate's signer to the fix's relays (§3.8.1, "the
+full input set"); what is left is resolving each signer to its offer's network, counting the
+distinct networks, the count on `GET /v1/aircraft` (`tally_api_types::Mlat`), and the same count in
+the world products' fixes once more than one relay signs them.
 
 ### §3.9 Our own use, and the production rule
 

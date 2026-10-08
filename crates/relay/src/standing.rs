@@ -4,6 +4,14 @@
 //! ([`Standing::model`]) and final and provisional positions ([`Standing::positions`]). A relay
 //! that reads the same records as a client holds the same standing as it.
 //!
+//! It holds no raw of its own: it reads the hosted MLAT engine's sealed bins
+//! ([`Standing::read_bins`], one store of raw per relay, RFC-0181 §5), so raw later than the
+//! engine's settling is missing for both alike. It is scoped to the areas this relay holds raw for
+//! (the hosted MLAT's areas and their border band, [`Standing::set_areas`]): a relay cannot hold
+//! the world's raw, and relays are regional. A receiver outside them, or any receiver of a relay
+//! that hosts no MLAT, has no standing here, not a bad one: it is unknown ([`Standing::of`] says
+//! `None`).
+//!
 //! It weighs which of a transmission's solutions stands (`Book::settle`, by `decide`) and which
 //! receivers have standing (`credit` corroborates them). Gating a receiver out of the solver
 //! (`ReceiverStanding::gated`) is not wired: the verifier refuses a solution that omits a
@@ -12,14 +20,14 @@
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use tally_mlat::area::Band;
 use tally_mlat_solver::ClockModel as Model;
-use tally_mlat_solver::held::Held;
+use tally_mlat_solver::held::SealedBins;
 use tally_mlat_solver::publish;
-use tally_mlat_solver::scope::{AFTER, BEFORE, STRIDE, bin_of};
 use tally_mlat_solver::standing::{Book, ReceiverStanding, Solved, heard_in};
 use tally_wire::batch::Hash;
 use tally_wire::clock_model::Assembler;
-use tally_wire::{Batch, ClockModel, Positions, PublicKey, Record, Solution};
+use tally_wire::{ClockModel, Positions, PublicKey, Record, Region, Regions, Solution};
 
 use crate::bounded::Bounded;
 
@@ -30,15 +38,10 @@ pub const MAX_MODEL_BYTES: usize = 64 << 20;
 /// Models solutions wait for, and solutions each.
 pub const MAX_WAITING: usize = 1_024;
 pub const WAITING_PER_MODEL: usize = 4_096;
-/// Bytes of raw held for telling when a reception was heard.
-pub const MAX_HELD: usize = 1 << 30;
 /// Transmissions waiting to be settled.
 pub const MAX_TRANSMISSIONS: usize = 262_144;
 /// Receivers whose standing is kept.
 pub const MAX_RECEIVERS: usize = 65_536;
-/// Bins of raw kept behind the relay's clock beyond a canonical window: the merge rule's.
-const RAW_SPARE_BINS: i64 = 4;
-
 struct HeldModel {
     spec: u16,
     inputs: Hash,
@@ -51,8 +54,11 @@ struct Inner {
     assembler: Assembler,
     models: Bounded<Hash, HeldModel>,
     waiting: Bounded<Hash, Waiting>,
-    held: Held,
+    /// The hosted engine's sealed bins: when a reception was heard. None, nothing is known.
+    sealed: Option<SealedBins>,
     book: Book,
+    /// The areas this relay holds raw for, with their border band.
+    scope: Option<Band>,
 }
 
 /// Every receiver's standing as this relay reads the records it forwards.
@@ -73,8 +79,9 @@ impl Standing {
                 assembler: Assembler::new(MAX_MODEL_BYTES, MAX_WAITING),
                 models: Bounded::new(MAX_MODELS),
                 waiting: Bounded::new(MAX_WAITING),
-                held: Held::new(MAX_HELD),
+                sealed: None,
                 book: Book::new(MAX_TRANSMISSIONS, MAX_RECEIVERS),
+                scope: None,
             }),
         }
     }
@@ -85,16 +92,15 @@ impl Standing {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    /// A receiver's batch the relay forwarded (verified): when its receptions were heard.
-    pub fn batch(&self, batch: &Batch, now_ms: u64) {
-        let (Ok(receiver), Ok(content)) = (batch.receiver(), batch.content()) else {
-            return;
-        };
-        let mut inner = self.inner();
-        inner.held.add(receiver, &content);
-        inner
-            .held
-            .forget_before(bin_of(now_ms) - BEFORE - AFTER - STRIDE - RAW_SPARE_BINS);
+    /// The hosted MLAT engine's sealed bins: the raw standing reads (`MlatHost::sealed_bins`).
+    pub fn read_bins(&self, sealed: SealedBins) {
+        self.inner().sealed = Some(sealed);
+    }
+
+    /// The areas this relay holds raw for (its hosted MLAT's): standing is kept for receivers in
+    /// them and their border band, and for no other.
+    pub fn set_areas(&self, areas: &Regions) {
+        self.inner().scope = (!areas.is_empty()).then(|| Band::of(areas));
     }
 
     /// A clock model manifest or part the relay forwarded: held once whole, read under the
@@ -139,9 +145,14 @@ impl Standing {
         self.inner().settle(now_ms);
     }
 
-    /// A receiver's standing now: a new key's, none.
-    pub fn of(&self, receiver: &PublicKey) -> ReceiverStanding {
-        self.inner().book.of(receiver)
+    /// A receiver's standing now, for a receiver declared at `cell`: a new key's, none; one
+    /// outside the areas this relay holds raw for, unknown (`None`).
+    pub fn of(&self, receiver: &PublicKey, cell: Option<Region>) -> Option<ReceiverStanding> {
+        let inner = self.inner();
+        inner.sealed.as_ref()?;
+        let band = inner.scope.as_ref()?;
+        cell.filter(|cell| band.holds(*cell))?;
+        Some(inner.book.of(receiver))
     }
 
     /// The receivers with standing now (their receptions kept agreeing with verified fixes):
@@ -166,8 +177,6 @@ impl Inner {
         if publish::inputs_id(&decoded) != content.inputs {
             return;
         }
-        // An engine solved the window, so its raw is in: sealed, as the merge rule seals it.
-        self.held.seal_through(decoded.window.last);
         let id = manifest.id();
         self.models.insert_active(
             id,
@@ -216,9 +225,11 @@ impl Inner {
     }
 
     fn settle(&mut self, now_ms: u64) {
-        let held = &self.held;
+        let Some(sealed) = &self.sealed else {
+            return;
+        };
         self.book.settle(now_ms, |id, transmitted_ms| {
-            heard_in(held, id, transmitted_ms)
+            heard_in(sealed, id, transmitted_ms)
         });
     }
 }
@@ -232,9 +243,23 @@ mod tests {
     fn a_new_key_has_no_standing_and_records_it_cannot_read_change_nothing() {
         let standing = Standing::new();
         let key = Identity::from_seed([3; 32]).public();
-        assert_eq!(standing.of(&key), ReceiverStanding::NEW);
+        let atlanta = Region::point(&tally_wire::Location {
+            lat_e7: 337_490_000,
+            lon_e7: -843_880_000,
+            alt_m: 0,
+            precision_m: 0,
+        })
+        .ok();
+        let area = atlanta.and_then(|cell| cell.ancestor(tally_wire::rendezvous::AREA_RESOLUTION));
+        standing.set_areas(&area.into_iter().collect());
+        // No hosted MLAT, no raw: unknown, even in the areas.
+        assert_eq!(standing.of(&key, atlanta), None);
+        standing.read_bins(SealedBins::new());
+        assert_eq!(standing.of(&key, atlanta), Some(ReceiverStanding::NEW));
         standing.model(&Record::Heartbeat, 0);
         standing.tick(u64::MAX / 2);
-        assert_eq!(standing.of(&key), ReceiverStanding::NEW);
+        assert_eq!(standing.of(&key, atlanta), Some(ReceiverStanding::NEW));
+        // Outside the areas held: unknown.
+        assert_eq!(standing.of(&key, None), None);
     }
 }
