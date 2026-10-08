@@ -63,8 +63,8 @@ use tally_wire::positions::{EnuCovariance, TransmitTime};
 use tally_wire::products::{MAX_REGIONAL_OBSERVATIONS, MAX_WORLD_FIXES, adsb_input_set, input_set};
 use tally_wire::rendezvous::area_of;
 use tally_wire::{
-    Batch, ClockModel, Identity, Observation, Positions, PublicKey, ReceiverInfo, Record, Region,
-    RegionalBatch, RegionalBatchContent, WireError, WorldFix, WorldPositions,
+    ClockModel, Decoded, Identity, ObsView, Observation, Positions, PublicKey, ReceiverInfo,
+    Record, Region, RegionalBatch, RegionalBatchContent, WireError, WorldFix, WorldPositions,
     WorldPositionsContent, WorldPrecise,
 };
 
@@ -214,7 +214,8 @@ impl Gatherer {
 }
 
 struct State {
-    keys: (RandomState, RandomState),
+    /// The key of `digest` (a world fix remembered by a 64-bit digest).
+    digest_key: RandomState,
     boot_id: u64,
     sequence: u64,
     own: Option<PublicKey>,
@@ -241,13 +242,13 @@ struct State {
 
 impl Products {
     pub fn new() -> Self {
-        let keys = (RandomState::new(), RandomState::new());
+        let digest_key = RandomState::new();
         // The standard library's per-process random keys: random per start, which is all a boot
         // id must be (as the hub's deduplicated stream takes its own).
         let boot_id = RandomState::new().build_hasher().finish();
         Self {
             state: Mutex::new(State {
-                keys,
+                digest_key,
                 boot_id,
                 sequence: 0,
                 own: None,
@@ -323,9 +324,10 @@ impl Products {
         }
     }
 
-    /// A receiver's batch: when the receiver chose this relay, its receptions join its area's
-    /// regional dedup.
-    pub fn batch(&self, batch: &Batch, receiver: &PublicKey, now_ms: u64) {
+    /// A receiver's batch, decoded once (`ingest`): when the receiver chose this relay, its
+    /// receptions join its area's regional dedup, each by its one fingerprint.
+    pub fn batch(&self, batch: &Decoded, now_ms: u64) {
+        let receiver = &batch.receiver();
         let Ok(mut state) = self.state.lock() else {
             return;
         };
@@ -337,11 +339,8 @@ impl Products {
             _ => return,
         };
         state.located.touch(receiver);
-        let Ok(content) = batch.content() else {
-            return;
-        };
-        for observation in content.observations {
-            state.offer_copy(area, observation, now_ms);
+        for obs in batch.observations() {
+            state.offer_copy(area, obs.fp, batch.view(obs), now_ms);
         }
     }
 
@@ -506,19 +505,15 @@ impl Products {
 }
 
 impl State {
-    fn fingerprint(&self, observation: &Observation) -> u128 {
-        let half = |keys: &RandomState| {
-            let mut hasher = keys.build_hasher();
-            hasher.write_u8(observation.format);
-            hasher.write(&observation.data);
-            hasher.finish()
-        };
-        (u128::from(half(&self.keys.0)) << 64) | u128::from(half(&self.keys.1))
-    }
-
-    /// One reception for `area`: kept when its message was not heard there within the window.
-    fn offer_copy(&mut self, area: Region, observation: Observation, now_ms: u64) {
-        let fingerprint = self.fingerprint(&observation);
+    /// One reception for `area`, its fingerprint `fingerprint` (`tally_wire::decoded`): kept (copied)
+    /// when its message was not heard there within the window.
+    fn offer_copy(
+        &mut self,
+        area: Region,
+        fingerprint: u128,
+        observation: ObsView<'_>,
+        now_ms: u64,
+    ) {
         if self.areas.get(&area).is_none() {
             while self.areas.len() >= MAX_AREAS {
                 let Some((_, forgotten)) = self.areas.pop_first() else {
@@ -544,7 +539,7 @@ impl State {
             return;
         }
         held.heard.insert(fingerprint, now_ms);
-        held.copies.push(observation);
+        held.copies.push(observation.to_observation());
         held.bytes += cost;
         self.pending_bytes += cost;
     }
@@ -682,7 +677,7 @@ impl State {
     }
 
     fn digest(&self, fix: &WorldFix) -> u64 {
-        let mut hasher = self.keys.0.build_hasher();
+        let mut hasher = self.digest_key.build_hasher();
         hasher.write_u32(fix.address);
         hasher.write_u64(fix.transmitted.unix_ms);
         hasher.write_u32(fix.transmitted.sub_ms_ps);

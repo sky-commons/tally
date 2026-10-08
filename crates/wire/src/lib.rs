@@ -7,6 +7,7 @@ pub mod batch;
 pub mod beast;
 pub mod clock_model;
 pub mod credit;
+pub mod decoded;
 pub mod delivery;
 pub mod directory;
 pub mod fault_proof;
@@ -24,12 +25,15 @@ mod signed;
 
 pub use batch::{Batch, BatchContent, Clock, Codec, Location, Observation, ReceiverInfo};
 pub use beast::{Frame, FrameKind};
+/// The shared byte buffer batches are held in, so a crate reading them needs no dependency of its own.
+pub use bytes::Bytes;
 pub use clock_model::{
     Assembler, ClockModel, ClockModelContent, ClockModelPart, Manifest, SignedClockModel,
 };
 pub use credit::{
     EvidenceBundle, EvidenceBundleContent, FirehoseCredential, FirehoseCredentialContent,
 };
+pub use decoded::{Decoded, FingerprintKey, ObsRef, ObsView, Undecodable};
 pub use delivery::{
     DeliveryAnswer, DeliveryAnswerContent, DeliveryQuery, Possession, SequenceRange,
     possession_proof,

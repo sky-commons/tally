@@ -954,6 +954,7 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "blake2",
+ "bytes",
  "ed25519-dalek",
  "getrandom 0.2.17",
  "h3o",

@@ -39,7 +39,7 @@ use tally_mlat_solver::{
     SPEC_VERSION, Tile, Transmission, Unpublished, modes, publish,
 };
 use tally_wire::batch::Hash;
-use tally_wire::{BatchContent, Identity, Positions, PublicKey, Record, SolutionsContent};
+use tally_wire::{Decoded, Identity, Positions, PublicKey, Record, SolutionsContent};
 
 use crate::window::{Part, parallel};
 
@@ -178,21 +178,23 @@ impl Provisional {
     }
 
     /// Takes a batch the engine admitted from `receiver`, arrived at `now_ms`.
-    pub fn hear(&mut self, receiver: PublicKey, content: &BatchContent, now_ms: u64) {
-        for observation in &content.observations {
-            let data = &observation.data;
+    pub fn hear(&mut self, batch: &Decoded, now_ms: u64) {
+        let receiver = batch.receiver();
+        let wall_ms = batch.wall_ms();
+        for observation in batch.views() {
+            let data = observation.data;
             let Some(address) = modes::address(data) else {
                 continue;
             };
             match modes::downlink_format(data) {
                 Some(17 | 18) => {
                     if modes::airborne_position(data).is_some() {
-                        let newest = self.adsb.entry(address).or_insert(content.wall_ms);
-                        *newest = (*newest).max(content.wall_ms);
+                        let newest = self.adsb.entry(address).or_insert(wall_ms);
+                        *newest = (*newest).max(wall_ms);
                     }
                 }
                 Some(0 | 4 | 5 | 11 | 16 | 20 | 21) => {
-                    if !self.target(address, content.wall_ms) {
+                    if !self.target(address, wall_ms) {
                         continue;
                     }
                     if self.count >= MAX_WAITING {
@@ -203,9 +205,9 @@ impl Provisional {
                     self.waiting.entry(address).or_default().push(Waiting {
                         reception: Reception {
                             receiver,
-                            epoch: content.counter_epoch,
-                            observation: observation.clone(),
-                            wall_ms: content.wall_ms,
+                            epoch: batch.counter_epoch(),
+                            observation: observation.to_observation(),
+                            wall_ms,
                         },
                         arrived_ms: now_ms,
                     });

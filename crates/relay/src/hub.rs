@@ -2,9 +2,7 @@
 //! models and fault proofs already forwarded, the deduplicated stream being gathered, each receiver's newest
 //! self-description, and the relays this one offers as hints.
 
-use std::collections::hash_map::RandomState;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
-use std::hash::{BuildHasher, Hasher};
 use std::net::{IpAddr, Ipv6Addr};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -12,13 +10,14 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tally_wire::batch::Hash;
 use tally_wire::{
-    Batch, ClockModel, ClockModelPart, FaultProof, Location, Observation, Positions, PublicKey,
-    ReceiverInfo, Record, Region, RelayAddress,
+    Batch, ClockModel, ClockModelPart, Decoded, FaultProof, Location, ObsView, Observation,
+    Positions, PublicKey, ReceiverInfo, Record, Region, RelayAddress,
 };
 use tokio::sync::broadcast;
 
 use crate::bounded::Bounded;
 use crate::egress::{Cap, Egress};
+use crate::ingest::Ingest;
 use crate::network::Network;
 use crate::parts::Parts;
 use crate::stations::{STATIONS_REMEMBERED, StationReport, Stations, StationsReport};
@@ -166,6 +165,9 @@ pub struct Item {
     /// model's, its tile's centre), computed once when published, so a client's regions route
     /// them as they route raw. `None` is unrouted: whole-world.
     pub points: Option<Arc<[Region]>>,
+    /// For a receiver's batch of a format this build reads: its one decode (`ingest`), so no
+    /// reader of the fan-out (the BEAST output) inflates or parses it again.
+    pub decoded: Option<Arc<Decoded>>,
 }
 
 /// Two generations of hashes: a hash is remembered for one to two windows, or until `most` newer
@@ -344,15 +346,13 @@ impl<K: std::hash::Hash + Eq + Clone> Forwarded<K> {
 /// is still forwarded raw in its receiver's batch, but is not compared or gathered here until there
 /// is room, and is counted in `skipped`.
 ///
-/// A message is remembered by a 128-bit fingerprint of its format and bytes, keyed by this
-/// process's random keys, not by a copy of its bytes: two of the standard library's SipHash keys,
-/// so nobody outside the process can make two messages share a fingerprint, and the chance that
-/// two real messages do is about 2^-128 a pair. The fingerprint also chooses the message's shard.
+/// A message is remembered by its reception's one fingerprint (`tally_wire::decoded`: keyed
+/// SipHash-2-4, 128 bits, made once when the batch is decoded), not by a copy of its bytes. The
+/// fingerprint also chooses the message's shard.
 /// Each shard is locked on its own; bytes are added to and released from `held` only under the
 /// shard that holds them, so the count never runs below what the shards hold.
 struct Deduplicator {
     shards: Vec<Mutex<Shard>>,
-    keys: (RandomState, RandomState),
     /// The order observations are offered in, so what is taken keeps arrival order across shards.
     arrived: AtomicU64,
     held: AtomicUsize,
@@ -375,7 +375,6 @@ impl Deduplicator {
     fn new(max_bytes: usize) -> Self {
         Self {
             shards: (0..DEDUP_SHARDS).map(|_| Mutex::default()).collect(),
-            keys: (RandomState::new(), RandomState::new()),
             arrived: AtomicU64::new(0),
             held: AtomicUsize::new(0),
             max_bytes,
@@ -383,19 +382,9 @@ impl Deduplicator {
         }
     }
 
-    fn fingerprint(&self, format: u8, data: &[u8]) -> u128 {
-        let half = |keys: &RandomState| {
-            let mut hasher = keys.build_hasher();
-            // The format is one byte, always first, so (format, data) reads one way only.
-            hasher.write_u8(format);
-            hasher.write(data);
-            hasher.finish()
-        };
-        (u128::from(half(&self.keys.0)) << 64) | u128::from(half(&self.keys.1))
-    }
-
-    fn offer(&self, observation: Observation, now: Instant) {
-        let fingerprint = self.fingerprint(observation.format, &observation.data);
+    /// One reception, its fingerprint `fingerprint`: gathered (copied) when its message is new
+    /// this window and there is room.
+    fn offer(&self, fingerprint: u128, observation: ObsView<'_>, now: Instant) {
         // The low bits of one half: uniform, whatever the messages.
         let at = usize::try_from(fingerprint % DEDUP_SHARDS as u128).unwrap_or(0);
         let Some(Ok(mut shard)) = self.shards.get(at).map(Mutex::lock) else {
@@ -407,7 +396,7 @@ impl Deduplicator {
         }
         // A key already held (heard a window ago, not yet purged) costs nothing more as a key.
         let as_key = if heard.is_some() { 0 } else { DEDUP_KEY_COST };
-        let needed = as_key + cost(&observation.data);
+        let needed = as_key + cost(observation.data);
         let reserved = self
             .held
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |held| {
@@ -420,7 +409,15 @@ impl Deduplicator {
         }
         shard.first_heard.insert(fingerprint, now);
         let order = self.arrived.fetch_add(1, Ordering::Relaxed);
-        shard.gathered.push((order, observation));
+        shard.gathered.push((order, observation.to_observation()));
+    }
+
+    /// An owned reception, fingerprinted under the process key: for tests.
+    #[cfg(test)]
+    fn offer_owned(&self, observation: Observation, now: Instant) {
+        let fingerprint = tally_wire::FingerprintKey::process()
+            .fingerprint(observation.format, &observation.data);
+        self.offer(fingerprint, ObsView::from(&observation), now);
     }
 
     /// The observations gathered since the last call, in the order they were offered; forgets the
@@ -482,6 +479,7 @@ impl Known {
             record: Arc::clone(&self.record),
             cell: self.cell,
             points: None,
+            decoded: None,
         }
     }
 }
@@ -636,6 +634,8 @@ pub struct Hub {
     egress: Arc<Egress>,
     /// RFC-0174's duties (`network`): the one place they meet the hub.
     network: Network,
+    /// The ingest clock and order, and the one decode of every batch (`ingest`).
+    ingest: Ingest,
 }
 
 /// Held for as long as a subscriber (or a connection) is served; releases its place when dropped.
@@ -754,6 +754,7 @@ impl Hub {
             // still served): a hub can never send without one.
             egress: Arc::new(Egress::new(Cap::NONE)),
             network: Network::new(),
+            ingest: Ingest::default(),
         }
     }
 
@@ -814,6 +815,7 @@ impl Hub {
                     record: Arc::new(Record::BundleIndex(index)),
                     cell,
                     points: None,
+                    decoded: None,
                 });
             }
             Record::RegionalBatch(regional) => {
@@ -826,6 +828,7 @@ impl Hub {
                     record: Arc::new(Record::RegionalBatch(regional)),
                     cell,
                     points: None,
+                    decoded: None,
                 });
             }
             other => {
@@ -834,6 +837,7 @@ impl Hub {
                     record: Arc::new(other),
                     cell: None,
                     points: None,
+                    decoded: None,
                 });
             }
         }
@@ -982,7 +986,8 @@ impl Hub {
     }
 
     /// Forwards a verified batch if it is new (see `Forwarded`), and offers its observations to
-    /// the deduplicated stream. True when it was new.
+    /// the deduplicated stream. True when it was new. A new batch is decoded here, once
+    /// (`ingest`), and that one decode is what every consumer reads.
     pub fn publish_batch(&self, source: u64, batch: Batch, receiver: PublicKey) -> bool {
         let new = self.batches.lock().is_ok_and(|mut forwarded| {
             forwarded.admit(batch.hash(), (receiver, batch.boot_id()), batch.sequence())
@@ -991,12 +996,16 @@ impl Hub {
             return false;
         }
         // A format this build cannot read is still forwarded raw; it just adds nothing here.
+        let (batch, decoded) = match self.ingest.decode(batch) {
+            Ok(decoded) => (decoded.batch().clone(), Some(decoded)),
+            Err(undecodable) => (undecodable.batch, None),
+        };
         let mut observations = 0;
-        if let Ok(content) = batch.content() {
+        if let Some(decoded) = &decoded {
             let now = Instant::now();
-            observations = content.observations.len() as u64;
-            for observation in content.observations {
-                self.deduplicator.offer(observation, now);
+            observations = decoded.observations().len() as u64;
+            for obs in decoded.observations() {
+                self.deduplicator.offer(obs.fp, decoded.view(obs), now);
             }
         }
         if let Ok(mut stations) = self.stations.lock() {
@@ -1013,13 +1022,14 @@ impl Hub {
             receivers.touch(&receiver);
             receivers.get(&receiver).copied().flatten()
         });
-        self.network.on_batch(&batch, &receiver, now_ms());
+        self.network.on_batch(&batch, decoded.as_ref(), now_ms());
         // An error only means nobody is subscribed right now.
         let _ = self.out.send(Item {
             source,
             record: Arc::new(Record::Batch(batch)),
             cell,
             points: None,
+            decoded,
         });
         true
     }
@@ -1169,6 +1179,7 @@ impl Hub {
             record,
             cell,
             points: None,
+            decoded: None,
         });
     }
 
@@ -1246,6 +1257,7 @@ impl Hub {
             record: Arc::new(record),
             cell: None,
             points,
+            decoded: None,
         });
     }
 
@@ -1297,6 +1309,7 @@ impl Hub {
                     record: Arc::new(Record::ClockModelPart(part)),
                     cell: None,
                     points: None,
+                    decoded: None,
                 });
             }
             let record = Record::ClockModel(model);
@@ -1307,6 +1320,7 @@ impl Hub {
                 record: Arc::new(record),
                 cell: None,
                 points,
+                decoded: None,
             });
             // Positions held for this model go out after it.
             self.release_awaiting();
@@ -1332,6 +1346,7 @@ impl Hub {
             record: Arc::new(Record::ClockModelPart(part)),
             cell: None,
             points: None,
+            decoded: None,
         });
         true
     }
@@ -1358,6 +1373,7 @@ impl Hub {
                 record: Arc::new(Record::FaultProof(proof)),
                 cell: None,
                 points: None,
+                decoded: None,
             });
         }
         new
@@ -1377,6 +1393,7 @@ impl Hub {
             record: Arc::new(Record::RelayBatch(batch)),
             cell: None,
             points: None,
+            decoded: None,
         });
     }
 
@@ -1652,18 +1669,18 @@ mod tests {
         let deduplicator = Deduplicator::new(2 * one + one / 2);
         let now = Instant::now();
         for n in 0..5 {
-            deduplicator.offer(observation(n), now);
+            deduplicator.offer_owned(observation(n), now);
         }
         assert_eq!(deduplicator.take(now).len(), 2);
-        deduplicator.offer(observation(5), now);
-        deduplicator.offer(observation(6), now);
+        deduplicator.offer_owned(observation(5), now);
+        deduplicator.offer_owned(observation(6), now);
         assert_eq!(deduplicator.take_skipped(), 4);
         // A window later everything is forgotten and there is room again.
         let later = now + DEDUPLICATION_WINDOW;
         assert_eq!(deduplicator.take(later).len(), 1);
         assert_eq!(deduplicator.held(), 0);
-        deduplicator.offer(observation(7), later);
-        deduplicator.offer(observation(8), later);
+        deduplicator.offer_owned(observation(7), later);
+        deduplicator.offer_owned(observation(8), later);
         assert_eq!(deduplicator.take(later).len(), 2);
         Ok(())
     }
@@ -2216,7 +2233,7 @@ mod tests {
                 let heard = messages(receiver);
                 std::thread::spawn(move || {
                     for observation in heard {
-                        deduplicator.offer(observation, now);
+                        deduplicator.offer_owned(observation, now);
                     }
                 })
             })
@@ -2234,7 +2251,7 @@ mod tests {
         // One thread alone: what is taken is in the order it was offered, across every shard.
         let alone = Deduplicator::new(usize::MAX);
         for observation in messages(0) {
-            alone.offer(observation, now);
+            alone.offer_owned(observation, now);
         }
         assert_eq!(alone.take(now), messages(0));
         // The keys are a window's; then nothing is held.

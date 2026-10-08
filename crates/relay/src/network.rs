@@ -25,8 +25,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use tally_wire::{
-    Batch, ClockModel, ClockModelPart, Identity, Positions, PublicKey, ReceiverInfo, Record,
-    Region, RelayAddress,
+    Batch, ClockModel, ClockModelPart, Decoded, Identity, Positions, PublicKey, ReceiverInfo,
+    Record, Region, RelayAddress,
 };
 
 use crate::admission::Admission;
@@ -262,13 +262,18 @@ impl Network {
         }
     }
 
-    /// A receiver's batch the hub forwarded (new, verified).
-    pub fn on_batch(&self, batch: &Batch, receiver: &PublicKey, now_ms: u64) {
+    /// A receiver's batch the hub forwarded (new, verified), with its one decode when this build
+    /// reads its format: delivery holds the bytes either way; products, standing and MLAT read the
+    /// decode and nothing else.
+    pub fn on_batch(&self, batch: &Batch, decoded: Option<&Arc<Decoded>>, now_ms: u64) {
         self.delivery.hold(batch, now_ms);
-        self.products.batch(batch, receiver, now_ms);
-        self.standing.batch(batch, now_ms);
+        let Some(decoded) = decoded else {
+            return;
+        };
+        self.products.batch(decoded, now_ms);
+        self.standing.batch(decoded, now_ms);
         if let Some(mlat) = self.mlat() {
-            mlat.offer(&Record::Batch(batch.clone()), now_ms);
+            mlat.offer_batch(decoded, now_ms);
         }
     }
 

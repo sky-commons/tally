@@ -538,7 +538,11 @@ fn honest_receivers_earn_standing_the_same_at_every_keeper() -> Result<(), Strin
     let relay = tally_relay::standing::Standing::new();
     for record in &records {
         match record {
-            Record::Batch(batch) => relay.batch(batch, world.now),
+            Record::Batch(batch) => {
+                let decoded = tally_wire::Decoded::from_verified(batch.clone(), world.now, 0)
+                    .map_err(|undecodable| undecodable.error.to_string())?;
+                relay.batch(&decoded, world.now);
+            }
             Record::ClockModel(_) | Record::ClockModelPart(_) => relay.model(record, world.now),
             Record::Positions(positions) => relay.positions(positions, world.now),
             _ => {}

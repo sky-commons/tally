@@ -8,9 +8,10 @@
 //! does not otherwise understand.
 
 use blake2::{Blake2s256, Digest};
+use bytes::Bytes;
 
 use crate::WireError;
-use crate::beast::{Frame, FrameKind};
+use crate::beast::Frame;
 use crate::key::{Identity, KEY_LEN, PublicKey, SIGNATURE_LEN};
 use crate::record::Body;
 
@@ -93,8 +94,7 @@ impl Observation {
 
     /// The BEAST frame, for a format BEAST carries.
     pub fn to_beast(&self) -> Option<Frame> {
-        let kind = FrameKind::from_type_byte(self.format)?;
-        Frame::new(kind, self.timestamp, self.signal, &self.data).ok()
+        crate::decoded::ObsView::from(self).to_beast()
     }
 
     pub(crate) fn encode(&self, out: &mut Vec<u8>) -> Result<(), WireError> {
@@ -144,10 +144,11 @@ pub struct BatchContent {
     pub observations: Vec<Observation>,
 }
 
-/// A signed batch, as bytes. Immutable: forwarding never re-encodes it.
+/// A signed batch, as bytes. Immutable: forwarding never re-encodes it, and every holder shares
+/// the one allocation (`Bytes`), so a clone is a reference count, not a copy.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Batch {
-    bytes: Vec<u8>,
+    bytes: Bytes,
 }
 
 impl Batch {
@@ -217,11 +218,14 @@ impl Batch {
         }
         let signature = identity.sign(&domain(label, &bytes));
         bytes.extend_from_slice(&signature);
-        Ok(Self { bytes })
+        Ok(Self {
+            bytes: Bytes::from(bytes),
+        })
     }
 
     /// Accepts any format whose fixed prefix is well formed. Does not check the signature.
-    pub fn from_bytes(bytes: Vec<u8>) -> Result<Self, WireError> {
+    pub fn from_bytes(bytes: impl Into<Bytes>) -> Result<Self, WireError> {
+        let bytes = bytes.into();
         if bytes.len() < BATCH_PREFIX_LEN + SIGNATURE_LEN {
             return Err(WireError::Truncated {
                 needed: BATCH_PREFIX_LEN + SIGNATURE_LEN,
@@ -234,6 +238,11 @@ impl Batch {
 
     pub fn as_bytes(&self) -> &[u8] {
         &self.bytes
+    }
+
+    /// The signed bytes, shared: a reference count, not a copy.
+    pub fn shared_bytes(&self) -> Bytes {
+        self.bytes.clone()
     }
 
     pub fn format(&self) -> u8 {
@@ -274,6 +283,27 @@ impl Batch {
 
     /// The content, for a format this build reads.
     pub fn content(&self) -> Result<BatchContent, WireError> {
+        let (header, plain) = self.header_and_plain()?;
+        let mut plain = Body::new(&plain);
+        let count = plain.u32()?;
+        let observations = (0..count)
+            .map(|_| Observation::decode(&mut plain))
+            .collect::<Result<_, _>>()?;
+        Ok(BatchContent {
+            boot_id: header.boot_id,
+            sequence: header.sequence,
+            counter_epoch: header.counter_epoch,
+            wall_ms: header.wall_ms,
+            dropped: header.dropped,
+            previous: header.previous,
+            observations,
+        })
+    }
+
+    /// The fixed fields, and the observations' plain bytes (`count u32 | observations`), for a
+    /// format this build reads: a slice of the signed bytes for format 1 (shared, not copied), and
+    /// for format 2 inflated once, to at most `MAX_PLAIN_LEN`.
+    pub(crate) fn header_and_plain(&self) -> Result<(Header, Bytes), WireError> {
         let format = self.format();
         if format != BATCH_FORMAT && format != BATCH_FORMAT_DEFLATE {
             return Err(WireError::Invalid {
@@ -283,48 +313,46 @@ impl Batch {
         }
         let (signed, _) = split_signature(&self.bytes)?;
         let mut reader = Body::new(&signed[1 + KEY_LEN..]);
-        let boot_id = reader.u64()?;
-        let sequence = reader.u64()?;
-        let counter_epoch = reader.u32()?;
-        let wall_ms = reader.u64()?;
-        let dropped = reader.u32()?;
-        let previous = reader.array()?;
-        let inflated;
-        let mut plain = if format == BATCH_FORMAT_DEFLATE {
-            let length = reader.u32()? as usize;
-            if length > MAX_PLAIN_LEN {
-                return Err(WireError::Oversize(length));
-            }
-            let fixed = 1 + KEY_LEN + 8 + 8 + 4 + 8 + 4 + 32 + 4;
-            inflated = miniz_oxide::inflate::decompress_to_vec_with_limit(&signed[fixed..], length)
+        let header = Header {
+            boot_id: reader.u64()?,
+            sequence: reader.u64()?,
+            counter_epoch: reader.u32()?,
+            wall_ms: reader.u64()?,
+            dropped: reader.u32()?,
+            previous: reader.array()?,
+        };
+        let fixed = 1 + KEY_LEN + reader.position();
+        if format == BATCH_FORMAT {
+            return Ok((header, self.bytes.slice(fixed..signed.len())));
+        }
+        let length = reader.u32()? as usize;
+        if length > MAX_PLAIN_LEN {
+            return Err(WireError::Oversize(length));
+        }
+        let inflated =
+            miniz_oxide::inflate::decompress_to_vec_with_limit(&signed[fixed + 4..], length)
                 .map_err(|_| WireError::Invalid {
                     field: "compressed batch",
                     value: length as u64,
                 })?;
-            if inflated.len() != length {
-                return Err(WireError::Invalid {
-                    field: "compressed batch length",
-                    value: inflated.len() as u64,
-                });
-            }
-            Body::new(&inflated)
-        } else {
-            reader
-        };
-        let count = plain.u32()?;
-        let observations = (0..count)
-            .map(|_| Observation::decode(&mut plain))
-            .collect::<Result<_, _>>()?;
-        Ok(BatchContent {
-            boot_id,
-            sequence,
-            counter_epoch,
-            wall_ms,
-            dropped,
-            previous,
-            observations,
-        })
+        if inflated.len() != length {
+            return Err(WireError::Invalid {
+                field: "compressed batch length",
+                value: inflated.len() as u64,
+            });
+        }
+        Ok((header, Bytes::from(inflated)))
     }
+}
+
+/// A batch's fixed fields after its prefix, read without its observations.
+pub(crate) struct Header {
+    pub(crate) boot_id: u64,
+    pub(crate) sequence: u64,
+    pub(crate) counter_epoch: u32,
+    pub(crate) wall_ms: u64,
+    pub(crate) dropped: u32,
+    pub(crate) previous: Hash,
 }
 
 /// The receiver's timestamp class, as mlat-client's `--input-type` names it, so an MLAT engine
@@ -580,6 +608,7 @@ pub(crate) fn u64_at(bytes: &[u8], at: usize) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::beast::FrameKind;
 
     #[test]
     fn a_compressed_batch_reads_back_as_its_plain_twin_and_a_bomb_is_refused()

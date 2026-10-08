@@ -11,6 +11,7 @@ publish.workspace = true
 [dependencies]
 base64.workspace = true
 blake2.workspace = true
+bytes.workspace = true
 ed25519-dalek.workspace = true
 getrandom.workspace = true
 h3o.workspace = true

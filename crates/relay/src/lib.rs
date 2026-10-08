@@ -10,6 +10,7 @@
 
 pub mod admission;
 pub mod bounded;
+pub mod budget;
 pub mod ceiling;
 pub mod config;
 pub mod credit;
@@ -17,13 +18,17 @@ pub mod deduplicated;
 pub mod delivery;
 pub mod directory;
 pub mod egress;
+pub mod exchange;
+pub mod fanout;
 pub mod hub;
+pub mod ingest;
 pub mod link;
 pub mod mlat_host;
 pub mod network;
 pub mod parts;
 pub mod peers;
 pub mod products;
+pub mod seal;
 pub mod selection;
 pub mod sharing;
 pub mod standing;
