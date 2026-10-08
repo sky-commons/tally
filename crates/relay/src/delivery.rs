@@ -41,8 +41,9 @@ use crate::selection::Selection;
 pub const TAG_BYTES: usize = std::mem::size_of::<Tagged>();
 /// What one feeder costs the store: a batch a second (RFC-0177's feeder) for the window.
 pub const PER_FEEDER_BYTES: usize = TAG_BYTES * (TAG_WINDOW_MS / 1000) as usize;
-/// The most entries held in all: 8 Mi, some 28,000 feeders' windows, 320 MiB. Past it a batch is
-/// refused whole and counted (`refused`).
+/// The most entries held in all until the relay's budget says otherwise (`Delivery::set_capacity`,
+/// its `budget::Store::Delivery` share): 8 Mi, some 28,000 feeders' windows, 320 MiB. Past the
+/// capacity a batch is refused whole and counted (`refused`).
 pub const TAGS_HELD: usize = 8 << 20;
 /// The most feeders whose keys are held.
 pub const KEYED_FEEDERS: usize = 100_000;
@@ -72,6 +73,8 @@ pub struct Delivery {
     /// Batches refused whole past `TAGS_HELD`, and grants refused past `KEYED_FEEDERS`.
     refused: AtomicU64,
     refused_keys: AtomicU64,
+    /// The most entries held in all (`TAGS_HELD` until set).
+    capacity: std::sync::atomic::AtomicUsize,
 }
 
 impl Default for Delivery {
@@ -132,6 +135,7 @@ impl Delivery {
     pub fn new() -> Self {
         Self {
             shards: (0..SHARDS).map(|_| Mutex::default()).collect(),
+            capacity: std::sync::atomic::AtomicUsize::new(TAGS_HELD),
             placement: RandomState::new(),
             started_ms: AtomicU64::new(u64::MAX),
             refused: AtomicU64::new(0),
@@ -173,12 +177,20 @@ impl Delivery {
     }
 
     /// `hold` of a batch named by its receiver, (boot, sequence) and signed bytes.
+    /// The most bytes of entries held in all: the relay's budget for the store. Past it a batch is
+    /// refused whole, counted.
+    pub fn set_capacity(&self, bytes: usize) {
+        self.capacity
+            .store((bytes / TAG_BYTES).max(SHARDS), Ordering::Release);
+    }
+
     fn hold_bytes(&self, receiver: PublicKey, name: (u64, u64), bytes: &[u8], now_ms: u64) {
         let watched = self.watched(now_ms);
+        let bound = self.capacity.load(Ordering::Acquire) / SHARDS;
         let Some(mut shard) = self.shard(&receiver) else {
             return;
         };
-        if !shard.hold(receiver, name, bytes, watched, now_ms) {
+        if !shard.hold(receiver, name, bytes, (watched, bound), now_ms) {
             self.refused.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -291,7 +303,7 @@ impl Shard {
         receiver: PublicKey,
         (boot_id, sequence): (u64, u64),
         bytes: &[u8],
-        watched: bool,
+        (watched, bound): (bool, usize),
         now_ms: u64,
     ) -> bool {
         self.let_go(now_ms);
@@ -325,12 +337,12 @@ impl Shard {
         }
         let was_active = before.is_some() && !stream.entries.is_empty();
         self.entries -= age(stream, now_ms);
-        let mut full = self.entries >= TAGS_HELD / SHARDS;
+        let mut full = self.entries >= bound;
         if full {
             // Room the window would have made in the other streams is made before refusing.
             let freed = age_all(&mut self.streams, &self.active, now_ms);
             self.entries -= freed;
-            full = self.entries >= TAGS_HELD / SHARDS;
+            full = self.entries >= bound;
         }
         let Some(stream) = self.streams.get_mut(&key) else {
             return true;

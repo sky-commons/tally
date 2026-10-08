@@ -434,6 +434,40 @@ impl Record {
         }
     }
 
+    /// The bytes `encode` writes for this record, header included: a signed record's own bytes
+    /// are read, never copied; any other is encoded to be measured (each a few bytes, or a
+    /// parity chunk's). The one measure of a record's size, for what it costs a queue or a store.
+    pub fn encoded_len(&self) -> usize {
+        let signed = match self {
+            Self::Batch(batch) | Self::RelayBatch(batch) => batch.as_bytes().len(),
+            Self::ReceiverInfo(info) => info.as_bytes().len(),
+            Self::Positions(positions) | Self::Provisional(positions) => positions.as_bytes().len(),
+            Self::ClockModel(model) => model.as_bytes().len(),
+            Self::ClockModelPart(part) => part.as_bytes().len(),
+            Self::FaultProof(proof) => proof.as_bytes().len(),
+            Self::EchoReply(signed) => signed.as_bytes().len(),
+            Self::DeliveryAnswer(signed) => signed.as_bytes().len(),
+            Self::ProviderOffer(signed) => signed.as_bytes().len(),
+            Self::PieceManifest(signed) => signed.as_bytes().len(),
+            Self::StripeReceipt(signed) => signed.as_bytes().len(),
+            Self::FirehoseCredential(signed) => signed.as_bytes().len(),
+            Self::EvidenceBundle(signed) => signed.as_bytes().len(),
+            Self::WorldPositions(signed) => signed.as_bytes().len(),
+            Self::RegionalBatch(signed) => signed.as_bytes().len(),
+            Self::BundleIndex(signed) => signed.as_bytes().len(),
+            Self::WorldPrecise(signed) => signed.as_bytes().len(),
+            _ => {
+                let mut out = Vec::new();
+                return match self.encode(&mut out) {
+                    Ok(()) => out.len(),
+                    // Too large to send: measured by what it would have taken.
+                    Err(_) => out.len().max(HEADER_LEN),
+                };
+            }
+        };
+        HEADER_LEN + signed
+    }
+
     /// Appends the record to `out`.
     pub fn encode(&self, out: &mut Vec<u8>) -> Result<(), WireError> {
         let start = out.len();
@@ -794,6 +828,18 @@ mod tests {
                 regions: Vec::new(),
             },
         ])
+    }
+
+    /// A record's measured size is what encoding it writes, for every kind: the one size every
+    /// queue and store charges a record by.
+    #[test]
+    fn a_records_encoded_len_is_what_it_encodes_to() -> Result<(), WireError> {
+        for record in every_record()? {
+            let mut out = Vec::new();
+            record.encode(&mut out)?;
+            assert_eq!(record.encoded_len(), out.len(), "{:?}", record.kind());
+        }
+        Ok(())
     }
 
     #[test]

@@ -18,6 +18,7 @@
 //! wire carries one. BLAKE2s keyed would serve too but costs several times as much per message at
 //! twelve million receptions a second, for no property this use needs.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use bytes::Bytes;
@@ -28,7 +29,7 @@ use crate::beast::{Frame, FrameKind};
 use crate::key::PublicKey;
 
 /// The fixed part of one encoded observation: format, 48-bit counter, signal, length.
-const OBSERVATION_FIXED: usize = 1 + 6 + 1 + 2;
+pub const OBSERVATION_FIXED: usize = 1 + 6 + 1 + 2;
 
 /// The secret keys of the fingerprint (module docs): two SipHash-2-4 keys of 128 bits each.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -178,7 +179,41 @@ pub struct Decoded {
     obs: Box<[ObsRef]>,
 }
 
+/// Every `Decoded` alive in this process: how many, and the bytes they hold
+/// ([`Decoded::footprint`]). A relay's stages share each one, so this is what every queue and
+/// store downstream of ingest holds of batches together, whichever charged it: a relay serves it
+/// beside its stores' gauges (`GET /memory`), so a holder that escapes them shows.
+static LIVE_COUNT: AtomicUsize = AtomicUsize::new(0);
+static LIVE_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+/// (Decoded batches alive, the bytes they hold.)
+pub fn live() -> (usize, usize) {
+    (
+        LIVE_COUNT.load(Ordering::Relaxed),
+        LIVE_BYTES.load(Ordering::Relaxed),
+    )
+}
+
+impl Drop for Decoded {
+    fn drop(&mut self) {
+        LIVE_COUNT.fetch_sub(1, Ordering::Relaxed);
+        LIVE_BYTES.fetch_sub(self.footprint(), Ordering::Relaxed);
+    }
+}
+
 impl Decoded {
+    /// What this decode holds in memory: the signed batch, its inflated bytes when they are its
+    /// own allocation, the receptions' references and the struct itself.
+    pub fn footprint(&self) -> usize {
+        let batch = self.batch.as_bytes();
+        let shares_batch = self.plain.as_ptr() >= batch.as_ptr()
+            && self.plain.as_ptr() < batch.as_ptr().wrapping_add(batch.len());
+        std::mem::size_of::<Self>()
+            + batch.len()
+            + if shares_batch { 0 } else { self.plain.len() }
+            + std::mem::size_of_val(&*self.obs)
+    }
+
     /// Decodes `batch`, whose signature the caller has already verified (this does not verify it),
     /// under the process's fingerprint key. `stamp_ms` is the ingest clock's reading when it was
     /// taken and `ingest_seq` its place in the ingest order: what every later decision reads, never
@@ -201,20 +236,25 @@ impl Decoded {
         ingest_seq: u64,
     ) -> Result<Arc<Self>, Box<Undecodable>> {
         match Self::decode(&batch, key) {
-            Ok((receiver, header, plain, obs)) => Ok(Arc::new(Self {
-                batch,
-                receiver,
-                boot_id: header.boot_id,
-                sequence: header.sequence,
-                counter_epoch: header.counter_epoch,
-                wall_ms: header.wall_ms,
-                dropped: header.dropped,
-                previous: header.previous,
-                stamp_ms,
-                ingest_seq,
-                plain,
-                obs,
-            })),
+            Ok((receiver, header, plain, obs)) => {
+                let decoded = Self {
+                    batch,
+                    receiver,
+                    boot_id: header.boot_id,
+                    sequence: header.sequence,
+                    counter_epoch: header.counter_epoch,
+                    wall_ms: header.wall_ms,
+                    dropped: header.dropped,
+                    previous: header.previous,
+                    stamp_ms,
+                    ingest_seq,
+                    plain,
+                    obs,
+                };
+                LIVE_COUNT.fetch_add(1, Ordering::Relaxed);
+                LIVE_BYTES.fetch_add(decoded.footprint(), Ordering::Relaxed);
+                Ok(Arc::new(decoded))
+            }
             Err(error) => Err(Box::new(Undecodable { batch, error })),
         }
     }

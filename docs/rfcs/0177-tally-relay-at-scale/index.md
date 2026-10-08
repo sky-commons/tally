@@ -58,6 +58,14 @@ Measured on main (tally-load, commit b3e3571809 on branch tally-load):
    across message shards, sort canonically, sequence in cell order, sign. MLAT bins:
    `Bin::seal_from(fragments)` byte-equal to `Bin::seal` of one Held. World seals at
    watermark + WORLD_SETTLE_MS. Geography appears only here.
+
+   As built: one sealer thread decides and a pool works. Each epoch's areas are cut into records that
+   fit (`RegionalBatch::fits`, decided without signing; the sequence is a fixed-width field), the
+   records are numbered in cell order by the one thread, then signed and their ADS-B fixes derived on
+   as many threads as the message exchange has, and applied in sequence order by the one thread.
+   Measured at 20,000 feeders before the pool: the single sealer thread held a whole core and fell
+   behind (deriving the regional batches' ADS-B fixes was 70% of it, `to_observation` 20%, signing
+   9%); after, the sealer thread is at 0.1 to 0.3 of a core.
 5. **One Held per relay**, sealed bins `Arc`, shared by the MLAT engine and standing (standing reads
    sealed bins; raw later than settle is missing for both, consistently). Held stores open records per
    receiver (per-receiver sorts in parallel at seal), chunked storage (no doubling copies), byte
@@ -139,6 +147,31 @@ Measured on main (tally-load, commit b3e3571809 on branch tally-load):
    receiver limit comes from the same F (>= 20,000). Any leftover overflow is counted, published, and
    refused whole (a whole receiver, bin, area or second), never partially in an interleaving-dependent
    way. `Added.dropped` is never discarded.
+
+   As built (`tally-relay`'s `budget`): every store and every queue whose size grows with what feeders
+   send is a `Store`, with a per-feeder cost over its own window, reserved at admission: the batch
+   byte store, `Held`, the fingerprints (as if every reception were new, with the tables' room to
+   double), the fan-out, the delivery tags, the ingest stage's credit, the epochs' decoded batches
+   between ingest and the sealer (`seal::EPOCHS_HELD`, 3 epochs), and what the products hold until
+   the hub takes it (`products::OUTBOX_EPOCHS`, 2). Each store has a gauge whose limit is its share
+   at the ceiling, charged for what the store really holds and released when it lets go (a decoded
+   batch by `Decoded::footprint`, a record by `Record::encoded_len`, the one size of either). What
+   a full gauge does is the store's policy: the ingest stage waits (the connection's socket unread);
+   an epoch past its share is refused whole by the message thread that holds it, and the sealer
+   counts it; the products refuse an epoch's records or stream whole, and a peer's record alone; the
+   fan-out lets go the subscriber holding most until the item fits. A sharing member reserves the
+   feeders its ingest ceiling is worth (`--max-member-bytes-per-sec` over a planned feeder's rate)
+   for as long as it is a member. A relay whose memory admits no feeder refuses to start
+   (`Budget::check`), and the deployed units are held to the budget by a test
+   (`//tally/crates/relay:deployed`). The gauges are served on `GET /memory`.
+
+   Why (measured 2026-10-08, 20,000 feeders on one 32-core host): the relay's resident memory grew
+   about 330 MB/s, unbounded, to 18 GB in 160 s. It was decoded batches: the sealer's queue was
+   bounded by count (4,096 commands), and each command was a whole epoch's part from one message
+   thread, so the queue could hold some 500 seconds of every batch; the one sealer thread could not
+   keep up, and 2.2 M decoded batches (18.6 GB) waited in it. With the gauges and the sealer pool:
+   2.3 GB resident at 20,000 feeders, flat.
+
 10. **Overload policy (decided)**: back-pressure for raw, delivery and fan-out; whole-epoch refusal,
     counted, for derived products.
 11. **Connection buffers from a shared pool**, not zeroed 64 KiB per connection. As built
@@ -163,6 +196,12 @@ Measured on main (tally-load, commit b3e3571809 on branch tally-load):
 9. No lock across a seal: ingest p99 flat with a sealer slowed to 1 s.
 10. Throughput scales ~linearly with cores; 20k feeders sustain 20k batches/s at target p99 in tally-load.
 
-## Sizing at 20k (critics' estimate, to be measured)
+## Sizing at 20k (critics' estimate; measured below)
 ~12-13 GB RAM (batch store ~2.4 GB, Held ~8 GB, dedup ~0.6 GB, fan-out ~0.33 GB, buffers ~0.3 GB) and
 ~35-40 cores (27 MLAT fits, 8-10 verify/inflate/ingest/dedup).
+
+Measured (2026-10-08, `tally-load`, 20,000 feeders, the relay alone on 10 cores, `--memory 14G`, no
+hosted MLAT): 586 kB reserved a feeder (the fingerprints' worst case is 178 kB of it), so 14 GiB
+admits 23,781; 6.3 cores mean, 7.4 peak; 2.3 GB resident, flat. The feeders and the client ran as
+their own processes on other cores: run in one process beside the relay, 20,000 simulated feeders
+take some 19 cores and starve the client's one read task, which then falls behind and is let go.

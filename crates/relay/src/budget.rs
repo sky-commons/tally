@@ -1,22 +1,37 @@
-//! Capacity is admission, never a silent drop inside a store (RFC-0177 §9). Each store that holds
-//! something per feeder ([`Store`]) states what one feeder costs it ([`PerFeeder::planned`]); a
-//! feeder's bytes in every store are reserved together when it is admitted ([`Budget::reserve`]),
-//! beside the upload cap's headroom check (RFC-0171, `admission`), and released when it leaves
-//! ([`Reservation`] dropped). The feeder ceiling is what the relay's memory (`--memory`, by default
-//! what the relay's cgroup or the host allows, [`memory_available`]) holds of that sum; a Hello
-//! beyond it is refused ("no spare slot"). The MLAT engine's receiver limit comes from the same
-//! ceiling. Whatever still overflows is refused whole (a whole receiver, bin, area or second),
-//! counted and published.
+//! Capacity is admission, never a silent drop inside a store (RFC-0177 §9). Every store and
+//! every queue that holds something per feeder ([`Store`]) states what one feeder costs it
+//! ([`PerFeeder::planned`]); a feeder's bytes in every store are reserved together when it is
+//! admitted ([`Budget::reserve`]), beside the upload cap's headroom check (RFC-0171, `admission`),
+//! and released when it leaves ([`Reservation`] dropped). A sharing member reserves the feeders its
+//! ingest ceiling is worth ([`Budget::reserve_feeders`]), so data from peers is admitted the same
+//! way. The feeder ceiling is what the relay's memory (`--memory`, by default what the relay's
+//! cgroup or the host allows, [`memory_available`]) holds of that sum, after [`BASE_BYTES`]; a
+//! Hello beyond it is refused ("no spare slot"), and a relay whose memory admits no feeder at all
+//! refuses to start ([`Budget::check`]). The MLAT engine's receiver limit comes from the same
+//! ceiling.
+//!
+//! The reservation is a plan; each store's [`Gauge`] is what holds the plan. Every store and queue
+//! that holds bytes beyond one batch at a time charges its gauge ([`Gauge::try_charge`],
+//! [`Gauge::charge`]) for what it holds and is released when it lets go ([`Charge`] dropped). A
+//! gauge's limit is that store's share at the ceiling (`per feeder x ceiling`), so the stores
+//! together never hold more than the relay's memory, whatever arrives and however slow a stage is.
+//! What a full gauge does is the store's policy (RFC-0177 §10): raw and fan-out push back (a
+//! connection's batch waits for room, its socket unread), derived products refuse whole (an epoch,
+//! counted). The gauges are served on `--stats-listen` (`GET /memory`).
 //!
 //! The per-feeder costs are planning figures at the rate the RFC sizes a feeder to
 //! ([`PLANNED_RECEPTIONS_PER_SEC`], [`PLANNED_BYTES_PER_SEC`]) times each store's own window,
 //! named where the store defines it, so a store that changes its window changes its reservation.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
-/// The stores that hold bytes per feeder.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+use tokio::sync::Notify;
+
+/// The stores that hold bytes per feeder: every store and queue of the relay whose size grows
+/// with what feeders send.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Store {
     /// The one batch byte store, over the sharing repair horizon.
     Batches,
@@ -30,6 +45,32 @@ pub enum Store {
     Delivery,
     /// Connection buffers.
     Buffers,
+    /// Batches read off connections and waiting for, or in, the ingest stage (`ingest::CREDIT`).
+    Ingest,
+    /// Decoded batches between ingest and the sealer: each epoch open in the message exchange,
+    /// closing, and waiting at the sealer (`seal::EPOCHS_HELD`).
+    Epochs,
+    /// What the sealer has made and the hub has not yet taken: the deduplicated stream's epochs
+    /// and the signed products, and the peers' records waiting for the sealer.
+    Products,
+}
+
+impl Store {
+    pub const ALL: [Self; 9] = [
+        Self::Batches,
+        Self::Held,
+        Self::Dedup,
+        Self::Fanout,
+        Self::Delivery,
+        Self::Buffers,
+        Self::Ingest,
+        Self::Epochs,
+        Self::Products,
+    ];
+
+    const fn index(self) -> usize {
+        self as usize
+    }
 }
 
 /// What one feeder costs each store, in bytes.
@@ -41,6 +82,9 @@ pub struct PerFeeder {
     pub fanout: usize,
     pub delivery: usize,
     pub buffers: usize,
+    pub ingest: usize,
+    pub epochs: usize,
+    pub products: usize,
 }
 
 impl PerFeeder {
@@ -52,17 +96,17 @@ impl PerFeeder {
             Store::Fanout => self.fanout,
             Store::Delivery => self.delivery,
             Store::Buffers => self.buffers,
+            Store::Ingest => self.ingest,
+            Store::Epochs => self.epochs,
+            Store::Products => self.products,
         }
     }
 
     /// Every store's cost together: what admitting one feeder reserves.
     pub fn total(&self) -> usize {
-        self.batches
-            .saturating_add(self.held)
-            .saturating_add(self.dedup)
-            .saturating_add(self.fanout)
-            .saturating_add(self.delivery)
-            .saturating_add(self.buffers)
+        Store::ALL
+            .iter()
+            .fold(0usize, |sum, store| sum.saturating_add(self.of(*store)))
     }
 
     /// What one feeder at the planned rate costs each store over that store's window. `holds_raw`:
@@ -70,6 +114,9 @@ impl PerFeeder {
     pub fn planned(holds_raw: bool) -> Self {
         let receptions = PLANNED_RECEPTIONS_PER_SEC;
         let bytes = PLANNED_BYTES_PER_SEC;
+        // One second of one feeder's batches as the stages hold them: signed, inflated once, each
+        // reception referenced (`tally_wire::Decoded::footprint`).
+        let decoded = bytes + receptions * DECODED_BYTES_PER_RECEPTION;
         Self {
             // The one batch byte store, over the sharing repair horizon.
             batches: bytes * crate::sharing::member::HORIZON_SECONDS as usize,
@@ -82,18 +129,30 @@ impl PerFeeder {
             } else {
                 0
             },
-            // Two generations of fingerprints, one epoch each (`exchange`).
-            dedup: receptions * 2 * DEDUP_ENTRY_BYTES,
-            // A subscriber's queue holds `BEHIND_MS` of inbound: the batches, and while they wait
-            // their one decode (a reception's reference and its inflated bytes).
-            fanout: (bytes + receptions * (DECODED_BYTES_PER_RECEPTION))
-                * crate::fanout::BEHIND_MS as usize
+            // Two generations of fingerprints, one epoch each (`exchange`), as if no reception
+            // were a copy of another's, with the tables' room to grow.
+            dedup: receptions
+                * crate::exchange::DEDUP_SLOTS_PER_RECEPTION
+                * crate::exchange::DEDUP_ENTRY_BYTES
+                * crate::seal::EPOCH_MS as usize
                 / 1_000,
+            // A subscriber's queue holds `BEHIND_MS` of inbound: the batches, and while they wait
+            // their one decode.
+            fanout: decoded * crate::fanout::BEHIND_MS as usize / 1_000,
             // A delivery tag per batch over the audit window (`delivery`).
             delivery: crate::delivery::PER_FEEDER_BYTES,
             // A connection's Noise buffers come from one pool and an idle connection holds none
             // (`noise`): what the pool keeps idle is the process's (`BASE_BYTES`), not a feeder's.
             buffers: 0,
+            // A connection's credit of batches read and not yet decoded (`ingest::CREDIT`), at a
+            // second's batches each.
+            ingest: crate::ingest::CREDIT * bytes,
+            // The decoded batches of the epochs between ingest and the sealer.
+            epochs: decoded * crate::seal::EPOCHS_HELD as usize * crate::seal::EPOCH_MS as usize
+                / 1_000,
+            // What the sealer made of those epochs and the hub has not taken: every reception as
+            // a signed product's observation, as if none were a copy (`products::OUTBOX_EPOCHS`).
+            products: receptions * PRODUCT_BYTES_PER_RECEPTION * crate::products::OUTBOX_EPOCHS,
         }
     }
 }
@@ -102,15 +161,18 @@ impl PerFeeder {
 /// (RFC-0177, "Requirement").
 pub const PLANNED_RECEPTIONS_PER_SEC: usize = 600;
 pub const PLANNED_BYTES_PER_SEC: usize = 8 * 1024;
-/// One fingerprint remembered: 128 bits, the areas heard, and the table's slack.
-const DEDUP_ENTRY_BYTES: usize = 64;
-/// One reception's reference in a decoded batch, and its message inflated.
-const DECODED_BYTES_PER_RECEPTION: usize = 24 + 14;
-/// What the relay holds whatever its feeders: descriptions, stream tables, the runtime, and the
-/// connection buffers the Noise pool keeps idle (`noise::POOL_IDLE` messages).
+/// One reception in a decoded batch: its reference, and its encoded observation in the inflated
+/// bytes (the fixed part and a 14-byte Mode S message).
+const DECODED_BYTES_PER_RECEPTION: usize =
+    std::mem::size_of::<tally_wire::ObsRef>() + tally_wire::decoded::OBSERVATION_FIXED + 14;
+/// One reception as a product holds it before it is sent: an owned observation (the struct and its
+/// message) in a record's list.
+const PRODUCT_BYTES_PER_RECEPTION: usize = std::mem::size_of::<tally_wire::Observation>() + 14;
+/// What the relay holds whatever its feeders: descriptions, stream tables, the runtime, the
+/// connection buffers the Noise pool keeps idle (`noise::POOL_IDLE` messages), and the one batch
+/// each ingest worker is decoding.
 pub const BASE_BYTES: usize =
     (1 << 30) + tally_wire::noise::POOL_IDLE * tally_wire::noise::MAX_MESSAGE;
-
 /// The bytes this relay may use, unless told (`--memory`): its cgroup's limit when it has one,
 /// else the host's memory.
 pub fn memory_available() -> usize {
@@ -144,26 +206,298 @@ fn host_memory() -> Option<usize> {
     kib.checked_mul(1024)
 }
 
-/// The relay's memory for feeders, and how much of it admitted feeders hold.
+/// One store's bytes held now, against its limit (its share of the budget at the ceiling).
+#[derive(Debug)]
+pub struct Gauge {
+    store: Store,
+    limit: AtomicUsize,
+    held: AtomicUsize,
+    peak: AtomicUsize,
+    /// Charges refused for room (`try_charge`), and charges that waited for it (`charge`).
+    refused: AtomicU64,
+    waited: AtomicU64,
+    /// Charges waiting for room now: a release wakes them only when there are any.
+    waiting: AtomicUsize,
+    released: Notify,
+}
+
+impl Gauge {
+    pub fn new(store: Store, limit: usize) -> Arc<Self> {
+        Arc::new(Self {
+            store,
+            limit: AtomicUsize::new(limit),
+            held: AtomicUsize::new(0),
+            peak: AtomicUsize::new(0),
+            refused: AtomicU64::new(0),
+            waited: AtomicU64::new(0),
+            waiting: AtomicUsize::new(0),
+            released: Notify::new(),
+        })
+    }
+
+    /// A gauge of no store, never full: for a part built without a budget (a test's).
+    pub fn unlimited(store: Store) -> Arc<Self> {
+        Self::new(store, usize::MAX)
+    }
+
+    pub fn store(&self) -> Store {
+        self.store
+    }
+
+    pub fn limit(&self) -> usize {
+        self.limit.load(Ordering::Acquire)
+    }
+
+    fn set_limit(&self, limit: usize) {
+        self.limit.store(limit, Ordering::Release);
+        self.released.notify_waiters();
+    }
+
+    pub fn held(&self) -> usize {
+        self.held.load(Ordering::Acquire)
+    }
+
+    pub fn peak(&self) -> usize {
+        self.peak.load(Ordering::Relaxed)
+    }
+
+    pub fn refused(&self) -> u64 {
+        self.refused.load(Ordering::Relaxed)
+    }
+
+    pub fn waited(&self) -> u64 {
+        self.waited.load(Ordering::Relaxed)
+    }
+
+    /// Takes `bytes` if they fit under the limit. A charge larger than the whole limit is taken
+    /// only while nothing else is held, so one oversized item is never refused forever.
+    fn take(self: &Arc<Self>, bytes: usize) -> Option<Charge> {
+        let limit = self.limit();
+        let taken = self
+            .held
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |held| {
+                let after = held.checked_add(bytes)?;
+                (after <= limit || held == 0).then_some(after)
+            })
+            .ok()?;
+        self.peak.fetch_max(taken + bytes, Ordering::Relaxed);
+        Some(Charge {
+            gauge: Some(Arc::clone(self)),
+            bytes,
+        })
+    }
+
+    /// A charge of nothing yet on this gauge, to grow (`Charge::try_grow`).
+    pub fn empty(self: &Arc<Self>) -> Charge {
+        Charge {
+            gauge: Some(Arc::clone(self)),
+            bytes: 0,
+        }
+    }
+
+    /// `bytes` charged whatever the limit: for bytes already allocated, which the store will let go
+    /// by its own rule (the fan-out lets its laggard go, `fanout::Router::publish`).
+    pub fn force(self: &Arc<Self>, bytes: usize) -> Charge {
+        let held = self.held.fetch_add(bytes, Ordering::AcqRel);
+        self.peak.fetch_max(held + bytes, Ordering::Relaxed);
+        Charge {
+            gauge: Some(Arc::clone(self)),
+            bytes,
+        }
+    }
+
+    /// Whether `bytes` more would fit now.
+    pub fn fits(&self, bytes: usize) -> bool {
+        self.held().saturating_add(bytes) <= self.limit()
+    }
+
+    /// `bytes` charged now, or `None` (counted) when the store is full: for a store that refuses
+    /// whole.
+    pub fn try_charge(self: &Arc<Self>, bytes: usize) -> Option<Charge> {
+        let charge = self.take(bytes);
+        if charge.is_none() {
+            self.refused.fetch_add(1, Ordering::Relaxed);
+        }
+        charge
+    }
+
+    /// `bytes` charged, waiting for room while the store is full: for a store that pushes back.
+    pub async fn charge(self: &Arc<Self>, bytes: usize) -> Charge {
+        if let Some(charge) = self.take(bytes) {
+            return charge;
+        }
+        self.waited.fetch_add(1, Ordering::Relaxed);
+        self.waiting.fetch_add(1, Ordering::SeqCst);
+        let _waiting = Waiting(&self.waiting);
+        loop {
+            let released = self.released.notified();
+            if let Some(charge) = self.take(bytes) {
+                return charge;
+            }
+            released.await;
+        }
+    }
+
+    fn release(&self, bytes: usize) {
+        self.held.fetch_sub(bytes, Ordering::SeqCst);
+        // A waiter counts itself before it looks for room (all sequentially consistent), so a
+        // release its look missed sees it waiting.
+        if self.waiting.load(Ordering::SeqCst) > 0 {
+            self.released.notify_waiters();
+        }
+    }
+
+    pub fn report(&self) -> GaugeReport {
+        GaugeReport {
+            store: self.store,
+            held: self.held(),
+            limit: self.limit(),
+            peak: self.peak(),
+            refused: self.refused(),
+            waited: self.waited(),
+        }
+    }
+}
+
+/// A charge waiting for room, counted while it waits (however its wait ends).
+struct Waiting<'a>(&'a AtomicUsize);
+
+impl Drop for Waiting<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Bytes a store holds for one thing, released when it is dropped.
+#[derive(Debug, Default)]
+pub struct Charge {
+    gauge: Option<Arc<Gauge>>,
+    bytes: usize,
+}
+
+impl Charge {
+    /// Nothing charged.
+    pub fn none() -> Self {
+        Self::default()
+    }
+
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    /// `bytes` more on the same gauge, if they fit (a charge of nothing never grows): false,
+    /// counted, when the store is full.
+    pub fn try_grow(&mut self, bytes: usize) -> bool {
+        let Some(gauge) = &self.gauge else {
+            return bytes == 0;
+        };
+        match gauge.try_charge(bytes) {
+            Some(mut more) => {
+                more.gauge = None;
+                self.bytes += more.bytes;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Releases all but `bytes` of this charge.
+    pub fn shrink_to(&mut self, bytes: usize) {
+        if let Some(gauge) = &self.gauge
+            && bytes < self.bytes
+        {
+            gauge.release(self.bytes - bytes);
+            self.bytes = bytes;
+        }
+    }
+}
+
+impl Drop for Charge {
+    fn drop(&mut self) {
+        if let Some(gauge) = self.gauge.take() {
+            gauge.release(self.bytes);
+        }
+    }
+}
+
+/// One store as served on `GET /memory`.
+#[derive(Clone, Copy, Debug, serde::Serialize)]
+pub struct GaugeReport {
+    pub store: Store,
+    pub held: usize,
+    pub limit: usize,
+    pub peak: usize,
+    pub refused: u64,
+    pub waited: u64,
+}
+
+/// The relay's memory for feeders, how much of it admitted feeders hold, and each store's gauge.
 #[derive(Debug)]
 pub struct Budget {
+    memory: usize,
     total: usize,
     per_feeder: PerFeeder,
     reserved: Arc<AtomicUsize>,
+    gauges: Arc<[Arc<Gauge>]>,
 }
 
 impl Budget {
     /// The budget of a relay that may use `memory` bytes: what is left after `BASE_BYTES`.
     pub fn of_memory(memory: usize, per_feeder: PerFeeder) -> Self {
-        Self::new(memory.saturating_sub(BASE_BYTES), per_feeder)
+        let mut budget = Self::new(memory.saturating_sub(BASE_BYTES), per_feeder);
+        budget.memory = memory;
+        budget
     }
 
     pub fn new(total: usize, per_feeder: PerFeeder) -> Self {
-        Self {
+        let gauges: Arc<[Arc<Gauge>]> = Store::ALL
+            .iter()
+            .map(|store| Gauge::new(*store, 0))
+            .collect();
+        let budget = Self {
+            memory: total.saturating_add(BASE_BYTES),
             total,
             per_feeder,
             reserved: Arc::new(AtomicUsize::new(0)),
+            gauges,
+        };
+        budget.limit_gauges();
+        budget
+    }
+
+    /// The same gauges (whoever holds one keeps it), resized for `memory` bytes: what a relay is
+    /// told after its parts were built.
+    pub fn resize(&mut self, memory: usize, per_feeder: PerFeeder) {
+        self.memory = memory;
+        self.total = memory.saturating_sub(BASE_BYTES);
+        self.per_feeder = per_feeder;
+        self.limit_gauges();
+    }
+
+    fn limit_gauges(&self) {
+        for store in Store::ALL {
+            self.gauges[store.index()].set_limit(self.store_bytes(store));
         }
+    }
+
+    /// Whether the budget admits a feeder at all: a relay that would refuse every Hello refuses to
+    /// start instead, saying what it was given and what it needs.
+    pub fn check(&self) -> Result<(), String> {
+        if self.ceiling() > 0 {
+            return Ok(());
+        }
+        Err(format!(
+            "{} bytes of memory admit no feeder: the relay needs {} bytes for itself and {} \
+             for each feeder; give it more (--memory, or the unit's MemoryMax)",
+            self.memory,
+            BASE_BYTES,
+            self.per_feeder.total()
+        ))
+    }
+
+    /// The least memory that admits `feeders`.
+    pub fn memory_for(feeders: usize, per_feeder: PerFeeder) -> usize {
+        BASE_BYTES.saturating_add(per_feeder.total().saturating_mul(feeders))
     }
 
     /// The most feeders the budget admits: the feeder ceiling.
@@ -176,7 +510,14 @@ impl Budget {
     /// Reserves one feeder's bytes in every store, or `None` when they do not fit (the Hello is
     /// refused).
     pub fn reserve(&self) -> Option<Reservation> {
-        let needed = self.per_feeder.total();
+        self.reserve_feeders(1)
+    }
+
+    /// Reserves `feeders` feeders' bytes in every store at once: what a sharing member, which
+    /// forwards many receivers' records up to its own ceiling, reserves for as long as it is
+    /// linked (`feeders_for_rate`). `None` when they do not fit.
+    pub fn reserve_feeders(&self, feeders: usize) -> Option<Reservation> {
+        let needed = self.per_feeder.total().saturating_mul(feeders);
         self.reserved
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |reserved| {
                 reserved
@@ -190,6 +531,15 @@ impl Budget {
         })
     }
 
+    /// The feeders a connection allowed `bytes_per_sec` is worth: its ceiling over a planned
+    /// feeder's rate, rounded up.
+    pub fn feeders_for_rate(bytes_per_sec: u64) -> usize {
+        usize::try_from(bytes_per_sec)
+            .unwrap_or(usize::MAX)
+            .div_ceil(PLANNED_BYTES_PER_SEC)
+            .max(1)
+    }
+
     pub fn reserved(&self) -> usize {
         self.reserved.load(Ordering::Acquire)
     }
@@ -198,13 +548,44 @@ impl Budget {
         self.per_feeder
     }
 
+    pub fn memory(&self) -> usize {
+        self.memory
+    }
+
     /// What every admitted feeder together may hold in `store`, at the ceiling.
     pub fn store_bytes(&self, store: Store) -> usize {
         self.per_feeder.of(store).saturating_mul(self.ceiling())
     }
+
+    /// The gauge of `store`: the same one for the budget's life, whatever it is resized to.
+    pub fn gauge(&self, store: Store) -> Arc<Gauge> {
+        Arc::clone(&self.gauges[store.index()])
+    }
+
+    pub fn report(&self) -> MemoryReport {
+        MemoryReport {
+            memory: self.memory,
+            base: BASE_BYTES,
+            per_feeder: self.per_feeder.total(),
+            ceiling: self.ceiling(),
+            reserved: self.reserved(),
+            stores: self.gauges.iter().map(|gauge| gauge.report()).collect(),
+        }
+    }
 }
 
-/// One admitted feeder's bytes, released when it is dropped.
+/// The budget as served on `GET /memory`.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct MemoryReport {
+    pub memory: usize,
+    pub base: usize,
+    pub per_feeder: usize,
+    pub ceiling: usize,
+    pub reserved: usize,
+    pub stores: Vec<GaugeReport>,
+}
+
+/// Admitted bytes, released when dropped.
 #[derive(Debug)]
 pub struct Reservation {
     bytes: usize,
@@ -245,12 +626,100 @@ mod tests {
         let with = PerFeeder::planned(true);
         assert_eq!(without.held, 0);
         assert!(with.held > 0);
-        for store in [Store::Batches, Store::Dedup, Store::Fanout, Store::Delivery] {
-            assert!(without.of(store) > 0, "{store:?}");
+        for store in Store::ALL {
+            if !matches!(store, Store::Held | Store::Buffers) {
+                assert!(without.of(store) > 0, "{store:?}");
+            }
         }
         // A relay of 64 GiB holds thousands of planned feeders, never none.
         let budget = Budget::of_memory(64 << 30, with);
         assert!(budget.ceiling() > 1_000);
+        assert!(budget.check().is_ok());
         assert!(memory_available() > 0);
+    }
+
+    #[test]
+    fn a_relay_whose_memory_admits_no_feeder_will_not_start() {
+        let per_feeder = PerFeeder::planned(false);
+        let none = Budget::of_memory(BASE_BYTES + per_feeder.total() - 1, per_feeder);
+        assert_eq!(none.ceiling(), 0);
+        assert!(none.check().is_err());
+        let one = Budget::of_memory(Budget::memory_for(1, per_feeder), per_feeder);
+        assert_eq!(one.ceiling(), 1);
+        assert!(one.check().is_ok());
+    }
+
+    #[test]
+    fn a_member_reserves_the_feeders_its_ceiling_is_worth() {
+        let per_feeder = PerFeeder {
+            batches: 10,
+            ..PerFeeder::default()
+        };
+        let budget = Budget::new(100, per_feeder);
+        assert_eq!(
+            Budget::feeders_for_rate(3 * PLANNED_BYTES_PER_SEC as u64 + 1),
+            4
+        );
+        let member = budget.reserve_feeders(4);
+        assert!(member.is_some());
+        assert_eq!(budget.reserved(), 40);
+        assert!(budget.reserve_feeders(7).is_none());
+        drop(member);
+        assert_eq!(budget.reserved(), 0);
+    }
+
+    /// Every store's gauge is its share of the budget at the ceiling, and resizing the budget
+    /// resizes the gauges whoever holds them; together they never pass the feeders' memory.
+    #[test]
+    fn the_gauges_are_each_stores_share_and_follow_a_resize() {
+        let per_feeder = PerFeeder::planned(false);
+        let mut budget = Budget::of_memory(Budget::memory_for(10, per_feeder), per_feeder);
+        let epochs = budget.gauge(Store::Epochs);
+        assert_eq!(epochs.limit(), per_feeder.epochs * 10);
+        let all: usize = Store::ALL
+            .iter()
+            .map(|store| budget.gauge(*store).limit())
+            .sum();
+        assert!(all <= budget.memory() - BASE_BYTES);
+        budget.resize(Budget::memory_for(20, per_feeder), per_feeder);
+        assert_eq!(epochs.limit(), per_feeder.epochs * 20);
+    }
+
+    #[test]
+    fn a_gauge_refuses_past_its_limit_counted_and_frees_what_is_let_go() {
+        let gauge = Gauge::new(Store::Products, 100);
+        let first = gauge.try_charge(60);
+        assert!(first.is_some());
+        assert!(gauge.try_charge(50).is_none());
+        assert_eq!(gauge.refused(), 1);
+        let mut grown = gauge.empty();
+        assert!(grown.try_grow(40));
+        assert!(!grown.try_grow(1));
+        assert_eq!(gauge.held(), 100);
+        drop(first);
+        grown.shrink_to(10);
+        assert_eq!(gauge.held(), 10);
+        assert_eq!(gauge.peak(), 100);
+        // One item larger than the whole limit is taken only when nothing else is held.
+        assert!(gauge.try_charge(500).is_none());
+        drop(grown);
+        assert!(gauge.try_charge(500).is_some());
+        assert_eq!(gauge.held(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_gauge_that_pushes_back_waits_for_room() {
+        let gauge = Gauge::new(Store::Ingest, 100);
+        let held = gauge.charge(80).await;
+        let waiting = tokio::spawn({
+            let gauge = Arc::clone(&gauge);
+            async move { gauge.charge(50).await.bytes() }
+        });
+        tokio::task::yield_now().await;
+        assert!(!waiting.is_finished());
+        drop(held);
+        assert_eq!(waiting.await.ok(), Some(50));
+        assert_eq!(gauge.waited(), 1);
+        assert_eq!(gauge.held(), 0);
     }
 }

@@ -23,7 +23,7 @@ use tally_wire::noise::{self, Accepted, Reader, Writer};
 use tally_wire::{Identity, PublicKey, Reason, Record, Role, Tolerance};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{OwnedSemaphorePermit, mpsc, watch};
+use tokio::sync::{mpsc, watch};
 use tokio::time::Instant;
 
 use crate::ceiling::{self, Ceiling, Metered};
@@ -31,7 +31,7 @@ use crate::config::Upstream;
 use crate::egress::{Class, Kind, Link, Shed, Socket};
 use crate::fanout::{Fell, Filter, Listener};
 use crate::hub::{Hub, Inbound, Item, Origin, OwnDescription, RelayTrust};
-use crate::ingest::{Credit, Refusal};
+use crate::ingest::{Credit, InFlight, Refusal};
 use crate::network::{Asker, AskerRole};
 use crate::subscription::{Subscription, directory_wants, on_directory_link};
 use tally_wire::RelayAddress;
@@ -1038,6 +1038,12 @@ async fn read_loop<S: AsyncRead>(
         Peer::Member | Peer::Relay => Credit::new(crate::ingest::RELAY_CREDIT),
         Peer::Feeder(_) | Peer::Subscriber | Peer::Engine(_) | Peer::Probe => Credit::default(),
     };
+    let ingest_gauge = hub.budget().gauge(crate::budget::Store::Ingest);
+    // A sharing member forwards many receivers' records: it is admitted as the feeders its ingest
+    // ceiling is worth, reserved in every store as theirs would be (RFC-0177 §9), for as long as
+    // it is a member. A directory link becomes one when its offer is verified, so this is taken
+    // when it first is.
+    let mut membership: Option<crate::budget::Reservation> = None;
     let mut records = Vec::new();
     let mut answers = Vec::new();
     loop {
@@ -1058,11 +1064,35 @@ async fn read_loop<S: AsyncRead>(
                 why: "sent more than its ingest ceiling".to_owned(),
             });
         }
+        if membership.is_none() && matches!(peer.now(hub, &asker.key), Peer::Member) {
+            let feeders = crate::budget::Budget::feeders_for_rate(hub.member_bytes_per_sec());
+            membership = Some(
+                hub.budget()
+                    .reserve_feeders(feeders)
+                    .ok_or_else(|| End::Told {
+                        reason: Reason::Full,
+                        retry_after_secs: OVER_CEILING_RETRY_SECS,
+                        why: format!(
+                            "turned away: no spare slot (a member is {feeders} feeders, and the \
+                         memory budget holds {})",
+                            hub.budget().ceiling()
+                        ),
+                    })?,
+            );
+        }
         for record in records.drain(..) {
-            let permit = if matches!(record, Record::Batch(_)) {
-                credit.acquire().await
-            } else {
-                None
+            let permit = match &record {
+                Record::Batch(batch) => {
+                    let bytes = batch.as_bytes().len();
+                    match credit.acquire().await {
+                        Some(permit) => Some(InFlight {
+                            permit,
+                            charge: ingest_gauge.charge(bytes).await,
+                        }),
+                        None => None,
+                    }
+                }
+                _ => None,
             };
             if let Some(why) = refusal.now() {
                 return Err(End::Closed(why));
@@ -1130,7 +1160,7 @@ fn ingest(
     (peer, asker): (Peer, &Asker),
     subscribe: Option<&watch::Sender<Subscription>>,
     described: &mut Option<Described>,
-    (permit, refusal): (Option<OwnedSemaphorePermit>, &Arc<Refusal>),
+    (permit, refusal): (Option<InFlight>, &Arc<Refusal>),
 ) -> Result<(), Unhandled> {
     // Whether the peer may send it at all is its role's one rule (`Peer::permit`).
     let peer = peer.now(hub, &asker.key);
@@ -1788,7 +1818,7 @@ fn parts(records: &[Arc<Record>]) -> Vec<&[Arc<Record>]> {
             start = at;
             bytes = 0;
         }
-        bytes += size(record);
+        bytes += record.encoded_len();
     }
     if start < records.len() {
         parts.push(&records[start..]);
@@ -1821,7 +1851,7 @@ impl Pending {
     fn keep(&mut self, item: Item, source: u64, wants: &Wants) {
         if item.source != source && wants.wants(&item) {
             let class = Class::of(&item.record, self.kind);
-            self.bytes += size(&item.record);
+            self.bytes += item.record.encoded_len();
             self.records += 1;
             self.by_class[class as usize].push(item.record);
         }
@@ -1855,30 +1885,13 @@ impl Pending {
 /// for each Noise message (one per record at worst, and every half message at most) its tag and
 /// two-byte length. The socket counts what is really written; this is what is granted first.
 fn wire_cost(records: &[Arc<Record>]) -> usize {
-    const RECORD_HEADER: usize = 3;
     const MESSAGE_OVERHEAD: usize = 2 + 16;
-    let bytes: usize = records
-        .iter()
-        .map(|record| size(record) + RECORD_HEADER)
-        .sum();
+    let bytes: usize = records.iter().map(|record| record.encoded_len()).sum();
     let messages = records
         .len()
         .min(bytes / (noise::MAX_PLAINTEXT / 2) + 1)
         .max(1);
     bytes + messages * MESSAGE_OVERHEAD
-}
-
-/// A record's signed bytes, near enough its size on the wire.
-fn size(record: &Record) -> usize {
-    match record {
-        Record::Batch(batch) | Record::RelayBatch(batch) => batch.as_bytes().len(),
-        Record::ReceiverInfo(info) => info.as_bytes().len(),
-        Record::Positions(positions) | Record::Provisional(positions) => positions.as_bytes().len(),
-        Record::ClockModel(model) => model.as_bytes().len(),
-        Record::ClockModelPart(part) => part.as_bytes().len(),
-        Record::FaultProof(proof) => proof.as_bytes().len(),
-        _ => 0,
-    }
 }
 
 /// Sends a directory link that fell behind the fan-out the directory held now, whole.
