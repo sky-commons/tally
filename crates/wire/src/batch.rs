@@ -145,11 +145,24 @@ pub struct BatchContent {
 }
 
 /// A signed batch, as bytes. Immutable: forwarding never re-encodes it, and every holder shares
-/// the one allocation (`Bytes`), so a clone is a reference count, not a copy.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// the one allocation (`Bytes`), so a clone is a reference count, not a copy. The signer's key is
+/// decompressed once, when the batch is read (`from_bytes`) or signed, and kept: naming the
+/// receiver and checking the signature never decompress it again (RFC-0177 §2).
+#[derive(Clone, Debug)]
 pub struct Batch {
     bytes: Bytes,
+    /// Shared, so a batch (and every record holding one) stays small.
+    signer: std::sync::Arc<ed25519_dalek::VerifyingKey>,
 }
+
+/// Two batches are the same batch when their signed bytes are: the kept key is read from them.
+impl PartialEq for Batch {
+    fn eq(&self, other: &Self) -> bool {
+        self.bytes == other.bytes
+    }
+}
+
+impl Eq for Batch {}
 
 impl Batch {
     /// A receiver's batch of its own receptions.
@@ -220,6 +233,7 @@ impl Batch {
         bytes.extend_from_slice(&signature);
         Ok(Self {
             bytes: Bytes::from(bytes),
+            signer: std::sync::Arc::new(identity.public().point()?),
         })
     }
 
@@ -232,8 +246,8 @@ impl Batch {
                 had: bytes.len(),
             });
         }
-        PublicKey::from_slice(&bytes[1..1 + KEY_LEN])?;
-        Ok(Self { bytes })
+        let signer = std::sync::Arc::new(PublicKey::from_slice(&bytes[1..1 + KEY_LEN])?.point()?);
+        Ok(Self { bytes, signer })
     }
 
     pub fn as_bytes(&self) -> &[u8] {
@@ -249,8 +263,10 @@ impl Batch {
         self.bytes[0]
     }
 
+    /// The key that signed it, as kept: never decompressed again. A `Result` for its callers'
+    /// sake; it cannot fail, the key was checked when the batch was read.
     pub fn receiver(&self) -> Result<PublicKey, WireError> {
-        PublicKey::from_slice(&self.bytes[1..1 + KEY_LEN])
+        Ok(PublicKey::of_point(&self.signer))
     }
 
     pub fn boot_id(&self) -> u64 {
@@ -278,7 +294,7 @@ impl Batch {
 
     fn verify_in(&self, label: &[u8]) -> Result<(), WireError> {
         let (signed, signature) = split_signature(&self.bytes)?;
-        self.receiver()?.verify(&domain(label, signed), &signature)
+        PublicKey::verify_by(&self.signer, &domain(label, signed), &signature)
     }
 
     /// The content, for a format this build reads.

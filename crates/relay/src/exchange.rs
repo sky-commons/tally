@@ -1,35 +1,43 @@
 //! Keyed exchanges between the ingest stage and the shards that own state (RFC-0177 §3). There
-//! are [`SHARDS`] logical shards per exchange, mapped onto threads, each owning its state outright,
-//! so nothing on the per-reception path takes a lock. A producer (an ingest worker) sends a shard
-//! one [`Slice`] per batch, never one message per reception: the batch, shared, and the index
-//! ranges of its receptions whose key falls in that shard. Queues are bounded per (producer,
-//! shard).
+//! are [`SHARDS`] logical shards per exchange, mapped onto threads (shard `s` on thread
+//! `s % threads`), each owning its state outright, so nothing on the per-reception path takes a
+//! lock. A producer (an ingest worker) sends each thread one [`Slice`] per batch, never one message
+//! per reception: the batch, shared, and the index ranges of its receptions whose key falls in that
+//! thread's shards. Each thread's queue is bounded ([`QUEUE_SLICES`] per producer): a producer
+//! that finds it full waits, which holds its connections' credit (`ingest::CREDIT`), which stops
+//! their sockets being read. That is the back-pressure raw meets (RFC-0177 §10).
 //!
 //! Keys are uniform hashes only, never geography, so a dense area cannot make a hot shard:
 //!
-//! - [`Exchange::Message`]: by a reception's fingerprint. The one deduplication (the hub's stream
-//!   and each area's first-heard).
-//! - [`Exchange::Raw`]: by receiver. Open MLAT fragments, station counters.
-//! - [`Exchange::Address`]: by ICAO address. The world and provisional products.
+//! - [`Exchange::Message`]: by a reception's fingerprint. The one deduplication
+//!   ([`MessageShard`]): the hub's stream and each area's first-heard.
+//! - [`Exchange::Raw`]: by receiver. Admission, station counters and each receiver's place, owned
+//!   by the ingest worker of the receiver's shard (`ingest::Stages`).
+//! - [`Exchange::Address`]: by ICAO address. Named for the world and provisional candidates, which
+//!   one sealer owns whole today (`products::Sealer`): they arrive per record, not per reception.
 //!
-//! Every producer sends [`Envelope::Tick`] down every queue as its stamps advance; a shard's
-//! watermark ([`Watermark`]) is the least of its producers' ticks, and a shard closes an epoch
-//! (`seal`) once its watermark passes it.
-//!
-//! Step 1 of the RFC: the keys, the split of a batch into slices and the watermark are real; the
-//! hub still calls each consumer inline with the whole batch ([`Inline`]).
+//! Every producer sends [`Envelope::Tick`] down every queue as its stamps advance; a thread's
+//! watermark ([`Watermark`]) is the least of its producers' ticks, and it closes an epoch once its
+//! watermark passes it (`seal::Closer`). Nothing is decided on arrival: an epoch's receptions are
+//! decided at its close, in the canonical order of their stamps (`ingest::Stamp`) and indices, so
+//! which copy of a message is kept, and in which area, is the same on any number of threads.
 
+use std::collections::{BTreeMap, HashMap};
+use std::hash::{BuildHasher, Hasher};
 use std::ops::Range;
-use std::sync::Arc;
+use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 
-use tally_wire::{Decoded, ObsRef, PublicKey};
+use tally_wire::{Decoded, ObsRef, PublicKey, Region};
 
 use crate::ingest::Stamp;
+use crate::seal::{Closer, Epoch, epoch_of};
 
 /// Logical shards per exchange: fixed, so a key's shard never depends on how many threads run.
 pub const SHARDS: usize = 256;
 
-/// Slices a (producer, shard) queue holds before the producer waits: about a second of one
+/// Slices a thread's queue holds per producer before the producer waits: about a second of one
 /// feeder's batches per producer at the RFC's rate, bounded whatever the shard's speed.
 pub const QUEUE_SLICES: usize = 1_024;
 
@@ -65,25 +73,41 @@ pub fn address_shard(address: u32) -> ShardId {
     ShardId(((mixed >> 16) as usize % SHARDS) as u16)
 }
 
-/// One batch's receptions for one shard: the batch, shared, and the runs of its observation
-/// indices whose key falls in the shard, ascending.
+/// The thread of `threads` a shard runs on.
+pub fn thread_of(shard: ShardId, threads: usize) -> usize {
+    usize::from(shard.0) % threads.max(1)
+}
+
+/// One batch's receptions for one thread: the batch, shared, the runs of its observation indices
+/// whose key falls in the thread's shards, ascending, and the area the batch's receiver is in for
+/// this relay's regional product (`products::Products::area_for`), if any.
 #[derive(Clone, Debug)]
 pub struct Slice {
     pub decoded: Arc<Decoded>,
     pub ranges: Box<[Range<u32>]>,
+    pub area: Option<Region>,
 }
 
 impl Slice {
-    /// The receptions of the slice, in the batch's order.
-    pub fn observations(&self) -> impl Iterator<Item = &ObsRef> + '_ {
+    /// The receptions of the slice, with their indices, in the batch's order.
+    pub fn observations(&self) -> impl Iterator<Item = (u32, &ObsRef)> + '_ {
         let all = self.decoded.observations();
-        self.ranges
-            .iter()
-            .flat_map(move |range| &all[range.start as usize..range.end as usize])
+        self.ranges.iter().flat_map(move |range| {
+            range
+                .clone()
+                .map(move |index| (index, &all[index as usize]))
+        })
+    }
+
+    fn stamp(&self) -> Stamp {
+        Stamp {
+            stamp_ms: self.decoded.stamp_ms(),
+            ingest_seq: self.decoded.ingest_seq(),
+        }
     }
 }
 
-/// What travels down a (producer, shard) queue.
+/// What travels down a thread's queue.
 #[derive(Clone, Debug)]
 pub enum Envelope {
     Slice(Slice),
@@ -91,107 +115,450 @@ pub enum Envelope {
     Tick(Stamp),
 }
 
-/// Splits a batch into one slice per shard its receptions key into, by `shard_of` each reception,
-/// shards ascending. A batch keyed as a whole (by receiver) is one slice: `whole`.
-pub fn split(
-    decoded: &Arc<Decoded>,
-    shard_of: impl Fn(&ObsRef) -> ShardId,
-) -> Vec<(ShardId, Slice)> {
-    let mut runs: Vec<(ShardId, Range<u32>)> = Vec::new();
+/// Splits a batch into one slice per thread its receptions' message shards run on, threads
+/// ascending, each slice's ranges ascending.
+pub fn split(decoded: &Arc<Decoded>, threads: usize, area: Option<Region>) -> Vec<(usize, Slice)> {
+    let mut runs: Vec<Vec<Range<u32>>> = vec![Vec::new(); threads.max(1)];
     for (index, obs) in decoded.observations().iter().enumerate() {
         let index = index as u32;
-        let shard = shard_of(obs);
-        match runs.last_mut() {
-            Some((last, range)) if *last == shard && range.end == index => range.end += 1,
-            _ => runs.push((shard, index..index + 1)),
+        let ranges = &mut runs[thread_of(message_shard(obs.fp), threads)];
+        match ranges.last_mut() {
+            Some(range) if range.end == index => range.end += 1,
+            _ => ranges.push(index..index + 1),
         }
     }
-    // Stable: each shard's runs stay ascending.
-    runs.sort_by_key(|(shard, _)| *shard);
-    let mut slices: Vec<(ShardId, Slice)> = Vec::new();
-    let mut at = 0;
-    while at < runs.len() {
-        let shard = runs[at].0;
-        let end = runs[at..]
-            .iter()
-            .position(|(other, _)| *other != shard)
-            .map_or(runs.len(), |offset| at + offset);
-        let ranges = runs[at..end]
-            .iter()
-            .map(|(_, range)| range.clone())
-            .collect();
-        slices.push((
-            shard,
-            Slice {
-                decoded: Arc::clone(decoded),
-                ranges,
-            },
-        ));
-        at = end;
-    }
-    slices
-}
-
-/// The whole batch as one slice, for an exchange keyed per batch (`Exchange::Raw`).
-pub fn whole(decoded: &Arc<Decoded>) -> (ShardId, Slice) {
-    let count = decoded.observations().len() as u32;
-    (
-        raw_shard(&decoded.receiver()),
-        Slice {
-            decoded: Arc::clone(decoded),
-            ranges: std::iter::once(0..count).collect(),
-        },
-    )
+    runs.into_iter()
+        .enumerate()
+        .filter(|(_, ranges)| !ranges.is_empty())
+        .map(|(thread, ranges)| {
+            (
+                thread,
+                Slice {
+                    decoded: Arc::clone(decoded),
+                    ranges: ranges.into_boxed_slice(),
+                    area,
+                },
+            )
+        })
+        .collect()
 }
 
 /// A shard's view of its producers' progress: the newest tick from each, and the least of them,
 /// before which nothing more will arrive.
 #[derive(Clone, Debug)]
 pub struct Watermark {
-    ticks: Box<[Stamp]>,
+    ticks: Box<[Option<Stamp>]>,
 }
 
 impl Watermark {
     pub fn new(producers: usize) -> Self {
         Self {
-            ticks: vec![Stamp::default(); producers].into_boxed_slice(),
+            ticks: vec![None; producers.max(1)].into_boxed_slice(),
         }
     }
 
     /// Producer `producer` ticked at `stamp`; the watermark after it. A tick never goes back.
     pub fn tick(&mut self, producer: usize, stamp: Stamp) -> Stamp {
         if let Some(tick) = self.ticks.get_mut(producer) {
-            *tick = (*tick).max(stamp);
+            *tick = Some(tick.map_or(stamp, |tick| tick.max(stamp)));
         }
         self.at()
     }
 
-    /// The least producer tick: every slice stamped before it has arrived.
+    /// Whether every producer has ticked.
+    pub fn complete(&self) -> bool {
+        self.ticks.iter().all(Option::is_some)
+    }
+
+    /// The least producer tick: every slice stamped before it has arrived. Zero until every
+    /// producer has ticked.
     pub fn at(&self) -> Stamp {
-        self.ticks.iter().copied().min().unwrap_or_default()
+        self.ticks
+            .iter()
+            .map(|tick| tick.unwrap_or_default())
+            .min()
+            .unwrap_or_default()
     }
 }
 
-/// What owns one shard's state: takes its slices and its watermark, on its own thread.
-pub trait Shard: Send {
-    fn take(&mut self, slice: &Slice);
-    /// The watermark advanced to `watermark`: what closes by it closes now (`seal`).
-    fn advance(&mut self, watermark: Stamp);
+/// Hashes a fingerprint by its high half: the fingerprint is already a keyed pseudorandom value
+/// (`tally_wire::decoded`), and its low bits choose the shard, so hashing it again buys nothing.
+#[derive(Clone, Copy, Default)]
+pub struct ByFingerprint;
+
+/// The hasher of [`ByFingerprint`].
+#[derive(Default)]
+pub struct FingerprintHasher(u64);
+
+impl Hasher for FingerprintHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        // Only `write_u128` is ever called; anything else is folded in, never ignored.
+        for byte in bytes {
+            self.0 = self.0.rotate_left(8) ^ u64::from(*byte);
+        }
+    }
+
+    fn write_u128(&mut self, value: u128) {
+        self.0 = (value >> 64) as u64;
+    }
 }
 
-/// Routes a batch to the shards of one exchange.
-pub trait Router: Send + Sync {
-    fn route(&self, exchange: Exchange, decoded: &Arc<Decoded>);
-    fn tick(&self, stamp: Stamp);
+impl BuildHasher for ByFingerprint {
+    type Hasher = FingerprintHasher;
+
+    fn build_hasher(&self) -> FingerprintHasher {
+        FingerprintHasher::default()
+    }
 }
 
-/// Today's path: the hub hands each consumer the whole batch itself, so this routes nothing.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct Inline;
+/// What one generation recorded of a message: whether it was kept for the hub's stream, and the
+/// areas it was kept for, almost always none or one. The two are separate windows: a message kept
+/// in an area does not count as kept for the stream, and the other way round, so a message heard in
+/// one area after another keeps its place in the stream's window and not the areas'.
+#[derive(Clone, Debug, Default)]
+struct Areas {
+    stream: bool,
+    first: Option<Region>,
+    more: Vec<Region>,
+}
 
-impl Router for Inline {
-    fn route(&self, _exchange: Exchange, _decoded: &Arc<Decoded>) {}
-    fn tick(&self, _stamp: Stamp) {}
+impl Areas {
+    fn holds(&self, area: Region) -> bool {
+        self.first == Some(area) || self.more.contains(&area)
+    }
+
+    fn add(&mut self, area: Region) {
+        if self.holds(area) {
+            return;
+        }
+        if self.first.is_none() {
+            self.first = Some(area);
+        } else {
+            self.more.push(area);
+        }
+    }
+}
+
+type Heard = HashMap<u128, Areas, ByFingerprint>;
+
+/// One message shard: the messages kept in the epoch being closed and the one before it (two
+/// generations, swapped per epoch, so forgetting costs nothing per message). A message is new to
+/// the stream when neither generation kept it for the stream, and new to an area when neither kept
+/// it for that area: each is remembered for one to two epochs, apart.
+#[derive(Default)]
+pub struct MessageShard {
+    previous: Heard,
+    current: Heard,
+}
+
+/// What a message shard decided of one reception.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Decision {
+    /// First heard by the relay this window: in the hub's deduplicated stream.
+    pub stream: bool,
+    /// First heard in its area this window: in that area's regional product.
+    pub regional: bool,
+}
+
+impl MessageShard {
+    /// Decides one reception of message `fp` by a receiver in `area`, and remembers it.
+    pub fn decide(&mut self, fp: u128, area: Option<Region>) -> Decision {
+        let before = self.previous.get(&fp);
+        let now = self.current.get(&fp);
+        let stream =
+            !before.is_some_and(|heard| heard.stream) && !now.is_some_and(|heard| heard.stream);
+        let regional = area.is_some_and(|area| {
+            !before.is_some_and(|heard| heard.holds(area))
+                && !now.is_some_and(|heard| heard.holds(area))
+        });
+        if stream || regional {
+            let heard = self.current.entry(fp).or_default();
+            heard.stream |= stream;
+            if let Some(area) = area.filter(|_| regional) {
+                heard.add(area);
+            }
+        }
+        Decision { stream, regional }
+    }
+
+    /// The next epoch begins: what the last one heard becomes the previous generation.
+    pub fn swap(&mut self) {
+        self.previous = std::mem::take(&mut self.current);
+        self.previous.shrink_to_fit();
+    }
+
+    /// An epoch begins two or more after the last: nothing heard is remembered.
+    pub fn clear(&mut self) {
+        self.previous = Heard::default();
+        self.current = Heard::default();
+    }
+
+    /// Fingerprints held.
+    pub fn len(&self) -> usize {
+        self.previous.len() + self.current.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// What one message thread hands the sealer: an epoch it closed that held receptions (the
+/// batches they came from, and which are new to the stream and to an area, each as (batch,
+/// observation) indices, in canonical order), or only how far it has closed. A thread sends nothing
+/// for an epoch it held nothing of, so a watermark that jumps costs nothing; its messages are
+/// numbered (`seq`) so the sealer knows when one was lost (`seal::Coordinator`).
+#[derive(Debug, Default)]
+pub struct Frozen {
+    pub thread: usize,
+    /// This thread's count of messages before this one.
+    pub seq: u64,
+    /// The epoch closed, when it held receptions.
+    pub epoch: Option<Epoch>,
+    /// Every epoch before this is closed on this thread.
+    pub closed_before: Epoch,
+    pub batches: Vec<Arc<Decoded>>,
+    pub stream: Vec<(u32, u32)>,
+    pub regional: Vec<(Region, u32, u32)>,
+}
+
+/// Where closed epochs go: the sealer (`seal::Coordinator`). False when it could not take one,
+/// which it then refuses whole.
+pub type Sink = Arc<dyn Fn(Frozen) -> bool + Send + Sync>;
+
+/// The state one message thread owns: its logical shards, its watermark, its open epochs.
+pub struct MessageThread {
+    thread: usize,
+    threads: usize,
+    /// Its shards, `thread`, `thread + threads`, ... at `shard / threads`.
+    shards: Vec<MessageShard>,
+    watermark: Watermark,
+    closer: Closer,
+    open: BTreeMap<Epoch, Vec<Slice>>,
+    /// The last epoch decided: its shards' generations are its and the one before.
+    decided: Option<Epoch>,
+    /// Messages sent the sealer.
+    sent: u64,
+    /// Every epoch before this is closed.
+    closed_before: Option<Epoch>,
+    sink: Sink,
+}
+
+impl MessageThread {
+    pub fn new(thread: usize, threads: usize, producers: usize, sink: Sink) -> Self {
+        let owned = (thread..SHARDS).step_by(threads.max(1)).count();
+        Self {
+            thread,
+            threads: threads.max(1),
+            shards: (0..owned).map(|_| MessageShard::default()).collect(),
+            watermark: Watermark::new(producers),
+            closer: Closer::default(),
+            open: BTreeMap::new(),
+            decided: None,
+            sent: 0,
+            closed_before: None,
+            sink,
+        }
+    }
+
+    pub fn take(&mut self, producer: usize, envelope: Envelope) {
+        match envelope {
+            Envelope::Slice(slice) => {
+                let epoch = epoch_of(slice.stamp());
+                self.open.entry(epoch).or_default().push(slice);
+            }
+            Envelope::Tick(stamp) => {
+                let watermark = self.watermark.tick(producer, stamp);
+                // Nothing closes until every producer has ticked once: before that the least
+                // tick is no watermark.
+                if !self.watermark.complete() {
+                    return;
+                }
+                let oldest = self.open.keys().next().copied();
+                let closing = self.closer.advance(watermark, oldest);
+                // Only the epochs that held something are decided; the rest close by count.
+                let held: Vec<Epoch> = self.open.range(..closing.end).map(|(e, _)| *e).collect();
+                for epoch in held {
+                    self.close(epoch, closing.end);
+                }
+                if self.closed_before.is_none_or(|before| closing.end > before) {
+                    self.closed_before = Some(closing.end);
+                    let marker = Frozen {
+                        thread: self.thread,
+                        closed_before: closing.end,
+                        ..Frozen::default()
+                    };
+                    self.send(marker);
+                }
+            }
+        }
+    }
+
+    /// Decides epoch `epoch`'s receptions in canonical order and hands them to the sealer.
+    fn close(&mut self, epoch: Epoch, closed_before: Epoch) {
+        let mut slices = self.open.remove(&epoch).unwrap_or_default();
+        // Anything older still open came after its epoch closed: impossible while producers keep
+        // their ticks, and kept out of any later epoch if it ever happened.
+        while let Some(entry) = self.open.first_entry() {
+            if *entry.key() > epoch {
+                break;
+            }
+            slices.extend(entry.remove());
+        }
+        slices.sort_by_key(Slice::stamp);
+        // The generations follow the epochs: the one before is remembered, older ones are not.
+        match self.decided {
+            Some(last) if epoch == last + 1 => self.shards.iter_mut().for_each(MessageShard::swap),
+            Some(last) if epoch > last + 1 => self.shards.iter_mut().for_each(MessageShard::clear),
+            _ => {}
+        }
+        self.decided = Some(epoch);
+        let mut frozen = Frozen {
+            thread: self.thread,
+            epoch: Some(epoch),
+            closed_before: (epoch + 1).min(closed_before),
+            batches: Vec::with_capacity(slices.len()),
+            ..Frozen::default()
+        };
+        for (at, slice) in slices.iter().enumerate() {
+            let at = at as u32;
+            for (index, obs) in slice.observations() {
+                let shard = usize::from(message_shard(obs.fp).0) / self.threads;
+                let decision = self.shards[shard].decide(obs.fp, slice.area);
+                if decision.stream {
+                    frozen.stream.push((at, index));
+                }
+                if decision.regional
+                    && let Some(area) = slice.area
+                {
+                    frozen.regional.push((area, at, index));
+                }
+            }
+        }
+        frozen.batches = slices.into_iter().map(|slice| slice.decoded).collect();
+        self.send(frozen);
+    }
+
+    fn send(&mut self, mut frozen: Frozen) {
+        frozen.seq = self.sent;
+        self.sent += 1;
+        (self.sink)(frozen);
+    }
+
+    /// Fingerprints held across its shards.
+    pub fn held(&self) -> usize {
+        self.shards.iter().map(MessageShard::len).sum()
+    }
+}
+
+/// The message exchange: its threads, or for a test one state run by the caller.
+pub enum MessageExchange {
+    /// Run by whoever sends, under one lock: one producer, every shard.
+    Inline(Mutex<MessageThread>),
+    Threads {
+        senders: Vec<SyncSender<(usize, Envelope)>>,
+        handles: Vec<JoinHandle<()>>,
+    },
+}
+
+impl MessageExchange {
+    pub fn inline(sink: Sink) -> Self {
+        Self::Inline(Mutex::new(MessageThread::new(0, 1, 1, sink)))
+    }
+
+    /// `threads` threads, fed by `producers` producers, each queue bounded per producer.
+    pub fn threads(threads: usize, producers: usize, sink: &Sink) -> Self {
+        let threads = threads.max(1);
+        let mut senders = Vec::with_capacity(threads);
+        let mut handles = Vec::with_capacity(threads);
+        for thread in 0..threads {
+            let (sender, receiver) = sync_channel(QUEUE_SLICES * producers.max(1));
+            let state = MessageThread::new(thread, threads, producers, Arc::clone(sink));
+            let handle = std::thread::Builder::new()
+                .name(format!("tally-message-{thread}"))
+                .spawn(move || run(state, &receiver));
+            match handle {
+                Ok(handle) => {
+                    senders.push(sender);
+                    handles.push(handle);
+                }
+                Err(error) => {
+                    eprintln!("tally-relay: message thread {thread}: {error}");
+                    break;
+                }
+            }
+        }
+        Self::Threads { senders, handles }
+    }
+
+    /// Threads the shards run on.
+    pub fn width(&self) -> usize {
+        match self {
+            Self::Inline(_) => 1,
+            Self::Threads { senders, .. } => senders.len().max(1),
+        }
+    }
+
+    /// Routes a batch's receptions to their shards' threads, waiting while a thread's queue is
+    /// full.
+    pub fn route(&self, producer: usize, decoded: &Arc<Decoded>, area: Option<Region>) {
+        for (thread, slice) in split(decoded, self.width(), area) {
+            self.send(producer, thread, Envelope::Slice(slice));
+        }
+    }
+
+    /// Producer `producer` will send nothing stamped before `stamp`.
+    pub fn tick(&self, producer: usize, stamp: Stamp) {
+        for thread in 0..self.width() {
+            self.send(producer, thread, Envelope::Tick(stamp));
+        }
+    }
+
+    fn send(&self, producer: usize, thread: usize, envelope: Envelope) {
+        match self {
+            Self::Inline(state) => {
+                if let Ok(mut state) = state.lock() {
+                    state.take(0, envelope);
+                }
+            }
+            Self::Threads { senders, .. } => {
+                if let Some(sender) = senders.get(thread) {
+                    // Blocks while the thread is behind: back-pressure, by design.
+                    let _ = sender.send((producer, envelope));
+                }
+            }
+        }
+    }
+}
+
+impl Drop for MessageExchange {
+    fn drop(&mut self) {
+        if let Self::Threads { senders, handles } = self {
+            senders.clear();
+            for handle in handles.drain(..) {
+                let _ = handle.join();
+            }
+        }
+    }
+}
+
+fn run(mut state: MessageThread, receiver: &Receiver<(usize, Envelope)>) {
+    while let Ok((producer, envelope)) = receiver.recv() {
+        state.take(producer, envelope);
+    }
+}
+
+/// Sends `frozen` to a bounded queue without waiting: a sealer that is behind refuses the epoch
+/// whole rather than slow the shards (RFC-0177 §10).
+pub fn offer(sender: &SyncSender<Frozen>, frozen: Frozen) -> bool {
+    match sender.try_send(frozen) {
+        Ok(()) => true,
+        Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => false,
+    }
 }
 
 #[cfg(test)]
@@ -199,7 +566,7 @@ mod tests {
     use super::*;
     use tally_wire::{Batch, BatchContent, Identity, Observation};
 
-    fn decoded(count: u8) -> Result<Arc<Decoded>, String> {
+    fn decoded(count: u8, stamp_ms: u64, ingest_seq: u64) -> Result<Arc<Decoded>, String> {
         let identity = Identity::generate().map_err(|error| error.to_string())?;
         let content = BatchContent {
             boot_id: 1,
@@ -218,18 +585,19 @@ mod tests {
                 .collect(),
         };
         let batch = Batch::sign(&identity, &content).map_err(|error| error.to_string())?;
-        Decoded::from_verified(batch, 0, 0).map_err(|undecodable| undecodable.error.to_string())
+        Decoded::from_verified(batch, stamp_ms, ingest_seq)
+            .map_err(|undecodable| undecodable.error.to_string())
     }
 
     #[test]
-    fn a_batch_splits_into_each_shards_receptions_once_in_order() -> Result<(), String> {
-        let decoded = decoded(200)?;
-        let slices = split(&decoded, |obs| message_shard(obs.fp));
+    fn a_batch_splits_into_each_threads_receptions_once_in_order() -> Result<(), String> {
+        let decoded = decoded(200, 0, 0)?;
+        let slices = split(&decoded, 7, None);
         let mut seen: Vec<u64> = Vec::new();
-        for (shard, slice) in &slices {
+        for (thread, slice) in &slices {
             let mut previous = None;
-            for obs in slice.observations() {
-                assert_eq!(message_shard(obs.fp), *shard);
+            for (_, obs) in slice.observations() {
+                assert_eq!(thread_of(message_shard(obs.fp), 7), *thread);
                 assert!(previous.is_none_or(|previous| previous < obs.timestamp));
                 previous = Some(obs.timestamp);
                 seen.push(obs.timestamp);
@@ -252,5 +620,66 @@ mod tests {
         assert_eq!(watermark.tick(1, at(5)), at(5));
         assert_eq!(watermark.tick(1, at(3)), at(5));
         assert_eq!(watermark.tick(1, at(20)), at(10));
+    }
+
+    #[test]
+    fn a_message_is_new_once_a_window_and_once_per_area() -> Result<(), String> {
+        let area = |lat_e7| {
+            Region::containing(
+                &tally_wire::Location {
+                    lat_e7,
+                    lon_e7: -843_880_000,
+                    alt_m: 0,
+                    precision_m: 0,
+                },
+                4,
+            )
+            .map_err(|error| error.to_string())
+        };
+        let (a, b) = (area(337_490_000)?, area(407_490_000)?);
+        let mut shard = MessageShard::default();
+        let new = |stream, regional| Decision { stream, regional };
+        assert_eq!(shard.decide(7, Some(a)), new(true, true));
+        assert_eq!(shard.decide(7, Some(a)), new(false, false));
+        assert_eq!(shard.decide(7, Some(b)), new(false, true));
+        assert_eq!(shard.decide(7, None), new(false, false));
+        shard.swap();
+        // Remembered one more epoch, then forgotten.
+        assert_eq!(shard.decide(7, Some(a)), new(false, false));
+        shard.swap();
+        shard.swap();
+        assert_eq!(shard.decide(7, Some(a)), new(true, true));
+        Ok(())
+    }
+
+    /// The stream's window and the areas' are apart: a message heard in one area after another,
+    /// epoch after epoch, is kept for the stream every other epoch, as one heard in one area is.
+    /// Before they were apart, each new area renewed the message in the stream's window too, and a
+    /// message heard across areas reached the stream once and never again.
+    #[test]
+    fn an_area_kept_does_not_renew_the_streams_window() -> Result<(), String> {
+        let area = |lat_e7| {
+            Region::containing(
+                &tally_wire::Location {
+                    lat_e7,
+                    lon_e7: -843_880_000,
+                    alt_m: 0,
+                    precision_m: 0,
+                },
+                4,
+            )
+            .map_err(|error| error.to_string())
+        };
+        let areas = [area(337_490_000)?, area(407_490_000)?, area(457_490_000)?];
+        let mut shard = MessageShard::default();
+        let mut kept = 0;
+        for epoch in 0..12usize {
+            // Heard every epoch, in an area the last epoch did not hear it in.
+            let decision = shard.decide(7, Some(areas[epoch % areas.len()]));
+            kept += usize::from(decision.stream);
+            shard.swap();
+        }
+        assert_eq!(kept, 6);
+        Ok(())
     }
 }

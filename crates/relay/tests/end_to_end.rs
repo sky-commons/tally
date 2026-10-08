@@ -292,9 +292,15 @@ async fn a_batch_arriving_twice_is_forwarded_once() -> Result {
 
 #[tokio::test]
 async fn a_stalled_subscriber_is_dropped_and_the_others_keep_every_batch() -> Result {
-    // A small fan-out slack, so a subscriber that stops reading falls behind quickly, and an
-    // ingest ceiling far above the flood this feeder sends to make that happen.
-    let relay = relay(Hub::with_capacity(8, 16).max_feeder_bytes_per_sec(1 << 30)).await?;
+    // A small subscriber queue (a megabyte, some dozen of these batches), so a subscriber that
+    // stops reading falls behind quickly, and an ingest ceiling far above the flood this feeder
+    // sends to make that happen.
+    let relay = relay(
+        Hub::new(8)
+            .queue_bytes(1 << 20)
+            .max_feeder_bytes_per_sec(1 << 30),
+    )
+    .await?;
     let mut fast = subscribe(&relay).await?;
     let stalled = subscribe(&relay).await?;
     let receiver = Identity::generate().map_err(text)?;
@@ -699,6 +705,12 @@ impl MlatHost for Scripted {
     fn set_areas(&self, _: Vec<Region>, _: Vec<ReceiverInfo>) {}
 
     fn offer(&self, _: &Record, _: u64) {}
+
+    fn offer_batch(&self, _: &Arc<tally_wire::Decoded>, _: u64) {}
+
+    fn sealed_bins(&self) -> Option<tally_mlat_solver::held::SealedBins> {
+        None
+    }
 
     fn take_published(&self, _: u64) -> Vec<Record> {
         self.ready
@@ -1339,6 +1351,53 @@ async fn a_feeder_is_told_its_rate_limit_and_the_relays_hints_first() -> Result 
     Ok(())
 }
 
+/// Capacity is admission (RFC-0177 §9): a relay whose memory holds one feeder's share of every
+/// store takes the first feeder and turns the second away at its Hello, pointed at the relays it
+/// knows, before anything it sent is taken in; the first is served on, and leaving frees its slot.
+#[tokio::test]
+async fn a_feeder_beyond_the_memory_budget_is_refused_at_its_hello() -> Result {
+    let hint = RelayAddress {
+        key: Identity::generate().map_err(text)?.public(),
+        address: "other.example:10900".to_owned(),
+    };
+    let one = tally_relay::budget::PerFeeder::planned(false).total();
+    let hub = Hub::new(8)
+        .advertising(vec![hint.clone()])
+        .memory(tally_relay::budget::BASE_BYTES + one + one / 2, false);
+    assert_eq!(hub.budget().ceiling(), 1);
+    let relay = relay(hub).await?;
+    let mut first = connect(&relay, &Identity::generate().map_err(text)?, Role::Feeder).await?;
+    let mut greeting = Vec::new();
+    first.reader.recv(&mut greeting).await.map_err(text)?;
+    assert!(matches!(greeting.first(), Some(Record::RateLimit { .. })));
+    let mut second = connect(&relay, &Identity::generate().map_err(text)?, Role::Feeder).await?;
+    let mut refused = Vec::new();
+    second.reader.recv(&mut refused).await.map_err(text)?;
+    assert_eq!(
+        refused.first(),
+        Some(&Record::Redirect {
+            retry_after_secs: 600,
+            hints: vec![hint],
+        })
+    );
+    // The first leaves; its slot is free for the next.
+    drop(first);
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let mut third = connect(&relay, &Identity::generate().map_err(text)?, Role::Feeder).await?;
+        let mut answer = Vec::new();
+        third.reader.recv(&mut answer).await.map_err(text)?;
+        if matches!(answer.first(), Some(Record::RateLimit { .. })) {
+            break;
+        }
+        if std::time::Instant::now() > deadline {
+            return Err("the first feeder's slot was never freed".to_owned());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    Ok(())
+}
+
 /// Two engines' clock models of the same inputs that differ: a fault anyone proves with the two
 /// manifests, which the relay checks and forwards; two that agree prove nothing.
 #[tokio::test]
@@ -1422,11 +1481,29 @@ async fn a_probe_and_a_delivery_query_are_answered_signed_by_the_relay() -> Resu
     assert_eq!(reply.signer().map_err(text)?, relay.key);
     assert_eq!(reply.content().map_err(text)?.nonce, 7);
 
+    // The query carries the feeder's signed grant of tag keys to this relay, as every one does.
+    let keys = tally_wire::TagKeys::sign(
+        &feeder,
+        &tally_wire::TagKeysContent {
+            member: relay.key,
+            current: tally_wire::TagKey {
+                id: 1,
+                key: [1; 32],
+            },
+            next: tally_wire::TagKey {
+                id: 2,
+                key: [2; 32],
+            },
+            switch_in_ms: 1_000,
+        },
+    )
+    .map_err(text)?;
     let query = tally_wire::DeliveryQuery {
         nonce: [3; 32],
         receiver: feeder.public(),
         boot_id: 1,
         ranges: vec![tally_wire::SequenceRange { first: 0, last: 3 }],
+        keys: Some(keys),
     };
     session
         .writer

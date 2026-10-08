@@ -47,9 +47,23 @@ rust_test(
     rustc_flags = SOLVER_RUSTC_FLAGS,
 )
 
+# The holder's byte accounting against an allocator that counts every byte (RFC-0177 §5): a binary
+# of its own, since a counting allocator is global and nothing else may allocate while it measures.
+rust_test(
+    name = "held_bytes",
+    size = "small",
+    srcs = ["tests/held_bytes.rs"],
+    crate_root = "tests/held_bytes.rs",
+    edition = "2024",
+    lint_config = ":cargo_lints",
+    rustc_flags = SOLVER_RUSTC_FLAGS,
+    deps = [":mlat-solver"],
+)
+
 rustfmt_test(
     name = "rustfmt",
     targets = [
+        ":held_bytes",
         ":mlat-solver",
         ":mlat-solver_test",
     ],

@@ -5,6 +5,7 @@
 //! held in the relay's fan-out.
 
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash as _, Hasher as _};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex};
@@ -67,9 +68,43 @@ counts!(
     undecodable,
 );
 
+/// Each distinct message (by its format and bytes) the client read this window, in the raw stream
+/// and in the deduplicated one: every message heard raw is in the deduplicated stream at least once
+/// a few seconds when the relay loses nothing (its rule keeps a message at least every other
+/// second), so one heard raw and never deduplicated is a message the relay lost.
+#[derive(Default)]
+pub struct Heard {
+    /// Bumped when a window begins: a decoder's own messages of an older window are let go.
+    pub window: AtomicU64,
+    pub raw: Mutex<HashSet<u64>>,
+    pub dedup: Mutex<HashSet<u64>>,
+}
+
+impl Heard {
+    /// (Messages heard raw this window, of them never in the deduplicated stream.)
+    pub fn coverage(&self) -> (usize, usize) {
+        let (Ok(raw), Ok(dedup)) = (self.raw.lock(), self.dedup.lock()) else {
+            return (0, 0);
+        };
+        (raw.len(), raw.difference(&dedup).count())
+    }
+}
+
+/// A message's identity for `Heard`: its format and bytes, hashed.
+fn message_id(format: u8, data: &[u8]) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    format.hash(&mut hasher);
+    data.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// How many batches a decoder reads before it hands its messages to `Heard`.
+const HEARD_EVERY: usize = 256;
+
 /// What the client measured.
 #[derive(Default)]
 pub struct Client {
+    pub heard: Heard,
     pub counts: Counts,
     pub raw_latency: Mutex<Histogram>,
     pub dedup_latency: Mutex<Histogram>,
@@ -91,6 +126,13 @@ impl Client {
         }
         if let Ok(mut receivers) = self.receivers.lock() {
             receivers.clear();
+        }
+        self.heard.window.fetch_add(1, Ordering::SeqCst);
+        if let Ok(mut raw) = self.heard.raw.lock() {
+            raw.clear();
+        }
+        if let Ok(mut dedup) = self.heard.dedup.lock() {
+            dedup.clear();
         }
     }
 
@@ -274,7 +316,39 @@ async fn session(
 
 fn decode(work: &std::sync::mpsc::Receiver<Work>, verify: bool, client: &Client) {
     let counts = &client.counts;
-    while let Ok(work) = work.recv() {
+    let (mut raw_heard, mut dedup_heard) = (HashSet::new(), HashSet::new());
+    let mut window = client.heard.window.load(Ordering::SeqCst);
+    let mut since = 0;
+    let hand_over =
+        |raw_heard: &mut HashSet<u64>, dedup_heard: &mut HashSet<u64>, window: &mut u64| {
+            let now = client.heard.window.load(Ordering::SeqCst);
+            if now == *window {
+                if let Ok(mut raw) = client.heard.raw.lock() {
+                    raw.extend(raw_heard.drain());
+                }
+                if let Ok(mut dedup) = client.heard.dedup.lock() {
+                    dedup.extend(dedup_heard.drain());
+                }
+            }
+            raw_heard.clear();
+            dedup_heard.clear();
+            *window = now;
+        };
+    loop {
+        let work = match work.recv_timeout(Duration::from_millis(500)) {
+            Ok(work) => work,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                hand_over(&mut raw_heard, &mut dedup_heard, &mut window);
+                since = 0;
+                continue;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        };
+        since += 1;
+        if since >= HEARD_EVERY {
+            hand_over(&mut raw_heard, &mut dedup_heard, &mut window);
+            since = 0;
+        }
         let (batch, received, raw) = match work {
             Work::Raw(batch, received) => (batch, received, true),
             Work::Dedup(batch, received) => (batch, received, false),
@@ -294,6 +368,14 @@ fn decode(work: &std::sync::mpsc::Receiver<Work>, verify: bool, client: &Client)
             continue;
         };
         let receptions = content.observations.len() as u64;
+        let heard = if raw {
+            &mut raw_heard
+        } else {
+            &mut dedup_heard
+        };
+        for observation in &content.observations {
+            heard.insert(message_id(observation.format, &observation.data));
+        }
         let latency = received.saturating_sub(content.wall_ms);
         if raw {
             counts

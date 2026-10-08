@@ -38,6 +38,15 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 use tokio::time::timeout;
 
+/// Each relay's stages on threads of their own, as a relay runs them (`Hub::staged`): its seals
+/// never hold up its connections, and its MLAT raw is taken into its raw shards by its ingest
+/// workers, never on its engine's thread. Two threads a stage, so the shards are split between
+/// workers as they are on a relay.
+const RELAY_THREADS: tally_relay::ingest::Threads = tally_relay::ingest::Threads {
+    ingest: 2,
+    message: 2,
+};
+
 type Result<T = ()> = std::result::Result<T, String>;
 
 fn text(error: impl std::fmt::Display) -> String {
@@ -61,6 +70,14 @@ impl MlatHost for Pinned {
 
     fn offer(&self, record: &Record, now_ms: u64) {
         self.host.offer(record, now_ms);
+    }
+
+    fn offer_batch(&self, batch: &std::sync::Arc<tally_wire::Decoded>, now_ms: u64) {
+        self.host.offer_batch(batch, now_ms);
+    }
+
+    fn sealed_bins(&self) -> Option<tally_mlat_solver::held::SealedBins> {
+        self.host.sealed_bins()
     }
 
     fn take_published(&self, now_ms: u64) -> Vec<Record> {
@@ -144,7 +161,8 @@ async fn relay(
     let hub = Arc::new(
         Hub::new(8)
             .accepting_relays(relays.iter().copied())
-            .max_connections_per_address(64),
+            .max_connections_per_address(64)
+            .staged(RELAY_THREADS),
     );
     if let Some(mlat) = mlat {
         hub.network().host_mlat(mlat);
@@ -172,6 +190,7 @@ fn pinned(identity: &Identity) -> Result<Arc<Pinned>> {
             regions: Vec::new(),
             settle_ms: SETTLE_MS,
             threads: 4,
+            capacity: tally_mlat::engine::Capacity::default(),
         },
     );
     // Solving from the first offer on: the relay's own network task re-states it every tick.
@@ -582,7 +601,8 @@ async fn offering(
         Hub::new(64)
             .advertising(vec![address.clone()])
             .accepting_relays(relays.iter().copied())
-            .max_connections_per_address(256),
+            .max_connections_per_address(256)
+            .staged(RELAY_THREADS),
     );
     let network = hub.network();
     network.selection.set_taken(areas.to_vec());
@@ -613,6 +633,14 @@ impl MlatHost for Gated {
 
     fn offer(&self, record: &Record, now_ms: u64) {
         self.host.offer(record, now_ms);
+    }
+
+    fn offer_batch(&self, batch: &std::sync::Arc<tally_wire::Decoded>, now_ms: u64) {
+        self.host.offer_batch(batch, now_ms);
+    }
+
+    fn sealed_bins(&self) -> Option<tally_mlat_solver::held::SealedBins> {
+        self.host.sealed_bins()
     }
 
     fn take_published(&self, now_ms: u64) -> Vec<Record> {
@@ -661,7 +689,8 @@ async fn member(
         Hub::new(64)
             .advertising(vec![address.clone()])
             .accepting_relays(relays.iter().copied())
-            .max_connections_per_address(256),
+            .max_connections_per_address(256)
+            .staged(RELAY_THREADS),
     );
     let network = hub.network();
     network.selection.set_taken(areas.to_vec());
@@ -677,6 +706,7 @@ async fn member(
                 regions: Vec::new(),
                 settle_ms: SETTLE_MS,
                 threads: 2,
+                capacity: tally_mlat::engine::Capacity::default(),
             },
         ),
         open: AtomicBool::new(false),
@@ -913,12 +943,15 @@ async fn three_relays_share_solve_and_serve_verifiable_positions_and_both_world_
             }
         }
     });
-    let (received, mut records) = tokio::sync::mpsc::unbounded_channel::<Record>();
+    // Each record with when it reached the client: the checks below take their time (a model is
+    // verified against the raw), and a record waiting behind them has already arrived.
+    let (received, mut records) = tokio::sync::mpsc::unbounded_channel::<(u64, Record)>();
     tokio::spawn(async move {
         let mut got = Vec::new();
         while reader.recv(&mut got).await.is_ok() {
+            let arrived = wall_ms();
             for record in got.drain(..) {
-                if received.send(record).is_err() {
+                if received.send((arrived, record)).is_err() {
                     return;
                 }
             }
@@ -1024,7 +1057,7 @@ async fn three_relays_share_solve_and_serve_verifiable_positions_and_both_world_
     let mut waiting: Vec<Positions> = Vec::new();
     let outcome = timeout(Duration::from_secs(240), async {
         while !heard.done() {
-            let record = records
+            let (arrived, record) = records
                 .recv()
                 .await
                 .ok_or("the relay closed the client's session")?;
@@ -1059,9 +1092,8 @@ async fn three_relays_share_solve_and_serve_verifiable_positions_and_both_world_
                     // The first phase is fed all at once, long after it was heard; only what is
                     // fed as it happens says how fast a provisional comes.
                     if newest >= split_ms + GRID_MS {
-                        heard.provisional_lag_ms = heard
-                            .provisional_lag_ms
-                            .max(wall_ms().saturating_sub(newest));
+                        heard.provisional_lag_ms =
+                            heard.provisional_lag_ms.max(arrived.saturating_sub(newest));
                     }
                     origins.insert(positions.hash(), record.clone());
                     None

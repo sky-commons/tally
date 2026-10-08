@@ -10,8 +10,10 @@
 //! receptions that chose the tile, and the solver specification's version. The mathematics is
 //! `tally_mlat_solver`'s; this crate is the engine around it.
 //!
-//! - `engine`: the state: receivers, the held observations (sealed per bin), the windows solved;
-//!   ingest and eviction by bin.
+//! - `engine`: the state: the sealed bins, the windows solved, provisional solving; eviction by
+//!   bin.
+//! - `intake`: the receivers and their open raw, split by receiver (an engine holds one, a relay
+//!   one per raw shard): who takes part, which batches are used, what each one holds.
 //! - `window`: one step, a pure function of what it is handed, run off the ingesting thread and
 //!   spread over threads: the tiles fitted in parallel, then the targets solved in parallel.
 //! - `provisional`: each target's transmissions solved about a second after they are heard, under
@@ -24,6 +26,7 @@
 
 pub mod area;
 pub mod engine;
+pub mod intake;
 pub mod provisional;
 pub mod replay;
 pub mod window;

@@ -378,8 +378,11 @@ pub(crate) mod tests {
         /// The area's sharing group as this relay passes on to it: the batches it takes go there.
         pub forwards_to: Option<Group>,
         /// As a member of the area's sharing group: a `DeliveryQuery` is answered from what the
-        /// group holds (a proof of each batch it holds, "not seen" of the rest).
+        /// group holds (a tag of each batch it holds, under the key the feeder last gave it, "not
+        /// seen" of the rest).
         pub answers_from: Option<Group>,
+        /// The tag key in force each feeder gave it, from the keys its queries carried.
+        pub keys: std::sync::Mutex<std::collections::HashMap<PublicKey, tally_wire::TagKey>>,
     }
 
     /// What an area's sharing group holds, in a test.
@@ -398,6 +401,7 @@ pub(crate) mod tests {
                 roles: None,
                 forwards_to: None,
                 answers_from: None,
+                keys: std::sync::Mutex::default(),
             }
         }
     }
@@ -471,8 +475,21 @@ pub(crate) mod tests {
                         }
                     }
                     Record::DeliveryQuery(query) => {
+                        if let Some(keys) = &query.keys
+                            && keys.verify().is_ok()
+                            && let Ok(content) = keys.content()
+                            && content.member == key
+                            && let Ok(mut held) = fake.keys.lock()
+                        {
+                            held.insert(query.receiver, content.current);
+                        }
                         if let Some(group) = &fake.answers_from {
-                            out.push(delivery_answer(&fake.identity, query, group)?);
+                            let keyed = fake
+                                .keys
+                                .lock()
+                                .ok()
+                                .and_then(|held| held.get(&query.receiver).copied());
+                            out.push(delivery_answer(&fake.identity, query, group, keyed)?);
                         }
                     }
                     _ => {}
@@ -504,11 +521,13 @@ pub(crate) mod tests {
         }
     }
 
-    /// A member's signed answer to `query` from what `group` holds.
+    /// A member's signed answer to `query` from what `group` holds: a tag under `keyed` of each
+    /// batch held (none, and no word, without a key), "not seen" of the rest.
     fn delivery_answer(
         member: &Identity,
         query: &tally_wire::DeliveryQuery,
         group: &Group,
+        keyed: Option<tally_wire::TagKey>,
     ) -> Result<Record, WireError> {
         let held: Vec<tally_wire::Batch> =
             group.lock().map(|held| held.clone()).unwrap_or_default();
@@ -516,7 +535,7 @@ pub(crate) mod tests {
             .ranges
             .iter()
             .flat_map(|range| range.first..=range.last)
-            .map(|sequence| {
+            .filter_map(|sequence| {
                 let found = held.iter().find(|batch| {
                     batch.sequence() == sequence
                         && batch.boot_id() == query.boot_id
@@ -524,14 +543,15 @@ pub(crate) mod tests {
                             .receiver()
                             .is_ok_and(|receiver| receiver == query.receiver)
                 });
-                let possession = match found {
-                    Some(batch) => tally_wire::Possession::Proved(tally_wire::possession_proof(
-                        &query.nonce,
-                        batch,
-                    )),
-                    None => tally_wire::Possession::NotSeen,
+                let possession = match (found, keyed) {
+                    (Some(batch), Some(key)) => tally_wire::Possession::Proved {
+                        key: key.id,
+                        tag: tally_wire::delivery_tag(&key.key, batch.as_bytes()),
+                    },
+                    (Some(_), None) => return None,
+                    (None, _) => tally_wire::Possession::NotSeen,
                 };
-                (sequence, possession)
+                Some((sequence, possession))
             })
             .collect();
         tally_wire::DeliveryAnswer::sign(

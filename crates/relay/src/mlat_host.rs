@@ -14,11 +14,24 @@
 //!   tiles and no others. A change of areas re-scopes the engine in place (`Engine::set_scope`);
 //!   no area at all drops the engine and every byte of raw it held, and the next area starts a new
 //!   one under a new boot id, so the relay's records never reuse a (key, boot, sequence).
-//! - **Threads.** One thread owns the engine. `offer` never waits: it hands the record to that
-//!   thread through a bounded queue, and a full queue drops the record (counted). Window steps and
-//!   provisional steps run off that thread (`prepare`/`run`/`apply`,
-//!   `provisional`/`apply_provisional`), each on threads of its own, at most one of each at a time,
-//!   spread over `--mlat-threads`.
+//! - **One store of raw, held where it arrives** (RFC-0177 §5). The receivers and their open raw
+//!   are held in raw shards keyed by receiver (`exchange::raw_shard`, one `tally_mlat::intake::Intake`
+//!   each), and a batch is taken into its shard by the ingest worker that decoded it
+//!   ([`MlatHost::offer_batch`]), in parallel, never on the engine's thread, which neither
+//!   verifies, decodes nor holds a batch. At each step the engine's thread takes the bins that are
+//!   complete out of every shard (a move, under each shard's lock in turn), and they are sealed off
+//!   that thread with no lock held (`Bin::seal_from`, byte for byte what one holder of all the raw
+//!   seals); the engine (`Engine::hosted`) solves the sealed bins, shared (`Arc`), and the relay's
+//!   standing reads the same bins ([`MlatHost::sealed_bins`]), so raw later than settling is
+//!   missing for both alike. The handle outlives each engine (emptied when one is dropped). How
+//!   many receivers and how much raw it holds is configuration (`tally_mlat::engine::Capacity`),
+//!   from the receivers the relay admits.
+//! - **Threads.** One thread owns the engine. What a batch says to provisional solving
+//!   (`provisional::notes_of`, read in its shard) reaches that thread through a bounded queue that
+//!   never waits (full: counted), and is weighed there in the order of the batches' stamps, so the
+//!   same stamped trace solves the same provisionals on any number of ingest workers. Seals, window
+//!   steps and provisional steps run off that thread, each on threads of its own, at most one step
+//!   of each kind at a time, spread over `--mlat-threads`.
 //! - **Counted.** Nothing offered or solved is let go silently: every drop is counted by why, and
 //!   every step's report kept ([`MlatReport`], served on `--stats-listen` as `GET /mlat`).
 //! - **Time.** Nothing here reads a clock: an offer carries when it arrived and `take_published`
@@ -30,27 +43,29 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 
-use tally_mlat::engine::{Engine, Ingested, Settings};
+use tally_mlat::engine::{Capacity, Dropped, Engine, Ingested, Settings};
+use tally_mlat::intake::{Intake, Seats};
+use tally_mlat::provisional::Note;
 use tally_mlat::{area, provisional, window};
+use tally_mlat_solver::Site;
+use tally_mlat_solver::held::{Bin, Fragment, Limits, SealedBins};
 use tally_wire::{Decoded, Identity, PublicKey, ReceiverInfo, Record, Region};
 
 use crate::config::Config;
+use crate::exchange::{SHARDS, raw_shard};
 
 /// The MLAT a relay hosts.
 pub trait MlatHost: Send + Sync {
     /// The areas to solve (plus their border band): the receivers it holds are theirs.
     /// `descriptions` are every receiver description the relay holds (`Hub::descriptions`), for
-    /// an engine that starts with these areas: the relay keeps the descriptions, not the host. The
-    /// relay calls this when the areas change.
+    /// a host that has not been offered them. The relay calls this when the areas change.
     fn set_areas(&self, areas: Vec<Region>, descriptions: Vec<ReceiverInfo>);
     /// A receiver's description the relay forwarded, or a batch it has not decoded.
     fn offer(&self, record: &Record, now_ms: u64);
-    /// A receiver's batch the relay forwarded, verified and decoded once by its ingest: the engine
-    /// neither verifies nor decodes it again. A host that cannot take a decode is offered the
-    /// batch itself.
-    fn offer_batch(&self, batch: &Arc<Decoded>, now_ms: u64) {
-        self.offer(&Record::Batch(batch.batch().clone()), now_ms);
-    }
+    /// A receiver's batch the relay forwarded, verified and decoded once by its ingest, on the
+    /// ingest worker that owns the receiver's raw shard, stamped `now_ms`: taken into that shard,
+    /// never verified or decoded again.
+    fn offer_batch(&self, batch: &Arc<Decoded>, now_ms: u64);
     /// What it signed since the last call (clock models and their parts, positions, provisional
     /// positions), in the order to publish.
     fn take_published(&self, now_ms: u64) -> Vec<Record>;
@@ -58,6 +73,9 @@ pub trait MlatHost: Send + Sync {
     fn cores(&self) -> u16;
     /// What it has done and let go, since it started.
     fn report(&self) -> MlatReport;
+    /// The sealed bins of the raw it holds, shared: what the relay's standing reads (one store of
+    /// raw per relay). None when it holds no raw of its own.
+    fn sealed_bins(&self) -> Option<SealedBins>;
 }
 
 /// One window step's report, as served: `tally_mlat::window::Report`, times in milliseconds.
@@ -167,24 +185,29 @@ impl ProvisionalReport {
 /// What a hosted MLAT has done and let go since it started, every drop by why (`GET /mlat`).
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MlatReport {
-    /// Batches the engine took (new, from a receiver taking part).
+    /// Batches taken (new, from a receiver taking part).
     pub ingested: u64,
-    /// Offers dropped because the engine's queue was full.
+    /// What batches said to provisional solving, dropped because the engine's queue was full.
     pub refused: u64,
     /// Signed records dropped because nobody took them in time.
     pub overflowed: u64,
     /// Batches whose (boot, sequence) was already used or too far behind.
     pub replayed: u64,
-    /// Records the engine refused as not signed as they claim.
+    /// Receiver descriptions refused as not signed as they claim.
     pub ingest_errors: u64,
-    /// Receiver descriptions not held for an engine about to start, for room.
-    pub descriptions_dropped: u64,
     /// Batches of undescribed receivers not held, for room, and held too long.
     pub orphans_dropped: u64,
     pub orphans_expired: u64,
-    /// Observations the engine dropped for room (`tally_mlat::engine::MAX_HELD_BYTES`).
-    pub observations_dropped: u64,
-    /// Window and provisional steps whose engine was dropped before they reported: not published.
+    /// Observations of a bin already sealed: later than its settling.
+    pub observations_late: u64,
+    /// Observations refused with their receiver's whole raw of a bin, beyond its share or beyond
+    /// the raw the engine holds (`tally_mlat_solver::held::Limits`).
+    pub observations_refused: u64,
+    /// New receivers refused whole, beyond the receivers the engine holds
+    /// (`tally_mlat::engine::Capacity`).
+    pub receivers_refused: u64,
+    /// Seals, window and provisional steps whose engine was dropped before they reported: not
+    /// published.
     pub steps_discarded: u64,
     /// Window steps applied.
     pub steps: u64,
@@ -198,16 +221,15 @@ pub struct MlatReport {
 pub const STEP_MS: u64 = 1_000;
 /// How long after a bin's canonical window ends it is solved, so the raw of its last bin is in.
 pub const SETTLE_MS: u64 = 2_000;
-/// Records offered and not yet taken by the engine's thread. A world's worth of feeders offer a
-/// few thousand batches a second; this is several seconds of them.
+/// What batches said to provisional solving and not yet weighed by the engine's thread. A world's
+/// worth of feeders offer a few thousand batches a second; this is several seconds of them.
 const OFFERS_WAITING: usize = 1 << 16;
-/// Batches held for a receiver whose description has not come, at most, and receivers, and for how
-/// long: a window's worth (a description later than that is not coming by the same way).
+/// Batches held for a receiver whose description has not come, at most, and receivers (in each raw
+/// shard), and for how long: a window's worth (a description later than that is not coming by the
+/// same way).
 const ORPHANS_PER_RECEIVER: usize = 64;
-const ORPHAN_RECEIVERS: usize = 4_096;
+const ORPHAN_RECEIVERS_PER_SHARD: usize = 4_096 / SHARDS;
 const ORPHAN_MS: u64 = 60_000;
-/// Descriptions held for an engine about to start, at most (the engine's own bound).
-const DESCRIPTIONS_WAITING: usize = 65_536;
 /// Records signed and not yet taken: a few steps of a busy area. Beyond it the oldest are dropped.
 const PUBLISHED_WAITING: usize = 1 << 16;
 
@@ -222,21 +244,44 @@ pub fn host_for(config: &Config, identity: Identity, boot_id: u64) -> Option<Hos
                 regions: Vec::new(),
                 settle_ms: SETTLE_MS,
                 threads: config.mlat_threads,
+                capacity: capacity(config),
             },
         )
     })
 }
 
-/// What the engine's thread is handed by the relay.
+/// What the hosted engine holds: sized for every feeder the relay's memory admits (the admission
+/// budget's ceiling, `budget`, RFC-0177 §9), never fewer than `tally_mlat::engine::MIN_RECEIVERS`.
+pub fn capacity(config: &Config) -> Capacity {
+    let budget =
+        crate::budget::Budget::of_memory(config.memory, crate::budget::PerFeeder::planned(true));
+    Capacity::for_receivers(budget.ceiling())
+}
+
+/// What the engine's thread is handed.
 enum Command {
-    Offer(Record, u64),
-    /// A batch verified and decoded by the relay's ingest.
-    Batch(Arc<Decoded>, u64),
+    /// What one batch said to provisional solving, read in its raw shard: the batch (which
+    /// carries when it arrived, its stamp), the notes, and the shard's engine generation then.
+    Heard(Arc<Decoded>, Vec<Note>, u64),
+    /// A receiver stopped taking part under engine generation `.0`: forgotten in the sealed bins.
+    Left(u64, PublicKey),
+    /// The areas changed (`set_areas` re-scoped every shard first): engine generation, areas.
+    Areas(u64, Vec<Region>),
     Tick(u64),
 }
 
-/// What a step reports to the engine's thread, for the engine of its generation.
+/// What a seal or a step reports to the engine's thread, for the engine of its generation.
 enum Finished {
+    /// The bins complete by `now_ms` (through `settled`), sealed, with the sites taking part and
+    /// what the shards refused.
+    Sealed {
+        generation: u64,
+        now_ms: u64,
+        settled: i64,
+        bins: Vec<Bin>,
+        sites: Vec<Site>,
+        dropped: Dropped,
+    },
     Stepped(u64, window::Outcome),
     Solved(u64, provisional::Outcome),
 }
@@ -244,25 +289,60 @@ enum Finished {
 /// How long the engine's thread waits for the relay before it looks for finished steps.
 const POLL: std::time::Duration = std::time::Duration::from_millis(20);
 
+/// One raw shard of the hosted MLAT: the intake of the receivers whose raw shard it is, and their
+/// batches waiting for a description.
+struct Shard {
+    intake: Intake,
+    /// The engine generation its intake holds raw for, and whether one runs.
+    generation: u64,
+    active: bool,
+    /// Batches of receivers not described yet, by receiver, oldest first, with when each came:
+    /// taken when the description comes. A batch can reach a relay before its receiver's
+    /// description (a repair, a rebuild from parity, a link that died between them), and the hub
+    /// forwards each batch once, so a batch turned away would be lost to MLAT.
+    orphans: BTreeMap<PublicKey, VecDeque<(Arc<Decoded>, u64)>>,
+}
+
+/// The areas as `set_areas` last set them, and the engine generation they started.
+#[derive(Default)]
+struct Scope {
+    areas: Vec<Region>,
+    generation: u64,
+}
+
 /// What the relay's side and the engine's thread share.
 struct Shared {
-    areas: Mutex<Vec<Region>>,
-    /// The relay's receiver descriptions as of the last `set_areas`, for an engine started then.
-    descriptions: Mutex<Vec<ReceiverInfo>>,
-    /// Bumped by every `set_areas`, so the engine's thread looks at `areas` only when it changed.
-    areas_version: AtomicU64,
+    scope: Mutex<Scope>,
+    /// The raw shards, `SHARDS` of them, each locked by the ingest worker that owns its receivers
+    /// (one batch at a time), and by the engine's thread to take what is complete or re-scope.
+    shards: Box<[Mutex<Shard>]>,
+    /// What each shard's open raw is bounded by.
+    limits: Limits,
     published: Mutex<VecDeque<Record>>,
-    /// Commands sent and not yet done with, and steps running.
+    /// Commands sent and not yet done with, and seals and steps running.
     in_flight: AtomicUsize,
-    /// Batches the engine took (new, from a receiver taking part).
+    /// Counted by the shards as batches come.
     ingested: AtomicU64,
-    /// Offers dropped because the queue was full.
     refused: AtomicU64,
+    replayed: AtomicU64,
+    ingest_errors: AtomicU64,
+    orphans_dropped: AtomicU64,
+    orphans_expired: AtomicU64,
     /// Records dropped because nobody took them in time.
     overflowed: AtomicU64,
     /// Everything else counted, by the engine's thread.
     counts: Mutex<MlatReport>,
+    /// The sealed bins of whichever engine runs: one handle for the host's life.
+    sealed: SealedBins,
     stop: AtomicBool,
+}
+
+impl Shared {
+    fn shard(&self, receiver: &PublicKey) -> std::sync::MutexGuard<'_, Shard> {
+        self.shards[usize::from(raw_shard(receiver).0)]
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
 }
 
 /// `tally-mlat`'s engine as a relay's hosted MLAT.
@@ -279,16 +359,35 @@ impl HostedMlat {
         let cores = u16::try_from(settings.threads).unwrap_or(u16::MAX);
         let (commands, received) = std::sync::mpsc::sync_channel(OFFERS_WAITING);
         let (finished, reported) = std::sync::mpsc::channel();
+        let limits = Limits {
+            bytes: usize::MAX,
+            ..settings.limits()
+        };
+        let seats = Seats::new(settings.capacity.receivers);
         let shared = Arc::new(Shared {
-            areas: Mutex::new(Vec::new()),
-            descriptions: Mutex::new(Vec::new()),
-            areas_version: AtomicU64::new(0),
+            scope: Mutex::new(Scope::default()),
+            shards: (0..SHARDS)
+                .map(|_| {
+                    Mutex::new(Shard {
+                        intake: Intake::new(Arc::clone(&seats), limits, None),
+                        generation: 0,
+                        active: false,
+                        orphans: BTreeMap::new(),
+                    })
+                })
+                .collect(),
+            limits,
             published: Mutex::new(VecDeque::new()),
             in_flight: AtomicUsize::new(0),
             ingested: AtomicU64::new(0),
             refused: AtomicU64::new(0),
+            replayed: AtomicU64::new(0),
+            ingest_errors: AtomicU64::new(0),
+            orphans_dropped: AtomicU64::new(0),
+            orphans_expired: AtomicU64::new(0),
             overflowed: AtomicU64::new(0),
             counts: Mutex::new(MlatReport::default()),
+            sealed: SealedBins::new(),
             stop: AtomicBool::new(false),
         });
         let host = Host {
@@ -298,14 +397,13 @@ impl HostedMlat {
             generation: 0,
             settings,
             engine: None,
-            areas: Vec::new(),
-            areas_version: 0,
             next_step_ms: 0,
             stepping: false,
             solving: false,
+            heard: BTreeMap::new(),
+            next_heard: 0,
             finished,
             shared: Arc::clone(&shared),
-            orphans: BTreeMap::new(),
         };
         let spawned = std::thread::Builder::new()
             .name("tally-mlat".to_owned())
@@ -320,18 +418,18 @@ impl HostedMlat {
         }
     }
 
-    /// Commands handed to the engine's thread and not yet done with, steps running included: zero
-    /// when everything offered and asked so far is published.
+    /// Commands handed to the engine's thread and not yet done with, seals and steps running
+    /// included: zero when everything offered and asked so far is published.
     pub fn in_flight(&self) -> usize {
         self.shared.in_flight.load(Ordering::SeqCst)
     }
 
-    /// Batches the engine has taken: new, and from a receiver of its areas or their band.
+    /// Batches taken: new, and from a receiver of its areas or their band.
     pub fn ingested(&self) -> u64 {
         self.shared.ingested.load(Ordering::SeqCst)
     }
 
-    /// Offers dropped because the engine's queue was full.
+    /// What batches said to provisional solving, dropped because the engine's queue was full.
     pub fn refused(&self) -> u64 {
         self.shared.refused.load(Ordering::Relaxed)
     }
@@ -341,8 +439,9 @@ impl HostedMlat {
         self.shared.overflowed.load(Ordering::Relaxed)
     }
 
-    /// What was signed and not yet taken.
-    fn drain(&self) -> Vec<Record> {
+    /// What was signed and not yet taken, asking for nothing more: for a caller that waited for
+    /// `in_flight` to reach zero.
+    pub fn take_signed(&self) -> Vec<Record> {
         self.shared
             .published
             .lock()
@@ -361,6 +460,95 @@ impl HostedMlat {
             }
         }
     }
+
+    /// Hands `command` to the engine's thread, waiting for room: what must not be lost (a change
+    /// of areas, a receiver to forget).
+    fn send_waiting(&self, command: Command) {
+        self.shared.in_flight.fetch_add(1, Ordering::SeqCst);
+        if self.commands.send(command).is_err() {
+            self.shared.in_flight.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    /// A description, into its receiver's shard: the batches that waited for it are taken now.
+    fn describe(&self, info: &ReceiverInfo) {
+        let Ok(key) = info.receiver() else {
+            return;
+        };
+        let left = {
+            let mut shard = self.shared.shard(&key);
+            let described = match shard.intake.describe(info) {
+                Ok(described) => described,
+                Err(_) => {
+                    self.shared.ingest_errors.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+            };
+            if described.ingested == Ingested::Described
+                && let Some(waiting) = shard.orphans.remove(&key)
+            {
+                for (batch, _) in waiting {
+                    self.take(&mut shard, &batch);
+                }
+            }
+            described.left.then_some(shard.generation)
+        };
+        // Sent with the shard let go: the engine's thread may be waiting for it.
+        if let Some(generation) = left {
+            self.send_waiting(Command::Left(generation, key));
+        }
+    }
+
+    /// One batch into `shard`, its receiver's: what it says to provisional solving goes to the
+    /// engine's thread.
+    fn take(&self, shard: &mut Shard, batch: &Arc<Decoded>) -> Ingested {
+        let (ingested, notes) = shard.intake.ingest_verified(batch, usize::MAX);
+        match ingested {
+            Ingested::Batch { .. } => {
+                self.shared.ingested.fetch_add(1, Ordering::SeqCst);
+                if !notes.is_empty()
+                    && !self.send(Command::Heard(Arc::clone(batch), notes, shard.generation))
+                {
+                    self.shared.refused.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            Ingested::Replayed => {
+                self.shared.replayed.fetch_add(1, Ordering::Relaxed);
+            }
+            Ingested::Described | Ingested::Ignored | Ingested::Refused => {}
+        }
+        ingested
+    }
+
+    /// Holds a batch of an undescribed receiver in its shard, within `ORPHANS_PER_RECEIVER` a
+    /// receiver and `ORPHAN_RECEIVERS_PER_SHARD` receivers (the oldest out first), for `ORPHAN_MS`.
+    fn hold_orphan(&self, shard: &mut Shard, batch: &Arc<Decoded>, now_ms: u64) {
+        let key = batch.receiver();
+        let mut expired = 0;
+        shard.orphans.retain(|_, waiting| {
+            let before = waiting.len();
+            waiting.retain(|(_, at)| now_ms.saturating_sub(*at) <= ORPHAN_MS);
+            expired += (before - waiting.len()) as u64;
+            !waiting.is_empty()
+        });
+        let mut dropped = 0;
+        if !shard.orphans.contains_key(&key) && shard.orphans.len() >= ORPHAN_RECEIVERS_PER_SHARD {
+            dropped += 1;
+        } else {
+            let waiting = shard.orphans.entry(key).or_default();
+            if waiting.len() >= ORPHANS_PER_RECEIVER {
+                waiting.pop_front();
+                dropped += 1;
+            }
+            waiting.push_back((Arc::clone(batch), now_ms));
+        }
+        self.shared
+            .orphans_expired
+            .fetch_add(expired, Ordering::Relaxed);
+        self.shared
+            .orphans_dropped
+            .fetch_add(dropped, Ordering::Relaxed);
+    }
 }
 
 impl Drop for HostedMlat {
@@ -372,52 +560,88 @@ impl Drop for HostedMlat {
 
 impl MlatHost for HostedMlat {
     fn set_areas(&self, areas: Vec<Region>, descriptions: Vec<ReceiverInfo>) {
+        for info in &descriptions {
+            self.describe(info);
+        }
         let mut areas = areas;
         areas.sort_unstable_by_key(|area| area.as_u64());
         areas.dedup();
-        if let Ok(mut wanted) = self.shared.areas.lock()
-            && *wanted != areas
-        {
-            // Added to, never replaced: a description offered between the hub reading these and
-            // the engine starting is held there too (`offered`).
-            if let Ok(mut held) = self.shared.descriptions.lock() {
-                held.extend(descriptions);
-            }
-            *wanted = areas;
-            self.shared.areas_version.fetch_add(1, Ordering::SeqCst);
+        let mut scope = self
+            .shared
+            .scope
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if scope.areas == areas {
+            return;
         }
+        // No area at all drops the engine and its raw; the first area after none starts a new one.
+        let restart = areas.is_empty() || scope.areas.is_empty();
+        if restart {
+            scope.generation += 1;
+        }
+        let band = (!areas.is_empty()).then(|| area::border_band(&areas));
+        let mut left = Vec::new();
+        for shard in &self.shared.shards {
+            let mut shard = shard
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if restart {
+                shard.intake.restart(self.shared.limits);
+                shard.orphans.clear();
+            }
+            left.extend(shard.intake.set_scope(band.clone()));
+            shard.generation = scope.generation;
+            shard.active = band.is_some();
+        }
+        scope.areas.clone_from(&areas);
+        let generation = scope.generation;
+        drop(scope);
+        if !restart {
+            for key in left {
+                self.send_waiting(Command::Left(generation, key));
+            }
+        }
+        self.send_waiting(Command::Areas(generation, areas));
     }
 
     fn offer(&self, record: &Record, now_ms: u64) {
-        let command = match record {
+        match record {
             // The relay verified it before offering it: decoded once here, it takes the same path
-            // as the hub's own decode. One this build cannot read goes to the engine whole.
-            Record::Batch(batch) => match Decoded::from_verified(batch.clone(), now_ms, 0) {
-                Ok(decoded) => Command::Batch(decoded, now_ms),
-                Err(undecodable) => Command::Offer(Record::Batch(undecodable.batch), now_ms),
-            },
-            Record::ReceiverInfo(_) => Command::Offer(record.clone(), now_ms),
-            _ => return,
-        };
-        if !self.send(command) {
-            self.shared.refused.fetch_add(1, Ordering::Relaxed);
+            // as the hub's own decode. One this build cannot read holds nothing.
+            Record::Batch(batch) => {
+                if let Ok(decoded) = Decoded::from_verified(batch.clone(), now_ms, 0) {
+                    self.offer_batch(&decoded, now_ms);
+                }
+            }
+            Record::ReceiverInfo(info) => self.describe(info),
+            _ => {}
         }
     }
 
     fn offer_batch(&self, batch: &Arc<Decoded>, now_ms: u64) {
-        if !self.send(Command::Batch(Arc::clone(batch), now_ms)) {
-            self.shared.refused.fetch_add(1, Ordering::Relaxed);
+        let mut shard = self.shared.shard(&batch.receiver());
+        if !shard.active {
+            return;
+        }
+        if self.take(&mut shard, batch) == Ingested::Ignored
+            && shard.intake.described(&batch.receiver()).is_none()
+        {
+            self.hold_orphan(&mut shard, batch, now_ms);
         }
     }
 
     fn take_published(&self, now_ms: u64) -> Vec<Record> {
         // A tick lost to a full queue is the next call's.
         self.send(Command::Tick(now_ms));
-        self.drain()
+        self.take_signed()
     }
 
     fn cores(&self) -> u16 {
         self.cores
+    }
+
+    fn sealed_bins(&self) -> Option<SealedBins> {
+        Some(self.shared.sealed.clone())
     }
 
     fn report(&self) -> MlatReport {
@@ -427,12 +651,21 @@ impl MlatHost for HostedMlat {
             .lock()
             .map(|counts| counts.clone())
             .unwrap_or_default();
+        let shared = &self.shared;
         report.ingested = self.ingested();
         report.refused = self.refused();
         report.overflowed = self.overflowed();
+        report.replayed = shared.replayed.load(Ordering::Relaxed);
+        report.ingest_errors = shared.ingest_errors.load(Ordering::Relaxed);
+        report.orphans_dropped = shared.orphans_dropped.load(Ordering::Relaxed);
+        report.orphans_expired = shared.orphans_expired.load(Ordering::Relaxed);
         report
     }
 }
+
+/// What one batch said to provisional solving, waiting to be weighed: the batch, its notes, and
+/// the engine generation of the shard that read them.
+type Heard = (Arc<Decoded>, Vec<Note>, u64);
 
 /// The engine's thread.
 struct Host {
@@ -441,24 +674,20 @@ struct Host {
     boot_id: u64,
     /// Engines started.
     engines: u64,
-    /// Bumped whenever the engine is dropped or started: a step reports to the generation that
-    /// started it, and is discarded if that engine is gone.
+    /// The generation of the engine running (`Scope::generation`): a seal or step reports to the
+    /// generation that started it, and is discarded if that engine is gone.
     generation: u64,
     settings: Settings,
     engine: Option<Engine>,
-    /// The areas the engine solves now, sorted, as of `set_areas`'s `areas_version`.
-    areas: Vec<Region>,
-    areas_version: u64,
     next_step_ms: u64,
     stepping: bool,
     solving: bool,
+    /// What batches said to provisional solving, by (stamp, place in the ingest order, arrival
+    /// here), weighed once the engine's clock passes them: in that order whatever worker read them.
+    heard: BTreeMap<(u64, u64, u64), Heard>,
+    next_heard: u64,
     finished: Sender<Finished>,
     shared: Arc<Shared>,
-    /// Batches of receivers the engine has no description of yet, by receiver, oldest first:
-    /// taken when the description comes. A batch can reach a relay before its receiver's
-    /// description (a repair, a rebuild from parity, a link that died between them), and the hub
-    /// forwards each batch once, so a batch the engine turned away would be lost to it.
-    orphans: BTreeMap<PublicKey, VecDeque<(Arc<Decoded>, u64)>>,
 }
 
 impl Host {
@@ -468,7 +697,8 @@ impl Host {
                 return;
             }
             while let Ok(finished) = reported.try_recv() {
-                self.finished(finished);
+                let started = self.finished(finished);
+                self.shared.in_flight.fetch_add(started, Ordering::SeqCst);
                 self.shared.in_flight.fetch_sub(1, Ordering::SeqCst);
             }
             let command = match received.recv_timeout(POLL) {
@@ -479,33 +709,52 @@ impl Host {
             if self.shared.stop.load(Ordering::SeqCst) {
                 return;
             }
-            let now_ms = match &command {
-                Command::Offer(_, now_ms) | Command::Batch(_, now_ms) | Command::Tick(now_ms) => {
-                    *now_ms
-                }
-            };
-            // New areas take effect before whatever comes after them, offers included.
-            self.rescope(now_ms);
             let started = match command {
-                Command::Offer(record, now_ms) => {
-                    self.offered(&record, now_ms);
+                Command::Heard(batch, notes, generation) => {
+                    if generation >= self.generation {
+                        let at = (batch.stamp_ms(), batch.ingest_seq(), self.next_heard);
+                        self.next_heard += 1;
+                        self.heard.insert(at, (batch, notes, generation));
+                    }
                     0
                 }
-                Command::Batch(batch, now_ms) => {
-                    self.offered_batch(batch, now_ms);
+                Command::Left(generation, key) => {
+                    if generation == self.generation
+                        && let Some(engine) = self.engine.as_mut()
+                    {
+                        engine.forget_receiver(&key);
+                    }
+                    0
+                }
+                Command::Areas(generation, areas) => {
+                    self.rescope(generation, areas);
                     0
                 }
                 Command::Tick(now_ms) => self.tick(now_ms),
             };
-            // This command is done with; the steps it started are in flight until they report.
+            // This command is done with; the work it started is in flight until it reports.
             self.shared.in_flight.fetch_add(started, Ordering::SeqCst);
             self.shared.in_flight.fetch_sub(1, Ordering::SeqCst);
         }
     }
 
-    /// A step's outcome, applied if its engine is still the one running; its report kept.
-    fn finished(&mut self, finished: Finished) {
-        let records = match finished {
+    /// A seal's or a step's outcome, applied if its engine is still the one running; its report
+    /// kept. The work it started.
+    fn finished(&mut self, finished: Finished) -> usize {
+        let (records, started) = match finished {
+            Finished::Sealed {
+                generation,
+                now_ms,
+                settled,
+                bins,
+                sites,
+                dropped,
+            } if generation == self.generation => {
+                for bin in bins {
+                    self.shared.sealed.insert(bin);
+                }
+                (Vec::new(), self.step(now_ms, settled, sites, dropped))
+            }
             Finished::Stepped(generation, outcome) if generation == self.generation => {
                 self.stepping = false;
                 match self.engine.as_mut() {
@@ -514,13 +763,15 @@ impl Host {
                         let step = StepReport::of(&report);
                         self.count(|counts| {
                             counts.steps += 1;
-                            counts.observations_dropped += dropped.observations;
+                            counts.observations_late += dropped.late;
+                            counts.observations_refused += dropped.refused;
+                            counts.receivers_refused += dropped.receivers;
                             counts.steps_total.add(&step);
                             counts.last_step = Some(step);
                         });
-                        records
+                        (records, 0)
                     }
-                    None => Vec::new(),
+                    None => (Vec::new(), 0),
                 }
             }
             Finished::Solved(generation, outcome) if generation == self.generation => {
@@ -530,18 +781,19 @@ impl Host {
                         let records = engine.apply_provisional(outcome);
                         let report = engine.provisional_report();
                         self.count(|counts| counts.provisional.add(&report));
-                        records
+                        (records, 0)
                     }
-                    None => Vec::new(),
+                    None => (Vec::new(), 0),
                 }
             }
-            // An engine since dropped: what it solved is not published, and counted.
-            Finished::Stepped(..) | Finished::Solved(..) => {
+            // An engine since dropped: what it sealed or solved is not published, and counted.
+            Finished::Sealed { .. } | Finished::Stepped(..) | Finished::Solved(..) => {
                 self.count(|counts| counts.steps_discarded += 1);
-                Vec::new()
+                (Vec::new(), 0)
             }
         };
         self.publish(records);
+        started
     }
 
     fn count(&self, change: impl FnOnce(&mut MlatReport)) {
@@ -550,195 +802,156 @@ impl Host {
         }
     }
 
-    fn offered(&mut self, record: &Record, now_ms: u64) {
-        // A description that comes while an engine is about to start (areas named, none running
-        // yet) is kept for it: the hub's descriptions it is handed with the areas were read before
-        // this one may have come. With no areas named the next `set_areas` hands them all.
-        if self.engine.is_none()
-            && let Record::ReceiverInfo(info) = record
-        {
-            let starting = self
-                .shared
-                .areas
-                .lock()
-                .is_ok_and(|areas| !areas.is_empty());
-            if starting && let Ok(mut held) = self.shared.descriptions.lock() {
-                if held.len() < DESCRIPTIONS_WAITING {
-                    held.push(info.clone());
-                } else {
-                    drop(held);
-                    self.count(|counts| counts.descriptions_dropped += 1);
-                }
-            }
-            return;
-        }
-        let Some(engine) = self.engine.as_mut() else {
-            return;
-        };
-        // An error is a record that does not verify; the hub verified it, so none should come.
-        let outcome = match engine.ingest(record, now_ms) {
-            Ok(outcome) => outcome,
-            Err(_) => {
-                self.count(|counts| counts.ingest_errors += 1);
-                return;
-            }
-        };
-        if let Some(engine) = self.engine.as_mut() {
-            match (outcome, record) {
-                (Ingested::Batch { .. }, _) => {
-                    self.shared.ingested.fetch_add(1, Ordering::SeqCst);
-                }
-                (Ingested::Replayed, _) => self.count(|counts| counts.replayed += 1),
-                (Ingested::Described, Record::ReceiverInfo(info)) => {
-                    if let Ok(key) = info.receiver()
-                        && let Some(waiting) = self.orphans.remove(&key)
-                    {
-                        for (batch, _) in waiting {
-                            if let Ingested::Batch { .. } = engine.ingest_verified(&batch, now_ms) {
-                                self.shared.ingested.fetch_add(1, Ordering::SeqCst);
-                            }
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-
-    /// A batch the relay verified and decoded: taken by the engine without verifying or decoding it
-    /// again, or held when its receiver is not described yet.
-    fn offered_batch(&mut self, batch: Arc<Decoded>, now_ms: u64) {
-        let Some(engine) = self.engine.as_mut() else {
-            return;
-        };
-        match engine.ingest_verified(&batch, now_ms) {
-            Ingested::Batch { .. } => {
-                self.shared.ingested.fetch_add(1, Ordering::SeqCst);
-            }
-            Ingested::Replayed => self.count(|counts| counts.replayed += 1),
-            Ingested::Ignored => {
-                let key = batch.receiver();
-                if engine.described(&key).is_none() {
-                    self.hold_orphan(key, batch, now_ms);
-                }
-            }
-            Ingested::Described => {}
-        }
-    }
-
-    /// Holds a batch of an undescribed receiver, within `ORPHANS_PER_RECEIVER` a receiver and
-    /// `ORPHAN_RECEIVERS` receivers (the oldest out first), for `ORPHAN_MS`.
-    fn hold_orphan(&mut self, key: PublicKey, batch: Arc<Decoded>, now_ms: u64) {
-        let mut expired = 0;
-        self.orphans.retain(|_, waiting| {
-            let before = waiting.len();
-            waiting.retain(|(_, at)| now_ms.saturating_sub(*at) <= ORPHAN_MS);
-            expired += (before - waiting.len()) as u64;
-            !waiting.is_empty()
-        });
-        let mut dropped = 0;
-        if !self.orphans.contains_key(&key) && self.orphans.len() >= ORPHAN_RECEIVERS {
-            dropped += 1;
-        } else {
-            let waiting = self.orphans.entry(key).or_default();
-            if waiting.len() >= ORPHANS_PER_RECEIVER {
-                waiting.pop_front();
-                dropped += 1;
-            }
-            waiting.push_back((batch, now_ms));
-        }
-        if expired + dropped > 0 {
-            self.count(|counts| {
-                counts.orphans_expired += expired;
-                counts.orphans_dropped += dropped;
-            });
-        }
-    }
-
-    /// Starts whatever work is due. The steps started.
+    /// Starts whatever work is due by `now_ms`. The work started.
     fn tick(&mut self, now_ms: u64) -> usize {
         let generation = self.generation;
-        let Some(engine) = self.engine.as_mut() else {
+        if self.engine.is_none() {
             return 0;
-        };
+        }
+        self.hear_through(now_ms);
         let mut started = 0;
-        if !self.solving
+        if let Some(engine) = self.engine.as_mut()
+            && !self.solving
             && let Some(job) = engine.provisional(now_ms, now_ms)
         {
             self.solving = true;
             started += 1;
             let finished = self.finished.clone();
-            spawn_or_run(move || {
+            spawn_or_run(Urgency::Prompt, move || {
                 let _ = finished.send(Finished::Solved(generation, job.run()));
             });
         }
         if !self.stepping && now_ms >= self.next_step_ms {
             self.next_step_ms = now_ms.saturating_add(STEP_MS);
-            if let Some(job) = engine.prepare(now_ms, now_ms) {
-                self.stepping = true;
-                started += 1;
-                let finished = self.finished.clone();
-                spawn_or_run(move || {
-                    let _ = finished.send(Finished::Stepped(generation, job.run()));
-                });
-            }
+            self.stepping = true;
+            started += self.close(now_ms);
         }
         started
     }
 
-    /// The areas `set_areas` last named, made the engine's.
-    fn rescope(&mut self, now_ms: u64) {
-        let version = self.shared.areas_version.load(Ordering::SeqCst);
-        if version == self.areas_version {
+    /// Weighs what batches stamped by `now_ms` said to provisional solving, in stamp order.
+    fn hear_through(&mut self, now_ms: u64) {
+        let later = self.heard.split_off(&(now_ms.saturating_add(1), 0, 0));
+        let due = std::mem::replace(&mut self.heard, later);
+        let Some(engine) = self.engine.as_mut() else {
             return;
-        }
-        self.areas_version = version;
-        let wanted = self
-            .shared
-            .areas
-            .lock()
-            .map(|areas| areas.clone())
-            .unwrap_or_default();
-        if wanted == self.areas {
-            return;
-        }
-        if wanted.is_empty() {
-            // No longer an MLAT relay for anything: the engine and its raw go, and whatever it
-            // is still solving is discarded when it reports.
-            self.engine = None;
-            self.generation += 1;
-            self.stepping = false;
-            self.solving = false;
-        } else {
-            let band = area::border_band(&wanted);
-            match self.engine.as_mut() {
-                Some(engine) => engine.set_scope(band, wanted.clone()),
-                None => {
-                    let mut engine = Engine::new(
-                        self.identity.clone(),
-                        self.boot_id.wrapping_add(self.engines),
-                        self.settings.clone(),
-                    );
-                    self.engines += 1;
-                    self.generation += 1;
-                    engine.set_scope(band, wanted.clone());
-                    let descriptions = self
-                        .shared
-                        .descriptions
-                        .lock()
-                        .map(|mut held| std::mem::take(&mut *held))
-                        .unwrap_or_default();
-                    for info in descriptions {
-                        let _ = engine.ingest(&Record::ReceiverInfo(info), now_ms);
-                    }
-                    self.engine = Some(engine);
-                    self.next_step_ms = now_ms;
-                    self.stepping = false;
-                    self.solving = false;
-                }
+        };
+        for (at, (batch, notes, generation)) in due {
+            if generation == self.generation {
+                engine.hear(&batch, &notes, batch.stamp_ms());
+            } else if generation > self.generation {
+                // Read by a shard already re-scoped for the engine about to start: kept for it.
+                self.heard.insert(at, (batch, notes, generation));
             }
         }
-        self.areas = wanted;
+    }
+
+    /// Takes every bin complete by `now_ms` out of every shard (a move under each shard's lock in
+    /// turn), with the sites taking part and what the shards refused, and seals them off this
+    /// thread. The work started.
+    fn close(&mut self, now_ms: u64) -> usize {
+        let Some(engine) = self.engine.as_ref() else {
+            self.stepping = false;
+            return 0;
+        };
+        let settled = engine.settled(now_ms);
+        let threads = self.settings.threads.max(1);
+        let mut fragments: Vec<Fragment> = Vec::new();
+        let mut sites: Vec<Site> = Vec::new();
+        let mut dropped = Dropped::default();
+        for shard in &self.shared.shards {
+            let mut shard = shard
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // A shard re-scoped for a newer engine than this one holds that engine's raw.
+            if shard.generation != self.generation {
+                continue;
+            }
+            fragments.extend(shard.intake.take_through(settled));
+            sites.extend(shard.intake.sites());
+            let more = shard.intake.take_dropped();
+            dropped.late += more.late;
+            dropped.refused += more.refused;
+            dropped.receivers += more.receivers;
+        }
+        sites.sort_unstable_by_key(|site| site.receiver);
+        let generation = self.generation;
+        if fragments.is_empty() {
+            return self.step(now_ms, settled, sites, dropped);
+        }
+        let finished = self.finished.clone();
+        spawn_or_run(Urgency::Background, move || {
+            let bins = tally_mlat::engine::seal(fragments, threads);
+            let _ = finished.send(Finished::Sealed {
+                generation,
+                now_ms,
+                settled,
+                bins,
+                sites,
+                dropped,
+            });
+        });
+        1
+    }
+
+    /// The window step of `now_ms`, every bin through `settled` sealed: run off this thread when
+    /// there is a window to solve. The work started.
+    fn step(&mut self, now_ms: u64, settled: i64, sites: Vec<Site>, dropped: Dropped) -> usize {
+        let generation = self.generation;
+        let Some(engine) = self.engine.as_mut() else {
+            self.stepping = false;
+            return 0;
+        };
+        engine.add_dropped(dropped);
+        let Some(job) = engine.prepare_sealed(now_ms, now_ms, settled, sites) else {
+            self.stepping = false;
+            return 0;
+        };
+        let finished = self.finished.clone();
+        spawn_or_run(Urgency::Background, move || {
+            let _ = finished.send(Finished::Stepped(generation, job.run()));
+        });
+        1
+    }
+
+    /// The areas `set_areas` named (every shard already re-scoped to them, under `generation`):
+    /// none drops the engine and its raw; the first after none starts a new engine under a new
+    /// boot id; otherwise the engine's scope changes in place.
+    fn rescope(&mut self, generation: u64, areas: Vec<Region>) {
+        if areas.is_empty() {
+            // No longer an MLAT relay for anything: the engine and its raw go, and whatever it
+            // is still sealing or solving is discarded when it reports.
+            self.engine = None;
+            self.shared.sealed.clear();
+            self.heard.clear();
+            self.generation = generation;
+            self.stepping = false;
+            self.solving = false;
+            return;
+        }
+        let band = area::border_band(&areas);
+        match self.engine.as_mut() {
+            Some(engine) if generation == self.generation => {
+                engine.set_scope(band, areas);
+            }
+            _ => {
+                self.shared.sealed.clear();
+                let mut engine = Engine::hosted(
+                    self.identity.clone(),
+                    self.boot_id.wrapping_add(self.engines),
+                    self.settings.clone(),
+                    self.shared.sealed.clone(),
+                );
+                self.engines += 1;
+                self.generation = generation;
+                engine.set_scope(band, areas);
+                self.engine = Some(engine);
+                self.heard.retain(|_, (_, _, heard)| *heard == generation);
+                self.next_step_ms = 0;
+                self.stepping = false;
+                self.solving = false;
+            }
+        }
     }
 
     fn publish(&self, records: Vec<Record>) {
@@ -758,13 +971,46 @@ impl Host {
     }
 }
 
-/// Runs `work` on a thread of its own, or here if no thread can be had.
-fn spawn_or_run(work: impl FnOnce() + Send + 'static) {
+/// How a piece of the engine's work is scheduled against the rest of the relay's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Urgency {
+    /// Provisional solving: a provisional is due within seconds of its transmission (RFC-0174
+    /// §2.4), so it runs at the relay's own priority.
+    Prompt,
+    /// Seals and window steps: a final position comes 7 to 47 s after its transmission (the
+    /// stride), and a window's fits take seconds of every core they are spread over. They run
+    /// below the relay's priority (`BACKGROUND_NICE`, inherited by the threads they spread over),
+    /// so on a busy host they yield the cores to provisional solving and to ingest, never the
+    /// other way round.
+    Background,
+}
+
+/// How far below the relay's priority background work runs: a nice value, which Linux gives each
+/// thread its own and a thread's children inherit.
+const BACKGROUND_NICE: libc::c_int = 10;
+
+/// Lowers the calling thread's priority to `BACKGROUND_NICE` (a thread may always lower its own).
+fn run_in_background() {
+    // SAFETY: `gettid` and `setpriority` read and write no memory of this process; on Linux a
+    // thread is addressed by its id as a process, so this changes this thread's nice value alone.
+    // A failure leaves it at the relay's priority, which is only slower to yield.
+    #[cfg(target_os = "linux")]
+    unsafe {
+        let tid = libc::gettid();
+        let _ = libc::setpriority(libc::PRIO_PROCESS, tid as libc::id_t, BACKGROUND_NICE);
+    }
+}
+
+/// Runs `work` on a thread of its own at `urgency`, or here if no thread can be had.
+fn spawn_or_run(urgency: Urgency, work: impl FnOnce() + Send + 'static) {
     let work = Arc::new(Mutex::new(Some(work)));
     let theirs = Arc::clone(&work);
     let spawned = std::thread::Builder::new()
         .name("tally-mlat-step".to_owned())
         .spawn(move || {
+            if urgency == Urgency::Background {
+                run_in_background();
+            }
             if let Some(work) = theirs.lock().ok().and_then(|mut work| work.take()) {
                 work();
             }
@@ -796,6 +1042,7 @@ mod tests {
             regions: Vec::new(),
             settle_ms: SETTLE_MS,
             threads: 2,
+            capacity: Capacity::default(),
         }
     }
 
@@ -852,7 +1099,12 @@ mod tests {
             }
             let early = host.take_published(now);
             quiet(host);
-            published.extend(early.into_iter().chain(host.drain()).map(|r| (now, r)));
+            published.extend(
+                early
+                    .into_iter()
+                    .chain(host.take_signed())
+                    .map(|r| (now, r)),
+            );
             now += STEP_MS;
         }
         published
@@ -922,6 +1174,15 @@ mod tests {
             }
         }
         assert_eq!(host.refused(), 0);
+        // The relay's other readers of the raw see the bins the engine holds, the reference's.
+        let sealed = host.sealed_bins().ok_or("no sealed bins")?;
+        let numbers = sealed.numbers();
+        assert!(!numbers.is_empty());
+        let reference = engine.sealed_bins();
+        assert_eq!(numbers, reference.numbers());
+        for bin in &numbers {
+            assert!(sealed.get(*bin) == reference.get(*bin), "bin {bin}");
+        }
         // Every step's report is kept, and nothing was let go.
         let report = host.report();
         assert!(report.steps > 0 && report.last_step.is_some(), "{report:?}");
@@ -1036,9 +1297,12 @@ mod tests {
         drive(&host, &delivered, first, half);
         let taken = host.ingested();
         assert!(taken > 0);
+        let sealed = host.sealed_bins().ok_or("no sealed bins")?;
         host.set_areas(Vec::new(), Vec::new());
         let after = drive(&host, &delivered, half + STEP_MS, last + 60_000);
         assert!(after.is_empty(), "{} records after", after.len());
+        // Its raw went with it, for every reader.
+        assert!(sealed.is_empty() && sealed.numbers().is_empty());
         assert_eq!(host.ingested(), taken);
         // Taken again: the same raw, from the start, under a new boot id, the engine starting
         // from the descriptions the relay holds (`Hub::descriptions`).

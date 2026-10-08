@@ -1,23 +1,176 @@
-//! The delivery check (RFC-0174 §2.2): a feeder asks members of its area's sharing group, on
-//! distinct networks, whether they hold a few of its recent batches, by (boot, sequence). A member
-//! that holds one proves it with the keyed hash of the feeder's fresh nonce over the batch's bytes
-//! ([`possession_proof`]), which only a holder can compute, and signs its answer; one that does not
-//! take the feeder's area says so, which is not the same as "not seen". A majority of networks
-//! proving a batch is delivery; one member's word alone convicts no relay.
+//! The delivery check (RFC-0174 §2.2, RFC-0177 §7): a feeder asks members of its area's sharing
+//! group, on distinct networks, whether they took in a few of its recent batches, by (boot,
+//! sequence). A member answers with the tag it made when the batch arrived, which only a relay
+//! that held the batch's bytes and the feeder's key for it could compute, and signs its answer;
+//! one that does not take the feeder's area says so, which is not the same as "not seen". A
+//! majority of networks proving a batch is delivery; one member's word alone convicts no relay.
+//!
+//! # Tags made on arrival
+//!
+//! Every key period (`KEY_PERIOD_MS`) the feeder gives every member it may ask a key of that
+//! member's own ([`TagKeys`]): the key in force now and the next one, signed by the feeder and
+//! carried in a [`DeliveryQuery`] over a `Probe` session. A member that holds a key for a feeder
+//! tags each of that feeder's batches as it arrives, [`delivery_tag`] of the key and the batch's
+//! signed bytes, keeps the 16-byte tag with the key's id for `TAG_WINDOW_MS`, and lets the bytes
+//! go. An audit later names batches by boot and sequence; the member answers with the tags; the
+//! feeder, which still holds the audited batches and every key it gave, recomputes them.
+//!
+//! - The tag needs the bytes: it is a keyed hash over all of them, so a member that saw only a
+//!   batch's hash (a piece manifest lists every hash) cannot make it.
+//! - The keys are per feeder and per member, and handed out on a schedule that has nothing to do
+//!   with audits, so nothing a member sees says when an audit runs or which batches it covers.
+//! - The keys rotate: a tag counts only under a key that was in force when the batch was sent
+//!   ([`tag_keys_for`]), so a tag made under an old key (a replay) proves nothing.
+//! - `TAG_WINDOW_MS` is the one window both sides use: a member keeps tags that long after
+//!   arrival, and a feeder asks only about batches it sent less than that long ago.
+
+use std::ops::RangeInclusive;
 
 use blake2::{Blake2s256, Digest};
 
 use crate::WireError;
-use crate::batch::{Batch, Hash};
+use crate::batch::Hash;
 use crate::key::{KEY_LEN, PublicKey};
 use crate::record::Body;
-use crate::signed::{Check, Checked, Fields, Unchecked, count_u16, read_count, signed_record};
+use crate::signed::{
+    Check, Checked, Fields, Unchecked, count_u16, put_blob, read_blob, read_count, signed_record,
+};
 
 /// The most sequence ranges one query names.
 pub const MAX_RANGES: usize = 16;
 /// The most batches one query asks about, over all its ranges: a sample, never a stream.
 pub const MAX_SEQUENCES: u64 = 64;
-const POSSESSION_DOMAIN: &[u8] = b"tally possession";
+/// How long a member keeps a batch's tag after it arrived, and how long after sending a batch a
+/// feeder may still ask about it: one constant, so the two sides cannot drift.
+pub const TAG_WINDOW_MS: u64 = 5 * 60 * 1000;
+/// How long one tag key is in force. A grant names the key in force and the next, so one grant
+/// lost still leaves a member a key for a whole period.
+pub const KEY_PERIOD_MS: u64 = TAG_WINDOW_MS;
+/// The bytes of a tag: BLAKE2s-256 truncated. A forger guesses one in 2^128.
+pub const TAG_LEN: usize = 16;
+/// The bytes of a tag key.
+pub const TAG_KEY_LEN: usize = 32;
+const TAG_DOMAIN: &[u8] = b"tally delivery tag";
+
+/// A batch's tag under one member's key.
+pub type Tag = [u8; TAG_LEN];
+
+/// The key period a wall-clock instant falls in: a tag key's id.
+pub fn key_period(wall_ms: u64) -> u32 {
+    u32::try_from(wall_ms / KEY_PERIOD_MS).unwrap_or(u32::MAX)
+}
+
+/// The ids of the keys a tag of a batch sent at `sent_ms` may be under: the period it was sent in,
+/// and one either side, for a member whose switch to the next key came a little early or late (it
+/// switches by its own clock, `switch_in_ms` after the grant arrived). A tag under any other key
+/// proves nothing.
+pub fn tag_keys_for(sent_ms: u64) -> RangeInclusive<u32> {
+    let period = key_period(sent_ms);
+    period.saturating_sub(1)..=period.saturating_add(1)
+}
+
+/// The tag of a batch's signed bytes under a member's key: BLAKE2s-256 over `"tally delivery
+/// tag" 0x00`, the key and the bytes, its first `TAG_LEN` bytes. Only one holding both the key
+/// and every byte of the batch computes it.
+pub fn delivery_tag(key: &[u8; TAG_KEY_LEN], batch: &[u8]) -> Tag {
+    let mut hasher = Blake2s256::new();
+    hasher.update(TAG_DOMAIN);
+    hasher.update([0]);
+    hasher.update(key);
+    hasher.update(batch);
+    let digest: Hash = hasher.finalize().into();
+    let mut tag = [0; TAG_LEN];
+    tag.copy_from_slice(&digest[..TAG_LEN]);
+    tag
+}
+
+/// One tag key and its id (its key period).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct TagKey {
+    pub id: u32,
+    pub key: [u8; TAG_KEY_LEN],
+}
+
+impl std::fmt::Debug for TagKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // A secret: never printed.
+        write!(f, "TagKey({}, ..)", self.id)
+    }
+}
+
+/// A feeder's grant of tag keys to one member: the key in force now, the next, and how long until
+/// the next takes over.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TagKeysContent {
+    /// The member the keys are for: no other member takes them.
+    pub member: PublicKey,
+    pub current: TagKey,
+    /// `current.id + 1`.
+    pub next: TagKey,
+    /// After this long, by the member's clock from when the grant arrived, `next` is in force; one
+    /// period after that, neither.
+    pub switch_in_ms: u64,
+}
+
+impl Check for TagKeysContent {
+    /// The next key is the one after the current, and the switch is at most one period away.
+    fn check(&self) -> Result<(), WireError> {
+        if self.current.id.checked_add(1) != Some(self.next.id) {
+            return Err(WireError::Invalid {
+                field: "next tag key id",
+                value: u64::from(self.next.id),
+            });
+        }
+        if self.switch_in_ms > KEY_PERIOD_MS {
+            return Err(WireError::Invalid {
+                field: "tag key switch",
+                value: self.switch_in_ms,
+            });
+        }
+        Ok(())
+    }
+}
+
+impl Fields for TagKeysContent {
+    fn write(keys: Checked<'_, Self>, out: &mut Vec<u8>) -> Result<(), WireError> {
+        out.extend_from_slice(keys.member.as_bytes());
+        for key in [keys.current, keys.next] {
+            out.extend_from_slice(&key.id.to_be_bytes());
+            out.extend_from_slice(&key.key);
+        }
+        out.extend_from_slice(&keys.switch_in_ms.to_be_bytes());
+        Ok(())
+    }
+
+    fn read(reader: &mut Body<'_>) -> Result<Unchecked<Self>, WireError> {
+        let member = PublicKey::from_slice(reader.bytes(KEY_LEN)?)?;
+        let mut key = || -> Result<TagKey, WireError> {
+            Ok(TagKey {
+                id: reader.u32()?,
+                key: reader.array()?,
+            })
+        };
+        let current = key()?;
+        let next = key()?;
+        Ok(Unchecked::new(Self {
+            member,
+            current,
+            next,
+            switch_in_ms: reader.u64()?,
+        }))
+    }
+}
+
+signed_record!(
+    /// A feeder's signed grant of tag keys to one member, carried in a `DeliveryQuery`. Signed, so
+    /// no one but the feeder can give a member keys for its batches (which would make every tag
+    /// that member made for it fail, and void its audits).
+    TagKeys,
+    TagKeysContent,
+    b"tally delivery tag keys",
+    1,
+    1 + KEY_LEN + KEY_LEN + 2 * (4 + TAG_KEY_LEN) + 8 + 64
+);
 
 /// Sequences `first..=last` of one boot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -38,7 +191,8 @@ impl SequenceRange {
     }
 }
 
-/// A feeder's question (unsigned: the nonce is what binds the answer to it).
+/// A feeder's word to a member: its tag keys for that member, and, in an audit, the batches it
+/// asks about (unsigned itself: the nonce binds the answer to it, and the keys are signed).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeliveryQuery {
     /// Fresh for every query.
@@ -46,8 +200,11 @@ pub struct DeliveryQuery {
     /// The feeder's own key: whose batches.
     pub receiver: PublicKey,
     pub boot_id: u64,
-    /// Ascending and disjoint, at most `MAX_RANGES`, at most `MAX_SEQUENCES` in all.
+    /// Ascending and disjoint, at most `MAX_RANGES`, at most `MAX_SEQUENCES` in all; none when the
+    /// query only carries keys.
     pub ranges: Vec<SequenceRange>,
+    /// The feeder's grant of tag keys to the member asked, signed by `receiver`.
+    pub keys: Option<TagKeys>,
 }
 
 impl DeliveryQuery {
@@ -62,7 +219,8 @@ impl DeliveryQuery {
 
 impl Check for DeliveryQuery {
     /// At most `MAX_RANGES` ranges, each non-empty, ascending and disjoint, naming at most
-    /// `MAX_SEQUENCES` batches in all, every count exact (no range or sum wraps).
+    /// `MAX_SEQUENCES` batches in all, every count exact (no range or sum wraps); keys, if any,
+    /// signed by the receiver (whether the signature holds is the member's to verify).
     fn check(&self) -> Result<(), WireError> {
         let ordered = self
             .ranges
@@ -78,9 +236,20 @@ impl Check for DeliveryQuery {
                 value: total.unwrap_or(u64::MAX),
             });
         }
+        if let Some(keys) = &self.keys
+            && keys.signer()? != self.receiver
+        {
+            return Err(WireError::Key(
+                "tag keys signed by another key than the receiver's".to_owned(),
+            ));
+        }
         Ok(())
     }
 }
+
+/// Whether a query carries keys, on the wire.
+const NO_KEYS: u8 = 0;
+const KEYS: u8 = 1;
 
 impl Fields for DeliveryQuery {
     fn write(query: Checked<'_, Self>, out: &mut Vec<u8>) -> Result<(), WireError> {
@@ -91,6 +260,13 @@ impl Fields for DeliveryQuery {
         for range in &query.ranges {
             out.extend_from_slice(&range.first.to_be_bytes());
             out.extend_from_slice(&range.last.to_be_bytes());
+        }
+        match &query.keys {
+            Some(keys) => {
+                out.push(KEYS);
+                put_blob(out, keys.as_bytes())?;
+            }
+            None => out.push(NO_KEYS),
         }
         Ok(())
     }
@@ -108,11 +284,28 @@ impl Fields for DeliveryQuery {
                 })
             })
             .collect::<Result<Vec<_>, WireError>>()?;
+        let keys = match reader.u8()? {
+            NO_KEYS => None,
+            KEYS => {
+                let bytes = read_blob(reader)?;
+                if bytes.len() > TagKeys::MAX_LEN {
+                    return Err(WireError::Oversize(bytes.len()));
+                }
+                Some(TagKeys::from_bytes(bytes)?)
+            }
+            other => {
+                return Err(WireError::Invalid {
+                    field: "delivery query keys flag",
+                    value: u64::from(other),
+                });
+            }
+        };
         Ok(Unchecked::new(Self {
             nonce,
             receiver,
             boot_id,
             ranges,
+            keys,
         }))
     }
 }
@@ -120,8 +313,8 @@ impl Fields for DeliveryQuery {
 /// What a member says of one batch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Possession {
-    /// It holds the batch: `possession_proof(nonce, batch)`.
-    Proved(Hash),
+    /// It took the batch in while it held the feeder's key `key`: the tag it made then.
+    Proved { key: u32, tag: Tag },
     /// It takes the feeder's area and has not seen the batch.
     NotSeen,
 }
@@ -145,6 +338,8 @@ pub struct DeliveryAnswerContent {
 /// a tag this build cannot read proves nothing either way).
 const TAG_NOT_SEEN: u8 = 0;
 const TAG_PROVED: u8 = 1;
+/// One entry's bytes at most: sequence, possession tag, key id, tag.
+const ENTRY_MAX: usize = 8 + 1 + 4 + TAG_LEN;
 
 impl Check for DeliveryAnswerContent {
     /// At most `MAX_SEQUENCES` entries, strictly ascending by sequence, and none at all from a
@@ -178,9 +373,10 @@ impl Fields for DeliveryAnswerContent {
         for (sequence, possession) in &answer.entries {
             out.extend_from_slice(&sequence.to_be_bytes());
             match possession {
-                Possession::Proved(proof) => {
+                Possession::Proved { key, tag } => {
                     out.push(TAG_PROVED);
-                    out.extend_from_slice(proof);
+                    out.extend_from_slice(&key.to_be_bytes());
+                    out.extend_from_slice(tag);
                 }
                 Possession::NotSeen => out.push(TAG_NOT_SEEN),
             }
@@ -209,7 +405,10 @@ impl Fields for DeliveryAnswerContent {
                 let sequence = reader.u64()?;
                 let possession = match reader.u8()? {
                     TAG_NOT_SEEN => Possession::NotSeen,
-                    TAG_PROVED => Possession::Proved(reader.array()?),
+                    TAG_PROVED => Possession::Proved {
+                        key: reader.u32()?,
+                        tag: reader.array()?,
+                    },
                     other => {
                         return Err(WireError::Invalid {
                             field: "possession tag",
@@ -237,43 +436,56 @@ signed_record!(
     DeliveryAnswerContent,
     b"tally delivery answer",
     1,
-    1 + KEY_LEN + 32 + KEY_LEN + 8 + 8 + 1 + 2 + MAX_SEQUENCES as usize * 41 + 64
+    1 + KEY_LEN + 32 + KEY_LEN + 8 + 8 + 1 + 2 + MAX_SEQUENCES as usize * ENTRY_MAX + 64
 );
-
-/// The proof that one holds `batch`: BLAKE2s-256 over `"tally possession" 0x00`, the nonce and
-/// the batch's signed bytes. The nonce comes first and is fresh, so the proof is keyed by it and
-/// no earlier answer can be replayed.
-pub fn possession_proof(nonce: &Hash, batch: &Batch) -> Hash {
-    let mut hasher = Blake2s256::new();
-    hasher.update(POSSESSION_DOMAIN);
-    hasher.update([0]);
-    hasher.update(nonce);
-    hasher.update(batch.as_bytes());
-    hasher.finalize().into()
-}
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::batch::BatchContent;
+    use crate::batch::{Batch, BatchContent};
     use crate::key::Identity;
 
-    #[test]
-    fn a_query_and_its_signed_answer_round_trip_and_only_a_holder_proves() -> Result<(), WireError>
-    {
-        let feeder = Identity::generate()?;
-        let batch = Batch::sign(
-            &feeder,
+    fn batch(feeder: &Identity, sequence: u64) -> Result<Batch, WireError> {
+        Batch::sign(
+            feeder,
             &BatchContent {
                 boot_id: 3,
-                sequence: 41,
+                sequence,
                 counter_epoch: 0,
                 wall_ms: 1,
                 dropped: 0,
                 previous: [0; 32],
                 observations: Vec::new(),
             },
-        )?;
+        )
+    }
+
+    fn grant(feeder: &Identity, member: PublicKey) -> Result<TagKeys, WireError> {
+        TagKeys::sign(
+            feeder,
+            &TagKeysContent {
+                member,
+                current: TagKey {
+                    id: 7,
+                    key: [1; TAG_KEY_LEN],
+                },
+                next: TagKey {
+                    id: 8,
+                    key: [2; TAG_KEY_LEN],
+                },
+                switch_in_ms: 1_000,
+            },
+        )
+    }
+
+    #[test]
+    fn a_query_with_keys_and_its_signed_answer_round_trip() -> Result<(), WireError> {
+        let feeder = Identity::generate()?;
+        let member = Identity::generate()?;
+        let batch = batch(&feeder, 41)?;
+        let keys = grant(&feeder, member.public())?;
+        keys.verify()?;
+        assert_eq!(keys.content()?.next.id, 8);
         let query = DeliveryQuery {
             nonce: [9; 32],
             receiver: feeder.public(),
@@ -288,11 +500,15 @@ mod tests {
                     last: 50,
                 },
             ],
+            keys: Some(keys.clone()),
         };
         assert_eq!(DeliveryQuery::from_body(&query.to_bytes()?)?, query);
-        let proof = possession_proof(&query.nonce, &batch);
-        assert_ne!(proof, possession_proof(&[8; 32], &batch));
-        let member = Identity::generate()?;
+        let keyless = DeliveryQuery {
+            keys: None,
+            ..query.clone()
+        };
+        assert_eq!(DeliveryQuery::from_body(&keyless.to_bytes()?)?, keyless);
+        let tag = delivery_tag(&[1; TAG_KEY_LEN], batch.as_bytes());
         let content = DeliveryAnswerContent {
             nonce: query.nonce,
             receiver: feeder.public(),
@@ -301,7 +517,7 @@ mod tests {
             takes_area: true,
             entries: vec![
                 (40, Possession::NotSeen),
-                (41, Possession::Proved(proof)),
+                (41, Possession::Proved { key: 7, tag }),
                 (50, Possession::NotSeen),
             ],
         };
@@ -309,6 +525,14 @@ mod tests {
         let back = DeliveryAnswer::from_bytes(answer.as_bytes().to_vec())?;
         back.verify()?;
         assert_eq!(back.content()?, content);
+        // A full answer fits its bound.
+        let full = DeliveryAnswerContent {
+            entries: (0..MAX_SEQUENCES)
+                .map(|sequence| (sequence, Possession::Proved { key: 7, tag }))
+                .collect(),
+            ..content.clone()
+        };
+        assert!(DeliveryAnswer::sign(&member, &full).is_ok());
         // Too many asked, or out of order, is refused.
         let mut greedy = query.clone();
         greedy.ranges = vec![SequenceRange {
@@ -316,15 +540,59 @@ mod tests {
             last: 100,
         }];
         assert!(greedy.to_bytes().is_err());
-        let mut backwards = query;
+        let mut backwards = query.clone();
         backwards.ranges.reverse();
         assert!(backwards.to_bytes().is_err());
+        // Keys signed by anyone but the receiver are refused on both sides.
+        let forged = DeliveryQuery {
+            keys: Some(grant(&Identity::generate()?, member.public())?),
+            ..query
+        };
+        assert!(forged.to_bytes().is_err());
         // Outside its area a member says nothing of the batches.
         let outside = DeliveryAnswerContent {
             takes_area: false,
             ..content
         };
         assert!(DeliveryAnswer::sign(&member, &outside).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn a_grants_ids_follow_each_other_and_its_switch_is_within_a_period() -> Result<(), WireError> {
+        let feeder = Identity::generate()?;
+        let member = Identity::generate()?.public();
+        let mut content = grant(&feeder, member)?.content()?;
+        content.next.id = 9;
+        assert!(TagKeys::sign(&feeder, &content).is_err());
+        content.next.id = 8;
+        content.switch_in_ms = KEY_PERIOD_MS + 1;
+        assert!(TagKeys::sign(&feeder, &content).is_err());
+        // Never printed.
+        assert!(!format!("{:?}", content.current).contains("[1"));
+        Ok(())
+    }
+
+    #[test]
+    fn a_tag_needs_the_key_and_every_byte_and_rotation_bounds_it() -> Result<(), WireError> {
+        let feeder = Identity::generate()?;
+        let one = batch(&feeder, 1)?;
+        let other = batch(&feeder, 2)?;
+        let key = [5; TAG_KEY_LEN];
+        let tag = delivery_tag(&key, one.as_bytes());
+        assert_eq!(tag, delivery_tag(&key, one.as_bytes()));
+        assert_ne!(tag, delivery_tag(&[6; TAG_KEY_LEN], one.as_bytes()));
+        assert_ne!(tag, delivery_tag(&key, other.as_bytes()));
+        // What a piece manifest lists of the batch is its hash: no tag made from the hash (or any
+        // prefix of the bytes) is the batch's.
+        assert_ne!(tag, delivery_tag(&key, &one.hash()));
+        let bytes = one.as_bytes();
+        assert_ne!(tag, delivery_tag(&key, &bytes[..bytes.len() - 1]));
+        // Keys in force for a batch: its period and one either side.
+        let sent = 10 * KEY_PERIOD_MS + 5;
+        assert_eq!(tag_keys_for(sent), 9..=11);
+        assert_eq!(tag_keys_for(0), 0..=1);
+        assert!(!tag_keys_for(sent + 3 * KEY_PERIOD_MS).contains(&10));
         Ok(())
     }
 
@@ -339,6 +607,7 @@ mod tests {
             body.extend_from_slice(&first.to_be_bytes());
             body.extend_from_slice(&last.to_be_bytes());
         }
+        body.push(NO_KEYS);
         Ok(body)
     }
 
@@ -376,10 +645,17 @@ mod tests {
                         last: *last,
                     })
                     .collect(),
+                keys: None,
             };
             assert!(query.to_bytes().is_err(), "{ranges:?}");
         }
         assert!(DeliveryQuery::from_body(&query_body(&[(0, 63)])?).is_ok());
+        // A keys flag that is neither is refused.
+        let mut body = query_body(&[(0, 0)])?;
+        if let Some(flag) = body.last_mut() {
+            *flag = 2;
+        }
+        assert!(DeliveryQuery::from_body(&body).is_err());
         Ok(())
     }
 

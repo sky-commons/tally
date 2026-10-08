@@ -60,9 +60,16 @@ const INFO_EVERY: Duration = Duration::from_secs(600);
 /// The least burst a relay's rate limit is given: the largest record one message carries, so a
 /// batch always fits, however small a burst the relay asked for.
 const BURST_FLOOR: u32 = noise::MAX_PLAINTEXT as u32;
-/// Batches remembered with the relays they were written to, for the delivery check: several
-/// minutes at one a second.
-const SENT_KEPT: usize = 512;
+/// The most batches remembered with the relays they were written to, for the delivery check: the
+/// window (`ASK_WITHIN_MS`) at one a second, with room for a feeder that seals faster. Each is a
+/// few dozen bytes; only the audited batches keep their bytes.
+const SENT_KEPT: usize = 1_024;
+/// The most relays the remembered batches name: a feeder writes to two, and a few more over the
+/// window as it fails over.
+const RELAY_SLOTS: usize = 15;
+/// The bit of a remembered batch's relays that says one of them could not be named (more than
+/// `RELAY_SLOTS` in the window): such a batch is never taken as the audited relay's alone.
+const UNNAMED: u16 = 1 << RELAY_SLOTS;
 
 /// Where the feeder heard of a relay. Kept so that one relay's hints never outweigh the owner's
 /// list, the seeds, or another relay's hints in what is remembered.
@@ -540,10 +547,27 @@ struct Withheld {
     from: Vec<PublicKey>,
 }
 
+/// One of the feeder's batches as remembered: its name, when it was first written, and to which
+/// relays (bits over `LedgerState::slots`). Not its bytes.
+#[derive(Clone, Copy, Debug)]
+struct Mark {
+    boot_id: u64,
+    sequence: u64,
+    first_at: tokio::time::Instant,
+    sent_ms: u64,
+    relays: u16,
+}
+
 #[derive(Default)]
 struct LedgerState {
-    /// The feeder's batches, oldest first, with when each was first written and to whom.
-    sent: VecDeque<(tokio::time::Instant, Sent)>,
+    /// The feeder's batches written within the window, oldest first.
+    sent: VecDeque<Mark>,
+    /// The relays the marks name, by bit.
+    slots: Vec<PublicKey>,
+    /// The sequences the latest audit covers (kept after it ends, until the next), and the
+    /// batches of them written: the only bytes the ledger keeps.
+    audited_range: Option<(u64, u64)>,
+    audited: Vec<Batch>,
     /// The newest sequence any session has seen.
     newest: Option<u64>,
     audit: Option<Audit>,
@@ -612,29 +636,48 @@ impl Ledger {
         let Ok(mut state) = self.state.lock() else {
             return;
         };
-        let (boot, sequence) = (batch.boot_id(), batch.sequence());
-        let found =
-            state.sent.iter_mut().rev().find(|(_, sent)| {
-                sent.batch.sequence() == sequence && sent.batch.boot_id() == boot
-            });
+        let (boot_id, sequence) = (batch.boot_id(), batch.sequence());
+        let bit = state.bit(relay);
+        let now = tokio::time::Instant::now();
+        let window = Duration::from_millis(delivery_check::ASK_WITHIN_MS);
+        while state
+            .sent
+            .front()
+            .is_some_and(|mark| now.saturating_duration_since(mark.first_at) > window)
+        {
+            state.sent.pop_front();
+        }
+        let found = state
+            .sent
+            .iter_mut()
+            .rev()
+            .find(|mark| mark.sequence == sequence && mark.boot_id == boot_id);
         match found {
-            Some((_, sent)) => {
-                if !sent.relays.contains(&relay) {
-                    sent.relays.push(relay);
-                }
-            }
+            Some(mark) => mark.relays |= bit,
             None => {
-                state.sent.push_back((
-                    tokio::time::Instant::now(),
-                    Sent {
-                        batch: batch.clone(),
-                        relays: vec![relay],
-                    },
-                ));
+                state.sent.push_back(Mark {
+                    boot_id,
+                    sequence,
+                    first_at: now,
+                    sent_ms: wall_ms(),
+                    relays: bit,
+                });
                 if state.sent.len() > SENT_KEPT {
                     state.sent.pop_front();
                 }
             }
+        }
+        let audited = state
+            .audited_range
+            .is_some_and(|(first, last)| (first..=last).contains(&sequence));
+        if audited
+            && !state
+                .audited
+                .iter()
+                .any(|kept| kept.sequence() == sequence && kept.boot_id() == boot_id)
+            && state.audited.len() < 2 * SAMPLED
+        {
+            state.audited.push(batch.clone());
         }
     }
 
@@ -644,12 +687,15 @@ impl Ledger {
         self.end_audit();
         if let Ok(mut state) = self.state.lock() {
             let first = state.newest.map_or(0, |newest| newest + 2);
+            let last = first + SAMPLED as u64 - 1;
             state.audit = Some(Audit {
                 relay,
                 first,
-                last: first + SAMPLED as u64 - 1,
+                last,
                 broken: false,
             });
+            state.audited_range = Some((first, last));
+            state.audited.clear();
         }
     }
 
@@ -666,12 +712,13 @@ impl Ledger {
             };
             let withheld = std::mem::take(&mut state.withheld);
             let mut owed = 0;
+            let audited_bit = state.slot(&audit.relay).map_or(0, |slot| 1 << slot);
             for kept in withheld {
                 let carried = !audit.broken
-                    && state.sent.iter().any(|(_, sent)| {
-                        sent.batch.sequence() == kept.batch.sequence()
-                            && sent.batch.boot_id() == kept.batch.boot_id()
-                            && sent.relays.contains(&audit.relay)
+                    && state.sent.iter().any(|mark| {
+                        mark.sequence == kept.batch.sequence()
+                            && mark.boot_id == kept.batch.boot_id()
+                            && mark.relays & audited_bit != 0
                     });
                 if carried {
                     continue;
@@ -734,20 +781,85 @@ impl Ledger {
         live
     }
 
-    /// The batches first written at least `settle` ago, oldest first.
-    pub fn settled(&self, settle: Duration) -> Vec<Sent> {
+    /// The latest audit's batches first written at least `settle` ago, oldest first, each with the
+    /// relays it was written to and when: what a check samples. A batch one of whose relays could
+    /// not be named is left out (it could look like the audited relay's alone).
+    pub fn audited(&self, settle: Duration) -> Vec<Sent> {
         let now = tokio::time::Instant::now();
-        self.state.lock().map_or_else(
-            |_| Vec::new(),
-            |state| {
-                state
-                    .sent
-                    .iter()
-                    .filter(|(at, _)| now.saturating_duration_since(*at) >= settle)
-                    .map(|(_, sent)| sent.clone())
-                    .collect()
-            },
-        )
+        let Ok(state) = self.state.lock() else {
+            return Vec::new();
+        };
+        let mut out: Vec<Sent> = state
+            .audited
+            .iter()
+            .filter_map(|batch| {
+                let mark = state.sent.iter().rev().find(|mark| {
+                    mark.sequence == batch.sequence() && mark.boot_id == batch.boot_id()
+                })?;
+                if now.saturating_duration_since(mark.first_at) < settle
+                    || mark.relays & UNNAMED != 0
+                {
+                    return None;
+                }
+                Some(Sent {
+                    batch: batch.clone(),
+                    relays: state.named(mark.relays),
+                    sent_ms: mark.sent_ms,
+                })
+            })
+            .collect();
+        out.sort_by_key(|sent| (sent.batch.boot_id(), sent.batch.sequence()));
+        out
+    }
+
+    /// Batches remembered now, and the bytes the ledger holds of batches (the audited and the
+    /// withheld): what it costs a feeder.
+    pub fn held(&self) -> (usize, usize) {
+        self.state.lock().map_or((0, 0), |state| {
+            let bytes = state
+                .audited
+                .iter()
+                .chain(state.withheld.iter().map(|kept| &kept.batch))
+                .chain(state.owed.values().flatten())
+                .map(|batch| batch.as_bytes().len())
+                .sum();
+            (state.sent.len(), bytes)
+        })
+    }
+}
+
+impl LedgerState {
+    fn slot(&self, relay: &PublicKey) -> Option<usize> {
+        self.slots.iter().position(|slot| slot == relay)
+    }
+
+    /// `relay`'s bit: its slot, a new one, or one no remembered batch names any more; `UNNAMED`
+    /// when every slot is in use.
+    fn bit(&mut self, relay: PublicKey) -> u16 {
+        if let Some(slot) = self.slot(&relay) {
+            return 1 << slot;
+        }
+        if self.slots.len() < RELAY_SLOTS {
+            self.slots.push(relay);
+            return 1 << (self.slots.len() - 1);
+        }
+        let used = self.sent.iter().fold(0u16, |used, mark| used | mark.relays);
+        match (0..RELAY_SLOTS).find(|slot| used & (1 << slot) == 0) {
+            Some(slot) => {
+                self.slots[slot] = relay;
+                1 << slot
+            }
+            None => UNNAMED,
+        }
+    }
+
+    fn named(&self, relays: u16) -> Vec<PublicKey> {
+        self.slots
+            .iter()
+            .enumerate()
+            .filter(|(slot, _)| relays & (1 << slot) != 0)
+            .map(|(_, relay)| *relay)
+            .collect()
     }
 }
 
@@ -858,6 +970,9 @@ pub async fn run(publishing: Publishing) {
     let every = publisher.checking.every;
     let mut check = tokio::time::interval_at(tokio::time::Instant::now() + jittered(every), every);
     check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Keys go to the members on their own schedule, never an audit's (`delivery_check`).
+    let mut grant = tokio::time::interval(publisher.checking.grant_every);
+    grant.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // The check in progress: the stage it is in, and when that stage is over.
     let mut stage: Option<(Stage, tokio::time::Instant)> = None;
     loop {
@@ -868,6 +983,7 @@ pub async fn run(publishing: Publishing) {
                 round_began = tokio::time::Instant::now();
                 publisher.probe_round();
             }
+            _ = grant.tick(), if publisher.area.is_some() => publisher.grant_keys(),
             // One check at a time: the next begins once the last is judged or dropped.
             _ = check.tick(), if publisher.area.is_some() && stage.is_none()
                 && !publisher.checker.in_progress() => {
@@ -944,18 +1060,56 @@ impl Publisher {
         });
     }
 
-    /// The members of the feeder's area to ask about batches sent to `checked`.
+    /// The members of the feeder's area to ask about batches sent to `checked`: those given the
+    /// key in force now.
     fn members(&self, checked: &[PublicKey]) -> Vec<delivery_check::Member> {
         let Some(area) = self.area else {
             return Vec::new();
         };
+        let now = wall_ms();
         delivery_check::members(
             &self.directory.offers(),
             area,
             checked,
             &self.observed,
-            wall_ms(),
+            |member| self.checker.keyring.keyed(member, now),
+            now,
         )
+    }
+
+    /// Gives every member of the area the feeder may ask its tag keys for this period and the
+    /// next, if it has not been given this period's: a query that carries keys alone, over a
+    /// `Probe` session, whose answer says nothing the feeder needs.
+    fn grant_keys(&mut self) {
+        let Some(area) = self.area else {
+            return;
+        };
+        let now = wall_ms();
+        let members = delivery_check::keyable(&self.directory.offers(), area, &self.observed, now);
+        let receiver = self.identity.public();
+        for member in members {
+            if self.checker.keyring.keyed(&member.relay.key, now) {
+                continue;
+            }
+            let Some(keys) = self
+                .checker
+                .keyring
+                .grant(&self.identity, member.relay.key, now)
+            else {
+                continue;
+            };
+            let query = DeliveryQuery {
+                nonce: delivery_check::fresh_nonce(),
+                receiver,
+                boot_id: 0,
+                ranges: Vec::new(),
+                keys: Some(keys),
+            };
+            let identity = self.identity.clone();
+            self.tasks.spawn(async move {
+                let _ = delivery_check::ask(&member.relay, &identity, &query).await;
+            });
+        }
     }
 
     /// Begins a check: audits the next relay with a session up that the area has members to ask
@@ -972,9 +1126,23 @@ impl Publisher {
         };
         let now = wall_ms();
         let observed = &self.observed;
-        let audited = self.checker.audit(&held, |relay| {
-            !delivery_check::members(&offers, area, &[*relay], observed, now).is_empty()
-        });
+        let keyring = &self.checker.keyring;
+        let askable: Vec<PublicKey> = held
+            .iter()
+            .filter(|relay| {
+                !delivery_check::members(
+                    &offers,
+                    area,
+                    &[**relay],
+                    observed,
+                    |member| keyring.keyed(member, now),
+                    now,
+                )
+                .is_empty()
+            })
+            .copied()
+            .collect();
+        let audited = self.checker.audit(&held, |relay| askable.contains(relay));
         match audited {
             Some(relay) => {
                 self.ledger.audit(relay);
@@ -986,7 +1154,7 @@ impl Publisher {
 
     /// Asks the area's members about the audited batches, once they have settled.
     fn ask_members(&mut self) {
-        let recent = self.ledger.settled(self.checking.settle);
+        let recent = self.ledger.audited(self.checking.settle);
         let Some(query) = self.checker.sample(&recent) else {
             self.checker.abandon();
             return;
@@ -996,12 +1164,28 @@ impl Publisher {
             self.checker.abandon();
             return;
         }
+        // Each member's query carries its keys again: an ask looks like a grant.
+        let now = wall_ms();
+        let asks: Vec<(delivery_check::Member, DeliveryQuery)> = members
+            .into_iter()
+            .map(|member| {
+                let keys = self
+                    .checker
+                    .keyring
+                    .grant(&self.identity, member.relay.key, now);
+                let query = DeliveryQuery {
+                    keys,
+                    ..query.clone()
+                };
+                (member, query)
+            })
+            .collect();
         let identity = self.identity.clone();
         let events = self.events.clone();
         self.tasks.spawn(async move {
             let mut asking = JoinSet::new();
-            for member in members {
-                let (identity, query) = (identity.clone(), query.clone());
+            for (member, query) in asks {
+                let identity = identity.clone();
                 asking.spawn(async move {
                     delivery_check::ask(&member.relay, &identity, &query)
                         .await
@@ -1767,7 +1951,7 @@ mod tests {
             }
         }
         assert_eq!(solo, vec![4, 5, 6, 7]);
-        let sent = ledger.settled(Duration::ZERO);
+        let sent = ledger.audited(Duration::ZERO);
         let audited_alone: Vec<u64> = sent
             .iter()
             .filter(|sent| sent.relays == vec![audited])
@@ -1779,6 +1963,53 @@ mod tests {
         ledger.live(audited, false);
         let next = batch(&feeder, 13)?;
         assert!(ledger.routes(&other, &next));
+        Ok(())
+    }
+
+    #[test]
+    fn the_ledger_keeps_names_for_the_window_and_bytes_only_of_audited_batches()
+    -> Result<(), String> {
+        // RFC-0177's feeder: a batch of about 8 KB a second, to two relays, audited now and then.
+        // Before, the ledger kept 512 whole batches (some 4 MiB); now it keeps each batch's name
+        // and relays, and the bytes of the audited ones alone.
+        let feeder = Identity::generate().map_err(|error| error.to_string())?;
+        let (audited, other) = (key()?, key()?);
+        let ledger = Ledger::default();
+        ledger.live(audited, true);
+        ledger.live(other, true);
+        let large = |sequence: u64| -> Result<Batch, String> {
+            let mut bytes = vec![1];
+            bytes.extend_from_slice(feeder.public().as_bytes());
+            bytes.extend_from_slice(&1u64.to_be_bytes());
+            bytes.extend_from_slice(&sequence.to_be_bytes());
+            bytes.resize(8 * 1024, 0);
+            Batch::from_bytes(bytes).map_err(|error| error.to_string())
+        };
+        for sequence in 0..3_000 {
+            if sequence % 300 == 0 {
+                ledger.audit(audited);
+            }
+            if sequence % 300 == 10 {
+                ledger.end_audit();
+            }
+            let batch = large(sequence)?;
+            for relay in [audited, other] {
+                if ledger.routes(&relay, &batch) {
+                    ledger.record(relay, &batch);
+                }
+            }
+            let _ = ledger.take_owed(&other);
+        }
+        let (names, bytes) = ledger.held();
+        assert!(names <= SENT_KEPT, "{names} names");
+        assert!(bytes <= 2 * SAMPLED * 8 * 1024, "{bytes} bytes of batches");
+        let resident = names * std::mem::size_of::<Mark>() + bytes;
+        assert!(resident < 128 * 1024, "{resident} bytes in all");
+        assert!(resident * 32 < 512 * 8 * 1024, "{resident} bytes in all");
+        // The audited batches are still there to check.
+        let sent = ledger.audited(Duration::ZERO);
+        assert_eq!(sent.len(), SAMPLED);
+        assert!(sent.iter().all(|sent| sent.relays == vec![audited]));
         Ok(())
     }
 
@@ -1925,6 +2156,7 @@ mod tests {
                 every: Duration::from_secs(1),
                 audit_for: Duration::from_secs(1),
                 settle: Duration::from_millis(500),
+                grant_every: Duration::from_millis(200),
             },
             prober: |relay, me| {
                 Box::pin(async move {

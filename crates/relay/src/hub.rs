@@ -1,6 +1,12 @@
-//! What every connection of a relay shares: the fan-out, the record of batches, positions, clock
-//! models and fault proofs already forwarded, the deduplicated stream being gathered, each receiver's newest
-//! self-description, and the relays this one offers as hints.
+//! What every connection of a relay shares: the fan-out (`fanout::Router`), the staged ingest of
+//! receivers' batches (`ingest::Stages`, RFC-0177), the record of positions, clock models and fault
+//! proofs already forwarded, each receiver's newest self-description, the admission budget
+//! (`budget`), and the relays this one offers as hints.
+//!
+//! A receiver's batch is admitted on the ingest worker that owns its raw shard ([`RawShard`]: its
+//! sequence windows, hashes and station counters, touched by that worker alone), decoded once,
+//! routed to the message exchange (the one deduplication, `exchange`) and offered to the fan-out
+//! from there, so its subscribers read it in admitted order.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, Ipv6Addr};
@@ -10,23 +16,25 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tally_wire::batch::Hash;
 use tally_wire::{
-    Batch, ClockModel, ClockModelPart, Decoded, FaultProof, Location, ObsView, Observation,
-    Positions, PublicKey, ReceiverInfo, Record, Region, RelayAddress,
+    Batch, ClockModel, ClockModelPart, Decoded, FaultProof, Location, Observation, Positions,
+    PublicKey, ReceiverInfo, Record, Region, RelayAddress,
 };
-use tokio::sync::broadcast;
+use tokio::sync::OwnedSemaphorePermit;
 
 use crate::bounded::Bounded;
+use crate::budget::{Budget, PerFeeder, Store, memory_available};
 use crate::egress::{Cap, Egress};
-use crate::ingest::Ingest;
-use crate::network::Network;
+use crate::exchange::{SHARDS, Sink, raw_shard};
+use crate::fanout::{BEHIND_MS, Bounds, Filter, Listener, Router};
+use crate::ingest::{Clock, Refusal, Stages, Stamp, Threads};
+use crate::network::{Asker, Network};
 use crate::parts::Parts;
 use crate::stations::{STATIONS_REMEMBERED, StationReport, Stations, StationsReport};
 use crate::subscription::{Described, Subscription};
 
-/// How many records a subscriber may fall behind before it is dropped. readsb's rule: drop the
-/// slow consumer, never slow the producers (RFC-0171 §3.6). Sized with the other defaults to the
-/// relay unit's memory (see `DEFAULT_MAX_CONNECTIONS`).
-pub const FAN_OUT_CAPACITY: usize = 4096;
+/// The least a subscriber's queue may hold, whatever the budget: a few seconds of one busy
+/// feeder, so a relay sized for few feeders still serves a subscriber a burst.
+pub const MIN_QUEUE_BYTES: usize = 64 * 1024 * 1024;
 
 /// How long a forwarded batch's hash is remembered, by default. Longer than any loop through the
 /// relay tree, so a batch arriving again by another path is recognised and forwarded once. It is
@@ -99,9 +107,9 @@ pub const DESCRIPTION_BYTES_HELD: usize = 64 * 1024 * 1024;
 /// | ------------------------------------------------------------ | ---------- |
 /// | 2,048 connections x ~320 KiB (Noise buffers, a decoded read) | 640 MiB    |
 /// | kernel socket buffers charged to the unit, ~100 fan-out links x 4 MiB | 400 MiB |
-/// | fan-out ring, 4,096 records x one 64 KiB message             | 256 MiB    |
+/// | subscriber queues (`fanout`, from the admission budget)      | per feeder |
 /// | records a link has gathered but not sent, ~100 x 320 KiB     | 32 MiB     |
-/// | deduplicated stream (`DEFAULT_MAX_DEDUP_BYTES`)              | 256 MiB    |
+/// | deduplication (`exchange`, from the admission budget)        | per feeder |
 /// | descriptions (`DESCRIPTION_BYTES_HELD`) and their index      | 80 MiB     |
 /// | streams, three tables x 200,000 x ~150 B                     | 90 MiB     |
 /// | hashes, four tables x two generations x 100,000              | 36 MiB     |
@@ -128,26 +136,6 @@ pub const DEFAULT_MAX_FEEDER_BYTES_PER_SEC: u64 = 262_144;
 /// whatever the key. An engine publishes nothing (an MLAT relay shares its positions through its
 /// groups), so it is held to the feeders' ceiling like any connection that only asks.
 pub const DEFAULT_MAX_MEMBER_BYTES_PER_SEC: u64 = 8 * 1024 * 1024;
-/// The most the deduplicated stream holds of messages being compared, by default.
-pub const DEFAULT_MAX_DEDUP_BYTES: usize = 256 * 1024 * 1024;
-
-/// What one gathered observation costs the deduplicator beside its bytes: its fields, its vector
-/// and its place in arrival order. An estimate, on the high side.
-const DEDUP_ENTRY_OVERHEAD: usize = 96;
-
-/// What one message remembered as heard costs the deduplicator: a 128-bit fingerprint and an
-/// instant in a hash map, with the map's slack. An estimate, on the high side.
-const DEDUP_KEY_COST: usize = 64;
-
-/// How many independently locked parts the deduplicator is split into, by fingerprint, so feeders
-/// offering observations at once rarely wait on each other.
-const DEDUP_SHARDS: usize = 64;
-
-/// How long a message's bytes are remembered for the deduplicated stream: another receiver's copy
-/// of the same transmission arrives well inside it, and a message an aircraft repeats a second or
-/// two later is a new transmission.
-const DEDUPLICATION_WINDOW: Duration = Duration::from_secs(2);
-
 /// The connection id of records the relay makes itself (its deduplicated stream). Connections
 /// are numbered from 1, so nothing is ever held back from a link as its own.
 pub const RELAY_ITSELF: u64 = 0;
@@ -168,6 +156,9 @@ pub struct Item {
     /// For a receiver's batch of a format this build reads: its one decode (`ingest`), so no
     /// reader of the fan-out (the BEAST output) inflates or parses it again.
     pub decoded: Option<Arc<Decoded>>,
+    /// The ingest clock when it was taken: a subscriber queue's age is read from this
+    /// (`fanout::BEHIND_MS`).
+    pub stamp_ms: u64,
 }
 
 /// Two generations of hashes: a hash is remembered for one to two windows, or until `most` newer
@@ -340,126 +331,6 @@ impl<K: std::hash::Hash + Eq + Clone> Forwarded<K> {
     }
 }
 
-/// The deduplicated stream on its way to being signed: first copies of each message, and when
-/// each message was first heard, across every receiver. It holds at most `max_bytes` (counted by
-/// `cost` and `DEDUP_KEY_COST`, one budget for every shard, an atomic); a new message beyond that
-/// is still forwarded raw in its receiver's batch, but is not compared or gathered here until there
-/// is room, and is counted in `skipped`.
-///
-/// A message is remembered by its reception's one fingerprint (`tally_wire::decoded`: keyed
-/// SipHash-2-4, 128 bits, made once when the batch is decoded), not by a copy of its bytes. The
-/// fingerprint also chooses the message's shard.
-/// Each shard is locked on its own; bytes are added to and released from `held` only under the
-/// shard that holds them, so the count never runs below what the shards hold.
-struct Deduplicator {
-    shards: Vec<Mutex<Shard>>,
-    /// The order observations are offered in, so what is taken keeps arrival order across shards.
-    arrived: AtomicU64,
-    held: AtomicUsize,
-    max_bytes: usize,
-    skipped: AtomicU64,
-}
-
-#[derive(Default)]
-struct Shard {
-    first_heard: HashMap<u128, Instant>,
-    gathered: Vec<(u64, Observation)>,
-}
-
-/// What holding `data` once as a gathered observation costs the deduplicator.
-fn cost(data: &[u8]) -> usize {
-    data.len() + DEDUP_ENTRY_OVERHEAD
-}
-
-impl Deduplicator {
-    fn new(max_bytes: usize) -> Self {
-        Self {
-            shards: (0..DEDUP_SHARDS).map(|_| Mutex::default()).collect(),
-            arrived: AtomicU64::new(0),
-            held: AtomicUsize::new(0),
-            max_bytes,
-            skipped: AtomicU64::new(0),
-        }
-    }
-
-    /// One reception, its fingerprint `fingerprint`: gathered (copied) when its message is new
-    /// this window and there is room.
-    fn offer(&self, fingerprint: u128, observation: ObsView<'_>, now: Instant) {
-        // The low bits of one half: uniform, whatever the messages.
-        let at = usize::try_from(fingerprint % DEDUP_SHARDS as u128).unwrap_or(0);
-        let Some(Ok(mut shard)) = self.shards.get(at).map(Mutex::lock) else {
-            return;
-        };
-        let heard = shard.first_heard.get(&fingerprint);
-        if heard.is_some_and(|heard| now.duration_since(*heard) < DEDUPLICATION_WINDOW) {
-            return;
-        }
-        // A key already held (heard a window ago, not yet purged) costs nothing more as a key.
-        let as_key = if heard.is_some() { 0 } else { DEDUP_KEY_COST };
-        let needed = as_key + cost(observation.data);
-        let reserved = self
-            .held
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |held| {
-                held.checked_add(needed)
-                    .filter(|after| *after <= self.max_bytes)
-            });
-        if reserved.is_err() {
-            self.skipped.fetch_add(1, Ordering::Relaxed);
-            return;
-        }
-        shard.first_heard.insert(fingerprint, now);
-        let order = self.arrived.fetch_add(1, Ordering::Relaxed);
-        shard.gathered.push((order, observation.to_observation()));
-    }
-
-    /// An owned reception, fingerprinted under the process key: for tests.
-    #[cfg(test)]
-    fn offer_owned(&self, observation: Observation, now: Instant) {
-        let fingerprint = tally_wire::FingerprintKey::process()
-            .fingerprint(observation.format, &observation.data);
-        self.offer(fingerprint, ObsView::from(&observation), now);
-    }
-
-    /// The observations gathered since the last call, in the order they were offered; forgets the
-    /// messages heard a window ago.
-    fn take(&self, now: Instant) -> Vec<Observation> {
-        let mut gathered = Vec::new();
-        for shard in &self.shards {
-            let Ok(mut shard) = shard.lock() else {
-                continue;
-            };
-            let before = shard.first_heard.len();
-            shard
-                .first_heard
-                .retain(|_, heard| now.duration_since(*heard) < DEDUPLICATION_WINDOW);
-            let mut released = (before - shard.first_heard.len()) * DEDUP_KEY_COST;
-            let taken = std::mem::take(&mut shard.gathered);
-            released += taken
-                .iter()
-                .map(|(_, observation)| cost(&observation.data))
-                .sum::<usize>();
-            // Released under the lock it was added under, so `held` never runs below zero.
-            self.held.fetch_sub(released, Ordering::AcqRel);
-            gathered.extend(taken);
-        }
-        gathered.sort_unstable_by_key(|(order, _)| *order);
-        gathered
-            .into_iter()
-            .map(|(_, observation)| observation)
-            .collect()
-    }
-
-    /// How many new messages were left out since the last call.
-    fn take_skipped(&self) -> u64 {
-        self.skipped.swap(0, Ordering::Relaxed)
-    }
-
-    #[cfg(test)]
-    fn held(&self) -> usize {
-        self.held.load(Ordering::Acquire)
-    }
-}
-
 /// A receiver's newest description, ready to send, and the finest cell of the location it
 /// declared in it.
 struct Known {
@@ -480,6 +351,79 @@ impl Known {
             cell: self.cell,
             points: None,
             decoded: None,
+            stamp_ms: 0,
+        }
+    }
+}
+
+/// One raw shard's state (`exchange::raw_shard`): its receivers' batch streams and their station
+/// counters. Owned by the ingest worker of the shard, which alone takes it on the batch path; the
+/// lock is for the reports and a feeder's arrival and departure.
+struct RawShard {
+    batches: Forwarded<(PublicKey, u64)>,
+    stations: Stations,
+}
+
+impl RawShard {
+    fn new(window: Duration) -> Self {
+        Self {
+            batches: Forwarded::bounded(
+                window,
+                STREAMS_REMEMBERED.div_ceil(SHARDS),
+                HASHES_REMEMBERED.div_ceil(SHARDS),
+            ),
+            stations: Stations::new(STATIONS_REMEMBERED.div_ceil(SHARDS)),
+        }
+    }
+}
+
+/// A feeder's own description, as its link last took it: given to the hub again when the hub has
+/// forgotten it and the feeder is publishing (see `RECEIVERS_REMEMBERED`).
+#[derive(Clone, Debug)]
+pub struct OwnDescription {
+    pub info: ReceiverInfo,
+    pub issued_ms: u64,
+    pub place: Option<Location>,
+}
+
+/// Where a batch came from, for what follows its admission.
+#[derive(Clone, Debug)]
+pub enum Origin {
+    /// The receiver's own feeder, with its description as its link holds it: seeded into the
+    /// receiver's sharing group by this relay, its origin.
+    Feeder(Option<Arc<OwnDescription>>),
+    /// A sharing member or a relay link: a piece of a group.
+    Peer(Asker),
+    /// Anywhere else (a subscriber, a test): forwarded, nothing more.
+    Elsewhere,
+}
+
+/// A batch a link took in, on its way to the ingest stage.
+pub struct Inbound {
+    pub source: u64,
+    pub batch: Batch,
+    pub origin: Origin,
+    /// Check the receiver's signature first (every batch a link takes; a test's may be trusted).
+    pub verify: bool,
+    /// Its stamp, when a trace gives one; else the ingest clock's when it is worked on.
+    pub stamp: Option<Stamp>,
+    /// The connection's credit, released when the batch is admitted and routed.
+    pub permit: Option<OwnedSemaphorePermit>,
+    /// Where a refused signature ends the connection.
+    pub refusal: Option<Arc<Refusal>>,
+}
+
+impl Inbound {
+    /// A batch with nothing to follow it: forwarded, from `source`.
+    pub fn trusted(source: u64, batch: Batch) -> Self {
+        Self {
+            source,
+            batch,
+            origin: Origin::Elsewhere,
+            verify: false,
+            stamp: None,
+            permit: None,
+            refusal: None,
         }
     }
 }
@@ -585,8 +529,14 @@ impl Directory {
 }
 
 pub struct Hub {
-    out: broadcast::Sender<Item>,
-    batches: Mutex<Forwarded<(PublicKey, u64)>>,
+    fanout: Arc<Router>,
+    /// The ingest workers and the message exchange (`ingest`, `exchange`).
+    stages: Stages,
+    /// Each raw shard's streams and stations, `SHARDS` of them.
+    raw: Box<[Mutex<RawShard>]>,
+    /// How long a forwarded batch's hash is remembered.
+    window: Duration,
+    budget: Budget,
     positions: Mutex<Forwarded<(PublicKey, u64)>>,
     /// An engine's provisional positions: a stream per engine boot, sequenced apart from its
     /// final positions.
@@ -606,16 +556,12 @@ pub struct Hub {
     /// index read on a one-hop raw link, passed on, read back) went round for ever, thousands a
     /// second, and every link behind the fan-out fell behind it.
     passed_on: Mutex<Seen>,
-    deduplicator: Deduplicator,
     /// The receivers described, each with its cell, in the order they are forgotten: what the
     /// batch path reads (a cell to route by) and marks (the receiver is publishing), O(1) each.
     receivers: Mutex<Bounded<PublicKey, Option<Region>>>,
     /// Their descriptions. Taken by `publish_info` (then `receivers`, in that order) and by a
     /// joining subscriber, never by the batch path, so no scan ever stalls a batch.
     directory: Mutex<Directory>,
-    /// What the relay reports about each receiver's traffic (`stations`). Taken alone, after the
-    /// batch path's other locks are released, and before the directory when reporting.
-    stations: Mutex<Stations>,
     next_connection: AtomicU64,
     subscribers: Arc<AtomicUsize>,
     max_subscribers: usize,
@@ -634,8 +580,6 @@ pub struct Hub {
     egress: Arc<Egress>,
     /// RFC-0174's duties (`network`): the one place they meet the hub.
     network: Network,
-    /// The ingest clock and order, and the one decode of every batch (`ingest`).
-    ingest: Ingest,
 }
 
 /// Held for as long as a subscriber (or a connection) is served; releases its place when dropped.
@@ -718,15 +662,25 @@ pub fn source_of(address: IpAddr) -> IpAddr {
 }
 
 impl Hub {
+    /// A hub whose stages run on the caller (`ingest::Stages::inline`), by the system clock, its
+    /// budget the host's memory: what a test builds. A relay is then `staged` onto its threads.
     pub fn new(max_subscribers: usize) -> Self {
-        Self::with_capacity(max_subscribers, FAN_OUT_CAPACITY)
+        Self::clocked(max_subscribers, Arc::new(crate::network::wall_ms))
     }
 
-    /// `capacity` records of slack before a slow subscriber is dropped.
-    pub fn with_capacity(max_subscribers: usize, capacity: usize) -> Self {
+    /// As `new`, its ingest clock `clock`.
+    pub fn clocked(max_subscribers: usize, clock: Clock) -> Self {
+        let network = Network::new();
+        let stages = Stages::inline(Arc::clone(&clock), network.products.sink());
+        let budget = Budget::of_memory(memory_available(), PerFeeder::planned(false));
         Self {
-            out: broadcast::channel(capacity).0,
-            batches: Mutex::new(Forwarded::new(SEEN_WINDOW)),
+            fanout: Arc::new(Router::new(queue_bounds(&budget))),
+            stages,
+            raw: (0..SHARDS)
+                .map(|_| Mutex::new(RawShard::new(SEEN_WINDOW)))
+                .collect(),
+            window: SEEN_WINDOW,
+            budget,
             positions: Mutex::new(Forwarded::new(SEEN_WINDOW)),
             provisional: Mutex::new(Forwarded::new(SEEN_WINDOW)),
             clock_models: Mutex::new(Forwarded::new(SEEN_WINDOW)),
@@ -734,10 +688,8 @@ impl Hub {
             awaiting: Mutex::new(VecDeque::new()),
             fault_proofs: Mutex::new(Seen::new(SEEN_WINDOW, HASHES_REMEMBERED)),
             passed_on: Mutex::new(Seen::new(SEEN_WINDOW, HASHES_REMEMBERED)),
-            deduplicator: Deduplicator::new(DEFAULT_MAX_DEDUP_BYTES),
             receivers: Mutex::new(Bounded::new(RECEIVERS_REMEMBERED)),
             directory: Mutex::new(Directory::new(DESCRIPTION_BYTES_HELD)),
-            stations: Mutex::new(Stations::new(STATIONS_REMEMBERED)),
             next_connection: AtomicU64::new(RELAY_ITSELF + 1),
             subscribers: Arc::new(AtomicUsize::new(0)),
             max_subscribers,
@@ -753,9 +705,63 @@ impl Hub {
             // Until the operator names a cap, nothing billed leaves the host (loopback peers are
             // still served): a hub can never send without one.
             egress: Arc::new(Egress::new(Cap::NONE)),
-            network: Network::new(),
-            ingest: Ingest::default(),
+            network,
         }
+    }
+
+    /// The stages on threads of their own (`threads`), the sealer on its own: what a relay runs.
+    /// Built before the hub is shared, so nothing has been ingested yet.
+    pub fn staged(mut self, threads: Threads) -> Self {
+        let clock = self.stages.clock();
+        // The inline stages hold the products' sink; let them go first.
+        let unused: Sink = Arc::new(|_| true);
+        self.stages = Stages::inline(Arc::clone(&clock), unused);
+        if let Some(products) = Arc::get_mut(&mut self.network.products) {
+            products.on_thread(threads.message.max(1));
+        }
+        self.stages = Stages::threaded(clock, threads, &self.network.products.sink());
+        self
+    }
+
+    /// The regional product's stream under `boot_id` instead of a random one: what two runs of
+    /// one trace compare byte for byte by. Built before the hub is shared or staged.
+    pub fn regional_boot(mut self, boot_id: u64) -> Self {
+        let clock = self.stages.clock();
+        let unused: Sink = Arc::new(|_| true);
+        self.stages = Stages::inline(Arc::clone(&clock), unused);
+        self.network.products = Arc::new(crate::products::Products::with_boot(boot_id, 1));
+        self.stages = Stages::inline(clock, self.network.products.sink());
+        self
+    }
+
+    /// The relay may use `memory` bytes: the admission budget (`budget`), and what each
+    /// subscriber's queue and standing's raw may hold of it. `holds_raw`: the relay hosts MLAT.
+    pub fn memory(mut self, memory: usize, holds_raw: bool) -> Self {
+        self.budget = Budget::of_memory(memory, PerFeeder::planned(holds_raw));
+        self.fanout = Arc::new(Router::new(queue_bounds(&self.budget)));
+        self.network
+            .sharing
+            .set_held_capacity(crate::sharing::member::held_bytes_for(
+                self.budget
+                    .ceiling()
+                    .saturating_mul(crate::budget::PLANNED_BYTES_PER_SEC) as u64,
+            ));
+        self
+    }
+
+    /// Each subscriber's queue holds at most `bytes` (and `fanout::BEHIND_MS` of inbound), instead
+    /// of the budget's share: a test's small queue, or an operator's.
+    pub fn queue_bytes(mut self, bytes: usize) -> Self {
+        self.fanout = Arc::new(Router::new(Bounds {
+            max_bytes: bytes,
+            max_age_ms: BEHIND_MS,
+        }));
+        self
+    }
+
+    /// The admission budget: a feeder is admitted only with its bytes reserved in every store.
+    pub fn budget(&self) -> &Budget {
+        &self.budget
     }
 
     /// RFC-0174's duties.
@@ -810,12 +816,13 @@ impl Hub {
                     return;
                 }
                 let cell = index.content().ok().map(|content| content.parent);
-                let _ = self.out.send(Item {
+                self.fanout.publish(Item {
                     source,
                     record: Arc::new(Record::BundleIndex(index)),
                     cell,
                     points: None,
                     decoded: None,
+                    stamp_ms: self.now_ms(),
                 });
             }
             Record::RegionalBatch(regional) => {
@@ -823,21 +830,23 @@ impl Hub {
                     return;
                 }
                 let cell = regional.content().ok().map(|content| content.cell);
-                let _ = self.out.send(Item {
+                self.fanout.publish(Item {
                     source,
                     record: Arc::new(Record::RegionalBatch(regional)),
                     cell,
                     points: None,
                     decoded: None,
+                    stamp_ms: self.now_ms(),
                 });
             }
             other => {
-                let _ = self.out.send(Item {
+                self.fanout.publish(Item {
                     source,
                     record: Arc::new(other),
                     cell: None,
                     points: None,
                     decoded: None,
+                    stamp_ms: self.now_ms(),
                 });
             }
         }
@@ -855,7 +864,10 @@ impl Hub {
 
     /// How long a forwarded hash is remembered (one to two of `window`), instead of a minute.
     pub fn remembering_hashes_for(mut self, window: Duration) -> Self {
-        self.batches = Mutex::new(Forwarded::new(window));
+        self.window = window;
+        self.raw = (0..SHARDS)
+            .map(|_| Mutex::new(RawShard::new(window)))
+            .collect();
         self.positions = Mutex::new(Forwarded::new(window));
         self.provisional = Mutex::new(Forwarded::new(window));
         self.clock_models = Mutex::new(Forwarded::new(window));
@@ -894,12 +906,6 @@ impl Hub {
     /// closed unanswered.
     pub fn max_connections_per_address(mut self, max: usize) -> Self {
         self.max_connections_per_address = max;
-        self
-    }
-
-    /// The most the deduplicated stream holds of messages being compared (see `Deduplicator`).
-    pub fn max_dedup_bytes(mut self, max: usize) -> Self {
-        self.deduplicator = Deduplicator::new(max);
         self
     }
 
@@ -973,7 +979,7 @@ impl Hub {
     /// it has sent the descriptions it joined with): everything published from now on reaches
     /// every one of them. What a test waits on before publishing, rather than a sleep.
     pub fn listening(&self) -> usize {
-        self.out.receiver_count()
+        self.fanout.listening()
     }
 
     /// Subscribers being served now (an engine takes no place among them, `Hub::engine`).
@@ -985,36 +991,109 @@ impl Hub {
         self.next_connection.fetch_add(1, Ordering::Relaxed)
     }
 
-    /// Forwards a verified batch if it is new (see `Forwarded`), and offers its observations to
-    /// the deduplicated stream. True when it was new. A new batch is decoded here, once
-    /// (`ingest`), and that one decode is what every consumer reads.
-    pub fn publish_batch(&self, source: u64, batch: Batch, receiver: PublicKey) -> bool {
-        let new = self.batches.lock().is_ok_and(|mut forwarded| {
-            forwarded.admit(batch.hash(), (receiver, batch.boot_id()), batch.sequence())
+    /// Forwards a batch if it is new (see `Forwarded`): handed to the ingest worker that owns its
+    /// receiver's shard, which admits, decodes (once, `ingest`), deduplicates and fans it out. On
+    /// a hub whose stages run inline this happens before it returns, and the answer is whether it
+    /// was new; on threads it is the worker's, and this says only that it was handed over.
+    pub fn ingest(self: &Arc<Self>, inbound: Inbound) -> bool {
+        let Ok(receiver) = inbound.batch.receiver() else {
+            return false;
+        };
+        if self.stages.is_inline() {
+            return self.admit(0, inbound);
+        }
+        let worker = self.stages.worker_of(raw_shard(&receiver));
+        let hub = Arc::clone(self);
+        self.stages.run_on(
+            worker,
+            Box::new(move |producer| {
+                hub.admit(producer, inbound);
+            }),
+        );
+        true
+    }
+
+    /// A receiver's batch, verified elsewhere, from `source`: as `ingest` with nothing to follow.
+    /// What a test, a replay and the relay's own links publish by.
+    pub fn publish_batch(self: &Arc<Self>, source: u64, batch: Batch, receiver: PublicKey) -> bool {
+        if batch.receiver().ok() != Some(receiver) {
+            return false;
+        }
+        self.ingest(Inbound::trusted(source, batch))
+    }
+
+    /// One batch on ingest worker `producer` (`ingest`): its signature, its admission by its raw
+    /// shard, its one decode, its receptions to the message exchange, the duties, the fan-out,
+    /// then what its link asked to follow. True when it was new.
+    fn admit(&self, producer: usize, inbound: Inbound) -> bool {
+        let Inbound {
+            source,
+            batch,
+            origin,
+            verify,
+            stamp,
+            permit,
+            refusal,
+        } = inbound;
+        // Released when this batch is done, whatever happens to it.
+        let _permit = permit;
+        let Ok(receiver) = batch.receiver() else {
+            return false;
+        };
+        // A receiver's signature only: a relay's deduplicated batch never passes as one.
+        if verify && let Err(error) = batch.verify() {
+            if let Some(refusal) = refusal {
+                refusal.refuse(error.to_string());
+            }
+            return false;
+        }
+        let stamp = match stamp {
+            Some(stamp) => self.stages.stamped(producer, stamp),
+            None => self.stages.stamp(producer),
+        };
+        let shard = &self.raw[usize::from(raw_shard(&receiver).0)];
+        let new = shard.lock().is_ok_and(|mut shard| {
+            shard
+                .batches
+                .admit(batch.hash(), (receiver, batch.boot_id()), batch.sequence())
         });
         if !new {
+            // Not forwarded again, but a member that sent it still sent it (sharing's receipts).
+            self.share(&origin, &Record::Batch(batch), stamp.stamp_ms);
             return false;
         }
         // A format this build cannot read is still forwarded raw; it just adds nothing here.
-        let (batch, decoded) = match self.ingest.decode(batch) {
+        let (batch, decoded) = match Stages::decode(batch, stamp) {
             Ok(decoded) => (decoded.batch().clone(), Some(decoded)),
             Err(undecodable) => (undecodable.batch, None),
         };
-        let mut observations = 0;
-        if let Some(decoded) = &decoded {
-            let now = Instant::now();
-            observations = decoded.observations().len() as u64;
-            for obs in decoded.observations() {
-                self.deduplicator.offer(obs.fp, decoded.view(obs), now);
-            }
-        }
-        if let Ok(mut stations) = self.stations.lock() {
-            stations.forwarded(
+        let observations = decoded
+            .as_ref()
+            .map_or(0, |decoded| decoded.observations().len() as u64);
+        if let Ok(mut shard) = shard.lock() {
+            shard.stations.forwarded(
                 receiver,
                 batch.boot_id(),
                 batch.sequence(),
                 observations,
-                now_ms(),
+                stamp.stamp_ms,
+            );
+            if matches!(origin, Origin::Feeder(_)) {
+                shard.stations.fed_by(&receiver, source);
+            }
+        }
+        // A feeder's description pushed out while it was not yet publishing comes back now that
+        // it is, as one that is, before the batch: a subscriber is told who a receiver is first.
+        if let Origin::Feeder(Some(own)) = &origin
+            && !self.describes(&receiver)
+        {
+            self.publish_info(
+                source,
+                own.info.clone(),
+                receiver,
+                own.issued_ms,
+                own.place,
+                true,
             );
         }
         // The receiver is publishing, so its description is the last to be forgotten.
@@ -1022,40 +1101,64 @@ impl Hub {
             receivers.touch(&receiver);
             receivers.get(&receiver).copied().flatten()
         });
-        self.network.on_batch(&batch, decoded.as_ref(), now_ms());
-        // An error only means nobody is subscribed right now.
-        let _ = self.out.send(Item {
+        if let Some(decoded) = &decoded {
+            let area = self.network.products.area_for(&receiver);
+            self.stages.message().route(producer, decoded, area);
+        }
+        self.network
+            .on_batch(&batch, decoded.as_ref(), stamp.stamp_ms);
+        let record = Record::Batch(batch);
+        self.share(&origin, &record, stamp.stamp_ms);
+        self.fanout.publish(Item {
             source,
-            record: Arc::new(Record::Batch(batch)),
+            record: Arc::new(record),
             cell,
             points: None,
             decoded,
+            stamp_ms: stamp.stamp_ms,
         });
         true
     }
 
+    /// The network duties see where a batch came from: a feeder's own is seeded into its area's
+    /// sharing group by this relay, its origin; a member's is a group piece.
+    fn share(&self, origin: &Origin, record: &Record, stamp_ms: u64) {
+        match origin {
+            Origin::Feeder(_) => self.network.originate(self, record, stamp_ms),
+            Origin::Peer(asker) => self.network.from_peer(self, asker, record, stamp_ms),
+            Origin::Elsewhere => {}
+        }
+    }
+
     /// Connection `source`, a feeder publishing as `receiver`, had a new batch forwarded.
     pub fn fed_by(&self, receiver: &PublicKey, source: u64) {
-        if let Ok(mut stations) = self.stations.lock() {
-            stations.fed_by(receiver, source);
+        if let Ok(mut shard) = self.raw[usize::from(raw_shard(receiver).0)].lock() {
+            shard.stations.fed_by(receiver, source);
         }
     }
 
     /// Connection `source` of a feeder publishing as `receiver` ended.
     pub fn left(&self, receiver: &PublicKey, source: u64) {
-        if let Ok(mut stations) = self.stations.lock() {
-            stations.left(receiver, source);
+        if let Ok(mut shard) = self.raw[usize::from(raw_shard(receiver).0)].lock() {
+            shard.stations.left(receiver, source);
         }
     }
 
     /// Every receiver's report (`stations`), with what its newest description declares.
     pub fn stations(&self) -> StationsReport {
         let now_ms = now_ms();
-        let reports = self
-            .stations
-            .lock()
-            .map(|stations| stations.reports(now_ms))
-            .unwrap_or_default();
+        let mut reports: Vec<(PublicKey, StationReport)> = self
+            .raw
+            .iter()
+            .filter_map(|shard| {
+                shard
+                    .lock()
+                    .ok()
+                    .map(|shard| shard.stations.reports(now_ms))
+            })
+            .flatten()
+            .collect();
+        reports.sort_by_key(|(key, _)| *key);
         let stations = match self.directory.lock() {
             Ok(directory) => reports
                 .into_iter()
@@ -1068,7 +1171,11 @@ impl Hub {
 
     /// One receiver's report, or `None` when the relay holds none for it.
     pub fn station(&self, receiver: &PublicKey) -> Option<StationReport> {
-        let report = self.stations.lock().ok()?.report(receiver, now_ms())?;
+        let report = self.raw[usize::from(raw_shard(receiver).0)]
+            .lock()
+            .ok()?
+            .stations
+            .report(receiver, now_ms())?;
         let directory = self.directory.lock().ok()?;
         Some(described(report, directory.known.get(receiver)))
     }
@@ -1174,12 +1281,13 @@ impl Hub {
         // A link joining reads its descriptions first and takes its place in the fan-out only once
         // it has sent them (see `subscribe`), so one changed in between reaches it at its
         // receiver's next description.
-        let _ = self.out.send(Item {
+        self.fanout.publish(Item {
             source,
             record,
             cell,
             points: None,
             decoded: None,
+            stamp_ms: self.now_ms(),
         });
     }
 
@@ -1252,12 +1360,13 @@ impl Hub {
 
     fn send_positions(&self, source: u64, record: Record) {
         let points = crate::network::points_of(&record);
-        let _ = self.out.send(Item {
+        self.fanout.publish(Item {
             source,
             record: Arc::new(record),
             cell: None,
             points,
             decoded: None,
+            stamp_ms: self.now_ms(),
         });
     }
 
@@ -1304,23 +1413,25 @@ impl Hub {
                 .map(|mut parts| parts.manifest(model.id(), hashes, Instant::now()))
                 .unwrap_or_default();
             for (from, part) in ready {
-                let _ = self.out.send(Item {
+                self.fanout.publish(Item {
                     source: from,
                     record: Arc::new(Record::ClockModelPart(part)),
                     cell: None,
                     points: None,
                     decoded: None,
+                    stamp_ms: self.now_ms(),
                 });
             }
             let record = Record::ClockModel(model);
             self.network.on_clock_model(&record, now_ms());
             let points = crate::network::points_of(&record);
-            let _ = self.out.send(Item {
+            self.fanout.publish(Item {
                 source,
                 record: Arc::new(record),
                 cell: None,
                 points,
                 decoded: None,
+                stamp_ms: self.now_ms(),
             });
             // Positions held for this model go out after it.
             self.release_awaiting();
@@ -1341,12 +1452,13 @@ impl Hub {
         };
         self.network
             .on_clock_model(&Record::ClockModelPart(part.clone()), now_ms());
-        let _ = self.out.send(Item {
+        self.fanout.publish(Item {
             source,
             record: Arc::new(Record::ClockModelPart(part)),
             cell: None,
             points: None,
             decoded: None,
+            stamp_ms: self.now_ms(),
         });
         true
     }
@@ -1368,32 +1480,33 @@ impl Hub {
             new
         });
         if new {
-            let _ = self.out.send(Item {
+            self.fanout.publish(Item {
                 source,
                 record: Arc::new(Record::FaultProof(proof)),
                 cell: None,
                 points: None,
                 decoded: None,
+                stamp_ms: self.now_ms(),
             });
         }
         new
     }
 
-    /// The first copies gathered since the last call, for the relay to sign, and how many new
-    /// messages were left out of them for want of room.
+    /// The first copies the message exchange decided since the last call, for the relay to sign,
+    /// in canonical order (`exchange`), and how many epochs were refused whole since then.
     pub fn take_deduplicated(&self) -> (Vec<Observation>, u64) {
-        let gathered = self.deduplicator.take(Instant::now());
-        (gathered, self.deduplicator.take_skipped())
+        self.network.products.take_stream()
     }
 
     /// Broadcasts a batch the relay signed itself.
     pub fn publish_relay_batch(&self, batch: Batch) {
-        let _ = self.out.send(Item {
+        self.fanout.publish(Item {
             source: RELAY_ITSELF,
             record: Arc::new(Record::RelayBatch(batch)),
             cell: None,
             points: None,
             decoded: None,
+            stamp_ms: self.now_ms(),
         });
     }
 
@@ -1430,8 +1543,34 @@ impl Hub {
 
     /// A place in the fan-out from now on, with no descriptions: for the loopback BEAST output, and
     /// for a link once it has sent the descriptions it joined with.
-    pub fn listen(&self) -> broadcast::Receiver<Item> {
-        self.out.subscribe()
+    pub fn listen(&self, source: u64, filter: Filter) -> Listener {
+        self.fanout.listen(source, filter)
+    }
+
+    /// The ingest clock now.
+    pub fn now_ms(&self) -> u64 {
+        self.stages.now_ms()
+    }
+
+    /// Every ingest worker ticks at `stamp_ms`: everything stamped before it has been handed in,
+    /// so the epochs before it close (`seal`).
+    pub fn advance(&self, stamp_ms: u64) {
+        self.stages.advance(stamp_ms);
+    }
+
+    /// Waits until every ingest worker has done what was handed to it before this call: every
+    /// batch ingested before it is admitted, decoded, routed and offered to the duties.
+    pub fn flush(&self) {
+        self.stages.flush();
+    }
+
+    /// Time passed with nothing ingested: a hub whose stages run on the caller ticks by the
+    /// ingest clock now, as an idle worker ticks itself (`ingest::TICK_MS`), so its epochs close
+    /// whether or not batches flow. Called by the timed duties (`network::run`).
+    pub fn idle(&self) {
+        if self.stages.is_inline() {
+            self.stages.advance(self.stages.now_ms());
+        }
     }
 
     /// Every known receiver description a subscription covers: what a subscriber is sent when it
@@ -1452,6 +1591,16 @@ impl Hub {
 }
 
 /// Unix milliseconds now, as the station reports state times.
+/// Each subscriber's queue bounds: `BEHIND_MS` of inbound, and the bytes the budget gives the
+/// fan-out (every admitted feeder's share: the queues share each record, so one queue may hold
+/// all of it), at least `MIN_QUEUE_BYTES`.
+fn queue_bounds(budget: &Budget) -> Bounds {
+    Bounds {
+        max_bytes: budget.store_bytes(Store::Fanout).max(MIN_QUEUE_BYTES),
+        max_age_ms: BEHIND_MS,
+    }
+}
+
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1480,7 +1629,7 @@ mod tests {
     #[test]
     fn a_bundle_index_that_comes_back_is_not_passed_on_again() -> Result<(), String> {
         let hub = Hub::new(8);
-        let mut out = hub.listen();
+        let out = hub.listen(u64::MAX, Filter::Everything);
         let parent = Region::containing(
             &tally_wire::Location {
                 lat_e7: 337_490_000,
@@ -1505,7 +1654,7 @@ mod tests {
             hub.publish_as(source, Record::BundleIndex(index.clone()));
         }
         let mut passed = 0;
-        while out.try_recv().is_ok() {
+        while out.try_recv().is_some() {
             passed += 1;
         }
         assert_eq!(passed, 1);
@@ -1588,6 +1737,7 @@ mod tests {
         const CAP: usize = 200;
         let mut hub = Hub::new(8);
         hub.receivers = Mutex::new(Bounded::new(CAP));
+        let hub = Arc::new(hub);
         let (honest, honest_key) = key()?;
         hub.publish_info(1, signed_info(&honest)?, honest_key, 1, None, false);
         hub.publish_batch(1, signed_batch(&honest, 0, Vec::new())?, honest_key);
@@ -1653,35 +1803,31 @@ mod tests {
     }
 
     #[test]
-    fn a_full_deduplicator_still_forwards_raw_and_counts_what_it_left_out() -> Result<(), String> {
-        // Room for two new messages: each costs a key and a gathered copy.
-        let one = DEDUP_KEY_COST + cost(&[0; 14]);
-        let hub = Hub::new(8).max_dedup_bytes(2 * one + one / 2);
-        let mut out = hub.out.subscribe();
-        let (receiver, receiver_key) = key()?;
-        let batch = signed_batch(&receiver, 0, (0..5).map(observation).collect())?;
-        assert!(hub.publish_batch(1, batch.clone(), receiver_key));
-        let forwarded = out.try_recv().map_err(|error| error.to_string())?;
-        assert_eq!(*forwarded.record, Record::Batch(batch));
-        let (gathered, skipped) = hub.take_deduplicated();
-        assert_eq!((gathered.len(), skipped), (2, 3));
-        // The gathered copies are released when taken; the two keys stay a window.
-        let deduplicator = Deduplicator::new(2 * one + one / 2);
-        let now = Instant::now();
-        for n in 0..5 {
-            deduplicator.offer_owned(observation(n), now);
+    fn the_deduplicated_stream_takes_each_message_once_across_receivers_when_its_epoch_closes()
+    -> Result<(), String> {
+        let clock = Arc::new(AtomicU64::new(10_100));
+        let reading = Arc::clone(&clock);
+        let hub = Arc::new(Hub::clocked(
+            8,
+            Arc::new(move || reading.load(Ordering::Relaxed)),
+        ));
+        for n in 0..4u64 {
+            let (receiver, receiver_key) = key()?;
+            // Every receiver hears messages 0..5; each also one of its own.
+            let mut heard: Vec<Observation> = (0..5).map(observation).collect();
+            heard.push(observation(100 + n as u8));
+            assert!(hub.publish_batch(1, signed_batch(&receiver, 0, heard)?, receiver_key));
         }
-        assert_eq!(deduplicator.take(now).len(), 2);
-        deduplicator.offer_owned(observation(5), now);
-        deduplicator.offer_owned(observation(6), now);
-        assert_eq!(deduplicator.take_skipped(), 4);
-        // A window later everything is forgotten and there is room again.
-        let later = now + DEDUPLICATION_WINDOW;
-        assert_eq!(deduplicator.take(later).len(), 1);
-        assert_eq!(deduplicator.held(), 0);
-        deduplicator.offer_owned(observation(7), later);
-        deduplicator.offer_owned(observation(8), later);
-        assert_eq!(deduplicator.take(later).len(), 2);
+        // The epoch is open: nothing yet.
+        assert_eq!(hub.take_deduplicated().0.len(), 0);
+        clock.store(11_000, Ordering::Relaxed);
+        hub.advance(11_000);
+        let (stream, refused) = hub.take_deduplicated();
+        assert_eq!((stream.len(), refused), (5 + 4, 0));
+        let mut data: Vec<Vec<u8>> = stream.iter().map(|o| o.data.clone()).collect();
+        data.sort_unstable();
+        data.dedup();
+        assert_eq!(data.len(), 9);
         Ok(())
     }
 
@@ -1892,7 +2038,7 @@ mod tests {
     fn a_large_models_parts_go_out_ahead_of_its_manifest_and_forged_ones_never()
     -> Result<(), String> {
         let hub = Hub::new(8);
-        let mut out = hub.listen();
+        let out = hub.listen(u64::MAX, Filter::Everything);
         let (engine, engine_key) = key()?;
         let model: Vec<u8> = (0..3 * tally_wire::clock_model::PART_LEN as u64)
             .map(|at| (at.wrapping_mul(2_654_435_761) >> 11) as u8)
@@ -1920,13 +2066,13 @@ mod tests {
         ] {
             assert!(!hub.publish_clock_model_part(5, part.clone()));
         }
-        assert!(out.try_recv().is_err());
+        assert!(out.try_recv().is_none());
         assert!(hub.publish_clock_model(6, signed.manifest.clone(), engine_key));
         // The late part goes out on its own, once.
         assert!(hub.publish_clock_model_part(7, signed.parts[1].clone()));
         assert!(!hub.publish_clock_model_part(8, signed.parts[1].clone()));
         let mut heard = Vec::new();
-        while let Ok(item) = out.try_recv() {
+        while let Some(item) = out.try_recv() {
             heard.push((item.source, (*item.record).clone()));
         }
         assert_eq!(
@@ -1963,7 +2109,7 @@ mod tests {
     #[test]
     fn positions_go_out_after_the_model_they_cite() -> Result<(), String> {
         let hub = Hub::new(8);
-        let mut out = hub.listen();
+        let out = hub.listen(u64::MAX, Filter::Everything);
         let (engine, engine_key) = key()?;
         let model = signed_clock_model(&engine, 1, 0)?;
         let receivers: Vec<PublicKey> = throwaways(4);
@@ -2009,12 +2155,12 @@ mod tests {
         .map_err(|e| e.to_string())?;
         assert!(hub.publish_positions(1, positions.clone(), engine_key));
         assert!(
-            out.try_recv().is_err(),
+            out.try_recv().is_none(),
             "positions went out before their model"
         );
         assert!(hub.publish_clock_model(2, model.clone(), engine_key));
         let mut heard = Vec::new();
-        while let Ok(item) = out.try_recv() {
+        while let Some(item) = out.try_recv() {
             heard.push((*item.record).clone());
         }
         assert_eq!(
@@ -2164,7 +2310,7 @@ mod tests {
     #[test]
     fn a_new_receiver_is_described_in_a_table_full_of_receivers_that_publish() -> Result<(), String>
     {
-        let hub = Hub::new(8);
+        let hub = Arc::new(Hub::new(8));
         let (stranger, _) = key()?;
         let info = signed_info(&stranger)?;
         // Every receiver held has had batches forwarded.
@@ -2190,13 +2336,13 @@ mod tests {
         let cell = Region::point(&place).map_err(|e| e.to_string())?;
         hub.publish_info(2, signed_info(&new)?, new_key, 1, Some(place), false);
         assert!(hub.describes(&new_key), "dropped on its first description");
-        let mut out = hub.out.subscribe();
+        let out = hub.listen(u64::MAX, Filter::Everything);
         // New keys keep arriving; it publishes once per hundred of them, and stays.
         for (n, receiver) in churn.iter().enumerate() {
             if n % 100 == 0 {
                 let sequence = u64::try_from(n / 100).map_err(|e| e.to_string())?;
                 assert!(hub.publish_batch(2, signed_batch(&new, sequence, Vec::new())?, new_key));
-                let routed = out.try_recv().map_err(|e| e.to_string())?;
+                let routed = out.try_recv().ok_or("nothing routed")?;
                 assert_eq!(
                     routed.cell,
                     Some(cell),
@@ -2208,55 +2354,6 @@ mod tests {
             assert!(hub.describes(&new_key), "forgot the new receiver at {n}");
         }
         assert_eq!(held(&hub)?, (RECEIVERS_REMEMBERED, RECEIVERS_REMEMBERED));
-        Ok(())
-    }
-
-    #[test]
-    fn the_deduplicator_keeps_one_copy_of_each_message_across_threads_in_the_order_offered()
-    -> Result<(), String> {
-        let deduplicator = Arc::new(Deduplicator::new(usize::MAX));
-        let messages = |offset: u32| -> Vec<Observation> {
-            (0..2_000u32)
-                .map(|n| Observation {
-                    format: b'3',
-                    timestamp: u64::from(offset),
-                    signal: 0,
-                    data: n.to_be_bytes().repeat(4),
-                })
-                .collect()
-        };
-        let now = Instant::now();
-        // The same messages heard by eight receivers at once.
-        let threads: Vec<_> = (0..8)
-            .map(|receiver| {
-                let deduplicator = Arc::clone(&deduplicator);
-                let heard = messages(receiver);
-                std::thread::spawn(move || {
-                    for observation in heard {
-                        deduplicator.offer_owned(observation, now);
-                    }
-                })
-            })
-            .collect();
-        for thread in threads {
-            thread
-                .join()
-                .map_err(|_| "a receiver's thread panicked".to_owned())?;
-        }
-        let gathered = deduplicator.take(now);
-        let mut data: Vec<Vec<u8>> = gathered.iter().map(|o| o.data.clone()).collect();
-        data.sort_unstable();
-        data.dedup();
-        assert_eq!((gathered.len(), data.len()), (2_000, 2_000));
-        // One thread alone: what is taken is in the order it was offered, across every shard.
-        let alone = Deduplicator::new(usize::MAX);
-        for observation in messages(0) {
-            alone.offer_owned(observation, now);
-        }
-        assert_eq!(alone.take(now), messages(0));
-        // The keys are a window's; then nothing is held.
-        deduplicator.take(now + DEDUPLICATION_WINDOW);
-        assert_eq!(deduplicator.held(), 0);
         Ok(())
     }
 }

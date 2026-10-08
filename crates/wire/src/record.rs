@@ -233,6 +233,11 @@ pub enum Reason {
     Refused,
     /// The peer broke the protocol.
     Protocol,
+    /// The subscriber fell behind what it asked for (RFC-0177 §8): its queue held more than its
+    /// bound of bytes or of time, so the relay let it go rather than slow anyone else. Not that
+    /// the relay is full: the subscriber may come back at once. A reader that predates it reads
+    /// `Other(6)`.
+    FellBehind,
     Other(u8),
 }
 
@@ -244,6 +249,7 @@ impl Reason {
             Self::Leaving => 3,
             Self::Refused => 4,
             Self::Protocol => 5,
+            Self::FellBehind => 6,
             Self::Other(byte) => byte,
         }
     }
@@ -255,6 +261,7 @@ impl Reason {
             3 => Self::Leaving,
             4 => Self::Refused,
             5 => Self::Protocol,
+            6 => Self::FellBehind,
             other => Self::Other(other),
         }
     }
@@ -755,6 +762,10 @@ mod tests {
                 reason: Reason::Other(200),
                 retry_after_secs: 0,
             },
+            Record::Goodbye {
+                reason: Reason::FellBehind,
+                retry_after_secs: 0,
+            },
             Record::hello(Role::Engine),
             Record::hello(Role::Probe),
             // A bit past the eighth: `Streams` is two bytes.
@@ -877,6 +888,7 @@ mod tests {
                 receiver: relay.public(),
                 boot_id: 2,
                 ranges: vec![SequenceRange { first: 9, last: 9 }],
+                keys: None,
             }),
             Record::DeliveryAnswer(answer.clone()),
             Record::ProviderOffer(ProviderOffer::sign(
@@ -1029,6 +1041,7 @@ mod tests {
             receiver: relay.public(),
             boot_id: 0,
             ranges: Vec::new(),
+            keys: None,
         });
         assert!(Role::Probe.may_send(&Record::Echo(Echo { nonce: 1 })));
         assert!(Role::Probe.may_send(&query));

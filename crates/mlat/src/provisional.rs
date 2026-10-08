@@ -138,6 +138,46 @@ pub struct Outcome {
     pub report: Report,
 }
 
+/// What one reception of a batch says to provisional solving (`notes_of`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Note {
+    /// An ADS-B airborne position of this aircraft: it is not a target for a while.
+    Position(u32),
+    /// A reply of this aircraft, by its index in the batch: solved if the aircraft is a target.
+    Reply(u32, u32),
+}
+
+/// What a batch says to provisional solving, in the batch's order: each aircraft whose ADS-B
+/// airborne position it carries (once: every reception of a batch has its wall clock, so a second
+/// says nothing more), and each reply MLAT solves, by index. A function of the batch alone, so the
+/// thread that holds the batch reads it (a relay's raw shard, RFC-0177 §5) and the engine's thread
+/// only weighs what it says (`Provisional::hear_notes`).
+pub fn notes_of(batch: &Decoded) -> Vec<Note> {
+    let mut notes = Vec::new();
+    let mut positions: Vec<u32> = Vec::new();
+    for (index, observation) in batch.views().enumerate() {
+        let data = observation.data;
+        let Some(address) = modes::address(data) else {
+            continue;
+        };
+        match modes::downlink_format(data) {
+            Some(17 | 18) => {
+                if modes::airborne_position(data).is_some()
+                    && let Err(at) = positions.binary_search(&address)
+                {
+                    positions.insert(at, address);
+                    notes.push(Note::Position(address));
+                }
+            }
+            Some(0 | 4 | 5 | 11 | 16 | 20 | 21) => {
+                notes.push(Note::Reply(address, index as u32));
+            }
+            _ => {}
+        }
+    }
+    notes
+}
+
 impl Provisional {
     /// Takes a published model: the newest of its tile replaces the one held.
     pub fn adopt(&mut self, carried: Carried) {
@@ -177,23 +217,27 @@ impl Provisional {
         self.models.len()
     }
 
-    /// Takes a batch the engine admitted from `receiver`, arrived at `now_ms`.
+    /// Takes a batch the engine admitted, arrived at `now_ms`.
     pub fn hear(&mut self, batch: &Decoded, now_ms: u64) {
+        self.hear_notes(batch, &notes_of(batch), now_ms);
+    }
+
+    /// Takes what [`notes_of`] read of a batch the engine admitted, arrived at `now_ms`: the same
+    /// as `hear`, with the reading done wherever the batch was held (a relay's raw shard).
+    pub fn hear_notes(&mut self, batch: &Decoded, notes: &[Note], now_ms: u64) {
         let receiver = batch.receiver();
         let wall_ms = batch.wall_ms();
-        for observation in batch.views() {
-            let data = observation.data;
-            let Some(address) = modes::address(data) else {
-                continue;
-            };
-            match modes::downlink_format(data) {
-                Some(17 | 18) => {
-                    if modes::airborne_position(data).is_some() {
-                        let newest = self.adsb.entry(address).or_insert(wall_ms);
-                        *newest = (*newest).max(wall_ms);
-                    }
+        let observations = batch.observations();
+        for note in notes {
+            match *note {
+                Note::Position(address) => {
+                    let newest = self.adsb.entry(address).or_insert(wall_ms);
+                    *newest = (*newest).max(wall_ms);
                 }
-                Some(0 | 4 | 5 | 11 | 16 | 20 | 21) => {
+                Note::Reply(address, index) => {
+                    let Some(obs) = observations.get(index as usize) else {
+                        continue;
+                    };
                     if !self.target(address, wall_ms) {
                         continue;
                     }
@@ -206,13 +250,12 @@ impl Provisional {
                         reception: Reception {
                             receiver,
                             epoch: batch.counter_epoch(),
-                            observation: observation.to_observation(),
+                            observation: batch.view(obs).to_observation(),
                             wall_ms,
                         },
                         arrived_ms: now_ms,
                     });
                 }
-                _ => {}
             }
         }
     }

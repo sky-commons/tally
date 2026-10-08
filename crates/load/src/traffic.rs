@@ -73,10 +73,44 @@ pub struct Calibration {
     pub probability: f64,
     /// Receptions a second a receiver makes, as simulated.
     pub per_sec: f64,
-    /// Distinct transmissions heard a second, by anyone: the deduplicated stream's messages.
+    /// Distinct transmissions heard a second, by anyone.
     pub messages_per_sec: f64,
     /// Receivers that heard each of them, on average.
     pub receivers_per_message: f64,
+    /// Distinct messages (by their bytes: a reply an aircraft repeats unchanged is one message)
+    /// heard a second, by anyone.
+    pub contents_per_sec: f64,
+    /// What the relay's deduplicated stream carries a second when it loses nothing
+    /// ([`expected_deduplicated`]): the receptions its rule keeps from this traffic.
+    pub deduplicated_per_sec: f64,
+}
+
+/// The receptions a second the relay's deduplicated stream keeps from `heard`, each second's
+/// distinct messages (by their bytes), the run's loop of them repeating for ever: the relay's rule
+/// (`tally_relay::exchange::MessageShard`), by the second. A message is kept in a second when the
+/// second before did not keep it, so one heard every second is kept every other second, and one
+/// heard once a loop, once a loop. The relay closes its seconds by its own clock, not the
+/// harness's, so a second's receptions reach it spread over two of its seconds; the rule keeps the
+/// same count either way (a message heard in two adjacent seconds is kept in the first).
+pub fn expected_deduplicated(heard: &[std::collections::HashSet<u32>]) -> f64 {
+    if heard.is_empty() {
+        return 0.0;
+    }
+    let mut kept_before: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    let mut last_loop = 0usize;
+    // The first loop starts from nothing; by the third, every second's keep is the loop's own.
+    for round in 0..3 {
+        last_loop = 0;
+        for second in heard {
+            let kept: std::collections::HashSet<u32> =
+                second.difference(&kept_before).copied().collect();
+            if round == 2 {
+                last_loop += kept.len();
+            }
+            kept_before = kept;
+        }
+    }
+    last_loop as f64 / heard.len() as f64
 }
 
 pub struct Traffic {
@@ -160,6 +194,8 @@ impl Traffic {
         let mut messages: Vec<Vec<u8>> = Vec::new();
         let (mut kept, mut distinct) = (0u64, 0u64);
         let mut first = 0usize;
+        // The messages (by index) anyone heard, each second of the period.
+        let mut seconds_heard: Vec<Vec<u32>> = vec![Vec::new(); period as usize];
         for (cluster, &size) in sizes.iter().enumerate() {
             let cluster_range = first..first + size;
             first += size;
@@ -180,6 +216,9 @@ impl Traffic {
                 .collect();
             let mut used: Vec<bool> = Vec::new();
             let mut overflow = false;
+            let mut by_second: Vec<Vec<u32>> = vec![Vec::new(); period as usize];
+            // Per transmission, the second it was last noted in, plus one.
+            let mut noted: Vec<u32> = Vec::new();
             let simulation = sim::run_into(&scenario, &mut |reception, source| {
                 let second = second_of(&scenario, reception.wall_ms);
                 if second == 0 || second > period {
@@ -192,6 +231,15 @@ impl Traffic {
                 if !used[source] {
                     used[source] = true;
                     distinct += 1;
+                }
+                if noted.len() <= source {
+                    noted.resize(source + 1, 0);
+                }
+                if noted[source] != second as u32
+                    && let Ok(message) = u32::try_from(offset + source)
+                {
+                    noted[source] = second as u32;
+                    by_second[(second - 1) as usize].push(message);
                 }
                 let Some(&at) = by.get(&reception.receiver) else {
                     return;
@@ -211,6 +259,9 @@ impl Traffic {
                 return Err("too many transmissions to index: lower --aircraft or --period".into());
             }
             messages.extend(simulation.transmissions.into_iter().map(|each| each.data));
+            for (second, heard) in by_second.into_iter().enumerate() {
+                seconds_heard[second].extend(heard);
+            }
             for (at, mut list) in heard.into_iter().enumerate() {
                 let index = mine.start + at;
                 let within = index - cluster_range.start;
@@ -238,6 +289,24 @@ impl Traffic {
             }
         }
         let seconds = (total as u64 * period) as f64;
+        // Each message by its bytes: two transmissions of the same bytes are one message to a
+        // deduplication.
+        let mut content: std::collections::HashMap<&[u8], u32> = std::collections::HashMap::new();
+        let mut content_of = Vec::with_capacity(messages.len());
+        for data in &messages {
+            let next = content.len() as u32;
+            content_of.push(*content.entry(data.as_slice()).or_insert(next));
+        }
+        let heard_contents: Vec<std::collections::HashSet<u32>> = seconds_heard
+            .iter()
+            .map(|heard| heard.iter().map(|&m| content_of[m as usize]).collect())
+            .collect();
+        let contents_per_sec = heard_contents
+            .iter()
+            .map(std::collections::HashSet::len)
+            .sum::<usize>() as f64
+            / period.max(1) as f64;
+        let deduplicated_per_sec = expected_deduplicated(&heard_contents);
         Ok(Self {
             receivers,
             messages,
@@ -248,6 +317,8 @@ impl Traffic {
                 per_sec: kept as f64 / seconds,
                 messages_per_sec: distinct as f64 / period as f64,
                 receivers_per_message: kept as f64 / distinct.max(1) as f64,
+                contents_per_sec,
+                deduplicated_per_sec,
             },
         })
     }

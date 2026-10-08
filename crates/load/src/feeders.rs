@@ -29,7 +29,10 @@ pub struct Counts {
 }
 
 /// Starts this shard's feeders, the `i`-th of them after `ramp * i / n`, each publishing to one of
-/// `relays` (by its index in the run, so every address takes its share).
+/// `relays` (by its index in the run, so every address takes its share). Every feeder plays the
+/// simulation on one clock, from `start`: second `n` of the run is heard by every receiver in it
+/// during the same second, as one transmission is heard by every receiver in reach at once. A
+/// feeder that starts later joins the second being heard.
 pub fn spawn(
     traffic: Arc<Traffic>,
     relays: &[RelayAddress],
@@ -37,6 +40,7 @@ pub fn spawn(
     ramp: Duration,
     state_dir: &Path,
     counts: Arc<Counts>,
+    start: tokio::time::Instant,
 ) {
     let local = traffic.receivers.len().max(1) as u32;
     for (at, receiver) in traffic.receivers.iter().enumerate() {
@@ -74,13 +78,12 @@ pub fn spawn(
             counts.started.fetch_add(1, Ordering::Relaxed);
             let mut slices = tokio::time::interval(Duration::from_millis(1000 / SLICES_A_SECOND));
             slices.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            let began = tokio::time::Instant::now();
             let mut second = u64::MAX;
             let mut frames = Vec::new();
             let mut handed = 0;
             loop {
                 slices.tick().await;
-                let elapsed = began.elapsed();
+                let elapsed = start.elapsed();
                 let now = elapsed.as_secs();
                 if now != second {
                     // What was left of the last second goes with it; a receiver never holds one back.

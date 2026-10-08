@@ -1,9 +1,11 @@
-//! The delivery check (RFC-0174 §2.2): every few minutes the feeder samples a few of its recent
-//! batches and asks several members of its area's sharing group, on distinct networks, for signed
-//! proofs of possession (`DeliveryQuery`, `DeliveryAnswer`). A batch is delivered when a majority
-//! of the networks that answered for it prove it; a relay whose batches fail that majority is
-//! switched away from and remembered as one that swallows (avoided for days, saved across
-//! restarts). One member's word alone convicts no one, and "I do not take this area" is no
+//! The delivery check (RFC-0174 §2.2, RFC-0177 §7): every key period the feeder gives every
+//! member of its area's sharing group a tag key of that member's own (`Keyring`, carried signed in
+//! a `DeliveryQuery`), and a member tags each of the feeder's batches with it as the batch arrives.
+//! Every few minutes the feeder samples a few of its recent batches and asks several members, on
+//! distinct networks, for those tags (`DeliveryQuery`, `DeliveryAnswer`). A batch is delivered when
+//! a majority of the networks that answered for it prove it; a relay whose batches fail that
+//! majority is switched away from and remembered as one that swallows (avoided for days, saved
+//! across restarts). One member's word alone convicts no one, and "I do not take this area" is no
 //! evidence.
 //!
 //! Decisions the RFC leaves to the build:
@@ -17,9 +19,17 @@
 //!   (`relays::Ledger::end_audit`), so an audit never costs the network a batch.
 //! - **No one to ask, no audit.** A relay is audited only when the area has members to ask about
 //!   it; otherwise nothing is held back from the other relay.
-//! - **Batches are named by boot and sequence.** The proof is the hash of the query's fresh nonce
-//!   joined to the batch's whole signed bytes, and the feeder checks it against its own copy, so a
-//!   proof binds the exact batch and naming it by its hash would add nothing.
+//! - **Batches are named by boot and sequence.** The proof is the tag the member made on arrival,
+//!   a keyed hash of the batch's whole signed bytes under the key this feeder gave that member
+//!   (`tally_wire::delivery_tag`), and the feeder checks it against its own copy of the audited
+//!   batches, so a proof binds the exact batch and naming it by its hash would add nothing. A tag
+//!   counts only under a key the feeder gave that member that was in force when the batch was sent
+//!   (`tally_wire::delivery::tag_keys_for`): a tag under an older key (a replay) is no proof.
+//! - **Keys on a schedule, never per audit.** The keys go to every member the feeder may ask,
+//!   every period, whether or not an audit runs, so a member learns nothing of when one does or of
+//!   which batches it covers, and cannot tip off the relay audited. Only a member holding a key for
+//!   the period is asked. The feeder keeps the bytes of the audited batches alone, and asks only
+//!   within `TAG_WINDOW_MS` of sending, the window a member keeps its tags for.
 //! - **Who counts.** An answer counts when it is signed by the member asked, names this query's
 //!   nonce, this feeder and this boot, and says the member takes the area. The audited relay is
 //!   never asked: it is the one being checked. The members asked are on networks known distinct
@@ -44,7 +54,10 @@ use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use tally_wire::delivery::{Possession, SequenceRange, possession_proof};
+use tally_wire::delivery::{
+    KEY_PERIOD_MS, Possession, SequenceRange, TAG_KEY_LEN, TAG_WINDOW_MS, TagKey, TagKeys,
+    TagKeysContent, delivery_tag, key_period, tag_keys_for,
+};
 use tally_wire::noise;
 use tally_wire::rendezvous::{Placement, distinct_networks, same_network};
 use tally_wire::{
@@ -68,17 +81,99 @@ pub const AVOID_FOR: Duration = Duration::from_secs(3 * 24 * 3600);
 pub const AUDIT_FOR: Duration = Duration::from_secs(SAMPLED as u64 + 3);
 /// How long after the audit ends the members are asked: time for the group to carry its batches.
 pub const SETTLE: Duration = Duration::from_secs(30);
+/// How often the members are given keys: a member new to the area, or one whose keys the period
+/// has moved past, is given them within this long.
+pub const GRANT_EVERY: Duration = Duration::from_secs(60);
+/// The most members of the area given keys: every one the feeder may ask, at most this many.
+pub const KEYED_MEMBERS: usize = 16;
 /// The longest one member is waited for.
 const ASK_TIMEOUT: Duration = Duration::from_secs(15);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long after sending a batch it may be asked about: the window a member keeps its tag for,
+/// less the longest an ask takes, so the tag is still held when the question arrives.
+pub const ASK_WITHIN_MS: u64 = TAG_WINDOW_MS - 2 * 15_000;
 /// The state file of relays found swallowing.
 const STATE_FILE: &str = "swallowers";
 
-/// One of the feeder's batches and the relays its sessions wrote it to.
+/// One of the feeder's audited batches, the relays its sessions wrote it to, and when (wall-clock
+/// milliseconds) it was first written: which of its keys a tag of it may be under.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Sent {
     pub batch: Batch,
     pub relays: Vec<PublicKey>,
+    pub sent_ms: u64,
+}
+
+/// The tag keys the feeder gave each member, by id (key period): the current period's and the
+/// next, and the two before, which tags of batches sent within the window may be under. Older keys
+/// are forgotten, so a tag under one proves nothing.
+#[derive(Default)]
+pub struct Keyring {
+    keys: HashMap<PublicKey, std::collections::BTreeMap<u32, [u8; TAG_KEY_LEN]>>,
+}
+
+impl Keyring {
+    /// `member`'s grant at `now_ms`, signed by the feeder: the keys of this period and the next,
+    /// made fresh the first time each is given and the same every time after.
+    pub fn grant(
+        &mut self,
+        identity: &Identity,
+        member: PublicKey,
+        now_ms: u64,
+    ) -> Option<TagKeys> {
+        let period = key_period(now_ms);
+        self.forget(now_ms);
+        if !self.keys.contains_key(&member) && self.keys.len() >= KEYED_MEMBERS {
+            return None;
+        }
+        let held = self.keys.entry(member).or_default();
+        let mut key = |id: u32| TagKey {
+            id,
+            key: *held.entry(id).or_insert_with(random_hash),
+        };
+        let (current, next) = (key(period), key(period.checked_add(1)?));
+        TagKeys::sign(
+            identity,
+            &TagKeysContent {
+                member,
+                current,
+                next,
+                switch_in_ms: KEY_PERIOD_MS - now_ms % KEY_PERIOD_MS,
+            },
+        )
+        .ok()
+    }
+
+    /// Whether `member` was given the key in force at `now_ms`: one that may be asked.
+    pub fn keyed(&self, member: &PublicKey, now_ms: u64) -> bool {
+        self.keys
+            .get(member)
+            .is_some_and(|held| held.contains_key(&key_period(now_ms)))
+    }
+
+    /// The key `id` given `member`, while it is kept.
+    fn key(&self, member: &PublicKey, id: u32) -> Option<&[u8; TAG_KEY_LEN]> {
+        self.keys.get(member)?.get(&id)
+    }
+
+    /// Whether `tag` is `member`'s tag of `sent`: under a key it was given that was in force when
+    /// the batch was sent, over the batch's bytes.
+    fn proves(&self, member: &PublicKey, sent: &Sent, key: u32, tag: &tally_wire::Tag) -> bool {
+        tag_keys_for(sent.sent_ms).contains(&key)
+            && self
+                .key(member, key)
+                .is_some_and(|held| delivery_tag(held, sent.batch.as_bytes()) == *tag)
+    }
+
+    /// Forgets keys older than any a tag of a batch still askable about may be under, and members
+    /// with none left.
+    fn forget(&mut self, now_ms: u64) {
+        let oldest = key_period(now_ms).saturating_sub(2);
+        self.keys.retain(|_, held| {
+            held.retain(|id, _| *id >= oldest);
+            !held.is_empty()
+        });
+    }
 }
 
 /// What one check found of the relays the sampled batches were sent to.
@@ -133,6 +228,8 @@ pub struct Checking {
     pub audit_for: Duration,
     /// How long after the audit the members are asked.
     pub settle: Duration,
+    /// How often the members are given keys they lack for the period.
+    pub grant_every: Duration,
 }
 
 impl Default for Checking {
@@ -141,6 +238,7 @@ impl Default for Checking {
             every: CHECK_EVERY,
             audit_for: AUDIT_FOR,
             settle: SETTLE,
+            grant_every: GRANT_EVERY,
         }
     }
 }
@@ -155,6 +253,8 @@ pub struct DeliveryChecker {
     audit: Option<Audit>,
     pending: Option<Pending>,
     audits: usize,
+    /// The tag keys given the members.
+    pub keyring: Keyring,
 }
 
 impl DeliveryChecker {
@@ -202,12 +302,19 @@ impl DeliveryChecker {
         }
     }
 
-    /// A query over a sample of `recent` (the feeder's own batches, newest last, each with the
+    /// A query over a sample of `recent` (the feeder's audited batches, newest last, each with the
     /// relays it was written to): the newest `SAMPLED` that the audited relay alone was written,
-    /// of the newest boot among them. None with no audit, a void one, or none of those.
+    /// sent within `ASK_WITHIN_MS`, of the newest boot among them. None with no audit, a void one,
+    /// or none of those. It carries no keys: each member's are added as it is asked.
     pub fn sample(&mut self, recent: &[Sent]) -> Option<DeliveryQuery> {
+        self.sample_at(recent, wall_ms())
+    }
+
+    fn sample_at(&mut self, recent: &[Sent], now_ms: u64) -> Option<DeliveryQuery> {
         let audit = self.audit.filter(|audit| !audit.void)?;
-        let solo = |sent: &&Sent| sent.relays == [audit.relay];
+        let solo = |sent: &&Sent| {
+            sent.relays == [audit.relay] && now_ms.saturating_sub(sent.sent_ms) < ASK_WITHIN_MS
+        };
         let newest = recent.iter().rev().find(solo)?;
         let boot_id = newest.batch.boot_id();
         let receiver = newest.batch.receiver().ok()?;
@@ -226,6 +333,7 @@ impl DeliveryChecker {
             receiver,
             boot_id,
             ranges: ranges(chosen.keys().copied()),
+            keys: None,
         };
         self.pending = Some(Pending {
             query: query.clone(),
@@ -308,9 +416,10 @@ impl DeliveryChecker {
                     continue;
                 };
                 let proved = match possession {
-                    Possession::Proved(proof) => {
-                        if possession_proof(&query.nonce, &sent.batch) != proof {
-                            // Not a proof of this batch: it proves nothing and denies nothing.
+                    Possession::Proved { key, tag } => {
+                        if !self.keyring.proves(&signer, sent, key, &tag) {
+                            // Not this member's tag of this batch under a key in force when it was
+                            // sent: it proves nothing and denies nothing.
                             continue;
                         }
                         true
@@ -416,6 +525,11 @@ fn ranges(sequences: impl Iterator<Item = u64>) -> Vec<SequenceRange> {
     ranges
 }
 
+/// A fresh nonce for a query.
+pub fn fresh_nonce() -> [u8; 32] {
+    random_hash()
+}
+
 fn random_hash() -> [u8; 32] {
     let mut bytes = [0; 32];
     let _ = getrandom::getrandom(&mut bytes);
@@ -423,13 +537,64 @@ fn random_hash() -> [u8; 32] {
 }
 
 /// The members of `area`'s sharing group to ask, from the offers a relay gave: signed, alive at
-/// `now_ms`, for the area or a cell above it, carrying raw, not one of `exclude`; at most `ASKED`,
+/// `now_ms`, for the area or a cell above it, carrying raw, not one of `exclude`, given the key in
+/// force now (`keyed`, from the `Keyring`: one without it has no tag to give); at most `ASKED`,
 /// chosen at random, each on a network known distinct from every other chosen
 /// (`rendezvous::distinct_networks`, over the offer's declared network and the address the feeder
 /// observed it at, from `observed`), and at most one more whose network is not known, not known
 /// to share one with any chosen. So no fixed few are always the judges, and no network judges
 /// twice.
 pub fn members(
+    offers: &[ProviderOffer],
+    area: Region,
+    exclude: &[PublicKey],
+    observed: &HashMap<PublicKey, IpAddr>,
+    keyed: impl Fn(&PublicKey) -> bool,
+    now_ms: u64,
+) -> Vec<Member> {
+    let mut candidates = candidates(offers, area, exclude, observed, now_ms);
+    candidates.retain(|member| keyed(&member.relay.key));
+    shuffle(&mut candidates);
+    let known = |member: &Member| member.network != 0 && member.host.is_some();
+    let mut chosen: Vec<Member> = Vec::new();
+    for member in candidates.iter().filter(|member| known(member)) {
+        if chosen.len() < ASKED
+            && chosen
+                .iter()
+                .all(|other| distinct_networks(other.placement(), member.placement()))
+        {
+            chosen.push(member.clone());
+        }
+    }
+    if let Some(unknown) = candidates.iter().find(|member| {
+        !known(member)
+            && chosen
+                .iter()
+                .all(|other| !same_network(other.placement(), member.placement()))
+    }) && chosen.len() < ASKED
+    {
+        chosen.push(unknown.clone());
+    }
+    chosen
+}
+
+/// Every member of `area`'s sharing group the feeder may ask (the offers `members` chooses from,
+/// none excluded), at most `KEYED_MEMBERS`, chosen at random: the members given tag keys.
+pub fn keyable(
+    offers: &[ProviderOffer],
+    area: Region,
+    observed: &HashMap<PublicKey, IpAddr>,
+    now_ms: u64,
+) -> Vec<Member> {
+    let mut candidates = candidates(offers, area, &[], observed, now_ms);
+    shuffle(&mut candidates);
+    candidates.truncate(KEYED_MEMBERS);
+    candidates
+}
+
+/// The members `offers` name for `area`: signed, alive at `now_ms`, for the area or a cell above
+/// it, carrying raw, not one of `exclude`, each once.
+fn candidates(
     offers: &[ProviderOffer],
     area: Region,
     exclude: &[PublicKey],
@@ -462,28 +627,7 @@ pub fn members(
             host: observed.get(&signer).copied(),
         });
     }
-    shuffle(&mut candidates);
-    let known = |member: &Member| member.network != 0 && member.host.is_some();
-    let mut chosen: Vec<Member> = Vec::new();
-    for member in candidates.iter().filter(|member| known(member)) {
-        if chosen.len() < ASKED
-            && chosen
-                .iter()
-                .all(|other| distinct_networks(other.placement(), member.placement()))
-        {
-            chosen.push(member.clone());
-        }
-    }
-    if let Some(unknown) = candidates.iter().find(|member| {
-        !known(member)
-            && chosen
-                .iter()
-                .all(|other| !same_network(other.placement(), member.placement()))
-    }) && chosen.len() < ASKED
-    {
-        chosen.push(unknown.clone());
-    }
-    chosen
+    candidates
 }
 
 fn shuffle<T>(items: &mut [T]) {
@@ -495,7 +639,8 @@ fn shuffle<T>(items: &mut [T]) {
     }
 }
 
-/// Asks `member` the query; its signed answer, if it gave one signed by its key.
+/// Asks `member` the query (with its keys, or carrying only keys); its signed answer, if it gave
+/// one signed by its key.
 pub async fn ask(
     member: &RelayAddress,
     me: &Identity,
@@ -573,44 +718,84 @@ mod tests {
         .map_err(error)
     }
 
-    /// A member's answer: a proof of each of `held`, "not seen" of the rest.
-    fn answer(
-        member: &Identity,
-        query: &DeliveryQuery,
-        batches: &[Batch],
-        held: &[u64],
-    ) -> Result<DeliveryAnswer, String> {
-        let entries = batches
-            .iter()
-            .map(|batch| {
-                let sequence = batch.sequence();
-                let possession = if held.contains(&sequence) {
-                    Possession::Proved(possession_proof(&query.nonce, batch))
-                } else {
-                    Possession::NotSeen
-                };
-                (sequence, possession)
-            })
-            .collect();
-        DeliveryAnswer::sign(
-            member,
-            &DeliveryAnswerContent {
-                nonce: query.nonce,
-                receiver: query.receiver,
-                boot_id: query.boot_id,
-                issued_ms: 1,
-                takes_area: true,
-                entries,
-            },
-        )
-        .map_err(error)
-    }
-
     struct Setup {
         checker: DeliveryChecker,
+        feeder: Identity,
         query: DeliveryQuery,
         batches: Vec<Batch>,
         relay: PublicKey,
+        sent_ms: u64,
+    }
+
+    impl Setup {
+        /// A member of the area, given its keys.
+        fn member(&mut self) -> Result<Identity, String> {
+            let member = identity()?;
+            self.checker
+                .keyring
+                .grant(&self.feeder, member.public(), self.sent_ms)
+                .ok_or("no grant")?;
+            Ok(member)
+        }
+
+        /// A member's answer: a tag of each of `held` (made as it arrived, under its key in force
+        /// when the batch was sent), "not seen" of the rest of `batches`.
+        fn answer(&mut self, batches: &[Batch], held: &[u64]) -> Result<DeliveryAnswer, String> {
+            let member = self.member()?;
+            self.answer_as(&member, batches, held)
+        }
+
+        /// `answer` over the first `count` audited batches.
+        fn answer_first(&mut self, count: usize, held: &[u64]) -> Result<DeliveryAnswer, String> {
+            let batches = self.batches[..count].to_vec();
+            self.answer(&batches, held)
+        }
+
+        fn answer_as(
+            &self,
+            member: &Identity,
+            batches: &[Batch],
+            held: &[u64],
+        ) -> Result<DeliveryAnswer, String> {
+            let id = key_period(self.sent_ms);
+            let key = *self
+                .checker
+                .keyring
+                .key(&member.public(), id)
+                .ok_or("no key")?;
+            let entries = batches
+                .iter()
+                .map(|batch| {
+                    let sequence = batch.sequence();
+                    let possession = if held.contains(&sequence) {
+                        Possession::Proved {
+                            key: id,
+                            tag: delivery_tag(&key, batch.as_bytes()),
+                        }
+                    } else {
+                        Possession::NotSeen
+                    };
+                    (sequence, possession)
+                })
+                .collect();
+            DeliveryAnswer::sign(
+                member,
+                &DeliveryAnswerContent {
+                    nonce: self.query.nonce,
+                    receiver: self.query.receiver,
+                    boot_id: self.query.boot_id,
+                    issued_ms: 1,
+                    takes_area: true,
+                    entries,
+                },
+            )
+            .map_err(error)
+        }
+
+        fn judge(&mut self, answers: &[(u32, DeliveryAnswer)]) -> Verdict {
+            let query = self.query.clone();
+            self.checker.judge(&query, answers)
+        }
     }
 
     /// A feeder whose last four batches were audited to one relay, and the query over them.
@@ -618,6 +803,7 @@ mod tests {
         let feeder = identity()?;
         let relay = identity()?.public();
         let other = identity()?.public();
+        let sent_ms = wall_ms();
         let mut recent = Vec::new();
         let mut batches = Vec::new();
         for sequence in 0..10 {
@@ -628,7 +814,11 @@ mod tests {
             } else {
                 vec![relay, other]
             };
-            recent.push(Sent { batch, relays });
+            recent.push(Sent {
+                batch,
+                relays,
+                sent_ms,
+            });
         }
         let mut checker = DeliveryChecker::default();
         assert_eq!(checker.audit(&[relay], |_| true), Some(relay));
@@ -641,9 +831,11 @@ mod tests {
         assert_eq!(checker.checked_relays(), vec![relay]);
         Ok(Setup {
             checker,
+            feeder,
             query,
             batches,
             relay,
+            sent_ms,
         })
     }
 
@@ -653,14 +845,11 @@ mod tests {
     fn a_majority_of_networks_proving_is_delivery() -> Result<(), String> {
         let mut setup = audited()?;
         let answers = vec![
-            (1, answer(&identity()?, &setup.query, &setup.batches, ALL)?),
-            (2, answer(&identity()?, &setup.query, &setup.batches, ALL)?),
-            (3, answer(&identity()?, &setup.query, &setup.batches, &[])?),
+            (1, setup.answer_first(4, ALL)?),
+            (2, setup.answer_first(4, ALL)?),
+            (3, setup.answer_first(4, &[])?),
         ];
-        assert_eq!(
-            setup.checker.judge(&setup.query, &answers),
-            Verdict::Delivered
-        );
+        assert_eq!(setup.judge(&answers), Verdict::Delivered);
         assert!(setup.checker.avoided().is_empty());
         Ok(())
     }
@@ -668,19 +857,16 @@ mod tests {
     #[test]
     fn one_members_word_alone_convicts_no_one() -> Result<(), String> {
         let mut setup = audited()?;
-        let alone = vec![(1, answer(&identity()?, &setup.query, &setup.batches, &[])?)];
-        assert_eq!(setup.checker.judge(&setup.query, &alone), Verdict::Unknown);
+        let alone = vec![(1, setup.answer_first(4, &[])?)];
+        assert_eq!(setup.judge(&alone), Verdict::Unknown);
         // Nor several members of one network: they are one vote.
         let mut setup = audited()?;
         let one_network = vec![
-            (5, answer(&identity()?, &setup.query, &setup.batches, &[])?),
-            (5, answer(&identity()?, &setup.query, &setup.batches, &[])?),
-            (5, answer(&identity()?, &setup.query, &setup.batches, &[])?),
+            (5, setup.answer_first(4, &[])?),
+            (5, setup.answer_first(4, &[])?),
+            (5, setup.answer_first(4, &[])?),
         ];
-        assert_eq!(
-            setup.checker.judge(&setup.query, &one_network),
-            Verdict::Unknown
-        );
+        assert_eq!(setup.judge(&one_network), Verdict::Unknown);
         assert!(setup.checker.avoided().is_empty());
         Ok(())
     }
@@ -689,14 +875,11 @@ mod tests {
     fn a_swallowing_relay_is_caught_by_a_majority_of_networks() -> Result<(), String> {
         let mut setup = audited()?;
         let answers = vec![
-            (1, answer(&identity()?, &setup.query, &setup.batches, &[])?),
-            (2, answer(&identity()?, &setup.query, &setup.batches, &[])?),
-            (3, answer(&identity()?, &setup.query, &setup.batches, ALL)?),
+            (1, setup.answer_first(4, &[])?),
+            (2, setup.answer_first(4, &[])?),
+            (3, setup.answer_first(4, ALL)?),
         ];
-        assert_eq!(
-            setup.checker.judge(&setup.query, &answers),
-            Verdict::Swallowed(vec![setup.relay])
-        );
+        assert_eq!(setup.judge(&answers), Verdict::Swallowed(vec![setup.relay]));
         assert_eq!(setup.checker.avoided(), vec![setup.relay]);
         Ok(())
     }
@@ -708,24 +891,31 @@ mod tests {
         // members on two networks have none of them, and a third offers proofs that are not of
         // these batches (it never held them): no proof, no delivery.
         let mut setup = audited()?;
-        let liar = identity()?;
-        let mut forged = answer(&liar, &setup.query, &setup.batches, &[])?
+        let liar = setup.member()?;
+        let mut forged = setup
+            .answer_as(&liar, &setup.batches, &[])?
             .content()
             .map_err(error)?;
+        let id = key_period(setup.sent_ms);
         forged.entries = ALL
             .iter()
-            .map(|sequence| (*sequence, Possession::Proved([0xaa; 32])))
+            .map(|sequence| {
+                (
+                    *sequence,
+                    Possession::Proved {
+                        key: id,
+                        tag: [0xaa; 16],
+                    },
+                )
+            })
             .collect();
         let forged = DeliveryAnswer::sign(&liar, &forged).map_err(error)?;
         let answers = vec![
-            (1, answer(&identity()?, &setup.query, &setup.batches, &[])?),
-            (2, answer(&identity()?, &setup.query, &setup.batches, &[])?),
+            (1, setup.answer_first(4, &[])?),
+            (2, setup.answer_first(4, &[])?),
             (3, forged),
         ];
-        assert_eq!(
-            setup.checker.judge(&setup.query, &answers),
-            Verdict::Swallowed(vec![setup.relay])
-        );
+        assert_eq!(setup.judge(&answers), Verdict::Swallowed(vec![setup.relay]));
         Ok(())
     }
 
@@ -737,13 +927,10 @@ mod tests {
         let mut setup = audited()?;
         setup.checker.session_ended(setup.relay);
         let answers = vec![
-            (1, answer(&identity()?, &setup.query, &setup.batches, &[])?),
-            (2, answer(&identity()?, &setup.query, &setup.batches, &[])?),
+            (1, setup.answer_first(4, &[])?),
+            (2, setup.answer_first(4, &[])?),
         ];
-        assert_eq!(
-            setup.checker.judge(&setup.query, &answers),
-            Verdict::Unknown
-        );
+        assert_eq!(setup.judge(&answers), Verdict::Unknown);
         assert!(setup.checker.avoided().is_empty());
         // Ended mid-audit, before the sample: there is no sample to take.
         let feeder = identity()?;
@@ -753,6 +940,7 @@ mod tests {
                 Ok(Sent {
                     batch: batch(&feeder, sequence)?,
                     relays: vec![relay],
+                    sent_ms: wall_ms(),
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
@@ -773,43 +961,28 @@ mod tests {
         // and let them go, which is no signed claim against anyone.
         let mut setup = audited()?;
         let answers = vec![
-            (1, answer(&identity()?, &setup.query, &[], &[])?),
-            (2, answer(&identity()?, &setup.query, &[], &[])?),
+            (1, setup.answer_first(0, &[])?),
+            (2, setup.answer_first(0, &[])?),
         ];
-        assert_eq!(
-            setup.checker.judge(&setup.query, &answers),
-            Verdict::Unknown
-        );
+        assert_eq!(setup.judge(&answers), Verdict::Unknown);
         assert!(setup.checker.avoided().is_empty());
         // One network proves every batch; another has let two go and proves the rest. Every
         // batch has a majority of the networks that said anything of it.
         let mut setup = audited()?;
         let answers = vec![
-            (1, answer(&identity()?, &setup.query, &setup.batches, ALL)?),
-            (
-                2,
-                answer(&identity()?, &setup.query, &setup.batches[..2], ALL)?,
-            ),
+            (1, setup.answer_first(4, ALL)?),
+            (2, setup.answer_first(2, ALL)?),
         ];
-        assert_eq!(
-            setup.checker.judge(&setup.query, &answers),
-            Verdict::Delivered
-        );
+        assert_eq!(setup.judge(&answers), Verdict::Delivered);
         // A signed "not seen" from a third network on the batches the second let go is a tie on
         // them (one proves, one denies): still no conviction.
         let mut setup = audited()?;
         let answers = vec![
-            (1, answer(&identity()?, &setup.query, &setup.batches, ALL)?),
-            (
-                2,
-                answer(&identity()?, &setup.query, &setup.batches[..2], ALL)?,
-            ),
-            (3, answer(&identity()?, &setup.query, &setup.batches, &[])?),
+            (1, setup.answer_first(4, ALL)?),
+            (2, setup.answer_first(2, ALL)?),
+            (3, setup.answer_first(4, &[])?),
         ];
-        assert_eq!(
-            setup.checker.judge(&setup.query, &answers),
-            Verdict::Unknown
-        );
+        assert_eq!(setup.judge(&answers), Verdict::Unknown);
         assert!(setup.checker.avoided().is_empty());
         Ok(())
     }
@@ -825,14 +998,165 @@ mod tests {
             .map(|sequence| batch(&other_feeder, *sequence))
             .collect::<Result<_, String>>()?;
         let answers = vec![
-            (1, answer(&identity()?, &setup.query, &impostors, ALL)?),
-            (2, answer(&identity()?, &setup.query, &setup.batches, &[])?),
+            (1, setup.answer(&impostors, ALL)?),
+            (2, setup.answer_first(4, &[])?),
         ];
         assert_eq!(
-            setup.checker.judge(&setup.query, &answers),
+            setup.judge(&answers),
             Verdict::Unknown,
             "a proof of another batch proves nothing; one network's denial convicts no one"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn a_tag_under_a_key_not_in_force_when_the_batch_was_sent_is_no_proof() -> Result<(), String> {
+        // Two members prove every batch, one under the key it was given for the period the
+        // batches were sent in, one under a key three periods old that it kept (a replay of
+        // an old key): only the first is a proof, and the old key's network denies nothing.
+        let mut setup = audited()?;
+        let honest = setup.answer_first(4, ALL)?;
+        let replayer = identity()?;
+        let old = setup.sent_ms - 3 * KEY_PERIOD_MS;
+        setup
+            .checker
+            .keyring
+            .grant(&setup.feeder, replayer.public(), old)
+            .ok_or("no grant")?;
+        // Granting now forgets keys past the window: the old one is gone, as rotation makes it.
+        setup
+            .checker
+            .keyring
+            .grant(&setup.feeder, replayer.public(), setup.sent_ms)
+            .ok_or("no grant")?;
+        let stale = [7; TAG_KEY_LEN];
+        let replayed = DeliveryAnswer::sign(
+            &replayer,
+            &DeliveryAnswerContent {
+                nonce: setup.query.nonce,
+                receiver: setup.query.receiver,
+                boot_id: setup.query.boot_id,
+                issued_ms: 1,
+                takes_area: true,
+                entries: setup
+                    .batches
+                    .iter()
+                    .map(|batch| {
+                        (
+                            batch.sequence(),
+                            Possession::Proved {
+                                key: key_period(old),
+                                tag: delivery_tag(&stale, batch.as_bytes()),
+                            },
+                        )
+                    })
+                    .collect(),
+            },
+        )
+        .map_err(error)?;
+        let deny = setup.answer_first(4, &[])?;
+        // The honest network proves, the replayer says nothing, one network denies: a tie of
+        // one each, no verdict. Without the replay counted, nobody is convicted.
+        assert_eq!(
+            setup.judge(&[(1, honest), (2, replayed), (3, deny)]),
+            Verdict::Unknown
+        );
+        assert!(setup.checker.avoided().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn a_tag_made_from_the_batch_hash_alone_is_no_proof() -> Result<(), String> {
+        // A member that saw only a piece manifest (which lists the batch's hash) tags the hash:
+        // no proof. Two networks deny; the swallower is caught.
+        let mut setup = audited()?;
+        let member = setup.member()?;
+        let id = key_period(setup.sent_ms);
+        let key = *setup
+            .checker
+            .keyring
+            .key(&member.public(), id)
+            .ok_or("no key")?;
+        let from_hashes = DeliveryAnswer::sign(
+            &member,
+            &DeliveryAnswerContent {
+                nonce: setup.query.nonce,
+                receiver: setup.query.receiver,
+                boot_id: setup.query.boot_id,
+                issued_ms: 1,
+                takes_area: true,
+                entries: setup
+                    .batches
+                    .iter()
+                    .map(|batch| {
+                        (
+                            batch.sequence(),
+                            Possession::Proved {
+                                key: id,
+                                tag: delivery_tag(&key, &batch.hash()),
+                            },
+                        )
+                    })
+                    .collect(),
+            },
+        )
+        .map_err(error)?;
+        let answers = vec![
+            (1, from_hashes),
+            (2, setup.answer_first(4, &[])?),
+            (3, setup.answer_first(4, &[])?),
+        ];
+        assert_eq!(setup.judge(&answers), Verdict::Swallowed(vec![setup.relay]));
+        Ok(())
+    }
+
+    #[test]
+    fn only_batches_within_the_window_are_asked_about() -> Result<(), String> {
+        let feeder = identity()?;
+        let relay = identity()?.public();
+        let now = wall_ms();
+        let recent = vec![Sent {
+            batch: batch(&feeder, 1)?,
+            relays: vec![relay],
+            sent_ms: now - ASK_WITHIN_MS,
+        }];
+        let mut checker = DeliveryChecker::default();
+        checker.audit(&[relay], |_| true);
+        assert_eq!(checker.sample_at(&recent, now), None);
+        assert!(checker.sample_at(&recent, now - 1).is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn keys_are_the_same_all_period_and_rotate_with_it() -> Result<(), String> {
+        let feeder = identity()?;
+        let member = identity()?.public();
+        let mut keyring = Keyring::default();
+        let start = 100 * KEY_PERIOD_MS;
+        let first = keyring
+            .grant(&feeder, member, start)
+            .ok_or("no grant")?
+            .content()
+            .map_err(error)?;
+        let again = keyring
+            .grant(&feeder, member, start + KEY_PERIOD_MS / 2)
+            .ok_or("no grant")?
+            .content()
+            .map_err(error)?;
+        assert_eq!((first.current, first.next), (again.current, again.next));
+        assert!(keyring.keyed(&member, start));
+        assert!(!keyring.keyed(&identity()?.public(), start));
+        let next = keyring
+            .grant(&feeder, member, start + KEY_PERIOD_MS)
+            .ok_or("no grant")?
+            .content()
+            .map_err(error)?;
+        assert_eq!(next.current, first.next);
+        assert_ne!(next.next, first.next);
+        // Three periods on, the first key is forgotten.
+        keyring.grant(&feeder, member, start + 3 * KEY_PERIOD_MS);
+        assert!(keyring.key(&member, first.current.id).is_none());
+        assert!(keyring.key(&member, first.current.id + 1).is_some());
         Ok(())
     }
 
@@ -865,6 +1189,7 @@ mod tests {
             recent.push(Sent {
                 batch: batch(&feeder, sequence)?,
                 relays,
+                sent_ms: wall_ms(),
             });
         }
         let mut checker = DeliveryChecker::default();
@@ -873,6 +1198,7 @@ mod tests {
         recent.push(Sent {
             batch: batch(&feeder, 6)?,
             relays: vec![audited],
+            sent_ms: wall_ms(),
         });
         let query = checker.sample(&recent).ok_or("no sample")?;
         assert_eq!(query.ranges, vec![SequenceRange { first: 6, last: 6 }]);
@@ -898,12 +1224,9 @@ mod tests {
         let answers = vec![
             (1, outside.clone()),
             (2, outside),
-            (3, answer(&identity()?, &setup.query, &setup.batches, &[])?),
+            (3, setup.answer_first(4, &[])?),
         ];
-        assert_eq!(
-            setup.checker.judge(&setup.query, &answers),
-            Verdict::Unknown
-        );
+        assert_eq!(setup.judge(&answers), Verdict::Unknown);
         Ok(())
     }
 
@@ -989,10 +1312,7 @@ mod tests {
         let impostor = member(identity()?, identity()?).await?;
         assert_eq!(ask(&impostor, &me, &setup.query).await, None);
         // One member's "not seen" is no verdict.
-        assert_eq!(
-            setup.checker.judge(&setup.query, &[(1, answer)]),
-            Verdict::Unknown
-        );
+        assert_eq!(setup.judge(&[(1, answer)]), Verdict::Unknown);
         Ok(())
     }
 
@@ -1066,7 +1386,7 @@ mod tests {
             })
             .collect();
         for _ in 0..10 {
-            let members = members(&offers, area, &[checked.public()], &observed, now);
+            let members = members(&offers, area, &[checked.public()], &observed, |_| true, now);
             let mut networks: Vec<u32> = members.iter().map(|member| member.network).collect();
             networks.sort_unstable();
             assert_eq!(networks, vec![0, 1, 2]);
@@ -1075,7 +1395,8 @@ mod tests {
                 .keys()
                 .map(|key| (*key, IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 9))))
                 .collect();
-            let one_prefix = super::members(&offers, area, &[checked.public()], &shared, now);
+            let one_prefix =
+                super::members(&offers, area, &[checked.public()], &shared, |_| true, now);
             assert_eq!(one_prefix.len(), 1, "{one_prefix:?}");
             assert!(
                 members

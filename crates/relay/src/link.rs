@@ -20,17 +20,18 @@ use std::time::Duration;
 use tally_wire::backoff::Backoff;
 use tally_wire::fault_proof::{FAULT_PROOF_FORMAT, MODEL_FAULT_PROOF_FORMAT};
 use tally_wire::noise::{self, Accepted, Reader, Writer};
-use tally_wire::{Identity, Location, PublicKey, Reason, ReceiverInfo, Record, Role, Tolerance};
+use tally_wire::{Identity, PublicKey, Reason, Record, Role, Tolerance};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::broadcast::{self, error::RecvError, error::TryRecvError};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{OwnedSemaphorePermit, mpsc, watch};
 use tokio::time::Instant;
 
 use crate::ceiling::{self, Ceiling, Metered};
 use crate::config::Upstream;
 use crate::egress::{Class, Kind, Link, Shed, Socket};
-use crate::hub::{Hub, Item, RelayTrust};
+use crate::fanout::{Fell, Filter, Listener};
+use crate::hub::{Hub, Inbound, Item, Origin, OwnDescription, RelayTrust};
+use crate::ingest::{Credit, Refusal};
 use crate::network::{Asker, AskerRole};
 use crate::subscription::{Subscription, directory_wants, on_directory_link};
 use tally_wire::RelayAddress;
@@ -222,12 +223,9 @@ impl Drop for Feeding {
 }
 
 /// A feeder's own description, as it last sent it: given to the hub again when the hub has
-/// forgotten it and the feeder is publishing (see `hub::RECEIVERS_REMEMBERED`).
-struct Described {
-    info: ReceiverInfo,
-    issued_ms: u64,
-    place: Option<Location>,
-}
+/// forgotten it and the feeder is publishing (see `hub::RECEIVERS_REMEMBERED`). Shared with each
+/// batch the link hands the ingest stage, which acts on it there.
+type Described = Arc<OwnDescription>;
 
 /// Which records on the fan-out a link is sent.
 enum Wants {
@@ -277,6 +275,14 @@ impl Wants {
     fn apply(&mut self, subscription: Subscription) {
         if let Self::Subscription { current, .. } = self {
             *current = subscription;
+        }
+    }
+
+    /// What the router offers a link that wants this.
+    fn filter(&self) -> Filter {
+        match self {
+            Self::Directory => Filter::Directory,
+            Self::Subscription { current, .. } => Filter::Subscription(current.clone()),
         }
     }
 }
@@ -498,6 +504,21 @@ where
         },
         _ => None,
     };
+    // And only with its bytes reserved in every store (`budget`, RFC-0177 §9): a feeder the
+    // relay's memory cannot hold is turned away now, never dropped from a store later.
+    let _reserved = match peer {
+        Peer::Feeder(_) => match hub.budget().reserve() {
+            Some(reservation) => Some(reservation),
+            None => {
+                farewell(&mut session.reader, &mut session.writer, full(&hub)).await;
+                return Err(format!(
+                    "turned away: no spare slot (the memory budget holds {} feeders)",
+                    hub.budget().ceiling()
+                ));
+            }
+        },
+        _ => None,
+    };
     // A feeder's session in the station reports ends with this connection, however it ends.
     let _feeding = match peer {
         Peer::Feeder(receiver) => Some(Feeding {
@@ -522,9 +543,18 @@ where
     // What came with Hello is acted on before anything is sent: a subscriber's first `Subscribe`
     // decides its first byte, and a network duty's answers (a probe's, before any) go first.
     let mut answers = Vec::new();
+    let refusal = Arc::new(Refusal::default());
     for record in first {
-        let ingested = ingest(record, &hub, source, (peer, &asker), steer, &mut described)
-            .or_else(|unhandled| network(unhandled, &hub, &asker, &mut answers));
+        let ingested = ingest(
+            record,
+            &hub,
+            source,
+            (peer, &asker),
+            steer,
+            &mut described,
+            (None, &refusal),
+        )
+        .or_else(|unhandled| network(unhandled, &hub, &asker, &mut answers));
         if let Err(end) = ingested {
             return Err(end_now(&mut session.reader, &mut session.writer, end).await);
         }
@@ -589,6 +619,7 @@ where
             fan_out,
             subscribe: steer,
             described,
+            refusal: Some(refusal),
             asker,
             // Each role its own ceiling, decided by the role its handshake established, never by
             // its key: a member publishes its groups' slices, a feeder one receiver's batches, an
@@ -722,6 +753,7 @@ async fn upstream_once(
             fan_out: Some(directory_fan_out()),
             subscribe: None,
             described: None,
+            refusal: None,
             // A directory link carries offers and queries; only data is held to a ceiling.
             ceiling: None,
             asker: Asker {
@@ -818,6 +850,7 @@ async fn member_once(
             fan_out: None,
             subscribe: None,
             described: None,
+            refusal: None,
             ceiling: None,
             asker: Asker {
                 role: AskerRole::Relay,
@@ -852,6 +885,9 @@ struct Serving<'a> {
     subscribe: Option<&'a watch::Sender<Subscription>>,
     /// A feeder's own description, if it sent one with its `Hello`.
     described: Option<Described>,
+    /// Where a batch refused by the ingest stage ends the connection: the one its `Hello`'s batches
+    /// were handed with, if any.
+    refusal: Option<Arc<Refusal>>,
     /// What the peer may send, for a connection that dialled in.
     ceiling: Option<Ceiling>,
     /// Who the peer is, as the network duties see it.
@@ -887,7 +923,7 @@ impl From<String> for Closing {
 async fn exchange<S>(
     reader: &mut Reader<S>,
     writer: &mut Writer<S>,
-    hub: &Hub,
+    hub: &Arc<Hub>,
     source: u64,
     peer: Peer,
     link: &Arc<Link>,
@@ -901,6 +937,7 @@ where
         fan_out,
         subscribe,
         described,
+        refusal,
         ceiling,
         asker,
         outgoing,
@@ -912,6 +949,7 @@ where
             subscribe,
             asker,
             replies: replying,
+            refusal: refusal.unwrap_or_default(),
         };
         match read_loop(reader, hub, source, peer, reading, described, ceiling).await {
             Ok(()) => Ok(None),
@@ -974,11 +1012,13 @@ struct Reading<'a> {
     subscribe: Option<&'a watch::Sender<Subscription>>,
     asker: Asker,
     replies: mpsc::Sender<Vec<Record>>,
+    /// Where the ingest stage says a batch's signature failed.
+    refusal: Arc<Refusal>,
 }
 
 async fn read_loop<S: AsyncRead>(
     reader: &mut Reader<S>,
-    hub: &Hub,
+    hub: &Arc<Hub>,
     source: u64,
     peer: Peer,
     reading: Reading<'_>,
@@ -989,15 +1029,28 @@ async fn read_loop<S: AsyncRead>(
         subscribe,
         asker,
         replies,
+        refusal,
     } = reading;
+    // `CREDIT` batches in the ingest stage at once (a relay's link `RELAY_CREDIT`, as it carries
+    // many receivers): with none left the socket is not read, and TCP holds the sender back
+    // (RFC-0177 §2).
+    let credit = match peer {
+        Peer::Member | Peer::Relay => Credit::new(crate::ingest::RELAY_CREDIT),
+        Peer::Feeder(_) | Peer::Subscriber | Peer::Engine(_) | Peer::Probe => Credit::default(),
+    };
     let mut records = Vec::new();
     let mut answers = Vec::new();
     loop {
         records.clear();
-        tokio::time::timeout(READ_TIMEOUT, reader.recv(&mut records))
-            .await
-            .map_err(|_| "silent too long".to_owned())?
-            .map_err(|error| error.to_string())?;
+        // A batch the ingest stage refused (its signature) ends the session at once, whatever
+        // is being read: the session is over, so a read cut short loses nothing.
+        tokio::select! {
+            read = tokio::time::timeout(READ_TIMEOUT, reader.recv(&mut records)) => {
+                read.map_err(|_| "silent too long".to_owned())?
+                    .map_err(|error| error.to_string())?;
+            }
+            why = refusal.refused() => return Err(End::Closed(why)),
+        }
         if ceiling.as_mut().is_some_and(|ceiling| !ceiling.within()) {
             return Err(End::Told {
                 reason: Reason::Full,
@@ -1006,6 +1059,14 @@ async fn read_loop<S: AsyncRead>(
             });
         }
         for record in records.drain(..) {
+            let permit = if matches!(record, Record::Batch(_)) {
+                credit.acquire().await
+            } else {
+                None
+            };
+            if let Some(why) = refusal.now() {
+                return Err(End::Closed(why));
+            }
             ingest(
                 record,
                 hub,
@@ -1013,6 +1074,7 @@ async fn read_loop<S: AsyncRead>(
                 (peer, &asker),
                 subscribe,
                 &mut described,
+                (permit, &refusal),
             )
             .or_else(|unhandled| network(unhandled, hub, &asker, &mut answers))?;
         }
@@ -1063,11 +1125,12 @@ fn network(
 
 fn ingest(
     record: Record,
-    hub: &Hub,
+    hub: &Arc<Hub>,
     source: u64,
     (peer, asker): (Peer, &Asker),
     subscribe: Option<&watch::Sender<Subscription>>,
     described: &mut Option<Described>,
+    (permit, refusal): (Option<OwnedSemaphorePermit>, &Arc<Refusal>),
 ) -> Result<(), Unhandled> {
     // Whether the peer may send it at all is its role's one rule (`Peer::permit`).
     let peer = peer.now(hub, &asker.key);
@@ -1081,43 +1144,25 @@ fn ingest(
     }
     match record {
         Record::Batch(batch) => {
-            let receiver = batch.receiver().map_err(|error| error.to_string())?;
-            // A receiver's signature only: a relay's deduplicated batch never passes as one.
-            batch.verify().map_err(|error| error.to_string())?;
-            // The network duties see where it came from: a feeder's own batch is seeded into its
-            // area's sharing group by this relay, its origin; a member's is a group piece.
-            let shared = match peer {
-                Peer::Feeder(_) | Peer::Member | Peer::Relay => Some(batch.clone()),
-                Peer::Subscriber | Peer::Engine(_) | Peer::Probe => None,
+            // Its signature (a receiver's only: a relay's deduplicated batch never passes as one),
+            // its admission and its decode are the ingest stage's, on a CPU worker; a refused
+            // signature ends this connection there (`Refusal`). What follows admission (the
+            // station counters, a forgotten description given again, the sharing duties) follows
+            // there too, in the receiver's order.
+            let origin = match peer {
+                Peer::Feeder(_) => Origin::Feeder(described.clone()),
+                Peer::Member | Peer::Relay => Origin::Peer(*asker),
+                Peer::Subscriber | Peer::Engine(_) | Peer::Probe => Origin::Elsewhere,
             };
-            let new = hub.publish_batch(source, batch, receiver);
-            if new && matches!(peer, Peer::Feeder(_)) {
-                hub.fed_by(&receiver, source);
-            }
-            if let Some(batch) = shared {
-                let now_ms = crate::network::wall_ms();
-                match peer {
-                    Peer::Feeder(_) => hub.network().from_feeder(hub, &batch, now_ms),
-                    _ => hub
-                        .network()
-                        .from_peer(hub, asker, &Record::Batch(batch), now_ms),
-                }
-            }
-            // A feeder's description pushed out while it was not yet publishing comes back now
-            // that it is, as one that is.
-            if new
-                && let Some(own) = described.as_ref()
-                && !hub.describes(&receiver)
-            {
-                hub.publish_info(
-                    source,
-                    own.info.clone(),
-                    receiver,
-                    own.issued_ms,
-                    own.place,
-                    true,
-                );
-            }
+            hub.ingest(Inbound {
+                source,
+                batch,
+                origin,
+                verify: true,
+                stamp: None,
+                permit,
+                refusal: Some(Arc::clone(refusal)),
+            });
         }
         Record::ReceiverInfo(info) => {
             let receiver = info.receiver().map_err(|error| error.to_string())?;
@@ -1133,11 +1178,11 @@ fn ingest(
                     .as_ref()
                     .is_none_or(|own| issued_ms >= own.issued_ms)
             {
-                *described = Some(Described {
+                *described = Some(Arc::new(OwnDescription {
                     info: info.clone(),
                     issued_ms,
                     place,
-                });
+                }));
             }
             hub.publish_info(source, info, receiver, issued_ms, place, false);
         }
@@ -1394,7 +1439,7 @@ async fn write_loop<S: AsyncWrite>(
     // A directory link joins the fan-out first and then reads the offers held, so an offer signed
     // or gossiped in between (each is published once) is in one or the other, never neither.
     let directory = matches!(wants, Wants::Directory);
-    let early = directory.then(|| hub.listen());
+    let early = directory.then(|| hub.listen(source, wants.filter()));
     let infos: Vec<Arc<Record>> = if directory {
         live_offers(hub)
     } else {
@@ -1403,30 +1448,33 @@ async fn write_loop<S: AsyncWrite>(
     for part in parts(&infos) {
         send_data(writer, hub, link, described_class(kind), part).await?;
     }
-    let mut out = early.unwrap_or_else(|| hub.listen());
+    let out = early.unwrap_or_else(|| hub.listen(source, wants.filter()));
     let mut pending = Pending::new(kind);
+    let mut taken = Vec::with_capacity(SEND_BATCH);
     loop {
         tokio::select! {
-            item = out.recv() => {
-                match item {
-                    Ok(item) => pending.keep(item, source, &wants),
+            got = out.recv_many(&mut taken, SEND_BATCH) => {
+                match got {
+                    Ok(()) => {}
                     // The directory a link is sent is held whole (`Directory`), so a directory
                     // link behind the fan-out is sent it again rather than dropped: what it
                     // missed is in what is held. A link of data has no such source; it goes.
-                    Err(RecvError::Lagged(_)) if directory => {
-                        resync_directory(writer, hub, link, kind).await?;
-                    }
-                    Err(RecvError::Lagged(_)) => return fell_behind(kind),
-                    Err(RecvError::Closed) => return Ok(()),
+                    Err(Fell::Resync) => resync_directory(writer, hub, link, kind).await?,
+                    Err(Fell::Behind(_)) => return fell_behind(kind),
+                }
+                for item in taken.drain(..) {
+                    pending.keep(item, source, &wants);
                 }
                 while !pending.full() {
-                    match out.try_recv() {
-                        Ok(item) => pending.keep(item, source, &wants),
-                        Err(TryRecvError::Lagged(_)) if directory => {
-                            resync_directory(writer, hub, link, kind).await?;
+                    match out.try_recv_many(&mut taken, SEND_BATCH) {
+                        Ok(0) => break,
+                        Ok(_) => {
+                            for item in taken.drain(..) {
+                                pending.keep(item, source, &wants);
+                            }
                         }
-                        Err(TryRecvError::Lagged(_)) => return fell_behind(kind),
-                        Err(_) => break,
+                        Err(Fell::Resync) => resync_directory(writer, hub, link, kind).await?,
+                        Err(Fell::Behind(_)) => return fell_behind(kind),
                     }
                 }
                 if let Some(pace) = pace.as_mut() {
@@ -1461,11 +1509,12 @@ async fn write_loop<S: AsyncWrite>(
                     .collect();
                 for part in parts(&infos) {
                     send_data(writer, hub, link, described_class(kind), part).await?;
-                    if !catch_up(writer, hub, link, &mut out, &mut pending, source, &wants).await? {
+                    if !catch_up(writer, hub, link, &out, &mut pending, source, &wants).await? {
                         return fell_behind(kind);
                     }
                 }
                 wants.apply(subscription);
+                out.set(wants.filter());
             }
             Some((last, why)) = farewells.recv() => return Err(Closing::Saying { last: Box::new(last), why }),
             Some(answers) = replies.recv() => {
@@ -1699,21 +1748,26 @@ async fn catch_up<S: AsyncWrite>(
     writer: &mut Writer<S>,
     hub: &Hub,
     link: &Arc<Link>,
-    out: &mut broadcast::Receiver<Item>,
+    out: &Listener,
     pending: &mut Pending,
     source: u64,
     wants: &Wants,
 ) -> Result<bool, Closing> {
+    let mut taken = Vec::with_capacity(SEND_BATCH);
     loop {
         let mut drained = false;
         while !pending.full() {
-            match out.try_recv() {
-                Ok(item) => pending.keep(item, source, wants),
-                Err(TryRecvError::Lagged(_)) => return Ok(false),
-                Err(_) => {
+            match out.try_recv_many(&mut taken, SEND_BATCH) {
+                Ok(0) => {
                     drained = true;
                     break;
                 }
+                Ok(_) => {
+                    for item in taken.drain(..) {
+                        pending.keep(item, source, wants);
+                    }
+                }
+                Err(_) => return Ok(false),
             }
         }
         pending.send(writer, hub, link).await?;
@@ -1843,10 +1897,11 @@ async fn resync_directory<S: AsyncWrite>(
 /// How long a subscriber that fell behind the stream is asked to stay away.
 const FELL_BEHIND_RETRY_SECS: u32 = 30;
 
-/// Ends a link that fell behind the stream: it is told the relay is full. A subscriber is asked to
-/// stay away a short while (`FELL_BEHIND_RETRY_SECS`), so a slow one does not churn; a peer that
-/// forwards (an MLAT relay's raw link) is asked for nothing, since what it carries is a duty and
-/// every second away is raw lost, and its own dial loop (`Redial`) paces it.
+/// Ends a link that fell behind the stream (its queue past `fanout::BEHIND_MS` of inbound, or past
+/// its bytes): it is told so (`Reason::FellBehind`), not that the relay is full. A subscriber is
+/// asked to stay away a short while (`FELL_BEHIND_RETRY_SECS`), so a slow one does not churn; a
+/// peer that forwards (an MLAT relay's raw link) is asked for nothing, since what it carries is a
+/// duty and every second away is raw lost, and its own dial loop (`Redial`) paces it.
 fn fell_behind(kind: Kind) -> Result<(), Closing> {
     let wait = if kind.forwards() {
         0
@@ -1854,7 +1909,7 @@ fn fell_behind(kind: Kind) -> Result<(), Closing> {
         FELL_BEHIND_RETRY_SECS
     };
     Err(Closing::Saying {
-        last: Box::new(goodbye(Reason::Full, wait)),
+        last: Box::new(goodbye(Reason::FellBehind, wait)),
         why: format!("fell behind the stream ({kind:?})"),
     })
 }
@@ -1867,7 +1922,7 @@ pub async fn serve_beast(listener: TcpListener, hub: Arc<Hub>) {
             tokio::time::sleep(Duration::from_millis(100)).await;
             continue;
         };
-        let out = hub.listen();
+        let out = hub.listen(hub.connection_id(), Filter::Beast);
         let stream = hub.egress().socket(stream, Some(peer.ip()));
         // It takes data and gives none: a plain subscriber, to the cap.
         stream.link().set_kind(Kind::Taker);
@@ -1883,26 +1938,27 @@ pub async fn serve_beast(listener: TcpListener, hub: Arc<Hub>) {
 /// cap as a plain subscriber's (a loopback client, the usual one, is never held to it).
 async fn beast_client<W: AsyncWrite + Unpin>(
     mut stream: Socket<W>,
-    mut out: broadcast::Receiver<Item>,
+    out: Listener,
     deadline: Duration,
 ) -> Result<(), String> {
     let link = stream.link();
     let egress = Arc::clone(stream.egress());
     let mut bytes = Vec::new();
+    let mut items: Vec<Item> = Vec::new();
     loop {
-        let item = match out.recv().await {
-            Ok(item) => item,
-            Err(RecvError::Lagged(missed)) => return Err(format!("fell behind by {missed}")),
-            Err(RecvError::Closed) => return Ok(()),
-        };
-        // A batch's one decode (`hub::Item::decoded`); a batch of a format this build cannot read
-        // has none and carries nothing BEAST can.
-        let Some(decoded) = &item.decoded else {
-            continue;
-        };
+        items.clear();
+        if let Err(fell) = out.recv_many(&mut items, SEND_BATCH).await {
+            return Err(format!("fell behind ({fell:?})"));
+        }
         bytes.clear();
-        for frame in decoded.views().filter_map(|view| view.to_beast()) {
-            frame.encode_beast(&mut bytes);
+        // Each batch's one decode (`hub::Item::decoded`); the router offers only batches with one.
+        for decoded in items.iter().filter_map(|item| item.decoded.as_ref()) {
+            for frame in decoded.views().filter_map(|view| view.to_beast()) {
+                frame.encode_beast(&mut bytes);
+            }
+        }
+        if bytes.is_empty() {
+            continue;
         }
         if egress.grant(&link, Class::Taker, bytes.len()).await == Err(Shed) {
             return Err("shed: the upload cap cannot carry it".to_owned());
@@ -1919,6 +1975,7 @@ mod tests {
     use super::*;
     use tally_wire::beast::FrameKind;
     use tally_wire::{Batch, BatchContent, Frame, Observation, RelayAddress, Streams};
+    use tally_wire::{Location, ReceiverInfo};
     use tokio::time::timeout;
 
     fn text(error: impl std::fmt::Display) -> String {
@@ -2095,7 +2152,10 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_subscriber_that_heartbeats_but_never_reads_is_dropped_at_the_write_deadline()
     -> Result<(), String> {
-        let hub = Arc::new(Hub::new(1).max_upload(roomy()));
+        // The ingest clock stopped: signing the batches below takes real seconds in a debug
+        // build, and a subscriber is let go two seconds of inbound behind, which is not what
+        // this measures.
+        let hub = Arc::new(Hub::clocked(1, Arc::new(|| 0)).max_upload(roomy()));
         let relay = Identity::generate().map_err(text)?;
         let relay_key = relay.public();
         let (near, far) = tokio::io::duplex(64 * 1024);
@@ -2159,10 +2219,11 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_beast_out_client_that_never_reads_is_dropped_at_its_deadline() -> Result<(), String>
     {
-        let hub = Hub::new(1).max_upload(roomy());
+        let hub = Arc::new(Hub::new(1).max_upload(roomy()));
         let (unread, far) = tokio::io::duplex(1024);
         let far = hub.egress().socket(far, None);
-        let client = tokio::spawn(beast_client(far, hub.listen(), Duration::from_millis(200)));
+        let out = hub.listen(hub.connection_id(), Filter::Beast);
+        let client = tokio::spawn(beast_client(far, out, Duration::from_millis(200)));
         let receiver = Identity::generate().map_err(text)?;
         hub.publish_batch(999, batch(&receiver, 0, 200)?, receiver.public());
         let ended = timeout(Duration::from_secs(5), client)
@@ -2227,6 +2288,7 @@ mod tests {
                 cell: None,
                 points: None,
                 decoded: None,
+                stamp_ms: 0,
             })
         );
         Ok(())
@@ -2261,10 +2323,10 @@ mod tests {
         use tally_wire::Clock;
         use tally_wire::batch::ReceiverInfoContent;
         const DESCRIBED: usize = 4_000;
-        // A ring far smaller than the directory: one send of the whole of it would leave the
-        // subscriber behind.
+        // A queue far smaller than the directory: one send of the whole of it would leave the
+        // subscriber behind. About `RING` of the small batches below.
         const RING: usize = 16;
-        let hub = Arc::new(Hub::with_capacity(1, RING).max_upload(roomy()));
+        let hub = Arc::new(Hub::new(1).queue_bytes(RING * 512).max_upload(roomy()));
         let author = Identity::generate().map_err(text)?;
         let info = ReceiverInfo::sign(
             &author,
@@ -3007,7 +3069,7 @@ mod tests {
                 .advertising(vec![hint])
                 .max_upload(cap),
         );
-        let mut out = hub.listen();
+        let out = hub.listen(u64::MAX, Filter::Everything);
 
         // A billed relay link: what feeders send is forwarded to it.
         let mut relay = dial_pipe(&hub)?;
@@ -3033,11 +3095,12 @@ mod tests {
             .send(&[Record::Batch(batch(&first_identity, 0, 10)?)])
             .await
             .map_err(text)?;
-        let item = timeout(Duration::from_secs(60), out.recv())
+        let mut items = Vec::new();
+        timeout(Duration::from_secs(60), out.recv_many(&mut items, 1))
             .await
             .map_err(|_| "the feeder's batch was not taken in".to_owned())?
-            .map_err(text)?;
-        assert!(matches!(&*item.record, Record::Batch(_)));
+            .map_err(|fell| format!("{fell:?}"))?;
+        assert!(matches!(&*items[0].record, Record::Batch(_)));
 
         // The second does not fit: pointed at the relays this one knows, and nothing it sent with
         // its hello is taken in.
@@ -3061,7 +3124,7 @@ mod tests {
         ));
         let why = ended(&mut second.serving).await?;
         assert!(why.contains("upload cap"), "{why}");
-        assert!(matches!(out.try_recv(), Err(TryRecvError::Empty)));
+        assert!(out.try_recv().is_none());
         assert_eq!(hub.egress().report().refused_feeders, 1);
         // The first is still served.
         assert!(!first.serving.is_finished());
