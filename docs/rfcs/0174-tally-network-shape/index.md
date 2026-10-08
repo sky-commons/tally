@@ -134,7 +134,9 @@ can vouch for several clients.
   one outage or one dishonest relay cannot silence it. Both are chosen by the rule below; when one
   fails, refuses or redirects, the next relay in the same ranking takes its place.
 - **Near is a band, measured, never claimed.** The feeder measures round-trip time to candidates
-  (a small echo record, §2.10, median of several probes, repeated every few minutes). A relay's
+  (a small echo record, §2.10, median of several probes, repeated every few minutes, and at the
+  reconnect backoff's pace while it holds no relay at all, so a feeder that boots beside its relay
+  publishes as soon as the relay listens). A relay's
   advertised location only orders which relays to probe first, never where to send: a location is a
   claim anyone can fake, and a round-trip time cannot be faked downward. A few random known relays
   are probed every round as well, so a lying location cannot hide a close relay. The candidates are

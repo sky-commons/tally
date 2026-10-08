@@ -1,8 +1,8 @@
 //! Which relays a feeder publishes to, and each session with one (RFC-0174 §2.2, RFC-0171 §3.5,
 //! §3.7).
 //!
-//! The rules are fixed here and no relay can change them. Every round (`probe::ROUND_EVERY`) the
-//! feeder measures candidate relays by round-trip time (`probe`), and chooses two from the band by
+//! The rules are fixed here and no relay can change them. Every round (`probe::ROUND_EVERY`; while
+//! it holds no relay at all, at the reconnect backoff's pace) the feeder measures candidate relays by round-trip time (`probe`), and chooses two from the band by
 //! the shared per-area pick, on two networks, with hysteresis (`selection`). It publishes every
 //! batch to both. The owner's `--relay` and the seeds are candidates, measured and ranked like any
 //! other: nothing is pinned. A relay that fails, refuses or redirects is replaced by the next in
@@ -847,7 +847,13 @@ pub async fn run(publishing: Publishing) {
         events,
         tasks: JoinSet::new(),
     };
-    let mut round = tokio::time::interval(ROUND_EVERY);
+    // Rounds come every `ROUND_EVERY`, except while the feeder holds no relay at all: then the
+    // next round is the reconnect backoff's (one second, doubling to the round), so a feeder
+    // that started before its relay was listening (a host booting both at once) publishes once
+    // the relay is up, not a whole round later.
+    let mut next_round = tokio::time::Instant::now();
+    let mut round_began = next_round;
+    let mut unplaced = Backoff::new();
     let mut probing = false;
     let every = publisher.checking.every;
     let mut check = tokio::time::interval_at(tokio::time::Instant::now() + jittered(every), every);
@@ -857,8 +863,9 @@ pub async fn run(publishing: Publishing) {
     loop {
         let due = stage.map(|(_, due)| due);
         tokio::select! {
-            _ = round.tick(), if !probing => {
+            _ = tokio::time::sleep_until(next_round), if !probing => {
                 probing = true;
+                round_began = tokio::time::Instant::now();
                 publisher.probe_round();
             }
             // One check at a time: the next begins once the last is judged or dropped.
@@ -883,10 +890,17 @@ pub async fn run(publishing: Publishing) {
                 };
             }
             Some(event) = inbox.recv() => {
-                if matches!(event, Event::Probed(_)) {
-                    probing = false;
-                }
+                let probed = matches!(event, Event::Probed(_));
                 publisher.handle(event);
+                if probed {
+                    probing = false;
+                    next_round = if publisher.sessions.is_empty() {
+                        tokio::time::Instant::now() + unplaced.wait().min(ROUND_EVERY)
+                    } else {
+                        unplaced.reset();
+                        round_began + ROUND_EVERY
+                    };
+                }
             }
             Some(_) = publisher.tasks.join_next(), if !publisher.tasks.is_empty() => {}
         }
@@ -2345,6 +2359,68 @@ mod tests {
         // The redirecting relay is left for as long as it asked, and the feeder says so.
         assert!(directory.avoided().contains(&fakes[1].key));
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_feeder_that_started_before_its_relay_publishes_once_the_relay_is_up()
+    -> Result<(), String> {
+        use crate::probe::tests::{Fake, Mode, echo_relay};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        // A host booting its relay and its feeder at once: the feeder's first probes find nothing
+        // listening. It must not then wait a whole round (`ROUND_EVERY`, five minutes) to look
+        // again; with no relay held it looks again at the reconnect backoff's pace.
+        static NOT_YET: AtomicUsize = AtomicUsize::new(2);
+        let error = |error: tally_wire::WireError| error.to_string();
+        let (taken, mut arrivals) = mpsc::unbounded_channel();
+        let fake = Fake {
+            batches: Some(taken),
+            ..Fake::new(Identity::generate().map_err(error)?, 1, 1, Mode::Serve)
+        };
+        let relay = echo_relay(fake).await?;
+        let feeder = Identity::generate().map_err(error)?;
+        let directory = Directory::new(
+            scratch(),
+            vec![relay.clone()],
+            Vec::new(),
+            feeder.clone(),
+            None,
+            Clock::Dump1090,
+        )?;
+        let (batches, _) = broadcast::channel(64);
+        let publisher = tokio::spawn(run(Publishing {
+            directory,
+            identity: feeder.clone(),
+            batches: batches.clone(),
+            ceiling: 64_000,
+            checker: DeliveryChecker::default(),
+            checking: Checking::default(),
+            prober: |relay, me| {
+                Box::pin(async move {
+                    let unanswered = NOT_YET
+                        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
+                        .is_ok();
+                    if unanswered {
+                        return Err("connection refused".to_owned());
+                    }
+                    probe::probe(&relay, &me).await
+                })
+            },
+        }));
+        let sending = tokio::spawn(async move {
+            for sequence in 0.. {
+                if let Ok(batch) = batch(&feeder, sequence) {
+                    let _ = batches.send(Arc::new(Record::Batch(batch)));
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        });
+        let arrived = tokio::time::timeout(Duration::from_secs(30), arrivals.recv()).await;
+        sending.abort();
+        publisher.abort();
+        match arrived {
+            Ok(Some((key, _))) if key == relay.key => Ok(()),
+            _ => Err("the relay took no batch within 30 s of coming up".to_owned()),
+        }
     }
 
     #[test]
