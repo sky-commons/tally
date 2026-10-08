@@ -23,8 +23,8 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
-use tally_wire::PublicKey;
 use tally_wire::batch::{BatchContent, format};
+use tally_wire::{Decoded, ObsView, PublicKey};
 
 use crate::modes;
 use crate::obs::{ObservationId, Reception, message_hash};
@@ -555,7 +555,17 @@ impl Held {
             receiver,
             content.counter_epoch,
             content.wall_ms,
-            &content.observations,
+            content.observations.iter().map(ObsView::from),
+        )
+    }
+
+    /// As `add`, a batch decoded once (`tally_wire::Decoded`): the messages are read in place.
+    pub fn add_decoded(&mut self, decoded: &Decoded) -> Added {
+        self.add_observations(
+            decoded.receiver(),
+            decoded.counter_epoch(),
+            decoded.wall_ms(),
+            decoded.views(),
         )
     }
 
@@ -566,16 +576,16 @@ impl Held {
             reception.receiver,
             reception.epoch,
             reception.wall_ms,
-            std::slice::from_ref(&reception.observation),
+            std::iter::once(ObsView::from(&reception.observation)),
         )
     }
 
-    fn add_observations(
+    fn add_observations<'a>(
         &mut self,
         receiver: PublicKey,
         counter_epoch: u32,
         wall_ms: u64,
-        observations: &[tally_wire::Observation],
+        observations: impl ExactSizeIterator<Item = ObsView<'a>>,
     ) -> Added {
         let mut added = Added::default();
         let bin = bin_of(wall_ms);
@@ -591,7 +601,7 @@ impl Held {
                 observation.format,
                 format::MODE_S_SHORT | format::MODE_S_LONG
             ) || observation.data.len() > LONG
-                || !wanted(&observation.data)
+                || !wanted(observation.data)
             {
                 added.filtered += 1;
                 continue;
@@ -602,7 +612,7 @@ impl Held {
                 } else {
                     48
                 }
-                + if open.messages.contains_key(&observation.data) {
+                + if open.messages.contains_key(observation.data) {
                     0
                 } else {
                     size_of::<Message>() + 2 * size_of::<usize>()
@@ -621,12 +631,12 @@ impl Held {
                     index
                 }
             };
-            let message = match open.messages.get(&observation.data) {
+            let message = match open.messages.get(observation.data) {
                 Some(index) => *index,
                 None => {
                     let index = open.data.len() as u32;
-                    open.data.push(observation.data.clone());
-                    open.messages.insert(observation.data.clone(), index);
+                    open.data.push(observation.data.to_vec());
+                    open.messages.insert(observation.data.to_vec(), index);
                     bytes += size_of::<Message>() + 2 * size_of::<usize>();
                     index
                 }

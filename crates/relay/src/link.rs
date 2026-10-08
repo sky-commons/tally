@@ -1895,18 +1895,13 @@ async fn beast_client<W: AsyncWrite + Unpin>(
             Err(RecvError::Lagged(missed)) => return Err(format!("fell behind by {missed}")),
             Err(RecvError::Closed) => return Ok(()),
         };
-        let Record::Batch(batch) = &*item.record else {
-            continue;
-        };
-        let Ok(content) = batch.content() else {
+        // A batch's one decode (`hub::Item::decoded`); a batch of a format this build cannot read
+        // has none and carries nothing BEAST can.
+        let Some(decoded) = &item.decoded else {
             continue;
         };
         bytes.clear();
-        for frame in content
-            .observations
-            .iter()
-            .filter_map(|observation| observation.to_beast())
-        {
+        for frame in decoded.views().filter_map(|view| view.to_beast()) {
             frame.encode_beast(&mut bytes);
         }
         if egress.grant(&link, Class::Taker, bytes.len()).await == Err(Shed) {
@@ -2231,6 +2226,7 @@ mod tests {
                 )),
                 cell: None,
                 points: None,
+                decoded: None,
             })
         );
         Ok(())

@@ -19,7 +19,7 @@ use tally_mlat_solver::scope::{AFTER, BEFORE, STRIDE, bin_of};
 use tally_mlat_solver::standing::{Book, ReceiverStanding, Solved, heard_in};
 use tally_wire::batch::Hash;
 use tally_wire::clock_model::Assembler;
-use tally_wire::{Batch, ClockModel, Positions, PublicKey, Record, Solution};
+use tally_wire::{ClockModel, Decoded, Positions, PublicKey, Record, Solution};
 
 use crate::bounded::Bounded;
 
@@ -85,13 +85,11 @@ impl Standing {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    /// A receiver's batch the relay forwarded (verified): when its receptions were heard.
-    pub fn batch(&self, batch: &Batch, now_ms: u64) {
-        let (Ok(receiver), Ok(content)) = (batch.receiver(), batch.content()) else {
-            return;
-        };
+    /// A receiver's batch the relay forwarded (verified, decoded once): when its receptions were
+    /// heard.
+    pub fn batch(&self, batch: &Decoded, now_ms: u64) {
         let mut inner = self.inner();
-        inner.held.add(receiver, &content);
+        inner.held.add_decoded(batch);
         inner
             .held
             .forget_before(bin_of(now_ms) - BEFORE - AFTER - STRIDE - RAW_SPARE_BINS);

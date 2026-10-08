@@ -11,9 +11,9 @@ use tally_wire::batch::{Hash, format};
 use tally_wire::positions::{AddressedCitation, EnuCovariance, Solution, TransmitTime};
 use tally_wire::rendezvous::area_of;
 use tally_wire::{
-    Batch, BatchContent, Clock, ClockModel, ClockModelContent, Identity, Location, Observation,
-    ObservationSet, Positions, PublicKey, ReceiverInfo, Reception, Record, Region, RegionalBatch,
-    RegionalBatchContent, SolutionsContent, Streams, WireError, WorldPositions,
+    Batch, BatchContent, Clock, ClockModel, ClockModelContent, Decoded, Identity, Location,
+    Observation, ObservationSet, Positions, PublicKey, ReceiverInfo, Reception, Record, Region,
+    RegionalBatch, RegionalBatchContent, SolutionsContent, Streams, WireError, WorldPositions,
 };
 
 use super::{FORWARD_HELD, Products, WAITING_MS, WORLD_SETTLE_MS, check_fix, regional_fixes};
@@ -551,8 +551,8 @@ fn feeder_batch(
     identity: &Identity,
     sequence: u64,
     observations: Vec<Observation>,
-) -> Result<Batch> {
-    Batch::sign(
+) -> Result<Arc<Decoded>> {
+    let batch = Batch::sign(
         identity,
         &BatchContent {
             boot_id: 1,
@@ -564,7 +564,8 @@ fn feeder_batch(
             observations,
         },
     )
-    .map_err(err)
+    .map_err(err)?;
+    Decoded::from_verified(batch, BASE_MS, 0).map_err(|undecodable| err(undecodable.error))
 }
 
 #[test]
@@ -600,11 +601,8 @@ fn the_regional_product_holds_one_copy_of_each_message_per_area_signed_as_origin
             })
             .collect();
         observations.push(long(all_call(0x00f0_0000 + n as u32), 1));
-        products.batch(
-            &feeder_batch(feeder, 0, observations)?,
-            &feeder.public(),
-            BASE_MS + 100,
-        );
+        let batch = feeder_batch(feeder, 0, observations)?;
+        products.batch(&batch, BASE_MS + 100);
     }
     let out = products.tick(Some(&relay), BASE_MS + 1_000);
     let batches: Vec<RegionalBatchContent> = out
@@ -645,10 +643,10 @@ fn the_regional_product_holds_one_copy_of_each_message_per_area_signed_as_origin
     }
     // Heard again within the window: nothing new to sign. After it: once more.
     let again = feeder_batch(&feeders[0], 1, shared.clone())?;
-    products.batch(&again, &feeders[0].public(), BASE_MS + 1_500);
+    products.batch(&again, BASE_MS + 1_500);
     assert!(products.tick(Some(&relay), BASE_MS + 2_000).is_empty());
     let later = feeder_batch(&feeders[0], 2, shared.clone())?;
-    products.batch(&later, &feeders[0].public(), BASE_MS + 4_000);
+    products.batch(&later, BASE_MS + 4_000);
     let out = products.tick(Some(&relay), BASE_MS + 4_100);
     assert_eq!(out.len(), 1);
     // The stream's sequence runs on from the first two.
@@ -730,6 +728,7 @@ fn the_products_are_routed_by_their_stream_bits_and_the_regional_by_its_cell() -
         record: Arc::new(Record::WorldPositions(world)),
         cell: None,
         points: None,
+        decoded: None,
     };
     let wants = |streams: Streams, regions: Vec<Region>, item: &Item| {
         Subscription { streams, regions }.wants(item)
@@ -850,7 +849,7 @@ fn what_a_busy_area_and_the_world_cost_a_second() -> Result<()> {
         let unique = heard.len();
         for (n, feeder) in feeders.iter().enumerate() {
             let batch = feeder_batch(feeder, second, heard.clone())?;
-            products.batch(&batch, &feeder.public(), at * 1_000 + n as u64);
+            products.batch(&batch, at * 1_000 + n as u64);
         }
         let sealed: Vec<Record> = products
             .tick(Some(&relay), at * 1_000 + 999)
@@ -1060,8 +1059,7 @@ fn every_drop_is_counted_by_why() -> Result<()> {
         vec![relay.public()],
     )?);
     products.batch(
-        &feeder_batch(&feeder, 0, adsb_second(&[0x00a0_0001], 0, false))?,
-        &feeder.public(),
+        &*feeder_batch(&feeder, 0, adsb_second(&[0x00a0_0001], 0, false))?,
         BASE_MS + 100,
     );
     products.tick(None, BASE_MS + 1_000);

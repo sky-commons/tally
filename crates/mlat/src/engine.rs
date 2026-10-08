@@ -27,7 +27,9 @@ use tally_mlat_solver::held::Held;
 use tally_mlat_solver::obs::MAX_SITE_PRECISION_M;
 use tally_mlat_solver::scope::{BEFORE, STRIDE, Window, bin_of};
 use tally_mlat_solver::{Site, Timebase};
-use tally_wire::{Batch, Clock, Identity, Location, PublicKey, ReceiverInfo, Record, Region};
+use tally_wire::{
+    Batch, Clock, Decoded, Identity, Location, PublicKey, ReceiverInfo, Record, Region,
+};
 
 use crate::provisional::{self, Provisional};
 use crate::window::{Job, Outcome, Report};
@@ -330,28 +332,58 @@ impl Engine {
 
     fn receive(&mut self, batch: &Batch, now_ms: u64) -> Result<Ingested, String> {
         let key = batch.receiver().map_err(|error| error.to_string())?;
-        let Some(known) = self.receivers.get_mut(&key) else {
-            return Ok(Ingested::Ignored);
-        };
-        if known.site.is_none() {
+        if !self.takes_part(&key) {
             return Ok(Ingested::Ignored);
         }
         batch
             .verify()
             .map_err(|error| format!("batch of {key}: {error}"))?;
-        if !known.admit(batch.boot_id(), batch.sequence()) {
-            return Ok(Ingested::Replayed);
+        match Decoded::from_verified(batch.clone(), now_ms, 0) {
+            Ok(decoded) => Ok(self.ingest_verified(&decoded, now_ms)),
+            // A format this build cannot read uses its sequence and holds nothing.
+            Err(_) => {
+                let admitted = self
+                    .receivers
+                    .get_mut(&key)
+                    .is_some_and(|known| known.admit(batch.boot_id(), batch.sequence()));
+                Ok(if admitted {
+                    Ingested::Ignored
+                } else {
+                    Ingested::Replayed
+                })
+            }
         }
-        let Ok(content) = batch.content() else {
-            return Ok(Ingested::Ignored);
+    }
+
+    /// Whether `receiver` is described and takes part.
+    fn takes_part(&self, receiver: &PublicKey) -> bool {
+        self.receivers
+            .get(receiver)
+            .is_some_and(|known| known.site.is_some())
+    }
+
+    /// Takes a batch whose signature the caller already verified and which it decoded once
+    /// (`tally_wire::Decoded`), at `now_ms` by the engine's clock: a relay hosting this engine
+    /// hands it what its own ingest checked, so nothing is verified or decoded twice. As `ingest`
+    /// otherwise: used once per (boot, sequence), held only from a receiver that takes part.
+    pub fn ingest_verified(&mut self, batch: &Decoded, now_ms: u64) -> Ingested {
+        let key = batch.receiver();
+        let Some(known) = self.receivers.get_mut(&key) else {
+            return Ingested::Ignored;
         };
-        self.provisional.hear(key, &content, now_ms);
-        let added = self.held.add(key, &content);
+        if known.site.is_none() {
+            return Ingested::Ignored;
+        }
+        if !known.admit(batch.boot_id(), batch.sequence()) {
+            return Ingested::Replayed;
+        }
+        self.provisional.hear(batch, now_ms);
+        let added = self.held.add_decoded(batch);
         self.dropped.observations += added.dropped as u64;
-        Ok(Ingested::Batch {
+        Ingested::Batch {
             new: added.new,
             filtered: added.filtered,
-        })
+        }
     }
 
     /// The latest bin complete by `now_ms`: it ended, and the settling time after it passed.

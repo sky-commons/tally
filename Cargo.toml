@@ -19,6 +19,9 @@ publish = false
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio"] }
 base64 = "0.22"
 blake2 = "0.10"
+# A batch's signed bytes and its inflated observations are shared, not copied, by every stage that
+# reads them (RFC-0177 §1): already in the tree under tokio.
+bytes = "1"
 ed25519-dalek = "2"
 # The version snow already uses, so the tree carries one getrandom.
 getrandom = "0.2"

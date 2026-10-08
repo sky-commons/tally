@@ -32,7 +32,7 @@ use std::sync::{Arc, Mutex};
 
 use tally_mlat::engine::{Engine, Ingested, Settings};
 use tally_mlat::{area, provisional, window};
-use tally_wire::{Identity, PublicKey, ReceiverInfo, Record, Region};
+use tally_wire::{Decoded, Identity, PublicKey, ReceiverInfo, Record, Region};
 
 use crate::config::Config;
 
@@ -43,8 +43,14 @@ pub trait MlatHost: Send + Sync {
     /// an engine that starts with these areas: the relay keeps the descriptions, not the host. The
     /// relay calls this when the areas change.
     fn set_areas(&self, areas: Vec<Region>, descriptions: Vec<ReceiverInfo>);
-    /// A receiver's batch or description the relay forwarded.
+    /// A receiver's description the relay forwarded, or a batch it has not decoded.
     fn offer(&self, record: &Record, now_ms: u64);
+    /// A receiver's batch the relay forwarded, verified and decoded once by its ingest: the engine
+    /// neither verifies nor decodes it again. A host that cannot take a decode is offered the
+    /// batch itself.
+    fn offer_batch(&self, batch: &Arc<Decoded>, now_ms: u64) {
+        self.offer(&Record::Batch(batch.batch().clone()), now_ms);
+    }
     /// What it signed since the last call (clock models and their parts, positions, provisional
     /// positions), in the order to publish.
     fn take_published(&self, now_ms: u64) -> Vec<Record>;
@@ -224,6 +230,8 @@ pub fn host_for(config: &Config, identity: Identity, boot_id: u64) -> Option<Hos
 /// What the engine's thread is handed by the relay.
 enum Command {
     Offer(Record, u64),
+    /// A batch verified and decoded by the relay's ingest.
+    Batch(Arc<Decoded>, u64),
     Tick(u64),
 }
 
@@ -381,10 +389,23 @@ impl MlatHost for HostedMlat {
     }
 
     fn offer(&self, record: &Record, now_ms: u64) {
-        if !matches!(record, Record::Batch(_) | Record::ReceiverInfo(_)) {
-            return;
+        let command = match record {
+            // The relay verified it before offering it: decoded once here, it takes the same path
+            // as the hub's own decode. One this build cannot read goes to the engine whole.
+            Record::Batch(batch) => match Decoded::from_verified(batch.clone(), now_ms, 0) {
+                Ok(decoded) => Command::Batch(decoded, now_ms),
+                Err(undecodable) => Command::Offer(Record::Batch(undecodable.batch), now_ms),
+            },
+            Record::ReceiverInfo(_) => Command::Offer(record.clone(), now_ms),
+            _ => return,
+        };
+        if !self.send(command) {
+            self.shared.refused.fetch_add(1, Ordering::Relaxed);
         }
-        if !self.send(Command::Offer(record.clone(), now_ms)) {
+    }
+
+    fn offer_batch(&self, batch: &Arc<Decoded>, now_ms: u64) {
+        if !self.send(Command::Batch(Arc::clone(batch), now_ms)) {
             self.shared.refused.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -437,7 +458,7 @@ struct Host {
     /// taken when the description comes. A batch can reach a relay before its receiver's
     /// description (a repair, a rebuild from parity, a link that died between them), and the hub
     /// forwards each batch once, so a batch the engine turned away would be lost to it.
-    orphans: BTreeMap<PublicKey, VecDeque<(Record, u64)>>,
+    orphans: BTreeMap<PublicKey, VecDeque<(Arc<Decoded>, u64)>>,
 }
 
 impl Host {
@@ -459,13 +480,19 @@ impl Host {
                 return;
             }
             let now_ms = match &command {
-                Command::Offer(_, now_ms) | Command::Tick(now_ms) => *now_ms,
+                Command::Offer(_, now_ms) | Command::Batch(_, now_ms) | Command::Tick(now_ms) => {
+                    *now_ms
+                }
             };
             // New areas take effect before whatever comes after them, offers included.
             self.rescope(now_ms);
             let started = match command {
                 Command::Offer(record, now_ms) => {
                     self.offered(&record, now_ms);
+                    0
+                }
+                Command::Batch(batch, now_ms) => {
+                    self.offered_batch(batch, now_ms);
                     0
                 }
                 Command::Tick(now_ms) => self.tick(now_ms),
@@ -562,19 +589,12 @@ impl Host {
                     self.shared.ingested.fetch_add(1, Ordering::SeqCst);
                 }
                 (Ingested::Replayed, _) => self.count(|counts| counts.replayed += 1),
-                (Ingested::Ignored, Record::Batch(batch)) => {
-                    if let Ok(key) = batch.receiver()
-                        && engine.described(&key).is_none()
-                    {
-                        self.hold_orphan(key, record.clone(), now_ms);
-                    }
-                }
                 (Ingested::Described, Record::ReceiverInfo(info)) => {
                     if let Ok(key) = info.receiver()
                         && let Some(waiting) = self.orphans.remove(&key)
                     {
                         for (batch, _) in waiting {
-                            if let Ok(Ingested::Batch { .. }) = engine.ingest(&batch, now_ms) {
+                            if let Ingested::Batch { .. } = engine.ingest_verified(&batch, now_ms) {
                                 self.shared.ingested.fetch_add(1, Ordering::SeqCst);
                             }
                         }
@@ -585,9 +605,30 @@ impl Host {
         }
     }
 
+    /// A batch the relay verified and decoded: taken by the engine without verifying or decoding it
+    /// again, or held when its receiver is not described yet.
+    fn offered_batch(&mut self, batch: Arc<Decoded>, now_ms: u64) {
+        let Some(engine) = self.engine.as_mut() else {
+            return;
+        };
+        match engine.ingest_verified(&batch, now_ms) {
+            Ingested::Batch { .. } => {
+                self.shared.ingested.fetch_add(1, Ordering::SeqCst);
+            }
+            Ingested::Replayed => self.count(|counts| counts.replayed += 1),
+            Ingested::Ignored => {
+                let key = batch.receiver();
+                if engine.described(&key).is_none() {
+                    self.hold_orphan(key, batch, now_ms);
+                }
+            }
+            Ingested::Described => {}
+        }
+    }
+
     /// Holds a batch of an undescribed receiver, within `ORPHANS_PER_RECEIVER` a receiver and
     /// `ORPHAN_RECEIVERS` receivers (the oldest out first), for `ORPHAN_MS`.
-    fn hold_orphan(&mut self, key: PublicKey, batch: Record, now_ms: u64) {
+    fn hold_orphan(&mut self, key: PublicKey, batch: Arc<Decoded>, now_ms: u64) {
         let mut expired = 0;
         self.orphans.retain(|_, waiting| {
             let before = waiting.len();

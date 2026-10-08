@@ -404,6 +404,7 @@ mod tests {
             record: Arc::new(provisional()?),
             cell: None,
             points: None,
+            decoded: None,
         };
         let asked = |streams: Streams| {
             Subscription {

@@ -21,6 +21,7 @@ rust_library(
     deps = [
         "@tally_crates//:base64",
         "@tally_crates//:blake2",
+        "@tally_crates//:bytes",
         "@tally_crates//:ed25519-dalek",
         "@tally_crates//:getrandom",
         "@tally_crates//:h3o",

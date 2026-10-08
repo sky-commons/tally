@@ -665,6 +665,11 @@ impl<'a> Body<'a> {
         Self { bytes, at: 0 }
     }
 
+    /// How many bytes have been read.
+    pub(crate) fn position(&self) -> usize {
+        self.at
+    }
+
     pub(crate) fn bytes(&mut self, len: usize) -> Result<&'a [u8], WireError> {
         let slice = take(self.bytes, self.at, len)?;
         self.at += len;
