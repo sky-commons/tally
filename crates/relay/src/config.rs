@@ -13,6 +13,16 @@ use crate::ingest::Threads;
 const USAGE: &str = "\
 usage: tally-relay --key FILE [--key FILE]... --max-upload RATE [options]
        tally-relay keygen          print a new key file to stdout and its public key to stderr
+       tally-relay check [--memory-limit BYTES] --key FILE ... [options]
+                                   refuse what a start would refuse, without starting: the same
+                                   arguments, read and checked as a start reads and checks them
+                                   (but for the key files, which it does not read, and the
+                                   sockets, which it does not open), then print the memory plan
+                                   (memory, base, per-feeder, feeders, planned, limit) and exit 0.
+                                   --memory-limit is the memory the relay will run in (its
+                                   cgroup's limit: a unit's MemoryMax, a container's
+                                   limits.memory), as it would find it there (default: this
+                                   host's, as a start here would find it)
 
   --key FILE             this relay's key; repeat during a rotation, newest first
   --max-upload RATE      required: the most this relay sends a second to billed peers, in
@@ -74,7 +84,8 @@ usage: tally-relay --key FILE [--key FILE]... --max-upload RATE [options]
                          MLAT raw, deduplication, subscriber queues, delivery tags, connection
                          buffers) is reserved when it is admitted, and a feeder beyond what this
                          holds is turned away at its Hello: no spare slot (default: the relay's
-                         cgroup limit, else the host's memory)
+                         cgroup limit, else the host's memory). Never above that limit: the
+                         kernel would kill the relay before its budget turned a feeder away
   --ingest-threads N     threads that verify, admit and decode feeders' batches (default: a
                          quarter of the cores)
   --message-threads N    threads that deduplicate receptions (default: an eighth of the cores)
@@ -123,6 +134,10 @@ pub struct Config {
     pub max_member_bytes_per_sec: u64,
     /// Bytes the relay may use: the admission budget (`budget`).
     pub memory: usize,
+    /// The memory the relay runs in: its cgroup's limit, else the host's
+    /// (`budget::memory_available`), or what `check` is told it will be (`--memory-limit`).
+    /// `memory` is never above it.
+    pub memory_limit: usize,
     pub threads: Threads,
     pub max_upload: Cap,
     /// The areas taken (RFC-0174 §2.1).
@@ -147,9 +162,55 @@ at most about 2.01 TB in 31 days, which leaves about 1 TB of a $12 Lightsail pla
 feeders send in, which counts toward it too (AWS bills $0.09 a GB of the excess out). tally/README.md,
 \"What a relay costs\", prices common hosts.";
 
+/// What the command line asks for.
+#[derive(Debug)]
+pub enum Command {
+    /// Start a relay.
+    Run(Config),
+    /// Refuse what a start would refuse and print the plan, without starting (`check`).
+    Check(Config),
+    /// Nothing more: the command was fully handled (usage, keygen).
+    Done,
+}
+
+impl Command {
+    pub fn from_args(args: impl Iterator<Item = String>) -> Result<Self, String> {
+        let mut args = args.peekable();
+        if args.peek().map(String::as_str) != Some("check") {
+            return Ok(Config::from_args(args)?.map_or(Self::Done, Self::Run));
+        }
+        args.next();
+        let memory_limit = if args.peek().map(String::as_str) == Some("--memory-limit") {
+            args.next();
+            let text = args.next().ok_or("--memory-limit needs a value")?;
+            parse_bytes(&text).map_err(|error| format!("--memory-limit {error}"))?
+        } else {
+            crate::budget::memory_available()
+        };
+        Ok(Config::parse(args, memory_limit)?.map_or(Self::Done, Self::Check))
+    }
+}
+
 impl Config {
-    /// `None` when the command was fully handled (usage, keygen).
+    /// `None` when the command was fully handled (usage, keygen). The relay's memory limit is
+    /// what this host gives it (`budget::memory_available`).
     pub fn from_args(args: impl Iterator<Item = String>) -> Result<Option<Self>, String> {
+        let mut args = args.peekable();
+        if args.peek().map(String::as_str) == Some("keygen") {
+            let identity = Identity::generate().map_err(|error| error.to_string())?;
+            println!("{}", identity.to_base64());
+            eprintln!("public key: {}", identity.public());
+            return Ok(None);
+        }
+        Self::parse(args, crate::budget::memory_available())
+    }
+
+    /// The relay's flags, for a relay that runs in `memory_limit` bytes: every refusal a start
+    /// makes of its arguments. `None` when the command was fully handled (usage).
+    pub fn parse(
+        args: impl Iterator<Item = String>,
+        memory_limit: usize,
+    ) -> Result<Option<Self>, String> {
         let mut config = Self {
             key_files: Vec::new(),
             listen: "0.0.0.0:10900".to_owned(),
@@ -164,7 +225,8 @@ impl Config {
             max_connections_per_address: DEFAULT_MAX_CONNECTIONS_PER_ADDRESS,
             max_feeder_bytes_per_sec: DEFAULT_MAX_FEEDER_BYTES_PER_SEC,
             max_member_bytes_per_sec: DEFAULT_MAX_MEMBER_BYTES_PER_SEC,
-            memory: crate::budget::memory_available(),
+            memory: memory_limit,
+            memory_limit,
             threads: Threads::from_cores(),
             max_upload: Cap::NONE,
             areas: Vec::new(),
@@ -175,13 +237,7 @@ impl Config {
             relay_duties: true,
         };
         let mut max_upload = None;
-        let mut args = args.peekable();
-        if args.peek().map(String::as_str) == Some("keygen") {
-            let identity = Identity::generate().map_err(|error| error.to_string())?;
-            println!("{}", identity.to_base64());
-            eprintln!("public key: {}", identity.public());
-            return Ok(None);
-        }
+        let mut args = args;
         while let Some(flag) = args.next() {
             let mut value = || args.next().ok_or_else(|| format!("{flag} needs a value"));
             match flag.as_str() {
@@ -217,7 +273,10 @@ impl Config {
                         .parse()
                         .map_err(|_| "--max-connections-per-address needs a number".to_owned())?;
                 }
-                "--memory" => config.memory = parse_bytes(&value()?)?,
+                "--memory" => {
+                    config.memory =
+                        parse_bytes(&value()?).map_err(|error| format!("--memory {error}"))?;
+                }
                 "--ingest-threads" => {
                     config.threads.ingest = value()?
                         .parse()
@@ -268,6 +327,15 @@ impl Config {
             return Err(format!("--key is required\n{USAGE}"));
         }
         config.max_upload = max_upload.ok_or(CAP_REQUIRED)?;
+        if config.memory > config.memory_limit {
+            return Err(format!(
+                "--memory {} is above the {} bytes this relay runs in (its cgroup's limit, else \
+                 the host's memory): the kernel would kill it before its budget turned a feeder \
+                 away; give it at most that, or raise the limit (the unit's MemoryMax, the \
+                 container's limits.memory)",
+                config.memory, config.memory_limit
+            ));
+        }
         if (config.world || config.world_precise) && !covers_the_world(&config.areas) {
             return Err(WORLD_NEEDS_EVERY_AREA.to_owned());
         }
@@ -315,7 +383,6 @@ The --area cells named do not cover the globe, so the product would be a part of
 as the whole. Take every area (the 122 resolution 0 cells cover it), or leave the world products
 to a relay that does.";
 
-/// An H3 cell as its 64-bit number: decimal, `0x` hex, or bare hex as H3's own tools print it.
 /// Bytes, as a number or with a binary K, M, G or T after it.
 pub fn parse_bytes(text: &str) -> Result<usize, String> {
     let text = text.trim();
@@ -330,9 +397,10 @@ pub fn parse_bytes(text: &str) -> Result<usize, String> {
         .parse::<usize>()
         .ok()
         .and_then(|number| number.checked_mul(1 << shift))
-        .ok_or_else(|| format!("--memory {text}: expected bytes, or a number with K, M, G or T"))
+        .ok_or_else(|| format!("{text}: expected bytes, or a number with K, M, G or T"))
 }
 
+/// An H3 cell as its 64-bit number: decimal, `0x` hex, or bare hex as H3's own tools print it.
 pub fn parse_area(text: &str) -> Result<Region, String> {
     let hex = text.strip_prefix("0x").or_else(|| text.strip_prefix("0X"));
     let candidates = match hex {
@@ -379,8 +447,12 @@ mod tests {
     use super::*;
     use crate::egress;
 
+    /// A host of a terabyte, whatever runs the test.
+    const LIMIT: usize = 1 << 40;
+
     fn config(args: &[&str]) -> Result<Config, String> {
-        Config::from_args(args.iter().map(|arg| (*arg).to_owned()))?.ok_or("no config".to_owned())
+        Config::parse(args.iter().map(|arg| (*arg).to_owned()), LIMIT)?
+            .ok_or("no config".to_owned())
     }
 
     #[test]
@@ -421,7 +493,7 @@ mod tests {
             ),
             (2048, 16, 262_144, 8_388_608)
         );
-        assert_eq!(config.memory, crate::budget::memory_available());
+        assert_eq!(config.memory, LIMIT);
         Ok(())
     }
 
@@ -622,6 +694,19 @@ mod tests {
             "2",
         ])?;
         assert_eq!(config.memory, 8 << 30);
+        // Never above the memory the relay runs in: the kernel would kill it first.
+        let over = Config::parse(
+            ["--key", "k", "--max-upload", "1MB/s", "--memory", "2G"]
+                .map(str::to_owned)
+                .into_iter(),
+            1 << 30,
+        )
+        .err()
+        .unwrap_or_default();
+        assert!(
+            over.contains("is above the 1073741824 bytes this relay runs in"),
+            "{over}"
+        );
         assert_eq!(
             config.threads,
             Threads {
