@@ -192,14 +192,14 @@ fn start(hub: &Hub, trace: &Trace) {
 }
 
 /// A trace's batch, as a link hands it in: stamped `stamp`, or by the ingest clock when `None`.
-fn inbound(batch: &Batch, stamp: Option<Stamp>) -> Inbound {
+fn inbound(hub: &Hub, batch: &Batch, stamp: Option<Stamp>) -> Inbound {
     Inbound {
         source: 2,
         batch: batch.clone(),
         origin: Origin::Elsewhere,
         verify: true,
         stamp,
-        permit: None,
+        in_flight: hub.in_flight_for(batch),
         refusal: None,
     }
 }
@@ -250,7 +250,7 @@ fn run(trace: &Trace, threads: Threads, delay: impl Fn(usize) -> Duration) -> Re
     start(&hub, trace);
     for (n, (batch, stamp)) in trace.batches.iter().enumerate() {
         std::thread::sleep(delay(n));
-        hub.ingest(inbound(batch, Some(*stamp)));
+        hub.ingest(inbound(&hub, batch, Some(*stamp)));
     }
     made(&hub, trace.end_ms)
 }
@@ -273,7 +273,7 @@ fn run_clocked(trace: &Trace, threads: Threads, pause: Option<Pause>) -> Result<
     for (second, batches) in trace.batches.chunks(FEEDERS).enumerate() {
         clock.store(BASE_MS + second as u64 * 1_000 + 100, Ordering::SeqCst);
         for (batch, _) in batches {
-            hub.ingest(inbound(batch, None));
+            hub.ingest(inbound(&hub, batch, None));
         }
         hub.flush();
     }
@@ -396,7 +396,7 @@ fn copies_of_a_message_up_to_two_seconds_apart_are_kept_once() -> Result {
             stamp_ms: BASE_MS + 400 + after_ms,
             ingest_seq: n as u64,
         };
-        hub.ingest(inbound(&batch, Some(stamp)));
+        hub.ingest(inbound(&hub, &batch, Some(stamp)));
     }
     let end_ms = BASE_MS + 10_000;
     hub.advance(end_ms);
@@ -538,13 +538,14 @@ async fn each_receivers_batches_reach_a_subscriber_in_order_described_first() ->
                 },
             )
             .map_err(text)?;
+            let in_flight = hub.in_flight_for(&batch);
             hub.ingest(Inbound {
                 source: 1,
                 batch,
                 origin: Origin::Elsewhere,
                 verify: true,
                 stamp: None,
-                permit: None,
+                in_flight,
                 refusal: None,
             });
         }
@@ -558,7 +559,7 @@ async fn each_receivers_batches_reach_a_subscriber_in_order_described_first() ->
             .await
             .map_err(|_| "the subscriber stopped hearing".to_owned())?
             .map_err(|fell| format!("{fell:?}"))?;
-        items.extend(got);
+        items.extend(got.into_iter().map(tally_relay::fanout::Taken::into_item));
         if Instant::now() > deadline {
             return Err(format!("heard {} of {wanted}", items.len()));
         }
@@ -595,10 +596,11 @@ async fn a_subscriber_that_falls_behind_is_let_go_whole_and_the_stream_refused_w
     // A budget of one feeder: the products hold some thirty-five epochs of this stream signed
     // (`budget::PerFeeder::planned`'s products, about 1.6 kB an epoch), so forty seconds of it
     // overflow.
-    let one = tally_relay::budget::PerFeeder::planned(false).total();
     let hub = Arc::new(
         Hub::clocked(8, Arc::new(|| 0))
-            .memory(tally_relay::budget::BASE_BYTES + one, false)
+            // No area taken, so no member's share beside the feeder's: the stores hold exactly
+            // what it is planned.
+            .memory_for_feeders(1, false)
             .queue_bytes(256 * 1024)
             .staged(Threads {
                 ingest: 2,
@@ -629,6 +631,7 @@ async fn a_subscriber_that_falls_behind_is_let_go_whole_and_the_stream_refused_w
             },
         )
         .map_err(text)?;
+        let in_flight = hub.in_flight_for(&batch);
         hub.ingest(Inbound {
             source: 1,
             batch,
@@ -638,7 +641,7 @@ async fn a_subscriber_that_falls_behind_is_let_go_whole_and_the_stream_refused_w
                 stamp_ms: BASE_MS + second * 1_000,
                 ingest_seq: second,
             }),
-            permit: None,
+            in_flight,
             refusal: None,
         });
     }
@@ -710,11 +713,10 @@ fn busy_batch(receiver: &Identity, sequence: u64, count: u32) -> Result<Batch> {
 /// when it does close, and the stalled subscriber is let go as fallen behind, holding nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_stalled_stage_never_grows_past_the_budget() -> Result {
-    use tally_relay::budget::{BASE_BYTES, PerFeeder, Store};
-    let one = PerFeeder::planned(false).total();
+    use tally_relay::budget::Store;
     let hub = Arc::new(
         Hub::clocked(8, Arc::new(|| 0))
-            .memory(BASE_BYTES + 4 * one, false)
+            .memory_for_feeders(4, false)
             .staged(Threads {
                 ingest: 2,
                 message: 2,
@@ -738,6 +740,7 @@ async fn a_stalled_stage_never_grows_past_the_budget() -> Result {
         for receiver in &receivers {
             let batch = busy_batch(receiver, sequence, 600)?;
             ingested += batch.as_bytes().len();
+            let in_flight = hub.in_flight_for(&batch);
             hub.ingest(Inbound {
                 source: 1,
                 batch,
@@ -747,7 +750,7 @@ async fn a_stalled_stage_never_grows_past_the_budget() -> Result {
                     stamp_ms: BASE_MS + 500,
                     ingest_seq: ingested as u64,
                 }),
-                permit: None,
+                in_flight,
                 refusal: None,
             });
         }

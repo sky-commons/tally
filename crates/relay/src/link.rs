@@ -29,9 +29,9 @@ use tokio::time::Instant;
 use crate::ceiling::{self, Ceiling, Metered};
 use crate::config::Upstream;
 use crate::egress::{Class, Kind, Link, Shed, Socket};
-use crate::fanout::{Fell, Filter, Listener};
-use crate::hub::{Hub, Inbound, Item, Origin, OwnDescription, RelayTrust};
-use crate::ingest::{Credit, InFlight, Refusal};
+use crate::fanout::{Fell, Filter, Listener, Taken};
+use crate::hub::{Description, Hub, Inbound, Item, Origin, OwnDescription, RelayTrust};
+use crate::ingest::{Allowance, InFlight, Refusal};
 use crate::network::{Asker, AskerRole};
 use crate::subscription::{Subscription, directory_wants, on_directory_link};
 use tally_wire::RelayAddress;
@@ -532,6 +532,27 @@ where
         },
         _ => None,
     };
+    // What it may have in the ingest stage, carved from what it reserved (a member's, from its
+    // pool, when it is one): the batches its Hello carries are charged like every other.
+    let mut admitted = match peer {
+        Peer::Feeder(_) => match hub.allowance(hub.budget().per_feeder().ingest) {
+            Some(allowance) => Admitted {
+                allowance: Some(allowance),
+                ..Admitted::default()
+            },
+            None => {
+                farewell(&mut session.reader, &mut session.writer, full(&hub)).await;
+                return Err("turned away: no room for its ingest allowance".to_owned());
+            }
+        },
+        // A relay that dialled in is admitted as a member once its offer is verified and it
+        // brings data in (`Admitted::charge`).
+        Peer::Member | Peer::Relay => Admitted {
+            joins: true,
+            ..Admitted::default()
+        },
+        Peer::Subscriber | Peer::Engine(_) | Peer::Probe => Admitted::default(),
+    };
     // A feeder's session in the station reports ends with this connection, however it ends.
     let _feeding = match peer {
         Peer::Feeder(receiver) => Some(Feeding {
@@ -558,6 +579,10 @@ where
     let mut answers = Vec::new();
     let refusal = Arc::new(Refusal::default());
     for record in first {
+        let in_flight = match admitted.charge(&hub, peer, &asker.key, &record).await {
+            Ok(in_flight) => in_flight,
+            Err(end) => return Err(end_now(&mut session.reader, &mut session.writer, end).await),
+        };
         let ingested = ingest(
             record,
             &hub,
@@ -565,7 +590,7 @@ where
             (peer, &asker),
             steer,
             &mut described,
-            (None, &refusal),
+            (in_flight, &refusal),
         )
         .or_else(|unhandled| network(unhandled, &hub, &asker, &mut answers));
         if let Err(end) = ingested {
@@ -633,6 +658,7 @@ where
             subscribe: steer,
             described,
             refusal: Some(refusal),
+            admitted,
             asker,
             // Each role its own ceiling, decided by the role its handshake established, never by
             // its key: a member publishes its groups' slices, a feeder one receiver's batches, an
@@ -740,6 +766,10 @@ async fn upstream_once(
     identity: &Identity,
     hub: &Arc<Hub>,
 ) -> Result<Option<Duration>, String> {
+    // A place under the connection cap, as every session holds (`Hub::dialled`).
+    let _slot = hub
+        .dialled()
+        .ok_or_else(|| "no connection slot to dial with (--max-connections)".to_owned())?;
     let stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(&upstream.address))
         .await
         .map_err(|_| "connect timed out".to_owned())?
@@ -767,6 +797,7 @@ async fn upstream_once(
             subscribe: None,
             described: None,
             refusal: None,
+            admitted: Admitted::default(),
             // A directory link carries offers and queries; only data is held to a ceiling.
             ceiling: None,
             asker: Asker {
@@ -837,6 +868,10 @@ async fn member_once(
     hub: &Arc<Hub>,
     outgoing: &mut mpsc::Receiver<Vec<Record>>,
 ) -> Result<Option<Duration>, String> {
+    // A place under the connection cap, as every session holds (`Hub::dialled`).
+    let _slot = hub
+        .dialled()
+        .ok_or_else(|| "no connection slot to dial with (--max-connections)".to_owned())?;
     let stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(&relay.address))
         .await
         .map_err(|_| "connect timed out".to_owned())?
@@ -864,6 +899,12 @@ async fn member_once(
             subscribe: None,
             described: None,
             refusal: None,
+            // A raw link brings another relay's raw in, so it is a member session; a member link
+            // this relay dialled only sends (what the member sends it comes over its own dial).
+            admitted: Admitted {
+                joins: role == Role::Engine,
+                ..Admitted::default()
+            },
             ceiling: None,
             asker: Asker {
                 role: AskerRole::Relay,
@@ -901,6 +942,8 @@ struct Serving<'a> {
     /// Where a batch refused by the ingest stage ends the connection: the one its `Hello`'s batches
     /// were handed with, if any.
     refusal: Option<Arc<Refusal>>,
+    /// What it was admitted with: its ingest allowance and, a member, its reservation.
+    admitted: Admitted,
     /// What the peer may send, for a connection that dialled in.
     ceiling: Option<Ceiling>,
     /// Who the peer is, as the network duties see it.
@@ -951,6 +994,7 @@ where
         subscribe,
         described,
         refusal,
+        admitted,
         ceiling,
         asker,
         outgoing,
@@ -963,6 +1007,7 @@ where
             asker,
             replies: replying,
             refusal: refusal.unwrap_or_default(),
+            admitted,
         };
         match read_loop(reader, hub, source, peer, reading, described, ceiling).await {
             Ok(()) => Ok(None),
@@ -1027,6 +1072,99 @@ struct Reading<'a> {
     replies: mpsc::Sender<Vec<Record>>,
     /// Where the ingest stage says a batch's signature failed.
     refusal: Arc<Refusal>,
+    admitted: Admitted,
+}
+
+/// What a connection that publishes batches was admitted with (RFC-0181 §2, §9): its allowance
+/// in the ingest stage, carved from `Store::Ingest` within what it reserved, and a member
+/// session's reservation from the members' pool and the pace the members share. A connection that
+/// publishes none has neither, and a batch from it never reaches the stage (`Peer::permit`).
+#[derive(Default)]
+struct Admitted {
+    allowance: Option<Allowance>,
+    membership: Option<crate::budget::Reservation>,
+    /// The members' shared rate (`ceiling::Pace`), which a member session's data waits for.
+    pace: Option<Arc<crate::ceiling::Pace>>,
+    /// Whether this session is admitted as a member once its peer is one (`admit_member`): a
+    /// session over which another relay's data may come in (one that relay dialled, or this
+    /// relay's own one-hop raw link). A session this relay dialled to send a member what is
+    /// addressed to it, or to an upstream for the directory, carries none in, and never is.
+    joins: bool,
+}
+
+impl Admitted {
+    /// `record`'s charge (`in_flight`), a relay's session admitted as a member first
+    /// (`admit_member`) when its offer is verified and this is the first data it brings in, for
+    /// as long as it is one: a session that only speaks the directory holds no member's place.
+    async fn charge(
+        &mut self,
+        hub: &Hub,
+        peer: Peer,
+        key: &PublicKey,
+        record: &Record,
+    ) -> Result<Option<InFlight>, End> {
+        if self.joins
+            && self.membership.is_none()
+            && matches!(record, Record::Batch(_) | Record::ReceiverInfo(_))
+            && matches!(peer.now(hub, key), Peer::Member)
+        {
+            *self = admit_member(hub)?;
+        }
+        Ok(self.in_flight(record).await)
+    }
+
+    /// A batch's charge from the allowance (`ingest::charge_of`), or a receiver description's
+    /// (its bytes: it passes the ingest stage too, `Hub::describe`), waiting while the connection
+    /// holds all of it; `None` for any other record, or a connection with no allowance.
+    async fn in_flight(&self, record: &Record) -> Option<InFlight> {
+        let bytes = match record {
+            Record::Batch(batch) => crate::ingest::charge_of(batch),
+            Record::ReceiverInfo(info) => info.as_bytes().len(),
+            _ => return None,
+        };
+        let allowance = self.allowance.as_ref()?;
+        // A member's waits first for the members' shared rate: together they bring in what was
+        // planned for them, no more (`budget::Plan::with_members`).
+        if let Some(pace) = &self.pace {
+            let wire = match record {
+                Record::Batch(batch) => batch.as_bytes().len(),
+                _ => bytes,
+            };
+            pace.take(u64::try_from(wire).unwrap_or(u64::MAX)).await;
+        }
+        Some(allowance.acquire(bytes).await)
+    }
+}
+
+/// A member session's admission: its own bytes (its ingest allowance) reserved from the members'
+/// pool, sized at start for every member session the relay's areas bring (`budget::members_for`),
+/// its allowance carved, and the members' shared pace. Turned away, counted, when the pool is full,
+/// which a relay planned from its areas meets only past what the protocol allows them.
+fn admit_member(hub: &Hub) -> Result<Admitted, End> {
+    let budget = hub.budget();
+    let refused = |why: String| {
+        hub.member_refused();
+        End::Told {
+            reason: Reason::Full,
+            retry_after_secs: OVER_CEILING_RETRY_SECS,
+            why,
+        }
+    };
+    let membership = budget.reserve_member().ok_or_else(|| {
+        refused(format!(
+            "turned away: no spare member slot (the relay holds {} member sessions)",
+            budget.members()
+        ))
+    })?;
+    let allowance = hub.allowance(budget.plan().per_member()).ok_or_else(|| {
+        refused("turned away: no room for a member's ingest allowance".to_owned())
+    })?;
+    Ok(Admitted {
+        allowance: Some(allowance),
+        membership: Some(membership),
+        pace: Some(hub.member_pace()),
+        joins: true,
+    })
 }
 
 async fn read_loop<S: AsyncRead>(
@@ -1043,20 +1181,14 @@ async fn read_loop<S: AsyncRead>(
         asker,
         replies,
         refusal,
+        mut admitted,
     } = reading;
-    // `CREDIT` batches in the ingest stage at once (a relay's link `RELAY_CREDIT`, as it carries
-    // many receivers): with none left the socket is not read, and TCP holds the sender back
-    // (RFC-0181 §2).
-    let credit = match peer {
-        Peer::Member | Peer::Relay => Credit::new(crate::ingest::RELAY_CREDIT),
-        Peer::Feeder(_) | Peer::Subscriber | Peer::Engine(_) | Peer::Probe => Credit::default(),
-    };
-    let ingest_gauge = hub.budget().gauge(crate::budget::Store::Ingest);
-    // A sharing member forwards many receivers' records: it is admitted as the feeders its ingest
-    // ceiling is worth, reserved in every store as theirs would be (RFC-0181 §9), for as long as
-    // it is a member. A directory link becomes one when its offer is verified, so this is taken
-    // when it first is.
-    let mut membership: Option<crate::budget::Reservation> = None;
+    // The message being read and the records decoded from it, until each is handed on: carved for
+    // as long as the connection is open (`ingest::BUFFERS_PER_CONNECTION`), a feeder's from what
+    // it reserved, so a peer that trickles a message holds what was planned for it, no more.
+    let _buffers = hub
+        .connection_buffers(matches!(peer, Peer::Feeder(_)))
+        .await;
     let mut records = Vec::new();
     let mut answers = Vec::new();
     loop {
@@ -1077,36 +1209,10 @@ async fn read_loop<S: AsyncRead>(
                 why: "sent more than its ingest ceiling".to_owned(),
             });
         }
-        if membership.is_none() && matches!(peer.now(hub, &asker.key), Peer::Member) {
-            let feeders = crate::budget::Budget::feeders_for_rate(hub.member_bytes_per_sec());
-            membership = Some(
-                hub.budget()
-                    .reserve_feeders(feeders)
-                    .ok_or_else(|| End::Told {
-                        reason: Reason::Full,
-                        retry_after_secs: OVER_CEILING_RETRY_SECS,
-                        why: format!(
-                            "turned away: no spare slot (a member is {feeders} feeders, and the \
-                         memory budget holds {})",
-                            hub.budget().ceiling()
-                        ),
-                    })?,
-            );
-        }
         for record in records.drain(..) {
-            let permit = match &record {
-                Record::Batch(batch) => {
-                    let bytes = batch.as_bytes().len();
-                    match credit.acquire().await {
-                        Some(permit) => Some(InFlight {
-                            permit,
-                            charge: ingest_gauge.charge(bytes).await,
-                        }),
-                        None => None,
-                    }
-                }
-                _ => None,
-            };
+            // Its charge from the connection's allowance before it is handed over: with the
+            // allowance held, the socket is not read, and TCP holds the sender back (RFC-0181 §2).
+            let in_flight = admitted.charge(hub, peer, &asker.key, &record).await?;
             if let Some(why) = refusal.now() {
                 return Err(End::Closed(why));
             }
@@ -1117,7 +1223,7 @@ async fn read_loop<S: AsyncRead>(
                 (peer, &asker),
                 subscribe,
                 &mut described,
-                (permit, &refusal),
+                (in_flight, &refusal),
             )
             .or_else(|unhandled| network(unhandled, hub, &asker, &mut answers))?;
         }
@@ -1173,7 +1279,7 @@ fn ingest(
     (peer, asker): (Peer, &Asker),
     subscribe: Option<&watch::Sender<Subscription>>,
     described: &mut Option<Described>,
-    (permit, refusal): (Option<InFlight>, &Arc<Refusal>),
+    (in_flight, refusal): (Option<InFlight>, &Arc<Refusal>),
 ) -> Result<(), Unhandled> {
     // Whether the peer may send it at all is its role's one rule (`Peer::permit`).
     let peer = peer.now(hub, &asker.key);
@@ -1197,13 +1303,23 @@ fn ingest(
                 Peer::Member | Peer::Relay => Origin::Peer(*asker),
                 Peer::Subscriber | Peer::Engine(_) | Peer::Probe => Origin::Elsewhere,
             };
+            // Charged from the connection's allowance before it came here: a peer that publishes
+            // batches was admitted with one, and none other gets a batch past its permit.
+            let Some(in_flight) = in_flight else {
+                return Err(End::Told {
+                    reason: Reason::Protocol,
+                    retry_after_secs: REFUSED_RETRY_SECS,
+                    why: "sent a batch on a connection admitted to publish none".to_owned(),
+                }
+                .into());
+            };
             hub.ingest(Inbound {
                 source,
                 batch,
                 origin,
                 verify: true,
                 stamp: None,
-                permit,
+                in_flight,
                 refusal: Some(Arc::clone(refusal)),
             });
         }
@@ -1227,7 +1343,25 @@ fn ingest(
                     place,
                 }));
             }
-            hub.publish_info(source, info, receiver, issued_ms, place, false);
+            // Charged like a batch, and for the same reason: it passes the ingest stage.
+            let Some(in_flight) = in_flight else {
+                return Err(End::Told {
+                    reason: Reason::Protocol,
+                    retry_after_secs: REFUSED_RETRY_SECS,
+                    why: "sent a description on a connection admitted to publish none".to_owned(),
+                }
+                .into());
+            };
+            hub.describe(Description {
+                source,
+                info,
+                receiver,
+                issued_ms,
+                place,
+                publishing: false,
+                stamp: None,
+                in_flight,
+            });
         }
         Record::Positions(positions) => {
             let engine = positions.engine().map_err(|error| error.to_string())?;
@@ -1845,6 +1979,9 @@ struct Pending {
     kind: Kind,
     /// By class, highest first; order within a class is the fan-out's.
     by_class: [Vec<Arc<Record>>; Class::ALL.len()],
+    /// The fan-out's charges of what is gathered (`budget::Store::Fanout`), held until it is
+    /// sent: what waits on a slow socket here is still charged.
+    charges: Vec<Arc<crate::budget::Charge>>,
     records: usize,
     bytes: usize,
 }
@@ -1854,6 +1991,7 @@ impl Pending {
         Self {
             kind,
             by_class: Default::default(),
+            charges: Vec::new(),
             records: 0,
             bytes: 0,
         }
@@ -1861,12 +1999,13 @@ impl Pending {
 
     /// Never send a record back down the connection it came in on, nor one the link did not ask
     /// for.
-    fn keep(&mut self, item: Item, source: u64, wants: &Wants) {
-        if item.source != source && wants.wants(&item) {
-            let class = Class::of(&item.record, self.kind);
-            self.bytes += item.record.encoded_len();
+    fn keep(&mut self, taken: Taken, source: u64, wants: &Wants) {
+        if taken.source != source && wants.wants(&taken) {
+            let class = Class::of(&taken.record, self.kind);
+            self.bytes += taken.record.encoded_len();
             self.records += 1;
-            self.by_class[class as usize].push(item.record);
+            self.charges.push(taken.charge());
+            self.by_class[class as usize].push(Arc::clone(&taken.record));
         }
     }
 
@@ -1888,6 +2027,8 @@ impl Pending {
                 records.clear();
             }
         }
+        // Sent: the fan-out's charge of it goes with the last holder.
+        self.charges.clear();
         self.records = 0;
         self.bytes = 0;
         Ok(())
@@ -1970,7 +2111,8 @@ async fn beast_client<W: AsyncWrite + Unpin>(
     let link = stream.link();
     let egress = Arc::clone(stream.egress());
     let mut bytes = Vec::new();
-    let mut items: Vec<Item> = Vec::new();
+    // Held, with their charges, until their bytes are written.
+    let mut items: Vec<Taken> = Vec::new();
     loop {
         items.clear();
         if let Err(fell) = out.recv_many(&mut items, SEND_BATCH).await {

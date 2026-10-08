@@ -418,46 +418,72 @@ mod tests {
         Ok(())
     }
 
-    /// The band of an area beside a pentagon is found, and is the same patch a ring by ring walk
-    /// finds where no pentagon is near: the walk H3's ring iterator made never ended there.
+    /// Rings out from an area the brute-force band looks at: more than its reach at the area
+    /// resolution (about 700 km to the farthest cell, at least 60 km a ring), checked by finding
+    /// nothing near on the outermost.
+    const BRUTE_RINGS: u32 = 12;
+
+    /// An area's band by brute force, with no walk: every cell of the area's disk of
+    /// `BRUTE_RINGS` (H3's safe disk, correct at the pentagons) that is near it, sorted. Nothing on
+    /// the outermost ring is near, so no near cell lies beyond the disk.
+    fn brute_band(area: CellIndex) -> Result<Vec<CellIndex>, String> {
+        let disk: Vec<(CellIndex, u32)> = area.grid_disk_distances_safe(BRUTE_RINGS).collect();
+        if disk
+            .iter()
+            .any(|(cell, ring)| *ring == BRUTE_RINGS && near(area, *cell))
+        {
+            return Err(format!("{area}: the band reaches past {BRUTE_RINGS} rings"));
+        }
+        let mut cells: Vec<CellIndex> = disk
+            .into_iter()
+            .map(|(cell, _)| cell)
+            .filter(|cell| near(area, *cell))
+            .collect();
+        cells.sort_unstable();
+        cells.dedup();
+        Ok(cells)
+    }
+
+    /// The band of an area at a pentagon, beside one and far from any is exactly the cells near it,
+    /// none missing and none extra, against a brute-force search of its disk: the walk H3's ring
+    /// iterator made never ended at a pentagon, and a walk that ended early would miss cells.
     #[test]
-    fn a_band_beside_a_pentagon_ends_and_elsewhere_is_the_rings() -> Result<(), String> {
+    fn a_band_at_a_pentagon_and_elsewhere_is_every_cell_near_its_area() -> Result<(), String> {
         let text = |error: h3o::error::InvalidCellIndex| error.to_string();
         let at = h3o::Resolution::try_from(AREA_RESOLUTION).map_err(|error| error.to_string())?;
-        // Base cell 4 is a pentagon; its centre child at the area resolution, and a neighbour.
+        // Base cell 4 is a pentagon; its centre child at the area resolution is one too.
         let pentagon = CellIndex::try_from(0x0800_9fff_ffff_ffff_u64).map_err(text)?;
-        let beside = pentagon.center_child(at).ok_or("no centre child")?;
-        assert!(beside.is_pentagon());
-        let band = walk_band(beside);
-        assert!(band.contains(&beside) && band.len() > 1);
-        assert!(band.iter().all(|cell| near(beside, *cell)));
-        // Far from any pentagon the walk is the rings, out to the first with nothing near.
+        let centre = pentagon.center_child(at).ok_or("no centre child")?;
+        assert!(centre.is_pentagon());
+        let mut areas = vec![centre];
+        // Its neighbours, beside the pentagon, and a cell two rings out.
+        areas.extend(centre.grid_disk_safe(1).filter(|cell| *cell != centre));
+        areas.extend(centre.grid_ring_fast(2).flatten().take(1));
+        // Every pentagon at the area resolution.
+        areas.extend(
+            CellIndex::base_cells()
+                .filter_map(|cell| cell.is_pentagon().then(|| cell.center_child(at)).flatten()),
+        );
+        // Far from any pentagon.
         for (lat, lon) in [(33.7, -84.4), (51.5, -0.1), (-33.9, 151.2), (35.7, 139.7)] {
-            let area = LatLng::new(lat, lon)
-                .map_err(|error| error.to_string())?
-                .to_cell(at);
-            let mut rings = vec![area];
-            for ring in 1.. {
-                let found: Option<Vec<CellIndex>> = area.grid_ring_fast(ring).collect();
-                let found: Vec<CellIndex> = found
-                    .ok_or("a pentagon near a test area")?
-                    .into_iter()
-                    .filter(|cell| near(area, *cell))
-                    .collect();
-                if found.is_empty() {
-                    break;
-                }
-                rings.extend(found);
-            }
-            rings.sort_unstable();
-            rings.dedup();
-            assert_eq!(walk_band(area), rings, "{lat}, {lon}");
+            areas.push(
+                LatLng::new(lat, lon)
+                    .map_err(|error| error.to_string())?
+                    .to_cell(at),
+            );
+        }
+        assert!(areas.iter().filter(|area| area.is_pentagon()).count() >= 12);
+        for area in areas {
+            let band = walk_band(area);
+            assert!(band.contains(&area) && band.len() > 1, "{area}");
+            assert_eq!(band, brute_band(area)?, "{area}");
         }
         Ok(())
     }
 
-    /// The band of areas, the old way: every area under them one by one, each area's own band,
-    /// merged. What `Band::of` computes from the areas' edge must be exactly this.
+    /// The band of areas by brute force: every area under them one by one, each area's band
+    /// searched over its disk (`brute_band`, no walk), merged. What `Band::of` computes from the
+    /// areas' edge, through the walk, must be exactly this.
     fn band_area_by_area(areas: &Regions) -> Result<Regions, String> {
         let mut cells = Vec::new();
         for listed in areas.iter() {
@@ -465,7 +491,7 @@ mod tests {
                 tally_wire::rendezvous::areas_of(listed).map_err(|error| error.to_string())?
             {
                 let cell = CellIndex::try_from(area.as_u64()).map_err(|error| error.to_string())?;
-                cells.extend(band_of(cell).iter().filter_map(|cell| region(*cell)));
+                cells.extend(brute_band(cell)?.into_iter().filter_map(region));
             }
         }
         Ok(Regions::new(cells))

@@ -568,28 +568,22 @@ impl Sharing {
                 }
                 continue;
             }
-            // Every live, verified offer covering the area, but this relay's own.
-            let offers: Vec<(PublicKey, tally_wire::ProviderOfferContent)> = directory
+            // Every live offer covering the area, but this relay's own: checked by the
+            // directory when it came (`directory::Checked`), never again here.
+            let offers: Vec<crate::directory::Checked> = directory
                 .offers_for(area, now_ms)
-                .iter()
-                .filter_map(|offer| {
-                    let (Ok(content), Ok(signer)) = (offer.content(), offer.signer()) else {
-                        return None;
-                    };
-                    (signer != me
-                        && crate::directory::expiry(&content) > now_ms
-                        && offer.verify().is_ok())
-                    .then_some((signer, content))
-                })
+                .into_iter()
+                .filter(|offer| offer.signer() != me)
                 .collect();
             let leaf = self.own_leaf(area, &taken, &withdrawal);
             for product in SHARED_PRODUCTS {
                 let key = GroupKey::new(area, product);
                 // Per signer, a leaf when any of its offers here forwards nothing.
                 let mut signers: BTreeMap<PublicKey, bool> = BTreeMap::new();
-                for (signer, content) in &offers {
+                for offer in &offers {
+                    let content = offer.content();
                     if content.products.contains(product) {
-                        *signers.entry(*signer).or_insert(false) |= content.stripes == 0;
+                        *signers.entry(offer.signer()).or_insert(false) |= content.stripes == 0;
                     }
                 }
                 self.groups.set_offers(key, &signers);

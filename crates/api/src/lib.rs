@@ -50,8 +50,6 @@ use crate::limit::Limiter;
 use crate::snapshot::{Snapshot, Stations};
 use crate::upstream::Upstream;
 
-/// The origin the public site is served from, allowed by default.
-pub const DEFAULT_ORIGIN: &str = "https://tally.flightlines.ai";
 /// Requests handled at once, by default; beyond it a request is answered 503 at once.
 pub const DEFAULT_MAX_REQUESTS: usize = 256;
 /// Connections held at once, by default; beyond it a new one is closed unanswered.
@@ -71,7 +69,8 @@ pub struct Settings {
     pub relay_stats: String,
     /// readsb's API port, such as `http://127.0.0.1:30152`.
     pub readsb: String,
-    /// The origins CORS allows, the first answered when a request names none of them.
+    /// The origins CORS allows, the first answered when a request names none of them. None by
+    /// default: a page on another site may read the API only where its operator allows that site.
     pub allow_origins: Vec<String>,
     /// A header a fronting proxy sets to the client's address (such as `CF-Connecting-IP`), read
     /// instead of the connection's peer. Only set it when every request comes through that proxy.
@@ -91,7 +90,7 @@ impl Settings {
         Self {
             relay_stats: relay_stats.into(),
             readsb: readsb.into(),
-            allow_origins: vec![DEFAULT_ORIGIN.to_owned()],
+            allow_origins: Vec::new(),
             client_ip_header: None,
             rate: limit::DEFAULT_RATE,
             burst: limit::DEFAULT_BURST,

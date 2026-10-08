@@ -18,9 +18,12 @@ usage: tally-relay --key FILE [--key FILE]... --max-upload RATE [options]
                                    arguments, read and checked as a start reads and checks them
                                    (but for the key files, which it does not read, and the
                                    sockets, which it does not open), then print the memory plan
-                                   (memory, base, per-feeder, feeders, planned, limit) and exit 0.
-                                   --memory-limit is the memory the relay will run in (its
-                                   cgroup's limit: a unit's MemoryMax, a container's
+                                   (memory, base, oversize, connections, connection-buffers,
+                                   per-feeder, feeders, members, per-member, member-feeders,
+                                   member-rate-pool, member-pool, planned, headroom, limit)
+                                   and exit 0. --memory-limit is the
+                                   memory the relay will run in (the lesser of its cgroup's
+                                   limits: a unit's MemoryHigh and MemoryMax, a container's
                                    limits.memory), as it would find it there (default: this
                                    host's, as a start here would find it)
 
@@ -62,7 +65,8 @@ usage: tally-relay --key FILE [--key FILE]... --max-upload RATE [options]
                          every relay it reads (RFC-0174 §2.1); repeatable
   --max-subscribers N    subscribers served before new ones are turned away (default 64)
   --max-connections N    connections held at once; beyond it a new one is closed before its
-                         handshake (default 2048)
+                         handshake (default 2048). Each one's Noise buffers (128 KiB) are
+                         planned in the memory budget before any feeder
   --max-connections-per-address N
                          connections held at once from one IPv4 address or IPv6 /64; beyond
                          it a new one from there is closed before its handshake (default 16)
@@ -74,18 +78,28 @@ usage: tally-relay --key FILE [--key FILE]... --max-upload RATE [options]
                          dialled in is held to it (a feeder, a subscriber, an engine, a probe)
                          but a relay, held to the next
   --max-member-bytes-per-sec N
-                         the same for a relay (a sharing member, or a directory link, which
-                         becomes one once its offer is verified): the most one may send a
-                         second, with a burst of the larger of
-                         N and 192 KiB; about twice a whole-world MLAT relay's clock models
-                         and final and provisional positions (default 8388608)
+                         the same for the relays that send this one data (its sharing members,
+                         a directory link once its offer is verified, its own one-hop raw
+                         links): the most they may send a second all together, each waiting
+                         its turn past it, and the most one alone may, with a burst of the
+                         larger of N and 192 KiB (default 1048576). Planned once, apart from
+                         the feeders', as the feeders it is worth (N over 8 KiB/s) in every
+                         store, so a whole-world relay sharing its clock models and final and
+                         provisional positions (about 4.2 MB/s) raises it, with the memory to
+                         match. The member sessions are not chosen: they are as many as the
+                         areas taken let other relays open (each area's cell, its ancestors and
+                         the cells under it, 32 relays a cell, and with MLAT their raw links),
+                         at most --max-connections, each carving its own ingest allowance; the
+                         relay refuses to start when its memory cannot hold them and one feeder
   --memory BYTES         the most memory this relay may use, in bytes or with K, M, G or T
                          (binary: 16G is 16 GiB). Every feeder's share of every store (batches,
                          MLAT raw, deduplication, subscriber queues, delivery tags, connection
                          buffers) is reserved when it is admitted, and a feeder beyond what this
-                         holds is turned away at its Hello: no spare slot (default: the relay's
-                         cgroup limit, else the host's memory). Never above that limit: the
-                         kernel would kill the relay before its budget turned a feeder away
+                         holds is turned away at its Hello: no spare slot (default: the memory
+                         the relay runs in, the lesser of its cgroup's memory.high and
+                         memory.max, else the host's memory, less 64 MiB of headroom for what
+                         no store charges). Never above that: the kernel would throttle or kill
+                         the relay before its budget turned a feeder away
   --ingest-threads N     threads that verify, admit and decode feeders' batches (default: a
                          quarter of the cores)
   --message-threads N    threads that deduplicate receptions (default: an eighth of the cores)
@@ -134,9 +148,9 @@ pub struct Config {
     pub max_member_bytes_per_sec: u64,
     /// Bytes the relay may use: the admission budget (`budget`).
     pub memory: usize,
-    /// The memory the relay runs in: its cgroup's limit, else the host's
+    /// The memory the relay runs in: the lesser of its cgroup's limits, else the host's
     /// (`budget::memory_available`), or what `check` is told it will be (`--memory-limit`).
-    /// `memory` is never above it.
+    /// `memory` is never above it less `budget::HEADROOM_BYTES`.
     pub memory_limit: usize,
     pub threads: Threads,
     pub max_upload: Cap,
@@ -225,7 +239,7 @@ impl Config {
             max_connections_per_address: DEFAULT_MAX_CONNECTIONS_PER_ADDRESS,
             max_feeder_bytes_per_sec: DEFAULT_MAX_FEEDER_BYTES_PER_SEC,
             max_member_bytes_per_sec: DEFAULT_MAX_MEMBER_BYTES_PER_SEC,
-            memory: memory_limit,
+            memory: crate::budget::budget_within(memory_limit),
             memory_limit,
             threads: Threads::from_cores(),
             max_upload: Cap::NONE,
@@ -327,13 +341,18 @@ impl Config {
             return Err(format!("--key is required\n{USAGE}"));
         }
         config.max_upload = max_upload.ok_or(CAP_REQUIRED)?;
-        if config.memory > config.memory_limit {
+        let most = crate::budget::budget_within(config.memory_limit);
+        if config.memory > most {
             return Err(format!(
-                "--memory {} is above the {} bytes this relay runs in (its cgroup's limit, else \
-                 the host's memory): the kernel would kill it before its budget turned a feeder \
-                 away; give it at most that, or raise the limit (the unit's MemoryMax, the \
-                 container's limits.memory)",
-                config.memory, config.memory_limit
+                "--memory {} is above the {most} bytes this relay may plan: the {} bytes it runs \
+                 in (the lesser of its cgroup's limits, else the host's memory) less {} of \
+                 headroom for what no store charges. Past it the kernel would throttle or kill \
+                 the relay before its budget turned a feeder away; give it at most that, or \
+                 raise the limit (the unit's MemoryHigh and MemoryMax, the container's \
+                 limits.memory)",
+                config.memory,
+                config.memory_limit,
+                crate::budget::HEADROOM_BYTES,
             ));
         }
         if (config.world || config.world_precise) && !covers_the_world(&config.areas) {
@@ -491,9 +510,9 @@ mod tests {
                 config.max_feeder_bytes_per_sec,
                 config.max_member_bytes_per_sec,
             ),
-            (2048, 16, 262_144, 8_388_608)
+            (2048, 16, 262_144, 1_048_576)
         );
-        assert_eq!(config.memory, LIMIT);
+        assert_eq!(config.memory, LIMIT - crate::budget::HEADROOM_BYTES);
         Ok(())
     }
 
@@ -507,6 +526,14 @@ mod tests {
             format!("(default {DEFAULT_MAX_CONNECTIONS_PER_ADDRESS})"),
             format!("(default {DEFAULT_MAX_FEEDER_BYTES_PER_SEC})"),
             format!("(default {DEFAULT_MAX_MEMBER_BYTES_PER_SEC})"),
+            format!(
+                "less {} MiB of headroom",
+                crate::budget::HEADROOM_BYTES >> 20
+            ),
+            format!(
+                "(N over {} KiB/s)",
+                crate::budget::PLANNED_BYTES_PER_SEC / 1024
+            ),
             format!("past {} s", egress::SHED_AFTER.as_secs()),
             format!("10Mbit/s is\n                         at most about {ten}"),
         ] {
@@ -704,8 +731,21 @@ mod tests {
         .err()
         .unwrap_or_default();
         assert!(
-            over.contains("is above the 1073741824 bytes this relay runs in"),
+            over.contains("is above the 1006632960 bytes this relay may plan"),
             "{over}"
+        );
+        // The headroom is kept whatever --memory says: all of the limit is refused too.
+        let all = Config::parse(
+            ["--key", "k", "--max-upload", "1MB/s", "--memory", "1G"]
+                .map(str::to_owned)
+                .into_iter(),
+            1 << 30,
+        );
+        assert!(all.is_err());
+        // The member sessions follow the areas; no operator picks them.
+        assert!(
+            super::tests::config(&["--key", "k", "--max-upload", "1MB/s", "--max-members", "3"])
+                .is_err()
         );
         assert_eq!(
             config.threads,

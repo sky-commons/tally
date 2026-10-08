@@ -10,7 +10,9 @@
 //! batch, so every subscriber reads each (receiver, boot) in admitted order, described first.
 //!
 //! Every item queued is charged once to the relay's budget (`budget::Store::Fanout`), however many
-//! queues hold it, and released when the last lets it go. When an item would pass the budget, the
+//! queues hold it, and released when the last lets it go: a link takes it with its charge
+//! ([`Taken`]) and holds both while it gathers and sends it, so what waits for a slow socket is
+//! charged until the send returns. When an item would pass the budget, the
 //! subscriber holding the most is let go as fallen behind, and the next, until it fits: the queues
 //! together never hold more than their share of the relay's memory, and no subscriber ever misses
 //! an item without being told.
@@ -167,6 +169,38 @@ pub fn item_bytes(item: &Item) -> usize {
 
 /// An item as a queue holds it: with the one charge every queue holding it shares.
 type Queued = (Item, Arc<Charge>);
+
+/// An item a link took from its queue, with the charge every holder of it shares: held for as
+/// long as the link holds the item (gathering it, sending it), released with the last holder.
+#[derive(Debug)]
+pub struct Taken {
+    item: Item,
+    charge: Arc<Charge>,
+}
+
+impl Taken {
+    pub fn item(&self) -> &Item {
+        &self.item
+    }
+
+    /// Its share of the charge, to hold beside what the link keeps of the item.
+    pub fn charge(&self) -> Arc<Charge> {
+        Arc::clone(&self.charge)
+    }
+
+    /// The item, its charge let go: for a holder that keeps nothing of it past this.
+    pub fn into_item(self) -> Item {
+        self.item
+    }
+}
+
+impl std::ops::Deref for Taken {
+    type Target = Item;
+
+    fn deref(&self) -> &Item {
+        &self.item
+    }
+}
 
 struct Subscriber {
     /// The connection it is, so nothing is sent back down the connection it came in on.
@@ -478,8 +512,9 @@ impl Listener {
         });
     }
 
-    /// Waits for at least one item, then moves up to `most` into `out`; or says it fell.
-    pub async fn recv_many(&self, out: &mut Vec<Item>, most: usize) -> Result<(), Fell> {
+    /// Waits for at least one item, then moves up to `most` into `out`, each with its charge; or
+    /// says it fell.
+    pub async fn recv_many(&self, out: &mut Vec<Taken>, most: usize) -> Result<(), Fell> {
         loop {
             if self.try_recv_many(out, most)? > 0 {
                 return Ok(());
@@ -490,8 +525,8 @@ impl Listener {
         }
     }
 
-    /// Moves up to `most` items into `out` without waiting: how many.
-    pub fn try_recv_many(&self, out: &mut Vec<Item>, most: usize) -> Result<usize, Fell> {
+    /// Moves up to `most` items into `out`, each with its charge, without waiting: how many.
+    pub fn try_recv_many(&self, out: &mut Vec<Taken>, most: usize) -> Result<usize, Fell> {
         let Ok(mut state) = self.subscriber.queue.lock() else {
             return Err(Fell::Behind(FellBehind::Bytes));
         };
@@ -505,10 +540,10 @@ impl Listener {
         }
         let mut moved = 0;
         while moved < most {
-            let Some((item, _charge)) = state.queue.pop() else {
+            let Some((item, charge)) = state.queue.pop() else {
                 break;
             };
-            out.push(item);
+            out.push(Taken { item, charge });
             moved += 1;
         }
         Ok(moved)
@@ -519,7 +554,7 @@ impl Listener {
     pub fn try_recv(&self) -> Option<Item> {
         let mut one = Vec::with_capacity(1);
         self.try_recv_many(&mut one, 1).ok()?;
-        one.pop()
+        one.pop().map(Taken::into_item)
     }
 
     /// Bytes waiting.
@@ -636,6 +671,40 @@ mod tests {
         assert_eq!(router.listening(), 4);
         drop(own);
         assert_eq!(router.listening(), 3);
+        Ok(())
+    }
+
+    /// RFC-0181 §8: an item's charge is let go when the last holder lets it go, the link that
+    /// took it among them, never when it leaves the queue.
+    #[test]
+    fn an_items_charge_is_held_until_its_link_lets_it_go() -> Result<(), String> {
+        let gauge = Gauge::new(Store::Fanout, 1 << 20);
+        let router = Arc::new(Router::charged(
+            Bounds {
+                max_bytes: 1 << 20,
+                max_age_ms: BEHIND_MS,
+            },
+            Arc::clone(&gauge),
+        ));
+        let world = router.listen(
+            10,
+            Filter::Subscription(Subscription {
+                streams: Streams::RAW,
+                regions: Vec::new(),
+            }),
+        );
+        router.publish(info_item(None, 0)?);
+        let held = gauge.held();
+        assert!(held > 0);
+        let mut out = Vec::new();
+        assert_eq!(world.try_recv_many(&mut out, 10), Ok(1));
+        assert_eq!((world.queued_bytes(), gauge.held()), (0, held));
+        // What a link keeps of it while it sends keeps its charge.
+        let sending = out.first().map(Taken::charge).ok_or("nothing taken")?;
+        out.clear();
+        assert_eq!(gauge.held(), held);
+        drop(sending);
+        assert_eq!(gauge.held(), 0);
         Ok(())
     }
 

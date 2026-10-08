@@ -40,7 +40,7 @@ use tally_mlat_solver::held::{Bin, Fragment, Limits, RAW_SPARE_BINS, Rates, Seal
 use tally_mlat_solver::scope::{AFTER, BEFORE, STRIDE, Window, bin_of};
 use tally_wire::{Batch, Decoded, Identity, PublicKey, Record, Regions};
 
-use crate::intake::{Intake, Seats};
+use crate::intake::{Intake, Orphaned, Seats};
 use crate::provisional::{self, Provisional};
 use crate::window::{Job, Outcome, Report};
 
@@ -55,6 +55,14 @@ pub const MIN_RECEIVERS: usize = 20_000;
 /// wanted receptions over the longest a reception waits (`provisional::WAITING_MS`).
 pub const WAITING_PER_RECEIVER: usize =
     Rates::MEASURED.wanted_per_s * provisional::WAITING_MS as usize / 1_000;
+/// How long after the window step that published a model provisional solving takes it up. A host
+/// that runs its provisional steps apart from its window steps (a relay's, `tally_relay::mlat_host`)
+/// so that a slow window step never holds a provisional one up, may start a provisional step only
+/// once every window step this long before it has reported: this is at least the window steps it
+/// may fall behind, so a host that sheds nothing never waits, and its provisional steps carry
+/// exactly the models one solving in line carries. A model is carried for 90 s past its window
+/// (`tally_mlat_solver::MAX_CARRY_PS`), so five seconds of it are not missed.
+pub const MODELS_RIPEN_MS: u64 = 5_000;
 
 /// How much an engine holds, derived from what its host admits (RFC-0181 §9).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -145,6 +153,9 @@ pub struct Dropped {
     /// Receivers refused whole for room (`intake::Seats`): new ones outranked, and seated ones a
     /// better ranked one took the seat of.
     pub receivers: u64,
+    /// Observations of a bin that begins too far past their batch's stamp
+    /// (`tally_mlat_solver::held::AHEAD_MS`), refused.
+    pub ahead: u64,
 }
 
 pub struct Engine {
@@ -165,6 +176,13 @@ pub struct Engine {
     models_sequence: u64,
     dropped: Dropped,
     provisional: Provisional,
+    /// Batches waiting for a description let go, since it started.
+    orphaned: Orphaned,
+    /// The step the window job handed out last was prepared at, and the models window steps
+    /// published, each with the step from which provisional solving takes it up
+    /// (`MODELS_RIPEN_MS`).
+    window_ms: u64,
+    ripening: Vec<(u64, provisional::Carried)>,
 }
 
 impl Engine {
@@ -218,6 +236,9 @@ impl Engine {
             models_sequence: 0,
             dropped: Dropped::default(),
             provisional: Provisional::hosted(),
+            orphaned: Orphaned::default(),
+            window_ms: 0,
+            ripening: Vec::new(),
         }
     }
 
@@ -267,6 +288,12 @@ impl Engine {
                 };
                 // One intake holds every receiver, so no other intake's receiver moves.
                 let described = intake.describe(info)?;
+                let key = info.receiver().map_err(|error| error.to_string())?;
+                // The batches that waited for it, taken now as they would have been then.
+                for (batch, stamp_ms) in intake.take_orphans(&key) {
+                    let (_, notes) = intake.ingest_verified(&batch);
+                    self.provisional.hear_notes(&batch, notes, stamp_ms);
+                }
                 for key in &described.left {
                     self.forget_receiver(key);
                 }
@@ -307,7 +334,9 @@ impl Engine {
 
     fn receive(&mut self, batch: &Batch, now_ms: u64) -> Result<Ingested, String> {
         let key = batch.receiver().map_err(|error| error.to_string())?;
-        if self.described(&key) != Some(true) {
+        // Described and taking no part: nothing of it is held. Not described: it waits for the
+        // description (`intake::Intake::hold_orphan`), verified first.
+        if self.described(&key) == Some(false) {
             return Ok(Ingested::Ignored);
         }
         batch
@@ -331,8 +360,21 @@ impl Engine {
             return Ingested::Ignored;
         };
         let (ingested, notes) = intake.ingest_verified(batch);
+        if ingested == Ingested::Ignored && intake.described(&batch.receiver()).is_none() {
+            let orphaned = intake.hold_orphan(batch, now_ms, Box::new(()));
+            self.orphaned.dropped += orphaned.dropped;
+        }
         self.provisional.hear_notes(batch, notes, now_ms);
         ingested
+    }
+
+    /// Lets go the batches that waited `intake::ORPHAN_MS` for a description by the step at
+    /// `now_ms`. What batches waiting for a description were let go since it started.
+    pub fn expire_orphans(&mut self, now_ms: u64) -> Orphaned {
+        if let Some(intake) = self.intake.as_mut() {
+            self.orphaned.expired += intake.expire_orphans(now_ms).expired;
+        }
+        self.orphaned
     }
 
     /// Refusals its host's intakes counted, reported with the next step.
@@ -340,6 +382,7 @@ impl Engine {
         self.dropped.late += dropped.late;
         self.dropped.refused += dropped.refused;
         self.dropped.receivers += dropped.receivers;
+        self.dropped.ahead += dropped.ahead;
     }
 
     /// The latest bin complete by `now_ms`: it ended, and the settling time after it passed.
@@ -386,6 +429,7 @@ impl Engine {
         settled: i64,
         sites: Vec<Site>,
     ) -> Option<Job> {
+        self.window_ms = now_ms;
         let windows: Vec<Window> = self
             .sealed
             .numbers()
@@ -434,9 +478,13 @@ impl Engine {
             .extend(outcome.windows.iter().map(|window| window.last));
         self.positions_sequence = outcome.positions_sequence;
         self.models_sequence = outcome.models_sequence;
-        for carried in outcome.carried {
-            self.provisional.adopt(carried);
-        }
+        let ripe_ms = self.window_ms.saturating_add(MODELS_RIPEN_MS);
+        self.ripening.extend(
+            outcome
+                .carried
+                .into_iter()
+                .map(|carried| (ripe_ms, carried)),
+        );
         let dropped = std::mem::take(&mut self.dropped);
         (outcome.records, outcome.report, dropped)
     }
@@ -445,6 +493,7 @@ impl Engine {
     /// host that holds the address shards: the models carried, spent ones forgotten first, and the
     /// next sequence. At most one step at a time; its outcome is `apply_provisional`'s.
     pub fn provisional_plan(&mut self, now_ms: u64, issued_ms: u64) -> provisional::Plan {
+        self.ripen(now_ms);
         self.provisional.plan(
             now_ms,
             &self.identity,
@@ -457,6 +506,7 @@ impl Engine {
     /// The provisional work due by `now_ms` (`crate::provisional`), owned, to run off the
     /// ingesting thread; `None` when nothing is due.
     pub fn provisional(&mut self, now_ms: u64, issued_ms: u64) -> Option<provisional::Job> {
+        self.ripen(now_ms);
         self.provisional.due(
             now_ms,
             &self.identity,
@@ -464,6 +514,19 @@ impl Engine {
             issued_ms,
             self.settings.threads,
         )
+    }
+
+    /// Provisional solving takes up the models published `MODELS_RIPEN_MS` or more before `now_ms`,
+    /// in the order they were published.
+    fn ripen(&mut self, now_ms: u64) {
+        let ripening = std::mem::take(&mut self.ripening);
+        for (ripe_ms, carried) in ripening {
+            if ripe_ms <= now_ms {
+                self.provisional.adopt(carried);
+            } else {
+                self.ripening.push((ripe_ms, carried));
+            }
+        }
     }
 
     /// Takes a finished provisional job's outcome: its records are the next in this boot's

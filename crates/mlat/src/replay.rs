@@ -9,7 +9,11 @@
 //!   jitter.
 //! - **The engine as it runs** (`replay`): at every multiple of `tick_ms` of the virtual clock (a
 //!   step), what arrived before it is ingested, provisional work is solved and published, and a due
-//!   window is stepped. Each record published is returned with its step. These are the hosted
+//!   window is stepped. A receiver's description takes effect at the step after it arrived, as a
+//!   relay's does (`tally_relay::mlat_host`, descriptions stamped and applied at their step): the
+//!   batches that arrived before that step are taken as the receiver stood before it (those of a
+//!   receiver not yet described wait for it, `intake::Intake::hold_orphan`), and the batches that
+//!   waited are let go once they have waited `intake::ORPHAN_MS` of steps. Each record published is returned with its step. These are the hosted
 //!   MLAT's steps (`tally_relay::mlat_host`: the multiples of its `STEP_MS` the stamp watermark
 //!   passes, each weighing the batches stamped before it), so this is the reference the relay is
 //!   held to byte for byte. The relay runs the two off the ingesting thread; here they run in
@@ -70,6 +74,69 @@ pub fn arrivals(simulation: &mut Simulation, seed: u64) -> Result<Vec<(u64, Reco
     Ok(out)
 }
 
+/// What orders two descriptions taking effect at one step after their stamps: the receiver's key,
+/// then the bytes (a relay applies them in the same order).
+fn description_key(record: &Record) -> (Vec<u8>, Vec<u8>) {
+    match record {
+        Record::ReceiverInfo(info) => (
+            info.receiver()
+                .map(|key| key.as_bytes().to_vec())
+                .unwrap_or_default(),
+            info.as_bytes().to_vec(),
+        ),
+        _ => (Vec::new(), Vec::new()),
+    }
+}
+
+/// `delivered` (`arrivals` of `simulation`) with two receivers' descriptions moved midway, for a
+/// test that descriptions take effect where their stamps say: the first receiver described again
+/// out of every area (its location moved 20 degrees north) a third of the way in and back ten
+/// seconds later, so it stops taking part and takes part again; and the second described first
+/// halfway in, so its batches before wait for it and those that waited too long are let go. In
+/// arrival order.
+pub fn described_midway(
+    simulation: &Simulation,
+    delivered: &[(u64, Record)],
+) -> Result<Vec<(u64, Record)>, String> {
+    let feeds = simulation.feeds().map_err(|error| error.to_string())?;
+    let first = delivered.first().map(|(at, _)| *at).ok_or("no raw")?;
+    let last = delivered.last().map_or(0, |(at, _)| *at);
+    let third = first + (last - first) / 3;
+    let half = first + (last - first) / 2;
+    let [moved, late, ..] = feeds.as_slice() else {
+        return Err("fewer than two receivers".to_owned());
+    };
+    let late_key = late.identity.public();
+    let mut changed: Vec<(u64, Record)> = delivered
+        .iter()
+        .filter(|(_, record)| {
+            !matches!(record, Record::ReceiverInfo(info) if info.receiver().ok() == Some(late_key))
+        })
+        .cloned()
+        .collect();
+    let content = moved.info.content().map_err(|error| error.to_string())?;
+    let away = tally_wire::batch::ReceiverInfoContent {
+        issued_ms: content.issued_ms + 1,
+        location: content.location.map(|location| tally_wire::Location {
+            lat_e7: location.lat_e7.saturating_add(200_000_000),
+            ..location
+        }),
+        ..content.clone()
+    };
+    let back = tally_wire::batch::ReceiverInfoContent {
+        issued_ms: content.issued_ms + 2,
+        ..content
+    };
+    for (at, content) in [(third, away), (third + 10_000, back)] {
+        let info = tally_wire::ReceiverInfo::sign(&moved.identity, &content)
+            .map_err(|error| error.to_string())?;
+        changed.push((at, Record::ReceiverInfo(info)));
+    }
+    changed.push((half, Record::ReceiverInfo(late.info.clone())));
+    changed.sort_by_key(|(at, _)| *at);
+    Ok(changed)
+}
+
 /// The unix milliseconds of a simulated transmission.
 pub fn transmitted_ms(simulation: &Simulation, source: usize) -> u64 {
     let start_ms =
@@ -93,10 +160,20 @@ pub fn replay(
     let mut next = 0;
     let mut published = Vec::new();
     let mut now = (first / tick_ms + 1) * tick_ms;
+    let mut descriptions: Vec<(u64, &Record)> = Vec::new();
     while now <= until_ms {
         while let Some((at, record)) = arrivals.get(next).filter(|(at, _)| *at < now) {
-            engine.ingest(record, *at)?;
+            if matches!(record, Record::ReceiverInfo(_)) {
+                descriptions.push((*at, record));
+            } else {
+                engine.ingest(record, *at)?;
+            }
             next += 1;
+        }
+        engine.expire_orphans(now);
+        descriptions.sort_by_cached_key(|(at, record)| (*at, description_key(record)));
+        for (at, record) in descriptions.drain(..) {
+            engine.ingest(record, at)?;
         }
         for record in engine.provisional_step(now, now) {
             published.push((now, record));

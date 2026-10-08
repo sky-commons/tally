@@ -53,7 +53,11 @@ The load:
   --ramp SECS            start the feeders evenly over this long (default 60)
   --warmup SECS          wait this long after the ramp before measuring (default 30)
   --duration SECS        measure for this long (default 60)
-  --streams LIST         what the subscriber asks for: raw, dedup or raw,dedup (default raw,dedup)
+  --streams LIST         what the subscriber asks for, of raw, dedup and provisional, comma
+                         separated (default raw,dedup). provisional measures how long a
+                         provisional MLAT position takes from its transmission to the subscriber
+                         (the relay must host MLAT: RFC-0174 §2.4's fast MLAT, which must reach
+                         the live world before its second is sealed, 4 s after it ends)
   --no-verify            the subscriber does not check signatures
   --decode-threads N     threads the subscriber decodes batches on (default 4)
   --simulate-only        simulate the traffic, print what it came to, and exit
@@ -248,7 +252,12 @@ fn streams(text: &str) -> Result<Streams, String> {
         bits |= match part {
             "raw" => Streams::RAW.0,
             "dedup" => Streams::DEDUPLICATED.0,
-            other => return Err(format!("--streams: unknown stream {other} (raw, dedup)")),
+            "provisional" => Streams::PROVISIONAL.0,
+            other => {
+                return Err(format!(
+                    "--streams: unknown stream {other} (raw, dedup, provisional)"
+                ));
+            }
         };
     }
     Ok(Streams(bits))

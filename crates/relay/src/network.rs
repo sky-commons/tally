@@ -212,7 +212,13 @@ impl Network {
                 // A relay's own answer is its own word, never credit evidence (`credit`). By the
                 // ingest clock, the clock delivery held each batch by (`on_batch`).
                 self.delivery
-                    .answer_at(&self.selection, identity, &query, point, hub.now_ms())
+                    .answer_at(
+                        &self.selection,
+                        identity,
+                        &query,
+                        (point, asker.source),
+                        hub.now_ms(),
+                    )
                     .map(Record::DeliveryAnswer)
                     .into_iter()
                     .collect()
@@ -273,22 +279,20 @@ impl Network {
         }
     }
 
-    /// A receiver's description the hub kept (newer than what it held, verified).
+    /// A receiver's description the hub kept (newer than what it held, verified). The hosted
+    /// MLAT is offered it by the hub, through the ingest stage, stamped there as the receiver's
+    /// batches are (`Hub::describe`).
     pub fn on_info(&self, info: &ReceiverInfo, now_ms: u64) {
         self.credit.described(info.clone(), now_ms);
         self.products.described(info);
-        if let Some(mlat) = self.mlat() {
-            mlat.offer_description(info);
-        }
     }
 
-    /// A receiver's batch the hub forwarded (new, verified), stamped `stamp_ms` by the ingest
-    /// clock, with its one decode when this build reads its
-    /// format: delivery holds the bytes either way; MLAT reads the decode and nothing else (and
-    /// standing reads MLAT's sealed bins). The regional product reads it through the message
-    /// exchange (`exchange`), not here.
-    pub fn on_batch(&self, batch: &Batch, decoded: Option<&Arc<Decoded>>, stamp_ms: u64) {
-        self.delivery.hold(batch, stamp_ms);
+    /// The one decode of a receiver's batch the hub forwarded (new, verified), when this build
+    /// reads its format, stamped `stamp_ms` by the ingest clock: MLAT reads the decode and nothing
+    /// else (and standing reads MLAT's sealed bins). The regional product reads it through the
+    /// message exchange (`exchange`), not here, and delivery tags the batch where its receiver's
+    /// place is read, as it is shared (`originate`, `from_peer`), so the batch is not passed here.
+    pub fn on_batch(&self, decoded: Option<&Arc<Decoded>>, stamp_ms: u64) {
         let Some(decoded) = decoded else {
             return;
         };
@@ -316,8 +320,9 @@ impl Network {
     /// own MLAT's positions and models, its own regional batches, a fault proof brought to it):
     /// it is the origin, and seeds it into the record's sharing group.
     pub fn originate(&self, hub: &Hub, record: &Record, now_ms: u64) {
-        if let Some((cell, product)) = crate::sharing::group_of(record, self.point_for(hub, record))
-        {
+        let point = self.point_for(hub, record);
+        self.tag(record, point, now_ms);
+        if let Some((cell, product)) = crate::sharing::group_of(record, point) {
             self.sharing.originate(record, cell, product, now_ms);
         }
     }
@@ -325,6 +330,15 @@ impl Network {
     /// A batch this relay's own feeder published.
     pub fn from_feeder(&self, hub: &Hub, batch: &Batch, now_ms: u64) {
         self.originate(hub, &Record::Batch(batch.clone()), now_ms);
+    }
+
+    /// A batch from a feeder or a peer, its receiver's place `point` (as its group is reckoned
+    /// from it), at `now_ms` by the ingest clock: delivery tags it if its receiver is of the
+    /// areas this relay takes (`delivery`).
+    fn tag(&self, record: &Record, point: Option<Region>, now_ms: u64) {
+        if let Record::Batch(batch) = record {
+            self.delivery.hold(&self.selection, batch, point, now_ms);
+        }
     }
 
     /// Where a record's group is reckoned from, when the record does not say: a batch's
@@ -433,6 +447,7 @@ impl Network {
     /// stripes, and the sender corroborated first-hand.
     pub fn from_peer(&self, hub: &Hub, asker: &Asker, record: &Record, now_ms: u64) {
         let point = self.point_for(hub, record);
+        self.tag(record, point, now_ms);
         let Some((cell, product)) = crate::sharing::group_of(record, point) else {
             return;
         };

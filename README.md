@@ -95,9 +95,11 @@ the members of its areas' sharing groups (relays whose signed offers it verified
 at the address each names), and over the one-hop raw links its MLAT keeps. So to join the network
 a relay needs one directory link to a relay already in it; the rest it learns from offers. Each feeder is held to
 `--max-feeder-bytes-per-sec` (256 KiB/s by default, told to the feeder in advance), as is every
-other connection that dials in but a relay's, which is held to `--max-member-bytes-per-sec`, and
-connections are capped overall (`--max-connections`) and per address
-(`--max-connections-per-address`). `tally-relay --help` lists the rest.
+other connection that dials in but a relay's. The relays that send it data (the members of its
+groups, and its own one-hop raw links) share `--max-member-bytes-per-sec` all together, and the
+relay plans memory for every member session its areas let other relays open, which nobody picks.
+Connections in and out are capped overall (`--max-connections`), and those dialling in per
+address (`--max-connections-per-address`). `tally-relay --help` lists the rest.
 
 ## What a relay costs
 
@@ -182,7 +184,7 @@ endpoint exactly as the API writes it. Every time field says what it is: an inst
 (Unix milliseconds on the API's clock, beside the answer's `now_ms`, so a client ages it against
 `now_ms` and never against its own clock), and a span is `*_for_ms`.
 
-Each client is rate limited (`--rate`, `--burst`), and CORS allows `--allow-origin` (repeatable),
+Each client is rate limited (`--rate`, `--burst`), and CORS allows `--allow-origin` (repeatable; no origin unless named),
 answering a preflight for `GET` with the `accept` and `traceparent` request headers and exposing
 `Retry-After`. `tally-api --help` lists the rest.
 

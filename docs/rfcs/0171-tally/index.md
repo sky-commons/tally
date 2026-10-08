@@ -182,6 +182,17 @@ The extension rules, which are what a frozen feeder relies on:
   before it, so a relay can verify, route and deduplicate a format it does not otherwise read.
 - An `Observation`'s format is BEAST's own type byte for 1090 MHz; 978 MHz UAT takes a new value
   and needs no new record, and relays forward formats they do not know.
+- A compressed batch (format 2, RFC-0174 §2.2) states the length its receptions inflate to, and
+  that length is at most 8 times its DEFLATE stream (`tally_wire::batch::MAX_INFLATION`) and at
+  most 1 MiB. Every reader refuses a stated length past either before it inflates anything, and
+  stops inflating at the stated length, so a relay's work on a batch is at most 8 times its wire
+  bytes; a writer whose batch would be denser writes it plain (format 1), so no honest batch is
+  refused. Why 8: the densest batch of honest 1090 MHz receptions the encoder makes is about 5
+  times (one aircraft's identical Mode-S short replies at a steady counter and signal level; real
+  extended squitters are about 1.5), because no receiver hears two receptions at one counter
+  value. Only zero-filled UAT uplinks go past it, and they lose only their compression. A relay
+  charges a batch by its inflated bytes and its receptions, never by its wire bytes alone
+  (`Batch::inflated_len`, `Batch::receptions_at_most`, `Decoded::receptions`).
 
 ### §3.5 The feeder: what version 1 is, and what it must never do
 

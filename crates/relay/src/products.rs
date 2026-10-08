@@ -480,28 +480,34 @@ impl Products {
         Ok(())
     }
 
-    /// Where the message exchange hands each closed epoch: to the sealer, without waiting; false
-    /// when its queue is full (the epoch is then refused whole).
+    /// Where the message exchange hands each closed epoch: to the sealer, without waiting; the
+    /// epoch back when its queue is full, for the exchange to hold, charged, and offer again.
     pub fn sink(self: &Arc<Self>) -> Sink {
         let products = Arc::clone(self);
-        Arc::new(move |frozen| products.command(Command::Frozen(frozen)))
+        Arc::new(move |frozen| products.frozen(frozen))
     }
 
-    fn command(&self, command: Command) -> bool {
+    /// An epoch for the sealer, without waiting: back when it could not be taken now.
+    fn frozen(&self, frozen: Frozen) -> Result<(), Box<Frozen>> {
         let Ok(sealer) = self.sealer.read() else {
-            return false;
+            return Err(Box::new(frozen));
         };
         match &*sealer {
             Sealer::Inline(sealing) => {
                 if let Ok(mut sealing) = sealing.lock() {
-                    sealing.handle(command);
+                    sealing.handle(Command::Frozen(frozen));
                     sealing.publish_report();
                 }
-                true
+                Ok(())
             }
-            Sealer::Thread { sender, .. } => match sender.try_send(command) {
-                Ok(()) => true,
-                Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => false,
+            Sealer::Thread { sender, .. } => match sender.try_send(Command::Frozen(frozen)) {
+                Ok(()) => Ok(()),
+                Err(
+                    TrySendError::Full(Command::Frozen(frozen))
+                    | TrySendError::Disconnected(Command::Frozen(frozen)),
+                ) => Err(Box::new(frozen)),
+                // Only an epoch was sent, so only an epoch comes back.
+                Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => Ok(()),
             },
         }
     }
@@ -758,6 +764,8 @@ impl Drop for Products {
 }
 
 fn run(mut sealing: Sealing, receiver: &Receiver<Command>, pause: Option<&Pause>) {
+    // A sealer that stopped would publish no epoch again: the relay ends instead
+    // (`crate::abort_on_any_panic`).
     let paused = |command| {
         if let Some(pause) = pause {
             pause(Stage::Sealer);

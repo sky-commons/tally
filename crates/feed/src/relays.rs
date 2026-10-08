@@ -1077,15 +1077,18 @@ impl Publisher {
         )
     }
 
-    /// Gives every member of the area the feeder may ask its tag keys for this period and the
-    /// next, if it has not been given this period's: a query that carries keys alone, over a
-    /// `Probe` session, whose answer says nothing the feeder needs.
+    /// Gives every member of the area drawn for this period (`DeliveryChecker::draw`, from every
+    /// member the feeder may ask) its tag keys for this period and the next, if it has not been
+    /// given this period's: a query that carries keys alone, over a `Probe` session, whose answer
+    /// says nothing the feeder needs.
     fn grant_keys(&mut self) {
         let Some(area) = self.area else {
             return;
         };
         let now = wall_ms();
-        let members = delivery_check::keyable(&self.directory.offers(), area, &self.observed, now);
+        let candidates =
+            delivery_check::keyable(&self.directory.offers(), area, &self.observed, now);
+        let members = self.checker.draw(candidates, now);
         let receiver = self.identity.public();
         for member in members {
             if self.checker.keyring.keyed(&member.relay.key, now) {

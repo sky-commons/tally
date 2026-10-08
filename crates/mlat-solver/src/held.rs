@@ -42,6 +42,14 @@
 //!   by the stamp watermark) decides it by the batch's ingest stamp instead: raw stamped at or after
 //!   the step that takes its bin is late whenever it arrives, so a batch that raced ahead of that
 //!   step is late exactly as one that came after it, and what is sealed never depends on which won.
+//! - **Never ahead of the stamp** ([`AHEAD_MS`]): the same holder opens no bin that begins more
+//!   than `AHEAD_MS` past the batch's stamp. A bin comes from the feeder's own signed wall clock,
+//!   which nothing else bounds, and a bin the steps never reach is never taken: a receiver stamping
+//!   its batches in the future would hold its open raw there for ever, and fill the store every
+//!   honest receiver's open raw is charged to. Such raw is refused and counted
+//!   ([`Added::ahead`]), at the one place a bin opens ([`Open`]'s every way in), so a holder's open
+//!   bins span at most its settling and the steps it may fall behind before the stamp and
+//!   `AHEAD_MS` after it, which is what [`Rates::cost`] reserves.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -85,12 +93,15 @@ pub struct Added {
     /// Wanted observations refused with their receiver's whole raw of the bin (`Limits`): this
     /// batch's, and what the receiver had held in the bin until it was refused.
     pub refused: usize,
+    /// Wanted observations of a bin that begins more than [`AHEAD_MS`] past the batch's stamp, for
+    /// a holder that closes by the stamp ([`Closing`]): refused, never opening that bin.
+    pub ahead: usize,
 }
 
 impl Added {
     /// Observations not held, for any reason but MLAT never using them.
     pub fn dropped(&self) -> usize {
-        self.late + self.refused
+        self.late + self.refused + self.ahead
     }
 }
 
@@ -646,12 +657,13 @@ impl Rates {
     }
 
     /// What one receiver at these rates costs a holder that seals a bin `settle_ms` after it ends:
-    /// its open raw over a bin and its settling at its ceiling (nothing shared bounds raw while its
-    /// bin is open, only the receiver's own share, so that is what it may hold), and its thinned raw
+    /// its open raw over a bin, its settling and the bins it may open ahead of its stamp
+    /// ([`AHEAD_MS`]) at its ceiling (nothing shared bounds raw while its bin is open, only the
+    /// receiver's own share, so that is what it may hold), and its thinned raw
     /// over the bins a holder keeps sealed (`SEALED_BINS_HELD`) at the kept rate (each bin is
     /// sealed within the holder's bytes, `Bin::seal_within`).
     pub fn cost(&self, settle_ms: u64) -> Cost {
-        let open_ms = GRID_MS + settle_ms;
+        let open_ms = GRID_MS + settle_ms + AHEAD_MS;
         let open_bins = open_ms.div_ceil(GRID_MS) as usize + 1;
         let sealed_ms = SEALED_BINS_HELD as u64 * GRID_MS;
         Cost {
@@ -676,6 +688,12 @@ impl Cost {
         self.open.saturating_add(self.sealed)
     }
 }
+
+/// How far past a batch's stamp a bin may begin and still be opened, for a holder that closes by the
+/// stamp (module docs, Never ahead): a receiver's wall clock ahead of the relay's ingest clock by a
+/// second is a clock that disagrees, and one further ahead is refused. A receiver's open raw is
+/// reserved over it too ([`Rates::cost`]).
+pub const AHEAD_MS: u64 = 1_000;
 
 /// When a holder that steps on a fixed clock takes each bin for sealing (module docs, late by
 /// the stamp): at every multiple of `step_ms` of its step clock, every bin that ended `settle_ms`
@@ -811,6 +829,28 @@ impl Open {
         )
     }
 
+    /// As `add_decoded_taking`, the batch taken as stamped `stamp_ms` (never earlier than its own
+    /// stamp): for a holder that takes a batch later than it came, as of the step that let it in (a
+    /// relay's raw shards taking a batch that waited for its receiver's description), so its raw is
+    /// late, or ahead, by that step and not by when it first came.
+    pub fn add_decoded_taking_at(
+        &mut self,
+        decoded: &Decoded,
+        stamp_ms: u64,
+        take: &mut dyn FnMut(usize) -> bool,
+    ) -> Added {
+        let room = self.limits.bytes;
+        self.add_observations(
+            decoded.receiver(),
+            decoded.counter_epoch(),
+            decoded.wall_ms(),
+            decoded.views(),
+            room,
+            Some(stamp_ms.max(decoded.stamp_ms())),
+            take,
+        )
+    }
+
     /// `room`: the bytes these open bins may grow to. `stamp_ms`: the batch's ingest stamp, which
     /// decides lateness when the holder closes by one ([`Closing`]). `take`: asked for every byte
     /// before it is allocated.
@@ -838,10 +878,17 @@ impl Open {
                 keep
             })
             .collect();
-        let late_by_stamp = match (self.closing, stamp_ms) {
-            (Some(closing), Some(stamp_ms)) => stamp_ms >= closing.close_at(bin),
-            _ => false,
+        let (late_by_stamp, ahead) = match (self.closing, stamp_ms) {
+            (Some(closing), Some(stamp_ms)) => (
+                stamp_ms >= closing.close_at(bin),
+                bin > bin_of(stamp_ms.saturating_add(AHEAD_MS)),
+            ),
+            _ => (false, false),
         };
+        if ahead {
+            added.ahead = wanted.len();
+            return added;
+        }
         if late_by_stamp || self.through.is_some_and(|through| bin <= through) {
             added.late = wanted.len();
             return added;
@@ -925,6 +972,15 @@ impl Open {
     /// Forgets everything of `receiver` in the open bins.
     pub fn forget_receiver(&mut self, receiver: &PublicKey) {
         for fragment in self.bins.values_mut() {
+            self.bytes -= fragment.forget(receiver);
+        }
+    }
+
+    /// Forgets everything of `receiver` in the open bins after `bin`: those up to it are taken by
+    /// steps already due, which hold it as they would have had they run in their turn.
+    pub fn forget_receiver_after(&mut self, receiver: &PublicKey, bin: i64) {
+        use std::ops::Bound::{Excluded, Unbounded};
+        for (_, fragment) in self.bins.range_mut((Excluded(bin), Unbounded)) {
             self.bytes -= fragment.forget(receiver);
         }
     }

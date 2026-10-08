@@ -25,10 +25,11 @@
 //!   batches, so a proof binds the exact batch and naming it by its hash would add nothing. A tag
 //!   counts only under a key the feeder gave that member that was in force when the batch was sent
 //!   (`tally_wire::delivery::tag_keys_for`): a tag under an older key (a replay) is no proof.
-//! - **Keys on a schedule, never per audit.** The keys go to every member the feeder may ask,
-//!   every period, whether or not an audit runs, so a member learns nothing of when one does or of
-//!   which batches it covers, and cannot tip off the relay audited. Only a member holding a key for
-//!   the period is asked. The feeder keeps the bytes of the audited batches alone, and asks only
+//! - **Keys on a schedule, never per audit.** The keys go to the members drawn at random for the
+//!   period (at most `KEYED_MEMBERS` of every member the feeder may ask, drawn afresh each period,
+//!   the keys of a member not drawn dropped: `Keyring`), every period, whether or not an audit
+//!   runs, so a member learns nothing of when one does or of which batches it covers, and cannot
+//!   tip off the relay audited. Only a member drawn and holding a key for the period is asked. The feeder keeps the bytes of the audited batches alone, and asks only
 //!   within `TAG_WINDOW_MS` of sending, the window a member keeps its tags for.
 //! - **Who counts.** An answer counts when it is signed by the member asked, names this query's
 //!   nonce, this feeder and this boot, and says the member takes the area. The audited relay is
@@ -104,17 +105,73 @@ pub struct Sent {
     pub sent_ms: u64,
 }
 
-/// The tag keys the feeder gave each member, by id (key period): the current period's and the
-/// next, and the two before, which tags of batches sent within the window may be under. Older keys
-/// are forgotten, so a tag under one proves nothing.
+/// One member's tag keys, by id (key period).
+type MemberKeys = BTreeMap<u32, [u8; TAG_KEY_LEN]>;
+
+/// The members drawn to be given tag keys, and the keys the feeder gave each, by id (key period):
+/// the current period's and the next, and the two before, which tags of batches sent within the
+/// window may be under. Older keys are forgotten, so a tag under one proves nothing.
+///
+/// **Who is keyed is drawn, never kept.** At most `KEYED_MEMBERS` members hold keys, drawn at
+/// random from every member the feeder may ask afresh each key period (`draw`); a member not drawn
+/// is given no key and its keys are dropped. So no fixed few are always the judges: whoever was
+/// keyed first (a set of keys that reached the feeder first after a restart) holds the set for a
+/// period at most, and every member of the area is drawn in turn.
 #[derive(Default)]
 pub struct Keyring {
-    keys: HashMap<PublicKey, std::collections::BTreeMap<u32, [u8; TAG_KEY_LEN]>>,
+    keys: HashMap<PublicKey, MemberKeys>,
+    /// The members drawn, and the key period they were drawn for.
+    drawn: HashSet<PublicKey>,
+    drawn_for: Option<u32>,
 }
 
 impl Keyring {
+    /// The members to give keys at `now_ms`, of `candidates` (every member the feeder may ask):
+    /// at the first draw of a key period, `KEYED_MEMBERS` of them at random, and every key of a
+    /// member not drawn dropped; later in the period, a member drawn stays drawn and a place left
+    /// is filled at random from the rest. The members drawn among `candidates`, and the keys
+    /// dropped (which a check already asked may still need to read its answers: `DeliveryChecker`).
+    pub fn draw(
+        &mut self,
+        candidates: &[PublicKey],
+        now_ms: u64,
+    ) -> (Vec<PublicKey>, Vec<(PublicKey, MemberKeys)>) {
+        let period = key_period(now_ms);
+        if self.drawn_for != Some(period) {
+            self.drawn_for = Some(period);
+            self.drawn.clear();
+        }
+        let mut rest: Vec<PublicKey> = candidates
+            .iter()
+            .filter(|candidate| !self.drawn.contains(*candidate))
+            .copied()
+            .collect();
+        rest.sort_unstable_by(|one, other| one.as_bytes().cmp(other.as_bytes()));
+        rest.dedup();
+        shuffle(&mut rest);
+        let room = KEYED_MEMBERS.saturating_sub(self.drawn.len());
+        self.drawn.extend(rest.into_iter().take(room));
+        let dropped: Vec<PublicKey> = self
+            .keys
+            .keys()
+            .filter(|member| !self.drawn.contains(*member))
+            .copied()
+            .collect();
+        let dropped = dropped
+            .into_iter()
+            .filter_map(|member| self.keys.remove(&member).map(|keys| (member, keys)))
+            .collect();
+        let drawn = candidates
+            .iter()
+            .filter(|candidate| self.drawn.contains(*candidate))
+            .copied()
+            .collect();
+        (drawn, dropped)
+    }
+
     /// `member`'s grant at `now_ms`, signed by the feeder: the keys of this period and the next,
-    /// made fresh the first time each is given and the same every time after.
+    /// made fresh the first time each is given and the same every time after. None for a member
+    /// not drawn (`draw`).
     pub fn grant(
         &mut self,
         identity: &Identity,
@@ -123,7 +180,7 @@ impl Keyring {
     ) -> Option<TagKeys> {
         let period = key_period(now_ms);
         self.forget(now_ms);
-        if !self.keys.contains_key(&member) && self.keys.len() >= KEYED_MEMBERS {
+        if !self.drawn.contains(&member) {
             return None;
         }
         let held = self.keys.entry(member).or_default();
@@ -144,11 +201,14 @@ impl Keyring {
         .ok()
     }
 
-    /// Whether `member` was given the key in force at `now_ms`: one that may be asked.
+    /// Whether `member` is drawn and was given the key in force at `now_ms`: one that may be
+    /// asked.
     pub fn keyed(&self, member: &PublicKey, now_ms: u64) -> bool {
-        self.keys
-            .get(member)
-            .is_some_and(|held| held.contains_key(&key_period(now_ms)))
+        self.drawn.contains(member)
+            && self
+                .keys
+                .get(member)
+                .is_some_and(|held| held.contains_key(&key_period(now_ms)))
     }
 
     /// The key `id` given `member`, while it is kept.
@@ -157,11 +217,19 @@ impl Keyring {
     }
 
     /// Whether `tag` is `member`'s tag of `sent`: under a key it was given that was in force when
-    /// the batch was sent, over the batch's bytes.
-    fn proves(&self, member: &PublicKey, sent: &Sent, key: u32, tag: &tally_wire::Tag) -> bool {
+    /// the batch was sent, over the batch's bytes. `dropped` are keys dropped since the check was
+    /// asked, still read for its answers.
+    fn proves(
+        &self,
+        member: &PublicKey,
+        dropped: &HashMap<PublicKey, MemberKeys>,
+        sent: &Sent,
+        (key, tag): (u32, &tally_wire::Tag),
+    ) -> bool {
         tag_keys_for(sent.sent_ms).contains(&key)
             && self
                 .key(member, key)
+                .or_else(|| dropped.get(member)?.get(&key))
                 .is_some_and(|held| delivery_tag(held, sent.batch.as_bytes()) == *tag)
     }
 
@@ -210,6 +278,9 @@ impl Member {
 struct Pending {
     query: DeliveryQuery,
     batches: Vec<Sent>,
+    /// Keys dropped by a draw since it was asked (`Keyring::draw`): its answers are read under
+    /// them still, and they go with it.
+    dropped: HashMap<PublicKey, MemberKeys>,
 }
 
 /// The audit in progress: the relay audited, and whether its session ended since it began.
@@ -287,6 +358,21 @@ impl DeliveryChecker {
         Some(relay)
     }
 
+    /// The members of `candidates` (every member the feeder may ask) to give keys at `now_ms`
+    /// (`Keyring::draw`). The keys of members not drawn are dropped, but for the check in flight,
+    /// which reads its answers under them still.
+    pub fn draw(&mut self, candidates: Vec<Member>, now_ms: u64) -> Vec<Member> {
+        let keys: Vec<PublicKey> = candidates.iter().map(|member| member.relay.key).collect();
+        let (drawn, dropped) = self.keyring.draw(&keys, now_ms);
+        if let Some(pending) = &mut self.pending {
+            pending.dropped.extend(dropped);
+        }
+        candidates
+            .into_iter()
+            .filter(|member| drawn.contains(&member.relay.key))
+            .collect()
+    }
+
     /// Whether a check has begun and is not yet judged or dropped.
     pub fn in_progress(&self) -> bool {
         self.audit.is_some()
@@ -338,6 +424,7 @@ impl DeliveryChecker {
         self.pending = Some(Pending {
             query: query.clone(),
             batches: chosen.into_values().collect(),
+            dropped: HashMap::new(),
         });
         Some(query)
     }
@@ -417,7 +504,10 @@ impl DeliveryChecker {
                 };
                 let proved = match possession {
                     Possession::Proved { key, tag } => {
-                        if !self.keyring.proves(&signer, sent, key, &tag) {
+                        if !self
+                            .keyring
+                            .proves(&signer, &pending.dropped, sent, (key, &tag))
+                        {
                             // Not this member's tag of this batch under a key in force when it was
                             // sent: it proves nothing and denies nothing.
                             continue;
@@ -579,17 +669,14 @@ pub fn members(
 }
 
 /// Every member of `area`'s sharing group the feeder may ask (the offers `members` chooses from,
-/// none excluded), at most `KEYED_MEMBERS`, chosen at random: the members given tag keys.
+/// none excluded): what the members given tag keys are drawn from (`DeliveryChecker::draw`).
 pub fn keyable(
     offers: &[ProviderOffer],
     area: Region,
     observed: &HashMap<PublicKey, IpAddr>,
     now_ms: u64,
 ) -> Vec<Member> {
-    let mut candidates = candidates(offers, area, &[], observed, now_ms);
-    shuffle(&mut candidates);
-    candidates.truncate(KEYED_MEMBERS);
-    candidates
+    candidates(offers, area, &[], observed, now_ms)
 }
 
 /// The members `offers` name for `area`: signed, alive at `now_ms`, for the area or a cell above
@@ -727,15 +814,35 @@ mod tests {
         sent_ms: u64,
     }
 
+    /// A member of the area at `key`, as the feeder's directory names it.
+    fn member_at(key: PublicKey) -> Member {
+        Member {
+            relay: RelayAddress {
+                key,
+                address: "member.example:1".to_owned(),
+            },
+            network: 0,
+            host: None,
+        }
+    }
+
     impl Setup {
-        /// A member of the area, given its keys.
+        /// A member of the area, drawn and given its keys.
         fn member(&mut self) -> Result<Identity, String> {
             let member = identity()?;
+            self.give_keys(member.public(), self.sent_ms)?;
+            Ok(member)
+        }
+
+        /// Draws `member` (a place is left) and gives it its keys at `now_ms`.
+        fn give_keys(&mut self, member: PublicKey, now_ms: u64) -> Result<(), String> {
+            let drawn = self.checker.draw(vec![member_at(member)], now_ms);
+            assert_eq!(drawn.len(), 1, "a place was left");
             self.checker
                 .keyring
-                .grant(&self.feeder, member.public(), self.sent_ms)
+                .grant(&self.feeder, member, now_ms)
                 .ok_or("no grant")?;
-            Ok(member)
+            Ok(())
         }
 
         /// A member's answer: a tag of each of `held` (made as it arrived, under its key in force
@@ -1018,17 +1125,9 @@ mod tests {
         let honest = setup.answer_first(4, ALL)?;
         let replayer = identity()?;
         let old = setup.sent_ms - 3 * KEY_PERIOD_MS;
-        setup
-            .checker
-            .keyring
-            .grant(&setup.feeder, replayer.public(), old)
-            .ok_or("no grant")?;
+        setup.give_keys(replayer.public(), old)?;
         // Granting now forgets keys past the window: the old one is gone, as rotation makes it.
-        setup
-            .checker
-            .keyring
-            .grant(&setup.feeder, replayer.public(), setup.sent_ms)
-            .ok_or("no grant")?;
+        setup.give_keys(replayer.public(), setup.sent_ms)?;
         let stale = [7; TAG_KEY_LEN];
         let replayed = DeliveryAnswer::sign(
             &replayer,
@@ -1133,6 +1232,7 @@ mod tests {
         let member = identity()?.public();
         let mut keyring = Keyring::default();
         let start = 100 * KEY_PERIOD_MS;
+        keyring.draw(&[member], start);
         let first = keyring
             .grant(&feeder, member, start)
             .ok_or("no grant")?
@@ -1146,6 +1246,7 @@ mod tests {
         assert_eq!((first.current, first.next), (again.current, again.next));
         assert!(keyring.keyed(&member, start));
         assert!(!keyring.keyed(&identity()?.public(), start));
+        keyring.draw(&[member], start + KEY_PERIOD_MS);
         let next = keyring
             .grant(&feeder, member, start + KEY_PERIOD_MS)
             .ok_or("no grant")?
@@ -1154,9 +1255,85 @@ mod tests {
         assert_eq!(next.current, first.next);
         assert_ne!(next.next, first.next);
         // Three periods on, the first key is forgotten.
+        keyring.draw(&[member], start + 3 * KEY_PERIOD_MS);
         keyring.grant(&feeder, member, start + 3 * KEY_PERIOD_MS);
         assert!(keyring.key(&member, first.current.id).is_none());
         assert!(keyring.key(&member, first.current.id + 1).is_some());
+        Ok(())
+    }
+
+    /// Item 14 of the sweep: the keyed members are drawn afresh at random each period, so a set
+    /// keyed first (Sybils that reached the feeder first after a restart) holds it a period at
+    /// most: a member not drawn is given no key and its keys are dropped, and every member is
+    /// drawn in turn.
+    #[test]
+    fn the_keyed_members_are_drawn_afresh_each_period() -> Result<(), String> {
+        let feeder = identity()?;
+        let sybils: Vec<PublicKey> = (0..KEYED_MEMBERS)
+            .map(|_| identity().map(|member| member.public()))
+            .collect::<Result<_, _>>()?;
+        let honest = identity()?.public();
+        let mut keyring = Keyring::default();
+        let start = 100 * KEY_PERIOD_MS;
+        // The Sybils first: every place is theirs for this period, and the honest member, come a
+        // moment later, has none.
+        let (drawn, _) = keyring.draw(&sybils, start);
+        assert_eq!(drawn.len(), KEYED_MEMBERS);
+        for sybil in &sybils {
+            keyring.grant(&feeder, *sybil, start).ok_or("no grant")?;
+        }
+        let everyone: Vec<PublicKey> = sybils.iter().copied().chain([honest]).collect();
+        let (drawn, _) = keyring.draw(&everyone, start + 1);
+        assert!(!drawn.contains(&honest));
+        assert!(keyring.grant(&feeder, honest, start + 1).is_none());
+        // Each period after, a fresh draw: the honest member is drawn in turn (here each period
+        // with chance 16 in 17, so never in 40 is beyond any chance), and the member left out
+        // each time has its keys dropped and is never asked.
+        let mut honest_drawn = 0;
+        for period in 1..=40 {
+            let now = start + period * KEY_PERIOD_MS;
+            let (drawn, dropped) = keyring.draw(&everyone, now);
+            assert_eq!(drawn.len(), KEYED_MEMBERS);
+            let left_out: Vec<PublicKey> = everyone
+                .iter()
+                .filter(|member| !drawn.contains(member))
+                .copied()
+                .collect();
+            let [left_out] = left_out[..] else {
+                return Err(format!("left out {left_out:?}"));
+            };
+            assert!(dropped.iter().all(|(member, _)| *member == left_out));
+            assert!(keyring.grant(&feeder, left_out, now).is_none());
+            assert!(!keyring.keyed(&left_out, now));
+            assert!(keyring.key(&left_out, key_period(now)).is_none());
+            for member in &drawn {
+                keyring.grant(&feeder, *member, now).ok_or("no grant")?;
+                assert!(keyring.keyed(member, now));
+            }
+            if drawn.contains(&honest) {
+                honest_drawn += 1;
+            }
+        }
+        assert!(honest_drawn > 0, "the honest member was never drawn");
+        Ok(())
+    }
+
+    /// A draw that drops a member's keys while a check is in flight leaves that check able to
+    /// read the member's answer: the keys it was asked under go with it.
+    #[test]
+    fn a_check_in_flight_reads_its_answers_under_keys_a_draw_dropped() -> Result<(), String> {
+        let mut setup = audited()?;
+        let answers = vec![
+            (1, setup.answer_first(4, ALL)?),
+            (2, setup.answer_first(4, ALL)?),
+        ];
+        // A new period's draw, from members the first two are not among.
+        let later = setup.sent_ms + KEY_PERIOD_MS;
+        let others: Vec<Member> = (0..KEYED_MEMBERS)
+            .map(|_| identity().map(|member| member_at(member.public())))
+            .collect::<Result<_, _>>()?;
+        setup.checker.draw(others, later);
+        assert_eq!(setup.judge(&answers), Verdict::Delivered);
         Ok(())
     }
 

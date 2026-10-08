@@ -114,7 +114,7 @@ pub const DESCRIPTION_BYTES_HELD: usize = 64 * 1024 * 1024;
 /// The default ceilings an operator may change (`config`).
 ///
 /// What the relay holds is not sized here: the admission budget (`budget`) is, from the memory the
-/// relay is given (`--memory`, by default its cgroup's `MemoryMax` or the host's). Every store that
+/// relay is given (`--memory`, by default the memory it runs in less `budget::HEADROOM_BYTES`). Every store that
 /// grows with what feeders send (subscriber queues, deduplication, the epochs between ingest and
 /// the sealer, the products, MLAT's raw, the batch store) is charged to its gauge and held to its
 /// share at the feeder ceiling, and a Hello past the ceiling is refused; a relay whose memory
@@ -128,27 +128,37 @@ pub const DESCRIPTION_BYTES_HELD: usize = 64 * 1024 * 1024;
 /// | hashes, four tables x two generations x 100,000              | 36 MiB     |
 /// | clock model parts awaiting manifests, and manifests' lists    | 96 MiB     |
 ///
-/// A connection's Noise buffers come from one pool and an idle connection holds none
-/// (`tally_wire::noise`), so the connection cap bounds sockets and handshakes, not buffers; the
-/// kernel's socket buffers for the fan-out's links are charged to the relay's cgroup beside it.
+/// A connection's Noise buffers come from one pool (`tally_wire::noise`), and each connection
+/// carves what it may hold of them while it reads (`ingest::BUFFERS_PER_CONNECTION`) when it is
+/// admitted: a feeder from what it reserved (`Store::Buffers`), every other connection from room
+/// the plan sizes to the connection cap (`budget::Plan::connection_buffers`), so a peer trickling
+/// a message holds what was planned for it. The kernel's socket buffers for the fan-out's links are charged to the
+/// relay's cgroup beside it.
 ///
-/// A sharing member at its ceiling (`DEFAULT_MAX_MEMBER_BYTES_PER_SEC`) reserves the feeders that
-/// ceiling is worth (`budget::Budget::reserve_feeders`), so what it sends is admitted the same way
-/// as a feeder's. What it costs beyond that is bandwidth in: up to its ceiling, from each member of
-/// the relay's groups, whose count the directory bounds; an operator sizes
-/// `--max-member-bytes-per-sec` to the host's link.
+/// The members (the sessions over which other relays' data comes in) share one rate
+/// (`DEFAULT_MAX_MEMBER_BYTES_PER_SEC`), planned once as the feeders it is worth, and each member
+/// session carves its ingest allowance from the members' own pool, sized at start for every member
+/// session the areas taken bring, at most this cap (`budget::members_for`,
+/// `budget::Budget::reserve_member`), so what they send is admitted the same way as a feeder's and
+/// never competes with feeders for room. Every session, in or out, holds a place under this cap
+/// (`Hub::connection`, `Hub::dialled`). What members cost beyond that is bandwidth in, up to their
+/// shared rate; an operator sizes `--max-member-bytes-per-sec` to the host's link.
 pub const DEFAULT_MAX_CONNECTIONS: usize = 2048;
 /// Per IPv4 address, or per IPv6 /64 (what one host is usually given), so one host cannot take
 /// the whole connection cap with handshakes it never finishes.
 pub const DEFAULT_MAX_CONNECTIONS_PER_ADDRESS: usize = 16;
 pub const DEFAULT_MAX_FEEDER_BYTES_PER_SEC: u64 = 262_144;
-/// What one sharing member may send a second, by default: a whole-world MLAT relay's clock
-/// models, final positions and provisional positions (about 1.2, 1.0 and 2.0 MB/s, RFC-0171
-/// §3.8.1) with room to spare. A member's place is known from its handshake (`Hub::relay_trust`),
-/// so it is held to this, and every other connection that dialled in to the feeders' ceiling,
-/// whatever the key. An engine publishes nothing (an MLAT relay shares its positions through its
-/// groups), so it is held to the feeders' ceiling like any connection that only asks.
-pub const DEFAULT_MAX_MEMBER_BYTES_PER_SEC: u64 = 8 * 1024 * 1024;
+/// What the sharing members may send a second, all of them together, by default: 1 MiB, planned
+/// once as the 128 feeders it is worth (`budget::Plan::with_members`) and held by one pace they
+/// share (`ceiling::Pace`). Any one member may carry all of it (a relay may be another's parent in
+/// every stripe of every area it takes), so it is also each member's own ceiling. A whole-world
+/// MLAT relay sharing its products (clock models, final and provisional positions, about 4.2 MB/s
+/// together, RFC-0171 §3.8.1) raises it, with the memory to match. A member's place is known from
+/// its handshake (`Hub::relay_trust`), so it is held to this, and every other connection that
+/// dialled in to the feeders' ceiling, whatever the key. An engine publishes nothing (an MLAT relay
+/// shares its positions through its groups), so it is held to the feeders' ceiling like any
+/// connection that only asks.
+pub const DEFAULT_MAX_MEMBER_BYTES_PER_SEC: u64 = 1 << 20;
 /// The connection id of records the relay makes itself (its deduplicated stream). Connections
 /// are numbered from 1, so nothing is ever held back from a link as its own.
 pub const RELAY_ITSELF: u64 = 0;
@@ -175,40 +185,50 @@ pub struct Item {
 }
 
 /// Two generations of hashes: a hash is remembered for one to two windows, or until `most` newer
-/// hashes have retired its generation, whichever is sooner. The oldest are forgotten first.
+/// hashes have retired its generation, whichever is sooner. The oldest are forgotten first. The
+/// windows are read from the stamps of what it is shown (the ingest clock's, `ingest::Stamp`),
+/// never from a clock of its own (RFC-0181 invariant 2): the same stamped batches are new or not
+/// the same way however late a stage takes them.
 struct Seen {
-    window: Duration,
+    window_ms: u64,
     most: usize,
     current: HashSet<Hash>,
     previous: HashSet<Hash>,
-    rotated: Instant,
+    /// The stamp its current generation began at, once it has been shown one.
+    rotated_ms: Option<u64>,
 }
 
 impl Seen {
     fn new(window: Duration, most: usize) -> Self {
         Self {
-            window,
+            window_ms: u64::try_from(window.as_millis()).unwrap_or(u64::MAX),
             most: most.max(1),
             current: HashSet::new(),
             previous: HashSet::new(),
-            rotated: Instant::now(),
+            rotated_ms: None,
         }
     }
 
-    fn rotate(&mut self) {
-        if self.rotated.elapsed() >= self.window {
-            self.retire();
+    /// Retires the current generation once `stamp_ms` is a window past its start.
+    fn rotate(&mut self, stamp_ms: u64) {
+        match self.rotated_ms {
+            None => self.rotated_ms = Some(stamp_ms),
+            Some(rotated) if stamp_ms.saturating_sub(rotated) >= self.window_ms => {
+                self.retire(stamp_ms);
+            }
+            Some(_) => {}
         }
     }
 
-    fn retire(&mut self) {
+    fn retire(&mut self, stamp_ms: u64) {
         self.previous = std::mem::take(&mut self.current);
-        self.rotated = Instant::now();
+        self.rotated_ms = Some(self.rotated_ms.map_or(stamp_ms, |at| at.max(stamp_ms)));
     }
 
     fn insert(&mut self, hash: Hash) {
         if self.current.len() >= self.most {
-            self.retire();
+            let at = self.rotated_ms.unwrap_or(0);
+            self.retire(at);
         }
         self.current.insert(hash);
     }
@@ -348,9 +368,10 @@ impl<A: std::hash::Hash + Eq + Clone> Forwarded<A> {
         }
     }
 
-    /// True, and remembered, when the record (`author`'s, under `boot`) is new.
-    fn admit(&mut self, hash: Hash, author: A, boot: u64, sequence: u64) -> bool {
-        self.seen.rotate();
+    /// True, and remembered, when the record (`author`'s, under `boot`, stamped `stamp_ms`) is
+    /// new.
+    fn admit(&mut self, hash: Hash, author: A, boot: u64, sequence: u64, stamp_ms: u64) -> bool {
+        self.seen.rotate(stamp_ms);
         if self.seen.contains(&hash) {
             return false;
         }
@@ -464,6 +485,8 @@ pub struct MemoryReport {
     pub delivery_held: usize,
     pub decoded_live: usize,
     pub decoded_live_bytes: usize,
+    /// Sharing members turned away for want of room in the members' pool.
+    pub members_refused: u64,
 }
 
 /// A batch a link took in, on its way to the ingest stage.
@@ -475,25 +498,49 @@ pub struct Inbound {
     pub verify: bool,
     /// Its stamp, when a trace gives one; else the ingest clock's when it is worked on.
     pub stamp: Option<Stamp>,
-    /// The connection's credit and the batch's charge, released when it is admitted and routed.
-    pub permit: Option<InFlight>,
+    /// Its charge in the ingest stage (`ingest::charge_of`), from its connection's allowance or,
+    /// handed in by the relay itself, from `Store::Ingest` (`Hub::in_flight_for`): no batch reaches
+    /// the stage uncharged. Shrunk to its decode, carried with its slices to the message exchange,
+    /// released when the epochs hold it or it is let go.
+    pub in_flight: InFlight,
     /// Where a refused signature ends the connection.
     pub refusal: Option<Arc<Refusal>>,
 }
 
 impl Inbound {
-    /// A batch with nothing to follow it: forwarded, from `source`.
-    pub fn trusted(source: u64, batch: Batch) -> Self {
+    /// A batch with nothing to follow it: forwarded, from `source`, charged `in_flight`.
+    pub fn trusted(source: u64, batch: Batch, in_flight: InFlight) -> Self {
         Self {
             source,
             batch,
             origin: Origin::Elsewhere,
             verify: false,
             stamp: None,
-            permit: None,
+            in_flight,
             refusal: None,
         }
     }
+}
+
+/// A receiver's description a link took in (or a trace hands in), on its way to the hub: kept if
+/// it is the newest for its key, and then handed to the hosted MLAT through the ingest stage, on the
+/// worker that owns its receiver's raw shard and stamped there as that receiver's batches are
+/// (`Hub::describe`), so where it falls among them is the trace's, never the threads'.
+pub struct Description {
+    pub source: u64,
+    pub info: ReceiverInfo,
+    pub receiver: PublicKey,
+    pub issued_ms: u64,
+    /// The location it declares, when this build can read it.
+    pub place: Option<Location>,
+    /// The receiver has just had a batch forwarded, so it is kept as one that publishes.
+    pub publishing: bool,
+    /// Its stamp, when a trace gives one; else the ingest clock's when it is worked on.
+    pub stamp: Option<Stamp>,
+    /// Its charge in the ingest stage, as a batch's: from its connection's allowance, or handed in
+    /// by the relay itself, from `Store::Ingest` (`Hub::in_flight_of`). Released once the hosted
+    /// MLAT holds it.
+    pub in_flight: InFlight,
 }
 
 /// One raw shard's receivers described (`exchange::raw_shard`), each with its cell, in the order
@@ -687,6 +734,13 @@ pub struct Hub {
     max_connections_per_address: usize,
     max_feeder_bytes_per_sec: u64,
     max_member_bytes_per_sec: u64,
+    /// The pace every member session shares (`ceiling::Pace`), at `max_member_bytes_per_sec`.
+    member_pace: Arc<crate::ceiling::Pace>,
+    /// The areas taken (RFC-0174 §2.1): what the member sessions are planned from
+    /// (`budget::members_for`).
+    areas: Vec<Region>,
+    /// Whether the relay holds MLAT raw: its plan's base and each feeder's cost (`Hub::memory`).
+    holds_raw: bool,
     /// The time the ingest ceilings read.
     ceiling_clock: crate::ceiling::Clock,
     accepted_relays: HashSet<PublicKey>,
@@ -695,6 +749,8 @@ pub struct Hub {
     egress: Arc<Egress>,
     /// RFC-0174's duties (`network`): the one place they meet the hub.
     network: Network,
+    /// Sharing members turned away because the members' pool was full (`Budget::reserve_member`).
+    members_refused: AtomicU64,
 }
 
 /// Held for as long as a subscriber (or a connection) is served; releases its place when dropped.
@@ -780,13 +836,18 @@ impl Hub {
     /// A hub whose stages run on the caller (`ingest::Stages::inline`), by the system clock, its
     /// budget `DEFAULT_MEMORY`: what a test builds. A relay is then `staged` onto its threads.
     pub fn new(max_subscribers: usize) -> Self {
-        Self::clocked(max_subscribers, Arc::new(crate::network::wall_ms))
+        Self::clocked(max_subscribers, crate::ingest::anchored_wall_clock())
     }
 
     /// As `new`, its ingest clock `clock`.
     pub fn clocked(max_subscribers: usize, clock: Clock) -> Self {
         let network = Network::new();
-        let budget = Budget::of_memory(DEFAULT_MEMORY, Plan::planned(false));
+        let budget = Budget::of_memory(
+            DEFAULT_MEMORY,
+            Plan::planned(false)
+                .with_members(0, DEFAULT_MAX_MEMBER_BYTES_PER_SEC)
+                .with_connections(DEFAULT_MAX_CONNECTIONS),
+        );
         network.charge_to(&budget);
         let stages = Stages::inline(
             Arc::clone(&clock),
@@ -823,6 +884,9 @@ impl Hub {
             max_connections_per_address: DEFAULT_MAX_CONNECTIONS_PER_ADDRESS,
             max_feeder_bytes_per_sec: DEFAULT_MAX_FEEDER_BYTES_PER_SEC,
             max_member_bytes_per_sec: DEFAULT_MAX_MEMBER_BYTES_PER_SEC,
+            member_pace: Arc::new(crate::ceiling::Pace::new(DEFAULT_MAX_MEMBER_BYTES_PER_SEC)),
+            areas: Vec::new(),
+            holds_raw: false,
             ceiling_clock: crate::ceiling::system_clock(),
             accepted_relays: HashSet::new(),
             hints: Vec::new(),
@@ -830,6 +894,7 @@ impl Hub {
             // still served): a hub can never send without one.
             egress: Arc::new(Egress::new(Cap::NONE)),
             network,
+            members_refused: AtomicU64::new(0),
         }
     }
 
@@ -870,7 +935,7 @@ impl Hub {
     /// compare byte for byte by. Built before the hub is shared or staged.
     pub fn product_boots(mut self, boot_id: u64) -> Self {
         let clock = self.stages.clock();
-        let unused: Sink = Arc::new(|_| true);
+        let unused: Sink = Arc::new(|_| Ok(()));
         let gauges = Gauges::of(&self.budget);
         self.stages = Stages::inline(Arc::clone(&clock), unused, gauges.clone());
         self.network.products = Arc::new(crate::products::Products::with_boots(
@@ -883,14 +948,51 @@ impl Hub {
         self
     }
 
-    /// The relay may use `memory` bytes: the admission budget (`budget`), and every store's and
-    /// queue's share of it (each store's gauge, resized in place). `holds_raw`: the relay hosts
-    /// MLAT.
+    /// The relay may use `memory` bytes, and holds MLAT raw (`holds_raw`: it hosts MLAT) or not:
+    /// the admission budget (`budget`), sized from this hub's plan (`Hub::plan`), and every
+    /// store's and queue's share of it (each store's gauge, resized in place). Whatever order the
+    /// hub's caps are set in, the budget follows the last of them.
     pub fn memory(mut self, memory: usize, holds_raw: bool) -> Self {
-        self.budget.resize(memory, Plan::planned(holds_raw));
+        self.holds_raw = holds_raw;
+        self.budget.resize(memory, self.plan());
         self.fanout = Arc::new(router(&self.budget));
         self.network.charge_to(&self.budget);
         self
+    }
+
+    /// The least memory that admits `feeders` beside everything this hub plans before any
+    /// (`budget::Plan::before_feeders`), holding MLAT raw or not: a test's exact budget.
+    pub fn memory_for_feeders(self, feeders: usize, holds_raw: bool) -> Self {
+        let plan = Self { holds_raw, ..self };
+        let memory = Budget::memory_for(feeders, plan.plan());
+        plan.memory(memory, holds_raw)
+    }
+
+    /// What this hub plans to hold (`budget::Plan`): whether it holds MLAT raw, its members'
+    /// pool (the member sessions its areas bring, `budget::members_for`, sharing
+    /// `max_member_bytes_per_sec`) and its connections' buffers (`max_connections`), from its own
+    /// settings, so the budget and the caps it enforces cannot disagree.
+    pub fn plan(&self) -> Plan {
+        let members = crate::budget::members_for(&self.areas, self.holds_raw, self.max_connections);
+        Plan::planned(self.holds_raw)
+            .with_members(members, self.max_member_bytes_per_sec)
+            .with_connections(self.max_connections)
+    }
+
+    /// Takes `areas` (RFC-0174 §2.1): the areas its sharing and MLAT choose from
+    /// (`Selection::set_taken`) and its regional product gathers (`Products::set_taken`), and the
+    /// areas its member sessions are planned from, so the three cannot disagree.
+    pub fn taking(mut self, areas: Vec<Region>) -> Self {
+        self.network.selection.set_taken(areas.clone());
+        self.network.products.set_taken(areas.clone());
+        self.areas = areas;
+        self.replanned()
+    }
+
+    /// The budget resized for this hub's plan as it now stands, at the same memory.
+    fn replanned(self) -> Self {
+        let (memory, holds_raw) = (self.budget.memory(), self.holds_raw);
+        self.memory(memory, holds_raw)
     }
 
     /// Each subscriber's queue holds at most `bytes` (and `fanout::BEHIND_MS` of inbound), instead
@@ -916,12 +1018,54 @@ impl Hub {
             delivery_held: self.network.delivery.held_bytes(),
             decoded_live: decoded,
             decoded_live_bytes: decoded_bytes,
+            members_refused: self.members_refused.load(Ordering::Relaxed),
         }
     }
 
     /// The admission budget: a feeder is admitted only with its bytes reserved in every store.
     pub fn budget(&self) -> &Budget {
         &self.budget
+    }
+
+    /// A sharing member was turned away: the members' pool was full. Counted on `GET /memory`.
+    pub fn member_refused(&self) {
+        self.members_refused.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A connection's ingest allowance of `bytes` (`ingest::Allowance`), carved from
+    /// `Store::Ingest`: a feeder's (`ingest::FEEDER_ALLOWANCE`) or a member's, each within what it
+    /// reserved. `None` when the store has no room for it.
+    pub fn allowance(&self, bytes: usize) -> Option<crate::ingest::Allowance> {
+        crate::ingest::Allowance::carve(
+            &self.budget.gauge(Store::Ingest),
+            &self.budget.oversize(),
+            bytes,
+        )
+    }
+
+    /// A batch the relay itself hands in (a test's trace, a replay): charged to `Store::Ingest`
+    /// as a link's is (`ingest::charge_of`), the caller's thread waiting for room.
+    pub fn in_flight_for(&self, batch: &Batch) -> InFlight {
+        self.in_flight_of(crate::ingest::charge_of(batch))
+    }
+
+    /// `bytes` the relay itself hands the ingest stage (a batch's, a description's), charged to
+    /// `Store::Ingest`, the caller's thread waiting for room.
+    pub fn in_flight_of(&self, bytes: usize) -> InFlight {
+        InFlight::trusted(&self.budget.gauge(Store::Ingest), bytes)
+    }
+
+    /// A connection's Noise buffers (`ingest::BUFFERS_PER_CONNECTION`), carved for as long as it
+    /// is open, waiting for room: a feeder's from `Store::Buffers`, which its reservation planned,
+    /// every other connection's from the room the plan sizes to the connection cap
+    /// (`budget::Plan::connection_buffers`).
+    pub async fn connection_buffers(&self, feeder: bool) -> crate::budget::Charge {
+        let gauge = if feeder {
+            self.budget.gauge(Store::Buffers)
+        } else {
+            self.budget.connection_buffers()
+        };
+        gauge.charge(crate::ingest::BUFFERS_PER_CONNECTION).await
     }
 
     /// RFC-0174's duties.
@@ -939,8 +1083,9 @@ impl Hub {
 
     /// Whether a record passed on by hash (`passed_on`) is new, remembering it if so.
     fn first_time(&self, hash: Hash) -> bool {
+        let now_ms = self.now_ms();
         self.passed_on.lock().is_ok_and(|mut seen| {
-            seen.rotate();
+            seen.rotate(now_ms);
             if seen.contains(&hash) {
                 return false;
             }
@@ -1059,7 +1204,8 @@ impl Hub {
     /// Connections served at once before a new one is closed unanswered.
     pub fn max_connections(mut self, max_connections: usize) -> Self {
         self.max_connections = max_connections;
-        self
+        // The connections' buffers are planned in the budget: resized with the cap.
+        self.replanned()
     }
 
     /// Connections from one source (`source_of`) served at once before a new one from it is
@@ -1076,10 +1222,18 @@ impl Hub {
         self
     }
 
-    /// The most bytes a second one sharing member's connection may send, beyond its burst.
+    /// The most bytes a second the sharing members may send, all together (their shared pace)
+    /// and each alone (its ceiling), beyond the burst. Planned once as the feeders this rate is
+    /// worth: the budget is resized with it.
     pub fn max_member_bytes_per_sec(mut self, rate: u64) -> Self {
         self.max_member_bytes_per_sec = rate;
-        self
+        self.member_pace = Arc::new(crate::ceiling::Pace::new(rate));
+        self.replanned()
+    }
+
+    /// The pace every member session shares.
+    pub fn member_pace(&self) -> Arc<crate::ceiling::Pace> {
+        Arc::clone(&self.member_pace)
     }
 
     pub fn hints(&self) -> &[RelayAddress] {
@@ -1118,6 +1272,13 @@ impl Hub {
 
     pub fn ceiling_clock(&self) -> crate::ceiling::Clock {
         std::sync::Arc::clone(&self.ceiling_clock)
+    }
+
+    /// A place under the connection cap for a session this relay dials itself (a member link, a
+    /// one-hop raw link, an upstream): every session in or out holds one, so the connections the
+    /// budget plans buffers and member sessions for (`budget::members_for`) are all of them.
+    pub fn dialled(&self) -> Option<Slot> {
+        Slot::take(&self.connections, self.max_connections)
     }
 
     /// A place for one more connection from `address`, or `None` when the relay, or that
@@ -1164,10 +1325,31 @@ impl Hub {
         }
         let worker = self.stages.worker_of(raw_shard(&receiver));
         let hub = Arc::clone(self);
-        self.stages.run_on(
+        let Inbound {
+            source,
+            batch,
+            origin,
+            verify,
+            stamp,
+            in_flight,
+            refusal,
+        } = inbound;
+        self.stages.run_charged(
             worker,
-            Box::new(move |producer| {
-                hub.admit(producer, inbound);
+            in_flight,
+            Box::new(move |producer, in_flight| {
+                hub.admit(
+                    producer,
+                    Inbound {
+                        source,
+                        batch,
+                        origin,
+                        verify,
+                        stamp,
+                        in_flight,
+                        refusal,
+                    },
+                );
             }),
         );
         true
@@ -1179,7 +1361,8 @@ impl Hub {
         if batch.receiver().ok() != Some(receiver) {
             return false;
         }
-        self.ingest(Inbound::trusted(source, batch))
+        let in_flight = self.in_flight_for(&batch);
+        self.ingest(Inbound::trusted(source, batch, in_flight))
     }
 
     /// One batch on ingest worker `producer` (`ingest`): its signature, its admission by its raw
@@ -1192,11 +1375,9 @@ impl Hub {
             origin,
             verify,
             stamp,
-            permit,
+            mut in_flight,
             refusal,
         } = inbound;
-        // Released when this batch is done, whatever happens to it.
-        let _permit = permit;
         let Ok(receiver) = batch.receiver() else {
             return false;
         };
@@ -1215,9 +1396,13 @@ impl Hub {
         self.stages.pause(Stage::Ingest);
         let shard = &self.raw[usize::from(raw_shard(&receiver).0)];
         let new = shard.lock().is_ok_and(|mut shard| {
-            shard
-                .batches
-                .admit(batch.hash(), receiver, batch.boot_id(), batch.sequence())
+            shard.batches.admit(
+                batch.hash(),
+                receiver,
+                batch.boot_id(),
+                batch.sequence(),
+                stamp.stamp_ms,
+            )
         });
         if !new {
             // Not forwarded again, but a member that sent it still sent it (sharing's receipts).
@@ -1252,23 +1437,31 @@ impl Hub {
         if described.is_none()
             && let Origin::Feeder(Some(own)) = &origin
         {
-            self.publish_info(
+            // On the worker that owns the receiver, stamped with its batch: offered to the hosted
+            // MLAT here, before the batch, as a description of a receiver is offered.
+            if self.keep_info(
                 source,
                 own.info.clone(),
                 receiver,
                 own.issued_ms,
                 own.place,
                 true,
-            );
+            ) && let Some(mlat) = self.network.mlat()
+            {
+                mlat.offer_description(&own.info, stamp.stamp_ms);
+            }
             described = self.publishing(&receiver);
         }
         let cell = described.flatten();
         if let Some(decoded) = &decoded {
+            // Charged for what the decode holds, no more, until the epochs hold it.
+            in_flight.shrink_to(decoded.footprint());
             let area = self.network.products.area_for(&receiver);
-            self.stages.message().route(producer, decoded, area);
+            self.stages
+                .message()
+                .route(producer, decoded, area, in_flight);
         }
-        self.network
-            .on_batch(&batch, decoded.as_ref(), stamp.stamp_ms);
+        self.network.on_batch(decoded.as_ref(), stamp.stamp_ms);
         let record = Record::Batch(batch);
         self.share(&origin, &record, stamp.stamp_ms);
         self.fanout.publish(Item {
@@ -1390,9 +1583,10 @@ impl Hub {
         shard.held.get(receiver).copied()
     }
 
-    /// Keeps a verified receiver description if it is the newest for its key, and forwards it.
-    /// `place` is the location it declares, when this build can read it. `publishing` says the
-    /// receiver has just had a batch forwarded, so the description is kept as one that is.
+    /// Keeps a verified receiver description if it is the newest for its key, and forwards it,
+    /// as `describe` does, charged from `Store::Ingest` (the relay's own, a test's). `place` is the
+    /// location it declares, when this build can read it. `publishing` says the receiver has just
+    /// had a batch forwarded, so the description is kept as one that is.
     pub fn publish_info(
         &self,
         source: u64,
@@ -1402,18 +1596,78 @@ impl Hub {
         place: Option<Location>,
         publishing: bool,
     ) {
-        let Ok(mut directory) = self.directory.lock() else {
+        let in_flight = self.in_flight_of(info.as_bytes().len());
+        self.describe(Description {
+            source,
+            info,
+            receiver,
+            issued_ms,
+            place,
+            publishing,
+            stamp: None,
+            in_flight,
+        });
+    }
+
+    /// Keeps a verified receiver description if it is the newest for its key and forwards it;
+    /// kept, it is offered to the hosted MLAT through the ingest stage: on the worker that owns
+    /// its receiver's raw shard, after the batches of that receiver handed in before it, stamped
+    /// there as they are (by the trace's stamp, or the ingest clock), so the step it takes effect
+    /// at is the trace's (`MlatHost::offer_description`). Its charge is let go once the host holds
+    /// it.
+    pub fn describe(&self, description: Description) {
+        let Description {
+            source,
+            info,
+            receiver,
+            issued_ms,
+            place,
+            publishing,
+            stamp,
+            in_flight,
+        } = description;
+        let offered = info.clone();
+        if !self.keep_info(source, info, receiver, issued_ms, place, publishing) {
             return;
+        }
+        let Some(mlat) = self.network.mlat().cloned() else {
+            return;
+        };
+        let worker = self.stages.worker_of(raw_shard(&receiver));
+        self.stages.run_stamped(
+            worker,
+            in_flight,
+            stamp,
+            Box::new(move |stamp, in_flight| {
+                mlat.offer_description(&offered, stamp.stamp_ms);
+                drop(in_flight);
+            }),
+        );
+    }
+
+    /// Keeps a verified receiver description if it is the newest for its key, and forwards it.
+    /// Whether it was kept.
+    fn keep_info(
+        &self,
+        source: u64,
+        info: ReceiverInfo,
+        receiver: PublicKey,
+        issued_ms: u64,
+        place: Option<Location>,
+        publishing: bool,
+    ) -> bool {
+        let Ok(mut directory) = self.directory.lock() else {
+            return false;
         };
         let newer = directory
             .known
             .get(&receiver)
             .is_none_or(|known| issued_ms > known.issued_ms);
         if !newer {
-            return;
+            return false;
         }
         let Ok(mut shard) = self.receivers.shard(&receiver).lock() else {
-            return;
+            return false;
         };
         // Projected once, here; every region test after is integer work.
         let cell = place.and_then(|place| Region::point(&place).ok());
@@ -1474,17 +1728,20 @@ impl Hub {
             decoded: None,
             stamp_ms: self.now_ms(),
         });
+        true
     }
 
     /// Forwards verified positions by `engine` if they are new (see `Forwarded`). True when they
     /// were.
     pub fn publish_positions(&self, source: u64, positions: Positions, engine: PublicKey) -> bool {
+        let now_ms = self.now_ms();
         let new = self.positions.lock().is_ok_and(|mut forwarded| {
             forwarded.admit(
                 positions.hash(),
                 engine,
                 positions.boot_id(),
                 positions.sequence(),
+                now_ms,
             )
         });
         if new {
@@ -1565,12 +1822,14 @@ impl Hub {
         positions: Positions,
         engine: PublicKey,
     ) -> bool {
+        let now_ms = self.now_ms();
         let new = self.provisional.lock().is_ok_and(|mut forwarded| {
             forwarded.admit(
                 positions.hash(),
                 engine,
                 positions.boot_id(),
                 positions.sequence(),
+                now_ms,
             )
         });
         if new {
@@ -1585,8 +1844,15 @@ impl Hub {
     /// out first, in index order, each from the connection it came from (`parts`). True when it
     /// was new.
     pub fn publish_clock_model(&self, source: u64, model: ClockModel, engine: PublicKey) -> bool {
+        let now_ms = self.now_ms();
         let new = self.clock_models.lock().is_ok_and(|mut forwarded| {
-            forwarded.admit(model.id(), engine, model.boot_id(), model.sequence())
+            forwarded.admit(
+                model.id(),
+                engine,
+                model.boot_id(),
+                model.sequence(),
+                now_ms,
+            )
         });
         if new {
             // A manifest this build cannot read lists nothing: its parts are never forwarded.
@@ -1657,8 +1923,9 @@ impl Hub {
 
     /// Forwards a checked fault proof if its hash is new. True when it was.
     pub fn publish_fault_proof(&self, source: u64, proof: FaultProof) -> bool {
+        let now_ms = self.now_ms();
         let new = self.fault_proofs.lock().is_ok_and(|mut seen| {
-            seen.rotate();
+            seen.rotate(now_ms);
             let hash = proof.hash();
             let new = !seen.contains(&hash);
             if new {
@@ -1838,32 +2105,32 @@ mod tests {
     #[test]
     fn a_record_is_forwarded_once_and_never_far_behind_its_stream() {
         let mut forwarded = Forwarded::new(Duration::from_secs(60));
-        assert!(forwarded.admit([1; 32], "engine", 0, 100));
+        assert!(forwarded.admit([1; 32], "engine", 0, 100, 0));
         // The same hash again, by another path.
-        assert!(!forwarded.admit([1; 32], "engine", 0, 100));
+        assert!(!forwarded.admit([1; 32], "engine", 0, 100, 0));
         // Reordered a little: still forwarded.
-        assert!(forwarded.admit([2; 32], "engine", 0, 100 - REORDER_ALLOWANCE + 1));
+        assert!(forwarded.admit([2; 32], "engine", 0, 100 - REORDER_ALLOWANCE + 1, 0));
         // Older than the allowance, with a hash never seen: a replay, dropped.
-        assert!(!forwarded.admit([3; 32], "engine", 0, 100 - REORDER_ALLOWANCE));
+        assert!(!forwarded.admit([3; 32], "engine", 0, 100 - REORDER_ALLOWANCE, 0));
         // Another stream has its own sequence.
-        assert!(forwarded.admit([3; 32], "other", 0, 0));
+        assert!(forwarded.admit([3; 32], "other", 0, 0, 0));
     }
 
     #[test]
     fn a_replay_inside_the_reorder_allowance_is_dropped_after_its_hash_is_forgotten() {
         let mut forwarded = Forwarded::new(Duration::ZERO);
-        assert!(forwarded.admit([1; 32], "receiver", 0, 10));
-        assert!(forwarded.admit([2; 32], "receiver", 0, 12));
+        assert!(forwarded.admit([1; 32], "receiver", 0, 10, 0));
+        assert!(forwarded.admit([2; 32], "receiver", 0, 12, 0));
         // Reordered, never forwarded: still taken.
-        assert!(forwarded.admit([3; 32], "receiver", 0, 11));
-        assert!(forwarded.admit([4; 32], "receiver", 0, 13));
+        assert!(forwarded.admit([3; 32], "receiver", 0, 11, 0));
+        assert!(forwarded.admit([4; 32], "receiver", 0, 13, 0));
         assert!(!forwarded.seen.contains(&[1; 32]));
         // Its hash forgotten and only three sequences behind, it was still forwarded once.
-        assert!(!forwarded.admit([1; 32], "receiver", 0, 10));
+        assert!(!forwarded.admit([1; 32], "receiver", 0, 10, 0));
         // Far ahead, the window starts again and the newest is taken once.
-        assert!(forwarded.admit([5; 32], "receiver", 0, 1_000));
-        assert!(!forwarded.admit([6; 32], "receiver", 0, 1_000));
-        assert!(forwarded.admit([7; 32], "receiver", 0, 1_000 - REORDER_ALLOWANCE + 1));
+        assert!(forwarded.admit([5; 32], "receiver", 0, 1_000, 0));
+        assert!(!forwarded.admit([6; 32], "receiver", 0, 1_000, 0));
+        assert!(forwarded.admit([7; 32], "receiver", 0, 1_000 - REORDER_ALLOWANCE + 1, 0));
     }
 
     fn signed_info(identity: &Identity) -> Result<ReceiverInfo, String> {
@@ -2047,15 +2314,57 @@ mod tests {
         Ok(())
     }
 
+    /// RFC-0181 invariant 2: the hashes' windows turn on the stamps they are shown, never on a
+    /// clock of their own.
+    #[test]
+    fn the_hash_window_turns_on_stamps() {
+        let mut seen = Seen::new(Duration::from_secs(1), 100);
+        seen.rotate(10_000);
+        seen.insert([1; 32]);
+        seen.rotate(10_999);
+        assert!(seen.contains(&[1; 32]));
+        // A window on: kept a generation more, then forgotten.
+        seen.rotate(11_000);
+        assert!(seen.contains(&[1; 32]));
+        seen.rotate(12_000);
+        assert!(!seen.contains(&[1; 32]));
+    }
+
+    /// RFC-0181 §9: a batch handed in is charged to `Store::Ingest` until the epochs hold it.
+    #[test]
+    fn a_batch_is_charged_until_the_epochs_hold_it() -> Result<(), String> {
+        let hub = Arc::new(Hub::new(8));
+        let (receiver, receiver_key) = key()?;
+        let ingest = hub.budget().gauge(Store::Ingest);
+        let epochs = hub.budget().gauge(Store::Epochs);
+        assert!(hub.publish_batch(
+            1,
+            signed_batch(
+                &receiver,
+                0,
+                vec![Observation {
+                    format: b'2',
+                    timestamp: 1,
+                    signal: 0,
+                    data: vec![0x5d; 7],
+                }]
+            )?,
+            receiver_key
+        ));
+        assert_eq!(ingest.held(), 0);
+        assert!(epochs.held() > 0);
+        Ok(())
+    }
+
     #[test]
     fn a_replay_is_dropped_after_its_hash_is_forgotten() {
         let mut forwarded = Forwarded::new(Duration::ZERO);
-        assert!(forwarded.admit([1; 32], "engine", 0, 0));
-        assert!(forwarded.admit([2; 32], "engine", 0, 200));
-        assert!(forwarded.admit([4; 32], "engine", 0, 201));
+        assert!(forwarded.admit([1; 32], "engine", 0, 0, 0));
+        assert!(forwarded.admit([2; 32], "engine", 0, 200, 0));
+        assert!(forwarded.admit([4; 32], "engine", 0, 201, 0));
         // Two rotations later the first hash is gone, and only its sequence refuses it.
         assert!(!forwarded.seen.contains(&[1; 32]));
-        assert!(!forwarded.admit([1; 32], "engine", 0, 0));
+        assert!(!forwarded.admit([1; 32], "engine", 0, 0, 0));
     }
 
     #[test]
@@ -2110,13 +2419,13 @@ mod tests {
         };
         // Every stream held has published more than once.
         for stream in 0..STREAMS {
-            assert!(forwarded.admit(next(), stream, 0, 0));
-            assert!(forwarded.admit(next(), stream, 0, 1));
+            assert!(forwarded.admit(next(), stream, 0, 0, 0));
+            assert!(forwarded.admit(next(), stream, 0, 1, 0));
         }
         // A new boot's first batch is remembered, so a replay of it is refused by sequence.
-        assert!(forwarded.admit(next(), STREAMS, 0, 5));
+        assert!(forwarded.admit(next(), STREAMS, 0, 5, 0));
         assert!(forwarded.newest.get(&STREAMS).is_some());
-        assert!(!forwarded.admit(next(), STREAMS, 0, 5));
+        assert!(!forwarded.admit(next(), STREAMS, 0, 5, 0));
         assert!(forwarded.newest.len() <= STREAMS);
     }
 
@@ -2132,22 +2441,22 @@ mod tests {
             hash
         };
         // An established stream: it has published twice.
-        assert!(forwarded.admit(next(), "honest", 0, 0));
-        assert!(forwarded.admit(next(), "honest", 0, 1));
+        assert!(forwarded.admit(next(), "honest", 0, 0, 0));
+        assert!(forwarded.admit(next(), "honest", 0, 1, 0));
         // Strangers churning keys, each its own new author, many times the table's size; the
         // honest stream publishing only now and then.
         let strangers: Vec<String> = (0..20 * STREAMS).map(|n| format!("stranger {n}")).collect();
         for (n, stranger) in strangers.iter().enumerate() {
-            assert!(forwarded.admit(next(), stranger.as_str(), 0, 0));
+            assert!(forwarded.admit(next(), stranger.as_str(), 0, 0, 0));
             // Publishing once per half a table's worth of new authors.
             if n % (STREAMS / 2) == 0 {
                 let sequence = 2 + (n / (STREAMS / 2)) as u64;
-                assert!(forwarded.admit(next(), "honest", 0, sequence));
+                assert!(forwarded.admit(next(), "honest", 0, sequence, 0));
             }
         }
         assert!(forwarded.newest.len() <= STREAMS);
         // Still remembered: a replay of an old sequence, under a hash never seen, is refused.
-        assert!(!forwarded.admit(next(), "honest", 0, 1));
+        assert!(!forwarded.admit(next(), "honest", 0, 1, 0));
     }
 
     /// RFC-0181 §9 against a churn of boots (the audit's 2.2): one author churning boot ids, each a
@@ -2166,23 +2475,23 @@ mod tests {
             hash
         };
         for honest in 0..AUTHORS - 1 {
-            assert!(forwarded.admit(next(), honest, 0, 0));
-            assert!(forwarded.admit(next(), honest, 0, 1));
+            assert!(forwarded.admit(next(), honest, 0, 0, 0));
+            assert!(forwarded.admit(next(), honest, 0, 1, 0));
         }
         // The churning author starts after them, so it is the most recently active throughout.
         for boot in 0..10_000u64 {
-            assert!(forwarded.admit(next(), AUTHORS, boot, 0));
+            assert!(forwarded.admit(next(), AUTHORS, boot, 0, 0));
         }
         assert!(forwarded.streams() <= AUTHORS - 1 + BOOTS_PER_AUTHOR);
         for honest in 0..AUTHORS - 1 {
             // Still remembered: a replay under a hash never seen is refused by its sequence.
             assert!(
-                !forwarded.admit(next(), honest, 0, 1),
+                !forwarded.admit(next(), honest, 0, 1, 0),
                 "author {honest} forgotten"
             );
         }
         // Its own oldest boots are what it forgot: an old boot starts afresh.
-        assert!(forwarded.admit(next(), AUTHORS, 0, 0));
+        assert!(forwarded.admit(next(), AUTHORS, 0, 0, 0));
     }
 
     fn signed_positions(

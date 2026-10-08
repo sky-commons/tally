@@ -16,6 +16,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use tally_wire::batch::Hash;
 use tally_wire::{Decoded, ObsRef, PublicKey, Region};
 
 use crate::budget::Charge;
@@ -44,16 +45,24 @@ pub fn epoch_of_ms(stamp_ms: u64) -> Epoch {
 }
 
 /// The canonical order of batches: by stamp, then by the batch itself (its receiver, boot and
-/// sequence, which admission makes unique). Never by the ingest order (`Stamp::ingest_seq`), which
-/// is the order the workers happened to take batches in: two batches stamped in one millisecond on
-/// two workers are ordered the same however the workers raced, so which copy of a message is kept
-/// (and so the stream's and the regional product's bytes) follows the stamps and the batches alone.
-pub fn canonical(decoded: &Decoded) -> (u64, PublicKey, u64, u64) {
+/// sequence), and last by its hash. Never by the ingest order (`Stamp::ingest_seq`), which is the
+/// order the workers happened to take batches in: two batches stamped in one millisecond on two
+/// workers are ordered the same however the workers raced, so which copy of a message is kept (and
+/// so the stream's and the regional product's bytes) follows the stamps and the batches alone.
+///
+/// The hash is what makes the order total. Admission keeps receiver, boot and sequence unique only
+/// while it remembers the boot (`hub::BOOTS_PER_AUTHOR`); once it forgets an old one, a second, different
+/// batch under the same three can be admitted in the same millisecond, and only the hash (which
+/// admission already holds, `Batch::hash` computed once) orders the two without the insertion order.
+/// It is the key's last field, so it orders only batches whose other fields are equal: any two
+/// batches it did not tie before keep the order they had.
+pub fn canonical(decoded: &Decoded) -> (u64, PublicKey, u64, u64, Hash) {
     (
         decoded.stamp_ms(),
         decoded.receiver(),
         decoded.boot_id(),
         decoded.sequence(),
+        decoded.batch().hash(),
     )
 }
 
@@ -108,7 +117,7 @@ impl Kept {
     }
 
     /// The canonical order: by batch ([`canonical`]), then index in the batch.
-    fn key(&self) -> ((u64, PublicKey, u64, u64), u32) {
+    fn key(&self) -> ((u64, PublicKey, u64, u64, Hash), u32) {
         (canonical(&self.decoded), self.index)
     }
 }
@@ -377,6 +386,104 @@ mod tests {
         let ready = coordinator.take(part(6, 1, 0));
         assert_eq!(ready.parts_lost, 0);
         assert_eq!(epochs(ready), vec![(5, false), (6, false)]);
+    }
+
+    fn decoded(
+        receiver: &tally_wire::Identity,
+        stamp_ms: u64,
+        sequence: u64,
+        signal: u8,
+    ) -> Result<Arc<Decoded>, String> {
+        let content = tally_wire::BatchContent {
+            boot_id: 1,
+            sequence,
+            counter_epoch: 0,
+            wall_ms: 0,
+            dropped: 0,
+            previous: [0; 32],
+            observations: vec![tally_wire::Observation {
+                format: tally_wire::batch::format::MODE_S_SHORT,
+                timestamp: 7,
+                signal,
+                data: vec![0x5d, 1, 2, 3, 4, 5, 6],
+            }],
+        };
+        let batch = tally_wire::Batch::sign(receiver, &content).map_err(|e| e.to_string())?;
+        Decoded::from_verified(batch, stamp_ms, 0).map_err(|e| e.error.to_string())
+    }
+
+    /// One thread's part of epoch 0 holding `batches`, each one reception kept.
+    fn holding(thread: usize, batches: Vec<Arc<Decoded>>) -> Frozen {
+        Frozen {
+            thread,
+            epoch: Some(0),
+            closed_before: 1,
+            stream: (0..batches.len() as u32).map(|at| (at, 0)).collect(),
+            batches,
+            ..Frozen::default()
+        }
+    }
+
+    fn order(merged: &Merged) -> Vec<Hash> {
+        merged
+            .stream
+            .iter()
+            .map(|kept| kept.decoded.batch().hash())
+            .collect()
+    }
+
+    /// Two different batches under one stamp, receiver, boot and sequence (admission forgot the
+    /// boot between them) merge in one order whichever thread's part came first: the hash decides,
+    /// never the insertion order. Batches whose other fields differ keep the order those fields
+    /// give, whichever way their hashes fall.
+    #[test]
+    fn the_canonical_order_is_total_and_the_hash_breaks_only_ties() -> Result<(), String> {
+        let receiver = tally_wire::Identity::from_seed([3; 32]);
+        let a = decoded(&receiver, 500, 4, 1)?;
+        let b = decoded(&receiver, 500, 4, 2)?;
+        assert_ne!(a.batch().hash(), b.batch().hash());
+        let one = merge(
+            0,
+            vec![
+                holding(0, vec![Arc::clone(&a)]),
+                holding(1, vec![Arc::clone(&b)]),
+            ],
+        );
+        let other = merge(
+            0,
+            vec![
+                holding(1, vec![Arc::clone(&b)]),
+                holding(0, vec![Arc::clone(&a)]),
+            ],
+        );
+        assert_eq!(order(&one), order(&other));
+        let mut tied = [a.batch().hash(), b.batch().hash()];
+        tied.sort();
+        assert_eq!(order(&one), tied);
+        // Earlier stamp, or lower sequence, first: whatever the hashes say.
+        for (first, second) in [
+            (
+                decoded(&receiver, 499, 9, 1)?,
+                decoded(&receiver, 500, 1, 1)?,
+            ),
+            (
+                decoded(&receiver, 500, 5, 1)?,
+                decoded(&receiver, 500, 6, 1)?,
+            ),
+            (
+                decoded(&receiver, 500, 6, 2)?,
+                decoded(&receiver, 500, 7, 2)?,
+            ),
+        ] {
+            let expected = vec![first.batch().hash(), second.batch().hash()];
+            for parts in [
+                vec![holding(0, vec![Arc::clone(&first), Arc::clone(&second)])],
+                vec![holding(0, vec![Arc::clone(&second), Arc::clone(&first)])],
+            ] {
+                assert_eq!(order(&merge(0, parts)), expected);
+            }
+        }
+        Ok(())
     }
 
     /// A part a thread refused (its epoch past the budget) refuses its epoch whole, whatever the

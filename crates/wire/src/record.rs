@@ -617,10 +617,29 @@ impl Record {
     /// Decodes one record from the front of `bytes`: `None` for a kind this build does not know
     /// and may skip.
     pub fn decode(bytes: &[u8]) -> Result<(Option<Record>, usize), WireError> {
+        Self::decode_knowing(bytes, Self::knows)
+    }
+
+    /// Whether this build reads `kind`: every kind it writes (`KINDS`), and the ones it knows
+    /// were retired (`RETIRED_KINDS`).
+    pub fn knows(kind: u8) -> bool {
+        KINDS.contains(&kind) || RETIRED_KINDS.contains(&kind)
+    }
+
+    /// As `decode`, as a reader that knows only the kinds `knows` admits (an older build, whose
+    /// kinds were a prefix of these): a kind it does not know is put to the one rule for unknown
+    /// kinds (§3.4), skipped unless critical. `decode` is this with `Record::knows`.
+    pub(crate) fn decode_knowing(
+        bytes: &[u8],
+        knows: impl Fn(u8) -> bool,
+    ) -> Result<(Option<Record>, usize), WireError> {
         let header = take(bytes, 0, HEADER_LEN)?;
         let kind = header[0];
         let length = usize::from(u16::from_be_bytes([header[1], header[2]]));
         let body = take(bytes, HEADER_LEN, length)?;
+        if !knows(kind) {
+            return Self::unknown(kind, length);
+        }
         let mut reader = Body::new(body);
         let record = match kind {
             KIND_HELLO => Self::Hello {
@@ -689,10 +708,18 @@ impl Record {
             KIND_BUNDLE_INDEX => Self::BundleIndex(BundleIndex::from_bytes(body.to_vec())?),
             KIND_WORLD_PRECISE => Self::WorldPrecise(WorldPrecise::from_bytes(body.to_vec())?),
             KIND_POSSESSION_QUERY | KIND_POSSESSION_ANSWER => Self::Retired(kind),
-            critical if critical & CRITICAL != 0 => return Err(WireError::UnknownCritical(kind)),
-            _ => return Ok((None, HEADER_LEN + length)),
+            _ => return Self::unknown(kind, length),
         };
         Ok((Some(record), HEADER_LEN + length))
+    }
+
+    /// The one rule for a kind a reader does not know (§3.4): skipped, its `length` bytes of body
+    /// unread, unless its critical bit says a reader that does not know it must stop.
+    fn unknown(kind: u8, length: usize) -> Result<(Option<Record>, usize), WireError> {
+        if kind & CRITICAL != 0 {
+            return Err(WireError::UnknownCritical(kind));
+        }
+        Ok((None, HEADER_LEN + length))
     }
 }
 
@@ -1153,17 +1180,10 @@ mod tests {
     /// first through `KIND_WORLD_PRECISE`, the possession check's 0x13 and 0x14 among them.
     const KINDS_BEFORE_TAGS: std::ops::RangeInclusive<u8> = KIND_HELLO..=KIND_WORLD_PRECISE;
 
-    /// What a build before the tagged check does with one record of a message: reads it when it
-    /// knows the kind, skips it when it does not and the kind is not critical (§3.4).
-    fn read_before_tags(record: &[u8]) -> Option<bool> {
-        let kind = record[0];
-        if KINDS_BEFORE_TAGS.contains(&kind) {
-            Some(true)
-        } else if kind & CRITICAL == 0 {
-            Some(false)
-        } else {
-            None
-        }
+    /// What a build before the tagged check does with one record: this build's decoder, knowing
+    /// only that build's kinds.
+    fn read_before_tags(record: &[u8]) -> Result<(Option<Record>, usize), WireError> {
+        Record::decode_knowing(record, |kind| KINDS_BEFORE_TAGS.contains(&kind))
     }
 
     #[test]
@@ -1214,11 +1234,22 @@ mod tests {
         for record in [query, answer] {
             let mut bytes = Vec::new();
             record.encode(&mut bytes)?;
-            // Unknown to it, and not critical: skipped, never read as the possession check.
-            assert_eq!(read_before_tags(&bytes), Some(false), "{record:?}");
+            // Unknown to it, and not critical: skipped whole, never read as the possession check.
+            assert_eq!(read_before_tags(&bytes)?, (None, bytes.len()), "{record:?}");
             assert!(!RETIRED_KINDS.contains(&bytes[0]));
             assert_eq!(Record::decode(&bytes)?.0, Some(record));
         }
+        // What it knew, it still reads, and an unknown critical kind still ends it.
+        let mut echo = Vec::new();
+        Record::Echo(Echo { nonce: 1 }).encode(&mut echo)?;
+        assert_eq!(
+            read_before_tags(&echo)?,
+            (Some(Record::Echo(Echo { nonce: 1 })), echo.len())
+        );
+        assert!(matches!(
+            read_before_tags(&[CRITICAL | KIND_DELIVERY_QUERY, 0, 0]),
+            Err(WireError::UnknownCritical(_))
+        ));
         Ok(())
     }
 

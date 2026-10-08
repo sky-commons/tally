@@ -44,6 +44,26 @@ use tokio::net::TcpListener;
 
 use crate::hub::Hub;
 
+/// Makes every panic, on any thread of the process (a stage's, a connection's task, the hosted
+/// engine's, a pool worker's), end it once it is reported, before anything unwinds: a part that
+/// stopped would hold its epochs open, its charges taken and its locks poisoned while the rest ran
+/// on as if it were whole, and nothing else would say so. The process's supervisor restarts it (the
+/// unit's `Restart=always`, the pod's restart policy). The relay's program sets it first thing
+/// (`main`), so every build of the binary (Cargo's, Bazel's) has it and no runtime that catches a
+/// task's panic (as tokio does) can keep the relay running without the part that panicked; it is
+/// the one mechanism (tests/panic.rs holds it to that). The library sets no hook of its own: its
+/// only other users are tests, where a panic is a test's failure to report, not a process to end.
+pub fn abort_on_any_panic() {
+    let report = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        report(info);
+        eprintln!(
+            "tally-relay: a thread panicked; ending the relay rather than running without it"
+        );
+        std::process::abort();
+    }));
+}
+
 /// Accepts connections on `listener` up to the hub's connection caps, the relay's and each source
 /// address's (beyond either, a connection is closed before its handshake), each counted and capped
 /// from its first byte (`egress::Socket`); and signs its own records (its products, the

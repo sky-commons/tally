@@ -515,9 +515,21 @@ fn summary(summary: &Summary) -> String {
         }
         // A batch's time is when it was made: a feeder's seal for raw, and for the deduplicated
         // stream the end of the epoch the relay signed it for (`tally_relay::deduplicated`).
-        for (name, histogram, since) in [
-            ("latency: raw", &client.raw_latency, "sealed"),
-            ("latency: deduplicated", &client.dedup_latency, "epoch end"),
+        // A provisional solution's time is its transmission's.
+        for (name, histogram, since, what) in [
+            ("latency: raw", &client.raw_latency, "sealed", "batches"),
+            (
+                "latency: deduplicated",
+                &client.dedup_latency,
+                "epoch end",
+                "batches",
+            ),
+            (
+                "latency: provisional",
+                &client.provisional_latency,
+                "transmitted",
+                "solutions",
+            ),
         ] {
             let histogram = histogram
                 .lock()
@@ -531,12 +543,31 @@ fn summary(summary: &Summary) -> String {
             row(
                 name,
                 format!(
-                    "p50 {} ms, p90 {} ms, p99 {} ms, p99.9 {} ms, max {} ms ({since} to read, {} batches)",
+                    "p50 {} ms, p90 {} ms, p99 {} ms, p99.9 {} ms, max {} ms ({since} to read, {} {what})",
                     at(0.5),
                     at(0.9),
                     at(0.99),
                     at(0.999),
                     histogram.max(),
+                    histogram.total()
+                ),
+            );
+        }
+        if config.streams.0 & tally_wire::Streams::PROVISIONAL.0 != 0 {
+            // RFC-0174 §2.4: a provisional position must reach the live world before its second
+            // is sealed, `WORLD_SETTLE_MS` after the second ends.
+            let settle = tally_relay::products::WORLD_SETTLE_MS;
+            let histogram = client
+                .provisional_latency
+                .lock()
+                .map(|each| each.clone())
+                .unwrap_or_default();
+            row(
+                "client: provisional",
+                format!(
+                    "{} of the {} solutions read more than {settle} ms after their transmission \
+                     (too late for the live world wherever its second ended first)",
+                    histogram.over(settle),
                     histogram.total()
                 ),
             );

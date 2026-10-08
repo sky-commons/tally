@@ -704,7 +704,7 @@ impl Scripted {
 impl MlatHost for Scripted {
     fn set_areas(&self, _: tally_wire::Regions, _: Vec<ReceiverInfo>) {}
 
-    fn offer_description(&self, _: &ReceiverInfo) {}
+    fn offer_description(&self, _: &ReceiverInfo, _: u64) {}
 
     fn offer_batch(&self, _: &Arc<tally_wire::Decoded>, _: u64) {}
 
@@ -1360,10 +1360,9 @@ async fn a_feeder_beyond_the_memory_budget_is_refused_at_its_hello() -> Result {
         key: Identity::generate().map_err(text)?.public(),
         address: "other.example:10900".to_owned(),
     };
-    let one = tally_relay::budget::PerFeeder::planned(false).total();
     let hub = Hub::new(8)
         .advertising(vec![hint.clone()])
-        .memory(tally_relay::budget::BASE_BYTES + one + one / 2, false);
+        .memory_for_feeders(1, false);
     assert_eq!(hub.budget().ceiling(), 1);
     let relay = relay(hub).await?;
     let mut first = connect(&relay, &Identity::generate().map_err(text)?, Role::Feeder).await?;

@@ -21,11 +21,33 @@ pub const BATCH_FORMAT: u8 = 1;
 /// The compressed layout (wire version 2, RFC-0174 §2.2): format 1's fields to `previous`, then
 /// `plain length u32` and the raw DEFLATE (RFC 1951) of what format 1 has after `previous`
 /// (`count u32 | observations`). Signed over the compressed bytes, so a relay forwards and
-/// deduplicates it without inflating it, and a reader inflates at most `MAX_PLAIN_LEN`.
+/// deduplicates it without inflating it, and a reader inflates at most `MAX_PLAIN_LEN` and at most
+/// `MAX_INFLATION` times its compressed stream ([`inflation_allowed`]).
 pub const BATCH_FORMAT_DEFLATE: u8 = 2;
 /// The most a compressed batch's observations may inflate to: far beyond any record's body, so
 /// no honest batch is refused, and bounded, so no batch is a decompression bomb.
 pub const MAX_PLAIN_LEN: usize = 1 << 20;
+/// The most a compressed batch's observations may inflate to, as a multiple of its compressed
+/// stream (the DEFLATE bytes after the stated length): a wire rule every reader applies before it
+/// inflates anything, and every writer keeps by writing a denser batch plain (format 1).
+///
+/// Why 8: the densest batch of honest 1090 MHz receptions the encoder makes is about 5 times
+/// (one aircraft's identical Mode-S short replies at a steady counter and a steady signal level,
+/// level 6 levelling off at 5.03 from a thousand receptions up; identical Mode A/C replies, 4.0;
+/// real extended squitters, 1.5). A receiver never hears two receptions at one counter value, so
+/// each reception carries at least its counter's changing bytes, and no honest 1090 MHz batch is
+/// denser. 8 clears that with room; a batch of mostly zero-filled UAT uplinks can be denser and is
+/// written plain, losing only its compression. What a relay does per byte it is sent is then at
+/// most 8 times what it is charged for the wire bytes, and it charges the inflated bytes and the
+/// receptions anyway (`Batch::inflated_len`, `Batch::receptions_at_most`).
+pub const MAX_INFLATION: usize = 8;
+
+/// The wire's one rule for a compressed batch (`MAX_INFLATION`, `MAX_PLAIN_LEN`): whether
+/// observations of `plain` bytes may be carried in a DEFLATE stream of `compressed` bytes. The
+/// encoder asks it before writing format 2 and every reader before inflating one.
+pub fn inflation_allowed(plain: usize, compressed: usize) -> bool {
+    plain <= MAX_PLAIN_LEN && plain <= MAX_INFLATION.saturating_mul(compressed)
+}
 /// DEFLATE's level 6: zlib's default, where its ratio levels off.
 const DEFLATE_LEVEL: u8 = 6;
 
@@ -36,7 +58,8 @@ pub enum Codec {
     Plain,
     /// Format 2: raw DEFLATE. Every peer reads it (wire version 2 is the minimum). Written as
     /// format 1 instead whenever compressing would not make the batch smaller, so a batch signed
-    /// with it is never larger than the plain one, and a size bound on the plain layout holds.
+    /// with it is never larger than the plain one, and a size bound on the plain layout holds; and
+    /// whenever it would inflate past `MAX_INFLATION` times its stream, so no reader refuses it.
     Deflate,
 }
 /// The receiver-info layout this build writes.
@@ -181,12 +204,29 @@ impl BatchDraft<'_> {
 /// A signed batch, as bytes. Immutable: forwarding never re-encodes it, and every holder shares
 /// the one allocation (`Bytes`), so a clone is a reference count, not a copy. The signer's key is
 /// decompressed once, when the batch is read (`from_bytes`) or signed, and kept: naming the
-/// receiver and checking the signature never decompress it again (RFC-0181 §2).
+/// receiver and checking the signature never decompress it again (RFC-0181 §2). Its hash is
+/// computed once, the first time anyone asks (admission does), and kept the same way.
 #[derive(Clone, Debug)]
 pub struct Batch {
     bytes: Bytes,
-    /// Shared, so a batch (and every record holding one) stays small.
-    signer: std::sync::Arc<ed25519_dalek::VerifyingKey>,
+    /// Shared with every clone, so a batch (and every record holding one) stays small.
+    kept: std::sync::Arc<Kept>,
+}
+
+/// What a batch keeps of its bytes once worked out: its signer's key, and its hash.
+#[derive(Debug)]
+struct Kept {
+    signer: ed25519_dalek::VerifyingKey,
+    hash: std::sync::OnceLock<Hash>,
+}
+
+impl Kept {
+    fn new(signer: ed25519_dalek::VerifyingKey) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            signer,
+            hash: std::sync::OnceLock::new(),
+        })
+    }
 }
 
 /// Two batches are the same batch when their signed bytes are: the kept key is read from them.
@@ -280,8 +320,10 @@ impl Batch {
                     return Err(WireError::Oversize(plain.len()));
                 }
                 let deflated = miniz_oxide::deflate::compress_to_vec(&plain, DEFLATE_LEVEL);
-                // The length field and the stream must come out smaller, or the batch is plain.
-                (4 + deflated.len() < plain.len()).then_some(deflated)
+                // The length field and the stream must come out smaller, and within the wire's
+                // inflation rule, or the batch is plain.
+                (4 + deflated.len() < plain.len() && inflation_allowed(plain.len(), deflated.len()))
+                    .then_some(deflated)
             }
         };
         let mut bytes = Vec::new();
@@ -309,7 +351,7 @@ impl Batch {
         bytes.extend_from_slice(&signature);
         Ok(Self {
             bytes: Bytes::from(bytes),
-            signer: std::sync::Arc::new(identity.point()),
+            kept: Kept::new(identity.point()),
         })
     }
 
@@ -323,8 +365,11 @@ impl Batch {
             });
         }
         // The one decompression of the signer's key, on the link task that read the batch.
-        let signer = std::sync::Arc::new(PublicKey::point_of(&bytes[1..1 + KEY_LEN])?);
-        Ok(Self { bytes, signer })
+        let signer = PublicKey::point_of(&bytes[1..1 + KEY_LEN])?;
+        Ok(Self {
+            bytes,
+            kept: Kept::new(signer),
+        })
     }
 
     pub fn as_bytes(&self) -> &[u8] {
@@ -343,7 +388,7 @@ impl Batch {
     /// The key that signed it, as kept: never decompressed again. A `Result` for its callers'
     /// sake; it cannot fail, the key was checked when the batch was read.
     pub fn receiver(&self) -> Result<PublicKey, WireError> {
-        Ok(PublicKey::of_point(&self.signer))
+        Ok(PublicKey::of_point(&self.kept.signer))
     }
 
     pub fn boot_id(&self) -> u64 {
@@ -354,9 +399,13 @@ impl Batch {
         u64_at(&self.bytes, 1 + KEY_LEN + 8)
     }
 
-    /// BLAKE2s over the whole signed batch: its identity for deduplication and the chain.
+    /// BLAKE2s over the whole signed batch: its identity for deduplication, the chain and the
+    /// last tiebreak of a relay's canonical order. Computed once and kept (`Kept`).
     pub fn hash(&self) -> Hash {
-        Blake2s256::digest(&self.bytes).into()
+        *self
+            .kept
+            .hash
+            .get_or_init(|| Blake2s256::digest(&self.bytes).into())
     }
 
     /// True when the receiver it names signed it as its own receptions.
@@ -371,7 +420,7 @@ impl Batch {
 
     fn verify_in(&self, label: &[u8]) -> Result<(), WireError> {
         let (signed, signature) = split_signature(&self.bytes)?;
-        PublicKey::verify_by(&self.signer, &domain(label, signed), &signature)
+        PublicKey::verify_by(&self.kept.signer, &domain(label, signed), &signature)
     }
 
     /// The content, for a format this build reads.
@@ -393,10 +442,29 @@ impl Batch {
         })
     }
 
-    /// The fixed fields, and the observations' plain bytes (`count u32 | observations`), for a
-    /// format this build reads: a slice of the signed bytes for format 1 (shared, not copied), and
-    /// for format 2 inflated once, to at most `MAX_PLAIN_LEN`.
-    pub(crate) fn header_and_plain(&self) -> Result<(Header, Bytes), WireError> {
+    /// The bytes this batch's observations take plain (`count u32 | observations`): what a reader
+    /// inflates a compressed batch to, read from its stated length and held to the wire's rule
+    /// (`inflation_allowed`) without inflating anything; a plain batch's own. What a relay charges
+    /// for a batch's work alongside its wire bytes, before it decodes it.
+    pub fn inflated_len(&self) -> Result<usize, WireError> {
+        let (_, layout) = self.layout()?;
+        Ok(match layout {
+            Layout::Plain(range) => range.len(),
+            Layout::Deflate { stated, .. } => stated,
+        })
+    }
+
+    /// The most receptions this batch can hold, from `inflated_len` alone: every reception takes
+    /// at least its fixed part, and a decode refuses a count past this. What a relay charges for
+    /// the receptions before it decodes the batch (a decode's exact count is
+    /// `Decoded::receptions`).
+    pub fn receptions_at_most(&self) -> Result<usize, WireError> {
+        Ok(self.inflated_len()?.saturating_sub(4) / crate::decoded::OBSERVATION_FIXED)
+    }
+
+    /// The fixed fields, and where the observations are, for a format this build reads: a
+    /// compressed batch's stated length already held to the wire's rule (`inflation_allowed`).
+    fn layout(&self) -> Result<(Header, Layout), WireError> {
         let format = self.format();
         if format != BATCH_FORMAT && format != BATCH_FORMAT_DEFLATE {
             return Err(WireError::Invalid {
@@ -416,19 +484,40 @@ impl Batch {
         };
         let fixed = 1 + KEY_LEN + reader.position();
         if format == BATCH_FORMAT {
-            return Ok((header, self.bytes.slice(fixed..signed.len())));
+            return Ok((header, Layout::Plain(fixed..signed.len())));
         }
-        let length = reader.u32()? as usize;
-        if length > MAX_PLAIN_LEN {
-            return Err(WireError::Oversize(length));
+        let stated = reader.u32()? as usize;
+        let stream = fixed + 4..signed.len();
+        if stated > MAX_PLAIN_LEN {
+            return Err(WireError::Oversize(stated));
         }
+        if !inflation_allowed(stated, stream.len()) {
+            return Err(WireError::Invalid {
+                field: "compressed batch inflation",
+                value: stated as u64,
+            });
+        }
+        Ok((header, Layout::Deflate { stated, stream }))
+    }
+
+    /// The fixed fields, and the observations' plain bytes (`count u32 | observations`), for a
+    /// format this build reads: a slice of the signed bytes for format 1 (shared, not copied), and
+    /// for format 2 inflated once, to its stated length and never past it, so at most
+    /// `MAX_INFLATION` times its stream and `MAX_PLAIN_LEN`.
+    pub(crate) fn header_and_plain(&self) -> Result<(Header, Bytes), WireError> {
+        let (header, layout) = self.layout()?;
+        let (stated, stream) = match layout {
+            Layout::Plain(range) => return Ok((header, self.bytes.slice(range))),
+            Layout::Deflate { stated, stream } => (stated, stream),
+        };
+        // Stops at `stated`: a stream that would inflate further is refused there.
         let inflated =
-            miniz_oxide::inflate::decompress_to_vec_with_limit(&signed[fixed + 4..], length)
+            miniz_oxide::inflate::decompress_to_vec_with_limit(&self.bytes[stream], stated)
                 .map_err(|_| WireError::Invalid {
                     field: "compressed batch",
-                    value: length as u64,
+                    value: stated as u64,
                 })?;
-        if inflated.len() != length {
+        if inflated.len() != stated {
             return Err(WireError::Invalid {
                 field: "compressed batch length",
                 value: inflated.len() as u64,
@@ -436,6 +525,17 @@ impl Batch {
         }
         Ok((header, Bytes::from(inflated)))
     }
+}
+
+/// Where a batch's observations are in its signed bytes.
+enum Layout {
+    /// Format 1: these bytes, as they are.
+    Plain(std::ops::Range<usize>),
+    /// Format 2: a DEFLATE stream in these bytes, stated to inflate to `stated`.
+    Deflate {
+        stated: usize,
+        stream: std::ops::Range<usize>,
+    },
 }
 
 /// A batch's fixed fields after its prefix, read without its observations.
@@ -752,6 +852,138 @@ mod tests {
         let signature = feeder.sign(&domain(BATCH_DOMAIN, &bytes));
         bytes.extend_from_slice(&signature);
         assert!(Batch::from_bytes(bytes)?.content().is_err());
+        Ok(())
+    }
+
+    /// A format 2 batch of whatever stream and stated length a hostile signer chooses.
+    fn signed_deflate(feeder: &Identity, stated: u32, stream: &[u8]) -> Result<Batch, WireError> {
+        let mut bytes = vec![BATCH_FORMAT_DEFLATE];
+        bytes.extend_from_slice(feeder.public().as_bytes());
+        bytes.extend_from_slice(&[0; BATCH_HEADER_LEN - 1 - KEY_LEN]);
+        bytes.extend_from_slice(&stated.to_be_bytes());
+        bytes.extend_from_slice(stream);
+        let signature = feeder.sign(&domain(BATCH_DOMAIN, &bytes));
+        bytes.extend_from_slice(&signature);
+        Batch::from_bytes(bytes)
+    }
+
+    /// `count` receptions of one shape, as the encoder lays them out plain.
+    fn plain_of(observations: &[Observation]) -> Result<Vec<u8>, WireError> {
+        let mut plain = (observations.len() as u32).to_be_bytes().to_vec();
+        for observation in observations {
+            ObsView::from(observation).encode(&mut plain)?;
+        }
+        Ok(plain)
+    }
+
+    fn receptions(count: u64, format: u8, step: u64, data: &[u8]) -> Vec<Observation> {
+        (0..count)
+            .map(|at| Observation {
+                format,
+                timestamp: 1_000_000 + at * step,
+                signal: 80,
+                data: data.to_vec(),
+            })
+            .collect()
+    }
+
+    /// The densest honest batches compress within the rule, so no honest compression is lost;
+    /// anything denser (zero-filled UAT uplinks, receptions an honest receiver cannot hear) is
+    /// written plain; and nothing the encoder writes is past the rule a reader applies.
+    #[test]
+    fn the_encoder_never_writes_a_batch_past_the_inflation_rule() -> Result<(), WireError> {
+        let feeder = Identity::generate()?;
+        let short = [0x5d, 0x4c, 0xa1, 0xb2, 0x11, 0x22, 0x33];
+        let honest = [
+            // One aircraft's identical all-call replies at a steady counter and signal: the
+            // densest honest 1090 MHz batch (`MAX_INFLATION`'s docs).
+            receptions(5_000, format::MODE_S_SHORT, 12_000, &short),
+            receptions(100, format::MODE_S_SHORT, 12_000, &short),
+            receptions(5_000, format::MODE_AC, 1_000, &[0x12, 0x34]),
+        ];
+        let denser = [
+            receptions(40, format::UAT_UPLINK, 31_000, &[0; 432]),
+            receptions(5_000, format::MODE_AC, 0, &[0x12, 0x34]),
+            receptions(3_000, format::MODE_S_LONG, 0, &[0; 14]),
+        ];
+        for (observations, compressed) in honest
+            .iter()
+            .map(|o| (o, true))
+            .chain(denser.iter().map(|o| (o, false)))
+        {
+            let content = BatchContent {
+                observations: observations.clone(),
+                ..content()?
+            };
+            let batch = Batch::sign_with(&feeder, &content, Codec::Deflate)?;
+            let shape = (observations.len(), observations[0].format, compressed);
+            let expected = if compressed {
+                BATCH_FORMAT_DEFLATE
+            } else {
+                BATCH_FORMAT
+            };
+            assert_eq!(batch.format(), expected, "{shape:?}");
+            assert_eq!(
+                batch.inflated_len()?,
+                plain_of(observations)?.len(),
+                "{shape:?}"
+            );
+            if batch.format() == BATCH_FORMAT_DEFLATE {
+                let stream = batch.as_bytes().len() - BATCH_HEADER_LEN - 4 - SIGNATURE_LEN;
+                assert!(
+                    inflation_allowed(batch.inflated_len()?, stream),
+                    "{shape:?}"
+                );
+            }
+            assert_eq!(batch.content()?, content, "{shape:?}");
+            assert!(
+                batch.receptions_at_most()? >= observations.len(),
+                "{shape:?}"
+            );
+        }
+        Ok(())
+    }
+
+    /// A batch that states, honestly, that it inflates past `MAX_INFLATION` times its stream (well
+    /// within `MAX_PLAIN_LEN`) is refused by its stated length, before anything is inflated: the
+    /// refusal is the rule's, not the inflater's. One that states a length within the rule and
+    /// inflates further is cut off at its stated length, never inflated whole.
+    #[test]
+    fn a_bomb_past_the_inflation_rule_is_refused_before_inflating() -> Result<(), WireError> {
+        let feeder = Identity::generate()?;
+        // 30,000 zeroed Mode-S long receptions: 720 KB, deflating to under a kilobyte.
+        let plain = plain_of(&receptions(30_000, format::MODE_S_LONG, 0, &[0; 14]))?;
+        let stream = miniz_oxide::deflate::compress_to_vec(&plain, DEFLATE_LEVEL);
+        assert!(plain.len() <= MAX_PLAIN_LEN && plain.len() > MAX_INFLATION * stream.len());
+        let refused = |result: Result<usize, WireError>| {
+            matches!(
+                result,
+                Err(WireError::Invalid {
+                    field: "compressed batch inflation",
+                    ..
+                })
+            )
+        };
+        let bomb = signed_deflate(&feeder, plain.len() as u32, &stream)?;
+        bomb.verify()?;
+        assert!(refused(bomb.inflated_len()));
+        assert!(refused(bomb.receptions_at_most()));
+        assert!(refused(
+            bomb.content().map(|content| content.observations.len())
+        ));
+        let decoded = crate::Decoded::from_verified(bomb, 0, 0).map(|decoded| decoded.receptions());
+        assert!(refused(decoded.map_err(|undecodable| undecodable.error)));
+        // Stated within the rule, inflating to far more: stopped at the stated length.
+        let stated = MAX_INFLATION * stream.len();
+        let liar = signed_deflate(&feeder, stated as u32, &stream)?;
+        assert_eq!(liar.inflated_len()?, stated);
+        assert!(matches!(
+            liar.content(),
+            Err(WireError::Invalid {
+                field: "compressed batch",
+                ..
+            })
+        ));
         Ok(())
     }
 
