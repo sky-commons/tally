@@ -55,7 +55,7 @@ receptions are dropped and counted, never buffered.
 
 ```sh
 tally-relay keygen > /etc/tally/relay.key
-tally-relay --key /etc/tally/relay.key --max-upload 8Mbit/s \
+tally-relay --key /etc/tally/relay.key --max-upload 6Mbit/s \
   --listen 0.0.0.0:10900 --beast-out 127.0.0.1:30105
 ```
 
@@ -130,14 +130,17 @@ is nearly over.
 (billed and loopback), the headroom left, each class's rate, demand, waiting sends and queued
 bytes, the peers dropped from each, and the feeders turned away.
 
-| Host                          | What the plan includes                | Beyond it        | A cap to start from                                                                          |
-| ----------------------------- | ------------------------------------- | ---------------- | -------------------------------------------------------------------------------------------- |
-| AWS Lightsail, $12 a month    | 3 TB out a month                      | $0.09 a GB       | `--max-upload 8Mbit/s` (at most 2.67 TB in 31 days)                                          |
-| Hetzner dedicated root server | a 1 Gbit uplink, unlimited traffic    | nothing          | `--max-upload 1Gbit/s` (the uplink itself)                                                   |
-| A home connection             | your ISP's monthly cap, if it has one | your ISP's terms | the ISP's cap divided by 2,678,400 (the seconds in 31 days), and less than your upload speed |
+| Host                          | What the plan includes                | Beyond it        | A cap to start from                                                                           |
+| ----------------------------- | ------------------------------------- | ---------------- | --------------------------------------------------------------------------------------------- |
+| AWS Lightsail, $12 a month    | 3 TB a month, in and out together     | $0.09 a GB out   | `--max-upload 6Mbit/s` (at most 2.01 TB out in 31 days, leaving about 1 TB for what comes in) |
+| Hetzner dedicated root server | a 1 Gbit uplink, unlimited traffic    | nothing          | `--max-upload 1Gbit/s` (the uplink itself)                                                    |
+| A home connection             | your ISP's monthly cap, if it has one | your ISP's terms | the ISP's cap divided by 2,678,400 (the seconds in 31 days), and less than your upload speed  |
 
 Sources: [Lightsail pricing](https://aws.amazon.com/lightsail/pricing/) ("$0.09 USD/GB" beyond a
-plan's allowance; the $12 plan includes 3 TB);
+plan's allowance; the $12 plan includes 3 TB) and the [Lightsail FAQ](https://aws.amazon.com/lightsail/faq/)
+("Both data transfer IN and data transfer OUT of your instance count toward your data transfer
+allowance"; only the excess out is billed), so what feeders send a relay uses the same allowance as
+what it sends;
 [Hetzner traffic](https://docs.hetzner.com/robot/general/traffic/) ("All root servers have a dedicated 1 GBit uplink by default and with it unlimited traffic").
 Prices change: read your own plan before you set the cap.
 
