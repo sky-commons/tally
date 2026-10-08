@@ -380,6 +380,17 @@ impl Decoded {
         &self.obs
     }
 
+    /// How many bytes its observations took inflated (`Batch::inflated_len`, now exact): with
+    /// `receptions`, what a relay charges for the batch's work, never its wire bytes alone.
+    pub fn inflated_len(&self) -> usize {
+        self.plain.len()
+    }
+
+    /// How many receptions it holds (at most `Batch::receptions_at_most`).
+    pub fn receptions(&self) -> usize {
+        self.obs.len()
+    }
+
     /// A reception's message bytes.
     pub fn data(&self, obs: &ObsRef) -> &[u8] {
         let start = obs.off as usize;
@@ -502,7 +513,11 @@ mod tests {
                 },
                 timestamp: u64::from(n) * 1_000 + 0xfff0_0000_0000,
                 signal: n,
-                data: vec![n; if n % 3 == 0 { 432 } else { 14 }],
+                // Varied, as real messages are: a batch denser than `MAX_INFLATION` is written
+                // plain whatever codec is asked for.
+                data: (0..if n % 3 == 0 { 432 } else { 14 })
+                    .map(|at: usize| (at as u8).wrapping_mul(31) ^ n)
+                    .collect(),
             })
             .collect()
     }
@@ -517,6 +532,14 @@ mod tests {
             let decoded = Decoded::from_verified_keyed(batch.clone(), &key, 11, 12)
                 .map_err(|undecodable| undecodable.error)?;
             assert_eq!(decoded.batch(), &batch);
+            let format = match codec {
+                Codec::Plain => crate::batch::BATCH_FORMAT,
+                Codec::Deflate => crate::batch::BATCH_FORMAT_DEFLATE,
+            };
+            assert_eq!(batch.format(), format);
+            assert_eq!(decoded.inflated_len(), batch.inflated_len()?);
+            assert_eq!(decoded.receptions(), content.observations.len());
+            assert!(decoded.receptions() <= batch.receptions_at_most()?);
             assert_eq!(decoded.receiver(), identity.public());
             assert_eq!(
                 (

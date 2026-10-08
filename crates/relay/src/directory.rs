@@ -18,15 +18,27 @@
 //!   networks displaces only itself. Past those, a group holds at most `OFFERS_PER_GROUP`
 //!   anywhere, a key at most `OFFERS_PER_KEY`, and the directory `OFFERS_HELD`: bounds on a flood,
 //!   which an honest network never reaches.
-//! - **Held by rank, never by arrival.** Within a cell, which offers are held is decided by the
-//!   wire's rendezvous ranking over (cell, key) (`rendezvous::rank`), never by which came first: a
-//!   newcomer to a full cell (or a full group within it) displaces the lowest-ranked offer there
-//!   only when it outranks it, and is refused otherwise. So the cell's held set is the top of the
-//!   ranking of the offers verified, the same set on every relay that verified the same offers, and
-//!   the sharing trees laid out over it (`sharing`) are the same trees everywhere. What it cannot
-//!   be is a reward for tenure: a party that grinds keys to rank high for a cell, from more
-//!   networks than a cell's group cap allows each, is held there, and it is the sharing duty
-//!   (receipts and demotion) that drops it once held.
+//! - **Held by rank, never by arrival.** Every cap (a group's share of a cell, the cell, a group
+//!   anywhere, a key, the directory) is kept by rank, never by which came first: a newcomer to a
+//!   full cap displaces the lowest-ranked offer under it only when it outranks it, and is refused
+//!   otherwise (`State::hold`). Within a cell the rank is the cell's ranking (`ranked`: tier, then
+//!   the wire's rendezvous ranking over (cell, key), `rendezvous::rank`). Across cells it is
+//!   `Standing`: the tier, then how deep the offer sits in its own cell's ranking, so the offer
+//!   given up is the one least likely to be chosen anywhere, and two offers in one cell stand as
+//!   their cell ranks them. So the held set is a function of the offers verified, the same set on
+//!   every relay that verified the same offers, and the sharing trees laid out over it
+//!   (`sharing`) are the same trees everywhere. What it cannot be is a reward for tenure: a party
+//!   that grinds keys to rank high for a cell, from more networks than a cell's group cap allows
+//!   each, is held there, and it is the sharing duty (receipts and demotion) that drops it once
+//!   held.
+//! - **A change costs its readers once per `CHANGED_AT_MOST_EVERY_MS`.** A held offer re-signed
+//!   saying something new takes effect at most that often per (key, cell): one sooner waits, the
+//!   newest kept, until its turn (`State::apply_deferred`). So a peer re-signing changed offers
+//!   in a loop costs the readers (the sharing trees, the MLAT choice) what an honest relay's
+//!   changes cost, however fast it signs.
+//! - **Checked once.** An offer's signature is verified and its content decoded when it arrives,
+//!   and what is held is that check (`Checked`): every reader gets it, so none verifies or decodes
+//!   a held offer again.
 //! - **No reflection.** Every offer is acted on once, by its hash: one that comes back round a
 //!   gossip loop is neither dialled nor gossiped again; the relay's own offers coming back are
 //!   ignored; and an offer is gossiped once, when it is first verified.
@@ -39,7 +51,7 @@
 //!   offers for every area of the world costs its readers nothing while nothing changes (the MLAT
 //!   choice in `selection`, the sharing trees in `sharing`).
 
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -128,6 +140,10 @@ pub const OWN_RESIGN_EVERY_MS: u64 = 60 * 1000;
 pub const OFFER_LIFETIME_MS: u64 = 3 * OWN_RESIGN_EVERY_MS;
 /// The soonest the relay re-signs its own offers again when what they declare changes.
 pub const OWN_RESIGN_AT_MOST_EVERY_MS: u64 = 10 * 1000;
+/// The soonest a peer's held offer for one cell takes a change again: what a relay's own changes
+/// are held to (`OWN_RESIGN_AT_MOST_EVERY_MS`), so an honest relay's changes are never deferred
+/// but by the clocks between them.
+pub const CHANGED_AT_MOST_EVERY_MS: u64 = OWN_RESIGN_AT_MOST_EVERY_MS;
 /// Offers in one answer to a query, at most: replies are written as control, 64 waiting a link.
 pub const QUERY_ANSWER_MAX: usize = 32;
 /// How long a dial may take to connect.
@@ -206,9 +222,17 @@ struct State {
     own_signed_ms: u64,
     /// Held offers by cell, then signer.
     cells: HashMap<u64, HashMap<PublicKey, Held>>,
-    per_key: HashMap<PublicKey, usize>,
-    per_group: HashMap<Group, usize>,
+    /// The cells each key's held offers are for, and the offers each group's are: what the per-key
+    /// and per-group caps count and contest.
+    per_key: HashMap<PublicKey, HashSet<u64>>,
+    per_group: HashMap<Group, HashSet<(u64, PublicKey)>>,
     held: usize,
+    /// Each cell's ranking of every offer held there (`ranked`), as last computed: dropped when the
+    /// cell's offers change, and all of them when the tiers may move (`State::clear_tiers`).
+    ranks: HashMap<u64, Vec<PublicKey>>,
+    /// Changes deferred (`CHANGED_AT_MOST_EVERY_MS`), by when they are due: (due, cell, key). The
+    /// change itself waits in its held offer (`Held::deferred`).
+    deferred: BTreeSet<(u64, u64, PublicKey)>,
     pending: VecDeque<Pending>,
     /// Addresses being dialled now.
     dialling: HashSet<String>,
@@ -259,6 +283,8 @@ impl Default for State {
             per_key: HashMap::new(),
             per_group: HashMap::new(),
             held: 0,
+            ranks: HashMap::new(),
+            deferred: BTreeSet::new(),
             pending: VecDeque::new(),
             dialling: HashSet::new(),
             verifying: 0,
@@ -284,12 +310,125 @@ impl Default for State {
 
 #[derive(Clone)]
 struct Held {
-    offer: ProviderOffer,
-    signer: PublicKey,
-    products: Streams,
+    offer: Checked,
     issued_ms: u64,
     expires_ms: u64,
     group: Group,
+    /// When what it says last changed here (by this relay's clock): a change sooner than
+    /// `CHANGED_AT_MOST_EVERY_MS` after waits.
+    changed_ms: u64,
+    /// The newest change of it that is waiting, with the group it answered from.
+    deferred: Option<(Checked, Group)>,
+}
+
+impl Held {
+    /// The newest signing held of it: its own, or the change waiting.
+    fn newest_ms(&self) -> u64 {
+        self.deferred
+            .as_ref()
+            .map_or(self.issued_ms, |(waiting, _)| {
+                waiting.content().issued_ms.max(self.issued_ms)
+            })
+    }
+
+    fn signer(&self) -> PublicKey {
+        self.offer.signer()
+    }
+
+    fn products(&self) -> Streams {
+        self.offer.content().products
+    }
+}
+
+/// An offer as the directory checked it on arrival: its signature verified, its signer and content
+/// read, once. What is held, and what every reader of the held offers is given, so none verifies or
+/// decodes a held offer again. Only the directory makes one. Cheap to clone.
+#[derive(Clone)]
+pub struct Checked(Arc<CheckedOffer>);
+
+struct CheckedOffer {
+    offer: ProviderOffer,
+    signer: PublicKey,
+    content: ProviderOfferContent,
+}
+
+impl Checked {
+    /// The offer as signed: what is gossiped and answered.
+    pub fn offer(&self) -> &ProviderOffer {
+        &self.0.offer
+    }
+
+    pub fn signer(&self) -> PublicKey {
+        self.0.signer
+    }
+
+    pub fn content(&self) -> &ProviderOfferContent {
+        &self.0.content
+    }
+}
+
+impl std::fmt::Debug for Checked {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.offer.fmt(formatter)
+    }
+}
+
+impl PartialEq for Checked {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.offer == other.0.offer
+    }
+}
+
+impl PartialEq<ProviderOffer> for Checked {
+    fn eq(&self, other: &ProviderOffer) -> bool {
+        self.0.offer == *other
+    }
+}
+
+/// Where a held offer stands against the others under a cap (`State::hold`), the lowest given up
+/// first: its key's tier, then how deep it sits in its own cell's ranking (`ranked`, the deeper
+/// the lower), then its cell and key, so two offers never stand alike. Restricted to one cell it
+/// is that cell's ranking, since the ranking puts every higher tier first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct Standing {
+    tier: u32,
+    depth: std::cmp::Reverse<usize>,
+    cell: u64,
+    key: PublicKey,
+}
+
+/// The caps an offer is held under, besides the relay's own (which count against none).
+#[derive(Clone, Copy, Debug)]
+enum Cap {
+    /// One network group's share of the cell.
+    GroupInCell,
+    Cell,
+    /// One network group, over every cell.
+    Group,
+    /// One key, over every cell.
+    Key,
+    /// The directory.
+    Held,
+}
+
+impl Cap {
+    const ALL: [Self; 5] = [
+        Self::GroupInCell,
+        Self::Cell,
+        Self::Group,
+        Self::Key,
+        Self::Held,
+    ];
+
+    fn limit(self) -> usize {
+        match self {
+            Self::GroupInCell => OFFERS_PER_GROUP_IN_CELL,
+            Self::Cell => OFFERS_PER_CELL,
+            Self::Group => OFFERS_PER_GROUP,
+            Self::Key => OFFERS_PER_KEY,
+            Self::Held => OFFERS_HELD,
+        }
+    }
 }
 
 /// `keys`, best first: by their contribution tier (`tier`, higher first), and within a tier by
@@ -340,9 +479,7 @@ const WEIGHED_EVERY_MS: u64 = 60 * 1000;
 
 #[derive(Clone)]
 struct Pending {
-    offer: ProviderOffer,
-    signer: PublicKey,
-    content: ProviderOfferContent,
+    offer: Checked,
     asker: PublicKey,
 }
 
@@ -395,12 +532,25 @@ fn same_offer(held: &ProviderOfferContent, new: &ProviderOfferContent) -> bool {
     plain(held) == plain(new)
 }
 
-/// An offer whose signature verifies and whose lifetime holds at `now_ms`.
-fn checked(offer: &ProviderOffer, now_ms: u64) -> Option<(PublicKey, ProviderOfferContent)> {
+/// An offer whose signature verifies and whose lifetime holds at `now_ms`, checked: the one place
+/// an offer is verified.
+fn checked(offer: &ProviderOffer, now_ms: u64) -> Option<Checked> {
     offer.verify().ok()?;
     let content = offer.content().ok()?;
-    let live = expiry(&content) > now_ms && content.issued_ms <= now_ms + CLOCK_SKEW_MS;
-    live.then_some((offer.signer().ok()?, content))
+    let signer = offer.signer().ok()?;
+    live(&content, now_ms).then(|| {
+        Checked(Arc::new(CheckedOffer {
+            offer: offer.clone(),
+            signer,
+            content,
+        }))
+    })
+}
+
+/// Whether an offer's lifetime holds at `now_ms`: not expired, and not issued in the future past
+/// the allowed skew.
+fn live(content: &ProviderOfferContent, now_ms: u64) -> bool {
+    expiry(content) > now_ms && content.issued_ms <= now_ms + CLOCK_SKEW_MS
 }
 
 /// What the held offers answer, named (`Directory::version`).
@@ -413,14 +563,14 @@ pub struct Version {
 /// The live offers of the cells no finer than an area (`Directory::coverage`).
 #[derive(Clone, Debug, Default)]
 pub struct Coverage {
-    offers: HashMap<u64, Vec<ProviderOffer>>,
+    offers: HashMap<u64, Vec<Checked>>,
     /// Every cell some covered cell lies strictly inside.
     inside: HashSet<u64>,
 }
 
 impl Coverage {
     /// The offers held for `cell` itself, in rank order.
-    pub fn at(&self, cell: Region) -> &[ProviderOffer] {
+    pub fn at(&self, cell: Region) -> &[Checked] {
         self.offers.get(&cell.as_u64()).map_or(&[], Vec::as_slice)
     }
 
@@ -431,7 +581,7 @@ impl Coverage {
     }
 
     /// The cells holding offers, with them.
-    pub fn cells(&self) -> impl Iterator<Item = (Region, &[ProviderOffer])> {
+    pub fn cells(&self) -> impl Iterator<Item = (Region, &[Checked])> {
         self.offers.iter().filter_map(|(cell, offers)| {
             Region::from_u64(*cell)
                 .ok()
@@ -472,9 +622,9 @@ impl Directory {
         let mut answer = Vec::new();
         for cell in path {
             let offers = state.ranked_offers(cell, now_ms, |held| {
-                query.products.0 == 0 || held.products.0 & query.products.0 != 0
+                query.products.0 == 0 || held.products().0 & query.products.0 != 0
             });
-            answer.extend(offers);
+            answer.extend(offers.into_iter().map(|offer| offer.offer().clone()));
             if answer.len() >= QUERY_ANSWER_MAX {
                 break;
             }
@@ -487,7 +637,7 @@ impl Directory {
     /// offer for a parent provides every cell under it), each cell's in rank order and at most
     /// `OFFERS_PER_CELL`. For the MLAT choice and the sharing trees, so unpaged: the same offers
     /// held give the same answer on every relay.
-    pub fn offers_for(&self, cell: Region, now_ms: u64) -> Vec<ProviderOffer> {
+    pub fn offers_for(&self, cell: Region, now_ms: u64) -> Vec<Checked> {
         let Ok(path) = rendezvous::ancestors(cell) else {
             return Vec::new();
         };
@@ -502,11 +652,9 @@ impl Directory {
     pub fn cells_of(&self, key: &PublicKey, now_ms: u64) -> Vec<Region> {
         let state = lock(&self.state);
         let mut cells: Vec<Region> = state
-            .cells
-            .values()
-            .filter_map(|offers| offers.get(key))
+            .held_of(key)
             .filter(|held| held.expires_ms > now_ms)
-            .filter_map(|held| held.offer.content().ok().map(|content| content.cell))
+            .map(|held| held.offer.content().cell)
             .collect();
         cells.sort_by_key(|cell| cell.as_u64());
         cells.dedup();
@@ -613,11 +761,10 @@ impl Directory {
             return None;
         }
         state
-            .cells
-            .values()
-            .filter_map(|offers| offers.get(key))
+            .held_of(key)
             .filter(|held| held.expires_ms > now_ms)
-            .find_map(|held| held.offer.content().ok().map(|content| content.address))
+            .min_by_key(|held| held.offer.content().cell.as_u64())
+            .map(|held| held.offer.content().address.clone())
     }
 
     /// Every live offer held, this relay's own included, each once: what a new directory link is
@@ -629,8 +776,8 @@ impl Directory {
             .cells
             .values()
             .flat_map(HashMap::values)
-            .filter(|held| held.expires_ms > now_ms && seen.insert(held.offer.hash()))
-            .map(|held| held.offer.clone())
+            .filter(|held| held.expires_ms > now_ms && seen.insert(held.offer.offer().hash()))
+            .map(|held| held.offer.offer().clone())
             .collect()
     }
 
@@ -680,10 +827,16 @@ impl Directory {
         let evidence_due = {
             let mut state = lock(&self.state);
             state.own = Some(identity.public());
-            state.own_group = basis
+            let own_group = basis
                 .as_ref()
                 .and_then(|basis| basis.address.parse::<std::net::SocketAddr>().ok())
                 .map(|address| Group::of(address.ip()));
+            // The relay's own network is one no witness of its own may come from (`State::tier`).
+            if state.own_group != own_group {
+                state.own_group = own_group;
+                state.networks_moved();
+                state.tiers_moved();
+            }
             state.expire(now_ms);
             if let Some(offers) = state.resign(identity, basis, now_ms) {
                 out.extend(offers);
@@ -709,8 +862,12 @@ impl Directory {
                 let state = Arc::clone(&self.state);
                 let identity = identity.clone();
                 runtime.spawn(async move {
-                    let answered =
-                        answers_as(&pending.content.address, &identity, &pending.signer).await;
+                    let answered = answers_as(
+                        &pending.offer.content().address,
+                        &identity,
+                        &pending.offer.signer(),
+                    )
+                    .await;
                     lock(&state).verified(pending, answered, crate::network::wall_ms());
                 });
             }
@@ -726,7 +883,12 @@ impl Directory {
     /// task).
     pub async fn verify_pending(&self, identity: &Identity, now_ms: u64) {
         while let Some(pending) = self.next_to_verify() {
-            let answered = answers_as(&pending.content.address, identity, &pending.signer).await;
+            let answered = answers_as(
+                &pending.offer.content().address,
+                identity,
+                &pending.offer.signer(),
+            )
+            .await;
             lock(&self.state).verified(pending, answered, now_ms);
         }
     }
@@ -741,9 +903,11 @@ impl Directory {
         let at = state
             .pending
             .iter()
-            .position(|pending| !state.dialling.contains(&pending.content.address))?;
+            .position(|pending| !state.dialling.contains(&pending.offer.content().address))?;
         let pending = state.pending.remove(at)?;
-        state.dialling.insert(pending.content.address.clone());
+        state
+            .dialling
+            .insert(pending.offer.content().address.clone());
         state.verifying += 1;
         Some(pending)
     }
@@ -756,8 +920,31 @@ impl Directory {
         group: Group,
         now_ms: u64,
     ) -> Result<bool, String> {
-        let (signer, content) = checked(&offer, now_ms).ok_or("not a live, signed offer")?;
-        Ok(lock(&self.state).hold(offer, signer, &content, group, now_ms))
+        let offer = checked(&offer, now_ms).ok_or("not a live, signed offer")?;
+        Ok(lock(&self.state).hold(offer, group, now_ms))
+    }
+}
+
+impl Directory {
+    /// Holds what an offer of `signer` saying `content` would be once checked, standing in
+    /// `stand_in`'s bytes, without signing or verifying it: for tests of the caps over tens of
+    /// thousands of offers, which signatures would make slow. Only what the caps and readers read
+    /// of a held offer (its signer and content) is real.
+    #[cfg(test)]
+    pub(crate) fn hold_unsigned(
+        &self,
+        stand_in: &ProviderOffer,
+        signer: PublicKey,
+        content: ProviderOfferContent,
+        group: Group,
+        now_ms: u64,
+    ) -> bool {
+        let offer = Checked(Arc::new(CheckedOffer {
+            offer: stand_in.clone(),
+            signer,
+            content,
+        }));
+        lock(&self.state).hold(offer, group, now_ms)
     }
 }
 
@@ -854,28 +1041,182 @@ impl State {
         cell: Region,
         now_ms: u64,
         keep: impl Fn(&Held) -> bool,
-    ) -> Vec<ProviderOffer> {
-        let live: Vec<PublicKey> = self
-            .cells
-            .get(&cell.as_u64())
-            .into_iter()
-            .flat_map(HashMap::values)
-            .filter(|held| held.expires_ms > now_ms && keep(held))
-            .map(|held| held.signer)
-            .collect();
-        let tiered: Vec<(PublicKey, u32)> = live
-            .into_iter()
-            .map(|key| (key, self.tier(&key, now_ms)))
-            .collect();
+    ) -> Vec<Checked> {
+        let order = self.ranking(cell.as_u64(), now_ms).to_vec();
         let Some(offers) = self.cells.get(&cell.as_u64()) else {
             return Vec::new();
         };
-        ranked(cell, tiered)
-            .into_iter()
-            .filter_map(|key| offers.get(&key))
+        order
+            .iter()
+            .filter_map(|key| offers.get(key))
+            .filter(|held| held.expires_ms > now_ms && keep(held))
             .take(OFFERS_PER_CELL)
             .map(|held| held.offer.clone())
             .collect()
+    }
+
+    /// Every offer held for `cell`, ranked (`ranked`): kept until the cell's offers or the tiers
+    /// change.
+    fn ranking(&mut self, cell: u64, now_ms: u64) -> &[PublicKey] {
+        self.weigh_at(now_ms);
+        if !self.ranks.contains_key(&cell) {
+            let keys: Vec<PublicKey> = self
+                .cells
+                .get(&cell)
+                .map(|offers| offers.keys().copied().collect())
+                .unwrap_or_default();
+            let tiered: Vec<(PublicKey, u32)> = keys
+                .into_iter()
+                .map(|key| (key, self.tier(&key, now_ms)))
+                .collect();
+            let order = Region::from_u64(cell)
+                .map(|region| ranked(region, tiered))
+                .unwrap_or_default();
+            self.ranks.insert(cell, order);
+        }
+        self.ranks.get(&cell).map_or(&[], Vec::as_slice)
+    }
+
+    /// The tiers are weighed by the minute: a new minute forgets them, and the rankings made from
+    /// them.
+    fn weigh_at(&mut self, now_ms: u64) {
+        let at = now_ms - now_ms % WEIGHED_EVERY_MS;
+        if at != self.tiers_at {
+            self.tiers_at = at;
+            self.clear_tiers();
+        }
+    }
+
+    /// The tiers are weighed again: forget them, and every ranking made from them.
+    fn clear_tiers(&mut self) {
+        self.tiers.clear();
+        self.ranks.clear();
+    }
+
+    /// What `keys`' tiers are weighed from changed (their own evidence): forget their tiers, and
+    /// the rankings of the cells they hold offers for. A key's evidence weighs in its own tier and
+    /// no other's.
+    fn retier(&mut self, keys: impl IntoIterator<Item = PublicKey>) {
+        for key in keys {
+            self.tiers.remove(&key);
+            for cell in self.per_key.get(&key).into_iter().flatten() {
+                self.ranks.remove(cell);
+            }
+        }
+    }
+
+    /// The networks some key answers from changed, which witnesses count by (`State::tier`): only
+    /// a key with evidence has a tier to move (one with none is tier 0 whatever networks answer),
+    /// so theirs are weighed again.
+    fn networks_moved(&mut self) {
+        let evidenced: Vec<PublicKey> = self.evidence.keys().copied().collect();
+        self.retier(evidenced);
+    }
+
+    /// Where the held offer of `key` for `cell` stands (`Standing`); `with` is a newcomer to rank
+    /// as if held, beside the cell's offers when it is the same cell.
+    fn standing(
+        &mut self,
+        (cell, key): (u64, PublicKey),
+        with: Option<(u64, PublicKey)>,
+        now_ms: u64,
+    ) -> Standing {
+        let tier = self.tier(&key, now_ms);
+        let depth = match with {
+            Some((with_cell, with_key)) if with_cell == cell => {
+                let mut keys: Vec<PublicKey> = self.ranking(cell, now_ms).to_vec();
+                if !keys.contains(&with_key) {
+                    keys.push(with_key);
+                }
+                let tiered: Vec<(PublicKey, u32)> = keys
+                    .into_iter()
+                    .map(|one| (one, self.tier(&one, now_ms)))
+                    .collect();
+                Region::from_u64(cell)
+                    .map(|region| ranked(region, tiered))
+                    .unwrap_or_default()
+                    .iter()
+                    .position(|one| *one == key)
+            }
+            _ => self
+                .ranking(cell, now_ms)
+                .iter()
+                .position(|one| *one == key),
+        }
+        .unwrap_or(usize::MAX);
+        Standing {
+            tier,
+            depth: std::cmp::Reverse(depth),
+            cell,
+            key,
+        }
+    }
+
+    /// The held offers under `cap` for a newcomer of `signer` for `cell` from `group`.
+    fn under(
+        &self,
+        cap: Cap,
+        (cell, signer, group): (u64, PublicKey, Group),
+    ) -> Vec<(u64, PublicKey)> {
+        let in_cell = || {
+            self.cells
+                .get(&cell)
+                .into_iter()
+                .flat_map(HashMap::values)
+                .filter(|held| held.group != Group::Own)
+        };
+        match cap {
+            Cap::GroupInCell => in_cell()
+                .filter(|held| held.group == group)
+                .map(|held| (cell, held.signer()))
+                .collect(),
+            Cap::Cell => in_cell().map(|held| (cell, held.signer())).collect(),
+            Cap::Group => self
+                .per_group
+                .get(&group)
+                .into_iter()
+                .flatten()
+                .copied()
+                .collect(),
+            Cap::Key => self
+                .per_key
+                .get(&signer)
+                .into_iter()
+                .flatten()
+                .map(|held_cell| (*held_cell, signer))
+                .collect(),
+            Cap::Held => self
+                .cells
+                .iter()
+                .flat_map(|(held_cell, offers)| {
+                    offers
+                        .values()
+                        .filter(|held| held.group != Group::Own)
+                        .map(move |held| (*held_cell, held.signer()))
+                })
+                .collect(),
+        }
+    }
+
+    /// How many held offers are under `cap` for a newcomer of `signer` for `cell` from `group`,
+    /// without listing them where a count is kept.
+    fn count_under(&self, cap: Cap, (cell, signer, group): (u64, PublicKey, Group)) -> usize {
+        match cap {
+            Cap::GroupInCell | Cap::Cell => self.under(cap, (cell, signer, group)).len(),
+            Cap::Group => self.per_group.get(&group).map_or(0, HashSet::len),
+            Cap::Key => self.per_key.get(&signer).map_or(0, HashSet::len),
+            Cap::Held => self.held - self.per_group.get(&Group::Own).map_or(0, HashSet::len),
+        }
+    }
+
+    /// The held offers `key` signed, in no order.
+    fn held_of<'a>(&'a self, key: &PublicKey) -> impl Iterator<Item = &'a Held> + 'a {
+        let key = *key;
+        self.per_key
+            .get(&key)
+            .into_iter()
+            .flatten()
+            .filter_map(move |cell| self.cells.get(cell)?.get(&key))
     }
 
     /// `key`'s contribution tier at `now_ms`'s minute: `tier` of what its evidence is worth by
@@ -896,11 +1237,8 @@ impl State {
     /// key that showed no evidence is tier 0, below every relay with a witness, and to outrank a
     /// relay with `n` witnesses a party needs relays answering on more than `n` networks.
     fn tier(&mut self, key: &PublicKey, now_ms: u64) -> u32 {
-        let at = now_ms - now_ms % WEIGHED_EVERY_MS;
-        if at != self.tiers_at {
-            self.tiers.clear();
-            self.tiers_at = at;
-        }
+        self.weigh_at(now_ms);
+        let at = self.tiers_at;
         if let Some(tier) = self.tiers.get(key) {
             return *tier;
         }
@@ -965,6 +1303,7 @@ impl State {
             match unheld {
                 Some(key) => {
                     self.evidence.remove(&key);
+                    self.retier([key]);
                 }
                 None => return false,
             }
@@ -978,7 +1317,7 @@ impl State {
         }
         let before = self.tier(&signer, now_ms);
         self.evidence.insert(signer, (shown, bundle.clone()));
-        self.tiers.clear();
+        self.retier([signer]);
         // A key's evidence weighs in its own tier and no other's.
         if self.tier(&signer, now_ms) != before {
             self.tiers_moved();
@@ -995,9 +1334,10 @@ impl State {
             return;
         }
         self.seen.insert(hash, ());
-        let Some((signer, content)) = checked(&offer, now_ms) else {
+        let Some(offer) = checked(&offer, now_ms) else {
             return;
         };
+        let (signer, content) = (offer.signer(), offer.content());
         // The relay's own offers, come back: never taken from outside.
         if Some(signer) == self.own {
             return;
@@ -1010,7 +1350,7 @@ impl State {
             .cells
             .get(&content.cell.as_u64())
             .and_then(|cell| cell.get(&signer))
-            .is_some_and(|held| held.issued_ms >= content.issued_ms);
+            .is_some_and(|held| held.newest_ms() >= content.issued_ms);
         if stale {
             return;
         }
@@ -1020,8 +1360,8 @@ impl State {
             .filter(|(_, until)| *until > now_ms)
             .map(|(group, _)| *group);
         if let Some(group) = trusted {
-            if self.hold(offer.clone(), signer, &content, group, now_ms) {
-                self.gossip.push(offer);
+            if self.hold(offer.clone(), group, now_ms) {
+                self.gossip.push(offer.offer().clone());
             }
             return;
         }
@@ -1034,13 +1374,13 @@ impl State {
         }
         // One waiting per (key, address, cell), the newest.
         if let Some(waiting) = self.pending.iter_mut().find(|waiting| {
-            waiting.signer == signer
-                && waiting.content.address == content.address
-                && waiting.content.cell == content.cell
+            let held = waiting.offer.content();
+            waiting.offer.signer() == signer
+                && held.address == content.address
+                && held.cell == content.cell
         }) {
-            if waiting.content.issued_ms < content.issued_ms {
+            if waiting.offer.content().issued_ms < content.issued_ms {
                 waiting.offer = offer;
-                waiting.content = content;
             }
             return;
         }
@@ -1054,147 +1394,166 @@ impl State {
         }
         self.pending.push_back(Pending {
             offer,
-            signer,
-            content,
             asker: asker.key,
         });
     }
 
     /// A handshake's outcome.
     fn verified(&mut self, pending: Pending, answered: Option<Group>, now_ms: u64) {
-        self.dialling.remove(&pending.content.address);
+        let (signer, content) = (pending.offer.signer(), pending.offer.content());
+        self.dialling.remove(&content.address);
         self.verifying = self.verifying.saturating_sub(1);
         match answered {
             Some(group) => {
                 self.verified.insert(
-                    (pending.signer, pending.content.address.clone()),
+                    (signer, content.address.clone()),
                     (group, now_ms + VERIFIED_FOR_MS),
                 );
-                let live = checked(&pending.offer, now_ms).is_some();
-                if live
-                    && self.hold(
-                        pending.offer.clone(),
-                        pending.signer,
-                        &pending.content,
-                        group,
-                        now_ms,
-                    )
-                {
-                    self.gossip.push(pending.offer);
+                // Checked when it came; only its lifetime may have run out since.
+                if live(content, now_ms) && self.hold(pending.offer.clone(), group, now_ms) {
+                    self.gossip.push(pending.offer.offer().clone());
                 }
             }
             None => {
                 self.unanswered
-                    .insert(pending.content.address, now_ms + UNANSWERED_FOR_MS);
+                    .insert(content.address.clone(), now_ms + UNANSWERED_FOR_MS);
             }
         }
     }
 
     /// Holds a verified offer if the caps allow it, by rank (see the module). True when held
-    /// (new, or newer for its key and cell).
-    fn hold(
-        &mut self,
-        offer: ProviderOffer,
-        signer: PublicKey,
-        content: &ProviderOfferContent,
-        group: Group,
-        now_ms: u64,
-    ) -> bool {
+    /// (new, or newer for its key and cell); false when refused, or when it is a change that must
+    /// wait its turn (`CHANGED_AT_MOST_EVERY_MS`), which is then held when due.
+    fn hold(&mut self, offer: Checked, group: Group, now_ms: u64) -> bool {
+        let (signer, content) = (offer.signer(), offer.content().clone());
         let cell_key = content.cell.as_u64();
         let replacing = self
             .cells
             .get(&cell_key)
             .and_then(|cell| cell.get(&signer))
-            .cloned();
-        if let Some(existing) = replacing {
-            if existing.issued_ms >= content.issued_ms {
+            .map(|held| {
+                (
+                    held.newest_ms(),
+                    held.group,
+                    held.changed_ms,
+                    same_offer(held.offer.content(), &content),
+                )
+            });
+        let mut changed_ms = now_ms;
+        if let Some((newest_ms, held_group, held_changed_ms, same)) = replacing {
+            if newest_ms >= content.issued_ms {
                 return false;
             }
             // Re-signed from the same network: its rank and its group are unchanged, so it keeps
             // its place. From another network it competes there as a newcomer. Re-signed saying
-            // what it said, it changes no answer.
-            let quiet = existing.group == group
-                && existing
-                    .offer
-                    .content()
-                    .is_ok_and(|held| same_offer(&held, content));
+            // what it said, it changes no answer, and supersedes any change waiting.
+            let quiet = held_group == group && same;
+            let due = held_changed_ms.saturating_add(CHANGED_AT_MOST_EVERY_MS);
+            if !quiet && group != Group::Own && now_ms < due {
+                if let Some(held) = self
+                    .cells
+                    .get_mut(&cell_key)
+                    .and_then(|cell| cell.get_mut(&signer))
+                {
+                    held.deferred = Some((offer, group));
+                    self.deferred.insert((due, cell_key, signer));
+                }
+                return false;
+            }
+            if quiet {
+                changed_ms = held_changed_ms;
+            }
             self.remove(cell_key, &signer, quiet);
-            if existing.group == group {
-                self.insert(offer, signer, content, group, quiet);
+            if held_group == group {
+                self.insert(offer, group, quiet, changed_ms);
                 return true;
             }
         }
         // The relay's own offers are always held (at most `OFFERS_PER_KEY`, checked before it
-        // starts: `offerable`) and count against no cap; they are ranked among the rest when answered.
+        // starts: `offerable`) and count against no cap; they are ranked among the rest when
+        // answered.
         if group != Group::Own {
-            if self.per_key.get(&signer).copied().unwrap_or(0) >= OFFERS_PER_KEY
-                || self.per_group.get(&group).copied().unwrap_or(0) >= OFFERS_PER_GROUP
-                || self.held >= OFFERS_HELD
-            {
-                return false;
-            }
-            let others: Vec<(PublicKey, Group)> = self
-                .cells
-                .get(&cell_key)
-                .into_iter()
-                .flat_map(HashMap::values)
-                .filter(|held| held.group != Group::Own)
-                .map(|held| (held.signer, held.group))
-                .collect();
-            let in_group: Vec<PublicKey> = others
-                .iter()
-                .filter(|(_, other)| *other == group)
-                .map(|(key, _)| *key)
-                .collect();
-            let contest = if in_group.len() >= OFFERS_PER_GROUP_IN_CELL {
-                Some(in_group)
-            } else if others.len() >= OFFERS_PER_CELL {
-                Some(others.iter().map(|(key, _)| *key).collect())
-            } else {
-                None
-            };
-            if let Some(mut contest) = contest {
-                contest.push(signer);
-                let tiered: Vec<(PublicKey, u32)> = contest
-                    .into_iter()
-                    .map(|key| (key, self.tier(&key, now_ms)))
-                    .collect();
-                let lowest = ranked(content.cell, tiered).pop();
-                match lowest {
-                    Some(lowest) if lowest != signer => self.remove(cell_key, &lowest, false),
-                    _ => return false,
+            let newcomer = (cell_key, signer, group);
+            let mut given_up: Vec<(u64, PublicKey)> = Vec::new();
+            for cap in Cap::ALL {
+                let full = |state: &Self, given_up: &[(u64, PublicKey)]| {
+                    let under = state.count_under(cap, newcomer);
+                    under >= cap.limit()
+                        && under - given_up_under(state, cap, newcomer, given_up) >= cap.limit()
+                };
+                while full(self, &given_up) {
+                    let contest: Vec<(u64, PublicKey)> = self
+                        .under(cap, newcomer)
+                        .into_iter()
+                        .filter(|held| !given_up.contains(held))
+                        .chain([(cell_key, signer)])
+                        .collect();
+                    let lowest = contest
+                        .into_iter()
+                        .map(|held| self.standing(held, Some((cell_key, signer)), now_ms))
+                        .min();
+                    match lowest {
+                        Some(lowest) if (lowest.cell, lowest.key) != (cell_key, signer) => {
+                            given_up.push((lowest.cell, lowest.key));
+                        }
+                        _ => return false,
+                    }
                 }
             }
+            for (cell, key) in given_up {
+                self.remove(cell, &key, false);
+            }
         }
-        self.insert(offer, signer, content, group, false);
+        self.insert(offer, group, false, changed_ms);
         true
+    }
+
+    /// The changes whose turn has come (`CHANGED_AT_MOST_EVERY_MS`), held now; each held is
+    /// gossiped, as an offer newly held is.
+    fn apply_deferred(&mut self, now_ms: u64) {
+        while let Some((due, cell, key)) = self.deferred.first().copied() {
+            if due > now_ms {
+                break;
+            }
+            self.deferred.pop_first();
+            let waiting = self
+                .cells
+                .get_mut(&cell)
+                .and_then(|offers| offers.get_mut(&key))
+                .and_then(|held| held.deferred.take());
+            if let Some((offer, group)) = waiting
+                && live(offer.content(), now_ms)
+                && self.hold(offer.clone(), group, now_ms)
+            {
+                self.gossip.push(offer.offer().clone());
+            }
+        }
     }
 
     /// Holds `offer`. `quiet` when it replaces one of its signer's for the cell that said the same
     /// (`same_offer`): what the held offers answer is unchanged, so nothing that follows them is
     /// told.
-    fn insert(
-        &mut self,
-        offer: ProviderOffer,
-        signer: PublicKey,
-        content: &ProviderOfferContent,
-        group: Group,
-        quiet: bool,
-    ) {
+    fn insert(&mut self, offer: Checked, group: Group, quiet: bool, changed_ms: u64) {
+        let (signer, content) = (offer.signer(), offer.content());
+        let cell_key = content.cell.as_u64();
         let expires_ms = expiry(content);
-        self.cells.entry(content.cell.as_u64()).or_default().insert(
+        let issued_ms = content.issued_ms;
+        self.cells.entry(cell_key).or_default().insert(
             signer,
             Held {
                 offer,
-                signer,
-                products: content.products,
-                issued_ms: content.issued_ms,
+                issued_ms,
                 expires_ms,
                 group,
+                changed_ms,
+                deferred: None,
             },
         );
-        *self.per_key.entry(signer).or_insert(0) += 1;
-        *self.per_group.entry(group).or_insert(0) += 1;
+        self.per_key.entry(signer).or_default().insert(cell_key);
+        self.per_group
+            .entry(group)
+            .or_default()
+            .insert((cell_key, signer));
         let in_group = self
             .key_groups
             .entry(signer)
@@ -1205,13 +1564,17 @@ impl State {
         let new_group = *in_group == 1;
         *self.expiries.entry(expires_ms).or_insert(0) += 1;
         self.held += 1;
-        self.tiers.clear();
+        self.ranks.remove(&cell_key);
         if !quiet {
-            self.changed_cell(content.cell.as_u64());
+            self.changed_cell(cell_key);
         }
-        // A network a key answers from is what witnesses count by (`State::tier`).
-        if new_group && !quiet {
-            self.tiers_moved();
+        // A network a key answers from is what witnesses count by (`State::tier`): the tiers move
+        // only when a key's networks do.
+        if new_group {
+            self.networks_moved();
+            if !quiet {
+                self.tiers_moved();
+            }
         }
     }
 
@@ -1225,8 +1588,18 @@ impl State {
         if cell.is_empty() {
             self.cells.remove(&cell_key);
         }
-        decrement(&mut self.per_key, signer);
-        decrement(&mut self.per_group, &held.group);
+        if let Some(cells) = self.per_key.get_mut(signer) {
+            cells.remove(&cell_key);
+            if cells.is_empty() {
+                self.per_key.remove(signer);
+            }
+        }
+        if let Some(offers) = self.per_group.get_mut(&held.group) {
+            offers.remove(&(cell_key, *signer));
+            if offers.is_empty() {
+                self.per_group.remove(&held.group);
+            }
+        }
         let mut left_group = false;
         if let Some(groups) = self.key_groups.get_mut(signer) {
             if let Some(count) = groups.get_mut(&held.group) {
@@ -1240,8 +1613,11 @@ impl State {
                 self.key_groups.remove(signer);
             }
         }
-        if left_group && !quiet {
-            self.tiers_moved();
+        if left_group {
+            self.networks_moved();
+            if !quiet {
+                self.tiers_moved();
+            }
         }
         if let Some(count) = self.expiries.get_mut(&held.expires_ms) {
             *count -= 1;
@@ -1250,7 +1626,7 @@ impl State {
             }
         }
         self.held -= 1;
-        self.tiers.clear();
+        self.ranks.remove(&cell_key);
         if !quiet {
             self.changed_cell(cell_key);
         }
@@ -1324,16 +1700,23 @@ impl State {
 
     /// Forgets every offer expired at `now_ms`, and the addresses no longer trusted or shunned.
     fn expire(&mut self, now_ms: u64) {
+        self.apply_deferred(now_ms);
         self.expire_offers(now_ms);
         // Evidence is held for the relays whose offers are held, and for one whose offer has not
         // come for a while (its handshake under way) until its offer would have.
         let own = self.own;
         let per_key = &self.per_key;
+        let mut dropped = Vec::new();
         self.evidence.retain(|key, (shown, _)| {
-            Some(*key) == own
+            let kept = Some(*key) == own
                 || per_key.contains_key(key)
-                || now_ms.saturating_sub(shown.issued_ms()) <= 2 * OWN_EVIDENCE_EVERY_MS
+                || now_ms.saturating_sub(shown.issued_ms()) <= 2 * OWN_EVIDENCE_EVERY_MS;
+            if !kept {
+                dropped.push(*key);
+            }
+            kept
         });
+        self.retier(dropped);
         while self
             .verified
             .first()
@@ -1405,7 +1788,10 @@ impl State {
                 continue;
             };
             self.seen.insert(offer.hash(), ());
-            if self.hold(offer.clone(), own, &content, Group::Own, now_ms) {
+            let Some(checked) = checked(&offer, now_ms) else {
+                continue;
+            };
+            if self.hold(checked, Group::Own, now_ms) {
                 signed.push(offer);
             }
         }
@@ -1413,13 +1799,31 @@ impl State {
     }
 }
 
-fn decrement<K: std::hash::Hash + Eq>(counts: &mut HashMap<K, usize>, key: &K) {
-    if let Some(count) = counts.get_mut(key) {
-        *count -= 1;
-        if *count == 0 {
-            counts.remove(key);
-        }
-    }
+/// How many of `given_up` are under `cap` for `newcomer`: already counted out of it.
+fn given_up_under(
+    state: &State,
+    cap: Cap,
+    (cell, signer, group): (u64, PublicKey, Group),
+    given_up: &[(u64, PublicKey)],
+) -> usize {
+    given_up
+        .iter()
+        .filter(|(held_cell, key)| {
+            let held = state
+                .cells
+                .get(held_cell)
+                .and_then(|offers| offers.get(key));
+            match cap {
+                Cap::GroupInCell => {
+                    *held_cell == cell && held.is_some_and(|held| held.group == group)
+                }
+                Cap::Cell => *held_cell == cell,
+                Cap::Group => held.is_some_and(|held| held.group == group),
+                Cap::Key => *key == signer,
+                Cap::Held => true,
+            }
+        })
+        .count()
 }
 
 #[cfg(test)]
@@ -1749,7 +2153,7 @@ mod tests {
             Ok(directory
                 .offers_for(cell, NOW + 2)
                 .iter()
-                .filter_map(|offer| offer.signer().ok())
+                .map(Checked::signer)
                 .collect())
         };
         let forwards = held_set(false)?;
@@ -1941,7 +2345,7 @@ mod tests {
             }
         }
         let state = directory.state.lock().map_err(text)?;
-        assert!(state.per_key.get(&busy.public()).copied().unwrap_or(0) <= OFFERS_PER_KEY);
+        assert!(state.per_key.get(&busy.public()).map_or(0, HashSet::len) <= OFFERS_PER_KEY);
         assert!(held >= cells.len().min(OFFERS_PER_KEY));
         assert!(state.held <= OFFERS_HELD);
         Ok(())
@@ -1973,8 +2377,7 @@ mod tests {
         assert_eq!(held.len(), honest.len() + 2 * OFFERS_PER_GROUP_IN_CELL);
         for relay in &honest {
             assert!(
-                held.iter()
-                    .any(|offer| offer.signer().ok() == Some(relay.public())),
+                held.iter().any(|offer| offer.signer() == relay.public()),
                 "an honest relay was displaced"
             );
         }
@@ -1982,6 +2385,187 @@ mod tests {
         // `MLAT_CORES_COUNTED` cores whatever it names.
         let chosen = crate::selection::mlat_relays(cell, &directory, NOW);
         assert_eq!(chosen.len(), rendezvous::MLAT_RELAYS_PER_AREA);
+        Ok(())
+    }
+
+    /// The areas under the base cells round Atlanta and London: 686 cells to spread offers over.
+    fn many_cells() -> std::result::Result<Vec<Region>, String> {
+        let mut cells = Vec::new();
+        for (lat_e7, lon_e7) in [(337_490_000, -843_880_000), (515_000_000, -1_200_000)] {
+            let base = Region::containing(
+                &Location {
+                    lat_e7,
+                    lon_e7,
+                    alt_m: 0,
+                    precision_m: 0,
+                },
+                0,
+            )
+            .map_err(text)?;
+            cells.extend(rendezvous::areas_of(base).map_err(text)?);
+        }
+        Ok(cells)
+    }
+
+    /// An offer of `key` for `cell`, as the cap tests hold it (`Directory::hold_unsigned`).
+    type Unsigned = (PublicKey, ProviderOfferContent, Group);
+
+    /// Every offer held after `offers` are held in `order`, as (cell, key), sorted.
+    fn held_after(
+        offers: &[Unsigned],
+        order: impl Iterator<Item = usize>,
+    ) -> std::result::Result<Vec<(u64, PublicKey)>, String> {
+        let stand_in = sign(
+            &Identity::from_seed([1; 32]),
+            &content("s.example:1", area()?, NOW),
+        )?;
+        let directory = Directory::new();
+        for index in order {
+            let (key, content, group) = &offers[index];
+            directory.hold_unsigned(&stand_in, *key, content.clone(), *group, NOW);
+        }
+        let state = directory.state.lock().map_err(text)?;
+        let mut held: Vec<(u64, PublicKey)> = state
+            .cells
+            .iter()
+            .flat_map(|(cell, offers)| offers.keys().map(move |key| (*cell, *key)))
+            .collect();
+        held.sort();
+        Ok(held)
+    }
+
+    /// Each order `offers` may come in: as listed, reversed, and shuffled.
+    fn orders(len: usize) -> [Vec<usize>; 3] {
+        [
+            (0..len).collect(),
+            (0..len).rev().collect(),
+            (0..len).map(|index| (index * 7919) % len).collect(),
+        ]
+    }
+
+    fn key_of(salt: u8, index: u64) -> PublicKey {
+        let mut seed = [salt; 32];
+        seed[..8].copy_from_slice(&index.to_be_bytes());
+        Identity::from_seed(seed).public()
+    }
+
+    /// Item 3 of the sweep: a full cap over many cells (a network group's, a key's) gives up the
+    /// lowest-ranked offer under it for a newcomer that outranks it, never "full, refused" by
+    /// arrival, so the set held is the same whatever order the offers came in.
+    #[test]
+    fn a_groups_and_a_keys_cap_keep_the_same_offers_whatever_the_arrival_order() -> Result {
+        let cells = many_cells()?;
+        let over = OFFERS_PER_GROUP + 44;
+        assert!(cells.len() >= over);
+        // One network, a key of its own in each cell.
+        let one_group: Vec<Unsigned> = (0..over)
+            .map(|index| {
+                (
+                    key_of(21, index as u64),
+                    content("g.example:1", cells[index], NOW),
+                    v4(60, 0),
+                )
+            })
+            .collect();
+        // One key, in each cell from a network of its own.
+        let busy = key_of(22, 0);
+        let one_key: Vec<Unsigned> = (0..over)
+            .map(|index| {
+                (
+                    busy,
+                    content("k.example:1", cells[index], NOW),
+                    v4(61 + (index / 250) as u8, index as u8),
+                )
+            })
+            .collect();
+        for (offers, cap) in [(&one_group, OFFERS_PER_GROUP), (&one_key, OFFERS_PER_KEY)] {
+            let [forward, backward, shuffled] = orders(offers.len());
+            let first = held_after(offers, forward.into_iter())?;
+            assert_eq!(first.len(), cap);
+            assert_eq!(held_after(offers, backward.into_iter())?, first);
+            assert_eq!(held_after(offers, shuffled.into_iter())?, first);
+        }
+        Ok(())
+    }
+
+    /// Item 3 of the sweep: the directory's own bound (`OFFERS_HELD`) gives up the lowest-ranked
+    /// offer anywhere, the same set whatever the order.
+    #[test]
+    fn the_directorys_bound_keeps_the_same_offers_whatever_the_arrival_order() -> Result {
+        let cells = many_cells()?;
+        // Keys of a network of their own, each in as many cells as a key may hold, spread so no
+        // cell holds more than 24: only the directory's bound binds.
+        let keys = (OFFERS_HELD / OFFERS_PER_KEY + 1) as u64;
+        let offers: Vec<Unsigned> = (0..keys)
+            .flat_map(|index| {
+                let key = key_of(23, index);
+                let cells = &cells;
+                (0..OFFERS_PER_KEY).map(move |at| {
+                    let spread = index as usize * cells.len() / keys as usize;
+                    let cell = cells[(spread + at) % cells.len()];
+                    (
+                        key,
+                        content("h.example:1", cell, NOW),
+                        v4(100 + (index / 200) as u8, index as u8),
+                    )
+                })
+            })
+            .collect();
+        assert!(offers.len() > OFFERS_HELD);
+        let [forward, backward, shuffled] = orders(offers.len());
+        let first = held_after(&offers, forward.into_iter())?;
+        assert_eq!(first.len(), OFFERS_HELD);
+        assert_eq!(held_after(&offers, backward.into_iter())?, first);
+        assert_eq!(held_after(&offers, shuffled.into_iter())?, first);
+        Ok(())
+    }
+
+    /// Item 4 of the sweep: a peer re-signing changed offers in a loop changes what its readers
+    /// see at most once per `CHANGED_AT_MOST_EVERY_MS` per (key, cell); the newest change waiting
+    /// is held when its turn comes, and a re-signing that changes nothing is held at once.
+    #[test]
+    fn a_peer_re_signing_changes_in_a_loop_costs_its_readers_once_a_turn() -> Result {
+        let relay = Identity::from_seed([31; 32]);
+        let cell = area()?;
+        let directory = Directory::new();
+        let first = sign(&relay, &content("r.example:1", cell, NOW))?;
+        assert!(directory.hold_verified(first, v4(1, 1), NOW)?);
+        assert_eq!(directory.take_changed_cells(NOW), vec![cell]);
+        let version = directory.version(NOW);
+        let mut newest = None;
+        for step in 1..=200_u64 {
+            let mut changed = content("r.example:1", cell, NOW + step);
+            // Never the 8 cores first held: each says something new.
+            changed.mlat_cores = (step % 60) as u16 + 9;
+            let offer = sign(&relay, &changed)?;
+            // Every 10 ms: deferred, and no reader is told.
+            assert!(!directory.hold_verified(offer.clone(), v4(1, 1), NOW + step * 10)?);
+            newest = Some(offer);
+        }
+        assert_eq!(directory.version(NOW + 2_000), version);
+        assert!(directory.take_changed_cells(NOW + 2_000).is_empty());
+        // Its turn: the newest change is held, told once, and gossiped once.
+        let due = NOW + CHANGED_AT_MOST_EVERY_MS;
+        directory.state.lock().map_err(text)?.expire(due);
+        let newest = newest.ok_or("no change")?;
+        assert_eq!(directory.offers_for(cell, due), vec![newest.clone()]);
+        assert_eq!(directory.take_changed_cells(due), vec![cell]);
+        assert_eq!(
+            directory.state.lock().map_err(text)?.gossip,
+            vec![newest.clone()]
+        );
+        // A re-signing saying the same is held at once, and tells no reader.
+        let mut same = newest.content().map_err(text)?;
+        same.issued_ms += 1_000;
+        let quiet = sign(&relay, &same)?;
+        assert!(directory.hold_verified(quiet.clone(), v4(1, 1), due + 1)?);
+        assert_eq!(directory.offers_for(cell, due + 1), vec![quiet]);
+        assert!(directory.take_changed_cells(due + 1).is_empty());
+        // And the next change waits its turn from the last.
+        let mut later = same.clone();
+        later.issued_ms += 1;
+        later.mlat_cores = 99;
+        assert!(!directory.hold_verified(sign(&relay, &later)?, v4(1, 1), due + 2)?);
         Ok(())
     }
 
@@ -2010,7 +2594,7 @@ mod tests {
             let mut keys: Vec<PublicKey> = directory
                 .offers_for(cell, NOW)
                 .iter()
-                .filter_map(|offer| offer.signer().ok())
+                .map(Checked::signer)
                 .collect();
             keys.sort();
             Ok(keys)

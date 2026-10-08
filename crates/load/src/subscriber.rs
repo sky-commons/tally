@@ -55,6 +55,8 @@ counts!(
     dedup_bytes,
     dedup_receptions,
     descriptions,
+    // Provisional MLAT solutions read (`--streams provisional`).
+    provisional,
     // Batches missing from a receiver's stream (its sequence jumped), and ones that came again or
     // out of order.
     gaps,
@@ -108,6 +110,8 @@ pub struct Client {
     pub counts: Counts,
     pub raw_latency: Mutex<Histogram>,
     pub dedup_latency: Mutex<Histogram>,
+    /// Each provisional solution's transmission to its reading: RFC-0174 §2.4's fast MLAT.
+    pub provisional_latency: Mutex<Histogram>,
     /// Receivers whose batches arrived this window.
     pub receivers: Mutex<HashSet<PublicKey>>,
     /// Why each session ended, and how often.
@@ -122,6 +126,9 @@ impl Client {
             *latency = Histogram::default();
         }
         if let Ok(mut latency) = self.dedup_latency.lock() {
+            *latency = Histogram::default();
+        }
+        if let Ok(mut latency) = self.provisional_latency.lock() {
             *latency = Histogram::default();
         }
         if let Ok(mut receivers) = self.receivers.lock() {
@@ -291,6 +298,19 @@ async fn session(
                 }
                 Record::ReceiverInfo(_) => {
                     client.counts.descriptions.fetch_add(1, Ordering::Relaxed);
+                }
+                Record::Provisional(positions) => {
+                    if let Ok(content) = positions.solutions()
+                        && let Ok(mut latency) = client.provisional_latency.lock()
+                    {
+                        for solution in &content.solutions {
+                            latency.record(now.saturating_sub(solution.transmitted.unix_ms));
+                        }
+                        client
+                            .counts
+                            .provisional
+                            .fetch_add(content.solutions.len() as u64, Ordering::Relaxed);
+                    }
                 }
                 Record::Goodbye {
                     reason,

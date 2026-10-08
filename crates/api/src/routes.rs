@@ -358,7 +358,7 @@ mod tests {
     #[test]
     fn an_allowed_origin_is_echoed_and_any_other_gets_the_first() {
         let allowed = vec![
-            "https://tally.flightlines.ai".to_owned(),
+            "https://tally.example".to_owned(),
             "http://localhost:5175".to_owned(),
         ];
         let with = |origin: Option<&'static str>| {
@@ -375,9 +375,16 @@ mod tests {
         for other in [Some("https://evil.example"), None] {
             assert_eq!(
                 with(other),
-                Some(HeaderValue::from_static("https://tally.flightlines.ai"))
+                Some(HeaderValue::from_static("https://tally.example"))
             );
         }
+        // With no origin configured, no page on another site may read the API.
+        let mut asked = HeaderMap::new();
+        asked.insert(
+            header::ORIGIN,
+            HeaderValue::from_static("https://tally.example"),
+        );
+        assert_eq!(allowed_origin(&[], &asked), None);
     }
 
     #[test]

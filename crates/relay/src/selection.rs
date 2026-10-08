@@ -11,11 +11,9 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use tally_wire::record::MAX_REGIONS;
 use tally_wire::rendezvous::{self, AREA_RESOLUTION, MLAT_RELAYS_PER_AREA, Weighted};
-use tally_wire::{
-    ProviderOffer, ProviderOfferContent, PublicKey, Region, Regions, RelayAddress, Streams,
-};
+use tally_wire::{PublicKey, Region, Regions, RelayAddress, Streams};
 
-use crate::directory::{Coverage, Directory, Version};
+use crate::directory::{Checked, Coverage, Directory, Version};
 
 #[derive(Default)]
 pub struct Selection {
@@ -25,13 +23,16 @@ pub struct Selection {
     solved: Mutex<Option<Solved>>,
 }
 
-/// The regions a relay takes, indexed so that whether a cell or an area is taken is a few lookups
-/// up the cell's ancestors, never a scan of the regions or of the areas under them: a relay taking
-/// the whole world (122 regions, 41,162 areas) holds 122 entries here and nothing per area.
-#[derive(Debug, Default)]
+/// The regions a relay takes, held as the wire's one set of places (`Regions`), so that whether a
+/// cell or an area is taken is a few lookups up the cell's ancestors (`Regions::contains`), never a
+/// scan of the regions or of the areas under them: a relay taking the whole world (122 regions,
+/// 41,162 areas) holds 122 cells here and nothing per area.
+#[derive(Default)]
 pub struct Taken {
     regions: Vec<Region>,
-    cells: HashSet<u64>,
+    /// The regions as named, for `names`.
+    named: HashSet<u64>,
+    set: Regions,
     /// The areas holding a region finer than an area (`rendezvous::areas_of` counts such an area
     /// taken).
     finer: HashSet<u64>,
@@ -45,7 +46,8 @@ static TAKEN_VERSIONS: AtomicU64 = AtomicU64::new(1);
 impl Taken {
     /// The index of `regions`.
     pub fn of(regions: Vec<Region>) -> Self {
-        let cells = regions.iter().map(|region| region.as_u64()).collect();
+        let set = Regions::new(regions.iter().copied());
+        let named = regions.iter().map(|region| region.as_u64()).collect();
         let finer = regions
             .iter()
             .filter(|region| region.resolution() > AREA_RESOLUTION)
@@ -54,7 +56,8 @@ impl Taken {
             .collect();
         Self {
             regions,
-            cells,
+            named,
+            set,
             finer,
             version: TAKEN_VERSIONS.fetch_add(1, Ordering::Relaxed),
         }
@@ -75,16 +78,24 @@ impl Taken {
 
     /// Whether `cell` is itself one of the regions taken.
     pub fn names(&self, cell: Region) -> bool {
-        self.cells.contains(&cell.as_u64())
+        self.named.contains(&cell.as_u64())
+    }
+
+    /// The places taken, as the fewest cells that cover them.
+    pub fn set(&self) -> &Regions {
+        &self.set
     }
 
     /// Whether `cell` lies inside a region taken (`Selection::takes`).
     pub fn takes(&self, cell: Region) -> bool {
-        !self.cells.is_empty()
-            && (0..=cell.resolution()).any(|resolution| {
-                cell.ancestor(resolution)
-                    .is_some_and(|ancestor| self.cells.contains(&ancestor.as_u64()))
-            })
+        self.set.contains(cell)
+    }
+
+    /// Whether a receiver whose signed location falls at `point` is in the areas taken: the one
+    /// rule for it (`Selection::takes_receiver`, and what delivery tags, `delivery`). One with no
+    /// located description is not known to be, so it is not.
+    pub fn takes_receiver(&self, point: Option<Region>) -> bool {
+        point.is_some_and(|point| self.takes(point))
     }
 
     /// Whether `area` (a cell at `AREA_RESOLUTION`) is one of the areas taken
@@ -97,7 +108,7 @@ impl Taken {
     /// Whether some area under `cell` (a cell no finer than an area) is taken: `cell` lies in a
     /// region taken, or a region taken lies in it.
     pub fn touches(&self, cell: Region) -> bool {
-        self.takes(cell) || self.regions.iter().any(|region| cell.contains(*region))
+        self.set.touches(cell)
     }
 
     /// Every area taken, sorted and once each: expanded, so only for a caller that must hold the
@@ -130,6 +141,8 @@ struct Solved {
     from: (u64, Option<PublicKey>, Version),
     /// Counts the computations, so a reader knows when the areas may differ.
     generation: u64,
+    /// What covers the areas, read once from the directory for both the choice and the raw links.
+    coverage: Coverage,
     areas: Regions,
     raw: Option<Vec<RawSource>>,
 }
@@ -175,7 +188,7 @@ impl Selection {
     /// (the finest cell, as the hub projects each description once). A receiver the relay holds
     /// no located description of is not known to be in its areas, so it is not taken.
     pub fn takes_receiver(&self, point: Option<Region>) -> bool {
-        point.is_some_and(|point| self.takes(point))
+        self.taken_index().takes_receiver(point)
     }
 
     /// The areas this relay is an MLAT relay for now: of the areas it takes, those where its own
@@ -203,10 +216,9 @@ impl Selection {
         self.with_solved(directory, now_ms, |solved| {
             if solved.raw.is_none() {
                 solved.raw = Some(raw_sources_of(
-                    directory,
-                    directory.own_key(),
+                    &solved.coverage,
+                    solved.from.1,
                     &solved.areas,
-                    now_ms,
                 ));
             }
             solved.raw.clone().unwrap_or_default()
@@ -235,14 +247,19 @@ impl Selection {
             }
             None => 1,
         };
-        let solved = held.get_or_insert_with(|| Solved {
-            from,
-            generation,
-            areas: match own {
-                Some(own) => solving(directory, &own, taken.regions(), now_ms),
+        let solved = held.get_or_insert_with(|| {
+            let coverage = directory.coverage(now_ms);
+            let areas = match own {
+                Some(own) => solving(directory, &coverage, &own, taken.regions(), now_ms),
                 None => Regions::default(),
-            },
-            raw: None,
+            };
+            Solved {
+                from,
+                generation,
+                coverage,
+                areas,
+                raw: None,
+            }
         });
         read(solved)
     }
@@ -256,19 +273,14 @@ type Wanted = ((u64, u8), String, Vec<Region>);
 /// cell over some of them is asked for those, with their band. Region by region: what a cell
 /// offered shares with the areas is the cell itself where the areas cover it, and else the cells
 /// of the areas inside it, never the areas one by one.
-fn raw_sources_of(
-    directory: &Directory,
-    own: Option<PublicKey>,
-    areas: &Regions,
-    now_ms: u64,
-) -> Vec<RawSource> {
+fn raw_sources_of(coverage: &Coverage, own: Option<PublicKey>, areas: &Regions) -> Vec<RawSource> {
     if areas.is_empty() {
         return Vec::new();
     }
     // Per key, its address (from its offer for the smallest area, finest cell first: the one an
     // area-by-area walk meets first) and the areas.
     let mut wanted: BTreeMap<PublicKey, Wanted> = BTreeMap::new();
-    for (cell, offers) in directory.coverage(now_ms).cells() {
+    for (cell, offers) in coverage.cells() {
         let cell = cell
             .ancestor(cell.resolution().min(AREA_RESOLUTION))
             .unwrap_or(cell);
@@ -292,9 +304,7 @@ fn raw_sources_of(
         };
         let order = (first, u8::MAX - cell.resolution());
         for offer in offers {
-            let Some((key, content)) = live(offer) else {
-                continue;
-            };
+            let (key, content) = (offer.signer(), offer.content());
             if Some(key) == own || !content.products.contains(Streams::RAW) {
                 continue;
             }
@@ -334,7 +344,13 @@ fn raw_sources_of(
 /// it takes ([`Selection::mlat_areas`]).
 pub fn areas_solved_by(directory: &Directory, relay: &PublicKey, now_ms: u64) -> Regions {
     let cells = directory.cells_of(relay, now_ms);
-    solving(directory, relay, &cells, now_ms)
+    solving(
+        directory,
+        &directory.coverage(now_ms),
+        relay,
+        &cells,
+        now_ms,
+    )
 }
 
 /// Of the areas under or around `regions` (`rendezvous::areas_of`), those `relay` is among the
@@ -344,11 +360,16 @@ pub fn areas_solved_by(directory: &Directory, relay: &PublicKey, now_ms: u64) ->
 /// for every area, whatever the ranking, and the region is chosen whole; only where more contest
 /// an area is it ranked on its own. So a relay alone in the world decides its 41,162 areas from
 /// 122 regions, and holds them as those 122.
-fn solving(directory: &Directory, relay: &PublicKey, regions: &[Region], now_ms: u64) -> Regions {
+fn solving(
+    directory: &Directory,
+    coverage: &Coverage,
+    relay: &PublicKey,
+    regions: &[Region],
+    now_ms: u64,
+) -> Regions {
     if regions.is_empty() {
         return Regions::default();
     }
-    let coverage = directory.coverage(now_ms);
     let mut out = Vec::new();
     let mut tops: Vec<Region> = regions
         .iter()
@@ -358,13 +379,11 @@ fn solving(directory: &Directory, relay: &PublicKey, regions: &[Region], now_ms:
     tops.dedup();
     for top in tops {
         // The offers of every cell strictly above the region cover each area under it.
-        let inherited: Vec<ProviderOffer> = (0..top.resolution())
+        let inherited: Vec<Checked> = (0..top.resolution())
             .filter_map(|resolution| top.ancestor(resolution))
             .flat_map(|cell| coverage.at(cell).iter().cloned())
             .collect();
-        solve_under(
-            directory, &coverage, relay, top, inherited, now_ms, &mut out,
-        );
+        solve_under(directory, coverage, relay, top, inherited, now_ms, &mut out);
     }
     Regions::new(out)
 }
@@ -375,7 +394,7 @@ fn solve_under(
     coverage: &Coverage,
     relay: &PublicKey,
     cell: Region,
-    mut offers: Vec<ProviderOffer>,
+    mut offers: Vec<Checked>,
     now_ms: u64,
     out: &mut Vec<Region>,
 ) {
@@ -402,9 +421,8 @@ fn solve_under(
     }
     let mut keys: Vec<PublicKey> = offers
         .iter()
-        .filter_map(live)
-        .filter(|(_, content)| content.mlat_cores > 0)
-        .map(|(key, _)| key)
+        .filter(|offer| offer.content().mlat_cores > 0)
+        .map(Checked::signer)
         .collect();
     keys.sort();
     keys.dedup();
@@ -442,19 +460,13 @@ pub fn mlat_relays(area: Region, directory: &Directory, now_ms: u64) -> Vec<Publ
 
 /// [`mlat_relays`] of `area` from `offers`, the live offers covering it (in any order: the
 /// ranking is a function of the set).
-fn choose(
-    area: Region,
-    offers: &[ProviderOffer],
-    directory: &Directory,
-    now_ms: u64,
-) -> Vec<PublicKey> {
+fn choose(area: Region, offers: &[Checked], directory: &Directory, now_ms: u64) -> Vec<PublicKey> {
     let candidates: Vec<Weighted> = offers
         .iter()
-        .filter_map(live)
-        .map(|(key, content)| Weighted {
-            key,
-            weight: u64::from(content.mlat_cores.min(MLAT_CORES_COUNTED)),
-            network: content.network,
+        .map(|offer| Weighted {
+            key: offer.signer(),
+            weight: u64::from(offer.content().mlat_cores.min(MLAT_CORES_COUNTED)),
+            network: offer.content().network,
             // The ranking reads no address; only a pair of destinations does.
             host: None,
         })
@@ -474,16 +486,12 @@ fn choose(
         .collect()
 }
 
-fn live(offer: &ProviderOffer) -> Option<(PublicKey, ProviderOfferContent)> {
-    Some((offer.signer().ok()?, offer.content().ok()?))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::directory::Group;
     use tally_wire::rendezvous::{AREA_RESOLUTION, area_of};
-    use tally_wire::{Identity, Location};
+    use tally_wire::{Identity, Location, ProviderOffer, ProviderOfferContent};
 
     type Result = std::result::Result<(), String>;
 

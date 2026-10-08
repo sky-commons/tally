@@ -4,8 +4,8 @@
 //! lock. A producer (an ingest worker) sends each thread one [`Slice`] per batch, never one message
 //! per reception: the batch, shared, and the index ranges of its receptions whose key falls in that
 //! thread's shards. Each thread's queue is bounded ([`QUEUE_SLICES`] per producer): a producer
-//! that finds it full waits, which holds its connections' credit (`ingest::CREDIT`), which stops
-//! their sockets being read. That is the back-pressure raw meets (RFC-0181 §10).
+//! that finds it full waits, which holds its connections' allowances (`ingest::Allowance`), which
+//! stops their sockets being read. That is the back-pressure raw meets (RFC-0181 §10).
 //!
 //! Keys are uniform hashes only, never geography, so a dense area cannot make a hot shard; the two
 //! a peer chooses (a receiver's key, an aircraft's address) are keyed under this process's secret
@@ -23,10 +23,22 @@
 //!
 //! What a thread holds is charged to the relay's budget (`budget`): each open epoch's decoded
 //! batches to [`Store::Epochs`] (a batch's share by the receptions its slice carries), and its
-//! [`DEDUP_GENERATIONS`] generations of fingerprints to [`Store::Dedup`]. An epoch that would pass
-//! either is refused whole: its slices are let go, and the sealer is told it was refused
-//! ([`Frozen::refused`]), so it counts it and makes no product of any part of it (RFC-0181 §10). The charge travels with the
-//! epoch's batches to the sealer and is released when the sealer is done with them.
+//! [`DEDUP_GENERATIONS`] generations of fingerprints to [`Store::Dedup`]. A slice comes down its
+//! queue with its share of the batch's ingest charge (`ingest::InFlight`), let go only once the
+//! epoch holds it (or the slice is let go), so the queues are charged in bytes all the way. An
+//! epoch that would pass either store on any thread is refused whole: its slices are let go, and
+//! the sealer is told it was refused ([`Frozen::refused`]), so it counts it and makes no product of
+//! any part of it (RFC-0181 §10). The charge travels with the epoch's batches to the sealer and is
+//! released when the sealer is done with them.
+//!
+//! Whether an epoch is admitted is settled once, for every thread, before any commits it
+//! ([`Admission`]): each thread decides its part against what it remembers and holds the
+//! fingerprints it would add aside (its generation of that epoch), and only when every thread has
+//! posted its part, and none refused, are they kept. An epoch refused anywhere is forgotten by
+//! every thread, so a message decided in it is still new in the next, never lost to an epoch that
+//! was never published. A thread decides the epoch after one it posted only once that one is
+//! settled. The settled epoch goes to the sealer as one word, and waits, held and charged, while
+//! the sealer's queue is full: once kept, an epoch is never lost on its way.
 //!
 //! Every producer sends [`Envelope::Tick`] down every queue as its stamps advance; a thread's
 //! watermark ([`Watermark`]) is the least of its producers' ticks, and it closes an epoch once its
@@ -38,17 +50,19 @@
 //! can stamp one behind its producer's tick) is late: let go and counted ([`Frozen::late`]), never
 //! decided in a later epoch and never costing another epoch anything.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::hash::{BuildHasher, Hasher};
 use std::ops::Range;
-use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 use tally_wire::{Decoded, ObsRef, PublicKey, Region};
 
 use crate::budget::{Budget, Charge, Gauge, Store};
-use crate::ingest::{Pause, Stage, Stamp};
+use crate::ingest::{InFlight, Pause, Stage, Stamp, TICK_MS};
 use crate::seal::{Closer, EPOCH_MS, Epoch};
 
 /// Logical shards per exchange: fixed, so a key's shard never depends on how many threads run.
@@ -189,9 +203,10 @@ impl Slice {
 }
 
 /// What travels down a thread's queue.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub enum Envelope {
-    Slice(Slice),
+    /// A slice, and its share of its batch's ingest charge: let go once the epoch holds it.
+    Slice(Slice, InFlight),
     /// Everything this producer sends from now on is stamped at or after this.
     Tick(Stamp),
 }
@@ -402,6 +417,12 @@ impl MessageShard {
         }
     }
 
+    /// Forgets what the epoch being decided kept: it was refused (`Admission`), so nothing of it
+    /// was published, and every message in it is new again.
+    pub fn forget_current(&mut self) {
+        self.generations[self.current].clear();
+    }
+
     /// The table slots every generation holds: what they cost (`DEDUP_ENTRY_BYTES` each).
     pub fn capacity(&self) -> usize {
         self.generations.iter().map(HashMap::capacity).sum()
@@ -446,9 +467,229 @@ pub struct Frozen {
     pub regional: Vec<(Region, u32, u32)>,
 }
 
-/// Where closed epochs go: the sealer (`seal::Coordinator`). False when it could not take one,
-/// which it then refuses whole.
-pub type Sink = Arc<dyn Fn(Frozen) -> bool + Send + Sync>;
+/// Where closed epochs go: the sealer (`seal::Coordinator`). The word back when it could not take
+/// it now (its queue is full): the exchange holds it, charged, and offers it again, in order.
+pub type Sink = Arc<dyn Fn(Frozen) -> Result<(), Box<Frozen>> + Send + Sync>;
+
+/// How every message thread settles each epoch once ([`Admission`]), and hands the sealer one word
+/// for it: the epochs' parts posted, and each thread's progress.
+pub struct Admission {
+    threads: usize,
+    sink: Sink,
+    ledger: Mutex<Ledger>,
+    /// Words waiting for the sealer: a flush takes the ledger only when there are any.
+    waiting: AtomicUsize,
+    /// Held while words are offered, so they reach the sealer in the order they were settled.
+    sending: Mutex<()>,
+}
+
+#[derive(Default)]
+struct Ledger {
+    /// Per thread: every epoch before this it has posted (decided, refused, or held nothing of).
+    through: Vec<Option<Epoch>>,
+    /// Epochs some thread posted a part of, not yet settled.
+    pending: BTreeMap<Epoch, Settling>,
+    /// Per thread: the epoch it awaits and whether it was admitted, once settled.
+    verdicts: Vec<Option<(Epoch, bool)>>,
+    /// Every epoch before this is settled and told the sealer.
+    frontier: Option<Epoch>,
+    outbox: VecDeque<Frozen>,
+    /// Epoch words sent the sealer: they go as thread 0's (`Frozen::seq`).
+    parts: u64,
+    /// Receptions let go late, not yet told.
+    late: u64,
+}
+
+#[derive(Default)]
+struct Settling {
+    parts: Vec<Frozen>,
+    refused: bool,
+    /// The threads that decided a part of it and keep it only if it is admitted.
+    awaiting: Vec<usize>,
+}
+
+impl Admission {
+    pub fn new(threads: usize, sink: Sink) -> Arc<Self> {
+        let threads = threads.max(1);
+        Arc::new(Self {
+            threads,
+            sink,
+            ledger: Mutex::new(Ledger {
+                through: vec![None; threads],
+                verdicts: vec![None; threads],
+                ..Ledger::default()
+            }),
+            waiting: AtomicUsize::new(0),
+            sending: Mutex::new(()),
+        })
+    }
+
+    /// Thread `thread` decided its part of `epoch` (`part`), or refused it (`None`).
+    fn post(&self, thread: usize, epoch: Epoch, part: Option<Frozen>) {
+        if let Ok(mut ledger) = self.ledger.lock() {
+            let settling = ledger.pending.entry(epoch).or_default();
+            match part {
+                Some(part) => {
+                    settling.parts.push(part);
+                    settling.awaiting.push(thread);
+                }
+                None => settling.refused = true,
+            }
+        }
+    }
+
+    /// Receptions thread `thread` let go, their epoch closed before they came.
+    fn late(&self, receptions: u64) {
+        if let Ok(mut ledger) = self.ledger.lock() {
+            ledger.late += receptions;
+        }
+    }
+
+    /// Whether `epoch`, which thread `thread` decided a part of, was admitted, once every thread
+    /// has posted it; `None` until then.
+    fn verdict(&self, thread: usize, epoch: Epoch) -> Option<bool> {
+        let mut ledger = self.ledger.lock().ok()?;
+        match ledger.verdicts.get(thread).copied().flatten() {
+            Some((settled, admitted)) if settled == epoch => {
+                ledger.verdicts[thread] = None;
+                Some(admitted)
+            }
+            _ => None,
+        }
+    }
+
+    /// Thread `thread` has posted every epoch before `through`: every epoch every thread has
+    /// posted is settled, in order, and told the sealer.
+    fn progress(&self, thread: usize, through: Epoch) {
+        if let Ok(mut ledger) = self.ledger.lock() {
+            let ledger = &mut *ledger;
+            if let Some(held) = ledger.through.get_mut(thread) {
+                *held = Some(held.map_or(through, |held| held.max(through)));
+            }
+            if let Some(frontier) = ledger
+                .through
+                .iter()
+                .copied()
+                .collect::<Option<Vec<Epoch>>>()
+                .and_then(|through| through.into_iter().min())
+                && ledger.frontier.is_none_or(|before| frontier > before)
+            {
+                while let Some(entry) = ledger.pending.first_entry() {
+                    if *entry.key() >= frontier {
+                        break;
+                    }
+                    let (epoch, settling) = entry.remove_entry();
+                    let word = settle(epoch, settling, ledger);
+                    ledger.push(word);
+                }
+                ledger.frontier = Some(frontier);
+                for thread in 0..self.threads {
+                    let marker = Frozen {
+                        thread,
+                        seq: if thread == 0 { ledger.parts } else { 0 },
+                        closed_before: frontier,
+                        ..Frozen::default()
+                    };
+                    ledger.push(marker);
+                }
+            }
+            self.waiting.store(ledger.outbox.len(), Ordering::Release);
+        }
+        self.flush();
+    }
+
+    /// Offers the sealer every word waiting, in order, until it takes no more.
+    fn flush(&self) {
+        if self.waiting.load(Ordering::Acquire) == 0 {
+            return;
+        }
+        let Ok(_sending) = self.sending.lock() else {
+            return;
+        };
+        loop {
+            let Some(word) = self
+                .ledger
+                .lock()
+                .ok()
+                .and_then(|mut ledger| ledger.outbox.pop_front())
+            else {
+                break;
+            };
+            if let Err(word) = (self.sink)(word) {
+                if let Ok(mut ledger) = self.ledger.lock() {
+                    ledger.outbox.push_front(*word);
+                }
+                break;
+            }
+        }
+        if let Ok(ledger) = self.ledger.lock() {
+            self.waiting.store(ledger.outbox.len(), Ordering::Release);
+        }
+    }
+}
+
+impl Ledger {
+    /// Queues `word` for the sealer, with the late receptions not yet told.
+    fn push(&mut self, mut word: Frozen) {
+        word.late = std::mem::take(&mut self.late);
+        self.outbox.push_back(word);
+    }
+}
+
+/// `epoch` settled: every thread that decided a part of it told whether it was admitted, and its
+/// one word for the sealer, every part as one (thread 0's), or its refusal.
+fn settle(epoch: Epoch, settling: Settling, ledger: &mut Ledger) -> Frozen {
+    let mut word = Frozen {
+        thread: 0,
+        seq: ledger.parts,
+        epoch: Some(epoch),
+        closed_before: epoch + 1,
+        ..Frozen::default()
+    };
+    ledger.parts += 1;
+    let mut admitted = !settling.refused;
+    if admitted {
+        for mut part in settling.parts {
+            let at = word.batches.len() as u32;
+            word.stream.extend(
+                part.stream
+                    .iter()
+                    .map(|(batch, index)| (batch + at, *index)),
+            );
+            word.regional.extend(
+                part.regional
+                    .iter()
+                    .map(|(area, batch, index)| (*area, batch + at, *index)),
+            );
+            word.batches.append(&mut part.batches);
+            // Every part is charged to the one `Store::Epochs`: a charge on another could not be
+            // handed on with the word, so the epoch is refused rather than held uncharged.
+            if word
+                .charge
+                .absorb(std::mem::take(&mut part.charge))
+                .is_err()
+            {
+                admitted = false;
+            }
+        }
+    }
+    if !admitted {
+        word = Frozen {
+            refused: true,
+            ..word
+        };
+        word.batches = Vec::new();
+        word.stream = Vec::new();
+        word.regional = Vec::new();
+        word.charge = Charge::none();
+    }
+    for thread in settling.awaiting {
+        if let Some(verdict) = ledger.verdicts.get_mut(thread) {
+            *verdict = Some((epoch, admitted));
+        }
+    }
+    word
+}
 
 /// The state one message thread owns: its logical shards, its watermark, its open epochs.
 pub struct MessageThread {
@@ -462,15 +703,14 @@ pub struct MessageThread {
     gauges: Gauges,
     /// What the generations' tables are charged (`Store::Dedup`).
     dedup: Charge,
-    /// The last epoch decided: its shards' generations are its and the one before.
+    /// The last epoch decided: its shards' generations are its and the ones before.
     decided: Option<Epoch>,
-    /// Epoch parts sent the sealer.
-    sent: u64,
-    /// Every epoch before this is closed.
-    closed_before: Option<Epoch>,
-    /// Late receptions not yet told the sealer.
-    late: u64,
-    sink: Sink,
+    /// Every epoch before this is closed by the watermark: no slice of it will be taken.
+    closed_to: Option<Epoch>,
+    /// The epoch it decided a part of and posted, until it is settled: the next is decided only
+    /// after, against what that one kept.
+    awaiting: Option<Epoch>,
+    admission: Arc<Admission>,
 }
 
 impl MessageThread {
@@ -478,7 +718,7 @@ impl MessageThread {
         thread: usize,
         threads: usize,
         producers: usize,
-        sink: Sink,
+        admission: Arc<Admission>,
         gauges: Gauges,
     ) -> Self {
         let owned = (thread..SHARDS).step_by(threads.max(1)).count();
@@ -492,20 +732,19 @@ impl MessageThread {
             closer: Closer::default(),
             open: BTreeMap::new(),
             decided: None,
-            sent: 0,
-            closed_before: None,
-            late: 0,
-            sink,
+            closed_to: None,
+            awaiting: None,
+            admission,
         }
     }
 
     pub fn take(&mut self, producer: usize, envelope: Envelope) {
         match envelope {
-            Envelope::Slice(slice) => {
+            Envelope::Slice(slice, in_flight) => {
                 let epoch = slice.epoch();
                 if self.closer.closed(epoch) {
                     // Its epoch is decided and gone: late, let go, counted at the next word.
-                    self.late += slice.receptions() as u64;
+                    self.admission.late(slice.receptions() as u64);
                     return;
                 }
                 let gauge = &self.gauges.epochs;
@@ -523,6 +762,8 @@ impl MessageThread {
                     // Past the budget: the whole epoch is refused, never a part of it.
                     open.refuse();
                 }
+                // The epoch holds its bytes now (or let them go): the ingest charge is done.
+                drop(in_flight);
             }
             Envelope::Tick(stamp) => {
                 let watermark = self.watermark.tick(producer, stamp);
@@ -533,30 +774,65 @@ impl MessageThread {
                 }
                 let oldest = self.open.keys().next().copied();
                 let closing = self.closer.advance(watermark, oldest);
-                // Only the epochs that held something are decided; the rest close by count.
-                let held: Vec<Epoch> = self.open.range(..closing.end).map(|(e, _)| *e).collect();
-                for epoch in held {
-                    self.close(epoch, closing.end);
-                }
-                if self.closed_before.is_none_or(|before| closing.end > before) {
-                    self.closed_before = Some(closing.end);
-                    let marker = Frozen {
-                        thread: self.thread,
-                        closed_before: closing.end,
-                        ..Frozen::default()
-                    };
-                    self.send(marker);
-                }
+                self.closed_to = Some(self.closed_to.map_or(closing.end, |to| to.max(closing.end)));
+                self.settle();
             }
         }
     }
 
-    /// Decides epoch `epoch`'s receptions in canonical order and hands them to the sealer. Every
-    /// epoch open before it was closed before it (`take` closes them oldest first, and a slice for
-    /// an epoch already closed never opens one), so none is ever decided after a later one.
-    fn close(&mut self, epoch: Epoch, closed_before: Epoch) {
-        let Some(open) = self.open.remove(&epoch) else {
+    /// Takes up what waits on the other threads: an epoch they have settled since, and the words
+    /// the sealer could not take before. Called between envelopes, and when none comes.
+    pub fn resume(&mut self) {
+        self.settle();
+        self.admission.flush();
+    }
+
+    /// Decides every closed epoch it holds, oldest first, each only once the one before it is
+    /// settled (`Admission`), and tells the others how far it has posted.
+    fn settle(&mut self) {
+        let Some(closed_to) = self.closed_to else {
             return;
+        };
+        loop {
+            let through = self
+                .open
+                .keys()
+                .next()
+                .copied()
+                .map_or(closed_to, |first| first.min(closed_to));
+            self.admission.progress(self.thread, through);
+            if let Some(epoch) = self.awaiting {
+                let Some(admitted) = self.admission.verdict(self.thread, epoch) else {
+                    return;
+                };
+                if !admitted {
+                    // Refused on some thread: nothing of it is published, so nothing of it is
+                    // remembered.
+                    self.shards
+                        .iter_mut()
+                        .for_each(MessageShard::forget_current);
+                    self.dedup
+                        .shrink_to(self.held_slots().saturating_mul(DEDUP_ENTRY_BYTES));
+                }
+                self.awaiting = None;
+            }
+            let Some(epoch) = self.open.keys().next().copied().filter(|e| *e < closed_to) else {
+                return;
+            };
+            if self.close(epoch) {
+                self.awaiting = Some(epoch);
+            }
+        }
+    }
+
+    /// Decides epoch `epoch`'s receptions in canonical order and posts them (`Admission`): true
+    /// when it decided a part, to keep only if the epoch is admitted; false when it refused it
+    /// here. Every epoch open before it was posted and settled before it (`settle` takes them
+    /// oldest first, and a slice for an epoch already closed never opens one), so none is ever
+    /// decided after a later one.
+    fn close(&mut self, epoch: Epoch) -> bool {
+        let Some(open) = self.open.remove(&epoch) else {
+            return false;
         };
         // The generations follow the epochs by number, not by which held anything: the
         // `DEDUP_GENERATIONS - 1` epochs before this one are remembered, older ones are not.
@@ -579,16 +855,9 @@ impl MessageThread {
             .saturating_mul(DEDUP_ENTRY_BYTES);
         let more = needed.saturating_sub(self.dedup.bytes());
         let room = !open.refused && self.dedup.try_grow(more);
-        let closed_before = (epoch + 1).min(closed_before);
         if !room {
-            self.send(Frozen {
-                thread: self.thread,
-                epoch: Some(epoch),
-                closed_before,
-                refused: true,
-                ..Frozen::default()
-            });
-            return;
+            self.admission.post(self.thread, epoch, None);
+            return false;
         }
         let Open {
             mut slices, charge, ..
@@ -599,7 +868,7 @@ impl MessageThread {
         let mut frozen = Frozen {
             thread: self.thread,
             epoch: Some(epoch),
-            closed_before,
+            closed_before: epoch + 1,
             charge,
             batches: Vec::with_capacity(slices.len()),
             ..Frozen::default()
@@ -623,21 +892,8 @@ impl MessageThread {
         // What the tables hold now, no more.
         self.dedup
             .shrink_to(self.held_slots().saturating_mul(DEDUP_ENTRY_BYTES));
-        self.send(frozen);
-    }
-
-    fn send(&mut self, mut frozen: Frozen) {
-        frozen.seq = self.sent;
-        let late = std::mem::take(&mut self.late);
-        frozen.late = late;
-        if frozen.epoch.is_some() {
-            self.sent += 1;
-        }
-        // A word the sealer could not take loses its epoch (counted there), never the count of
-        // late receptions it carried: that goes with the next word.
-        if !(self.sink)(frozen) {
-            self.late += late;
-        }
+        self.admission.post(self.thread, epoch, Some(frozen));
+        true
     }
 
     /// Fingerprints held across its shards.
@@ -679,7 +935,13 @@ pub enum MessageExchange {
 
 impl MessageExchange {
     pub fn inline(sink: Sink, gauges: Gauges) -> Self {
-        Self::Inline(Mutex::new(MessageThread::new(0, 1, 1, sink, gauges)))
+        Self::Inline(Mutex::new(MessageThread::new(
+            0,
+            1,
+            1,
+            Admission::new(1, sink),
+            gauges,
+        )))
     }
 
     /// `threads` threads, fed by `producers` producers, each queue bounded per producer, each
@@ -699,10 +961,16 @@ impl MessageExchange {
             senders: Vec::with_capacity(threads),
             handles: Vec::with_capacity(threads),
         };
+        let admission = Admission::new(threads, Arc::clone(sink));
         for thread in 0..threads {
             let (sender, receiver) = sync_channel(QUEUE_SLICES * producers.max(1));
-            let state =
-                MessageThread::new(thread, threads, producers, Arc::clone(sink), gauges.clone());
+            let state = MessageThread::new(
+                thread,
+                threads,
+                producers,
+                Arc::clone(&admission),
+                gauges.clone(),
+            );
             let pause = pause.cloned();
             let handle = std::thread::Builder::new()
                 .name(format!("tally-message-{thread}"))
@@ -726,10 +994,25 @@ impl MessageExchange {
     }
 
     /// Routes a batch's receptions to their shards' threads, waiting while a thread's queue is
-    /// full.
-    pub fn route(&self, producer: usize, decoded: &Arc<Decoded>, area: Option<Region>) {
-        for (thread, slice) in split(decoded, self.width(), area) {
-            self.send(producer, thread, Envelope::Slice(slice));
+    /// full, each slice with its share of the batch's charge (`in_flight`), so the bytes waiting in
+    /// the queues are charged until the epochs hold them. What no slice carries is let go here.
+    pub fn route(
+        &self,
+        producer: usize,
+        decoded: &Arc<Decoded>,
+        area: Option<Region>,
+        mut in_flight: InFlight,
+    ) {
+        let slices = split(decoded, self.width(), area);
+        let last = slices.len().saturating_sub(1);
+        for (at, (thread, slice)) in slices.into_iter().enumerate() {
+            let share = if at == last {
+                in_flight.bytes()
+            } else {
+                slice.share()
+            };
+            let charge = in_flight.split(share);
+            self.send(producer, thread, Envelope::Slice(slice, charge));
         }
     }
 
@@ -769,20 +1052,18 @@ impl Drop for MessageExchange {
 }
 
 fn run(mut state: MessageThread, receiver: &Receiver<(usize, Envelope)>, pause: Option<&Pause>) {
-    while let Ok((producer, envelope)) = receiver.recv() {
-        if let Some(pause) = pause {
-            pause(Stage::Message);
+    loop {
+        match receiver.recv_timeout(Duration::from_millis(TICK_MS)) {
+            Ok((producer, envelope)) => {
+                if let Some(pause) = pause {
+                    pause(Stage::Message);
+                }
+                state.take(producer, envelope);
+            }
+            // Nothing came: what waits on the other threads or the sealer is taken up anyway.
+            Err(RecvTimeoutError::Timeout) => state.resume(),
+            Err(RecvTimeoutError::Disconnected) => break,
         }
-        state.take(producer, envelope);
-    }
-}
-
-/// Sends `frozen` to a bounded queue without waiting: a sealer that is behind refuses the epoch
-/// whole rather than slow the shards (RFC-0181 §10).
-pub fn offer(sender: &SyncSender<Frozen>, frozen: Frozen) -> bool {
-    match sender.try_send(frozen) {
-        Ok(()) => true,
-        Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => false,
     }
 }
 
@@ -942,10 +1223,15 @@ mod tests {
     fn thread() -> (MessageThread, Arc<Mutex<Vec<Frozen>>>) {
         let words = Arc::new(Mutex::new(Vec::new()));
         let kept = Arc::clone(&words);
-        let sink: Sink =
-            Arc::new(move |frozen| kept.lock().map(|mut kept| kept.push(frozen)).is_ok());
+        let sink: Sink = Arc::new(move |frozen| match kept.lock() {
+            Ok(mut kept) => {
+                kept.push(frozen);
+                Ok(())
+            }
+            Err(_) => Err(Box::new(frozen)),
+        });
         (
-            MessageThread::new(0, 1, 1, sink, Gauges::unlimited()),
+            MessageThread::new(0, 1, 1, Admission::new(1, sink), Gauges::unlimited()),
             words,
         )
     }
@@ -974,7 +1260,7 @@ mod tests {
             (2, 2_999),
             (1, 3_000),
         ] {
-            thread.take(0, Envelope::Slice(copy_of(n, stamp_ms)?));
+            thread.take(0, Envelope::Slice(copy_of(n, stamp_ms)?, InFlight::free()));
         }
         thread.take(0, tick(10_000));
         let words = words.lock().map_err(|error| error.to_string())?;
@@ -993,16 +1279,96 @@ mod tests {
         Ok(())
     }
 
+    /// The word the sealer was told for `epoch`: whether it was refused, and the first byte of
+    /// each message it kept for the stream.
+    fn word_of(
+        words: &Mutex<Vec<Frozen>>,
+        epoch: Epoch,
+    ) -> Result<Option<(bool, Vec<u8>)>, String> {
+        let words = words.lock().map_err(|error| error.to_string())?;
+        Ok(words
+            .iter()
+            .find(|word| word.epoch == Some(epoch))
+            .map(|word| {
+                let kept = word
+                    .stream
+                    .iter()
+                    .map(|(at, index)| {
+                        let batch = &word.batches[*at as usize];
+                        batch.data(&batch.observations()[*index as usize])[0]
+                    })
+                    .collect();
+                (word.refused, kept)
+            }))
+    }
+
+    /// RFC-0181 §10, invariant 7: an epoch refused on one message thread is refused on every
+    /// one, and what another thread decided in it is forgotten, never kept: a message decided on
+    /// thread 1 in an epoch thread 0 refused is still new in the next epoch, and published there.
+    /// Before admission was settled once, thread 1 kept it in the refused epoch and dropped its
+    /// copy in the next as a duplicate, so it was in no product at all.
+    #[test]
+    fn an_epoch_refused_on_one_thread_is_forgotten_on_every_thread() -> Result<(), String> {
+        let words = Arc::new(Mutex::new(Vec::new()));
+        let kept = Arc::clone(&words);
+        let sink: Sink = Arc::new(move |frozen| match kept.lock() {
+            Ok(mut kept) => {
+                kept.push(frozen);
+                Ok(())
+            }
+            Err(_) => Err(Box::new(frozen)),
+        });
+        let admission = Admission::new(2, sink);
+        // Thread 0's epochs hold one slice: a second refuses the epoch there.
+        let tight = Gauges {
+            epochs: Gauge::new(Store::Epochs, 1),
+            dedup: Gauge::unlimited(Store::Dedup),
+        };
+        let mut zero = MessageThread::new(0, 2, 1, Arc::clone(&admission), tight);
+        let mut one = MessageThread::new(1, 2, 1, Arc::clone(&admission), Gauges::unlimited());
+        one.take(0, Envelope::Slice(copy_of(7, 500)?, InFlight::free()));
+        zero.take(0, Envelope::Slice(copy_of(1, 500)?, InFlight::free()));
+        zero.take(0, Envelope::Slice(copy_of(2, 600)?, InFlight::free()));
+        // Thread 1 closes epoch 0 first, deciding message 7 in it; thread 0 then refuses it.
+        one.take(0, tick(1_000));
+        one.take(0, Envelope::Slice(copy_of(7, 1_500)?, InFlight::free()));
+        zero.take(0, tick(1_000));
+        one.take(0, tick(2_000));
+        zero.take(0, tick(2_000));
+        assert_eq!(word_of(&words, 0)?, Some((true, Vec::new())));
+        assert_eq!(word_of(&words, 1)?, Some((false, vec![7])));
+        Ok(())
+    }
+
+    /// RFC-0181 §9: a slice's share of its batch's ingest charge is held down the queue and let
+    /// go only once the epoch holds the bytes, or the slice is let go late.
+    #[test]
+    fn a_slices_ingest_charge_is_held_until_its_epoch_holds_it() -> Result<(), String> {
+        let (mut thread, _) = thread();
+        let ingest = Gauge::unlimited(Store::Ingest);
+        let slice = copy_of(1, 500)?;
+        let share = slice.share();
+        let envelope = Envelope::Slice(slice, InFlight::trusted(&ingest, share));
+        assert_eq!(ingest.held(), share);
+        thread.take(0, envelope);
+        assert_eq!(ingest.held(), 0);
+        thread.take(0, tick(2_000));
+        let late = copy_of(2, 600)?;
+        thread.take(0, Envelope::Slice(late, InFlight::trusted(&ingest, share)));
+        assert_eq!(ingest.held(), 0);
+        Ok(())
+    }
+
     /// A slice for an epoch its thread has already closed is late: let go and counted, never
     /// decided in a later epoch, and the epochs around it are decided whole.
     #[test]
     fn a_late_slice_is_counted_and_never_decided_or_costs_another_epoch() -> Result<(), String> {
         let (mut thread, words) = thread();
-        thread.take(0, Envelope::Slice(copy_of(1, 500)?));
+        thread.take(0, Envelope::Slice(copy_of(1, 500)?, InFlight::free()));
         thread.take(0, tick(2_000));
         // Epoch 0 is closed: a slice stamped in it is late. Epoch 2's is not.
-        thread.take(0, Envelope::Slice(copy_of(2, 600)?));
-        thread.take(0, Envelope::Slice(copy_of(3, 2_100)?));
+        thread.take(0, Envelope::Slice(copy_of(2, 600)?, InFlight::free()));
+        thread.take(0, Envelope::Slice(copy_of(3, 2_100)?, InFlight::free()));
         thread.take(0, tick(4_000));
         let words = words.lock().map_err(|error| error.to_string())?;
         assert_eq!(words.iter().map(|word| word.late).sum::<u64>(), 1);

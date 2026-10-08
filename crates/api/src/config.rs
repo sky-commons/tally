@@ -15,7 +15,8 @@ usage: tally-api --relay-stats URL --readsb URL [options]
                          http://127.0.0.1:10901
   --readsb URL           readsb's API port (its --net-api-port), such as http://127.0.0.1:30152
   --listen ADDR          where the API serves HTTP (default 127.0.0.1:10902)
-  --allow-origin ORIGIN  an origin CORS allows; repeatable (default https://tally.flightlines.ai)
+  --allow-origin ORIGIN  an origin CORS allows, such as the site that draws the API; repeatable
+                         (default none: no other site's page may read the API)
   --client-ip-header NAME
                          read each client's address from this header (such as CF-Connecting-IP)
                          instead of the connection's; set it only behind a proxy that sets it
@@ -103,9 +104,7 @@ impl Config {
         }
         settings.relay_stats = relay_stats.ok_or(format!("--relay-stats is required\n{USAGE}"))?;
         settings.readsb = readsb.ok_or(format!("--readsb is required\n{USAGE}"))?;
-        if !origins.is_empty() {
-            settings.allow_origins = origins;
-        }
+        settings.allow_origins = origins;
         if let Some(linked) = &linked_relay {
             // A credential binds a key: one minted fresh each run is one no relay vouches for.
             if key_file.is_none() {
@@ -141,7 +140,7 @@ fn count(flag: &str, text: &str) -> Result<usize, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{DEFAULT_MAX_CONNECTIONS, DEFAULT_MAX_REQUESTS, DEFAULT_ORIGIN, limit};
+    use crate::{DEFAULT_MAX_CONNECTIONS, DEFAULT_MAX_REQUESTS, limit};
 
     fn parse(args: &[&str]) -> Result<Config, String> {
         Config::from_args(args.iter().map(|arg| (*arg).to_owned()))?.ok_or("no config".to_owned())
@@ -158,7 +157,7 @@ mod tests {
         ])?;
         let settings = &config.settings;
         assert_eq!(config.listen, "127.0.0.1:10902");
-        assert_eq!(settings.allow_origins, [DEFAULT_ORIGIN]);
+        assert!(settings.allow_origins.is_empty());
         assert_eq!(
             (settings.rate, settings.burst),
             (limit::DEFAULT_RATE, limit::DEFAULT_BURST)
@@ -172,7 +171,7 @@ mod tests {
     }
 
     #[test]
-    fn origins_repeat_and_replace_the_default() -> Result<(), String> {
+    fn origins_are_the_operators_and_repeat() -> Result<(), String> {
         let config = parse(&[
             "--relay-stats",
             "r",
@@ -292,7 +291,7 @@ mod tests {
             format!("(default {DEFAULT_MAX_REQUESTS})"),
             format!("(default {DEFAULT_MAX_CONNECTIONS})"),
             format!("(default {})", crate::snapshot::DEFAULT_REFRESH.as_secs()),
-            format!("(default {DEFAULT_ORIGIN})"),
+            "(default none: no other site's page may read the API)".to_owned(),
             format!("(default {})", crate::mlat::DEFAULT_MAX_AGE.as_secs()),
         ] {
             assert!(USAGE.contains(&stated), "the help does not say {stated}");

@@ -31,11 +31,19 @@
 //!   receiver standing (RFC-0174 §2.12) is earned only by receptions the seated engine solves, so
 //!   ranking by it would keep a receiver once seated seated forever and one never seated out, and it
 //!   is a bar the merge applies to solutions, not an order of who may be heard.
+//! - **A batch before its receiver's description** waits for it ([`Intake::hold_orphan`]): a batch
+//!   can reach a holder before its receiver's description (a repair, a rebuild from parity, a link
+//!   that died between them, or a description that takes effect at the next step), and is forwarded
+//!   once, so one turned away is lost to MLAT. It is held, within `ORPHANS_PER_RECEIVER` a receiver
+//!   and the intake's bound on receivers, for `ORPHAN_MS` of its holder's steps
+//!   ([`Intake::expire_orphans`]), and taken when the description comes ([`Intake::take_orphans`]),
+//!   by whichever holder: an engine holding its own raw and a relay's raw shards alike.
 //! - **Late by the stamp** (`held::Closing`): an intake whose raw arrives on threads of its own
 //!   while its holder steps on another ([`Intake::closing`], a relay's raw shards) refuses as late
 //!   the raw stamped at or after the step that takes its bin, so a batch that raced ahead of that
 //!   step is late exactly as one that came after it.
 
+use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
@@ -53,6 +61,32 @@ const REORDER: u64 = 64;
 /// Boots remembered per receiver, most recent first. A receiver that restarts more often than
 /// this within one window only weakens its own replay protection.
 const BOOTS_PER_RECEIVER: usize = 8;
+/// Batches held for one receiver not yet described, at most (module docs): the oldest goes first.
+pub const ORPHANS_PER_RECEIVER: usize = 64;
+/// Receivers whose batches an intake holds waiting for a description, at most, unless its holder
+/// says otherwise ([`Intake::orphan_receivers`]): one more is dropped, counted.
+pub const ORPHAN_RECEIVERS: usize = 4_096;
+/// How long, by its holder's steps, a batch waits for its receiver's description: as long as what
+/// it says to provisional solving can still be weighed in time and its raw is not yet late (a bin's
+/// settling and a step). A description later than that is not coming by the same way.
+pub const ORPHAN_MS: u64 = 3_000;
+
+/// A batch waiting for its receiver's description, stamped when it came, with what its holder
+/// charged for holding it (dropped when the batch is let go).
+struct Orphan {
+    batch: Arc<Decoded>,
+    stamp_ms: u64,
+    _hold: Box<dyn Any + Send>,
+}
+
+/// What holding, expiring or taking batches waiting for a description let go.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Orphaned {
+    /// Dropped for room: beyond `ORPHANS_PER_RECEIVER` a receiver, or the intake's receivers.
+    pub dropped: u64,
+    /// Expired: waited `ORPHAN_MS` and no description came.
+    pub expired: u64,
+}
 
 /// Where a described receiver stands for room.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -342,6 +376,9 @@ pub struct Intake {
     /// How lateness is decided by the stamp, if it is (`closing`); kept across a restart.
     closing: Option<Closing>,
     dropped: Dropped,
+    /// Batches of receivers not described yet, by receiver, oldest first (module docs).
+    orphans: BTreeMap<PublicKey, VecDeque<Orphan>>,
+    orphan_receivers: usize,
 }
 
 impl Described {
@@ -362,7 +399,80 @@ impl Intake {
             open: Open::new(limits),
             closing: None,
             dropped: Dropped::default(),
+            orphans: BTreeMap::new(),
+            orphan_receivers: ORPHAN_RECEIVERS,
         }
+    }
+
+    /// Holds batches waiting for a description of at most `receivers` receivers (a relay's raw
+    /// shards share `ORPHAN_RECEIVERS` among them).
+    #[must_use]
+    pub fn orphan_receivers(mut self, receivers: usize) -> Self {
+        self.orphan_receivers = receivers;
+        self
+    }
+
+    /// Holds `batch`, stamped `stamp_ms`, of a receiver not described here, until its description
+    /// comes or `ORPHAN_MS` of steps pass; `hold` is what its holder charged for it, let go with
+    /// it. The oldest of the receiver's goes first beyond `ORPHANS_PER_RECEIVER`, and a receiver
+    /// beyond the intake's bound is not held: each counted.
+    pub fn hold_orphan(
+        &mut self,
+        batch: &Arc<Decoded>,
+        stamp_ms: u64,
+        hold: Box<dyn Any + Send>,
+    ) -> Orphaned {
+        let mut orphaned = Orphaned::default();
+        let key = batch.receiver();
+        if self.receivers.contains_key(&key) {
+            return orphaned;
+        }
+        if !self.orphans.contains_key(&key) && self.orphans.len() >= self.orphan_receivers {
+            orphaned.dropped += 1;
+            return orphaned;
+        }
+        let waiting = self.orphans.entry(key).or_default();
+        if waiting.len() >= ORPHANS_PER_RECEIVER {
+            waiting.pop_front();
+            orphaned.dropped += 1;
+        }
+        waiting.push_back(Orphan {
+            batch: Arc::clone(batch),
+            stamp_ms,
+            _hold: hold,
+        });
+        orphaned
+    }
+
+    /// Lets go every batch that has waited `ORPHAN_MS` by the step at `now_ms`.
+    pub fn expire_orphans(&mut self, now_ms: u64) -> Orphaned {
+        let mut orphaned = Orphaned::default();
+        self.orphans.retain(|_, waiting| {
+            let before = waiting.len();
+            waiting.retain(|orphan| orphan.stamp_ms.saturating_add(ORPHAN_MS) > now_ms);
+            orphaned.expired += (before - waiting.len()) as u64;
+            !waiting.is_empty()
+        });
+        orphaned
+    }
+
+    /// The batches that waited for `receiver`'s description, oldest first, each with its stamp:
+    /// for its holder to take now that it is described (their holds let go).
+    pub fn take_orphans(&mut self, receiver: &PublicKey) -> Vec<(Arc<Decoded>, u64)> {
+        self.orphans
+            .remove(receiver)
+            .map(|waiting| {
+                waiting
+                    .into_iter()
+                    .map(|orphan| (orphan.batch, orphan.stamp_ms))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Batches waiting for a description.
+    pub fn orphans(&self) -> usize {
+        self.orphans.values().map(VecDeque::len).sum()
     }
 
     /// Raw late by its stamp under `closing` (module docs): for an intake whose holder steps on a
@@ -418,6 +528,19 @@ impl Intake {
     /// A receiver's description (verified here: it is the receiver's own word). An error is one
     /// that does not verify.
     pub fn describe(&mut self, info: &ReceiverInfo) -> Result<Description, String> {
+        self.describe_after(info, None)
+    }
+
+    /// As `describe`, at a step of a holder whose earlier steps are not all done: what a receiver
+    /// that stops taking part (it, or one whose seat it changed) held in the bins through `kept`
+    /// stays for those steps to take, as they would have had they run in their turn
+    /// (`held::Open::forget_receiver_after`); its holder forgets it in the sealed bins at this
+    /// step. `None`: everything it held here goes now.
+    pub fn describe_after(
+        &mut self,
+        info: &ReceiverInfo,
+        kept: Option<i64>,
+    ) -> Result<Description, String> {
         let ignored = Description {
             ingested: Ingested::Ignored,
             left: Vec::new(),
@@ -453,8 +576,8 @@ impl Intake {
         known.clock = content.clock;
         known.site = site;
         let changed = self.seats.rank(key, site.is_none());
-        let mut description = self.settle_all(changed);
-        if self.settle_was(&key, was) {
+        let mut description = self.settle_all(changed, kept);
+        if self.settle_was(&key, was, kept) {
             description.left.push(key);
         }
         let seated = self.receivers.get(&key).is_some_and(|known| known.seated);
@@ -471,7 +594,7 @@ impl Intake {
     }
 
     /// Settles every receiver of `changed` this intake holds; the rest are another intake's.
-    fn settle_all(&mut self, changed: Vec<PublicKey>) -> Description {
+    fn settle_all(&mut self, changed: Vec<PublicKey>, kept: Option<i64>) -> Description {
         let mut description = Description {
             ingested: Ingested::Ignored,
             left: Vec::new(),
@@ -479,7 +602,7 @@ impl Intake {
         };
         for other in changed {
             if self.receivers.contains_key(&other) {
-                if self.settle(&other) {
+                if self.settle_after(&other, kept) {
                     description.left.push(other);
                 }
             } else {
@@ -495,14 +618,19 @@ impl Intake {
     /// whole from then on, and counted. Settling twice, or late, is settling once: it reads where
     /// the receiver stands now.
     pub fn settle(&mut self, receiver: &PublicKey) -> bool {
+        self.settle_after(receiver, None)
+    }
+
+    /// As `settle`, its raw through `kept` left for the steps already due (`describe_after`).
+    pub fn settle_after(&mut self, receiver: &PublicKey, kept: Option<i64>) -> bool {
         let was = self
             .receivers
             .get(receiver)
             .is_some_and(Described::taking_part);
-        self.settle_was(receiver, was)
+        self.settle_was(receiver, was, kept)
     }
 
-    fn settle_was(&mut self, receiver: &PublicKey, was: bool) -> bool {
+    fn settle_was(&mut self, receiver: &PublicKey, was: bool, kept: Option<i64>) -> bool {
         let place = self.seats.place(receiver);
         let Some(known) = self.receivers.get_mut(receiver) else {
             return false;
@@ -522,7 +650,10 @@ impl Intake {
             if let Some(known) = self.receivers.get_mut(receiver) {
                 known.boots.clear();
             }
-            self.open.forget_receiver(receiver);
+            match kept {
+                Some(kept) => self.open.forget_receiver_after(receiver, kept),
+                None => self.open.forget_receiver(receiver),
+            }
         }
         left
     }
@@ -564,7 +695,7 @@ impl Intake {
             }
         }
         for (key, _, was) in decided {
-            if self.settle_was(&key, was) {
+            if self.settle_was(&key, was, None) {
                 description.left.push(key);
             }
         }
@@ -582,6 +713,7 @@ impl Intake {
             None => Open::new(limits),
         };
         self.dropped = Dropped::default();
+        self.orphans.clear();
     }
 
     /// The site a declared location and clock give, if the receiver takes part.
@@ -614,6 +746,18 @@ impl Intake {
         batch: &Decoded,
         take: &mut dyn FnMut(usize) -> bool,
     ) -> (Ingested, Vec<Note>) {
+        self.ingest_verified_taking_at(batch, None, take)
+    }
+
+    /// As `ingest_verified_taking`, the batch taken as stamped `stamp_ms` when given (never earlier
+    /// than its own stamp, `held::Open::add_decoded_taking_at`): a batch that waited for its
+    /// receiver's description, taken as of the step that let it in.
+    pub fn ingest_verified_taking_at(
+        &mut self,
+        batch: &Decoded,
+        stamp_ms: Option<u64>,
+        take: &mut dyn FnMut(usize) -> bool,
+    ) -> (Ingested, Vec<Note>) {
         let key = batch.receiver();
         let Some(known) = self.receivers.get_mut(&key) else {
             return (Ingested::Ignored, Vec::new());
@@ -625,9 +769,13 @@ impl Intake {
             return (Ingested::Replayed, Vec::new());
         }
         let notes = notes_of(batch);
-        let added = self.open.add_decoded_taking(batch, take);
+        let added = match stamp_ms {
+            Some(stamp_ms) => self.open.add_decoded_taking_at(batch, stamp_ms, take),
+            None => self.open.add_decoded_taking(batch, take),
+        };
         self.dropped.late += added.late as u64;
         self.dropped.refused += added.refused as u64;
+        self.dropped.ahead += added.ahead as u64;
         (
             Ingested::Batch {
                 new: added.new,

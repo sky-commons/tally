@@ -1,2 +1,5 @@
 # Build helpers for tally/ itself (exported with the public repository).
-exports_files(["opt.bzl"])
+exports_files([
+    "opt.bzl",
+    "resources.bzl",
+])

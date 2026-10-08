@@ -49,10 +49,21 @@ Measured on main (tally-load, commit b3e3571809 on branch tally-load):
    regional record copies nothing, and so is the relay's deduplicated stream
    (`Batch::sign_relay_draft`): the sealer signs each epoch's stream in its pool while it still holds
    the epoch's batches (§4), so no kept reception is ever copied out of its batch.
-2. **Ingest stage on a dedicated CPU pool**, not Tokio workers. Connection tasks do I/O only, with a
-   credit of k=2 batches in flight per connection; out of credit, stop reading the socket (TCP
-   pushes back; the feeder's signed `dropped` records its own loss). Workers: verify, hash, admit
-   (per-receiver sequence/dedup, owned by receiver shard), inflate, decode.
+2. **Ingest stage on a dedicated CPU pool**, not Tokio workers. Connection tasks do I/O only, each
+   within an allowance of bytes in flight carved for it when it is admitted (`ingest::Allowance`,
+   from `Store::Ingest`); with its allowance held, it stops reading the socket (TCP pushes back; the
+   feeder's signed `dropped` records its own loss). Workers: verify, hash, admit (per-receiver
+   sequence/dedup, owned by receiver shard), inflate, decode.
+
+   As built: the allowance is counted in bytes as a batch is charged (`ingest::charge_of`: signed,
+   inflated and referenced), never in batches, so a peer sending 64 KiB batches holds no more than
+   one sending 8 KiB ones. A feeder's is `ingest::FEEDER_ALLOWANCE`, `CREDIT` (2) planned batches'
+   charge, which its reservation planned (`PerFeeder::ingest`); a member session's is the same, from
+   the members' pool (`Plan::per_member`), since what it forwards arrives as feeders' batches. A
+   batch larger than its connection's whole allowance waits until the connection holds nothing and
+   takes the rest from one oversize room shared by every connection (`ingest::OVERSIZE_BYTES`, 64
+   MiB), planned in the budget beside the base (`Plan::oversize`). The charge travels with the batch
+   until the next store holds its bytes, so the allowance is released only then.
 
    As built: each signature is verified strictly, one at a time, never by Ed25519 batch
    verification. A batch equation accepts some signatures strict verification refuses (a torsion
@@ -80,8 +91,8 @@ Measured on main (tally-load, commit b3e3571809 on branch tally-load):
    (`QUEUE_SLICES` slices per producer), not one per (producer, shard): a producer sends each thread
    one slice per batch covering every shard that thread owns, so a queue per shard would multiply the
    sends by the shards a thread owns and buy no ordering the watermark does not already give. A
-   producer that finds a queue full waits, which holds its connections' credit: the back-pressure raw
-   meets (§10).
+   producer that finds a queue full waits, its batches' charges still held against their connections'
+   allowances, so those connections' sockets stay unread: the back-pressure raw meets (§10).
 
    The dedup window changed with the epochs, and is now stated (`DEDUP_WINDOW_MS`, 2 s): a copy of
    a message stamped up to 2 s after the copy kept is never kept again. The deduplication before the
@@ -121,14 +132,46 @@ Measured on main (tally-load, commit b3e3571809 on branch tally-load):
 
    The hosted MLAT steps on the same watermark: once per `STEP_MS` grid point the products'
    watermark passes, in order. Its raw is late by its stamp (raw stamped at or after the step that
-   takes its bin is late, whenever it arrived), and provisional solving weighs a step's notes in
-   content order. What batches tell provisional solving is held until the step that weighs it has
-   read it, charged to its own store (`Store::Notes`) before it is held. A step waits for the one
-   before it, up to `mlat_host::STEPS_BEHIND` (4) steps the watermark has passed and that have not
-   started; past them the oldest is shed, whole and counted (§9, §10), so the steps MLAT is behind
-   by are bounded and so is what it holds while it is: `INTERVALS_HELD` (7) step intervals of a
-   feeder's decoded batches and the notes a step admits a seat, and its open raw over the settle and
-   those steps (`OPEN_MS`, 7 s).
+   takes its bin is late, whenever it arrived), and never ahead of it: raw of a bin that begins more
+   than `held::AHEAD_MS` (1 s) past its batch's stamp is refused and counted, so no bin opens that
+   the steps never reach (a receiver stamping its batches in the future once held its open raw for
+   ever and filled the store every honest receiver's is charged to). Provisional solving weighs a
+   step's notes in content order. What batches tell provisional solving is held until the step that
+   weighs it has read it, charged to its own store (`Store::Notes`) before it is held.
+
+   A receiver's description is stamped too, by the watermark when the relay keeps it (never before
+   one the host was asked with), and takes effect at the step after its stamp, applied as the
+   watermark passes that step, before anything of the step runs, in the order of the descriptions'
+   stamps, keys and bytes. A batch is taken as its receiver stood when its step interval began: one
+   stamped in an interval whose descriptions are not yet applied waits in its raw shard until they
+   are; one of a receiver not described waits for its description (`intake::Intake::hold_orphan`,
+   its own store `Store::Orphans`, let go by the steps after `intake::ORPHAN_MS`, 3 s) and is taken
+   as the last thing of the interval before the step that applies it. A receiver that stops taking
+   part keeps its raw in the bins the steps already due take, and is forgotten in the sealed bins
+   when its window step starts; a window step fits with the sites its descriptions left. Before,
+   a description took effect when it arrived, before or after a window step, so a seat that changed
+   midway made different bytes by thread timing; `staged_mlat` now holds the bytes with a receiver
+   described again midway and one described first midway, with delays inside every stage, and the
+   reference drive (`tally_mlat::replay`) applies descriptions the same way. As built, a relay
+   stamps a description by its products' watermark when the hub keeps it; a description the hub
+   kept is not routed through the ingest stage's stamps, so how the same trace's descriptions fall
+   against its batches depends on that watermark when the hub kept them.
+
+   Window steps (a step's seal, then its window) and provisional steps run apart, each kind one at a
+   time and in order: a window step's fits take seconds, and a provisional step waiting behind them
+   came too late for the live world. A provisional step carries the models of the window steps
+   `engine::MODELS_RIPEN_MS` (5 s) before it, in line and hosted alike, and starts once they have
+   reported, which a host shedding no window step has always done (it is at least the window steps
+   it may fall behind). Each kind waits for the one before it up to its own limit, steps the
+   watermark has passed and that have not started: `mlat_host::STEPS_BEHIND` (4) window steps, past
+   which the oldest is shed, its bins taken and sealed at once (after the seal in flight, if one
+   is), and `mlat_host::PROVISIONAL_BEHIND` (1) provisional step, past which the oldest is shed,
+   whole and counted (§9, §10), so a provisional step starts within one step of its turn and its
+   positions reach the live world before their second is sealed. So the steps MLAT is behind by are
+   bounded and so is what it holds while it is: `INTERVALS_HELD` (4) step intervals of a feeder's
+   decoded batches and notes at `NOTES_HEADROOM` (four times) the planned rate, each interval
+   bounded by its share of the store so a host that sheds nothing never fills it, and its open raw
+   over the settle, those window steps and `AHEAD_MS` (`OPEN_MS`, 7 s, and 1 s ahead).
 
    Measured at 20,000 feeders before the pool: the single sealer thread held a whole core and fell
    behind (deriving the regional batches' ADS-B fixes was 70% of it, `to_observation` 20%, signing
@@ -150,7 +193,8 @@ Measured on main (tally-load, commit b3e3571809 on branch tally-load):
    the window's raw alone. As built the two halves are two stores, each charged before it holds a
    byte: sealed raw is `Store::Held` (0.75 MB a receiver), checked on each whole bin as it is sealed
    and charged as it is inserted; open raw is `Store::Open`, over the settle and the steps MLAT may
-   fall behind (`mlat_host::OPEN_MS`, 7 s: 0.64 MB a receiver at its ceiling), charged by each raw
+   fall behind (`mlat_host::OPEN_MS`, 7 s) and the second a bin may open ahead of its batch's stamp
+   (`held::AHEAD_MS`): 0.69 MB a receiver at its ceiling, charged by each raw
    shard as it grows (`held::Open::add_decoded_taking` asks for every byte before it allocates it;
    one refused refuses the batch's raw of the bin, counted).
 6. **One batch byte store**: shared `Bytes` keyed by (receiver, boot, seq); others hold handles.
@@ -186,17 +230,25 @@ Measured on main (tally-load, commit b3e3571809 on branch tally-load):
    - **The grant.** `TagKeys`, signed by the feeder, names the member, the key in force (its id is
      the key period, `wall_ms / KEY_PERIOD_MS`, five minutes) and the next, and how long until the
      next takes over by the member's clock. It rides in a `DeliveryQuery` (so a `Probe` session
-     still sends only `Echo` and `DeliveryQuery`), every minute to any member of the area not yet
-     given the current period's key, and again with every audit question. Signed, because the
-     query is not: a key from anyone else would make every tag that member makes fail and void the
-     feeder's audits. A member takes it only for a feeder of an area it takes, only addressed to
-     itself, and never older than the keys it holds.
+     still sends only `Echo` and `DeliveryQuery`), every minute to any member drawn for the period
+     not yet given its key, and again with every audit question. The members given keys are at most
+     `KEYED_MEMBERS` (16), drawn at random from every member the feeder may ask afresh each key
+     period, and a member not drawn has its keys dropped, so whoever reached the feeder first (a set
+     of Sybils after a restart) judges for one period at most. Signed, because the query is not: a
+     key from anyone else would make every tag that member makes fail and void the feeder's audits.
+     A member takes it only for a feeder of an area it takes that fed it a batch within the window
+     (so fresh keys that never fed cost it nothing), only addressed to itself, and never older than
+     the keys it holds.
    - **The tag.** BLAKE2s-256 over a domain, k_m and the batch's signed bytes, first 16 bytes, with
      the key's id: `delivery_tag`. A member keeps an entry of 40 bytes (sequence, arrival, key id,
-     tag) per batch for W, tagged or not, sharded by receiver under a process-secret hash. 20,000
-     feeders at one batch a second: 6 M entries, 240 MB (`PER_FEEDER_BYTES` = 12 KB), bound at
-     `TAGS_HELD` = 8 Mi entries (320 MiB); past it a batch is refused whole, counted, and never
-     denied.
+     tag) per batch for W, tagged or not, only for a receiver of the areas it takes (the relay's own
+     regions decide, as for the answer's "takes the area"), sharded by receiver under a
+     process-secret hash, each stream kept in sequence order so a query's batches are found by
+     binary search. 20,000 feeders at one batch a second: 6 M entries, 240 MB (`PER_FEEDER_BYTES` =
+     12 KB), bound per receiver at `ENTRIES_PER_RECEIVER` (twice a feeder's rate over W, so one
+     receiver fills only its own share) and in all at `TAGS_HELD` = 8 Mi entries (320 MiB); past
+     either a batch is refused whole, counted, and never denied. A session is answered a few
+     queries at once and one more a second.
    - **The verdict.** The feeder recomputes the tag from its copy of the audited batch and the key
      it gave that member, and takes it only under a key in force when it sent the batch (its period
      or one either side, `tag_keys_for`). It keeps keys for the two periods before the current, so
@@ -204,9 +256,10 @@ Measured on main (tally-load, commit b3e3571809 on branch tally-load):
      It asks only about batches sent within `ASK_WITHIN_MS` (W less the longest ask), so the tag is
      still held. Majority and votes are unchanged: a network votes on a batch when a member of it
      proved it or signed "not seen".
-   - **"Not seen" only when known.** A member says "not seen" only after it has watched for a whole
-     window (since its first call: a restarted relay denies nothing for W) and holds no entry for
-     the batch at or above its stream's horizon. A batch that came while it held no key for the
+   - **"Not seen" only when known.** A member says "not seen" only after it has watched the
+     receiver for a whole window (since its first batch here: a restarted relay, or a receiver only
+     now in its areas, is denied nothing for W; a receiver it does not watch, nothing ever) and
+     holds no entry for the batch at or above its stream's horizon. A batch that came while it held no key for the
      feeder has an entry and no tag, and is left out, as is one refused or let go.
    - **The feeder's ledger.** Per batch first written within the window: (boot, sequence, first
      written, wall clock, a 16-bit relay mask over a slot table), 48 bytes, at most 1,024; a batch
@@ -249,15 +302,22 @@ Measured on main (tally-load, commit b3e3571809 on branch tally-load):
    As built (`tally-relay`'s `budget`): every store and every queue whose size grows with what feeders
    send is a `Store`, with a per-feeder cost over its own window, reserved at admission: the batch
    byte store, `Held`, the fingerprints (as if every reception were new, with the tables' room to
-   double), the fan-out, the delivery tags, the ingest stage's credit, the epochs' decoded batches
+   double), the fan-out, the delivery tags, a connection's ingest allowance (`FEEDER_ALLOWANCE`) and
+   its Noise buffers (`BUFFERS_PER_CONNECTION`, every other connection's from room the plan sizes to
+   `--max-connections`, `Plan::connection_buffers`), the epochs' decoded batches
    between ingest and the sealer (`seal::EPOCHS_HELD`, 3 epochs), and what the products hold until
    the hub takes it (`products::OUTBOX_EPOCHS`, 2: the signed records only, every reception as an
    encoded observation in two of them, its stream's batch and its area's regional batch: 48 bytes a
    reception, where the owned copy the stream used to hold was planned at 54 alone); and, where the
    relay hosts MLAT, its sealed raw (`Held`), its open raw (`Open`), what batches told provisional
-   solving (`Notes`) and the engine's own tables (`Engine`: the receptions waiting for provisional
-   solving, `Capacity::waiting`, 1,116 a seat at `provisional::WAITING_BYTES`, and a window step's
-   working set, `SOLVE_BYTES_PER_RECEIVER`, 192 KiB a seat, reserved while it runs). Each store has a gauge whose limit is its share
+   solving (`Notes`, `mlat_host::notes_per_feeder`: the intervals held at `NOTES_HEADROOM`, the one
+   figure a step's count is bounded by too, so the bytes a step admits are what the store holds;
+   before, the count allowed four times the planned rate and the bytes covered one), the batches
+   waiting for their receiver's description (`Orphans`, `mlat_host::orphans_per_feeder`, before
+   charged to `Notes` with nothing reserved and let go only when another came) and the engine's own
+   tables (`Engine`: the receptions waiting for provisional solving, `Capacity::waiting`, 1,116 a
+   seat at `provisional::WAITING_BYTES`, and a window step's working set,
+   `SOLVE_BYTES_PER_RECEIVER`, 192 KiB a seat, reserved while it runs). Each store has a gauge whose limit is its share
    at the ceiling, charged for what the store really holds and released when it lets go (a decoded
    batch by `Decoded::footprint`, a record by `Record::encoded_len`, the one size of either). A
    charge is taken before the bytes are held: there is no way to charge a gauge past its limit
@@ -268,14 +328,52 @@ Measured on main (tally-load, commit b3e3571809 on branch tally-load):
    counts it; the products refuse an epoch's records (its stream's batches among them) whole, and a
    peer's record alone; the
    fan-out lets go the subscriber holding most until the item fits, and lets go those it was for if
-   it never does; hosted MLAT refuses a step's notes whole, a batch's open raw of its bin, a sealed
-   bin whole, a batch's replies to provisional solving whole, each counted, and sheds whole steps it
-   falls behind on (§10). A sharing member reserves the
-   feeders its ingest ceiling is worth (`--max-member-bytes-per-sec` over a planned feeder's rate)
-   for as long as it is a member. A relay whose memory admits no feeder refuses to start
-   (`Budget::check`). `tally-relay check` makes every refusal a start makes, along the start's own
-   path, and prints the memory plan; the packaged unit is held to it by `//tally/crates/relay:check`,
-   and an operator holds its own deploy to it the same way (ours: `//infra/tally:relay_config_test`). The gauges are served on `GET /memory`.
+   it never does; hosted MLAT refuses a step's notes whole (past its count or its share of
+   `Notes`, by the trace), a batch's open raw of its bin, raw ahead of its stamp, a sealed bin
+   whole, a batch's replies to provisional solving whole and a batch waiting for a description
+   `Orphans` cannot hold, each counted, and sheds whole steps it falls behind on (§10). A member is a
+   session over which another relay's data comes in: a relay whose offer this one verified dialling
+   it, or this relay's own one-hop raw link (a link this relay dials only to send a member what is
+   addressed to it, or to an upstream for the directory, brings no data in and is none). The
+   members share one rate, `--max-member-bytes-per-sec` all together (by default 1 MiB/s; a
+   whole-world relay sharing its products, about 4.2 MB/s, raises it with the memory to match),
+   held by one pace each waits its turn on (`ceiling::Pace`) and planned once as the feeders it is
+   worth (128 at the default), and each member session carves its own ingest allowance from a pool
+   sized at start for every member session the protocol lets the relay's areas bring
+   (`budget::members_for`: an area's groups are the relays offering its cell or an ancestor's, at
+   most `OFFERS_PER_CELL` a cell, so a relay taking region `r` may be dialled by whoever offers a
+   cell above `r`, `r` itself or a cell under it down to the area's resolution, at most
+   `OFFERS_HELD`, and hosting MLAT it dials each of them for raw once per `MAX_REGIONS` cells of its
+   border band; never more than `--max-connections`, under which every session in or out holds a
+   place, `Hub::dialled`), for as long as each is a member (`Plan::with_members`,
+   `Budget::reserve_member`): feeders never take the members' room, a relay full of feeders still
+   takes its members, and no operator picks a member count a protocol-legal link could exceed. The budget is
+   `--memory`, by default the memory the relay runs in (the lesser of its cgroup's `memory.high` and
+   `memory.max`, its own and its ancestors', else the host's) less `budget::HEADROOM_BYTES` (64 MiB,
+   what no store charges: the allocator's unreturned pages, stacks, the kernel's socket buffers);
+   `--memory` above that is refused. Before any feeder the budget plans, each on its own line: the
+   base, the oversize room (`Plan::oversize`), the Noise buffers of every connection the cap allows
+   but a feeder's, which a feeder's reservation holds (`Plan::connection_buffers`, from
+   `--max-connections`), and the members' pool (their shared rate's feeders' worth less the buffers
+   and allowances, and each member session's allowance). A relay whose budget cannot hold these and
+   one feeder refuses to start (`Budget::check`). `tally-relay check` makes every refusal a start
+   makes, along the start's own path, and prints the memory plan (the member sessions, each one's
+   share, their rate's feeders and pool, the headroom); the packaged unit is held to it by
+   `//tally/crates/relay:check`, with no area and with a base cell taken, and an operator holds its
+   own deploy to it the same way (ours: `//infra/tally:relay_config_test`, which also holds that a
+   relay taking areas plans their members and one taking none plans none). The gauges are served on
+   `GET /memory`.
+
+   Why the pool (2026-10-08): members once reserved from the feeders' room, as 1,024 feeders at the
+   then default 8 MiB/s. 576 MiB admitted 107 feeders and 2 GiB some 640, so every sharing member was
+   refused full and cross-relay sharing and MLAT raw never flowed; the checks asked only that one
+   feeder fit, and the budget was all of `memory.max` with no headroom and ignored `MemoryHigh`, so
+   no check could fail. The pool then held `--max-members` (default 1) members, each the feeders its
+   own ceiling was worth, and counted every session with a verified relay as one, this relay's own
+   one-hop raw links and its dials to send included: with the default a second relay's raw link was
+   turned away ("no spare member slot"), so a network of more than two relays shared and solved
+   nothing until its tests raised the count to 32. Members now are what the areas bring, and their
+   rate is planned once.
 
    Why (measured 2026-10-08, 20,000 feeders on one 32-core host): the relay's resident memory grew
    about 330 MB/s, unbounded, to 18 GB in 160 s. It was decoded batches: the sealer's queue was
@@ -288,13 +386,18 @@ Measured on main (tally-load, commit b3e3571809 on branch tally-load):
     products; refusal whole, counted, for delivery tags (a batch past `TAGS_HELD` is never tagged and
     never denied, §7); disconnection for fan-out (§8); for hosted MLAT that cannot keep up, whole
     steps shed, counted. MLAT never pushes back on ingest and never grows: while the watermark has
-    passed more than `STEPS_BEHIND` steps that have not started, the oldest is shed, its provisional
-    solving let go (every batch whose notes it held counted, `MlatReport::shed`, the step counted,
-    `steps_shed`), its bins taken and sealed at once, and its window step the next one's, which
-    solves every window due as one that ran late would. What is lost is provisional positions, never
-    a window. A host within `STEPS_BEHIND` of the watermark sheds nothing, so the same stamped trace
-    still makes the same bytes; one further behind is shed by how far behind it is, which no trace
-    decides. Changed from "back-pressure for delivery and
+    passed more than `STEPS_BEHIND` window steps that have not started, the oldest is shed (counted,
+    `steps_shed`), its bins taken at once and sealed then, or once the seal in flight has reported,
+    and its window step the next one's, which solves every window due as one that ran late would;
+    while it has passed more than `PROVISIONAL_BEHIND` provisional steps that have not started, the
+    oldest is shed, its provisional solving let go (every batch whose notes it held counted,
+    `MlatReport::shed`, the step counted, `provisional_steps_shed`). What is lost is provisional
+    positions, never a window. A host within those limits of the watermark sheds nothing, so the
+    same stamped trace still makes the same bytes; one further behind is shed by how far behind it
+    is, which no trace decides. Before, a step shed only while no seal was in flight, so a slow seal
+    let the steps queued behind it grow without bound; and a provisional step waited for the window
+    step before it, so a provisional position could wait five steps and a seal, past the live
+    world's seal. Changed from "back-pressure for delivery and
     fan-out" as built: back-pressure from either would let one slow subscriber, or a full tag store,
     stall ingest for every feeder, and both have a loss that is counted and told (a "fell behind"
     Goodbye, a batch left out of the audit) where back-pressure's is everyone's.
@@ -318,9 +421,17 @@ Measured on main (tally-load, commit b3e3571809 on branch tally-load):
 1. Thread-count independence: same stamped trace at 1, 2, 8, 32 threads gives byte-identical MLAT
    models, positions, provisionals, world/precise parts, standing, regional record sequence.
 2. No consumer reads a clock: decisions use `stamp_ms`; injected queue delays change nothing,
-   for hosted MLAT while it is within `STEPS_BEHIND` steps of the watermark (past them it sheds
-   whole steps, counted, §10; `staged_mlat` holds the bytes with delays inside that, and
-   `mlat_host`'s tests hold the shedding and every store within its limit outside it).
+   for hosted MLAT while it is within its limits of the watermark (`PROVISIONAL_BEHIND`,
+   `STEPS_BEHIND`; past them it sheds whole steps, counted, §10; `staged_mlat` holds the bytes with
+   delays inside that, descriptions midway included, and `mlat_host`'s tests hold the shedding,
+   exactly one step for every step past a limit with a seal held shut, and every store within its
+   limit outside it). The tests that run relays hosting MLAT over sockets (the relay's
+   `tests/mlat_host.rs`, the API's end to end) step their relays' ingest clock a step at a time
+   (`mlat_host::stepping`), only once every relay has been offered what was fed and has stepped
+   and published, never past the wall clock, and assert in stamps: a provisional record is published
+   within `WORLD_SETTLE_MS` of its newest transmission, and every one published before its
+   second's seal is in the live world for that second. How fast on the wall clock is a bed's to
+   measure (`tally-load --streams provisional`), not a test's.
 3. MLAT/world output unchanged under permutation and duplication between two watermarks.
 4. `Bin::seal_from(fragments)` byte-equal to `Bin::seal` for any split by receiver.
 5. Dedup across shards exact: a message via k receivers on k workers is gathered once per window.
@@ -382,8 +493,9 @@ A line through the MLAT runs (least squares) is 843 MiB and 3.30 MiB a feeder, a
 differences from the runs without it 569 MiB and 2.90 MiB a feeder; through the 500 and 2,000
 points alone it meets zero feeders below zero. None of these intercepts is a base: what MLAT holds
 grows faster than any line where the engine falls behind, and is still rising at the end of each
-run. Its base is what it holds before any feeder, 2.5 MiB, and `budget::MLAT_BASE_BYTES` is 4 MiB,
-in the relay's base (`budget::Plan::base`) when it hosts MLAT.
+run. Its base is what it holds before any feeder, 2.5 MiB, and `budget::MLAT_BASE_BYTES` is 8 MiB
+(4 MiB for that, and the 4 MiB bound on the signed records not yet taken,
+`mlat_host::PUBLISHED_BYTES`), in the relay's base (`budget::Plan::base`) when it hosts MLAT.
 
 What those runs showed was that MLAT's memory was not held to the budget. At 5,000 feeders the
 relay was 17 GB resident under a 14 GiB `--memory`. Its notes to provisional solving were charged
@@ -428,7 +540,29 @@ to 50):
 
 Four threads on that host did not keep up with the window steps at 500 feeders and more (a window
 step took 17 to 60 s), so MLAT shed whole steps, counted, and stayed within its stores; at the
-deployed shape it kept up and shed nothing. 576 MiB now admits 107 MLAT feeders, not 167.
+deployed shape it kept up and shed nothing. 576 MiB then admitted 107 MLAT feeders, not 167.
+
+Since (the second sweep, 2026-10-08), what hosting MLAT reserves a feeder is sealed raw 0.75 MB,
+open raw 0.69 MB (the second a bin may open ahead of its stamp), notes 0.73 MB (sized from the
+same four times the planned rate their count is bounded by, over the four intervals a host that
+sheds nothing holds), the batches waiting for a description 0.13 MB (a store of their own) and the
+engine's tables 0.45 MB: 2.75 MB of MLAT stores, 0.52 MB more than before, so a given memory
+admits fewer MLAT feeders. The runs above were not repeated with it.
+
+**The deployed budgets now** (`tally-relay check`). Before any feeder a relay plans its base
+(293,601,024 bytes with MLAT), the oversize room (`ingest::OVERSIZE_BYTES`, 67,108,864), the Noise
+buffers of every connection its cap allows (`ingest::BUFFERS_PER_CONNECTION`, 131,070 each) and its
+members' pool, each on its own line of the plan; a feeder then reserves 3,654,510 bytes, and the
+budget keeps 67,108,864 of headroom below the memory it runs in. The public relay's 640 MiB limit is
+a 603,979,776-byte budget; with 128 connections (16,776,960) and its members' pool (125,974,272:
+the 128 member sessions its 122 base cells bring, capped by its connections, at 137,752 each, and
+their shared 256 KiB/s as 32 feeders' worth less buffers and allowances, 108,342,016), 27 feeders
+fit, 602,132,890 planned. The master's loopback relay (2 GiB, 2,048 connections, no area taken and
+so no member) admits 397; the packaged unit (`MemoryHigh=3G`) admits 690 as packaged and 495 with a
+base cell taken (2,048 member sessions and the default 1 MiB/s, 715,484,160). Every new line of the
+plan cost the public relay feeders it had been admitting without room for them: 107 before the
+members' pool, 75 with it, 31 once the connections' buffers, the oversize room and a feeder's
+allowance in bytes were planned, 27 once every member session its areas bring was.
 
 **What the areas cost at rest.** Taking the 122 resolution-0 areas once cost 530 MiB and a whole
 core with no feeder at all. As built: idle work follows activity, not the areas taken (`sharing`,
@@ -440,6 +574,7 @@ their fewest, every one: a cap of 64 offers a key once cut the public relay to i
 so it offered and solved MLAT for about half the world. The cap is now a network group's
 (`OFFERS_PER_KEY` = `OFFERS_PER_GROUP`, 256, at least the 122 base cells) and a relay whose areas
 need more cells refuses to start (`directory::offerable`). Measured (2026-10-08, release build, the
-deployed args): idle on four cores, 9.2 MiB resident and 0.3% of a core over 60 s; under
+deployed args): idle on four cores, 9.2 MiB resident and 0.3% of a core over 60 s (9.5 MiB and 0.4%
+again once its 128 member sessions were planned, on a host at load 60); under
 `tally-load` with 200 feeders offered and 107 admitted, 300 s, 391 MiB at its peak and 0.18 cores
 mean, MLAT shedding nothing. It fits its 640 MiB limit.

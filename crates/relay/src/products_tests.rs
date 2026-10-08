@@ -53,7 +53,8 @@ impl Staged {
     /// A receiver's batch, decoded and stamped: into its area's regional product, if any.
     fn feed(&self, batch: &Arc<Decoded>) {
         let area = self.products.area_for(&batch.receiver());
-        self.exchange.route(0, batch, area);
+        self.exchange
+            .route(0, batch, area, crate::ingest::InFlight::free());
         self.exchange.tick(0, stamp(batch.stamp_ms()));
     }
 
@@ -1135,7 +1136,7 @@ fn every_drop_is_counted_by_why() -> Result<()> {
     let sink = refusing.sink();
     // Thread 1's part of epoch 6 (its second message) never came.
     for (epoch, thread, seq) in [(5, 0, 0), (5, 1, 0), (6, 0, 1), (7, 0, 2), (7, 1, 2)] {
-        assert!(sink(part(epoch, thread, seq)));
+        assert!(sink(part(epoch, thread, seq)).is_ok());
     }
     assert_eq!(refusing.report().epochs_refused, 1);
     // Peers' regional batches past what waits to be forwarded.
@@ -1177,7 +1178,7 @@ fn records_wait_apart_from_the_epochs_and_are_taken_in_by_stamp() -> Result<()> 
             ..crate::exchange::Frozen::default()
         };
         assert!(
-            sink(marker),
+            sink(marker).is_ok(),
             "an epoch's word refused behind a flood of records"
         );
     }

@@ -356,7 +356,12 @@ trust: a bundle is checked record by record exactly as its cells would be.
 - Relays gossip offers the way they gossip `RelayList`, keep each until it expires, and hold at most
   32 offers per cell, at most 4 from one network. Within a cell, offers are held and answered by
   contribution tier first, then by rendezvous rank over (cell, key), never by arrival, so any two
-  relays that hold the same evidence and offers lay out the same trees. The tier is the bit length
+  relays that hold the same evidence and offers lay out the same trees. The bounds on a flood (a
+  network's offers anywhere, a key's, the directory's) are kept by rank too: a newcomer to a full
+  one displaces the offer under it lowest by tier, then deepest in its own cell's ranking, or is
+  refused. A held offer takes a change at most every ten seconds per key and cell (the newest
+  waiting its turn), so a peer re-signing changes in a loop costs its readers what an honest
+  relay's changes do. The tier is the bit length
   of the number of distinct networks whose relays, verified in the directory, signed receipts for
   what the relay delivered (§2.1's evidence, weighed by the one weigher); the relay's own network,
   feeder descriptions and claimed rates do not count, because feeder keys are free and one network
@@ -424,8 +429,9 @@ kinds skips it:
 | 0x21 | `WorldPrecise` | The precise world product (§2.11), the `WORLD_PRECISE` bit (128). |
 | 0x22, 0x23 | `DeliveryQuery`, `DeliveryAnswer` | The feeder's signed grant of tag keys to the member asked, and, in an audit, a nonce and a few batches named by boot and sequence; per batch, the member's tag made on arrival and its key's id, or "not seen", signed, answer format 2 (§2.2, RFC-0181 §7). Kinds of their own, not 0x13 and 0x14 read differently, so no build reads one form as the other. |
 
-A batch may be compressed (format 2, raw DEFLATE, inflating at most 1 MiB); a feeder compresses
-whenever it shrinks the batch, since every version 2 reader inflates it.
+A batch may be compressed (format 2, raw DEFLATE, inflating at most 1 MiB and at most 8 times its
+compressed stream, RFC-0171 §3.4); a feeder compresses whenever it shrinks the batch within that
+rule, since every version 2 reader inflates it.
 
 ### §2.11 Two products: regional and world
 

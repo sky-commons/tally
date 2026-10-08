@@ -44,6 +44,12 @@ impl Histogram {
         self.max
     }
 
+    /// The samples later than `ms` (below `MAX_MS`, the longest told apart).
+    pub fn over(&self, ms: u64) -> u64 {
+        let from = usize::try_from(ms).unwrap_or(MAX_MS).min(MAX_MS);
+        self.counts[from + 1..].iter().sum()
+    }
+
     /// The smallest latency at least `quantile` of the samples are at or under; `None` if empty.
     pub fn quantile(&self, quantile: f64) -> Option<u64> {
         if self.total == 0 {
@@ -75,6 +81,7 @@ mod tests {
         assert_eq!(histogram.quantile(0.5), Some(50));
         assert_eq!(histogram.quantile(0.99), Some(99));
         assert_eq!(histogram.quantile(1.0), Some(100));
+        assert_eq!((histogram.over(90), histogram.over(100)), (10, 0));
         let mut other = Histogram::default();
         other.record(90_000);
         histogram.merge(&other);

@@ -330,11 +330,12 @@ fn open_raw_costs_what_admission_reserves() {
 #[test]
 fn a_receivers_cost_follows_its_rates() {
     let cost = Rates::MEASURED.cost(2_000);
-    // A bin and its settling of wanted raw at the ceiling, 28 bytes each, and three open bins'
-    // allowance.
+    // A bin, its settling and the second it may open ahead of its stamp (`AHEAD_MS`) of wanted
+    // raw at the ceiling, 28 bytes each, and three open bins' allowance.
+    assert_eq!(AHEAD_MS, 1_000);
     assert_eq!(
         cost.open,
-        1_800 * 7 * OPEN_BYTES_PER_RECEPTION + 3 * OPEN_BYTES_PER_RECEIVER_BIN
+        1_800 * 8 * OPEN_BYTES_PER_RECEPTION + 3 * OPEN_BYTES_PER_RECEIVER_BIN
     );
     assert_eq!(
         cost.sealed,
@@ -465,6 +466,87 @@ fn raw_stamped_after_its_bins_step_is_late_whether_it_raced_ahead_or_not() -> Re
     // A holder with no closing decides by what it took alone.
     let mut open = Open::new(Limits::UNBOUNDED);
     assert_eq!(open.add_decoded(&after).new, 2);
+    Ok(())
+}
+
+/// Never ahead of the stamp (module docs): a holder that closes by the stamp opens no bin that
+/// begins more than `AHEAD_MS` past the batch's stamp. A receiver stamping its batches in the future
+/// opens nothing its steps would never reach, is counted, and holds no byte; a clock a little ahead
+/// is a clock that disagrees, and is held; and a batch taken later than it came is bounded by the
+/// stamp it is taken at.
+#[test]
+fn a_bin_far_ahead_of_its_batchs_stamp_is_refused_and_counted() -> Result<(), String> {
+    let closing = Closing {
+        step_ms: 1_000,
+        settle_ms: 2_000,
+    };
+    let liar = Identity::from_seed([8; 32]);
+    let honest = Identity::from_seed([9; 32]);
+    let stamp = 52_000;
+    let mut open = Open::new(Limits::UNBOUNDED).closing(closing);
+    let empty = open.bytes();
+    // Bins from one to an hour ahead, each a batch: none opened, every observation counted.
+    let mut ahead = 0;
+    for (n, lead) in [6_000u64, 60_000, 3_600_000].into_iter().enumerate() {
+        let batch = stamped(
+            &liar,
+            n as u64,
+            content(stamp + lead, &replies(20, 0)),
+            stamp,
+        )?;
+        let added = open.add_decoded(&batch);
+        assert_eq!((added.new, added.late, added.refused), (0, 0, 0));
+        ahead += added.ahead;
+        assert_eq!(added.dropped(), added.ahead);
+    }
+    assert_eq!(ahead, 60);
+    assert_eq!(open.bytes(), empty);
+    assert!(open.is_empty());
+    // Within `AHEAD_MS` of the stamp, into the next bin: held.
+    let near = stamped(
+        &honest,
+        0,
+        content(stamp + AHEAD_MS - 1, &replies(5, 0)),
+        stamp,
+    )?;
+    assert_eq!(open.add_decoded(&near).new, 5);
+    // A batch taken as of a later step is bounded by that step: what was ahead of its own stamp is
+    // not ahead of the step's.
+    let early = stamped(&honest, 1, content(stamp + 6_000, &replies(3, 10)), stamp)?;
+    assert_eq!(open.add_decoded_taking(&early, &mut |_| true).ahead, 3);
+    assert_eq!(
+        open.add_decoded_taking_at(&early, stamp + 5_500, &mut |_| true)
+            .new,
+        3
+    );
+    // A holder that decides by what it took, with no stamp to bound by, holds what it is handed.
+    let mut in_line = Open::new(Limits::UNBOUNDED);
+    let far = stamped(&liar, 9, content(stamp + 60_000, &replies(4, 0)), stamp)?;
+    assert_eq!(in_line.add_decoded(&far).new, 4);
+    Ok(())
+}
+
+/// What a receiver that stops taking part held is forgotten only after the bins that steps
+/// already due take: those hold it, as they would have had the steps run in their turn.
+#[test]
+fn a_receiver_is_forgotten_only_after_the_bins_already_due() -> Result<(), String> {
+    let receiver = Identity::from_seed([3; 32]);
+    let other = Identity::from_seed([4; 32]);
+    let mut open = Open::new(Limits::UNBOUNDED);
+    for (n, wall) in [1_000u64, 6_000, 11_000].into_iter().enumerate() {
+        let mine = stamped(&receiver, n as u64, content(wall, &replies(2, 0)), 0)?;
+        let theirs = stamped(&other, n as u64, content(wall, &replies(1, 50)), 0)?;
+        open.add_decoded(&mine);
+        open.add_decoded(&theirs);
+    }
+    // Bin 0 is due; bins 1 and 2 are not.
+    open.forget_receiver_after(&receiver.public(), 0);
+    let kept: Vec<usize> = open
+        .take_through(2)
+        .into_iter()
+        .map(|fragment| fragment.len())
+        .collect();
+    assert_eq!(kept, vec![3, 1, 1]);
     Ok(())
 }
 
