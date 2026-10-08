@@ -85,16 +85,28 @@ impl Buffer {
 
 impl Drop for Buffer {
     fn drop(&mut self) {
-        let buffer = std::mem::take(&mut self.0);
-        if buffer.capacity() < MAX_MESSAGE {
+        let Some(buffer) = poolable(std::mem::take(&mut self.0)) else {
             return;
-        }
+        };
         if let Ok(mut pool) = POOL.lock()
             && pool.len() < POOL_IDLE
         {
             pool.push(buffer);
         }
     }
+}
+
+/// What of a buffer given back the pool keeps: one of `MAX_MESSAGE` bytes' capacity, never more.
+/// A writer's plaintext can outgrow a message while a record that will not fit is moved to the next
+/// (`send_now`); it is cut back here, so the pool holds at most `POOL_IDLE` messages' worth
+/// whatever passed through it.
+fn poolable(mut buffer: Vec<u8>) -> Option<Vec<u8>> {
+    if buffer.capacity() < MAX_MESSAGE {
+        return None;
+    }
+    buffer.truncate(MAX_MESSAGE);
+    buffer.shrink_to(MAX_MESSAGE);
+    Some(buffer)
 }
 
 fn preamble(hint: [u8; KEY_HINT_LEN]) -> [u8; PREAMBLE_LEN] {
@@ -660,6 +672,22 @@ mod tests {
             Err(WireError::Timeout)
         ));
         Ok(())
+    }
+
+    #[test]
+    fn the_pool_keeps_a_message_a_buffer_never_more() {
+        let grown = Vec::<u8>::with_capacity(3 * MAX_MESSAGE);
+        assert_eq!(
+            poolable(grown).map(|kept| kept.capacity()),
+            Some(MAX_MESSAGE)
+        );
+        let mut full = vec![0u8; MAX_MESSAGE + 100];
+        full.reserve(MAX_MESSAGE);
+        assert_eq!(
+            poolable(full).map(|kept| kept.capacity()),
+            Some(MAX_MESSAGE)
+        );
+        assert!(poolable(Vec::with_capacity(MAX_MESSAGE / 2)).is_none());
     }
 
     #[tokio::test]

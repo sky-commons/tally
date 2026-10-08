@@ -19,18 +19,22 @@ use tally_wire::{
     Batch, ClockModel, ClockModelPart, Decoded, FaultProof, Location, Observation, Positions,
     PublicKey, ReceiverInfo, Record, Region, RelayAddress,
 };
-use tokio::sync::OwnedSemaphorePermit;
 
 use crate::bounded::Bounded;
-use crate::budget::{Budget, PerFeeder, Store, memory_available};
+use crate::budget::{Budget, PerFeeder, Store};
 use crate::egress::{Cap, Egress};
-use crate::exchange::{SHARDS, Sink, raw_shard};
+use crate::exchange::{Gauges, SHARDS, Sink, raw_shard};
 use crate::fanout::{BEHIND_MS, Bounds, Filter, Listener, Router};
-use crate::ingest::{Clock, Refusal, Stages, Stamp, Threads};
+use crate::ingest::{Clock, InFlight, Refusal, Stages, Stamp, Threads};
 use crate::network::{Asker, Network};
 use crate::parts::Parts;
 use crate::stations::{STATIONS_REMEMBERED, StationReport, Stations, StationsReport};
 use crate::subscription::{Described, Subscription};
+
+/// The memory a hub is budgeted until it is told its own (`Hub::memory`, which a relay always
+/// does from `--memory`): a fixed figure, never the host's, so a hub a test builds behaves the
+/// same on any machine.
+pub const DEFAULT_MEMORY: usize = 16 << 30;
 
 /// The least a subscriber's queue may hold, whatever the budget: a few seconds of one busy
 /// feeder, so a relay sized for few feeders still serves a subscriber a burst.
@@ -398,6 +402,18 @@ pub enum Origin {
     Elsewhere,
 }
 
+/// What the relay's memory holds (`Hub::memory_report`, `GET /memory`): the budget and its gauges,
+/// what the stores that count their own bytes hold (their limits are the budget's
+/// `store_bytes`), and every decoded batch alive, whichever stores share it.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct MemoryReport {
+    pub budget: crate::budget::MemoryReport,
+    pub batches_held: usize,
+    pub delivery_held: usize,
+    pub decoded_live: usize,
+    pub decoded_live_bytes: usize,
+}
+
 /// A batch a link took in, on its way to the ingest stage.
 pub struct Inbound {
     pub source: u64,
@@ -407,8 +423,8 @@ pub struct Inbound {
     pub verify: bool,
     /// Its stamp, when a trace gives one; else the ingest clock's when it is worked on.
     pub stamp: Option<Stamp>,
-    /// The connection's credit, released when the batch is admitted and routed.
-    pub permit: Option<OwnedSemaphorePermit>,
+    /// The connection's credit and the batch's charge, released when it is admitted and routed.
+    pub permit: Option<InFlight>,
     /// Where a refused signature ends the connection.
     pub refusal: Option<Arc<Refusal>>,
 }
@@ -663,7 +679,7 @@ pub fn source_of(address: IpAddr) -> IpAddr {
 
 impl Hub {
     /// A hub whose stages run on the caller (`ingest::Stages::inline`), by the system clock, its
-    /// budget the host's memory: what a test builds. A relay is then `staged` onto its threads.
+    /// budget `DEFAULT_MEMORY`: what a test builds. A relay is then `staged` onto its threads.
     pub fn new(max_subscribers: usize) -> Self {
         Self::clocked(max_subscribers, Arc::new(crate::network::wall_ms))
     }
@@ -671,10 +687,15 @@ impl Hub {
     /// As `new`, its ingest clock `clock`.
     pub fn clocked(max_subscribers: usize, clock: Clock) -> Self {
         let network = Network::new();
-        let stages = Stages::inline(Arc::clone(&clock), network.products.sink());
-        let budget = Budget::of_memory(memory_available(), PerFeeder::planned(false));
+        let budget = Budget::of_memory(DEFAULT_MEMORY, PerFeeder::planned(false));
+        network.charge_to(&budget);
+        let stages = Stages::inline(
+            Arc::clone(&clock),
+            network.products.sink(),
+            Gauges::of(&budget),
+        );
         Self {
-            fanout: Arc::new(Router::new(queue_bounds(&budget))),
+            fanout: Arc::new(router(&budget)),
             stages,
             raw: (0..SHARDS)
                 .map(|_| Mutex::new(RawShard::new(SEEN_WINDOW)))
@@ -715,11 +736,12 @@ impl Hub {
         let clock = self.stages.clock();
         // The inline stages hold the products' sink; let them go first.
         let unused: Sink = Arc::new(|_| true);
-        self.stages = Stages::inline(Arc::clone(&clock), unused);
+        let gauges = Gauges::of(&self.budget);
+        self.stages = Stages::inline(Arc::clone(&clock), unused, gauges.clone());
         if let Some(products) = Arc::get_mut(&mut self.network.products) {
             products.on_thread(threads.message.max(1));
         }
-        self.stages = Stages::threaded(clock, threads, &self.network.products.sink());
+        self.stages = Stages::threaded(clock, threads, &self.network.products.sink(), &gauges);
         self
     }
 
@@ -728,35 +750,48 @@ impl Hub {
     pub fn regional_boot(mut self, boot_id: u64) -> Self {
         let clock = self.stages.clock();
         let unused: Sink = Arc::new(|_| true);
-        self.stages = Stages::inline(Arc::clone(&clock), unused);
+        let gauges = Gauges::of(&self.budget);
+        self.stages = Stages::inline(Arc::clone(&clock), unused, gauges.clone());
         self.network.products = Arc::new(crate::products::Products::with_boot(boot_id, 1));
-        self.stages = Stages::inline(clock, self.network.products.sink());
+        self.network.charge_to(&self.budget);
+        self.stages = Stages::inline(clock, self.network.products.sink(), gauges);
         self
     }
 
-    /// The relay may use `memory` bytes: the admission budget (`budget`), and what each
-    /// subscriber's queue and standing's raw may hold of it. `holds_raw`: the relay hosts MLAT.
+    /// The relay may use `memory` bytes: the admission budget (`budget`), and every store's and
+    /// queue's share of it (each store's gauge, resized in place). `holds_raw`: the relay hosts
+    /// MLAT.
     pub fn memory(mut self, memory: usize, holds_raw: bool) -> Self {
-        self.budget = Budget::of_memory(memory, PerFeeder::planned(holds_raw));
-        self.fanout = Arc::new(Router::new(queue_bounds(&self.budget)));
-        self.network
-            .sharing
-            .set_held_capacity(crate::sharing::member::held_bytes_for(
-                self.budget
-                    .ceiling()
-                    .saturating_mul(crate::budget::PLANNED_BYTES_PER_SEC) as u64,
-            ));
+        self.budget.resize(memory, PerFeeder::planned(holds_raw));
+        self.fanout = Arc::new(router(&self.budget));
+        self.network.charge_to(&self.budget);
         self
     }
 
     /// Each subscriber's queue holds at most `bytes` (and `fanout::BEHIND_MS` of inbound), instead
     /// of the budget's share: a test's small queue, or an operator's.
     pub fn queue_bytes(mut self, bytes: usize) -> Self {
-        self.fanout = Arc::new(Router::new(Bounds {
-            max_bytes: bytes,
-            max_age_ms: BEHIND_MS,
-        }));
+        self.fanout = Arc::new(Router::charged(
+            Bounds {
+                max_bytes: bytes,
+                max_age_ms: BEHIND_MS,
+            },
+            self.budget.gauge(Store::Fanout),
+        ));
         self
+    }
+
+    /// What the relay's memory holds, store by store (`GET /memory`).
+    pub fn memory_report(&self) -> MemoryReport {
+        let (sharing, _) = self.network.sharing.held();
+        let (decoded, decoded_bytes) = tally_wire::decoded::live();
+        MemoryReport {
+            budget: self.budget.report(),
+            batches_held: sharing,
+            delivery_held: self.network.delivery.held_bytes(),
+            decoded_live: decoded,
+            decoded_live_bytes: decoded_bytes,
+        }
     }
 
     /// The admission budget: a feeder is admitted only with its bytes reserved in every store.
@@ -1599,6 +1634,11 @@ fn queue_bounds(budget: &Budget) -> Bounds {
         max_bytes: budget.store_bytes(Store::Fanout).max(MIN_QUEUE_BYTES),
         max_age_ms: BEHIND_MS,
     }
+}
+
+/// The fan-out, its queues bounded each by `queue_bounds` and together by the budget's gauge.
+fn router(budget: &Budget) -> Router {
+    Router::charged(queue_bounds(budget), budget.gauge(Store::Fanout))
 }
 
 fn now_ms() -> u64 {

@@ -17,6 +17,7 @@ use std::sync::Arc;
 
 use tally_wire::{Decoded, ObsRef, Region};
 
+use crate::budget::Charge;
 use crate::exchange::Frozen;
 use crate::ingest::Stamp;
 
@@ -25,6 +26,11 @@ pub type Epoch = u64;
 
 /// How long an epoch is: the regional product's once a second.
 pub const EPOCH_MS: u64 = crate::products::REGIONAL_EVERY_MS;
+
+/// Epochs whose decoded batches the relay holds between ingest and the products, at most: the one
+/// open, the one closing (open until the slowest producer's tick passes it), and the one the sealer
+/// is working on. Past what they are budgeted (`budget::Store::Epochs`) an epoch is refused whole.
+pub const EPOCHS_HELD: u64 = 3;
 
 /// The epoch a stamp falls in.
 pub fn epoch_of(stamp: Stamp) -> Epoch {
@@ -96,6 +102,8 @@ pub struct Merged {
     pub stream: Vec<Copy>,
     /// First copies in each area, by the area's cell number, each in canonical order.
     pub regional: BTreeMap<u64, (Region, Vec<Copy>)>,
+    /// What its batches are charged, released when the epoch is let go.
+    pub charges: Vec<Charge>,
 }
 
 impl Merged {
@@ -111,17 +119,20 @@ impl Merged {
 
 /// Gathers each epoch's frozen parts from every message thread and hands each epoch on whole and
 /// in order, once every thread has closed it: merged when every part came, refused when one was
-/// lost. A thread sends a part only for an epoch it held receptions of, and numbers what it sends,
-/// so a gap in its numbers is a part lost (the sealer's queue was full): every epoch it could have
-/// been for, from the thread's last word to the next, is refused.
+/// refused or lost. A thread sends a part only for an epoch it held receptions of, and numbers its
+/// parts (a marker of how far it has closed carries the count so far), so a gap in a thread's
+/// numbers is a part of its lost (the sealer's queue was full), never a marker: every epoch from the
+/// thread's last word to the next that lacks a part of that thread is refused, and nothing else.
+/// Each lost part is counted ([`Ready::parts_lost`]), whether or not any other thread held anything
+/// of its epoch.
 pub struct Coordinator {
     pending: BTreeMap<Epoch, Gathering>,
     /// Per thread: every epoch before this is closed there.
     closed: Vec<Option<Epoch>>,
-    /// Per thread: the number of its next message.
+    /// Per thread: the number of its next epoch part.
     expected: Vec<u64>,
-    /// Epochs a lost part may have been for: refused when they complete.
-    lost: Vec<std::ops::Range<Epoch>>,
+    /// Per thread, the epochs a part of it that was lost may have been for.
+    lost: Vec<(usize, std::ops::Range<Epoch>)>,
     /// Every epoch before this has been handed on.
     next: Epoch,
 }
@@ -129,6 +140,18 @@ pub struct Coordinator {
 #[derive(Default)]
 struct Gathering {
     parts: Vec<Frozen>,
+    refused: bool,
+}
+
+/// What a thread's word completes.
+#[derive(Debug, Default)]
+pub struct Ready {
+    /// Epochs handed on, oldest first: merged, or refused whole.
+    pub merged: Vec<Merged>,
+    /// Epoch parts lost on the way since the last word (each one thread's part of one epoch).
+    pub parts_lost: u64,
+    /// Every epoch before this is closed on every thread.
+    pub watermark: Option<Epoch>,
 }
 
 impl Coordinator {
@@ -144,28 +167,40 @@ impl Coordinator {
 
     /// One thread's word: the epochs it completes, merged or refused, oldest first, and the
     /// watermark every thread has closed to (every epoch before it is done).
-    pub fn take(&mut self, frozen: Frozen) -> (Vec<Merged>, Option<Epoch>) {
+    pub fn take(&mut self, frozen: Frozen) -> Ready {
         let thread = frozen.thread.min(self.closed.len() - 1);
-        if frozen.seq != self.expected[thread] {
-            // Lost on the way: whatever it was, it was for an epoch from the thread's last word
-            // to this one (from its first, the oldest epoch anyone has a part of).
+        let mut parts_lost = 0;
+        if frozen.seq > self.expected[thread] {
+            parts_lost = frozen.seq - self.expected[thread];
+            // Lost on the way: each was for an epoch from the thread's last word to this one
+            // (from its first, the oldest epoch anyone has a part of).
             let until = frozen.epoch.unwrap_or(frozen.closed_before);
             let since = self.closed[thread]
                 .or_else(|| self.pending.keys().next().copied())
                 .unwrap_or(until)
                 .max(self.next);
             if since < until {
-                self.lost.push(since..until);
+                self.lost.push((thread, since..until));
             }
         }
-        self.expected[thread] = frozen.seq + 1;
+        self.expected[thread] = self.expected[thread].max(frozen.seq);
+        if frozen.epoch.is_some() {
+            self.expected[thread] = frozen.seq + 1;
+        }
         self.closed[thread] = Some(frozen.closed_before.max(self.closed[thread].unwrap_or(0)));
         if let Some(epoch) = frozen.epoch
             && epoch >= self.next
         {
-            self.pending.entry(epoch).or_default().parts.push(frozen);
+            let gathering = self.pending.entry(epoch).or_default();
+            gathering.refused |= frozen.refused;
+            gathering.parts.push(frozen);
         }
-        self.ready()
+        let (merged, watermark) = self.ready();
+        Ready {
+            merged,
+            parts_lost,
+            watermark,
+        }
     }
 
     /// Every epoch before the least thread's close, in order.
@@ -186,7 +221,11 @@ impl Coordinator {
                 break;
             }
             let gathering = entry.remove();
-            if self.lost.iter().any(|lost| lost.contains(&epoch)) {
+            let lost = self.lost.iter().any(|(thread, lost)| {
+                lost.contains(&epoch) && !gathering.parts.iter().any(|part| part.thread == *thread)
+            });
+            if gathering.refused || lost {
+                // Its parts, and what they are charged, are let go here.
                 out.push(Merged {
                     epoch,
                     refused: true,
@@ -196,26 +235,9 @@ impl Coordinator {
                 out.push(merge(epoch, gathering.parts));
             }
         }
-        // An epoch lost whole (every part of it lost) is refused all the same.
-        for lost in &self.lost {
-            for epoch in lost.start.max(self.next)..lost.end.min(watermark) {
-                if !out.iter().any(|merged| merged.epoch == epoch) {
-                    out.push(Merged {
-                        epoch,
-                        refused: true,
-                        ..Merged::default()
-                    });
-                }
-                // A lost range is never wider than the epochs one thread closed at once.
-                if out.len() > 4_096 {
-                    break;
-                }
-            }
-        }
-        out.sort_by_key(|merged| merged.epoch);
         self.next = self.next.max(watermark);
         let next = self.next;
-        self.lost.retain(|lost| lost.end > next);
+        self.lost.retain(|(_, lost)| lost.end > next);
         (out, Some(watermark))
     }
 }
@@ -226,7 +248,8 @@ pub fn merge(epoch: Epoch, parts: Vec<Frozen>) -> Merged {
         epoch,
         ..Merged::default()
     };
-    for part in parts {
+    for mut part in parts {
+        merged.charges.push(std::mem::take(&mut part.charge));
         let copy = |at: u32, index: u32| Copy {
             decoded: Arc::clone(&part.batches[at as usize]),
             index,
@@ -284,8 +307,18 @@ mod tests {
         }
     }
 
-    fn epochs(done: (Vec<Merged>, Option<Epoch>)) -> Vec<(Epoch, bool)> {
-        done.0.iter().map(|m| (m.epoch, m.refused)).collect()
+    fn epochs(done: Ready) -> Vec<(Epoch, bool)> {
+        done.merged.iter().map(|m| (m.epoch, m.refused)).collect()
+    }
+
+    fn marker(thread: usize, seq: u64, closed_before: Epoch) -> Frozen {
+        Frozen {
+            thread,
+            seq,
+            epoch: None,
+            closed_before,
+            ..Frozen::default()
+        }
     }
 
     #[test]
@@ -293,26 +326,45 @@ mod tests {
         let mut coordinator = Coordinator::new(2);
         assert!(epochs(coordinator.take(part(5, 0, 0))).is_empty());
         assert_eq!(epochs(coordinator.take(part(5, 1, 0))), vec![(5, false)]);
-        // Thread 1's part of epoch 6 was lost (its next message is its third): 6 is refused.
+        // Thread 1's part of epoch 6 was lost (its next part is its third): 6 is refused.
         assert!(epochs(coordinator.take(part(6, 0, 1))).is_empty());
-        assert_eq!(epochs(coordinator.take(part(7, 1, 2))), vec![(6, true)]);
+        let ready = coordinator.take(part(7, 1, 2));
+        assert_eq!(ready.parts_lost, 1);
+        assert_eq!(epochs(ready), vec![(6, true)]);
         assert_eq!(epochs(coordinator.take(part(7, 0, 2))), vec![(7, false)]);
         // An epoch a thread held nothing of needs nothing from it: its close is enough.
         assert!(epochs(coordinator.take(part(9, 0, 3))).is_empty());
-        let closed = Frozen {
-            thread: 1,
-            seq: 3,
-            epoch: None,
-            closed_before: 1_000_000_000,
-            ..Frozen::default()
-        };
-        let (done, watermark) = coordinator.take(closed);
-        assert_eq!(
-            done.iter()
-                .map(|m| (m.epoch, m.refused))
-                .collect::<Vec<_>>(),
-            vec![(9, false)]
-        );
-        assert_eq!(watermark, Some(10));
+        let ready = coordinator.take(marker(1, 3, 1_000_000_000));
+        assert_eq!(ready.parts_lost, 0);
+        assert_eq!(ready.watermark, Some(10));
+        assert_eq!(epochs(ready), vec![(9, false)]);
+    }
+
+    /// A marker carries no data, so losing one loses nothing: the epochs it spans that every thread
+    /// completed are merged, not refused.
+    #[test]
+    fn a_lost_marker_refuses_nothing() {
+        let mut coordinator = Coordinator::new(2);
+        assert!(epochs(coordinator.take(part(5, 0, 0))).is_empty());
+        // Thread 1's marker closing 5 was lost; its next word is its part of 6, still its first.
+        assert!(epochs(coordinator.take(part(6, 0, 1))).is_empty());
+        let ready = coordinator.take(part(6, 1, 0));
+        assert_eq!(ready.parts_lost, 0);
+        assert_eq!(epochs(ready), vec![(5, false), (6, false)]);
+    }
+
+    /// A part a thread refused (its epoch past the budget) refuses its epoch whole, whatever the
+    /// other threads sent of it; a lost part is counted even when no other thread held its epoch.
+    #[test]
+    fn a_refused_part_refuses_its_epoch_and_every_lost_part_is_counted() {
+        let mut coordinator = Coordinator::new(2);
+        let mut refused = part(5, 1, 0);
+        refused.refused = true;
+        assert!(epochs(coordinator.take(part(5, 0, 0))).is_empty());
+        assert_eq!(epochs(coordinator.take(refused)), vec![(5, true)]);
+        // Thread 0 lost three parts, for epochs no other thread held: counted, nothing to refuse.
+        let ready = coordinator.take(marker(0, 4, 20));
+        assert_eq!(ready.parts_lost, 3);
+        assert_eq!(epochs(coordinator.take(marker(1, 1, 20))), Vec::new());
     }
 }

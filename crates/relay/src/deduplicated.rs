@@ -28,6 +28,8 @@ struct Signer {
     boot_id: u64,
     sequence: u64,
     previous: Hash,
+    /// Observations too large for any message since the last report: never sent, and said.
+    oversized: u64,
 }
 
 impl Signer {
@@ -39,6 +41,7 @@ impl Signer {
             boot_id: RandomState::new().build_hasher().finish(),
             sequence: 0,
             previous: [0; 32],
+            oversized: 0,
         }
     }
 
@@ -57,8 +60,8 @@ impl Signer {
                     self.sequence += 1;
                     signed.push(batch);
                 }
-                // One observation too large for any message is not deliverable; drop it.
-                None if chunk.len() <= 1 => {}
+                // One observation too large for any message is not deliverable: counted.
+                None if chunk.len() <= 1 => self.oversized += chunk.len() as u64,
                 None => {
                     let (first, second) = chunk.split_at(chunk.len() / 2);
                     todo.push(second.to_vec());
@@ -112,14 +115,17 @@ pub async fn run(hub: Arc<Hub>, identity: Identity) {
         every.tick().await;
         let (gathered, epochs_refused) = hub.take_deduplicated();
         refused += epochs_refused;
-        if refused > 0 && reported.elapsed() >= REPORT_EVERY {
+        if (refused > 0 || signer.oversized > 0) && reported.elapsed() >= REPORT_EVERY {
             eprintln!(
                 "tally-relay: {refused} seconds of the deduplicated stream were refused whole \
                  since the last report, each with every message first heard in it (their batches \
-                 were forwarded raw): the stream held as many unsigned seconds as it may \
-                 (`stream_refused` in GET /products)"
+                 were forwarded raw): the products were behind or past their budget \
+                 (`stream_refused` in GET /products); {} observations were too large for any \
+                 message",
+                signer.oversized
             );
             refused = 0;
+            signer.oversized = 0;
             reported = Instant::now();
         }
         if gathered.is_empty() {

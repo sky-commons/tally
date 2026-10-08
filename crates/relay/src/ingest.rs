@@ -32,7 +32,7 @@ use std::time::Duration;
 use tally_wire::{Batch, Decoded, Undecodable};
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 
-use crate::exchange::{MessageExchange, Sink};
+use crate::exchange::{Gauges, MessageExchange, Sink};
 
 /// Batches one feeder's connection may have in the ingest stage at once. Two: one being worked on,
 /// one read and waiting, so a connection's socket is read while its previous batch is decoded.
@@ -109,6 +109,15 @@ impl Credit {
     pub fn available(&self) -> usize {
         self.permits.available_permits()
     }
+}
+
+/// One batch's place in the ingest stage: its connection's credit, and its bytes charged to the
+/// relay's budget (`budget::Store::Ingest`), both released when the batch is decoded and routed.
+/// A connection takes both before it hands a batch over, and waits for them (its socket unread)
+/// while either is spent: the back-pressure raw meets (RFC-0177 §10).
+pub struct InFlight {
+    pub permit: OwnedSemaphorePermit,
+    pub charge: crate::budget::Charge,
 }
 
 /// A connection's verdict from the ingest stage: a batch it sent failed its signature, so the
@@ -221,28 +230,28 @@ pub struct Stages {
 
 impl Stages {
     /// Every stage run by the caller (one producer, one message thread): for tests.
-    pub fn inline(clock: Clock, sink: Sink) -> Self {
+    pub fn inline(clock: Clock, sink: Sink, gauges: Gauges) -> Self {
         Self {
             core: Arc::new(Core {
                 clock,
                 next: AtomicU64::new(0),
                 last: vec![AtomicU64::new(0)].into_boxed_slice(),
                 ticked: vec![AtomicU64::new(0)].into_boxed_slice(),
-                message: MessageExchange::inline(sink),
+                message: MessageExchange::inline(sink, gauges),
             }),
             pool: Pool::Inline(Mutex::new(())),
         }
     }
 
     /// The stages on `threads`, closed epochs going to `sink`.
-    pub fn threaded(clock: Clock, threads: Threads, sink: &Sink) -> Self {
+    pub fn threaded(clock: Clock, threads: Threads, sink: &Sink, gauges: &Gauges) -> Self {
         let workers = threads.ingest.max(1);
         let core = Arc::new(Core {
             clock,
             next: AtomicU64::new(0),
             last: (0..workers).map(|_| AtomicU64::new(0)).collect(),
             ticked: (0..workers).map(|_| AtomicU64::new(0)).collect(),
-            message: MessageExchange::threads(threads.message, workers, sink),
+            message: MessageExchange::threads(threads.message, workers, sink, gauges),
         });
         let mut senders = Vec::with_capacity(workers);
         let mut handles = Vec::with_capacity(workers);
@@ -416,7 +425,7 @@ mod tests {
     #[test]
     fn stamps_read_the_ingest_clock_never_go_back_and_count_up() {
         let sink: Sink = Arc::new(|_| true);
-        let stages = Stages::inline(Arc::new(|| 42), sink);
+        let stages = Stages::inline(Arc::new(|| 42), sink, Gauges::unlimited());
         let first = stages.stamp(0);
         let second = stages.stamp(0);
         assert_eq!((first.stamp_ms, first.ingest_seq), (42, 0));
@@ -461,6 +470,7 @@ mod tests {
                 message: 2,
             },
             &sink,
+            &Gauges::unlimited(),
         ));
         drop(sink);
         let identity = tally_wire::Identity::generate().map_err(|error| error.to_string())?;

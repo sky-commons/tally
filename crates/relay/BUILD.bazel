@@ -133,9 +133,28 @@ opt_test(
     test = ":mlat_host_binary",
 )
 
+# Every deployed relay's configuration admits feeders (RFC-0177 §9): its arguments through the
+# relay's own parser, its memory as the relay finds it, its budget as `main` builds it.
+rust_test(
+    name = "deployed",
+    size = "small",
+    srcs = ["tests/deployed.rs"],
+    data = [
+        "//infra/prod-host:tally/units/tally-relay.service",
+        "//tally/packaging/systemd:tally-relay.service",
+    ],
+    edition = "2024",
+    env = {
+        "TALLY_RELAY_DEPLOYED": "$(rootpaths //infra/prod-host:tally/units/tally-relay.service) $(rootpaths //tally/packaging/systemd:tally-relay.service)",
+    },
+    lint_config = ":cargo_lints",
+    deps = [":relay"],
+)
+
 rustfmt_test(
     name = "rustfmt",
     targets = [
+        ":deployed",
         ":end_to_end",
         ":mlat_host_binary",
         ":relay",

@@ -9,6 +9,12 @@
 //! (`ingest`), in the order they were admitted, and its description is published before its first
 //! batch, so every subscriber reads each (receiver, boot) in admitted order, described first.
 //!
+//! Every item queued is charged once to the relay's budget (`budget::Store::Fanout`), however many
+//! queues hold it, and released when the last lets it go. When an item would pass the budget, the
+//! subscriber holding the most is let go as fallen behind, and the next, until it fits: the queues
+//! together never hold more than their share of the relay's memory, and no subscriber ever misses
+//! an item without being told.
+//!
 //! Routing reads a subscription's regions once, when it changes ([`Router::set`]): a record placed
 //! at a cell is offered to the whole-world subscribers and to the subscribers of that cell's
 //! ancestors at the resolutions anyone subscribed at, a few hash lookups whatever the number of
@@ -20,6 +26,8 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use tally_wire::{Record, Region};
 use tokio::sync::Notify;
+
+use crate::budget::{Charge, Gauge, Store};
 
 use crate::hub::Item;
 use crate::subscription::{Subscription, directory_wants};
@@ -148,24 +156,17 @@ pub enum Fell {
     Resync,
 }
 
-/// What an item costs a queue: its signed bytes, and while it waits its one decode.
+/// What an item costs a queue: a batch's one decode (its signed bytes among it,
+/// `Decoded::footprint`), or the record's encoded bytes.
 pub fn item_bytes(item: &Item) -> usize {
-    let record = match &*item.record {
-        Record::Batch(batch) | Record::RelayBatch(batch) => batch.as_bytes().len(),
-        Record::ReceiverInfo(info) => info.as_bytes().len(),
-        Record::Positions(positions) | Record::Provisional(positions) => positions.as_bytes().len(),
-        Record::ClockModel(model) => model.as_bytes().len(),
-        Record::ClockModelPart(part) => part.as_bytes().len(),
-        Record::FaultProof(proof) => proof.as_bytes().len(),
-        Record::RegionalBatch(regional) => regional.as_bytes().len(),
-        _ => 256,
-    };
-    record
-        + item
-            .decoded
-            .as_ref()
-            .map_or(0, |decoded| decoded.plain().len())
+    match &item.decoded {
+        Some(decoded) => decoded.footprint(),
+        None => item.record.encoded_len(),
+    }
 }
+
+/// An item as a queue holds it: with the one charge every queue holding it shares.
+type Queued = (Item, Arc<Charge>);
 
 struct Subscriber {
     /// The connection it is, so nothing is sent back down the connection it came in on.
@@ -177,19 +178,22 @@ struct Subscriber {
 }
 
 struct State {
-    queue: Queue<Item>,
+    queue: Queue<Queued>,
     fell: Option<Fell>,
 }
 
 impl Subscriber {
-    fn offer(&self, item: &Item, bytes: usize) {
+    fn offer(&self, item: &Item, charge: &Arc<Charge>, bytes: usize) {
         let Ok(mut state) = self.queue.lock() else {
             return;
         };
         if matches!(state.fell, Some(Fell::Behind(_))) {
             return;
         }
-        if let Err(why) = state.queue.push(item.clone(), bytes, item.stamp_ms) {
+        if let Err(why) = state
+            .queue
+            .push((item.clone(), Arc::clone(charge)), bytes, item.stamp_ms)
+        {
             // What it holds is no use to it now: let it go at once, not when it is read.
             state.queue.clear();
             state.fell = Some(if self.resyncs {
@@ -199,6 +203,25 @@ impl Subscriber {
             });
         }
         drop(state);
+        self.notify.notify_one();
+    }
+
+    /// Bytes it holds now.
+    fn bytes(&self) -> usize {
+        self.queue.lock().map_or(0, |state| state.queue.bytes())
+    }
+
+    /// Let go for the budget: told it fell behind (a directory link is resynchronised), and what
+    /// it held let go now.
+    fn let_go(&self) {
+        if let Ok(mut state) = self.queue.lock() {
+            state.queue.clear();
+            state.fell = Some(if self.resyncs {
+                Fell::Resync
+            } else {
+                Fell::Behind(FellBehind::Bytes)
+            });
+        }
         self.notify.notify_one();
     }
 }
@@ -297,14 +320,22 @@ fn place(item: &Item) -> Place<'_> {
 pub struct Router {
     index: RwLock<Index>,
     bounds: Bounds,
+    gauge: Arc<Gauge>,
     next: AtomicU64,
 }
 
 impl Router {
+    /// Queues bounded by `bounds` alone: for a test.
     pub fn new(bounds: Bounds) -> Self {
+        Self::charged(bounds, Gauge::unlimited(Store::Fanout))
+    }
+
+    /// Queues bounded by `bounds`, and together by `gauge` (the budget's `Store::Fanout`).
+    pub fn charged(bounds: Bounds, gauge: Arc<Gauge>) -> Self {
         Self {
             index: RwLock::new(Index::default()),
             bounds,
+            gauge,
             next: AtomicU64::new(0),
         }
     }
@@ -322,30 +353,56 @@ impl Router {
         if index.entries.is_empty() {
             return;
         }
-        let bytes = item_bytes(&item);
-        let offer = |at: usize| {
+        // Who takes it: every whole-world subscriber, and those whose regions hold its place.
+        let mut takers = Vec::new();
+        let mut take = |at: usize| {
             let entry = &index.entries[at];
             if entry.subscriber.source != item.source && entry.filter.wants(&item) {
-                entry.subscriber.offer(&item, bytes);
+                takers.push(at);
             }
         };
         for at in &index.everywhere {
-            offer(*at);
+            take(*at);
         }
         match place(&item) {
             Place::Nowhere => {
                 for at in &index.regional {
-                    offer(*at);
+                    take(*at);
                 }
             }
             Place::Cells(cells) if !cells.is_empty() && !index.regional.is_empty() => {
                 let mut held = Vec::new();
                 index.holding(cells, &mut held);
                 for at in held {
-                    offer(at);
+                    take(at);
                 }
             }
             Place::Cells(_) => {}
+        }
+        if takers.is_empty() {
+            return;
+        }
+        let bytes = item_bytes(&item);
+        // Room in the budget, made by letting go whoever holds most, as many as it takes.
+        for _ in 0..index.entries.len() {
+            if self.gauge.fits(bytes) {
+                break;
+            }
+            let Some((_, laggard)) = index
+                .entries
+                .iter()
+                .map(|entry| (entry.subscriber.bytes(), &entry.subscriber))
+                .filter(|(held, _)| *held > 0)
+                .max_by_key(|(held, _)| *held)
+            else {
+                break;
+            };
+            laggard.let_go();
+        }
+        // Charged once whatever holds it; released when the last queue lets it go.
+        let charge = Arc::new(self.gauge.force(bytes));
+        for at in takers {
+            index.entries[at].subscriber.offer(&item, &charge, bytes);
         }
     }
 
@@ -435,7 +492,7 @@ impl Listener {
         }
         let mut moved = 0;
         while moved < most {
-            let Some(item) = state.queue.pop() else {
+            let Some((item, _charge)) = state.queue.pop() else {
                 break;
             };
             out.push(item);

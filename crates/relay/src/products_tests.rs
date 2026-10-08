@@ -45,7 +45,8 @@ impl Staged {
     fn new(relay: &Identity) -> Self {
         let products = Arc::new(Products::new());
         products.adopt_identity(relay);
-        let exchange = MessageExchange::inline(products.sink());
+        let exchange =
+            MessageExchange::inline(products.sink(), crate::exchange::Gauges::unlimited());
         Self { products, exchange }
     }
 

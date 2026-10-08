@@ -122,12 +122,17 @@ impl Signed {
         bytes.extend_from_slice(identity.public().as_bytes());
         bytes.extend_from_slice(body);
         let total = bytes.len() + SIGNATURE_LEN;
-        if total > max.min(MAX_BODY) {
+        if !Self::fits(body.len(), max) {
             return Err(WireError::Oversize(total));
         }
         let signature = identity.sign(&domain(label, &bytes));
         bytes.extend_from_slice(&signature);
         Ok(Self { bytes })
+    }
+
+    /// Whether a body of `body` bytes makes a record of at most `max` bytes, signature included.
+    pub(crate) fn fits(body: usize, max: usize) -> bool {
+        PREFIX_LEN + body + SIGNATURE_LEN <= max.min(MAX_BODY)
     }
 
     /// Accepts any format whose prefix is well formed. Does not check the signature.
@@ -201,6 +206,15 @@ macro_rules! signed_record {
                 let mut body = Vec::new();
                 $crate::signed::Fields::encode(content, &mut body)?;
                 $crate::signed::Signed::sign($domain, $format, identity, &body, $max).map(Self)
+            }
+
+            /// Whether `content` is a valid record of this kind that `sign` would make: its
+            /// fields check, and it fits the kind's size. Decided without signing, so a caller can
+            /// cut what it signs to fit before numbering it.
+            pub fn fits(content: &$content) -> bool {
+                let mut body = Vec::new();
+                $crate::signed::Fields::encode(content, &mut body).is_ok()
+                    && $crate::signed::Signed::fits(body.len(), $max)
             }
 
             /// Any format with a well-formed prefix. Does not check the signature.

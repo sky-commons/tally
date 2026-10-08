@@ -17,6 +17,13 @@
 //!   shards (`mlat_host`, `tally_mlat::provisional::shard_of`); the world candidates arrive per
 //!   record, not per reception, and one sealer owns them whole (`products::Sealer`).
 //!
+//! What a thread holds is charged to the relay's budget (`budget`): each open epoch's decoded
+//! batches to [`Store::Epochs`] (a batch's share by the receptions its slice carries), and its two
+//! generations of fingerprints to [`Store::Dedup`]. An epoch that would pass either is refused
+//! whole: its slices are let go, and the sealer is told it was refused ([`Frozen::refused`]), so it
+//! counts it and makes no product of any part of it (RFC-0177 §10). The charge travels with the
+//! epoch's batches to the sealer and is released when the sealer is done with them.
+//!
 //! Every producer sends [`Envelope::Tick`] down every queue as its stamps advance; a thread's
 //! watermark ([`Watermark`]) is the least of its producers' ticks, and it closes an epoch once its
 //! watermark passes it (`seal::Closer`). Nothing is decided on arrival: an epoch's receptions are
@@ -32,6 +39,7 @@ use std::thread::JoinHandle;
 
 use tally_wire::{Decoded, ObsRef, PublicKey, Region};
 
+use crate::budget::{Budget, Charge, Gauge, Store};
 use crate::ingest::Stamp;
 use crate::seal::{Closer, Epoch, epoch_of};
 
@@ -41,6 +49,39 @@ pub const SHARDS: usize = 256;
 /// Slices a thread's queue holds per producer before the producer waits: about a second of one
 /// feeder's batches per producer at the RFC's rate, bounded whatever the shard's speed.
 pub const QUEUE_SLICES: usize = 1_024;
+
+/// One fingerprint remembered, as the table holds it: the key, what was kept of it, and the table's
+/// control byte, at the table's most loaded (seven eighths full).
+pub const DEDUP_ENTRY_BYTES: usize = (std::mem::size_of::<(u128, Areas)>() + 1) * 8 / 7;
+
+/// Table slots one reception may take at the worst, every reception new: the epoch being decided
+/// reserves two for each (a table grows by doubling) beside the previous generation's one, which a
+/// swap may leave at up to twice its entries.
+pub const DEDUP_SLOTS_PER_RECEPTION: usize = 4;
+
+/// The gauges the message exchange charges.
+#[derive(Clone, Debug)]
+pub struct Gauges {
+    pub epochs: Arc<Gauge>,
+    pub dedup: Arc<Gauge>,
+}
+
+impl Gauges {
+    pub fn of(budget: &Budget) -> Self {
+        Self {
+            epochs: budget.gauge(Store::Epochs),
+            dedup: budget.gauge(Store::Dedup),
+        }
+    }
+
+    /// Never full: for a test's exchange.
+    pub fn unlimited() -> Self {
+        Self {
+            epochs: Gauge::unlimited(Store::Epochs),
+            dedup: Gauge::unlimited(Store::Dedup),
+        }
+    }
+}
 
 /// A shard of one exchange, `0..SHARDS`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -105,6 +146,17 @@ impl Slice {
             stamp_ms: self.decoded.stamp_ms(),
             ingest_seq: self.decoded.ingest_seq(),
         }
+    }
+
+    fn receptions(&self) -> usize {
+        self.ranges.iter().map(|range| range.len()).sum()
+    }
+
+    /// This slice's share of its batch's bytes (`Decoded::footprint`), by the receptions it
+    /// carries: a batch's slices together are charged the batch once.
+    pub fn share(&self) -> usize {
+        let all = self.decoded.observations().len().max(1);
+        self.decoded.footprint() * self.receptions() / all
     }
 }
 
@@ -286,10 +338,20 @@ impl MessageShard {
         Decision { stream, regional }
     }
 
-    /// The next epoch begins: what the last one heard becomes the previous generation.
+    /// The next epoch begins: what the last one heard becomes the previous generation, and the
+    /// older one's table is cleared to be the current one (kept, unless it is much larger than what
+    /// an epoch now holds, so a burst's table does not outlive it).
     pub fn swap(&mut self) {
-        self.previous = std::mem::take(&mut self.current);
-        self.previous.shrink_to_fit();
+        std::mem::swap(&mut self.previous, &mut self.current);
+        self.current.clear();
+        if self.current.capacity() > 2 * self.previous.len().max(64) {
+            self.current.shrink_to(self.previous.len());
+        }
+    }
+
+    /// The table slots both generations hold: what they cost (`DEDUP_ENTRY_BYTES` each).
+    pub fn capacity(&self) -> usize {
+        self.previous.capacity() + self.current.capacity()
     }
 
     /// An epoch begins two or more after the last: nothing heard is remembered.
@@ -310,16 +372,23 @@ impl MessageShard {
 
 /// What one message thread hands the sealer: an epoch it closed that held receptions (the
 /// batches they came from, and which are new to the stream and to an area, each as (batch,
-/// observation) indices, in canonical order), or only how far it has closed. A thread sends nothing
-/// for an epoch it held nothing of, so a watermark that jumps costs nothing; its messages are
-/// numbered (`seq`) so the sealer knows when one was lost (`seal::Coordinator`).
+/// observation) indices, in canonical order), an epoch it refused, or only how far it has closed.
+/// A thread sends nothing for an epoch it held nothing of, so a watermark that jumps costs nothing;
+/// its epoch parts are numbered (`seq`) so the sealer knows when one was lost
+/// (`seal::Coordinator`).
 #[derive(Debug, Default)]
 pub struct Frozen {
     pub thread: usize,
-    /// This thread's count of messages before this one.
+    /// This thread's count of epoch parts (`epoch` is some) sent before this one: a marker carries
+    /// the count sent so far. A gap is a part lost, never a marker.
     pub seq: u64,
     /// The epoch closed, when it held receptions.
     pub epoch: Option<Epoch>,
+    /// The epoch was refused whole here (its bytes would have passed the budget): it carries
+    /// nothing, and the sealer refuses the epoch.
+    pub refused: bool,
+    /// What its batches are charged (`Store::Epochs`), released when the sealer lets them go.
+    pub charge: Charge,
     /// Every epoch before this is closed on this thread.
     pub closed_before: Epoch,
     pub batches: Vec<Arc<Decoded>>,
@@ -339,10 +408,13 @@ pub struct MessageThread {
     shards: Vec<MessageShard>,
     watermark: Watermark,
     closer: Closer,
-    open: BTreeMap<Epoch, Vec<Slice>>,
+    open: BTreeMap<Epoch, Open>,
+    gauges: Gauges,
+    /// What the generations' tables are charged (`Store::Dedup`).
+    dedup: Charge,
     /// The last epoch decided: its shards' generations are its and the one before.
     decided: Option<Epoch>,
-    /// Messages sent the sealer.
+    /// Epoch parts sent the sealer.
     sent: u64,
     /// Every epoch before this is closed.
     closed_before: Option<Epoch>,
@@ -350,9 +422,17 @@ pub struct MessageThread {
 }
 
 impl MessageThread {
-    pub fn new(thread: usize, threads: usize, producers: usize, sink: Sink) -> Self {
+    pub fn new(
+        thread: usize,
+        threads: usize,
+        producers: usize,
+        sink: Sink,
+        gauges: Gauges,
+    ) -> Self {
         let owned = (thread..SHARDS).step_by(threads.max(1)).count();
         Self {
+            dedup: gauges.dedup.empty(),
+            gauges,
             thread,
             threads: threads.max(1),
             shards: (0..owned).map(|_| MessageShard::default()).collect(),
@@ -370,7 +450,21 @@ impl MessageThread {
         match envelope {
             Envelope::Slice(slice) => {
                 let epoch = epoch_of(slice.stamp());
-                self.open.entry(epoch).or_default().push(slice);
+                let gauge = &self.gauges.epochs;
+                let open = self.open.entry(epoch).or_insert_with(|| Open {
+                    slices: Vec::new(),
+                    charge: gauge.empty(),
+                    refused: false,
+                });
+                if open.refused {
+                    return;
+                }
+                if open.charge.try_grow(slice.share()) {
+                    open.slices.push(slice);
+                } else {
+                    // Past the budget: the whole epoch is refused, never a part of it.
+                    open.refuse();
+                }
             }
             Envelope::Tick(stamp) => {
                 let watermark = self.watermark.tick(producer, stamp);
@@ -401,16 +495,19 @@ impl MessageThread {
 
     /// Decides epoch `epoch`'s receptions in canonical order and hands them to the sealer.
     fn close(&mut self, epoch: Epoch, closed_before: Epoch) {
-        let mut slices = self.open.remove(&epoch).unwrap_or_default();
+        let Some(mut open) = self.open.remove(&epoch) else {
+            return;
+        };
         // Anything older still open came after its epoch closed: impossible while producers keep
-        // their ticks, and kept out of any later epoch if it ever happened.
+        // their ticks. Were it to happen it is let go here, counted with this epoch's refusal, and
+        // never decided in a later epoch than its own.
         while let Some(entry) = self.open.first_entry() {
             if *entry.key() > epoch {
                 break;
             }
-            slices.extend(entry.remove());
+            entry.remove();
+            open.refuse();
         }
-        slices.sort_by_key(Slice::stamp);
         // The generations follow the epochs: the one before is remembered, older ones are not.
         match self.decided {
             Some(last) if epoch == last + 1 => self.shards.iter_mut().for_each(MessageShard::swap),
@@ -418,10 +515,38 @@ impl MessageThread {
             _ => {}
         }
         self.decided = Some(epoch);
+        // Room for every reception of the epoch to be new, before any is decided: an epoch the
+        // fingerprints' budget cannot hold is refused whole, never decided in part.
+        let receptions: usize = open.slices.iter().map(Slice::receptions).sum();
+        // The charge already covers the tables as they stand (set at the last close; a swap or a
+        // clear never grows them).
+        // A table grows by doubling, so deciding them may at most double what the tables and the
+        // new entries take; the charge is cut to what they hold once decided.
+        let needed = (self.held_slots() + receptions)
+            .saturating_mul(2)
+            .saturating_mul(DEDUP_ENTRY_BYTES);
+        let more = needed.saturating_sub(self.dedup.bytes());
+        let room = !open.refused && self.dedup.try_grow(more);
+        let closed_before = (epoch + 1).min(closed_before);
+        if !room {
+            self.send(Frozen {
+                thread: self.thread,
+                epoch: Some(epoch),
+                closed_before,
+                refused: true,
+                ..Frozen::default()
+            });
+            return;
+        }
+        let Open {
+            mut slices, charge, ..
+        } = open;
+        slices.sort_by_key(Slice::stamp);
         let mut frozen = Frozen {
             thread: self.thread,
             epoch: Some(epoch),
-            closed_before: (epoch + 1).min(closed_before),
+            closed_before,
+            charge,
             batches: Vec::with_capacity(slices.len()),
             ..Frozen::default()
         };
@@ -441,18 +566,44 @@ impl MessageThread {
             }
         }
         frozen.batches = slices.into_iter().map(|slice| slice.decoded).collect();
+        // What the tables hold now, no more.
+        self.dedup
+            .shrink_to(self.held_slots().saturating_mul(DEDUP_ENTRY_BYTES));
         self.send(frozen);
     }
 
     fn send(&mut self, mut frozen: Frozen) {
         frozen.seq = self.sent;
-        self.sent += 1;
+        if frozen.epoch.is_some() {
+            self.sent += 1;
+        }
         (self.sink)(frozen);
     }
 
     /// Fingerprints held across its shards.
     pub fn held(&self) -> usize {
         self.shards.iter().map(MessageShard::len).sum()
+    }
+
+    /// Table slots its shards' generations hold.
+    fn held_slots(&self) -> usize {
+        self.shards.iter().map(MessageShard::capacity).sum()
+    }
+}
+
+/// An epoch open on a message thread: its slices so far and what they are charged, or refused.
+struct Open {
+    slices: Vec<Slice>,
+    charge: Charge,
+    refused: bool,
+}
+
+impl Open {
+    /// Refused whole: what it held is let go now.
+    fn refuse(&mut self) {
+        self.refused = true;
+        self.slices = Vec::new();
+        self.charge.shrink_to(0);
     }
 }
 
@@ -467,18 +618,19 @@ pub enum MessageExchange {
 }
 
 impl MessageExchange {
-    pub fn inline(sink: Sink) -> Self {
-        Self::Inline(Mutex::new(MessageThread::new(0, 1, 1, sink)))
+    pub fn inline(sink: Sink, gauges: Gauges) -> Self {
+        Self::Inline(Mutex::new(MessageThread::new(0, 1, 1, sink, gauges)))
     }
 
     /// `threads` threads, fed by `producers` producers, each queue bounded per producer.
-    pub fn threads(threads: usize, producers: usize, sink: &Sink) -> Self {
+    pub fn threads(threads: usize, producers: usize, sink: &Sink, gauges: &Gauges) -> Self {
         let threads = threads.max(1);
         let mut senders = Vec::with_capacity(threads);
         let mut handles = Vec::with_capacity(threads);
         for thread in 0..threads {
             let (sender, receiver) = sync_channel(QUEUE_SLICES * producers.max(1));
-            let state = MessageThread::new(thread, threads, producers, Arc::clone(sink));
+            let state =
+                MessageThread::new(thread, threads, producers, Arc::clone(sink), gauges.clone());
             let handle = std::thread::Builder::new()
                 .name(format!("tally-message-{thread}"))
                 .spawn(move || run(state, &receiver));

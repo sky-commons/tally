@@ -34,6 +34,7 @@ pub fn router(hub: Arc<Hub>) -> Router {
         .route("/egress", get(egress))
         .route("/mlat", get(mlat))
         .route("/products", get(products))
+        .route("/memory", get(memory))
         .with_state(hub)
 }
 
@@ -56,6 +57,12 @@ async fn mlat(State(hub): State<Arc<Hub>>) -> Response {
 
 async fn products(State(hub): State<Arc<Hub>>) -> Response {
     axum::Json(hub.network().products.report()).into_response()
+}
+
+/// The budget and every store's gauge, with what the stores that count their own bytes hold
+/// (the batch byte store, the delivery tags) and the decoded batches alive in all.
+async fn memory(State(hub): State<Arc<Hub>>) -> Response {
+    axum::Json(hub.memory_report()).into_response()
 }
 
 async fn stations(State(hub): State<Arc<Hub>>) -> Response {

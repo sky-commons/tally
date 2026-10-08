@@ -40,6 +40,8 @@ async fn run() -> Result<(), String> {
             .memory(config.memory, hosts_mlat)
             .staged(config.threads),
     );
+    // A relay whose memory admits no feeder would refuse every Hello: it refuses to start instead.
+    hub.budget().check()?;
     eprintln!(
         "tally-relay: {} of memory admits {} feeders ({} each); {} ingest and {} message threads",
         egress::decimal(config.memory as u64),
