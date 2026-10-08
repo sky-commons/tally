@@ -106,7 +106,7 @@ subscriber asks for as much as it likes: one whole-world deduplicated subscriber
 is about 10 TB a month. So every relay names a speed cap, `--max-upload`, and keeps to it whatever
 its peers ask. The cap bounds the bill: the relay can never send more than the cap times the
 seconds in a month (plus one second's burst). 10 Mbit/s is at most about 3.24 TB in a 30-day month
-and 3.34 TB in a 31-day one. A cap never goes dark: when more is asked for than it carries,
+and 3.35 TB in a 31-day one. A cap never goes dark: when more is asked for than it carries,
 lower-priority traffic goes slower, and nobody's data stops reaching the network because the month
 is nearly over.
 

@@ -19,7 +19,7 @@ usage: tally-relay --key FILE [--key FILE]... --max-upload RATE [options]
                          (decimal, as hosts state them, but for the KiB family), e.g.
                          10Mbit/s. It bounds the bill: the relay never sends more than this
                          rate times the seconds in a month, so 10Mbit/s is
-                         at most about 3.34 TB in 31 days. Under the cap control goes first,
+                         at most about 3.35 TB in 31 days. Under the cap control goes first,
                          then positions and clock models, then raw to relay links and
                          engines, then the rest they are sent, then plain subscribers, each
                          class fairly among its peers; once a send has waited past 2 s, a
@@ -133,7 +133,7 @@ const CAP_REQUIRED: &str = "\
 --max-upload is required: a relay sends every subscriber what it asks for, and what a relay sends
 is what its host bills. Name the most this relay may send a second, which bounds the bill: it can
 never send more than that rate times the seconds in a month. For example --max-upload 6Mbit/s is
-at most about 2.00 TB in 31 days, which leaves about 1 TB of a $12 Lightsail plan's 3 TB for what
+at most about 2.01 TB in 31 days, which leaves about 1 TB of a $12 Lightsail plan's 3 TB for what
 feeders send in, which counts toward it too (AWS bills $0.09 a GB of the excess out). tally/README.md,
 \"What a relay costs\", prices common hosts.";
 

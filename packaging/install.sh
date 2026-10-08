@@ -21,7 +21,8 @@
 set -euo pipefail
 
 VERSION="v0.1.0"
-# Relays run by several independent operators, filled at release: HOST:PORT=KEY, space-separated.
+# The relays a new feeder starts from, HOST:PORT=KEY, space-separated: today the one public relay
+# (infra/tally/keygen.sh writes it); relays from other operators join this list as they come.
 RELAYS="relay.tally.flightlines.ai:10900=JHSEe+sJIFnbegZAoEvGzLcBKS1UYzgPBU7jpIuUJ8o="
 RELEASES="https://github.com/flightlines/tally/releases/download/$VERSION"
 BIN=/usr/local/bin/tally-feed
