@@ -54,7 +54,7 @@ pub use products::{
     WorldPositionsContent, WorldPrecise,
 };
 pub use record::{Reason, Record, RelayAddress, Role, Streams};
-pub use region::Region;
+pub use region::{Region, Regions};
 pub use sharing::{
     BundleIndex, BundleIndexContent, HaveSummary, ParityChunk, PieceManifest, PieceManifestContent,
     StripeAssignment, StripeReceipt, StripeReceiptContent,

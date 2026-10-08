@@ -38,7 +38,7 @@ use std::sync::Arc;
 use tally_mlat_solver::Site;
 use tally_mlat_solver::held::{Bin, Fragment, Limits, RAW_SPARE_BINS, Rates, SealedBins};
 use tally_mlat_solver::scope::{AFTER, BEFORE, STRIDE, Window, bin_of};
-use tally_wire::{Batch, Decoded, Identity, PublicKey, Record, Region};
+use tally_wire::{Batch, Decoded, Identity, PublicKey, Record, Regions};
 
 use crate::intake::{Intake, Seats};
 use crate::provisional::{self, Provisional};
@@ -50,6 +50,11 @@ use crate::window::{Job, Outcome, Report};
 /// ceiling instead (`Capacity::for_receivers`), with no floor: its seats come from the same budget
 /// as everything else it holds.
 pub const MIN_RECEIVERS: usize = 20_000;
+
+/// Receptions one receiver at the measured rates may have waiting for provisional solving: its
+/// wanted receptions over the longest a reception waits (`provisional::WAITING_MS`).
+pub const WAITING_PER_RECEIVER: usize =
+    Rates::MEASURED.wanted_per_s * provisional::WAITING_MS as usize / 1_000;
 
 /// How much an engine holds, derived from what its host admits (RFC-0178 §9).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -75,6 +80,18 @@ impl Capacity {
     }
 }
 
+impl Capacity {
+    /// Receptions waiting for provisional solving, at most: each receiver's wanted receptions over
+    /// the longest one waits (`provisional::WAITING_MS`). Beyond it a batch's replies are refused
+    /// whole (`provisional::admit`).
+    pub fn waiting(&self) -> usize {
+        self.receivers
+            .saturating_mul(self.rates.wanted_per_s)
+            .saturating_mul(provisional::WAITING_MS as usize)
+            / 1_000
+    }
+}
+
 impl Default for Capacity {
     fn default() -> Self {
         Self::for_receivers(MIN_RECEIVERS)
@@ -85,7 +102,7 @@ impl Default for Capacity {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Settings {
     /// The H3 cells whose receivers take part; empty is every receiver with a location.
-    pub regions: Vec<Region>,
+    pub regions: Regions,
     /// How long after a bin's canonical window ends (by the engine's clock) it is solved, so the
     /// raw of the window's last bin is in.
     pub settle_ms: u64,
@@ -136,7 +153,7 @@ pub struct Engine {
     settings: Settings,
     /// The areas whose tiles it fits (`set_scope`): a tile is fitted only if its centre is in one.
     /// Empty: every tile its regions cover.
-    owned: Vec<Region>,
+    owned: Regions,
     /// Its receivers and their open raw, when it holds them itself; `None` when its host does
     /// (`hosted`).
     intake: Option<Intake>,
@@ -175,7 +192,7 @@ impl Engine {
         );
         let mut engine = Self::hosted(identity, boot_id, settings, sealed);
         engine.intake = Some(intake);
-        engine.provisional = Provisional::new();
+        engine.provisional = Provisional::new(engine.settings.capacity.waiting());
         engine
     }
 
@@ -193,7 +210,7 @@ impl Engine {
             identity,
             boot_id,
             settings,
-            owned: Vec::new(),
+            owned: Regions::default(),
             intake: None,
             sealed,
             processed: BTreeSet::new(),
@@ -277,7 +294,7 @@ impl Engine {
     /// takes no part and what it heard is forgotten, as when its own description moves it out; one
     /// now inside takes part from its next batch. The same records under the same scope solve to
     /// the same bytes whatever scopes came before. A hosted engine's host re-scopes its intakes.
-    pub fn set_scope(&mut self, regions: Vec<Region>, owned: Vec<Region>) {
+    pub fn set_scope(&mut self, regions: Regions, owned: Regions) {
         self.settings.regions.clone_from(&regions);
         self.owned = owned;
         if let Some(intake) = self.intake.as_mut() {
@@ -520,11 +537,11 @@ mod tests {
     use tally_mlat_solver::obs::MAX_SITE_PRECISION_M;
     use tally_wire::ReceiverInfo;
     use tally_wire::batch::{ReceiverInfoContent, format};
-    use tally_wire::{BatchContent, Clock, Location, Observation};
+    use tally_wire::{BatchContent, Clock, Location, Observation, Region};
 
     fn settings() -> Settings {
         Settings {
-            regions: Vec::new(),
+            regions: Regions::default(),
             settle_ms: 1_000,
             threads: 1,
             capacity: Capacity::default(),
@@ -739,7 +756,7 @@ mod tests {
                 Identity::generate().map_err(text)?,
                 1,
                 Settings {
-                    regions: vec![region],
+                    regions: Regions::new([region]),
                     ..settings()
                 },
             );
@@ -752,7 +769,7 @@ mod tests {
             Identity::generate().map_err(text)?,
             1,
             Settings {
-                regions: vec![region],
+                regions: Regions::new([region]),
                 ..settings()
             },
         );

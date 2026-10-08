@@ -702,7 +702,7 @@ impl Scripted {
 }
 
 impl MlatHost for Scripted {
-    fn set_areas(&self, _: Vec<Region>, _: Vec<ReceiverInfo>) {}
+    fn set_areas(&self, _: tally_wire::Regions, _: Vec<ReceiverInfo>) {}
 
     fn offer_description(&self, _: &ReceiverInfo) {}
 

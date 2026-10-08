@@ -42,7 +42,7 @@ use std::sync::{Arc, Mutex};
 use tally_mlat_solver::held::{Closing, Fragment, Limits, Open};
 use tally_mlat_solver::obs::MAX_SITE_PRECISION_M;
 use tally_mlat_solver::{Site, Timebase};
-use tally_wire::{Clock, Decoded, FingerprintKey, Location, PublicKey, ReceiverInfo, Region};
+use tally_wire::{Clock, Decoded, FingerprintKey, Location, PublicKey, ReceiverInfo, Regions};
 
 use crate::engine::{Dropped, Ingested};
 use crate::provisional::{Note, notes_of};
@@ -336,7 +336,7 @@ pub struct Intake {
     seats: Arc<Seats>,
     /// The engine's regions: a receiver inside one takes part (empty: every receiver with a
     /// location). `None`: no engine runs, and no receiver takes part.
-    regions: Option<Vec<Region>>,
+    regions: Option<Regions>,
     receivers: BTreeMap<PublicKey, Described>,
     open: Open,
     /// How lateness is decided by the stamp, if it is (`closing`); kept across a restart.
@@ -354,7 +354,7 @@ impl Intake {
     /// Receivers seated in `seats`, raw bounded by `limits` (its byte bound is the open raw's own;
     /// a holder whose raw is split checks its whole bound when it seals, `Bin::seal_within`),
     /// taking part in `regions`.
-    pub fn new(seats: Arc<Seats>, limits: Limits, regions: Option<Vec<Region>>) -> Self {
+    pub fn new(seats: Arc<Seats>, limits: Limits, regions: Option<Regions>) -> Self {
         Self {
             seats,
             regions,
@@ -531,7 +531,7 @@ impl Intake {
     /// is decided again on its own signed word, and ranked again for its seat: the receivers here
     /// that stopped taking part, whose raw here is forgotten (their holder forgets them in the
     /// sealed bins), and those of other intakes whose seat changed.
-    pub fn set_scope(&mut self, regions: Option<Vec<Region>>) -> Description {
+    pub fn set_scope(&mut self, regions: Option<Regions>) -> Description {
         self.regions = regions;
         let decided: Vec<(PublicKey, Option<Site>, bool)> = self
             .receivers
@@ -588,7 +588,7 @@ impl Intake {
     fn site(&self, key: PublicKey, location: Option<Location>, clock: Clock) -> Option<Site> {
         let regions = self.regions.as_ref()?;
         let location = location?;
-        let inside = regions.is_empty() || regions.iter().any(|region| region.covers(&location));
+        let inside = regions.is_empty() || regions.covers(&location);
         let usable = Timebase::of(clock).is_some() && location.precision_m <= MAX_SITE_PRECISION_M;
         (inside && usable).then_some(Site {
             receiver: key,
@@ -602,6 +602,18 @@ impl Intake {
     /// (`Limits::per_receiver_bin`; the holder's whole bound is checked when it seals). What it
     /// did, and what it says to provisional solving (nothing unless it was taken).
     pub fn ingest_verified(&mut self, batch: &Decoded) -> (Ingested, Vec<Note>) {
+        self.ingest_verified_taking(batch, &mut |_| true)
+    }
+
+    /// As `ingest_verified`, every byte of open raw asked of `take` before it is allocated
+    /// (`held::Open::add_decoded_taking`): for a holder charged for its open raw as it grows. A
+    /// byte refused refuses the batch's raw of its bin, counted with the receiver's raw refused
+    /// for its share; what it says to provisional solving is told all the same.
+    pub fn ingest_verified_taking(
+        &mut self,
+        batch: &Decoded,
+        take: &mut dyn FnMut(usize) -> bool,
+    ) -> (Ingested, Vec<Note>) {
         let key = batch.receiver();
         let Some(known) = self.receivers.get_mut(&key) else {
             return (Ingested::Ignored, Vec::new());
@@ -613,7 +625,7 @@ impl Intake {
             return (Ingested::Replayed, Vec::new());
         }
         let notes = notes_of(batch);
-        let added = self.open.add_decoded(batch);
+        let added = self.open.add_decoded_taking(batch, take);
         self.dropped.late += added.late as u64;
         self.dropped.refused += added.refused as u64;
         (

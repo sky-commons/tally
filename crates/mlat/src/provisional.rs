@@ -38,7 +38,8 @@
 //!   ([`notes_of`]) is told and held until a step weighs it ([`Shard::read`], [`Shard::keep`]),
 //!   every batch in [`Order`] (its stamp, then its receiver, boot and sequence), so the same
 //!   batches between two steps weigh the same however they were interleaved.
-//! - **Bounded, whole**: receptions waiting by count, `MAX_WAITING`. A batch's replies to be solved
+//! - **Bounded, whole**: receptions waiting by count, the engine's `Capacity::waiting` (a share a
+//!   receiver, `WAITING_BYTES` each, what a relay reserves for them). A batch's replies to be solved
 //!   are kept or refused together, in every shard at once ([`admit`]), counted, in the order of the
 //!   batches: what is held never depends on which shard's notes landed first.
 //!   A model is forgotten once it can be carried no further.
@@ -63,12 +64,17 @@ pub const SETTLE_MS: u64 = 1_100;
 pub const ADSB_HORIZON_MS: u64 =
     (tally_mlat_solver::scope::BEFORE as u64 + 1 + tally_mlat_solver::scope::AFTER as u64)
         * GRID_MS;
-/// Receptions waiting to be solved, at most: a second and a tenth of the whole world's targets'
-/// replies many times over.
-pub const MAX_WAITING: usize = 1 << 20;
 /// How long a waiting reception is kept past its settling time when no model can carry it, or
 /// while too few receivers of its transmission have come to solve it.
 const KEPT_PAST_SETTLE_MS: u64 = 1_000;
+/// How long a reception may wait, at most: its settling, kept past it, and the step it is read in.
+/// What a receiver may have waiting is its wanted receptions over this
+/// (`engine::Capacity::waiting`).
+pub const WAITING_MS: u64 = SETTLE_MS + KEPT_PAST_SETTLE_MS + 1_000;
+/// A waiting reception as allocated, at most: its entry in its aircraft's list (a vector, so up to
+/// twice its size while the list doubles) and its message's own allocation (14 bytes, with the
+/// allocator's header, rounded).
+pub const WAITING_BYTES: usize = 2 * std::mem::size_of::<Waiting>() + 32;
 
 /// A published tile model, carried for provisional solutions.
 pub struct Carried {
@@ -182,13 +188,17 @@ impl Taken {
 /// Which batches' replies are refused, whole, in every address shard at once: in `order`, each
 /// batch's replies (`sizes`, its total over every shard, ascending by [`Order`]) are kept while the
 /// receptions waiting (`waiting`, every shard's after the last step) and those kept before it fit
-/// `MAX_WAITING`; a batch that does not fit is refused, all of it. A function of the batches and
-/// their order alone.
-pub fn admit(waiting: usize, sizes: impl IntoIterator<Item = (Order, usize)>) -> BTreeSet<Order> {
+/// `most` (the engine's `Capacity::waiting`); a batch that does not fit is refused, all of it. A
+/// function of the batches, their order and the engine's capacity alone.
+pub fn admit(
+    waiting: usize,
+    sizes: impl IntoIterator<Item = (Order, usize)>,
+    most: usize,
+) -> BTreeSet<Order> {
     let mut total = waiting;
     let mut refused = BTreeSet::new();
     for (order, size) in sizes {
-        if total.saturating_add(size) > MAX_WAITING {
+        if total.saturating_add(size) > most {
             refused.insert(order);
         } else {
             total += size;
@@ -556,12 +566,8 @@ pub struct Provisional {
     told: Vec<Told>,
     sequence: u64,
     report: Report,
-}
-
-impl Default for Provisional {
-    fn default() -> Self {
-        Self::new()
-    }
+    /// Receptions waiting in `shards`, at most.
+    most_waiting: usize,
 }
 
 /// A provisional step's work, owned.
@@ -660,14 +666,16 @@ pub fn by_shard(notes: &mut [Note]) -> Vec<(usize, std::ops::Range<usize>)> {
 }
 
 impl Provisional {
-    /// Provisional solving that hears its own batches: every address shard here.
-    pub fn new() -> Self {
+    /// Provisional solving that hears its own batches: every address shard here, at most
+    /// `most_waiting` receptions waiting in them (the engine's `Capacity::waiting`).
+    pub fn new(most_waiting: usize) -> Self {
         Self {
             book: Arc::default(),
             shards: (0..SHARDS).map(|_| Shard::default()).collect(),
             told: Vec::new(),
             sequence: 0,
             report: Report::default(),
+            most_waiting,
         }
     }
 
@@ -675,7 +683,7 @@ impl Provisional {
     pub fn hosted() -> Self {
         Self {
             shards: Vec::new(),
-            ..Self::new()
+            ..Self::new(0)
         }
     }
 
@@ -718,7 +726,11 @@ impl Provisional {
                 read.push((shard, self.shards[shard].read(&batch, &notes[range], order)));
             }
         }
-        let refused = admit(waiting, sizes(read.iter().map(|(_, taken)| taken)));
+        let refused = admit(
+            waiting,
+            sizes(read.iter().map(|(_, taken)| taken)),
+            self.most_waiting,
+        );
         for (shard, taken) in read {
             if refused.contains(&taken.order) {
                 self.shards[shard].refuse(taken);

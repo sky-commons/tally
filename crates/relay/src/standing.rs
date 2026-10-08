@@ -27,7 +27,7 @@ use tally_mlat_solver::publish;
 use tally_mlat_solver::standing::{Book, ReceiverStanding, Solved, heard_in};
 use tally_wire::batch::Hash;
 use tally_wire::clock_model::Assembler;
-use tally_wire::{ClockModel, Positions, PublicKey, Record, Region, Solution};
+use tally_wire::{ClockModel, Positions, PublicKey, Record, Region, Regions, Solution};
 
 use crate::bounded::Bounded;
 
@@ -99,7 +99,7 @@ impl Standing {
 
     /// The areas this relay holds raw for (its hosted MLAT's): standing is kept for receivers in
     /// them and their border band, and for no other.
-    pub fn set_areas(&self, areas: &[Region]) {
+    pub fn set_areas(&self, areas: &Regions) {
         self.inner().scope = (!areas.is_empty()).then(|| Band::of(areas));
     }
 
@@ -251,7 +251,7 @@ mod tests {
         })
         .ok();
         let area = atlanta.and_then(|cell| cell.ancestor(tally_wire::rendezvous::AREA_RESOLUTION));
-        standing.set_areas(&area.into_iter().collect::<Vec<_>>());
+        standing.set_areas(&area.into_iter().collect());
         // No hosted MLAT, no raw: unknown, even in the areas.
         assert_eq!(standing.of(&key, atlanta), None);
         standing.read_bins(SealedBins::new());

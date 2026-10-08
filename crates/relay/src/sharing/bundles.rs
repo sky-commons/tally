@@ -11,15 +11,16 @@
 //! omission is detectable, not merely unlikely.
 
 use std::collections::BTreeSet;
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 
 use tally_wire::batch::Hash;
 use tally_wire::rendezvous::{AREA_RESOLUTION, areas_of};
 use tally_wire::sharing::receipt_digest;
-use tally_wire::{PieceManifest, Region, Streams};
+use tally_wire::{PieceManifest, Region, Regions, Streams};
 
 use super::locks::{read, write};
 use super::stripes::domain_block;
+use crate::selection::Taken;
 
 const BUNDLE: &[u8] = b"tally sharing bundle child";
 
@@ -43,13 +44,17 @@ pub fn children(parent: Region) -> Vec<Region> {
     cells
 }
 
-/// What this relay holds of the area tree.
+/// What this relay holds of the area tree: the regions it takes (each area under one is
+/// gathered), the coarser cells it holds whole from another provider, and, computed from them
+/// once when either changes, the parents it may offer. Nothing per area.
 #[derive(Default)]
 pub struct Bundles {
-    /// Areas (at `AREA_RESOLUTION`) whose groups this relay is in.
-    gathered: RwLock<BTreeSet<u64>>,
+    /// The areas whose groups this relay is in: those it takes.
+    gathered: RwLock<Arc<Taken>>,
     /// Coarser cells held whole as bundles from another provider.
     held: RwLock<BTreeSet<u64>>,
+    /// Every parent offerable now, sorted: `None` until computed after a change.
+    offerable: RwLock<Option<Arc<BTreeSet<u64>>>>,
 }
 
 impl Bundles {
@@ -57,22 +62,29 @@ impl Bundles {
         Self::default()
     }
 
-    /// The areas this relay holds now (it takes them and is in their groups).
-    pub fn set_gathered(&self, areas: &[Region]) {
-        *write(&self.gathered) = areas
-            .iter()
-            .filter(|area| area.resolution() == AREA_RESOLUTION)
-            .map(|area| area.as_u64())
-            .collect();
+    /// The areas this relay holds now (it takes them and is in their groups): every area under
+    /// or around `regions` (`rendezvous::areas_of`), as the regions, never expanded.
+    pub fn set_gathered(&self, regions: &[Region]) {
+        self.set_taken(Arc::new(Taken::of(regions.to_vec())));
+    }
+
+    /// [`Bundles::set_gathered`] from the relay's own index of what it takes.
+    pub fn set_taken(&self, taken: Arc<Taken>) {
+        *write(&self.gathered) = taken;
+        *write(&self.offerable) = None;
     }
 
     /// A coarser cell held whole as a bundle from a provider (or no longer).
     pub fn set_held(&self, cell: Region, held: bool) {
         let mut set = write(&self.held);
-        if held {
-            set.insert(cell.as_u64());
+        let changed = if held {
+            set.insert(cell.as_u64())
         } else {
-            set.remove(&cell.as_u64());
+            set.remove(&cell.as_u64())
+        };
+        drop(set);
+        if changed {
+            *write(&self.offerable) = None;
         }
     }
 
@@ -83,38 +95,102 @@ impl Bundles {
 
     /// Every cell coarser than an area that this relay may offer as a bundle now.
     pub fn offerable(&self) -> Vec<Region> {
-        let (gathered, held) = (read(&self.gathered), read(&self.held));
-        let mut candidates = BTreeSet::new();
-        for area in gathered
+        self.offerable_set()
             .iter()
-            .filter_map(|area| Region::from_u64(*area).ok())
-        {
-            for resolution in 0..AREA_RESOLUTION {
-                if let Some(parent) = area.ancestor(resolution) {
-                    candidates.insert(parent.as_u64());
-                }
-            }
-        }
-        candidates
-            .into_iter()
-            .filter_map(|cell| Region::from_u64(cell).ok())
-            .filter(|cell| complete(*cell, &gathered, &held))
+            .filter_map(|cell| Region::from_u64(*cell).ok())
             .collect()
+    }
+
+    /// Whether `cell` is one this relay may offer as a bundle now.
+    pub fn is_offerable(&self, cell: Region) -> bool {
+        self.offerable_set().contains(&cell.as_u64())
+    }
+
+    /// What the relay's own offers name (`directory`): `cells` (the regions it takes) and the
+    /// bundles it may offer, as the fewest cells that cover them. A bundle under a region taken
+    /// adds nothing (a provider of a cell provides every cell under it, `rendezvous::ancestors`),
+    /// and one over regions taken stands for them, so there are never more than the regions taken
+    /// at their fewest (`Regions::new(cells)`), which is what the relay checks it may offer before
+    /// it starts (`directory::offerable`). Every place taken is offered: nothing is cut.
+    pub fn offered(&self, cells: &[Region]) -> Regions {
+        let bundles = self.offerable_set();
+        cells
+            .iter()
+            .copied()
+            .chain(
+                bundles
+                    .iter()
+                    .filter_map(|cell| Region::from_u64(*cell).ok()),
+            )
+            .collect()
+    }
+
+    fn offerable_set(&self) -> Arc<BTreeSet<u64>> {
+        if let Some(cached) = read(&self.offerable).as_ref() {
+            return Arc::clone(cached);
+        }
+        let gathered = Arc::clone(&read(&self.gathered));
+        let held = read(&self.held).clone();
+        let computed = Arc::new(offerable(&gathered, &held));
+        *write(&self.offerable) = Some(Arc::clone(&computed));
+        computed
     }
 }
 
-fn complete(cell: Region, gathered: &BTreeSet<u64>, held: &BTreeSet<u64>) -> bool {
+/// Every cell coarser than an area, above an area gathered, that is complete: the regions taken
+/// coarser than an area, their ancestors and their descendants down to just above the areas, and
+/// the ancestors of the rest, each checked. Computed from the regions, never from their areas.
+fn offerable(gathered: &Taken, held: &BTreeSet<u64>) -> BTreeSet<u64> {
+    let mut candidates = BTreeSet::new();
+    for region in gathered.regions() {
+        let top = region.resolution().min(AREA_RESOLUTION);
+        for resolution in 0..top {
+            if let Some(ancestor) = region.ancestor(resolution) {
+                candidates.insert(ancestor.as_u64());
+            }
+        }
+        // Every cell under a region coarser than an area, down to just above the areas.
+        let mut level = vec![*region];
+        while let Some(first) = level.first()
+            && first.resolution() < AREA_RESOLUTION
+        {
+            candidates.extend(level.iter().map(|cell| cell.as_u64()));
+            level = level.iter().flat_map(|cell| children(*cell)).collect();
+        }
+    }
+    candidates
+        .into_iter()
+        .filter(|cell| Region::from_u64(*cell).is_ok_and(|cell| complete(cell, gathered, held)))
+        .collect()
+}
+
+fn complete(cell: Region, gathered: &Taken, held: &BTreeSet<u64>) -> bool {
     if held.contains(&cell.as_u64()) {
         return true;
     }
     if cell.resolution() >= AREA_RESOLUTION {
-        return gathered.contains(&cell.as_u64());
+        return gathered.takes_area(cell);
+    }
+    // Every area under a region taken is gathered.
+    if gathered.takes(cell) {
+        return true;
+    }
+    // Nothing gathered or held under it: not complete, without walking its areas.
+    if !gathered.touches(cell) && !held_under(cell, held) {
+        return false;
     }
     let children = children(cell);
     !children.is_empty()
         && children
             .into_iter()
             .all(|child| complete(child, gathered, held))
+}
+
+/// Whether a cell held whole lies inside `cell`.
+fn held_under(cell: Region, held: &BTreeSet<u64>) -> bool {
+    held.iter()
+        .filter_map(|held| Region::from_u64(*held).ok())
+        .any(|held| cell.contains(held))
 }
 
 /// Why a bundle is not whole.

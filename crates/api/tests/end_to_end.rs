@@ -494,13 +494,13 @@ fn minutes_ago(scenario: Scenario) -> Scenario {
 /// slow machine had delivered by then.
 struct Held {
     host: HostedMlat,
-    areas: Vec<Region>,
+    areas: tally_wire::Regions,
     batches: u64,
     released: Arc<AtomicBool>,
 }
 
 impl MlatHost for Held {
-    fn set_areas(&self, _: Vec<Region>, descriptions: Vec<ReceiverInfo>) {
+    fn set_areas(&self, _: tally_wire::Regions, descriptions: Vec<ReceiverInfo>) {
         self.host.set_areas(self.areas.clone(), descriptions);
     }
 
@@ -578,12 +578,12 @@ async fn mlat_relay(batches: u64) -> Result<(RelayAddress, Arc<Hub>)> {
         }
     });
     let hub = Arc::new(Hub::clocked(8, clock).max_connections_per_address(64));
-    let areas = areas()?;
+    let areas = tally_wire::Regions::new(areas()?);
     let host = HostedMlat::new(
         identity.clone(),
         1,
         tally_mlat::engine::Settings {
-            regions: Vec::new(),
+            regions: tally_wire::Regions::default(),
             settle_ms: SETTLE_MS,
             threads: 4,
             capacity: tally_mlat::engine::Capacity::default(),

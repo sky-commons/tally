@@ -2,7 +2,9 @@
 //! hold", 1 to 3 and 7): the relay holds MLAT's raw once, in its raw shards, taken there by the
 //! ingest workers and sealed from them, and its provisional state in address shards; the host steps
 //! by the stamp watermark the products seal by, asked as the network task asks it, on a thread of
-//! its own, never waited on step by step. The same stamped trace makes the same clock models,
+//! its own, never waited on step by step, only kept within `STEPS_BEHIND` steps of the watermark,
+//! past which a host sheds whole steps (`mlat_host`, Behind: what a host that cannot keep up does,
+//! counted, and asserted here never to happen). The same stamped trace makes the same clock models,
 //! positions and provisional positions, byte for byte, on 1, 2 and 8 ingest workers and as many MLAT
 //! threads, with delays injected inside every stage of the host and between the batches, and they
 //! are what the reference engine, holding all the raw itself and driven in line on the same steps,
@@ -15,8 +17,8 @@ use std::time::{Duration, Instant};
 
 use tally_relay::hub::{Hub, Inbound, Origin};
 use tally_relay::ingest::{Stamp, Threads};
-use tally_relay::mlat_host::{HostedMlat, MlatHost, MlatReport, STEP_MS, Stage};
-use tally_wire::{Identity, Location, PublicKey, ReceiverInfo, Record, Region};
+use tally_relay::mlat_host::{HostedMlat, MlatHost, MlatReport, STEP_MS, STEPS_BEHIND, Stage};
+use tally_wire::{Identity, Location, PublicKey, ReceiverInfo, Record, Region, Regions};
 
 type Result<T = ()> = std::result::Result<T, String>;
 
@@ -25,7 +27,7 @@ fn text(error: impl std::fmt::Display) -> String {
 }
 
 /// The areas within about 150 km of the simulator's centre, where its receivers and aircraft are.
-fn mlat_areas() -> Result<Vec<Region>> {
+fn mlat_areas() -> Result<Regions> {
     let (lat, lon) = tally_mlat_solver::sim::CENTRE;
     let mut areas = Vec::new();
     for north in -2..=2 {
@@ -38,19 +40,17 @@ fn mlat_areas() -> Result<Vec<Region>> {
             };
             let area = Region::containing(&location, tally_wire::rendezvous::AREA_RESOLUTION)
                 .map_err(text)?;
-            if !areas.contains(&area) {
-                areas.push(area);
-            }
+            areas.push(area);
         }
     }
-    Ok(areas)
+    Ok(Regions::new(areas))
 }
 
 const MLAT_BOOT: u64 = 0xb007;
 
 fn mlat_settings(threads: usize) -> tally_mlat::engine::Settings {
     tally_mlat::engine::Settings {
-        regions: Vec::new(),
+        regions: Regions::default(),
         settle_ms: tally_relay::mlat_host::SETTLE_MS,
         threads,
         capacity: tally_mlat::engine::Capacity::default(),
@@ -143,13 +143,14 @@ enum Delays {
 /// What a staged relay on `threads` hosting MLAT for `areas` (on `settings`) signs from `arrivals`,
 /// on the real concurrent path: the descriptions handed in as `describing` says, then each step's
 /// batches (each stamped when it arrived) handed to the ingest workers and every worker ticked to
-/// the step, never waiting for them; meanwhile another thread asks the host with the products'
-/// watermark as the network task does, never waiting for it either. Only at the end is the host
-/// waited on, once. Its records, provisional ones apart from the rest, each encoded in order; its
+/// the step, never waiting for them, only for the host to be within `STEPS_BEHIND` steps of the
+/// next (a host further behind sheds, which a relay's real-time watermark gives it the seconds
+/// not to); meanwhile another thread asks the host with the products' watermark as the network
+/// task does, never waiting for it either. Only at the end is the host waited on, once. Its records, provisional ones apart from the rest, each encoded in order; its
 /// report; and the receivers whose raw it held.
 fn mlat_run_with(
     arrivals: &[(u64, Record)],
-    areas: &[Region],
+    areas: &Regions,
     threads: Threads,
     settings: tally_mlat::engine::Settings,
     describing: Describing,
@@ -176,7 +177,7 @@ fn mlat_run_with(
     }
     hub.network()
         .host_mlat(Arc::clone(&host) as Arc<dyn MlatHost>);
-    host.set_areas(areas.to_vec(), Vec::new());
+    host.set_areas(areas.clone(), Vec::new());
     describe_all(&hub, arrivals, describing)?;
     let first = arrivals.first().map(|(at, _)| *at).ok_or("no raw")?;
     let until = arrivals.last().map_or(0, |(at, _)| *at) + 60_000;
@@ -203,7 +204,19 @@ fn mlat_run_with(
         });
         let mut next = 0;
         let mut step = (first / STEP_MS + 1) * STEP_MS;
+        let ahead = STEPS_BEHIND as u64 * STEP_MS;
+        let since = Instant::now();
         while step <= until {
+            // Within `STEPS_BEHIND` steps of the host, as a real-time watermark keeps it.
+            while step > host.stepped_ms().max(first / STEP_MS * STEP_MS) + ahead {
+                if since.elapsed() > Duration::from_secs(300) {
+                    return Err(format!(
+                        "the hosted MLAT stepped to {}, {step} handed in",
+                        host.stepped_ms()
+                    ));
+                }
+                std::thread::sleep(Duration::from_micros(200));
+            }
             while let Some((at, record)) = arrivals.get(next).filter(|(at, _)| *at < step) {
                 if let Record::Batch(batch) = record {
                     if let Delays::Seeded(seed) = delays {
@@ -285,8 +298,9 @@ fn encoded(records: &[Record]) -> Signed {
 /// MLAT threads, with and without delays injected inside every stage of the host (an offer held up
 /// on its way, a provisional step, a seal and a window step each slowed by up to 30 ms) and between
 /// the batches, the host asked by the watermark on a thread of its own and never waited on step by
-/// step; and they are what the reference engine makes of the same raw on the same steps
-/// (`tally_mlat::replay`). Nothing is refused or let go on the way.
+/// step (only kept within `STEPS_BEHIND` of it); and they are what the reference engine makes of
+/// the same raw on the same steps (`tally_mlat::replay`). Nothing is refused, shed or let go on the
+/// way.
 #[test]
 fn hosted_mlat_makes_the_same_bytes_on_any_threads_with_any_delays_and_the_reference_engines()
 -> Result {
@@ -308,9 +322,11 @@ fn hosted_mlat_makes_the_same_bytes_on_any_threads_with_any_delays_and_the_refer
                 report.refused,
                 report.overflowed,
                 report.steps_discarded,
-                report.ingest_errors
+                report.ingest_errors,
+                report.steps_shed,
+                report.shed
             ),
-            (0, 0, 0, 0),
+            (0, 0, 0, 0, 0, 0),
             "{ingest} threads, {delays:?}: {report:?}"
         );
         Ok(signed)
@@ -419,6 +435,11 @@ fn at_capacity_the_same_receivers_are_refused_whatever_the_order_and_the_threads
         )?;
         assert_eq!(
             report.receivers_refused, SHORT as u64,
+            "{ingest} threads, {describing:?}, {delays:?}: {report:?}"
+        );
+        assert_eq!(
+            (report.steps_shed, report.shed),
+            (0, 0),
             "{ingest} threads, {describing:?}, {delays:?}: {report:?}"
         );
         assert_eq!(

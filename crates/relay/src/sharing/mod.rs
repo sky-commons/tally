@@ -20,6 +20,15 @@
 //! indexes), and what it addresses to members ([`Sharing::take_outbox`]), which `network` carries
 //! down a session to each (`peers`). [`group_of`] is the one rule for which group a record is in.
 //!
+//! **Idle costs nothing.** A relay takes every area under its regions (the whole world is 41,162),
+//! but holds and visits only what carries something: a group only this relay is in, with nothing
+//! in it, has no book (`groups`) and is not held (`member`), and its trees are computed when asked
+//! ([`Sharing::layout`]). The tick lays out again only the trees of the areas whose offers changed
+//! (`Directory::take_changed_cells`), whose demotions began or ended, or all held ones when what
+//! the relay takes or has withdrawn from changes; and the member visits only the groups with a duty
+//! due. So a tick with no traffic and no change does no work, however many areas are taken
+//! ([`Sharing::work`] counts it).
+//!
 //! What the seam hands back to an asker ([`DataReplies`]) is data, never control: a repair page is
 //! manifests, parity and records, and the link sends it as data, paced and capped like any other
 //! record of its class (`egress`), so an asker cannot draw the control reserve by asking.
@@ -36,9 +45,11 @@ pub mod withdrawal;
 #[cfg(test)]
 mod tests;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use tally_wire::rendezvous::{AREA_RESOLUTION, areas_of};
 use tally_wire::{
     BundleIndex, BundleIndexContent, HaveSummary, Identity, ParityChunk, PieceManifest, PublicKey,
     Record, Region, Streams, StripeAssignment, StripeReceipt,
@@ -47,6 +58,7 @@ use tally_wire::{
 use crate::egress::{Class, EgressReport};
 use crate::hub::Hub;
 use crate::network::{Asker, AskerRole};
+use crate::selection::Taken;
 
 use self::groups::{ASK_LIFETIME_MS, GroupKey};
 use self::locks::lock;
@@ -96,6 +108,34 @@ pub struct Sharing {
     withdrawal: Mutex<Withdrawal>,
     /// The member's capacity, once the relay set one.
     capacity: Mutex<Option<usize>>,
+    /// What the trees were last laid out from: the regions taken, the regions withdrawn, the key.
+    view: Mutex<View>,
+    /// Areas to lay out again at the next tick (a demotion the trees now leave out).
+    relayout: Mutex<BTreeSet<u64>>,
+    /// Group trees laid out since start: one per (area, product) whose offers, demotions or
+    /// withdrawal changed, never one per area taken.
+    laid_out: AtomicU64,
+}
+
+#[derive(Default)]
+struct View {
+    taken: Arc<Taken>,
+    withdrawn: Vec<Region>,
+    me: Option<PublicKey>,
+}
+
+/// What sharing has done and holds: the work a tick costs follows these, and none of them follows
+/// the number of areas taken.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Work {
+    /// Group trees laid out since start.
+    pub laid_out: u64,
+    /// Groups the member's tick visited since start.
+    pub visited: u64,
+    /// Groups held now (each more than this relay alone with nothing).
+    pub held_groups: usize,
+    /// Groups another relay is in (offered or asked), held as books now.
+    pub books: usize,
 }
 
 struct Assembling {
@@ -211,8 +251,12 @@ impl Sharing {
     }
 
     /// A record this relay originated for an area's product (a feeder's batch, its own
-    /// positions): held, and seeded into the group.
+    /// positions): held, and seeded into the group. Only in an area it takes: a group of any
+    /// other has no tree this relay is in.
     pub fn originate(&self, record: &Record, cell: Region, product: Streams, now_ms: u64) {
+        if !self.takes_area(cell) {
+            return;
+        }
         let Some((hash, piece)) = encoded(record) else {
             return;
         };
@@ -234,12 +278,15 @@ impl Sharing {
         let Some((hash, piece)) = encoded(record) else {
             return;
         };
-        let message = Message::Piece {
-            group: GroupKey::new(cell, product),
-            hash,
-            piece,
-        };
-        let out = self.with_member(|member| member.receive(*from, message, now_ms));
+        let group = GroupKey::new(cell, product);
+        let message = Message::Piece { group, hash, piece };
+        let joins = self.takes_area(cell);
+        let out = self.with_member(|member| {
+            if joins {
+                member.join(group);
+            }
+            member.receive(*from, message, now_ms)
+        });
         self.queue(out.unwrap_or_default());
     }
 
@@ -331,12 +378,69 @@ impl Sharing {
         self.bundles.offerable()
     }
 
-    /// The group trees as this relay sees them (none before it serves).
+    /// The group trees as this relay sees them (none before it serves): a held group's, or, for
+    /// an area it takes that no other relay is in, this relay alone.
     pub fn layout(&self, cell: Region, product: Streams) -> Option<stripes::Layout> {
-        lock(&self.member)
-            .as_ref()?
-            .layout(GroupKey::new(cell, product))
-            .cloned()
+        let member = lock(&self.member);
+        let member = member.as_ref()?;
+        if let Some(layout) = member.layout(GroupKey::new(cell, product)) {
+            return Some(layout.clone());
+        }
+        let me = member.key();
+        let taken = Arc::clone(&lock(&self.view).taken);
+        if !taken.takes_area(cell) {
+            return None;
+        }
+        let withdrawal = lock(&self.withdrawal).clone();
+        let leaves = if self.own_leaf(cell, &taken, &withdrawal) {
+            vec![me]
+        } else {
+            Vec::new()
+        };
+        Some(stripes::Layout::new(cell, product, &[me], &leaves))
+    }
+
+    /// The stripes `key` is an interior candidate in, in the group's trees as this relay sees them;
+    /// `None` when there are none or it is not in them. For an area no other relay is in, without
+    /// laying the trees out: this relay alone forwards every stripe.
+    pub fn homes(&self, cell: Region, product: Streams, key: &PublicKey) -> Option<Vec<u8>> {
+        let member = lock(&self.member);
+        let member = member.as_ref()?;
+        if let Some(layout) = member.layout(GroupKey::new(cell, product)) {
+            return layout.contains(key).then(|| layout.homes(key));
+        }
+        (member.key() == *key && self.takes_area(cell)).then(|| (0..stripes::STRIPES).collect())
+    }
+
+    /// What sharing has done and holds.
+    pub fn work(&self) -> Work {
+        let (visited, held_groups) = lock(&self.member)
+            .as_ref()
+            .map_or((0, 0), |member| (member.visits(), member.groups().len()));
+        Work {
+            laid_out: self.laid_out.load(Ordering::Relaxed),
+            visited,
+            held_groups,
+            books: self.groups.keys().len(),
+        }
+    }
+
+    /// Whether `area` is one this relay takes, as of the last tick.
+    fn takes_area(&self, area: Region) -> bool {
+        lock(&self.view).taken.takes_area(area)
+    }
+
+    /// Whether this relay is a leaf in `area`'s trees: some cell it offers that holds the area (a
+    /// region it takes or a bundle) overlaps a region it withdrew from. Its offers for that cell
+    /// say 0 stripes, and it reads itself as every other relay reads those offers.
+    fn own_leaf(&self, area: Region, taken: &Taken, withdrawal: &Withdrawal) -> bool {
+        !withdrawal.withdrawn().is_empty()
+            && (0..=area.resolution())
+                .filter_map(|resolution| area.ancestor(resolution))
+                .any(|cell| {
+                    (taken.names(cell) || self.bundles.is_offerable(cell))
+                        && withdrawal.covers(cell)
+                })
     }
 
     /// Whether this relay forwards nothing in `cell` now: the cell overlaps a region it withdrew
@@ -356,6 +460,11 @@ impl Sharing {
     }
 
     /// [`Sharing::tick`], with the egress's count of forwarding peers shed given.
+    ///
+    /// Lays out again only the trees that may have changed: the areas under the cells whose offers
+    /// changed (where another relay offers, or a group is held or booked), the areas whose
+    /// demotions began or ended, and every held or booked group when the regions taken, the regions
+    /// withdrawn or the key change. Then the member's duties that are due.
     pub(crate) fn tick_shed(
         &self,
         hub: &Hub,
@@ -368,54 +477,24 @@ impl Sharing {
         };
         let me = identity.public();
         let network = hub.network();
-        let regions = network.selection.taken();
-        // Groups are per area (`group_of` routes every record to its area's), whatever the
-        // operator named: a region coarser than an area is every area under it.
-        let areas = network.selection.taken_areas();
+        let taken = network.selection.taken_index();
         let withdrawal = {
             let mut withdrawal = lock(&self.withdrawal);
-            withdrawal.observe(shed, &regions, &me, now_ms);
+            withdrawal.observe(shed, taken.regions(), &me, now_ms);
             withdrawal.clone()
         };
-        let mut offered_cells = regions.clone();
-        offered_cells.extend(self.bundles.offerable());
-        self.groups.expire(now_ms);
-        let mut keys = Vec::new();
-        for area in &areas {
-            let offers = network.directory.offers_for(*area, now_ms);
-            // This relay's offers covering the area say 0 stripes when any overlaps a withdrawn
-            // region; it reads itself as every other relay reads those offers.
-            let leaf = offered_cells
-                .iter()
-                .any(|cell| cell.contains(*area) && withdrawal.covers(*cell));
-            for product in SHARED_PRODUCTS {
-                let key = GroupKey::new(*area, product);
-                self.groups.own(key, me, now_ms + ASK_LIFETIME_MS, leaf);
-                // Every live, verified offer covering the area for the product, per signer: until
-                // the latest expires, and a leaf when any of them forwards nothing here.
-                let mut signers: BTreeMap<PublicKey, (u64, bool)> = BTreeMap::new();
-                for offer in &offers {
-                    let (Ok(content), Ok(signer)) = (offer.content(), offer.signer()) else {
-                        continue;
-                    };
-                    if signer == me
-                        || !content.products.contains(product)
-                        || crate::directory::expiry(&content) <= now_ms
-                        || offer.verify().is_err()
-                    {
-                        continue;
-                    }
-                    let held = signers.entry(signer).or_insert((0, false));
-                    held.0 = held.0.max(crate::directory::expiry(&content));
-                    held.1 |= content.stripes == 0;
-                }
-                for (signer, (until, leaf)) in signers {
-                    self.groups.offered(key, signer, until, leaf);
-                }
-                keys.push(key);
-            }
+        let (taken_moved, withdrawn_moved) = {
+            let mut view = lock(&self.view);
+            let taken_moved = view.taken.version() != taken.version() || view.me != Some(me);
+            let withdrawn_moved = view.withdrawn != withdrawal.withdrawn();
+            view.taken = Arc::clone(&taken);
+            view.withdrawn = withdrawal.withdrawn().to_vec();
+            view.me = Some(me);
+            (taken_moved, withdrawn_moved)
+        };
+        if taken_moved {
+            self.bundles.set_taken(Arc::clone(&taken));
         }
-        self.bundles.set_gathered(&areas);
         lock(&self.assembling).retain(|_, held| held.started_ms + PARITY_ASSEMBLY_MS > now_ms);
         let mut guard = lock(&self.member);
         let capacity = *lock(&self.capacity);
@@ -430,19 +509,112 @@ impl Sharing {
         if member.key() != me {
             *member = fresh(identity);
         }
-        let mut out = Vec::new();
-        for key in member.groups() {
-            if !keys.contains(&key) {
-                member.leave(key);
+        // The areas whose trees may have changed.
+        let directory = &network.directory;
+        let changed = directory.take_changed_cells(now_ms);
+        let mut areas: BTreeSet<u64> = std::mem::take(&mut *lock(&self.relayout));
+        for key in self.groups.expire(now_ms) {
+            areas.insert(key.cell.as_u64());
+        }
+        let known = |areas: &mut BTreeSet<u64>, member: &Member, under: Option<Region>| {
+            let held = member.groups().into_iter().chain(self.groups.keys());
+            areas.extend(
+                held.map(|key| key.cell)
+                    .filter(|cell| under.is_none_or(|under| under.contains(*cell)))
+                    .map(Region::as_u64),
+            );
+        };
+        if taken_moved || withdrawn_moved {
+            known(&mut areas, member, None);
+        }
+        let cells = if taken_moved {
+            directory.cells_held_by_others(&me)
+        } else {
+            changed
+        };
+        for cell in cells {
+            if cell.resolution() > AREA_RESOLUTION || !taken.touches(cell) {
+                continue;
+            }
+            if directory.others_hold(cell, &me) {
+                let under = if cell.resolution() == AREA_RESOLUTION {
+                    vec![cell]
+                } else {
+                    areas_of(cell).unwrap_or_default()
+                };
+                areas.extend(
+                    under
+                        .into_iter()
+                        .filter(|area| taken.takes_area(*area))
+                        .map(Region::as_u64),
+                );
+            } else {
+                // Only this relay offers here now: what changed is another's leaving, and only
+                // the groups held or booked under the cell had it.
+                known(&mut areas, member, Some(cell));
             }
         }
-        for key in &keys {
-            let (members, leaves) = self.groups.tree(*key, now_ms);
-            out.extend(member.set_members(*key, &members, &leaves, now_ms));
+        let mut out = Vec::new();
+        let mut laid_out = 0;
+        for area in areas
+            .into_iter()
+            .filter_map(|area| Region::from_u64(area).ok())
+        {
+            if !taken.takes_area(area) {
+                for product in SHARED_PRODUCTS {
+                    let key = GroupKey::new(area, product);
+                    self.groups.set_offers(key, &BTreeMap::new());
+                    member.leave(key);
+                }
+                continue;
+            }
+            // Every live, verified offer covering the area, but this relay's own.
+            let offers: Vec<(PublicKey, tally_wire::ProviderOfferContent)> = directory
+                .offers_for(area, now_ms)
+                .iter()
+                .filter_map(|offer| {
+                    let (Ok(content), Ok(signer)) = (offer.content(), offer.signer()) else {
+                        return None;
+                    };
+                    (signer != me
+                        && crate::directory::expiry(&content) > now_ms
+                        && offer.verify().is_ok())
+                    .then_some((signer, content))
+                })
+                .collect();
+            let leaf = self.own_leaf(area, &taken, &withdrawal);
+            for product in SHARED_PRODUCTS {
+                let key = GroupKey::new(area, product);
+                // Per signer, a leaf when any of its offers here forwards nothing.
+                let mut signers: BTreeMap<PublicKey, bool> = BTreeMap::new();
+                for (signer, content) in &offers {
+                    if content.products.contains(product) {
+                        *signers.entry(*signer).or_insert(false) |= content.stripes == 0;
+                    }
+                }
+                self.groups.set_offers(key, &signers);
+                let (members, mut leaves) = self.groups.tree(key);
+                if members.is_empty() && !member.holds_group(key) {
+                    // This relay alone, with nothing: not held (`Sharing::layout`).
+                    continue;
+                }
+                if leaf {
+                    leaves.push(me);
+                    leaves.sort();
+                }
+                laid_out += 1;
+                out.extend(member.set_members(key, &members, &leaves, now_ms));
+            }
         }
+        self.laid_out.fetch_add(laid_out, Ordering::Relaxed);
         out.extend(member.tick(now_ms));
-        for (group, demoted, until) in member.take_demotions() {
-            self.groups.demote(group, demoted, until);
+        let demotions = member.take_demotions();
+        if !demotions.is_empty() {
+            let mut relayout = lock(&self.relayout);
+            for (group, demoted, until) in demotions {
+                self.groups.demote(group, demoted, until);
+                relayout.insert(group.cell.as_u64());
+            }
         }
         let indexes = self.bundle_indexes(member, identity, now_ms);
         let rebuilt: Vec<Record> = member
@@ -458,9 +630,13 @@ impl Sharing {
         published
     }
 
-    /// The bundle indexes due (§2.6): for each parent this relay offers as a bundle and each
-    /// shared product, once a second, `BUNDLE_INDEX_AFTER_SECONDS` after it ends, every child with
-    /// the digest of the origin manifests held under it.
+    /// The bundle indexes due (§2.6): once a second, `BUNDLE_INDEX_AFTER_SECONDS` after it ends,
+    /// for each parent this relay may offer as a bundle and each shared product under which it
+    /// holds an origin manifest of that second, every child with the digest of the manifests held
+    /// under it. A parent with nothing under it that second has no index: there is nothing to
+    /// omit, and a reader who saw a manifest under a parent for a second with no index from its
+    /// bundler holds the omission itself. So the indexes cost what was originated, never the
+    /// number of parents offered.
     fn bundle_indexes(
         &self,
         member: &Member,
@@ -476,17 +652,40 @@ impl Sharing {
         }
         *through = Some(second);
         drop(through);
-        let parents = self.bundles.offerable();
+        // By parent, then product (in `SHARED_PRODUCTS` order), the manifests under it.
+        let mut under: BTreeMap<u64, BTreeMap<usize, Vec<PieceManifest>>> = BTreeMap::new();
+        for (group, manifests) in member.manifests_of(second) {
+            let Some(product) = SHARED_PRODUCTS
+                .iter()
+                .position(|product| *product == group.product)
+            else {
+                continue;
+            };
+            for resolution in 0..AREA_RESOLUTION {
+                if let Some(parent) = group.cell.ancestor(resolution)
+                    && self.bundles.is_offerable(parent)
+                {
+                    under
+                        .entry(parent.as_u64())
+                        .or_default()
+                        .entry(product)
+                        .or_default()
+                        .extend(manifests.iter().cloned());
+                }
+            }
+        }
         let mut out = Vec::new();
-        for parent in parents {
-            for product in SHARED_PRODUCTS {
-                let manifests: Vec<PieceManifest> = member
-                    .groups()
-                    .into_iter()
-                    .filter(|group| group.product == product && parent.contains(group.cell))
-                    .flat_map(|group| member.manifests(group, second))
-                    .collect();
-                let index = bundles::BundleIndex::build(parent, product, second, &manifests);
+        for (parent, products) in under {
+            let Ok(parent) = Region::from_u64(parent) else {
+                continue;
+            };
+            for (product, manifests) in products {
+                let index = bundles::BundleIndex::build(
+                    parent,
+                    SHARED_PRODUCTS[product],
+                    second,
+                    &manifests,
+                );
                 let content = BundleIndexContent {
                     parent: index.parent,
                     product: index.product,
@@ -504,8 +703,15 @@ impl Sharing {
     /// Hands a message to the member; what goes back to the asker is the reply, the rest waits in
     /// the outbox.
     fn drive(&self, asker: &Asker, message: Message, now_ms: u64) -> DataReplies {
+        // A message about a group of an area this relay takes is the group's, held or not.
+        let joins = message.group().filter(|group| self.takes_area(group.cell));
         let out = self
-            .with_member(|member| member.receive(asker.key, message, now_ms))
+            .with_member(|member| {
+                if let Some(group) = joins {
+                    member.join(group);
+                }
+                member.receive(asker.key, message, now_ms)
+            })
             .unwrap_or_default();
         let (reply, rest): (Vec<Outgoing>, Vec<Outgoing>) = out
             .into_iter()

@@ -61,7 +61,7 @@ fn build() -> Result<World, String> {
         engine.clone(),
         0xb007,
         EngineSettings {
-            regions: Vec::new(),
+            regions: tally_wire::Regions::default(),
             settle_ms: SETTLE_MS,
             threads: 4,
             capacity: Default::default(),
@@ -338,7 +338,7 @@ fn honest_fixes_are_consistent_with_their_own_receptions() -> Result<(), String>
         Identity::from_seed([62; 32]),
         0xb007,
         EngineSettings {
-            regions: Vec::new(),
+            regions: tally_wire::Regions::default(),
             settle_ms: SETTLE_MS,
             threads: 2,
             capacity: Default::default(),
@@ -559,7 +559,7 @@ fn honest_receivers_earn_standing_the_same_at_every_keeper() -> Result<(), Strin
     let area = cell
         .ancestor(tally_wire::rendezvous::AREA_RESOLUTION)
         .ok_or("no area")?;
-    relay.set_areas(&[area]);
+    relay.set_areas(&tally_wire::Regions::new([area]));
     for record in &records {
         match record {
             Record::ClockModel(_) | Record::ClockModelPart(_) => relay.model(record, world.now),
@@ -782,7 +782,7 @@ fn the_ranking_is_a_function_of_the_records_held_not_of_when_they_arrived() -> R
             Identity::from_seed([70 + at as u8; 32]),
             0xb007,
             EngineSettings {
-                regions: Vec::new(),
+                regions: tally_wire::Regions::default(),
                 settle_ms: SETTLE_MS,
                 threads: 4,
                 capacity: Default::default(),

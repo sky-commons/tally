@@ -220,7 +220,7 @@ mod tests {
             Identity::from_seed([3; 32]),
             1,
             tally_mlat::engine::Settings {
-                regions: Vec::new(),
+                regions: tally_wire::Regions::default(),
                 settle_ms: crate::mlat_host::SETTLE_MS,
                 threads: 1,
                 capacity: tally_mlat::engine::Capacity::default(),

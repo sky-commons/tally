@@ -120,11 +120,15 @@ Measured on main (tally-load, commit b3e3571809 on branch tally-load):
    closed is dropped and counted (`receptions_late`), never merged into a later epoch.
 
    The hosted MLAT steps on the same watermark: once per `STEP_MS` grid point the products'
-   watermark passes, in order, none coalesced. Its raw is late by its stamp (raw stamped at or after
-   the step that takes its bin is late, whenever it arrived), and provisional solving weighs a step's
-   notes in content order. What batches tell provisional solving is held until the step that weighs
-   it, charged to its own store (`Store::Notes`, two steps of a feeder's decoded batches and the
-   notes a step admits a seat).
+   watermark passes, in order. Its raw is late by its stamp (raw stamped at or after the step that
+   takes its bin is late, whenever it arrived), and provisional solving weighs a step's notes in
+   content order. What batches tell provisional solving is held until the step that weighs it has
+   read it, charged to its own store (`Store::Notes`) before it is held. A step waits for the one
+   before it, up to `mlat_host::STEPS_BEHIND` (4) steps the watermark has passed and that have not
+   started; past them the oldest is shed, whole and counted (§9, §10), so the steps MLAT is behind
+   by are bounded and so is what it holds while it is: `INTERVALS_HELD` (7) step intervals of a
+   feeder's decoded batches and the notes a step admits a seat, and its open raw over the settle and
+   those steps (`OPEN_MS`, 7 s).
 
    Measured at 20,000 feeders before the pool: the single sealer thread held a whole core and fell
    behind (deriving the regional batches' ADS-B fixes was 70% of it, `to_observation` 20%, signing
@@ -143,7 +147,12 @@ Measured on main (tally-load, commit b3e3571809 on branch tally-load):
    receptions a second, five times the mean) over a bin and the settle, 7 s, about 0.35 MB with its
    bins' fixed cost, plus its thinned raw (150 kept a second) over the 25 sealed bins a holder keeps
    (`SEALED_BINS_HELD`), 0.75 MB: about 1.1 MB a receiver, 22.5 GB at 20,000. The critics' 8 GB was
-   the window's raw alone.
+   the window's raw alone. As built the two halves are two stores, each charged before it holds a
+   byte: sealed raw is `Store::Held` (0.75 MB a receiver), checked on each whole bin as it is sealed
+   and charged as it is inserted; open raw is `Store::Open`, over the settle and the steps MLAT may
+   fall behind (`mlat_host::OPEN_MS`, 7 s: 0.64 MB a receiver at its ceiling), charged by each raw
+   shard as it grows (`held::Open::add_decoded_taking` asks for every byte before it allocates it;
+   one refused refuses the batch's raw of the bin, counted).
 6. **One batch byte store**: shared `Bytes` keyed by (receiver, boot, seq); others hold handles.
    Window = the sharing repair horizon derived from sharing's own constants (~12-15 s), not 60 s.
    As built: the sharing member is that store. A group holds a batch as the `Batch` itself
@@ -244,14 +253,24 @@ Measured on main (tally-load, commit b3e3571809 on branch tally-load):
    between ingest and the sealer (`seal::EPOCHS_HELD`, 3 epochs), and what the products hold until
    the hub takes it (`products::OUTBOX_EPOCHS`, 2: the signed records only, every reception as an
    encoded observation in two of them, its stream's batch and its area's regional batch: 48 bytes a
-   reception, where the owned copy the stream used to hold was planned at 54 alone). Each store has a gauge whose limit is its share
+   reception, where the owned copy the stream used to hold was planned at 54 alone); and, where the
+   relay hosts MLAT, its sealed raw (`Held`), its open raw (`Open`), what batches told provisional
+   solving (`Notes`) and the engine's own tables (`Engine`: the receptions waiting for provisional
+   solving, `Capacity::waiting`, 1,116 a seat at `provisional::WAITING_BYTES`, and a window step's
+   working set, `SOLVE_BYTES_PER_RECEIVER`, 192 KiB a seat, reserved while it runs). Each store has a gauge whose limit is its share
    at the ceiling, charged for what the store really holds and released when it lets go (a decoded
-   batch by `Decoded::footprint`, a record by `Record::encoded_len`, the one size of either). What
-   a full gauge does is the store's policy: the ingest stage waits (the connection's socket unread);
+   batch by `Decoded::footprint`, a record by `Record::encoded_len`, the one size of either). A
+   charge is taken before the bytes are held: there is no way to charge a gauge past its limit
+   (`Gauge::force`, which charged whatever the limit for bytes already allocated, is gone; hosted
+   MLAT's notes and raw were charged that way and held ten times their share when MLAT fell behind,
+   "Sizing"). What a full gauge does is the store's policy: the ingest stage waits (the connection's socket unread);
    an epoch past its share is refused whole by the message thread that holds it, and the sealer
    counts it; the products refuse an epoch's records (its stream's batches among them) whole, and a
    peer's record alone; the
-   fan-out lets go the subscriber holding most until the item fits. A sharing member reserves the
+   fan-out lets go the subscriber holding most until the item fits, and lets go those it was for if
+   it never does; hosted MLAT refuses a step's notes whole, a batch's open raw of its bin, a sealed
+   bin whole, a batch's replies to provisional solving whole, each counted, and sheds whole steps it
+   falls behind on (§10). A sharing member reserves the
    feeders its ingest ceiling is worth (`--max-member-bytes-per-sec` over a planned feeder's rate)
    for as long as it is a member. A relay whose memory admits no feeder refuses to start
    (`Budget::check`), and the deployed units are held to the budget by a test
@@ -266,7 +285,15 @@ Measured on main (tally-load, commit b3e3571809 on branch tally-load):
 
 10. **Overload policy (decided)**: back-pressure for raw; whole-epoch refusal, counted, for derived
     products; refusal whole, counted, for delivery tags (a batch past `TAGS_HELD` is never tagged and
-    never denied, §7); disconnection for fan-out (§8). Changed from "back-pressure for delivery and
+    never denied, §7); disconnection for fan-out (§8); for hosted MLAT that cannot keep up, whole
+    steps shed, counted. MLAT never pushes back on ingest and never grows: while the watermark has
+    passed more than `STEPS_BEHIND` steps that have not started, the oldest is shed, its provisional
+    solving let go (every batch whose notes it held counted, `MlatReport::shed`, the step counted,
+    `steps_shed`), its bins taken and sealed at once, and its window step the next one's, which
+    solves every window due as one that ran late would. What is lost is provisional positions, never
+    a window. A host within `STEPS_BEHIND` of the watermark sheds nothing, so the same stamped trace
+    still makes the same bytes; one further behind is shed by how far behind it is, which no trace
+    decides. Changed from "back-pressure for delivery and
     fan-out" as built: back-pressure from either would let one slow subscriber, or a full tag store,
     stall ingest for every feeder, and both have a loss that is counted and told (a "fell behind"
     Goodbye, a batch left out of the audit) where back-pressure's is everyone's.
@@ -289,7 +316,10 @@ Measured on main (tally-load, commit b3e3571809 on branch tally-load):
 ## Invariants the tests hold
 1. Thread-count independence: same stamped trace at 1, 2, 8, 32 threads gives byte-identical MLAT
    models, positions, provisionals, world/precise parts, standing, regional record sequence.
-2. No consumer reads a clock: decisions use `stamp_ms`; injected queue delays change nothing.
+2. No consumer reads a clock: decisions use `stamp_ms`; injected queue delays change nothing,
+   for hosted MLAT while it is within `STEPS_BEHIND` steps of the watermark (past them it sheds
+   whole steps, counted, §10; `staged_mlat` holds the bytes with delays inside that, and
+   `mlat_host`'s tests hold the shedding and every store within its limit outside it).
 3. MLAT/world output unchanged under permutation and duplication between two watermarks.
 4. `Bin::seal_from(fragments)` byte-equal to `Bin::seal` for any split by receiver.
 5. Dedup across shards exact: a message via k receivers on k workers is gathered once per window.
@@ -354,19 +384,61 @@ grows faster than any line where the engine falls behind, and is still rising at
 run. Its base is what it holds before any feeder, 2.5 MiB, and `budget::MLAT_BASE_BYTES` is 4 MiB,
 in the relay's base (`budget::Plan::base`) when it hosts MLAT.
 
-What the runs show instead is that MLAT's memory is not held to the budget. At 5,000 feeders the
-relay was 17 GB resident under a 14 GiB `--memory`. Its notes to provisional solving are charged
-by force (`Gauge::force`, `mlat_host::Shared::tell`): one step interval's notes are bounded by
-count, but nothing bounds how many intervals wait for a step that is behind, so with four threads
-the `Notes` store held six times its share at 2,000 feeders and ten at its peak at 5,000, keeping
-4.9 GB of decoded batches alive. `Held` is charged by force too. At 500 feeders, with every store
-inside its share, the relay was still 1.1 GB above what its stores and base account for: the
-engine's own tables, which no store charges.
+What those runs showed was that MLAT's memory was not held to the budget. At 5,000 feeders the
+relay was 17 GB resident under a 14 GiB `--memory`. Its notes to provisional solving were charged
+by force (`Gauge::force`, since deleted): one step interval's notes were bounded by count, but
+nothing bounded how many intervals waited for a step that was behind, so with four threads the
+`Notes` store held six times its share at 2,000 feeders and ten at its peak at 5,000, keeping 4.9 GB
+of decoded batches alive. `Held` was charged by force too, and its open bins grew with the steps
+MLAT was behind. The public relay's shape (`infra/kubernetes/tally/relay.yaml`: `--memory 576M`,
+`--mlat-threads 1`, its then ceiling of 167 feeders, two areas, 300 s measured) was 712 MiB resident
+and still rising, past its 640 MiB limit: `Held` peaked at 211 MiB of its 179 and `Notes` at 66 of
+its 18.
 
-The public relay's shape (`infra/kubernetes/tally/relay.yaml`: `--memory 576M`,
-`--mlat-threads 1`, its ceiling of 167 feeders, two areas, 300 s measured) was 712 MiB resident and
-still rising, past its 640 MiB limit: `Held` peaked at 211 MiB of its 179 and `Notes` at 66 of
-its 18. It does not fit, and the 64 MiB it left under its limit was not standing in for a base.
-Separately, taking the 122 resolution-0 areas costs 530 MiB and a whole core with no feeder at all
-(the per-area work of every 100 ms network tick, on `main` as here), so the deployed relay does not
-fit its node however MLAT is sized.
+**Where the rest went** (measured the same day, the relay built with an allocator that tags each
+allocation by the stage that made it, 500 feeders): what was allocated and live was the stores and
+the base, and the engine's tables beyond them were small (provisional solving's state about 35 MiB,
+70 KiB a feeder; a window step's working set at most 79 MiB while it ran, 160 KiB a feeder). The
+gigabyte above the stores was two things. First, lag: while a window step ran (18 s at 500 feeders
+on a loaded host), the steps queued behind it held their notes' decoded batches (`tell` peaking at
+215 MiB, the batches it pinned at 500 MiB more), their open raw, and, once read at once, their
+provisional receptions (peaking at 525 MiB). Second, the allocator: a window step's work is spread
+over threads it starts (`window::parallel`), each served by one of glibc's arenas, which keep what
+they freed for their own reuse, so resident memory was about twice what was live (2,094 MiB
+resident with 900 MiB live; with `MALLOC_ARENA_MAX=2`, 1,711 MiB).
+
+As built since: every store is charged before it holds a byte (§9), the steps MLAT may be behind
+are bounded and the oldest shed past them (§4, §10), the engine's own tables that grow with its
+receivers are a store (`Engine`), and after each window step the host hands the allocator's free
+pages back (`mlat_host::give_back_freed`, `malloc_trim`). A feeder now reserves 2.89 MB where MLAT
+is hosted (0.67 MB without it): sealed raw 0.75 MB, open raw 0.64 MB, notes 0.39 MB, the engine's
+tables 0.45 MB; the base is 280 MiB (`BASE_BYTES`, `MLAT_BASE_BYTES`: 4 MiB and the signed records'
+4 MiB bound). Measured (2026-10-08, the same harness, the relay on cores 0-9, two areas, four MLAT
+threads and `--memory` exactly what the feeders' reservations need, `Budget::memory_for`; the
+deployed shape with one thread and 576 MiB, 300 s; the host shared with other work at a load of 45
+to 50):
+
+| Feeders          | `--memory` | Resident, peak | Resident, end | Steps shed | Every store within its limit |
+| ---------------- | ---------- | -------------- | ------------- | ---------- | ---------------------------- |
+| 107 (576 MiB, 1) | 576 MiB    | 398 MiB        | 348 MiB       | 0          | yes                          |
+| 500              | 1,659 MiB  | 1,449 MiB      | 1,182 MiB     | 32         | yes                          |
+| 2,000            | 5,798 MiB  | 4,754 MiB      | 4,249 MiB     | 71         | yes                          |
+| 5,000            | 14,076 MiB | 7,139 MiB      | 5,665 MiB     | 82         | yes                          |
+
+Four threads on that host did not keep up with the window steps at 500 feeders and more (a window
+step took 17 to 60 s), so MLAT shed whole steps, counted, and stayed within its stores; at the
+deployed shape it kept up and shed nothing. 576 MiB now admits 107 MLAT feeders, not 167.
+
+**What the areas cost at rest.** Taking the 122 resolution-0 areas once cost 530 MiB and a whole
+core with no feeder at all. As built: idle work follows activity, not the areas taken (`sharing`,
+`directory`); the MLAT choice, the hosted engine's scope, standing's and an engine grant's band are
+held as the fewest cells that cover them (`tally_wire::Regions`, membership by ancestor), so the
+world is 122 cells and never its 41,162 areas; a band is found from its areas' edge
+(`tally_mlat::area::Band`), and the world has none. A relay's own offers are the cells it takes at
+their fewest, every one: a cap of 64 offers a key once cut the public relay to its first 64 cells,
+so it offered and solved MLAT for about half the world. The cap is now a network group's
+(`OFFERS_PER_KEY` = `OFFERS_PER_GROUP`, 256, at least the 122 base cells) and a relay whose areas
+need more cells refuses to start (`directory::offerable`). Measured (2026-10-08, release build, the
+deployed args): idle on four cores, 9.2 MiB resident and 0.3% of a core over 60 s; under
+`tally-load` with 200 feeders offered and 107 admitted, 300 s, 391 MiB at its peak and 0.18 cores
+mean, MLAT shedding nothing. It fits its 640 MiB limit.

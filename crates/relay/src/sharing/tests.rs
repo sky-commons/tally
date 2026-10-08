@@ -1470,3 +1470,93 @@ fn a_member_holds_records_for_its_repair_horizon_shared_and_refuses_past_its_cap
     }
     Ok(())
 }
+
+/// Every resolution-0 cell: the whole world, as the public relay takes it.
+fn world() -> Result<Vec<Region>, String> {
+    (0..122u64)
+        .map(|base| Region::from_u64(0x0800_0000_0000_0000 | (base << 45) | ((1 << 45) - 1)))
+        .collect::<Result<_, _>>()
+        .map_err(text)
+}
+
+/// The class of defect behind the public relay that burned its whole CPU limit with no feeder at
+/// all: every 100 ms tick laid out the trees of every area it takes (41,162 areas under the
+/// world's 122 cells, five groups each) and visited every one. Idle work follows activity, never
+/// the areas taken: with the world taken and nothing flowing, a minute of ticks (its own offers
+/// re-signed on the way) lays out no tree, visits no group and holds none; the MLAT choice is
+/// computed once; and one other relay's offer for one area costs that area's groups and nothing
+/// more. Counted by sharing's own work (`Sharing::work`), not by the clock.
+#[test]
+fn a_tick_with_the_world_taken_and_nothing_flowing_does_no_work() -> Outcome {
+    let me = identity(0);
+    let hub = crate::hub::Hub::new(8).advertising(vec![tally_wire::RelayAddress {
+        key: me.public(),
+        address: "me.example:7450".to_owned(),
+    }]);
+    let network = hub.network();
+    network.adopt_identity(me.clone());
+    let world = world()?;
+    if world.iter().any(|cell| cell.resolution() != 0)
+        || tally_wire::rendezvous::areas_of(world[0])
+            .map_err(text)?
+            .len()
+            < 300
+    {
+        return Err("not the world's resolution-0 cells".into());
+    }
+    network.selection.set_taken(world.clone());
+    let sharing = &network.sharing;
+    let mut now = START_MS;
+    let _ = network.tick(&hub, now);
+    let (generation, _) = network.selection.solved(&network.directory, now);
+    for _ in 0..600 {
+        now += 100;
+        let _ = network.tick(&hub, now);
+    }
+    let work = sharing.work();
+    if work != super::Work::default() {
+        return Err(format!("a minute of idle ticks did work: {work:?}"));
+    }
+    if network.selection.solved(&network.directory, now).0 != generation {
+        return Err("the MLAT choice was computed again with nothing changed".into());
+    }
+    // Every place taken is offered, under the relay's own key: the 122 cells, none cut. A cap
+    // on the count once cut the public relay's offers to its first 64 cells, half the world.
+    let offered = network.directory.cells_of(&me.public(), now);
+    if tally_wire::Regions::new(offered.iter().copied()) != tally_wire::Regions::world()
+        || offered.len() != world.len()
+    {
+        return Err(format!("the world taken, {} cells offered", offered.len()));
+    }
+    // Every area taken still has its trees, this relay alone, computed when asked.
+    let area = area()?;
+    let layout = sharing.layout(area, Streams::RAW).ok_or("no trees")?;
+    if layout.members() != vec![me.public()] {
+        return Err("the trees of an idle area are not this relay alone".into());
+    }
+    // One other relay offers one area: that area's groups are laid out and held, and no other.
+    hold_offer(&hub, &identity(1), area, 0b1111, now)?;
+    now += 100;
+    let _ = network.tick(&hub, now);
+    let products = super::SHARED_PRODUCTS.len();
+    let work = sharing.work();
+    if work.laid_out != products as u64 || work.held_groups != products {
+        return Err(format!("one area offered cost {work:?}"));
+    }
+    if !sharing
+        .layout(area, Streams::RAW)
+        .is_some_and(|layout| layout.contains(&identity(1).public()))
+    {
+        return Err("the other relay is not in the area's trees".into());
+    }
+    // Ticks with nothing due visit nothing, the held groups included.
+    let visited = work.visited;
+    for _ in 0..5 {
+        now += 100;
+        let _ = network.tick(&hub, now);
+    }
+    if sharing.work().visited != visited || sharing.work().laid_out != work.laid_out {
+        return Err(format!("idle ticks did work: {:?}", sharing.work()));
+    }
+    Ok(())
+}
