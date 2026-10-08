@@ -19,11 +19,13 @@
 //!   prefilter and, when a bin is sealed, its canonical thinning), in 24 bytes an observation. The
 //!   raw it holds is the one store its host keeps (`Engine::sealed_bins` is what the host's other
 //!   readers, a relay's standing, share), sealed on `Settings::threads` threads.
-//! - **Capacity is configuration, and refusal is whole** (RFC-0177 §9). How many receivers it
-//!   describes and what its raw may hold come from `Settings::capacity`, which a relay derives from
-//!   the receivers it admits; a receiver beyond them is refused whole (never remembered, its raw
-//!   never held) and counted, and a receiver's raw of a bin beyond its share is refused whole and
-//!   counted (`tally_mlat_solver::held::Limits`), never partly by arrival order.
+//! - **Capacity is configuration, and refusal is whole and never by order** (RFC-0177 §9). How many
+//!   receivers it seats and what its raw may hold come from `Settings::capacity`, which a relay
+//!   derives from the receivers it admits. Who is seated is the best ranked of those described
+//!   (`intake::Seats`), whatever order they came in; one outranked is refused whole (its raw never
+//!   held) and counted. A receiver's raw of a bin beyond its share is refused whole, and the bytes
+//!   are checked on each whole bin as it is sealed (`held::Bin::seal_within`): both counted, never
+//!   decided by arrival order.
 //! - Which window an observation is in is decided by its content alone: its grid bin is its
 //!   signed batch wall clock's, never when it arrived (`tally_mlat_solver::scope`). A bin is
 //!   sealed once it has ended and a settling time has passed by the engine's clock, and a window
@@ -38,7 +40,7 @@ use tally_mlat_solver::scope::{AFTER, BEFORE, STRIDE, Window, bin_of};
 use tally_wire::{Batch, Decoded, Identity, PublicKey, Record, Region};
 
 use crate::intake::{Intake, Seats};
-use crate::provisional::{self, Note, Provisional};
+use crate::provisional::{self, Provisional};
 use crate::window::{Job, Outcome, Report};
 
 /// The fewest receivers an engine is sized for: a region's whole receiver population at the
@@ -117,7 +119,8 @@ pub struct Dropped {
     pub late: u64,
     /// Observations refused with their receiver's whole raw of a bin (`Limits`).
     pub refused: u64,
-    /// Descriptions of new receivers refused whole, beyond `Capacity::receivers`.
+    /// Receivers refused whole for room (`intake::Seats`): new ones outranked, and seated ones a
+    /// better ranked one took the seat of.
     pub receivers: u64,
 }
 
@@ -166,6 +169,7 @@ impl Engine {
         );
         let mut engine = Self::hosted(identity, boot_id, settings, sealed);
         engine.intake = Some(intake);
+        engine.provisional = Provisional::new();
         engine
     }
 
@@ -190,7 +194,7 @@ impl Engine {
             positions_sequence: 0,
             models_sequence: 0,
             dropped: Dropped::default(),
-            provisional: Provisional::default(),
+            provisional: Provisional::hosted(),
         }
     }
 
@@ -238,11 +242,10 @@ impl Engine {
                 let Some(intake) = self.intake.as_mut() else {
                     return Ok(Ingested::Ignored);
                 };
+                // One intake holds every receiver, so no other intake's receiver moves.
                 let described = intake.describe(info)?;
-                if described.left
-                    && let Ok(key) = info.receiver()
-                {
-                    self.forget_receiver(&key);
+                for key in &described.left {
+                    self.forget_receiver(key);
                 }
                 Ok(described.ingested)
             }
@@ -272,7 +275,7 @@ impl Engine {
         self.settings.regions.clone_from(&regions);
         self.owned = owned;
         if let Some(intake) = self.intake.as_mut() {
-            for key in intake.set_scope(Some(regions)) {
+            for key in intake.set_scope(Some(regions)).left {
                 self.sealed
                     .forget_receiver(&key, self.settings.threads.max(1));
             }
@@ -301,23 +304,12 @@ impl Engine {
     /// hands it what its own ingest checked, so nothing is verified or decoded twice. As `ingest`
     /// otherwise: used once per (boot, sequence), held only from a receiver that takes part.
     pub fn ingest_verified(&mut self, batch: &Decoded, now_ms: u64) -> Ingested {
-        let room = self
-            .settings
-            .limits()
-            .bytes
-            .saturating_sub(self.sealed.bytes());
         let Some(intake) = self.intake.as_mut() else {
             return Ingested::Ignored;
         };
-        let (ingested, notes) = intake.ingest_verified(batch, room);
+        let (ingested, notes) = intake.ingest_verified(batch);
         self.provisional.hear_notes(batch, &notes, now_ms);
         ingested
-    }
-
-    /// What a batch said to provisional solving (`provisional::notes_of`), read by the intake
-    /// that took it, arrived at `now_ms`: for a hosted engine, in the order the batches arrived.
-    pub fn hear(&mut self, batch: &Decoded, notes: &[Note], now_ms: u64) {
-        self.provisional.hear_notes(batch, notes, now_ms);
     }
 
     /// Refusals its host's intakes counted, reported with the next step.
@@ -346,10 +338,20 @@ impl Engine {
         let sites: Vec<Site> = intake.sites().collect();
         let dropped = intake.take_dropped();
         self.add_dropped(dropped);
-        for bin in seal(fragments, threads) {
+        let (bins, refused) = seal(fragments, threads, self.room());
+        self.dropped.refused += refused as u64;
+        for bin in bins {
             self.sealed.insert(bin);
         }
         self.prepare_sealed(now_ms, issued_ms, settled, sites)
+    }
+
+    /// The bytes of raw the sealed bins may still grow by: `Settings::limits` less what is sealed.
+    pub fn room(&self) -> usize {
+        self.settings
+            .limits()
+            .bytes
+            .saturating_sub(self.sealed.bytes())
     }
 
     /// As `prepare`, for an engine whose host sealed every bin through `settled` (the latest bin
@@ -416,6 +418,19 @@ impl Engine {
         (outcome.records, outcome.report, dropped)
     }
 
+    /// What a provisional step at `now_ms` needs of the engine (`crate::provisional::Plan`), for a
+    /// host that holds the address shards: the models carried, spent ones forgotten first, and the
+    /// next sequence. At most one step at a time; its outcome is `apply_provisional`'s.
+    pub fn provisional_plan(&mut self, now_ms: u64, issued_ms: u64) -> provisional::Plan {
+        self.provisional.plan(
+            now_ms,
+            &self.identity,
+            self.boot_id,
+            issued_ms,
+            self.settings.threads,
+        )
+    }
+
     /// The provisional work due by `now_ms` (`crate::provisional`), owned, to run off the
     /// ingesting thread; `None` when nothing is due.
     pub fn provisional(&mut self, now_ms: u64, issued_ms: u64) -> Option<provisional::Job> {
@@ -469,17 +484,28 @@ impl Engine {
 }
 
 /// Seals the open raw `fragments` hold, any split of it by receiver (one holder's, or every raw
-/// shard's of a relay), bin by bin, on up to `threads` threads: each bin byte for byte what one
-/// holder of all of it seals (`held::Bin::seal_from`). The bins, ascending.
-pub fn seal(fragments: Vec<Fragment>, threads: usize) -> Vec<Bin> {
+/// shard's of a relay), bin by bin ascending, on up to `threads` threads, the bins together within
+/// `room` bytes (`Engine::room`): each bin byte for byte what one holder of all of it seals
+/// within what the bins before it left (`held::Bin::seal_within`), so what is refused for room is
+/// decided on whole bins, the same whatever order the raw came in. The bins, ascending, and the
+/// observations refused.
+pub fn seal(fragments: Vec<Fragment>, threads: usize, room: usize) -> (Vec<Bin>, usize) {
     let mut by_bin: BTreeMap<i64, Vec<Fragment>> = BTreeMap::new();
     for fragment in fragments {
         by_bin.entry(fragment.bin()).or_default().push(fragment);
     }
-    by_bin
+    let mut room = room;
+    let mut refused = 0;
+    let bins = by_bin
         .into_iter()
-        .map(|(bin, fragments)| Bin::seal_from(bin, fragments, threads))
-        .collect()
+        .map(|(bin, fragments)| {
+            let (sealed, more) = Bin::seal_within(bin, fragments, threads, room);
+            room = room.saturating_sub(SealedBins::cost(&sealed));
+            refused += more;
+            sealed
+        })
+        .collect();
+    (bins, refused)
 }
 
 #[cfg(test)]

@@ -330,10 +330,11 @@ fn open_raw_costs_what_admission_reserves() {
 #[test]
 fn a_receivers_cost_follows_its_rates() {
     let cost = Rates::MEASURED.cost(2_000);
-    // A bin and its settling of wanted raw, 28 bytes each, and three open bins' allowance.
+    // A bin and its settling of wanted raw at the ceiling, 28 bytes each, and three open bins'
+    // allowance.
     assert_eq!(
         cost.open,
-        360 * 7 * OPEN_BYTES_PER_RECEPTION + 3 * OPEN_BYTES_PER_RECEIVER_BIN
+        1_800 * 7 * OPEN_BYTES_PER_RECEPTION + 3 * OPEN_BYTES_PER_RECEIVER_BIN
     );
     assert_eq!(
         cost.sealed,
@@ -342,4 +343,59 @@ fn a_receivers_cost_follows_its_rates() {
     let limits = Limits::for_receivers(20_000, Rates::MEASURED, 2_000);
     assert_eq!(limits.bytes, 20_000 * cost.total());
     assert_eq!(limits.per_receiver_bin, 9_000);
+}
+
+/// A bin sealed within a holder's bytes (`Bin::seal_within`) refuses the receivers with the most
+/// records, whole, until it fits; and the bin and what it refused are the same however the raw was
+/// split among owners, whatever order it came in, and on any number of threads.
+#[test]
+fn a_bin_sealed_within_its_room_refuses_the_busiest_receivers_whole_whatever_the_split() {
+    let keys: Vec<PublicKey> = (1..=6u8)
+        .map(|seed| Identity::from_seed([seed; 32]).public())
+        .collect();
+    // Receiver n hears 20 + 10n replies of the bin, the same aircraft as the others.
+    let batch = |n: usize| content(1_000 + n as u64, &replies(20 + 10 * n as u64, 0));
+    let whole = |order: &[usize], owners: usize| -> Vec<Fragment> {
+        let mut opens: Vec<Open> = (0..owners).map(|_| Open::new(Limits::UNBOUNDED)).collect();
+        for n in order {
+            opens[n % owners].add(keys[*n], &batch(*n));
+        }
+        opens
+            .iter_mut()
+            .flat_map(|open| open.take_through(0))
+            .collect()
+    };
+    let unbounded = Bin::seal_from(0, whole(&[0, 1, 2, 3, 4, 5], 1), 1);
+    let cost = SealedBins::cost(&unbounded);
+    // Room for about half of it: the busiest receivers go first.
+    let room = cost / 2;
+    let (reference, refused) = Bin::seal_within(0, whole(&[0, 1, 2, 3, 4, 5], 1), 1, room);
+    assert!(SealedBins::cost(&reference) <= room);
+    assert!(refused > 0);
+    assert!(!reference.receivers.is_empty());
+    // Whole and busiest first: every receiver kept hears less than every one refused.
+    let kept: Vec<usize> = (0..keys.len())
+        .filter(|n| reference.receiver(&keys[*n]).is_some())
+        .collect();
+    let gone: Vec<usize> = (0..keys.len()).filter(|n| !kept.contains(n)).collect();
+    assert!(!gone.is_empty());
+    assert!(
+        kept.iter().all(|k| gone.iter().all(|g| k < g)),
+        "{kept:?} {gone:?}"
+    );
+    for (order, owners, threads) in [
+        (vec![5, 4, 3, 2, 1, 0], 1, 1),
+        (vec![2, 0, 5, 1, 4, 3], 3, 4),
+        (vec![0, 1, 2, 3, 4, 5], 6, 2),
+    ] {
+        let (bin, again) = Bin::seal_within(0, whole(&order, owners), threads, room);
+        assert_eq!(
+            bin, reference,
+            "{order:?} over {owners} owners on {threads} threads"
+        );
+        assert_eq!(again, refused);
+    }
+    // With room for all of it, nothing is refused.
+    let (all, none) = Bin::seal_within(0, whole(&[0, 1, 2, 3, 4, 5], 1), 1, cost);
+    assert_eq!((all, none), (unbounded, 0));
 }

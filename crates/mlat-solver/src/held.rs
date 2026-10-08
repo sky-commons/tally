@@ -24,7 +24,11 @@
 //!   receptions in a bin, and beyond them its raw of that bin is refused whole (what it held there
 //!   is let go), which depends on that receiver's own raw alone, never on arrival order. Beyond
 //!   `bytes` held in all, the same: the receiver's raw of the bin is refused whole. Both counted.
-//!   What a holder reserves per receiver to never reach either is [`Rates::cost`].
+//!   A holder whose raw is split among owners (an engine's intakes, a relay's raw shards) checks
+//!   the bytes once a bin is complete, on the whole bin ([`Bin::seal_within`]), so which receiver
+//!   is refused never depends on which owner took what first; one holder of all of it ([`Held`])
+//!   checks on arrival, in the one order it is handed raw. What a holder reserves per receiver to
+//!   never reach either is [`Rates::cost`].
 //! - **Accounted as allocated**: every byte [`Held::bytes`] reports is a capacity actually
 //!   allocated (vectors by capacity, maps by their tables), so admission is sized on what is
 //!   really in memory.
@@ -594,14 +598,16 @@ impl Rates {
     }
 
     /// What one receiver at these rates costs a holder that seals a bin `settle_ms` after it ends:
-    /// its open raw over a bin and its settling, and its thinned raw over the bins a holder keeps
-    /// sealed (`SEALED_BINS_HELD`).
+    /// its open raw over a bin and its settling at its ceiling (nothing shared bounds raw while its
+    /// bin is open, only the receiver's own share, so that is what it may hold), and its thinned raw
+    /// over the bins a holder keeps sealed (`SEALED_BINS_HELD`) at the kept rate (each bin is
+    /// sealed within the holder's bytes, `Bin::seal_within`).
     pub fn cost(&self, settle_ms: u64) -> Cost {
         let open_ms = GRID_MS + settle_ms;
         let open_bins = open_ms.div_ceil(GRID_MS) as usize + 1;
         let sealed_ms = SEALED_BINS_HELD as u64 * GRID_MS;
         Cost {
-            open: (self.wanted_per_s as u64 * open_ms / 1_000) as usize * OPEN_BYTES_PER_RECEPTION
+            open: (self.ceiling_per_s as u64 * open_ms / 1_000) as usize * OPEN_BYTES_PER_RECEPTION
                 + open_bins * OPEN_BYTES_PER_RECEIVER_BIN,
             sealed: (self.kept_per_s as u64 * sealed_ms / 1_000) as usize * SEALED_BYTES_PER_RECORD,
         }
@@ -611,7 +617,7 @@ impl Rates {
 /// What one receiver costs a holder of raw, in bytes.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Cost {
-    /// Open bins: wanted rate times a bin and its settling, at 28 bytes a reception.
+    /// Open bins: the ceiling rate times a bin and its settling, at 28 bytes a reception.
     pub open: usize,
     /// Sealed bins: kept rate times the bins held, at their measured bytes a record.
     pub sealed: usize,
@@ -1115,6 +1121,53 @@ impl Bin {
         }
     }
 
+    /// Seals `fragments` as `seal_from` does, within `room` bytes (what its holder may still hold:
+    /// `Limits::bytes` less the bins it holds sealed). While the sealed bin costs more than `room`,
+    /// the receivers with the most records in it (ties: the greater key first) are refused whole,
+    /// enough to free the excess, and what is left is sealed again. Decided on the whole bin once
+    /// it is complete, so the same raw and the same `room` give the same bin and the same refusals
+    /// whatever order the raw came in, however it is split and on any number of threads (module
+    /// docs, Bounded). The bin, and the records refused.
+    pub fn seal_within(
+        bin: i64,
+        fragments: Vec<Fragment>,
+        threads: usize,
+        room: usize,
+    ) -> (Self, usize) {
+        let mut sealed = Self::seal_from(bin, fragments, threads);
+        let mut refused = 0;
+        loop {
+            let cost = SealedBins::cost(&sealed);
+            if cost <= room || sealed.records.is_empty() {
+                return (sealed, refused);
+            }
+            let mut counts = vec![0usize; sealed.receivers.len()];
+            for record in &sealed.records {
+                counts[record.receiver as usize] += 1;
+            }
+            let mut order: Vec<u32> = (0..counts.len() as u32).collect();
+            order.sort_by(|a, b| {
+                counts[*b as usize]
+                    .cmp(&counts[*a as usize])
+                    .then(sealed.receivers[*b as usize].cmp(&sealed.receivers[*a as usize]))
+            });
+            let per_record = cost.div_ceil(sealed.records.len()).max(1);
+            let excess = cost - room;
+            let mut skip = BTreeSet::new();
+            let mut freed = 0;
+            for receiver in order {
+                if freed >= excess {
+                    break;
+                }
+                skip.insert(receiver);
+                freed += counts[receiver as usize] * per_record;
+                refused += counts[receiver as usize];
+            }
+            let fragment = sealed.reopen_without_any(|index| skip.contains(&index));
+            sealed = Self::seal_from(bin, vec![fragment], threads);
+        }
+    }
+
     /// Bytes allocated, index included (module docs, Accounted as allocated).
     pub fn bytes(&self) -> usize {
         vec_bytes(&self.receivers)
@@ -1215,10 +1268,15 @@ impl Bin {
 
     /// This bin's raw, open again without `receiver`: what forgetting a receiver reseals.
     fn reopen_without(&self, receiver: &PublicKey) -> Fragment {
-        let mut fragment = Fragment::new(self.bin);
         let skip = self.receiver(receiver);
+        self.reopen_without_any(|index| Some(index) == skip)
+    }
+
+    /// This bin's raw, open again without the receivers (by index) `skip` names.
+    fn reopen_without_any(&self, skip: impl Fn(u32) -> bool) -> Fragment {
+        let mut fragment = Fragment::new(self.bin);
         for record in &self.records {
-            if Some(record.receiver) == skip {
+            if skip(record.receiver) {
                 continue;
             }
             let slot = fragment.slot(self.receivers[record.receiver as usize]);
@@ -1307,7 +1365,7 @@ impl SealedBins {
     }
 
     /// Bytes a sealed bin costs here: its own, its shared allocation, and its share of the map.
-    fn cost(bin: &Bin) -> usize {
+    pub fn cost(bin: &Bin) -> usize {
         bin.bytes()
             + size_of::<Bin>()
             + 2 * size_of::<usize>()

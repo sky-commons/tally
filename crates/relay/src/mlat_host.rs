@@ -26,12 +26,23 @@
 //!   missing for both alike. The handle outlives each engine (emptied when one is dropped). How
 //!   many receivers and how much raw it holds is configuration (`tally_mlat::engine::Capacity`),
 //!   from the receivers the relay admits.
-//! - **Threads.** One thread owns the engine. What a batch says to provisional solving
-//!   (`provisional::notes_of`, read in its shard) reaches that thread through a bounded queue that
-//!   never waits (full: counted), and is weighed there in the order of the batches' stamps, so the
-//!   same stamped trace solves the same provisionals on any number of ingest workers. Seals, window
-//!   steps and provisional steps run off that thread, each on threads of its own, at most one step
-//!   of each kind at a time, spread over `--mlat-threads`.
+//! - **Provisional state sharded by aircraft** (RFC-0177 §3). What a batch says to provisional
+//!   solving (`provisional::notes_of`, read in its raw shard by the ingest worker that took it) is
+//!   split by ICAO address (`provisional::shard_of`, a uniform hash) into `provisional::SHARDS`
+//!   address shards, each holding its aircraft's state (`provisional::Shard`) and what it was told
+//!   and has not weighed yet. Each provisional step weighs every shard's notes stamped by its clock
+//!   in the order of their stamps, finds what is due, all shards in parallel over `--mlat-threads`,
+//!   and solves the due work of all of them, ascending by aircraft (`provisional::Plan::job`): the
+//!   same stamped trace solves the same provisionals on any number of ingest workers and step
+//!   threads. The engine's thread holds only the models carried and the sequences.
+//! - **Threads.** One thread owns the engine. Seals, window steps and provisional steps run off
+//!   that thread, each on threads of its own, at most one step of each kind at a time, spread over
+//!   `--mlat-threads`.
+//! - **Capacity** (RFC-0177 §9). The receivers seated are the best ranked of those described
+//!   (`tally_mlat::intake::Seats`), whichever raw shard took them and in whatever order; a shard's
+//!   open raw is bounded by each receiver's share of a bin, and the engine's whole bytes are checked
+//!   on each complete bin as it is sealed (`tally_mlat::engine::seal`). Neither depends on arrival
+//!   order or on the number of threads; both refuse whole and are counted.
 //! - **Counted.** Nothing offered or solved is let go silently: every drop is counted by why, and
 //!   every step's report kept ([`MlatReport`], served on `--stats-listen` as `GET /mlat`).
 //! - **Time.** Nothing here reads a clock: an offer carries when it arrived and `take_published`
@@ -44,8 +55,8 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, SyncSender, TrySendErr
 use std::sync::{Arc, Mutex};
 
 use tally_mlat::engine::{Capacity, Dropped, Engine, Ingested, Settings};
-use tally_mlat::intake::{Intake, Seats};
-use tally_mlat::provisional::Note;
+use tally_mlat::intake::{Description, Intake, Seats};
+use tally_mlat::provisional::{self as provisional_, Due, Note};
 use tally_mlat::{area, provisional, window};
 use tally_mlat_solver::Site;
 use tally_mlat_solver::held::{Bin, Fragment, Limits, SealedBins};
@@ -187,7 +198,8 @@ impl ProvisionalReport {
 pub struct MlatReport {
     /// Batches taken (new, from a receiver taking part).
     pub ingested: u64,
-    /// What batches said to provisional solving, dropped because the engine's queue was full.
+    /// What batches said to provisional solving, refused whole (a batch's notes to one address
+    /// shard) because that shard held `NOTES_WAITING` not yet weighed.
     pub refused: u64,
     /// Signed records dropped because nobody took them in time.
     pub overflowed: u64,
@@ -221,9 +233,12 @@ pub struct MlatReport {
 pub const STEP_MS: u64 = 1_000;
 /// How long after a bin's canonical window ends it is solved, so the raw of its last bin is in.
 pub const SETTLE_MS: u64 = 2_000;
-/// What batches said to provisional solving and not yet weighed by the engine's thread. A world's
-/// worth of feeders offer a few thousand batches a second; this is several seconds of them.
-const OFFERS_WAITING: usize = 1 << 16;
+/// Commands for the engine's thread not yet taken: a few seconds of ticks and changes.
+const COMMANDS_WAITING: usize = 1 << 12;
+/// What batches said to provisional solving that one address shard holds not yet weighed, at most:
+/// at RFC-0177's 20,000 feeders about 300 replies and positions a feeder a second spread over the
+/// shards, this is a few seconds of them, so only a step stalled that long reaches it.
+const NOTES_WAITING: usize = 1 << 16;
 /// Batches held for a receiver whose description has not come, at most, and receivers (in each raw
 /// shard), and for how long: a window's worth (a description later than that is not coming by the
 /// same way).
@@ -260,9 +275,6 @@ pub fn capacity(config: &Config) -> Capacity {
 
 /// What the engine's thread is handed.
 enum Command {
-    /// What one batch said to provisional solving, read in its raw shard: the batch (which
-    /// carries when it arrived, its stamp), the notes, and the shard's engine generation then.
-    Heard(Arc<Decoded>, Vec<Note>, u64),
     /// A receiver stopped taking part under engine generation `.0`: forgotten in the sealed bins.
     Left(u64, PublicKey),
     /// The areas changed (`set_areas` re-scoped every shard first): engine generation, areas.
@@ -303,6 +315,73 @@ struct Shard {
     orphans: BTreeMap<PublicKey, VecDeque<(Arc<Decoded>, u64)>>,
 }
 
+/// What one batch said to one address shard, not yet weighed: the batch (which carries when it
+/// arrived, its stamp), its notes sorted by shard (shared by every shard it spoke to) and this
+/// shard's run of them, and the engine generation of the raw shard that read them.
+struct Heard {
+    batch: Arc<Decoded>,
+    notes: Arc<[Note]>,
+    range: std::ops::Range<usize>,
+    generation: u64,
+}
+
+/// What a batch says to provisional solving as its raw shard read it: the batch, its notes, and the
+/// raw shard's engine generation then. Handed to the address shards once the raw shard is let go.
+type Told = (Arc<Decoded>, Vec<Note>, u64);
+
+/// One address shard of provisional solving (`provisional::Shard`), with what it was told and has
+/// not weighed yet.
+#[derive(Default)]
+struct Listening {
+    /// By (stamp, place in the ingest order, arrival here): weighed in that order once a step's
+    /// clock passes the stamp, whatever worker read them.
+    heard: Vec<((u64, u64, u64), Heard)>,
+    /// Notes in `heard`.
+    notes: usize,
+    arrivals: u64,
+    /// The engine generation `state` is of.
+    generation: u64,
+    state: provisional_::Shard,
+}
+
+impl Listening {
+    /// Weighs what was heard stamped by `now_ms` for the engine of `generation` (what an older one
+    /// heard is dropped, a newer one's kept), in stamp order, then hands out what is due under
+    /// `book`.
+    fn step(&mut self, generation: u64, now_ms: u64, book: &provisional_::Book) -> Due {
+        if self.generation != generation {
+            self.state = provisional_::Shard::default();
+            self.generation = generation;
+        }
+        self.heard.sort_unstable_by_key(|(at, _)| *at);
+        let due = self
+            .heard
+            .partition_point(|((stamp, _, _), _)| *stamp <= now_ms);
+        let mut kept = Vec::new();
+        for (at, heard) in self.heard.drain(..due) {
+            if heard.generation == generation {
+                self.notes -= heard.range.len();
+                self.state.hear(
+                    &heard.batch,
+                    &heard.notes[heard.range.clone()],
+                    heard.batch.stamp_ms(),
+                );
+            } else if heard.generation > generation {
+                // Read by a raw shard already re-scoped for the engine about to start: kept for it.
+                kept.push((at, heard));
+            } else {
+                self.notes -= heard.range.len();
+            }
+        }
+        self.heard.extend(kept);
+        self.state.due(now_ms, book)
+    }
+
+    fn clear(&mut self) {
+        *self = Self::default();
+    }
+}
+
 /// The areas as `set_areas` last set them, and the engine generation they started.
 #[derive(Default)]
 struct Scope {
@@ -316,6 +395,9 @@ struct Shared {
     /// The raw shards, `SHARDS` of them, each locked by the ingest worker that owns its receivers
     /// (one batch at a time), and by the engine's thread to take what is complete or re-scope.
     shards: Box<[Mutex<Shard>]>,
+    /// The address shards of provisional solving, `provisional::SHARDS` of them, each locked by
+    /// an ingest worker to hand it a batch's notes and by a provisional step to weigh and step it.
+    listening: Box<[Mutex<Listening>]>,
     /// What each shard's open raw is bounded by.
     limits: Limits,
     published: Mutex<VecDeque<Record>>,
@@ -343,6 +425,54 @@ impl Shared {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
+
+    fn listening(&self, shard: usize) -> std::sync::MutexGuard<'_, Listening> {
+        self.listening[shard]
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Hands what `batch` said to provisional solving to the address shards it speaks of, read in
+    /// its raw shard under engine `generation`. A shard holding `NOTES_WAITING` refuses its part
+    /// whole, counted.
+    fn tell(&self, batch: &Arc<Decoded>, mut notes: Vec<Note>, generation: u64) {
+        let runs = provisional_::by_shard(&mut notes);
+        let notes: Arc<[Note]> = notes.into();
+        let at = (batch.stamp_ms(), batch.ingest_seq());
+        for (shard, range) in runs {
+            let mut listening = self.listening(shard);
+            if listening.notes + range.len() > NOTES_WAITING {
+                drop(listening);
+                self.refused.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+            listening.notes += range.len();
+            let arrival = listening.arrivals;
+            listening.arrivals += 1;
+            listening.heard.push((
+                (at.0, at.1, arrival),
+                Heard {
+                    batch: Arc::clone(batch),
+                    notes: Arc::clone(&notes),
+                    range,
+                    generation,
+                },
+            ));
+        }
+    }
+
+    /// Settles each receiver of `moved` (whose seat changed while another raw shard took a
+    /// description) in its own raw shard: those that stopped taking part, with their generation.
+    fn settle(&self, moved: &[PublicKey]) -> Vec<(u64, PublicKey)> {
+        let mut left = Vec::new();
+        for key in moved {
+            let mut shard = self.shard(key);
+            if shard.intake.settle(key) {
+                left.push((shard.generation, *key));
+            }
+        }
+        left
+    }
 }
 
 /// `tally-mlat`'s engine as a relay's hosted MLAT.
@@ -357,7 +487,7 @@ impl HostedMlat {
     /// `settings.regions` is ignored: the areas are `set_areas`'s.
     pub fn new(identity: Identity, boot_id: u64, settings: Settings) -> Self {
         let cores = u16::try_from(settings.threads).unwrap_or(u16::MAX);
-        let (commands, received) = std::sync::mpsc::sync_channel(OFFERS_WAITING);
+        let (commands, received) = std::sync::mpsc::sync_channel(COMMANDS_WAITING);
         let (finished, reported) = std::sync::mpsc::channel();
         let limits = Limits {
             bytes: usize::MAX,
@@ -375,6 +505,9 @@ impl HostedMlat {
                         orphans: BTreeMap::new(),
                     })
                 })
+                .collect(),
+            listening: (0..provisional_::SHARDS)
+                .map(|_| Mutex::new(Listening::default()))
                 .collect(),
             limits,
             published: Mutex::new(VecDeque::new()),
@@ -400,8 +533,6 @@ impl HostedMlat {
             next_step_ms: 0,
             stepping: false,
             solving: false,
-            heard: BTreeMap::new(),
-            next_heard: 0,
             finished,
             shared: Arc::clone(&shared),
         };
@@ -429,7 +560,7 @@ impl HostedMlat {
         self.shared.ingested.load(Ordering::SeqCst)
     }
 
-    /// What batches said to provisional solving, dropped because the engine's queue was full.
+    /// What batches said to provisional solving, refused whole because an address shard was full.
     pub fn refused(&self) -> u64 {
         self.shared.refused.load(Ordering::Relaxed)
     }
@@ -471,11 +602,13 @@ impl HostedMlat {
     }
 
     /// A description, into its receiver's shard: the batches that waited for it are taken now.
+    /// A receiver of another shard whose seat it changed is settled in its own shard after.
     fn describe(&self, info: &ReceiverInfo) {
         let Ok(key) = info.receiver() else {
             return;
         };
-        let left = {
+        let mut told = Vec::new();
+        let (mut left, moved) = {
             let mut shard = self.shared.shard(&key);
             let described = match shard.intake.describe(info) {
                 Ok(described) => described,
@@ -488,28 +621,39 @@ impl HostedMlat {
                 && let Some(waiting) = shard.orphans.remove(&key)
             {
                 for (batch, _) in waiting {
-                    self.take(&mut shard, &batch);
+                    let (_, heard) = self.take(&mut shard, &batch);
+                    told.extend(heard);
                 }
             }
-            described.left.then_some(shard.generation)
+            let Description { left, moved, .. } = described;
+            let generation = shard.generation;
+            (
+                left.into_iter()
+                    .map(|key| (generation, key))
+                    .collect::<Vec<_>>(),
+                moved,
+            )
         };
-        // Sent with the shard let go: the engine's thread may be waiting for it.
-        if let Some(generation) = left {
+        for (batch, notes, generation) in told {
+            self.shared.tell(&batch, notes, generation);
+        }
+        // Each shard let go before the next is taken: the engine's thread may be waiting for one.
+        left.extend(self.shared.settle(&moved));
+        for (generation, key) in left {
             self.send_waiting(Command::Left(generation, key));
         }
     }
 
-    /// One batch into `shard`, its receiver's: what it says to provisional solving goes to the
-    /// engine's thread.
-    fn take(&self, shard: &mut Shard, batch: &Arc<Decoded>) -> Ingested {
-        let (ingested, notes) = shard.intake.ingest_verified(batch, usize::MAX);
+    /// One batch into `shard`, its receiver's: what it did, and what it says to provisional
+    /// solving with the shard's engine generation, to hand to the address shards once `shard` is
+    /// let go (`Shared::tell`).
+    fn take(&self, shard: &mut Shard, batch: &Arc<Decoded>) -> (Ingested, Option<Told>) {
+        let (ingested, notes) = shard.intake.ingest_verified(batch);
         match ingested {
             Ingested::Batch { .. } => {
                 self.shared.ingested.fetch_add(1, Ordering::SeqCst);
-                if !notes.is_empty()
-                    && !self.send(Command::Heard(Arc::clone(batch), notes, shard.generation))
-                {
-                    self.shared.refused.fetch_add(1, Ordering::Relaxed);
+                if !notes.is_empty() {
+                    return (ingested, Some((Arc::clone(batch), notes, shard.generation)));
                 }
             }
             Ingested::Replayed => {
@@ -517,7 +661,7 @@ impl HostedMlat {
             }
             Ingested::Described | Ingested::Ignored | Ingested::Refused => {}
         }
-        ingested
+        (ingested, None)
     }
 
     /// Holds a batch of an undescribed receiver in its shard, within `ORPHANS_PER_RECEIVER` a
@@ -581,6 +725,7 @@ impl MlatHost for HostedMlat {
         }
         let band = (!areas.is_empty()).then(|| area::border_band(&areas));
         let mut left = Vec::new();
+        let mut moved = Vec::new();
         for shard in &self.shared.shards {
             let mut shard = shard
                 .lock()
@@ -589,10 +734,17 @@ impl MlatHost for HostedMlat {
                 shard.intake.restart(self.shared.limits);
                 shard.orphans.clear();
             }
-            left.extend(shard.intake.set_scope(band.clone()));
+            let described = shard.intake.set_scope(band.clone());
+            left.extend(described.left);
+            moved.extend(described.moved);
             shard.generation = scope.generation;
             shard.active = band.is_some();
         }
+        // Every shard re-scoped: a seat that changed in a shard taken earlier is settled now, by
+        // where its receiver stands after all of them.
+        moved.sort_unstable();
+        moved.dedup();
+        left.extend(self.shared.settle(&moved).into_iter().map(|(_, key)| key));
         scope.areas.clone_from(&areas);
         let generation = scope.generation;
         drop(scope);
@@ -619,14 +771,20 @@ impl MlatHost for HostedMlat {
     }
 
     fn offer_batch(&self, batch: &Arc<Decoded>, now_ms: u64) {
-        let mut shard = self.shared.shard(&batch.receiver());
-        if !shard.active {
-            return;
-        }
-        if self.take(&mut shard, batch) == Ingested::Ignored
-            && shard.intake.described(&batch.receiver()).is_none()
-        {
-            self.hold_orphan(&mut shard, batch, now_ms);
+        let heard = {
+            let mut shard = self.shared.shard(&batch.receiver());
+            if !shard.active {
+                return;
+            }
+            let (ingested, heard) = self.take(&mut shard, batch);
+            if ingested == Ingested::Ignored && shard.intake.described(&batch.receiver()).is_none()
+            {
+                self.hold_orphan(&mut shard, batch, now_ms);
+            }
+            heard
+        };
+        if let Some((batch, notes, generation)) = heard {
+            self.shared.tell(&batch, notes, generation);
         }
     }
 
@@ -663,10 +821,6 @@ impl MlatHost for HostedMlat {
     }
 }
 
-/// What one batch said to provisional solving, waiting to be weighed: the batch, its notes, and
-/// the engine generation of the shard that read them.
-type Heard = (Arc<Decoded>, Vec<Note>, u64);
-
 /// The engine's thread.
 struct Host {
     identity: Identity,
@@ -682,10 +836,6 @@ struct Host {
     next_step_ms: u64,
     stepping: bool,
     solving: bool,
-    /// What batches said to provisional solving, by (stamp, place in the ingest order, arrival
-    /// here), weighed once the engine's clock passes them: in that order whatever worker read them.
-    heard: BTreeMap<(u64, u64, u64), Heard>,
-    next_heard: u64,
     finished: Sender<Finished>,
     shared: Arc<Shared>,
 }
@@ -710,14 +860,6 @@ impl Host {
                 return;
             }
             let started = match command {
-                Command::Heard(batch, notes, generation) => {
-                    if generation >= self.generation {
-                        let at = (batch.stamp_ms(), batch.ingest_seq(), self.next_heard);
-                        self.next_heard += 1;
-                        self.heard.insert(at, (batch, notes, generation));
-                    }
-                    0
-                }
                 Command::Left(generation, key) => {
                     if generation == self.generation
                         && let Some(engine) = self.engine.as_mut()
@@ -808,16 +950,28 @@ impl Host {
         if self.engine.is_none() {
             return 0;
         }
-        self.hear_through(now_ms);
         let mut started = 0;
         if let Some(engine) = self.engine.as_mut()
             && !self.solving
-            && let Some(job) = engine.provisional(now_ms, now_ms)
         {
+            // The step weighs and steps every address shard off this thread, in parallel.
+            let plan = engine.provisional_plan(now_ms, now_ms);
             self.solving = true;
             started += 1;
             let finished = self.finished.clone();
+            let shared = Arc::clone(&self.shared);
             spawn_or_run(Urgency::Prompt, move || {
+                let shards: Vec<usize> = (0..provisional_::SHARDS).collect();
+                let (parts, _) = window::parallel(
+                    plan.threads,
+                    &shards,
+                    |shard, _: &mut provisional::Report| {
+                        shared
+                            .listening(*shard)
+                            .step(generation, plan.now_ms, &plan.book)
+                    },
+                );
+                let job = plan.job(parts);
                 let _ = finished.send(Finished::Solved(generation, job.run()));
             });
         }
@@ -829,23 +983,6 @@ impl Host {
         started
     }
 
-    /// Weighs what batches stamped by `now_ms` said to provisional solving, in stamp order.
-    fn hear_through(&mut self, now_ms: u64) {
-        let later = self.heard.split_off(&(now_ms.saturating_add(1), 0, 0));
-        let due = std::mem::replace(&mut self.heard, later);
-        let Some(engine) = self.engine.as_mut() else {
-            return;
-        };
-        for (at, (batch, notes, generation)) in due {
-            if generation == self.generation {
-                engine.hear(&batch, &notes, batch.stamp_ms());
-            } else if generation > self.generation {
-                // Read by a shard already re-scoped for the engine about to start: kept for it.
-                self.heard.insert(at, (batch, notes, generation));
-            }
-        }
-    }
-
     /// Takes every bin complete by `now_ms` out of every shard (a move under each shard's lock in
     /// turn), with the sites taking part and what the shards refused, and seals them off this
     /// thread. The work started.
@@ -855,6 +992,7 @@ impl Host {
             return 0;
         };
         let settled = engine.settled(now_ms);
+        let room = engine.room();
         let threads = self.settings.threads.max(1);
         let mut fragments: Vec<Fragment> = Vec::new();
         let mut sites: Vec<Site> = Vec::new();
@@ -881,7 +1019,9 @@ impl Host {
         }
         let finished = self.finished.clone();
         spawn_or_run(Urgency::Background, move || {
-            let bins = tally_mlat::engine::seal(fragments, threads);
+            let (bins, refused) = tally_mlat::engine::seal(fragments, threads, room);
+            let mut dropped = dropped;
+            dropped.refused += refused as u64;
             let _ = finished.send(Finished::Sealed {
                 generation,
                 now_ms,
@@ -923,7 +1063,9 @@ impl Host {
             // is still sealing or solving is discarded when it reports.
             self.engine = None;
             self.shared.sealed.clear();
-            self.heard.clear();
+            for shard in 0..provisional_::SHARDS {
+                self.shared.listening(shard).clear();
+            }
             self.generation = generation;
             self.stepping = false;
             self.solving = false;
@@ -946,7 +1088,6 @@ impl Host {
                 self.generation = generation;
                 engine.set_scope(band, areas);
                 self.engine = Some(engine);
-                self.heard.retain(|_, (_, _, heard)| *heard == generation);
                 self.next_step_ms = 0;
                 self.stepping = false;
                 self.solving = false;
