@@ -702,9 +702,20 @@ fn the_regional_product_holds_one_copy_of_each_message_per_area_signed_as_origin
     let later = feeder_batch(&feeders[0], 2, shared.clone(), (BASE_MS + 4_000, 11))?;
     staged.feed(&later);
     let out = staged.tick(BASE_MS + 5_000);
-    assert_eq!(out.len(), 1);
-    // The stream's sequence runs on from the first two.
+    // The epoch's deduplicated stream first, then its one area's regional batch.
+    assert_eq!(out.len(), 2);
     match &out[0] {
+        Record::RelayBatch(batch) => {
+            batch.verify_as_relay().map_err(err)?;
+            assert_eq!(
+                batch.content().map_err(err)?.observations.len(),
+                shared.len()
+            );
+        }
+        _ => return Err("not the deduplicated stream".to_owned()),
+    }
+    // The regional stream's sequence runs on from the first two.
+    match &out[1] {
         Record::RegionalBatch(batch) => assert_eq!(batch.content().map_err(err)?.sequence, 2),
         _ => return Err("not a regional batch".to_owned()),
     }

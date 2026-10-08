@@ -1849,7 +1849,7 @@ mod tests {
     fn mlat_is_hosted_with_relay_duties_and_threads_and_never_without_duties() -> Result<(), String>
     {
         let base = "--key k --max-upload 8Mbit/s";
-        let budget = Budget::of_memory(64 << 30, PerFeeder::planned(true));
+        let budget = Budget::of_memory(64 << 30, crate::budget::Plan::planned(true));
         let host = |line: &str| -> Result<Option<HostedMlat>, String> {
             host_for(&config(line)?, identity(), 1, &budget)
         };

@@ -12,6 +12,7 @@ use bytes::Bytes;
 
 use crate::WireError;
 use crate::beast::Frame;
+use crate::decoded::ObsView;
 use crate::key::{Identity, KEY_LEN, PublicKey, SIGNATURE_LEN};
 use crate::record::Body;
 
@@ -49,6 +50,9 @@ const RECEIVER_INFO_DOMAIN: &[u8] = b"tally receiver";
 
 /// Format, key, boot id, sequence: the part of a batch fixed across every format version.
 const BATCH_PREFIX_LEN: usize = 1 + KEY_LEN + 8 + 8;
+/// The prefix and the rest of format 1's fixed fields: counter epoch, wall clock, dropped,
+/// previous.
+const BATCH_HEADER_LEN: usize = BATCH_PREFIX_LEN + 4 + 8 + 4 + 32;
 const INFO_PREFIX_LEN: usize = 1 + KEY_LEN;
 
 pub type Hash = [u8; 32];
@@ -94,11 +98,7 @@ impl Observation {
 
     /// The BEAST frame, for a format BEAST carries.
     pub fn to_beast(&self) -> Option<Frame> {
-        crate::decoded::ObsView::from(self).to_beast()
-    }
-
-    pub(crate) fn encode(&self, out: &mut Vec<u8>) -> Result<(), WireError> {
-        crate::decoded::ObsView::from(self).encode(out)
+        ObsView::from(self).to_beast()
     }
 
     pub(crate) fn decode(reader: &mut Body<'_>) -> Result<Self, WireError> {
@@ -137,6 +137,47 @@ pub struct BatchContent {
     pub observations: Vec<Observation>,
 }
 
+impl BatchContent {
+    fn header(&self) -> Header {
+        Header {
+            boot_id: self.boot_id,
+            sequence: self.sequence,
+            counter_epoch: self.counter_epoch,
+            wall_ms: self.wall_ms,
+            dropped: self.dropped,
+            previous: self.previous,
+        }
+    }
+}
+
+/// A batch's content with its receptions borrowed where they are held (a decoded batch's,
+/// `ObsView`): signed into the same bytes as the `BatchContent` of their owned copies, with no copy
+/// made. What a relay signs its deduplicated stream from (`Batch::sign_relay_draft`), as the
+/// regional product is signed from a `RegionalDraft`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BatchDraft<'a> {
+    pub boot_id: u64,
+    pub sequence: u64,
+    pub counter_epoch: u32,
+    pub wall_ms: u64,
+    pub dropped: u32,
+    pub previous: Hash,
+    pub observations: Vec<ObsView<'a>>,
+}
+
+impl BatchDraft<'_> {
+    fn header(&self) -> Header {
+        Header {
+            boot_id: self.boot_id,
+            sequence: self.sequence,
+            counter_epoch: self.counter_epoch,
+            wall_ms: self.wall_ms,
+            dropped: self.dropped,
+            previous: self.previous,
+        }
+    }
+}
+
 /// A signed batch, as bytes. Immutable: forwarding never re-encodes it, and every holder shares
 /// the one allocation (`Bytes`), so a clone is a reference count, not a copy. The signer's key is
 /// decompressed once, when the batch is read (`from_bytes`) or signed, and kept: naming the
@@ -160,7 +201,7 @@ impl Eq for Batch {}
 impl Batch {
     /// A receiver's batch of its own receptions.
     pub fn sign(identity: &Identity, content: &BatchContent) -> Result<Self, WireError> {
-        Self::sign_in(BATCH_DOMAIN, identity, content, Codec::Plain)
+        Self::sign_content(BATCH_DOMAIN, identity, content, Codec::Plain)
     }
 
     /// A receiver's batch, its observations written by `codec`.
@@ -169,25 +210,67 @@ impl Batch {
         content: &BatchContent,
         codec: Codec,
     ) -> Result<Self, WireError> {
-        Self::sign_in(BATCH_DOMAIN, identity, content, codec)
+        Self::sign_content(BATCH_DOMAIN, identity, content, codec)
     }
 
     /// A relay's batch of its deduplicated stream (`Record::RelayBatch`).
     pub fn sign_as_relay(identity: &Identity, content: &BatchContent) -> Result<Self, WireError> {
-        Self::sign_in(RELAY_BATCH_DOMAIN, identity, content, Codec::Plain)
+        Self::sign_content(RELAY_BATCH_DOMAIN, identity, content, Codec::Plain)
     }
 
-    fn sign_in(
+    fn sign_content(
         label: &[u8],
         identity: &Identity,
         content: &BatchContent,
         codec: Codec,
     ) -> Result<Self, WireError> {
+        let observations = content.observations.iter().map(ObsView::from);
+        Self::sign_in(label, identity, &content.header(), observations, codec)
+    }
+
+    /// As `sign_as_relay`, from receptions borrowed where they are held: the bytes
+    /// `sign_as_relay` makes of their owned copies, with no copy made.
+    pub fn sign_relay_draft(
+        identity: &Identity,
+        draft: &BatchDraft<'_>,
+    ) -> Result<Self, WireError> {
+        Self::sign_in(
+            RELAY_BATCH_DOMAIN,
+            identity,
+            &draft.header(),
+            draft.observations.iter().copied(),
+            Codec::Plain,
+        )
+    }
+
+    /// Whether `sign_relay_draft` would make a batch that fits one record (`record::MAX_BODY`),
+    /// decided without signing: the signature's length is fixed.
+    pub fn relay_draft_fits(draft: &BatchDraft<'_>) -> bool {
+        let observations: usize = draft
+            .observations
+            .iter()
+            .map(|observation| crate::decoded::OBSERVATION_FIXED + observation.data.len())
+            .sum();
+        BATCH_HEADER_LEN + 4 + observations + SIGNATURE_LEN <= crate::record::MAX_BODY
+            && draft
+                .observations
+                .iter()
+                .all(|observation| u16::try_from(observation.data.len()).is_ok())
+            && u32::try_from(draft.observations.len()).is_ok()
+    }
+
+    fn sign_in<'a>(
+        label: &[u8],
+        identity: &Identity,
+        header: &Header,
+        observations: impl ExactSizeIterator<Item = ObsView<'a>>,
+        codec: Codec,
+    ) -> Result<Self, WireError> {
         let mut plain = Vec::new();
-        let count = u32::try_from(content.observations.len())
-            .map_err(|_| WireError::Oversize(content.observations.len()))?;
+        let count = u32::try_from(observations.len())
+            .map_err(|_| WireError::Oversize(observations.len()))?;
         plain.extend_from_slice(&count.to_be_bytes());
-        for observation in &content.observations {
+        for observation in observations {
             observation.encode(&mut plain)?;
         }
         let deflated = match codec {
@@ -208,12 +291,12 @@ impl Batch {
             BATCH_FORMAT
         });
         bytes.extend_from_slice(identity.public().as_bytes());
-        bytes.extend_from_slice(&content.boot_id.to_be_bytes());
-        bytes.extend_from_slice(&content.sequence.to_be_bytes());
-        bytes.extend_from_slice(&content.counter_epoch.to_be_bytes());
-        bytes.extend_from_slice(&content.wall_ms.to_be_bytes());
-        bytes.extend_from_slice(&content.dropped.to_be_bytes());
-        bytes.extend_from_slice(&content.previous);
+        bytes.extend_from_slice(&header.boot_id.to_be_bytes());
+        bytes.extend_from_slice(&header.sequence.to_be_bytes());
+        bytes.extend_from_slice(&header.counter_epoch.to_be_bytes());
+        bytes.extend_from_slice(&header.wall_ms.to_be_bytes());
+        bytes.extend_from_slice(&header.dropped.to_be_bytes());
+        bytes.extend_from_slice(&header.previous);
         match deflated {
             None => bytes.extend_from_slice(&plain),
             Some(deflated) => {
@@ -735,6 +818,65 @@ mod tests {
             assert!(
                 tampered.is_err() || tampered.is_ok_and(|batch| batch.verify().is_err()),
                 "byte {at}"
+            );
+        }
+        Ok(())
+    }
+
+    /// A relay batch signed from borrowed receptions is the one signed from their owned copies,
+    /// byte for byte, and fits a record exactly when that batch's record encodes within a
+    /// message's plaintext.
+    #[test]
+    fn a_relay_draft_signs_the_bytes_its_owned_copies_sign() -> Result<(), WireError> {
+        let relay = Identity::from_seed([5; 32]);
+        let fits_record = |batch: &Batch| {
+            let mut encoded = Vec::new();
+            crate::Record::RelayBatch(batch.clone())
+                .encode(&mut encoded)
+                .is_ok()
+                && encoded.len() <= crate::noise::MAX_PLAINTEXT
+        };
+        for (count, length) in [
+            (0usize, 14usize),
+            (40, 14),
+            (2_700, 14),
+            (2_800, 14),
+            (3, 30_000),
+        ] {
+            let observations: Vec<Observation> = (0..count)
+                .map(|n| Observation {
+                    format: format::MODE_S_LONG,
+                    timestamp: 1_000 + n as u64,
+                    signal: (n % 251) as u8,
+                    data: vec![(n % 256) as u8; length],
+                })
+                .collect();
+            let content = BatchContent {
+                boot_id: 11,
+                sequence: 4,
+                counter_epoch: 0,
+                wall_ms: 1_791_244_800_000,
+                dropped: 0,
+                previous: [7; 32],
+                observations: observations.clone(),
+            };
+            let draft = BatchDraft {
+                boot_id: 11,
+                sequence: 4,
+                counter_epoch: 0,
+                wall_ms: content.wall_ms,
+                dropped: 0,
+                previous: [7; 32],
+                observations: observations.iter().map(ObsView::from).collect(),
+            };
+            let owned = Batch::sign_as_relay(&relay, &content)?;
+            let borrowed = Batch::sign_relay_draft(&relay, &draft)?;
+            assert_eq!(borrowed, owned, "{count} of {length} bytes");
+            borrowed.verify_as_relay()?;
+            assert_eq!(
+                Batch::relay_draft_fits(&draft),
+                fits_record(&owned),
+                "{count} of {length} bytes"
             );
         }
         Ok(())

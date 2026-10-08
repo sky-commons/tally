@@ -151,13 +151,27 @@ fn trace() -> Result<Trace> {
     })
 }
 
-/// What a relay made of a trace: its regional records, world parts and deduplicated stream, each
-/// as bytes in the order made.
+/// What a relay made of a trace: its regional records, world parts and deduplicated stream's
+/// batches, each as signed bytes in the order made.
 #[derive(Debug, PartialEq, Eq)]
 struct Made {
     regional: Vec<Vec<u8>>,
     world: Vec<Vec<u8>>,
-    stream: Vec<(u8, Vec<u8>)>,
+    stream: Vec<Vec<u8>>,
+}
+
+/// The deduplicated stream the relay signed since the products were last taken, each batch
+/// checked as the relay's own, and how many of its epochs were refused whole so far.
+fn stream_of(hub: &Hub) -> Result<(Vec<Observation>, u64)> {
+    let products = &hub.network().products;
+    let mut stream = Vec::new();
+    for record in products.tick(None) {
+        if let Record::RelayBatch(batch) = record {
+            batch.verify_as_relay().map_err(text)?;
+            stream.extend(batch.content().map_err(text)?.observations);
+        }
+    }
+    Ok((stream, products.report().stream_refused))
 }
 
 /// The relay's key, the trace's world switched on and its feeders described: as the trace's
@@ -213,16 +227,15 @@ fn made(hub: &Hub, end_ms: u64) -> Result<Made> {
         match record {
             Record::RegionalBatch(regional) => made.regional.push(regional.as_bytes().to_vec()),
             Record::WorldPositions(world) => made.world.push(world.as_bytes().to_vec()),
+            Record::RelayBatch(batch) => {
+                batch.verify_as_relay().map_err(text)?;
+                made.stream.push(batch.as_bytes().to_vec());
+            }
             _ => {}
         }
     }
-    let (stream, refused) = hub.take_deduplicated();
-    assert_eq!(refused, 0);
+    assert_eq!(products.report().stream_refused, 0);
     assert_eq!(products.report().epochs_refused, 0);
-    made.stream = stream
-        .into_iter()
-        .map(|observation| (observation.format, observation.data))
-        .collect();
     Ok(made)
 }
 
@@ -231,7 +244,7 @@ fn made(hub: &Hub, end_ms: u64) -> Result<Made> {
 fn run(trace: &Trace, threads: Threads, delay: impl Fn(usize) -> Duration) -> Result<Made> {
     let hub = Arc::new(
         Hub::clocked(8, Arc::new(|| 0))
-            .regional_boot(42)
+            .product_boots(42)
             .staged(threads)?,
     );
     start(&hub, trace);
@@ -253,7 +266,7 @@ fn run_clocked(trace: &Trace, threads: Threads, pause: Option<Pause>) -> Result<
     let reading = Arc::clone(&clock);
     let hub = Arc::new(
         Hub::clocked(8, Arc::new(move || reading.load(Ordering::SeqCst)))
-            .regional_boot(42)
+            .product_boots(42)
             .staged_pausing(threads, pause)?,
     );
     start(&hub, trace);
@@ -349,6 +362,7 @@ fn copies_of_a_message_up_to_two_seconds_apart_are_kept_once() -> Result {
         ingest: 4,
         message: 4,
     })?);
+    hub.network().adopt_identity(Identity::from_seed([59; 32]));
     let message = airborne(
         0x00a0_0001,
         LatLon {
@@ -394,7 +408,7 @@ fn copies_of_a_message_up_to_two_seconds_apart_are_kept_once() -> Result {
         }
         std::thread::sleep(Duration::from_millis(5));
     }
-    let (stream, refused) = hub.take_deduplicated();
+    let (stream, refused) = stream_of(&hub)?;
     assert_eq!(refused, 0);
     let kept: Vec<u64> = stream
         .iter()
@@ -445,16 +459,21 @@ fn a_message_heard_by_many_receivers_on_many_workers_is_kept_once_a_window() -> 
     )?;
     // Each second: every aircraft's two positions once, and each feeder's own reply once. A
     // position is new each second (the aircraft moved), so nothing is kept twice across them.
+    let mut stream = Vec::new();
+    for bytes in &made.stream {
+        let batch = Batch::from_bytes(bytes.clone()).map_err(text)?;
+        stream.extend(batch.content().map_err(text)?.observations);
+    }
     let mut counts: HashMap<&[u8], usize> = HashMap::new();
-    for (_, data) in &made.stream {
-        *counts.entry(data.as_slice()).or_default() += 1;
+    for observation in &stream {
+        *counts.entry(observation.data.as_slice()).or_default() += 1;
     }
     assert!(
         counts.values().all(|count| *count == 1),
         "a message kept twice"
     );
     assert_eq!(
-        made.stream.len(),
+        stream.len(),
         SECONDS as usize * (2 * AIRCRAFT as usize + FEEDERS)
     );
     // Each area once per message: two areas hear every position.
@@ -573,8 +592,9 @@ async fn each_receivers_batches_reach_a_subscriber_in_order_described_first() ->
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_subscriber_that_falls_behind_is_let_go_whole_and_the_stream_refused_whole_counted()
 -> Result {
-    // A budget of one feeder: the products hold some twenty epochs of this stream unsigned, so
-    // forty seconds of it overflow.
+    // A budget of one feeder: the products hold some thirty-five epochs of this stream signed
+    // (`budget::PerFeeder::planned`'s products, about 1.6 kB an epoch), so forty seconds of it
+    // overflow.
     let one = tally_relay::budget::PerFeeder::planned(false).total();
     let hub = Arc::new(
         Hub::clocked(8, Arc::new(|| 0))
@@ -592,6 +612,7 @@ async fn a_subscriber_that_falls_behind_is_let_go_whole_and_the_stream_refused_w
         })
     };
     let stalled = hub.listen(998, raw());
+    hub.network().adopt_identity(Identity::from_seed([4; 32]));
     let receiver = Identity::from_seed([3; 32]);
     let seconds = 40u64;
     for second in 0..seconds {
@@ -637,9 +658,9 @@ async fn a_subscriber_that_falls_behind_is_let_go_whole_and_the_stream_refused_w
         Err(Fell::Behind(_))
     ));
     assert_eq!(stalled.queued_bytes(), 0);
-    // Nobody took the deduplicated stream: the epochs past what the products' budget holds were
-    // refused whole and counted; those held are whole.
-    let (stream, refused) = hub.take_deduplicated();
+    // Nobody took the products: the epochs of the deduplicated stream past what the products'
+    // budget holds were refused whole and counted; those held are whole.
+    let (stream, refused) = stream_of(&hub)?;
     let per_epoch = 2 * AIRCRAFT as usize + 1;
     assert!(refused > 0);
     assert_eq!(stream.len() % per_epoch, 0);
@@ -769,7 +790,7 @@ async fn a_stalled_stage_never_grows_past_the_budget() -> Result {
     }
     assert!(hub.network().products.report().epochs_refused >= 1);
     assert_eq!(epochs.held(), 0);
-    let (stream, refused) = hub.take_deduplicated();
+    let (stream, refused) = stream_of(&hub)?;
     assert!(stream.is_empty());
     assert!(refused >= 1);
     Ok(())

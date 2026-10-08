@@ -1,7 +1,7 @@
 //! Every deployed relay's configuration admits feeders (RFC-0178 §9). A relay's memory is its
 //! `--memory`, or else its cgroup's limit (a systemd unit's `MemoryMax=`, a Kubernetes container's
-//! `limits.memory`); the budget takes `budget::BASE_BYTES` of it first, and a relay whose budget
-//! holds no feeder refuses to start (`Budget::check`). Each deployed configuration is read here as
+//! `limits.memory`); the budget takes the relay's base (`budget::Plan::base`) of it first, and a
+//! relay whose budget holds no feeder refuses to start (`Budget::check`). Each deployed configuration is read here as
 //! the relay reads it: its arguments through the relay's own parser (`config::Config`), its memory
 //! as the relay would find it, and its budget built as `main` builds it. A deployment given too
 //! little memory, or an argument the relay no longer takes, is a red test here, not a relay that
@@ -15,7 +15,7 @@
 //! The files are named by the build (`TALLY_RELAY_DEPLOYED`, their runfiles paths); `cargo test`
 //! reads the same files from the repository.
 
-use tally_relay::budget::{BASE_BYTES, Budget, PerFeeder};
+use tally_relay::budget::{Budget, Plan};
 use tally_relay::config::{Config, parse_bytes};
 
 type Result<T = ()> = std::result::Result<T, String>;
@@ -416,7 +416,7 @@ fn budget_of(deployed: &Deployed) -> Result<Budget> {
             .ok_or("neither --memory nor a memory limit")?
     };
     let hosts_mlat = config.relay_duties && config.mlat_threads > 0;
-    let budget = Budget::of_memory(memory, PerFeeder::planned(hosts_mlat));
+    let budget = Budget::of_memory(memory, Plan::planned(hosts_mlat));
     budget.check()?;
     Ok(budget)
 }
@@ -488,7 +488,7 @@ MemoryMax=3G
     );
     assert_eq!(deployed.limit, Some(3 << 30));
     // Memory that is the relay's base and no more holds no feeder, and is refused.
-    let budget = Budget::of_memory(BASE_BYTES, PerFeeder::planned(true));
+    let budget = Budget::of_memory(Plan::planned(true).base, Plan::planned(true));
     assert!(budget.check().is_err());
     Ok(())
 }

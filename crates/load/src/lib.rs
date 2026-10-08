@@ -513,9 +513,11 @@ fn summary(summary: &Summary) -> String {
                 ),
             );
         }
-        for (name, histogram) in [
-            ("latency: raw", &client.raw_latency),
-            ("latency: deduplicated", &client.dedup_latency),
+        // A batch's time is when it was made: a feeder's seal for raw, and for the deduplicated
+        // stream the end of the epoch the relay signed it for (`tally_relay::deduplicated`).
+        for (name, histogram, since) in [
+            ("latency: raw", &client.raw_latency, "sealed"),
+            ("latency: deduplicated", &client.dedup_latency, "epoch end"),
         ] {
             let histogram = histogram
                 .lock()
@@ -529,7 +531,7 @@ fn summary(summary: &Summary) -> String {
             row(
                 name,
                 format!(
-                    "p50 {} ms, p90 {} ms, p99 {} ms, p99.9 {} ms, max {} ms (sealed to read, {} batches)",
+                    "p50 {} ms, p90 {} ms, p99 {} ms, p99.9 {} ms, max {} ms ({since} to read, {} batches)",
                     at(0.5),
                     at(0.9),
                     at(0.99),

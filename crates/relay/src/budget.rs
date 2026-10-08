@@ -5,7 +5,8 @@
 //! and released when it leaves ([`Reservation`] dropped). A sharing member reserves the feeders its
 //! ingest ceiling is worth ([`Budget::reserve_feeders`]), so data from peers is admitted the same
 //! way. The feeder ceiling is what the relay's memory (`--memory`, by default what the relay's
-//! cgroup or the host allows, [`memory_available`]) holds of that sum, after [`BASE_BYTES`]; a
+//! cgroup or the host allows, [`memory_available`]) holds of that sum, after its own base ([`Plan::base`]: [`BASE_BYTES`], and
+//! [`MLAT_BASE_BYTES`] more when it hosts MLAT); a
 //! Hello beyond it is refused ("no spare slot"), and a relay whose memory admits no feeder at all
 //! refuses to start ([`Budget::check`]). The MLAT engine's receiver limit comes from the same
 //! ceiling.
@@ -53,8 +54,8 @@ pub enum Store {
     /// Decoded batches between ingest and the sealer: each epoch open in the message exchange,
     /// closing, and waiting at the sealer (`seal::EPOCHS_HELD`).
     Epochs,
-    /// What the sealer has made and the hub has not yet taken: the deduplicated stream's epochs
-    /// and the signed products, and the peers' records waiting for the sealer.
+    /// What the sealer has signed and the hub has not yet taken (the deduplicated stream's
+    /// batches and the products), and the peers' records waiting for the sealer.
     Products,
 }
 
@@ -169,8 +170,9 @@ impl PerFeeder {
             // The decoded batches of the epochs between ingest and the sealer.
             epochs: decoded * crate::seal::EPOCHS_HELD as usize * crate::seal::EPOCH_MS as usize
                 / 1_000,
-            // What the sealer made of those epochs and the hub has not taken: every reception as
-            // a signed product's observation, as if none were a copy (`products::OUTBOX_EPOCHS`).
+            // What the sealer signed of those epochs and the hub has not taken: every reception
+            // twice as a signed record's observation, in the deduplicated stream and in its area's
+            // regional batch, as if none were a copy (`products::OUTBOX_EPOCHS`).
             products: receptions * PRODUCT_BYTES_PER_RECEPTION * crate::products::OUTBOX_EPOCHS,
         }
     }
@@ -184,9 +186,11 @@ pub const PLANNED_BYTES_PER_SEC: usize = 8 * 1024;
 /// bytes (the fixed part and a 14-byte Mode S message).
 const DECODED_BYTES_PER_RECEPTION: usize =
     std::mem::size_of::<tally_wire::ObsRef>() + tally_wire::decoded::OBSERVATION_FIXED + 14;
-/// One reception as a product holds it before it is sent: an owned observation (the struct and its
-/// message) in a record's list.
-const PRODUCT_BYTES_PER_RECEPTION: usize = std::mem::size_of::<tally_wire::Observation>() + 14;
+/// One reception as the products hold it before the hub takes them: its encoded observation (the
+/// fixed part and a 14-byte Mode S message) in two signed records, the deduplicated stream's batch
+/// and its area's regional batch. Both are signed from the epoch's batches, so neither holds an
+/// owned copy (`deduplicated::Stream::sign`, `tally_wire::RegionalBatch::sign_draft`).
+const PRODUCT_BYTES_PER_RECEPTION: usize = 2 * (tally_wire::decoded::OBSERVATION_FIXED + 14);
 /// What the relay holds whatever its feeders: descriptions, stream tables, the runtime and the one
 /// batch each ingest worker is decoding (256 MiB), and the connection buffers the Noise pool keeps
 /// idle (`noise::POOL_IDLE` messages). Measured (RFC-0178, "Sizing", 2026-10-07): resident memory
@@ -196,6 +200,32 @@ const PRODUCT_BYTES_PER_RECEPTION: usize = std::mem::size_of::<tally_wire::Obser
 /// that measured growth, so this base is safe at any load.
 pub const BASE_BYTES: usize =
     (256 << 20) + tally_wire::noise::POOL_IDLE * tally_wire::noise::MAX_MESSAGE;
+/// What hosting MLAT adds to the relay's own base, whatever its feeders: the engine's thread, its
+/// pool and its empty tables (its raw is `Held`'s and its notes `Notes`', per feeder). Measured
+/// (RFC-0178, "Sizing", 2026-10-08): a relay hosting MLAT on two areas, before any feeder, was
+/// 19.8 MiB resident where the same relay without it was 17.3 MiB; the loaded runs, fitted to a
+/// base and a slope, put the base no higher (their intercept is below zero: what MLAT holds grows
+/// faster than linearly with feeders, see the RFC). 2.5 MiB measured, held at 4 MiB.
+pub const MLAT_BASE_BYTES: usize = 4 << 20;
+
+/// What a relay plans to hold: its own base, and each feeder's cost in every store. Both follow
+/// one switch, whether the relay hosts MLAT, so the base and the reservation cannot disagree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Plan {
+    pub base: usize,
+    pub per_feeder: PerFeeder,
+}
+
+impl Plan {
+    /// The plan of a relay that hosts MLAT (`hosts_mlat`) or does not.
+    pub fn planned(hosts_mlat: bool) -> Self {
+        Self {
+            base: BASE_BYTES + if hosts_mlat { MLAT_BASE_BYTES } else { 0 },
+            per_feeder: PerFeeder::planned(hosts_mlat),
+        }
+    }
+}
+
 /// The bytes this relay may use, unless told (`--memory`): its cgroup's limit when it has one,
 /// else the host's memory.
 pub fn memory_available() -> usize {
@@ -458,6 +488,8 @@ pub struct GaugeReport {
 #[derive(Debug)]
 pub struct Budget {
     memory: usize,
+    /// What the relay holds whatever its feeders (`Plan::base`).
+    base: usize,
     total: usize,
     per_feeder: PerFeeder,
     reserved: Arc<AtomicUsize>,
@@ -465,13 +497,15 @@ pub struct Budget {
 }
 
 impl Budget {
-    /// The budget of a relay that may use `memory` bytes: what is left after `BASE_BYTES`.
-    pub fn of_memory(memory: usize, per_feeder: PerFeeder) -> Self {
-        let mut budget = Self::new(memory.saturating_sub(BASE_BYTES), per_feeder);
+    /// The budget of a relay that may use `memory` bytes: what is left after its base.
+    pub fn of_memory(memory: usize, plan: Plan) -> Self {
+        let mut budget = Self::new(memory.saturating_sub(plan.base), plan.per_feeder);
         budget.memory = memory;
+        budget.base = plan.base;
         budget
     }
 
+    /// A budget of `total` bytes for feeders, above a base of `BASE_BYTES`.
     pub fn new(total: usize, per_feeder: PerFeeder) -> Self {
         let gauges: Arc<[Arc<Gauge>]> = Store::ALL
             .iter()
@@ -479,6 +513,7 @@ impl Budget {
             .collect();
         let budget = Self {
             memory: total.saturating_add(BASE_BYTES),
+            base: BASE_BYTES,
             total,
             per_feeder,
             reserved: Arc::new(AtomicUsize::new(0)),
@@ -490,10 +525,11 @@ impl Budget {
 
     /// The same gauges (whoever holds one keeps it), resized for `memory` bytes: what a relay is
     /// told after its parts were built.
-    pub fn resize(&mut self, memory: usize, per_feeder: PerFeeder) {
+    pub fn resize(&mut self, memory: usize, plan: Plan) {
         self.memory = memory;
-        self.total = memory.saturating_sub(BASE_BYTES);
-        self.per_feeder = per_feeder;
+        self.base = plan.base;
+        self.total = memory.saturating_sub(plan.base);
+        self.per_feeder = plan.per_feeder;
         self.limit_gauges();
     }
 
@@ -513,14 +549,15 @@ impl Budget {
             "{} bytes of memory admit no feeder: the relay needs {} bytes for itself and {} \
              for each feeder; give it more (--memory, or the unit's MemoryMax)",
             self.memory,
-            BASE_BYTES,
+            self.base,
             self.per_feeder.total()
         ))
     }
 
     /// The least memory that admits `feeders`.
-    pub fn memory_for(feeders: usize, per_feeder: PerFeeder) -> usize {
-        BASE_BYTES.saturating_add(per_feeder.total().saturating_mul(feeders))
+    pub fn memory_for(feeders: usize, plan: Plan) -> usize {
+        plan.base
+            .saturating_add(plan.per_feeder.total().saturating_mul(feeders))
     }
 
     /// The most feeders the budget admits: the feeder ceiling.
@@ -575,6 +612,11 @@ impl Budget {
         self.memory
     }
 
+    /// What the relay holds whatever its feeders.
+    pub fn base(&self) -> usize {
+        self.base
+    }
+
     /// What every admitted feeder together may hold in `store`, at the ceiling.
     pub fn store_bytes(&self, store: Store) -> usize {
         self.per_feeder.of(store).saturating_mul(self.ceiling())
@@ -588,7 +630,7 @@ impl Budget {
     pub fn report(&self) -> MemoryReport {
         MemoryReport {
             memory: self.memory,
-            base: BASE_BYTES,
+            base: self.base,
             per_feeder: self.per_feeder.total(),
             ceiling: self.ceiling(),
             reserved: self.reserved(),
@@ -657,7 +699,7 @@ mod tests {
             }
         }
         // A relay of 64 GiB holds thousands of planned feeders, never none.
-        let budget = Budget::of_memory(64 << 30, with);
+        let budget = Budget::of_memory(64 << 30, Plan::planned(true));
         assert!(budget.ceiling() > 1_000);
         assert!(budget.check().is_ok());
         assert!(memory_available() > 0);
@@ -665,13 +707,20 @@ mod tests {
 
     #[test]
     fn a_relay_whose_memory_admits_no_feeder_will_not_start() {
-        let per_feeder = PerFeeder::planned(false);
-        let none = Budget::of_memory(BASE_BYTES + per_feeder.total() - 1, per_feeder);
-        assert_eq!(none.ceiling(), 0);
-        assert!(none.check().is_err());
-        let one = Budget::of_memory(Budget::memory_for(1, per_feeder), per_feeder);
-        assert_eq!(one.ceiling(), 1);
-        assert!(one.check().is_ok());
+        for hosts_mlat in [false, true] {
+            let plan = Plan::planned(hosts_mlat);
+            let none = Budget::of_memory(plan.base + plan.per_feeder.total() - 1, plan);
+            assert_eq!(none.ceiling(), 0);
+            assert!(none.check().is_err());
+            let one = Budget::of_memory(Budget::memory_for(1, plan), plan);
+            assert_eq!(one.ceiling(), 1);
+            assert!(one.check().is_ok());
+        }
+        // Hosting MLAT adds its own base, beside each feeder's raw and notes.
+        assert_eq!(
+            Plan::planned(true).base,
+            Plan::planned(false).base + MLAT_BASE_BYTES
+        );
     }
 
     #[test]
@@ -697,16 +746,17 @@ mod tests {
     /// resizes the gauges whoever holds them; together they never pass the feeders' memory.
     #[test]
     fn the_gauges_are_each_stores_share_and_follow_a_resize() {
-        let per_feeder = PerFeeder::planned(false);
-        let mut budget = Budget::of_memory(Budget::memory_for(10, per_feeder), per_feeder);
+        let plan = Plan::planned(false);
+        let per_feeder = plan.per_feeder;
+        let mut budget = Budget::of_memory(Budget::memory_for(10, plan), plan);
         let epochs = budget.gauge(Store::Epochs);
         assert_eq!(epochs.limit(), per_feeder.epochs * 10);
         let all: usize = Store::ALL
             .iter()
             .map(|store| budget.gauge(*store).limit())
             .sum();
-        assert!(all <= budget.memory() - BASE_BYTES);
-        budget.resize(Budget::memory_for(20, per_feeder), per_feeder);
+        assert!(all <= budget.memory() - budget.base());
+        budget.resize(Budget::memory_for(20, plan), plan);
         assert_eq!(epochs.limit(), per_feeder.epochs * 20);
     }
 

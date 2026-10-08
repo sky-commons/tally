@@ -97,12 +97,12 @@ impl Closer {
 
 /// One reception kept: its batch, shared, and its index there.
 #[derive(Clone, Debug)]
-pub struct Copy {
+pub struct Kept {
     pub decoded: Arc<Decoded>,
     pub index: u32,
 }
 
-impl Copy {
+impl Kept {
     pub fn obs(&self) -> &ObsRef {
         &self.decoded.observations()[self.index as usize]
     }
@@ -120,9 +120,9 @@ pub struct Merged {
     /// No copy of it is kept: a part was lost (a sealer behind), so all of it is refused.
     pub refused: bool,
     /// First copies of each message the relay heard, in canonical order.
-    pub stream: Vec<Copy>,
+    pub stream: Vec<Kept>,
     /// First copies in each area, by the area's cell number, each in canonical order.
-    pub regional: BTreeMap<u64, (Region, Vec<Copy>)>,
+    pub regional: BTreeMap<u64, (Region, Vec<Kept>)>,
     /// What its batches are charged, released when the epoch is let go.
     pub charges: Vec<Charge>,
 }
@@ -276,7 +276,7 @@ pub fn merge(epoch: Epoch, parts: Vec<Frozen>) -> Merged {
     };
     for mut part in parts {
         merged.charges.push(std::mem::take(&mut part.charge));
-        let copy = |at: u32, index: u32| Copy {
+        let copy = |at: u32, index: u32| Kept {
             decoded: Arc::clone(&part.batches[at as usize]),
             index,
         };
@@ -292,9 +292,9 @@ pub fn merge(epoch: Epoch, parts: Vec<Frozen>) -> Merged {
                 .push(copy(*at, *index));
         }
     }
-    merged.stream.sort_by_key(Copy::key);
+    merged.stream.sort_by_key(Kept::key);
     for (_, copies) in merged.regional.values_mut() {
-        copies.sort_by_key(Copy::key);
+        copies.sort_by_key(Kept::key);
     }
     merged
 }

@@ -144,7 +144,7 @@ impl ObsView<'_> {
     }
 
     /// Its bytes in a signed list of receptions: the one encoding of a reception, whether it is
-    /// borrowed or owned (`Observation::encode` writes through this).
+    /// borrowed or owned (an owned one is written as its view, `ObsView::from`).
     pub(crate) fn encode(&self, out: &mut Vec<u8>) -> Result<(), WireError> {
         out.push(self.format);
         out.extend_from_slice(&self.timestamp.to_be_bytes()[2..]);
