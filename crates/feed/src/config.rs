@@ -19,10 +19,11 @@ usage: tally-feed --key FILE [options]
   --source HOST:PORT     readsb's BEAST output (default 127.0.0.1:30005)
   --uat HOST:PORT        dump978-fa's raw output, for 978 MHz UAT (none by default; it is
                          usually 127.0.0.1:30978)
-  --relay HOST:PORT=KEY  a relay to know of; repeatable
-  --home HOST:PORT=KEY   a relay always in the set (your own, if you run one)
-  --relays N             how many relays to publish to (default 4)
-  --state DIR            where learned relays and the anchor are kept (default /var/lib/tally-feed)
+  --relay HOST:PORT=KEY  a relay to consider; repeatable. Measured and ranked like every relay the
+                         feeder knows: the feeder sends to the two nearest healthy relays on
+                         different networks, chosen with every feeder of its area (RFC-0174)
+  --state DIR            where learned relays and relays found swallowing are kept
+                         (default /var/lib/tally-feed)
   --lat DEG --lon DEG --alt ALT
                          the antenna's position, published exactly unless --precision says
                          otherwise (MLAT needs it exact); ALT is metres above the ellipsoid,
@@ -45,12 +46,10 @@ pub struct Config {
     pub key_file: PathBuf,
     pub source: String,
     pub uat: Option<String>,
-    /// The relays the owner named with `--relay`.
+    /// The relays the owner named with `--relay`: candidates, never pinned (RFC-0174 §2.2).
     pub relays: Vec<RelayAddress>,
     /// The relays shipped in the binary (`SEEDS`).
     pub seeds: Vec<RelayAddress>,
-    pub home: Option<RelayAddress>,
-    pub relay_count: usize,
     pub state_dir: PathBuf,
     pub location: Option<Location>,
     pub clock: Clock,
@@ -70,8 +69,6 @@ pub fn parse(args: impl Iterator<Item = String>) -> Result<Command, String> {
         uat: None,
         relays: Vec::new(),
         seeds: Vec::new(),
-        home: None,
-        relay_count: 4,
         state_dir: PathBuf::from("/var/lib/tally-feed"),
         location: None,
         clock: Clock::Dump1090,
@@ -85,8 +82,9 @@ pub fn parse(args: impl Iterator<Item = String>) -> Result<Command, String> {
             "--source" => config.source = value()?,
             "--uat" => config.uat = Some(value()?),
             "--relay" => config.relays.push(parse_relay(&value()?)?),
-            "--home" => config.home = Some(parse_relay(&value()?)?),
-            "--relays" => config.relay_count = number(&flag, &value()?)?,
+            // Retired with the home, anchor and random slots (RFC-0174 §2.2), and refused, so no
+            // command line goes on saying what the feeder no longer does.
+            "--home" | "--relays" => return Err(retired(&flag)),
             "--state" => config.state_dir = PathBuf::from(value()?),
             "--lat" => lat = Some(degrees(&flag, &value()?, 90.0)?),
             "--lon" => lon = Some(degrees(&flag, &value()?, 180.0)?),
@@ -123,10 +121,17 @@ pub fn parse(args: impl Iterator<Item = String>) -> Result<Command, String> {
         (None, None) => None,
         _ => return Err("--lat and --lon go together".to_owned()),
     };
-    if config.relay_count == 0 {
-        return Err("--relays must be at least 1".to_owned());
-    }
     Ok(Command::Run(Box::new(config)))
+}
+
+/// Why a retired flag is refused, and what replaces it.
+fn retired(flag: &str) -> String {
+    let instead = if flag == "--home" {
+        "a home relay is a candidate like any other: name it with --relay HOST:PORT=KEY"
+    } else {
+        "a feeder always sends to two relays: remove it"
+    };
+    format!("{flag} was retired with the home, anchor and random slots (RFC-0174 §2.2); {instead}")
 }
 
 pub fn parse_relay(text: &str) -> Result<RelayAddress, String> {
@@ -231,6 +236,23 @@ mod tests {
         ] {
             assert!(alt(bad).is_err(), "{bad} was taken");
         }
+        Ok(())
+    }
+
+    #[test]
+    fn the_retired_home_and_relay_count_are_refused() -> Result<(), String> {
+        let key = tally_wire::Identity::generate()
+            .map_err(|error| error.to_string())?
+            .public();
+        let home = format!("home.example:10900={key}");
+        for args in [
+            vec!["--key", "k", "--home", home.as_str()],
+            vec!["--key", "k", "--relays", "1"],
+        ] {
+            let refused = run(&args).err().ok_or("a retired flag was taken")?;
+            assert!(refused.contains("retired"), "{refused}");
+        }
+        assert!(run(&["--key", "k", "--home", &home]).is_err_and(|why| why.contains("--relay")));
         Ok(())
     }
 

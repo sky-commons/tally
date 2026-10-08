@@ -1,0 +1,353 @@
+//! THE TALLY API'S PUBLIC JSON (RFC-0173 §2.5), declared once: `tally-api` serialises these types
+//! and every client deserialises them (the Flightlines client core's `tally-reads` among them), so a
+//! field renamed here is renamed on both sides by the compiler, never by hand.
+//!
+//! Every time field says which kind of time it is:
+//!
+//! - an INSTANT is `*_at_ms`, Unix milliseconds on the API's own clock, beside the response's
+//!   `now_ms` (when the API's data was current, on the same clock), so a client ages an instant
+//!   against `now_ms` and never against its own clock;
+//! - a SPAN is `*_for_ms`, a count of milliseconds.
+//!
+//! A client may ignore a field it does not read; a field a type states is always present (an
+//! optional one as `null`).
+//!
+//! [`fixtures`] holds one answer of each endpoint exactly as `tally-api` writes it: `tally-api`'s
+//! own test serialises its answers and holds them equal to these, and a client's test reads them, so
+//! the two sides are tested against one text.
+//!
+//! This file depends on `serde` alone and names nothing of its crate's own (no `crate::` path), so a
+//! client in another build may compile this very file into itself (the Flightlines client core does,
+//! as a module, `#[path]` from `core/crates/tally-reads`) rather than restate it.
+
+#![forbid(unsafe_code)]
+
+use serde::{Deserialize, Serialize};
+
+/// `GET /v1/aircraft?west=&south=&east=&north=[&feed=live|precise]`: the aircraft in a viewport.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AircraftResponse {
+    /// When the data was current: Unix milliseconds on the API's clock. For the precise feed,
+    /// the product's own second (about a minute and a half ago), so a client ages each aircraft
+    /// against it and draws the feed where it was then.
+    pub now_ms: u64,
+    /// Which feed was served: what the client asked for (`live` when it named none).
+    pub feed: Feed,
+    pub aircraft: Vec<Aircraft>,
+}
+
+/// Which feed of positions a client reads (RFC-0174 §2.11), its choice.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Feed {
+    /// Now: each aircraft at its newest position, an MLAT aircraft by its provisional fix a second
+    /// or two after it was heard until its final fix replaces it.
+    #[default]
+    Live,
+    /// The precise world product, about a minute and a half behind: every aircraft at one second,
+    /// an MLAT aircraft by its final fix only. Each aircraft's `last_heard_at_ms` says how old.
+    Precise,
+}
+
+/// One aircraft with a position: as the API's decoder (readsb) holds it, its position either
+/// readsb's own (decoded from the aircraft's ADS-B) or, for an aircraft readsb holds no position
+/// for, the API's merged MLAT solution (RFC-0171 §3.8.1).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Aircraft {
+    /// The 24-bit address as six lowercase hex digits (readsb prefixes a non-ICAO address `~`).
+    pub hex: String,
+    /// The callsign, trimmed; `null` when none was heard.
+    pub flight: Option<String>,
+    pub lat: f64,
+    pub lon: f64,
+    /// Barometric altitude in feet; `null` on the ground or when none was heard.
+    pub alt_baro_ft: Option<i32>,
+    pub gs_kt: Option<f64>,
+    pub track_deg: Option<f64>,
+    pub baro_rate_fpm: Option<i32>,
+    pub on_ground: bool,
+    /// When its last message was heard (for an MLAT position, when the transmission it was
+    /// solved from was sent): Unix milliseconds on the API's clock, at or before `now_ms`.
+    pub last_heard_at_ms: u64,
+    /// Where `lat` and `lon` came from.
+    pub position_source: PositionSource,
+    /// An MLAT position's uncertainty and how it was checked; `null` for an ADS-B position.
+    pub mlat: Option<Mlat>,
+}
+
+/// Where an aircraft's position came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PositionSource {
+    /// The aircraft's own broadcast, as readsb decoded it.
+    Adsb,
+    /// Multilateration: solved by Tally MLAT engines from receivers' timestamps.
+    Mlat,
+}
+
+/// What an MLAT position is worth.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Mlat {
+    /// One standard deviation of the horizontal position, metres, clock error included.
+    pub horizontal_sigma_m: f64,
+    pub check: MlatCheck,
+    /// Final, or provisional until a final position replaces it.
+    pub kind: MlatKind,
+    /// Whether the receivers it was solved from have standing (RFC-0174 §2.12): `unconfirmed` is
+    /// drawn, and labelled so.
+    pub confidence: MlatConfidence,
+    /// Whether a solution over more receptions of the same transmission disagreed with it: the
+    /// position stands, and the disagreement is kept as evidence against the added receptions.
+    pub contested: bool,
+}
+
+/// How far an MLAT position's receivers are trusted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MlatConfidence {
+    /// At least the solver's minimum of its receivers have standing.
+    Standing,
+    /// Fewer, or the API has not weighed them (a precise world fix, read as its relay signed it).
+    Unconfirmed,
+}
+
+/// Which MLAT position is served: the API serves a provisional one while it is later than every
+/// final one it holds of the aircraft.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MlatKind {
+    /// Solved under the clock model of the window holding its transmission: published some 7 to
+    /// 47 s after it.
+    Final,
+    /// Solved about a second after its transmission under an older clock model carried forward,
+    /// its uncertainty grown by how far: a final position of the same transmission follows and
+    /// replaces it, and one no final position confirms is retracted.
+    Provisional,
+}
+
+/// How the API checked an MLAT position before serving it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MlatCheck {
+    /// The API holds the raw it was solved from: the clock model was verified by the model
+    /// verifier and the solution by the solution verifier.
+    Model,
+    /// Signatures and content addresses only: the engine's solution and the model it cites are
+    /// signed and whole, and agree with each other, but the API holds none of their raw.
+    Signature,
+    /// The API solved it itself, from the union of two engines' raw it holds.
+    Resolved,
+}
+
+/// `GET /v1/network`: the network's totals.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Network {
+    /// When the relay counted them: Unix milliseconds on the API's clock.
+    pub now_ms: u64,
+    pub receivers_online: u32,
+    pub receivers_total: u32,
+    pub messages_per_sec: f64,
+    /// Aircraft the decoder holds a position for.
+    pub aircraft: u32,
+}
+
+/// `GET /v1/stations/{key}`, the key in the path as base64url without padding: one receiver.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Station {
+    /// When the relay reported it: Unix milliseconds on the API's clock.
+    pub now_ms: u64,
+    /// The receiver's public key as tally prints it (standard base64).
+    pub key: String,
+    /// The relay forwarded a batch of it recently.
+    pub online: bool,
+    /// When the relay first forwarded a batch of it: Unix milliseconds on the API's clock.
+    pub first_seen_at_ms: u64,
+    /// When the relay last forwarded a batch of it: Unix milliseconds on the API's clock.
+    pub last_seen_at_ms: u64,
+    pub messages_per_sec: f64,
+    /// Signed batches the relay accepted from it.
+    pub batches: u64,
+    /// Batches of its sequence that never arrived.
+    pub gaps: u64,
+    /// Where it says it is; `null` when it does not say.
+    pub location: Option<Position>,
+    /// What it runs, as it says; `null` when it says nothing.
+    pub software: Option<String>,
+}
+
+/// `GET /v1/stations/{key}/stats`, the key as base64url without padding: what one feeder gave the
+/// network over the window, as the API computes it (RFC-0174 §2.12) from public signed data alone
+/// (the feeder's signed batches, the signed positions that cite its receptions, and its standing),
+/// so anyone who reads the same records computes the same figures. The site that shows them is one
+/// client of the network; no relay computes or vouches for any of them.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FeederStats {
+    /// When the figures were computed: Unix milliseconds on the API's clock.
+    pub now_ms: u64,
+    /// The receiver's public key as tally prints it (standard base64).
+    pub key: String,
+    /// The span the figures cover: the last day, or less while the API has been reading for less.
+    pub window_for_ms: u64,
+    /// The share of the window's minutes in which a signed batch of it was published, 0 to 1.
+    pub uptime: f64,
+    /// Receptions in its signed batches over the window.
+    pub messages: u64,
+    /// `messages` over the window, a second.
+    pub messages_per_sec: f64,
+    /// Distinct aircraft whose checked address it heard over the window.
+    pub aircraft: u32,
+    /// The farthest positioned aircraft it heard, metres from where it says it is; `null` when it
+    /// states no place or heard no positioned aircraft.
+    pub range_m: Option<f64>,
+    /// The sky it heard positioned aircraft in, square kilometres of coverage cells.
+    pub coverage_km2: f64,
+    /// The part of `coverage_km2` no other feeder heard over the window.
+    pub unique_coverage_km2: f64,
+    /// Distinct published MLAT positions that cite one of its receptions.
+    pub mlat_positions: u64,
+    /// Its area: the H3 cell (resolution 3, as hex) that holds where it says it is; `null` when it
+    /// states no place.
+    pub area: Option<String>,
+    /// Its receptions have earned standing (RFC-0174 §2.12): only a feeder with standing is ranked.
+    pub standing: bool,
+    /// Its places on its area's leaderboards; `null` when it is not ranked (no standing, or no
+    /// area).
+    pub ranks: Option<Ranks>,
+}
+
+/// A feeder's places on its area's two leaderboards, 1 the first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Ranks {
+    pub unique_coverage: u32,
+    pub mlat: u32,
+    /// How many feeders the area ranks.
+    pub of: u32,
+}
+
+/// `GET /v1/leaderboards`: every area with a ranked feeder, the most ranked first.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Leaderboards {
+    /// When the boards were computed: Unix milliseconds on the API's clock.
+    pub now_ms: u64,
+    /// The span every board covers.
+    pub window_for_ms: u64,
+    pub areas: Vec<LeaderboardArea>,
+}
+
+/// One area, as the leaderboards list it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct LeaderboardArea {
+    /// The H3 cell (resolution 3), as hex: the path `GET /v1/leaderboards/{area}` names.
+    pub area: String,
+    /// The cell's centre.
+    pub center: Position,
+    /// Feeders ranked in it.
+    pub ranked: u32,
+}
+
+/// `GET /v1/leaderboards/{area}`: one area's two leaderboards, each its first feeders. Ranked by
+/// what a feeder adds that no one else does (unique coverage) and by how much it helps MLAT, never
+/// by raw message counts; only feeders with standing are ranked.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Leaderboard {
+    /// When the boards were computed: Unix milliseconds on the API's clock.
+    pub now_ms: u64,
+    pub window_for_ms: u64,
+    pub area: String,
+    pub center: Position,
+    /// Feeders ranked in the area, of which each board lists the first.
+    pub ranked: u32,
+    /// By unique coverage, then MLAT help, then key.
+    pub by_unique_coverage: Vec<LeaderboardEntry>,
+    /// By MLAT help, then unique coverage, then key.
+    pub by_mlat: Vec<LeaderboardEntry>,
+}
+
+/// One feeder on a leaderboard.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct LeaderboardEntry {
+    /// 1 the first.
+    pub rank: u32,
+    /// The receiver's public key as tally prints it (standard base64).
+    pub key: String,
+    pub unique_coverage_km2: f64,
+    pub mlat_positions: u64,
+}
+
+/// A place, in degrees.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Position {
+    pub lat: f64,
+    pub lon: f64,
+}
+
+/// One answer of each endpoint, exactly as `tally-api` writes it (`testdata/`). `tally-api`'s test
+/// holds its own serialised answers equal to these; a client's test reads them.
+pub mod fixtures {
+    /// `GET /v1/aircraft`: three aircraft: one named and airborne, one unnamed on the ground, both
+    /// at their ADS-B positions, and one readsb holds no position for, at its MLAT position.
+    pub const AIRCRAFT: &str = include_str!("../testdata/aircraft.json");
+    /// `GET /v1/aircraft?...&feed=precise`: one second of the precise world product, an ADS-B
+    /// aircraft and an MLAT one.
+    pub const AIRCRAFT_PRECISE: &str = include_str!("../testdata/aircraft_precise.json");
+    /// `GET /v1/network`.
+    pub const NETWORK: &str = include_str!("../testdata/network.json");
+    /// `GET /v1/stations/{key}`: a located station.
+    pub const STATION: &str = include_str!("../testdata/station.json");
+    /// `GET /v1/stations/{key}`: a station that states neither place nor software.
+    pub const STATION_BARE: &str = include_str!("../testdata/station_bare.json");
+    /// The key the station fixtures name, as base64url without padding (the path's form).
+    pub const STATION_KEY_URL: &str = "6kpsY-KcUgq-9VB7Ey7F-ZVHdq6-vnuSQh7qaRRG0iw";
+    /// `GET /v1/stations/{key}/stats`: a located feeder with standing, ranked in its area.
+    pub const FEEDER_STATS: &str = include_str!("../testdata/feeder_stats.json");
+    /// `GET /v1/stations/{key}/stats`: a feeder that states no place and has no standing.
+    pub const FEEDER_STATS_UNRANKED: &str = include_str!("../testdata/feeder_stats_unranked.json");
+    /// `GET /v1/leaderboards`.
+    pub const LEADERBOARDS: &str = include_str!("../testdata/leaderboards.json");
+    /// `GET /v1/leaderboards/{area}`: the area `LEADERBOARDS` lists.
+    pub const LEADERBOARD: &str = include_str!("../testdata/leaderboard.json");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Each fixture reads as its type and writes back as the same JSON: no field is lost, renamed
+    /// or added on the way through.
+    fn whole<T: serde::de::DeserializeOwned + Serialize>(text: &str) -> Result<(), String> {
+        let value: serde_json::Value = serde_json::from_str(text).map_err(|e| e.to_string())?;
+        let typed: T = serde_json::from_value(value.clone()).map_err(|e| e.to_string())?;
+        let back = serde_json::to_value(&typed).map_err(|e| e.to_string())?;
+        if back == value {
+            Ok(())
+        } else {
+            Err(format!("{back} is not {value}"))
+        }
+    }
+
+    #[test]
+    fn every_fixture_is_its_type_whole() -> Result<(), String> {
+        whole::<AircraftResponse>(fixtures::AIRCRAFT)?;
+        whole::<AircraftResponse>(fixtures::AIRCRAFT_PRECISE)?;
+        whole::<Network>(fixtures::NETWORK)?;
+        whole::<Station>(fixtures::STATION)?;
+        whole::<Station>(fixtures::STATION_BARE)?;
+        whole::<FeederStats>(fixtures::FEEDER_STATS)?;
+        whole::<FeederStats>(fixtures::FEEDER_STATS_UNRANKED)?;
+        whole::<Leaderboards>(fixtures::LEADERBOARDS)?;
+        whole::<Leaderboard>(fixtures::LEADERBOARD)
+    }
+
+    #[test]
+    fn a_stated_field_that_is_missing_is_refused() {
+        assert!(serde_json::from_str::<AircraftResponse>(r#"{"aircraft":[]}"#).is_err());
+        assert!(
+            serde_json::from_str::<AircraftResponse>(
+                r#"{"now_ms":1,"aircraft":[{"hex":"a","lat":1,"lon":2,"on_ground":false}]}"#
+            )
+            .is_err(),
+            "last_heard_at_ms is stated"
+        );
+        assert!(serde_json::from_str::<Network>(r#"{"now_ms":"1"}"#).is_err());
+    }
+}

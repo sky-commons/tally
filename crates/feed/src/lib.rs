@@ -1,9 +1,12 @@
 //! A Tally feeder (RFC-0171 §3.5): reads a receiver's own decoder, signs what it heard, and
-//! publishes it to a few relays. It listens on no port, takes no orders from the network, and
+//! publishes it to the two nearest healthy relays on different networks (RFC-0174 §2.2). It listens on no port, takes no orders from the network, and
 //! changes nothing about the receiver's other feeds.
 
 pub mod config;
+pub mod delivery_check;
+pub mod probe;
 pub mod relays;
+pub mod selection;
 pub mod source;
 pub mod uat;
 
@@ -13,7 +16,8 @@ use tally_wire::Identity;
 use tokio::sync::broadcast;
 
 use crate::config::Config;
-use crate::relays::{Directory, SlotKind};
+use crate::delivery_check::DeliveryChecker;
+use crate::relays::{Directory, Publishing};
 use crate::source::Batcher;
 
 /// Batches held for relay sessions that are momentarily slow: about a minute.
@@ -67,43 +71,20 @@ pub async fn run(config: Config) -> Result<(), String> {
         config.state_dir.clone(),
         config.relays.clone(),
         config.seeds.clone(),
-        config.relay_count,
         identity.clone(),
         config.location,
         config.clock,
     )?;
-    let mut kinds = Vec::new();
-    if let Some(home) = config.home.clone() {
-        kinds.push((SlotKind::Home, Some(home)));
-    }
-    // An anchor is never the home relay's own machine: two slots on one host are one network.
-    let anchor = directory.saved_anchor().filter(|anchor| {
-        config
-            .home
-            .as_ref()
-            .is_none_or(|home| !relays::same_host(home, anchor))
-    });
-    kinds.push((SlotKind::Anchor, anchor));
-    while kinds.len() < config.relay_count {
-        kinds.push((SlotKind::Random, None));
-    }
-    kinds.truncate(config.relay_count);
-    // The owner's and the saved relays are held before any slot picks, so none picks their host.
-    for (index, (_, relay)) in kinds.iter().enumerate() {
-        directory.hold(index, relay.as_ref());
-    }
     tokio::spawn(relays::keep_saved(Arc::clone(&directory)));
-    for (index, (kind, relay)) in kinds.into_iter().enumerate() {
-        tokio::spawn(relays::slot(
-            index,
-            kind,
-            relay,
-            Arc::clone(&directory),
-            identity.clone(),
-            batches.clone(),
-            config.ceiling,
-        ));
-    }
+    tokio::spawn(relays::run(Publishing {
+        directory,
+        identity: identity.clone(),
+        batches: batches.clone(),
+        ceiling: config.ceiling,
+        checker: DeliveryChecker::load(&config.state_dir),
+        checking: delivery_check::Checking::default(),
+        prober: probe::measure,
+    }));
     let (inputs, intake) = source::channel();
     tokio::spawn(source::read_beast(config.source, inputs.clone()));
     if let Some(uat) = config.uat {

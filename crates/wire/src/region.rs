@@ -26,6 +26,11 @@ impl Region {
         u64::from(self.0)
     }
 
+    /// The cell's resolution, 0 (coarsest) to 15: its level in the area tree.
+    pub fn resolution(self) -> u8 {
+        u8::from(self.0.resolution())
+    }
+
     /// The region of the given resolution (0, coarsest, to 15) a location falls in.
     pub fn containing(location: &Location, resolution: u8) -> Result<Self, WireError> {
         let resolution = h3o::Resolution::try_from(resolution).map_err(|_| WireError::Invalid {
@@ -39,6 +44,13 @@ impl Region {
     /// is integer work (`contains`), never a projection.
     pub fn point(location: &Location) -> Result<Self, WireError> {
         Self::containing(location, 15)
+    }
+
+    /// The cell of `resolution` this one lies in: itself at its own resolution, `None` for a
+    /// finer resolution than its own (or one past 15).
+    pub fn ancestor(self, resolution: u8) -> Option<Self> {
+        let resolution = h3o::Resolution::try_from(resolution).ok()?;
+        self.0.parent(resolution).map(Self)
     }
 
     /// True if `cell` (a finer or equal cell, such as a receiver's `point`) is inside this region.

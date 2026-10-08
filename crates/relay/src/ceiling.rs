@@ -118,6 +118,16 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Metered<S> {
     }
 }
 
+/// What a ceiling reads the time from: the system's clock, or one a test holds still, so what a
+/// connection is allowed is a function of the bytes and the time it is told, never of how quickly
+/// a loaded host got round to reading them.
+pub type Clock = Arc<dyn Fn() -> Instant + Send + Sync>;
+
+/// The system's monotonic clock.
+pub fn system_clock() -> Clock {
+    Arc::new(Instant::now)
+}
+
 /// A token bucket over a connection's byte count: `rate` bytes a second, up to `burst` saved.
 pub struct Ceiling {
     rate: u64,
@@ -127,26 +137,29 @@ pub struct Ceiling {
     refilled: Instant,
     read: Arc<AtomicU64>,
     counted: u64,
+    clock: Clock,
 }
 
 impl Ceiling {
     /// Holds the count `read` to `rate` bytes a second, with a burst of the larger of the rate and
     /// `MIN_BURST`. The connection starts with its whole burst.
-    pub fn new(rate: u64, read: Arc<AtomicU64>) -> Self {
+    pub fn new(rate: u64, read: Arc<AtomicU64>, clock: Clock) -> Self {
         let burst = burst(rate);
         Self {
             rate,
             burst,
             allowance: burst as f64,
-            refilled: Instant::now(),
+            refilled: clock(),
             read,
             counted: 0,
+            clock,
         }
     }
 
     /// False once the connection has sent more than its rate and burst allow.
     pub fn within(&mut self) -> bool {
-        self.within_at(Instant::now())
+        let now = (self.clock)();
+        self.within_at(now)
     }
 
     fn within_at(&mut self, now: Instant) -> bool {
@@ -168,7 +181,7 @@ mod tests {
     #[test]
     fn a_burst_is_allowed_and_a_sustained_excess_is_not() {
         let read = Arc::new(AtomicU64::new(0));
-        let mut ceiling = Ceiling::new(1_000, Arc::clone(&read));
+        let mut ceiling = Ceiling::new(1_000, Arc::clone(&read), system_clock());
         let start = ceiling.refilled;
         // The whole burst at once is within the ceiling.
         read.store(MIN_BURST, Ordering::Relaxed);
@@ -189,7 +202,7 @@ mod tests {
         let floor = noise::MAX_PLAINTEXT as u64;
         let feeder_burst = u64::from(told_burst).max(floor);
         let read = Arc::new(AtomicU64::new(0));
-        let mut ceiling = Ceiling::new(rate, Arc::clone(&read));
+        let mut ceiling = Ceiling::new(rate, Arc::clone(&read), system_clock());
         let start = ceiling.refilled;
         // The worst first moment: handshake, the largest description, the whole burst of batches
         // in as many small messages as a second's framing allows.

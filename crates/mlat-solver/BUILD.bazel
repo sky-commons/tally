@@ -1,0 +1,56 @@
+load("@rules_rust//cargo:defs.bzl", "extract_cargo_lints")
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test", "rustfmt_test")
+
+package(default_visibility = ["//tally:__subpackages__"])
+
+exports_files(["Cargo.toml"])
+
+extract_cargo_lints(
+    name = "cargo_lints",
+    manifest = "Cargo.toml",
+    workspace = "//tally:Cargo.toml",
+)
+
+# The solver is numerical code compiled optimised in every build, its tests too, as Cargo does
+# (`[profile.dev.package.tally-mlat-solver]` in //tally:Cargo.toml; BLAKE2s, on its hot path, is
+# optimised by an annotation in //tally:tally.MODULE.bazel): unoptimised, the calibration tests'
+# thousands of solves take six minutes of CPU where optimised they take thirteen seconds of wall
+# time, and every engine test that solves pays the same. Debug assertions and overflow checks stay
+# as the build has them. The results are the same to the bit at either level (no fused
+# multiply-add, `libm` for transcendentals; the golden test holds a model's bytes either way).
+SOLVER_RUSTC_FLAGS = ["-Copt-level=2"]
+
+rust_library(
+    name = "mlat-solver",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "tally_mlat_solver",
+    edition = "2024",
+    lint_config = ":cargo_lints",
+    rustc_flags = SOLVER_RUSTC_FLAGS,
+    version = "0.1.0",
+    deps = [
+        "//tally/crates/wire",
+        "@tally_crates//:blake2",
+        "@tally_crates//:libm",
+        "@tally_crates//:thiserror",
+    ],
+)
+
+rust_test(
+    name = "mlat-solver_test",
+    # Optimised, the whole suite takes about thirteen seconds of wall time on four cores and under
+    # forty seconds of CPU; the benchmarks are the ignored tests.
+    size = "medium",
+    crate = ":mlat-solver",
+    edition = "2024",
+    lint_config = ":cargo_lints",
+    rustc_flags = SOLVER_RUSTC_FLAGS,
+)
+
+rustfmt_test(
+    name = "rustfmt",
+    targets = [
+        ":mlat-solver",
+        ":mlat-solver_test",
+    ],
+)

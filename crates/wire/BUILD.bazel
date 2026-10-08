@@ -24,6 +24,7 @@ rust_library(
         "@tally_crates//:ed25519-dalek",
         "@tally_crates//:getrandom",
         "@tally_crates//:h3o",
+        "@tally_crates//:miniz_oxide",
         "@tally_crates//:snow",
         "@tally_crates//:thiserror",
         "@tally_crates//:tokio",

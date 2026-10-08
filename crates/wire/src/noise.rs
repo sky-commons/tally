@@ -97,18 +97,26 @@ where
 {
     tokio::time::timeout(
         HANDSHAKE_TIMEOUT,
-        initiate(stream, local, remote, role, first),
+        initiate(
+            stream,
+            local,
+            remote,
+            (role, first),
+            (MIN_VERSION, MAX_VERSION),
+        ),
     )
     .await
     .map_err(|_| WireError::Timeout)?
 }
 
+/// Dials and says `Hello` with the versions `speaking` (this build's own range, except in a
+/// test of how an older initiator is answered).
 async fn initiate<S>(
     stream: S,
     local: &Identity,
     remote: &PublicKey,
-    role: Role,
-    first: &[Record],
+    (role, first): (Role, &[Record]),
+    (min_version, max_version): (u16, u16),
 ) -> Result<Session<S>, WireError>
 where
     S: AsyncRead + AsyncWrite + Send,
@@ -131,7 +139,11 @@ where
     let transport = Arc::new(handshake.into_stateless_transport_mode()?);
     let mut reader = Reader::new(read, Arc::clone(&transport));
     let mut writer = Writer::new(write, transport);
-    let mut opening = vec![Record::hello(role)];
+    let mut opening = vec![Record::Hello {
+        min_version,
+        max_version,
+        role,
+    }];
     opening.extend_from_slice(first);
     writer.send(&opening).await?;
     let mut records = Vec::new();
@@ -288,6 +300,15 @@ impl<S: AsyncRead> Reader<S> {
         Record::decode_message(&self.plaintext[..length], out)?;
         Ok(())
     }
+
+    /// Reads and drops whatever the peer still sends, undecrypted, until it closes or the read
+    /// fails. Ending a session closes over nothing unread this way: a socket closed with bytes
+    /// unread is reset, and a reset discards what had not yet been sent of the last word. The
+    /// caller bounds the wait.
+    pub async fn discard(&mut self) {
+        let mut sink = [0u8; 4096];
+        while matches!(self.read.read(&mut sink).await, Ok(read) if read > 0) {}
+    }
 }
 
 /// The sending half of a session. Records are packed into as few messages as fit.
@@ -322,6 +343,15 @@ impl<S: AsyncWrite> Writer<S> {
         tokio::time::timeout(WRITE_TIMEOUT, self.send_now(records))
             .await
             .map_err(|_| WireError::Timeout)?
+    }
+
+    /// Ends the sending direction once everything sent is on its way: the peer reads the end of
+    /// stream after the last message. Fails with `Timeout` after `WRITE_TIMEOUT`.
+    pub async fn shutdown(&mut self) -> Result<(), WireError> {
+        tokio::time::timeout(WRITE_TIMEOUT, self.write.shutdown())
+            .await
+            .map_err(|_| WireError::Timeout)?
+            .map_err(WireError::from)
     }
 
     async fn send_now<R>(&mut self, records: &[R]) -> Result<(), WireError>
@@ -396,7 +426,10 @@ mod tests {
         let mut theirs = join(dial.await)??;
         assert_eq!(accepted.peer, feeder.public());
         assert_eq!(accepted.role, Role::Feeder);
-        assert_eq!((accepted.session.version, theirs.version), (1, 1));
+        assert_eq!(
+            (accepted.session.version, theirs.version),
+            (MAX_VERSION, MAX_VERSION)
+        );
 
         let batches: Vec<Record> = (0..200)
             .map(|sequence| {
@@ -459,6 +492,37 @@ mod tests {
         let accepted = accept(far, &[relay]).await?;
         join(dial.await)??;
         assert_eq!(accepted.first, vec![Record::Heartbeat]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_version_1_initiator_is_refused_with_a_goodbye() -> Result<(), WireError> {
+        let relay = Identity::generate()?;
+        let feeder = Identity::generate()?;
+        let (near, far) = tokio::io::duplex(1 << 16);
+        let relay_key = relay.public();
+        let dial = tokio::spawn(async move {
+            initiate(near, &feeder, &relay_key, (Role::Feeder, &[]), (1, 1)).await
+        });
+        assert!(accept(far, &[relay]).await.is_err());
+        assert!(matches!(
+            join(dial.await)?,
+            Err(WireError::Refused {
+                reason: Reason::Version,
+                ..
+            })
+        ));
+        // An initiator that also speaks 2 is welcomed at 2.
+        let relay = Identity::generate()?;
+        let feeder = Identity::generate()?;
+        let (near, far) = tokio::io::duplex(1 << 16);
+        let relay_key = relay.public();
+        let dial = tokio::spawn(async move {
+            initiate(near, &feeder, &relay_key, (Role::Probe, &[]), (1, 2)).await
+        });
+        let accepted = accept(far, &[relay]).await?;
+        assert_eq!((accepted.session.version, accepted.role), (2, Role::Probe));
+        assert_eq!(join(dial.await)??.version, 2);
         Ok(())
     }
 

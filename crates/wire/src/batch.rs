@@ -14,8 +14,29 @@ use crate::beast::{Frame, FrameKind};
 use crate::key::{Identity, KEY_LEN, PublicKey, SIGNATURE_LEN};
 use crate::record::Body;
 
-/// The batch layout this build writes.
+/// The batch layout this build writes uncompressed.
 pub const BATCH_FORMAT: u8 = 1;
+/// The compressed layout (wire version 2, RFC-0174 §2.2): format 1's fields to `previous`, then
+/// `plain length u32` and the raw DEFLATE (RFC 1951) of what format 1 has after `previous`
+/// (`count u32 | observations`). Signed over the compressed bytes, so a relay forwards and
+/// deduplicates it without inflating it, and a reader inflates at most `MAX_PLAIN_LEN`.
+pub const BATCH_FORMAT_DEFLATE: u8 = 2;
+/// The most a compressed batch's observations may inflate to: far beyond any record's body, so
+/// no honest batch is refused, and bounded, so no batch is a decompression bomb.
+pub const MAX_PLAIN_LEN: usize = 1 << 20;
+/// DEFLATE's level 6: zlib's default, where its ratio levels off.
+const DEFLATE_LEVEL: u8 = 6;
+
+/// How a batch's observations are written.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Codec {
+    /// Format 1: as they are.
+    Plain,
+    /// Format 2: raw DEFLATE. Every peer reads it (wire version 2 is the minimum). Written as
+    /// format 1 instead whenever compressing would not make the batch smaller, so a batch signed
+    /// with it is never larger than the plain one, and a size bound on the plain layout holds.
+    Deflate,
+}
 /// The receiver-info layout this build writes.
 pub const RECEIVER_INFO_FORMAT: u8 = 1;
 
@@ -76,7 +97,7 @@ impl Observation {
         Frame::new(kind, self.timestamp, self.signal, &self.data).ok()
     }
 
-    fn encode(&self, out: &mut Vec<u8>) -> Result<(), WireError> {
+    pub(crate) fn encode(&self, out: &mut Vec<u8>) -> Result<(), WireError> {
         out.push(self.format);
         out.extend_from_slice(&self.timestamp.to_be_bytes()[2..]);
         out.push(self.signal);
@@ -87,7 +108,7 @@ impl Observation {
         Ok(())
     }
 
-    fn decode(reader: &mut Body<'_>) -> Result<Self, WireError> {
+    pub(crate) fn decode(reader: &mut Body<'_>) -> Result<Self, WireError> {
         let format = reader.u8()?;
         let mut counter = [0; 8];
         counter[2..].copy_from_slice(reader.bytes(6)?);
@@ -132,21 +153,53 @@ pub struct Batch {
 impl Batch {
     /// A receiver's batch of its own receptions.
     pub fn sign(identity: &Identity, content: &BatchContent) -> Result<Self, WireError> {
-        Self::sign_in(BATCH_DOMAIN, identity, content)
+        Self::sign_in(BATCH_DOMAIN, identity, content, Codec::Plain)
+    }
+
+    /// A receiver's batch, its observations written by `codec`.
+    pub fn sign_with(
+        identity: &Identity,
+        content: &BatchContent,
+        codec: Codec,
+    ) -> Result<Self, WireError> {
+        Self::sign_in(BATCH_DOMAIN, identity, content, codec)
     }
 
     /// A relay's batch of its deduplicated stream (`Record::RelayBatch`).
     pub fn sign_as_relay(identity: &Identity, content: &BatchContent) -> Result<Self, WireError> {
-        Self::sign_in(RELAY_BATCH_DOMAIN, identity, content)
+        Self::sign_in(RELAY_BATCH_DOMAIN, identity, content, Codec::Plain)
     }
 
     fn sign_in(
         label: &[u8],
         identity: &Identity,
         content: &BatchContent,
+        codec: Codec,
     ) -> Result<Self, WireError> {
+        let mut plain = Vec::new();
+        let count = u32::try_from(content.observations.len())
+            .map_err(|_| WireError::Oversize(content.observations.len()))?;
+        plain.extend_from_slice(&count.to_be_bytes());
+        for observation in &content.observations {
+            observation.encode(&mut plain)?;
+        }
+        let deflated = match codec {
+            Codec::Plain => None,
+            Codec::Deflate => {
+                if plain.len() > MAX_PLAIN_LEN {
+                    return Err(WireError::Oversize(plain.len()));
+                }
+                let deflated = miniz_oxide::deflate::compress_to_vec(&plain, DEFLATE_LEVEL);
+                // The length field and the stream must come out smaller, or the batch is plain.
+                (4 + deflated.len() < plain.len()).then_some(deflated)
+            }
+        };
         let mut bytes = Vec::new();
-        bytes.push(BATCH_FORMAT);
+        bytes.push(if deflated.is_some() {
+            BATCH_FORMAT_DEFLATE
+        } else {
+            BATCH_FORMAT
+        });
         bytes.extend_from_slice(identity.public().as_bytes());
         bytes.extend_from_slice(&content.boot_id.to_be_bytes());
         bytes.extend_from_slice(&content.sequence.to_be_bytes());
@@ -154,11 +207,13 @@ impl Batch {
         bytes.extend_from_slice(&content.wall_ms.to_be_bytes());
         bytes.extend_from_slice(&content.dropped.to_be_bytes());
         bytes.extend_from_slice(&content.previous);
-        let count = u32::try_from(content.observations.len())
-            .map_err(|_| WireError::Oversize(content.observations.len()))?;
-        bytes.extend_from_slice(&count.to_be_bytes());
-        for observation in &content.observations {
-            observation.encode(&mut bytes)?;
+        match deflated {
+            None => bytes.extend_from_slice(&plain),
+            Some(deflated) => {
+                // Bounded by `MAX_PLAIN_LEN` above.
+                bytes.extend_from_slice(&(plain.len() as u32).to_be_bytes());
+                bytes.extend_from_slice(&deflated);
+            }
         }
         let signature = identity.sign(&domain(label, &bytes));
         bytes.extend_from_slice(&signature);
@@ -219,10 +274,11 @@ impl Batch {
 
     /// The content, for a format this build reads.
     pub fn content(&self) -> Result<BatchContent, WireError> {
-        if self.format() != BATCH_FORMAT {
+        let format = self.format();
+        if format != BATCH_FORMAT && format != BATCH_FORMAT_DEFLATE {
             return Err(WireError::Invalid {
                 field: "batch format",
-                value: u64::from(self.format()),
+                value: u64::from(format),
             });
         }
         let (signed, _) = split_signature(&self.bytes)?;
@@ -233,9 +289,31 @@ impl Batch {
         let wall_ms = reader.u64()?;
         let dropped = reader.u32()?;
         let previous = reader.array()?;
-        let count = reader.u32()?;
+        let inflated;
+        let mut plain = if format == BATCH_FORMAT_DEFLATE {
+            let length = reader.u32()? as usize;
+            if length > MAX_PLAIN_LEN {
+                return Err(WireError::Oversize(length));
+            }
+            let fixed = 1 + KEY_LEN + 8 + 8 + 4 + 8 + 4 + 32 + 4;
+            inflated = miniz_oxide::inflate::decompress_to_vec_with_limit(&signed[fixed..], length)
+                .map_err(|_| WireError::Invalid {
+                    field: "compressed batch",
+                    value: length as u64,
+                })?;
+            if inflated.len() != length {
+                return Err(WireError::Invalid {
+                    field: "compressed batch length",
+                    value: inflated.len() as u64,
+                });
+            }
+            Body::new(&inflated)
+        } else {
+            reader
+        };
+        let count = plain.u32()?;
         let observations = (0..count)
-            .map(|_| Observation::decode(&mut reader))
+            .map(|_| Observation::decode(&mut plain))
             .collect::<Result<_, _>>()?;
         Ok(BatchContent {
             boot_id,
@@ -286,7 +364,8 @@ impl Clock {
         .find(|clock| clock.name() == Some(name))
     }
 
-    fn byte(self) -> u8 {
+    /// The clock's byte, as a receiver's description carries it.
+    pub fn byte(self) -> u8 {
         match self {
             Self::Unknown => 0,
             Self::Dump1090 => 1,
@@ -297,7 +376,8 @@ impl Clock {
         }
     }
 
-    fn from_byte(byte: u8) -> Self {
+    /// The clock a byte names; a byte this build does not know is `Other`.
+    pub fn from_byte(byte: u8) -> Self {
         match byte {
             0 => Self::Unknown,
             1 => Self::Dump1090,
@@ -320,6 +400,31 @@ pub struct Location {
     pub precision_m: u32,
 }
 
+impl Location {
+    /// On the globe: latitude within 90 degrees, longitude within 180.
+    pub fn check(&self) -> Result<(), WireError> {
+        check_coordinates(self.lat_e7, self.lon_e7)
+    }
+}
+
+/// Degrees times 10^7 that name a point on the globe: latitude in -90..=90 and longitude in
+/// -180..=180. Every record that carries a position holds it to this.
+pub fn check_coordinates(lat_e7: i32, lon_e7: i32) -> Result<(), WireError> {
+    if lat_e7.unsigned_abs() > 900_000_000 {
+        return Err(WireError::Invalid {
+            field: "latitude",
+            value: u64::from(lat_e7.unsigned_abs()),
+        });
+    }
+    if lon_e7.unsigned_abs() > 1_800_000_000 {
+        return Err(WireError::Invalid {
+            field: "longitude",
+            value: u64::from(lon_e7.unsigned_abs()),
+        });
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReceiverInfoContent {
     /// Unix milliseconds. The newest a relay has seen for a key wins.
@@ -340,8 +445,17 @@ pub struct ReceiverInfo {
     bytes: Vec<u8>,
 }
 
+impl crate::signed::Check for ReceiverInfoContent {
+    /// A location on the globe, if any. The software name and the relay list are bounded by
+    /// their length bytes, which writing refuses to exceed.
+    fn check(&self) -> Result<(), WireError> {
+        self.location.as_ref().map_or(Ok(()), Location::check)
+    }
+}
+
 impl ReceiverInfo {
     pub fn sign(identity: &Identity, content: &ReceiverInfoContent) -> Result<Self, WireError> {
+        crate::signed::Check::check(content)?;
         let mut bytes = Vec::new();
         bytes.push(RECEIVER_INFO_FORMAT);
         bytes.extend_from_slice(identity.public().as_bytes());
@@ -424,13 +538,15 @@ impl ReceiverInfo {
         let relays = (0..count)
             .map(|_| PublicKey::from_slice(reader.bytes(KEY_LEN)?))
             .collect::<Result<_, _>>()?;
-        Ok(ReceiverInfoContent {
+        let content = ReceiverInfoContent {
             issued_ms,
             location,
             clock,
             software,
             relays,
-        })
+        };
+        crate::signed::Check::check(&content)?;
+        Ok(content)
     }
 }
 
@@ -464,6 +580,73 @@ pub(crate) fn u64_at(bytes: &[u8], at: usize) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_compressed_batch_reads_back_as_its_plain_twin_and_a_bomb_is_refused()
+    -> Result<(), WireError> {
+        let feeder = Identity::generate()?;
+        let observations: Vec<Observation> = (0..300u64)
+            .map(|at| Observation {
+                format: format::MODE_S_LONG,
+                timestamp: 1_000_000 + at * 12_000,
+                signal: 80,
+                data: vec![
+                    0x8d,
+                    0x4c,
+                    0xa1,
+                    0xb2,
+                    0x58,
+                    0xc3,
+                    0x82,
+                    0xd6,
+                    0x90,
+                    0xc8,
+                    0xac,
+                    0x28,
+                    0x63,
+                    (at % 251) as u8,
+                ],
+            })
+            .collect();
+        let content = BatchContent {
+            boot_id: 1,
+            sequence: 2,
+            counter_epoch: 3,
+            wall_ms: 4,
+            dropped: 5,
+            previous: [6; 32],
+            observations,
+        };
+        let plain = Batch::sign(&feeder, &content)?;
+        let packed = Batch::sign_with(&feeder, &content, Codec::Deflate)?;
+        packed.verify()?;
+        assert_eq!(packed.format(), BATCH_FORMAT_DEFLATE);
+        assert_eq!(packed.content()?, content);
+        assert!(packed.as_bytes().len() * 2 < plain.as_bytes().len());
+        // A stated length past the bound is refused before anything is inflated.
+        let mut bytes = packed.as_bytes()[..packed.as_bytes().len() - SIGNATURE_LEN].to_vec();
+        let at = 1 + KEY_LEN + 8 + 8 + 4 + 8 + 4 + 32;
+        bytes[at..at + 4].copy_from_slice(&((MAX_PLAIN_LEN as u32) + 1).to_be_bytes());
+        let signature = feeder.sign(&domain(BATCH_DOMAIN, &bytes));
+        bytes.extend_from_slice(&signature);
+        assert!(Batch::from_bytes(bytes)?.content().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn a_batch_compression_would_not_shrink_is_written_plain() -> Result<(), WireError> {
+        let feeder = Identity::generate()?;
+        // An empty batch: its count alone, which DEFLATE only grows.
+        let empty = BatchContent {
+            observations: Vec::new(),
+            ..content()?
+        };
+        let packed = Batch::sign_with(&feeder, &empty, Codec::Deflate)?;
+        assert_eq!(packed.format(), BATCH_FORMAT);
+        assert_eq!(packed, Batch::sign(&feeder, &empty)?);
+        assert_eq!(packed.content()?, empty);
+        Ok(())
+    }
 
     fn content() -> Result<BatchContent, WireError> {
         Ok(BatchContent {

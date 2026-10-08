@@ -4,7 +4,7 @@
 //! written as base64 on one line, the way WireGuard writes them.
 
 use base64::Engine;
-use base64::engine::general_purpose::STANDARD;
+use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use blake2::{Blake2s256, Digest};
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 
@@ -66,6 +66,19 @@ impl PublicKey {
     pub fn from_base64(text: &str) -> Result<Self, WireError> {
         let bytes = STANDARD
             .decode(text.trim())
+            .map_err(|error| WireError::Key(error.to_string()))?;
+        Self::from_slice(&bytes)
+    }
+
+    /// The form a URL path carries: base64url without padding, since the file form's `/`, `+`
+    /// and `=` are not path-safe.
+    pub fn to_base64url(&self) -> String {
+        URL_SAFE_NO_PAD.encode(self.0)
+    }
+
+    pub fn from_base64url(text: &str) -> Result<Self, WireError> {
+        let bytes = URL_SAFE_NO_PAD
+            .decode(text)
             .map_err(|error| WireError::Key(error.to_string()))?;
         Self::from_slice(&bytes)
     }
@@ -162,6 +175,22 @@ mod tests {
             PublicKey::from_base64(&identity.public().to_base64())?,
             identity.public()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn a_key_survives_its_url_form_and_the_file_form_is_not_it() -> Result<(), WireError> {
+        // Generated until the file form carries a character a URL path cannot.
+        let key = loop {
+            let key = Identity::generate()?.public();
+            if key.to_base64().contains(['/', '+']) {
+                break key;
+            }
+        };
+        let url = key.to_base64url();
+        assert!(!url.contains(['/', '+', '=']), "{url}");
+        assert_eq!(PublicKey::from_base64url(&url)?, key);
+        assert!(PublicKey::from_base64url(&key.to_base64()).is_err());
         Ok(())
     }
 

@@ -1,0 +1,14 @@
+{
+  "now_ms": 1791220060000,
+  "window_for_ms": 60000,
+  "areas": [
+    {
+      "area": "832834fffffffff",
+      "center": {
+        "lat": 37.097866,
+        "lon": -122.134251
+      },
+      "ranked": 2
+    }
+  ]
+}
