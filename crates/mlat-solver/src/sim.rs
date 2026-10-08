@@ -74,6 +74,10 @@ pub struct ClockTruth {
     phase: Vec<f64>,
     /// (true time, step seconds): the counter reads late by `step` from `time` on.
     pub jumps: Vec<(f64, f64)>,
+    /// A constant the counter reads late by, seconds: a receiver that stamps the end of a
+    /// message rather than its start, or a long antenna cable, behind a clock that is otherwise
+    /// what it says.
+    pub offset_s: f64,
     /// One standard deviation of a reception's timing jitter, seconds.
     pub jitter_s: f64,
 }
@@ -94,7 +98,7 @@ impl ClockTruth {
             .filter(|(at, _)| t >= *at)
             .map(|(_, step)| step)
             .sum();
-        phase + jumps
+        phase + jumps + self.offset_s
     }
 
     /// The raw counter at true time `t` (seconds after the scenario's start, which is
@@ -200,6 +204,14 @@ pub struct Scenario {
     pub bad: Vec<usize>,
     /// Whether the first receivers are `RECEIVERS`; when not, every receiver is on the spiral.
     pub named: bool,
+    /// (receiver index, seconds): receivers whose counter reads late by a constant
+    /// (`ClockTruth::offset_s`), whatever they declare.
+    pub offsets: Vec<(usize, f64)>,
+    /// (receiver index, seconds): receivers whose timing jitter is this instead, whatever they
+    /// declare: a counter that is not the clock it says it is (a GNSS receiver without its lock
+    /// stamping from a coarse clock, as real ones in OpenSky's data do at hundreds of
+    /// microseconds).
+    pub jitters: Vec<(usize, f64)>,
 }
 
 impl Scenario {
@@ -229,6 +241,8 @@ impl Scenario {
             jitter_s: None,
             bad: Vec::new(),
             named: true,
+            offsets: Vec::new(),
+            jitters: Vec::new(),
         }
     }
 }
@@ -392,6 +406,7 @@ fn clock_truth(rng: &mut Rng, gps: bool, duration: f64, rate_ppm: Option<f64>) -
         start_counts: (rng.next_u64() >> 24) as f64,
         phase,
         jumps: Vec::new(),
+        offset_s: 0.0,
         jitter_s: jitter,
     }
 }
@@ -485,6 +500,12 @@ pub fn run_into(scenario: &Scenario, sink: &mut dyn FnMut(Reception, usize)) -> 
             if !gps {
                 let mixed = mixed_jitter(&mut rng, index);
                 truth.jitter_s = scenario.jitter_s.unwrap_or(mixed);
+            }
+            if let Some((_, offset)) = scenario.offsets.iter().find(|(at, _)| *at == index) {
+                truth.offset_s = *offset;
+            }
+            if let Some((_, jitter)) = scenario.jitters.iter().find(|(at, _)| *at == index) {
+                truth.jitter_s = *jitter;
             }
             truth.jumps = scenario
                 .jumps

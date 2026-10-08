@@ -71,9 +71,9 @@ pub const MAX_SIGMA_M: f64 = 1_500.0;
 /// The published position covariance is the solve's, its standard deviations times this, plus
 /// `ERROR_FLOOR_M` squared on each axis. The simulator calibrates without them; real receivers
 /// carry what it does not model (tropospheric delay differences of a metre or two between sites,
-/// antenna phase centres off their declared sites, multipath), so until a calibration against
-/// real receivers' truth (RFC-0171 §3.8.1, owed) says otherwise, a fix claims a little less than
-/// the mathematics alone would.
+/// antenna phase centres off their declared sites, multipath), so a fix claims a little less than
+/// the mathematics alone would. The calibration over real receivers (RFC-0171 §3.8.1) shows no
+/// uniform overconfidence for these to correct, so they stand (the crate docs, § Solving).
 pub const ERROR_INFLATION: f64 = 1.1;
 /// The least one-axis standard deviation a fix claims, metres (see `ERROR_INFLATION`).
 pub const ERROR_FLOOR_M: f64 = 5.0;
