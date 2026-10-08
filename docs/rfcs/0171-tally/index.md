@@ -755,6 +755,10 @@ received stream is never re-published as if our receivers heard it.
 
 ### §3.10 Where the code lives, and the mirror
 
+**Superseded by RFC-0180 (Tally stands alone).** Tally leaves the monorepo for its own repository,
+`sky-commons/tally`, with its history extracted; the Copybara mirror below stops, and nothing is mirrored
+in either direction. The text below is kept as what was built.
+
 `tally/` is a self-contained Cargo workspace with its own Bazel module file: it references
 nothing outside itself and builds with `cargo` or Bazel alone. In the monorepo, the root module
 includes `//tally:tally.MODULE.bazel` (its crate repository, `tally_crates`), and the nested
