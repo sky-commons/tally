@@ -1,5 +1,5 @@
 load("@rules_rust//cargo:defs.bzl", "extract_cargo_lints")
-load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test", "rustfmt_test")
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test", "rustfmt_test")
 
 package(default_visibility = ["//tally:__subpackages__"])
 
@@ -22,80 +22,25 @@ rust_library(
     lint_config = ":cargo_lints",
     version = "0.1.0",
     deps = [
+        "//tally/crates/mlat-solver",
         "//tally/crates/wire",
-        "@tally_crates//:getrandom",
-        "@tally_crates//:serde_json",
-        "@tally_crates//:tokio",
-    ],
-)
-
-rust_binary(
-    name = "tally-mlat",
-    srcs = ["src/main.rs"],
-    edition = "2024",
-    lint_config = ":cargo_lints",
-    version = "0.1.0",
-    deps = [
-        ":mlat",
-        "@tally_crates//:tokio",
+        "@tally_crates//:h3o",
+        "@tally_crates//:libm",
     ],
 )
 
 rust_test(
     name = "mlat_test",
-    size = "small",
+    size = "medium",
     crate = ":mlat",
     edition = "2024",
     lint_config = ":cargo_lints",
 )
 
-# A stand-in relay and a stand-in mlat-server around a real engine, over loopback sockets.
-rust_test(
-    name = "end_to_end",
-    size = "medium",
-    srcs = [
-        "tests/end_to_end.rs",
-        "tests/support/mod.rs",
-    ],
-    crate_root = "tests/end_to_end.rs",
-    edition = "2024",
-    lint_config = ":cargo_lints",
-    deps = [
-        ":mlat",
-        "//tally/crates/wire",
-        "@tally_crates//:serde_json",
-        "@tally_crates//:tokio",
-    ],
-)
-
-# The same engine and stand-in mlat-server against a real relay, with a feeder and a positions
-# subscriber on it.
-rust_test(
-    name = "real_relay",
-    size = "medium",
-    srcs = [
-        "tests/real_relay.rs",
-        "tests/support/mod.rs",
-    ],
-    crate_root = "tests/real_relay.rs",
-    edition = "2024",
-    lint_config = ":cargo_lints",
-    deps = [
-        ":mlat",
-        "//tally/crates/relay",
-        "//tally/crates/wire",
-        "@tally_crates//:serde_json",
-        "@tally_crates//:tokio",
-    ],
-)
-
 rustfmt_test(
     name = "rustfmt",
     targets = [
-        ":end_to_end",
         ":mlat",
         ":mlat_test",
-        ":real_relay",
-        ":tally-mlat",
     ],
 )

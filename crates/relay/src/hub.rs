@@ -1,22 +1,27 @@
-//! What every connection of a relay shares: the fan-out, the record of batches and positions
-//! already forwarded, the deduplicated stream being gathered, each receiver's newest
+//! What every connection of a relay shares: the fan-out, the record of batches, positions, clock
+//! models and fault proofs already forwarded, the deduplicated stream being gathered, each receiver's newest
 //! self-description, and the relays this one offers as hints.
 
 use std::collections::hash_map::RandomState;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::hash::{BuildHasher, Hasher};
 use std::net::{IpAddr, Ipv6Addr};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tally_wire::batch::Hash;
 use tally_wire::{
-    Batch, Location, Observation, Positions, PublicKey, ReceiverInfo, Record, Region, RelayAddress,
+    Batch, ClockModel, ClockModelPart, FaultProof, Location, Observation, Positions, PublicKey,
+    ReceiverInfo, Record, Region, RelayAddress,
 };
 use tokio::sync::broadcast;
 
 use crate::bounded::Bounded;
+use crate::egress::{Cap, Egress};
+use crate::network::Network;
+use crate::parts::Parts;
+use crate::stations::{STATIONS_REMEMBERED, StationReport, Stations, StationsReport};
 use crate::subscription::{Described, Subscription};
 
 /// How many records a subscriber may fall behind before it is dropped. readsb's rule: drop the
@@ -56,10 +61,20 @@ const _: () = assert!(REORDER_ALLOWANCE <= u64::BITS as u64);
 ///
 /// Who can make use of a forgotten stream: a feeder may publish only its own batches and an engine
 /// only its own positions (`link::Peer`), so a record of *another* author reaches this relay only
-/// from a relay the operator accepted (`--accept-relay`) or an upstream it chose to dial. A replay
-/// across authors therefore needs a peer the operator trusted; churning its own streams lets a
-/// stranger replay nothing but its own records.
+/// from a member (`Hub::relay_trust`: a relay whose offer this one verified at its address) or a
+/// member link this relay dialled. A replay across authors therefore needs a relay that answers
+/// at an address of its own; churning its own streams lets a stranger replay nothing but its own
+/// records.
 pub const STREAMS_REMEMBERED: usize = 200_000;
+
+/// What a relay's session is trusted with (`Hub::relay_trust`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RelayTrust {
+    /// A relay whose offer this relay verified: a sharing member.
+    Member,
+    /// A relay the operator accepted and whose offer is not verified: the directory only.
+    Directory,
+}
 
 /// How many receivers' descriptions the relay holds. When full, the one least recently active is
 /// forgotten: a receiver is active when it is first described and whenever a batch of it is
@@ -89,17 +104,31 @@ pub const DESCRIPTION_BYTES_HELD: usize = 64 * 1024 * 1024;
 /// | records a link has gathered but not sent, ~100 x 320 KiB     | 32 MiB     |
 /// | deduplicated stream (`DEFAULT_MAX_DEDUP_BYTES`)              | 256 MiB    |
 /// | descriptions (`DESCRIPTION_BYTES_HELD`) and their index      | 80 MiB     |
-/// | streams, two tables x 200,000 x ~150 B                       | 60 MiB     |
-/// | hashes, two tables x two generations x 100,000               | 18 MiB     |
-/// | total                                                        | ~1.7 GiB   |
+/// | streams, three tables x 200,000 x ~150 B                     | 90 MiB     |
+/// | hashes, four tables x two generations x 100,000              | 36 MiB     |
+/// | clock model parts awaiting manifests, and manifests' lists    | 96 MiB     |
+/// | total                                                        | ~1.9 GiB   |
 ///
 /// The earlier defaults (4,096 connections, an 8,192-record ring, descriptions bounded only by
 /// count) reached past 5 GB.
+///
+/// A sharing member at its ceiling (`DEFAULT_MAX_MEMBER_BYTES_PER_SEC`) adds no row: what it
+/// sends passes through the ring and the parts table above, which are bounded whatever arrives,
+/// and its connection's buffers are one of the 2,048. What it costs is bandwidth in: up to its
+/// ceiling, from each member of the relay's groups, whose count the directory bounds; an operator
+/// sizes `--max-member-bytes-per-sec` to the host's link.
 pub const DEFAULT_MAX_CONNECTIONS: usize = 2048;
 /// Per IPv4 address, or per IPv6 /64 (what one host is usually given), so one host cannot take
 /// the whole connection cap with handshakes it never finishes.
 pub const DEFAULT_MAX_CONNECTIONS_PER_ADDRESS: usize = 16;
 pub const DEFAULT_MAX_FEEDER_BYTES_PER_SEC: u64 = 262_144;
+/// What one sharing member may send a second, by default: a whole-world MLAT relay's clock
+/// models, final positions and provisional positions (about 1.2, 1.0 and 2.0 MB/s, RFC-0171
+/// §3.8.1) with room to spare. A member's place is known from its handshake (`Hub::relay_trust`),
+/// so it is held to this, and every other connection that dialled in to the feeders' ceiling,
+/// whatever the key. An engine publishes nothing (an MLAT relay shares its positions through its
+/// groups), so it is held to the feeders' ceiling like any connection that only asks.
+pub const DEFAULT_MAX_MEMBER_BYTES_PER_SEC: u64 = 8 * 1024 * 1024;
 /// The most the deduplicated stream holds of messages being compared, by default.
 pub const DEFAULT_MAX_DEDUP_BYTES: usize = 256 * 1024 * 1024;
 
@@ -133,6 +162,10 @@ pub struct Item {
     /// receiver last declared itself, if it has, computed once when its description was kept.
     /// Regions route by this and by nothing else.
     pub cell: Option<Region>,
+    /// For positions and clock models: the finest cells of the aircraft they place (a clock
+    /// model's, its tile's centre), computed once when published, so a client's regions route
+    /// them as they route raw. `None` is unrouted: whole-world.
+    pub points: Option<Arc<[Region]>>,
 }
 
 /// Two generations of hashes: a hash is remembered for one to two windows, or until `most` newer
@@ -235,6 +268,38 @@ impl Sequences {
 ///
 /// A stream is its author and its boot id, for batches and positions alike, so an author that
 /// restarts begins a new stream at sequence 0 instead of being refused as a replay of its last boot.
+/// Positions held until the models they cite have gone out, at most, and for at most how long.
+const AWAITING_MAX: usize = 4_096;
+const AWAITING_MS: Duration = Duration::from_secs(10);
+
+/// Positions held for their models (`Hub::forward_positions`).
+struct Awaiting {
+    source: u64,
+    record: Record,
+    cited: Vec<Hash>,
+    since: Instant,
+}
+
+/// The clock models a positions record cites, each once.
+fn cited_models(record: &Record) -> Vec<Hash> {
+    let (Record::Positions(positions) | Record::Provisional(positions)) = record else {
+        return Vec::new();
+    };
+    let mut cited: Vec<Hash> = positions
+        .solutions()
+        .map(|content| {
+            content
+                .solutions
+                .iter()
+                .map(|solution| solution.clock_model)
+                .collect()
+        })
+        .unwrap_or_default();
+    cited.sort_unstable();
+    cited.dedup();
+    cited
+}
+
 struct Forwarded<K> {
     seen: Seen,
     newest: Bounded<K, Sequences>,
@@ -405,6 +470,9 @@ struct Known {
     record: Arc<Record>,
     cell: Option<Region>,
     bytes: usize,
+    /// What it declares, read once when kept, for the station reports.
+    place: Option<Location>,
+    software: Option<String>,
 }
 
 impl Known {
@@ -413,6 +481,7 @@ impl Known {
             source: RELAY_ITSELF,
             record: Arc::clone(&self.record),
             cell: self.cell,
+            points: None,
         }
     }
 }
@@ -521,6 +590,24 @@ pub struct Hub {
     out: broadcast::Sender<Item>,
     batches: Mutex<Forwarded<(PublicKey, u64)>>,
     positions: Mutex<Forwarded<(PublicKey, u64)>>,
+    /// An engine's provisional positions: a stream per engine boot, sequenced apart from its
+    /// final positions.
+    provisional: Mutex<Forwarded<(PublicKey, u64)>>,
+    /// An engine's clock models: a stream per engine boot, sequenced apart from its positions.
+    clock_models: Mutex<Forwarded<(PublicKey, u64)>>,
+    /// Clock model parts held for their manifests, and forwarded manifests' lists (`parts`).
+    parts: Mutex<Parts>,
+    /// Positions held until the clock models they cite have gone out (`awaiting`).
+    awaiting: Mutex<VecDeque<Awaiting>>,
+    /// Fault proofs, by hash only: a proof is anyone's and unsigned, so it has no stream to
+    /// window. One replayed after its hash is forgotten is forwarded again, which costs the
+    /// replayer its own ingest ceiling and tells a consumer nothing it did not already act on.
+    fault_proofs: Mutex<Seen>,
+    /// The products a peer's record is passed on as (bundle indexes, regional batches), by hash:
+    /// each into the fan-out once. Without it a record that comes back round a loop of relays (an
+    /// index read on a one-hop raw link, passed on, read back) went round for ever, thousands a
+    /// second, and every link behind the fan-out fell behind it.
+    passed_on: Mutex<Seen>,
     deduplicator: Deduplicator,
     /// The receivers described, each with its cell, in the order they are forgotten: what the
     /// batch path reads (a cell to route by) and marks (the receiver is publishing), O(1) each.
@@ -528,6 +615,9 @@ pub struct Hub {
     /// Their descriptions. Taken by `publish_info` (then `receivers`, in that order) and by a
     /// joining subscriber, never by the batch path, so no scan ever stalls a batch.
     directory: Mutex<Directory>,
+    /// What the relay reports about each receiver's traffic (`stations`). Taken alone, after the
+    /// batch path's other locks are released, and before the directory when reporting.
+    stations: Mutex<Stations>,
     next_connection: AtomicU64,
     subscribers: Arc<AtomicUsize>,
     max_subscribers: usize,
@@ -537,8 +627,15 @@ pub struct Hub {
     per_address: Arc<Mutex<HashMap<IpAddr, usize>>>,
     max_connections_per_address: usize,
     max_feeder_bytes_per_sec: u64,
+    max_member_bytes_per_sec: u64,
+    /// The time the ingest ceilings read.
+    ceiling_clock: crate::ceiling::Clock,
     accepted_relays: HashSet<PublicKey>,
     hints: Vec<RelayAddress>,
+    /// What the relay may send a second, and every byte it has sent (`egress`).
+    egress: Arc<Egress>,
+    /// RFC-0174's duties (`network`): the one place they meet the hub.
+    network: Network,
 }
 
 /// Held for as long as a subscriber (or a connection) is served; releases its place when dropped.
@@ -631,9 +728,16 @@ impl Hub {
             out: broadcast::channel(capacity).0,
             batches: Mutex::new(Forwarded::new(SEEN_WINDOW)),
             positions: Mutex::new(Forwarded::new(SEEN_WINDOW)),
+            provisional: Mutex::new(Forwarded::new(SEEN_WINDOW)),
+            clock_models: Mutex::new(Forwarded::new(SEEN_WINDOW)),
+            parts: Mutex::new(Parts::default()),
+            awaiting: Mutex::new(VecDeque::new()),
+            fault_proofs: Mutex::new(Seen::new(SEEN_WINDOW, HASHES_REMEMBERED)),
+            passed_on: Mutex::new(Seen::new(SEEN_WINDOW, HASHES_REMEMBERED)),
             deduplicator: Deduplicator::new(DEFAULT_MAX_DEDUP_BYTES),
             receivers: Mutex::new(Bounded::new(RECEIVERS_REMEMBERED)),
             directory: Mutex::new(Directory::new(DESCRIPTION_BYTES_HELD)),
+            stations: Mutex::new(Stations::new(STATIONS_REMEMBERED)),
             next_connection: AtomicU64::new(RELAY_ITSELF + 1),
             subscribers: Arc::new(AtomicUsize::new(0)),
             max_subscribers,
@@ -642,15 +746,116 @@ impl Hub {
             per_address: Arc::new(Mutex::new(HashMap::new())),
             max_connections_per_address: DEFAULT_MAX_CONNECTIONS_PER_ADDRESS,
             max_feeder_bytes_per_sec: DEFAULT_MAX_FEEDER_BYTES_PER_SEC,
+            max_member_bytes_per_sec: DEFAULT_MAX_MEMBER_BYTES_PER_SEC,
+            ceiling_clock: crate::ceiling::system_clock(),
             accepted_relays: HashSet::new(),
             hints: Vec::new(),
+            // Until the operator names a cap, nothing billed leaves the host (loopback peers are
+            // still served): a hub can never send without one.
+            egress: Arc::new(Egress::new(Cap::NONE)),
+            network: Network::new(),
         }
+    }
+
+    /// RFC-0174's duties.
+    pub fn network(&self) -> &Network {
+        &self.network
+    }
+
+    /// A record the relay itself originated (a network duty's, or its hosted MLAT's): into the
+    /// fan-out as the relay's own, routed by kind exactly as a peer's would be. Positions, clock
+    /// models and their parts go through their own forwarding rules, so a duplicate is still
+    /// forwarded once.
+    pub fn publish_own(&self, record: Record) {
+        self.publish_as(RELAY_ITSELF, record);
+    }
+
+    /// Whether a record passed on by hash (`passed_on`) is new, remembering it if so.
+    fn first_time(&self, hash: Hash) -> bool {
+        self.passed_on.lock().is_ok_and(|mut seen| {
+            seen.rotate();
+            if seen.contains(&hash) {
+                return false;
+            }
+            seen.insert(hash);
+            true
+        })
+    }
+
+    /// As `publish_own`, a record that came in on connection `source` and is forwarded unchanged
+    /// (a peer's regional batch): never sent back down that connection.
+    pub fn publish_as(&self, source: u64, record: Record) {
+        match record {
+            Record::Positions(positions) => {
+                if let Ok(engine) = positions.engine() {
+                    self.publish_positions(source, positions, engine);
+                }
+            }
+            Record::Provisional(positions) => {
+                if let Ok(engine) = positions.engine() {
+                    self.publish_provisional(source, positions, engine);
+                }
+            }
+            Record::ClockModel(model) => {
+                if let Ok(engine) = model.engine() {
+                    self.publish_clock_model(source, model, engine);
+                }
+            }
+            Record::ClockModelPart(part) => {
+                self.publish_clock_model_part(source, part);
+            }
+            Record::BundleIndex(index) => {
+                if !self.first_time(index.hash()) {
+                    return;
+                }
+                let cell = index.content().ok().map(|content| content.parent);
+                let _ = self.out.send(Item {
+                    source,
+                    record: Arc::new(Record::BundleIndex(index)),
+                    cell,
+                    points: None,
+                });
+            }
+            Record::RegionalBatch(regional) => {
+                if !self.first_time(regional.hash()) {
+                    return;
+                }
+                let cell = regional.content().ok().map(|content| content.cell);
+                let _ = self.out.send(Item {
+                    source,
+                    record: Arc::new(Record::RegionalBatch(regional)),
+                    cell,
+                    points: None,
+                });
+            }
+            other => {
+                let _ = self.out.send(Item {
+                    source,
+                    record: Arc::new(other),
+                    cell: None,
+                    points: None,
+                });
+            }
+        }
+    }
+
+    /// The most the relay sends a second to billed peers (`--max-upload`).
+    pub fn max_upload(mut self, cap: Cap) -> Self {
+        self.egress = Arc::new(Egress::new(cap));
+        self
+    }
+
+    pub fn egress(&self) -> &Arc<Egress> {
+        &self.egress
     }
 
     /// How long a forwarded hash is remembered (one to two of `window`), instead of a minute.
     pub fn remembering_hashes_for(mut self, window: Duration) -> Self {
         self.batches = Mutex::new(Forwarded::new(window));
         self.positions = Mutex::new(Forwarded::new(window));
+        self.provisional = Mutex::new(Forwarded::new(window));
+        self.clock_models = Mutex::new(Forwarded::new(window));
+        self.fault_proofs = Mutex::new(Seen::new(window, HASHES_REMEMBERED));
         self
     }
 
@@ -664,6 +869,14 @@ impl Hub {
     /// is not held to the subscriber cap, so that trust is the operator's to give, key by key.
     pub fn accepting_relays(mut self, keys: impl IntoIterator<Item = PublicKey>) -> Self {
         self.accepted_relays = keys.into_iter().collect();
+        self
+    }
+
+    /// The clients this relay vouches for (RFC-0174 §2.1): each is signed a firehose credential
+    /// and this relay's evidence on its sessions here, which it presents to every relay it reads.
+    /// The operator's to give, key by key, as a relay's acceptance is.
+    pub fn vouching_for(self, clients: impl IntoIterator<Item = PublicKey>) -> Self {
+        self.network.credit.vouch_for(clients);
         self
     }
 
@@ -686,9 +899,16 @@ impl Hub {
         self
     }
 
-    /// The most bytes a second one connection may send, beyond its burst.
+    /// The most bytes a second one connection that dialled in and is not a sharing member or a
+    /// directory link may send, beyond its burst.
     pub fn max_feeder_bytes_per_sec(mut self, rate: u64) -> Self {
         self.max_feeder_bytes_per_sec = rate;
+        self
+    }
+
+    /// The most bytes a second one sharing member's connection may send, beyond its burst.
+    pub fn max_member_bytes_per_sec(mut self, rate: u64) -> Self {
+        self.max_member_bytes_per_sec = rate;
         self
     }
 
@@ -696,12 +916,38 @@ impl Hub {
         &self.hints
     }
 
-    pub fn accepts_relay(&self, key: &PublicKey) -> bool {
-        self.accepted_relays.contains(key)
+    /// How far a key that opens a session as a relay is trusted (RFC-0171 §3.6, RFC-0174 §2.5):
+    /// the one rule, read by every session as it opens and again as it runs. A relay whose live
+    /// offer this relay holds, verified by a handshake at the address the offer names, is a
+    /// member (it exchanges its sharing groups' records and may take raw as an engine); failing
+    /// that, a key the operator accepted (`--accept-relay`) is a directory link (the directory
+    /// only); any other key is not a relay here.
+    pub fn relay_trust(&self, key: &PublicKey) -> Option<RelayTrust> {
+        if self.network.directory.knows(key) {
+            Some(RelayTrust::Member)
+        } else if self.accepted_relays.contains(key) {
+            Some(RelayTrust::Directory)
+        } else {
+            None
+        }
     }
 
     pub fn feeder_bytes_per_sec(&self) -> u64 {
         self.max_feeder_bytes_per_sec
+    }
+
+    pub fn member_bytes_per_sec(&self) -> u64 {
+        self.max_member_bytes_per_sec
+    }
+
+    /// The clock the ingest ceilings read, instead of the system's: a test holds it still.
+    pub fn ceiling_clock_from(mut self, clock: crate::ceiling::Clock) -> Self {
+        self.ceiling_clock = clock;
+        self
+    }
+
+    pub fn ceiling_clock(&self) -> crate::ceiling::Clock {
+        std::sync::Arc::clone(&self.ceiling_clock)
     }
 
     /// A place for one more connection from `address`, or `None` when the relay, or that
@@ -719,7 +965,14 @@ impl Hub {
         })
     }
 
-    /// Subscribers (and engines) being served now.
+    /// Links in the fan-out now (subscribers, engines, relay links and the BEAST output, each once
+    /// it has sent the descriptions it joined with): everything published from now on reaches
+    /// every one of them. What a test waits on before publishing, rather than a sleep.
+    pub fn listening(&self) -> usize {
+        self.out.receiver_count()
+    }
+
+    /// Subscribers being served now (an engine takes no place among them, `Hub::engine`).
     pub fn subscribers(&self) -> usize {
         self.subscribers.load(Ordering::SeqCst)
     }
@@ -738,24 +991,108 @@ impl Hub {
             return false;
         }
         // A format this build cannot read is still forwarded raw; it just adds nothing here.
+        let mut observations = 0;
         if let Ok(content) = batch.content() {
             let now = Instant::now();
+            observations = content.observations.len() as u64;
             for observation in content.observations {
                 self.deduplicator.offer(observation, now);
             }
+        }
+        if let Ok(mut stations) = self.stations.lock() {
+            stations.forwarded(
+                receiver,
+                batch.boot_id(),
+                batch.sequence(),
+                observations,
+                now_ms(),
+            );
         }
         // The receiver is publishing, so its description is the last to be forgotten.
         let cell = self.receivers.lock().ok().and_then(|mut receivers| {
             receivers.touch(&receiver);
             receivers.get(&receiver).copied().flatten()
         });
+        self.network.on_batch(&batch, &receiver, now_ms());
         // An error only means nobody is subscribed right now.
         let _ = self.out.send(Item {
             source,
             record: Arc::new(Record::Batch(batch)),
             cell,
+            points: None,
         });
         true
+    }
+
+    /// Connection `source`, a feeder publishing as `receiver`, had a new batch forwarded.
+    pub fn fed_by(&self, receiver: &PublicKey, source: u64) {
+        if let Ok(mut stations) = self.stations.lock() {
+            stations.fed_by(receiver, source);
+        }
+    }
+
+    /// Connection `source` of a feeder publishing as `receiver` ended.
+    pub fn left(&self, receiver: &PublicKey, source: u64) {
+        if let Ok(mut stations) = self.stations.lock() {
+            stations.left(receiver, source);
+        }
+    }
+
+    /// Every receiver's report (`stations`), with what its newest description declares.
+    pub fn stations(&self) -> StationsReport {
+        let now_ms = now_ms();
+        let reports = self
+            .stations
+            .lock()
+            .map(|stations| stations.reports(now_ms))
+            .unwrap_or_default();
+        let stations = match self.directory.lock() {
+            Ok(directory) => reports
+                .into_iter()
+                .map(|(key, report)| described(report, directory.known.get(&key)))
+                .collect(),
+            Err(_) => reports.into_iter().map(|(_, report)| report).collect(),
+        };
+        StationsReport { now_ms, stations }
+    }
+
+    /// One receiver's report, or `None` when the relay holds none for it.
+    pub fn station(&self, receiver: &PublicKey) -> Option<StationReport> {
+        let report = self.stations.lock().ok()?.report(receiver, now_ms())?;
+        let directory = self.directory.lock().ok()?;
+        Some(described(report, directory.known.get(receiver)))
+    }
+
+    /// Where `receiver`'s newest signed description places it: the finest cell, projected once
+    /// when the description was kept. `None` when the relay holds no located description of it.
+    pub fn point_of(&self, receiver: &PublicKey) -> Option<Region> {
+        let directory = self.directory.lock().ok()?;
+        directory.known.get(receiver).and_then(|known| known.cell)
+    }
+
+    /// Every receiver description the relay holds: what a duty that starts late (the hosted MLAT,
+    /// when its areas change) is handed instead of keeping a copy of its own.
+    pub fn descriptions(&self) -> Vec<ReceiverInfo> {
+        let Ok(directory) = self.directory.lock() else {
+            return Vec::new();
+        };
+        directory
+            .known
+            .values()
+            .filter_map(|known| match &*known.record {
+                Record::ReceiverInfo(info) => Some(info.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The newest description of `receiver` the relay holds, and when it was issued.
+    pub fn description_of(&self, receiver: &PublicKey) -> Option<(Arc<Record>, u64)> {
+        let directory = self.directory.lock().ok()?;
+        directory
+            .known
+            .get(receiver)
+            .map(|known| (Arc::clone(&known.record), known.issued_ms))
     }
 
     /// Whether the relay holds a description of `receiver`.
@@ -793,6 +1130,8 @@ impl Hub {
         // Projected once, here; every region test after is integer work.
         let cell = place.and_then(|place| Region::point(&place).ok());
         let bytes = info.as_bytes().len();
+        let software = info.content().ok().map(|content| content.software);
+        self.network.on_info(&info, now_ms());
         let record = Arc::new(Record::ReceiverInfo(info));
         directory.insert(
             receiver,
@@ -801,6 +1140,8 @@ impl Hub {
                 record: Arc::clone(&record),
                 cell,
                 bytes,
+                place,
+                software,
             },
         );
         let forgotten = if publishing {
@@ -827,6 +1168,7 @@ impl Hub {
             source,
             record,
             cell,
+            points: None,
         });
     }
 
@@ -841,10 +1183,181 @@ impl Hub {
             )
         });
         if new {
+            self.network.on_positions(&positions, now_ms());
+            self.forward_positions(source, Record::Positions(positions));
+        }
+        new
+    }
+
+    /// Sends positions into the fan-out once every clock model they cite has gone out before them
+    /// (one session carries a model before what cites it, but a record that reaches this relay
+    /// rebuilt from parity, by a repair or over a link that died between them, may come first);
+    /// held meanwhile, for `AWAITING_MS` at most, after which they go anyway (the relay forwards;
+    /// it is the reader that cannot check them).
+    fn forward_positions(&self, source: u64, record: Record) {
+        let cited = cited_models(&record);
+        let ready = self
+            .clock_models
+            .lock()
+            .is_ok_and(|forwarded| cited.iter().all(|id| forwarded.seen.contains(id)));
+        if ready {
+            self.send_positions(source, record);
+        } else if let Ok(mut awaiting) = self.awaiting.lock() {
+            if awaiting.len() >= AWAITING_MAX
+                && let Some(oldest) = awaiting.pop_front()
+            {
+                self.send_positions(oldest.source, oldest.record);
+            }
+            awaiting.push_back(Awaiting {
+                source,
+                record,
+                cited,
+                since: Instant::now(),
+            });
+        }
+        self.release_awaiting();
+    }
+
+    /// Sends the held positions whose models have all gone out, or which waited too long.
+    pub fn release_awaiting(&self) {
+        let ready: Vec<Awaiting> = {
+            let (Ok(mut awaiting), Ok(forwarded)) =
+                (self.awaiting.lock(), self.clock_models.lock())
+            else {
+                return;
+            };
+            let (ready, held): (VecDeque<Awaiting>, VecDeque<Awaiting>) =
+                awaiting.drain(..).partition(|one| {
+                    one.since.elapsed() >= AWAITING_MS
+                        || one.cited.iter().all(|id| forwarded.seen.contains(id))
+                });
+            *awaiting = held;
+            ready.into_iter().collect()
+        };
+        for one in ready {
+            self.send_positions(one.source, one.record);
+        }
+    }
+
+    fn send_positions(&self, source: u64, record: Record) {
+        let points = crate::network::points_of(&record);
+        let _ = self.out.send(Item {
+            source,
+            record: Arc::new(record),
+            cell: None,
+            points,
+        });
+    }
+
+    /// Forwards verified provisional positions by `engine` if they are new, as
+    /// `publish_positions` does final ones but in a stream of their own, and only to whoever
+    /// asked for them (`Streams::PROVISIONAL`). True when they were.
+    pub fn publish_provisional(
+        &self,
+        source: u64,
+        positions: Positions,
+        engine: PublicKey,
+    ) -> bool {
+        let new = self.provisional.lock().is_ok_and(|mut forwarded| {
+            forwarded.admit(
+                positions.hash(),
+                (engine, positions.boot_id()),
+                positions.sequence(),
+            )
+        });
+        if new {
+            self.network.on_positions(&positions, now_ms());
+            self.forward_positions(source, Record::Provisional(positions));
+        }
+        new
+    }
+
+    /// Forwards a verified clock model manifest by `engine` if it is new: an id not seen, in its
+    /// engine boot's window of sequences (see `Forwarded`). The parts held for it that it lists go
+    /// out first, in index order, each from the connection it came from (`parts`). True when it
+    /// was new.
+    pub fn publish_clock_model(&self, source: u64, model: ClockModel, engine: PublicKey) -> bool {
+        let new = self.clock_models.lock().is_ok_and(|mut forwarded| {
+            forwarded.admit(model.id(), (engine, model.boot_id()), model.sequence())
+        });
+        if new {
+            // A manifest this build cannot read lists nothing: its parts are never forwarded.
+            let hashes = model
+                .manifest()
+                .map(|manifest| manifest.parts)
+                .unwrap_or_default();
+            let ready = self
+                .parts
+                .lock()
+                .map(|mut parts| parts.manifest(model.id(), hashes, Instant::now()))
+                .unwrap_or_default();
+            for (from, part) in ready {
+                let _ = self.out.send(Item {
+                    source: from,
+                    record: Arc::new(Record::ClockModelPart(part)),
+                    cell: None,
+                    points: None,
+                });
+            }
+            let record = Record::ClockModel(model);
+            self.network.on_clock_model(&record, now_ms());
+            let points = crate::network::points_of(&record);
             let _ = self.out.send(Item {
                 source,
-                record: Arc::new(Record::Positions(positions)),
+                record: Arc::new(record),
                 cell: None,
+                points,
+            });
+            // Positions held for this model go out after it.
+            self.release_awaiting();
+        }
+        new
+    }
+
+    /// Takes a clock model part: held until its manifest, forwarded now if its manifest went out
+    /// and lists it, or dropped (`parts`). True when it was forwarded now.
+    pub fn publish_clock_model_part(&self, source: u64, part: ClockModelPart) -> bool {
+        let forward = self
+            .parts
+            .lock()
+            .ok()
+            .and_then(|mut parts| parts.part(source, part, Instant::now()));
+        let Some(part) = forward else {
+            return false;
+        };
+        self.network
+            .on_clock_model(&Record::ClockModelPart(part.clone()), now_ms());
+        let _ = self.out.send(Item {
+            source,
+            record: Arc::new(Record::ClockModelPart(part)),
+            cell: None,
+            points: None,
+        });
+        true
+    }
+
+    /// Bytes of clock model parts held for their manifests.
+    pub fn parts_held_bytes(&self) -> usize {
+        self.parts.lock().map_or(0, |parts| parts.held_bytes())
+    }
+
+    /// Forwards a checked fault proof if its hash is new. True when it was.
+    pub fn publish_fault_proof(&self, source: u64, proof: FaultProof) -> bool {
+        let new = self.fault_proofs.lock().is_ok_and(|mut seen| {
+            seen.rotate();
+            let hash = proof.hash();
+            let new = !seen.contains(&hash);
+            if new {
+                seen.insert(hash);
+            }
+            new
+        });
+        if new {
+            let _ = self.out.send(Item {
+                source,
+                record: Arc::new(Record::FaultProof(proof)),
+                cell: None,
+                points: None,
             });
         }
         new
@@ -863,6 +1376,7 @@ impl Hub {
             source: RELAY_ITSELF,
             record: Arc::new(Record::RelayBatch(batch)),
             cell: None,
+            points: None,
         });
     }
 
@@ -877,6 +1391,14 @@ impl Hub {
     pub fn subscribe(&self, subscription: &Subscription) -> Option<(Vec<Item>, Slot)> {
         let slot = Slot::take(&self.subscribers, self.max_subscribers)?;
         Some((self.infos_for(subscription), slot))
+    }
+
+    /// As `subscribe`, without a place among the subscribers: for an engine, which is another
+    /// relay's MLAT taking its area's raw one hop (RFC-0174 §2.3), a duty of the network the
+    /// subscriber cap was never meant to turn away. What it may take is bounded by its grant (the
+    /// border band of the areas it solves), never by the cap.
+    pub fn engine(&self, subscription: &Subscription) -> Vec<Item> {
+        self.infos_for(subscription)
     }
 
     /// Every description, for a link to another relay, which does not count against the
@@ -912,11 +1434,66 @@ impl Hub {
     }
 }
 
+/// Unix milliseconds now, as the station reports state times.
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| {
+            u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
+        })
+}
+
+/// A station's report with what its description, if held, declares.
+fn described(mut report: StationReport, known: Option<&Known>) -> StationReport {
+    if let Some(known) = known {
+        report.location = known.place.map(Into::into);
+        report.software = known.software.clone();
+    }
+    report
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use tally_wire::batch::ReceiverInfoContent;
     use tally_wire::{BatchContent, Clock, Identity};
+
+    /// A bundle index a peer sent is passed on once, however often it comes back: three relays
+    /// once passed one round a loop of their one-hop raw links for ever, thousands a second.
+    #[test]
+    fn a_bundle_index_that_comes_back_is_not_passed_on_again() -> Result<(), String> {
+        let hub = Hub::new(8);
+        let mut out = hub.listen();
+        let parent = Region::containing(
+            &tally_wire::Location {
+                lat_e7: 337_490_000,
+                lon_e7: -843_880_000,
+                alt_m: 0,
+                precision_m: 0,
+            },
+            1,
+        )
+        .map_err(|error| error.to_string())?;
+        let index = tally_wire::BundleIndex::sign(
+            &Identity::generate().map_err(|error| error.to_string())?,
+            &tally_wire::BundleIndexContent {
+                parent,
+                product: tally_wire::Streams::RAW,
+                second: 100,
+                children: Vec::new(),
+            },
+        )
+        .map_err(|error| error.to_string())?;
+        for source in [7, 8, 7] {
+            hub.publish_as(source, Record::BundleIndex(index.clone()));
+        }
+        let mut passed = 0;
+        while out.try_recv().is_ok() {
+            passed += 1;
+        }
+        assert_eq!(passed, 1);
+        Ok(())
+    }
 
     #[test]
     fn a_record_is_forwarded_once_and_never_far_behind_its_stream() {
@@ -1224,16 +1801,42 @@ mod tests {
         boot_id: u64,
         sequence: u64,
     ) -> Result<Positions, String> {
-        Positions::sign(
+        Positions::sign_solutions(
             engine,
-            &tally_wire::PositionsContent {
+            &tally_wire::SolutionsContent {
                 boot_id,
                 sequence,
                 issued_ms: 1,
-                positions: Vec::new(),
+                spec_version: 1,
+                solutions: Vec::new(),
             },
         )
         .map_err(|error| error.to_string())
+    }
+
+    #[test]
+    fn provisional_positions_are_a_stream_of_their_own() -> Result<(), String> {
+        let hub = Hub::new(8);
+        let (engine, engine_key) = key()?;
+        let provisional = |sequence: u64| {
+            Positions::sign_provisional(
+                &engine,
+                &tally_wire::SolutionsContent {
+                    boot_id: 1,
+                    sequence,
+                    issued_ms: 1,
+                    spec_version: 1,
+                    solutions: Vec::new(),
+                },
+            )
+            .map_err(|error| error.to_string())
+        };
+        assert!(hub.publish_positions(1, signed_positions(&engine, 1, 500)?, engine_key));
+        // Sequenced apart: 0 is new among the engine's provisionals, and only once.
+        assert!(hub.publish_provisional(1, provisional(0)?, engine_key));
+        assert!(!hub.publish_provisional(1, provisional(0)?, engine_key));
+        assert!(hub.publish_provisional(1, provisional(1)?, engine_key));
+        Ok(())
     }
 
     #[test]
@@ -1245,6 +1848,174 @@ mod tests {
         assert!(hub.publish_positions(1, signed_positions(&engine, 2, 0)?, engine_key));
         assert!(!hub.publish_positions(1, signed_positions(&engine, 1, 0)?, engine_key));
         assert!(hub.publish_positions(1, signed_positions(&engine, 2, 1)?, engine_key));
+        Ok(())
+    }
+
+    fn signed_clock_model(
+        engine: &Identity,
+        boot_id: u64,
+        sequence: u64,
+    ) -> Result<tally_wire::ClockModel, String> {
+        tally_wire::ClockModel::sign(
+            engine,
+            &tally_wire::ClockModelContent {
+                boot_id,
+                sequence,
+                issued_ms: 1,
+                spec_version: 1,
+                inputs: [0; 32],
+                model: sequence.to_be_bytes().to_vec(),
+            },
+        )
+        .map(|signed| signed.manifest)
+        .map_err(|error| error.to_string())
+    }
+
+    #[test]
+    fn a_large_models_parts_go_out_ahead_of_its_manifest_and_forged_ones_never()
+    -> Result<(), String> {
+        let hub = Hub::new(8);
+        let mut out = hub.listen();
+        let (engine, engine_key) = key()?;
+        let model: Vec<u8> = (0..3 * tally_wire::clock_model::PART_LEN as u64)
+            .map(|at| (at.wrapping_mul(2_654_435_761) >> 11) as u8)
+            .collect();
+        let signed = tally_wire::ClockModel::sign(
+            &engine,
+            &tally_wire::ClockModelContent {
+                boot_id: 1,
+                sequence: 0,
+                issued_ms: 1,
+                spec_version: 1,
+                inputs: [0; 32],
+                model,
+            },
+        )
+        .map_err(|error| error.to_string())?;
+        let id = signed.manifest.id();
+        let forged = ClockModelPart::new(id, 1, b"forged");
+        // Reordered, repeated and with a forgery: none goes out before the manifest.
+        for part in [
+            &signed.parts[2],
+            &forged,
+            &signed.parts[0],
+            &signed.parts[2],
+        ] {
+            assert!(!hub.publish_clock_model_part(5, part.clone()));
+        }
+        assert!(out.try_recv().is_err());
+        assert!(hub.publish_clock_model(6, signed.manifest.clone(), engine_key));
+        // The late part goes out on its own, once.
+        assert!(hub.publish_clock_model_part(7, signed.parts[1].clone()));
+        assert!(!hub.publish_clock_model_part(8, signed.parts[1].clone()));
+        let mut heard = Vec::new();
+        while let Ok(item) = out.try_recv() {
+            heard.push((item.source, (*item.record).clone()));
+        }
+        assert_eq!(
+            heard,
+            vec![
+                (5, Record::ClockModelPart(signed.parts[0].clone())),
+                (5, Record::ClockModelPart(signed.parts[2].clone())),
+                (6, Record::ClockModel(signed.manifest.clone())),
+                (7, Record::ClockModelPart(signed.parts[1].clone())),
+            ]
+        );
+        assert_eq!(hub.parts_held_bytes(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn clock_models_are_forwarded_once_per_id_and_windowed_apart_from_positions()
+    -> Result<(), String> {
+        let hub = Hub::new(8);
+        let (engine, engine_key) = key()?;
+        let model = signed_clock_model(&engine, 1, 1_000)?;
+        assert!(hub.publish_clock_model(1, model.clone(), engine_key));
+        assert!(!hub.publish_clock_model(2, model, engine_key));
+        // Far behind its boot's newest: a replay.
+        assert!(!hub.publish_clock_model(1, signed_clock_model(&engine, 1, 0)?, engine_key));
+        // The engine's positions keep their own sequence: 0 is new there.
+        assert!(hub.publish_positions(1, signed_positions(&engine, 1, 0)?, engine_key));
+        assert!(hub.publish_clock_model(1, signed_clock_model(&engine, 2, 0)?, engine_key));
+        Ok(())
+    }
+
+    /// Positions that reach the hub before the clock model they cite (rebuilt from parity, by a
+    /// repair, over a link that died between them) wait for it, and go out after it.
+    #[test]
+    fn positions_go_out_after_the_model_they_cite() -> Result<(), String> {
+        let hub = Hub::new(8);
+        let mut out = hub.listen();
+        let (engine, engine_key) = key()?;
+        let model = signed_clock_model(&engine, 1, 0)?;
+        let receivers: Vec<PublicKey> = throwaways(4);
+        let solution = tally_wire::Solution {
+            address: 0x00ab_cdef,
+            transmitted: tally_wire::TransmitTime::new(1_000, 0).map_err(|e| e.to_string())?,
+            lat_e7: 337_000_000,
+            lon_e7: -843_000_000,
+            alt_hae_mm: Some(9_000_000),
+            covariance: tally_wire::EnuCovariance {
+                xx: 900.0,
+                xy: 0.0,
+                xz: 0.0,
+                yy: 900.0,
+                yz: 0.0,
+                zz: 900.0,
+            },
+            clock_model: model.id(),
+            addressed: tally_wire::AddressedCitation::default(),
+            observations: tally_wire::ObservationSet::new(
+                vec![0x5d, 0xab, 0xcd, 0xef, 0, 0, 0],
+                receivers
+                    .iter()
+                    .map(|receiver| tally_wire::Reception {
+                        receiver: *receiver,
+                        epoch: 0,
+                        counter: 1,
+                    })
+                    .collect(),
+            )
+            .map_err(|e| e.to_string())?,
+        };
+        let positions = Positions::sign_solutions(
+            &engine,
+            &tally_wire::SolutionsContent {
+                boot_id: 1,
+                sequence: 0,
+                issued_ms: 1,
+                spec_version: 1,
+                solutions: vec![solution],
+            },
+        )
+        .map_err(|e| e.to_string())?;
+        assert!(hub.publish_positions(1, positions.clone(), engine_key));
+        assert!(
+            out.try_recv().is_err(),
+            "positions went out before their model"
+        );
+        assert!(hub.publish_clock_model(2, model.clone(), engine_key));
+        let mut heard = Vec::new();
+        while let Ok(item) = out.try_recv() {
+            heard.push((*item.record).clone());
+        }
+        assert_eq!(
+            heard,
+            vec![Record::ClockModel(model), Record::Positions(positions)]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_fault_proof_is_forwarded_once() -> Result<(), String> {
+        let hub = Hub::new(8);
+        let (engine, _) = key()?;
+        let a = signed_positions(&engine, 1, 0)?;
+        let b = signed_positions(&engine, 1, 1)?;
+        let proof = tally_wire::FaultProof::new(&a, 0, &b, 0).map_err(|error| error.to_string())?;
+        assert!(hub.publish_fault_proof(1, proof.clone()));
+        assert!(!hub.publish_fault_proof(2, proof));
         Ok(())
     }
 

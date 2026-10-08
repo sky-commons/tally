@@ -1,0 +1,24 @@
+[package]
+name = "tally-merge"
+description = "The consumer merge rule for Tally MLAT: one checked solution per aircraft from any number of engines and relays (RFC-0171 §3.8.1)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+blake2.workspace = true
+libm.workspace = true
+tally-mlat-solver.workspace = true
+tally-relay.workspace = true
+tally-wire.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+# The merge rules are tested over what real engines publish.
+tally-mlat.workspace = true
+
+[lints]
+workspace = true

@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use tally_relay::config::Config;
+use tally_relay::egress;
 use tally_relay::hub::Hub;
 use tally_relay::link;
 use tokio::net::TcpListener;
@@ -20,25 +21,62 @@ async fn run() -> Result<(), String> {
         return Ok(());
     };
     let identities = config.identities()?;
+    eprintln!(
+        "tally-relay: upload capped at {}/s to billed peers, at most {} in 31 days",
+        egress::decimal(config.max_upload.rate()),
+        egress::decimal(config.max_upload.most_a_month())
+    );
     let hub = Arc::new(
         Hub::new(config.max_subscribers)
             .advertising(config.hints())
             .accepting_relays(config.accept_relays.iter().copied())
+            .vouching_for(config.clients.iter().copied())
             .max_connections(config.max_connections)
             .max_connections_per_address(config.max_connections_per_address)
             .max_dedup_bytes(config.max_dedup_bytes)
-            .max_feeder_bytes_per_sec(config.max_feeder_bytes_per_sec),
+            .max_feeder_bytes_per_sec(config.max_feeder_bytes_per_sec)
+            .max_member_bytes_per_sec(config.max_member_bytes_per_sec)
+            .max_upload(config.max_upload),
     );
     eprintln!(
         "tally-relay: key {} listening on {}",
         identities[0].public(),
         config.listen
     );
+    // RFC-0174's duties, configured once here.
+    let network = hub.network();
+    network.selection.set_taken(config.areas.clone());
+    network.products.set_taken(config.areas.clone());
+    network.products.set_world(config.world);
+    network.products.set_world_precise(config.world_precise);
+    network
+        .admission
+        .configure(config.network, config.relay_duties);
+    network.credit.set_upload_cap(config.max_upload.rate());
+    if let Some(host) = tally_relay::mlat_host::host_for(&config, identities[0].clone(), boot_id()?)
+    {
+        eprintln!(
+            "tally-relay: hosting MLAT on {} threads for the areas it is chosen to solve",
+            config.mlat_threads
+        );
+        network.host_mlat(Arc::new(host));
+    }
     if let Some(address) = &config.beast_out {
         let listener = TcpListener::bind(address)
             .await
             .map_err(|error| format!("beast-out {address}: {error}"))?;
         tokio::spawn(link::serve_beast(listener, Arc::clone(&hub)));
+    }
+    if let Some(address) = &config.stats_listen {
+        let listener = TcpListener::bind(address)
+            .await
+            .map_err(|error| format!("stats-listen {address}: {error}"))?;
+        let hub = Arc::clone(&hub);
+        tokio::spawn(async move {
+            if let Err(error) = tally_relay::stats::serve(listener, hub).await {
+                eprintln!("tally-relay: stats: {error}");
+            }
+        });
     }
     for upstream in &config.upstreams {
         tokio::spawn(link::upstream(
@@ -51,4 +89,13 @@ async fn run() -> Result<(), String> {
         .await
         .map_err(|error| format!("listen {}: {error}", config.listen))?;
     tally_relay::serve(listener, identities, hub).await
+}
+
+/// A random boot id for the hosted MLAT's records, so relays tell this process's from the last.
+fn boot_id() -> Result<u64, String> {
+    let identity = tally_wire::Identity::generate().map_err(|error| error.to_string())?;
+    let bytes = identity.public();
+    let mut id = [0; 8];
+    id.copy_from_slice(&bytes.as_bytes()[..8]);
+    Ok(u64::from_be_bytes(id))
 }

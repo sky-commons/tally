@@ -1,0 +1,18 @@
+[package]
+name = "tally-mlat-solver"
+description = "Tally's native MLAT mathematics: Mode S decoding, the clock model, the per-transmission solver, the verifier and a simulator. Pure, deterministic, no I/O."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+blake2.workspace = true
+libm.workspace = true
+tally-wire.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true
