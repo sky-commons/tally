@@ -17,10 +17,16 @@ name = "tally-relay"
 path = "src/main.rs"
 
 [dependencies]
+axum.workspace = true
+serde.workspace = true
+# One program (RFC-0174 §2.1): the relay hosts the MLAT engine for its areas (`mlat_host`).
+tally-mlat.workspace = true
+tally-mlat-solver.workspace = true
 tally-wire.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
+serde_json.workspace = true
 tally-feed = { path = "../feed" }
 # `test-util` pauses time, so a deadline test waits no real seconds.
 tokio = { workspace = true, features = ["test-util"] }

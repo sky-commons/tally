@@ -14,6 +14,9 @@ repository = "https://github.com/flightlines/tally"
 publish = false
 
 [workspace.dependencies]
+# The relay's loopback stats listener and the public API (tally-api) serve HTTP with axum over
+# hyper: pure Rust, no TLS (the API sits behind the edge, which terminates it).
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio"] }
 base64 = "0.22"
 blake2 = "0.10"
 ed25519-dalek = "2"
@@ -21,10 +24,24 @@ ed25519-dalek = "2"
 getrandom = "0.2"
 # H3 cells name regions (RFC-0171 §3.6); pure Rust.
 h3o = "0.11"
-# mlat-server's client protocol is JSON lines (tally-mlat).
+# Pure Rust transcendental functions, the same bits on every platform (tally-mlat-solver).
+libm = "0.2"
+# tally-api serves HTTP/1.1 with hyper's own connection builder (header deadline, connection cap),
+# and reads readsb and the relay over loopback with hyper's own client.
+http-body-util = "0.1"
+hyper = { version = "1", default-features = false, features = ["client", "http1", "server"] }
+hyper-util = { version = "0.1", default-features = false, features = ["client-legacy", "http1", "tokio"] }
+# Batch compression (RFC-0174 §2.2, wire version 2): raw DEFLATE, pure Rust, the decoder std's own
+# backtraces use. Chosen by measurement on the simulator's one-second batches (3.2 KB each):
+# DEFLATE level 6 shrinks them 1.52 times, lz4_flex and pure-Rust zstd (ruzstd 0.8, whose only
+# complete level is its fastest) 1.23 times; zstd proper needs C. A feeder pays its bytes monthly.
+miniz_oxide = { version = "0.8", default-features = false, features = ["with-alloc"] }
+serde = { version = "1", features = ["derive"] }
+# The relay's stats and the API are JSON.
 serde_json = "1"
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "time", "macros", "sync"] }
+tower = { version = "0.5", default-features = false, features = ["util"] }
 # Pure Rust, no C: snow's `std` feature turns on `ring/std` unconditionally (0.10.0), which drags
 # ring and a C toolchain into every build, so the resolver's crates are named one by one instead.
 snow = { version = "0.10", default-features = false, features = [
@@ -34,8 +51,27 @@ snow = { version = "0.10", default-features = false, features = [
   "use-curve25519",
   "use-getrandom",
 ] }
+tally-api-types = { path = "crates/api-types" }
+tally-merge = { path = "crates/merge" }
+tally-mlat = { path = "crates/mlat" }
+tally-mlat-solver = { path = "crates/mlat-solver" }
+tally-relay = { path = "crates/relay" }
 tally-wire = { path = "crates/wire" }
 
 [workspace.lints.clippy]
 unwrap_used = "deny"
 expect_used = "deny"
+
+# The MLAT solver is numerical code, and BLAKE2s is on its hot path (every reception's identity,
+# every ranking and thinning hash): both optimised in every profile, tests too. Unoptimised, the
+# solver's tests take six minutes of CPU (two and a quarter of wall time on four cores) where
+# optimised they take forty seconds (thirteen of wall time), and every engine test that solves
+# pays the same; either alone saves little. Debug assertions and overflow checks stay as the
+# profile has them, and results are the same to the bit either way (the golden test). Bazel says
+# the same: //tally/crates/mlat-solver:BUILD.bazel and the blake2 annotation in
+# //tally:tally.MODULE.bazel.
+[profile.dev.package.tally-mlat-solver]
+opt-level = 2
+
+[profile.dev.package.blake2]
+opt-level = 2

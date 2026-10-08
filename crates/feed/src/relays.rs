@@ -1,41 +1,22 @@
-//! Which relays a feeder publishes to, and each session with one (RFC-0171 §3.5, §3.7).
+//! Which relays a feeder publishes to, and each session with one (RFC-0174 §2.2, RFC-0171 §3.5,
+//! §3.7).
 //!
-//! The rules are fixed here and no relay can change them: a home relay the owner pinned, an
-//! anchor kept across restarts, the rest picked at random from relays the feeder knows of. A relay
-//! that says "leave me" is left, and no slot dials it again until its `retry_after_secs` has
-//! passed; what it suggests instead is only a hint, added to what the feeder knows.
-//!
-//! A relay that is unreachable is retried, never replaced in a hurry, since rushing to fresh relays
-//! during an outage is how a feeder gets surrounded. That holds within fixed bounds, so a relay
-//! that is gone for good does not hold its slot forever. A relay is reached when a session with it
-//! gets to `Welcome`, and stays reached while that session is up; it is unreachable from the last
-//! time it was reached, or, never reached, from when the slot first chose it.
-//!
-//! - A random slot gives up its relay once it has been continuously unreachable for an hour
-//!   (`RANDOM_GIVES_UP`), and picks another; with no other to pick, it keeps retrying.
-//! - The anchor gives up its relay after seven days continuously unreachable (`ANCHOR_GIVES_UP`),
-//!   then a new anchor is chosen and saved; with no other to pick, it keeps retrying. When the
-//!   anchor was last reached is saved beside it, so the seven days run across restarts.
-//! - The home relay is the owner's, and is never given up.
-//!
-//! No relay can hold a slot past those bounds by asking it to wait. A random or anchor slot that is
-//! asked to wait longer than what remains of its bound (a `Goodbye` or a refused handshake with a
-//! long `retry_after_secs`, whatever its reason) takes it as "leave me": the relay is avoided for
-//! its wait and the slot moves on. Every wait between dials is cut to what remains of the bound,
-//! and the bound is checked again after it. The home relay is never given up, so the longest it is
-//! waited for is a day (`HOME_WAITS_AT_MOST`), whatever it asks. A slot with nothing to pick looks
-//! again within `NOTHING_TO_PICK_AT_MOST`, so relays learned meanwhile are not missed.
-//!
-//! When the anchor was last reached is a wall-clock time, and a clock before `PLAUSIBLE_SINCE_MS`
-//! (a board with no real-time clock, booted before it has the time) is not one: no time is saved
-//! while the clock reads earlier than that, and a saved time earlier than that or later than now
-//! is read as unknown, so the anchor's count starts again at this run rather than at 1970.
+//! The rules are fixed here and no relay can change them. Every round (`probe::ROUND_EVERY`) the
+//! feeder measures candidate relays by round-trip time (`probe`), and chooses two from the band by
+//! the shared per-area pick, on two networks, with hysteresis (`selection`). It publishes every
+//! batch to both. The owner's `--relay` and the seeds are candidates, measured and ranked like any
+//! other: nothing is pinned. A relay that fails, refuses or redirects is replaced by the next in
+//! the ranking, dialled after a jitter; with no other to take its place it is retried at the
+//! backoff's pace. A relay that says "leave me" is not dialled again until its `retry_after_secs`
+//! has passed; what it suggests instead is only a hint, added to what the feeder knows. Every few
+//! minutes a delivery check (`delivery_check`) asks the area's sharing group whether a relay's
+//! batches arrived, and a relay found swallowing them is left for days.
 //!
 //! A session ends when the relay stops reading (a send waits at most `noise::WRITE_TIMEOUT`) and
 //! when the reader fails (closed, or silent for `READ_TIMEOUT`), even while a send is pending.
 
-use std::collections::{HashMap, HashSet};
-use std::future::Future;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -43,66 +24,55 @@ use std::time::{Duration, Instant};
 use tally_wire::backoff::Backoff;
 use tally_wire::noise;
 use tally_wire::{
-    Clock, Identity, Location, PublicKey, Reason, ReceiverInfo, Record, RelayAddress, Role,
+    Batch, Clock, DeliveryAnswer, DeliveryQuery, Identity, Location, ProviderOffer, ProviderQuery,
+    PublicKey, Reason, ReceiverInfo, Record, Region, RelayAddress, Role, Streams,
 };
 use tokio::net::TcpStream;
 use tokio::sync::{broadcast, mpsc, watch};
+use tokio::task::JoinSet;
 
+use crate::delivery_check::{self, Checking, DeliveryChecker, SAMPLED, Sent, Verdict};
+use crate::probe::{self, MOST_PER_ROUND, Measured, Probed, Prober, RANDOM_PER_ROUND, ROUND_EVERY};
+use crate::selection::{BandRendezvous, Choice, RelaySelection, failover_jitter};
 use crate::source::{TokenBucket, wall_ms};
 
 const HEARTBEAT: Duration = Duration::from_secs(30);
 const READ_TIMEOUT: Duration = Duration::from_secs(120);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-/// How long a session must stay up to count as having worked, so a later failure is retried soon.
+/// How long a session must stay up to count as having worked: one that fails sooner is a failed
+/// relay, and its place goes to the next; one that worked is dialled again.
 const HEALTHY_SESSION: Duration = Duration::from_secs(60);
-/// How long a random slot's relay may be continuously unreachable before the slot picks another.
-const RANDOM_GIVES_UP: Duration = Duration::from_secs(3_600);
-/// How long the anchor may be continuously unreachable before a new anchor is chosen.
-const ANCHOR_GIVES_UP: Duration = Duration::from_secs(7 * 24 * 3_600);
-/// The longest the home relay is waited for between dials, whatever it asks: it is never given up,
-/// so a relay asking for years would otherwise stop the slot for years.
-const HOME_WAITS_AT_MOST: Duration = Duration::from_secs(24 * 3_600);
-/// How long a slot with no relay to pick waits before looking again, at least.
-const NOTHING_TO_PICK: Duration = Duration::from_secs(60);
-/// And at most, before jitter, however long the relays it could pick asked to be left: relays
-/// learned meanwhile by other slots are then picked up within it.
-const NOTHING_TO_PICK_AT_MOST: Duration = Duration::from_secs(3_600);
-/// 2026-01-01T00:00:00Z in wall-clock milliseconds. A wall clock earlier than this is wrong (this
-/// code did not exist then), as on a board with no real-time clock before it has the time; a time
-/// the anchor was reached is neither saved from such a clock nor believed if it is earlier.
-pub const PLAUSIBLE_SINCE_MS: u64 = 1_767_225_600_000;
 /// The most relays kept from any one source's hints. A relay's own list weighs no more than this,
 /// however long it is.
 const HINTS_PER_SOURCE: usize = 32;
 /// The most learned relays kept in all; past it the oldest learned is forgotten first.
 const HINTS_IN_ALL: usize = 512;
+/// The most offers of the feeder's area kept, the newest of each relay.
+const OFFERS_KEPT: usize = 64;
 /// The state file of learned relays is written at most this often.
 const SAVE_EVERY: Duration = Duration::from_secs(60);
 /// How often a session says how many batches it did not send.
 const REPORT_EVERY: Duration = Duration::from_secs(600);
 /// How often a session re-signs and re-sends the receiver's description, so a relay that forgot it
 /// (a restart, memory pressure) has it back within this long, not at the next change of relays.
+/// The session asks for its area's offers as often.
 const INFO_EVERY: Duration = Duration::from_secs(600);
 /// The least burst a relay's rate limit is given: the largest record one message carries, so a
 /// batch always fits, however small a burst the relay asked for.
 const BURST_FLOOR: u32 = noise::MAX_PLAINTEXT as u32;
+/// Batches remembered with the relays they were written to, for the delivery check: several
+/// minutes at one a second.
+const SENT_KEPT: usize = 512;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SlotKind {
-    Home,
-    Anchor,
-    Random,
-}
-
-/// Where the feeder heard of a relay. A random slot first chooses a source, then a relay within
-/// it, so no one relay's hints outweigh the owner's list, the seeds, or another relay's hints.
+/// Where the feeder heard of a relay. Kept so that one relay's hints never outweigh the owner's
+/// list, the seeds, or another relay's hints in what is remembered.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Source {
     /// The owner named it (`--relay`).
     Configured,
     /// Shipped in the binary.
     Seed,
-    /// Hinted by this relay (`RelayList`, `Redirect`).
+    /// Hinted by this relay (`RelayList`, `Redirect`, a `ProviderOffer` it passed on).
     Learned(PublicKey),
     /// Read from a state file written before sources were kept: learned, from whom unknown.
     Cached,
@@ -119,13 +89,15 @@ struct Known {
     source: Source,
 }
 
-/// What the feeder knows of relays, oldest first, and which each slot holds.
+/// What the feeder knows of relays, oldest first, and which it is using.
 struct Relays {
     known: Vec<Known>,
-    in_use: Vec<Option<RelayAddress>>,
-    /// Relays that said "leave me", and until when no slot may pick them. Shared by every slot, so
-    /// a relay one slot left is not picked straight back by another.
+    held: Vec<PublicKey>,
+    /// Relays that said "leave me", and until when none is dialled.
     avoided: HashMap<PublicKey, tokio::time::Instant>,
+    /// The newest offer of the feeder's area from each relay, verified: the area's sharing group,
+    /// whom the delivery check asks, and the relays probed first.
+    offers: Vec<ProviderOffer>,
     /// Learned relays changed since the state file was last written.
     changed: bool,
 }
@@ -162,50 +134,8 @@ impl Relays {
         }
     }
 
-    fn held(&self) -> Vec<PublicKey> {
-        self.in_use
-            .iter()
-            .flatten()
-            .map(|relay| relay.key)
-            .collect()
-    }
-
-    /// A known relay no slot holds, on a host no slot holds, that has not asked to be left and is
-    /// not `except`: a source chosen uniformly among the sources with such a relay, then one of its
-    /// relays. `random(n)` is below `n`.
-    fn choose(
-        &mut self,
-        now: tokio::time::Instant,
-        except: Option<PublicKey>,
-        mut random: impl FnMut(usize) -> usize,
-    ) -> Option<RelayAddress> {
-        self.avoided.retain(|_, until| *until > now);
-        let keys: HashSet<PublicKey> = self.in_use.iter().flatten().map(|r| r.key).collect();
-        let hosts: HashSet<String> = self.in_use.iter().flatten().map(host).collect();
-        let mut sources: Vec<(Source, Vec<&RelayAddress>)> = Vec::new();
-        for known in &self.known {
-            if keys.contains(&known.relay.key)
-                || hosts.contains(&host(&known.relay))
-                || self.avoided.contains_key(&known.relay.key)
-                || except == Some(known.relay.key)
-            {
-                continue;
-            }
-            match sources
-                .iter_mut()
-                .find(|(source, _)| *source == known.source)
-            {
-                Some((_, relays)) => relays.push(&known.relay),
-                None => sources.push((known.source, vec![&known.relay])),
-            }
-        }
-        if sources.is_empty() {
-            return None;
-        }
-        let (_, relays) = sources.get(random(sources.len()))?;
-        relays
-            .get(random(relays.len()))
-            .map(|relay| (*relay).clone())
+    fn is_avoided(&self, key: &PublicKey, now: tokio::time::Instant) -> bool {
+        self.avoided.get(key).is_some_and(|until| *until > now)
     }
 
     /// The learned relays as the state file keeps them, oldest first: `HOST:PORT=KEY from KEY`, or
@@ -222,21 +152,6 @@ impl Relays {
         }
         text
     }
-}
-
-/// The part of `host:port` that names the machine, so two relays on one machine are one network.
-/// Without DNS it is as near as the feeder can get to the RFC's "distinct networks".
-fn host(relay: &RelayAddress) -> String {
-    relay
-        .address
-        .rsplit_once(':')
-        .map_or(relay.address.as_str(), |(host, _)| host)
-        .to_ascii_lowercase()
-}
-
-/// Whether two relays are on one machine.
-pub fn same_host(one: &RelayAddress, other: &RelayAddress) -> bool {
-    host(one) == host(other)
 }
 
 /// A number below `n`, for choosing among relays.
@@ -258,19 +173,21 @@ pub struct Directory {
 }
 
 impl Directory {
+    /// `configured` are the owner's (`--relay`), `seeds` the binary's: both candidates, never
+    /// pinned.
     pub fn new(
         state_dir: PathBuf,
         configured: Vec<RelayAddress>,
         seeds: Vec<RelayAddress>,
-        slots: usize,
         identity: Identity,
         location: Option<Location>,
         clock: Clock,
     ) -> Result<Arc<Self>, String> {
         let mut relays = Relays {
             known: Vec::new(),
-            in_use: vec![None; slots],
+            held: Vec::new(),
             avoided: HashMap::new(),
+            offers: Vec::new(),
             changed: false,
         };
         for relay in configured {
@@ -297,92 +214,15 @@ impl Directory {
         self.info.subscribe()
     }
 
-    /// The anchor kept from an earlier run, if it is still known.
-    pub fn saved_anchor(&self) -> Option<RelayAddress> {
-        let text = std::fs::read_to_string(self.state_dir.join("anchor")).ok()?;
-        crate::config::parse_relay(text.lines().next()?.trim()).ok()
+    /// The feeder's area (`rendezvous::area_of` its signed location); none without one.
+    pub fn area(&self) -> Option<Region> {
+        self.location
+            .as_ref()
+            .and_then(|location| tally_wire::rendezvous::area_of(location).ok())
     }
 
-    /// How long the saved anchor, if it is `relay`, has been unreachable: since the wall-clock time
-    /// saved beside it. Zero for another relay, for a file from a build that saved no time
-    /// (`HOST:PORT=KEY` alone), and for a time that cannot be right (before `PLAUSIBLE_SINCE_MS`,
-    /// or after now, as when this run's clock is not yet set), whose count starts again at this run.
-    pub fn anchor_unreached_for(&self, relay: &RelayAddress) -> Duration {
-        self.anchor_unreached_at(relay, wall_ms())
-    }
-
-    /// As `anchor_unreached_for`, with the wall clock reading `now_ms`.
-    fn anchor_unreached_at(&self, relay: &RelayAddress, now_ms: u64) -> Duration {
-        let Ok(text) = std::fs::read_to_string(self.state_dir.join("anchor")) else {
-            return Duration::ZERO;
-        };
-        let mut lines = text.lines();
-        let saved = lines
-            .next()
-            .and_then(|line| crate::config::parse_relay(line.trim()).ok());
-        if saved.is_none_or(|saved| saved.key != relay.key) {
-            return Duration::ZERO;
-        }
-        lines
-            .find_map(|line| {
-                line.trim()
-                    .strip_prefix("reached ")?
-                    .trim()
-                    .parse::<u64>()
-                    .ok()
-            })
-            .filter(|reached| (PLAUSIBLE_SINCE_MS..=now_ms).contains(reached))
-            .map_or(Duration::ZERO, |reached| {
-                Duration::from_millis(now_ms - reached)
-            })
-    }
-
-    /// Saves `relay` as the anchor, last reached (or chosen) `unreached_for` ago:
-    /// `HOST:PORT=KEY`, then `reached MS`, the wall-clock milliseconds of that time. With no
-    /// plausible time (the clock, or that time, before `PLAUSIBLE_SINCE_MS`) only the relay is saved,
-    /// and a later run counts from its own start.
-    pub fn save_anchor(&self, relay: &RelayAddress, unreached_for: Duration) {
-        self.save_anchor_at(relay, unreached_for, wall_ms());
-    }
-
-    /// The anchor was reached just now. With a plausible clock that time is saved; without one,
-    /// any older time the file held is wrong now, so only the relay is saved and a later run counts
-    /// from its own start.
-    pub fn anchor_reached_now(&self, relay: &RelayAddress) {
-        self.anchor_reached_at(relay, wall_ms());
-    }
-
-    fn anchor_reached_at(&self, relay: &RelayAddress, now_ms: u64) {
-        let named = format!("{}={}\n", relay.address, relay.key);
-        if now_ms < PLAUSIBLE_SINCE_MS {
-            self.write_state("anchor", &named);
-        } else {
-            self.write_state("anchor", &format!("{named}reached {now_ms}\n"));
-        }
-    }
-
-    /// As `save_anchor`, with the wall clock reading `now_ms`. This is the save when a slot takes an
-    /// anchor, whose reach is unknown yet: with no plausible time, a file that already names this
-    /// relay keeps what it knew.
-    fn save_anchor_at(&self, relay: &RelayAddress, unreached_for: Duration, now_ms: u64) {
-        let lost = u64::try_from(unreached_for.as_millis()).unwrap_or(u64::MAX);
-        let reached = now_ms.saturating_sub(lost);
-        let named = format!("{}={}\n", relay.address, relay.key);
-        if reached < PLAUSIBLE_SINCE_MS {
-            // The clock cannot say when it was last reached. If the file already names this relay,
-            // it already says so, from a run whose clock could: keep it rather than erase it.
-            let path = self.state_dir.join("anchor");
-            if std::fs::read_to_string(path).is_ok_and(|saved| saved.starts_with(&named)) {
-                return;
-            }
-            self.write_state("anchor", &named);
-            return;
-        }
-        self.write_state("anchor", &format!("{named}reached {reached}\n"));
-    }
-
-    /// Adds relays that relay `from` offered. They are hints: they only widen what random slots
-    /// pick from, and at most `HINTS_PER_SOURCE` of them count, its newest.
+    /// Adds relays that relay `from` offered. They are hints: they only widen what is probed, and
+    /// at most `HINTS_PER_SOURCE` of them count, its newest.
     pub fn learn(&self, from: PublicKey, offered: &[RelayAddress]) {
         let Ok(mut relays) = self.relays.lock() else {
             return;
@@ -403,6 +243,129 @@ impl Directory {
         }
     }
 
+    /// An offer relay `from` passed on: kept if it verifies, is alive, and is for the feeder's
+    /// area or a cell above it; its relay is learned, and probed first.
+    pub fn offered(&self, from: PublicKey, offer: ProviderOffer) {
+        let Some(area) = self.area() else {
+            return;
+        };
+        let (Ok(signer), Ok(())) = (offer.signer(), offer.verify()) else {
+            return;
+        };
+        let Ok(content) = offer.content() else {
+            return;
+        };
+        if content.expires_ms <= wall_ms() || !content.cell.contains(area) {
+            return;
+        }
+        self.learn(
+            from,
+            &[RelayAddress {
+                key: signer,
+                address: content.address,
+            }],
+        );
+        let Ok(mut relays) = self.relays.lock() else {
+            return;
+        };
+        relays
+            .offers
+            .retain(|kept| kept.signer().is_ok_and(|kept| kept != signer));
+        relays.offers.push(offer);
+        if relays.offers.len() > OFFERS_KEPT {
+            relays.offers.remove(0);
+        }
+    }
+
+    /// The offers of the feeder's area held now.
+    pub fn offers(&self) -> Vec<ProviderOffer> {
+        let now = wall_ms();
+        self.relays.lock().map_or_else(
+            |_| Vec::new(),
+            |relays| {
+                relays
+                    .offers
+                    .iter()
+                    .filter(|offer| {
+                        offer
+                            .content()
+                            .is_ok_and(|content| content.expires_ms > now)
+                    })
+                    .cloned()
+                    .collect()
+            },
+        )
+    }
+
+    /// The relays to probe this round, at most `MOST_PER_ROUND`: those held, those that offer the
+    /// feeder's area (the one use of where a relay says it is: whom to probe first), the owner's,
+    /// the seeds, and last round's band, in that order, at most `MOST_PER_ROUND - RANDOM_PER_ROUND`
+    /// of them; then the rest of the round at random among the others known, so a relay whose
+    /// offer lies about where it is still gets measured. Relays that
+    /// asked to be left are not probed until their wait has passed.
+    pub fn probe_set(&self, last_band: &[PublicKey]) -> Vec<RelayAddress> {
+        let Ok(relays) = self.relays.lock() else {
+            return Vec::new();
+        };
+        let now = tokio::time::Instant::now();
+        let offering: Vec<PublicKey> = relays
+            .offers
+            .iter()
+            .filter_map(|offer| offer.signer().ok())
+            .collect();
+        let find = |key: &PublicKey| {
+            relays
+                .known
+                .iter()
+                .find(|known| known.relay.key == *key)
+                .map(|known| known.relay.clone())
+        };
+        let mut first: Vec<RelayAddress> = Vec::new();
+        let push = |relay: RelayAddress, into: &mut Vec<RelayAddress>| {
+            if !relays.is_avoided(&relay.key, now) && !into.iter().any(|each| each.key == relay.key)
+            {
+                into.push(relay);
+            }
+        };
+        let ordered = relays
+            .held
+            .iter()
+            .chain(&offering)
+            .filter_map(find)
+            .chain(
+                relays
+                    .known
+                    .iter()
+                    .filter(|known| matches!(known.source, Source::Configured))
+                    .map(|known| known.relay.clone()),
+            )
+            .chain(
+                relays
+                    .known
+                    .iter()
+                    .filter(|known| matches!(known.source, Source::Seed))
+                    .map(|known| known.relay.clone()),
+            )
+            .chain(last_band.iter().filter_map(find));
+        for relay in ordered {
+            push(relay, &mut first);
+        }
+        first.truncate(MOST_PER_ROUND - RANDOM_PER_ROUND);
+        // The rest of the round, at least `RANDOM_PER_ROUND`, at random among the others known.
+        let mut rest: Vec<RelayAddress> = relays
+            .known
+            .iter()
+            .map(|known| known.relay.clone())
+            .filter(|relay| !first.iter().any(|each| each.key == relay.key))
+            .filter(|relay| !relays.is_avoided(&relay.key, now))
+            .collect();
+        while first.len() < MOST_PER_ROUND && !rest.is_empty() {
+            let picked = rest.swap_remove(random_below(rest.len()));
+            first.push(picked);
+        }
+        first
+    }
+
     /// Writes the learned relays if they changed since the last write.
     pub fn save(&self) {
         let text = {
@@ -418,49 +381,20 @@ impl Directory {
         self.write_state("relays", &text);
     }
 
-    /// Picks a random known relay for `slot` and holds it there, in one step, so two slots never
-    /// pick the same relay or two relays on one host.
-    pub fn claim(&self, slot: usize) -> Option<RelayAddress> {
-        self.pick(slot, None)
-    }
-
-    /// As `claim`, for a slot giving up `current`: picks any relay but `current`, and if there is
-    /// none, the slot keeps holding `current`.
-    pub fn replace(&self, slot: usize, current: &RelayAddress) -> Option<RelayAddress> {
-        self.pick(slot, Some(current))
-    }
-
-    fn pick(&self, slot: usize, except: Option<&RelayAddress>) -> Option<RelayAddress> {
-        let mut relays = self.relays.lock().ok()?;
-        let kept = relays.in_use.get_mut(slot).and_then(Option::take);
-        let relay = relays.choose(
-            tokio::time::Instant::now(),
-            except.map(|relay| relay.key),
-            random_below,
-        );
-        let held = match (&relay, except) {
-            (None, Some(_)) => kept,
-            _ => relay.clone(),
-        };
-        if let Some(slot) = relays.in_use.get_mut(slot) {
-            *slot = held;
-        }
-        self.announce(&relays, true);
-        relay
-    }
-
-    /// Records which relay a slot holds, and re-signs the receiver's description to say so.
-    pub fn hold(&self, slot: usize, relay: Option<&RelayAddress>) {
+    /// Records which relays the feeder publishes to, and re-signs the receiver's description to
+    /// say so.
+    pub fn hold(&self, held: &[PublicKey]) {
         let Ok(mut relays) = self.relays.lock() else {
             return;
         };
-        if let Some(held) = relays.in_use.get_mut(slot) {
-            *held = relay.cloned();
+        if relays.held == held {
+            return;
         }
+        relays.held = held.to_vec();
         self.announce(&relays, true);
     }
 
-    /// Keeps every slot off `relay` for `wait`, or the backoff's first wait if that is longer; a
+    /// Keeps the feeder off `relay` for `wait`, or the backoff's first wait if that is longer; a
     /// longer wait already asked for stays.
     pub fn avoid(&self, relay: &PublicKey, wait: Duration) {
         let Ok(mut relays) = self.relays.lock() else {
@@ -471,16 +405,24 @@ impl Directory {
         *entry = (*entry).max(until);
     }
 
-    /// How long until the soonest avoided relay may be picked again, if any is avoided.
-    pub fn avoided_for(&self) -> Option<Duration> {
-        let relays = self.relays.lock().ok()?;
+    /// The relays that asked to be left and whose wait has not passed.
+    pub fn avoided(&self) -> Vec<PublicKey> {
+        let Ok(mut relays) = self.relays.lock() else {
+            return Vec::new();
+        };
         let now = tokio::time::Instant::now();
-        relays
-            .avoided
-            .values()
-            .filter(|until| **until > now)
-            .map(|until| *until - now)
-            .min()
+        relays.avoided.retain(|_, until| *until > now);
+        relays.avoided.keys().copied().collect()
+    }
+
+    /// How long until `relay` may be dialled again; zero if it never asked to be left.
+    pub fn avoided_for(&self, relay: &PublicKey) -> Duration {
+        let now = tokio::time::Instant::now();
+        self.relays
+            .lock()
+            .ok()
+            .and_then(|relays| relays.avoided.get(relay).copied())
+            .map_or(Duration::ZERO, |until| until.saturating_duration_since(now))
     }
 
     /// The receiver's description signed afresh, with a new `issued_ms` and the relays held now.
@@ -494,7 +436,7 @@ impl Directory {
     /// Signs the receiver's description for the relays held now and makes it the latest. It runs
     /// under the relays lock, so the latest is always the newest signed and names what is held.
     fn announce(&self, relays: &Relays, wake: bool) -> Option<Arc<Record>> {
-        match sign_info(&self.identity, self.location, self.clock, &relays.held()) {
+        match sign_info(&self.identity, self.location, self.clock, &relays.held) {
             Ok(info) => {
                 let record = Arc::new(Record::ReceiverInfo(info));
                 let latest = Arc::clone(&record);
@@ -581,242 +523,715 @@ fn sign_info(
     .map_err(|error| error.to_string())
 }
 
+/// An audit: the batches of sequences `first..=last` go to `relay` alone (`delivery_check`).
+#[derive(Clone, Copy, Debug)]
+struct Audit {
+    relay: PublicKey,
+    first: u64,
+    last: u64,
+    /// The audited relay's session ended during the audit: what it was written may not have
+    /// reached it.
+    broken: bool,
+}
+
+/// A batch an audit held back, and the relays it was held back from.
+struct Withheld {
+    batch: Batch,
+    from: Vec<PublicKey>,
+}
+
+#[derive(Default)]
+struct LedgerState {
+    /// The feeder's batches, oldest first, with when each was first written and to whom.
+    sent: VecDeque<(tokio::time::Instant, Sent)>,
+    /// The newest sequence any session has seen.
+    newest: Option<u64>,
+    audit: Option<Audit>,
+    /// What the audit in force has held back.
+    withheld: Vec<Withheld>,
+    /// Batches each relay's session is to send after all: an ended audit's, that the audited
+    /// relay did not carry.
+    owed: HashMap<PublicKey, Vec<Batch>>,
+    /// Relays with a session up.
+    live: HashSet<PublicKey>,
+}
+
+/// Which batch went to which relay, and the audit in force: what the sessions write and the
+/// delivery check reads.
+pub struct Ledger {
+    state: Mutex<LedgerState>,
+    /// Bumped when batches are owed to some session (`take_owed`).
+    owed: watch::Sender<u64>,
+}
+
+impl Default for Ledger {
+    fn default() -> Self {
+        Self {
+            state: Mutex::default(),
+            owed: watch::channel(0).0,
+        }
+    }
+}
+
+impl Ledger {
+    /// Whether the session to `relay` sends `batch`: every batch, except one being audited to
+    /// another relay whose session is up, which is held back (`end_audit`).
+    pub fn routes(&self, relay: &PublicKey, batch: &Batch) -> bool {
+        let Ok(mut state) = self.state.lock() else {
+            return true;
+        };
+        let sequence = batch.sequence();
+        state.newest = Some(state.newest.map_or(sequence, |newest| newest.max(sequence)));
+        let held_back = match state.audit {
+            Some(audit) if (audit.first..=audit.last).contains(&sequence) => {
+                audit.relay != *relay && state.live.contains(&audit.relay)
+            }
+            _ => false,
+        };
+        if held_back {
+            let same = |kept: &&mut Withheld| {
+                kept.batch.sequence() == sequence && kept.batch.boot_id() == batch.boot_id()
+            };
+            match state.withheld.iter_mut().find(same) {
+                Some(kept) => {
+                    if !kept.from.contains(relay) {
+                        kept.from.push(*relay);
+                    }
+                }
+                None => state.withheld.push(Withheld {
+                    batch: batch.clone(),
+                    from: vec![*relay],
+                }),
+            }
+        }
+        !held_back
+    }
+
+    /// The session to `relay` wrote `batch`.
+    pub fn record(&self, relay: PublicKey, batch: &Batch) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        let (boot, sequence) = (batch.boot_id(), batch.sequence());
+        let found =
+            state.sent.iter_mut().rev().find(|(_, sent)| {
+                sent.batch.sequence() == sequence && sent.batch.boot_id() == boot
+            });
+        match found {
+            Some((_, sent)) => {
+                if !sent.relays.contains(&relay) {
+                    sent.relays.push(relay);
+                }
+            }
+            None => {
+                state.sent.push_back((
+                    tokio::time::Instant::now(),
+                    Sent {
+                        batch: batch.clone(),
+                        relays: vec![relay],
+                    },
+                ));
+                if state.sent.len() > SENT_KEPT {
+                    state.sent.pop_front();
+                }
+            }
+        }
+    }
+
+    /// Audits `relay`: the next `SAMPLED` batches go to it alone, until `end_audit`. An audit
+    /// still in force is ended first.
+    pub fn audit(&self, relay: PublicKey) {
+        self.end_audit();
+        if let Ok(mut state) = self.state.lock() {
+            let first = state.newest.map_or(0, |newest| newest + 2);
+            state.audit = Some(Audit {
+                relay,
+                first,
+                last: first + SAMPLED as u64 - 1,
+                broken: false,
+            });
+        }
+    }
+
+    /// Ends the audit in force: every batch it held back that the audited relay's session did not
+    /// write, or every one if that session ended during the audit, is owed to the relays it was
+    /// held back from, so the network has it either way. How many batches are owed.
+    pub fn end_audit(&self) -> usize {
+        let owed = {
+            let Ok(mut state) = self.state.lock() else {
+                return 0;
+            };
+            let Some(audit) = state.audit.take() else {
+                return 0;
+            };
+            let withheld = std::mem::take(&mut state.withheld);
+            let mut owed = 0;
+            for kept in withheld {
+                let carried = !audit.broken
+                    && state.sent.iter().any(|(_, sent)| {
+                        sent.batch.sequence() == kept.batch.sequence()
+                            && sent.batch.boot_id() == kept.batch.boot_id()
+                            && sent.relays.contains(&audit.relay)
+                    });
+                if carried {
+                    continue;
+                }
+                for relay in kept.from {
+                    state
+                        .owed
+                        .entry(relay)
+                        .or_default()
+                        .push(kept.batch.clone());
+                    owed += 1;
+                }
+            }
+            owed
+        };
+        if owed > 0 {
+            self.owed
+                .send_modify(|count| *count = count.wrapping_add(1));
+        }
+        owed
+    }
+
+    /// Bumped whenever batches are owed to some session.
+    pub fn owed_changes(&self) -> watch::Receiver<u64> {
+        self.owed.subscribe()
+    }
+
+    /// The batches owed to `relay`'s session, oldest first; they are its to send now.
+    pub fn take_owed(&self, relay: &PublicKey) -> Vec<Batch> {
+        self.state
+            .lock()
+            .ok()
+            .and_then(|mut state| state.owed.remove(relay))
+            .unwrap_or_default()
+    }
+
+    fn live(&self, relay: PublicKey, up: bool) {
+        if let Ok(mut state) = self.state.lock() {
+            if up {
+                state.live.insert(relay);
+            } else {
+                state.live.remove(&relay);
+                if let Some(audit) = &mut state.audit
+                    && audit.relay == relay
+                {
+                    audit.broken = true;
+                }
+            }
+        }
+    }
+
+    /// The relays with a session up, in key order.
+    fn live_relays(&self) -> Vec<PublicKey> {
+        let mut live: Vec<PublicKey> = self
+            .state
+            .lock()
+            .map(|state| state.live.iter().copied().collect())
+            .unwrap_or_default();
+        live.sort_unstable_by(|one, other| one.as_bytes().cmp(other.as_bytes()));
+        live
+    }
+
+    /// The batches first written at least `settle` ago, oldest first.
+    pub fn settled(&self, settle: Duration) -> Vec<Sent> {
+        let now = tokio::time::Instant::now();
+        self.state.lock().map_or_else(
+            |_| Vec::new(),
+            |state| {
+                state
+                    .sent
+                    .iter()
+                    .filter(|(at, _)| now.saturating_duration_since(*at) >= settle)
+                    .map(|(_, sent)| sent.clone())
+                    .collect()
+            },
+        )
+    }
+}
+
 /// How a session ended.
-enum Outcome {
+#[derive(Debug)]
+pub enum Outcome {
     /// Try the same relay again, after at least this long.
     Retry(Duration),
-    /// The relay asked to be left.
+    /// The relay asked to be left (a redirect, or a goodbye because it is full, leaving, or
+    /// refusing): a declaration, never swallowing.
     Leave(Duration),
 }
 
-/// When a slot's relay was last reached. A session marks it at `Welcome` and again every
-/// `INFO_EVERY` it stays up; after each session the slot asks how long it has been since, to decide
-/// whether to give the relay up. The anchor's is saved beside it at each mark, so a restart does not
-/// start its count again.
-#[derive(Clone)]
-pub struct Reach {
-    unreached: Arc<Mutex<Unreached>>,
-    anchor: Option<(Arc<Directory>, RelayAddress)>,
+/// What a running session and the background work tell the publisher.
+enum Event {
+    Probed(Vec<Probed>),
+    Up {
+        relay: PublicKey,
+        generation: u64,
+    },
+    Ended {
+        relay: PublicKey,
+        generation: u64,
+        ended: Result<Outcome, String>,
+        up_for: Option<Duration>,
+    },
+    Answers {
+        query: DeliveryQuery,
+        answers: Vec<(u32, DeliveryAnswer)>,
+    },
 }
 
-struct Unreached {
-    since: tokio::time::Instant,
-    /// Unreachable time carried in from before `since`: the anchor's, from an earlier run.
-    before: Duration,
+/// Everything the publisher works from.
+pub struct Publishing {
+    pub directory: Arc<Directory>,
+    pub identity: Identity,
+    pub batches: broadcast::Sender<Arc<Record>>,
+    /// The owner's ceiling, bytes a second.
+    pub ceiling: u32,
+    pub checker: DeliveryChecker,
+    /// When the delivery checks run: `Checking::default()`.
+    pub checking: Checking,
+    /// How each candidate is measured each round: `probe::measure`.
+    pub prober: Prober,
 }
 
-impl Reach {
-    fn new(before: Duration, anchor: Option<(Arc<Directory>, RelayAddress)>) -> Self {
-        Self {
-            unreached: Arc::new(Mutex::new(Unreached {
-                since: tokio::time::Instant::now(),
-                before,
-            })),
-            anchor,
-        }
-    }
-
-    /// The relay was reached now.
-    pub fn mark(&self) {
-        if let Ok(mut unreached) = self.unreached.lock() {
-            unreached.since = tokio::time::Instant::now();
-            unreached.before = Duration::ZERO;
-        }
-        if let Some((directory, relay)) = &self.anchor {
-            directory.anchor_reached_now(relay);
-        }
-    }
-
-    fn unreached_for(&self) -> Duration {
-        self.unreached.lock().map_or(Duration::ZERO, |unreached| {
-            unreached.before + unreached.since.elapsed()
-        })
-    }
+/// One session the publisher keeps.
+struct Running {
+    relay: RelayAddress,
+    generation: u64,
+    task: tokio::task::AbortHandle,
+    backoff: Backoff,
 }
 
-/// How long a slot's relay may be continuously unreachable before the slot gives it up; never, for
-/// the owner's home relay.
-fn gives_up_after(kind: SlotKind) -> Option<Duration> {
-    match kind {
-        SlotKind::Home => None,
-        SlotKind::Anchor => Some(ANCHOR_GIVES_UP),
-        SlotKind::Random => Some(RANDOM_GIVES_UP),
-    }
-}
-
-/// One slot of the relay set, for as long as the feeder runs.
-pub async fn slot(
-    index: usize,
-    kind: SlotKind,
-    relay: Option<RelayAddress>,
+/// The publisher's state between events.
+struct Publisher {
     directory: Arc<Directory>,
     identity: Identity,
     batches: broadcast::Sender<Arc<Record>>,
     ceiling: u32,
-) {
-    let sessions = Arc::clone(&directory);
-    let dial = move |current: RelayAddress, reach: Reach| {
-        let identity = identity.clone();
-        let directory = Arc::clone(&sessions);
-        let batches = batches.subscribe();
-        async move { session(&current, &identity, &directory, batches, ceiling, &reach).await }
+    checker: DeliveryChecker,
+    checking: Checking,
+    prober: Prober,
+    area: Option<Region>,
+    ledger: Arc<Ledger>,
+    selection: BandRendezvous,
+    sessions: HashMap<PublicKey, Running>,
+    /// Where each relay's last probe reached it: the observed half of telling networks apart
+    /// (`rendezvous::distinct_networks`) for the members a delivery check asks.
+    observed: HashMap<PublicKey, IpAddr>,
+    last_band: Vec<PublicKey>,
+    generation: u64,
+    events: mpsc::Sender<Event>,
+    tasks: JoinSet<()>,
+}
+
+/// Publishes the feeder's batches for as long as it runs: probes every round, chooses, keeps a
+/// session with each relay chosen, fails over, and checks delivery.
+pub async fn run(publishing: Publishing) {
+    let (events, mut inbox) = mpsc::channel(64);
+    let area = publishing.directory.area();
+    let mut publisher = Publisher {
+        directory: publishing.directory,
+        identity: publishing.identity,
+        batches: publishing.batches,
+        ceiling: publishing.ceiling,
+        checker: publishing.checker,
+        checking: publishing.checking,
+        prober: publishing.prober,
+        area,
+        ledger: Arc::new(Ledger::default()),
+        selection: BandRendezvous::new(),
+        sessions: HashMap::new(),
+        observed: HashMap::new(),
+        last_band: Vec::new(),
+        generation: 0,
+        events,
+        tasks: JoinSet::new(),
     };
-    run_slot(index, kind, relay, &directory, dial).await;
-}
-
-/// The slot's rules, apart from how a session with a relay runs.
-async fn run_slot<F, S>(
-    index: usize,
-    kind: SlotKind,
-    mut relay: Option<RelayAddress>,
-    directory: &Arc<Directory>,
-    mut dial: F,
-) where
-    F: FnMut(RelayAddress, Reach) -> S,
-    S: Future<Output = Result<Outcome, String>>,
-{
-    let mut backoff = Backoff::new();
-    // The relay the slot is on and when it was last reached, kept until the slot moves.
-    let mut on: Option<(PublicKey, Reach)> = None;
+    let mut round = tokio::time::interval(ROUND_EVERY);
+    let mut probing = false;
+    let every = publisher.checking.every;
+    let mut check = tokio::time::interval_at(tokio::time::Instant::now() + jittered(every), every);
+    check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // The check in progress: the stage it is in, and when that stage is over.
+    let mut stage: Option<(Stage, tokio::time::Instant)> = None;
     loop {
-        let current = match relay.clone() {
-            Some(current) => {
-                directory.hold(index, Some(&current));
-                current
+        let due = stage.map(|(_, due)| due);
+        tokio::select! {
+            _ = round.tick(), if !probing => {
+                probing = true;
+                publisher.probe_round();
             }
-            None => match directory.claim(index) {
-                Some(current) => current,
-                None => {
-                    // Nothing to pick, perhaps because every relay asked to be left: wait until
-                    // the soonest of those may be picked again, never less than a minute, and
-                    // never more than an hour, so a relay learned meanwhile is not missed.
-                    let left = directory.avoided_for().unwrap_or_default();
-                    let wait = left.clamp(NOTHING_TO_PICK, NOTHING_TO_PICK_AT_MOST);
-                    tokio::time::sleep(jittered(wait)).await;
-                    continue;
+            // One check at a time: the next begins once the last is judged or dropped.
+            _ = check.tick(), if publisher.area.is_some() && stage.is_none()
+                && !publisher.checker.in_progress() => {
+                if publisher.begin_check() {
+                    let over = tokio::time::Instant::now() + publisher.checking.audit_for;
+                    stage = Some((Stage::Auditing, over));
                 }
-            },
-        };
-        relay = Some(current.clone());
-        let reach = match &on {
-            Some((key, reach)) if *key == current.key => reach.clone(),
-            _ => {
-                let reach = if kind == SlotKind::Anchor {
-                    // The saved anchor carries its unreachable time over from the last run; a new
-                    // one starts at zero. Either way the file now names it.
-                    let before = directory.anchor_unreached_for(&current);
-                    directory.save_anchor(&current, before);
-                    Reach::new(before, Some((Arc::clone(directory), current.clone())))
-                } else {
-                    Reach::new(Duration::ZERO, None)
+            }
+            _ = sleep_until(due), if due.is_some() => {
+                stage = match stage {
+                    Some((Stage::Auditing, _)) => {
+                        publisher.ledger.end_audit();
+                        let asked = tokio::time::Instant::now() + publisher.checking.settle;
+                        Some((Stage::Settling, asked))
+                    }
+                    _ => {
+                        publisher.ask_members();
+                        None
+                    }
                 };
-                on = Some((current.key, reach.clone()));
-                reach
             }
-        };
-        let started = tokio::time::Instant::now();
-        let outcome = dial(current.clone(), reach.clone()).await;
-        // A session that stayed up was a success: the next wait starts from the shortest again,
-        // as it would for a first try, and only a relay's own retry_after lengthens it.
-        if started.elapsed() >= HEALTHY_SESSION {
-            backoff.reset();
-        }
-        let bound = gives_up_after(kind);
-        let outcome = match outcome {
-            // A slot that would give its relay up is not held past that by a relay asking it to
-            // wait: a wait longer than what remains of the bound is "leave me".
-            Ok(Outcome::Retry(wait))
-                if bound
-                    .is_some_and(|bound| wait > bound.saturating_sub(reach.unreached_for())) =>
-            {
-                Ok(Outcome::Leave(wait))
-            }
-            outcome => outcome,
-        };
-        match outcome {
-            // What remains is honoured, as the home relay's is up to a day; the sleep is cut below.
-            Ok(Outcome::Retry(wait)) => backoff.at_least(wait),
-            Ok(Outcome::Leave(wait)) => {
-                directory.avoid(&current.key, wait);
-                // Only the owner's home relay is kept through a "leave me", and waited for; an
-                // anchor that retires is replaced, and the new one saved. A slot moves to another
-                // relay at once, since the one it left is avoided for as long as it asked.
-                if kind != SlotKind::Home {
-                    relay = None;
-                    directory.hold(index, None);
-                    backoff.reset();
-                    continue;
+            Some(event) = inbox.recv() => {
+                if matches!(event, Event::Probed(_)) {
+                    probing = false;
                 }
-                backoff.at_least(wait);
+                publisher.handle(event);
             }
-            Err(error) => eprintln!("tally-feed: relay {}: {error}", current.address),
+            Some(_) = publisher.tasks.join_next(), if !publisher.tasks.is_empty() => {}
         }
-        if let Some(next) = give_up(index, kind, &current, &reach, directory) {
-            relay = Some(next);
-            backoff.reset();
-            continue;
-        }
-        // The wait is cut to what remains of the bound, and the bound checked again after it; once
-        // past the bound with no other relay to pick, the slot keeps retrying at the backoff's pace.
-        let wait = backoff.wait();
-        let wait = match bound.map(|bound| bound.saturating_sub(reach.unreached_for())) {
-            Some(left) if !left.is_zero() => wait.min(left),
-            Some(_) => wait,
-            None => wait.min(HOME_WAITS_AT_MOST),
+    }
+}
+
+/// A delivery check's stages: the audit holds batches back from the other relay; then the group
+/// is given time to carry them; then its members are asked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Stage {
+    Auditing,
+    Settling,
+}
+
+async fn sleep_until(due: Option<tokio::time::Instant>) {
+    match due {
+        Some(due) => tokio::time::sleep_until(due).await,
+        None => std::future::pending().await,
+    }
+}
+
+impl Publisher {
+    /// Probes this round's candidates at once, and reports what came back.
+    fn probe_round(&mut self) {
+        let candidates = self.directory.probe_set(&self.last_band);
+        let identity = self.identity.clone();
+        let events = self.events.clone();
+        let prober = self.prober;
+        self.tasks.spawn(async move {
+            let mut probes = JoinSet::new();
+            for relay in candidates {
+                probes.spawn(prober(relay, identity.clone()));
+            }
+            let mut probed = Vec::new();
+            while let Some(done) = probes.join_next().await {
+                if let Ok(Ok(result)) = done {
+                    probed.push(result);
+                }
+            }
+            let _ = events.send(Event::Probed(probed)).await;
+        });
+    }
+
+    /// The members of the feeder's area to ask about batches sent to `checked`.
+    fn members(&self, checked: &[PublicKey]) -> Vec<delivery_check::Member> {
+        let Some(area) = self.area else {
+            return Vec::new();
         };
-        tokio::time::sleep(wait).await;
-        if let Some(next) = give_up(index, kind, &current, &reach, directory) {
-            relay = Some(next);
-            backoff.reset();
+        delivery_check::members(
+            &self.directory.offers(),
+            area,
+            checked,
+            &self.observed,
+            wall_ms(),
+        )
+    }
+
+    /// Begins a check: audits the next relay with a session up that the area has members to ask
+    /// about. False when there is none, and nothing is held back.
+    fn begin_check(&mut self) -> bool {
+        let live = self.ledger.live_relays();
+        let held: Vec<PublicKey> = live
+            .into_iter()
+            .filter(|relay| self.sessions.contains_key(relay))
+            .collect();
+        let offers = self.directory.offers();
+        let Some(area) = self.area else {
+            return false;
+        };
+        let now = wall_ms();
+        let observed = &self.observed;
+        let audited = self.checker.audit(&held, |relay| {
+            !delivery_check::members(&offers, area, &[*relay], observed, now).is_empty()
+        });
+        match audited {
+            Some(relay) => {
+                self.ledger.audit(relay);
+                true
+            }
+            None => false,
         }
     }
-}
 
-/// Gives up `current` for another relay if it has been unreachable past its slot's bound and there
-/// is another to pick; with none, the slot keeps it.
-fn give_up(
-    index: usize,
-    kind: SlotKind,
-    current: &RelayAddress,
-    reach: &Reach,
-    directory: &Directory,
-) -> Option<RelayAddress> {
-    let unreached = reach.unreached_for();
-    if gives_up_after(kind).is_none_or(|bound| unreached < bound) {
-        return None;
+    /// Asks the area's members about the audited batches, once they have settled.
+    fn ask_members(&mut self) {
+        let recent = self.ledger.settled(self.checking.settle);
+        let Some(query) = self.checker.sample(&recent) else {
+            self.checker.abandon();
+            return;
+        };
+        let members = self.members(&self.checker.checked_relays());
+        if members.is_empty() {
+            self.checker.abandon();
+            return;
+        }
+        let identity = self.identity.clone();
+        let events = self.events.clone();
+        self.tasks.spawn(async move {
+            let mut asking = JoinSet::new();
+            for member in members {
+                let (identity, query) = (identity.clone(), query.clone());
+                asking.spawn(async move {
+                    delivery_check::ask(&member.relay, &identity, &query)
+                        .await
+                        .map(|answer| (member.network, answer))
+                });
+            }
+            let mut answers = Vec::new();
+            while let Some(done) = asking.join_next().await {
+                if let Ok(Some(answer)) = done {
+                    answers.push(answer);
+                }
+            }
+            let _ = events.send(Event::Answers { query, answers }).await;
+        });
     }
-    let next = directory.replace(index, current)?;
-    eprintln!(
-        "tally-feed: relay {} unreachable for {} minutes; trying {} instead",
-        current.address,
-        unreached.as_secs() / 60,
-        next.address
-    );
-    Some(next)
+
+    fn handle(&mut self, event: Event) {
+        match event {
+            Event::Probed(probed) => {
+                let mut measured: Vec<Measured> = Vec::new();
+                for each in probed {
+                    self.directory.learn(each.measured.relay.key, &each.hints);
+                    if let Some(host) = each.measured.observed {
+                        self.observed.insert(each.measured.relay.key, host);
+                    }
+                    measured.push(each.measured);
+                }
+                self.last_band = probe::band(&measured)
+                    .iter()
+                    .map(|each| each.relay.key)
+                    .collect();
+                let avoid = self.avoid();
+                let choice = self.selection.choose(self.area, &measured, &avoid);
+                self.apply(&choice, false);
+            }
+            Event::Up { relay, generation } => {
+                if let Some(running) = self.sessions.get(&relay)
+                    && running.generation == generation
+                {
+                    self.ledger.live(relay, true);
+                }
+            }
+            Event::Ended {
+                relay,
+                generation,
+                ended,
+                up_for,
+            } => self.ended(relay, generation, ended, up_for),
+            Event::Answers { query, answers } => {
+                if let Verdict::Swallowed(swallowers) = self.checker.judge(&query, &answers) {
+                    for swallower in swallowers {
+                        eprintln!(
+                            "tally-feed: relay {swallower} did not deliver this feeder's batches \
+                             to its area; leaving it for {} days",
+                            delivery_check::AVOID_FOR.as_secs() / 86_400
+                        );
+                        let choice = self.selection.left(&swallower);
+                        self.apply(&choice, true);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Relays not to choose: those remembered as swallowing, and those that asked to be left.
+    fn avoid(&self) -> Vec<PublicKey> {
+        let mut avoid = self.checker.avoided();
+        avoid.extend(self.directory.avoided());
+        avoid
+    }
+
+    fn ended(
+        &mut self,
+        relay: PublicKey,
+        generation: u64,
+        ended: Result<Outcome, String>,
+        up_for: Option<Duration>,
+    ) {
+        let Some(mut running) = self
+            .sessions
+            .remove(&relay)
+            .filter(|running| running.generation == generation)
+        else {
+            return;
+        };
+        self.ledger.live(relay, false);
+        // Whatever ended it, an audit of it in progress says nothing.
+        self.checker.session_ended(relay);
+        let healthy = up_for.is_some_and(|up| up >= HEALTHY_SESSION);
+        if healthy {
+            running.backoff.reset();
+        }
+        let choice = match ended {
+            Ok(Outcome::Leave(wait)) => {
+                self.directory.avoid(&relay, wait);
+                self.selection.failed(&relay)
+            }
+            Ok(Outcome::Retry(wait)) if healthy => {
+                running.backoff.at_least(wait);
+                self.redial(running);
+                return;
+            }
+            Ok(Outcome::Retry(wait)) => {
+                running.backoff.at_least(wait);
+                self.selection.failed(&relay)
+            }
+            Err(error) => {
+                eprintln!("tally-feed: relay {}: {error}", running.relay.address);
+                if healthy {
+                    self.redial(running);
+                    return;
+                }
+                self.selection.failed(&relay)
+            }
+        };
+        if choice.keys().contains(&relay) {
+            // No other relay can take its place: the same one again, at the backoff's pace.
+            self.redial(running);
+        }
+        self.apply(&choice, true);
+    }
+
+    /// Dials `running`'s relay again after its backoff's wait.
+    fn redial(&mut self, mut running: Running) {
+        let wait = running
+            .backoff
+            .wait()
+            .max(self.directory.avoided_for(&running.relay.key));
+        let backoff = std::mem::take(&mut running.backoff);
+        self.start(running.relay, wait, backoff);
+    }
+
+    /// Makes the sessions follow `choice`: those no longer chosen end, those newly chosen start
+    /// (after a jitter when they take a failed relay's place).
+    fn apply(&mut self, choice: &Choice, failover: bool) {
+        let wanted = choice.keys();
+        let gone: Vec<PublicKey> = self
+            .sessions
+            .keys()
+            .filter(|key| !wanted.contains(key))
+            .copied()
+            .collect();
+        for key in gone {
+            if let Some(running) = self.sessions.remove(&key) {
+                running.task.abort();
+                self.ledger.live(key, false);
+            }
+        }
+        for relay in choice.relays() {
+            if self.sessions.contains_key(&relay.key) {
+                continue;
+            }
+            let jitter = if failover {
+                failover_jitter()
+            } else {
+                Duration::ZERO
+            };
+            let wait = jitter.max(self.directory.avoided_for(&relay.key));
+            self.start(relay, wait, Backoff::new());
+        }
+        self.directory.hold(&wanted);
+    }
+
+    fn start(&mut self, relay: RelayAddress, wait: Duration, backoff: Backoff) {
+        self.generation += 1;
+        let generation = self.generation;
+        let context = Context {
+            relay: relay.clone(),
+            directory: Arc::clone(&self.directory),
+            ledger: Arc::clone(&self.ledger),
+            ceiling: self.ceiling,
+            area: self.area,
+        };
+        let identity = self.identity.clone();
+        let batches = self.batches.subscribe();
+        let events = self.events.clone();
+        let task = self.tasks.spawn(async move {
+            tokio::time::sleep(wait).await;
+            let key = context.relay.key;
+            let (ended, up_for) = session(&context, &identity, batches, || {
+                let _ = events.try_send(Event::Up {
+                    relay: key,
+                    generation,
+                });
+            })
+            .await;
+            let _ = events
+                .send(Event::Ended {
+                    relay: key,
+                    generation,
+                    ended,
+                    up_for,
+                })
+                .await;
+        });
+        self.sessions.insert(
+            relay.key,
+            Running {
+                relay,
+                generation,
+                task,
+                backoff,
+            },
+        );
+    }
 }
 
-async fn session(
-    relay: &RelayAddress,
-    identity: &Identity,
-    directory: &Directory,
-    mut batches: broadcast::Receiver<Arc<Record>>,
+/// What one session works with.
+struct Context {
+    relay: RelayAddress,
+    directory: Arc<Directory>,
+    ledger: Arc<Ledger>,
     ceiling: u32,
-    reach: &Reach,
-) -> Result<Outcome, String> {
-    let stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(&relay.address))
-        .await
-        .map_err(|_| "connect timed out".to_owned())?
-        .map_err(|error| error.to_string())?;
+    area: Option<Region>,
+}
+
+/// One session with a relay: how it ended, and how long it was up (none if it never was).
+async fn session(
+    context: &Context,
+    identity: &Identity,
+    batches: broadcast::Receiver<Arc<Record>>,
+    up: impl FnOnce(),
+) -> (Result<Outcome, String>, Option<Duration>) {
+    let relay = &context.relay;
+    let stream =
+        match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(&relay.address)).await {
+            Ok(Ok(stream)) => stream,
+            Ok(Err(error)) => return (Err(error.to_string()), None),
+            Err(_) => return (Err("connect timed out".to_owned()), None),
+        };
     let session = match noise::connect(stream, identity, &relay.key, Role::Feeder).await {
         Ok(session) => session,
         Err(tally_wire::WireError::Refused {
             reason,
             retry_after_secs,
-        }) => return Ok(goodbye(reason, retry_after_secs)),
-        Err(error) => return Err(error.to_string()),
+        }) => return (Ok(goodbye(reason, retry_after_secs)), None),
+        Err(error) => return (Err(error.to_string()), None),
     };
-    reach.mark();
-    eprintln!("tally-feed: publishing to {}", relay.address);
+    let began = tokio::time::Instant::now();
+    up();
+    eprintln!(
+        "tally-feed: publishing to {} (version {})",
+        relay.address, session.version
+    );
     let (mut reader, mut writer) = (session.reader, session.writer);
     // The reader runs on its own: a read cut short by a select would lose its bytes.
     let (records_in, mut records) = mpsc::channel(16);
@@ -834,18 +1249,9 @@ async fn session(
             }
         }
     });
-    let result = publish(
-        relay,
-        &mut writer,
-        &mut records,
-        &mut batches,
-        directory,
-        ceiling,
-        reach,
-    )
-    .await;
+    let ended = publish(context, &mut writer, &mut records, batches).await;
     reading.abort();
-    result
+    (ended, Some(began.elapsed()))
 }
 
 /// How much one relay session sends of what the batcher sealed. The owner's ceiling is kept once,
@@ -887,15 +1293,16 @@ impl Pace {
     }
 }
 
+type Inbound = mpsc::Receiver<Result<Vec<Record>, String>>;
+
 /// One session's sending half, with what the relay says while it sends. Every send is raced against
 /// the reader, so a reader that fails (closed, silent too long) or a relay that says goodbye ends
 /// the session at once, even while a send waits on a relay that stopped reading. A send cut short
 /// leaves the writer mid-frame, which is why the session then ends.
 struct Link<'a, S> {
-    relay: &'a RelayAddress,
+    context: &'a Context,
     writer: &'a mut noise::Writer<S>,
-    records: &'a mut mpsc::Receiver<Result<Vec<Record>, String>>,
-    directory: &'a Directory,
+    records: &'a mut Inbound,
     pace: Pace,
 }
 
@@ -905,16 +1312,52 @@ impl<S: tokio::io::AsyncWrite> Link<'_, S> {
     where
         R: std::borrow::Borrow<Record> + Sync,
     {
-        let sending = self.writer.send(out);
-        tokio::pin!(sending);
-        loop {
-            tokio::select! {
-                sent = &mut sending => return sent.map(|()| None).map_err(|error| error.to_string()),
-                got = self.records.recv() => {
-                    if let Some(outcome) = heard(self.relay, self.directory, &mut self.pace, got)? {
-                        return Ok(Some(outcome));
+        let sent = {
+            let sending = self.writer.send(out);
+            tokio::pin!(sending);
+            loop {
+                tokio::select! {
+                    sent = &mut sending => break sent,
+                    got = self.records.recv() => {
+                        if let Some(outcome) = heard(self.context, &mut self.pace, got)? {
+                            return Ok(Some(outcome));
+                        }
                     }
                 }
+            }
+        };
+        match sent {
+            Ok(()) => Ok(None),
+            Err(tally_wire::WireError::Io(error)) => self.farewell_or(error.to_string()).await,
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
+    /// Sends what an ended audit owes this relay (`Ledger::end_audit`): batches the audited relay
+    /// did not carry, which this session held back. Few, so they go whatever the relay's pace.
+    async fn send_owed(&mut self) -> Result<Option<Outcome>, String> {
+        let relay = self.context.relay.key;
+        for batch in self.context.ledger.take_owed(&relay) {
+            let record = Arc::new(Record::Batch(batch.clone()));
+            if let Some(outcome) = self.send(&[record]).await? {
+                return Ok(Some(outcome));
+            }
+            self.context.ledger.record(relay, &batch);
+        }
+        Ok(None)
+    }
+
+    /// The socket failed under a send. A relay that says goodbye closes at once, and closing over
+    /// batches it has not read resets the connection, so the reset can reach the writer before the
+    /// reader has passed the goodbye on. The goodbye is in order ahead of the reset on the read
+    /// side, which a dead socket ends promptly, so the reader is drained: the relay's farewell is
+    /// the outcome if it said one, and the send's `error` only if it did not.
+    async fn farewell_or(&mut self, error: String) -> Result<Option<Outcome>, String> {
+        loop {
+            match heard(self.context, &mut self.pace, self.records.recv().await) {
+                Ok(Some(outcome)) => return Ok(Some(outcome)),
+                Ok(None) => {}
+                Err(_) => return Err(error),
             }
         }
     }
@@ -923,15 +1366,16 @@ impl<S: tokio::io::AsyncWrite> Link<'_, S> {
 /// Acts on what the reader passed on; `Some` if the relay ended the session, an error if the
 /// reader failed or ended.
 fn heard(
-    relay: &RelayAddress,
-    directory: &Directory,
+    context: &Context,
     pace: &mut Pace,
     got: Option<Result<Vec<Record>, String>>,
 ) -> Result<Option<Outcome>, String> {
     let got = got.ok_or_else(|| "reader ended".to_owned())??;
+    let relay = &context.relay;
     for record in got {
         match record {
-            Record::RelayList(relays) => directory.learn(relay.key, &relays),
+            Record::RelayList(relays) => context.directory.learn(relay.key, &relays),
+            Record::ProviderOffer(offer) => context.directory.offered(relay.key, offer),
             Record::RateLimit {
                 bytes_per_sec,
                 burst,
@@ -940,7 +1384,7 @@ fn heard(
                 retry_after_secs,
                 hints,
             } => {
-                directory.learn(relay.key, &hints);
+                context.directory.learn(relay.key, &hints);
                 return Ok(Some(Outcome::Leave(Duration::from_secs(
                     retry_after_secs.into(),
                 ))));
@@ -955,25 +1399,37 @@ fn heard(
     Ok(None)
 }
 
+/// "Who offers my area?": the relay's answer is the area's sharing group.
+fn ask_offers(context: &Context) -> Option<Record> {
+    let cell = context.area?;
+    Some(Record::ProviderQuery(ProviderQuery {
+        cell,
+        products: Streams::RAW,
+    }))
+}
+
 async fn publish<S: tokio::io::AsyncWrite>(
-    relay: &RelayAddress,
+    context: &Context,
     writer: &mut noise::Writer<S>,
-    records: &mut mpsc::Receiver<Result<Vec<Record>, String>>,
-    batches: &mut broadcast::Receiver<Arc<Record>>,
-    directory: &Directory,
-    ceiling: u32,
-    reach: &Reach,
+    records: &mut Inbound,
+    mut batches: broadcast::Receiver<Arc<Record>>,
 ) -> Result<Outcome, String> {
+    let relay = &context.relay;
+    let directory = &context.directory;
     let mut link = Link {
-        relay,
+        context,
         writer,
         records,
-        directory,
-        pace: Pace::new(ceiling),
+        pace: Pace::new(context.ceiling),
     };
     let mut info = directory.info();
-    let first = Arc::clone(&info.borrow_and_update());
-    if let Some(outcome) = link.send(&[first]).await? {
+    let mut owed = context.ledger.owed_changes();
+    let mut first = vec![Arc::clone(&info.borrow_and_update())];
+    first.extend(ask_offers(context).map(Arc::new));
+    if let Some(outcome) = link.send(&first).await? {
+        return Ok(outcome);
+    }
+    if let Some(outcome) = link.send_owed().await? {
         return Ok(outcome);
     }
     let mut lagged = 0u64;
@@ -987,8 +1443,14 @@ async fn publish<S: tokio::io::AsyncWrite>(
             batch = batches.recv() => match batch {
                 Ok(batch) => {
                     let Record::Batch(signed) = &*batch else { continue };
-                    if link.pace.admit(signed.as_bytes().len(), Instant::now()) {
-                        link.send(&[batch]).await?
+                    if !context.ledger.routes(&relay.key, signed) {
+                        None
+                    } else if link.pace.admit(signed.as_bytes().len(), Instant::now()) {
+                        let ended = link.send(&[Arc::clone(&batch)]).await?;
+                        if ended.is_none() {
+                            context.ledger.record(relay.key, signed);
+                        }
+                        ended
                     } else {
                         None
                     }
@@ -1008,14 +1470,14 @@ async fn publish<S: tokio::io::AsyncWrite>(
                     None
                 }
             }
+            changed = owed.changed() => {
+                if changed.is_ok() { link.send_owed().await? } else { None }
+            }
             _ = heartbeat.tick() => link.send(&[Record::Heartbeat]).await?,
             _ = refresh.tick() => {
-                // Still up, so still reached.
-                reach.mark();
-                match directory.resign() {
-                    Some(fresh) => link.send(&[fresh]).await?,
-                    None => None,
-                }
+                let mut out: Vec<Arc<Record>> = directory.resign().into_iter().collect();
+                out.extend(ask_offers(context).map(Arc::new));
+                if out.is_empty() { None } else { link.send(&out).await? }
             }
             _ = report.tick() => {
                 if link.pace.skipped > 0 || lagged > 0 {
@@ -1029,7 +1491,7 @@ async fn publish<S: tokio::io::AsyncWrite>(
                 }
                 None
             }
-            got = link.records.recv() => heard(relay, directory, &mut link.pace, got)?,
+            got = link.records.recv() => heard(context, &mut link.pace, got)?,
         };
         if let Some(outcome) = ended {
             return Ok(outcome);
@@ -1037,17 +1499,19 @@ async fn publish<S: tokio::io::AsyncWrite>(
     }
 }
 
-/// `wait` with the backoff's jitter, so feeders a relay sent away together do not return together.
+/// `wait` with the backoff's jitter, so feeders started together do not check together.
 fn jittered(wait: Duration) -> Duration {
     let mut backoff = Backoff::new();
     backoff.at_least(wait);
     backoff.wait()
 }
 
+/// A relay closing a session or refusing one. Full, leaving or refusing is "leave me": the relay
+/// declared it will not carry this feeder now. Anything else is retried.
 fn goodbye(reason: Reason, retry_after_secs: u32) -> Outcome {
     let wait = Duration::from_secs(retry_after_secs.into());
     match reason {
-        Reason::Leaving | Reason::Refused => Outcome::Leave(wait),
+        Reason::Full | Reason::Leaving | Reason::Refused => Outcome::Leave(wait),
         _ => Outcome::Retry(wait),
     }
 }
@@ -1084,14 +1548,12 @@ mod tests {
     fn directory_at(
         state_dir: PathBuf,
         configured: Vec<RelayAddress>,
-        slots: usize,
     ) -> Result<Arc<Directory>, String> {
         let identity = Identity::generate().map_err(|error| error.to_string())?;
         Directory::new(
             state_dir,
             configured,
             Vec::new(),
-            slots,
             identity,
             None,
             Clock::Dump1090,
@@ -1109,7 +1571,7 @@ mod tests {
 
     #[test]
     fn one_relays_hints_are_capped_and_all_hints_are_capped() -> Result<(), String> {
-        let directory = directory_at(scratch(), relays("owner", 2)?, 4)?;
+        let directory = directory_at(scratch(), relays("owner", 2)?)?;
         let flooder = key()?;
         let flood = relays("flood", 1_000)?;
         directory.learn(flooder, &flood);
@@ -1136,41 +1598,6 @@ mod tests {
     }
 
     #[test]
-    fn a_random_slot_weighs_each_source_as_one() -> Result<(), String> {
-        let owner = relay("owner.example:10900")?;
-        let directory = directory_at(scratch(), vec![owner.clone()], 1)?;
-        directory.learn(key()?, &relays("hinted", HINTS_PER_SOURCE)?);
-        let trials = 4_000;
-        let mut owners = 0;
-        for _ in 0..trials {
-            if directory.claim(0).as_ref() == Some(&owner) {
-                owners += 1;
-            }
-        }
-        // Uniform over relays would pick the owner's 1 time in 33; by source it is 1 in 2.
-        assert!((1_600..=2_400).contains(&owners), "{owners} of {trials}");
-        Ok(())
-    }
-
-    #[test]
-    fn no_two_slots_hold_relays_on_one_host() -> Result<(), String> {
-        let one = relay("Relay.Example:10900")?;
-        let two = relay("relay.example:10901")?;
-        let other = relay("other.example:10900")?;
-        let directory = directory_at(scratch(), vec![one, two], 3)?;
-        assert!(directory.claim(0).is_some());
-        assert!(directory.claim(1).is_none(), "a second relay on one host");
-        directory.learn(key()?, std::slice::from_ref(&other));
-        assert_eq!(directory.claim(1), Some(other));
-        assert!(directory.claim(2).is_none());
-        // A held relay's host stays out of reach too.
-        let fresh = directory_at(scratch(), vec![relay("home.example:1")?], 2)?;
-        fresh.hold(0, Some(&relay("home.example:2")?));
-        assert!(fresh.claim(1).is_none());
-        Ok(())
-    }
-
-    #[test]
     fn learned_relays_are_saved_with_their_source() -> Result<(), String> {
         let state = scratch();
         let hinter = key()?;
@@ -1183,15 +1610,73 @@ mod tests {
             format!("{}={}\n", old.address, old.key),
         )
         .map_err(|error| error.to_string())?;
-        let first = directory_at(state.clone(), relays("owner", 1)?, 4)?;
+        let first = directory_at(state.clone(), relays("owner", 1)?)?;
         first.learn(hinter, &hinted);
         first.save();
-        let again = directory_at(state.clone(), Vec::new(), 4)?;
+        let again = directory_at(state.clone(), Vec::new())?;
         assert_eq!(from(&again, Source::Learned(hinter)), hinted);
         assert_eq!(from(&again, Source::Cached), vec![old]);
         // The owner's relays come from the command line each run, never from the file.
         assert!(from(&again, Source::Configured).is_empty());
         std::fs::remove_dir_all(&state).map_err(|error| error.to_string())
+    }
+
+    #[test]
+    fn the_owners_relay_and_the_seeds_are_probed_first_never_pinned() -> Result<(), String> {
+        let owner = relays("owner", 2)?;
+        let directory = directory_at(scratch(), owner.clone())?;
+        directory.learn(key()?, &relays("learned", 30)?);
+        let set = directory.probe_set(&[]);
+        assert_eq!(set.len(), MOST_PER_ROUND);
+        assert_eq!(set[..2], owner[..]);
+        // Asked to leave, the owner's relay is not probed until its wait has passed.
+        directory.avoid(&owner[0].key, Duration::from_secs(600));
+        assert!(
+            !directory
+                .probe_set(&[])
+                .iter()
+                .any(|relay| relay.key == owner[0].key)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_relay_hiding_behind_a_lying_location_is_still_probed() -> Result<(), String> {
+        // Many relays outrank it for the first places (the owner's, last round's band), and it
+        // offers no cell near the feeder: the random places still find it within a few rounds.
+        let directory = directory_at(scratch(), relays("owner", 3)?)?;
+        let band: Vec<RelayAddress> = relays("band", 20)?;
+        directory.learn(key()?, &band[..10]);
+        directory.learn(key()?, &band[10..]);
+        let hidden = relay("close-but-says-far.example:10900")?;
+        directory.learn(key()?, std::slice::from_ref(&hidden));
+        let band_keys: Vec<PublicKey> = band.iter().map(|relay| relay.key).collect();
+        // Every round has its first places (the owner's, then last round's band) and its random
+        // ones; the hidden relay can win only a random place. Drawn uniformly, each round finds it
+        // with the chance of the random places among the relays not already first.
+        let first = MOST_PER_ROUND - RANDOM_PER_ROUND;
+        let others = 3 + band.len() + 1 - first;
+        let chance = RANDOM_PER_ROUND as f64 / others as f64;
+        const ROUNDS: usize = 3_000;
+        let mut found = 0;
+        for _ in 0..ROUNDS {
+            let set = directory.probe_set(&band_keys);
+            assert_eq!(set.len(), MOST_PER_ROUND);
+            assert!(
+                set[..first].iter().all(|relay| relay.key != hidden.key),
+                "a lying location never wins a first place"
+            );
+            found += usize::from(set.iter().any(|relay| relay.key == hidden.key));
+        }
+        // Expected `chance * ROUNDS` (some 200); within a factor of two either way is more than
+        // seven standard deviations, so this fails only when the draw is not uniform.
+        let expected = chance * ROUNDS as f64;
+        let found = found as f64;
+        assert!(
+            found >= expected / 2.0 && found <= expected * 2.0,
+            "probed in {found} of {ROUNDS} rounds, expected about {expected:.0}"
+        );
+        Ok(())
     }
 
     #[test]
@@ -1223,154 +1708,258 @@ mod tests {
         assert_eq!(sent.first(), Some(&0));
     }
 
-    /// Runs a slot whose every session ends with the relay saying "leave me, for `retry`", for
-    /// `run` of paused time, and returns which relay it dialled and when.
-    async fn dials_when_every_relay_redirects(
-        kind: SlotKind,
-        start: Option<RelayAddress>,
-        directory: Arc<Directory>,
-        retry: Duration,
-        run: Duration,
-    ) -> Vec<(PublicKey, Duration)> {
-        let began = tokio::time::Instant::now();
-        let log = Arc::new(Mutex::new(Vec::new()));
-        let written = Arc::clone(&log);
-        let slot = tokio::spawn(async move {
-            let dial = move |relay: RelayAddress, _reach: Reach| {
-                if let Ok(mut log) = written.lock() {
-                    log.push((relay.key, began.elapsed()));
+    fn batch(feeder: &Identity, sequence: u64) -> Result<Batch, String> {
+        Batch::sign(
+            feeder,
+            &tally_wire::BatchContent {
+                boot_id: 1,
+                sequence,
+                counter_epoch: 0,
+                wall_ms: 1,
+                dropped: 0,
+                previous: [0; 32],
+                observations: Vec::new(),
+            },
+        )
+        .map_err(|error| error.to_string())
+    }
+
+    #[test]
+    fn an_audit_sends_its_batches_to_one_relay_alone_and_only_while_it_is_up() -> Result<(), String>
+    {
+        let feeder = Identity::generate().map_err(|error| error.to_string())?;
+        let (audited, other) = (key()?, key()?);
+        let ledger = Ledger::default();
+        ledger.live(audited, true);
+        ledger.live(other, true);
+        for sequence in 0..3 {
+            let batch = batch(&feeder, sequence)?;
+            for relay in [audited, other] {
+                assert!(ledger.routes(&relay, &batch));
+                ledger.record(relay, &batch);
+            }
+        }
+        ledger.audit(audited);
+        let mut solo = Vec::new();
+        for sequence in 3..12 {
+            let batch = batch(&feeder, sequence)?;
+            for relay in [audited, other] {
+                if ledger.routes(&relay, &batch) {
+                    ledger.record(relay, &batch);
                 }
-                async move { Ok(Outcome::Leave(retry)) }
-            };
-            run_slot(0, kind, start, &directory, dial).await;
-        });
-        tokio::time::sleep(run).await;
-        slot.abort();
-        log.lock().map(|log| log.clone()).unwrap_or_default()
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn a_relay_that_said_leave_is_not_dialled_again_until_its_retry_after()
-    -> Result<(), String> {
-        let only = relay("only.example:10900")?;
-        let directory = directory_at(scratch(), vec![only.clone()], 1)?;
-        let retry = Duration::from_secs(600);
-        let dials = dials_when_every_relay_redirects(
-            SlotKind::Random,
-            None,
-            directory,
-            retry,
-            Duration::from_secs(1_000),
-        )
-        .await;
-        // Once at the start, then not before 600 s (and at most half again for jitter).
-        assert_eq!(dials.len(), 2, "{dials:?}");
-        assert!(dials.iter().all(|(key, _)| *key == only.key));
-        let again = dials.get(1).map(|(_, at)| *at).ok_or("no second dial")?;
-        assert!(
-            again >= retry && again <= retry.mul_f64(1.5) + Duration::from_secs(1),
-            "{again:?}"
-        );
-        Ok(())
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn after_a_session_that_stayed_up_the_next_try_comes_soon() -> Result<(), String> {
-        let only = relay("only.example:10900")?;
-        let directory = directory_at(scratch(), vec![only], 1)?;
-        let began = tokio::time::Instant::now();
-        let log = Arc::new(Mutex::new(Vec::new()));
-        let written = Arc::clone(&log);
-        let slot = tokio::spawn(async move {
-            let dial = move |_relay: RelayAddress, _reach: Reach| {
-                let attempt = written.lock().map_or(0, |mut log| {
-                    log.push(began.elapsed());
-                    log.len()
-                });
-                async move {
-                    // Six quick failures grow the wait; the seventh session stays up ten minutes.
-                    if attempt == 7 {
-                        tokio::time::sleep(Duration::from_secs(600)).await;
-                    }
-                    Err::<Outcome, String>("closed".to_owned())
-                }
-            };
-            run_slot(0, SlotKind::Random, None, &directory, dial).await;
-        });
-        tokio::time::sleep(Duration::from_secs(1_200)).await;
-        slot.abort();
-        let dials = log.lock().map(|log| log.clone()).unwrap_or_default();
-        let (long, next) = (
-            dials.get(6).ok_or("no long session")?,
-            dials.get(7).ok_or("no retry")?,
-        );
-        // The wait had grown past 30 s before the long session; after it, the next try is the
-        // first wait again (1 s, up to half again of jitter), after the session's 600 s.
-        let gap = *next - *long - Duration::from_secs(600);
-        assert!(gap <= Duration::from_millis(1_500), "{gap:?} {dials:?}");
-        Ok(())
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn a_slot_left_by_one_relay_moves_to_another_at_once() -> Result<(), String> {
-        let one = relay("one.example:10900")?;
-        let two = relay("two.example:10900")?;
-        let directory = directory_at(scratch(), vec![one, two], 1)?;
-        let retry = Duration::from_secs(600);
-        let dials = dials_when_every_relay_redirects(
-            SlotKind::Random,
-            None,
-            directory,
-            retry,
-            Duration::from_secs(500),
-        )
-        .await;
-        // Both relays at once, then neither while both are avoided.
-        assert_eq!(dials.len(), 2, "{dials:?}");
-        let (first, second) = (dials.first().ok_or("none")?, dials.get(1).ok_or("one")?);
-        assert_ne!(first.0, second.0);
-        assert_eq!(first.1, second.1);
-        Ok(())
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn the_home_relay_is_kept_through_a_leave_and_waited_for() -> Result<(), String> {
-        let home = relay("home.example:10900")?;
-        let other = relay("other.example:10900")?;
-        let directory = directory_at(scratch(), vec![other], 1)?;
-        let retry = Duration::from_secs(600);
-        let dials = dials_when_every_relay_redirects(
-            SlotKind::Home,
-            Some(home.clone()),
-            directory,
-            retry,
-            Duration::from_secs(1_000),
-        )
-        .await;
-        assert_eq!(dials.len(), 2, "{dials:?}");
-        assert!(dials.iter().all(|(key, _)| *key == home.key));
-        let again = dials.get(1).map(|(_, at)| *at).ok_or("no second dial")?;
-        assert!(again >= retry, "{again:?}");
+            }
+            if !ledger.routes(&other, &batch) {
+                solo.push(sequence);
+            }
+        }
+        assert_eq!(solo, vec![4, 5, 6, 7]);
+        let sent = ledger.settled(Duration::ZERO);
+        let audited_alone: Vec<u64> = sent
+            .iter()
+            .filter(|sent| sent.relays == vec![audited])
+            .map(|sent| sent.batch.sequence())
+            .collect();
+        assert_eq!(audited_alone, solo);
+        // The audited relay's session is down: nothing is withheld from the other.
+        ledger.audit(audited);
+        ledger.live(audited, false);
+        let next = batch(&feeder, 13)?;
+        assert!(ledger.routes(&other, &next));
         Ok(())
     }
 
     #[test]
-    fn an_avoided_relay_is_not_claimed_by_any_slot_until_its_wait_passes() -> Result<(), String> {
-        let only = relay("only.example:10900")?;
-        let directory = directory_at(scratch(), vec![only.clone()], 2)?;
-        directory.avoid(&only.key, Duration::ZERO);
-        // Even a relay that asked for no wait is avoided for the backoff's first.
-        assert!(directory.claim(1).is_none());
-        let left = directory.avoided_for().ok_or("not avoided")?;
-        assert!(left > Duration::ZERO && left <= Backoff::FIRST);
-        // A shorter wait asked later does not shorten a longer one.
-        directory.avoid(&only.key, Duration::from_secs(600));
-        directory.avoid(&only.key, Duration::from_secs(5));
-        assert!(directory.avoided_for().ok_or("not avoided")? > Duration::from_secs(590));
+    fn an_audited_batch_the_audited_relay_did_not_carry_reaches_the_other_relay()
+    -> Result<(), String> {
+        let feeder = Identity::generate().map_err(|error| error.to_string())?;
+        let (audited, other) = (key()?, key()?);
+        let ledger = Ledger::default();
+        ledger.live(audited, true);
+        ledger.live(other, true);
+        let changes = ledger.owed_changes();
+        let first = batch(&feeder, 0)?;
+        ledger.routes(&audited, &first);
+        ledger.routes(&other, &first);
+        ledger.audit(audited);
+        // The audited session skips the first audited batch (its pace, or it lagged) and writes
+        // the rest; the other relay is held back from all of them.
+        for sequence in 2..6 {
+            let batch = batch(&feeder, sequence)?;
+            assert!(!ledger.routes(&other, &batch));
+            if ledger.routes(&audited, &batch) && sequence != 2 {
+                ledger.record(audited, &batch);
+            }
+        }
+        assert!(!changes.has_changed().map_err(|error| error.to_string())?);
+        assert_eq!(ledger.end_audit(), 1);
+        assert!(changes.has_changed().map_err(|error| error.to_string())?);
+        let owed: Vec<u64> = ledger
+            .take_owed(&other)
+            .iter()
+            .map(Batch::sequence)
+            .collect();
+        assert_eq!(owed, vec![2]);
+        assert!(ledger.take_owed(&audited).is_empty());
+        // Ended, the audit holds nothing back.
+        assert!(ledger.routes(&other, &batch(&feeder, 6)?));
+
+        // The audited relay's session ends mid-audit: what it was written may not have reached
+        // it, so every batch held back goes to the other relay.
+        ledger.audit(audited);
+        for sequence in 8..12 {
+            let batch = batch(&feeder, sequence)?;
+            assert!(!ledger.routes(&other, &batch));
+            if ledger.routes(&audited, &batch) {
+                ledger.record(audited, &batch);
+            }
+        }
+        ledger.live(audited, false);
+        assert_eq!(ledger.end_audit(), 4);
+        let owed: Vec<u64> = ledger
+            .take_owed(&other)
+            .iter()
+            .map(Batch::sequence)
+            .collect();
+        assert_eq!(owed, vec![8, 9, 10, 11]);
+        Ok(())
+    }
+
+    /// The feeder's delivery checks, live over loopback relays: it audits each relay it holds in
+    /// turn, asks the area's members (two, on two networks) about the audited batches, convicts the
+    /// relay that took its batches and passed none on, remembers it across restarts, and moves to
+    /// the next in the ranking. The honest relay, audited too, is never convicted.
+    #[tokio::test]
+    async fn the_live_audit_loop_catches_a_swallower_and_spares_an_honest_relay()
+    -> Result<(), String> {
+        use crate::probe::tests::{Fake, Group, Mode, echo_relay};
+        use tally_wire::directory::ProviderOfferContent;
+        const LOOPBACK: Duration = Duration::from_millis(1);
+        let error = |error: tally_wire::WireError| error.to_string();
+        let location = Location {
+            lat_e7: 339_400_000,
+            lon_e7: -1_184_000_000,
+            alt_m: 30,
+            precision_m: 0,
+        };
+        let area = tally_wire::rendezvous::area_of(&location).map_err(error)?;
+        let group: Group = Arc::default();
+        let (taken, mut arrivals) = mpsc::unbounded_channel();
+        // Each on its own /24 and network, so the networks are known distinct.
+        let relay = |ip, network, slots, honest: bool| -> Result<Fake, String> {
+            Ok(Fake {
+                ip,
+                batches: Some(taken.clone()),
+                forwards_to: honest.then(|| Arc::clone(&group)),
+                ..Fake::new(
+                    Identity::generate().map_err(error)?,
+                    network,
+                    slots,
+                    Mode::Serve,
+                )
+            })
+        };
+        let swallower = echo_relay(relay("127.0.1.1", 1, 1_000_000, false)?).await?;
+        let honest = echo_relay(relay("127.0.2.1", 2, 1_000_000, true)?).await?;
+        let reserve = echo_relay(relay("127.0.3.1", 3, 1, true)?).await?;
+        let feeder = Identity::generate().map_err(error)?;
+        let dir = scratch();
+        let directory = Directory::new(
+            dir.clone(),
+            vec![swallower.clone(), honest.clone(), reserve.clone()],
+            Vec::new(),
+            feeder.clone(),
+            Some(location),
+            Clock::Dump1090,
+        )?;
+        // Two members of the area's sharing group, which take no feeder.
+        for (ip, network) in [("127.0.11.1", 11), ("127.0.12.1", 12)] {
+            let identity = Identity::generate().map_err(error)?;
+            let member = echo_relay(Fake {
+                ip,
+                answers_from: Some(Arc::clone(&group)),
+                ..Fake::new(identity.clone(), network, 0, Mode::Serve)
+            })
+            .await?;
+            let now = wall_ms();
+            let offer = ProviderOffer::sign(
+                &identity,
+                &ProviderOfferContent {
+                    address: member.address.clone(),
+                    cell: area,
+                    products: Streams::RAW,
+                    stripes_of: 1,
+                    stripes: 1,
+                    mlat_cores: 0,
+                    feeder_slots: 0,
+                    network,
+                    issued_ms: now,
+                    expires_ms: now + 600_000,
+                },
+            )
+            .map_err(error)?;
+            directory.offered(member.key, offer);
+        }
+        assert_eq!(directory.offers().len(), 2);
+        let (batches, _) = broadcast::channel(64);
+        let publisher = tokio::spawn(run(Publishing {
+            directory: Arc::clone(&directory),
+            identity: feeder.clone(),
+            batches: batches.clone(),
+            ceiling: 64_000,
+            checker: DeliveryChecker::load(&dir),
+            checking: Checking {
+                every: Duration::from_secs(1),
+                audit_for: Duration::from_secs(1),
+                settle: Duration::from_millis(500),
+            },
+            prober: |relay, me| {
+                Box::pin(async move {
+                    let mut probed = probe::probe(&relay, &me).await?;
+                    probed.measured.rtt = LOOPBACK;
+                    Ok(probed)
+                })
+            },
+        }));
+        let sending = tokio::spawn(async move {
+            for sequence in 0.. {
+                if let Ok(batch) = batch(&feeder, sequence) {
+                    let _ = batches.send(Arc::new(Record::Batch(batch)));
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        });
+        let convicted = || {
+            std::fs::read_to_string(dir.join("swallowers"))
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|line| line.split_once(' '))
+                .filter_map(|(key, _)| PublicKey::from_base64(key).ok())
+                .collect::<Vec<PublicKey>>()
+        };
+        // Until the reserve takes the swallower's place.
+        let waited = tokio::time::timeout(Duration::from_secs(60), async {
+            while let Some((relay, _)) = arrivals.recv().await {
+                if relay == reserve.key {
+                    return;
+                }
+            }
+        })
+        .await;
+        sending.abort();
+        publisher.abort();
+        waited.map_err(|_| {
+            format!(
+                "the swallower was not replaced; convicted {:?}",
+                convicted()
+            )
+        })?;
+        assert_eq!(convicted(), vec![swallower.key]);
+        let _ = std::fs::remove_dir_all(dir);
         Ok(())
     }
 
     type Pipe = tokio::io::DuplexStream;
+    type Outbound = mpsc::Sender<Result<Vec<Record>, String>>;
 
     /// A session over an in-memory pipe that buffers `buffer` bytes each way: the feeder's end, the
     /// relay's end, and the relay's key.
@@ -1394,6 +1983,19 @@ mod tests {
         Ok((session, accepted.session, relay_key))
     }
 
+    fn context(directory: Arc<Directory>, key: PublicKey, address: &str) -> Context {
+        Context {
+            relay: RelayAddress {
+                key,
+                address: address.to_owned(),
+            },
+            directory,
+            ledger: Arc::new(Ledger::default()),
+            ceiling: 64_000,
+            area: None,
+        }
+    }
+
     /// A publishing session over an in-memory pipe, and the relay's end of it.
     async fn publishing(
         directory: Arc<Directory>,
@@ -1407,25 +2009,14 @@ mod tests {
         String,
     > {
         let (session, relay_end, relay_key) = pipe(1 << 20).await?;
-        let (out, mut batches) = broadcast::channel(64);
+        let (out, batches) = broadcast::channel(64);
         let (records_in, mut records) = mpsc::channel(16);
-        let address = RelayAddress {
-            key: relay_key,
-            address: "relay.example:10900".to_owned(),
-        };
+        let context = context(directory, relay_key, "relay.example:10900");
         let mut writer = session.writer;
-        let running = tokio::spawn(async move {
-            publish(
-                &address,
-                &mut writer,
-                &mut records,
-                &mut batches,
-                &directory,
-                64_000,
-                &Reach::new(Duration::ZERO, None),
-            )
-            .await
-        });
+        let running =
+            tokio::spawn(
+                async move { publish(&context, &mut writer, &mut records, batches).await },
+            );
         Ok((running, relay_end.reader, out, records_in))
     }
 
@@ -1433,7 +2024,7 @@ mod tests {
     async fn a_session_re_sends_a_freshly_signed_receiver_info_every_ten_minutes()
     -> Result<(), String> {
         let error = |error: tally_wire::WireError| error.to_string();
-        let directory = directory_at(scratch(), Vec::new(), 1)?;
+        let directory = directory_at(scratch(), Vec::new())?;
         let (running, mut reader, _out, _records_in) = publishing(directory).await?;
         let began = tokio::time::Instant::now();
         let mut infos = Vec::new();
@@ -1462,6 +2053,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_compressed_batch_reaches_a_relay_whole() -> Result<(), String> {
+        let error = |error: tally_wire::WireError| error.to_string();
+        let directory = directory_at(scratch(), Vec::new())?;
+        let (running, mut reader, out, _records_in) = publishing(directory).await?;
+        let feeder = Identity::generate().map_err(error)?;
+        let mut batcher = Batcher::new(feeder, u32::MAX, Clock::Dump1090);
+        for counter in 1..200u64 {
+            let frame = tally_wire::Frame::new(
+                tally_wire::FrameKind::ModeSLong,
+                counter * 1_000,
+                9,
+                &[0x8d, 0xa0, 0x00, 0x01, 0x58, 0x1f, 0, 0, 0, 0, 0, 0, 0, 0],
+            )
+            .map_err(error)?;
+            batcher.observe(&frame)?;
+        }
+        let sealed = batcher.seal()?.ok_or("no batch")?;
+        let _ = out.send(Arc::new(Record::Batch(sealed.clone())));
+        loop {
+            let mut got = Vec::new();
+            tokio::time::timeout(Duration::from_secs(10), reader.recv(&mut got))
+                .await
+                .map_err(|_| "no batch arrived".to_owned())?
+                .map_err(error)?;
+            if let Some(Record::Batch(arrived)) = got
+                .into_iter()
+                .find(|record| matches!(record, Record::Batch(_)))
+            {
+                running.abort();
+                assert_eq!(arrived, sealed);
+                assert_eq!(arrived.format(), tally_wire::batch::BATCH_FORMAT_DEFLATE);
+                arrived.verify().map_err(error)?;
+                assert_eq!(arrived.content().map_err(error)?.observations.len(), 199);
+                return Ok(());
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn a_feeder_at_its_ceiling_delivers_every_batch_to_a_relay_that_asked_nothing()
     -> Result<(), String> {
         let error = |error: tally_wire::WireError| error.to_string();
@@ -1479,30 +2109,29 @@ mod tests {
             .await
             .map_err(|error| error.to_string())?
             .map_err(error)?;
-        let directory = directory_at(scratch(), Vec::new(), 1)?;
-        let (out, mut batches) = broadcast::channel(64);
+        let directory = directory_at(scratch(), Vec::new())?;
+        let (out, batches) = broadcast::channel(64);
         let (_records_in, mut records) = mpsc::channel(16);
-        let address = RelayAddress {
-            key: relay_key,
-            address: "relay.example:10900".to_owned(),
-        };
+        let context = context(directory, relay_key, "relay.example:10900");
         let mut writer = session.writer;
-        let publishing = tokio::spawn(async move {
-            publish(
-                &address,
-                &mut writer,
-                &mut records,
-                &mut batches,
-                &directory,
-                64_000,
-                &Reach::new(Duration::ZERO, None),
-            )
-            .await
-        });
-        // Batches as big as the batcher seals them, each near the whole second's ceiling.
+        let publishing =
+            tokio::spawn(
+                async move { publish(&context, &mut writer, &mut records, batches).await },
+            );
+        // Batches as big as the batcher seals them, each a large part of the second's ceiling even
+        // compressed: each message is noise (splitmix64 of its counter), which DEFLATE barely
+        // shrinks.
         let mut batcher = Batcher::new(feeder, u32::MAX, Clock::Dump1090);
         let frame = |counter: u64| {
-            tally_wire::Frame::new(tally_wire::FrameKind::ModeSLong, counter, 9, &[0x8d; 14])
+            let mix = |x: u64| {
+                let x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+                let x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+                x ^ (x >> 31)
+            };
+            let mut message = [0u8; 14];
+            message[..8].copy_from_slice(&mix(counter).to_be_bytes());
+            message[8..].copy_from_slice(&mix(!counter).to_be_bytes()[..6]);
+            tally_wire::Frame::new(tally_wire::FrameKind::ModeSLong, counter, 9, &message)
                 .map_err(|error| error.to_string())
         };
         let mut sent = 0;
@@ -1512,7 +2141,11 @@ mod tests {
             counter += 1;
             if batcher.is_full() {
                 let batch = batcher.seal()?.ok_or("no batch")?;
-                assert!(batch.as_bytes().len() > 48 * 1024);
+                assert!(
+                    batch.as_bytes().len() > 32 * 1024,
+                    "{}",
+                    batch.as_bytes().len()
+                );
                 let _ = out.send(Arc::new(Record::Batch(batch)));
                 sent += 1;
             }
@@ -1536,518 +2169,73 @@ mod tests {
         Ok(())
     }
 
-    /// Runs a slot whose every session ends with `answer`, given the session's `Reach`, for `run`
-    /// of paused time, and returns which relay it dialled and when.
-    async fn dials(
-        kind: SlotKind,
-        start: Option<RelayAddress>,
-        directory: Arc<Directory>,
-        run: Duration,
-        answer: fn(&Reach) -> Result<Outcome, String>,
-    ) -> Vec<(PublicKey, Duration)> {
-        let began = tokio::time::Instant::now();
-        let log = Arc::new(Mutex::new(Vec::new()));
-        let written = Arc::clone(&log);
-        let slot = tokio::spawn(async move {
-            let dial = move |relay: RelayAddress, reach: Reach| {
-                if let Ok(mut log) = written.lock() {
-                    log.push((relay.key, began.elapsed()));
-                }
-                let answered = answer(&reach);
-                async move { answered }
-            };
-            run_slot(0, kind, start, &directory, dial).await;
-        });
-        tokio::time::sleep(run).await;
-        slot.abort();
-        log.lock().map(|log| log.clone()).unwrap_or_default()
-    }
-
-    fn unreachable(_reach: &Reach) -> Result<Outcome, String> {
-        Err("connection refused".to_owned())
-    }
-
-    /// The first dial to a relay other than the first one dialled, and when.
-    fn first_move(dials: &[(PublicKey, Duration)]) -> Option<(PublicKey, Duration)> {
-        let (first, _) = dials.first()?;
-        dials.iter().find(|(key, _)| key != first).copied()
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn a_random_slot_gives_up_a_relay_unreachable_for_an_hour() -> Result<(), String> {
-        let directory = directory_at(scratch(), relays("relay", 2)?, 1)?;
-        let dials = dials(
-            SlotKind::Random,
-            None,
-            directory,
-            Duration::from_secs(3 * 3_600),
-            unreachable,
-        )
-        .await;
-        let (moved_to, at) = first_move(&dials).ok_or_else(|| format!("never moved {dials:?}"))?;
-        // At the hour: not before it, and not a backoff after it, since the last wait is cut to
-        // what remains of it.
-        assert_eq!(at, RANDOM_GIVES_UP, "{dials:?}");
-        // The new relay gets its own hour: no move back before it has had it.
-        let moved = dials
-            .iter()
-            .position(|(key, _)| *key == moved_to)
-            .ok_or("no move")?;
-        assert!(
-            dials
-                .iter()
-                .skip(moved)
-                .take_while(|(_, when)| *when < at + RANDOM_GIVES_UP)
-                .all(|(key, _)| *key == moved_to),
-            "{dials:?}"
-        );
-        Ok(())
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn a_random_slot_with_no_other_relay_keeps_retrying() -> Result<(), String> {
-        let only = relay("only.example:10900")?;
-        let directory = directory_at(scratch(), vec![only.clone()], 1)?;
-        let run = Duration::from_secs(3 * 3_600);
-        let dials = dials(SlotKind::Random, None, directory, run, unreachable).await;
-        assert!(dials.iter().all(|(key, _)| *key == only.key));
-        let last = dials.last().map(|(_, at)| *at).ok_or("no dials")?;
-        assert!(last >= run - Duration::from_secs(451), "{last:?}");
-        Ok(())
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn a_relay_that_reaches_welcome_is_never_given_up() -> Result<(), String> {
-        let directory = directory_at(scratch(), relays("relay", 2)?, 1)?;
-        let dials = dials(
-            SlotKind::Random,
-            None,
-            directory,
-            Duration::from_secs(3 * 3_600),
-            |reach| {
-                reach.mark();
-                Err("closed after Welcome".to_owned())
-            },
-        )
-        .await;
-        assert!(dials.len() > 10, "{dials:?}");
-        assert_eq!(first_move(&dials), None);
-        Ok(())
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn the_anchor_gives_up_after_seven_days_counted_across_restarts() -> Result<(), String> {
-        let state = scratch();
-        let (anchor, other) = (
-            relay("anchor.example:10900")?,
-            relay("other.example:10900")?,
-        );
-        std::fs::create_dir_all(&state).map_err(|error| error.to_string())?;
-        // An earlier run last reached the anchor six days and 23 hours ago.
-        let lost = ANCHOR_GIVES_UP - Duration::from_secs(3_600);
-        let reached = wall_ms() - u64::try_from(lost.as_millis()).map_err(|e| e.to_string())?;
-        std::fs::write(
-            state.join("anchor"),
-            format!("{}={}\nreached {reached}\n", anchor.address, anchor.key),
-        )
-        .map_err(|error| error.to_string())?;
-        let directory = directory_at(state.clone(), vec![anchor.clone(), other.clone()], 1)?;
-        assert_eq!(directory.saved_anchor().as_ref(), Some(&anchor));
-        let dials = dials(
-            SlotKind::Anchor,
-            Some(anchor.clone()),
-            Arc::clone(&directory),
-            Duration::from_secs(3 * 3_600),
-            unreachable,
-        )
-        .await;
-        let (moved_to, at) = first_move(&dials).ok_or_else(|| format!("never moved {dials:?}"))?;
-        assert_eq!(moved_to, other.key);
-        // The hour left of its seven days, not seven days from this run's start: the last wait is
-        // cut to what remains, so the move is at the hour (less the real milliseconds between
-        // writing the file and reading it), never a backoff past it.
-        let left = Duration::from_secs(3_600);
-        assert!(at >= left - Duration::from_secs(1) && at <= left, "{at:?}");
-        // The new anchor is saved, its own count started when it was chosen.
-        assert_eq!(directory.saved_anchor(), Some(other.clone()));
-        let unreached = directory.anchor_unreached_for(&other);
-        assert!(unreached <= Duration::from_secs(60), "{unreached:?}");
-        std::fs::remove_dir_all(&state).map_err(|error| error.to_string())
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn an_anchor_reached_is_saved_as_reached() -> Result<(), String> {
-        let state = scratch();
-        let anchor = relay("anchor.example:10900")?;
-        let directory = directory_at(state.clone(), vec![anchor.clone()], 1)?;
-        let _ = dials(
-            SlotKind::Anchor,
-            Some(anchor.clone()),
-            Arc::clone(&directory),
-            Duration::from_secs(10),
-            |reach| {
-                reach.mark();
-                Err("closed after Welcome".to_owned())
-            },
-        )
-        .await;
-        assert_eq!(directory.saved_anchor().as_ref(), Some(&anchor));
-        assert!(directory.anchor_unreached_for(&anchor) <= Duration::from_secs(60));
-        // A file of an earlier build, with no time, starts the count again.
-        std::fs::write(
-            state.join("anchor"),
-            format!("{}={}\n", anchor.address, anchor.key),
-        )
-        .map_err(|error| error.to_string())?;
-        assert_eq!(directory.saved_anchor().as_ref(), Some(&anchor));
-        assert_eq!(directory.anchor_unreached_for(&anchor), Duration::ZERO);
-        std::fs::remove_dir_all(&state).map_err(|error| error.to_string())
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn the_home_relay_is_never_given_up() -> Result<(), String> {
-        let home = relay("home.example:10900")?;
-        let directory = directory_at(scratch(), relays("other", 3)?, 1)?;
-        let dials = dials(
-            SlotKind::Home,
-            Some(home.clone()),
-            directory,
-            ANCHOR_GIVES_UP + Duration::from_secs(24 * 3_600),
-            unreachable,
-        )
-        .await;
-        assert!(dials.len() > 1_000, "{}", dials.len());
-        assert!(dials.iter().all(|(key, _)| *key == home.key));
-        Ok(())
-    }
-
-    fn full_for_ever(_reach: &Reach) -> Result<Outcome, String> {
-        Ok(goodbye(Reason::Full, u32::MAX))
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn a_random_slot_asked_to_wait_past_its_bound_moves_on_at_once() -> Result<(), String> {
-        let directory = directory_at(scratch(), relays("relay", 2)?, 1)?;
-        let dials = dials(
-            SlotKind::Random,
-            None,
-            directory,
-            Duration::from_secs(10),
-            full_for_ever,
-        )
-        .await;
-        // Both relays at once, each then avoided for its wait, so neither again.
-        assert_eq!(dials.len(), 2, "{dials:?}");
-        let (first, second) = (dials.first().ok_or("none")?, dials.get(1).ok_or("one")?);
-        assert_ne!(first.0, second.0);
-        assert_eq!(first.1, second.1);
-        Ok(())
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn a_handshake_refused_for_ever_moves_the_anchor_on_at_once() -> Result<(), String> {
-        let state = scratch();
-        let (anchor, other) = (
-            relay("anchor.example:10900")?,
-            relay("other.example:10900")?,
-        );
-        let directory = directory_at(state.clone(), vec![anchor.clone(), other.clone()], 1)?;
-        let dials = dials(
-            SlotKind::Anchor,
-            Some(anchor.clone()),
-            Arc::clone(&directory),
-            Duration::from_secs(10),
-            // What `session` makes of `WireError::Refused { Full, u32::MAX }`.
-            full_for_ever,
-        )
-        .await;
-        assert_eq!(first_move(&dials), Some((other.key, Duration::ZERO)));
-        assert_eq!(directory.saved_anchor(), Some(other));
-        std::fs::remove_dir_all(&state).map_err(|error| error.to_string())
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn a_wait_within_the_bound_is_honoured_on_the_same_relay() -> Result<(), String> {
-        let directory = directory_at(scratch(), relays("relay", 2)?, 1)?;
-        let dials = dials(
-            SlotKind::Random,
-            None,
-            directory,
-            Duration::from_secs(1_000),
-            |reach| {
-                reach.mark();
-                Ok(goodbye(Reason::Full, 600))
-            },
-        )
-        .await;
-        assert_eq!(dials.len(), 2, "{dials:?}");
-        assert_eq!(first_move(&dials), None);
-        let again = dials.get(1).map(|(_, at)| *at).ok_or("no second dial")?;
-        assert!(again >= Duration::from_secs(600), "{again:?}");
-        Ok(())
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn a_wait_is_cut_to_what_remains_of_the_bound() -> Result<(), String> {
-        let directory = directory_at(scratch(), relays("relay", 2)?, 1)?;
-        let dials = dials(
-            SlotKind::Random,
-            None,
-            directory,
-            Duration::from_secs(3 * 3_600),
-            // Fifty minutes, within the hour: honoured, but jitter may take it past the hour.
-            |_reach| Ok(goodbye(Reason::Full, 3_000)),
-        )
-        .await;
-        let (_, at) = first_move(&dials).ok_or_else(|| format!("never moved {dials:?}"))?;
-        assert!(at <= RANDOM_GIVES_UP, "{at:?} {dials:?}");
-        Ok(())
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn the_home_relay_asked_to_wait_for_ever_is_dialled_again_within_a_day()
-    -> Result<(), String> {
-        let home = relay("home.example:10900")?;
-        let directory = directory_at(scratch(), relays("other", 2)?, 1)?;
-        let dials = dials(
-            SlotKind::Home,
-            Some(home.clone()),
-            directory,
-            Duration::from_secs(3 * 24 * 3_600 + 60),
-            full_for_ever,
-        )
-        .await;
-        assert!(dials.len() >= 4, "{dials:?}");
-        assert!(dials.iter().all(|(key, _)| *key == home.key));
-        let gaps: Vec<Duration> = dials.windows(2).map(|two| two[1].1 - two[0].1).collect();
-        assert!(
-            gaps.iter().all(|gap| *gap <= HOME_WAITS_AT_MOST),
-            "{gaps:?}"
-        );
-        Ok(())
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn a_slot_with_nothing_to_pick_finds_a_relay_learned_meanwhile() -> Result<(), String> {
-        let only = relay("only.example:10900")?;
-        let directory = directory_at(scratch(), vec![only.clone()], 1)?;
-        let fresh = relay("fresh.example:10900")?;
-        let (learner, hinter, offered) = (Arc::clone(&directory), key()?, vec![fresh.clone()]);
-        let learning = tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_secs(10)).await;
-            learner.learn(hinter, &offered);
-        });
-        let dials = dials(
-            SlotKind::Random,
-            None,
-            directory,
-            Duration::from_secs(2 * 3_600),
-            |_reach| Ok(Outcome::Leave(Duration::from_secs(u32::MAX.into()))),
-        )
-        .await;
-        learning.abort();
-        let (moved_to, at) = first_move(&dials).ok_or_else(|| format!("never moved {dials:?}"))?;
-        assert_eq!(moved_to, fresh.key);
-        assert!(
-            at <= Duration::from_secs(10) + NOTHING_TO_PICK_AT_MOST.mul_f64(1.5),
-            "{at:?}"
-        );
-        Ok(())
-    }
-
-    fn anchor_file(
-        state: &std::path::Path,
-        anchor: &RelayAddress,
-        reached: u64,
-    ) -> Result<(), String> {
-        std::fs::create_dir_all(state).map_err(|error| error.to_string())?;
-        std::fs::write(
-            state.join("anchor"),
-            format!("{}={}\nreached {reached}\n", anchor.address, anchor.key),
-        )
-        .map_err(|error| error.to_string())
-    }
-
-    #[test]
-    fn no_reached_time_is_saved_from_a_clock_that_is_not_set() -> Result<(), String> {
-        let state = scratch();
-        let anchor = relay("anchor.example:10900")?;
-        let directory = directory_at(state.clone(), vec![anchor.clone()], 1)?;
-        // A board with no real-time clock, booted in 1970, an hour before it had the time.
-        directory.save_anchor_at(&anchor, Duration::ZERO, 3_600_000);
-        let text = std::fs::read_to_string(state.join("anchor")).map_err(|e| e.to_string())?;
-        assert!(!text.contains("reached"), "{text}");
-        assert_eq!(directory.saved_anchor().as_ref(), Some(&anchor));
-        assert_eq!(directory.anchor_unreached_for(&anchor), Duration::ZERO);
-        // Nor a time that, counted back, falls before the floor.
-        directory.save_anchor_at(&anchor, Duration::from_secs(60), PLAUSIBLE_SINCE_MS + 1_000);
-        let text = std::fs::read_to_string(state.join("anchor")).map_err(|e| e.to_string())?;
-        assert!(!text.contains("reached"), "{text}");
-        // A set clock saves its time.
-        let now = PLAUSIBLE_SINCE_MS + 86_400_000;
-        directory.save_anchor_at(&anchor, Duration::from_secs(60), now);
-        let text = std::fs::read_to_string(state.join("anchor")).map_err(|e| e.to_string())?;
-        assert!(
-            text.contains(&format!("reached {}", now - 60_000)),
-            "{text}"
-        );
-        assert_eq!(
-            directory.anchor_unreached_at(&anchor, now),
-            Duration::from_secs(60)
-        );
-        // The next boot comes up in 1970 again: saving the same anchor keeps the time it knew.
-        directory.save_anchor_at(&anchor, Duration::ZERO, 3_600_000);
-        let text = std::fs::read_to_string(state.join("anchor")).map_err(|e| e.to_string())?;
-        assert!(
-            text.contains(&format!("reached {}", now - 60_000)),
-            "{text}"
-        );
-        // Reached while the clock is not set: the time it knew is stale now, so it is dropped.
-        directory.anchor_reached_at(&anchor, 3_600_000);
-        let text = std::fs::read_to_string(state.join("anchor")).map_err(|e| e.to_string())?;
-        assert!(!text.contains("reached"), "{text}");
-        assert_eq!(directory.saved_anchor().as_ref(), Some(&anchor));
-        // Reached with the clock set: that time is saved.
-        directory.anchor_reached_at(&anchor, now + 5_000);
-        let text = std::fs::read_to_string(state.join("anchor")).map_err(|e| e.to_string())?;
-        assert!(text.contains(&format!("reached {}", now + 5_000)), "{text}");
-        // A different anchor, saved while the clock is not set, starts without one.
-        let other = relay("other.example:10900")?;
-        directory.save_anchor_at(&other, Duration::ZERO, 3_600_000);
-        let text = std::fs::read_to_string(state.join("anchor")).map_err(|e| e.to_string())?;
-        assert!(!text.contains("reached"), "{text}");
-        std::fs::remove_dir_all(&state).map_err(|error| error.to_string())
-    }
-
-    #[test]
-    fn a_saved_time_that_cannot_be_right_is_read_as_unknown() -> Result<(), String> {
-        let state = scratch();
-        let anchor = relay("anchor.example:10900")?;
-        let directory = directory_at(state.clone(), vec![anchor.clone()], 1)?;
-        let now = wall_ms();
-        // Saved by a run whose clock read 1970.
-        anchor_file(&state, &anchor, 3_600_000)?;
-        assert_eq!(directory.anchor_unreached_for(&anchor), Duration::ZERO);
-        // Later than now.
-        anchor_file(&state, &anchor, now + 86_400_000)?;
-        assert_eq!(directory.anchor_unreached_for(&anchor), Duration::ZERO);
-        // A good time, read by a run whose clock is not yet set, is later than its now.
-        anchor_file(&state, &anchor, PLAUSIBLE_SINCE_MS + 1_000)?;
-        assert_eq!(
-            directory.anchor_unreached_at(&anchor, 3_600_000),
-            Duration::ZERO
-        );
-        // And read by a set clock, it counts.
-        assert_eq!(
-            directory.anchor_unreached_at(&anchor, PLAUSIBLE_SINCE_MS + 61_000),
-            Duration::from_secs(60)
-        );
-        std::fs::remove_dir_all(&state).map_err(|error| error.to_string())
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn an_anchor_saved_with_a_1970_time_is_not_given_up_at_once() -> Result<(), String> {
-        let state = scratch();
-        let (anchor, other) = (
-            relay("anchor.example:10900")?,
-            relay("other.example:10900")?,
-        );
-        anchor_file(&state, &anchor, 3_600_000)?;
-        let directory = directory_at(state.clone(), vec![anchor.clone(), other], 1)?;
-        let dials = dials(
-            SlotKind::Anchor,
-            Some(anchor.clone()),
-            Arc::clone(&directory),
-            Duration::from_secs(2 * 3_600),
-            unreachable,
-        )
-        .await;
-        assert!(dials.len() > 1, "{dials:?}");
-        assert_eq!(first_move(&dials), None);
-        assert_eq!(directory.saved_anchor(), Some(anchor));
-        std::fs::remove_dir_all(&state).map_err(|error| error.to_string())
-    }
-
-    /// What the reader passes on to a session, both ends.
-    type Inbound = (
-        mpsc::Sender<Result<Vec<Record>, String>>,
-        mpsc::Receiver<Result<Vec<Record>, String>>,
-    );
-
     /// A publishing session to a relay that completed the handshake and then stopped reading, over
     /// a pipe too small for even the first receiver info. The relay's end and the reader's sender
     /// are held for as long as the session runs.
     async fn stalled(
         directory: Arc<Directory>,
-        records: Option<Inbound>,
+        records: Option<(Outbound, Inbound)>,
     ) -> Result<Outcome, String> {
         let (session, _relay_end, relay_key) = pipe(64).await?;
-        let (_out, mut batches) = broadcast::channel(64);
+        let (_out, batches) = broadcast::channel(64);
         let (_records_in, mut records) = records.unwrap_or_else(|| mpsc::channel(16));
-        let address = RelayAddress {
-            key: relay_key,
-            address: "stalled.example:10900".to_owned(),
-        };
+        let context = context(directory, relay_key, "stalled.example:10900");
         let mut writer = session.writer;
-        publish(
-            &address,
-            &mut writer,
-            &mut records,
-            &mut batches,
-            &directory,
-            64_000,
-            &Reach::new(Duration::ZERO, None),
-        )
-        .await
+        publish(&context, &mut writer, &mut records, batches).await
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_relay_that_stops_reading_ends_the_session_by_the_deadline_and_is_retried()
-    -> Result<(), String> {
-        let directory = directory_at(scratch(), vec![relay("stalled.example:10900")?], 1)?;
+    async fn a_relay_that_stops_reading_ends_the_session_by_the_deadline() -> Result<(), String> {
+        let directory = directory_at(scratch(), Vec::new())?;
         let began = tokio::time::Instant::now();
-        let log = Arc::new(Mutex::new(Vec::new()));
-        let written = Arc::clone(&log);
-        let sessions = Arc::clone(&directory);
-        let slot = tokio::spawn(async move {
-            let dial = move |_relay: RelayAddress, _reach: Reach| {
-                let written = Arc::clone(&written);
-                let directory = Arc::clone(&sessions);
-                async move {
-                    let dialled = began.elapsed();
-                    let ended = stalled(directory, None).await;
-                    if let Ok(mut log) = written.lock() {
-                        log.push((dialled, began.elapsed(), ended.is_err()));
-                    }
-                    ended
-                }
-            };
-            run_slot(0, SlotKind::Random, None, &directory, dial).await;
-        });
-        tokio::time::sleep(Duration::from_secs(100)).await;
-        slot.abort();
-        let sessions = log.lock().map(|log| log.clone()).unwrap_or_default();
-        let (first, second) = (
-            sessions.first().ok_or("no session ended")?,
-            sessions.get(1).ok_or("not retried")?,
-        );
-        // Ended in error at the write deadline, not before and not much after.
-        assert!(first.2, "{sessions:?}");
-        let lasted = first.1 - first.0;
+        let ended = stalled(directory, None).await;
+        assert!(ended.is_err(), "{ended:?}");
+        let lasted = began.elapsed();
         assert!(
             lasted >= noise::WRITE_TIMEOUT
                 && lasted <= noise::WRITE_TIMEOUT + Duration::from_secs(1),
             "{lasted:?}"
         );
-        // And the slot dialled again after the first wait, a second and up to half again.
-        let gap = second.0 - first.1;
-        assert!(gap <= Duration::from_millis(1_600), "{gap:?}");
+        Ok(())
+    }
+
+    /// A relay that redirects and closes over unread batches resets the connection, and the reset
+    /// can fail the next send before the reader has passed the redirect on. The redirect, not the
+    /// reset, is how the session ended.
+    #[tokio::test]
+    async fn a_redirect_the_reader_passes_on_after_a_send_failed_still_ends_the_session()
+    -> Result<(), String> {
+        let directory = directory_at(scratch(), Vec::new())?;
+        let (session, relay_end, relay_key) = pipe(64 * 1024).await?;
+        drop(relay_end);
+        let (_out, batches) = broadcast::channel(64);
+        let (records_in, mut records) = mpsc::channel(16);
+        // On this one thread the reader's records arrive only once the session waits on them,
+        // which is after its first send has already failed against the closed pipe.
+        let reader = tokio::spawn(async move {
+            let redirect = Record::Redirect {
+                retry_after_secs: 600,
+                hints: Vec::new(),
+            };
+            let _ = records_in.send(Ok(vec![redirect])).await;
+            let _ = records_in
+                .send(Err("i/o: connection reset by peer".to_owned()))
+                .await;
+        });
+        let context = context(directory, relay_key, "redirecting.example:10900");
+        let mut writer = session.writer;
+        let ended = publish(&context, &mut writer, &mut records, batches).await;
+        reader.abort();
+        assert!(
+            matches!(ended, Ok(Outcome::Leave(wait)) if wait == Duration::from_secs(600)),
+            "{ended:?}"
+        );
         Ok(())
     }
 
     #[tokio::test(start_paused = true)]
     async fn a_failed_reader_ends_the_session_while_a_send_waits() -> Result<(), String> {
-        let directory = directory_at(scratch(), Vec::new(), 1)?;
+        let directory = directory_at(scratch(), Vec::new())?;
         let (records_in, records) = mpsc::channel(16);
         let reader = records_in.clone();
         let running = tokio::spawn(stalled(directory, Some((records_in, records))));
@@ -2065,5 +2253,107 @@ mod tests {
         assert_eq!(ended.err().as_deref(), Some("silent too long"));
         assert!(failed_at.elapsed() < Duration::from_secs(1));
         Ok(())
+    }
+
+    /// The whole publisher over loopback relays: it probes, chooses two on distinct networks,
+    /// publishes compressed to both, and when one redirects at its
+    /// first batch, the next in the ranking takes its place after the failover jitter.
+    #[tokio::test]
+    async fn the_publisher_sends_to_two_networks_and_fails_over_from_a_redirect()
+    -> Result<(), String> {
+        use crate::probe::tests::{Fake, Mode, echo_relay};
+        // The three relays are equally near. What a probe times between them on loopback is this
+        // host's scheduling (one test thread runs the feeder and all three relays), which under
+        // load spreads past the band and leaves out whichever relay it happens to slow. So every
+        // relay is probed for real (signed reply, headroom, network) and read at one time.
+        const LOOPBACK: Duration = Duration::from_millis(1);
+        let error = |error: tally_wire::WireError| error.to_string();
+        let (taken, mut arrivals) = mpsc::unbounded_channel();
+        // The redirecting relay declares overwhelming capacity, so the ranking puts it first.
+        let mut fakes = Vec::new();
+        for (ip, network, slots, mode) in [
+            ("127.0.0.1", 1, 1, Mode::Serve),
+            ("127.0.0.2", 2, 1_000_000, Mode::RedirectOnBatch),
+            ("127.0.0.3", 3, 1, Mode::Serve),
+        ] {
+            let fake = Fake {
+                ip,
+                batches: Some(taken.clone()),
+                ..Fake::new(Identity::generate().map_err(error)?, network, slots, mode)
+            };
+            fakes.push(echo_relay(fake).await?);
+        }
+        let feeder = Identity::generate().map_err(error)?;
+        let directory = Directory::new(
+            scratch(),
+            fakes.clone(),
+            Vec::new(),
+            feeder.clone(),
+            Some(Location {
+                lat_e7: 339_400_000,
+                lon_e7: -1_184_000_000,
+                alt_m: 30,
+                precision_m: 0,
+            }),
+            Clock::Dump1090,
+        )?;
+        let (batches, _) = broadcast::channel(64);
+        let publisher = tokio::spawn(run(Publishing {
+            directory: Arc::clone(&directory),
+            identity: feeder.clone(),
+            batches: batches.clone(),
+            ceiling: 64_000,
+            checker: DeliveryChecker::default(),
+            checking: Checking::default(),
+            prober: |relay, me| {
+                Box::pin(async move {
+                    let mut probed = probe::probe(&relay, &me).await?;
+                    probed.measured.rtt = LOOPBACK;
+                    Ok(probed)
+                })
+            },
+        }));
+        let sending = tokio::spawn(async move {
+            for sequence in 0.. {
+                if let Ok(batch) = batch(&feeder, sequence) {
+                    let _ = batches.send(Arc::new(Record::Batch(batch)));
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        });
+        let mut heard: HashSet<PublicKey> = HashSet::new();
+        let serving: HashSet<PublicKey> = [fakes[0].key, fakes[2].key].into_iter().collect();
+        let waited = tokio::time::timeout(Duration::from_secs(60), async {
+            while heard != serving {
+                match arrivals.recv().await {
+                    Some((relay, _)) => {
+                        heard.insert(relay);
+                    }
+                    None => return,
+                }
+            }
+        })
+        .await;
+        sending.abort();
+        publisher.abort();
+        waited.map_err(|_| {
+            format!(
+                "only {} of the two serving relays took batches",
+                heard.len()
+            )
+        })?;
+        // The redirecting relay is left for as long as it asked, and the feeder says so.
+        assert!(directory.avoided().contains(&fakes[1].key));
+        Ok(())
+    }
+
+    #[test]
+    fn full_leaving_and_refused_are_leave_me_and_the_rest_retry() {
+        for reason in [Reason::Full, Reason::Leaving, Reason::Refused] {
+            assert!(matches!(goodbye(reason, 60), Outcome::Leave(_)));
+        }
+        for reason in [Reason::Protocol, Reason::Version, Reason::Other(9)] {
+            assert!(matches!(goodbye(reason, 60), Outcome::Retry(_)));
+        }
     }
 }

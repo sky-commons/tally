@@ -1,0 +1,18 @@
+[package]
+name = "tally-api-types"
+description = "The Tally API's public JSON (RFC-0173 §2.5), one declaration that tally-api serialises and every client deserialises: serde only, no I/O."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+serde.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[lints]
+workspace = true

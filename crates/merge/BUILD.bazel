@@ -1,0 +1,46 @@
+load("@rules_rust//cargo:defs.bzl", "extract_cargo_lints")
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test", "rustfmt_test")
+
+package(default_visibility = ["//tally:__subpackages__"])
+
+exports_files(["Cargo.toml"])
+
+extract_cargo_lints(
+    name = "cargo_lints",
+    manifest = "Cargo.toml",
+    workspace = "//tally:Cargo.toml",
+)
+
+rust_library(
+    name = "merge",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "tally_merge",
+    edition = "2024",
+    lint_config = ":cargo_lints",
+    version = "0.1.0",
+    deps = [
+        "//tally/crates/mlat-solver",
+        "//tally/crates/relay",
+        "//tally/crates/wire",
+        "@tally_crates//:blake2",
+        "@tally_crates//:libm",
+        "@tally_crates//:tokio",
+    ],
+)
+
+rust_test(
+    name = "merge_test",
+    size = "medium",
+    crate = ":merge",
+    edition = "2024",
+    lint_config = ":cargo_lints",
+    deps = ["//tally/crates/mlat"],
+)
+
+rustfmt_test(
+    name = "rustfmt",
+    targets = [
+        ":merge",
+        ":merge_test",
+    ],
+)

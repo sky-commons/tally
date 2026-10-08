@@ -1,0 +1,57 @@
+load("@rules_rust//cargo:defs.bzl", "extract_cargo_lints")
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test", "rustfmt_test")
+
+package(default_visibility = ["//tally:__subpackages__"])
+
+exports_files(["Cargo.toml"])
+
+# The Tally API's public JSON (RFC-0173 §2.5): one declaration tally-api serialises and every client
+# reads. A client in another crate universe compiles this same file into itself (`srcs`; the
+# Flightlines client core does, from core/crates/tally-reads), so the types are this text and never a
+# copy of it; the fixtures in testdata/ are what tally-api writes (its fixtures_test) and what a
+# client's test reads.
+filegroup(
+    name = "srcs",
+    srcs = glob(["src/**/*.rs"]),
+    visibility = ["//visibility:public"],
+)
+
+filegroup(
+    name = "testdata",
+    srcs = glob(["testdata/*.json"]),
+    visibility = ["//visibility:public"],
+)
+
+extract_cargo_lints(
+    name = "cargo_lints",
+    manifest = "Cargo.toml",
+    workspace = "//tally:Cargo.toml",
+)
+
+rust_library(
+    name = "api-types",
+    srcs = [":srcs"],
+    compile_data = [":testdata"],
+    crate_name = "tally_api_types",
+    edition = "2024",
+    lint_config = ":cargo_lints",
+    version = "0.1.0",
+    deps = ["@tally_crates//:serde"],
+)
+
+rust_test(
+    name = "api-types_test",
+    size = "small",
+    crate = ":api-types",
+    edition = "2024",
+    lint_config = ":cargo_lints",
+    deps = ["@tally_crates//:serde_json"],
+)
+
+rustfmt_test(
+    name = "rustfmt",
+    targets = [
+        ":api-types",
+        ":api-types_test",
+    ],
+)

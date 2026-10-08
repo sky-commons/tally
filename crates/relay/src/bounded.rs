@@ -43,6 +43,11 @@ impl<K: Hash + Eq + Clone, V> Bounded<K, V> {
         self.entries.get(key).map(|(_, value)| value)
     }
 
+    /// Changing a value in place does not count as activity either.
+    pub fn get_mut(&mut self, key: &K) -> Option<&mut V> {
+        self.entries.get_mut(key).map(|(_, value)| value)
+    }
+
     /// Writes `key`. A key not held is ranked as active now; a key held keeps its rank. Forgets
     /// the key least recently active if that is one too many, and returns it: never `key` itself.
     pub fn insert(&mut self, key: K, value: V) -> Option<K> {
@@ -60,6 +65,27 @@ impl<K: Hash + Eq + Clone, V> Bounded<K, V> {
         let (_, first) = self.order.pop_first()?;
         self.entries.remove(&first);
         Some(first)
+    }
+
+    /// The key least recently active, and its value: the next `forget_first` forgets.
+    pub fn first(&self) -> Option<(&K, &V)> {
+        let (_, key) = self.order.first_key_value()?;
+        self.entries.get(key).map(|(_, value)| (key, value))
+    }
+
+    /// Forgets the key least recently active and returns it with its value, for a caller that
+    /// accounts for what each value holds.
+    pub fn pop_first(&mut self) -> Option<(K, V)> {
+        let (_, first) = self.order.pop_first()?;
+        let (_, value) = self.entries.remove(&first)?;
+        Some((first, value))
+    }
+
+    /// Forgets `key`, returning its value.
+    pub fn remove(&mut self, key: &K) -> Option<V> {
+        let (rank, value) = self.entries.remove(key)?;
+        self.order.remove(&rank);
+        Some(value)
     }
 
     fn write(&mut self, key: K, value: V, active: bool) -> Option<K> {
@@ -101,6 +127,10 @@ impl<K: Hash + Eq + Clone, V> Bounded<K, V> {
 
     pub fn values(&self) -> impl Iterator<Item = &V> {
         self.entries.values().map(|(_, value)| value)
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&K, &V)> {
+        self.entries.iter().map(|(key, (_, value))| (key, value))
     }
 
     pub fn len(&self) -> usize {
