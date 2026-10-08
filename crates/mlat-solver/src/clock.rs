@@ -9,8 +9,17 @@ use crate::scope::{Citation, Window};
 
 /// The version of this crate's specification (the module docs of `lib.rs`). A published solution
 /// or clock model names it; two engines agree exactly only under the same version. Version 2 added
-/// the gauge's rate and the sync aircraft's position biases.
-pub const SPEC_VERSION: u16 = 3;
+/// the gauge's rate and the sync aircraft's position biases; version 3 the tile models; version 4
+/// fits a GNSS-disciplined clock as it behaves (no prior ties it to the gauge's stamps) and drops a
+/// clock nothing places.
+pub const SPEC_VERSION: u16 = 4;
+
+// Relays judge fault proofs by the tolerance the wire sets per version: a version the wire does
+// not know would make every proof of it unjudgeable (as bumping to 4 once did in `tally-merge`).
+const _: () = assert!(
+    tally_wire::Tolerance::for_spec(SPEC_VERSION).is_some(),
+    "tally_wire::Tolerance::for_spec does not know this SPEC_VERSION"
+);
 
 /// Picoseconds per second.
 pub const PS: i128 = 1_000_000_000_000;
@@ -112,11 +121,12 @@ impl Timebase {
     /// The default timing noise before the clock model estimates it, seconds.
     pub fn default_noise_s(self) -> f64 {
         match self {
-            // What a 12 MHz clock is taken as until its own receptions estimate it: the worst
-            // common class (a dump1090-class dongle, about 500 ns), so a clock heard too little
-            // to estimate is never taken as better than it may be.
-            Self::Mhz12 => 500e-9,
-            Self::GpsNanos => 30e-9,
+            // What any clock is taken as until its own receptions estimate it: the worst common
+            // class (a dump1090-class dongle, about 500 ns), so a clock heard too little to
+            // estimate is never taken as better than it may be. A GNSS declaration is the
+            // feeder's word, not a measurement: version 3 took a GNSS clock at 30 ns, and one
+            // whose counter was noise (OpenSky's data has them) lost a tile's robust start.
+            Self::Mhz12 | Self::GpsNanos => 500e-9,
         }
     }
 

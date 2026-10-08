@@ -903,6 +903,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "tally-mlat-calibrate"
+version = "0.1.0"
+dependencies = [
+ "blake2",
+ "tally-mlat",
+ "tally-mlat-solver",
+ "tally-wire",
+]
+
+[[package]]
 name = "tally-mlat-solver"
 version = "0.1.0"
 dependencies = [

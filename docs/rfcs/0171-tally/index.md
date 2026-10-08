@@ -502,8 +502,11 @@ over it. As built:
   normal case: a model is a few kilobytes, about 6 KB at 30 members), its manifest, then the
   positions citing it. The manifest frames the specification's bytes rather than restating them,
   and carries the hash of the model's inputs, which is what a client matches models by.
-- The specification is version 3 (tile models, the addressed citation, dropped clocks; version 2
-  added the gauge's rate and the reference aircraft's position biases, version 1 had neither). A
+- The specification is version 4 (version 3's tile models, addressed citation and dropped clocks,
+  and from the calibration over real receivers below: a clock that declares GNSS discipline is
+  fitted as it behaves, a clock nothing places is dropped rather than failing its tile, and the
+  last jump scan is at the published estimate a verifier scans; version 2 added the gauge's rate
+  and the reference aircraft's position biases, version 1 had neither). A
   model or solution names its version, and two relays agree exactly only under the same one.
   From version 3 two signed models of one inputs that differ are not a fault (optimality is
   within tolerance, so honest relays may differ in the last bits); a proof of that form is
@@ -564,23 +567,80 @@ over it. As built:
 - The simulator's calibration holds under a realistic clock mix (a third of receivers at 50 to
   100 ns, a third at 250 ns, a third dump1090-class at 500 ns) and each aircraft's GNSS error
   drawn once from its NACp: with the published floor and inflation stripped, the truth is inside
-  the 95% ellipsoid for 0.950 overall and 0.949 for Mode S only over forty scenarios, 0.938,
-  0.957, 0.953 and 0.956 at the four tile levels, 0.956, 0.939 and 0.954 by altitude band, and
-  0.948 for transmissions whose hearers lie outside their tile, for a median horizontal error of
-  31.4 m; the published ellipsoid covers 0.979. All clocks at 80, 250 or 500 ns give 0.940 to
-  0.942. Fixes are jointly calibrated: two aircraft under one model cover 0.968 jointly, one
-  aircraft's consecutive fixes 0.951, their clock correlation 0.002 to 0.005; gluing two tiles'
+  the 95% ellipsoid for 0.953 overall and 0.952 for Mode S only over forty scenarios, 0.945,
+  0.961, 0.955 and 0.951 at the four tile levels, 0.959, 0.944 and 0.955 by altitude band, and
+  0.950 for transmissions whose hearers lie outside their tile, for a median horizontal error of
+  31.5 m; the published ellipsoid covers 0.979 (version 3: 0.950, 0.949, 0.938 to 0.957, 0.939
+  to 0.956, 0.948, 31.4 m and 0.979). All clocks at 80, 250 or 500 ns give 0.940 to
+  0.942. Fixes are jointly calibrated: two aircraft under one model cover 0.965 jointly, one
+  aircraft's consecutive fixes 0.956, their clock correlation 0.002 to 0.005; gluing two tiles'
   fixes as if independent gives 0.87 to 0.90, the overconfidence the model id exists to show. An
   aircraft crossing from one tile to the next moves its published fix by a median 0.004 and a
-  95th percentile 0.033 squared sigmas. With 500 ns on every receiver and one bad clock stepping
-  5 to 10 µs every 2 s, 77 tiles fit, the bad clock is dropped from every one and coverage is
-  0.942 with no false jump. Every clock 30 ppm fast with a free-running gauge, the fit measures
-  the gauge's rate (16 of 16 within three sigmas) and covers 0.944 against 0.959 with a GNSS
-  gauge. Taking each message's GNSS error as independent, as the first version did, gave 0.933
+  95th percentile 0.034 squared sigmas. With 500 ns on every receiver and one bad clock stepping
+  5 to 10 µs every 2 s, 77 tiles fit, the bad clock is dropped where the jump rule finds it (7
+  tiles) and coverage is 0.943 with no false jump. Every clock 30 ppm fast with a free-running
+  gauge, the fit measures the gauge's rate (16 of 16 within three sigmas) and covers 0.945
+  against 0.961 with a GNSS gauge. Receivers that declare GNSS and are not what they declare
+  (one stamping 120.6 µs late throughout, one with 300 µs of jitter, beside an honest one) cost
+  no fit and cover 0.953; one that declares GNSS and whose counter is noise at a millisecond
+  costs no fit and no honest clock and covers 0.965. Taking each message's GNSS error as independent, as the first version did, gave 0.933
   against 0.938 with the bias, and 0.916 against 0.939 when every reference aircraft is NACp 8.
-  **These are the simulator's numbers. Before 0.95 is trusted, it is owed a calibration over
-  real receivers** (§10, step 7): positions solved for aircraft that also broadcast ADS-B, withheld, the
-  coverage of their published ellipsoids measured.
+- **Calibrated over real receivers** (§10, step 7; measured 2026-10-08,
+  `tally/crates/mlat-calibrate`, whose crate documentation states the method). The data is
+  OpenSky's LocaRDS (Strohmeier et al., Sensors 2021; Zenodo 10.5281/zenodo.4739276, CC BY-SA
+  4.0, `fetch.sh` downloads and checks it): one hour of Europe (subset 2, 460 MB zipped), 6.5
+  million ADS-B positions heard by 317 crowdsourced sensors with each sensor's own nanosecond
+  timestamp, its declared site, and the decoded position. Each reception becomes what a feeder
+  would publish: GNSS sensors' stamps (read from the hour: 54, on one UTC scale) become Radarcape
+  GPS counters, the rest 12 MHz counts (exactly the dump1090 counts OpenSky converted); one
+  aircraft in eight (359) is withheld, every report of it sent as a DF4 reply with its pressure
+  altitude, so it is an MLAT target; the rest are DF17 positions that sync the clocks. The
+  engine a relay hosts (`tally_mlat::engine`, relay settings, every solution through the
+  verifier) is driven on a virtual clock, and what it publishes is scored against the withheld
+  reports. It does not test decoding real bytes, real reply rates, or operational status
+  (LocaRDS has none; the type code's containment radius stands in).
+  - *The truth is itself off by about as much as a fix.* A textbook solver over the receptions
+    of LocaRDS-verified GNSS Radarcapes alone, needing no clock model, whose residuals fit 70 ns
+    (median chi-square per degree of freedom 0.63 over 214,000 fixes), covers the reported
+    position 0.47 of the time: an ADS-B report lags its aircraft a median 32 m along the track
+    and scatters beyond its NACp. Against the raw truth every fix looks overconfident (finals
+    cover 0.54 horizontally, 0.82 across the track alone; median horizontal error 121 m against a
+    median claimed sigma of 69 m, the error leaning 39 m along the track). So the truth is
+    widened by what that reference needs to cover 95% (the lag taken off, then 118 m along the
+    track and 39 m across, with which the reference covers 0.947), and a fix is judged by
+    whether it does as well. This says within a few points, not to the third decimal.
+  - *Solver defects it found, fixed (version 4).* Over real receivers a declaration of GNSS
+    discipline is not a measurement: GRX1090s stamp 120.6 µs after Radarcapes (a long message's
+    end, not its start), one Radarcape declaring GPS runs 0.7 s off and drifting 0.09 ppm, and
+    three stamp with hundreds of microseconds of jitter. Version 3 held every disciplined clock
+    to the gauge's stamps (100 ns, rates to 0.001 ppm) and took it at 30 ns until estimated, and
+    let a clock no weighted reception placed leave its normal equations singular: 5,166 of 10,260
+    tile fits over the hour failed. Version 4 fits a declared-GNSS clock as any clock (its
+    discipline shows only as its timebase's curvature), starts every clock at 500 ns, drops a
+    clock nothing places (one receiver costs the tile that receiver, never the tile), and scans
+    the published estimate for jumps last. Over the same hour the failed fits fall to the 1,559
+    with no sync event, the (aircraft, bin) pairs with a final position rise from 0.22 to 0.48 of
+    those heard by three receivers (52,353 to 122,514 final positions), the median horizontal
+    error falls from 135 to 121 m, and coverage against the truth model is unchanged (0.894 to
+    0.895). The simulator moves within its noise (above).
+  - *What it measures, version 4, final positions with the floor and inflation stripped, against
+    the truth model:* 0.895 overall (0.906 published); 0.912, 0.879 and 0.892 below 6 km, 6 to 9
+    km and above; 0.885, 0.884, 0.912, 0.906 and 0.902 with 3, 4, 5 or 6, 7 to 9 and 10 or more
+    receptions; 0.884, 0.931, 0.886 and 0.914 at the four tile levels; 0.927 when every receiver
+    used is GNSS, 0.904 when some are and 0.864 when none is. Over the 45 sensors LocaRDS verified
+    alone (all GNSS) it is 0.941 (0.947 published), and for the aircraft whose ADS-B LocaRDS
+    verified, 0.938 over every sensor and 0.966 over the verified ones. As DF11 replies (no
+    altitude) it is 0.917. Declaring every unverified site to 20 m changes nothing (0.893).
+  - *So:* where the receivers and the truth are what they say, the published covariance is
+    honest (0.94 to 0.97 against a truth that can only say so to a few points). The shortfall
+    with every receiver is in fixes from unverified free-running receivers and from 3 or 4
+    receptions, where nothing is redundant enough to catch a wrong site or a misbehaving
+    counter; LocaRDS cannot tell those apart from a fault of the 12 MHz noise model, because it
+    verifies no dump1090 sensor. The floor and inflation are left as they are: the calibration
+    does not show a uniform overconfidence for them to correct, and widening every fix for the
+    sake of unverified inputs would hide them. Owed: the same calibration over our own receivers
+    with surveyed sites (§10 step 7), and over a dataset whose free-running receivers are
+    verified.
 - An exactly determined transmission (three receptions and the altitude) generally has two
   roots that both fit perfectly; the solver also starts it from a ring about the receivers, and
   refuses it when a second fit as good lies outside the first's 10^-6 ellipsoid (one such DF4,
@@ -609,10 +669,12 @@ over it. As built:
   - *Measured* (the simulator, feeders sealing at phases of their own and paths of 40 to 250 ms):
     published a median 1.34 s after the transmission, 1.65 s at the 95th percentile, 3.0 s at
     most (an aircraft's first, waiting for a model). Calibration with the floor and inflation
-    stripped: 0.941 carried up to 20 s, 0.946 from 20 to 45 s, 0.974 from 45 to 90 s, 0.956 of
-    5,081 overall (0.982 published), for median horizontal errors of 123, 234 and 458 m. The carry
-    costs precision, not honesty. The owed real-receiver calibration gates these as it does the
-    final positions'.
+    stripped: 0.940 carried up to 20 s, 0.947 from 20 to 45 s, 0.975 from 45 to 90 s, 0.956 of
+    5,076 overall (0.982 published), for median horizontal errors of 124, 237 and 468 m. The carry
+    costs precision, not honesty. Over real receivers (above; version 4, the same hour and truth
+    model): 0.929 of 139,600 (0.936 published), 0.962 over the verified sensors alone and 0.959
+    for the verified aircraft, for a median horizontal error of 151 m (version 3: 0.913 of
+    111,955, 174 m).
 - The client merge rule is implemented once, `tally/crates/merge` (`tally-merge`), for every
   client; `tally-api` is the first. It reads positions, clock models (reassembled part by part
   against their manifests), fault proofs and, optionally, raw from any number of relays, and holds
@@ -846,6 +908,9 @@ roughly $200 to $700 a month on budget hosting; today it is one server.
    as the native MLAT over `tally-mlat-solver` (§3.8.1), tested end to end over two real
    relays with the simulator's receivers as feeders and every published solution verified by a
    subscriber; the feeder's 978 MHz input from dump978-fa, in the same signed chain as 1090.
-   Owed: a run with real receivers, and with it the calibration over real receivers that gates
-   trusting the simulator's 0.95 (§3.8.1).
+   Calibrated over real receivers offline (§3.8.1, `tally-mlat-calibrate` over OpenSky's LocaRDS,
+   2026-10-08): it found and fixed three solver defects (specification version 4), and with
+   receivers and truth that are what they say the published covariance covers 0.94 to 0.97,
+   0.895 with every crowdsourced receiver. Owed: a run with our own real receivers, surveyed,
+   and the same calibration over them.
    Then **the Bridge as a receiver** (its own RFC).

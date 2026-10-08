@@ -31,6 +31,11 @@ pub enum FitError {
     UndeclaredJump,
     #[error("the model does not fit its own inputs: {0}")]
     Shape(&'static str),
+    /// Clocks (receiver, counter epoch) none of whose receptions carries weight in a used event:
+    /// nothing places them, so the fit drops them and starts over (`fit_read`); a verifier that
+    /// meets one refuses the model.
+    #[error("{} clocks carry no information", .0.len())]
+    Uninformed(Vec<(PublicKey, u32)>),
 }
 
 /// Parts per million in one unit of `ClockModel::gauge_rate`.
@@ -70,9 +75,6 @@ pub const BARO_BIAS_SIGMA_M: f64 = 100.0;
 pub const RATE_PRIOR_PPM: f64 = 200.0;
 /// The prior on a GNSS-disciplined gauge's rate, parts per million.
 pub const GNSS_GAUGE_RATE_PPM: f64 = 0.001;
-/// GNSS-disciplined clocks agree with a GNSS gauge to this, seconds and dimensionless.
-pub const GNSS_OFFSET_SIGMA_S: f64 = 100e-9;
-pub const GNSS_RATE_SIGMA: f64 = 1e-9;
 /// The floor on a receiver's estimated timing noise, seconds.
 pub const MIN_NOISE_S: f64 = 10e-9;
 /// The farthest a receiver may be from a position it is said to have heard, metres.
@@ -1091,6 +1093,10 @@ impl State {
         weighting: Weighting,
     ) -> Result<Step, FitError> {
         let (normal, gradient, eliminated) = self.normal_equations(problem, noise, weighting)?;
+        let uninformed = uninformed(problem.layout, &eliminated);
+        if !uninformed.is_empty() {
+            return Err(FitError::Uninformed(uninformed));
+        }
         let factor = normal.factor().ok_or(FitError::Singular)?;
         let mut rhs = gradient.clone();
         rhs.slices
@@ -1170,30 +1176,6 @@ impl State {
                     theta(b) - theta(a),
                     RATE_PRIOR_PPM * 1e-6 * C * spacing_s,
                 )?;
-            }
-            if gauge.timebase.disciplined() && clock.timebase.disciplined() {
-                let difference =
-                    (clock.base - gauge.base + DAY_NS / 2).rem_euclid(DAY_NS) - DAY_NS / 2;
-                let target = C * difference as f64 * 1e-9;
-                for knot in clock.first..clock.end {
-                    let Some(a) = at(knot) else { continue };
-                    add_prior(
-                        normal,
-                        gradient,
-                        &[(a, 1.0)],
-                        theta(a) - target,
-                        GNSS_OFFSET_SIGMA_S * C,
-                    )?;
-                    if let Some(b) = at(knot + 1) {
-                        add_prior(
-                            normal,
-                            gradient,
-                            &[(b, 1.0), (a, -1.0)],
-                            theta(b) - theta(a),
-                            GNSS_RATE_SIGMA * C * spacing_s,
-                        )?;
-                    }
-                }
             }
         }
         for (param, sigma) in &layout.priors {
@@ -1393,6 +1375,39 @@ struct Step {
     gradient: Vector,
     delta: Vector,
     events: Vec<Eliminated>,
+}
+
+/// The clocks (receiver and epoch, ascending) other than the gauge that no reception with weight
+/// in a used event places: every reception of theirs is beyond the robust cutoff, or in events
+/// whose own parameters nothing else fixes. Their offsets are then free (only the curvature and
+/// first rate priors bind them, which say nothing of a level), so the normal equations are
+/// singular; a real receiver whose stamps are garbage, or a fit that leaves one clock with no
+/// partner, does this. Such a clock costs the tile that receiver, never the tile.
+fn uninformed(layout: &Layout, eliminated: &[Eliminated]) -> Vec<(PublicKey, u32)> {
+    let clock_of: BTreeMap<At, usize> = layout
+        .places
+        .iter()
+        .map(|((clock, _), at)| (*at, *clock))
+        .collect();
+    let mut informed: BTreeSet<usize> = BTreeSet::new();
+    for event in eliminated.iter().filter(|event| event.hll.is_some()) {
+        for row in event.rows.iter().filter(|row| row.weight > 0.0) {
+            for (at, value) in row.global.as_slice() {
+                if *value != 0.0
+                    && let Some(clock) = clock_of.get(at)
+                {
+                    informed.insert(*clock);
+                }
+            }
+        }
+    }
+    let mut out: BTreeSet<(PublicKey, u32)> = BTreeSet::new();
+    for (index, clock) in layout.shape.clocks.iter().enumerate() {
+        if clock.key != layout.shape.gauge && !informed.contains(&index) {
+            out.insert((clock.key.receiver, clock.key.epoch));
+        }
+    }
+    out.into_iter().collect()
 }
 
 /// Accumulates one event's rows into the reduced normal equations, eliminating its four local
@@ -1959,158 +1974,197 @@ fn fit_read_from(
     let mut jumps: Vec<Jump> = Vec::new();
     let mut dropped: BTreeSet<(PublicKey, u32)> = BTreeSet::new();
     loop {
-        let events = without(&read.events, &read.rxs, &dropped);
-        let boundaries = boundaries_of(&jumps);
-        let shape = shape(
-            &read.sites,
-            &read.rxs,
-            &events,
-            &boundaries,
-            &read.hearers,
-            gauge,
-        )?;
-        let layout = Layout::new(shape, &read.sites, &read.rxs, &events);
-        if layout.events.is_empty() {
-            return Err(FitError::NoSyncEvents);
-        }
-        let problem = Problem {
-            sites: &read.sites,
-            rxs: &read.rxs,
-            events: &events,
-            layout: &layout,
-        };
-        let mut noise = BTreeMap::new();
-        let warm = prior.and_then(|prior| {
-            let state = State::warm(prior, &problem)?;
-            let known: BTreeMap<ClockKey, f64> = prior
-                .pieces
-                .iter()
-                .map(|piece| (piece.key, piece.noise_ps as f64 * 1e-12))
-                .collect();
-            Some((state, known))
-        });
-        let mut state = match warm {
-            Some((mut state, known)) => {
-                noise.extend(known);
-                state.settle_events(&problem, &noise);
-                state
-            }
-            None => {
-                let mut state = State::start(&problem);
-                state.step(&problem, &noise, Weighting::Unit)?;
-                for _ in 0..HUBER_STEPS {
-                    state.step(&problem, &noise, Weighting::Huber)?;
+        match attempt(inputs, read, gauge, max_jumps, prior, &jumps, &dropped) {
+            Ok(Attempt::Done(done)) => return Ok(*done),
+            Ok(Attempt::Jump(jump)) => admit(&mut jumps, &mut dropped, jump, max_jumps)?,
+            // Clocks nothing places are dropped, their jumps with them, and the fit starts over:
+            // each pass drops at least one, so it ends.
+            Err(FitError::Uninformed(clocks)) => {
+                let before = dropped.len();
+                dropped.extend(clocks);
+                if dropped.len() == before {
+                    return Err(FitError::Singular);
                 }
-                state
+                jumps.retain(|jump| !dropped.contains(&(jump.receiver, jump.epoch)));
             }
-        };
-        if max_jumps > 0
-            && let Some(jump) = find_jump(&problem, &state)
-        {
-            admit(&mut jumps, &mut dropped, jump, max_jumps)?;
-            continue;
+            Err(error) => return Err(error),
         }
-        noise.extend(robust_noise(&problem, &state));
-        for round in 1..=NOISE_ROUNDS.1 {
-            let step = state.step(&problem, &noise, Weighting::Final)?;
-            let inverse = step.factor.selected_inverse();
-            let estimates = estimate_noise(&problem, &state, &step, &inverse);
-            let settled = estimates.iter().all(|(key, value)| {
-                noise
-                    .get(key)
-                    .is_some_and(|old: &f64| (value - old).abs() <= NOISE_SETTLED * old)
-            });
-            noise.extend(estimates);
-            if round >= NOISE_ROUNDS.0 && settled {
+    }
+}
+
+/// What one pass of a fit ends in: a model, or a jump to declare before the next.
+enum Attempt {
+    Done(Box<(ClockModel, Calibrated)>),
+    Jump(Jump),
+}
+
+/// One pass of `fit_read_from` with the jumps and dropped clocks so far.
+fn attempt(
+    inputs: &Inputs,
+    read: &Read<'_>,
+    gauge: Option<PublicKey>,
+    max_jumps: usize,
+    prior: Option<&ClockModel>,
+    jumps: &[Jump],
+    dropped: &BTreeSet<(PublicKey, u32)>,
+) -> Result<Attempt, FitError> {
+    let events = without(&read.events, &read.rxs, dropped);
+    let boundaries = boundaries_of(jumps);
+    let shape = shape(
+        &read.sites,
+        &read.rxs,
+        &events,
+        &boundaries,
+        &read.hearers,
+        gauge,
+    )?;
+    let layout = Layout::new(shape, &read.sites, &read.rxs, &events);
+    if layout.events.is_empty() {
+        return Err(FitError::NoSyncEvents);
+    }
+    let problem = Problem {
+        sites: &read.sites,
+        rxs: &read.rxs,
+        events: &events,
+        layout: &layout,
+    };
+    let mut noise = BTreeMap::new();
+    let warm = prior.and_then(|prior| {
+        let state = State::warm(prior, &problem)?;
+        let known: BTreeMap<ClockKey, f64> = prior
+            .pieces
+            .iter()
+            .map(|piece| (piece.key, piece.noise_ps as f64 * 1e-12))
+            .collect();
+        Some((state, known))
+    });
+    let mut state = match warm {
+        Some((mut state, known)) => {
+            noise.extend(known);
+            state.settle_events(&problem, &noise);
+            state
+        }
+        None => {
+            let mut state = State::start(&problem);
+            state.step(&problem, &noise, Weighting::Unit)?;
+            for _ in 0..HUBER_STEPS {
+                state.step(&problem, &noise, Weighting::Huber)?;
+            }
+            state
+        }
+    };
+    if max_jumps > 0
+        && let Some(jump) = find_jump(&problem, &state)
+    {
+        return Ok(Attempt::Jump(jump));
+    }
+    noise.extend(robust_noise(&problem, &state));
+    for round in 1..=NOISE_ROUNDS.1 {
+        let step = state.step(&problem, &noise, Weighting::Final)?;
+        let inverse = step.factor.selected_inverse();
+        let estimates = estimate_noise(&problem, &state, &step, &inverse);
+        let settled = estimates.iter().all(|(key, value)| {
+            noise
+                .get(key)
+                .is_some_and(|old: &f64| (value - old).abs() <= NOISE_SETTLED * old)
+        });
+        noise.extend(estimates);
+        if round >= NOISE_ROUNDS.0 && settled {
+            break;
+        }
+    }
+    // Final steps until one moves the estimate by less than `CONVERGED` squared standard
+    // deviations, at least `FINAL_STEPS` and at most `MAX_FINAL_STEPS`.
+    for taken in 1..=MAX_FINAL_STEPS {
+        let step = state.step(&problem, &noise, Weighting::Final)?;
+        let moved = -step.delta.dot(&step.gradient);
+        if taken >= FINAL_STEPS && moved <= CONVERGED {
+            break;
+        }
+    }
+    // A jump the final estimate still shows is split too, and the fit starts over: so a
+    // model that is published shows none above the threshold, which a verifier checks.
+    if max_jumps > 0
+        && let Some(jump) = find_jump(&problem, &state)
+    {
+        return Ok(Attempt::Jump(jump));
+    }
+    let mut jumps = jumps.to_vec();
+    jumps.sort_unstable();
+    let mut fixups = 0;
+    loop {
+        let mut model = build_model(inputs, &problem, &state, &noise, jumps.clone())?;
+        // The estimate as a verifier will see it: the published model, its events settled
+        // from their priors with the clocks held (`State::at`). Under robust weights an event
+        // can settle into another of its optima than the joint iteration left it in; then the
+        // fit goes on from there, so what is published is an optimum of what anyone rebuilds.
+        // The step at the published estimate that shows it converged is its calibration too:
+        // its factor's selected inverse is what solving under the model needs (folded, not
+        // formed again).
+        model.dropped = dropped.iter().copied().collect();
+        let mut at_estimate: Option<(State, Step)> = None;
+        for _ in 0..RESETTLE_PASSES {
+            let (mut settled, published) = State::at(&model, &problem);
+            let step = settled.system(&problem, &published, Weighting::Final)?;
+            if -step.delta.dot(&step.gradient) <= CONVERGED {
+                at_estimate = Some((settled, step));
                 break;
             }
-        }
-        // Final steps until one moves the estimate by less than `CONVERGED` squared standard
-        // deviations, at least `FINAL_STEPS` and at most `MAX_FINAL_STEPS`.
-        for taken in 1..=MAX_FINAL_STEPS {
-            let step = state.step(&problem, &noise, Weighting::Final)?;
-            let moved = -step.delta.dot(&step.gradient);
-            if taken >= FINAL_STEPS && moved <= CONVERGED {
-                break;
-            }
-        }
-        // A jump the final estimate still shows is split too, and the fit starts over: so a
-        // model that is published shows none above the threshold, which a verifier checks.
-        if max_jumps > 0
-            && let Some(jump) = find_jump(&problem, &state)
-        {
-            admit(&mut jumps, &mut dropped, jump, max_jumps)?;
-            continue;
-        }
-        jumps.sort_unstable();
-        let mut fixups = 0;
-        loop {
-            let mut model = build_model(inputs, &problem, &state, &noise, jumps.clone())?;
-            // The estimate as a verifier will see it: the published model, its events settled
-            // from their priors with the clocks held (`State::at`). Under robust weights an event
-            // can settle into another of its optima than the joint iteration left it in; then the
-            // fit goes on from there, so what is published is an optimum of what anyone rebuilds.
-            // The step at the published estimate that shows it converged is its calibration too:
-            // its factor's selected inverse is what solving under the model needs (folded, not
-            // formed again).
-            model.dropped = dropped.iter().copied().collect();
-            let mut at_estimate: Option<(State, Step)> = None;
-            for _ in 0..RESETTLE_PASSES {
-                let (mut settled, published) = State::at(&model, &problem);
-                let step = settled.system(&problem, &published, Weighting::Final)?;
-                if -step.delta.dot(&step.gradient) <= CONVERGED {
-                    at_estimate = Some((settled, step));
+            settled.apply(&step);
+            for taken in 2..=MAX_FINAL_STEPS {
+                let step = settled.step(&problem, &published, Weighting::Final)?;
+                if taken >= FINAL_STEPS && -step.delta.dot(&step.gradient) <= CONVERGED {
                     break;
                 }
-                settled.apply(&step);
-                for taken in 2..=MAX_FINAL_STEPS {
-                    let step = settled.step(&problem, &published, Weighting::Final)?;
-                    if taken >= FINAL_STEPS && -step.delta.dot(&step.gradient) <= CONVERGED {
-                        break;
-                    }
-                }
-                model = build_model(inputs, &problem, &settled, &published, jumps.clone())?;
-                model.dropped = dropped.iter().copied().collect();
             }
-            let (settled, step) = match at_estimate {
-                Some(found) => found,
-                None => {
-                    let (settled, published) = State::at(&model, &problem);
-                    let step = settled.system(&problem, &published, Weighting::Final)?;
-                    (settled, step)
-                }
-            };
-            let inverse = step.factor.selected_inverse();
-            // The noise the rule estimates at the published estimate: a clock published well
-            // below it would be refused (understated noise), so the noise is taken from there and
-            // the final steps run again, at most `NOISE_FIXUPS` times.
-            let estimates = estimate_noise(&problem, &settled, &step, &inverse);
-            let understated = model.pieces.iter().any(|piece| {
-                estimates.get(&piece.key).is_some_and(|estimate| {
-                    (piece.noise_ps as f64) * 1e-12
-                        < (1.0 - crate::verify::NOISE_BAND / 2.0) * estimate
-                })
-            });
-            if understated && fixups < NOISE_FIXUPS {
-                fixups += 1;
-                noise.extend(estimates);
-                state = settled;
-                for taken in 1..=MAX_FINAL_STEPS {
-                    let step = state.step(&problem, &noise, Weighting::Final)?;
-                    if taken >= FINAL_STEPS && -step.delta.dot(&step.gradient) <= CONVERGED {
-                        break;
-                    }
-                }
-                continue;
-            }
-            let calibrated = Calibrated {
-                model: model.clone(),
-                places: layout.places.clone(),
-                rate: layout.rate(),
-                inverse,
-            };
-            return Ok((model, calibrated));
+            model = build_model(inputs, &problem, &settled, &published, jumps.clone())?;
+            model.dropped = dropped.iter().copied().collect();
         }
+        let (settled, step) = match at_estimate {
+            Some(found) => found,
+            None => {
+                let (settled, published) = State::at(&model, &problem);
+                let step = settled.system(&problem, &published, Weighting::Final)?;
+                (settled, step)
+            }
+        };
+        // What a verifier scans for undeclared jumps is the published estimate, so that is what
+        // is scanned last: a step there is split as one the joint estimate shows (a clock whose
+        // stamps are noise can show a step only once its events are settled from their priors).
+        if max_jumps > 0
+            && let Some(jump) = find_jump(&problem, &settled)
+        {
+            return Ok(Attempt::Jump(jump));
+        }
+        let inverse = step.factor.selected_inverse();
+        // The noise the rule estimates at the published estimate: a clock published well
+        // below it would be refused (understated noise), so the noise is taken from there and
+        // the final steps run again, at most `NOISE_FIXUPS` times.
+        let estimates = estimate_noise(&problem, &settled, &step, &inverse);
+        let understated = model.pieces.iter().any(|piece| {
+            estimates.get(&piece.key).is_some_and(|estimate| {
+                (piece.noise_ps as f64) * 1e-12 < (1.0 - crate::verify::NOISE_BAND / 2.0) * estimate
+            })
+        });
+        if understated && fixups < NOISE_FIXUPS {
+            fixups += 1;
+            noise.extend(estimates);
+            state = settled;
+            for taken in 1..=MAX_FINAL_STEPS {
+                let step = state.step(&problem, &noise, Weighting::Final)?;
+                if taken >= FINAL_STEPS && -step.delta.dot(&step.gradient) <= CONVERGED {
+                    break;
+                }
+            }
+            continue;
+        }
+        let calibrated = Calibrated {
+            model: model.clone(),
+            places: layout.places.clone(),
+            rate: layout.rate(),
+            inverse,
+        };
+        return Ok(Attempt::Done(Box::new((model, calibrated))));
     }
 }
 
@@ -2512,6 +2566,70 @@ mod tests {
     use crate::linalg::Matrix;
     use crate::scope::{Sites, Window, WindowIndex};
     use crate::sim::{self, Scenario};
+
+    /// A clock none of whose receptions carries weight has a free offset: the system is singular
+    /// (in floating point it may still factor, on a vanishing pivot, which is worse: the free
+    /// offset is solved to noise), and `uninformed` names that clock and no other, so the fit drops it and goes on
+    /// (`fit_read_from`) instead of failing the tile. Real receivers do this (OpenSky's LocaRDS:
+    /// clocks left with no usable event, and clocks every reception of which is beyond the
+    /// cut-off); here one honest clock is given a noise so small that every reception of it is.
+    #[test]
+    fn a_clock_with_no_weight_is_named_uninformed_and_nothing_else_is() -> Result<(), String> {
+        let simulation = sim::run(&Scenario {
+            duration_s: 12.0,
+            ..Scenario::new(3)
+        });
+        let bins: Vec<_> = crate::held::bins_of(&simulation.receptions)
+            .into_values()
+            .collect();
+        let sites = Sites::new(&simulation.sites());
+        let bin = bins.last().ok_or("no bins")?.bin;
+        let index = WindowIndex::new(Window::canonical(bin), &bins, &sites);
+        let plan = index.plan();
+        let tile = plan.tiles().into_iter().next().ok_or("no tile")?;
+        let inputs = index
+            .inputs(tile, &plan.members[&tile])
+            .ok_or("no inputs")?;
+        let model = fit(&inputs).map_err(|e| e.to_string())?;
+        let read = read(&inputs);
+        let layout = Layout::new(
+            Shape::of_model(&model),
+            &read.sites,
+            &read.rxs,
+            &read.events,
+        );
+        let problem = Problem {
+            sites: &read.sites,
+            rxs: &read.rxs,
+            events: &read.events,
+            layout: &layout,
+        };
+        let (state, mut noise) = State::at(&model, &problem);
+        let (_, _, eliminated) = state
+            .normal_equations(&problem, &noise, Weighting::Final)
+            .map_err(|e| e.to_string())?;
+        assert!(uninformed(&layout, &eliminated).is_empty());
+        let silenced = layout
+            .shape
+            .clocks
+            .iter()
+            .find(|clock| clock.key != layout.shape.gauge)
+            .ok_or("one clock")?
+            .key;
+        noise.insert(silenced, 1e-15);
+        let (_, _, eliminated) = state
+            .normal_equations(&problem, &noise, Weighting::Final)
+            .map_err(|e| e.to_string())?;
+        assert_eq!(
+            uninformed(&layout, &eliminated),
+            vec![(silenced.receiver, silenced.epoch)]
+        );
+        assert!(matches!(
+            state.system(&problem, &noise, Weighting::Final),
+            Err(FitError::Uninformed(_))
+        ));
+        Ok(())
+    }
 
     /// (a) A scope's time-banded system solves and selectively inverts as the same system dense:
     /// every step and every block of the selected inverse to within 1e-12, relative.

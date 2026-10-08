@@ -7,7 +7,9 @@
 //! the same raw observations. This crate is that mathematics; `tally-mlat` is the engine around
 //! it.
 //!
-//! This documentation is the specification (version [`clock::SPEC_VERSION`]). It is written so an
+//! This documentation is the specification (version [`clock::SPEC_VERSION`]; version 4 trusts no
+//! receiver's declaration of GNSS discipline beyond its timebase, from the calibration over real
+//! receivers, § The least-squares problem). It is written so an
 //! independent implementation makes the same discrete decisions: holding, windows, tiles,
 //! members and assignment are decided by content in integers (the tile module refuses floating
 //! point at compile time), grouping and the feasibility screen are exact integer arithmetic on raw
@@ -160,7 +162,8 @@
 //! the published covariance is worth is what the simulator measures (§ The clock model, the noise
 //! margin; the calibration tests: single, by level, by altitude band, at the tile's edge, and
 //! jointly for solutions sharing a tile), and what a calibration against real receivers' truth
-//! shows (RFC-0171 §3.8.1: owed, the gate before trusting 0.95).
+//! shows (RFC-0171 §3.8.1, `tally-mlat-calibrate` over OpenSky's LocaRDS: the truth there, each
+//! aircraft's own ADS-B position, is itself off by tens of metres, so it bounds what can be said).
 //!
 //! # The clock model ([`sync::fit`])
 //!
@@ -228,8 +231,8 @@
 //! - a reception: `t + r (t - t_e) - T - |X - site| / c`, `t` the clock's time and `t_e` the
 //!   nominal time of the event's first reception (so the rate's column is a time difference
 //!   within the event, and `T` absorbs `r t_e` exactly), with the clock's timing noise plus its
-//!   site variance (a clock's noise starts from its residuals' robust scale, and is 500 ns for a
-//!   12 MHz clock and 30 ns for a GPS one until its receptions estimate it);
+//!   site variance (a clock's noise starts from its residuals' robust scale, and is 500 ns for any
+//!   clock, whatever it declares, until its receptions estimate it);
 //! - an event's position prior: east and north of the decoded position plus the aircraft's
 //!   horizontal bias, and up about the reported altitude plus its vertical bias;
 //! - curvature: every clock, the gauge too, wanders as an integrated random walk whose second
@@ -241,9 +244,17 @@
 //!   (Sherman-Morrison);
 //! - each clock's first interval's rate: 0 with 200 ppm; the gauge's rate: 0 with 200 ppm when it
 //!   runs free, 0.001 ppm when it is GNSS-disciplined;
-//! - each bias: 0 with its prior (§ Sync events);
-//! - when the gauge is GNSS-disciplined, each other disciplined clock's knots: the difference of
-//!   the stamps with 100 ns, and every interval's rate 0 with 0.001 ppm.
+//! - each bias: 0 with its prior (§ Sync events).
+//!
+//! Nothing ties a GNSS-disciplined clock to the gauge's stamps: its offset and rate are fitted
+//! from the sync events as any clock's are, and its discipline shows only as its timebase's
+//! tighter curvature. A declaration is the feeder's word, not a measurement. Version 3 held every
+//! disciplined clock to the stamp difference with 100 ns and its rate with 0.001 ppm; over real
+//! receivers (LocaRDS, RFC-0171 §3.8.1) a GRX1090 stamps 120.6 µs after a Radarcape (the end of a
+//! long message, not its start), some Radarcapes declaring GPS run without a lock (one 0.7 s off
+//! and drifting 0.09 ppm, three with stamps jittering by hundreds of microseconds), and holding
+//! them to the gauge made half of all fits there singular; when such a receiver was the gauge,
+//! every honest GNSS clock of the tile was held to it.
 //!
 //! It is solved by Gauss-Newton. Each event's four parameters are eliminated by Schur complement;
 //! the reduced system is block-banded: one block per knot (time slice), every clock's offset at
@@ -273,6 +284,14 @@
 //! to the lowest key) from the tile, its jumps with it, and the fit goes on without it: one bad
 //! receiver costs the tile that receiver, never the tile. Dropped clocks are published.
 //!
+//! The same holds for a clock nothing places: before each system is factored, a clock other than
+//! the gauge none of whose receptions carries weight in an event whose own parameters are
+//! determined (every one beyond the cut-off, or in events left with none) has a free offset, so
+//! the system is singular. Every such clock is dropped from the tile (its whole epoch, as for
+//! jumps), its jumps with it, and the fit starts over; each pass drops at least one, so it ends.
+//! Over real receivers this is a receiver whose stamps agree with nothing (OpenSky's data has
+//! several), or one left with no event usable against the rest.
+//!
 //! Then the noise: each clock starts from its residuals' robust scale (1.4826 times their median
 //! absolute value), then rounds of a final-weighted step and an estimate, at least two, until no
 //! clock's estimate moves by more than 5%, at most three: each clock with at least 20 receptions
@@ -287,7 +306,9 @@
 //! scan is made again at the final estimate: a jump there is split too and the fit starts over.
 //! The published (rounded) model's events are then settled from their priors as a verifier will
 //! (§ Output), and while the step there is not negligible the final steps go on from it (at most
-//! three times); and where the noise the rule estimates at the published estimate is more than
+//! three times). The scan is made a last time there, at the estimate a verifier scans: a jump only
+//! the settled events show (a clock whose stamps are noise can) is split and the fit starts over.
+//! And where the noise the rule estimates at the published estimate is more than
 //! 12.5% above a clock's published noise, the noise is taken from there and the final steps run
 //! again (at most twice). The step at the published estimate is the model's calibration: its
 //! factor's selected inverse is what solving under it needs, so an engine never forms it again.
@@ -363,9 +384,11 @@
 //!    1.1, plus 5 m squared on each axis (`solve::ERROR_INFLATION`, `ERROR_FLOOR_M`): the
 //!    simulator calibrates the mathematics without them (the calibration tests strip them), but
 //!    real receivers carry what it does not model (tropospheric delay differences of a metre or
-//!    two between sites, antenna phase centres off their declared sites, multipath), so until a
-//!    calibration against real receivers' truth says otherwise a fix claims a little less than
-//!    the mathematics alone. A fix whose standard deviation on any axis would exceed 1.5 km is
+//!    two between sites, antenna phase centres off their declared sites, multipath), so a fix
+//!    claims a little less than the mathematics alone. The calibration over real receivers
+//!    (RFC-0171 §3.8.1, `tally-mlat-calibrate`) finds the mathematics honest where receivers and
+//!    truth are what they say (0.94 to 0.97) and short with unverified crowdsourced receivers
+//!    (0.895), not uniformly, so it leaves these as they are. A fix whose standard deviation on any axis would exceed 1.5 km is
 //!    not published: there the Gaussian no longer describes the error (a transmission with no
 //!    altitude over a flat network leaves the height nearly free; measured, a DF11 6 km below its
 //!    aircraft at 58 squared standard deviations).
@@ -479,9 +502,9 @@
 //!
 //! Measured over the simulator (six 170 s scenarios, the default clock mix, each window's models
 //! carried over the replies after it, one an aircraft a second): with the floor and inflation
-//! stripped the truth is inside the 95% ellipsoid for 0.941 carried up to 20 s, 0.946 from 20 to
-//! 45 s and 0.974 from 45 to 90 s (0.956 of 5,081 overall; 0.982 published), for median
-//! horizontal errors of 123, 234 and 458 m. The carry costs precision, not honesty.
+//! stripped the truth is inside the 95% ellipsoid for 0.940 carried up to 20 s, 0.947 from 20 to
+//! 45 s and 0.975 from 45 to 90 s (0.956 of 5,076 overall; 0.982 published), for median
+//! horizontal errors of 124, 237 and 468 m. The carry costs precision, not honesty.
 
 // Matrix code reads as the algebra it implements: index loops over rows and columns.
 #![allow(clippy::needless_range_loop)]
