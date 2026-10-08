@@ -1351,7 +1351,7 @@ async fn a_feeder_is_told_its_rate_limit_and_the_relays_hints_first() -> Result 
     Ok(())
 }
 
-/// Capacity is admission (RFC-0177 §9): a relay whose memory holds one feeder's share of every
+/// Capacity is admission (RFC-0178 §9): a relay whose memory holds one feeder's share of every
 /// store takes the first feeder and turns the second away at its Hello, pointed at the relays it
 /// knows, before anything it sent is taken in; the first is served on, and leaving frees its slot.
 #[tokio::test]

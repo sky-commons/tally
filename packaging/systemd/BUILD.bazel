@@ -1,5 +1,5 @@
 # The packaged units. //tally/crates/relay:deployed holds the relay's to its memory budget
-# (RFC-0177 §9).
+# (RFC-0178 §9).
 exports_files(
     ["tally-relay.service"],
     visibility = ["//tally/crates/relay:__pkg__"],

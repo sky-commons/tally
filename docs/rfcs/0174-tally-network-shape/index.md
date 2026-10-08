@@ -165,7 +165,7 @@ can vouch for several clients.
   session, on that schedule whether or not an audit runs. A member holding a key for a feeder tags
   each of its batches as it arrives (a keyed BLAKE2s of the key and the batch's signed bytes, 16
   bytes, with the key's id), keeps the tag five minutes (`TAG_WINDOW_MS`, the one window both sides
-  use), and lets the bytes go (RFC-0177 §7). Every few minutes the feeder audits one of its two
+  use), and lets the bytes go (RFC-0178 §7). Every few minutes the feeder audits one of its two
   relays at a time: the next few batches go to that relay alone, and it asks several keyed members,
   on distinct networks, for their tags of those batches, named by boot and sequence, within the
   window; the answer is signed by the member's key and names the query's fresh nonce. The feeder
@@ -238,7 +238,7 @@ the border band of the areas it is an MLAT relay for, and is held to a feeder's 
   each area so that one failure or one dishonest relay neither stops nor decides its positions;
   overlap costs compute, never correctness.
 - What one relay costs, measured (RFC-0171 §3.8.1, the world-scale benchmark, re-measured at the
-  real reception rate for RFC-0177): the whole world's MLAT, 20,000 receivers clustered as the US
+  real reception rate for RFC-0178): the whole world's MLAT, 20,000 receivers clustered as the US
   and Europe's are, about 320 wanted receptions a second each and about 5,400 targets a window,
   takes 41 cores to keep up (3,800 tile fits a 40 s stride, 0.35 s each, and the solves, on 32
   threads) and holds 8.7 GB of raw for a window (30 bytes an observation, index included), about
@@ -412,7 +412,7 @@ kinds skips it:
 | --- | --- | --- |
 | 0x10 | `Provisional` | A provisional MLAT position (§2.4), with the `PROVISIONAL` bit on `Streams` (16). |
 | 0x11, 0x12 | `Echo`, `EchoReply` | Round-trip measurement: a nonce; the reply signed, with the relay's spare capacity and network. |
-| 0x13, 0x14 | `DeliveryQuery`, `DeliveryAnswer` | The feeder's signed grant of tag keys to the member asked, and, in an audit, a nonce and a few batches named by boot and sequence; per batch, the member's tag made on arrival and its key's id, or "not seen", signed (§2.2, RFC-0177 §7). |
+| 0x13, 0x14 | `DeliveryQuery`, `DeliveryAnswer` | The feeder's signed grant of tag keys to the member asked, and, in an audit, a nonce and a few batches named by boot and sequence; per batch, the member's tag made on arrival and its key's id, or "not seen", signed (§2.2, RFC-0178 §7). |
 | 0x15, 0x16 | `ProviderOffer`, `ProviderQuery` | The directory (§2.6): cells, stripes, MLAT cores, address and network, signed. |
 | 0x17 to 0x1a | `StripeAssignment`, `PieceManifest`, `HaveSummary`, `StripeReceipt` | Sharing groups (§2.5). |
 | 0x1b, 0x1c | `FirehoseCredential`, `EvidenceBundle` | Credit (§2.1): the credential, and feeders' descriptions and children's receipts. |

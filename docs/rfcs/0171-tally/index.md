@@ -131,7 +131,7 @@ also widens `Streams` to two bytes, so products after the eighth have bits.
 one hop, RFC-0174 §2.3; it publishes nothing), and **probe**. A probe is a
 measurement session (RFC-0174 §2.2's round-trip probing and delivery check): it may send only
 `Echo` and `DeliveryQuery` (`Role::may_send`; a query also carries the feeder's tag keys for the
-member, RFC-0177 §7), is answered, and is never admitted as a feeder or
+member, RFC-0178 §7), is answered, and is never admitted as a feeder or
 a subscriber, so measuring a relay takes none of its feeder slots and is sent none of its streams.
 A probe that sends anything else is ended with `Goodbye{Protocol}`. A full relay still answers a
 probe.
@@ -549,7 +549,7 @@ over it. As built:
   subscriber cap, so an operator sizes that cap and the MLAT ceiling to the host's link.
 - What the whole world costs one relay is set by the tile, the stride, the targets and the
   reception rate, and measured in release by the simulator at 20,000 receivers (about 5,400
-  targets a window, on 3,800 tiles; `world_scale_one_node`, re-measured 2026-10-08 for RFC-0177).
+  targets a window, on 3,800 tiles; `world_scale_one_node`, re-measured 2026-10-08 for RFC-0178).
   At the real rate, about 320 wanted receptions a second a receiver (a real receiver hears about
   600 a second, 60% of them wanted; the simulator comes nearest with every receiver in reach
   hearing every transmission), 41 cores keep up: 1,300 core-seconds of fits (a tile fit 0.35 s a

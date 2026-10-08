@@ -1,4 +1,4 @@
-# RFC-0177: One relay carries 20,000 feeders
+# RFC-0178: One relay carries 20,000 feeders
 
 - Status: accepted (founder requirement 2026-10-07: one relay, one client, 20,000 feeders)
 - Builds on: RFC-0171, RFC-0174
@@ -117,7 +117,7 @@ Measured on main (tally-load, commit b3e3571809 on branch tally-load):
    - **The feeder's ledger.** Per batch first written within the window: (boot, sequence, first
      written, wall clock, a 16-bit relay mask over a slot table), 48 bytes, at most 1,024; a batch
      one of whose relays could not be named is never taken as the audited relay's alone. Bytes
-     only of the latest audit's batches and of what an audit withheld or owes. At RFC-0177's 8 KB
+     only of the latest audit's batches and of what an audit withheld or owes. At RFC-0178's 8 KB
      a second: before, 512 whole batches, about 4 MiB; after, about 13 KB of marks over the window
      plus 32 KB of audited bytes (at most 80 KB with the 1,024-mark cap).
 

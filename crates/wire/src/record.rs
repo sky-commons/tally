@@ -233,7 +233,7 @@ pub enum Reason {
     Refused,
     /// The peer broke the protocol.
     Protocol,
-    /// The subscriber fell behind what it asked for (RFC-0177 §8): its queue held more than its
+    /// The subscriber fell behind what it asked for (RFC-0178 §8): its queue held more than its
     /// bound of bytes or of time, so the relay let it go rather than slow anyone else. Not that
     /// the relay is full: the subscriber may come back at once. A reader that predates it reads
     /// `Other(6)`.

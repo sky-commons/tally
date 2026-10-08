@@ -1,4 +1,4 @@
-//! The ingest stage (RFC-0177 §2): where a batch becomes one immutable [`Decoded`], once, before
+//! The ingest stage (RFC-0178 §2): where a batch becomes one immutable [`Decoded`], once, before
 //! any other stage reads it. A connection task does I/O only and holds at most [`CREDIT`] batches
 //! in flight ([`Credit`]); out of credit it stops reading its socket, so TCP pushes back on the
 //! feeder (whose signed `dropped` records its own loss) and nothing queues unbounded. The work
@@ -14,7 +14,7 @@
 //! Every batch is stamped here ([`Stamp`]): the ingest clock's reading and the batch's place in the
 //! ingest order, never going back on one worker. Every later decision (which epoch a reception is
 //! in, when a shard may seal) reads the stamp and never a clock of its own, so the same stamped
-//! trace gives the same output on any number of threads (RFC-0177, invariants 1 and 2). Each worker
+//! trace gives the same output on any number of threads (RFC-0178, invariants 1 and 2). Each worker
 //! ticks the message exchange (`exchange::Envelope::Tick`) as its stamps advance and when idle, so
 //! epochs close whether or not batches flow.
 //!
@@ -114,7 +114,7 @@ impl Credit {
 /// One batch's place in the ingest stage: its connection's credit, and its bytes charged to the
 /// relay's budget (`budget::Store::Ingest`), both released when the batch is decoded and routed.
 /// A connection takes both before it hands a batch over, and waits for them (its socket unread)
-/// while either is spent: the back-pressure raw meets (RFC-0177 §10).
+/// while either is spent: the back-pressure raw meets (RFC-0178 §10).
 pub struct InFlight {
     pub permit: OwnedSemaphorePermit,
     pub charge: crate::budget::Charge,
@@ -530,7 +530,7 @@ mod tests {
         Ok(took[took.len() * 99 / 100])
     }
 
-    /// RFC-0177 invariant 9: no lock is held across a seal, so a sealer slowed to a second an
+    /// RFC-0178 invariant 9: no lock is held across a seal, so a sealer slowed to a second an
     /// epoch leaves ingest as fast as one that takes no time (it refuses the epochs it cannot
     /// take, whole; it never holds a shard back).
     #[test]

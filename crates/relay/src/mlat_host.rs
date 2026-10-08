@@ -14,7 +14,7 @@
 //!   tiles and no others. A change of areas re-scopes the engine in place (`Engine::set_scope`);
 //!   no area at all drops the engine and every byte of raw it held, and the next area starts a new
 //!   one under a new boot id, so the relay's records never reuse a (key, boot, sequence).
-//! - **One store of raw, held where it arrives** (RFC-0177 §5). The receivers and their open raw
+//! - **One store of raw, held where it arrives** (RFC-0178 §5). The receivers and their open raw
 //!   are held in raw shards keyed by receiver (`exchange::raw_shard`, one `tally_mlat::intake::Intake`
 //!   each), and a batch is taken into its shard by the ingest worker that decoded it
 //!   ([`MlatHost::offer_batch`]), in parallel, never on the engine's thread, which neither
@@ -26,7 +26,7 @@
 //!   missing for both alike. The handle outlives each engine (emptied when one is dropped). How
 //!   many receivers and how much raw it holds is configuration (`tally_mlat::engine::Capacity`),
 //!   from the receivers the relay admits.
-//! - **Provisional state sharded by aircraft** (RFC-0177 §3). What a batch says to provisional
+//! - **Provisional state sharded by aircraft** (RFC-0178 §3). What a batch says to provisional
 //!   solving (`provisional::notes_of`, read in its raw shard by the ingest worker that took it) is
 //!   split by ICAO address (`provisional::shard_of`, a uniform hash) into `provisional::SHARDS`
 //!   address shards, each holding its aircraft's state (`provisional::Shard`) and what it was told
@@ -38,7 +38,7 @@
 //! - **Threads.** One thread owns the engine. Seals, window steps and provisional steps run off
 //!   that thread, each on threads of its own, at most one step of each kind at a time, spread over
 //!   `--mlat-threads`.
-//! - **Capacity** (RFC-0177 §9). The receivers seated are the best ranked of those described
+//! - **Capacity** (RFC-0178 §9). The receivers seated are the best ranked of those described
 //!   (`tally_mlat::intake::Seats`), whichever raw shard took them and in whatever order; a shard's
 //!   open raw is bounded by each receiver's share of a bin, and the engine's whole bytes are checked
 //!   on each complete bin as it is sealed (`tally_mlat::engine::seal`). Neither depends on arrival
@@ -236,7 +236,7 @@ pub const SETTLE_MS: u64 = 2_000;
 /// Commands for the engine's thread not yet taken: a few seconds of ticks and changes.
 const COMMANDS_WAITING: usize = 1 << 12;
 /// What batches said to provisional solving that one address shard holds not yet weighed, at most:
-/// at RFC-0177's 20,000 feeders about 300 replies and positions a feeder a second spread over the
+/// at RFC-0178's 20,000 feeders about 300 replies and positions a feeder a second spread over the
 /// shards, this is a few seconds of them, so only a step stalled that long reaches it.
 const NOTES_WAITING: usize = 1 << 16;
 /// Batches held for a receiver whose description has not come, at most, and receivers (in each raw
@@ -266,7 +266,7 @@ pub fn host_for(config: &Config, identity: Identity, boot_id: u64) -> Option<Hos
 }
 
 /// What the hosted engine holds: sized for every feeder the relay's memory admits (the admission
-/// budget's ceiling, `budget`, RFC-0177 §9), never fewer than `tally_mlat::engine::MIN_RECEIVERS`.
+/// budget's ceiling, `budget`, RFC-0178 §9), never fewer than `tally_mlat::engine::MIN_RECEIVERS`.
 pub fn capacity(config: &Config) -> Capacity {
     let budget =
         crate::budget::Budget::of_memory(config.memory, crate::budget::PerFeeder::planned(true));

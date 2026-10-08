@@ -70,7 +70,7 @@ pub const JUDGE_AFTER_MS: u64 = 2_000;
 /// `RECEIPT_GRACE_MS` after the window ends, judged `JUDGE_AFTER_MS` after that, and a member short
 /// of it asks for repair from `REPAIR_AFTER_MS` on; so the horizon is the window, the grace, the
 /// judgment and the repair delay, 12.5 s, rounded up to whole seconds. It is the one batch byte
-/// store's window (RFC-0177 §6): what a relay holds of a batch's bytes after it is passed on.
+/// store's window (RFC-0178 §6): what a relay holds of a batch's bytes after it is passed on.
 pub const HORIZON_MS: u64 =
     RECEIPT_WINDOW_SECONDS * 1000 + RECEIPT_GRACE_MS + JUDGE_AFTER_MS + REPAIR_AFTER_MS;
 pub const HORIZON_SECONDS: u64 = HORIZON_MS.div_ceil(1000);
@@ -79,7 +79,7 @@ pub const HORIZON_SECONDS: u64 = HORIZON_MS.div_ceil(1000);
 pub const fn held_bytes_for(bytes_per_second: u64) -> usize {
     (bytes_per_second * HORIZON_SECONDS) as usize
 }
-/// The inflow a member is sized for until its relay says otherwise: RFC-0177's 20,000 feeders at
+/// The inflow a member is sized for until its relay says otherwise: RFC-0178's 20,000 feeders at
 /// 8 KiB a second each.
 pub const DEFAULT_BYTES_PER_SECOND: u64 = 20_000 * 8 * 1024;
 /// The most bytes one answer to a `HaveSummary` carries.

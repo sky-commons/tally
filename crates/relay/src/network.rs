@@ -185,7 +185,7 @@ impl Network {
 
     /// The MLAT this relay runs (one program); none when its MLAT duty is off.
     pub fn host_mlat(&self, host: Arc<dyn MlatHost>) {
-        // Standing reads the engine's raw: one store of raw per relay (RFC-0177 §5).
+        // Standing reads the engine's raw: one store of raw per relay (RFC-0178 §5).
         if let Some(sealed) = host.sealed_bins() {
             self.standing.read_bins(sealed);
         }
