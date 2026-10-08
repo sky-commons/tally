@@ -58,21 +58,29 @@
 //!   with an altitude) or gives a sync position its prior (an operational status with a NACp).
 //!   Identification, velocity, surface positions, Mode A/C and UAT are never held.
 //! - An observation is held once per bin, by identity; of copies, the earliest batch wall clock.
-//!   A held observation is 24 bytes (counter and milliseconds into its bin in one word, receiver,
-//!   epoch and message as indices into the bin's tables); a message's bytes and hash are held once
-//!   per bin. Measured at world scale, with the bin's index, 33.7 bytes an observation.
-//! - A bin is open until its raw is complete, then sealed: sorted into identity order,
+//!   While its bin is open it is 28 bytes in its receiver's own list (the message inline, chunks
+//!   that are never copied), so raw split by receiver has independent owners. Sealed, it is 24
+//!   bytes (counter and milliseconds into its bin in one word, receiver, epoch and message as
+//!   indices into the bin's tables), and a message's bytes and hash are held once per bin.
+//!   Measured at world scale, with the bin's index, 30 to 35 bytes an observation, every byte
+//!   counted as allocated.
+//! - A bin is open until its raw is complete, then sealed: each receiver's raw sorted on its own,
+//!   in parallel, the messages gathered once, the receivers merged in key order, then
 //!   deduplicated, thinned, and indexed once (per address its records; the sync candidates, a
 //!   position with an altitude heard by two or more, by message hash; per receiver its
 //!   candidates and whether it is sync-active; per address its status messages; the aircraft
-//!   heard with ADS-B). A window is assembled from its sealed bins without a copy.
+//!   heard with ADS-B). Any split of a bin's raw by receiver seals to the same bytes, on any
+//!   number of threads (`Bin::seal_from`). A window is assembled from its sealed bins without a
+//!   copy, and every reader of a holder's raw shares its sealed bins (`SealedBins`).
 //! - **Ingest thinning at sealing**, the same for every holder: each receiver keeps its
 //!   `SYNC_PER_RECEIVER = 32` lowest-hash sync candidates of the bin (more than any tile keeps of
 //!   it there: ten, and one with each partner); a reply of an aircraft heard with ADS-B in the bin
 //!   is dropped (it is no MLAT target), unless the aircraft is in the calibration sample (the
 //!   first byte of BLAKE2s-256 over `"tally calibration sample" 0x00`, address and bin, below
 //!   256 / 16: one in sixteen), whose receptions are all kept; status is kept.
-//! - Memory is bounded by bytes.
+//! - Memory is bounded, and refusal is whole: a receiver's raw of a bin beyond its share, or
+//!   beyond the bytes held, is refused entire and counted, never partly by arrival order
+//!   (`Limits`); what one receiver costs is `Rates::cost`, for admission to reserve.
 //!
 //! # Windows and the stride ([`scope`])
 //!
@@ -85,8 +93,9 @@
 //! hundred receivers, a hundred aircraft): per solved bin 21.4 fits and 0.86 s at `s = 1`, 11.0
 //! and 0.45 s at 2, 5.7 and 0.24 s at 4, 2.9 and 0.13 s at 8, coverage 0.958 to 0.963 at every
 //! stride; a final position comes on average 14.5 s, 17, 22 and 32 s after its transmission. At
-//! world scale `s = 4` needs 34 cores and `s = 8` 26: the baseline (one 16 to 32 core node) takes
-//! `s = 8`, and the provisional stream covers the latency. The engine solves a window when its
+//! world scale, at an eighth of the real reception rate, `s = 4` needed 34 cores and `s = 8` 26;
+//! at the real rate `s = 8` needs 41 (RFC-0171 §3.8.1): the baseline takes `s = 8`, and the
+//! provisional stream covers the latency. The engine solves a window when its
 //! own clock has passed the end of the window's last bin and a settling time; that decides only
 //! whether late raw makes it in.
 //!

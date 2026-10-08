@@ -41,6 +41,28 @@ impl PublicKey {
         VerifyingKey::from_bytes(&self.0).map_err(|error| WireError::Key(error.to_string()))
     }
 
+    /// The key as a decompressed point, for a holder that verifies by it more than once (a
+    /// `Batch` keeps it, so its signature check never decompresses the key again).
+    pub(crate) fn point(&self) -> Result<VerifyingKey, WireError> {
+        self.verifying()
+    }
+
+    /// The key a decompressed point is: no check, the point already is one.
+    pub(crate) fn of_point(point: &VerifyingKey) -> Self {
+        Self(point.to_bytes())
+    }
+
+    /// `verify`, by a key already decompressed (`point`).
+    pub(crate) fn verify_by(
+        point: &VerifyingKey,
+        message: &[u8],
+        signature: &[u8; SIGNATURE_LEN],
+    ) -> Result<(), WireError> {
+        point
+            .verify_strict(message, &Signature::from_bytes(signature))
+            .map_err(|_| WireError::BadSignature)
+    }
+
     /// The X25519 public key the Noise handshake authenticates.
     pub fn noise_key(&self) -> Result<[u8; KEY_LEN], WireError> {
         Ok(self.verifying()?.to_montgomery().to_bytes())
@@ -54,9 +76,7 @@ impl PublicKey {
 
     /// Strict Ed25519 verification (no malleable signatures, no small-order keys).
     pub fn verify(&self, message: &[u8], signature: &[u8; SIGNATURE_LEN]) -> Result<(), WireError> {
-        self.verifying()?
-            .verify_strict(message, &Signature::from_bytes(signature))
-            .map_err(|_| WireError::BadSignature)
+        Self::verify_by(&self.verifying()?, message, signature)
     }
 
     pub fn to_base64(&self) -> String {

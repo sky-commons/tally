@@ -1855,77 +1855,92 @@ fn per_stage_timers_and_fit_time_flat_in_the_regions_receivers() -> Result {
     Ok(())
 }
 
-/// The founder's baseline at world scale: one node, 20,000 receivers clustered as the US and
-/// Europe's are, about 3,000 Mode S-only aircraft among 6,000 with ADS-B. Generates the raw straight
-/// into the held store (no batches, no copies), seals it, then runs one window as the engine
-/// would, every stage timed: tile fits on every core, then the solves. Reports the held memory,
-/// its bytes per observation, and the cores the work of one stride needs to keep up. Run in
-/// release with `--ignored --nocapture` (several minutes, about 20 GB).
-#[test]
-#[ignore = "a benchmark: run with --release -- --ignored --nocapture"]
-fn world_scale_one_node() -> Result {
-    use crate::held::Held;
-    let receivers: usize = std::env::var("WORLD_RECEIVERS")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(10_000);
-    let cluster = |seed: u64, centre: (f64, f64), spread_m: f64| Scenario {
-        // A whole window at any alignment of the stride, and a bin either side.
-        duration_s: 5.0
-            * (crate::scope::BEFORE + crate::scope::AFTER + 2 * crate::scope::STRIDE + 2) as f64,
-        receivers,
-        adsb_aircraft: 3_000,
-        modes_aircraft: 1_500,
-        centre,
-        spread_m,
-        reception_probability: 0.12,
-        named: false,
-        gps: (0..receivers).step_by(50).collect(),
-        ..Scenario::new(seed)
+/// One cluster of the world benchmark, measured.
+#[derive(Default)]
+struct Measured {
+    receivers: usize,
+    made: usize,
+    filtered: usize,
+    wanted: usize,
+    late: usize,
+    seconds: f64,
+    generated: std::time::Duration,
+    /// Each bin sealed as the stream passed it: the receptions it took and how long it took.
+    seals: Vec<(usize, std::time::Duration)>,
+    /// The most held at once, open and sealed, and of it open.
+    peak_bytes: usize,
+    peak_open_bytes: usize,
+    window_bins: usize,
+    window_records: usize,
+    window_bytes: usize,
+    indexing: std::time::Duration,
+    plan_wall: std::time::Duration,
+    planning: std::time::Duration,
+    targets: usize,
+    tiles: usize,
+    fit_wall: std::time::Duration,
+    fit_cpu: std::time::Duration,
+    solutions: usize,
+    solve_cpu: std::time::Duration,
+    alone_cpu: std::time::Duration,
+}
+
+/// Streams `scenario`'s receptions in time order into a holder as an engine takes them, sealing
+/// each bin on `threads` threads once the stream has passed it and forgetting what the window does
+/// not need, then solves the window as the engine would, every stage timed.
+fn world_cluster(scenario: &Scenario, window: Window, threads: usize) -> Result<Measured> {
+    use crate::held::{Held, Limits, SealedBins};
+    use crate::scope::bin_of;
+    let mut measured = Measured {
+        receivers: scenario.receivers,
+        seconds: scenario.duration_s,
+        ..Measured::default()
     };
-    let clusters = [
-        cluster(901, (50.0, 10.0), 1_500_000.0),
-        cluster(902, (39.0, -95.0), 2_000_000.0),
-    ];
     let started = std::time::Instant::now();
-    let mut held = Held::new(usize::MAX);
-    let (mut made, mut taken, mut filtered) = (0usize, 0usize, 0usize);
-    let mut sites = Vec::new();
-    for scenario in &clusters {
-        let simulation = sim::run_into(scenario, &mut |reception, _| {
-            made += 1;
-            let added = held.add_one(&reception);
-            taken += added.new;
-            filtered += added.filtered;
-        });
-        sites.extend(simulation.sites());
-    }
-    let generated = started.elapsed();
-    let started = std::time::Instant::now();
-    held.seal_through(i64::MAX - 1);
-    let sealing = started.elapsed();
-    let bins = held.bins(i64::MIN, i64::MAX - 1);
-    let observations: usize = bins.iter().map(|bin| bin.records.len()).sum();
-    let bytes = held.bytes();
-    let sites = Sites::new(&sites);
-    let first = bins.first().ok_or("no bins")?.bin;
-    let last = bins.last().ok_or("no bins")?.bin;
-    let window = (first..=last)
-        .map(Window::canonical)
-        .rev()
-        .find(|window| window.first >= first && window.last <= last)
-        .ok_or("no window inside the run")?;
-    let window_bins = held.bins(window.first, window.last);
-    let window_bytes: usize = window_bins.iter().map(|bin| bin.bytes()).sum();
-    let threads = std::thread::available_parallelism().map_or(8, usize::from);
+    let mut held = Held::with(Limits::UNBOUNDED, threads, SealedBins::new());
+    let mut newest = i64::MIN;
+    let mut through = i64::MIN;
+    let simulation = sim::run_into_in_time_order(scenario, &mut |reception, _| {
+        measured.made += 1;
+        let bin = bin_of(reception.wall_ms);
+        let added = held.add_one(&reception);
+        measured.wanted += added.new + added.late;
+        measured.filtered += added.filtered;
+        measured.late += added.late;
+        if bin > newest {
+            newest = bin;
+            // A bin is complete once the stream is a whole bin past it.
+            if newest - 2 > through && newest - 2 >= window.first - 1 {
+                through = newest - 2;
+                measured.peak_bytes = measured.peak_bytes.max(held.bytes());
+                measured.peak_open_bytes = measured.peak_open_bytes.max(held.open_bytes());
+                let open = held.len() - held.sealed_bins().len();
+                let sealing = std::time::Instant::now();
+                held.seal_through(through);
+                measured.seals.push((open, sealing.elapsed()));
+                held.forget_before(window.first);
+            }
+        }
+    });
+    held.seal_through(window.last);
+    measured.peak_bytes = measured.peak_bytes.max(held.bytes());
+    held.forget_before(window.first);
+    measured.generated = started.elapsed();
+    let bins = held.bins(window.first, window.last);
+    measured.window_bins = bins.len();
+    measured.window_records = bins.iter().map(|bin| bin.records.len()).sum();
+    measured.window_bytes = bins.iter().map(|bin| bin.bytes()).sum();
+    let sites = Sites::new(&simulation.sites());
     let started = std::time::Instant::now();
     let index = WindowIndex::new(window, &bins, &sites);
-    let indexing = started.elapsed();
+    measured.indexing = started.elapsed();
     let started = std::time::Instant::now();
     let plan = index.plan_on(threads);
-    let plan_wall = started.elapsed();
-    let planning = indexing + plan_wall * threads as u32;
+    measured.plan_wall = started.elapsed();
+    measured.planning = measured.indexing + measured.plan_wall * threads as u32;
     let tiles = plan.tiles();
+    measured.targets = plan.assignments.len();
+    measured.tiles = tiles.len();
     let size = tiles.len().div_ceil(threads).max(1);
     let started = std::time::Instant::now();
     type Fitted = Vec<(Vec<(Tile, (ClockModel, Calibrated))>, std::time::Duration)>;
@@ -1952,8 +1967,8 @@ fn world_scale_one_node() -> Result {
             .filter_map(|handle| handle.join().ok())
             .collect()
     });
-    let fit_wall = started.elapsed();
-    let fit_cpu: std::time::Duration = fitted.iter().map(|(_, time)| *time).sum();
+    measured.fit_wall = started.elapsed();
+    measured.fit_cpu = fitted.iter().map(|(_, time)| *time).sum();
     let models: BTreeMap<Tile, (ClockModel, Calibrated)> =
         fitted.into_iter().flat_map(|(list, _)| list).collect();
     let work: Vec<(&u32, &crate::Assignment)> = plan
@@ -2007,33 +2022,184 @@ fn world_scale_one_node() -> Result {
             .filter_map(|handle| handle.join().ok())
             .collect()
     });
-    let solve_cpu: std::time::Duration = solved.iter().map(|(_, time, _)| *time).sum();
-    let alone_cpu: std::time::Duration = solved.iter().map(|(_, _, time)| *time).sum();
-    let solutions: usize = solved.iter().map(|(count, _, _)| count).sum();
+    measured.solve_cpu = solved.iter().map(|(_, time, _)| *time).sum();
+    measured.alone_cpu = solved.iter().map(|(_, _, time)| *time).sum();
+    measured.solutions = solved.iter().map(|(count, _, _)| count).sum();
+    Ok(measured)
+}
+
+/// The process's peak resident memory, bytes (`VmHWM`).
+fn peak_rss() -> usize {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|status| {
+            status
+                .lines()
+                .find_map(|line| line.strip_prefix("VmHWM:"))
+                .and_then(|kb| {
+                    kb.trim()
+                        .trim_end_matches("kB")
+                        .trim()
+                        .parse::<usize>()
+                        .ok()
+                })
+        })
+        .map_or(0, |kb| kb * 1024)
+}
+
+/// The founder's baseline at world scale: one node, 20,000 receivers clustered as the US and
+/// Europe's are, about 3,000 Mode S-only aircraft among 9,000. Each cluster's raw is made in time
+/// order straight into a holder (no batches, no copies) and each bin sealed once the stream is past
+/// it, as an engine seals, so only the window and the open bins are ever held; then the window is
+/// solved as the engine would, every stage timed: tile fits on every core, then the solves. The
+/// clusters are an ocean apart (no tile spans both), so the world's figures are their sums.
+/// Reports the reception rate per receiver (`WORLD_RECEPTION`, the chance a receiver in reach hears
+/// a transmission: 0.12 is the rate RFC-0174 first measured at, about 40 wanted receptions a
+/// second a receiver; 1.0, the default, every receiver in reach hearing everything, is the nearest
+/// the simulator's few message kinds come to a real receiver's 360 a second, RFC-0177), the raw a
+/// window holds and its bytes per observation, each bin's sealing time, and the cores the work of
+/// one stride needs to keep up. Run in release with `--ignored --nocapture` (`WORLD_RECEIVERS` a
+/// cluster, default 10,000; `WORLD_THREADS`, default every core).
+#[test]
+#[ignore = "a benchmark: run with --release -- --ignored --nocapture"]
+fn world_scale_one_node() -> Result {
+    let env = |name: &str| std::env::var(name).ok();
+    let receivers: usize = env("WORLD_RECEIVERS")
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(10_000);
+    let reception: f64 = env("WORLD_RECEPTION")
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(1.0);
+    let threads = env("WORLD_THREADS")
+        .and_then(|value| value.parse().ok())
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(8, usize::from));
+    let cluster = |seed: u64, centre: (f64, f64), spread_m: f64| Scenario {
+        receivers,
+        adsb_aircraft: 3_000,
+        modes_aircraft: 1_500,
+        centre,
+        spread_m,
+        reception_probability: reception,
+        named: false,
+        gps: (0..receivers).step_by(50).collect(),
+        ..Scenario::new(seed)
+    };
+    // The first canonical window wholly after the run's first bin, and the run just long enough
+    // to fill it.
+    let base = cluster(0, (0.0, 0.0), 0.0);
+    let first = crate::scope::bin_of(base.wall_ms(0.0)) + 1;
+    let window = (first..)
+        .map(Window::canonical)
+        .find(|window| window.first >= first)
+        .ok_or("no window")?;
+    let duration_s = ((window.last + 1 - crate::scope::bin_of(base.wall_ms(0.0))) as u64
+        * crate::scope::GRID_MS) as f64
+        / 1_000.0;
+    let clusters = [
+        Scenario {
+            duration_s,
+            ..cluster(901, (50.0, 10.0), 1_500_000.0)
+        },
+        Scenario {
+            duration_s,
+            ..cluster(902, (39.0, -95.0), 2_000_000.0)
+        },
+    ];
+    let mut all: Vec<Measured> = Vec::new();
+    for scenario in &clusters {
+        let measured = world_cluster(scenario, window, threads)?;
+        eprintln!(
+            "world cluster {}: {} receptions made in {:?}, {:.0} wanted a receiver a second; \
+             window {} bins, {} held, {:.2} GB, {:.1} bytes each; peak held {:.2} GB ({:.2} GB \
+             open); {} tiles, {} targets",
+            scenario.seed,
+            measured.made,
+            measured.generated,
+            measured.wanted as f64 / (measured.receivers as f64 * measured.seconds),
+            measured.window_bins,
+            measured.window_records,
+            measured.window_bytes as f64 / 1e9,
+            measured.window_bytes as f64 / measured.window_records.max(1) as f64,
+            measured.peak_bytes as f64 / 1e9,
+            measured.peak_open_bytes as f64 / 1e9,
+            measured.tiles,
+            measured.targets,
+        );
+        all.push(measured);
+    }
+    let sum = |field: fn(&Measured) -> usize| all.iter().map(field).sum::<usize>();
+    let time = |field: fn(&Measured) -> std::time::Duration| {
+        all.iter().map(field).sum::<std::time::Duration>()
+    };
+    let receivers_all = sum(|m| m.receivers);
+    let wanted = sum(|m| m.wanted);
+    let made = sum(|m| m.made);
+    let records = sum(|m| m.window_records);
+    let window_bytes = sum(|m| m.window_bytes);
+    let window_s = (window.last - window.first + 1) as f64 * 5.0;
+    // A world bin is both clusters' bins of one number, sealed one after the other.
+    let seals: Vec<(usize, std::time::Duration)> = (0..all[0].seals.len().min(all[1].seals.len()))
+        .skip(1)
+        .map(|at| {
+            (
+                all[0].seals[at].0 + all[1].seals[at].0,
+                all[0].seals[at].1 + all[1].seals[at].1,
+            )
+        })
+        .collect();
+    let seal_mean = seals
+        .iter()
+        .map(|(_, time)| *time)
+        .sum::<std::time::Duration>()
+        / seals.len().max(1) as u32;
+    let seal_max = seals
+        .iter()
+        .map(|(_, time)| *time)
+        .max()
+        .unwrap_or_default();
+    let seal_receptions = seals.iter().map(|(count, _)| count).sum::<usize>() / seals.len().max(1);
     let stride_s = crate::scope::STRIDE as f64 * 5.0;
+    let planning = time(|m| m.planning);
+    let fit_cpu = time(|m| m.fit_cpu);
+    let solve_cpu = time(|m| m.solve_cpu);
+    let alone_cpu = time(|m| m.alone_cpu);
+    let seal_cpu = seal_mean.as_secs_f64() * threads as f64 * crate::scope::STRIDE as f64;
     let cpu = planning.as_secs_f64() + fit_cpu.as_secs_f64() + solve_cpu.as_secs_f64();
     eprintln!(
-        "world: {} receivers, {made} receptions made in {generated:?} ({filtered} never held, \
-         {taken} taken), sealed in {sealing:?} to {observations} held observations, {:.1} GB, \
-         {:.1} bytes each; one window ({} bins) holds {:.1} GB",
-        sites.len(),
-        bytes as f64 / 1e9,
-        bytes as f64 / observations.max(1) as f64,
-        window_bins.len(),
-        window_bytes as f64 / 1e9
+        "world: {receivers_all} receivers at reception {reception}, {made} receptions made, \
+         {:.0} wanted a receiver a second, {:.0} kept after thinning; one window ({} bins, {} s) \
+         holds {records} observations, {:.2} GB, {:.1} bytes each; peak held {:.2} GB a cluster; \
+         process peak RSS {:.2} GB",
+        wanted as f64 / (receivers_all as f64 * all[0].seconds),
+        records as f64 / (receivers_all as f64 * window_s),
+        all[0].window_bins,
+        window_s,
+        window_bytes as f64 / 1e9,
+        window_bytes as f64 / records.max(1) as f64,
+        all.iter().map(|m| m.peak_bytes).max().unwrap_or(0) as f64 / 1e9,
+        peak_rss() as f64 / 1e9,
     );
     eprintln!(
-        "world: window index {indexing:?}, plan {plan_wall:?} wall on {threads} threads; {} \
-         targets on {} tiles; fits {fit_wall:?} \
-         wall on {threads} threads ({fit_cpu:?} of cores); {solutions} published in \
+        "world: a bin of {seal_receptions} receptions sealed in {seal_mean:?} on {threads} threads \
+         (at most {seal_max:?}, {} bins)",
+        seals.len()
+    );
+    eprintln!(
+        "world: window index {:?}, plan {:?} wall on {threads} threads; {} targets on {} tiles; \
+         fits {:?} wall on {threads} threads ({fit_cpu:?} of cores); {} published in \
          {solve_cpu:?} of cores, every one verified ({alone_cpu:?} solving alone, so checking \
-         costs {:.0}% more); {:.1} core-seconds a stride of {stride_s} s: {:.1} cores \
-         to keep up",
-        plan.assignments.len(),
-        tiles.len(),
+         costs {:.0}% more); {:.1} core-seconds a stride of {stride_s} s: {:.1} cores to keep up, \
+         and sealing at most {:.1} cores more",
+        time(|m| m.indexing),
+        time(|m| m.plan_wall),
+        sum(|m| m.targets),
+        sum(|m| m.tiles),
+        time(|m| m.fit_wall),
+        sum(|m| m.solutions),
         100.0 * (solve_cpu.as_secs_f64() / alone_cpu.as_secs_f64().max(1e-9) - 1.0),
         cpu,
-        cpu / stride_s
+        cpu / stride_s,
+        seal_cpu / stride_s,
     );
     Ok(())
 }

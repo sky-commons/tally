@@ -5,9 +5,10 @@ use tally_wire::{Identity, PublicKey, Region, RelayAddress};
 use crate::egress::Cap;
 
 use crate::hub::{
-    DEFAULT_MAX_CONNECTIONS, DEFAULT_MAX_CONNECTIONS_PER_ADDRESS, DEFAULT_MAX_DEDUP_BYTES,
-    DEFAULT_MAX_FEEDER_BYTES_PER_SEC, DEFAULT_MAX_MEMBER_BYTES_PER_SEC,
+    DEFAULT_MAX_CONNECTIONS, DEFAULT_MAX_CONNECTIONS_PER_ADDRESS, DEFAULT_MAX_FEEDER_BYTES_PER_SEC,
+    DEFAULT_MAX_MEMBER_BYTES_PER_SEC,
 };
+use crate::ingest::Threads;
 
 const USAGE: &str = "\
 usage: tally-relay --key FILE [--key FILE]... --max-upload RATE [options]
@@ -68,8 +69,15 @@ usage: tally-relay --key FILE [--key FILE]... --max-upload RATE [options]
                          second, with a burst of the larger of
                          N and 192 KiB; about twice a whole-world MLAT relay's clock models
                          and final and provisional positions (default 8388608)
-  --max-dedup-bytes N    the most the deduplicated stream holds of messages being compared;
-                         beyond it new messages are forwarded raw only (default 268435456)
+  --memory BYTES         the most memory this relay may use, in bytes or with K, M, G or T
+                         (binary: 16G is 16 GiB). Every feeder's share of every store (batches,
+                         MLAT raw, deduplication, subscriber queues, delivery tags, connection
+                         buffers) is reserved when it is admitted, and a feeder beyond what this
+                         holds is turned away at its Hello: no spare slot (default: the relay's
+                         cgroup limit, else the host's memory)
+  --ingest-threads N     threads that verify, admit and decode feeders' batches (default: a
+                         quarter of the cores)
+  --message-threads N    threads that deduplicate receptions (default: an eighth of the cores)
   --area CELL            an area this relay takes (an H3 cell, hex or decimal): it shares it
                          and, with relay duties on, may solve its MLAT (RFC-0174 §2.1);
                          repeatable
@@ -113,7 +121,9 @@ pub struct Config {
     pub max_connections_per_address: usize,
     pub max_feeder_bytes_per_sec: u64,
     pub max_member_bytes_per_sec: u64,
-    pub max_dedup_bytes: usize,
+    /// Bytes the relay may use: the admission budget (`budget`).
+    pub memory: usize,
+    pub threads: Threads,
     pub max_upload: Cap,
     /// The areas taken (RFC-0174 §2.1).
     pub areas: Vec<Region>,
@@ -154,7 +164,8 @@ impl Config {
             max_connections_per_address: DEFAULT_MAX_CONNECTIONS_PER_ADDRESS,
             max_feeder_bytes_per_sec: DEFAULT_MAX_FEEDER_BYTES_PER_SEC,
             max_member_bytes_per_sec: DEFAULT_MAX_MEMBER_BYTES_PER_SEC,
-            max_dedup_bytes: DEFAULT_MAX_DEDUP_BYTES,
+            memory: crate::budget::memory_available(),
+            threads: Threads::from_cores(),
             max_upload: Cap::NONE,
             areas: Vec::new(),
             network: 0,
@@ -206,10 +217,16 @@ impl Config {
                         .parse()
                         .map_err(|_| "--max-connections-per-address needs a number".to_owned())?;
                 }
-                "--max-dedup-bytes" => {
-                    config.max_dedup_bytes = value()?
+                "--memory" => config.memory = parse_bytes(&value()?)?,
+                "--ingest-threads" => {
+                    config.threads.ingest = value()?
                         .parse()
-                        .map_err(|_| "--max-dedup-bytes needs a number".to_owned())?;
+                        .map_err(|_| "--ingest-threads needs a number".to_owned())?;
+                }
+                "--message-threads" => {
+                    config.threads.message = value()?
+                        .parse()
+                        .map_err(|_| "--message-threads needs a number".to_owned())?;
                 }
                 "--max-feeder-bytes-per-sec" => {
                     config.max_feeder_bytes_per_sec = value()?
@@ -297,6 +314,23 @@ as the whole. Take every area (the 122 resolution 0 cells cover it), or leave th
 to a relay that does.";
 
 /// An H3 cell as its 64-bit number: decimal, `0x` hex, or bare hex as H3's own tools print it.
+/// Bytes, as a number or with a binary K, M, G or T after it.
+pub fn parse_bytes(text: &str) -> Result<usize, String> {
+    let text = text.trim();
+    let (number, shift) = match text.chars().last() {
+        Some('K' | 'k') => (&text[..text.len() - 1], 10),
+        Some('M' | 'm') => (&text[..text.len() - 1], 20),
+        Some('G' | 'g') => (&text[..text.len() - 1], 30),
+        Some('T' | 't') => (&text[..text.len() - 1], 40),
+        _ => (text, 0),
+    };
+    number
+        .parse::<usize>()
+        .ok()
+        .and_then(|number| number.checked_mul(1 << shift))
+        .ok_or_else(|| format!("--memory {text}: expected bytes, or a number with K, M, G or T"))
+}
+
 pub fn parse_area(text: &str) -> Result<Region, String> {
     let hex = text.strip_prefix("0x").or_else(|| text.strip_prefix("0X"));
     let candidates = match hex {
@@ -390,10 +424,10 @@ mod tests {
                 config.max_connections_per_address,
                 config.max_feeder_bytes_per_sec,
                 config.max_member_bytes_per_sec,
-                config.max_dedup_bytes,
             ),
-            (2048, 16, 262_144, 8_388_608, 256 * 1024 * 1024)
+            (2048, 16, 262_144, 8_388_608)
         );
+        assert_eq!(config.memory, crate::budget::memory_available());
         Ok(())
     }
 
@@ -407,7 +441,6 @@ mod tests {
             format!("(default {DEFAULT_MAX_CONNECTIONS_PER_ADDRESS})"),
             format!("(default {DEFAULT_MAX_FEEDER_BYTES_PER_SEC})"),
             format!("(default {DEFAULT_MAX_MEMBER_BYTES_PER_SEC})"),
-            format!("(default {DEFAULT_MAX_DEDUP_BYTES})"),
             format!("past {} s", egress::SHED_AFTER.as_secs()),
             format!("10Mbit/s is\n                         at most about {ten}"),
         ] {
@@ -519,6 +552,35 @@ mod tests {
         assert!(
             super::tests::config(&["--key", "k", "--max-upload", "1MB/s", "--client", "x"])
                 .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn memory_is_read_in_bytes_or_binary_units_and_threads_by_flag() -> Result<(), String> {
+        assert_eq!(parse_bytes("4096")?, 4096);
+        assert_eq!(parse_bytes("16G")?, 16 << 30);
+        assert_eq!(parse_bytes("512M")?, 512 << 20);
+        assert!(parse_bytes("lots").is_err());
+        let config = config(&[
+            "--key",
+            "relay.key",
+            "--max-upload",
+            "10Mbit/s",
+            "--memory",
+            "8G",
+            "--ingest-threads",
+            "3",
+            "--message-threads",
+            "2",
+        ])?;
+        assert_eq!(config.memory, 8 << 30);
+        assert_eq!(
+            config.threads,
+            Threads {
+                ingest: 3,
+                message: 2
+            }
         );
         Ok(())
     }

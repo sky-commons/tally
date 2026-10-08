@@ -65,12 +65,70 @@ Measured on main (tally-load, commit b3e3571809 on branch tally-load):
    answers "unknown" outside them (decided: a relay cannot hold world raw, and relays are regional).
 6. **One batch byte store**: shared `Bytes` keyed by (receiver, boot, seq); others hold handles.
    Window = the sharing repair horizon derived from sharing's own constants (~12-15 s), not 60 s.
+   As built: the sharing member is that store. A group holds a batch as the `Batch` itself
+   (`sharing::member::Piece`), so its bytes are the one allocation the hub, products and fan-out
+   already hold a handle to; parity is built from and rebuilt into the same pieces. The horizon is
+   `HORIZON_MS` = the receipt window (5 s) + its grace (4 s) + the judgment (2 s) + the repair delay
+   (1.5 s) = 12.5 s, held as 13 whole seconds. The capacity is sized by time,
+   `held_bytes_for(bytes_per_second)` = the admitted inflow over the horizon (default 20,000 x
+   8 KiB/s, about 2 GiB; `Sharing::set_held_capacity` for the budget), and a record that would
+   pass it is refused whole and counted (`Stats::refused`), never the oldest dropped to make room.
 7. **Delivery proofs as tags made on arrival** (protocol change, v2 not yet shipped; decided): each
    round the feeder gives every member it may ask its own key k_m over the signed Probe session
    (current and next key overlapping, rotated); on arrival a member stores H(k_m || batch bytes)
    truncated to 16 B. Proof still needs the bytes and binds the exact batch; keys are per feeder, not
    per audit, so nothing reveals when an audit runs. Window W = 5 min, one shared constant. Feeder keeps
-   (boot, seq, relay bitmask) for 512 batches plus bytes only for audited/withheld ones.
+   (boot, seq, relay bitmask) for the window plus bytes only for audited/withheld ones.
+
+   As built (`tally_wire::delivery`, `tally-relay`'s `delivery`, `tally-feed`'s `delivery_check`):
+   - **The grant.** `TagKeys`, signed by the feeder, names the member, the key in force (its id is
+     the key period, `wall_ms / KEY_PERIOD_MS`, five minutes) and the next, and how long until the
+     next takes over by the member's clock. It rides in a `DeliveryQuery` (so a `Probe` session
+     still sends only `Echo` and `DeliveryQuery`), every minute to any member of the area not yet
+     given the current period's key, and again with every audit question. Signed, because the
+     query is not: a key from anyone else would make every tag that member makes fail and void the
+     feeder's audits. A member takes it only for a feeder of an area it takes, only addressed to
+     itself, and never older than the keys it holds.
+   - **The tag.** BLAKE2s-256 over a domain, k_m and the batch's signed bytes, first 16 bytes, with
+     the key's id: `delivery_tag`. A member keeps an entry of 40 bytes (sequence, arrival, key id,
+     tag) per batch for W, tagged or not, sharded by receiver under a process-secret hash. 20,000
+     feeders at one batch a second: 6 M entries, 240 MB (`PER_FEEDER_BYTES` = 12 KB), bound at
+     `TAGS_HELD` = 8 Mi entries (320 MiB); past it a batch is refused whole, counted, and never
+     denied.
+   - **The verdict.** The feeder recomputes the tag from its copy of the audited batch and the key
+     it gave that member, and takes it only under a key in force when it sent the batch (its period
+     or one either side, `tag_keys_for`). It keeps keys for the two periods before the current, so
+     a tag under an older key (a replay, or a key a member kept past its rotation) proves nothing.
+     It asks only about batches sent within `ASK_WITHIN_MS` (W less the longest ask), so the tag is
+     still held. Majority and votes are unchanged: a network votes on a batch when a member of it
+     proved it or signed "not seen".
+   - **"Not seen" only when known.** A member says "not seen" only after it has watched for a whole
+     window (since its first call: a restarted relay denies nothing for W) and holds no entry for
+     the batch at or above its stream's horizon. A batch that came while it held no key for the
+     feeder has an entry and no tag, and is left out, as is one refused or let go.
+   - **The feeder's ledger.** Per batch first written within the window: (boot, sequence, first
+     written, wall clock, a 16-bit relay mask over a slot table), 48 bytes, at most 1,024; a batch
+     one of whose relays could not be named is never taken as the audited relay's alone. Bytes
+     only of the latest audit's batches and of what an audit withheld or owes. At RFC-0177's 8 KB
+     a second: before, 512 whole batches, about 4 MiB; after, about 13 KB of marks over the window
+     plus 32 KB of audited bytes (at most 80 KB with the 1,024-mark cap).
+
+   Why the alternatives fail:
+   - **Holding whole batches for the window** (as before, `HELD_BYTES` 64 MiB): an audit asks up to
+     W after sending, so the store must hold W of every feeder's bytes: 20,000 x 8 KB/s x 300 s is
+     about 48 GB, and even the shortest useful window (the ~52 s an ask takes today) is ~8 GB. At
+     64 MiB the store held 0.4 s, so every audit was void.
+   - **A proof over the batch hash alone** (keyed hash of the nonce and the batch hash, so members
+     could drop the bytes): every member already holds every batch hash, from the piece manifests
+     its group floods, so a member that never received the batch (or a relay that swallowed it and
+     forwarded only manifests) answers correctly. The tag must be over the bytes, and the key must be
+     there when the bytes are, which is on arrival.
+   - **Announcing the audit** (telling members ahead which batches to keep): a member that colludes
+     with the audited relay tells it which batches matter; it delivers those and swallows the rest.
+     Keys handed out on a schedule of their own, per member, say nothing of when an audit runs or
+     what it covers.
+   - **Keys that never rotate**: a member that once held a key can tag bytes it obtains at any
+     later time; rotation bounds that to the batch's own period and its neighbours.
 8. **Fan-out**: replace the 4096-record broadcast with a router keyed by subscription cell into
    per-subscriber queues bounded in BYTES and TIME (L = 2 s of inbound); a full queue disconnects with a
    Goodbye that says "fell behind" (not "full"). Fed per receiver shard: per-receiver order holds,
@@ -83,7 +141,14 @@ Measured on main (tally-load, commit b3e3571809 on branch tally-load):
    way. `Added.dropped` is never discarded.
 10. **Overload policy (decided)**: back-pressure for raw, delivery and fan-out; whole-epoch refusal,
     counted, for derived products.
-11. **Connection buffers from a shared pool**, not zeroed 64 KiB per connection.
+11. **Connection buffers from a shared pool**, not zeroed 64 KiB per connection. As built
+    (`tally_wire::noise::Buffer`): a session's reader and writer hold no buffer between messages.
+    A message's frame, its plaintext and the records packed into it are written in buffers taken
+    from one process-wide pool while that message is in hand, and given back after; the pool keeps
+    at most `POOL_IDLE` (256) idle, 16 MiB. Per connection idle: before, two zeroed 64 KiB buffers
+    and a writer plaintext that fills to 64 KiB, about 192 KiB resident, plus a fresh frame
+    allocation per message; after, the two halves (under 1 KiB) and the transport state, with
+    buffers only for messages in flight.
 
 ## Invariants the tests hold
 1. Thread-count independence: same stamped trace at 1, 2, 8, 32 threads gives byte-identical MLAT

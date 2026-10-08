@@ -405,6 +405,7 @@ mod tests {
             cell: None,
             points: None,
             decoded: None,
+            stamp_ms: 0,
         };
         let asked = |streams: Streams| {
             Subscription {

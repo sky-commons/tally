@@ -491,6 +491,14 @@ impl MlatHost for Held {
         self.host.offer(record, now_ms);
     }
 
+    fn offer_batch(&self, batch: &std::sync::Arc<tally_wire::Decoded>, now_ms: u64) {
+        self.host.offer_batch(batch, now_ms);
+    }
+
+    fn sealed_bins(&self) -> Option<tally_mlat_solver::held::SealedBins> {
+        self.host.sealed_bins()
+    }
+
     fn take_published(&self, now_ms: u64) -> Vec<Record> {
         if self.host.ingested() >= self.batches {
             self.host.take_published(now_ms)
@@ -547,6 +555,7 @@ async fn mlat_relay(batches: u64) -> Result<(RelayAddress, Arc<Hub>)> {
             regions: Vec::new(),
             settle_ms: SETTLE_MS,
             threads: 4,
+            capacity: tally_mlat::engine::Capacity::default(),
         },
     );
     host.set_areas(areas.clone(), Vec::new());

@@ -130,7 +130,8 @@ also widens `Streams` to two bytes, so products after the eighth have bits.
 **The roles** a `Hello` names: feeder, subscriber, relay, engine (another relay's MLAT taking raw
 one hop, RFC-0174 §2.3; it publishes nothing), and **probe**. A probe is a
 measurement session (RFC-0174 §2.2's round-trip probing and delivery check): it may send only
-`Echo` and `DeliveryQuery` (`Role::may_send`), is answered, and is never admitted as a feeder or
+`Echo` and `DeliveryQuery` (`Role::may_send`; a query also carries the feeder's tag keys for the
+member, RFC-0177 §7), is answered, and is never admitted as a feeder or
 a subscriber, so measuring a relay takes none of its feeder slots and is sent none of its streams.
 A probe that sends anything else is ended with `Goodbye{Protocol}`. A full relay still answers a
 probe.
@@ -166,8 +167,8 @@ The extension rules, which are what a frozen feeder relies on:
   cleanly. New records are therefore non-critical unless ignoring them would be wrong.
 - A body may carry bytes after the fields a reader knows; they are ignored, so fields are appended.
 - An enum value a reader does not know is kept as `Other`, never an error. The exception is
-  evidence: a delivery answer's possession tag a reader does not know is an error, never read as
-  a proof.
+  evidence: a delivery answer's possession kind a reader does not know is an error, never read
+  as a proof.
 - Every record body has one check of what makes it well formed (ranges ascending and exact,
   spans bounded, a position on the globe, one product where one is named), and the codec runs it
   on every encode and every decode (`tally_wire::Check`), so no value that breaks it is written or
@@ -546,18 +547,29 @@ over it. As built:
   passes through the fan-out ring and the parts table, both bounded, and goes out again to every
   subscriber of positions or clock models, a slow one dropped. MLAT links count against the
   subscriber cap, so an operator sizes that cap and the MLAT ceiling to the host's link.
-- What the whole world costs one relay is set by the tile, the stride and the targets, and
-  measured in release by the simulator at 20,000 receivers (about 5,400 targets a window, on
-  3,800 tiles): 27 cores keep up (a tile fit 0.28 s a core, 1,050 core-seconds of fits and 22 of
-  solving a 40 s stride, on 32 threads) and the raw for one window is 1.6 GB (118 million
-  receptions made a minute, 70 million held after thinning, 34 bytes an observation with the
-  index). Indexing a window takes 43 ms and assigning every target 0.4 s on 32 threads. A tile's
+- What the whole world costs one relay is set by the tile, the stride, the targets and the
+  reception rate, and measured in release by the simulator at 20,000 receivers (about 5,400
+  targets a window, on 3,800 tiles; `world_scale_one_node`, re-measured 2026-10-08 for RFC-0177).
+  At the real rate, about 320 wanted receptions a second a receiver (a real receiver hears about
+  600 a second, 60% of them wanted; the simulator comes nearest with every receiver in reach
+  hearing every transmission), 41 cores keep up: 1,300 core-seconds of fits (a tile fit 0.35 s a
+  core) and 300 of solving, every solution verified, a 40 s stride, on 32 threads. One window (20
+  bins, 100 s) holds 289 million observations after thinning (145 a receiver a second of the 324
+  wanted), 8.7 GB at 30 bytes an observation with the index, every byte counted as allocated;
+  sealing a bin of the whole world (65 million receptions) takes 2.0 s on 32 threads, at most 13
+  cores more. The first measurement, at a rate an eighth of the real one (39 wanted a receiver a
+  second), gave 29 cores and 1.6 GB a window (46 million observations at 35 bytes; the 70 million
+  it once named were held over the 30 bins of its run, not the 20 of a window), and that figure is
+  superseded: the fits barely change with the rate, since a tile's events are capped, but the
+  solves and the raw grow with it. Indexing a window takes 40 ms and assigning every target 0.8 s
+  on 32 threads. A tile's
   fit plus its folded calibration takes 71, 95 and 107 ms at 100, 300 and 1,000 receivers, and an
   outside verifier checks it in 23 to 34 ms. Each choice that sets this was measured, and the
   trade is stated:
   - *Stride 8.* Fits a solved bin cost 21.4, 11.0, 5.7 and 2.9 at stride 1, 2, 4 and 8 (0.86,
     0.45, 0.24 and 0.13 s), at the same coverage (0.958 to 0.963), for a final position 14.5,
-    17, 22 and 32 s late on average; the world needs 34 cores at stride 4 and 27 at 8. The cost
+    17, 22 and 32 s late on average; at the first measurement's rate the world needed 34 cores
+    at stride 4 and 27 at 8 (41 at 8 at the real rate). The cost
     of the eighth is latency: a final MLAT position arrives 7 to 47 s after it was heard.
   - *Sixteen sync aircraft a tile.* At 8, 16, 32 and every one, coverage is 0.964, 0.946, 0.949
     and 0.953 and the median error 52.6, 36.1, 33.6 and 36.1 m, for 20, 31, 45 and 49 s of fits

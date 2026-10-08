@@ -94,7 +94,7 @@ pub struct Network {
     pub selection: Selection,
     pub sharing: Sharing,
     pub credit: Credit,
-    pub products: Products,
+    pub products: Arc<Products>,
     pub standing: Standing,
     pub peers: Peers,
     mlat: OnceLock<Arc<dyn MlatHost>>,
@@ -127,7 +127,7 @@ impl Network {
             selection: Selection::new(),
             sharing: Sharing::new(),
             credit: Credit::new(),
-            products: Products::new(),
+            products: Arc::new(Products::new()),
             standing: Standing::new(),
             peers: Peers::new(),
             mlat: OnceLock::new(),
@@ -163,6 +163,7 @@ impl Network {
     /// The key the relay signs its network records with (its newest), once it serves.
     pub fn adopt_identity(&self, identity: Identity) {
         self.credit.adopt_identity(identity.public());
+        self.products.adopt_identity(&identity);
         let _ = self.identity.set(identity);
     }
 
@@ -172,6 +173,10 @@ impl Network {
 
     /// The MLAT this relay runs (one program); none when its MLAT duty is off.
     pub fn host_mlat(&self, host: Arc<dyn MlatHost>) {
+        // Standing reads the engine's raw: one store of raw per relay (RFC-0177 §5).
+        if let Some(sealed) = host.sealed_bins() {
+            self.standing.read_bins(sealed);
+        }
         let _ = self.mlat.set(host);
     }
 
@@ -192,9 +197,10 @@ impl Network {
                 .collect(),
             Record::DeliveryQuery(query) => {
                 let point = hub.point_of(&query.receiver);
-                // A relay's own answer is its own word, never credit evidence (`credit`).
+                // A relay's own answer is its own word, never credit evidence (`credit`). By the
+                // ingest clock, the clock delivery held each batch by (`on_batch`).
                 self.delivery
-                    .answer_at(&self.selection, identity, &query, point, now_ms)
+                    .answer_at(&self.selection, identity, &query, point, hub.now_ms())
                     .map(Record::DeliveryAnswer)
                     .into_iter()
                     .collect()
@@ -262,18 +268,18 @@ impl Network {
         }
     }
 
-    /// A receiver's batch the hub forwarded (new, verified), with its one decode when this build
-    /// reads its format: delivery holds the bytes either way; products, standing and MLAT read the
-    /// decode and nothing else.
-    pub fn on_batch(&self, batch: &Batch, decoded: Option<&Arc<Decoded>>, now_ms: u64) {
-        self.delivery.hold(batch, now_ms);
+    /// A receiver's batch the hub forwarded (new, verified), stamped `stamp_ms` by the ingest
+    /// clock, with its one decode when this build reads its
+    /// format: delivery holds the bytes either way; MLAT reads the decode and nothing else (and
+    /// standing reads MLAT's sealed bins). The regional product reads it through the message
+    /// exchange (`exchange`), not here.
+    pub fn on_batch(&self, batch: &Batch, decoded: Option<&Arc<Decoded>>, stamp_ms: u64) {
+        self.delivery.hold(batch, stamp_ms);
         let Some(decoded) = decoded else {
             return;
         };
-        self.products.batch(decoded, now_ms);
-        self.standing.batch(decoded, now_ms);
         if let Some(mlat) = self.mlat() {
-            mlat.offer_batch(decoded, now_ms);
+            mlat.offer_batch(decoded, stamp_ms);
         }
     }
 
@@ -434,8 +440,10 @@ impl Network {
         let mut out = Vec::new();
         out.extend(self.directory.tick(hub, identity, now_ms));
         out.extend(self.sharing.tick(hub, identity, now_ms));
-        out.extend(self.products.tick(identity, now_ms));
-        self.standing.tick(now_ms);
+        // The products seal by the watermark as epochs close (`products::Sealer`); this takes
+        // what they signed.
+        out.extend(self.products.tick(identity));
+        self.standing.tick(self.products.watermark_ms());
         let last = self.corroborated_ms.load(Ordering::Relaxed);
         if now_ms.saturating_sub(last) >= CORROBORATE_EVERY_MS {
             self.corroborated_ms.store(now_ms, Ordering::Relaxed);
@@ -455,6 +463,8 @@ impl Network {
                 })
                 .unwrap_or(false);
             if changed {
+                // Standing holds raw for the areas the hosted MLAT does, and for no other.
+                self.standing.set_areas(&areas);
                 mlat.set_areas(areas, hub.descriptions());
             }
             let published = mlat.take_published(now_ms);
@@ -522,6 +532,7 @@ pub async fn run(hub: Arc<Hub>) {
     let mut raw_ms = 0;
     loop {
         tick.tick().await;
+        hub.idle();
         let now_ms = wall_ms();
         for record in hub.network().tick(&hub, now_ms) {
             hub.publish_own(record);

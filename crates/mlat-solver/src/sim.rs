@@ -490,6 +490,26 @@ pub fn run(scenario: &Scenario) -> Simulation {
 /// instead of keeping it: what a world-scale scenario's hundreds of millions of receptions need.
 /// The `Simulation` returned holds no receptions.
 pub fn run_into(scenario: &Scenario, sink: &mut dyn FnMut(Reception, usize)) -> Simulation {
+    run_with(scenario, false, sink)
+}
+
+/// As `run_into`, the transmissions made in the order they were sent rather than aircraft by
+/// aircraft, so the receptions come about in wall clock order (to the second a batch carries) and
+/// a holder can seal each bin once the stream has passed it, as an engine does: what a
+/// world-scale run at the real reception rate needs to fit in memory. The draws come in another
+/// order, so it is a different sky of the same scenario.
+pub fn run_into_in_time_order(
+    scenario: &Scenario,
+    sink: &mut dyn FnMut(Reception, usize),
+) -> Simulation {
+    run_with(scenario, true, sink)
+}
+
+fn run_with(
+    scenario: &Scenario,
+    in_time_order: bool,
+    sink: &mut dyn FnMut(Reception, usize),
+) -> Simulation {
     let mut rng = Rng::new(scenario.seed);
     let receivers: Vec<SimReceiver> = (0..scenario.receivers.min(usize::from(u16::MAX) - 1))
         .map(|index| {
@@ -664,7 +684,12 @@ pub fn run_into(scenario: &Scenario, sink: &mut dyn FnMut(Reception, usize)) -> 
             .or_default()
             .push(index);
     }
-    for (index, transmission) in transmissions.iter().enumerate() {
+    let mut order: Vec<usize> = (0..transmissions.len()).collect();
+    if in_time_order {
+        order.sort_by(|a, b| transmissions[*a].time.total_cmp(&transmissions[*b].time));
+    }
+    for index in order {
+        let transmission = &transmissions[index];
         let at = geo::from_ecef(transmission.ecef);
         let (row, column) = cell(at.lat_deg, at.lon_deg);
         let reach = (4.0 / at.lat_deg.to_radians().cos().max(0.2)).ceil() as i32;

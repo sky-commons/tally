@@ -16,7 +16,7 @@ use tally_wire::{Batch, BatchContent, Identity, Observation, Record};
 use crate::hub::Hub;
 
 const EVERY: Duration = Duration::from_secs(1);
-/// How often messages left out for want of room are reported, at most.
+/// How often seconds of the stream refused whole are reported, at most.
 const REPORT_EVERY: Duration = Duration::from_secs(60);
 /// The most observations tried in one batch before it is measured; halved until it fits a
 /// message.
@@ -106,18 +106,20 @@ fn wall_ms() -> u64 {
 pub async fn run(hub: Arc<Hub>, identity: Identity) {
     let mut signer = Signer::new(identity);
     let mut every = tokio::time::interval(EVERY);
-    let mut skipped = 0u64;
+    let mut refused = 0u64;
     let mut reported = Instant::now();
     loop {
         every.tick().await;
-        let (gathered, left_out) = hub.take_deduplicated();
-        skipped += left_out;
-        if skipped > 0 && reported.elapsed() >= REPORT_EVERY {
+        let (gathered, epochs_refused) = hub.take_deduplicated();
+        refused += epochs_refused;
+        if refused > 0 && reported.elapsed() >= REPORT_EVERY {
             eprintln!(
-                "tally-relay: {skipped} new messages in the last minute were forwarded raw but \
-                 left out of the deduplicated stream: it was holding as much as it may"
+                "tally-relay: {refused} seconds of the deduplicated stream were refused whole \
+                 since the last report, each with every message first heard in it (their batches \
+                 were forwarded raw): the stream held as many unsigned seconds as it may \
+                 (`stream_refused` in GET /products)"
             );
-            skipped = 0;
+            refused = 0;
             reported = Instant::now();
         }
         if gathered.is_empty() {

@@ -19,6 +19,7 @@ fn engine(threads: usize) -> Engine {
             regions: Vec::new(),
             settle_ms: 1_000,
             threads,
+            capacity: crate::engine::Capacity::default(),
         },
     )
 }

@@ -13,6 +13,7 @@ use tally_wire::batch::Hash;
 use tally_wire::sharing::receipt_digest;
 use tally_wire::{Record, Region, Streams};
 
+use super::member::Piece;
 use super::stripes::{DATA_STRIPES, data_stripe, domain_block};
 
 const PARITY: &[u8] = b"tally sharing parity";
@@ -42,7 +43,7 @@ impl Parity {
         cell: Region,
         product: Streams,
         second: u64,
-        pieces: &[(Hash, &[u8])],
+        pieces: &[(Hash, &Piece)],
     ) -> Self {
         let slices = slices(pieces);
         let longest = slices.iter().map(Vec::len).max().unwrap_or(0);
@@ -69,7 +70,7 @@ impl Parity {
     /// The encoded records of stripe `missing`, rebuilt from the records of every other data
     /// stripe (each with its hash; exactly the manifest's, in any order). `None` when the
     /// lengths do not add up. The caller checks each record's hash against the manifest.
-    pub fn rebuild(&self, missing: u8, others: &[(Hash, &[u8])]) -> Option<Vec<Vec<u8>>> {
+    pub fn rebuild(&self, missing: u8, others: &[(Hash, &Piece)]) -> Option<Vec<Vec<u8>>> {
         let len = usize::try_from(*self.lens.get(usize::from(missing))?).ok()?;
         let slices = slices(others);
         let mut slice = self.xor.clone();
@@ -121,14 +122,14 @@ pub fn id_of(manifest: &Hash) -> Hash {
 }
 
 /// Each data stripe's slice of `pieces`.
-fn slices(pieces: &[(Hash, &[u8])]) -> Vec<Vec<u8>> {
-    let mut sorted: Vec<&(Hash, &[u8])> = pieces.iter().collect();
+fn slices(pieces: &[(Hash, &Piece)]) -> Vec<Vec<u8>> {
+    let mut sorted: Vec<&(Hash, &Piece)> = pieces.iter().collect();
     sorted.sort_by_key(|(hash, _)| *hash);
     sorted.dedup_by_key(|(hash, _)| *hash);
     let mut slices = vec![Vec::new(); usize::from(DATA_STRIPES)];
-    for (hash, bytes) in sorted {
+    for (hash, piece) in sorted {
         if let Some(slice) = slices.get_mut(usize::from(data_stripe(hash))) {
-            slice.extend_from_slice(bytes);
+            piece.encode_into(slice);
         }
     }
     slices

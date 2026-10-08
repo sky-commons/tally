@@ -138,14 +138,17 @@ pub async fn run(config: Config) -> Result<String, String> {
         let calibration = built.calibration;
         eprintln!(
             "tally-load: simulated in {:.1} s: {:.0} receptions a second a receiver ({:.0} in \
-             reach, kept at {:.3}), {:.0} distinct messages a second, each heard by {:.1} \
-             receivers; {} receptions held",
+             reach, kept at {:.3}), {:.0} distinct transmissions a second, each heard by {:.1} \
+             receivers, {:.0} distinct messages a second by their bytes, {:.0} a second for the \
+             deduplicated stream; {} receptions held",
             started.elapsed().as_secs_f64(),
             calibration.per_sec,
             calibration.in_reach_per_sec,
             calibration.probability,
             calibration.messages_per_sec,
             calibration.receivers_per_message,
+            calibration.contents_per_sec,
+            calibration.deduplicated_per_sec,
             built.held()
         );
         if config.simulate_only {
@@ -212,6 +215,7 @@ pub async fn run(config: Config) -> Result<String, String> {
             config.ramp,
             &config.state_dir,
             Arc::clone(&counts),
+            tokio::time::Instant::now(),
         );
     }
     let watch = Watch {
@@ -400,10 +404,12 @@ fn summary(summary: &Summary) -> String {
         row(
             "simulated traffic",
             format!(
-                "{:.0} receptions/s a receiver; {:.0} distinct messages/s, each heard by {:.1}",
+                "{:.0} receptions/s a receiver; {:.0} distinct transmissions/s, each heard by \
+                 {:.1}; {:.0} distinct messages/s by their bytes",
                 calibration.per_sec,
                 calibration.messages_per_sec,
-                calibration.receivers_per_message
+                calibration.receivers_per_message,
+                calibration.contents_per_sec
             ),
         );
         row(
@@ -479,15 +485,33 @@ fn summary(summary: &Summary) -> String {
                 rate(delta.raw_bytes) / (publishing.max(1)) as f64
             ),
         );
+        let expected = traffic.map_or(String::new(), |traffic| {
+            format!(
+                " (expected {:.0}/s: the simulation's distinct messages, by the relay's rule)",
+                traffic.calibration.deduplicated_per_sec
+            )
+        });
         row(
             "client: deduplicated",
             format!(
-                "{:.1} batches/s, {:.0} receptions/s, {:.2} MB/s",
+                "{:.1} batches/s, {:.0} receptions/s{expected}, {:.2} MB/s",
                 rate(delta.dedup_batches),
                 rate(delta.dedup_receptions),
                 rate(delta.dedup_bytes) / 1e6
             ),
         );
+        if config.streams.0 & tally_wire::Streams::RAW.0 != 0
+            && config.streams.0 & tally_wire::Streams::DEDUPLICATED.0 != 0
+        {
+            let (heard, missing) = client.heard.coverage();
+            row(
+                "client: dedup coverage",
+                format!(
+                    "{missing} of the {heard} distinct messages read raw this window never in the \
+                     deduplicated stream (0 when the relay loses none)"
+                ),
+            );
+        }
         for (name, histogram) in [
             ("latency: raw", &client.raw_latency),
             ("latency: deduplicated", &client.dedup_latency),

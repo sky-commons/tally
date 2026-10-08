@@ -26,6 +26,7 @@ async fn run() -> Result<(), String> {
         egress::decimal(config.max_upload.rate()),
         egress::decimal(config.max_upload.most_a_month())
     );
+    let hosts_mlat = config.relay_duties && config.mlat_threads > 0;
     let hub = Arc::new(
         Hub::new(config.max_subscribers)
             .advertising(config.hints())
@@ -33,10 +34,19 @@ async fn run() -> Result<(), String> {
             .vouching_for(config.clients.iter().copied())
             .max_connections(config.max_connections)
             .max_connections_per_address(config.max_connections_per_address)
-            .max_dedup_bytes(config.max_dedup_bytes)
             .max_feeder_bytes_per_sec(config.max_feeder_bytes_per_sec)
             .max_member_bytes_per_sec(config.max_member_bytes_per_sec)
-            .max_upload(config.max_upload),
+            .max_upload(config.max_upload)
+            .memory(config.memory, hosts_mlat)
+            .staged(config.threads),
+    );
+    eprintln!(
+        "tally-relay: {} of memory admits {} feeders ({} each); {} ingest and {} message threads",
+        egress::decimal(config.memory as u64),
+        hub.budget().ceiling(),
+        egress::decimal(hub.budget().per_feeder().total() as u64),
+        config.threads.ingest,
+        config.threads.message,
     );
     eprintln!(
         "tally-relay: key {} listening on {}",

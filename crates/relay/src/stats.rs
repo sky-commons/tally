@@ -216,6 +216,7 @@ mod tests {
                 regions: Vec::new(),
                 settle_ms: crate::mlat_host::SETTLE_MS,
                 threads: 1,
+                capacity: tally_mlat::engine::Capacity::default(),
             },
         ));
         let hub = Arc::new(Hub::new(8));

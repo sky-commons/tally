@@ -84,7 +84,7 @@ use tally_wire::{EnuCovariance, ObservationSet, PublicKey, Relation, TransmitTim
 
 use crate::clock::{ClockModel, Reach};
 use crate::geo::{self, C, Geodetic};
-use crate::held::{Held, sampled};
+use crate::held::{HoldsBins, sampled};
 use crate::linalg::{self, Matrix, Vec3};
 use crate::obs::{ObservationId, message_hash};
 use crate::scope::bin_of;
@@ -970,28 +970,13 @@ impl Book {
 
 /// The signed wall clock of the batch that carried `id`, when `held` holds it in a sealed bin of
 /// its transmission (`transmitted_ms`) or the next few: what a keeper with raw passes
-/// [`Book::settle`].
-pub fn heard_in(held: &Held, id: &ObservationId, transmitted_ms: u64) -> Option<u64> {
+/// [`Book::settle`]. `held` is a holder of raw or the shared handle of its sealed bins
+/// (`held::SealedBins`), so a relay's standing reads the bins its MLAT engine holds.
+pub fn heard_in(held: &impl HoldsBins, id: &ObservationId, transmitted_ms: u64) -> Option<u64> {
     let bin = bin_of(transmitted_ms);
     held.bins(bin - 1, bin + 2).iter().find_map(|sealed| {
-        let receiver = sealed.receiver(&id.receiver)?;
-        let message = sealed
-            .messages
-            .binary_search_by_key(&id.message, |message| message.hash)
-            .ok()? as u32;
-        let key = (receiver, id.epoch, id.timestamp, message);
-        let at = sealed
-            .records
-            .binary_search_by_key(&key, |record| {
-                (
-                    record.receiver,
-                    record.epoch,
-                    record.counter(),
-                    record.message,
-                )
-            })
-            .ok()?;
-        Some(sealed.wall_ms(&sealed.records[at]))
+        let at = sealed.find(id)?;
+        Some(sealed.wall_ms(&sealed.records[at as usize]))
     })
 }
 

@@ -50,7 +50,7 @@ use crate::network::{Asker, AskerRole};
 
 use self::groups::{ASK_LIFETIME_MS, GroupKey};
 use self::locks::lock;
-use self::member::{Arrival, HORIZON_SECONDS, Member, Message, Outgoing, record_hash};
+use self::member::{Arrival, HORIZON_SECONDS, Member, Message, Outgoing, Piece, record_hash};
 use self::withdrawal::Withdrawal;
 
 pub use self::seeds::{SEED_COPIES, seeded_bytes};
@@ -94,6 +94,8 @@ pub struct Sharing {
     indexed_through: Mutex<Option<u64>>,
     /// The regions this relay has withdrawn from forwarding in.
     withdrawal: Mutex<Withdrawal>,
+    /// The member's capacity, once the relay set one.
+    capacity: Mutex<Option<usize>>,
 }
 
 struct Assembling {
@@ -211,11 +213,11 @@ impl Sharing {
     /// A record this relay originated for an area's product (a feeder's batch, its own
     /// positions): held, and seeded into the group.
     pub fn originate(&self, record: &Record, cell: Region, product: Streams, now_ms: u64) {
-        let Some((hash, bytes)) = encoded(record) else {
+        let Some((hash, piece)) = encoded(record) else {
             return;
         };
         let out = self.with_member(|member| {
-            member.originate(GroupKey::new(cell, product), hash, bytes, now_ms)
+            member.originate(GroupKey::new(cell, product), hash, piece, now_ms)
         });
         self.queue(out.unwrap_or_default());
     }
@@ -229,13 +231,13 @@ impl Sharing {
         product: Streams,
         now_ms: u64,
     ) {
-        let Some((hash, bytes)) = encoded(record) else {
+        let Some((hash, piece)) = encoded(record) else {
             return;
         };
         let message = Message::Piece {
             group: GroupKey::new(cell, product),
             hash,
-            bytes,
+            piece,
         };
         let out = self.with_member(|member| member.receive(*from, message, now_ms));
         self.queue(out.unwrap_or_default());
@@ -300,6 +302,23 @@ impl Sharing {
             xor: whole.bytes,
         };
         self.drive(asker, Message::Parity(Arc::new(parity)), now_ms)
+    }
+
+    /// The most record bytes this relay's groups hold over the horizon:
+    /// `member::held_bytes_for` the inflow the relay admits. A record past it is refused whole
+    /// and counted (`member::Stats::refused`).
+    pub fn set_held_capacity(&self, bytes: usize) {
+        *lock(&self.capacity) = Some(bytes);
+        if let Some(member) = lock(&self.member).as_mut() {
+            member.set_capacity(bytes);
+        }
+    }
+
+    /// Record bytes the groups hold now, and records refused for room since start.
+    pub fn held(&self) -> (usize, u64) {
+        lock(&self.member).as_ref().map_or((0, 0), |member| {
+            (member.held_bytes(), member.stats().refused)
+        })
     }
 
     /// The addressed sends waiting for their links: (member, record).
@@ -399,9 +418,17 @@ impl Sharing {
         self.bundles.set_gathered(&areas);
         lock(&self.assembling).retain(|_, held| held.started_ms + PARITY_ASSEMBLY_MS > now_ms);
         let mut guard = lock(&self.member);
-        let member = guard.get_or_insert_with(|| Member::new(identity.clone()));
+        let capacity = *lock(&self.capacity);
+        let fresh = |identity: &Identity| {
+            let mut member = Member::new(identity.clone());
+            if let Some(bytes) = capacity {
+                member.set_capacity(bytes);
+            }
+            member
+        };
+        let member = guard.get_or_insert_with(|| fresh(identity));
         if member.key() != me {
-            *member = Member::new(identity.clone());
+            *member = fresh(identity);
         }
         let mut out = Vec::new();
         for key in member.groups() {
@@ -422,7 +449,7 @@ impl Sharing {
             .take_delivered()
             .into_iter()
             .filter(|delivered| delivered.arrival == Arrival::Rebuilt)
-            .filter_map(|delivered| decoded(&delivered.bytes))
+            .filter_map(|delivered| delivered.piece.record())
             .collect();
         drop(guard);
         self.queue(out);
@@ -564,22 +591,15 @@ pub fn group_of(record: &Record, point: Option<Region>) -> Option<(Region, Strea
     }
 }
 
-/// A record as a group carries it: its hash and its encoding.
-fn encoded(record: &Record) -> Option<(tally_wire::batch::Hash, Arc<Vec<u8>>)> {
-    let hash = record_hash(record)?;
-    let mut bytes = Vec::new();
-    record.encode(&mut bytes).ok()?;
-    Some((hash, Arc::new(bytes)))
-}
-
-fn decoded(bytes: &[u8]) -> Option<Record> {
-    Record::decode(bytes).ok()?.0
+/// A record as a group carries it: its hash and its piece (a batch's own bytes, shared).
+fn encoded(record: &Record) -> Option<(tally_wire::batch::Hash, Piece)> {
+    Some((record_hash(record)?, Piece::of(record)?))
 }
 
 /// The wire records of a message: one, or a parity's chunks.
 fn to_records(message: Message) -> Vec<Record> {
     match message {
-        Message::Piece { bytes, .. } => decoded(&bytes).into_iter().collect(),
+        Message::Piece { piece, .. } => piece.record().into_iter().collect(),
         Message::Manifest(manifest) => vec![Record::PieceManifest(manifest)],
         Message::Receipt(receipt) => vec![Record::StripeReceipt(receipt)],
         Message::Have(have) => vec![Record::HaveSummary(have)],

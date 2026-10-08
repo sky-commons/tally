@@ -35,8 +35,8 @@ pub use credit::{
 };
 pub use decoded::{Decoded, FingerprintKey, ObsRef, ObsView, Undecodable};
 pub use delivery::{
-    DeliveryAnswer, DeliveryAnswerContent, DeliveryQuery, Possession, SequenceRange,
-    possession_proof,
+    DeliveryAnswer, DeliveryAnswerContent, DeliveryQuery, Possession, SequenceRange, Tag, TagKey,
+    TagKeys, TagKeysContent, delivery_tag,
 };
 pub use directory::{ProviderOffer, ProviderOfferContent, ProviderQuery};
 pub use fault_proof::{Fault, FaultProof, ModelFault, SolutionFault, Tolerance};

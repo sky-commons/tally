@@ -27,6 +27,7 @@ rust_library(
         "//tally/crates/mlat-solver",
         "//tally/crates/wire",
         "@tally_crates//:axum",
+        "@tally_crates//:libc",
         "@tally_crates//:serde",
         "@tally_crates//:tokio",
     ],
@@ -67,6 +68,25 @@ rust_test(
     deps = [
         ":relay",
         "//tally/crates/feed",
+        "//tally/crates/mlat-solver",
+        "//tally/crates/wire",
+        "@tally_crates//:tokio",
+    ],
+)
+
+# The staged relay's invariants (RFC-0177) on its own threads: the same stamped trace makes the
+# same bytes on 1, 2 and 8 threads (products, stream and hosted MLAT), delays change nothing, a message is kept once a window, each
+# receiver's batches reach a subscriber in order, and what is let go is let go whole.
+rust_test(
+    name = "staged",
+    size = "medium",
+    srcs = ["tests/staged.rs"],
+    edition = "2024",
+    lint_config = ":cargo_lints",
+    deps = [
+        ":relay",
+        "//tally/crates/mlat",
+        "//tally/crates/mlat-solver",
         "//tally/crates/wire",
         "@tally_crates//:tokio",
     ],
@@ -120,6 +140,7 @@ rustfmt_test(
         ":mlat_host_binary",
         ":relay",
         ":relay_test",
+        ":staged",
         ":tally-relay",
     ],
 )

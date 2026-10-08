@@ -15,7 +15,7 @@ use tally_wire::{
 
 use super::bundles::{BundleIndex, Bundles, Omission, children};
 use super::groups::{GroupKey, Groups};
-use super::member::{Member, Message, Outgoing, piece_hash};
+use super::member::{Member, Message, Outgoing, Piece};
 use super::parity::Parity;
 use super::seeds::{
     SEED_COPIES, SEED_ROTATION_SECONDS, SEEDS, epoch_of, is_seed, seed_members, seeded_bytes,
@@ -214,15 +214,14 @@ impl Sim {
             )
             .map_err(text)?;
             let record = Record::Batch(batch);
-            let mut bytes = Vec::new();
-            record.encode(&mut bytes).map_err(text)?;
-            let hash = piece_hash(&bytes).ok_or("no hash")?;
+            let piece = Piece::of(&record).ok_or("no piece")?;
+            let hash = piece.hash().ok_or("no hash")?;
             self.originated.insert(hash, (self.now, origin));
             hashes.push(hash);
             if self.down.contains(&origin) {
                 continue;
             }
-            let out = self.members[origin].originate(self.group, hash, Arc::new(bytes), self.now);
+            let out = self.members[origin].originate(self.group, hash, piece, self.now);
             self.collect(origin);
             self.send(origin, out);
         }
@@ -292,14 +291,16 @@ impl Sim {
             .collect()
     }
 
-    /// Every live member holds every record originated by a live origin, handed over once.
+    /// Every live member was handed every record originated by a live origin, once, and still
+    /// holds those within the horizon (older ones it has let go, as it should).
     fn everyone_holds_everything(&self, excluded: &BTreeSet<usize>) -> Outcome {
-        for (hash, (_, origin)) in &self.originated {
+        let horizon_ms = super::member::HORIZON_SECONDS * 1000;
+        for (hash, (at, origin)) in &self.originated {
             if self.down.contains(origin) {
                 continue;
             }
             for i in self.live().into_iter().filter(|i| !excluded.contains(i)) {
-                if !self.members[i].holds(self.group, hash) {
+                if at + horizon_ms > self.now && !self.members[i].holds(self.group, hash) {
                     return Err(format!(
                         "member {i} of {} lacks a record from {origin}",
                         self.members.len()
@@ -657,11 +658,10 @@ fn receipts_verify_and_name_what_was_delivered() -> Outcome {
             return Err("an empty receipt".into());
         }
         // Only listed records are credited: the digest is over records the child holds.
-        let child = &sim.members[*from];
         let held = sim
             .originated
             .keys()
-            .filter(|hash| child.holds(sim.group, hash))
+            .filter(|hash| sim.handed.contains_key(&(*from, **hash)))
             .count();
         if content.records as usize > held {
             return Err("a receipt for more than was held".into());
@@ -726,30 +726,43 @@ fn parity_rebuilds_any_one_stripe() -> Outcome {
             },
         )
         .map_err(text)?;
-        let mut bytes = Vec::new();
-        Record::Batch(batch).encode(&mut bytes).map_err(text)?;
-        records.push((piece_hash(&bytes).ok_or("hash")?, bytes));
+        let piece = Piece::of(&Record::Batch(batch)).ok_or("no piece")?;
+        records.push((piece.hash().ok_or("hash")?, piece));
     }
-    let pieces: Vec<(Hash, &[u8])> = records.iter().map(|(h, b)| (*h, b.as_slice())).collect();
+    let pieces: Vec<(Hash, &Piece)> = records.iter().map(|(h, b)| (*h, b)).collect();
     let parity = Parity::build([9; 32], area()?, Streams::RAW, 5, &pieces);
     for missing in 0..DATA_STRIPES {
-        let others: Vec<(Hash, &[u8])> = pieces
+        let others: Vec<(Hash, &Piece)> = pieces
             .iter()
             .filter(|(hash, _)| data_stripe(hash) != missing)
             .copied()
             .collect();
         let rebuilt = parity.rebuild(missing, &others).ok_or("not rebuilt")?;
-        let mut expected: Vec<&(Hash, Vec<u8>)> = records
+        let mut expected: Vec<&(Hash, Piece)> = records
             .iter()
             .filter(|(hash, _)| data_stripe(hash) == missing)
             .collect();
         expected.sort_by_key(|(hash, _)| *hash);
-        let expected: Vec<Vec<u8>> = expected.into_iter().map(|(_, b)| b.clone()).collect();
+        let expected: Vec<Vec<u8>> = expected
+            .into_iter()
+            .map(|(_, piece)| {
+                let mut bytes = Vec::new();
+                piece.encode_into(&mut bytes);
+                bytes
+            })
+            .collect();
         if rebuilt != expected {
             return Err(format!("stripe {missing} rebuilt wrong"));
         }
+        // A rebuilt batch is the batch, its piece the same as the one held.
+        for bytes in &rebuilt {
+            let piece = Piece::from_encoded(bytes.clone()).ok_or("not a piece")?;
+            if !records.iter().any(|(_, held)| *held == piece) {
+                return Err("rebuilt a piece not held".into());
+            }
+        }
         // Missing a record of a second stripe too: refused, never a wrong answer.
-        let fewer: Vec<(Hash, &[u8])> = others.iter().skip(1).copied().collect();
+        let fewer: Vec<(Hash, &Piece)> = others.iter().skip(1).copied().collect();
         if parity.rebuild(missing, &fewer).is_some() {
             return Err("rebuilt from too little".into());
         }
@@ -926,11 +939,7 @@ fn the_seam_admits_relays_that_ask_and_ignores_clients() -> Outcome {
 }
 
 /// A receiver's batch as a group carries it: its hash and its encoding.
-fn record(
-    receiver: &Identity,
-    sequence: u64,
-    wall_ms: u64,
-) -> Result<(Hash, Arc<Vec<u8>>), String> {
+fn record(receiver: &Identity, sequence: u64, wall_ms: u64) -> Result<(Hash, Piece), String> {
     let batch = Batch::sign(
         receiver,
         &BatchContent {
@@ -944,10 +953,9 @@ fn record(
         },
     )
     .map_err(text)?;
-    let mut bytes = Vec::new();
-    Record::Batch(batch).encode(&mut bytes).map_err(text)?;
-    let hash = piece_hash(&bytes).ok_or("no hash")?;
-    Ok((hash, Arc::new(bytes)))
+    let piece = Piece::of(&Record::Batch(batch)).ok_or("no piece")?;
+    let hash = piece.hash().ok_or("no hash")?;
+    Ok((hash, piece))
 }
 
 fn manifest(
@@ -1028,9 +1036,9 @@ fn a_have_summary_at_the_end_of_time_is_refused_not_a_panic() -> Outcome {
     let members = keys(3);
     let _ = member.set_members(group, &members, &[], START_MS);
     let origin = identity(1);
-    let (hash, bytes) = record(&identity(10_000), 1, START_MS)?;
+    let (hash, piece) = record(&identity(10_000), 1, START_MS)?;
     let second = START_MS / 1000;
-    let _ = member.receive(members[1], Message::Piece { group, hash, bytes }, START_MS);
+    let _ = member.receive(members[1], Message::Piece { group, hash, piece }, START_MS);
     let _ = member.receive(
         members[1],
         Message::Manifest(manifest(&origin, group, second, &[hash])?),
@@ -1093,9 +1101,9 @@ fn a_poisoned_lock_does_not_end_sharing() -> Outcome {
     if sharing.layout(cell, Streams::RAW).is_none() {
         return Err("sharing ended with a poisoned lock".into());
     }
-    let batch = Record::decode(&record(&identity(10_000), 1, START_MS)?.1)
-        .map_err(text)?
-        .0
+    let batch = record(&identity(10_000), 1, START_MS)?
+        .1
+        .record()
         .ok_or("no record")?;
     sharing.originate(&batch, cell, Streams::RAW, START_MS + 1_100);
     let _ = sharing.take_outbox();
@@ -1230,12 +1238,12 @@ fn a_false_parity_is_dropped_and_a_true_one_after_it_rebuilds() -> Outcome {
             let message = Message::Piece {
                 group,
                 hash: *hash,
-                bytes: Arc::clone(bytes),
+                piece: bytes.clone(),
             };
             let _ = member.receive(members[1], message, START_MS);
         }
     }
-    let views: Vec<(Hash, &[u8])> = pieces.iter().map(|(h, b)| (*h, b.as_slice())).collect();
+    let views: Vec<(Hash, &Piece)> = pieces.iter().map(|(h, b)| (*h, b)).collect();
     let good = Parity::build(signed.hash(), group.cell, group.product, second, &views);
     let mut bad = good.clone();
     for byte in &mut bad.xor {
@@ -1268,9 +1276,9 @@ fn repair_is_answered_only_to_members_of_the_trees() -> Outcome {
     let mut member = Member::new(identity(0));
     let members = keys(3);
     let _ = member.set_members(group, &members, &[], START_MS);
-    let (hash, bytes) = record(&identity(10_000), 1, START_MS)?;
+    let (hash, piece) = record(&identity(10_000), 1, START_MS)?;
     let second = START_MS / 1000;
-    let _ = member.receive(members[1], Message::Piece { group, hash, bytes }, START_MS);
+    let _ = member.receive(members[1], Message::Piece { group, hash, piece }, START_MS);
     let _ = member.receive(
         members[1],
         Message::Manifest(manifest(&identity(1), group, second, &[hash])?),
@@ -1389,6 +1397,76 @@ fn a_full_cap_withdraws_regions_one_at_a_time_in_a_fixed_order_and_takes_them_ba
     let _ = sharing.tick_shed(&hub, Some(&mine), 1, START_MS + 1_000);
     if !sharing.withdrawn(area) || !homes(sharing).is_empty() {
         return Err("still forwarding in a withdrawn area".into());
+    }
+    Ok(())
+}
+
+#[test]
+fn a_member_holds_records_for_its_repair_horizon_shared_and_refuses_past_its_capacity() -> Outcome {
+    use super::member::{
+        HORIZON_MS, HORIZON_SECONDS, JUDGE_AFTER_MS, RECEIPT_GRACE_MS, RECEIPT_WINDOW_SECONDS,
+        REPAIR_AFTER_MS, held_bytes_for,
+    };
+    // The horizon is sharing's own duties end to end, not a round minute.
+    if HORIZON_MS
+        != RECEIPT_WINDOW_SECONDS * 1000 + RECEIPT_GRACE_MS + JUDGE_AFTER_MS + REPAIR_AFTER_MS
+        || !(12..=15).contains(&HORIZON_SECONDS)
+    {
+        return Err(format!("a horizon of {HORIZON_SECONDS} s"));
+    }
+    let group = GroupKey::new(area()?, Streams::RAW);
+    let members = keys(4);
+    let mut member = Member::new(identity(0));
+    let _ = member.set_members(group, &members, &[], START_MS);
+    let receiver = identity(10_000);
+    let (hash, piece) = record(&receiver, 1, START_MS)?;
+    let len = piece.len();
+    // Sized by time: room for two such records a second over the horizon.
+    member.set_capacity(held_bytes_for(2 * len as u64));
+    let _ = member.originate(group, hash, piece.clone(), START_MS);
+    // What it holds and hands on is the batch itself: its bytes are the batch's, not a copy.
+    let delivered = member.take_delivered();
+    let (Some(super::member::Piece::Batch(held)), super::member::Piece::Batch(original)) =
+        (delivered.first().map(|delivered| &delivered.piece), &piece)
+    else {
+        return Err("a batch held as something else".into());
+    };
+    if held.as_bytes().as_ptr() != original.as_bytes().as_ptr() {
+        return Err("a batch's bytes copied into the group".into());
+    }
+    if member.held_bytes() != len {
+        return Err(format!("{} bytes held of {len}", member.held_bytes()));
+    }
+    // Past the capacity a record is refused whole, and counted.
+    let mut taken = 1;
+    for sequence in 2..(2 * HORIZON_SECONDS + 10) {
+        let (hash, piece) = record(&receiver, sequence, START_MS)?;
+        let _ = member.originate(group, hash, piece, START_MS);
+        if member.holds(group, &hash) {
+            taken += 1;
+        }
+    }
+    if member.held_bytes() > held_bytes_for(2 * len as u64) || member.stats().refused == 0 {
+        return Err(format!(
+            "{} bytes held, {} refused",
+            member.held_bytes(),
+            member.stats().refused
+        ));
+    }
+    if taken as usize * len != member.held_bytes() {
+        return Err("a record held in part".into());
+    }
+    // Within the horizon it is held; past it, let go, and its bytes with it.
+    let _ = member.tick(START_MS + HORIZON_SECONDS * 1000);
+    if !member.holds(group, &hash) {
+        return Err("let go within the horizon".into());
+    }
+    let _ = member.tick(START_MS + HORIZON_SECONDS * 1000 + 1_001);
+    if member.holds(group, &hash) || member.held_bytes() != 0 {
+        return Err(format!(
+            "held past the horizon: {} bytes",
+            member.held_bytes()
+        ));
     }
     Ok(())
 }

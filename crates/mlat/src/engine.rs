@@ -1,6 +1,9 @@
 //! The engine's state (RFC-0171 §3.8, §3.8.1): the receivers it multilaterates for, the raw
 //! observations it holds (`tally_mlat_solver::held`, compact, per bin), and which windows it has
-//! solved. Nothing here reads a clock or a socket: the caller says what time it is, so the same
+//! solved. The receivers and their open raw are its [`Intake`] (`intake`): an engine holds its
+//! own ([`Engine::new`]), or its host holds them split by receiver and hands it the sealed bins
+//! and what each batch says to provisional solving ([`Engine::hosted`]: a relay's raw shards,
+//! RFC-0177 §5), and the same raw solves to the same bytes either way. Nothing here reads a clock or a socket: the caller says what time it is, so the same
 //! records in any order leave the same state, and the same state solves to the same bytes
 //! (`window`).
 //!
@@ -13,42 +16,62 @@
 //! - An observation is held once (the G-Set of §3.8.1): its identity is (receiver key, counter
 //!   epoch, raw counter, message hash), the same however many paths delivered it, so the held set
 //!   is the union of everything delivered. Only what MLAT uses is held (the solver's ingest
-//!   prefilter and, when a bin is sealed, its canonical thinning), in 24 bytes an observation, the
-//!   whole bounded by bytes (`MAX_HELD_BYTES`).
+//!   prefilter and, when a bin is sealed, its canonical thinning), in 24 bytes an observation. The
+//!   raw it holds is the one store its host keeps (`Engine::sealed_bins` is what the host's other
+//!   readers, a relay's standing, share), sealed on `Settings::threads` threads.
+//! - **Capacity is configuration, and refusal is whole** (RFC-0177 §9). How many receivers it
+//!   describes and what its raw may hold come from `Settings::capacity`, which a relay derives from
+//!   the receivers it admits; a receiver beyond them is refused whole (never remembered, its raw
+//!   never held) and counted, and a receiver's raw of a bin beyond its share is refused whole and
+//!   counted (`tally_mlat_solver::held::Limits`), never partly by arrival order.
 //! - Which window an observation is in is decided by its content alone: its grid bin is its
 //!   signed batch wall clock's, never when it arrived (`tally_mlat_solver::scope`). A bin is
 //!   sealed once it has ended and a settling time has passed by the engine's clock, and a window
 //!   (strided: one fit per tile per `STRIDE` bins) is solved once its last bin is sealed; when
 //!   decides only whether late raw makes it in, never what the same raw solves to.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet};
 
-use tally_mlat_solver::held::Held;
-use tally_mlat_solver::obs::MAX_SITE_PRECISION_M;
-use tally_mlat_solver::scope::{BEFORE, STRIDE, Window, bin_of};
-use tally_mlat_solver::{Site, Timebase};
-use tally_wire::{
-    Batch, Clock, Decoded, Identity, Location, PublicKey, ReceiverInfo, Record, Region,
-};
+use tally_mlat_solver::Site;
+use tally_mlat_solver::held::{Bin, Fragment, Limits, RAW_SPARE_BINS, Rates, SealedBins};
+use tally_mlat_solver::scope::{AFTER, BEFORE, STRIDE, Window, bin_of};
+use tally_wire::{Batch, Decoded, Identity, PublicKey, Record, Region};
 
-use crate::provisional::{self, Provisional};
+use crate::intake::{Intake, Seats};
+use crate::provisional::{self, Note, Provisional};
 use crate::window::{Job, Outcome, Report};
 
-/// How far behind a boot's newest sequence a batch may still arrive (two relays, or one relay's
-/// reordering) and be used; anything older is a replay or too late to matter.
-const REORDER: u64 = 64;
-/// Boots remembered per receiver, most recent first. A receiver that restarts more often than
-/// this within one window only weakens its own replay protection.
-const BOOTS_PER_RECEIVER: usize = 8;
-/// Receivers described at once, taking part or not. A region's relays bound what reaches the
-/// engine; this bounds what the engine keeps if they do not.
-pub const MAX_RECEIVERS: usize = 16_384;
-/// Bytes of raw held at once (`tally_mlat_solver::held`, about 24 bytes an observation and its
-/// share of the bin's index and messages). Sized for the whole world on one node: 20,000
-/// feeders, at the few hundred observations a second each that survive ingest thinning, over
-/// the 85 s a window at stride 4 and its settling span (RFC-0171 §3.8.1). Beyond it new raw is
-/// refused (and counted) until a bin is forgotten.
-pub const MAX_HELD_BYTES: usize = 48 << 30;
+/// The fewest receivers an engine is sized for: a region's whole receiver population at the
+/// founder's requirement (RFC-0177: one relay, 20,000 feeders).
+pub const MIN_RECEIVERS: usize = 20_000;
+
+/// How much an engine holds, derived from what its host admits (RFC-0177 §9).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Capacity {
+    /// Receivers described at once, taking part or not: every receiver whose raw reaches it (a
+    /// relay's admitted feeders and the border band its raw links carry). A new one beyond them
+    /// is refused whole and counted.
+    pub receivers: usize,
+    /// The rates each receiver is admitted at, which size the raw held
+    /// (`tally_mlat_solver::held::Limits::for_receivers`).
+    pub rates: Rates,
+}
+
+impl Capacity {
+    /// Sized for `receivers` at the measured rates, never fewer than `MIN_RECEIVERS`.
+    pub fn for_receivers(receivers: usize) -> Self {
+        Self {
+            receivers: receivers.max(MIN_RECEIVERS),
+            rates: Rates::MEASURED,
+        }
+    }
+}
+
+impl Default for Capacity {
+    fn default() -> Self {
+        Self::for_receivers(MIN_RECEIVERS)
+    }
+}
 
 /// What the operator chose.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -58,8 +81,18 @@ pub struct Settings {
     /// How long after a bin's canonical window ends (by the engine's clock) it is solved, so the
     /// raw of the window's last bin is in.
     pub settle_ms: u64,
-    /// The threads one step's work is spread over. Any number gives the same bytes.
+    /// The threads one step's work, and a bin's sealing, are spread over. Any number gives the
+    /// same bytes.
     pub threads: usize,
+    /// How much it holds.
+    pub capacity: Capacity,
+}
+
+impl Settings {
+    /// The raw it may hold.
+    pub fn limits(&self) -> Limits {
+        Limits::for_receivers(self.capacity.receivers, self.capacity.rates, self.settle_ms)
+    }
 }
 
 /// What one record did.
@@ -73,98 +106,33 @@ pub enum Ingested {
     Replayed,
     /// Anything else, or a record of a receiver that takes no part.
     Ignored,
+    /// A new receiver's description beyond `Capacity::receivers`: refused whole, and counted.
+    Refused,
 }
 
-/// Observations dropped for room since the last step.
+/// What was refused since the last step, every refusal whole.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Dropped {
-    pub observations: u64,
-}
-
-/// A receiver's newest description: when it was issued, its bytes (which decide between two
-/// issued in the same millisecond, so the order they arrive in does not), and its site if it
-/// takes part.
-struct Described {
-    issued_ms: u64,
-    bytes: Vec<u8>,
-    /// What it declared, so a change of the engine's regions re-decides whether it takes part.
-    location: Option<Location>,
-    clock: Clock,
-    site: Option<Site>,
-    /// The sequences used per boot, most recent boot first.
-    boots: VecDeque<(u64, Sequences)>,
-}
-
-/// The sequences of one boot already used: the newest, and which of the `REORDER` before it.
-struct Sequences {
-    newest: u64,
-    /// Bit `i` set: sequence `newest - i` was used.
-    used: u64,
-}
-
-impl Sequences {
-    fn new(sequence: u64) -> Self {
-        Self {
-            newest: sequence,
-            used: 1,
-        }
-    }
-
-    /// True the first time `sequence` is offered, if it is within `REORDER` of the newest.
-    fn admit(&mut self, sequence: u64) -> bool {
-        if sequence > self.newest {
-            let ahead = sequence - self.newest;
-            self.used = if ahead >= REORDER {
-                0
-            } else {
-                self.used << ahead
-            };
-            self.used |= 1;
-            self.newest = sequence;
-            return true;
-        }
-        let behind = self.newest - sequence;
-        if behind >= REORDER {
-            return false;
-        }
-        let bit = 1 << behind;
-        if self.used & bit != 0 {
-            return false;
-        }
-        self.used |= bit;
-        true
-    }
-}
-
-impl Described {
-    /// True when the batch numbered `sequence` in `boot` has not been used.
-    fn admit(&mut self, boot: u64, sequence: u64) -> bool {
-        let found = self
-            .boots
-            .iter()
-            .position(|(id, _)| *id == boot)
-            .and_then(|at| self.boots.remove(at));
-        let (admitted, sequences) = match found {
-            Some((_, mut sequences)) => (sequences.admit(sequence), sequences),
-            None => {
-                self.boots.truncate(BOOTS_PER_RECEIVER - 1);
-                (true, Sequences::new(sequence))
-            }
-        };
-        self.boots.push_front((boot, sequences));
-        admitted
-    }
+    /// Observations of a bin already sealed: later than its settling.
+    pub late: u64,
+    /// Observations refused with their receiver's whole raw of a bin (`Limits`).
+    pub refused: u64,
+    /// Descriptions of new receivers refused whole, beyond `Capacity::receivers`.
+    pub receivers: u64,
 }
 
 pub struct Engine {
     identity: Identity,
     boot_id: u64,
     settings: Settings,
-    receivers: BTreeMap<PublicKey, Described>,
     /// The areas whose tiles it fits (`set_scope`): a tile is fitted only if its centre is in one.
     /// Empty: every tile its regions cover.
     owned: Vec<Region>,
-    held: Held,
+    /// Its receivers and their open raw, when it holds them itself; `None` when its host does
+    /// (`hosted`).
+    intake: Option<Intake>,
+    /// The sealed bins: its own, or its host's, shared with the host's other readers.
+    sealed: SealedBins,
     /// The windows solved, by their last bin.
     processed: BTreeSet<i64>,
     positions_sequence: u64,
@@ -177,13 +145,47 @@ impl Engine {
     /// `boot_id` is this process's: relays number an engine's records per (engine, boot), so a
     /// restart starts its sequences again at 0 without colliding with what the last boot sent.
     pub fn new(identity: Identity, boot_id: u64, settings: Settings) -> Self {
+        Self::sharing(identity, boot_id, settings, SealedBins::new())
+    }
+
+    /// As `new`, sealing into `sealed`: the handle its host's other readers of the raw keep (a
+    /// relay's standing), so the raw is held once.
+    pub fn sharing(
+        identity: Identity,
+        boot_id: u64,
+        settings: Settings,
+        sealed: SealedBins,
+    ) -> Self {
+        let intake = Intake::new(
+            Seats::new(settings.capacity.receivers),
+            Limits {
+                bytes: usize::MAX,
+                ..settings.limits()
+            },
+            Some(settings.regions.clone()),
+        );
+        let mut engine = Self::hosted(identity, boot_id, settings, sealed);
+        engine.intake = Some(intake);
+        engine
+    }
+
+    /// An engine whose host holds its receivers and their raw (`intake::Intake`, split by
+    /// receiver) and seals it into `sealed`: it is handed what each batch says to provisional
+    /// solving (`hear`), the sites and the sealed bins at each step (`prepare_sealed`), and solves
+    /// them as `new`'s engine solves the same raw.
+    pub fn hosted(
+        identity: Identity,
+        boot_id: u64,
+        settings: Settings,
+        sealed: SealedBins,
+    ) -> Self {
         Self {
             identity,
             boot_id,
             settings,
-            receivers: BTreeMap::new(),
             owned: Vec::new(),
-            held: Held::new(MAX_HELD_BYTES),
+            intake: None,
+            sealed,
             processed: BTreeSet::new(),
             positions_sequence: 0,
             models_sequence: 0,
@@ -196,37 +198,54 @@ impl Engine {
         self.boot_id
     }
 
+    pub fn settings(&self) -> &Settings {
+        &self.settings
+    }
+
     /// Observations held now (an open bin's copies included until it is sealed).
     pub fn held(&self) -> usize {
-        self.held.len()
+        self.sealed.len() + self.intake.as_ref().map_or(0, Intake::len)
     }
 
-    /// Bytes of raw held now.
+    /// Bytes of raw held now, as allocated.
     pub fn held_bytes(&self) -> usize {
-        self.held.bytes()
+        self.sealed.bytes() + self.intake.as_ref().map_or(0, Intake::bytes)
     }
 
-    /// Whether `receiver` is described, and whether it takes part.
+    /// The sealed bins it holds, shared: a cheap handle that sees every bin it seals and forgets.
+    pub fn sealed_bins(&self) -> SealedBins {
+        self.sealed.clone()
+    }
+
+    /// Whether `receiver` is described, and whether it takes part (one refused for room is
+    /// described, and takes no part). Always `None` for a hosted engine.
     pub fn described(&self, receiver: &PublicKey) -> Option<bool> {
-        self.receivers
-            .get(receiver)
-            .map(|described| described.site.is_some())
+        self.intake.as_ref()?.described(receiver)
     }
 
-    /// Receivers taking part now.
+    /// Receivers taking part now (of its own intake).
     pub fn taking_part(&self) -> usize {
-        self.receivers
-            .values()
-            .filter(|described| described.site.is_some())
-            .count()
+        self.intake.as_ref().map_or(0, Intake::taking_part)
     }
 
     /// Takes a record a relay delivered, at `now_ms` by the engine's clock (which decides only
     /// when a reception is solved provisionally, never what anything solves to). An error is a
-    /// record that claimed to be signed and is not.
+    /// record that claimed to be signed and is not. A hosted engine takes nothing this way: its
+    /// host's intakes do.
     pub fn ingest(&mut self, record: &Record, now_ms: u64) -> Result<Ingested, String> {
         match record {
-            Record::ReceiverInfo(info) => self.describe(info),
+            Record::ReceiverInfo(info) => {
+                let Some(intake) = self.intake.as_mut() else {
+                    return Ok(Ingested::Ignored);
+                };
+                let described = intake.describe(info)?;
+                if described.left
+                    && let Ok(key) = info.receiver()
+                {
+                    self.forget_receiver(&key);
+                }
+                Ok(described.ingested)
+            }
             Record::Batch(batch) => self.receive(batch, now_ms),
             // A relay's deduplicated stream is the relay's word, not a receiver's: it carries no
             // receiver's counter and is never multilaterated.
@@ -234,54 +253,11 @@ impl Engine {
         }
     }
 
-    fn describe(&mut self, info: &ReceiverInfo) -> Result<Ingested, String> {
-        let key = info.receiver().map_err(|error| error.to_string())?;
-        info.verify()
-            .map_err(|error| format!("receiver info of {key}: {error}"))?;
-        // A format this build cannot read says nothing it can use.
-        let Ok(content) = info.content() else {
-            return Ok(Ingested::Ignored);
-        };
-        if let Some(known) = self.receivers.get(&key)
-            && (known.issued_ms, known.bytes.as_slice()) >= (content.issued_ms, info.as_bytes())
-        {
-            return Ok(Ingested::Ignored);
-        }
-        let site = self.site(key, content.location, content.clock);
-        if !self.receivers.contains_key(&key) && self.receivers.len() >= MAX_RECEIVERS {
-            // Full: a receiver that takes part displaces the first that does not; one that does
-            // not take part is not remembered.
-            let Some(idle) = self
-                .receivers
-                .iter()
-                .find(|(_, known)| known.site.is_none())
-                .map(|(key, _)| *key)
-                .filter(|_| site.is_some())
-            else {
-                return Ok(Ingested::Ignored);
-            };
-            self.receivers.remove(&idle);
-        }
-        let known = self.receivers.entry(key).or_insert_with(|| Described {
-            issued_ms: 0,
-            bytes: Vec::new(),
-            location: None,
-            clock: content.clock,
-            site: None,
-            boots: VecDeque::new(),
-        });
-        known.issued_ms = content.issued_ms;
-        known.bytes = info.as_bytes().to_vec();
-        known.location = content.location;
-        known.clock = content.clock;
-        let left = known.site.is_some() && site.is_none();
-        known.site = site;
-        if left {
-            // It left the regions or became unusable: what it heard is no longer used.
-            known.boots.clear();
-            self.held.forget_receiver(&key);
-        }
-        Ok(Ingested::Described)
+    /// Forgets `receiver` in the sealed bins: it stopped taking part (its intake forgot its open
+    /// raw).
+    pub fn forget_receiver(&mut self, receiver: &PublicKey) {
+        self.sealed
+            .forget_receiver(receiver, self.settings.threads.max(1));
     }
 
     /// Changes what the engine covers, as a relay hosting it does when the areas it is an MLAT
@@ -291,48 +267,21 @@ impl Engine {
     /// cover). Every receiver described is decided again on its own signed word: one now outside
     /// takes no part and what it heard is forgotten, as when its own description moves it out; one
     /// now inside takes part from its next batch. The same records under the same scope solve to
-    /// the same bytes whatever scopes came before.
+    /// the same bytes whatever scopes came before. A hosted engine's host re-scopes its intakes.
     pub fn set_scope(&mut self, regions: Vec<Region>, owned: Vec<Region>) {
-        self.settings.regions = regions;
+        self.settings.regions.clone_from(&regions);
         self.owned = owned;
-        let decided: Vec<(PublicKey, Option<Site>)> = self
-            .receivers
-            .iter()
-            .map(|(key, known)| (*key, self.site(*key, known.location, known.clock)))
-            .collect();
-        for (key, site) in decided {
-            let Some(known) = self.receivers.get_mut(&key) else {
-                continue;
-            };
-            let left = known.site.is_some() && site.is_none();
-            known.site = site;
-            if left {
-                known.boots.clear();
-                self.held.forget_receiver(&key);
+        if let Some(intake) = self.intake.as_mut() {
+            for key in intake.set_scope(Some(regions)) {
+                self.sealed
+                    .forget_receiver(&key, self.settings.threads.max(1));
             }
         }
     }
 
-    /// The site a declared location and clock give, if the receiver takes part.
-    fn site(&self, key: PublicKey, location: Option<Location>, clock: Clock) -> Option<Site> {
-        let location = location?;
-        let inside = self.settings.regions.is_empty()
-            || self
-                .settings
-                .regions
-                .iter()
-                .any(|region| region.covers(&location));
-        let usable = Timebase::of(clock).is_some() && location.precision_m <= MAX_SITE_PRECISION_M;
-        (inside && usable).then_some(Site {
-            receiver: key,
-            clock,
-            location,
-        })
-    }
-
     fn receive(&mut self, batch: &Batch, now_ms: u64) -> Result<Ingested, String> {
         let key = batch.receiver().map_err(|error| error.to_string())?;
-        if !self.takes_part(&key) {
+        if self.described(&key) != Some(true) {
             return Ok(Ingested::Ignored);
         }
         batch
@@ -341,25 +290,10 @@ impl Engine {
         match Decoded::from_verified(batch.clone(), now_ms, 0) {
             Ok(decoded) => Ok(self.ingest_verified(&decoded, now_ms)),
             // A format this build cannot read uses its sequence and holds nothing.
-            Err(_) => {
-                let admitted = self
-                    .receivers
-                    .get_mut(&key)
-                    .is_some_and(|known| known.admit(batch.boot_id(), batch.sequence()));
-                Ok(if admitted {
-                    Ingested::Ignored
-                } else {
-                    Ingested::Replayed
-                })
-            }
+            Err(_) => Ok(self.intake.as_mut().map_or(Ingested::Ignored, |intake| {
+                intake.use_sequence(&key, batch.boot_id(), batch.sequence())
+            })),
         }
-    }
-
-    /// Whether `receiver` is described and takes part.
-    fn takes_part(&self, receiver: &PublicKey) -> bool {
-        self.receivers
-            .get(receiver)
-            .is_some_and(|known| known.site.is_some())
     }
 
     /// Takes a batch whose signature the caller already verified and which it decoded once
@@ -367,27 +301,34 @@ impl Engine {
     /// hands it what its own ingest checked, so nothing is verified or decoded twice. As `ingest`
     /// otherwise: used once per (boot, sequence), held only from a receiver that takes part.
     pub fn ingest_verified(&mut self, batch: &Decoded, now_ms: u64) -> Ingested {
-        let key = batch.receiver();
-        let Some(known) = self.receivers.get_mut(&key) else {
+        let room = self
+            .settings
+            .limits()
+            .bytes
+            .saturating_sub(self.sealed.bytes());
+        let Some(intake) = self.intake.as_mut() else {
             return Ingested::Ignored;
         };
-        if known.site.is_none() {
-            return Ingested::Ignored;
-        }
-        if !known.admit(batch.boot_id(), batch.sequence()) {
-            return Ingested::Replayed;
-        }
-        self.provisional.hear(batch, now_ms);
-        let added = self.held.add_decoded(batch);
-        self.dropped.observations += added.dropped as u64;
-        Ingested::Batch {
-            new: added.new,
-            filtered: added.filtered,
-        }
+        let (ingested, notes) = intake.ingest_verified(batch, room);
+        self.provisional.hear_notes(batch, &notes, now_ms);
+        ingested
+    }
+
+    /// What a batch said to provisional solving (`provisional::notes_of`), read by the intake
+    /// that took it, arrived at `now_ms`: for a hosted engine, in the order the batches arrived.
+    pub fn hear(&mut self, batch: &Decoded, notes: &[Note], now_ms: u64) {
+        self.provisional.hear_notes(batch, notes, now_ms);
+    }
+
+    /// Refusals its host's intakes counted, reported with the next step.
+    pub fn add_dropped(&mut self, dropped: Dropped) {
+        self.dropped.late += dropped.late;
+        self.dropped.refused += dropped.refused;
+        self.dropped.receivers += dropped.receivers;
     }
 
     /// The latest bin complete by `now_ms`: it ended, and the settling time after it passed.
-    fn settled(&self, now_ms: u64) -> i64 {
+    pub fn settled(&self, now_ms: u64) -> i64 {
         bin_of(now_ms.saturating_sub(self.settings.settle_ms)) - 1
     }
 
@@ -395,13 +336,34 @@ impl Engine {
     /// sealed and that is not solved yet (owned: the sealed bins are shared, not copied), so it
     /// runs off the thread that keeps ingesting; and forgets the bins no window still to be solved
     /// needs. `None` when there is nothing to solve. `now_ms` is the engine's wall clock;
-    /// `issued_ms` the wall clock the records it signs carry.
+    /// `issued_ms` the wall clock the records it signs carry. A hosted engine's host seals instead
+    /// and calls `prepare_sealed`.
     pub fn prepare(&mut self, now_ms: u64, issued_ms: u64) -> Option<Job> {
         let settled = self.settled(now_ms);
-        self.held.seal_through(settled);
+        let threads = self.settings.threads.max(1);
+        let intake = self.intake.as_mut()?;
+        let fragments = intake.take_through(settled);
+        let sites: Vec<Site> = intake.sites().collect();
+        let dropped = intake.take_dropped();
+        self.add_dropped(dropped);
+        for bin in seal(fragments, threads) {
+            self.sealed.insert(bin);
+        }
+        self.prepare_sealed(now_ms, issued_ms, settled, sites)
+    }
+
+    /// As `prepare`, for an engine whose host sealed every bin through `settled` (the latest bin
+    /// complete by `now_ms`, `settled`) and holds the receivers taking part, `sites`, in key order.
+    pub fn prepare_sealed(
+        &mut self,
+        now_ms: u64,
+        issued_ms: u64,
+        settled: i64,
+        sites: Vec<Site>,
+    ) -> Option<Job> {
         let windows: Vec<Window> = self
-            .held
-            .sealed()
+            .sealed
+            .numbers()
             .into_iter()
             .map(Window::canonical)
             .filter(|window| window.last <= settled && !self.processed.contains(&window.last))
@@ -409,34 +371,33 @@ impl Engine {
             .into_iter()
             .collect();
         let job = match (windows.first(), windows.last()) {
-            (Some(first), Some(last)) => {
-                let sites = self
-                    .receivers
-                    .values()
-                    .filter_map(|known| known.site)
-                    .collect();
-                Some(Job {
-                    identity: self.identity.clone(),
-                    boot_id: self.boot_id,
-                    issued_ms,
-                    threads: self.settings.threads.max(1),
-                    regions: self.settings.regions.clone(),
-                    owned: self.owned.clone(),
-                    windows: windows.clone(),
-                    sites,
-                    bins: self.held.bins(first.first, last.last),
-                    positions_sequence: self.positions_sequence,
-                    models_sequence: self.models_sequence,
-                })
-            }
+            (Some(first), Some(last)) => Some(Job {
+                identity: self.identity.clone(),
+                boot_id: self.boot_id,
+                issued_ms,
+                threads: self.settings.threads.max(1),
+                regions: self.settings.regions.clone(),
+                owned: self.owned.clone(),
+                windows: windows.clone(),
+                sites,
+                bins: self.sealed.bins(first.first, last.last),
+                positions_sequence: self.positions_sequence,
+                models_sequence: self.models_sequence,
+            }),
             _ => None,
         };
         // A window still to be solved solves bins after `settled - STRIDE`; nothing before its
-        // history is needed.
+        // history is needed by the engine. Its raw is its host's one store, so it keeps what
+        // standing settles against too: a window and its stride behind the clock, and the spare
+        // bins (`held::RAW_SPARE_BINS`).
         let keep = Window::canonical(settled + 1)
             .first
-            .min(settled + 1 - BEFORE - STRIDE);
-        self.held.forget_before(keep);
+            .min(settled + 1 - BEFORE - STRIDE)
+            .min(bin_of(now_ms) - BEFORE - AFTER - STRIDE - RAW_SPARE_BINS);
+        self.sealed.forget_before(keep);
+        if let Some(intake) = self.intake.as_mut() {
+            intake.forget_before(keep);
+        }
         self.processed.retain(|last| *last >= keep);
         job
     }
@@ -507,9 +468,25 @@ impl Engine {
     }
 }
 
+/// Seals the open raw `fragments` hold, any split of it by receiver (one holder's, or every raw
+/// shard's of a relay), bin by bin, on up to `threads` threads: each bin byte for byte what one
+/// holder of all of it seals (`held::Bin::seal_from`). The bins, ascending.
+pub fn seal(fragments: Vec<Fragment>, threads: usize) -> Vec<Bin> {
+    let mut by_bin: BTreeMap<i64, Vec<Fragment>> = BTreeMap::new();
+    for fragment in fragments {
+        by_bin.entry(fragment.bin()).or_default().push(fragment);
+    }
+    by_bin
+        .into_iter()
+        .map(|(bin, fragments)| Bin::seal_from(bin, fragments, threads))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tally_mlat_solver::obs::MAX_SITE_PRECISION_M;
+    use tally_wire::ReceiverInfo;
     use tally_wire::batch::{ReceiverInfoContent, format};
     use tally_wire::{BatchContent, Clock, Location, Observation};
 
@@ -518,6 +495,7 @@ mod tests {
             regions: Vec::new(),
             settle_ms: 1_000,
             threads: 1,
+            capacity: Capacity::default(),
         }
     }
 
@@ -802,9 +780,11 @@ mod tests {
         assert!(engine.prepare(due(first), 0).is_some());
         assert_eq!(engine.held(), 2);
         // Once every window spanning bin 1000 is solved, it goes; then the later one.
-        let _ = engine.prepare(due(Window::canonical(1_000 + BEFORE + STRIDE)), 0);
+        // Standing reads the same store, so the spare bins it settles in are kept too.
+        let gone = |bin: i64| Window::canonical(bin + BEFORE + STRIDE + RAW_SPARE_BINS);
+        let _ = engine.prepare(due(gone(1_000)), 0);
         assert_eq!(engine.held(), 1);
-        let _ = engine.prepare(due(Window::canonical(later + BEFORE + STRIDE)), 0);
+        let _ = engine.prepare(due(gone(later)), 0);
         assert_eq!(engine.held(), 0);
         Ok(())
     }

@@ -32,10 +32,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use tally_wire::batch::Hash;
+use tally_wire::record::{KIND_BATCH, KIND_RELAY_BATCH};
 use tally_wire::sharing::{MAX_HAVE_SECONDS, MAX_PIECES, receipt_digest};
 use tally_wire::{
-    Check, HaveSummary, Identity, PieceManifest, PieceManifestContent, PublicKey, Record,
-    StripeAssignment, StripeReceipt, StripeReceiptContent,
+    Batch, Bytes, Check, HaveSummary, Identity, PieceManifest, PieceManifestContent, PublicKey,
+    Record, StripeAssignment, StripeReceipt, StripeReceiptContent,
 };
 
 use crate::directory::CLOCK_SKEW_MS;
@@ -64,10 +65,23 @@ pub const RECEIPT_WINDOW_SECONDS: u64 = 5;
 pub const RECEIPT_GRACE_MS: u64 = 4_000;
 /// After the receipts of a window, how long before the group judges it.
 pub const JUDGE_AFTER_MS: u64 = 2_000;
-/// How far back a member holds records and manifests.
-pub const HORIZON_SECONDS: u64 = 60;
-/// The most record bytes one member holds across its groups; the oldest go first beyond it.
-pub const MAX_HELD_BYTES: usize = 256 * 1024 * 1024;
+/// How far back a member holds records and manifests: as long as its own duties need them, and no
+/// longer. A record of a window's first second is owed in that window's receipts, signed
+/// `RECEIPT_GRACE_MS` after the window ends, judged `JUDGE_AFTER_MS` after that, and a member short
+/// of it asks for repair from `REPAIR_AFTER_MS` on; so the horizon is the window, the grace, the
+/// judgment and the repair delay, 12.5 s, rounded up to whole seconds. It is the one batch byte
+/// store's window (RFC-0177 §6): what a relay holds of a batch's bytes after it is passed on.
+pub const HORIZON_MS: u64 =
+    RECEIPT_WINDOW_SECONDS * 1000 + RECEIPT_GRACE_MS + JUDGE_AFTER_MS + REPAIR_AFTER_MS;
+pub const HORIZON_SECONDS: u64 = HORIZON_MS.div_ceil(1000);
+/// What the records of `bytes_per_second` of inflow cost held for the horizon: a member's capacity
+/// is sized by time, from the rate its relay admits (`Member::set_capacity`).
+pub const fn held_bytes_for(bytes_per_second: u64) -> usize {
+    (bytes_per_second * HORIZON_SECONDS) as usize
+}
+/// The inflow a member is sized for until its relay says otherwise: RFC-0177's 20,000 feeders at
+/// 8 KiB a second each.
+pub const DEFAULT_BYTES_PER_SECOND: u64 = 20_000 * 8 * 1024;
 /// The most bytes one answer to a `HaveSummary` carries.
 pub const REPAIR_PAGE_BYTES: usize = 256 * 1024;
 /// The least time between two answers to one member's `HaveSummary`s.
@@ -90,14 +104,113 @@ pub struct Outgoing {
     pub message: Message,
 }
 
+/// A record as a group holds and passes it: a batch as the batch itself (its bytes are the one
+/// shared allocation every stage of the relay holds a handle to, so the group copies nothing), any
+/// other record as its encoding, shared. Its length is its encoded length, which is what parity
+/// covers and what is counted.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Piece {
+    /// Shared: a piece goes to several members, and a batch carries its decompressed key.
+    Batch(Arc<Batch>),
+    RelayBatch(Arc<Batch>),
+    Encoded(Bytes),
+}
+
+/// A record's header: kind, then its body's length.
+const HEADER_LEN: usize = 3;
+
+impl Piece {
+    /// The piece of a record, without copying a batch's bytes. `None` for a record that does not
+    /// encode.
+    pub fn of(record: &Record) -> Option<Self> {
+        match record {
+            Record::Batch(batch) => Some(Self::Batch(Arc::new(batch.clone()))),
+            Record::RelayBatch(batch) => Some(Self::RelayBatch(Arc::new(batch.clone()))),
+            other => {
+                let mut bytes = Vec::new();
+                other.encode(&mut bytes).ok()?;
+                Some(Self::Encoded(Bytes::from(bytes)))
+            }
+        }
+    }
+
+    /// The piece of one encoded record (what parity rebuilds), a batch's body kept in place.
+    /// `None` for bytes that are not one record.
+    pub fn from_encoded(bytes: Vec<u8>) -> Option<Self> {
+        let (_, used) = Record::decode(&bytes).ok()?;
+        if used != bytes.len() || bytes.len() < HEADER_LEN {
+            return None;
+        }
+        let kind = bytes[0];
+        let bytes = Bytes::from(bytes);
+        match kind {
+            KIND_BATCH => Batch::from_bytes(bytes.slice(HEADER_LEN..))
+                .ok()
+                .map(|batch| Self::Batch(Arc::new(batch))),
+            KIND_RELAY_BATCH => Batch::from_bytes(bytes.slice(HEADER_LEN..))
+                .ok()
+                .map(|batch| Self::RelayBatch(Arc::new(batch))),
+            _ => Some(Self::Encoded(bytes)),
+        }
+    }
+
+    /// The record it is.
+    pub fn record(&self) -> Option<Record> {
+        match self {
+            Self::Batch(batch) => Some(Record::Batch(Batch::clone(batch))),
+            Self::RelayBatch(batch) => Some(Record::RelayBatch(Batch::clone(batch))),
+            Self::Encoded(bytes) => Record::decode(bytes).ok()?.0,
+        }
+    }
+
+    /// What a manifest lists it by.
+    pub fn hash(&self) -> Option<Hash> {
+        match self {
+            Self::Batch(batch) | Self::RelayBatch(batch) => Some(batch.hash()),
+            Self::Encoded(bytes) => piece_hash(bytes),
+        }
+    }
+
+    /// Its encoded length: header and body.
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Batch(batch) | Self::RelayBatch(batch) => HEADER_LEN + batch.as_bytes().len(),
+            Self::Encoded(bytes) => bytes.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Appends its encoding to `out`: what a parity slice is made of.
+    pub fn encode_into(&self, out: &mut Vec<u8>) {
+        match self {
+            Self::Batch(batch) | Self::RelayBatch(batch) => {
+                let kind = if matches!(self, Self::Batch(_)) {
+                    KIND_BATCH
+                } else {
+                    KIND_RELAY_BATCH
+                };
+                let body = batch.as_bytes();
+                out.push(kind);
+                // A batch fits a record's body: it was read from or signed as one.
+                out.extend_from_slice(&u16::try_from(body.len()).unwrap_or(u16::MAX).to_be_bytes());
+                out.extend_from_slice(body);
+            }
+            Self::Encoded(bytes) => out.extend_from_slice(bytes),
+        }
+    }
+}
+
 /// What members send each other.
 #[derive(Clone, Debug)]
 pub enum Message {
-    /// A record of a group's product, as encoded on the wire, by its hash.
+    /// A record of a group's product, by its hash.
     Piece {
         group: GroupKey,
         hash: Hash,
-        bytes: Arc<Vec<u8>>,
+        piece: Piece,
     },
     Manifest(PieceManifest),
     Parity(Arc<Parity>),
@@ -110,7 +223,7 @@ impl Message {
     /// Bytes on the wire, near enough, for accounting.
     pub fn len(&self) -> usize {
         match self {
-            Self::Piece { bytes, .. } => bytes.len(),
+            Self::Piece { piece, .. } => piece.len(),
             Self::Manifest(manifest) => manifest.as_bytes().len(),
             Self::Parity(parity) => parity.len(),
             Self::Receipt(receipt) => receipt.as_bytes().len(),
@@ -163,8 +276,7 @@ pub enum Arrival {
 pub struct Delivered {
     pub group: GroupKey,
     pub hash: Hash,
-    /// As encoded on the wire.
-    pub bytes: Arc<Vec<u8>>,
+    pub piece: Piece,
     pub arrival: Arrival,
 }
 
@@ -179,13 +291,15 @@ pub struct Stats {
     pub repaired: u64,
     /// Copies of a record already held.
     pub duplicates: u64,
+    /// Records refused whole because holding them would pass the member's capacity.
+    pub refused: u64,
     /// Receipts signed, and those that reported a shortfall.
     pub receipts: u64,
     pub shortfalls: u64,
 }
 
 struct Held {
-    bytes: Arc<Vec<u8>>,
+    piece: Piece,
     at_ms: u64,
     /// Who sent it, and when, in order; empty for one this relay originated or rebuilt.
     from: Vec<(PublicKey, u64)>,
@@ -213,6 +327,8 @@ struct Group {
     /// When the trees last changed, newest last.
     changed_ms: Vec<u64>,
     pieces: BTreeMap<Hash, Held>,
+    /// The encoded bytes of `pieces`, kept as they change.
+    bytes: usize,
     /// By second, then by the manifest's hash.
     manifests: BTreeMap<u64, BTreeMap<Hash, Listed>>,
     parity: BTreeMap<Hash, HeldParity>,
@@ -246,6 +362,7 @@ impl Group {
             layout: Layout::new(key.cell, key.product, &[me], &[]),
             changed_ms: Vec::new(),
             pieces: BTreeMap::new(),
+            bytes: 0,
             manifests: BTreeMap::new(),
             parity: BTreeMap::new(),
             own: BTreeMap::new(),
@@ -354,7 +471,7 @@ impl Group {
     fn bytes_of(&self, hash: &Hash) -> u64 {
         self.pieces
             .get(hash)
-            .map(|held| held.bytes.len())
+            .map(|held| held.piece.len())
             .or_else(|| self.parity.get(hash).map(|held| held.parity.len()))
             .map_or(0, |len| u64::try_from(len).unwrap_or(u64::MAX))
     }
@@ -367,8 +484,10 @@ impl Group {
         })
     }
 
-    fn held_bytes(&self) -> usize {
-        self.pieces.values().map(|held| held.bytes.len()).sum()
+    /// Holds a piece, counting its bytes.
+    fn hold(&mut self, hash: Hash, piece: Piece, at_ms: u64, from: Vec<(PublicKey, u64)>) {
+        self.bytes += piece.len();
+        self.pieces.insert(hash, Held { piece, at_ms, from });
     }
 }
 
@@ -380,6 +499,9 @@ pub struct Member {
     delivered: Vec<Delivered>,
     demotions: Vec<(GroupKey, PublicKey, u64)>,
     stats: Stats,
+    /// The most record bytes held across its groups over the horizon. A record that would pass it
+    /// is refused whole, and counted (`Stats::refused`).
+    capacity: usize,
 }
 
 impl Member {
@@ -392,7 +514,27 @@ impl Member {
             delivered: Vec::new(),
             demotions: Vec::new(),
             stats: Stats::default(),
+            capacity: held_bytes_for(DEFAULT_BYTES_PER_SECOND),
         }
+    }
+
+    /// The most record bytes it holds: `held_bytes_for` the inflow its relay admits.
+    pub fn set_capacity(&mut self, bytes: usize) {
+        self.capacity = bytes;
+    }
+
+    /// Record bytes held now, across its groups.
+    pub fn held_bytes(&self) -> usize {
+        self.groups.values().map(|group| group.bytes).sum()
+    }
+
+    /// Whether `len` more bytes fit; counted as refused when they do not.
+    fn fits(&mut self, len: usize) -> bool {
+        let fits = self.held_bytes().saturating_add(len) <= self.capacity;
+        if !fits {
+            self.stats.refused += 1;
+        }
+        fits
     }
 
     pub fn key(&self) -> PublicKey {
@@ -482,37 +624,37 @@ impl Member {
         &mut self,
         key: GroupKey,
         hash: Hash,
-        bytes: Arc<Vec<u8>>,
+        piece: Piece,
         now_ms: u64,
     ) -> Vec<Outgoing> {
         let me = self.me;
+        let held = self
+            .groups
+            .get(&key)
+            .is_some_and(|group| group.pieces.contains_key(&hash));
+        if !held && !self.fits(piece.len()) {
+            return Vec::new();
+        }
         let group = self
             .groups
             .entry(key)
             .or_insert_with(|| Group::new(key, me));
         group.own.entry(now_ms / 1000).or_default().insert(hash);
-        if group.pieces.contains_key(&hash) {
+        if held {
             return Vec::new();
         }
-        group.pieces.insert(
-            hash,
-            Held {
-                bytes: Arc::clone(&bytes),
-                at_ms: now_ms,
-                from: Vec::new(),
-            },
-        );
+        group.hold(hash, piece.clone(), now_ms, Vec::new());
         self.delivered.push(Delivered {
             group: key,
             hash,
-            bytes: Arc::clone(&bytes),
+            piece: piece.clone(),
             arrival: Arrival::Originated,
         });
         let stripe = data_stripe(&hash);
         let message = Message::Piece {
             group: key,
             hash,
-            bytes,
+            piece,
         };
         inject(group, &me, stripe, message, now_ms)
     }
@@ -520,7 +662,7 @@ impl Member {
     /// A message from another relay.
     pub fn receive(&mut self, from: PublicKey, message: Message, now_ms: u64) -> Vec<Outgoing> {
         match message {
-            Message::Piece { group, hash, bytes } => self.piece(from, group, hash, bytes, now_ms),
+            Message::Piece { group, hash, piece } => self.piece(from, group, hash, piece, now_ms),
             Message::Manifest(manifest) => self.manifest(from, manifest, now_ms),
             Message::Parity(parity) => self.parity(from, parity, now_ms),
             Message::Receipt(receipt) => self.receipt(from, receipt, now_ms),
@@ -534,7 +676,7 @@ impl Member {
         from: PublicKey,
         key: GroupKey,
         hash: Hash,
-        bytes: Arc<Vec<u8>>,
+        piece: Piece,
         now_ms: u64,
     ) -> Vec<Outgoing> {
         let me = self.me;
@@ -548,9 +690,12 @@ impl Member {
             self.stats.duplicates += 1;
             return Vec::new();
         }
-        if piece_hash(&bytes) != Some(hash) {
+        if piece.hash() != Some(hash) || !self.fits(piece.len()) {
             return Vec::new();
         }
+        let Some(group) = self.groups.get_mut(&key) else {
+            return Vec::new();
+        };
         let parent = group
             .layout
             .place(data_stripe(&hash), epoch_of(now_ms / 1000), &me)
@@ -558,25 +703,18 @@ impl Member {
         if parent.is_some_and(|parent| parent != from) {
             self.stats.repaired += 1;
         }
-        group.pieces.insert(
-            hash,
-            Held {
-                bytes: Arc::clone(&bytes),
-                at_ms: now_ms,
-                from: vec![(from, now_ms)],
-            },
-        );
+        group.hold(hash, piece.clone(), now_ms, vec![(from, now_ms)]);
         self.delivered.push(Delivered {
             group: key,
             hash,
-            bytes: Arc::clone(&bytes),
+            piece: piece.clone(),
             arrival: Arrival::Received(from),
         });
         push(group, &me, &from, data_stripe(&hash), now_ms, || {
             Message::Piece {
                 group: key,
                 hash,
-                bytes: Arc::clone(&bytes),
+                piece: piece.clone(),
             }
         })
     }
@@ -726,7 +864,7 @@ impl Member {
                     group.pieces.get(hash).map(|held| Message::Piece {
                         group: key,
                         hash: *hash,
-                        bytes: Arc::clone(&held.bytes),
+                        piece: held.piece.clone(),
                     })
                 }));
                 for message in messages {
@@ -748,6 +886,7 @@ impl Member {
         let me = self.me;
         let mut out = Vec::new();
         let keys: Vec<GroupKey> = self.groups.keys().copied().collect();
+        let mut held = self.held_bytes();
         for key in keys {
             let Some(group) = self.groups.get_mut(&key) else {
                 continue;
@@ -757,6 +896,7 @@ impl Member {
                 group,
                 &me,
                 now_ms,
+                (&mut held, self.capacity),
                 &mut self.delivered,
                 &mut self.stats,
             ));
@@ -767,36 +907,7 @@ impl Member {
             out.extend(repair(group, &me, now_ms, &mut self.stats));
             forget(group, now_ms);
         }
-        self.bound_memory();
         out
-    }
-
-    /// Drops the oldest records beyond `MAX_HELD_BYTES`.
-    fn bound_memory(&mut self) {
-        let mut total: usize = self.groups.values().map(Group::held_bytes).sum();
-        if total <= MAX_HELD_BYTES {
-            return;
-        }
-        let mut ages: Vec<(u64, GroupKey, Hash, usize)> = self
-            .groups
-            .iter()
-            .flat_map(|(key, group)| {
-                group
-                    .pieces
-                    .iter()
-                    .map(|(hash, held)| (held.at_ms, *key, *hash, held.bytes.len()))
-            })
-            .collect();
-        ages.sort_by_key(|(at, key, hash, _)| (*at, *key, *hash));
-        for (_, key, hash, len) in ages {
-            if total <= MAX_HELD_BYTES {
-                break;
-            }
-            if let Some(group) = self.groups.get_mut(&key) {
-                group.pieces.remove(&hash);
-            }
-            total -= len;
-        }
     }
 }
 
@@ -944,14 +1055,9 @@ fn originate_manifests(group: &mut Group, identity: &Identity, now_ms: u64) -> V
             };
             let hash = manifest.hash();
             group.seen.insert(hash, now_ms);
-            let pieces: Option<Vec<(Hash, &[u8])>> = chunk
+            let pieces: Option<Vec<(Hash, &Piece)>> = chunk
                 .iter()
-                .map(|hash| {
-                    group
-                        .pieces
-                        .get(hash)
-                        .map(|held| (*hash, held.bytes.as_slice()))
-                })
+                .map(|hash| group.pieces.get(hash).map(|held| (*hash, &held.piece)))
                 .collect();
             let parity = pieces.map(|pieces| {
                 Arc::new(Parity::build(
@@ -1004,10 +1110,11 @@ fn rebuild(
     group: &mut Group,
     me: &PublicKey,
     now_ms: u64,
+    (held_bytes, capacity): (&mut usize, usize),
     delivered: &mut Vec<Delivered>,
     stats: &mut Stats,
 ) -> Vec<Outgoing> {
-    let mut found: Vec<(Hash, Vec<u8>)> = Vec::new();
+    let mut found: Vec<(Hash, Piece)> = Vec::new();
     let mut false_parity: Vec<Hash> = Vec::new();
     for (second, by_hash) in &mut group.manifests {
         if (second + 1) * 1000 + REBUILD_AFTER_MS > now_ms {
@@ -1035,23 +1142,21 @@ fn rebuild(
             let Some(held) = group.parity.get(&id) else {
                 continue;
             };
-            let others: Vec<(Hash, &[u8])> = listed
+            let others: Vec<(Hash, &Piece)> = listed
                 .hashes
                 .iter()
                 .filter(|hash| data_stripe(hash) != stripe)
-                .filter_map(|hash| {
-                    group
-                        .pieces
-                        .get(hash)
-                        .map(|held| (*hash, held.bytes.as_slice()))
-                })
+                .filter_map(|hash| group.pieces.get(hash).map(|held| (*hash, &held.piece)))
                 .collect();
             let mut matched = BTreeSet::new();
             let mut extra = false;
             for bytes in held.parity.rebuild(stripe, &others).unwrap_or_default() {
-                match piece_hash(&bytes) {
+                let piece = Piece::from_encoded(bytes);
+                match piece.as_ref().and_then(Piece::hash) {
                     Some(hash) if missing.contains(&hash) && matched.insert(hash) => {
-                        found.push((hash, bytes));
+                        if let Some(piece) = piece {
+                            found.push((hash, piece));
+                        }
                     }
                     _ => extra = true,
                 }
@@ -1065,24 +1170,21 @@ fn rebuild(
         group.parity.remove(&id);
     }
     let mut out = Vec::new();
-    for (hash, bytes) in found {
+    for (hash, piece) in found {
         if group.pieces.contains_key(&hash) {
             continue;
         }
-        let bytes = Arc::new(bytes);
-        group.pieces.insert(
-            hash,
-            Held {
-                bytes: Arc::clone(&bytes),
-                at_ms: now_ms,
-                from: Vec::new(),
-            },
-        );
+        if held_bytes.saturating_add(piece.len()) > capacity {
+            stats.refused += 1;
+            continue;
+        }
+        *held_bytes += piece.len();
+        group.hold(hash, piece.clone(), now_ms, Vec::new());
         stats.rebuilt += 1;
         delivered.push(Delivered {
             group: group.key,
             hash,
-            bytes: Arc::clone(&bytes),
+            piece: piece.clone(),
             arrival: Arrival::Rebuilt,
         });
         let key = group.key;
@@ -1090,7 +1192,7 @@ fn rebuild(
             Message::Piece {
                 group: key,
                 hash,
-                bytes: Arc::clone(&bytes),
+                piece: piece.clone(),
             }
         }));
     }
@@ -1354,7 +1456,15 @@ fn forget(group: &mut Group, now_ms: u64) {
     let horizon_ms = now_ms.saturating_sub(HORIZON_SECONDS * 1000);
     let horizon_second = horizon_ms / 1000;
     let horizon_window = horizon_second / RECEIPT_WINDOW_SECONDS;
-    group.pieces.retain(|_, held| held.at_ms >= horizon_ms);
+    let mut freed = 0;
+    group.pieces.retain(|_, held| {
+        let keep = held.at_ms >= horizon_ms;
+        if !keep {
+            freed += held.piece.len();
+        }
+        keep
+    });
+    group.bytes -= freed;
     group.parity.retain(|_, held| held.at_ms >= horizon_ms);
     group.manifests = group.manifests.split_off(&horizon_second);
     group.own = group.own.split_off(&horizon_second);
