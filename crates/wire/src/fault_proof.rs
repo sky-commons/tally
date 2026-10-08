@@ -75,11 +75,13 @@ pub struct Tolerance {
 impl Tolerance {
     /// The tolerance a solver specification version sets, `None` for a version this build does
     /// not know (whose proofs it therefore cannot judge). Here, not in the solver, because relays
-    /// judge proofs and depend on the wire alone.
-    pub fn for_spec(spec_version: u16) -> Option<Self> {
+    /// judge proofs and depend on the wire alone; the solver refuses to compile with a
+    /// `SPEC_VERSION` this does not know (`tally_mlat_solver::clock`), so a version is never
+    /// bumped without its tolerance.
+    pub const fn for_spec(spec_version: u16) -> Option<Self> {
         match spec_version {
             // About 1 m of latitude, 1 m of altitude, 3 m of light travel, 0.1% of a variance.
-            1..=3 => Some(Self {
+            1..=4 => Some(Self {
                 position_e7: 10,
                 alt_mm: 1_000,
                 transmit_ns: 10,

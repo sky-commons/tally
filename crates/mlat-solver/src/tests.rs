@@ -1188,6 +1188,137 @@ fn noisy_clocks_raise_no_false_jumps_and_a_bad_clock_is_dropped_not_fatal() -> R
     Ok(())
 }
 
+/// Every tile's fit over `receptions`: how many were tried, and why any failed.
+fn fit_failures(sites: &[Site], receptions: &[Reception]) -> (usize, Vec<crate::FitError>) {
+    let bins = all_bins(receptions);
+    let sites = Sites::new(sites);
+    let (mut tried, mut failures) = (0, Vec::new());
+    for window in windows(&bins, crate::scope::STRIDE) {
+        let index = WindowIndex::new(window, &bins, &sites);
+        let plan = index.plan();
+        for tile in plan.tiles() {
+            let Some(inputs) = index.inputs(tile, &plan.members[&tile]) else {
+                continue;
+            };
+            tried += 1;
+            if let Err(error) = crate::fit_calibrated(&inputs) {
+                failures.push(error);
+            }
+        }
+    }
+    (tried, failures)
+}
+
+/// A receiver that declares GNSS discipline is fitted as it behaves, not as it declares (RFC-0171
+/// §3.8.1, the calibration over real receivers): one whose stamps are 120.6 µs late throughout
+/// (a GRX1090 in OpenSky's data, stamping a long message's end) and one whose stamps carry 300 µs
+/// of jitter (a Radarcape without its lock, also there), beside an honest one, so the gauge of a
+/// tile is often a liar. No tile fails its fit for them, and what is solved stays calibrated.
+/// With the fit holding every GNSS clock to the gauge's stamps (100 ns), as it did, most of these
+/// tiles' normal equations were singular, and on LocaRDS half of all fits failed.
+#[test]
+fn a_declared_gnss_clock_is_fitted_as_it_behaves() -> Result {
+    let mut inside = Count::default();
+    let (mut tried, mut failed) = (0, Vec::new());
+    for seed in 261..265 {
+        let simulation = sim::run(&Scenario {
+            gps: vec![0, 2, 5],
+            offsets: vec![(0, 120.6e-6)],
+            jitters: vec![(2, 300e-6)],
+            ..dense(seed)
+        });
+        let (tiles, failures) = fit_failures(&simulation.sites(), &simulation.receptions);
+        tried += tiles;
+        failed.extend(
+            failures
+                .into_iter()
+                .filter(|error| *error != crate::FitError::NoSyncEvents),
+        );
+        let truth = truth_of(&simulation);
+        for run in run(&simulation.sites(), &simulation.receptions)? {
+            for solved in &run.solutions {
+                let source = truth
+                    .get(&solved.solution.observations[0])
+                    .ok_or("unknown observation")?;
+                inside.add(
+                    mahalanobis(&solved.solution, simulation.transmissions[*source].ecef)
+                        .ok_or("singular")?
+                        < CHI2_3_95,
+                );
+            }
+        }
+    }
+    eprintln!(
+        "declared GNSS, offset and unlocked: {tried} fits, {} failed ({failed:?}); coverage {:.4} \
+         of {}",
+        failed.len(),
+        inside.rate(),
+        inside.total
+    );
+    assert!(tried >= 20 && failed.is_empty(), "{tried} {failed:?}");
+    assert!((0.93..=0.97).contains(&inside.rate()), "{}", inside.rate());
+    Ok(())
+}
+
+/// A receiver that declares GNSS and whose counter is noise at a millisecond (so it is often a
+/// tile's gauge) costs no fit and no honest clock, and what is solved stays calibrated. While a
+/// clock's noise was taken from its declaration until estimated (30 ns for GNSS), such a gauge
+/// made the robust start lose every event it heard: 18 of these 89 fits failed singular, and once
+/// clocks nothing places were dropped (`sync::uninformed`), 62 models dropped 469 honest clocks.
+/// Every clock now starts at the worst common class (500 ns) until its receptions say otherwise.
+#[test]
+fn a_declared_gnss_clock_of_noise_costs_no_honest_clock() -> Result {
+    let garbage = 3;
+    let mut inside = Count::default();
+    let (mut tried, mut failed, mut dropped, mut honest) = (0, Vec::new(), 0, 0);
+    for seed in 271..275 {
+        let simulation = sim::run(&Scenario {
+            gps: vec![garbage, 7],
+            jitters: vec![(garbage, 1e-3)],
+            ..dense(seed)
+        });
+        let (tiles, failures) = fit_failures(&simulation.sites(), &simulation.receptions);
+        tried += tiles;
+        failed.extend(
+            failures
+                .into_iter()
+                .filter(|error| *error != crate::FitError::NoSyncEvents),
+        );
+        let truth = truth_of(&simulation);
+        let culprit = simulation.receivers[garbage].key;
+        for run in run(&simulation.sites(), &simulation.receptions)? {
+            dropped += usize::from(!run.model.dropped.is_empty());
+            honest += run
+                .model
+                .dropped
+                .iter()
+                .filter(|(receiver, _)| *receiver != culprit)
+                .count();
+            for solved in &run.solutions {
+                let source = truth
+                    .get(&solved.solution.observations[0])
+                    .ok_or("unknown observation")?;
+                inside.add(
+                    mahalanobis(&solved.solution, simulation.transmissions[*source].ecef)
+                        .ok_or("singular")?
+                        < CHI2_3_95,
+                );
+            }
+        }
+    }
+    eprintln!(
+        "a clock of noise: {tried} fits, {} failed, {dropped} models drop a clock ({honest} honest \
+         clocks dropped); coverage {:.4} of {}",
+        failed.len(),
+        inside.rate(),
+        inside.total
+    );
+    assert!(tried >= 20 && failed.is_empty(), "{tried} {failed:?}");
+    assert_eq!(honest, 0, "honest clocks dropped");
+    assert!((0.93..=0.97).contains(&inside.rate()), "{}", inside.rate());
+    Ok(())
+}
+
 #[test]
 fn a_receiver_with_an_unknown_clock_or_coarse_location_takes_no_part() -> Result {
     let simulation = sim::run(&Scenario {
@@ -1625,8 +1756,9 @@ fn a_tile_models_bytes_are_the_committed_golden() -> Result {
     Ok(())
 }
 
-/// BLAKE2s-256 of the first tile model of scenario 301 (12 s), made on the x86 host.
-const GOLDEN: &str = "2ee1367e8c16690724c447caea02fa36643f0acca72efd67d707aae32a8599d7";
+/// BLAKE2s-256 of the first tile model of scenario 301 (12 s), made on the x86 host (version 4:
+/// every clock starts at 500 ns, so the GNSS gauge's fit starts elsewhere than version 3's).
+const GOLDEN: &str = "0758416042f68480004ce93fee8ca8699248818e1e35eb51b2a6db8f41dabc3e";
 
 /// Per-stage timers at a region's scale: index, plan, inputs, fit (folded calibration), solve,
 /// and an external verification. Run in release with `--ignored`.
