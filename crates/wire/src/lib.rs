@@ -5,19 +5,55 @@
 pub mod backoff;
 pub mod batch;
 pub mod beast;
+pub mod clock_model;
+pub mod credit;
+pub mod delivery;
+pub mod directory;
+pub mod fault_proof;
 pub mod key;
 pub mod noise;
+pub mod observation_set;
 pub mod positions;
+pub mod probe;
+pub mod products;
 pub mod record;
 pub mod region;
+pub mod rendezvous;
+pub mod sharing;
+mod signed;
 
-pub use batch::{Batch, BatchContent, Clock, Location, Observation, ReceiverInfo};
+pub use batch::{Batch, BatchContent, Clock, Codec, Location, Observation, ReceiverInfo};
 pub use beast::{Frame, FrameKind};
+pub use clock_model::{
+    Assembler, ClockModel, ClockModelContent, ClockModelPart, Manifest, SignedClockModel,
+};
+pub use credit::{
+    EvidenceBundle, EvidenceBundleContent, FirehoseCredential, FirehoseCredentialContent,
+};
+pub use delivery::{
+    DeliveryAnswer, DeliveryAnswerContent, DeliveryQuery, Possession, SequenceRange,
+    possession_proof,
+};
+pub use directory::{ProviderOffer, ProviderOfferContent, ProviderQuery};
+pub use fault_proof::{Fault, FaultProof, ModelFault, SolutionFault, Tolerance};
 pub use key::{Identity, PublicKey};
 pub use noise::{Accepted, Reader, Session, Writer};
-pub use positions::{Position, Positions, PositionsContent};
+pub use observation_set::{Citations, ObservationIdentity, ObservationSet, Reception, Relation};
+pub use positions::{
+    AddressedCitation, EnuCovariance, Positions, Solution, SolutionsContent, TransmitTime,
+};
+pub use probe::{Echo, EchoReply, EchoReplyContent, Headroom};
+pub use products::{
+    RegionalBatch, RegionalBatchContent, WorldCandidate, WorldFix, WorldPositions,
+    WorldPositionsContent, WorldPrecise,
+};
 pub use record::{Reason, Record, RelayAddress, Role, Streams};
 pub use region::Region;
+pub use sharing::{
+    BundleIndex, BundleIndexContent, HaveSummary, ParityChunk, PieceManifest, PieceManifestContent,
+    StripeAssignment, StripeReceipt, StripeReceiptContent,
+};
+pub use signed::Check;
 
 /// Everything that can go wrong on the wire. Any of these ends the connection.
 #[derive(Debug, thiserror::Error)]
@@ -47,4 +83,6 @@ pub enum WireError {
     Key(String),
     #[error("signature does not verify")]
     BadSignature,
+    #[error("not a fault proof: {0}")]
+    NotAFault(&'static str),
 }

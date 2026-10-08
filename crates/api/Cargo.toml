@@ -1,0 +1,40 @@
+[package]
+name = "tally-api"
+description = "The Tally API: aircraft in a viewport, network totals and station stats, as public JSON (RFC-0173 §2.5)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lib]
+name = "tally_api"
+path = "src/lib.rs"
+
+[[bin]]
+name = "tally-api"
+path = "src/main.rs"
+
+[dependencies]
+axum.workspace = true
+h3o.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tally-api-types.workspace = true
+tally-merge.workspace = true
+tally-mlat-solver.workspace = true
+tally-relay.workspace = true
+tally-wire.workspace = true
+tokio.workspace = true
+tower.workspace = true
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+# The end-to-end test runs real engines on the simulator's receivers.
+tally-mlat.workspace = true

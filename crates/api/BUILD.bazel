@@ -1,0 +1,96 @@
+load("@rules_rust//cargo:defs.bzl", "extract_cargo_lints")
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test", "rustfmt_test")
+
+package(default_visibility = ["//tally:__subpackages__"])
+
+exports_files(["Cargo.toml"])
+
+extract_cargo_lints(
+    name = "cargo_lints",
+    manifest = "Cargo.toml",
+    workspace = "//tally:Cargo.toml",
+)
+
+rust_library(
+    name = "api",
+    srcs = glob(
+        ["src/**/*.rs"],
+        exclude = ["src/main.rs"],
+    ),
+    crate_name = "tally_api",
+    edition = "2024",
+    lint_config = ":cargo_lints",
+    version = "0.1.0",
+    deps = [
+        "//tally/crates/api-types",
+        "//tally/crates/merge",
+        "//tally/crates/mlat-solver",
+        "//tally/crates/relay",
+        "//tally/crates/wire",
+        "@tally_crates//:axum",
+        "@tally_crates//:h3o",
+        "@tally_crates//:http-body-util",
+        "@tally_crates//:hyper",
+        "@tally_crates//:hyper-util",
+        "@tally_crates//:serde",
+        "@tally_crates//:serde_json",
+        "@tally_crates//:tokio",
+        "@tally_crates//:tower",
+    ],
+)
+
+rust_binary(
+    name = "tally-api",
+    srcs = ["src/main.rs"],
+    edition = "2024",
+    lint_config = ":cargo_lints",
+    version = "0.1.0",
+    deps = [
+        ":api",
+        "@tally_crates//:tokio",
+    ],
+)
+
+rust_test(
+    name = "api_test",
+    size = "small",
+    crate = ":api",
+    edition = "2024",
+    lint_config = ":cargo_lints",
+)
+
+# A stand-in readsb and a real relay, fed by a receiver over loopback, behind the API; and two
+# real engines on the simulator's receivers, publishing through two relays the API merges.
+rust_test(
+    name = "end_to_end",
+    size = "medium",
+    srcs = ["tests/end_to_end.rs"],
+    edition = "2024",
+    lint_config = ":cargo_lints",
+    deps = [
+        ":api",
+        "//tally/crates/api-types",
+        "//tally/crates/merge",
+        "//tally/crates/mlat",
+        "//tally/crates/mlat-solver",
+        "//tally/crates/relay",
+        "//tally/crates/wire",
+        "@tally_crates//:axum",
+        "@tally_crates//:http-body-util",
+        "@tally_crates//:hyper",
+        "@tally_crates//:hyper-util",
+        "@tally_crates//:serde",
+        "@tally_crates//:serde_json",
+        "@tally_crates//:tokio",
+    ],
+)
+
+rustfmt_test(
+    name = "rustfmt",
+    targets = [
+        ":api",
+        ":api_test",
+        ":end_to_end",
+        ":tally-api",
+    ],
+)

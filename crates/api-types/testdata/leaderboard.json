@@ -1,0 +1,38 @@
+{
+  "now_ms": 1791220060000,
+  "window_for_ms": 60000,
+  "area": "832834fffffffff",
+  "center": {
+    "lat": 37.097866,
+    "lon": -122.134251
+  },
+  "ranked": 2,
+  "by_unique_coverage": [
+    {
+      "rank": 1,
+      "key": "6kpsY+KcUgq+9VB7Ey7F+ZVHdq6+vnuSQh7qaRRG0iw=",
+      "unique_coverage_km2": 263.2,
+      "mlat_positions": 1
+    },
+    {
+      "rank": 2,
+      "key": "E5j2LG0aRXxRumpLXz29L2n8qTIWIY3ImX5Ba9F9k8o=",
+      "unique_coverage_km2": 0.0,
+      "mlat_positions": 1
+    }
+  ],
+  "by_mlat": [
+    {
+      "rank": 1,
+      "key": "6kpsY+KcUgq+9VB7Ey7F+ZVHdq6+vnuSQh7qaRRG0iw=",
+      "unique_coverage_km2": 263.2,
+      "mlat_positions": 1
+    },
+    {
+      "rank": 2,
+      "key": "E5j2LG0aRXxRumpLXz29L2n8qTIWIY3ImX5Ba9F9k8o=",
+      "unique_coverage_km2": 0.0,
+      "mlat_positions": 1
+    }
+  ]
+}

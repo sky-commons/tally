@@ -11,7 +11,7 @@ use tally_wire::backoff::Backoff;
 use tally_wire::batch::Hash;
 use tally_wire::beast::Decoder;
 use tally_wire::noise;
-use tally_wire::{Batch, BatchContent, Clock, Frame, Identity, Observation, Record};
+use tally_wire::{Batch, BatchContent, Clock, Codec, Frame, Identity, Observation, Record};
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
 use tokio::sync::{broadcast, mpsc};
@@ -200,7 +200,9 @@ impl Batcher {
             previous: self.previous,
             observations: std::mem::take(&mut self.observations),
         };
-        let batch = Batch::sign(&self.identity, &content).map_err(|error| error.to_string())?;
+        // Compressed: every relay reads it (wire version 2 is the minimum).
+        let batch = Batch::sign_with(&self.identity, &content, Codec::Deflate)
+            .map_err(|error| error.to_string())?;
         self.sequence += 1;
         self.previous = batch.hash();
         self.bytes = 0;

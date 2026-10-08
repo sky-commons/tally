@@ -24,4 +24,13 @@ tally_crate.from_cargo(
         "aarch64-apple-darwin",
     ],
 )
+
+# BLAKE2s is on the MLAT's hot path (every reception's identity, every ranking and thinning hash),
+# and unoptimised it costs the solver's tests ten times their time: optimised in every build, as
+# tally's Cargo.toml does (`[profile.dev.package.blake2]`).
+tally_crate.annotation(
+    crate = "blake2",
+    repositories = ["tally_crates"],
+    rustc_flags = ["-Copt-level=2"],
+)
 use_repo(tally_crate, "tally_crates")

@@ -1,0 +1,12 @@
+{
+  "now_ms": 1791220000250,
+  "key": "6kpsY+KcUgq+9VB7Ey7F+ZVHdq6+vnuSQh7qaRRG0iw=",
+  "online": true,
+  "first_seen_at_ms": 1791216400250,
+  "last_seen_at_ms": 1791219999250,
+  "messages_per_sec": 42.25,
+  "batches": 9001,
+  "gaps": 3,
+  "location": null,
+  "software": null
+}
