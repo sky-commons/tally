@@ -271,6 +271,8 @@ impl Config {
         if (config.world || config.world_precise) && !covers_the_world(&config.areas) {
             return Err(WORLD_NEEDS_EVERY_AREA.to_owned());
         }
+        // Every region taken is offered, or the relay does not start.
+        crate::directory::offerable(&config.areas).map_err(|error| format!("--area: {error}"))?;
         // A relay list carries a one-byte count.
         if config.hints().len() > usize::from(u8::MAX) {
             return Err("at most 255 advertised relays and upstreams together".to_owned());
@@ -344,29 +346,21 @@ pub fn parse_area(text: &str) -> Result<Region, String> {
         .ok_or_else(|| format!("--area: {text} is not an H3 cell"))
 }
 
-/// The 122 resolution 0 cells: H3's base cells, each the index with mode 1, resolution 0, its
-/// base cell number, and every digit unused (7).
-fn base_cells() -> Vec<Region> {
-    (0..122u64)
-        .filter_map(|base| Region::from_u64(0x0800_1fff_ffff_ffff | (base << 45)).ok())
-        .collect()
-}
-
 /// Whether `areas` cover the globe: every area (`rendezvous::AREA_RESOLUTION`) lies in one of
-/// them.
+/// them (a region finer than an area counts its area taken, as `rendezvous::areas_of` does).
+/// Region by region: the areas they name, at their fewest, are the base cells.
 pub fn covers_the_world(areas: &[Region]) -> bool {
-    let taken: std::collections::HashSet<u64> = areas
+    let named: tally_wire::Regions = areas
         .iter()
-        .filter_map(|region| tally_wire::rendezvous::areas_of(*region).ok())
-        .flatten()
-        .map(Region::as_u64)
-        .collect();
-    let bases = base_cells();
-    bases.len() == 122
-        && bases.into_iter().all(|base| {
-            tally_wire::rendezvous::areas_of(base)
-                .is_ok_and(|every| every.iter().all(|area| taken.contains(&area.as_u64())))
+        .filter_map(|region| {
+            region.ancestor(
+                region
+                    .resolution()
+                    .min(tally_wire::rendezvous::AREA_RESOLUTION),
+            )
         })
+        .collect();
+    named == tally_wire::Regions::world()
 }
 
 pub fn parse_upstream(text: &str) -> Result<Upstream, String> {
@@ -469,6 +463,59 @@ mod tests {
             assert_eq!(parse_area(&text)?, region, "{text}");
         }
         assert!(parse_area("12").is_err());
+        Ok(())
+    }
+
+    /// The 122 resolution 0 cells: H3's base cells.
+    fn base_cells() -> Vec<Region> {
+        tally_wire::Regions::world().cells().to_vec()
+    }
+
+    /// Every region taken is offered: a relay whose regions, at their fewest, are more cells than
+    /// its peers hold offers of one key refuses to start, and says how many; the same places
+    /// named by fewer cells start.
+    #[test]
+    fn a_relay_refuses_areas_it_could_not_offer_whole() -> Result<(), String> {
+        let base = *base_cells().first().ok_or("no base cell")?;
+        // Every other area under one base cell: no two siblings merge, so they stay that many.
+        let scattered: Vec<String> = tally_wire::rendezvous::areas_of(base)
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .step_by(2)
+            .map(|cell| format!("{:x}", cell.as_u64()))
+            .collect();
+        assert!(scattered.len() < crate::directory::OFFERS_PER_KEY);
+        let mut args = vec!["--key", "k", "--max-upload", "10Mbit/s"];
+        let some: Vec<&str> = scattered.iter().map(String::as_str).collect();
+        for area in &some {
+            args.extend(["--area", area]);
+        }
+        assert!(config(&args).is_ok());
+        // The other half of a second base cell's areas too: past the bound, refused.
+        let second = *base_cells().get(1).ok_or("no second base cell")?;
+        let more: Vec<String> = tally_wire::rendezvous::areas_of(second)
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .step_by(2)
+            .map(|cell| format!("{:x}", cell.as_u64()))
+            .collect();
+        for area in &more {
+            args.extend(["--area", area.as_str()]);
+        }
+        let refused = config(&args)
+            .err()
+            .ok_or("started with areas it cannot offer")?;
+        assert!(refused.contains("cells at their fewest"), "{refused}");
+        // The same two base cells named whole: two cells, started.
+        let whole = [
+            format!("{:x}", base.as_u64()),
+            format!("{:x}", second.as_u64()),
+        ];
+        let mut args = vec!["--key", "k", "--max-upload", "10Mbit/s"];
+        for cell in &whole {
+            args.extend(["--area", cell.as_str()]);
+        }
+        assert!(config(&args).is_ok());
         Ok(())
     }
 

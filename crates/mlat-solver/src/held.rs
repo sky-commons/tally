@@ -28,7 +28,10 @@
 //!   the bytes once a bin is complete, on the whole bin ([`Bin::seal_within`]), so which receiver
 //!   is refused never depends on which owner took what first; one holder of all of it ([`Held`])
 //!   checks on arrival, in the one order it is handed raw. What a holder reserves per receiver to
-//!   never reach either is [`Rates::cost`].
+//!   never reach either is [`Rates::cost`]. An owner of open raw that is charged for it as it grows
+//!   ([`Open::add_decoded_taking`], a relay's raw shards, each charging the relay's open raw store)
+//!   is asked for every byte before it is allocated; one refused refuses the batch's raw of the
+//!   bin, its receiver's whole when it already holds some there, counted as the rest are.
 //! - **Accounted as allocated**: every byte [`Held::bytes`] reports is a capacity actually
 //!   allocated (vectors by capacity, maps by their tables), so admission is sized on what is
 //!   really in memory.
@@ -433,16 +436,7 @@ struct Slot {
 /// Bytes a hash map's table allocates (hashbrown's layout: a power-of-two bucket count at 7/8
 /// load, each bucket an entry and a control byte, and a group of control bytes more).
 fn map_bytes<K, V>(map: &HashMap<K, V>) -> usize {
-    let capacity = map.capacity();
-    if capacity == 0 {
-        return 0;
-    }
-    let buckets = if capacity < 8 {
-        (capacity + 1).next_power_of_two()
-    } else {
-        (capacity * 8 / 7).next_power_of_two()
-    };
-    (buckets * size_of::<(K, V)>()).next_multiple_of(16) + buckets + 16
+    table_bytes::<K, V>(buckets_of(map))
 }
 
 /// The open raw of one bin, of some receivers: what an owner of raw (a whole holder, or one of a
@@ -454,6 +448,42 @@ pub struct Fragment {
     index: HashMap<PublicKey, u32>,
     /// Bytes allocated by the slots' lists.
     raw_bytes: usize,
+}
+
+/// Rust's vector growth for one more element: its capacity after a push.
+fn grown_capacity<T>(vec: &Vec<T>) -> usize {
+    if vec.len() < vec.capacity() {
+        vec.capacity()
+    } else {
+        let least = if size_of::<T>() == 1 {
+            8
+        } else if size_of::<T>() <= 1024 {
+            4
+        } else {
+            1
+        };
+        (vec.capacity() * 2).max(vec.len() + 1).max(least)
+    }
+}
+
+/// `map_bytes` of a table of `buckets` buckets.
+fn table_bytes<K, V>(buckets: usize) -> usize {
+    if buckets == 0 {
+        return 0;
+    }
+    (buckets * size_of::<(K, V)>()).next_multiple_of(16) + buckets + 16
+}
+
+/// The buckets `map_bytes` counts for `map`.
+fn buckets_of<K, V>(map: &HashMap<K, V>) -> usize {
+    let capacity = map.capacity();
+    if capacity == 0 {
+        0
+    } else if capacity < 8 {
+        (capacity + 1).next_power_of_two()
+    } else {
+        (capacity * 8 / 7).next_power_of_two()
+    }
 }
 
 impl Fragment {
@@ -482,6 +512,17 @@ impl Fragment {
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// The most making a slot for a receiver it holds none of may allocate: the slots' vector
+    /// growing, and the index's table doubling (at least four buckets), which it may do short of
+    /// its capacity when receivers forgotten left their places marked.
+    fn slot_growth(&self) -> usize {
+        let slots = (grown_capacity(&self.slots) - self.slots.capacity()) * size_of::<Slot>();
+        let buckets = buckets_of(&self.index);
+        let index = table_bytes::<PublicKey, u32>((buckets * 2).max(4))
+            - table_bytes::<PublicKey, u32>(buckets);
+        slots + index
     }
 
     /// `receiver`'s slot, made if it has none.
@@ -725,6 +766,7 @@ impl Open {
             content.observations.iter().map(ObsView::from),
             room,
             None,
+            &mut |_| true,
         )
     }
 
@@ -745,11 +787,34 @@ impl Open {
             decoded.views(),
             room,
             Some(decoded.stamp_ms()),
+            &mut |_| true,
+        )
+    }
+
+    /// As `add_decoded`, every byte asked of `take` before it is allocated (module docs, Bounded):
+    /// for an owner charged for its open raw as it grows. What `take` granted and this did not
+    /// allocate is the owner's to give back: afterwards these bins hold [`Open::bytes`].
+    pub fn add_decoded_taking(
+        &mut self,
+        decoded: &Decoded,
+        take: &mut dyn FnMut(usize) -> bool,
+    ) -> Added {
+        let room = self.limits.bytes;
+        self.add_observations(
+            decoded.receiver(),
+            decoded.counter_epoch(),
+            decoded.wall_ms(),
+            decoded.views(),
+            room,
+            Some(decoded.stamp_ms()),
+            take,
         )
     }
 
     /// `room`: the bytes these open bins may grow to. `stamp_ms`: the batch's ingest stamp, which
-    /// decides lateness when the holder closes by one ([`Closing`]).
+    /// decides lateness when the holder closes by one ([`Closing`]). `take`: asked for every byte
+    /// before it is allocated.
+    #[allow(clippy::too_many_arguments)]
     fn add_observations<'a>(
         &mut self,
         receiver: PublicKey,
@@ -758,6 +823,7 @@ impl Open {
         observations: impl Iterator<Item = ObsView<'a>>,
         room: usize,
         stamp_ms: Option<u64>,
+        take: &mut dyn FnMut(usize) -> bool,
     ) -> Added {
         let mut added = Added::default();
         let bin = bin_of(wall_ms);
@@ -781,8 +847,20 @@ impl Open {
             return added;
         }
         let into_ms = (wall_ms % GRID_MS) as u16;
+        if !self.bins.contains_key(&bin) {
+            let len = self.bins.len();
+            let growth = btree_bytes::<i64, Fragment>(len + 1) - btree_bytes::<i64, Fragment>(len);
+            if !take(growth) {
+                added.refused = wanted.len();
+                return added;
+            }
+        }
         let fragment = self.bins.entry(bin).or_insert_with(|| Fragment::new(bin));
         if wanted.is_empty() {
+            return added;
+        }
+        if !fragment.index.contains_key(&receiver) && !take(fragment.slot_growth()) {
+            added.refused = wanted.len();
             return added;
         }
         let before = fragment.bytes();
@@ -798,7 +876,8 @@ impl Open {
         if !over_count {
             for observation in &wanted {
                 let raws = &mut fragment.slots[slot].raws;
-                if self.bytes + grown + raws.next_growth() > room {
+                let growth = raws.next_growth();
+                if self.bytes + grown + growth > room || (growth > 0 && !take(growth)) {
                     break;
                 }
                 grown += raws.push(Raw::new(
@@ -1573,6 +1652,7 @@ impl Held {
             content.observations.iter().map(ObsView::from),
             room,
             None,
+            &mut |_| true,
         )
     }
 
@@ -1586,6 +1666,7 @@ impl Held {
             decoded.views(),
             room,
             None,
+            &mut |_| true,
         )
     }
 
@@ -1600,6 +1681,7 @@ impl Held {
             std::iter::once(ObsView::from(&reception.observation)),
             room,
             None,
+            &mut |_| true,
         )
     }
 

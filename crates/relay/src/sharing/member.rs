@@ -27,6 +27,15 @@
 //!   window, and it did not itself report being starved then, every member drops it from the
 //!   trees for `groups::DEMOTION_MS`. Windows in which the trees changed (membership, or a seed
 //!   rotation at their end) are not judged, so a move is never mistaken for a fault.
+//!
+//! **Work follows activity.** A group is held only while it is something more than this relay
+//! alone with nothing: another member, or records, manifests, receipts or demotions within the
+//! horizon. One that is neither is let go (its trees are this relay alone, which any reader can
+//! compute: `Sharing::layout`), so a relay that takes every area of the world holds no group until
+//! one carries something. And the tick visits only the groups with something due: each held group
+//! is scheduled for when its next duty falls (now, while it holds records; else the next seed
+//! rotation or anti-entropy ask while it has other members, and the end of a demotion), so a tick
+//! with nothing due does no work whatever the groups held.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -235,6 +244,24 @@ impl Message {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    /// The group it is about, when it names one.
+    pub fn group(&self) -> Option<GroupKey> {
+        match self {
+            Self::Piece { group, .. } => Some(*group),
+            Self::Manifest(manifest) => manifest
+                .content()
+                .ok()
+                .map(|content| GroupKey::new(content.cell, content.product)),
+            Self::Parity(parity) => Some(GroupKey::new(parity.cell, parity.product)),
+            Self::Receipt(receipt) => receipt
+                .content()
+                .ok()
+                .map(|content| GroupKey::new(content.cell, content.product)),
+            Self::Have(have) => Some(GroupKey::new(have.cell, have.product)),
+            Self::Assign(_) => None,
+        }
+    }
 }
 
 /// The identity of a record a group carries: what its manifests list. `None` for a kind no group
@@ -320,6 +347,8 @@ struct HeldParity {
 
 struct Group {
     key: GroupKey,
+    /// When the tick next visits it (`Member::settle`), if ever.
+    due_ms: Option<u64>,
     members: Vec<PublicKey>,
     leaves_only: Vec<PublicKey>,
     demoted: BTreeMap<PublicKey, u64>,
@@ -356,6 +385,7 @@ impl Group {
     fn new(key: GroupKey, me: PublicKey) -> Self {
         Self {
             key,
+            due_ms: None,
             members: vec![me],
             leaves_only: Vec::new(),
             demoted: BTreeMap::new(),
@@ -484,10 +514,66 @@ impl Group {
         })
     }
 
-    /// Holds a piece, counting its bytes.
-    fn hold(&mut self, hash: Hash, piece: Piece, at_ms: u64, from: Vec<(PublicKey, u64)>) {
-        self.bytes += piece.len();
+    /// Holds a piece, counting its bytes. The bytes it adds.
+    fn hold(&mut self, hash: Hash, piece: Piece, at_ms: u64, from: Vec<(PublicKey, u64)>) -> usize {
+        let len = piece.len();
+        self.bytes += len;
         self.pieces.insert(hash, Held { piece, at_ms, from });
+        len
+    }
+
+    /// Whether it holds anything within the horizon: then every tick has duties for it
+    /// (manifests, rebuilds, receipts, judgment, repair, forgetting).
+    fn busy(&self) -> bool {
+        !(self.pieces.is_empty()
+            && self.manifests.is_empty()
+            && self.parity.is_empty()
+            && self.own.is_empty()
+            && self.seen.is_empty()
+            && self.receipted.is_empty()
+            && self.judged.is_empty()
+            && self.shortfalls.is_empty()
+            && self.starved.is_empty())
+    }
+
+    /// Whether this relay is alone in it with nothing: what it would be if it were not held at
+    /// all, so it is let go.
+    fn idle(&self, me: &PublicKey) -> bool {
+        self.members.iter().all(|member| member == me)
+            && self.leaves_only.iter().all(|member| member == me)
+            && !self.busy()
+            && self.demoted.is_empty()
+            && self.assigned.is_empty()
+            && self.changed_ms.is_empty()
+            && self.answered.is_empty()
+    }
+
+    /// When the tick must next visit it: at once while it holds anything; else at the soonest of
+    /// its timed duties (the next seed rotation and anti-entropy ask while it has another member,
+    /// a demotion's end, forgetting what it remembers of the trees); never when it has none.
+    fn wake_ms(&self, me: &PublicKey, now_ms: u64) -> Option<u64> {
+        if self.busy() {
+            return Some(now_ms);
+        }
+        let mut wake = u64::MAX;
+        let others = self.layout.members().iter().any(|member| member != me);
+        if others || !self.assigned.is_empty() {
+            let epoch = epoch_of(now_ms / 1000);
+            wake = wake.min((epoch + 1) * SEED_ROTATION_SECONDS * 1000);
+        }
+        if others {
+            wake = wake.min(self.repair_at_ms.max(self.anti_entropy_at_ms));
+        }
+        if let Some(until) = self.demoted.values().min() {
+            wake = wake.min(*until);
+        }
+        if let Some(changed) = self.changed_ms.iter().min() {
+            wake = wake.min(changed + 2 * HORIZON_SECONDS * 1000 + 1);
+        }
+        if let Some(at) = self.answered.values().min() {
+            wake = wake.min(at + ANSWER_INTERVAL_MS);
+        }
+        (wake != u64::MAX).then_some(wake.max(now_ms))
     }
 }
 
@@ -496,6 +582,13 @@ pub struct Member {
     identity: Identity,
     me: PublicKey,
     groups: BTreeMap<GroupKey, Group>,
+    /// The held groups by when the tick next visits them.
+    due: BTreeSet<(u64, GroupKey)>,
+    /// Record bytes held across the groups, kept as they change.
+    bytes: usize,
+    /// Groups the tick has visited since start: the work it did, which follows what the groups
+    /// hold and never how many areas the relay takes.
+    visits: u64,
     delivered: Vec<Delivered>,
     demotions: Vec<(GroupKey, PublicKey, u64)>,
     stats: Stats,
@@ -511,6 +604,9 @@ impl Member {
             identity,
             me,
             groups: BTreeMap::new(),
+            due: BTreeSet::new(),
+            bytes: 0,
+            visits: 0,
             delivered: Vec::new(),
             demotions: Vec::new(),
             stats: Stats::default(),
@@ -525,12 +621,17 @@ impl Member {
 
     /// Record bytes held now, across its groups.
     pub fn held_bytes(&self) -> usize {
-        self.groups.values().map(|group| group.bytes).sum()
+        self.bytes
+    }
+
+    /// Groups the tick has visited since start.
+    pub fn visits(&self) -> u64 {
+        self.visits
     }
 
     /// Whether `len` more bytes fit; counted as refused when they do not.
     fn fits(&mut self, len: usize) -> bool {
-        let fits = self.held_bytes().saturating_add(len) <= self.capacity;
+        let fits = self.bytes.saturating_add(len) <= self.capacity;
         if !fits {
             self.stats.refused += 1;
         }
@@ -552,6 +653,35 @@ impl Member {
 
     pub fn groups(&self) -> Vec<GroupKey> {
         self.groups.keys().copied().collect()
+    }
+
+    /// Whether `group` is held (it is more than this relay alone with nothing).
+    pub fn holds_group(&self, group: GroupKey) -> bool {
+        self.groups.contains_key(&group)
+    }
+
+    /// Holds `group` for a message about to be handed in (`receive`), which lets it go again if
+    /// the message leaves it with nothing.
+    pub fn join(&mut self, group: GroupKey) {
+        let me = self.me;
+        self.groups
+            .entry(group)
+            .or_insert_with(|| Group::new(group, me));
+    }
+
+    /// The origin manifests held of `second`, by group: what the bundle indexes over it digest.
+    pub fn manifests_of(&self, second: u64) -> Vec<(GroupKey, Vec<PieceManifest>)> {
+        self.groups
+            .iter()
+            .filter_map(|(key, group)| {
+                let by_hash = group.manifests.get(&second)?;
+                let manifests: Vec<PieceManifest> = by_hash
+                    .values()
+                    .map(|listed| listed.manifest.clone())
+                    .collect();
+                Some((*key, manifests))
+            })
+            .collect()
     }
 
     /// The origin manifests held for `group`'s `second`: what a bundle index over it digests.
@@ -611,12 +741,39 @@ impl Member {
         group.members = members;
         group.leaves_only = leaves_only.to_vec();
         group.relayout(now_ms);
-        assign(group, &me, now_ms)
+        let out = assign(group, &me, now_ms);
+        self.settle(key, now_ms);
+        out
     }
 
     /// Leaves a group (the relay no longer takes its cell).
     pub fn leave(&mut self, key: GroupKey) {
-        self.groups.remove(&key);
+        if let Some(group) = self.groups.remove(&key) {
+            self.bytes -= group.bytes;
+            if let Some(at) = group.due_ms {
+                self.due.remove(&(at, key));
+            }
+        }
+    }
+
+    /// Schedules `key` for when the tick next has something to do for it, or lets it go when it
+    /// is this relay alone with nothing.
+    fn settle(&mut self, key: GroupKey, now_ms: u64) {
+        let me = self.me;
+        let Some(group) = self.groups.get_mut(&key) else {
+            return;
+        };
+        if let Some(at) = group.due_ms.take() {
+            self.due.remove(&(at, key));
+        }
+        if group.idle(&me) {
+            self.leave(key);
+            return;
+        }
+        if let Some(at) = group.wake_ms(&me, now_ms) {
+            group.due_ms = Some(at);
+            self.due.insert((at, key));
+        }
     }
 
     /// A record this relay originated for a group: held, and sent once to its stripe's seed.
@@ -641,9 +798,10 @@ impl Member {
             .or_insert_with(|| Group::new(key, me));
         group.own.entry(now_ms / 1000).or_default().insert(hash);
         if held {
+            self.settle(key, now_ms);
             return Vec::new();
         }
-        group.hold(hash, piece.clone(), now_ms, Vec::new());
+        self.bytes += group.hold(hash, piece.clone(), now_ms, Vec::new());
         self.delivered.push(Delivered {
             group: key,
             hash,
@@ -656,19 +814,26 @@ impl Member {
             hash,
             piece,
         };
-        inject(group, &me, stripe, message, now_ms)
+        let out = inject(group, &me, stripe, message, now_ms);
+        self.settle(key, now_ms);
+        out
     }
 
     /// A message from another relay.
     pub fn receive(&mut self, from: PublicKey, message: Message, now_ms: u64) -> Vec<Outgoing> {
-        match message {
+        let key = message.group();
+        let out = match message {
             Message::Piece { group, hash, piece } => self.piece(from, group, hash, piece, now_ms),
             Message::Manifest(manifest) => self.manifest(from, manifest, now_ms),
             Message::Parity(parity) => self.parity(from, parity, now_ms),
             Message::Receipt(receipt) => self.receipt(from, receipt, now_ms),
             Message::Have(have) => self.have(from, &have, now_ms),
             Message::Assign(_) => Vec::new(),
+        };
+        if let Some(key) = key {
+            self.settle(key, now_ms);
         }
+        out
     }
 
     fn piece(
@@ -703,7 +868,7 @@ impl Member {
         if parent.is_some_and(|parent| parent != from) {
             self.stats.repaired += 1;
         }
-        group.hold(hash, piece.clone(), now_ms, vec![(from, now_ms)]);
+        self.bytes += group.hold(hash, piece.clone(), now_ms, vec![(from, now_ms)]);
         self.delivered.push(Delivered {
             group: key,
             hash,
@@ -882,21 +1047,30 @@ impl Member {
 
     /// The timed duties: manifests and parity, rebuilds, receipts, judgments, repair, and
     /// forgetting what is past the horizon.
+    ///
+    /// Only the groups with something due are visited (`settle`), in key order, and each is
+    /// scheduled again after: a group with nothing due at `now_ms` would have done nothing.
     pub fn tick(&mut self, now_ms: u64) -> Vec<Outgoing> {
         let me = self.me;
         let mut out = Vec::new();
-        let keys: Vec<GroupKey> = self.groups.keys().copied().collect();
-        let mut held = self.held_bytes();
+        let mut keys: Vec<GroupKey> = self
+            .due
+            .iter()
+            .take_while(|(at, _)| *at <= now_ms)
+            .map(|(_, key)| *key)
+            .collect();
+        keys.sort();
         for key in keys {
             let Some(group) = self.groups.get_mut(&key) else {
                 continue;
             };
+            self.visits += 1;
             out.extend(originate_manifests(group, &self.identity, now_ms));
             out.extend(rebuild(
                 group,
                 &me,
                 now_ms,
-                (&mut held, self.capacity),
+                (&mut self.bytes, self.capacity),
                 &mut self.delivered,
                 &mut self.stats,
             ));
@@ -905,7 +1079,8 @@ impl Member {
             expire_demotions(group, now_ms);
             out.extend(assign(group, &me, now_ms));
             out.extend(repair(group, &me, now_ms, &mut self.stats));
-            forget(group, now_ms);
+            self.bytes -= forget(group, now_ms);
+            self.settle(key, now_ms);
         }
         out
     }
@@ -1178,8 +1353,7 @@ fn rebuild(
             stats.refused += 1;
             continue;
         }
-        *held_bytes += piece.len();
-        group.hold(hash, piece.clone(), now_ms, Vec::new());
+        *held_bytes += group.hold(hash, piece.clone(), now_ms, Vec::new());
         stats.rebuilt += 1;
         delivered.push(Delivered {
             group: group.key,
@@ -1451,8 +1625,8 @@ fn repair(group: &mut Group, me: &PublicKey, now_ms: u64, stats: &mut Stats) -> 
     }]
 }
 
-/// Forgets what is past the horizon.
-fn forget(group: &mut Group, now_ms: u64) {
+/// Forgets what is past the horizon. The record bytes it let go.
+fn forget(group: &mut Group, now_ms: u64) -> usize {
     let horizon_ms = now_ms.saturating_sub(HORIZON_SECONDS * 1000);
     let horizon_second = horizon_ms / 1000;
     let horizon_window = horizon_second / RECEIPT_WINDOW_SECONDS;
@@ -1483,6 +1657,7 @@ fn forget(group: &mut Group, now_ms: u64) {
     group
         .changed_ms
         .retain(|changed| *changed + 2 * HORIZON_SECONDS * 1000 >= now_ms);
+    freed
 }
 
 /// Whether a signed `second` is one this relay holds things for: within the horizon behind its

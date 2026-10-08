@@ -32,6 +32,12 @@
 //!   ignored; and an offer is gossiped once, when it is first verified.
 //! - **Expiry by the reader's clock.** An offer already expired, or issued in the future past the
 //!   allowed skew, is not taken, and one that expires while held is forgotten.
+//! - **Readers follow changes, never scan.** What the held offers answer changes only when an
+//!   offer comes, goes or says something new, or the tiers move: [`Directory::version`] names that
+//!   state, and [`Directory::take_changed_cells`] the cells whose answer changed since the last
+//!   look. A re-signing that says what the held offer said changes neither, so a relay that holds
+//!   offers for every area of the world costs its readers nothing while nothing changes (the MLAT
+//!   choice in `selection`, the sharing trees in `sharing`).
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::net::IpAddr;
@@ -51,8 +57,27 @@ use crate::hub::Hub;
 use crate::network::{Asker, AskerRole};
 use crate::sharing::locks::lock;
 
-/// Offers held per signing key, at most.
-pub const OFFERS_PER_KEY: usize = 64;
+/// Offers held per signing key, at most: as many as one network group may hold
+/// (`OFFERS_PER_GROUP`), so a key is bounded as its network is. A relay's own offers are the
+/// regions it takes at their fewest (`Bundles::offered`), all of them, and a relay whose regions
+/// need more than this refuses to start (`offerable`), so no relay's offers are cut by its peers'
+/// bound: the whole world at its coarsest (`BASE_CELLS`) always fits.
+pub const OFFERS_PER_KEY: usize = OFFERS_PER_GROUP;
+const _: () = assert!(OFFERS_PER_KEY >= tally_wire::region::BASE_CELLS);
+
+/// Whether a relay taking `regions` can offer all of them: its offers are at most the regions at
+/// their fewest (`Bundles::offered`), and every peer holds at most `OFFERS_PER_KEY` of one key.
+/// The error says how many cells they are, for a relay to refuse to start on.
+pub fn offerable(regions: &[Region]) -> Result<(), String> {
+    let cells = tally_wire::Regions::new(regions.iter().copied()).len();
+    if cells > OFFERS_PER_KEY {
+        return Err(format!(
+            "the areas taken are {cells} cells at their fewest, and a relay's peers hold at most \
+             {OFFERS_PER_KEY} offers of one key: name them by coarser cells"
+        ));
+    }
+    Ok(())
+}
 /// Offers held per cell, at most.
 pub const OFFERS_PER_CELL: usize = 32;
 /// Offers held per cell from one network group, at most.
@@ -210,6 +235,18 @@ struct State {
     /// Each key's tier, weighed at `tiers_at`; cleared whenever what they are weighed from changes.
     tiers: HashMap<PublicKey, u32>,
     tiers_at: u64,
+    /// Bumped whenever what the held offers answer may have changed: an offer held or let go, one
+    /// that says something new, evidence that moves the tiers (`Directory::version`).
+    version: u64,
+    /// The cells whose answer changed since sharing last looked (`Directory::take_changed_cells`).
+    changed: HashSet<u64>,
+    /// The minute the tiers were last weighed for readers (`State::roll_tiers`), and the tiers
+    /// above 0 then, sorted.
+    rolled_at: u64,
+    rolled: Vec<(PublicKey, u32)>,
+    /// When held offers expire: each instant, with how many expire then. What makes expiry cost
+    /// nothing until one is due.
+    expiries: BTreeMap<u64, usize>,
 }
 
 impl Default for State {
@@ -236,6 +273,11 @@ impl Default for State {
             key_groups: HashMap::new(),
             tiers: HashMap::new(),
             tiers_at: 0,
+            version: 0,
+            changed: HashSet::new(),
+            rolled_at: 0,
+            rolled: Vec::new(),
+            expiries: BTreeMap::new(),
         }
     }
 }
@@ -340,12 +382,62 @@ pub fn expiry(content: &ProviderOfferContent) -> u64 {
         .min(content.issued_ms.saturating_add(OFFER_LIFETIME_MS))
 }
 
+/// Whether two offers of one signer for one cell say the same, but for when they were signed, how
+/// long they live and the feeder slots they count (which only a feeder's query reads): a
+/// re-signing that changes nothing any reader of the held offers follows.
+fn same_offer(held: &ProviderOfferContent, new: &ProviderOfferContent) -> bool {
+    let plain = |content: &ProviderOfferContent| ProviderOfferContent {
+        issued_ms: 0,
+        expires_ms: 0,
+        feeder_slots: 0,
+        ..content.clone()
+    };
+    plain(held) == plain(new)
+}
+
 /// An offer whose signature verifies and whose lifetime holds at `now_ms`.
 fn checked(offer: &ProviderOffer, now_ms: u64) -> Option<(PublicKey, ProviderOfferContent)> {
     offer.verify().ok()?;
     let content = offer.content().ok()?;
     let live = expiry(&content) > now_ms && content.issued_ms <= now_ms + CLOCK_SKEW_MS;
     live.then_some((offer.signer().ok()?, content))
+}
+
+/// What the held offers answer, named (`Directory::version`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Version {
+    held: u64,
+    expired: u64,
+}
+
+/// The live offers of the cells no finer than an area (`Directory::coverage`).
+#[derive(Clone, Debug, Default)]
+pub struct Coverage {
+    offers: HashMap<u64, Vec<ProviderOffer>>,
+    /// Every cell some covered cell lies strictly inside.
+    inside: HashSet<u64>,
+}
+
+impl Coverage {
+    /// The offers held for `cell` itself, in rank order.
+    pub fn at(&self, cell: Region) -> &[ProviderOffer] {
+        self.offers.get(&cell.as_u64()).map_or(&[], Vec::as_slice)
+    }
+
+    /// Whether some cell strictly inside `cell` (and no finer than an area) holds offers: if
+    /// not, every area under `cell` is covered by the same offers.
+    pub fn inside(&self, cell: Region) -> bool {
+        self.inside.contains(&cell.as_u64())
+    }
+
+    /// The cells holding offers, with them.
+    pub fn cells(&self) -> impl Iterator<Item = (Region, &[ProviderOffer])> {
+        self.offers.iter().filter_map(|(cell, offers)| {
+            Region::from_u64(*cell)
+                .ok()
+                .map(|cell| (cell, offers.as_slice()))
+        })
+    }
 }
 
 impl Directory {
@@ -419,6 +511,89 @@ impl Directory {
         cells.sort_by_key(|cell| cell.as_u64());
         cells.dedup();
         cells
+    }
+
+    /// What the held offers answer at `now_ms`, named: two equal versions answer `offers_for`,
+    /// `coverage` and `tier_of` alike, so a reader keeps what it computed from them until the
+    /// version moves. It moves when an offer is held, let go or says something new, when a tier
+    /// moves (by new evidence, or weighed again in a new minute), and when a held offer's expiry
+    /// passes.
+    pub fn version(&self, now_ms: u64) -> Version {
+        let mut state = lock(&self.state);
+        state.roll_tiers(now_ms);
+        Version {
+            held: state.version,
+            expired: state
+                .expiries
+                .range(..=now_ms)
+                .next_back()
+                .map_or(0, |(at, _)| *at),
+        }
+    }
+
+    /// The cells whose held offers answer differently since the last call, sorted: offers that
+    /// expired by `now_ms` let go first, and every crowded cell when the tiers are weighed again.
+    /// For sharing, which lays out the trees of only the areas under these.
+    pub fn take_changed_cells(&self, now_ms: u64) -> Vec<Region> {
+        let mut state = lock(&self.state);
+        state.expire_offers(now_ms);
+        state.roll_tiers(now_ms);
+        let mut cells: Vec<Region> = state
+            .changed
+            .drain()
+            .filter_map(|cell| Region::from_u64(cell).ok())
+            .collect();
+        cells.sort_by_key(|cell| cell.as_u64());
+        cells
+    }
+
+    /// Every cell another relay than `own` holds an offer for, sorted.
+    pub fn cells_held_by_others(&self, own: &PublicKey) -> Vec<Region> {
+        let state = lock(&self.state);
+        let mut cells: Vec<Region> = state
+            .cells
+            .iter()
+            .filter(|(_, offers)| offers.keys().any(|key| key != own))
+            .filter_map(|(cell, _)| Region::from_u64(*cell).ok())
+            .collect();
+        cells.sort_by_key(|cell| cell.as_u64());
+        cells
+    }
+
+    /// Whether another relay than `own` holds an offer for `cell` itself.
+    pub fn others_hold(&self, cell: Region, own: &PublicKey) -> bool {
+        lock(&self.state)
+            .cells
+            .get(&cell.as_u64())
+            .is_some_and(|offers| offers.keys().any(|key| key != own))
+    }
+
+    /// The live offers of every cell no finer than an area, each cell's as `offers_for` takes
+    /// them (in rank order, at most `OFFERS_PER_CELL`): what covers the areas, read once for a
+    /// whole region rather than area by area (`selection`).
+    pub fn coverage(&self, now_ms: u64) -> Coverage {
+        let mut state = lock(&self.state);
+        let cells: Vec<u64> = state.cells.keys().copied().collect();
+        let mut coverage = Coverage::default();
+        for cell in cells {
+            let Ok(region) = Region::from_u64(cell) else {
+                continue;
+            };
+            if region.resolution() > rendezvous::AREA_RESOLUTION {
+                continue;
+            }
+            let offers = state.ranked_offers(region, now_ms, |_| true);
+            if offers.is_empty() {
+                continue;
+            }
+            for resolution in 0..region.resolution() {
+                if let Some(ancestor) = region.ancestor(resolution) {
+                    coverage.inside.insert(ancestor.as_u64());
+                }
+            }
+            coverage.offers.insert(cell, offers);
+        }
+        coverage
     }
 
     /// Whether a live offer signed by `key` is held (one this relay verified, by a handshake at
@@ -615,12 +790,14 @@ fn own_basis(hub: &Hub, identity: &Identity) -> Option<Basis> {
         .find(|hint| hint.key == own)?
         .address
         .clone();
-    // The areas taken, and the parents this relay has gathered every child of (bundles, §2.6).
-    let mut cells = network.selection.taken();
-    cells.extend(network.sharing.bundle_offers());
-    cells.sort_by_key(|cell| cell.as_u64());
-    cells.dedup();
-    cells.truncate(OFFERS_PER_KEY);
+    // The areas taken, and the parents this relay has gathered every child of (bundles, §2.6),
+    // as the fewest cells that cover them: every one, never cut to a count.
+    let cells: Vec<Region> = network
+        .sharing
+        .bundles
+        .offered(&network.selection.taken())
+        .cells()
+        .to_vec();
     if cells.is_empty() {
         return None;
     }
@@ -654,11 +831,9 @@ fn forwarded_stripes(sharing: &crate::sharing::Sharing, cell: Region, own: &Publ
     let mut stripes = 0;
     let mut laid_out = false;
     for product in crate::sharing::SHARED_PRODUCTS {
-        if let Some(layout) = sharing.layout(cell, product)
-            && layout.contains(own)
-        {
+        if let Some(homes) = sharing.homes(cell, product, own) {
             laid_out = true;
-            for stripe in layout.homes(own) {
+            for stripe in homes {
                 stripes |= 1 << stripe;
             }
         }
@@ -801,8 +976,13 @@ impl State {
         if !newer {
             return false;
         }
+        let before = self.tier(&signer, now_ms);
         self.evidence.insert(signer, (shown, bundle.clone()));
         self.tiers.clear();
+        // A key's evidence weighs in its own tier and no other's.
+        if self.tier(&signer, now_ms) != before {
+            self.tiers_moved();
+        }
         if Some(signer) != self.own {
             self.evidence_gossip.push(bundle.clone());
         }
@@ -930,16 +1110,22 @@ impl State {
             if existing.issued_ms >= content.issued_ms {
                 return false;
             }
-            self.remove(cell_key, &signer);
             // Re-signed from the same network: its rank and its group are unchanged, so it keeps
-            // its place. From another network it competes there as a newcomer.
+            // its place. From another network it competes there as a newcomer. Re-signed saying
+            // what it said, it changes no answer.
+            let quiet = existing.group == group
+                && existing
+                    .offer
+                    .content()
+                    .is_ok_and(|held| same_offer(&held, content));
+            self.remove(cell_key, &signer, quiet);
             if existing.group == group {
-                self.insert(offer, signer, content, group);
+                self.insert(offer, signer, content, group, quiet);
                 return true;
             }
         }
-        // The relay's own offers are always held (at most `OFFERS_PER_KEY`, by `own_basis`) and
-        // count against no cap; they are ranked among the rest when answered.
+        // The relay's own offers are always held (at most `OFFERS_PER_KEY`, checked before it
+        // starts: `offerable`) and count against no cap; they are ranked among the rest when answered.
         if group != Group::Own {
             if self.per_key.get(&signer).copied().unwrap_or(0) >= OFFERS_PER_KEY
                 || self.per_group.get(&group).copied().unwrap_or(0) >= OFFERS_PER_GROUP
@@ -975,22 +1161,27 @@ impl State {
                     .collect();
                 let lowest = ranked(content.cell, tiered).pop();
                 match lowest {
-                    Some(lowest) if lowest != signer => self.remove(cell_key, &lowest),
+                    Some(lowest) if lowest != signer => self.remove(cell_key, &lowest, false),
                     _ => return false,
                 }
             }
         }
-        self.insert(offer, signer, content, group);
+        self.insert(offer, signer, content, group, false);
         true
     }
 
+    /// Holds `offer`. `quiet` when it replaces one of its signer's for the cell that said the same
+    /// (`same_offer`): what the held offers answer is unchanged, so nothing that follows them is
+    /// told.
     fn insert(
         &mut self,
         offer: ProviderOffer,
         signer: PublicKey,
         content: &ProviderOfferContent,
         group: Group,
+        quiet: bool,
     ) {
+        let expires_ms = expiry(content);
         self.cells.entry(content.cell.as_u64()).or_default().insert(
             signer,
             Held {
@@ -998,23 +1189,33 @@ impl State {
                 signer,
                 products: content.products,
                 issued_ms: content.issued_ms,
-                expires_ms: expiry(content),
+                expires_ms,
                 group,
             },
         );
         *self.per_key.entry(signer).or_insert(0) += 1;
         *self.per_group.entry(group).or_insert(0) += 1;
-        *self
+        let in_group = self
             .key_groups
             .entry(signer)
             .or_default()
             .entry(group)
-            .or_insert(0) += 1;
+            .or_insert(0);
+        *in_group += 1;
+        let new_group = *in_group == 1;
+        *self.expiries.entry(expires_ms).or_insert(0) += 1;
         self.held += 1;
         self.tiers.clear();
+        if !quiet {
+            self.changed_cell(content.cell.as_u64());
+        }
+        // A network a key answers from is what witnesses count by (`State::tier`).
+        if new_group && !quiet {
+            self.tiers_moved();
+        }
     }
 
-    fn remove(&mut self, cell_key: u64, signer: &PublicKey) {
+    fn remove(&mut self, cell_key: u64, signer: &PublicKey, quiet: bool) {
         let Some(cell) = self.cells.get_mut(&cell_key) else {
             return;
         };
@@ -1026,23 +1227,86 @@ impl State {
         }
         decrement(&mut self.per_key, signer);
         decrement(&mut self.per_group, &held.group);
+        let mut left_group = false;
         if let Some(groups) = self.key_groups.get_mut(signer) {
             if let Some(count) = groups.get_mut(&held.group) {
                 *count -= 1;
                 if *count == 0 {
                     groups.remove(&held.group);
+                    left_group = true;
                 }
             }
             if groups.is_empty() {
                 self.key_groups.remove(signer);
             }
         }
+        if left_group && !quiet {
+            self.tiers_moved();
+        }
+        if let Some(count) = self.expiries.get_mut(&held.expires_ms) {
+            *count -= 1;
+            if *count == 0 {
+                self.expiries.remove(&held.expires_ms);
+            }
+        }
         self.held -= 1;
         self.tiers.clear();
+        if !quiet {
+            self.changed_cell(cell_key);
+        }
     }
 
-    /// Forgets every offer expired at `now_ms`, and the addresses no longer trusted or shunned.
-    fn expire(&mut self, now_ms: u64) {
+    /// What `cell`'s held offers answer may have changed.
+    fn changed_cell(&mut self, cell_key: u64) {
+        self.version += 1;
+        self.changed.insert(cell_key);
+    }
+
+    /// The tiers may have moved: every cell holding more offers than it answers with may answer
+    /// with others now (`ranked_offers` keeps the top `OFFERS_PER_CELL` by tier), and the MLAT
+    /// choice ranks by tier first.
+    fn tiers_moved(&mut self) {
+        self.version += 1;
+        let crowded: Vec<u64> = self
+            .cells
+            .iter()
+            .filter(|(_, offers)| offers.len() > OFFERS_PER_CELL)
+            .map(|(cell, _)| *cell)
+            .collect();
+        self.changed.extend(crowded);
+    }
+
+    /// Weighs the tiers of the minute `now_ms` falls in, once a minute, for readers that follow the
+    /// version: a tier that moved since the last minute moves it; tiers that stood still do not.
+    fn roll_tiers(&mut self, now_ms: u64) {
+        let at = now_ms - now_ms % WEIGHED_EVERY_MS;
+        if at == self.rolled_at {
+            return;
+        }
+        self.rolled_at = at;
+        let keys: Vec<PublicKey> = self.evidence.keys().copied().collect();
+        let mut tiers: Vec<(PublicKey, u32)> = keys
+            .into_iter()
+            .map(|key| (key, self.tier(&key, now_ms)))
+            .filter(|(_, tier)| *tier > 0)
+            .collect();
+        tiers.sort();
+        if tiers != self.rolled {
+            self.rolled = tiers;
+            self.tiers_moved();
+        }
+    }
+
+    /// Forgets every offer expired at `now_ms`: nothing to do, and no scan, until the soonest
+    /// expiry held is due.
+    fn expire_offers(&mut self, now_ms: u64) {
+        if self
+            .expiries
+            .first_key_value()
+            .is_none_or(|(at, _)| *at > now_ms)
+        {
+            return;
+        }
         let expired: Vec<(u64, PublicKey)> = self
             .cells
             .iter()
@@ -1054,8 +1318,13 @@ impl State {
             })
             .collect();
         for (cell, key) in expired {
-            self.remove(cell, &key);
+            self.remove(cell, &key, false);
         }
+    }
+
+    /// Forgets every offer expired at `now_ms`, and the addresses no longer trusted or shunned.
+    fn expire(&mut self, now_ms: u64) {
+        self.expire_offers(now_ms);
         // Evidence is held for the relays whose offers are held, and for one whose offer has not
         // come for a while (its handshake under way) until its offer would have.
         let own = self.own;
@@ -1113,7 +1382,7 @@ impl State {
             .map(|(cell, _)| *cell)
             .collect();
         for cell in withdrawn {
-            self.remove(cell, &own);
+            self.remove(cell, &own, false);
         }
         self.own_signed_ms = now_ms;
         self.own_basis.clone_from(&basis);
@@ -1661,9 +1930,11 @@ mod tests {
             1,
         )
         .map_err(text)?;
-        let cells = rendezvous::areas_of(state).map_err(text)?;
+        let continent = state.ancestor(0).ok_or("no base cell")?;
+        let cells = rendezvous::areas_of(continent).map_err(text)?;
+        assert!(cells.len() > OFFERS_PER_KEY);
         let mut held = 0;
-        for (index, cell) in cells.iter().cycle().take(100).enumerate() {
+        for (index, cell) in cells.iter().cycle().take(400).enumerate() {
             let content = content("busy.example:1", *cell, NOW + index as u64);
             if directory.hold_verified(sign(&busy, &content)?, v4(12, (index % 200) as u8), NOW)? {
                 held += 1;

@@ -34,8 +34,8 @@ use tally_relay::mlat_host::{HostedMlat, MlatHost, MlatReport, SETTLE_MS};
 use tally_wire::noise;
 use tally_wire::rendezvous::AREA_RESOLUTION;
 use tally_wire::{
-    Assembler, Identity, Location, Positions, PublicKey, Reader, Record, Region, RelayAddress,
-    Role, Streams,
+    Assembler, Identity, Location, Positions, PublicKey, Reader, Record, Region, Regions,
+    RelayAddress, Role, Streams,
 };
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
@@ -106,12 +106,12 @@ impl TestClock {
 /// until the test opens it.
 struct Pinned {
     host: HostedMlat,
-    areas: Vec<Region>,
+    areas: Regions,
     open: AtomicBool,
 }
 
 impl MlatHost for Pinned {
-    fn set_areas(&self, _chosen: Vec<Region>, descriptions: Vec<tally_wire::ReceiverInfo>) {
+    fn set_areas(&self, _chosen: Regions, descriptions: Vec<tally_wire::ReceiverInfo>) {
         self.host.set_areas(self.areas.clone(), descriptions);
     }
 
@@ -235,13 +235,14 @@ fn pinned(identity: &Identity) -> Result<Arc<Pinned>> {
         identity.clone(),
         7,
         Settings {
-            regions: Vec::new(),
+            regions: Regions::default(),
             settle_ms: SETTLE_MS,
             threads: 4,
             capacity: tally_mlat::engine::Capacity::default(),
         },
     )?;
     // Solving from the first offer on: the relay's own network task re-states it every tick.
+    let areas = Regions::new(areas);
     host.set_areas(areas.clone(), Vec::new());
     Ok(Arc::new(Pinned {
         host,
@@ -688,7 +689,7 @@ struct Gated {
 }
 
 impl MlatHost for Gated {
-    fn set_areas(&self, chosen: Vec<Region>, descriptions: Vec<tally_wire::ReceiverInfo>) {
+    fn set_areas(&self, chosen: Regions, descriptions: Vec<tally_wire::ReceiverInfo>) {
         self.host.set_areas(chosen, descriptions);
     }
 
@@ -765,7 +766,7 @@ async fn member(
             identity.clone(),
             u64::from(asn),
             Settings {
-                regions: Vec::new(),
+                regions: Regions::default(),
                 settle_ms: SETTLE_MS,
                 threads: 2,
                 capacity: tally_mlat::engine::Capacity::default(),
@@ -940,7 +941,7 @@ async fn three_relays_share_solve_and_serve_verifiable_positions_and_both_world_
             let ready = members.iter().all(|m| {
                 let network = m.hub.network();
                 let now = tally_relay::network::wall_ms();
-                network.selection.mlat_areas(&network.directory, now).len() == areas.len()
+                network.selection.mlat_areas(&network.directory, now) == Regions::new(areas.clone())
                     && network.selection.raw_sources(&network.directory, now).len() >= 2
                     && network.peers.counts().1 >= 2
                     && keys
@@ -1270,7 +1271,7 @@ async fn three_relays_share_solve_and_serve_verifiable_positions_and_both_world_
 }
 
 /// Every relay's MLAT choice for each area, as it computes it: (relay, areas it solves).
-fn choices(members: &[Member]) -> Vec<(PublicKey, Vec<Region>)> {
+fn choices(members: &[Member]) -> Vec<(PublicKey, Regions)> {
     let now = tally_relay::network::wall_ms();
     members
         .iter()
@@ -1285,10 +1286,10 @@ fn choices(members: &[Member]) -> Vec<(PublicKey, Vec<Region>)> {
 }
 
 /// The relays solving `area`, by their own choice.
-fn solving(choices: &[(PublicKey, Vec<Region>)], area: Region) -> BTreeSet<PublicKey> {
+fn solving(choices: &[(PublicKey, Regions)], area: Region) -> BTreeSet<PublicKey> {
     choices
         .iter()
-        .filter(|(_, areas)| areas.contains(&area))
+        .filter(|(_, areas)| areas.contains(area))
         .map(|(key, _)| *key)
         .collect()
 }
@@ -1463,7 +1464,7 @@ async fn of_four_relays_three_solve_an_area_and_a_dead_one_is_replaced_by_the_ne
             .network()
             .selection
             .mlat_areas(&unchosen.hub.network().directory, wall_ms())
-            .contains(&area)
+            .contains(area)
     );
 
     // One chosen relay dies outright: not the first, whose directory link the others joined by,

@@ -26,7 +26,7 @@ use std::time::Duration;
 
 use tally_wire::{
     Batch, ClockModel, ClockModelPart, Decoded, Identity, Positions, PublicKey, ReceiverInfo,
-    Record, Region, RelayAddress,
+    Record, Region, Regions, RelayAddress,
 };
 
 use crate::admission::Admission;
@@ -98,8 +98,8 @@ pub struct Network {
     pub standing: Standing,
     pub peers: Peers,
     mlat: OnceLock<Arc<dyn MlatHost>>,
-    /// The areas last handed the hosted MLAT.
-    mlat_areas: Mutex<Vec<Region>>,
+    /// The areas last handed the hosted MLAT, and the generation of the choice they came from.
+    mlat_areas: Mutex<(u64, Regions)>,
     corroborated_ms: AtomicU64,
     /// Recent clock models, oldest first.
     models: Mutex<std::collections::VecDeque<HeldModel>>,
@@ -131,7 +131,7 @@ impl Network {
             standing: Standing::new(),
             peers: Peers::new(),
             mlat: OnceLock::new(),
-            mlat_areas: Mutex::new(Vec::new()),
+            mlat_areas: Mutex::new((0, Regions::default())),
             corroborated_ms: AtomicU64::new(0),
             models: Mutex::new(std::collections::VecDeque::new()),
             shared_in: AtomicU64::new(0),
@@ -467,13 +467,19 @@ impl Network {
             }
         }
         if let Some(mlat) = self.mlat() {
-            let areas = self.selection.mlat_areas(&self.directory, now_ms);
+            // The choice is recomputed only when what it follows moved (`Selection::solved`), and
+            // handed on only when it came out different.
+            let (generation, areas) = self.selection.solved(&self.directory, now_ms);
             let changed = self
                 .mlat_areas
                 .lock()
                 .map(|mut held| {
-                    let changed = *held != areas;
-                    held.clone_from(&areas);
+                    if held.0 == generation {
+                        return false;
+                    }
+                    held.0 = generation;
+                    let changed = held.1 != areas;
+                    held.1 = areas.clone();
                     changed
                 })
                 .unwrap_or(false);
@@ -641,7 +647,7 @@ mod tests {
                     let routed = tile_point(&tile.bytes()).ok_or("no point")?;
                     let area = area_of_cell(routed).ok_or("no area")?;
                     assert!(
-                        tally_mlat::window::owns(&[area], tile),
+                        tally_mlat::window::owns(&Regions::new([area]), tile),
                         "{tile:?} routed to {area:?}, which does not fit it"
                     );
                     checked += 1;

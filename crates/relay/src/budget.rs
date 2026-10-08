@@ -16,9 +16,12 @@
 //! [`Gauge::charge`]) for what it holds and is released when it lets go ([`Charge`] dropped). A
 //! gauge's limit is that store's share at the ceiling (`per feeder x ceiling`), so the stores
 //! together never hold more than the relay's memory, whatever arrives and however slow a stage is.
-//! What a full gauge does is the store's policy (RFC-0178 §10): raw and fan-out push back (a
+//! A charge is taken before the bytes are held, never after: there is no way to charge a gauge
+//! past its limit, so a store whose stage falls behind cannot grow past its share by holding what
+//! it already took. What a full gauge does is the store's policy (RFC-0178 §10): raw pushes back (a
 //! connection's batch waits for room, its socket unread), derived products refuse whole (an epoch,
-//! counted). The gauges are served on `--stats-listen` (`GET /memory`).
+//! counted), the fan-out lets its laggard go, and hosted MLAT sheds whole steps it is behind on
+//! (`mlat_host`). The gauges are served on `--stats-listen` (`GET /memory`).
 //!
 //! The per-feeder costs are planning figures at the rate the RFC sizes a feeder to
 //! ([`PLANNED_RECEPTIONS_PER_SEC`], [`PLANNED_BYTES_PER_SEC`]) times each store's own window,
@@ -36,11 +39,19 @@ use tokio::sync::Notify;
 pub enum Store {
     /// The one batch byte store, over the sharing repair horizon.
     Batches,
-    /// MLAT's raw (`Held`), shared by the engine and standing.
+    /// MLAT's sealed raw (`Held`'s sealed bins), shared by the engine and standing.
     Held,
+    /// MLAT's open raw: the bins not yet sealed, in the raw shards and on their way to sealing,
+    /// over a bin, its settling and the steps MLAT may fall behind (`mlat_host::STEPS_BEHIND`).
+    Open,
     /// What batches told hosted MLAT's provisional solving and its step has not yet weighed: the
-    /// decoded batches the notes keep alive, and the notes (`mlat_host::NOTES_PER_RECEIVER_STEP`).
+    /// decoded batches the notes keep alive, and the notes (`mlat_host::NOTES_PER_RECEIVER_STEP`),
+    /// over the step intervals MLAT may fall behind; and the batches of receivers not yet described.
     Notes,
+    /// The hosted engine's own tables that grow with its receivers: the receptions waiting for
+    /// provisional solving (`tally_mlat::engine::Capacity::waiting`) and a window step's working
+    /// set while it runs (`mlat_host::SOLVE_BYTES_PER_RECEIVER`).
+    Engine,
     /// The message exchange's generations of fingerprints (`exchange::DEDUP_GENERATIONS`).
     Dedup,
     /// Subscriber queues' share of one feeder's inbound.
@@ -60,10 +71,12 @@ pub enum Store {
 }
 
 impl Store {
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 12] = [
         Self::Batches,
         Self::Held,
+        Self::Open,
         Self::Notes,
+        Self::Engine,
         Self::Dedup,
         Self::Fanout,
         Self::Delivery,
@@ -83,7 +96,9 @@ impl Store {
 pub struct PerFeeder {
     pub batches: usize,
     pub held: usize,
+    pub open: usize,
     pub notes: usize,
+    pub engine: usize,
     pub dedup: usize,
     pub fanout: usize,
     pub delivery: usize,
@@ -98,7 +113,9 @@ impl PerFeeder {
         match store {
             Store::Batches => self.batches,
             Store::Held => self.held,
+            Store::Open => self.open,
             Store::Notes => self.notes,
+            Store::Engine => self.engine,
             Store::Dedup => self.dedup,
             Store::Fanout => self.fanout,
             Store::Delivery => self.delivery,
@@ -117,7 +134,8 @@ impl PerFeeder {
     }
 
     /// What one feeder at the planned rate costs each store over that store's window. `holds_raw`:
-    /// whether this relay holds MLAT raw (`Held`) at all, which it does only when it hosts MLAT.
+    /// whether this relay holds MLAT raw (`Held`, `Open`) at all, which it does only when it hosts
+    /// MLAT.
     pub fn planned(holds_raw: bool) -> Self {
         let receptions = PLANNED_RECEPTIONS_PER_SEC;
         let bytes = PLANNED_BYTES_PER_SEC;
@@ -127,24 +145,44 @@ impl PerFeeder {
         Self {
             // The one batch byte store, over the sharing repair horizon.
             batches: bytes * crate::sharing::member::HORIZON_SECONDS as usize,
-            // MLAT's raw (`Held`): its open bins over a bin and the engine's settling, and the
-            // sealed bins a holder keeps, at the rates measured (`held::Rates::MEASURED`).
+            // MLAT's sealed raw (`Held`): the sealed bins a holder keeps, at the rates measured
+            // (`held::Rates::MEASURED`).
             held: if holds_raw {
                 tally_mlat_solver::held::Rates::MEASURED
                     .cost(crate::mlat_host::SETTLE_MS)
-                    .total()
+                    .sealed
+            } else {
+                0
+            },
+            // MLAT's open raw (`Open`): a receiver's bins open over a bin, the engine's settling
+            // and the steps it may fall behind before the oldest is shed
+            // (`mlat_host::OPEN_MS`), at its ceiling.
+            open: if holds_raw {
+                tally_mlat_solver::held::Rates::MEASURED
+                    .cost(crate::mlat_host::OPEN_MS)
+                    .open
             } else {
                 0
             },
             // Provisional solving's notes, where MLAT is hosted: a batch told is held (its decode
-            // kept alive, and its notes) until the step after its stamp's interval weighs it, so
-            // two step intervals of decoded batches, and the notes a step admits a seat
+            // kept alive, and its notes) until the step after its stamp's interval weighs it, and
+            // the steps MLAT may fall behind wait with theirs, so `mlat_host::INTERVALS_HELD` step
+            // intervals of decoded batches, and the notes a step admits a seat
             // (`mlat_host::NOTES_PER_RECEIVER_STEP`) for each.
             notes: if holds_raw {
                 let step = crate::mlat_host::STEP_MS as usize;
-                2 * (decoded * step / 1_000
-                    + crate::mlat_host::NOTES_PER_RECEIVER_STEP
-                        * std::mem::size_of::<tally_mlat::provisional::Note>())
+                crate::mlat_host::INTERVALS_HELD
+                    * (decoded * step / 1_000
+                        + crate::mlat_host::NOTES_PER_RECEIVER_STEP
+                            * std::mem::size_of::<tally_mlat::provisional::Note>())
+            } else {
+                0
+            },
+            // The engine's own tables (`Engine`): the receptions a seat may have waiting for
+            // provisional solving, and its share of a window step's working set.
+            engine: if holds_raw {
+                tally_mlat::engine::WAITING_PER_RECEIVER * tally_mlat::provisional::WAITING_BYTES
+                    + crate::mlat_host::SOLVE_BYTES_PER_RECEIVER
             } else {
                 0
             },
@@ -201,12 +239,12 @@ const PRODUCT_BYTES_PER_RECEPTION: usize = 2 * (tally_wire::decoded::OBSERVATION
 pub const BASE_BYTES: usize =
     (256 << 20) + tally_wire::noise::POOL_IDLE * tally_wire::noise::MAX_MESSAGE;
 /// What hosting MLAT adds to the relay's own base, whatever its feeders: the engine's thread, its
-/// pool and its empty tables (its raw is `Held`'s and its notes `Notes`', per feeder). Measured
-/// (RFC-0178, "Sizing", 2026-10-08): a relay hosting MLAT on two areas, before any feeder, was
-/// 19.8 MiB resident where the same relay without it was 17.3 MiB; the loaded runs, fitted to a
-/// base and a slope, put the base no higher (their intercept is below zero: what MLAT holds grows
-/// faster than linearly with feeders, see the RFC). 2.5 MiB measured, held at 4 MiB.
-pub const MLAT_BASE_BYTES: usize = 4 << 20;
+/// pool and its empty tables (its raw is `Held`'s and `Open`'s, its notes `Notes`', its waiting
+/// receptions and working set `Engine`'s, per feeder), and the signed records not yet taken
+/// (`mlat_host::PUBLISHED_BYTES`). Measured (RFC-0178, "Sizing", 2026-10-08): a relay hosting MLAT
+/// on two areas, before any feeder, was 19.8 MiB resident where the same relay without it was
+/// 17.3 MiB. 2.5 MiB measured, held at 4 MiB, and the records' bound beside it.
+pub const MLAT_BASE_BYTES: usize = (4 << 20) + crate::mlat_host::PUBLISHED_BYTES;
 
 /// What a relay plans to hold: its own base, and each feeder's cost in every store. Both follow
 /// one switch, whether the relay hosts MLAT, so the base and the reservation cannot disagree.
@@ -348,17 +386,6 @@ impl Gauge {
         }
     }
 
-    /// `bytes` charged whatever the limit: for bytes already allocated, which the store will let go
-    /// by its own rule (the fan-out lets its laggard go, `fanout::Router::publish`).
-    pub fn force(self: &Arc<Self>, bytes: usize) -> Charge {
-        let held = self.held.fetch_add(bytes, Ordering::AcqRel);
-        self.peak.fetch_max(held + bytes, Ordering::Relaxed);
-        Charge {
-            gauge: Some(Arc::clone(self)),
-            bytes,
-        }
-    }
-
     /// Whether `bytes` more would fit now.
     pub fn fits(&self, bytes: usize) -> bool {
         self.held().saturating_add(bytes) <= self.limit()
@@ -451,6 +478,18 @@ impl Charge {
                 true
             }
             None => false,
+        }
+    }
+
+    /// `bytes` of this charge (all of it, if it holds less) moved into a charge of their own on the
+    /// same gauge, nothing taken or released: what a store hands on with the thing it holds (open
+    /// raw handed to its seal).
+    pub fn split(&mut self, bytes: usize) -> Charge {
+        let bytes = bytes.min(self.bytes);
+        self.bytes -= bytes;
+        Charge {
+            gauge: self.gauge.clone(),
+            bytes,
         }
     }
 
@@ -689,12 +728,15 @@ mod tests {
     fn the_planned_feeder_reserves_every_store_and_raw_only_where_held() {
         let without = PerFeeder::planned(false);
         let with = PerFeeder::planned(true);
-        assert_eq!(without.held, 0);
-        assert_eq!(without.notes, 0);
-        assert!(with.held > 0);
-        assert!(with.notes > 0);
+        for store in [Store::Held, Store::Open, Store::Notes, Store::Engine] {
+            assert_eq!(without.of(store), 0, "{store:?}");
+            assert!(with.of(store) > 0, "{store:?}");
+        }
         for store in Store::ALL {
-            if !matches!(store, Store::Held | Store::Notes | Store::Buffers) {
+            if !matches!(
+                store,
+                Store::Held | Store::Open | Store::Notes | Store::Engine | Store::Buffers
+            ) {
                 assert!(without.of(store) > 0, "{store:?}");
             }
         }
@@ -779,6 +821,28 @@ mod tests {
         assert!(gauge.try_charge(500).is_none());
         drop(grown);
         assert!(gauge.try_charge(500).is_some());
+        assert_eq!(gauge.held(), 0);
+    }
+
+    /// A charge handed on with what it holds moves its bytes, taking and releasing nothing, and
+    /// no charge ever takes a gauge past its limit.
+    #[test]
+    fn a_charge_split_moves_its_bytes_and_none_passes_the_limit() {
+        let gauge = Gauge::new(Store::Open, 100);
+        let mut held = gauge.empty();
+        assert!(held.try_grow(70));
+        let handed = held.split(30);
+        assert_eq!((held.bytes(), handed.bytes(), gauge.held()), (40, 30, 70));
+        // More than it holds moves all of it.
+        let mut rest = held.split(1_000);
+        assert_eq!((held.bytes(), rest.bytes(), gauge.held()), (0, 40, 70));
+        drop(handed);
+        assert_eq!(gauge.held(), 40);
+        assert!(!rest.try_grow(61));
+        assert!(rest.try_grow(60));
+        assert!(gauge.try_charge(1).is_none());
+        assert_eq!(gauge.peak(), 100);
+        drop(rest);
         assert_eq!(gauge.held(), 0);
     }
 

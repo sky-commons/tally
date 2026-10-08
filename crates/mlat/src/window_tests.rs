@@ -6,7 +6,7 @@ use crate::engine::{Engine, Settings};
 use std::collections::{BTreeMap, BTreeSet};
 use tally_mlat_solver::scope::{AFTER, GRID_MS, STRIDE, bin_of};
 use tally_mlat_solver::sim::{self, Rng, Scenario, Simulation};
-use tally_wire::{EnuCovariance, ObservationSet, Reception as WireReception, TransmitTime};
+use tally_wire::{EnuCovariance, ObservationSet, Reception as WireReception, Region, TransmitTime};
 
 fn text(error: impl std::fmt::Display) -> String {
     error.to_string()
@@ -19,7 +19,7 @@ fn engine(seed: u8, regions: Vec<Region>, threads: usize) -> Engine {
         Identity::from_seed([seed; 32]),
         0xb007,
         Settings {
-            regions,
+            regions: regions.into_iter().collect(),
             settle_ms: SETTLE_MS,
             threads,
             capacity: crate::engine::Capacity::default(),

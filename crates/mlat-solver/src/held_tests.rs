@@ -467,3 +467,69 @@ fn raw_stamped_after_its_bins_step_is_late_whether_it_raced_ahead_or_not() -> Re
     assert_eq!(open.add_decoded(&after).new, 2);
     Ok(())
 }
+
+/// An owner charged for its open raw as it grows (a relay's raw shards) is asked for every byte
+/// before it is allocated: whatever arrives, the bins never hold more than was granted, and a byte
+/// refused refuses the batch's raw (its receiver's whole once it holds some in the bin), counted.
+#[test]
+fn open_raw_asks_for_every_byte_before_it_holds_it() -> Result<(), String> {
+    let receivers: Vec<Identity> = (0..40u8).map(|n| Identity::from_seed([n; 32])).collect();
+    let mut open = Open::new(Limits::UNBOUNDED);
+    let mut granted = 0usize;
+    let mut sequence = 0;
+    for round in 0..30u64 {
+        for (n, receiver) in receivers.iter().enumerate() {
+            let wall_ms = round * 700 + n as u64;
+            let count = 1 + (round * 7 + n as u64) % 90;
+            let batch = stamped(
+                receiver,
+                sequence,
+                content(wall_ms, &replies(count, wall_ms)),
+                0,
+            )?;
+            sequence += 1;
+            let added = open.add_decoded_taking(&batch, &mut |bytes| {
+                granted += bytes;
+                true
+            });
+            assert_eq!(added.new as u64, count);
+            assert!(open.bytes() <= granted, "{} > {granted}", open.bytes());
+            // What was granted and not allocated is given back, as an owner shrinks its charge.
+            granted = open.bytes();
+        }
+        if round % 5 == 4 {
+            // Receivers forgotten leave their places in the bins' indexes marked.
+            for receiver in receivers.iter().skip(round as usize % 3).step_by(3) {
+                open.forget_receiver(&receiver.public());
+            }
+            granted = open.bytes();
+        }
+    }
+    // Refused: nothing more is held, and the batch's raw is counted refused.
+    let before = open.bytes();
+    let batch = stamped(&receivers[0], sequence, content(30_000, &replies(50, 0)), 0)?;
+    let added = open.add_decoded_taking(&batch, &mut |_| false);
+    assert_eq!((added.new, added.refused), (0, 50));
+    assert_eq!(open.bytes(), before);
+    // Refused part way through a receiver's bin: its raw of the bin is refused whole.
+    let mut grants = 3;
+    let big = stamped(
+        &receivers[1],
+        sequence + 1,
+        content(31_000, &replies(400, 0)),
+        0,
+    )?;
+    let added = open.add_decoded_taking(&big, &mut |_| {
+        grants -= 1;
+        grants >= 0
+    });
+    assert_eq!((added.new, added.refused), (0, 400));
+    let after = stamped(
+        &receivers[1],
+        sequence + 2,
+        content(31_500, &replies(1, 900)),
+        0,
+    )?;
+    assert_eq!(open.add_decoded_taking(&after, &mut |_| true).refused, 1);
+    Ok(())
+}

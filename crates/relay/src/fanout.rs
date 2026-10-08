@@ -383,10 +383,16 @@ impl Router {
             return;
         }
         let bytes = item_bytes(&item);
-        // Room in the budget, made by letting go whoever holds most, as many as it takes.
-        for _ in 0..index.entries.len() {
-            if self.gauge.fits(bytes) {
-                break;
+        // Room in the budget, made by letting go whoever holds most, as many as it takes. Charged
+        // once whatever holds it, before any queue holds it; released when the last queue lets it
+        // go.
+        let mut charge = None;
+        for _ in 0..=index.entries.len() {
+            if self.gauge.fits(bytes) || self.gauge.held() == 0 {
+                charge = self.gauge.try_charge(bytes);
+                if charge.is_some() {
+                    break;
+                }
             }
             let Some((_, laggard)) = index
                 .entries
@@ -399,8 +405,15 @@ impl Router {
             };
             laggard.let_go();
         }
-        // Charged once whatever holds it; released when the last queue lets it go.
-        let charge = Arc::new(self.gauge.force(bytes));
+        // No room even with every queue let go (another publisher took it meanwhile): the item is
+        // held by none, and those it was for fall behind, as a full queue does.
+        let Some(charge) = charge else {
+            for at in takers {
+                index.entries[at].subscriber.let_go();
+            }
+            return;
+        };
+        let charge = Arc::new(charge);
         for at in takers {
             index.entries[at].subscriber.offer(&item, &charge, bytes);
         }
