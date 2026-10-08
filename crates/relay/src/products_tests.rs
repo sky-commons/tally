@@ -1157,20 +1157,29 @@ fn every_drop_is_counted_by_why() -> Result<()> {
 }
 
 /// RFC-0181 §10 and invariant 1 for the records that are not epochs: they wait in a queue of their
-/// own, so a peer flooding them is refused (counted) and never costs this relay an epoch; and a
+/// own, held by the products' gauge alone, so a peer flooding them is refused (counted) once the
+/// gauge is full and never costs this relay an epoch; and a
 /// world candidate is in time or late by its stamp against the watermark that seals its second,
 /// never by when it was handled: two candidates handed in together, before that watermark is
 /// reached, one stamped before it and one at it, are the first in time and the second late.
 #[test]
 fn records_wait_apart_from_the_epochs_and_are_taken_in_by_stamp() -> Result<()> {
-    // The flood: more records than wait, stamped far ahead so none is taken in.
+    // The flood: more records than the products' gauge holds, stamped far ahead so none is taken
+    // in.
     let products = Arc::new(Products::with_boot(1, 1));
     products.on_thread(1, None)?;
     let mlat = Mlat::new()?;
     let flood = mlat.solutions(&[0x00c0_0001], BASE_MS, 0, true, 1)?;
-    for _ in 0..super::RECORDS_HELD + 10 {
+    const HELD: usize = 1_000;
+    let gauge = crate::budget::Gauge::new(
+        crate::budget::Store::Products,
+        HELD * flood.as_bytes().len(),
+    );
+    products.charge_to(Arc::clone(&gauge));
+    for _ in 0..HELD + 10 {
         products.positions(&flood, BASE_MS + 1_000_000);
     }
+    assert_eq!(gauge.held(), HELD * flood.as_bytes().len());
     let sink = products.sink();
     for closed_before in 1..=100 {
         let marker = crate::exchange::Frozen {

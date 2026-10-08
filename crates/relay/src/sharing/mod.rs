@@ -55,6 +55,7 @@ use tally_wire::{
     Record, Region, Streams, StripeAssignment, StripeReceipt,
 };
 
+use crate::budget::{Charge, Gauge, Store};
 use crate::egress::{Class, EgressReport};
 use crate::hub::Hub;
 use crate::network::{Asker, AskerRole};
@@ -85,16 +86,12 @@ pub const SHARED_PRODUCTS: [Streams; 5] = [
 
 /// The most addressed sends held for the links before the oldest are dropped.
 pub const OUTBOX_MAX: usize = 65_536;
-/// Parities being reassembled from their chunks at once, at most, and bytes in all.
-pub const PARITIES_ASSEMBLING: usize = 256;
-pub const PARITY_BYTES_ASSEMBLING: usize = 64 << 20;
 /// How long a parity may take to arrive whole from its first chunk: its chunks are sent together,
 /// so one still missing a piece after this never will be.
 pub const PARITY_ASSEMBLY_MS: u64 = 10 * 1000;
 /// How long after a second ends a bundle index over it is signed: its manifests are in by then.
 pub const BUNDLE_INDEX_AFTER_SECONDS: u64 = 3;
 
-#[derive(Default)]
 pub struct Sharing {
     pub groups: groups::Groups,
     pub bundles: bundles::Bundles,
@@ -106,8 +103,10 @@ pub struct Sharing {
     indexed_through: Mutex<Option<u64>>,
     /// The regions this relay has withdrawn from forwarding in.
     withdrawal: Mutex<Withdrawal>,
-    /// The member's capacity, once the relay set one.
-    capacity: Mutex<Option<usize>>,
+    /// The one batch byte store's gauge (`budget::Store::Batches`): what the member's groups hold
+    /// (records and parities) and the parities being reassembled are charged to it, and it is
+    /// their only bound. Unlimited until the relay charges sharing to its budget (`charge_to`).
+    gauge: Mutex<Arc<Gauge>>,
     /// What the trees were last laid out from: the regions taken, the regions withdrawn, the key.
     view: Mutex<View>,
     /// Areas to lay out again at the next tick (a demotion the trees now leave out).
@@ -142,6 +141,8 @@ struct Assembling {
     /// The first chunk, without its bytes: what every later chunk must agree with.
     first: ParityChunk,
     bytes: Vec<u8>,
+    /// Its bytes and its own size, charged to the store's gauge while it is reassembled.
+    _charge: Charge,
     /// The byte ranges written, disjoint and merged (start to end), and how many bytes they cover.
     covered: BTreeMap<usize, usize>,
     filled: usize,
@@ -200,6 +201,24 @@ pub fn forwarders_shed(report: &EgressReport) -> u64 {
         .filter(|class| !matches!(class.class, Class::Control | Class::Taker))
         .map(|class| class.shed)
         .sum()
+}
+
+impl Default for Sharing {
+    fn default() -> Self {
+        Self {
+            groups: groups::Groups::default(),
+            bundles: bundles::Bundles::default(),
+            member: Mutex::default(),
+            outbox: Mutex::default(),
+            assembling: Mutex::default(),
+            indexed_through: Mutex::default(),
+            withdrawal: Mutex::default(),
+            gauge: Mutex::new(Gauge::unlimited(Store::Batches)),
+            view: Mutex::default(),
+            relayout: Mutex::default(),
+            laid_out: AtomicU64::new(0),
+        }
+    }
 }
 
 impl Sharing {
@@ -303,24 +322,32 @@ impl Sharing {
             let Ok(total) = usize::try_from(chunk.total) else {
                 return Vec::new();
             };
-            let held_bytes: usize = assembling.values().map(|held| held.bytes.len()).sum();
-            if !assembling.contains_key(&key)
-                && (assembling.len() >= PARITIES_ASSEMBLING
-                    || held_bytes.saturating_add(total) > PARITY_BYTES_ASSEMBLING
-                    || chunk.second.saturating_add(HORIZON_SECONDS) < now_ms / 1000)
-            {
-                return Vec::new();
-            }
-            let held = assembling.entry(key).or_insert_with(|| Assembling {
-                bytes: vec![0; total],
-                covered: BTreeMap::new(),
-                filled: 0,
-                started_ms: now_ms,
-                first: ParityChunk {
-                    bytes: Vec::new(),
-                    ..chunk.clone()
-                },
-            });
+            let held = match assembling.entry(key) {
+                std::collections::hash_map::Entry::Occupied(held) => held.into_mut(),
+                std::collections::hash_map::Entry::Vacant(vacant) => {
+                    if chunk.second.saturating_add(HORIZON_SECONDS) < now_ms / 1000 {
+                        return Vec::new();
+                    }
+                    // Charged before it is held: past the store's share it is refused whole.
+                    let gauge = Arc::clone(&lock(&self.gauge));
+                    let Some(charge) =
+                        gauge.try_charge(total.saturating_add(std::mem::size_of::<Assembling>()))
+                    else {
+                        return Vec::new();
+                    };
+                    vacant.insert(Assembling {
+                        bytes: vec![0; total],
+                        _charge: charge,
+                        covered: BTreeMap::new(),
+                        filled: 0,
+                        started_ms: now_ms,
+                        first: ParityChunk {
+                            bytes: Vec::new(),
+                            ..chunk.clone()
+                        },
+                    })
+                }
+            };
             let Ok(start) = usize::try_from(chunk.offset) else {
                 return Vec::new();
             };
@@ -332,40 +359,58 @@ impl Sharing {
             }
             assembling.remove(&key)
         };
-        let Some(whole) = whole else {
+        let Some(Assembling {
+            first,
+            bytes: xor,
+            _charge: assembled,
+            ..
+        }) = whole
+        else {
             return Vec::new();
         };
+        // Whole: its charge ends here, and the parity is charged again where it is held.
+        drop(assembled);
         let mut lens = [0u32; stripes::DATA_STRIPES as usize];
-        if whole.first.lens.len() != lens.len() {
+        if first.lens.len() != lens.len() {
             return Vec::new();
         }
-        lens.copy_from_slice(&whole.first.lens);
+        lens.copy_from_slice(&first.lens);
         let parity = parity::Parity {
-            manifest: whole.first.manifest,
-            cell: whole.first.cell,
-            product: whole.first.product,
-            second: whole.first.second,
+            manifest: first.manifest,
+            cell: first.cell,
+            product: first.product,
+            second: first.second,
             lens,
-            xor: whole.bytes,
+            xor,
         };
         self.drive(asker, Message::Parity(Arc::new(parity)), now_ms)
     }
 
-    /// The most record bytes this relay's groups hold over the horizon:
-    /// `member::held_bytes_for` the inflow the relay admits. A record past it is refused whole
-    /// and counted (`member::Stats::refused`).
-    pub fn set_held_capacity(&self, bytes: usize) {
-        *lock(&self.capacity) = Some(bytes);
+    /// What this relay's groups hold (records and parities) and the parities being reassembled
+    /// are charged to `gauge` (the budget's `Store::Batches`) from now on: its limit, the store's
+    /// share of the budget, is the store's only bound. A record or parity past it is refused whole
+    /// and counted (`member::Stats::refused`, and the gauge's own count).
+    pub fn charge_to(&self, gauge: Arc<Gauge>) {
+        *lock(&self.gauge) = Arc::clone(&gauge);
         if let Some(member) = lock(&self.member).as_mut() {
-            member.set_capacity(bytes);
+            member.charge_to(gauge);
         }
     }
 
-    /// Record bytes the groups hold now, and records refused for room since start.
+    /// Bytes the groups hold now (records and parities, what the gauge is charged for them), and
+    /// what they refused for room since start.
     pub fn held(&self) -> (usize, u64) {
-        lock(&self.member).as_ref().map_or((0, 0), |member| {
-            (member.held_bytes(), member.stats().refused)
-        })
+        // The store's own count, kept apart from its charge: what each group holds, and every
+        // parity being reassembled, so `/memory` sets it beside the gauge.
+        let assembling: usize = lock(&self.assembling)
+            .values()
+            .map(|held| held.bytes.len() + std::mem::size_of::<Assembling>())
+            .sum();
+        lock(&self.member)
+            .as_ref()
+            .map_or((assembling, 0), |member| {
+                (member.group_bytes() + assembling, member.stats().refused)
+            })
     }
 
     /// The addressed sends waiting for their links: (member, record).
@@ -497,18 +542,15 @@ impl Sharing {
         }
         lock(&self.assembling).retain(|_, held| held.started_ms + PARITY_ASSEMBLY_MS > now_ms);
         let mut guard = lock(&self.member);
-        let capacity = *lock(&self.capacity);
-        let fresh = |identity: &Identity| {
-            let mut member = Member::new(identity.clone());
-            if let Some(bytes) = capacity {
-                member.set_capacity(bytes);
-            }
-            member
-        };
+        let gauge = Arc::clone(&lock(&self.gauge));
+        let fresh = |identity: &Identity| Member::new(identity.clone(), Arc::clone(&gauge));
         let member = guard.get_or_insert_with(|| fresh(identity));
         if member.key() != me {
             *member = fresh(identity);
         }
+        // The members that turned this relay's links away as full, while they are: routed around
+        // (`Member::route`) until their wait ends.
+        member.set_full(network.peers.full(now_ms));
         // The areas whose trees may have changed.
         let directory = &network.directory;
         let changed = directory.take_changed_cells(now_ms);

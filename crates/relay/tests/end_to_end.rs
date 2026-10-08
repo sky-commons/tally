@@ -604,16 +604,21 @@ async fn two_receivers_hearing_one_message_are_one_copy_in_the_relays_signed_str
     let after = frames(2)?[1].message().to_vec();
     let mut feeds = Vec::new();
     let mut receivers = HashSet::new();
+    // Everything the subscriber is sent from here on: an epoch may seal (and its signed batch
+    // arrive) while the raw copies are still being read.
+    let mut heard = Vec::new();
     for (counter, data) in [(10, &message), (20, &message), (30, &after)] {
         if data == &after {
             // Both copies through the relay before the later message is sent.
-            until(&mut subscriber, "both copies raw", |record| {
-                if let (Record::Batch(_), Some(key)) = (record, author(record)) {
-                    receivers.insert(key);
-                }
-                receivers.len() == 2
-            })
-            .await?;
+            heard.extend(
+                until(&mut subscriber, "both copies raw", |record| {
+                    if let (Record::Batch(_), Some(key)) = (record, author(record)) {
+                        receivers.insert(key);
+                    }
+                    receivers.len() == 2
+                })
+                .await?,
+            );
         }
         let receiver = Identity::generate().map_err(text)?;
         let mut feed = connect(&relay, &receiver, Role::Feeder).await?;
@@ -664,17 +669,19 @@ async fn two_receivers_hearing_one_message_are_one_copy_in_the_relays_signed_str
         }
         Ok((copies, signed))
     };
-    let heard = until(
-        &mut subscriber,
-        "the later message, deduplicated",
-        |record| {
-            matches!(record, Record::RelayBatch(batch)
-            if batch.content().is_ok_and(|content| {
-                content.observations.iter().any(|observation| observation.data == after)
-            }))
-        },
-    )
-    .await?;
+    heard.extend(
+        until(
+            &mut subscriber,
+            "the later message, deduplicated",
+            |record| {
+                matches!(record, Record::RelayBatch(batch)
+                if batch.content().is_ok_and(|content| {
+                    content.observations.iter().any(|observation| observation.data == after)
+                }))
+            },
+        )
+        .await?,
+    );
     let (total, signed) = copies(&heard, &message)?;
     assert_eq!(signed.first().map(Batch::sequence), Some(0));
     assert_eq!(total, 1);
@@ -1527,4 +1534,164 @@ async fn a_probe_and_a_delivery_query_are_answered_signed_by_the_relay() -> Resu
         ([3; 32], feeder.public())
     );
     Ok(())
+}
+
+/// A relay that takes `areas`, advertising its own address so its offers can be verified, on
+/// network `asn`, accepting `relays` on directory links.
+async fn taking(
+    identity: Identity,
+    areas: &[Region],
+    asn: u32,
+    relays: &[PublicKey],
+) -> Result<(Relay, Arc<Hub>)> {
+    let listener = TcpListener::bind("127.0.0.1:0").await.map_err(text)?;
+    let address = listener.local_addr().map_err(text)?;
+    let hub = Arc::new(
+        Hub::new(8)
+            .advertising(vec![RelayAddress {
+                key: identity.public(),
+                address: address.to_string(),
+            }])
+            .accepting_relays(relays.iter().copied())
+            .max_connections_per_address(256)
+            .taking(areas.to_vec()),
+    );
+    hub.network().admission.configure(asn, true);
+    let key = identity.public();
+    tokio::spawn(tally_relay::serve(
+        listener,
+        vec![identity],
+        Arc::clone(&hub),
+    ));
+    Ok((
+        Relay {
+            address,
+            // No BEAST output here.
+            beast_out: address,
+            key,
+        },
+        hub,
+    ))
+}
+
+/// RFC-0174 §2.5, "A relay's members are bounded": three relays take one area. The first holds
+/// every member session its plan admits, so when the third's link brings it the group's data it
+/// is turned away with `Reason::Full`. The third takes that as "this provider is full": it routes
+/// what it would have sent the full relay to the next members of the area's trees, so its
+/// feeder's batches reach the second relay and its subscriber all the same, and it does not dial
+/// the full relay again for the wait it was given (so the full relay turns it away once, never in
+/// a loop).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_relay_whose_members_are_full_is_routed_around_and_the_data_still_arrives() -> Result {
+    let place = at(33.749, -84.388);
+    let area = tally_wire::rendezvous::area_of(&place).map_err(text)?;
+    let [full, next, third] = [
+        Identity::generate().map_err(text)?,
+        Identity::generate().map_err(text)?,
+        Identity::generate().map_err(text)?,
+    ];
+    let joining = [next.public(), third.public()];
+    let (_, full_hub) = taking(full.clone(), &[area], 64_531, &joining).await?;
+    let (next_relay, next_hub) = taking(next.clone(), &[area], 64_532, &[]).await?;
+    let (third_relay, third_hub) = taking(third.clone(), &[area], 64_533, &[]).await?;
+    // The full relay's member pool, every session its plan admits, held.
+    let mut held = Vec::new();
+    while let Some(membership) = full_hub.budget().reserve_member() {
+        held.push(membership);
+    }
+    assert_eq!(held.len(), full_hub.budget().members());
+    let full_address = {
+        let advertised = full_hub.hints();
+        advertised.first().ok_or("no address")?.address.clone()
+    };
+    for (identity, hub) in [(&next, &next_hub), (&third, &third_hub)] {
+        tokio::spawn(link::upstream(
+            tally_relay::config::Upstream {
+                address: full_address.clone(),
+                key: full.public(),
+            },
+            identity.clone(),
+            Arc::clone(hub),
+        ));
+    }
+    let keys = [full.public(), next.public(), third.public()];
+    let hubs = [&full_hub, &next_hub, &third_hub];
+    tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            let found = hubs.iter().zip(keys).all(|(hub, own)| {
+                keys.iter()
+                    .filter(|key| **key != own)
+                    .all(|key| hub.network().directory.knows(key))
+            });
+            if found {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .map_err(|_| "the relays never verified one another's offers".to_owned())?;
+
+    // A feeder of the area on the third relay, and a subscriber to its raw on the second.
+    let feeder = Identity::generate().map_err(text)?;
+    let mut feed = described_feeder(&third_relay, &feeder, Some(place)).await?;
+    let mut subscriber = subscribe(&next_relay).await?;
+    let sent = 40;
+    let author = feeder.public();
+    let heard = tokio::spawn(async move {
+        let mut sequences = std::collections::BTreeSet::new();
+        let _ = until(&mut subscriber, "the third relay's batches", |record| {
+            if let Record::Batch(batch) = record
+                && batch.receiver().ok() == Some(author)
+            {
+                sequences.insert(batch.sequence());
+            }
+            sequences.len() == sent
+        })
+        .await;
+        sequences.len()
+    });
+    for sequence in 0..sent as u64 {
+        let now = tally_relay::network::wall_ms();
+        feed.writer
+            .send(&[Record::Batch(fresh_batch(&feeder, sequence, now)?)])
+            .await
+            .map_err(text)?;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let got = tokio::time::timeout(Duration::from_secs(60), heard)
+        .await
+        .map_err(|_| "the third relay's batches never all reached the second".to_owned())?
+        .map_err(text)?;
+    assert_eq!(got, sent);
+    // The full relay said so, and the third took it as full: routed around, not dialled again.
+    let now = tally_relay::network::wall_ms();
+    assert!(
+        third_hub.network().peers.full(now).contains(&full.public()),
+        "the third relay does not hold the first as full"
+    );
+    let refused = full_hub.memory_report().members_refused;
+    assert!(
+        (1..=2).contains(&refused),
+        "the full relay turned links away {refused} times"
+    );
+    drop(held);
+    Ok(())
+}
+
+/// A batch of `identity`'s stamped `wall_ms`, as a live feeder sends one.
+fn fresh_batch(identity: &Identity, sequence: u64, wall_ms: u64) -> Result<Batch> {
+    Batch::sign(
+        identity,
+        &BatchContent {
+            boot_id: 1,
+            sequence,
+            counter_epoch: 0,
+            wall_ms,
+            dropped: 0,
+            previous: [0; 32],
+            observations: vec![tally_wire::Observation::from_beast(&frames(1)?[0])],
+        },
+    )
+    .map_err(text)
 }

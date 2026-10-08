@@ -158,13 +158,9 @@ const WAITING_MS: u64 = 30_000;
 const DERIVED_REMEMBERED: usize = 200_000;
 /// What the sealer's queue of epochs holds before it refuses one: every message thread's word for
 /// many seconds of epochs (a thread sends at most a part and a marker an epoch). Only the message
-/// threads and the relay's own settings use it; records wait in their own queue (`RECORDS_HELD`).
+/// threads and the relay's own settings use it; records wait apart (`Records`), held by the
+/// products' gauge alone.
 const EPOCH_QUEUE: usize = 4_096;
-/// Records (positions, clock models, peers' world and regional records) waiting for the sealer to
-/// take them in by stamp, at most: their bytes are charged too. A record arrives at most about an
-/// epoch before the watermark passes its stamp, and a world-scale relay is handed some thousands a
-/// second, so this is seconds of them.
-const RECORDS_HELD: usize = 16_384;
 /// Epochs of products the hub may leave untaken before an epoch's are refused whole, counted: what
 /// the products' budget is planned for (`budget::Store::Products`). The hub takes them every
 /// `network::TICK`, a tenth of an epoch.
@@ -199,8 +195,8 @@ pub struct ProductsReport {
     pub regional_stale: u64,
     /// Peers' regional batches taken but not forwarded for room (`FORWARD_HELD`).
     pub regional_forward_full: u64,
-    /// Records (positions, models, peers' products) not taken for room: their own queue full
-    /// (`RECORDS_HELD`) or the products' budget spent. Never an epoch.
+    /// Records (positions, models, peers' products) not taken for room: the products' budget
+    /// (their gauge, `budget::Store::Products`) spent. Never an epoch.
     pub records_refused: u64,
     /// Receptions a message thread let go because their epoch had closed before they came: only
     /// a trace can stamp a batch behind its worker's tick.
@@ -513,13 +509,10 @@ impl Products {
     }
 
     /// A record for the sealer, stamped `stamp_ms` (no earlier than what the sealer has taken in)
-    /// and charged while it waits; refused and counted when the records' queue or the products'
+    /// and charged while it waits, its gauge its only bound; refused and counted when the products'
     /// budget is full. It waits apart from the epochs, so it never takes an epoch's place.
     fn record(&self, stamp_ms: u64, hash: Hash, bytes: usize, input: Input) {
         let taken = self.shared.records.lock().is_ok_and(|mut records| {
-            if records.pending.len() >= RECORDS_HELD {
-                return false;
-            }
             let Some(charge) = self.shared.gauge().try_charge(bytes) else {
                 return false;
             };

@@ -21,6 +21,7 @@ use super::seeds::{
     SEED_COPIES, SEED_ROTATION_SECONDS, SEEDS, epoch_of, is_seed, seed_members, seeded_bytes,
 };
 use super::stripes::{DATA_STRIPES, FANOUT, Layout, STRIPES, data_stripe};
+use crate::budget::{Gauge, Store};
 use crate::network::{Asker, AskerRole};
 
 type Outcome = Result<(), String>;
@@ -96,7 +97,7 @@ impl Sim {
     fn new(count: usize, delay_ms: u64) -> Result<Self, String> {
         let group = GroupKey::new(area()?, Streams::RAW);
         let keys = keys(count);
-        let mut members: Vec<Member> = (0..count).map(|i| Member::new(identity(i))).collect();
+        let mut members: Vec<Member> = (0..count).map(|i| unlimited(identity(i))).collect();
         let index = keys.iter().enumerate().map(|(i, key)| (*key, i)).collect();
         let mut sim = Self {
             group,
@@ -1032,7 +1033,7 @@ fn hold_offer(
 fn a_have_summary_at_the_end_of_time_is_refused_not_a_panic() -> Outcome {
     let me = identity(0);
     let group = GroupKey::new(area()?, Streams::RAW);
-    let mut member = Member::new(me.clone());
+    let mut member = unlimited(me.clone());
     let members = keys(3);
     let _ = member.set_members(group, &members, &[], START_MS);
     let origin = identity(1);
@@ -1131,7 +1132,7 @@ fn a_region_coarser_than_an_area_is_shared_in_its_areas_groups() -> Outcome {
 #[test]
 fn manifests_are_taken_from_members_each_within_its_own_share() -> Outcome {
     let group = GroupKey::new(area()?, Streams::RAW);
-    let mut member = Member::new(identity(0));
+    let mut member = unlimited(identity(0));
     let members = keys(3);
     let _ = member.set_members(group, &members, &[], START_MS);
     let second = START_MS / 1000;
@@ -1220,7 +1221,7 @@ fn a_false_parity_is_dropped_and_a_true_one_after_it_rebuilds() -> Outcome {
     let group = GroupKey::new(area()?, Streams::RAW);
     let me = identity(0);
     let members = keys(4);
-    let mut member = Member::new(me);
+    let mut member = unlimited(me);
     let _ = member.set_members(group, &members, &[], START_MS);
     let origin = identity(1);
     let receiver = identity(10_000);
@@ -1273,7 +1274,7 @@ fn a_false_parity_is_dropped_and_a_true_one_after_it_rebuilds() -> Outcome {
 #[test]
 fn repair_is_answered_only_to_members_of_the_trees() -> Outcome {
     let group = GroupKey::new(area()?, Streams::RAW);
-    let mut member = Member::new(identity(0));
+    let mut member = unlimited(identity(0));
     let members = keys(3);
     let _ = member.set_members(group, &members, &[], START_MS);
     let (hash, piece) = record(&identity(10_000), 1, START_MS)?;
@@ -1401,11 +1402,21 @@ fn a_full_cap_withdraws_regions_one_at_a_time_in_a_fixed_order_and_takes_them_ba
     Ok(())
 }
 
+/// A member charged to no budget: a test's, whose store has no bound.
+fn unlimited(identity: Identity) -> Member {
+    Member::new(identity, Gauge::unlimited(Store::Batches))
+}
+
+/// The one batch byte store is held by its gauge alone (RFC-0181 §9): every record and parity a
+/// member holds is charged before it is held and released as it is let go, so driven to its limit
+/// the gauge reads exactly the bytes the groups hold, counted afresh from what they hold, and a
+/// record past it is refused whole and counted, by the member and the gauge alike.
 #[test]
-fn a_member_holds_records_for_its_repair_horizon_shared_and_refuses_past_its_capacity() -> Outcome {
+fn a_member_holds_records_for_its_repair_horizon_shared_and_its_gauge_is_what_it_holds() -> Outcome
+{
     use super::member::{
         HORIZON_MS, HORIZON_SECONDS, JUDGE_AFTER_MS, RECEIPT_GRACE_MS, RECEIPT_WINDOW_SECONDS,
-        REPAIR_AFTER_MS, held_bytes_for,
+        REPAIR_AFTER_MS,
     };
     // The horizon is sharing's own duties end to end, not a round minute.
     if HORIZON_MS
@@ -1416,13 +1427,14 @@ fn a_member_holds_records_for_its_repair_horizon_shared_and_refuses_past_its_cap
     }
     let group = GroupKey::new(area()?, Streams::RAW);
     let members = keys(4);
-    let mut member = Member::new(identity(0));
-    let _ = member.set_members(group, &members, &[], START_MS);
     let receiver = identity(10_000);
     let (hash, piece) = record(&receiver, 1, START_MS)?;
     let len = piece.len();
-    // Sized by time: room for two such records a second over the horizon.
-    member.set_capacity(held_bytes_for(2 * len as u64));
+    // The store's share: room for two such records a second over the horizon.
+    let limit = 2 * len * HORIZON_SECONDS as usize;
+    let gauge = Gauge::new(Store::Batches, limit);
+    let mut member = Member::new(identity(0), std::sync::Arc::clone(&gauge));
+    let _ = member.set_members(group, &members, &[], START_MS);
     let _ = member.originate(group, hash, piece.clone(), START_MS);
     // What it holds and hands on is the batch itself: its bytes are the batch's, not a copy.
     let delivered = member.take_delivered();
@@ -1434,10 +1446,14 @@ fn a_member_holds_records_for_its_repair_horizon_shared_and_refuses_past_its_cap
     if held.as_bytes().as_ptr() != original.as_bytes().as_ptr() {
         return Err("a batch's bytes copied into the group".into());
     }
-    if member.held_bytes() != len {
-        return Err(format!("{} bytes held of {len}", member.held_bytes()));
+    if member.held_bytes() != len || gauge.held() != len {
+        return Err(format!(
+            "{} bytes held of {len}, the gauge charged {}",
+            member.held_bytes(),
+            gauge.held()
+        ));
     }
-    // Past the capacity a record is refused whole, and counted.
+    // Driven to its limit: past it a record is refused whole, and counted.
     let mut taken = 1;
     for sequence in 2..(2 * HORIZON_SECONDS + 10) {
         let (hash, piece) = record(&receiver, sequence, START_MS)?;
@@ -1446,26 +1462,51 @@ fn a_member_holds_records_for_its_repair_horizon_shared_and_refuses_past_its_cap
             taken += 1;
         }
     }
-    if member.held_bytes() > held_bytes_for(2 * len as u64) || member.stats().refused == 0 {
+    if gauge.held() > limit || member.stats().refused == 0 || gauge.refused() == 0 {
         return Err(format!(
-            "{} bytes held, {} refused",
-            member.held_bytes(),
-            member.stats().refused
+            "{} bytes charged of {limit}, {} refused, the gauge refused {}",
+            gauge.held(),
+            member.stats().refused,
+            gauge.refused()
         ));
     }
-    if taken as usize * len != member.held_bytes() {
-        return Err("a record held in part".into());
+    if limit - gauge.held() >= len {
+        return Err(format!(
+            "{} bytes charged of {limit}: room was left",
+            gauge.held()
+        ));
     }
-    // Within the horizon it is held; past it, let go, and its bytes with it.
+    if taken as usize * len != member.counted_bytes()
+        || gauge.held() != member.counted_bytes()
+        || member.group_bytes() != member.counted_bytes()
+    {
+        return Err(format!(
+            "{taken} records of {len} bytes held, {} counted, {} charged",
+            member.counted_bytes(),
+            gauge.held()
+        ));
+    }
+    // A tick a second on signs the manifest and builds the parity of what it originated: the
+    // parity is held only if the gauge takes it, and the gauge is still what the groups hold.
+    let _ = member.tick(START_MS + 1_000 + super::member::MANIFEST_DELAY_MS);
+    if gauge.held() != member.counted_bytes() || gauge.held() > limit {
+        return Err(format!(
+            "{} charged with the parity, {} counted",
+            gauge.held(),
+            member.counted_bytes()
+        ));
+    }
+    // Within the horizon it is held; past it, let go, and its bytes released with it.
     let _ = member.tick(START_MS + HORIZON_SECONDS * 1000);
     if !member.holds(group, &hash) {
         return Err("let go within the horizon".into());
     }
     let _ = member.tick(START_MS + HORIZON_SECONDS * 1000 + 1_001);
-    if member.holds(group, &hash) || member.held_bytes() != 0 {
+    if member.holds(group, &hash) || member.held_bytes() != 0 || gauge.held() != 0 {
         return Err(format!(
-            "held past the horizon: {} bytes",
-            member.held_bytes()
+            "held past the horizon: {} bytes, {} charged",
+            member.held_bytes(),
+            gauge.held()
         ));
     }
     Ok(())
@@ -1557,6 +1598,115 @@ fn a_tick_with_the_world_taken_and_nothing_flowing_does_no_work() -> Outcome {
     }
     if sharing.work().visited != visited || sharing.work().laid_out != work.laid_out {
         return Err(format!("idle ticks did work: {:?}", sharing.work()));
+    }
+    Ok(())
+}
+
+/// RFC-0174 §2.5, a relay's members are bounded: a member that turned this relay's link away as
+/// full is routed around, never addressed. A record whose stripe it seeds goes instead to the
+/// members beneath it in that stripe's tree (its children, and in place of one full too, that
+/// one's), so the rest of the tree still receives it from this relay; a manifest goes to those
+/// beneath it in every stripe; and once it is no longer full it is the seed again, the trees
+/// unchanged throughout.
+#[test]
+fn a_full_member_is_routed_around_to_the_members_beneath_it() -> Outcome {
+    use super::seeds::epoch_of;
+    use super::stripes::{DATA_STRIPES, data_stripe};
+    let group = GroupKey::new(area()?, Streams::RAW);
+    let members = keys(12);
+    let me = members[0];
+    let mut member = unlimited(identity(0));
+    let _ = member.set_members(group, &members, &[], START_MS);
+    let layout = member.layout(group).ok_or("no trees")?.clone();
+    let epoch = epoch_of(START_MS / 1000);
+    // A data stripe whose seed is another member with children of its own.
+    let (stripe, seed) = (0..DATA_STRIPES)
+        .filter_map(|stripe| Some((stripe, layout.seed(stripe, epoch)?)))
+        .find(|(stripe, seed)| {
+            *seed != me
+                && layout
+                    .place(*stripe, epoch, seed)
+                    .is_some_and(|place| place.children.iter().any(|child| *child != me))
+        })
+        .ok_or("no seed with children")?;
+    let children: BTreeSet<PublicKey> = layout
+        .place(stripe, epoch, &seed)
+        .ok_or("the seed has no place")?
+        .children
+        .into_iter()
+        .filter(|child| *child != me)
+        .collect();
+    let receiver = identity(10_000);
+    let in_stripe = |from: u64| -> Result<(Hash, Piece), String> {
+        (from..from + 1_000)
+            .map(|sequence| record(&receiver, sequence, START_MS))
+            .find(|made| {
+                made.as_ref()
+                    .is_ok_and(|(hash, _)| data_stripe(hash) == stripe)
+            })
+            .ok_or("no record in the stripe")?
+    };
+    let sent_to = |out: &[Outgoing]| -> BTreeSet<PublicKey> { out.iter().map(|o| o.to).collect() };
+
+    // Not full: the record goes to its stripe's seed.
+    let (hash, piece) = in_stripe(1)?;
+    let out = member.originate(group, hash, piece, START_MS);
+    if !sent_to(&out).contains(&seed) {
+        return Err("the seed was not sent its stripe".into());
+    }
+
+    // Full: never addressed; its children are sent the record in its place.
+    member.set_full(BTreeSet::from([seed]));
+    let (hash, piece) = in_stripe(1_000)?;
+    let out = member.originate(group, hash, piece, START_MS);
+    let to = sent_to(&out);
+    if to.contains(&seed) || !children.is_subset(&to) {
+        return Err(format!(
+            "a full seed's record went to {} members, {} of its {} children, the seed {}",
+            to.len(),
+            children.intersection(&to).count(),
+            children.len(),
+            if to.contains(&seed) {
+                "among them"
+            } else {
+                "not"
+            }
+        ));
+    }
+    // A child full too is passed over for its own children.
+    let child = *children.iter().next().ok_or("no child")?;
+    let grandchildren: BTreeSet<PublicKey> = layout
+        .place(stripe, epoch, &child)
+        .map(|place| {
+            place
+                .children
+                .into_iter()
+                .filter(|key| *key != me)
+                .collect()
+        })
+        .unwrap_or_default();
+    member.set_full(BTreeSet::from([seed, child]));
+    let (hash, piece) = in_stripe(2_000)?;
+    let to = sent_to(&member.originate(group, hash, piece, START_MS));
+    if to.contains(&seed) || to.contains(&child) || !grandchildren.is_subset(&to) {
+        return Err("a full child's place was not taken by its children".into());
+    }
+    // A manifest is never addressed to it either; its trees are what every relay lays out.
+    let out = member.tick(START_MS + 2_000);
+    if out
+        .iter()
+        .any(|outgoing| outgoing.to == seed || outgoing.to == child)
+    {
+        return Err("a full member was addressed by the tick".into());
+    }
+    if member.layout(group) != Some(&layout) {
+        return Err("routing around a full member changed the trees".into());
+    }
+    // No longer full: the seed is sent its stripe again.
+    member.set_full(BTreeSet::new());
+    let (hash, piece) = in_stripe(3_000)?;
+    if !sent_to(&member.originate(group, hash, piece, START_MS + 2_000)).contains(&seed) {
+        return Err("the seed was not sent its stripe once it had room".into());
     }
     Ok(())
 }

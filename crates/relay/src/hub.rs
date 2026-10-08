@@ -140,9 +140,10 @@ pub const DESCRIPTION_BYTES_HELD: usize = 64 * 1024 * 1024;
 /// session carves its ingest allowance from the members' own pool, sized at start for every member
 /// session the areas taken bring, at most this cap (`budget::members_for`,
 /// `budget::Budget::reserve_member`), so what they send is admitted the same way as a feeder's and
-/// never competes with feeders for room. Every session, in or out, holds a place under this cap
-/// (`Hub::connection`, `Hub::dialled`). What members cost beyond that is bandwidth in, up to their
-/// shared rate; an operator sizes `--max-member-bytes-per-sec` to the host's link.
+/// never competes with feeders for room; past them a member is turned away as full
+/// (`Reason::Full`) and routed around (RFC-0174 §2.5). Every session, in or out, holds a place
+/// under this cap (`Hub::connection`, `Hub::dialled`). What members cost beyond that is bandwidth
+/// in, up to their shared rate; an operator sizes `--max-member-bytes-per-sec` to the host's link.
 pub const DEFAULT_MAX_CONNECTIONS: usize = 2048;
 /// Per IPv4 address, or per IPv6 /64 (what one host is usually given), so one host cannot take
 /// the whole connection cap with handshakes it never finishes.
@@ -476,8 +477,9 @@ pub enum Origin {
 }
 
 /// What the relay's memory holds (`Hub::memory_report`, `GET /memory`): the budget and its gauges,
-/// what the stores that count their own bytes hold (their limits are the budget's
-/// `store_bytes`), and every decoded batch alive, whichever stores share it.
+/// the one batch byte store's and the delivery tags' own counts of what they hold (kept apart from
+/// their charges, so each is read beside its gauge, `Store::Batches` and `Store::Delivery`, which
+/// hold them), and every decoded batch alive, whichever stores share it.
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct MemoryReport {
     pub budget: crate::budget::MemoryReport,
