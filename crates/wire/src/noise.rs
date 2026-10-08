@@ -13,7 +13,7 @@
 //!
 //! # Buffers
 //!
-//! A session holds no message buffer of its own between messages (RFC-0178 §11). Each message's
+//! A session holds no message buffer of its own between messages (RFC-0181 §11). Each message's
 //! ciphertext, plaintext and the records packed into it are written in buffers taken from one
 //! process-wide pool ([`Buffer`]) for as long as that message is in hand, and given back after:
 //! at most `POOL_IDLE` are kept idle, so the pool holds what the busiest moment needed, not two

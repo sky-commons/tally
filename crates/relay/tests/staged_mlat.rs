@@ -1,4 +1,4 @@
-//! The hosted MLAT's invariants on the staged relay's own threads (RFC-0178, "Invariants the tests
+//! The hosted MLAT's invariants on the staged relay's own threads (RFC-0181, "Invariants the tests
 //! hold", 1 to 3 and 7): the relay holds MLAT's raw once, in its raw shards, taken there by the
 //! ingest workers and sealed from them, and its provisional state in address shards; the host steps
 //! by the stamp watermark the products seal by, asked as the network task asks it, on a thread of
@@ -293,7 +293,7 @@ fn encoded(records: &[Record]) -> Signed {
     (provisional, rest)
 }
 
-/// RFC-0178 §3, §4, §5 and invariants 1 to 3: the same stamped trace makes the same clock models,
+/// RFC-0181 §3, §4, §5 and invariants 1 to 3: the same stamped trace makes the same clock models,
 /// positions and provisional positions, byte for byte, on 1, 2 and 8 ingest workers and as many
 /// MLAT threads, with and without delays injected inside every stage of the host (an offer held up
 /// on its way, a provisional step, a seal and a window step each slowed by up to 30 ms) and between
@@ -377,7 +377,7 @@ fn hosted_mlat_makes_the_same_bytes_on_any_threads_with_any_delays_and_the_refer
     Ok(())
 }
 
-/// RFC-0178 §9 and invariant 1 at capacity: a relay whose MLAT seats fewer receivers than are
+/// RFC-0181 §9 and invariant 1 at capacity: a relay whose MLAT seats fewer receivers than are
 /// described refuses the same ones, whole, whatever order the descriptions came in, however they
 /// raced, and on any number of threads, with delays or none: the best ranked are seated
 /// (`tally_mlat::intake::Seats`: taking part first, then the draw under the relay's secret,

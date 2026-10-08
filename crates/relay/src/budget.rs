@@ -1,4 +1,4 @@
-//! Capacity is admission, never a silent drop inside a store (RFC-0178 §9). Every store and
+//! Capacity is admission, never a silent drop inside a store (RFC-0181 §9). Every store and
 //! every queue that holds something per feeder ([`Store`]) states what one feeder costs it
 //! ([`PerFeeder::planned`]); a feeder's bytes in every store are reserved together when it is
 //! admitted ([`Budget::reserve`]), beside the upload cap's headroom check (RFC-0171, `admission`),
@@ -18,7 +18,7 @@
 //! together never hold more than the relay's memory, whatever arrives and however slow a stage is.
 //! A charge is taken before the bytes are held, never after: there is no way to charge a gauge
 //! past its limit, so a store whose stage falls behind cannot grow past its share by holding what
-//! it already took. What a full gauge does is the store's policy (RFC-0178 §10): raw pushes back (a
+//! it already took. What a full gauge does is the store's policy (RFC-0181 §10): raw pushes back (a
 //! connection's batch waits for room, its socket unread), derived products refuse whole (an epoch,
 //! counted), the fan-out lets its laggard go, and hosted MLAT sheds whole steps it is behind on
 //! (`mlat_host`). The gauges are served on `--stats-listen` (`GET /memory`).
@@ -217,7 +217,7 @@ impl PerFeeder {
 }
 
 /// The rate the RFC sizes one feeder to: about 600 receptions and 8 KB of signed batches a second
-/// (RFC-0178, "Requirement").
+/// (RFC-0181, "Requirement").
 pub const PLANNED_RECEPTIONS_PER_SEC: usize = 600;
 pub const PLANNED_BYTES_PER_SEC: usize = 8 * 1024;
 /// One reception in a decoded batch: its reference, and its encoded observation in the inflated
@@ -231,7 +231,7 @@ const DECODED_BYTES_PER_RECEPTION: usize =
 const PRODUCT_BYTES_PER_RECEPTION: usize = 2 * (tally_wire::decoded::OBSERVATION_FIXED + 14);
 /// What the relay holds whatever its feeders: descriptions, stream tables, the runtime and the one
 /// batch each ingest worker is decoding (256 MiB), and the connection buffers the Noise pool keeps
-/// idle (`noise::POOL_IDLE` messages). Measured (RFC-0178, "Sizing", 2026-10-07): resident memory
+/// idle (`noise::POOL_IDLE` messages). Measured (RFC-0181, "Sizing", 2026-10-07): resident memory
 /// grew 247 KiB a feeder from 1,000 to 5,000 feeders and about 100 KiB from 5,000 to 20,000, so the
 /// cost of a feeder falls as feeders are added and the 1k/5k line taken back to no feeders (260 MiB)
 /// is an upper bound on the base. A feeder's reservation (`PerFeeder::planned`) is several times
@@ -241,7 +241,7 @@ pub const BASE_BYTES: usize =
 /// What hosting MLAT adds to the relay's own base, whatever its feeders: the engine's thread, its
 /// pool and its empty tables (its raw is `Held`'s and `Open`'s, its notes `Notes`', its waiting
 /// receptions and working set `Engine`'s, per feeder), and the signed records not yet taken
-/// (`mlat_host::PUBLISHED_BYTES`). Measured (RFC-0178, "Sizing", 2026-10-08): a relay hosting MLAT
+/// (`mlat_host::PUBLISHED_BYTES`). Measured (RFC-0181, "Sizing", 2026-10-08): a relay hosting MLAT
 /// on two areas, before any feeder, was 19.8 MiB resident where the same relay without it was
 /// 17.3 MiB. 2.5 MiB measured, held at 4 MiB, and the records' bound beside it.
 pub const MLAT_BASE_BYTES: usize = (4 << 20) + crate::mlat_host::PUBLISHED_BYTES;

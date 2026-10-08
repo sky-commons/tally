@@ -1,4 +1,4 @@
-//! The raw an MLAT participant holds (RFC-0171 §3.8.1, crate docs § Holding raw; RFC-0178 §5): a
+//! The raw an MLAT participant holds (RFC-0171 §3.8.1, crate docs § Holding raw; RFC-0181 §5): a
 //! grow-only set of Mode S receptions keyed by observation identity, the union of everything
 //! delivered, kept per 5 s grid bin and indexed once per bin. One implementation for everyone who
 //! holds raw (an engine solving, a relay's standing, a consumer verifying and re-solving), so two
@@ -631,7 +631,7 @@ pub const OPEN_BYTES_PER_RECEIVER_BIN: usize = size_of::<Slot>()
 pub const SEALED_BYTES_PER_RECORD: usize = 40;
 
 impl Rates {
-    /// A real receiver (RFC-0178, box-01): about 600 receptions a second, of which about 60%
+    /// A real receiver (RFC-0181, box-01): about 600 receptions a second, of which about 60%
     /// survive `wanted`, and of those what thinning kept in the world benchmark at that rate. The
     /// ceiling is five times the mean.
     pub const MEASURED: Self = Self {

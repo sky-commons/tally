@@ -1,4 +1,4 @@
-//! The delivery check (RFC-0174 §2.2, RFC-0178 §7): every key period the feeder gives every
+//! The delivery check (RFC-0174 §2.2, RFC-0181 §7): every key period the feeder gives every
 //! member of its area's sharing group a tag key of that member's own (`Keyring`, carried signed in
 //! a `DeliveryQuery`), and a member tags each of the feeder's batches with it as the batch arrives.
 //! Every few minutes the feeder samples a few of its recent batches and asks several members, on

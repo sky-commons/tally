@@ -14,7 +14,7 @@
 //!   tiles and no others. A change of areas re-scopes the engine in place (`Engine::set_scope`);
 //!   no area at all drops the engine and every byte of raw it held, and the next area starts a new
 //!   one under a new boot id, so the relay's records never reuse a (key, boot, sequence).
-//! - **One store of raw, held where it arrives** (RFC-0178 §5). The receivers and their open raw
+//! - **One store of raw, held where it arrives** (RFC-0181 §5). The receivers and their open raw
 //!   are held in raw shards keyed by receiver (`exchange::raw_shard`, one `tally_mlat::intake::Intake`
 //!   each), and a batch is taken into its shard by the ingest worker that decoded it
 //!   ([`MlatHost::offer_batch`]), in parallel, never on the engine's thread, which neither
@@ -26,7 +26,7 @@
 //!   missing for both alike. The handle outlives each engine (emptied when one is dropped). How
 //!   many receivers and how much raw it holds is configuration (`tally_mlat::engine::Capacity`),
 //!   from the receivers the relay admits.
-//! - **Provisional state sharded by aircraft** (RFC-0178 §3). What a batch says to provisional
+//! - **Provisional state sharded by aircraft** (RFC-0181 §3). What a batch says to provisional
 //!   solving (`provisional::notes_of`, read in its raw shard by the ingest worker that took it) is
 //!   split by ICAO address (`provisional::shard_of`, a hash keyed by the process's secret) into
 //!   `provisional::SHARDS` address shards, each holding its aircraft's state (`provisional::Shard`)
@@ -37,7 +37,7 @@
 //!   (`provisional::Plan::job`): the same stamped trace solves the same provisionals on any number
 //!   of ingest workers and step threads. The engine's thread holds only the models carried and the
 //!   sequences.
-//! - **Stepped by the stamp watermark, never by a clock** (RFC-0178 §4, invariants 1 to 3). The
+//! - **Stepped by the stamp watermark, never by a clock** (RFC-0181 §4, invariants 1 to 3). The
 //!   relay asks with its stamp watermark ([`MlatHost::take_published`]: every batch stamped before
 //!   it has been offered), the one the products seal by. The host steps at every multiple of
 //!   `STEP_MS` the watermark passes, each once and in order: step `t` weighs exactly the batches
@@ -54,7 +54,7 @@
 //!   window step before it, as the engine solving in line does. A step that falls behind waits,
 //!   up to `STEPS_BEHIND` steps; past them MLAT sheds, whole and counted, never by growing (below,
 //!   Behind).
-//! - **Behind** (RFC-0178 §9, §10). While the watermark passes more than `STEPS_BEHIND` steps that
+//! - **Behind** (RFC-0181 §9, §10). While the watermark passes more than `STEPS_BEHIND` steps that
 //!   have not started, the oldest of them is shed: what batches told its provisional solving is
 //!   let go, every batch of it counted (`MlatReport::shed`), and the bins it would take are taken
 //!   and sealed now, so its window step is the next step's (which solves every window due, as one
@@ -62,7 +62,7 @@
 //!   which is what the budget reserves for it (`OPEN_MS`, `INTERVALS_HELD`). A host that keeps up
 //!   never sheds, so the same stamped trace still makes the same bytes; one that does not loses
 //!   provisional positions, counted, and never a window.
-//! - **Capacity** (RFC-0178 §9). The receivers seated are the best ranked of those described
+//! - **Capacity** (RFC-0181 §9). The receivers seated are the best ranked of those described
 //!   (`tally_mlat::intake::Seats`: taking part first, then a draw under the relay's secret no
 //!   feeder can choose), whichever raw shard took them and in whatever order, as many as the
 //!   relay's feeder ceiling admits (`capacity`, the same F every store is sized by). Every byte it
@@ -303,14 +303,14 @@ pub const OPEN_MS: u64 = SETTLE_MS + (STEPS_BEHIND as u64 + 1) * STEP_MS;
 /// reserves for notes (`Store::Notes`).
 pub const INTERVALS_HELD: usize = STEPS_BEHIND + 3;
 /// A seat's share of a window step's working set (its scope, its fits and its solutions), reserved
-/// in the `Engine` store while the step runs. Measured (RFC-0178, "Sizing", 2026-10-08): a window
+/// in the `Engine` store while the step runs. Measured (RFC-0181, "Sizing", 2026-10-08): a window
 /// step at 500 feeders allocated at most 79 MiB beyond what it read, about 160 KiB a feeder.
 pub const SOLVE_BYTES_PER_RECEIVER: usize = 192 << 10;
 /// Commands for the engine's thread not yet taken: a few seconds of asks and changes. An ask
 /// beyond it is dropped; the next carries a watermark at least as new, which steps everything the
 /// dropped one would have.
 const COMMANDS_WAITING: usize = 1 << 12;
-/// What batches may tell provisional solving in one step, a seat: four times RFC-0178's planned
+/// What batches may tell provisional solving in one step, a seat: four times RFC-0181's planned
 /// rate of about 300 replies and positions a feeder a second. Beyond it the step's notes are
 /// refused whole (`MlatReport::refused`), so a step holds at most this times the seats, and which
 /// batches are refused is a function of the trace, never of the interleaving.
@@ -393,7 +393,7 @@ pub fn host_for(
 }
 
 /// What the hosted engine holds: a seat for every feeder the relay's memory admits (the budget's
-/// ceiling, RFC-0178 §9: "MLAT receiver limit comes from the same F"), and the raw of that many at
+/// ceiling, RFC-0181 §9: "MLAT receiver limit comes from the same F"), and the raw of that many at
 /// the measured rates, which is what the budget reserved for `Held` (`PerFeeder::planned`). No
 /// floor: seats beyond the ceiling would be raw the budget never reserved.
 pub fn capacity(budget: &Budget) -> Capacity {
@@ -972,7 +972,7 @@ impl HostedMlat {
         })
     }
 
-    /// Delays injected at every stage (`Stage`), for a test that shows they change nothing (RFC-0178
+    /// Delays injected at every stage (`Stage`), for a test that shows they change nothing (RFC-0181
     /// invariant 2). Set once; later calls are ignored.
     pub fn delaying(&self, delay: Delay) {
         let _ = self.shared.delay.set(delay);
@@ -1843,7 +1843,7 @@ fn run_in_background() {
 /// allocated on many short-lived threads (`window::parallel`), each served by one of the
 /// allocator's arenas, and freed when the step ends; glibc keeps what an arena freed for that arena
 /// to reuse, so without this the relay's resident memory is its stores' peak working sets summed
-/// over every arena, not what its stores hold (RFC-0178, "Sizing": at 500 feeders, about twice what
+/// over every arena, not what its stores hold (RFC-0181, "Sizing": at 500 feeders, about twice what
 /// was allocated). Called after each window step, on the engine's thread.
 fn give_back_freed() {
     // SAFETY: `malloc_trim` takes no pointer and only returns free pages of the allocator's own
@@ -2226,7 +2226,7 @@ mod tests {
         Ok(())
     }
 
-    /// RFC-0178 §9, "MLAT receiver limit comes from the same F": the engine seats exactly the
+    /// RFC-0181 §9, "MLAT receiver limit comes from the same F": the engine seats exactly the
     /// feeders the relay's budget admits, no floor beside it, and so holds the raw the budget
     /// reserved for `Held` and `Open`, and the waiting receptions and window working set it
     /// reserved for `Engine`, and no more.
@@ -2362,7 +2362,7 @@ mod tests {
         Ok(())
     }
 
-    /// RFC-0178 §9, §10: a host that falls behind its steps (its window steps slowed, the watermark
+    /// RFC-0181 §9, §10: a host that falls behind its steps (its window steps slowed, the watermark
     /// passing a step every call, nothing waited for) sheds whole steps, counted, and never grows a
     /// store past its limit; it still solves its windows, each the next step's; and once caught up
     /// it has nothing in hand.

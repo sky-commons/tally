@@ -1,4 +1,4 @@
-//! Answering delivery checks (RFC-0174 §2.2, RFC-0178 §7): the relay tags each batch it takes in
+//! Answering delivery checks (RFC-0174 §2.2, RFC-0181 §7): the relay tags each batch it takes in
 //! with the key its feeder gave this relay for it, keeps the 16-byte tag (never the bytes) for
 //! `TAG_WINDOW_MS`, and answers a `DeliveryQuery` with a signed `DeliveryAnswer`: per batch asked,
 //! its tag, or "not seen", or, for a feeder of an area it does not take, that it does not take it.
@@ -39,7 +39,7 @@ use crate::selection::Selection;
 
 /// One entry a batch costs while it is held.
 pub const TAG_BYTES: usize = std::mem::size_of::<Tagged>();
-/// What one feeder costs the store: a batch a second (RFC-0178's feeder) for the window.
+/// What one feeder costs the store: a batch a second (RFC-0181's feeder) for the window.
 pub const PER_FEEDER_BYTES: usize = TAG_BYTES * (TAG_WINDOW_MS / 1000) as usize;
 /// The most entries held in all until the relay's budget says otherwise (`Delivery::set_capacity`,
 /// its `budget::Store::Delivery` share): 8 Mi, some 28,000 feeders' windows, 320 MiB. Past the
@@ -966,7 +966,7 @@ mod tests {
     #[test]
     fn a_tag_made_four_minutes_ago_proves_delivery_at_twenty_thousand_feeders() -> Result {
         // 20,000 feeders, each a batch a second, for four minutes: the relay's whole arrival rate
-        // at RFC-0178's target. The first batch of each is proved at the end, from the tag made
+        // at RFC-0181's target. The first batch of each is proved at the end, from the tag made
         // when it came; the store holds every entry within its bound, refusing none.
         const FEEDERS: usize = 20_000;
         const SECONDS: u64 = 240;

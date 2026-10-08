@@ -74,7 +74,7 @@ rust_test(
     ],
 )
 
-# The staged relay's invariants (RFC-0178) on its own threads: the same stamped trace makes the
+# The staged relay's invariants (RFC-0181) on its own threads: the same stamped trace makes the
 # same bytes on 1, 2 and 8 threads (products and stream), batches stamped by the relay's own clock
 # with delays inside every stage make the same bytes as with none, a message is kept once a window
 # (copies up to two seconds apart are one), each receiver's batches reach a subscriber in order,
@@ -93,7 +93,7 @@ rust_test(
     ],
 )
 
-# The same invariants for the hosted MLAT (RFC-0178 §3, §5, §9): the same stamped trace makes the
+# The same invariants for the hosted MLAT (RFC-0181 §3, §5, §9): the same stamped trace makes the
 # same clock models, positions and provisional positions on any number of threads, and at
 # capacity the same receivers are refused whole whatever the order.
 rust_test(
@@ -152,7 +152,7 @@ opt_test(
     test = ":mlat_host_binary",
 )
 
-# Every deployed relay's configuration admits feeders (RFC-0178 §9): its arguments through the
+# Every deployed relay's configuration admits feeders (RFC-0181 §9): its arguments through the
 # relay's own parser, its memory as the relay finds it, its budget as `main` builds it.
 rust_test(
     name = "deployed",

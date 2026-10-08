@@ -1,4 +1,4 @@
-//! The delivery check (RFC-0174 §2.2, RFC-0178 §7): a feeder asks members of its area's sharing
+//! The delivery check (RFC-0174 §2.2, RFC-0181 §7): a feeder asks members of its area's sharing
 //! group, on distinct networks, whether they took in a few of its recent batches, by (boot,
 //! sequence). A member answers with the tag it made when the batch arrived, which only a relay
 //! that held the batch's bytes and the feeder's key for it could compute, and signs its answer;

@@ -57,7 +57,7 @@ pub const KIND_PROVISIONAL: u8 = 0x10;
 // RFC-0174 §2.10, version 2. Non-critical, as every new kind is unless ignoring it would be wrong.
 pub const KIND_ECHO: u8 = 0x11;
 pub const KIND_ECHO_REPLY: u8 = 0x12;
-/// Retired (RFC-0178 §7): the delivery check's first form, a proof of possession over the feeder's
+/// Retired (RFC-0181 §7): the delivery check's first form, a proof of possession over the feeder's
 /// nonce, which needs the member to hold every batch's bytes until it is asked. A build that knows
 /// the tagged form reads these two kinds as `Record::Retired` and nothing of their bodies, and
 /// answers the query with `Record::refusal`; it never writes either. The kind bytes are never
@@ -77,7 +77,7 @@ pub const KIND_REGIONAL_BATCH: u8 = 0x1e;
 pub const KIND_PARITY: u8 = 0x1f;
 pub const KIND_BUNDLE_INDEX: u8 = 0x20;
 pub const KIND_WORLD_PRECISE: u8 = 0x21;
-// RFC-0178 §7: the delivery check by tags made on arrival. Kinds of their own, not the retired
+// RFC-0181 §7: the delivery check by tags made on arrival. Kinds of their own, not the retired
 // ones' bytes, so a build that predates them skips them as unknown (non-critical) rather than
 // misreading one form as the other, and an answer's signed record is a format of its own too.
 pub const KIND_DELIVERY_QUERY: u8 = 0x22;
@@ -251,13 +251,13 @@ pub enum Reason {
     Refused,
     /// The peer broke the protocol.
     Protocol,
-    /// The subscriber fell behind what it asked for (RFC-0178 §8): its queue held more than its
+    /// The subscriber fell behind what it asked for (RFC-0181 §8): its queue held more than its
     /// bound of bytes or of time, so the relay let it go rather than slow anyone else. Not that
     /// the relay is full: the subscriber may come back at once. A reader that predates it reads
     /// `Other(6)`.
     FellBehind,
     /// The peer sent a record of a form this build has retired (`RETIRED_KINDS`) and will never
-    /// answer: an old feeder's delivery query (RFC-0178 §7). A reader that predates it reads
+    /// answer: an old feeder's delivery query (RFC-0181 §7). A reader that predates it reads
     /// `Other(7)`, and a feeder that predates the tagged check takes any `Goodbye` to its query as
     /// no answer, never as evidence.
     Retired,
@@ -379,7 +379,7 @@ pub enum Record {
     /// A relay's signed answer to an `Echo`, with its headroom.
     EchoReply(EchoReply),
     /// A feeder giving a sharing group member its tag keys, and in an audit asking it for the
-    /// tags it made of some of its batches (RFC-0178 §7).
+    /// tags it made of some of its batches (RFC-0181 §7).
     DeliveryQuery(DeliveryQuery),
     /// A member's signed answer: the tag it made per batch, or that it does not take the area.
     DeliveryAnswer(DeliveryAnswer),
@@ -1149,7 +1149,7 @@ mod tests {
         Ok(())
     }
 
-    /// The kinds every version 2 build before the tagged delivery check knew (RFC-0178 §7): the
+    /// The kinds every version 2 build before the tagged delivery check knew (RFC-0181 §7): the
     /// first through `KIND_WORLD_PRECISE`, the possession check's 0x13 and 0x14 among them.
     const KINDS_BEFORE_TAGS: std::ops::RangeInclusive<u8> = KIND_HELLO..=KIND_WORLD_PRECISE;
 

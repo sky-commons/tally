@@ -1,11 +1,11 @@
-//! Keyed exchanges between the ingest stage and the shards that own state (RFC-0178 §3). There
+//! Keyed exchanges between the ingest stage and the shards that own state (RFC-0181 §3). There
 //! are [`SHARDS`] logical shards per exchange, mapped onto threads (shard `s` on thread
 //! `s % threads`), each owning its state outright, so nothing on the per-reception path takes a
 //! lock. A producer (an ingest worker) sends each thread one [`Slice`] per batch, never one message
 //! per reception: the batch, shared, and the index ranges of its receptions whose key falls in that
 //! thread's shards. Each thread's queue is bounded ([`QUEUE_SLICES`] per producer): a producer
 //! that finds it full waits, which holds its connections' credit (`ingest::CREDIT`), which stops
-//! their sockets being read. That is the back-pressure raw meets (RFC-0178 §10).
+//! their sockets being read. That is the back-pressure raw meets (RFC-0181 §10).
 //!
 //! Keys are uniform hashes only, never geography, so a dense area cannot make a hot shard; the two
 //! a peer chooses (a receiver's key, an aircraft's address) are keyed under this process's secret
@@ -25,7 +25,7 @@
 //! batches to [`Store::Epochs`] (a batch's share by the receptions its slice carries), and its
 //! [`DEDUP_GENERATIONS`] generations of fingerprints to [`Store::Dedup`]. An epoch that would pass
 //! either is refused whole: its slices are let go, and the sealer is told it was refused
-//! ([`Frozen::refused`]), so it counts it and makes no product of any part of it (RFC-0178 §10). The charge travels with the
+//! ([`Frozen::refused`]), so it counts it and makes no product of any part of it (RFC-0181 §10). The charge travels with the
 //! epoch's batches to the sealer and is released when the sealer is done with them.
 //!
 //! Every producer sends [`Envelope::Tick`] down every queue as its stamps advance; a thread's
@@ -778,7 +778,7 @@ fn run(mut state: MessageThread, receiver: &Receiver<(usize, Envelope)>, pause: 
 }
 
 /// Sends `frozen` to a bounded queue without waiting: a sealer that is behind refuses the epoch
-/// whole rather than slow the shards (RFC-0178 §10).
+/// whole rather than slow the shards (RFC-0181 §10).
 pub fn offer(sender: &SyncSender<Frozen>, frozen: Frozen) -> bool {
     match sender.try_send(frozen) {
         Ok(()) => true,

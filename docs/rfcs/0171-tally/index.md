@@ -131,7 +131,7 @@ also widens `Streams` to two bytes, so products after the eighth have bits.
 one hop, RFC-0174 §2.3; it publishes nothing), and **probe**. A probe is a
 measurement session (RFC-0174 §2.2's round-trip probing and delivery check): it may send only
 `Echo` and `DeliveryQuery` (`Role::may_send`; a query also carries the feeder's tag keys for the
-member, RFC-0178 §7), is answered, and is never admitted as a feeder or
+member, RFC-0181 §7), is answered, and is never admitted as a feeder or
 a subscriber, so measuring a relay takes none of its feeder slots and is sent none of its streams.
 A probe that sends a delivery query of the retired form is ended with `Goodbye{Retired}`; one that
 sends anything else, with `Goodbye{Protocol}`. A full relay still answers a probe.
@@ -159,7 +159,7 @@ record is a kind byte, a two-byte length, a body; a Noise message carries whole 
 | 0x0e | `FaultProof`   | two signed solutions of one inputs that disagree, or two signed models of one inputs that differ; checked before forwarding |
 | 0x0f | `ClockModelPart` | one part of a clock model too large for its manifest, checked against it (§3.8.1) |
 | 0x10 | `Provisional`  | a relay's signed provisional solutions (`Positions` format 4), superseded by final ones; only to subscribers that asked (`PROVISIONAL`, §3.8.1) |
-| 0x11 to 0x23 | RFC-0174's records | echo, delivery check, provider directory, sharing groups, credit, the regional and the two world products, parity and bundle index (RFC-0174 §2.10); transport version 2, the minimum. 0x13 and 0x14 are retired (the first delivery check), read as retired and never written; the delivery check is 0x22 and 0x23 (RFC-0178 §7) |
+| 0x11 to 0x23 | RFC-0174's records | echo, delivery check, provider directory, sharing groups, credit, the regional and the two world products, parity and bundle index (RFC-0174 §2.10); transport version 2, the minimum. 0x13 and 0x14 are retired (the first delivery check), read as retired and never written; the delivery check is 0x22 and 0x23 (RFC-0181 §7) |
 
 The extension rules, which are what a frozen feeder relies on:
 
@@ -172,7 +172,7 @@ The extension rules, which are what a frozen feeder relies on:
 - A record whose meaning changes takes a new kind, and a signed one a new format; its old kind is
   retired, never reused. The appended-field rule cannot carry a change of meaning: a reader that
   ignores the new bytes reads the old meaning into them. The delivery check's two forms are the
-  case (RFC-0178 §7).
+  case (RFC-0181 §7).
 - Every record body has one check of what makes it well formed (ranges ascending and exact,
   spans bounded, a position on the globe, one product where one is named), and the codec runs it
   on every encode and every decode (`tally_wire::Check`), so no value that breaks it is written or
@@ -553,7 +553,7 @@ over it. As built:
   subscriber cap, so an operator sizes that cap and the MLAT ceiling to the host's link.
 - What the whole world costs one relay is set by the tile, the stride, the targets and the
   reception rate, and measured in release by the simulator at 20,000 receivers (about 5,400
-  targets a window, on 3,800 tiles; `world_scale_one_node`, re-measured 2026-10-08 for RFC-0178).
+  targets a window, on 3,800 tiles; `world_scale_one_node`, re-measured 2026-10-08 for RFC-0181).
   At the real rate, about 320 wanted receptions a second a receiver (a real receiver hears about
   600 a second, 60% of them wanted; the simulator comes nearest with every receiver in reach
   hearing every transmission), 41 cores keep up: 1,300 core-seconds of fits (a tile fit 0.35 s a

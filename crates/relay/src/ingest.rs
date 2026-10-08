@@ -1,4 +1,4 @@
-//! The ingest stage (RFC-0178 §2): where a batch becomes one immutable [`Decoded`], once, before
+//! The ingest stage (RFC-0181 §2): where a batch becomes one immutable [`Decoded`], once, before
 //! any other stage reads it. A connection task does I/O only and holds at most [`CREDIT`] batches
 //! in flight ([`Credit`]); out of credit it stops reading its socket, so TCP pushes back on the
 //! feeder (whose signed `dropped` records its own loss) and nothing queues unbounded. The work
@@ -16,7 +16,7 @@
 //! in, when a shard may seal, which copy of a message is kept) reads the stamp's time and the batch
 //! itself (`seal::canonical`), never a clock of its own and never the ingest order the workers
 //! raced to, so the same stamped batches give the same output on any number of threads and whatever
-//! a stage's delays (RFC-0178, invariants 1 and 2). A stage is held up only by a test's [`Pause`],
+//! a stage's delays (RFC-0181, invariants 1 and 2). A stage is held up only by a test's [`Pause`],
 //! at the points [`Stage`] names. Each worker
 //! ticks the message exchange (`exchange::Envelope::Tick`) as its stamps advance and when idle, so
 //! epochs close whether or not batches flow.
@@ -72,7 +72,7 @@ pub enum Stage {
     Sealer,
 }
 
-/// What holds a stage up, inside it: a test's injected delay or stall (RFC-0178 invariant 2, "no
+/// What holds a stage up, inside it: a test's injected delay or stall (RFC-0181 invariant 2, "no
 /// consumer reads a clock": what a stage is given, not when, decides its output). A relay runs with
 /// none.
 pub type Pause = Arc<dyn Fn(Stage) + Send + Sync>;
@@ -133,7 +133,7 @@ impl Credit {
 /// One batch's place in the ingest stage: its connection's credit, and its bytes charged to the
 /// relay's budget (`budget::Store::Ingest`), both released when the batch is decoded and routed.
 /// A connection takes both before it hands a batch over, and waits for them (its socket unread)
-/// while either is spent: the back-pressure raw meets (RFC-0178 §10).
+/// while either is spent: the back-pressure raw meets (RFC-0181 §10).
 pub struct InFlight {
     pub permit: OwnedSemaphorePermit,
     pub charge: crate::budget::Charge,
@@ -539,7 +539,7 @@ mod tests {
         }
     }
 
-    /// RFC-0178 invariant 9: no lock is held across a seal and nothing on the ingest path waits for
+    /// RFC-0181 invariant 9: no lock is held across a seal and nothing on the ingest path waits for
     /// the sealer. The real sealer is stalled outright (held at its first command until the test
     /// lets it go) while twenty epochs of batches are handed in by a scripted ingest clock: every
     /// one is decoded and routed all the same, and once the sealer runs again it catches up to the

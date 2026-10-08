@@ -3,7 +3,7 @@
 //! solved. The receivers and their open raw are its [`Intake`] (`intake`): an engine holds its
 //! own ([`Engine::new`]), or its host holds them split by receiver and hands it the sealed bins
 //! and what each batch says to provisional solving ([`Engine::hosted`]: a relay's raw shards,
-//! RFC-0178 §5), and the same raw solves to the same bytes either way. Nothing here reads a clock or a socket: the caller says what time it is, so the same
+//! RFC-0181 §5), and the same raw solves to the same bytes either way. Nothing here reads a clock or a socket: the caller says what time it is, so the same
 //! records in any order leave the same state, and the same state solves to the same bytes
 //! (`window`).
 //!
@@ -19,7 +19,7 @@
 //!   prefilter and, when a bin is sealed, its canonical thinning), in 24 bytes an observation. The
 //!   raw it holds is the one store its host keeps (`Engine::sealed_bins` is what the host's other
 //!   readers, a relay's standing, share), sealed on `Settings::threads` threads.
-//! - **Capacity is configuration, and refusal is whole and never by order** (RFC-0178 §9). How many
+//! - **Capacity is configuration, and refusal is whole and never by order** (RFC-0181 §9). How many
 //!   receivers it seats and what its raw may hold come from `Settings::capacity`, which a relay
 //!   derives from the receivers it admits. Who is seated is the best ranked of those described
 //!   (`intake::Seats`), whatever order they came in; one outranked is refused whole (its raw never
@@ -46,7 +46,7 @@ use crate::window::{Job, Outcome, Report};
 
 /// What an engine is sized for when its host does not say (`Capacity::default`, an engine run on
 /// its own or in a test): a region's whole receiver population at the founder's requirement
-/// (RFC-0178: one relay, 20,000 feeders). A relay's hosted engine is sized by the relay's feeder
+/// (RFC-0181: one relay, 20,000 feeders). A relay's hosted engine is sized by the relay's feeder
 /// ceiling instead (`Capacity::for_receivers`), with no floor: its seats come from the same budget
 /// as everything else it holds.
 pub const MIN_RECEIVERS: usize = 20_000;
@@ -56,7 +56,7 @@ pub const MIN_RECEIVERS: usize = 20_000;
 pub const WAITING_PER_RECEIVER: usize =
     Rates::MEASURED.wanted_per_s * provisional::WAITING_MS as usize / 1_000;
 
-/// How much an engine holds, derived from what its host admits (RFC-0178 §9).
+/// How much an engine holds, derived from what its host admits (RFC-0181 §9).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Capacity {
     /// Receivers described at once, taking part or not: every receiver whose raw reaches it (a
@@ -69,7 +69,7 @@ pub struct Capacity {
 }
 
 impl Capacity {
-    /// Sized for exactly `receivers` at the measured rates: a relay's feeder ceiling (RFC-0178 §9,
+    /// Sized for exactly `receivers` at the measured rates: a relay's feeder ceiling (RFC-0181 §9,
     /// "MLAT receiver limit comes from the same F"), so the raw it may hold (`Settings::limits`)
     /// is what the budget reserved for it, and never more.
     pub fn for_receivers(receivers: usize) -> Self {

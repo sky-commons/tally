@@ -117,7 +117,7 @@ impl Region {
 /// H3's resolution-0 cells: the whole world, at its coarsest, is this many cells.
 pub const BASE_CELLS: usize = 122;
 
-/// A set of places, held as the fewest cells that cover it (RFC-0178): no cell inside another
+/// A set of places, held as the fewest cells that cover it (RFC-0181): no cell inside another
 /// listed, and every full set of siblings merged into their parent, recursively. So two `Regions`
 /// covering the same places are equal, whatever cells they were named by, and one covering the
 /// whole world is the 122 resolution-0 cells. Membership is decided by ancestor (a cell is in the

@@ -1155,7 +1155,7 @@ fn every_drop_is_counted_by_why() -> Result<()> {
     Ok(())
 }
 
-/// RFC-0178 §10 and invariant 1 for the records that are not epochs: they wait in a queue of their
+/// RFC-0181 §10 and invariant 1 for the records that are not epochs: they wait in a queue of their
 /// own, so a peer flooding them is refused (counted) and never costs this relay an epoch; and a
 /// world candidate is in time or late by its stamp against the watermark that seals its second,
 /// never by when it was handled: two candidates handed in together, before that watermark is

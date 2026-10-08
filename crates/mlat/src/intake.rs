@@ -1,4 +1,4 @@
-//! The receiver side of an engine (RFC-0171 §3.8.1, RFC-0178 §5): which receivers take part, the
+//! The receiver side of an engine (RFC-0171 §3.8.1, RFC-0181 §5): which receivers take part, the
 //! sequences each has used, their open raw (`tally_mlat_solver::held::Open`) and what each batch
 //! says to provisional solving (`provisional::notes_of`). Everything here belongs to one receiver,
 //! so it splits by receiver: an engine that holds its own raw keeps one [`Intake`] (`Engine::new`),
@@ -12,7 +12,7 @@
 //!   location no coarser than it allows (`tally_mlat_solver::obs::MAX_SITE_PRECISION_M`).
 //! - A batch is used once: from a receiver that takes part, with a (boot, sequence) not already used
 //!   and not too far behind that boot's newest (§3.1).
-//! - **Room is shared, refusal is whole, and neither depends on order** (RFC-0178 §9). The
+//! - **Room is shared, refusal is whole, and neither depends on order** (RFC-0181 §9). The
 //!   receivers seated across every intake of one engine are bounded by one count ([`Seats`],
 //!   `Capacity::receivers`), and who is seated is a function of who is described: the best ranked
 //!   (taking part first, then a draw no feeder can choose, [`draw`]), whatever order they came in
@@ -27,7 +27,7 @@
 //!   free, so ranking by the key itself let anyone grind keys that outrank every honest receiver and
 //!   take the seats from them with one description each. Under a secret it cannot do better than
 //!   chance, whatever it grinds. Neither tenure nor standing serves instead: tenure (first come)
-//!   rewards whoever floods first and is decided by arrival order, which RFC-0178 §9 forbids;
+//!   rewards whoever floods first and is decided by arrival order, which RFC-0181 §9 forbids;
 //!   receiver standing (RFC-0174 §2.12) is earned only by receptions the seated engine solves, so
 //!   ranking by it would keep a receiver once seated seated forever and one never seated out, and it
 //!   is a bar the merge applies to solutions, not an order of who may be heard.
@@ -107,7 +107,7 @@ impl Places {
     }
 }
 
-/// The seats for described receivers, shared by every intake of one engine (RFC-0178 §9). Who is
+/// The seats for described receivers, shared by every intake of one engine (RFC-0181 §9). Who is
 /// seated is a function of who is described, never of the order they came in or of which intake
 /// took them: the `limit` best ranked ([`Rank`]: taking part first, then the draw), and up to `limit`
 /// more waiting; beyond that the worst ranked are forgotten with their descriptions, which bounds

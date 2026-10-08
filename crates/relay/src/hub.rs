@@ -1,5 +1,5 @@
 //! What every connection of a relay shares: the fan-out (`fanout::Router`), the staged ingest of
-//! receivers' batches (`ingest::Stages`, RFC-0178), the record of positions, clock models and fault
+//! receivers' batches (`ingest::Stages`, RFC-0181), the record of positions, clock models and fault
 //! proofs already forwarded, each receiver's newest self-description, the admission budget
 //! (`budget`), and the relays this one offers as hints.
 //!
@@ -2150,7 +2150,7 @@ mod tests {
         assert!(!forwarded.admit(next(), "honest", 0, 1));
     }
 
-    /// RFC-0178 §9 against a churn of boots (the audit's 2.2): one author churning boot ids, each a
+    /// RFC-0181 §9 against a churn of boots (the audit's 2.2): one author churning boot ids, each a
     /// new stream, in a table as small as a raw shard's, forgets only its own oldest boots. Every
     /// other author's window stays, however long the churn, so no replay into another stream is
     /// reopened.

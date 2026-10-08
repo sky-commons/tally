@@ -4,7 +4,7 @@
 //! one mistakes it for a receiver's reception, and never passed to another relay: each relay
 //! derives its own.
 //!
-//! The sealer signs it (RFC-0178 §4), in its pool beside the epoch's areas, while the epoch's
+//! The sealer signs it (RFC-0181 §4), in its pool beside the epoch's areas, while the epoch's
 //! batches are still held: each reception is read where its batch holds it
 //! (`Batch::sign_relay_draft`), never copied, and the signed batches go out with the epoch's other
 //! records (`products::Sealer`). An epoch's batches carry its end as their time, as its regional
