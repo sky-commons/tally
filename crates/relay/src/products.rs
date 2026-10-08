@@ -6,7 +6,7 @@
 //! after its second with MLAT by provisional fixes, and precise as `WorldPrecise`, sealed
 //! `WORLD_PRECISE_SETTLE_MS` after with MLAT by final fixes only.
 //!
-//! # Who does what (RFC-0177)
+//! # Who does what (RFC-0178)
 //!
 //! Nothing here is on the per-reception path. Which reception is an area's first copy is decided
 //! by the message exchange's one deduplication (`exchange::MessageShard`), at each epoch's close,
@@ -19,7 +19,7 @@
 //! `WORLD_SETTLE_MS`, so the same stamped trace gives the same records on any number of threads.
 //! A sealer that falls behind refuses whole epochs, counted ([`ProductsReport`]); never part of one.
 //!
-//! The sealer is one thread that decides, and a pool that works (RFC-0177 §4, "a sealer pool"):
+//! The sealer is one thread that decides, and a pool that works (RFC-0178 §4, "a sealer pool"):
 //! each epoch's areas are made into records in parallel (their observations gathered, cut to
 //! fit a record, signed, and their ADS-B fixes derived), across as many threads as the message
 //! exchange has, then numbered and applied in cell order by the one thread, so the records and
@@ -159,7 +159,7 @@ pub struct ProductsReport {
     /// Peers' regional batches forwarded.
     pub regional_forwarded: u64,
     /// Epochs refused whole, every product of them (the sealer was behind, or its records were
-    /// not taken, or the epoch was past the budget): RFC-0177 §10.
+    /// not taken, or the epoch was past the budget): RFC-0178 §10.
     pub epochs_refused: u64,
     /// Epoch parts (one message thread's share of one epoch) lost on the way to the sealer, its
     /// queue full: each refuses its epoch, counted above when another thread held any of it.

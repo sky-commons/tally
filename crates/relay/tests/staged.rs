@@ -1,4 +1,4 @@
-//! The staged relay's invariants (RFC-0177, "Invariants the tests hold"), on the relay's own
+//! The staged relay's invariants (RFC-0178, "Invariants the tests hold"), on the relay's own
 //! threads: the same stamped trace gives byte-identical products and stream on 1, 2 and 8
 //! threads, and byte-identical MLAT (clock models, positions, provisional positions: the raw held
 //! once, in the raw shards, sealed from them) which is also what the reference engine makes of
@@ -727,7 +727,7 @@ fn encoded(records: &[Record]) -> Signed {
     (provisional, rest)
 }
 
-/// RFC-0177 §3, §5 and invariant 1: the relay holds MLAT's raw once, in its raw shards, taken there
+/// RFC-0178 §3, §5 and invariant 1: the relay holds MLAT's raw once, in its raw shards, taken there
 /// by the ingest workers and sealed from them (`held::Bin::seal_from`), and its provisional state
 /// in address shards, weighed and stepped in parallel; the hosted engine solves those sealed bins.
 /// The same stamped trace makes the same clock models, positions and provisional positions, byte
@@ -791,7 +791,7 @@ fn hosted_mlat_makes_the_same_bytes_on_any_number_of_threads_and_the_reference_e
     Ok(())
 }
 
-/// RFC-0177 §9 and invariant 1 at capacity: a relay whose MLAT seats fewer receivers than are
+/// RFC-0178 §9 and invariant 1 at capacity: a relay whose MLAT seats fewer receivers than are
 /// described refuses the same ones, whole, whatever order the descriptions came in, however they
 /// raced, and on any number of threads: the best ranked are seated (`tally_mlat::intake::Seats`,
 /// taking part first, then key), every other one refused and counted, and the same records signed
@@ -889,7 +889,7 @@ fn busy_batch(receiver: &Identity, sequence: u64, count: u32) -> Result<Batch> {
     .map_err(text)
 }
 
-/// RFC-0177 invariant 8, for the stages that can stall: a stage that never lets go cannot grow
+/// RFC-0178 invariant 8, for the stages that can stall: a stage that never lets go cannot grow
 /// the relay's memory past its budget. Here the epoch never closes (every batch is stamped in one
 /// second and the ingest clock stands still), so the message exchange holds everything it is
 /// given, and nobody reads the one subscriber's queue. Ten times what the budget gives the epochs

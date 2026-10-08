@@ -147,7 +147,7 @@ pub struct BatchContent {
 /// A signed batch, as bytes. Immutable: forwarding never re-encodes it, and every holder shares
 /// the one allocation (`Bytes`), so a clone is a reference count, not a copy. The signer's key is
 /// decompressed once, when the batch is read (`from_bytes`) or signed, and kept: naming the
-/// receiver and checking the signature never decompress it again (RFC-0177 §2).
+/// receiver and checking the signature never decompress it again (RFC-0178 §2).
 #[derive(Clone, Debug)]
 pub struct Batch {
     bytes: Bytes,

@@ -1,4 +1,4 @@
-//! Capacity is admission, never a silent drop inside a store (RFC-0177 §9). Every store and
+//! Capacity is admission, never a silent drop inside a store (RFC-0178 §9). Every store and
 //! every queue that holds something per feeder ([`Store`]) states what one feeder costs it
 //! ([`PerFeeder::planned`]); a feeder's bytes in every store are reserved together when it is
 //! admitted ([`Budget::reserve`]), beside the upload cap's headroom check (RFC-0171, `admission`),
@@ -15,7 +15,7 @@
 //! [`Gauge::charge`]) for what it holds and is released when it lets go ([`Charge`] dropped). A
 //! gauge's limit is that store's share at the ceiling (`per feeder x ceiling`), so the stores
 //! together never hold more than the relay's memory, whatever arrives and however slow a stage is.
-//! What a full gauge does is the store's policy (RFC-0177 §10): raw and fan-out push back (a
+//! What a full gauge does is the store's policy (RFC-0178 §10): raw and fan-out push back (a
 //! connection's batch waits for room, its socket unread), derived products refuse whole (an epoch,
 //! counted). The gauges are served on `--stats-listen` (`GET /memory`).
 //!
@@ -158,7 +158,7 @@ impl PerFeeder {
 }
 
 /// The rate the RFC sizes one feeder to: about 600 receptions and 8 KB of signed batches a second
-/// (RFC-0177, "Requirement").
+/// (RFC-0178, "Requirement").
 pub const PLANNED_RECEPTIONS_PER_SEC: usize = 600;
 pub const PLANNED_BYTES_PER_SEC: usize = 8 * 1024;
 /// One reception in a decoded batch: its reference, and its encoded observation in the inflated

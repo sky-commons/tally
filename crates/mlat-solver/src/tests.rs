@@ -2056,7 +2056,7 @@ fn peak_rss() -> usize {
 /// Reports the reception rate per receiver (`WORLD_RECEPTION`, the chance a receiver in reach hears
 /// a transmission: 0.12 is the rate RFC-0174 first measured at, about 40 wanted receptions a
 /// second a receiver; 1.0, the default, every receiver in reach hearing everything, is the nearest
-/// the simulator's few message kinds come to a real receiver's 360 a second, RFC-0177), the raw a
+/// the simulator's few message kinds come to a real receiver's 360 a second, RFC-0178), the raw a
 /// window holds and its bytes per observation, each bin's sealing time, and the cores the work of
 /// one stride needs to keep up. Run in release with `--ignored --nocapture` (`WORLD_RECEIVERS` a
 /// cluster, default 10,000; `WORLD_THREADS`, default every core).

@@ -1,5 +1,5 @@
 //! What every connection of a relay shares: the fan-out (`fanout::Router`), the staged ingest of
-//! receivers' batches (`ingest::Stages`, RFC-0177), the record of positions, clock models and fault
+//! receivers' batches (`ingest::Stages`, RFC-0178), the record of positions, clock models and fault
 //! proofs already forwarded, each receiver's newest self-description, the admission budget
 //! (`budget`), and the relays this one offers as hints.
 //!

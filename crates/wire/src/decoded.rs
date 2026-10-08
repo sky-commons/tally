@@ -1,4 +1,4 @@
-//! A verified batch decoded once (RFC-0177 §1): its fixed fields, its observations inflated once
+//! A verified batch decoded once (RFC-0178 §1): its fixed fields, its observations inflated once
 //! into one shared buffer, and each reception's place in that buffer with its one fingerprint.
 //! Every stage of a relay that reads a batch's receptions (the hub's deduplicated stream, the
 //! regional product, standing, the hosted MLAT engine, the BEAST output) takes this, shared

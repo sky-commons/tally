@@ -3,7 +3,7 @@
 //! solved. The receivers and their open raw are its [`Intake`] (`intake`): an engine holds its
 //! own ([`Engine::new`]), or its host holds them split by receiver and hands it the sealed bins
 //! and what each batch says to provisional solving ([`Engine::hosted`]: a relay's raw shards,
-//! RFC-0177 §5), and the same raw solves to the same bytes either way. Nothing here reads a clock or a socket: the caller says what time it is, so the same
+//! RFC-0178 §5), and the same raw solves to the same bytes either way. Nothing here reads a clock or a socket: the caller says what time it is, so the same
 //! records in any order leave the same state, and the same state solves to the same bytes
 //! (`window`).
 //!
@@ -19,7 +19,7 @@
 //!   prefilter and, when a bin is sealed, its canonical thinning), in 24 bytes an observation. The
 //!   raw it holds is the one store its host keeps (`Engine::sealed_bins` is what the host's other
 //!   readers, a relay's standing, share), sealed on `Settings::threads` threads.
-//! - **Capacity is configuration, and refusal is whole and never by order** (RFC-0177 §9). How many
+//! - **Capacity is configuration, and refusal is whole and never by order** (RFC-0178 §9). How many
 //!   receivers it seats and what its raw may hold come from `Settings::capacity`, which a relay
 //!   derives from the receivers it admits. Who is seated is the best ranked of those described
 //!   (`intake::Seats`), whatever order they came in; one outranked is refused whole (its raw never
@@ -44,10 +44,10 @@ use crate::provisional::{self, Provisional};
 use crate::window::{Job, Outcome, Report};
 
 /// The fewest receivers an engine is sized for: a region's whole receiver population at the
-/// founder's requirement (RFC-0177: one relay, 20,000 feeders).
+/// founder's requirement (RFC-0178: one relay, 20,000 feeders).
 pub const MIN_RECEIVERS: usize = 20_000;
 
-/// How much an engine holds, derived from what its host admits (RFC-0177 §9).
+/// How much an engine holds, derived from what its host admits (RFC-0178 §9).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Capacity {
     /// Receivers described at once, taking part or not: every receiver whose raw reaches it (a

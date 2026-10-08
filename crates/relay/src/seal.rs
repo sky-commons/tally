@@ -1,4 +1,4 @@
-//! Sealing by watermark, off the hot path (RFC-0177 §4). A message thread owns its open epochs.
+//! Sealing by watermark, off the hot path (RFC-0178 §4). A message thread owns its open epochs.
 //! When its watermark (`exchange::Watermark`) passes the end of one, it decides that epoch's
 //! receptions, swaps its generations ([`Closer`]) and hands the frozen result to the sealer
 //! (`products::Sealer`, its own thread) through a bounded queue it never waits on; no lock is held

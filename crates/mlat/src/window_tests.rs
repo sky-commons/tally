@@ -100,7 +100,7 @@ fn the_same_raw_signs_the_same_bytes_whatever_the_order_copies_and_threads() -> 
     assert_eq!(report.rejected, 0, "{report:?}");
     assert!(one.iter().any(|r| matches!(r, Record::ClockModel(_))));
     assert!(one.iter().any(|r| matches!(r, Record::Positions(_))));
-    // Sealing and solving spread over 2, 8 and 32 threads (RFC-0177 invariant 1).
+    // Sealing and solving spread over 2, 8 and 32 threads (RFC-0178 invariant 1).
     for threads in [2, 8, 32] {
         let mut rng = Rng::new(77 + threads as u64);
         let mut second = engine(9, Vec::new(), threads);

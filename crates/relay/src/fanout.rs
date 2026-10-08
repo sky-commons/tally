@@ -1,4 +1,4 @@
-//! Fan-out to subscribers (RFC-0177 §8). A [`Router`] keyed by subscription cell feeds one queue
+//! Fan-out to subscribers (RFC-0178 §8). A [`Router`] keyed by subscription cell feeds one queue
 //! per subscriber ([`Queue`]), bounded in bytes and in time ([`Bounds`]): a subscriber whose queue
 //! would hold more than [`BEHIND_MS`] of inbound, or more bytes than its bound, has fallen behind and
 //! is let go with a Goodbye that says so (`Reason::FellBehind`), never cut for a full shared ring,

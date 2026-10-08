@@ -47,7 +47,7 @@ rust_test(
     rustc_flags = SOLVER_RUSTC_FLAGS,
 )
 
-# The holder's byte accounting against an allocator that counts every byte (RFC-0177 §5): a binary
+# The holder's byte accounting against an allocator that counts every byte (RFC-0178 §5): a binary
 # of its own, since a counting allocator is global and nothing else may allocate while it measures.
 rust_test(
     name = "held_bytes",

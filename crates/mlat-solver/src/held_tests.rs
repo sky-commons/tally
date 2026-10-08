@@ -174,7 +174,7 @@ fn fill(receptions: &[Reception], opens: &mut [Open], owner: impl Fn(&PublicKey)
     }
 }
 
-/// RFC-0177 invariant 4: sealing the raw of a bin split among owners by receiver, in any split,
+/// RFC-0178 invariant 4: sealing the raw of a bin split among owners by receiver, in any split,
 /// on any number of threads, gives the bin one whole holder seals, byte for byte.
 #[test]
 fn sealing_any_split_by_receiver_gives_the_whole_holders_bin() {

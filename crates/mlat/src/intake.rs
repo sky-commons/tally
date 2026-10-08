@@ -1,4 +1,4 @@
-//! The receiver side of an engine (RFC-0171 §3.8.1, RFC-0177 §5): which receivers take part, the
+//! The receiver side of an engine (RFC-0171 §3.8.1, RFC-0178 §5): which receivers take part, the
 //! sequences each has used, their open raw (`tally_mlat_solver::held::Open`) and what each batch
 //! says to provisional solving (`provisional::notes_of`). Everything here belongs to one receiver,
 //! so it splits by receiver: an engine that holds its own raw keeps one [`Intake`] (`Engine::new`),
@@ -12,7 +12,7 @@
 //!   location no coarser than it allows (`tally_mlat_solver::obs::MAX_SITE_PRECISION_M`).
 //! - A batch is used once: from a receiver that takes part, with a (boot, sequence) not already used
 //!   and not too far behind that boot's newest (§3.1).
-//! - **Room is shared, refusal is whole, and neither depends on order** (RFC-0177 §9). The
+//! - **Room is shared, refusal is whole, and neither depends on order** (RFC-0178 §9). The
 //!   receivers seated across every intake of one engine are bounded by one count ([`Seats`],
 //!   `Capacity::receivers`), and who is seated is a function of who is described: the best ranked
 //!   (taking part first, then key), whatever order they came in and whichever intake took them. A
@@ -76,7 +76,7 @@ impl Places {
     }
 }
 
-/// The seats for described receivers, shared by every intake of one engine (RFC-0177 §9). Who is
+/// The seats for described receivers, shared by every intake of one engine (RFC-0178 §9). Who is
 /// seated is a function of who is described, never of the order they came in or of which intake
 /// took them: the `limit` best ranked ([`Rank`]: taking part first, then key), and up to `limit`
 /// more waiting; beyond that the worst ranked are forgotten with their descriptions, which bounds

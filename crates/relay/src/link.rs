@@ -504,7 +504,7 @@ where
         },
         _ => None,
     };
-    // And only with its bytes reserved in every store (`budget`, RFC-0177 §9): a feeder the
+    // And only with its bytes reserved in every store (`budget`, RFC-0178 §9): a feeder the
     // relay's memory cannot hold is turned away now, never dropped from a store later.
     let _reserved = match peer {
         Peer::Feeder(_) => match hub.budget().reserve() {
@@ -1033,14 +1033,14 @@ async fn read_loop<S: AsyncRead>(
     } = reading;
     // `CREDIT` batches in the ingest stage at once (a relay's link `RELAY_CREDIT`, as it carries
     // many receivers): with none left the socket is not read, and TCP holds the sender back
-    // (RFC-0177 §2).
+    // (RFC-0178 §2).
     let credit = match peer {
         Peer::Member | Peer::Relay => Credit::new(crate::ingest::RELAY_CREDIT),
         Peer::Feeder(_) | Peer::Subscriber | Peer::Engine(_) | Peer::Probe => Credit::default(),
     };
     let ingest_gauge = hub.budget().gauge(crate::budget::Store::Ingest);
     // A sharing member forwards many receivers' records: it is admitted as the feeders its ingest
-    // ceiling is worth, reserved in every store as theirs would be (RFC-0177 §9), for as long as
+    // ceiling is worth, reserved in every store as theirs would be (RFC-0178 §9), for as long as
     // it is a member. A directory link becomes one when its offer is verified, so this is taken
     // when it first is.
     let mut membership: Option<crate::budget::Reservation> = None;
