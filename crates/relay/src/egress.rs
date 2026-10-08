@@ -193,7 +193,8 @@ impl Cap {
     }
 }
 
-/// A count of bytes as a person reads a bill: decimal, to two places.
+/// A count of bytes as a person reads a bill: decimal, to two places, rounded up, since every figure
+/// it prints is a ceiling (what a cap allows at most) and must never read lower than the truth.
 pub fn decimal(bytes: u64) -> String {
     const UNITS: [(u64, &str); 4] = [
         (1_000_000_000_000, "TB"),
@@ -203,7 +204,7 @@ pub fn decimal(bytes: u64) -> String {
     ];
     for (size, unit) in UNITS {
         if bytes >= size {
-            let hundredths = u128::from(bytes) * 100 / u128::from(size);
+            let hundredths = (u128::from(bytes) * 100).div_ceil(u128::from(size));
             return format!("{}.{:02} {unit}", hundredths / 100, hundredths % 100);
         }
     }
@@ -1331,7 +1332,7 @@ mod tests {
         // 10 Mbit/s for 31 days, and a second's burst: about 3.35 TB.
         let cap = Cap::bytes_per_sec(1_250_000);
         assert_eq!(cap.most_a_month(), 1_250_000 * SECONDS_A_MONTH + 1_250_000);
-        assert_eq!(decimal(cap.most_a_month()), "3.34 TB");
+        assert_eq!(decimal(cap.most_a_month()), "3.35 TB");
         assert_eq!(decimal(1_250_000 * 30 * 86_400), "3.24 TB");
         assert_eq!(Cap::NONE.most_a_month(), 0);
         // A small cap still has room for the largest grant and the control reserve.

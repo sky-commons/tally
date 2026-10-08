@@ -32,12 +32,14 @@ rust_library(
     ],
 )
 
+# Public: what is deployed packs it (the Flightlines repository's images of the public relay).
 rust_binary(
     name = "tally-relay",
     srcs = ["src/main.rs"],
     edition = "2024",
     lint_config = ":cargo_lints",
     version = "0.1.0",
+    visibility = ["//visibility:public"],
     deps = [
         ":relay",
         "//tally/crates/wire",
