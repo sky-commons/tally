@@ -22,7 +22,7 @@ How Tally's binaries are installed on a Linux box with systemd (248 or later).
   `/etc/default/tally-relay`. Its upload cap is `TALLY_RELAY_MAX_UPLOAD` there too; the unit's
   default, `2Mbit/s` (at most about 670 GB in 31 days), is deliberately small, and the operator
   sets it for the host's plan (`../README.md`, "What a relay costs"): the bill can never exceed the
-  cap times the seconds in a month, so `10Mbit/s` is at most about 3.34 TB. The cap keeps no state.
+  cap times the seconds in a month, so `10Mbit/s` is at most about 3.35 TB. The cap keeps no state.
 
 A release therefore carries `install.sh`, `tally-feed-x86_64-linux`, `tally-feed-aarch64-linux` and
 `tally-feed.service`, each with a `.sha256` whose first field is the file's hash. The binaries are

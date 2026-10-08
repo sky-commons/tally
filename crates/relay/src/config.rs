@@ -19,7 +19,7 @@ usage: tally-relay --key FILE [--key FILE]... --max-upload RATE [options]
                          (decimal, as hosts state them, but for the KiB family), e.g.
                          10Mbit/s. It bounds the bill: the relay never sends more than this
                          rate times the seconds in a month, so 10Mbit/s is
-                         at most about 3.34 TB in 31 days. Under the cap control goes first,
+                         at most about 3.35 TB in 31 days. Under the cap control goes first,
                          then positions and clock models, then raw to relay links and
                          engines, then the rest they are sent, then plain subscribers, each
                          class fairly among its peers; once a send has waited past 2 s, a
@@ -132,9 +132,10 @@ pub struct Config {
 const CAP_REQUIRED: &str = "\
 --max-upload is required: a relay sends every subscriber what it asks for, and what a relay sends
 is what its host bills. Name the most this relay may send a second, which bounds the bill: it can
-never send more than that rate times the seconds in a month. For example --max-upload 8Mbit/s is
-at most about 2.67 TB in 31 days, inside a $12 Lightsail plan's 3 TB (AWS bills $0.09 a GB beyond
-it). tally/README.md, \"What a relay costs\", prices common hosts.";
+never send more than that rate times the seconds in a month. For example --max-upload 6Mbit/s is
+at most about 2.01 TB in 31 days, which leaves about 1 TB of a $12 Lightsail plan's 3 TB for what
+feeders send in, which counts toward it too (AWS bills $0.09 a GB of the excess out). tally/README.md,
+\"What a relay costs\", prices common hosts.";
 
 impl Config {
     /// `None` when the command was fully handled (usage, keygen).
@@ -542,13 +543,14 @@ mod tests {
         assert!(refused.contains("--max-upload is required"), "{refused}");
         assert!(refused.contains("What a relay costs"), "{refused}");
         // The safe example it names is what it says, and inside the plan it names.
-        let safe = Cap::parse("8Mbit/s")?;
+        let safe = Cap::parse("6Mbit/s")?;
         let bound = egress::decimal(safe.most_a_month());
         assert!(
-            refused.contains(&format!("--max-upload 8Mbit/s is\nat most about {bound}")),
+            refused.contains(&format!("--max-upload 6Mbit/s is\nat most about {bound}")),
             "{refused}"
         );
-        assert!(safe.most_a_month() <= 3_000_000_000_000);
+        // Inside the plan with the terabyte it says it leaves for what comes in.
+        assert!(safe.most_a_month() + 990_000_000_000 <= 3_000_000_000_000);
         Ok(())
     }
 

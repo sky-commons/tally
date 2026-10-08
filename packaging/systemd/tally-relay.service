@@ -11,9 +11,10 @@
 # "What a relay costs"). It bounds the bill: the relay never sends more than this rate times the
 # seconds in a month. The default below is deliberately small, so a relay nobody configured cannot
 # run up a bill: 2Mbit/s is at most about 670 GB in 31 days. The operator must set it for this
-# host's plan in /etc/default/tally-relay, for example TALLY_RELAY_MAX_UPLOAD=8Mbit/s on a $12
-# Lightsail plan (at most about 2.67 TB in 31 days, inside its 3 TB; 10Mbit/s would be up to about
-# 3.34 TB). The cap keeps no state, so nothing needs to survive a restart.
+# host's plan in /etc/default/tally-relay, for example TALLY_RELAY_MAX_UPLOAD=6Mbit/s on a $12
+# Lightsail plan (at most about 2.01 TB in 31 days, leaving about 1 TB of its 3 TB for what feeders
+# send in, which counts toward it too; 10Mbit/s would be up to about 3.35 TB out alone). The cap keeps
+# no state, so nothing needs to survive a restart.
 #
 # Needs systemd 248 or later (LoadCredential and the %d specifier).
 

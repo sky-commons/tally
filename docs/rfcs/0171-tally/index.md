@@ -269,8 +269,9 @@ hard and never goes dark; it only sends lower-priority traffic slower.
 
 - `--max-upload RATE` is required (`kbit/s`, `Mbit/s`, `Gbit/s`, `kB/s`, `MB/s`, `GB/s`, decimal as
   hosts state them, or `KiB/s`, `MiB/s`, `GiB/s`); the relay refuses to start without it, naming
-  `8Mbit/s` (at most 2.67 TB in 31 days, inside a $12 Lightsail plan's 3 TB) and saying that the
-  bill can never exceed the cap times the seconds in a month. `0` with a unit sends nothing billed,
+  `6Mbit/s` (at most 2.01 TB out in 31 days, leaving about 1 TB of a $12 Lightsail plan's 3 TB for
+  what feeders send in, since both directions count) and saying that the bill can never exceed the
+  cap times the seconds in a month. `0` with a unit sends nothing billed,
   and a hub built in code with no cap sends nothing billed. There is no period, no state file and
   nothing to reset on a restart.
 - Every byte written to a peer passes one place, the socket (`egress::Socket`): handshakes, rate
