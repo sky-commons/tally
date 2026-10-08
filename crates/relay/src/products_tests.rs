@@ -372,8 +372,9 @@ fn gather(inputs: &Inputs, second: u64, reversed: bool) -> Result<(Identity, Vec
         }
     }
     if reversed {
-        // The model last: every solution waited for it.
-        products.clock_model(&inputs.mlat.model, now);
+        // The model last (stamped after them, records are taken in by stamp): every solution
+        // waited for it.
+        products.clock_model(&inputs.mlat.model, now + 1);
     }
     let mut out = Vec::new();
     for record in tick(&products, Some(&relay), sealed_at(second + 1)) {
@@ -568,8 +569,9 @@ fn no_aircraft_has_two_fixes_in_one_second_and_a_late_fix_is_dropped() -> Result
     // A fix for a second already sealed is late, and changes nothing published.
     let late = mlat.solutions(&[0x00c0_0003], first * 1_000 + 500, 0, false, 9_999)?;
     products.positions(&late, BASE_MS + 15_000);
-    assert_eq!(products.report().world_late, 1);
+    // Taken in once the watermark passes its stamp.
     let after = tick(&products, Some(&relay), BASE_MS + 15_250);
+    assert_eq!(products.report().world_late, 1);
     assert!(
         !after
             .iter()
@@ -745,6 +747,8 @@ fn a_peer_regional_batch_is_forwarded_once_unchanged_within_the_areas_taken() ->
     ] {
         assert!(products.regional_from(&asker, batch, now).is_empty());
     }
+    // The sealer takes them in once the watermark passes their stamp.
+    products.advance(now + 1);
     let out = products.take_forward();
     let came_on = relay_asker(peer).source;
     assert_eq!(out, vec![(came_on, taken.clone())]);
@@ -752,6 +756,7 @@ fn a_peer_regional_batch_is_forwarded_once_unchanged_within_the_areas_taken() ->
     assert_eq!(products.report().regional_stale, 1);
     // Heard back from another peer: already forwarded.
     products.regional_from(&relay_asker(peer), taken, now + 50);
+    products.advance(now + 51);
     assert!(products.take_forward().is_empty());
     Ok(())
 }
@@ -1094,12 +1099,18 @@ fn every_drop_is_counted_by_why() -> Result<()> {
     products.clock_model(&mlat.model, BASE_MS);
     let ahead = mlat.solutions(&[0x00c0_0001], BASE_MS + 60_000, 0, true, 1)?;
     products.positions(&ahead, BASE_MS);
+    products.advance(BASE_MS + 1);
     assert_eq!(products.report().world_out_of_window, 1);
     // Positions under a model never shown: they wait, then expire, counted.
     let other = Mlat::new()?;
     let waiting = other.solutions(&[0x00c0_0002], BASE_MS, 0, false, 2)?;
     products.positions(&waiting, BASE_MS);
-    tick(&products, None, BASE_MS + WAITING_MS + 1);
+    // Handed in after the watermark passed `BASE_MS + 1`, it is stamped there, never earlier, so
+    // it waits from then: still waiting a full `WAITING_MS` later, expired just after.
+    let stamped = BASE_MS + 1;
+    tick(&products, None, stamped + WAITING_MS);
+    assert_eq!(products.report().positions_waiting_expired, 0);
+    tick(&products, None, stamped + WAITING_MS + 1);
     assert_eq!(products.report().positions_waiting_expired, 1);
     // An epoch gathered from two message threads, one of whose parts was lost: refused whole.
     let refusing = Arc::new(Products::with_boot(1, 2));
@@ -1121,11 +1132,81 @@ fn every_drop_is_counted_by_why() -> Result<()> {
     let peer = Identity::generate().map_err(err)?.public();
     let atlanta = area_of(&place(33.7, -84.4)).map_err(err)?;
     products.set_taken(vec![atlanta]);
+    // Past the watermark already taken (a record is never stamped before it).
+    let now = stamped + WAITING_MS + 2;
     for sequence in 0..=FORWARD_HELD as u64 {
-        let batch = regional(&origin, atlanta, sequence, BASE_MS, Vec::new())?;
-        products.regional_from(&relay_asker(peer), batch, BASE_MS + 100);
+        let batch = regional(&origin, atlanta, sequence, now - 100, Vec::new())?;
+        products.regional_from(&relay_asker(peer), batch, now);
     }
+    products.advance(now + 1);
     assert_eq!(products.report().regional_forward_full, 1);
     assert_eq!(products.take_forward().len(), FORWARD_HELD);
+    Ok(())
+}
+
+/// RFC-0178 §10 and invariant 1 for the records that are not epochs: they wait in a queue of their
+/// own, so a peer flooding them is refused (counted) and never costs this relay an epoch; and a
+/// world candidate is in time or late by its stamp against the watermark that seals its second,
+/// never by when it was handled: two candidates handed in together, before that watermark is
+/// reached, one stamped before it and one at it, are the first in time and the second late.
+#[test]
+fn records_wait_apart_from_the_epochs_and_are_taken_in_by_stamp() -> Result<()> {
+    // The flood: more records than wait, stamped far ahead so none is taken in.
+    let products = Arc::new(Products::with_boot(1, 1));
+    products.on_thread(1, None)?;
+    let mlat = Mlat::new()?;
+    let flood = mlat.solutions(&[0x00c0_0001], BASE_MS, 0, true, 1)?;
+    for _ in 0..super::RECORDS_HELD + 10 {
+        products.positions(&flood, BASE_MS + 1_000_000);
+    }
+    let sink = products.sink();
+    for closed_before in 1..=100 {
+        let marker = crate::exchange::Frozen {
+            closed_before,
+            ..crate::exchange::Frozen::default()
+        };
+        assert!(
+            sink(marker),
+            "an epoch's word refused behind a flood of records"
+        );
+    }
+    let started = std::time::Instant::now();
+    while products.watermark_ms() < 100 * crate::seal::EPOCH_MS {
+        if started.elapsed() > std::time::Duration::from_secs(60) {
+            return Err("the sealer never took the epochs".to_owned());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    let report = products.report();
+    assert_eq!((report.records_refused, report.epochs_refused), (10, 0));
+
+    // By stamp: second `s` seals once the watermark reaches `(s + 1) s + WORLD_SETTLE_MS`.
+    let relay = Identity::generate().map_err(err)?;
+    let products = Products::new();
+    products.set_world(true);
+    let mlat = Mlat::new()?;
+    let second = BASE_MS / 1_000;
+    let seals = sealed_at(second);
+    products.clock_model(&mlat.model, BASE_MS);
+    let in_time = mlat.solutions(&[0x00c0_0001], BASE_MS + 100, 0, true, 1)?;
+    let late = mlat.solutions(&[0x00c0_0002], BASE_MS + 200, 0, true, 2)?;
+    products.positions(&late, seals);
+    products.positions(&in_time, seals - 1);
+    let mut addresses = Vec::new();
+    for now in [seals, seals + 1] {
+        for record in tick(&products, Some(&relay), now) {
+            if let Record::WorldPositions(world) = record {
+                let content = world.content().map_err(err)?;
+                addresses.extend(
+                    content
+                        .fixes
+                        .iter()
+                        .map(|fix| (content.second, fix.address)),
+                );
+            }
+        }
+    }
+    assert_eq!(addresses, vec![(second, 0x00c0_0001)]);
+    assert_eq!(products.report().world_late, 1);
     Ok(())
 }

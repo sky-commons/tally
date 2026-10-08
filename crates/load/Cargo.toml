@@ -23,6 +23,8 @@ serde_json.workspace = true
 tally-feed = { path = "../feed" }
 # What the feeders hear: the MLAT simulator's receivers and aircraft (`sim`).
 tally-mlat-solver.workspace = true
+# The relay's own rules the harness's expectations follow (its deduplication window).
+tally-relay.workspace = true
 tally-wire.workspace = true
 tokio.workspace = true
 

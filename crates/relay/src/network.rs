@@ -251,12 +251,14 @@ impl Network {
                 self.credit.evidence(asker, bundle, now_ms);
                 Vec::new()
             }
-            Record::WorldPositions(world) => self.products.world_from(asker, world, now_ms),
-            Record::WorldPrecise(world) => self.products.precise_from(asker, world, now_ms),
+            // The products take a record in by its stamp against their watermark, so it is
+            // stamped by the ingest clock their watermark comes from (`products::Records`).
+            Record::WorldPositions(world) => self.products.world_from(asker, world, hub.now_ms()),
+            Record::WorldPrecise(world) => self.products.precise_from(asker, world, hub.now_ms()),
             Record::RegionalBatch(regional) => {
                 let record = Record::RegionalBatch(regional.clone());
                 self.from_peer(hub, asker, &record, now_ms);
-                self.products.regional_from(asker, regional, now_ms)
+                self.products.regional_from(asker, regional, hub.now_ms())
             }
             Record::Parity(chunk) => self.sharing.parity_chunk(asker, chunk, now_ms),
             // A bundler's index: checked, and passed on to whoever reads the parent cell.
@@ -276,7 +278,7 @@ impl Network {
         self.credit.described(info.clone(), now_ms);
         self.products.described(info);
         if let Some(mlat) = self.mlat() {
-            mlat.offer(&Record::ReceiverInfo(info.clone()), now_ms);
+            mlat.offer_description(info);
         }
     }
 
@@ -295,7 +297,8 @@ impl Network {
         }
     }
 
-    /// Final or provisional positions the hub forwarded (new, verified).
+    /// Final or provisional positions the hub forwarded (new, verified), at `now_ms` by the
+    /// ingest clock (the products take them in by it).
     pub fn on_positions(&self, positions: &Positions, now_ms: u64) {
         self.products.positions(positions, now_ms);
         self.standing.positions(positions, now_ms);
@@ -479,7 +482,7 @@ impl Network {
                 self.standing.set_areas(&areas);
                 mlat.set_areas(areas, hub.descriptions());
             }
-            let published = mlat.take_published(now_ms);
+            let published = mlat.take_published(self.products.watermark_ms());
             // A model's parts come before its manifest; held first, they place it.
             for record in &published {
                 match record {

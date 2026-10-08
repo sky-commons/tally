@@ -3,6 +3,7 @@
 //! (`tally_relay::stats`), a stand-in readsb answers its own API queries, and the API serves all
 //! three endpoints from them over loopback HTTP, with CORS, caching and the rate limit on each.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -461,25 +462,41 @@ async fn a_preflight_allows_what_the_client_core_sends_and_costs_no_token() -> R
     Ok(())
 }
 
-/// A scenario on yesterday's UTC day, so every window bin of it is long past by an engine's clock.
-fn yesterday(scenario: Scenario) -> Scenario {
-    let now = std::time::SystemTime::now()
+fn wall_ms() -> u64 {
+    std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_millis() as u64);
+        .map_or(0, |elapsed| elapsed.as_millis() as u64)
+}
+
+/// How long before now the scenario starts: its window bins are past by the relays' clock once it
+/// is the wall clock again (a 30 s scenario, a window after it and its settling).
+const SCENARIO_AGO_MS: u64 = 150_000;
+/// What the relays' ingest clock is held at while the scenario is fed: before its first bin, so
+/// every batch is stamped before the step that takes its bin (RFC-0178: raw is late by its stamp,
+/// never by when a step ran), and few enough steps before now that the first step is soon.
+const HELD_AGO_MS: u64 = 180_000;
+
+/// A scenario that began `SCENARIO_AGO_MS` ago, so every window bin of it is past by the time the
+/// relays' clock is released.
+fn minutes_ago(scenario: Scenario) -> Scenario {
+    let start_ms = wall_ms() - SCENARIO_AGO_MS;
     Scenario {
-        midnight_unix_ms: (now / 86_400_000 - 1) * 86_400_000,
+        midnight_unix_ms: start_ms - start_ms % 86_400_000,
+        start_tod_s: (start_ms % 86_400_000) as f64 / 1000.0,
         ..scenario
     }
 }
 
 /// A relay's hosted MLAT (`tally_relay::mlat_host`, RFC-0174 §2.1: the relay and its MLAT are
 /// one program) pinned to the simulator's areas, whose steps wait until it has taken `batches`
-/// batches: the scenario is a day old, so every window is due the moment the engine looks, and a
-/// step on the clock would solve whatever raw a slow machine had delivered by then.
+/// batches, and which then releases its relay's clock (`released`): the scenario is past, so every
+/// window is due the moment the engine looks, and a step on the clock would solve whatever raw a
+/// slow machine had delivered by then.
 struct Held {
     host: HostedMlat,
     areas: Vec<Region>,
     batches: u64,
+    released: Arc<AtomicBool>,
 }
 
 impl MlatHost for Held {
@@ -487,8 +504,8 @@ impl MlatHost for Held {
         self.host.set_areas(self.areas.clone(), descriptions);
     }
 
-    fn offer(&self, record: &Record, now_ms: u64) {
-        self.host.offer(record, now_ms);
+    fn offer_description(&self, info: &tally_wire::ReceiverInfo) {
+        self.host.offer_description(info);
     }
 
     fn offer_batch(&self, batch: &std::sync::Arc<tally_wire::Decoded>, now_ms: u64) {
@@ -501,6 +518,7 @@ impl MlatHost for Held {
 
     fn take_published(&self, now_ms: u64) -> Vec<Record> {
         if self.host.ingested() >= self.batches {
+            self.released.store(true, Ordering::SeqCst);
             self.host.take_published(now_ms)
         } else {
             Vec::new()
@@ -546,7 +564,20 @@ async fn mlat_relay(batches: u64) -> Result<(RelayAddress, Arc<Hub>)> {
     let listener = TcpListener::bind("127.0.0.1:0").await.map_err(text)?;
     let address = listener.local_addr().map_err(text)?;
     // Every feeder here comes from loopback: more than one host's share of connections.
-    let hub = Arc::new(Hub::new(8).max_connections_per_address(64));
+    // Its ingest clock is held before the scenario until every batch is in (`Held`).
+    let released = Arc::new(AtomicBool::new(false));
+    let held_ms = wall_ms() - HELD_AGO_MS;
+    let clock: tally_relay::ingest::Clock = Arc::new({
+        let released = Arc::clone(&released);
+        move || {
+            if released.load(Ordering::SeqCst) {
+                wall_ms()
+            } else {
+                held_ms
+            }
+        }
+    });
+    let hub = Arc::new(Hub::clocked(8, clock).max_connections_per_address(64));
     let areas = areas()?;
     let host = HostedMlat::new(
         identity.clone(),
@@ -557,12 +588,13 @@ async fn mlat_relay(batches: u64) -> Result<(RelayAddress, Arc<Hub>)> {
             threads: 4,
             capacity: tally_mlat::engine::Capacity::default(),
         },
-    );
+    )?;
     host.set_areas(areas.clone(), Vec::new());
     hub.network().host_mlat(Arc::new(Held {
         host,
         areas,
         batches,
+        released,
     }));
     tokio::spawn(tally_relay::serve(
         listener,
@@ -630,7 +662,7 @@ async fn feed_simulation(
 /// every record both relays carried holds, aircraft both relays solved included.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_api_serves_one_merged_mlat_position_per_aircraft_from_two_relays() -> Result {
-    let simulation = sim::run(&yesterday(Scenario {
+    let simulation = sim::run(&minutes_ago(Scenario {
         duration_s: 30.0,
         modes_aircraft: 16,
         ..Scenario::new(31)
@@ -651,7 +683,7 @@ async fn the_api_serves_one_merged_mlat_position_per_aircraft_from_two_relays() 
     let (_, _, stats_url) = start_relay().await?;
     let mut settings = Settings::new(stats_url, readsb_url);
     settings.mlat.relays = vec![west.clone(), east.clone()];
-    // The scenario ran yesterday.
+    // The scenario ran minutes ago.
     settings.mlat.max_age = Duration::from_secs(3 * 86_400);
     let api = start_api(settings).await?;
     // A client of its own on both relays: every record the API could have read.

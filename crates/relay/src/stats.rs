@@ -225,7 +225,7 @@ mod tests {
                 threads: 1,
                 capacity: tally_mlat::engine::Capacity::default(),
             },
-        ));
+        )?);
         let hub = Arc::new(Hub::new(8));
         hub.network().host_mlat(hosted);
         let listener = TcpListener::bind("127.0.0.1:0").await.map_err(text)?;

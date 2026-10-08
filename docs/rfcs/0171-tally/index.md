@@ -133,8 +133,8 @@ measurement session (RFC-0174 §2.2's round-trip probing and delivery check): it
 `Echo` and `DeliveryQuery` (`Role::may_send`; a query also carries the feeder's tag keys for the
 member, RFC-0178 §7), is answered, and is never admitted as a feeder or
 a subscriber, so measuring a relay takes none of its feeder slots and is sent none of its streams.
-A probe that sends anything else is ended with `Goodbye{Protocol}`. A full relay still answers a
-probe.
+A probe that sends a delivery query of the retired form is ended with `Goodbye{Retired}`; one that
+sends anything else, with `Goodbye{Protocol}`. A full relay still answers a probe.
 
 ### §3.4 Records, and the rules that let them change without the feeder
 
@@ -159,7 +159,7 @@ record is a kind byte, a two-byte length, a body; a Noise message carries whole 
 | 0x0e | `FaultProof`   | two signed solutions of one inputs that disagree, or two signed models of one inputs that differ; checked before forwarding |
 | 0x0f | `ClockModelPart` | one part of a clock model too large for its manifest, checked against it (§3.8.1) |
 | 0x10 | `Provisional`  | a relay's signed provisional solutions (`Positions` format 4), superseded by final ones; only to subscribers that asked (`PROVISIONAL`, §3.8.1) |
-| 0x11 to 0x21 | RFC-0174's records | echo, delivery check, provider directory, sharing groups, credit, the regional and the two world products, parity and bundle index (RFC-0174 §2.10); transport version 2, the minimum |
+| 0x11 to 0x23 | RFC-0174's records | echo, delivery check, provider directory, sharing groups, credit, the regional and the two world products, parity and bundle index (RFC-0174 §2.10); transport version 2, the minimum. 0x13 and 0x14 are retired (the first delivery check), read as retired and never written; the delivery check is 0x22 and 0x23 (RFC-0178 §7) |
 
 The extension rules, which are what a frozen feeder relies on:
 
@@ -169,6 +169,10 @@ The extension rules, which are what a frozen feeder relies on:
 - An enum value a reader does not know is kept as `Other`, never an error. The exception is
   evidence: a delivery answer's possession kind a reader does not know is an error, never read
   as a proof.
+- A record whose meaning changes takes a new kind, and a signed one a new format; its old kind is
+  retired, never reused. The appended-field rule cannot carry a change of meaning: a reader that
+  ignores the new bytes reads the old meaning into them. The delivery check's two forms are the
+  case (RFC-0178 §7).
 - Every record body has one check of what makes it well formed (ranges ascending and exact,
   spans bounded, a position on the globe, one product where one is named), and the codec runs it
   on every encode and every decode (`tally_wire::Check`), so no value that breaks it is written or
@@ -755,6 +759,45 @@ over it. As built:
   it, stating `position_source` (`adsb` or `mlat`) and, for MLAT, the horizontal sigma, the check
   it passed (`model`, `signature` or `resolved`) and its `kind` (`final`, or `provisional` while
   later than every final fix).
+
+#### §3.8.2 Who checks a position
+
+Verification is delegated, not universal. No one checks every fix against raw, and nothing here
+needs anyone to; each fix is checked by whoever is placed to, and says which check it passed.
+
+- **The relay that signs it.** A relay's MLAT verifies every solution it signs as any checker
+  would, from the raw it holds (`publish::solve_published`, every one; one that fails is dropped
+  and counted). It does not verify its own clock model: that is for others.
+- **The other relays holding the area.** Every relay that covers an area's tiles holds the same raw
+  (§3.8.1) and computes the same positions to the same bytes. Two signatures over the same inputs
+  that disagree are a fault proof (`FaultProof`), which anyone checks with the two signed records
+  alone, no raw needed, and which travels to every reader of positions.
+- **A client holding raw** (the API with `--mlat-raw`) checks a fix itself: the model by the model
+  verifier and the solution by the solution verifier.
+- **A client holding no raw** relies on the signatures and content addresses: the solution and the
+  model it cites are signed, whole, and agree with each other. The API reports which of these each
+  fix passed (`MlatCheck`: `model`, `signature`, or `resolved` when it solved the fix itself from
+  two engines' raw).
+
+**The weak spot.** An area that one relay holds, or that only one operator's relays hold, has no
+independent check: nobody else computes its positions, so no disagreement can be signed, and a
+client without raw has only that operator's word. Several keys prove nothing here, since one
+operator can run any number.
+
+**The rule (decided 2026-10-08).** A fix counts as cross-checked only when at least two relays of
+different operators signed the same solution of the same inputs: agreeing signatures (two
+solutions of one inputs hash within the verifier's tolerance, which merge as one, §3.8.1) from
+signers whose declared networks differ (`ProviderOffer::network`, the same proxy for independence
+the delivery check uses, RFC-0174 §2.2). The API reports, per fix, the count of independent
+agreeing signers beside `MlatCheck`, so a client can require two and a map can mark a fix that has
+one. Nothing is refused for having one: a lone relay's fixes are served, counted as one. The
+directory aims to place at least two relays of different operators on every area (RFC-0174 §2.9),
+and the count is how a client sees where it has not yet.
+
+Open, to build: the merge already joins a duplicate's signer to the fix's relays (§3.8.1, "the
+full input set"); what is left is resolving each signer to its offer's network, counting the
+distinct networks, the count on `GET /v1/aircraft` (`tally_api_types::Mlat`), and the same count in
+the world products' fixes once more than one relay signs them.
 
 ### §3.9 Our own use, and the production rule
 

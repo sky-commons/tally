@@ -37,21 +37,64 @@ Measured on main (tally-load, commit b3e3571809 on branch tally-load):
 1. **Decode once.** `Batch` bytes become shared (`bytes::Bytes`). Ingest produces one immutable
    `Decoded` (receiver, boot, seq, wall, epoch, `stamp_ms` = ingest clock, `ingest_seq`, inflated
    `plain: Bytes`, `obs: Box<[ObsRef]>` with offsets into `plain` and ONE keyed 128-bit fingerprint per
-   reception, the receiver's resolved place). Every consumer (hub stream, products, standing/MLAT,
-   delivery, fan-out, BEAST out) takes `Arc<Decoded>`; nobody inflates, verifies or allocates per
-   reception again. The relay-hosted MLAT engine never re-verifies.
+   reception). Every consumer (hub stream, products, standing/MLAT, delivery, fan-out, BEAST out) takes
+   `Arc<Decoded>`; nobody inflates or verifies again. The relay-hosted MLAT engine never re-verifies.
+
+   As built (`tally_wire::Decoded`): there is no place field. A receiver's place is held, with its
+   admission and station counters, by the ingest worker that owns its raw shard (`exchange`, the raw
+   exchange), and a stage that places a reception reads it there. The signer's key is decompressed
+   once, when the batch is read (`Batch::from_bytes`), and kept; there is no call that checks a key
+   and decompresses it again. The regional products are signed from the receptions where their batches
+   hold them (`RegionalBatch::sign_draft`, one encoder for a borrowed or an owned reception), so a
+   regional record copies nothing. One allocation per kept reception remains, in the deduplicated
+   stream: the sealer hands each epoch's stream to the signer that runs each second, and that hold
+   outlives the epoch's batches, so it is an owned copy, charged to `Store::Products`.
 2. **Ingest stage on a dedicated CPU pool**, not Tokio workers. Connection tasks do I/O only, with a
    credit of k=2 batches in flight per connection; out of credit, stop reading the socket (TCP
-   pushes back; the feeder's signed `dropped` records its own loss). Workers: verify (Ed25519 batch
-   verification), hash, admit (per-receiver sequence/dedup, owned by receiver shard), inflate, decode.
+   pushes back; the feeder's signed `dropped` records its own loss). Workers: verify, hash, admit
+   (per-receiver sequence/dedup, owned by receiver shard), inflate, decode.
+
+   As built: each signature is verified strictly, one at a time, never by Ed25519 batch
+   verification. A batch equation accepts some signatures strict verification refuses (a torsion
+   component in `R` passes it one time in eight), and every reader of a relay's stream verifies
+   strictly, so a relay that verified in batches could be made to forward what its readers reject.
+   What batching would have saved is mostly the key's decompression, and that is done once per batch
+   (§1).
 3. **Keyed exchanges, owned shards, no locks on the per-reception path.** Fixed logical shard count
-   (e.g. 256) mapped onto threads; bounded queues per (producer, shard), carrying
-   `(Arc<Decoded>, index ranges)` per batch, not per reception. Keys are uniform hashes only, never
-   geography, so a dense area cannot make a hot shard:
-   - `message` shard by fingerprint: the ONE dedup (hub stream + per-area first-heard), two
-     generations swapped per window for O(1) expiry.
+   (256) mapped onto threads; bounded queues carrying `(Arc<Decoded>, index ranges)` per batch, not
+   per reception. Keys are uniform hashes only, never geography, so a dense area cannot make a hot
+   shard:
+   - `message` shard by fingerprint: the ONE dedup (hub stream + per-area first-heard), generations
+     swapped per epoch for O(1) expiry.
    - `raw` shard by receiver: open Held fragments, station counters.
    - `world`/`provisional` shard by ICAO address.
+
+   As built: the two keys a peer chooses, a receiver's key and an aircraft's address, are hashed
+   under a secret of the relay's process (`FingerprintKey::process`, each in its own domain listed
+   once in `tally_wire::decoded::keyed`), so no feeder can grind keys or report addresses that land
+   in one shard and evict the honest entries there. The per-receiver tables that remember streams
+   (the hub's sequence windows, delivery's tags) hold at most four boots a receiver
+   (`BOOTS_PER_AUTHOR`), so a feeder churning boot ids forgets only its own streams.
+
+   As built (`exchange`): one bounded queue per thread, shared by every producer that sends to it
+   (`QUEUE_SLICES` slices per producer), not one per (producer, shard): a producer sends each thread
+   one slice per batch covering every shard that thread owns, so a queue per shard would multiply the
+   sends by the shards a thread owns and buy no ordering the watermark does not already give. A
+   producer that finds a queue full waits, which holds its connections' credit: the back-pressure raw
+   meets (§10).
+
+   The dedup window changed with the epochs, and is now stated (`DEDUP_WINDOW_MS`, 2 s): a copy of
+   a message stamped up to 2 s after the copy kept is never kept again. The deduplication before the
+   stages held two 2 s generations (a copy was caught 2 to 4 s after the first); the first cut of the
+   exchange held one 1 s epoch and the one before, so a copy a feeder's network or a relay's queue
+   held back a second or more was kept again (at 20,000 feeders the stream carried 77,000 receptions a
+   second where 42,000 were messages). It holds `DEDUP_GENERATIONS` = 3 one-second generations, each
+   reserved at admission as if every reception were new.
+
+   Batches are ordered canonically: by stamp, then by the batch itself (receiver, boot, sequence;
+   `seal::canonical`), never by `ingest_seq`, the order the workers happened to take them in. Which
+   copy of a message is kept, and so the stream's and the regional products' bytes, follows the
+   stamps and the batches alone.
 4. **Seal by watermark, off the hot path.** Ingest workers send `Tick(stamp)` down every queue; a
    shard closes epoch e when the minimum watermark passes it, by swapping its open buffer; frozen
    buffers go to a sealer pool. No lock is held across a seal. Regional products merge copies per area
@@ -63,6 +106,20 @@ Measured on main (tally-load, commit b3e3571809 on branch tally-load):
    fit (`RegionalBatch::fits`, decided without signing; the sequence is a fixed-width field), the
    records are numbered in cell order by the one thread, then signed and their ADS-B fixes derived on
    as many threads as the message exchange has, and applied in sequence order by the one thread.
+   Records that are not epochs (positions, clock models, peers' world and regional records) wait in
+   a queue of their own (`products::Records`, bounded in count and bytes), so a flood of them refuses
+   records, counted, never an epoch. Before sealing an epoch or advancing the watermark the sealer
+   takes in every record stamped before it, sorted by stamp then hash; a record handed in later is
+   stamped no earlier than what was already taken. A slice that reaches its thread after its epoch
+   closed is dropped and counted (`receptions_late`), never merged into a later epoch.
+
+   The hosted MLAT steps on the same watermark: once per `STEP_MS` grid point the products'
+   watermark passes, in order, none coalesced. Its raw is late by its stamp (raw stamped at or after
+   the step that takes its bin is late, whenever it arrived), and provisional solving weighs a step's
+   notes in content order. What batches tell provisional solving is held until the step that weighs
+   it, charged to its own store (`Store::Notes`, two steps of a feeder's decoded batches and the
+   notes a step admits a seat).
+
    Measured at 20,000 feeders before the pool: the single sealer thread held a whole core and fell
    behind (deriving the regional batches' ADS-B fixes was 70% of it, `to_observation` 20%, signing
    9%); after, the sealer thread is at 0.1 to 0.3 of a core.
@@ -71,6 +128,16 @@ Measured on main (tally-load, commit b3e3571809 on branch tally-load):
    receiver (per-receiver sorts in parallel at seal), chunked storage (no doubling copies), byte
    accounting of what is really allocated. Standing is scoped to the areas this relay holds raw for and
    answers "unknown" outside them (decided: a relay cannot hold world raw, and relays are regional).
+
+   Held's size, one figure (it replaces the critics' "~8 GB" in the sizing below, and agrees with
+   RFC-0174 §2.11): what a relay hosting MLAT holds of raw at 20,000 feeders, measured, is 8.7 GB for
+   a canonical window (30 bytes an observation, index included) and about 12 GB with the open bins and
+   the bins standing settles in. What it reserves is more, because the reservation is a bound, not a
+   mean (`held::Rates::MEASURED.cost(SETTLE_MS)`): a receiver's open raw at its ceiling (1,800 wanted
+   receptions a second, five times the mean) over a bin and the settle, 7 s, about 0.35 MB with its
+   bins' fixed cost, plus its thinned raw (150 kept a second) over the 25 sealed bins a holder keeps
+   (`SEALED_BINS_HELD`), 0.75 MB: about 1.1 MB a receiver, 22.5 GB at 20,000. The critics' 8 GB was
+   the window's raw alone.
 6. **One batch byte store**: shared `Bytes` keyed by (receiver, boot, seq); others hold handles.
    Window = the sharing repair horizon derived from sharing's own constants (~12-15 s), not 60 s.
    As built: the sharing member is that store. A group holds a batch as the `Batch` itself
@@ -89,6 +156,18 @@ Measured on main (tally-load, commit b3e3571809 on branch tally-load):
    (boot, seq, relay bitmask) for the window plus bytes only for audited/withheld ones.
 
    As built (`tally_wire::delivery`, `tally-relay`'s `delivery`, `tally-feed`'s `delivery_check`):
+   - **Not the old form read differently.** The proof of possession this replaces travelled under
+     record kinds 0x13 and 0x14, and its answer was a format 1 `DeliveryAnswer` whose `Proved` entry
+     was a 32-byte proof under the same entry tag byte. Read by the other build, either form parses
+     as the other's fields and means nothing. So the tagged check has kinds of its own
+     (`KIND_DELIVERY_QUERY` 0x22, `KIND_DELIVERY_ANSWER` 0x23), which a build that predates them
+     skips as unknown (they are not critical, RFC-0171 §3.4), and its answer is format 2, whose
+     reader refuses format 1 and which a format 1 reader refuses (an old answer carried in an
+     `EvidenceBundle` included). A relay reads 0x13 and 0x14 as retired (`Record::Retired`, nothing
+     of the body read, never written) and answers an old feeder's query with a `Goodbye` of reason
+     `Retired`, which the old feeder takes as no answer from that member, never as evidence. Old
+     feeders' audits therefore find no answer at new relays until they update; nothing counts that
+     against a relay, and nothing is misread.
    - **The grant.** `TagKeys`, signed by the feeder, names the member, the key in force (its id is
      the key period, `wall_ms / KEY_PERIOD_MS`, five minutes) and the next, and how long until the
      next takes over by the member's clock. It rides in a `DeliveryQuery` (so a `Probe` session
@@ -140,7 +219,11 @@ Measured on main (tally-load, commit b3e3571809 on branch tally-load):
 8. **Fan-out**: replace the 4096-record broadcast with a router keyed by subscription cell into
    per-subscriber queues bounded in BYTES and TIME (L = 2 s of inbound); a full queue disconnects with a
    Goodbye that says "fell behind" (not "full"). Fed per receiver shard: per-receiver order holds,
-   description before first batch.
+   description before first batch. Fan-out never pushes back on the producers: a subscriber that
+   cannot keep up is let go, so one slow reader never slows ingest for every feeder. When an item
+   would pass the fan-out's budget, the subscriber holding most is let go the same way, and the next,
+   until it fits. A relay's directory link is the one exception: what it is sent is held whole
+   elsewhere, so it is sent that again (a resync) instead.
 9. **Capacity is admission, never a silent drop inside a store.** Each store's per-feeder bytes are
    reserved when a feeder is admitted, in the same headroom check RFC-0171 uses for egress; the feeder
    ceiling is derived from RAM and those formulas; Hello beyond it is refused ("no spare slot"). MLAT
@@ -170,10 +253,14 @@ Measured on main (tally-load, commit b3e3571809 on branch tally-load):
    bounded by count (4,096 commands), and each command was a whole epoch's part from one message
    thread, so the queue could hold some 500 seconds of every batch; the one sealer thread could not
    keep up, and 2.2 M decoded batches (18.6 GB) waited in it. With the gauges and the sealer pool:
-   2.3 GB resident at 20,000 feeders, flat.
+   3.1 GB resident at 20,000 feeders, flat (Sizing, below).
 
-10. **Overload policy (decided)**: back-pressure for raw, delivery and fan-out; whole-epoch refusal,
-    counted, for derived products.
+10. **Overload policy (decided)**: back-pressure for raw; whole-epoch refusal, counted, for derived
+    products; refusal whole, counted, for delivery tags (a batch past `TAGS_HELD` is never tagged and
+    never denied, §7); disconnection for fan-out (§8). Changed from "back-pressure for delivery and
+    fan-out" as built: back-pressure from either would let one slow subscriber, or a full tag store,
+    stall ingest for every feeder, and both have a loss that is counted and told (a "fell behind"
+    Goodbye, a batch left out of the audit) where back-pressure's is everyone's.
 11. **Connection buffers from a shared pool**, not zeroed 64 KiB per connection. As built
     (`tally_wire::noise::Buffer`): a session's reader and writer hold no buffer between messages.
     A message's frame, its plaintext and the records packed into it are written in buffers taken
@@ -182,6 +269,13 @@ Measured on main (tally-load, commit b3e3571809 on branch tally-load):
     and a writer plaintext that fills to 64 KiB, about 192 KiB resident, plus a fresh frame
     allocation per message; after, the two halves (under 1 KiB) and the transport state, with
     buffers only for messages in flight.
+
+    A buffer given back is zeroed over every byte any holder wrote before the pool keeps it, so no
+    session's plaintext outlives its message in memory: a buffer's bytes are reached only through
+    calls that record the most it was written (`space`, `append`), and only that much is zeroed, so
+    a message costs the zeroing of what it used, never 64 KiB. A writer measures each record before
+    it writes it (`Record::encoded_len`) and seals the message first when the record would not fit,
+    so a buffer never grows past a message and the 16 MiB bound holds whatever passed through.
 
 ## Invariants the tests hold
 1. Thread-count independence: same stamped trace at 1, 2, 8, 32 threads gives byte-identical MLAT
@@ -196,12 +290,40 @@ Measured on main (tally-load, commit b3e3571809 on branch tally-load):
 9. No lock across a seal: ingest p99 flat with a sealer slowed to 1 s.
 10. Throughput scales ~linearly with cores; 20k feeders sustain 20k batches/s at target p99 in tally-load.
 
-## Sizing at 20k (critics' estimate; measured below)
-~12-13 GB RAM (batch store ~2.4 GB, Held ~8 GB, dedup ~0.6 GB, fan-out ~0.33 GB, buffers ~0.3 GB) and
-~35-40 cores (27 MLAT fits, 8-10 verify/inflate/ingest/dedup).
+## Sizing at 20k
 
-Measured (2026-10-08, `tally-load`, 20,000 feeders, the relay alone on 10 cores, `--memory 14G`, no
-hosted MLAT): 586 kB reserved a feeder (the fingerprints' worst case is 178 kB of it), so 14 GiB
-admits 23,781; 6.3 cores mean, 7.4 peak; 2.3 GB resident, flat. The feeders and the client ran as
-their own processes on other cores: run in one process beside the relay, 20,000 simulated feeders
-take some 19 cores and starve the client's one read task, which then falls behind and is let go.
+The critics' estimate, before anything was built: ~12-13 GB RAM (batch store ~2.4 GB, Held ~8 GB,
+dedup ~0.6 GB, fan-out ~0.33 GB, buffers ~0.3 GB) and ~35-40 cores (27 MLAT fits, 8-10
+verify/inflate/ingest/dedup). Held is about 12 GB resident and 22.5 GB reserved (§5); the rest is
+what follows.
+
+Measured (2026-10-08, `tally-load`, the relay alone on its own cores, `--memory 14G`, no hosted
+MLAT), resident memory at three loads:
+
+| Feeders | Resident  |
+| ------- | --------- |
+| 1,000   | 502 MiB   |
+| 5,000   | 1,469 MiB |
+| 20,000  | 3.1 GB    |
+
+At 20,000 the relay held about 7 cores and its memory stayed flat.
+
+The feeders and the client ran as their own processes on other cores: run in one process beside the
+relay, 20,000 simulated feeders take some 19 cores and starve the client's one read task, which then
+falls behind and is let go. An earlier run the same day, before the dedup window was widened to
+three generations (§3), measured 2.3 GB and 6.3 cores mean (7.4 peak), with 586 kB reserved a
+feeder (the fingerprints' worst case 178 kB of it).
+
+**The relay's own base.** Between 1,000 and 5,000 feeders the relay grows 247 KiB a feeder; between
+5,000 and 20,000, about 100 KiB. What a feeder adds falls as feeders are added, so the line through
+the 1,000 and 5,000 points meets zero feeders at or above the true base: 502 MiB less 1,000 x 247 KiB
+is 260 MiB. The relay's own base, with no hosted MLAT, is at most 260 MiB, the 16 MiB Noise pool
+and the runtime's threads included. `budget::BASE_BYTES` was planned at 1 GiB and 16 MiB, four
+times that, and with it a relay given 1 GiB, or the public relay's 640 MiB, admitted no feeder and
+refused to start (`Budget::check`). It is 272 MiB: 256 MiB and the pool's 16 MiB
+(`noise::POOL_IDLE x MAX_MESSAGE`), above the measured 260 MiB, and safe at any load because each
+feeder's reservation (about 0.7 MB with the three dedup generations) is well above the 247 KiB the
+relay measured adding. It is 272 MiB (`budget::BASE_BYTES`). What hosted MLAT adds to the base (its engine's tables, not its raw, which
+`Held` reserves per feeder) is not yet measured; a deployment that hosts MLAT leaves room for it
+between its `--memory` and its cgroup limit (the public relay leaves 64 MiB,
+`infra/kubernetes/tally/relay.yaml`) until it is.

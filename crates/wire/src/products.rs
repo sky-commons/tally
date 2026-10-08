@@ -16,7 +16,8 @@ use blake2::{Blake2s256, Digest};
 
 use crate::WireError;
 use crate::batch::{Hash, Observation, check_coordinates};
-use crate::key::{KEY_LEN, PublicKey};
+use crate::decoded::ObsView;
+use crate::key::{Identity, KEY_LEN, PublicKey};
 use crate::observation_set::ObservationSet;
 use crate::positions::{EnuCovariance, TransmitTime};
 use crate::record::{Body, MAX_BODY};
@@ -447,17 +448,76 @@ impl Check for RegionalBatchContent {
     }
 }
 
+/// One cell's deduplicated receptions as its origin relay is about to sign them, borrowed where
+/// they are held (a decoded batch's, `ObsView`): signed into the same bytes as the
+/// `RegionalBatchContent` of their owned copies (`RegionalBatch::sign_draft`), with no copy made.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RegionalDraft<'a> {
+    pub cell: Region,
+    pub boot_id: u64,
+    pub sequence: u64,
+    pub wall_ms: u64,
+    pub observations: Vec<ObsView<'a>>,
+}
+
+/// The one layout of a regional batch's body, whether its receptions are owned or borrowed: at
+/// most `MAX_REGIONAL_OBSERVATIONS` of them, as `RegionalBatchContent::check` says.
+fn write_regional<'a>(
+    out: &mut Vec<u8>,
+    (cell, boot_id, sequence, wall_ms): (Region, u64, u64, u64),
+    observations: impl ExactSizeIterator<Item = ObsView<'a>>,
+) -> Result<(), WireError> {
+    out.extend_from_slice(&cell.as_u64().to_be_bytes());
+    out.extend_from_slice(&boot_id.to_be_bytes());
+    out.extend_from_slice(&sequence.to_be_bytes());
+    out.extend_from_slice(&wall_ms.to_be_bytes());
+    count_u16(out, observations.len(), MAX_REGIONAL_OBSERVATIONS)?;
+    for observation in observations {
+        observation.encode(out)?;
+    }
+    Ok(())
+}
+
+impl RegionalDraft<'_> {
+    fn body(&self) -> Result<Vec<u8>, WireError> {
+        let mut body = Vec::new();
+        write_regional(
+            &mut body,
+            (self.cell, self.boot_id, self.sequence, self.wall_ms),
+            self.observations.iter().copied(),
+        )?;
+        Ok(body)
+    }
+}
+
+impl RegionalBatch {
+    /// As `sign`, from receptions borrowed: the bytes `sign` makes of their owned copies.
+    pub fn sign_draft(identity: &Identity, draft: &RegionalDraft<'_>) -> Result<Self, WireError> {
+        let body = draft.body()?;
+        crate::signed::Signed::sign(Self::DOMAIN, Self::FORMAT, identity, &body, Self::MAX_LEN)
+            .map(Self)
+    }
+
+    /// As `fits`, for a draft: whether `sign_draft` would make it.
+    pub fn fits_draft(draft: &RegionalDraft<'_>) -> bool {
+        draft
+            .body()
+            .is_ok_and(|body| crate::signed::Signed::fits(body.len(), Self::MAX_LEN))
+    }
+}
+
 impl Fields for RegionalBatchContent {
     fn write(regional: Checked<'_, Self>, out: &mut Vec<u8>) -> Result<(), WireError> {
-        out.extend_from_slice(&regional.cell.as_u64().to_be_bytes());
-        out.extend_from_slice(&regional.boot_id.to_be_bytes());
-        out.extend_from_slice(&regional.sequence.to_be_bytes());
-        out.extend_from_slice(&regional.wall_ms.to_be_bytes());
-        count_u16(out, regional.observations.len(), MAX_REGIONAL_OBSERVATIONS)?;
-        for observation in &regional.observations {
-            observation.encode(out)?;
-        }
-        Ok(())
+        write_regional(
+            out,
+            (
+                regional.cell,
+                regional.boot_id,
+                regional.sequence,
+                regional.wall_ms,
+            ),
+            regional.observations.iter().map(ObsView::from),
+        )
     }
 
     fn read(reader: &mut Body<'_>) -> Result<Unchecked<Self>, WireError> {
@@ -492,7 +552,52 @@ signed_record!(
 mod tests {
     use super::*;
     use crate::directory::tests::cell;
-    use crate::key::Identity;
+
+    /// A regional batch signed from borrowed receptions is the one signed from their owned
+    /// copies, byte for byte, and fits exactly when it does.
+    #[test]
+    fn a_draft_signs_the_bytes_its_owned_copies_sign() -> Result<(), WireError> {
+        let relay = Identity::from_seed([9; 32]);
+        let observations: Vec<Observation> = (0..40u8)
+            .map(|n| Observation {
+                format: b'3',
+                timestamp: 1_000 + u64::from(n),
+                signal: n,
+                data: vec![n; 14],
+            })
+            .collect();
+        let content = RegionalBatchContent {
+            cell: cell()?,
+            boot_id: 3,
+            sequence: 7,
+            wall_ms: 1_791_244_800_000,
+            observations: observations.clone(),
+        };
+        let draft = RegionalDraft {
+            cell: content.cell,
+            boot_id: 3,
+            sequence: 7,
+            wall_ms: content.wall_ms,
+            observations: observations.iter().map(ObsView::from).collect(),
+        };
+        assert_eq!(
+            RegionalBatch::sign_draft(&relay, &draft)?,
+            RegionalBatch::sign(&relay, &content)?
+        );
+        assert!(RegionalBatch::fits_draft(&draft) && RegionalBatch::fits(&content));
+        let huge = vec![0u8; MAX_BODY];
+        let draft = RegionalDraft {
+            observations: vec![ObsView {
+                format: b'3',
+                timestamp: 0,
+                signal: 0,
+                data: &huge,
+            }],
+            ..draft
+        };
+        assert!(!RegionalBatch::fits_draft(&draft));
+        Ok(())
+    }
 
     #[test]
     fn products_round_trip_under_their_own_domains() -> Result<(), WireError> {

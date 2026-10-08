@@ -19,16 +19,26 @@
 //! `WORLD_SETTLE_MS`, so the same stamped trace gives the same records on any number of threads.
 //! A sealer that falls behind refuses whole epochs, counted ([`ProductsReport`]); never part of one.
 //!
+//! The records that are not epochs (positions, clock models, a peer's world or regional records)
+//! are stamped as they are handed in and wait in a queue of their own ([`Records`]), never the
+//! epochs' queue, so a peer flooding records can refuse only records, never this relay's epochs.
+//! The sealer takes them in by stamp: before it seals anything at a watermark it takes every record
+//! stamped before it, in the order of their stamps (and their hashes, for one stamp), so whether a
+//! world candidate is in time, late or out of its window is decided by its stamp and the
+//! watermark's, never by which queue it waited in or which thread's word came first. A record
+//! handed in after the sealer has taken in a watermark is stamped no earlier than it.
+//!
 //! The sealer is one thread that decides, and a pool that works (RFC-0178 §4, "a sealer pool"):
 //! each epoch's areas are made into records in parallel (their observations gathered, cut to
-//! fit a record, signed, and their ADS-B fixes derived), across as many threads as the message
-//! exchange has, then numbered and applied in cell order by the one thread, so the records and
-//! their sequence are the same on any number of threads.
+//! fit a record, signed, and their ADS-B fixes derived), on threads started with the sealer (so a
+//! thread that cannot be started fails the relay at its start, never an epoch), as many as the
+//! message exchange has, then numbered and applied in cell order by the one thread, so the records
+//! and their sequence are the same on any number of threads.
 //!
 //! What the sealer holds is charged to the relay's budget (`budget::Store::Products`): the
-//! deduplicated stream and the signed records the hub has not yet taken, and the peers' records
-//! waiting in its queue. An epoch whose products would pass it is refused whole, counted; a peer's
-//! record is refused, counted (`records_refused`).
+//! deduplicated stream and the signed records the hub has not yet taken, and the records waiting
+//! in their queue. An epoch whose products would pass it is refused whole, counted; a record is
+//! refused, counted (`records_refused`).
 //!
 //! # The regional product
 //!
@@ -36,8 +46,8 @@
 //! newest signed description ([`Products::described`]) names this relay among their relays. Their
 //! receptions are grouped by the receiver's area (the H3 cell of its signed location at
 //! `rendezvous::AREA_RESOLUTION`, [`Products::area_for`]), and each area keeps one copy of each
-//! message heard within one to two epochs, as the hub's deduplicated stream does across the whole
-//! relay. Once an epoch every area's copies are signed as `RegionalBatch` records: the relay's own
+//! message heard within the deduplication's window (`exchange::DEDUP_WINDOW_MS`, by stamps), as
+//! the hub's deduplicated stream does across the whole relay. Once an epoch every area's copies are signed as `RegionalBatch` records: the relay's own
 //! stream (one random boot id a process, one sequence from 0 across its areas, in cell order), cut
 //! to fit a record. The signature is the origin's and covers the cell, so any relay forwards the
 //! record unchanged and a subscriber's regions cut it by the cell it names. A relay forwards a
@@ -81,8 +91,8 @@ use std::collections::hash_map::RandomState;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::hash::{BuildHasher, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::mpsc::{Receiver, Sender, SyncSender, TrySendError, channel, sync_channel};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::thread::JoinHandle;
 
 use tally_mlat_solver::modes::{self, AltitudeKind};
@@ -92,13 +102,14 @@ use tally_wire::products::{MAX_REGIONAL_OBSERVATIONS, MAX_WORLD_FIXES, adsb_inpu
 use tally_wire::rendezvous::area_of;
 use tally_wire::{
     ClockModel, Identity, Observation, Positions, PublicKey, ReceiverInfo, Record, Region,
-    RegionalBatch, RegionalBatchContent, WireError, WorldFix, WorldPositions,
-    WorldPositionsContent, WorldPrecise,
+    RegionalBatch, RegionalDraft, WireError, WorldFix, WorldPositions, WorldPositionsContent,
+    WorldPrecise,
 };
 
 use crate::bounded::Bounded;
 use crate::budget::{Charge, Gauge, Store};
 use crate::exchange::{Frozen, SHARDS, Sink, raw_shard};
+use crate::ingest::{Pause, Stage};
 use crate::network::{Asker, AskerRole};
 use crate::seal::{Coordinator, Epoch, Merged, end_of};
 
@@ -141,9 +152,15 @@ const WAITING_MS: u64 = 30_000;
 /// Fixes derived from origins this relay holds, by (origin, index), to check a peer's world fix
 /// that cites one of them.
 const DERIVED_REMEMBERED: usize = 200_000;
-/// What the sealer's queue holds before it refuses: epochs from every message thread and records
-/// from every link, a few seconds' worth at the RFC's rates.
-const SEALER_QUEUE: usize = 4_096;
+/// What the sealer's queue of epochs holds before it refuses one: every message thread's word for
+/// many seconds of epochs (a thread sends at most a part and a marker an epoch). Only the message
+/// threads and the relay's own settings use it; records wait in their own queue (`RECORDS_HELD`).
+const EPOCH_QUEUE: usize = 4_096;
+/// Records (positions, clock models, peers' world and regional records) waiting for the sealer to
+/// take them in by stamp, at most: their bytes are charged too. A record arrives at most about an
+/// epoch before the watermark passes its stamp, and a world-scale relay is handed some thousands a
+/// second, so this is seconds of them.
+const RECORDS_HELD: usize = 16_384;
 /// Epochs of products the hub may leave untaken before an epoch's are refused whole, counted: what
 /// the products' budget is planned for (`budget::Store::Products`). The hub takes them every
 /// `network::TICK`, a tenth of an epoch.
@@ -175,8 +192,16 @@ pub struct ProductsReport {
     pub regional_stale: u64,
     /// Peers' regional batches taken but not forwarded for room (`FORWARD_HELD`).
     pub regional_forward_full: u64,
-    /// Records (positions, models, peers' products) the sealer's queue was too full to take.
+    /// Records (positions, models, peers' products) not taken for room: their own queue full
+    /// (`RECORDS_HELD`) or the products' budget spent. Never an epoch.
     pub records_refused: u64,
+    /// Receptions a message thread let go because their epoch had closed before they came: only
+    /// a trace can stamp a batch behind its worker's tick.
+    #[serde(default)]
+    pub receptions_late: u64,
+    /// Observations of the deduplicated stream too large for any `RelayBatch` (`deduplicated`).
+    #[serde(default)]
+    pub stream_oversized: u64,
     /// World records signed (live).
     pub world_signed: u64,
     /// Precise world records signed.
@@ -240,9 +265,36 @@ struct Outbox {
     stream_refused: u64,
 }
 
-/// What the sealer shares with the handle: its outbox, its report, its watermark, its gauge.
+/// A record that is not an epoch, for the sealer to take in at its stamp.
+enum Input {
+    Positions(Positions),
+    ClockModel(ClockModel),
+    World(WorldPositionsContent, bool),
+    Regional(u64, RegionalBatch),
+}
+
+/// One record waiting: its stamp, its hash (the order of records of one stamp), and what it is
+/// charged until it is taken in.
+struct Pending {
+    stamp_ms: u64,
+    hash: Hash,
+    input: Input,
+    _charge: Charge,
+}
+
+/// The records waiting for the sealer, and how far it has taken them in: every record stamped
+/// before `taken_before` has been, so one handed in now is stamped no earlier.
+#[derive(Default)]
+struct Records {
+    pending: Vec<Pending>,
+    taken_before: u64,
+}
+
+/// What the sealer shares with the handle: its outbox, its records, its report, its watermark, its
+/// gauge.
 struct Shared {
     outbox: Mutex<Outbox>,
+    records: Mutex<Records>,
     report: Mutex<ProductsReport>,
     /// The end of the newest epoch sealed: the products' time.
     watermark_ms: AtomicU64,
@@ -253,6 +305,7 @@ impl Default for Shared {
     fn default() -> Self {
         Self {
             outbox: Mutex::default(),
+            records: Mutex::default(),
             report: Mutex::default(),
             watermark_ms: AtomicU64::new(0),
             gauge: Mutex::new(Gauge::unlimited(Store::Products)),
@@ -290,8 +343,8 @@ fn observations_bytes(observations: &[Observation]) -> usize {
 /// What one sealer owns: everything the products decide.
 pub struct Sealing {
     coordinator: Coordinator,
-    /// Threads an epoch's areas are made into records on.
-    workers: usize,
+    /// The threads an epoch's areas are made into records on, beside the sealer's own.
+    pool: Pool,
     identity: Option<Identity>,
     /// The key of `digest` (a world fix remembered by a 64-bit digest).
     digest_key: RandomState,
@@ -315,14 +368,11 @@ pub struct Sealing {
     shared: Arc<Shared>,
 }
 
-/// What the sealer is asked to do. A peer's record carries what it is charged while it waits.
+/// What the sealer is asked to do through its queue: an epoch, or a setting. Records wait in
+/// [`Records`] instead.
 enum Command {
     Frozen(Frozen),
     Identity(Identity),
-    Positions(Positions, u64, Charge),
-    ClockModel(ClockModel, u64, Charge),
-    World(WorldPositionsContent, bool, u64, Charge),
-    Regional(u64, RegionalBatch, u64, Charge),
     Taken(Vec<Region>),
     Live(bool),
     Precise(bool),
@@ -339,12 +389,13 @@ enum Sealer {
 }
 
 /// The products: the receivers' areas (read per batch by the ingest worker that owns the
-/// receiver's shard), and the sealer.
+/// receiver's shard), and the sealer. Whoever holds them sees the sealer where it runs: moving it
+/// onto its thread (`on_thread`) needs no exclusive hold, so it can never be left behind inline.
 pub struct Products {
     /// Each receiver's area and chosen relays, by its raw shard.
     located: Box<[Mutex<Bounded<PublicKey, Located>>]>,
     own: OnceLock<PublicKey>,
-    sealer: Sealer,
+    sealer: RwLock<Sealer>,
     shared: Arc<Shared>,
 }
 
@@ -368,38 +419,51 @@ impl Products {
                 .map(|_| Mutex::new(Bounded::new(RECEIVERS_LOCATED / SHARDS)))
                 .collect(),
             own: OnceLock::new(),
-            sealer: Sealer::Inline(Box::new(Mutex::new(Sealing::new(
+            sealer: RwLock::new(Sealer::Inline(Box::new(Mutex::new(Sealing::new(
                 boot_id,
                 threads,
                 Arc::clone(&shared),
-            )))),
+            ))))),
             shared,
         }
     }
 
-    /// The sealing on a thread of its own, gathering from `threads` message threads. What it was
-    /// told so far (areas taken, the world's switches) is carried over.
-    pub fn on_thread(&mut self, threads: usize) {
-        let Sealer::Inline(sealing) = &self.sealer else {
-            return;
+    /// The sealing on a thread of its own, gathering from `threads` message threads, with a pool
+    /// of as many threads, each held up by `pause` (a test's; none in a relay). What it was told
+    /// so far (areas taken, the world's switches, its key) is carried over. Every thread is started
+    /// or this fails, and the relay with it: an inline sealer behind a staged exchange would gather
+    /// from one thread and refuse every epoch.
+    pub fn on_thread(&self, threads: usize, pause: Option<&Pause>) -> Result<(), String> {
+        let mut sealer = self
+            .sealer
+            .write()
+            .map_err(|_| "the sealer's lock is poisoned".to_owned())?;
+        let Sealer::Inline(sealing) = &*sealer else {
+            return Err("the sealer already runs on its own thread".to_owned());
         };
-        let Ok(sealing) = sealing.lock().map(|mut held| {
+        let mut fresh = {
+            let mut held = sealing
+                .lock()
+                .map_err(|_| "the sealer's lock is poisoned".to_owned())?;
             let mut fresh = Sealing::new(held.boot_id, threads, Arc::clone(&self.shared));
-            fresh.workers = threads.max(1);
             fresh.taken = std::mem::take(&mut held.taken);
             fresh.live.on = held.live.on;
             fresh.precise.on = held.precise.on;
             fresh.identity = held.identity.take();
             fresh
-        }) else {
-            return;
         };
-        let (sender, receiver) = sync_channel(SEALER_QUEUE);
+        fresh.pool = Pool::start(threads.max(1) - 1, pause)?;
+        let (sender, receiver) = sync_channel(EPOCH_QUEUE);
+        let pause = pause.cloned();
         let handle = std::thread::Builder::new()
             .name("tally-sealer".to_owned())
-            .spawn(move || run(sealing, &receiver))
-            .ok();
-        self.sealer = Sealer::Thread { sender, handle };
+            .spawn(move || run(fresh, &receiver, pause.as_ref()))
+            .map_err(|error| format!("sealer thread: {error}"))?;
+        *sealer = Sealer::Thread {
+            sender,
+            handle: Some(handle),
+        };
+        Ok(())
     }
 
     /// Where the message exchange hands each closed epoch: to the sealer, without waiting; false
@@ -410,7 +474,10 @@ impl Products {
     }
 
     fn command(&self, command: Command) -> bool {
-        match &self.sealer {
+        let Ok(sealer) = self.sealer.read() else {
+            return false;
+        };
+        match &*sealer {
             Sealer::Inline(sealing) => {
                 if let Ok(mut sealing) = sealing.lock() {
                     sealing.handle(command);
@@ -425,16 +492,37 @@ impl Products {
         }
     }
 
-    /// A record for the sealer, charged while it waits, refused and counted when the sealer's
-    /// queue or the products' budget is full.
-    fn record(&self, bytes: usize, command: impl FnOnce(Charge) -> Command) {
-        let taken = self
-            .shared
-            .gauge()
-            .try_charge(bytes)
-            .is_some_and(|charge| self.command(command(charge)));
+    /// A record for the sealer, stamped `stamp_ms` (no earlier than what the sealer has taken in)
+    /// and charged while it waits; refused and counted when the records' queue or the products'
+    /// budget is full. It waits apart from the epochs, so it never takes an epoch's place.
+    fn record(&self, stamp_ms: u64, hash: Hash, bytes: usize, input: Input) {
+        let taken = self.shared.records.lock().is_ok_and(|mut records| {
+            if records.pending.len() >= RECORDS_HELD {
+                return false;
+            }
+            let Some(charge) = self.shared.gauge().try_charge(bytes) else {
+                return false;
+            };
+            let stamp_ms = stamp_ms.max(records.taken_before);
+            records.pending.push(Pending {
+                stamp_ms,
+                hash,
+                input,
+                _charge: charge,
+            });
+            true
+        });
         if !taken && let Ok(mut report) = self.shared.report.lock() {
             report.records_refused += 1;
+        }
+    }
+
+    /// `count` observations of the deduplicated stream were too large for any batch, counted.
+    pub fn stream_oversized(&self, count: u64) {
+        if count > 0
+            && let Ok(mut report) = self.shared.report.lock()
+        {
+            report.stream_oversized += count;
         }
     }
 
@@ -464,7 +552,10 @@ impl Products {
 
     /// A setting: waits for room, never refused.
     fn control(&self, command: Command) {
-        match &self.sealer {
+        let Ok(sealer) = self.sealer.read() else {
+            return;
+        };
+        match &*sealer {
             Sealer::Inline(sealing) => {
                 if let Ok(mut sealing) = sealing.lock() {
                     sealing.handle(command);
@@ -539,17 +630,23 @@ impl Products {
     /// with. Positions waiting for it are taken now.
     pub fn clock_model(&self, model: &ClockModel, stamp_ms: u64) {
         let bytes = model.as_bytes().len();
-        self.record(bytes, |charge| {
-            Command::ClockModel(model.clone(), stamp_ms, charge)
-        });
+        self.record(
+            stamp_ms,
+            model.id(),
+            bytes,
+            Input::ClockModel(model.clone()),
+        );
     }
 
     /// Final or provisional positions (verified): candidates for the world product.
     pub fn positions(&self, positions: &Positions, stamp_ms: u64) {
         let bytes = positions.as_bytes().len();
-        self.record(bytes, |charge| {
-            Command::Positions(positions.clone(), stamp_ms, charge)
-        });
+        self.record(
+            stamp_ms,
+            positions.hash(),
+            bytes,
+            Input::Positions(positions.clone()),
+        );
     }
 
     /// A world record a peer sent. A relay that gathers the world takes its fixes as candidates,
@@ -559,9 +656,8 @@ impl Products {
             return Vec::new();
         }
         if let Ok(content) = world.content() {
-            self.record(world_bytes(&content), |charge| {
-                Command::World(content, false, stamp_ms, charge)
-            });
+            let bytes = world_bytes(&content);
+            self.record(stamp_ms, world.hash(), bytes, Input::World(content, false));
         }
         Vec::new()
     }
@@ -572,9 +668,8 @@ impl Products {
             return Vec::new();
         }
         if let Ok(content) = world.content() {
-            self.record(world_bytes(&content), |charge| {
-                Command::World(content, true, stamp_ms, charge)
-            });
+            let bytes = world_bytes(&content);
+            self.record(stamp_ms, world.hash(), bytes, Input::World(content, true));
         }
         Vec::new()
     }
@@ -592,15 +687,18 @@ impl Products {
             return Vec::new();
         }
         let bytes = regional.as_bytes().len();
-        self.record(bytes, |charge| {
-            Command::Regional(asker.source, regional, stamp_ms, charge)
-        });
+        self.record(
+            stamp_ms,
+            regional.hash(),
+            bytes,
+            Input::Regional(asker.source, regional),
+        );
         Vec::new()
     }
 
-    /// The watermark passed `watermark_ms` with nothing flowing to say so: every world second it
-    /// settles is sealed. The message exchange's epochs say it as they close; this is for a
-    /// products of their own (a test, a relay with no feeders yet).
+    /// The watermark passed `watermark_ms` with nothing flowing to say so: every record stamped
+    /// before it is taken in, then every world second it settles is sealed. The message
+    /// exchange's epochs say it as they close; this is for a products of their own (a test).
     pub fn advance(&self, watermark_ms: u64) {
         self.control(Command::Advance(watermark_ms));
     }
@@ -657,7 +755,7 @@ impl Products {
 
 impl Drop for Products {
     fn drop(&mut self) {
-        if let Sealer::Thread { sender, handle } = &mut self.sealer {
+        if let Ok(Sealer::Thread { sender, handle }) = self.sealer.get_mut() {
             // Closing the queue ends the thread.
             let (closed, _) = sync_channel(0);
             drop(std::mem::replace(sender, closed));
@@ -668,12 +766,18 @@ impl Drop for Products {
     }
 }
 
-fn run(mut sealing: Sealing, receiver: &Receiver<Command>) {
+fn run(mut sealing: Sealing, receiver: &Receiver<Command>, pause: Option<&Pause>) {
+    let paused = |command| {
+        if let Some(pause) = pause {
+            pause(Stage::Sealer);
+        }
+        command
+    };
     while let Ok(command) = receiver.recv() {
-        sealing.handle(command);
+        sealing.handle(paused(command));
         // Whatever else is waiting, then the report once.
         while let Ok(command) = receiver.try_recv() {
-            sealing.handle(command);
+            sealing.handle(paused(command));
         }
         sealing.publish_report();
     }
@@ -689,7 +793,7 @@ impl Sealing {
     fn new(boot_id: u64, threads: usize, shared: Arc<Shared>) -> Self {
         Self {
             coordinator: Coordinator::new(threads),
-            workers: 1,
+            pool: Pool::default(),
             identity: None,
             digest_key: RandomState::new(),
             boot_id,
@@ -713,8 +817,11 @@ impl Sealing {
             Command::Frozen(frozen) => {
                 let ready = self.coordinator.take(frozen);
                 self.report.epoch_parts_lost += ready.parts_lost;
+                self.report.receptions_late += ready.late;
                 let watermark = ready.watermark;
                 for merged in ready.merged {
+                    // The records stamped in or before the epoch are candidates beside it.
+                    self.take_records(end_of(merged.epoch));
                     self.seal_epoch(merged);
                 }
                 // Every epoch before the watermark is closed: the world seals by it, whether or
@@ -724,18 +831,6 @@ impl Sealing {
                 }
             }
             Command::Identity(identity) => self.identity = Some(identity),
-            // A record's charge is released once it is taken in: what it leaves held is the
-            // gatherers' and the waiting list's, each bounded by count.
-            Command::Positions(positions, stamp_ms, _charge) => {
-                self.take_positions(positions, stamp_ms);
-            }
-            Command::ClockModel(model, stamp_ms, _charge) => self.clock_model(&model, stamp_ms),
-            Command::World(content, precise, stamp_ms, _charge) => {
-                self.take_world(content, precise, stamp_ms);
-            }
-            Command::Regional(source, regional, stamp_ms, _charge) => {
-                self.regional_from(source, regional, stamp_ms);
-            }
             Command::Taken(areas) => self.taken = areas,
             Command::Live(on) => self.live.on = on,
             Command::Precise(on) => self.precise.on = on,
@@ -746,11 +841,46 @@ impl Sealing {
     fn publish_report(&self) {
         if let Ok(mut report) = self.shared.report.lock() {
             // What the handle counted itself is kept.
-            let records_refused = report.records_refused.max(self.report.records_refused);
+            let records_refused = report.records_refused;
             let forwarded = report.regional_forwarded;
+            let stream_oversized = report.stream_oversized;
             *report = self.report;
             report.records_refused = records_refused;
             report.regional_forwarded = forwarded;
+            report.stream_oversized = stream_oversized;
+        }
+    }
+
+    /// Takes in every record stamped before `before_ms`, in the order of their stamps (then
+    /// hashes), and from now on stamps a record handed in no earlier than that. What it is charged
+    /// is released as it is taken in: what it leaves held is the gatherers' and the waiting
+    /// list's, each bounded by count.
+    fn take_records(&mut self, before_ms: u64) {
+        let mut due = match self.shared.records.lock() {
+            Ok(mut records) => {
+                records.taken_before = records.taken_before.max(before_ms);
+                let (due, waiting): (Vec<Pending>, Vec<Pending>) =
+                    std::mem::take(&mut records.pending)
+                        .into_iter()
+                        .partition(|pending| pending.stamp_ms < before_ms);
+                records.pending = waiting;
+                due
+            }
+            Err(_) => return,
+        };
+        due.sort_by_key(|pending| (pending.stamp_ms, pending.hash));
+        for Pending {
+            stamp_ms, input, ..
+        } in due
+        {
+            match input {
+                Input::Positions(positions) => self.take_positions(positions, stamp_ms),
+                Input::ClockModel(model) => self.clock_model(&model, stamp_ms),
+                Input::World(content, precise) => self.take_world(content, precise, stamp_ms),
+                Input::Regional(source, regional) => {
+                    self.regional_from(source, regional, stamp_ms);
+                }
+            }
         }
     }
 
@@ -794,9 +924,11 @@ impl Sealing {
         self.out(records);
     }
 
-    /// The watermark passed `watermark_ms`: what it seals goes out, and only then does the
-    /// handle read the new watermark, so a reader that sees it finds everything sealed by it.
+    /// The watermark passed `watermark_ms`: every record stamped before it is taken in, what it
+    /// seals goes out, and only then does the handle read the new watermark, so a reader that sees
+    /// it finds everything sealed by it.
     fn advance(&mut self, watermark_ms: u64) {
+        self.take_records(watermark_ms);
         let records = self.advance_records(watermark_ms);
         self.out(records);
         self.publish_report();
@@ -849,7 +981,7 @@ impl Sealing {
     /// An epoch's copies, area by area in cell order, as signed regional batches. Their time is
     /// the epoch's end. Without an identity the copies are counted and dropped.
     ///
-    /// The work is the pool's (`in_parallel`, `workers` threads): each area's observations are
+    /// The work is the pool's ([`Pool::map`]): each area's observations are
     /// gathered and cut to fit a record ([`cut`]), then, numbered here in cell order, each record is
     /// signed and its ADS-B fixes derived. What is decided (the numbering, the fixes remembered and
     /// offered) is decided here, in that order, so the records are the same on any number of
@@ -869,31 +1001,28 @@ impl Sealing {
             return sealed;
         };
         let boot_id = self.boot_id;
-        let cuts = in_parallel(areas.into_values().collect(), self.workers, |area| {
+        let cuts = self.pool.map(areas.into_values().collect(), move |area| {
             cut(area, boot_id, wall_ms)
         });
-        let mut contents = Vec::new();
+        let mut chunks = Vec::new();
         for cut in cuts {
             self.report.regional_oversized += cut.oversized;
-            for observations in cut.chunks {
-                contents.push(RegionalBatchContent {
-                    cell: cut.cell,
-                    boot_id,
-                    sequence: self.sequence,
-                    wall_ms,
-                    observations,
-                });
+            for copies in cut.chunks {
+                chunks.push((cut.cell, self.sequence, copies));
                 self.sequence += 1;
             }
         }
-        let signed = in_parallel(contents, self.workers, |content| {
-            match RegionalBatch::sign(&identity, &content) {
+        let signed = self.pool.map(chunks, move |(cell, sequence, copies)| {
+            match RegionalBatch::sign_draft(
+                &identity,
+                &draft(cell, (boot_id, sequence, wall_ms), &copies),
+            ) {
                 Ok(regional) => {
                     let fixes = regional_fixes(&regional).ok();
                     Ok((regional, fixes))
                 }
                 // `cut` made it fit, so this is never reached; were it, it is counted.
-                Err(_) => Err(content.observations.len() as u64),
+                Err(_) => Err(copies.len() as u64),
             }
         });
         for outcome in signed {
@@ -1062,11 +1191,12 @@ impl Sealing {
         }
     }
 
-    /// One candidate for one product, taken in at `stamp_ms`: held when its second is open and it
-    /// ranks above the aircraft's best so far. Its window is reckoned from the later of its
-    /// stamp and the watermark.
+    /// One candidate for one product, stamped `stamp_ms`: held when its second is open and it
+    /// ranks above the aircraft's best so far. Its window is reckoned from its stamp alone (a
+    /// record is taken in before the watermark passes its stamp, so the two agree), and whether
+    /// its second is sealed from the watermarks before its stamp: never from when it was handled.
     fn offer_to(&mut self, fix: WorldFix, precise: bool, stamp_ms: u64) {
-        let now_ms = stamp_ms.max(self.watermark_ms);
+        let now_ms = stamp_ms;
         let gatherer = if precise {
             &mut self.precise
         } else {
@@ -1151,98 +1281,174 @@ impl Sealing {
 /// each of which makes a record that fits, in order, and the copies too large for any record.
 struct Cut {
     cell: Region,
-    chunks: Vec<Vec<Observation>>,
+    chunks: Vec<Vec<crate::seal::Copy>>,
     oversized: u64,
 }
 
+/// The draft of one record of `cell`'s copies: each read where its batch holds it, never copied
+/// (`RegionalBatch::sign_draft` writes the bytes its owned copies would).
+fn draft(
+    cell: Region,
+    (boot_id, sequence, wall_ms): (u64, u64, u64),
+    copies: &[crate::seal::Copy],
+) -> RegionalDraft<'_> {
+    RegionalDraft {
+        cell,
+        boot_id,
+        sequence,
+        wall_ms,
+        observations: copies
+            .iter()
+            .map(|copy| copy.decoded.view(copy.obs()))
+            .collect(),
+    }
+}
+
 /// Cuts one area's copies (`(cell, copies)`) into records that fit: at most
-/// `MAX_REGIONAL_OBSERVATIONS` each, halved until it fits (`RegionalBatch::fits`, decided without
-/// signing, and the same whatever the record's sequence, a fixed-width field). A copy too large for
-/// any record is not deliverable, and is counted.
-fn cut((cell, copies): (Region, Vec<crate::seal::Copy>), boot_id: u64, wall_ms: u64) -> Cut {
-    let observations: Vec<Observation> = copies
-        .iter()
-        .map(|copy| copy.decoded.view(copy.obs()).to_observation())
-        .collect();
-    drop(copies);
-    let mut todo: Vec<Vec<Observation>> = observations
-        .chunks(MAX_REGIONAL_OBSERVATIONS)
-        .rev()
-        .map(<[Observation]>::to_vec)
-        .collect();
+/// `MAX_REGIONAL_OBSERVATIONS` each, halved until it fits (`RegionalBatch::fits_draft`, decided
+/// without signing, and the same whatever the record's sequence, a fixed-width field). A copy too
+/// large for any record is not deliverable, and is counted. The copies are moved into their
+/// chunks, never their receptions copied.
+fn cut((cell, mut copies): (Region, Vec<crate::seal::Copy>), boot_id: u64, wall_ms: u64) -> Cut {
+    let mut todo: Vec<Vec<crate::seal::Copy>> = Vec::new();
+    while copies.len() > MAX_REGIONAL_OBSERVATIONS {
+        let rest = copies.split_off(MAX_REGIONAL_OBSERVATIONS);
+        todo.push(std::mem::replace(&mut copies, rest));
+    }
+    todo.push(copies);
+    todo.reverse();
     let mut out = Cut {
         cell,
         chunks: Vec::new(),
         oversized: 0,
     };
-    while let Some(chunk) = todo.pop() {
-        let content = RegionalBatchContent {
-            cell,
-            boot_id,
-            sequence: 0,
-            wall_ms,
-            observations: chunk,
-        };
-        if RegionalBatch::fits(&content) {
-            out.chunks.push(content.observations);
-        } else if content.observations.len() <= 1 {
-            out.oversized += content.observations.len() as u64;
+    while let Some(mut chunk) = todo.pop() {
+        if chunk.is_empty() {
+            continue;
+        }
+        if RegionalBatch::fits_draft(&draft(cell, (boot_id, 0, wall_ms), &chunk)) {
+            out.chunks.push(chunk);
+        } else if chunk.len() <= 1 {
+            out.oversized += chunk.len() as u64;
         } else {
-            let mut first = content.observations;
-            let second = first.split_off(first.len() / 2);
+            let second = chunk.split_off(chunk.len() / 2);
             todo.push(second);
-            todo.push(first);
+            todo.push(chunk);
         }
     }
     out
 }
 
-/// `work` over `items` on up to `workers` threads, the results in the items' order: the sealer's
-/// pool. One worker (or one item) runs on the caller.
-fn in_parallel<T: Send, R: Send>(
-    items: Vec<T>,
-    workers: usize,
-    work: impl Fn(T) -> R + Sync,
-) -> Vec<R> {
-    let threads = workers.min(items.len());
-    if threads <= 1 {
-        return items.into_iter().map(work).collect();
-    }
-    let items: Vec<Mutex<Option<T>>> = items
-        .into_iter()
-        .map(|item| Mutex::new(Some(item)))
-        .collect();
-    let next = std::sync::atomic::AtomicUsize::new(0);
-    let mut done: Vec<(usize, R)> = std::thread::scope(|scope| {
-        let handles: Vec<_> = (0..threads)
-            .map(|_| {
-                scope.spawn(|| {
-                    let mut done = Vec::new();
+/// A job for the sealer's pool.
+type Job = Box<dyn FnOnce() + Send>;
+
+/// The sealer's pool (RFC-0178 §4): threads of its own, started with the sealer and stopped with
+/// it, that work beside the sealer's thread. Started whole or not at all (`start`), so a thread
+/// that cannot be started fails the relay at its start; none for a sealer that runs inline.
+#[derive(Default)]
+struct Pool {
+    jobs: Option<Sender<Job>>,
+    handles: Vec<JoinHandle<()>>,
+}
+
+impl Pool {
+    /// `helpers` threads beside the caller's, each held up by `pause` before each job.
+    fn start(helpers: usize, pause: Option<&Pause>) -> Result<Self, String> {
+        if helpers == 0 {
+            return Ok(Self::default());
+        }
+        let (jobs, taken) = channel::<Job>();
+        let taken = Arc::new(Mutex::new(taken));
+        // Dropping `pool` on a failure stops and joins the threads already started.
+        let mut pool = Self {
+            jobs: Some(jobs),
+            handles: Vec::with_capacity(helpers),
+        };
+        for helper in 0..helpers {
+            let taken = Arc::clone(&taken);
+            let pause = pause.cloned();
+            let handle = std::thread::Builder::new()
+                .name(format!("tally-seal-{helper}"))
+                .spawn(move || {
                     loop {
-                        let at = next.fetch_add(1, Ordering::Relaxed);
-                        let Some(slot) = items.get(at) else {
+                        let job = taken.lock().ok().and_then(|taken| taken.recv().ok());
+                        let Some(job) = job else {
                             break;
                         };
-                        if let Some(item) = slot.lock().ok().and_then(|mut slot| slot.take()) {
-                            done.push((at, work(item)));
+                        if let Some(pause) = &pause {
+                            pause(Stage::Sealer);
                         }
+                        job();
                     }
-                    done
+                })
+                .map_err(|error| format!("sealer pool thread {helper} of {helpers}: {error}"))?;
+            pool.handles.push(handle);
+        }
+        Ok(pool)
+    }
+
+    /// `work` over `items` on the pool's threads and the caller's, the results in the items'
+    /// order. A pool thread that panicked takes the sealer with it, never a part of an epoch
+    /// silently.
+    fn map<T, R>(&self, items: Vec<T>, work: impl Fn(T) -> R + Send + Sync + 'static) -> Vec<R>
+    where
+        T: Send + 'static,
+        R: Send + 'static,
+    {
+        let helpers = self.handles.len().min(items.len().saturating_sub(1));
+        let Some(jobs) = self.jobs.as_ref().filter(|_| helpers > 0) else {
+            return items.into_iter().map(work).collect();
+        };
+        let count = items.len();
+        let queue: Arc<Mutex<VecDeque<(usize, T)>>> =
+            Arc::new(Mutex::new(items.into_iter().enumerate().collect()));
+        let work: Arc<dyn Fn(T) -> R + Send + Sync> = Arc::new(work);
+        let (done, results) = channel::<(usize, R)>();
+        let drain = |queue: &Mutex<VecDeque<(usize, T)>>,
+                     work: &(dyn Fn(T) -> R + Send + Sync),
+                     done: &Sender<(usize, R)>| {
+            loop {
+                let next = queue.lock().ok().and_then(|mut queue| queue.pop_front());
+                let Some((at, item)) = next else {
+                    break;
+                };
+                if done.send((at, work(item))).is_err() {
+                    break;
+                }
+            }
+        };
+        for _ in 0..helpers {
+            let (queue, work, done) = (Arc::clone(&queue), Arc::clone(&work), done.clone());
+            // A job never run (the pool stopping) is dropped, and with it its sender: the caller
+            // does its items itself.
+            let _ = jobs.send(Box::new(move || drain(&queue, &*work, &done)));
+        }
+        drain(&queue, &*work, &done);
+        drop(done);
+        let mut out: Vec<Option<R>> = (0..count).map(|_| None).collect();
+        for (at, result) in results {
+            if let Some(slot) = out.get_mut(at) {
+                *slot = Some(result);
+            }
+        }
+        out.into_iter()
+            .map(|result| {
+                result.unwrap_or_else(|| {
+                    panic!("a sealer pool thread panicked: the epoch is never sealed in part")
                 })
             })
-            .collect();
-        // A worker that panicked takes the sealer with it, never a part of an epoch silently.
-        handles
-            .into_iter()
-            .flat_map(|handle| {
-                handle
-                    .join()
-                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
-            })
             .collect()
-    });
-    done.sort_unstable_by_key(|(at, _)| *at);
-    done.into_iter().map(|(_, result)| result).collect()
+    }
+}
+
+impl Drop for Pool {
+    fn drop(&mut self) {
+        // Closing the jobs ends every thread once it is idle.
+        self.jobs = None;
+        for handle in self.handles.drain(..) {
+            let _ = handle.join();
+        }
+    }
 }
 
 /// One second's final fixes, ascending by address, as signed precise parts of at most

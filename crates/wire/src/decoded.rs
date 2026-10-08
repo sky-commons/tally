@@ -89,6 +89,17 @@ impl FingerprintKey {
     }
 }
 
+/// The domains of the process's keyed hashes other than a message's fingerprint, each taken under
+/// [`FingerprintKey::process`] in place of a format byte: listed once, so no two share one.
+pub mod keyed {
+    /// A receiver's draw for an MLAT seat (`tally_mlat::intake::draw`).
+    pub const SEAT_DRAW: u8 = 0xf0;
+    /// An ICAO address's shard (`tally_mlat::provisional::shard_of`, the relay's address shards).
+    pub const ADDRESS_SHARD: u8 = 0xf1;
+    /// A receiver's raw shard (`tally_relay::exchange::raw_shard`).
+    pub const RAW_SHARD: u8 = 0xf2;
+}
+
 /// One reception of a decoded batch: its fixed fields, where its message is in the batch's plain
 /// bytes, and its fingerprint. Its message is [`Decoded::data`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -130,6 +141,19 @@ impl ObsView<'_> {
     pub fn to_beast(&self) -> Option<Frame> {
         let kind = FrameKind::from_type_byte(self.format)?;
         Frame::new(kind, self.timestamp, self.signal, self.data).ok()
+    }
+
+    /// Its bytes in a signed list of receptions: the one encoding of a reception, whether it is
+    /// borrowed or owned (`Observation::encode` writes through this).
+    pub(crate) fn encode(&self, out: &mut Vec<u8>) -> Result<(), WireError> {
+        out.push(self.format);
+        out.extend_from_slice(&self.timestamp.to_be_bytes()[2..]);
+        out.push(self.signal);
+        let length =
+            u16::try_from(self.data.len()).map_err(|_| WireError::Oversize(self.data.len()))?;
+        out.extend_from_slice(&length.to_be_bytes());
+        out.extend_from_slice(self.data);
+        Ok(())
     }
 
     /// An owned copy (what a stage that keeps the message past the batch holds).

@@ -32,6 +32,13 @@
 //! - **Accounted as allocated**: every byte [`Held::bytes`] reports is a capacity actually
 //!   allocated (vectors by capacity, maps by their tables), so admission is sized on what is
 //!   really in memory.
+//! - **Late by the stamp, never by arrival** ([`Closing`]): raw for a bin already taken for
+//!   sealing is late. A holder that is handed raw in one order and steps in line with it (one
+//!   [`Held`], an engine holding its own) knows that by what it took ([`Open::through`]). A holder
+//!   whose raw arrives on many threads while its steps run on another (a relay's raw shards, stepped
+//!   by the stamp watermark) decides it by the batch's ingest stamp instead: raw stamped at or after
+//!   the step that takes its bin is late whenever it arrives, so a batch that raced ahead of that
+//!   step is late exactly as one that came after it, and what is sealed never depends on which won.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -629,6 +636,30 @@ impl Cost {
     }
 }
 
+/// When a holder that steps on a fixed clock takes each bin for sealing (module docs, late by
+/// the stamp): at every multiple of `step_ms` of its step clock, every bin that ended `settle_ms`
+/// or more before it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Closing {
+    pub step_ms: u64,
+    pub settle_ms: u64,
+}
+
+impl Closing {
+    /// The step that takes `bin`: the first multiple of `step_ms` at or after the bin's end plus
+    /// `settle_ms`. Raw of the bin stamped at or after it is late.
+    pub fn close_at(&self, bin: i64) -> u64 {
+        let ended = u64::try_from(bin.saturating_add(1).max(0))
+            .unwrap_or(0)
+            .saturating_mul(GRID_MS);
+        let step = self.step_ms.max(1);
+        ended
+            .saturating_add(self.settle_ms)
+            .div_ceil(step)
+            .saturating_mul(step)
+    }
+}
+
 /// The open bins of a holder of raw (or of one of a relay's raw shards).
 #[derive(Debug)]
 pub struct Open {
@@ -637,6 +668,8 @@ pub struct Open {
     bytes: usize,
     /// No bin up to this is open any more: raw for it is late.
     through: Option<i64>,
+    /// When each bin is taken, for a holder that decides lateness by the stamp ([`Closing`]).
+    closing: Option<Closing>,
 }
 
 impl Open {
@@ -646,12 +679,26 @@ impl Open {
             bins: BTreeMap::new(),
             bytes: 0,
             through: None,
+            closing: None,
         }
+    }
+
+    /// Lateness decided by the batch's stamp under `closing` (module docs), for a holder whose
+    /// raw arrives on threads of its own while it steps on another.
+    #[must_use]
+    pub fn closing(mut self, closing: Closing) -> Self {
+        self.closing = Some(closing);
+        self
     }
 
     /// Bytes allocated.
     pub fn bytes(&self) -> usize {
         self.bytes + btree_bytes::<i64, Fragment>(self.bins.len())
+    }
+
+    /// What it refuses beyond.
+    pub fn limits(&self) -> Limits {
+        self.limits
     }
 
     /// Receptions held (copies included).
@@ -677,6 +724,7 @@ impl Open {
             content.wall_ms,
             content.observations.iter().map(ObsView::from),
             room,
+            None,
         )
     }
 
@@ -687,7 +735,7 @@ impl Open {
     }
 
     /// As `add_decoded`, these open bins growing to `room` bytes at most (the holder's limit less
-    /// what it holds sealed).
+    /// what it holds sealed). Late by its stamp when the holder closes by one ([`Closing`]).
     pub fn add_decoded_within(&mut self, decoded: &Decoded, room: usize) -> Added {
         let room = room.min(self.limits.bytes);
         self.add_observations(
@@ -696,10 +744,12 @@ impl Open {
             decoded.wall_ms(),
             decoded.views(),
             room,
+            Some(decoded.stamp_ms()),
         )
     }
 
-    /// `room`: the bytes these open bins may grow to.
+    /// `room`: the bytes these open bins may grow to. `stamp_ms`: the batch's ingest stamp, which
+    /// decides lateness when the holder closes by one ([`Closing`]).
     fn add_observations<'a>(
         &mut self,
         receiver: PublicKey,
@@ -707,6 +757,7 @@ impl Open {
         wall_ms: u64,
         observations: impl Iterator<Item = ObsView<'a>>,
         room: usize,
+        stamp_ms: Option<u64>,
     ) -> Added {
         let mut added = Added::default();
         let bin = bin_of(wall_ms);
@@ -721,7 +772,11 @@ impl Open {
                 keep
             })
             .collect();
-        if self.through.is_some_and(|through| bin <= through) {
+        let late_by_stamp = match (self.closing, stamp_ms) {
+            (Some(closing), Some(stamp_ms)) => stamp_ms >= closing.close_at(bin),
+            _ => false,
+        };
+        if late_by_stamp || self.through.is_some_and(|through| bin <= through) {
             added.late = wanted.len();
             return added;
         }
@@ -1517,6 +1572,7 @@ impl Held {
             content.wall_ms,
             content.observations.iter().map(ObsView::from),
             room,
+            None,
         )
     }
 
@@ -1529,6 +1585,7 @@ impl Held {
             decoded.wall_ms(),
             decoded.views(),
             room,
+            None,
         )
     }
 
@@ -1542,6 +1599,7 @@ impl Held {
             reception.wall_ms,
             std::iter::once(ObsView::from(&reception.observation)),
             room,
+            None,
         )
     }
 

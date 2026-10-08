@@ -15,19 +15,34 @@
 //! - **Room is shared, refusal is whole, and neither depends on order** (RFC-0178 §9). The
 //!   receivers seated across every intake of one engine are bounded by one count ([`Seats`],
 //!   `Capacity::receivers`), and who is seated is a function of who is described: the best ranked
-//!   (taking part first, then key), whatever order they came in and whichever intake took them. A
-//!   receiver outranked is refused whole (none of its raw held) and counted, and one that loses its
-//!   seat to a better ranked one is let go whole. A receiver's raw of a bin beyond its share is
-//!   refused whole (`held::Limits`); the holder's bytes are checked on each whole bin as it is
-//!   sealed (`held::Bin::seal_within`), never on arrival.
+//!   (taking part first, then a draw no feeder can choose, [`draw`]), whatever order they came in
+//!   and whichever intake took them. A receiver outranked is refused whole (none of its raw held)
+//!   and counted, and one that loses its seat to a better ranked one is let go whole. A receiver's
+//!   raw of a bin beyond its share is refused whole (`held::Limits`); the holder's bytes are
+//!   checked on each whole bin as it is sealed (`held::Bin::seal_within`), never on arrival.
+//! - **The rank is no feeder's to choose** (RFC-0171 §9, critic 4: standing counts places, not
+//!   keys, and is a bar, not a ranking). Taking part is the bar. Among the receivers over it the
+//!   seat goes by a keyed hash of the receiver's key under a secret this process drew
+//!   ([`draw`], `tally_wire::FingerprintKey::process`, the message fingerprint's own key): a key is
+//!   free, so ranking by the key itself let anyone grind keys that outrank every honest receiver and
+//!   take the seats from them with one description each. Under a secret it cannot do better than
+//!   chance, whatever it grinds. Neither tenure nor standing serves instead: tenure (first come)
+//!   rewards whoever floods first and is decided by arrival order, which RFC-0178 §9 forbids;
+//!   receiver standing (RFC-0174 §2.12) is earned only by receptions the seated engine solves, so
+//!   ranking by it would keep a receiver once seated seated forever and one never seated out, and it
+//!   is a bar the merge applies to solutions, not an order of who may be heard.
+//! - **Late by the stamp** (`held::Closing`): an intake whose raw arrives on threads of its own
+//!   while its holder steps on another ([`Intake::closing`], a relay's raw shards) refuses as late
+//!   the raw stamped at or after the step that takes its bin, so a batch that raced ahead of that
+//!   step is late exactly as one that came after it.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
-use tally_mlat_solver::held::{Fragment, Limits, Open};
+use tally_mlat_solver::held::{Closing, Fragment, Limits, Open};
 use tally_mlat_solver::obs::MAX_SITE_PRECISION_M;
 use tally_mlat_solver::{Site, Timebase};
-use tally_wire::{Clock, Decoded, Location, PublicKey, ReceiverInfo, Region};
+use tally_wire::{Clock, Decoded, FingerprintKey, Location, PublicKey, ReceiverInfo, Region};
 
 use crate::engine::{Dropped, Ingested};
 use crate::provisional::{Note, notes_of};
@@ -51,11 +66,27 @@ pub enum Place {
     Gone,
 }
 
-/// What decides who is seated: receivers that take part before those that do not, then by key.
-/// A receiver's rank is its own (its key and its own word), never when it came.
+/// The domain of the seat draw under the process key (`tally_wire::decoded::keyed`).
+const SEAT_DOMAIN: u8 = tally_wire::decoded::keyed::SEAT_DRAW;
+
+/// A receiver's draw for a seat (module docs): a keyed hash of its key under `secret`, the same for
+/// every intake of one engine, unknown outside the process, so no key can be ground to win it.
+pub fn draw_under(secret: &FingerprintKey, key: &PublicKey) -> u128 {
+    secret.fingerprint(SEAT_DOMAIN, key.as_bytes())
+}
+
+/// [`draw_under`] this process's secret (`FingerprintKey::process`): what [`Seats::new`] ranks by.
+pub fn draw(key: &PublicKey) -> u128 {
+    draw_under(FingerprintKey::process(), key)
+}
+
+/// What decides who is seated: receivers that take part before those that do not, then by their
+/// draw (module docs), then by key (two draws of 128 bits never meet in practice; the key makes
+/// the order total). A receiver's rank is its own word and the relay's secret, never when it came.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct Rank {
     idle: bool,
+    draw: u128,
     key: PublicKey,
 }
 
@@ -78,7 +109,7 @@ impl Places {
 
 /// The seats for described receivers, shared by every intake of one engine (RFC-0178 §9). Who is
 /// seated is a function of who is described, never of the order they came in or of which intake
-/// took them: the `limit` best ranked ([`Rank`]: taking part first, then key), and up to `limit`
+/// took them: the `limit` best ranked ([`Rank`]: taking part first, then the draw), and up to `limit`
 /// more waiting; beyond that the worst ranked are forgotten with their descriptions, which bounds
 /// what is remembered. A change re-settles every place, and says whose place changed, so each
 /// intake holding one of them settles it ([`Intake::settle`]). One limit: a receiver forgotten is
@@ -87,6 +118,8 @@ impl Places {
 #[derive(Debug)]
 pub struct Seats {
     limit: usize,
+    /// What the draw is keyed by: this process's secret, or a test's.
+    secret: FingerprintKey,
     places: Mutex<Places>,
 }
 
@@ -100,9 +133,17 @@ impl std::fmt::Debug for Places {
 }
 
 impl Seats {
+    /// `limit` seats, drawn for under this process's secret ([`draw`]).
     pub fn new(limit: usize) -> Arc<Self> {
+        Self::keyed(limit, *FingerprintKey::process())
+    }
+
+    /// `limit` seats, drawn for under `secret`: for a test that needs the same seats twice, or
+    /// different secrets to differ.
+    pub fn keyed(limit: usize, secret: FingerprintKey) -> Arc<Self> {
         Arc::new(Self {
             limit,
+            secret,
             places: Mutex::new(Places::default()),
         })
     }
@@ -124,7 +165,11 @@ impl Seats {
             }
             None => false,
         };
-        let rank = Rank { idle, key };
+        let rank = Rank {
+            idle,
+            draw: draw_under(&self.secret, &key),
+            key,
+        };
         places.ranks.insert(key, rank);
         if seated {
             places.seated.insert(rank);
@@ -294,6 +339,8 @@ pub struct Intake {
     regions: Option<Vec<Region>>,
     receivers: BTreeMap<PublicKey, Described>,
     open: Open,
+    /// How lateness is decided by the stamp, if it is (`closing`); kept across a restart.
+    closing: Option<Closing>,
     dropped: Dropped,
 }
 
@@ -313,8 +360,18 @@ impl Intake {
             regions,
             receivers: BTreeMap::new(),
             open: Open::new(limits),
+            closing: None,
             dropped: Dropped::default(),
         }
+    }
+
+    /// Raw late by its stamp under `closing` (module docs): for an intake whose holder steps on a
+    /// thread of its own, by the stamp watermark.
+    #[must_use]
+    pub fn closing(mut self, closing: Closing) -> Self {
+        self.open = Open::new(self.open.limits()).closing(closing);
+        self.closing = Some(closing);
+        self
     }
 
     /// Receptions held open (copies included).
@@ -520,7 +577,10 @@ impl Intake {
         for known in self.receivers.values_mut() {
             known.boots.clear();
         }
-        self.open = Open::new(limits);
+        self.open = match self.closing {
+            Some(closing) => Open::new(limits).closing(closing),
+            None => Open::new(limits),
+        };
         self.dropped = Dropped::default();
     }
 
@@ -602,9 +662,14 @@ mod tests {
     use super::*;
     use tally_wire::Identity;
 
+    fn secret(seed: u8) -> FingerprintKey {
+        FingerprintKey::from_bytes([seed; 32])
+    }
+
     /// Who is seated, waiting and forgotten is a function of who is described: the same in any
-    /// order of arrival, taking part ranked before idle, then by key. While nobody is forgotten
-    /// (at most twice the seats described), changes of rank on the way change nothing either.
+    /// order of arrival, taking part ranked before idle, then by the draw. While nobody is
+    /// forgotten (at most twice the seats described), changes of rank on the way change nothing
+    /// either.
     #[test]
     fn who_is_seated_depends_on_who_is_described_never_on_the_order() {
         let keys: Vec<PublicKey> = (0..12u8)
@@ -613,7 +678,7 @@ mod tests {
         // Every third idle.
         let idle = |n: usize| n.is_multiple_of(3);
         let outcome = |order: &[usize], limit: usize, detour: bool| -> Vec<Place> {
-            let seats = Seats::new(limit);
+            let seats = Seats::keyed(limit, secret(9));
             for n in order {
                 if detour {
                     // Described first as taking part, then decided: a change of rank on the way.
@@ -623,13 +688,14 @@ mod tests {
             }
             keys.iter().map(|key| seats.place(key)).collect()
         };
-        let mut ranked: Vec<(bool, PublicKey)> =
-            (0..keys.len()).map(|n| (idle(n), keys[n])).collect();
+        let mut ranked: Vec<(bool, u128, PublicKey)> = (0..keys.len())
+            .map(|n| (idle(n), draw_under(&secret(9), &keys[n]), keys[n]))
+            .collect();
         ranked.sort_unstable();
         let expected = |limit: usize| -> Vec<Place> {
             keys.iter()
                 .map(|key| {
-                    let at = ranked.iter().position(|(_, k)| k == key).unwrap_or(0);
+                    let at = ranked.iter().position(|(_, _, k)| k == key).unwrap_or(0);
                     if at < limit {
                         Place::Seated
                     } else if at < 2 * limit {
@@ -660,5 +726,45 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// RFC-0171 §9 (critic 4) and the audit's grinding attack: a seat is not won by choosing a
+    /// key. Keys that sort first win no more seats than any others; who is seated follows the
+    /// relay's secret, so the same receivers under another secret are seated differently, and
+    /// nobody outside the process can tell in advance which.
+    #[test]
+    fn a_seat_is_not_won_by_choosing_a_key() {
+        let mut keys: Vec<PublicKey> = (0..64u8)
+            .map(|seed| Identity::from_seed([seed; 32]).public())
+            .collect();
+        keys.sort_unstable();
+        const LIMIT: usize = 8;
+        let seated = |secret: FingerprintKey| -> Vec<PublicKey> {
+            let seats = Seats::keyed(LIMIT, secret);
+            for key in &keys {
+                let _ = seats.rank(*key, false);
+            }
+            keys.iter()
+                .filter(|key| seats.place(key) == Place::Seated)
+                .copied()
+                .collect()
+        };
+        let first = seated(secret(1));
+        let second = seated(secret(2));
+        assert_eq!((first.len(), second.len()), (LIMIT, LIMIT));
+        // The keys a grinder would choose (the least) are not what is seated.
+        assert_ne!(first, keys[..LIMIT].to_vec());
+        assert_ne!(second, keys[..LIMIT].to_vec());
+        // Another secret, other seats.
+        assert_ne!(first, second);
+        // Under one secret the seats are the best draws, whatever the keys.
+        let mut draws: Vec<(u128, PublicKey)> = keys
+            .iter()
+            .map(|key| (draw_under(&secret(1), key), *key))
+            .collect();
+        draws.sort_unstable();
+        let mut best: Vec<PublicKey> = draws[..LIMIT].iter().map(|(_, key)| *key).collect();
+        best.sort_unstable();
+        assert_eq!(first, best);
     }
 }

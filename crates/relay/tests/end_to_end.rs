@@ -704,7 +704,7 @@ impl Scripted {
 impl MlatHost for Scripted {
     fn set_areas(&self, _: Vec<Region>, _: Vec<ReceiverInfo>) {}
 
-    fn offer(&self, _: &Record, _: u64) {}
+    fn offer_description(&self, _: &ReceiverInfo) {}
 
     fn offer_batch(&self, _: &Arc<tally_wire::Decoded>, _: u64) {}
 

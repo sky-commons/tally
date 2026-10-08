@@ -22,8 +22,19 @@ pub struct PublicKey([u8; KEY_LEN]);
 impl PublicKey {
     /// Accepts only a valid Ed25519 point, so every key in circulation can verify and derive.
     pub fn from_bytes(bytes: [u8; KEY_LEN]) -> Result<Self, WireError> {
-        VerifyingKey::from_bytes(&bytes).map_err(|error| WireError::Key(error.to_string()))?;
+        Self::point_of(&bytes)?;
         Ok(Self(bytes))
+    }
+
+    /// The key in `bytes` as a decompressed point: the one decompression a holder that verifies
+    /// by the key more than once does (a `Batch` keeps it), checking the key as `from_slice` does.
+    /// There is no way to decompress a `PublicKey` already checked into a point, so no reader
+    /// checks a key and then decompresses it again (RFC-0178 §2).
+    pub(crate) fn point_of(bytes: &[u8]) -> Result<VerifyingKey, WireError> {
+        let array: [u8; KEY_LEN] = bytes.try_into().map_err(|_| {
+            WireError::Key(format!("expected {KEY_LEN} bytes, got {}", bytes.len()))
+        })?;
+        VerifyingKey::from_bytes(&array).map_err(|error| WireError::Key(error.to_string()))
     }
 
     pub fn from_slice(bytes: &[u8]) -> Result<Self, WireError> {
@@ -39,12 +50,6 @@ impl PublicKey {
 
     fn verifying(&self) -> Result<VerifyingKey, WireError> {
         VerifyingKey::from_bytes(&self.0).map_err(|error| WireError::Key(error.to_string()))
-    }
-
-    /// The key as a decompressed point, for a holder that verifies by it more than once (a
-    /// `Batch` keeps it, so its signature check never decompresses the key again).
-    pub(crate) fn point(&self) -> Result<VerifyingKey, WireError> {
-        self.verifying()
     }
 
     /// The key a decompressed point is: no check, the point already is one.
@@ -145,6 +150,11 @@ impl Identity {
 
     pub fn public(&self) -> PublicKey {
         self.public
+    }
+
+    /// The public key as a point, which the signing key already holds: nothing decompressed.
+    pub(crate) fn point(&self) -> VerifyingKey {
+        self.signing.verifying_key()
     }
 
     pub fn sign(&self, message: &[u8]) -> [u8; SIGNATURE_LEN] {

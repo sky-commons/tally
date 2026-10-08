@@ -1271,8 +1271,6 @@ mod tests {
             (0x10, "Provisional", V, T),
             (0x11, "Echo", C, C),
             (0x12, "EchoReply", C, C),
-            (0x13, "DeliveryQuery", C, C),
-            (0x14, "DeliveryAnswer", C, C),
             (0x15, "ProviderOffer", F, C),
             (0x16, "ProviderQuery", C, C),
             (0x17, "StripeAssignment", C, C),
@@ -1287,6 +1285,8 @@ mod tests {
             (0x1f, "Parity", F, T),
             (0x20, "BundleIndex", F, T),
             (0x21, "WorldPrecise", F, T),
+            (0x22, "DeliveryQuery", C, C),
+            (0x23, "DeliveryAnswer", C, C),
         ];
         let kinds: Vec<u8> = table.iter().map(|(kind, ..)| *kind).collect();
         assert_eq!(

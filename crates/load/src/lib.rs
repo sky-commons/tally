@@ -139,8 +139,8 @@ pub async fn run(config: Config) -> Result<String, String> {
         eprintln!(
             "tally-load: simulated in {:.1} s: {:.0} receptions a second a receiver ({:.0} in \
              reach, kept at {:.3}), {:.0} distinct transmissions a second, each heard by {:.1} \
-             receivers, {:.0} distinct messages a second by their bytes, {:.0} a second for the \
-             deduplicated stream; {} receptions held",
+             receivers, {:.0} distinct messages a second by their bytes, about {:.0} a second for \
+             the deduplicated stream; {} receptions held",
             started.elapsed().as_secs_f64(),
             calibration.per_sec,
             calibration.in_reach_per_sec,
@@ -487,7 +487,8 @@ fn summary(summary: &Summary) -> String {
         );
         let expected = traffic.map_or(String::new(), |traffic| {
             format!(
-                " (expected {:.0}/s: the simulation's distinct messages, by the relay's rule)",
+                " (expected about {:.0}/s: the simulation's distinct messages, by the relay's \
+                 rule; where its stamps fall moves it)",
                 traffic.calibration.deduplicated_per_sec
             )
         });

@@ -49,6 +49,10 @@ pub const TAGS_HELD: usize = 8 << 20;
 pub const KEYED_FEEDERS: usize = 100_000;
 /// The most streams (receiver and boot) whose horizon is remembered.
 pub const STREAMS_REMEMBERED: usize = 100_000;
+/// The most boots of one receiver whose streams are remembered: past it the receiver's stream held
+/// longest ago is forgotten, so one feeder churning boot ids forgets only its own streams, never
+/// another's (the hub's `BOOTS_PER_AUTHOR`, for the same reason).
+pub const BOOTS_PER_RECEIVER: usize = crate::hub::BOOTS_PER_AUTHOR;
 /// How long a silent stream's horizon is remembered: what "not seen" of an unknown stream means.
 pub const STREAM_MEMORY_MS: u64 = 60 * 60 * 1000;
 /// Locks the state is split under.
@@ -87,12 +91,23 @@ impl Default for Delivery {
 struct Shard {
     keys: HashMap<PublicKey, Keys>,
     streams: HashMap<StreamKey, Stream>,
+    /// Each receiver's boots remembered (`BOOTS_PER_RECEIVER`).
+    receivers: HashMap<PublicKey, Boots>,
     /// Streams holding entries, by their last arrival: the order entries age out in.
     active: BTreeSet<(u64, StreamKey)>,
     /// Streams holding none, by their last arrival: the order they are forgotten in.
     idle: BTreeSet<(u64, StreamKey)>,
     entries: usize,
     /// Until then a stream the relay knows nothing of may be one it forgot early.
+    unsure_until_ms: u64,
+}
+
+/// One receiver's boots whose streams are remembered, and until when a boot of it the relay knows
+/// nothing of may be one it forgot to make room for a newer one.
+#[derive(Default)]
+struct Boots {
+    /// The boot held most recently last.
+    held: Vec<u64>,
     unsure_until_ms: u64,
 }
 
@@ -319,6 +334,9 @@ impl Shard {
             None => None,
         };
         let before = self.streams.get(&key).map(|stream| stream.last_ms);
+        if before.is_none() {
+            self.room_for_boot(receiver);
+        }
         let stream = self.streams.entry(key).or_insert(Stream {
             // A stream first seen before the relay has watched a whole window may have sent
             // earlier batches it did not see.
@@ -373,8 +391,47 @@ impl Shard {
         } else {
             self.idle.insert((after, key));
         }
-        self.bound_streams();
+        let boots = self.receivers.entry(receiver).or_default();
+        boots.held.retain(|held| *held != boot_id);
+        boots.held.push(boot_id);
+        self.bound_streams(now_ms);
         !full
+    }
+
+    /// Before a new stream of `receiver`: when it has `BOOTS_PER_RECEIVER` boots remembered, the
+    /// one it held longest ago is forgotten, and until that one's memory would have run out an
+    /// unknown boot of this receiver may be it. Its own churn costs only itself.
+    fn room_for_boot(&mut self, receiver: PublicKey) {
+        let Some(boots) = self.receivers.get_mut(&receiver) else {
+            return;
+        };
+        while boots.held.len() >= BOOTS_PER_RECEIVER {
+            let oldest = boots.held.remove(0);
+            let key = (receiver, oldest);
+            if let Some(stream) = self.streams.remove(&key) {
+                self.entries -= stream.entries.len();
+                self.active.remove(&(stream.last_ms, key));
+                self.idle.remove(&(stream.last_ms, key));
+                boots.unsure_until_ms = boots
+                    .unsure_until_ms
+                    .max(stream.last_ms.saturating_add(STREAM_MEMORY_MS));
+            }
+        }
+    }
+
+    /// `key`'s stream is forgotten (its memory ran out, or the shard's bound): its receiver no
+    /// longer remembers that boot.
+    fn forgot(&mut self, key: StreamKey) {
+        if let Some(boots) = self.receivers.get_mut(&key.0) {
+            boots.held.retain(|held| *held != key.1);
+        }
+    }
+
+    /// Whether `receiver` may have a boot the relay forgot to make room for its newer ones.
+    fn unsure_of(&self, receiver: &PublicKey, now_ms: u64) -> bool {
+        self.receivers
+            .get(receiver)
+            .is_some_and(|boots| now_ms < boots.unsure_until_ms)
     }
 
     fn take_keys(&mut self, receiver: PublicKey, content: &TagKeysContent, now_ms: u64) -> bool {
@@ -423,12 +480,15 @@ impl Shard {
             }
             self.idle.pop_first();
             self.streams.remove(&key);
+            self.forgot(key);
         }
         // The oldest entries of a stream still active age out as it is held again or asked of.
     }
 
-    /// Bounds the streams remembered: the longest silent first, idle before active.
-    fn bound_streams(&mut self) {
+    /// Bounds the streams remembered: the longest silent first, idle before active. Then the
+    /// receivers: one that remembers no boot is let go once they pass twice the streams' bound (so
+    /// the sweep is paid for by as many holds); one still unsure makes the shard unsure as long.
+    fn bound_streams(&mut self, now_ms: u64) {
         while self.streams.len() > STREAMS_REMEMBERED / SHARDS {
             let Some((last_ms, key)) = self.idle.pop_first().or_else(|| self.active.pop_first())
             else {
@@ -441,6 +501,20 @@ impl Shard {
             if let Some(stream) = self.streams.remove(&key) {
                 self.entries -= stream.entries.len();
             }
+            self.forgot(key);
+        }
+        if self.receivers.len() > 2 * (STREAMS_REMEMBERED / SHARDS) {
+            let mut unsure_until_ms = self.unsure_until_ms;
+            self.receivers.retain(|_, boots| {
+                if !boots.held.is_empty() {
+                    return true;
+                }
+                if now_ms < boots.unsure_until_ms {
+                    unsure_until_ms = unsure_until_ms.max(boots.unsure_until_ms);
+                }
+                false
+            });
+            self.unsure_until_ms = unsure_until_ms;
         }
     }
 
@@ -465,7 +539,9 @@ impl Shard {
                     None => Said::Unknown,
                 }
             }
-            None if !watched || now_ms < self.unsure_until_ms => Said::Unknown,
+            None if !watched || now_ms < self.unsure_until_ms || self.unsure_of(&key.0, now_ms) => {
+                Said::Unknown
+            }
             None => Said::NotSeen,
         }
     }
@@ -1006,13 +1082,14 @@ mod tests {
         let (selection, point) = taking_here()?;
         let delivery = Delivery::new();
         delivery.started(T0);
-        // One feeder, one stream per boot (all in its shard), more than a shard remembers.
+        // One feeder, one stream per boot, more than a shard remembers: it keeps only its newest
+        // `BOOTS_PER_RECEIVER`.
         let feeder = Identity::from_seed([3; 32]);
         let boots = (STREAMS_REMEMBERED / SHARDS) as u64 + 10;
         for boot in 0..boots {
             delivery.hold(&unsigned(&feeder.public(), boot, 0, 0)?, WATCHED + boot);
         }
-        assert!(delivery.streams() <= STREAMS_REMEMBERED / SHARDS);
+        assert_eq!(delivery.streams(), BOOTS_PER_RECEIVER);
         let asked = |boot: u64, now: u64| -> std::result::Result<Vec<(u64, Possession)>, String> {
             Ok(delivery
                 .answer_at(
@@ -1038,6 +1115,45 @@ mod tests {
         assert!(asked(boots + 5, WATCHED + boots)?.is_empty());
         let later = WATCHED + STREAM_MEMORY_MS + boots;
         assert_eq!(asked(boots + 5, later)?, vec![(1, Possession::NotSeen)]);
+        Ok(())
+    }
+
+    /// Audit 2.2's twin here: a feeder churning boot ids forgets only its own streams. Another
+    /// feeder's stream (whatever shard either is in) is remembered, so a sequence it never sent
+    /// is still said not seen, and the churner's forgotten boots are never denied.
+    #[test]
+    fn a_churn_of_one_feeders_boots_forgets_only_its_own_streams() -> Result {
+        let relay = Identity::generate().map_err(text)?;
+        let (selection, point) = taking_here()?;
+        let delivery = Delivery::new();
+        delivery.started(T0);
+        let honest = Identity::from_seed([4; 32]);
+        let churner = Identity::from_seed([5; 32]);
+        delivery.hold(&unsigned(&honest.public(), 1, 0, 0)?, WATCHED);
+        // Four times what a shard remembers, all the churner's.
+        let boots = 4 * (STREAMS_REMEMBERED / SHARDS) as u64;
+        for boot in 0..boots {
+            delivery.hold(&unsigned(&churner.public(), boot, 0, 0)?, WATCHED + 1);
+        }
+        assert_eq!(delivery.streams(), 1 + BOOTS_PER_RECEIVER);
+        let asked =
+            |feeder: &Identity, boot: u64| -> std::result::Result<Vec<(u64, Possession)>, String> {
+                Ok(delivery
+                    .answer_at(
+                        &selection,
+                        Some(&relay),
+                        &query(feeder, boot, 1, 1),
+                        Some(point),
+                        WATCHED + 2,
+                    )
+                    .ok_or("no answer")?
+                    .content()
+                    .map_err(text)?
+                    .entries)
+            };
+        assert_eq!(asked(&honest, 1)?, vec![(1, Possession::NotSeen)]);
+        assert_eq!(asked(&churner, boots - 1)?, vec![(1, Possession::NotSeen)]);
+        assert!(asked(&churner, 0)?.is_empty());
         Ok(())
     }
 }

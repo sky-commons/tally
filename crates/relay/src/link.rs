@@ -131,6 +131,19 @@ impl Peer {
     /// own, and the network records, whose duties judge their asker) are taken from every role a
     /// probe is not.
     fn permit(self, record: &Record) -> Permit {
+        // A delivery query of the retired form is answered on every link, never read and never
+        // dropped unheard: its sender hears a Goodbye it already takes as "no answer".
+        if let Some(Record::Goodbye {
+            reason,
+            retry_after_secs,
+        }) = record.refusal()
+        {
+            return Permit::Refuse(End::Told {
+                reason,
+                retry_after_secs,
+                why: "a delivery query of the retired form (RFC-0178 §7)".to_owned(),
+            });
+        }
         match self {
             Self::Member => Permit::Take,
             Self::Probe if Role::Probe.may_send(record) => Permit::Take,
@@ -1993,6 +2006,39 @@ mod tests {
 
     fn text(error: impl std::fmt::Display) -> String {
         error.to_string()
+    }
+
+    /// RFC-0178 §7: a delivery query of the retired form is answered from every peer with a
+    /// goodbye naming it (which an old feeder takes as "no answer"), never dropped unheard; an old
+    /// answer, which no peer is owed a word for, is not.
+    #[test]
+    fn a_retired_delivery_query_is_refused_by_name_from_every_peer() -> Result<(), String> {
+        use tally_wire::record::{KIND_POSSESSION_ANSWER, KIND_POSSESSION_QUERY};
+        let key = Identity::from_seed([1; 32]).public();
+        let peers = [
+            Peer::Feeder(key),
+            Peer::Relay,
+            Peer::Subscriber,
+            Peer::Engine(key),
+            Peer::Member,
+            Peer::Probe,
+        ];
+        for peer in peers {
+            match peer.permit(&Record::Retired(KIND_POSSESSION_QUERY)) {
+                Permit::Refuse(End::Told {
+                    reason: Reason::Retired,
+                    ..
+                }) => {}
+                _ => return Err("a retired query was not refused by name".to_owned()),
+            }
+            if let Permit::Refuse(End::Told { reason, .. }) =
+                peer.permit(&Record::Retired(KIND_POSSESSION_ANSWER))
+                && reason == Reason::Retired
+            {
+                return Err("a retired answer was refused as a query".to_owned());
+            }
+        }
+        Ok(())
     }
 
     #[tokio::test]
