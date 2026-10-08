@@ -22,7 +22,7 @@ set -euo pipefail
 
 VERSION="v0.1.0"
 # Relays run by several independent operators, filled at release: HOST:PORT=KEY, space-separated.
-RELAYS=""
+RELAYS="relay.tally.flightlines.ai:10900=JHSEe+sJIFnbegZAoEvGzLcBKS1UYzgPBU7jpIuUJ8o="
 RELEASES="https://github.com/flightlines/tally/releases/download/$VERSION"
 BIN=/usr/local/bin/tally-feed
 KEY=/etc/tally/key
