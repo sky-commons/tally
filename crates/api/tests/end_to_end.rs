@@ -24,6 +24,7 @@ use tally_api_types::{
 use tally_merge::Merge;
 use tally_mlat_solver::sim::{self, Scenario, Simulation};
 use tally_relay::hub::Hub;
+use tally_relay::mlat_host::stepping::{self, Hosting};
 use tally_relay::mlat_host::{HostedMlat, MlatHost, MlatReport, SETTLE_MS};
 use tally_relay::stations::StationReport;
 use tally_wire::batch::ReceiverInfoContent;
@@ -37,7 +38,16 @@ use tokio::net::{TcpListener, TcpStream};
 type Result<T = ()> = std::result::Result<T, String>;
 
 const WAIT: Duration = Duration::from_secs(20);
-const SITE: &str = "https://tally.flightlines.ai";
+/// The site whose pages read the API, as this test configures it (`--allow-origin`): the API
+/// allows no origin of its own accord.
+const SITE: &str = "https://site.example";
+
+/// The API's settings over `relay_stats` and `readsb`, the test's site allowed.
+fn settings(relay_stats: impl Into<String>, readsb: impl Into<String>) -> Settings {
+    let mut settings = Settings::new(relay_stats, readsb);
+    settings.allow_origins = vec![SITE.to_owned()];
+    settings
+}
 
 fn text(error: impl std::fmt::Display) -> String {
     error.to_string()
@@ -169,8 +179,8 @@ async fn get(url: &str) -> Result<(StatusCode, HeaderMap, Bytes)> {
     send(url, request).await
 }
 
-/// The preflight a browser sends before a `GET` that carries `traceparent` and `accept`, as the
-/// Flightlines client core's fetch port sends every read.
+/// The preflight a browser sends before a `GET` that carries `traceparent` and `accept`, as a
+/// browser client sends every read.
 async fn preflight(url: &str) -> Result<(StatusCode, HeaderMap, Bytes)> {
     let request = Request::builder()
         .method(Method::OPTIONS)
@@ -256,7 +266,7 @@ async fn the_api_serves_aircraft_the_network_and_a_station_from_readsb_and_a_rea
         (key.to_base64().as_str(), 1, true, 1, 12)
     );
 
-    let mut settings = Settings::new(stats_url, readsb_url);
+    let mut settings = settings(stats_url, readsb_url);
     settings.refresh = Duration::from_millis(100);
     let api = start_api(settings).await?;
 
@@ -400,7 +410,7 @@ async fn the_api_serves_aircraft_the_network_and_a_station_from_readsb_and_a_rea
 #[tokio::test(flavor = "multi_thread")]
 async fn a_client_beyond_its_burst_is_refused_and_the_refusal_is_not_cached() -> Result {
     let (readsb_url, _) = start_readsb().await?;
-    let mut settings = Settings::new("http://127.0.0.1:9", readsb_url);
+    let mut settings = settings("http://127.0.0.1:9", readsb_url);
     // A rate so slow no token comes back during the test.
     settings.rate = 0.001;
     settings.burst = 3.0;
@@ -419,7 +429,7 @@ async fn a_client_beyond_its_burst_is_refused_and_the_refusal_is_not_cached() ->
 #[tokio::test(flavor = "multi_thread")]
 async fn a_preflight_allows_what_the_client_core_sends_and_costs_no_token() -> Result {
     let (readsb_url, _) = start_readsb().await?;
-    let mut settings = Settings::new("http://127.0.0.1:9", readsb_url);
+    let mut settings = settings("http://127.0.0.1:9", readsb_url);
     // One token, and none comes back during the test.
     settings.rate = 0.001;
     settings.burst = 1.0;
@@ -461,42 +471,63 @@ async fn a_preflight_allows_what_the_client_core_sends_and_costs_no_token() -> R
     Ok(())
 }
 
-/// A scenario on yesterday's UTC day, so every window bin of it is long past by an engine's clock.
-fn yesterday(scenario: Scenario) -> Scenario {
-    let now = std::time::SystemTime::now()
+fn wall_ms() -> u64 {
+    std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_millis() as u64);
+        .map_or(0, |elapsed| elapsed.as_millis() as u64)
+}
+
+/// How long before now the scenario starts: its window bins are past by the time the relays'
+/// clock, walking it from its start (`stepping`), reaches the wall clock (a 30 s scenario, a window
+/// after it and its settling).
+const SCENARIO_AGO_MS: u64 = 150_000;
+
+/// A scenario that began `SCENARIO_AGO_MS` ago, so every window bin of it is past by the time the
+/// relays' clock reaches the wall clock.
+fn minutes_ago(scenario: Scenario) -> Scenario {
+    let start_ms = wall_ms() - SCENARIO_AGO_MS;
     Scenario {
-        midnight_unix_ms: (now / 86_400_000 - 1) * 86_400_000,
+        midnight_unix_ms: start_ms - start_ms % 86_400_000,
+        start_tod_s: (start_ms % 86_400_000) as f64 / 1000.0,
         ..scenario
     }
 }
 
 /// A relay's hosted MLAT (`tally_relay::mlat_host`, RFC-0174 §2.1: the relay and its MLAT are
-/// one program) pinned to the simulator's areas, whose steps wait until it has taken `batches`
-/// batches: the scenario is a day old, so every window is due the moment the engine looks, and a
-/// step on the clock would solve whatever raw a slow machine had delivered by then.
+/// one program) pinned to the simulator's areas. Its relay's clock walks the scenario a step at a
+/// time (`tally_relay::mlat_host::stepping`), each step once the engine has been offered every
+/// batch fed by then and has stepped to it and published: raw is late by its stamp, never by when
+/// a step ran (RFC-0181), so no step solves whatever raw a slow machine had delivered by then.
 struct Held {
     host: HostedMlat,
-    areas: Vec<Region>,
-    batches: u64,
+    areas: tally_wire::Regions,
+}
+
+impl Hosting for Held {
+    fn host(&self) -> &HostedMlat {
+        &self.host
+    }
 }
 
 impl MlatHost for Held {
-    fn set_areas(&self, _: Vec<Region>, descriptions: Vec<ReceiverInfo>) {
+    fn set_areas(&self, _: tally_wire::Regions, descriptions: Vec<ReceiverInfo>) {
         self.host.set_areas(self.areas.clone(), descriptions);
     }
 
-    fn offer(&self, record: &Record, now_ms: u64) {
-        self.host.offer(record, now_ms);
+    fn offer_description(&self, info: &tally_wire::ReceiverInfo, stamp_ms: u64) {
+        self.host.offer_description(info, stamp_ms);
+    }
+
+    fn offer_batch(&self, batch: &std::sync::Arc<tally_wire::Decoded>, now_ms: u64) {
+        self.host.offer_batch(batch, now_ms);
+    }
+
+    fn sealed_bins(&self) -> Option<tally_mlat_solver::held::SealedBins> {
+        self.host.sealed_bins()
     }
 
     fn take_published(&self, now_ms: u64) -> Vec<Record> {
-        if self.host.ingested() >= self.batches {
-            self.host.take_published(now_ms)
-        } else {
-            Vec::new()
-        }
+        self.host.take_published(now_ms)
     }
 
     fn cores(&self) -> u16 {
@@ -530,31 +561,30 @@ fn areas() -> Result<Vec<Region>> {
     Ok(areas)
 }
 
-/// A relay hosting MLAT for the simulator's areas, its first step once it holds `batches`
-/// batches: its address as a client names it, and its hub.
-async fn mlat_relay(batches: u64) -> Result<(RelayAddress, Arc<Hub>)> {
+/// A relay hosting MLAT for the simulator's areas, on `clock`: its address as a client names it,
+/// its hub and its hosted MLAT.
+async fn mlat_relay(clock: &Arc<stepping::Clock>) -> Result<(RelayAddress, Arc<Hub>, Arc<Held>)> {
     let identity = Identity::generate().map_err(text)?;
     let key = identity.public();
     let listener = TcpListener::bind("127.0.0.1:0").await.map_err(text)?;
     let address = listener.local_addr().map_err(text)?;
     // Every feeder here comes from loopback: more than one host's share of connections.
-    let hub = Arc::new(Hub::new(8).max_connections_per_address(64));
-    let areas = areas()?;
+    let hub = Arc::new(Hub::clocked(8, clock.clock()).max_connections_per_address(64));
+    let areas = tally_wire::Regions::new(areas()?);
     let host = HostedMlat::new(
         identity.clone(),
         1,
         tally_mlat::engine::Settings {
-            regions: Vec::new(),
+            regions: tally_wire::Regions::default(),
             settle_ms: SETTLE_MS,
             threads: 4,
+            capacity: tally_mlat::engine::Capacity::default(),
         },
-    );
+    )?;
     host.set_areas(areas.clone(), Vec::new());
-    hub.network().host_mlat(Arc::new(Held {
-        host,
-        areas,
-        batches,
-    }));
+    let held = Arc::new(Held { host, areas });
+    hub.network()
+        .host_mlat(Arc::clone(&held) as Arc<dyn MlatHost>);
     tokio::spawn(tally_relay::serve(
         listener,
         vec![identity],
@@ -566,6 +596,7 @@ async fn mlat_relay(batches: u64) -> Result<(RelayAddress, Arc<Hub>)> {
             address: address.to_string(),
         },
         hub,
+        held,
     ))
 }
 
@@ -586,33 +617,44 @@ async fn listening(hub: &Hub, before: usize, links: usize) -> Result {
     })
 }
 
-/// The simulated receivers `receivers`, publishing to `relay` as feeders.
+/// The simulated receivers `receivers`, publishing to `relay` as feeders: each its description at
+/// once, then each batch once `clock` reaches its wall clock. The wall clocks of the batches fed.
 async fn feed_simulation(
     simulation: &Simulation,
     relay: &RelayAddress,
     receivers: std::ops::Range<usize>,
-) -> Result {
+    clock: &Arc<stepping::Clock>,
+) -> Result<Vec<u64>> {
     let feeds = simulation.feeds().map_err(text)?;
+    let mut walls = Vec::new();
     for feed in &feeds[receivers] {
-        {
-            let stream = TcpStream::connect(&relay.address).await.map_err(text)?;
-            let mut session = noise::connect(stream, &feed.identity, &relay.key, Role::Feeder)
-                .await
-                .map_err(text)?;
-            let mut records = vec![Record::ReceiverInfo(feed.info.clone())];
-            records.extend(feed.batches.iter().cloned().map(Record::Batch));
-            tokio::spawn(async move {
-                for record in records {
-                    if session.writer.send(&[record]).await.is_err() {
-                        return;
-                    }
-                }
-                std::future::pending::<()>().await;
-                drop(session);
-            });
+        let stream = TcpStream::connect(&relay.address).await.map_err(text)?;
+        let mut session = noise::connect(stream, &feed.identity, &relay.key, Role::Feeder)
+            .await
+            .map_err(text)?;
+        let description = Record::ReceiverInfo(feed.info.clone());
+        let mut batches = Vec::new();
+        for batch in &feed.batches {
+            let wall = batch.content().map_err(text)?.wall_ms;
+            walls.push(wall);
+            batches.push((wall, Record::Batch(batch.clone())));
         }
+        let clock = Arc::clone(clock);
+        tokio::spawn(async move {
+            if session.writer.send(&[description]).await.is_err() {
+                return;
+            }
+            for (wall, record) in batches {
+                clock.reached(wall).await;
+                if session.writer.send(&[record]).await.is_err() {
+                    return;
+                }
+            }
+            std::future::pending::<()>().await;
+            drop(session);
+        });
     }
-    Ok(())
+    Ok(walls)
 }
 
 /// THE POINT: two relays each solve MLAT from the raw of the receivers that feed it (seven of
@@ -621,28 +663,29 @@ async fn feed_simulation(
 /// every record both relays carried holds, aircraft both relays solved included.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_api_serves_one_merged_mlat_position_per_aircraft_from_two_relays() -> Result {
-    let simulation = sim::run(&yesterday(Scenario {
+    let simulation = sim::run(&minutes_ago(Scenario {
         duration_s: 30.0,
         modes_aircraft: 16,
         ..Scenario::new(31)
     }));
-    let feeds = simulation.feeds().map_err(text)?;
-    let batches = |receivers: std::ops::Range<usize>| -> u64 {
-        feeds[receivers]
-            .iter()
-            .map(|feed| feed.batches.len() as u64)
-            .sum()
-    };
-    let ((west, west_hub), (east, east_hub)) = (
-        mlat_relay(batches(0..7)).await?,
-        mlat_relay(batches(3..10)).await?,
+    // Both relays' clock, walking the scenario from the step its first batch is in.
+    let first = simulation
+        .receptions
+        .iter()
+        .map(|reception| reception.wall_ms)
+        .min()
+        .ok_or("a scenario heard nothing")?;
+    let clock = stepping::Clock::at(
+        first / tally_relay::mlat_host::STEP_MS * tally_relay::mlat_host::STEP_MS,
     );
+    let ((west, west_hub, west_mlat), (east, east_hub, east_mlat)) =
+        (mlat_relay(&clock).await?, mlat_relay(&clock).await?);
     let before = (west_hub.listening(), east_hub.listening());
     let (readsb_url, _) = start_readsb().await?;
     let (_, _, stats_url) = start_relay().await?;
-    let mut settings = Settings::new(stats_url, readsb_url);
+    let mut settings = settings(stats_url, readsb_url);
     settings.mlat.relays = vec![west.clone(), east.clone()];
-    // The scenario ran yesterday.
+    // The scenario ran minutes ago.
     settings.mlat.max_age = Duration::from_secs(3 * 86_400);
     let api = start_api(settings).await?;
     // A client of its own on both relays: every record the API could have read.
@@ -659,8 +702,16 @@ async fn the_api_serves_one_merged_mlat_position_per_aircraft_from_two_relays() 
     // publishes, so nothing published is missed.
     listening(&west_hub, before.0, 2).await?;
     listening(&east_hub, before.1, 2).await?;
-    feed_simulation(&simulation, &west, 0..7).await?;
-    feed_simulation(&simulation, &east, 3..10).await?;
+    let west_walls = feed_simulation(&simulation, &west, 0..7, &clock).await?;
+    let east_walls = feed_simulation(&simulation, &east, 3..10, &clock).await?;
+    let stepper = stepping::step(
+        Arc::clone(&clock),
+        vec![
+            (west_mlat as Arc<dyn Hosting>, west_walls),
+            (east_mlat as Arc<dyn Hosting>, east_walls),
+        ],
+        Duration::from_secs(60),
+    );
 
     let mut merge = Merge::new(tally_merge::Settings::new(false));
     let last: Arc<Mutex<String>> = Arc::default();
@@ -711,8 +762,14 @@ async fn the_api_serves_one_merged_mlat_position_per_aircraft_from_two_relays() 
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
     })
-    .await
-    .map_err(|_| {
+    .await;
+    // The clock's own error first, when it stood still: the deadline only follows from it.
+    if outcome.is_err() && stepper.is_finished() {
+        stepper.await.map_err(text)??;
+    } else {
+        stepper.abort();
+    }
+    let outcome = outcome.map_err(|_| {
         format!(
             "the API never served the merged positions: {}",
             last.lock().map(|last| last.clone()).unwrap_or_default()

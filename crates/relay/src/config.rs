@@ -5,13 +5,27 @@ use tally_wire::{Identity, PublicKey, Region, RelayAddress};
 use crate::egress::Cap;
 
 use crate::hub::{
-    DEFAULT_MAX_CONNECTIONS, DEFAULT_MAX_CONNECTIONS_PER_ADDRESS, DEFAULT_MAX_DEDUP_BYTES,
-    DEFAULT_MAX_FEEDER_BYTES_PER_SEC, DEFAULT_MAX_MEMBER_BYTES_PER_SEC,
+    DEFAULT_MAX_CONNECTIONS, DEFAULT_MAX_CONNECTIONS_PER_ADDRESS, DEFAULT_MAX_FEEDER_BYTES_PER_SEC,
+    DEFAULT_MAX_MEMBER_BYTES_PER_SEC,
 };
+use crate::ingest::Threads;
 
 const USAGE: &str = "\
 usage: tally-relay --key FILE [--key FILE]... --max-upload RATE [options]
        tally-relay keygen          print a new key file to stdout and its public key to stderr
+       tally-relay check [--memory-limit BYTES] --key FILE ... [options]
+                                   refuse what a start would refuse, without starting: the same
+                                   arguments, read and checked as a start reads and checks them
+                                   (but for the key files, which it does not read, and the
+                                   sockets, which it does not open), then print the memory plan
+                                   (memory, base, oversize, connections, connection-buffers,
+                                   per-feeder, feeders, members, per-member, member-feeders,
+                                   member-rate-pool, member-pool, planned, headroom, limit)
+                                   and exit 0. --memory-limit is the
+                                   memory the relay will run in (the lesser of its cgroup's
+                                   limits: a unit's MemoryHigh and MemoryMax, a container's
+                                   limits.memory), as it would find it there (default: this
+                                   host's, as a start here would find it)
 
   --key FILE             this relay's key; repeat during a rotation, newest first
   --max-upload RATE      required: the most this relay sends a second to billed peers, in
@@ -51,7 +65,8 @@ usage: tally-relay --key FILE [--key FILE]... --max-upload RATE [options]
                          every relay it reads (RFC-0174 §2.1); repeatable
   --max-subscribers N    subscribers served before new ones are turned away (default 64)
   --max-connections N    connections held at once; beyond it a new one is closed before its
-                         handshake (default 2048)
+                         handshake (default 2048). Each one's Noise buffers (128 KiB) are
+                         planned in the memory budget before any feeder
   --max-connections-per-address N
                          connections held at once from one IPv4 address or IPv6 /64; beyond
                          it a new one from there is closed before its handshake (default 16)
@@ -63,13 +78,31 @@ usage: tally-relay --key FILE [--key FILE]... --max-upload RATE [options]
                          dialled in is held to it (a feeder, a subscriber, an engine, a probe)
                          but a relay, held to the next
   --max-member-bytes-per-sec N
-                         the same for a relay (a sharing member, or a directory link, which
-                         becomes one once its offer is verified): the most one may send a
-                         second, with a burst of the larger of
-                         N and 192 KiB; about twice a whole-world MLAT relay's clock models
-                         and final and provisional positions (default 8388608)
-  --max-dedup-bytes N    the most the deduplicated stream holds of messages being compared;
-                         beyond it new messages are forwarded raw only (default 268435456)
+                         the same for the relays that send this one data (its sharing members,
+                         a directory link once its offer is verified, its own one-hop raw
+                         links): the most they may send a second all together, each waiting
+                         its turn past it, and the most one alone may, with a burst of the
+                         larger of N and 192 KiB (default 1048576). Planned once, apart from
+                         the feeders', as the feeders it is worth (N over 8 KiB/s) in every
+                         store, so a whole-world relay sharing its clock models and final and
+                         provisional positions (about 4.2 MB/s) raises it, with the memory to
+                         match. The member sessions are not chosen: they are as many as the
+                         areas taken let other relays open (each area's cell, its ancestors and
+                         the cells under it, 32 relays a cell, and with MLAT their raw links),
+                         at most --max-connections, each carving its own ingest allowance; the
+                         relay refuses to start when its memory cannot hold them and one feeder
+  --memory BYTES         the most memory this relay may use, in bytes or with K, M, G or T
+                         (binary: 16G is 16 GiB). Every feeder's share of every store (batches,
+                         MLAT raw, deduplication, subscriber queues, delivery tags, connection
+                         buffers) is reserved when it is admitted, and a feeder beyond what this
+                         holds is turned away at its Hello: no spare slot (default: the memory
+                         the relay runs in, the lesser of its cgroup's memory.high and
+                         memory.max, else the host's memory, less 64 MiB of headroom for what
+                         no store charges). Never above that: the kernel would throttle or kill
+                         the relay before its budget turned a feeder away
+  --ingest-threads N     threads that verify, admit and decode feeders' batches (default: a
+                         quarter of the cores)
+  --message-threads N    threads that deduplicate receptions (default: an eighth of the cores)
   --area CELL            an area this relay takes (an H3 cell, hex or decimal): it shares it
                          and, with relay duties on, may solve its MLAT (RFC-0174 §2.1);
                          repeatable
@@ -113,7 +146,13 @@ pub struct Config {
     pub max_connections_per_address: usize,
     pub max_feeder_bytes_per_sec: u64,
     pub max_member_bytes_per_sec: u64,
-    pub max_dedup_bytes: usize,
+    /// Bytes the relay may use: the admission budget (`budget`).
+    pub memory: usize,
+    /// The memory the relay runs in: the lesser of its cgroup's limits, else the host's
+    /// (`budget::memory_available`), or what `check` is told it will be (`--memory-limit`).
+    /// `memory` is never above it less `budget::HEADROOM_BYTES`.
+    pub memory_limit: usize,
+    pub threads: Threads,
     pub max_upload: Cap,
     /// The areas taken (RFC-0174 §2.1).
     pub areas: Vec<Region>,
@@ -137,9 +176,55 @@ at most about 2.01 TB in 31 days, which leaves about 1 TB of a $12 Lightsail pla
 feeders send in, which counts toward it too (AWS bills $0.09 a GB of the excess out). tally/README.md,
 \"What a relay costs\", prices common hosts.";
 
+/// What the command line asks for.
+#[derive(Debug)]
+pub enum Command {
+    /// Start a relay.
+    Run(Config),
+    /// Refuse what a start would refuse and print the plan, without starting (`check`).
+    Check(Config),
+    /// Nothing more: the command was fully handled (usage, keygen).
+    Done,
+}
+
+impl Command {
+    pub fn from_args(args: impl Iterator<Item = String>) -> Result<Self, String> {
+        let mut args = args.peekable();
+        if args.peek().map(String::as_str) != Some("check") {
+            return Ok(Config::from_args(args)?.map_or(Self::Done, Self::Run));
+        }
+        args.next();
+        let memory_limit = if args.peek().map(String::as_str) == Some("--memory-limit") {
+            args.next();
+            let text = args.next().ok_or("--memory-limit needs a value")?;
+            parse_bytes(&text).map_err(|error| format!("--memory-limit {error}"))?
+        } else {
+            crate::budget::memory_available()
+        };
+        Ok(Config::parse(args, memory_limit)?.map_or(Self::Done, Self::Check))
+    }
+}
+
 impl Config {
-    /// `None` when the command was fully handled (usage, keygen).
+    /// `None` when the command was fully handled (usage, keygen). The relay's memory limit is
+    /// what this host gives it (`budget::memory_available`).
     pub fn from_args(args: impl Iterator<Item = String>) -> Result<Option<Self>, String> {
+        let mut args = args.peekable();
+        if args.peek().map(String::as_str) == Some("keygen") {
+            let identity = Identity::generate().map_err(|error| error.to_string())?;
+            println!("{}", identity.to_base64());
+            eprintln!("public key: {}", identity.public());
+            return Ok(None);
+        }
+        Self::parse(args, crate::budget::memory_available())
+    }
+
+    /// The relay's flags, for a relay that runs in `memory_limit` bytes: every refusal a start
+    /// makes of its arguments. `None` when the command was fully handled (usage).
+    pub fn parse(
+        args: impl Iterator<Item = String>,
+        memory_limit: usize,
+    ) -> Result<Option<Self>, String> {
         let mut config = Self {
             key_files: Vec::new(),
             listen: "0.0.0.0:10900".to_owned(),
@@ -154,7 +239,9 @@ impl Config {
             max_connections_per_address: DEFAULT_MAX_CONNECTIONS_PER_ADDRESS,
             max_feeder_bytes_per_sec: DEFAULT_MAX_FEEDER_BYTES_PER_SEC,
             max_member_bytes_per_sec: DEFAULT_MAX_MEMBER_BYTES_PER_SEC,
-            max_dedup_bytes: DEFAULT_MAX_DEDUP_BYTES,
+            memory: crate::budget::budget_within(memory_limit),
+            memory_limit,
+            threads: Threads::from_cores(),
             max_upload: Cap::NONE,
             areas: Vec::new(),
             network: 0,
@@ -164,13 +251,7 @@ impl Config {
             relay_duties: true,
         };
         let mut max_upload = None;
-        let mut args = args.peekable();
-        if args.peek().map(String::as_str) == Some("keygen") {
-            let identity = Identity::generate().map_err(|error| error.to_string())?;
-            println!("{}", identity.to_base64());
-            eprintln!("public key: {}", identity.public());
-            return Ok(None);
-        }
+        let mut args = args;
         while let Some(flag) = args.next() {
             let mut value = || args.next().ok_or_else(|| format!("{flag} needs a value"));
             match flag.as_str() {
@@ -206,10 +287,19 @@ impl Config {
                         .parse()
                         .map_err(|_| "--max-connections-per-address needs a number".to_owned())?;
                 }
-                "--max-dedup-bytes" => {
-                    config.max_dedup_bytes = value()?
+                "--memory" => {
+                    config.memory =
+                        parse_bytes(&value()?).map_err(|error| format!("--memory {error}"))?;
+                }
+                "--ingest-threads" => {
+                    config.threads.ingest = value()?
                         .parse()
-                        .map_err(|_| "--max-dedup-bytes needs a number".to_owned())?;
+                        .map_err(|_| "--ingest-threads needs a number".to_owned())?;
+                }
+                "--message-threads" => {
+                    config.threads.message = value()?
+                        .parse()
+                        .map_err(|_| "--message-threads needs a number".to_owned())?;
                 }
                 "--max-feeder-bytes-per-sec" => {
                     config.max_feeder_bytes_per_sec = value()?
@@ -251,9 +341,25 @@ impl Config {
             return Err(format!("--key is required\n{USAGE}"));
         }
         config.max_upload = max_upload.ok_or(CAP_REQUIRED)?;
+        let most = crate::budget::budget_within(config.memory_limit);
+        if config.memory > most {
+            return Err(format!(
+                "--memory {} is above the {most} bytes this relay may plan: the {} bytes it runs \
+                 in (the lesser of its cgroup's limits, else the host's memory) less {} of \
+                 headroom for what no store charges. Past it the kernel would throttle or kill \
+                 the relay before its budget turned a feeder away; give it at most that, or \
+                 raise the limit (the unit's MemoryHigh and MemoryMax, the container's \
+                 limits.memory)",
+                config.memory,
+                config.memory_limit,
+                crate::budget::HEADROOM_BYTES,
+            ));
+        }
         if (config.world || config.world_precise) && !covers_the_world(&config.areas) {
             return Err(WORLD_NEEDS_EVERY_AREA.to_owned());
         }
+        // Every region taken is offered, or the relay does not start.
+        crate::directory::offerable(&config.areas).map_err(|error| format!("--area: {error}"))?;
         // A relay list carries a one-byte count.
         if config.hints().len() > usize::from(u8::MAX) {
             return Err("at most 255 advertised relays and upstreams together".to_owned());
@@ -296,6 +402,23 @@ The --area cells named do not cover the globe, so the product would be a part of
 as the whole. Take every area (the 122 resolution 0 cells cover it), or leave the world products
 to a relay that does.";
 
+/// Bytes, as a number or with a binary K, M, G or T after it.
+pub fn parse_bytes(text: &str) -> Result<usize, String> {
+    let text = text.trim();
+    let (number, shift) = match text.chars().last() {
+        Some('K' | 'k') => (&text[..text.len() - 1], 10),
+        Some('M' | 'm') => (&text[..text.len() - 1], 20),
+        Some('G' | 'g') => (&text[..text.len() - 1], 30),
+        Some('T' | 't') => (&text[..text.len() - 1], 40),
+        _ => (text, 0),
+    };
+    number
+        .parse::<usize>()
+        .ok()
+        .and_then(|number| number.checked_mul(1 << shift))
+        .ok_or_else(|| format!("{text}: expected bytes, or a number with K, M, G or T"))
+}
+
 /// An H3 cell as its 64-bit number: decimal, `0x` hex, or bare hex as H3's own tools print it.
 pub fn parse_area(text: &str) -> Result<Region, String> {
     let hex = text.strip_prefix("0x").or_else(|| text.strip_prefix("0X"));
@@ -310,29 +433,21 @@ pub fn parse_area(text: &str) -> Result<Region, String> {
         .ok_or_else(|| format!("--area: {text} is not an H3 cell"))
 }
 
-/// The 122 resolution 0 cells: H3's base cells, each the index with mode 1, resolution 0, its
-/// base cell number, and every digit unused (7).
-fn base_cells() -> Vec<Region> {
-    (0..122u64)
-        .filter_map(|base| Region::from_u64(0x0800_1fff_ffff_ffff | (base << 45)).ok())
-        .collect()
-}
-
 /// Whether `areas` cover the globe: every area (`rendezvous::AREA_RESOLUTION`) lies in one of
-/// them.
+/// them (a region finer than an area counts its area taken, as `rendezvous::areas_of` does).
+/// Region by region: the areas they name, at their fewest, are the base cells.
 pub fn covers_the_world(areas: &[Region]) -> bool {
-    let taken: std::collections::HashSet<u64> = areas
+    let named: tally_wire::Regions = areas
         .iter()
-        .filter_map(|region| tally_wire::rendezvous::areas_of(*region).ok())
-        .flatten()
-        .map(Region::as_u64)
-        .collect();
-    let bases = base_cells();
-    bases.len() == 122
-        && bases.into_iter().all(|base| {
-            tally_wire::rendezvous::areas_of(base)
-                .is_ok_and(|every| every.iter().all(|area| taken.contains(&area.as_u64())))
+        .filter_map(|region| {
+            region.ancestor(
+                region
+                    .resolution()
+                    .min(tally_wire::rendezvous::AREA_RESOLUTION),
+            )
         })
+        .collect();
+    named == tally_wire::Regions::world()
 }
 
 pub fn parse_upstream(text: &str) -> Result<Upstream, String> {
@@ -351,8 +466,12 @@ mod tests {
     use super::*;
     use crate::egress;
 
+    /// A host of a terabyte, whatever runs the test.
+    const LIMIT: usize = 1 << 40;
+
     fn config(args: &[&str]) -> Result<Config, String> {
-        Config::from_args(args.iter().map(|arg| (*arg).to_owned()))?.ok_or("no config".to_owned())
+        Config::parse(args.iter().map(|arg| (*arg).to_owned()), LIMIT)?
+            .ok_or("no config".to_owned())
     }
 
     #[test]
@@ -390,10 +509,10 @@ mod tests {
                 config.max_connections_per_address,
                 config.max_feeder_bytes_per_sec,
                 config.max_member_bytes_per_sec,
-                config.max_dedup_bytes,
             ),
-            (2048, 16, 262_144, 8_388_608, 256 * 1024 * 1024)
+            (2048, 16, 262_144, 1_048_576)
         );
+        assert_eq!(config.memory, LIMIT - crate::budget::HEADROOM_BYTES);
         Ok(())
     }
 
@@ -407,7 +526,14 @@ mod tests {
             format!("(default {DEFAULT_MAX_CONNECTIONS_PER_ADDRESS})"),
             format!("(default {DEFAULT_MAX_FEEDER_BYTES_PER_SEC})"),
             format!("(default {DEFAULT_MAX_MEMBER_BYTES_PER_SEC})"),
-            format!("(default {DEFAULT_MAX_DEDUP_BYTES})"),
+            format!(
+                "less {} MiB of headroom",
+                crate::budget::HEADROOM_BYTES >> 20
+            ),
+            format!(
+                "(N over {} KiB/s)",
+                crate::budget::PLANNED_BYTES_PER_SEC / 1024
+            ),
             format!("past {} s", egress::SHED_AFTER.as_secs()),
             format!("10Mbit/s is\n                         at most about {ten}"),
         ] {
@@ -436,6 +562,59 @@ mod tests {
             assert_eq!(parse_area(&text)?, region, "{text}");
         }
         assert!(parse_area("12").is_err());
+        Ok(())
+    }
+
+    /// The 122 resolution 0 cells: H3's base cells.
+    fn base_cells() -> Vec<Region> {
+        tally_wire::Regions::world().cells().to_vec()
+    }
+
+    /// Every region taken is offered: a relay whose regions, at their fewest, are more cells than
+    /// its peers hold offers of one key refuses to start, and says how many; the same places
+    /// named by fewer cells start.
+    #[test]
+    fn a_relay_refuses_areas_it_could_not_offer_whole() -> Result<(), String> {
+        let base = *base_cells().first().ok_or("no base cell")?;
+        // Every other area under one base cell: no two siblings merge, so they stay that many.
+        let scattered: Vec<String> = tally_wire::rendezvous::areas_of(base)
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .step_by(2)
+            .map(|cell| format!("{:x}", cell.as_u64()))
+            .collect();
+        assert!(scattered.len() < crate::directory::OFFERS_PER_KEY);
+        let mut args = vec!["--key", "k", "--max-upload", "10Mbit/s"];
+        let some: Vec<&str> = scattered.iter().map(String::as_str).collect();
+        for area in &some {
+            args.extend(["--area", area]);
+        }
+        assert!(config(&args).is_ok());
+        // The other half of a second base cell's areas too: past the bound, refused.
+        let second = *base_cells().get(1).ok_or("no second base cell")?;
+        let more: Vec<String> = tally_wire::rendezvous::areas_of(second)
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .step_by(2)
+            .map(|cell| format!("{:x}", cell.as_u64()))
+            .collect();
+        for area in &more {
+            args.extend(["--area", area.as_str()]);
+        }
+        let refused = config(&args)
+            .err()
+            .ok_or("started with areas it cannot offer")?;
+        assert!(refused.contains("cells at their fewest"), "{refused}");
+        // The same two base cells named whole: two cells, started.
+        let whole = [
+            format!("{:x}", base.as_u64()),
+            format!("{:x}", second.as_u64()),
+        ];
+        let mut args = vec!["--key", "k", "--max-upload", "10Mbit/s"];
+        for cell in &whole {
+            args.extend(["--area", cell.as_str()]);
+        }
+        assert!(config(&args).is_ok());
         Ok(())
     }
 
@@ -519,6 +698,61 @@ mod tests {
         assert!(
             super::tests::config(&["--key", "k", "--max-upload", "1MB/s", "--client", "x"])
                 .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn memory_is_read_in_bytes_or_binary_units_and_threads_by_flag() -> Result<(), String> {
+        assert_eq!(parse_bytes("4096")?, 4096);
+        assert_eq!(parse_bytes("16G")?, 16 << 30);
+        assert_eq!(parse_bytes("512M")?, 512 << 20);
+        assert!(parse_bytes("lots").is_err());
+        let config = config(&[
+            "--key",
+            "relay.key",
+            "--max-upload",
+            "10Mbit/s",
+            "--memory",
+            "8G",
+            "--ingest-threads",
+            "3",
+            "--message-threads",
+            "2",
+        ])?;
+        assert_eq!(config.memory, 8 << 30);
+        // Never above the memory the relay runs in: the kernel would kill it first.
+        let over = Config::parse(
+            ["--key", "k", "--max-upload", "1MB/s", "--memory", "2G"]
+                .map(str::to_owned)
+                .into_iter(),
+            1 << 30,
+        )
+        .err()
+        .unwrap_or_default();
+        assert!(
+            over.contains("is above the 1006632960 bytes this relay may plan"),
+            "{over}"
+        );
+        // The headroom is kept whatever --memory says: all of the limit is refused too.
+        let all = Config::parse(
+            ["--key", "k", "--max-upload", "1MB/s", "--memory", "1G"]
+                .map(str::to_owned)
+                .into_iter(),
+            1 << 30,
+        );
+        assert!(all.is_err());
+        // The member sessions follow the areas; no operator picks them.
+        assert!(
+            super::tests::config(&["--key", "k", "--max-upload", "1MB/s", "--max-members", "3"])
+                .is_err()
+        );
+        assert_eq!(
+            config.threads,
+            Threads {
+                ingest: 3,
+                message: 2
+            }
         );
         Ok(())
     }

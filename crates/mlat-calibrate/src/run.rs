@@ -343,9 +343,10 @@ pub fn run(
             Identity::from_seed([0x17; 32]),
             1,
             EngineSettings {
-                regions: Vec::new(),
+                regions: tally_wire::Regions::default(),
                 settle_ms: SETTLE_MS,
                 threads: settings.threads.max(1),
+                capacity: tally_mlat::engine::Capacity::default(),
             },
         ),
         feeds,

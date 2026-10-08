@@ -20,6 +20,15 @@
 //! indexes), and what it addresses to members ([`Sharing::take_outbox`]), which `network` carries
 //! down a session to each (`peers`). [`group_of`] is the one rule for which group a record is in.
 //!
+//! **Idle costs nothing.** A relay takes every area under its regions (the whole world is 41,162),
+//! but holds and visits only what carries something: a group only this relay is in, with nothing
+//! in it, has no book (`groups`) and is not held (`member`), and its trees are computed when asked
+//! ([`Sharing::layout`]). The tick lays out again only the trees of the areas whose offers changed
+//! (`Directory::take_changed_cells`), whose demotions began or ended, or all held ones when what
+//! the relay takes or has withdrawn from changes; and the member visits only the groups with a duty
+//! due. So a tick with no traffic and no change does no work, however many areas are taken
+//! ([`Sharing::work`] counts it).
+//!
 //! What the seam hands back to an asker ([`DataReplies`]) is data, never control: a repair page is
 //! manifests, parity and records, and the link sends it as data, paced and capped like any other
 //! record of its class (`egress`), so an asker cannot draw the control reserve by asking.
@@ -36,21 +45,25 @@ pub mod withdrawal;
 #[cfg(test)]
 mod tests;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use tally_wire::rendezvous::{AREA_RESOLUTION, areas_of};
 use tally_wire::{
     BundleIndex, BundleIndexContent, HaveSummary, Identity, ParityChunk, PieceManifest, PublicKey,
     Record, Region, Streams, StripeAssignment, StripeReceipt,
 };
 
+use crate::budget::{Charge, Gauge, Store};
 use crate::egress::{Class, EgressReport};
 use crate::hub::Hub;
 use crate::network::{Asker, AskerRole};
+use crate::selection::Taken;
 
 use self::groups::{ASK_LIFETIME_MS, GroupKey};
 use self::locks::lock;
-use self::member::{Arrival, HORIZON_SECONDS, Member, Message, Outgoing, record_hash};
+use self::member::{Arrival, HORIZON_SECONDS, Member, Message, Outgoing, Piece, record_hash};
 use self::withdrawal::Withdrawal;
 
 pub use self::seeds::{SEED_COPIES, seeded_bytes};
@@ -73,16 +86,12 @@ pub const SHARED_PRODUCTS: [Streams; 5] = [
 
 /// The most addressed sends held for the links before the oldest are dropped.
 pub const OUTBOX_MAX: usize = 65_536;
-/// Parities being reassembled from their chunks at once, at most, and bytes in all.
-pub const PARITIES_ASSEMBLING: usize = 256;
-pub const PARITY_BYTES_ASSEMBLING: usize = 64 << 20;
 /// How long a parity may take to arrive whole from its first chunk: its chunks are sent together,
 /// so one still missing a piece after this never will be.
 pub const PARITY_ASSEMBLY_MS: u64 = 10 * 1000;
 /// How long after a second ends a bundle index over it is signed: its manifests are in by then.
 pub const BUNDLE_INDEX_AFTER_SECONDS: u64 = 3;
 
-#[derive(Default)]
 pub struct Sharing {
     pub groups: groups::Groups,
     pub bundles: bundles::Bundles,
@@ -94,12 +103,46 @@ pub struct Sharing {
     indexed_through: Mutex<Option<u64>>,
     /// The regions this relay has withdrawn from forwarding in.
     withdrawal: Mutex<Withdrawal>,
+    /// The one batch byte store's gauge (`budget::Store::Batches`): what the member's groups hold
+    /// (records and parities) and the parities being reassembled are charged to it, and it is
+    /// their only bound. Unlimited until the relay charges sharing to its budget (`charge_to`).
+    gauge: Mutex<Arc<Gauge>>,
+    /// What the trees were last laid out from: the regions taken, the regions withdrawn, the key.
+    view: Mutex<View>,
+    /// Areas to lay out again at the next tick (a demotion the trees now leave out).
+    relayout: Mutex<BTreeSet<u64>>,
+    /// Group trees laid out since start: one per (area, product) whose offers, demotions or
+    /// withdrawal changed, never one per area taken.
+    laid_out: AtomicU64,
+}
+
+#[derive(Default)]
+struct View {
+    taken: Arc<Taken>,
+    withdrawn: Vec<Region>,
+    me: Option<PublicKey>,
+}
+
+/// What sharing has done and holds: the work a tick costs follows these, and none of them follows
+/// the number of areas taken.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Work {
+    /// Group trees laid out since start.
+    pub laid_out: u64,
+    /// Groups the member's tick visited since start.
+    pub visited: u64,
+    /// Groups held now (each more than this relay alone with nothing).
+    pub held_groups: usize,
+    /// Groups another relay is in (offered or asked), held as books now.
+    pub books: usize,
 }
 
 struct Assembling {
     /// The first chunk, without its bytes: what every later chunk must agree with.
     first: ParityChunk,
     bytes: Vec<u8>,
+    /// Its bytes and its own size, charged to the store's gauge while it is reassembled.
+    _charge: Charge,
     /// The byte ranges written, disjoint and merged (start to end), and how many bytes they cover.
     covered: BTreeMap<usize, usize>,
     filled: usize,
@@ -160,6 +203,24 @@ pub fn forwarders_shed(report: &EgressReport) -> u64 {
         .sum()
 }
 
+impl Default for Sharing {
+    fn default() -> Self {
+        Self {
+            groups: groups::Groups::default(),
+            bundles: bundles::Bundles::default(),
+            member: Mutex::default(),
+            outbox: Mutex::default(),
+            assembling: Mutex::default(),
+            indexed_through: Mutex::default(),
+            withdrawal: Mutex::default(),
+            gauge: Mutex::new(Gauge::unlimited(Store::Batches)),
+            view: Mutex::default(),
+            relayout: Mutex::default(),
+            laid_out: AtomicU64::new(0),
+        }
+    }
+}
+
 impl Sharing {
     pub fn new() -> Self {
         Self::default()
@@ -209,13 +270,17 @@ impl Sharing {
     }
 
     /// A record this relay originated for an area's product (a feeder's batch, its own
-    /// positions): held, and seeded into the group.
+    /// positions): held, and seeded into the group. Only in an area it takes: a group of any
+    /// other has no tree this relay is in.
     pub fn originate(&self, record: &Record, cell: Region, product: Streams, now_ms: u64) {
-        let Some((hash, bytes)) = encoded(record) else {
+        if !self.takes_area(cell) {
+            return;
+        }
+        let Some((hash, piece)) = encoded(record) else {
             return;
         };
         let out = self.with_member(|member| {
-            member.originate(GroupKey::new(cell, product), hash, bytes, now_ms)
+            member.originate(GroupKey::new(cell, product), hash, piece, now_ms)
         });
         self.queue(out.unwrap_or_default());
     }
@@ -229,15 +294,18 @@ impl Sharing {
         product: Streams,
         now_ms: u64,
     ) {
-        let Some((hash, bytes)) = encoded(record) else {
+        let Some((hash, piece)) = encoded(record) else {
             return;
         };
-        let message = Message::Piece {
-            group: GroupKey::new(cell, product),
-            hash,
-            bytes,
-        };
-        let out = self.with_member(|member| member.receive(*from, message, now_ms));
+        let group = GroupKey::new(cell, product);
+        let message = Message::Piece { group, hash, piece };
+        let joins = self.takes_area(cell);
+        let out = self.with_member(|member| {
+            if joins {
+                member.join(group);
+            }
+            member.receive(*from, message, now_ms)
+        });
         self.queue(out.unwrap_or_default());
     }
 
@@ -254,24 +322,32 @@ impl Sharing {
             let Ok(total) = usize::try_from(chunk.total) else {
                 return Vec::new();
             };
-            let held_bytes: usize = assembling.values().map(|held| held.bytes.len()).sum();
-            if !assembling.contains_key(&key)
-                && (assembling.len() >= PARITIES_ASSEMBLING
-                    || held_bytes.saturating_add(total) > PARITY_BYTES_ASSEMBLING
-                    || chunk.second.saturating_add(HORIZON_SECONDS) < now_ms / 1000)
-            {
-                return Vec::new();
-            }
-            let held = assembling.entry(key).or_insert_with(|| Assembling {
-                bytes: vec![0; total],
-                covered: BTreeMap::new(),
-                filled: 0,
-                started_ms: now_ms,
-                first: ParityChunk {
-                    bytes: Vec::new(),
-                    ..chunk.clone()
-                },
-            });
+            let held = match assembling.entry(key) {
+                std::collections::hash_map::Entry::Occupied(held) => held.into_mut(),
+                std::collections::hash_map::Entry::Vacant(vacant) => {
+                    if chunk.second.saturating_add(HORIZON_SECONDS) < now_ms / 1000 {
+                        return Vec::new();
+                    }
+                    // Charged before it is held: past the store's share it is refused whole.
+                    let gauge = Arc::clone(&lock(&self.gauge));
+                    let Some(charge) =
+                        gauge.try_charge(total.saturating_add(std::mem::size_of::<Assembling>()))
+                    else {
+                        return Vec::new();
+                    };
+                    vacant.insert(Assembling {
+                        bytes: vec![0; total],
+                        _charge: charge,
+                        covered: BTreeMap::new(),
+                        filled: 0,
+                        started_ms: now_ms,
+                        first: ParityChunk {
+                            bytes: Vec::new(),
+                            ..chunk.clone()
+                        },
+                    })
+                }
+            };
             let Ok(start) = usize::try_from(chunk.offset) else {
                 return Vec::new();
             };
@@ -283,23 +359,58 @@ impl Sharing {
             }
             assembling.remove(&key)
         };
-        let Some(whole) = whole else {
+        let Some(Assembling {
+            first,
+            bytes: xor,
+            _charge: assembled,
+            ..
+        }) = whole
+        else {
             return Vec::new();
         };
+        // Whole: its charge ends here, and the parity is charged again where it is held.
+        drop(assembled);
         let mut lens = [0u32; stripes::DATA_STRIPES as usize];
-        if whole.first.lens.len() != lens.len() {
+        if first.lens.len() != lens.len() {
             return Vec::new();
         }
-        lens.copy_from_slice(&whole.first.lens);
+        lens.copy_from_slice(&first.lens);
         let parity = parity::Parity {
-            manifest: whole.first.manifest,
-            cell: whole.first.cell,
-            product: whole.first.product,
-            second: whole.first.second,
+            manifest: first.manifest,
+            cell: first.cell,
+            product: first.product,
+            second: first.second,
             lens,
-            xor: whole.bytes,
+            xor,
         };
         self.drive(asker, Message::Parity(Arc::new(parity)), now_ms)
+    }
+
+    /// What this relay's groups hold (records and parities) and the parities being reassembled
+    /// are charged to `gauge` (the budget's `Store::Batches`) from now on: its limit, the store's
+    /// share of the budget, is the store's only bound. A record or parity past it is refused whole
+    /// and counted (`member::Stats::refused`, and the gauge's own count).
+    pub fn charge_to(&self, gauge: Arc<Gauge>) {
+        *lock(&self.gauge) = Arc::clone(&gauge);
+        if let Some(member) = lock(&self.member).as_mut() {
+            member.charge_to(gauge);
+        }
+    }
+
+    /// Bytes the groups hold now (records and parities, what the gauge is charged for them), and
+    /// what they refused for room since start.
+    pub fn held(&self) -> (usize, u64) {
+        // The store's own count, kept apart from its charge: what each group holds, and every
+        // parity being reassembled, so `/memory` sets it beside the gauge.
+        let assembling: usize = lock(&self.assembling)
+            .values()
+            .map(|held| held.bytes.len() + std::mem::size_of::<Assembling>())
+            .sum();
+        lock(&self.member)
+            .as_ref()
+            .map_or((assembling, 0), |member| {
+                (member.group_bytes() + assembling, member.stats().refused)
+            })
     }
 
     /// The addressed sends waiting for their links: (member, record).
@@ -312,12 +423,69 @@ impl Sharing {
         self.bundles.offerable()
     }
 
-    /// The group trees as this relay sees them (none before it serves).
+    /// The group trees as this relay sees them (none before it serves): a held group's, or, for
+    /// an area it takes that no other relay is in, this relay alone.
     pub fn layout(&self, cell: Region, product: Streams) -> Option<stripes::Layout> {
-        lock(&self.member)
-            .as_ref()?
-            .layout(GroupKey::new(cell, product))
-            .cloned()
+        let member = lock(&self.member);
+        let member = member.as_ref()?;
+        if let Some(layout) = member.layout(GroupKey::new(cell, product)) {
+            return Some(layout.clone());
+        }
+        let me = member.key();
+        let taken = Arc::clone(&lock(&self.view).taken);
+        if !taken.takes_area(cell) {
+            return None;
+        }
+        let withdrawal = lock(&self.withdrawal).clone();
+        let leaves = if self.own_leaf(cell, &taken, &withdrawal) {
+            vec![me]
+        } else {
+            Vec::new()
+        };
+        Some(stripes::Layout::new(cell, product, &[me], &leaves))
+    }
+
+    /// The stripes `key` is an interior candidate in, in the group's trees as this relay sees them;
+    /// `None` when there are none or it is not in them. For an area no other relay is in, without
+    /// laying the trees out: this relay alone forwards every stripe.
+    pub fn homes(&self, cell: Region, product: Streams, key: &PublicKey) -> Option<Vec<u8>> {
+        let member = lock(&self.member);
+        let member = member.as_ref()?;
+        if let Some(layout) = member.layout(GroupKey::new(cell, product)) {
+            return layout.contains(key).then(|| layout.homes(key));
+        }
+        (member.key() == *key && self.takes_area(cell)).then(|| (0..stripes::STRIPES).collect())
+    }
+
+    /// What sharing has done and holds.
+    pub fn work(&self) -> Work {
+        let (visited, held_groups) = lock(&self.member)
+            .as_ref()
+            .map_or((0, 0), |member| (member.visits(), member.groups().len()));
+        Work {
+            laid_out: self.laid_out.load(Ordering::Relaxed),
+            visited,
+            held_groups,
+            books: self.groups.keys().len(),
+        }
+    }
+
+    /// Whether `area` is one this relay takes, as of the last tick.
+    fn takes_area(&self, area: Region) -> bool {
+        lock(&self.view).taken.takes_area(area)
+    }
+
+    /// Whether this relay is a leaf in `area`'s trees: some cell it offers that holds the area (a
+    /// region it takes or a bundle) overlaps a region it withdrew from. Its offers for that cell
+    /// say 0 stripes, and it reads itself as every other relay reads those offers.
+    fn own_leaf(&self, area: Region, taken: &Taken, withdrawal: &Withdrawal) -> bool {
+        !withdrawal.withdrawn().is_empty()
+            && (0..=area.resolution())
+                .filter_map(|resolution| area.ancestor(resolution))
+                .any(|cell| {
+                    (taken.names(cell) || self.bundles.is_offerable(cell))
+                        && withdrawal.covers(cell)
+                })
     }
 
     /// Whether this relay forwards nothing in `cell` now: the cell overlaps a region it withdrew
@@ -337,6 +505,11 @@ impl Sharing {
     }
 
     /// [`Sharing::tick`], with the egress's count of forwarding peers shed given.
+    ///
+    /// Lays out again only the trees that may have changed: the areas under the cells whose offers
+    /// changed (where another relay offers, or a group is held or booked), the areas whose
+    /// demotions began or ended, and every held or booked group when the regions taken, the regions
+    /// withdrawn or the key change. Then the member's duties that are due.
     pub(crate) fn tick_shed(
         &self,
         hub: &Hub,
@@ -349,80 +522,142 @@ impl Sharing {
         };
         let me = identity.public();
         let network = hub.network();
-        let regions = network.selection.taken();
-        // Groups are per area (`group_of` routes every record to its area's), whatever the
-        // operator named: a region coarser than an area is every area under it.
-        let areas = network.selection.taken_areas();
+        let taken = network.selection.taken_index();
         let withdrawal = {
             let mut withdrawal = lock(&self.withdrawal);
-            withdrawal.observe(shed, &regions, &me, now_ms);
+            withdrawal.observe(shed, taken.regions(), &me, now_ms);
             withdrawal.clone()
         };
-        let mut offered_cells = regions.clone();
-        offered_cells.extend(self.bundles.offerable());
-        self.groups.expire(now_ms);
-        let mut keys = Vec::new();
-        for area in &areas {
-            let offers = network.directory.offers_for(*area, now_ms);
-            // This relay's offers covering the area say 0 stripes when any overlaps a withdrawn
-            // region; it reads itself as every other relay reads those offers.
-            let leaf = offered_cells
-                .iter()
-                .any(|cell| cell.contains(*area) && withdrawal.covers(*cell));
-            for product in SHARED_PRODUCTS {
-                let key = GroupKey::new(*area, product);
-                self.groups.own(key, me, now_ms + ASK_LIFETIME_MS, leaf);
-                // Every live, verified offer covering the area for the product, per signer: until
-                // the latest expires, and a leaf when any of them forwards nothing here.
-                let mut signers: BTreeMap<PublicKey, (u64, bool)> = BTreeMap::new();
-                for offer in &offers {
-                    let (Ok(content), Ok(signer)) = (offer.content(), offer.signer()) else {
-                        continue;
-                    };
-                    if signer == me
-                        || !content.products.contains(product)
-                        || crate::directory::expiry(&content) <= now_ms
-                        || offer.verify().is_err()
-                    {
-                        continue;
-                    }
-                    let held = signers.entry(signer).or_insert((0, false));
-                    held.0 = held.0.max(crate::directory::expiry(&content));
-                    held.1 |= content.stripes == 0;
-                }
-                for (signer, (until, leaf)) in signers {
-                    self.groups.offered(key, signer, until, leaf);
-                }
-                keys.push(key);
-            }
+        let (taken_moved, withdrawn_moved) = {
+            let mut view = lock(&self.view);
+            let taken_moved = view.taken.version() != taken.version() || view.me != Some(me);
+            let withdrawn_moved = view.withdrawn != withdrawal.withdrawn();
+            view.taken = Arc::clone(&taken);
+            view.withdrawn = withdrawal.withdrawn().to_vec();
+            view.me = Some(me);
+            (taken_moved, withdrawn_moved)
+        };
+        if taken_moved {
+            self.bundles.set_taken(Arc::clone(&taken));
         }
-        self.bundles.set_gathered(&areas);
         lock(&self.assembling).retain(|_, held| held.started_ms + PARITY_ASSEMBLY_MS > now_ms);
         let mut guard = lock(&self.member);
-        let member = guard.get_or_insert_with(|| Member::new(identity.clone()));
+        let gauge = Arc::clone(&lock(&self.gauge));
+        let fresh = |identity: &Identity| Member::new(identity.clone(), Arc::clone(&gauge));
+        let member = guard.get_or_insert_with(|| fresh(identity));
         if member.key() != me {
-            *member = Member::new(identity.clone());
+            *member = fresh(identity);
         }
-        let mut out = Vec::new();
-        for key in member.groups() {
-            if !keys.contains(&key) {
-                member.leave(key);
+        // The members that turned this relay's links away as full, while they are: routed around
+        // (`Member::route`) until their wait ends.
+        member.set_full(network.peers.full(now_ms));
+        // The areas whose trees may have changed.
+        let directory = &network.directory;
+        let changed = directory.take_changed_cells(now_ms);
+        let mut areas: BTreeSet<u64> = std::mem::take(&mut *lock(&self.relayout));
+        for key in self.groups.expire(now_ms) {
+            areas.insert(key.cell.as_u64());
+        }
+        let known = |areas: &mut BTreeSet<u64>, member: &Member, under: Option<Region>| {
+            let held = member.groups().into_iter().chain(self.groups.keys());
+            areas.extend(
+                held.map(|key| key.cell)
+                    .filter(|cell| under.is_none_or(|under| under.contains(*cell)))
+                    .map(Region::as_u64),
+            );
+        };
+        if taken_moved || withdrawn_moved {
+            known(&mut areas, member, None);
+        }
+        let cells = if taken_moved {
+            directory.cells_held_by_others(&me)
+        } else {
+            changed
+        };
+        for cell in cells {
+            if cell.resolution() > AREA_RESOLUTION || !taken.touches(cell) {
+                continue;
+            }
+            if directory.others_hold(cell, &me) {
+                let under = if cell.resolution() == AREA_RESOLUTION {
+                    vec![cell]
+                } else {
+                    areas_of(cell).unwrap_or_default()
+                };
+                areas.extend(
+                    under
+                        .into_iter()
+                        .filter(|area| taken.takes_area(*area))
+                        .map(Region::as_u64),
+                );
+            } else {
+                // Only this relay offers here now: what changed is another's leaving, and only
+                // the groups held or booked under the cell had it.
+                known(&mut areas, member, Some(cell));
             }
         }
-        for key in &keys {
-            let (members, leaves) = self.groups.tree(*key, now_ms);
-            out.extend(member.set_members(*key, &members, &leaves, now_ms));
+        let mut out = Vec::new();
+        let mut laid_out = 0;
+        for area in areas
+            .into_iter()
+            .filter_map(|area| Region::from_u64(area).ok())
+        {
+            if !taken.takes_area(area) {
+                for product in SHARED_PRODUCTS {
+                    let key = GroupKey::new(area, product);
+                    self.groups.set_offers(key, &BTreeMap::new());
+                    member.leave(key);
+                }
+                continue;
+            }
+            // Every live offer covering the area, but this relay's own: checked by the
+            // directory when it came (`directory::Checked`), never again here.
+            let offers: Vec<crate::directory::Checked> = directory
+                .offers_for(area, now_ms)
+                .into_iter()
+                .filter(|offer| offer.signer() != me)
+                .collect();
+            let leaf = self.own_leaf(area, &taken, &withdrawal);
+            for product in SHARED_PRODUCTS {
+                let key = GroupKey::new(area, product);
+                // Per signer, a leaf when any of its offers here forwards nothing.
+                let mut signers: BTreeMap<PublicKey, bool> = BTreeMap::new();
+                for offer in &offers {
+                    let content = offer.content();
+                    if content.products.contains(product) {
+                        *signers.entry(offer.signer()).or_insert(false) |= content.stripes == 0;
+                    }
+                }
+                self.groups.set_offers(key, &signers);
+                let (members, mut leaves) = self.groups.tree(key);
+                if members.is_empty() && !member.holds_group(key) {
+                    // This relay alone, with nothing: not held (`Sharing::layout`).
+                    continue;
+                }
+                if leaf {
+                    leaves.push(me);
+                    leaves.sort();
+                }
+                laid_out += 1;
+                out.extend(member.set_members(key, &members, &leaves, now_ms));
+            }
         }
+        self.laid_out.fetch_add(laid_out, Ordering::Relaxed);
         out.extend(member.tick(now_ms));
-        for (group, demoted, until) in member.take_demotions() {
-            self.groups.demote(group, demoted, until);
+        let demotions = member.take_demotions();
+        if !demotions.is_empty() {
+            let mut relayout = lock(&self.relayout);
+            for (group, demoted, until) in demotions {
+                self.groups.demote(group, demoted, until);
+                relayout.insert(group.cell.as_u64());
+            }
         }
         let indexes = self.bundle_indexes(member, identity, now_ms);
         let rebuilt: Vec<Record> = member
             .take_delivered()
             .into_iter()
             .filter(|delivered| delivered.arrival == Arrival::Rebuilt)
-            .filter_map(|delivered| decoded(&delivered.bytes))
+            .filter_map(|delivered| delivered.piece.record())
             .collect();
         drop(guard);
         self.queue(out);
@@ -431,9 +666,13 @@ impl Sharing {
         published
     }
 
-    /// The bundle indexes due (§2.6): for each parent this relay offers as a bundle and each
-    /// shared product, once a second, `BUNDLE_INDEX_AFTER_SECONDS` after it ends, every child with
-    /// the digest of the origin manifests held under it.
+    /// The bundle indexes due (§2.6): once a second, `BUNDLE_INDEX_AFTER_SECONDS` after it ends,
+    /// for each parent this relay may offer as a bundle and each shared product under which it
+    /// holds an origin manifest of that second, every child with the digest of the manifests held
+    /// under it. A parent with nothing under it that second has no index: there is nothing to
+    /// omit, and a reader who saw a manifest under a parent for a second with no index from its
+    /// bundler holds the omission itself. So the indexes cost what was originated, never the
+    /// number of parents offered.
     fn bundle_indexes(
         &self,
         member: &Member,
@@ -449,17 +688,40 @@ impl Sharing {
         }
         *through = Some(second);
         drop(through);
-        let parents = self.bundles.offerable();
+        // By parent, then product (in `SHARED_PRODUCTS` order), the manifests under it.
+        let mut under: BTreeMap<u64, BTreeMap<usize, Vec<PieceManifest>>> = BTreeMap::new();
+        for (group, manifests) in member.manifests_of(second) {
+            let Some(product) = SHARED_PRODUCTS
+                .iter()
+                .position(|product| *product == group.product)
+            else {
+                continue;
+            };
+            for resolution in 0..AREA_RESOLUTION {
+                if let Some(parent) = group.cell.ancestor(resolution)
+                    && self.bundles.is_offerable(parent)
+                {
+                    under
+                        .entry(parent.as_u64())
+                        .or_default()
+                        .entry(product)
+                        .or_default()
+                        .extend(manifests.iter().cloned());
+                }
+            }
+        }
         let mut out = Vec::new();
-        for parent in parents {
-            for product in SHARED_PRODUCTS {
-                let manifests: Vec<PieceManifest> = member
-                    .groups()
-                    .into_iter()
-                    .filter(|group| group.product == product && parent.contains(group.cell))
-                    .flat_map(|group| member.manifests(group, second))
-                    .collect();
-                let index = bundles::BundleIndex::build(parent, product, second, &manifests);
+        for (parent, products) in under {
+            let Ok(parent) = Region::from_u64(parent) else {
+                continue;
+            };
+            for (product, manifests) in products {
+                let index = bundles::BundleIndex::build(
+                    parent,
+                    SHARED_PRODUCTS[product],
+                    second,
+                    &manifests,
+                );
                 let content = BundleIndexContent {
                     parent: index.parent,
                     product: index.product,
@@ -477,8 +739,15 @@ impl Sharing {
     /// Hands a message to the member; what goes back to the asker is the reply, the rest waits in
     /// the outbox.
     fn drive(&self, asker: &Asker, message: Message, now_ms: u64) -> DataReplies {
+        // A message about a group of an area this relay takes is the group's, held or not.
+        let joins = message.group().filter(|group| self.takes_area(group.cell));
         let out = self
-            .with_member(|member| member.receive(asker.key, message, now_ms))
+            .with_member(|member| {
+                if let Some(group) = joins {
+                    member.join(group);
+                }
+                member.receive(asker.key, message, now_ms)
+            })
             .unwrap_or_default();
         let (reply, rest): (Vec<Outgoing>, Vec<Outgoing>) = out
             .into_iter()
@@ -564,22 +833,15 @@ pub fn group_of(record: &Record, point: Option<Region>) -> Option<(Region, Strea
     }
 }
 
-/// A record as a group carries it: its hash and its encoding.
-fn encoded(record: &Record) -> Option<(tally_wire::batch::Hash, Arc<Vec<u8>>)> {
-    let hash = record_hash(record)?;
-    let mut bytes = Vec::new();
-    record.encode(&mut bytes).ok()?;
-    Some((hash, Arc::new(bytes)))
-}
-
-fn decoded(bytes: &[u8]) -> Option<Record> {
-    Record::decode(bytes).ok()?.0
+/// A record as a group carries it: its hash and its piece (a batch's own bytes, shared).
+fn encoded(record: &Record) -> Option<(tally_wire::batch::Hash, Piece)> {
+    Some((record_hash(record)?, Piece::of(record)?))
 }
 
 /// The wire records of a message: one, or a parity's chunks.
 fn to_records(message: Message) -> Vec<Record> {
     match message {
-        Message::Piece { bytes, .. } => decoded(&bytes).into_iter().collect(),
+        Message::Piece { piece, .. } => piece.record().into_iter().collect(),
         Message::Manifest(manifest) => vec![Record::PieceManifest(manifest)],
         Message::Receipt(receipt) => vec![Record::StripeReceipt(receipt)],
         Message::Have(have) => vec![Record::HaveSummary(have)],

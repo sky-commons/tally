@@ -173,10 +173,83 @@ impl Ceiling {
     }
 }
 
+/// One rate several sessions share, held by making each wait (RFC-0181 §9): the members' rate
+/// (`--max-member-bytes-per-sec`), which the relay plans once for all of them together
+/// (`budget::Plan::with_members`). A session takes what it read ([`Pace::take`]); past the rate and
+/// its burst, it waits until the debt is repaid, its socket unread, so TCP holds its sender back
+/// and the members together never bring in more than was planned. Read off tokio's clock, so a
+/// test that pauses time paces with it.
+pub struct Pace {
+    rate: u64,
+    burst: u64,
+    /// Bytes still allowed (negative: owed), as of when.
+    state: std::sync::Mutex<(f64, tokio::time::Instant)>,
+}
+
+impl Pace {
+    /// `rate` bytes a second, with the burst a connection at that rate is allowed ([`burst`]).
+    pub fn new(rate: u64) -> Self {
+        let burst = burst(rate);
+        Self {
+            rate,
+            burst,
+            state: std::sync::Mutex::new((burst as f64, tokio::time::Instant::now())),
+        }
+    }
+
+    pub fn rate(&self) -> u64 {
+        self.rate
+    }
+
+    /// Spends `bytes`, waiting while the sessions sharing the pace owe more than it has refilled.
+    pub async fn take(&self, bytes: u64) {
+        let wait = {
+            let Ok(mut state) = self.state.lock() else {
+                return;
+            };
+            let now = tokio::time::Instant::now();
+            let elapsed = now.saturating_duration_since(state.1).as_secs_f64();
+            let allowed =
+                (state.0 + elapsed * self.rate as f64).min(self.burst as f64) - bytes as f64;
+            *state = (allowed, now);
+            if allowed >= 0.0 || self.rate == 0 {
+                None
+            } else {
+                Some(std::time::Duration::from_secs_f64(
+                    -allowed / self.rate as f64,
+                ))
+            }
+        };
+        if let Some(wait) = wait {
+            tokio::time::sleep(wait).await;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    /// Sessions sharing a pace together bring in its rate: past the burst, each waits its turn.
+    #[tokio::test(start_paused = true)]
+    async fn sessions_sharing_a_pace_together_keep_to_its_rate() {
+        let pace = Arc::new(Pace::new(MIN_BURST));
+        let start = tokio::time::Instant::now();
+        // The burst at once, then four more seconds' worth from four sessions.
+        pace.take(MIN_BURST).await;
+        assert_eq!(start.elapsed(), Duration::ZERO);
+        let sessions: Vec<_> = (0..4)
+            .map(|_| {
+                let pace = Arc::clone(&pace);
+                tokio::spawn(async move { pace.take(MIN_BURST).await })
+            })
+            .collect();
+        for session in sessions {
+            assert!(session.await.is_ok());
+        }
+        assert_eq!(start.elapsed().as_secs(), 4);
+    }
 
     #[test]
     fn a_burst_is_allowed_and_a_sustained_excess_is_not() {

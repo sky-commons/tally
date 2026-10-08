@@ -11,15 +11,66 @@ use tally_wire::batch::{Hash, format};
 use tally_wire::positions::{AddressedCitation, EnuCovariance, Solution, TransmitTime};
 use tally_wire::rendezvous::area_of;
 use tally_wire::{
-    Batch, BatchContent, Clock, ClockModel, ClockModelContent, Identity, Location, Observation,
-    ObservationSet, Positions, PublicKey, ReceiverInfo, Reception, Record, Region, RegionalBatch,
-    RegionalBatchContent, SolutionsContent, Streams, WireError, WorldPositions,
+    Batch, BatchContent, Clock, ClockModel, ClockModelContent, Decoded, Identity, Location,
+    Observation, ObservationSet, Positions, PublicKey, ReceiverInfo, Reception, Record, Region,
+    RegionalBatch, RegionalBatchContent, SolutionsContent, Streams, WireError, WorldPositions,
 };
 
 use super::{FORWARD_HELD, Products, WAITING_MS, WORLD_SETTLE_MS, check_fix, regional_fixes};
+use crate::exchange::MessageExchange;
+use crate::fanout::Filter;
 use crate::hub::{Hub, Item};
+use crate::ingest::Stamp;
 use crate::network::{Asker, AskerRole};
 use crate::subscription::Subscription;
+
+/// The watermark passes `now`, with `relay` (when given) the products' key: what they signed.
+fn tick(products: &Products, relay: Option<&Identity>, now: u64) -> Vec<Record> {
+    if let Some(relay) = relay {
+        products.adopt_identity(relay);
+    }
+    products.advance(now);
+    products.tick(None)
+}
+
+/// Products fed as a relay feeds them: each batch's receptions through the message exchange's one
+/// deduplication (inline: one shard thread, one producer), each epoch sealed as the watermark
+/// passes it.
+struct Staged {
+    products: Arc<Products>,
+    exchange: MessageExchange,
+}
+
+impl Staged {
+    fn new(relay: &Identity) -> Self {
+        let products = Arc::new(Products::new());
+        products.adopt_identity(relay);
+        let exchange =
+            MessageExchange::inline(products.sink(), crate::exchange::Gauges::unlimited());
+        Self { products, exchange }
+    }
+
+    /// A receiver's batch, decoded and stamped: into its area's regional product, if any.
+    fn feed(&self, batch: &Arc<Decoded>) {
+        let area = self.products.area_for(&batch.receiver());
+        self.exchange
+            .route(0, batch, area, crate::ingest::InFlight::free());
+        self.exchange.tick(0, stamp(batch.stamp_ms()));
+    }
+
+    /// The watermark passes `now`: what the epochs before it sealed.
+    fn tick(&self, now: u64) -> Vec<Record> {
+        self.exchange.tick(0, stamp(now));
+        self.products.tick(None)
+    }
+}
+
+fn stamp(stamp_ms: u64) -> Stamp {
+    Stamp {
+        stamp_ms,
+        ingest_seq: 0,
+    }
+}
 
 /// 2026-10-04T00:00:00Z.
 const BASE_MS: u64 = 1_791_244_800_000;
@@ -322,11 +373,12 @@ fn gather(inputs: &Inputs, second: u64, reversed: bool) -> Result<(Identity, Vec
         }
     }
     if reversed {
-        // The model last: every solution waited for it.
-        products.clock_model(&inputs.mlat.model, now);
+        // The model last (stamped after them, records are taken in by stamp): every solution
+        // waited for it.
+        products.clock_model(&inputs.mlat.model, now + 1);
     }
     let mut out = Vec::new();
-    for record in products.tick(Some(&relay), sealed_at(second + 1)) {
+    for record in tick(&products, Some(&relay), sealed_at(second + 1)) {
         if let Record::WorldPositions(world) = record {
             out.push(world);
         }
@@ -469,9 +521,9 @@ fn no_aircraft_has_two_fixes_in_one_second_and_a_late_fix_is_dropped() -> Result
     let mut sequence = 0;
     // Ten seconds, each with four regional batches and three provisional records per aircraft,
     // ticked every 250 ms as the relay is.
-    for tick in 0..60 {
-        let now = BASE_MS + tick * 250;
-        if tick < 40 {
+    for step in 0..60 {
+        let now = BASE_MS + step * 250;
+        if step < 40 {
             let at = now / 1_000;
             products.regional_from(
                 &relay_asker(peer),
@@ -496,7 +548,7 @@ fn no_aircraft_has_two_fixes_in_one_second_and_a_late_fix_is_dropped() -> Result
                 products.positions(&record, now);
             }
         }
-        for record in products.tick(Some(&relay), now) {
+        for record in tick(&products, Some(&relay), now) {
             if let Record::WorldPositions(world) = record {
                 published.push(world.content().map_err(err)?);
             }
@@ -518,8 +570,9 @@ fn no_aircraft_has_two_fixes_in_one_second_and_a_late_fix_is_dropped() -> Result
     // A fix for a second already sealed is late, and changes nothing published.
     let late = mlat.solutions(&[0x00c0_0003], first * 1_000 + 500, 0, false, 9_999)?;
     products.positions(&late, BASE_MS + 15_000);
+    // Taken in once the watermark passes its stamp.
+    let after = tick(&products, Some(&relay), BASE_MS + 15_250);
     assert_eq!(products.report().world_late, 1);
-    let after = products.tick(Some(&relay), BASE_MS + 15_250);
     assert!(
         !after
             .iter()
@@ -547,12 +600,14 @@ fn described(
     .map_err(err)
 }
 
+/// A feeder's batch, taken in at `stamp_ms`, the `ingest_seq`th.
 fn feeder_batch(
     identity: &Identity,
     sequence: u64,
     observations: Vec<Observation>,
-) -> Result<Batch> {
-    Batch::sign(
+    (stamp_ms, ingest_seq): (u64, u64),
+) -> Result<Arc<Decoded>> {
+    let batch = Batch::sign(
         identity,
         &BatchContent {
             boot_id: 1,
@@ -564,15 +619,16 @@ fn feeder_batch(
             observations,
         },
     )
-    .map_err(err)
+    .map_err(err)?;
+    Decoded::from_verified(batch, stamp_ms, ingest_seq)
+        .map_err(|undecodable| err(undecodable.error))
 }
 
 #[test]
 fn the_regional_product_holds_one_copy_of_each_message_per_area_signed_as_origin() -> Result<()> {
     let relay = Identity::generate().map_err(err)?;
-    let products = Products::new();
-    // The relay learns its key on its first tick.
-    products.tick(Some(&relay), BASE_MS);
+    let staged = Staged::new(&relay);
+    let products = &staged.products;
     let atlanta = place(33.7, -84.4);
     let chicago = place(41.9, -87.6);
     let shared: Vec<Observation> = adsb_second(&[0x00a0_0001, 0x00a0_0002, 0x00a0_0003], 0, false);
@@ -600,13 +656,10 @@ fn the_regional_product_holds_one_copy_of_each_message_per_area_signed_as_origin
             })
             .collect();
         observations.push(long(all_call(0x00f0_0000 + n as u32), 1));
-        products.batch(
-            &feeder_batch(feeder, 0, observations)?,
-            &feeder.public(),
-            BASE_MS + 100,
-        );
+        let batch = feeder_batch(feeder, 0, observations, (BASE_MS + 100, n as u64))?;
+        staged.feed(&batch);
     }
-    let out = products.tick(Some(&relay), BASE_MS + 1_000);
+    let out = staged.tick(BASE_MS + 1_000);
     let batches: Vec<RegionalBatchContent> = out
         .iter()
         .filter_map(|record| match record {
@@ -643,16 +696,27 @@ fn the_regional_product_holds_one_copy_of_each_message_per_area_signed_as_origin
         let feeder_seven = all_call(0x00f0_0007);
         assert!(!messages.contains(&feeder_seven.as_slice()));
     }
-    // Heard again within the window: nothing new to sign. After it: once more.
-    let again = feeder_batch(&feeders[0], 1, shared.clone())?;
-    products.batch(&again, &feeders[0].public(), BASE_MS + 1_500);
-    assert!(products.tick(Some(&relay), BASE_MS + 2_000).is_empty());
-    let later = feeder_batch(&feeders[0], 2, shared.clone())?;
-    products.batch(&later, &feeders[0].public(), BASE_MS + 4_000);
-    let out = products.tick(Some(&relay), BASE_MS + 4_100);
-    assert_eq!(out.len(), 1);
-    // The stream's sequence runs on from the first two.
+    // Heard again within the window (the next epoch): nothing new to sign. After it: once more.
+    let again = feeder_batch(&feeders[0], 1, shared.clone(), (BASE_MS + 1_500, 10))?;
+    staged.feed(&again);
+    assert!(staged.tick(BASE_MS + 2_000).is_empty());
+    let later = feeder_batch(&feeders[0], 2, shared.clone(), (BASE_MS + 4_000, 11))?;
+    staged.feed(&later);
+    let out = staged.tick(BASE_MS + 5_000);
+    // The epoch's deduplicated stream first, then its one area's regional batch.
+    assert_eq!(out.len(), 2);
     match &out[0] {
+        Record::RelayBatch(batch) => {
+            batch.verify_as_relay().map_err(err)?;
+            assert_eq!(
+                batch.content().map_err(err)?.observations.len(),
+                shared.len()
+            );
+        }
+        _ => return Err("not the deduplicated stream".to_owned()),
+    }
+    // The regional stream's sequence runs on from the first two.
+    match &out[1] {
         Record::RegionalBatch(batch) => assert_eq!(batch.content().map_err(err)?.sequence, 2),
         _ => return Err("not a regional batch".to_owned()),
     }
@@ -695,6 +759,8 @@ fn a_peer_regional_batch_is_forwarded_once_unchanged_within_the_areas_taken() ->
     ] {
         assert!(products.regional_from(&asker, batch, now).is_empty());
     }
+    // The sealer takes them in once the watermark passes their stamp.
+    products.advance(now + 1);
     let out = products.take_forward();
     let came_on = relay_asker(peer).source;
     assert_eq!(out, vec![(came_on, taken.clone())]);
@@ -702,6 +768,7 @@ fn a_peer_regional_batch_is_forwarded_once_unchanged_within_the_areas_taken() ->
     assert_eq!(products.report().regional_stale, 1);
     // Heard back from another peer: already forwarded.
     products.regional_from(&relay_asker(peer), taken, now + 50);
+    products.advance(now + 51);
     assert!(products.take_forward().is_empty());
     Ok(())
 }
@@ -714,9 +781,9 @@ fn the_products_are_routed_by_their_stream_bits_and_the_regional_by_its_cell() -
     let batch = regional(&relay, atlanta, 0, BASE_MS, adsb_second(&[1], 0, false))?;
     // The hub routes the relay's own regional batch by the cell it signed.
     let hub = Hub::new(4);
-    let mut listener = hub.listen();
+    let listener = hub.listen(u64::MAX, Filter::Everything);
     hub.publish_own(Record::RegionalBatch(batch.clone()));
-    let item = listener.try_recv().map_err(err)?;
+    let item = listener.try_recv().ok_or("nothing routed")?;
     assert_eq!(item.cell, Some(atlanta));
     let world = super::world_parts(
         &relay,
@@ -730,6 +797,8 @@ fn the_products_are_routed_by_their_stream_bits_and_the_regional_by_its_cell() -
         record: Arc::new(Record::WorldPositions(world)),
         cell: None,
         points: None,
+        decoded: None,
+        stamp_ms: 0,
     };
     let wants = |streams: Streams, regions: Vec<Region>, item: &Item| {
         Subscription { streams, regions }.wants(item)
@@ -812,8 +881,8 @@ fn what_a_busy_area_and_the_world_cost_a_second() -> Result<()> {
     const FEEDERS: usize = 30;
     const SECONDS: u64 = 5;
     let relay = Identity::generate().map_err(err)?;
-    let products = Products::new();
-    products.tick(Some(&relay), BASE_MS - 1_000);
+    let staged = Staged::new(&relay);
+    let products = &staged.products;
     let location = place(33.7, -84.4);
     let feeders: Vec<Identity> = (0..FEEDERS)
         .map(|_| Identity::generate())
@@ -849,11 +918,11 @@ fn what_a_busy_area_and_the_world_cost_a_second() -> Result<()> {
         }
         let unique = heard.len();
         for (n, feeder) in feeders.iter().enumerate() {
-            let batch = feeder_batch(feeder, second, heard.clone())?;
-            products.batch(&batch, &feeder.public(), at * 1_000 + n as u64);
+            let batch = feeder_batch(feeder, second, heard.clone(), (at * 1_000 + n as u64, 0))?;
+            staged.feed(&batch);
         }
-        let sealed: Vec<Record> = products
-            .tick(Some(&relay), at * 1_000 + 999)
+        let sealed: Vec<Record> = staged
+            .tick((at + 1) * 1_000)
             .into_iter()
             .filter(|record| matches!(record, Record::RegionalBatch(_)))
             .collect();
@@ -885,7 +954,7 @@ fn what_a_busy_area_and_the_world_cost_a_second() -> Result<()> {
     let mlat = Mlat::new()?;
     gatherer.clock_model(&mlat.model, BASE_MS);
     // Running already: what was due before is sealed, so a final fix 30 s late is late.
-    gatherer.tick(Some(&relay), BASE_MS - 500);
+    tick(&gatherer, Some(&relay), BASE_MS - 500);
     let cell = area_of(&location).map_err(err)?;
     let adsb: Vec<u32> = (0x0040_0000..0x0040_0000 + WORLD_ADSB).collect();
     let targets: Vec<u32> = (0x0080_0000..0x0080_0000 + WORLD_TARGETS).collect();
@@ -919,8 +988,7 @@ fn what_a_busy_area_and_the_world_cost_a_second() -> Result<()> {
             }
         }
         world.extend(
-            gatherer
-                .tick(Some(&relay), now)
+            tick(&gatherer, Some(&relay), now)
                 .into_iter()
                 .filter(|record| matches!(record, Record::WorldPositions(_))),
         );
@@ -980,18 +1048,18 @@ fn the_precise_world_waits_for_finals_and_takes_no_provisional() -> Result<()> {
         products.positions(positions, now);
     }
     let live_at = sealed_at(second + 1);
-    let early = products.tick(Some(&relay), live_at);
+    let early = tick(&products, Some(&relay), live_at);
     assert!(early.iter().any(|r| matches!(r, Record::WorldPositions(_))));
     assert!(!early.iter().any(|r| matches!(r, Record::WorldPrecise(_))));
     // Not before its seal: (second + 2) * 1000 + WORLD_PRECISE_SETTLE_MS for both seconds.
     let before = (second + 1) * 1_000 + super::WORLD_PRECISE_SETTLE_MS - 1;
     assert!(
-        !products
-            .tick(Some(&relay), before)
+        !tick(&products, Some(&relay), before)
             .iter()
             .any(|r| matches!(r, Record::WorldPrecise(_)))
     );
-    let sealed = products.tick(
+    let sealed = tick(
+        &products,
         Some(&relay),
         (second + 2) * 1_000 + super::WORLD_PRECISE_SETTLE_MS,
     );
@@ -1032,8 +1100,8 @@ fn the_precise_world_waits_for_finals_and_takes_no_provisional() -> Result<()> {
 
 /// Nothing the products let go is let go silently (every drop counted by why, and served on
 /// `--stats-listen`): a world fix outside the window the relay holds, positions whose model never
-/// came, receptions sealed before the relay has a key to sign with, and peers' regional batches
-/// beyond what waits to be forwarded.
+/// came, an epoch a message thread's part of was lost (refused whole, every product of it), and
+/// peers' regional batches beyond what waits to be forwarded.
 #[test]
 fn every_drop_is_counted_by_why() -> Result<()> {
     let products = Products::new();
@@ -1043,39 +1111,123 @@ fn every_drop_is_counted_by_why() -> Result<()> {
     products.clock_model(&mlat.model, BASE_MS);
     let ahead = mlat.solutions(&[0x00c0_0001], BASE_MS + 60_000, 0, true, 1)?;
     products.positions(&ahead, BASE_MS);
+    products.advance(BASE_MS + 1);
     assert_eq!(products.report().world_out_of_window, 1);
     // Positions under a model never shown: they wait, then expire, counted.
     let other = Mlat::new()?;
     let waiting = other.solutions(&[0x00c0_0002], BASE_MS, 0, false, 2)?;
     products.positions(&waiting, BASE_MS);
-    products.tick(None, BASE_MS + WAITING_MS + 1);
+    // Handed in after the watermark passed `BASE_MS + 1`, it is stamped there, never earlier, so
+    // it waits from then: still waiting a full `WAITING_MS` later, expired just after.
+    let stamped = BASE_MS + 1;
+    tick(&products, None, stamped + WAITING_MS);
+    assert_eq!(products.report().positions_waiting_expired, 0);
+    tick(&products, None, stamped + WAITING_MS + 1);
     assert_eq!(products.report().positions_waiting_expired, 1);
-    // A feeder's receptions sealed with no key yet: dropped, counted.
-    let feeder = Identity::generate().map_err(err)?;
-    let relay = Identity::generate().map_err(err)?;
-    products.tick(Some(&relay), BASE_MS);
-    products.described(&described(
-        &feeder,
-        place(33.7, -84.4),
-        vec![relay.public()],
-    )?);
-    products.batch(
-        &feeder_batch(&feeder, 0, adsb_second(&[0x00a0_0001], 0, false))?,
-        &feeder.public(),
-        BASE_MS + 100,
-    );
-    products.tick(None, BASE_MS + 1_000);
-    assert_eq!(products.report().regional_unsigned, 2);
+    // An epoch gathered from two message threads, one of whose parts was lost: refused whole.
+    let refusing = Arc::new(Products::with_boot(1, 2));
+    let part = |epoch, thread, seq| crate::exchange::Frozen {
+        thread,
+        seq,
+        epoch: Some(epoch),
+        closed_before: epoch + 1,
+        ..crate::exchange::Frozen::default()
+    };
+    let sink = refusing.sink();
+    // Thread 1's part of epoch 6 (its second message) never came.
+    for (epoch, thread, seq) in [(5, 0, 0), (5, 1, 0), (6, 0, 1), (7, 0, 2), (7, 1, 2)] {
+        assert!(sink(part(epoch, thread, seq)).is_ok());
+    }
+    assert_eq!(refusing.report().epochs_refused, 1);
     // Peers' regional batches past what waits to be forwarded.
     let origin = Identity::generate().map_err(err)?;
     let peer = Identity::generate().map_err(err)?.public();
     let atlanta = area_of(&place(33.7, -84.4)).map_err(err)?;
     products.set_taken(vec![atlanta]);
+    // Past the watermark already taken (a record is never stamped before it).
+    let now = stamped + WAITING_MS + 2;
     for sequence in 0..=FORWARD_HELD as u64 {
-        let batch = regional(&origin, atlanta, sequence, BASE_MS, Vec::new())?;
-        products.regional_from(&relay_asker(peer), batch, BASE_MS + 100);
+        let batch = regional(&origin, atlanta, sequence, now - 100, Vec::new())?;
+        products.regional_from(&relay_asker(peer), batch, now);
     }
+    products.advance(now + 1);
     assert_eq!(products.report().regional_forward_full, 1);
     assert_eq!(products.take_forward().len(), FORWARD_HELD);
+    Ok(())
+}
+
+/// RFC-0181 §10 and invariant 1 for the records that are not epochs: they wait in a queue of their
+/// own, held by the products' gauge alone, so a peer flooding them is refused (counted) once the
+/// gauge is full and never costs this relay an epoch; and a
+/// world candidate is in time or late by its stamp against the watermark that seals its second,
+/// never by when it was handled: two candidates handed in together, before that watermark is
+/// reached, one stamped before it and one at it, are the first in time and the second late.
+#[test]
+fn records_wait_apart_from_the_epochs_and_are_taken_in_by_stamp() -> Result<()> {
+    // The flood: more records than the products' gauge holds, stamped far ahead so none is taken
+    // in.
+    let products = Arc::new(Products::with_boot(1, 1));
+    products.on_thread(1, None)?;
+    let mlat = Mlat::new()?;
+    let flood = mlat.solutions(&[0x00c0_0001], BASE_MS, 0, true, 1)?;
+    const HELD: usize = 1_000;
+    let gauge = crate::budget::Gauge::new(
+        crate::budget::Store::Products,
+        HELD * flood.as_bytes().len(),
+    );
+    products.charge_to(Arc::clone(&gauge));
+    for _ in 0..HELD + 10 {
+        products.positions(&flood, BASE_MS + 1_000_000);
+    }
+    assert_eq!(gauge.held(), HELD * flood.as_bytes().len());
+    let sink = products.sink();
+    for closed_before in 1..=100 {
+        let marker = crate::exchange::Frozen {
+            closed_before,
+            ..crate::exchange::Frozen::default()
+        };
+        assert!(
+            sink(marker).is_ok(),
+            "an epoch's word refused behind a flood of records"
+        );
+    }
+    let started = std::time::Instant::now();
+    while products.watermark_ms() < 100 * crate::seal::EPOCH_MS {
+        if started.elapsed() > std::time::Duration::from_secs(60) {
+            return Err("the sealer never took the epochs".to_owned());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    let report = products.report();
+    assert_eq!((report.records_refused, report.epochs_refused), (10, 0));
+
+    // By stamp: second `s` seals once the watermark reaches `(s + 1) s + WORLD_SETTLE_MS`.
+    let relay = Identity::generate().map_err(err)?;
+    let products = Products::new();
+    products.set_world(true);
+    let mlat = Mlat::new()?;
+    let second = BASE_MS / 1_000;
+    let seals = sealed_at(second);
+    products.clock_model(&mlat.model, BASE_MS);
+    let in_time = mlat.solutions(&[0x00c0_0001], BASE_MS + 100, 0, true, 1)?;
+    let late = mlat.solutions(&[0x00c0_0002], BASE_MS + 200, 0, true, 2)?;
+    products.positions(&late, seals);
+    products.positions(&in_time, seals - 1);
+    let mut addresses = Vec::new();
+    for now in [seals, seals + 1] {
+        for record in tick(&products, Some(&relay), now) {
+            if let Record::WorldPositions(world) = record {
+                let content = world.content().map_err(err)?;
+                addresses.extend(
+                    content
+                        .fixes
+                        .iter()
+                        .map(|fix| (content.second, fix.address)),
+                );
+            }
+        }
+    }
+    assert_eq!(addresses, vec![(second, 0x00c0_0001)]);
+    assert_eq!(products.report().world_late, 1);
     Ok(())
 }

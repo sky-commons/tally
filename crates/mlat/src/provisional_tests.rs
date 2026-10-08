@@ -16,9 +16,10 @@ fn engine(threads: usize) -> Engine {
         Identity::from_seed([4; 32]),
         0xb007,
         Settings {
-            regions: Vec::new(),
+            regions: tally_wire::Regions::default(),
             settle_ms: 1_000,
             threads,
+            capacity: crate::engine::Capacity::default(),
         },
     )
 }

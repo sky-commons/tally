@@ -20,17 +20,18 @@ use std::time::Duration;
 use tally_wire::backoff::Backoff;
 use tally_wire::fault_proof::{FAULT_PROOF_FORMAT, MODEL_FAULT_PROOF_FORMAT};
 use tally_wire::noise::{self, Accepted, Reader, Writer};
-use tally_wire::{Identity, Location, PublicKey, Reason, ReceiverInfo, Record, Role, Tolerance};
+use tally_wire::{Identity, PublicKey, Reason, Record, Role, Tolerance};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::broadcast::{self, error::RecvError, error::TryRecvError};
 use tokio::sync::{mpsc, watch};
 use tokio::time::Instant;
 
 use crate::ceiling::{self, Ceiling, Metered};
 use crate::config::Upstream;
 use crate::egress::{Class, Kind, Link, Shed, Socket};
-use crate::hub::{Hub, Item, RelayTrust};
+use crate::fanout::{Fell, Filter, Listener, Taken};
+use crate::hub::{Description, Hub, Inbound, Item, Origin, OwnDescription, RelayTrust};
+use crate::ingest::{Allowance, InFlight, Refusal};
 use crate::network::{Asker, AskerRole};
 use crate::subscription::{Subscription, directory_wants, on_directory_link};
 use tally_wire::RelayAddress;
@@ -70,6 +71,10 @@ const REFUSED_RETRY_SECS: u32 = 86_400;
 const UNVERIFIED_RETRY_SECS: u32 = (crate::directory::OWN_RESIGN_EVERY_MS / 1000) as u32;
 /// How long a connection that sent more than its ingest ceiling is asked to stay away.
 const OVER_CEILING_RETRY_SECS: u32 = 60;
+/// How long a relay turned away because every member session the plan admits is held is asked to
+/// stay away (`Reason::Full`): it routes what it would have sent this relay to the next members of
+/// its trees meanwhile, and doubles the wait each time it is turned away again (`peers`).
+const MEMBERS_FULL_RETRY_SECS: u32 = 60;
 /// The longest a goodbye is given to reach a peer before the link is dropped anyway.
 const FAREWELL_TIMEOUT: Duration = Duration::from_secs(5);
 /// After a goodbye, the longest the relay keeps reading (and dropping) what the peer still sends
@@ -130,6 +135,19 @@ impl Peer {
     /// own, and the network records, whose duties judge their asker) are taken from every role a
     /// probe is not.
     fn permit(self, record: &Record) -> Permit {
+        // A delivery query of the retired form is answered on every link, never read and never
+        // dropped unheard: its sender hears a Goodbye it already takes as "no answer".
+        if let Some(Record::Goodbye {
+            reason,
+            retry_after_secs,
+        }) = record.refusal()
+        {
+            return Permit::Refuse(End::Told {
+                reason,
+                retry_after_secs,
+                why: "a delivery query of the retired form (RFC-0181 §7)".to_owned(),
+            });
+        }
         match self {
             Self::Member => Permit::Take,
             Self::Probe if Role::Probe.may_send(record) => Permit::Take,
@@ -222,12 +240,9 @@ impl Drop for Feeding {
 }
 
 /// A feeder's own description, as it last sent it: given to the hub again when the hub has
-/// forgotten it and the feeder is publishing (see `hub::RECEIVERS_REMEMBERED`).
-struct Described {
-    info: ReceiverInfo,
-    issued_ms: u64,
-    place: Option<Location>,
-}
+/// forgotten it and the feeder is publishing (see `hub::RECEIVERS_REMEMBERED`). Shared with each
+/// batch the link hands the ingest stage, which acts on it there.
+type Described = Arc<OwnDescription>;
 
 /// Which records on the fan-out a link is sent.
 enum Wants {
@@ -279,6 +294,14 @@ impl Wants {
             *current = subscription;
         }
     }
+
+    /// What the router offers a link that wants this.
+    fn filter(&self) -> Filter {
+        match self {
+            Self::Directory => Filter::Directory,
+            Self::Subscription { current, .. } => Filter::Subscription(current.clone()),
+        }
+    }
 }
 
 /// What a link is sent from the fan-out: the descriptions known when it joined, sent before it
@@ -298,8 +321,28 @@ enum End {
     },
     /// Closed without a word: the peer broke a rule it cannot have broken by accident.
     Closed(String),
-    /// Another relay said goodbye (or "leave me"), asking for this long before the next try.
-    Departed { retry_after_secs: u32 },
+    /// Another relay said goodbye (or "leave me"), asking for this long before the next try, and
+    /// whether it said it is full (`Reason::Full`).
+    Departed(Away),
+}
+
+/// Why a relay this one dialled ended the session with a word: how long it asked to be left, and
+/// whether it said it is full (`Reason::Full`: for a relay sending it data, it holds every member
+/// session its plan admits, RFC-0174 §2.5), which the dialler takes as "this provider is full" and
+/// routes around (`peers::Peers::refused_full`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Away {
+    pub wait: Duration,
+    pub full: bool,
+}
+
+impl Away {
+    fn of(reason: Reason, retry_after_secs: u32) -> Self {
+        Self {
+            wait: Duration::from_secs(retry_after_secs.into()),
+            full: reason == Reason::Full,
+        }
+    }
 }
 
 impl From<String> for End {
@@ -370,8 +413,8 @@ where
             why
         }
         End::Closed(why) => why,
-        End::Departed { retry_after_secs } => {
-            format!("the relay left, asking for {retry_after_secs} s")
+        End::Departed(away) => {
+            format!("the relay left, asking for {} s", away.wait.as_secs())
         }
     }
 }
@@ -498,6 +541,42 @@ where
         },
         _ => None,
     };
+    // And only with its bytes reserved in every store (`budget`, RFC-0181 §9): a feeder the
+    // relay's memory cannot hold is turned away now, never dropped from a store later.
+    let _reserved = match peer {
+        Peer::Feeder(_) => match hub.budget().reserve() {
+            Some(reservation) => Some(reservation),
+            None => {
+                farewell(&mut session.reader, &mut session.writer, full(&hub)).await;
+                return Err(format!(
+                    "turned away: no spare slot (the memory budget holds {} feeders)",
+                    hub.budget().ceiling()
+                ));
+            }
+        },
+        _ => None,
+    };
+    // What it may have in the ingest stage, carved from what it reserved (a member's, from its
+    // pool, when it is one): the batches its Hello carries are charged like every other.
+    let mut admitted = match peer {
+        Peer::Feeder(_) => match hub.allowance(hub.budget().per_feeder().ingest) {
+            Some(allowance) => Admitted {
+                allowance: Some(allowance),
+                ..Admitted::default()
+            },
+            None => {
+                farewell(&mut session.reader, &mut session.writer, full(&hub)).await;
+                return Err("turned away: no room for its ingest allowance".to_owned());
+            }
+        },
+        // A relay that dialled in is admitted as a member once its offer is verified and it
+        // brings data in (`Admitted::charge`).
+        Peer::Member | Peer::Relay => Admitted {
+            joins: true,
+            ..Admitted::default()
+        },
+        Peer::Subscriber | Peer::Engine(_) | Peer::Probe => Admitted::default(),
+    };
     // A feeder's session in the station reports ends with this connection, however it ends.
     let _feeding = match peer {
         Peer::Feeder(receiver) => Some(Feeding {
@@ -522,9 +601,22 @@ where
     // What came with Hello is acted on before anything is sent: a subscriber's first `Subscribe`
     // decides its first byte, and a network duty's answers (a probe's, before any) go first.
     let mut answers = Vec::new();
+    let refusal = Arc::new(Refusal::default());
     for record in first {
-        let ingested = ingest(record, &hub, source, (peer, &asker), steer, &mut described)
-            .or_else(|unhandled| network(unhandled, &hub, &asker, &mut answers));
+        let in_flight = match admitted.charge(&hub, peer, &asker.key, &record).await {
+            Ok(in_flight) => in_flight,
+            Err(end) => return Err(end_now(&mut session.reader, &mut session.writer, end).await),
+        };
+        let ingested = ingest(
+            record,
+            &hub,
+            source,
+            (peer, &asker),
+            steer,
+            &mut described,
+            (in_flight, &refusal),
+        )
+        .or_else(|unhandled| network(unhandled, &hub, &asker, &mut answers));
         if let Err(end) = ingested {
             return Err(end_now(&mut session.reader, &mut session.writer, end).await);
         }
@@ -589,6 +681,8 @@ where
             fan_out,
             subscribe: steer,
             described,
+            refusal: Some(refusal),
+            admitted,
             asker,
             // Each role its own ceiling, decided by the role its handshake established, never by
             // its key: a member publishes its groups' slices, a feeder one receiver's batches, an
@@ -648,7 +742,7 @@ impl Redial {
     async fn after(
         &mut self,
         started: tokio::time::Instant,
-        outcome: Result<Option<Duration>, String>,
+        outcome: Result<Option<Away>, String>,
         who: &str,
     ) {
         if started.elapsed() >= HEALTHY_LINK {
@@ -656,7 +750,7 @@ impl Redial {
         }
         match outcome {
             Ok(None) => {}
-            Ok(Some(wait)) => {
+            Ok(Some(Away { wait, .. })) => {
                 let wait = wait.min(PEER_WAITS_AT_MOST);
                 eprintln!(
                     "tally-relay: {who} asked this relay to stay away {} s",
@@ -670,12 +764,14 @@ impl Redial {
     }
 }
 
-/// A session's refusal by the peer at its handshake, as the wait it asked for.
-fn refused(error: tally_wire::WireError) -> Result<Option<Duration>, String> {
+/// A session's refusal by the peer at its handshake, as the wait it asked for and whether it said
+/// it is full.
+fn refused(error: tally_wire::WireError) -> Result<Option<Away>, String> {
     match error {
         tally_wire::WireError::Refused {
-            retry_after_secs, ..
-        } => Ok(Some(Duration::from_secs(retry_after_secs.into()))),
+            reason,
+            retry_after_secs,
+        } => Ok(Some(Away::of(reason, retry_after_secs))),
         error => Err(error.to_string()),
     }
 }
@@ -695,7 +791,11 @@ async fn upstream_once(
     upstream: &Upstream,
     identity: &Identity,
     hub: &Arc<Hub>,
-) -> Result<Option<Duration>, String> {
+) -> Result<Option<Away>, String> {
+    // A place under the connection cap, as every session holds (`Hub::dialled`).
+    let _slot = hub
+        .dialled()
+        .ok_or_else(|| "no connection slot to dial with (--max-connections)".to_owned())?;
     let stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(&upstream.address))
         .await
         .map_err(|_| "connect timed out".to_owned())?
@@ -722,6 +822,8 @@ async fn upstream_once(
             fan_out: Some(directory_fan_out()),
             subscribe: None,
             described: None,
+            refusal: None,
+            admitted: Admitted::default(),
             // A directory link carries offers and queries; only data is held to a ceiling.
             ceiling: None,
             asker: Asker {
@@ -767,6 +869,11 @@ fn live_offers(hub: &Hub) -> Vec<Arc<Record>> {
 /// raw an MLAT area here needs, as an engine subscribing `first` (a region-cut raw `Subscribe`).
 /// What the far relay sends back is taken as a member's: anyone's signed records, published here.
 /// Ends when `outgoing` closes; a failed or refused session is dialled again as `Redial` says.
+///
+/// A sharing member that turns the link away as full (`Reason::Full`, RFC-0174 §2.5) ends it: it
+/// is this provider that is full, so the relay routes what it would have sent it to the next
+/// members of its trees for as long as it asked, doubled on each refusal after
+/// (`peers::Peers::refused_full`), and dials it again only once sharing addresses it again.
 pub async fn member(
     relay: RelayAddress,
     identity: Identity,
@@ -780,6 +887,21 @@ pub async fn member(
     while !outgoing.is_closed() {
         let started = redial.dialling();
         let outcome = member_once(&relay, &identity, role, &first, &hub, &mut outgoing).await;
+        if role == Role::Relay
+            && let Ok(Some(away)) = outcome
+            && away.full
+        {
+            let peers = &hub.network().peers;
+            peers.refused_full(relay.key, away.wait, crate::network::wall_ms());
+            let routed = peers
+                .full_for(&relay.key, crate::network::wall_ms())
+                .unwrap_or(away.wait);
+            eprintln!(
+                "tally-relay: {who} is full: routing around it for {} s",
+                routed.as_secs()
+            );
+            return;
+        }
         redial.after(started, outcome, &who).await;
     }
 }
@@ -791,7 +913,23 @@ async fn member_once(
     first: &[Record],
     hub: &Arc<Hub>,
     outgoing: &mut mpsc::Receiver<Vec<Record>>,
-) -> Result<Option<Duration>, String> {
+) -> Result<Option<Away>, String> {
+    // A place under the connection cap, as every session holds (`Hub::dialled`).
+    let _slot = hub
+        .dialled()
+        .ok_or_else(|| "no connection slot to dial with (--max-connections)".to_owned())?;
+    // A raw link brings another relay's raw in, so it is a member session: its place in the
+    // members' pool is taken before it is dialled, never once data comes, so this relay never
+    // dials a link it would then turn away itself. A member link this relay dialled only sends
+    // (what the member sends it comes over its own dial), and takes none.
+    let admitted = if role == Role::Engine {
+        admit_member(hub).map_err(|end| match end {
+            End::Told { why, .. } | End::Closed(why) => why,
+            End::Departed(_) => "turned away".to_owned(),
+        })?
+    } else {
+        Admitted::default()
+    };
     let stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(&relay.address))
         .await
         .map_err(|_| "connect timed out".to_owned())?
@@ -818,6 +956,8 @@ async fn member_once(
             fan_out: None,
             subscribe: None,
             described: None,
+            refusal: None,
+            admitted,
             ceiling: None,
             asker: Asker {
                 role: AskerRole::Relay,
@@ -852,6 +992,11 @@ struct Serving<'a> {
     subscribe: Option<&'a watch::Sender<Subscription>>,
     /// A feeder's own description, if it sent one with its `Hello`.
     described: Option<Described>,
+    /// Where a batch refused by the ingest stage ends the connection: the one its `Hello`'s batches
+    /// were handed with, if any.
+    refusal: Option<Arc<Refusal>>,
+    /// What it was admitted with: its ingest allowance and, a member, its reservation.
+    admitted: Admitted,
     /// What the peer may send, for a connection that dialled in.
     ceiling: Option<Ceiling>,
     /// Who the peer is, as the network duties see it.
@@ -887,12 +1032,12 @@ impl From<String> for Closing {
 async fn exchange<S>(
     reader: &mut Reader<S>,
     writer: &mut Writer<S>,
-    hub: &Hub,
+    hub: &Arc<Hub>,
     source: u64,
     peer: Peer,
     link: &Arc<Link>,
     serving: Serving<'_>,
-) -> Result<Option<Duration>, String>
+) -> Result<Option<Away>, String>
 where
     S: AsyncRead + AsyncWrite + Send,
 {
@@ -901,6 +1046,8 @@ where
         fan_out,
         subscribe,
         described,
+        refusal,
+        admitted,
         ceiling,
         asker,
         outgoing,
@@ -912,13 +1059,13 @@ where
             subscribe,
             asker,
             replies: replying,
+            refusal: refusal.unwrap_or_default(),
+            admitted,
         };
         match read_loop(reader, hub, source, peer, reading, described, ceiling).await {
             Ok(()) => Ok(None),
             Err(End::Closed(why)) => Err(why),
-            Err(End::Departed { retry_after_secs }) => {
-                Ok(Some(Duration::from_secs(retry_after_secs.into())))
-            }
+            Err(End::Departed(away)) => Ok(Some(away)),
             Err(End::Told {
                 reason,
                 retry_after_secs,
@@ -974,11 +1121,107 @@ struct Reading<'a> {
     subscribe: Option<&'a watch::Sender<Subscription>>,
     asker: Asker,
     replies: mpsc::Sender<Vec<Record>>,
+    /// Where the ingest stage says a batch's signature failed.
+    refusal: Arc<Refusal>,
+    admitted: Admitted,
+}
+
+/// What a connection that publishes batches was admitted with (RFC-0181 §2, §9): its allowance
+/// in the ingest stage, carved from `Store::Ingest` within what it reserved, and a member
+/// session's reservation from the members' pool and the pace the members share. A connection that
+/// publishes none has neither, and a batch from it never reaches the stage (`Peer::permit`).
+#[derive(Default)]
+struct Admitted {
+    allowance: Option<Allowance>,
+    membership: Option<crate::budget::Reservation>,
+    /// The members' shared rate (`ceiling::Pace`), which a member session's data waits for.
+    pace: Option<Arc<crate::ceiling::Pace>>,
+    /// Whether this session is admitted as a member once its peer is one (`admit_member`): a
+    /// session over which another relay's data may come in (one that relay dialled, or this
+    /// relay's own one-hop raw link). A session this relay dialled to send a member what is
+    /// addressed to it, or to an upstream for the directory, carries none in, and never is.
+    joins: bool,
+}
+
+impl Admitted {
+    /// `record`'s charge (`in_flight`), a relay's session admitted as a member first
+    /// (`admit_member`) when its offer is verified and this is the first data it brings in, for
+    /// as long as it is one: a session that only speaks the directory holds no member's place.
+    async fn charge(
+        &mut self,
+        hub: &Hub,
+        peer: Peer,
+        key: &PublicKey,
+        record: &Record,
+    ) -> Result<Option<InFlight>, End> {
+        if self.joins
+            && self.membership.is_none()
+            && matches!(record, Record::Batch(_) | Record::ReceiverInfo(_))
+            && matches!(peer.now(hub, key), Peer::Member)
+        {
+            *self = admit_member(hub)?;
+        }
+        Ok(self.in_flight(record).await)
+    }
+
+    /// A batch's charge from the allowance (`ingest::charge_of`), or a receiver description's
+    /// (its bytes: it passes the ingest stage too, `Hub::describe`), waiting while the connection
+    /// holds all of it; `None` for any other record, or a connection with no allowance.
+    async fn in_flight(&self, record: &Record) -> Option<InFlight> {
+        let bytes = match record {
+            Record::Batch(batch) => crate::ingest::charge_of(batch),
+            Record::ReceiverInfo(info) => info.as_bytes().len(),
+            _ => return None,
+        };
+        let allowance = self.allowance.as_ref()?;
+        // A member's waits first for the members' shared rate: together they bring in what was
+        // planned for them, no more (`budget::Plan::with_members`).
+        if let Some(pace) = &self.pace {
+            let wire = match record {
+                Record::Batch(batch) => batch.as_bytes().len(),
+                _ => bytes,
+            };
+            pace.take(u64::try_from(wire).unwrap_or(u64::MAX)).await;
+        }
+        Some(allowance.acquire(bytes).await)
+    }
+}
+
+/// A member session's admission: its own bytes (its ingest allowance) reserved from the members'
+/// pool, sized at start for the member sessions the relay's plan admits (`budget::members_for`),
+/// its allowance carved, and the members' shared pace. Past them it is turned away, counted, with
+/// `Reason::Full` (RFC-0174 §2.5, "A relay's members are bounded"): the relay that dialled routes
+/// around this one, to the next members of its trees, for the wait it is given.
+fn admit_member(hub: &Hub) -> Result<Admitted, End> {
+    let budget = hub.budget();
+    let refused = |why: String| {
+        hub.member_refused();
+        End::Told {
+            reason: Reason::Full,
+            retry_after_secs: MEMBERS_FULL_RETRY_SECS,
+            why,
+        }
+    };
+    let membership = budget.reserve_member().ok_or_else(|| {
+        refused(format!(
+            "turned away: no spare member slot (the relay holds {} member sessions)",
+            budget.members()
+        ))
+    })?;
+    let allowance = hub.allowance(budget.plan().per_member()).ok_or_else(|| {
+        refused("turned away: no room for a member's ingest allowance".to_owned())
+    })?;
+    Ok(Admitted {
+        allowance: Some(allowance),
+        membership: Some(membership),
+        pace: Some(hub.member_pace()),
+        joins: true,
+    })
 }
 
 async fn read_loop<S: AsyncRead>(
     reader: &mut Reader<S>,
-    hub: &Hub,
+    hub: &Arc<Hub>,
     source: u64,
     peer: Peer,
     reading: Reading<'_>,
@@ -989,15 +1232,28 @@ async fn read_loop<S: AsyncRead>(
         subscribe,
         asker,
         replies,
+        refusal,
+        mut admitted,
     } = reading;
+    // The message being read and the records decoded from it, until each is handed on: carved for
+    // as long as the connection is open (`ingest::BUFFERS_PER_CONNECTION`), a feeder's from what
+    // it reserved, so a peer that trickles a message holds what was planned for it, no more.
+    let _buffers = hub
+        .connection_buffers(matches!(peer, Peer::Feeder(_)))
+        .await;
     let mut records = Vec::new();
     let mut answers = Vec::new();
     loop {
         records.clear();
-        tokio::time::timeout(READ_TIMEOUT, reader.recv(&mut records))
-            .await
-            .map_err(|_| "silent too long".to_owned())?
-            .map_err(|error| error.to_string())?;
+        // A batch the ingest stage refused (its signature) ends the session at once, whatever
+        // is being read: the session is over, so a read cut short loses nothing.
+        tokio::select! {
+            read = tokio::time::timeout(READ_TIMEOUT, reader.recv(&mut records)) => {
+                read.map_err(|_| "silent too long".to_owned())?
+                    .map_err(|error| error.to_string())?;
+            }
+            why = refusal.refused() => return Err(End::Closed(why)),
+        }
         if ceiling.as_mut().is_some_and(|ceiling| !ceiling.within()) {
             return Err(End::Told {
                 reason: Reason::Full,
@@ -1006,6 +1262,12 @@ async fn read_loop<S: AsyncRead>(
             });
         }
         for record in records.drain(..) {
+            // Its charge from the connection's allowance before it is handed over: with the
+            // allowance held, the socket is not read, and TCP holds the sender back (RFC-0181 §2).
+            let in_flight = admitted.charge(hub, peer, &asker.key, &record).await?;
+            if let Some(why) = refusal.now() {
+                return Err(End::Closed(why));
+            }
             ingest(
                 record,
                 hub,
@@ -1013,6 +1275,7 @@ async fn read_loop<S: AsyncRead>(
                 (peer, &asker),
                 subscribe,
                 &mut described,
+                (in_flight, &refusal),
             )
             .or_else(|unhandled| network(unhandled, hub, &asker, &mut answers))?;
         }
@@ -1063,11 +1326,12 @@ fn network(
 
 fn ingest(
     record: Record,
-    hub: &Hub,
+    hub: &Arc<Hub>,
     source: u64,
     (peer, asker): (Peer, &Asker),
     subscribe: Option<&watch::Sender<Subscription>>,
     described: &mut Option<Described>,
+    (in_flight, refusal): (Option<InFlight>, &Arc<Refusal>),
 ) -> Result<(), Unhandled> {
     // Whether the peer may send it at all is its role's one rule (`Peer::permit`).
     let peer = peer.now(hub, &asker.key);
@@ -1081,43 +1345,35 @@ fn ingest(
     }
     match record {
         Record::Batch(batch) => {
-            let receiver = batch.receiver().map_err(|error| error.to_string())?;
-            // A receiver's signature only: a relay's deduplicated batch never passes as one.
-            batch.verify().map_err(|error| error.to_string())?;
-            // The network duties see where it came from: a feeder's own batch is seeded into its
-            // area's sharing group by this relay, its origin; a member's is a group piece.
-            let shared = match peer {
-                Peer::Feeder(_) | Peer::Member | Peer::Relay => Some(batch.clone()),
-                Peer::Subscriber | Peer::Engine(_) | Peer::Probe => None,
+            // Its signature (a receiver's only: a relay's deduplicated batch never passes as one),
+            // its admission and its decode are the ingest stage's, on a CPU worker; a refused
+            // signature ends this connection there (`Refusal`). What follows admission (the
+            // station counters, a forgotten description given again, the sharing duties) follows
+            // there too, in the receiver's order.
+            let origin = match peer {
+                Peer::Feeder(_) => Origin::Feeder(described.clone()),
+                Peer::Member | Peer::Relay => Origin::Peer(*asker),
+                Peer::Subscriber | Peer::Engine(_) | Peer::Probe => Origin::Elsewhere,
             };
-            let new = hub.publish_batch(source, batch, receiver);
-            if new && matches!(peer, Peer::Feeder(_)) {
-                hub.fed_by(&receiver, source);
-            }
-            if let Some(batch) = shared {
-                let now_ms = crate::network::wall_ms();
-                match peer {
-                    Peer::Feeder(_) => hub.network().from_feeder(hub, &batch, now_ms),
-                    _ => hub
-                        .network()
-                        .from_peer(hub, asker, &Record::Batch(batch), now_ms),
+            // Charged from the connection's allowance before it came here: a peer that publishes
+            // batches was admitted with one, and none other gets a batch past its permit.
+            let Some(in_flight) = in_flight else {
+                return Err(End::Told {
+                    reason: Reason::Protocol,
+                    retry_after_secs: REFUSED_RETRY_SECS,
+                    why: "sent a batch on a connection admitted to publish none".to_owned(),
                 }
-            }
-            // A feeder's description pushed out while it was not yet publishing comes back now
-            // that it is, as one that is.
-            if new
-                && let Some(own) = described.as_ref()
-                && !hub.describes(&receiver)
-            {
-                hub.publish_info(
-                    source,
-                    own.info.clone(),
-                    receiver,
-                    own.issued_ms,
-                    own.place,
-                    true,
-                );
-            }
+                .into());
+            };
+            hub.ingest(Inbound {
+                source,
+                batch,
+                origin,
+                verify: true,
+                stamp: None,
+                in_flight,
+                refusal: Some(Arc::clone(refusal)),
+            });
         }
         Record::ReceiverInfo(info) => {
             let receiver = info.receiver().map_err(|error| error.to_string())?;
@@ -1133,13 +1389,31 @@ fn ingest(
                     .as_ref()
                     .is_none_or(|own| issued_ms >= own.issued_ms)
             {
-                *described = Some(Described {
+                *described = Some(Arc::new(OwnDescription {
                     info: info.clone(),
                     issued_ms,
                     place,
-                });
+                }));
             }
-            hub.publish_info(source, info, receiver, issued_ms, place, false);
+            // Charged like a batch, and for the same reason: it passes the ingest stage.
+            let Some(in_flight) = in_flight else {
+                return Err(End::Told {
+                    reason: Reason::Protocol,
+                    retry_after_secs: REFUSED_RETRY_SECS,
+                    why: "sent a description on a connection admitted to publish none".to_owned(),
+                }
+                .into());
+            };
+            hub.describe(Description {
+                source,
+                info,
+                receiver,
+                issued_ms,
+                place,
+                publishing: false,
+                stamp: None,
+                in_flight,
+            });
         }
         Record::Positions(positions) => {
             let engine = positions.engine().map_err(|error| error.to_string())?;
@@ -1202,15 +1476,18 @@ fn ingest(
                 subscribe.send_replace(allowed);
             }
         }
-        // A relay this one links to leaves or refuses it, saying when to come back; the dial loop
-        // of a link this relay dialled (`redial`) honours it.
+        // A relay this one links to leaves or refuses it, saying when to come back and whether it
+        // is full; the dial loop of a link this relay dialled (`member`, `Redial`) acts on it.
         Record::Goodbye {
-            retry_after_secs, ..
+            reason,
+            retry_after_secs,
+        } if matches!(peer, Peer::Relay | Peer::Member) => {
+            return Err(End::Departed(Away::of(reason, retry_after_secs)).into());
         }
-        | Record::Redirect {
+        Record::Redirect {
             retry_after_secs, ..
         } if matches!(peer, Peer::Relay | Peer::Member) => {
-            return Err(End::Departed { retry_after_secs }.into());
+            return Err(End::Departed(Away::of(Reason::Leaving, retry_after_secs)).into());
         }
         // RFC-0174's records are the network duties' (`network`), whoever sent them.
         record @ (Record::Echo(_)
@@ -1394,7 +1671,7 @@ async fn write_loop<S: AsyncWrite>(
     // A directory link joins the fan-out first and then reads the offers held, so an offer signed
     // or gossiped in between (each is published once) is in one or the other, never neither.
     let directory = matches!(wants, Wants::Directory);
-    let early = directory.then(|| hub.listen());
+    let early = directory.then(|| hub.listen(source, wants.filter()));
     let infos: Vec<Arc<Record>> = if directory {
         live_offers(hub)
     } else {
@@ -1403,30 +1680,33 @@ async fn write_loop<S: AsyncWrite>(
     for part in parts(&infos) {
         send_data(writer, hub, link, described_class(kind), part).await?;
     }
-    let mut out = early.unwrap_or_else(|| hub.listen());
+    let out = early.unwrap_or_else(|| hub.listen(source, wants.filter()));
     let mut pending = Pending::new(kind);
+    let mut taken = Vec::with_capacity(SEND_BATCH);
     loop {
         tokio::select! {
-            item = out.recv() => {
-                match item {
-                    Ok(item) => pending.keep(item, source, &wants),
+            got = out.recv_many(&mut taken, SEND_BATCH) => {
+                match got {
+                    Ok(()) => {}
                     // The directory a link is sent is held whole (`Directory`), so a directory
                     // link behind the fan-out is sent it again rather than dropped: what it
                     // missed is in what is held. A link of data has no such source; it goes.
-                    Err(RecvError::Lagged(_)) if directory => {
-                        resync_directory(writer, hub, link, kind).await?;
-                    }
-                    Err(RecvError::Lagged(_)) => return fell_behind(kind),
-                    Err(RecvError::Closed) => return Ok(()),
+                    Err(Fell::Resync) => resync_directory(writer, hub, link, kind).await?,
+                    Err(Fell::Behind(_)) => return fell_behind(kind),
+                }
+                for item in taken.drain(..) {
+                    pending.keep(item, source, &wants);
                 }
                 while !pending.full() {
-                    match out.try_recv() {
-                        Ok(item) => pending.keep(item, source, &wants),
-                        Err(TryRecvError::Lagged(_)) if directory => {
-                            resync_directory(writer, hub, link, kind).await?;
+                    match out.try_recv_many(&mut taken, SEND_BATCH) {
+                        Ok(0) => break,
+                        Ok(_) => {
+                            for item in taken.drain(..) {
+                                pending.keep(item, source, &wants);
+                            }
                         }
-                        Err(TryRecvError::Lagged(_)) => return fell_behind(kind),
-                        Err(_) => break,
+                        Err(Fell::Resync) => resync_directory(writer, hub, link, kind).await?,
+                        Err(Fell::Behind(_)) => return fell_behind(kind),
                     }
                 }
                 if let Some(pace) = pace.as_mut() {
@@ -1461,11 +1741,12 @@ async fn write_loop<S: AsyncWrite>(
                     .collect();
                 for part in parts(&infos) {
                     send_data(writer, hub, link, described_class(kind), part).await?;
-                    if !catch_up(writer, hub, link, &mut out, &mut pending, source, &wants).await? {
+                    if !catch_up(writer, hub, link, &out, &mut pending, source, &wants).await? {
                         return fell_behind(kind);
                     }
                 }
                 wants.apply(subscription);
+                out.set(wants.filter());
             }
             Some((last, why)) = farewells.recv() => return Err(Closing::Saying { last: Box::new(last), why }),
             Some(answers) = replies.recv() => {
@@ -1699,21 +1980,26 @@ async fn catch_up<S: AsyncWrite>(
     writer: &mut Writer<S>,
     hub: &Hub,
     link: &Arc<Link>,
-    out: &mut broadcast::Receiver<Item>,
+    out: &Listener,
     pending: &mut Pending,
     source: u64,
     wants: &Wants,
 ) -> Result<bool, Closing> {
+    let mut taken = Vec::with_capacity(SEND_BATCH);
     loop {
         let mut drained = false;
         while !pending.full() {
-            match out.try_recv() {
-                Ok(item) => pending.keep(item, source, wants),
-                Err(TryRecvError::Lagged(_)) => return Ok(false),
-                Err(_) => {
+            match out.try_recv_many(&mut taken, SEND_BATCH) {
+                Ok(0) => {
                     drained = true;
                     break;
                 }
+                Ok(_) => {
+                    for item in taken.drain(..) {
+                        pending.keep(item, source, wants);
+                    }
+                }
+                Err(_) => return Ok(false),
             }
         }
         pending.send(writer, hub, link).await?;
@@ -1734,7 +2020,7 @@ fn parts(records: &[Arc<Record>]) -> Vec<&[Arc<Record>]> {
             start = at;
             bytes = 0;
         }
-        bytes += size(record);
+        bytes += record.encoded_len();
     }
     if start < records.len() {
         parts.push(&records[start..]);
@@ -1748,6 +2034,9 @@ struct Pending {
     kind: Kind,
     /// By class, highest first; order within a class is the fan-out's.
     by_class: [Vec<Arc<Record>>; Class::ALL.len()],
+    /// The fan-out's charges of what is gathered (`budget::Store::Fanout`), held until it is
+    /// sent: what waits on a slow socket here is still charged.
+    charges: Vec<Arc<crate::budget::Charge>>,
     records: usize,
     bytes: usize,
 }
@@ -1757,6 +2046,7 @@ impl Pending {
         Self {
             kind,
             by_class: Default::default(),
+            charges: Vec::new(),
             records: 0,
             bytes: 0,
         }
@@ -1764,12 +2054,13 @@ impl Pending {
 
     /// Never send a record back down the connection it came in on, nor one the link did not ask
     /// for.
-    fn keep(&mut self, item: Item, source: u64, wants: &Wants) {
-        if item.source != source && wants.wants(&item) {
-            let class = Class::of(&item.record, self.kind);
-            self.bytes += size(&item.record);
+    fn keep(&mut self, taken: Taken, source: u64, wants: &Wants) {
+        if taken.source != source && wants.wants(&taken) {
+            let class = Class::of(&taken.record, self.kind);
+            self.bytes += taken.record.encoded_len();
             self.records += 1;
-            self.by_class[class as usize].push(item.record);
+            self.charges.push(taken.charge());
+            self.by_class[class as usize].push(Arc::clone(&taken.record));
         }
     }
 
@@ -1791,6 +2082,8 @@ impl Pending {
                 records.clear();
             }
         }
+        // Sent: the fan-out's charge of it goes with the last holder.
+        self.charges.clear();
         self.records = 0;
         self.bytes = 0;
         Ok(())
@@ -1801,30 +2094,13 @@ impl Pending {
 /// for each Noise message (one per record at worst, and every half message at most) its tag and
 /// two-byte length. The socket counts what is really written; this is what is granted first.
 fn wire_cost(records: &[Arc<Record>]) -> usize {
-    const RECORD_HEADER: usize = 3;
     const MESSAGE_OVERHEAD: usize = 2 + 16;
-    let bytes: usize = records
-        .iter()
-        .map(|record| size(record) + RECORD_HEADER)
-        .sum();
+    let bytes: usize = records.iter().map(|record| record.encoded_len()).sum();
     let messages = records
         .len()
         .min(bytes / (noise::MAX_PLAINTEXT / 2) + 1)
         .max(1);
     bytes + messages * MESSAGE_OVERHEAD
-}
-
-/// A record's signed bytes, near enough its size on the wire.
-fn size(record: &Record) -> usize {
-    match record {
-        Record::Batch(batch) | Record::RelayBatch(batch) => batch.as_bytes().len(),
-        Record::ReceiverInfo(info) => info.as_bytes().len(),
-        Record::Positions(positions) | Record::Provisional(positions) => positions.as_bytes().len(),
-        Record::ClockModel(model) => model.as_bytes().len(),
-        Record::ClockModelPart(part) => part.as_bytes().len(),
-        Record::FaultProof(proof) => proof.as_bytes().len(),
-        _ => 0,
-    }
 }
 
 /// Sends a directory link that fell behind the fan-out the directory held now, whole.
@@ -1843,10 +2119,11 @@ async fn resync_directory<S: AsyncWrite>(
 /// How long a subscriber that fell behind the stream is asked to stay away.
 const FELL_BEHIND_RETRY_SECS: u32 = 30;
 
-/// Ends a link that fell behind the stream: it is told the relay is full. A subscriber is asked to
-/// stay away a short while (`FELL_BEHIND_RETRY_SECS`), so a slow one does not churn; a peer that
-/// forwards (an MLAT relay's raw link) is asked for nothing, since what it carries is a duty and
-/// every second away is raw lost, and its own dial loop (`Redial`) paces it.
+/// Ends a link that fell behind the stream (its queue past `fanout::BEHIND_MS` of inbound, or past
+/// its bytes): it is told so (`Reason::FellBehind`), not that the relay is full. A subscriber is
+/// asked to stay away a short while (`FELL_BEHIND_RETRY_SECS`), so a slow one does not churn; a
+/// peer that forwards (an MLAT relay's raw link) is asked for nothing, since what it carries is a
+/// duty and every second away is raw lost, and its own dial loop (`Redial`) paces it.
 fn fell_behind(kind: Kind) -> Result<(), Closing> {
     let wait = if kind.forwards() {
         0
@@ -1854,7 +2131,7 @@ fn fell_behind(kind: Kind) -> Result<(), Closing> {
         FELL_BEHIND_RETRY_SECS
     };
     Err(Closing::Saying {
-        last: Box::new(goodbye(Reason::Full, wait)),
+        last: Box::new(goodbye(Reason::FellBehind, wait)),
         why: format!("fell behind the stream ({kind:?})"),
     })
 }
@@ -1867,7 +2144,7 @@ pub async fn serve_beast(listener: TcpListener, hub: Arc<Hub>) {
             tokio::time::sleep(Duration::from_millis(100)).await;
             continue;
         };
-        let out = hub.listen();
+        let out = hub.listen(hub.connection_id(), Filter::Beast);
         let stream = hub.egress().socket(stream, Some(peer.ip()));
         // It takes data and gives none: a plain subscriber, to the cap.
         stream.link().set_kind(Kind::Taker);
@@ -1883,31 +2160,28 @@ pub async fn serve_beast(listener: TcpListener, hub: Arc<Hub>) {
 /// cap as a plain subscriber's (a loopback client, the usual one, is never held to it).
 async fn beast_client<W: AsyncWrite + Unpin>(
     mut stream: Socket<W>,
-    mut out: broadcast::Receiver<Item>,
+    out: Listener,
     deadline: Duration,
 ) -> Result<(), String> {
     let link = stream.link();
     let egress = Arc::clone(stream.egress());
     let mut bytes = Vec::new();
+    // Held, with their charges, until their bytes are written.
+    let mut items: Vec<Taken> = Vec::new();
     loop {
-        let item = match out.recv().await {
-            Ok(item) => item,
-            Err(RecvError::Lagged(missed)) => return Err(format!("fell behind by {missed}")),
-            Err(RecvError::Closed) => return Ok(()),
-        };
-        let Record::Batch(batch) = &*item.record else {
-            continue;
-        };
-        let Ok(content) = batch.content() else {
-            continue;
-        };
+        items.clear();
+        if let Err(fell) = out.recv_many(&mut items, SEND_BATCH).await {
+            return Err(format!("fell behind ({fell:?})"));
+        }
         bytes.clear();
-        for frame in content
-            .observations
-            .iter()
-            .filter_map(|observation| observation.to_beast())
-        {
-            frame.encode_beast(&mut bytes);
+        // Each batch's one decode (`hub::Item::decoded`); the router offers only batches with one.
+        for decoded in items.iter().filter_map(|item| item.decoded.as_ref()) {
+            for frame in decoded.views().filter_map(|view| view.to_beast()) {
+                frame.encode_beast(&mut bytes);
+            }
+        }
+        if bytes.is_empty() {
+            continue;
         }
         if egress.grant(&link, Class::Taker, bytes.len()).await == Err(Shed) {
             return Err("shed: the upload cap cannot carry it".to_owned());
@@ -1924,10 +2198,44 @@ mod tests {
     use super::*;
     use tally_wire::beast::FrameKind;
     use tally_wire::{Batch, BatchContent, Frame, Observation, RelayAddress, Streams};
+    use tally_wire::{Location, ReceiverInfo};
     use tokio::time::timeout;
 
     fn text(error: impl std::fmt::Display) -> String {
         error.to_string()
+    }
+
+    /// RFC-0181 §7: a delivery query of the retired form is answered from every peer with a
+    /// goodbye naming it (which an old feeder takes as "no answer"), never dropped unheard; an old
+    /// answer, which no peer is owed a word for, is not.
+    #[test]
+    fn a_retired_delivery_query_is_refused_by_name_from_every_peer() -> Result<(), String> {
+        use tally_wire::record::{KIND_POSSESSION_ANSWER, KIND_POSSESSION_QUERY};
+        let key = Identity::from_seed([1; 32]).public();
+        let peers = [
+            Peer::Feeder(key),
+            Peer::Relay,
+            Peer::Subscriber,
+            Peer::Engine(key),
+            Peer::Member,
+            Peer::Probe,
+        ];
+        for peer in peers {
+            match peer.permit(&Record::Retired(KIND_POSSESSION_QUERY)) {
+                Permit::Refuse(End::Told {
+                    reason: Reason::Retired,
+                    ..
+                }) => {}
+                _ => return Err("a retired query was not refused by name".to_owned()),
+            }
+            if let Permit::Refuse(End::Told { reason, .. }) =
+                peer.permit(&Record::Retired(KIND_POSSESSION_ANSWER))
+                && reason == Reason::Retired
+            {
+                return Err("a retired answer was refused as a query".to_owned());
+            }
+        }
+        Ok(())
     }
 
     #[tokio::test]
@@ -1946,7 +2254,9 @@ mod tests {
             address,
             key: parent_key,
         };
-        let asked = upstream_once(&upstream, &child, &Arc::new(Hub::new(8))).await?;
+        let asked = upstream_once(&upstream, &child, &Arc::new(Hub::new(8)))
+            .await?
+            .map(|away| away.wait);
         // Neither accepted nor verified: asked to wait one re-signing of its offers, by when its
         // offer would have been verified if it is going to be.
         assert_eq!(
@@ -1970,7 +2280,15 @@ mod tests {
                 .map_err(text)?;
             let address = listener.local_addr().map_err(text)?.to_string();
             tokio::spawn(crate::serve(listener, vec![far], Arc::new(Hub::new(8))));
-            let hub = Arc::new(Hub::new(8));
+            // A relay taking an area, so a raw link has its place in the members' pool.
+            let area = tally_wire::rendezvous::area_of(&tally_wire::Location {
+                lat_e7: 337_490_000,
+                lon_e7: -843_880_000,
+                alt_m: 0,
+                precision_m: 0,
+            })
+            .map_err(text)?;
+            let hub = Arc::new(Hub::new(8).taking(vec![area]));
             let (_sender, outgoing) = mpsc::channel(1);
             let subscribe = Record::Subscribe {
                 streams: Streams::RAW,
@@ -2066,7 +2384,14 @@ mod tests {
             key: parent_key,
         };
         let asked = upstream_once(&upstream, &child, &Arc::new(Hub::new(8))).await?;
-        assert_eq!(asked, Some(Duration::from_secs(77)));
+        // And that it said it is full, which a dialler of data routes around.
+        assert_eq!(
+            asked,
+            Some(Away {
+                wait: Duration::from_secs(77),
+                full: true
+            })
+        );
         Ok(())
     }
 
@@ -2100,7 +2425,10 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_subscriber_that_heartbeats_but_never_reads_is_dropped_at_the_write_deadline()
     -> Result<(), String> {
-        let hub = Arc::new(Hub::new(1).max_upload(roomy()));
+        // The ingest clock stopped: signing the batches below takes real seconds in a debug
+        // build, and a subscriber is let go two seconds of inbound behind, which is not what
+        // this measures.
+        let hub = Arc::new(Hub::clocked(1, Arc::new(|| 0)).max_upload(roomy()));
         let relay = Identity::generate().map_err(text)?;
         let relay_key = relay.public();
         let (near, far) = tokio::io::duplex(64 * 1024);
@@ -2164,10 +2492,11 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_beast_out_client_that_never_reads_is_dropped_at_its_deadline() -> Result<(), String>
     {
-        let hub = Hub::new(1).max_upload(roomy());
+        let hub = Arc::new(Hub::new(1).max_upload(roomy()));
         let (unread, far) = tokio::io::duplex(1024);
         let far = hub.egress().socket(far, None);
-        let client = tokio::spawn(beast_client(far, hub.listen(), Duration::from_millis(200)));
+        let out = hub.listen(hub.connection_id(), Filter::Beast);
+        let client = tokio::spawn(beast_client(far, out, Duration::from_millis(200)));
         let receiver = Identity::generate().map_err(text)?;
         hub.publish_batch(999, batch(&receiver, 0, 200)?, receiver.public());
         let ended = timeout(Duration::from_secs(5), client)
@@ -2231,6 +2560,8 @@ mod tests {
                 )),
                 cell: None,
                 points: None,
+                decoded: None,
+                stamp_ms: 0,
             })
         );
         Ok(())
@@ -2265,10 +2596,10 @@ mod tests {
         use tally_wire::Clock;
         use tally_wire::batch::ReceiverInfoContent;
         const DESCRIBED: usize = 4_000;
-        // A ring far smaller than the directory: one send of the whole of it would leave the
-        // subscriber behind.
+        // A queue far smaller than the directory: one send of the whole of it would leave the
+        // subscriber behind. About `RING` of the small batches below.
         const RING: usize = 16;
-        let hub = Arc::new(Hub::with_capacity(1, RING).max_upload(roomy()));
+        let hub = Arc::new(Hub::new(1).queue_bytes(RING * 512).max_upload(roomy()));
         let author = Identity::generate().map_err(text)?;
         let info = ReceiverInfo::sign(
             &author,
@@ -2879,7 +3210,9 @@ mod tests {
             address,
             key: parent_key,
         };
-        let asked = upstream_once(&upstream, &Identity::generate().map_err(text)?, &child).await?;
+        let asked = upstream_once(&upstream, &Identity::generate().map_err(text)?, &child)
+            .await?
+            .map(|away| away.wait);
         assert_eq!(asked, Some(Duration::from_secs(1)));
         let read = parent_read.await.map_err(text)??;
         assert!(read > 0);
@@ -3011,7 +3344,7 @@ mod tests {
                 .advertising(vec![hint])
                 .max_upload(cap),
         );
-        let mut out = hub.listen();
+        let out = hub.listen(u64::MAX, Filter::Everything);
 
         // A billed relay link: what feeders send is forwarded to it.
         let mut relay = dial_pipe(&hub)?;
@@ -3037,11 +3370,12 @@ mod tests {
             .send(&[Record::Batch(batch(&first_identity, 0, 10)?)])
             .await
             .map_err(text)?;
-        let item = timeout(Duration::from_secs(60), out.recv())
+        let mut items = Vec::new();
+        timeout(Duration::from_secs(60), out.recv_many(&mut items, 1))
             .await
             .map_err(|_| "the feeder's batch was not taken in".to_owned())?
-            .map_err(text)?;
-        assert!(matches!(&*item.record, Record::Batch(_)));
+            .map_err(|fell| format!("{fell:?}"))?;
+        assert!(matches!(&*items[0].record, Record::Batch(_)));
 
         // The second does not fit: pointed at the relays this one knows, and nothing it sent with
         // its hello is taken in.
@@ -3065,7 +3399,7 @@ mod tests {
         ));
         let why = ended(&mut second.serving).await?;
         assert!(why.contains("upload cap"), "{why}");
-        assert!(matches!(out.try_recv(), Err(TryRecvError::Empty)));
+        assert!(out.try_recv().is_none());
         assert_eq!(hub.egress().report().refused_feeders, 1);
         // The first is still served.
         assert!(!first.serving.is_finished());

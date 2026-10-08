@@ -61,9 +61,10 @@ fn build() -> Result<World, String> {
         engine.clone(),
         0xb007,
         EngineSettings {
-            regions: Vec::new(),
+            regions: tally_wire::Regions::default(),
             settle_ms: SETTLE_MS,
             threads: 4,
+            capacity: Default::default(),
         },
     );
     for record in &raw {
@@ -337,9 +338,10 @@ fn honest_fixes_are_consistent_with_their_own_receptions() -> Result<(), String>
         Identity::from_seed([62; 32]),
         0xb007,
         EngineSettings {
-            regions: Vec::new(),
+            regions: tally_wire::Regions::default(),
             settle_ms: SETTLE_MS,
             threads: 2,
+            capacity: Default::default(),
         },
     );
     let published: Vec<Record> = tally_mlat::replay::replay(&mut engine, &delivered, 100, until)?
@@ -534,11 +536,32 @@ fn honest_receivers_earn_standing_the_same_at_every_keeper() -> Result<(), Strin
     shuffled.extend(later);
     let backward = settled(&shuffled, world.now)?;
     assert_eq!(backward.standing().book().receivers(), book.receivers());
-    // A relay that forwarded the same records.
+    // A relay that forwarded the same records: its standing reads the raw its hosted engine
+    // sealed (one store of raw per relay), for receivers in the areas it holds raw for.
     let relay = tally_relay::standing::Standing::new();
+    let mut held = tally_mlat_solver::held::Held::new(1 << 30);
+    for record in &records {
+        if let Record::Batch(batch) = record {
+            let decoded = tally_wire::Decoded::from_verified(batch.clone(), world.now, 0)
+                .map_err(|undecodable| undecodable.error.to_string())?;
+            held.add_decoded(&decoded);
+        }
+    }
+    held.seal_through(bin_of(world.now) + 1);
+    relay.read_bins(held.sealed_bins().clone());
+    let cell = tally_wire::Region::point(&tally_wire::Location {
+        lat_e7: 337_490_000,
+        lon_e7: -843_880_000,
+        alt_m: 0,
+        precision_m: 0,
+    })
+    .map_err(|error| error.to_string())?;
+    let area = cell
+        .ancestor(tally_wire::rendezvous::AREA_RESOLUTION)
+        .ok_or("no area")?;
+    relay.set_areas(&tally_wire::Regions::new([area]));
     for record in &records {
         match record {
-            Record::Batch(batch) => relay.batch(batch, world.now),
             Record::ClockModel(_) | Record::ClockModelPart(_) => relay.model(record, world.now),
             Record::Positions(positions) => relay.positions(positions, world.now),
             _ => {}
@@ -546,13 +569,16 @@ fn honest_receivers_earn_standing_the_same_at_every_keeper() -> Result<(), Strin
     }
     relay.tick(world.now + rule::SETTLE_MS + 1);
     for receiver in expected.keys() {
-        assert_eq!(&relay.of(receiver), &forward.standing().of(receiver));
+        assert_eq!(
+            relay.of(receiver, Some(cell)),
+            Some(forward.standing().of(receiver))
+        );
     }
     let relays: Vec<ReceiverStanding> = world
         .simulation
         .receivers
         .iter()
-        .map(|receiver| relay.of(&receiver.key))
+        .filter_map(|receiver| relay.of(&receiver.key, Some(cell)))
         .collect();
     let clients: Vec<ReceiverStanding> = world
         .simulation
@@ -756,9 +782,10 @@ fn the_ranking_is_a_function_of_the_records_held_not_of_when_they_arrived() -> R
             Identity::from_seed([70 + at as u8; 32]),
             0xb007,
             EngineSettings {
-                regions: Vec::new(),
+                regions: tally_wire::Regions::default(),
                 settle_ms: SETTLE_MS,
                 threads: 4,
+                capacity: Default::default(),
             },
         );
         for record in &world.raw {

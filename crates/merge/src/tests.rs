@@ -69,9 +69,10 @@ fn build() -> Result<World, String> {
                 identity,
                 0xb007,
                 EngineSettings {
-                    regions: Vec::new(),
+                    regions: tally_wire::Regions::default(),
                     settle_ms: SETTLE_MS,
                     threads: 4,
+                    capacity: Default::default(),
                 },
             );
             for record in &raw {
@@ -861,9 +862,10 @@ fn a_live_engines_provisionals_are_superseded_or_confirmed_by_its_finals() -> Re
         identity.clone(),
         0xb007,
         EngineSettings {
-            regions: Vec::new(),
+            regions: tally_wire::Regions::default(),
             settle_ms: SETTLE_MS,
             threads: 2,
+            capacity: Default::default(),
         },
     );
     let published = tally_mlat::replay::replay(&mut engine, &delivered, 100, until)?;

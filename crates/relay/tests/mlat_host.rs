@@ -11,13 +11,18 @@
 //! area moves to the next by rendezvous once its offers lapse.
 //!
 //! In the first three tests the host is pinned to the simulator's areas, so they test the hosting
-//! and nothing else. The first step is held until every batch of the first phase is in the engine:
-//! the scenario's first window is due the moment the relay looks, and a step on the wall clock
-//! would solve whatever raw a slow machine had delivered by then.
+//! and nothing else. The scenario begins in the past, so the relays' ingest clock ([`Clock`])
+//! walks it a step at a time from its start, and each feeder sends a batch once the clock reaches
+//! the batch's own wall clock: raw is late by its stamp, never by when a step ran (RFC-0181), and
+//! is never stamped before its bin (`held::AHEAD_MS`). The clock moves a step only once every
+//! relay has been offered what was fed and its hosted MLAT has stepped to it and published
+//! (`stepping`), and never past the wall clock: through the past as fast as the relays keep up,
+//! then as it happens. So nothing here measures time, and no step runs on a clock a slow machine
+//! has not caught up with; what it asserts it asserts in stamps (how fast a provisional position
+//! comes on the wall clock is `tally-load`'s to measure, a bed, `--provisional-latency`).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use tally_mlat::engine::Settings;
@@ -27,16 +32,25 @@ use tally_mlat_solver::{
     Calibrated, ClockModel as Model, Reception, publish, verify, verify_model,
 };
 use tally_relay::hub::Hub;
+use tally_relay::mlat_host::stepping::{Clock, Hosting, step};
 use tally_relay::mlat_host::{HostedMlat, MlatHost, MlatReport, SETTLE_MS};
 use tally_wire::noise;
 use tally_wire::rendezvous::AREA_RESOLUTION;
 use tally_wire::{
-    Assembler, Identity, Location, Positions, PublicKey, Reader, Record, Region, RelayAddress,
-    Role, Streams,
+    Assembler, Identity, Location, Positions, PublicKey, Reader, Record, Region, Regions,
+    RelayAddress, Role, Streams,
 };
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::watch;
 use tokio::time::timeout;
+
+/// Each relay's stages on threads of their own, as a relay runs them (`Hub::staged`): its seals
+/// never hold up its connections, and its MLAT raw is taken into its raw shards by its ingest
+/// workers, never on its engine's thread. Two threads a stage, so the shards are split between
+/// workers as they are on a relay.
+const RELAY_THREADS: tally_relay::ingest::Threads = tally_relay::ingest::Threads {
+    ingest: 2,
+    message: 2,
+};
 
 type Result<T = ()> = std::result::Result<T, String>;
 
@@ -45,30 +59,58 @@ fn text(error: impl std::fmt::Display) -> String {
 }
 
 const WAIT: Duration = Duration::from_secs(90);
+/// How long the clock may stand still before the test says why (`stepping`): inside `WAIT`, so
+/// its reason comes before the client's deadline.
+const STOOD: Duration = Duration::from_secs(60);
 
-/// The relay's hosted MLAT, its areas pinned (in place of `selection`'s choice) and its steps held
-/// until the test opens it.
+/// Moves `clock` for as long as the test runs, every host fed every batch of `walls`
+/// (`stepping::step`).
+fn stepping(
+    clock: Arc<Clock>,
+    hosts: Vec<Arc<dyn Hosting>>,
+    walls: Vec<u64>,
+) -> tokio::task::JoinHandle<Result> {
+    step(
+        clock,
+        hosts
+            .into_iter()
+            .map(|host| (host, walls.clone()))
+            .collect(),
+        STOOD,
+    )
+}
+
+/// The relay's hosted MLAT, its areas pinned (in place of `selection`'s choice).
 struct Pinned {
     host: HostedMlat,
-    areas: Vec<Region>,
-    open: AtomicBool,
+    areas: Regions,
+}
+
+impl Hosting for Pinned {
+    fn host(&self) -> &HostedMlat {
+        &self.host
+    }
 }
 
 impl MlatHost for Pinned {
-    fn set_areas(&self, _chosen: Vec<Region>, descriptions: Vec<tally_wire::ReceiverInfo>) {
+    fn set_areas(&self, _chosen: Regions, descriptions: Vec<tally_wire::ReceiverInfo>) {
         self.host.set_areas(self.areas.clone(), descriptions);
     }
 
-    fn offer(&self, record: &Record, now_ms: u64) {
-        self.host.offer(record, now_ms);
+    fn offer_description(&self, info: &tally_wire::ReceiverInfo, stamp_ms: u64) {
+        self.host.offer_description(info, stamp_ms);
+    }
+
+    fn offer_batch(&self, batch: &std::sync::Arc<tally_wire::Decoded>, now_ms: u64) {
+        self.host.offer_batch(batch, now_ms);
+    }
+
+    fn sealed_bins(&self) -> Option<tally_mlat_solver::held::SealedBins> {
+        self.host.sealed_bins()
     }
 
     fn take_published(&self, now_ms: u64) -> Vec<Record> {
-        if self.open.load(Ordering::SeqCst) {
-            self.host.take_published(now_ms)
-        } else {
-            Vec::new()
-        }
+        self.host.take_published(now_ms)
     }
 
     fn cores(&self) -> u16 {
@@ -136,15 +178,17 @@ async fn relay(
     identity: Identity,
     relays: &[PublicKey],
     mlat: Option<Arc<Pinned>>,
+    clock: &Arc<Clock>,
 ) -> Result<(RelayAddress, Arc<Hub>)> {
     let key = identity.public();
     let listener = TcpListener::bind("127.0.0.1:0").await.map_err(text)?;
     let address = listener.local_addr().map_err(text)?;
     // Every feeder here comes from loopback: more than one host's share of connections.
     let hub = Arc::new(
-        Hub::new(8)
+        Hub::clocked(8, clock.clock())
             .accepting_relays(relays.iter().copied())
-            .max_connections_per_address(64),
+            .max_connections_per_address(64)
+            .staged(RELAY_THREADS)?,
     );
     if let Some(mlat) = mlat {
         hub.network().host_mlat(mlat);
@@ -169,18 +213,16 @@ fn pinned(identity: &Identity) -> Result<Arc<Pinned>> {
         identity.clone(),
         7,
         Settings {
-            regions: Vec::new(),
+            regions: Regions::default(),
             settle_ms: SETTLE_MS,
             threads: 4,
+            capacity: tally_mlat::engine::Capacity::default(),
         },
-    );
+    )?;
     // Solving from the first offer on: the relay's own network task re-states it every tick.
+    let areas = Regions::new(areas);
     host.set_areas(areas.clone(), Vec::new());
-    Ok(Arc::new(Pinned {
-        host,
-        areas,
-        open: AtomicBool::new(false),
-    }))
+    Ok(Arc::new(Pinned { host, areas }))
 }
 
 /// A client of the relay's clock models, positions and provisional positions: its reading half.
@@ -224,70 +266,74 @@ async fn listening(hub: &Hub, before: usize, links: usize) -> Result {
     .map_err(|_| "the links never joined the fan-out".to_owned())
 }
 
-/// Every simulated receiver, a feeder of `relay`: its description and the batches up to
-/// `split_ms` at once, the rest once `second` turns true. The batches of the first phase.
+/// Every simulated receiver of `simulation`, a feeder of `relay`: its description at once, then
+/// each batch whose wall clock `fed` keeps once `clock` reaches it. The wall clocks of the batches
+/// fed.
 async fn feed(
     simulation: &Simulation,
     relay: &RelayAddress,
-    split_ms: u64,
-    second: &watch::Receiver<bool>,
-) -> Result<u64> {
-    let mut first_phase = 0;
+    clock: &Arc<Clock>,
+    fed: impl Fn(u64) -> bool,
+) -> Result<Vec<u64>> {
+    let mut walls = Vec::new();
     for feed in simulation.feeds().map_err(text)? {
         let stream = TcpStream::connect(&relay.address).await.map_err(text)?;
-        let mut session = noise::connect(stream, &feed.identity, &relay.key, Role::Feeder)
+        let session = noise::connect(stream, &feed.identity, &relay.key, Role::Feeder)
             .await
             .map_err(text)?;
-        let mut early = vec![Record::ReceiverInfo(feed.info.clone())];
-        let mut late = Vec::new();
+        let mut batches = Vec::new();
         for batch in feed.batches {
             let wall = batch.content().map_err(text)?.wall_ms;
-            if wall < split_ms {
-                first_phase += 1;
-                early.push(Record::Batch(batch));
-            } else {
-                late.push(Record::Batch(batch));
+            if fed(wall) {
+                walls.push(wall);
+                batches.push((wall, Record::Batch(batch)));
             }
         }
-        let mut second = second.clone();
-        tokio::spawn(async move {
-            for record in early {
-                if session.writer.send(&[record]).await.is_err() {
-                    return;
-                }
-            }
-            if second.wait_for(|go| *go).await.is_err() {
-                return;
-            }
-            for record in late {
-                if session.writer.send(&[record]).await.is_err() {
-                    return;
-                }
-            }
-            // The feeder stays connected, as a real one does.
-            std::future::pending::<()>().await;
-            drop(session);
-        });
+        sending(session, Record::ReceiverInfo(feed.info), batches, clock);
     }
-    Ok(first_phase)
+    Ok(walls)
 }
 
-/// Waits until the host has taken `batches` batches, then lets it step.
-async fn all_in(mlat: &Pinned, batches: u64) -> Result {
-    timeout(WAIT, async {
-        while mlat.host.ingested() < batches {
-            tokio::time::sleep(Duration::from_millis(10)).await;
+/// A feeder's session sending `description`, then each of `batches` once `clock` reaches its wall
+/// clock; connected for as long as the test runs, as a real feeder stays.
+fn sending(
+    mut session: tally_wire::noise::Session<TcpStream>,
+    description: Record,
+    batches: Vec<(u64, Record)>,
+    clock: &Arc<Clock>,
+) {
+    let clock = Arc::clone(clock);
+    tokio::spawn(async move {
+        if session.writer.send(&[description]).await.is_err() {
+            return;
         }
-    })
-    .await
-    .map_err(|_| {
-        format!(
-            "{} of {batches} batches reached the engine",
-            mlat.host.ingested()
-        )
-    })?;
-    mlat.open.store(true, Ordering::SeqCst);
-    Ok(())
+        for (wall, record) in batches {
+            clock.reached(wall).await;
+            if session.writer.send(&[record]).await.is_err() {
+                return;
+            }
+        }
+        std::future::pending::<()>().await;
+        drop(session);
+    });
+}
+
+/// Which batches of a `recent` scenario split at `split_ms` are fed: all but those of the bin right
+/// after the split, the last of the first window's, so that window's models are the first phase's
+/// raw alone, the raw the client holds ([`Raw::of`]).
+fn first_window(split_ms: u64) -> impl Fn(u64) -> bool {
+    move |wall| wall < split_ms || wall >= split_ms + GRID_MS
+}
+
+/// The clock of a scenario's start: the step its first batch is in.
+fn start_of(simulation: &Simulation) -> Result<u64> {
+    let first = simulation
+        .receptions
+        .iter()
+        .map(|reception| reception.wall_ms)
+        .min()
+        .ok_or("a scenario heard nothing")?;
+    Ok(first / tally_relay::mlat_host::STEP_MS * tally_relay::mlat_host::STEP_MS)
 }
 
 /// The raw the client holds (the simulator's receptions before `split_ms`), sealed in its bins.
@@ -377,20 +423,19 @@ struct Heard {
 }
 
 /// Reads the client until `want` final solutions are verified and, if `provisional`, a
-/// provisional position citing a model it holds has come; `second` is let go once the finals are
-/// in, so the second phase's receptions are solved under the carried models.
+/// provisional position citing a model it holds has come.
 async fn listen(
     reader: &mut Reader<TcpStream>,
     relay: PublicKey,
     raw: &Raw,
     want: usize,
-    provisional: Option<&watch::Sender<bool>>,
+    provisional: bool,
 ) -> Result<Heard> {
     let mut assembler = Assembler::new(256 * 1024 * 1024, 1_024);
     let mut models: BTreeMap<[u8; 32], Checked> = BTreeMap::new();
     let mut heard = Heard::default();
     let outcome = timeout(WAIT, async {
-        while heard.verified < want || (provisional.is_some() && heard.provisional == 0) {
+        while heard.verified < want || (provisional && heard.provisional == 0) {
             let mut got = Vec::new();
             reader.recv(&mut got).await.map_err(text)?;
             for record in got {
@@ -427,11 +472,6 @@ async fn listen(
                     models.insert(manifest.id(), check_model(model, raw)?);
                 }
             }
-            if heard.verified >= want
-                && let Some(second) = provisional
-            {
-                let _ = second.send(true);
-            }
         }
         Ok::<_, String>(())
     })
@@ -440,6 +480,17 @@ async fn listen(
         Ok(result) => result.map(|()| heard),
         Err(_) => Err(format!("before the deadline: {heard:?}")),
     }
+}
+
+/// What a test heard, or why not: the clock's own error first when it stood still (a relay that
+/// never caught up), which the client's deadline only follows from. The clock stops with the test.
+async fn settled<T>(heard: Result<T>, stepper: tokio::task::JoinHandle<Result>) -> Result<T> {
+    if heard.is_err() && stepper.is_finished() {
+        stepper.await.map_err(text)??;
+    } else {
+        stepper.abort();
+    }
+    heard
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -458,15 +509,16 @@ async fn feeders_of_a_relay_hosting_mlat_give_its_clients_verifiable_positions_a
     let simulation = sim::run(&scenario);
     let raw = Raw::of(&simulation, split_ms);
     let identity = Identity::generate().map_err(text)?;
+    let clock = Clock::at(start_of(&simulation)?);
     let mlat = pinned(&identity)?;
-    let (relay, hub) = relay(identity, &[], Some(Arc::clone(&mlat))).await?;
+    let (relay, hub) = relay(identity, &[], Some(Arc::clone(&mlat)), &clock).await?;
     let before = hub.listening();
     let mut reader = client(&relay).await?;
     listening(&hub, before, 1).await?;
-    let (second, go) = watch::channel(false);
-    let batches = feed(&simulation, &relay, split_ms, &go).await?;
-    all_in(&mlat, batches).await?;
-    let heard = listen(&mut reader, relay.key, &raw, 100, Some(&second)).await?;
+    let walls = feed(&simulation, &relay, &clock, first_window(split_ms)).await?;
+    let stepper = stepping(clock, vec![Arc::clone(&mlat) as Arc<dyn Hosting>], walls);
+    let heard = listen(&mut reader, relay.key, &raw, 100, true).await;
+    let heard = settled(heard, stepper).await?;
     assert!(heard.models > 0, "{heard:?}");
     // Nothing offered was let go, and the steps' reports were kept.
     let report = mlat.host.report();
@@ -487,15 +539,16 @@ async fn every_final_a_relay_publishes_passes_the_verifier_seed_53() -> Result {
     let simulation = sim::run(&scenario);
     let raw = Raw::of(&simulation, split_ms);
     let identity = Identity::generate().map_err(text)?;
+    let clock = Clock::at(start_of(&simulation)?);
     let mlat = pinned(&identity)?;
-    let (relay, hub) = relay(identity, &[], Some(Arc::clone(&mlat))).await?;
+    let (relay, hub) = relay(identity, &[], Some(Arc::clone(&mlat)), &clock).await?;
     let before = hub.listening();
     let mut reader = client(&relay).await?;
     listening(&hub, before, 1).await?;
-    let (_second, go) = watch::channel(false);
-    let batches = feed(&simulation, &relay, split_ms, &go).await?;
-    all_in(&mlat, batches).await?;
-    let heard = listen(&mut reader, relay.key, &raw, 100, None).await?;
+    let walls = feed(&simulation, &relay, &clock, first_window(split_ms)).await?;
+    let stepper = stepping(clock, vec![Arc::clone(&mlat) as Arc<dyn Hosting>], walls);
+    let heard = listen(&mut reader, relay.key, &raw, 100, false).await;
+    let heard = settled(heard, stepper).await?;
     assert!(heard.models > 0, "{heard:?}");
     Ok(())
 }
@@ -513,15 +566,24 @@ async fn raw_from_a_relay_that_solves_nothing_reaches_the_relay_that_solves_its_
     let areas = areas()?;
     let solving = Identity::generate().map_err(text)?;
     let holding = Identity::generate().map_err(text)?;
+    let clock = Clock::at(start_of(&simulation)?);
     let mlat = pinned(&solving)?;
-    let (feeders, feeders_hub) =
-        offering(holding.clone(), &areas, 64_521, None, &[solving.public()]).await?;
+    let (feeders, feeders_hub) = offering(
+        holding.clone(),
+        &areas,
+        64_521,
+        None,
+        &[solving.public()],
+        &clock,
+    )
+    .await?;
     let (solver, solver_hub) = offering(
         solving.clone(),
         &areas,
         64_522,
         Some(Arc::clone(&mlat)),
         &[],
+        &clock,
     )
     .await?;
     tokio::spawn(tally_relay::link::upstream(
@@ -555,10 +617,10 @@ async fn raw_from_a_relay_that_solves_nothing_reaches_the_relay_that_solves_its_
     let before = solver_hub.listening();
     let mut reader = client(&solver).await?;
     listening(&solver_hub, before, 1).await?;
-    let (_second, go) = watch::channel(false);
-    let batches = feed(&simulation, &feeders, split_ms, &go).await?;
-    all_in(&mlat, batches).await?;
-    let heard = listen(&mut reader, solver.key, &raw, 40, None).await?;
+    let walls = feed(&simulation, &feeders, &clock, first_window(split_ms)).await?;
+    let stepper = stepping(clock, vec![Arc::clone(&mlat) as Arc<dyn Hosting>], walls);
+    let heard = listen(&mut reader, solver.key, &raw, 40, false).await;
+    let heard = settled(heard, stepper).await?;
     assert!(heard.models > 0, "{heard:?}");
     Ok(())
 }
@@ -572,6 +634,7 @@ async fn offering(
     asn: u32,
     mlat: Option<Arc<Pinned>>,
     relays: &[PublicKey],
+    clock: &Arc<Clock>,
 ) -> Result<(RelayAddress, Arc<Hub>)> {
     let listener = TcpListener::bind("127.0.0.1:0").await.map_err(text)?;
     let address = RelayAddress {
@@ -579,14 +642,15 @@ async fn offering(
         address: listener.local_addr().map_err(text)?.to_string(),
     };
     let hub = Arc::new(
-        Hub::new(64)
+        Hub::clocked(64, clock.clock())
             .advertising(vec![address.clone()])
             .accepting_relays(relays.iter().copied())
-            .max_connections_per_address(256),
+            .max_connections_per_address(256)
+            // Its areas, which its member sessions are planned from, as `tally-relay` plans them.
+            .taking(areas.to_vec())
+            .staged(RELAY_THREADS)?,
     );
     let network = hub.network();
-    network.selection.set_taken(areas.to_vec());
-    network.products.set_taken(areas.to_vec());
     network.admission.configure(asn, true);
     if let Some(mlat) = mlat {
         network.host_mlat(mlat);
@@ -599,28 +663,36 @@ async fn offering(
     Ok((address, hub))
 }
 
-/// A relay's hosted MLAT whose areas are `selection`'s (unlike [`Pinned`]) and whose steps are
-/// held until the test opens it, for the reason the module docs give.
+/// A relay's hosted MLAT whose areas are `selection`'s (unlike [`Pinned`]).
 struct Gated {
     host: HostedMlat,
-    open: AtomicBool,
+}
+
+impl Hosting for Gated {
+    fn host(&self) -> &HostedMlat {
+        &self.host
+    }
 }
 
 impl MlatHost for Gated {
-    fn set_areas(&self, chosen: Vec<Region>, descriptions: Vec<tally_wire::ReceiverInfo>) {
+    fn set_areas(&self, chosen: Regions, descriptions: Vec<tally_wire::ReceiverInfo>) {
         self.host.set_areas(chosen, descriptions);
     }
 
-    fn offer(&self, record: &Record, now_ms: u64) {
-        self.host.offer(record, now_ms);
+    fn offer_description(&self, info: &tally_wire::ReceiverInfo, stamp_ms: u64) {
+        self.host.offer_description(info, stamp_ms);
+    }
+
+    fn offer_batch(&self, batch: &std::sync::Arc<tally_wire::Decoded>, now_ms: u64) {
+        self.host.offer_batch(batch, now_ms);
+    }
+
+    fn sealed_bins(&self) -> Option<tally_mlat_solver::held::SealedBins> {
+        self.host.sealed_bins()
     }
 
     fn take_published(&self, now_ms: u64) -> Vec<Record> {
-        if self.open.load(Ordering::SeqCst) {
-            self.host.take_published(now_ms)
-        } else {
-            Vec::new()
-        }
+        self.host.take_published(now_ms)
     }
 
     fn cores(&self) -> u16 {
@@ -649,6 +721,7 @@ async fn member(
     asn: u32,
     world: bool,
     relays: &[PublicKey],
+    clock: &Arc<Clock>,
 ) -> Result<Member> {
     let listener = TcpListener::bind("127.0.0.1:0").await.map_err(text)?;
     let address = RelayAddress {
@@ -658,14 +731,15 @@ async fn member(
     // Subscribers here: the client, the other relays' one-hop raw links (one per chunk of the
     // border band) and their directory checks.
     let hub = Arc::new(
-        Hub::new(64)
+        Hub::clocked(64, clock.clock())
             .advertising(vec![address.clone()])
             .accepting_relays(relays.iter().copied())
-            .max_connections_per_address(256),
+            .max_connections_per_address(256)
+            // Its areas, which its member sessions are planned from, as `tally-relay` plans them.
+            .taking(areas.to_vec())
+            .staged(RELAY_THREADS)?,
     );
     let network = hub.network();
-    network.selection.set_taken(areas.to_vec());
-    network.products.set_taken(areas.to_vec());
     network.products.set_world(world);
     network.products.set_world_precise(world);
     network.admission.configure(asn, true);
@@ -674,12 +748,12 @@ async fn member(
             identity.clone(),
             u64::from(asn),
             Settings {
-                regions: Vec::new(),
+                regions: Regions::default(),
                 settle_ms: SETTLE_MS,
                 threads: 2,
+                capacity: tally_mlat::engine::Capacity::default(),
             },
-        ),
-        open: AtomicBool::new(false),
+        )?,
     });
     network.host_mlat(Arc::clone(&mlat) as Arc<dyn MlatHost>);
     tokio::spawn(tally_relay::serve(
@@ -702,8 +776,8 @@ struct Network {
     models: usize,
     unconfirmed: usize,
     provisional: usize,
-    /// The longest a provisional record of the live phase (fed as it happens) reached the client
-    /// after its newest transmission.
+    /// The most any provisional record was published (its step, `issued_ms`) after its newest
+    /// transmission.
     provisional_lag_ms: u64,
     regional: usize,
     /// World fixes checked against the record each cites (`products::check_fix`), live and
@@ -813,10 +887,22 @@ async fn three_relays_share_solve_and_serve_verifiable_positions_and_both_world_
         Identity::generate().map_err(text)?,
     ];
     let joining: Vec<PublicKey> = identities[1..].iter().map(Identity::public).collect();
+    // Set to the scenario's start once it is built, then stepped (`stepping`).
+    let clock = Clock::at(0);
     let mut members = Vec::new();
     for (identity, asn) in identities.iter().zip([64_501, 64_502, 64_503]) {
         let accepted = if asn == 64_501 { &joining[..] } else { &[] };
-        members.push(member(identity.clone(), &areas, asn, asn == 64_501, accepted).await?);
+        members.push(
+            member(
+                identity.clone(),
+                &areas,
+                asn,
+                asn == 64_501,
+                accepted,
+                &clock,
+            )
+            .await?,
+        );
     }
     for (identity, joiner) in identities[1..].iter().zip(&members[1..]) {
         tokio::spawn(tally_relay::link::upstream(
@@ -837,7 +923,7 @@ async fn three_relays_share_solve_and_serve_verifiable_positions_and_both_world_
             let ready = members.iter().all(|m| {
                 let network = m.hub.network();
                 let now = tally_relay::network::wall_ms();
-                network.selection.mlat_areas(&network.directory, now).len() == areas.len()
+                network.selection.mlat_areas(&network.directory, now) == Regions::new(areas.clone())
                     && network.selection.raw_sources(&network.directory, now).len() >= 2
                     && network.peers.counts().1 >= 2
                     && keys
@@ -913,6 +999,8 @@ async fn three_relays_share_solve_and_serve_verifiable_positions_and_both_world_
             }
         }
     });
+    // Each record as it reached the client: the checks below take their time (a model is verified
+    // against the raw), and the session is read meanwhile.
     let (received, mut records) = tokio::sync::mpsc::unbounded_channel::<Record>();
     tokio::spawn(async move {
         let mut got = Vec::new();
@@ -926,95 +1014,43 @@ async fn three_relays_share_solve_and_serve_verifiable_positions_and_both_world_
     });
 
     // A third of the receivers on each relay, each naming the relay it chose (as tally-feed's
-    // description does: that relay is the origin of its regional product): the past at once,
-    // then each batch once its second has ended.
-    // Connected ahead too; each sends from the moment `start` turns.
-    let (start, started) = watch::channel(false);
-    let (second, go) = watch::channel(false);
-    let mut first_phase = 0;
+    // description does: that relay is the origin of its regional product), each batch sent once
+    // the clock reaches it. The bin right after the first phase is the last of its window's
+    // (`recent`); it is left empty, so the models are the first phase's alone wherever the second
+    // phase has reached.
+    let mut walls = Vec::new();
     for (index, feed) in feeds.into_iter().enumerate() {
         let relay = members[index % members.len()].address.clone();
         let stream = TcpStream::connect(&relay.address).await.map_err(text)?;
-        let mut session = noise::connect(stream, &feed.identity, &relay.key, Role::Feeder)
+        let session = noise::connect(stream, &feed.identity, &relay.key, Role::Feeder)
             .await
             .map_err(text)?;
         let mut described = feed.info.content().map_err(text)?;
         described.relays = vec![relay.key];
         let info = tally_wire::ReceiverInfo::sign(&feed.identity, &described).map_err(text)?;
-        let mut early = vec![Record::ReceiverInfo(info)];
-        let mut late = Vec::new();
+        let mut batches = Vec::new();
         for batch in feed.batches {
             let wall = batch.content().map_err(text)?.wall_ms;
-            // The bin right after the first phase is the last of its window's (`recent`), which
-            // the relays solve as the test opens them; it is left empty, so the models are the
-            // first phase's alone wherever the second phase has reached. Everything after it is
-            // fed as it happens.
-            if wall < split_ms {
-                first_phase += 1;
-                early.push(Record::Batch(batch));
-            } else if wall >= split_ms + GRID_MS {
-                late.push((wall, Record::Batch(batch)));
+            if first_window(split_ms)(wall) {
+                walls.push(wall);
+                batches.push((wall, Record::Batch(batch)));
             }
         }
-        let mut go = go.clone();
-        let mut started = started.clone();
-        tokio::spawn(async move {
-            if started.wait_for(|start| *start).await.is_err() {
-                return;
-            }
-            for record in early {
-                if session.writer.send(&[record]).await.is_err() {
-                    return;
-                }
-            }
-            if go.wait_for(|go| *go).await.is_err() {
-                return;
-            }
-            for (wall, record) in late {
-                let wait = wall.saturating_sub(wall_ms());
-                tokio::time::sleep(Duration::from_millis(wait)).await;
-                if session.writer.send(&[record]).await.is_err() {
-                    return;
-                }
-            }
-            std::future::pending::<()>().await;
-            drop(session);
-        });
+        sending(session, Record::ReceiverInfo(info), batches, &clock);
     }
+    // Once the window comes due on the wall clock, the clock walks the scenario from its start, its
+    // past as fast as the relays keep up: every relay's engine is offered every receiver's batches,
+    // by its own feeders, its sharing members and its one-hop raw links, before it moves past them.
     tokio::time::sleep(Duration::from_millis(at.saturating_sub(wall_ms()))).await;
-    let _ = start.send(true);
-    // Every relay's engine holds every receiver's first phase, by its own feeders, its sharing
-    // members and its one-hop raw links; then they solve.
-    for member in &members {
-        timeout(WAIT, async {
-            while member.mlat.host.ingested() < first_phase {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .map_err(|_| {
-            let state: Vec<_> = members
-                .iter()
-                .map(|m| {
-                    let network = m.hub.network();
-                    (
-                        m.mlat.host.ingested(),
-                        network.shared_in(),
-                        network.peers.counts(),
-                        network.directory.len(),
-                    )
-                })
-                .collect();
-            format!(
-                "an engine short of {first_phase} batches: (ingested, shared in, links, offers) \
-                 per relay {state:?}"
-            )
-        })?;
-    }
-    for member in &members {
-        member.mlat.open.store(true, Ordering::SeqCst);
-    }
-    let _ = second.send(true);
+    clock.set(start_of(&simulation)?);
+    let stepper = stepping(
+        Arc::clone(&clock),
+        members
+            .iter()
+            .map(|member| Arc::clone(&member.mlat) as Arc<dyn Hosting>)
+            .collect(),
+        walls,
+    );
 
     let mut assembler = Assembler::new(256 * 1024 * 1024, 1_024);
     let mut models: BTreeMap<[u8; 32], Checked> = BTreeMap::new();
@@ -1022,6 +1058,10 @@ async fn three_relays_share_solve_and_serve_verifiable_positions_and_both_world_
     let mut origins: BTreeMap<[u8; 32], Record> = BTreeMap::new();
     let mut heard = Network::default();
     let mut waiting: Vec<Positions> = Vec::new();
+    // The client's relay's own provisional solutions, by (address, second transmitted), and the
+    // aircraft the live world drew in each second it sealed.
+    let mut own: BTreeMap<(u32, u64), u64> = BTreeMap::new();
+    let mut drawn: BTreeMap<u64, BTreeSet<u32>> = BTreeMap::new();
     let outcome = timeout(Duration::from_secs(240), async {
         while !heard.done() {
             let record = records
@@ -1048,20 +1088,22 @@ async fn three_relays_share_solve_and_serve_verifiable_positions_and_both_world_
                 Record::Provisional(positions) => {
                     positions.verify().map_err(text)?;
                     heard.provisional += 1;
-                    let newest = positions
-                        .solutions()
-                        .map_err(text)?
+                    let content = positions.solutions().map_err(text)?;
+                    // In stamps: the step that published it, against its newest transmission.
+                    let newest = content
                         .solutions
                         .iter()
                         .map(|solution| solution.transmitted.unix_ms)
                         .max()
                         .unwrap_or(0);
-                    // The first phase is fed all at once, long after it was heard; only what is
-                    // fed as it happens says how fast a provisional comes.
-                    if newest >= split_ms + GRID_MS {
-                        heard.provisional_lag_ms = heard
-                            .provisional_lag_ms
-                            .max(wall_ms().saturating_sub(newest));
+                    heard.provisional_lag_ms = heard
+                        .provisional_lag_ms
+                        .max(content.issued_ms.saturating_sub(newest));
+                    if positions.engine().map_err(text)? == client.address.key {
+                        for solution in &content.solutions {
+                            own.entry((solution.address, solution.transmitted.unix_ms / 1_000))
+                                .or_insert(content.issued_ms);
+                        }
                     }
                     origins.insert(positions.hash(), record.clone());
                     None
@@ -1077,6 +1119,10 @@ async fn three_relays_share_solve_and_serve_verifiable_positions_and_both_world_
                     world.verify().map_err(text)?;
                     assert_eq!(world.signer().map_err(text)?, client.address.key);
                     let content = world.content().map_err(text)?;
+                    drawn
+                        .entry(content.second)
+                        .or_default()
+                        .extend(content.fixes.iter().map(|fix| fix.address));
                     let (checked, mlat) = check_world(&content, &origins, &inputs, false)?;
                     heard.live_fixes += checked;
                     heard.live_mlat += mlat;
@@ -1134,10 +1180,11 @@ async fn three_relays_share_solve_and_serve_verifiable_positions_and_both_world_
          world {:?}",
         client.hub.network().products.report()
     );
-    match outcome {
-        Ok(result) => result?,
-        Err(_) => return Err(format!("before the deadline: {heard:?}")),
-    }
+    let outcome = match outcome {
+        Ok(result) => result,
+        Err(_) => Err(format!("before the deadline: {heard:?}")),
+    };
+    settled(outcome, stepper).await?;
     for (members_up, raw_up) in links {
         assert!(raw_up >= 2, "one-hop raw links: {raw_up}");
         assert!(members_up >= 1, "sharing member links: {members_up}");
@@ -1149,22 +1196,55 @@ async fn three_relays_share_solve_and_serve_verifiable_positions_and_both_world_
         assert!(network.shared_in() > 0, "no group record reached a relay");
         assert_eq!(network.data_on_directory_links(), 0);
     }
-    // Fast MLAT is fast (RFC-0174 §2.4): a provisional position reaches the client within the
-    // live world's seal (`WORLD_SETTLE_MS`, 4 s: about 3 s at most to publish, measured, with the
-    // hops between relays), or the live world would have sealed its second without it. The RFC's
-    // median is 1.34 s and its 95th percentile 1.65 s; this is the longest of all of them, three
-    // relays in one test process.
+    // Fast MLAT is fast (RFC-0174 §2.4), in stamps: a provisional record is published (by the step
+    // that signs it) within the live world's seal of its newest transmission (`WORLD_SETTLE_MS`);
+    // every solution the client's relay published before its second's seal is in the live world
+    // for that second; and nearly all are published before it (a transmission whose receptions
+    // straggle waits for them, `provisional::SETTLE_MS` and the time kept past it). Every second the
+    // client holds whole (all but the newest) is checked. How fast on the wall clock is
+    // `tally-load`'s to measure (`--provisional-latency`).
     assert!(heard.provisional > 0, "{heard:?}");
     assert!(
         heard.provisional_lag_ms <= tally_relay::products::WORLD_SETTLE_MS,
-        "a provisional reached the client {} ms after its transmission",
+        "a provisional was published {} ms after its transmission",
         heard.provisional_lag_ms
     );
+    let newest = drawn.keys().next_back().copied().unwrap_or(0);
+    let (mut in_world, mut after_seal) = (0, 0);
+    for ((address, second), issued_ms) in &own {
+        if *second >= newest {
+            continue;
+        }
+        let Some(aircraft) = drawn.get(second) else {
+            continue;
+        };
+        let sealed_ms = (second + 1) * 1_000 + tally_relay::products::WORLD_SETTLE_MS;
+        if *issued_ms >= sealed_ms {
+            after_seal += 1;
+            continue;
+        }
+        assert!(
+            aircraft.contains(address),
+            "{address:06x}'s provisional of second {second}, published at {issued_ms}, before \
+             its seal, is not in its live world ({} aircraft drawn: {aircraft:06x?})",
+            aircraft.len()
+        );
+        in_world += 1;
+    }
+    eprintln!("provisional solutions: {in_world} in their live world, {after_seal} after its seal");
+    // Measured (2026-10-08): 711 in, 15 after, every batch stamped up to a step after its wall
+    // clock as this clock steps.
+    assert!(
+        after_seal * 10 <= in_world + after_seal,
+        "{after_seal} of {} provisional solutions published after their second's seal",
+        in_world + after_seal
+    );
+    assert!(in_world > 0, "no provisional of a sealed second: {heard:?}");
     Ok(())
 }
 
 /// Every relay's MLAT choice for each area, as it computes it: (relay, areas it solves).
-fn choices(members: &[Member]) -> Vec<(PublicKey, Vec<Region>)> {
+fn choices(members: &[Member]) -> Vec<(PublicKey, Regions)> {
     let now = tally_relay::network::wall_ms();
     members
         .iter()
@@ -1179,10 +1259,10 @@ fn choices(members: &[Member]) -> Vec<(PublicKey, Vec<Region>)> {
 }
 
 /// The relays solving `area`, by their own choice.
-fn solving(choices: &[(PublicKey, Vec<Region>)], area: Region) -> BTreeSet<PublicKey> {
+fn solving(choices: &[(PublicKey, Regions)], area: Region) -> BTreeSet<PublicKey> {
     choices
         .iter()
-        .filter(|(_, areas)| areas.contains(&area))
+        .filter(|(_, areas)| areas.contains(area))
         .map(|(key, _)| *key)
         .collect()
 }
@@ -1220,7 +1300,15 @@ impl Killable {
                 }
             };
             let made = runtime.block_on(async {
-                let made = member(identity.clone(), &areas, asn, false, &accepted).await?;
+                let made = member(
+                    identity.clone(),
+                    &areas,
+                    asn,
+                    false,
+                    &accepted,
+                    &Clock::wall(),
+                )
+                .await?;
                 if let Some(upstream) = upstream {
                     tokio::spawn(tally_relay::link::upstream(
                         tally_relay::config::Upstream {
@@ -1349,7 +1437,7 @@ async fn of_four_relays_three_solve_an_area_and_a_dead_one_is_replaced_by_the_ne
             .network()
             .selection
             .mlat_areas(&unchosen.hub.network().directory, wall_ms())
-            .contains(&area)
+            .contains(area)
     );
 
     // One chosen relay dies outright: not the first, whose directory link the others joined by,

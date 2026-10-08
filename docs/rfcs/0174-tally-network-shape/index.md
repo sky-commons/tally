@@ -159,20 +159,27 @@ can vouch for several clients.
   forth, which would churn sessions and split them. A held relay the feeder's own probes fail to
   reach two rounds in a row is dropped, whatever its offer still says. A dead session fails over
   sooner: about 12 s when the host refuses the connection, about 2.5 min when it vanishes silently.
-- **Delivery check, by proof and by majority.** Every few minutes the feeder audits one of its
-  two relays at a time: the next few batches go to that relay alone, and it asks several members
-  of its own area's sharing group (§2.5), on distinct networks, for a signed proof of possession:
-  for each batch, named by boot and sequence, the hash of a fresh nonce joined to the batch's
-  signed bytes, which only a relay holding the batch can compute and which the feeder checks
-  against its own copy, so the proof binds the exact batch; signed by the member's key. A batch
-  counts as delivered when a majority of the networks that said anything of it prove it. A
-  sequence a member leaves out is no vote (a relay leaves out batches it has let go); only a
-  signed "not seen" counts against. An audit whose relay's session ends before the verdict says
+- **Delivery check, by proof and by majority.** Every key period (five minutes) the feeder gives
+  every member of its area's sharing group (§2.5) that it may ask a tag key of that member's own:
+  the key in force and the next, signed by the feeder, carried in a `DeliveryQuery` over a `Probe`
+  session, on that schedule whether or not an audit runs. A member holding a key for a feeder tags
+  each of its batches as it arrives (a keyed BLAKE2s of the key and the batch's signed bytes, 16
+  bytes, with the key's id), keeps the tag five minutes (`TAG_WINDOW_MS`, the one window both sides
+  use), and lets the bytes go (RFC-0181 §7). Every few minutes the feeder audits one of its two
+  relays at a time: the next few batches go to that relay alone, and it asks several keyed members,
+  on distinct networks, for their tags of those batches, named by boot and sequence, within the
+  window; the answer is signed by the member's key and names the query's fresh nonce. The feeder
+  keeps the audited batches' bytes and every key it gave, and recomputes each tag, so a proof binds
+  the exact batch; a tag counts only under a key that was in force when the batch was sent, so one
+  under an old key (a replay) proves nothing. A batch counts as delivered when a majority of the
+  networks that said anything of it prove it. A sequence a member leaves out is no vote (a relay
+  leaves out batches it took in with no key for their feeder, refused past its bound, or let go,
+  and says nothing until it has watched a whole window); only a signed "not seen" counts against. An audit whose relay's session ends before the verdict says
   nothing of that relay. When the audit ends, any audited batch the audited relay was not written
   goes to the other relay, so an audit never costs the network a batch. No audit runs when the
   area has no members to ask. A relay whose batches
   fail that majority is switched away from and remembered as one that swallows (avoided for days,
-  saved across restarts); one member's word alone convicts no one. The sample is a few hashes, so
+  saved across restarts); one member's word alone convicts no one. The sample is a few tags, so
   the check costs bytes, not a stream, and the members learn nothing they do not already hold.
 - **What happens to the slots.** The home, anchor and random slots go. An owner's `--relay` and the
   seeds join the candidates and are measured and ranked like any other. A production user that
@@ -230,11 +237,16 @@ the border band of the areas it is an MLAT relay for, and is held to a feeder's 
   A relay publishes a tile only if its area covers the tile's whole footprint. Two or three solve
   each area so that one failure or one dishonest relay neither stops nor decides its positions;
   overlap costs compute, never correctness.
-- What one relay costs, measured (RFC-0171 §3.8.1, the world-scale benchmark): the whole world's
-  MLAT, 20,000 receivers clustered as the US and Europe's are and about 5,400 targets a window,
-  takes 27 cores to keep up (3,800 tile fits a 40 s stride, 0.28 s each on 32 threads) and holds
-  1.6 GB of raw for a window (34 bytes an observation, index included). One 32-core relay carries
-  it; a 16-core relay carries about half the world.
+- What one relay costs, measured (RFC-0171 §3.8.1, the world-scale benchmark, re-measured at the
+  real reception rate for RFC-0181): the whole world's MLAT, 20,000 receivers clustered as the US
+  and Europe's are, about 320 wanted receptions a second each and about 5,400 targets a window,
+  takes 41 cores to keep up (3,800 tile fits a 40 s stride, 0.35 s each, and the solves, on 32
+  threads) and holds 8.7 GB of raw for a window (30 bytes an observation, index included), about
+  12 GB with the open bins and the bins standing settles in. What a relay reserves for it is a bound,
+  not that mean: `held::Rates::cost` reserves about 1.1 MB a receiver (open raw at five times the
+  mean rate, and 25 sealed bins of thinned raw), 22.5 GB at 20,000 (RFC-0181 §5). One 32-core relay no longer carries the whole world; a 32-core relay carries about
+  three quarters of it, and a 16-core relay about a third. (The 27 cores and 1.6 GB first
+  measured were at an eighth of the real rate.)
 - Raw travels at most a hop, never worldwide. Only positions travel far.
 - Why here: clock sync needs every receiver that heard an aircraft in one place, and the raw is
   already at the relay its feeders chose. Moving the computation to the data is cheaper than any
@@ -303,6 +315,23 @@ positions; clock models): the relays that take that area.
   only from a member of the group, at most 8 per origin per second, and none for a second more
   than 60 s ahead of the reader's clock. A parity is checked against its manifest when used; a
   false one is dropped and a later one taken.
+- **A relay's members are bounded** (as built, 2026-10-08). A relay holds at most the member
+  sessions (sessions that bring another relay's data in: a member's link sending it what its
+  groups address it, and its own one-hop raw links) its memory plan admits: every one its areas
+  could bring, at most its connection cap (RFC-0181 §9). Nothing bounds how many relays share a
+  group with one taking coarse areas (the 122 base cells reach every offer held, up to 16,384), so
+  past its plan it turns a member's link away with a `Goodbye` of reason `Full`, the reason a full
+  relay already gives a feeder; no new reason, so no reader needs a new version. The relay turned
+  away takes it as "this provider is full" for every area and product it sends that member, never
+  as a fault: for the wait the `Goodbye` names (60 s), doubled each time it is turned away again
+  within the wait after the last (at most 30 minutes), it neither dials that member nor addresses
+  it, and what the trees would have had it send that member goes to the next members by the trees'
+  own order instead: down a stripe, to the full member's children there (and in place of one full
+  too, to its children); a manifest, to those beneath it in every stripe; what was for it alone (a
+  receipt, a have-summary, an ask) nowhere. The trees are not changed, so every relay still lays
+  out the same ones and the area's data still reaches every member but the full one, which repairs
+  what it lacks once it has room. A relay hosting MLAT takes a raw link's place in its own pool
+  before it dials it, so it never dials a link it would turn away itself.
 - **Relay links carry the directory; data moves over member links** (as built). A relay links to
   another relay in two ways. A directory link (`--upstream` dials one, `--accept-relay` lets a key
   dial in) carries the directory and nothing else: signed offers and queries, echoes, delivery
@@ -344,7 +373,12 @@ trust: a bundle is checked record by record exactly as its cells would be.
 - Relays gossip offers the way they gossip `RelayList`, keep each until it expires, and hold at most
   32 offers per cell, at most 4 from one network. Within a cell, offers are held and answered by
   contribution tier first, then by rendezvous rank over (cell, key), never by arrival, so any two
-  relays that hold the same evidence and offers lay out the same trees. The tier is the bit length
+  relays that hold the same evidence and offers lay out the same trees. The bounds on a flood (a
+  network's offers anywhere, a key's, the directory's) are kept by rank too: a newcomer to a full
+  one displaces the offer under it lowest by tier, then deepest in its own cell's ranking, or is
+  refused. A held offer takes a change at most every ten seconds per key and cell (the newest
+  waiting its turn), so a peer re-signing changes in a loop costs its readers what an honest
+  relay's changes do. The tier is the bit length
   of the number of distinct networks whose relays, verified in the directory, signed receipts for
   what the relay delivered (§2.1's evidence, weighed by the one weigher); the relay's own network,
   feeder descriptions and claimed rates do not count, because feeder keys are free and one network
@@ -354,7 +388,10 @@ trust: a bundle is checked record by record exactly as its cells would be.
 - An offer is a hint, never a promise. A reader tries several providers, keeps those that deliver
   valid, fresh, complete data for the cell (the same accounting as §2.5), and drops the rest on its
   own authority. A provider is ranked by what it delivered to this reader, never by what it
-  claims.
+  claims. A provider that turns a relay away as full (`Goodbye` `Full`: it holds every member it
+  plans, §2.5) is skipped for that relay for the wait it names, doubled on each refusal after, and
+  the next provider by the same order takes its place; it is not demoted for it, and it is tried
+  again once the wait has passed.
 
 ### §2.7 Blocked aircraft (LADD and PIA) are the displayer's duty
 
@@ -401,7 +438,7 @@ kinds skips it:
 | --- | --- | --- |
 | 0x10 | `Provisional` | A provisional MLAT position (§2.4), with the `PROVISIONAL` bit on `Streams` (16). |
 | 0x11, 0x12 | `Echo`, `EchoReply` | Round-trip measurement: a nonce; the reply signed, with the relay's spare capacity and network. |
-| 0x13, 0x14 | `DeliveryQuery`, `DeliveryAnswer` | A nonce and a few batches named by boot and sequence; per batch, the signed proof of possession (§2.2). |
+| 0x13, 0x14 | retired | The first delivery check, a proof of possession over the feeder's nonce. Read as retired and never written; a relay answers an old query with `Goodbye{Retired}` (RFC-0181 §7). |
 | 0x15, 0x16 | `ProviderOffer`, `ProviderQuery` | The directory (§2.6): cells, stripes, MLAT cores, address and network, signed. |
 | 0x17 to 0x1a | `StripeAssignment`, `PieceManifest`, `HaveSummary`, `StripeReceipt` | Sharing groups (§2.5). |
 | 0x1b, 0x1c | `FirehoseCredential`, `EvidenceBundle` | Credit (§2.1): the credential, and feeders' descriptions and children's receipts. |
@@ -410,9 +447,11 @@ kinds skips it:
 | 0x1f | `Parity` | A stripe's XOR parity slice, chunked under the body limit (§2.5), unsigned. |
 | 0x20 | `BundleIndex` | A parent cell's bundle for one second: its children's digests, signed (§2.6). |
 | 0x21 | `WorldPrecise` | The precise world product (§2.11), the `WORLD_PRECISE` bit (128). |
+| 0x22, 0x23 | `DeliveryQuery`, `DeliveryAnswer` | The feeder's signed grant of tag keys to the member asked, and, in an audit, a nonce and a few batches named by boot and sequence; per batch, the member's tag made on arrival and its key's id, or "not seen", signed, answer format 2 (§2.2, RFC-0181 §7). Kinds of their own, not 0x13 and 0x14 read differently, so no build reads one form as the other. |
 
-A batch may be compressed (format 2, raw DEFLATE, inflating at most 1 MiB); a feeder compresses
-whenever it shrinks the batch, since every version 2 reader inflates it.
+A batch may be compressed (format 2, raw DEFLATE, inflating at most 1 MiB and at most 8 times its
+compressed stream, RFC-0171 §3.4); a feeder compresses whenever it shrinks the batch within that
+rule, since every version 2 reader inflates it.
 
 ### §2.11 Two products: regional and world
 

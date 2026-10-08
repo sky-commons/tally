@@ -880,6 +880,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "tally-load"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "serde_json",
+ "tally-feed",
+ "tally-mlat-solver",
+ "tally-relay",
+ "tally-wire",
+ "tokio",
+]
+
+[[package]]
 name = "tally-merge"
 version = "0.1.0"
 dependencies = [
@@ -927,6 +940,7 @@ name = "tally-relay"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "libc",
  "serde",
  "serde_json",
  "tally-feed",
@@ -942,6 +956,7 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "blake2",
+ "bytes",
  "ed25519-dalek",
  "getrandom 0.2.17",
  "h3o",

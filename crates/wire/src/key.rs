@@ -22,8 +22,19 @@ pub struct PublicKey([u8; KEY_LEN]);
 impl PublicKey {
     /// Accepts only a valid Ed25519 point, so every key in circulation can verify and derive.
     pub fn from_bytes(bytes: [u8; KEY_LEN]) -> Result<Self, WireError> {
-        VerifyingKey::from_bytes(&bytes).map_err(|error| WireError::Key(error.to_string()))?;
+        Self::point_of(&bytes)?;
         Ok(Self(bytes))
+    }
+
+    /// The key in `bytes` as a decompressed point: the one decompression a holder that verifies
+    /// by the key more than once does (a `Batch` keeps it), checking the key as `from_slice` does.
+    /// There is no way to decompress a `PublicKey` already checked into a point, so no reader
+    /// checks a key and then decompresses it again (RFC-0181 §2).
+    pub(crate) fn point_of(bytes: &[u8]) -> Result<VerifyingKey, WireError> {
+        let array: [u8; KEY_LEN] = bytes.try_into().map_err(|_| {
+            WireError::Key(format!("expected {KEY_LEN} bytes, got {}", bytes.len()))
+        })?;
+        VerifyingKey::from_bytes(&array).map_err(|error| WireError::Key(error.to_string()))
     }
 
     pub fn from_slice(bytes: &[u8]) -> Result<Self, WireError> {
@@ -41,6 +52,22 @@ impl PublicKey {
         VerifyingKey::from_bytes(&self.0).map_err(|error| WireError::Key(error.to_string()))
     }
 
+    /// The key a decompressed point is: no check, the point already is one.
+    pub(crate) fn of_point(point: &VerifyingKey) -> Self {
+        Self(point.to_bytes())
+    }
+
+    /// `verify`, by a key already decompressed (`point`).
+    pub(crate) fn verify_by(
+        point: &VerifyingKey,
+        message: &[u8],
+        signature: &[u8; SIGNATURE_LEN],
+    ) -> Result<(), WireError> {
+        point
+            .verify_strict(message, &Signature::from_bytes(signature))
+            .map_err(|_| WireError::BadSignature)
+    }
+
     /// The X25519 public key the Noise handshake authenticates.
     pub fn noise_key(&self) -> Result<[u8; KEY_LEN], WireError> {
         Ok(self.verifying()?.to_montgomery().to_bytes())
@@ -54,9 +81,7 @@ impl PublicKey {
 
     /// Strict Ed25519 verification (no malleable signatures, no small-order keys).
     pub fn verify(&self, message: &[u8], signature: &[u8; SIGNATURE_LEN]) -> Result<(), WireError> {
-        self.verifying()?
-            .verify_strict(message, &Signature::from_bytes(signature))
-            .map_err(|_| WireError::BadSignature)
+        Self::verify_by(&self.verifying()?, message, signature)
     }
 
     pub fn to_base64(&self) -> String {
@@ -125,6 +150,11 @@ impl Identity {
 
     pub fn public(&self) -> PublicKey {
         self.public
+    }
+
+    /// The public key as a point, which the signing key already holds: nothing decompressed.
+    pub(crate) fn point(&self) -> VerifyingKey {
+        self.signing.verifying_key()
     }
 
     pub fn sign(&self, message: &[u8]) -> [u8; SIGNATURE_LEN] {

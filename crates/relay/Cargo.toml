@@ -18,6 +18,9 @@ path = "src/main.rs"
 
 [dependencies]
 axum.workspace = true
+# A thread's scheduling priority (`mlat_host`: seals and window steps yield to provisional
+# solving).
+libc.workspace = true
 serde.workspace = true
 # One program (RFC-0174 §2.1): the relay hosts the MLAT engine for its areas (`mlat_host`).
 tally-mlat.workspace = true

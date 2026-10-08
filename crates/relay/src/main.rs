@@ -1,15 +1,24 @@
 //! `tally-relay`: the relay's command line (RFC-0171 §3.6).
 
+use std::io::Write as _;
 use std::sync::Arc;
 
-use tally_relay::config::Config;
+use tally_relay::budget::HEADROOM_BYTES;
+use tally_relay::config::{Command, Config};
 use tally_relay::egress;
 use tally_relay::hub::Hub;
 use tally_relay::link;
+use tally_wire::Identity;
 use tokio::net::TcpListener;
 
+fn main() {
+    // Every panic ends the relay (`tally_relay::abort_on_any_panic`), set before any thread runs.
+    tally_relay::abort_on_any_panic();
+    serve_main();
+}
+
 #[tokio::main]
-async fn main() {
+async fn serve_main() {
     if let Err(error) = run().await {
         eprintln!("tally-relay: {error}");
         std::process::exit(1);
@@ -17,15 +26,55 @@ async fn main() {
 }
 
 async fn run() -> Result<(), String> {
-    let Some(config) = Config::from_args(std::env::args().skip(1))? else {
-        return Ok(());
-    };
-    let identities = config.identities()?;
-    eprintln!(
-        "tally-relay: upload capped at {}/s to billed peers, at most {} in 31 days",
-        egress::decimal(config.max_upload.rate()),
-        egress::decimal(config.max_upload.most_a_month())
+    match Command::from_args(std::env::args().skip(1))? {
+        Command::Done => Ok(()),
+        Command::Check(config) => check(&config),
+        Command::Run(config) => serve(config).await,
+    }
+}
+
+/// `tally-relay check`: everything a start does before it reads its keys and opens its sockets,
+/// each refusal included (`prepare`), then the memory plan on stdout, one `name value` a line.
+/// The keys are an operator's secrets, not its configuration: a throwaway key stands in for them.
+fn check(config: &Config) -> Result<(), String> {
+    let identity = Identity::generate().map_err(|error| error.to_string())?;
+    let (hub, _) = prepare(config, &identity)?;
+    let budget = hub.budget();
+    let plan = format!(
+        "memory {}\nbase {}\noversize {}\nconnections {}\nconnection-buffers {}\n\
+         per-feeder {}\nfeeders {}\nmembers {}\nper-member {}\nmember-feeders {}\n\
+         member-rate-pool {}\nmember-pool {}\nplanned {}\nheadroom {}\nlimit {}\n",
+        budget.memory(),
+        budget.base(),
+        budget.plan().oversize(),
+        budget.plan().connections,
+        budget.plan().connection_buffers(),
+        budget.per_feeder().total(),
+        budget.ceiling(),
+        budget.members(),
+        budget.plan().per_member(),
+        budget.member_feeders(),
+        budget.plan().member_rate_pool(),
+        budget.plan().member_pool(),
+        budget.planned(),
+        HEADROOM_BYTES,
+        config.memory_limit,
     );
+    let mut stdout = std::io::stdout();
+    stdout
+        .write_all(plan.as_bytes())
+        .and_then(|()| stdout.flush())
+        .map_err(|error| format!("stdout: {error}"))?;
+    // The hub's stages and the hosted engine hold threads a return would wait on.
+    std::process::exit(0)
+}
+
+/// The relay as its configuration builds it, before any socket: its hub, staged, with its budget
+/// checked and its RFC-0174 duties configured, and whether it hosts MLAT. Every refusal a start
+/// makes after reading its arguments (but for reading its keys and binding its sockets) is made
+/// here, so `check` refuses exactly what a start refuses.
+fn prepare(config: &Config, identity: &Identity) -> Result<(Arc<Hub>, bool), String> {
+    let hosts_mlat = config.relay_duties && config.mlat_threads > 0;
     let hub = Arc::new(
         Hub::new(config.max_subscribers)
             .advertising(config.hints())
@@ -33,33 +82,68 @@ async fn run() -> Result<(), String> {
             .vouching_for(config.clients.iter().copied())
             .max_connections(config.max_connections)
             .max_connections_per_address(config.max_connections_per_address)
-            .max_dedup_bytes(config.max_dedup_bytes)
             .max_feeder_bytes_per_sec(config.max_feeder_bytes_per_sec)
             .max_member_bytes_per_sec(config.max_member_bytes_per_sec)
-            .max_upload(config.max_upload),
+            .max_upload(config.max_upload)
+            .memory(config.memory, hosts_mlat)
+            // Its areas, which the member sessions are planned from (`budget::members_for`).
+            .taking(config.areas.clone())
+            // A stage short of a thread would close no epoch: the relay fails to start instead.
+            .staged(config.threads)?,
     );
-    eprintln!(
-        "tally-relay: key {} listening on {}",
-        identities[0].public(),
-        config.listen
-    );
+    // A relay whose memory cannot hold its members' pool and a feeder beside it would refuse every
+    // Hello, or its members: it refuses to start instead.
+    hub.budget().check()?;
     // RFC-0174's duties, configured once here.
     let network = hub.network();
-    network.selection.set_taken(config.areas.clone());
-    network.products.set_taken(config.areas.clone());
     network.products.set_world(config.world);
     network.products.set_world_precise(config.world_precise);
     network
         .admission
         .configure(config.network, config.relay_duties);
     network.credit.set_upload_cap(config.max_upload.rate());
-    if let Some(host) = tally_relay::mlat_host::host_for(&config, identities[0].clone(), boot_id()?)
-    {
+    let hosted =
+        match tally_relay::mlat_host::host_for(config, identity.clone(), boot_id()?, hub.budget())?
+        {
+            Some(host) => {
+                network.host_mlat(Arc::new(host));
+                true
+            }
+            None => false,
+        };
+    Ok((hub, hosted))
+}
+
+async fn serve(config: Config) -> Result<(), String> {
+    let identities = config.identities()?;
+    eprintln!(
+        "tally-relay: upload capped at {}/s to billed peers, at most {} in 31 days",
+        egress::decimal(config.max_upload.rate()),
+        egress::decimal(config.max_upload.most_a_month())
+    );
+    let (hub, hosted) = prepare(&config, &identities[0])?;
+    eprintln!(
+        "tally-relay: {} of memory admits {} feeders ({} each) beside {} member sessions ({} \
+         each, and {} for their shared rate); {} ingest and {} message threads",
+        egress::decimal(config.memory as u64),
+        hub.budget().ceiling(),
+        egress::decimal(hub.budget().per_feeder().total() as u64),
+        hub.budget().members(),
+        egress::decimal(hub.budget().plan().per_member() as u64),
+        egress::decimal(hub.budget().plan().member_rate_pool() as u64),
+        config.threads.ingest,
+        config.threads.message,
+    );
+    eprintln!(
+        "tally-relay: key {} listening on {}",
+        identities[0].public(),
+        config.listen
+    );
+    if hosted {
         eprintln!(
             "tally-relay: hosting MLAT on {} threads for the areas it is chosen to solve",
             config.mlat_threads
         );
-        network.host_mlat(Arc::new(host));
     }
     if let Some(address) = &config.beast_out {
         let listener = TcpListener::bind(address)
@@ -93,7 +177,7 @@ async fn run() -> Result<(), String> {
 
 /// A random boot id for the hosted MLAT's records, so relays tell this process's from the last.
 fn boot_id() -> Result<u64, String> {
-    let identity = tally_wire::Identity::generate().map_err(|error| error.to_string())?;
+    let identity = Identity::generate().map_err(|error| error.to_string())?;
     let bytes = identity.public();
     let mut id = [0; 8];
     id.copy_from_slice(&bytes.as_bytes()[..8]);
