@@ -14,8 +14,10 @@
 //! about 12 KB a feeder ([`PER_FEEDER_BYTES`]), 240 MB at 20,000 feeders, where holding the
 //! batches themselves for the same window would be some 8 GB. Bounded per receiver by
 //! [`ENTRIES_PER_RECEIVER`] (twice a feeder's rate over the window), so one receiver, however
-//! fast it sends, fills only its own share, and in all by [`TAGS_HELD`] (the relay's budget);
-//! past either a batch is refused whole (no tag, and never denied) and counted.
+//! fast it sends, fills only its own share, and in all by the store's gauge (the budget's
+//! `Store::Delivery`, [`Delivery::charge_to`]), which every entry is charged to before it is held
+//! and released from as it is let go, and which is the store's only bound in all; past either a
+//! batch is refused whole (no tag, and never denied) and counted.
 //!
 //! **"Not seen" is said only when it is known.** A batch is "not seen" when the relay has watched
 //! its receiver for that long and holds no entry for it: an entry is kept for every batch taken in,
@@ -45,7 +47,7 @@
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::hash::{BuildHasher, RandomState};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use tally_wire::delivery::{KEY_PERIOD_MS, TAG_WINDOW_MS};
 use tally_wire::{
@@ -54,16 +56,13 @@ use tally_wire::{
 };
 
 use crate::bounded::Bounded;
+use crate::budget::{Charge, Gauge, Store};
 use crate::selection::Selection;
 
 /// One entry a batch costs while it is held.
 pub const TAG_BYTES: usize = std::mem::size_of::<Tagged>();
 /// What one feeder costs the store: a batch a second (RFC-0181's feeder) for the window.
 pub const PER_FEEDER_BYTES: usize = TAG_BYTES * (TAG_WINDOW_MS / 1000) as usize;
-/// The most entries held in all until the relay's budget says otherwise (`Delivery::set_capacity`,
-/// its `budget::Store::Delivery` share): 8 Mi, some 28,000 feeders' windows, 320 MiB. Past the
-/// capacity a batch is refused whole and counted (`refused`).
-pub const TAGS_HELD: usize = 8 << 20;
 /// The most entries one receiver holds, over all its streams: twice a feeder's batch a second over
 /// the window, room for a burst. Past it that receiver's batch is refused whole and counted; no
 /// other receiver's is.
@@ -107,8 +106,9 @@ pub struct Delivery {
     refused: AtomicU64,
     refused_keys: AtomicU64,
     unanswered: AtomicU64,
-    /// The most entries held in all (`TAGS_HELD` until set).
-    capacity: AtomicUsize,
+    /// The store's gauge (`budget::Store::Delivery`), which each shard's entries are charged to:
+    /// unlimited until the relay charges the store to its budget (`charge_to`).
+    gauge: Mutex<std::sync::Arc<Gauge>>,
     /// Each session's allowance of queries: (left, as of when).
     sessions: Mutex<Bounded<u64, (u32, u64)>>,
 }
@@ -119,7 +119,6 @@ impl Default for Delivery {
     }
 }
 
-#[derive(Default)]
 struct Shard {
     /// The receivers watched: those of the relay's areas that fed it, while a stream of theirs is
     /// remembered.
@@ -130,6 +129,22 @@ struct Shard {
     /// Streams holding none, by their last arrival: the order they are forgotten in.
     idle: BTreeSet<(u64, StreamKey)>,
     entries: usize,
+    /// Its entries' bytes (`TAG_BYTES` each), charged to the store's gauge before an entry is
+    /// held and released as one is let go: `entries * TAG_BYTES`, always.
+    held: Charge,
+}
+
+impl Shard {
+    fn new(gauge: &std::sync::Arc<Gauge>) -> Self {
+        Self {
+            receivers: HashMap::new(),
+            streams: HashMap::new(),
+            active: BTreeSet::new(),
+            idle: BTreeSet::new(),
+            entries: 0,
+            held: gauge.empty(),
+        }
+    }
 }
 
 /// One receiver watched.
@@ -194,9 +209,12 @@ enum Said {
 
 impl Delivery {
     pub fn new() -> Self {
+        let gauge = Gauge::unlimited(Store::Delivery);
         Self {
-            shards: (0..SHARDS).map(|_| Mutex::default()).collect(),
-            capacity: AtomicUsize::new(TAGS_HELD),
+            shards: (0..SHARDS)
+                .map(|_| Mutex::new(Shard::new(&gauge)))
+                .collect(),
+            gauge: Mutex::new(gauge),
             placement: RandomState::new(),
             refused: AtomicU64::new(0),
             refused_keys: AtomicU64::new(0),
@@ -229,21 +247,30 @@ impl Delivery {
         );
     }
 
-    /// The most bytes of entries held in all: the relay's budget for the store. Past it a batch is
-    /// refused whole, counted.
-    pub fn set_capacity(&self, bytes: usize) {
-        self.capacity
-            .store((bytes / TAG_BYTES).max(SHARDS), Ordering::Release);
+    /// The store's entries are charged to `gauge` (the budget's `Store::Delivery`) from now on: its
+    /// limit, the store's share of the budget, is its only bound in all. Past it a batch is refused
+    /// whole, counted. What a shard holds now is moved to it, or let go if it cannot take it.
+    pub fn charge_to(&self, gauge: std::sync::Arc<Gauge>) {
+        if let Ok(mut held) = self.gauge.lock() {
+            if std::sync::Arc::ptr_eq(&held, &gauge) {
+                return;
+            }
+            *held = std::sync::Arc::clone(&gauge);
+        }
+        for shard in self.shards.iter() {
+            if let Ok(mut shard) = shard.lock() {
+                shard.charge_to(&gauge);
+            }
+        }
     }
 
     /// `hold` of a batch of a receiver of the relay's areas, named by its receiver,
     /// (boot, sequence) and signed bytes.
     fn hold_bytes(&self, receiver: PublicKey, name: (u64, u64), bytes: &[u8], now_ms: u64) {
-        let bound = self.capacity.load(Ordering::Acquire) / SHARDS;
         let Some(mut shard) = self.shard(&receiver) else {
             return;
         };
-        if !shard.hold(receiver, name, bytes, bound, now_ms) {
+        if !shard.hold(receiver, name, bytes, now_ms) {
             self.refused.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -341,6 +368,18 @@ impl Delivery {
         self.tags() * TAG_BYTES
     }
 
+    /// The bytes of every entry the streams hold, counted afresh: what the gauge must read.
+    #[cfg(test)]
+    fn counted_bytes(&self) -> usize {
+        self.each(|shard| {
+            shard
+                .streams
+                .values()
+                .map(|stream| stream.entries.len())
+                .sum::<usize>()
+        }) * TAG_BYTES
+    }
+
     /// Streams remembered now.
     pub fn streams(&self) -> usize {
         self.each(|shard| shard.streams.len())
@@ -380,13 +419,25 @@ impl Delivery {
 }
 
 impl Shard {
-    /// False when the batch was refused past a bound.
+    /// Its entries charged to `gauge` from now on: moved there, or every stream forgotten early if
+    /// the gauge cannot take them.
+    fn charge_to(&mut self, gauge: &std::sync::Arc<Gauge>) {
+        let mut moved = gauge.empty();
+        if !moved.try_grow(self.held.bytes()) {
+            let keys: Vec<StreamKey> = self.streams.keys().copied().collect();
+            for key in keys {
+                self.forget_stream(key, true);
+            }
+        }
+        self.held = moved;
+    }
+
+    /// False when the batch was refused past a bound: its receiver's share, or the store's gauge.
     fn hold(
         &mut self,
         receiver: PublicKey,
         (boot_id, sequence): (u64, u64),
         bytes: &[u8],
-        bound: usize,
         now_ms: u64,
     ) -> bool {
         self.let_go(now_ms);
@@ -428,22 +479,24 @@ impl Shard {
         let was_active = before.is_some() && !stream.entries.is_empty();
         let freed = age(stream, now_ms);
         self.freed(receiver, freed);
-        let mut full = self.entries >= bound;
-        if full {
+        if !self.held.fits(TAG_BYTES) {
             // Room the window would have made in the other streams is made before refusing.
             for (other, freed) in age_all(&mut self.streams, &self.active, now_ms) {
                 self.freed(other, freed);
             }
-            full = self.entries >= bound;
         }
         let over_quota = self
             .receivers
             .get(&receiver)
             .is_some_and(|record| record.entries >= ENTRIES_PER_RECEIVER);
+        // Charged before it is held: past the store's share it is refused whole.
+        let refused = over_quota || !self.held.try_grow(TAG_BYTES);
         let Some(stream) = self.streams.get_mut(&key) else {
+            if !refused {
+                self.held.shrink_to(self.entries * TAG_BYTES);
+            }
             return true;
         };
-        let refused = full || over_quota;
         if refused {
             // Refused whole: it has no entry, so it must never be said "not seen".
             stream.horizon = stream.horizon.max(sequence.saturating_add(1));
@@ -494,9 +547,10 @@ impl Shard {
         !refused
     }
 
-    /// `freed` of `receiver`'s entries were let go.
+    /// `freed` of `receiver`'s entries were let go, and their bytes released.
     fn freed(&mut self, receiver: PublicKey, freed: usize) {
         self.entries -= freed;
+        self.held.shrink_to(self.entries * TAG_BYTES);
         if let Some(record) = self.receivers.get_mut(&receiver) {
             record.entries = record.entries.saturating_sub(freed);
         }
@@ -1297,9 +1351,9 @@ mod tests {
     fn past_the_relays_bound_a_batch_is_refused_whole_counted_and_never_denied() -> Result {
         let relay = Relay::new()?;
         // Room for a receiver's share in each shard, and no more.
-        relay
-            .delivery
-            .set_capacity(SHARDS * ENTRIES_PER_RECEIVER * TAG_BYTES);
+        let limit = SHARDS * ENTRIES_PER_RECEIVER * TAG_BYTES;
+        let gauge = Gauge::new(Store::Delivery, limit);
+        relay.delivery.charge_to(std::sync::Arc::clone(&gauge));
         let feeders: Vec<Identity> = (0..4 * SHARDS as u64)
             .map(|index| {
                 let mut seed = [0x33; 32];
@@ -1312,8 +1366,18 @@ mod tests {
                 relay.hold(&unsigned(&feeder.public(), 0, sequence, 0)?, T0);
             }
         }
+        // Driven to its limit, the gauge is what the streams hold, entry by entry, and full.
         assert!(relay.delivery.refused() > 0);
-        assert!(relay.delivery.tags() <= SHARDS * ENTRIES_PER_RECEIVER);
+        assert!(gauge.refused() > 0);
+        assert_eq!(gauge.held(), relay.delivery.counted_bytes());
+        assert_eq!(gauge.held(), relay.delivery.held_bytes());
+        assert!(gauge.held() <= limit && limit - gauge.held() < TAG_BYTES);
+        // Let go past the window, the entries' bytes are released with them.
+        relay.hold(
+            &unsigned(&feeders[0].public(), 0, ENTRIES_PER_RECEIVER as u64, 0)?,
+            T0 + 2 * TAG_WINDOW_MS,
+        );
+        assert_eq!(gauge.held(), relay.delivery.counted_bytes());
         // A refused batch is not denied, whichever feeder's it was.
         let content = relay.ask(
             &query(&feeders[0], 0, 0, ENTRIES_PER_RECEIVER as u64 - 1),
@@ -1334,7 +1398,7 @@ mod tests {
     /// streams, and every stream the shard did keep, still are.
     #[test]
     fn streams_are_bounded_over_many_feeders_and_one_forgotten_early_is_not_denied() {
-        let mut shard = Shard::default();
+        let mut shard = Shard::new(&Gauge::unlimited(Store::Delivery));
         let bound = STREAMS_REMEMBERED / SHARDS;
         let feeders: Vec<PublicKey> = (0..2 * bound as u64)
             .map(|index| {
@@ -1345,7 +1409,7 @@ mod tests {
             .collect();
         // Each feeder's first batch in the order they came, a moment apart.
         for (feeder, at) in feeders.iter().zip(0_u64..) {
-            assert!(shard.hold(*feeder, (1, 1), feeder.as_bytes(), usize::MAX, T0 + at));
+            assert!(shard.hold(*feeder, (1, 1), feeder.as_bytes(), T0 + at));
         }
         assert_eq!(shard.streams.len(), bound);
         assert!(shard.receivers.len() <= bound);

@@ -140,15 +140,14 @@ impl Network {
         }
     }
 
-    /// Every duty's store sized to its share of `budget` (`budget::Store`): the one batch byte
-    /// store (sharing), the delivery tags, and what the products hold. Called again when the budget
-    /// is resized; the gauges are the budget's own, so whoever holds one sees the new limit.
+    /// Every duty's store charged to its gauge of `budget` (`budget::Store`), the gauge's limit its
+    /// share and its only bound: the one batch byte store (sharing), the delivery tags, and what
+    /// the products hold. Called again when the budget is resized; the gauges are the budget's own
+    /// for its life, so whoever holds one sees the new limit.
     pub fn charge_to(&self, budget: &crate::budget::Budget) {
         use crate::budget::Store;
-        self.sharing
-            .set_held_capacity(budget.store_bytes(Store::Batches));
-        self.delivery
-            .set_capacity(budget.store_bytes(Store::Delivery));
+        self.sharing.charge_to(budget.gauge(Store::Batches));
+        self.delivery.charge_to(budget.gauge(Store::Delivery));
         self.products.charge_to(budget.gauge(Store::Products));
     }
 

@@ -6,9 +6,11 @@
 //! another relay's data comes in (a relay whose offer this one verified dialling it, or this relay's
 //! own one-hop raw link): the members together are planned once, as the feeders their one shared
 //! rate is worth, and each member session carves its ingest allowance from a pool sized at start
-//! for every member session the protocol lets this relay's areas bring ([`members_for`],
-//! [`Plan::with_members`], [`Budget::reserve_member`]): feeders can never take the room members
-//! were planned, and a member is never refused because feeders came first. The feeder ceiling is
+//! for every member session the protocol lets this relay's areas bring, at most its connections
+//! ([`members_for`], [`Plan::with_members`], [`Budget::reserve_member`]): feeders can never take
+//! the room members were planned, and a member is never refused because feeders came first. Past
+//! the sessions planned a member is turned away as full (`Reason::Full`), and the relay it was
+//! routes around this one (RFC-0174 §2.5). The feeder ceiling is
 //! what the relay's budget holds of a feeder's cost after its own base ([`Plan::base`]:
 //! [`BASE_BYTES`], and [`MLAT_BASE_BYTES`] more when it hosts MLAT) and the members' pool. The
 //! budget is `--memory`, by default the memory the relay runs in ([`memory_available`]: the lesser
@@ -43,7 +45,8 @@ use tokio::sync::Notify;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Store {
-    /// The one batch byte store, over the sharing repair horizon.
+    /// The one batch byte store, over the sharing repair horizon: the records the sharing groups
+    /// hold, their parities, and the parities being reassembled (`sharing`).
     Batches,
     /// MLAT's sealed raw (`Held`'s sealed bins), shared by the engine and standing.
     Held,
@@ -170,8 +173,14 @@ impl PerFeeder {
         // reception referenced (`tally_wire::Decoded::footprint`).
         let decoded = bytes + receptions * DECODED_BYTES_PER_RECEPTION;
         Self {
-            // The one batch byte store, over the sharing repair horizon.
-            batches: bytes * crate::sharing::member::HORIZON_SECONDS as usize,
+            // The one batch byte store, over the sharing repair horizon: the records, and their
+            // parities, which the groups hold as long and charge to the same gauge. A parity is
+            // as long as its manifest's longest stripe slice: a third of its records in a busy
+            // area, all of them in one with a record a second (measured 2026-10-08, 5,000
+            // feeders: parities 0.72 of the records), so it is planned at the most it can be,
+            // its records' bytes and its own overhead (`sharing::parity::OVERHEAD`) a second.
+            batches: (2 * bytes + crate::sharing::parity::OVERHEAD)
+                * crate::sharing::member::HORIZON_SECONDS as usize,
             // MLAT's sealed raw (`Held`): the sealed bins a holder keeps, at the rates measured
             // (`held::Rates::MEASURED`).
             held: if holds_raw {
@@ -385,9 +394,14 @@ impl Plan {
     }
 }
 
-/// The member sessions a relay taking `areas` must hold so that it never turns a link the protocol
-/// allows away (RFC-0174 §2.3, §2.5, §2.6), at most `connections` (every session in or out holds a
-/// place under the connection cap, `Hub::connection`, `Hub::dialled`):
+/// The member sessions a relay taking `areas` plans (RFC-0174 §2.3, §2.5, §2.6): every one the
+/// protocol lets its areas bring, at most `connections` (every session in or out holds a place
+/// under the connection cap, `Hub::connection`, `Hub::dialled`). The protocol bounds a relay's
+/// members by its plan, not the plan by the protocol: a relay taking coarse areas may share groups
+/// with more relays than it can hold (122 base cells, up to `OFFERS_HELD`), and past its plan it
+/// turns a member away with `Reason::Full` (`link::admit_member`), which the relay turned away
+/// routes around, to the next members of the area's trees (`peers`, `sharing::member`). So a
+/// member past the plan costs the area nothing but a hop. The sessions it plans:
 ///
 /// - **Who shares an area with it.** An area's sharing groups are the relays whose live offers
 ///   cover it: offers for the area's cell and for each of its ancestors (`Directory::offers_for`),
@@ -667,6 +681,13 @@ impl Charge {
 
     pub fn bytes(&self) -> usize {
         self.bytes
+    }
+
+    /// Whether `bytes` more would fit on its gauge now (a charge of nothing fits only nothing).
+    pub fn fits(&self, bytes: usize) -> bool {
+        self.gauge
+            .as_ref()
+            .map_or(bytes == 0, |gauge| gauge.fits(bytes))
     }
 
     /// `bytes` more on the same gauge, if they fit (a charge of nothing never grows): false,

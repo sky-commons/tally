@@ -315,6 +315,23 @@ positions; clock models): the relays that take that area.
   only from a member of the group, at most 8 per origin per second, and none for a second more
   than 60 s ahead of the reader's clock. A parity is checked against its manifest when used; a
   false one is dropped and a later one taken.
+- **A relay's members are bounded** (as built, 2026-10-08). A relay holds at most the member
+  sessions (sessions that bring another relay's data in: a member's link sending it what its
+  groups address it, and its own one-hop raw links) its memory plan admits: every one its areas
+  could bring, at most its connection cap (RFC-0181 §9). Nothing bounds how many relays share a
+  group with one taking coarse areas (the 122 base cells reach every offer held, up to 16,384), so
+  past its plan it turns a member's link away with a `Goodbye` of reason `Full`, the reason a full
+  relay already gives a feeder; no new reason, so no reader needs a new version. The relay turned
+  away takes it as "this provider is full" for every area and product it sends that member, never
+  as a fault: for the wait the `Goodbye` names (60 s), doubled each time it is turned away again
+  within the wait after the last (at most 30 minutes), it neither dials that member nor addresses
+  it, and what the trees would have had it send that member goes to the next members by the trees'
+  own order instead: down a stripe, to the full member's children there (and in place of one full
+  too, to its children); a manifest, to those beneath it in every stripe; what was for it alone (a
+  receipt, a have-summary, an ask) nowhere. The trees are not changed, so every relay still lays
+  out the same ones and the area's data still reaches every member but the full one, which repairs
+  what it lacks once it has room. A relay hosting MLAT takes a raw link's place in its own pool
+  before it dials it, so it never dials a link it would turn away itself.
 - **Relay links carry the directory; data moves over member links** (as built). A relay links to
   another relay in two ways. A directory link (`--upstream` dials one, `--accept-relay` lets a key
   dial in) carries the directory and nothing else: signed offers and queries, echoes, delivery
@@ -371,7 +388,10 @@ trust: a bundle is checked record by record exactly as its cells would be.
 - An offer is a hint, never a promise. A reader tries several providers, keeps those that deliver
   valid, fresh, complete data for the cell (the same accounting as §2.5), and drops the rest on its
   own authority. A provider is ranked by what it delivered to this reader, never by what it
-  claims.
+  claims. A provider that turns a relay away as full (`Goodbye` `Full`: it holds every member it
+  plans, §2.5) is skipped for that relay for the wait it names, doubled on each refusal after, and
+  the next provider by the same order takes its place; it is not demoted for it, and it is tried
+  again once the wait has passed.
 
 ### §2.7 Blocked aircraft (LADD and PIA) are the displayer's duty
 

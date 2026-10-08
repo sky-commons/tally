@@ -243,7 +243,11 @@ impl Streams {
 pub enum Reason {
     /// No version in the initiator's range.
     Version,
-    /// The relay is at capacity.
+    /// The relay is at capacity: to a feeder or a subscriber, it holds every one it admits; to a
+    /// relay whose link brings it data (a sharing member's, RFC-0174 §2.5), it holds every member
+    /// session its plan admits. A relay told so takes the sender as a full provider: it routes
+    /// what it would have sent it to the next members of that area's trees, and does not dial it
+    /// again until the wait it was given has passed, doubled on each refusal that follows.
     Full,
     /// The relay is shutting down or retiring.
     Leaving,

@@ -18,6 +18,12 @@ use super::stripes::{DATA_STRIPES, data_stripe, domain_block};
 
 const PARITY: &[u8] = b"tally sharing parity";
 
+/// What a parity is beside its XOR: the manifest's hash, the second, the stripes' lengths. Its XOR
+/// is as long as its longest slice, never longer than the records it covers, so the parities of a
+/// second's records hold at most those records' bytes and this for each (the budget plans that,
+/// `budget::PerFeeder::planned`).
+pub const OVERHEAD: usize = 32 + 8 + 1 + 8 + 4 * DATA_STRIPES as usize;
+
 /// The parity of one origin manifest's records.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Parity {
@@ -108,7 +114,7 @@ impl Parity {
 
     /// Its size on the wire, near enough, for accounting.
     pub fn len(&self) -> usize {
-        32 + 8 + 1 + 8 + 4 * usize::from(DATA_STRIPES) + self.xor.len()
+        OVERHEAD + self.xor.len()
     }
 
     pub fn is_empty(&self) -> bool {

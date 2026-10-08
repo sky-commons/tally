@@ -71,6 +71,10 @@ const REFUSED_RETRY_SECS: u32 = 86_400;
 const UNVERIFIED_RETRY_SECS: u32 = (crate::directory::OWN_RESIGN_EVERY_MS / 1000) as u32;
 /// How long a connection that sent more than its ingest ceiling is asked to stay away.
 const OVER_CEILING_RETRY_SECS: u32 = 60;
+/// How long a relay turned away because every member session the plan admits is held is asked to
+/// stay away (`Reason::Full`): it routes what it would have sent this relay to the next members of
+/// its trees meanwhile, and doubles the wait each time it is turned away again (`peers`).
+const MEMBERS_FULL_RETRY_SECS: u32 = 60;
 /// The longest a goodbye is given to reach a peer before the link is dropped anyway.
 const FAREWELL_TIMEOUT: Duration = Duration::from_secs(5);
 /// After a goodbye, the longest the relay keeps reading (and dropping) what the peer still sends
@@ -317,8 +321,28 @@ enum End {
     },
     /// Closed without a word: the peer broke a rule it cannot have broken by accident.
     Closed(String),
-    /// Another relay said goodbye (or "leave me"), asking for this long before the next try.
-    Departed { retry_after_secs: u32 },
+    /// Another relay said goodbye (or "leave me"), asking for this long before the next try, and
+    /// whether it said it is full (`Reason::Full`).
+    Departed(Away),
+}
+
+/// Why a relay this one dialled ended the session with a word: how long it asked to be left, and
+/// whether it said it is full (`Reason::Full`: for a relay sending it data, it holds every member
+/// session its plan admits, RFC-0174 §2.5), which the dialler takes as "this provider is full" and
+/// routes around (`peers::Peers::refused_full`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Away {
+    pub wait: Duration,
+    pub full: bool,
+}
+
+impl Away {
+    fn of(reason: Reason, retry_after_secs: u32) -> Self {
+        Self {
+            wait: Duration::from_secs(retry_after_secs.into()),
+            full: reason == Reason::Full,
+        }
+    }
 }
 
 impl From<String> for End {
@@ -389,8 +413,8 @@ where
             why
         }
         End::Closed(why) => why,
-        End::Departed { retry_after_secs } => {
-            format!("the relay left, asking for {retry_after_secs} s")
+        End::Departed(away) => {
+            format!("the relay left, asking for {} s", away.wait.as_secs())
         }
     }
 }
@@ -718,7 +742,7 @@ impl Redial {
     async fn after(
         &mut self,
         started: tokio::time::Instant,
-        outcome: Result<Option<Duration>, String>,
+        outcome: Result<Option<Away>, String>,
         who: &str,
     ) {
         if started.elapsed() >= HEALTHY_LINK {
@@ -726,7 +750,7 @@ impl Redial {
         }
         match outcome {
             Ok(None) => {}
-            Ok(Some(wait)) => {
+            Ok(Some(Away { wait, .. })) => {
                 let wait = wait.min(PEER_WAITS_AT_MOST);
                 eprintln!(
                     "tally-relay: {who} asked this relay to stay away {} s",
@@ -740,12 +764,14 @@ impl Redial {
     }
 }
 
-/// A session's refusal by the peer at its handshake, as the wait it asked for.
-fn refused(error: tally_wire::WireError) -> Result<Option<Duration>, String> {
+/// A session's refusal by the peer at its handshake, as the wait it asked for and whether it said
+/// it is full.
+fn refused(error: tally_wire::WireError) -> Result<Option<Away>, String> {
     match error {
         tally_wire::WireError::Refused {
-            retry_after_secs, ..
-        } => Ok(Some(Duration::from_secs(retry_after_secs.into()))),
+            reason,
+            retry_after_secs,
+        } => Ok(Some(Away::of(reason, retry_after_secs))),
         error => Err(error.to_string()),
     }
 }
@@ -765,7 +791,7 @@ async fn upstream_once(
     upstream: &Upstream,
     identity: &Identity,
     hub: &Arc<Hub>,
-) -> Result<Option<Duration>, String> {
+) -> Result<Option<Away>, String> {
     // A place under the connection cap, as every session holds (`Hub::dialled`).
     let _slot = hub
         .dialled()
@@ -843,6 +869,11 @@ fn live_offers(hub: &Hub) -> Vec<Arc<Record>> {
 /// raw an MLAT area here needs, as an engine subscribing `first` (a region-cut raw `Subscribe`).
 /// What the far relay sends back is taken as a member's: anyone's signed records, published here.
 /// Ends when `outgoing` closes; a failed or refused session is dialled again as `Redial` says.
+///
+/// A sharing member that turns the link away as full (`Reason::Full`, RFC-0174 §2.5) ends it: it
+/// is this provider that is full, so the relay routes what it would have sent it to the next
+/// members of its trees for as long as it asked, doubled on each refusal after
+/// (`peers::Peers::refused_full`), and dials it again only once sharing addresses it again.
 pub async fn member(
     relay: RelayAddress,
     identity: Identity,
@@ -856,6 +887,21 @@ pub async fn member(
     while !outgoing.is_closed() {
         let started = redial.dialling();
         let outcome = member_once(&relay, &identity, role, &first, &hub, &mut outgoing).await;
+        if role == Role::Relay
+            && let Ok(Some(away)) = outcome
+            && away.full
+        {
+            let peers = &hub.network().peers;
+            peers.refused_full(relay.key, away.wait, crate::network::wall_ms());
+            let routed = peers
+                .full_for(&relay.key, crate::network::wall_ms())
+                .unwrap_or(away.wait);
+            eprintln!(
+                "tally-relay: {who} is full: routing around it for {} s",
+                routed.as_secs()
+            );
+            return;
+        }
         redial.after(started, outcome, &who).await;
     }
 }
@@ -867,11 +913,23 @@ async fn member_once(
     first: &[Record],
     hub: &Arc<Hub>,
     outgoing: &mut mpsc::Receiver<Vec<Record>>,
-) -> Result<Option<Duration>, String> {
+) -> Result<Option<Away>, String> {
     // A place under the connection cap, as every session holds (`Hub::dialled`).
     let _slot = hub
         .dialled()
         .ok_or_else(|| "no connection slot to dial with (--max-connections)".to_owned())?;
+    // A raw link brings another relay's raw in, so it is a member session: its place in the
+    // members' pool is taken before it is dialled, never once data comes, so this relay never
+    // dials a link it would then turn away itself. A member link this relay dialled only sends
+    // (what the member sends it comes over its own dial), and takes none.
+    let admitted = if role == Role::Engine {
+        admit_member(hub).map_err(|end| match end {
+            End::Told { why, .. } | End::Closed(why) => why,
+            End::Departed(_) => "turned away".to_owned(),
+        })?
+    } else {
+        Admitted::default()
+    };
     let stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(&relay.address))
         .await
         .map_err(|_| "connect timed out".to_owned())?
@@ -899,12 +957,7 @@ async fn member_once(
             subscribe: None,
             described: None,
             refusal: None,
-            // A raw link brings another relay's raw in, so it is a member session; a member link
-            // this relay dialled only sends (what the member sends it comes over its own dial).
-            admitted: Admitted {
-                joins: role == Role::Engine,
-                ..Admitted::default()
-            },
+            admitted,
             ceiling: None,
             asker: Asker {
                 role: AskerRole::Relay,
@@ -984,7 +1037,7 @@ async fn exchange<S>(
     peer: Peer,
     link: &Arc<Link>,
     serving: Serving<'_>,
-) -> Result<Option<Duration>, String>
+) -> Result<Option<Away>, String>
 where
     S: AsyncRead + AsyncWrite + Send,
 {
@@ -1012,9 +1065,7 @@ where
         match read_loop(reader, hub, source, peer, reading, described, ceiling).await {
             Ok(()) => Ok(None),
             Err(End::Closed(why)) => Err(why),
-            Err(End::Departed { retry_after_secs }) => {
-                Ok(Some(Duration::from_secs(retry_after_secs.into())))
-            }
+            Err(End::Departed(away)) => Ok(Some(away)),
             Err(End::Told {
                 reason,
                 retry_after_secs,
@@ -1137,16 +1188,17 @@ impl Admitted {
 }
 
 /// A member session's admission: its own bytes (its ingest allowance) reserved from the members'
-/// pool, sized at start for every member session the relay's areas bring (`budget::members_for`),
-/// its allowance carved, and the members' shared pace. Turned away, counted, when the pool is full,
-/// which a relay planned from its areas meets only past what the protocol allows them.
+/// pool, sized at start for the member sessions the relay's plan admits (`budget::members_for`),
+/// its allowance carved, and the members' shared pace. Past them it is turned away, counted, with
+/// `Reason::Full` (RFC-0174 §2.5, "A relay's members are bounded"): the relay that dialled routes
+/// around this one, to the next members of its trees, for the wait it is given.
 fn admit_member(hub: &Hub) -> Result<Admitted, End> {
     let budget = hub.budget();
     let refused = |why: String| {
         hub.member_refused();
         End::Told {
             reason: Reason::Full,
-            retry_after_secs: OVER_CEILING_RETRY_SECS,
+            retry_after_secs: MEMBERS_FULL_RETRY_SECS,
             why,
         }
     };
@@ -1424,15 +1476,18 @@ fn ingest(
                 subscribe.send_replace(allowed);
             }
         }
-        // A relay this one links to leaves or refuses it, saying when to come back; the dial loop
-        // of a link this relay dialled (`redial`) honours it.
+        // A relay this one links to leaves or refuses it, saying when to come back and whether it
+        // is full; the dial loop of a link this relay dialled (`member`, `Redial`) acts on it.
         Record::Goodbye {
-            retry_after_secs, ..
+            reason,
+            retry_after_secs,
+        } if matches!(peer, Peer::Relay | Peer::Member) => {
+            return Err(End::Departed(Away::of(reason, retry_after_secs)).into());
         }
-        | Record::Redirect {
+        Record::Redirect {
             retry_after_secs, ..
         } if matches!(peer, Peer::Relay | Peer::Member) => {
-            return Err(End::Departed { retry_after_secs }.into());
+            return Err(End::Departed(Away::of(Reason::Leaving, retry_after_secs)).into());
         }
         // RFC-0174's records are the network duties' (`network`), whoever sent them.
         record @ (Record::Echo(_)
@@ -2199,7 +2254,9 @@ mod tests {
             address,
             key: parent_key,
         };
-        let asked = upstream_once(&upstream, &child, &Arc::new(Hub::new(8))).await?;
+        let asked = upstream_once(&upstream, &child, &Arc::new(Hub::new(8)))
+            .await?
+            .map(|away| away.wait);
         // Neither accepted nor verified: asked to wait one re-signing of its offers, by when its
         // offer would have been verified if it is going to be.
         assert_eq!(
@@ -2223,7 +2280,15 @@ mod tests {
                 .map_err(text)?;
             let address = listener.local_addr().map_err(text)?.to_string();
             tokio::spawn(crate::serve(listener, vec![far], Arc::new(Hub::new(8))));
-            let hub = Arc::new(Hub::new(8));
+            // A relay taking an area, so a raw link has its place in the members' pool.
+            let area = tally_wire::rendezvous::area_of(&tally_wire::Location {
+                lat_e7: 337_490_000,
+                lon_e7: -843_880_000,
+                alt_m: 0,
+                precision_m: 0,
+            })
+            .map_err(text)?;
+            let hub = Arc::new(Hub::new(8).taking(vec![area]));
             let (_sender, outgoing) = mpsc::channel(1);
             let subscribe = Record::Subscribe {
                 streams: Streams::RAW,
@@ -2319,7 +2384,14 @@ mod tests {
             key: parent_key,
         };
         let asked = upstream_once(&upstream, &child, &Arc::new(Hub::new(8))).await?;
-        assert_eq!(asked, Some(Duration::from_secs(77)));
+        // And that it said it is full, which a dialler of data routes around.
+        assert_eq!(
+            asked,
+            Some(Away {
+                wait: Duration::from_secs(77),
+                full: true
+            })
+        );
         Ok(())
     }
 
@@ -3138,7 +3210,9 @@ mod tests {
             address,
             key: parent_key,
         };
-        let asked = upstream_once(&upstream, &Identity::generate().map_err(text)?, &child).await?;
+        let asked = upstream_once(&upstream, &Identity::generate().map_err(text)?, &child)
+            .await?
+            .map(|away| away.wait);
         assert_eq!(asked, Some(Duration::from_secs(1)));
         let read = parent_read.await.map_err(text)??;
         assert!(read > 0);

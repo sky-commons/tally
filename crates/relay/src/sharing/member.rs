@@ -23,6 +23,13 @@
 //!   its parent (or, for a seed, each origin) delivered of what the manifests list, and sends it to
 //!   the deliverer: the evidence of the deliverer's credit. One short of what was owed is also a
 //!   report: it floods to the group.
+//! - **Full members.** A member that turned this relay's link away because it holds every member
+//!   session its plan admits (`Reason::Full`, `peers`) is routed around while it is full: what
+//!   this relay would send it down a stripe goes instead to the next members of that stripe's tree
+//!   beneath it (its children, and theirs where they are full too), a manifest to them in every
+//!   stripe, and what was for it alone (a receipt, a have-summary, an ask) nowhere. The trees are
+//!   not changed: every relay still lays out the same ones, and the full member's children are fed
+//!   past it by whoever would have fed it.
 //! - **Demotion.** When most of a member's children in a stripe report it short for the same
 //!   window, and it did not itself report being starved then, every member drops it from the
 //!   trees for `groups::DEMOTION_MS`. Windows in which the trees changed (membership, or a seed
@@ -48,6 +55,7 @@ use tally_wire::{
     Record, StripeAssignment, StripeReceipt, StripeReceiptContent,
 };
 
+use crate::budget::{Charge, Gauge};
 use crate::directory::CLOCK_SKEW_MS;
 
 use super::groups::{DEMOTION_MS, GroupKey};
@@ -83,14 +91,6 @@ pub const JUDGE_AFTER_MS: u64 = 2_000;
 pub const HORIZON_MS: u64 =
     RECEIPT_WINDOW_SECONDS * 1000 + RECEIPT_GRACE_MS + JUDGE_AFTER_MS + REPAIR_AFTER_MS;
 pub const HORIZON_SECONDS: u64 = HORIZON_MS.div_ceil(1000);
-/// What the records of `bytes_per_second` of inflow cost held for the horizon: a member's capacity
-/// is sized by time, from the rate its relay admits (`Member::set_capacity`).
-pub const fn held_bytes_for(bytes_per_second: u64) -> usize {
-    (bytes_per_second * HORIZON_SECONDS) as usize
-}
-/// The inflow a member is sized for until its relay says otherwise: RFC-0181's 20,000 feeders at
-/// 8 KiB a second each.
-pub const DEFAULT_BYTES_PER_SECOND: u64 = 20_000 * 8 * 1024;
 /// The most bytes one answer to a `HaveSummary` carries.
 pub const REPAIR_PAGE_BYTES: usize = 256 * 1024;
 /// The least time between two answers to one member's `HaveSummary`s.
@@ -318,7 +318,8 @@ pub struct Stats {
     pub repaired: u64,
     /// Copies of a record already held.
     pub duplicates: u64,
-    /// Records refused whole because holding them would pass the member's capacity.
+    /// Records and parities refused whole because holding them would pass the store's share of
+    /// the budget (its gauge, `budget::Store::Batches`).
     pub refused: u64,
     /// Receipts signed, and those that reported a shortfall.
     pub receipts: u64,
@@ -356,7 +357,8 @@ struct Group {
     /// When the trees last changed, newest last.
     changed_ms: Vec<u64>,
     pieces: BTreeMap<Hash, Held>,
-    /// The encoded bytes of `pieces`, kept as they change.
+    /// The bytes it holds, kept as they change: the encoded bytes of `pieces` and the bytes of
+    /// `parity` (`Parity::len`), each charged to the member's gauge before it is held.
     bytes: usize,
     /// By second, then by the manifest's hash.
     manifests: BTreeMap<u64, BTreeMap<Hash, Listed>>,
@@ -429,6 +431,36 @@ impl Group {
             .place(stripe, epoch_of(now_ms / 1000), me)
             .map(|place| place.children)
             .unwrap_or_default()
+    }
+
+    /// The members beneath `key` in `stripe`'s tree that take its place for what this relay sends
+    /// while it is full: its children, and in place of each that is full too, that one's, never
+    /// this relay itself.
+    fn beneath(
+        &self,
+        stripe: u8,
+        key: &PublicKey,
+        (full, me): (&BTreeSet<PublicKey>, &PublicKey),
+        now_ms: u64,
+        out: &mut BTreeSet<PublicKey>,
+    ) {
+        let epoch = epoch_of(now_ms / 1000);
+        let mut next = vec![*key];
+        while let Some(at) = next.pop() {
+            let Some(place) = self.layout.place(stripe, epoch, &at) else {
+                continue;
+            };
+            for child in place.children {
+                if child == *me || out.contains(&child) {
+                    continue;
+                }
+                if full.contains(&child) {
+                    next.push(child);
+                } else {
+                    out.insert(child);
+                }
+            }
+        }
     }
 
     /// Every member this one shares a tree edge with, in any stripe.
@@ -514,12 +546,23 @@ impl Group {
         })
     }
 
-    /// Holds a piece, counting its bytes. The bytes it adds.
-    fn hold(&mut self, hash: Hash, piece: Piece, at_ms: u64, from: Vec<(PublicKey, u64)>) -> usize {
-        let len = piece.len();
-        self.bytes += len;
+    /// Holds a piece, counting its bytes, which its caller has charged (`Member::charge`).
+    fn hold(&mut self, hash: Hash, piece: Piece, at_ms: u64, from: Vec<(PublicKey, u64)>) {
+        self.bytes += piece.len();
         self.pieces.insert(hash, Held { piece, at_ms, from });
-        len
+    }
+
+    /// Holds a parity, counting its bytes, which its caller has charged.
+    fn hold_parity(&mut self, held: HeldParity) {
+        self.bytes += held.parity.len();
+        self.parity.insert(held.parity.id(), held);
+    }
+
+    /// Lets a parity go. The bytes it let go.
+    fn drop_parity(&mut self, id: &Hash) -> usize {
+        let freed = self.parity.remove(id).map_or(0, |held| held.parity.len());
+        self.bytes -= freed;
+        freed
     }
 
     /// Whether it holds anything within the horizon: then every tick has duties for it
@@ -584,44 +627,139 @@ pub struct Member {
     groups: BTreeMap<GroupKey, Group>,
     /// The held groups by when the tick next visits them.
     due: BTreeSet<(u64, GroupKey)>,
-    /// Record bytes held across the groups, kept as they change.
-    bytes: usize,
+    /// What the groups hold together (their records and parities), charged to the one batch byte
+    /// store's gauge (`budget::Store::Batches`) before it is held and released as it is let go: the
+    /// store's only bound. A record or parity the gauge cannot take is refused whole, counted
+    /// (`Stats::refused`).
+    held: Charge,
+    gauge: Arc<Gauge>,
+    /// The members that turned this relay's link away as full, while they are (`set_full`): what
+    /// it sends is routed around them (`route`).
+    full: BTreeSet<PublicKey>,
     /// Groups the tick has visited since start: the work it did, which follows what the groups
     /// hold and never how many areas the relay takes.
     visits: u64,
     delivered: Vec<Delivered>,
     demotions: Vec<(GroupKey, PublicKey, u64)>,
     stats: Stats,
-    /// The most record bytes held across its groups over the horizon. A record that would pass it
-    /// is refused whole, and counted (`Stats::refused`).
-    capacity: usize,
 }
 
 impl Member {
-    pub fn new(identity: Identity) -> Self {
+    /// A member whose groups hold what `gauge` (the budget's `Store::Batches`) takes.
+    pub fn new(identity: Identity, gauge: Arc<Gauge>) -> Self {
         let me = identity.public();
         Self {
             identity,
             me,
             groups: BTreeMap::new(),
             due: BTreeSet::new(),
-            bytes: 0,
+            held: gauge.empty(),
+            gauge,
+            full: BTreeSet::new(),
             visits: 0,
             delivered: Vec::new(),
             demotions: Vec::new(),
             stats: Stats::default(),
-            capacity: held_bytes_for(DEFAULT_BYTES_PER_SECOND),
         }
     }
 
-    /// The most record bytes it holds: `held_bytes_for` the inflow its relay admits.
-    pub fn set_capacity(&mut self, bytes: usize) {
-        self.capacity = bytes;
+    /// What it holds is charged to `gauge` from now on: what it holds now moved there, or let go
+    /// whole if that gauge cannot take it.
+    pub fn charge_to(&mut self, gauge: Arc<Gauge>) {
+        if Arc::ptr_eq(&self.gauge, &gauge) {
+            return;
+        }
+        let mut moved = gauge.empty();
+        if !moved.try_grow(self.held.bytes()) {
+            self.groups.clear();
+            self.due.clear();
+        }
+        self.held = moved;
+        self.gauge = gauge;
     }
 
-    /// Record bytes held now, across its groups.
+    /// The members full now (`peers::Peers::full`): routed around from now on, until the next
+    /// call says otherwise.
+    pub fn set_full(&mut self, full: BTreeSet<PublicKey>) {
+        self.full = full;
+    }
+
+    /// What this relay sends, routed around the members that are full: what one would have been
+    /// sent down a stripe goes to the members beneath it there (`Group::beneath`), a manifest to
+    /// those beneath it in every stripe, and anything else addressed to it alone is not sent. An
+    /// answer to `asker` goes back as it is: it travels down the asker's own link, not one this
+    /// relay dials.
+    fn route(&self, out: Vec<Outgoing>, asker: Option<&PublicKey>, now_ms: u64) -> Vec<Outgoing> {
+        if self.full.is_empty() {
+            return out;
+        }
+        let mut routed = Vec::with_capacity(out.len());
+        for outgoing in out {
+            if !self.full.contains(&outgoing.to) || Some(&outgoing.to) == asker {
+                routed.push(outgoing);
+                continue;
+            }
+            let stripes: Vec<u8> = match &outgoing.message {
+                Message::Piece { hash, .. } => vec![data_stripe(hash)],
+                Message::Parity(_) => vec![PARITY_STRIPE],
+                Message::Manifest(_) => (0..STRIPES).collect(),
+                Message::Receipt(_) | Message::Have(_) | Message::Assign(_) => Vec::new(),
+            };
+            let Some(group) = outgoing
+                .message
+                .group()
+                .and_then(|key| self.groups.get(&key))
+            else {
+                continue;
+            };
+            let mut beneath = BTreeSet::new();
+            for stripe in stripes {
+                group.beneath(
+                    stripe,
+                    &outgoing.to,
+                    (&self.full, &self.me),
+                    now_ms,
+                    &mut beneath,
+                );
+            }
+            routed.extend(beneath.into_iter().map(|to| Outgoing {
+                to,
+                message: outgoing.message.clone(),
+            }));
+        }
+        routed
+    }
+
+    /// Bytes held now across its groups (records and parities): what its gauge is charged.
     pub fn held_bytes(&self) -> usize {
-        self.bytes
+        self.held.bytes()
+    }
+
+    /// The bytes its groups hold, by each group's own count (kept apart from the charge, as
+    /// records and parities come and go): what its gauge reads.
+    pub fn group_bytes(&self) -> usize {
+        self.groups.values().map(|group| group.bytes).sum()
+    }
+
+    /// The bytes its groups hold, counted afresh from every record and parity in them: what its
+    /// gauge must read.
+    #[cfg(test)]
+    pub fn counted_bytes(&self) -> usize {
+        self.groups
+            .values()
+            .map(|group| {
+                group
+                    .pieces
+                    .values()
+                    .map(|held| held.piece.len())
+                    .sum::<usize>()
+                    + group
+                        .parity
+                        .values()
+                        .map(|held| held.parity.len())
+                        .sum::<usize>()
+            })
+            .sum()
     }
 
     /// Groups the tick has visited since start.
@@ -629,13 +767,9 @@ impl Member {
         self.visits
     }
 
-    /// Whether `len` more bytes fit; counted as refused when they do not.
-    fn fits(&mut self, len: usize) -> bool {
-        let fits = self.bytes.saturating_add(len) <= self.capacity;
-        if !fits {
-            self.stats.refused += 1;
-        }
-        fits
+    /// `len` more bytes charged to the gauge, or false, counted as refused, when it is full.
+    fn charge(&mut self, len: usize) -> bool {
+        charge(&mut self.held, &mut self.stats, len)
     }
 
     pub fn key(&self) -> PublicKey {
@@ -743,13 +877,13 @@ impl Member {
         group.relayout(now_ms);
         let out = assign(group, &me, now_ms);
         self.settle(key, now_ms);
-        out
+        self.route(out, None, now_ms)
     }
 
     /// Leaves a group (the relay no longer takes its cell).
     pub fn leave(&mut self, key: GroupKey) {
         if let Some(group) = self.groups.remove(&key) {
-            self.bytes -= group.bytes;
+            release(&mut self.held, group.bytes);
             if let Some(at) = group.due_ms {
                 self.due.remove(&(at, key));
             }
@@ -789,7 +923,7 @@ impl Member {
             .groups
             .get(&key)
             .is_some_and(|group| group.pieces.contains_key(&hash));
-        if !held && !self.fits(piece.len()) {
+        if !held && !self.charge(piece.len()) {
             return Vec::new();
         }
         let group = self
@@ -801,7 +935,7 @@ impl Member {
             self.settle(key, now_ms);
             return Vec::new();
         }
-        self.bytes += group.hold(hash, piece.clone(), now_ms, Vec::new());
+        group.hold(hash, piece.clone(), now_ms, Vec::new());
         self.delivered.push(Delivered {
             group: key,
             hash,
@@ -816,7 +950,7 @@ impl Member {
         };
         let out = inject(group, &me, stripe, message, now_ms);
         self.settle(key, now_ms);
-        out
+        self.route(out, None, now_ms)
     }
 
     /// A message from another relay.
@@ -833,7 +967,7 @@ impl Member {
         if let Some(key) = key {
             self.settle(key, now_ms);
         }
-        out
+        self.route(out, Some(&from), now_ms)
     }
 
     fn piece(
@@ -855,7 +989,7 @@ impl Member {
             self.stats.duplicates += 1;
             return Vec::new();
         }
-        if piece.hash() != Some(hash) || !self.fits(piece.len()) {
+        if piece.hash() != Some(hash) || !self.charge(piece.len()) {
             return Vec::new();
         }
         let Some(group) = self.groups.get_mut(&key) else {
@@ -868,7 +1002,7 @@ impl Member {
         if parent.is_some_and(|parent| parent != from) {
             self.stats.repaired += 1;
         }
-        self.bytes += group.hold(hash, piece.clone(), now_ms, vec![(from, now_ms)]);
+        group.hold(hash, piece.clone(), now_ms, vec![(from, now_ms)]);
         self.delivered.push(Delivered {
             group: key,
             hash,
@@ -939,17 +1073,16 @@ impl Member {
             }
             return Vec::new();
         }
-        if !in_window(parity.second, now_ms) {
+        if !in_window(parity.second, now_ms)
+            || !charge(&mut self.held, &mut self.stats, parity.len())
+        {
             return Vec::new();
         }
-        group.parity.insert(
-            id,
-            HeldParity {
-                parity: Arc::clone(&parity),
-                at_ms: now_ms,
-                from: vec![(from, now_ms)],
-            },
-        );
+        group.hold_parity(HeldParity {
+            parity: Arc::clone(&parity),
+            at_ms: now_ms,
+            from: vec![(from, now_ms)],
+        });
         push(group, &me, &from, PARITY_STRIPE, now_ms, || {
             Message::Parity(Arc::clone(&parity))
         })
@@ -1065,12 +1198,17 @@ impl Member {
                 continue;
             };
             self.visits += 1;
-            out.extend(originate_manifests(group, &self.identity, now_ms));
+            out.extend(originate_manifests(
+                group,
+                &self.identity,
+                now_ms,
+                (&mut self.held, &mut self.stats),
+            ));
             out.extend(rebuild(
                 group,
                 &me,
                 now_ms,
-                (&mut self.bytes, self.capacity),
+                &mut self.held,
                 &mut self.delivered,
                 &mut self.stats,
             ));
@@ -1079,10 +1217,10 @@ impl Member {
             expire_demotions(group, now_ms);
             out.extend(assign(group, &me, now_ms));
             out.extend(repair(group, &me, now_ms, &mut self.stats));
-            self.bytes -= forget(group, now_ms);
+            release(&mut self.held, forget(group, now_ms));
             self.settle(key, now_ms);
         }
-        out
+        self.route(out, None, now_ms)
     }
 }
 
@@ -1204,7 +1342,12 @@ fn owed_by(
 
 /// An origin's duty after each second: sign the manifest of what it originated, flood it, and
 /// send its parity down the parity stripe.
-fn originate_manifests(group: &mut Group, identity: &Identity, now_ms: u64) -> Vec<Outgoing> {
+fn originate_manifests(
+    group: &mut Group,
+    identity: &Identity,
+    now_ms: u64,
+    (held, stats): (&mut Charge, &mut Stats),
+) -> Vec<Outgoing> {
     let me = identity.public();
     let due: Vec<u64> = group
         .own
@@ -1254,14 +1397,15 @@ fn originate_manifests(group: &mut Group, identity: &Identity, now_ms: u64) -> V
             );
             out.extend(flood(group, &me, None, now_ms, Message::Manifest(manifest)));
             if let Some(parity) = parity {
-                group.parity.insert(
-                    parity.id(),
-                    HeldParity {
+                // Held for repair only if the store has room; sent down the parity stripe either
+                // way, as what this relay sends is never the store's.
+                if charge(held, stats, parity.len()) {
+                    group.hold_parity(HeldParity {
                         parity: Arc::clone(&parity),
                         at_ms: now_ms,
                         from: Vec::new(),
-                    },
-                );
+                    });
+                }
                 out.extend(inject(
                     group,
                     &me,
@@ -1285,7 +1429,7 @@ fn rebuild(
     group: &mut Group,
     me: &PublicKey,
     now_ms: u64,
-    (held_bytes, capacity): (&mut usize, usize),
+    held: &mut Charge,
     delivered: &mut Vec<Delivered>,
     stats: &mut Stats,
 ) -> Vec<Outgoing> {
@@ -1342,18 +1486,17 @@ fn rebuild(
         }
     }
     for id in false_parity {
-        group.parity.remove(&id);
+        release(held, group.drop_parity(&id));
     }
     let mut out = Vec::new();
     for (hash, piece) in found {
         if group.pieces.contains_key(&hash) {
             continue;
         }
-        if held_bytes.saturating_add(piece.len()) > capacity {
-            stats.refused += 1;
+        if !charge(held, stats, piece.len()) {
             continue;
         }
-        *held_bytes += group.hold(hash, piece.clone(), now_ms, Vec::new());
+        group.hold(hash, piece.clone(), now_ms, Vec::new());
         stats.rebuilt += 1;
         delivered.push(Delivered {
             group: group.key,
@@ -1625,7 +1768,7 @@ fn repair(group: &mut Group, me: &PublicKey, now_ms: u64, stats: &mut Stats) -> 
     }]
 }
 
-/// Forgets what is past the horizon. The record bytes it let go.
+/// Forgets what is past the horizon. The bytes it let go (records and parities).
 fn forget(group: &mut Group, now_ms: u64) -> usize {
     let horizon_ms = now_ms.saturating_sub(HORIZON_SECONDS * 1000);
     let horizon_second = horizon_ms / 1000;
@@ -1638,8 +1781,14 @@ fn forget(group: &mut Group, now_ms: u64) -> usize {
         }
         keep
     });
+    group.parity.retain(|_, held| {
+        let keep = held.at_ms >= horizon_ms;
+        if !keep {
+            freed += held.parity.len();
+        }
+        keep
+    });
     group.bytes -= freed;
-    group.parity.retain(|_, held| held.at_ms >= horizon_ms);
     group.manifests = group.manifests.split_off(&horizon_second);
     group.own = group.own.split_off(&horizon_second);
     group.seen.retain(|_, at| *at >= horizon_ms);
@@ -1658,6 +1807,21 @@ fn forget(group: &mut Group, now_ms: u64) -> usize {
         .changed_ms
         .retain(|changed| *changed + 2 * HORIZON_SECONDS * 1000 >= now_ms);
     freed
+}
+
+/// `len` more bytes on the store's charge, or false, counted as refused, when its gauge is full.
+fn charge(held: &mut Charge, stats: &mut Stats, len: usize) -> bool {
+    let charged = held.try_grow(len);
+    if !charged {
+        stats.refused += 1;
+    }
+    charged
+}
+
+/// `freed` bytes the store let go, released from its charge.
+fn release(held: &mut Charge, freed: usize) {
+    let left = held.bytes().saturating_sub(freed);
+    held.shrink_to(left);
 }
 
 /// Whether a signed `second` is one this relay holds things for: within the horizon behind its

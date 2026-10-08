@@ -124,8 +124,9 @@ Measured on main (tally-load, commit b3e3571809 on branch tally-load):
    for a signer that ran once a second on the wall clock; now the same stamped batches sign the same
    stream bytes on any number of threads, as the regional products' do.
    Records that are not epochs (positions, clock models, peers' world and regional records) wait in
-   a queue of their own (`products::Records`, bounded in count and bytes), so a flood of them refuses
-   records, counted, never an epoch. Before sealing an epoch or advancing the watermark the sealer
+   a queue of their own (`products::Records`, held by the products' gauge alone: the count it once
+   kept beside the gauge, `RECORDS_HELD`, is gone, §9), so a flood of them refuses records, counted,
+   never an epoch. Before sealing an epoch or advancing the watermark the sealer
    takes in every record stamped before it, sorted by stamp then hash; a record handed in later is
    stamped no earlier than what was already taken. A slice that reaches its thread after its epoch
    closed is dropped and counted (`receptions_late`), never merged into a later epoch.
@@ -203,10 +204,23 @@ Measured on main (tally-load, commit b3e3571809 on branch tally-load):
    (`sharing::member::Piece`), so its bytes are the one allocation the hub, products and fan-out
    already hold a handle to; parity is built from and rebuilt into the same pieces. The horizon is
    `HORIZON_MS` = the receipt window (5 s) + its grace (4 s) + the judgment (2 s) + the repair delay
-   (1.5 s) = 12.5 s, held as 13 whole seconds. The capacity is sized by time,
-   `held_bytes_for(bytes_per_second)` = the admitted inflow over the horizon (default 20,000 x
-   8 KiB/s, about 2 GiB; `Sharing::set_held_capacity` for the budget), and a record that would
-   pass it is refused whole and counted (`Stats::refused`), never the oldest dropped to make room.
+   (1.5 s) = 12.5 s, held as 13 whole seconds. The store is held by its gauge alone
+   (`budget::Store::Batches`, `Sharing::charge_to`): every record and parity a group holds, and
+   every parity being reassembled from its chunks, is charged before it is held and released as it
+   is let go, so the gauge reads what the store holds; one that would pass the gauge's limit (the
+   store's share of the budget, planned as a feeder's bytes over the horizon and as much again for
+   their parities: a parity is as long as its manifest's longest stripe slice, a third of the
+   records in a busy area and all of them in one with a record a second, so at most its records'
+   bytes and `parity::OVERHEAD`) is refused whole and counted (`Stats::refused`, the gauge's own
+   count), never the oldest dropped to make room. Before (2026-10-08) the member held
+   its own capacity beside the budget (`held_bytes_for`, `set_held_capacity`) and charged no gauge,
+   its parities were held uncounted, and reassembling parities had a 64 MiB bound of their own; so
+   `/memory` read the store at 0 while it held 340 MB of records at 5,000 feeders, and some 250 MB
+   of parities beside them that nothing counted. Measured since (2026-10-08, 5,000 feeders, MLAT
+   off, the relay on cores 0-9 and the harness on 10-31): the gauge read exactly the store's own
+   count at every sample, 596 MB at steady state (records and parities, 618 MB at its peak) of its
+   2.44 GB limit, none refused; the delivery tags' gauge likewise read exactly what they held, 11.1
+   MB at the end of the run, of its 137 MB limit.
 7. **Delivery proofs as tags made on arrival** (protocol change, v2 not yet shipped; decided): each
    round the feeder gives every member it may ask its own key k_m over the signed Probe session
    (current and next key overlapping, rotated); on arrival a member stores H(k_m || batch bytes)
@@ -246,8 +260,12 @@ Measured on main (tally-load, commit b3e3571809 on branch tally-load):
      process-secret hash, each stream kept in sequence order so a query's batches are found by
      binary search. 20,000 feeders at one batch a second: 6 M entries, 240 MB (`PER_FEEDER_BYTES` =
      12 KB), bound per receiver at `ENTRIES_PER_RECEIVER` (twice a feeder's rate over W, so one
-     receiver fills only its own share) and in all at `TAGS_HELD` = 8 Mi entries (320 MiB); past
-     either a batch is refused whole, counted, and never denied. A session is answered a few
+     receiver fills only its own share) and in all by the store's gauge (`budget::Store::Delivery`,
+     `Delivery::charge_to`), which each entry's 40 bytes are charged to before it is held and
+     released from as it is let go; past either a batch is refused whole, counted, and never
+     denied. Before (2026-10-08) the store held its own count beside the budget (`TAGS_HELD`,
+     8 Mi entries, `set_capacity`) and charged no gauge, so `/memory` read it at 0 while it held
+     16 MB at 5,000 feeders. A session is answered a few
      queries at once and one more a second.
    - **The verdict.** The feeder recomputes the tag from its copy of the audited batch and the key
      it gave that member, and takes it only under a key in force when it sent the batch (its period
@@ -347,7 +365,15 @@ Measured on main (tally-load, commit b3e3571809 on branch tally-load):
    border band; never more than `--max-connections`, under which every session in or out holds a
    place, `Hub::dialled`), for as long as each is a member (`Plan::with_members`,
    `Budget::reserve_member`): feeders never take the members' room, a relay full of feeders still
-   takes its members, and no operator picks a member count a protocol-legal link could exceed. The budget is
+   takes its members, and no operator picks a member count. The plan is the bound, not the
+   protocol's ceiling (RFC-0174 §2.5, "A relay's members are bounded"): a relay taking coarse areas
+   shares groups with up to `OFFERS_HELD` (16,384) relays and its connections cap what it plans,
+   so past the sessions planned a member is turned away with `Reason::Full`, counted
+   (`members_refused`), and the relay turned away routes what it would have sent this one to the
+   next members of the area's trees (`peers::Peers::refused_full`, `sharing::member`'s `route`),
+   dialling it again only once its wait (60 s, doubled on each refusal after, at most 30 min) has
+   passed. A raw link takes its place in this relay's own pool before it is dialled, so a relay
+   never dials a link it would turn away itself. The budget is
    `--memory`, by default the memory the relay runs in (the lesser of its cgroup's `memory.high` and
    `memory.max`, its own and its ancestors', else the host's) less `budget::HEADROOM_BYTES` (64 MiB,
    what no store charges: the allocator's unreturned pages, stacks, the kernel's socket buffers);
@@ -383,7 +409,7 @@ Measured on main (tally-load, commit b3e3571809 on branch tally-load):
    3.1 GB resident at 20,000 feeders, flat (Sizing, below).
 
 10. **Overload policy (decided)**: back-pressure for raw; whole-epoch refusal, counted, for derived
-    products; refusal whole, counted, for delivery tags (a batch past `TAGS_HELD` is never tagged and
+    products; refusal whole, counted, for delivery tags (a batch past the store's gauge is never tagged and
     never denied, §7); disconnection for fan-out (§8); for hosted MLAT that cannot keep up, whole
     steps shed, counted. MLAT never pushes back on ingest and never grows: while the watermark has
     passed more than `STEPS_BEHIND` window steps that have not started, the oldest is shed (counted,
@@ -552,17 +578,18 @@ admits fewer MLAT feeders. The runs above were not repeated with it.
 **The deployed budgets now** (`tally-relay check`). Before any feeder a relay plans its base
 (293,601,024 bytes with MLAT), the oversize room (`ingest::OVERSIZE_BYTES`, 67,108,864), the Noise
 buffers of every connection its cap allows (`ingest::BUFFERS_PER_CONNECTION`, 131,070 each) and its
-members' pool, each on its own line of the plan; a feeder then reserves 3,654,510 bytes, and the
+members' pool, each on its own line of the plan; a feeder then reserves 3,761,799 bytes, and the
 budget keeps 67,108,864 of headroom below the memory it runs in. The public relay's 640 MiB limit is
-a 603,979,776-byte budget; with 128 connections (16,776,960) and its members' pool (125,974,272:
+a 603,979,776-byte budget; with 128 connections (16,776,960) and its members' pool (129,407,520:
 the 128 member sessions its 122 base cells bring, capped by its connections, at 137,752 each, and
-their shared 256 KiB/s as 32 feeders' worth less buffers and allowances, 108,342,016), 27 feeders
-fit, 602,132,890 planned. The master's loopback relay (2 GiB, 2,048 connections, no area taken and
-so no member) admits 397; the packaged unit (`MemoryHigh=3G`) admits 690 as packaged and 495 with a
-base cell taken (2,048 member sessions and the default 1 MiB/s, 715,484,160). Every new line of the
+their shared 256 KiB/s as 32 feeders' worth less buffers and allowances, 111,775,264), 25 feeders
+fit, 600,939,343 planned. The master's loopback relay (2 GiB, 2,048 connections, no area taken and
+so no member) admits 385; the packaged unit (`MemoryHigh=3G`) admits 671 as packaged and 477 with a
+base cell taken (2,048 member sessions and the default 1 MiB/s, 729,217,152). Every new line of the
 plan cost the public relay feeders it had been admitting without room for them: 107 before the
 members' pool, 75 with it, 31 once the connections' buffers, the oversize room and a feeder's
-allowance in bytes were planned, 27 once every member session its areas bring was.
+allowance in bytes were planned, 27 once every member session its areas bring was, 25 once the
+batch byte store planned the parities it holds beside its records (107,289 bytes more a feeder, §6).
 
 **What the areas cost at rest.** Taking the 122 resolution-0 areas once cost 530 MiB and a whole
 core with no feeder at all. As built: idle work follows activity, not the areas taken (`sharing`,
