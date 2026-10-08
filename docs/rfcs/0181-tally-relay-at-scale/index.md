@@ -273,8 +273,9 @@ Measured on main (tally-load, commit b3e3571809 on branch tally-load):
    falls behind on (§10). A sharing member reserves the
    feeders its ingest ceiling is worth (`--max-member-bytes-per-sec` over a planned feeder's rate)
    for as long as it is a member. A relay whose memory admits no feeder refuses to start
-   (`Budget::check`), and the deployed units are held to the budget by a test
-   (`//tally/crates/relay:deployed`). The gauges are served on `GET /memory`.
+   (`Budget::check`). `tally-relay check` makes every refusal a start makes, along the start's own
+   path, and prints the memory plan; the packaged unit is held to it by `//tally/crates/relay:check`,
+   and an operator holds its own deploy to it the same way (ours: `//infra/tally:relay_config_test`). The gauges are served on `GET /memory`.
 
    Why (measured 2026-10-08, 20,000 feeders on one 32-core host): the relay's resident memory grew
    about 330 MB/s, unbounded, to 18 GB in 160 s. It was decoded batches: the sealer's queue was

@@ -33,7 +33,7 @@ rust_library(
     ],
 )
 
-# Public: what is deployed packs it (the Flightlines repository's images of the public relay).
+# Public: an operator packs it and checks its deploy against it (`tally-relay check`).
 rust_binary(
     name = "tally-relay",
     srcs = ["src/main.rs"],
@@ -152,30 +152,30 @@ opt_test(
     test = ":mlat_host_binary",
 )
 
-# Every deployed relay's configuration admits feeders (RFC-0181 §9): its arguments through the
-# relay's own parser, its memory as the relay finds it, its budget as `main` builds it.
+# `tally-relay check` refuses what a start refuses and prints the memory plan (RFC-0181 §9), run
+# against the built binary with the test's own arguments and with the packaged unit's: what Tally
+# publishes starts a relay that admits feeders. An operator checks its own deploy the same way, by
+# asking the relay it runs (RFC-0180 §3).
 rust_test(
-    name = "deployed",
+    name = "check",
     size = "small",
-    srcs = ["tests/deployed.rs"],
+    srcs = ["tests/check.rs"],
     data = [
-        "//infra/kubernetes:tally/public-keys.yaml",
-        "//infra/kubernetes:tally/relay.yaml",
-        "//infra/prod-host:tally/units/tally-relay.service",
+        ":tally-relay",
         "//tally/packaging/systemd:tally-relay.service",
     ],
     edition = "2024",
     env = {
-        "TALLY_RELAY_DEPLOYED": "$(rootpaths //infra/prod-host:tally/units/tally-relay.service) $(rootpaths //tally/packaging/systemd:tally-relay.service) $(rootpaths //infra/kubernetes:tally/relay.yaml) $(rootpaths //infra/kubernetes:tally/public-keys.yaml)",
+        "TALLY_RELAY_BIN": "$(rootpath :tally-relay)",
+        "TALLY_RELAY_UNIT": "$(rootpath //tally/packaging/systemd:tally-relay.service)",
     },
     lint_config = ":cargo_lints",
-    deps = [":relay"],
 )
 
 rustfmt_test(
     name = "rustfmt",
     targets = [
-        ":deployed",
+        ":check",
         ":end_to_end",
         ":mlat_host_binary",
         ":relay",

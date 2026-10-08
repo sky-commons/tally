@@ -656,6 +656,13 @@ impl Budget {
         self.base
     }
 
+    /// What the relay plans to hold at its ceiling: its base and every admitted feeder's share
+    /// (`memory`, less what no whole feeder fits in).
+    pub fn planned(&self) -> usize {
+        self.base
+            .saturating_add(self.per_feeder.total().saturating_mul(self.ceiling()))
+    }
+
     /// What every admitted feeder together may hold in `store`, at the ceiling.
     pub fn store_bytes(&self, store: Store) -> usize {
         self.per_feeder.of(store).saturating_mul(self.ceiling())
