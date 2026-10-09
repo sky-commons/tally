@@ -78,7 +78,8 @@ fn check(args: &[&str]) -> Result<Checked> {
 /// member, a link's share each), one feeder fits, each
 /// admitted feeder's share fits in what is left, and the budget keeps the declared headroom below
 /// the memory the relay runs in. A relay holding member sessions plans their rate; one holding
-/// none (it takes no area) plans nothing for them.
+/// none (it takes no area) plans nothing for them. It admits the fewer of the feeders its memory
+/// holds and those its cores carry, and runs every stage on a thread at least.
 fn assert_plan_holds(checked: &Checked) -> Result {
     let (memory, base, each, feeders, members, per_member, pool, planned, headroom, limit) = (
         checked.get("memory")?,
@@ -127,11 +128,24 @@ fn assert_plan_holds(checked: &Checked) -> Result {
         planned,
         base + oversize + buffers + pool + links + each * feeders
     );
-    assert!(
-        planned <= memory && memory - planned < each,
+    let (memory_feeders, core_feeders) =
+        (checked.get("memory-feeders")?, checked.get("core-feeders")?);
+    assert_eq!(
+        feeders,
+        memory_feeders.min(core_feeders),
         "{:?}",
         checked.plan
     );
+    assert!(planned <= memory, "{:?}", checked.plan);
+    // Bound by its memory, it plans all of it but less than a feeder.
+    assert!(
+        feeders < memory_feeders || memory - planned < each,
+        "{:?}",
+        checked.plan
+    );
+    for stage in ["ingest-threads", "message-threads", "seal-threads"] {
+        assert!(checked.get(stage)? >= 1, "{stage}: {:?}", checked.plan);
+    }
     assert!(headroom > 0, "{:?}", checked.plan);
     assert!(memory + headroom <= limit, "{:?}", checked.plan);
     Ok(())
@@ -197,6 +211,85 @@ fn a_configuration_the_relay_takes_is_accepted_with_its_plan() -> Result {
     assert_plan_holds(&whole)
 }
 
+/// The stages' threads follow the load the relay admits, never the host's cores alone, and its
+/// cores bound what it admits (`tally_relay::cores`): the configuration measured on 2026-10-09
+/// (10 cores, memory for 5,000 feeders and more) runs more than one message thread, the same
+/// memory on one core admits what one core carries, and a relay of many cores and little memory
+/// runs the threads its few feeders need.
+#[test]
+fn the_stages_follow_the_load_admitted_and_the_cores_bound_it() -> Result {
+    let on = |cores: &str, memory: &str| -> Result<Checked> {
+        let checked = check(&[
+            "--memory-limit",
+            "32G",
+            "--cores",
+            cores,
+            "--key",
+            "k",
+            "--max-upload",
+            "10Gbit/s",
+            "--mlat-threads",
+            "0",
+            "--memory",
+            memory,
+            "--max-connections",
+            "11024",
+            "--max-connections-per-address",
+            "11024",
+            "--area",
+            "801ffffffffffff",
+            "--area",
+            "8027fffffffffff",
+        ])?;
+        assert!(checked.accepted, "{}", checked.refusal);
+        assert_plan_holds(&checked)?;
+        assert_eq!(checked.get("cores")?, cores.parse::<usize>().unwrap_or(0));
+        Ok(checked)
+    };
+    let expected = |checked: &Checked| -> Result<tally_relay::ingest::Threads> {
+        Ok(tally_relay::cores::threads_for(
+            checked.get("feeders")? + checked.get("member-feeders")?,
+            false,
+            Some(checked.get("cores")?),
+        ))
+    };
+    let threads = |checked: &Checked| -> Result<tally_relay::ingest::Threads> {
+        Ok(tally_relay::ingest::Threads {
+            ingest: checked.get("ingest-threads")?,
+            message: checked.get("message-threads")?,
+            seal: checked.get("seal-threads")?,
+        })
+    };
+    let measured = on("10", "24G")?;
+    assert!(measured.get("feeders")? >= 5_000, "{:?}", measured.plan);
+    assert_eq!(threads(&measured)?, expected(&measured)?);
+    assert!(
+        threads(&measured)?.message >= 2,
+        "{:?}",
+        threads(&measured)?
+    );
+    // One core: the cores bound it, below what the memory holds.
+    let one = on("1", "24G")?;
+    assert!(
+        one.get("feeders")? == one.get("core-feeders")?
+            && one.get("feeders")? < one.get("memory-feeders")?,
+        "{:?}",
+        one.plan
+    );
+    assert_eq!(threads(&one)?, expected(&one)?);
+    // Many cores and little memory: the memory bounds it, and the threads follow its feeders.
+    let small = on("32", "16G")?;
+    assert!(
+        small.get("feeders")? == small.get("memory-feeders")?
+            && small.get("feeders")? < small.get("core-feeders")?,
+        "{:?}",
+        small.plan
+    );
+    assert_eq!(threads(&small)?, expected(&small)?);
+    assert!(threads(&small)?.message < threads(&measured)?.message);
+    Ok(())
+}
+
 #[test]
 fn a_configuration_a_start_refuses_is_refused_and_says_why() -> Result {
     let refused = |args: &[&str], why: &str| -> Result {
@@ -242,6 +335,36 @@ fn a_configuration_a_start_refuses_is_refused_and_says_why() -> Result {
             "8001fffffffffff",
         ],
         "admit no feeder beside 64 member sessions",
+    )?;
+    // Cores that carry no feeder beside the members' shared rate: 128 MiB/s is 16,384 feeders'
+    // worth, more than one core carries.
+    refused(
+        &[
+            "--memory-limit",
+            "64G",
+            "--cores",
+            "1",
+            "--key",
+            "k",
+            "--max-upload",
+            "6Mbit/s",
+            "--max-member-bytes-per-sec",
+            "134217728",
+            "--area",
+            "8001fffffffffff",
+        ],
+        "1 cores carry no feeder beside the 16384 feeders",
+    )?;
+    // The stages' threads are the plan's: no operator picks them.
+    for flag in ["--ingest-threads", "--message-threads"] {
+        refused(
+            &["--key", "k", "--max-upload", "6Mbit/s", flag, "2"],
+            &format!("unknown argument {flag}"),
+        )?;
+    }
+    refused(
+        &["--cores", "0", "--key", "k", "--max-upload", "6Mbit/s"],
+        "--cores needs a number of cores, at least 1",
     )?;
     // The member sessions follow the areas: no operator picks them.
     refused(
@@ -336,8 +459,9 @@ fn unit_settings(text: &str) -> Vec<(String, String)> {
 /// What a unit gives the relay, as systemd gives it: the arguments `ExecStart` passes (each
 /// `${NAME}` its `Environment=` default, an operator's `$NAME` list empty), and the memory it runs
 /// in: the lesser of `MemoryHigh=` and `MemoryMax=` (each the last setting winning), its cgroup's
-/// `memory.high` and `memory.max`, in bytes.
-fn read_unit(text: &str) -> Result<(Vec<String>, usize)> {
+/// `memory.high` and `memory.max`, in bytes; and the cores its `CPUQuota=` gives it, rounded down
+/// and at least one as the relay counts them, or none (the host's).
+fn read_unit(text: &str) -> Result<(Vec<String>, usize, Option<usize>)> {
     let settings = unit_settings(text);
     let environment: Vec<(String, String)> = settings
         .iter()
@@ -381,7 +505,20 @@ fn read_unit(text: &str) -> Result<(Vec<String>, usize)> {
         (None, Some(max)) => max,
         (_, None) => return Err("no MemoryMax: the relay would take the whole host".to_owned()),
     };
-    Ok((args, limit))
+    let cores = settings
+        .iter()
+        .rev()
+        .find(|(key, _)| key == "CPUQuota")
+        .filter(|(_, value)| !value.is_empty())
+        .map(|(_, value)| {
+            value
+                .strip_suffix('%')
+                .and_then(|percent| percent.parse::<usize>().ok())
+                .map(|percent| (percent / 100).max(1))
+                .ok_or_else(|| format!("CPUQuota={value}: not a quota"))
+        })
+        .transpose()?;
+    Ok((args, limit, cores))
 }
 
 /// A systemd size: a number with K, M, G or T, base 1024 (systemd.resource-control(5)).
@@ -407,15 +544,18 @@ ExecStart=/usr/local/bin/tally-relay \\
 MemoryMax=3G
 MemoryMax=4G
 ";
-    let (args, limit) = read_unit(unit)?;
+    let (args, limit, cores) = read_unit(unit)?;
     assert_eq!(
         args,
         ["--key", "/k", "--max-upload", "2Mbit/s"].map(str::to_owned)
     );
-    assert_eq!(limit, 4 << 30);
+    assert_eq!((limit, cores), (4 << 30, None));
     // The throttle is a limit too: the lesser is the memory the relay runs in.
-    let (_, high) = read_unit(&format!("{unit}MemoryHigh=3G\n"))?;
+    let (_, high, _) = read_unit(&format!("{unit}MemoryHigh=3G\n"))?;
     assert_eq!(high, 3 << 30);
+    // A quota is the cores the relay counts: rounded down, at least one.
+    assert_eq!(read_unit(&format!("{unit}CPUQuota=250%\n"))?.2, Some(2));
+    assert_eq!(read_unit(&format!("{unit}CPUQuota=50%\n"))?.2, Some(1));
     Ok(())
 }
 
@@ -424,9 +564,11 @@ fn the_packaged_unit_starts_a_relay_that_admits_feeders() -> Result {
     let path = packaged_unit();
     let text =
         std::fs::read_to_string(&path).map_err(|error| format!("{}: {error}", path.display()))?;
-    let (args, limit) = read_unit(&text).map_err(|error| format!("{}: {error}", path.display()))?;
-    let limit = limit.to_string();
+    let (args, limit, cores) =
+        read_unit(&text).map_err(|error| format!("{}: {error}", path.display()))?;
+    let (limit, cores) = (limit.to_string(), cores.map(|cores| cores.to_string()));
     let mut line = vec!["--memory-limit", limit.as_str()];
+    line.extend(cores.iter().flat_map(|cores| ["--cores", cores.as_str()]));
     line.extend(args.iter().map(String::as_str));
     // As packaged, and with a base cell taken (an operator's `--area` in its arguments): every
     // member session that area brings fits beside the feeders.

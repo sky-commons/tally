@@ -13,6 +13,7 @@ pub mod bounded;
 pub mod budget;
 pub mod ceiling;
 pub mod config;
+pub mod cores;
 pub mod credit;
 pub mod deduplicated;
 pub mod delivery;

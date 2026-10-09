@@ -8,7 +8,6 @@ use crate::hub::{
     DEFAULT_MAX_CONNECTIONS, DEFAULT_MAX_CONNECTIONS_PER_ADDRESS, DEFAULT_MAX_FEEDER_BYTES_PER_SEC,
     DEFAULT_MAX_MEMBER_BYTES_PER_SEC,
 };
-use crate::ingest::Threads;
 
 /// Subscribers served before new ones are turned away, unless `--max-subscribers` says.
 const DEFAULT_MAX_SUBSCRIBERS: usize = 64;
@@ -16,19 +15,23 @@ const DEFAULT_MAX_SUBSCRIBERS: usize = 64;
 const USAGE: &str = "\
 usage: tally-relay --key FILE [--key FILE]... --max-upload RATE [options]
        tally-relay keygen          print a new key file to stdout and its public key to stderr
-       tally-relay check [--memory-limit BYTES] --key FILE ... [options]
+       tally-relay check [--memory-limit BYTES] [--cores N] --key FILE ... [options]
                                    refuse what a start would refuse, without starting: the same
                                    arguments, read and checked as a start reads and checks them
                                    (but for the key files, which it does not read, and the
-                                   sockets, which it does not open), then print the memory plan
+                                   sockets, which it does not open), then print the plan
                                    (memory, base, oversize, connections, connection-buffers,
-                                   per-feeder, feeders, members, per-member, member-feeders,
-                                   member-rate-pool, member-pool, planned, headroom, limit)
-                                   and exit 0. --memory-limit is the
-                                   memory the relay will run in (the lesser of its cgroup's
-                                   limits: a unit's MemoryHigh and MemoryMax, a container's
-                                   limits.memory), as it would find it there (default: this
-                                   host's, as a start here would find it)
+                                   per-feeder, feeders, memory-feeders, cores, core-feeders,
+                                   ingest-threads, message-threads, seal-threads, members,
+                                   per-member, member-feeders, member-rate-pool, member-pool,
+                                   member-links, planned, headroom, limit) and exit 0.
+                                   --memory-limit is the memory the relay will run in (the
+                                   lesser of its cgroup's limits: a unit's MemoryHigh and
+                                   MemoryMax, a container's limits.memory), as it would find it
+                                   there (default: this host's, as a start here would find it);
+                                   --cores the cores it will run on (its CPU affinity and its
+                                   cgroup's quota: a unit's CPUQuota, a container's limits.cpu,
+                                   rounded down, at least 1; default: this host's)
 
   --key FILE             this relay's key; repeat during a rotation, newest first
   --max-upload RATE      required: the most this relay sends a second to billed peers, in
@@ -106,10 +109,10 @@ usage: tally-relay --key FILE [--key FILE]... --max-upload RATE [options]
                          the relay runs in, the lesser of its cgroup's memory.high and
                          memory.max, else the host's memory, less 64 MiB of headroom for what
                          no store charges). Never above that: the kernel would throttle or kill
-                         the relay before its budget turned a feeder away
-  --ingest-threads N     threads that verify, admit and decode feeders' batches (default: a
-                         quarter of the cores)
-  --message-threads N    threads that deduplicate receptions (default: an eighth of the cores)
+                         the relay before its budget turned a feeder away. The feeders admitted
+                         are also no more than the cores it runs on (its CPU affinity and its
+                         cgroup's quota) carry beside its members' rate, each stage at most
+                         50% busy, and each stage's threads follow what it admits
   --area CELL            an area this relay takes (an H3 cell, hex or decimal): it shares it
                          and, with relay duties on, may solve its MLAT (RFC-0174 §2.1);
                          repeatable
@@ -159,7 +162,10 @@ pub struct Config {
     /// (`budget::memory_available`), or what `check` is told it will be (`--memory-limit`).
     /// `memory` is never above it less `budget::HEADROOM_BYTES`.
     pub memory_limit: usize,
-    pub threads: Threads,
+    /// The cores the relay runs on (`cores::cores_available`), or what `check` is told it will
+    /// have (`--cores`): the feeders they carry bound the ceiling, and the stages' threads follow
+    /// what is admitted (`cores`).
+    pub cores: usize,
     pub max_upload: Cap,
     /// The areas taken (RFC-0174 §2.1).
     pub areas: Vec<Region>,
@@ -201,20 +207,58 @@ impl Command {
             return Ok(Config::from_args(args)?.map_or(Self::Done, Self::Run));
         }
         args.next();
-        let memory_limit = if args.peek().map(String::as_str) == Some("--memory-limit") {
-            args.next();
-            let text = args.next().ok_or("--memory-limit needs a value")?;
-            parse_bytes(&text).map_err(|error| format!("--memory-limit {error}"))?
-        } else {
-            crate::budget::memory_available()
+        let mut memory_limit = None;
+        let mut cores = None;
+        loop {
+            match args.peek().map(String::as_str) {
+                Some("--memory-limit") => {
+                    args.next();
+                    let text = args.next().ok_or("--memory-limit needs a value")?;
+                    memory_limit = Some(
+                        parse_bytes(&text).map_err(|error| format!("--memory-limit {error}"))?,
+                    );
+                }
+                Some("--cores") => {
+                    args.next();
+                    let count = args
+                        .next()
+                        .and_then(|text| text.parse::<usize>().ok())
+                        .filter(|count| *count > 0)
+                        .ok_or("--cores needs a number of cores, at least 1")?;
+                    cores = Some(count);
+                }
+                _ => break,
+            }
+        }
+        let host = Host {
+            memory_limit: memory_limit.unwrap_or_else(crate::budget::memory_available),
+            cores: cores.unwrap_or_else(crate::cores::cores_available),
         };
-        Ok(Config::parse(args, memory_limit)?.map_or(Self::Done, Self::Check))
+        Ok(Config::parse(args, host)?.map_or(Self::Done, Self::Check))
+    }
+}
+
+/// What the relay runs in: the memory (`budget::memory_available`) and the cores
+/// (`cores::cores_available`) this host gives it, or what `check` is told it will have.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Host {
+    pub memory_limit: usize,
+    pub cores: usize,
+}
+
+impl Host {
+    /// This host as a start here finds it.
+    pub fn this() -> Self {
+        Self {
+            memory_limit: crate::budget::memory_available(),
+            cores: crate::cores::cores_available(),
+        }
     }
 }
 
 impl Config {
-    /// `None` when the command was fully handled (usage, keygen). The relay's memory limit is
-    /// what this host gives it (`budget::memory_available`).
+    /// `None` when the command was fully handled (usage, keygen). The relay's memory limit and
+    /// cores are what this host gives it ([`Host::this`]).
     pub fn from_args(args: impl Iterator<Item = String>) -> Result<Option<Self>, String> {
         let mut args = args.peekable();
         if args.peek().map(String::as_str) == Some("keygen") {
@@ -223,15 +267,16 @@ impl Config {
             eprintln!("public key: {}", identity.public());
             return Ok(None);
         }
-        Self::parse(args, crate::budget::memory_available())
+        Self::parse(args, Host::this())
     }
 
-    /// The relay's flags, for a relay that runs in `memory_limit` bytes: every refusal a start
-    /// makes of its arguments. `None` when the command was fully handled (usage).
-    pub fn parse(
-        args: impl Iterator<Item = String>,
-        memory_limit: usize,
-    ) -> Result<Option<Self>, String> {
+    /// The relay's flags, for a relay that runs on `host`: every refusal a start makes of its
+    /// arguments. `None` when the command was fully handled (usage).
+    pub fn parse(args: impl Iterator<Item = String>, host: Host) -> Result<Option<Self>, String> {
+        let Host {
+            memory_limit,
+            cores,
+        } = host;
         let mut config = Self {
             key_files: Vec::new(),
             listen: "0.0.0.0:10900".to_owned(),
@@ -248,11 +293,11 @@ impl Config {
             max_member_bytes_per_sec: DEFAULT_MAX_MEMBER_BYTES_PER_SEC,
             memory: crate::budget::budget_within(memory_limit),
             memory_limit,
-            threads: Threads::from_cores(),
+            cores,
             max_upload: Cap::NONE,
             areas: Vec::new(),
             network: 0,
-            mlat_threads: std::thread::available_parallelism().map_or(1, std::num::NonZero::get),
+            mlat_threads: cores,
             world: false,
             world_precise: false,
             relay_duties: true,
@@ -297,16 +342,6 @@ impl Config {
                 "--memory" => {
                     config.memory =
                         parse_bytes(&value()?).map_err(|error| format!("--memory {error}"))?;
-                }
-                "--ingest-threads" => {
-                    config.threads.ingest = value()?
-                        .parse()
-                        .map_err(|_| "--ingest-threads needs a number".to_owned())?;
-                }
-                "--message-threads" => {
-                    config.threads.message = value()?
-                        .parse()
-                        .map_err(|_| "--message-threads needs a number".to_owned())?;
                 }
                 "--max-feeder-bytes-per-sec" => {
                     config.max_feeder_bytes_per_sec = value()?
@@ -476,9 +511,14 @@ mod tests {
     /// A host of a terabyte, whatever runs the test.
     const LIMIT: usize = 1 << 40;
 
+    /// That host, on 16 cores.
+    const HOST: Host = Host {
+        memory_limit: LIMIT,
+        cores: 16,
+    };
+
     fn config(args: &[&str]) -> Result<Config, String> {
-        Config::parse(args.iter().map(|arg| (*arg).to_owned()), LIMIT)?
-            .ok_or("no config".to_owned())
+        Config::parse(args.iter().map(|arg| (*arg).to_owned()), HOST)?.ok_or("no config".to_owned())
     }
 
     #[test]
@@ -548,6 +588,10 @@ mod tests {
                 crate::budget::PLANNED_BYTES_PER_SEC / 1024
             ),
             format!("past {} s", egress::SHED_AFTER.as_secs()),
+            format!(
+                "at most\n                         {}% busy",
+                crate::cores::BUSY_PERCENT
+            ),
             format!("10Mbit/s is\n                         at most about {ten}"),
         ] {
             assert!(USAGE.contains(&stated), "the help does not say {stated}");
@@ -716,7 +760,7 @@ mod tests {
     }
 
     #[test]
-    fn memory_is_read_in_bytes_or_binary_units_and_threads_by_flag() -> Result<(), String> {
+    fn memory_is_read_in_bytes_or_binary_units_and_no_thread_count_by_flag() -> Result<(), String> {
         assert_eq!(parse_bytes("4096")?, 4096);
         assert_eq!(parse_bytes("16G")?, 16 << 30);
         assert_eq!(parse_bytes("512M")?, 512 << 20);
@@ -728,18 +772,18 @@ mod tests {
             "10Mbit/s",
             "--memory",
             "8G",
-            "--ingest-threads",
-            "3",
-            "--message-threads",
-            "2",
         ])?;
         assert_eq!(config.memory, 8 << 30);
+        assert_eq!(config.cores, 16);
         // Never above the memory the relay runs in: the kernel would kill it first.
         let over = Config::parse(
             ["--key", "k", "--max-upload", "1MB/s", "--memory", "2G"]
                 .map(str::to_owned)
                 .into_iter(),
-            1 << 30,
+            Host {
+                memory_limit: 1 << 30,
+                cores: 1,
+            },
         )
         .err()
         .unwrap_or_default();
@@ -752,7 +796,10 @@ mod tests {
             ["--key", "k", "--max-upload", "1MB/s", "--memory", "1G"]
                 .map(str::to_owned)
                 .into_iter(),
-            1 << 30,
+            Host {
+                memory_limit: 1 << 30,
+                cores: 1,
+            },
         );
         assert!(all.is_err());
         // The member sessions follow the areas; no operator picks them.
@@ -760,13 +807,13 @@ mod tests {
             super::tests::config(&["--key", "k", "--max-upload", "1MB/s", "--max-members", "3"])
                 .is_err()
         );
-        assert_eq!(
-            config.threads,
-            Threads {
-                ingest: 3,
-                message: 2
-            }
-        );
+        // The stages' threads follow the load admitted (`cores`): no operator picks them.
+        for flag in ["--ingest-threads", "--message-threads"] {
+            assert!(
+                super::tests::config(&["--key", "k", "--max-upload", "1MB/s", flag, "4"]).is_err(),
+                "{flag}"
+            );
+        }
         Ok(())
     }
 

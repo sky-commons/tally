@@ -746,6 +746,10 @@ pub struct Hub {
     areas: Vec<Region>,
     /// Whether the relay holds MLAT raw: its plan's base and each feeder's cost (`Hub::memory`).
     holds_raw: bool,
+    /// The cores the relay runs on (`Hub::cores`): the feeders they carry bound the ceiling, and
+    /// its stages' threads follow the load admitted (`cores`). None for a test's hub, whose
+    /// feeders only its memory bounds and whose stages' threads it names.
+    cores: Option<usize>,
     /// The time the ingest ceilings read.
     ceiling_clock: crate::ceiling::Clock,
     accepted_relays: HashSet<PublicKey>,
@@ -904,6 +908,7 @@ impl Hub {
             member_pace: Arc::new(crate::ceiling::Pace::new(DEFAULT_MAX_MEMBER_BYTES_PER_SEC)),
             areas: Vec::new(),
             holds_raw: false,
+            cores: None,
             ceiling_clock: crate::ceiling::system_clock(),
             accepted_relays: HashSet::new(),
             hints: Vec::new(),
@@ -916,7 +921,16 @@ impl Hub {
         .replanned()
     }
 
-    /// The stages on threads of their own (`threads`), the sealer on its own: what a relay runs.
+    /// The stages on as many threads as the load this hub plans to admit needs
+    /// (`Budget::threads`): what a relay runs. Built once the budget is final, so the threads
+    /// follow the ceiling and the members' rate it was sized to.
+    pub fn staged_as_planned(self) -> Result<Self, String> {
+        let threads = self.budget.threads();
+        self.staged(threads)
+    }
+
+    /// The stages on threads of their own (`threads`), the sealer on its own: a test's, which
+    /// names its threads.
     /// Built before the hub is shared, so nothing has been ingested yet. Every thread starts or
     /// this fails, and the relay with it: a stage short of a thread would close no epoch ever, or
     /// refuse every one.
@@ -935,9 +949,7 @@ impl Hub {
         let gauges = Gauges::of(&self.budget);
         // The sealer moves onto its thread wherever it is held: no exclusive hold is needed, so
         // it can never be left inline behind threaded stages.
-        self.network
-            .products
-            .on_thread(threads.message.max(1), pause.as_ref())?;
+        self.network.products.on_thread(threads, pause.as_ref())?;
         self.stages = Stages::threaded(
             clock,
             threads,
@@ -995,6 +1007,15 @@ impl Hub {
         Plan::planned(self.holds_raw)
             .with_members(members, self.max_member_bytes_per_sec)
             .with_connections(self.non_feeder_connections(members))
+            .with_cores(self.cores)
+    }
+
+    /// Runs on `cores` cores (`cores::cores_available`, or what `check` is told): the feeders it
+    /// admits are no more than they carry beside its members' rate (`cores::feeders_carried`), and
+    /// its stages' threads follow what it admits (`Hub::staged_as_planned`).
+    pub fn cores(mut self, cores: usize) -> Self {
+        self.cores = Some(cores);
+        self.replanned()
     }
 
     /// Every connection but a feeder's the relay holds at once, each by its own role's cap: those

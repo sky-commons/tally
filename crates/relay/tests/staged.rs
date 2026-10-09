@@ -306,17 +306,23 @@ fn the_same_stamped_trace_makes_the_same_bytes_on_any_number_of_threads() -> Res
         Threads {
             ingest: 1,
             message: 1,
+            seal: 1,
         },
         |_| Duration::ZERO,
     )?;
     assert!(!one.regional.is_empty(), "no regional product");
     assert!(!one.world.is_empty(), "no world product");
     assert!(!one.stream.is_empty(), "no deduplicated stream");
-    for (ingest, message) in [(2, 2), (8, 8), (8, 3)] {
-        let many = run(&trace, Threads { ingest, message }, |_| Duration::ZERO)?;
+    for (ingest, message, seal) in [(2, 2, 2), (8, 8, 8), (8, 3, 5), (2, 4, 1)] {
+        let threads = Threads {
+            ingest,
+            message,
+            seal,
+        };
+        let many = run(&trace, threads, |_| Duration::ZERO)?;
         assert_eq!(
             one, many,
-            "{ingest} ingest and {message} message threads differ"
+            "{ingest} ingest, {message} message and {seal} seal threads differ"
         );
     }
     Ok(())
@@ -336,17 +342,23 @@ fn stamped_by_the_ingest_clock_with_delays_inside_every_stage_the_bytes_are_the_
         Threads {
             ingest: 1,
             message: 1,
+            seal: 1,
         },
         None,
     )?;
     assert!(!steady.regional.is_empty(), "no regional product");
     assert!(!steady.world.is_empty(), "no world product");
     assert!(!steady.stream.is_empty(), "no deduplicated stream");
-    for (ingest, message) in [(4, 4), (8, 3)] {
-        let delayed = run_clocked(&trace, Threads { ingest, message }, Some(jitter(2_000)))?;
+    for (ingest, message, seal) in [(4, 4, 4), (8, 3, 2)] {
+        let threads = Threads {
+            ingest,
+            message,
+            seal,
+        };
+        let delayed = run_clocked(&trace, threads, Some(jitter(2_000)))?;
         assert_eq!(
             steady, delayed,
-            "{ingest} ingest and {message} message threads, delayed inside, differ"
+            "{ingest} ingest, {message} message and {seal} seal threads, delayed inside, differ"
         );
     }
     Ok(())
@@ -361,6 +373,7 @@ fn copies_of_a_message_up_to_two_seconds_apart_are_kept_once() -> Result {
     let hub = Arc::new(Hub::clocked(8, Arc::new(|| 0)).staged(Threads {
         ingest: 4,
         message: 4,
+        seal: 4,
     })?);
     hub.network().adopt_identity(Identity::from_seed([59; 32]));
     let message = airborne(
@@ -429,6 +442,7 @@ fn delays_injected_between_batches_change_nothing() -> Result {
     let threads = Threads {
         ingest: 4,
         message: 4,
+        seal: 4,
     };
     let steady = run(&trace, threads, |_| Duration::ZERO)?;
     // Pseudorandom pauses: the workers, the shards and the sealer each fall behind and catch up
@@ -454,6 +468,7 @@ fn a_message_heard_by_many_receivers_on_many_workers_is_kept_once_a_window() -> 
         Threads {
             ingest: 8,
             message: 8,
+            seal: 8,
         },
         |_| Duration::ZERO,
     )?;
@@ -496,6 +511,7 @@ async fn each_receivers_batches_reach_a_subscriber_in_order_described_first() ->
     let hub = Arc::new(Hub::clocked(8, Arc::new(|| 0)).staged(Threads {
         ingest: 8,
         message: 2,
+        seal: 2,
     })?);
     let listener = hub.listen(
         999,
@@ -605,6 +621,7 @@ async fn a_subscriber_that_falls_behind_is_let_go_whole_and_the_stream_refused_w
             .staged(Threads {
                 ingest: 2,
                 message: 2,
+                seal: 2,
             })?,
     );
     let raw = || {

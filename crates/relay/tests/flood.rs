@@ -211,6 +211,7 @@ async fn memory_stays_bounded_under_a_flood_of_many_feeders() -> Result {
     let threads = Threads {
         ingest: 2,
         message: 2,
+        seal: 2,
     };
     let hub = Arc::new(
         Hub::new(8)
@@ -348,6 +349,7 @@ async fn a_stalled_stage_never_grows_past_the_budget() -> Result {
             .staged(Threads {
                 ingest: 2,
                 message: 2,
+                seal: 2,
             })?,
     );
     let stalled = hub.listen(

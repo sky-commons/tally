@@ -350,7 +350,11 @@ fn hosted_mlat_makes_the_same_bytes_on_any_threads_with_any_delays_and_the_refer
         let (signed, report, _) = mlat_run_with(
             &delivered,
             &areas,
-            Threads { ingest, message },
+            Threads {
+                ingest,
+                message,
+                seal: message,
+            },
             mlat_settings(ingest),
             Describing::Before { reversed: false },
             delays,
@@ -465,6 +469,7 @@ fn at_capacity_the_same_receivers_are_refused_whatever_the_order_and_the_threads
         let threads = Threads {
             ingest,
             message: ingest,
+            seal: ingest,
         };
         let (signed, report, held) = mlat_run_with(
             &delivered,
@@ -528,6 +533,7 @@ fn descriptions_midway_make_the_same_bytes_with_any_delays_and_the_reference_eng
             Threads {
                 ingest,
                 message: ingest,
+                seal: ingest,
             },
             mlat_settings(ingest),
             Describing::Before { reversed: false },
@@ -580,6 +586,7 @@ fn descriptions_midway_make_the_same_bytes_with_any_delays_and_the_reference_eng
         Threads {
             ingest: 1,
             message: 1,
+            seal: 1,
         },
         mlat_settings(1),
         Describing::Before { reversed: false },

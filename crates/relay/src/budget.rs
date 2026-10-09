@@ -12,7 +12,9 @@
 //! the sessions planned a member is turned away as full (`Reason::Full`), and the relay it was
 //! routes around this one (RFC-0174 §2.5). The feeder ceiling is
 //! what the relay's budget holds of a feeder's cost after its own base ([`Plan::base`]:
-//! [`BASE_BYTES`], and [`MLAT_BASE_BYTES`] more when it hosts MLAT) and the members' pool. The
+//! [`BASE_BYTES`], and [`MLAT_BASE_BYTES`] more when it hosts MLAT) and the members' pool, and no
+//! more than its cores carry beside the members' rate ([`Plan::core_feeders`], `cores`); its
+//! stages' threads follow what it admits ([`Budget::threads`]). The
 //! budget is `--memory`, by default the memory the relay runs in ([`memory_available`]: the lesser
 //! of its cgroup's `memory.high` and `memory.max`, else the host's) less [`HEADROOM_BYTES`], what
 //! no store charges. A Hello beyond the ceiling is refused ("no spare slot"), and a relay whose
@@ -357,6 +359,12 @@ pub struct Plan {
     /// its reservation's, `PerFeeder::buffers`) carves its Noise buffers from room planned here
     /// (`Plan::connection_buffers`).
     pub connections: usize,
+    /// The cores the relay runs on, whose work bounds the feeders admitted beside the memory
+    /// (`cores::feeders_carried`); none for a plan only its memory bounds (a test's).
+    pub cores: Option<usize>,
+    /// Whether the relay holds MLAT raw (it hosts MLAT): the base, each feeder's cost in the
+    /// stores and in the cores follow it.
+    pub holds_raw: bool,
 }
 
 impl Plan {
@@ -368,7 +376,23 @@ impl Plan {
             members: 0,
             member_feeders: 0,
             connections: 0,
+            cores: None,
+            holds_raw: hosts_mlat,
         }
+    }
+
+    /// The same plan on `cores` cores (`cores::cores_available`): the feeders admitted are no more
+    /// than they carry.
+    #[must_use]
+    pub fn with_cores(self, cores: Option<usize>) -> Self {
+        Self { cores, ..self }
+    }
+
+    /// The feeders the cores carry beside the members' rate (`cores::feeders_carried`), or none
+    /// as a bound when the cores are not planned.
+    pub fn core_feeders(&self) -> Option<usize> {
+        self.cores
+            .map(|cores| crate::cores::feeders_carried(cores, self.holds_raw, self.member_feeders))
     }
 
     /// The same plan holding `connections` connections at once, each with its Noise buffers.
@@ -885,6 +909,10 @@ pub struct Budget {
     member_feeders: usize,
     /// The connections whose buffers are planned (`Plan::with_connections`).
     connections: usize,
+    /// The cores planned (`Plan::with_cores`).
+    cores: Option<usize>,
+    /// Whether the relay holds MLAT raw (`Plan::holds_raw`).
+    holds_raw: bool,
     reserved: Arc<AtomicUsize>,
     /// Bytes the admitted members hold of their pool.
     members_reserved: Arc<AtomicUsize>,
@@ -920,6 +948,8 @@ impl Budget {
             members: 0,
             member_feeders: 0,
             connections: 0,
+            cores: None,
+            holds_raw: false,
             reserved: Arc::new(AtomicUsize::new(0)),
             members_reserved: Arc::new(AtomicUsize::new(0)),
             gauges,
@@ -940,6 +970,8 @@ impl Budget {
         self.members = plan.members;
         self.member_feeders = plan.member_feeders;
         self.connections = plan.connections;
+        self.cores = plan.cores;
+        self.holds_raw = plan.holds_raw;
         self.total = memory.saturating_sub(plan.before_feeders());
         self.limit_gauges();
     }
@@ -980,6 +1012,8 @@ impl Budget {
             members: self.members,
             member_feeders: self.member_feeders,
             connections: self.connections,
+            cores: self.cores,
+            holds_raw: self.holds_raw,
         }
     }
 
@@ -988,6 +1022,18 @@ impl Budget {
     /// it was given and what it needs.
     pub fn check(&self) -> Result<(), String> {
         let plan = self.plan();
+        if let (Some(cores), Some(0)) = (plan.cores, plan.core_feeders()) {
+            return Err(format!(
+                "{cores} cores carry no feeder beside the {} feeders its members' shared rate is \
+                 worth (--max-member-bytes-per-sec): planned at {}% busy, a core carries {} \
+                 planned feeders' work (ingest, deduplication, sealing and the connections \
+                 together, RFC-0181 \"Sizing\"); give it more cores (the unit's CPUQuota, the \
+                 container's limits.cpu, its CPU affinity) or plan a slower members' rate",
+                plan.member_feeders,
+                crate::cores::BUSY_PERCENT,
+                crate::cores::load_carried(1, plan.holds_raw),
+            ));
+        }
         let needed = Self::memory_for(1, plan);
         if self.memory >= needed && self.ceiling() > 0 {
             return Ok(());
@@ -1024,17 +1070,44 @@ impl Budget {
             .saturating_add(plan.per_feeder.total().saturating_mul(feeders))
     }
 
-    /// The most feeders the budget admits: the feeder ceiling.
+    /// The most feeders the budget admits: the feeder ceiling, the fewer of those its memory
+    /// holds ([`Budget::memory_feeders`]) and those its cores carry (`Plan::core_feeders`).
     pub fn ceiling(&self) -> usize {
+        let memory = self.memory_feeders();
+        self.plan()
+            .core_feeders()
+            .map_or(memory, |cores| cores.min(memory))
+    }
+
+    /// The feeders the memory holds beside what it holds before any.
+    pub fn memory_feeders(&self) -> usize {
         self.total
             .checked_div(self.per_feeder.total())
             .unwrap_or(usize::MAX)
     }
 
+    /// The planned feeders' worth of load the relay admits at its ceiling: its feeders and the
+    /// feeders its members' shared rate is worth. What its stages' threads are sized for.
+    pub fn load(&self) -> usize {
+        self.ceiling().saturating_add(self.member_feeders)
+    }
+
+    /// Each stage's threads for the load admitted ([`Budget::load`], `cores::threads_for`).
+    pub fn threads(&self) -> crate::ingest::Threads {
+        let plan = self.plan();
+        crate::cores::threads_for(self.load(), plan.holds_raw, plan.cores)
+    }
+
     /// Reserves one feeder's bytes in every store, or `None` when they do not fit (the Hello is
-    /// refused). Feeders reserve from their own room, never from the members' pool.
+    /// refused): no more feeders than the ceiling, whichever of the memory and the cores bounds
+    /// it. Feeders reserve from their own room, never from the members' pool.
     pub fn reserve(&self) -> Option<Reservation> {
-        Self::take(&self.reserved, self.per_feeder.total(), self.total)
+        let per_feeder = self.per_feeder.total();
+        Self::take(
+            &self.reserved,
+            per_feeder,
+            per_feeder.saturating_mul(self.ceiling()).min(self.total),
+        )
     }
 
     /// Reserves one member session's own bytes (its ingest allowance, `Plan::per_member`) from the
@@ -1284,6 +1357,55 @@ mod tests {
         assert!(memory_available() > 0);
     }
 
+    /// The cores bound the feeders as the memory does (`cores`): the ceiling is the fewer, a
+    /// feeder past it is refused at its Hello whatever room the memory has, every store's share
+    /// follows it, and the stages' threads follow the load admitted, the members' rate in it.
+    #[test]
+    fn the_cores_bound_the_ceiling_and_the_threads_follow_it() {
+        let members = Plan::planned(false).with_members(4, 16 * PLANNED_BYTES_PER_SEC as u64);
+        let memory = Budget::memory_for(10_000, members);
+        let unbounded = Budget::of_memory(memory, members);
+        assert_eq!(unbounded.ceiling(), 10_000);
+        let one = members.with_cores(Some(1));
+        let carried = crate::cores::feeders_carried(1, false, members.member_feeders);
+        assert!(carried > 0 && carried < 10_000, "{carried}");
+        let budget = Budget::of_memory(memory, one);
+        assert_eq!(
+            (budget.ceiling(), budget.memory_feeders()),
+            (carried, 10_000)
+        );
+        assert!(budget.check().is_ok());
+        let admitted: Vec<_> = (0..carried).filter_map(|_| budget.reserve()).collect();
+        assert_eq!(admitted.len(), carried);
+        assert!(
+            budget.reserve().is_none(),
+            "a feeder past the cores was admitted"
+        );
+        assert_eq!(
+            budget.store_bytes(Store::Dedup),
+            unbounded.store_bytes(Store::Dedup) - (10_000 - carried) * one.per_feeder.dedup
+        );
+        assert_eq!(budget.load(), carried + members.member_feeders);
+        assert_eq!(
+            budget.threads(),
+            crate::cores::threads_for(budget.load(), false, Some(1))
+        );
+        // Ten cores carry the 10,000 the memory holds: the memory bounds it, and the threads
+        // follow those feeders, more than one a stage.
+        let ten = Budget::of_memory(memory, members.with_cores(Some(10)));
+        assert_eq!(ten.ceiling(), 10_000);
+        assert!(ten.threads().message > 1 && ten.threads().ingest > 1);
+        // Cores that carry no more than the members' rate start no relay.
+        let rate = Plan::planned(false).with_members(
+            4,
+            (crate::cores::load_carried(1, false) * PLANNED_BYTES_PER_SEC) as u64,
+        );
+        let starved = Budget::of_memory(Budget::memory_for(10, rate), rate.with_cores(Some(1)));
+        assert_eq!(starved.ceiling(), 0);
+        let refusal = starved.check().err().unwrap_or_default();
+        assert!(refusal.contains("cores carry no feeder"), "{refusal}");
+    }
+
     #[test]
     fn a_relay_whose_memory_admits_no_feeder_will_not_start() {
         for hosts_mlat in [false, true] {
@@ -1318,6 +1440,8 @@ mod tests {
             members: 0,
             member_feeders: 0,
             connections: 0,
+            cores: None,
+            holds_raw: false,
         }
         .with_members(2, 3 * PLANNED_BYTES_PER_SEC as u64 + 1);
         // The rate is worth four feeders, planned once for both sessions.
