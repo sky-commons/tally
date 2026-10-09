@@ -24,6 +24,26 @@ use crate::relay::{Admission, Sample};
 use crate::subscriber::{Client, Snapshot};
 use crate::traffic::Traffic;
 
+/// How much nicer than the instruments the feeders run (`lower_priority`).
+const FEEDERS_NICE: libc::c_int = 5;
+
+/// Lowers the calling thread's priority below the harness's other threads: the simulation that
+/// makes the sky, the client that reads the relay and its decoders are the instruments, and when
+/// thousands of feeders ask for more cores than there are, the instruments must still get theirs
+/// (a client that cannot keep up is dropped by the relay as too slow, a simulation that falls
+/// behind starves the feeders it feeds), while a feeder that waits only delays its own batch.
+/// Run on each of the feeders' runtime threads as it starts. Failing, it leaves the thread as it is.
+pub fn lower_priority() {
+    // SAFETY: `gettid` and `setpriority` take and touch no memory of ours.
+    unsafe {
+        let _ = libc::setpriority(
+            libc::PRIO_PROCESS,
+            libc::gettid() as libc::id_t,
+            FEEDERS_NICE,
+        );
+    }
+}
+
 /// How often a progress line is printed.
 const PROGRESS_EVERY: Duration = Duration::from_secs(10);
 
@@ -162,11 +182,24 @@ pub async fn run(config: Config) -> Result<String, String> {
             config.spec.seconds
         );
         let spec = config.spec.clone();
-        let built = tokio::task::spawn_blocking(move || {
-            Traffic::build(&spec, local_range, traffic::Pace::Run)
-        })
-        .await
-        .map_err(|error| error.to_string())??;
+        let subscriber = config.subscriber || config.simulate_only;
+        // On a thread of its own, not the runtime's blocking pool: the simulation's threads
+        // inherit this one's priority, and the runtime's are the feeders' (`lower_priority`).
+        let (made, built) = tokio::sync::oneshot::channel();
+        std::thread::Builder::new()
+            .name("tally-load-build".to_owned())
+            .spawn(move || {
+                // Only the process with the subscriber counts what the whole run hears (its
+                // expectations); a feeders-only shard makes its own receivers' share.
+                let _ = made.send(Traffic::build_for(
+                    &spec,
+                    local_range,
+                    traffic::Pace::Run,
+                    subscriber,
+                ));
+            })
+            .map_err(|error| error.to_string())?;
+        let built = built.await.map_err(|error| error.to_string())??;
         let calibration = built.calibration;
         eprintln!(
             "tally-load: measured in {:.1} s: a receiver hears {:.0} receptions a second in \
@@ -217,13 +250,14 @@ pub async fn run(config: Config) -> Result<String, String> {
     };
     let client = Arc::new(Client::default());
     if config.subscriber {
-        tokio::spawn(subscriber::run(
+        subscriber::start(
             addresses[0].clone(),
             config.streams,
             config.verify,
             config.decode_threads,
+            config.client_sample,
             Arc::clone(&client),
-        ));
+        );
     }
     let counts = Arc::new(feeders::Counts::default());
     if let Some(traffic) = &traffic {
@@ -237,6 +271,7 @@ pub async fn run(config: Config) -> Result<String, String> {
                 networks: config.networks,
                 replay: config.replay,
                 seed: config.spec.seed,
+                deflate: config.deflate_level,
             },
             Arc::clone(&counts),
             tokio::time::Instant::now(),

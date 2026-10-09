@@ -61,6 +61,10 @@ pub enum Codec {
     /// with it is never larger than the plain one, and a size bound on the plain layout holds; and
     /// whenever it would inflate past `MAX_INFLATION` times its stream, so no reader refuses it.
     Deflate,
+    /// As `Deflate`, at compression level `n` (1 to 9) instead of the wire's own: the same layout
+    /// every reader takes, only the ratio and the time spent differ. For a load harness whose
+    /// thousands of feeders share the cores one reader has.
+    DeflateAt(u8),
 }
 /// The receiver-info layout this build writes.
 pub const RECEIVER_INFO_FORMAT: u8 = 1;
@@ -315,11 +319,15 @@ impl Batch {
         }
         let deflated = match codec {
             Codec::Plain => None,
-            Codec::Deflate => {
+            Codec::Deflate | Codec::DeflateAt(_) => {
                 if plain.len() > MAX_PLAIN_LEN {
                     return Err(WireError::Oversize(plain.len()));
                 }
-                let deflated = miniz_oxide::deflate::compress_to_vec(&plain, DEFLATE_LEVEL);
+                let level = match codec {
+                    Codec::DeflateAt(level) => level.clamp(1, 9),
+                    _ => DEFLATE_LEVEL,
+                };
+                let deflated = miniz_oxide::deflate::compress_to_vec(&plain, level);
                 // The length field and the stream must come out smaller, and within the wire's
                 // inflation rule, or the batch is plain.
                 (4 + deflated.len() < plain.len() && inflation_allowed(plain.len(), deflated.len()))

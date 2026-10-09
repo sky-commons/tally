@@ -10,14 +10,15 @@
 //! clock. While the relay carries what it is sized for nothing is cut. Over demand, each
 //! source's allowance is its max-min fair share:
 //!
-//! > `min(source ceiling, R_max x weight / active weight)`, and more where a source wants less
+//! > `R_max x weight / active weight`, and more where a source wants less
 //!
 //! A source is a [`Unit`]: a receiver this relay corroborated first-hand (it has earned credit,
 //! `credit::Credit::corroborated_receiver`), or else its network group, so a hundred keys behind
 //! one address block hold one share, not a hundred. Every unit weighs one.
 //!
 //! The division is the water-filling one: a source wanting less than the level keeps all it
-//! wants, and the rest share what those leave, none past the source ceiling; the level is found
+//! wants, and the rest share what those leave; with demand within `R_max` there is no level at
+//! all, so a group of any size is cut for nothing. The level is found
 //! again every quarter of [`ACTIVE_MS`] from each unit's attempted rate (`State::levelled`). A
 //! source wanting no more than the level is admitted whenever the bucket holds its batch. A
 //! source wanting more is kept to the level by what it has been admitted over the last
@@ -240,7 +241,7 @@ impl Shedder {
         Self::bounded_by(Rates::UNBOUNDED, Rates::UNBOUNDED)
     }
 
-    /// `rate` is `R_max`; `ceiling` is the most one source's share may be (the pace ceiling).
+    /// `rate` is `R_max`; `ceiling` is the per-receiver pace told to feeders, reported only: it is no cap on a group.
     pub fn new(rate: Rates, ceiling: Rates) -> Self {
         Self::bounded_by(rate, ceiling)
     }
@@ -378,27 +379,28 @@ impl Shedder {
 impl State {
     /// The rate each source may be admitted at, per dimension: the water level of a max-min
     /// fair division of `R_max`, where a source that wants less than the level keeps all it wants
-    /// and the rest share what those leave, none past the source ceiling. A relay under its rate
-    /// has no level below the ceiling. Weights are one each (a unit is one share, `Unit`).
+    /// and the rest share what those leave. A relay whose demand is within `R_max` has no level
+    /// (infinite): no group is held to a share however many receivers it holds. The per-receiver
+    /// pace (`ingest::ReceptionCeilings`) is not a group cap and is judged elsewhere. Weights are
+    /// one each (a unit is one share, `Unit`).
     fn levelled(&mut self, now: u64) {
-        let rate = self.rate.dims();
-        let ceiling = self.ceiling.dims();
-        for dim in 0..DIMS {
+        for (dim, &rate) in self.rate.dims().iter().enumerate() {
             let mut wants: Vec<f64> = self
                 .units
                 .values()
-                .map(|used| Self::faded(used, now, false)[dim].min(ceiling[dim]))
+                .map(|used| Self::faded(used, now, false)[dim])
                 .collect();
             wants.sort_unstable_by(f64::total_cmp);
-            let mut left = rate[dim];
+            let mut left = rate;
             let mut count = wants.len() as f64;
-            let mut level = ceiling[dim];
+            // Demand within `R_max` has no level: nothing is cut for a group's size.
+            let mut level = f64::INFINITY;
             for want in wants {
                 if want * count <= left {
                     left -= want;
                     count -= 1.0;
                 } else {
-                    level = (left / count).min(ceiling[dim]);
+                    level = left / count;
                     break;
                 }
             }
@@ -560,6 +562,73 @@ mod tests {
         }
         let report = shedder.report();
         assert_eq!(report.over_share.batches + report.relay_rate.batches, 0);
+    }
+
+    /// Many keys behind one group, as one unit, in tenths of a second.
+    fn run_group(shedder: &Shedder, unit: Unit, keys: u64, per_key: u64, seconds: u64) -> u64 {
+        let mut admitted = 0;
+        for tick in 0..seconds * 10 {
+            for key in 0..keys {
+                let stamp = tick * 100 + key * 100 / keys;
+                if shedder.judge(unit, cost(per_key / 10), stamp).is_ok() {
+                    admitted += per_key / 10;
+                }
+            }
+        }
+        admitted
+    }
+
+    #[test]
+    fn nothing_is_cut_while_demand_is_within_the_rate_whatever_the_group_layout() {
+        // One group of 100 keys at 90 a second each: 9,000 a second against 10,000, three times
+        // the source ceiling, all in one /16.
+        let shedder = Shedder::new(RATE, CEILING);
+        assert_eq!(
+            run_group(&shedder, group(1), 100, 90, 20),
+            9_000 * 20,
+            "a lone group within R_max is cut for nothing"
+        );
+        let report = shedder.report();
+        assert_eq!(report.over_share.batches + report.relay_rate.batches, 0);
+        // Two groups, one of them far past the ceiling, together within the rate.
+        let shedder = Shedder::new(RATE, CEILING);
+        let sources = [(group(1), 6_000), (group(2), 3_900)];
+        let admitted = run(&shedder, &sources, 20);
+        assert_eq!(got(&admitted, group(1)), 6_000 * 20);
+        assert_eq!(got(&admitted, group(2)), 3_900 * 20);
+    }
+
+    #[test]
+    fn past_the_rate_honest_groups_keep_their_share_and_a_sybil_group_holds_one() {
+        let seconds = 30;
+        let shedder = Shedder::new(RATE, CEILING);
+        // Four honest groups at 1,500 (6,000) and one Sybil group of 200 keys at 450 each
+        // (90,000): the Sybil holds the 4,000 the honest leave, as one share.
+        let sybil = group(500);
+        let mut honest = 0;
+        let mut hostile = 0;
+        for tick in 0..seconds * 10 {
+            for n in 0..4u16 {
+                let stamp = tick * 100 + u64::from(n) * 25;
+                if shedder.judge(group(n), cost(150), stamp).is_ok() {
+                    honest += 150;
+                }
+            }
+            for key in 0..200u64 {
+                if shedder
+                    .judge(sybil, cost(45), tick * 100 + 10 + key / 4)
+                    .is_ok()
+                {
+                    hostile += 45;
+                }
+            }
+        }
+        assert!(honest >= 4 * 1_500 * (seconds - 1), "honest kept {honest}");
+        assert!(
+            hostile <= 4_500 * seconds,
+            "the Sybil set holds one share: {hostile}"
+        );
+        assert!(hostile > 0);
     }
 
     #[test]

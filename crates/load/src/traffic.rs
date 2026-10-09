@@ -18,18 +18,25 @@
 //! F8 and F9). Before that, each loop replayed the period forward with every counter moved on by
 //! the period exactly, so every aircraft and every free-running clock jumped at each boundary.
 //!
+//! A cluster's sky is made by a few threads at once (`World::hear`): every draw is keyed by the
+//! seed, the transmission and the receiver, so a transmission's receptions come from any thread,
+//! and a shard makes only its own receivers' (a process that carries the subscriber also counts
+//! the rest, `Traffic::build_for`). What the serial simulation spent a thread a cluster on, one
+//! stream of draws and a clone of the message for every reception, is now work for the cores the
+//! feeders leave.
+//!
 //! The rate is set, not assumed: a first pass measures what each receiver would hear if it heard
 //! every transmission in reach, and the run keeps each reception with the probability that gives
 //! the rate asked for (`Spec::receptions_per_sec`).
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashSet, VecDeque};
 use std::hash::{DefaultHasher, Hash as _, Hasher as _};
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use tally_mlat_solver::sim::{self, Scenario};
+use tally_mlat_solver::sim::{self, Heard as Hearing, Scenario, World};
 use tally_wire::{Clock, Frame, FrameKind, Identity, Location};
 
 /// What to simulate.
@@ -328,6 +335,18 @@ impl Traffic {
     /// Measures the rate, then starts simulating the run's whole population, keeping what the
     /// receivers in `local` hear.
     pub fn build(spec: &Spec, local: Range<usize>, pace: Pace) -> Result<Self, String> {
+        Self::build_for(spec, local, pace, true)
+    }
+
+    /// As `build`; `census` says whether this process counts what the whole run's receivers hear
+    /// (`Made`, which the subscriber's expectations read), else only its own receivers'.
+    pub fn build_for(
+        spec: &Spec,
+        local: Range<usize>,
+        pace: Pace,
+        census: bool,
+    ) -> Result<Self, String> {
+        let workers = sim_workers();
         let sizes = layout(spec.feeders);
         let total: usize = sizes.iter().sum();
         if total == 0 {
@@ -347,9 +366,24 @@ impl Traffic {
                 continue;
             }
             let scenario = scenario(spec, cluster, receivers, 2.0, 1.0);
-            sim::run_into(&scenario, &mut |reception, _| {
-                in_reach += u64::from(second_of(&scenario, reception.wall_ms) == 1);
-            });
+            let world = World::build(&scenario);
+            let everyone = 0..receivers;
+            in_reach += in_chunks(world.transmissions.len(), workers, |range| {
+                let (mut near, mut heard) = (Vec::new(), Vec::new());
+                let mut count = 0u64;
+                for index in range {
+                    heard.clear();
+                    world.hear(index, &everyone, false, 1.0, &mut near, &mut heard);
+                    count += heard
+                        .iter()
+                        .filter(|each| second_of(&scenario, each.wall_ms) == 1)
+                        .count() as u64;
+                }
+                count
+            })
+            .into_iter()
+            .map(|(_, count)| count)
+            .sum::<u64>();
         }
         let in_reach_per_sec = in_reach as f64 / total as f64;
         if in_reach_per_sec <= 0.0 {
@@ -393,11 +427,9 @@ impl Traffic {
                 duration_s: 1.0,
                 ..scenario.clone()
             });
-            let mut by: HashMap<tally_wire::PublicKey, usize> = HashMap::new();
             for index in mine.clone() {
                 let within = index - cluster_range.start;
                 let simulated = &sites.receivers[within];
-                by.insert(simulated.key, index - mine.start);
                 receivers.push(Receiver {
                     index,
                     identity: sim::receiver_identity(scenario.seed, within),
@@ -408,10 +440,10 @@ impl Traffic {
                 });
             }
             let shared = Arc::clone(&shared);
-            let slots = mine.len();
+            let within = mine.start - cluster_range.start..mine.end - cluster_range.start;
             std::thread::Builder::new()
                 .name(format!("tally-load-sim-{cluster}"))
-                .spawn(move || simulate(&scenario, cluster, slots, &by, &shared))
+                .spawn(move || simulate(&scenario, cluster, &within, census, workers, &shared))
                 .map_err(|error| error.to_string())?;
         }
         let first = Scenario::new(0);
@@ -548,58 +580,115 @@ impl Traffic {
     }
 }
 
-/// Runs one cluster's scenario forward in time, handing each second to the feeders once it has
-/// passed it: the body of that cluster's simulation thread.
-fn simulate(
-    scenario: &Scenario,
+/// Threads that make one cluster's sky at once: a quarter of the cores this process may use,
+/// since the feeders need the rest.
+fn sim_workers() -> usize {
+    std::thread::available_parallelism()
+        .map_or(2, std::num::NonZero::get)
+        .div_ceil(4)
+        .clamp(1, 8)
+}
+
+/// Splits `0..count` into at most `workers` contiguous ranges, runs `work` on each on a thread of
+/// its own, and returns each range with what its work made, in order.
+fn in_chunks<T: Send>(
+    count: usize,
+    workers: usize,
+    work: impl Fn(Range<usize>) -> T + Sync,
+) -> Vec<(Range<usize>, T)> {
+    let each = count.div_ceil(workers.max(1)).max(1);
+    let ranges: Vec<Range<usize>> = (0..count)
+        .step_by(each)
+        .map(|from| from..(from + each).min(count))
+        .collect();
+    if ranges.len() <= 1 {
+        return ranges
+            .into_iter()
+            .map(|range| (range.clone(), work(range)))
+            .collect();
+    }
+    std::thread::scope(|scope| {
+        let work = &work;
+        let handles: Vec<_> = ranges
+            .iter()
+            .map(|range| {
+                let range = range.clone();
+                scope.spawn(move || work(range))
+            })
+            .collect();
+        ranges
+            .iter()
+            .cloned()
+            .zip(handles)
+            .map(|(range, handle)| match handle.join() {
+                Ok(made) => (range, made),
+                Err(panic) => std::panic::resume_unwind(panic),
+            })
+            .collect()
+    })
+}
+
+/// Transmissions made at once by the threads, before their receptions are put in order: about a
+/// tenth of a second of a cluster's sky.
+const BLOCK: usize = 4_096;
+
+/// One cluster's seconds as they are made: the receptions, in the order the transmissions were
+/// sent, put in their seconds and handed to the feeders once the simulation has passed them.
+struct Maker<'a> {
+    scenario: &'a Scenario,
     cluster: usize,
     slots: usize,
-    by: &HashMap<tally_wire::PublicKey, usize>,
-    shared: &Shared,
-) {
-    // Seconds being made, from `base`.
-    let mut making: VecDeque<Making> = VecDeque::new();
-    let mut base = 0u64;
-    let mut dedup = Dedup::default();
-    let hand = |making: &mut VecDeque<Making>, base: &mut u64, dedup: &mut Dedup, upto: u64| {
-        while *base < upto {
+    shared: &'a Shared,
+    /// Seconds being made, from `base`.
+    making: VecDeque<Making>,
+    base: u64,
+    dedup: Dedup,
+}
+
+impl Maker<'_> {
+    /// Hands over the seconds before `upto`.
+    fn hand(&mut self, upto: u64) {
+        while self.base < upto {
             // A second nobody heard anything in is handed over empty.
-            let mut done = making.pop_front().unwrap_or_else(|| Making::new(slots));
+            let mut done = self
+                .making
+                .pop_front()
+                .unwrap_or_else(|| Making::new(self.slots));
             done.made.contents = done.contents.len() as u64;
-            done.made.deduplicated = dedup.keep(&done.contents);
-            if let Ok(mut made) = shared.clusters[cluster].lock() {
-                made.seconds.insert(*base, Arc::new(done.second));
+            done.made.deduplicated = self.dedup.keep(&done.contents);
+            if let Ok(mut made) = self.shared.clusters[self.cluster].lock() {
+                made.seconds.insert(self.base, Arc::new(done.second));
                 made.made.push(done.made);
-                made.whole_to = *base + 1;
-                if shared.paced {
-                    let keep_from = shared.playing().unwrap_or(0).saturating_sub(KEPT_S);
+                made.whole_to = self.base + 1;
+                if self.shared.paced {
+                    let keep_from = self.shared.playing().unwrap_or(0).saturating_sub(KEPT_S);
                     made.seconds = made.seconds.split_off(&keep_from);
                 }
             }
-            *base += 1;
-            shared.handed.notify_all();
+            self.base += 1;
+            self.shared.handed.notify_all();
         }
-    };
-    sim::run_into_in_time_order(scenario, &mut |reception, source| {
-        if shared.stopped.load(Ordering::Relaxed) {
-            return;
-        }
-        let Some(second) = second_of(scenario, reception.wall_ms).checked_sub(SKIPPED_S) else {
+    }
+
+    /// One reception of transmission `source` (whose message is `data`), heard by the receiver in
+    /// `slot` if it is one of this process's, else only counted.
+    fn take(&mut self, source: usize, data: &[u8], hearing: &Hearing, slot: Option<usize>) {
+        let Some(second) = second_of(self.scenario, hearing.wall_ms).checked_sub(SKIPPED_S) else {
             return;
         };
-        if second < base {
+        if second < self.base {
             // Past a second already handed over (by more than `SETTLED_S`): never, since a
             // reception is heard milliseconds after its transmission; dropped rather than late.
             return;
         }
-        if second > base + SETTLED_S {
-            hand(&mut making, &mut base, &mut dedup, second - SETTLED_S);
-            shared.wait_to_make(second);
+        if second > self.base + SETTLED_S {
+            self.hand(second - SETTLED_S);
+            self.shared.wait_to_make(second);
         }
-        while making.len() as u64 <= second - base {
-            making.push_back(Making::new(slots));
+        while self.making.len() as u64 <= second - self.base {
+            self.making.push_back(Making::new(self.slots));
         }
-        let Some(now) = making.get_mut((second - base) as usize) else {
+        let Some(now) = self.making.get_mut((second - self.base) as usize) else {
             return;
         };
         now.made.receptions += 1;
@@ -607,25 +696,83 @@ fn simulate(
             Some((last, at)) if last == source => at,
             _ => {
                 now.made.transmissions += 1;
-                now.contents
-                    .insert(content_hash(&reception.observation.data));
+                now.contents.insert(content_hash(data));
                 let at = now.second.messages.len() as u32;
-                now.second.messages.push(reception.observation.data.clone());
+                now.second.messages.push(data.to_vec());
                 now.last = Some((source, at));
                 at
             }
         };
-        if let Some(&slot) = by.get(&reception.receiver)
+        if let Some(slot) = slot
             && let Some(heard) = now.second.heard.get_mut(slot)
         {
             heard.push(Heard {
-                stamp: reception.observation.timestamp,
+                stamp: hearing.counter,
                 message,
             });
         }
-    });
-    let end = base + making.len() as u64;
-    hand(&mut making, &mut base, &mut dedup, end);
+    }
+}
+
+/// Runs one cluster's scenario forward in time, handing each second to the feeders once it has
+/// passed it: the body of that cluster's simulation thread. The receivers `mine` (by index in the
+/// cluster) are kept; with `census` every receiver's receptions are counted.
+fn simulate(
+    scenario: &Scenario,
+    cluster: usize,
+    mine: &Range<usize>,
+    census: bool,
+    workers: usize,
+    shared: &Shared,
+) {
+    let world = World::build(scenario);
+    let order = world.in_time_order();
+    let mut maker = Maker {
+        scenario,
+        cluster,
+        slots: mine.len(),
+        shared,
+        making: VecDeque::new(),
+        base: 0,
+        dedup: Dedup::default(),
+    };
+    'blocks: for block in order.chunks(BLOCK) {
+        let parts = in_chunks(block.len(), workers, |range| {
+            let (mut near, mut heard) = (Vec::new(), Vec::new());
+            let mut counts = Vec::with_capacity(range.len());
+            for &index in &block[range] {
+                let before = heard.len();
+                world.hear(
+                    index,
+                    mine,
+                    census,
+                    scenario.reception_probability,
+                    &mut near,
+                    &mut heard,
+                );
+                counts.push(heard.len() - before);
+            }
+            (heard, counts)
+        });
+        for (range, (heard, counts)) in parts {
+            let mut at = 0;
+            for (&index, count) in block[range].iter().zip(counts) {
+                let data = &world.transmissions[index].data;
+                for each in &heard[at..at + count] {
+                    if shared.stopped.load(Ordering::Relaxed) {
+                        break 'blocks;
+                    }
+                    let slot = mine
+                        .contains(&each.receiver)
+                        .then(|| each.receiver - mine.start);
+                    maker.take(index, data, each, slot);
+                }
+                at += count;
+            }
+        }
+    }
+    let end = maker.base + maker.making.len() as u64;
+    maker.hand(end);
     if let Ok(mut made) = shared.clusters[cluster].lock() {
         made.whole_to = u64::MAX;
     }
@@ -647,6 +794,8 @@ pub fn shift_time_of_day(stamp: u64, to_unix_ms: u64, from_unix_ms: u64) -> u64 
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
 
     fn small(feeders: usize, receptions_per_sec: f64, seconds: u32) -> Spec {

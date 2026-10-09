@@ -161,6 +161,7 @@ pub struct Batcher {
     /// The relays' wanted ceilings this batcher sheds to, and its bucket at the one it last read.
     wanted: Arc<WantedCeilings>,
     wanted_bucket: Option<(u32, TokenBucket)>,
+    codec: Codec,
 }
 
 impl Batcher {
@@ -186,7 +187,16 @@ impl Batcher {
             bucket: TokenBucket::new(ceiling),
             wanted: Arc::default(),
             wanted_bucket: None,
+            codec: Codec::Deflate,
         }
+    }
+
+    /// Compresses at DEFLATE level `level` instead of the wire's own (`Codec::DeflateAt`).
+    pub fn compressing_at(mut self, level: Option<u8>) -> Self {
+        if let Some(level) = level {
+            self.codec = Codec::DeflateAt(level);
+        }
+        self
     }
 
     /// Sheds wanted receptions to `ceilings` (what the relays it publishes to stated), counted as
@@ -200,7 +210,7 @@ impl Batcher {
     /// A second's worth at once, as a relay holds it (`tally_relay::ingest::FEEDER_RECEPTIONS_BURST_SECS`
     /// allows a second more for the batches' arrival). The bucket follows the ceiling as it
     /// changes, keeping what it held.
-    fn wanted_fits(&mut self) -> bool {
+    fn wanted_fits(&mut self, now: Instant) -> bool {
         let Some(ceiling) = self.wanted.least() else {
             self.wanted_bucket = None;
             return true;
@@ -216,7 +226,7 @@ impl Batcher {
                 &mut held.insert((ceiling, bucket)).1
             }
         };
-        bucket.take(1)
+        bucket.take_at(1, now)
     }
 
     /// Takes what a reader sent. A batch is returned when the input had to seal one first.
@@ -228,11 +238,27 @@ impl Batcher {
         }
     }
 
+    /// The frames one read of a decoder's port gave, as `observe` takes each: every batch that
+    /// sealed on the way (a full one) is appended to `sealed`.
+    pub fn take_frames(&mut self, frames: &[Frame], sealed: &mut Vec<Batch>) -> Result<(), String> {
+        let now = Instant::now();
+        for frame in frames {
+            sealed.extend(self.observe_at(frame, now)?);
+        }
+        Ok(())
+    }
+
     /// A 1090 MHz frame. A free-running counter that ran backwards seals what came before it, so
     /// a batch never holds counters from two epochs. A Radarcape's GPS counter is time of day and
     /// runs back every UTC midnight by design, so for it only a reconnect starts an epoch. A frame
     /// with no timestamp (0) says nothing about the counter.
     pub fn observe(&mut self, frame: &Frame) -> Result<Option<Batch>, String> {
+        self.observe_at(frame, Instant::now())
+    }
+
+    /// As `observe`, with the upload ceiling and the relays' wanted ceiling refilled to `now`: a
+    /// reader that hands over what one read decoded reads the clock once for all of it.
+    pub fn observe_at(&mut self, frame: &Frame, now: Instant) -> Result<Option<Batch>, String> {
         let counter = frame.timestamp();
         let mut sealed = None;
         if counter != 0 {
@@ -246,19 +272,28 @@ impl Batcher {
             self.last_counter = Some(counter);
         }
         // After a restart the batch is empty, so this reception cannot seal a second one.
-        let pushed = self.push(Observation::from_beast(frame))?;
+        let pushed = self.push_at(Observation::from_beast(frame), now)?;
         Ok(sealed.or(pushed))
     }
 
     /// A reception of any format, under the ceiling or dropped and counted. If it would take the
     /// batch past what one message carries, what gathered before it is sealed first and returned.
     pub fn push(&mut self, observation: Observation) -> Result<Option<Batch>, String> {
+        self.push_at(observation, Instant::now())
+    }
+
+    /// As `push`, at `now` (`observe_at`).
+    pub fn push_at(
+        &mut self,
+        observation: Observation,
+        now: Instant,
+    ) -> Result<Option<Batch>, String> {
         let cost = 1 + 6 + 1 + 2 + observation.data.len();
         // A wanted reception past the relays' ceiling is shed here, before it is signed: the
         // relay would drop the batch it took past it (F4 of sweep 6).
         let shed = tally_wire::modes::wanted_reception(observation.format, &observation.data)
-            && !self.wanted_fits();
-        if shed || cost > MAX_OBSERVATION_BYTES || !self.bucket.take(cost) {
+            && !self.wanted_fits(now);
+        if shed || cost > MAX_OBSERVATION_BYTES || !self.bucket.take_at(cost, now) {
             self.dropped = self.dropped.saturating_add(1);
             return Ok(None);
         }
@@ -305,7 +340,7 @@ impl Batcher {
             observations: std::mem::take(&mut self.observations),
         };
         // Compressed: every relay reads it (wire version 2 is the minimum).
-        let batch = Batch::sign_with(&self.identity, &content, Codec::Deflate)
+        let batch = Batch::sign_with(&self.identity, &content, self.codec)
             .map_err(|error| error.to_string())?;
         self.sequence += 1;
         self.previous = batch.hash();
@@ -343,28 +378,45 @@ pub enum Input {
     CounterRestarted,
 }
 
+/// What crosses the channel: one input, or the frames one read of a decoder's port decoded (one
+/// message for all of them, not one each).
+enum Message {
+    One(Input),
+    Frames(Vec<Frame>),
+}
+
 /// A source reader's end of the channel to the batcher.
 #[derive(Clone)]
 pub struct Inputs {
-    sender: mpsc::Sender<Input>,
+    sender: mpsc::Sender<Message>,
     overflow: Arc<AtomicU32>,
+    /// Receptions sent and not yet taken: the backlog is counted in receptions, whether they
+    /// crossed one at a time or a read's worth at once.
+    queued: Arc<AtomicU32>,
 }
 
 /// The batcher's end.
 pub struct Intake {
-    receiver: mpsc::Receiver<Input>,
+    receiver: mpsc::Receiver<Message>,
     overflow: Arc<AtomicU32>,
+    queued: Arc<AtomicU32>,
 }
 
 pub fn channel() -> (Inputs, Intake) {
     let (sender, receiver) = mpsc::channel(INPUT_BACKLOG);
     let overflow = Arc::new(AtomicU32::new(0));
+    let queued = Arc::new(AtomicU32::new(0));
     (
         Inputs {
             sender,
             overflow: Arc::clone(&overflow),
+            queued: Arc::clone(&queued),
         },
-        Intake { receiver, overflow },
+        Intake {
+            receiver,
+            overflow,
+            queued,
+        },
     )
 }
 
@@ -374,14 +426,36 @@ impl Inputs {
     /// for a source that is not a decoder's port: the load harness (`tally-load`) offers a
     /// simulated receiver's receptions here, so its batches are this batcher's own.
     pub fn offer(&self, input: Input) {
-        if let Err(mpsc::error::TrySendError::Full(_)) = self.sender.try_send(input) {
-            self.overflow.fetch_add(1, Ordering::Relaxed);
+        self.send(Message::One(input), 1);
+    }
+
+    /// Sends `message` of `count` receptions unless that would put more than `INPUT_BACKLOG`
+    /// receptions in the channel: then it is dropped, counted.
+    fn send(&self, message: Message, count: u32) {
+        let before = self.queued.fetch_add(count, Ordering::Relaxed);
+        if before.saturating_add(count) > INPUT_BACKLOG as u32
+            || self.sender.try_send(message).is_err()
+        {
+            self.queued.fetch_sub(count, Ordering::Relaxed);
+            self.overflow.fetch_add(count, Ordering::Relaxed);
+        }
+    }
+
+    /// The frames one read decoded, as `offer` takes one: if the batcher is behind, all of them
+    /// are dropped and counted.
+    pub fn offer_frames(&self, frames: Vec<Frame>) {
+        let count = u32::try_from(frames.len()).unwrap_or(u32::MAX);
+        if count > 0 {
+            self.send(Message::Frames(frames), count);
         }
     }
 
     /// An epoch change is not a reception and is never dropped.
     async fn counter_restarted(&self) {
-        let _ = self.sender.send(Input::CounterRestarted).await;
+        let _ = self
+            .sender
+            .send(Message::One(Input::CounterRestarted))
+            .await;
     }
 }
 
@@ -396,10 +470,26 @@ pub async fn batch(mut batcher: Batcher, mut intake: Intake, out: broadcast::Sen
                     flush(&mut batcher, &intake.overflow, &out);
                     return;
                 };
-                match batcher.take(input) {
-                    Ok(Some(batch)) => publish(&out, batch),
-                    Ok(None) => {}
-                    Err(error) => eprintln!("tally-feed: signing a batch: {error}"),
+                let taken = match &input {
+                    Message::One(_) => 1,
+                    Message::Frames(frames) => u32::try_from(frames.len()).unwrap_or(u32::MAX),
+                };
+                intake.queued.fetch_sub(taken, Ordering::Relaxed);
+                match input {
+                    Message::One(input) => match batcher.take(input) {
+                        Ok(Some(batch)) => publish(&out, batch),
+                        Ok(None) => {}
+                        Err(error) => eprintln!("tally-feed: signing a batch: {error}"),
+                    },
+                    Message::Frames(frames) => {
+                        let mut sealed = Vec::new();
+                        if let Err(error) = batcher.take_frames(&frames, &mut sealed) {
+                            eprintln!("tally-feed: signing a batch: {error}");
+                        }
+                        for batch in sealed {
+                            publish(&out, batch);
+                        }
+                    }
                 }
                 if batcher.is_full() {
                     flush(&mut batcher, &intake.overflow, &out);
@@ -453,11 +543,13 @@ async fn read_beast_stream(
         if length == 0 {
             return Err("closed".to_owned());
         }
+        let mut frames = Vec::new();
         decoder.push(&buffer[..length], |frame| {
             if !*refusing {
-                inputs.offer(Input::Frame(frame));
+                frames.push(frame);
             }
         });
+        inputs.offer_frames(frames);
         if decoder.is_merged() && !*refusing {
             *refusing = true;
             eprintln!(
@@ -609,6 +701,46 @@ mod tests {
             batcher.push(reception(&wanted, tally_wire::batch::format::MODE_S_SHORT))?;
         }
         assert_eq!(content(&batcher.seal()?.ok_or("no batch")?)?.dropped, 0);
+        Ok(())
+    }
+
+    /// The frames one read decoded take as each would one at a time: the same batches, in the
+    /// same order, a full one sealed on the way, and what the channel holds is counted in
+    /// receptions however they crossed it.
+    #[test]
+    fn a_reads_frames_batch_as_they_would_one_at_a_time() -> Result<(), String> {
+        let frames = (1..=4_000u64).map(frame).collect::<Result<Vec<_>, _>>()?;
+        let mut together = batcher(100_000_000)?;
+        let mut sealed = Vec::new();
+        together.take_frames(&frames, &mut sealed)?;
+        sealed.extend(together.seal()?);
+        assert!(sealed.len() >= 2, "a full batch seals on the way");
+        let counters = |batches: &[Batch]| -> Result<Vec<u64>, String> {
+            let mut all = Vec::new();
+            for batch in batches {
+                all.extend(
+                    content(batch)?
+                        .observations
+                        .iter()
+                        .map(|each| each.timestamp),
+                );
+            }
+            Ok(all)
+        };
+        assert_eq!(counters(&sealed)?, (1..=4_000).collect::<Vec<u64>>());
+        for pair in sealed.windows(2) {
+            assert_eq!(content(&pair[1])?.previous, pair[0].hash());
+        }
+        let (inputs, mut intake) = channel();
+        inputs.offer_frames(frames[..3_000].to_vec());
+        inputs.offer_frames(frames[..3_000].to_vec());
+        // 3,000 and 3,000 receptions against a backlog of 4,096: the second is dropped, counted.
+        assert_eq!(intake.overflow.load(Ordering::Relaxed), 3_000);
+        assert!(matches!(
+            intake.receiver.try_recv(),
+            Ok(Message::Frames(taken)) if taken.len() == 3_000
+        ));
+        assert!(intake.receiver.try_recv().is_err());
         Ok(())
     }
 

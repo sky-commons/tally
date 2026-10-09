@@ -8,7 +8,6 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use tally_feed::config::Config;
-use tally_feed::source::Input;
 use tally_wire::RelayAddress;
 
 use crate::traffic::Traffic;
@@ -42,6 +41,8 @@ pub struct Run {
     pub replay: usize,
     /// The simulation's seed, from which the identities of the replaying feeders are made.
     pub seed: u64,
+    /// The DEFLATE level the feeders compress at (`None`: the wire's own).
+    pub deflate: Option<u8>,
 }
 
 /// Starts this shard's feeders, the `i`-th of them after `ramp * i / n`, each publishing to one of
@@ -60,6 +61,7 @@ pub fn spawn(run: Run, counts: Arc<Counts>, start: tokio::time::Instant) {
         networks,
         replay,
         seed,
+        deflate,
     } = run;
     let relays = relays.as_slice();
     let state_dir = state_dir.as_path();
@@ -103,6 +105,7 @@ pub fn spawn(run: Run, counts: Arc<Counts>, start: tokio::time::Instant) {
             clock: receiver.clock,
             ceiling,
             source_address: networks.source_address(index, loopback),
+            deflate_level: deflate,
         };
         let identity = if round == 0 {
             receiver.identity.clone()
@@ -141,9 +144,7 @@ pub fn spawn(run: Run, counts: Arc<Counts>, start: tokio::time::Instant) {
                 let now = elapsed.as_secs();
                 if now != second {
                     // What was left of the last second goes with it; a receiver never holds one back.
-                    for frame in &frames[handed..] {
-                        inputs.offer(Input::Frame(*frame));
-                    }
+                    inputs.offer_frames(frames[handed..].to_vec());
                     counts
                         .offered
                         .fetch_add(frames.len() as u64, Ordering::Relaxed);
@@ -159,9 +160,7 @@ pub fn spawn(run: Run, counts: Arc<Counts>, start: tokio::time::Instant) {
                 // The share of this second's receptions due by now.
                 let tenth = u64::from(elapsed.subsec_millis()) * SLICES_A_SECOND / 1000 + 1;
                 let due = (frames.len() as u64 * tenth / SLICES_A_SECOND) as usize;
-                for frame in &frames[handed..due.max(handed)] {
-                    inputs.offer(Input::Frame(*frame));
-                }
+                inputs.offer_frames(frames[handed..due.max(handed)].to_vec());
                 handed = due.max(handed);
             }
         });

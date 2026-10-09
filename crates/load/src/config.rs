@@ -54,6 +54,14 @@ The load:
                          about 320 receptions a second, since a simulated aircraft sends about
                          3.4 messages a second; 9,000 reach 600)
   --seed S               the simulation's seed (default 0: the world benchmark's clusters)
+  --client-sample N      the client decodes one raw batch in N (default 1, all): the rest are
+                         counted from their own receptions count and followed by sequence, so
+                         receptions, bytes and losses stay whole, while the latency, the
+                         coverage line and the feeders' drops are of the sample. Decoding every
+                         batch of 12 M receptions a second takes about 3 cores
+  --deflate-level N      the DEFLATE level the feeders compress their batches at, 1 to 9, or 0 for
+                         the wire's own, 6 (default 2: within 2% of the size, a quarter of the
+                         time, which is what lets one box's cores carry 20,000 feeders)
   --replay K             make traffic for N/K receivers and have K feeders play each (the first
                          with the receiver's identity, the rest with identities of their own that
                          hear what it hears): for runs of more feeders than the simulation (one
@@ -91,6 +99,11 @@ Limits of the host, checked at start:
   by default): widen it to 1024 65535, or give the relay more addresses (--relay at
   127.0.0.2..127.0.0.N with --relay-listen 0.0.0.0:PORT, or more shards on more hosts).
 ";
+
+/// The DEFLATE level the simulated feeders compress at: compressing a batch is half of what a
+/// harness spends, and level 2 makes batches within 2% of the wire's level 6 in a quarter of the
+/// time (860 receptions: 13.6 against 13.4 bytes a reception).
+const DEFAULT_DEFLATE_LEVEL: u8 = 2;
 
 /// Seconds simulated past the measured window's end.
 const RUN_SPARE: Duration = Duration::from_secs(30);
@@ -221,6 +234,11 @@ pub struct Config {
     pub networks: Networks,
     /// Feeders playing each simulated receiver (`--replay`).
     pub replay: usize,
+    /// The DEFLATE level the feeders compress their batches at (`--deflate-level`); `None` is the
+    /// wire's own.
+    pub deflate_level: Option<u8>,
+    /// The client decodes one raw batch in this many (`--client-sample`).
+    pub client_sample: u32,
 }
 
 /// `None` when the command was fully handled (usage).
@@ -262,6 +280,8 @@ pub fn parse(args: impl Iterator<Item = String>) -> Result<Option<Config>, Strin
         simulate_only: false,
         networks: Networks::Auto,
         replay: 1,
+        deflate_level: Some(DEFAULT_DEFLATE_LEVEL),
+        client_sample: 1,
     };
     let mut args = args.peekable();
     while let Some(flag) = args.next() {
@@ -296,6 +316,14 @@ pub fn parse(args: impl Iterator<Item = String>) -> Result<Option<Config>, Strin
             "--decode-threads" => config.decode_threads = number(&flag, &value()?)?,
             "--state-dir" => config.state_dir = PathBuf::from(value()?),
             "--simulate-only" => config.simulate_only = true,
+            "--client-sample" => config.client_sample = number::<u32>(&flag, &value()?)?.max(1),
+            "--deflate-level" => {
+                let level: u8 = number(&flag, &value()?)?;
+                if level > 9 {
+                    return Err("--deflate-level: 0 to 9".to_owned());
+                }
+                config.deflate_level = (level != 0).then_some(level);
+            }
             "--replay" => config.replay = number::<usize>(&flag, &value()?)?.max(1),
             "--feeder-networks" => config.networks = Networks::parse(&value()?)?,
             other => return Err(format!("unknown argument {other}\n\n{USAGE}")),

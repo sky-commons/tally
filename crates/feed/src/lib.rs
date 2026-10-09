@@ -113,7 +113,9 @@ pub fn start(
     }));
     let (inputs, intake) = source::channel();
     let batching = source::batch(
-        Batcher::new(identity, config.ceiling, config.clock).shedding_to(wanted),
+        Batcher::new(identity, config.ceiling, config.clock)
+            .shedding_to(wanted)
+            .compressing_at(config.deflate_level),
         intake,
         batches,
     );
