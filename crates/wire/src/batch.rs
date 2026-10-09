@@ -462,6 +462,48 @@ impl Batch {
         Ok(self.inflated_len()?.saturating_sub(4) / crate::decoded::OBSERVATION_FIXED)
     }
 
+    /// The receptions this batch states it holds (`count u32`, the first four bytes of its
+    /// observations): exactly what a decode of it reads, if it decodes at all, since a decode
+    /// reads that many and refuses a batch whose bytes cannot hold them. Read without decoding
+    /// anything: a plain batch's from its bytes, a compressed one's by inflating its first four
+    /// bytes alone. What a relay paces a feeder's receptions by before the batch reaches a worker
+    /// (`tally_relay::link`); `receptions_at_most` overstates an honest batch by its messages'
+    /// bytes, some twice.
+    pub fn receptions(&self) -> Result<usize, WireError> {
+        let (_, layout) = self.layout()?;
+        let mut count = [0u8; 4];
+        match layout {
+            Layout::Plain(range) => {
+                let bytes =
+                    self.bytes
+                        .get(range.start..range.start + 4)
+                        .ok_or(WireError::Truncated {
+                            needed: 4,
+                            had: range.len(),
+                        })?;
+                count.copy_from_slice(bytes);
+            }
+            Layout::Deflate { stream, .. } => {
+                use miniz_oxide::inflate::core::{DecompressorOxide, decompress, inflate_flags};
+                let mut inflater = Box::<DecompressorOxide>::default();
+                let (_, _, written) = decompress(
+                    &mut inflater,
+                    &self.bytes[stream],
+                    &mut count,
+                    0,
+                    inflate_flags::TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF,
+                );
+                if written < 4 {
+                    return Err(WireError::Invalid {
+                        field: "compressed batch",
+                        value: written as u64,
+                    });
+                }
+            }
+        }
+        Ok(u32::from_be_bytes(count) as usize)
+    }
+
     /// The fixed fields, and where the observations are, for a format this build reads: a
     /// compressed batch's stated length already held to the wire's rule (`inflation_allowed`).
     fn layout(&self) -> Result<(Header, Layout), WireError> {

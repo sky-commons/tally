@@ -184,10 +184,8 @@ pub struct Engine {
     provisional: Provisional,
     /// Batches waiting for a description let go, since it started.
     orphaned: Orphaned,
-    /// The step the window job handed out last was prepared at, and the models window steps
-    /// published, each with the step from which provisional solving takes it up
-    /// (`MODELS_RIPEN_MS`).
-    window_ms: u64,
+    /// The models window steps published, each with the step from which provisional solving
+    /// takes it up (`MODELS_RIPEN_MS` after its window's due step).
     ripening: Vec<(u64, provisional::Carried)>,
 }
 
@@ -243,7 +241,6 @@ impl Engine {
             dropped: Dropped::default(),
             provisional: Provisional::hosted(),
             orphaned: Orphaned::default(),
-            window_ms: 0,
             ripening: Vec::new(),
         }
     }
@@ -300,9 +297,7 @@ impl Engine {
                     let (_, notes) = intake.ingest_verified(&batch);
                     self.provisional.hear_notes(&batch, notes, stamp_ms);
                 }
-                for key in &described.left {
-                    self.forget_receiver(key);
-                }
+                self.forget_receivers(&described.left);
                 Ok(described.ingested)
             }
             Record::Batch(batch) => self.receive(batch, now_ms),
@@ -315,8 +310,15 @@ impl Engine {
     /// Forgets `receiver` in the sealed bins: it stopped taking part (its intake forgot its open
     /// raw).
     pub fn forget_receiver(&mut self, receiver: &PublicKey) {
+        self.forget_receivers(std::slice::from_ref(receiver));
+    }
+
+    /// Forgets every one of `receivers` in the sealed bins at once: each bin that held any of
+    /// them sealed again once, however many left together (`SealedBins::forget_receivers`), never
+    /// once a receiver.
+    pub fn forget_receivers(&mut self, receivers: &[PublicKey]) {
         self.sealed
-            .forget_receiver(receiver, self.settings.threads.max(1));
+            .forget_receivers(receivers, self.settings.threads.max(1));
     }
 
     /// Changes what the engine covers, as a relay hosting it does when the areas it is an MLAT
@@ -331,10 +333,8 @@ impl Engine {
         self.settings.regions.clone_from(&regions);
         self.owned = owned;
         if let Some(intake) = self.intake.as_mut() {
-            for key in intake.set_scope(Some(regions)).left {
-                self.sealed
-                    .forget_receiver(&key, self.settings.threads.max(1));
-            }
+            let left = intake.set_scope(Some(regions)).left;
+            self.forget_receivers(&left);
         }
     }
 
@@ -435,7 +435,6 @@ impl Engine {
         settled: i64,
         sites: Vec<Site>,
     ) -> Option<Job> {
-        self.window_ms = now_ms;
         let windows: Vec<Window> = self
             .sealed
             .numbers()
@@ -461,6 +460,18 @@ impl Engine {
             }),
             _ => None,
         };
+        self.forget_by(now_ms, settled, i64::MAX);
+        job
+    }
+
+    /// Forgets what no window still to be solved needs as of the step `now_ms`, whose bins are
+    /// sealed through `settled`, and nothing from bin `floor` on: what `prepare_sealed` forgets
+    /// once it has handed its windows out. A host that seals at every step and prepares windows
+    /// only at the steps where one falls due (`falls_due`; a relay's, `tally_relay::mlat_host`)
+    /// forgets so at every step, its `floor` the first bin of a window it has not solved yet, so
+    /// what the sealed bins hold, and the room the next seal has, is the stamps' alone, as in line,
+    /// and a window that waits is never solved without the bins it began with.
+    pub fn forget_by(&mut self, now_ms: u64, settled: i64, floor: i64) {
         // A window still to be solved solves bins after `settled - STRIDE`; nothing before its
         // history is needed by the engine. Its raw is its host's one store, so it keeps what
         // standing settles against too: a window and its stride behind the clock, and the spare
@@ -468,13 +479,34 @@ impl Engine {
         let keep = Window::canonical(settled + 1)
             .first
             .min(settled + 1 - BEFORE - STRIDE)
-            .min(bin_of(now_ms) - BEFORE - AFTER - STRIDE - RAW_SPARE_BINS);
+            .min(bin_of(now_ms) - BEFORE - AFTER - STRIDE - RAW_SPARE_BINS)
+            .min(floor);
         self.sealed.forget_before(keep);
         if let Some(intake) = self.intake.as_mut() {
             intake.forget_before(keep);
         }
         self.processed.retain(|last| *last >= keep);
-        job
+    }
+
+    /// The first bin of the earliest window of the sealed bins that falls due at the step whose
+    /// bins are sealed through `settled`, the step before it having sealed through `before`: of
+    /// those whose last bin is in `(before, settled]`, which `prepare_sealed` at that step hands
+    /// out. `None` when none does.
+    pub fn falls_due(&self, before: i64, settled: i64) -> Option<i64> {
+        self.sealed
+            .numbers()
+            .into_iter()
+            .map(Window::canonical)
+            .filter(|window| before < window.last && window.last <= settled)
+            .map(|window| window.first)
+            .min()
+    }
+
+    /// The step a window falls due at: the first at which its last bin is complete (`settled`).
+    /// A model it published ripens `MODELS_RIPEN_MS` after it, whenever the window was solved.
+    fn due_ms(&self, window: &Window) -> u64 {
+        (window.last.max(-1) + 1) as u64 * tally_mlat_solver::scope::GRID_MS
+            + self.settings.settle_ms
     }
 
     /// Takes a finished job's outcome: what it solved is not solved again, and its records are
@@ -484,13 +516,17 @@ impl Engine {
             .extend(outcome.windows.iter().map(|window| window.last));
         self.positions_sequence = outcome.positions_sequence;
         self.models_sequence = outcome.models_sequence;
-        let ripe_ms = self.window_ms.saturating_add(MODELS_RIPEN_MS);
-        self.ripening.extend(
-            outcome
-                .carried
-                .into_iter()
-                .map(|carried| (ripe_ms, carried)),
-        );
+        // Each model ripens by its own window's due step, however late the step that solved it ran
+        // (a host's window step that waited, or took up a window shed or put off before it).
+        let ripening: Vec<(u64, provisional::Carried)> = outcome
+            .carried
+            .into_iter()
+            .map(|carried| {
+                let ripe_ms = self.due_ms(&carried.window).saturating_add(MODELS_RIPEN_MS);
+                (ripe_ms, carried)
+            })
+            .collect();
+        self.ripening.extend(ripening);
         let dropped = std::mem::take(&mut self.dropped);
         (outcome.records, outcome.report, dropped)
     }

@@ -6,15 +6,24 @@
 //! thread a step starts on ([`enter`]), and every thread a step spreads its work over
 //! ([`on_threads`], which every parallel pass of the solver and the engine goes through). A thread
 //! waiting on its own workers lends its permit to them while it waits ([`lend`]), so no thread
-//! holds one idle. Provisional work is let in first: a waiting [`Urgency::Prompt`] thread takes the
-//! next permit freed, and background work gives its permit up between two items of its work
-//! whenever one waits ([`checkpoint`]), so a long window step never holds a provisional step up
-//! past one item.
+//! holds one idle. Provisional work is let in first, and never waits on background work for its
+//! first permit: of a gate of two or more permits, background work holds all but one at most
+//! ([`Gate::reserved`]), so a provisional step that arrives while seals and window steps hold every
+//! permit they may takes the one left at once, and runs on it however long their items are (sweep 5,
+//! N6: before, every permit could be background's, and a provisional step waited for one until a
+//! [`checkpoint`], which only the window's fits had: a seal or a scope pass held it up whole). A
+//! gate of one permit cannot spare one, so there background work gives its permit up between two
+//! items of its work whenever a provisional thread waits ([`checkpoint`], in every pass of the
+//! seals, the scope and the window, each item a receiver, a message run, an address or a tile),
+//! and a waiting [`Urgency::Prompt`] thread takes the next permit freed: a provisional step then
+//! waits one item at most. Beyond its first, a provisional step's threads take the permits
+//! background gives up at its checkpoints.
 //!
 //! Work run on no gate (an engine driven in line, a test, a relay's standing) is not bounded here:
 //! every call is then a no-op. Which thread runs what, and when, never changes what is computed.
 
 use std::cell::RefCell;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
 /// How soon a gate's work is needed: provisional work before background (seals, window steps,
@@ -39,18 +48,33 @@ struct State {
 pub struct Gate {
     state: Mutex<State>,
     freed: Condvar,
+    /// Permits background work never takes (`reserved`).
+    reserve: usize,
+    /// `State::prompt_waiting`, readable without the lock: what a checkpoint asks.
+    prompt_waiting: AtomicUsize,
 }
 
 impl Gate {
-    /// A gate of `permits` threads, at least one.
+    /// A gate of `permits` threads, at least one, one of them kept for provisional work when there
+    /// are two or more ([`Gate::reserved`]).
     pub fn new(permits: usize) -> Arc<Self> {
+        let permits = permits.max(1);
         Arc::new(Self {
             state: Mutex::new(State {
-                free: permits.max(1),
+                free: permits,
                 ..State::default()
             }),
             freed: Condvar::new(),
+            reserve: Self::reserved(permits),
+            prompt_waiting: AtomicUsize::new(0),
         })
+    }
+
+    /// Of a gate of `permits`, the permits background work never holds: one when there are two or
+    /// more, so provisional work always finds one free at once (module docs); none of one, which
+    /// background work could not do without.
+    pub const fn reserved(permits: usize) -> usize {
+        if permits >= 2 { 1 } else { 0 }
     }
 
     /// The most threads that ever held a permit at once.
@@ -69,6 +93,8 @@ impl Gate {
         match urgency {
             Urgency::Prompt => {
                 state.prompt_waiting += 1;
+                self.prompt_waiting
+                    .store(state.prompt_waiting, Ordering::Release);
                 while state.free == 0 {
                     state = self
                         .freed
@@ -76,9 +102,11 @@ impl Gate {
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
                 }
                 state.prompt_waiting -= 1;
+                self.prompt_waiting
+                    .store(state.prompt_waiting, Ordering::Release);
             }
             Urgency::Background => {
-                while state.free == 0 || state.prompt_waiting > 0 {
+                while state.free <= self.reserve || state.prompt_waiting > 0 {
                     state = self
                         .freed
                         .wait(state)
@@ -99,9 +127,9 @@ impl Gate {
         self.freed.notify_all();
     }
 
-    /// Whether a prompt thread waits for a permit.
-    fn prompt_waits(&self) -> bool {
-        self.lock().prompt_waiting > 0
+    /// Whether a prompt thread waits for a permit: without the lock, so a checkpoint costs a load.
+    pub(crate) fn prompt_waits(&self) -> bool {
+        self.prompt_waiting.load(Ordering::Acquire) > 0
     }
 }
 
@@ -198,7 +226,8 @@ pub fn lend<R>(wait: impl FnOnce() -> R) -> R {
 }
 
 /// Between two items of a thread's work: background work whose gate has a prompt thread waiting
-/// gives its permit up, and takes one again once the prompt work has its.
+/// gives its permit up, and takes one again once the prompt work has its. Cheap (a thread-local
+/// read and an atomic load), so every pass of background work calls it between its items.
 pub fn checkpoint() {
     let yielding = HERE.with(|here| {
         here.borrow().as_ref().and_then(|here| {
@@ -276,6 +305,58 @@ mod tests {
                 .sum::<usize>()
         });
         assert_eq!(gated, free);
+    }
+
+    /// Sweep 5, N6: background work never holds a gate's every permit when it has two or more, so
+    /// a provisional step arriving while background work holds all it may starts at once, however
+    /// long the background items run and with no checkpoint among them. Before, a background step
+    /// spread over the gate's every permit held a provisional one up until an item ended.
+    #[test]
+    fn prompt_work_finds_a_permit_free_at_once_while_background_holds_all_it_may() {
+        for permits in [2, 3, 8] {
+            let gate = Gate::new(permits);
+            let let_go = Arc::new(AtomicUsize::new(0));
+            let running = Arc::new(AtomicUsize::new(0));
+            let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+            std::thread::scope(|scope| {
+                let (gate_b, let_go_b, running_b) =
+                    (Arc::clone(&gate), Arc::clone(&let_go), Arc::clone(&running));
+                scope.spawn(move || {
+                    enter(&gate_b, Urgency::Background, || {
+                        // Every item waits, with no checkpoint, until the prompt work has run (or
+                        // ten seconds, so a failure ends).
+                        on_threads((0..permits * 2).collect(), |_: usize| {
+                            running_b.fetch_add(1, Ordering::SeqCst);
+                            let started = std::time::Instant::now();
+                            while let_go_b.load(Ordering::SeqCst) == 0
+                                && started.elapsed() < Duration::from_secs(10)
+                            {
+                                std::thread::sleep(Duration::from_millis(1));
+                            }
+                        });
+                    });
+                });
+                // Background holds every permit it may.
+                let held = permits - Gate::reserved(permits);
+                while running.load(Ordering::SeqCst) < held {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                let asked = std::time::Instant::now();
+                let gate_p = Arc::clone(&gate);
+                scope.spawn(move || {
+                    enter(&gate_p, Urgency::Prompt, || {
+                        let _ = entered_tx.send(asked.elapsed());
+                    });
+                });
+                let waited = entered_rx.recv_timeout(Duration::from_secs(5));
+                let_go.store(1, Ordering::SeqCst);
+                assert!(
+                    waited.is_ok_and(|waited| waited < Duration::from_secs(1)),
+                    "the prompt work waited for background work: {waited:?} of {permits}"
+                );
+            });
+            assert!(gate.peak() <= permits, "{} of {permits}", gate.peak());
+        }
     }
 
     /// A prompt thread waiting for a permit is let in at the next checkpoint of background work

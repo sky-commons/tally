@@ -17,7 +17,8 @@
 //! when an item would pass the budget, the subscriber holding the most of both is let go as fallen
 //! behind, and the next, until it fits. Letting a subscriber go lets go of its charges at once,
 //! those its link holds in hand among them ([`Hold`] is only a claim on a charge the subscriber
-//! keeps), so the room the budget counted on is free before the next is ranked: before, only its
+//! keeps; an item still held whole, its decode with it, keeps a claim of its own until it is
+//! dropped, [`Taken`]), so the room the budget counted on is free before the next is ranked: before, only its
 //! queue was cleared and its link let go of what it held in hand when it next woke, so a stalled
 //! socket holding its items in hand with an empty queue freed nothing, and an honest subscriber
 //! was let go in its place. A link let go stops its send at once ([`Listener::fallen`]), and no
@@ -200,9 +201,18 @@ type Queued = (Item, Arc<Charge>);
 /// An item a link took from its queue, with the charge every holder of it shares and its place
 /// among what its subscriber holds in hand: held for as long as the link holds the item
 /// (gathering it, sending it), released with the last holder.
+///
+/// It holds a claim of its own on the charge beside its subscriber's (`charge`), declared after
+/// the item, so its decode goes before that claim (Rust drops a struct's fields in order): a
+/// subscriber let go releases what it holds in hand at once ([`Hold`]), but a charge whose decode
+/// a link still holds in a `Taken` stays until the `Taken` is dropped, never a moment past the
+/// decode. A link that keeps an item past taking it keeps only its [`Hold`] (`Taken::hold`), which
+/// holds no decode. Before, letting a subscriber go released the charges of items its link still
+/// held whole, and the decodes stayed alive uncharged until the link next woke.
 #[derive(Debug)]
 pub struct Taken {
     item: Item,
+    charge: Arc<Charge>,
     hold: Hold,
 }
 
@@ -268,12 +278,16 @@ impl Taken {
         &self.item
     }
 
-    /// What to hold beside what the link keeps of the item, until it is sent.
+    /// What to hold beside what the link keeps of the item (its record, never its decode), until
+    /// it is sent: the item and this claim on its charge go now, the item first.
     pub fn hold(self) -> Hold {
-        self.hold
+        let Self { item, charge, hold } = self;
+        drop(item);
+        drop(charge);
+        hold
     }
 
-    /// The item, its charge let go: for a holder that keeps nothing of it past this.
+    /// The item, its charge let go: for a test that reads what it was sent.
     pub fn into_item(self) -> Item {
         self.item
     }
@@ -661,9 +675,10 @@ impl Listener {
             };
             // In hand from here until the link lets it go (or the subscriber is let go), counted
             // before it leaves the queue's lock, so the subscriber's bytes are never seen short.
-            let id = state.in_hand.take(charge, bytes);
+            let id = state.in_hand.take(Arc::clone(&charge), bytes);
             out.push(Taken {
                 item,
+                charge,
                 hold: Hold {
                     subscriber: Arc::clone(&self.subscriber),
                     id,
@@ -895,20 +910,27 @@ mod tests {
             router.publish(info_item(Some(atlanta), 0)?);
         }
         // The stalled link took all six and sends none of them: its queue is empty, everything it
-        // holds is in its hand.
-        let mut in_hand = Vec::new();
-        assert_eq!(stalled.try_recv_many(&mut in_hand, 10), Ok(6));
+        // holds is in its hand. It keeps five as a link keeps what it gathers, their claims alone
+        // (`Taken::hold`, as `link`'s `Pending` does), and one still whole, item and all.
+        let mut taken = Vec::new();
+        assert_eq!(stalled.try_recv_many(&mut taken, 10), Ok(6));
         assert_eq!((stalled.in_hand(), stalled.queued_bytes()), (6 * unit, 0));
+        let whole = taken.pop().ok_or("took none")?;
+        let in_hand: Vec<Hold> = taken.into_iter().map(Taken::hold).collect();
         for _ in 0..2 {
             router.publish(info_item(Some(paris), 0)?);
         }
         assert_eq!(gauge.held(), 8 * unit);
         // One more for the honest subscriber does not fit: the stalled one holds the most, and
-        // letting it go frees what it holds in hand at once, while its link still has the items:
+        // letting it go frees what it holds in hand at once, while its link still has the claims:
         // the honest one keeps all three. Before, only the stalled one's (empty) queue was
-        // cleared, the store stayed full, and the honest one was let go next.
+        // cleared, the store stayed full, and the honest one was let go next. The item its link
+        // still holds whole stays charged until it is dropped, never a moment past it: its
+        // `Taken` holds a claim of its own.
         router.publish(info_item(Some(paris), 0)?);
-        assert_eq!((gauge.held(), stalled.in_hand()), (3 * unit, 0));
+        assert_eq!((gauge.held(), stalled.in_hand()), (4 * unit, 0));
+        drop(whole);
+        assert_eq!(gauge.held(), 3 * unit);
         let mut out = Vec::new();
         assert_eq!(honest.try_recv_many(&mut out, 10), Ok(3));
         assert_eq!(

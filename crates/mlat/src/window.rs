@@ -68,6 +68,9 @@ pub struct Report {
     /// Tiles with no model: why, the first time it happened.
     pub unfitted: usize,
     pub unfitted_reason: Option<String>,
+    /// Clocks the fits dropped as cut off from their gauge by robust weights
+    /// (`FitError::Disconnected`): fitted around, not failed, so apart from `unfitted`.
+    pub disconnected: usize,
     /// Transmissions chosen for solving.
     pub transmissions: usize,
     pub solved: usize,
@@ -99,6 +102,7 @@ impl Part for Report {
         if self.unfitted_reason.is_none() {
             self.unfitted_reason = other.unfitted_reason.clone();
         }
+        self.disconnected += other.disconnected;
         self.transmissions += other.transmissions;
         self.solved += other.solved;
         self.unsolved += other.unsolved;
@@ -214,6 +218,7 @@ fn fit_one(
             return None;
         }
     };
+    report.disconnected += calibrated.disconnected;
     let bytes = publish::encode(&model).ok()?;
     Some(Fitted {
         tile,

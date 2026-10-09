@@ -57,6 +57,8 @@ counts!(
     descriptions,
     // Provisional MLAT solutions read (`--streams provisional`).
     provisional,
+    // Of them, those dated after the stamp of the step that solved them (`Client::provisional`).
+    provisional_after_stamp,
     // Batches missing from a receiver's stream (its sequence jumped), and ones that came again or
     // out of order.
     gaps,
@@ -112,6 +114,12 @@ pub struct Client {
     pub dedup_latency: Mutex<Histogram>,
     /// Each provisional solution's transmission to its reading: RFC-0174 §2.4's fast MLAT.
     pub provisional_latency: Mutex<Histogram>,
+    /// The same in its two halves (`Client::provisional`): its transmission to the stamp of the
+    /// relay's step that solved it (the record's `issued_ms`), what the relay's own lateness
+    /// budget does not see (the feeder's batching, the ingest and the watermark), and that stamp
+    /// to its reading, what the budget does (the step, its publishing and the fan-out).
+    pub provisional_to_stamp: Mutex<Histogram>,
+    pub provisional_from_stamp: Mutex<Histogram>,
     /// Receivers whose batches arrived this window.
     pub receivers: Mutex<HashSet<PublicKey>>,
     /// Why each session ended, and how often.
@@ -120,6 +128,37 @@ pub struct Client {
 }
 
 impl Client {
+    /// A provisional record read at `now` (Unix ms): each solution's transmission to its reading,
+    /// and that split at the stamp of the relay's step that solved it (`issued_ms`, the step's
+    /// stamp on the relay's ingest clock, `mlat_host`). A solution dated after that stamp is
+    /// counted (`provisional_after_stamp`) and its first half taken as none: a free-running
+    /// gauge's model dates its transmissions by the seal of the batch that anchored it
+    /// (`tally_mlat_solver::sync`), up to a second late.
+    pub fn provisional(&self, content: &tally_wire::SolutionsContent, now: u64) {
+        let stamp = content.issued_ms;
+        let (Ok(mut whole), Ok(mut to_stamp), Ok(mut from_stamp)) = (
+            self.provisional_latency.lock(),
+            self.provisional_to_stamp.lock(),
+            self.provisional_from_stamp.lock(),
+        ) else {
+            return;
+        };
+        let mut after = 0;
+        for solution in &content.solutions {
+            let transmitted = solution.transmitted.unix_ms;
+            whole.record(now.saturating_sub(transmitted));
+            to_stamp.record(stamp.saturating_sub(transmitted));
+            from_stamp.record(now.saturating_sub(stamp));
+            after += u64::from(transmitted > stamp);
+        }
+        self.counts
+            .provisional
+            .fetch_add(content.solutions.len() as u64, Ordering::Relaxed);
+        self.counts
+            .provisional_after_stamp
+            .fetch_add(after, Ordering::Relaxed);
+    }
+
     /// Begins a window: latencies and receivers seen from now.
     pub fn reset_window(&self) {
         if let Ok(mut latency) = self.raw_latency.lock() {
@@ -128,8 +167,14 @@ impl Client {
         if let Ok(mut latency) = self.dedup_latency.lock() {
             *latency = Histogram::default();
         }
-        if let Ok(mut latency) = self.provisional_latency.lock() {
-            *latency = Histogram::default();
+        for latency in [
+            &self.provisional_latency,
+            &self.provisional_to_stamp,
+            &self.provisional_from_stamp,
+        ] {
+            if let Ok(mut latency) = latency.lock() {
+                *latency = Histogram::default();
+            }
         }
         if let Ok(mut receivers) = self.receivers.lock() {
             receivers.clear();
@@ -300,16 +345,8 @@ async fn session(
                     client.counts.descriptions.fetch_add(1, Ordering::Relaxed);
                 }
                 Record::Provisional(positions) => {
-                    if let Ok(content) = positions.solutions()
-                        && let Ok(mut latency) = client.provisional_latency.lock()
-                    {
-                        for solution in &content.solutions {
-                            latency.record(now.saturating_sub(solution.transmitted.unix_ms));
-                        }
-                        client
-                            .counts
-                            .provisional
-                            .fetch_add(content.solutions.len() as u64, Ordering::Relaxed);
+                    if let Ok(content) = positions.solutions() {
+                        client.provisional(&content, now);
                     }
                 }
                 Record::Goodbye {
@@ -415,5 +452,75 @@ fn decode(work: &std::sync::mpsc::Receiver<Work>, verify: bool, client: &Client)
                 histogram.record(latency);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tally_wire::{
+        AddressedCitation, EnuCovariance, ObservationSet, Reception, Solution, SolutionsContent,
+        TransmitTime,
+    };
+
+    fn solution(transmitted_ms: u64) -> Result<Solution, String> {
+        let receiver = Identity::from_seed([3; 32]).public();
+        Ok(Solution {
+            address: 0x48_0001,
+            transmitted: TransmitTime::new(transmitted_ms, 0).map_err(|error| error.to_string())?,
+            lat_e7: 520_000_000,
+            lon_e7: 50_000_000,
+            alt_hae_mm: None,
+            covariance: EnuCovariance {
+                xx: 1.0,
+                xy: 0.0,
+                xz: 0.0,
+                yy: 1.0,
+                yz: 0.0,
+                zz: 1.0,
+            },
+            clock_model: [0; 32],
+            addressed: AddressedCitation::default(),
+            observations: ObservationSet::new(
+                vec![0x8d; 14],
+                vec![Reception {
+                    receiver,
+                    epoch: 1,
+                    counter: 7,
+                }],
+            )
+            .map_err(|error| error.to_string())?,
+        })
+    }
+
+    /// H-d: a provisional solution's latency is reported in its two halves, split at the stamp of
+    /// the relay's step that solved it, beside the whole; one dated after that stamp is counted.
+    #[test]
+    fn a_provisional_solution_is_timed_to_its_steps_stamp_and_from_it() -> Result<(), String> {
+        let client = Client::default();
+        let content = SolutionsContent {
+            boot_id: 1,
+            sequence: 0,
+            issued_ms: 10_000,
+            spec_version: 3,
+            solutions: vec![solution(8_700)?, solution(10_400)?],
+        };
+        client.provisional(&content, 10_900);
+        let quantiles = |histogram: &Mutex<Histogram>| -> Result<(u64, u64, u64), String> {
+            let histogram = histogram.lock().map_err(|error| error.to_string())?;
+            Ok((
+                histogram.total(),
+                histogram.quantile(0.0).unwrap_or(u64::MAX),
+                histogram.max(),
+            ))
+        };
+        assert_eq!(quantiles(&client.provisional_latency)?, (2, 500, 2_200));
+        // Transmission to stamp: 1,300 ms, and none for the one dated after it.
+        assert_eq!(quantiles(&client.provisional_to_stamp)?, (2, 0, 1_300));
+        // Stamp to read: 900 ms for both.
+        assert_eq!(quantiles(&client.provisional_from_stamp)?, (2, 900, 900));
+        let counts = client.counts.snapshot();
+        assert_eq!((counts.provisional, counts.provisional_after_stamp), (2, 1));
+        Ok(())
     }
 }

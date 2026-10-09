@@ -178,6 +178,8 @@ fn mlat_run_with(
                     // An ingest worker held up on its way to the host (the message exchange
                     // pushing back on `route`).
                     Stage::Offer => 400,
+                    // Each address shard a provisional step reads, holding it: many a step.
+                    Stage::Reading => 200,
                     _ => 30_000,
                 };
                 std::thread::sleep(pause(seed, n, most));
@@ -235,9 +237,13 @@ fn mlat_run_with(
         let since = Instant::now();
         while step <= until {
             // Within the host's limits (`PROVISIONAL_BEHIND` steps, the tighter, and
-            // `STEPS_BEHIND`), as a real-time watermark keeps it.
+            // `STEPS_BEHIND`), as a real-time watermark keeps it; and what it signed taken by the
+            // asker before the watermark moves on a step, as a real-time watermark moves a tenth
+            // of a step between the network task's asks (a provisional step's records taken past
+            // `PROVISIONAL_PUBLISH_MS` after it are late by the stamps, and refused).
             while step > host.provisionals_stepped_ms().max(base) + ahead
                 || step > host.windows_stepped_ms().max(base) + windows_ahead
+                || host.untaken() > 0
             {
                 if since.elapsed() > Duration::from_secs(300) {
                     return Err(format!(
@@ -619,9 +625,10 @@ fn descriptions_midway_make_the_same_bytes_with_any_delays_and_the_reference_eng
     Ok(())
 }
 
-/// Sweep 4, R-N16 and N6: a window step that runs long, past the old ripening and past the window
-/// steps MLAT may fall behind (`STEPS_BEHIND`, so the empty steps behind it are shed), changes no
-/// provisional byte: a provisional step carries exactly the models of the window steps
+/// Sweep 4, R-N16 and N6: a window step that runs long, past the old ripening and past as many steps
+/// as `STEPS_BEHIND` (which sheds none: a window step is queued only at a step a window falls due
+/// at, sweep 5, H-c; before, every step it ran past queued as one, and those past the limit were
+/// shed), changes no provisional byte: a provisional step carries exactly the models of the window steps
 /// `MODELS_RIPEN_MS` before it, by their stamp, and the ripening covers a window step on the
 /// planned threads (measured 9 to 11 s: here every window step that solves is held while the
 /// watermark runs ten steps past it). Before, a provisional step five seconds after a window step
@@ -654,10 +661,10 @@ fn a_window_step_that_runs_long_changes_no_provisional_byte() -> Result {
             behind: BEHIND,
         },
     )?;
-    // The window steps fell behind past their limit: the empty ones behind the held one shed.
-    assert!(report.steps_shed > 0, "{report:?}");
+    // The steps it ran past were sealed in their turn, and none was shed.
     assert_eq!(
         (
+            report.steps_shed,
             report.provisional_steps_shed,
             report.provisional_models_late,
             report.provisional_steps_late,
@@ -665,7 +672,7 @@ fn a_window_step_that_runs_long_changes_no_provisional_byte() -> Result {
             report.steps_discarded,
             report.waiting_dropped
         ),
-        (0, 0, 0, 0, 0, 0),
+        (0, 0, 0, 0, 0, 0, 0),
         "{report:?}"
     );
     assert!(!signed.0.is_empty(), "no provisional positions");

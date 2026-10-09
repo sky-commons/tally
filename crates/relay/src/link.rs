@@ -331,7 +331,7 @@ enum End {
     /// from its shortfalls. Never a refusal of what the peer did (its ceiling overrun is
     /// `Reason::OverCeiling`): before, every `Full` this relay said was noted, so a parent that
     /// overran its child's ceiling to be turned away delivered nothing and was never filed short.
-    Full { retry_after_secs: u32, why: String },
+    Full(capacity::AtAdmission),
     /// Closed without a word: the peer broke a rule it cannot have broken by accident.
     Closed(String),
     /// Another relay said goodbye (or "leave me"), asking for this long before the next try, and
@@ -396,25 +396,62 @@ fn goodbye(reason: Reason, retry_after_secs: u32) -> Record {
 }
 
 /// Notes, when this relay turns a relay that dialled it (a member, a directory link that may be
-/// one, another relay's MLAT) away for its own capacity (`last`, a `Goodbye` of reason `Full`),
-/// that the relay turned away now routes its slice past this one for the wait the one rule gives
+/// one, another relay's MLAT) away at its admission for want of a member's room (`refused`), that
+/// the relay turned away now routes its slice past this one for the wait the one rule gives
 /// (`sharing::full::Wait`, the rule its `peers::Peers::refused_full` applies to the same
-/// refusal): this relay files no shortfall against it for those windows (RFC-0174 §2.5). Called
-/// only where this relay decided it is full ([`End::Full`] at a member's admission,
-/// [`Closing::Turning`] when the upload cap sheds a link), never from the word said: a refusal of
-/// what the peer did is never a reason to excuse it.
-fn turning_away(hub: &Hub, peer: Peer, key: &PublicKey, last: &Record) {
-    if let Record::Goodbye {
-        reason: Reason::Full,
-        retry_after_secs,
-    } = last
-        && matches!(peer, Peer::Member | Peer::Relay | Peer::Engine(_))
-    {
-        hub.network().sharing.turned_away(
-            *key,
-            Duration::from_secs((*retry_after_secs).into()),
-            crate::network::wall_ms(),
-        );
+/// refusal): this relay files no shortfall against it for those windows (RFC-0174 §2.5). It takes
+/// a [`capacity::AtAdmission`], which only `admit_member` makes, so nothing else can excuse a
+/// peer: not the word said, and not a link the upload cap shed (N11), which the peer chooses by
+/// what it asks for (a peer flooding queries is the one the cap sheds).
+fn turning_away(hub: &Hub, peer: Peer, key: &PublicKey, refused: &capacity::AtAdmission) {
+    if matches!(peer, Peer::Member | Peer::Relay | Peer::Engine(_)) {
+        hub.network()
+            .sharing
+            .turned_away(*key, refused.wait(), crate::network::wall_ms());
+    }
+}
+
+/// The one refusal for this relay's own capacity that excuses a peer its shortfalls
+/// ([`turning_away`]): a member turned away at its admission (`admit_member`) for want of a
+/// member's slot or room. Its fields are this module's, so it is made only by
+/// [`AtAdmission::member_refused`], which only `admit_member` calls; an end of any other kind (a
+/// ceiling overrun, a shed, falling behind) cannot be one.
+mod capacity {
+    use std::time::Duration;
+
+    use tally_wire::{Reason, Record};
+
+    pub(super) struct AtAdmission {
+        retry_after_secs: u32,
+        why: String,
+    }
+
+    impl AtAdmission {
+        /// A member turned away at its admission: `admit_member`'s alone.
+        pub(super) fn member_refused(retry_after_secs: u32, why: String) -> Self {
+            Self {
+                retry_after_secs,
+                why,
+            }
+        }
+
+        /// What the peer is told: this relay is full.
+        pub(super) fn last(&self) -> Record {
+            super::goodbye(Reason::Full, self.retry_after_secs)
+        }
+
+        /// How long it is asked to stay away, the wait it routes around this relay for.
+        pub(super) fn wait(&self) -> Duration {
+            Duration::from_secs(self.retry_after_secs.into())
+        }
+
+        pub(super) fn why(&self) -> &str {
+            &self.why
+        }
+
+        pub(super) fn into_why(self) -> String {
+            self.why
+        }
     }
 }
 
@@ -454,14 +491,10 @@ where
             farewell(reader, writer, goodbye(reason, retry_after_secs)).await;
             why
         }
-        End::Full {
-            retry_after_secs,
-            why,
-        } => {
-            let last = goodbye(Reason::Full, retry_after_secs);
-            turning_away(hub, peer, key, &last);
-            farewell(reader, writer, last).await;
-            why
+        End::Full(refused) => {
+            turning_away(hub, peer, key, &refused);
+            farewell(reader, writer, refused.last()).await;
+            refused.into_why()
         }
         End::Closed(why) => why,
         End::Departed(away) => {
@@ -553,12 +586,10 @@ where
         key,
         source,
         loopback: !link.billed(),
+        address: Some(connection.address()),
     };
-    // Whatever this session was given (a client's credit, its free-tier place) ends with it.
-    let _leaving = Leaving {
-        hub: Arc::clone(&hub),
-        source,
-    };
+    // Its place in the network duties, from before its `Hello`'s records are acted on.
+    let leaving = Leaving::join(&hub, &asker);
     link.set_kind(match peer {
         Peer::Feeder(_) => Kind::Feeder,
         Peer::Relay | Peer::Member => Kind::Relay,
@@ -566,14 +597,9 @@ where
         Peer::Subscriber => Kind::Taker,
         Peer::Probe => Kind::Probe,
     });
-    // The records a second it may send (R-N12), from its first: a relay's at the members' rate, as
-    // its byte ceiling is (below), any other role's at a feeder's.
-    let records = RecordPace::new(match peer {
-        Peer::Relay | Peer::Member => hub.member_records_per_sec(),
-        Peer::Feeder(_) | Peer::Subscriber | Peer::Engine(_) | Peer::Probe => {
-            hub.feeder_records_per_sec()
-        }
-    });
+    // The records a second it may send (R-N12, R4 of sweep 5), from its first, by its role
+    // (`Paces`), and a feeder's receptions a second.
+    let paces = Paces::of(&hub, peer);
     // The echoes and delivery queries that lead what came with Hello are answered before anything
     // else, admission included: a feeder measuring relays learns how near a full one is, and that
     // it is full, from its signed reply, and a feeder checking its delivery asks members it does
@@ -582,11 +608,14 @@ where
     let probing = |record: &Record| matches!(record, Record::Echo(_) | Record::DeliveryQuery(_));
     let mut echoed = Vec::new();
     while let Some(probe) = first.next_if(probing).map_err(|error| error.to_string())? {
-        records.take().await;
-        echoed.extend(
-            hub.network()
-                .handle(&hub, &asker, probe, crate::network::wall_ms()),
-        );
+        let pace = paces.take(&hub, peer, &asker.key, &probe).await;
+        echoed.extend(hub.network().handle(
+            &hub,
+            &asker,
+            probe,
+            crate::network::wall_ms(),
+            pace.as_deref(),
+        ));
     }
     if role == Role::Probe && !first.is_read() {
         let last = goodbye(Reason::Protocol, REFUSED_RETRY_SECS);
@@ -685,8 +714,10 @@ where
     let steer = matches!(peer, Peer::Subscriber | Peer::Engine(_)).then_some(&subscribe);
     let mut described = None;
     // What came with Hello is acted on before anything is sent: a subscriber's first `Subscribe`
-    // decides its first byte, and a network duty's answers (a probe's, before any) go first.
-    let mut answers = Vec::new();
+    // decides its first byte, and a network duty's answers (a probe's, before any) go first: they
+    // wait for the write side as every later record's do, within the connection's room, and it
+    // sends them straight after the greeting (`write_loop`).
+    let replies = Replies::new(peer, &link);
     let refusal = Arc::new(Refusal::default());
     loop {
         let record = match first.next() {
@@ -694,7 +725,7 @@ where
             Ok(None) => break,
             Err(error) => return Err(error.to_string()),
         };
-        records.take().await;
+        let pace = paces.take(&hub, peer, &asker.key, &record).await;
         let in_flight = match admitted.charge(&hub, peer, &asker.key, &record).await {
             Ok(in_flight) => in_flight,
             Err(end) => {
@@ -716,7 +747,13 @@ where
             &mut described,
             (in_flight, &refusal),
         )
-        .or_else(|unhandled| network(unhandled, &hub, &asker, &mut answers));
+        .or_else(|unhandled| {
+            network(
+                unhandled,
+                (&hub, &asker, pace.as_deref()),
+                &replies.replying,
+            )
+        });
         if let Err(end) = ingested {
             return Err(end_now(
                 &mut session.reader,
@@ -727,7 +764,7 @@ where
             .await);
         }
     }
-    let (mut greeting, fan_out, _slot) = match peer {
+    let (greeting, fan_out, _slot) = match peer {
         Peer::Feeder(_) => {
             // What the relay will take from it, less framing, so a feeder that keeps to it never
             // meets the ceiling.
@@ -776,7 +813,6 @@ where
             (Vec::new(), Some(fan_out), Some(slot))
         }
     };
-    greeting.extend(answers);
     exchange(
         &mut session.reader,
         &mut session.writer,
@@ -806,8 +842,10 @@ where
                     Ceiling::new(hub.feeder_bytes_per_sec(), read, hub.ceiling_clock()),
                 ),
             },
-            records: Some(records),
+            paces,
             outgoing: None,
+            replies,
+            leaving,
         },
     )
     .await
@@ -920,6 +958,13 @@ async fn upstream_once(
         Err(error) => return refused(error),
     };
     let source = hub.connection_id();
+    let asker = Asker {
+        role: AskerRole::Relay,
+        key: upstream.key,
+        source,
+        loopback: !link.billed(),
+        address: peer,
+    };
     exchange(
         &mut session.reader,
         &mut session.writer,
@@ -928,22 +973,21 @@ async fn upstream_once(
         Peer::Relay,
         &link,
         Serving {
+            leaving: Leaving::join(hub, &asker),
             greeting: Vec::new(),
             fan_out: Some(directory_fan_out()),
             subscribe: None,
             described: None,
             refusal: None,
             admitted: Admitted::default(),
-            // A directory link carries offers and queries; only data is held to a ceiling.
+            // A directory link carries offers and queries; only data is held to a ceiling. Its
+            // records wait for the directory's pace, shared by every directory link, whoever
+            // dialled (`Paces`).
             ceiling: None,
-            records: None,
-            asker: Asker {
-                role: AskerRole::Relay,
-                key: upstream.key,
-                source,
-                loopback: !link.billed(),
-            },
+            paces: Paces::shared(),
+            asker,
             outgoing: None,
+            replies: Replies::new(Peer::Relay, &link),
         },
     )
     .await
@@ -1035,7 +1079,8 @@ async fn member_once(
     let admitted =
         if role == Role::Engine {
             admit_member(hub).map_err(|end| match end {
-                End::Told { why, .. } | End::Full { why, .. } | End::Closed(why) => why,
+                End::Told { why, .. } | End::Closed(why) => why,
+                End::Full(refused) => refused.into_why(),
                 End::Departed(_) => "turned away".to_owned(),
             })?
         } else {
@@ -1060,7 +1105,14 @@ async fn member_once(
         Err(error) => return refused(error),
     };
     let source = hub.connection_id();
-    let loopback = !link.billed();
+    let asker = Asker {
+        role: AskerRole::Relay,
+        key: relay.key,
+        source,
+        loopback: !link.billed(),
+        address,
+    };
+    let leaving = Leaving::join(hub, &asker);
     exchange(
         &mut session.reader,
         &mut session.writer,
@@ -1076,28 +1128,39 @@ async fn member_once(
             refusal: None,
             admitted,
             ceiling: None,
-            records: None,
-            asker: Asker {
-                role: AskerRole::Relay,
-                key: relay.key,
-                source,
-                loopback,
-            },
+            // What it sends back is a member's, paced as every member's is (`Paces`).
+            paces: Paces::shared(),
+            asker,
             outgoing: Some(outgoing),
+            replies: Replies::new(Peer::Member, &link),
+            leaving,
         },
     )
     .await
 }
 
-/// Ends a session's place in the network duties (its credit link, its free-tier place).
+/// A session's place in the network duties: joined when it is made (`Network::joined`), and
+/// ended, whatever it was given (a client's credit, its free-tier place, a peer's records'
+/// shares), when it is dropped (`Network::left`). Every session holds one ([`Serving::leaving`]),
+/// inbound and both kinds this relay dials, so none joins without leaving or leaves unjoined.
 struct Leaving {
     hub: Arc<Hub>,
     source: u64,
 }
 
+impl Leaving {
+    fn join(hub: &Arc<Hub>, asker: &Asker) -> Self {
+        hub.network().joined(asker);
+        Self {
+            hub: Arc::clone(hub),
+            source: asker.source,
+        }
+    }
+}
+
 impl Drop for Leaving {
     fn drop(&mut self) {
-        self.hub.network().credit.left(self.source);
+        self.hub.network().left(self.source);
     }
 }
 
@@ -1117,21 +1180,110 @@ struct Serving<'a> {
     admitted: Admitted,
     /// What the peer may send, for a connection that dialled in.
     ceiling: Option<Ceiling>,
-    /// The records a second the peer may send, for a connection that dialled in
-    /// (`ingest::records_per_sec`).
-    records: Option<RecordPace>,
+    /// The records a second the peer may send, and a feeder's receptions (`Paces`).
+    paces: Paces,
     /// Who the peer is, as the network duties see it.
     asker: Asker,
     /// What the network duties address to this peer, for a member link this relay dialled.
     outgoing: Option<&'a mut mpsc::Receiver<Queued>>,
+    /// Where the network duties' replies wait for the write side: made before the `Hello`'s
+    /// records are handled, so their answers wait there as every later record's do.
+    replies: Replies,
+    /// Its place in the network duties, left when the session ends.
+    leaving: Leaving,
 }
 
-/// Replies the network duties give a peer, waiting for the write side. Beyond this many the newest
-/// is dropped: a peer that floods queries gets fewer answers, never more of the relay's memory.
+/// Replies the network duties give a peer, waiting for the write side, by count; their bytes are
+/// held to `ingest::REPLIES_BYTES` ([`ReplyRoom`]). Beyond either the newest is dropped: a peer
+/// that floods queries gets fewer answers, never more of the relay's memory.
 const REPLIES_WAITING: usize = 64;
 
+/// What one connection's replies waiting for its write side hold, by their encoded bytes, held to
+/// `ingest::REPLIES_BYTES`, the room carved for them with its buffers
+/// (`ingest::BUFFERS_PER_CONNECTION`). A reply holds its bytes until it is written or let go
+/// ([`Reply`]), so the bound holds whatever the write side waits on.
+#[derive(Default)]
+struct ReplyRoom {
+    waiting: std::sync::atomic::AtomicUsize,
+}
+
+impl ReplyRoom {
+    /// The answers to one record that fit the room now, in order, holding their bytes; the rest
+    /// are dropped. `None` when none fit.
+    fn offer(self: &Arc<Self>, answers: Vec<Record>) -> Option<Reply> {
+        use std::sync::atomic::Ordering;
+        let mut bytes = 0;
+        let mut records = Vec::with_capacity(answers.len());
+        for record in answers {
+            let len = record.encoded_len();
+            let taken = self
+                .waiting
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |waiting| {
+                    let after = waiting.checked_add(len)?;
+                    (after <= crate::ingest::REPLIES_BYTES).then_some(after)
+                })
+                .is_ok();
+            if !taken {
+                break;
+            }
+            bytes += len;
+            records.push(record);
+        }
+        let reply = Reply {
+            records,
+            bytes,
+            room: Arc::clone(self),
+        };
+        (!reply.records.is_empty()).then_some(reply)
+    }
+
+    /// Bytes of replies waiting now.
+    #[cfg(test)]
+    fn waiting(&self) -> usize {
+        self.waiting.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+/// The network duties' answers to one record, each one the peer takes, waiting for the write side
+/// with their bytes held in the connection's [`ReplyRoom`] until they are written or let go.
+struct Reply {
+    records: Vec<Record>,
+    bytes: usize,
+    room: Arc<ReplyRoom>,
+}
+
+impl Drop for Reply {
+    fn drop(&mut self) {
+        self.room
+            .waiting
+            .fetch_sub(self.bytes, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+/// A connection's replies from the network duties, from the read side ([`Replying`]) to the write
+/// side, within its [`ReplyRoom`].
+struct Replies {
+    replying: Replying,
+    waiting: mpsc::Receiver<Reply>,
+}
+
+impl Replies {
+    fn new(peer: Peer, link: &Arc<Link>) -> Self {
+        let (sender, waiting) = mpsc::channel::<Reply>(REPLIES_WAITING);
+        Self {
+            replying: Replying {
+                sender,
+                room: Arc::default(),
+                peer,
+                link: Arc::clone(link),
+            },
+            waiting,
+        }
+    }
+}
+
 /// What the write side is to end on: a last word between whole messages (`Closing::Saying`, or
-/// `Closing::Turning` for a capacity refusal), and why the link ends.
+/// `Closing::Turning` for a member refused at its admission), and why the link ends.
 type Farewell = Closing;
 
 /// How the write side ended: on a failure, with nothing more to say, or between whole messages with
@@ -1143,12 +1295,10 @@ enum Closing {
         last: Box<Record>,
         why: String,
     },
-    /// As `Saying`, a refusal for this relay's capacity: a relay that dialled in is noted as
-    /// routing around this one (`turning_away`) as it is said.
-    Turning {
-        last: Box<Record>,
-        why: String,
-    },
+    /// As `Saying`, a member refused at its admission (`End::Full`): a relay that dialled in is
+    /// noted as routing around this one (`turning_away`) as it is said. Nothing else is: a link
+    /// the upload cap sheds ends `Saying` (N11).
+    Turning(capacity::AtAdmission),
 }
 
 impl From<String> for Closing {
@@ -1180,20 +1330,24 @@ where
         refusal,
         admitted,
         ceiling,
-        records,
+        paces,
         asker,
         outgoing,
+        replies: Replies {
+            replying,
+            waiting: mut replies,
+        },
+        leaving: _leaving,
     } = serving;
     // A relay that dialled this one and is told it is full routes its slice past it
     // (`turning_away`); one this relay dialled is only ever sent to, and routes nothing.
     let dialled_in = outgoing.is_none();
-    let turned_away = |last: &Record| {
+    let turned_away = |refused: &capacity::AtAdmission| {
         if dialled_in {
-            turning_away(hub, peer, &asker.key, last);
+            turning_away(hub, peer, &asker.key, refused);
         }
     };
     let (telling, mut farewells) = mpsc::channel::<Farewell>(1);
-    let (replying, mut replies) = mpsc::channel::<Vec<Record>>(REPLIES_WAITING);
     let reading = async {
         let reading = Reading {
             subscribe,
@@ -1209,7 +1363,7 @@ where
             peer,
             reading,
             described,
-            (ceiling, records),
+            (ceiling, paces),
         )
         .await
         {
@@ -1234,19 +1388,11 @@ where
                 tokio::time::sleep(FAREWELL_TIMEOUT).await;
                 Err(why)
             }
-            Err(End::Full {
-                retry_after_secs,
-                why,
-            }) => {
-                let last = Box::new(goodbye(Reason::Full, retry_after_secs));
+            Err(End::Full(refused)) => {
+                let why = refused.why().to_owned();
                 // Said by the write side (`Closing::Turning`, below), which notes the refusal as
                 // full (`turning_away`) as it says it.
-                let _ = telling
-                    .send(Closing::Turning {
-                        last,
-                        why: why.clone(),
-                    })
-                    .await;
+                let _ = telling.send(Closing::Turning(refused)).await;
                 tokio::time::sleep(FAREWELL_TIMEOUT).await;
                 Err(why)
             }
@@ -1267,7 +1413,6 @@ where
                 outgoing,
                 client: (asker.role == AskerRole::Client && !asker.loopback).then_some(asker),
                 steer: subscribe,
-                peer: (peer, asker.key),
                 vouched: (asker.role == AskerRole::Client
                     && hub.network().credit.vouches_for(&asker.key))
                 .then_some(asker),
@@ -1281,10 +1426,10 @@ where
             farewell(reader, writer, *last).await;
             Err(why)
         }
-        Err(Closing::Turning { last, why }) => {
-            turned_away(&last);
-            farewell(reader, writer, *last).await;
-            Err(why)
+        Err(Closing::Turning(refused)) => {
+            turned_away(&refused);
+            farewell(reader, writer, refused.last()).await;
+            Err(refused.into_why())
         }
     }
 }
@@ -1294,10 +1439,35 @@ where
 struct Reading<'a> {
     subscribe: Option<&'a watch::Sender<Subscription>>,
     asker: Asker,
-    replies: mpsc::Sender<Vec<Record>>,
+    replies: Replying,
     /// Where the ingest stage says a batch's signature failed.
     refusal: Arc<Refusal>,
     admitted: Admitted,
+}
+
+/// Where the read side hands the network duties' replies to the write side: each record's answers
+/// as soon as it is handled, only those the peer takes (`Peer::takes_reply`), within the
+/// connection's [`ReplyRoom`].
+struct Replying {
+    sender: mpsc::Sender<Reply>,
+    room: Arc<ReplyRoom>,
+    peer: Peer,
+    link: Arc<Link>,
+}
+
+impl Replying {
+    /// The answers to one record, handed on now: those the peer takes, as many as the room holds.
+    /// A full queue or room drops them: the peer asked faster than it reads.
+    fn hand_on(&self, hub: &Hub, key: &PublicKey, mut answers: Vec<Record>) {
+        if answers.is_empty() {
+            return;
+        }
+        let (peer, kind) = (self.peer.now(hub, key), self.link.kind());
+        answers.retain(|record| peer.takes_reply(record, kind));
+        if let Some(reply) = self.room.offer(answers) {
+            let _ = self.sender.try_send(reply);
+        }
+    }
 }
 
 /// What a connection that publishes batches was admitted with (RFC-0181 §2, §9): its allowance
@@ -1310,10 +1480,6 @@ struct Admitted {
     membership: Option<crate::budget::Reservation>,
     /// The members' shared rate (`ceiling::Pace`), which a member session's data waits for.
     pace: Option<Arc<crate::ceiling::Pace>>,
-    /// The members' shared records a second (`ingest::RecordPace`), which a member session's data
-    /// waits for beside their bytes: what the ingest cores plan for the members' rate
-    /// (`ingest::member_records_per_sec`).
-    records: Option<Arc<RecordPace>>,
     /// Whether this session is admitted as a member once its peer is one (`admit_member`): a
     /// session over which another relay's data may come in (one that relay dialled, or this
     /// relay's own one-hop raw link). A session this relay dialled to send a member what is
@@ -1365,9 +1531,6 @@ impl Admitted {
             };
             pace.take(u64::try_from(wire).unwrap_or(u64::MAX)).await;
         }
-        if let Some(records) = &self.records {
-            records.take().await;
-        }
         Some(allowance.acquire(bytes).await)
     }
 }
@@ -1381,10 +1544,10 @@ fn admit_member(hub: &Hub) -> Result<Admitted, End> {
     let budget = hub.budget();
     let refused = |why: String| {
         hub.member_refused();
-        End::Full {
-            retry_after_secs: MEMBERS_FULL_RETRY_SECS,
+        End::Full(capacity::AtAdmission::member_refused(
+            MEMBERS_FULL_RETRY_SECS,
             why,
-        }
+        ))
     };
     let membership = budget.reserve_member().ok_or_else(|| {
         refused(format!(
@@ -1399,10 +1562,82 @@ fn admit_member(hub: &Hub) -> Result<Admitted, End> {
         allowance: Some(allowance),
         membership: Some(membership),
         pace: Some(hub.member_pace()),
-        records: Some(hub.member_records()),
         joins: true,
         _general: None,
     })
+}
+
+/// What a connection's records wait for (R-N12, R4 of sweep 5), each role at what it legitimately
+/// sends (`ingest`'s `RolePace`s, each with its reason), and what the cores plan for every session
+/// (`cores::Sessions`): a feeder's own, at its byte ceiling over `ingest::RECORD_BYTES`; a
+/// subscriber's, an engine's and a probe's own, at their role's pace; every member session's one
+/// pace, the members' records a second (`Hub::member_records`), and every directory link's one
+/// pace (`Hub::directory_records`), each shared as its rate is, whoever dialled. A relay that
+/// dialled in is a directory link until its offer makes it a member (`Peer::now`), so each record
+/// waits for the pace of what its sender is when it is read. A feeder's batches wait as well for
+/// its receptions a second (`ingest::FEEDER_RECEPTIONS_PER_SEC`), by the count each states
+/// (`Batch::receptions`). Before, every role but a relay's was paced at a feeder's eight records a
+/// second, and each relay session at the members' whole rate on its own, none of it planned: 2,048
+/// connections under the cap could send 16,000 records a second the cores never held.
+struct Paces {
+    /// The role's own pace, for a connection that dialled in as a feeder, subscriber, engine or
+    /// probe; none for a relay's, whose paces are shared.
+    own: Option<Arc<RecordPace>>,
+    /// A feeder's receptions a second.
+    receptions: Option<RecordPace>,
+}
+
+impl Paces {
+    fn of(hub: &Hub, peer: Peer) -> Self {
+        let own = match peer {
+            Peer::Feeder(_) => Some(RecordPace::new(hub.feeder_records_per_sec())),
+            Peer::Subscriber => Some(crate::ingest::SUBSCRIBER_RECORDS.pace()),
+            Peer::Engine(_) => Some(crate::ingest::ENGINE_RECORDS.pace()),
+            Peer::Probe => Some(crate::ingest::PROBE_RECORDS.pace()),
+            Peer::Relay | Peer::Member => None,
+        };
+        Self {
+            own: own.map(Arc::new),
+            receptions: matches!(peer, Peer::Feeder(_))
+                .then(|| RecordPace::new(crate::ingest::FEEDER_RECEPTIONS_PER_SEC)),
+        }
+    }
+
+    /// A session with another relay this relay dialled: the shared paces only.
+    fn shared() -> Self {
+        Self {
+            own: None,
+            receptions: None,
+        }
+    }
+
+    /// Waits for `record`'s place: the pace of what its sender is now, and a feeder's batch's
+    /// receptions. The pace it was taken by, for the work it brings beyond its token to be owed to.
+    async fn take(
+        &self,
+        hub: &Hub,
+        peer: Peer,
+        key: &PublicKey,
+        record: &Record,
+    ) -> Option<Arc<RecordPace>> {
+        let pace = match peer.now(hub, key) {
+            Peer::Member => Some(hub.member_records()),
+            Peer::Relay => Some(hub.directory_records()),
+            Peer::Feeder(_) | Peer::Subscriber | Peer::Engine(_) | Peer::Probe => self.own.clone(),
+        };
+        if let Some(pace) = &pace {
+            pace.take().await;
+        }
+        if let (Some(receptions), Record::Batch(batch)) = (&self.receptions, record) {
+            // A batch whose count cannot be read is refused by the ingest stage, which ends the
+            // connection: it waits for nothing here.
+            let count = batch.receptions().unwrap_or(0);
+            receptions
+                .take_many(u64::try_from(count).unwrap_or(u64::MAX))
+                .await;
+        }
+        pace
+    }
 }
 
 async fn read_loop<S: AsyncRead>(
@@ -1412,7 +1647,7 @@ async fn read_loop<S: AsyncRead>(
     peer: Peer,
     reading: Reading<'_>,
     mut described: Option<Described>,
-    (mut ceiling, records): (Option<Ceiling>, Option<RecordPace>),
+    (mut ceiling, paces): (Option<Ceiling>, Paces),
 ) -> Result<(), End> {
     let Reading {
         subscribe,
@@ -1421,7 +1656,6 @@ async fn read_loop<S: AsyncRead>(
         refusal,
         mut admitted,
     } = reading;
-    let mut answers = Vec::new();
     loop {
         // A batch the ingest stage refused (its signature) ends the session at once, whatever
         // is being read: the session is over, so a read cut short loses nothing. The message read
@@ -1439,11 +1673,9 @@ async fn read_loop<S: AsyncRead>(
             return Err(over_ceiling());
         }
         while let Some(record) = message.next().map_err(|error| error.to_string())? {
-            // Its place in the connection's records a second (R-N12): past it, the socket is not
-            // read until the pace allows the next.
-            if let Some(records) = &records {
-                records.take().await;
-            }
+            // Its place in the connection's records a second (R-N12), and a feeder's batch's in its
+            // receptions a second: past either, the socket is not read until the pace allows it.
+            let pace = paces.take(hub, peer, &asker.key, &record).await;
             // Its charge from the connection's allowance before it is handed over: with the
             // allowance held, the socket is not read, and TCP holds the sender back (RFC-0181 §2).
             let in_flight = admitted.charge(hub, peer, &asker.key, &record).await?;
@@ -1459,11 +1691,7 @@ async fn read_loop<S: AsyncRead>(
                 &mut described,
                 (in_flight, &refusal),
             )
-            .or_else(|unhandled| network(unhandled, hub, &asker, &mut answers))?;
-        }
-        if !answers.is_empty() {
-            // A full queue drops these answers: the peer asked faster than it reads.
-            let _ = replies.try_send(std::mem::take(&mut answers));
+            .or_else(|unhandled| network(unhandled, (hub, &asker, pace.as_deref()), &replies))?;
         }
     }
 }
@@ -1497,20 +1725,22 @@ impl From<String> for Unhandled {
 }
 
 /// A record `ingest` left to the network duties (`network::Network::handle`): their replies are
-/// kept for the write side.
+/// handed to the write side at once (`Replying::hand_on`), never gathered across a message whose
+/// records are paced (N4).
+/// The work a record brings beyond its one token (each signature inside an evidence bundle) is
+/// owed to the pace it was taken by (`pace`), and paid before the connection's next record.
 fn network(
     unhandled: Unhandled,
-    hub: &Hub,
-    asker: &Asker,
-    answers: &mut Vec<Record>,
+    (hub, asker, pace): (&Hub, &Asker, Option<&RecordPace>),
+    replies: &Replying,
 ) -> Result<(), End> {
     match unhandled {
         Unhandled::End(end) => Err(end),
         Unhandled::Network(record) => {
-            answers.extend(
-                hub.network()
-                    .handle(hub, asker, record, crate::network::wall_ms()),
-            );
+            let answers = hub
+                .network()
+                .handle(hub, asker, record, crate::network::wall_ms(), pace);
+            replies.hand_on(hub, &asker.key, answers);
             Ok(())
         }
     }
@@ -1725,13 +1955,11 @@ fn share(hub: &Hub, peer: Peer, asker: &Asker, record: &Record) {
 /// who it is, so what it is sent keeps to its allowance (`credit`).
 struct Inputs<'a> {
     farewells: &'a mut mpsc::Receiver<Farewell>,
-    replies: &'a mut mpsc::Receiver<Vec<Record>>,
+    replies: &'a mut mpsc::Receiver<Reply>,
     outgoing: Option<&'a mut mpsc::Receiver<Queued>>,
     client: Option<Asker>,
     /// A client's subscription, which the write side re-admits as its credit changes.
     steer: Option<&'a watch::Sender<Subscription>>,
-    /// Who the peer is, and its key: what replies it takes (`Peer::takes_reply`).
-    peer: (Peer, PublicKey),
     /// A client this relay vouches for: signed a credential and this relay's evidence when its
     /// session starts and again before the credential lapses (`credit::RENEW_BEFORE_MS`).
     vouched: Option<Asker>,
@@ -1820,7 +2048,6 @@ async fn write_loop<S: AsyncWrite>(
         mut outgoing,
         client,
         steer,
-        peer,
         vouched,
     } = inputs;
     let mut readmit = tokio::time::interval(READMIT_EVERY);
@@ -1834,6 +2061,10 @@ async fn write_loop<S: AsyncWrite>(
         .send(&greeting)
         .await
         .map_err(|error| error.to_string())?;
+    // The answers to what came with its `Hello`, before anything of the streams.
+    while let Ok(answers) = replies.try_recv() {
+        reply(writer, hub, link, answers).await?;
+    }
     let Some(FanOut { infos, mut wants }) = fan_out else {
         loop {
             tokio::select! {
@@ -1845,7 +2076,7 @@ async fn write_loop<S: AsyncWrite>(
                 }
                 Some(closing) = farewells.recv() => return Err(closing),
                 Some(answers) = replies.recv() => {
-                    reply(writer, hub, link, peer, answers).await?;
+                    reply(writer, hub, link, answers).await?;
                 }
                 _ = revouch.tick(), if vouched.is_some() => {
                     vouch(writer, hub, vouched.as_ref()).await?;
@@ -1944,7 +2175,7 @@ async fn write_loop<S: AsyncWrite>(
             }
             Some(closing) = farewells.recv() => return Err(closing),
             Some(answers) = replies.recv() => {
-                reply(writer, hub, link, peer, answers).await?;
+                reply(writer, hub, link, answers).await?;
             }
             _ = revouch.tick(), if vouched.is_some() => {
                 vouch(writer, hub, vouched.as_ref()).await?;
@@ -2064,23 +2295,21 @@ impl Told {
     }
 }
 
-/// Sends the network duties' replies to the peer, each only if its role takes it
-/// (`Peer::takes_reply`): what is control to it at once, as an echo's reply must be; the rest
-/// (offers to a directory link) by class through the upload cap (`send_data`).
+/// Sends the network duties' replies to the peer (only those it takes, `Replying::hand_on`): what
+/// is control to it at once, as an echo's reply must be; the rest (offers to a directory link) by
+/// class through the upload cap (`send_data`). Their bytes stay held in the connection's
+/// [`ReplyRoom`] until they are written.
 async fn reply<S: AsyncWrite>(
     writer: &mut Writer<S>,
     hub: &Hub,
     link: &Arc<Link>,
-    (peer, key): (Peer, PublicKey),
-    answers: Vec<Record>,
+    mut answers: Reply,
 ) -> Result<(), Closing> {
-    let peer = peer.now(hub, &key);
     let kind = link.kind();
     let mut control = Vec::new();
     let mut by_class: [Vec<Arc<Record>>; Class::ALL.len()] = Default::default();
-    for record in answers
+    for record in std::mem::take(&mut answers.records)
         .into_iter()
-        .filter(|record| peer.takes_reply(record, kind))
         .map(Arc::new)
     {
         match Class::of(&record, kind) {
@@ -2158,9 +2387,11 @@ async fn send_data<S: AsyncWrite>(
 }
 
 /// Ends a link the upload cap shed: it is told the relay is full, pointed at the relays this one
-/// knows.
+/// knows. It is never excused its shortfalls (`turning_away`, N11): the cap sheds the peer asking
+/// the most of its class, which a peer chooses (one flooding `ProviderQuery`s is it), so a shed
+/// excused would be a way to deliver nothing and never be filed short.
 fn shed(hub: &Hub) -> Result<(), Closing> {
-    Err(Closing::Turning {
+    Err(Closing::Saying {
         last: Box::new(full(hub)),
         why: "shed: the upload cap cannot carry it".to_owned(),
     })
@@ -2422,10 +2653,8 @@ async fn beast_client<W: AsyncWrite + Unpin>(
     let link = stream.link();
     let egress = Arc::clone(stream.egress());
     let mut bytes = Vec::new();
-    // Held, with their charges, until their bytes are written.
     let mut items: Vec<Taken> = Vec::new();
     loop {
-        items.clear();
         if let Err(fell) = out.recv_many(&mut items, SEND_BATCH).await {
             return Err(format!("fell behind ({fell:?})"));
         }
@@ -2436,6 +2665,10 @@ async fn beast_client<W: AsyncWrite + Unpin>(
                 frame.encode_beast(&mut bytes);
             }
         }
+        // Their charges are held until their bytes are written; their decodes are not, once
+        // encoded (`fanout::Taken::hold`), so none waits on the socket beside a charge its
+        // subscriber may let go.
+        let _holds: Vec<crate::fanout::Hold> = items.drain(..).map(Taken::hold).collect();
         if bytes.is_empty() {
             continue;
         }
@@ -3364,15 +3597,12 @@ mod tests {
             .map_err(text)?;
             let mut accepted = accepting.await.map_err(text)?.map_err(text)?;
             let key = Identity::generate().map_err(text)?.public();
-            reply(
-                &mut accepted.session.writer,
-                &hub,
-                &link,
-                (peer, key),
-                answers()?,
-            )
-            .await
-            .map_err(|_| "the reply failed".to_owned())?;
+            let mut replies = Replies::new(peer, &link);
+            replies.replying.hand_on(&hub, &key, answers()?);
+            let waiting = replies.waiting.try_recv().map_err(text)?;
+            reply(&mut accepted.session.writer, &hub, &link, waiting)
+                .await
+                .map_err(|_| "the reply failed".to_owned())?;
             accepted
                 .session
                 .writer
@@ -3779,6 +4009,24 @@ mod tests {
         Ok(())
     }
 
+    /// N11: a link the upload cap sheds is told the relay is full and is never excused its
+    /// shortfalls: it ends `Saying`, never `Turning`, the end `turning_away` notes. The cap sheds
+    /// the peer asking the most of its class, so before, a peer flooding `ProviderQuery`s made
+    /// itself the one shed, was noted as routing around this relay, and owed nothing for it.
+    #[test]
+    fn a_link_the_cap_sheds_is_told_full_and_never_excused() {
+        let hub = Hub::new(1);
+        match shed(&hub) {
+            Err(Closing::Saying { last, why }) => {
+                assert_eq!(*last, full(&hub));
+                assert!(why.contains("upload cap"), "{why}");
+            }
+            Err(Closing::Turning(_)) => panic!("a shed link is excused its shortfalls"),
+            Err(Closing::Silent(why)) => panic!("a shed link is told nothing: {why}"),
+            Ok(()) => panic!("a shed link goes on"),
+        }
+    }
+
     /// N1: the one end that excuses a peer its shortfalls (`End::Full`, noted by `turning_away`)
     /// is this relay's own capacity at a member's admission; an overrun of the peer's ceiling is
     /// an end that tells it so and notes nothing.
@@ -3786,7 +4034,7 @@ mod tests {
     fn only_a_capacity_refusal_turns_a_relay_away_as_full() {
         // A hub that plans no member session has no member slot.
         let hub = Hub::new(1);
-        assert!(matches!(admit_member(&hub), Err(End::Full { .. })));
+        assert!(matches!(admit_member(&hub), Err(End::Full(_))));
         assert!(matches!(
             over_ceiling(),
             End::Told {
@@ -3874,17 +4122,70 @@ mod tests {
         Ok(())
     }
 
-    /// R-N12: a connection's records a second are held to its byte ceiling over
-    /// `ingest::RECORD_BYTES`, whatever their bytes: a probe that sends forty echoes in one
-    /// message (each a signature the relay makes) is answered over four seconds at the default
-    /// feeder ceiling (eight a second, after a second's burst), not at once. Before, a feeder's
-    /// tiny batches within its bytes were some 870 signature checks a second.
+    /// N4: a connection's replies waiting for its write side hold at most `ingest::REPLIES_BYTES`
+    /// of encoded bytes, carved with its buffers: answers past it are dropped, in order, and
+    /// what a reply holds is the room's again once it is written or let go. Before, replies were
+    /// gathered and queued uncharged, up to 64 lists of up to 32 offers each.
+    #[test]
+    fn a_connections_waiting_replies_hold_no_more_than_their_room() {
+        let room = Arc::new(ReplyRoom::default());
+        let echo = |nonce| Record::Echo(tally_wire::Echo { nonce });
+        let one = echo(0).encoded_len();
+        let fit = crate::ingest::REPLIES_BYTES / one;
+        let first = room.offer((0..fit as u64 + 5).map(echo).collect());
+        assert_eq!(first.as_ref().map(|reply| reply.records.len()), Some(fit));
+        assert_eq!(room.waiting(), fit * one);
+        // Full: the next answers are dropped whole.
+        assert!(room.offer(vec![echo(1)]).is_none());
+        drop(first);
+        assert_eq!(room.waiting(), 0);
+        let again = room.offer(vec![echo(2)]);
+        assert_eq!(room.waiting(), one);
+        drop(again);
+        assert_eq!(room.waiting(), 0);
+    }
+
+    /// N4: each record's answers are handed to the write side as soon as the record is handled,
+    /// never gathered across the message: a probe that sends forty echoes in one message, paced
+    /// at eight a second, hears its first answer at once. Before, every answer to a message waited
+    /// until its last record was read, about five seconds here and minutes for a 64 KiB message.
+    #[tokio::test(start_paused = true)]
+    async fn each_records_answers_are_sent_as_it_is_handled() -> Result<(), String> {
+        let hub = Arc::new(Hub::new(8).max_upload(roomy()));
+        hub.network()
+            .adopt_identity(Identity::generate().map_err(text)?);
+        let mut probe = dial_pipe(&hub)?;
+        let mut session = connected(&mut probe, Role::Probe).await?;
+        let echoes: Vec<Record> = (0..40)
+            .map(|nonce| Record::Echo(tally_wire::Echo { nonce }))
+            .collect();
+        let started = Instant::now();
+        session.writer.send(&echoes).await.map_err(text)?;
+        loop {
+            let answered = next(&mut session.reader)
+                .await?
+                .iter()
+                .any(|record| matches!(record, Record::EchoReply(_)));
+            if answered {
+                break;
+            }
+        }
+        let took = started.elapsed();
+        assert!(took < Duration::from_secs(1), "first answer after {took:?}");
+        Ok(())
+    }
+
+    /// R-N12, R4 of sweep 5: a connection's records a second are held to its role's pace whatever
+    /// their bytes: a probe that sends forty echoes in one message (each a signature the relay
+    /// makes) is answered over 32 s (`ingest::PROBE_RECORDS`: a round of eight at once, then one
+    /// a second), not at once. Before, every role but a relay's was paced at a feeder's eight a
+    /// second, and none of them was planned in the cores.
     #[tokio::test(start_paused = true)]
     async fn a_connections_records_are_paced_whatever_their_bytes() -> Result<(), String> {
         let hub = Arc::new(Hub::new(8).max_upload(roomy()));
         hub.network()
             .adopt_identity(Identity::generate().map_err(text)?);
-        assert_eq!(hub.feeder_records_per_sec(), 8);
+        let pace = crate::ingest::PROBE_RECORDS;
         let mut probe = dial_pipe(&hub)?;
         let mut session = connected(&mut probe, Role::Probe).await?;
         const ECHOES: u64 = 40;
@@ -3902,9 +4203,60 @@ mod tests {
                 .count() as u64;
         }
         let took = started.elapsed();
+        let paced = Duration::from_secs((ECHOES - pace.burst) * 60 / pace.per_minute);
         assert!(
-            took >= Duration::from_secs(4) && took < Duration::from_secs(5),
+            took >= paced && took < paced + Duration::from_secs(1),
             "{ECHOES} echoes answered in {took:?}"
+        );
+        Ok(())
+    }
+
+    /// RFC-0181 §10, "The cores" (decided 2026-10-09): a feeder's receptions a second are held to
+    /// `ingest::FEEDER_RECEPTIONS_PER_SEC`, by the count each batch states, before the batch is
+    /// handed on: nine batches of 1,000 receptions (9,000, within a second's records) are taken
+    /// over four seconds (a second's 1,800 at once, then 1,800 a second). Before, a feeder within
+    /// its bytes could send some 15,000 receptions a second the cores never planned.
+    #[tokio::test(start_paused = true)]
+    async fn a_feeders_receptions_are_paced_by_the_count_each_batch_states() -> Result<(), String> {
+        let hub = Hub::new(8);
+        let feeder = Identity::generate().map_err(text)?;
+        let paces = Paces::of(&hub, Peer::Feeder(feeder.public()));
+        const BATCHES: u64 = 9;
+        const EACH: u32 = 1_000;
+        let mut batches = Vec::new();
+        for sequence in 0..BATCHES {
+            batches.push(Record::Batch(batch(&feeder, sequence, EACH)?));
+        }
+        let started = Instant::now();
+        for record in &batches {
+            paces
+                .take(
+                    &hub,
+                    Peer::Feeder(feeder.public()),
+                    &feeder.public(),
+                    record,
+                )
+                .await;
+        }
+        let took = started.elapsed();
+        let rate = crate::ingest::FEEDER_RECEPTIONS_PER_SEC;
+        let paced =
+            Duration::from_secs_f64((BATCHES * u64::from(EACH) - rate) as f64 / rate as f64);
+        assert!(
+            took >= paced && took < paced + Duration::from_millis(100),
+            "{BATCHES} batches of {EACH} taken in {took:?}"
+        );
+        // The pace is the one ceiling MLAT's raw holder holds a receiver to.
+        assert_eq!(
+            rate,
+            tally_mlat_solver::held::Rates::MEASURED.ceiling_per_s as u64
+        );
+        // A subscriber's records wait for its own role's pace, never a feeder's receptions.
+        let subscriber = Paces::of(&hub, Peer::Subscriber);
+        assert!(subscriber.receptions.is_none());
+        assert_eq!(
+            subscriber.own.as_ref().map(|pace| pace.per_minute_rate()),
+            Some(crate::ingest::SUBSCRIBER_RECORDS.per_minute)
         );
         Ok(())
     }

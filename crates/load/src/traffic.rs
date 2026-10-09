@@ -1,7 +1,14 @@
 //! What the simulated receivers hear: the MLAT simulator's receivers and aircraft (`sim`), laid
 //! out as RFC-0174's world benchmark lays them (two clusters, as Europe's and the US's receivers
 //! are), so one transmission is heard by every receiver in reach, as real traffic is. A few seconds
-//! are simulated once and replayed in a loop, each loop's counters moved on by the loop's length.
+//! are simulated once and replayed in a loop, forward then backward ([`Traffic::frames`]), so
+//! nothing a receiver hears jumps at a loop's boundary: an aircraft flies the period and back
+//! (where it is is continuous, its heading turns round), and each receiver's clock runs on through
+//! every loop at its own rate, the simulated clock's error continued, never put back. Before, each
+//! loop replayed the period forward with every counter moved on by the loop's length exactly, so at
+//! each boundary every aircraft jumped back to where it began and every free-running clock (its
+//! rate some 30 ppm off) jumped by its rate's error over the period (about 150 us at 5 s): a 60 s
+//! clock fit saw a dozen jumps and failed, and positions decoded across the boundary were wrong.
 //!
 //! The rate is set, not assumed: a first pass measures what each receiver would hear if it heard
 //! every transmission in reach, and the second keeps each reception with the probability that
@@ -9,7 +16,8 @@
 
 use std::ops::Range;
 
-use tally_mlat_solver::sim::{self, Scenario};
+use tally_mlat_solver::linalg::{self, Vec3};
+use tally_mlat_solver::sim::{self, ClockTruth, Scenario};
 use tally_wire::{Clock, Frame, FrameKind, Identity, Location};
 
 /// What to simulate.
@@ -33,6 +41,10 @@ const CLUSTERS: [((f64, f64), f64); 2] =
 
 /// The benchmark's one GNSS-disciplined receiver in fifty.
 const GPS_EVERY: usize = 50;
+
+/// The simulation's first played second (`second_of`'s second 1: aircraft begin within their
+/// first second or two, so second 0 is thin), in its own time: where the period begins.
+const PLAYED_FROM_S: f64 = 1.0;
 
 /// What a receiver's 48-bit counter wraps at (BEAST's timestamp).
 const COUNTER_MASK: u64 = (1 << 48) - 1;
@@ -59,6 +71,11 @@ pub struct Receiver {
     pub identity: Identity,
     pub location: Location,
     pub clock: Clock,
+    /// Where it is, for the time each transmission takes to reach it.
+    ecef: Vec3,
+    /// How its clock truly behaves over the simulated period, which the loops continue
+    /// ([`Traffic::moved`]).
+    truth: ClockTruth,
     heard: Vec<Heard>,
     /// Where each second's receptions begin in `heard`; one more than the period, for the end.
     seconds: Vec<u32>,
@@ -132,6 +149,9 @@ pub fn expected_deduplicated(heard: &[std::collections::HashSet<u32>]) -> f64 {
 pub struct Traffic {
     pub receivers: Vec<Receiver>,
     messages: Vec<Vec<u8>>,
+    /// When and where each message (by its index in `messages`) was sent, in the simulation's
+    /// time: what playing it backward needs ([`Traffic::moved`]).
+    sent: Vec<(f64, Vec3)>,
     period_s: u32,
     /// The Unix time a GNSS-disciplined receiver's counter reads in the first second the
     /// simulation plays (`second_of`'s second 1, its scenario's first second after the thin one):
@@ -212,6 +232,7 @@ impl Traffic {
         let period = u64::from(spec.period_s);
         let mut receivers: Vec<Receiver> = Vec::with_capacity(local.len());
         let mut messages: Vec<Vec<u8>> = Vec::new();
+        let mut sent: Vec<(f64, Vec3)> = Vec::new();
         let (mut kept, mut distinct) = (0u64, 0u64);
         let mut first = 0usize;
         // The messages (by index) anyone heard, each second of the period.
@@ -278,6 +299,12 @@ impl Traffic {
             if overflow {
                 return Err("too many transmissions to index: lower --aircraft or --period".into());
             }
+            sent.extend(
+                simulation
+                    .transmissions
+                    .iter()
+                    .map(|each| (each.time, each.ecef)),
+            );
             messages.extend(simulation.transmissions.into_iter().map(|each| each.data));
             for (second, heard) in by_second.into_iter().enumerate() {
                 seconds_heard[second].extend(heard);
@@ -285,7 +312,8 @@ impl Traffic {
             for (at, mut list) in heard.into_iter().enumerate() {
                 let index = mine.start + at;
                 let within = index - cluster_range.start;
-                let site = simulation.receivers[within].site;
+                let simulated = &simulation.receivers[within];
+                let site = simulated.site;
                 list.sort_unstable_by_key(|each| ({ each.key } >> MESSAGE_BITS, { each.stamp }));
                 let mut seconds = Vec::with_capacity(spec.period_s as usize + 1);
                 let mut at_second = 0;
@@ -303,6 +331,8 @@ impl Traffic {
                     identity: sim::receiver_identity(scenario.seed, within),
                     location: site.location,
                     clock: site.clock,
+                    ecef: simulated.ecef,
+                    truth: simulated.truth.clone(),
                     heard: list,
                     seconds,
                 });
@@ -326,11 +356,18 @@ impl Traffic {
             .map(std::collections::HashSet::len)
             .sum::<usize>() as f64
             / period.max(1) as f64;
-        let deduplicated_per_sec = expected_deduplicated(&heard_contents);
+        // The loop is the period forward then backward ([`Traffic::frames`]).
+        let played: Vec<std::collections::HashSet<u32>> = heard_contents
+            .iter()
+            .chain(heard_contents.iter().rev())
+            .cloned()
+            .collect();
+        let deduplicated_per_sec = expected_deduplicated(&played);
         let first = Scenario::new(0);
         Ok(Self {
             receivers,
             messages,
+            sent,
             period_s: spec.period_s,
             gps_first_unix_ms: first.midnight_unix_ms + (first.start_tod_s * 1000.0) as u64 + 1000,
             calibration: Calibration {
@@ -346,43 +383,92 @@ impl Traffic {
     }
 
     /// The receptions `receiver` (by its place in `receivers`) makes in second `second` of the
-    /// run, as its decoder would hand them over, the counters moved on by the loops before it. A
-    /// GNSS-disciplined receiver's counter is the UTC time of day, so it is moved to the run's
-    /// own: second `second` of a run whose second 0 began at `start_unix_ms` reads that wall clock,
-    /// as a real Radarcape's does, never the scenario's (else every model whose gauge is one
-    /// dates its solutions hours from the wall clock of the batches that carried them).
+    /// run, as its decoder would hand them over. The simulated period is played forward in even
+    /// loops and backward in odd ones, so every aircraft flies on from where the last loop left it
+    /// (turning round at each boundary), and each counter reads its clock carried on through the
+    /// loops before it ([`Traffic::moved`]), never put back. A GNSS-disciplined receiver's counter
+    /// is the UTC time of day, so it is moved to the run's own: second `second` of a run whose
+    /// second 0 began at `start_unix_ms` reads that wall clock, as a real Radarcape's does, never
+    /// the scenario's (else every model whose gauge is one dates its solutions hours from the wall
+    /// clock of the batches that carried them).
     pub fn frames(&self, receiver: usize, second: u64, start_unix_ms: u64, into: &mut Vec<Frame>) {
         let Some(receiver) = self.receivers.get(receiver) else {
             return;
         };
         let period = u64::from(self.period_s);
-        let within = (second % period) as usize;
-        let moved = second - second % period;
+        let lap = second / period;
+        let backward = lap % 2 == 1;
+        let within = second % period;
+        // Backward, second `within` of the loop is the period's second `period - 1 - within`,
+        // its receptions in the reverse order.
+        let played = if backward {
+            period - 1 - within
+        } else {
+            within
+        } as usize;
         let (Some(&begin), Some(&end)) = (
-            receiver.seconds.get(within),
-            receiver.seconds.get(within + 1),
+            receiver.seconds.get(played),
+            receiver.seconds.get(played + 1),
         ) else {
             return;
         };
         let gps = receiver.clock == Clock::RadarcapeGps;
-        for heard in &receiver.heard[begin as usize..end as usize] {
+        let heard = &receiver.heard[begin as usize..end as usize];
+        let mut play = |heard: &Heard| {
             let message = ({ heard.key } & ((1 << MESSAGE_BITS) - 1)) as usize;
             let Some(data) = self.messages.get(message) else {
-                continue;
+                return;
             };
             let kind = if data.len() == FrameKind::ModeSLong.message_len() {
                 FrameKind::ModeSLong
             } else {
                 FrameKind::ModeSShort
             };
-            let mut stamp = advance(heard.stamp, moved, gps);
+            let mut stamp = advance(heard.stamp, self.moved(receiver, lap, message), gps);
             if gps {
                 stamp = shift_time_of_day(stamp, start_unix_ms, self.gps_first_unix_ms);
             }
             if let Ok(frame) = Frame::new(kind, stamp, 128, data) {
                 into.push(frame);
             }
+        };
+        if backward {
+            heard.iter().rev().for_each(&mut play);
+        } else {
+            heard.iter().for_each(&mut play);
         }
+    }
+
+    /// Seconds `receiver`'s counter is moved on from what it read hearing `message` in the
+    /// simulation, played in loop `lap` (from 0). The period is the simulation's seconds `T0`
+    /// (1, its first whole second) to `T1` (`T0` and the period); its clock read `t + e(t)` at true
+    /// time `t`, `e` its error (`ClockTruth::error`), and over the period gained `d = e(T1) - e(T0)`.
+    ///
+    /// Played in loop `k`, a reception is heard at the run's time `T0 + kP + u`, `u` its time into
+    /// the loop, and its clock is to read that time plus an error carried on from the loops
+    /// before: `k d` and the period's own error forward (`e(T0 + u)`), or backward its mirror
+    /// (`e(T0) + e(T1) - e(T1 - u)`), which keeps the clock's rate where the period reversed would
+    /// run it back. Both meet the next loop where the last left off, so the clock never jumps.
+    /// Forward, `u` is the reception's own time into the period, so it moves `k (P + d)`. Backward,
+    /// the message sent at `t` is sent at `T0 + T1 - t` instead and heard the same time after it.
+    fn moved(&self, receiver: &Receiver, lap: u64, message: usize) -> f64 {
+        let period = f64::from(self.period_s);
+        let (t0, t1) = (PLAYED_FROM_S, PLAYED_FROM_S + period);
+        let error = |t: f64| receiver.truth.error(t);
+        let lap_f = lap as f64;
+        let gained = error(t1) - error(t0);
+        if lap.is_multiple_of(2) {
+            return lap_f * (period + gained);
+        }
+        let Some(&(sent, from)) = self.sent.get(message) else {
+            return lap_f * (period + gained);
+        };
+        let flight = linalg::norm(linalg::sub(from, receiver.ecef)) / tally_mlat_solver::geo::C;
+        let heard = sent + flight;
+        let into = t1 - sent + flight;
+        let reads =
+            t0 + lap_f * period + into + lap_f * gained + error(t0) + error(t1) - error(t1 - into);
+        reads - (heard + error(heard))
     }
 
     /// Receptions held for this shard's receivers.
@@ -393,13 +479,14 @@ impl Traffic {
 
 /// A receiver's counter `seconds` later: a 12 MHz counter by that many ticks, a Radarcape's GPS
 /// counter (seconds of the UTC day above 30 bits of nanoseconds) by that many seconds of the day.
-pub fn advance(stamp: u64, seconds: u64, gps: bool) -> u64 {
+pub fn advance(stamp: u64, seconds: f64, gps: bool) -> u64 {
     if gps {
-        let nanos = stamp & ((1 << 30) - 1);
-        let tod = ((stamp >> 30) + seconds) % 86_400;
-        (tod << 30) | nanos
+        let nanos = i128::from(stamp >> 30) * 1_000_000_000 + i128::from(stamp & ((1 << 30) - 1));
+        let moved = (nanos + (seconds * 1e9).round() as i128).rem_euclid(DAY_NANOS);
+        (((moved / 1_000_000_000) as u64) << 30) | (moved % 1_000_000_000) as u64
     } else {
-        stamp.wrapping_add(seconds.wrapping_mul(TICKS_A_SECOND)) & COUNTER_MASK
+        let ticks = (seconds * TICKS_A_SECOND as f64).round() as i128;
+        (i128::from(stamp) + ticks).rem_euclid(i128::from(COUNTER_MASK) + 1) as u64
     }
 }
 
@@ -422,10 +509,164 @@ mod tests {
 
     #[test]
     fn counters_move_on_by_the_loop() {
-        assert_eq!(advance(100, 5, false), 100 + 5 * TICKS_A_SECOND);
-        assert_eq!(advance(COUNTER_MASK, 1, false), TICKS_A_SECOND - 1);
+        assert_eq!(advance(100, 5.0, false), 100 + 5 * TICKS_A_SECOND);
+        assert_eq!(advance(COUNTER_MASK, 1.0, false), TICKS_A_SECOND - 1);
+        assert_eq!(
+            advance(TICKS_A_SECOND, -1.5, false),
+            COUNTER_MASK + 1 - TICKS_A_SECOND / 2
+        );
         let stamp = (86_399 << 30) | 7;
-        assert_eq!(advance(stamp, 2, true), (1 << 30) | 7);
+        assert_eq!(advance(stamp, 2.0, true), (1 << 30) | 7);
+        assert_eq!(advance(7, -0.000_000_007, true), 0);
+    }
+
+    /// H-a: across loops, a free-running clock runs on at its own rate and an aircraft flies on
+    /// from where it was, so what a free-running receiver and a GNSS one both hear of one
+    /// transmission differs by the free-running clock's error and the two paths' difference, both
+    /// smooth through every loop's boundary. Before, each loop moved every counter on by the
+    /// period exactly and put every aircraft back where it began: the free-running clock jumped by
+    /// its rate's error over the period (and the paths by the aircraft's jump) at each boundary.
+    #[test]
+    fn clocks_and_aircraft_run_on_through_every_loop() -> Result<(), String> {
+        let spec = Spec {
+            feeders: 120,
+            receptions_per_sec: 60.0,
+            aircraft: 300,
+            period_s: 3,
+            seed: 0,
+        };
+        let traffic = Traffic::build(&spec, 0..120)?;
+        let period = f64::from(spec.period_s);
+        let at = |receiver: &Receiver| receiver.location;
+        let gps = traffic
+            .receivers
+            .iter()
+            .position(|each| each.clock == Clock::RadarcapeGps)
+            .ok_or("no GNSS receiver simulated")?;
+        // Free-running receivers near it whose clocks are well off (above 10 ppm), so a jump of
+        // their error over the period would be 30 us or more.
+        let near = |receiver: &Receiver| {
+            let (a, b) = (at(receiver), at(&traffic.receivers[gps]));
+            (i64::from(a.lat_e7) - i64::from(b.lat_e7)).abs()
+                + (i64::from(a.lon_e7) - i64::from(b.lon_e7)).abs()
+        };
+        let mut free: Vec<usize> = (0..traffic.receivers.len())
+            .filter(|&index| {
+                let receiver = &traffic.receivers[index];
+                let gained = receiver.truth.error(PLAYED_FROM_S + period)
+                    - receiver.truth.error(PLAYED_FROM_S);
+                receiver.clock != Clock::RadarcapeGps && gained.abs() > 10e-6 * period
+            })
+            .collect();
+        free.sort_by_key(|&index| near(&traffic.receivers[index]));
+        // An airborne position (DF17, type code 11): unique bytes, its CPR and its noise.
+        let position = |data: &[u8]| data.len() == 14 && data[0] >> 3 == 17 && data[4] >> 3 == 11;
+        // Each message by its bytes, and how long it took to reach a receiver.
+        let index: std::collections::HashMap<&[u8], usize> = traffic
+            .messages
+            .iter()
+            .enumerate()
+            .map(|(at, data)| (data.as_slice(), at))
+            .collect();
+        let flight = |receiver: &Receiver, message: usize| {
+            let (_, from) = traffic.sent[message];
+            linalg::norm(linalg::sub(from, receiver.ecef)) / tally_mlat_solver::geo::C
+        };
+        // Ten hours into a day: no GNSS reading wraps at midnight.
+        let start_ms = 36_000_000;
+        let mut checked = 0;
+        for &receiver in free.iter().take(5) {
+            // What both heard of each position message, over four loops: the GNSS receiver's reading (the true time, give or take 20 ns) and the
+            // difference of the two readings.
+            let mut pairs: Vec<(f64, f64)> = Vec::new();
+            for second in 0..4 * u64::from(spec.period_s) {
+                let (mut theirs, mut ours) = (Vec::new(), Vec::new());
+                traffic.frames(gps, second, start_ms, &mut theirs);
+                traffic.frames(receiver, second, start_ms, &mut ours);
+                for frame in &ours {
+                    if !position(frame.message()) {
+                        continue;
+                    }
+                    let same: Vec<&Frame> = theirs
+                        .iter()
+                        .filter(|each| each.message() == frame.message())
+                        .collect();
+                    let ([reference], Some(&message)) =
+                        (same.as_slice(), index.get(frame.message()))
+                    else {
+                        continue;
+                    };
+                    let true_s = (reference.timestamp() >> 30) as f64
+                        + (reference.timestamp() & ((1 << 30) - 1)) as f64 * 1e-9;
+                    let read_s = frame.timestamp() as f64 / TICKS_A_SECOND as f64;
+                    let paths = flight(&traffic.receivers[receiver], message)
+                        - flight(&traffic.receivers[gps], message);
+                    pairs.push((true_s, read_s - true_s - paths));
+                }
+            }
+            if pairs.len() < 40 {
+                continue;
+            }
+            // Fitted by a line (a clock's rate), what is left is jitter and the paths' slow
+            // change: a jump at any boundary leaves its half on either side.
+            let n = pairs.len() as f64;
+            let (mx, my) = pairs
+                .iter()
+                .fold((0.0, 0.0), |(x, y), (a, b)| (x + a / n, y + b / n));
+            let (sxy, sxx) = pairs.iter().fold((0.0, 0.0), |(xy, xx), (a, b)| {
+                (xy + (a - mx) * (b - my), xx + (a - mx) * (a - mx))
+            });
+            let slope = sxy / sxx;
+            let worst = pairs
+                .iter()
+                .map(|(a, b)| (b - my - slope * (a - mx)).abs())
+                .fold(0.0, f64::max);
+            assert!(
+                worst < 4e-6,
+                "receiver {receiver}: {:.1} us off its clock's line over {} shared messages",
+                worst * 1e6,
+                pairs.len()
+            );
+            checked += 1;
+        }
+        assert!(
+            checked >= 2,
+            "only {checked} receivers shared enough with the GNSS one"
+        );
+        // Each aircraft the GNSS receiver hears flies on: between two of its messages, read by
+        // that receiver's true time, it moved no further than an airliner can (250 m/s and the
+        // simulator's 30 m of reported noise). Before, it was back where it began each loop.
+        let mut tracks: std::collections::HashMap<[u8; 3], Vec<(f64, usize)>> =
+            std::collections::HashMap::new();
+        for second in 0..4 * u64::from(spec.period_s) {
+            let mut theirs = Vec::new();
+            traffic.frames(gps, second, start_ms, &mut theirs);
+            for frame in &theirs {
+                let data = frame.message();
+                if let (true, Some(&message)) = (position(data), index.get(data)) {
+                    let read = (frame.timestamp() >> 30) as f64
+                        + (frame.timestamp() & ((1 << 30) - 1)) as f64 * 1e-9;
+                    let address = [data[1], data[2], data[3]];
+                    tracks.entry(address).or_default().push((read, message));
+                }
+            }
+        }
+        let mut steps = 0;
+        for track in tracks.values_mut() {
+            track.sort_by(|a, b| a.0.total_cmp(&b.0));
+            for pair in track.windows(2) {
+                let ((t0, a), (t1, b)) = (pair[0], pair[1]);
+                let moved = linalg::norm(linalg::sub(traffic.sent[b].1, traffic.sent[a].1));
+                assert!(
+                    moved <= 250.0 * (t1 - t0) + 30.0,
+                    "an aircraft moved {moved:.0} m in {:.2} s",
+                    t1 - t0
+                );
+                steps += 1;
+            }
+        }
+        assert!(steps > 100, "{steps}");
+        Ok(())
     }
 
     #[test]

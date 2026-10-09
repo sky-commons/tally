@@ -36,9 +36,10 @@
 //! relay's stream verifies strictly, so a relay that batched could be made to forward what its
 //! readers reject. Each batch's key is decompressed once instead (`Batch` keeps it).
 
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::mpsc::{RecvTimeoutError, Sender, channel};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(test)]
+use std::sync::mpsc::{RecvTimeoutError, channel};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -160,44 +161,164 @@ pub const MEMBER_RECORDS_PER_FEEDER: u64 = 4;
 /// ceiling (eight tiny records a second, 240 us) costs the workers some 1.8 times a planned one.
 pub const INGEST_NANOS_PER_RECORD: usize = 30_000;
 
-/// A connection's (or the member sessions') records a second, waited for ([`records_per_sec`]): a
-/// token bucket of `rate` records a second and a second's worth of burst. Past it the read loop
-/// waits before it takes the next record, its socket unread, so TCP holds the sender back as the
-/// ingest allowance does. Read off tokio's clock, so a test that pauses time paces with it.
+/// The receptions a second one feeder's connection may send, at most (RFC-0181 §10, "The cores",
+/// decided 2026-10-09): the one ceiling a receiver is held to, the same constant MLAT's raw holder
+/// sizes a receiver's open bins by (`tally_mlat_solver::held::Rates::MEASURED`, `ceiling_per_s`),
+/// three times the 600 a planned feeder sends (`budget::PLANNED_RECEPTIONS_PER_SEC`), which is what
+/// the cores are planned at. Past it the read loop waits before it takes the next batch, its socket
+/// unread, as it does for records ([`RecordPace`]): a feeder is slowed, never refused. Before, a
+/// feeder's receptions were bounded only by its bytes (256 KiB/s, some 15,000 receptions a second
+/// at 17 bytes each), so one feeder within its byte ceiling cost the stages 25 planned feeders'.
+pub const FEEDER_RECEPTIONS_PER_SEC: u64 =
+    tally_mlat_solver::held::Rates::MEASURED.ceiling_per_s as u64;
+
+/// How fast, and how far ahead, one session of a role may send records: `per_minute` a minute,
+/// and `burst` at once from rest. What the cores plan for a session is its `per_minute`
+/// (`cores::Sessions`); its `burst` is what its role legitimately sends at once (with its Hello,
+/// or a credential and its evidence), taken once and refilled at `per_minute`. By the minute, since
+/// what most roles need is a heartbeat every 30 s and a few records when something changes, far
+/// under one a second.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RolePace {
+    pub per_minute: u64,
+    pub burst: u64,
+}
+
+impl RolePace {
+    /// A pace of this role's, for one session (or, the directory's, shared by every link).
+    pub fn pace(self) -> RecordPace {
+        RecordPace::per_minute(self.per_minute, self.burst)
+    }
+}
+
+/// The most signatures one evidence bundle carries inside it: `MAX_EVIDENCE` feeders'
+/// descriptions and as many receipts, each a token of its asker's pace (`credit::check`).
+pub const EVIDENCE_SIGNATURES: u64 = 2 * tally_wire::credit::MAX_EVIDENCE as u64;
+
+/// A subscriber's session (R4 of sweep 5): a heartbeat every 30 s, a `Subscribe` when the regions
+/// it reads change, a firehose credential with its relay's evidence when it starts and each time
+/// the credential is renewed (at most hourly, `MAX_CREDENTIAL_LIFETIME_MS`), and a provider query
+/// or an echo now and then: twelve a minute, one every five seconds, holds them with room. Its
+/// burst is what it sends with its Hello at most: the credential, the evidence and every signature
+/// inside it ([`EVIDENCE_SIGNATURES`], each a token, `credit::check`), and a few more.
+pub const SUBSCRIBER_RECORDS: RolePace = RolePace {
+    per_minute: 12,
+    burst: EVIDENCE_SIGNATURES + 8,
+};
+
+/// Another relay's hosted MLAT taking raw one hop (`Role::Engine`): a heartbeat every 30 s and a
+/// `Subscribe` when the band it solves changes; it publishes nothing here. Six a minute, and a
+/// burst of a few for what comes with its Hello.
+pub const ENGINE_RECORDS: RolePace = RolePace {
+    per_minute: 6,
+    burst: 8,
+};
+
+/// A measurement session (`Role::Probe`): a feeder's round of echoes (five, `tally_feed::probe`,
+/// each sent once the one before is answered) or one delivery query, then it hangs up, and the
+/// feeder probes again minutes later. Its burst holds a round; past it, one every ten seconds.
+pub const PROBE_RECORDS: RolePace = RolePace {
+    per_minute: 6,
+    burst: 8,
+};
+
+/// The most records a minute of every session under the connection cap that is not a directory
+/// link (not yet identified, probes, engines): what the cores plan each of them at.
+pub const GENERAL_RECORDS_PER_MINUTE: u64 = if PROBE_RECORDS.per_minute > ENGINE_RECORDS.per_minute
+{
+    PROBE_RECORDS.per_minute
+} else {
+    ENGINE_RECORDS.per_minute
+};
+
+/// Every directory link together (a relay that dialled in and is not a member: offers, queries,
+/// evidence, echoes, heartbeats, `subscription::on_directory_link`), one pace they share, as the
+/// members share theirs: the gossip a relay must take does not grow with the links it comes over
+/// (each offer is the same offer on every link), so a relay with many links is planned no more,
+/// and one link sending as fast as it may takes at most its turn (each link waits for its own
+/// token in order, so of `k` links sending at once each is let in once in `k`). Twice what the
+/// directory holds at its bound (`directory::OFFERS_HELD`), each offer re-signed once a minute
+/// (`OWN_RESIGN_EVERY_MS`), some 546 a second: half for the offers, half for the queries, echoes
+/// and the evidence and its signatures (each a token, `credit::check`). Gossip past it waits: an
+/// offer lives three re-signings and evidence a half-life of 30 minutes, so waiting seconds loses
+/// nothing.
+pub const DIRECTORY_RECORDS: RolePace = RolePace {
+    per_minute: 2 * crate::directory::OFFERS_HELD as u64 * 60_000
+        / crate::directory::OWN_RESIGN_EVERY_MS,
+    burst: 2 * crate::directory::OFFERS_HELD as u64 * 60_000
+        / crate::directory::OWN_RESIGN_EVERY_MS,
+};
+
+/// A count a second, waited for: a connection's (or the member sessions', or the directory links')
+/// records a second ([`records_per_sec`], [`RolePace`]), or a feeder's receptions a second
+/// ([`FEEDER_RECEPTIONS_PER_SEC`]). A token bucket of `rate` a second and `burst` at once from
+/// rest. Past it the read loop waits before it takes the next record, its socket unread, so TCP
+/// holds the sender back as the ingest allowance does. Work a record brings beyond its one token
+/// (each signature inside an evidence bundle, `credit::check`) is owed ([`RecordPace::owe`]) and
+/// paid before the connection's next record is read. Read off tokio's clock, so a test that pauses
+/// time paces with it.
 pub struct RecordPace {
-    rate: u64,
-    /// Records still allowed (negative: owed), as of when.
+    /// Tokens a second.
+    rate: f64,
+    burst: u64,
+    /// Tokens still allowed (negative: owed), as of when.
     state: Mutex<(f64, tokio::time::Instant)>,
 }
 
 impl RecordPace {
+    /// `rate` a second, a second's worth at once.
     pub fn new(rate: u64) -> Self {
-        let rate = rate.max(1);
+        Self::with_burst(rate, rate)
+    }
+
+    /// `rate` a second, `burst` at once.
+    pub fn with_burst(rate: u64, burst: u64) -> Self {
+        Self::per_minute(rate.saturating_mul(60), burst)
+    }
+
+    /// `per_minute` a minute, `burst` at once.
+    pub fn per_minute(per_minute: u64, burst: u64) -> Self {
+        let burst = burst.max(1);
         Self {
-            rate,
-            state: Mutex::new((rate as f64, tokio::time::Instant::now())),
+            rate: per_minute.max(1) as f64 / 60.0,
+            burst,
+            state: Mutex::new((burst as f64, tokio::time::Instant::now())),
         }
     }
 
-    pub fn rate(&self) -> u64 {
-        self.rate
+    /// Tokens a minute.
+    pub fn per_minute_rate(&self) -> u64 {
+        (self.rate * 60.0).round() as u64
+    }
+
+    /// Takes `count` tokens now, refilled to the moment: how long the pace then owes, if it does.
+    fn spend(&self, count: u64) -> Option<Duration> {
+        let Ok(mut state) = self.state.lock() else {
+            return None;
+        };
+        let now = tokio::time::Instant::now();
+        let elapsed = now.saturating_duration_since(state.1).as_secs_f64();
+        let allowed = (state.0 + elapsed * self.rate).min(self.burst as f64) - count as f64;
+        *state = (allowed, now);
+        (allowed < 0.0).then(|| Duration::from_secs_f64(-allowed / self.rate))
     }
 
     /// One record, waiting while the pace owes more than it has refilled.
     pub async fn take(&self) {
-        let wait = {
-            let Ok(mut state) = self.state.lock() else {
-                return;
-            };
-            let now = tokio::time::Instant::now();
-            let elapsed = now.saturating_duration_since(state.1).as_secs_f64();
-            let allowed = (state.0 + elapsed * self.rate as f64).min(self.rate as f64) - 1.0;
-            *state = (allowed, now);
-            (allowed < 0.0).then(|| Duration::from_secs_f64(-allowed / self.rate as f64))
-        };
-        if let Some(wait) = wait {
+        self.take_many(1).await;
+    }
+
+    /// `count` at once (a batch's receptions), waiting until the pace has refilled them.
+    pub async fn take_many(&self, count: u64) {
+        if let Some(wait) = self.spend(count) {
             tokio::time::sleep(wait).await;
         }
+    }
+
+    /// `count` owed without waiting: work done for a record already taken, paid for by the wait
+    /// before the next.
+    pub fn owe(&self, count: u64) {
+        let _ = self.spend(count);
     }
 }
 
@@ -209,10 +330,22 @@ impl RecordPace {
 /// and held for the session, so a peer that trickles a message, or reads slowly what it is sent,
 /// holds what was planned for it and no more. Before, only the reader's two were carved, while
 /// a send held two more for up to 30 s and the reader held a third while it decoded: some 2 GB
-/// outside every gauge at 20,000 slow subscribers.
+/// outside every gauge at 20,000 slow subscribers. With them, the network duties' replies waiting
+/// for the write side ([`REPLIES_BYTES`]).
 pub const BUFFERS_PER_CONNECTION: usize = (tally_wire::noise::READER_BUFFERS
     + tally_wire::noise::WRITER_BUFFERS)
-    * tally_wire::noise::MAX_MESSAGE;
+    * tally_wire::noise::MAX_MESSAGE
+    + REPLIES_BYTES;
+
+/// What one connection's replies from the network duties (echo replies, delivery answers, offers
+/// for a provider query) hold at most while they wait for its write side, by their encoded bytes:
+/// a message's worth, carved with its buffers ([`BUFFERS_PER_CONNECTION`]). A reply past it is
+/// dropped (`link::ReplyRoom`): a peer that asks faster than it reads gets fewer answers, never
+/// more of the relay's memory. Before (N4), the answers to a whole message were gathered,
+/// uncharged, while its records were paced at eight a second, and up to 64 such lists waited for
+/// the write side: one 64 KiB message of `ProviderQuery`s, each answered with up to 32 offers,
+/// held some 25 MB a connection for minutes.
+pub const REPLIES_BYTES: usize = tally_wire::noise::MAX_MESSAGE;
 
 /// What batches larger than their connection's whole allowance may hold past it, all
 /// connections together: such a batch takes its connection's whole allowance (it waits until
@@ -342,10 +475,10 @@ impl Lent {
     }
 
     /// `bytes` of it (all, if it holds less) moved into a charge of their own, lent from the same
-    /// carve.
-    fn split(&mut self, bytes: usize) -> Self {
+    /// carve, covering `decoded` (`budget::Charge::split_covering`).
+    fn split_covering(&mut self, bytes: usize, decoded: &Arc<tally_wire::Decoded>) -> Self {
         Self {
-            charge: self.charge.split(bytes),
+            charge: self.charge.split_covering(bytes, decoded),
             home: self.home.clone(),
         }
     }
@@ -454,7 +587,7 @@ impl InFlight {
     }
 
     /// This charge is for holding `decoded` (`budget::Charge::cover`), and so is every part split
-    /// from it. Covered once it is shrunk to the decode (`shrink_to`), so what goes back to the
+    /// from it with it ([`InFlight::split`]). Covered once it is shrunk to the decode (`shrink_to`), so what goes back to the
     /// carve covers nothing.
     pub fn cover(&mut self, decoded: &Arc<tally_wire::Decoded>) {
         self.store.charge.cover(decoded);
@@ -474,13 +607,14 @@ impl InFlight {
     }
 
     /// `bytes` of this charge (all of it, if it holds less) moved into a charge of their own,
-    /// nothing taken or released: a slice's share, handed on with it.
-    pub fn split(&mut self, bytes: usize) -> InFlight {
-        let over = self.over.split(bytes);
+    /// nothing taken or released: a slice's share, handed on with it, covering its decode
+    /// `decoded` and no other (`budget::Charge::split_covering`).
+    pub fn split(&mut self, bytes: usize, decoded: &Arc<tally_wire::Decoded>) -> InFlight {
+        let over = self.over.split_covering(bytes, decoded);
         let rest = bytes - over.bytes();
         InFlight {
             own: self.own.split(rest),
-            store: self.store.split(rest),
+            store: self.store.split_covering(rest, decoded),
             over,
         }
     }
@@ -607,7 +741,7 @@ impl Refusal {
 /// charge ([`Stages::run_charged`], [`Stages::run_stamped`]), each at least [`CHARGE_FLOOR`] of
 /// `Store::Ingest` and the oversize room, so the records the charges admit are at most their bytes
 /// over [`CHARGE_FLOOR`] ([`Room::records`]), however many connections came and went; and the
-/// workers' queues take no more than that, whatever the charges say ([`Queued`]). Anything else a
+/// workers' queues take no more than that, whatever the charges say ([`lanes::Lanes`]). Anything else a
 /// worker is given is a trace's or a test's (`advance`, `flush`), at most [`CONTROL_QUEUED`] at
 /// once, its sender waiting for room; a worker ticks itself.
 type Work = Box<dyn FnOnce(usize) + Send>;
@@ -646,69 +780,189 @@ impl Room {
 /// the workers at once; a sender past it waits for room.
 pub const CONTROL_QUEUED: usize = 64;
 
-/// What waits in the workers' queues, counted as it is handed in and as a worker takes it, so no
-/// queue holds more than its bound by construction (R-P9): charged records at most
-/// [`Room::records`], every worker together, a record past it refused and counted, never queued;
-/// control work at most [`CONTROL_QUEUED`], its sender waiting. Before, each worker's queue was an
-/// unbounded channel, bounded only by what the charges admitted: a path that handed a record over
-/// uncharged, or charged short, grew it without limit.
-struct Queued {
-    room: Option<Room>,
-    records: AtomicUsize,
-    refused: AtomicU64,
-    control: Mutex<usize>,
-    control_taken: Condvar,
-}
+/// The workers' queues (R-P9, R1): one a worker, each pushed only through [`lanes::Lanes`], whose
+/// two ways in count what they push. A charged record is counted against [`Room::records`], every
+/// worker together, and one past it is refused and counted, never queued; control work waits while
+/// [`CONTROL_QUEUED`] wait. A queue is a `VecDeque` behind its lane's lock with no way to push but
+/// those two, so no path can hand a worker anything uncounted.
+///
+/// Before, each queue was an `mpsc::channel`, unbounded, with the count kept beside it: bounded
+/// only while every path that sent on it counted first, and the refusals it counted were read by
+/// no report (`Hub::memory_report` serves them now, `ingest_refused`).
+mod lanes {
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
+    use std::time::Duration;
 
-impl Queued {
-    fn new(room: Option<Room>) -> Self {
-        Self {
-            room,
-            records: AtomicUsize::new(0),
-            refused: AtomicU64::new(0),
-            control: Mutex::new(0),
-            control_taken: Condvar::new(),
+    use super::{CONTROL_QUEUED, Room, Work};
+
+    enum Item {
+        Record(Work),
+        Control(Work),
+    }
+
+    #[derive(Default)]
+    struct State {
+        items: VecDeque<Item>,
+        closed: bool,
+    }
+
+    #[derive(Default)]
+    struct Lane {
+        state: Mutex<State>,
+        ready: Condvar,
+    }
+
+    impl Lane {
+        fn lock(&self) -> MutexGuard<'_, State> {
+            self.state.lock().unwrap_or_else(PoisonError::into_inner)
         }
     }
 
-    /// A record counted in, if the queues hold fewer than their bound.
-    fn admit(&self) -> bool {
-        let bound = self.room.as_ref().map_or(usize::MAX, Room::records);
-        let admitted = self
-            .records
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |queued| {
-                (queued < bound).then_some(queued + 1)
-            })
-            .is_ok();
-        if !admitted {
-            self.refused.fetch_add(1, Ordering::Relaxed);
-        }
-        admitted
+    /// What a worker is given next.
+    pub(super) enum Next {
+        Work(Work),
+        /// Nothing came within the wait: the worker ticks.
+        Idle,
+        /// Its stages are dropped and its queue is empty: the worker ends.
+        Closed,
     }
 
-    fn record_taken(&self) {
-        self.records.fetch_sub(1, Ordering::AcqRel);
+    pub(super) struct Lanes {
+        lanes: Box<[Lane]>,
+        room: Room,
+        records: AtomicUsize,
+        refused: AtomicU64,
+        control: Mutex<usize>,
+        control_taken: Condvar,
     }
 
-    /// Control work counted in, waiting while [`CONTROL_QUEUED`] wait.
-    fn admit_control(&self) {
-        let Ok(mut waiting) = self.control.lock() else {
-            return;
-        };
-        while *waiting >= CONTROL_QUEUED {
-            match self.control_taken.wait(waiting) {
-                Ok(again) => waiting = again,
-                Err(_) => return,
+    impl Lanes {
+        pub(super) fn new(workers: usize, room: Room) -> Self {
+            Self {
+                lanes: (0..workers.max(1)).map(|_| Lane::default()).collect(),
+                room,
+                records: AtomicUsize::new(0),
+                refused: AtomicU64::new(0),
+                control: Mutex::new(0),
+                control_taken: Condvar::new(),
             }
         }
-        *waiting += 1;
-    }
 
-    fn control_taken(&self) {
-        if let Ok(mut waiting) = self.control.lock() {
-            *waiting = waiting.saturating_sub(1);
+        pub(super) fn width(&self) -> usize {
+            self.lanes.len()
         }
-        self.control_taken.notify_all();
+
+        fn lane(&self, worker: usize) -> &Lane {
+            &self.lanes[worker % self.lanes.len()]
+        }
+
+        /// A charged record onto worker `worker`'s queue, counted: false, counted refused, when
+        /// the queues hold all the records the rooms admit ([`Room::records`]). One handed to a
+        /// worker that is gone (the stages being dropped) is dropped unrun.
+        pub(super) fn push_record(&self, worker: usize, work: Work) -> bool {
+            let bound = self.room.records();
+            let admitted = self
+                .records
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |queued| {
+                    (queued < bound).then_some(queued + 1)
+                })
+                .is_ok();
+            if !admitted {
+                self.refused.fetch_add(1, Ordering::Relaxed);
+                return false;
+            }
+            if !self.push(worker, Item::Record(work)) {
+                self.records.fetch_sub(1, Ordering::AcqRel);
+            }
+            true
+        }
+
+        /// Control work onto worker `worker`'s queue, waiting while [`CONTROL_QUEUED`] wait.
+        pub(super) fn push_control(&self, worker: usize, work: Work) {
+            {
+                let mut waiting = self.control.lock().unwrap_or_else(PoisonError::into_inner);
+                while *waiting >= CONTROL_QUEUED {
+                    waiting = self
+                        .control_taken
+                        .wait(waiting)
+                        .unwrap_or_else(PoisonError::into_inner);
+                }
+                *waiting += 1;
+            }
+            if !self.push(worker, Item::Control(work)) {
+                self.control_done();
+            }
+        }
+
+        fn push(&self, worker: usize, item: Item) -> bool {
+            let lane = self.lane(worker);
+            let mut state = lane.lock();
+            if state.closed {
+                return false;
+            }
+            state.items.push_back(item);
+            drop(state);
+            lane.ready.notify_one();
+            true
+        }
+
+        fn control_done(&self) {
+            {
+                let mut waiting = self.control.lock().unwrap_or_else(PoisonError::into_inner);
+                *waiting = waiting.saturating_sub(1);
+            }
+            self.control_taken.notify_all();
+        }
+
+        /// Worker `worker`'s next work, waiting up to `wait` for it; uncounted as it is taken.
+        pub(super) fn next(&self, worker: usize, wait: Duration) -> Next {
+            let lane = self.lane(worker);
+            let mut state = lane.lock();
+            loop {
+                match state.items.pop_front() {
+                    Some(Item::Record(work)) => {
+                        self.records.fetch_sub(1, Ordering::AcqRel);
+                        return Next::Work(work);
+                    }
+                    Some(Item::Control(work)) => {
+                        drop(state);
+                        self.control_done();
+                        return Next::Work(work);
+                    }
+                    None if state.closed => return Next::Closed,
+                    None => {
+                        let (again, waited) = lane
+                            .ready
+                            .wait_timeout(state, wait)
+                            .unwrap_or_else(PoisonError::into_inner);
+                        state = again;
+                        if waited.timed_out() && state.items.is_empty() && !state.closed {
+                            return Next::Idle;
+                        }
+                    }
+                }
+            }
+        }
+
+        /// No more work is taken: each worker runs what its queue holds, then ends.
+        pub(super) fn close(&self) {
+            for lane in &*self.lanes {
+                lane.lock().closed = true;
+                lane.ready.notify_all();
+            }
+        }
+
+        /// Records refused because the queues held their bound.
+        pub(super) fn refused(&self) -> u64 {
+            self.refused.load(Ordering::Relaxed)
+        }
+
+        /// Records waiting for the workers now.
+        pub(super) fn queued(&self) -> usize {
+            self.records.load(Ordering::Acquire)
+        }
     }
 }
 
@@ -724,7 +978,7 @@ enum Pool {
     /// Run by the caller, one at a time: producer 0. For tests, and nothing else.
     Inline(Mutex<()>),
     Threads {
-        senders: Vec<Sender<Work>>,
+        lanes: Arc<lanes::Lanes>,
         handles: Vec<JoinHandle<()>>,
     },
 }
@@ -739,8 +993,6 @@ struct Core {
     ticked: Box<[AtomicU64]>,
     message: MessageExchange,
     pause: Option<Pause>,
-    /// What waits in the workers' queues.
-    queued: Queued,
 }
 
 impl Core {
@@ -806,7 +1058,6 @@ impl Stages {
                 ticked: vec![AtomicU64::new(0)].into_boxed_slice(),
                 message: MessageExchange::inline(sink, gauges),
                 pause: None,
-                queued: Queued::new(None),
             }),
             pool: Pool::Inline(Mutex::new(())),
         }
@@ -837,37 +1088,36 @@ impl Stages {
                 pause.as_ref(),
             )?,
             pause,
-            queued: Queued::new(Some(room)),
         });
+        let lanes = Arc::new(lanes::Lanes::new(workers, room));
         // Dropping `stages` on a failure stops and joins the workers already started.
         let mut stages = Self {
             core: Arc::clone(&core),
             pool: Pool::Threads {
-                senders: Vec::with_capacity(workers),
+                lanes: Arc::clone(&lanes),
                 handles: Vec::with_capacity(workers),
             },
         };
         for producer in 0..workers {
-            let (sender, receiver) = channel::<Work>();
             let core = Arc::clone(&core);
+            let lanes = Arc::clone(&lanes);
             let spawned = std::thread::Builder::new()
                 .name(format!("tally-ingest-{producer}"))
                 .spawn(move || {
                     loop {
-                        match receiver.recv_timeout(Duration::from_millis(TICK_MS)) {
-                            Ok(work) => {
+                        match lanes.next(producer, Duration::from_millis(TICK_MS)) {
+                            lanes::Next::Work(work) => {
                                 work(producer);
                                 core.tick(producer, false);
                             }
-                            Err(RecvTimeoutError::Timeout) => core.tick(producer, true),
-                            Err(RecvTimeoutError::Disconnected) => break,
+                            lanes::Next::Idle => core.tick(producer, true),
+                            lanes::Next::Closed => break,
                         }
                     }
                 });
             let handle = spawned
                 .map_err(|error| format!("ingest thread {producer} of {workers}: {error}"))?;
-            if let Pool::Threads { senders, handles } = &mut stages.pool {
-                senders.push(sender);
+            if let Pool::Threads { handles, .. } = &mut stages.pool {
                 handles.push(handle);
             }
         }
@@ -890,7 +1140,7 @@ impl Stages {
     pub fn width(&self) -> usize {
         match &self.pool {
             Pool::Inline(_) => 1,
-            Pool::Threads { senders, .. } => senders.len().max(1),
+            Pool::Threads { lanes, .. } => lanes.width(),
         }
     }
 
@@ -908,14 +1158,20 @@ impl Stages {
     }
 
     /// Records refused because the workers' queues held their bound: none while every record is
-    /// charged as it should be.
+    /// charged as it should be. Served on `GET /memory` (`hub::MemoryReport::ingest_refused`).
     pub fn refused(&self) -> u64 {
-        self.core.queued.refused.load(Ordering::Relaxed)
+        match &self.pool {
+            Pool::Inline(_) => 0,
+            Pool::Threads { lanes, .. } => lanes.refused(),
+        }
     }
 
     /// Records waiting for the workers now.
     pub fn queued(&self) -> usize {
-        self.core.queued.records.load(Ordering::Acquire)
+        match &self.pool {
+            Pool::Inline(_) => 0,
+            Pool::Threads { lanes, .. } => lanes.queued(),
+        }
     }
 
     /// Runs `work` on worker `worker` with its charge, stamped there as a batch is: by `given`, a
@@ -945,56 +1201,29 @@ impl Stages {
     /// Runs a charged record's `work` on worker `worker`, counted in the workers' queues until a
     /// worker takes it; false, counted, when they hold their bound.
     fn run_record(&self, worker: usize, work: Work) -> bool {
-        if matches!(self.pool, Pool::Inline(_)) {
-            self.run_on(worker, work);
-            return true;
+        match &self.pool {
+            Pool::Inline(lock) => {
+                self.run_inline(lock, work);
+                true
+            }
+            Pool::Threads { lanes, .. } => lanes.push_record(worker, work),
         }
-        if !self.core.queued.admit() {
-            return false;
-        }
-        let core = Arc::clone(&self.core);
-        let counted = Box::new(move |producer| {
-            core.queued.record_taken();
-            work(producer);
-        });
-        if !self.run_on(worker, counted) {
-            self.core.queued.record_taken();
-        }
-        true
     }
 
     /// Runs control work (a trace's or a test's) on worker `worker`, waiting while
     /// [`CONTROL_QUEUED`] wait.
     fn run_control(&self, worker: usize, work: Work) {
-        if matches!(self.pool, Pool::Inline(_)) {
-            self.run_on(worker, work);
-            return;
-        }
-        self.core.queued.admit_control();
-        let core = Arc::clone(&self.core);
-        let counted = Box::new(move |producer| {
-            core.queued.control_taken();
-            work(producer);
-        });
-        if !self.run_on(worker, counted) {
-            self.core.queued.control_taken();
+        match &self.pool {
+            Pool::Inline(lock) => self.run_inline(lock, work),
+            Pool::Threads { lanes, .. } => lanes.push_control(worker, work),
         }
     }
 
-    /// Runs `work` on worker `worker` (inline: now, on the caller, then ticks). False if the
-    /// worker is gone (the stages are being dropped), the work dropped unrun.
-    fn run_on(&self, worker: usize, work: Work) -> bool {
-        match &self.pool {
-            Pool::Inline(lock) => {
-                let _held = lock.lock();
-                work(0);
-                self.core.tick(0, true);
-                true
-            }
-            Pool::Threads { senders, .. } => senders
-                .get(worker % senders.len().max(1))
-                .is_some_and(|sender| sender.send(work).is_ok()),
-        }
+    /// Runs `work` now, on the caller, then ticks.
+    fn run_inline(&self, lock: &Mutex<()>, work: Work) {
+        let _held = lock.lock();
+        work(0);
+        self.core.tick(0, true);
     }
 
     /// The next stamp of `producer`: now by the ingest clock, never before its last.
@@ -1025,6 +1254,18 @@ impl Stages {
         Decoded::from_verified(batch, stamp.stamp_ms, stamp.ingest_seq)
     }
 
+    /// As `decode`, covered by `in_flight` before it is counted alive
+    /// (`Decoded::from_verified_held`): never a decode alive no charge covers, even for an instant.
+    pub fn decode_covered(
+        batch: Batch,
+        stamp: Stamp,
+        in_flight: &mut InFlight,
+    ) -> Result<Arc<Decoded>, Box<Undecodable>> {
+        Decoded::from_verified_held(batch, stamp.stamp_ms, stamp.ingest_seq, |decoded| {
+            in_flight.cover(decoded);
+        })
+    }
+
     pub fn message(&self) -> &MessageExchange {
         &self.core.message
     }
@@ -1037,8 +1278,8 @@ impl Stages {
                 let _held = lock.lock();
                 self.core.tick_at(0, stamp_ms);
             }
-            Pool::Threads { senders, .. } => {
-                for worker in 0..senders.len() {
+            Pool::Threads { lanes, .. } => {
+                for worker in 0..lanes.width() {
                     let core = Arc::clone(&self.core);
                     self.run_control(
                         worker,
@@ -1056,9 +1297,9 @@ impl Stages {
     /// Waits until every worker has done everything handed to it before this call (each worker
     /// takes its work in order). For a trace's end, and a test's.
     pub fn flush(&self) {
-        if let Pool::Threads { senders, .. } = &self.pool {
-            let (done, finished) = channel::<()>();
-            let waiting = senders.len();
+        if let Pool::Threads { lanes, .. } = &self.pool {
+            let (done, finished) = std::sync::mpsc::channel::<()>();
+            let waiting = lanes.width();
             for worker in 0..waiting {
                 let done = done.clone();
                 self.run_control(
@@ -1080,8 +1321,8 @@ impl Stages {
 
 impl Drop for Stages {
     fn drop(&mut self) {
-        if let Pool::Threads { senders, handles } = &mut self.pool {
-            senders.clear();
+        if let Pool::Threads { lanes, handles } = &mut self.pool {
+            lanes.close();
             let here = std::thread::current().id();
             for handle in handles.drain(..) {
                 // Dropped by work on one of its own workers: that one ends when its work does.
@@ -1189,7 +1430,7 @@ mod tests {
         let mut in_flight = InFlight::trusted(&gauge, charge);
         in_flight.shrink_to(decoded.footprint());
         assert_eq!(gauge.held(), decoded.footprint());
-        let slice = in_flight.split(100);
+        let slice = in_flight.split(100, &decoded);
         assert_eq!(
             (slice.bytes(), in_flight.bytes(), gauge.held()),
             (100, decoded.footprint() - 100, decoded.footprint())
@@ -1276,7 +1517,8 @@ mod tests {
     /// queues uncounted. Before, the carve went back with the read loop, and the store said 0
     /// while the batches waited.
     #[tokio::test]
-    async fn a_batch_a_connection_left_holds_the_store_for_its_own_bytes() {
+    async fn a_batch_a_connection_left_holds_the_store_for_its_own_bytes() -> Result<(), String> {
+        let decoded = a_decode()?;
         let ingest = Gauge::new(Store::Ingest, 300);
         let oversize = Gauge::new(Store::Ingest, 1_000);
         let mut queued = Vec::new();
@@ -1293,13 +1535,40 @@ mod tests {
         assert_eq!(connected, 6);
         // A slice of a queued batch still holds its share after the rest goes.
         let mut first = queued.remove(0);
-        let slice = first.split(10);
+        let slice = first.split(10, &decoded);
         drop(first);
         assert_eq!(ingest.held(), 210);
         drop(slice);
         assert_eq!(ingest.held(), 200);
         drop(queued);
         assert_eq!(ingest.held(), 0);
+        Ok(())
+    }
+
+    /// A signed batch of forty receptions, decoded.
+    fn a_decode() -> Result<Arc<Decoded>, String> {
+        let identity = tally_wire::Identity::generate().map_err(|error| error.to_string())?;
+        let batch = Batch::sign(
+            &identity,
+            &tally_wire::BatchContent {
+                boot_id: 1,
+                sequence: 0,
+                counter_epoch: 0,
+                wall_ms: 0,
+                dropped: 0,
+                previous: [0; 32],
+                observations: (0..40u8)
+                    .map(|n| tally_wire::Observation {
+                        format: b'3',
+                        timestamp: u64::from(n),
+                        signal: 0,
+                        data: vec![n; 14],
+                    })
+                    .collect(),
+            },
+        )
+        .map_err(|error| error.to_string())?;
+        Stages::decode(batch, Stamp::default()).map_err(|undecodable| undecodable.error.to_string())
     }
 
     /// RFC-0181 §2: what a batch holds of `Store::Ingest` is its own bytes, never its connection's
@@ -1328,7 +1597,7 @@ mod tests {
         assert_eq!(ingest.held(), 230);
         assert!(Allowance::carve(&ingest, &oversize, 100).is_none());
         // A slice of the old batch holds its share, the rest its own.
-        let slice = held.split(10);
+        let slice = held.split(10, &a_decode()?);
         drop(held);
         assert_eq!(ingest.held(), 210);
         drop(slice);

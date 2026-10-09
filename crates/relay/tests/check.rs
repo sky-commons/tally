@@ -91,12 +91,23 @@ fn check(args: &[&str]) -> Result<Checked> {
 /// none (it takes no area) plans nothing for them. It admits the fewer of the feeders its memory
 /// holds and those its cores carry, and runs every stage on a thread at least.
 /// The load the plan admits (`cores::Load`): its feeders, each held to the records it prints, and
-/// the feeders its members' rate is worth.
+/// the feeders its members' rate is worth, and its other sessions, each at its role's pace.
 fn load(checked: &Checked) -> Result<tally_relay::cores::Load> {
+    let sessions = tally_relay::cores::Sessions {
+        general: checked.get("general-sessions")?,
+        subscribers: checked.get("subscriber-sessions")?,
+    };
+    assert_eq!(
+        checked.get("session-records-per-minute")? as u64,
+        sessions.records_per_minute(),
+        "{:?}",
+        checked.plan
+    );
     Ok(tally_relay::cores::Load {
         feeders: checked.get("feeders")?,
         member_feeders: checked.get("member-feeders")?,
         feeder_records_per_sec: checked.get("feeder-records")? as u64,
+        sessions,
     })
 }
 
@@ -729,5 +740,78 @@ fn the_packaged_unit_starts_a_relay_that_admits_feeders() -> Result {
             checked.get("members")?
         );
     }
+    Ok(())
+}
+
+/// The lines of `check`'s plan RFC-0181 ("Sizing", "What the cores carry") quotes, and the
+/// configuration it quotes them for: ten cores, the two areas the harness's clusters are, memory to
+/// spare (so the cores bound it), with hosted MLAT and without.
+const CORE_LINES: [&str; 11] = [
+    "cores",
+    "core-feeders",
+    "feeder-records",
+    "general-sessions",
+    "subscriber-sessions",
+    "session-records-per-minute",
+    "member-feeders",
+    "ingest-threads",
+    "message-threads",
+    "seal-threads",
+    "mlat-threads",
+];
+
+const TEN_CORES: [&str; 18] = [
+    "--memory-limit",
+    "32G",
+    "--cores",
+    "10",
+    "--key",
+    "k",
+    "--max-upload",
+    "10Gbit/s",
+    "--memory",
+    "24G",
+    "--max-connections",
+    "5024",
+    "--max-connections-per-address",
+    "5024",
+    "--area",
+    "801ffffffffffff",
+    "--area",
+    "8027fffffffffff",
+];
+
+/// N15 of sweep 5: RFC-0181's figures for what ten cores carry are this test's printed output,
+/// held equal to `tests/cores-10.txt`, never prose: the plan the relay prints for that
+/// configuration, hosting MLAT and not. A change to the cores' plan (a figure measured again, a
+/// cost planned that was not) fails here until the file is regenerated from what this test prints,
+/// and the RFC quotes the file. Before, the RFC's prose said ten cores admitted 4,129 hosting MLAT
+/// while the relay planned 3,917, its figures from before a record's cost was planned.
+#[test]
+fn the_cores_figures_the_rfc_quotes_are_the_relays_own() -> Result {
+    let mut printed = String::new();
+    for (name, mlat) in [("hosting MLAT", true), ("without MLAT (--no-mlat)", false)] {
+        let mut args = TEN_CORES.to_vec();
+        if !mlat {
+            args.push("--no-mlat");
+        }
+        let checked = check(&args)?;
+        assert!(checked.accepted, "{}", checked.refusal);
+        printed.push_str(&format!(
+            "# tally-relay check {}, {name}\n",
+            TEN_CORES.join(" ")
+        ));
+        for line in CORE_LINES {
+            printed.push_str(&format!("{line} {}\n", checked.get(line)?));
+        }
+    }
+    print!("{printed}");
+    let held = include_str!("cores-10.txt");
+    assert!(
+        held == printed,
+        "tally/crates/relay/tests/cores-10.txt is not what the relay plans: write this test's \
+         output there (`bazel test //tally/crates/relay:check --test_output=all`) and quote it in \
+         RFC-0181, \"What the cores carry\":\n{printed}"
+    );
     Ok(())
 }

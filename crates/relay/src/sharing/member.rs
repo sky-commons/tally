@@ -334,6 +334,10 @@ pub struct Stats {
     /// Receipts signed, and those that reported a shortfall.
     pub receipts: u64,
     pub shortfalls: u64,
+    /// Receipt windows the judge weighed (`judge`): those steady enough to be judged (no seed
+    /// rotation or change of the members about them), the only windows whose shortfalls can
+    /// demote. What says "no member was demoted" is a verdict and not a judge that never sat.
+    pub judged: u64,
 }
 
 struct Held {
@@ -1391,7 +1395,7 @@ impl Member {
                 now_ms,
                 &mut self.stats,
             ));
-            judge(group, now_ms, &mut self.demotions);
+            judge(group, now_ms, &mut self.demotions, &mut self.stats);
             expire_demotions(group, now_ms);
             out.extend(assign(group, &me, now_ms));
             out.extend(repair(group, &me, now_ms, &mut self.stats));
@@ -1905,7 +1909,12 @@ fn sign_receipt(
 
 /// Demotes a member most of whose children in a stripe reported it short for a window it was not
 /// itself starved in.
-fn judge(group: &mut Group, now_ms: u64, demotions: &mut Vec<(GroupKey, PublicKey, u64)>) {
+fn judge(
+    group: &mut Group,
+    now_ms: u64,
+    demotions: &mut Vec<(GroupKey, PublicKey, u64)>,
+    stats: &mut Stats,
+) {
     let due: Vec<u64> = group
         .receipted
         .iter()
@@ -1921,6 +1930,7 @@ fn judge(group: &mut Group, now_ms: u64, demotions: &mut Vec<(GroupKey, PublicKe
         if !group.steady(window) {
             continue;
         }
+        stats.judged += 1;
         let epoch = epoch_of(window * RECEIPT_WINDOW_SECONDS);
         let accused: Vec<(u8, PublicKey, BTreeSet<PublicKey>)> = group
             .shortfalls

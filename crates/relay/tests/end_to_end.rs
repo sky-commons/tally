@@ -308,10 +308,21 @@ async fn a_stalled_subscriber_is_dropped_and_the_others_keep_every_batch() -> Re
     let mut feeder = noise::connect(stream, &receiver, &relay.key, Role::Feeder)
         .await
         .map_err(text)?;
-    // Big batches, enough to fill the stalled subscriber's socket buffers many times over.
-    let big: Vec<tally_wire::Observation> = frames(2_000)?
-        .iter()
-        .map(tally_wire::Observation::from_beast)
+    // Big batches, enough to fill the stalled subscriber's socket buffers many times over: few
+    // receptions of long messages, so the feeder's receptions a second
+    // (`ingest::FEEDER_RECEPTIONS_PER_SEC`) let the flood through in seconds.
+    let big: Vec<tally_wire::Observation> = (0..100u32)
+        .map(|n| tally_wire::Observation {
+            format: tally_wire::batch::format::MODE_S_LONG,
+            timestamp: 1_000 + u64::from(n),
+            signal: 100,
+            data: [0x8d_u8; 4]
+                .into_iter()
+                .chain(n.to_be_bytes())
+                .cycle()
+                .take(480)
+                .collect(),
+        })
         .collect();
     let total = 400u64;
     let (heard, mut done) = tokio::sync::mpsc::channel::<()>(1);
@@ -1588,7 +1599,8 @@ async fn taking(
 /// (§2.6, "it is not demoted for it"), judged relay by relay (sweep 4, R-N20): the full relay
 /// itself, which still takes the group's data over the session it admitted, and the second relay
 /// each receipt a judged window; the third, the origin of the only feed, is owed nothing and
-/// receipts none; and no relay files a shortfall or demotes another.
+/// receipts none; every relay's judge weighed a window that could have demoted (sweep 5, R5:
+/// `member::Stats::judged`), and no relay files a shortfall or demotes another.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_relay_whose_members_are_full_is_routed_around_and_the_data_still_arrives() -> Result {
     use tally_relay::sharing::member::{JUDGE_AFTER_MS, RECEIPT_GRACE_MS, RECEIPT_WINDOW_SECONDS};
@@ -1713,6 +1725,12 @@ async fn a_relay_whose_members_are_full_is_routed_around_and_the_data_still_arri
             "the {name} relay signed {} receipts ({}owed the feed): {stats:?}",
             stats.receipts,
             if owed { "" } else { "not " }
+        );
+        // The judge sat: a window steady enough to demote was weighed (sweep 5, R5), so the
+        // shortfalls and demotions below are a verdict, not a judgment that never ran.
+        assert!(
+            stats.judged > 0,
+            "the {name} relay judged no receipt window: {stats:?}"
         );
         assert_eq!(
             stats.shortfalls, 0,

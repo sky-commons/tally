@@ -496,6 +496,12 @@ pub struct MemoryReport {
     pub delivery_held: usize,
     /// Sharing members turned away for want of room in the members' pool.
     pub members_refused: u64,
+    /// Records waiting for the ingest workers now, beside `Store::Ingest`'s gauge, and those
+    /// refused because the workers' queues held their bound (`ingest::Stages::refused`): none
+    /// while every record is charged as it should be, so one counted here is a path that charged
+    /// short.
+    pub ingest_queued: usize,
+    pub ingest_refused: u64,
 }
 
 /// A batch a link took in, on its way to the ingest stage.
@@ -748,9 +754,13 @@ pub struct Hub {
     max_member_bytes_per_sec: u64,
     /// The pace every member session shares (`ceiling::Pace`), at `max_member_bytes_per_sec`.
     member_pace: Arc<crate::ceiling::Pace>,
-    /// The records a second every member session's data shares (`ingest::RecordPace`), at the
-    /// feeders `max_member_bytes_per_sec` is worth (`Hub::member_records_per_sec`).
+    /// The records a second every member session shares, all it sends (`ingest::RecordPace`), at
+    /// the feeders `max_member_bytes_per_sec` is worth (`ingest::member_records_per_sec`).
     member_records: Arc<crate::ingest::RecordPace>,
+    /// The records a second every directory link shares, whoever dialled
+    /// (`ingest::DIRECTORY_RECORDS`): planned once, as the gossip it carries is one whatever the
+    /// links.
+    directory_records: Arc<crate::ingest::RecordPace>,
     /// The areas taken (RFC-0174 §2.1): what the member sessions are planned from
     /// (`budget::members_for`).
     areas: Vec<Region>,
@@ -800,6 +810,8 @@ impl Drop for Slot {
 pub struct Connection {
     general: Option<Slot>,
     _source: SourceSlot,
+    /// The address it came from, as the socket saw it.
+    address: IpAddr,
 }
 
 impl Connection {
@@ -809,6 +821,11 @@ impl Connection {
     /// bounded by its own cap, never by another's (`Hub::plan`).
     pub fn general(&mut self) -> Option<Slot> {
         self.general.take()
+    }
+
+    /// The address it came from, as the socket saw it (its source slot counts its /64).
+    pub fn address(&self) -> IpAddr {
+        self.address
     }
 }
 
@@ -884,7 +901,7 @@ impl Hub {
             DEFAULT_MEMORY,
             Plan::planned(false)
                 .with_members(0, DEFAULT_MAX_MEMBER_BYTES_PER_SEC)
-                .with_connections(DEFAULT_MAX_CONNECTIONS),
+                .with_sessions(DEFAULT_MAX_CONNECTIONS, max_subscribers),
         );
         network.charge_to(&budget);
         let stages = Stages::inline(
@@ -927,6 +944,7 @@ impl Hub {
             member_records: Arc::new(crate::ingest::RecordPace::new(member_records_for(
                 DEFAULT_MAX_MEMBER_BYTES_PER_SEC,
             ))),
+            directory_records: Arc::new(crate::ingest::DIRECTORY_RECORDS.pace()),
             areas: Vec::new(),
             holds_raw: false,
             cores: None,
@@ -1031,7 +1049,7 @@ impl Hub {
         Plan::planned(self.holds_raw)
             .with_feeder_ceiling(self.max_feeder_bytes_per_sec)
             .with_members(members, self.max_member_bytes_per_sec)
-            .with_connections(self.non_feeder_connections(members))
+            .with_sessions(self.max_connections, self.max_subscribers)
             .with_cores(self.cores)
     }
 
@@ -1041,19 +1059,6 @@ impl Hub {
     pub fn cores(mut self, cores: usize) -> Self {
         self.cores = Some(cores);
         self.replanned()
-    }
-
-    /// Every connection but a feeder's the relay holds at once, each by its own role's cap: those
-    /// under the connection cap (not yet identified, probes, engines, directory links, the dials
-    /// that hold no member's place), the member sessions (`members`), and the subscribers. A
-    /// feeder's are its reservation's. Before, the three shared the one cap, so the plan counted
-    /// some 128 members, 25 feeders and 64 subscribers in 128 connections, and a member past the
-    /// connections the others held was closed on before its handshake, with no word to route
-    /// around it by.
-    fn non_feeder_connections(&self, members: usize) -> usize {
-        self.max_connections
-            .saturating_add(members)
-            .saturating_add(self.max_subscribers)
     }
 
     /// Takes `areas` (RFC-0174 §2.1): the areas its sharing and MLAT choose from
@@ -1088,6 +1093,8 @@ impl Hub {
             batches_held: sharing,
             delivery_held: self.network.delivery.held_bytes(),
             members_refused: self.members_refused.load(Ordering::Relaxed),
+            ingest_queued: self.stages.queued(),
+            ingest_refused: self.stages.refused(),
         }
     }
 
@@ -1315,14 +1322,13 @@ impl Hub {
         Arc::clone(&self.member_records)
     }
 
-    /// The records a second one relay's session may send (`ingest::member_records_per_sec`): the
-    /// members' whole rate, as its byte ceiling is their whole rate's bytes.
-    pub fn member_records_per_sec(&self) -> u64 {
-        member_records_for(self.max_member_bytes_per_sec)
+    /// The records a second every directory link shares (`ingest::DIRECTORY_RECORDS`).
+    pub fn directory_records(&self) -> Arc<crate::ingest::RecordPace> {
+        Arc::clone(&self.directory_records)
     }
 
-    /// The records a second one feeder's (or subscriber's, engine's, probe's) session may send
-    /// (`ingest::records_per_sec` of its byte ceiling).
+    /// The records a second one feeder's session may send (`ingest::records_per_sec` of its byte
+    /// ceiling).
     pub fn feeder_records_per_sec(&self) -> u64 {
         crate::ingest::records_per_sec(self.max_feeder_bytes_per_sec)
     }
@@ -1389,6 +1395,7 @@ impl Hub {
         Some(Connection {
             general: Some(general),
             _source: source,
+            address,
         })
     }
 
@@ -1506,13 +1513,13 @@ impl Hub {
             return false;
         }
         // A format this build cannot read is still forwarded raw; it just adds nothing here.
-        let (batch, decoded) = match Stages::decode(batch, stamp) {
+        let (batch, decoded) = match Stages::decode_covered(batch, stamp, &mut in_flight) {
             Ok(decoded) => {
-                // Covering it from the moment it exists, then charged for what it holds, no more,
-                // until the epochs hold it. Covered first: shrinking releases bytes, which wakes
-                // whoever waits for room in the store, and a decode not yet covered when that
-                // thread runs first is one no charge covers for as long as this one waits.
-                in_flight.cover(&decoded);
+                // Covered from before it is counted alive (`Stages::decode_covered`), then charged
+                // for what it holds, no more, until the epochs hold it. Covered first: shrinking
+                // releases bytes, which wakes whoever waits for room in the store, and a decode not
+                // yet covered when that thread runs first is one no charge covers for as long as
+                // this one waits.
                 in_flight.shrink_to(decoded.footprint());
                 (decoded.batch().clone(), Some(decoded))
             }
@@ -1848,7 +1855,7 @@ impl Hub {
             )
         });
         if new {
-            self.network.on_positions(&positions, self.now_ms());
+            self.network.on_positions(&positions, source, self.now_ms());
             self.forward_positions(source, Record::Positions(positions));
         }
         new
@@ -1936,7 +1943,7 @@ impl Hub {
             )
         });
         if new {
-            self.network.on_positions(&positions, self.now_ms());
+            self.network.on_positions(&positions, source, self.now_ms());
             self.forward_positions(source, Record::Provisional(positions));
         }
         new
@@ -1979,7 +1986,7 @@ impl Hub {
                 });
             }
             let record = Record::ClockModel(model);
-            self.network.on_clock_model(&record, self.now_ms());
+            self.network.on_clock_model(&record, source, self.now_ms());
             let points = crate::network::points_of(&record);
             self.fanout.publish(Item {
                 source,
@@ -2007,7 +2014,7 @@ impl Hub {
             return false;
         };
         self.network
-            .on_clock_model(&Record::ClockModelPart(part.clone()), self.now_ms());
+            .on_clock_model(&Record::ClockModelPart(part.clone()), source, self.now_ms());
         self.fanout.publish(Item {
             source,
             record: Arc::new(Record::ClockModelPart(part)),
@@ -2211,6 +2218,64 @@ mod tests {
             passed += 1;
         }
         assert_eq!(passed, 1);
+        Ok(())
+    }
+
+    /// R1: what the ingest workers' queues hold and refuse is served on `GET /memory`
+    /// (`MemoryReport::ingest_queued`, `ingest_refused`), read from the queues themselves. The one
+    /// worker is held inside its first record while the queues fill to their bound
+    /// (`ingest::Room::records`); the next is refused and counted, and the report says so. Before,
+    /// the refusals were counted and read by no report.
+    #[test]
+    fn the_memory_report_counts_what_the_ingest_workers_hold_and_refuse() -> Result<(), String> {
+        let threads = crate::ingest::Threads {
+            ingest: 1,
+            message: 1,
+            seal: 1,
+        };
+        let hub = Hub::new(1).memory(64 << 20, false).staged(threads)?;
+        let bound = crate::ingest::Room::of(hub.budget()).records();
+        let gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let (started, running) = std::sync::mpsc::channel::<()>();
+        let held = Arc::clone(&gate);
+        assert!(hub.stages.run_charged(
+            0,
+            InFlight::free(),
+            Box::new(move |_, _| {
+                let _ = started.send(());
+                let (open, opened) = &*held;
+                let mut open = open
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                while !*open {
+                    open = opened
+                        .wait(open)
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                }
+            }),
+        ));
+        running
+            .recv_timeout(Duration::from_secs(60))
+            .map_err(|_| "the worker never took the first record".to_owned())?;
+        let handed: usize = (0..=bound)
+            .map(|_| {
+                usize::from(
+                    hub.stages
+                        .run_charged(0, InFlight::free(), Box::new(|_, _| {})),
+                )
+            })
+            .sum();
+        assert_eq!(handed, bound);
+        let report = hub.memory_report();
+        assert_eq!((report.ingest_queued, report.ingest_refused), (bound, 1));
+        let (open, opened) = &*gate;
+        *open
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        opened.notify_all();
+        hub.stages.flush();
+        let report = hub.memory_report();
+        assert_eq!((report.ingest_queued, report.ingest_refused), (0, 1));
         Ok(())
     }
 

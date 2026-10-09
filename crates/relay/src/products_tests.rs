@@ -75,6 +75,9 @@ fn stamp(stamp_ms: u64) -> Stamp {
 /// 2026-10-04T00:00:00Z.
 const BASE_MS: u64 = 1_791_244_800_000;
 
+/// The session a test's peer records are handed in by (the hub's id of its connection).
+const PEER: u64 = 7;
+
 type Result<T> = std::result::Result<T, String>;
 
 fn err(error: impl std::fmt::Display) -> String {
@@ -85,8 +88,9 @@ fn relay_asker(key: PublicKey) -> Asker {
     Asker {
         role: AskerRole::Relay,
         key,
-        source: 7,
+        source: PEER,
         loopback: false,
+        address: None,
     }
 }
 
@@ -361,21 +365,21 @@ fn gather(inputs: &Inputs, second: u64, reversed: bool) -> Result<(Identity, Vec
         shown.reverse();
     } else {
         // The model first, so nothing waits for it.
-        products.clock_model(&inputs.mlat.model, now);
+        products.clock_model(&inputs.mlat.model, PEER, now);
     }
     for record in shown {
         match record {
             Record::RegionalBatch(batch) => {
                 products.regional_from(&relay_asker(peer), batch, now);
             }
-            Record::Positions(positions) => products.positions(&positions, now),
+            Record::Positions(positions) => products.positions(&positions, PEER, now),
             _ => {}
         }
     }
     if reversed {
         // The model last (stamped after them, records are taken in by stamp): every solution
         // waited for it.
-        products.clock_model(&inputs.mlat.model, now + 1);
+        products.clock_model(&inputs.mlat.model, PEER, now + 1);
     }
     let mut out = Vec::new();
     for record in tick(&products, Some(&relay), sealed_at(second + 1)) {
@@ -514,7 +518,7 @@ fn no_aircraft_has_two_fixes_in_one_second_and_a_late_fix_is_dropped() -> Result
     let products = Products::new();
     products.set_world(true);
     let mlat = Mlat::new()?;
-    products.clock_model(&mlat.model, BASE_MS);
+    products.clock_model(&mlat.model, PEER, BASE_MS);
     let first = BASE_MS / 1_000;
     let addresses: Vec<u32> = (1..=20).collect();
     let mut published = Vec::new();
@@ -545,7 +549,7 @@ fn no_aircraft_has_two_fixes_in_one_second_and_a_late_fix_is_dropped() -> Result
                     true,
                     sequence * 4 + n as u64,
                 )?;
-                products.positions(&record, now);
+                products.positions(&record, PEER, now);
             }
         }
         for record in tick(&products, Some(&relay), now) {
@@ -569,7 +573,7 @@ fn no_aircraft_has_two_fixes_in_one_second_and_a_late_fix_is_dropped() -> Result
     assert_eq!(seen.len(), 10 * (addresses.len() + 2));
     // A fix for a second already sealed is late, and changes nothing published.
     let late = mlat.solutions(&[0x00c0_0003], first * 1_000 + 500, 0, false, 9_999)?;
-    products.positions(&late, BASE_MS + 15_000);
+    products.positions(&late, PEER, BASE_MS + 15_000);
     // Taken in once the watermark passes its stamp.
     let after = tick(&products, Some(&relay), BASE_MS + 15_250);
     assert_eq!(products.report().world_late, 1);
@@ -952,7 +956,7 @@ fn what_a_busy_area_and_the_world_cost_a_second() -> Result<()> {
     let peer = Identity::generate().map_err(err)?.public();
     let origin = Identity::generate().map_err(err)?;
     let mlat = Mlat::new()?;
-    gatherer.clock_model(&mlat.model, BASE_MS);
+    gatherer.clock_model(&mlat.model, PEER, BASE_MS);
     // Running already: what was due before is sealed, so a final fix 30 s late is late.
     tick(&gatherer, Some(&relay), BASE_MS - 500);
     let cell = area_of(&location).map_err(err)?;
@@ -973,6 +977,7 @@ fn what_a_busy_area_and_the_world_cost_a_second() -> Result<()> {
                 let n = n as u64;
                 gatherer.positions(
                     &mlat.solutions(chunk, at * 1_000 + 200, 0, true, sequence * 1_000 + 2 * n)?,
+                    PEER,
                     now,
                 );
                 gatherer.positions(
@@ -983,6 +988,7 @@ fn what_a_busy_area_and_the_world_cost_a_second() -> Result<()> {
                         false,
                         sequence * 1_000 + 2 * n + 1,
                     )?,
+                    PEER,
                     now,
                 );
             }
@@ -1040,12 +1046,12 @@ fn the_precise_world_waits_for_finals_and_takes_no_provisional() -> Result<()> {
     products.set_world(true);
     products.set_world_precise(true);
     let now = second * 1_000 + 1_500;
-    products.clock_model(&inputs.mlat.model, now);
+    products.clock_model(&inputs.mlat.model, PEER, now);
     for batch in &inputs.regional {
         products.regional_from(&relay_asker(peer), batch.clone(), now);
     }
     for positions in &inputs.positions {
-        products.positions(positions, now);
+        products.positions(positions, PEER, now);
     }
     let live_at = sealed_at(second + 1);
     let early = tick(&products, Some(&relay), live_at);
@@ -1108,15 +1114,15 @@ fn every_drop_is_counted_by_why() -> Result<()> {
     products.set_world(true);
     let mlat = Mlat::new()?;
     // A fix a minute ahead of the relay's clock, under a model it holds: outside the window.
-    products.clock_model(&mlat.model, BASE_MS);
+    products.clock_model(&mlat.model, PEER, BASE_MS);
     let ahead = mlat.solutions(&[0x00c0_0001], BASE_MS + 60_000, 0, true, 1)?;
-    products.positions(&ahead, BASE_MS);
+    products.positions(&ahead, PEER, BASE_MS);
     products.advance(BASE_MS + 1);
     assert_eq!(products.report().world_out_of_window, 1);
     // Positions under a model never shown: they wait, then expire, counted.
     let other = Mlat::new()?;
     let waiting = other.solutions(&[0x00c0_0002], BASE_MS, 0, false, 2)?;
-    products.positions(&waiting, BASE_MS);
+    products.positions(&waiting, PEER, BASE_MS);
     // Handed in after the watermark passed `BASE_MS + 1`, it is stamped there, never earlier, so
     // it waits from then: still waiting a full `WAITING_MS` later, expired just after.
     let stamped = BASE_MS + 1;
@@ -1194,10 +1200,11 @@ fn records_wait_apart_from_the_epochs_and_are_taken_in_by_stamp() -> Result<()> 
     let budget = products_budget(1 << 20, HELD * len);
     let gauge = budget.gauge(Store::Records);
     products.charge_to(&budget);
-    // One peer floods: it fills its own part of the share (`RecordsRoom`), no more.
-    let fits = super::peer_part(super::peers_part(HELD * len)) / len;
+    // One session floods, the only one open: it fills its own part of the share (`RecordsRoom`),
+    // the peers' whole part, no more.
+    let fits = super::session_part(super::peers_part(HELD * len), 1) / len;
     for _ in 0..fits + 10 {
-        products.positions(&flood, BASE_MS + 1_000_000);
+        products.positions(&flood, PEER, BASE_MS + 1_000_000);
     }
     assert_eq!(gauge.held(), fits * len);
     let sink = products.sink();
@@ -1236,13 +1243,15 @@ fn records_wait_apart_from_the_epochs_and_are_taken_in_by_stamp() -> Result<()> 
     let limit = wanted + HELD * len;
     let budget = products_budget(64 * 1024, limit);
     products.charge_to(&budget);
-    products.clock_model(&mlat.model, BASE_MS);
-    products.positions(&late, seals);
-    products.positions(&in_time, seals - 1);
-    // The flood's signer is not the second engine's: it fills a part of its own.
-    let fits = super::peer_part(super::peers_part(limit)) / len;
+    products.clock_model(&mlat.model, PEER, BASE_MS);
+    products.positions(&late, PEER, seals);
+    products.positions(&in_time, PEER, seals - 1);
+    // The flood comes from another session than the engine's records: it fills a part of its
+    // own, half the peers' with two sessions open.
+    const FLOODER: u64 = PEER + 1;
+    let fits = super::session_part(super::peers_part(limit), 2) / len;
     for _ in 0..fits + 10 {
-        products.positions(&flood, BASE_MS + 1_000_000);
+        products.positions(&flood, FLOODER, BASE_MS + 1_000_000);
     }
     assert_eq!(products.report().records_refused, 10);
     let mut addresses = Vec::new();
@@ -1265,37 +1274,45 @@ fn records_wait_apart_from_the_epochs_and_are_taken_in_by_stamp() -> Result<()> 
     Ok(())
 }
 
-/// Sweep 4, R-N14 and N11: the records the products are handed are charged to who handed them in,
-/// so what is taken never depends on what came first. Peers flooding records past the whole share
-/// each fill their own part and are refused there: a quiet peer's record after a flood by fewer
-/// peers than the parts is taken; and this relay's own MLAT positions are taken after more peers
-/// than there are parts have flooded, from a part no peer's records may take. Handed in the other
-/// way round, the same records are taken.
+/// Sweep 4, R-N14 and N11, and sweep 5, N3: the records the products are handed are charged to
+/// the session that handed them in, never to the key that signed them, so what is taken never
+/// depends on what came first or on how many keys a peer signs with. One session forwarding
+/// records signed by many throwaway keys (more than the old eight parts) fills only its own part,
+/// the peers' share divided by the sessions open; so every honest session open beside it, more of
+/// them than the old parts too, has its record taken, flood first or last, and this relay's own
+/// MLAT positions are taken from a part no peer's records may take. Charged by signer, the flood's
+/// keys took every part between them and the honest sessions were refused.
 #[test]
-fn own_output_and_each_peer_have_a_part_of_the_records_share_whatever_came_first() -> Result<()> {
+fn own_output_and_each_session_have_a_part_of_the_records_share_whatever_came_first() -> Result<()>
+{
     use crate::budget::Store;
+    const HOSTILE: u64 = 100;
+    const HONEST: u64 = 12;
     let own = Mlat::new()?;
-    let peers: Vec<Mlat> = (0..super::PEER_PARTS + 2)
-        .map(|_| Mlat::new())
-        .collect::<Result<_>>()?;
-    let quiet = Mlat::new()?;
+    let throwaway: Vec<Mlat> = (0..16).map(|_| Mlat::new()).collect::<Result<_>>()?;
+    let honest: Vec<Mlat> = (0..HONEST).map(|_| Mlat::new()).collect::<Result<_>>()?;
     let one =
         |mlat: &Mlat, sequence: u64| mlat.solutions(&[0x00c0_0001], BASE_MS, 0, true, sequence);
     let len = one(&own, 0)?.as_bytes().len();
-    // A share of a hundred records; every record is stamped far ahead, so none is taken in.
-    let limit = 100 * len;
+    // A share of two hundred records; every record is stamped far ahead, so none is taken in.
+    let limit = 200 * len;
     let ahead = BASE_MS + 1_000_000;
-    // `flooders` peers flood, before the quiet peer and this relay hand theirs in or after: the
-    // records refused from the quiet peer and from this relay, and what the share holds.
-    let run = |flooders: usize, flood_first: bool| -> Result<(u64, u64, usize)> {
+    // The hostile session floods (before the honest sessions and this relay hand theirs in, or
+    // after): the records refused from the honest sessions and from this relay, and what the
+    // share holds. Every session is open from the start, as a peer's is from its handshake.
+    let run = |flood_first: bool| -> Result<(u64, u64, usize)> {
         let products = Products::new();
         products.adopt_identity(&own.engine);
         let budget = products_budget(1 << 20, limit);
         products.charge_to(&budget);
+        products.joined(HOSTILE);
+        for session in 1..=HONEST {
+            products.joined(session);
+        }
         let flood = || -> Result<()> {
-            for peer in &peers[..flooders] {
+            for key in &throwaway {
                 for sequence in 0..200 {
-                    products.positions(&one(peer, sequence)?, ahead);
+                    products.positions(&one(key, sequence)?, HOSTILE, ahead);
                 }
             }
             Ok(())
@@ -1305,35 +1322,63 @@ fn own_output_and_each_peer_have_a_part_of_the_records_share_whatever_came_first
             flood()?;
         }
         let before = refused();
-        products.positions(&one(&quiet, 0)?, ahead);
-        let quiet_refused = refused() - before;
+        for (session, mlat) in (1..=HONEST).zip(&honest) {
+            products.positions(&one(mlat, 0)?, session, ahead);
+        }
+        let honest_refused = refused() - before;
         let before = refused();
         for sequence in 0..20 {
-            products.positions(&one(&own, sequence)?, ahead);
+            products.positions(&one(&own, sequence)?, HOSTILE, ahead);
         }
         let own_refused = refused() - before;
         if !flood_first {
             flood()?;
         }
         Ok((
-            quiet_refused,
+            honest_refused,
             own_refused,
             budget.gauge(Store::Records).held(),
         ))
     };
     for flood_first in [true, false] {
-        let (quiet_refused, own_refused, held) = run(super::PEER_PARTS - 1, flood_first)?;
+        let (honest_refused, own_refused, held) = run(flood_first)?;
         assert_eq!(
-            (quiet_refused, own_refused),
+            (honest_refused, own_refused),
             (0, 0),
-            "peers flooding (first: {flood_first}) cost a quiet peer or this relay its records"
+            "a session flooding by {} keys (first: {flood_first}) cost an honest session or this \
+             relay its records",
+            throwaway.len()
         );
         assert!(held <= limit, "the share held {held} of {limit} bytes");
-        let (_, own_refused, _) = run(peers.len(), flood_first)?;
-        assert_eq!(
-            own_refused, 0,
-            "more peers than parts flooding (first: {flood_first}) cost this relay its own"
-        );
     }
+    Ok(())
+}
+
+/// Sweep 5, N3: the peers' share is divided by the sessions open, so a session that leaves gives
+/// its part back to those that stay, and one that joins takes its part from them.
+#[test]
+fn a_session_leaving_gives_its_part_to_those_open() -> Result<()> {
+    let mlat = Mlat::new()?;
+    let one = |sequence: u64| mlat.solutions(&[0x00c0_0001], BASE_MS, 0, true, sequence);
+    let len = one(0)?.as_bytes().len();
+    let limit = 200 * len;
+    let ahead = BASE_MS + 1_000_000;
+    let products = Products::new();
+    products.charge_to(&products_budget(1 << 20, limit));
+    let peers = super::peers_part(limit);
+    let taken = |session: u64, records: u64, first: u64| -> Result<u64> {
+        let before = products.report().records_refused;
+        for sequence in first..first + records {
+            products.positions(&one(sequence)?, session, ahead);
+        }
+        Ok(records - (products.report().records_refused - before))
+    };
+    products.joined(1);
+    products.joined(2);
+    let half = (super::session_part(peers, 2) / len) as u64;
+    assert_eq!(taken(1, 1_000, 0)?, half);
+    products.left(2);
+    let whole = (super::session_part(peers, 1) / len) as u64;
+    assert_eq!(taken(1, 1_000, 1_000)?, whole - half);
     Ok(())
 }

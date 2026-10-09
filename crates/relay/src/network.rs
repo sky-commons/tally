@@ -68,6 +68,11 @@ pub struct Asker {
     pub source: u64,
     /// It is on loopback: never billed, so never rationed (`credit`), as the egress counts it.
     pub loopback: bool,
+    /// The address its connection came from (or was dialled at), as the socket saw it: what a
+    /// duty that rations strangers buckets them by (its network group, `directory::Group`), since
+    /// a key is free and an address in another network is not. `None` for a stream with no
+    /// address.
+    pub address: Option<std::net::IpAddr>,
 }
 
 /// What the asker's handshake established it is.
@@ -199,7 +204,16 @@ impl Network {
 
     /// A record a link took in that is a duty's: what to send back down that link (a reply), in
     /// order. A duty that has nothing to say returns nothing; a record no duty takes is dropped.
-    pub fn handle(&self, hub: &Hub, asker: &Asker, record: Record, now_ms: u64) -> Vec<Record> {
+    /// `pace` is the pace the record was taken by, to which a duty owes the work it brings beyond
+    /// its one token (each signature inside an evidence bundle, `credit::check`).
+    pub fn handle(
+        &self,
+        hub: &Hub,
+        asker: &Asker,
+        record: Record,
+        now_ms: u64,
+        pace: Option<&crate::ingest::RecordPace>,
+    ) -> Vec<Record> {
         let identity = self.identity();
         match record {
             Record::Echo(echo) => self
@@ -217,8 +231,13 @@ impl Network {
                         &self.selection,
                         identity,
                         &query,
-                        // Rationed by the prober's key, never its connection (`delivery`).
-                        (point, asker.key),
+                        // Rationed by the prober's key, never its connection, and a stranger's
+                        // by its network group (`delivery`).
+                        (
+                            point,
+                            asker.key,
+                            asker.address.map(crate::directory::Group::of),
+                        ),
                         hub.now_ms(),
                     )
                     .map(Record::DeliveryAnswer)
@@ -264,9 +283,9 @@ impl Network {
             // credit may use too.
             Record::EvidenceBundle(bundle) => {
                 if asker.role == AskerRole::Relay {
-                    self.directory.evidence(&bundle, now_ms);
+                    self.directory.evidence(&bundle, now_ms, pace);
                 }
-                self.credit.evidence(asker, bundle, now_ms);
+                self.credit.evidence(asker, bundle, now_ms, pace);
                 Vec::new()
             }
             // The products take a record in by its stamp against their watermark, so it is
@@ -323,19 +342,39 @@ impl Network {
         }
     }
 
-    /// Final or provisional positions the hub forwarded (new, verified), at `now_ms` by the
-    /// ingest clock (the products take them in by it).
-    pub fn on_positions(&self, positions: &Positions, now_ms: u64) {
-        self.products.positions(positions, now_ms);
+    /// Final or provisional positions the hub forwarded (new, verified), handed in by the
+    /// session `source` (the hub's id of its connection, `hub::RELAY_ITSELF` for the relay's own),
+    /// at `now_ms` by the ingest clock (the products take them in by it, and charge them to that
+    /// session, `products::From`).
+    pub fn on_positions(&self, positions: &Positions, source: u64, now_ms: u64) {
+        self.products.positions(positions, source, now_ms);
         self.standing.positions(positions, now_ms);
     }
 
-    /// A clock model manifest or part the hub forwarded (new, verified or checked).
-    pub fn on_clock_model(&self, record: &Record, now_ms: u64) {
+    /// A clock model manifest or part the hub forwarded (new, verified or checked), handed in by
+    /// the session `source`.
+    pub fn on_clock_model(&self, record: &Record, source: u64, now_ms: u64) {
         if let Record::ClockModel(model) = record {
-            self.products.clock_model(model, now_ms);
+            self.products.clock_model(model, source, now_ms);
         }
         self.standing.model(record, now_ms);
+    }
+
+    /// A session opened, as `asker`: one that may hand the products records (a relay's, an
+    /// engine's) has a part of the peers' share of them from now until it leaves
+    /// (`products::Products::joined`). Called once for every session, as it starts.
+    pub fn joined(&self, asker: &Asker) {
+        if matches!(asker.role, AskerRole::Relay | AskerRole::Engine) {
+            self.products.joined(asker.source);
+        }
+    }
+
+    /// The session `source` closed: whatever it was given ends with it (a client's credit, its
+    /// free-tier place, its part of the products' records). Called once for every session, as it
+    /// ends, whichever side dialled.
+    pub fn left(&self, source: u64) {
+        self.credit.left(source);
+        self.products.left(source);
     }
 
     /// A record this relay is the first relay to hold (its own feeder's batch, an engine's or its

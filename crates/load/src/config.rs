@@ -49,7 +49,8 @@ The load:
                          and the US's are, but its 4,500 aircraft a cluster give a receiver at most
                          about 320 receptions a second, since a simulated aircraft sends about
                          3.4 messages a second; 9,000 reach 600)
-  --period SECS          seconds of simulated traffic, replayed in a loop (default 5)
+  --period SECS          seconds of simulated traffic, played forward then backward in a loop,
+                         so no aircraft and no receiver's clock jumps at a loop's end (default 5)
   --seed S               the simulation's seed (default 0: the world benchmark's clusters)
   --ceiling BYTES        each feeder's --ceiling (default 64000, the feeder's own default)
   --ramp SECS            start the feeders evenly over this long (default 60)

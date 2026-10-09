@@ -357,10 +357,14 @@ pub struct Plan {
     /// The feeders the members' one shared rate (`--max-member-bytes-per-sec`, all of them
     /// together) is worth: planned once, however many members carry it.
     pub member_feeders: usize,
-    /// The connections held at once (`--max-connections`): every one but a feeder's (whose are
-    /// its reservation's, `PerFeeder::buffers`) carves its Noise buffers from room planned here
+    /// The connections held at once but a feeder's (whose are its reservation's,
+    /// `PerFeeder::buffers`): those under the connection cap, the member sessions and the
+    /// subscribers (`Plan::with_sessions`), each carving its Noise buffers from room planned here
     /// (`Plan::connection_buffers`).
     pub connections: usize,
+    /// The sessions beside the feeders and the members' rate whose records the cores carry
+    /// (`cores::Sessions`): those under the connection cap and the subscribers.
+    pub sessions: crate::cores::Sessions,
     /// The cores the relay runs on, whose work bounds the feeders admitted beside the memory
     /// (`cores::feeders_carried`); none for a plan only its memory bounds (a test's).
     pub cores: Option<usize>,
@@ -382,6 +386,10 @@ impl Plan {
             members: 0,
             member_feeders: 0,
             connections: 0,
+            sessions: crate::cores::Sessions {
+                general: 0,
+                subscribers: 0,
+            },
             cores: None,
             holds_raw: hosts_mlat,
             feeder_records_per_sec: crate::ingest::records_per_sec(
@@ -406,6 +414,7 @@ impl Plan {
             feeders,
             member_feeders: self.member_feeders,
             feeder_records_per_sec: self.feeder_records_per_sec,
+            sessions: self.sessions,
         }
     }
 
@@ -423,11 +432,24 @@ impl Plan {
             .map(|cores| crate::cores::feeders_carried(cores, self.holds_raw, self.load_of(0)))
     }
 
-    /// The same plan holding `connections` connections at once, each with its Noise buffers.
+    /// The same plan holding `general` sessions under the connection cap (`--max-connections`) and
+    /// `subscribers` subscribers (`--max-subscribers`) beside its member sessions: each with its
+    /// Noise buffers (`Plan::connections`), and their records in the cores (`cores::Sessions`). One
+    /// count for both, so the sessions whose buffers are planned are the sessions whose records
+    /// are. Set after `with_members`, whose sessions it counts. Each role holds its own cap: before,
+    /// the three shared the one, so the plan counted some 128 members, 25 feeders and 64
+    /// subscribers in 128 connections, and a member past the connections the others held was
+    /// closed on before its handshake, with no word to route around it by.
     #[must_use]
-    pub fn with_connections(self, connections: usize) -> Self {
+    pub fn with_sessions(self, general: usize, subscribers: usize) -> Self {
         Self {
-            connections,
+            connections: general
+                .saturating_add(self.members)
+                .saturating_add(subscribers),
+            sessions: crate::cores::Sessions {
+                general,
+                subscribers,
+            },
             ..self
         }
     }
@@ -879,6 +901,12 @@ static COVERED: Covered = Covered::new();
 #[derive(Debug)]
 struct CoverEntry {
     covers: usize,
+    /// The bytes its covers' charges hold for it together ([`Cover::bytes`]).
+    vouched: usize,
+    /// Its footprint, read when it was first covered: what it counts for while it is alive.
+    footprint: usize,
+    /// Let go (`tally_wire::decoded::on_drop`): no longer counted alive, whatever its covers.
+    gone: bool,
     decoded: Weak<tally_wire::Decoded>,
 }
 
@@ -889,9 +917,22 @@ impl Covered {
         }
     }
 
-    /// The process's: every charge's covers ([`Charge::cover`]).
+    /// The process's: every charge's covers ([`Charge::cover`]). Told each decode as it leaves
+    /// `tally_wire::decoded::live` ([`Covered::gone`]).
     pub fn process() -> &'static Self {
+        static TOLD: std::sync::Once = std::sync::Once::new();
+        TOLD.call_once(|| {
+            tally_wire::decoded::on_drop(|address| COVERED.gone(address));
+        });
         &COVERED
+    }
+
+    /// The decode at `address` was let go and `live` no longer counts it: its covers, until they
+    /// go, count for nothing.
+    fn gone(&self, address: usize) {
+        if let Some(entry) = self.shard(address).get_mut(&address) {
+            entry.gone = true;
+        }
     }
 
     fn shard(&self, address: usize) -> std::sync::MutexGuard<'_, BTreeMap<usize, CoverEntry>> {
@@ -901,26 +942,81 @@ impl Covered {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    fn add(&self, decoded: &Arc<tally_wire::Decoded>) -> usize {
+    fn add(&self, decoded: &Arc<tally_wire::Decoded>, bytes: usize) -> usize {
         let address = Arc::as_ptr(decoded) as usize;
-        self.shard(address)
-            .entry(address)
-            .or_insert_with(|| CoverEntry {
-                covers: 0,
-                decoded: Arc::downgrade(decoded),
-            })
-            .covers += 1;
+        let mut shard = self.shard(address);
+        let entry = shard.entry(address).or_insert_with(|| CoverEntry {
+            covers: 0,
+            vouched: 0,
+            footprint: decoded.footprint(),
+            gone: false,
+            decoded: Arc::downgrade(decoded),
+        });
+        entry.covers += 1;
+        entry.vouched += bytes;
         address
     }
 
-    fn remove(&self, address: usize) {
+    fn remove(&self, address: usize, bytes: usize) {
         let mut shard = self.shard(address);
         if let Some(entry) = shard.get_mut(&address) {
             entry.covers -= 1;
+            entry.vouched = entry.vouched.saturating_sub(bytes);
             if entry.covers == 0 {
                 shard.remove(&address);
             }
         }
+    }
+
+    /// One cover of the decode at `address` holds `bytes` less for it.
+    fn lessen(&self, address: usize, bytes: usize) {
+        if let Some(entry) = self.shard(address).get_mut(&address) {
+            entry.vouched = entry.vouched.saturating_sub(bytes);
+        }
+    }
+
+    /// The bytes the charges covering `decoded` hold for it together.
+    pub fn vouched_for(&self, decoded: &Arc<tally_wire::Decoded>) -> usize {
+        let address = Arc::as_ptr(decoded) as usize;
+        self.shard(address)
+            .get(&address)
+            .map_or(0, |entry| entry.vouched)
+    }
+
+    /// The decoded batches alive whose covers' charges hold less for them together than their
+    /// footprint, and the bytes they are short (N14 of sweep 5): a decode one charge of a byte
+    /// covers is held as surely as one no charge covers, outside every gauge.
+    pub fn short(&self) -> (usize, usize) {
+        self.short_decodes()
+            .iter()
+            .fold((0, 0), |(batches, bytes), (_, short)| {
+                (batches + 1, bytes + short)
+            })
+    }
+
+    /// The same, each by its address (which is its own while it is alive) and what it is short:
+    /// a check that sees the same decode short twice knows it is held so, not caught in a hand-off.
+    pub fn short_decodes(&self) -> Vec<(usize, usize)> {
+        let mut short = Vec::new();
+        // The decodes looked at are let go once their shard's lock is: one this held last is let
+        // go here, and its going takes that lock (`Covered::gone`).
+        let mut looked_at = Vec::new();
+        for shard in &self.shards {
+            let shard = shard
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for (address, entry) in shard.iter() {
+                if let Some(decoded) = entry.decoded.upgrade() {
+                    if entry.vouched < decoded.footprint() {
+                        short.push((*address, decoded.footprint() - entry.vouched));
+                    }
+                    looked_at.push(decoded);
+                }
+            }
+            drop(shard);
+            looked_at.clear();
+        }
+        short
     }
 
     /// How many charges cover `decoded` now.
@@ -931,32 +1027,55 @@ impl Covered {
             .map_or(0, |entry| entry.covers)
     }
 
-    /// The decoded batches alive that some charge covers, each once, and the bytes they hold
-    /// (`Decoded::footprint`).
-    pub fn now(&self) -> (usize, usize) {
+    /// The decoded batches some charge covers, each once, and the bytes they hold
+    /// (`Decoded::footprint`), beside `live` (the decodes alive, `tally_wire::decoded::live`) read
+    /// at the same instant: every shard locked while both are read. A decode is covered before it
+    /// is counted alive (`Decoded::from_verified_held`, its cover taking its shard's lock), and
+    /// marked gone after it stops being counted (`Covered::gone`, taking the lock too), so with
+    /// every lock held a decode `live` counts and no charge covers is one no charge covers; one
+    /// whose cover outlasts it (a share kept until a sweep) counts for nothing once gone, and one
+    /// caught between the two counts as covered for that instant. Before, the two were read at
+    /// different instants and a check needed two samples to step over a decode made or dropped
+    /// between them.
+    pub fn with_live(
+        &self,
+        live: impl FnOnce() -> (usize, usize),
+    ) -> ((usize, usize), (usize, usize)) {
+        let shards: Vec<_> = self
+            .shards
+            .iter()
+            .map(|shard| {
+                shard
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+            })
+            .collect();
+        let live = live();
         let (mut batches, mut bytes) = (0, 0);
-        for shard in &self.shards {
-            let shard = shard
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            for entry in shard.values() {
-                if let Some(decoded) = entry.decoded.upgrade() {
-                    batches += 1;
-                    bytes += decoded.footprint();
-                }
+        for shard in &shards {
+            for entry in shard.values().filter(|entry| !entry.gone) {
+                batches += 1;
+                bytes += entry.footprint;
             }
         }
-        (batches, bytes)
+        ((batches, bytes), live)
+    }
+
+    /// The decoded batches some charge covers, each once, and the bytes they hold.
+    pub fn now(&self) -> (usize, usize) {
+        self.with_live(|| (0, 0)).0
     }
 }
 
 /// One charge's hold on one decoded batch ([`Charge::cover`]): counted in its [`Covered`] while
-/// it lives.
+/// it lives, with the bytes of its charge it holds for the decode. A charge's covers together hold
+/// no more than its bytes (`Charge::settle`), so what the covers of a decode hold is what the
+/// stores holding it are charged for it.
 #[derive(Debug)]
 struct Cover {
     covered: &'static Covered,
     address: usize,
-    decoded: Weak<tally_wire::Decoded>,
+    bytes: usize,
 }
 
 impl std::fmt::Debug for Covered {
@@ -966,34 +1085,25 @@ impl std::fmt::Debug for Covered {
 }
 
 impl Cover {
-    fn new(covered: &'static Covered, decoded: &Arc<tally_wire::Decoded>) -> Self {
+    fn new(covered: &'static Covered, decoded: &Arc<tally_wire::Decoded>, bytes: usize) -> Self {
         Self {
             covered,
-            address: covered.add(decoded),
-            decoded: Arc::downgrade(decoded),
+            address: covered.add(decoded, bytes),
+            bytes,
         }
     }
-}
 
-impl Clone for Cover {
-    fn clone(&self) -> Self {
-        match self.decoded.upgrade() {
-            Some(decoded) => Self::new(self.covered, &decoded),
-            // Gone: nothing to hold, and nothing counted for it.
-            None => Self {
-                covered: self.covered,
-                address: 0,
-                decoded: Weak::new(),
-            },
-        }
+    /// Holds `bytes` less for its decode.
+    fn lessen(&mut self, bytes: usize) {
+        let bytes = bytes.min(self.bytes);
+        self.bytes -= bytes;
+        self.covered.lessen(self.address, bytes);
     }
 }
 
 impl Drop for Cover {
     fn drop(&mut self) {
-        if self.address != 0 {
-            self.covered.remove(self.address);
-        }
+        self.covered.remove(self.address, self.bytes);
     }
 }
 
@@ -1022,9 +1132,45 @@ impl Charge {
         self.covers.clear();
     }
 
-    /// As [`Charge::cover`], counted in `covered`: a test's own.
+    /// As [`Charge::cover`], counted in `covered`: a test's own. The cover holds for the decode
+    /// what this charge holds and its other covers do not, up to the decode's footprint.
     fn cover_in(&mut self, covered: &'static Covered, decoded: &Arc<tally_wire::Decoded>) {
-        self.covers.push(Cover::new(covered, decoded));
+        let free = self.bytes.saturating_sub(self.vouched());
+        self.covers
+            .push(Cover::new(covered, decoded, free.min(decoded.footprint())));
+    }
+
+    /// What its covers hold for their decodes together.
+    fn vouched(&self) -> usize {
+        self.covers.iter().map(|cover| cover.bytes).sum()
+    }
+
+    /// Its covers made to hold no more than its bytes once they have fallen (split off, released):
+    /// the cover of the decode at `first` (one handed on with a part) gives up its hold first, then
+    /// the newest. Never more than they hold, so a decode's covers hold what its stores are charged.
+    fn settle(&mut self, first: Option<usize>) {
+        let mut over = self.vouched().saturating_sub(self.bytes);
+        if over == 0 {
+            return;
+        }
+        if let Some(address) = first
+            && let Some(cover) = self
+                .covers
+                .iter_mut()
+                .find(|cover| cover.address == address)
+        {
+            let less = over.min(cover.bytes);
+            cover.lessen(less);
+            over -= less;
+        }
+        for cover in self.covers.iter_mut().rev() {
+            if over == 0 {
+                break;
+            }
+            let less = over.min(cover.bytes);
+            cover.lessen(less);
+            over -= less;
+        }
     }
 
     /// Whether `bytes` more would fit on its gauge now (a charge of nothing fits only nothing).
@@ -1052,16 +1198,49 @@ impl Charge {
 
     /// `bytes` of this charge (all of it, if it holds less) moved into a charge of their own on the
     /// same gauge, nothing taken or released: what a store hands on with the thing it holds (open
-    /// raw handed to its seal, a batch's slices each with its share). Both cover what this one
-    /// covered: each part is charged for holding the decodes it was split from.
+    /// raw handed to its seal, bytes going back to a carve). The part covers no decode: one handed
+    /// on with a decode is split with it ([`Charge::split_covering`]).
+    ///
+    /// Before, every part cloned every cover of the charge it came from (N5): an epoch refused
+    /// whole split a share for each of its slices off a charge covering all of them, each split a
+    /// lock taken per cover, so a refused epoch of `n` slices cost `n²` of them on the message
+    /// thread. A part covers only the decode it is handed on with, so a split costs one cover at
+    /// most, whatever the charge it comes from covers.
     pub fn split(&mut self, bytes: usize) -> Charge {
+        let part = self.part(bytes);
+        self.settle(None);
+        part
+    }
+
+    /// `bytes` of this charge moved into a part of their own, its covers not yet settled.
+    fn part(&mut self, bytes: usize) -> Charge {
         let bytes = bytes.min(self.bytes);
         self.bytes -= bytes;
         Charge {
             gauge: self.gauge.clone(),
             bytes,
-            covers: self.covers.clone(),
+            covers: Vec::new(),
         }
+    }
+
+    /// As [`Charge::split`], the part handed on with `decoded` (a batch's slice with its share, a
+    /// refused slice's share kept while its decode lives): it covers that decode and no other.
+    ///
+    /// The part's cover is made before this charge's own cover of the decode gives up what moved,
+    /// so the decode's covers never hold less for it than its stores are charged, even for an
+    /// instant (N14).
+    pub fn split_covering(&mut self, bytes: usize, decoded: &Arc<tally_wire::Decoded>) -> Charge {
+        let address = Arc::as_ptr(decoded) as usize;
+        // Counted where this charge's own cover of it is (a test's own), else the process's.
+        let covered = self
+            .covers
+            .iter()
+            .find(|cover| cover.address == address)
+            .map_or_else(Covered::process, |cover| cover.covered);
+        let mut part = self.part(bytes);
+        part.cover_in(covered, decoded);
+        self.settle(Some(address));
+        part
     }
 
     /// Releases all but `bytes` of this charge.
@@ -1071,6 +1250,7 @@ impl Charge {
         {
             gauge.release(self.bytes - bytes);
             self.bytes = bytes;
+            self.settle(None);
         }
     }
 }
@@ -1124,24 +1304,14 @@ pub struct GaugeReport {
 #[derive(Debug)]
 pub struct Budget {
     memory: usize,
-    /// What the relay holds whatever its feeders (`Plan::base`).
-    base: usize,
+    /// What it was planned by, whole: its base, each feeder's cost, its members, its sessions, its
+    /// cores. Held as the one `Plan`, never field by field beside it, so a part the plan gains is
+    /// the budget's too. Before, the budget copied each field, and a field added to the plan and
+    /// not copied was planned in `check` and lost in the relay.
+    plan: Plan,
     /// The bytes feeders reserve from: the budget less what it holds before any feeder
     /// (`Plan::before_feeders`).
     total: usize,
-    per_feeder: PerFeeder,
-    /// The member sessions the pool holds and the feeders their shared rate is worth
-    /// (`Plan::with_members`).
-    members: usize,
-    member_feeders: usize,
-    /// The connections whose buffers are planned (`Plan::with_connections`).
-    connections: usize,
-    /// The cores planned (`Plan::with_cores`).
-    cores: Option<usize>,
-    /// Whether the relay holds MLAT raw (`Plan::holds_raw`).
-    holds_raw: bool,
-    /// The records a second a feeder may send (`Plan::feeder_records_per_sec`).
-    feeder_records_per_sec: u64,
     reserved: Arc<AtomicUsize>,
     /// Bytes the admitted members hold of their pool.
     members_reserved: Arc<AtomicUsize>,
@@ -1173,15 +1343,12 @@ impl Budget {
             .collect();
         let budget = Self {
             memory: total.saturating_add(BASE_BYTES),
-            base: BASE_BYTES,
+            plan: Plan {
+                base: BASE_BYTES,
+                per_feeder,
+                ..Plan::planned(false)
+            },
             total,
-            per_feeder,
-            members: 0,
-            member_feeders: 0,
-            connections: 0,
-            cores: None,
-            holds_raw: false,
-            feeder_records_per_sec: Plan::planned(false).feeder_records_per_sec,
             reserved: Arc::new(AtomicUsize::new(0)),
             members_reserved: Arc::new(AtomicUsize::new(0)),
             gauges,
@@ -1198,14 +1365,7 @@ impl Budget {
     /// relay is told after its parts were built.
     pub fn resize(&mut self, memory: usize, plan: Plan) {
         self.memory = memory;
-        self.base = plan.base;
-        self.per_feeder = plan.per_feeder;
-        self.members = plan.members;
-        self.member_feeders = plan.member_feeders;
-        self.connections = plan.connections;
-        self.cores = plan.cores;
-        self.holds_raw = plan.holds_raw;
-        self.feeder_records_per_sec = plan.feeder_records_per_sec;
+        self.plan = plan;
         self.total = memory.saturating_sub(plan.before_feeders());
         self.limit_gauges();
     }
@@ -1247,16 +1407,7 @@ impl Budget {
 
     /// The plan this budget was sized from.
     pub fn plan(&self) -> Plan {
-        Plan {
-            base: self.base,
-            per_feeder: self.per_feeder,
-            members: self.members,
-            member_feeders: self.member_feeders,
-            connections: self.connections,
-            cores: self.cores,
-            holds_raw: self.holds_raw,
-            feeder_records_per_sec: self.feeder_records_per_sec,
-        }
+        self.plan
     }
 
     /// Whether the budget holds its members' pool and a feeder beside it: a relay that would refuse
@@ -1267,12 +1418,18 @@ impl Budget {
         if let (Some(cores), Some(0)) = (plan.cores, plan.core_feeders()) {
             return Err(format!(
                 "{cores} cores carry no feeder beside the {} feeders its members' shared rate is \
-                 worth (--max-member-bytes-per-sec): planned at {}% busy, a core carries {} \
+                 worth (--max-member-bytes-per-sec) and the {} records a minute its {} \
+                 connections and {} subscribers may send (--max-connections, \
+                 --max-subscribers): planned at {}% busy, a core carries {} \
                  planned feeders' work (ingest, deduplication, sealing and the connections \
                  together, and hosted MLAT's steps beside them unless --no-mlat, RFC-0181 \
                  \"Sizing\"); give it more cores (the unit's CPUQuota, the container's \
-                 limits.cpu, its CPU affinity), plan a slower members' rate or host no MLAT",
+                 limits.cpu, its CPU affinity), plan a slower members' rate, fewer connections \
+                 or subscribers, or host no MLAT",
                 plan.member_feeders,
+                plan.sessions.records_per_minute(),
+                plan.sessions.general,
+                plan.sessions.subscribers,
                 crate::cores::BUSY_PERCENT,
                 crate::cores::load_carried(1, plan.holds_raw, plan.feeder_records_per_sec),
             ));
@@ -1294,17 +1451,17 @@ impl Budget {
              limits.memory), or plan fewer connections or a slower members' rate \
              (--max-connections, --max-member-bytes-per-sec)",
             self.memory,
-            self.members,
-            self.base,
+            self.plan.members,
+            self.plan.base,
             plan.oversize(),
             plan.connection_buffers(),
-            self.connections,
+            self.plan.connections,
             plan.member_rate_pool(),
-            self.member_feeders,
+            self.plan.member_feeders,
             plan.per_member(),
             crate::peers::WAITING_PER_LINK_BYTES,
             plan.parity_assembly(),
-            self.per_feeder.total(),
+            self.plan.per_feeder.total(),
         ))
     }
 
@@ -1327,7 +1484,7 @@ impl Budget {
     /// The feeders the memory holds beside what it holds before any.
     pub fn memory_feeders(&self) -> usize {
         self.total
-            .checked_div(self.per_feeder.total())
+            .checked_div(self.plan.per_feeder.total())
             .unwrap_or(usize::MAX)
     }
 
@@ -1354,7 +1511,7 @@ impl Budget {
     /// refused): no more feeders than the ceiling, whichever of the memory and the cores bounds
     /// it. Feeders reserve from their own room, never from the members' pool.
     pub fn reserve(&self) -> Option<Reservation> {
-        let per_feeder = self.per_feeder.total();
+        let per_feeder = self.plan.per_feeder.total();
         Self::take(
             &self.reserved,
             per_feeder,
@@ -1398,17 +1555,17 @@ impl Budget {
     }
 
     pub fn per_feeder(&self) -> PerFeeder {
-        self.per_feeder
+        self.plan.per_feeder
     }
 
     /// The member sessions the pool holds (`members_for`).
     pub fn members(&self) -> usize {
-        self.members
+        self.plan.members
     }
 
     /// The feeders the members' shared rate is planned as.
     pub fn member_feeders(&self) -> usize {
-        self.member_feeders
+        self.plan.member_feeders
     }
 
     pub fn memory(&self) -> usize {
@@ -1417,7 +1574,7 @@ impl Budget {
 
     /// What the relay holds whatever its feeders.
     pub fn base(&self) -> usize {
-        self.base
+        self.plan.base
     }
 
     /// What the relay plans to hold at its ceiling: what it holds before any feeder
@@ -1430,14 +1587,19 @@ impl Budget {
     /// What every admitted feeder and member together may hold in `store`, at the ceiling: the
     /// feeders' shares, the members' shared rate's, and each member session's allowance.
     pub fn store_bytes(&self, store: Store) -> usize {
-        let feeders = self.per_feeder.of(store).saturating_mul(self.ceiling());
+        let feeders = self
+            .plan
+            .per_feeder
+            .of(store)
+            .saturating_mul(self.ceiling());
         let rate = self
+            .plan
             .per_feeder
             .as_member()
             .of(store)
-            .saturating_mul(self.member_feeders);
+            .saturating_mul(self.plan.member_feeders);
         let sessions = if store == Store::Ingest {
-            self.plan().per_member().saturating_mul(self.members)
+            self.plan().per_member().saturating_mul(self.plan.members)
         } else {
             0
         };
@@ -1470,15 +1632,15 @@ impl Budget {
     /// grow past the budget. Exact to the batch: no allowance carved and idle, and no decode two
     /// stores hold, stands in for one.
     pub fn decoded_held(&self) -> DecodedHeld {
-        let before = Covered::process().now();
-        let (batches, live) = tally_wire::decoded::live();
-        let after = Covered::process().now();
-        let covered = if after.1 > before.1 { after } else { before };
+        let (covered, (batches, live)) = Covered::process().with_live(tally_wire::decoded::live);
+        let short = Covered::process().short();
         DecodedHeld {
             batches,
             live,
             covered_batches: covered.0,
             covered: covered.1,
+            short_batches: short.0,
+            short: short.1,
             charged: self.decoded_charged(),
         }
     }
@@ -1487,13 +1649,13 @@ impl Budget {
         let plan = self.plan();
         MemoryReport {
             memory: self.memory,
-            base: self.base,
-            per_feeder: self.per_feeder.total(),
+            base: self.plan.base,
+            per_feeder: self.plan.per_feeder.total(),
             ceiling: self.ceiling(),
             reserved: self.reserved(),
-            members: self.members,
+            members: self.plan.members,
             per_member: plan.per_member(),
-            member_feeders: self.member_feeders,
+            member_feeders: self.plan.member_feeders,
             members_reserved: self.members_reserved(),
             stores: self.gauges.iter().map(|gauge| gauge.report()).collect(),
             decoded: self.decoded_held(),
@@ -1544,6 +1706,11 @@ pub struct DecodedHeld {
     /// What the stores holding decoded batches, and the oversize room, are charged: their room
     /// in use, allowances carved and idle among it, and a decode held twice charged twice.
     pub charged: usize,
+    /// Of the covered batches, those whose covers' charges hold less for them together than their
+    /// footprint, and the bytes they are short ([`Covered::short`]): held past what any gauge was
+    /// charged, however many charges cover them.
+    pub short_batches: usize,
+    pub short: usize,
 }
 
 impl DecodedHeld {
@@ -1628,7 +1795,8 @@ mod tests {
         let mut in_flight = budget.gauge(Store::Epochs).empty();
         assert!(in_flight.try_grow(two.footprint()));
         in_flight.cover_in(covered, &two);
-        let slice = in_flight.split(two.footprint() / 2);
+        let mut slice = in_flight.split(two.footprint() / 2);
+        slice.cover_in(covered, &two);
         assert_eq!(covered.covers_of(&two), 2);
         assert_eq!(covered.now(), (2, one.footprint() + two.footprint()));
         // The slice's charge absorbed into the epoch's: the cover moves with it.
@@ -1643,14 +1811,76 @@ mod tests {
         drop((epochs, queue));
         assert_eq!(covered.now(), (0, 0));
         assert_eq!(covered.covers_of(&one), 0);
-        // A cover keeps no decode alive, and one whose decode is gone counts for nothing.
+        // A cover keeps no decode alive; one whose decode is gone counts as covered until it goes
+        // (a dying decode, `Covered::with_live`), and is never short.
         let mut late = budget.gauge(Store::Notes).empty();
         late.cover_in(covered, &leaked);
         let weak = Arc::downgrade(&leaked);
+        let footprint = leaked.footprint();
         drop(leaked);
         assert!(weak.upgrade().is_none());
-        assert_eq!(covered.now(), (0, 0));
+        assert_eq!(covered.now(), (1, footprint));
+        assert_eq!(covered.short(), (0, 0));
         drop(late);
+        assert_eq!(covered.now(), (0, 0));
+        Ok(())
+    }
+
+    /// N14 of sweep 5: a cover holds for its decode the bytes its charge was charged, never only
+    /// its presence: a decode covered by a charge of one byte is short of its footprint, and so is
+    /// one whose charge was shrunk below it or split away from it; a decode handed on in parts
+    /// (`split_covering`) is held whole by them together at every step, and a charge's covers
+    /// together never hold more than its bytes.
+    #[test]
+    fn a_cover_holds_what_its_charge_was_charged_and_no_more() -> Result<(), String> {
+        let covered: &'static Covered = Box::leak(Box::new(Covered::new()));
+        let plan = Plan::planned(false);
+        let budget = Budget::of_memory(Budget::memory_for(4, plan), plan);
+        let (one, two) = (decoded(40)?, decoded(60)?);
+        // A byte's charge covering a whole decode: covered, and short of all but that byte.
+        let mut token = budget.gauge(Store::Notes).empty();
+        assert!(token.try_grow(1));
+        token.cover_in(covered, &one);
+        assert_eq!(covered.now(), (1, one.footprint()));
+        assert_eq!(covered.short(), (1, one.footprint() - 1));
+        // Charged its footprint beside it: whole.
+        let mut queue = budget.gauge(Store::Fanout).empty();
+        assert!(queue.try_grow(one.footprint()));
+        queue.cover_in(covered, &one);
+        assert_eq!(covered.short(), (0, 0));
+        drop(token);
+        assert_eq!(covered.short(), (0, 0));
+        // Shrunk below it: short by what was released.
+        queue.shrink_to(one.footprint() - 10);
+        assert_eq!(covered.short(), (1, 10));
+        drop(queue);
+        // One charge covering two decodes holds each its own bytes, never one's for the other.
+        let mut epoch = budget.gauge(Store::Epochs).empty();
+        assert!(epoch.try_grow(one.footprint()));
+        epoch.cover_in(covered, &one);
+        assert!(epoch.try_grow(two.footprint() / 2));
+        epoch.cover_in(covered, &two);
+        assert_eq!(covered.vouched_for(&one), one.footprint());
+        assert_eq!(covered.vouched_for(&two), two.footprint() / 2);
+        // Handed on in a part with `one`: the part holds it and the epoch gives up as much for it,
+        // never for `two`.
+        let part = epoch.split_covering(one.footprint(), &one);
+        assert_eq!(covered.vouched_for(&one), one.footprint());
+        assert_eq!(covered.vouched_for(&two), two.footprint() / 2);
+        assert_eq!(covered.covers_of(&one), 2);
+        // A split carrying no decode leaves the charge's covers no more than its bytes.
+        let back = epoch.split(two.footprint() / 4);
+        assert_eq!(
+            covered.vouched_for(&two),
+            two.footprint() / 2 - two.footprint() / 4
+        );
+        // Absorbed, both the bytes and the covers move: nothing is held twice or lost.
+        let mut joined = budget.gauge(Store::Epochs).empty();
+        assert!(joined.absorb(part).is_ok());
+        assert_eq!(covered.vouched_for(&one), one.footprint());
+        drop((back, epoch, joined));
+        assert_eq!(covered.now(), (0, 0));
+        assert_eq!(covered.short(), (0, 0));
         Ok(())
     }
 
@@ -1743,10 +1973,11 @@ mod tests {
             budget.threads(),
             crate::cores::threads_for(budget.load(), false, Some(1))
         );
-        // Sixteen cores carry the 10,000 the memory holds (ten no longer do, the feeders' records
-        // planned in the ingest workers): the memory bounds it, and the threads follow those
-        // feeders, more than one a stage.
-        let ten = Budget::of_memory(memory, members.with_cores(Some(16)));
+        // Thirty-two cores carry the 10,000 the memory holds (ten no longer do, the feeders'
+        // records planned in the ingest workers, nor sixteen, every record planned wherever it is
+        // answered): the memory bounds it, and the threads follow those feeders, more than one a
+        // stage.
+        let ten = Budget::of_memory(memory, members.with_cores(Some(32)));
         assert_eq!(ten.ceiling(), 10_000);
         assert!(ten.threads().message > 1 && ten.threads().ingest > 1);
         // Cores that carry no more than the members' rate start no relay.
@@ -1794,6 +2025,7 @@ mod tests {
             members: 0,
             member_feeders: 0,
             connections: 0,
+            sessions: crate::cores::Sessions::default(),
             cores: None,
             holds_raw: false,
             feeder_records_per_sec: 1,

@@ -36,6 +36,12 @@ pub enum FitError {
     /// meets one refuses the model.
     #[error("{} clocks carry no information", .0.len())]
     Uninformed(Vec<(PublicKey, u32)>),
+    /// Clocks (receiver, counter epoch) each carrying weight, but in a group that no event with
+    /// weight on two clocks joins to the group the fit keeps (`disconnected`): robust weights
+    /// cut it off, so its level against the gauge is free. The fit drops them as it drops
+    /// uninformed clocks and starts over; a verifier that meets one refuses the model.
+    #[error("{} clocks are cut off from the gauge", .0.len())]
+    Disconnected(Vec<(PublicKey, u32)>),
 }
 
 /// Parts per million in one unit of `ClockModel::gauge_rate`.
@@ -1097,6 +1103,10 @@ impl State {
         if !uninformed.is_empty() {
             return Err(FitError::Uninformed(uninformed));
         }
+        let disconnected = disconnected(problem.layout, &eliminated);
+        if !disconnected.is_empty() {
+            return Err(FitError::Disconnected(disconnected));
+        }
         let factor = normal.factor().ok_or(FitError::Singular)?;
         let mut rhs = gradient.clone();
         rhs.slices
@@ -1408,6 +1418,79 @@ fn uninformed(layout: &Layout, eliminated: &[Eliminated]) -> Vec<(PublicKey, u32
         }
     }
     out.into_iter().collect()
+}
+
+/// The clocks (receiver and epoch, ascending) outside the group of clocks the fit keeps, when
+/// weighted events split them into more than one. Two clocks are joined when both carry weight in
+/// one event whose own parameters are determined: the event's transmit time absorbs any level
+/// its receptions share, so a reception that is the only one with weight in its event places
+/// nothing, and a group no such event joins to another has one level free against it (the
+/// curvature and rate priors bind shapes and rates, never a level). The shape's rule chose one
+/// component by unweighted events; under robust weights it can split, and `uninformed` (which
+/// asks only whether each clock has a weighted row) cannot see that. The group kept is the one
+/// holding the most receivers, ties to the gauge's, then to the one whose lowest clock key is
+/// lowest; every other is dropped, the gauge with its group when that is not the one kept (the
+/// next shape then takes its gauge from what is left).
+fn disconnected(layout: &Layout, eliminated: &[Eliminated]) -> Vec<(PublicKey, u32)> {
+    let clocks = &layout.shape.clocks;
+    let mut parent: Vec<usize> = (0..clocks.len()).collect();
+    for (event_use, event) in layout.events.iter().zip(eliminated) {
+        if event.hll.is_none() {
+            continue;
+        }
+        // Reception rows come first, in `event_use.rows`' order (`State::rows`).
+        let mut weighted = event_use
+            .rows
+            .iter()
+            .zip(&event.rows)
+            .filter(|(_, local)| local.weight > 0.0)
+            .map(|(row, _)| row.clock);
+        let Some(first) = weighted.next() else {
+            continue;
+        };
+        for clock in weighted {
+            let a = find(&mut parent, first);
+            let b = find(&mut parent, clock);
+            if a != b {
+                let (low, high) = if a < b { (a, b) } else { (b, a) };
+                parent[high] = low;
+            }
+        }
+    }
+    let mut components: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    for clock in 0..clocks.len() {
+        let root = find(&mut parent, clock);
+        components.entry(root).or_default().push(clock);
+    }
+    if components.len() <= 1 {
+        return Vec::new();
+    }
+    let gauge = clocks
+        .iter()
+        .position(|clock| clock.key == layout.shape.gauge);
+    // Components are keyed by their lowest member, and clocks are sorted by key, so the first of
+    // equals in this order has the lowest key.
+    let mut kept: Option<((usize, bool), usize)> = None;
+    for (root, members) in &components {
+        let receivers = members
+            .iter()
+            .map(|clock| clocks[*clock].key.receiver)
+            .collect::<BTreeSet<_>>()
+            .len();
+        let rank = (receivers, gauge.is_some_and(|g| members.contains(&g)));
+        if kept.is_none_or(|(best, _)| rank > best) {
+            kept = Some((rank, *root));
+        }
+    }
+    let kept = kept.map(|(_, root)| root);
+    components
+        .iter()
+        .filter(|(root, _)| Some(**root) != kept)
+        .flat_map(|(_, members)| members.iter())
+        .map(|clock| (clocks[*clock].key.receiver, clocks[*clock].key.epoch))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 /// Accumulates one event's rows into the reduced normal equations, eliminating its four local
@@ -1973,21 +2056,34 @@ fn fit_read_from(
     }
     let mut jumps: Vec<Jump> = Vec::new();
     let mut dropped: BTreeSet<(PublicKey, u32)> = BTreeSet::new();
+    let mut disconnected = 0;
     loop {
         match attempt(inputs, read, gauge, max_jumps, prior, &jumps, &dropped) {
-            Ok(Attempt::Done(done)) => return Ok(*done),
+            Ok(Attempt::Done(done)) => {
+                let (model, mut calibrated) = *done;
+                calibrated.disconnected = disconnected;
+                return Ok((model, calibrated));
+            }
             Ok(Attempt::Jump(jump)) => admit(&mut jumps, &mut dropped, jump, max_jumps)?,
-            // Clocks nothing places are dropped, their jumps with them, and the fit starts over:
-            // each pass drops at least one, so it ends.
-            Err(FitError::Uninformed(clocks)) => {
+            // Clocks nothing places, and groups robust weights cut off from the one kept, are
+            // dropped, their jumps with them, and the fit starts over: each pass drops at least
+            // one, so it ends.
+            Err(error) => {
+                let (clocks, cut_off) = match error {
+                    FitError::Uninformed(clocks) => (clocks, false),
+                    FitError::Disconnected(clocks) => (clocks, true),
+                    error => return Err(error),
+                };
                 let before = dropped.len();
                 dropped.extend(clocks);
                 if dropped.len() == before {
                     return Err(FitError::Singular);
                 }
+                if cut_off {
+                    disconnected += dropped.len() - before;
+                }
                 jumps.retain(|jump| !dropped.contains(&(jump.receiver, jump.epoch)));
             }
-            Err(error) => return Err(error),
         }
     }
 }
@@ -2160,6 +2256,7 @@ fn attempt(
         }
         let calibrated = Calibrated {
             model: model.clone(),
+            disconnected: 0,
             places: layout.places.clone(),
             rate: layout.rate(),
             inverse,
@@ -2355,6 +2452,9 @@ pub fn origin_unix_ns(timebase: Timebase, anchor: i64, wall_unix_ns: u64) -> Opt
 #[derive(Clone, Debug)]
 pub struct Calibrated {
     pub model: ClockModel,
+    /// Clocks the fit dropped as cut off from the gauge (`FitError::Disconnected`) before it
+    /// converged; zero for a calibration of a published model, which drops nothing.
+    pub disconnected: usize,
     /// (piece, knot) to its place in `inverse`.
     places: BTreeMap<(usize, i32), At>,
     /// The gauge rate's place (parts per million).
@@ -2503,6 +2603,7 @@ fn calibrate_read(
     Ok((
         Calibrated {
             model: model.clone(),
+            disconnected: 0,
             places: layout.places.clone(),
             rate: layout.rate(),
             inverse,
@@ -2628,6 +2729,119 @@ mod tests {
             state.system(&problem, &noise, Weighting::Final),
             Err(FitError::Uninformed(_))
         ));
+        Ok(())
+    }
+
+    /// A group of clocks each with weight, but cut off from the gauge's by robust weights, has
+    /// one level free: `uninformed` sees every clock weighted, so before `disconnected` the
+    /// system went to the factor and failed `Singular` (or factored on a vanishing pivot). Here
+    /// half the receivers' receptions in every event they share with the other half are moved
+    /// by a millisecond and more, a different amount each event, so at the estimate each such
+    /// event settles on one half and the other half's rows fall beyond the cut-off: the halves
+    /// are each joined within, and by no weighted event to each other. The system names the
+    /// half without the gauge, and the fit drops exactly that half and publishes the rest.
+    #[test]
+    fn a_group_robust_weights_cut_off_is_named_disconnected_and_dropped() -> Result<(), String> {
+        let simulation = sim::run(&Scenario {
+            duration_s: 20.0,
+            ..Scenario::new(3)
+        });
+        let bins: Vec<_> = crate::held::bins_of(&simulation.receptions)
+            .into_values()
+            .collect();
+        let sites = Sites::new(&simulation.sites());
+        let bin = bins.last().ok_or("no bins")?.bin;
+        let index = WindowIndex::new(Window::canonical(bin), &bins, &sites);
+        let plan = index.plan();
+        let tile = plan.tiles().into_iter().next().ok_or("no tile")?;
+        let inputs = index
+            .inputs(tile, &plan.members[&tile])
+            .ok_or("no inputs")?;
+        let model = fit(&inputs).map_err(|e| e.to_string())?;
+        let gauge = model.gauge.receiver;
+        let receivers: Vec<PublicKey> = model
+            .pieces
+            .iter()
+            .map(|piece| piece.key.receiver)
+            .filter(|receiver| *receiver != gauge)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let cut: BTreeSet<PublicKey> = receivers[receivers.len() / 2..].iter().copied().collect();
+        // Two events in five heard by the first half only, two by the cut half only, and one by
+        // both, in which the cut half's receptions are moved: the halves share events, and only
+        // through receptions robust weights cut.
+        let mut read = read(&inputs);
+        let mut events = Vec::new();
+        for (number, mut event) in std::mem::take(&mut read.events).into_iter().enumerate() {
+            let rxs = &mut read.rxs;
+            match number % 5 {
+                0 | 1 => event.rx.retain(|i| !cut.contains(&rxs[*i].receiver)),
+                2 | 3 => event.rx.retain(|i| cut.contains(&rxs[*i].receiver)),
+                _ => {
+                    let shift_ps = 1_000_000_000 + (number as i128 * 2_654_435_761) % 1_000_000_000;
+                    for i in &event.rx {
+                        let rx = &mut rxs[*i];
+                        if cut.contains(&rx.receiver) {
+                            let counts = read.sites[&rx.receiver].timebase.counts_of_ps(shift_ps);
+                            rx.raw = rx.raw.wrapping_add(counts as u64);
+                            rx.linear += counts;
+                        }
+                    }
+                }
+            }
+            if event.rx.len() >= 2 {
+                events.push(event);
+            }
+        }
+        read.events = events;
+        let layout = Layout::new(
+            Shape::of_model(&model),
+            &read.sites,
+            &read.rxs,
+            &read.events,
+        );
+        let problem = Problem {
+            sites: &read.sites,
+            rxs: &read.rxs,
+            events: &read.events,
+            layout: &layout,
+        };
+        let (state, noise) = State::at(&model, &problem);
+        let (_, _, eliminated) = state
+            .normal_equations(&problem, &noise, Weighting::Final)
+            .map_err(|e| e.to_string())?;
+        assert!(
+            uninformed(&layout, &eliminated).is_empty(),
+            "every clock keeps weight"
+        );
+        let expected: Vec<(PublicKey, u32)> = model
+            .pieces
+            .iter()
+            .filter(|piece| cut.contains(&piece.key.receiver))
+            .map(|piece| (piece.key.receiver, piece.key.epoch))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        match state.system(&problem, &noise, Weighting::Final) {
+            Err(FitError::Disconnected(clocks)) => assert_eq!(clocks, expected),
+            Err(error) => return Err(format!("system: {error}")),
+            Ok(_) => return Err("system: a group with a free level factored".into()),
+        }
+        // The engine's fit, from the model before (jumps not looked for: the moved receptions
+        // would read as them): it drops the cut half and publishes the rest.
+        let (refit, calibrated) = fit_read_from(&inputs, &read, None, 0, Some(&model))
+            .map_err(|e| format!("fit: {e}"))?;
+        assert_eq!(refit.dropped, expected);
+        // Counted as cut off, for the engine's report (`window::Report::disconnected`).
+        assert_eq!(calibrated.disconnected, expected.len());
+        assert!(
+            refit
+                .pieces
+                .iter()
+                .all(|piece| !cut.contains(&piece.key.receiver))
+                && !refit.pieces.is_empty()
+        );
         Ok(())
     }
 

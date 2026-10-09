@@ -53,6 +53,7 @@ use tally_wire::{
     PublicKey, ReceiverInfo, Region, Streams, StripeReceipt, WireError,
 };
 
+use crate::ingest::RecordPace;
 use crate::network::{Asker, AskerRole};
 use crate::sharing::seeded_bytes;
 use crate::subscription::Subscription;
@@ -698,14 +699,27 @@ impl Credit {
     }
 
     /// The evidence behind a credential a client presented.
-    pub fn evidence(&self, asker: &Asker, bundle: EvidenceBundle, now_ms: u64) {
-        let _ = (asker, self.weigh(&bundle, now_ms));
+    /// Each signature inside it is a token of `pace`, the asker's (`check`).
+    pub fn evidence(
+        &self,
+        asker: &Asker,
+        bundle: EvidenceBundle,
+        now_ms: u64,
+        pace: Option<&RecordPace>,
+    ) {
+        let _ = (asker, self.weigh(&bundle, now_ms, pace));
     }
 
     /// Checks a bundle and keeps what its good records show of its relay, if it is newer than what
-    /// is held. The bundle itself must verify and be in time; a bad record in it is skipped.
-    pub fn weigh(&self, bundle: &EvidenceBundle, now_ms: u64) -> Result<(), Refused> {
-        let shown = check(bundle, now_ms)?;
+    /// is held. The bundle itself must verify and be in time; a bad record in it is skipped. Each
+    /// signature inside it is a token of `pace` (`check`).
+    pub fn weigh(
+        &self,
+        bundle: &EvidenceBundle,
+        now_ms: u64,
+        pace: Option<&RecordPace>,
+    ) -> Result<(), Refused> {
+        let shown = check(bundle, now_ms, pace)?;
         let relay = bundle.signer().map_err(unreadable)?;
         let mut state = self.state();
         let newer = state
@@ -819,7 +833,24 @@ fn newest_first<T>(mut dated: Vec<(u64, T)>, bytes: impl Fn(&T) -> &[u8]) -> Vec
 /// checked (refused whole if either fails), then each record by its own signature, body and time
 /// and that it says what it must of that relay; a record that fails any is skipped. Delivery
 /// answers are the relay's own word and never weighed.
-pub fn check(bundle: &EvidenceBundle, now_ms: u64) -> Result<Shown, Refused> {
+///
+/// Every signature verified inside it is one token of `pace`, the pace the bundle's asker's
+/// records were taken by (`ingest::RecordPace::owe`), owed and paid before that connection's next
+/// record is read (R4 of sweep 5): a bundle is one record on the wire but up to
+/// `ingest::EVIDENCE_SIGNATURES` and its own verifications, some 3.5 ms of a core, while its record
+/// was planned as one (`cores::RUNTIME_NANOS_PER_RECORD`). Before, a session sending bundles at
+/// its records' pace had the relay verify some 130 times what the cores planned for it. `None`
+/// for a bundle no session brought (the relay's own).
+pub fn check(
+    bundle: &EvidenceBundle,
+    now_ms: u64,
+    pace: Option<&RecordPace>,
+) -> Result<Shown, Refused> {
+    let spend = || {
+        if let Some(pace) = pace {
+            pace.owe(1);
+        }
+    };
     bundle.verify().map_err(unreadable)?;
     let relay = bundle.signer().map_err(unreadable)?;
     let content = bundle.content().map_err(unreadable)?;
@@ -834,6 +865,7 @@ pub fn check(bundle: &EvidenceBundle, now_ms: u64) -> Result<Shown, Refused> {
         ..Shown::default()
     };
     for info in &content.feeders {
+        spend();
         let (Ok(()), Ok(feeder), Ok(described)) = (info.verify(), info.receiver(), info.content())
         else {
             continue;
@@ -847,6 +879,7 @@ pub fn check(bundle: &EvidenceBundle, now_ms: u64) -> Result<Shown, Refused> {
         shown.feeders.push((feeder, described.issued_ms));
     }
     for receipt in &content.receipts {
+        spend();
         let (Ok(()), Ok(child), Ok(slice)) =
             (receipt.verify(), receipt.signer(), receipt.content())
         else {
@@ -1000,6 +1033,7 @@ mod tests {
     };
 
     use super::*;
+    use std::time::Duration;
 
     type Result<T = ()> = std::result::Result<T, String>;
 
@@ -1043,6 +1077,7 @@ mod tests {
             key,
             source,
             loopback: false,
+            address: None,
         }
     }
 
@@ -1209,6 +1244,7 @@ mod tests {
             .weigh(
                 &bundle(&relay, hosted(&judge, &relay, 8)?, vec![], vec![])?,
                 NOW,
+                None,
             )
             .map_err(text)?;
         judge.link(&session, &credential, NOW).map_err(text)?;
@@ -1249,7 +1285,7 @@ mod tests {
             ],
             vec![],
         )?;
-        judge.weigh(&mixed, NOW).map_err(text)?;
+        judge.weigh(&mixed, NOW, None).map_err(text)?;
         assert_eq!(judge.earned(&relay.public(), NOW), 4 * FEEDER_CREDIT);
         // The bundle's own signature and time are not skipped: a forged or future bundle is
         // refused whole.
@@ -1258,7 +1294,7 @@ mod tests {
         bytes[last] ^= 1;
         let forged = EvidenceBundle::from_bytes(bytes).map_err(text)?;
         assert!(matches!(
-            judge.weigh(&forged, NOW),
+            judge.weigh(&forged, NOW, None),
             Err(Refused::Unreadable(_))
         ));
         let future = EvidenceBundle::sign(
@@ -1271,7 +1307,7 @@ mod tests {
             },
         )
         .map_err(text)?;
-        assert_eq!(judge.weigh(&future, NOW), Err(Refused::Future));
+        assert_eq!(judge.weigh(&future, NOW, None), Err(Refused::Future));
         Ok(())
     }
 
@@ -1290,7 +1326,7 @@ mod tests {
             })
             .collect::<Result<Vec<_>>>()?;
         judge
-            .weigh(&bundle(&relay, vec![], vec![], answers)?, NOW)
+            .weigh(&bundle(&relay, vec![], vec![], answers)?, NOW, None)
             .map_err(text)?;
         assert_eq!(judge.earned(&relay.public(), NOW), 0);
         // And its own bundle never carries one.
@@ -1323,7 +1359,7 @@ mod tests {
         )
         .map_err(text)?;
         judge
-            .weigh(&bundle(&relay, vec![], vec![instant], vec![])?, NOW)
+            .weigh(&bundle(&relay, vec![], vec![instant], vec![])?, NOW, None)
             .map_err(text)?;
         assert_eq!(judge.earned(&relay.public(), NOW), 5_000);
         Ok(())
@@ -1404,6 +1440,7 @@ mod tests {
             .weigh(
                 &bundle(&relay, hosted(&judge, &relay, 24)?, vec![], vec![])?,
                 NOW,
+                None,
             )
             .map_err(text)?;
         assert_eq!(judge.earned(&relay.public(), NOW), 24 * FEEDER_CREDIT);
@@ -1529,6 +1566,40 @@ mod tests {
         Ok(())
     }
 
+    /// R4 of sweep 5: every signature `check` verifies inside a bundle is a token of the pace its
+    /// asker's records were taken by, owed and paid before that connection's next record: a bundle
+    /// of 6 descriptions and 4 receipts on a pace of one a second holds the next record 11 s (its
+    /// ten signatures, then its own token).
+    /// Before, a bundle was one token whatever it held, its up to 128 signatures unplanned.
+    #[tokio::test(start_paused = true)]
+    async fn each_signature_inside_a_bundle_is_a_token_of_its_askers_pace() -> Result {
+        let relay = identity()?;
+        let feeders = (0..6)
+            .map(|_| info(&identity()?, relay.public(), NOW))
+            .collect::<Result<Vec<_>>>()?;
+        let receipts = (0..4)
+            .map(|_| receipt(&identity()?, relay.public(), 1_000, NOW))
+            .collect::<Result<Vec<_>>>()?;
+        let evidence = bundle(&relay, feeders, receipts, vec![])?;
+        let pace = RecordPace::with_burst(1, 1);
+        // The record itself, taken as the read loop takes it.
+        pace.take().await;
+        let started = tokio::time::Instant::now();
+        check(&evidence, NOW, Some(&pace)).map_err(|refused| format!("{refused:?}"))?;
+        pace.take().await;
+        let waited = started.elapsed();
+        assert!(
+            waited >= Duration::from_secs(11) && waited < Duration::from_secs(12),
+            "the next record waited {waited:?}"
+        );
+        // A bundle no session brought owes nothing.
+        let started = tokio::time::Instant::now();
+        check(&evidence, NOW, None).map_err(|refused| format!("{refused:?}"))?;
+        pace.take().await;
+        assert!(started.elapsed() <= Duration::from_secs(1));
+        Ok(())
+    }
+
     #[test]
     fn fake_feeder_keys_naming_a_relay_earn_nothing_without_corroboration() -> Result {
         let relay = identity()?;
@@ -1542,7 +1613,7 @@ mod tests {
             .collect::<Result<Vec<_>>>()?;
         // Every record is genuinely signed, so the bundle is accepted, and earns nothing.
         judge
-            .weigh(&bundle(&relay, feeders, vec![], vec![])?, NOW)
+            .weigh(&bundle(&relay, feeders, vec![], vec![])?, NOW, None)
             .map_err(text)?;
         assert_eq!(judge.earned(&relay.public(), NOW), 0);
         // Two of them turn out real: those two count.
@@ -1565,6 +1636,7 @@ mod tests {
             .weigh(
                 &bundle(&relay, hosted(&judge, &relay, 50)?, vec![], vec![])?,
                 NOW,
+                None,
             )
             .map_err(text)?;
         let earned = judge.earned(&relay.public(), NOW);
@@ -1605,6 +1677,7 @@ mod tests {
                     vec![],
                 )?,
                 NOW,
+                None,
             )
             .map_err(text)?;
         let shared = identity()?;
@@ -1648,7 +1721,7 @@ mod tests {
         let shown = bundle(&relay, vec![], receipts.clone(), vec![])?;
         // An honest relay that never dealt with the colluders: nothing.
         let honest = Credit::new();
-        honest.weigh(&shown, NOW).map_err(text)?;
+        honest.weigh(&shown, NOW, None).map_err(text)?;
         assert_eq!(honest.earned(&relay.public(), NOW), 0);
         // The colluders vouching for each other the same way earn nothing either.
         for (index, colluder) in colluders.iter().enumerate() {
@@ -1659,7 +1732,7 @@ mod tests {
                 vec![receipt(next, colluder.public(), 100_000, NOW)?],
                 vec![],
             )?;
-            honest.weigh(&mutual, NOW).map_err(text)?;
+            honest.weigh(&mutual, NOW, None).map_err(text)?;
             assert_eq!(honest.earned(&colluder.public(), NOW), 0);
         }
         // A real child this relay knows counts, once, however many receipts it signs, and no
@@ -1679,7 +1752,7 @@ mod tests {
             },
         )
         .map_err(text)?;
-        honest.weigh(&later, NOW + 1).map_err(text)?;
+        honest.weigh(&later, NOW + 1, None).map_err(text)?;
         assert_eq!(honest.earned(&relay.public(), NOW + 1), decayed(2_000, 1));
         let flood = bundle(
             &known,
@@ -1688,7 +1761,7 @@ mod tests {
             vec![],
         )?;
         honest.corroborate_relay(relay.public(), NOW);
-        honest.weigh(&flood, NOW).map_err(text)?;
+        honest.weigh(&flood, NOW, None).map_err(text)?;
         assert_eq!(
             honest.earned(&known.public(), NOW),
             AREA_FEEDERS * FEEDER_BYTES_PER_SEC
@@ -1709,6 +1782,7 @@ mod tests {
             .weigh(
                 &bundle(&relay, hosted(&judge, &relay, 4)?, vec![], vec![])?,
                 NOW,
+                None,
             )
             .map_err(text)?;
         assert_eq!(judge.earned(&relay.public(), NOW), 4 * FEEDER_CREDIT);
@@ -1720,7 +1794,8 @@ mod tests {
             judge
                 .weigh(
                     &bundle(&relay, vec![], vec![], vec![])?,
-                    NOW + MAX_EVIDENCE_AGE_MS + 1
+                    NOW + MAX_EVIDENCE_AGE_MS + 1,
+                    None
                 )
                 .is_err()
         );
@@ -1735,7 +1810,7 @@ mod tests {
             },
         )
         .map_err(text)?;
-        judge.weigh(&stale, NOW).map_err(text)?;
+        judge.weigh(&stale, NOW, None).map_err(text)?;
         assert_eq!(judge.earned(&relay.public(), NOW), 4 * FEEDER_CREDIT);
         Ok(())
     }
@@ -1764,7 +1839,7 @@ mod tests {
         let judge = Credit::new();
         judge.corroborate_receiver(feeder.public(), NOW);
         judge.corroborate_relay(child.public(), NOW);
-        judge.weigh(&bundled, NOW).map_err(text)?;
+        judge.weigh(&bundled, NOW, None).map_err(text)?;
         assert_eq!(judge.earned(&relay.public(), NOW), FEEDER_CREDIT + 4_000);
         // A full evidence store still bundles into one record, and alike every time.
         for _ in 0..200 {

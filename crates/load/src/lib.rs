@@ -75,6 +75,8 @@ struct Moment {
     own: Option<Sample>,
     client: Snapshot,
     admission: Option<Admission>,
+    /// The hosted MLAT's clock fits, where the relay hosts it (`relay::fits`).
+    fits: Option<relay::Fits>,
     offered: u64,
 }
 
@@ -96,6 +98,10 @@ impl Watch {
                 .stats
                 .as_deref()
                 .and_then(|stats| relay::admission(stats).ok()),
+            fits: self
+                .stats
+                .as_deref()
+                .and_then(|stats| relay::fits(stats).ok()),
             offered: self.counts.offered.load(Ordering::Relaxed),
         }
     }
@@ -444,6 +450,28 @@ fn summary(summary: &Summary) -> String {
             ),
         );
     }
+    if let (Some(now), Some(before)) = (&end.fits, &start.fits)
+        && now.steps > 0
+    {
+        // H-a: a harness whose clocks jumped at each loop failed most fits.
+        row(
+            "relay: MLAT clock fits",
+            format!(
+                "{} fitted, {} failed this window ({}), {} clocks dropped as cut off, over {} \
+                 window steps; the last failure: {}",
+                now.fits.saturating_sub(before.fits),
+                now.unfitted.saturating_sub(before.unfitted),
+                now.failed_since(before)
+                    .map_or("none tried".to_owned(), |share| format!(
+                        "{:.1}% failed",
+                        share * 100.0
+                    )),
+                now.disconnected.saturating_sub(before.disconnected),
+                now.steps.saturating_sub(before.steps),
+                now.reason.as_deref().unwrap_or("none")
+            ),
+        );
+    }
     if let (Some(now), Some(before)) = (end.sample, start.sample) {
         row(
             "relay: CPU",
@@ -517,27 +545,44 @@ fn summary(summary: &Summary) -> String {
         }
         // A batch's time is when it was made: a feeder's seal for raw, and for the deduplicated
         // stream the end of the epoch the relay signed it for (`tally_relay::deduplicated`).
-        // A provisional solution's time is its transmission's.
-        for (name, stream, histogram, since, what) in [
+        // A provisional solution's time is its transmission's, and its latency is split at the
+        // stamp of the relay's step that solved it (`subscriber::Client::provisional`): what the
+        // relay's lateness budget does not see (the feeder's batching, ingest, the watermark),
+        // then what it does.
+        for (name, stream, histogram, span, what) in [
             (
                 "latency: raw",
                 tally_wire::Streams::RAW,
                 &client.raw_latency,
-                "sealed",
+                "sealed to read",
                 "batches",
             ),
             (
                 "latency: deduplicated",
                 tally_wire::Streams::DEDUPLICATED,
                 &client.dedup_latency,
-                "epoch end",
+                "epoch end to read",
                 "batches",
             ),
             (
                 "latency: provisional",
                 tally_wire::Streams::PROVISIONAL,
                 &client.provisional_latency,
-                "transmitted",
+                "transmitted to read",
+                "solutions",
+            ),
+            (
+                "  to its step's stamp",
+                tally_wire::Streams::PROVISIONAL,
+                &client.provisional_to_stamp,
+                "transmitted to the stamp of the relay's step that solved it",
+                "solutions",
+            ),
+            (
+                "  from its step's stamp",
+                tally_wire::Streams::PROVISIONAL,
+                &client.provisional_from_stamp,
+                "that stamp to read",
                 "solutions",
             ),
         ] {
@@ -559,7 +604,7 @@ fn summary(summary: &Summary) -> String {
             row(
                 name,
                 format!(
-                    "p50 {} ms, p90 {} ms, p99 {} ms, p99.9 {} ms, max {} ms ({since} to read, {} {what})",
+                    "p50 {} ms, p90 {} ms, p99 {} ms, p99.9 {} ms, max {} ms ({span}, {} {what})",
                     at(0.5),
                     at(0.9),
                     at(0.99),
@@ -578,13 +623,17 @@ fn summary(summary: &Summary) -> String {
                 .lock()
                 .map(|each| each.clone())
                 .unwrap_or_default();
+            let delta = end.client - start.client;
             row(
                 "client: provisional",
                 format!(
                     "{} of the {} solutions read more than {settle} ms after their transmission \
-                     (too late for the live world wherever its second ended first)",
+                     (too late for the live world wherever its second ended first); {} dated \
+                     after their step's stamp (a free-running gauge dates a transmission by the \
+                     seal of the batch that anchored its model, up to a second late)",
                     histogram.over(settle),
-                    histogram.total()
+                    histogram.total(),
+                    delta.provisional_after_stamp
                 ),
             );
         }

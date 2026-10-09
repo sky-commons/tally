@@ -266,6 +266,54 @@ pub fn admission(stats: &str) -> Result<Admission, String> {
     })
 }
 
+/// What a relay hosting MLAT says of its window steps' clock fits (`GET /mlat`, `steps_total`):
+/// the clock models fitted and those whose fit failed, since it started, and why the last failed.
+#[derive(Clone, Debug, Default)]
+pub struct Fits {
+    pub fits: u64,
+    pub unfitted: u64,
+    /// Clocks the fits dropped as cut off from their gauge (`disconnected`).
+    pub disconnected: u64,
+    pub steps: u64,
+    pub reason: Option<String>,
+}
+
+impl Fits {
+    /// The share of the fits tried between `before` and this that failed, if any were tried.
+    pub fn failed_since(&self, before: &Self) -> Option<f64> {
+        let fits = self.fits.saturating_sub(before.fits);
+        let unfitted = self.unfitted.saturating_sub(before.unfitted);
+        let tried = fits + unfitted;
+        (tried > 0).then(|| unfitted as f64 / tried as f64)
+    }
+}
+
+pub fn fits(stats: &str) -> Result<Fits, String> {
+    let body = get(stats, "/mlat")?;
+    let json: serde_json::Value = serde_json::from_str(&body).map_err(|error| error.to_string())?;
+    let total = json.get("steps_total");
+    let number = |name: &str| {
+        total
+            .and_then(|total| total.get(name))
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+    };
+    Ok(Fits {
+        fits: number("fits"),
+        unfitted: number("unfitted"),
+        disconnected: number("disconnected"),
+        steps: json
+            .get("steps")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
+        reason: json
+            .get("last_step")
+            .and_then(|last| last.get("unfitted_reason"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+    })
+}
+
 /// A plain HTTP/1.1 GET over loopback; the body, de-chunked.
 fn get(address: &str, path: &str) -> Result<String, String> {
     let mut stream = TcpStream::connect(address).map_err(|error| format!("{address}: {error}"))?;

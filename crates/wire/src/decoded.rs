@@ -218,10 +218,26 @@ pub fn live() -> (usize, usize) {
     )
 }
 
+/// Told each decode's address as it is let go, once [`live`] has stopped counting it
+/// ([`on_drop`]).
+static ON_DROP: std::sync::OnceLock<fn(usize)> = std::sync::OnceLock::new();
+
+/// Sets what is told each decode's address (`Arc::as_ptr`) as it is let go, after [`live`] has
+/// stopped counting it: for a holder that tracks decodes by address (a relay's charges,
+/// `tally_relay::budget::Covered`) to mark it gone at the moment it leaves `live`, so the two agree
+/// at every instant, never only once whoever last held it has let its charge go too. One a
+/// process: false if one was already set.
+pub fn on_drop(hook: fn(usize)) -> bool {
+    ON_DROP.set(hook).is_ok()
+}
+
 impl Drop for Decoded {
     fn drop(&mut self) {
         LIVE_COUNT.fetch_sub(1, Ordering::Relaxed);
         LIVE_BYTES.fetch_sub(self.footprint(), Ordering::Relaxed);
+        if let Some(hook) = ON_DROP.get() {
+            hook(std::ptr::from_ref(self) as usize);
+        }
     }
 }
 
@@ -259,6 +275,33 @@ impl Decoded {
         stamp_ms: u64,
         ingest_seq: u64,
     ) -> Result<Arc<Self>, Box<Undecodable>> {
+        Self::from_verified_keyed_held(batch, key, (stamp_ms, ingest_seq), |_| {})
+    }
+
+    /// As `from_verified`, `held` given the decode before it is counted alive ([`live`]): a
+    /// holder that charges it there (a relay's charge covering it, `tally_relay::budget::Covered`)
+    /// is never seen with a decode alive that nothing has charged, not even for the instant
+    /// between its making and its charge.
+    pub fn from_verified_held(
+        batch: Batch,
+        stamp_ms: u64,
+        ingest_seq: u64,
+        held: impl FnOnce(&Arc<Self>),
+    ) -> Result<Arc<Self>, Box<Undecodable>> {
+        Self::from_verified_keyed_held(
+            batch,
+            FingerprintKey::process(),
+            (stamp_ms, ingest_seq),
+            held,
+        )
+    }
+
+    fn from_verified_keyed_held(
+        batch: Batch,
+        key: &FingerprintKey,
+        (stamp_ms, ingest_seq): (u64, u64),
+        held: impl FnOnce(&Arc<Self>),
+    ) -> Result<Arc<Self>, Box<Undecodable>> {
         match Self::decode(&batch, key) {
             Ok((receiver, header, plain, obs)) => {
                 let decoded = Self {
@@ -275,9 +318,12 @@ impl Decoded {
                     plain,
                     obs,
                 };
+                let footprint = decoded.footprint();
+                let decoded = Arc::new(decoded);
+                held(&decoded);
                 LIVE_COUNT.fetch_add(1, Ordering::Relaxed);
-                LIVE_BYTES.fetch_add(decoded.footprint(), Ordering::Relaxed);
-                Ok(Arc::new(decoded))
+                LIVE_BYTES.fetch_add(footprint, Ordering::Relaxed);
+                Ok(decoded)
             }
             Err(error) => Err(Box::new(Undecodable { batch, error })),
         }
@@ -540,6 +586,8 @@ mod tests {
             assert_eq!(decoded.inflated_len(), batch.inflated_len()?);
             assert_eq!(decoded.receptions(), content.observations.len());
             assert!(decoded.receptions() <= batch.receptions_at_most()?);
+            // Stated before any decode, in either codec: what a relay paces receptions by.
+            assert_eq!(batch.receptions()?, decoded.receptions());
             assert_eq!(decoded.receiver(), identity.public());
             assert_eq!(
                 (
