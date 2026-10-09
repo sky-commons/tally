@@ -919,12 +919,14 @@ fn the_seam_admits_relays_that_ask_and_ignores_clients() -> Outcome {
         key: identity(1).public(),
         source: 1,
         loopback: false,
+        address: None,
     };
     let client = Asker {
         role: AskerRole::Client,
         key: identity(2).public(),
         source: 2,
         loopback: false,
+        address: None,
     };
     sharing.assigned(&client, assignment, 1_000);
     sharing.assigned(&relay, assignment, 1_000);
@@ -985,6 +987,7 @@ fn relay(key: PublicKey) -> Asker {
         key,
         source: 1,
         loopback: false,
+        address: None,
     }
 }
 
@@ -1961,7 +1964,17 @@ fn routing_around_a_full_member_files_no_shortfall_and_demotes_nobody() -> Outco
 
     let receipts: u64 = sim.members.iter().map(|m| m.stats().receipts).sum();
     if receipts == 0 {
-        return Err("no receipt was signed: no window was judged".into());
+        return Err("no receipt was signed".into());
+    }
+    // Sweep 5, R5: "nobody is demoted" is a verdict only from a judge that sat: every member
+    // weighed a window whose shortfalls could have demoted.
+    let unjudged: Vec<usize> = sim
+        .live()
+        .into_iter()
+        .filter(|i| sim.members[*i].stats().judged == 0)
+        .collect();
+    if !unjudged.is_empty() {
+        return Err(format!("members that judged no window: {unjudged:?}"));
     }
     let shortfalls: Vec<(usize, u64)> = sim
         .members

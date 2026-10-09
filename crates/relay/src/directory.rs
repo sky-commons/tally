@@ -831,9 +831,15 @@ impl Directory {
 
     /// A relay's evidence bundle, gossiped on a directory link: checked by credit's own
     /// verifier (`credit::check`) and held if it is newer than what is held of its signer. True
-    /// when held, and then gossiped once at the next tick.
-    pub fn evidence(&self, bundle: &EvidenceBundle, now_ms: u64) -> bool {
-        lock(&self.state).evidence(bundle, now_ms)
+    /// when held, and then gossiped once at the next tick. Each signature inside it is a token of
+    /// `pace`, the link's (`credit::check`).
+    pub fn evidence(
+        &self,
+        bundle: &EvidenceBundle,
+        now_ms: u64,
+        pace: Option<&crate::ingest::RecordPace>,
+    ) -> bool {
+        lock(&self.state).evidence(bundle, now_ms, pace)
     }
 
     /// Every evidence bundle held: what a new directory link is sent beside the offers.
@@ -907,7 +913,7 @@ impl Directory {
         if evidence_due && let Ok(bundle) = hub.network().credit.bundle(identity, now_ms) {
             let mut state = lock(&self.state);
             state.own_evidence_ms = Some(now_ms);
-            if state.evidence(&bundle, now_ms) {
+            if state.evidence(&bundle, now_ms, None) {
                 evidence.push(bundle);
             }
         }
@@ -1346,11 +1352,16 @@ impl State {
     }
 
     /// See `Directory::evidence`.
-    fn evidence(&mut self, bundle: &EvidenceBundle, now_ms: u64) -> bool {
+    fn evidence(
+        &mut self,
+        bundle: &EvidenceBundle,
+        now_ms: u64,
+        pace: Option<&crate::ingest::RecordPace>,
+    ) -> bool {
         let Ok(signer) = bundle.signer() else {
             return false;
         };
-        let Ok(shown) = credit::check(bundle, now_ms) else {
+        let Ok(shown) = credit::check(bundle, now_ms, pace) else {
             return false;
         };
         // Held whether or not the signer's offer is yet (it may be waiting for its handshake), so
@@ -2071,6 +2082,7 @@ mod tests {
             key,
             source: 1,
             loopback: false,
+            address: None,
         }
     }
 
@@ -2277,7 +2289,7 @@ mod tests {
                 steps.push(Box::new(move |directory: &Directory| {
                     let offer = sign(&relay, &content("honest.example:1", cell, NOW))?;
                     directory.hold_verified(offer, v4(10, at as u8), NOW)?;
-                    directory.evidence(&evidence_of(&relay, &child_set, 10_000)?, NOW);
+                    directory.evidence(&evidence_of(&relay, &child_set, 10_000)?, NOW, None);
                     Ok(())
                 }));
             }
@@ -2304,10 +2316,14 @@ mod tests {
                     match index % 3 {
                         0 => {}
                         1 => {
-                            directory.evidence(&evidence_of(&key, &free, 1_000_000)?, NOW);
+                            directory.evidence(&evidence_of(&key, &free, 1_000_000)?, NOW, None);
                         }
                         _ => {
-                            directory.evidence(&evidence_of(&key, &one_network, 1_000_000)?, NOW);
+                            directory.evidence(
+                                &evidence_of(&key, &one_network, 1_000_000)?,
+                                NOW,
+                                None,
+                            );
                         }
                     }
                     Ok(())
@@ -2371,7 +2387,7 @@ mod tests {
             v4(99, 0),
             NOW,
         )?;
-        one.evidence(&evidence_of(witness, &one_network, 1_000_000)?, NOW);
+        one.evidence(&evidence_of(witness, &one_network, 1_000_000)?, NOW, None);
         assert_eq!(one.tier_of(&witness.public(), NOW), tier(1));
         assert_eq!(tier(1), 1);
         // The same evidence, held in the opposite order: the same set, in the same order.
@@ -2413,7 +2429,7 @@ mod tests {
                 offered.mlat_cores = 1;
                 directory.hold_verified(sign(relay, &offered)?, v4(10, at as u8), NOW)?;
                 if evidenced {
-                    directory.evidence(&evidence_of(relay, &children, 10_000)?, NOW);
+                    directory.evidence(&evidence_of(relay, &children, 10_000)?, NOW, None);
                 }
             }
             for (index, key) in ground.iter().enumerate() {
@@ -2473,6 +2489,7 @@ mod tests {
             key: Identity::generate().map_err(text)?.public(),
             source: 2,
             loopback: false,
+            address: None,
         };
         directory.offered(&client, offer.clone(), NOW);
         assert!(directory.state.lock().map_err(text)?.pending.is_empty());

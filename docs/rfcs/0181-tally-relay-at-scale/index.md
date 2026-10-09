@@ -200,10 +200,12 @@ Measured on main (tally-load, commit b3e3571809 on branch tally-load):
    came), its excess let go and counted (`waiting_dropped`). Before, both were charged to one gauge
    in arrival order, and then what waits for a step's descriptions was one pool refused batch by
    batch as they came, so which batch a full store dropped was thread timing. A receiver that stops taking part keeps its raw in the
-   bins the steps already due take, and is forgotten in every sealed bin when its window step
-   starts or is shed, a bin still being sealed then included once it is held (before, a seal in
-   flight when the receiver left kept it); a window step fits with the sites its descriptions
-   left. Before,
+   bins the steps already due take, and is forgotten in every sealed bin at its step, a bin still
+   being sealed then included once it is held (before, a seal in flight when the receiver left kept
+   it), every receiver one change let go forgotten together, each bin re-sealed once for all of
+   them, bin by bin, each charged to `Held` before it is built (one there is no room to re-seal is
+   forgotten whole, its records counted refused); a window step fits with the sites its step's
+   descriptions left. Before,
    a description took effect when it arrived, before or after a window step, so a seat that changed
    midway made different bytes by thread timing; `staged_mlat` now holds the bytes with a receiver
    described again midway and one described first midway, with delays inside every stage, and the
@@ -212,47 +214,83 @@ Measured on main (tally-load, commit b3e3571809 on branch tally-load):
    kept is not routed through the ingest stage's stamps, so how the same trace's descriptions fall
    against its batches depends on that watermark when the hub kept them.
 
-   Window steps (a step's seal, then its window) and provisional steps run apart, each kind one at a
-   time and in order: a window step's fits take seconds, and a provisional step waiting behind them
-   came too late for the live world. The engine's thread itself does nothing that takes long and
-   wakes for a message alone: every seal, a shed step's too, and every forgetting of receivers that
-   left (those that left together in one pass, each sealed bin re-sealed once for all of them) runs
-   off it, below the stages, one at a time and in order (before, a shed step's seal ran on it, and
-   the steps' descriptions waited behind it; and an area change re-sealed every bin once a departed
-   receiver, on it, for seconds, at the stages' priority). A provisional step carries exactly the
-   models of the window steps `engine::MODELS_RIPEN_MS` (15 s) before it, by their stamp, in line
-   and hosted alike, and is shed at its turn, counted (`provisional_models_late`, and
-   `provisional_steps_shed`), if one of them has not reported: it never runs with other models, so
-   every provisional step a host runs makes the reference's bytes however long its window steps
-   ran. The ripening covers a window step on the planned threads (9 to 11 s, "MLAT in the cores")
-   and the window steps a host may fall behind, so a host within its plan never sheds one so; and a
-   model is carried 90 s past its window and refitted every stride (40 s), so fifteen seconds of it
-   are not missed. Before, the ripening was 5 s, shorter than a planned window step, and a
-   provisional step whose models had not reported started without them and adopted them at
-   whichever step came after they reported, so which models a step used, and the provisional bytes
-   of two relays of one area, were thread timing's; before that, a provisional step waited for
-   them, and a window step running past about four seconds shed every provisional step behind it.
-   `staged_mlat` holds the bytes with every window step that solves held while the watermark runs
-   ten steps past it. Each kind waits for the one before it up to its own limit, steps the watermark
-   has passed and that have not started: `mlat_host::STEPS_BEHIND` (4) window steps, past which the
-   oldest is shed, its bins taken at once and sealed in their turn, and
-   `mlat_host::PROVISIONAL_BEHIND` (0) provisional steps, so a provisional step starts at its turn
+   Every step the watermark passes is sealed in its turn, whatever the window steps are doing;
+   window steps and provisional steps run apart, each kind one at a time and in order: a window
+   step's fits take seconds, and a provisional step waiting behind them came too late for the live
+   world. MLAT's work runs on three runners started with the host (seals and forgets, window
+   steps, provisional steps), each a thread for the host's life at its priority below the stages,
+   so no piece of it ever needs a thread it may not get (before, a step whose thread could not be
+   spawned ran on the engine's thread, ungated and at the stages' priority); a runner that could
+   not be lowered as far as planned, a relay already at nice 19 among them, is counted
+   (`priority_unset`). The engine's thread itself does nothing that takes long and wakes for a
+   message alone, and for the network task's ask only when the watermark passed a step no ask
+   handed it yet and an engine runs (before, every ask woke it, ten times a second, areas or none);
+   it never takes an address shard (before, dropping an engine cleared them there, waiting on a
+   provisional step's every pass; now the provisional runner lets them go after the step it runs).
+   Once a step's seal is held, a window step is queued if a window falls due at it
+   (`Engine::falls_due`, about once a stride, 40 s) and started unless one runs, and what no window
+   still to be solved needs is forgotten by the step's stamp (`Engine::forget_by`), every step
+   alike, before the next seal reads the room it has, so the room a seal has, and which receivers
+   it refuses, is the stamps' alone. Before, a step's seal waited for the window step before it, so
+   every step a window step ran past queued as a window step and those past the limit were shed
+   (about six a window step, at 11 to 14 s a window step), and only a window step that ran forgot
+   raw, so two relays of one area sealed different receivers out of the same bin by how long their
+   window steps ran. A window step is prepared as of the step its window fell due at, however long
+   it waited, and nothing a window step queued or running has still to solve is forgotten
+   (`forget_by`'s floor, the first bin of its earliest window): a host whose window steps start when
+   their window falls due and finish within the grace the forgetting leaves them (about 23 s)
+   forgets exactly what the engine in line does. What a seal refuses is counted when it finishes,
+   and what the shards refused as they take a step's bins, then (before, both waited in the engine
+   for its next window step, and went with it when it was dropped). A provisional step carries
+   exactly the models of the windows that fell due `engine::MODELS_RIPEN_MS` (15 s) before it, each
+   ripening by its own window's due step however late it was solved, in line and hosted alike, and
+   is shed at its turn, counted (`provisional_models_late`, and `provisional_steps_shed`), if one of
+   them has not been solved: it never runs with other models, so every provisional step a host runs
+   makes the reference's bytes however long its window steps ran or waited (before, a window step
+   put off for want of the `Engine` store was counted done, its windows solved at the next step's
+   and their models ripened by it). The ripening covers a window step on the planned threads (9 to
+   11 s, "MLAT in the cores") and the seals a host may fall behind, so a host within its plan never
+   sheds one so; and a model is carried 90 s past its window and refitted every stride (40 s), so
+   fifteen seconds of it are not missed. Before, the ripening was 5 s, shorter than a planned window
+   step, and a provisional step whose models had not reported started without them and adopted them
+   at whichever step came after they reported, so which models a step used, and the provisional
+   bytes of two relays of one area, were thread timing's; before that, a provisional step waited
+   for them, and a window step running past about four seconds shed every provisional step behind
+   it. `staged_mlat` holds the bytes with every window step that solves held while the watermark
+   runs ten steps past it, nothing shed. Each kind waits for the one before it up to its own limit:
+   `mlat_host::STEPS_BEHIND` (4) window steps (steps a window fell due at) waiting not started, past
+   which the oldest is shed, its windows the next one's, and `mlat_host::PROVISIONAL_BEHIND` (0)
+   provisional steps the watermark passed not started, so a provisional step starts at its turn
    or, if the one before it still runs then, is shed whole and counted (§9, §10). That is what the
    live world's seal allows: a transmission's provisional is weighed by the step after it is due,
    at most `provisional::WAITING_MS` (3.1 s: settling 1.1 s, kept past it 1 s while too few
    receivers have come, and the step) after its first reception's stamp, and its step's run and
    its records' way to the relay that gathers the world are budgeted at
    `mlat_host::PROVISIONAL_PUBLISH_MS` (0.9 s), within `products::WORLD_SETTLE_MS` (4 s), checked at
-   compile time, and held: a step whose records are ready later than that after its turn has them
-   refused whole, counted (`provisional_steps_late`, its state applied all the same, so the steps
-   after it make the reference's bytes); before, nothing held it, and a step running 0.9 to 1 s
-   missed the world second unseen. Before, one step of waiting was allowed and the settling's second was left out,
-   about 5.1 s at worst. The way from the transmission to its first reception's stamp (the feeder's
-   batching and link) is not in it and is the world product's to allow for. So the steps MLAT is
-   behind by are bounded and so is what it holds while it is: `INTERVALS_HELD` (3) step intervals
-   of a feeder's decoded batches and notes at `NOTES_HEADROOM` (four times) the planned rate, each
-   interval bounded by its share of the store so a host that sheds nothing never fills it, and its
-   open raw over the settle, those window steps and `AHEAD_MS` (`OPEN_MS`, 7 s, and 1 s ahead).
+   compile time, and held by the stamps: a step's records taken once the watermark is that far past
+   the step are refused whole, counted (`provisional_steps_late`, its state applied all the same,
+   so the steps after it make the reference's bytes). Before, nothing held it, and a step running
+   0.9 to 1 s missed the world second unseen; then it was held by the wall clock from the step's
+   turn to its run's end, which left out the watermark's lag and the wait to be taken, and made a
+   test's verdict its machine's speed. Before, one step of waiting was allowed and the settling's
+   second was left out, about 5.1 s at worst. The way from the transmission to its first
+   reception's stamp (the feeder's batching and link) is not in it and is the world product's to
+   allow for. So the steps MLAT is behind by are bounded and so is what it holds while it is:
+   `INTERVALS_HELD` (3) step intervals of a feeder's decoded batches and notes at `NOTES_HEADROOM`
+   (four times) the planned rate, each interval bounded by its share of the store so a host that
+   sheds nothing never fills it, and its open raw over the settle, the seals it may fall behind and
+   `AHEAD_MS` (`OPEN_MS`, 7 s, and 1 s ahead; past it the shards refuse raw, counted).
+
+   **A panic in hosted MLAT (decided 2026-10-09, sweep 5, N7).** It ends the relay, as a panic in
+   any other part does (`abort_on_any_panic`), not isolated and restarted: MLAT's state (the sealed
+   bins standing reads, the address shards, the steps in hand) is shared with the rest of the
+   relay through locks and charges a panic would leave poisoned or held, and a part restarted
+   beside them would run on with them as if whole, which is what the relay's hook exists to
+   refuse. The engine's thread and every runner hold a guard that ends the process when its
+   thread unwinds (`mlat_host::EndOnUnwind`), so a host built apart from the relay's program, which
+   sets no hook (a test's), is held to the same; a worker's panic inside a step is its step's
+   (`gate::on_threads` re-raises it on the runner, never swallows it). Before, a runner's panic left
+   no report, and MLAT stalled for good, silently.
 
    Measured at 20,000 feeders before the pool: the single sealer thread held a whole core and fell
    behind (deriving the regional batches' ADS-B fixes was 70% of it, `to_observation` 20%, signing
@@ -517,17 +555,19 @@ Measured on main (tally-load, commit b3e3571809 on branch tally-load):
 10. **Overload policy (decided)**: back-pressure for raw; whole-epoch refusal, counted, for derived
     products; refusal whole, counted, for delivery tags (a batch past the store's gauge is never tagged and
     never denied, §7); disconnection for fan-out (§8); for hosted MLAT that cannot keep up, whole
-    steps shed, counted. MLAT never pushes back on ingest and never grows: while the watermark has
-    passed more than `STEPS_BEHIND` window steps that have not started, the oldest is shed (counted,
-    `steps_shed`), its bins taken at once and sealed then, or once the seal in flight has reported,
-    and its window step the next one's, which solves every window due as one that ran late would;
-    while it has passed more than `PROVISIONAL_BEHIND` (none) provisional steps that have not
-    started, the oldest is shed, its provisional solving let go (every batch whose notes it held
-    counted, `MlatReport::shed`, the step counted, `provisional_steps_shed`); a provisional step
-    whose models (the window steps `MODELS_RIPEN_MS` before it) have not all reported at its turn
-    is shed the same way, counted (`provisional_models_late`), never started with other models; and
-    one whose records are ready past its publish slot has them refused whole, counted
-    (`provisional_steps_late`). What is lost is provisional positions, never a window. A host within those limits of the watermark sheds nothing, so the
+    steps shed, counted. MLAT never pushes back on ingest and never grows: every step's bins are
+    taken as the watermark passes it and sealed in their turn; while more than `STEPS_BEHIND` window
+    steps (steps a window fell due at) wait not started, the oldest is shed (counted,
+    `steps_shed`), its windows the next one's, which solves every window due as one that ran late
+    would; while the watermark has passed more than `PROVISIONAL_BEHIND` (none) provisional steps
+    that have not started, the oldest is shed, its provisional solving let go (every batch whose
+    notes it held counted, `MlatReport::shed`, the step counted, `provisional_steps_shed`); a
+    provisional step whose models (the windows that fell due `MODELS_RIPEN_MS` before it) have not
+    all been solved at its turn is shed the same way, counted (`provisional_models_late`), never
+    started with other models; and one whose records are taken past its publish slot, by the
+    stamps, has them refused whole, counted (`provisional_steps_late`). What is lost is
+    provisional positions, never a window. A host within those limits of the watermark sheds
+    nothing, so the
     same stamped trace still makes the same bytes; one further behind is shed by how far behind it
     is, which no trace decides. Before, a step shed only while no seal was in flight, so a slow seal
     let the steps queued behind it grow without bound; and a provisional step waited for the window
@@ -552,7 +592,14 @@ Measured on main (tally-load, commit b3e3571809 on branch tally-load):
     feeder's are its byte ceiling's (eight at the default 256 KiB/s, 240 us, some 1.8 times a
     planned batch's 133 us), a members' feeder's worth its `MEMBER_RECORDS_PER_FEEDER` (four, 120
     us, below its receptions), so a relay whose feeders may send tiny batches up to their pace has
-    the ingest threads for it, and `check` prints `feeder-records`. The feeders the cores carry are every stage's work and the async runtime's together in
+    the ingest threads for it, and `check` prints `feeder-records`. The same records may instead be
+    answered on the async runtime (an echo's reply signed, a delivery query's answered, a fault
+    proof's two records verified), so the runtime is planned for every one of them beside a
+    feeder's session (`cores::RUNTIME_NANOS_PER_RECORD`, 60 us, R4 of sweep 5), and the cores hold
+    each source's records once, at the dearer of the two (`cores::spent_per_feeder`): one pace holds
+    them all, so a record is taken by one or the other, never both. Before, the runtime was planned
+    for a feeder's session alone (83 us of a core a second), while its eight records a second
+    answered there cost some 480 us. The feeders the cores carry are every stage's work and the async runtime's together in
     that share of the cores (`cores::feeders_carried`), the members' rate taken first; the ceiling
     is the fewer of those and the feeders the memory holds (`Budget::ceiling`), so a Hello past
     either is refused ("no spare slot") and every store's share follows the same ceiling. A relay
@@ -566,6 +613,51 @@ Measured on main (tally-load, commit b3e3571809 on branch tally-load):
     build worker's; the master's unit runs on `CPUQuota=200%`), and prints `cores`, `core-feeders`,
     `memory-feeders` and each stage's threads beside the memory plan. `--ingest-threads` and
     `--message-threads` are gone: no operator picks a stage's threads.
+
+    **A feeder's receptions are paced (decided 2026-10-09).** The cores are planned at the mean, 600
+    receptions a second a feeder (`budget::PLANNED_RECEPTIONS_PER_SEC`), and each feeder's connection
+    is held to 1,800 receptions a second (`ingest::FEEDER_RECEPTIONS_PER_SEC`): the one ceiling MLAT's
+    raw holder already held a receiver to (`tally_mlat_solver::held::Rates::MEASURED`,
+    `ceiling_per_s`), one constant and not two, so a feeder let in at its pace is never refused there
+    for its rate. It is enforced in the read loop of each feeder's connection (`link::Paces`), by the
+    count each batch states (`Batch::receptions`: the first four bytes of its observations, inflated
+    alone for a compressed batch, which is exactly what a decode reads), the way the connection's
+    records already are: over the pace the loop waits before it takes the batch, its socket unread,
+    so TCP holds the feeder back and nothing is refused or counted lost (one mechanism for records
+    and receptions). Before, a feeder's receptions were bounded only by its bytes, some 15,000 a
+    second at 17 bytes each within 256 KiB/s: one connection could cost the stages 25 planned
+    feeders'.
+
+    **Every session's records are paced by its role, and planned (R4 of sweep 5).** A record costs
+    the relay a signature checked or made whatever its bytes (`cores::RUNTIME_NANOS_PER_RECORD`, 60
+    us), so each role's records are paced at what that role legitimately sends (`ingest`'s
+    `RolePace`s, each with its reason; `link::Paces` picks the pace of what the sender is when each
+    record is read):
+
+    | Session | Pace | Why |
+    | ------- | ---- | --- |
+    | Feeder | its byte ceiling over 32 KiB (8 a second at 256 KiB/s) | a batch a second, early only at 48 KiB |
+    | Member sessions | one pace all share, the members' rate's feeders at 4 records a second each | what a member forwards is feeders' batches and descriptions |
+    | Directory links | one pace all share, whoever dialled, 546 a second | twice the directory's bound (`OFFERS_HELD`) re-signed once a minute: offers, and the queries, echoes and evidence beside them |
+    | Subscriber | 12 a minute, 136 at once | a heartbeat every 30 s, a `Subscribe` when its regions change; its burst holds a credential and its evidence with every signature inside it |
+    | Engine (raw one hop) | 6 a minute, 8 at once | a heartbeat every 30 s and a `Subscribe` when its band changes |
+    | Probe | 6 a minute, 8 at once | a round of five echoes or one delivery query, then it hangs up |
+
+    A shared pace is fair: each link waits for its own token in order, so of `k` links sending at
+    once each is let in once in `k`, and one flooding link takes its turn and no more. Work a record
+    brings beyond its token is owed to the pace it was taken by and paid before the connection's next
+    record: every signature `credit::check` verifies inside an evidence bundle is a token
+    (`RecordPace::owe`), a bundle being one record on the wire and up to 129 signatures. The cores
+    plan every session at its pace before any feeder (`cores::Sessions`, `cores::feeders_carried`):
+    each connection under `--max-connections` at the dearest pace among them (6 a minute), each
+    subscriber at 12, and the directory's shared pace once, each record at 60 us, at `BUSY_PERCENT`;
+    `tally-relay check` prints `general-sessions`, `subscriber-sessions` and
+    `session-records-per-minute`. The packaged unit on one core, with the default caps (2,048
+    connections, 64 subscribers, 45,824 records a minute), carries 274 feeders. Before, every role
+    but a relay's was paced at a feeder's eight a second and each relay session at the members' whole
+    rate on its own, and none of it was planned: the 2,048 connections the cap allows could send
+    16,384 records a second, about a core the plan never held, and an evidence bundle's signatures
+    were one token.
 
     **MLAT in the cores (decided 2026-10-09).** A relay that hosts MLAT plans its engine in the same
     cores. The stages keep their half-busy share for raw; MLAT's steps get what is left. Each
@@ -646,8 +738,9 @@ Measured on main (tally-load, commit b3e3571809 on branch tally-load):
    for hosted MLAT while it is within its limits of the watermark (`PROVISIONAL_BEHIND`,
    `STEPS_BEHIND`; past them it sheds whole steps, counted, §10; `staged_mlat` holds the bytes with
    delays inside that, descriptions midway included, and `mlat_host`'s tests hold the shedding,
-   exactly one step for every step past a limit with a seal held shut, and every store within its
-   limit outside it). The tests that run relays hosting MLAT over sockets (the relay's
+   no window step shed while a seal or a window step is held shut past many steps, every
+   provisional step past the ripening shed at its turn, every store within its limit, and the
+   sealed bins the reference's at the same step while a window step runs long). The tests that run relays hosting MLAT over sockets (the relay's
    `tests/mlat_host.rs`, the API's end to end) step their relays' ingest clock a step at a time
    (`mlat_host::stepping`), only once every relay has been offered what was fed and has stepped
    and published, never past the wall clock, and assert in stamps: a provisional record is published
@@ -747,8 +840,8 @@ resident with 900 MiB live; with `MALLOC_ARENA_MAX=2`, 1,711 MiB).
 
 As built since: every store is charged before it holds a byte (§9), the steps MLAT may be behind
 are bounded and the oldest shed past them (§4, §10), the engine's own tables that grow with its
-receivers are a store (`Engine`), and after each window step the host hands the allocator's free
-pages back (`mlat_host::give_back_freed`, `malloc_trim`). A feeder then (the first sweep) reserved
+receivers are a store (`Engine`), and after each window step the host handed the allocator's free
+pages back (`malloc_trim`; removed since, "MLAT and the allocator" below). A feeder then (the first sweep) reserved
 2.89 MB where MLAT is hosted (0.67 MB without it): sealed raw 0.75 MB, open raw 0.64 MB, notes
 0.39 MB, the engine's tables 0.45 MB; the base was 280 MiB (`BASE_BYTES`, `MLAT_BASE_BYTES`: 4 MiB and the signed records'
 4 MiB bound). Measured (2026-10-08, the same harness, the relay on cores 0-9, two areas, four MLAT
@@ -797,10 +890,23 @@ caches), and the slice each batch sends each thread cost nothing measurable besi
 so it is sized by its one-thread figure. The part of the seal no helper takes (gathering each epoch,
 numbering its records, applying them) was 0.144 to 0.164 of a core at 3.02 M receptions a second and
 0.144 at 4.61 M: it follows the epochs and the areas, not the receptions, so it bounds no feeder
-count. A planned feeder without MLAT costs the four together 454 us of a core a second; planned at
-50% busy, a core carries 1,100 feeders' worth, ten cores 11,000, and the founder's 20,000 feeders
-need 19 cores with the members' rate beside them. Run with ten cores and memory for 11,403
-feeders, `tally-relay check` plans 10,879 (11,007 less the members' 128) and three threads a stage.
+count.
+
+**What ten cores carry is the relay's to say, not this document's** (N15 of sweep 5). The feeders
+the cores admit and each stage's threads follow from the figures above, each record a source may
+send (`cores::Source::records_nanos`, at the dearer of an ingest worker's 30 us and the runtime's
+60 us, `cores::RUNTIME_NANOS_PER_RECORD`: a record answered on the runtime, an echo's reply signed or
+a fault proof's two records verified, costs it up to two signatures checked, measured 26.8 to
+28.1 us each), and whatever else the plan holds. They are `tally/crates/relay/tests/cores-10.txt`:
+`tally-relay check`'s cores lines for ten cores, the harness's two areas and memory to spare,
+hosting MLAT and not, which the `check` test (`the_cores_figures_the_rfc_quotes_are_the_relays_own`)
+prints and holds equal to what the relay plans, so a figure here can no more drift from the code
+than the file can. Before, this paragraph said ten cores admitted 10,879 without MLAT and 4,129
+hosting it, from before a record's cost was planned, while the relay planned 3,917 hosting it; with
+every record planned wherever it is answered (R4 of sweep 5), it plans fewer again, and the file
+says how many: with every session beside the feeders planned at its role's pace too (§10,
+"Every session's records are paced by its role"; the file's `general-sessions`,
+`subscriber-sessions` and `session-records-per-minute`), 2,874 hosting MLAT and 5,188 without.
 
 Three runs back to back at 5,000 feeders, MLAT off, the plan's threads (three ingest, three message,
 three seal), the same harness and host as above:
@@ -824,11 +930,10 @@ step was shed. A window step comes about every 40 s and costs seconds of every t
 is taken whole: 10.0 and 11.0 cores-seconds at 500 feeders, 39.4 at 2,000. Each figure is the most a
 feeder cost over the runs (`cores::MLAT_WINDOW_NANOS_PER_FEEDER`,
 `cores::MLAT_PROVISIONAL_NANOS_PER_FEEDER`), planned at 100% of what the stages leave
-(`cores::MLAT_BUSY_PERCENT`). Hosting MLAT, a planned feeder costs the stages 619 us of a core a
-second (its raw held), planned at 50% busy, and MLAT 1.11 ms: a core carries 427 feeders' worth, ten
-4,275, and with the members' 128 beside them ten cores admit 4,129 where they admitted 7,944 with
-MLAT unplanned. At 2,000 feeders and memory for 2,358, ten cores run one thread a stage and seven
-for MLAT.
+(`cores::MLAT_BUSY_PERCENT`). Hosting MLAT, a planned feeder costs MLAT 1.11 ms of a core a second
+beside what it costs the stages with its raw held; the feeders ten cores admit hosting it, and the
+threads they run (MLAT's among them), are `tally/crates/relay/tests/cores-10.txt`'s "hosting MLAT"
+lines, as above.
 
 Three runs back to back at 2,000 feeders hosting MLAT, the plan's threads (one ingest, one
 message, one seal, seven MLAT), `--memory 14G`, the same harness and host (cores over the measured
@@ -848,6 +953,29 @@ provisional steps started without its models (`provisional_models_late`, then: t
 feeders with MLAT on two threads at the old defaults gave raw a p99 of 220 ms (max 284), and on
 eight 162 ms (max 282).
 
+**MLAT and the allocator** (2026-10-09, sweep 5). With the harness's clocks continuous across its
+loops, MLAT solved some twelve times what it had, and at 2,000 feeders hosting MLAT raw's p99 rose
+from 77 ms to 880 ms, a subscriber fell behind, and no stage thread waited on the run queue
+(`/proc/<tid>/schedstat`: every stage under 4% of its run time waiting). The cause was the engine's
+thread calling `malloc_trim(0)` after each window step: glibc walks every arena with that arena's
+lock held, returning each free page, so every ingest worker, message thread and runtime worker that
+allocated in an arena meanwhile waited for it, for seconds after a large step. MLAT ran below the
+stages and its trim stopped them. Holding large blocks to their own mappings instead
+(`M_MMAP_THRESHOLD` fixed at 128 KiB) moved the wait to the address space's lock (each free an
+unmapping by a thread at nice 10) and slowed the window steps by half. Nothing now returns the
+allocator's free pages on MLAT's behalf: it reuses them. Runs (2,000 feeders, MLAT on,
+`--memory 16G`, three minutes measured with provisional positions read; relay on cores 0-9, harness
+on 10-31):
+
+| Build | Raw p99 per run (max) | Window steps measured | Resident peak |
+| ----- | --------------------- | --------------------- | ------------- |
+| `malloc_trim` after each window step | 2,456 ms (4,080), 440 (1,460), 64 (163) | 1, 5, 1 | 4.1 to 4.4 GB |
+| 128 KiB mapping threshold, no trim | 67 ms (140), 1,846 (3,581) | 2, 2 | 6.4 to 6.7 GB |
+| Neither | 64 ms (130), 33 (81), 56 (106), 29 (124) | 4, 4, 4, 4 | 5.0 to 5.1 GB |
+
+Resident memory without the trim is what the arenas keep for reuse beside what the stores hold, a
+fifth more at this load and well inside the plan's 16 GB.
+
 **The deployed budgets** are `tally-relay check`'s to state, not this document's: the numbers move
 with every store's plan, and a figure copied here is wrong the next time one does. Before any feeder
 a relay plans its base (with MLAT's where it hosts MLAT), the oversize room
@@ -860,7 +988,11 @@ deploys, and holds each to its limit. Every new line of the plan cost the public
 had been admitting without room for them (2026-10-08, as each landed): 107 before the members'
 pool, 75 with it, 31 once the connections' buffers, the oversize room and a feeder's allowance in
 bytes were planned, 27 once every member session its areas bring was, 25 once the batch byte store
-planned the parities it holds beside its records (§6).
+planned the parities it holds beside its records (§6). Its caps were then set to admit 40 at least
+(`relay.yaml`, THE CAPS); 34 once MLAT's sealed raw was reserved at the kept ceiling every receiver
+is held to (`held::KEPT_CEILING_PER_S`, 300 a second) rather than its mean (2026-10-09, sweep 5 H-b),
+so its limit was raised from 640 to 672 MiB, which admits 41 and still fits the node's 1,194 MiB
+beside readsb and the API (`relay.yaml`, THE FIT).
 
 **What the areas cost at rest.** Taking the 122 resolution-0 areas once cost 530 MiB and a whole
 core with no feeder at all. As built: idle work follows activity, not the areas taken (`sharing`,
@@ -875,4 +1007,4 @@ need more cells refuses to start (`directory::offerable`). Measured (2026-10-08,
 deployed args): idle on four cores, 9.2 MiB resident and 0.3% of a core over 60 s (9.5 MiB and 0.4%
 again once its 128 member sessions were planned, on a host at load 60); under
 `tally-load` with 200 feeders offered and 107 admitted, 300 s, 391 MiB at its peak and 0.18 cores
-mean, MLAT shedding nothing. It fits its 640 MiB limit.
+mean, MLAT shedding nothing. It fits its 672 MiB limit.

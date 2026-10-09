@@ -43,9 +43,12 @@
 //! allowance is never a connection's and never a bare key's, since a key is free: it is held in
 //! the record of a receiver that fed the relay (a feeder asks as its receiver's key, about its own
 //! batches), so it is bounded as the receivers watched are and outlives the prober's reconnects,
-//! and a key that never fed the relay shares one allowance with every other such key (`strangers`).
-//! A fresh key per connection therefore starts from what the strangers left, never from a full
-//! allowance of its own, and takes nothing from any feeder's.
+//! and a key that never fed the relay shares one allowance with every other such key asking from
+//! the same network group (`Strangers`; the group of the address its connection came from, an IPv4
+//! /16 or an IPv6 /32, `directory::Group`, the unit every flood is bucketed by). A fresh key per
+//! connection therefore starts from what its network's strangers left, never from a full allowance
+//! of its own, and takes nothing from any feeder's; and one hostile prober, however many keys it
+//! makes, spends only its own network's allowance, never a stranger's elsewhere.
 //!
 //! The state is sharded by receiver, under a process-secret hash, so one lock is never every
 //! feeder's.
@@ -62,6 +65,7 @@ use tally_wire::{
 };
 
 use crate::budget::{Charge, Gauge, Store};
+use crate::directory::Group;
 use crate::selection::Selection;
 
 /// One entry a batch costs while it is held.
@@ -88,6 +92,11 @@ pub const FED_WITHIN_MS: u64 = TAG_WINDOW_MS;
 /// grants it keys once a minute. Every key that never fed the relay, together, is one prober.
 pub const PROBER_QUERIES: u32 = 4;
 pub const PROBER_QUERY_EVERY_MS: u64 = 1_000;
+/// The network groups whose strangers' allowances are remembered at most. An allowance earned back
+/// whole is no different from none and is forgotten first; past the bound, every further group's
+/// strangers share one allowance (`Strangers::overflow`), so a prober spread over more networks
+/// than this spends that one and never a remembered group's.
+pub const STRANGER_GROUPS: usize = 4_096;
 /// Locks the state is split under.
 const SHARDS: usize = 64;
 
@@ -113,9 +122,53 @@ pub struct Delivery {
     /// The store's gauge (`budget::Store::Delivery`), which each shard's entries are charged to:
     /// unlimited until the relay charges the store to its budget (`charge_to`).
     gauge: Mutex<std::sync::Arc<Gauge>>,
-    /// The one allowance of every prober whose key is no receiver the relay watches: a key that
-    /// never fed it, which costs nothing to make (`Allowance`).
-    strangers: Mutex<Option<Allowance>>,
+    /// The allowances of the probers whose keys are no receiver the relay watches (a key that
+    /// never fed it, which costs nothing to make), one per network group they ask from.
+    strangers: Mutex<Strangers>,
+}
+
+/// The strangers' allowances, one per network group (`Delivery::allowed`): a key costs nothing,
+/// an address in another network does, so strangers are rationed by where they ask from. A prober
+/// with no address (a stream that is no socket) is a group of its own, `None`.
+#[derive(Default)]
+struct Strangers {
+    groups: HashMap<Option<Group>, Allowance>,
+    /// The one allowance every group past `STRANGER_GROUPS` shares.
+    overflow: Option<Allowance>,
+    /// When those earned back whole were last forgotten: again only once every allowance spent
+    /// then could have been earned back (`WHOLE_AFTER_MS`), so the map is scanned at most once in
+    /// that time, never a query.
+    swept_ms: Option<u64>,
+}
+
+/// How long an allowance spent to nothing takes to be earned back whole.
+const WHOLE_AFTER_MS: u64 = PROBER_QUERIES as u64 * PROBER_QUERY_EVERY_MS;
+
+impl Strangers {
+    /// Spends one query of `group`'s strangers at `now_ms`, if one is left.
+    fn spend(&mut self, group: Option<Group>, now_ms: u64) -> bool {
+        if let Some(allowance) = self.groups.get_mut(&group) {
+            return allowance.spend(now_ms);
+        }
+        if self.groups.len() >= STRANGER_GROUPS
+            && self
+                .swept_ms
+                .is_none_or(|swept| now_ms.saturating_sub(swept) >= WHOLE_AFTER_MS)
+        {
+            self.groups.retain(|_, allowance| !allowance.whole(now_ms));
+            self.swept_ms = Some(now_ms);
+        }
+        if self.groups.len() >= STRANGER_GROUPS {
+            return self
+                .overflow
+                .get_or_insert_with(|| Allowance::full(now_ms))
+                .spend(now_ms);
+        }
+        self.groups
+            .entry(group)
+            .or_insert_with(|| Allowance::full(now_ms))
+            .spend(now_ms)
+    }
 }
 
 impl Default for Delivery {
@@ -185,6 +238,12 @@ impl Allowance {
             left: PROBER_QUERIES,
             as_of_ms: now_ms,
         }
+    }
+
+    /// Whether it has earned back every query by `now_ms`: no different from a fresh one.
+    fn whole(&self, now_ms: u64) -> bool {
+        let earned = now_ms.saturating_sub(self.as_of_ms) / PROBER_QUERY_EVERY_MS;
+        u64::from(self.left).saturating_add(earned) >= u64::from(PROBER_QUERIES)
     }
 
     /// Spends one query at `now_ms` if one is left after what it earned since; false if none is.
@@ -261,7 +320,7 @@ impl Delivery {
             refused: AtomicU64::new(0),
             refused_keys: AtomicU64::new(0),
             unanswered: AtomicU64::new(0),
-            strangers: Mutex::new(None),
+            strangers: Mutex::default(),
         }
     }
 
@@ -317,8 +376,9 @@ impl Delivery {
         }
     }
 
-    /// The signed answer to `query`, asked by `prober` (the key its session's handshake proved),
-    /// about a feeder whose signed
+    /// The signed answer to `query`, asked by `prober` (the key its session's handshake proved,
+    /// from the network group `group` of the address its connection came from), about a feeder
+    /// whose signed
     /// location falls at `point`: per sequence asked, its tag, "not seen" for one known never to
     /// have come, and nothing for one the relay cannot speak for; or, outside the areas the relay
     /// takes, that it does not take the area and nothing else. The query's keys, if it carries a
@@ -329,11 +389,11 @@ impl Delivery {
         selection: &Selection,
         identity: Option<&Identity>,
         query: &DeliveryQuery,
-        (point, prober): (Option<Region>, PublicKey),
+        (point, prober, group): (Option<Region>, PublicKey, Option<Group>),
         now_ms: u64,
     ) -> Option<DeliveryAnswer> {
         let identity = identity?;
-        if !self.allowed(prober, now_ms) {
+        if !self.allowed(prober, group, now_ms) {
             self.unanswered.fetch_add(1, Ordering::Relaxed);
             return None;
         }
@@ -376,8 +436,8 @@ impl Delivery {
 
     /// Whether `prober` may be answered one more query at `now_ms`, and if so spends it: from its
     /// own allowance if it is a receiver the relay watches (one that fed it), else from the one
-    /// every other key shares.
-    fn allowed(&self, prober: PublicKey, now_ms: u64) -> bool {
+    /// every other key asking from its network group shares (`Strangers`).
+    fn allowed(&self, prober: PublicKey, group: Option<Group>, now_ms: u64) -> bool {
         {
             let Some(mut shard) = self.shard(&prober) else {
                 return false;
@@ -389,9 +449,7 @@ impl Delivery {
         let Ok(mut strangers) = self.strangers.lock() else {
             return false;
         };
-        strangers
-            .get_or_insert_with(|| Allowance::full(now_ms))
-            .spend(now_ms)
+        strangers.spend(group, now_ms)
     }
 
     /// `receiver`'s grant, its signature already checked: what `answer_at` takes.
@@ -919,7 +977,7 @@ mod tests {
                     &self.selection,
                     Some(&self.identity),
                     query,
-                    (point, query.receiver),
+                    (point, query.receiver, None),
                     now_ms,
                 )
                 .ok_or("no answer")?
@@ -979,7 +1037,7 @@ mod tests {
                 &relay.selection,
                 Some(&relay.identity),
                 &asked,
-                (Some(relay.point), feeder.public()),
+                (Some(relay.point), feeder.public(), None),
                 now + 1_000,
             )
             .ok_or("no answer")?;
@@ -1090,7 +1148,7 @@ mod tests {
                     &relay.selection,
                     None,
                     &query(&feeder, 1, 1, 1),
-                    (None, prober()),
+                    (None, prober(), None),
                     WATCHED
                 )
                 .is_none()
@@ -1152,7 +1210,7 @@ mod tests {
                 &relay.selection,
                 Some(&relay.identity),
                 &query(&feeder, 1, 0, 63),
-                (Some(relay.point), this),
+                (Some(relay.point), this, None),
                 now_ms,
             )
         };
@@ -1187,7 +1245,7 @@ mod tests {
                     &relay.selection,
                     Some(&relay.identity),
                     &query(&feeder, 1, 0, 63),
-                    (Some(relay.point), prober),
+                    (Some(relay.point), prober, None),
                     now_ms,
                 )
                 .is_some()
@@ -1202,6 +1260,74 @@ mod tests {
         let own = (0..1_000).filter(|_| asked(feeder.public(), later)).count();
         assert_eq!(own, PROBER_QUERIES as usize);
         Ok(())
+    }
+
+    /// R-P21 of sweep 5: the strangers' allowance is per network group, so one hostile prober,
+    /// however many keys it makes from its network, spends only that network's allowance, and a
+    /// stranger asking from another network is answered all the same. Without the groups the
+    /// prober's thousand fresh keys spent the one allowance every stranger shared.
+    #[test]
+    fn a_hostile_prober_spends_only_its_own_networks_allowance() -> Result {
+        let relay = Relay::new()?;
+        let feeder = Identity::generate().map_err(text)?;
+        relay.hold(&unsigned(&feeder.public(), FEEDING_BOOT, 0, 0)?, T0);
+        let asked =
+            |prober: PublicKey, address: &str, now_ms: u64| -> std::result::Result<bool, String> {
+                let address: std::net::IpAddr = address.parse().map_err(text)?;
+                Ok(relay
+                    .delivery
+                    .answer_at(
+                        &relay.selection,
+                        Some(&relay.identity),
+                        &query(&feeder, 1, 0, 63),
+                        (Some(relay.point), prober, Some(Group::of(address))),
+                        now_ms,
+                    )
+                    .is_some())
+            };
+        // The hostile prober: a fresh key and a fresh address in its /16 each query.
+        let mut hostile = 0;
+        for n in 0..1_000u32 {
+            let address = format!("198.51.{}.{}", (n / 250) % 256, n % 250 + 1);
+            hostile += usize::from(asked(prober(), &address, T0)?);
+        }
+        assert_eq!(hostile, PROBER_QUERIES as usize);
+        // A stranger elsewhere has its network's whole allowance; one in the hostile's has none.
+        let elsewhere = (0..1_000)
+            .filter(|_| asked(prober(), "203.0.113.7", T0).unwrap_or(false))
+            .count();
+        assert_eq!(elsewhere, PROBER_QUERIES as usize);
+        assert!(!asked(prober(), "198.51.200.9", T0)?);
+        // An IPv6 prober is grouped by its /32: another /64 of the same /32 is the same network.
+        let v6 = (0..8)
+            .filter(|n| asked(prober(), &format!("2001:db8:{n}::1"), T0).unwrap_or(false))
+            .count();
+        assert_eq!(v6, PROBER_QUERIES as usize);
+        Ok(())
+    }
+
+    /// The strangers' groups remembered are bounded: past `STRANGER_GROUPS` (those earned back
+    /// whole forgotten first), the further groups share one allowance, so a prober spread over
+    /// more networks than that is answered no more than one allowance past them.
+    #[test]
+    fn strangers_past_the_groups_remembered_share_one_allowance() {
+        let mut strangers = Strangers::default();
+        let group = |n: usize| Some(Group::V4(u16::try_from(n).unwrap_or(u16::MAX)));
+        for n in 0..STRANGER_GROUPS {
+            assert!(strangers.spend(group(n), T0));
+        }
+        let past = (STRANGER_GROUPS..STRANGER_GROUPS + 100)
+            .filter(|n| strangers.spend(group(*n), T0))
+            .count();
+        assert_eq!(past, PROBER_QUERIES as usize);
+        assert!(strangers.groups.len() <= STRANGER_GROUPS);
+        // Once the remembered groups have earned their queries back, they are forgotten, and a new
+        // group has an allowance of its own again.
+        let later = T0 + WHOLE_AFTER_MS;
+        let fresh = (0..2 * STRANGER_GROUPS)
+            .filter(|n| strangers.spend(group(STRANGER_GROUPS + 100 + n % 7), later))
+            .count();
+        assert_eq!(fresh, 7 * PROBER_QUERIES as usize);
     }
 
     #[test]
@@ -1557,6 +1683,7 @@ mod tests {
                     key,
                     source: *source,
                     loopback: false,
+                    address: Some(std::net::IpAddr::from([192, 0, 2, 1])),
                 };
                 !hub.network()
                     .handle(
@@ -1564,6 +1691,7 @@ mod tests {
                         &asker,
                         Record::DeliveryQuery(query(&feeder, 1, 0, 3)),
                         T0,
+                        None,
                     )
                     .is_empty()
             })

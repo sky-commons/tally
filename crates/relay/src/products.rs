@@ -46,8 +46,10 @@
 //! `budget::Store::Records`. An epoch whose products would pass the first is refused whole,
 //! counted; a record past the second is refused, counted (`records_refused`), and however many
 //! come, no epoch is refused for them. The second is cut by who hands a record in (`From`): this
-//! relay's own MLAT output keeps a part no peer's record may take, and each peer's records fill a
-//! part of their own, so which records are taken follows who sent them, never which came first.
+//! relay's own MLAT output keeps a part no peer's record may take, and each session that hands
+//! records in fills a part of its own (the peers' part divided by the sessions open, never by the
+//! keys that signed what they send), so which records are taken follows who sent them, never
+//! which came first.
 //!
 //! # The regional product
 //!
@@ -99,7 +101,7 @@
 use std::collections::hash_map::RandomState;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::hash::{BuildHasher, Hasher};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender, SyncSender, TrySendError, channel, sync_channel};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::thread::JoinHandle;
@@ -297,45 +299,48 @@ struct Outbox {
 }
 
 /// Who a record handed the products is charged to (`Store::Records`): this relay's own output (its
-/// MLAT's positions and models, signed with its key), or a peer, by the key answerable for it: the
-/// session's that handed it in (a peer's world or regional record), or for what the hub forwards
-/// only once by its hash (positions and clock models, `hub::Forwarded`) the key that signed it, so
-/// nobody spends another's part by sending its records again.
+/// MLAT's positions and models, signed with its key, whoever hands them back), or the session that
+/// handed it in, by the hub's id of its connection (`network::Asker::source`; the relay's own
+/// rebuilding from parity is `hub::RELAY_ITSELF`, one session like any other). Never the key that
+/// signed it: a key is free, so a session forwarding records signed by many keys would take as
+/// many parts; a session is what a peer is admitted as, and it has one part however many keys
+/// sign what it sends.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum From {
     Own,
-    Peer(PublicKey),
+    Peer(u64),
 }
 
 /// The parts of the records' share (`Store::Records`): every peer's records together may hold all
-/// but [`OWN_PART`] of it, which is this relay's own output's alone; one peer's at most a
-/// [`PEER_PARTS`]th of what the peers may. So what is taken is decided by who sent it, never by
-/// which came first: a peer flooding records is refused in its own part, the other peers keep
-/// theirs, and this relay's own positions are never refused for any peer's.
+/// but [`OWN_PART`] of it, which is this relay's own output's alone; each session that may hand
+/// records in (`Products::joined`, or one that has handed one) at most the peers' part divided by
+/// how many such sessions are open now. So what is taken is decided by who sent it, never by which
+/// came first: a session flooding records is refused in its own part, every other session keeps
+/// its own, however many sessions there are, and this relay's own positions are never refused for
+/// any peer's.
 struct RecordsRoom {
     store: Arc<Gauge>,
     peers: Arc<Gauge>,
-    /// Each peer's part while it holds anything (its charges hold the gauge; a part nobody holds
-    /// is gone, and made afresh at its next record).
-    parts: HashMap<PublicKey, std::sync::Weak<Gauge>>,
-    /// How many parts were kept when the dead ones were last let go: they are let go again once
-    /// there are twice as many, so the map is never scanned a record.
-    swept_at: usize,
+    /// Each session open that may hand records in, with what its records hold now; a session's
+    /// part goes when it leaves (`Products::left`), and the parts of those open divide the peers'.
+    sessions: HashMap<u64, Arc<AtomicUsize>>,
+    /// How many there are: what each part's bound divides the peers' part by, read by a charge
+    /// as it grows.
+    open: Arc<AtomicUsize>,
 }
 
 /// The records' share this relay's own output keeps from every peer: a quarter.
 const OWN_PART: usize = 4;
-/// The parts the peers' records are cut into, at most one a peer.
-pub const PEER_PARTS: usize = 8;
 
 /// What every peer's records together may hold of a records' share of `limit` bytes.
 pub fn peers_part(limit: usize) -> usize {
     limit - limit / OWN_PART
 }
 
-/// What one peer's records may hold of the peers' part of `limit` bytes.
-pub fn peer_part(limit: usize) -> usize {
-    limit / PEER_PARTS
+/// What one session's records may hold of the peers' part of `limit` bytes, with `open` sessions
+/// that may hand records in open.
+pub fn session_part(limit: usize, open: usize) -> usize {
+    limit / open.max(1)
 }
 
 impl RecordsRoom {
@@ -343,13 +348,37 @@ impl RecordsRoom {
         Self {
             peers: store.share(peers_part),
             store,
-            parts: HashMap::new(),
-            swept_at: 0,
+            sessions: HashMap::new(),
+            open: Arc::new(AtomicUsize::new(0)),
         }
     }
 
-    /// `bytes` charged to the store, and for a peer's record to the peers' part and its own;
-    /// `None` when any is full.
+    /// Charged to `store` from now on; the sessions open stay open.
+    fn charge_to(&mut self, store: Arc<Gauge>) {
+        self.peers = store.share(peers_part);
+        self.store = store;
+    }
+
+    /// `source`'s part, made if it has none: a session that may hand records in.
+    fn join(&mut self, source: u64) -> Arc<AtomicUsize> {
+        let part = Arc::clone(
+            self.sessions
+                .entry(source)
+                .or_insert_with(|| Arc::new(AtomicUsize::new(0))),
+        );
+        self.open.store(self.sessions.len(), Ordering::Release);
+        part
+    }
+
+    /// `source` left: its part is gone, and the others divide the peers' part without it. What
+    /// its records hold stays charged until they are let go.
+    fn leave(&mut self, source: u64) {
+        self.sessions.remove(&source);
+        self.open.store(self.sessions.len(), Ordering::Release);
+    }
+
+    /// `bytes` charged to the store, and for a peer's record to the peers' part and its
+    /// session's; `None` when any is full.
     fn charge(&mut self, from: From, bytes: usize) -> Option<Held> {
         let mut held = self.empty(from);
         held.grow(bytes).then_some(held)
@@ -357,57 +386,95 @@ impl RecordsRoom {
 
     /// A charge of nothing yet in `from`'s parts, to grow ([`Held::grow`]).
     fn empty(&mut self, from: From) -> Held {
-        let From::Peer(key) = from else {
+        let From::Peer(source) = from else {
             return Held {
                 store: self.store.empty(),
                 peer: None,
             };
         };
-        let part = match self.parts.get(&key).and_then(std::sync::Weak::upgrade) {
-            Some(part) => part,
-            None => {
-                if self.parts.len() >= 2 * self.swept_at.max(PEER_PARTS) {
-                    self.parts.retain(|_, part| part.strong_count() > 0);
-                    self.swept_at = self.parts.len();
-                }
-                let part = self.peers.share(peer_part);
-                self.parts.insert(key, Arc::downgrade(&part));
-                part
-            }
-        };
+        let session = self.join(source);
         Held {
             store: self.store.empty(),
-            peer: Some((self.peers.empty(), part.empty())),
+            peer: Some(SessionHeld {
+                peers: self.peers.empty(),
+                of: Arc::clone(&self.peers),
+                open: Arc::clone(&self.open),
+                session,
+                bytes: 0,
+            }),
         }
     }
 }
 
 /// What a record handed the products holds while it waits, in each part it is charged to
-/// ([`RecordsRoom`]): the store's, and for a peer's the peers' part and its own. It moves with the
-/// record (waiting for the sealer, for a model, to be forwarded) until the record is let go.
+/// ([`RecordsRoom`]): the store's, and for a peer's the peers' part and its session's. It moves
+/// with the record (waiting for the sealer, for a model, to be forwarded) until the record is let
+/// go.
 #[derive(Debug, Default)]
 struct Held {
     store: Charge,
-    peer: Option<(Charge, Charge)>,
+    peer: Option<SessionHeld>,
+}
+
+/// A peer's record's charge to the peers' part and to its session's.
+#[derive(Debug)]
+struct SessionHeld {
+    peers: Charge,
+    /// The peers' part, whose limit the session's bound divides.
+    of: Arc<Gauge>,
+    open: Arc<AtomicUsize>,
+    /// What the session's records hold now.
+    session: Arc<AtomicUsize>,
+    bytes: usize,
+}
+
+impl SessionHeld {
+    /// `bytes` more in the session's part, if they fit under its bound now (the peers' part over
+    /// the sessions open), or if the session holds nothing, so one oversized record is never
+    /// refused forever (as `budget::Gauge` takes one); and in the peers' part.
+    fn try_grow(&mut self, bytes: usize) -> bool {
+        let bound = session_part(self.of.limit(), self.open.load(Ordering::Acquire));
+        let grown = self
+            .session
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |held| {
+                let after = held.checked_add(bytes)?;
+                (after <= bound || held == 0).then_some(after)
+            })
+            .is_ok();
+        if !grown {
+            return false;
+        }
+        if !self.peers.try_grow(bytes) {
+            self.session.fetch_sub(bytes, Ordering::SeqCst);
+            return false;
+        }
+        self.bytes += bytes;
+        true
+    }
+
+    fn shrink_to(&mut self, bytes: usize) {
+        if bytes < self.bytes {
+            self.session.fetch_sub(self.bytes - bytes, Ordering::SeqCst);
+            self.bytes = bytes;
+        }
+        self.peers.shrink_to(bytes);
+    }
+}
+
+impl Drop for SessionHeld {
+    fn drop(&mut self) {
+        self.session.fetch_sub(self.bytes, Ordering::SeqCst);
+    }
 }
 
 impl Held {
     /// `bytes` more in every part it is charged to, or in none.
     fn grow(&mut self, bytes: usize) -> bool {
-        let before = self
-            .peer
-            .as_ref()
-            .map(|(peers, part)| (peers.bytes(), part.bytes()));
-        let peer = self
-            .peer
-            .as_mut()
-            .is_none_or(|(peers, part)| part.try_grow(bytes) && peers.try_grow(bytes));
+        let before = self.peer.as_ref().map(|peer| peer.bytes);
+        let peer = self.peer.as_mut().is_none_or(|peer| peer.try_grow(bytes));
         let grown = peer && self.store.try_grow(bytes);
-        if !grown
-            && let (Some((peers, part)), Some((was_peers, was_part))) = (&mut self.peer, before)
-        {
-            peers.shrink_to(was_peers);
-            part.shrink_to(was_part);
+        if !grown && let (Some(peer), Some(was)) = (&mut self.peer, before) {
+            peer.shrink_to(was);
         }
         grown
     }
@@ -698,7 +765,7 @@ impl Products {
             *held = budget.gauge(Store::Products);
         }
         if let Ok(mut room) = self.shared.room.lock() {
-            *room = RecordsRoom::new(budget.gauge(Store::Records));
+            room.charge_to(budget.gauge(Store::Records));
         }
     }
 
@@ -795,21 +862,39 @@ impl Products {
         }
     }
 
-    /// Who a record the hub forwarded once by its hash is charged to (positions, a clock model):
-    /// this relay when its own key signed it, else the peer whose key did ([`From`]).
-    fn signed_by(&self, signer: Result<PublicKey, WireError>) -> Option<From> {
+    /// Who a record the hub forwarded once by its hash is charged to (positions, a clock model),
+    /// handed in by session `source`: this relay when its own key signed it, else that session,
+    /// whatever key signed it ([`From`]).
+    fn handed_by(&self, source: u64, signer: Result<PublicKey, WireError>) -> Option<From> {
         let signer = signer.ok()?;
         Some(if self.own.get() == Some(&signer) {
             From::Own
         } else {
-            From::Peer(signer)
+            From::Peer(source)
         })
     }
 
-    /// A clock model's manifest (verified): the inputs hash its solutions' input sets are made
-    /// with. Positions waiting for it are taken now.
-    pub fn clock_model(&self, model: &ClockModel, stamp_ms: u64) {
-        let Some(from) = self.signed_by(model.engine()) else {
+    /// Session `source` is open and may hand records in (a relay's, an engine's): it has a part of
+    /// the peers' share from now until it leaves, and every other session's part is divided by
+    /// one more ([`RecordsRoom`]). A session that hands a record in without having joined joins
+    /// then.
+    pub fn joined(&self, source: u64) {
+        if let Ok(mut room) = self.shared.room.lock() {
+            room.join(source);
+        }
+    }
+
+    /// Session `source` closed: its part is gone, and the others are divided by one fewer.
+    pub fn left(&self, source: u64) {
+        if let Ok(mut room) = self.shared.room.lock() {
+            room.leave(source);
+        }
+    }
+
+    /// A clock model's manifest (verified), handed in by session `source`: the inputs hash its
+    /// solutions' input sets are made with. Positions waiting for it are taken now.
+    pub fn clock_model(&self, model: &ClockModel, source: u64, stamp_ms: u64) {
+        let Some(from) = self.handed_by(source, model.engine()) else {
             return;
         };
         let bytes = model.as_bytes().len();
@@ -822,9 +907,10 @@ impl Products {
         );
     }
 
-    /// Final or provisional positions (verified): candidates for the world product.
-    pub fn positions(&self, positions: &Positions, stamp_ms: u64) {
-        let Some(from) = self.signed_by(positions.engine()) else {
+    /// Final or provisional positions (verified), handed in by session `source`: candidates for
+    /// the world product.
+    pub fn positions(&self, positions: &Positions, source: u64, stamp_ms: u64) {
+        let Some(from) = self.handed_by(source, positions.engine()) else {
             return;
         };
         let bytes = positions.as_bytes().len();
@@ -846,7 +932,7 @@ impl Products {
         if let Ok(content) = world.content() {
             let bytes = world_bytes(&content);
             self.record(
-                From::Peer(asker.key),
+                From::Peer(asker.source),
                 stamp_ms,
                 world.hash(),
                 bytes,
@@ -863,7 +949,7 @@ impl Products {
         if let Ok(content) = world.content() {
             let bytes = world_bytes(&content);
             self.record(
-                From::Peer(asker.key),
+                From::Peer(asker.source),
                 stamp_ms,
                 world.hash(),
                 bytes,
@@ -881,7 +967,7 @@ impl Products {
         }
         let bytes = regional.as_bytes().len();
         self.record(
-            From::Peer(asker.key),
+            From::Peer(asker.source),
             stamp_ms,
             regional.hash(),
             bytes,

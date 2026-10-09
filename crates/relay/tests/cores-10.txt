@@ -1,0 +1,24 @@
+# tally-relay check --memory-limit 32G --cores 10 --key k --max-upload 10Gbit/s --memory 24G --max-connections 5024 --max-connections-per-address 5024 --area 801ffffffffffff --area 8027fffffffffff, hosting MLAT
+cores 10
+core-feeders 2874
+feeder-records 8
+general-sessions 5024
+subscriber-sessions 64
+session-records-per-minute 63680
+member-feeders 128
+ingest-threads 2
+message-threads 1
+seal-threads 2
+mlat-threads 4
+# tally-relay check --memory-limit 32G --cores 10 --key k --max-upload 10Gbit/s --memory 24G --max-connections 5024 --max-connections-per-address 5024 --area 801ffffffffffff --area 8027fffffffffff, without MLAT (--no-mlat)
+cores 10
+core-feeders 5188
+feeder-records 8
+general-sessions 5024
+subscriber-sessions 64
+session-records-per-minute 63680
+member-feeders 128
+ingest-threads 3
+message-threads 2
+seal-threads 2
+mlat-threads 0

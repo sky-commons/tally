@@ -28,7 +28,9 @@
 //!   the bytes once a bin is complete, on the whole bin ([`Bin::seal_within`]), so which receiver
 //!   is refused never depends on which owner took what first; one holder of all of it ([`Held`])
 //!   checks on arrival, in the one order it is handed raw. What a holder reserves per receiver to
-//!   never reach either is [`Rates::cost`]. An owner of open raw that is charged for it as it grows
+//!   never reach either is [`Rates::cost`]: its sealed raw at the kept ceiling thinning holds every
+//!   receiver to in every bin ([`KEPT_PER_RECEIVER_BIN`]), so a holder sized for its receivers
+//!   never refuses one of theirs whole at a seal. An owner of open raw that is charged for it as it grows
 //!   ([`Open::add_decoded_taking`], a relay's raw shards, each charging the relay's open raw store)
 //!   is asked for every byte before it is allocated; one refused refuses the batch's raw of the
 //!   bin, its receiver's whole when it already holds some there, counted as the rest are.
@@ -174,6 +176,26 @@ pub const CALIBRATION_SAMPLE: u32 = 16;
 /// What the calibration sample is hashed under.
 const SAMPLE_DOMAIN: &[u8] = b"tally calibration sample";
 
+/// The most observations a second one receiver keeps once its bins are sealed: the kept ceiling,
+/// twice the mean thinning keeps of a receiver at the measured rates (`Rates::MEASURED`,
+/// 150 a second). A holder reserves each receiver's sealed raw at this ceiling ([`Rates::cost`])
+/// and thinning holds every receiver to it in every bin ([`KEPT_PER_RECEIVER_BIN`]), so a holder
+/// sized for its receivers never holds more sealed raw than it reserved and never has to refuse a
+/// receiver's bin whole to fit ([`Bin::seal_within`] refuses only beyond the receivers it was
+/// sized for). Reserved at the mean instead, nothing bounded one receiver's share: a holder whose
+/// receivers kept more than the mean filled its sealed bins and then refused, whole, the
+/// receivers with the most records, which are the best placed (sweep 5, H-b, millions of
+/// observations a run). Twice the mean, because the receivers that keep more than the mean are
+/// those under busy airspace hearing more of the Mode S-only targets thinning keeps (sync is
+/// capped at `SYNC_PER_RECEIVER` a bin whatever the traffic): it doubles what a receiver's sealed
+/// raw reserves, and a receiver keeping more than it loses its highest-hash replies of the bin, the
+/// same ones on every holder, never its sync.
+pub const KEPT_CEILING_PER_S: usize = 300;
+/// Observations one receiver keeps in one sealed bin, at most (`KEPT_CEILING_PER_S` over a bin):
+/// canonical thinning keeps a receiver's records sync, status and the calibration sample first,
+/// then replies, each lowest message hash first, and stops here (`thin`).
+pub const KEPT_PER_RECEIVER_BIN: usize = KEPT_CEILING_PER_S * GRID_MS as usize / 1_000;
+
 /// Whether `address`, heard with ADS-B in `bin`, is in the calibration sample: the first byte of
 /// BLAKE2s-256 over `"tally calibration sample" 0x00`, the address and the bin, big-endian, below
 /// `256 / CALIBRATION_SAMPLE`.
@@ -192,8 +214,10 @@ pub fn sampled(address: u32, bin: i64) -> bool {
 /// candidates (an airborne position with an altitude heard by two or more), each receiver keeps
 /// its `SYNC_PER_RECEIVER` lowest-hash ones; replies of an aircraft heard with ADS-B in the bin
 /// are dropped (it is no MLAT target) unless it is in the calibration sample, whose receptions are
-/// all kept; operational status is kept. Messages nothing keeps are dropped, and the rest
-/// renumbered in their order. What it returns is allocated to its size.
+/// all kept; operational status is kept; and no receiver keeps more than `KEPT_PER_RECEIVER_BIN`
+/// records, sync, status and the sample taken before replies, each lowest hash first. Messages
+/// nothing keeps are dropped, and the rest renumbered in their order. What it returns is allocated
+/// to its size.
 fn thin(
     bin: i64,
     messages: Vec<Message>,
@@ -204,12 +228,22 @@ fn thin(
     let by_message = by_message(messages.len(), &records);
     let mut keep = vec![false; records.len()];
     let mut taken = vec![0usize; receivers];
-    // Messages ascend by hash: the rank.
-    for (message, list) in messages.iter().zip(&by_message) {
+    // Every receiver's records kept so far, held to `KEPT_PER_RECEIVER_BIN`.
+    let mut kept_of = vec![0usize; receivers];
+    let receiver_of = |record: u32| records[record as usize].receiver as usize;
+    // First what places clocks and calibrates (sync, status, the sample), then the replies MLAT
+    // solves; each pass in message rank (messages ascend by hash), so a receiver over its ceiling
+    // loses its highest-hash replies, the same ones on every holder.
+    for (at, (message, list)) in messages.iter().zip(&by_message).enumerate() {
+        every(at, checkpoint);
         let sample = message.address.is_some_and(|address| sampled(address, bin));
         if message.status || sample {
             for record in list {
-                keep[*record as usize] = true;
+                let receiver = receiver_of(*record);
+                if kept_of[receiver] < KEPT_PER_RECEIVER_BIN {
+                    kept_of[receiver] += 1;
+                    keep[*record as usize] = true;
+                }
             }
             continue;
         }
@@ -222,13 +256,23 @@ fn thin(
             if distinct.len() < 2 {
                 continue;
             }
-            let kept: Vec<u32> = list
-                .iter()
-                .copied()
-                .filter(|record| {
-                    taken[records[*record as usize].receiver as usize] < SYNC_PER_RECEIVER
-                })
-                .collect();
+            // Records of one message by one receiver are adjacent (identity order): the room
+            // each would leave its receiver, counted as they are taken.
+            let mut kept: Vec<u32> = Vec::with_capacity(list.len());
+            let mut pending: Option<(usize, usize)> = None;
+            for record in list {
+                let receiver = receiver_of(*record);
+                let already = match pending {
+                    Some((at, count)) if at == receiver => count,
+                    _ => 0,
+                };
+                if taken[receiver] < SYNC_PER_RECEIVER
+                    && kept_of[receiver] + already < KEPT_PER_RECEIVER_BIN
+                {
+                    kept.push(*record);
+                    pending = Some((receiver, already + 1));
+                }
+            }
             let mut by: Vec<u32> = kept
                 .iter()
                 .map(|record| records[*record as usize].receiver)
@@ -241,8 +285,15 @@ fn thin(
                 taken[receiver as usize] += 1;
             }
             for record in kept {
+                kept_of[receiver_of(record)] += 1;
                 keep[record as usize] = true;
             }
+        }
+    }
+    for (at, (message, list)) in messages.iter().zip(&by_message).enumerate() {
+        every(at, checkpoint);
+        let sample = message.address.is_some_and(|address| sampled(address, bin));
+        if message.status || sample || message.sync {
             continue;
         }
         let target = message
@@ -250,7 +301,11 @@ fn thin(
             .is_some_and(|address| !adsb.contains(&address));
         if target {
             for record in list {
-                keep[*record as usize] = true;
+                let receiver = receiver_of(*record);
+                if kept_of[receiver] < KEPT_PER_RECEIVER_BIN {
+                    kept_of[receiver] += 1;
+                    keep[*record as usize] = true;
+                }
             }
         }
     }
@@ -623,12 +678,17 @@ impl Limits {
 pub struct Rates {
     /// Wanted receptions a second (what `wanted` keeps), the mean an admitted receiver sends.
     pub wanted_per_s: usize,
-    /// Of them, what canonical thinning keeps when a bin is sealed.
+    /// Of them, what canonical thinning keeps when a bin is sealed, on average: what is reserved
+    /// is the ceiling every receiver is held to instead ([`KEPT_CEILING_PER_S`]).
     pub kept_per_s: usize,
     /// The most wanted receptions a second one receiver may send: beyond its bin's share, its raw
-    /// of the bin is refused whole.
+    /// of the bin is refused whole. `MEASURED`'s is also the one ceiling a relay paces every
+    /// feeder's receptions at, wanted or not (`tally_relay::ingest::FEEDER_RECEPTIONS_PER_SEC`):
+    /// one constant, so a feeder the relay lets in at its pace is never refused here for its rate.
     pub ceiling_per_s: usize,
 }
+
+const _: () = assert!(Rates::MEASURED.kept_per_s <= KEPT_CEILING_PER_S);
 
 /// Bytes an open reception costs: its record, as allocated.
 pub const OPEN_BYTES_PER_RECEPTION: usize = size_of::<Raw>();
@@ -662,8 +722,9 @@ impl Rates {
     /// its open raw over a bin, its settling and the bins it may open ahead of its stamp
     /// ([`AHEAD_MS`]) at its ceiling (nothing shared bounds raw while its bin is open, only the
     /// receiver's own share, so that is what it may hold), and its thinned raw
-    /// over the bins a holder keeps sealed (`SEALED_BINS_HELD`) at the kept rate (each bin is
-    /// sealed within the holder's bytes, `Bin::seal_within`).
+    /// over the bins a holder keeps sealed (`SEALED_BINS_HELD`) at the kept ceiling every
+    /// receiver is held to in every bin ([`KEPT_CEILING_PER_S`]), never at the mean: so a holder
+    /// sized for its receivers seals every bin of theirs within its bytes and refuses none whole.
     pub fn cost(&self, settle_ms: u64) -> Cost {
         let open_ms = GRID_MS + settle_ms + AHEAD_MS;
         let open_bins = open_ms.div_ceil(GRID_MS) as usize + 1;
@@ -671,7 +732,8 @@ impl Rates {
         Cost {
             open: (self.ceiling_per_s as u64 * open_ms / 1_000) as usize * OPEN_BYTES_PER_RECEPTION
                 + open_bins * OPEN_BYTES_PER_RECEIVER_BIN,
-            sealed: (self.kept_per_s as u64 * sealed_ms / 1_000) as usize * SEALED_BYTES_PER_RECORD,
+            sealed: (KEPT_CEILING_PER_S as u64 * sealed_ms / 1_000) as usize
+                * SEALED_BYTES_PER_RECORD,
         }
     }
 }
@@ -1031,6 +1093,23 @@ fn on_threads<I: Send, R: Send>(inputs: Vec<I>, work: impl Fn(I) -> R + Sync) ->
     crate::gate::on_threads(inputs, work)
 }
 
+/// Between two items of a seal's work (`crate::gate::checkpoint`): background work lets a waiting
+/// provisional step in.
+fn checkpoint() {
+    crate::gate::checkpoint();
+}
+
+/// Items of a seal's cheapest passes (a message's thinning or its index, a record's hash) between
+/// two checkpoints: a few hundred microseconds of work at most.
+const ITEMS_PER_CHECKPOINT: usize = 1_024;
+
+/// `checkpoint` before every `ITEMS_PER_CHECKPOINT`th item, `at` the item's place in its pass.
+fn every(at: usize, checkpoint: fn()) {
+    if at.is_multiple_of(ITEMS_PER_CHECKPOINT) {
+        checkpoint();
+    }
+}
+
 /// Splits `items` into owned runs at `runs`' boundaries.
 fn split_owned<T>(items: Vec<T>, runs: &[std::ops::Range<usize>]) -> Vec<Vec<T>> {
     let mut out = Vec::with_capacity(runs.len());
@@ -1095,6 +1174,7 @@ impl Bin {
         let sorted: Vec<Vec<Vec<Raw>>> = on_threads(split_owned(lists, &cut), |run| {
             run.into_iter()
                 .map(|(_, chunks)| {
+                    checkpoint();
                     let mut raws: Vec<Raw> =
                         Vec::with_capacity(chunks.iter().map(|raws| raws.len).sum());
                     for list in chunks {
@@ -1114,6 +1194,7 @@ impl Bin {
         let gathered: Vec<Vec<Vec<MessageKey>>> = on_threads(sorted.iter().collect(), |run| {
             let mut by_part: Vec<Vec<MessageKey>> = vec![Vec::new(); parts];
             for raws in run {
+                checkpoint();
                 for raw in raws {
                     let key = raw.message();
                     by_part[key.part(parts)].push(key);
@@ -1135,7 +1216,14 @@ impl Bin {
             let mut keys: Vec<MessageKey> = lists.into_iter().flatten().collect();
             keys.sort_unstable();
             keys.dedup();
-            let messages = keys.iter().map(|key| Message::of(key.bytes())).collect();
+            let messages = keys
+                .iter()
+                .enumerate()
+                .map(|(at, key)| {
+                    every(at, checkpoint);
+                    Message::of(key.bytes())
+                })
+                .collect();
             (keys, messages)
         });
         let mut order: Vec<([u8; 32], u32, u32)> = made
@@ -1183,6 +1271,7 @@ impl Bin {
             on_threads(slices, |(first, run, slice)| {
                 let mut at = 0;
                 for (offset, raws) in run.into_iter().enumerate() {
+                    checkpoint();
                     let out = &mut slice[at..at + raws.len()];
                     for (record, raw) in out.iter_mut().zip(&raws) {
                         let key = raw.message();
@@ -1226,6 +1315,7 @@ impl Bin {
         let mut sync_active = vec![false; receivers.len()];
         let mut status: BTreeMap<u32, Vec<(u32, Vec<u32>)>> = BTreeMap::new();
         for (message, list) in by_message.into_iter().enumerate() {
+            every(message, checkpoint);
             let entry = &messages[message];
             let Some(address) = entry.address else {
                 continue;
@@ -1310,17 +1400,17 @@ impl Bin {
             });
             let per_record = cost.div_ceil(sealed.records.len()).max(1);
             let excess = cost - room;
-            let mut skip = BTreeSet::new();
+            let mut skip = vec![false; sealed.receivers.len()];
             let mut freed = 0;
             for receiver in order {
                 if freed >= excess {
                     break;
                 }
-                skip.insert(receiver);
+                skip[receiver as usize] = true;
                 freed += counts[receiver as usize] * per_record;
                 refused += counts[receiver as usize];
             }
-            let fragment = sealed.reopen_without_any(|index| skip.contains(&index));
+            let fragment = sealed.reopen_without(&skip);
             sealed = Self::seal_from(bin, vec![fragment], threads);
         }
     }
@@ -1423,12 +1513,25 @@ impl Bin {
         self.find(id).is_some()
     }
 
-    /// This bin's raw, open again without the receivers (by index) `skip` names: what forgetting
+    /// Which of this bin's receivers (by index) `keys` names: a mask its records are tested against
+    /// by index, so a pass over every record costs one lookup a record however many receivers
+    /// leave (sweep 5, R6: a list searched per record was quadratic in the receivers leaving).
+    fn mask(&self, keys: &[PublicKey]) -> Vec<bool> {
+        let mut skip = vec![false; self.receivers.len()];
+        for key in keys {
+            if let Some(at) = self.receiver(key) {
+                skip[at as usize] = true;
+            }
+        }
+        skip
+    }
+
+    /// This bin's raw, open again without the receivers (by index) `skip` marks: what forgetting
     /// receivers reseals.
-    fn reopen_without_any(&self, skip: impl Fn(u32) -> bool) -> Fragment {
+    fn reopen_without(&self, skip: &[bool]) -> Fragment {
         let mut fragment = Fragment::new(self.bin);
         for record in &self.records {
-            if skip(record.receiver) {
+            if skip.get(record.receiver as usize).copied().unwrap_or(false) {
                 continue;
             }
             let slot = fragment.slot(self.receivers[record.receiver as usize]);
@@ -1558,6 +1661,15 @@ impl SealedBins {
         }
     }
 
+    /// Forgets the bin numbered `bin`, if it is held: the records let go.
+    pub fn forget(&self, bin: i64) -> usize {
+        let old = self.write().remove(&bin);
+        old.map_or(0, |old| {
+            self.let_go(&old);
+            old.records.len()
+        })
+    }
+
     /// Forgets every bin.
     pub fn clear(&self) {
         self.forget_before(i64::MAX);
@@ -1574,40 +1686,84 @@ impl SealedBins {
     }
 
     /// Forgets every one of `receivers` in every sealed bin (they left, or became unusable): each
-    /// bin that held any of them is sealed again once, without all of them (`without`), and
-    /// replaces the old one, so a reader sees one bin or the other, never none. Rare, and costs a
-    /// seal of each bin it touches, however many receivers left at once.
+    /// bin that held any of them is sealed again once, without all of them, and replaces the old
+    /// one before the next is built (`without_each`), so a reader sees one bin or the other, never
+    /// none, and at most one bin is held twice at once. Rare, and costs a seal of each bin it
+    /// touches, however many receivers left at once.
     pub fn forget_receivers(&self, receivers: &[PublicKey], threads: usize) {
-        for bin in self.without(receivers, threads) {
-            self.insert(bin);
-        }
+        self.without_each(
+            receivers,
+            threads,
+            |_| Some(()),
+            |resealed| match resealed {
+                Resealed::Bin(bin, ()) => self.insert(*bin),
+                Resealed::Refused { .. } => unreachable!("nothing refuses"),
+            },
+        );
     }
 
-    /// Each sealed bin that holds any of `receivers`, sealed again once without all of them, on up
-    /// to `threads` threads: for a holder that forgets them off its own thread and replaces the
-    /// bins on it (`insert`). Each is no larger than the bin it replaces.
-    pub fn without(&self, receivers: &[PublicKey], threads: usize) -> Vec<Bin> {
+    /// Each sealed bin that holds any of `receivers`, in ascending order, sealed again without
+    /// all of them on up to `threads` threads, one bin at a time, each charged before it is built
+    /// (sweep 5, N2): `charge` is asked for the bytes the bin about to be built may take
+    /// ([`SealedBins::cost`] of the bin it replaces: a bin sealed without some of its receivers is
+    /// never larger), and what it grants (`G`, a charge its holder lets go of once the new bin is
+    /// held in place of the old one and the holder's own charge for its sealed bins is settled) is
+    /// handed to `each` with the bin, before the next is asked for. A charge refused builds
+    /// nothing: `each` is told the bin's number and records, for its holder to forget it whole
+    /// (what a receiver that left held is never kept for want of room to drop it). So the
+    /// re-sealing holds at most one bin beyond the sealed bins at once, and that one charged;
+    /// before, every re-sealed bin was built before any was held or charged, and a receiver
+    /// leaving briefly doubled the sealed raw outside the budget. The bins are looked up one at a
+    /// time, so none the holder has let go of meanwhile is held here past its turn.
+    pub fn without_each<G>(
+        &self,
+        receivers: &[PublicKey],
+        threads: usize,
+        mut charge: impl FnMut(usize) -> Option<G>,
+        mut each: impl FnMut(Resealed<G>),
+    ) {
         if receivers.is_empty() {
-            return Vec::new();
+            return;
         }
-        let holding: Vec<Arc<Bin>> = self
+        let numbers: Vec<i64> = self
             .read()
             .values()
             .filter(|bin| receivers.iter().any(|key| bin.receiver(key).is_some()))
-            .cloned()
+            .map(|bin| bin.bin)
             .collect();
-        holding
-            .into_iter()
-            .map(|old| {
-                let skip: Vec<u32> = receivers
-                    .iter()
-                    .filter_map(|key| old.receiver(key))
-                    .collect();
-                let fragment = old.reopen_without_any(|index| skip.contains(&index));
-                Bin::seal_from(old.bin, vec![fragment], threads)
-            })
-            .collect()
+        for number in numbers {
+            let Some(old) = self.get(number) else {
+                continue;
+            };
+            let skip = old.mask(receivers);
+            if !skip.contains(&true) {
+                continue;
+            }
+            let Some(granted) = charge(SealedBins::cost(&old)) else {
+                each(Resealed::Refused {
+                    bin: number,
+                    records: old.records.len(),
+                });
+                continue;
+            };
+            let fragment = old.reopen_without(&skip);
+            drop(old);
+            let bin = Bin::seal_from(number, vec![fragment], threads);
+            each(Resealed::Bin(Box::new(bin), granted));
+        }
     }
+}
+
+/// One sealed bin [`SealedBins::without_each`] was asked to seal again.
+#[derive(Debug)]
+pub enum Resealed<G> {
+    /// Sealed again without the receivers, with the charge granted for it before it was built:
+    /// for its holder to put in place of the old one ([`SealedBins::insert`]), settle its own
+    /// charge for its sealed bins, then let this one go.
+    Bin(Box<Bin>, G),
+    /// The charge was refused, so nothing was built: the bin, and the records it holds, for its
+    /// holder to forget whole and count.
+    Refused { bin: i64, records: usize },
 }
 
 impl HoldsBins for SealedBins {

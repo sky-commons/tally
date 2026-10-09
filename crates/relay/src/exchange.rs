@@ -202,10 +202,12 @@ impl Slice {
     }
 
     /// This slice's share of its batch's bytes (`Decoded::footprint`), by the receptions it
-    /// carries: a batch's slices together are charged the batch once.
+    /// carries, rounded up: a batch's slices together are charged the batch once, and never a
+    /// byte less (N14 of sweep 5: rounded down, a batch cut in `n` slices was charged up to `n - 1`
+    /// bytes below what it holds, which a check by the byte sees).
     pub fn share(&self) -> usize {
         let all = self.decoded.observations().len().max(1);
-        self.decoded.footprint() * self.receptions() / all
+        (self.decoded.footprint() * self.receptions()).div_ceil(all)
     }
 }
 
@@ -462,8 +464,6 @@ pub struct Frozen {
     /// The epoch was refused whole here (its bytes would have passed the budget): it carries
     /// nothing, and the sealer refuses the epoch.
     pub refused: bool,
-    /// What its batches are charged (`Store::Epochs`), released when the sealer lets them go.
-    pub charge: Charge,
     /// Every epoch before this is closed on this thread.
     pub closed_before: Epoch,
     /// Receptions that arrived for an epoch this thread had already closed, since its last word:
@@ -472,6 +472,44 @@ pub struct Frozen {
     pub batches: Vec<Arc<Decoded>>,
     pub stream: Vec<(u32, u32)>,
     pub regional: Vec<(Region, u32, u32)>,
+    /// What its batches are charged (`Store::Epochs`), released when the sealer lets them go.
+    /// Declared after `batches`, so a word dropped lets its decodes go before their charge (Rust
+    /// drops a struct's fields in order): never a decode alive past what it is charged. Words held
+    /// together (one epoch's parts) are let go together, every part's batches first ([`Parts`]).
+    pub charge: Charge,
+}
+
+/// One epoch's parts held together, gathered across message threads (`Settling`, and the sealer's
+/// `seal::Coordinator`): a batch cut into several threads' slices is in several parts, each charged
+/// its slices' share, so letting the parts go one by one (each its batches, then its charge) would
+/// leave such a decode alive, charged for less than it holds, between the first part's charge and
+/// the last part's batches. Let go, every part's batches go before any part's charge. Before, the
+/// flood check sampled twice before it called a short decode a holder, to step over that moment.
+#[derive(Debug, Default)]
+pub struct Parts(Vec<Frozen>);
+
+impl Parts {
+    pub fn push(&mut self, part: Frozen) {
+        self.0.push(part);
+    }
+
+    pub fn iter(&self) -> std::slice::Iter<'_, Frozen> {
+        self.0.iter()
+    }
+
+    /// The parts, for a holder that takes each one's batches and charge on together (`settle`,
+    /// `seal::merge`), and so lets nothing go between them.
+    pub fn into_vec(mut self) -> Vec<Frozen> {
+        std::mem::take(&mut self.0)
+    }
+}
+
+impl Drop for Parts {
+    fn drop(&mut self) {
+        for part in &mut self.0 {
+            part.batches.clear();
+        }
+    }
 }
 
 /// What one reception may cost an epoch's word beside its batch's decode, at most: its place in
@@ -547,7 +585,7 @@ struct Ledger {
 
 #[derive(Default)]
 struct Settling {
-    parts: Vec<Frozen>,
+    parts: Parts,
     refused: bool,
     /// The threads that decided a part of it and keep it only if it is admitted.
     awaiting: Vec<usize>,
@@ -725,16 +763,19 @@ fn settle(epoch: Epoch, settling: Settling, ledger: &mut Ledger) -> Frozen {
     };
     ledger.parts += 1;
     let mut admitted = !settling.refused;
+    // A part's charge the word could not take: let go only once every batch is (`Parts`).
+    let mut kept_back = Vec::new();
+    let parts = settling.parts.into_vec();
     if admitted {
         // Each list exactly as long as its parts' together: within what the parts were charged
         // for theirs, which the word takes on.
         word.batches
-            .reserve_exact(settling.parts.iter().map(|part| part.batches.len()).sum());
+            .reserve_exact(parts.iter().map(|part| part.batches.len()).sum());
         word.stream
-            .reserve_exact(settling.parts.iter().map(|part| part.stream.len()).sum());
+            .reserve_exact(parts.iter().map(|part| part.stream.len()).sum());
         word.regional
-            .reserve_exact(settling.parts.iter().map(|part| part.regional.len()).sum());
-        for mut part in settling.parts {
+            .reserve_exact(parts.iter().map(|part| part.regional.len()).sum());
+        for mut part in parts {
             let at = word.batches.len() as u32;
             word.stream.extend(
                 part.stream
@@ -749,14 +790,14 @@ fn settle(epoch: Epoch, settling: Settling, ledger: &mut Ledger) -> Frozen {
             word.batches.append(&mut part.batches);
             // Every part is charged to the one `Store::Epochs`: a charge on another could not be
             // handed on with the word, so the epoch is refused rather than held uncharged.
-            if word
-                .charge
-                .absorb(std::mem::take(&mut part.charge))
-                .is_err()
-            {
+            if let Err(charge) = word.charge.absorb(std::mem::take(&mut part.charge)) {
+                kept_back.push(charge);
                 admitted = false;
             }
         }
+    } else {
+        // Refused: every part's batches go before any part's charge (`Parts`).
+        drop(Parts(parts));
     }
     if !admitted {
         word = Frozen {
@@ -768,6 +809,8 @@ fn settle(epoch: Epoch, settling: Settling, ledger: &mut Ledger) -> Frozen {
         word.regional = Vec::new();
         word.charge = Charge::none();
     }
+    // Every batch let go is gone by now: the charges the word could not take go after them.
+    drop(kept_back);
     for thread in settling.awaiting {
         if let Some(verdict) = ledger.verdicts.get_mut(thread) {
             *verdict = Some((epoch, admitted));
@@ -843,7 +886,7 @@ impl MessageThread {
                     refused: false,
                 });
                 if open.refused {
-                    self.held.let_go(&slice, in_flight);
+                    self.held.let_go(slice, in_flight);
                     return;
                 }
                 if open.charge.try_grow(slice.share()) {
@@ -854,7 +897,7 @@ impl MessageThread {
                 } else {
                     // Past the budget: the whole epoch is refused, never a part of it.
                     open.refuse(&mut self.held);
-                    self.held.let_go(&slice, in_flight);
+                    self.held.let_go(slice, in_flight);
                 }
             }
             Envelope::Tick(stamp) => {
@@ -1041,11 +1084,10 @@ impl Open {
     fn refuse(&mut self, held: &mut Held) {
         self.refused = true;
         for slice in std::mem::take(&mut self.slices) {
-            // Its share covers its own decode, not every decode the epoch held.
-            let mut share = self.charge.split(slice.share());
-            share.uncover();
-            share.cover(&slice.decoded);
-            held.keep(&slice, Some(share), None);
+            // Its share covers its own decode, not every decode the epoch held: one cover a slice,
+            // never a copy of the epoch's (N5).
+            let share = self.charge.split_covering(slice.share(), &slice.decoded);
+            held.keep(slice, Some(share), None);
         }
         self.charge.shrink_to(0);
         // It holds no decode now: a refused epoch stays open, holding nothing, until it closes.
@@ -1061,6 +1103,9 @@ struct Held {
     parts: Vec<HeldPart>,
 }
 
+/// A slice's charge kept while anything else holds its decode, by a weak hold: two threads' parts
+/// of one decode must not keep each other. A cover whose decode is gone counts for nothing
+/// (`budget::Covered::gone`), so what lingers here until the next sweep is never counted.
 #[derive(Debug)]
 struct HeldPart {
     decoded: std::sync::Weak<Decoded>,
@@ -1070,19 +1115,24 @@ struct HeldPart {
 
 impl Held {
     /// `slice` let go, with what it was charged: kept while something else holds its decode,
-    /// dropped now otherwise.
-    fn keep(&mut self, slice: &Slice, share: Option<Charge>, in_flight: Option<InFlight>) {
+    /// dropped now otherwise, the slice first: its decode is never alive past its charge, even
+    /// for the instant between the two. Taken by value so no caller holds the slice on past it.
+    fn keep(&mut self, slice: Slice, share: Option<Charge>, in_flight: Option<InFlight>) {
         if Arc::strong_count(&slice.decoded) > 1 {
             self.parts.push(HeldPart {
                 decoded: Arc::downgrade(&slice.decoded),
                 _share: share,
                 _in_flight: in_flight,
             });
+            drop(slice);
+        } else {
+            drop(slice);
+            drop((share, in_flight));
         }
     }
 
     /// A slice let go (its epoch refused here), with its ingest charge.
-    fn let_go(&mut self, slice: &Slice, in_flight: InFlight) {
+    fn let_go(&mut self, slice: Slice, in_flight: InFlight) {
         self.keep(slice, None, Some(in_flight));
     }
 
@@ -1182,7 +1232,7 @@ impl MessageExchange {
             } else {
                 slice.share()
             };
-            let charge = in_flight.split(share);
+            let charge = in_flight.split(share, decoded);
             self.send(producer, thread, Envelope::Slice(slice, charge));
         }
     }
@@ -1477,6 +1527,60 @@ mod tests {
                     .collect();
                 (word.refused, kept)
             }))
+    }
+
+    /// N5: an epoch refused whole hands each slice's share on covering that slice's decode and
+    /// no other, and no split along the way copies the epoch's covers: a part split off a charge
+    /// covering many decodes covers none of them until it is split with one. Before, every split
+    /// cloned every cover of the epoch's charge, a lock a cover, so refusing an epoch of `n`
+    /// slices took `n²` of them on the message thread.
+    #[test]
+    fn a_refused_epochs_shares_each_cover_their_own_decode_and_copy_no_other() -> Result<(), String>
+    {
+        let covered = crate::budget::Covered::process();
+        let decodes = (0..4u64)
+            .map(|at| decoded(20, 0, at))
+            .collect::<Result<Vec<_>, String>>()?;
+        let epochs = Gauge::unlimited(Store::Epochs);
+        let mut charge = epochs.empty();
+        for decode in &decodes {
+            assert!(charge.try_grow(decode.footprint()));
+            charge.cover(decode);
+        }
+        // A plain split moves bytes and copies no cover.
+        let part = charge.split(10);
+        assert!(decodes.iter().all(|decode| covered.covers_of(decode) == 1));
+        // Split with a decode, the part covers that one alone.
+        let with_first = charge.split_covering(10, &decodes[0]);
+        assert_eq!(covered.covers_of(&decodes[0]), 2);
+        assert!(
+            decodes[1..]
+                .iter()
+                .all(|decode| covered.covers_of(decode) == 1)
+        );
+        drop((part, with_first));
+        // Refused whole: each kept share covers its own decode, the epoch's charge none.
+        let mut open = Open {
+            slices: decodes
+                .iter()
+                .map(|decode| Slice {
+                    decoded: Arc::clone(decode),
+                    ranges: std::iter::once(0..20).collect(),
+                    area: None,
+                })
+                .collect(),
+            charge,
+            refused: false,
+        };
+        let mut held = Held::default();
+        open.refuse(&mut held);
+        assert!(open.refused);
+        assert_eq!(open.charge.bytes(), 0);
+        assert!(decodes.iter().all(|decode| covered.covers_of(decode) == 1));
+        assert_eq!(held.parts.len(), decodes.len());
+        drop(held);
+        assert!(decodes.iter().all(|decode| covered.covers_of(decode) == 0));
+        Ok(())
     }
 
     /// RFC-0181 §10, invariant 7: an epoch refused on one message thread is refused on every

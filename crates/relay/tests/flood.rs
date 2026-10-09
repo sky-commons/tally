@@ -2,8 +2,9 @@
 //! its memory stays within its budget. Four times the feeders its budget admits connect together;
 //! exactly the ceiling is admitted at Hello and the rest are turned away, and those admitted send
 //! batches of distinct receptions as fast as their ingest ceiling lets them while a subscriber
-//! never reads. Throughout, every decoded batch alive is covered by a charge of the store holding
-//! it (`budget::Covered`, each decode once however many hold it), read at the same instant, and the
+//! never reads. Throughout, in every sample, every decoded batch alive is covered by a charge of the
+//! store holding it (`budget::Covered`, each decode once however many hold it), the charges covering
+//! each holding no less for it together than its footprint (`Covered::short`), and the
 //! batch byte store and the delivery tags hold no more than they are charged. No gauge's charge can
 //! pass its limit (`budget::Gauge`, its own tests) and the limits together are the budget
 //! (`budget`'s tests), so what this watches for is the one way past the budget: bytes held that no
@@ -22,7 +23,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use tally_relay::budget::Store;
+use tally_relay::budget::{Covered, Store};
 use tally_relay::fanout::{Fell, Filter};
 use tally_relay::hub::{Hub, Inbound, Origin};
 use tally_relay::ingest::{Stamp, Threads};
@@ -67,9 +68,12 @@ fn text(error: impl std::fmt::Display) -> String {
 /// The feeders the budget admits, and how many times that connect.
 const CEILING: usize = 16;
 const OFFERED: usize = 4 * CEILING;
-/// Receptions a batch, each distinct: about 20 KB signed, so a feeder's ceiling (256 KiB/s with
-/// its burst) is a dozen batches a second.
-const RECEPTIONS: u32 = 600;
+/// Receptions a batch, each distinct and long: about 20 KB signed, so a feeder's byte ceiling (256
+/// KiB/s with its burst) is a dozen batches a second, and its receptions a second
+/// (`ingest::FEEDER_RECEPTIONS_PER_SEC`, 1,800) hold it to no fewer: the flood is the bytes'.
+const RECEPTIONS: u32 = 100;
+/// Bytes of each reception's message.
+const MESSAGE_BYTES: usize = 190;
 /// How long the admitted feeders flood.
 const FLOOD: Duration = Duration::from_secs(8);
 
@@ -93,6 +97,7 @@ fn busy_batch(receiver: &Identity, sequence: u64) -> Result<Batch> {
                         &sequence.to_be_bytes()[..],
                         &n.to_be_bytes(),
                         &receiver.public().as_bytes()[..2],
+                        &[0x5a; MESSAGE_BYTES - 14],
                     ]
                     .concat(),
                 })
@@ -113,23 +118,27 @@ async fn connect(
         .map_err(text)
 }
 
-/// How long a holder must be seen uncharged, in every sample, before it is one: a hand-off
-/// releases its charge a moment before it drops what it held, and a sample may fall between. A
-/// holder that keeps anything (a queue, a cache) is seen in every sample while it holds it.
-const UNCHARGED_FOR: Duration = Duration::from_millis(100);
+/// How long the watch goes on sampling once the relay has stopped, stalled or closed: what it
+/// holds then is watched as it lets go.
+const SAMPLE_AFTER: Duration = Duration::from_millis(200);
 /// How often the watch samples while the relay runs.
 const SAMPLE_EVERY: Duration = Duration::from_millis(20);
 
 /// Every decoded batch alive is covered by a charge of the store holding it, read at the same
 /// instant (`Budget::decoded_held`), to the batch: no allowance carved and idle, and no decode two
-/// stores charge, stands in for one nobody does. And the batch byte store and the delivery tags
-/// hold no more than their gauges are charged. A store whose own charge cannot pass its limit by
-/// construction (`Gauge::take`) holds the relay to its budget only if nothing holds bytes it was
-/// not charged: that is what this watches for.
+/// stores charge, stands in for one nobody does; and the charges covering each hold its footprint
+/// at least, together (`Covered::short_decodes`), to the byte, so a charge of a byte covering a
+/// batch is a batch held uncharged (N14 of sweep 5; before, only a cover's presence was checked).
+/// One sample decides: every holder lets a decode go before, or with, its charge (an epoch's parts
+/// together, `exchange::Parts`; a slice let go, `exchange::Held`; a subscriber's item, its own
+/// claim on the charge, `fanout::Taken`), so a decode is never short or uncovered even for the
+/// moment a holder lets go, and the watch needs no window. Before, it called a decode held only
+/// once two samples running saw it, to step over that moment, and before that after 100 ms. And
+/// the batch byte store and the delivery tags hold no more than their gauges are charged. A store
+/// whose own charge cannot pass its limit by construction (`Gauge::take`) holds the relay to its
+/// budget only if nothing holds bytes it was not charged: that is what this watches for.
 #[derive(Default)]
 struct Watch {
-    /// Since when every sample has seen something uncharged.
-    since: Option<Instant>,
     most_live: usize,
 }
 
@@ -139,6 +148,7 @@ impl Watch {
         let budget = hub.budget();
         let decoded = budget.decoded_held();
         self.most_live = self.most_live.max(decoded.live);
+        // Counted: decodes alive no charge covers, and stores holding past their charge.
         let mut uncharged = Vec::new();
         if decoded.uncharged_batches() > 0 || decoded.uncharged() > 0 {
             let stores: Vec<String> = Store::ALL
@@ -164,23 +174,25 @@ impl Watch {
                 uncharged.push(format!("{store:?} holds {held} bytes, charged {charged}"));
             }
         }
-        if uncharged.is_empty() {
-            self.since = None;
-            return Ok(());
-        }
-        let since = *self.since.get_or_insert_with(Instant::now);
-        if since.elapsed() >= UNCHARGED_FOR {
-            return Err(format!(
-                "uncharged in every sample for {:?}: {}",
-                since.elapsed(),
-                uncharged.join("; ")
+        // By the decode: covered for less than its footprint.
+        let short = Covered::process().short_decodes();
+        if !short.is_empty() {
+            uncharged.push(format!(
+                "{} decoded batches covered for {} bytes less than their footprints \
+                 ({decoded:?})",
+                short.len(),
+                short.iter().map(|(_, bytes)| bytes).sum::<usize>()
             ));
         }
-        Ok(())
+        if uncharged.is_empty() {
+            return Ok(());
+        }
+        Err(format!("uncharged: {}", uncharged.join("; ")))
     }
 }
 
-/// The watch sees a holder no gauge charges, of one batch: a batch decoded here and kept, beside
+/// The watch sees a holder no gauge charges, of one batch, in one sample, and one a charge of a
+/// byte covers (N14): a batch decoded here and kept, beside
 /// the relay in the middle of its flood, every connection's allowance carved and the stores
 /// holding megabytes. Before, the watch compared the
 /// decodes alive with what the stores holding them were charged, which counts every allowance
@@ -192,16 +204,26 @@ async fn assert_watch_sees_one_leaked_batch(hub: &Hub) -> Result {
     let kept =
         tally_wire::Decoded::from_verified(batch, 0, 0).map_err(|error| error.error.to_string())?;
     let mut watch = Watch::default();
-    let mut seen = None;
-    let started = Instant::now();
-    while seen.is_none() && started.elapsed() < 10 * UNCHARGED_FOR {
-        seen = watch.sample(hub).err();
-        tokio::time::sleep(SAMPLE_EVERY).await;
-    }
+    // Covered by nothing: seen in the one sample.
+    let uncovered = watch.sample(hub).err();
+    let mut watch = Watch::default();
+    // Covered by a charge of one byte (N14): present, and still a batch held uncharged.
+    let mut token = hub
+        .budget()
+        // The peers' records' share: nothing of this flood's is in it.
+        .gauge(Store::Records)
+        .try_charge(1)
+        .ok_or("no byte of room for the token charge")?;
+    token.cover(&kept);
+    let short = watch.sample(hub).err();
+    drop(token);
     drop(kept);
-    match seen {
-        Some(_) => Ok(()),
-        None => Err("one decoded batch no store charged went unseen".to_owned()),
+    match (uncovered, short) {
+        (Some(_), Some(short)) if short.contains("less than their footprints") => Ok(()),
+        (None, _) => Err("one decoded batch no store charged went unseen".to_owned()),
+        (_, short) => Err(format!(
+            "one decoded batch covered by a charge of a byte went unseen: {short:?}"
+        )),
     }
 }
 
@@ -323,7 +345,7 @@ async fn memory_stays_bounded_under_a_flood_of_many_feeders() -> Result {
     stop.store(true, Ordering::Relaxed);
     while floods.join_next().await.is_some() {}
     let stopped = Instant::now();
-    while stopped.elapsed() < 2 * UNCHARGED_FOR {
+    while stopped.elapsed() < SAMPLE_AFTER {
         watch.sample(&hub)?;
         tokio::time::sleep(SAMPLE_EVERY).await;
     }
@@ -414,7 +436,7 @@ async fn a_stalled_stage_never_grows_past_the_budget() -> Result {
     }
     // Stalled: what is alive now is what the stalled stages hold, every byte of it charged.
     let stalled_at = Instant::now();
-    while stalled_at.elapsed() < 2 * UNCHARGED_FOR {
+    while stalled_at.elapsed() < SAMPLE_AFTER {
         watch.sample(&hub)?;
         tokio::time::sleep(SAMPLE_EVERY).await;
     }
@@ -442,7 +464,7 @@ async fn a_stalled_stage_never_grows_past_the_budget() -> Result {
     assert!(hub.network().products.report().epochs_refused >= 1);
     assert_eq!(epochs.held(), 0);
     let closed = Instant::now();
-    while closed.elapsed() < 2 * UNCHARGED_FOR {
+    while closed.elapsed() < SAMPLE_AFTER {
         watch.sample(&hub)?;
         tokio::time::sleep(SAMPLE_EVERY).await;
     }

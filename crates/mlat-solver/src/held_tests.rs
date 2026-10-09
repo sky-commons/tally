@@ -300,6 +300,106 @@ fn receivers_forgotten_together_are_forgotten_as_one_by_one() {
     assert_eq!(together.bytes(), one_by_one.bytes());
 }
 
+/// Sweep 5, N2: receivers forgotten bin by bin, each bin charged before it is built and handed
+/// back before the next is asked for, so the re-sealing never holds more than one bin beyond the
+/// sealed bins, and that one charged. A budget of one bin's cost re-seals them all, to the bins
+/// forgetting them at once makes; a budget below a bin's cost builds nothing for it and names it,
+/// for its holder to forget whole.
+#[test]
+fn receivers_are_forgotten_one_bin_at_a_time_each_charged_before_it_is_built() {
+    use std::cell::Cell;
+    let receptions = sky(9);
+    let mut keys: Vec<PublicKey> = receptions.iter().map(|r| r.receiver).collect();
+    keys.sort_unstable();
+    keys.dedup();
+    let gone = [keys[0], keys[2]];
+    let sealed_by = || {
+        let sealed = SealedBins::new();
+        let mut held = Held::with(Limits::UNBOUNDED, 2, sealed.clone());
+        for reception in &receptions {
+            held.add_one(reception, reception.wall_ms);
+        }
+        held.seal_through(i64::MAX - 1);
+        (held, sealed)
+    };
+    let (_reference_held, reference) = sealed_by();
+    reference.forget_receivers(&gone, 2);
+    let (_held, sealed) = sealed_by();
+    let holding = sealed
+        .bins(i64::MIN, i64::MAX)
+        .iter()
+        .filter(|bin| gone.iter().any(|key| bin.receiver(key).is_some()))
+        .count();
+    assert!(holding > 1, "{holding} bins hold them");
+    let largest = sealed
+        .bins(i64::MIN, i64::MAX)
+        .iter()
+        .map(|bin| SealedBins::cost(bin))
+        .max()
+        .unwrap_or(0);
+    // A charge of at most one bin's cost outstanding: granted while nothing is, let go when the
+    // bin it paid for has been held in place of the old one.
+    struct Guard<'a>(&'a Cell<usize>, usize);
+    impl Drop for Guard<'_> {
+        fn drop(&mut self) {
+            self.0.set(self.0.get() - self.1);
+        }
+    }
+    let outstanding = Cell::new(0usize);
+    let (asked, handed) = (Cell::new(0usize), Cell::new(0usize));
+    sealed.without_each(
+        &gone,
+        2,
+        |bytes| {
+            // Asked before it is built, and never while a bin built before is not yet handed back.
+            assert_eq!(
+                asked.get(),
+                handed.get(),
+                "a bin built before it was charged"
+            );
+            asked.set(asked.get() + 1);
+            (outstanding.get() + bytes <= largest).then(|| {
+                outstanding.set(outstanding.get() + bytes);
+                Guard(&outstanding, bytes)
+            })
+        },
+        |resealed| {
+            handed.set(handed.get() + 1);
+            match resealed {
+                Resealed::Bin(bin, guard) => {
+                    assert!(SealedBins::cost(&bin) <= guard.1);
+                    sealed.insert(*bin);
+                    drop(guard);
+                }
+                Resealed::Refused { bin, .. } => panic!("bin {bin} refused within one bin's cost"),
+            }
+        },
+    );
+    assert_eq!((asked.get(), handed.get()), (holding, holding));
+    assert_eq!(outstanding.get(), 0);
+    assert_eq!(sealed.numbers(), reference.numbers());
+    for bin in sealed.numbers() {
+        assert!(sealed.get(bin) == reference.get(bin), "bin {bin}");
+    }
+    // Below a bin's cost nothing is built: each such bin is named, for its holder to forget.
+    let (_held, starved) = sealed_by();
+    let mut refused = Vec::new();
+    starved.without_each(
+        &gone,
+        2,
+        |_| None::<()>,
+        |resealed| match resealed {
+            Resealed::Refused { bin, records } => refused.push((bin, records)),
+            Resealed::Bin(..) => panic!("built without a charge"),
+        },
+    );
+    assert_eq!(refused.len(), holding);
+    for (bin, records) in refused {
+        assert_eq!(starved.forget(bin), records);
+        assert!(starved.get(bin).is_none());
+    }
+}
+
 /// The handle a reader keeps sees what its holder seals and forgets, and nothing open.
 #[test]
 fn a_reader_of_the_sealed_bins_sees_what_the_holder_seals_and_forgets() {
@@ -390,9 +490,11 @@ fn a_receivers_cost_follows_its_rates() {
         cost.open,
         1_800 * 8 * OPEN_BYTES_PER_RECEPTION + 3 * OPEN_BYTES_PER_RECEIVER_BIN
     );
+    // Sealed raw at the kept ceiling every receiver is held to, never at the mean.
+    assert_eq!(KEPT_PER_RECEIVER_BIN, 300 * 5);
     assert_eq!(
         cost.sealed,
-        150 * 5 * SEALED_BINS_HELD as usize * SEALED_BYTES_PER_RECORD
+        KEPT_PER_RECEIVER_BIN * SEALED_BINS_HELD as usize * SEALED_BYTES_PER_RECORD
     );
     let limits = Limits::for_receivers(20_000, Rates::MEASURED, 2_000);
     assert_eq!(limits.bytes, 20_000 * cost.total());
@@ -452,6 +554,120 @@ fn a_bin_sealed_within_its_room_refuses_the_busiest_receivers_whole_whatever_the
     // With room for all of it, nothing is refused.
     let (all, none) = Bin::seal_within(0, whole(&[0, 1, 2, 3, 4, 5], 1), 1, cost);
     assert_eq!((all, none), (unbounded, 0));
+}
+
+/// Sweep 5, H-b: a holder sized for its receivers seals every bin of theirs within what it
+/// reserved, and never refuses one whole, however busy: thinning holds each receiver to the kept
+/// ceiling in every bin (`KEPT_PER_RECEIVER_BIN`), its lowest-hash replies kept, and the
+/// reservation is that ceiling. Before, the reservation was the mean and nothing bounded one
+/// receiver: the receiver with the most records, the best placed, was refused whole.
+#[test]
+fn a_holder_sized_for_its_receivers_never_refuses_a_busy_one_whole() -> Result<(), String> {
+    const RECEIVERS: usize = 20;
+    let keys: Vec<PublicKey> = (1..=RECEIVERS as u8)
+        .map(|seed| Identity::from_seed([seed; 32]).public())
+        .collect();
+    // Every receiver hears the measured mean of replies kept in a bin, the same aircraft; the
+    // busiest three times the ceiling, the others' among them.
+    let busy = KEPT_PER_RECEIVER_BIN * 3;
+    let mean = Rates::MEASURED.kept_per_s * GRID_MS as usize / 1_000;
+    let mut open = Open::new(Limits::UNBOUNDED);
+    for (n, key) in keys.iter().enumerate() {
+        let heard = if n == 0 { busy } else { mean };
+        open.add(*key, &content(1_000, &replies(heard as u64, 0)), 1_000);
+    }
+    let fragments = open.take_through(0);
+    // One bin's share of what a holder of these receivers reserves for its sealed raw.
+    let room = RECEIVERS * Rates::MEASURED.cost(2_000).sealed / SEALED_BINS_HELD as usize;
+    let (bin, refused) = Bin::seal_within(0, fragments, 2, room);
+    assert_eq!(refused, 0, "a receiver refused whole");
+    assert_eq!(bin.receivers.len(), RECEIVERS);
+    let busiest = bin
+        .receiver(&keys[0])
+        .ok_or("the busiest receiver is not held")?;
+    let kept: Vec<&Record> = bin
+        .records
+        .iter()
+        .filter(|record| record.receiver == busiest)
+        .collect();
+    assert_eq!(kept.len(), KEPT_PER_RECEIVER_BIN);
+    // The ones it kept: the calibration sample's first, then its lowest-hash other replies.
+    let ranked = |sample: bool| {
+        let mut hashes: Vec<[u8; 32]> = (0..busy as u32)
+            .map(|n| 0x400000 + n)
+            .filter(|address| sampled(*address, 0) == sample)
+            .map(|address| message_hash(&df11(address)))
+            .collect();
+        hashes.sort_unstable();
+        hashes
+    };
+    let mut expected = ranked(true);
+    let rest = KEPT_PER_RECEIVER_BIN - expected.len();
+    expected.extend_from_slice(&ranked(false)[..rest]);
+    expected.sort_unstable();
+    let mut held: Vec<[u8; 32]> = kept
+        .iter()
+        .map(|record| bin.messages[record.message as usize].hash)
+        .collect();
+    held.sort_unstable();
+    assert!(
+        held == expected,
+        "not the busy receiver's lowest-hash replies"
+    );
+    for key in &keys[1..] {
+        let at = bin.receiver(key).ok_or("a receiver is not held")?;
+        assert_eq!(
+            bin.records.iter().filter(|r| r.receiver == at).count(),
+            mean
+        );
+    }
+    Ok(())
+}
+
+/// Sweep 5, N6: on a gate of one permit (which can spare none for provisional work), a seal lets
+/// a waiting provisional step in between two items of its own passes, here on the one thread it
+/// is given, where nothing lends the permit: the provisional work runs before the seal ends, not
+/// after it.
+#[test]
+fn a_seal_lets_waiting_provisional_work_in_between_its_items() {
+    use crate::gate::{self, Gate, Urgency};
+    use std::sync::atomic::AtomicBool;
+    let receptions = sky(5);
+    let bin = bin_of(receptions[0].wall_ms);
+    let fragment = || {
+        let mut open = Open::new(Limits::UNBOUNDED);
+        fill(&receptions, std::slice::from_mut(&mut open), |_| 0);
+        open.take_through(bin).into_iter().last()
+    };
+    let gate = Gate::new(1);
+    let ran = AtomicBool::new(false);
+    let ran_during = std::thread::scope(|scope| {
+        let (gate_b, ran_b) = (Arc::clone(&gate), &ran);
+        let background = scope.spawn(move || {
+            gate::enter(&gate_b, Urgency::Background, || {
+                // Once the provisional step waits, seal on this one thread.
+                while !gate_b.prompt_waits() {
+                    std::thread::yield_now();
+                }
+                let sealed = fragment().map(|fragment| Bin::seal_from(bin, vec![fragment], 1));
+                assert!(sealed.is_some_and(|sealed| !sealed.records.is_empty()));
+                ran_b.load(Ordering::SeqCst)
+            })
+        });
+        let gate_p = Arc::clone(&gate);
+        let ran_p = &ran;
+        // Ask for the permit only once the seal holds it.
+        while gate.peak() == 0 {
+            std::thread::yield_now();
+        }
+        scope.spawn(move || {
+            gate::enter(&gate_p, Urgency::Prompt, || {
+                ran_p.store(true, Ordering::SeqCst)
+            });
+        });
+        background.join().unwrap_or(false)
+    });
+    assert!(ran_during, "the provisional work waited for the whole seal");
 }
 
 /// A signed batch of `receiver`, decoded and stamped `stamp_ms` by the ingest clock.

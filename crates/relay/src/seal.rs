@@ -20,7 +20,7 @@ use tally_wire::batch::Hash;
 use tally_wire::{Decoded, ObsRef, PublicKey, Region};
 
 use crate::budget::Charge;
-use crate::exchange::Frozen;
+use crate::exchange::{Frozen, Parts};
 use crate::ingest::Stamp;
 
 /// An epoch: one `EPOCH_MS` of the ingest clock.
@@ -167,9 +167,11 @@ pub struct Coordinator {
     next: Epoch,
 }
 
+/// One epoch's parts as they come: let go whole (`exchange::Parts`), every part's batches before
+/// any part's charge.
 #[derive(Default)]
 struct Gathering {
-    parts: Vec<Frozen>,
+    parts: Parts,
     refused: bool,
 }
 
@@ -267,7 +269,7 @@ impl Coordinator {
                     ..Merged::default()
                 });
             } else {
-                out.push(merge(epoch, gathering.parts));
+                out.push(merge(epoch, gathering.parts.into_vec()));
             }
         }
         self.next = self.next.max(watermark);

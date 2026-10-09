@@ -77,10 +77,16 @@
 //!   it there: ten, and one with each partner); a reply of an aircraft heard with ADS-B in the bin
 //!   is dropped (it is no MLAT target), unless the aircraft is in the calibration sample (the
 //!   first byte of BLAKE2s-256 over `"tally calibration sample" 0x00`, address and bin, below
-//!   256 / 16: one in sixteen), whose receptions are all kept; status is kept.
+//!   256 / 16: one in sixteen), whose receptions are all kept; status is kept. And no receiver
+//!   keeps more than `KEPT_PER_RECEIVER_BIN = 1500` records of a bin (`KEPT_CEILING_PER_S = 300`
+//!   a second, twice the measured mean): its sync, status and sample records first, then its
+//!   replies, each lowest message hash first, so a busy receiver loses its highest-hash replies,
+//!   the same ones on every holder.
 //! - Memory is bounded, and refusal is whole: a receiver's raw of a bin beyond its share, or
 //!   beyond the bytes held, is refused entire and counted, never partly by arrival order
-//!   (`Limits`); what one receiver costs is `Rates::cost`, for admission to reserve.
+//!   (`Limits`); what one receiver costs is `Rates::cost`, for admission to reserve: its sealed
+//!   raw at the kept ceiling, so a holder sized for its receivers never refuses one whole at a
+//!   seal.
 //!
 //! # Windows and the stride ([`scope`])
 //!
@@ -300,6 +306,15 @@
 //! jumps), its jumps with it, and the fit starts over; each pass drops at least one, so it ends.
 //! Over real receivers this is a receiver whose stamps agree with nothing (OpenSky's data has
 //! several), or one left with no event usable against the rest.
+//!
+//! And a group: two clocks are joined when both carry weight in one such event (an event's
+//! transmit time absorbs any level its receptions share, so a reception alone with weight in its
+//! event places nothing). When robust weights split the clocks into more than one joined group,
+//! each group but one has its level free against the gauge, and every clock of each such group
+//! is dropped as above (`FitError::Disconnected`, distinct from `FitError::Uninformed`, and never
+//! `FitError::Singular`): the group kept is the one holding the most receivers, ties to the
+//! gauge's, then to the one whose lowest clock key is lowest; when the gauge's group is not kept,
+//! the next pass takes its gauge from what is left.
 //!
 //! Then the noise: each clock starts from its residuals' robust scale (1.4826 times their median
 //! absolute value), then rounds of a final-weighted step and an estimate, at least two, until no

@@ -278,6 +278,7 @@ impl<'a> WindowIndex<'a> {
             .collect();
         let mut active: BTreeMap<PublicKey, [i64; 3]> = BTreeMap::new();
         for (bin, usable) in bins.iter().zip(&usable) {
+            crate::gate::checkpoint();
             for (index, key) in bin.receivers.iter().enumerate() {
                 if bin.sync_active[index]
                     && let Some(mm) = usable[index]
@@ -319,6 +320,7 @@ impl<'a> WindowIndex<'a> {
         let solved = self.window.solved();
         let mut out: BTreeSet<u32> = BTreeSet::new();
         for (bin, usable) in self.bins.iter().zip(&self.usable) {
+            crate::gate::checkpoint();
             if !solved.contains(&bin.bin) {
                 continue;
             }
@@ -403,6 +405,7 @@ impl<'a> WindowIndex<'a> {
                 chunk
                     .iter()
                     .filter_map(|address| {
+                        crate::gate::checkpoint();
                         let hearers = self.hearers(*address);
                         let points: Vec<[i64; 3]> = hearers.iter().map(|(_, mm)| *mm).collect();
                         let median = tile::lower_median(&points)?;
@@ -429,7 +432,10 @@ impl<'a> WindowIndex<'a> {
             |chunk: &[Tile]| {
                 chunk
                     .iter()
-                    .map(|tile| (*tile, self.members(*tile)))
+                    .map(|tile| {
+                        crate::gate::checkpoint();
+                        (*tile, self.members(*tile))
+                    })
                     .collect::<Vec<_>>()
             },
         )
@@ -442,6 +448,7 @@ impl<'a> WindowIndex<'a> {
             members,
         };
         for (address, hearers, _) in &candidates {
+            crate::gate::checkpoint();
             if let Some((tile, scope)) = tile::assign(hearers, |tile| {
                 plan.members.get(&tile).cloned().unwrap_or_default()
             }) {

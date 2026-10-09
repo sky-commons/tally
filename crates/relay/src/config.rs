@@ -78,9 +78,10 @@ usage: tally-relay --key FILE [--key FILE]... --max-upload RATE [options]
                          yet identified, probes, engines, directory links, dials that only
                          send); beyond it a new one is closed before its handshake
                          (default 2048). A feeder, a subscriber and a member session give
-                         their place up for their own role's. Every connection's Noise buffers (256 KiB)
-                         are planned in the memory budget: a feeder's in its reservation, and
-                         these, the member sessions' and the subscribers' before any feeder
+                         their place up for their own role's. Every connection's Noise
+                         buffers and waiting replies (320 KiB) are planned in the memory
+                         budget: a feeder's in its reservation, and these, the member
+                         sessions' and the subscribers' before any feeder
   --max-connections-per-address N
                          connections held at once from one IPv4 address or IPv6 /64; beyond
                          it a new one from there is closed before its handshake (default 16)
@@ -576,7 +577,7 @@ mod tests {
             format!("(default {DEFAULT_MAX_SUBSCRIBERS})"),
             format!("(default {DEFAULT_MAX_CONNECTIONS})"),
             format!(
-                "Noise buffers ({} KiB)",
+                "buffers and waiting replies ({} KiB)",
                 crate::ingest::BUFFERS_PER_CONNECTION.div_ceil(1024)
             ),
             format!("{} relays a cell", crate::directory::OFFERS_PER_CELL),

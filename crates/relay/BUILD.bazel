@@ -259,6 +259,8 @@ rust_test(
     name = "check",
     size = "small",
     srcs = ["tests/check.rs"],
+    # The cores' plan RFC-0181 quotes, which the test holds equal to what the relay prints.
+    compile_data = ["tests/cores-10.txt"],
     data = [
         ":tally-relay",
         "//tally/packaging/systemd:tally-relay.service",

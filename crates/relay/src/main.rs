@@ -60,6 +60,12 @@ fn check(config: &Config) -> Result<(), String> {
             "feeder-records",
             usize::try_from(plan.feeder_records_per_sec).unwrap_or(usize::MAX),
         ),
+        ("general-sessions", plan.sessions.general),
+        ("subscriber-sessions", plan.sessions.subscribers),
+        (
+            "session-records-per-minute",
+            usize::try_from(plan.sessions.records_per_minute()).unwrap_or(usize::MAX),
+        ),
         ("ingest-threads", threads.ingest),
         ("message-threads", threads.message),
         ("seal-threads", threads.seal),
