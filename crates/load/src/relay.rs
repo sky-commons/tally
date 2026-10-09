@@ -190,7 +190,21 @@ fn fitted_memory(bin: &Path, args: &[String], feeders: usize) -> Result<u64, Str
             .find_map(|line| line.strip_prefix(name)?.strip_prefix(' ')?.parse().ok())
             .ok_or_else(|| format!("{} check printed no {name}", bin.display()))
     };
-    Ok(line("before-feeders")? + line("per-feeder")? * feeders as u64)
+    // The connections' cost out of what MLAT's share leaves, the seats' out of the share
+    // (`Budget::memory_for`): the least that admits `feeders` connections and, hosting, a seat
+    // for each.
+    let connections = line("per-connection")? * feeders as u64;
+    let share = line("mlat-share-percent")?;
+    let total = if share == 0 {
+        connections
+    } else {
+        let seats = line("per-seat")? * feeders as u64;
+        (connections * 100)
+            .div_ceil(100 - share)
+            .max((seats * 100).div_ceil(share))
+            + 200
+    };
+    Ok(line("before-feeders")? + total)
 }
 
 /// What the relay's peak resident memory came to beside the memory it is budgeted (`GET /memory`)

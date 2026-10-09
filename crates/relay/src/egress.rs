@@ -275,11 +275,12 @@ impl Class {
             KIND_BATCH, KIND_BUNDLE_INDEX, KIND_CLOCK_MODEL, KIND_CLOCK_MODEL_PART,
             KIND_DELIVERY_ANSWER, KIND_DELIVERY_QUERY, KIND_ECHO, KIND_ECHO_REPLY,
             KIND_EVIDENCE_BUNDLE, KIND_FAULT_PROOF, KIND_FIREHOSE_CREDENTIAL, KIND_GOODBYE,
-            KIND_HAVE_SUMMARY, KIND_HEARTBEAT, KIND_HELLO, KIND_PARITY, KIND_PIECE_MANIFEST,
-            KIND_POSITIONS, KIND_PROVIDER_OFFER, KIND_PROVIDER_QUERY, KIND_PROVISIONAL,
-            KIND_RATE_LIMIT, KIND_RECEIVER_INFO, KIND_REDIRECT, KIND_REGIONAL_BATCH,
-            KIND_RELAY_BATCH, KIND_RELAY_LIST, KIND_STRIPE_ASSIGNMENT, KIND_STRIPE_RECEIPT,
-            KIND_SUBSCRIBE, KIND_WELCOME, KIND_WORLD_POSITIONS, KIND_WORLD_PRECISE,
+            KIND_HAVE_SUMMARY, KIND_HEARTBEAT, KIND_HELLO, KIND_MLAT_CUT, KIND_PARITY,
+            KIND_PIECE_MANIFEST, KIND_POSITIONS, KIND_PROVIDER_OFFER, KIND_PROVIDER_QUERY,
+            KIND_PROVISIONAL, KIND_RATE_LIMIT, KIND_RECEIVER_INFO, KIND_REDIRECT,
+            KIND_REGIONAL_BATCH, KIND_RELAY_BATCH, KIND_RELAY_LIST, KIND_STRIPE_ASSIGNMENT,
+            KIND_STRIPE_RECEIPT, KIND_SUBSCRIBE, KIND_WELCOME, KIND_WORLD_POSITIONS,
+            KIND_WORLD_PRECISE,
         };
         let forwards = kind.forwards();
         match record {
@@ -299,6 +300,7 @@ impl Class {
             | KIND_STRIPE_ASSIGNMENT
             | KIND_HAVE_SUMMARY
             | KIND_STRIPE_RECEIPT
+            | KIND_MLAT_CUT
             | KIND_FIREHOSE_CREDENTIAL => Self::Control,
             KIND_PROVIDER_OFFER | KIND_EVIDENCE_BUNDLE if !forwards => Self::Control,
             _ if !forwards => Self::Taker,
@@ -1252,7 +1254,7 @@ mod tests {
         use Class::{Control as C, Forwarded as F, Positions as P, Provisional as V, Raw as R};
         use tally_wire::record::KINDS;
         const T: Class = Class::Taker;
-        let table: [(u8, &str, Class, Class); 33] = [
+        let table: [(u8, &str, Class, Class); 34] = [
             (0x01, "Hello", C, C),
             (0x02, "Welcome", C, C),
             (0x03, "Batch", R, T),
@@ -1287,6 +1289,8 @@ mod tests {
             (0x21, "WorldPrecise", F, T),
             (0x22, "DeliveryQuery", C, C),
             (0x23, "DeliveryAnswer", C, C),
+            // A few bytes a relay sends the relays holding its areas, which apply it at a step.
+            (0x24, "MlatCut", C, C),
         ];
         let kinds: Vec<u8> = table.iter().map(|(kind, ..)| *kind).collect();
         assert_eq!(

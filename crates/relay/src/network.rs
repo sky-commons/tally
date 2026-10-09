@@ -120,6 +120,12 @@ pub struct Network {
     /// taken: a relay link carries only the directory).
     shared_in: AtomicU64,
     data_on_directory_links: AtomicU64,
+    /// Overload cuts (`mlat_host::Cut`) this relay sent a relay holding its areas (one count a
+    /// relay it addressed), took from one, and refused (not signed by the relay that sent it, or
+    /// from one holding none of this relay's areas).
+    cuts_sent: AtomicU64,
+    cuts_received: AtomicU64,
+    cuts_refused: AtomicU64,
     /// Dials this relay's own links have started (`link::Redial`): upstreams, members, raw.
     dials: Arc<AtomicU64>,
 }
@@ -149,6 +155,9 @@ impl Network {
             models: Mutex::new(std::collections::VecDeque::new()),
             shared_in: AtomicU64::new(0),
             data_on_directory_links: AtomicU64::new(0),
+            cuts_sent: AtomicU64::new(0),
+            cuts_received: AtomicU64::new(0),
+            cuts_refused: AtomicU64::new(0),
             dials: Arc::new(AtomicU64::new(0)),
         }
     }
@@ -169,6 +178,15 @@ impl Network {
     /// Group records members have sent this relay.
     pub fn shared_in(&self) -> u64 {
         self.shared_in.load(Ordering::Relaxed)
+    }
+
+    /// The overload cuts sent, taken and refused (`Network::publish_cuts`, `Network::take_cut`).
+    pub fn cuts(&self) -> (u64, u64, u64) {
+        (
+            self.cuts_sent.load(Ordering::Relaxed),
+            self.cuts_received.load(Ordering::Relaxed),
+            self.cuts_refused.load(Ordering::Relaxed),
+        )
     }
 
     /// The count of dials this relay's own links have started, shared with each dial loop.
@@ -327,8 +345,77 @@ impl Network {
                 }
                 Vec::new()
             }
+            Record::MlatCut(cut) => {
+                self.take_cut(asker, &cut, now_ms);
+                Vec::new()
+            }
             Record::EchoReply(_) => Vec::new(),
             _ => Vec::new(),
+        }
+    }
+
+    /// Publishes the overload cuts the hosted MLAT decided (`MlatHost::take_cuts`), each signed by
+    /// this relay and addressed, down the member links `carry` keeps, to every relay holding an
+    /// area it solves (`Selection::raw_sources`: the relays offering the area's raw), which offer it
+    /// to their hosts (`Network::take_cut`) to apply at the same step. A cut is a few bytes sent
+    /// once, ahead of its step by `mlat_host::CUT_LEAD_STEPS`; one that cannot reach a relay in time
+    /// is that relay's `cuts_late`, counted and never silent.
+    pub fn publish_cuts(&self, cuts: Vec<crate::mlat_host::Cut>, now_ms: u64) {
+        if cuts.is_empty() {
+            return;
+        }
+        let Some(identity) = self.identity() else {
+            return;
+        };
+        let sources = self.selection.raw_sources(&self.directory, now_ms);
+        for cut in cuts {
+            let content = tally_wire::MlatCutContent {
+                from_ms: cut.from_ms,
+                seats: cut.seats,
+            };
+            let Ok(signed) = tally_wire::MlatCut::sign(identity, &content) else {
+                continue;
+            };
+            for source in &sources {
+                if self
+                    .sharing
+                    .address(source.relay.key, Record::MlatCut(signed.clone()))
+                {
+                    self.cuts_sent.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+    }
+
+    /// An overload cut `asker`, a relay this one verified, sent: taken by the hosted MLAT when it
+    /// is signed by the relay that sent it and that relay holds an area this relay solves, else
+    /// refused and counted. Whoever signs a cut can ask for fewer seats on a relay that took its
+    /// word, so only a relay whose raw this one links to is heard.
+    fn take_cut(&self, asker: &Asker, cut: &tally_wire::MlatCut, now_ms: u64) {
+        let Some(mlat) = self.mlat() else {
+            return;
+        };
+        let content = cut.content();
+        let heard = asker.role == AskerRole::Relay
+            && cut.verify().is_ok()
+            && cut.signer().is_ok_and(|signer| signer == asker.key)
+            && self
+                .selection
+                .raw_sources(&self.directory, now_ms)
+                .iter()
+                .any(|source| source.relay.key == asker.key);
+        match content {
+            Ok(content) if heard => {
+                self.cuts_received.fetch_add(1, Ordering::Relaxed);
+                mlat.offer_cut(crate::mlat_host::Cut {
+                    from_ms: content.from_ms,
+                    origin: asker.key,
+                    seats: content.seats,
+                });
+            }
+            _ => {
+                self.cuts_refused.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 
@@ -586,6 +673,7 @@ impl Network {
                 self.standing.set_areas(&areas);
                 mlat.set_areas(areas, hub.descriptions());
             }
+            self.publish_cuts(mlat.take_cuts(), now_ms);
             let published = mlat.take_published(self.products.watermark_ms());
             // A model's parts come before its manifest; held first, they place it.
             for record in &published {

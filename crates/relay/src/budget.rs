@@ -38,11 +38,11 @@
 //! ([`PLANNED_RECEPTIONS_PER_SEC`], [`PLANNED_BYTES_PER_SEC`]) times each store's own window,
 //! named where the store defines it, so a store that changes its window changes its reservation.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
-use tokio::sync::Notify;
+use tokio::sync::oneshot;
 
 /// The stores that hold bytes per feeder: every store and queue of the relay whose size grows
 /// with what feeders send.
@@ -94,6 +94,18 @@ pub enum Store {
     Records,
 }
 
+/// What a store's size follows (`Store::driver`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Driver {
+    /// One of these per connection, whatever it sends: its floor, reserved when it is admitted.
+    Connection,
+    /// The window of the relay-wide rate `R_max` (and the members' rate) through the store:
+    /// `limit = window x (R_max + members' rate)`.
+    Rate,
+    /// One per hosted MLAT seat, the seats being their own pool.
+    Seat,
+}
+
 impl Store {
     pub const ALL: [Self; 14] = [
         Self::Batches,
@@ -114,6 +126,41 @@ impl Store {
 
     const fn index(self) -> usize {
         self as usize
+    }
+
+    /// The name the store is served and printed by (`GET /memory`, `tally-relay check`).
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Batches => "batches",
+            Self::Held => "held",
+            Self::Open => "open",
+            Self::Notes => "notes",
+            Self::Engine => "engine",
+            Self::Orphans => "orphans",
+            Self::Dedup => "dedup",
+            Self::Fanout => "fanout",
+            Self::Delivery => "delivery",
+            Self::Buffers => "buffers",
+            Self::Ingest => "ingest",
+            Self::Epochs => "epochs",
+            Self::Products => "products",
+            Self::Records => "records",
+        }
+    }
+
+    /// What drives this store's size: a connection's floor, the relay-wide rate, or a MLAT seat
+    /// (RFC-0181 §9, "Admission"). Every store answers, with no default.
+    pub const fn driver(self) -> Driver {
+        match self {
+            Self::Buffers | Self::Ingest | Self::Delivery => Driver::Connection,
+            Self::Batches
+            | Self::Dedup
+            | Self::Fanout
+            | Self::Epochs
+            | Self::Products
+            | Self::Records => Driver::Rate,
+            Self::Held | Self::Open | Self::Notes | Self::Engine | Self::Orphans => Driver::Seat,
+        }
     }
 
     /// Whether this store holds decoded batches (`tally_wire::Decoded`), each charged at least its
@@ -157,9 +204,62 @@ pub struct PerFeeder {
     pub epochs: usize,
     pub products: usize,
     pub records: usize,
+    /// A connection's pace state outside any store: its record pace, its reception bucket and its
+    /// share's counters ([`PACE_STATE_BYTES`]). Part of a connection's floor.
+    pub pace: usize,
 }
 
 impl PerFeeder {
+    /// Only the stores `driver` sizes: the rest zero.
+    pub fn only(&self, driver: Driver) -> Self {
+        let mut kept = Self::default();
+        for store in Store::ALL {
+            if store.driver() == driver {
+                kept.set(store, self.of(store));
+            }
+        }
+        if driver == Driver::Connection {
+            kept.pace = self.pace;
+        }
+        kept
+    }
+
+    /// What a connection costs whatever it sends: its buffers, ingest allowance, delivery tags
+    /// and pace state.
+    pub fn floor(&self) -> Self {
+        self.only(Driver::Connection)
+    }
+
+    /// What one planned feeder's rate (a planned feeder's receptions a second) costs the
+    /// rate-driven stores over their windows.
+    pub fn rate(&self) -> Self {
+        self.only(Driver::Rate)
+    }
+
+    /// What one MLAT seat costs the seat stores.
+    pub fn seat(&self) -> Self {
+        self.only(Driver::Seat)
+    }
+
+    fn set(&mut self, store: Store, bytes: usize) {
+        match store {
+            Store::Batches => self.batches = bytes,
+            Store::Held => self.held = bytes,
+            Store::Open => self.open = bytes,
+            Store::Notes => self.notes = bytes,
+            Store::Engine => self.engine = bytes,
+            Store::Orphans => self.orphans = bytes,
+            Store::Dedup => self.dedup = bytes,
+            Store::Fanout => self.fanout = bytes,
+            Store::Delivery => self.delivery = bytes,
+            Store::Buffers => self.buffers = bytes,
+            Store::Ingest => self.ingest = bytes,
+            Store::Epochs => self.epochs = bytes,
+            Store::Products => self.products = bytes,
+            Store::Records => self.records = bytes,
+        }
+    }
+
     pub fn of(&self, store: Store) -> usize {
         match store {
             Store::Batches => self.batches,
@@ -187,15 +287,28 @@ impl PerFeeder {
         Self {
             buffers: 0,
             ingest: 0,
+            pace: 0,
             ..*self
         }
+    }
+
+    /// The sum of two costs, store by store.
+    pub fn plus(&self, other: &Self) -> Self {
+        let mut sum = Self {
+            pace: self.pace.saturating_add(other.pace),
+            ..Self::default()
+        };
+        for store in Store::ALL {
+            sum.set(store, self.of(store).saturating_add(other.of(store)));
+        }
+        sum
     }
 
     /// Every store's cost together: what admitting one feeder reserves.
     pub fn total(&self) -> usize {
         Store::ALL
             .iter()
-            .fold(0usize, |sum, store| sum.saturating_add(self.of(*store)))
+            .fold(self.pace, |sum, store| sum.saturating_add(self.of(*store)))
     }
 
     /// What one feeder at the planned rate costs each store over that store's window. `holds_raw`:
@@ -305,9 +418,16 @@ impl PerFeeder {
             // The records waiting for the sealer, and to be forwarded, apart from the outputs
             // (`products::records_per_feeder`).
             records: crate::products::records_per_feeder(receptions),
+            pace: PACE_STATE_BYTES,
         }
     }
 }
+
+/// What a connection's pace state holds outside any store: its record pace (`ingest::RecordPace`,
+/// a rate, a burst and a locked token count), its entry in the reception ceilings
+/// (`ingest::ReceptionCeilings`, a key and two numbers) and its share's counters in the ingest
+/// rate (`shed`), each tens of bytes in a map; planned at a kibibyte.
+pub const PACE_STATE_BYTES: usize = 1 << 10;
 
 /// The rate the RFC sizes one feeder to: about 600 receptions and 8 KB of signed batches a second
 /// (RFC-0181, "Requirement").
@@ -350,7 +470,16 @@ pub const MLAT_BASE_BYTES: usize = (4 << 20) + crate::mlat_host::PUBLISHED_BYTES
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Plan {
     pub base: usize,
+    /// What one connection costs whatever it sends: its floor (buffers, ingest allowance, delivery
+    /// tags, pace state), reserved when it is admitted ([`Budget::reserve`]). Not the rate-driven
+    /// stores', which follow the relay-wide rate, nor MLAT's, which follow its seats.
     pub per_feeder: PerFeeder,
+    /// What one planned feeder's rate (600 receptions a second) costs the rate-driven stores over
+    /// their windows: a gauge's limit is this over [`PLANNED_RECEPTIONS_PER_SEC`] times the
+    /// relay-wide rate `R_max` and the members' rate.
+    pub per_rate: PerFeeder,
+    /// What one MLAT seat costs the seat stores (all zero where MLAT is not hosted).
+    pub per_seat: PerFeeder,
     /// The member sessions the relay holds at once ([`members_for`]): each carves its ingest
     /// allowance ([`Plan::per_member`]).
     pub members: usize,
@@ -380,9 +509,12 @@ pub struct Plan {
 impl Plan {
     /// The plan of a relay that hosts MLAT (`hosts_mlat`) or does not, holding no member.
     pub fn planned(hosts_mlat: bool) -> Self {
+        let planned = PerFeeder::planned(hosts_mlat);
         Self {
             base: BASE_BYTES + if hosts_mlat { MLAT_BASE_BYTES } else { 0 },
-            per_feeder: PerFeeder::planned(hosts_mlat),
+            per_feeder: planned.floor(),
+            per_rate: planned.rate(),
+            per_seat: planned.seat(),
             members: 0,
             member_feeders: 0,
             connections: 0,
@@ -408,28 +540,123 @@ impl Plan {
         }
     }
 
-    /// The load of `feeders` beside the members' rate (`cores::Load`).
-    pub fn load_of(&self, feeders: usize) -> crate::cores::Load {
-        crate::cores::Load {
-            feeders,
-            member_feeders: self.member_feeders,
-            feeder_records_per_sec: self.feeder_records_per_sec,
-            sessions: self.sessions,
-        }
-    }
-
-    /// The same plan on `cores` cores (`cores::cores_available`): the feeders admitted are no more
-    /// than they carry.
+    /// The same plan on `cores` cores (`cores::cores_available`): the connections admitted, the rate
+    /// and the MLAT seats are no more than they carry.
     #[must_use]
     pub fn with_cores(self, cores: Option<usize>) -> Self {
         Self { cores, ..self }
     }
 
-    /// The feeders the cores carry beside the members' rate (`cores::feeders_carried`), or none
-    /// as a bound when the cores are not planned.
-    pub fn core_feeders(&self) -> Option<usize> {
-        self.cores
-            .map(|cores| crate::cores::feeders_carried(cores, self.holds_raw, self.load_of(0)))
+    /// What the plan admits in `total` bytes, the memory left after what the relay holds before
+    /// any feeder (`Plan::before_feeders`). The one derivation (RFC-0181 §10, "Admission"):
+    ///
+    /// 1. **Connections** first, at their floor and the windows of the planned mean rate: the
+    ///    fewer of the memory over a connection's cost and the cores over a session and the stages'
+    ///    cost of the mean rate. A relay hosting MLAT plans them from what remains after MLAT's share
+    ///    (`cores::MLAT_SHARE_PERCENT` of the memory and of the cores), so it does not give every
+    ///    byte to connections and leave its seats none.
+    /// 2. **MLAT seats**, where MLAT is hosted, from what the connections leave (the share and
+    ///    whatever they did not use): the fewer of the memory left over a seat, the cores left
+    ///    over a seat's steps, and the connections. Seats are no more than connections, never the
+    ///    reverse; a feeder past them is still a connection, relayed and not solved.
+    /// 3. **`R_max`**: the least of the memory left after the floors and the seats over a
+    ///    reception's windows, the cores left after the sessions and the seats over a reception's
+    ///    cost through the stages (at `cores::BUSY_PERCENT`). Connections are admitted at the
+    ///    planned mean, so `R_max` is at least their mean; what bound the connections bounds it
+    ///    too, and the other is the room above.
+    pub fn admit(&self, total: usize) -> Admission {
+        let floor = self.per_feeder.total();
+        let unit = self.per_rate.total();
+        let seat = self.per_seat.total();
+        let mean = PLANNED_RECEPTIONS_PER_SEC as u128;
+        let holds_raw = self.holds_raw;
+        let available = self.cores.map(|cores| {
+            crate::cores::available_nanos(cores, holds_raw, self.member_feeders, self.sessions)
+        });
+        let per_connection = floor.saturating_add(unit);
+        // Connections.
+        let connections_by_memory = crate::cores::after_mlat_share(total, holds_raw)
+            .checked_div(per_connection)
+            .unwrap_or(usize::MAX);
+        let connections_by_cores = available.map(|nanos| {
+            crate::cores::connections_carried(
+                crate::cores::after_mlat_share(nanos, holds_raw),
+                holds_raw,
+                0,
+            )
+        });
+        let connections = connections_by_memory.min(connections_by_cores.unwrap_or(usize::MAX));
+        let connections_bound =
+            if connections_by_cores.is_some_and(|cores| cores < connections_by_memory) {
+                Bound::Cores
+            } else if per_connection == 0 {
+                Bound::Unbounded
+            } else {
+                Bound::Memory
+            };
+        // Seats, from what the connections leave.
+        let seats_by_memory = if holds_raw {
+            total
+                .saturating_sub(per_connection.saturating_mul(connections))
+                .checked_div(seat)
+                .unwrap_or(usize::MAX)
+        } else {
+            0
+        };
+        let seats_by_cores =
+            available.map(|nanos| crate::cores::seats_carried(nanos, holds_raw, connections));
+        let seats = if holds_raw {
+            seats_by_memory
+                .min(seats_by_cores.unwrap_or(usize::MAX))
+                .min(connections)
+        } else {
+            0
+        };
+        let seats_bound = if !holds_raw {
+            Bound::NotHosted
+        } else if seats == connections
+            && connections < seats_by_memory.min(seats_by_cores.unwrap_or(usize::MAX))
+        {
+            Bound::Connections
+        } else if seats_by_cores.is_some_and(|cores| cores < seats_by_memory) {
+            Bound::Cores
+        } else {
+            Bound::Memory
+        };
+        // R_max.
+        let rate_by_memory = if unit == 0 {
+            u64::MAX
+        } else {
+            let left = total
+                .saturating_sub(floor.saturating_mul(connections))
+                .saturating_sub(seat.saturating_mul(seats));
+            mul_div(left as u64, mean, unit as u128)
+        };
+        let rate_by_cores =
+            available.map(|nanos| crate::cores::rate_carried(nanos, holds_raw, connections, seats));
+        let rate = rate_by_memory.min(rate_by_cores.unwrap_or(u64::MAX));
+        let rate_bound = if rate_by_cores.is_some_and(|cores| cores < rate_by_memory) {
+            Bound::Cores
+        } else if unit == 0 {
+            Bound::Unbounded
+        } else {
+            Bound::Memory
+        };
+        Admission {
+            floor,
+            connections,
+            connections_by_memory,
+            connections_by_cores,
+            connections_bound,
+            rate,
+            rate_by_memory,
+            rate_by_cores,
+            rate_bound,
+            seats,
+            seats_by_memory,
+            seats_by_cores,
+            seats_bound,
+        }
     }
 
     /// The same plan holding `general` sessions under the connection cap (`--max-connections`) and
@@ -547,10 +774,19 @@ impl Plan {
     /// What the members' shared rate holds in every store but their sessions' allowances
     /// (`PerFeeder::as_member`, the rate's feeders' worth).
     pub fn member_rate_pool(&self) -> usize {
-        self.per_feeder
-            .as_member()
+        self.member_unit()
             .total()
             .saturating_mul(self.member_feeders)
+    }
+
+    /// What one feeder's worth of the members' shared rate costs every store but their sessions'
+    /// allowances: the floor's delivery tags, the rate-driven stores' windows and, hosting MLAT, a
+    /// seat's raw (the raw links bring other relays' feeders').
+    pub fn member_unit(&self) -> PerFeeder {
+        self.per_feeder
+            .as_member()
+            .plus(&self.per_rate)
+            .plus(&self.per_seat)
     }
 
     /// The members' pool: their shared rate's worth, and every member session's allowance.
@@ -558,6 +794,105 @@ impl Plan {
         self.member_rate_pool()
             .saturating_add(self.per_member().saturating_mul(self.members))
     }
+}
+
+/// What bound a figure of the plan (`tally-relay check` prints it).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Bound {
+    /// The memory the plan holds for it.
+    Memory,
+    /// The cores: their sessions, receptions through the stages, or MLAT's steps.
+    Cores,
+    /// Nothing bound it (a plan without a cost for it, a test's).
+    Unbounded,
+    /// Not planned: MLAT is not hosted.
+    NotHosted,
+    /// The connections: a seat for every connection, and no more.
+    Connections,
+}
+
+impl Bound {
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Memory => "memory",
+            Self::Cores => "cores",
+            Self::Unbounded => "unbounded",
+            Self::NotHosted => "not-hosted",
+            Self::Connections => "connections",
+        }
+    }
+}
+
+/// What a plan admits in the memory it is given (RFC-0181 §9, §10, "Admission"): one figure each
+/// for the connections, the relay-wide rate and the MLAT seats, and what bound it. Derived by
+/// [`Plan::admit`], the only place these are decided; the gauges' limits, the ingest rate
+/// (`shed`), the stages' threads, MLAT's seats and `tally-relay check` all read it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct Admission {
+    /// What a connection reserves when it is admitted (`Plan::per_feeder`, its floor).
+    pub floor: usize,
+    /// The feeder connections admitted at most: the fewer of [`Admission::connections_by_memory`]
+    /// and [`Admission::connections_by_cores`].
+    pub connections: usize,
+    pub connections_by_memory: usize,
+    pub connections_by_cores: Option<usize>,
+    pub connections_bound: Bound,
+    /// `R_max`, receptions a second the relay carries for its feeders (not its members'): the
+    /// lesser of what the memory left after the floors holds and what the cores carry after the
+    /// sessions and the seats.
+    pub rate: u64,
+    pub rate_by_memory: u64,
+    pub rate_by_cores: Option<u64>,
+    pub rate_bound: Bound,
+    /// MLAT's seats, their own pool: planned from what the connections leave of the memory and the
+    /// cores, no more than the connections.
+    pub seats: usize,
+    pub seats_by_memory: usize,
+    pub seats_by_cores: Option<usize>,
+    pub seats_bound: Bound,
+}
+
+impl Admission {
+    /// `R_max` in bytes a second, at the planned mean's bytes to receptions.
+    pub fn bytes_per_sec(&self) -> u64 {
+        mul_div(
+            self.rate,
+            PLANNED_BYTES_PER_SEC as u128,
+            PLANNED_RECEPTIONS_PER_SEC as u128,
+        )
+    }
+
+    /// The records a second the relay-wide rate admits (`cores::RECORDS_PER_PLANNED_FEEDER`
+    /// for each planned feeder's worth of it).
+    pub fn records_per_sec(&self) -> u64 {
+        mul_div(
+            self.rate,
+            u128::from(crate::cores::RECORDS_PER_PLANNED_FEEDER),
+            PLANNED_RECEPTIONS_PER_SEC as u128,
+        )
+    }
+
+    /// Feeders carried at the planned mean: `R_max` over a planned feeder's receptions.
+    pub fn feeders_at_mean(&self) -> u64 {
+        self.rate / PLANNED_RECEPTIONS_PER_SEC as u64
+    }
+
+    /// Feeders carried if every one sent at the ceiling a source is held to
+    /// (`ingest::SOURCE_RECEPTIONS_PER_SEC`).
+    pub fn feeders_at_ceiling(&self) -> u64 {
+        self.rate
+            .checked_div(crate::ingest::SOURCE_RECEPTIONS_PER_SEC)
+            .unwrap_or(0)
+    }
+}
+
+/// `a x b / c` without overflow, saturating at `u64::MAX`; `c` of nothing is nothing to divide by
+/// (the result is `u64::MAX`).
+fn mul_div(a: u64, b: u128, c: u128) -> u64 {
+    (u128::from(a) * b)
+        .checked_div(c)
+        .map_or(u64::MAX, |value| u64::try_from(value).unwrap_or(u64::MAX))
 }
 
 /// The member sessions a relay taking `areas` plans (RFC-0174 §2.3, §2.5, §2.6): every one the
@@ -643,15 +978,34 @@ pub const HEADROOM_BYTES: usize = 64 << 20;
 /// against 11 to 19 with eight or with glibc's own count; RFC-0181, "MLAT and the allocator").
 pub const MALLOC_ARENAS: i32 = 8;
 
-/// What the allocator keeps for reuse beside what is live, as a percent of what it serves the plan:
-/// the relay's base and every store. Measured with [`MALLOC_ARENAS`] (2026-10-09, 2,000 feeders
-/// hosting MLAT, `tally-load`): resident less the base and every store's charge at most 973 MiB
-/// over 5,452 MiB planned in use, 17.8% ([`MEASURED_ALLOCATOR_PERCENT`]); planned at 25.
+/// What the allocator keeps for reuse beside what is live, as a percent of what it serves the plan
+/// (the relay's base and every store), for a relay small enough that this is the lesser of the two
+/// bounds on its share ([`ALLOCATOR_CAP_BYTES`]). Measured with [`MALLOC_ARENAS`] (2026-10-09,
+/// 2,000 feeders hosting MLAT, `tally-load`): resident less the base and every store's charge at
+/// most 973 MiB over 5,452 MiB planned in use, 17.8% ([`MEASURED_ALLOCATOR_PERCENT`]); planned at
+/// 25.
 pub const ALLOCATOR_PERCENT: usize = 25;
 
 /// The share measured ([`ALLOCATOR_PERCENT`]), which the plan must hold.
 pub const MEASURED_ALLOCATOR_PERCENT: usize = 18;
 const _: () = assert!(ALLOCATOR_PERCENT >= MEASURED_ALLOCATOR_PERCENT);
+
+/// What one glibc arena keeps free for its own reuse at most, in a relay hosting MLAT (RFC-0181,
+/// "Admission", "The allocator's share"). Read off a running relay: `GET /memory` serves
+/// `mallinfo2` (`allocator.free`, bytes freed and kept in the arenas, and `allocator.in_use`),
+/// sampled every five seconds under `tally-load`, the relay on cores 0-9 and the harness on 10-31.
+/// The free bytes came to 2,037 MiB over the eight arenas at 2,000 feeders hosting MLAT (255 MiB an
+/// arena; in use 1.6 to 2.6 GiB, so the free pages were the larger half of the arenas), and the
+/// 2,000-feeder runs measured before `GET /memory` served it left 2.2 to 2.4 GiB resident beyond
+/// what the stores were charged (about 290 MiB an arena); at 5,000 feeders without MLAT 612 MiB
+/// (77 MiB an arena). It follows the arenas, not the plan: the same ~2 GiB sat free after a run that
+/// MLAT shed to 392 seats as after one that solved all 2,000. Planned at 320 MiB.
+pub const ARENA_RETENTION_BYTES: usize = 320 << 20;
+
+/// The most the allocator's free pages come to, whatever the plan: [`MALLOC_ARENAS`] arenas of
+/// [`ARENA_RETENTION_BYTES`] each. Before, the share was a quarter of the plan at any size, which
+/// reserved 6.9 GB of a 32 GB relay for pages the measurement says never pass 2.6 GiB.
+pub const ALLOCATOR_CAP_BYTES: usize = MALLOC_ARENAS as usize * ARENA_RETENTION_BYTES;
 
 /// Bounds what the allocator keeps (F3 of sweep 6): glibc's arenas capped at [`MALLOC_ARENAS`],
 /// set before any thread starts, so the pages it keeps for reuse stay within the share the plan
@@ -668,17 +1022,64 @@ pub fn bound_the_allocator() {
     }
 }
 
+/// What the allocator holds now (`mallinfo2`, every arena): the bytes in use, the bytes it has
+/// taken from the kernel and keeps free for reuse, and what it maps apart. Served on `GET
+/// /memory`, so the allocator's share of the plan ([`ALLOCATOR_PERCENT`]) is read off a running
+/// relay rather than guessed: resident memory is these and what no allocation holds (stacks, the
+/// binary, the kernel's socket buffers).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
+pub struct AllocatorReport {
+    /// Bytes allocated and not freed (`uordblks`).
+    pub in_use: u64,
+    /// Bytes freed and kept in the arenas for reuse (`fordblks`).
+    pub free: u64,
+    /// Bytes served by `mmap` apart from the arenas (`hblkhd`).
+    pub mapped: u64,
+    /// Bytes the arenas took from the kernel (`arena`).
+    pub arenas: u64,
+}
+
+/// The allocator's holdings now ([`AllocatorReport`]); zeros where the allocator is not glibc's.
+pub fn allocator_report() -> AllocatorReport {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        // SAFETY: `mallinfo2` only reads the allocator's counters.
+        let info = unsafe { libc::mallinfo2() };
+        AllocatorReport {
+            in_use: info.uordblks as u64,
+            free: info.fordblks as u64,
+            mapped: info.hblkhd as u64,
+            arenas: info.arena as u64,
+        }
+    }
+    #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+    AllocatorReport::default()
+}
+
+/// The allocator's share of a relay planning `planned` bytes (its base and its stores): the
+/// lesser of [`ALLOCATOR_PERCENT`] of it and [`ALLOCATOR_CAP_BYTES`].
+pub fn allocator_share(planned: usize) -> usize {
+    (planned.saturating_mul(ALLOCATOR_PERCENT) / 100).min(ALLOCATOR_CAP_BYTES)
+}
+
 /// What a relay planning `planned` bytes (its base and its stores) keeps below the memory it runs
-/// in: [`HEADROOM_BYTES`] and the allocator's share of what it plans ([`ALLOCATOR_PERCENT`]). A
-/// relay holding its whole plan is still within the memory it runs in.
+/// in: [`HEADROOM_BYTES`] and the allocator's share ([`allocator_share`]). A relay holding its
+/// whole plan is still within the memory it runs in.
 pub fn headroom_for(planned: usize) -> usize {
-    HEADROOM_BYTES.saturating_add(planned.saturating_mul(ALLOCATOR_PERCENT) / 100)
+    HEADROOM_BYTES.saturating_add(allocator_share(planned))
 }
 
 /// The budget of a relay that runs in `limit` bytes ([`memory_available`]): the most whose
 /// headroom ([`headroom_for`]) still fits beside it.
 pub fn budget_within(limit: usize) -> usize {
-    limit.saturating_sub(HEADROOM_BYTES).saturating_mul(100) / (100 + ALLOCATOR_PERCENT)
+    let room = limit.saturating_sub(HEADROOM_BYTES);
+    // Where a quarter of the budget is the share; else the cap.
+    let proportional = room.saturating_mul(100) / (100 + ALLOCATOR_PERCENT);
+    if proportional.saturating_mul(ALLOCATOR_PERCENT) / 100 <= ALLOCATOR_CAP_BYTES {
+        proportional
+    } else {
+        room.saturating_sub(ALLOCATOR_CAP_BYTES)
+    }
 }
 
 /// The least of cgroup v2's `memory.high` and `memory.max` over this process's cgroup and its
@@ -730,9 +1131,11 @@ pub struct Gauge {
     /// Charges refused for room (`try_charge`), and charges that waited for it (`charge`).
     refused: AtomicU64,
     waited: AtomicU64,
-    /// Charges waiting for room now: a release wakes them only when there are any.
+    /// Charges waiting for room now (those abandoned by a dropped waiter are counted until the
+    /// next release sweeps them): a release serves them only when there are any.
     waiting: AtomicUsize,
-    released: Notify,
+    /// Who waits for room, by source, served in turn ([`Gauge::charge_for`]).
+    queue: Mutex<Queue>,
     /// The shares of this store a part splits it into ([`Gauge::share`]), each with the rule its
     /// limit follows from this one's: set again whenever this one is (`Budget::resize`).
     shares: Mutex<Vec<(Weak<Gauge>, Share)>>,
@@ -751,7 +1154,7 @@ impl Gauge {
             refused: AtomicU64::new(0),
             waited: AtomicU64::new(0),
             waiting: AtomicUsize::new(0),
-            released: Notify::new(),
+            queue: Mutex::new(Queue::default()),
             shares: Mutex::new(Vec::new()),
         })
     }
@@ -783,9 +1186,11 @@ impl Gauge {
         self.limit.load(Ordering::Acquire)
     }
 
-    fn set_limit(&self, limit: usize) {
+    fn set_limit(self: &Arc<Self>, limit: usize) {
         self.limit.store(limit, Ordering::Release);
-        self.released.notify_waiters();
+        if self.waiting.load(Ordering::SeqCst) > 0 {
+            self.serve();
+        }
         let shares = self
             .shares
             .lock()
@@ -858,29 +1263,126 @@ impl Gauge {
     }
 
     /// `bytes` charged, waiting for room while the store is full: for a store that pushes back.
+    /// The waiter is one source among those waiting ([`Gauge::charge_for`], source 0).
     pub async fn charge(self: &Arc<Self>, bytes: usize) -> Charge {
-        if let Some(charge) = self.take(bytes) {
-            return charge;
-        }
-        self.waited.fetch_add(1, Ordering::Relaxed);
-        self.waiting.fetch_add(1, Ordering::SeqCst);
-        let _waiting = Waiting(&self.waiting);
+        self.charge_for(0, bytes).await
+    }
+
+    /// `bytes` charged for `source`, waiting for room while the store is full. Waiters are served
+    /// in turn by source, not by who wakes first: each source with a waiter takes its turn in
+    /// arrival order, and in its turn is served up to a quantum of bytes (deficit round robin),
+    /// so one source with a thousand batches waiting gets a thousandth of a turn's room per
+    /// batch while another's one batch is served in its turn. Before, a release woke every
+    /// waiter and the race winner took the room (RFC-0181 §10, "Admission"). A newcomer joins the
+    /// queue while anyone waits; it never takes room ahead of them.
+    pub async fn charge_for(self: &Arc<Self>, source: u64, bytes: usize) -> Charge {
         loop {
-            let released = self.released.notified();
-            if let Some(charge) = self.take(bytes) {
+            let granted = {
+                let mut queue = self
+                    .queue
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if queue.order.is_empty()
+                    && let Some(charge) = self.take(bytes)
+                {
+                    return charge;
+                }
+                let (grant, granted) = oneshot::channel();
+                let turn = queue.turns.entry(source).or_insert_with(|| Turn {
+                    waiters: VecDeque::new(),
+                    deficit: 0,
+                });
+                let first = turn.waiters.is_empty();
+                turn.waiters.push_back(Waiter { bytes, grant });
+                if first {
+                    queue.order.push_back(source);
+                }
+                self.waited.fetch_add(1, Ordering::Relaxed);
+                self.waiting.fetch_add(1, Ordering::SeqCst);
+                granted
+            };
+            // Room that came between the failed look and the enqueue is served now.
+            self.serve();
+            if let Ok(charge) = granted.await {
                 return charge;
             }
-            released.await;
         }
     }
 
-    fn release(&self, bytes: usize) {
+    /// Serves the waiters in turn while there is room (deficit round robin over sources). The
+    /// charges a waiter that has gone cannot take are let go after the queue is unlocked, their
+    /// release serving again.
+    fn serve(self: &Arc<Self>) {
+        let mut undelivered = Vec::new();
+        {
+            let mut queue = self
+                .queue
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            'sources: while let Some(&source) = queue.order.front() {
+                if !queue.fresh {
+                    if let Some(turn) = queue.turns.get_mut(&source) {
+                        turn.deficit = turn.deficit.saturating_add(DRR_QUANTUM);
+                    }
+                    queue.fresh = true;
+                }
+                while let Some(turn) = queue.turns.get_mut(&source) {
+                    while turn
+                        .waiters
+                        .front()
+                        .is_some_and(|waiter| waiter.grant.is_closed())
+                    {
+                        turn.waiters.pop_front();
+                        self.waiting.fetch_sub(1, Ordering::SeqCst);
+                    }
+                    let Some(head) = turn.waiters.front() else {
+                        break;
+                    };
+                    if head.bytes > turn.deficit {
+                        break;
+                    }
+                    // No room for the one whose turn it is: nobody behind it takes it. Its turn
+                    // (and its quantum, already given) resumes at the next release.
+                    let Some(charge) = self.take(head.bytes) else {
+                        break 'sources;
+                    };
+                    turn.deficit -= head.bytes;
+                    if let Some(waiter) = turn.waiters.pop_front() {
+                        self.waiting.fetch_sub(1, Ordering::SeqCst);
+                        if let Err(charge) = waiter.grant.send(charge) {
+                            undelivered.push(charge);
+                        }
+                    }
+                }
+                // Its turn is over: it goes to the back with what it has not spent, or leaves.
+                queue.order.pop_front();
+                let empty = queue
+                    .turns
+                    .get(&source)
+                    .is_none_or(|turn| turn.waiters.is_empty());
+                if empty {
+                    queue.turns.remove(&source);
+                } else {
+                    queue.order.push_back(source);
+                }
+                queue.fresh = false;
+            }
+        }
+        drop(undelivered);
+    }
+
+    fn release(self: &Arc<Self>, bytes: usize) {
         self.held.fetch_sub(bytes, Ordering::SeqCst);
         // A waiter counts itself before it looks for room (all sequentially consistent), so a
         // release its look missed sees it waiting.
         if self.waiting.load(Ordering::SeqCst) > 0 {
-            self.released.notify_waiters();
+            self.serve();
         }
+    }
+
+    /// Charges waiting for room now.
+    pub fn waiting(&self) -> usize {
+        self.waiting.load(Ordering::SeqCst)
     }
 
     pub fn report(&self) -> GaugeReport {
@@ -895,14 +1397,32 @@ impl Gauge {
     }
 }
 
-/// A charge waiting for room, counted while it waits (however its wait ends).
-struct Waiting<'a>(&'a AtomicUsize);
-
-impl Drop for Waiting<'_> {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::AcqRel);
-    }
+/// A charge waiting for room: its bytes and where its charge is delivered.
+#[derive(Debug)]
+struct Waiter {
+    bytes: usize,
+    grant: oneshot::Sender<Charge>,
 }
+
+/// One source's waiters and what it has not yet spent of its turns (deficit round robin).
+#[derive(Debug)]
+struct Turn {
+    waiters: VecDeque<Waiter>,
+    deficit: usize,
+}
+
+/// Who waits on a gauge: the sources in the order their turns come, each with its waiters.
+#[derive(Debug, Default)]
+struct Queue {
+    turns: BTreeMap<u64, Turn>,
+    order: VecDeque<u64>,
+    /// The source at the front of `order` has had its quantum for this turn.
+    fresh: bool,
+}
+
+/// The bytes a source is given each turn of a gauge's waiters ([`Gauge::charge_for`]): about
+/// a planned batch's charge, so a source of planned batches is served about one in its turn.
+pub const DRR_QUANTUM: usize = 128 << 10;
 
 /// Bytes a store holds for one thing, released when it is dropped, and the decoded batches it is
 /// charged for holding ([`Charge::cover`]), each counted once in the process's [`Covered`] for as
@@ -1446,6 +1966,8 @@ impl Budget {
             plan: Plan {
                 base: BASE_BYTES,
                 per_feeder,
+                per_rate: PerFeeder::default(),
+                per_seat: PerFeeder::default(),
                 ..Plan::planned(false)
             },
             total,
@@ -1510,88 +2032,161 @@ impl Budget {
         self.plan
     }
 
-    /// Whether the budget holds its members' pool and a feeder beside it: a relay that would refuse
-    /// every Hello, or hold fewer members than it was told, refuses to start instead, saying what
-    /// it was given and what it needs.
+    /// What the plan admits in this budget's memory ([`Plan::admit`]): the connections, `R_max`
+    /// and the MLAT seats, each with what bound it.
+    pub fn admission(&self) -> Admission {
+        self.plan.admit(self.total)
+    }
+
+    /// Whether the budget holds its members' pool and a connection beside it, and the cores
+    /// carry one: a relay that would refuse every Hello, or hold fewer members than it was told,
+    /// refuses to start instead, saying what it was given and what it needs.
     pub fn check(&self) -> Result<(), String> {
         let plan = self.plan();
-        if let (Some(cores), Some(0)) = (plan.cores, plan.core_feeders()) {
-            return Err(format!(
-                "{cores} cores carry no feeder beside the {} feeders its members' shared rate is \
-                 worth (--max-member-bytes-per-sec) and the {} records a minute its {} \
-                 connections and {} subscribers may send (--max-connections, \
-                 --max-subscribers): planned at {}% busy, a core carries {} \
-                 planned feeders' work (ingest, deduplication, sealing and the connections \
-                 together, and hosted MLAT's steps beside them unless --no-mlat, RFC-0181 \
-                 \"Sizing\"); give it more cores (the unit's CPUQuota, the container's \
-                 limits.cpu, its CPU affinity), plan a slower members' rate, fewer connections \
-                 or subscribers, or host no MLAT",
+        let admission = self.admission();
+        if let Some(cores) = plan.cores {
+            let available = crate::cores::available_nanos(
+                cores,
+                plan.holds_raw,
                 plan.member_feeders,
-                plan.sessions.records_per_minute(),
-                plan.sessions.general,
-                plan.sessions.subscribers,
-                crate::cores::BUSY_PERCENT,
-                crate::cores::load_carried(1, plan.holds_raw, plan.feeder_records_per_sec),
-            ));
+                plan.sessions,
+            );
+            if crate::cores::connections_carried(available, plan.holds_raw, 0) == 0 {
+                return Err(format!(
+                    "{cores} cores carry no feeder beside the {} feeders its members' shared rate is \
+                     worth (--max-member-bytes-per-sec) and the {} records a minute its {} \
+                     connections and {} subscribers may send (--max-connections, \
+                     --max-subscribers): planned at {}% busy, a feeder's session and the \
+                     stages' work on its receptions (ingest, deduplication and sealing) cost {} \
+                     ns of a core a second (RFC-0181 \"Sizing\"); give it more cores (the unit's \
+                     CPUQuota, the container's limits.cpu, its CPU affinity), plan a slower \
+                     members' rate, fewer connections or subscribers",
+                    plan.member_feeders,
+                    plan.sessions.records_per_minute(),
+                    plan.sessions.general,
+                    plan.sessions.subscribers,
+                    crate::cores::BUSY_PERCENT,
+                    crate::cores::connection_nanos(plan.holds_raw)
+                        + crate::cores::stage_nanos(plan.holds_raw),
+                ));
+            }
         }
         let needed = Self::memory_for(1, plan);
-        if self.memory >= needed && self.ceiling() > 0 {
-            return Ok(());
+        if self.memory < needed || admission.connections == 0 {
+            return Err(format!(
+                "{} bytes of memory admit no feeder beside {} member sessions: the relay needs {} \
+                 bytes for itself, {} for batches past their connection's allowance, {} for the \
+                 Noise buffers of its {} connections (--max-connections), {} for its members' shared \
+                 rate ({} feeders' worth at --max-member-bytes-per-sec) and {} for each member \
+                 session (as many as its areas bring, at most its connections) and {} more for what \
+                 waits for its link to each, {} for the parities its members' rate reassembles at \
+                 once (the parity-assembly room), and {} for each connection ({} of them its floor, \
+                 the rest the windows of the planned rate{}), {needed} in all for these \
+                 and one; give it more (--memory, or the \
+                 memory it runs in: the unit's MemoryHigh and MemoryMax, the container's \
+                 limits.memory), or plan fewer connections or a slower members' rate \
+                 (--max-connections, --max-member-bytes-per-sec)",
+                self.memory,
+                self.plan.members,
+                self.plan.base,
+                plan.oversize(),
+                plan.connection_buffers(),
+                self.plan.connections,
+                plan.member_rate_pool(),
+                self.plan.member_feeders,
+                plan.per_member(),
+                crate::peers::WAITING_PER_LINK_BYTES,
+                plan.parity_assembly(),
+                Self::memory_for(1, plan) - plan.before_feeders(),
+                plan.per_feeder.total(),
+                if plan.holds_raw {
+                    " and a MLAT seat"
+                } else {
+                    ""
+                },
+            ));
         }
-        Err(format!(
-            "{} bytes of memory admit no feeder beside {} member sessions: the relay needs {} \
-             bytes for itself, {} for batches past their connection's allowance, {} for the \
-             Noise buffers of its {} connections (--max-connections), {} for its members' shared \
-             rate ({} feeders' worth at --max-member-bytes-per-sec) and {} for each member \
-             session (as many as its areas bring, at most its connections) and {} more for what \
-             waits for its link to each, {} for the parities its members' rate reassembles at \
-             once (the parity-assembly room), and {} for each feeder, {needed} in all for these \
-             and one feeder; give it more (--memory, or the \
-             memory it runs in: the unit's MemoryHigh and MemoryMax, the container's \
-             limits.memory), or plan fewer connections or a slower members' rate \
-             (--max-connections, --max-member-bytes-per-sec)",
-            self.memory,
-            self.plan.members,
-            self.plan.base,
-            plan.oversize(),
-            plan.connection_buffers(),
-            self.plan.connections,
-            plan.member_rate_pool(),
-            self.plan.member_feeders,
-            plan.per_member(),
-            crate::peers::WAITING_PER_LINK_BYTES,
-            plan.parity_assembly(),
-            self.plan.per_feeder.total(),
-        ))
+        if plan.holds_raw && admission.seats == 0 {
+            return Err(format!(
+                "this relay hosts MLAT but its {} bytes of memory and its cores leave no seat for a \
+                 receiver beside its connections (a seat costs {} bytes and {} ns of a core a \
+                 second): give it more, or host none (--no-mlat)",
+                self.memory,
+                plan.per_seat.total(),
+                crate::cores::mlat_per_feeder(true),
+            ));
+        }
+        Ok(())
     }
 
-    /// The least memory that admits `feeders` beside what the plan holds before any
-    /// (`Plan::before_feeders`).
+    /// The least memory that admits `feeders` connections at the planned mean rate and, where MLAT
+    /// is hosted, a MLAT seat for each, beside what the plan holds before any
+    /// (`Plan::before_feeders`): the connections' cost out of what MLAT's share leaves, the seats'
+    /// out of the share, whichever needs more.
     pub fn memory_for(feeders: usize, plan: Plan) -> usize {
+        let connections = plan
+            .per_feeder
+            .total()
+            .saturating_add(plan.per_rate.total())
+            .saturating_mul(feeders);
+        if !plan.holds_raw {
+            return plan.before_feeders().saturating_add(connections);
+        }
+        let share = crate::cores::MLAT_SHARE_PERCENT;
+        let seats = plan.per_seat.total().saturating_mul(feeders);
+        // Each side rounded up, and a hundred bytes more for the share's rounding down.
+        let by_connections = connections.saturating_mul(100).div_ceil(100 - share);
+        let by_seats = seats.saturating_mul(100).div_ceil(share);
         plan.before_feeders()
-            .saturating_add(plan.per_feeder.total().saturating_mul(feeders))
+            .saturating_add(by_connections.max(by_seats))
+            .saturating_add(200)
     }
 
-    /// The most feeders the budget admits: the feeder ceiling, the fewer of those its memory
-    /// holds ([`Budget::memory_feeders`]) and those its cores carry (`Plan::core_feeders`).
+    /// The most feeder connections the budget admits (`Admission::connections`): its memory over a
+    /// connection's floor and its mean rate's windows, and its cores' sessions and stages.
     pub fn ceiling(&self) -> usize {
-        let memory = self.memory_feeders();
-        self.plan()
-            .core_feeders()
-            .map_or(memory, |cores| cores.min(memory))
+        self.admission().connections
     }
 
-    /// The feeders the memory holds beside what it holds before any.
+    /// The connection limit by the memory alone.
     pub fn memory_feeders(&self) -> usize {
-        self.total
-            .checked_div(self.plan.per_feeder.total())
-            .unwrap_or(usize::MAX)
+        self.admission().connections_by_memory
     }
 
-    /// The load the relay admits at its ceiling: its feeders and the feeders its members' shared
-    /// rate is worth (`cores::Load`). What its stages' threads are sized for.
+    /// The relay-wide rate `R_max` in receptions a second (RFC-0181 §10, "Admission"): the least
+    /// of what the memory and the cores carry ([`Plan::admit`]). What the ingest stage admits
+    /// before signing, and what every rate-driven store's window is sized by.
+    pub fn max_receptions_per_sec(&self) -> u64 {
+        self.admission().rate
+    }
+
+    /// `R_max` in bytes a second.
+    pub fn max_bytes_per_sec(&self) -> u64 {
+        self.admission().bytes_per_sec()
+    }
+
+    /// The records a second `R_max` admits (`Admission::records_per_sec`).
+    pub fn max_records_per_sec(&self) -> u64 {
+        self.admission().records_per_sec()
+    }
+
+    /// The MLAT receiver seats the relay hosts at most (its own pool, planned from the memory and
+    /// the cores); none where MLAT is not hosted.
+    pub fn mlat_seats(&self) -> usize {
+        self.admission().seats
+    }
+
+    /// The load the relay is planned to carry (`cores::Load`): `R_max`, its connections and its
+    /// seats. What its stages' threads are sized for.
     pub fn load(&self) -> crate::cores::Load {
-        self.plan().load_of(self.ceiling())
+        let admission = self.admission();
+        crate::cores::Load {
+            receptions_per_sec: admission.rate,
+            connections: admission.connections,
+            seats: admission.seats,
+            member_feeders: self.plan.member_feeders,
+            sessions: self.plan.sessions,
+        }
     }
 
     /// Each stage's threads for the load admitted ([`Budget::load`], `cores::threads_for`).
@@ -1607,15 +2202,16 @@ impl Budget {
         crate::cores::mlat_threads_for(self.load(), plan.holds_raw, plan.cores)
     }
 
-    /// Reserves one feeder's bytes in every store, or `None` when they do not fit (the Hello is
-    /// refused): no more feeders than the ceiling, whichever of the memory and the cores bounds
-    /// it. Feeders reserve from their own room, never from the members' pool.
+    /// Reserves one connection's floor in the connection stores, or `None` when the connection
+    /// limit is reached (the Hello is refused). Connections reserve from their own room, never
+    /// from the members' pool; the rate-driven stores are not reserved per connection but sized
+    /// for the relay-wide rate ([`Admission::rate`]).
     pub fn reserve(&self) -> Option<Reservation> {
-        let per_feeder = self.plan.per_feeder.total();
+        let floor = self.plan.per_feeder.total();
         Self::take(
             &self.reserved,
-            per_feeder,
-            per_feeder.saturating_mul(self.ceiling()).min(self.total),
+            floor,
+            floor.saturating_mul(self.ceiling()).min(self.total),
         )
     }
 
@@ -1677,25 +2273,53 @@ impl Budget {
         self.plan.base
     }
 
-    /// What the relay plans to hold at its ceiling: what it holds before any feeder
-    /// (`Plan::before_feeders`) and every admitted feeder's share (`memory`, less what no whole
-    /// feeder fits in).
+    /// What the relay plans to hold at its limits: what it holds before any feeder
+    /// (`Plan::before_feeders`), every admitted connection's floor, the windows of `R_max` and
+    /// the seats.
     pub fn planned(&self) -> usize {
-        Self::memory_for(self.ceiling(), self.plan())
+        let admission = self.admission();
+        self.plan()
+            .before_feeders()
+            .saturating_add(admission.floor.saturating_mul(admission.connections))
+            .saturating_add(Self::rate_bytes(&self.plan, admission.rate))
+            .saturating_add(self.plan.per_seat.total().saturating_mul(admission.seats))
     }
 
-    /// What every admitted feeder and member together may hold in `store`, at the ceiling: the
-    /// feeders' shares, the members' shared rate's, and each member session's allowance.
+    /// What the rate-driven stores hold over their windows at `rate` receptions a second, all
+    /// together.
+    fn rate_bytes(plan: &Plan, rate: u64) -> usize {
+        Store::ALL
+            .iter()
+            .filter(|store| store.driver() == Driver::Rate)
+            .map(|store| Self::window_bytes(plan.per_rate.of(*store), rate))
+            .fold(0usize, usize::saturating_add)
+    }
+
+    /// `window` bytes a planned feeder's rate holds, at `rate` receptions a second: the store's
+    /// limit is its window times the rate.
+    fn window_bytes(window: usize, rate: u64) -> usize {
+        usize::try_from(
+            (window as u128).saturating_mul(u128::from(rate)) / PLANNED_RECEPTIONS_PER_SEC as u128,
+        )
+        .unwrap_or(usize::MAX)
+    }
+
+    /// What every admitted connection, the rate and the members together may hold in `store`:
+    /// the connections' floors, the store's window of `R_max` and of the members' rate (RFC-0181
+    /// §10: `limit = window x (R_max + members' rate)`), the seats', and each member session's
+    /// allowance.
     pub fn store_bytes(&self, store: Store) -> usize {
-        let feeders = self
+        let admission = self.admission();
+        let floors = self
             .plan
             .per_feeder
             .of(store)
-            .saturating_mul(self.ceiling());
-        let rate = self
+            .saturating_mul(admission.connections);
+        let rate = Self::window_bytes(self.plan.per_rate.of(store), admission.rate);
+        let seats = self.plan.per_seat.of(store).saturating_mul(admission.seats);
+        let members = self
             .plan
-            .per_feeder
-            .as_member()
+            .member_unit()
             .of(store)
             .saturating_mul(self.plan.member_feeders);
         let sessions = if store == Store::Ingest {
@@ -1703,7 +2327,11 @@ impl Budget {
         } else {
             0
         };
-        feeders.saturating_add(rate).saturating_add(sessions)
+        floors
+            .saturating_add(rate)
+            .saturating_add(seats)
+            .saturating_add(members)
+            .saturating_add(sessions)
     }
 
     /// The gauge of `store`: the same one for the budget's life, whatever it is resized to.
@@ -1752,6 +2380,8 @@ impl Budget {
             base: self.plan.base,
             per_feeder: self.plan.per_feeder.total(),
             ceiling: self.ceiling(),
+            admission: self.admission(),
+            allocator: allocator_report(),
             reserved: self.reserved(),
             members: self.plan.members,
             per_member: plan.per_member(),
@@ -1772,8 +2402,13 @@ impl Budget {
 pub struct MemoryReport {
     pub memory: usize,
     pub base: usize,
+    /// A connection's floor.
     pub per_feeder: usize,
     pub ceiling: usize,
+    /// What the plan admits: the connections, `R_max` and the MLAT seats, and what bound each.
+    pub admission: Admission,
+    /// The allocator's holdings (`allocator_report`).
+    pub allocator: AllocatorReport,
     pub reserved: usize,
     pub members: usize,
     pub per_member: usize,
@@ -2036,47 +2671,61 @@ mod tests {
         assert!(memory_available() > 0);
     }
 
-    /// The cores bound the feeders as the memory does (`cores`): the ceiling is the fewer, a
-    /// feeder past it is refused at its Hello whatever room the memory has, every store's share
-    /// follows it, and the stages' threads follow the load admitted, the members' rate in it.
+    /// The cores bound the connections and the rate as the memory does (`cores`): the limit is
+    /// the fewer, a connection past it is refused at its Hello whatever room the memory has, every
+    /// store's share follows the rate, and the stages' threads follow the load admitted, the
+    /// members' rate in it.
     #[test]
-    fn the_cores_bound_the_ceiling_and_the_threads_follow_it() {
+    fn the_cores_bound_the_connections_and_the_threads_follow_the_rate() {
         let members = Plan::planned(false).with_members(4, 16 * PLANNED_BYTES_PER_SEC as u64);
         let memory = Budget::memory_for(10_000, members);
         let unbounded = Budget::of_memory(memory, members);
         assert_eq!(unbounded.ceiling(), 10_000);
+        // Memory-bound, the rate is the connections' mean, no slack: the memory left holds no more.
+        assert_eq!(
+            unbounded.max_receptions_per_sec(),
+            10_000 * PLANNED_RECEPTIONS_PER_SEC as u64
+        );
+        assert_eq!(unbounded.admission().rate_bound, Bound::Memory);
         let one = members.with_cores(Some(1));
-        let carried = crate::cores::feeders_carried(1, false, members.load_of(0));
+        let available =
+            crate::cores::available_nanos(1, false, members.member_feeders, members.sessions);
+        let carried = crate::cores::connections_carried(available, false, 0);
         assert!(carried > 0 && carried < 10_000, "{carried}");
         let budget = Budget::of_memory(memory, one);
         assert_eq!(
             (budget.ceiling(), budget.memory_feeders()),
             (carried, 10_000)
         );
+        assert_eq!(budget.admission().connections_bound, Bound::Cores);
         assert!(budget.check().is_ok());
         let admitted: Vec<_> = (0..carried).filter_map(|_| budget.reserve()).collect();
         assert_eq!(admitted.len(), carried);
         assert!(
             budget.reserve().is_none(),
-            "a feeder past the cores was admitted"
+            "a connection past the cores was admitted"
         );
+        // The rate the cores carry is the connections' mean, and every rate-driven store's limit
+        // follows it, not the connections.
+        assert!(budget.max_receptions_per_sec() >= carried as u64 * 600);
+        assert!(budget.max_receptions_per_sec() < 2 * carried as u64 * 600);
+        assert!(budget.store_bytes(Store::Dedup) < unbounded.store_bytes(Store::Dedup));
         assert_eq!(
-            budget.store_bytes(Store::Dedup),
-            unbounded.store_bytes(Store::Dedup) - (10_000 - carried) * one.per_feeder.dedup
-        );
-        assert_eq!(budget.load(), members.load_of(carried));
-        assert_eq!(
-            budget.load().planned_feeders(),
-            carried + members.member_feeders
+            budget.load(),
+            crate::cores::Load {
+                receptions_per_sec: budget.max_receptions_per_sec(),
+                connections: carried,
+                seats: 0,
+                member_feeders: members.member_feeders,
+                sessions: members.sessions,
+            }
         );
         assert_eq!(
             budget.threads(),
             crate::cores::threads_for(budget.load(), false, Some(1))
         );
-        // Thirty-two cores carry the 10,000 the memory holds (ten no longer do, the feeders'
-        // records planned in the ingest workers, nor sixteen, every record planned wherever it is
-        // answered): the memory bounds it, and the threads follow those feeders, more than one a
-        // stage.
+        // Thirty-two cores carry the 10,000 the memory holds: the memory bounds it, and the
+        // threads follow that rate, more than one a stage.
         let ten = Budget::of_memory(memory, members.with_cores(Some(32)));
         assert_eq!(ten.ceiling(), 10_000);
         assert!(ten.threads().message > 1 && ten.threads().ingest > 1);
@@ -2099,7 +2748,7 @@ mod tests {
             assert_eq!(none.ceiling(), 0);
             assert!(none.check().is_err());
             let one = Budget::of_memory(Budget::memory_for(1, plan), plan);
-            assert_eq!(one.ceiling(), 1);
+            assert!(one.ceiling() >= 1);
             assert!(one.check().is_ok());
         }
         // Hosting MLAT adds its own base, beside each feeder's raw and notes.
@@ -2122,6 +2771,8 @@ mod tests {
         let plan = Plan {
             base: 0,
             per_feeder,
+            per_rate: PerFeeder::default(),
+            per_seat: PerFeeder::default(),
             members: 0,
             member_feeders: 0,
             connections: 0,
@@ -2216,7 +2867,10 @@ mod tests {
         for hosts_mlat in [false, true] {
             let plan = Plan::planned(hosts_mlat).with_members(2, 512 * 1024);
             let short = Budget::of_memory(Budget::memory_for(1, plan) - 1, plan);
-            assert_eq!(short.ceiling(), 0);
+            // (Hosting MLAT, memory short of a seat still admits connections, and the relay will
+            // not start without a seat to host.)
+            assert!(hosts_mlat || short.ceiling() == 0);
+            assert!(hosts_mlat || short.mlat_seats() == 0);
             let refused = short.check().err().unwrap_or_default();
             assert!(refused.contains("beside 2 member sessions"), "{refused}");
             // Memory that would hold the pool but not a feeder, and a feeder but not the pool.
@@ -2226,7 +2880,7 @@ mod tests {
                 Budget::of_memory(Budget::memory_for(1, Plan::planned(hosts_mlat)), plan);
             assert!(feeder_only.check().is_err());
             let fits = Budget::of_memory(Budget::memory_for(1, plan), plan);
-            assert_eq!(fits.ceiling(), 1);
+            assert!(fits.ceiling() >= 1);
             assert!(fits.check().is_ok());
             assert!(fits.reserve_member().is_some() && fits.reserve_member().is_some());
             assert!(fits.reserve().is_some());
@@ -2239,15 +2893,27 @@ mod tests {
     /// stores held beside it.
     #[test]
     fn the_budget_is_the_memory_run_in_less_the_headroom() {
-        for limit in [640 << 20, 672 << 20, 2 << 30, 16 << 30, 64 << 30] {
+        for limit in [640 << 20, 672 << 20, 2 << 30, 16 << 30, 32 << 30, 64 << 30] {
             let budget = budget_within(limit);
             assert!(budget + headroom_for(budget) <= limit, "{limit}");
             assert!(budget + 1 + headroom_for(budget + 1) > limit - 1, "{limit}");
+            // The share is what was measured (a small relay's) or the cap (a large one's).
             assert!(
-                limit - budget >= HEADROOM_BYTES + budget * MEASURED_ALLOCATOR_PERCENT / 100,
+                limit - budget
+                    >= HEADROOM_BYTES
+                        + (budget * MEASURED_ALLOCATOR_PERCENT / 100).min(ALLOCATOR_CAP_BYTES),
                 "{limit}"
             );
         }
+        // A small relay's share is a quarter of its budget; a large one's the cap.
+        assert_eq!(allocator_share(1 << 30), (1 << 30) / 4);
+        assert_eq!(allocator_share(usize::MAX / 200), ALLOCATOR_CAP_BYTES);
+        assert_eq!(allocator_share(24 << 30), ALLOCATOR_CAP_BYTES);
+        // At the cap, the 32 GiB relay keeps the cap and not a quarter of its budget.
+        assert_eq!(
+            (32usize << 30) - budget_within(32 << 30),
+            HEADROOM_BYTES + ALLOCATOR_CAP_BYTES
+        );
         assert_eq!(budget_within(HEADROOM_BYTES - 1), 0);
     }
 
@@ -2324,7 +2990,7 @@ mod tests {
     #[test]
     fn the_gauges_are_each_stores_share_and_follow_a_resize() {
         let plan = Plan::planned(false);
-        let per_feeder = plan.per_feeder;
+        let per_feeder = plan.per_rate;
         let mut budget = Budget::of_memory(Budget::memory_for(10, plan), plan);
         let epochs = budget.gauge(Store::Epochs);
         assert_eq!(epochs.limit(), per_feeder.epochs * 10);
@@ -2449,5 +3115,250 @@ mod tests {
         assert_eq!(budget.report().decoded.charged, decoded + (1 << 20));
         drop(charges);
         assert_eq!(budget.decoded_charged(), 0);
+    }
+
+    /// A connection reserves its floor and nothing the rate drives: the planned feeder's windows
+    /// are the relay-wide rate's, not reserved per connection (RFC-0181 §10, "Admission").
+    #[test]
+    fn a_connection_reserves_only_its_floor() {
+        for hosts_mlat in [false, true] {
+            let plan = Plan::planned(hosts_mlat);
+            let full = PerFeeder::planned(hosts_mlat);
+            assert_eq!(plan.per_feeder, full.floor());
+            assert_eq!(plan.per_rate, full.rate());
+            assert_eq!(plan.per_seat, full.seat());
+            // The three views are the planned feeder together, store by store.
+            assert_eq!(
+                plan.per_feeder.plus(&plan.per_rate).plus(&plan.per_seat),
+                full
+            );
+            for store in Store::ALL {
+                let views = [
+                    plan.per_feeder.of(store),
+                    plan.per_rate.of(store),
+                    plan.per_seat.of(store),
+                ];
+                assert!(
+                    views.iter().filter(|bytes| **bytes > 0).count() <= 1,
+                    "{store:?}"
+                );
+            }
+            assert!(plan.per_feeder.total() < full.total() / 2);
+            let budget = Budget::of_memory(Budget::memory_for(3, plan), plan);
+            let one = budget.reserve();
+            assert!(one.is_some());
+            assert_eq!(budget.reserved(), plan.per_feeder.total());
+        }
+    }
+
+    /// RFC-0181 §10, "Admission": each rate-driven gauge's limit is its window times the rate the
+    /// relay carries and the members' rate, each connection store's its floor times the
+    /// connections, and together they never pass the memory. The windows are the planned feeder's,
+    /// per reception a second.
+    #[test]
+    fn the_rate_driven_gauges_are_window_times_rate_and_members() {
+        let plan = Plan::planned(false).with_members(4, 16 * PLANNED_BYTES_PER_SEC as u64);
+        for connections in [10usize, 1_000, 20_000] {
+            let budget = Budget::of_memory(Budget::memory_for(connections, plan), plan);
+            let admission = budget.admission();
+            assert_eq!(admission.connections, connections);
+            let rate = admission.rate;
+            assert_eq!(rate, connections as u64 * PLANNED_RECEPTIONS_PER_SEC as u64);
+            let members = plan.member_feeders;
+            for store in Store::ALL {
+                let limit = budget.gauge(store).limit();
+                let expected = match store.driver() {
+                    Driver::Rate => plan.per_rate.of(store) * (rate as usize + members * 600) / 600,
+                    Driver::Connection => {
+                        plan.per_feeder.of(store) * connections
+                            + plan.member_unit().of(store) * members
+                            + if store == Store::Ingest {
+                                plan.per_member() * plan.members
+                            } else {
+                                0
+                            }
+                    }
+                    Driver::Seat => 0,
+                };
+                assert_eq!(limit, expected, "{store:?} at {connections}");
+            }
+            let all: usize = Store::ALL
+                .iter()
+                .map(|store| budget.gauge(*store).limit())
+                .sum();
+            assert!(all <= budget.memory() - budget.base(), "{connections}");
+            // The memory is planned to the byte but for what no whole connection fits in.
+            assert!(budget.memory() - budget.planned() < plan.per_feeder.total());
+        }
+    }
+
+    /// `R_max` is the lesser of what the memory and the cores carry, the connection limit the
+    /// fewer of the same, and each is printed with what bound it.
+    #[test]
+    fn r_max_is_the_lesser_of_memory_and_cores() {
+        let plan = Plan::planned(false);
+        let memory = Budget::memory_for(30_000, plan);
+        // Plenty of cores: the memory bounds both.
+        let many = Budget::of_memory(memory, plan.with_cores(Some(64))).admission();
+        assert_eq!(many.connections, 30_000);
+        assert_eq!(many.rate, many.rate_by_memory);
+        assert_eq!(
+            (many.connections_bound, many.rate_bound),
+            (Bound::Memory, Bound::Memory)
+        );
+        // Few cores: the cores bound both, and the rate is what the stages carry beside the
+        // sessions, a connection's mean at least.
+        let few = Budget::of_memory(memory, plan.with_cores(Some(8))).admission();
+        assert!(few.connections < 30_000);
+        assert_eq!(few.rate, few.rate_by_cores.unwrap_or(0));
+        assert_eq!(
+            (few.connections_bound, few.rate_bound),
+            (Bound::Cores, Bound::Cores)
+        );
+        assert!(few.rate >= few.connections as u64 * 600);
+        assert!(few.rate < many.rate);
+        // The one derivation: what the accessors say is what the plan admits.
+        let budget = Budget::of_memory(memory, plan.with_cores(Some(8)));
+        assert_eq!(budget.max_receptions_per_sec(), few.rate);
+        assert_eq!(budget.max_bytes_per_sec(), few.bytes_per_sec());
+        assert_eq!(
+            budget.max_bytes_per_sec(),
+            few.rate * PLANNED_BYTES_PER_SEC as u64 / PLANNED_RECEPTIONS_PER_SEC as u64
+        );
+        assert_eq!(
+            budget.max_records_per_sec(),
+            few.rate * crate::cores::RECORDS_PER_PLANNED_FEEDER / 600
+        );
+        // Feeders carried: at the planned mean, and at the ceiling a source is held to.
+        assert_eq!(few.feeders_at_mean(), few.rate / 600);
+        assert_eq!(
+            few.feeders_at_ceiling(),
+            few.rate / crate::ingest::SOURCE_RECEPTIONS_PER_SEC
+        );
+        assert!(few.feeders_at_ceiling() < few.feeders_at_mean());
+        // A smaller memory carries less of each.
+        let small = Budget::of_memory(Budget::memory_for(1_000, plan), plan).admission();
+        assert!(small.rate < many.rate && small.connections < many.connections);
+    }
+
+    /// MLAT's seats are their own pool, planned from what the connections leave: connections first
+    /// at their floor and mean rate, seats from MLAT's share and whatever the connections do not
+    /// use, never more than the connections.
+    #[test]
+    fn mlat_seats_are_a_pool_of_their_own() {
+        let plan = Plan::planned(true);
+        let connection = plan.per_feeder.total() + plan.per_rate.total();
+        // Memory for 500 pairs holds them, and connections go on beyond the seats: three times
+        // as many connections as before, where a seat for each connection admitted 500.
+        let pairs = Budget::of_memory(Budget::memory_for(500, plan), plan).admission();
+        assert!(pairs.seats >= 500, "{pairs:?}");
+        assert!(pairs.connections > pairs.seats, "{pairs:?}");
+        assert_eq!(pairs.seats_bound, Bound::Memory);
+        // The connections were planned from the memory the share left, at floor + rate, and the
+        // seats from the rest: together within the memory.
+        let total = Budget::memory_for(500, plan) - plan.before_feeders();
+        assert!(pairs.connections * connection <= total - total / 100 * 25);
+        assert!(pairs.connections * connection + pairs.seats * plan.per_seat.total() <= total);
+        // A memory-bound relay admits far more connections than the same memory in pairs (the
+        // public pod's fifteen).
+        let pair = connection + plan.per_seat.total();
+        assert!(pairs.connections > 2 * (total / pair), "{pairs:?}");
+        // The same relay not hosting MLAT carries more connections in that memory, and no seat.
+        let without = Plan::planned(false);
+        let none = Budget::of_memory(Budget::memory_for(500, plan), without).admission();
+        assert_eq!(none.seats, 0);
+        assert!(none.connections > pairs.connections);
+        assert_eq!(none.seats_bound, Bound::NotHosted);
+        // Cores that carry fewer connections than the memory holds cap them, and the seats are what
+        // the connections leave of the memory, never more than the connections.
+        let cores = plan.with_cores(Some(2));
+        let capped = Budget::of_memory(Budget::memory_for(20_000, plan), cores).admission();
+        assert_eq!(capped.connections_bound, Bound::Cores);
+        assert!(
+            capped.seats > 0 && capped.seats <= capped.connections,
+            "{capped:?}"
+        );
+        // Plenty of memory and few connections: a seat for each connection and no more.
+        let roomy = Budget::of_memory(Budget::memory_for(20_000, plan), plan.with_cores(Some(1)))
+            .admission();
+        assert!(roomy.seats <= roomy.connections, "{roomy:?}");
+        // The gauges of the seat stores are the seats' worth, nothing else's.
+        let budget = Budget::of_memory(Budget::memory_for(500, plan), plan);
+        let seats = budget.mlat_seats();
+        assert!(seats >= 500);
+        for store in Store::ALL {
+            if store.driver() == Driver::Seat {
+                assert_eq!(
+                    budget.gauge(store).limit(),
+                    plan.per_seat.of(store) * seats,
+                    "{store:?}"
+                );
+            }
+        }
+        // A hosting relay whose cores or memory leave no seat refuses to start.
+        let starved = Budget::of_memory(Budget::memory_for(1, plan) - 1, plan);
+        assert!(starved.check().is_err());
+    }
+
+    /// Waiters are served in turn by source, not by who wakes first: a source with many waiting
+    /// takes one turn at a time, so another's one batch is not behind all of them.
+    #[tokio::test]
+    async fn waiters_are_served_in_turn_by_source() {
+        let batch = DRR_QUANTUM * 3 / 4;
+        let gauge = Gauge::new(Store::Ingest, batch);
+        let held = gauge.charge_for(9, batch).await;
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let mut tasks = Vec::new();
+        for (source, count) in [(1u64, 5), (2u64, 1)] {
+            for _ in 0..count {
+                let (gauge, order) = (Arc::clone(&gauge), Arc::clone(&order));
+                tasks.push(tokio::spawn(async move {
+                    let charge = gauge.charge_for(source, batch).await;
+                    order.lock().map(|mut order| order.push(source)).ok();
+                    tokio::task::yield_now().await;
+                    drop(charge);
+                }));
+                tokio::task::yield_now().await;
+            }
+        }
+        assert_eq!(gauge.waiting(), 6);
+        drop(held);
+        for task in tasks {
+            task.await.ok();
+        }
+        let order = order.lock().map(|order| order.clone()).unwrap_or_default();
+        // The late source is served in its turn, second, not after the five before it.
+        assert_eq!(order, [1, 2, 1, 1, 1, 1]);
+        assert_eq!((gauge.held(), gauge.waiting()), (0, 0));
+    }
+
+    /// A newcomer does not take room ahead of a waiter, and a waiter that gives up is no one's
+    /// block.
+    #[tokio::test]
+    async fn a_newcomer_queues_behind_waiters_and_an_abandoned_waiter_blocks_no_one() {
+        let gauge = Gauge::new(Store::Ingest, 100);
+        let held = gauge.charge(100).await;
+        let big = tokio::spawn({
+            let gauge = Arc::clone(&gauge);
+            async move { gauge.charge_for(1, 100).await.bytes() }
+        });
+        tokio::task::yield_now().await;
+        let abandoned = tokio::spawn({
+            let gauge = Arc::clone(&gauge);
+            async move { gauge.charge_for(2, 50).await.bytes() }
+        });
+        tokio::task::yield_now().await;
+        abandoned.abort();
+        tokio::task::yield_now().await;
+        let behind = tokio::spawn({
+            let gauge = Arc::clone(&gauge);
+            async move { gauge.charge_for(3, 10).await.bytes() }
+        });
+        tokio::task::yield_now().await;
+        // Room for the newcomer's 10 only, after 90 are let go: it still waits behind the 100.
+        drop(held);
+        assert_eq!(big.await.ok(), Some(100));
+        assert_eq!(behind.await.ok(), Some(10));
+        assert_eq!(gauge.held(), 0);
     }
 }

@@ -54,6 +54,9 @@ pub struct Config {
     pub location: Option<Location>,
     pub clock: Clock,
     pub ceiling: u32,
+    /// The local address its relay sessions connect from; `None` (always, from the command line)
+    /// is the system's choice. A load harness sets one for each simulated feeder.
+    pub source_address: Option<std::net::IpAddr>,
 }
 
 pub fn parse(args: impl Iterator<Item = String>) -> Result<Command, String> {
@@ -73,6 +76,7 @@ pub fn parse(args: impl Iterator<Item = String>) -> Result<Command, String> {
         location: None,
         clock: Clock::Dump1090,
         ceiling: 64_000,
+        source_address: None,
     };
     let (mut lat, mut lon, mut alt, mut precision) = (None, None, None, 0u32);
     while let Some(flag) = args.next() {

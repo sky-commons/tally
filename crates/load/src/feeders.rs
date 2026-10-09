@@ -3,7 +3,6 @@
 //! second), with the simulator in place of readsb. They share one runtime, so thousands run in one
 //! process; they start evenly over the ramp.
 
-use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
@@ -31,22 +30,40 @@ pub struct Counts {
     pub behind: AtomicU64,
 }
 
+/// What the feeders play and where they connect from (`spawn`).
+pub struct Run {
+    pub traffic: Arc<Traffic>,
+    pub relays: Vec<RelayAddress>,
+    pub ceiling: u32,
+    pub ramp: Duration,
+    pub state_dir: std::path::PathBuf,
+    pub networks: crate::config::Networks,
+    /// Feeders playing each simulated receiver (`--replay`).
+    pub replay: usize,
+    /// The simulation's seed, from which the identities of the replaying feeders are made.
+    pub seed: u64,
+}
+
 /// Starts this shard's feeders, the `i`-th of them after `ramp * i / n`, each publishing to one of
 /// `relays` (by its index in the run, so every address takes its share). Every feeder plays the
 /// simulation on one clock, from `start`: second `n` of the run is heard by every receiver in it
 /// during the same second, as one transmission is heard by every receiver in reach at once, and the
 /// simulation makes the run's seconds a few ahead of that clock. A feeder that starts later joins
 /// the second being heard.
-pub fn spawn(
-    traffic: Arc<Traffic>,
-    relays: &[RelayAddress],
-    ceiling: u32,
-    ramp: Duration,
-    state_dir: &Path,
-    counts: Arc<Counts>,
-    start: tokio::time::Instant,
-) {
-    let local = traffic.receivers.len().max(1) as u32;
+pub fn spawn(run: Run, counts: Arc<Counts>, start: tokio::time::Instant) {
+    let Run {
+        traffic,
+        relays,
+        ceiling,
+        ramp,
+        state_dir,
+        networks,
+        replay,
+        seed,
+    } = run;
+    let relays = relays.as_slice();
+    let state_dir = state_dir.as_path();
+    let local = (traffic.receivers.len().max(1) * replay.max(1)) as u32;
     // The wall clock of `start`, which a GNSS-disciplined receiver's counter reads (`frames`).
     let start_unix_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -54,8 +71,26 @@ pub fn spawn(
         .saturating_sub(start.elapsed().as_millis() as u64);
     // The simulation runs a few seconds ahead of this clock (`Traffic::begin`).
     traffic.begin(start.into_std());
-    for (at, receiver) in traffic.receivers.iter().enumerate() {
-        let relay = relays[receiver.index % relays.len()].clone();
+    // A feeder on a relay at a loopback address connects from one of its own (`Networks`).
+    let loopback = relays.iter().all(|relay| {
+        relay.address.rsplit_once(':').is_some_and(|(host, _)| {
+            host == "localhost"
+                || host
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|ip| ip.is_loopback())
+        })
+    });
+    // Each simulated receiver is played by `replay` feeders (`--replay`): the first with its own
+    // identity, the others with identities of their own that hear what it hears, so a run of more
+    // feeders than the simulation can make traffic for in real time still has each feeder send
+    // signed, chained batches of its own.
+    let each: Vec<(usize, usize)> = (0..replay.max(1))
+        .flat_map(|round| (0..traffic.receivers.len()).map(move |at| (round, at)))
+        .collect();
+    for (round, at) in each {
+        let receiver = &traffic.receivers[at];
+        let index = round * traffic.receivers.len() + at;
+        let relay = relays[index % relays.len()].clone();
         let config = Config {
             // Never read: the identity is handed over (`tally_feed::start`).
             key_file: state_dir.join("unused"),
@@ -63,12 +98,20 @@ pub fn spawn(
             uat: None,
             relays: vec![relay],
             seeds: Vec::new(),
-            state_dir: state_dir.join("feeders").join(receiver.index.to_string()),
+            state_dir: state_dir.join("feeders").join(index.to_string()),
             location: Some(receiver.location),
             clock: receiver.clock,
             ceiling,
+            source_address: networks.source_address(index, loopback),
         };
-        let identity = receiver.identity.clone();
+        let identity = if round == 0 {
+            receiver.identity.clone()
+        } else {
+            tally_mlat_solver::sim::receiver_identity(
+                seed.wrapping_add((round as u64).wrapping_mul(1_000_003)),
+                receiver.index,
+            )
+        };
         let traffic = Arc::clone(&traffic);
         let counts = Arc::clone(&counts);
         let wait = ramp.mul_f64(f64::from(at as u32) / f64::from(local));

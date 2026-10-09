@@ -53,7 +53,11 @@ async fn egress(State(hub): State<Arc<Hub>>) -> Response {
 
 async fn mlat(State(hub): State<Arc<Hub>>) -> Response {
     match hub.network().mlat() {
-        Some(mlat) => axum::Json(mlat.report()).into_response(),
+        Some(mlat) => {
+            let mut report = mlat.report();
+            (report.cuts_sent, report.cuts_received, report.cuts_refused) = hub.network().cuts();
+            axum::Json(report).into_response()
+        }
         None => (StatusCode::NOT_FOUND, "this relay hosts no MLAT").into_response(),
     }
 }
@@ -250,7 +254,17 @@ mod tests {
         let (status, body) = get(address, "/mlat").await?;
         assert_eq!(status, 200, "{body}");
         let report: crate::mlat_host::MlatReport = serde_json::from_str(&body).map_err(text)?;
-        assert_eq!(report, crate::mlat_host::MlatReport::default());
+        // Nothing has happened, but the seats the host was planned (its capacity's receivers, here
+        // the default) are served: no cut is in force, so the cap is the limit.
+        assert_eq!(report.seat_cap, report.seat_limit, "{body}");
+        assert_eq!(
+            report,
+            crate::mlat_host::MlatReport {
+                seat_cap: report.seat_limit,
+                seat_limit: report.seat_limit,
+                ..crate::mlat_host::MlatReport::default()
+            }
+        );
         for counter in [
             "refused",
             "overflowed",

@@ -34,7 +34,7 @@ For a spawned relay:
   --relay-mlat           let it host MLAT (no --no-mlat): it plans MLAT's memory and cores
                          beside the stages, so it admits fewer feeders
   --relay-fit            give it --memory exactly what --feeders need (`tally-relay check`'s
-                         before-feeders and per-feeder), as a deploy sized for them is: the run
+                         before-feeders and per-connection (and per-seat, hosting MLAT)), as a deploy sized for them is: the run
                          then fails if the relay's peak resident memory passed that budget and
                          the headroom the relay keeps below the memory it runs in
 
@@ -54,6 +54,15 @@ The load:
                          about 320 receptions a second, since a simulated aircraft sends about
                          3.4 messages a second; 9,000 reach 600)
   --seed S               the simulation's seed (default 0: the world benchmark's clusters)
+  --replay K             make traffic for N/K receivers and have K feeders play each (the first
+                         with the receiver's identity, the rest with identities of their own that
+                         hear what it hears): for runs of more feeders than the simulation (one
+                         thread a cluster) can make real-time traffic for, at the cost of every
+                         message being heard by K times as many feeders as it would be (default 1)
+  --feeder-networks M    where the feeders connect from, which the relay groups them by (their
+                         /16): many (each from its own address across 127.0.0.0/8, in 256 groups,
+                         so the relay sees honest feeders), one (all from one address, one group:
+                         the Sybil case), auto (many if every relay is on loopback; the default)
   --ceiling BYTES        each feeder's --ceiling (default 64000, the feeder's own default)
   --ramp SECS            start the feeders evenly over this long (default 60)
   --warmup SECS          wait this long after the ramp before measuring (default 30)
@@ -144,6 +153,55 @@ impl Shard {
     }
 }
 
+/// Where the simulated feeders connect from, which is what a relay groups them by (their network
+/// group, the /16 of an IPv4 address): it shares its ingest rate between groups, so feeders in one
+/// group are one share.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Networks {
+    /// `Many` where every relay is on loopback, else `One`.
+    Auto,
+    /// Each feeder connects from an address of its own across 127.0.0.0/8 (Linux routes all of it
+    /// to loopback), spread over its 256 /16 groups, so a run measures honest feeders, each in
+    /// a network of its own kind.
+    Many,
+    /// Every feeder connects from the system's address: one group, as a Sybil does.
+    One,
+}
+
+impl Networks {
+    fn parse(text: &str) -> Result<Self, String> {
+        match text {
+            "auto" => Ok(Self::Auto),
+            "many" => Ok(Self::Many),
+            "one" => Ok(Self::One),
+            other => Err(format!(
+                "--feeder-networks: {other} is not auto, many or one"
+            )),
+        }
+    }
+
+    /// The address feeder number `index` of the run connects from, when it is given one. 256
+    /// groups (127.G.0.0/16, G from the index) hold the feeders in turn, each feeder its own host
+    /// in its group.
+    pub fn source_address(self, index: usize, loopback: bool) -> Option<std::net::IpAddr> {
+        let many = match self {
+            Self::Many => true,
+            Self::One => false,
+            Self::Auto => loopback,
+        };
+        many.then(|| {
+            let group = (index % 256) as u8;
+            let host = (index / 256 + 1) as u16;
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(
+                127,
+                group,
+                (host >> 8) as u8,
+                (host & 0xff) as u8,
+            ))
+        })
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Config {
     pub relay: Relay,
@@ -160,6 +218,9 @@ pub struct Config {
     pub decode_threads: usize,
     pub state_dir: PathBuf,
     pub simulate_only: bool,
+    pub networks: Networks,
+    /// Feeders playing each simulated receiver (`--replay`).
+    pub replay: usize,
 }
 
 /// `None` when the command was fully handled (usage).
@@ -199,6 +260,8 @@ pub fn parse(args: impl Iterator<Item = String>) -> Result<Option<Config>, Strin
         decode_threads: 4,
         state_dir: std::env::temp_dir().join(format!("tally-load-{}", std::process::id())),
         simulate_only: false,
+        networks: Networks::Auto,
+        replay: 1,
     };
     let mut args = args.peekable();
     while let Some(flag) = args.next() {
@@ -233,6 +296,8 @@ pub fn parse(args: impl Iterator<Item = String>) -> Result<Option<Config>, Strin
             "--decode-threads" => config.decode_threads = number(&flag, &value()?)?,
             "--state-dir" => config.state_dir = PathBuf::from(value()?),
             "--simulate-only" => config.simulate_only = true,
+            "--replay" => config.replay = number::<usize>(&flag, &value()?)?.max(1),
+            "--feeder-networks" => config.networks = Networks::parse(&value()?)?,
             other => return Err(format!("unknown argument {other}\n\n{USAGE}")),
         }
     }
@@ -247,6 +312,8 @@ pub fn parse(args: impl Iterator<Item = String>) -> Result<Option<Config>, Strin
     // The run simulated whole, and some to spare for the feeders' last second and the summary.
     let run = config.ramp + config.warmup + config.duration + RUN_SPARE;
     spec.seconds = u32::try_from(run.as_secs().saturating_add(1)).unwrap_or(u32::MAX);
+    // The simulation makes traffic for the receivers each feeder plays (`--replay`).
+    spec.feeders = spec.feeders.div_ceil(config.replay);
     config.spec = spec;
     config.relay = match (addresses.is_empty(), relay_bin) {
         (false, _) => Relay::Existing {

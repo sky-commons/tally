@@ -134,27 +134,60 @@ const NANOS: usize = 1_000_000_000;
 /// Nanoseconds of one core a second one thread is planned to spend ([`BUSY_PERCENT`] of it).
 const PLANNED_PER_THREAD: usize = NANOS / 100 * BUSY_PERCENT;
 
-/// Where one planned feeder's worth of load comes from, which decides what it costs the ingest
-/// workers: a record costs them [`INGEST_NANOS_PER_RECORD`] whatever its receptions, so a source
-/// costs the more of its planned receptions and the records a second it may send.
+/// Nanoseconds of one core a Noise XX handshake and the Hello's verification cost the responder.
+/// Measured (2026-10-09, release build, one core of the 32-core build host): 160 to 200 us the
+/// responder's side, 5,000 to 6,000 a second a core; planned at the dearer, 200 us.
+pub const HANDSHAKE_NANOS: usize = 200_000;
+/// How long a planned handshake waits on its peer from its first byte to its last (a round trip
+/// and a half of a peer within some 50 ms), which holds its permit without costing a core.
+pub const HANDSHAKE_WAIT_MS: usize = 100;
+
+/// The handshakes a second the runtime's `cores` pass, planned: [`BUSY_PERCENT`] of each core at
+/// [`HANDSHAKE_NANOS`] a handshake. A reconnect storm is admitted at this pace, so it never takes
+/// the sessions already served with it, and 20,000 feeders reconnecting at once are all admitted in
+/// a few seconds on a few cores.
+pub const fn handshake_pace_per_sec(cores: usize) -> u64 {
+    (cores.saturating_mul(PLANNED_PER_THREAD) / HANDSHAKE_NANOS) as u64
+}
+
+/// The handshakes a second `permits` at once pass when each holds its permit [`HANDSHAKE_WAIT_MS`].
+pub const fn handshake_pace_of(permits: usize) -> u64 {
+    (permits as u64).saturating_mul(1_000) / HANDSHAKE_WAIT_MS as u64
+}
+
+/// The handshakes allowed at once on `cores` cores: the pace over the time each holds its permit
+/// waiting on its peer ([`HANDSHAKE_WAIT_MS`], Little's law), so the cap passes the pace and
+/// admits no more than it. At least one.
+pub const fn handshakes_in_flight(cores: usize) -> usize {
+    let permits =
+        (handshake_pace_per_sec(cores) as usize).saturating_mul(HANDSHAKE_WAIT_MS) / 1_000;
+    if permits == 0 { 1 } else { permits }
+}
+
+/// Where a planned feeder's worth of load comes from, which decides what it costs the ingest
+/// workers. The feeders' own records are not planned per feeder (a planned feeder's one batch a
+/// second is inside the reception costs measured over whole batches, and the records beyond them
+/// are metered at ingest against one relay-wide figure, [`RECORDS_PER_PLANNED_FEEDER`] of the
+/// rate admitted); only the members' rate is planned by its records, which come over links the
+/// relay does not meter per source.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Source {
-    /// A feeder, sending at most this many records a second (`ingest::records_per_sec` of its
-    /// byte ceiling, `--max-feeder-bytes-per-sec`): eight at the default 256 KiB/s, so one sending
-    /// tiny batches up to its pace costs the workers more than a planned feeder's receptions do.
-    Feeder { records_per_sec: u64 },
     /// One planned feeder's worth of the members' shared rate, its records at
     /// `ingest::MEMBER_RECORDS_PER_FEEDER` a second.
     Member,
 }
 
+/// The records a second the relay-wide rate admits for each planned feeder's worth of it
+/// (`Budget::max_records_per_sec`): the batch a second a planned feeder sends and as many again
+/// (small batches, echoes, queries). The stages' headroom ([`BUSY_PERCENT`]) holds the ingest
+/// workers' verification of them, a record costing [`INGEST_NANOS_PER_RECORD`] against the 133 us a
+/// planned feeder's receptions cost the workers; past it ingest sheds.
+pub const RECORDS_PER_PLANNED_FEEDER: u64 = 2;
+
 impl Source {
     /// The records a second it may send.
     pub const fn records_per_sec(self) -> u64 {
-        match self {
-            Self::Feeder { records_per_sec } => records_per_sec,
-            Self::Member => MEMBER_RECORDS_PER_FEEDER,
-        }
+        MEMBER_RECORDS_PER_FEEDER
     }
 
     /// Nanoseconds of one core a second its records cost at most, wherever they are taken: each at
@@ -225,35 +258,36 @@ impl Sessions {
     }
 }
 
-/// The load a relay is planned to admit: its feeders, each sending at most `feeder_records_per_sec`
-/// records a second, the feeders its members' shared rate is worth (`Budget::load`), and its other
-/// sessions ([`Sessions`]).
+/// The load a relay is planned to carry (`Budget::load`): the receptions a second its stages carry
+/// (the relay-wide rate `R_max`, `Budget::max_receptions_per_sec`), the feeder connections its
+/// runtime serves, the MLAT seats it hosts, the feeders its members' shared rate is worth and its
+/// other sessions ([`Sessions`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Load {
-    pub feeders: usize,
+    /// Receptions a second the stages carry for feeders (not the members').
+    pub receptions_per_sec: u64,
+    /// The feeder connections: each a Noise session on the runtime.
+    pub connections: usize,
+    /// The MLAT seats hosted (each a feeder's worth of MLAT's steps).
+    pub seats: usize,
     pub member_feeders: usize,
-    pub feeder_records_per_sec: u64,
     pub sessions: Sessions,
 }
 
 impl Load {
-    /// The feeder's source of this load.
-    pub const fn feeder(&self) -> Source {
-        Source::Feeder {
-            records_per_sec: self.feeder_records_per_sec,
-        }
-    }
-
-    /// Nanoseconds of one core a second `cost` adds over this load: its feeders' and its members'.
-    fn spent(&self, cost: impl Fn(Source) -> usize) -> usize {
-        self.feeders
-            .saturating_mul(cost(self.feeder()))
-            .saturating_add(self.member_feeders.saturating_mul(cost(Source::Member)))
-    }
-
-    /// The planned feeders' worth it is: its feeders and the members' rate's.
-    pub const fn planned_feeders(&self) -> usize {
-        self.feeders.saturating_add(self.member_feeders)
+    /// Nanoseconds of one core a second `work` spends on this load at its average: the stages by
+    /// their receptions (a planned feeder's 600 cost [`Work::receptions_part`]), the runtime by
+    /// its connections' sessions, and the members' feeders' worth apiece.
+    fn average_nanos(&self, work: Work, holds_raw: bool) -> usize {
+        let part = work.receptions_part(holds_raw) as u128;
+        let own = match work {
+            Work::Runtime => part * self.connections as u128,
+            _ => part * u128::from(self.receptions_per_sec) / PLANNED_RECEPTIONS_PER_SEC as u128,
+        };
+        usize::try_from(own).unwrap_or(usize::MAX).saturating_add(
+            self.member_feeders
+                .saturating_mul(work.per_feeder(holds_raw, Source::Member)),
+        )
     }
 }
 
@@ -272,14 +306,10 @@ impl Work {
     pub const ALL: [Self; 4] = [Self::Ingest, Self::Message, Self::Seal, Self::Runtime];
 
     /// Nanoseconds of one core a second one planned feeder's worth from `source` costs this work,
-    /// in a relay that holds MLAT raw (`holds_raw`) or not, at its busiest: what its threads are
-    /// sized by. The ingest workers' is the more of its planned receptions and its records a second
-    /// at [`INGEST_NANOS_PER_RECORD`] each (R-N12): before, only the receptions were planned, while
-    /// a feeder sending tiny batches up to its records' pace cost the workers 1.8 times a planned
-    /// one. The runtime's is its session's and every record answered there
-    /// ([`RUNTIME_NANOS_PER_RECORD`], R4 of sweep 5). The two count the same records, each the
-    /// one stage's whole pace: what the cores spend on a source together is
-    /// [`Work::receptions_part`] of each and its records once ([`Source::records_nanos`]).
+    /// in a relay that holds MLAT raw (`holds_raw`) or not, at its busiest. The ingest workers' is
+    /// the more of its planned receptions and its records a second at [`INGEST_NANOS_PER_RECORD`]
+    /// each (R-N12); the runtime's is its session's and every record answered there
+    /// ([`RUNTIME_NANOS_PER_RECORD`], R4 of sweep 5).
     pub const fn per_feeder(self, holds_raw: bool, source: Source) -> usize {
         let part = self.receptions_part(holds_raw);
         let records = source.records_per_sec() as usize;
@@ -312,15 +342,15 @@ impl Work {
     /// The threads this work needs for `load`, at least one, at most `cores` when they are known.
     pub fn threads_for(self, load: Load, holds_raw: bool, cores: Option<usize>) -> usize {
         let threads = load
-            .spent(|source| self.per_feeder(holds_raw, source))
+            .average_nanos(self, holds_raw)
             .div_ceil(PLANNED_PER_THREAD)
             .max(1);
         cores.map_or(threads, |cores| threads.min(cores.max(1)))
     }
 }
 
-/// Every stage's threads for `load` (the feeders admitted and those the members' rate is worth),
-/// holding MLAT raw or not, on `cores` cores when they are known: what a relay runs.
+/// Every stage's threads for `load`, holding MLAT raw or not, on `cores` cores when they are
+/// known: what a relay runs.
 pub fn threads_for(load: Load, holds_raw: bool, cores: Option<usize>) -> Threads {
     Threads {
         ingest: Work::Ingest.threads_for(load, holds_raw, cores),
@@ -329,9 +359,9 @@ pub fn threads_for(load: Load, holds_raw: bool, cores: Option<usize>) -> Threads
     }
 }
 
-/// Nanoseconds of one core a second hosted MLAT costs one planned feeder: its window steps and its
-/// provisional steps, in a relay that hosts MLAT (`hosts_mlat`, the relay that holds MLAT raw), and
-/// nothing in one that does not.
+/// Nanoseconds of one core a second hosted MLAT costs one seat (a planned feeder's worth): its
+/// window steps and its provisional steps, in a relay that hosts MLAT (`hosts_mlat`), and nothing
+/// in one that does not.
 pub const fn mlat_per_feeder(hosts_mlat: bool) -> usize {
     if hosts_mlat {
         MLAT_WINDOW_NANOS_PER_FEEDER + MLAT_PROVISIONAL_NANOS_PER_FEEDER
@@ -341,11 +371,8 @@ pub const fn mlat_per_feeder(hosts_mlat: bool) -> usize {
 }
 
 /// Nanoseconds of one core a second the stages and the runtime spend on one planned feeder's
-/// worth from `source` at most, together: every work's receptions part (the runtime's session) and
-/// its records once, each at the dearer of where it may be taken. A record goes to the ingest
-/// workers or to the runtime, never both, so of `r` records `k` taken as batches cost no more than
-/// the receptions planned and `k` ingest records, and the rest the runtime's: at most the
-/// receptions and `r` at the dearer, whatever `k`.
+/// worth from `source` at most, together: every work's receptions part (the runtime's session)
+/// and its records once, each at the dearer of where it may be taken.
 pub const fn spent_per_feeder(source: Source, holds_raw: bool) -> usize {
     let mut spent = source.records_nanos();
     let mut at = 0;
@@ -356,76 +383,139 @@ pub const fn spent_per_feeder(source: Source, holds_raw: bool) -> usize {
     spent
 }
 
-/// Nanoseconds of one core a second the plan sets aside for one planned feeder's worth from
-/// `source` in the stages ([`spent_per_feeder`] at [`BUSY_PERCENT`]), holding MLAT raw or not.
-fn stage_planned(source: Source, holds_raw: bool) -> usize {
-    spent_per_feeder(source, holds_raw)
+/// The same over `load`, every work at [`BUSY_PERCENT`] of its threads.
+fn stages_planned(load: Load, holds_raw: bool) -> usize {
+    Work::ALL
+        .iter()
+        .map(|work| load.average_nanos(*work, holds_raw))
+        .fold(0usize, usize::saturating_add)
         .saturating_mul(100)
         .div_ceil(BUSY_PERCENT)
 }
 
-/// The same over `load`.
-fn stages_planned(load: Load, holds_raw: bool) -> usize {
-    load.spent(|source| stage_planned(source, holds_raw))
-}
-
 /// The same for hosted MLAT's steps over `load` (at [`MLAT_BUSY_PERCENT`]): none where it is not
-/// hosted. MLAT's work follows the receptions, whatever the records carry them.
+/// hosted. MLAT's work follows the seats and the members' raw.
 fn mlat_planned(load: Load, hosts_mlat: bool) -> usize {
-    load.planned_feeders()
+    load.seats
+        .saturating_add(load.member_feeders)
         .saturating_mul(mlat_per_feeder(hosts_mlat))
         .saturating_mul(100)
         .div_ceil(MLAT_BUSY_PERCENT)
 }
 
-/// Nanoseconds of one core a second the plan sets aside for one planned feeder's worth from
-/// `source`: the stages' share and, hosting MLAT, its steps'.
+/// Nanoseconds of one core a second the plan sets aside for one planned feeder's worth of the
+/// members' rate: the stages' share at [`BUSY_PERCENT`] and, hosting MLAT, its steps'.
 pub fn planned_per_feeder(source: Source, holds_raw: bool) -> usize {
-    let one = Load {
-        feeders: 0,
-        member_feeders: 0,
-        feeder_records_per_sec: source.records_per_sec(),
-        sessions: Sessions::default(),
-    };
-    let one = match source {
-        Source::Feeder { .. } => Load { feeders: 1, ..one },
-        Source::Member => Load {
-            member_feeders: 1,
-            ..one
-        },
-    };
-    stages_planned(one, holds_raw).saturating_add(mlat_planned(one, holds_raw))
+    let stages = spent_per_feeder(source, holds_raw)
+        .saturating_mul(100)
+        .div_ceil(BUSY_PERCENT);
+    stages.saturating_add(
+        mlat_per_feeder(holds_raw)
+            .saturating_mul(100)
+            .div_ceil(MLAT_BUSY_PERCENT),
+    )
 }
 
-/// The feeders sending at most `records_per_sec` records a second that `cores` cores carry,
-/// holding MLAT raw (hosting MLAT) or not: every stage's work at the planned rate, the runtime's
-/// with it, in [`BUSY_PERCENT`] of their share, and beside them hosted MLAT's steps in
-/// [`MLAT_BUSY_PERCENT`] of what is left.
-pub fn load_carried(cores: usize, holds_raw: bool, records_per_sec: u64) -> usize {
+/// Nanoseconds of one core a second the cores leave the feeders' connections and the MLAT seats:
+/// all of `cores` less the members' rate's worth (stages and raw) and the other sessions' records,
+/// which the plan holds first, as the memory's members' pool and connection buffers are.
+pub fn available_nanos(
+    cores: usize,
+    holds_raw: bool,
+    member_feeders: usize,
+    sessions: Sessions,
+) -> usize {
     cores
         .saturating_mul(NANOS)
-        .checked_div(planned_per_feeder(
-            Source::Feeder { records_per_sec },
-            holds_raw,
-        ))
+        .saturating_sub(
+            member_feeders.saturating_mul(planned_per_feeder(Source::Member, holds_raw)),
+        )
+        .saturating_sub(sessions.planned())
+}
+
+/// Nanoseconds a feeder connection's session costs the runtime, at [`BUSY_PERCENT`].
+pub fn connection_nanos(holds_raw: bool) -> usize {
+    Work::Runtime
+        .receptions_part(holds_raw)
+        .saturating_mul(100)
+        .div_ceil(BUSY_PERCENT)
+}
+
+/// Nanoseconds the stages spend on a planned feeder's 600 receptions a second, at
+/// [`BUSY_PERCENT`]: ingest, message exchange and sealer together. The cost of a reception is this
+/// over 600.
+pub fn stage_nanos(holds_raw: bool) -> usize {
+    [Work::Ingest, Work::Message, Work::Seal]
+        .iter()
+        .map(|work| work.receptions_part(holds_raw))
+        .fold(0usize, usize::saturating_add)
+        .saturating_mul(100)
+        .div_ceil(BUSY_PERCENT)
+}
+
+/// The feeder connections `available` nanoseconds carry at the planned mean (their sessions and
+/// their receptions through the stages, at [`BUSY_PERCENT`]) beside `seats` MLAT seats.
+pub fn connections_carried(available: usize, holds_raw: bool, seats: usize) -> usize {
+    available
+        .saturating_sub(seats.saturating_mul(mlat_per_feeder(holds_raw)))
+        .checked_div(connection_nanos(holds_raw).saturating_add(stage_nanos(holds_raw)))
         .unwrap_or(usize::MAX)
+}
+
+/// The receptions a second the stages carry in what `available` nanoseconds leave after
+/// `connections` sessions and `seats` MLAT seats: the cores' bound on `R_max`.
+pub fn rate_carried(available: usize, holds_raw: bool, connections: usize, seats: usize) -> u64 {
+    let left = available
+        .saturating_sub(seats.saturating_mul(mlat_per_feeder(holds_raw)))
+        .saturating_sub(connections.saturating_mul(connection_nanos(holds_raw)));
+    (left as u128 * PLANNED_RECEPTIONS_PER_SEC as u128)
+        .checked_div(stage_nanos(holds_raw) as u128)
+        .map_or(u64::MAX, |rate| u64::try_from(rate).unwrap_or(u64::MAX))
+}
+
+/// The seats the cores carry once `connections` are planned at the mean: what `available`
+/// nanoseconds leave after their sessions and receptions through the stages, over a seat's steps.
+/// MLAT's seats are planned from what the connections leave, never the reverse.
+pub fn seats_carried(available: usize, holds_raw: bool, connections: usize) -> usize {
+    available
+        .saturating_sub(
+            connections
+                .saturating_mul(connection_nanos(holds_raw).saturating_add(stage_nanos(holds_raw))),
+        )
+        .checked_div(mlat_per_feeder(holds_raw))
+        .unwrap_or(usize::MAX)
+}
+
+/// The part of the memory and of the cores a relay hosting MLAT keeps for its seats when it plans
+/// its connections (`budget::Plan::admit`): the connections are planned from the rest, at their
+/// floor and the windows of their mean rate, and the seats from the share and whatever the
+/// connections leave unused (a relay whose cores bind its connections leaves memory), never more
+/// than the connections. Without it a relay bound by memory would plan every byte to connections
+/// and have none for a seat, and with a seat for each connection (before) it admitted about
+/// fifteen on the public pod.
+pub const MLAT_SHARE_PERCENT: usize = 25;
+
+/// `total` less the share a relay hosting MLAT keeps for its seats ([`MLAT_SHARE_PERCENT`]).
+pub const fn after_mlat_share(total: usize, holds_raw: bool) -> usize {
+    if holds_raw {
+        total - total / 100 * MLAT_SHARE_PERCENT
+    } else {
+        total
+    }
 }
 
 /// The threads hosted MLAT's steps are spread over for `load`, on `cores` cores when they are
 /// known: none where it is not hosted; else the cores the stages' share leaves, rounded up, at
 /// least one, or where the cores are not known as many as its measured cost at
-/// [`MLAT_BUSY_PERCENT`] needs, at least one. The load a relay admits is no more than its cores
-/// carry with MLAT's share beside the stages' ([`feeders_carried`]), so at its ceiling the cores
-/// left hold what MLAT needs on average. MLAT is given all of them, not only that, because its
-/// work is not even: a window step's comes at once every 40 s or so, and a provisional step carries
-/// exactly the models of the window steps `tally_mlat::engine::MODELS_RIPEN_MS` (15 s) before it,
-/// by their stamp, and is shed, counted (`provisional_models_late`), when one of them has not
-/// reported by its turn: the sooner a window step reports, the fewer provisional steps are shed.
-/// Measured (2026-10-09, 2,000 feeders on 10 cores): on the three threads its average cost needs, a
-/// window step took 19 and 24 s, past the ripening; on eight, about 10 s, within it. Its threads
-/// run below the stages' priority, so the cores they share with the stages cost the stages
-/// nothing, and the relay's resident memory was the same on either (4.4 to 4.7 GB at its peak on
-/// three, 4.3 on eight).
+/// [`MLAT_BUSY_PERCENT`] needs, at least one. MLAT is given all of what is left, not only its
+/// average, because its work is not even: a window step's comes at once every 40 s or so, and a
+/// provisional step carries exactly the models of the window steps `tally_mlat::engine::MODELS_RIPEN_MS`
+/// (15 s) before it, by their stamp, and is shed, counted (`provisional_models_late`), when one of
+/// them has not reported by its turn: the sooner a window step reports, the fewer provisional steps
+/// are shed. Measured (2026-10-09, 2,000 feeders on 10 cores): on the three threads its average
+/// cost needs, a window step took 19 and 24 s, past the ripening; on eight, about 10 s, within
+/// it. Its threads run below the stages' priority, so the cores they share with the stages cost
+/// the stages nothing.
 pub fn mlat_threads_for(load: Load, hosts_mlat: bool, cores: Option<usize>) -> usize {
     if !hosts_mlat {
         return 0;
@@ -441,22 +531,6 @@ pub fn mlat_threads_for(load: Load, hosts_mlat: bool, cores: Option<usize>) -> u
     }
 }
 
-/// The feeders (sending at most `load.feeder_records_per_sec` records a second each) `cores`
-/// cores carry beside `load.member_feeders`, the feeders the members' shared rate is worth, and
-/// `load.sessions` (which the plan holds first, as the memory's members' pool and connection
-/// buffers are): none when they carry no more than those. `load.feeders` is not read.
-pub fn feeders_carried(cores: usize, holds_raw: bool, load: Load) -> usize {
-    let members = load
-        .member_feeders
-        .saturating_mul(planned_per_feeder(Source::Member, holds_raw));
-    cores
-        .saturating_mul(NANOS)
-        .saturating_sub(members)
-        .saturating_sub(load.sessions.planned())
-        .checked_div(planned_per_feeder(load.feeder(), holds_raw))
-        .unwrap_or(usize::MAX)
-}
-
 /// The cores this process may run on: its affinity and its cgroup's CPU quota
 /// (`std::thread::available_parallelism`), one when it cannot be read.
 pub fn cores_available() -> usize {
@@ -467,56 +541,54 @@ pub fn cores_available() -> usize {
 mod tests {
     use super::*;
 
-    /// The default feeder's records a second: its 256 KiB/s ceiling's.
-    const RECORDS: u64 =
-        crate::ingest::records_per_sec(crate::hub::DEFAULT_MAX_FEEDER_BYTES_PER_SEC);
-
-    fn feeders(feeders: usize) -> Load {
+    fn load(receptions_per_sec: u64) -> Load {
         Load {
-            feeders,
+            receptions_per_sec,
+            connections: (receptions_per_sec / PLANNED_RECEPTIONS_PER_SEC as u64) as usize,
+            seats: 0,
             member_feeders: 0,
-            feeder_records_per_sec: RECORDS,
             sessions: Sessions::default(),
         }
     }
 
-    const FEEDER: Source = Source::Feeder {
-        records_per_sec: RECORDS,
-    };
+    /// The receptions a second of `feeders` planned feeders.
+    fn planned(feeders: u64) -> u64 {
+        feeders * PLANNED_RECEPTIONS_PER_SEC as u64
+    }
 
     #[test]
-    fn each_stage_follows_the_load_and_never_runs_on_no_thread() {
+    fn each_stage_follows_the_rate_and_never_runs_on_no_thread() {
         for holds_raw in [false, true] {
             // No load: one thread a stage, as a relay at rest needs.
             assert_eq!(
-                threads_for(feeders(0), holds_raw, Some(16)),
+                threads_for(load(0), holds_raw, Some(16)),
                 Threads {
                     ingest: 1,
                     message: 1,
                     seal: 1
                 }
             );
-            // The load the 2026-10-09 measurement ran: 5,000 feeders, about 3 M receptions a
-            // second, which one message thread could not carry.
-            let five = threads_for(feeders(5_000), holds_raw, Some(10));
+            // 5,000 planned feeders, about 3 M receptions a second, which one message thread
+            // could not carry.
+            let five = threads_for(load(planned(5_000)), holds_raw, Some(10));
             assert!(
                 five.message >= 2 && five.ingest >= 2 && five.seal >= 2,
                 "{five:?}"
             );
-            // Four times the load, about four times the threads.
-            let twenty = threads_for(feeders(20_000), holds_raw, None);
+            // Four times the rate, about four times the threads.
+            let twenty = threads_for(load(planned(20_000)), holds_raw, None);
             assert!(
                 twenty.message >= 4 * five.message - 3,
                 "{twenty:?} {five:?}"
             );
-            // Each thread planned at most BUSY_PERCENT of its time, and more than the threads
-            // but one would be (no stage takes a thread it will not use).
+            // Each thread planned at most BUSY_PERCENT of its time, and more than the threads but
+            // one would be (no stage takes a thread it will not use).
             for (work, threads) in [
                 (Work::Ingest, twenty.ingest),
                 (Work::Message, twenty.message),
                 (Work::Seal, twenty.seal),
             ] {
-                let spent = 20_000 * work.per_feeder(holds_raw, FEEDER);
+                let spent = load(planned(20_000)).average_nanos(work, holds_raw);
                 assert!(
                     spent <= threads * PLANNED_PER_THREAD,
                     "{work:?} on {threads}"
@@ -528,14 +600,14 @@ mod tests {
             }
             // Never more threads than cores.
             assert_eq!(
-                threads_for(feeders(1_000_000), holds_raw, Some(3)).message,
+                threads_for(load(planned(1_000_000)), holds_raw, Some(3)).message,
                 3
             );
         }
         // Holding MLAT raw costs the sealer more, and the ingest workers' receptions more.
         assert!(
-            threads_for(feeders(20_000), true, None).seal
-                > threads_for(feeders(20_000), false, None).seal
+            threads_for(load(planned(20_000)), true, None).seal
+                > threads_for(load(planned(20_000)), false, None).seal
         );
         assert!(
             Work::Ingest.per_feeder(true, Source::Member)
@@ -544,181 +616,203 @@ mod tests {
     }
 
     /// R-N12: a record costs the ingest workers `INGEST_NANOS_PER_RECORD` whatever its receptions,
-    /// so a feeder is planned at the more of its receptions and the records its ceiling lets it
-    /// send, and a members' feeder's worth at its own records; the faster the feeders' ceiling, the
-    /// more ingest threads and the fewer feeders the cores carry.
+    /// so the members' feeder's worth (whose records come over links the relay does not meter per
+    /// source) is planned at the more of its receptions and its records.
     #[test]
-    fn the_ingest_workers_are_planned_for_the_records_a_feeder_may_send() {
+    fn the_members_are_planned_for_their_records() {
         for holds_raw in [false, true] {
-            let receptions =
-                Work::Ingest.per_feeder(holds_raw, Source::Feeder { records_per_sec: 1 });
-            // One record a second costs less than a planned batch's receptions.
-            assert!(receptions > INGEST_NANOS_PER_RECORD);
-            // The default ceiling's eight tiny records cost more than a planned batch.
-            assert_eq!(
-                Work::Ingest.per_feeder(holds_raw, FEEDER),
-                RECORDS as usize * INGEST_NANOS_PER_RECORD
-            );
-            assert!(RECORDS as usize * INGEST_NANOS_PER_RECORD > receptions);
-            // A member's feeder's worth at its own records.
+            let receptions = Work::Ingest.receptions_part(holds_raw);
             assert_eq!(
                 Work::Ingest.per_feeder(holds_raw, Source::Member),
                 receptions.max(MEMBER_RECORDS_PER_FEEDER as usize * INGEST_NANOS_PER_RECORD)
             );
-            // Twice the ceiling, twice the records: more threads, fewer feeders carried.
-            let fast = Load {
-                feeder_records_per_sec: 2 * RECORDS,
-                ..feeders(5_000)
-            };
-            assert!(
-                threads_for(fast, holds_raw, None).ingest
-                    > threads_for(feeders(5_000), holds_raw, None).ingest
-            );
-            assert!(
-                load_carried(10, holds_raw, 2 * RECORDS) < load_carried(10, holds_raw, RECORDS)
-            );
-            // The other stages follow the receptions, whatever the records.
-            assert_eq!(
-                threads_for(fast, holds_raw, None).message,
-                threads_for(feeders(5_000), holds_raw, None).message
-            );
         }
     }
 
+    /// The cores' bounds are the stages' and sessions' planned costs, and what they carry fits
+    /// them: the connections carried at the mean (after MLAT's share when it is hosted), the seats
+    /// from what they leave, the rate beside them.
     #[test]
     fn the_cores_carry_what_their_headroom_holds() {
         for holds_raw in [false, true] {
-            // One core carries a relay's worth of feeders at the public relay's scale.
-            assert!(feeders_carried(1, holds_raw, feeders(0)) > 100);
-            // The load carried grows with the cores.
-            assert_eq!(
-                load_carried(10, holds_raw, RECORDS) / 10,
-                load_carried(1, holds_raw, RECORDS)
-            );
-            // At the load carried, the cores hold every stage's work at BUSY_PERCENT and hosted
-            // MLAT's at MLAT_BUSY_PERCENT beside it.
-            for cores in [1, 4, 10, 32] {
-                let load = load_carried(cores, holds_raw, RECORDS);
-                let stages = load * spent_per_feeder(FEEDER, holds_raw);
-                let mlat = load * mlat_per_feeder(holds_raw);
+            for cores in [1usize, 4, 10, 16, 32] {
+                let available = available_nanos(cores, holds_raw, 0, Sessions::default());
+                assert_eq!(available, cores * NANOS);
+                let connections =
+                    connections_carried(after_mlat_share(available, holds_raw), holds_raw, 0);
+                let seats = if holds_raw {
+                    seats_carried(available, holds_raw, connections).min(connections)
+                } else {
+                    0
+                };
+                // Connections carried at the mean with their seats fit the cores.
                 assert!(
-                    stages * 100 / BUSY_PERCENT + mlat * 100 / MLAT_BUSY_PERCENT <= cores * NANOS,
-                    "{cores}"
+                    connections * (connection_nanos(holds_raw) + stage_nanos(holds_raw))
+                        + seats * mlat_per_feeder(holds_raw)
+                        <= available,
+                    "{cores} {holds_raw}"
                 );
+                if holds_raw {
+                    // MLAT's share is kept for the seats, and connections went on beyond them.
+                    assert!(seats > 0 && seats <= connections, "{cores} {seats}");
+                    assert!(
+                        (seats + 1) * mlat_per_feeder(true) >= available / 100 * MLAT_SHARE_PERCENT
+                            || seats == connections,
+                        "{cores} {seats} {connections}"
+                    );
+                } else {
+                    assert_eq!(after_mlat_share(available, false), available);
+                }
+                // The rate left beside them is at least their mean.
+                let rate = rate_carried(available, holds_raw, connections, seats);
+                assert!(rate >= planned(connections as u64), "{cores} {holds_raw}");
             }
-            // The members' rate is carried first, at its own cost.
-            let members = |member_feeders| Load {
-                member_feeders,
-                ..feeders(0)
-            };
-            let all = 4 * NANOS / planned_per_feeder(Source::Member, holds_raw);
-            assert_eq!(feeders_carried(4, holds_raw, members(all + 1)), 0);
+            // More cores, proportionally more.
+            let one = connections_carried(NANOS, holds_raw, 0);
+            let ten = connections_carried(10 * NANOS, holds_raw, 0);
+            assert!(ten >= 10 * one && ten <= 10 * one + 10, "{one} {ten}");
+        }
+        // The seats are the cores' leftover over a seat's steps: none when the connections take
+        // them all.
+        let all = connections_carried(10 * NANOS, true, 0);
+        assert_eq!(seats_carried(10 * NANOS, true, all + 1), 0);
+        // The members' rate and the other sessions are held first.
+        let sessions = Sessions {
+            general: 2_048,
+            subscribers: 64,
+        };
+        for holds_raw in [false, true] {
             assert_eq!(
-                feeders_carried(4, holds_raw, members(10)),
-                (4 * NANOS - 10 * planned_per_feeder(Source::Member, holds_raw))
-                    / planned_per_feeder(FEEDER, holds_raw)
+                available_nanos(4, holds_raw, 10, sessions),
+                4 * NANOS - 10 * planned_per_feeder(Source::Member, holds_raw) - sessions.planned()
+            );
+            let all = 4 * NANOS / planned_per_feeder(Source::Member, holds_raw);
+            assert_eq!(
+                connections_carried(
+                    available_nanos(4, holds_raw, all + 1, Sessions::default()),
+                    holds_raw,
+                    0
+                ),
+                0
             );
         }
-        // Hosting MLAT, a core carries fewer: its raw costs the stages more, and its steps are
-        // planned beside them.
-        assert!(load_carried(10, true, RECORDS) < load_carried(10, false, RECORDS));
-        // 5,000 feeders without MLAT fit the 10 cores they were measured on, and the 2,000 the
-        // MLAT runs measured fit them hosting it.
-        assert!(load_carried(10, false, RECORDS) >= 5_000);
-        assert!(load_carried(10, true, RECORDS) >= 2_000);
+        // The packaged unit's one core, the default caps, still carries connections.
+        assert!(
+            connections_carried(available_nanos(1, true, 0, sessions), true, 0) > 100,
+            "one core"
+        );
         assert!(cores_available() >= 1);
     }
 
-    /// R4 of sweep 5: a source's records are paced together and any may be answered on the
-    /// runtime (an echo's reply signed, a fault proof's two records verified) instead of taken by
-    /// an ingest worker, so the runtime is planned for every one of them beside its session, and
-    /// the cores hold every split of them between the two. Before, the runtime was planned for a
-    /// feeder's session alone (83 us of a core a second) while its eight records a second
-    /// answered there cost some 480 us.
+    /// The handshake cap is planned from the measured cost of one: the pace is the share of each
+    /// core at that cost, the permits the pace over the time a handshake waits on its peer, and a
+    /// reconnect storm of 20,000 feeders clears in seconds on the cores that carry them.
     #[test]
-    fn every_record_a_source_may_send_is_planned_wherever_it_is_answered() {
+    fn the_handshake_cap_follows_the_measured_cost() {
+        // 200 us each at half a core: 2,500 a second a core.
+        assert_eq!(handshake_pace_per_sec(1), 2_500);
+        assert_eq!(handshake_pace_per_sec(16), 40_000);
+        // Little's law: 2,500 a second, each holding a permit 100 ms: 250 in flight a core.
+        assert_eq!(handshakes_in_flight(1), 250);
+        assert_eq!(handshakes_in_flight(16), 4_000);
+        assert_eq!(
+            handshake_pace_of(handshakes_in_flight(16)),
+            handshake_pace_per_sec(16)
+        );
+        assert_eq!(handshakes_in_flight(0), 1);
+        // 20,000 feeders reconnecting at once are admitted within a second on 16 cores.
+        assert!(20_000 <= handshake_pace_per_sec(16));
+    }
+
+    /// The records the stages are planned to verify fit the ingest headroom: at
+    /// `RECORDS_PER_PLANNED_FEEDER` a second for each planned feeder, a record's verification
+    /// costs the ingest workers no more than the receptions they are planned for.
+    #[test]
+    fn the_records_admitted_fit_the_ingest_workers_planned_time() {
         for holds_raw in [false, true] {
-            for source in [FEEDER, Source::Member] {
-                let records = source.records_per_sec() as usize;
-                let session = Work::Runtime.receptions_part(holds_raw);
-                assert_eq!(
-                    Work::Runtime.per_feeder(holds_raw, source),
-                    session + records * RUNTIME_NANOS_PER_RECORD
+            assert!(
+                RECORDS_PER_PLANNED_FEEDER as usize * INGEST_NANOS_PER_RECORD
+                    <= Work::Ingest.receptions_part(holds_raw),
+                "{holds_raw}"
+            );
+        }
+    }
+
+    /// R4 of sweep 5: a source's records are paced together and any may be answered on the
+    /// runtime instead of taken by an ingest worker, so the members' records are planned wherever
+    /// they are answered, and the cores hold every split of them between the two.
+    #[test]
+    fn every_record_a_member_may_send_is_planned_wherever_it_is_answered() {
+        for holds_raw in [false, true] {
+            let source = Source::Member;
+            let records = source.records_per_sec() as usize;
+            let session = Work::Runtime.receptions_part(holds_raw);
+            assert_eq!(
+                Work::Runtime.per_feeder(holds_raw, source),
+                session + records * RUNTIME_NANOS_PER_RECORD
+            );
+            let others: usize = [Work::Message, Work::Seal]
+                .iter()
+                .map(|work| work.per_feeder(holds_raw, source))
+                .sum();
+            let receptions = Work::Ingest.receptions_part(holds_raw);
+            for k in 0..=records {
+                let ingest = receptions.max(k * INGEST_NANOS_PER_RECORD);
+                let runtime = session + (records - k) * RUNTIME_NANOS_PER_RECORD;
+                assert!(
+                    ingest + runtime + others <= spent_per_feeder(source, holds_raw),
+                    "{source:?} {k}"
                 );
-                // Every split of its records between the ingest workers (k, each with a planned
-                // batch's receptions at most) and the runtime (the rest) is within what the cores
-                // hold for it.
-                let others: usize = [Work::Message, Work::Seal]
-                    .iter()
-                    .map(|work| work.per_feeder(holds_raw, source))
-                    .sum();
-                let receptions = Work::Ingest.receptions_part(holds_raw);
-                for k in 0..=records {
-                    let ingest = receptions.max(k * INGEST_NANOS_PER_RECORD);
-                    let runtime = session + (records - k) * RUNTIME_NANOS_PER_RECORD;
-                    assert!(
-                        ingest + runtime + others <= spent_per_feeder(source, holds_raw),
-                        "{source:?} {k}"
-                    );
-                }
             }
         }
-        // The default feeder's eight records answered on the runtime cost more than its session.
-        assert!(RECORDS as usize * RUNTIME_NANOS_PER_RECORD > 4 * NANOS / RUNTIME_FEEDERS_PER_CORE);
     }
 
     /// RFC-0181 §10, "The cores": MLAT's steps are planned in the same cores as the stages. The
-    /// stages keep their half-busy share for raw; MLAT is given what is left, which at the load
-    /// the cores carry holds its measured cost; and a relay that does not host MLAT runs none.
+    /// stages keep their half-busy share for raw; MLAT is given what is left; a relay that does
+    /// not host MLAT runs none.
     #[test]
-    fn mlat_takes_the_cores_the_stages_leave_and_admission_keeps_them_enough() {
-        assert_eq!(mlat_threads_for(feeders(1_000), false, Some(10)), 0);
-        assert_eq!(mlat_threads_for(feeders(1_000), false, None), 0);
-        for cores in [1, 2, 4, 10, 32] {
-            let carried = load_carried(cores, true, RECORDS);
-            for load in [0, 1, carried / 2, carried] {
-                let load = feeders(load);
+    fn mlat_takes_the_cores_the_stages_leave() {
+        assert_eq!(mlat_threads_for(load(planned(1_000)), false, Some(10)), 0);
+        assert_eq!(mlat_threads_for(load(planned(1_000)), false, None), 0);
+        for cores in [1usize, 2, 4, 10, 32] {
+            let available = available_nanos(cores, true, 0, Sessions::default());
+            let carried = connections_carried(after_mlat_share(available, true), true, 0);
+            let seats = seats_carried(available, true, carried).min(carried);
+            for fraction in [0, 1, 2] {
+                let connections = carried * fraction / 2;
+                let load = Load {
+                    receptions_per_sec: planned(connections as u64),
+                    connections,
+                    seats,
+                    member_feeders: 0,
+                    sessions: Sessions::default(),
+                };
                 let threads = mlat_threads_for(load, true, Some(cores));
                 assert!(
                     threads >= 1 && threads <= cores,
                     "{cores} {load:?} {threads}"
                 );
-                // MLAT's threads are what is left beside the stages' share, and at the load
-                // carried what is left holds its planned cost.
                 let left = (cores * NANOS).saturating_sub(stages_planned(load, true));
                 assert_eq!(threads, left.div_ceil(NANOS).max(1), "{cores} {load:?}");
+                // At the pairs the cores carry, what the stages leave holds MLAT's planned cost.
                 assert!(mlat_planned(load, true) <= left, "{cores} {load:?}");
-                assert!(
-                    threads * NANOS >= mlat_planned(load, true),
-                    "{cores} {load:?}"
-                );
             }
-            // Past the load carried, what is left no longer holds it: admission stops there.
-            let past = feeders(carried + 1);
-            assert!(
-                mlat_planned(past, true)
-                    > (cores * NANOS).saturating_sub(stages_planned(past, true)),
-                "{cores}"
-            );
         }
         // Where the cores are not known, MLAT is given what its cost needs.
-        assert_eq!(mlat_threads_for(feeders(0), true, None), 1);
+        assert_eq!(mlat_threads_for(load(0), true, None), 1);
+        let load = Load {
+            seats: 10_000,
+            ..load(0)
+        };
         assert_eq!(
-            mlat_threads_for(feeders(10_000), true, None),
+            mlat_threads_for(load, true, None),
             (10_000 * mlat_per_feeder(true)).div_ceil(NANOS)
-        );
-        // The measured 2,000 feeders on ten cores: MLAT keeps more than its cost.
-        let threads = mlat_threads_for(feeders(2_000), true, Some(10));
-        assert!(
-            threads * NANOS >= 2_000 * mlat_per_feeder(true),
-            "{threads}"
         );
     }
 
     /// R4 of sweep 5: every session beside the feeders and the members is planned at its role's
-    /// pace, before any feeder, so the more sessions a relay may hold the fewer feeders its cores
-    /// carry, and its MLAT is left what both leave. The packaged unit's (one core, the default
-    /// caps) still carries feeders.
+    /// pace, before any feeder, so the more sessions a relay may hold the fewer connections its
+    /// cores carry.
     #[test]
     fn every_session_is_planned_at_its_roles_pace() {
         let none = Sessions::default();
@@ -740,31 +834,9 @@ mod tests {
                 / BUSY_PERCENT
         );
         for holds_raw in [false, true] {
-            let with = Load {
-                sessions: some,
-                ..feeders(0)
-            };
-            assert_eq!(
-                feeders_carried(4, holds_raw, with),
-                (4 * NANOS - some.planned()) / planned_per_feeder(FEEDER, holds_raw)
-            );
-            assert!(
-                feeders_carried(4, holds_raw, with) < feeders_carried(4, holds_raw, feeders(0))
-            );
-            assert!(
-                feeders_carried(1, holds_raw, with) > 0,
-                "one core, the default caps"
-            );
+            let with = connections_carried(available_nanos(4, holds_raw, 0, some), holds_raw, 0);
+            let without = connections_carried(available_nanos(4, holds_raw, 0, none), holds_raw, 0);
+            assert!(with < without, "{holds_raw}");
         }
-        let load = Load {
-            sessions: some,
-            ..feeders(100)
-        };
-        assert_eq!(
-            mlat_threads_for(load, true, Some(10)),
-            (10 * NANOS - stages_planned(load, true) - some.planned())
-                .div_ceil(NANOS)
-                .max(1)
-        );
     }
 }

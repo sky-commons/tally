@@ -529,16 +529,20 @@ where
     // Every byte the peer sends is counted from the first, the handshake's included, as every
     // byte sent it is (`Socket`).
     let (stream, read) = Metered::new(stream);
+    // Its turn at the handshake: only as many run at once as the runtime's cores are planned to
+    // carry (`cores::handshakes_in_flight`), so a reconnect storm is admitted at a planned pace
+    // and never takes the sessions already served with it.
+    let turn = hub.handshake().await;
     // What came with its Hello stays in its message, decoded a record at a time as each is acted
     // on (`noise::Message`).
+    let accepted = noise::accept_message(stream, identities).await;
+    drop(turn);
     let Accepted {
         mut session,
         peer: key,
         role,
         mut first,
-    } = noise::accept_message(stream, identities)
-        .await
-        .map_err(|error| error.to_string())?;
+    } = accepted.map_err(|error| error.to_string())?;
     let source = hub.connection_id();
     let peer = match role {
         Role::Feeder => Peer::Feeder(key),
@@ -1790,7 +1794,9 @@ fn ingest(
             // station counters, a forgotten description given again, the sharing duties) follows
             // there too, in the receiver's order.
             let origin = match peer {
-                Peer::Feeder(_) => Origin::Feeder(described.clone()),
+                Peer::Feeder(_) => {
+                    Origin::Feeder(described.clone(), crate::ingest::group_of(asker.address))
+                }
                 Peer::Member | Peer::Relay => Origin::Peer(*asker),
                 Peer::Subscriber | Peer::Engine(_) | Peer::Probe => Origin::Elsewhere,
             };
@@ -1945,7 +1951,8 @@ fn ingest(
         | Record::WorldPrecise(_)
         | Record::RegionalBatch(_)
         | Record::Parity(_)
-        | Record::BundleIndex(_)) => return Err(Unhandled::Network(record)),
+        | Record::BundleIndex(_)
+        | Record::MlatCut(_)) => return Err(Unhandled::Network(record)),
         // Another relay's deduplicated stream is its own claim; this relay derives its own.
         _ => {}
     }
@@ -2715,6 +2722,60 @@ mod tests {
     fn loopback(hub: &Hub) -> Result<Connection, String> {
         hub.connection(std::net::Ipv4Addr::LOCALHOST.into())
             .ok_or_else(|| "no connection place".to_owned())
+    }
+
+    /// A reconnect storm is admitted at the planned handshake pace (`cores::handshakes_in_flight`):
+    /// of sixty feeders that all reconnect at once, only the cap's four are in their handshake at
+    /// any moment, the rest wait their turn in arrival order, and every one is served. Paused
+    /// time: every client takes 10 ms to send its first bytes, so all sixty connections are in
+    /// their handshake together unless the cap holds them (uncapped the peak is sixty).
+    #[tokio::test(start_paused = true)]
+    async fn a_reconnect_storm_is_admitted_at_the_planned_handshake_pace() -> Result<(), String> {
+        let storm = 60;
+        let permits = 4;
+        let hub = Arc::new(
+            Hub::new(8)
+                .max_connections_per_address(storm * 2)
+                .max_connections(storm * 2)
+                .max_upload(roomy())
+                .handshakes_capped(permits),
+        );
+        let relay = Identity::generate().map_err(text)?;
+        let relay_key = relay.public();
+        let mut feeders = Vec::new();
+        for _ in 0..storm {
+            let (near, far) = tokio::io::duplex(64 * 1024);
+            let far = hub.egress().socket(far, None);
+            let connection = loopback(&hub)?;
+            let (hub, relay) = (Arc::clone(&hub), relay.clone());
+            tokio::spawn(async move { inbound(far, &[relay], hub, connection).await });
+            feeders.push(tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                let session = noise::connect(
+                    near,
+                    &Identity::generate().map_err(text)?,
+                    &relay_key,
+                    Role::Probe,
+                )
+                .await
+                .map_err(text)?;
+                Ok::<_, String>(session)
+            }));
+        }
+        let mut sessions = Vec::new();
+        for feeder in feeders {
+            sessions.push(feeder.await.map_err(text)??);
+        }
+        let report = hub.handshake_report();
+        assert_eq!(report.begun, storm as u64, "every connection was served");
+        assert_eq!(report.permits, permits);
+        assert_eq!(report.peak, permits, "the cap was reached and never passed");
+        assert_eq!(
+            report.planned_per_sec,
+            crate::cores::handshake_pace_of(permits)
+        );
+        drop(sessions);
+        Ok(())
     }
 
     /// RFC-0181 §7: a delivery query of the retired form is answered from every peer with a

@@ -38,7 +38,7 @@ fn check_host(
     let soft = relay::raise_open_files()?;
     let mut needed = if config.run_feeders { 2 * local } else { 0 } + 1024;
     if spawning {
-        needed = needed.max(2 * config.spec.feeders + 1024);
+        needed = needed.max(2 * config.spec.feeders * config.replay + 1024);
     }
     if soft < needed as u64 {
         return Err(format!(
@@ -129,7 +129,11 @@ impl Watch {
 /// Runs the harness as configured and returns its summary table.
 pub async fn run(config: Config) -> Result<String, String> {
     let range = config.shard.range(config.spec.feeders);
-    let local = if config.run_feeders { range.len() } else { 0 };
+    let local = if config.run_feeders {
+        range.len() * config.replay
+    } else {
+        0
+    };
     let (addresses, pid, stats, mut spawned) = match &config.relay {
         Relay::Existing {
             addresses,
@@ -191,7 +195,7 @@ pub async fn run(config: Config) -> Result<String, String> {
     };
     let (addresses, pid, stats) = match &config.relay {
         Relay::Spawn(how) => {
-            let relay = relay::spawn(how, config.spec.feeders, &config.state_dir)?;
+            let relay = relay::spawn(how, config.spec.feeders * config.replay, &config.state_dir)?;
             eprintln!(
                 "tally-load: relay pid {} at {}={} (log {}); other shards join with --relay {}={}",
                 relay.pid(),
@@ -224,11 +228,16 @@ pub async fn run(config: Config) -> Result<String, String> {
     let counts = Arc::new(feeders::Counts::default());
     if let Some(traffic) = &traffic {
         feeders::spawn(
-            Arc::clone(traffic),
-            &addresses,
-            config.ceiling,
-            config.ramp,
-            &config.state_dir,
+            feeders::Run {
+                traffic: Arc::clone(traffic),
+                relays: addresses.clone(),
+                ceiling: config.ceiling,
+                ramp: config.ramp,
+                state_dir: config.state_dir.clone(),
+                networks: config.networks,
+                replay: config.replay,
+                seed: config.spec.seed,
+            },
             Arc::clone(&counts),
             tokio::time::Instant::now(),
         );
