@@ -234,14 +234,24 @@ impl Network {
                 .into_iter()
                 .map(Record::ProviderOffer)
                 .collect(),
+            // Sharing answers nothing down the link a message came in on: what it sends, a repair
+            // page to the asker too, goes over this relay's own member links (`sharing`).
             Record::StripeAssignment(assignment) => {
-                self.sharing.assigned(asker, assignment, now_ms)
+                self.sharing.assigned(asker, assignment, now_ms);
+                Vec::new()
             }
-            Record::PieceManifest(manifest) => self.sharing.manifest(asker, manifest, now_ms),
-            Record::HaveSummary(have) => self.sharing.have(asker, have, now_ms),
+            Record::PieceManifest(manifest) => {
+                self.sharing.manifest(asker, manifest, now_ms);
+                Vec::new()
+            }
+            Record::HaveSummary(have) => {
+                self.sharing.have(asker, have, now_ms);
+                Vec::new()
+            }
             Record::StripeReceipt(receipt) => {
                 self.credit.record_receipt(receipt.clone(), now_ms);
-                self.sharing.receipt(asker, receipt, now_ms)
+                self.sharing.receipt(asker, receipt, now_ms);
+                Vec::new()
             }
             Record::FirehoseCredential(credential) => {
                 self.credit.presented(asker, credential, now_ms);
@@ -259,14 +269,24 @@ impl Network {
             }
             // The products take a record in by its stamp against their watermark, so it is
             // stamped by the ingest clock their watermark comes from (`products::Records`).
-            Record::WorldPositions(world) => self.products.world_from(asker, world, hub.now_ms()),
-            Record::WorldPrecise(world) => self.products.precise_from(asker, world, hub.now_ms()),
+            Record::WorldPositions(world) => {
+                self.products.world_from(asker, world, hub.now_ms());
+                Vec::new()
+            }
+            Record::WorldPrecise(world) => {
+                self.products.precise_from(asker, world, hub.now_ms());
+                Vec::new()
+            }
             Record::RegionalBatch(regional) => {
                 let record = Record::RegionalBatch(regional.clone());
                 self.from_peer(hub, asker, &record, now_ms);
-                self.products.regional_from(asker, regional, hub.now_ms())
+                self.products.regional_from(asker, regional, hub.now_ms());
+                Vec::new()
             }
-            Record::Parity(chunk) => self.sharing.parity_chunk(asker, chunk, now_ms),
+            Record::Parity(chunk) => {
+                self.sharing.parity_chunk(asker, chunk, now_ms);
+                Vec::new()
+            }
             // A bundler's index: checked, and passed on to whoever reads the parent cell.
             Record::BundleIndex(index) => {
                 if asker.role == AskerRole::Relay && index.verify().is_ok() {

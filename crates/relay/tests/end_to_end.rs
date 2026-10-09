@@ -1057,13 +1057,14 @@ async fn a_key_the_operator_did_not_accept_as_a_relay_is_refused() -> Result {
             0,
         )?)])
         .await;
-    // Asked to come back after one re-signing of offers (`directory::OWN_RESIGN_EVERY_MS`): a
-    // relay not yet verified may be by then, so the wait is gossip's, never a day's.
+    // Asked to wait no longer than its own dial schedule's first step (`Backoff::FIRST`): a
+    // relay not yet verified may be within seconds, as gossip goes, so the wait is gossip's,
+    // never a re-signing's and never a day's; its own doubling spaces it out from there.
     assert_eq!(
         told(&mut session).await?,
         Some(Record::Goodbye {
             reason: tally_wire::Reason::Refused,
-            retry_after_secs: (tally_relay::directory::OWN_RESIGN_EVERY_MS / 1000) as u32,
+            retry_after_secs: tally_wire::backoff::Backoff::FIRST.as_secs() as u32,
         })
     );
     // The accepted key is served, as a directory link (RFC-0174 §2.5): a batch it sends is not

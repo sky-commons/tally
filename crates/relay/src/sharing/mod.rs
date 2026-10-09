@@ -31,9 +31,11 @@
 //! due. So a tick with no traffic and no change does no work, however many areas are taken
 //! ([`Sharing::work`] counts it).
 //!
-//! What the seam hands back to an asker ([`DataReplies`]) is data, never control: a repair page is
-//! manifests, parity and records, and the link sends it as data, paced and capped like any other
-//! record of its class (`egress`), so an asker cannot draw the control reserve by asking.
+//! Nothing goes back down the link a message came in on. What answers it (a repair page:
+//! manifests, parity and records) is addressed to the asker and waits in the outbox like any other
+//! send, so it travels over this relay's own member link to the asker (`peers`), the one way data
+//! enters a relay (a link a relay dials takes none in, `link::member`), paced and capped as data
+//! (`egress`), never drawing the control reserve; and an asker that is full now is sent none.
 
 pub mod bundles;
 pub mod full;
@@ -70,11 +72,6 @@ use self::member::{Arrival, Member, Message, Outgoing, Piece, record_hash};
 use self::withdrawal::Withdrawal;
 
 pub use self::seeds::{SEED_COPIES, seeded_bytes};
-
-/// Records of data the seam sends back down the asker's link: a repair page (manifests, parity
-/// chunks and records). The link sends them as data, each in its own egress class under the
-/// cap, never as control.
-pub type DataReplies = Vec<Record>;
 
 /// The products an area's group shares (§2.5: raw, positions, provisional positions, clock
 /// models, and the regional product's deduplicated batches): every record of data one relay passes
@@ -281,14 +278,9 @@ impl Sharing {
 
     /// A member asking this relay for stripes: it is a member of the group for a while, as its
     /// offer would make it.
-    pub fn assigned(
-        &self,
-        asker: &Asker,
-        assignment: StripeAssignment,
-        now_ms: u64,
-    ) -> DataReplies {
+    pub fn assigned(&self, asker: &Asker, assignment: StripeAssignment, now_ms: u64) {
         if asker.role != AskerRole::Relay {
-            return Vec::new();
+            return;
         }
         let group = GroupKey::new(assignment.cell, assignment.product);
         self.groups
@@ -297,27 +289,28 @@ impl Sharing {
     }
 
     /// An origin's manifest of one second, passed on to the group.
-    pub fn manifest(&self, asker: &Asker, manifest: PieceManifest, now_ms: u64) -> DataReplies {
+    pub fn manifest(&self, asker: &Asker, manifest: PieceManifest, now_ms: u64) {
         if asker.role != AskerRole::Relay {
-            return Vec::new();
+            return;
         }
         self.drive(asker, Message::Manifest(manifest), now_ms)
     }
 
-    /// A member's have-summary: answered down its link with what it lacks, paged, as data. Only a
-    /// member the group's trees hold (by its verified offer), and not demoted, is answered.
-    pub fn have(&self, asker: &Asker, have: HaveSummary, now_ms: u64) -> DataReplies {
+    /// A member's have-summary: answered with what it lacks, paged, as data, over this relay's
+    /// own member link to it (the outbox). Only a member the group's trees hold (by its verified
+    /// offer), and not demoted, is answered.
+    pub fn have(&self, asker: &Asker, have: HaveSummary, now_ms: u64) {
         if asker.role != AskerRole::Relay {
-            return Vec::new();
+            return;
         }
         self.drive(asker, Message::Have(have), now_ms)
     }
 
     /// A child's receipt (this relay's evidence, which `credit` keeps), or a member's report of
     /// a shortfall, which may demote the member it names.
-    pub fn receipt(&self, asker: &Asker, receipt: StripeReceipt, now_ms: u64) -> DataReplies {
+    pub fn receipt(&self, asker: &Asker, receipt: StripeReceipt, now_ms: u64) {
         if asker.role != AskerRole::Relay {
-            return Vec::new();
+            return;
         }
         self.drive(asker, Message::Receipt(receipt), now_ms)
     }
@@ -372,9 +365,9 @@ impl Sharing {
     /// manifest nobody signed, or one declaring more than its records could be, holds nothing, and
     /// a sender that never finishes holds what it sent, for `PARITY_ASSEMBLY_MS`, from its own
     /// share.
-    pub fn parity_chunk(&self, asker: &Asker, chunk: ParityChunk, now_ms: u64) -> DataReplies {
+    pub fn parity_chunk(&self, asker: &Asker, chunk: ParityChunk, now_ms: u64) {
         if asker.role != AskerRole::Relay {
-            return Vec::new();
+            return;
         }
         let key = (asker.key, chunk.manifest);
         let fresh_start = !lock(&self.assembling).contains_key(&key);
@@ -383,7 +376,7 @@ impl Sharing {
         let room = if fresh_start {
             match self.with_member(|member| member.parity_room(&asker.key, &chunk)) {
                 Some(Some(total)) => Some(total),
-                _ => return Vec::new(),
+                _ => return,
             }
         } else {
             None
@@ -403,10 +396,10 @@ impl Sharing {
                     let gauge = Arc::clone(&lock(&self.gauge));
                     let own = std::mem::size_of::<Assembling>();
                     if sender.saturating_add(own) > ASSEMBLING_PER_SENDER {
-                        return Vec::new();
+                        return;
                     }
                     let Some(charge) = gauge.try_charge(own) else {
-                        return Vec::new();
+                        return;
                     };
                     sender += own;
                     vacant.insert(Assembling {
@@ -422,7 +415,7 @@ impl Sharing {
                     })
                 }
                 // It finished, or expired, while the member was asked: a stray chunk.
-                (std::collections::hash_map::Entry::Vacant(_), None) => return Vec::new(),
+                (std::collections::hash_map::Entry::Vacant(_), None) => return,
             };
             // What the chunk brings that no earlier one did, within the sender's share and
             // charged before it is held: past either it is refused whole, and a parity it would
@@ -443,28 +436,28 @@ impl Sharing {
                 if held.filled == 0 {
                     assembling.remove(&key);
                 }
-                return Vec::new();
+                return;
             };
             for (from, bytes) in fresh {
                 held.filled += bytes.len();
                 held.pieces.insert(from, bytes);
             }
             if held.filled < held.total {
-                return Vec::new();
+                return;
             }
             assembling.remove(&key)
         };
         let Some(assembled) = whole else {
-            return Vec::new();
+            return;
         };
         // Its charge is held while the whole is put together, and ends once it is
         // (`Assembling::whole`): the parity is charged again where it is held (`Member::parity`).
         let Some((first, xor)) = assembled.whole() else {
-            return Vec::new();
+            return;
         };
         let mut lens = [0u32; stripes::DATA_STRIPES as usize];
         if first.lens.len() != lens.len() {
-            return Vec::new();
+            return;
         }
         lens.copy_from_slice(&first.lens);
         let parity = parity::Parity {
@@ -853,9 +846,8 @@ impl Sharing {
         out
     }
 
-    /// Hands a message to the member; what goes back to the asker is the reply, the rest waits in
-    /// the outbox.
-    fn drive(&self, asker: &Asker, message: Message, now_ms: u64) -> DataReplies {
+    /// Hands a message to the member; what it sends, to the asker too, waits in the outbox.
+    fn drive(&self, asker: &Asker, message: Message, now_ms: u64) {
         // A message about a group of an area this relay takes is the group's, held or not.
         let joins = message.group().filter(|group| self.takes_area(group.cell));
         let out = self
@@ -866,14 +858,7 @@ impl Sharing {
                 member.receive(asker.key, message, now_ms)
             })
             .unwrap_or_default();
-        let (reply, rest): (Vec<Outgoing>, Vec<Outgoing>) = out
-            .into_iter()
-            .partition(|outgoing| outgoing.to == asker.key);
-        self.queue(rest);
-        reply
-            .into_iter()
-            .flat_map(|outgoing| to_records(outgoing.message))
-            .collect()
+        self.queue(out);
     }
 
     fn with_member<T>(&self, act: impl FnOnce(&mut Member) -> T) -> Option<T> {

@@ -700,40 +700,33 @@ impl Products {
 
     /// A world record a peer sent. A relay that gathers the world takes its fixes as candidates,
     /// except one that disagrees with an origin this relay holds. Nothing is sent back.
-    pub fn world_from(&self, asker: &Asker, world: WorldPositions, stamp_ms: u64) -> Vec<Record> {
+    pub fn world_from(&self, asker: &Asker, world: WorldPositions, stamp_ms: u64) {
         if asker.role != AskerRole::Relay || world.verify().is_err() {
-            return Vec::new();
+            return;
         }
         if let Ok(content) = world.content() {
             let bytes = world_bytes(&content);
             self.record(stamp_ms, world.hash(), bytes, Input::World(content, false));
         }
-        Vec::new()
     }
 
     /// A precise world record a peer sent: as `world_from`, into the precise product.
-    pub fn precise_from(&self, asker: &Asker, world: WorldPrecise, stamp_ms: u64) -> Vec<Record> {
+    pub fn precise_from(&self, asker: &Asker, world: WorldPrecise, stamp_ms: u64) {
         if asker.role != AskerRole::Relay || world.verify().is_err() {
-            return Vec::new();
+            return;
         }
         if let Ok(content) = world.content() {
             let bytes = world_bytes(&content);
             self.record(stamp_ms, world.hash(), bytes, Input::World(content, true));
         }
-        Vec::new()
     }
 
     /// A regional batch a peer sent: once, its ADS-B positions become world candidates, and when
     /// its cell is inside an area this relay takes it is forwarded unchanged
     /// ([`Products::take_forward`], never down the connection it came in on). Nothing is sent back.
-    pub fn regional_from(
-        &self,
-        asker: &Asker,
-        regional: RegionalBatch,
-        stamp_ms: u64,
-    ) -> Vec<Record> {
+    pub fn regional_from(&self, asker: &Asker, regional: RegionalBatch, stamp_ms: u64) {
         if asker.role != AskerRole::Relay || regional.verify().is_err() {
-            return Vec::new();
+            return;
         }
         let bytes = regional.as_bytes().len();
         self.record(
@@ -742,7 +735,6 @@ impl Products {
             bytes,
             Input::Regional(asker.source, regional),
         );
-        Vec::new()
     }
 
     /// The watermark passed `watermark_ms` with nothing flowing to say so: every record stamped

@@ -757,7 +757,7 @@ fn a_peer_regional_batch_is_forwarded_once_unchanged_within_the_areas_taken() ->
         (relay_asker(peer), not_taken),
         (relay_asker(peer), stale),
     ] {
-        assert!(products.regional_from(&asker, batch, now).is_empty());
+        products.regional_from(&asker, batch, now);
     }
     // The sealer takes them in once the watermark passes their stamp.
     products.advance(now + 1);
