@@ -34,17 +34,20 @@ async fn run() -> Result<(), String> {
 }
 
 /// `tally-relay check`: everything a start does before it reads its keys and opens its sockets,
-/// each refusal included (`prepare`), then the memory plan on stdout, one `name value` a line.
+/// each refusal included (`prepare`), then the plan on stdout, one `name value` a line: the
+/// memory's, the cores' and the stages' threads.
 /// The keys are an operator's secrets, not its configuration: a throwaway key stands in for them.
 fn check(config: &Config) -> Result<(), String> {
     let identity = Identity::generate().map_err(|error| error.to_string())?;
     let (hub, _) = prepare(config, &identity)?;
     let budget = hub.budget();
+    let threads = budget.threads();
     let plan = format!(
         "memory {}\nbase {}\noversize {}\nconnections {}\nconnection-buffers {}\n\
-         per-feeder {}\nfeeders {}\nmembers {}\nper-member {}\nmember-feeders {}\n\
-         member-rate-pool {}\nmember-pool {}\nmember-links {}\nplanned {}\nheadroom {}\n\
-         limit {}\n",
+         per-feeder {}\nfeeders {}\nmemory-feeders {}\ncores {}\ncore-feeders {}\n\
+         ingest-threads {}\nmessage-threads {}\nseal-threads {}\nmembers {}\nper-member {}\n\
+         member-feeders {}\nmember-rate-pool {}\nmember-pool {}\nmember-links {}\n\
+         planned {}\nheadroom {}\nlimit {}\n",
         budget.memory(),
         budget.base(),
         budget.plan().oversize(),
@@ -52,6 +55,12 @@ fn check(config: &Config) -> Result<(), String> {
         budget.plan().connection_buffers(),
         budget.per_feeder().total(),
         budget.ceiling(),
+        budget.memory_feeders(),
+        config.cores,
+        budget.plan().core_feeders().unwrap_or(usize::MAX),
+        threads.ingest,
+        threads.message,
+        threads.seal,
         budget.members(),
         budget.plan().per_member(),
         budget.member_feeders(),
@@ -90,8 +99,11 @@ fn prepare(config: &Config, identity: &Identity) -> Result<(Arc<Hub>, bool), Str
             .memory(config.memory, hosts_mlat)
             // Its areas, which the member sessions are planned from (`budget::members_for`).
             .taking(config.areas.clone())
-            // A stage short of a thread would close no epoch: the relay fails to start instead.
-            .staged(config.threads)?,
+            // Its cores, which bound the feeders it admits (`cores::feeders_carried`).
+            .cores(config.cores)
+            // Each stage on the threads the load it admits needs (`cores::threads_for`). A stage
+            // short of a thread would close no epoch: the relay fails to start instead.
+            .staged_as_planned()?,
     );
     // A relay whose memory cannot hold its members' pool and a feeder beside it would refuse every
     // Hello, or its members: it refuses to start instead.
@@ -124,17 +136,24 @@ async fn serve(config: Config) -> Result<(), String> {
         egress::decimal(config.max_upload.most_a_month())
     );
     let (hub, hosted) = prepare(&config, &identities[0])?;
+    let budget = hub.budget();
+    let threads = budget.threads();
     eprintln!(
-        "tally-relay: {} of memory admits {} feeders ({} each) beside {} member sessions ({} \
-         each, and {} for their shared rate); {} ingest and {} message threads",
+        "tally-relay: admits {} feeders: {} of memory holds {} ({} each) beside {} member \
+         sessions ({} each, and {} for their shared rate), and its {} cores carry {}; {} ingest, \
+         {} message and {} seal threads for them",
+        budget.ceiling(),
         egress::decimal(config.memory as u64),
-        hub.budget().ceiling(),
-        egress::decimal(hub.budget().per_feeder().total() as u64),
-        hub.budget().members(),
-        egress::decimal(hub.budget().plan().per_member() as u64),
-        egress::decimal(hub.budget().plan().member_rate_pool() as u64),
-        config.threads.ingest,
-        config.threads.message,
+        budget.memory_feeders(),
+        egress::decimal(budget.per_feeder().total() as u64),
+        budget.members(),
+        egress::decimal(budget.plan().per_member() as u64),
+        egress::decimal(budget.plan().member_rate_pool() as u64),
+        config.cores,
+        budget.plan().core_feeders().unwrap_or(usize::MAX),
+        threads.ingest,
+        threads.message,
+        threads.seal,
     );
     eprintln!(
         "tally-relay: key {} listening on {}",

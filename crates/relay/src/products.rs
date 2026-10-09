@@ -32,7 +32,7 @@
 //! each epoch's areas are made into records in parallel (their observations gathered, cut to
 //! fit a record, signed, and their ADS-B fixes derived), on threads started with the sealer (so a
 //! thread that cannot be started fails the relay at its start, never an epoch), as many as the
-//! message exchange has, then numbered and applied in cell order by the one thread, so the records
+//! load planned needs (`cores::threads_for`), then numbered and applied in cell order by the one thread, so the records
 //! and their sequence are the same on any number of threads.
 //!
 //! The deduplicated stream is signed there too (`deduplicated::Stream`), one job of the pool
@@ -116,7 +116,7 @@ use crate::bounded::Bounded;
 use crate::budget::{Charge, Gauge, Store};
 use crate::deduplicated::{Signed, Stream};
 use crate::exchange::{Frozen, SHARDS, Sink, raw_shard};
-use crate::ingest::{Pause, Stage};
+use crate::ingest::{Pause, Stage, Threads};
 use crate::network::{Asker, AskerRole};
 use crate::seal::{Coordinator, Epoch, Kept, Merged, end_of};
 
@@ -473,12 +473,12 @@ impl Products {
         }
     }
 
-    /// The sealing on a thread of its own, gathering from `threads` message threads, with a pool
-    /// of as many threads, each held up by `pause` (a test's; none in a relay). What it was told
-    /// so far (areas taken, the world's switches, its key) is carried over. Every thread is started
-    /// or this fails, and the relay with it: an inline sealer behind a staged exchange would gather
-    /// from one thread and refuse every epoch.
-    pub fn on_thread(&self, threads: usize, pause: Option<&Pause>) -> Result<(), String> {
+    /// The sealing on a thread of its own, gathering from `threads.message` message threads, with
+    /// a pool of `threads.seal` threads, itself and its helpers, each held up by `pause` (a test's;
+    /// none in a relay). What it was told so far (areas taken, the world's switches, its key) is
+    /// carried over. Every thread is started or this fails, and the relay with it: an inline sealer
+    /// behind a staged exchange would gather from one thread and refuse every epoch.
+    pub fn on_thread(&self, threads: Threads, pause: Option<&Pause>) -> Result<(), String> {
         let mut sealer = self
             .sealer
             .write()
@@ -490,7 +490,11 @@ impl Products {
             let mut held = sealing
                 .lock()
                 .map_err(|_| "the sealer's lock is poisoned".to_owned())?;
-            let mut fresh = Sealing::new((held.boot_id, 0), threads, Arc::clone(&self.shared));
+            let mut fresh = Sealing::new(
+                (held.boot_id, 0),
+                threads.message.max(1),
+                Arc::clone(&self.shared),
+            );
             fresh.stream = std::mem::take(&mut held.stream);
             fresh.taken = std::mem::take(&mut held.taken);
             fresh.live.on = held.live.on;
@@ -498,7 +502,7 @@ impl Products {
             fresh.identity = held.identity.take();
             fresh
         };
-        fresh.pool = Pool::start(threads.max(1) - 1, pause)?;
+        fresh.pool = Pool::start(threads.seal.max(1) - 1, pause)?;
         let (sender, receiver) = sync_channel(EPOCH_QUEUE);
         let pause = pause.cloned();
         let handle = std::thread::Builder::new()

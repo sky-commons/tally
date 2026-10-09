@@ -8,8 +8,9 @@
 //! A batch's charge ([`InFlight`]) travels with it to the message exchange and is let go only once
 //! the epochs hold its bytes (`exchange`). The work
 //! (verify, hash, admit, inflate, decode, route) runs on a [`Pool`] of dedicated OS threads sized
-//! from the host's cores ([`Threads`]), never on the async runtime's workers, so a burst of
-//! verification never stalls a heartbeat or an egress write.
+//! from the load the relay is planned to admit ([`Threads`], `cores::threads_for`), never on the
+//! async runtime's workers, so a burst of verification never stalls a heartbeat or an egress
+//! write.
 //!
 //! A batch runs on the worker that owns its receiver's raw shard (`exchange::raw_shard`, fixed
 //! logical shards mapped onto the workers), so one receiver's batches are admitted, and reach every
@@ -166,25 +167,17 @@ pub enum Stage {
 /// none.
 pub type Pause = Arc<dyn Fn(Stage) + Send + Sync>;
 
-/// How many threads each stage runs on.
+/// How many threads each stage runs on. A relay's follow the load it is planned to admit
+/// (`Budget::threads`, from `cores::threads_for`); a test names its own, and the output bytes are
+/// the same on any of them (RFC-0181, invariant 1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Threads {
     /// Ingest workers: verify, hash, admit, inflate, decode, route.
     pub ingest: usize,
     /// Message exchange threads: the one deduplication.
     pub message: usize,
-}
-
-impl Threads {
-    /// From the host's cores: a quarter for ingest, an eighth for the message exchange, at least
-    /// one each. The rest are the async runtime's, the sealer's and the hosted MLAT's.
-    pub fn from_cores() -> Self {
-        let cores = std::thread::available_parallelism().map_or(4, std::num::NonZero::get);
-        Self {
-            ingest: (cores / 4).max(1),
-            message: (cores / 8).max(1),
-        }
-    }
+    /// Sealer threads: the sealer and its pool's helpers beside it (`products::Products::on_thread`).
+    pub seal: usize,
 }
 
 /// One connection's allowance of bytes in the ingest stage (RFC-0181 §2, §10), carved from the
@@ -1062,8 +1055,9 @@ mod tests {
         let threads = Threads {
             ingest: 2,
             message: 2,
+            seal: 2,
         };
-        products.on_thread(threads.message, Some(&pause))?;
+        products.on_thread(threads, Some(&pause))?;
         let sink = products.sink();
         let clock = Arc::new(AtomicU64::new(0));
         let reading = Arc::clone(&clock);
@@ -1153,11 +1147,5 @@ mod tests {
         }
         drop(stages);
         Ok(())
-    }
-
-    #[test]
-    fn the_threads_come_from_the_cores_and_never_none() {
-        let threads = Threads::from_cores();
-        assert!(threads.ingest >= 1 && threads.message >= 1);
     }
 }

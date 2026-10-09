@@ -116,7 +116,8 @@ Measured on main (tally-load, commit b3e3571809 on branch tally-load):
    As built: one sealer thread decides and a pool works. Each epoch's areas are cut into records that
    fit (`RegionalBatch::fits`, decided without signing; the sequence is a fixed-width field), the
    records are numbered in cell order by the one thread, then signed and their ADS-B fixes derived on
-   as many threads as the message exchange has, and applied in sequence order by the one thread.
+   as many threads as the load planned needs (§10, "The cores"), and applied in sequence order by
+   the one thread.
    The deduplicated stream is signed in the same pool, one job beside the areas' cuts: its hash chain
    makes its batches one sequence, so one job signs them all in canonical order
    (`deduplicated::Stream::sign`), each batch timed the epoch's end as the regional records are, and
@@ -472,6 +473,37 @@ Measured on main (tally-load, commit b3e3571809 on branch tally-load):
     fan-out" as built: back-pressure from either would let one slow subscriber, or a full tag store,
     stall ingest for every feeder, and both have a loss that is counted and told (a "fell behind"
     Goodbye, a batch left out of the audit) where back-pressure's is everyone's.
+
+    **The cores (decided 2026-10-09).** Back-pressure for raw is the right loss only while the
+    stages can carry what the relay admitted; when they cannot, it is every feeder's latency, all
+    the time. So the cores are admission, as the memory is (§9): a relay plans no more feeders than
+    its cores carry, and each stage's threads follow the load it plans to admit, never a fixed
+    share of the host (`cores`). The load is the feeders admitted and the feeders the members'
+    shared rate is worth (`Budget::load`), each at the planned rate; a stage's threads are that
+    load's receptions over what one thread of the stage was measured to sustain, at
+    `cores::BUSY_PERCENT` (50%) busy, at least one and at most the cores (`cores::threads_for`):
+    the ingest workers, the message threads and the sealer's pool each by their own figure
+    (`ingest::Threads`, whose `seal` the sealer's pool now takes instead of the message threads'
+    count). The feeders the cores carry are every stage's work and the async runtime's together in
+    that share of the cores (`cores::feeders_carried`), the members' rate taken first; the ceiling
+    is the fewer of those and the feeders the memory holds (`Budget::ceiling`), so a Hello past
+    either is refused ("no spare slot") and every store's share follows the same ceiling. A relay
+    whose cores carry no feeder beside its members' rate refuses to start (`Budget::check`). Of the
+    two ways a relay could meet cores too few for its memory (refuse to start, or admit what the
+    cores carry), it admits what they carry: a relay given more memory than its cores can use is a
+    smaller relay, not a broken one, and the memory already works that way. The cores are what the
+    process may run on (its affinity and its cgroup's quota, `std::thread::available_parallelism`);
+    `tally-relay check --cores N` is told a deploy's, and prints `cores`, `core-feeders`,
+    `memory-feeders` and each stage's threads beside the memory plan. `--ingest-threads` and
+    `--message-threads` are gone: no operator picks a stage's threads. The hosted MLAT engine's
+    threads are not planned: it sheds what it falls behind on and never pushes back on ingest.
+
+    Why (measured 2026-10-09, 5,000 feeders, about 3 M receptions a second, the relay on cores 0-9):
+    the stages took a quarter of the cores for ingest and an eighth for the message exchange, so
+    ten cores ran one message thread. It was 66% busy on average and saturated at each epoch's
+    close; its queue filled, the ingest workers waited on it, and raw's p99 was 0.6 to 1.2 s, and
+    different run to run. Two message threads at 28% each gave 41 ms. The figures each stage is
+    sized by, and the runs after, are in "Sizing", "What the cores carry".
 11. **Connection buffers from a shared pool**, not zeroed 64 KiB per connection. As built
     (`tally_wire::noise::Buffer`): a session's reader and writer hold no buffer between messages.
     A message's frame, its plaintext and the records packed into it are written in buffers taken
@@ -622,6 +654,46 @@ same four times the planned rate their count is bounded by, over the four interv
 sheds nothing holds), the batches waiting for a description 0.13 MB (a store of their own) and the
 engine's tables 0.45 MB: 2.75 MB of MLAT stores, 0.52 MB more than before, so a given memory
 admits fewer MLAT feeders. The runs above were not repeated with it.
+
+**What the cores carry** (measured 2026-10-09, `tally-load` built `-c opt`, the relay on cores 0-9
+and the harness on 10-31, two areas, `--memory 24G`, a 60 s ramp, 30 s warm-up and 60 s measured;
+each stage's threads' CPU over the measured minute from `/proc/<pid>/task/*/stat`, beside what the
+subscriber read). Each stage was run at more than one thread count, and its figure is the least a
+thread sustained:
+
+| Stage                      | Runs (receptions a second: threads, the stage's cores)       | Per thread, sized by        |
+| -------------------------- | ------------------------------------------------------------ | --------------------------- |
+| Ingest                     | 3.05 M: 2, 0.594; 3.02 M: 4, 0.636; 4.61 M: 4, 1.018          | 4.5 M (221 ns), 7,500 batches |
+| Ingest, MLAT raw held      | 1.21 M: 2, 0.352                                             | 3.4 M (290 ns), 5,700 batches |
+| Message exchange           | 3.05 M: 1, 0.660; 3.02 M: 2, 0.557 and 4, 0.468; 4.61 M: 4, 0.620 | 4.6 M (216 ns), 7,600 batches |
+| Sealer and its pool        | 3.02 M: 1, 0.517; 2, 0.506; 4, 0.538; 4.61 M: 4, 0.492        | 5.6 M (178 ns), 9,300 batches |
+| Sealer, MLAT raw held      | 1.21 M: 2, 0.370                                             | 3.2 M (305 ns)              |
+| Async runtime (10 workers) | 5,000 feeders: 0.404 to 0.412; 6,742: 0.516                  | 12,000 feeders a core       |
+| Async runtime, raw held    | 2,000 feeders: 0.243                                         | 8,000 feeders a core        |
+
+The message exchange costs less a reception the more threads it has (a thread's shards fit its
+caches), and the slice each batch sends each thread cost nothing measurable beside its receptions,
+so it is sized by its one-thread figure. The part of the seal no helper takes (gathering each epoch,
+numbering its records, applying them) was 0.144 to 0.164 of a core at 3.02 M receptions a second and
+0.144 at 4.61 M: it follows the epochs and the areas, not the receptions, so it bounds no feeder
+count. A planned feeder without MLAT costs the four together 454 us of a core a second; planned at
+50% busy, a core carries 1,100 feeders' worth, ten cores 11,000, and the founder's 20,000 feeders
+need 19 cores with the members' rate beside them. Run with ten cores and memory for 11,403
+feeders, `tally-relay check` plans 10,879 (11,007 less the members' 128) and three threads a stage.
+
+Three runs back to back at 5,000 feeders, MLAT off, the plan's threads (three ingest, three message,
+three seal), the same harness and host as above:
+
+| Run | Raw p50 | Raw p99 | Raw max | Ingest (3) | Message (3) | Sealer and helpers (1 + 2) | Runtime | Relay  |
+| --- | ------- | ------- | ------- | ---------- | ----------- | -------------------------- | ------- | ------ |
+| 1   | 1 ms    | 69 ms   | 127 ms  | 0.640      | 0.511       | 0.277 + 0.246              | 0.411   | 2.10   |
+| 2   | 1 ms    | 68 ms   | 117 ms  | 0.637      | 0.481       | 0.280 + 0.251              | 0.410   | 2.07   |
+| 3   | 1 ms    | 92 ms   | 127 ms  | 0.674      | 0.527       | 0.293 + 0.260              | 0.434   | 2.20   |
+
+(cores over the measured minute; every thread of a stage within 0.03 of the others, the busiest
+0.23.) Each run read 5,000 batches and 3.02 M receptions a second with nothing lost, and the relay
+admitted all 5,000. Before, with one message thread and two ingest workers, the same runs' raw p99
+was 266, 275, 1,067 and 587 ms.
 
 **The deployed budgets** are `tally-relay check`'s to state, not this document's: the numbers move
 with every store's plan, and a figure copied here is wrong the next time one does. Before any feeder

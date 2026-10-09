@@ -50,6 +50,7 @@ use tokio::time::timeout;
 const RELAY_THREADS: tally_relay::ingest::Threads = tally_relay::ingest::Threads {
     ingest: 2,
     message: 2,
+    seal: 2,
 };
 
 type Result<T = ()> = std::result::Result<T, String>;

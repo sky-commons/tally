@@ -1179,7 +1179,14 @@ fn records_wait_apart_from_the_epochs_and_are_taken_in_by_stamp() -> Result<()> 
     use crate::budget::Store;
     // The flood: more records than their share holds, stamped far ahead so none is taken in.
     let products = Arc::new(Products::with_boot(1, 1));
-    products.on_thread(1, None)?;
+    products.on_thread(
+        crate::ingest::Threads {
+            ingest: 1,
+            message: 1,
+            seal: 1,
+        },
+        None,
+    )?;
     let mlat = Mlat::new()?;
     let flood = mlat.solutions(&[0x00c0_0001], BASE_MS, 0, true, 1)?;
     const HELD: usize = 1_000;
