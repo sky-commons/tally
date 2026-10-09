@@ -3,6 +3,12 @@
 #
 #   curl -fsSL <release>/install.sh | sudo bash
 #
+# Until a release pipeline publishes Tally's releases (RFC-0180 phase 1), nothing writes the
+# release's address into this script (PUBLISHED_RELEASE) or publishes a seed list beside it, so an
+# install names both itself:
+#
+#   curl -fsSL <release>/install.sh | sudo TALLY_RELEASE=<release> TALLY_SEEDS=/path/to/seeds bash
+#
 # It downloads tally-feed for this machine and checks its sha256, finds the receiver's decoders and
 # location, makes the receiver's key if there is none, and starts tally-feed.service. It changes no
 # readsb or dump978 setting and no other feed. Running it again upgrades the binary and keeps the
@@ -58,10 +64,10 @@ fetch() {
 }
 
 # Downloads NAME from the release with NAME.sha256 beside it, into the work directory, and stops if
-# they disagree.
+# they disagree. A NAME that cannot be downloaded stops saying WHY, if given.
 fetch_verified() {
   local name="$1"
-  fetch "$release/$name" "$work/$name" || stop "could not download $release/$name"
+  fetch "$release/$name" "$work/$name" || stop "${2:-could not download $release/$name}"
   fetch "$release/$name.sha256" "$work/$name.sha256" ||
     stop "could not download $release/$name.sha256"
   local expected actual
@@ -152,6 +158,14 @@ metres() {
   is_number "$text" && awk -v value="$text" -v scale="$scale" 'BEGIN { printf "%.0f", value * scale }'
 }
 
+# WHY, and how to pass the release and the seed list by hand. Until a release pipeline publishes
+# Tally's releases (RFC-0180 phase 1), nothing writes PUBLISHED_RELEASE into this script or
+# publishes a `seeds` beside it, so an install names both itself. sudo passes a NAME=value given
+# before the command into its environment.
+how_to_pass() {
+  printf '%s. Until a release pipeline publishes them, name the release (a directory holding tally-feed-x86_64-linux, tally-feed-aarch64-linux and tally-feed.service, each with its .sha256) and a seed list file (one HOST:PORT=KEY OPERATOR a line) yourself:\n  curl -fsSL RELEASE/install.sh | sudo TALLY_RELEASE=RELEASE TALLY_SEEDS=/path/to/seeds bash\nNothing was installed.' "$1"
+}
+
 # Everything runs from here, once the whole script has arrived: a download cut short runs nothing.
 main() {
   if [[ ${1:-} == --check-seeds ]]; then
@@ -164,18 +178,17 @@ main() {
     return 0
   fi
   [[ $# -eq 0 ]] || stop "unknown argument $1 (install.sh takes none, or --check-seeds FILE)"
-  if [[ $EUID -ne 0 ]]; then
-    stop "run as root (curl ... | sudo bash)"
-  fi
-  for tool in curl sha256sum systemctl timeout awk; do
-    command -v "$tool" >/dev/null || stop "$tool is required"
-  done
 
+  # Where it installs from and the relays it starts from are settled first, before root is asked
+  # for: neither needs it, and an owner told what to pass is told before anything else.
   release="${TALLY_RELEASE:-$PUBLISHED_RELEASE}"
   release="${release%/}"
   if [[ -z $release ]]; then
-    stop "this install.sh names no release to install from: set TALLY_RELEASE to the release's address and run this again; nothing was installed"
+    stop "$(how_to_pass "this install.sh names no release to install from")"
   fi
+  for tool in curl sha256sum timeout awk; do
+    command -v "$tool" >/dev/null || stop "$tool is required"
+  done
   work="$(mktemp -d)"
   trap 'rm -rf "$work"' EXIT
 
@@ -183,10 +196,15 @@ main() {
   if [[ -n ${TALLY_SEEDS:-} ]]; then
     seeds="$TALLY_SEEDS" seeds_from="$TALLY_SEEDS"
   else
-    fetch_verified seeds
+    fetch_verified seeds "$(how_to_pass "could not download the seed list $release/seeds")"
     seeds="$work/seeds" seeds_from="$release/seeds"
   fi
   read_seeds "$seeds"
+
+  if [[ $EUID -ne 0 ]]; then
+    stop "run as root (curl ... | sudo bash)"
+  fi
+  command -v systemctl >/dev/null || stop "systemctl is required"
 
   case "$(uname -m)" in
     x86_64 | amd64) ARCH=x86_64 ;;

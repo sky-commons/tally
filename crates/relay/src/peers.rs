@@ -427,13 +427,22 @@ mod tests {
         assert_eq!(store.held(), kept.len() * 2 * one);
         assert!(waiting.held() <= WAITING_PER_LINK_BYTES);
         assert_eq!(links.held(), waiting.held());
-        // A second link's share fills the room, and a third finds none left.
+        // A second link's share fills its own share; a third takes only what room the two left
+        // (less than a share's whole sends), and then a fourth finds none.
         let second = Gauge::new(Store::Batches, WAITING_PER_LINK_BYTES);
         while let Some(send) = queued((&second, &links), &member, addressed(&store, member, 2)) {
             kept.push(send);
         }
+        let room = 2 * WAITING_PER_LINK_BYTES - links.held();
         let third = Gauge::new(Store::Batches, WAITING_PER_LINK_BYTES);
-        assert!(queued((&third, &links), &member, addressed(&store, member, 2)).is_none());
+        let mut taken = 0;
+        while let Some(send) = queued((&third, &links), &member, addressed(&store, member, 2)) {
+            kept.push(send);
+            taken += 1;
+        }
+        assert_eq!(taken, room / bytes);
+        let fourth = Gauge::new(Store::Batches, WAITING_PER_LINK_BYTES);
+        assert!(queued((&fourth, &links), &member, addressed(&store, member, 2)).is_none());
         assert!(links.held() <= 2 * WAITING_PER_LINK_BYTES);
         drop(kept);
         assert_eq!((store.held(), waiting.held(), links.held()), (0, 0, 0));

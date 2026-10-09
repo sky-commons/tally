@@ -75,7 +75,10 @@ description declares. It is unauthenticated too: bind it to loopback.
 what it takes with every relay that takes the same area, and offers it, signed, to the network.
 `--advertise HOST:PORT=KEY` with the relay's own key says where it answers, which its offers
 carry: a relay that does not list itself signs no offer, so no other relay can verify it, choose it
-to solve an area's MLAT, or pass it an area's raw. `--network ASN` declares the autonomous system it is on, so feeders choose two relays on
+to solve an area's MLAT, or pass it an area's raw. An offer names the address by number (an IP and
+port), which puts it in its network group for every relay alike: a host name given here is
+resolved by the relay, and the IP it resolved to is what it signs (nothing is signed before it
+first resolves). `--network ASN` declares the autonomous system it is on, so feeders choose two relays on
 different networks. The duties of a full relay are on by default: it accepts feeders, runs MLAT
 for the areas it is chosen to solve (on the cores its other work leaves, below its priority, so
 MLAT that falls behind sheds rather than delaying raw; `--no-mlat` runs none), and seeds its feeders' data into their areas' sharing groups. `--no-relay-duties` turns all

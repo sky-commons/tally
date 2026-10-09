@@ -265,6 +265,14 @@ pub enum Reason {
     /// `Other(7)`, and a feeder that predates the tagged check takes any `Goodbye` to its query as
     /// no answer, never as evidence.
     Retired,
+    /// The peer sent more than this relay's ceiling for its role allows (its bytes a second, or
+    /// its signed records a second): the sender's abuse, not this relay's capacity. A relay told so
+    /// is not a full provider, and the relay saying it files its shortfalls against the sender as
+    /// for any link that brought nothing (RFC-0174 §2.5): a parent that overruns its child's
+    /// ceiling to be turned away delivers nothing and is held to it. Before, it was `Full`, which
+    /// exempted such a parent from every shortfall. A reader that predates it reads `Other(8)`,
+    /// which no reader takes as full.
+    OverCeiling,
     Other(u8),
 }
 
@@ -278,6 +286,7 @@ impl Reason {
             Self::Protocol => 5,
             Self::FellBehind => 6,
             Self::Retired => 7,
+            Self::OverCeiling => 8,
             Self::Other(byte) => byte,
         }
     }
@@ -291,6 +300,7 @@ impl Reason {
             5 => Self::Protocol,
             6 => Self::FellBehind,
             7 => Self::Retired,
+            8 => Self::OverCeiling,
             other => Self::Other(other),
         }
     }
@@ -881,6 +891,10 @@ mod tests {
             Record::Goodbye {
                 reason: Reason::FellBehind,
                 retry_after_secs: 0,
+            },
+            Record::Goodbye {
+                reason: Reason::OverCeiling,
+                retry_after_secs: 60,
             },
             Record::hello(Role::Engine),
             Record::hello(Role::Probe),

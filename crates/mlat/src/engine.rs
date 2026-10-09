@@ -55,14 +55,20 @@ pub const MIN_RECEIVERS: usize = 20_000;
 /// wanted receptions over the longest a reception waits (`provisional::WAITING_MS`).
 pub const WAITING_PER_RECEIVER: usize =
     Rates::MEASURED.wanted_per_s * provisional::WAITING_MS as usize / 1_000;
-/// How long after the window step that published a model provisional solving takes it up. A host
-/// that runs its provisional steps apart from its window steps (a relay's, `tally_relay::mlat_host`)
-/// so that a slow window step never holds a provisional one up, may start a provisional step only
-/// once every window step this long before it has reported: this is at least the window steps it
-/// may fall behind, so a host that sheds nothing never waits, and its provisional steps carry
-/// exactly the models one solving in line carries. A model is carried for 90 s past its window
-/// (`tally_mlat_solver::MAX_CARRY_PS`), so five seconds of it are not missed.
-pub const MODELS_RIPEN_MS: u64 = 5_000;
+/// How long after the window step that published a model provisional solving takes it up: by the
+/// step's stamp, never by when it reported, so the provisional step at `t` carries exactly the
+/// models of the window steps at or before `t - MODELS_RIPEN_MS`, in line and hosted alike, and
+/// the same stamped trace solves the same provisionals however long its window steps ran. A host
+/// that runs its provisional steps apart from its window steps (a relay's,
+/// `tally_relay::mlat_host`) so that a slow window step never holds a provisional one up, starts a
+/// provisional step only once every window step this long before it has reported, and sheds it,
+/// counted, when one has not: never starts it with other models than these. So this is at least a
+/// window step's run on the threads its host plans (measured on a relay's planned threads, RFC-0181
+/// "MLAT in the cores", 9 to 11 s at 2,000 feeders; it was 5 s, and every window step past it made
+/// the provisional bytes depend on thread timing), and at least the window steps a host may fall
+/// behind. A model is carried for 90 s past its window (`tally_mlat_solver::MAX_CARRY_PS`) and a
+/// tile's is refitted every stride (40 s), so fifteen seconds of it are not missed.
+pub const MODELS_RIPEN_MS: u64 = 15_000;
 
 /// How much an engine holds, derived from what its host admits (RFC-0181 §9).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

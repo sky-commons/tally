@@ -205,8 +205,11 @@ fn wall_ms() -> u64 {
 }
 
 /// A scenario whose first 30 seconds fill the solved bins of the newest window already due by the
-/// relay's clock, and whose last 15 come after it: the first phase is solved the moment the relay
-/// steps, and the second is recent enough for that window's models to carry.
+/// relay's clock, and whose last 30 come after it: the first phase is solved the moment the relay
+/// steps, and the second is recent enough for that window's models to carry, and runs past the
+/// step they ripen at (`tally_mlat::engine::MODELS_RIPEN_MS` after the window step, about 22 s
+/// past the split), so provisional positions are solved under them before the next window comes
+/// due (about 47 s past it), whose models are of raw the client does not hold.
 fn recent(seed: u64) -> (Scenario, u64) {
     recent_at(seed, wall_ms())
 }
@@ -219,7 +222,7 @@ fn recent_at(seed: u64, now_ms: u64) -> (Scenario, u64) {
     let start_ms = (top - 5) as u64 * GRID_MS + 200;
     let split_ms = (top + 1) as u64 * GRID_MS;
     let scenario = Scenario {
-        duration_s: 45.0,
+        duration_s: 60.0,
         modes_aircraft: 16,
         midnight_unix_ms: start_ms - start_ms % 86_400_000,
         start_tod_s: (start_ms % 86_400_000) as f64 / 1000.0,

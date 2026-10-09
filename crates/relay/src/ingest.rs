@@ -36,9 +36,9 @@
 //! relay's stream verifies strictly, so a relay that batched could be made to forward what its
 //! readers reject. Each batch's key is decompressed once instead (`Batch` keeps it).
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{RecvTimeoutError, Sender, channel};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -116,6 +116,91 @@ pub const CHARGE_FLOOR: usize = FEEDER_ALLOWANCE / RECORDS_IN_FLIGHT;
 // batches it was sized for (`budget::PerFeeder::planned`'s ingest line).
 const _: () = assert!(PLANNED_BATCH_CHARGE >= CHARGE_FLOOR);
 
+/// The bytes of its byte ceiling each record a connection sends is paced as, at least
+/// ([`records_per_sec`]): whatever its bytes, a record costs the relay a fixed amount (a signature
+/// verified on an ingest worker, or one checked or signed for an answer on the async runtime, and
+/// its decode), so a connection's records a second are held to its byte ceiling over this. A feeder
+/// seals a batch once a second and early only at 48 KiB (`tally_feed`), so one keeping to its
+/// ceiling sends fewer: at the default 256 KiB/s, eight a second, where it sends five at most.
+pub const RECORD_BYTES: u64 = 32 << 10;
+
+/// The records a second a connection held to `bytes_per_sec` may send (R-N12), at least one: its
+/// ceiling over [`RECORD_BYTES`]. The ingest cores plan each feeder's worth of these
+/// ([`INGEST_NANOS_PER_RECORD`] each, `cores`). Before, a feeder sending tiny batches within its
+/// 256 KiB/s was some 870 signature checks a second, and a few dozen such feeders took every
+/// ingest worker: [`CHARGE_FLOOR`] bounded how many it had waiting at once, never how many a
+/// second.
+pub const fn records_per_sec(bytes_per_sec: u64) -> u64 {
+    let records = bytes_per_sec.div_ceil(RECORD_BYTES);
+    if records == 0 { 1 } else { records }
+}
+
+/// The records a second the members' shared rate may bring, all member sessions together, for
+/// `member_feeders` planned feeders' worth (`budget::Plan::member_feeders`): [`MEMBER_RECORDS_PER_FEEDER`]
+/// each. What a member forwards is feeders' batches at the planned rate (one a second each) and
+/// their descriptions.
+pub const fn member_records_per_sec(member_feeders: usize) -> u64 {
+    let feeders = member_feeders as u64;
+    let records = feeders.saturating_mul(MEMBER_RECORDS_PER_FEEDER);
+    if records == 0 { 1 } else { records }
+}
+
+/// The records a second one planned feeder's worth of the members' rate may bring: four times the
+/// planned batch a second, the headroom the notes plan for feeders above their rate
+/// (`mlat_host::NOTES_HEADROOM`).
+pub const MEMBER_RECORDS_PER_FEEDER: u64 = 4;
+
+/// Nanoseconds of an ingest worker one record costs whatever its receptions: its strict Ed25519
+/// verification, its hash, admission and decode. Measured (2026-10-09, `-c opt`-equivalent release
+/// build, one core of the 32-core build host): an empty batch and a batch of one reception, read as
+/// the connection task reads them (the key decompressed there), cost 24.3 to 25.1 us each to verify,
+/// hash and decode, the verification nearly all of it; admission, routing and the fan-out's offer
+/// add a few more, so 30 us is planned. A planned batch costs some 151 us
+/// (`cores::INGEST_RECEPTIONS_PER_THREAD`), so a feeder at [`records_per_sec`] of the default
+/// ceiling (eight tiny records a second, 240 us) costs the workers some 1.8 times a planned one.
+pub const INGEST_NANOS_PER_RECORD: usize = 30_000;
+
+/// A connection's (or the member sessions') records a second, waited for ([`records_per_sec`]): a
+/// token bucket of `rate` records a second and a second's worth of burst. Past it the read loop
+/// waits before it takes the next record, its socket unread, so TCP holds the sender back as the
+/// ingest allowance does. Read off tokio's clock, so a test that pauses time paces with it.
+pub struct RecordPace {
+    rate: u64,
+    /// Records still allowed (negative: owed), as of when.
+    state: Mutex<(f64, tokio::time::Instant)>,
+}
+
+impl RecordPace {
+    pub fn new(rate: u64) -> Self {
+        let rate = rate.max(1);
+        Self {
+            rate,
+            state: Mutex::new((rate as f64, tokio::time::Instant::now())),
+        }
+    }
+
+    pub fn rate(&self) -> u64 {
+        self.rate
+    }
+
+    /// One record, waiting while the pace owes more than it has refilled.
+    pub async fn take(&self) {
+        let wait = {
+            let Ok(mut state) = self.state.lock() else {
+                return;
+            };
+            let now = tokio::time::Instant::now();
+            let elapsed = now.saturating_duration_since(state.1).as_secs_f64();
+            let allowed = (state.0 + elapsed * self.rate as f64).min(self.rate as f64) - 1.0;
+            *state = (allowed, now);
+            (allowed < 0.0).then(|| Duration::from_secs_f64(-allowed / self.rate as f64))
+        };
+        if let Some(wait) = wait {
+            tokio::time::sleep(wait).await;
+        }
+    }
+}
+
 /// What a connection holds of Noise buffers at most, both directions together
 /// (`tally_wire::noise::READER_BUFFERS`, `tally_wire::noise::WRITER_BUFFERS`, each a whole
 /// message): the reader's frame and its plaintext, then the plaintext and the records decoded
@@ -181,22 +266,109 @@ pub struct Threads {
 }
 
 /// One connection's allowance of bytes in the ingest stage (RFC-0181 §2, §10), carved from the
-/// relay's `Store::Ingest` when the connection is admitted and held for as long as it, or any
-/// batch it read, holds any of it: what a feeder reserved ([`FEEDER_ALLOWANCE`]), or a sharing
-/// member its feeders' worth. Each batch takes its charge ([`charge_of`]) from it before it is
-/// handed over, waiting while the connection holds its allowance (its socket unread), so no peer
-/// can hold the room another connection was given.
+/// relay's `Store::Ingest` when the connection is admitted and held for as long as the connection
+/// is: what a feeder reserved ([`FEEDER_ALLOWANCE`]), or a sharing member its feeders' worth. Each
+/// batch takes its charge ([`charge_of`]) from it before it is handed over, waiting while the
+/// connection holds its allowance (its socket unread), so no peer can hold the room another
+/// connection was given.
 ///
-/// The carve is shared by the allowance and every charge taken from it ([`InFlight`]), and goes
-/// back to `Store::Ingest` with the last of them: a connection that ends with batches still
-/// queued for the workers leaves its carve held until they are done. Before, the carve went back
-/// when the read loop ended, while the batches it had read were charged only to the connection's
-/// own gauge: a peer that connected, sent a Hello and ~140 KB of batches, and hung up, again and
-/// again, queued work no store counted.
+/// A charge is lent its own bytes of the carve ([`Lent`]), and nothing more: while the connection
+/// is open they go back to the carve when the charge is let go, and once it has ended they go back
+/// to `Store::Ingest` then; the rest of the carve goes back the moment the connection ends. So a
+/// batch the connection read holds what it is charged, whoever holds it and for however long, and
+/// a connection that ends with batches still queued for the workers holds the store for those
+/// batches alone. Before, every charge held the whole carve (some 68 KB for a feeder) until the
+/// last of them was let go, and a decode held on (orphans for 3 s, subscriber queues, the notes,
+/// the exchange's held parts) kept it: after a network blip at the ceiling, every reconnect was
+/// turned away for want of room for its allowance until the old carves drained, and a churner
+/// could force it. And before that, the carve went back when the read loop ended while the batches
+/// it had read were charged only to the connection's own gauge: a peer that connected, sent a
+/// Hello and ~140 KB of batches, and hung up, again and again, queued work no store counted.
 pub struct Allowance {
     own: Arc<Gauge>,
     oversize: Arc<Gauge>,
-    carved: Arc<Charge>,
+    carve: Arc<Carve>,
+}
+
+/// What of a connection's carve no charge has been lent: given back to `Store::Ingest` when the
+/// connection's [`Allowance`] is dropped, with it.
+struct Carve(Mutex<Charge>);
+
+impl Carve {
+    /// `bytes` of the carve lent to a charge (all of it, if less is left: never, while the
+    /// connection's own gauge holds its charges to the allowance).
+    fn lend(self: &Arc<Self>, bytes: usize) -> Lent {
+        let charge = self
+            .0
+            .lock()
+            .map(|mut carve| carve.split(bytes))
+            .unwrap_or_default();
+        Lent {
+            charge,
+            home: Arc::downgrade(self),
+        }
+    }
+
+    /// `charge` back in the carve.
+    fn repay(&self, mut charge: Charge) {
+        // The carve holds no decode: what the charge was lent for is not covered by it.
+        charge.uncover();
+        if let Ok(mut carve) = self.0.lock() {
+            // Lent from this carve, so on its gauge: absorbed whole.
+            let _ = carve.absorb(charge);
+        }
+    }
+}
+
+/// Bytes of `Store::Ingest` one charge holds: lent from its connection's [`Carve`], to which they go
+/// back when let go while the connection is open (else to the store, as the charge drops), or
+/// charged to the store directly (`InFlight::trusted`), with no carve to go back to.
+#[derive(Debug, Default)]
+struct Lent {
+    charge: Charge,
+    home: std::sync::Weak<Carve>,
+}
+
+impl Lent {
+    fn bytes(&self) -> usize {
+        self.charge.bytes()
+    }
+
+    /// All but `bytes` let go.
+    fn shrink_to(&mut self, bytes: usize) {
+        let excess = self.charge.bytes().saturating_sub(bytes);
+        let back = self.charge.split(excess);
+        self.give_back(back);
+    }
+
+    /// `bytes` of it (all, if it holds less) moved into a charge of their own, lent from the same
+    /// carve.
+    fn split(&mut self, bytes: usize) -> Self {
+        Self {
+            charge: self.charge.split(bytes),
+            home: self.home.clone(),
+        }
+    }
+
+    fn give_back(&self, charge: Charge) {
+        match self.home.upgrade() {
+            Some(carve) => carve.repay(charge),
+            None => drop(charge),
+        }
+    }
+}
+
+impl Drop for Lent {
+    fn drop(&mut self) {
+        let charge = std::mem::take(&mut self.charge);
+        self.give_back(charge);
+    }
+}
+
+impl std::fmt::Debug for Carve {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Carve")
+    }
 }
 
 impl Allowance {
@@ -207,14 +379,13 @@ impl Allowance {
         Some(Self {
             own: Gauge::new(Store::Ingest, bytes),
             oversize: Arc::clone(oversize),
-            carved: Arc::new(carved),
+            carve: Arc::new(Carve(Mutex::new(carved))),
         })
     }
 
     /// One batch's charge of `bytes`, waiting while the connection holds its allowance. A batch
     /// larger than the whole allowance waits until the connection holds nothing, and takes the rest
-    /// from the oversize room ([`OVERSIZE_BYTES`]). The charge holds the connection's carve until
-    /// it is let go.
+    /// from the oversize room ([`OVERSIZE_BYTES`]). The charge is lent its bytes of the carve.
     pub async fn acquire(&self, bytes: usize) -> InFlight {
         let own = bytes.min(self.own.limit());
         let charge = self.own.charge(own).await;
@@ -224,9 +395,9 @@ impl Allowance {
             Charge::none()
         };
         InFlight {
-            charge,
+            store: self.carve.lend(own),
+            own: charge,
             over,
-            carved: Some(Arc::clone(&self.carved)),
         }
     }
 
@@ -241,14 +412,16 @@ impl Allowance {
 /// ([`InFlight::trusted`]). Every batch handed to the stage carries one (`hub::Inbound`): it is
 /// shrunk to the decode's footprint once decoded, split with the batch's slices to the message
 /// exchange, and let go when the epochs hold the bytes (or the batch is let go), so the bytes
-/// between a socket and the epochs are charged all the way. Each part of it holds its
-/// connection's carve (`carved`): what the allowance was cut from `Store::Ingest` stays cut
-/// until the last batch the connection read is let go, whenever the connection ended.
+/// between a socket and the epochs are charged all the way. What it holds of `Store::Ingest` is its
+/// own bytes and no more ([`Lent`]), however long something holds it.
 #[derive(Debug)]
 pub struct InFlight {
-    charge: Charge,
+    /// Against its connection's allowance (none for a trusted batch): what bounds the connection.
+    own: Charge,
+    /// Its bytes of `Store::Ingest`, the same as `own` for a connection's batch.
+    store: Lent,
+    /// What a batch past its connection's whole allowance takes from the oversize room.
     over: Charge,
-    carved: Option<Arc<Charge>>,
 }
 
 impl InFlight {
@@ -257,9 +430,12 @@ impl InFlight {
     /// wait. A charge larger than the whole limit waits until nothing else is held.
     pub fn trusted(gauge: &Arc<Gauge>, bytes: usize) -> Self {
         Self {
-            charge: block_on(gauge.charge(bytes)),
+            own: Charge::none(),
+            store: Lent {
+                charge: block_on(gauge.charge(bytes)),
+                home: std::sync::Weak::new(),
+            },
             over: Charge::none(),
-            carved: None,
         }
     }
 
@@ -267,24 +443,33 @@ impl InFlight {
     #[cfg(test)]
     pub fn free() -> Self {
         Self {
-            charge: Charge::none(),
+            own: Charge::none(),
+            store: Lent::default(),
             over: Charge::none(),
-            carved: None,
         }
     }
 
     pub fn bytes(&self) -> usize {
-        self.charge.bytes() + self.over.bytes()
+        self.store.bytes() + self.over.bytes()
+    }
+
+    /// This charge is for holding `decoded` (`budget::Charge::cover`), and so is every part split
+    /// from it. Covered once it is shrunk to the decode (`shrink_to`), so what goes back to the
+    /// carve covers nothing.
+    pub fn cover(&mut self, decoded: &Arc<tally_wire::Decoded>) {
+        self.store.charge.cover(decoded);
+        self.over.cover(decoded);
     }
 
     /// Releases all but `bytes` (the oversize room's first): the decode is no larger.
     pub fn shrink_to(&mut self, bytes: usize) {
-        let own = self.charge.bytes();
-        if bytes < own {
+        let base = self.store.bytes();
+        if bytes < base {
             self.over.shrink_to(0);
-            self.charge.shrink_to(bytes);
+            self.store.shrink_to(bytes);
+            self.own.shrink_to(bytes);
         } else {
-            self.over.shrink_to(bytes - own);
+            self.over.shrink_to(bytes - base);
         }
     }
 
@@ -292,11 +477,11 @@ impl InFlight {
     /// nothing taken or released: a slice's share, handed on with it.
     pub fn split(&mut self, bytes: usize) -> InFlight {
         let over = self.over.split(bytes);
-        let charge = self.charge.split(bytes - over.bytes());
+        let rest = bytes - over.bytes();
         InFlight {
-            charge,
+            own: self.own.split(rest),
+            store: self.store.split(rest),
             over,
-            carved: self.carved.clone(),
         }
     }
 }
@@ -419,12 +604,113 @@ impl Refusal {
 }
 
 /// Work for one worker, given its producer number. The relay hands a worker a record only with its
-/// charge ([`Stages::run_charged`], [`Stages::run_stamped`]), each at least [`CHARGE_FLOOR`] and
-/// holding its connection's carve until it is let go ([`Allowance`]), so what waits in a worker's
-/// queue is bounded by `Store::Ingest` and the oversize room: at most their bytes over
-/// [`CHARGE_FLOOR`] records, however many connections came and went. Anything else a worker is
-/// given is a trace's or a test's (`advance`, `flush`), which waits for it; a worker ticks itself.
+/// charge ([`Stages::run_charged`], [`Stages::run_stamped`]), each at least [`CHARGE_FLOOR`] of
+/// `Store::Ingest` and the oversize room, so the records the charges admit are at most their bytes
+/// over [`CHARGE_FLOOR`] ([`Room::records`]), however many connections came and went; and the
+/// workers' queues take no more than that, whatever the charges say ([`Queued`]). Anything else a
+/// worker is given is a trace's or a test's (`advance`, `flush`), at most [`CONTROL_QUEUED`] at
+/// once, its sender waiting for room; a worker ticks itself.
 type Work = Box<dyn FnOnce(usize) + Send>;
+
+/// The rooms a record handed to the ingest workers is charged to: `Store::Ingest` and the
+/// oversize room (`Budget::oversize`). What bounds the workers' queues ([`Room::records`]).
+#[derive(Clone)]
+pub struct Room {
+    pub ingest: Arc<Gauge>,
+    pub oversize: Arc<Gauge>,
+}
+
+impl Room {
+    /// The rooms of a relay's budget.
+    pub fn of(budget: &crate::budget::Budget) -> Self {
+        Self {
+            ingest: budget.gauge(Store::Ingest),
+            oversize: budget.oversize(),
+        }
+    }
+
+    /// The most records the two rooms admit at once, each charged at least [`CHARGE_FLOOR`] (and
+    /// one, however large, while nothing else is held): read from their limits now, so a budget
+    /// resized is followed.
+    pub fn records(&self) -> usize {
+        self.ingest
+            .limit()
+            .saturating_add(self.oversize.limit())
+            .checked_div(CHARGE_FLOOR)
+            .unwrap_or(usize::MAX)
+            .max(1)
+    }
+}
+
+/// The most control work (`Stages::advance`, `Stages::flush`: a trace's and a test's) waiting for
+/// the workers at once; a sender past it waits for room.
+pub const CONTROL_QUEUED: usize = 64;
+
+/// What waits in the workers' queues, counted as it is handed in and as a worker takes it, so no
+/// queue holds more than its bound by construction (R-P9): charged records at most
+/// [`Room::records`], every worker together, a record past it refused and counted, never queued;
+/// control work at most [`CONTROL_QUEUED`], its sender waiting. Before, each worker's queue was an
+/// unbounded channel, bounded only by what the charges admitted: a path that handed a record over
+/// uncharged, or charged short, grew it without limit.
+struct Queued {
+    room: Option<Room>,
+    records: AtomicUsize,
+    refused: AtomicU64,
+    control: Mutex<usize>,
+    control_taken: Condvar,
+}
+
+impl Queued {
+    fn new(room: Option<Room>) -> Self {
+        Self {
+            room,
+            records: AtomicUsize::new(0),
+            refused: AtomicU64::new(0),
+            control: Mutex::new(0),
+            control_taken: Condvar::new(),
+        }
+    }
+
+    /// A record counted in, if the queues hold fewer than their bound.
+    fn admit(&self) -> bool {
+        let bound = self.room.as_ref().map_or(usize::MAX, Room::records);
+        let admitted = self
+            .records
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |queued| {
+                (queued < bound).then_some(queued + 1)
+            })
+            .is_ok();
+        if !admitted {
+            self.refused.fetch_add(1, Ordering::Relaxed);
+        }
+        admitted
+    }
+
+    fn record_taken(&self) {
+        self.records.fetch_sub(1, Ordering::AcqRel);
+    }
+
+    /// Control work counted in, waiting while [`CONTROL_QUEUED`] wait.
+    fn admit_control(&self) {
+        let Ok(mut waiting) = self.control.lock() else {
+            return;
+        };
+        while *waiting >= CONTROL_QUEUED {
+            match self.control_taken.wait(waiting) {
+                Ok(again) => waiting = again,
+                Err(_) => return,
+            }
+        }
+        *waiting += 1;
+    }
+
+    fn control_taken(&self) {
+        if let Ok(mut waiting) = self.control.lock() {
+            *waiting = waiting.saturating_sub(1);
+        }
+        self.control_taken.notify_all();
+    }
+}
 
 /// A batch's work for one worker: given its producer number and the batch's charge.
 pub type ChargedWork = Box<dyn FnOnce(usize, InFlight) + Send>;
@@ -453,6 +739,8 @@ struct Core {
     ticked: Box<[AtomicU64]>,
     message: MessageExchange,
     pause: Option<Pause>,
+    /// What waits in the workers' queues.
+    queued: Queued,
 }
 
 impl Core {
@@ -518,20 +806,21 @@ impl Stages {
                 ticked: vec![AtomicU64::new(0)].into_boxed_slice(),
                 message: MessageExchange::inline(sink, gauges),
                 pause: None,
+                queued: Queued::new(None),
             }),
             pool: Pool::Inline(Mutex::new(())),
         }
     }
 
     /// The stages on `threads`, closed epochs going to `sink`, each stage held up by `pause` (a
-    /// test's; none in a relay). Every thread is running or the stages are not made: a worker
-    /// that cannot be started fails the relay at its start, since every message thread waits for
-    /// every worker's tick and one missing would close no epoch ever.
+    /// test's; none in a relay), the records waiting for the workers at most what `room` admits
+    /// ([`Room::records`]). Every thread is running or the stages are not made: a worker that
+    /// cannot be started fails the relay at its start, since every message thread waits for every
+    /// worker's tick and one missing would close no epoch ever.
     pub fn threaded(
         clock: Clock,
         threads: Threads,
-        sink: &Sink,
-        gauges: &Gauges,
+        (sink, gauges, room): (&Sink, &Gauges, Room),
         pause: Option<Pause>,
     ) -> Result<Self, String> {
         let workers = threads.ingest.max(1);
@@ -548,6 +837,7 @@ impl Stages {
                 pause.as_ref(),
             )?,
             pause,
+            queued: Queued::new(Some(room)),
         });
         // Dropping `stages` on a failure stops and joins the workers already started.
         let mut stages = Self {
@@ -610,9 +900,22 @@ impl Stages {
     }
 
     /// Runs a batch's `work` on worker `worker`, with its charge: the one way a batch reaches a
-    /// worker, so the batches waiting for the workers are charged.
-    pub fn run_charged(&self, worker: usize, in_flight: InFlight, work: ChargedWork) {
-        self.run_on(worker, Box::new(move |producer| work(producer, in_flight)));
+    /// worker, so the batches waiting for the workers are charged. False, counted
+    /// ([`Stages::refused`]), when the workers' queues hold all the records the rooms admit
+    /// ([`Room::records`]): the record is let go with its charge, never queued past the bound.
+    pub fn run_charged(&self, worker: usize, in_flight: InFlight, work: ChargedWork) -> bool {
+        self.run_record(worker, Box::new(move |producer| work(producer, in_flight)))
+    }
+
+    /// Records refused because the workers' queues held their bound: none while every record is
+    /// charged as it should be.
+    pub fn refused(&self) -> u64 {
+        self.core.queued.refused.load(Ordering::Relaxed)
+    }
+
+    /// Records waiting for the workers now.
+    pub fn queued(&self) -> usize {
+        self.core.queued.records.load(Ordering::Acquire)
     }
 
     /// Runs `work` on worker `worker` with its charge, stamped there as a batch is: by `given`, a
@@ -625,9 +928,9 @@ impl Stages {
         in_flight: InFlight,
         given: Option<Stamp>,
         work: StampedWork,
-    ) {
+    ) -> bool {
         let core = Arc::clone(&self.core);
-        self.run_on(
+        self.run_record(
             worker,
             Box::new(move |producer| {
                 let stamp = given.map_or_else(
@@ -636,22 +939,61 @@ impl Stages {
                 );
                 work(stamp, in_flight);
             }),
-        );
+        )
     }
 
-    /// Runs `work` on worker `worker` (inline: now, on the caller, then ticks).
-    fn run_on(&self, worker: usize, work: Work) {
+    /// Runs a charged record's `work` on worker `worker`, counted in the workers' queues until a
+    /// worker takes it; false, counted, when they hold their bound.
+    fn run_record(&self, worker: usize, work: Work) -> bool {
+        if matches!(self.pool, Pool::Inline(_)) {
+            self.run_on(worker, work);
+            return true;
+        }
+        if !self.core.queued.admit() {
+            return false;
+        }
+        let core = Arc::clone(&self.core);
+        let counted = Box::new(move |producer| {
+            core.queued.record_taken();
+            work(producer);
+        });
+        if !self.run_on(worker, counted) {
+            self.core.queued.record_taken();
+        }
+        true
+    }
+
+    /// Runs control work (a trace's or a test's) on worker `worker`, waiting while
+    /// [`CONTROL_QUEUED`] wait.
+    fn run_control(&self, worker: usize, work: Work) {
+        if matches!(self.pool, Pool::Inline(_)) {
+            self.run_on(worker, work);
+            return;
+        }
+        self.core.queued.admit_control();
+        let core = Arc::clone(&self.core);
+        let counted = Box::new(move |producer| {
+            core.queued.control_taken();
+            work(producer);
+        });
+        if !self.run_on(worker, counted) {
+            self.core.queued.control_taken();
+        }
+    }
+
+    /// Runs `work` on worker `worker` (inline: now, on the caller, then ticks). False if the
+    /// worker is gone (the stages are being dropped), the work dropped unrun.
+    fn run_on(&self, worker: usize, work: Work) -> bool {
         match &self.pool {
             Pool::Inline(lock) => {
                 let _held = lock.lock();
                 work(0);
                 self.core.tick(0, true);
+                true
             }
-            Pool::Threads { senders, .. } => {
-                if let Some(sender) = senders.get(worker % senders.len().max(1)) {
-                    let _ = sender.send(work);
-                }
-            }
+            Pool::Threads { senders, .. } => senders
+                .get(worker % senders.len().max(1))
+                .is_some_and(|sender| sender.send(work).is_ok()),
         }
     }
 
@@ -696,11 +1038,14 @@ impl Stages {
                 self.core.tick_at(0, stamp_ms);
             }
             Pool::Threads { senders, .. } => {
-                for sender in senders {
+                for worker in 0..senders.len() {
                     let core = Arc::clone(&self.core);
-                    let _ = sender.send(Box::new(move |producer| {
-                        core.tick_at(producer, stamp_ms);
-                    }));
+                    self.run_control(
+                        worker,
+                        Box::new(move |producer| {
+                            core.tick_at(producer, stamp_ms);
+                        }),
+                    );
                 }
             }
         }
@@ -713,17 +1058,15 @@ impl Stages {
     pub fn flush(&self) {
         if let Pool::Threads { senders, .. } = &self.pool {
             let (done, finished) = channel::<()>();
-            let mut waiting = 0;
-            for sender in senders {
+            let waiting = senders.len();
+            for worker in 0..waiting {
                 let done = done.clone();
-                if sender
-                    .send(Box::new(move |_| {
+                self.run_control(
+                    worker,
+                    Box::new(move |_| {
                         let _ = done.send(());
-                    }))
-                    .is_ok()
-                {
-                    waiting += 1;
-                }
+                    }),
+                );
             }
             drop(done);
             for _ in 0..waiting {
@@ -926,13 +1269,14 @@ mod tests {
         assert_eq!(last, 27_000);
     }
 
-    /// RFC-0181 §2: a connection's carve outlives the connection while any batch it read holds a
-    /// charge. A peer that connects, sends a batch the workers have not taken, and hangs up, again
-    /// and again, holds `Store::Ingest` for every batch it left queued, so the next connection is
-    /// turned away once the store is full and nothing queues uncounted. Before, the carve went
-    /// back with the read loop, and the store said 0 while the batches waited.
+    /// RFC-0181 §2: a batch a connection read holds the store for its own bytes for as long as
+    /// anything holds it, whenever the connection ended. A peer that connects, sends a batch the
+    /// workers have not taken, and hangs up, again and again, holds `Store::Ingest` for every batch
+    /// it left queued, so the next connection is turned away once the store is full and nothing
+    /// queues uncounted. Before, the carve went back with the read loop, and the store said 0
+    /// while the batches waited.
     #[tokio::test]
-    async fn a_connections_carve_is_held_until_the_last_batch_it_read_is_let_go() {
+    async fn a_batch_a_connection_left_holds_the_store_for_its_own_bytes() {
         let ingest = Gauge::new(Store::Ingest, 300);
         let oversize = Gauge::new(Store::Ingest, 1_000);
         let mut queued = Vec::new();
@@ -942,19 +1286,62 @@ mod tests {
             // A batch handed to the workers, then the connection ends.
             queued.push(allowance.acquire(40).await);
             drop(allowance);
-            assert_eq!(ingest.held(), 100 * connected);
-            assert!(connected <= 3, "connected past the store");
+            assert_eq!(ingest.held(), 40 * connected);
+            assert!(connected <= 6, "connected past the store");
         }
-        assert_eq!(connected, 3);
-        // A slice of a queued batch still holds the carve after the rest goes.
+        // Five batches left behind, and room for one more allowance beside them.
+        assert_eq!(connected, 6);
+        // A slice of a queued batch still holds its share after the rest goes.
         let mut first = queued.remove(0);
         let slice = first.split(10);
         drop(first);
-        assert_eq!(ingest.held(), 300);
+        assert_eq!(ingest.held(), 210);
         drop(slice);
         assert_eq!(ingest.held(), 200);
         drop(queued);
         assert_eq!(ingest.held(), 0);
+    }
+
+    /// RFC-0181 §2: what a batch holds of `Store::Ingest` is its own bytes, never its connection's
+    /// whole carve. A connection ends while a batch it read is still held (its decode in the
+    /// orphans, a subscriber's queue, the exchange's held parts), and its peer reconnects at once:
+    /// the new connection's allowance fits beside that batch's bytes. Before, every charge held
+    /// the whole carve until the last of them was let go, so after a network blip at the ceiling
+    /// every reconnect was turned away ("no room for its ingest allowance") until the old decodes
+    /// were gone, and a churner could keep it so. While a connection is open, what its charges let
+    /// go goes back to its own carve, never to the store, so it keeps its whole allowance.
+    #[tokio::test]
+    async fn a_batch_holds_its_own_bytes_of_the_carve_and_no_more() -> Result<(), String> {
+        let ingest = Gauge::new(Store::Ingest, 300);
+        let oversize = Gauge::new(Store::Ingest, 1_000);
+        let first = Allowance::carve(&ingest, &oversize, 100).ok_or("the first carve fits")?;
+        let mut held = first.acquire(40).await;
+        // Decoded smaller: what it let go is the open connection's again, not the store's.
+        held.shrink_to(30);
+        assert_eq!((ingest.held(), first.available()), (100, 70));
+        // The connection ends, its batch still held: the store holds the batch's bytes alone.
+        drop(first);
+        assert_eq!(ingest.held(), 30);
+        // Its peer reconnects, and another beside it: both fit beside the batch, a third not.
+        let second = Allowance::carve(&ingest, &oversize, 100).ok_or("a reconnect fits")?;
+        let third = Allowance::carve(&ingest, &oversize, 100).ok_or("a second one fits")?;
+        assert_eq!(ingest.held(), 230);
+        assert!(Allowance::carve(&ingest, &oversize, 100).is_none());
+        // A slice of the old batch holds its share, the rest its own.
+        let slice = held.split(10);
+        drop(held);
+        assert_eq!(ingest.held(), 210);
+        drop(slice);
+        assert_eq!(ingest.held(), 200);
+        // An open connection's charges come from its carve and go back to it: the store holds the
+        // two carves whatever they lend.
+        let lent = second.acquire(100).await;
+        assert_eq!((ingest.held(), second.available()), (200, 0));
+        drop(lent);
+        assert_eq!((ingest.held(), second.available()), (200, 100));
+        drop((second, third));
+        assert_eq!(ingest.held(), 0);
+        Ok(())
     }
 
     /// RFC-0181 §2: however small its records, a connection has at most `RECORDS_IN_FLIGHT` of
@@ -994,6 +1381,118 @@ mod tests {
         }
         assert_eq!(held.len(), RECORDS_IN_FLIGHT);
         Ok(())
+    }
+
+    /// Rooms that bound nothing: a test's stages.
+    fn unlimited_room() -> Room {
+        Room {
+            ingest: Gauge::unlimited(Store::Ingest),
+            oversize: Gauge::unlimited(Store::Ingest),
+        }
+    }
+
+    /// R-P9: the workers' queues are bounded by construction, not only by what the charges admit.
+    /// The one worker is held at a gate while records are handed in: the queues take as many as
+    /// the rooms admit (`Room::records`, here two) and refuse, counted, the next, letting its charge
+    /// go at once; the worker let go runs the two it holds. Before, each worker's queue was an
+    /// unbounded channel: a record handed in past what the charges allow (a path that charged
+    /// short, or not at all) was queued all the same, and the queue grew without limit.
+    #[test]
+    fn the_workers_queues_hold_no_more_than_the_rooms_admit() -> Result<(), String> {
+        let room = Room {
+            ingest: Gauge::new(Store::Ingest, 2 * CHARGE_FLOOR),
+            oversize: Gauge::new(Store::Ingest, 0),
+        };
+        assert_eq!(room.records(), 2);
+        let sink: Sink = Arc::new(|_| Ok(()));
+        let threads = Threads {
+            ingest: 1,
+            message: 1,
+            seal: 1,
+        };
+        let stages = Stages::threaded(
+            Arc::new(|| 0),
+            threads,
+            (&sink, &Gauges::unlimited(), room),
+            None,
+        )?;
+        // The worker takes the first and waits at the gate inside it.
+        let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let (started, running) = channel::<()>();
+        let held = Arc::clone(&gate);
+        assert!(stages.run_charged(
+            0,
+            InFlight::free(),
+            Box::new(move |_, _| {
+                let _ = started.send(());
+                let (open, opened) = &*held;
+                if let Ok(mut open) = open.lock() {
+                    while !*open {
+                        match opened.wait(open) {
+                            Ok(again) => open = again,
+                            Err(_) => return,
+                        }
+                    }
+                }
+            }),
+        ));
+        running
+            .recv_timeout(Duration::from_secs(60))
+            .map_err(|_| "the worker never took the first record".to_owned())?;
+        // Two wait for it, each charged; the third is refused and its charge let go.
+        let charges = Gauge::unlimited(Store::Ingest);
+        let (ran, done) = channel::<()>();
+        let mut handed = Vec::new();
+        for _ in 0..3 {
+            let ran = ran.clone();
+            handed.push(stages.run_charged(
+                0,
+                InFlight::trusted(&charges, CHARGE_FLOOR),
+                Box::new(move |_, in_flight| {
+                    drop(in_flight);
+                    let _ = ran.send(());
+                }),
+            ));
+        }
+        drop(ran);
+        assert_eq!(handed, [true, true, false]);
+        assert_eq!((stages.queued(), stages.refused()), (2, 1));
+        assert_eq!(charges.held(), 2 * CHARGE_FLOOR);
+        // Let go, the worker runs the two it holds, and the queues are empty again.
+        let (open, opened) = &*gate;
+        if let Ok(mut open) = open.lock() {
+            *open = true;
+        }
+        opened.notify_all();
+        for _ in 0..2 {
+            done.recv_timeout(Duration::from_secs(60))
+                .map_err(|_| "a queued record never ran".to_owned())?;
+        }
+        stages.flush();
+        assert_eq!((stages.queued(), charges.held()), (0, 0));
+        Ok(())
+    }
+
+    /// R-N12: a connection's records a second are held to its byte ceiling over `RECORD_BYTES`,
+    /// whatever their bytes: at the default feeder ceiling, eight a second after a second's burst,
+    /// so tiny batches sent as fast as the socket takes them are some eight signature checks a
+    /// second, not the 870 they were. Paused time: each wait is the pace's exactly.
+    #[tokio::test(start_paused = true)]
+    async fn a_connections_records_a_second_are_held_to_its_ceiling() {
+        assert_eq!(records_per_sec(256 * 1024), 8);
+        assert_eq!(records_per_sec(0), 1);
+        let pace = RecordPace::new(records_per_sec(256 * 1024));
+        let start = tokio::time::Instant::now();
+        // The burst at once.
+        for _ in 0..8 {
+            pace.take().await;
+        }
+        assert_eq!(start.elapsed(), Duration::ZERO);
+        // Then eight a second: forty more take five seconds.
+        for _ in 0..40 {
+            pace.take().await;
+        }
+        assert_eq!(start.elapsed(), Duration::from_secs(5));
     }
 
     /// Opens a stalled stage's gate when dropped, so a test that fails never leaves a thread
@@ -1064,8 +1563,7 @@ mod tests {
         let stages = Arc::new(Stages::threaded(
             Arc::new(move || reading.load(Ordering::Relaxed)),
             threads,
-            &sink,
-            &Gauges::unlimited(),
+            (&sink, &Gauges::unlimited(), unlimited_room()),
             Some(pause),
         )?);
         drop(sink);
@@ -1102,7 +1600,7 @@ mod tests {
             clock.store(sequence * MS_APART, Ordering::Relaxed);
             let done = done.clone();
             let working = Arc::clone(&stages);
-            stages.run_on(
+            stages.run_record(
                 sequence as usize,
                 Box::new(move |producer| {
                     let stamp = working.stamp(producer);

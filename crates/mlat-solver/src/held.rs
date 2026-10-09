@@ -832,28 +832,6 @@ impl Open {
         )
     }
 
-    /// As `add_decoded_taking`, the batch taken as stamped `stamp_ms` (never earlier than its own
-    /// stamp): for a holder that takes a batch later than it came, as of the step that let it in (a
-    /// relay's raw shards taking a batch that waited for its receiver's description), so its raw is
-    /// late, or ahead, by that step and not by when it first came.
-    pub fn add_decoded_taking_at(
-        &mut self,
-        decoded: &Decoded,
-        stamp_ms: u64,
-        take: &mut dyn FnMut(usize) -> bool,
-    ) -> Added {
-        let room = self.limits.bytes;
-        self.add_observations(
-            decoded.receiver(),
-            decoded.counter_epoch(),
-            decoded.wall_ms(),
-            decoded.views(),
-            room,
-            stamp_ms.max(decoded.stamp_ms()),
-            take,
-        )
-    }
-
     /// `room`: the bytes these open bins may grow to. `stamp_ms`: the batch's ingest stamp, which
     /// every way in passes (module docs, Never ahead): it bounds how far ahead a bin may open for
     /// every holder alike, however it was built, and decides lateness when the holder closes by
@@ -1047,25 +1025,10 @@ fn runs<T>(
 }
 
 /// Runs `work` on each of `inputs` on a thread of its own (here, when there is one), and returns
-/// the results in the inputs' order.
+/// the results in the inputs' order: under the gate of the thread asking, if any
+/// (`crate::gate::on_threads`), so a host's seals spread over no more threads than its plan gave it.
 fn on_threads<I: Send, R: Send>(inputs: Vec<I>, work: impl Fn(I) -> R + Sync) -> Vec<R> {
-    if inputs.len() <= 1 {
-        return inputs.into_iter().map(work).collect();
-    }
-    let work = &work;
-    std::thread::scope(|scope| {
-        let handles: Vec<_> = inputs
-            .into_iter()
-            .map(|input| scope.spawn(move || work(input)))
-            .collect();
-        handles
-            .into_iter()
-            .map(|handle| match handle.join() {
-                Ok(result) => result,
-                Err(panic) => std::panic::resume_unwind(panic),
-            })
-            .collect()
-    })
+    crate::gate::on_threads(inputs, work)
 }
 
 /// Splits `items` into owned runs at `runs`' boundaries.
@@ -1460,13 +1423,8 @@ impl Bin {
         self.find(id).is_some()
     }
 
-    /// This bin's raw, open again without `receiver`: what forgetting a receiver reseals.
-    fn reopen_without(&self, receiver: &PublicKey) -> Fragment {
-        let skip = self.receiver(receiver);
-        self.reopen_without_any(|index| Some(index) == skip)
-    }
-
-    /// This bin's raw, open again without the receivers (by index) `skip` names.
+    /// This bin's raw, open again without the receivers (by index) `skip` names: what forgetting
+    /// receivers reseals.
     fn reopen_without_any(&self, skip: impl Fn(u32) -> bool) -> Fragment {
         let mut fragment = Fragment::new(self.bin);
         for record in &self.records {
@@ -1609,20 +1567,46 @@ impl SealedBins {
         }
     }
 
-    /// Forgets `receiver` in every sealed bin (it left, or became unusable): the bins that held
-    /// it are sealed again without it, on up to `threads` threads, each built before it replaces
-    /// the old one, so a reader sees one bin or the other, never none. Rare.
+    /// Forgets `receiver` in every sealed bin (it left, or became unusable): as
+    /// [`SealedBins::forget_receivers`] of it alone.
     pub fn forget_receiver(&self, receiver: &PublicKey, threads: usize) {
+        self.forget_receivers(std::slice::from_ref(receiver), threads);
+    }
+
+    /// Forgets every one of `receivers` in every sealed bin (they left, or became unusable): each
+    /// bin that held any of them is sealed again once, without all of them (`without`), and
+    /// replaces the old one, so a reader sees one bin or the other, never none. Rare, and costs a
+    /// seal of each bin it touches, however many receivers left at once.
+    pub fn forget_receivers(&self, receivers: &[PublicKey], threads: usize) {
+        for bin in self.without(receivers, threads) {
+            self.insert(bin);
+        }
+    }
+
+    /// Each sealed bin that holds any of `receivers`, sealed again once without all of them, on up
+    /// to `threads` threads: for a holder that forgets them off its own thread and replaces the
+    /// bins on it (`insert`). Each is no larger than the bin it replaces.
+    pub fn without(&self, receivers: &[PublicKey], threads: usize) -> Vec<Bin> {
+        if receivers.is_empty() {
+            return Vec::new();
+        }
         let holding: Vec<Arc<Bin>> = self
             .read()
             .values()
-            .filter(|bin| bin.receiver(receiver).is_some())
+            .filter(|bin| receivers.iter().any(|key| bin.receiver(key).is_some()))
             .cloned()
             .collect();
-        for old in holding {
-            let fragment = old.reopen_without(receiver);
-            self.insert(Bin::seal_from(old.bin, vec![fragment], threads));
-        }
+        holding
+            .into_iter()
+            .map(|old| {
+                let skip: Vec<u32> = receivers
+                    .iter()
+                    .filter_map(|key| old.receiver(key))
+                    .collect();
+                let fragment = old.reopen_without_any(|index| skip.contains(&index));
+                Bin::seal_from(old.bin, vec![fragment], threads)
+            })
+            .collect()
     }
 }
 

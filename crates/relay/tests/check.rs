@@ -47,7 +47,17 @@ impl Checked {
     }
 }
 
+/// The flags without which `check` plans for the host the test runs on, not the deploy it is
+/// asked about: a build worker of four cores refused for its cores what the test expected refused
+/// for its memory. Every check here names both.
+const STATED: [&str; 2] = ["--memory-limit", "--cores"];
+
 fn check(args: &[&str]) -> Result<Checked> {
+    if let Some(missing) = STATED.iter().find(|flag| !args.contains(flag)) {
+        return Err(format!(
+            "{args:?} names no {missing}: the plan would be the build worker's, not the deploy's"
+        ));
+    }
     let binary = binary()?;
     let output = Command::new(&binary)
         .arg("check")
@@ -73,13 +83,23 @@ fn check(args: &[&str]) -> Result<Checked> {
 }
 
 /// The plan holds together: the budget is the memory, what it holds before any feeder taken first
-/// (its base, the oversize room, its connections' buffers, its members' pool: their shared rate's
-/// worth, planned once, and each member session's allowance, and what waits for its link to each
-/// member, a link's share each), one feeder fits, each
+/// (every part the plan lists: its base, the oversize room, its connections' buffers, its members'
+/// pool: their shared rate's worth, planned once, and each member session's allowance, what waits
+/// for its link to each member, a link's share each, and the rest), one feeder fits, each
 /// admitted feeder's share fits in what is left, and the budget keeps the declared headroom below
 /// the memory the relay runs in. A relay holding member sessions plans their rate; one holding
 /// none (it takes no area) plans nothing for them. It admits the fewer of the feeders its memory
 /// holds and those its cores carry, and runs every stage on a thread at least.
+/// The load the plan admits (`cores::Load`): its feeders, each held to the records it prints, and
+/// the feeders its members' rate is worth.
+fn load(checked: &Checked) -> Result<tally_relay::cores::Load> {
+    Ok(tally_relay::cores::Load {
+        feeders: checked.get("feeders")?,
+        member_feeders: checked.get("member-feeders")?,
+        feeder_records_per_sec: checked.get("feeder-records")? as u64,
+    })
+}
+
 fn assert_plan_holds(checked: &Checked) -> Result {
     let (memory, base, each, feeders, members, per_member, pool, planned, headroom, limit) = (
         checked.get("memory")?,
@@ -124,10 +144,21 @@ fn assert_plan_holds(checked: &Checked) -> Result {
         checked.plan
     );
     assert_eq!(pool, rate_pool + per_member * members);
-    assert_eq!(
-        planned,
-        base + oversize + buffers + pool + links + each * feeders
+    // What it holds before any feeder is every part the plan lists, each printed, and the plan is
+    // that and the feeders' shares. The parts are the plan's own list (`before_feeders_parts`),
+    // never one written here, so a part the plan gains cannot be left out of the sum.
+    let before = checked.get("before-feeders")?;
+    let mut parts = 0;
+    for (name, _) in tally_relay::budget::Plan::planned(false).before_feeders_parts() {
+        parts += checked.get(name)?;
+    }
+    assert_eq!(before, parts, "{:?}", checked.plan);
+    assert!(
+        before >= base + oversize + buffers + pool + links,
+        "{:?}",
+        checked.plan
     );
+    assert_eq!(planned, before + each * feeders, "{:?}", checked.plan);
     let (memory_feeders, core_feeders) =
         (checked.get("memory-feeders")?, checked.get("core-feeders")?);
     assert_eq!(
@@ -157,6 +188,8 @@ fn a_configuration_the_relay_takes_is_accepted_with_its_plan() -> Result {
     let checked = check(&[
         "--memory-limit",
         "640M",
+        "--cores",
+        "2",
         "--key",
         "/nonexistent/relay.key",
         "--max-upload",
@@ -197,6 +230,8 @@ fn a_configuration_the_relay_takes_is_accepted_with_its_plan() -> Result {
     let whole = check(&[
         "--memory-limit",
         "2G",
+        "--cores",
+        "2",
         "--key",
         "k",
         "--max-upload",
@@ -248,7 +283,7 @@ fn the_stages_follow_the_load_admitted_and_the_cores_bound_it() -> Result {
     };
     let expected = |checked: &Checked| -> Result<tally_relay::ingest::Threads> {
         Ok(tally_relay::cores::threads_for(
-            checked.get("feeders")? + checked.get("member-feeders")?,
+            load(checked)?,
             false,
             Some(checked.get("cores")?),
         ))
@@ -326,14 +361,14 @@ fn hosted_mlat_takes_the_cores_the_stages_leave_and_bounds_admission() -> Result
         Ok(checked)
     };
     let (hosting, without) = (on(true)?, on(false)?);
-    let load = hosting.get("feeders")? + hosting.get("member-feeders")?;
+    let load = load(&hosting)?;
     // The cores bound it, below what its memory holds, and below what they carry without MLAT.
     assert_eq!(hosting.get("feeders")?, hosting.get("core-feeders")?);
     assert!(hosting.get("feeders")? < hosting.get("memory-feeders")?);
     assert!(hosting.get("core-feeders")? < without.get("core-feeders")?);
     assert_eq!(
         hosting.get("core-feeders")?,
-        tally_relay::cores::feeders_carried(10, true, hosting.get("member-feeders")?)
+        tally_relay::cores::feeders_carried(10, true, load)
     );
     // The 2,000 feeders measured hosting MLAT fit.
     assert!(hosting.get("feeders")? >= 2_000, "{:?}", hosting.plan);
@@ -364,11 +399,14 @@ fn a_configuration_a_start_refuses_is_refused_and_says_why() -> Result {
         );
         Ok(())
     };
-    // A budget that admits no feeder (refused once the hub is built, as a start refuses it).
+    // A budget that admits no feeder (refused once the hub is built, as a start refuses it), on
+    // cores that would carry many.
     refused(
         &[
             "--memory-limit",
             "1G",
+            "--cores",
+            "16",
             "--key",
             "k",
             "--max-upload",
@@ -379,11 +417,14 @@ fn a_configuration_a_start_refuses_is_refused_and_says_why() -> Result {
         "admit no feeder",
     )?;
     // Memory that holds feeders but not the members' pool beside one: the 64 member sessions an
-    // area brings under a cap of 64 connections, sharing 16 MiB/s (2,048 feeders' worth).
+    // area brings under a cap of 64 connections, sharing 16 MiB/s (2,048 feeders' worth), on cores
+    // that carry them and many feeders beside.
     refused(
         &[
             "--memory-limit",
             "4G",
+            "--cores",
+            "16",
             "--key",
             "k",
             "--max-upload",
@@ -419,17 +460,41 @@ fn a_configuration_a_start_refuses_is_refused_and_says_why() -> Result {
     // The stages' threads are the plan's: no operator picks them.
     for flag in ["--ingest-threads", "--message-threads"] {
         refused(
-            &["--key", "k", "--max-upload", "6Mbit/s", flag, "2"],
+            &[
+                "--memory-limit",
+                "2G",
+                "--cores",
+                "2",
+                "--key",
+                "k",
+                "--max-upload",
+                "6Mbit/s",
+                flag,
+                "2",
+            ],
             &format!("unknown argument {flag}"),
         )?;
     }
     refused(
-        &["--cores", "0", "--key", "k", "--max-upload", "6Mbit/s"],
+        &[
+            "--memory-limit",
+            "2G",
+            "--cores",
+            "0",
+            "--key",
+            "k",
+            "--max-upload",
+            "6Mbit/s",
+        ],
         "--cores needs a number of cores, at least 1",
     )?;
     // The member sessions follow the areas: no operator picks them.
     refused(
         &[
+            "--memory-limit",
+            "2G",
+            "--cores",
+            "2",
             "--key",
             "k",
             "--max-upload",
@@ -446,6 +511,8 @@ fn a_configuration_a_start_refuses_is_refused_and_says_why() -> Result {
             &[
                 "--memory-limit",
                 "512M",
+                "--cores",
+                "2",
                 "--key",
                 "k",
                 "--max-upload",
@@ -459,6 +526,10 @@ fn a_configuration_a_start_refuses_is_refused_and_says_why() -> Result {
     // The world product over a part of the world.
     refused(
         &[
+            "--memory-limit",
+            "2G",
+            "--cores",
+            "2",
             "--key",
             "k",
             "--max-upload",
@@ -472,6 +543,10 @@ fn a_configuration_a_start_refuses_is_refused_and_says_why() -> Result {
     // A flag the relay does not take, and the cap it requires.
     refused(
         &[
+            "--memory-limit",
+            "2G",
+            "--cores",
+            "2",
             "--key",
             "k",
             "--max-upload",
@@ -481,9 +556,12 @@ fn a_configuration_a_start_refuses_is_refused_and_says_why() -> Result {
         ],
         "unknown argument --egress-budget",
     )?;
-    refused(&["--key", "k"], "--max-upload is required")?;
     refused(
-        &["--memory-limit", "lots"],
+        &["--memory-limit", "2G", "--cores", "2", "--key", "k"],
+        "--max-upload is required",
+    )?;
+    refused(
+        &["--cores", "2", "--memory-limit", "lots"],
         "--memory-limit lots: expected bytes",
     )
 }
@@ -627,9 +705,11 @@ fn the_packaged_unit_starts_a_relay_that_admits_feeders() -> Result {
         std::fs::read_to_string(&path).map_err(|error| format!("{}: {error}", path.display()))?;
     let (args, limit, cores) =
         read_unit(&text).map_err(|error| format!("{}: {error}", path.display()))?;
-    let (limit, cores) = (limit.to_string(), cores.map(|cores| cores.to_string()));
-    let mut line = vec!["--memory-limit", limit.as_str()];
-    line.extend(cores.iter().flat_map(|cores| ["--cores", cores.as_str()]));
+    // The packaged unit sets no quota: it runs on whatever host an operator has, so it must start
+    // and admit feeders on the least any host gives it, one core. A quota, if it states one, is
+    // the cores it runs on.
+    let (limit, cores) = (limit.to_string(), cores.unwrap_or(1).to_string());
+    let mut line = vec!["--memory-limit", limit.as_str(), "--cores", cores.as_str()];
     line.extend(args.iter().map(String::as_str));
     // As packaged, and with a base cell taken (an operator's `--area` in its arguments): every
     // member session that area brings fits beside the feeders.

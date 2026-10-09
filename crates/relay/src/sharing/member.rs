@@ -359,7 +359,9 @@ struct Owed {
 
 /// A relay this one turned away as full (`Reason::Full`, `link`): the wait the refusals gave it,
 /// by the rule the relay refused applies to them (`full::Wait`), and the spans it routed around
-/// this one, (start, end) in order.
+/// this one, (start, end): in order and apart (each starts past the last's end and its slack), a
+/// refusal within one merged into it, so a relay turned away again and again while it waits holds
+/// one span, and a receipt check finds the span it asks about by search.
 #[derive(Clone, Debug, Default)]
 struct TurnedAway {
     last: Option<Wait>,
@@ -367,11 +369,34 @@ struct TurnedAway {
 }
 
 impl TurnedAway {
+    /// It routed around this relay from `start_ms` to `end_ms`: put in its place by start, and
+    /// merged with every span it touches, counting the slack, which covers the same moments. A
+    /// refusal comes after the last as a rule, so this is a merge into the last span or a push.
+    fn add(&mut self, start_ms: u64, end_ms: u64) {
+        let at = self.spans.partition_point(|(start, _)| *start <= start_ms);
+        self.spans.insert(at, (start_ms, end_ms));
+        let mut merged: Vec<(u64, u64)> = Vec::with_capacity(self.spans.len());
+        for (start, end) in self.spans.drain(..) {
+            match merged.last_mut() {
+                Some((_, last)) if start <= last.saturating_add(ROUTE_SLACK_MS) => {
+                    *last = (*last).max(end);
+                }
+                _ => merged.push((start, end)),
+            }
+        }
+        self.spans = merged;
+    }
+
     /// Whether it was routing around this relay at any time from `from_ms` to `to_ms`.
     fn during(&self, from_ms: u64, to_ms: u64) -> bool {
+        // The spans are apart and in order, so their ends are too: the first that reaches
+        // `from_ms` is the only one that may.
+        let first = self
+            .spans
+            .partition_point(|(_, end)| end.saturating_add(ROUTE_SLACK_MS) < from_ms);
         self.spans
-            .iter()
-            .any(|(start, end)| *start <= to_ms && end.saturating_add(ROUTE_SLACK_MS) >= from_ms)
+            .get(first)
+            .is_some_and(|(start, _)| *start <= to_ms)
     }
 }
 
@@ -762,7 +787,13 @@ impl Member {
         let held = self.turned_away.entry(key).or_default();
         let wait = Wait::after(held.last, asked, now_ms);
         held.last = Some(wait);
-        held.spans.push((now_ms, wait.until_ms));
+        held.add(now_ms, wait.until_ms);
+    }
+
+    /// The spans this relay holds of `key` routing around it (`turned_away`).
+    #[cfg(test)]
+    pub fn turned_away_spans(&self, key: &PublicKey) -> usize {
+        self.turned_away.get(key).map_or(0, |held| held.spans.len())
     }
 
     /// Whether this relay turned `key` away and it was routing around this relay at any time from

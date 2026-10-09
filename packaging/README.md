@@ -27,6 +27,18 @@ FILE` reads a list the same way, installing nothing);
   sets it for the host's plan (`../README.md`, "What a relay costs"): the bill can never exceed the
   cap times the seconds in a month, so `10Mbit/s` is at most about 3.35 TB. The cap keeps no state.
 
+**Until a release pipeline exists** (RFC-0180 phase 1), nothing writes `PUBLISHED_RELEASE` into
+`install.sh` or publishes a `seeds` beside it, so the plain `curl | sudo bash` stops before
+installing anything and says how to go on. Name the release and the seed list yourself: the
+release is any HTTPS directory holding the files below, and the seed list a local file in the
+format above (check it first with `bash install.sh --check-seeds FILE`). `sudo` passes the
+`NAME=value` words before `bash` into the script's environment:
+
+```sh
+curl -fsSL https://example.org/tally/v0.1.0/install.sh |
+  sudo TALLY_RELEASE=https://example.org/tally/v0.1.0 TALLY_SEEDS=/home/pi/seeds bash
+```
+
 A release therefore carries `install.sh`, `tally-feed-x86_64-linux`, `tally-feed-aarch64-linux`,
 `tally-feed.service` and `seeds`, each with a `.sha256` whose first field is the file's hash. The
 seed list is the publisher's configuration, not this repository's: each publisher ships the relays

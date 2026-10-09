@@ -57,9 +57,9 @@ const PREAMBLE_LEN: usize = 4 + 1 + 1 + 2 + KEY_HINT_LEN;
 pub const POOL_IDLE: usize = 256;
 
 /// The most message buffers a session's reader holds at once: the frame and the plaintext it is
-/// decrypted into, then the plaintext alone while its records are decoded (the frame is given back
-/// first, `Reader::decrypt`). The records decoded are the caller's, at most a message's worth.
-/// What a relay plans for a connection is these and [`WRITER_BUFFERS`], each a whole message.
+/// decrypted into, then the plaintext alone while its records are decoded one at a time and handed
+/// on ([`Message`]; the frame is given back first, `Reader::decrypt`). What a relay plans for a
+/// connection is these and [`WRITER_BUFFERS`], each a whole message.
 pub const READER_BUFFERS: usize = 2;
 
 /// The most message buffers a session's writer holds at once: the plaintext being packed and the
@@ -228,14 +228,16 @@ pub struct Session<S> {
     pub version: u16,
 }
 
-/// What a responder learns about who connected.
-pub struct Accepted<S> {
+/// What a responder learns about who connected: `first` is what the initiator sent in the same
+/// message as its `Hello`, all of it decoded ([`accept`], `Vec<Record>`) or the rest of that
+/// message to decode a record at a time ([`accept_message`], [`Message`]).
+pub struct Accepted<S, First = Vec<Record>> {
     pub session: Session<S>,
     pub peer: PublicKey,
     pub role: Role,
     /// Records the initiator sent in the same message as its `Hello` (a subscriber's `Subscribe`),
     /// to act on before anything is sent its way.
-    pub first: Vec<Record>,
+    pub first: First,
 }
 
 /// Dials a responder whose key is known, says who we are and what we speak.
@@ -320,33 +322,63 @@ where
     }];
     opening.extend_from_slice(first);
     writer.send(&opening).await?;
-    let mut records = Vec::new();
-    reader.recv(&mut records).await?;
-    match records.first() {
-        Some(Record::Welcome { version }) if (MIN_VERSION..=MAX_VERSION).contains(version) => {
+    // Only the answer's first record is read: whatever else its message holds is never decoded.
+    let answer = reader.recv_message().await?.next()?;
+    match answer {
+        Some(Record::Welcome { version }) if (MIN_VERSION..=MAX_VERSION).contains(&version) => {
             Ok(Session {
                 reader,
                 writer,
-                version: *version,
+                version,
             })
         }
         Some(Record::Goodbye {
             reason,
             retry_after_secs,
         }) => Err(WireError::Refused {
-            reason: *reason,
-            retry_after_secs: *retry_after_secs,
+            reason,
+            retry_after_secs,
         }),
-        _ => Err(WireError::Invalid {
+        other => Err(WireError::Invalid {
             field: "answer to Hello",
-            value: records.len() as u64,
+            value: u64::from(other.is_some()),
         }),
     }
 }
 
 /// Answers an initiator dialling any of `identities` (more than one while a relay rotates its
 /// key). Returns who it is and what it is; whether to serve that key is the caller's decision.
+/// What came with its `Hello` is decoded whole: for a peer that is trusted to send little with it
+/// (a test's stand-in relay). A relay, which answers strangers, reads it with [`accept_message`].
 pub async fn accept<S>(stream: S, identities: &[Identity]) -> Result<Accepted<S>, WireError>
+where
+    S: AsyncRead + AsyncWrite + Send,
+{
+    let Accepted {
+        session,
+        peer,
+        role,
+        mut first,
+    } = accept_message(stream, identities).await?;
+    let mut records = Vec::new();
+    while let Some(record) = first.next()? {
+        records.push(record);
+    }
+    Ok(Accepted {
+        session,
+        peer,
+        role,
+        first: records,
+    })
+}
+
+/// As [`accept`], what came with the `Hello` left in its message, decoded a record at a time as
+/// the caller takes them ([`Message`]): a stranger who packs a message with tens of thousands of
+/// three-byte records makes the responder hold one decoded record at a time, never them all.
+pub async fn accept_message<S>(
+    stream: S,
+    identities: &[Identity],
+) -> Result<Accepted<S, Message>, WireError>
 where
     S: AsyncRead + AsyncWrite + Send,
 {
@@ -359,7 +391,7 @@ async fn respond<S>(
     stream: S,
     identities: &[Identity],
     pool: &'static Pool,
-) -> Result<Accepted<S>, WireError>
+) -> Result<Accepted<S, Message>, WireError>
 where
     S: AsyncRead + AsyncWrite + Send,
 {
@@ -412,17 +444,16 @@ where
     let transport = Arc::new(handshake.into_stateless_transport_mode()?);
     let mut reader = Reader::new(read, Arc::clone(&transport), pool);
     let mut writer = Writer::new(write, transport, pool);
-    let mut records = Vec::new();
-    reader.recv(&mut records).await?;
+    let mut first = reader.recv_message().await?;
     let Some(Record::Hello {
         min_version,
         max_version,
         role,
-    }) = records.first().cloned()
+    }) = first.next()?
     else {
         return Err(WireError::Invalid {
             field: "first record (expected Hello)",
-            value: records.len() as u64,
+            value: 0,
         });
     };
     let version = max_version.min(MAX_VERSION);
@@ -447,7 +478,7 @@ where
         },
         peer,
         role,
-        first: records.split_off(1),
+        first,
     })
 }
 
@@ -477,8 +508,25 @@ impl<S: AsyncRead> Reader<S> {
     }
 
     /// Reads one message and appends the records this build knows to `out`. An end of stream is
-    /// an `Io` error of kind `UnexpectedEof`. The caller bounds the wait.
+    /// an `Io` error of kind `UnexpectedEof`. The caller bounds the wait. Every record of the
+    /// message is decoded at once: for a reader of a peer it trusts with that (a feeder reading its
+    /// relay). One that reads strangers takes a message's records one at a time
+    /// ([`Reader::recv_message`]).
     pub async fn recv(&mut self, out: &mut Vec<Record>) -> Result<(), WireError> {
+        let mut message = self.recv_message().await?;
+        while let Some(record) = message.next()? {
+            out.push(record);
+        }
+        Ok(())
+    }
+
+    /// Reads one message, its records left in its plaintext to be decoded one at a time as the
+    /// caller takes them ([`Message::next`]). What a reader holds of a message is then its
+    /// plaintext and the one record taken, whatever the records are: a 64 KiB message of
+    /// three-byte records is some 21,800 of them, and decoded together they were several
+    /// megabytes per connection, outside every plan. An end of stream is an `Io` error of kind
+    /// `UnexpectedEof`. The caller bounds the wait.
+    pub async fn recv_message(&mut self) -> Result<Message, WireError> {
         let mut length = [0; 2];
         self.read.read_exact(&mut length).await?;
         let length = usize::from(u16::from_be_bytes(length));
@@ -489,8 +537,7 @@ impl<S: AsyncRead> Reader<S> {
         self.pool
             .decoding
             .fetch_max(self.pool.out.load(Ordering::Relaxed), Ordering::Relaxed);
-        Record::decode_message(plaintext.written(length), out)?;
-        Ok(())
+        Ok(Message::of(plaintext, length))
     }
 
     /// The plaintext of the frame `message` holds (its first `length` bytes), and its length. The
@@ -517,6 +564,93 @@ impl<S: AsyncRead> Reader<S> {
     pub async fn discard(&mut self) {
         let mut sink = [0u8; 4096];
         while matches!(self.read.read(&mut sink).await, Ok(read) if read > 0) {}
+    }
+}
+
+/// One message's plaintext, its records decoded one at a time as they are taken ([`Message::next`]):
+/// what a reader holds of a message is this one buffer and the record its caller holds, never the
+/// message's records all at once. The buffer goes back to the pool once its last record is taken
+/// (or one fails), or when this is dropped.
+pub struct Message {
+    plaintext: Option<Buffer>,
+    length: usize,
+    /// Where the next record starts.
+    at: usize,
+    /// A record decoded and not taken ([`Message::next_if`]): the next one [`Message::next`] gives.
+    held: Option<Record>,
+}
+
+impl Message {
+    fn of(plaintext: Buffer, length: usize) -> Self {
+        let mut message = Self {
+            plaintext: Some(plaintext),
+            length,
+            at: 0,
+            held: None,
+        };
+        message.release_if_read();
+        message
+    }
+
+    /// The next record this build knows, skipping the kinds it may skip (`Record::decode`), or
+    /// `None` once the message is read. A record that does not decode fails it, and the records
+    /// after it are not read.
+    #[allow(clippy::should_implement_trait)]
+    pub fn next(&mut self) -> Result<Option<Record>, WireError> {
+        if let Some(record) = self.held.take() {
+            return Ok(Some(record));
+        }
+        while let Some(plaintext) = &self.plaintext {
+            let rest = plaintext.written(self.length).get(self.at..).unwrap_or(&[]);
+            let (record, used) = match Record::decode(rest) {
+                Ok(decoded) => decoded,
+                Err(error) => {
+                    self.plaintext = None;
+                    self.at = self.length;
+                    return Err(error);
+                }
+            };
+            self.at += used;
+            self.release_if_read();
+            if record.is_some() {
+                return Ok(record);
+            }
+        }
+        Ok(None)
+    }
+
+    /// The next record if `take` takes it; else `None`, the record kept for the next
+    /// [`Message::next`] (one record held, never more).
+    pub fn next_if(
+        &mut self,
+        take: impl FnOnce(&Record) -> bool,
+    ) -> Result<Option<Record>, WireError> {
+        let Some(record) = self.next()? else {
+            return Ok(None);
+        };
+        if take(&record) {
+            Ok(Some(record))
+        } else {
+            self.held = Some(record);
+            Ok(None)
+        }
+    }
+
+    /// Gives the plaintext back once nothing of it is left to decode.
+    fn release_if_read(&mut self) {
+        if self.at >= self.length {
+            self.plaintext = None;
+        }
+    }
+
+    /// Plaintext bytes not yet decoded.
+    pub fn remaining(&self) -> usize {
+        self.length.saturating_sub(self.at)
+    }
+
+    /// Whether every record of it has been taken (none decoded and kept, none left to decode).
+    pub fn is_read(&self) -> bool {
+        self.held.is_none() && self.plaintext.is_none()
     }
 }
 
@@ -1029,6 +1163,108 @@ mod tests {
             theirs.writer.send(&[huge]).await,
             Err(WireError::Oversize(_))
         ));
+        Ok(())
+    }
+
+    /// Counts the bytes each thread has live on the heap and the most it had since it last asked
+    /// ([`counting::start`]): what one test measures on its own thread, whatever the others do.
+    mod counting {
+        use std::alloc::{GlobalAlloc, Layout, System};
+        use std::cell::Cell;
+
+        thread_local! {
+            static LIVE: Cell<isize> = const { Cell::new(0) };
+            static PEAK: Cell<isize> = const { Cell::new(0) };
+        }
+
+        fn add(bytes: isize) {
+            // A thread's own counters, skipped while its storage is being torn down.
+            let _ = LIVE.try_with(|live| {
+                let now = live.get() + bytes;
+                live.set(now);
+                let _ = PEAK.try_with(|peak| peak.set(peak.get().max(now)));
+            });
+        }
+
+        struct Counting;
+
+        // SAFETY: every call is the system allocator's, with the same arguments; the counters are
+        // the calling thread's own cells, touched by nothing else.
+        unsafe impl GlobalAlloc for Counting {
+            unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+                add(layout.size() as isize);
+                // SAFETY: the caller's contract is the system allocator's.
+                unsafe { System.alloc(layout) }
+            }
+
+            unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+                add(-(layout.size() as isize));
+                // SAFETY: the caller's contract is the system allocator's.
+                unsafe { System.dealloc(ptr, layout) }
+            }
+
+            unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+                add(new_size as isize - layout.size() as isize);
+                // SAFETY: the caller's contract is the system allocator's.
+                unsafe { System.realloc(ptr, layout, new_size) }
+            }
+        }
+
+        #[global_allocator]
+        static GLOBAL: Counting = Counting;
+
+        /// Starts a measure on this thread: the bytes live now.
+        pub fn start() -> isize {
+            let live = LIVE.with(Cell::get);
+            PEAK.with(|peak| peak.set(live));
+            live
+        }
+
+        /// The most this thread had live since `start`, above what it had then.
+        pub fn peak_since(start: isize) -> isize {
+            PEAK.with(Cell::get) - start
+        }
+    }
+
+    /// A message packed with the smallest records (a heartbeat is three bytes: some 21,800 to a
+    /// message) is read one record at a time ([`Message`]): what the reader holds beside the
+    /// message's plaintext is the one record its caller has, whatever the message holds. Decoded
+    /// whole, as a relay's read loop and its handshake did, the same message held megabytes per
+    /// connection, outside every plan; that is shown first, on the same bytes.
+    #[test]
+    fn a_message_of_tiny_records_is_held_one_record_at_a_time() -> Result<(), WireError> {
+        let pool = own_pool(4);
+        let mut plaintext = Buffer::take_from(pool);
+        plaintext.truncate(0);
+        let one = Record::Heartbeat.encoded_len();
+        let count = MAX_PLAINTEXT / one;
+        for _ in 0..count {
+            plaintext.append(|out| Record::Heartbeat.encode(out))?;
+        }
+        let length = plaintext.packed().len();
+        assert!(count > 20_000, "{count} records");
+        // Decoded whole: every record at once.
+        let start = counting::start();
+        let mut whole = Vec::new();
+        Record::decode_message(plaintext.written(length), &mut whole)?;
+        let held_whole = counting::peak_since(start);
+        assert_eq!(whole.len(), count);
+        drop(whole);
+        assert!(
+            held_whole > 1 << 20,
+            "decoded whole, it held only {held_whole} bytes"
+        );
+        // A record at a time: never more than a record's worth beside the plaintext.
+        let mut message = Message::of(plaintext, length);
+        let start = counting::start();
+        let mut read = 0;
+        while let Some(record) = message.next()? {
+            assert_eq!(record, Record::Heartbeat);
+            read += 1;
+        }
+        let held = counting::peak_since(start);
+        assert_eq!((read, message.remaining()), (count, 0));
+        assert!(held < 4_096, "a record at a time held {held} bytes");
         Ok(())
     }
 }

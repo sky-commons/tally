@@ -12,13 +12,18 @@
 //!   not dialled again for `UNANSWERED_FOR_MS`, so offers naming a stranger's address cannot turn
 //!   relays into a flood against it. A key verified at an address is trusted there for
 //!   `VERIFIED_FOR_MS`, so its re-signed offers are held without a new dial.
-//! - **Buckets by network group.** The address a verified offer answered at puts it in a group (an
-//!   IPv4 /16, an IPv6 /32). A cell holds at most `OFFERS_PER_GROUP_IN_CELL` of one group and
+//! - **Buckets by network group.** An offer names the address it answers at by number (an IP and
+//!   port, never a host name), and that address, which every peer dials, puts it in a group (an
+//!   IPv4 /16, an IPv6 /32: `Group::of_address`). The group is read from the signed offer alone,
+//!   so every relay, the signer included, puts one offer in one group: no relay's resolver has a
+//!   say, as one could if each resolved a host name its own way. An offer naming a host name is
+//!   not taken. A cell holds at most `OFFERS_PER_GROUP_IN_CELL` of one group and
 //!   `OFFERS_PER_CELL` in all, so a flood of keys from a few networks displaces only itself. The
-//!   relay's own offers are no exception: they are held under the group of the address they
-//!   advertise, as every peer that verified them there holds them (`State::hold_own`; a host name
-//!   is resolved, as a peer's dial resolves it), and compete under every cap as a peer's would, so
-//!   this relay holds the same offers its peers do and lays out the same trees and MLAT choice. Past those, a group holds at most `OFFERS_PER_GROUP`
+//!   relay's own offers are no exception: they are held under the group of the address they name,
+//!   as every peer that verified them there holds them (`State::hold_own`; an advertised host name
+//!   is resolved once and the offers name the address it resolved to), and compete under every cap
+//!   as a peer's would, so this relay holds the same offers its peers do and lays out the same
+//!   trees and MLAT choice. Past those, a group holds at most `OFFERS_PER_GROUP`
 //!   anywhere, a key at most `OFFERS_PER_KEY`, and the directory `OFFERS_HELD`: bounds on a flood,
 //!   which an honest network never reaches.
 //! - **Held by rank, never by arrival.** Every cap (a group's share of a cell, the cell, a group
@@ -206,8 +211,18 @@ impl Group {
         }
     }
 
-    /// The group of an address an offer's key answered at. An IPv4 address mapped into IPv6 is
-    /// its IPv4 address.
+    /// The group of an offer naming `address` (its `HOST:PORT`): the group of the IP it names,
+    /// which is the address every peer dials and its signer answers at. `None` for a host name,
+    /// which each relay's resolver may answer differently: such an offer is in no group, and is
+    /// not taken. The one place an offer's group is decided, for its signer and its peers alike.
+    pub fn of_address(address: &str) -> Option<Self> {
+        address
+            .parse::<std::net::SocketAddr>()
+            .ok()
+            .map(|address| Self::of(address.ip()))
+    }
+
+    /// The group of an IP address. An IPv4 address mapped into IPv6 is its IPv4 address.
     pub fn of(address: IpAddr) -> Self {
         match address.to_canonical() {
             IpAddr::V4(v4) => {
@@ -250,8 +265,8 @@ struct State {
     /// Addresses being dialled now.
     dialling: HashSet<String>,
     verifying: usize,
-    /// (key, address) that answered, with its group and until when it is trusted.
-    verified: Bounded<(PublicKey, String), (Group, u64)>,
+    /// (key, address) that answered, and until when it is trusted there.
+    verified: Bounded<(PublicKey, String), u64>,
     /// Addresses that did not answer, until when they are not dialled again.
     unanswered: Bounded<String, u64>,
     /// Offer hashes acted on.
@@ -265,16 +280,15 @@ struct State {
     evidence_gossip: Vec<EvidenceBundle>,
     /// When the relay's own evidence was last bundled.
     own_evidence_ms: Option<u64>,
-    /// The network group the relay's own advertised address is in, as a peer dialling it finds
-    /// it (`own_group_of`): what its own offers are held under. `None` until it is known (a host
-    /// name not yet resolved), and then its own offers are not held, as no peer holds them before
-    /// its dial.
+    /// The network group of the address the relay's own offers as last signed name
+    /// (`Group::of_address`), as every peer that dials it finds it: what its own offers are held
+    /// under. `None` while it signs none.
     own_group: Option<Group>,
     /// The relay's own offers as last signed (`resign`): held under `own_group` (`hold_own`).
     own_offers: Vec<Checked>,
-    /// The advertised host name last resolved, the group it resolved to, and until when that is
-    /// taken without resolving again (`VERIFIED_FOR_MS`, as a peer trusts a verified address).
-    own_resolved: Option<(String, Group, u64)>,
+    /// The advertised host name last resolved, the address it resolved to (what the relay's
+    /// offers name), and until when that is taken without resolving again (`VERIFIED_FOR_MS`).
+    own_resolved: Option<(String, std::net::SocketAddr, u64)>,
     /// The host name being resolved, and when it may be tried again: never while a resolution is
     /// under way, `RESOLVE_AGAIN_MS` after one failed.
     own_resolving: Option<(String, u64)>,
@@ -862,16 +876,23 @@ impl Directory {
         let evidence_due = {
             let mut state = lock(&self.state);
             state.own = Some(identity.public());
-            let own_group = basis.as_ref().and_then(|basis| {
-                let (group, due) = state.own_group_of(&basis.address, now_ms);
+            // The offers name the advertised address by number: a host name as it last resolved,
+            // and nothing is signed (or withdrawn) before it first resolves.
+            let mut unresolved = false;
+            let basis = basis.and_then(|mut basis| {
+                let (address, due) = state.own_address_of(&basis.address, now_ms);
                 if due {
                     resolve = Some(basis.address.clone());
                 }
-                group
+                let Some(address) = address else {
+                    unresolved = true;
+                    return None;
+                };
+                basis.address = address.to_string();
+                Some(basis)
             });
-            state.set_own_group(own_group, now_ms);
             state.expire(now_ms);
-            if let Some(offers) = state.resign(identity, basis, now_ms) {
+            if !unresolved && let Some(offers) = state.resign(identity, basis, now_ms) {
                 out.extend(offers);
             }
             out.append(&mut state.gossip);
@@ -891,15 +912,15 @@ impl Directory {
             }
         }
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            // The advertised host name, resolved as a peer's dial resolves it: the group its own
-            // offers are held under from then on.
+            // The advertised host name, resolved: the address its own offers name from then on,
+            // which puts them in their group for every relay alike.
             if let Some(address) = resolve {
                 lock(&self.state).own_resolving = Some((address.clone(), u64::MAX));
                 let state = Arc::clone(&self.state);
                 runtime.spawn(async move {
-                    let group = resolved_group(&address).await;
-                    // By the clock of the tick that asked, the one its offers are held by.
-                    lock(&state).resolved(&address, group, now_ms);
+                    let resolved = resolved_address(&address).await;
+                    // By the clock of the tick that asked.
+                    lock(&state).resolved(&address, resolved, now_ms);
                 });
             }
             while let Some(pending) = self.next_to_verify() {
@@ -992,32 +1013,35 @@ impl Directory {
     }
 }
 
-/// The group `address` (a `HOST:PORT`) is in as a dial to it finds it: the first address it
-/// resolves to, as `TcpStream::connect` tries first (`answers_as`).
-async fn resolved_group(address: &str) -> Option<Group> {
+/// The address the advertised `address` (a `HOST:PORT`) resolves to first: what the relay's own
+/// offers name, so no peer resolves it.
+async fn resolved_address(address: &str) -> Option<std::net::SocketAddr> {
     let mut addresses = tokio::time::timeout(CONNECT_TIMEOUT, tokio::net::lookup_host(address))
         .await
         .ok()?
         .ok()?;
-    addresses.next().map(|address| Group::of(address.ip()))
+    addresses.next()
 }
 
-/// Dials `address` and runs the handshake to `key`: the group it answered from, or `None` if it
-/// did not answer as `key`. A refusal after the handshake (a full relay's `Goodbye`) still proves
-/// the key, since only its holder completes the handshake.
-async fn answers_as(address: &str, identity: &Identity, key: &PublicKey) -> Option<Group> {
-    let stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(address))
-        .await
-        .ok()?
-        .ok()?;
-    let ip = stream.peer_addr().ok()?.ip();
+/// Dials `address` (an offer's, an IP and port: `Group::of_address`) and runs the handshake to
+/// `key`: true if it answered as `key`. A refusal after the handshake (a full relay's `Goodbye`)
+/// still proves the key, since only its holder completes the handshake. Never resolves a name.
+async fn answers_as(address: &str, identity: &Identity, key: &PublicKey) -> bool {
+    let Ok(address) = address.parse::<std::net::SocketAddr>() else {
+        return false;
+    };
+    let ip = address.ip();
     if ip.is_unspecified() || ip.is_multicast() {
-        return None;
+        return false;
     }
-    match noise::connect(stream, identity, key, tally_wire::Role::Subscriber).await {
-        Ok(_) | Err(WireError::Refused { .. }) => Some(Group::of(ip)),
-        Err(_) => None,
-    }
+    let Ok(Ok(stream)) = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(address)).await
+    else {
+        return false;
+    };
+    matches!(
+        noise::connect(stream, identity, key, tally_wire::Role::Subscriber).await,
+        Ok(_) | Err(WireError::Refused { .. })
+    )
 }
 
 /// What the relay's own offers should declare now, or `None` if it has nothing to offer (no
@@ -1378,6 +1402,10 @@ impl State {
             return;
         };
         let (signer, content) = (offer.signer(), offer.content());
+        // In no group (a host name): no two relays could be sure to put it in the same one.
+        let Some(group) = Group::of_address(&content.address) else {
+            return;
+        };
         // The relay's own offers, come back: never taken from outside.
         if Some(signer) == self.own {
             return;
@@ -1397,9 +1425,8 @@ impl State {
         let trusted = self
             .verified
             .get(&(signer, content.address.clone()))
-            .filter(|(_, until)| *until > now_ms)
-            .map(|(group, _)| *group);
-        if let Some(group) = trusted {
+            .is_some_and(|until| *until > now_ms);
+        if trusted {
             if self.hold(offer.clone(), group, now_ms) {
                 self.gossip.push(offer.offer().clone());
             }
@@ -1439,16 +1466,15 @@ impl State {
     }
 
     /// A handshake's outcome.
-    fn verified(&mut self, pending: Pending, answered: Option<Group>, now_ms: u64) {
+    fn verified(&mut self, pending: Pending, answered: bool, now_ms: u64) {
         let (signer, content) = (pending.offer.signer(), pending.offer.content());
         self.dialling.remove(&content.address);
         self.verifying = self.verifying.saturating_sub(1);
-        match answered {
+        // Only an offer in a group is queued (`offered`).
+        match Group::of_address(&content.address).filter(|_| answered) {
             Some(group) => {
-                self.verified.insert(
-                    (signer, content.address.clone()),
-                    (group, now_ms + VERIFIED_FOR_MS),
-                );
+                self.verified
+                    .insert((signer, content.address.clone()), now_ms + VERIFIED_FOR_MS);
                 // Checked when it came; only its lifetime may have run out since.
                 if live(content, now_ms) && self.hold(pending.offer.clone(), group, now_ms) {
                     self.gossip.push(pending.offer.offer().clone());
@@ -1785,7 +1811,7 @@ impl State {
         while self
             .verified
             .first()
-            .is_some_and(|(_, (_, until))| *until <= now_ms)
+            .is_some_and(|(_, until)| *until <= now_ms)
         {
             self.verified.pop_first();
         }
@@ -1835,7 +1861,11 @@ impl State {
         self.own_signed_ms = now_ms;
         self.own_basis.clone_from(&basis);
         self.own_offers.clear();
-        let basis = basis?;
+        let Some(basis) = basis else {
+            self.set_own_group(None, now_ms);
+            return None;
+        };
+        let group = Group::of_address(&basis.address);
         let mut signed = Vec::new();
         for (cell, stripes) in basis.cells.iter().zip(&basis.stripes) {
             let content = ProviderOfferContent {
@@ -1862,17 +1892,18 @@ impl State {
             // relay does, from the same offers.
             signed.push(offer);
         }
-        self.hold_own(now_ms);
+        // Held under the group of the address they name, as every peer holds them.
+        self.set_own_group(group, now_ms);
         Some(signed)
     }
 
-    /// The group the relay's advertised `address` is in, as a peer's dial finds it: an address
-    /// named by number is its own group; a host name the group it last resolved to. `true` when
-    /// it is to be resolved now (never resolved, or resolved over `VERIFIED_FOR_MS` ago), and no
-    /// resolution of it is under way.
-    fn own_group_of(&self, address: &str, now_ms: u64) -> (Option<Group>, bool) {
+    /// The address the relay's own offers name for its advertised `address`: one named by number
+    /// is itself; a host name the address it last resolved to. `true` when it is to be resolved
+    /// now (never resolved, or resolved over `VERIFIED_FOR_MS` ago), and no resolution of it is
+    /// under way.
+    fn own_address_of(&self, address: &str, now_ms: u64) -> (Option<std::net::SocketAddr>, bool) {
         if let Ok(address) = address.parse::<std::net::SocketAddr>() {
-            return (Some(Group::of(address.ip())), false);
+            return (Some(address), false);
         }
         let resolved = self
             .own_resolved
@@ -1883,14 +1914,17 @@ impl State {
             .as_ref()
             .is_some_and(|(name, again_ms)| name == address && now_ms < *again_ms);
         let due = resolved.is_none_or(|(_, _, until)| *until <= now_ms);
-        (resolved.map(|(_, group, _)| *group), due && !resolving)
+        (
+            resolved.map(|(_, resolved, _)| *resolved),
+            due && !resolving,
+        )
     }
 
-    /// `address` resolved to `group` (none: it did not resolve, and is tried again
-    /// `RESOLVE_AGAIN_MS` on): the relay's own offers are held under it from the next tick, by
-    /// the tick's clock (`own_group_of`).
-    fn resolved(&mut self, address: &str, group: Option<Group>, now_ms: u64) {
-        let Some(group) = group else {
+    /// `address` resolved to `resolved` (none: it did not resolve, and is tried again
+    /// `RESOLVE_AGAIN_MS` on, the address it last resolved to still named): the relay's own
+    /// offers name it from their next signing, by the tick's clock (`own_address_of`).
+    fn resolved(&mut self, address: &str, resolved: Option<std::net::SocketAddr>, now_ms: u64) {
+        let Some(resolved) = resolved else {
             self.own_resolving = Some((address.to_owned(), now_ms + RESOLVE_AGAIN_MS));
             return;
         };
@@ -1901,14 +1935,16 @@ impl State {
         {
             self.own_resolving = None;
         }
-        self.own_resolved = Some((address.to_owned(), group, now_ms + VERIFIED_FOR_MS));
+        self.own_resolved = Some((address.to_owned(), resolved, now_ms + VERIFIED_FOR_MS));
     }
 
-    /// The relay's own offers are in `group` from now on: they leave the one they were held
-    /// under and are held under this one by its caps. The relay's own network is also one no
-    /// witness of its own may come from (`State::tier`), which its offers' group says.
+    /// The relay's own offers are in `group` from now on (the group of the address they name):
+    /// they leave the one they were held under and are held under this one by its caps. The
+    /// relay's own network is also one no witness of its own may come from (`State::tier`), which
+    /// its offers' group says.
     fn set_own_group(&mut self, group: Option<Group>, now_ms: u64) {
         if self.own_group == group {
+            self.hold_own(now_ms);
             return;
         }
         self.own_group = group;
@@ -2431,7 +2467,7 @@ mod tests {
         let other = Identity::generate().map_err(text)?;
         directory.adopt_own_key(own.public());
         let cell = area()?;
-        let offer = sign(&other, &content("relay.example:7450", cell, NOW))?;
+        let offer = sign(&other, &content("192.0.2.7:7450", cell, NOW))?;
         let client = Asker {
             role: AskerRole::Client,
             key: Identity::generate().map_err(text)?.public(),
@@ -2441,7 +2477,7 @@ mod tests {
         directory.offered(&client, offer.clone(), NOW);
         assert!(directory.state.lock().map_err(text)?.pending.is_empty());
         // The relay's own offer, come back round a gossip loop.
-        let mine = sign(&own, &content("me.example:7450", cell, NOW))?;
+        let mine = sign(&own, &content("192.0.2.8:7450", cell, NOW))?;
         directory.offered(&relay_asker(other.public()), mine, NOW);
         assert!(directory.state.lock().map_err(text)?.pending.is_empty());
         // A client announcing its own offer is queued.
@@ -2449,7 +2485,7 @@ mod tests {
             key: other.public(),
             ..client
         };
-        let fresh = sign(&other, &content("relay.example:7450", cell, NOW + 1))?;
+        let fresh = sign(&other, &content("192.0.2.7:7450", cell, NOW + 1))?;
         directory.offered(&announcing, fresh, NOW + 1);
         assert_eq!(directory.state.lock().map_err(text)?.pending.len(), 1);
         Ok(())
@@ -2974,34 +3010,88 @@ mod tests {
         Ok(())
     }
 
-    /// Sweep 3, N6: a relay advertising a host name holds its own offers once the name resolves,
-    /// under the group it resolves to, as a peer's dial finds it; never before, under no group.
+    /// R-P3 of sweep 4: a relay advertising a host name signs offers naming the address it
+    /// resolved to, and holds them under that address's group; a peer that verifies the gossiped
+    /// offer by dialling the address it names holds it under the very same group. Neither
+    /// resolves anything for the group.
     #[tokio::test]
-    async fn a_relay_advertising_a_host_name_holds_its_offers_under_the_group_it_resolves_to()
-    -> Result {
+    async fn a_relay_advertising_a_host_name_is_in_the_group_its_peers_put_it_in() -> Result {
         let cell = area()?;
         let identity = Identity::from_seed([81; 32]);
-        let hub = own_relay(&identity, "localhost:7450", cell);
-        let directory = Directory::new();
-        directory.tick(&hub, Some(&identity), NOW);
+        // Answering as the relay at whichever loopback address `localhost` resolves to.
+        let v4 = TcpListener::bind("127.0.0.1:0").await.map_err(text)?;
+        let port = v4.local_addr().map_err(text)?.port();
+        let v6 = TcpListener::bind(("::1", port)).await.ok();
+        for listener in std::iter::once(v4).chain(v6) {
+            let identities = vec![identity.clone()];
+            tokio::spawn(async move {
+                while let Ok((stream, _)) = listener.accept().await {
+                    let identities = identities.clone();
+                    tokio::spawn(async move {
+                        let _ = noise::accept(stream, &identities).await;
+                    });
+                }
+            });
+        }
+        let hub = own_relay(&identity, &format!("localhost:{port}"), cell);
+        let mine = Directory::new();
         let mut now = NOW;
+        let mut gossiped = mine.tick(&hub, Some(&identity), now);
         for _ in 0..100 {
-            if !directory.offers_for(cell, now).is_empty() {
+            if !mine.offers_for(cell, now).is_empty() {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
             now += 100;
-            directory.tick(&hub, Some(&identity), now);
+            gossiped.extend(mine.tick(&hub, Some(&identity), now));
         }
-        let state = lock(&directory.state);
+        let offer = gossiped
+            .into_iter()
+            .find_map(|record| match record {
+                Record::ProviderOffer(offer) => Some(offer),
+                _ => None,
+            })
+            .ok_or("no offer of its own was gossiped")?;
+        let named = offer.content().map_err(text)?.address;
+        let group = Group::of_address(&named).ok_or("the offer names a host name")?;
+        {
+            let state = lock(&mine.state);
+            let held = state
+                .cells
+                .get(&cell.as_u64())
+                .and_then(|offers| offers.get(&identity.public()))
+                .ok_or("the relay's own offer is not held")?;
+            assert_eq!(held.group, group);
+            assert!(matches!(held.group, Group::V4(0x7f00) | Group::V6(0)));
+        }
+        // A peer, given the gossiped offer, dials the address it names and holds it there.
+        let peer = Directory::new();
+        peer.offered(&relay_asker(identity.public()), offer, now);
+        peer.verify_pending(&Identity::generate().map_err(text)?, now)
+            .await;
+        let state = lock(&peer.state);
         let held = state
             .cells
             .get(&cell.as_u64())
             .and_then(|offers| offers.get(&identity.public()))
-            .ok_or("the relay's own offer is not held")?;
-        let resolved = state.own_resolved.as_ref().map(|(_, group, _)| *group);
-        assert_eq!(Some(held.group), resolved);
-        assert!(matches!(held.group, Group::V4(0x7f00) | Group::V6(0)));
+            .ok_or("the peer did not hold the relay's offer")?;
+        assert_eq!(held.group, group);
+        Ok(())
+    }
+
+    /// R-P3 of sweep 4: an offer naming a host name is in no group every relay agrees on (each
+    /// resolver may answer it differently), so it is not taken: never queued for a dial.
+    #[test]
+    fn an_offer_naming_a_host_name_is_not_taken() -> Result {
+        let directory = Directory::new();
+        let relay = Identity::generate().map_err(text)?;
+        let cell = area()?;
+        let named = sign(&relay, &content("relay.example:7450", cell, NOW))?;
+        directory.offered(&relay_asker(relay.public()), named, NOW);
+        assert!(directory.state.lock().map_err(text)?.pending.is_empty());
+        let numbered = sign(&relay, &content("192.0.2.7:7450", cell, NOW + 1))?;
+        directory.offered(&relay_asker(relay.public()), numbered, NOW + 1);
+        assert_eq!(directory.state.lock().map_err(text)?.pending.len(), 1);
         Ok(())
     }
 

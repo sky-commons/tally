@@ -15,9 +15,13 @@
 //! charged until the send returns. What a subscriber holds is what its queue holds and what its
 //! link took and has not yet sent (its items in hand, [`Hold`]), both: its bounds count both, and
 //! when an item would pass the budget, the subscriber holding the most of both is let go as fallen
-//! behind, and the next, until it fits. A link let go stops its send at once
-//! ([`Listener::fallen`]), and no send of taken items outlives [`BEHIND_MS`] (`link`), so what a
-//! stalled socket holds is let go within that. The queues together never hold more than their
+//! behind, and the next, until it fits. Letting a subscriber go lets go of its charges at once,
+//! those its link holds in hand among them ([`Hold`] is only a claim on a charge the subscriber
+//! keeps), so the room the budget counted on is free before the next is ranked: before, only its
+//! queue was cleared and its link let go of what it held in hand when it next woke, so a stalled
+//! socket holding its items in hand with an empty queue freed nothing, and an honest subscriber
+//! was let go in its place. A link let go stops its send at once ([`Listener::fallen`]), and no
+//! subscriber's send of taken items outlives [`BEHIND_MS`] (`link`). The queues together never hold more than their
 //! share of the relay's memory, and no subscriber ever misses an item without being told. Before,
 //! the subscribers were ranked by their queues alone: a socket that stalled with items taken held
 //! their charges for up to `noise::WRITE_TIMEOUT` (30 s) with an empty queue, never ranked, and
@@ -29,7 +33,7 @@
 //! subscribers; every offer is then the subscription's own rule (`Subscription::wants`).
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use tally_wire::{Record, Region};
@@ -202,27 +206,60 @@ pub struct Taken {
     hold: Hold,
 }
 
-/// What a link keeps of an item it took while it sends it: the item's charge (shared by every
-/// holder), and the bytes it adds to what its subscriber holds in hand, which rank and bound the
-/// subscriber as its queue's do. Let go once the item is sent.
+/// What a link keeps of an item it took while it sends it: its claim on the item's charge (shared
+/// by every holder), which its subscriber keeps among what it holds in hand ([`InHand`]) and which
+/// ranks and bounds the subscriber as its queue's bytes do. Let go once the item is sent, or by
+/// the subscriber at once when it is let go.
 #[derive(Debug)]
 pub struct Hold {
-    _charge: Arc<Charge>,
-    _in_hand: InHand,
+    subscriber: Arc<Subscriber>,
+    id: u64,
 }
 
-/// Bytes one subscriber's link holds of an item it took, counted for as long as it does.
-#[derive(Debug)]
+impl Drop for Hold {
+    fn drop(&mut self) {
+        // Taken out under the lock, dropped after it: a charge released wakes its gauge's waiters.
+        let released = self
+            .subscriber
+            .queue
+            .lock()
+            .ok()
+            .and_then(|mut state| state.in_hand.release(self.id));
+        drop(released);
+    }
+}
+
+/// Charges held in hand, by hold, each with its bytes.
+type Held = HashMap<u64, (Arc<Charge>, usize)>;
+
+/// What one subscriber's link holds in hand: each item's charge it took, by its hold, and their
+/// bytes together.
+#[derive(Debug, Default)]
 struct InHand {
-    subscriber: Arc<Subscriber>,
+    next: u64,
+    held: Held,
     bytes: usize,
 }
 
-impl Drop for InHand {
-    fn drop(&mut self) {
-        self.subscriber
-            .in_hand
-            .fetch_sub(self.bytes, Ordering::AcqRel);
+impl InHand {
+    fn take(&mut self, charge: Arc<Charge>, bytes: usize) -> u64 {
+        let id = self.next;
+        self.next += 1;
+        self.held.insert(id, (charge, bytes));
+        self.bytes += bytes;
+        id
+    }
+
+    fn release(&mut self, id: u64) -> Option<Arc<Charge>> {
+        let (charge, bytes) = self.held.remove(&id)?;
+        self.bytes -= bytes;
+        Some(charge)
+    }
+
+    /// Every charge held, taken out to be let go.
+    fn release_all(&mut self) -> Held {
+        self.bytes = 0;
+        std::mem::take(&mut self.held)
     }
 }
 
@@ -258,15 +295,27 @@ struct Subscriber {
     notify: Notify,
     /// A directory link: on overflow, resynchronised, never let go.
     resyncs: bool,
-    /// Bytes its link took and has not yet sent ([`Hold`]).
-    in_hand: AtomicUsize,
 }
 
 #[derive(Debug)]
-
 struct State {
     queue: Queue<Queued>,
     fell: Option<Fell>,
+    /// What its link took and has not yet sent ([`Hold`]).
+    in_hand: InHand,
+}
+
+impl State {
+    /// Fallen (behind, or to be resynchronised): what it holds, queued and in hand, is no use to
+    /// it now, and is let go at once, returned to be dropped outside the lock.
+    fn fall(&mut self, fell: Fell) -> (Queue<Queued>, Held) {
+        self.fell = Some(fell);
+        let bounds = self.queue.bounds;
+        (
+            std::mem::replace(&mut self.queue, Queue::new(bounds)),
+            self.in_hand.release_all(),
+        )
+    }
 }
 
 impl Subscriber {
@@ -277,7 +326,8 @@ impl Subscriber {
         if matches!(state.fell, Some(Fell::Behind(_))) {
             return;
         }
-        let in_hand = self.in_hand.load(Ordering::Acquire);
+        let in_hand = state.in_hand.bytes;
+        let mut fallen = None;
         if let Err(why) = state.queue.push_beside(
             (item.clone(), Arc::clone(charge)),
             bytes,
@@ -285,38 +335,39 @@ impl Subscriber {
             in_hand,
         ) {
             // What it holds is no use to it now: let it go at once, not when it is read.
-            state.queue.clear();
-            state.fell = Some(if self.resyncs {
+            fallen = Some(state.fall(if self.resyncs {
                 Fell::Resync
             } else {
                 Fell::Behind(why)
-            });
+            }));
         }
         drop(state);
+        drop(fallen);
         self.notify.notify_one();
     }
 
     /// Bytes it holds now, queued and in hand, while it may still be let go: `None` once it was
-    /// (what it holds in hand goes as its link stops), so it is never let go twice.
+    /// (it held nothing from then), so it is never let go twice.
     fn holding(&self) -> Option<usize> {
         let state = self.queue.lock().ok()?;
         state
             .fell
             .is_none()
-            .then(|| state.queue.bytes() + self.in_hand.load(Ordering::Acquire))
+            .then(|| state.queue.bytes() + state.in_hand.bytes)
     }
 
     /// Let go for the budget: told it fell behind (a directory link is resynchronised), and what
-    /// it held let go now.
+    /// it held, queued and in its link's hand, let go now, so the room is free before this
+    /// returns.
     fn let_go(&self) {
-        if let Ok(mut state) = self.queue.lock() {
-            state.queue.clear();
-            state.fell = Some(if self.resyncs {
+        let fallen = self.queue.lock().ok().map(|mut state| {
+            state.fall(if self.resyncs {
                 Fell::Resync
             } else {
                 Fell::Behind(FellBehind::Bytes)
-            });
-        }
+            })
+        });
+        drop(fallen);
         self.notify.notify_one();
     }
 }
@@ -485,6 +536,9 @@ impl Router {
         for _ in 0..=index.entries.len() {
             if self.gauge.fits(bytes) || self.gauge.held() == 0 {
                 charge = self.gauge.try_charge(bytes);
+                if let (Some(charge), Some(decoded)) = (&mut charge, &item.decoded) {
+                    charge.cover(decoded);
+                }
                 if charge.is_some() {
                     break;
                 }
@@ -522,10 +576,10 @@ impl Router {
             queue: Mutex::new(State {
                 queue: Queue::new(self.bounds),
                 fell: None,
+                in_hand: InHand::default(),
             }),
             notify: Notify::new(),
             resyncs: matches!(filter, Filter::Directory),
-            in_hand: AtomicUsize::new(0),
         });
         self.edit(|entries| {
             entries.push(Entry {
@@ -605,17 +659,14 @@ impl Listener {
             let Some(((item, charge), bytes)) = state.queue.pop_sized() else {
                 break;
             };
-            // In hand from here until the link lets it go, counted before it leaves the queue's
-            // lock, so the subscriber's bytes are never seen short.
-            self.subscriber.in_hand.fetch_add(bytes, Ordering::AcqRel);
+            // In hand from here until the link lets it go (or the subscriber is let go), counted
+            // before it leaves the queue's lock, so the subscriber's bytes are never seen short.
+            let id = state.in_hand.take(charge, bytes);
             out.push(Taken {
                 item,
                 hold: Hold {
-                    _charge: charge,
-                    _in_hand: InHand {
-                        subscriber: Arc::clone(&self.subscriber),
-                        bytes,
-                    },
+                    subscriber: Arc::clone(&self.subscriber),
+                    id,
                 },
             });
             moved += 1;
@@ -641,9 +692,19 @@ impl Listener {
         }
     }
 
+    /// Whether the fan-out resynchronises this listener rather than letting it go (a directory
+    /// link, [`Fell::Resync`]): such a link is never let go as fallen behind, so its sends are held
+    /// to no in-hand deadline (`link`).
+    pub fn resyncs(&self) -> bool {
+        self.subscriber.resyncs
+    }
+
     /// Bytes its link holds in hand: taken, not yet let go.
     pub fn in_hand(&self) -> usize {
-        self.subscriber.in_hand.load(Ordering::Acquire)
+        self.subscriber
+            .queue
+            .lock()
+            .map_or(0, |state| state.in_hand.bytes)
     }
 
     /// The next item, if one waits: for tests.
@@ -833,16 +894,21 @@ mod tests {
         for _ in 0..6 {
             router.publish(info_item(Some(atlanta), 0)?);
         }
-        // The stalled link took five and sends none of them; one stays queued.
+        // The stalled link took all six and sends none of them: its queue is empty, everything it
+        // holds is in its hand.
         let mut in_hand = Vec::new();
-        assert_eq!(stalled.try_recv_many(&mut in_hand, 5), Ok(5));
-        assert_eq!(stalled.in_hand(), 5 * unit);
+        assert_eq!(stalled.try_recv_many(&mut in_hand, 10), Ok(6));
+        assert_eq!((stalled.in_hand(), stalled.queued_bytes()), (6 * unit, 0));
         for _ in 0..2 {
             router.publish(info_item(Some(paris), 0)?);
         }
         assert_eq!(gauge.held(), 8 * unit);
-        // One more for the honest subscriber does not fit: the stalled one holds the most.
+        // One more for the honest subscriber does not fit: the stalled one holds the most, and
+        // letting it go frees what it holds in hand at once, while its link still has the items:
+        // the honest one keeps all three. Before, only the stalled one's (empty) queue was
+        // cleared, the store stayed full, and the honest one was let go next.
         router.publish(info_item(Some(paris), 0)?);
+        assert_eq!((gauge.held(), stalled.in_hand()), (3 * unit, 0));
         let mut out = Vec::new();
         assert_eq!(honest.try_recv_many(&mut out, 10), Ok(3));
         assert_eq!(
@@ -859,8 +925,9 @@ mod tests {
         };
         assert!(told(&stalled));
         assert!(!told(&honest));
+        // Its link letting go of the items later releases nothing twice.
         drop(in_hand);
-        assert_eq!(stalled.in_hand(), 0);
+        assert_eq!((stalled.in_hand(), gauge.held()), (0, 3 * unit));
         Ok(())
     }
 
