@@ -661,8 +661,8 @@ impl Directory {
         lock(&self.state).hosts.insert(host.to_owned(), ip);
     }
 
-    #[cfg(test)]
-    pub(crate) fn adopt_own_key(&self, key: PublicKey) {
+    #[doc(hidden)]
+    pub fn adopt_own_key(&self, key: PublicKey) {
         lock(&self.state).own = Some(key);
     }
 
@@ -1007,9 +1007,10 @@ impl Directory {
         Some(pending)
     }
 
-    /// Holds an offer as verified from `group`, without a dial: for the relay's own path and tests.
-    #[cfg(test)]
-    pub(crate) fn hold_verified(
+    /// Holds an offer as verified from `group`, without a dial: for the relay's own path and tests
+    /// (also those of the integration suites, which have no peer to dial).
+    #[doc(hidden)]
+    pub fn hold_verified(
         &self,
         offer: ProviderOffer,
         group: Group,

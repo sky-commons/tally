@@ -15,22 +15,27 @@
 //! - **Room is shared, refusal is whole, and neither depends on order** (RFC-0181 §9). The
 //!   receivers seated across every intake of one engine are bounded by one count ([`Seats`],
 //!   `Capacity::receivers`), and who is seated is a function of who is described: the best ranked
-//!   (taking part first, then a draw no feeder can choose, [`draw`]), whatever order they came in
+//!   (taking part first, then the key-hash rank, [`draw`]), whatever order they came in
 //!   and whichever intake took them. A receiver outranked is refused whole (none of its raw held)
 //!   and counted, and one that loses its seat to a better ranked one is let go whole. A receiver's
 //!   raw of a bin beyond its share is refused whole (`held::Limits`); the holder's bytes are
 //!   checked on each whole bin as it is sealed (`held::Bin::seal_within`), never on arrival.
-//! - **The rank is no feeder's to choose** (RFC-0171 §9, critic 4: standing counts places, not
-//!   keys, and is a bar, not a ranking). Taking part is the bar. Among the receivers over it the
-//!   seat goes by a keyed hash of the receiver's key under a secret this process drew
-//!   ([`draw`], `tally_wire::FingerprintKey::process`, the message fingerprint's own key): a key is
-//!   free, so ranking by the key itself let anyone grind keys that outrank every honest receiver and
-//!   take the seats from them with one description each. Under a secret it cannot do better than
-//!   chance, whatever it grinds. Neither tenure nor standing serves instead: tenure (first come)
-//!   rewards whoever floods first and is decided by arrival order, which RFC-0181 §9 forbids;
-//!   receiver standing (RFC-0174 §2.12) is earned only by receptions the seated engine solves, so
-//!   ranking by it would keep a receiver once seated seated forever and one never seated out, and it
-//!   is a bar the merge applies to solutions, not an order of who may be heard.
+//! - **The rank is the receiver's own word, the same on every relay** (RFC-0181 §9, §10). Taking
+//!   part is the bar. Among the receivers over it the seat goes by a hash of the receiver's key
+//!   under a fixed fleet-wide seed ([`draw`]), so two relays holding one area seat the same
+//!   receivers whatever order the descriptions reached each, and an overloaded host's cut
+//!   ([`Seats::set_cap`], published by stamp) leaves the same receivers on every relay: before, the
+//!   seed was a secret each process drew, which no two relays shared, so the receivers one relay
+//!   refused another solved and their products could not match. What the secret bought was that a
+//!   key could not be ground to outrank honest ones; a key is not free here any more than a seat
+//!   is (every feeder is admitted at its connection, per credit and network group, before it can
+//!   describe at all, RFC-0181 §5), so grinding costs an admitted connection a rank, and a relay
+//!   that wants the rank unpredictable gives all its peers one seed ([`Seats::keyed`]). Neither
+//!   tenure nor standing serves instead: tenure (first come) rewards whoever floods first and is
+//!   decided by arrival order, which RFC-0181 §9 forbids; receiver standing (RFC-0174 §2.12) is
+//!   earned only by receptions the seated engine solves, so ranking by it would keep a receiver
+//!   once seated seated forever and one never seated out, and it is a bar the merge applies to
+//!   solutions, not an order of who may be heard.
 //! - **A batch before its receiver's description** waits for it ([`Intake::hold_orphan`]): a batch
 //!   can reach a holder before its receiver's description (a repair, a rebuild from parity, a link
 //!   that died between them, or a description that takes effect at the next step), and is forwarded
@@ -50,6 +55,7 @@
 
 use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tally_mlat_solver::held::{Closing, Fragment, Limits, Open};
@@ -285,18 +291,27 @@ pub enum Place {
     Gone,
 }
 
-/// The domain of the seat draw under the process key (`tally_wire::decoded::keyed`).
+/// The domain of the seat draw (`tally_wire::decoded::keyed`).
 const SEAT_DOMAIN: u8 = tally_wire::decoded::keyed::SEAT_DRAW;
 
+/// The seed of the seat draw every relay shares (module docs): a constant, so the same receivers
+/// rank the same on every relay.
+const FLEET_SEED: [u8; 32] = *b"tally.mlat.seat.rank.fleet.v1...";
+
+/// The fleet-wide key of the seat draw: what [`Seats::new`] ranks by.
+pub fn fleet_key() -> FingerprintKey {
+    FingerprintKey::from_bytes(FLEET_SEED)
+}
+
 /// A receiver's draw for a seat (module docs): a keyed hash of its key under `secret`, the same for
-/// every intake of one engine, unknown outside the process, so no key can be ground to win it.
+/// every intake of one engine.
 pub fn draw_under(secret: &FingerprintKey, key: &PublicKey) -> u128 {
     secret.fingerprint(SEAT_DOMAIN, key.as_bytes())
 }
 
-/// [`draw_under`] this process's secret (`FingerprintKey::process`): what [`Seats::new`] ranks by.
+/// [`draw_under`] the fleet's seed: what [`Seats::new`] ranks by, the same on every relay.
 pub fn draw(key: &PublicKey) -> u128 {
-    draw_under(FingerprintKey::process(), key)
+    draw_under(&fleet_key(), key)
 }
 
 /// What decides who is seated: receivers that take part before those that do not, then by their
@@ -337,6 +352,8 @@ impl Places {
 #[derive(Debug)]
 pub struct Seats {
     limit: usize,
+    /// How many of the `limit` are seated now: the overload cut (`set_cap`), never above `limit`.
+    cap: AtomicUsize,
     /// What the draw is keyed by: this process's secret, or a test's.
     secret: FingerprintKey,
     places: Mutex<Places>,
@@ -352,9 +369,9 @@ impl std::fmt::Debug for Places {
 }
 
 impl Seats {
-    /// `limit` seats, drawn for under this process's secret ([`draw`]).
+    /// `limit` seats, drawn for under the fleet's seed ([`draw`]).
     pub fn new(limit: usize) -> Arc<Self> {
-        Self::keyed(limit, *FingerprintKey::process())
+        Self::keyed(limit, fleet_key())
     }
 
     /// `limit` seats, drawn for under `secret`: for a test that needs the same seats twice, or
@@ -362,6 +379,7 @@ impl Seats {
     pub fn keyed(limit: usize, secret: FingerprintKey) -> Arc<Self> {
         Arc::new(Self {
             limit,
+            cap: AtomicUsize::new(limit),
             secret,
             places: Mutex::new(Places::default()),
         })
@@ -422,8 +440,17 @@ impl Seats {
     /// forgets the worst waiting beyond `limit` of them. Whose place changed.
     fn settle(&self, places: &mut Places) -> Vec<PublicKey> {
         let mut changed = Vec::new();
+        let cap = self.cap();
+        // A cut: the worst ranked seated give their seats back, kept waiting.
+        while places.seated.len() > cap {
+            let Some(worst) = places.seated.pop_last() else {
+                break;
+            };
+            places.waiting.insert(worst);
+            changed.push(worst.key);
+        }
         while let Some(best) = places.waiting.first().copied() {
-            if places.seated.len() < self.limit {
+            if places.seated.len() < cap {
                 places.waiting.remove(&best);
                 places.seated.insert(best);
                 changed.push(best.key);
@@ -464,6 +491,22 @@ impl Seats {
 
     pub fn limit(&self) -> usize {
         self.limit
+    }
+
+    /// The seats in use at most now: `limit`, or less under an overload cut ([`Seats::set_cap`]).
+    pub fn cap(&self) -> usize {
+        self.cap.load(Ordering::SeqCst).min(self.limit)
+    }
+
+    /// Cuts the seated to the `cap` best ranked (at least one, at most `limit`) or lifts the cut,
+    /// and settles every place: whose changed, for each intake holding one to settle
+    /// ([`Intake::settle`]). The receivers cut stay described, waiting, so a lifted cut seats them
+    /// again by rank. The same cap on every relay seats the same receivers (module docs).
+    pub fn set_cap(&self, cap: usize) -> Vec<PublicKey> {
+        let mut places = self.places();
+        self.cap
+            .store(cap.clamp(1, self.limit.max(1)), Ordering::SeqCst);
+        self.settle(&mut places)
     }
 }
 
@@ -954,6 +997,9 @@ mod tests {
     use super::*;
     use tally_wire::Identity;
 
+    /// `draw` of `Identity::from_seed([7; 32])`'s key.
+    const KNOWN_DRAW: u128 = 0xa152b57161dad4a033a9d8cbfd33dbb0;
+
     fn secret(seed: u8) -> FingerprintKey {
         FingerprintKey::from_bytes([seed; 32])
     }
@@ -1017,6 +1063,74 @@ mod tests {
                     "{order:?} with detours"
                 );
             }
+        }
+    }
+
+    /// RFC-0181 §9, §10: the rank is the same on every relay. A known answer, so the rank is
+    /// pinned to the fleet's seed and not to anything this process drew (before, each relay's own
+    /// secret: two relays holding one area seated different receivers, and an overloaded host's
+    /// cut left others than the peer's).
+    #[test]
+    fn the_seat_rank_is_the_same_on_every_relay() {
+        let key = Identity::from_seed([7; 32]).public();
+        assert_eq!(draw(&key), KNOWN_DRAW, "{:#x}", draw(&key));
+        assert_eq!(Seats::new(1).draw_of(&key), draw(&key));
+        // And not the process's secret.
+        assert_ne!(
+            draw(&key),
+            draw_under(FingerprintKey::process(), &key),
+            "ranked by the process's secret"
+        );
+    }
+
+    /// RFC-0181 §10: a cut seats the best ranked of those seated and no others, whatever order
+    /// they came in, keeps the cut waiting (described, unseated) and lifts back to the same seats.
+    #[test]
+    fn a_cut_leaves_the_best_ranked_seated_whatever_the_order_and_lifts_back() {
+        let keys: Vec<PublicKey> = (0..24u8)
+            .map(|seed| Identity::from_seed([seed; 32]).public())
+            .collect();
+        let mut best: Vec<(u128, PublicKey)> = keys.iter().map(|key| (draw(key), *key)).collect();
+        best.sort_unstable();
+        let seated = |seats: &Seats| -> Vec<PublicKey> {
+            let mut seated: Vec<PublicKey> = keys
+                .iter()
+                .copied()
+                .filter(|key| seats.place(key) == Place::Seated)
+                .collect();
+            seated.sort_unstable();
+            seated
+        };
+        let expected = |n: usize| -> Vec<PublicKey> {
+            let mut set: Vec<PublicKey> = best[..n].iter().map(|(_, key)| *key).collect();
+            set.sort_unstable();
+            set
+        };
+        for reversed in [false, true] {
+            let seats = Seats::new(16);
+            let order: Vec<PublicKey> = if reversed {
+                keys.iter().rev().copied().collect()
+            } else {
+                keys.clone()
+            };
+            for key in &order {
+                let _ = seats.rank(*key, false);
+            }
+            assert_eq!(seated(&seats), expected(16));
+            let changed = seats.set_cap(10);
+            assert_eq!(seats.cap(), 10);
+            assert_eq!(seated(&seats), expected(10));
+            // The six cut changed place, and are waiting, not forgotten.
+            assert_eq!(changed.len(), 6);
+            for (_, key) in &best[10..16] {
+                assert_eq!(seats.place(key), Place::Waiting);
+            }
+            // Never above the limit, never below one.
+            seats.set_cap(1_000);
+            assert_eq!(seats.cap(), 16);
+            assert_eq!(seated(&seats), expected(16));
+            seats.set_cap(0);
+            assert_eq!(seats.cap(), 1);
         }
     }
 

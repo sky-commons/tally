@@ -109,6 +109,7 @@ pub fn start(
         checker: DeliveryChecker::load(&config.state_dir),
         checking: delivery_check::Checking::default(),
         prober: probe::measure,
+        source_address: config.source_address,
     }));
     let (inputs, intake) = source::channel();
     let batching = source::batch(

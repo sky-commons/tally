@@ -160,6 +160,7 @@ async fn a_receivers_frames_reach_both_outputs_signed_and_unchanged() -> Result 
         location: Some(location),
         clock: Clock::Dump1090,
         ceiling: 1_000_000,
+        source_address: None,
     }));
 
     // The subscriber gets the receiver's signed description and its batches, verified.

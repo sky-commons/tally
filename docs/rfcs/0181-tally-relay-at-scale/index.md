@@ -444,10 +444,14 @@ Measured on main (tally-load, commit b3e3571809 on branch tally-load):
    would pass the fan-out's budget, the subscriber holding most is let go the same way, and the next,
    until it fits. A relay's directory link is the one exception: what it is sent is held whole
    elsewhere, so it is sent that again (a resync) instead.
-9. **Capacity is admission, never a silent drop inside a store.** Each store's per-feeder bytes are
+9. **Capacity is admission, never a silent drop inside a store.** (The per-feeder worst-case
+   reservation described first below is superseded by "Admission": a connection reserves its floor,
+   the rate-driven stores are sized for one relay-wide rate, MLAT's seats are a pool of their own.)
+   Each store's per-feeder bytes are
    reserved when a feeder is admitted, in the same headroom check RFC-0171 uses for egress; the feeder
    ceiling is derived from RAM and those formulas; Hello beyond it is refused ("no spare slot"). MLAT
-   receiver limit comes from the same F (>= 20,000). Any leftover overflow is counted, published, and
+   seats are a pool of their own, fewer than the feeders (§10, "MLAT seats"): a feeder past it is
+   still a feeder, its raw still flows. Any leftover overflow is counted, published, and
    refused whole (a whole receiver, bin, area or second), never partially in an interleaving-dependent
    way. `Added.dropped` is never discarded.
 
@@ -592,14 +596,108 @@ Measured on main (tally-load, commit b3e3571809 on branch tally-load):
     stamps, has them refused whole, counted (`provisional_steps_late`). What is lost is
     provisional positions, never a window. A host within those limits of the watermark sheds
     nothing, so the
-    same stamped trace still makes the same bytes; one further behind is shed by how far behind it
-    is, which no trace decides. Before, a step shed only while no seal was in flight, so a slow seal
+    same stamped trace still makes the same bytes. Those sheds are a bound on what MLAT holds, not
+    the policy: what decides who is solved under overload is the cut below (decided 2026-10-09),
+    which every relay holding the area makes the same. Before, a host further behind was shed by
+    how far behind it was, which no trace decides: two relays holding one area dropped different
+    steps and made different products. Before, a step shed only while no seal was in flight, so a slow seal
     let the steps queued behind it grow without bound; and a provisional step waited for the window
     step before it, so a provisional position could wait five steps and a seal, past the live
     world's seal. Changed from "back-pressure for delivery and
     fan-out" as built: back-pressure from either would let one slow subscriber, or a full tag store,
     stall ingest for every feeder, and both have a loss that is counted and told (a "fell behind"
     Goodbye, a batch left out of the audit) where back-pressure's is everyone's.
+
+    **MLAT seats and the overload cut (decided 2026-10-09).** MLAT has its own pool of receiver
+    seats (`Budget::mlat_seats`, `mlat_host::capacity`), planned from the cores and memory left
+    after the stages, not the feeder ceiling: the world's MLAT does not fit one box under any
+    admission model, and a window step that runs past the ripening sheds provisional positions of
+    every receiver alike. A receiver past the seats is not hosted for MLAT (its raw still flows
+    and is served) and is refused at its description, counted (`receivers_refused`). Who holds the
+    seats is the best ranked by a hash of the receiver's key under one seed every relay shares
+    (`tally_mlat::intake::draw`), taking part first: the same receivers on every relay holding an
+    area whatever order their descriptions came in, where before each relay's own secret ranked
+    them and two relays seated different receivers. The price is the grind the secret bought: a
+    key can be chosen to rank first, but a key is admitted at a connection first (per credit and
+    network group, §5), so it costs an admitted feeder, not a free key. Under overload the
+    receivers solved are cut by the same rank, published by stamp: a window step that runs past
+    `mlat_host::WINDOW_BUDGET_MS` (the ripening, 15 s, less three steps; 12 s) makes the host
+    decide a `Cut` (at most half its seats, aimed at three quarters of the budget), effective
+    `CUT_LEAD_STEPS` (5) past its watermark, which `MlatHost::take_cuts` hands the relay to publish
+    to the relays holding the area and `MlatHost::offer_cut` takes from them. The seats at a step
+    are the least any origin's newest cut at or before it asks for, applied at the step with its
+    descriptions (`Seats::set_cap`), so relays offered the same cuts solve the same receivers from
+    the same step and make byte-identical products (`staged_mlat`: the two cut tests). The
+    receivers cut stay described, waiting, and a host that cut lifts its cut when its window steps
+    run in half the budget. A cut offered after its step was applied takes effect at the next and
+    is counted (`cuts_late`).
+
+    **The cut travels as a signed record** (`MlatCut`, kind 0x24, `tally_wire::cut`): the relay's
+    signature over the step it takes effect from (`from_ms`) and the seats it asks for. No existing
+    record fits (a group's records carry an area's data, and a group stripes them across its
+    members), so it has a kind of its own, non-critical like every kind since version 2: a relay
+    that predates it skips it whole (RFC-0171 §3.4) and applies no cut, which is the overload
+    behaviour it always had. `Network::tick` takes the hosted MLAT's decided cuts
+    (`MlatHost::take_cuts`), signs each and addresses it, by the path sharing already uses for what
+    it sends one member (`Sharing::address`, the outbox `Network::carry` sends down each member
+    link), to every relay that offers the raw of an area this relay solves
+    (`Selection::raw_sources`). A relay that gets one (`Network::handle`) offers it to its host
+    (`MlatHost::offer_cut`) only if it verifies, is signed by the relay that sent it, and that relay
+    is one of its own raw sources; else it is refused and counted (`cuts_refused`), so a relay that
+    holds none of an area cannot cut its solving. `staged_mlat`'s
+    `an_overloaded_relays_cut_reaches_the_relay_holding_its_area_and_both_make_the_same_bytes`
+    holds it: relay A, overloaded, signs the cut it decided, relay B takes it through
+    `Network::handle` and, though it never ran long, makes the same bytes as A.
+
+    **Grinding, and what bounds it.** The rank that seats and cuts receivers is a public hash of the
+    receiver's key under one seed, so every relay agrees without talking; the cost is that a key can
+    be ground, by trying keys until one ranks first, to hold a seat and to be last cut. What a ground
+    key buys is bounded by the layers before it, with no further change: it must first be an
+    admitted connection, which costs a place in a network group's share of the ingest rate (§5,
+    `shed`) and the credit an honest feeder earns, so a grinder with many keys in one network holds
+    one share of `R_max` between them, and the seats it can hold are no more than the connections it
+    can hold. What a ground key wins is the order in which receivers are solved or cut, never what a
+    solution says: a solution is checked against the raw it cites whoever's seat it came from. The
+    cost is a displaced honest receiver, whose raw is still relayed and served. That is the
+    trade-off accepted: a public rank every relay shares (so an overload cut published by stamp is
+    one every relay applies the same) in exchange for the secret rank no two relays could agree on.
+    The mitigation is the admission before it, not a rank that is harder to grind.
+
+    Measured 2026-10-09, `tally-load` 2,000 feeders (two clusters of 1,000, 9,000 aircraft each),
+    MLAT on, the relay on 10 cores (`taskset -c 0-9`) and the harness on the other 22, 180 s, seats
+    fixed by hand, no cut (window steps in the 180 s, mean elapsed, core-seconds fit plus solve a
+    step, provisional steps shed or late of those run):
+
+    | Seats | Window step, mean | Core-s a step | Provisional steps shed | Relay cores, mean |
+    | ----- | ----------------- | ------------- | ---------------------- | ----------------- |
+    | 2,000 | 21.5 s            | 67            | 80 of 269              | 5.5               |
+    | 1,000 | 20.3 s            | 57            | 56 of 269              | 4.4               |
+    |   700 | 16.1 s            | 46            | 34 of 269              | 4.1               |
+    |   500 |  8.5 s            | 19            | 12 of 269              | 2.8               |
+
+    The step's cost is not in proportion to its seats: a part is the aircraft's, whatever the
+    receivers, and below about 500 seats fewer aircraft are heard by enough of them to be solved.
+    What 10 cores carry inside the 12 s budget at 2,000 feeders (ingest takes 4 to 7 cores of
+    them) is about 500 to 550 seats, so the cut aims there, and the plan is to seat what its
+    leftover cores carry at about 35 core-ms a seat a window step (0.9 ms a seat a second) beside
+    the 0.41 ms a second of the provisional steps.
+
+    Measured again with the planned seats, the cut and the harness's feeders in 256 network groups
+    (2026-10-09, 2,000 feeders at 300 receptions a second, MLAT on, the relay on 6 cores
+    (`taskset -c 0-5`, `check` plans 1,243 seats) and the harness on 26, 300 s measured): all 2,000
+    feeders held and relayed (raw p50 1 ms, p99 51 ms, p99.9 488 ms, none missing from any
+    sequence), 1,243 of them seated at first, the rest refused at their description and counted.
+    Window steps overran the budget at once: 4 cuts in the run took the seats from 1,243 to 148
+    (`cuts_decided` 4, `seat_cap` 148, `receivers_refused` 1,852), the 10 window steps took 115 s
+    together (11.5 s a step, the last 12.4 s), 30 of 360 provisional steps were shed (29 for models
+    late, 1 late to publish), 114,398 provisional solutions were read (p50 2.5 s, p99 14.3 s, 1,933
+    past the 4 s the live world takes), and the relay took 1.44 cores mean and 2.1 GiB resident
+    (498 MiB charged to the stores at most: the allocator keeps the rest). This relay had no peer,
+    so nothing was sent (`cuts_sent` 0); the transport is held by `staged_mlat`'s
+    `an_overloaded_relays_cut_reaches_the_relay_holding_its_area_and_both_make_the_same_bytes`. The
+    window step still took 11 to 12 s at 148 seats: a part of its cost is the aircraft's and does not
+    fall with the seats (the table above), which a cut that aims by seats alone does not see, so
+    four cuts followed one another. Noted to be tuned against a longer run.
 
     **The cores (decided 2026-10-09).** Back-pressure for raw is the right loss only while the
     stages can carry what the relay admitted; when they cannot, it is every feeder's latency, all
@@ -760,6 +858,182 @@ Measured on main (tally-load, commit b3e3571809 on branch tally-load):
     it writes it (`Record::encoded_len`) and seals the message first when the record would not fit,
     so a buffer never grows past a message and the 16 MiB bound holds whatever passed through.
 
+## Admission (decided 2026-10-09)
+
+**What was wrong.** A feeder reserved its worst case in every store (`Plan::per_feeder`, the sum of
+every store's window at 600 receptions a second), and the stores' gauges were one shared pool each
+(`limit = per feeder x ceiling`). The reservation counted feeders and never gave any one of them a
+share: a hostile feeder at its pace could fill Epochs, Batches and Products for all, and a release
+woke every waiter (`notify_waiters`), so the race winner took the room. The plan also contradicted
+itself: memory was planned at 600 receptions a second a feeder, the cores at the pace ceiling. Both
+must come from one figure, the rate the relay admits. Two ways of deciding by load were rejected:
+admission by observed load is gameable (a Sybil connects quiet, then sends at pace) and oscillates,
+so measured load is a report and never the rule; and shedding in a store after sharing (Batches,
+Epochs, Dedup) breaks determinism, since two relays holding one area would drop different batches.
+Raw push-back is safe, epochs close on the watermark.
+
+**The model** (`budget::Plan::admit`, the one derivation; the gauges, the ingest rate, the stages'
+threads, MLAT's seats and `tally-relay check` all read its `Admission`):
+
+1. **The floor** is what a connection costs whatever it sends: its Noise buffers, its ingest
+   allowance, its delivery tags and its pace state (`Plan::per_feeder`, reserved at the Hello by
+   `Budget::reserve`). The rest of a planned feeder is split by what drives it (`Store::driver`):
+   the rate-driven stores (Batches, Dedup, Epochs, Products, Records, Fanout; `Plan::per_rate`)
+   and MLAT's seat stores (Held, Open, Notes, Engine, Orphans; `Plan::per_seat`).
+2. **The connection limit** is the fewer of what the memory carries (a connection's floor and its
+   mean rate's windows) and what the cores carry (its session on the runtime and the stages' cost of
+   its mean rate, at `cores::BUSY_PERCENT`, beside the sessions' and the members' share).
+3. **`R_max`**, one relay-wide rate in receptions and bytes a second (and the records it admits,
+   `cores::RECORDS_PER_PLANNED_FEEDER` for each planned feeder's worth), is the lesser of the memory
+   left after the floors over a reception's windows and the cores left after the sessions over a
+   reception's cost through ingest, message exchange and sealer. Connections are admitted at the
+   planned mean, so `R_max` is at least their mean; what bound the connections bounds it too, and
+   the other bound is the room above. Each rate-driven gauge's limit is its window times
+   `R_max` and the members' rate (`window x (R_max + members' rate)`), a hard reservation sized from
+   the plan and never overcommitted, so the gauges together never pass the memory. A store after
+   sharing keeps push-back and never refuses a member's batch for room: the room is sized for the
+   rate ingest admits.
+4. **Rate shedding only at ingest, before signing** (`shed`, Writer B): a relay-wide token bucket on
+   `R_max` beside the per-receiver pace. Over demand a source's allowance is its max-min fair share
+   of `R_max`, weighted by its credit or its network group so N Sybil keys do not hold N shares; the
+   source furthest over its share is cut first, ties by key-hash rank, judged by the batch's own
+   stamps, local to the ingesting relay and before sharing, so no cross-relay agreement is needed.
+   `tally-load` connects each simulated feeder from an address of its own across 127.0.0.0/8 (Linux
+   routes all of it to loopback; 256 network groups, `--feeder-networks many`, the default on
+   loopback), so a run measures honest feeders; before, all of them came from 127.0.0.1, one group
+   and one share. `--feeder-networks one` puts them all in one group: the Sybil case.
+5. **Waiting is fair** (`Gauge::charge_for`): a gauge serves its waiters in turn by source, deficit
+   round robin with a quantum of `DRR_QUANTUM` (a planned batch's charge), instead of waking all and
+   letting the race winner take the room. A newcomer queues while anyone waits, and a waiter that
+   gives up blocks no one.
+6. **MLAT seats are their own pool, planned from what the connections leave.** Connections are
+   planned first, at their floor and the windows of their mean rate, against the memory and the
+   cores that remain after MLAT's share (`cores::MLAT_SHARE_PERCENT`, a quarter of each, kept
+   only by a relay that hosts MLAT). Seats are then the fewer of the memory left over a seat
+   (`Plan::per_seat`), the cores left over a seat's steps, and the connections: the share, and
+   whatever the connections did not use (a relay bound by its cores leaves memory). Seats are never
+   more than connections, and a feeder past them is still a connection, its raw relayed and served,
+   only not solved. Before, a hosting relay kept a seat for each connection and admitted the pairs
+   its memory and cores carried, so a 672 MiB pod with 74 MiB left admitted about fifteen
+   connections; the same pod admits 40 now, with 5 seats (`relay_config_test` prints the plan). The
+   seats are what the stages leave, MLAT running below their priority. The world's MLAT does not fit
+   one 16-core box under any admission model: a window step is 63 to 85 CPU-seconds every 40 s at
+   2,000 feeders and about 2.9 MiB a feeder, so a relay carrying the world's feeders hosts no MLAT
+   (`--no-mlat`) and one hosting it solves the receivers its seats cover.
+7. **The handshakes are paced from their measured cost.** A Noise XX handshake and the Hello's
+   verification cost the responder 160 to 200 us of a core (measured 2026-10-09, release build, one
+   core of the 32-core build host: 5,000 to 6,000 a second a core). The cap on handshakes in flight
+   and its pace come from that, in `cores`: the pace is `BUSY_PERCENT` of the runtime's cores at
+   `HANDSHAKE_NANOS` (200 us) each, 2,500 a second a core, and the permits are the pace over the
+   time each holds its permit waiting on its peer, `HANDSHAKE_WAIT_MS` (100 ms, Little's law), 250 a
+   core. A reconnect storm of all 20,000 feeders is passed in about half a second on 16 cores, in
+   arrival order, and the sessions already served keep their share of the cores. `tally-relay
+   check` prints `handshakes-in-flight` and `handshakes-per-sec`.
+
+**Why this shape.** A connection must be admitted by what it costs for certain, its floor, and by
+nothing it may or may not send; what it sends is a rate, and a rate has one owner, `R_max`, which
+the cores and the memory both bound, so the plan cannot disagree with itself and fairness has
+something to share. Hard reservations sized from `R_max` leave no store refusing what ingest
+admitted. Fair waiting and the fair share at ingest are the two places two sources meet; before, they
+met in a race.
+
+**What it admits, as the relay prints it** (`tally-relay check`, the `check` test
+`the_world_relay_prints_what_it_admits`, 16 cores and a 32 GB container, one base cell, the public
+relay's caps; output of the test, not prose):
+
+| Line                              | Without MLAT | Hosting MLAT |
+| --------------------------------- | ------------ | ------------ |
+| floor (a connection)              | 478,451      | 478,451      |
+| per-connection (floor + mean rate)| 1,390,174    | 1,390,174    |
+| per-seat                          | 0            | 3,473,416    |
+| connection-limit                  | 17,324       | 9,416        |
+| connections-by-memory / by-cores  | 21,597 / 17,324 | 15,953 / 9,416 |
+| connection-limit-bound            | cores        | cores        |
+| max-receptions-per-sec (`R_max`)  | 10,394,482   | 5,649,819    |
+| max-bytes-per-sec                 | 141,919,327  | 77,138,862   |
+| max-records-per-sec               | 34,648       | 18,832       |
+| rate-by-memory / by-cores         | 14,304,277 / 10,394,482 | 8,486,559 / 5,649,819 |
+| feeders-at-mean / at-ceiling      | 17,324 / 3,464 | 9,416 / 1,883 |
+| mlat-seats (bound)                | 0            | 3,504 (cores) |
+| ingest / message / seal threads   | 5 / 5 / 4    | 4 / 3 / 4 (and 5 MLAT) |
+| handshakes-in-flight / per-sec    | 4,000 / 40,000 | 4,000 / 40,000 |
+| allocator (the share kept)        | 2,684,354,560 | 2,684,354,560 |
+
+(Hosting MLAT, the connections are planned from three quarters of the memory and the cores, the
+rest being MLAT's share, so they are fewer, bound by cores here; the seats are what the
+connections leave, 3,504 of 9,416.)
+
+The 32 GB relay without MLAT is bound by its 16 cores at 17,324 connections, not by its memory
+(21,597). The 20,000 feeders the RFC sizes for need 19 cores at these figures (`check --cores 19`
+admits 20,781), or the stages' costs measured lower; "feeders at the ceiling" is `R_max` over what one source is held to
+(`ingest::SOURCE_RECEPTIONS_PER_SEC`), what the relay carries if every feeder sends at its pace.
+Ten cores and 24 GB with the harness's two areas are `tests/cores-10.txt`, held equal to what the
+relay prints.
+
+**The world relay run on this box, and what it showed** (2026-10-09, `tally-load` built `-c opt`, MLAT
+off). The plan for 20,000 feeders is 19 cores: `check --cores 16` admits 17,324 connections,
+`--cores 19` admits 20,781 (bound by cores, as the table above says), so the relay ran on
+`taskset -c 0-18` with `--memory 30G` (the plan's 30.6 GB of limits, not allocated until used) and
+the harness on the other 13 cores, a watchdog killing only the harness if `MemAvailable` fell under
+10 GB (it never did). Three things the run found:
+
+1. **The harness cannot make 600 receptions a second for 20,000 feeders on 13 cores.** Its
+   simulation is one thread a cluster and made seconds at about 0.4 of real time at 10,000
+   receivers a cluster (the feeders were offered nothing from the 30th second); with `--replay 4`
+   (traffic for 5,000 receivers, four feeders on each) the harness itself took 11.2 of its 13
+   cores signing and sealing 12 M receptions a second, and the feeders reached the relay slowly
+   (4,700 held at 90 s), so that run is not a measure of the relay. The RFC's 5,000-feeder runs
+   used 22 harness cores. What the plan's 12 M receptions a second would cost is therefore not
+   measured here: the per-batch and per-reception costs above are.
+2. **An MLAT-off relay corroborates nobody, so every feeder is charged to its network group.**
+   `credit::corroborate_receiver` is called only for receivers with standing, which needs the
+   hosted MLAT's verified fixes (`Standing::agreeing`); `shed` therefore gives every receiver of a
+   relay without MLAT the share of its /16, which it caps at one source ceiling (3,000 receptions
+   a second, `ingest::SOURCE_RECEPTIONS_PER_SEC`) whatever `R_max` has to spare. Loopback has 256
+   /16s (`--feeder-networks many`), so honest 600-a-second feeders fit 1,280 of them without a cut.
+   At 20,000 feeders of 35 receptions a second each (78 to a group, 2,730 a second a group, 704,000
+   offered) nothing was cut: raw p50 2 ms, p99 6 ms, p99.9 50 ms, no batch missing from any
+   sequence, 19,594 feeders held at the end (0 turned away), 2.49 cores in the relay (ingest 1.14,
+   runtime workers 0.59, message threads 0.58, the sealer and its helpers 0.12) and 591 MiB resident
+   against 959 MiB charged to the stores at most. At 100 a second each (7,800 a group, 2.0 M offered)
+   the shedder cut 2,587,432 batches (258,974,924 receptions), all `over_share`, none for the
+   receiver's pace or `R_max`, and 1,848,489 batches were missing from the receivers' sequences:
+   the rule working as written, on a harness that cannot present 20,000 feeders in more than 256
+   groups. Whether a relay without MLAT should hold honest feeders to their group's one share, or
+   corroborate them some other way, is open (the rule is the Sybil bound, and it has no other way
+   to tell a key from a key).
+3. **Handshakes and the floor held.** 20,000 feeders started over 120 s: 46,151 handshakes begun (a
+   feeder's probe and its session), 74 in flight at the most against the cap of 4,750 and a planned
+   pace of 47,500 a second, and 19,594 feeders held at the end with none turned away.
+
+**Rate per stage, per batch.** Ingest took 1.14 cores for 19,500 batches and 650,000 receptions a
+second: about 58 us a batch with the receptions beside it, the signature and the hash being most of
+it, which the planned 221 ns a reception over 600 receptions (133 us a batch) leaves room for.
+
+**BUSY_PERCENT stays 50** (re-measured 2026-10-09, 5,000 feeders, MLAT off, ten cores, 3.04 M
+receptions a second, the stages' threads' CPU in 100 ms windows from `/proc/<pid>/task/*/stat`,
+60 s): ingest threads mean 0.30, p99 0.60 to 0.70, max 0.80 to 0.90; message threads mean 0.30 to
+0.31, p99 1.00 to 1.10, max up to 1.10; sealer and helpers mean 0.15 to 0.37, p99 0.90 to 1.00. The
+message threads and the sealer saturate in the 100 ms around an epoch's close while their mean is
+under a third, so the bursts that remain are internal (the close freezes every message thread's
+shards and the sealer gathers them at once), the ingest bucket does not shape them, and a higher
+planned mean would only lengthen the saturated windows. The same run's per-reception costs were
+higher than the planned figures (ingest about 290 ns, message about 300, seal about 230, against 222,
+217 and 179), on a host shared with other work, so the figures are not lowered. Raw p99 in that run
+was 992 ms on that shared host.
+
+**The allocator's share, measured.** `GET /memory` now serves `allocator` (`mallinfo2`: bytes in use,
+bytes freed and kept in the arenas, bytes mapped). Under `tally-load` the free bytes came to 2,037 MiB
+over the eight arenas at 2,000 feeders hosting MLAT (255 MiB an arena), and 612 MiB at 5,000 feeders
+without it (77 MiB an arena). The earlier 2,000-feeder runs left 2.2 to 2.4 GiB resident beyond what
+the stores were charged (about 290 MiB an arena), which a share of a quarter of the plan (1.1 GiB at
+that size) did not hold. What the allocator keeps follows the arenas and not the plan (the same ~2 GiB
+sat free after a run MLAT shed to 392 seats as after one that solved all 2,000), so the share is the
+lesser of a quarter of the plan and `ALLOCATOR_CAP_BYTES`, eight arenas of 320 MiB
+(`budget::ARENA_RETENTION_BYTES`): 2.5 GiB, where a quarter of a 32 GB relay's plan was 6.9 GB.
+Setting the mmap threshold (128 KiB, 64 KiB with a 256 KiB trim threshold) did not reduce it:
+resident was 7.05 and 7.10 GiB against 6.7 to 6.8 GiB for the same run unchanged.
+
 ## Invariants the tests hold
 1. Thread-count independence: same stamped trace at 1, 2, 8, 32 threads gives byte-identical MLAT
    models, positions, provisionals, world/precise parts, standing, regional record sequence.
@@ -819,8 +1093,8 @@ and the runtime's threads included. `budget::BASE_BYTES` was planned at 1 GiB an
 times that, and with it a relay given 1 GiB, or the public relay's 640 MiB, admitted no feeder and
 refused to start (`Budget::check`). It is 272 MiB: 256 MiB and the pool's 16 MiB
 (`noise::POOL_IDLE x MAX_MESSAGE`), above the measured 260 MiB, and safe at any load because each
-feeder's reservation (`PerFeeder::planned`, `per-feeder` in `tally-relay check`'s plan) is above the
-247 KiB the relay measured adding, which `budget`'s tests hold against the measured figure
+feeder's planned cost (`PerFeeder::planned`: its floor, `floor` in `tally-relay check`'s plan, and
+its rate's windows, "Admission") is above the 247 KiB the relay measured adding, which `budget`'s tests hold against the measured figure
 (`budget::MEASURED_GROWTH_PER_FEEDER`) rather than a size stated here.
 
 **What hosting MLAT costs** (measured 2026-10-08, `tally-load` built `-c opt`, the relay on cores
@@ -921,13 +1195,14 @@ numbering its records, applying them) was 0.144 to 0.164 of a core at 3.02 M rec
 0.144 at 4.61 M: it follows the epochs and the areas, not the receptions, so it bounds no feeder
 count.
 
-**What ten cores carry is the relay's to say, not this document's** (N15 of sweep 5). The feeders
-the cores admit and each stage's threads follow from the figures above, each record a source may
+**What ten cores carry is the relay's to say, not this document's** (N15 of sweep 5). The connections
+and the rate (`R_max`) the cores admit, the MLAT seats, and each stage's threads follow from the figures above, each record a source may
 send (`cores::Source::records_nanos`, at the dearer of an ingest worker's 30 us and the runtime's
 60 us, `cores::RUNTIME_NANOS_PER_RECORD`: a record answered on the runtime, an echo's reply signed or
 a fault proof's two records verified, costs it up to two signatures checked, measured 26.8 to
 28.1 us each), and whatever else the plan holds. They are `tally/crates/relay/tests/cores-10.txt`:
-`tally-relay check`'s cores lines for ten cores, the harness's two areas and memory to spare,
+`tally-relay check`'s cores lines (connection limit and rate with what bound them, seats, threads)
+for ten cores, the harness's two areas and 24 GB,
 hosting MLAT and not, which the `check` test (`the_cores_figures_the_rfc_quotes_are_the_relays_own`)
 prints and holds equal to what the relay plans, so a figure here can no more drift from the code
 than the file can. A figure of it copied into this document is the drift this file exists to

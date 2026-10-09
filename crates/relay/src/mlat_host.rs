@@ -124,10 +124,25 @@
 //!   falls due and finish within the forgetting's grace never sheds, so the same stamped trace
 //!   still makes the same bytes; one that does not loses provisional positions, counted, and
 //!   never a window.
-//! - **Capacity** (RFC-0181 §9). The receivers seated are the best ranked of those described
-//!   (`tally_mlat::intake::Seats`: taking part first, then a draw under the relay's secret no
-//!   feeder can choose), whichever raw shard took them and in whatever order, as many as the
-//!   relay's feeder ceiling admits (`capacity`, the same F every store is sized by). Every byte it
+//! - **Overload** (RFC-0181 §10). A window step that runs past `WINDOW_BUDGET_MS` (the models'
+//!   ripening less the steps a seal waits) is MLAT overloaded: the host cuts its seats to what
+//!   that run carries within the budget (`Host::judge`), a [`Cut`] from `CUT_LEAD_STEPS` past the
+//!   watermark, published for the relays holding the same areas ([`MlatHost::take_cuts`],
+//!   [`MlatHost::offer_cut`]). The seats at a step are the least any origin's newest cut at or
+//!   before it asks for, applied at the step like a description (`Host::apply`,
+//!   `Seats::set_cap`), and the receivers solved are the best ranked by key hash, so every relay
+//!   offered the same cuts solves the same receivers from the same step and makes the same
+//!   bytes: the cut is decided by rank and by stamp, never by how far behind one host was. The
+//!   receivers cut stay described and are counted refused (`MlatReport::receivers_refused`); a
+//!   host that cut lifts its cut the same way when its window steps run well within the budget.
+//!   The sheds of Behind remain beneath it, a bound on what is held and no longer the policy: a
+//!   host the cut keeps within its budget sheds nothing.
+//! - **Capacity** (RFC-0181 §9). MLAT has its own pool of receiver seats, the count the budget
+//!   plans from the cores and memory the stages leave (`capacity`, `Budget::mlat_seats`). The
+//!   receivers seated are the best ranked of those described (`tally_mlat::intake::Seats`:
+//!   taking part first, then a hash of the receiver's key under the fleet's seed, the same on
+//!   every relay), whichever raw shard took them and in whatever order. A receiver past the seats
+//!   is not hosted for MLAT (its raw still flows), refused at its description and counted. Every byte it
 //!   holds is charged to a store of the relay's budget before it is held ([`host_for`]), and none is
 //!   charged past its store's limit. A shard's open raw is bounded by each receiver's share of a
 //!   bin, and charged to `Open` as it grows: a byte refused refuses the batch's raw of the bin,
@@ -221,6 +236,26 @@ pub trait MlatHost: Send + Sync {
     fn gate(&self) -> Option<Arc<Gate>> {
         None
     }
+    /// A cut another relay holding the same areas published (module docs, Overload): the seats
+    /// MLAT keeps from the step it names. Offered in any order; the same cuts make the same bytes.
+    fn offer_cut(&self, _cut: Cut) {}
+    /// The cuts this host decided since the last call, in the order decided: the relay publishes
+    /// each, stamped, to every relay holding the same areas, which offer it to their hosts.
+    fn take_cuts(&self) -> Vec<Cut> {
+        Vec::new()
+    }
+}
+
+/// An overload cut (module docs, Overload): from step `from_ms` (a multiple of `STEP_MS`), the
+/// relay `origin` asks that MLAT seat only the `seats` best ranked receivers
+/// (`tally_mlat::intake::Seats`). It is a fact of the stamps, not of a clock: the seats at a step
+/// are the least any origin's newest cut at or before that step asks for, so every relay offered
+/// the same cuts seats the same receivers at the same steps and makes the same bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Cut {
+    pub from_ms: u64,
+    pub origin: PublicKey,
+    pub seats: u32,
 }
 
 /// One window step's report, as served: `tally_mlat::window::Report`, times in milliseconds.
@@ -402,6 +437,20 @@ pub struct MlatReport {
     /// New receivers refused whole, beyond the receivers the engine holds
     /// (`tally_mlat::engine::Capacity`).
     pub receivers_refused: u64,
+    /// Overload cuts this host decided (module docs, Overload), and cuts offered too late to take
+    /// effect at their step (the step was applied already: they take effect at the next).
+    pub cuts_decided: u64,
+    pub cuts_late: u64,
+    /// Cuts this relay addressed to the relays holding its areas, took from them, and refused
+    /// (`Network`; filled when the report is served).
+    pub cuts_sent: u64,
+    pub cuts_received: u64,
+    pub cuts_refused: u64,
+    /// The seats in force now: the cap an overload cut left on the seats MLAT was given.
+    pub seat_cap: u64,
+    /// The seats MLAT holds at most, and those taken now.
+    pub seat_limit: u64,
+    pub seats_taken: u64,
     /// Seals, window and provisional steps whose engine was dropped before they reported: not
     /// published.
     pub steps_discarded: u64,
@@ -415,6 +464,22 @@ pub struct MlatReport {
     pub steps_total: StepReport,
     pub provisional: ProvisionalReport,
 }
+
+/// What a window step may run for (module docs, Overload): the models' ripening less the steps a
+/// seal may wait before it, so a window step that runs no longer is solved before the provisional
+/// step that carries its models. A longer one is overload: MLAT cuts its seats.
+pub const WINDOW_BUDGET_MS: u64 = MODELS_RIPEN_MS - 3 * STEP_MS;
+/// What a cut aims a window step at: three quarters of the budget, so the step after it has room.
+pub const WINDOW_TARGET_MS: u64 = WINDOW_BUDGET_MS * 3 / 4;
+/// Steps ahead of the watermark a cut takes effect, for the relay to publish it to its peers
+/// before any of them reaches the step.
+pub const CUT_LEAD_STEPS: u64 = 5;
+/// The fewest seats a cut leaves.
+pub const MIN_CUT_SEATS: usize = 8;
+/// Origins whose cuts are kept, and cuts kept of each: a relay's peers are few, and a cut is
+/// superseded by its origin's next.
+const CUT_ORIGINS: usize = 64;
+const CUTS_PER_ORIGIN: usize = 16;
 
 /// The step clock's grid: the host steps at every multiple of it the watermark passes.
 pub const STEP_MS: u64 = 1_000;
@@ -625,12 +690,15 @@ pub fn host_for(
     .map(Some)
 }
 
-/// What the hosted engine holds: a seat for every feeder the relay's memory admits (the budget's
-/// ceiling, RFC-0181 §9: "MLAT receiver limit comes from the same F"), and the raw of that many at
-/// the measured rates, which is what the budget reserved for `Held` (`PerFeeder::planned`). No
-/// floor: seats beyond the ceiling would be raw the budget never reserved.
+/// What the hosted engine holds: MLAT's own pool of receiver seats (RFC-0181 §9, §10), the count
+/// the budget plans from the cores and memory the stages leave (`Budget::mlat_seats`), and the raw
+/// of that many at the measured rates, which is what the budget reserved for `Held`
+/// (`PerFeeder::planned`). A receiver past the seats is not hosted for MLAT (its raw still flows)
+/// and is refused at its description, counted (`MlatReport::receivers_refused`); which receivers
+/// hold the seats is decided by key-hash rank (`tally_mlat::intake::Seats`), the same on every
+/// relay holding the area. No floor: seats beyond the plan would be cores and raw it never reserved.
 pub fn capacity(budget: &Budget) -> Capacity {
-    Capacity::for_receivers(budget.ceiling())
+    Capacity::for_receivers(budget.mlat_seats())
 }
 
 /// Where in the host a test injects a delay ([`HostedMlat::delaying`]): every stage that may run
@@ -738,7 +806,7 @@ enum Finished {
     Forgotten { generation: u64 },
     /// A window step's outcome, boxed (it is far larger than the others), with the `Engine` charge
     /// of the step's working set, which holds it until it is applied (sweep 4, N17).
-    Stepped(u64, Box<window::Outcome>, Charge),
+    Stepped(u64, Box<window::Outcome>, Charge, u64),
     /// Provisional step `step_ms`'s outcome, and the batches whose notes it refused with their
     /// step's for their count, and let go as shed.
     Solved {
@@ -961,6 +1029,77 @@ struct Scope {
 struct Descriptions {
     applied_ms: Option<u64>,
     asked_ms: u64,
+}
+
+/// The overload cuts known (module docs, Overload), by the relay that decided each.
+#[derive(Default)]
+struct Cuts {
+    by_origin: BTreeMap<PublicKey, BTreeMap<u64, u32>>,
+    /// Decided here and not yet taken for publishing.
+    decided: Vec<Cut>,
+    /// The seats of the newest cut this host decided, while it holds one under the limit: only a
+    /// host that cut lifts its cut (a cut offered by a peer is the peer's to lift).
+    own: Option<u32>,
+    /// The last step whose cut was applied: one for a step at or before it takes effect at the
+    /// next (counted).
+    applied_ms: Option<u64>,
+}
+
+impl Cuts {
+    /// Takes `cut`; false when it was too late for its step (it takes effect at the next), or was
+    /// not kept for want of room.
+    fn offer(&mut self, mut cut: Cut) -> bool {
+        let mut on_time = true;
+        if let Some(applied) = self.applied_ms.filter(|applied| cut.from_ms <= *applied) {
+            cut.from_ms = applied + STEP_MS;
+            on_time = false;
+        }
+        cut.from_ms = cut.from_ms.div_ceil(STEP_MS) * STEP_MS;
+        if !self.by_origin.contains_key(&cut.origin) && self.by_origin.len() >= CUT_ORIGINS {
+            return false;
+        }
+        let entries = self.by_origin.entry(cut.origin).or_default();
+        entries.insert(cut.from_ms, cut.seats);
+        while entries.len() > CUTS_PER_ORIGIN {
+            entries.pop_first();
+        }
+        on_time
+    }
+
+    /// The seats asked for at `step_ms`: the least of each origin's newest cut at or before it,
+    /// none asking for any beyond `limit`.
+    fn seats_at(&self, step_ms: u64, limit: usize) -> usize {
+        self.by_origin
+            .values()
+            .filter_map(|entries| {
+                entries
+                    .range(..=step_ms)
+                    .next_back()
+                    .map(|(_, seats)| *seats)
+            })
+            .map(|seats| seats as usize)
+            .fold(limit, usize::min)
+            .max(MIN_CUT_SEATS.min(limit))
+    }
+
+    /// `origin`'s newest cut, if any.
+    fn newest(&self, origin: &PublicKey) -> Option<(u64, u32)> {
+        self.by_origin
+            .get(origin)
+            .and_then(|entries| entries.iter().next_back().map(|(at, seats)| (*at, *seats)))
+    }
+
+    /// Forgets what a step at `step_ms` no longer needs: each origin's cuts before its newest at
+    /// or before the step.
+    fn applied(&mut self, step_ms: u64) {
+        self.applied_ms = Some(step_ms);
+        for entries in self.by_origin.values_mut() {
+            let keep = entries.range(..=step_ms).next_back().map(|(at, _)| *at);
+            if let Some(keep) = keep {
+                *entries = entries.split_off(&keep);
+            }
+        }
+    }
 }
 
 /// A description waiting for its step, with its stamp and its charge.
@@ -1363,6 +1502,12 @@ struct Shared {
     notes_bytes_per_step: usize,
     /// What each shard's open raw is bounded by.
     limits: Limits,
+    /// The seats, shared by every raw shard, and the overload cuts that cap them (module docs).
+    seats: Arc<Seats>,
+    cuts: Mutex<Cuts>,
+    cuts_late: AtomicU64,
+    /// What a window step may run for before MLAT is overloaded: `WINDOW_BUDGET_MS`, or a test's.
+    window_budget_ms: OnceLock<u64>,
     published: Mutex<Published>,
     /// Commands sent and not yet done with; steps queued or running; asks taken.
     commands: AtomicUsize,
@@ -1859,6 +2004,10 @@ impl HostedMlat {
                 .saturating_mul(NOTES_PER_RECEIVER_STEP),
             notes_bytes_per_step: gauges.notes.limit() / INTERVALS_HELD,
             limits,
+            seats: Arc::clone(&seats),
+            cuts: Mutex::new(Cuts::default()),
+            cuts_late: AtomicU64::new(0),
+            window_budget_ms: OnceLock::new(),
             published: Mutex::new(Published::default()),
             commands: AtomicUsize::new(0),
             asks: AtomicU64::new(0),
@@ -1935,6 +2084,13 @@ impl HostedMlat {
     /// invariant 2). Set once; later calls are ignored.
     pub fn delaying(&self, delay: Delay) {
         let _ = self.shared.delay.set(delay);
+    }
+
+    /// What a window step may run for before MLAT is overloaded (module docs, Overload), in place
+    /// of `WINDOW_BUDGET_MS`: for a test that shows the cut without a window step of seconds.
+    /// Set once; later calls are ignored.
+    pub fn budgeting(&self, window_budget_ms: u64) {
+        let _ = self.shared.window_budget_ms.set(window_budget_ms);
     }
 
     /// Commands handed to the engine's thread and not yet done with, and steps queued or running:
@@ -2231,6 +2387,28 @@ impl MlatHost for HostedMlat {
         Some(Arc::clone(&self.shared.gate))
     }
 
+    fn offer_cut(&self, cut: Cut) {
+        let mut cuts = self
+            .shared
+            .cuts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !cuts.offer(cut) {
+            self.shared.cuts_late.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn take_cuts(&self) -> Vec<Cut> {
+        std::mem::take(
+            &mut self
+                .shared
+                .cuts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .decided,
+        )
+    }
+
     fn report(&self) -> MlatReport {
         let mut report = self
             .shared
@@ -2247,6 +2425,10 @@ impl MlatHost for HostedMlat {
         report.orphans_expired = shared.orphans_expired.load(Ordering::Relaxed);
         report.waiting_dropped = shared.waiting_dropped.load(Ordering::Relaxed);
         report.priority_unset = shared.priority_unset.load(Ordering::Relaxed);
+        report.cuts_late = shared.cuts_late.load(Ordering::Relaxed);
+        report.seat_cap = shared.seats.cap() as u64;
+        report.seat_limit = shared.seats.limit() as u64;
+        report.seats_taken = shared.seats.taken() as u64;
         report
     }
 }
@@ -2388,7 +2570,22 @@ impl Host {
         shared.orphans_expired.fetch_add(expired, Ordering::Relaxed);
         let mut told = Vec::new();
         let mut left = Vec::new();
-        let mut moved = Vec::new();
+        // The cut in force at this step (module docs, Overload): the same on every relay offered
+        // the same cuts. The receivers it seats or unseats settle with the descriptions'.
+        let mut moved = {
+            let mut cuts = shared
+                .cuts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let seats = cuts.seats_at(step_ms, shared.seats.limit());
+            cuts.applied(step_ms);
+            drop(cuts);
+            if seats == shared.seats.cap() {
+                Vec::new()
+            } else {
+                shared.seats.set_cap(seats)
+            }
+        };
         let at = Some(step_ms.saturating_sub(1));
         for (_, info) in &due {
             let (heard, gone, changed) = shared.describe(info, at, kept);
@@ -2669,6 +2866,74 @@ impl Host {
         });
     }
 
+    /// A window step ran `ran_ms` (module docs, Overload): longer than `WINDOW_BUDGET_MS`, MLAT
+    /// is overloaded, and cuts its seats to what that run says it carries in `WINDOW_TARGET_MS`;
+    /// seats cut and a run well within the budget, it lifts the cut the same way. Either is a cut
+    /// from `CUT_LEAD_STEPS` past the watermark, published for the relays holding the same areas
+    /// ([`MlatHost::take_cuts`]): the receivers solved are decided by rank and the stamp of the
+    /// cut, never by how far behind this host happened to be.
+    fn judge(&mut self, ran_ms: u64) {
+        let (Some(through), Some(_)) = (self.through_ms, self.engine.as_ref()) else {
+            return;
+        };
+        let seats = &self.shared.seats;
+        let (cap, taken, limit) = (seats.cap(), seats.taken(), seats.limit());
+        let own_cut = self
+            .shared
+            .cuts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .own
+            .is_some();
+        let budget = self
+            .shared
+            .window_budget_ms
+            .get()
+            .copied()
+            .unwrap_or(WINDOW_BUDGET_MS);
+        let target = budget / 4 * 3;
+        let wanted = if ran_ms > budget {
+            let carried = (taken as u128 * u128::from(target) / u128::from(ran_ms.max(1))) as usize;
+            let floor = MIN_CUT_SEATS.min(limit);
+            if taken <= floor {
+                return;
+            }
+            // At most half of them a cut: a step's cost is not in proportion to its seats (a
+            // part of it is the aircraft's, whatever the receivers), so a cut aimed at the
+            // budget in one go would undershoot; the next window step judges again.
+            carried.max(floor).max(taken / 2).min(taken - 1)
+        } else if own_cut && cap < limit && taken >= cap && ran_ms < budget / 2 {
+            let carried = (cap as u128 * u128::from(target) / u128::from(ran_ms.max(1))) as usize;
+            carried.min(limit).min(cap + cap / 4 + 1)
+        } else {
+            return;
+        };
+        if wanted == cap {
+            return;
+        }
+        let origin = self.identity.public();
+        let from_ms = (through / STEP_MS + CUT_LEAD_STEPS) * STEP_MS;
+        let cut = Cut {
+            from_ms,
+            origin,
+            seats: u32::try_from(wanted).unwrap_or(u32::MAX),
+        };
+        let mut cuts = self
+            .shared
+            .cuts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // One cut in flight at a time: the next decision waits for this one to take effect.
+        if cuts.newest(&origin).is_some_and(|(at, _)| at > through) {
+            return;
+        }
+        cuts.offer(cut);
+        cuts.decided.push(cut);
+        cuts.own = (wanted < limit).then_some(cut.seats);
+        drop(cuts);
+        self.shared.count(|counts| counts.cuts_decided += 1);
+    }
+
     /// Sheds the oldest window step queued (module docs, Behind): counted, its windows the next
     /// queued one's, which solves every window due as one that ran late would.
     fn shed_window(&mut self) {
@@ -2865,8 +3130,10 @@ impl Host {
             let messages = self.messages.clone();
             let shared = Arc::clone(&self.shared);
             self.runners.hand(&self.shared, Kind::Window, move || {
+                let started = std::time::Instant::now();
                 shared.delay(Stage::Window);
                 let outcome = job.run();
+                let ran_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
                 // The working set's charge travels with the outcome until it is applied, so a
                 // finished window waiting for the engine's thread is never outside every store
                 // (sweep 4, N17).
@@ -2874,6 +3141,7 @@ impl Host {
                     generation,
                     Box::new(outcome),
                     working,
+                    ran_ms,
                 )));
             });
         }
@@ -2934,7 +3202,9 @@ impl Host {
                 self.settle_sealed();
                 self.next_seal();
             }
-            Finished::Stepped(generation, outcome, working) if generation == self.generation => {
+            Finished::Stepped(generation, outcome, working, ran_ms)
+                if generation == self.generation =>
+            {
                 self.shared.delay(Stage::Apply);
                 if let Some(engine) = self.engine.as_mut() {
                     let (records, report, _) = engine.apply(*outcome);
@@ -2947,6 +3217,7 @@ impl Host {
                         counts.last_step = Some(step);
                     });
                     self.publish(records, None);
+                    self.judge(ran_ms);
                 }
                 self.window = None;
             }
@@ -3952,10 +4223,10 @@ mod tests {
         Ok(())
     }
 
-    /// RFC-0181 §9, "MLAT receiver limit comes from the same F": the engine seats exactly the
-    /// feeders the relay's budget admits, no floor beside it, and so holds the raw the budget
-    /// reserved for `Held` and `Open`, and the waiting receptions and window working set it
-    /// reserved for `Engine`, and no more.
+    /// RFC-0181 §9, §10: the engine seats exactly the pool the relay's budget plans for MLAT
+    /// (`Budget::mlat_seats`, at most the feeders it admits), no floor beside it, and what the
+    /// stores reserved for `Held`, `Open` and `Engine` covers the raw, waiting receptions and
+    /// window working set of the ceiling, and so of any pool within it.
     #[test]
     fn the_seats_are_the_feeder_ceiling_and_what_they_hold_is_the_stores() {
         use tally_mlat_solver::held::Rates;
@@ -3964,44 +4235,40 @@ mod tests {
             let budget = Budget::new(per_feeder.total() * feeders, per_feeder);
             assert_eq!(budget.ceiling(), feeders);
             let capacity = capacity(&budget);
-            assert_eq!(capacity.receivers, feeders);
+            // MLAT's own pool (`Budget::mlat_seats`): never more seats than feeders.
+            assert_eq!(capacity.receivers, budget.mlat_seats());
+            assert!(capacity.receivers <= feeders);
+            // The stores cover what the pool holds, at the rates the budget planned for it (the
+            // planned rate may be above the pool's: a store is sized by the rate admitted).
+            let seats = capacity.receivers.max(1);
             let cost = Rates::MEASURED.cost(SETTLE_MS);
-            assert_eq!(budget.store_bytes(Store::Held), feeders * cost.sealed);
-            // Open raw over its settling and the steps MLAT may fall behind, at its ceiling.
-            assert_eq!(
-                budget.store_bytes(Store::Open),
-                feeders * Rates::MEASURED.cost(OPEN_MS).open
-            );
+            assert!(budget.store_bytes(Store::Held) >= seats * cost.sealed);
+            // Open raw over its settling and the steps MLAT may fall behind, at its seats.
+            assert!(budget.store_bytes(Store::Open) >= seats * Rates::MEASURED.cost(OPEN_MS).open);
             assert!(Rates::MEASURED.cost(OPEN_MS).open > cost.open);
-            // The receptions waiting and a window step's working set: exactly the store.
-            assert_eq!(
-                budget.store_bytes(Store::Engine),
-                capacity.waiting() * provisional_::WAITING_BYTES
-                    + feeders * SOLVE_BYTES_PER_RECEIVER
+            // The receptions waiting and a window step's working set.
+            assert!(
+                budget.store_bytes(Store::Engine)
+                    >= capacity.waiting() * provisional_::WAITING_BYTES
+                        + seats * SOLVE_BYTES_PER_RECEIVER
             );
             // Each interval's share of the notes is what a step's count admits at the same
             // headroom: the store is every interval a host that sheds nothing holds.
             let notes = budget.store_bytes(Store::Notes);
-            assert_eq!(notes, feeders * per_feeder.notes);
             assert_eq!(notes % INTERVALS_HELD, 0);
             assert!(
                 notes / INTERVALS_HELD
-                    >= feeders * NOTES_PER_RECEIVER_STEP * std::mem::size_of::<Note>()
+                    >= seats * NOTES_PER_RECEIVER_STEP * std::mem::size_of::<Note>()
             );
             // The batches waiting for a description have their own store, split whole between
             // those waiting for one that has not come (a seat's share each, by rank) and what
             // waits for a step's descriptions: neither share is charged past, so the store never
             // refuses one by when it came.
             let orphans = budget.store_bytes(Store::Orphans);
-            assert_eq!(orphans, feeders * per_feeder.orphans);
             assert!(per_feeder.orphans > 0);
             let room = Room::of(orphans);
             assert_eq!(room.orphans + room.waiting, orphans);
-            assert!(room.orphans / capacity.receivers * capacity.receivers <= room.orphans);
-            // A seat's share holds its batches over `ORPHAN_MS` at the planned rate.
-            let planned =
-                per_feeder.orphans * ORPHAN_MS as usize / (ORPHAN_MS + WAITING_MS) as usize;
-            assert!(room.orphans / capacity.receivers + 1 >= planned, "{room:?}");
+            assert!(room.orphans / seats * seats <= room.orphans);
         }
     }
 

@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 use tally_relay::hub::{Description, Hub, Inbound, Origin};
 use tally_relay::ingest::{Stamp, Threads};
 use tally_relay::mlat_host::{
-    HostedMlat, MlatHost, MlatReport, PROVISIONAL_BEHIND, STEP_MS, Stage, WINDOW_STEPS_BEHIND,
+    Cut, HostedMlat, MlatHost, MlatReport, PROVISIONAL_BEHIND, STEP_MS, Stage, WINDOW_STEPS_BEHIND,
 };
 use tally_wire::{Identity, Location, PublicKey, ReceiverInfo, Record, Region, Regions};
 
@@ -163,6 +163,97 @@ fn mlat_run_with(
     describing: Describing,
     delays: Delays,
 ) -> Result<(Signed, MlatReport, Vec<PublicKey>)> {
+    let run = mlat_run_cuts(
+        arrivals,
+        areas,
+        threads,
+        settings,
+        describing,
+        delays,
+        Cutting::default(),
+    )?;
+    Ok((run.signed, run.report, run.held))
+}
+
+/// What a run of `mlat_run_cuts` is given to cut by: a window budget in place of the host's, and
+/// the cuts other relays published, offered before the first step.
+#[derive(Clone, Debug, Default)]
+struct Cutting {
+    budget_ms: Option<u64>,
+    offered: Vec<Cut>,
+    /// The relays' network: this relay's key and the one other relay holding its areas, and the
+    /// records that relay addressed this one, handed to the duties as a link hands them
+    /// (`Network::handle`) before the first step.
+    network: Option<Neighbours>,
+}
+
+/// Two relays holding every area of the trace, each with the other's verified offer.
+#[derive(Clone, Debug)]
+struct Neighbours {
+    me: Identity,
+    other: Identity,
+    carried: Vec<Record>,
+}
+
+/// Makes `hub` a relay `me` that takes `areas` and holds the verified offers of `me` and `other`
+/// for each, the choice and the raw links that make `other` an area's neighbour
+/// (`Selection::raw_sources`).
+fn neighbouring(hub: &Hub, me: &Identity, other: &Identity, areas: &Regions, now: u64) -> Result {
+    use tally_relay::directory::Group;
+    use tally_wire::{ProviderOffer, ProviderOfferContent, Streams};
+    let network = hub.network();
+    network.adopt_identity(me.clone());
+    network.directory.adopt_own_key(me.public());
+    network.selection.set_taken(areas.cells().to_vec());
+    for (group, relay) in [me, other].into_iter().enumerate() {
+        for cell in areas.cells() {
+            let offer = ProviderOffer::sign(
+                relay,
+                &ProviderOfferContent {
+                    address: format!("{}:7450", relay.public().to_base64url()),
+                    cell: *cell,
+                    products: Streams::RAW,
+                    stripes_of: 1,
+                    stripes: 1,
+                    mlat_cores: 8,
+                    feeder_slots: 10,
+                    network: 1 + group as u32,
+                    issued_ms: now,
+                    expires_ms: now + 600_000,
+                },
+            )
+            .map_err(text)?;
+            network
+                .directory
+                .hold_verified(offer, Group::V4(group as u16), now)?;
+        }
+    }
+    Ok(())
+}
+
+/// A run's records, report, the receivers whose raw it held, and the cuts it decided.
+struct Run {
+    signed: Signed,
+    report: MlatReport,
+    held: Vec<PublicKey>,
+    cuts: Vec<Cut>,
+    /// The cuts as the relay addressed them to its neighbour (`Network::publish_cuts`), signed.
+    sent: Vec<Record>,
+    /// Cuts the relay took from its neighbour and refused (`Network::cuts`).
+    network_cuts: (u64, u64, u64),
+}
+
+/// As `mlat_run_with`, under `cutting`.
+#[allow(clippy::too_many_arguments)]
+fn mlat_run_cuts(
+    arrivals: &[(u64, Record)],
+    areas: &Regions,
+    threads: Threads,
+    settings: tally_mlat::engine::Settings,
+    describing: Describing,
+    delays: Delays,
+    cutting: Cutting,
+) -> Result<Run> {
     let hub = Arc::new(Hub::clocked(8, Arc::new(|| 0)).staged(threads)?);
     let host = Arc::new(HostedMlat::new(
         Identity::from_seed([5; 32]),
@@ -194,9 +285,30 @@ fn mlat_run_with(
         }
         Delays::None => {}
     }
+    if let Some(budget_ms) = cutting.budget_ms {
+        host.budgeting(budget_ms);
+    }
+    for cut in &cutting.offered {
+        host.offer_cut(*cut);
+    }
     hub.network()
         .host_mlat(Arc::clone(&host) as Arc<dyn MlatHost>);
     host.set_areas(areas.clone(), Vec::new());
+    let now = tally_relay::network::wall_ms();
+    if let Some(neighbours) = &cutting.network {
+        neighbouring(&hub, &neighbours.me, &neighbours.other, areas, now)?;
+        let asker = tally_relay::network::Asker {
+            role: tally_relay::network::AskerRole::Relay,
+            key: neighbours.other.public(),
+            source: 77,
+            loopback: true,
+            address: None,
+        };
+        for record in &neighbours.carried {
+            hub.network()
+                .handle(&hub, &asker, record.clone(), now, None);
+        }
+    }
     describe_all(&hub, arrivals, describing)?;
     let first = arrivals.first().map(|(at, _)| *at).ok_or("no raw")?;
     let until = arrivals.last().map_or(0, |(at, _)| *at) + 60_000;
@@ -333,7 +445,26 @@ fn mlat_run_with(
         .collect();
     held.sort_unstable();
     held.dedup();
-    Ok((encoded(&published), host.report(), held))
+    let cuts = host.take_cuts();
+    let mut sent = Vec::new();
+    if cutting.network.is_some() {
+        hub.network().publish_cuts(cuts.clone(), now);
+        sent = hub
+            .network()
+            .sharing
+            .take_outbox()
+            .into_iter()
+            .map(|addressed| addressed.record)
+            .collect();
+    }
+    Ok(Run {
+        signed: encoded(&published),
+        report: host.report(),
+        held,
+        cuts,
+        sent,
+        network_cuts: hub.network().cuts(),
+    })
 }
 
 /// Records as bytes, in order: provisional positions, and the rest.
@@ -694,6 +825,353 @@ fn a_window_step_that_runs_long_changes_no_provisional_byte() -> Result {
     assert_eq!(
         signed.1, reference.1,
         "models and positions differ from the reference"
+    );
+    Ok(())
+}
+
+/// The receivers of a trace, and settings seating all of them with room to spare.
+type CutTrace = (
+    Vec<(u64, Record)>,
+    Regions,
+    usize,
+    tally_mlat::engine::Settings,
+);
+
+fn cut_trace() -> Result<CutTrace> {
+    use tally_mlat::replay::{arrivals, scenario};
+    let mut simulation = tally_mlat_solver::sim::run(&scenario(17, 60.0));
+    let delivered = arrivals(&mut simulation, 3)?;
+    let areas = mlat_areas()?;
+    let receivers = delivered
+        .iter()
+        .filter(|(_, record)| matches!(record, Record::ReceiverInfo(_)))
+        .count();
+    let settings = tally_mlat::engine::Settings {
+        capacity: tally_mlat::engine::Capacity {
+            receivers: receivers + 2,
+            rates: tally_mlat_solver::held::Rates::MEASURED,
+        },
+        ..mlat_settings(2)
+    };
+    Ok((delivered, areas, receivers, settings))
+}
+
+/// RFC-0181 §10, the cut by key rank: two relays holding one area, offered one published cut
+/// (from a step, so many seats), solve the same receivers from that step whatever order their
+/// descriptions came in, on any threads, with delays or none, and make the same bytes; the
+/// receivers cut are the worst ranked, counted; and the cut changes the bytes (it is not vacuous).
+/// Before, the seats were drawn under each process's own secret and a host's cut was how far
+/// behind it was, which no other relay could share.
+#[test]
+fn two_relays_offered_one_cut_solve_the_same_receivers_and_make_the_same_bytes() -> Result {
+    let (delivered, areas, receivers, settings) = cut_trace()?;
+    let first = delivered.first().map(|(at, _)| *at).ok_or("no raw")?;
+    const CUT: usize = 2;
+    assert!(
+        receivers >= CUT + tally_relay::mlat_host::MIN_CUT_SEATS,
+        "{receivers} receivers"
+    );
+    let cut = Cut {
+        from_ms: (first + 20_000) / STEP_MS * STEP_MS,
+        origin: Identity::from_seed([9; 32]).public(),
+        seats: (receivers - CUT) as u32,
+    };
+    let run = |ingest: usize, describing: Describing, delays: Delays, offered: Vec<Cut>| {
+        mlat_run_cuts(
+            &delivered,
+            &areas,
+            Threads {
+                ingest,
+                message: ingest,
+                seal: ingest,
+            },
+            settings.clone(),
+            describing,
+            delays,
+            Cutting {
+                budget_ms: None,
+                offered,
+                network: None,
+            },
+        )
+    };
+    let relay_a = run(
+        1,
+        Describing::Before { reversed: false },
+        Delays::None,
+        vec![cut],
+    )?;
+    let relay_b = run(
+        8,
+        Describing::Before { reversed: true },
+        Delays::Seeded(6),
+        vec![cut],
+    )?;
+    let relay_c = run(2, Describing::Racing { seed: 4 }, Delays::None, vec![cut])?;
+    let uncut = run(
+        1,
+        Describing::Before { reversed: false },
+        Delays::None,
+        Vec::new(),
+    )?;
+    for (name, relay) in [("a", &relay_a), ("b", &relay_b), ("c", &relay_c)] {
+        assert_eq!(
+            relay.report.seat_cap,
+            (receivers - CUT) as u64,
+            "{name}: {:?}",
+            relay.report
+        );
+        assert_eq!(relay.report.receivers_refused, CUT as u64, "{name}");
+        assert_eq!(
+            (
+                relay.report.steps_shed,
+                relay.report.provisional_steps_shed,
+                relay.report.cuts_late
+            ),
+            (0, 0, 0),
+            "{name}: {:?}",
+            relay.report
+        );
+        assert!(
+            relay.cuts.is_empty(),
+            "{name} decided a cut of its own: {:?}",
+            relay.cuts
+        );
+    }
+    assert_eq!(uncut.report.seat_cap, (receivers + 2) as u64);
+    assert_eq!(uncut.report.receivers_refused, 0);
+    assert!(!relay_a.signed.0.is_empty(), "no provisional positions");
+    assert_eq!(relay_a.signed, relay_b.signed, "relays a and b differ");
+    assert_eq!(relay_a.signed, relay_c.signed, "relays a and c differ");
+    assert_ne!(relay_a.signed, uncut.signed, "the cut changed nothing");
+    Ok(())
+}
+
+/// RFC-0181 §10, overload: a host whose window step runs past its budget cuts its seats to what
+/// that run carries within the budget, from a step a few ahead of its watermark, published for its
+/// peers (`take_cuts`); and a peer that is offered that cut makes the same bytes as the host did,
+/// receiver for receiver, though it never ran long. Before, the host shed the steps it was behind
+/// on, by how far behind it was, and no peer could shed the same.
+#[test]
+fn an_overloaded_host_cuts_by_rank_and_a_peer_offered_the_cut_makes_the_same_bytes() -> Result {
+    let (delivered, areas, receivers, settings) = cut_trace()?;
+    let threads = Threads {
+        ingest: 2,
+        message: 2,
+        seal: 2,
+    };
+    // Every window step is held 600 ms against a budget of 200: overload at the first.
+    let overloaded = mlat_run_cuts(
+        &delivered,
+        &areas,
+        threads,
+        settings.clone(),
+        Describing::Before { reversed: false },
+        Delays::Windows {
+            held_ms: 600,
+            behind: 10,
+        },
+        Cutting {
+            budget_ms: Some(200),
+            offered: Vec::new(),
+            network: None,
+        },
+    )?;
+    assert!(
+        !overloaded.cuts.is_empty(),
+        "no cut: {:?}",
+        overloaded.report
+    );
+    assert_eq!(
+        overloaded.report.cuts_decided,
+        overloaded.cuts.len() as u64,
+        "{:?}",
+        overloaded.cuts
+    );
+    for cut in &overloaded.cuts {
+        assert_eq!(cut.from_ms % STEP_MS, 0, "{cut:?}");
+        assert!(
+            cut.seats as usize >= tally_relay::mlat_host::MIN_CUT_SEATS,
+            "{cut:?}"
+        );
+        assert!((cut.seats as usize) < receivers, "{cut:?}");
+    }
+    // Nothing was shed by lateness: the cut came before it was needed.
+    assert_eq!(
+        (
+            overloaded.report.steps_shed,
+            overloaded.report.provisional_steps_shed,
+            overloaded.report.provisional_models_late,
+        ),
+        (0, 0, 0),
+        "{:?}",
+        overloaded.report
+    );
+    assert!(overloaded.report.seat_cap < (receivers + 2) as u64);
+    let peer = mlat_run_cuts(
+        &delivered,
+        &areas,
+        Threads {
+            ingest: 8,
+            message: 8,
+            seal: 8,
+        },
+        settings.clone(),
+        Describing::Before { reversed: true },
+        Delays::Seeded(7),
+        Cutting {
+            budget_ms: None,
+            offered: overloaded.cuts.clone(),
+            network: None,
+        },
+    )?;
+    assert_eq!(peer.report.seat_cap, overloaded.report.seat_cap);
+    assert_eq!(
+        peer.report.receivers_refused,
+        overloaded.report.receivers_refused
+    );
+    assert_eq!(peer.signed, overloaded.signed, "the peer differs");
+    let uncut = mlat_run_cuts(
+        &delivered,
+        &areas,
+        threads,
+        settings,
+        Describing::Before { reversed: false },
+        Delays::None,
+        Cutting::default(),
+    )?;
+    assert_ne!(uncut.signed, overloaded.signed, "the cut changed nothing");
+    Ok(())
+}
+
+/// RFC-0181 §10, the cut on the wire: relay A, overloaded, signs the cut it decided and addresses it
+/// to relay B, which holds the same areas (`Network::publish_cuts`); B takes it from A as a link
+/// hands it (`Network::handle`) and, though it never ran long, applies the same cut at the same
+/// step, so it solves the same receivers and makes the same bytes as A did. A cut from a key that
+/// is not the sender's, or from a relay holding none of B's areas, is refused and counted, and
+/// changes nothing.
+#[test]
+fn an_overloaded_relays_cut_reaches_the_relay_holding_its_area_and_both_make_the_same_bytes()
+-> Result {
+    let (delivered, areas, receivers, settings) = cut_trace()?;
+    let relay_a = Identity::from_seed([6; 32]);
+    let relay_b = Identity::from_seed([7; 32]);
+    let stranger = Identity::from_seed([8; 32]);
+    let threads = Threads {
+        ingest: 2,
+        message: 2,
+        seal: 2,
+    };
+    let overloaded = mlat_run_cuts(
+        &delivered,
+        &areas,
+        threads,
+        settings.clone(),
+        Describing::Before { reversed: false },
+        Delays::Windows {
+            held_ms: 600,
+            behind: 10,
+        },
+        Cutting {
+            budget_ms: Some(200),
+            offered: Vec::new(),
+            network: Some(Neighbours {
+                me: relay_a.clone(),
+                other: relay_b.clone(),
+                carried: Vec::new(),
+            }),
+        },
+    )?;
+    assert!(!overloaded.cuts.is_empty(), "{:?}", overloaded.report);
+    // One signed record per cut, to the one neighbour, each saying what the host decided.
+    assert_eq!(overloaded.sent.len(), overloaded.cuts.len());
+    assert_eq!(overloaded.network_cuts.0, overloaded.cuts.len() as u64);
+    for (record, cut) in overloaded.sent.iter().zip(&overloaded.cuts) {
+        let Record::MlatCut(signed) = record else {
+            return Err(format!("sent {record:?}"));
+        };
+        signed.verify().map_err(text)?;
+        assert_eq!(signed.signer().map_err(text)?, relay_a.public());
+        let content = signed.content().map_err(text)?;
+        assert_eq!((content.from_ms, content.seats), (cut.from_ms, cut.seats));
+        // And it travels as a record does.
+        let mut bytes = Vec::new();
+        record.encode(&mut bytes).map_err(text)?;
+        assert_eq!(
+            Record::decode(&bytes).map_err(text)?.0.as_ref(),
+            Some(record)
+        );
+    }
+    let peer = |carried: Vec<Record>, threads: usize, delays: Delays| {
+        mlat_run_cuts(
+            &delivered,
+            &areas,
+            Threads {
+                ingest: threads,
+                message: threads,
+                seal: threads,
+            },
+            settings.clone(),
+            Describing::Before { reversed: true },
+            delays,
+            Cutting {
+                budget_ms: None,
+                offered: Vec::new(),
+                network: Some(Neighbours {
+                    me: relay_b.clone(),
+                    other: relay_a.clone(),
+                    carried,
+                }),
+            },
+        )
+    };
+    let relay_b_run = peer(overloaded.sent.clone(), 8, Delays::Seeded(7))?;
+    assert_eq!(
+        relay_b_run.network_cuts,
+        (0, overloaded.cuts.len() as u64, 0),
+        "{:?}",
+        relay_b_run.report
+    );
+    assert_eq!(relay_b_run.report.cuts_late, 0);
+    assert_eq!(relay_b_run.report.seat_cap, overloaded.report.seat_cap);
+    assert_eq!(
+        relay_b_run.report.receivers_refused,
+        overloaded.report.receivers_refused
+    );
+    assert_eq!(
+        relay_b_run.signed, overloaded.signed,
+        "relay b differs from the overloaded relay a"
+    );
+    assert!(overloaded.report.seat_cap < (receivers + 2) as u64);
+    // The same cut signed by a key that is not the relay that sent it, or sent by a relay that
+    // holds none of its areas, is refused: B solves everything it is given, as with no cut.
+    let forged: Vec<Record> = overloaded
+        .cuts
+        .iter()
+        .map(|cut| {
+            tally_wire::MlatCut::sign(
+                &stranger,
+                &tally_wire::MlatCutContent {
+                    from_ms: cut.from_ms,
+                    seats: cut.seats,
+                },
+            )
+            .map(Record::MlatCut)
+            .map_err(text)
+        })
+        .collect::<Result<_>>()?;
+    let refused = peer(forged, 2, Delays::None)?;
+    assert_eq!(
+        refused.network_cuts,
+        (0, 0, overloaded.cuts.len() as u64),
+        "{:?}",
+        refused.report
+    );
+    assert_eq!(refused.report.seat_cap, (receivers + 2) as u64);
+    assert_eq!(refused.report.receivers_refused, 0);
+    assert_ne!(
+        refused.signed, overloaded.signed,
+        "a refused cut changed things"
     );
     Ok(())
 }

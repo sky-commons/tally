@@ -907,6 +907,10 @@ pub struct Publishing {
     pub checking: Checking,
     /// How each candidate is measured each round: `probe::measure`.
     pub prober: Prober,
+    /// The local address its sessions connect from, when one is chosen (`None`: the system's
+    /// choice, as a feeder always runs). A load harness gives each simulated feeder its own, so a
+    /// relay sees the many networks real feeders come from.
+    pub source_address: Option<IpAddr>,
 }
 
 /// One session the publisher keeps.
@@ -927,6 +931,7 @@ struct Publisher {
     checker: DeliveryChecker,
     checking: Checking,
     prober: Prober,
+    source_address: Option<IpAddr>,
     area: Option<Region>,
     ledger: Arc<Ledger>,
     selection: BandRendezvous,
@@ -954,6 +959,7 @@ pub async fn run(publishing: Publishing) {
         checker: publishing.checker,
         checking: publishing.checking,
         prober: publishing.prober,
+        source_address: publishing.source_address,
         area,
         ledger: Arc::new(Ledger::default()),
         selection: BandRendezvous::new(),
@@ -1367,6 +1373,7 @@ impl Publisher {
             ceiling: self.ceiling,
             area: self.area,
             wanted: Arc::clone(&self.wanted),
+            source_address: self.source_address,
         };
         let identity = self.identity.clone();
         let batches = self.batches.subscribe();
@@ -1411,6 +1418,28 @@ struct Context {
     area: Option<Region>,
     /// The relays' wanted ceilings the batcher sheds to: this session's statement is one.
     wanted: Arc<WantedCeilings>,
+    /// The local address to connect from (`Publishing::source_address`).
+    source_address: Option<IpAddr>,
+}
+
+/// Connects to `address` from `from` when one is chosen, else as the system chooses.
+async fn dial(address: &str, from: Option<IpAddr>) -> std::io::Result<TcpStream> {
+    let Some(from) = from else {
+        return TcpStream::connect(address).await;
+    };
+    let mut last = None;
+    for target in tokio::net::lookup_host(address).await? {
+        let socket = match target {
+            std::net::SocketAddr::V4(_) => tokio::net::TcpSocket::new_v4()?,
+            std::net::SocketAddr::V6(_) => tokio::net::TcpSocket::new_v6()?,
+        };
+        socket.bind(std::net::SocketAddr::new(from, 0))?;
+        match socket.connect(target).await {
+            Ok(stream) => return Ok(stream),
+            Err(error) => last = Some(error),
+        }
+    }
+    Err(last.unwrap_or_else(|| std::io::Error::other("no address")))
 }
 
 /// One session with a relay: how it ended, and how long it was up (none if it never was).
@@ -1421,12 +1450,16 @@ async fn session(
     up: impl FnOnce(),
 ) -> (Result<Outcome, String>, Option<Duration>) {
     let relay = &context.relay;
-    let stream =
-        match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(&relay.address)).await {
-            Ok(Ok(stream)) => stream,
-            Ok(Err(error)) => return (Err(error.to_string()), None),
-            Err(_) => return (Err("connect timed out".to_owned()), None),
-        };
+    let stream = match tokio::time::timeout(
+        CONNECT_TIMEOUT,
+        dial(&relay.address, context.source_address),
+    )
+    .await
+    {
+        Ok(Ok(stream)) => stream,
+        Ok(Err(error)) => return (Err(error.to_string()), None),
+        Err(_) => return (Err("connect timed out".to_owned()), None),
+    };
     let session = match noise::connect(stream, identity, &relay.key, Role::Feeder).await {
         Ok(session) => session,
         Err(tally_wire::WireError::Refused {
@@ -2209,6 +2242,7 @@ mod tests {
                     Ok(probed)
                 })
             },
+            source_address: None,
         }));
         let sending = tokio::spawn(async move {
             for sequence in 0.. {
@@ -2284,6 +2318,7 @@ mod tests {
             ceiling: 64_000,
             area: None,
             wanted: Arc::default(),
+            source_address: None,
         }
     }
 
@@ -2604,6 +2639,7 @@ mod tests {
                     Ok(probed)
                 })
             },
+            source_address: None,
         }));
         let sending = tokio::spawn(async move {
             for sequence in 0.. {
@@ -2684,6 +2720,7 @@ mod tests {
                     probe::probe(&relay, &me).await
                 })
             },
+            source_address: None,
         }));
         let sending = tokio::spawn(async move {
             for sequence in 0.. {

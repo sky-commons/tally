@@ -32,6 +32,7 @@ pub mod products;
 pub mod seal;
 pub mod selection;
 pub mod sharing;
+pub mod shed;
 pub mod standing;
 pub mod stations;
 pub mod stats;

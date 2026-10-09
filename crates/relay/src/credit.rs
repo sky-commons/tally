@@ -471,6 +471,13 @@ impl Credit {
         );
     }
 
+    /// Whether `receiver` stands corroborated here at `now_ms` (`corroborate_receiver`, not yet
+    /// lapsed): the receivers the ingest rate (`shed`) gives a share of their own, where every
+    /// other is held to its network group's.
+    pub fn corroborated_receiver(&self, receiver: &PublicKey, now_ms: u64) -> bool {
+        corroborated(&self.state().corroborated_receivers, receiver, now_ms)
+    }
+
     /// A relay this relay corroborated first-hand (a sharing peer it dealt with): only such a
     /// relay's receipts earn the relay it signed them for any credit here.
     pub fn corroborate_relay(&self, relay: PublicKey, now_ms: u64) {

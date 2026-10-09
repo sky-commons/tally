@@ -239,6 +239,20 @@ impl ReceptionCeilings {
     }
 }
 
+/// The receptions a second (all of them, wanted or not) one source's share of the relay's rate is
+/// at most (`shed`): its wanted ceiling ([`FEEDER_RECEPTIONS_PER_SEC`]) over the wanted share of
+/// what a planned feeder hears (360 of its 600, `budget::PLANNED_RECEPTIONS_PER_SEC`).
+pub const SOURCE_RECEPTIONS_PER_SEC: u64 = FEEDER_RECEPTIONS_PER_SEC
+    * PLANNED_RECEPTIONS_PER_SEC as u64
+    / PLANNED_WANTED_RECEPTIONS_PER_SEC;
+/// The wanted receptions a second of a planned feeder's 600 (`tally_wire::modes::wanted_reception`).
+pub const PLANNED_WANTED_RECEPTIONS_PER_SEC: u64 = 360;
+
+/// The cores this host gives the process (`std::thread::available_parallelism`), at least one.
+pub fn host_cores() -> usize {
+    std::thread::available_parallelism().map_or(1, std::num::NonZero::get)
+}
+
 /// How fast, and how far ahead, one session of a role may send records: `per_minute` a minute,
 /// and `burst` at once from rest. What the cores plan for a session is its `per_minute`
 /// (`cores::Sessions`); its `burst` is what its role legitimately sends at once (with its Hello,
