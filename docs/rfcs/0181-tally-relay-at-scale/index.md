@@ -894,10 +894,17 @@ threads, MLAT's seats and `tally-relay check` all read its `Admission`):
    sharing keeps push-back and never refuses a member's batch for room: the room is sized for the
    rate ingest admits.
 4. **Rate shedding only at ingest, before signing** (`shed`, Writer B): a relay-wide token bucket on
-   `R_max` beside the per-receiver pace. Over demand a source's allowance is its max-min fair share
-   of `R_max`, weighted by its credit or its network group so N Sybil keys do not hold N shares; the
-   source furthest over its share is cut first, ties by key-hash rank, judged by the batch's own
-   stamps, local to the ingesting relay and before sharing, so no cross-relay agreement is needed.
+   `R_max` beside the per-receiver pace. **Nothing is shed while total demand is within `R_max`**,
+   whatever the layout of the sources: 20,000 feeders behind one /16 are cut for nothing while the
+   relay has room. Only over demand does max-min fair sharing apply, across sources (a receiver
+   this relay corroborated, else its network group), each source's share equal (so N Sybil keys in
+   one group hold one share, not N), water-filling the room the sources under their share leave;
+   the source furthest over its share is cut first, ties by key-hash rank, judged by the batch's
+   own stamps, local to the ingesting relay and before sharing, so no cross-relay agreement is
+   needed. The wanted-reception ceiling a feeder is told (1,800 a second, per receiver) is the
+   pace of a receiver and holds always; it is not a cap on a group. Before, a source without
+   corroboration was capped at one source ceiling (3,000 a second) whatever room the relay had, so
+   honest feeders sharing a /16 were cut at 2 M a second against an `R_max` of 12.47 M.
    `tally-load` connects each simulated feeder from an address of its own across 127.0.0.0/8 (Linux
    routes all of it to loopback; 256 network groups, `--feeder-networks many`, the default on
    loopback), so a run measures honest feeders; before, all of them came from 127.0.0.1, one group
@@ -977,7 +984,8 @@ off). The plan for 20,000 feeders is 19 cores: `check --cores 16` admits 17,324 
 the harness on the other 13 cores, a watchdog killing only the harness if `MemAvailable` fell under
 10 GB (it never did). Three things the run found:
 
-1. **The harness cannot make 600 receptions a second for 20,000 feeders on 13 cores.** Its
+1. **The harness could not make 600 receptions a second for 20,000 feeders on 13 cores** (fixed
+   the same day, "The harness at 12 M a second" below; this is what the first run found). Its
    simulation is one thread a cluster and made seconds at about 0.4 of real time at 10,000
    receivers a cluster (the feeders were offered nothing from the 30th second); with `--replay 4`
    (traffic for 5,000 receivers, four feeders on each) the harness itself took 11.2 of its 13
@@ -985,7 +993,10 @@ the harness on the other 13 cores, a watchdog killing only the harness if `MemAv
    (4,700 held at 90 s), so that run is not a measure of the relay. The RFC's 5,000-feeder runs
    used 22 harness cores. What the plan's 12 M receptions a second would cost is therefore not
    measured here: the per-batch and per-reception costs above are.
-2. **An MLAT-off relay corroborates nobody, so every feeder is charged to its network group.**
+2. **An MLAT-off relay corroborates nobody, so every feeder was charged to its network group, and
+   a group was capped at one source ceiling** (fixed the same day: Admission item 4 now sheds
+   nothing while demand is within `R_max`, and a group is one share of the room only past it; what
+   follows is what the run found).
    `credit::corroborate_receiver` is called only for receivers with standing, which needs the
    hosted MLAT's verified fixes (`Standing::agreeing`); `shed` therefore gives every receiver of a
    relay without MLAT the share of its /16, which it caps at one source ceiling (3,000 receptions
@@ -1005,6 +1016,69 @@ the harness on the other 13 cores, a watchdog killing only the harness if `MemAv
 3. **Handshakes and the floor held.** 20,000 feeders started over 120 s: 46,151 handshakes begun (a
    feeder's probe and its session), 74 in flight at the most against the cap of 4,750 and a planned
    pace of 47,500 a second, and 19,594 feeders held at the end with none turned away.
+
+**The harness at 12 M a second, and the baseline it gave** (2026-10-09, after the two findings
+above; the relay `taskset -c 0-18`, `check --cores 19` (20,781 admitted), `--memory 30G`, MLAT off,
+the harness on cores 19 to 31 with a watchdog that kills only its pid under 10 GB of `MemAvailable`,
+20,000 feeders at 600 receptions a second, `bazel`-equivalent `-c opt` builds).
+
+*Profile first* (`perf record -g` of the harness at 20,000 feeders, 13 cores, symbols and frame
+pointers on). Before: DEFLATE at level 6 was 43% to 50% of all harness CPU (about half a
+millisecond a batch of 860 receptions); ed25519 signing 7%; the simulation, one serial stream of
+draws on one thread a cluster, tested every receiver in a wide block of cells against each
+transmission, each pair with a `sincos` for the receiver's local vertical, and made 0.4 of real time
+(44.7 s to calibrate; a heard reception cloned its message); a reception cost the feeder a channel
+message, two clock reads and a wakeup (about 20% of the harness with the allocation beside it).
+What was changed, by what the profile showed:
+
+1. **The sky is made by hash, on any thread** (`sim::World::hear`): every draw is keyed by the seed,
+   the transmission and the receiver, so a transmission's receptions come from any thread and a
+   shard makes only its own receivers' (the process with the subscriber also counts the rest,
+   `Traffic::build_for`); the receivers' index is a 0.5 degree grid, the vertical is kept, a
+   heard reception is one 24-byte record with no clone. `sim::run` is unchanged (same draws, same
+   receptions: its tests pass over the new index). Calibration 44.7 s to 7.4 s; the same 648
+   receptions a second in reach, 0.926 kept, 58,843 transmissions a second heard by 206.4. The
+   simulation is now under 2% of the harness at 12 M a second, and `--shard i/n` divides it with the
+   feeders (before, every shard simulated the whole world).
+2. **DEFLATE at level 2** (`--deflate-level`, default 2; 0 is the wire's 6): 13.6 bytes a reception
+   against 13.4, a quarter of the time. Level 1 is 15.0 bytes, which at 12 M a second is 180 MB/s
+   against `R_max`'s 170 MB/s of bytes, so it would shed for bytes and confound the run. The wire's
+   level for the feeder itself is unchanged (`Codec::DeflateAt` is only the harness's).
+3. **A read's frames are one message** (`Inputs::offer_frames`, `Batcher::take_frames`; the product
+   reader uses them too): one channel message and one clock read for the frames one read of the
+   decoder's port gave, the backlog still counted in receptions.
+4. **The instruments get their cores.** The client runs on a thread and runtime of its own and the
+   feeders' runtime threads at nice 5 (`lower_priority`): with thousands of feeders asking for more
+   cores than there are, a client in the same runtime waited behind them and the relay dropped it
+   as too slow, and a simulation that fell behind starved the feeders it fed.
+   `--client-sample N` decodes one raw batch in N (the rest are counted from their own count and
+   followed by sequence), and the client's message ids are no longer SipHash twice a reception.
+
+*Result.* The harness offers 11.9 to 12.0 M receptions a second (the plan's 12.0 M) from all
+20,000 feeders, 10.0 to 11.2 of its 13 cores, the simulation never behind, 20,000 held by 190 s.
+With a deduplicated-only client (`--streams dedup`) the relay carried 11.95 M a second for about
+200 s steadily (9.0 cores mean, 2.2 to 2.5 GB resident, `check`'s budget 30.7 GB) before the host
+itself stalled the harness (the box's swap was full and its other tenants take 2 to 3 of those 13
+cores). What one box cannot hold is the harness and a client that reads and decodes the whole raw
+stream at once: about 0.7 cores per million receptions a second for the feeders and 0.25 for the
+client, 12 to 13 cores in all. At 16,000 feeders and 9.2 to 9.9 M a second the raw client held
+(p50 2 to 6 ms, p99 316 to 490 ms, p99.9 0.9 to 1.0 s, no batch missing); at 20,000 and 12 M it
+read 11.0 to 11.3 M a second with raw at most 1.5 s for 70 s, then fell behind (in four runs, from
+70 to 100 s after full load: the relay's ingest, epoch and buffer stores reached their planned
+limits, resident memory rose to 5.5 GB, and the relay dropped the client as too slow, `goodbye
+FellBehind`), so a 180 s window at full load reads p50 3 to 5 s, p99 60 s and is not a measure. A
+clean 180 s of raw latency at 12 M a second needs the client on its own box (`--no-feeders`
+against the same relay, `--shard i/n` for the feeders) or about 4 more cores.
+
+*What the shedder cut.* Only `over_share`; none for a receiver's pace and none for `R_max` itself.
+Over a whole run 9,143 batches (5.3 M receptions, about 0.2%), 112,127 and 178,940 (2% to 3.5%) in
+the other two long ones. In the one run polled every 5 s the cuts came in two moments, 1,062 batches
+as the last feeders connected (their backlogs of up to 64 batches arrive at once, above `R_max`) and
+8,000 as the client collapsed and the harness caught up (an interval offered 12.8 to 13.0 M against
+`R_max`'s 12.47 M); between them nothing. The other two runs had intervals of 12.6 to 13.0 M
+offered the same way and only their totals were read, so the same cause is likely there and not
+shown. The relay running at 96% of `R_max` is cut by any burst above it, which the rule says it
+should be.
 
 **Rate per stage, per batch.** Ingest took 1.14 cores for 19,500 batches and 650,000 receptions a
 second: about 58 us a batch with the receptions beside it, the signature and the hash being most of

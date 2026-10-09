@@ -5,7 +5,6 @@
 //! held in the relay's fan-out.
 
 use std::collections::{HashMap, HashSet};
-use std::hash::{Hash as _, Hasher as _};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex};
@@ -80,8 +79,31 @@ counts!(
 pub struct Heard {
     /// Bumped when a window begins: a decoder's own messages of an older window are let go.
     pub window: AtomicU64,
-    pub raw: Mutex<HashSet<u64>>,
-    pub dedup: Mutex<HashSet<u64>>,
+    pub raw: Mutex<Ids>,
+    pub dedup: Mutex<Ids>,
+}
+
+/// Message identities, which are hashes already: kept as they are, not hashed again.
+pub type Ids = HashSet<u64, std::hash::BuildHasherDefault<Passthrough>>;
+
+/// A hasher for keys that are already hashes (`message_id`).
+#[derive(Default)]
+pub struct Passthrough(u64);
+
+impl std::hash::Hasher for Passthrough {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            self.0 = self.0.rotate_left(8) ^ u64::from(*byte);
+        }
+    }
+
+    fn write_u64(&mut self, value: u64) {
+        self.0 = value;
+    }
 }
 
 impl Heard {
@@ -95,11 +117,19 @@ impl Heard {
 }
 
 /// A message's identity for `Heard`: its format and bytes, hashed.
+///
+/// Twelve million of these a second are made at the run's full rate, so it is a multiply and a
+/// fold a word, not SipHash.
 fn message_id(format: u8, data: &[u8]) -> u64 {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    format.hash(&mut hasher);
-    data.hash(&mut hasher);
-    hasher.finish()
+    let mut hash = 0x9e37_79b9_7f4a_7c15 ^ u64::from(format) ^ ((data.len() as u64) << 8);
+    for chunk in data.chunks(8) {
+        let mut word = [0u8; 8];
+        word[..chunk.len()].copy_from_slice(chunk);
+        hash = (hash ^ u64::from_le_bytes(word)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        hash ^= hash >> 31;
+    }
+    hash = (hash ^ (hash >> 30)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    hash ^ (hash >> 27)
 }
 
 /// How many batches a decoder reads before it hands its messages to `Heard`.
@@ -205,19 +235,52 @@ enum Work {
     Dedup(Batch, u64),
 }
 
-/// Reads `relay` for as long as the harness runs, reconnecting a second after a session ends.
-pub async fn run(
+/// Starts the client on a thread and runtime of its own: its session is one task that has to read
+/// a socket carrying the whole run's raw stream, and on the feeders' runtime, saturated by
+/// thousands of tasks, it waits its turn behind them and the relay drops it as too slow
+/// (`goodbye FellBehind`). A thread of its own gets the share of a core the scheduler gives any.
+pub fn start(
     relay: RelayAddress,
     streams: Streams,
     verify: bool,
     threads: usize,
+    sample: u32,
+    client: Arc<Client>,
+) {
+    let spawned = std::thread::Builder::new()
+        .name("tally-load-client".to_owned())
+        .spawn(move || {
+            match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => {
+                    runtime.block_on(run(relay, streams, verify, threads, sample, client));
+                }
+                Err(error) => eprintln!("tally-load: client runtime: {error}"),
+            }
+        });
+    if let Err(error) = spawned {
+        eprintln!("tally-load: client thread: {error}");
+    }
+}
+
+/// Reads `relay` for as long as the harness runs, reconnecting a second after a session ends.
+async fn run(
+    relay: RelayAddress,
+    streams: Streams,
+    verify: bool,
+    threads: usize,
+    sample: u32,
     client: Arc<Client>,
 ) {
     let workers: Vec<SyncSender<Work>> = (0..threads.max(1))
         .map(|_| {
             let (send, receive) = sync_channel(WAITING);
             let client = Arc::clone(&client);
-            std::thread::spawn(move || decode(&receive, verify, &client));
+            let _ = std::thread::Builder::new()
+                .name("tally-load-decode".to_owned())
+                .spawn(move || decode(&receive, verify, &client));
             send
         })
         .collect();
@@ -232,6 +295,8 @@ pub async fn run(
         workers,
         next: 0,
         newest: HashMap::new(),
+        sample: u64::from(sample.max(1)),
+        seen: 0,
     };
     loop {
         let why = session(&relay, &identity, streams, &client, &mut reading).await;
@@ -245,9 +310,19 @@ struct Reading {
     next: usize,
     /// Each receiver stream's newest sequence (receiver, boot).
     newest: HashMap<(PublicKey, u64), u64>,
+    /// One raw batch in this many is decoded (`--client-sample`); the rest are counted and
+    /// followed by sequence.
+    sample: u64,
+    seen: u64,
 }
 
 impl Reading {
+    /// Whether the next raw batch is one to decode.
+    fn sampled(&mut self) -> bool {
+        self.seen += 1;
+        self.seen.is_multiple_of(self.sample)
+    }
+
     fn hand(&mut self, work: Work, client: &Client) {
         self.next = (self.next + 1) % self.workers.len();
         if let Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) =
@@ -334,7 +409,14 @@ async fn session(
                             receivers.insert(receiver);
                         }
                     }
-                    reading.hand(Work::Raw(batch, now), client);
+                    if reading.sampled() {
+                        reading.hand(Work::Raw(batch, now), client);
+                    } else if let Ok(receptions) = batch.receptions() {
+                        // Not decoded: counted from the batch's own count, and no more.
+                        counts
+                            .raw_receptions
+                            .fetch_add(receptions as u64, Ordering::Relaxed);
+                    }
                 }
                 Record::RelayBatch(batch) => {
                     let counts = &client.counts;
@@ -376,24 +458,23 @@ async fn session(
 
 fn decode(work: &std::sync::mpsc::Receiver<Work>, verify: bool, client: &Client) {
     let counts = &client.counts;
-    let (mut raw_heard, mut dedup_heard) = (HashSet::new(), HashSet::new());
+    let (mut raw_heard, mut dedup_heard) = (Ids::default(), Ids::default());
     let mut window = client.heard.window.load(Ordering::SeqCst);
     let mut since = 0;
-    let hand_over =
-        |raw_heard: &mut HashSet<u64>, dedup_heard: &mut HashSet<u64>, window: &mut u64| {
-            let now = client.heard.window.load(Ordering::SeqCst);
-            if now == *window {
-                if let Ok(mut raw) = client.heard.raw.lock() {
-                    raw.extend(raw_heard.drain());
-                }
-                if let Ok(mut dedup) = client.heard.dedup.lock() {
-                    dedup.extend(dedup_heard.drain());
-                }
+    let hand_over = |raw_heard: &mut Ids, dedup_heard: &mut Ids, window: &mut u64| {
+        let now = client.heard.window.load(Ordering::SeqCst);
+        if now == *window {
+            if let Ok(mut raw) = client.heard.raw.lock() {
+                raw.extend(raw_heard.drain());
             }
-            raw_heard.clear();
-            dedup_heard.clear();
-            *window = now;
-        };
+            if let Ok(mut dedup) = client.heard.dedup.lock() {
+                dedup.extend(dedup_heard.drain());
+            }
+        }
+        raw_heard.clear();
+        dedup_heard.clear();
+        *window = now;
+    };
     loop {
         let work = match work.recv_timeout(Duration::from_millis(500)) {
             Ok(work) => work,
