@@ -397,32 +397,26 @@ impl<'a> WindowIndex<'a> {
         let threads = threads.clamp(1, addresses.len().max(1));
         let split = |count: usize| count.div_ceil(threads).max(1);
         // Each target's hearers and its tile at every level.
-        let candidates: Vec<Candidates> = std::thread::scope(|scope| {
-            let handles: Vec<_> = addresses
-                .chunks(split(addresses.len()))
-                .map(|chunk| {
-                    scope.spawn(move || {
-                        chunk
-                            .iter()
-                            .filter_map(|address| {
-                                let hearers = self.hearers(*address);
-                                let points: Vec<[i64; 3]> =
-                                    hearers.iter().map(|(_, mm)| *mm).collect();
-                                let median = tile::lower_median(&points)?;
-                                let tiles = (0..tile::LEVELS)
-                                    .map(|level| Tile::containing(level, median))
-                                    .collect();
-                                Some((*address, hearers, tiles))
-                            })
-                            .collect::<Vec<_>>()
+        let candidates: Vec<Candidates> = crate::gate::on_threads(
+            addresses.chunks(split(addresses.len())).collect(),
+            |chunk: &[u32]| {
+                chunk
+                    .iter()
+                    .filter_map(|address| {
+                        let hearers = self.hearers(*address);
+                        let points: Vec<[i64; 3]> = hearers.iter().map(|(_, mm)| *mm).collect();
+                        let median = tile::lower_median(&points)?;
+                        let tiles = (0..tile::LEVELS)
+                            .map(|level| Tile::containing(level, median))
+                            .collect();
+                        Some((*address, hearers, tiles))
                     })
-                })
-                .collect();
-            handles
-                .into_iter()
-                .flat_map(|handle| handle.join().unwrap_or_default())
-                .collect()
-        });
+                    .collect::<Vec<_>>()
+            },
+        )
+        .into_iter()
+        .flatten()
+        .collect();
         // Every distinct candidate's members.
         let tiles: Vec<Tile> = candidates
             .iter()
@@ -430,23 +424,18 @@ impl<'a> WindowIndex<'a> {
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect();
-        let members: BTreeMap<Tile, Vec<PublicKey>> = std::thread::scope(|scope| {
-            let handles: Vec<_> = tiles
-                .chunks(split(tiles.len()))
-                .map(|chunk| {
-                    scope.spawn(move || {
-                        chunk
-                            .iter()
-                            .map(|tile| (*tile, self.members(*tile)))
-                            .collect::<Vec<_>>()
-                    })
-                })
-                .collect();
-            handles
-                .into_iter()
-                .flat_map(|handle| handle.join().unwrap_or_default())
-                .collect()
-        });
+        let members: BTreeMap<Tile, Vec<PublicKey>> = crate::gate::on_threads(
+            tiles.chunks(split(tiles.len())).collect(),
+            |chunk: &[Tile]| {
+                chunk
+                    .iter()
+                    .map(|tile| (*tile, self.members(*tile)))
+                    .collect::<Vec<_>>()
+            },
+        )
+        .into_iter()
+        .flatten()
+        .collect();
         // The choice, by the rule.
         let mut plan = Plan {
             assignments: BTreeMap::new(),

@@ -65,6 +65,36 @@ Measured on main (tally-load, commit b3e3571809 on branch tally-load):
    MiB), planned in the budget beside the base (`Plan::oversize`). The charge travels with the batch
    until the next store holds its bytes, so the allowance is released only then.
 
+   As built: a charge borrows only its own bytes of the carve (`ingest::Lent`): while the
+   connection is open they go back to its carve when the charge is let go, and once it has ended
+   they go back to `Store::Ingest`; the rest of the carve goes back the moment the connection ends.
+   So whatever still holds a decode after its connection (orphans for 3 s, a subscriber's queue,
+   the notes, the exchange's held parts) holds the bytes it is charged and no more. Before, every
+   charge held the whole carve (some 68 KB for a feeder) until the last of them was let go: after
+   a network blip at the ceiling every reconnect was turned away for want of room for its
+   allowance until the old carves drained, and a peer reconnecting in a loop could force it.
+
+   As built: a connection's records are paced as well as its bytes (`ingest::RecordPace`, R-N12).
+   A record costs an ingest worker a strict verification whatever its size, so the allowance in
+   bytes bounds how many records wait at once (`RECORDS_IN_FLIGHT`) but not how many a second: a
+   feeder sending tiny batches within its 256 KiB/s was some 870 verifications a second, and a few
+   dozen such feeders took every worker. A feeder's records a second are its byte ceiling over
+   `RECORD_BYTES` (32 KiB: eight at the default, where an honest feeder sends at most five), a
+   member session's are the feeders the members' shared rate is worth at
+   `MEMBER_RECORDS_PER_FEEDER` (4) each, shared by every member session. Past its pace the read
+   loop waits before it takes the next record, its socket unread, as it does with its allowance
+   held: the sender is slowed, never refused. The cores plan it (§10, "The cores"): each record
+   costs `INGEST_NANOS_PER_RECORD` (30 us, measured 24 to 25 us to verify, hash and decode a tiny
+   batch), and a feeder's ingest load is the more of its planned receptions and its records a
+   second at that cost (`cores::Source`), so the ingest threads and the feeders the cores carry
+   follow `--max-feeder-bytes-per-sec`.
+
+   As built: a connection that overruns its byte ceiling is ended with `Reason::OverCeiling`, the
+   sender's abuse; `Reason::Full` says only this relay's capacity, at a member's admission. Only a
+   `Full` excuses the relay told so from its shortfalls (a dialler routes around a full provider).
+   Before, an overrun was told `Full` too, so a hostile parent that overran each child's ceiling
+   delivered nothing, was excused as full, and its children's own children reported them short.
+
    As built: each signature is verified strictly, one at a time, never by Ed25519 batch
    verification. A batch equation accepts some signatures strict verification refuses (a torsion
    component in `R` passes it one time in eight), and every reader of a relay's stream verifies
@@ -155,17 +185,21 @@ Measured on main (tally-load, commit b3e3571809 on branch tally-load):
    holds one description a receiver a step, charged, so a receiver re-signing in a loop holds one,
    and an older description never applies after a newer one. A batch is taken as its receiver
    stood when its step interval began: one stamped in an interval whose descriptions are not yet
-   applied waits in its raw shard until they are; one of a receiver not described waits for its
-   description (`intake::Orphans`, one for every raw shard, let go by the steps after
-   `intake::ORPHAN_MS`, 3 s) and is taken as the last thing of the interval before the step that
-   applies it. Both wait in `Store::Orphans`, split whole in two shares (`mlat_host::Room`): the
-   batches waiting for a description that has not come, held by rank (the best drawn receivers of
-   those that came, a seat's share each, its oldest going first), so who is held never depends on
-   arrival and the share is never charged past; and what waits for a step's descriptions, batches
-   and descriptions, over `mlat_host::WAITING_MS` (the epochs held ahead of the watermark and a
-   step), which only a host behind on its watermark passes, its excess let go and counted
-   (`waiting_dropped`). Before, both were charged to one gauge in arrival order, so which batch a
-   full store dropped was thread timing. A receiver that stops taking part keeps its raw in the
+   applied waits until they are; one of a receiver not described waits for its description
+   (`intake::Orphans`, one for every raw shard, let go by the steps after `intake::ORPHAN_MS`, 3 s)
+   and is taken as the last thing of the interval before the step that applies it: its notes
+   weighed at that step, its raw judged ahead or late by its own stamp, as the reference engine
+   judges it (before, by the stamp of the step that took it, so a feeder 1 to 4 s fast had raw the
+   reference refused kept by the host). Both wait in `Store::Orphans`, split whole in two shares
+   (`mlat_host::Room`): the batches waiting for a description that has not come, held by rank (the
+   best drawn receivers of those that came, a seat's share each, its oldest going first), so who
+   is held never depends on arrival and the share is never charged past; and what waits for a
+   step's descriptions, batches and descriptions, over `mlat_host::WAITING_MS` (the epochs held
+   ahead of the watermark and a step), which only a host behind on its watermark passes, held the
+   same way (`mlat_host::WaitingRoom`: a seat's share each, the best drawn receivers of those that
+   came), its excess let go and counted (`waiting_dropped`). Before, both were charged to one gauge
+   in arrival order, and then what waits for a step's descriptions was one pool refused batch by
+   batch as they came, so which batch a full store dropped was thread timing. A receiver that stops taking part keeps its raw in the
    bins the steps already due take, and is forgotten in every sealed bin when its window step
    starts or is shed, a bin still being sealed then included once it is held (before, a seal in
    flight when the receiver left kept it); a window step fits with the sites its descriptions
@@ -180,16 +214,26 @@ Measured on main (tally-load, commit b3e3571809 on branch tally-load):
 
    Window steps (a step's seal, then its window) and provisional steps run apart, each kind one at a
    time and in order: a window step's fits take seconds, and a provisional step waiting behind them
-   came too late for the live world. The engine's thread itself does nothing that takes long: every
-   seal, a shed step's too, runs off it, one at a time and in order (before, a shed step's seal ran
-   on it, and the steps' descriptions waited behind it). A provisional step carries the models of
-   the window steps `engine::MODELS_RIPEN_MS` (5 s) before it, in line and hosted alike; it starts
-   at its turn whether or not they have reported, without those that have not, counted
-   (`provisional_models_late`), adopting them by their stamp at the first step after they report.
-   A host whose window steps each report within the window steps it may fall behind (the ripening
-   is at least those) never starts one so, and makes the reference's bytes. Before, a provisional
-   step waited for them, and a window step running past about four seconds shed every provisional
-   step behind it. Each kind waits for the one before it up to its own limit, steps the watermark
+   came too late for the live world. The engine's thread itself does nothing that takes long and
+   wakes for a message alone: every seal, a shed step's too, and every forgetting of receivers that
+   left (those that left together in one pass, each sealed bin re-sealed once for all of them) runs
+   off it, below the stages, one at a time and in order (before, a shed step's seal ran on it, and
+   the steps' descriptions waited behind it; and an area change re-sealed every bin once a departed
+   receiver, on it, for seconds, at the stages' priority). A provisional step carries exactly the
+   models of the window steps `engine::MODELS_RIPEN_MS` (15 s) before it, by their stamp, in line
+   and hosted alike, and is shed at its turn, counted (`provisional_models_late`, and
+   `provisional_steps_shed`), if one of them has not reported: it never runs with other models, so
+   every provisional step a host runs makes the reference's bytes however long its window steps
+   ran. The ripening covers a window step on the planned threads (9 to 11 s, "MLAT in the cores")
+   and the window steps a host may fall behind, so a host within its plan never sheds one so; and a
+   model is carried 90 s past its window and refitted every stride (40 s), so fifteen seconds of it
+   are not missed. Before, the ripening was 5 s, shorter than a planned window step, and a
+   provisional step whose models had not reported started without them and adopted them at
+   whichever step came after they reported, so which models a step used, and the provisional bytes
+   of two relays of one area, were thread timing's; before that, a provisional step waited for
+   them, and a window step running past about four seconds shed every provisional step behind it.
+   `staged_mlat` holds the bytes with every window step that solves held while the watermark runs
+   ten steps past it. Each kind waits for the one before it up to its own limit, steps the watermark
    has passed and that have not started: `mlat_host::STEPS_BEHIND` (4) window steps, past which the
    oldest is shed, its bins taken at once and sealed in their turn, and
    `mlat_host::PROVISIONAL_BEHIND` (0) provisional steps, so a provisional step starts at its turn
@@ -199,7 +243,10 @@ Measured on main (tally-load, commit b3e3571809 on branch tally-load):
    receivers have come, and the step) after its first reception's stamp, and its step's run and
    its records' way to the relay that gathers the world are budgeted at
    `mlat_host::PROVISIONAL_PUBLISH_MS` (0.9 s), within `products::WORLD_SETTLE_MS` (4 s), checked at
-   compile time. Before, one step of waiting was allowed and the settling's second was left out,
+   compile time, and held: a step whose records are ready later than that after its turn has them
+   refused whole, counted (`provisional_steps_late`, its state applied all the same, so the steps
+   after it make the reference's bytes); before, nothing held it, and a step running 0.9 to 1 s
+   missed the world second unseen. Before, one step of waiting was allowed and the settling's second was left out,
    about 5.1 s at worst. The way from the transmission to its first reception's stamp (the feeder's
    batching and link) is not in it and is the world product's to allow for. So the steps MLAT is
    behind by are bounded and so is what it holds while it is: `INTERVALS_HELD` (3) step intervals
@@ -424,16 +471,30 @@ Measured on main (tally-load, commit b3e3571809 on branch tally-load):
    which a feeder's reservation holds (`Plan::connection_buffers`: those under
    `--max-connections`, the member sessions and the subscribers, each role by its own cap), the members' pool (their shared rate's feeders' worth less the buffers
    and allowances, and each member session's allowance), and what waits for the links it dials
-   to its members (`Plan::member_links`, a link's share for each member session). A relay whose budget cannot hold these and
+   to its members (`Plan::member_links`, a link's share for each member session), and the rest the
+   plan lists (`Plan::before_feeders_parts`: the one list the budget sums and `check` prints, each
+   part on its line and their sum as `before-feeders`, so a room planned is a line printed and no
+   deploy check sums a list of its own). A relay whose budget cannot hold these and
    one feeder refuses to start (`Budget::check`). `tally-relay check` makes every refusal a start
    makes, along the start's own path, and prints the memory plan (the member sessions, each one's
    share, their rate's feeders and pool, the headroom); the packaged unit is held to it by
    `//tally/crates/relay:check`, with no area and with a base cell taken, and an operator holds its
    own deploy to it the same way (ours: `//infra/tally:relay_config_test`, which also holds that a
    relay taking areas plans their members and one taking none plans none). The gauges are served on
-   `GET /memory`, beside the decoded batches alive and what the stores holding them are charged
+   `GET /memory`, beside the decoded batches alive and those some store's charge covers
    (`Budget::decoded_held`): a charge cannot pass its gauge's limit, so the one way past the budget
-   is a holder no gauge charges, and that is what the two read together show.
+   is a holder no gauge charges, and that is what the two read together show. Beside them it
+   serves the batch store's own count of what the sharing groups hold (`batches_held`, records and
+   parities), read against `Store::Batches`, and the delivery tags' (`delivery_held`); the parities
+   being reassembled are in neither, but under `parity_assembly`, the gauge of their own room
+   (`Plan::parity_assembly`), which counts them itself. Each store charges
+   a decode it holds with a charge that covers it (`Charge::cover`, kept through a split and an
+   absorb), and the covers count each decode once however many stores hold it
+   (`budget::Covered`), so the comparison is exact to the batch: one decode held where no gauge
+   sees it shows, and the flood test leaks exactly one in the middle of a flood to prove it.
+   Before, the stores' gauges were summed: every connection's allowance carved and idle counted,
+   and a decode in the epochs and a subscriber's queue counted twice, about a megabyte of slack
+   under a flood, inside which dozens of leaked batches went unseen.
 
    Why the pool (2026-10-08): members once reserved from the feeders' room, as 1,024 feeders at the
    then default 8 MiB/s. 576 MiB admitted 107 feeders and 2 GiB some 640, so every sharing member was
@@ -462,9 +523,11 @@ Measured on main (tally-load, commit b3e3571809 on branch tally-load):
     and its window step the next one's, which solves every window due as one that ran late would;
     while it has passed more than `PROVISIONAL_BEHIND` (none) provisional steps that have not
     started, the oldest is shed, its provisional solving let go (every batch whose notes it held
-    counted, `MlatReport::shed`, the step counted, `provisional_steps_shed`); a provisional step is
-    never shed for a window step's sake, and starts without the models of one that has not reported,
-    counted (`provisional_models_late`). What is lost is provisional positions, never a window. A host within those limits of the watermark sheds nothing, so the
+    counted, `MlatReport::shed`, the step counted, `provisional_steps_shed`); a provisional step
+    whose models (the window steps `MODELS_RIPEN_MS` before it) have not all reported at its turn
+    is shed the same way, counted (`provisional_models_late`), never started with other models; and
+    one whose records are ready past its publish slot has them refused whole, counted
+    (`provisional_steps_late`). What is lost is provisional positions, never a window. A host within those limits of the watermark sheds nothing, so the
     same stamped trace still makes the same bytes; one further behind is shed by how far behind it
     is, which no trace decides. Before, a step shed only while no seal was in flight, so a slow seal
     let the steps queued behind it grow without bound; and a provisional step waited for the window
@@ -484,7 +547,12 @@ Measured on main (tally-load, commit b3e3571809 on branch tally-load):
     `cores::BUSY_PERCENT` (50%) busy, at least one and at most the cores (`cores::threads_for`):
     the ingest workers, the message threads and the sealer's pool each by their own figure
     (`ingest::Threads`, whose `seal` the sealer's pool now takes instead of the message threads'
-    count). The feeders the cores carry are every stage's work and the async runtime's together in
+    count). The ingest workers' figure is the more of a source's planned receptions and its
+    records a second at `ingest::INGEST_NANOS_PER_RECORD` (30 us) each (`cores::Source`, §2): a
+    feeder's are its byte ceiling's (eight at the default 256 KiB/s, 240 us, some 1.8 times a
+    planned batch's 133 us), a members' feeder's worth its `MEMBER_RECORDS_PER_FEEDER` (four, 120
+    us, below its receptions), so a relay whose feeders may send tiny batches up to their pace has
+    the ingest threads for it, and `check` prints `feeder-records`. The feeders the cores carry are every stage's work and the async runtime's together in
     that share of the cores (`cores::feeders_carried`), the members' rate taken first; the ceiling
     is the fewer of those and the feeders the memory holds (`Budget::ceiling`), so a Hello past
     either is refused ("no spare slot") and every store's share follows the same ceiling. A relay
@@ -493,7 +561,9 @@ Measured on main (tally-load, commit b3e3571809 on branch tally-load):
     cores carry), it admits what they carry: a relay given more memory than its cores can use is a
     smaller relay, not a broken one, and the memory already works that way. The cores are what the
     process may run on (its affinity and its cgroup's quota, `std::thread::available_parallelism`);
-    `tally-relay check --cores N` is told a deploy's, and prints `cores`, `core-feeders`,
+    `tally-relay check --cores N` is told a deploy's (every check of ours states it, from the unit's
+    `CPUQuota=` or the container's `limits.cpu`, so the plan printed is the deploy's and never the
+    build worker's; the master's unit runs on `CPUQuota=200%`), and prints `cores`, `core-feeders`,
     `memory-feeders` and each stage's threads beside the memory plan. `--ingest-threads` and
     `--message-threads` are gone: no operator picks a stage's threads.
 
@@ -509,18 +579,34 @@ Measured on main (tally-load, commit b3e3571809 on branch tally-load):
     are the cores the stages' share leaves for the load admitted, rounded up
     (`cores::mlat_threads_for`, `Budget::mlat_threads`), which at the ceiling hold its cost. All of
     them, not only its average need, because its work is not even: a window step's comes at once
-    every 40 s or so, and a provisional step carries a window step's models only if it reported
-    within `MODELS_RIPEN_MS` (5 s). On the three threads its average cost needs at 2,000 feeders, a
+    every 40 s or so, and a provisional step runs only once the window steps `MODELS_RIPEN_MS`
+    (15 s) before it have reported. On the three threads its average cost needs at 2,000 feeders, a
     window step took 19 and 24 s and 15 and 20 provisional steps a minute started without its
-    models; on the seven the plan gives it, 9 to 11 s and 10 to 14. Every MLAT step
-    runs below the stages' priority (`mlat_host::Urgency`): provisional steps at nice 5, seals and
-    window steps at nice 10, the threads they spread over inheriting it, so on a relay short of
-    cores it is MLAT that waits and sheds whole steps, counted (`steps_shed`,
-    `provisional_steps_shed`, beside the steps it ran, `steps` and `provisional_steps`), never raw
-    that is delayed. No step holds a lock a stage waits on while it works: an address shard's
-    inbox, which the ingest workers hand notes to, is apart from the state a provisional step
-    weighs, and the step only swaps it out (`Shared::due`); the engine's own thread, which does
-    nothing long and takes the raw shards' locks, stays at the stages' priority.
+    models (then 5 s); on the seven the plan gives it, 9 to 11 s and 10 to 14, which the ripening
+    now covers. Those threads are every kind of MLAT work's together: seals, window steps, forgets
+    and provisional steps each hold one of them while they work (`tally_mlat_solver::gate`), so the
+    three kinds at once never work on more than the plan gave (before, each kind spread over all of
+    them, up to three times the plan), provisional work let in first, between two items of the
+    others'. Every MLAT step runs below the stages' priority (`mlat_host::Urgency`): provisional
+    steps 5 nice steps below the relay's own, seals, window steps and forgets 10 below, the threads
+    they spread over inheriting it, so on a relay short of cores it is MLAT that waits and sheds
+    whole steps, counted (`steps_shed`, `provisional_steps_shed`, beside the steps it ran, `steps`
+    and `provisional_steps`), never raw that is delayed. Below the relay's own whatever it was
+    started at: before, nice 5 and 10 were set outright, so a relay started at nice 5 or more ran
+    MLAT level with its stages; a thread whose priority cannot be lowered is counted
+    (`priority_unset`). Nice orders the relay's threads among themselves and no further: under a
+    CPU quota (the public relay's 1,500m) every thread of the process draws on the one quota, and
+    MLAT's share of it is what the plan sizes its threads by (`Budget::mlat_threads` over the cores
+    the quota gives). No step holds a lock a stage or the engine's thread waits on while it works:
+    an address shard's inbox, which the ingest workers hand notes to, is apart from the state a
+    provisional step weighs, and the step only swaps it out (`Shared::due`); the charge of the
+    receptions waiting is locked only to grow it and to settle it, never across a step's passes
+    (before, held across them, the engine's thread dropping an engine waited on a provisional
+    step). The engine's own thread, which does nothing long and takes the raw shards' locks, stays
+    at the stages' priority; idle, it never wakes (before, ten times a second), and a provisional
+    step with nothing to weigh is done on it, on no thread. A window step's working set stays
+    charged until its outcome is applied, so a finished window waiting for the engine's thread is
+    never outside every store.
     `--mlat-threads` is gone: no operator can need a thread count the plan does not size, and its
     one other use, turning MLAT off, is `--no-mlat`. `tally-relay check` prints `mlat-threads`.
 
@@ -757,7 +843,8 @@ minute; MLAT's by its probe, its window steps over the minute holding two of the
 Each run read 2,000 batches and 1.21 M receptions a second with nothing lost; resident memory peaked
 at 4.1 to 4.3 GB. Every provisional step ran. A window step took 9 to 11 s, so the empty steps the
 watermark passed behind it were shed into the next (`steps_shed`, no window lost) and as many
-provisional steps started without its models (`provisional_models_late`). Before, the same 2,000
+provisional steps started without its models (`provisional_models_late`, then: the ripening was
+5 s; it is 15 s since, sweep 4). Before, the same 2,000
 feeders with MLAT on two threads at the old defaults gave raw a p99 of 220 ms (max 284), and on
 eight 162 ms (max 282).
 
@@ -765,8 +852,8 @@ eight 162 ms (max 282).
 with every store's plan, and a figure copied here is wrong the next time one does. Before any feeder
 a relay plans its base (with MLAT's where it hosts MLAT), the oversize room
 (`ingest::OVERSIZE_BYTES`), the Noise buffers of every connection but a feeder's its caps allow
-(`ingest::BUFFERS_PER_CONNECTION` each) and its members' pool, each on its own line of the plan; a
-feeder then reserves `per-feeder`, and the budget keeps `headroom` below the memory it runs in. `bazel
+(`ingest::BUFFERS_PER_CONNECTION` each), its members' pool and every other part the plan lists, each
+on its own line of the plan and summed as `before-feeders`; a feeder then reserves `per-feeder`, and the budget keeps `headroom` below the memory it runs in. `bazel
 test //tally/crates/relay:check //infra/tally:relay_config_test --test_output=all` prints the plan
 of the packaged unit (as packaged, and with a base cell taken) and of each relay Flightlines
 deploys, and holds each to its limit. Every new line of the plan cost the public relay feeders it

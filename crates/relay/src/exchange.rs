@@ -847,6 +847,7 @@ impl MessageThread {
                     return;
                 }
                 if open.charge.try_grow(slice.share()) {
+                    open.charge.cover(&slice.decoded);
                     open.slices.push(slice);
                     // The epoch holds its bytes now: the ingest charge is done.
                     drop(in_flight);
@@ -1040,10 +1041,15 @@ impl Open {
     fn refuse(&mut self, held: &mut Held) {
         self.refused = true;
         for slice in std::mem::take(&mut self.slices) {
-            let share = self.charge.split(slice.share());
+            // Its share covers its own decode, not every decode the epoch held.
+            let mut share = self.charge.split(slice.share());
+            share.uncover();
+            share.cover(&slice.decoded);
             held.keep(&slice, Some(share), None);
         }
         self.charge.shrink_to(0);
+        // It holds no decode now: a refused epoch stays open, holding nothing, until it closes.
+        self.charge.uncover();
     }
 }
 

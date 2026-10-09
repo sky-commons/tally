@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 use tally_relay::hub::{Description, Hub, Inbound, Origin};
 use tally_relay::ingest::{Stamp, Threads};
 use tally_relay::mlat_host::{
-    HostedMlat, MlatHost, MlatReport, PROVISIONAL_BEHIND, STEP_MS, Stage,
+    HostedMlat, MlatHost, MlatReport, PROVISIONAL_BEHIND, STEP_MS, STEPS_BEHIND, Stage,
 };
 use tally_wire::{Identity, Location, PublicKey, ReceiverInfo, Record, Region, Regions};
 
@@ -138,11 +138,13 @@ fn pause(seed: u64, n: u64, most: u64) -> Duration {
 }
 
 /// Delays injected inside the host (`HostedMlat::delaying`) and between the batches handed in:
-/// none, or pseudorandom ones from a seed.
+/// none, pseudorandom ones from a seed, or every window step that solves something held `held_ms`
+/// while the watermark runs up to `behind` steps past the last window step that reported.
 #[derive(Clone, Copy, Debug)]
 enum Delays {
     None,
     Seeded(u64),
+    Windows { held_ms: u64, behind: u64 },
 }
 
 /// What a staged relay on `threads` hosting MLAT for `areas` (on `settings`) signs from `arrivals`,
@@ -167,18 +169,28 @@ fn mlat_run_with(
         MLAT_BOOT,
         settings,
     )?);
-    if let Delays::Seeded(seed) = delays {
-        let count = Arc::new(AtomicU64::new(0));
-        host.delaying(Arc::new(move |stage: Stage| {
-            let n = count.fetch_add(1, Ordering::Relaxed);
-            let most = match stage {
-                // An ingest worker held up on its way to the host (the message exchange pushing
-                // back on `route`).
-                Stage::Offer => 400,
-                Stage::Provisional | Stage::Seal | Stage::Window => 30_000,
-            };
-            std::thread::sleep(pause(seed, n, most));
-        }));
+    match delays {
+        Delays::Seeded(seed) => {
+            let count = Arc::new(AtomicU64::new(0));
+            host.delaying(Arc::new(move |stage: Stage| {
+                let n = count.fetch_add(1, Ordering::Relaxed);
+                let most = match stage {
+                    // An ingest worker held up on its way to the host (the message exchange
+                    // pushing back on `route`).
+                    Stage::Offer => 400,
+                    _ => 30_000,
+                };
+                std::thread::sleep(pause(seed, n, most));
+            }));
+        }
+        Delays::Windows { held_ms, .. } => {
+            host.delaying(Arc::new(move |stage: Stage| {
+                if stage == Stage::Window {
+                    std::thread::sleep(Duration::from_millis(held_ms));
+                }
+            }));
+        }
+        Delays::None => {}
     }
     hub.network()
         .host_mlat(Arc::clone(&host) as Arc<dyn MlatHost>);
@@ -201,7 +213,7 @@ fn mlat_run_with(
                 }
                 n += 1;
                 let most = match delays {
-                    Delays::None => 2_000,
+                    Delays::None | Delays::Windows { .. } => 2_000,
                     Delays::Seeded(seed) => 2_000 + pause(seed, n, 8_000).as_micros() as u64,
                 };
                 std::thread::sleep(Duration::from_micros(most));
@@ -214,11 +226,19 @@ fn mlat_run_with(
         // has reported finds at most that many not started behind the one running, so nothing is
         // shed.
         let ahead = (PROVISIONAL_BEHIND as u64 + 1) * STEP_MS;
+        // Window steps may fall further behind when a test says so (`Delays::Windows`).
+        let windows_ahead = match delays {
+            Delays::Windows { behind, .. } => behind * STEP_MS,
+            _ => ahead,
+        };
+        let base = first / STEP_MS * STEP_MS;
         let since = Instant::now();
         while step <= until {
             // Within the host's limits (`PROVISIONAL_BEHIND` steps, the tighter, and
             // `STEPS_BEHIND`), as a real-time watermark keeps it.
-            while step > host.stepped_ms().max(first / STEP_MS * STEP_MS) + ahead {
+            while step > host.provisionals_stepped_ms().max(base) + ahead
+                || step > host.windows_stepped_ms().max(base) + windows_ahead
+            {
                 if since.elapsed() > Duration::from_secs(300) {
                     return Err(format!(
                         "the hosted MLAT stepped to {}, {step} handed in",
@@ -595,6 +615,78 @@ fn descriptions_midway_make_the_same_bytes_with_any_delays_and_the_reference_eng
     assert_ne!(
         one.1, unchanged.0.1,
         "the descriptions midway changed nothing"
+    );
+    Ok(())
+}
+
+/// Sweep 4, R-N16 and N6: a window step that runs long, past the old ripening and past the window
+/// steps MLAT may fall behind (`STEPS_BEHIND`, so the empty steps behind it are shed), changes no
+/// provisional byte: a provisional step carries exactly the models of the window steps
+/// `MODELS_RIPEN_MS` before it, by their stamp, and the ripening covers a window step on the
+/// planned threads (measured 9 to 11 s: here every window step that solves is held while the
+/// watermark runs ten steps past it). Before, a provisional step five seconds after a window step
+/// still running started without its models and adopted them at whichever step came after they
+/// reported, so the provisional bytes were the thread timing's. They are the reference engine's,
+/// and no provisional step is shed or started late.
+#[test]
+fn a_window_step_that_runs_long_changes_no_provisional_byte() -> Result {
+    use tally_mlat::replay::{arrivals, replay, scenario};
+    let mut simulation = tally_mlat_solver::sim::run(&scenario(17, 60.0));
+    let delivered = arrivals(&mut simulation, 3)?;
+    let areas = mlat_areas()?;
+    const BEHIND: u64 = 10;
+    const {
+        assert!(BEHIND * STEP_MS > (STEPS_BEHIND as u64 + 1) * STEP_MS);
+        assert!(BEHIND * STEP_MS <= tally_mlat::engine::MODELS_RIPEN_MS);
+    }
+    let (signed, report, _) = mlat_run_with(
+        &delivered,
+        &areas,
+        Threads {
+            ingest: 2,
+            message: 2,
+            seal: 2,
+        },
+        mlat_settings(2),
+        Describing::Before { reversed: false },
+        Delays::Windows {
+            held_ms: 1_500,
+            behind: BEHIND,
+        },
+    )?;
+    // The window steps fell behind past their limit: the empty ones behind the held one shed.
+    assert!(report.steps_shed > 0, "{report:?}");
+    assert_eq!(
+        (
+            report.provisional_steps_shed,
+            report.provisional_models_late,
+            report.provisional_steps_late,
+            report.shed,
+            report.steps_discarded,
+            report.waiting_dropped
+        ),
+        (0, 0, 0, 0, 0, 0),
+        "{report:?}"
+    );
+    assert!(!signed.0.is_empty(), "no provisional positions");
+    let first = delivered.first().map(|(at, _)| *at).ok_or("no raw")?;
+    let until = delivered.last().map_or(0, |(at, _)| *at) + 60_000;
+    let mut engine =
+        tally_mlat::engine::Engine::new(Identity::from_seed([5; 32]), MLAT_BOOT, mlat_settings(2));
+    engine.set_scope(tally_mlat::area::border_band(&areas), areas.clone());
+    let reference: Vec<Record> = replay(&mut engine, &delivered, STEP_MS, until)?
+        .into_iter()
+        .filter(|(at, _)| *at >= first)
+        .map(|(_, record)| record)
+        .collect();
+    let reference = encoded(&reference);
+    assert_eq!(
+        signed.0, reference.0,
+        "provisionals differ from the reference"
+    );
+    assert_eq!(
+        signed.1, reference.1,
+        "models and positions differ from the reference"
     );
     Ok(())
 }

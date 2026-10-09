@@ -891,18 +891,6 @@ impl Intake {
         batch: &Decoded,
         take: &mut dyn FnMut(usize) -> bool,
     ) -> (Ingested, Vec<Note>) {
-        self.ingest_verified_taking_at(batch, None, take)
-    }
-
-    /// As `ingest_verified_taking`, the batch taken as stamped `stamp_ms` when given (never earlier
-    /// than its own stamp, `held::Open::add_decoded_taking_at`): a batch that waited for its
-    /// receiver's description, taken as of the step that let it in.
-    pub fn ingest_verified_taking_at(
-        &mut self,
-        batch: &Decoded,
-        stamp_ms: Option<u64>,
-        take: &mut dyn FnMut(usize) -> bool,
-    ) -> (Ingested, Vec<Note>) {
         let key = batch.receiver();
         let Some(known) = self.receivers.get_mut(&key) else {
             return (Ingested::Ignored, Vec::new());
@@ -914,10 +902,9 @@ impl Intake {
             return (Ingested::Replayed, Vec::new());
         }
         let notes = notes_of(batch);
-        let added = match stamp_ms {
-            Some(stamp_ms) => self.open.add_decoded_taking_at(batch, stamp_ms, take),
-            None => self.open.add_decoded_taking(batch, take),
-        };
+        // Judged ahead or late by its own stamp, however late it is taken (a batch that waited for
+        // its receiver's description too): every holder judges the same raw the same way.
+        let added = self.open.add_decoded_taking(batch, take);
         self.dropped.late += added.late as u64;
         self.dropped.refused += added.refused as u64;
         self.dropped.ahead += added.ahead as u64;

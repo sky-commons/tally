@@ -38,6 +38,7 @@
 //! ([`PLANNED_RECEPTIONS_PER_SEC`], [`PLANNED_BYTES_PER_SEC`]) times each store's own window,
 //! named where the store defines it, so a store that changes its window changes its reservation.
 
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
@@ -366,6 +367,10 @@ pub struct Plan {
     /// Whether the relay holds MLAT raw (it hosts MLAT): the base, each feeder's cost in the
     /// stores and in the cores (the stages' and MLAT's steps') follow it.
     pub holds_raw: bool,
+    /// The records a second a feeder may send (`ingest::records_per_sec` of its byte ceiling,
+    /// `--max-feeder-bytes-per-sec`): each costs the ingest workers a verification whatever its
+    /// size, so the cores carry fewer feeders the more each may send (`cores::Source`).
+    pub feeder_records_per_sec: u64,
 }
 
 impl Plan {
@@ -379,6 +384,28 @@ impl Plan {
             connections: 0,
             cores: None,
             holds_raw: hosts_mlat,
+            feeder_records_per_sec: crate::ingest::records_per_sec(
+                crate::hub::DEFAULT_MAX_FEEDER_BYTES_PER_SEC,
+            ),
+        }
+    }
+
+    /// The same plan with each feeder held to `bytes_per_sec` (`--max-feeder-bytes-per-sec`): the
+    /// records a second it may send ([`Plan::feeder_records_per_sec`]).
+    #[must_use]
+    pub fn with_feeder_ceiling(self, bytes_per_sec: u64) -> Self {
+        Self {
+            feeder_records_per_sec: crate::ingest::records_per_sec(bytes_per_sec),
+            ..self
+        }
+    }
+
+    /// The load of `feeders` beside the members' rate (`cores::Load`).
+    pub fn load_of(&self, feeders: usize) -> crate::cores::Load {
+        crate::cores::Load {
+            feeders,
+            member_feeders: self.member_feeders,
+            feeder_records_per_sec: self.feeder_records_per_sec,
         }
     }
 
@@ -393,7 +420,7 @@ impl Plan {
     /// as a bound when the cores are not planned.
     pub fn core_feeders(&self) -> Option<usize> {
         self.cores
-            .map(|cores| crate::cores::feeders_carried(cores, self.holds_raw, self.member_feeders))
+            .map(|cores| crate::cores::feeders_carried(cores, self.holds_raw, self.load_of(0)))
     }
 
     /// The same plan holding `connections` connections at once, each with its Noise buffers.
@@ -427,15 +454,42 @@ impl Plan {
             .saturating_mul(crate::peers::WAITING_PER_LINK_BYTES)
     }
 
-    /// What the relay holds before any feeder: its base, the oversize room, the connections'
-    /// buffers, the members' pool and what waits for the member links. Feeders reserve from what
-    /// is left.
+    /// What the members' shared rate (`--max-member-bytes-per-sec`) brings in a second at most, as
+    /// planned: the feeders it is worth, each at the planned rate (no less than the rate itself).
+    pub fn member_bytes_per_sec(&self) -> usize {
+        self.member_feeders.saturating_mul(PLANNED_BYTES_PER_SEC)
+    }
+
+    /// The parities being reassembled from their chunks, at most (`sharing::assembly_room`): every
+    /// chunk the members' shared rate can bring while one parity may wait to be whole, so the room
+    /// is never full for an honest sender (`Budget::parity_assembly`).
+    pub fn parity_assembly(&self) -> usize {
+        crate::sharing::assembly_room(self.member_bytes_per_sec())
+    }
+
+    /// Every part of what the relay holds before any feeder, each under the name `tally-relay
+    /// check` prints it by: its base, the oversize room, the connections' buffers, the members'
+    /// pool, what waits for the member links and the parities being reassembled. The one list
+    /// [`Plan::before_feeders`] sums and `check` prints, so a part planned is a part printed: a
+    /// room added here and nowhere else is in both, and the deploy checks that add the lines up
+    /// (`before-feeders`) never sum a list of their own.
+    pub fn before_feeders_parts(&self) -> [(&'static str, usize); 6] {
+        [
+            ("base", self.base),
+            ("oversize", self.oversize()),
+            ("connection-buffers", self.connection_buffers()),
+            ("member-pool", self.member_pool()),
+            ("member-links", self.member_links()),
+            ("parity-assembly", self.parity_assembly()),
+        ]
+    }
+
+    /// What the relay holds before any feeder ([`Plan::before_feeders_parts`], together).
+    /// Feeders reserve from what is left.
     pub fn before_feeders(&self) -> usize {
-        self.base
-            .saturating_add(self.oversize())
-            .saturating_add(self.connection_buffers())
-            .saturating_add(self.member_pool())
-            .saturating_add(self.member_links())
+        self.before_feeders_parts()
+            .iter()
+            .fold(0, |sum, (_, bytes)| sum.saturating_add(*bytes))
     }
 
     /// The same plan holding `members` member sessions at once ([`members_for`]), sending
@@ -536,7 +590,7 @@ pub fn members_for(areas: &[tally_wire::Region], hosts_mlat: bool, connections: 
 
 /// The feeders a connection allowed `bytes_per_sec` is worth: its ceiling over a planned feeder's
 /// rate, rounded up.
-fn feeders_for_rate(bytes_per_sec: u64) -> usize {
+pub fn feeders_for_rate(bytes_per_sec: u64) -> usize {
     usize::try_from(bytes_per_sec)
         .unwrap_or(usize::MAX)
         .div_ceil(PLANNED_BYTES_PER_SEC)
@@ -714,6 +768,7 @@ impl Gauge {
         Some(Charge {
             gauge: Some(Arc::clone(self)),
             bytes,
+            covers: Vec::new(),
         })
     }
 
@@ -722,6 +777,7 @@ impl Gauge {
         Charge {
             gauge: Some(Arc::clone(self)),
             bytes: 0,
+            covers: Vec::new(),
         }
     }
 
@@ -787,11 +843,158 @@ impl Drop for Waiting<'_> {
     }
 }
 
-/// Bytes a store holds for one thing, released when it is dropped.
+/// Bytes a store holds for one thing, released when it is dropped, and the decoded batches it is
+/// charged for holding ([`Charge::cover`]), each counted once in the process's [`Covered`] for as
+/// long as any charge covers it.
 #[derive(Debug, Default)]
 pub struct Charge {
     gauge: Option<Arc<Gauge>>,
     bytes: usize,
+    covers: Vec<Cover>,
+}
+
+/// The decoded batches alive that some store's charge covers ([`Charge::cover`]), each counted
+/// once however many stores and charges hold it: what [`Budget::decoded_held`] sets beside the
+/// decodes alive (`tally_wire::decoded::live`), so one decode alive that no charge covers shows,
+/// whatever the stores hold beside it. One a process ([`Covered::process`]), as the decodes alive
+/// are counted once a process.
+///
+/// Before, the check summed the gauges of the stores that hold decodes. A connection's allowance
+/// is carved whole from `Store::Ingest` when it is admitted (`ingest::Allowance`) and stays
+/// carved while it reads nothing, and a decode in the epochs and a subscriber's queue is charged
+/// by both: the sum ran about a megabyte past the decodes alive under a flood, and a holder
+/// keeping dozens of batches uncharged was inside it.
+///
+/// Sharded by the decode's address so the stages' threads seldom meet on a lock: each decode's
+/// address, how many covers hold it and the decode itself, weakly (a cover keeps no decode alive;
+/// its allocation, and so its address, stays the decode's while a cover does).
+pub struct Covered {
+    shards: [Mutex<BTreeMap<usize, CoverEntry>>; COVER_SHARDS],
+}
+
+const COVER_SHARDS: usize = 64;
+
+static COVERED: Covered = Covered::new();
+
+#[derive(Debug)]
+struct CoverEntry {
+    covers: usize,
+    decoded: Weak<tally_wire::Decoded>,
+}
+
+impl Covered {
+    const fn new() -> Self {
+        Self {
+            shards: [const { Mutex::new(BTreeMap::new()) }; COVER_SHARDS],
+        }
+    }
+
+    /// The process's: every charge's covers ([`Charge::cover`]).
+    pub fn process() -> &'static Self {
+        &COVERED
+    }
+
+    fn shard(&self, address: usize) -> std::sync::MutexGuard<'_, BTreeMap<usize, CoverEntry>> {
+        // Allocations are at least 16-byte aligned: the bits above those spread them.
+        self.shards[(address >> 4) % COVER_SHARDS]
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn add(&self, decoded: &Arc<tally_wire::Decoded>) -> usize {
+        let address = Arc::as_ptr(decoded) as usize;
+        self.shard(address)
+            .entry(address)
+            .or_insert_with(|| CoverEntry {
+                covers: 0,
+                decoded: Arc::downgrade(decoded),
+            })
+            .covers += 1;
+        address
+    }
+
+    fn remove(&self, address: usize) {
+        let mut shard = self.shard(address);
+        if let Some(entry) = shard.get_mut(&address) {
+            entry.covers -= 1;
+            if entry.covers == 0 {
+                shard.remove(&address);
+            }
+        }
+    }
+
+    /// How many charges cover `decoded` now.
+    pub fn covers_of(&self, decoded: &Arc<tally_wire::Decoded>) -> usize {
+        let address = Arc::as_ptr(decoded) as usize;
+        self.shard(address)
+            .get(&address)
+            .map_or(0, |entry| entry.covers)
+    }
+
+    /// The decoded batches alive that some charge covers, each once, and the bytes they hold
+    /// (`Decoded::footprint`).
+    pub fn now(&self) -> (usize, usize) {
+        let (mut batches, mut bytes) = (0, 0);
+        for shard in &self.shards {
+            let shard = shard
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for entry in shard.values() {
+                if let Some(decoded) = entry.decoded.upgrade() {
+                    batches += 1;
+                    bytes += decoded.footprint();
+                }
+            }
+        }
+        (batches, bytes)
+    }
+}
+
+/// One charge's hold on one decoded batch ([`Charge::cover`]): counted in its [`Covered`] while
+/// it lives.
+#[derive(Debug)]
+struct Cover {
+    covered: &'static Covered,
+    address: usize,
+    decoded: Weak<tally_wire::Decoded>,
+}
+
+impl std::fmt::Debug for Covered {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Covered")
+    }
+}
+
+impl Cover {
+    fn new(covered: &'static Covered, decoded: &Arc<tally_wire::Decoded>) -> Self {
+        Self {
+            covered,
+            address: covered.add(decoded),
+            decoded: Arc::downgrade(decoded),
+        }
+    }
+}
+
+impl Clone for Cover {
+    fn clone(&self) -> Self {
+        match self.decoded.upgrade() {
+            Some(decoded) => Self::new(self.covered, &decoded),
+            // Gone: nothing to hold, and nothing counted for it.
+            None => Self {
+                covered: self.covered,
+                address: 0,
+                decoded: Weak::new(),
+            },
+        }
+    }
+}
+
+impl Drop for Cover {
+    fn drop(&mut self) {
+        if self.address != 0 {
+            self.covered.remove(self.address);
+        }
+    }
 }
 
 impl Charge {
@@ -802,6 +1005,26 @@ impl Charge {
 
     pub fn bytes(&self) -> usize {
         self.bytes
+    }
+
+    /// This charge is for holding `decoded` (or its share of it): the decode is counted as charged
+    /// ([`Covered`]) for as long as this charge, or any part split from it or absorbing it, lives.
+    /// Every store that holds decoded batches covers each with the charge it takes for it, so a
+    /// decode alive with no cover is one held where no gauge sees it (`Budget::decoded_held`).
+    pub fn cover(&mut self, decoded: &Arc<tally_wire::Decoded>) {
+        self.cover_in(Covered::process(), decoded);
+    }
+
+    /// This charge holds no decode any more: its bytes go back to a pool that holds none (an
+    /// allowance's carve, `ingest::Allowance`), which would otherwise count every decode its
+    /// charges were lent for as covered for as long as the connection lasts.
+    pub fn uncover(&mut self) {
+        self.covers.clear();
+    }
+
+    /// As [`Charge::cover`], counted in `covered`: a test's own.
+    fn cover_in(&mut self, covered: &'static Covered, decoded: &Arc<tally_wire::Decoded>) {
+        self.covers.push(Cover::new(covered, decoded));
     }
 
     /// Whether `bytes` more would fit on its gauge now (a charge of nothing fits only nothing).
@@ -829,13 +1052,15 @@ impl Charge {
 
     /// `bytes` of this charge (all of it, if it holds less) moved into a charge of their own on the
     /// same gauge, nothing taken or released: what a store hands on with the thing it holds (open
-    /// raw handed to its seal).
+    /// raw handed to its seal, a batch's slices each with its share). Both cover what this one
+    /// covered: each part is charged for holding the decodes it was split from.
     pub fn split(&mut self, bytes: usize) -> Charge {
         let bytes = bytes.min(self.bytes);
         self.bytes -= bytes;
         Charge {
             gauge: self.gauge.clone(),
             bytes,
+            covers: self.covers.clone(),
         }
     }
 
@@ -868,6 +1093,7 @@ impl Charge {
             self.gauge = other.gauge.clone();
         }
         self.bytes += other.bytes;
+        self.covers.append(&mut other.covers);
         other.bytes = 0;
         other.gauge = None;
         Ok(())
@@ -914,6 +1140,8 @@ pub struct Budget {
     cores: Option<usize>,
     /// Whether the relay holds MLAT raw (`Plan::holds_raw`).
     holds_raw: bool,
+    /// The records a second a feeder may send (`Plan::feeder_records_per_sec`).
+    feeder_records_per_sec: u64,
     reserved: Arc<AtomicUsize>,
     /// Bytes the admitted members hold of their pool.
     members_reserved: Arc<AtomicUsize>,
@@ -924,6 +1152,8 @@ pub struct Budget {
     connection_buffers: Arc<Gauge>,
     /// What waits for the member links this relay dials (`Plan::member_links`).
     member_links: Arc<Gauge>,
+    /// The parities being reassembled (`Plan::parity_assembly`).
+    parity_assembly: Arc<Gauge>,
 }
 
 impl Budget {
@@ -951,12 +1181,14 @@ impl Budget {
             connections: 0,
             cores: None,
             holds_raw: false,
+            feeder_records_per_sec: Plan::planned(false).feeder_records_per_sec,
             reserved: Arc::new(AtomicUsize::new(0)),
             members_reserved: Arc::new(AtomicUsize::new(0)),
             gauges,
             oversize: Gauge::new(Store::Ingest, 0),
             connection_buffers: Gauge::new(Store::Buffers, 0),
             member_links: Gauge::new(Store::Batches, 0),
+            parity_assembly: Gauge::new(Store::Batches, 0),
         };
         budget.limit_gauges();
         budget
@@ -973,6 +1205,7 @@ impl Budget {
         self.connections = plan.connections;
         self.cores = plan.cores;
         self.holds_raw = plan.holds_raw;
+        self.feeder_records_per_sec = plan.feeder_records_per_sec;
         self.total = memory.saturating_sub(plan.before_feeders());
         self.limit_gauges();
     }
@@ -985,6 +1218,7 @@ impl Budget {
         self.oversize.set_limit(plan.oversize());
         self.connection_buffers.set_limit(plan.connection_buffers());
         self.member_links.set_limit(plan.member_links());
+        self.parity_assembly.set_limit(plan.parity_assembly());
     }
 
     /// The room a batch past its connection's whole allowance takes (`ingest::Allowance`), one at
@@ -1005,6 +1239,12 @@ impl Budget {
         Arc::clone(&self.member_links)
     }
 
+    /// The room parities are reassembled in (`sharing`), apart from the batch store: the same gauge
+    /// for the budget's life, sized to the members' shared rate (`Plan::parity_assembly`).
+    pub fn parity_assembly(&self) -> Arc<Gauge> {
+        Arc::clone(&self.parity_assembly)
+    }
+
     /// The plan this budget was sized from.
     pub fn plan(&self) -> Plan {
         Plan {
@@ -1015,6 +1255,7 @@ impl Budget {
             connections: self.connections,
             cores: self.cores,
             holds_raw: self.holds_raw,
+            feeder_records_per_sec: self.feeder_records_per_sec,
         }
     }
 
@@ -1033,7 +1274,7 @@ impl Budget {
                  limits.cpu, its CPU affinity), plan a slower members' rate or host no MLAT",
                 plan.member_feeders,
                 crate::cores::BUSY_PERCENT,
-                crate::cores::load_carried(1, plan.holds_raw),
+                crate::cores::load_carried(1, plan.holds_raw, plan.feeder_records_per_sec),
             ));
         }
         let needed = Self::memory_for(1, plan);
@@ -1046,8 +1287,9 @@ impl Budget {
              Noise buffers of its {} connections (--max-connections), {} for its members' shared \
              rate ({} feeders' worth at --max-member-bytes-per-sec) and {} for each member \
              session (as many as its areas bring, at most its connections) and {} more for what \
-             waits for its link to each, and {} for each feeder, {needed} in all for these and \
-             one feeder; give it more (--memory, or the \
+             waits for its link to each, {} for the parities its members' rate reassembles at \
+             once (the parity-assembly room), and {} for each feeder, {needed} in all for these \
+             and one feeder; give it more (--memory, or the \
              memory it runs in: the unit's MemoryHigh and MemoryMax, the container's \
              limits.memory), or plan fewer connections or a slower members' rate \
              (--max-connections, --max-member-bytes-per-sec)",
@@ -1061,6 +1303,7 @@ impl Budget {
             self.member_feeders,
             plan.per_member(),
             crate::peers::WAITING_PER_LINK_BYTES,
+            plan.parity_assembly(),
             self.per_feeder.total(),
         ))
     }
@@ -1088,10 +1331,10 @@ impl Budget {
             .unwrap_or(usize::MAX)
     }
 
-    /// The planned feeders' worth of load the relay admits at its ceiling: its feeders and the
-    /// feeders its members' shared rate is worth. What its stages' threads are sized for.
-    pub fn load(&self) -> usize {
-        self.ceiling().saturating_add(self.member_feeders)
+    /// The load the relay admits at its ceiling: its feeders and the feeders its members' shared
+    /// rate is worth (`cores::Load`). What its stages' threads are sized for.
+    pub fn load(&self) -> crate::cores::Load {
+        self.plan().load_of(self.ceiling())
     }
 
     /// Each stage's threads for the load admitted ([`Budget::load`], `cores::threads_for`).
@@ -1216,21 +1459,27 @@ impl Budget {
             .fold(self.oversize.held(), usize::saturating_add)
     }
 
-    /// The decoded batches alive in this process (`tally_wire::decoded::live`) beside what the
-    /// stores holding them are charged ([`Budget::decoded_charged`]), the charges read on both
-    /// sides of the count and the larger kept, so a batch handed from one store to the next while
-    /// they are read is not taken for one nobody holds. Every decoded batch is charged before it
-    /// is decoded (the connection's allowance, `ingest::Allowance`) and stays charged in whichever
-    /// store holds it, so what is alive past the charge, other than a hand-off caught between its
-    /// release and its drop, is a holder no gauge sees: the bytes that would grow past the budget.
+    /// The decoded batches alive in this process (`tally_wire::decoded::live`) beside those some
+    /// store's charge covers ([`Covered`], each decode once however many hold it), the covers read
+    /// on both sides of the count and the larger kept, so a batch handed from one store to the next
+    /// while they are read is not taken for one nobody holds; and what the stores holding decodes
+    /// are charged ([`Budget::decoded_charged`]), for the report. Every decoded batch is covered
+    /// by the charge it is decoded under (its connection's allowance, `ingest::InFlight`) and by
+    /// every store's that holds it after, so a decode alive with no cover, other than a hand-off
+    /// caught between its release and its drop, is a holder no gauge sees: the bytes that would
+    /// grow past the budget. Exact to the batch: no allowance carved and idle, and no decode two
+    /// stores hold, stands in for one.
     pub fn decoded_held(&self) -> DecodedHeld {
-        let before = self.decoded_charged();
+        let before = Covered::process().now();
         let (batches, live) = tally_wire::decoded::live();
-        let after = self.decoded_charged();
+        let after = Covered::process().now();
+        let covered = if after.1 > before.1 { after } else { before };
         DecodedHeld {
             batches,
             live,
-            charged: before.max(after),
+            covered_batches: covered.0,
+            covered: covered.1,
+            charged: self.decoded_charged(),
         }
     }
 
@@ -1251,6 +1500,7 @@ impl Budget {
             oversize: self.oversize.report(),
             connection_buffers: self.connection_buffers.report(),
             member_links: self.member_links.report(),
+            parity_assembly: self.parity_assembly.report(),
         }
     }
 }
@@ -1277,6 +1527,8 @@ pub struct MemoryReport {
     pub connection_buffers: GaugeReport,
     /// What waits for the member links (`Plan::member_links`).
     pub member_links: GaugeReport,
+    /// The parities being reassembled (`Plan::parity_assembly`).
+    pub parity_assembly: GaugeReport,
 }
 
 /// The decoded batches alive and what the stores holding them are charged, read together
@@ -1286,14 +1538,23 @@ pub struct DecodedHeld {
     /// Decoded batches alive in the process, and the bytes they hold (`Decoded::footprint`).
     pub batches: usize,
     pub live: usize,
-    /// What the stores holding decoded batches, and the oversize room, are charged.
+    /// Of those, the batches some store's charge covers ([`Covered`]), each once, and their bytes.
+    pub covered_batches: usize,
+    pub covered: usize,
+    /// What the stores holding decoded batches, and the oversize room, are charged: their room
+    /// in use, allowances carved and idle among it, and a decode held twice charged twice.
     pub charged: usize,
 }
 
 impl DecodedHeld {
     /// Decoded bytes alive that no store's charge covers.
     pub fn uncharged(&self) -> usize {
-        self.live.saturating_sub(self.charged)
+        self.live.saturating_sub(self.covered)
+    }
+
+    /// Decoded batches alive that no store's charge covers.
+    pub fn uncharged_batches(&self) -> usize {
+        self.batches.saturating_sub(self.covered_batches)
     }
 }
 
@@ -1313,6 +1574,85 @@ impl Drop for Reservation {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A decoded batch of `receptions` receptions, its own.
+    fn decoded(receptions: u32) -> Result<Arc<tally_wire::Decoded>, String> {
+        let receiver = tally_wire::Identity::generate().map_err(|error| error.to_string())?;
+        let batch = tally_wire::Batch::sign(
+            &receiver,
+            &tally_wire::BatchContent {
+                boot_id: 1,
+                sequence: 1,
+                counter_epoch: 0,
+                wall_ms: 0,
+                dropped: 0,
+                previous: [0; 32],
+                observations: (0..receptions)
+                    .map(|n| tally_wire::Observation {
+                        format: tally_wire::batch::format::MODE_S_LONG,
+                        timestamp: u64::from(n),
+                        signal: 0,
+                        data: n.to_be_bytes().repeat(4),
+                    })
+                    .collect(),
+            },
+        )
+        .map_err(|error| error.to_string())?;
+        tally_wire::Decoded::from_verified(batch, 0, 0).map_err(|error| error.error.to_string())
+    }
+
+    /// R-P23: a decode is counted covered once however many charges and stores hold it, a charge
+    /// that covers nothing (an allowance carved and idle) counts for no decode, a cover follows
+    /// its charge through a split and an absorb, and a decode no charge covers is counted
+    /// uncovered: to the batch, so one leaked batch shows.
+    #[test]
+    fn each_decode_is_covered_once_and_an_idle_carve_covers_none() -> Result<(), String> {
+        let covered: &'static Covered = Box::leak(Box::new(Covered::new()));
+        let plan = Plan::planned(false);
+        let budget = Budget::of_memory(Budget::memory_for(4, plan), plan);
+        // An allowance carved and idle: charged, covering nothing.
+        let idle = budget.gauge(Store::Ingest).try_charge(4 << 10);
+        assert!(idle.is_some());
+        assert_eq!(covered.now(), (0, 0));
+        let (one, two, leaked) = (decoded(40)?, decoded(60)?, decoded(80)?);
+        // `one` in the epochs and in a subscriber's queue, charged by both: counted once.
+        let mut epochs = budget.gauge(Store::Epochs).empty();
+        assert!(epochs.try_grow(one.footprint()));
+        epochs.cover_in(covered, &one);
+        let mut queue = budget.gauge(Store::Fanout).empty();
+        assert!(queue.try_grow(one.footprint()));
+        queue.cover_in(covered, &one);
+        assert_eq!(covered.covers_of(&one), 2);
+        assert_eq!(covered.now(), (1, one.footprint()));
+        // `two`, charged whole and split across its slices: each part covers it.
+        let mut in_flight = budget.gauge(Store::Epochs).empty();
+        assert!(in_flight.try_grow(two.footprint()));
+        in_flight.cover_in(covered, &two);
+        let slice = in_flight.split(two.footprint() / 2);
+        assert_eq!(covered.covers_of(&two), 2);
+        assert_eq!(covered.now(), (2, one.footprint() + two.footprint()));
+        // The slice's charge absorbed into the epoch's: the cover moves with it.
+        assert!(epochs.absorb(slice).is_ok());
+        assert_eq!(covered.covers_of(&two), 2);
+        drop(in_flight);
+        assert_eq!(covered.covers_of(&two), 1);
+        // `leaked` is alive and covered by nothing: everything else is counted, it is not.
+        assert_eq!(covered.covers_of(&leaked), 0);
+        assert_eq!(covered.now(), (2, one.footprint() + two.footprint()));
+        // Every charge let go: nothing covered, whatever is still alive.
+        drop((epochs, queue));
+        assert_eq!(covered.now(), (0, 0));
+        assert_eq!(covered.covers_of(&one), 0);
+        // A cover keeps no decode alive, and one whose decode is gone counts for nothing.
+        let mut late = budget.gauge(Store::Notes).empty();
+        late.cover_in(covered, &leaked);
+        let weak = Arc::downgrade(&leaked);
+        drop(leaked);
+        assert!(weak.upgrade().is_none());
+        assert_eq!(covered.now(), (0, 0));
+        drop(late);
+        Ok(())
+    }
 
     #[test]
     fn a_feeder_is_admitted_only_with_room_in_every_store_and_leaving_frees_it() {
@@ -1376,7 +1716,7 @@ mod tests {
         let unbounded = Budget::of_memory(memory, members);
         assert_eq!(unbounded.ceiling(), 10_000);
         let one = members.with_cores(Some(1));
-        let carried = crate::cores::feeders_carried(1, false, members.member_feeders);
+        let carried = crate::cores::feeders_carried(1, false, members.load_of(0));
         assert!(carried > 0 && carried < 10_000, "{carried}");
         let budget = Budget::of_memory(memory, one);
         assert_eq!(
@@ -1394,21 +1734,26 @@ mod tests {
             budget.store_bytes(Store::Dedup),
             unbounded.store_bytes(Store::Dedup) - (10_000 - carried) * one.per_feeder.dedup
         );
-        assert_eq!(budget.load(), carried + members.member_feeders);
+        assert_eq!(budget.load(), members.load_of(carried));
+        assert_eq!(
+            budget.load().planned_feeders(),
+            carried + members.member_feeders
+        );
         assert_eq!(
             budget.threads(),
             crate::cores::threads_for(budget.load(), false, Some(1))
         );
-        // Ten cores carry the 10,000 the memory holds: the memory bounds it, and the threads
-        // follow those feeders, more than one a stage.
-        let ten = Budget::of_memory(memory, members.with_cores(Some(10)));
+        // Sixteen cores carry the 10,000 the memory holds (ten no longer do, the feeders' records
+        // planned in the ingest workers): the memory bounds it, and the threads follow those
+        // feeders, more than one a stage.
+        let ten = Budget::of_memory(memory, members.with_cores(Some(16)));
         assert_eq!(ten.ceiling(), 10_000);
         assert!(ten.threads().message > 1 && ten.threads().ingest > 1);
         // Cores that carry no more than the members' rate start no relay.
-        let rate = Plan::planned(false).with_members(
-            4,
-            (crate::cores::load_carried(1, false) * PLANNED_BYTES_PER_SEC) as u64,
-        );
+        let member_carried =
+            1_000_000_000 / crate::cores::planned_per_feeder(crate::cores::Source::Member, false);
+        let rate = Plan::planned(false)
+            .with_members(4, ((member_carried + 1) * PLANNED_BYTES_PER_SEC) as u64);
         let starved = Budget::of_memory(Budget::memory_for(10, rate), rate.with_cores(Some(1)));
         assert_eq!(starved.ceiling(), 0);
         let refusal = starved.check().err().unwrap_or_default();
@@ -1451,6 +1796,7 @@ mod tests {
             connections: 0,
             cores: None,
             holds_raw: false,
+            feeder_records_per_sec: 1,
         }
         .with_members(2, 3 * PLANNED_BYTES_PER_SEC as u64 + 1);
         // The rate is worth four feeders, planned once for both sessions.

@@ -255,6 +255,51 @@ fn a_receiver_forgotten_is_gone_from_every_bin() {
     assert!(held.bytes() > reopened && held.bytes() < reopened + bins.len() * 1_024);
 }
 
+/// Sweep 4, N3: receivers that left together are forgotten in one pass, each bin that held any of
+/// them sealed again once without all of them: the bins are those forgetting them one by one
+/// makes, and a bin that held none of them is left as it was.
+#[test]
+fn receivers_forgotten_together_are_forgotten_as_one_by_one() {
+    let receptions = sky(9);
+    let mut keys: Vec<PublicKey> = receptions.iter().map(|r| r.receiver).collect();
+    keys.sort_unstable();
+    keys.dedup();
+    assert!(keys.len() > 3, "{} receivers", keys.len());
+    let gone = [keys[0], keys[2]];
+    let sealed_by = || {
+        let sealed = SealedBins::new();
+        let mut held = Held::with(Limits::UNBOUNDED, 2, sealed.clone());
+        for reception in &receptions {
+            held.add_one(reception, reception.wall_ms);
+        }
+        held.seal_through(i64::MAX - 1);
+        (held, sealed)
+    };
+    let (_together_held, together) = sealed_by();
+    let (_one_held, one_by_one) = sealed_by();
+    let before = together.bins(i64::MIN, i64::MAX);
+    together.forget_receivers(&gone, 2);
+    for key in &gone {
+        one_by_one.forget_receiver(key, 2);
+    }
+    assert_eq!(together.numbers(), one_by_one.numbers());
+    for bin in together.numbers() {
+        let (a, b) = (together.get(bin), one_by_one.get(bin));
+        assert!(a == b, "bin {bin}");
+        assert!(a.is_some_and(|a| gone.iter().all(|key| a.receiver(key).is_none())));
+    }
+    for old in before {
+        if gone.iter().all(|key| old.receiver(key).is_none()) {
+            assert!(
+                together
+                    .get(old.bin)
+                    .is_some_and(|now| Arc::ptr_eq(&now, &old))
+            );
+        }
+    }
+    assert_eq!(together.bytes(), one_by_one.bytes());
+}
+
 /// The handle a reader keeps sees what its holder seals and forgets, and nothing open.
 #[test]
 fn a_reader_of_the_sealed_bins_sees_what_the_holder_seals_and_forgets() {
@@ -518,15 +563,11 @@ fn a_bin_far_ahead_of_its_batchs_stamp_is_refused_and_counted() -> Result<(), St
         stamp,
     )?;
     assert_eq!(open.add_decoded(&near).new, 5);
-    // A batch taken as of a later step is bounded by that step: what was ahead of its own stamp is
-    // not ahead of the step's.
+    // A batch is judged by its own stamp on every way in, however late it is taken (one that
+    // waited for its receiver's description too, sweep 4, R-P5): there is no way in that takes a
+    // later stamp in its place.
     let early = stamped(&honest, 1, content(stamp + 6_000, &replies(3, 10)), stamp)?;
     assert_eq!(open.add_decoded_taking(&early, &mut |_| true).ahead, 3);
-    assert_eq!(
-        open.add_decoded_taking_at(&early, stamp + 5_500, &mut |_| true)
-            .new,
-        3
-    );
     // A holder that decides lateness by what it took (one engine holding its own raw, the
     // reference drive) refuses the same raw ahead of its stamp: whether a bin too far ahead opens
     // never depends on how the holder was built (sweep 3, N9). Every way in takes a stamp.

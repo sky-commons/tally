@@ -35,44 +35,47 @@ async fn run() -> Result<(), String> {
 
 /// `tally-relay check`: everything a start does before it reads its keys and opens its sockets,
 /// each refusal included (`prepare`), then the plan on stdout, one `name value` a line: the
-/// memory's, the cores' and the stages' threads.
+/// memory's, the cores' and the stages' threads. Every part of what the relay holds before any
+/// feeder is printed from the plan's own list (`Plan::before_feeders_parts`), with their sum,
+/// `before-feeders`: a part the plan gains is a line printed, and `planned` is `before-feeders`
+/// and the feeders' shares.
 /// The keys are an operator's secrets, not its configuration: a throwaway key stands in for them.
 fn check(config: &Config) -> Result<(), String> {
     let identity = Identity::generate().map_err(|error| error.to_string())?;
     let (hub, _) = prepare(config, &identity)?;
     let budget = hub.budget();
     let threads = budget.threads();
-    let plan = format!(
-        "memory {}\nbase {}\noversize {}\nconnections {}\nconnection-buffers {}\n\
-         per-feeder {}\nfeeders {}\nmemory-feeders {}\ncores {}\ncore-feeders {}\n\
-         ingest-threads {}\nmessage-threads {}\nseal-threads {}\nmlat-threads {}\nmembers {}\n\
-         per-member {}\n\
-         member-feeders {}\nmember-rate-pool {}\nmember-pool {}\nmember-links {}\n\
-         planned {}\nheadroom {}\nlimit {}\n",
-        budget.memory(),
-        budget.base(),
-        budget.plan().oversize(),
-        budget.plan().connections,
-        budget.plan().connection_buffers(),
-        budget.per_feeder().total(),
-        budget.ceiling(),
-        budget.memory_feeders(),
-        config.cores,
-        budget.plan().core_feeders().unwrap_or(usize::MAX),
-        threads.ingest,
-        threads.message,
-        threads.seal,
-        budget.mlat_threads(),
-        budget.members(),
-        budget.plan().per_member(),
-        budget.member_feeders(),
-        budget.plan().member_rate_pool(),
-        budget.plan().member_pool(),
-        budget.plan().member_links(),
-        budget.planned(),
-        HEADROOM_BYTES,
-        config.memory_limit,
-    );
+    let plan = budget.plan();
+    let mut lines: Vec<(&str, usize)> = vec![("memory", budget.memory())];
+    lines.extend(plan.before_feeders_parts());
+    lines.extend([
+        ("before-feeders", plan.before_feeders()),
+        ("connections", plan.connections),
+        ("per-feeder", budget.per_feeder().total()),
+        ("feeders", budget.ceiling()),
+        ("memory-feeders", budget.memory_feeders()),
+        ("cores", config.cores),
+        ("core-feeders", plan.core_feeders().unwrap_or(usize::MAX)),
+        (
+            "feeder-records",
+            usize::try_from(plan.feeder_records_per_sec).unwrap_or(usize::MAX),
+        ),
+        ("ingest-threads", threads.ingest),
+        ("message-threads", threads.message),
+        ("seal-threads", threads.seal),
+        ("mlat-threads", budget.mlat_threads()),
+        ("members", budget.members()),
+        ("per-member", plan.per_member()),
+        ("member-feeders", budget.member_feeders()),
+        ("member-rate-pool", plan.member_rate_pool()),
+        ("planned", budget.planned()),
+        ("headroom", HEADROOM_BYTES),
+        ("limit", config.memory_limit),
+    ]);
+    let plan: String = lines
+        .iter()
+        .map(|(name, value)| format!("{name} {value}\n"))
+        .collect();
     let mut stdout = std::io::stdout();
     stdout
         .write_all(plan.as_bytes())

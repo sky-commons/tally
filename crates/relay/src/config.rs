@@ -20,12 +20,15 @@ usage: tally-relay --key FILE [--key FILE]... --max-upload RATE [options]
                                    arguments, read and checked as a start reads and checks them
                                    (but for the key files, which it does not read, and the
                                    sockets, which it does not open), then print the plan
-                                   (memory, base, oversize, connections, connection-buffers,
-                                   per-feeder, feeders, memory-feeders, cores, core-feeders,
-                                   ingest-threads, message-threads, seal-threads,
-                                   mlat-threads, members,
-                                   per-member, member-feeders, member-rate-pool, member-pool,
-                                   member-links, planned, headroom, limit) and exit 0.
+                                   (memory; what it holds before any feeder, each part: base,
+                                   oversize, connection-buffers, member-pool, member-links,
+                                   parity-assembly, and their sum, before-feeders;
+                                   connections, per-feeder, feeders, memory-feeders, cores,
+                                   core-feeders, feeder-records, ingest-threads,
+                                   message-threads, seal-threads, mlat-threads, members,
+                                   per-member, member-feeders, member-rate-pool, planned,
+                                   headroom, limit)
+                                   and exit 0.
                                    --memory-limit is the memory the relay will run in (the
                                    lesser of its cgroup's limits: a unit's MemoryHigh and
                                    MemoryMax, a container's limits.memory), as it would find it

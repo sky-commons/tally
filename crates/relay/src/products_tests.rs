@@ -1190,13 +1190,16 @@ fn records_wait_apart_from_the_epochs_and_are_taken_in_by_stamp() -> Result<()> 
     let mlat = Mlat::new()?;
     let flood = mlat.solutions(&[0x00c0_0001], BASE_MS, 0, true, 1)?;
     const HELD: usize = 1_000;
-    let budget = products_budget(1 << 20, HELD * flood.as_bytes().len());
+    let len = flood.as_bytes().len();
+    let budget = products_budget(1 << 20, HELD * len);
     let gauge = budget.gauge(Store::Records);
     products.charge_to(&budget);
-    for _ in 0..HELD + 10 {
+    // One peer floods: it fills its own part of the share (`RecordsRoom`), no more.
+    let fits = super::peer_part(super::peers_part(HELD * len)) / len;
+    for _ in 0..fits + 10 {
         products.positions(&flood, BASE_MS + 1_000_000);
     }
-    assert_eq!(gauge.held(), HELD * flood.as_bytes().len());
+    assert_eq!(gauge.held(), fits * len);
     let sink = products.sink();
     for closed_before in 1..=100 {
         let marker = crate::exchange::Frozen {
@@ -1230,12 +1233,15 @@ fn records_wait_apart_from_the_epochs_and_are_taken_in_by_stamp() -> Result<()> 
     let in_time = mlat.solutions(&[0x00c0_0001], BASE_MS + 100, 0, true, 1)?;
     let late = mlat.solutions(&[0x00c0_0002], BASE_MS + 200, 0, true, 2)?;
     let wanted = mlat.model.as_bytes().len() + in_time.as_bytes().len() + late.as_bytes().len();
-    let budget = products_budget(64 * 1024, wanted + HELD * flood.as_bytes().len());
+    let limit = wanted + HELD * len;
+    let budget = products_budget(64 * 1024, limit);
     products.charge_to(&budget);
     products.clock_model(&mlat.model, BASE_MS);
     products.positions(&late, seals);
     products.positions(&in_time, seals - 1);
-    for _ in 0..HELD + 10 {
+    // The flood's signer is not the second engine's: it fills a part of its own.
+    let fits = super::peer_part(super::peers_part(limit)) / len;
+    for _ in 0..fits + 10 {
         products.positions(&flood, BASE_MS + 1_000_000);
     }
     assert_eq!(products.report().records_refused, 10);
@@ -1256,5 +1262,78 @@ fn records_wait_apart_from_the_epochs_and_are_taken_in_by_stamp() -> Result<()> 
     assert_eq!(addresses, vec![(second, 0x00c0_0001)]);
     assert_eq!(products.report().world_late, 1);
     assert_eq!(products.report().epochs_refused, 0);
+    Ok(())
+}
+
+/// Sweep 4, R-N14 and N11: the records the products are handed are charged to who handed them in,
+/// so what is taken never depends on what came first. Peers flooding records past the whole share
+/// each fill their own part and are refused there: a quiet peer's record after a flood by fewer
+/// peers than the parts is taken; and this relay's own MLAT positions are taken after more peers
+/// than there are parts have flooded, from a part no peer's records may take. Handed in the other
+/// way round, the same records are taken.
+#[test]
+fn own_output_and_each_peer_have_a_part_of_the_records_share_whatever_came_first() -> Result<()> {
+    use crate::budget::Store;
+    let own = Mlat::new()?;
+    let peers: Vec<Mlat> = (0..super::PEER_PARTS + 2)
+        .map(|_| Mlat::new())
+        .collect::<Result<_>>()?;
+    let quiet = Mlat::new()?;
+    let one =
+        |mlat: &Mlat, sequence: u64| mlat.solutions(&[0x00c0_0001], BASE_MS, 0, true, sequence);
+    let len = one(&own, 0)?.as_bytes().len();
+    // A share of a hundred records; every record is stamped far ahead, so none is taken in.
+    let limit = 100 * len;
+    let ahead = BASE_MS + 1_000_000;
+    // `flooders` peers flood, before the quiet peer and this relay hand theirs in or after: the
+    // records refused from the quiet peer and from this relay, and what the share holds.
+    let run = |flooders: usize, flood_first: bool| -> Result<(u64, u64, usize)> {
+        let products = Products::new();
+        products.adopt_identity(&own.engine);
+        let budget = products_budget(1 << 20, limit);
+        products.charge_to(&budget);
+        let flood = || -> Result<()> {
+            for peer in &peers[..flooders] {
+                for sequence in 0..200 {
+                    products.positions(&one(peer, sequence)?, ahead);
+                }
+            }
+            Ok(())
+        };
+        let refused = || products.report().records_refused;
+        if flood_first {
+            flood()?;
+        }
+        let before = refused();
+        products.positions(&one(&quiet, 0)?, ahead);
+        let quiet_refused = refused() - before;
+        let before = refused();
+        for sequence in 0..20 {
+            products.positions(&one(&own, sequence)?, ahead);
+        }
+        let own_refused = refused() - before;
+        if !flood_first {
+            flood()?;
+        }
+        Ok((
+            quiet_refused,
+            own_refused,
+            budget.gauge(Store::Records).held(),
+        ))
+    };
+    for flood_first in [true, false] {
+        let (quiet_refused, own_refused, held) = run(super::PEER_PARTS - 1, flood_first)?;
+        assert_eq!(
+            (quiet_refused, own_refused),
+            (0, 0),
+            "peers flooding (first: {flood_first}) cost a quiet peer or this relay its records"
+        );
+        assert!(held <= limit, "the share held {held} of {limit} bytes");
+        let (_, own_refused, _) = run(peers.len(), flood_first)?;
+        assert_eq!(
+            own_refused, 0,
+            "more peers than parts flooding (first: {flood_first}) cost this relay its own"
+        );
+    }
     Ok(())
 }

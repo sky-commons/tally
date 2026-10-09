@@ -1177,8 +1177,10 @@ async fn a_subscribe_naming_too_many_regions_ends_the_session() -> Result {
     Ok(())
 }
 
+/// A feeder past its ingest ceiling is told so (`Reason::OverCeiling`) and dropped: never that the
+/// relay is full, which would excuse a relay told it its shortfalls (`link::End::Full`).
 #[tokio::test]
-async fn a_feeder_over_its_ingest_ceiling_is_told_the_relay_is_full_and_dropped() -> Result {
+async fn a_feeder_over_its_ingest_ceiling_is_told_it_is_over_and_dropped() -> Result {
     let relay = relay(Hub::new(8).max_feeder_bytes_per_sec(1)).await?;
     let receiver = Identity::generate().map_err(text)?;
     let mut feed = connect(&relay, &receiver, Role::Feeder).await?;
@@ -1212,7 +1214,7 @@ async fn a_feeder_over_its_ingest_ceiling_is_told_the_relay_is_full_and_dropped(
     assert_eq!(
         told(&mut feed).await?,
         Some(Record::Goodbye {
-            reason: tally_wire::Reason::Full,
+            reason: tally_wire::Reason::OverCeiling,
             retry_after_secs: 60,
         })
     );
@@ -1576,14 +1578,17 @@ async fn taking(
 }
 
 /// RFC-0174 §2.5, "A relay's members are bounded": three relays take one area. The first holds
-/// every member session its plan admits, so when the third's link brings it the group's data it
-/// is turned away with `Reason::Full`. The third takes that as "this provider is full": it routes
-/// what it would have sent the full relay to the next members of the area's trees, so its
-/// feeder's batches reach the second relay and its subscriber all the same, and it does not dial
-/// the full relay again for the wait it was given (so the full relay turns each relay away once,
-/// never in a loop). The feed runs past several receipt windows and their judgment, and routing
-/// around is no fault on either side (§2.6, "it is not demoted for it"): receipts are signed, no
-/// relay files a shortfall, and none demotes another.
+/// every member session its plan admits but one, so the first relay whose link brings it the
+/// group's data is taken and the other is turned away with `Reason::Full`. The relay turned away
+/// takes that as "this provider is full": it routes what it would have sent the full relay to the
+/// next members of the area's trees, so the feeder's batches on the third relay reach the second
+/// relay and its subscriber all the same, and it does not dial the full relay again for the wait
+/// it was given (so the full relay turns each relay away once, never in a loop). The feed runs
+/// past several receipt windows and their judgment, and routing around is no fault on either side
+/// (§2.6, "it is not demoted for it"), judged relay by relay (sweep 4, R-N20): the full relay
+/// itself, which still takes the group's data over the session it admitted, and the second relay
+/// each receipt a judged window; the third, the origin of the only feed, is owed nothing and
+/// receipts none; and no relay files a shortfall or demotes another.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_relay_whose_members_are_full_is_routed_around_and_the_data_still_arrives() -> Result {
     use tally_relay::sharing::member::{JUDGE_AFTER_MS, RECEIPT_GRACE_MS, RECEIPT_WINDOW_SECONDS};
@@ -1598,12 +1603,16 @@ async fn a_relay_whose_members_are_full_is_routed_around_and_the_data_still_arri
     let (_, full_hub) = taking(full.clone(), &[area], 64_531, &joining).await?;
     let (next_relay, next_hub) = taking(next.clone(), &[area], 64_532, &[]).await?;
     let (third_relay, third_hub) = taking(third.clone(), &[area], 64_533, &[]).await?;
-    // The full relay's member pool, every session its plan admits, held.
+    // The full relay's member pool held, every session its plan admits but one.
     let mut held = Vec::new();
-    while let Some(membership) = full_hub.budget().reserve_member() {
-        held.push(membership);
+    while held.len() + 1 < full_hub.budget().members() {
+        held.push(
+            full_hub
+                .budget()
+                .reserve_member()
+                .ok_or("the member pool held fewer sessions than planned")?,
+        );
     }
-    assert_eq!(held.len(), full_hub.budget().members());
     let full_address = {
         let advertised = full_hub.hints();
         advertised.first().ok_or("no address")?.address.clone()
@@ -1679,40 +1688,43 @@ async fn a_relay_whose_members_are_full_is_routed_around_and_the_data_still_arri
     let wait = judged_at.saturating_sub(tally_relay::network::wall_ms());
     tokio::time::sleep(Duration::from_millis(wait)).await;
 
-    // The full relay said so, and each relay it turned away took it as full: routed around, not
-    // dialled again, so it turned each away exactly once.
+    // The full relay said so, and the one relay it turned away took it as full: routed around,
+    // not dialled again, so it turned it away exactly once.
     let now = tally_relay::network::wall_ms();
-    assert!(
-        third_hub.network().peers.full(now).contains(&full.public()),
-        "the third relay does not hold the first as full"
-    );
     let turned_away = [&next_hub, &third_hub]
         .iter()
         .filter(|hub| hub.network().peers.full(now).contains(&full.public()))
         .count() as u64;
     let refused = full_hub.memory_report().members_refused;
     assert_eq!(
-        refused, turned_away,
+        (refused, turned_away),
+        (1, 1),
         "the full relay turned links away {refused} times, {turned_away} relays hold it as full"
     );
-    // Windows were receipted and judged, and nobody took the route-around for a fault.
+    // Relay by relay: each owed the feed's data receipted a judged window, the origin receipted
+    // none, and nobody took the route-around for a fault.
     let group = tally_relay::sharing::groups::GroupKey::new(area, tally_wire::Streams::RAW);
-    let mut receipts = 0;
-    for (hub, own) in hubs.iter().zip(keys) {
+    for ((hub, own), name) in hubs.iter().zip(keys).zip(["full", "second", "third"]) {
         let (stats, _) = hub.network().sharing.stats();
-        receipts += stats.receipts;
+        let owed = own != third.public();
+        assert_eq!(
+            stats.receipts > 0,
+            owed,
+            "the {name} relay signed {} receipts ({}owed the feed): {stats:?}",
+            stats.receipts,
+            if owed { "" } else { "not " }
+        );
         assert_eq!(
             stats.shortfalls, 0,
-            "a relay filed a shortfall after a route-around"
+            "the {name} relay filed a shortfall after a route-around: {stats:?}"
         );
         for key in keys.iter().filter(|key| **key != own) {
             assert!(
                 !hub.network().sharing.groups.is_demoted(group, key),
-                "a relay demoted another after a route-around"
+                "the {name} relay demoted another after a route-around"
             );
         }
     }
-    assert!(receipts > 0, "no receipt was signed: no window was judged");
     drop(held);
     Ok(())
 }
