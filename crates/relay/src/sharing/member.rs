@@ -98,8 +98,11 @@ pub const JUDGE_AFTER_MS: u64 = 2_000;
 pub const HORIZON_MS: u64 =
     RECEIPT_WINDOW_SECONDS * 1000 + RECEIPT_GRACE_MS + JUDGE_AFTER_MS + REPAIR_AFTER_MS;
 pub const HORIZON_SECONDS: u64 = HORIZON_MS.div_ceil(1000);
-/// The most bytes one answer to a `HaveSummary` carries.
-pub const REPAIR_PAGE_BYTES: usize = 256 * 1024;
+/// The most bytes one answer to a `HaveSummary` carries. It travels as one send over this relay's
+/// member link to the asker, so it is half what may wait for one link
+/// (`peers::WAITING_PER_LINK_BYTES` is twice it): a whole page and its records' overhead fit beside
+/// the stripes' own sends of the tick, never refused whole for being a page.
+pub const REPAIR_PAGE_BYTES: usize = 128 * 1024;
 /// The least time between two answers to one member's `HaveSummary`s.
 pub const ANSWER_INTERVAL_MS: u64 = REPAIR_INTERVAL_MS / 2;
 /// The most manifests held from one origin for one second of one group: `MAX_PIECES` records
@@ -816,8 +819,8 @@ impl Member {
     /// What this relay sends, routed around the members that are full: what one would have been
     /// sent down a stripe goes to the members beneath it there (`Group::beneath`), a manifest to
     /// those beneath it in every stripe, and anything else addressed to it alone is not sent. An
-    /// answer to `asker` goes back as it is: it travels down the asker's own link, not one this
-    /// relay dials.
+    /// answer to `asker` (a repair page) is for it alone and is never routed past it: it goes to
+    /// it over this relay's member link, which sends nothing to a member full now (`peers`).
     fn route(&self, out: Vec<Outgoing>, asker: Option<&PublicKey>, now_ms: u64) -> Vec<Outgoing> {
         if self.full.is_empty() {
             return out;

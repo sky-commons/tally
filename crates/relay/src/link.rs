@@ -65,11 +65,16 @@ const FULL_RETRY_SECS: u32 = 600;
 /// How long a peer refused outright (a broken protocol, a role it may not take) is asked to stay
 /// away.
 const REFUSED_RETRY_SECS: u32 = 86_400;
-/// How long a relay refused because this one has not verified its offer is asked to stay away:
-/// one re-signing of its offers (`directory::OWN_RESIGN_EVERY_MS`), by when its newest offer has
-/// reached this relay and been verified, if it is going to be. A refusal for that is a wait for
-/// gossip, not a verdict, so it is never the day a broken peer is given.
-const UNVERIFIED_RETRY_SECS: u32 = (crate::directory::OWN_RESIGN_EVERY_MS / 1000) as u32;
+/// How long a relay refused because this one has not verified its offer is asked to stay away: no
+/// longer than the dialler's own schedule waits (`Backoff`, from a second, doubling to five
+/// minutes). A refusal for that is a wait for gossip, not a verdict. Offers spread and are verified
+/// within seconds, and two relays learn of each other in either order, so a member dials one that
+/// has not verified it yet as often as not; asked to stay away a re-signing (a minute), its slice
+/// for that member waited a minute, past the repair horizon (`sharing::member::HORIZON_MS`), and
+/// reached it that late or, past its link's share (`peers::WAITING_PER_LINK_BYTES`), not at all.
+/// Its doubling still spaces out a relay whose offer
+/// is never verified, and it is never the day a broken peer is given.
+const UNVERIFIED_RETRY_SECS: u32 = Backoff::FIRST.as_secs() as u32;
 /// How long a connection that sent more than its ingest ceiling is asked to stay away.
 const OVER_CEILING_RETRY_SECS: u32 = 60;
 /// How long a relay turned away because every member session the plan admits is held is asked to
@@ -169,15 +174,15 @@ impl Peer {
         }
     }
 
-    /// Whether a reply the network duties give (`Network::handle`) is sent to the peer: anything
-    /// to a member; the directory to a directory link; to any other peer, only what is control
-    /// to it (an echo's reply, a delivery answer, offers to a feeder that asked). A repair's
-    /// batches and positions therefore reach only a member, and through the upload cap
-    /// (`reply`).
+    /// Whether a reply the network duties give (`Network::handle`) is sent to the peer: to a
+    /// relay, member or not, only the directory; to any other peer, only what is control to it
+    /// (an echo's reply, a delivery answer, offers to a feeder that asked). Data never goes back
+    /// down the session it was asked for on: the far end of a member's session is the link that
+    /// member dialled, which takes no data in (`member`), so a repair page sent there would end
+    /// it. Sharing sends one over this relay's own member link to the asker instead (`peers`).
     fn takes_reply(self, record: &Record, kind: Kind) -> bool {
         match self {
-            Self::Member => true,
-            Self::Relay => on_directory_link(record),
+            Self::Member | Self::Relay => on_directory_link(record),
             Self::Feeder(_) | Self::Subscriber | Self::Engine(_) | Self::Probe => {
                 Class::of(record, kind) == Class::Control
             }
@@ -1744,7 +1749,7 @@ async fn write_loop<S: AsyncWrite>(
                 }
                 Some((last, why)) = farewells.recv() => return Err(Closing::Saying { last: Box::new(last), why }),
                 Some(answers) = replies.recv() => {
-                    reply(writer, hub, link, peer, &mut told, answers).await?;
+                    reply(writer, hub, link, peer, answers).await?;
                 }
                 _ = revouch.tick(), if vouched.is_some() => {
                     vouch(writer, hub, vouched.as_ref()).await?;
@@ -1843,7 +1848,7 @@ async fn write_loop<S: AsyncWrite>(
             }
             Some((last, why)) = farewells.recv() => return Err(Closing::Saying { last: Box::new(last), why }),
             Some(answers) = replies.recv() => {
-                reply(writer, hub, link, peer, &mut told, answers).await?;
+                reply(writer, hub, link, peer, answers).await?;
             }
             _ = revouch.tick(), if vouched.is_some() => {
                 vouch(writer, hub, vouched.as_ref()).await?;
@@ -1964,26 +1969,24 @@ impl Told {
 }
 
 /// Sends the network duties' replies to the peer, each only if its role takes it
-/// (`Peer::takes_reply`): what is control to it at once, as an echo's reply must be; the rest (a
-/// repair's batches and positions, with what they depend on first, as on an addressed send, and
-/// offers to a directory link) by class through the upload cap (`send_data`).
+/// (`Peer::takes_reply`): what is control to it at once, as an echo's reply must be; the rest
+/// (offers to a directory link) by class through the upload cap (`send_data`).
 async fn reply<S: AsyncWrite>(
     writer: &mut Writer<S>,
     hub: &Hub,
     link: &Arc<Link>,
     (peer, key): (Peer, PublicKey),
-    told: &mut Told,
     answers: Vec<Record>,
 ) -> Result<(), Closing> {
     let peer = peer.now(hub, &key);
     let kind = link.kind();
-    let taken: Vec<Record> = answers
-        .into_iter()
-        .filter(|record| peer.takes_reply(record, kind))
-        .collect();
     let mut control = Vec::new();
     let mut by_class: [Vec<Arc<Record>>; Class::ALL.len()] = Default::default();
-    for record in told.before_batches(hub, taken) {
+    for record in answers
+        .into_iter()
+        .filter(|record| peer.takes_reply(record, kind))
+        .map(Arc::new)
+    {
         match Class::of(&record, kind) {
             Class::Control => control.push(record),
             class => by_class[class as usize].push(record),
@@ -2407,8 +2410,8 @@ mod tests {
         let asked = upstream_once(&upstream, &child, &Arc::new(Hub::new(8)))
             .await?
             .map(|away| away.wait);
-        // Neither accepted nor verified: asked to wait one re-signing of its offers, by when its
-        // offer would have been verified if it is going to be.
+        // Neither accepted nor verified: asked to wait gossip's time (its own schedule's first
+        // step), never a re-signing's, so a member whose offer is still spreading is not kept out.
         assert_eq!(
             asked,
             Some(Duration::from_secs(UNVERIFIED_RETRY_SECS.into()))
@@ -2416,9 +2419,10 @@ mod tests {
         Ok(())
     }
 
-    /// A relay that refuses this one (it never verified this relay's offer) is dialled once per
-    /// wait it names, whatever the role dialled: never again at once, never in a loop. And a peer
-    /// that drops every connection at once is dialled less and less often (`Redial`).
+    /// A relay that refuses this one (it never verified this relay's offer, so it asks gossip's
+    /// wait, no longer than the dial schedule's own) and a peer that drops every connection at
+    /// once are each dialled less and less often, whatever the role dialled: never again at once,
+    /// never in a loop (`Redial`).
     #[tokio::test]
     async fn a_dial_that_is_refused_or_dropped_is_not_retried_in_a_hot_loop() -> Result<(), String>
     {
@@ -2455,15 +2459,14 @@ mod tests {
                 Arc::clone(&hub),
                 outgoing,
             ));
-            tokio::time::sleep(Duration::from_secs(3)).await;
+            // Waits of 1, 2 and 4 s (each up to half again): at most three dials in four seconds.
+            tokio::time::sleep(Duration::from_secs(4)).await;
             dialling.abort();
-            assert_eq!(
-                hub.network()
-                    .dials()
-                    .load(std::sync::atomic::Ordering::Relaxed),
-                1,
-                "{role:?}"
-            );
+            let dials = hub
+                .network()
+                .dials()
+                .load(std::sync::atomic::Ordering::Relaxed);
+            assert!((2..=3).contains(&dials), "{role:?}: {dials} dials in 4 s");
         }
         // A peer that takes the connection and drops it unanswered.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -3208,8 +3211,11 @@ mod tests {
         Ok(())
     }
 
+    /// A reply is control or the directory, to a member's session too: data never goes back down
+    /// the session it was asked for on, whose far end (the link a member dialled) takes none in.
+    /// A repair page goes over this relay's own member link to the asker (`sharing`, `peers`).
     #[tokio::test]
-    async fn a_repairs_data_goes_only_to_a_member_and_through_the_cap() -> Result<(), String> {
+    async fn no_data_goes_back_down_the_session_it_was_asked_on() -> Result<(), String> {
         let hub = Arc::new(Hub::new(8).max_upload(roomy()));
         let relay = Identity::generate().map_err(text)?;
         let receiver = Identity::generate().map_err(text)?;
@@ -3224,7 +3230,7 @@ mod tests {
                 Record::Batch(batch(&receiver, 0, 1)?),
             ])
         };
-        for (peer, data) in [(Peer::Relay, false), (Peer::Member, true)] {
+        for peer in [Peer::Relay, Peer::Member] {
             let (near, far) = tokio::io::duplex(1 << 20);
             let far = hub.egress().socket(far, None);
             let link = far.link();
@@ -3243,13 +3249,11 @@ mod tests {
             .map_err(text)?;
             let mut accepted = accepting.await.map_err(text)?.map_err(text)?;
             let key = Identity::generate().map_err(text)?.public();
-            let mut told = Told::new();
             reply(
                 &mut accepted.session.writer,
                 &hub,
                 &link,
                 (peer, key),
-                &mut told,
                 answers()?,
             )
             .await
@@ -3268,13 +3272,11 @@ mod tests {
                 got.iter()
                     .any(|record| matches!(record, Record::EchoReply(_)))
             );
-            assert_eq!(
-                got.iter().any(|record| matches!(record, Record::Batch(_))),
-                data,
+            assert!(
+                !got.iter().any(|record| matches!(record, Record::Batch(_))),
                 "{got:?}"
             );
-            // The member's batch was granted by the cap, in the raw class; the relay link's never
-            // asked it.
+            // Nor was the cap asked for it.
             let raw = hub
                 .egress()
                 .report()
@@ -3282,7 +3284,7 @@ mod tests {
                 .iter()
                 .find(|class| class.class == Class::Raw)
                 .map_or(0, |class| class.asked_bytes_per_sec);
-            assert_eq!(raw > 0, data, "raw asked {raw} B/s");
+            assert_eq!(raw, 0, "raw asked {raw} B/s");
         }
         Ok(())
     }

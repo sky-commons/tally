@@ -926,8 +926,8 @@ fn the_seam_admits_relays_that_ask_and_ignores_clients() -> Outcome {
         source: 2,
         loopback: false,
     };
-    let _ = sharing.assigned(&client, assignment, 1_000);
-    let _ = sharing.assigned(&relay, assignment, 1_000);
+    sharing.assigned(&client, assignment, 1_000);
+    sharing.assigned(&relay, assignment, 1_000);
     if sharing.groups.members(cell, Streams::RAW) != vec![relay.key] {
         return Err("the seam's membership".into());
     }
@@ -1247,7 +1247,7 @@ fn a_parity_is_reassembled_only_for_a_held_manifest_and_charged_as_its_chunks_ar
         .take(usize::from(DATA_STRIPES))
         .collect();
     let signed = manifest(&origin, group, second, &few)?;
-    let _ = sharing.manifest(&asker, signed.clone(), now);
+    sharing.manifest(&asker, signed.clone(), now);
     let longest = 60_000u32;
     let chunk = |manifest: Hash, total: u32, offset: u32, bytes: Vec<u8>| tally_wire::ParityChunk {
         manifest,
@@ -1260,16 +1260,16 @@ fn a_parity_is_reassembled_only_for_a_held_manifest_and_charged_as_its_chunks_ar
         bytes,
     };
     // A manifest nobody signed: nothing held, nothing charged.
-    let _ = sharing.parity_chunk(&asker, chunk([3; 32], longest, 0, vec![1; 100]), now);
+    sharing.parity_chunk(&asker, chunk([3; 32], longest, 0, vec![1; 100]), now);
     if held(&sharing) != 0 || charged(&sharing) != 0 {
         return Err("a chunk for a manifest not held was reassembled".into());
     }
     // A whole longer than the manifest's records allow (one record in a slice) is refused.
     let mut too_long = chunk(signed.hash(), MAX_PARITY_LEN, 0, vec![1; 100]);
     too_long.lens = vec![MAX_PARITY_LEN; usize::from(DATA_STRIPES)];
-    let _ = sharing.parity_chunk(&asker, too_long, now);
+    sharing.parity_chunk(&asker, too_long, now);
     // And a relay the group does not know is refused for a manifest it does hold.
-    let _ = sharing.parity_chunk(
+    sharing.parity_chunk(
         &relay(identity(2).public()),
         chunk(signed.hash(), longest, 0, vec![1; 100]),
         now,
@@ -1278,7 +1278,7 @@ fn a_parity_is_reassembled_only_for_a_held_manifest_and_charged_as_its_chunks_ar
         return Err("a parity past its records, or from a stranger, was reassembled".into());
     }
     // A first chunk of a held manifest is charged what it brought, never the whole declared.
-    let _ = sharing.parity_chunk(&asker, chunk(signed.hash(), longest, 0, vec![1; 100]), now);
+    sharing.parity_chunk(&asker, chunk(signed.hash(), longest, 0, vec![1; 100]), now);
     let first = charged(&sharing);
     if held(&sharing) != 1 || first == 0 || first >= 1_000 {
         return Err(format!(
@@ -1286,11 +1286,11 @@ fn a_parity_is_reassembled_only_for_a_held_manifest_and_charged_as_its_chunks_ar
         ));
     }
     // The same bytes again add nothing; an overlapping chunk adds only what is new.
-    let _ = sharing.parity_chunk(&asker, chunk(signed.hash(), longest, 0, vec![1; 100]), now);
+    sharing.parity_chunk(&asker, chunk(signed.hash(), longest, 0, vec![1; 100]), now);
     if charged(&sharing) != first {
         return Err("a chunk sent twice was charged twice".into());
     }
-    let _ = sharing.parity_chunk(&asker, chunk(signed.hash(), longest, 50, vec![1; 100]), now);
+    sharing.parity_chunk(&asker, chunk(signed.hash(), longest, 50, vec![1; 100]), now);
     let overlapped = charged(&sharing) - first;
     if !(50..1_000).contains(&overlapped) {
         return Err(format!("an overlap of 50 new bytes charged {overlapped}"));
@@ -1316,7 +1316,7 @@ fn a_parity_is_reassembled_only_for_a_held_manifest_and_charged_as_its_chunks_ar
         let mut listed = hashes(tally_wire::sharing::MAX_PIECES, 5);
         listed.iter_mut().for_each(|hash| hash[31] = salt);
         let signed = manifest(&origin, group, second, &listed)?;
-        let _ = sharing.manifest(&asker, signed.clone(), now);
+        sharing.manifest(&asker, signed.clone(), now);
         manifests.push(signed.hash());
     }
     let longest_chunk = |manifest: Hash, offset: usize, len: usize| {
@@ -1335,7 +1335,7 @@ fn a_parity_is_reassembled_only_for_a_held_manifest_and_charged_as_its_chunks_ar
     let last = whole - whole % MAX_PARITY_CHUNK;
     for manifest in &manifests[..2] {
         for offset in (0..last).step_by(MAX_PARITY_CHUNK) {
-            let _ = sharing.parity_chunk(
+            sharing.parity_chunk(
                 &asker,
                 longest_chunk(*manifest, offset, MAX_PARITY_CHUNK)?,
                 now,
@@ -1345,7 +1345,7 @@ fn a_parity_is_reassembled_only_for_a_held_manifest_and_charged_as_its_chunks_ar
     if held(&sharing) != 2 {
         return Err(format!("{} parities reassembling, not 2", held(&sharing)));
     }
-    let _ = sharing.parity_chunk(
+    sharing.parity_chunk(
         &asker,
         longest_chunk(manifests[2], 0, MAX_PARITY_CHUNK)?,
         now,
@@ -1355,15 +1355,15 @@ fn a_parity_is_reassembled_only_for_a_held_manifest_and_charged_as_its_chunks_ar
     }
     // Another sender's room is its own.
     let theirs = manifest(&other, group, second, &few)?;
-    let _ = sharing.manifest(&relay(other.public()), theirs.clone(), now);
+    sharing.manifest(&relay(other.public()), theirs.clone(), now);
     let mut first_of_theirs = chunk(theirs.hash(), longest, 0, vec![1; 100]);
     first_of_theirs.second = second;
-    let _ = sharing.parity_chunk(&relay(other.public()), first_of_theirs, now);
+    sharing.parity_chunk(&relay(other.public()), first_of_theirs, now);
     if held(&sharing) != 3 {
         return Err("another sender was refused for the first's share".into());
     }
     // The longest finishes within the share, and is taken as the member's parity.
-    let _ = sharing.parity_chunk(
+    sharing.parity_chunk(
         &asker,
         longest_chunk(manifests[0], last, whole - last)?,
         now,
@@ -1474,7 +1474,7 @@ fn a_relay_that_only_asked_is_in_no_tree() -> Outcome {
     let offered = identity(1);
     hold_offer(&hub, &offered, cell, 0b1111, START_MS)?;
     let asker = relay(identity(2).public());
-    let _ = sharing.assigned(
+    sharing.assigned(
         &asker,
         tally_wire::StripeAssignment {
             cell,
