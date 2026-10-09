@@ -38,8 +38,14 @@
 //!
 //! **Queries are cheap and rationed.** A query names at most `MAX_SEQUENCES` batches, each found
 //! by its sequence in a stream kept in sequence order (a binary search, never a scan), and a
-//! session is answered at most `SESSION_QUERIES` queries at once, one more each
-//! `SESSION_QUERY_EVERY_MS`: the shard locks ingest holds batches under are never a querier's.
+//! prober is answered at most `PROBER_QUERIES` queries at once, one more each
+//! `PROBER_QUERY_EVERY_MS`: the shard locks ingest holds batches under are never a querier's. The
+//! allowance is never a connection's and never a bare key's, since a key is free: it is held in
+//! the record of a receiver that fed the relay (a feeder asks as its receiver's key, about its own
+//! batches), so it is bounded as the receivers watched are and outlives the prober's reconnects,
+//! and a key that never fed the relay shares one allowance with every other such key (`strangers`).
+//! A fresh key per connection therefore starts from what the strangers left, never from a full
+//! allowance of its own, and takes nothing from any feeder's.
 //!
 //! The state is sharded by receiver, under a process-secret hash, so one lock is never every
 //! feeder's.
@@ -55,7 +61,6 @@ use tally_wire::{
     Region, Tag, TagKey, TagKeysContent, delivery_tag,
 };
 
-use crate::bounded::Bounded;
 use crate::budget::{Charge, Gauge, Store};
 use crate::selection::Selection;
 
@@ -78,12 +83,11 @@ pub const STREAM_MEMORY_MS: u64 = 60 * 60 * 1000;
 /// How recently a receiver must have fed the relay a batch for its grant to be taken: a feeder
 /// grants every minute, to members its batches reach, so a window is ample.
 pub const FED_WITHIN_MS: u64 = TAG_WINDOW_MS;
-/// Queries one session is answered at once, and how often it may ask one more: a feeder asks a
-/// member once a check, over a session of its own.
-pub const SESSION_QUERIES: u32 = 4;
-pub const SESSION_QUERY_EVERY_MS: u64 = 1_000;
-/// Sessions whose allowance is remembered.
-const SESSIONS_REMEMBERED: usize = 4_096;
+/// Queries one prober (a receiver that fed the relay, by its key) is answered at once, and how
+/// often it may ask one more, over all its sessions: a feeder asks a member once a check, and
+/// grants it keys once a minute. Every key that never fed the relay, together, is one prober.
+pub const PROBER_QUERIES: u32 = 4;
+pub const PROBER_QUERY_EVERY_MS: u64 = 1_000;
 /// Locks the state is split under.
 const SHARDS: usize = 64;
 
@@ -102,15 +106,16 @@ pub struct Delivery {
     /// Which shard a receiver is in: secret, so no feeder grinds keys into one.
     placement: RandomState,
     /// Batches refused whole past a bound, grants refused from a receiver that has not fed here,
-    /// and queries past their session's allowance.
+    /// and queries past their prober's allowance.
     refused: AtomicU64,
     refused_keys: AtomicU64,
     unanswered: AtomicU64,
     /// The store's gauge (`budget::Store::Delivery`), which each shard's entries are charged to:
     /// unlimited until the relay charges the store to its budget (`charge_to`).
     gauge: Mutex<std::sync::Arc<Gauge>>,
-    /// Each session's allowance of queries: (left, as of when).
-    sessions: Mutex<Bounded<u64, (u32, u64)>>,
+    /// The one allowance of every prober whose key is no receiver the relay watches: a key that
+    /// never fed it, which costs nothing to make (`Allowance`).
+    strangers: Mutex<Option<Allowance>>,
 }
 
 impl Default for Delivery {
@@ -161,6 +166,43 @@ struct Receiver {
     keys: Option<Keys>,
     /// Entries it holds over all its streams (`ENTRIES_PER_RECEIVER`).
     entries: usize,
+    /// Its queries' allowance, when it asks as itself (`Delivery::allowed`): held here, so it is
+    /// bounded as the receivers are and a reconnect earns it nothing.
+    allowance: Allowance,
+}
+
+/// A prober's queries: `left` of `PROBER_QUERIES`, one more earned each `PROBER_QUERY_EVERY_MS`
+/// after `as_of_ms`.
+#[derive(Clone, Copy)]
+struct Allowance {
+    left: u32,
+    as_of_ms: u64,
+}
+
+impl Allowance {
+    fn full(now_ms: u64) -> Self {
+        Self {
+            left: PROBER_QUERIES,
+            as_of_ms: now_ms,
+        }
+    }
+
+    /// Spends one query at `now_ms` if one is left after what it earned since; false if none is.
+    fn spend(&mut self, now_ms: u64) -> bool {
+        let earned = now_ms.saturating_sub(self.as_of_ms) / PROBER_QUERY_EVERY_MS;
+        let left = u64::from(self.left)
+            .saturating_add(earned)
+            .min(u64::from(PROBER_QUERIES));
+        self.as_of_ms = self
+            .as_of_ms
+            .saturating_add(earned.saturating_mul(PROBER_QUERY_EVERY_MS));
+        let Some(left) = left.checked_sub(1) else {
+            self.left = 0;
+            return false;
+        };
+        self.left = u32::try_from(left).unwrap_or(0);
+        true
+    }
 }
 
 /// A feeder's keys for this relay: `current` until `switch_at_ms`, then `next` for a period.
@@ -219,7 +261,7 @@ impl Delivery {
             refused: AtomicU64::new(0),
             refused_keys: AtomicU64::new(0),
             unanswered: AtomicU64::new(0),
-            sessions: Mutex::new(Bounded::new(SESSIONS_REMEMBERED)),
+            strangers: Mutex::new(None),
         }
     }
 
@@ -275,22 +317,23 @@ impl Delivery {
         }
     }
 
-    /// The signed answer to `query`, asked on session `session`, from a feeder whose signed
+    /// The signed answer to `query`, asked by `prober` (the key its session's handshake proved),
+    /// about a feeder whose signed
     /// location falls at `point`: per sequence asked, its tag, "not seen" for one known never to
     /// have come, and nothing for one the relay cannot speak for; or, outside the areas the relay
     /// takes, that it does not take the area and nothing else. The query's keys, if it carries a
     /// grant for this relay signed by a feeder of an area it takes that fed it recently, are taken
-    /// first. None past the session's allowance (`SESSION_QUERIES`), counted.
+    /// first. None past the prober's allowance (`PROBER_QUERIES`), counted.
     pub fn answer_at(
         &self,
         selection: &Selection,
         identity: Option<&Identity>,
         query: &DeliveryQuery,
-        (point, session): (Option<Region>, u64),
+        (point, prober): (Option<Region>, PublicKey),
         now_ms: u64,
     ) -> Option<DeliveryAnswer> {
         let identity = identity?;
-        if !self.allowed(session, now_ms) {
+        if !self.allowed(prober, now_ms) {
             self.unanswered.fetch_add(1, Ordering::Relaxed);
             return None;
         }
@@ -331,25 +374,24 @@ impl Delivery {
         DeliveryAnswer::sign(identity, &content).ok()
     }
 
-    /// Whether session `session` may be answered one more query at `now_ms`, and if so spends it.
-    fn allowed(&self, session: u64, now_ms: u64) -> bool {
-        let Ok(mut sessions) = self.sessions.lock() else {
+    /// Whether `prober` may be answered one more query at `now_ms`, and if so spends it: from its
+    /// own allowance if it is a receiver the relay watches (one that fed it), else from the one
+    /// every other key shares.
+    fn allowed(&self, prober: PublicKey, now_ms: u64) -> bool {
+        {
+            let Some(mut shard) = self.shard(&prober) else {
+                return false;
+            };
+            if let Some(record) = shard.receivers.get_mut(&prober) {
+                return record.allowance.spend(now_ms);
+            }
+        }
+        let Ok(mut strangers) = self.strangers.lock() else {
             return false;
         };
-        let (left, as_of) = sessions
-            .get(&session)
-            .copied()
-            .unwrap_or((SESSION_QUERIES, now_ms));
-        let earned = now_ms.saturating_sub(as_of) / SESSION_QUERY_EVERY_MS;
-        let left = u64::from(left)
-            .saturating_add(earned)
-            .min(u64::from(SESSION_QUERIES));
-        let as_of = as_of.saturating_add(earned * SESSION_QUERY_EVERY_MS);
-        let Some(left) = left.checked_sub(1) else {
-            return false;
-        };
-        sessions.insert(session, (u32::try_from(left).unwrap_or(0), as_of));
-        true
+        strangers
+            .get_or_insert_with(|| Allowance::full(now_ms))
+            .spend(now_ms)
     }
 
     /// `receiver`'s grant, its signature already checked: what `answer_at` takes.
@@ -397,7 +439,7 @@ impl Delivery {
     }
 
     /// Batches refused whole past a bound, grants refused from a receiver that has not fed here
-    /// (or not of the relay's areas), and queries past their session's allowance, since start.
+    /// (or not of the relay's areas), and queries past their prober's allowance, since start.
     pub fn refused(&self) -> u64 {
         self.refused.load(Ordering::Relaxed)
     }
@@ -453,6 +495,7 @@ impl Shard {
             unsure_until_ms: 0,
             keys: None,
             entries: 0,
+            allowance: Allowance::full(now_ms),
         });
         record.fed_ms = record.fed_ms.max(now_ms);
         // A receiver first watched now may have sent earlier batches the relay did not see.
@@ -724,7 +767,7 @@ mod tests {
     use super::*;
     use tally_wire::delivery::{TAG_KEY_LEN, key_period, tag_keys_for};
     use tally_wire::rendezvous::area_of;
-    use tally_wire::{BatchContent, Location, SequenceRange, TagKeys};
+    use tally_wire::{BatchContent, Location, Record, SequenceRange, TagKeys};
 
     type Result = std::result::Result<(), String>;
 
@@ -758,10 +801,12 @@ mod tests {
     /// The boot the helpers feed under to make a receiver one that fed the relay.
     const FEEDING_BOOT: u64 = u64::MAX;
 
-    /// A fresh session, so each ask has its own allowance.
-    fn session() -> u64 {
+    /// A key that never fed the relay, fresh each call.
+    fn prober() -> PublicKey {
         static NEXT: AtomicU64 = AtomicU64::new(1);
-        NEXT.fetch_add(1, Ordering::Relaxed)
+        let mut seed = [5; 32];
+        seed[..8].copy_from_slice(&NEXT.fetch_add(1, Ordering::Relaxed).to_be_bytes());
+        Identity::from_seed(seed).public()
     }
 
     fn batch(feeder: &Identity, boot_id: u64, sequence: u64) -> std::result::Result<Batch, String> {
@@ -861,7 +906,8 @@ mod tests {
                 .hold(&self.selection, batch, Some(self.point), now_ms);
         }
 
-        /// The answer to `query` from a receiver at `point`, on a fresh session.
+        /// The answer to `query` from a receiver at `point`, asked as a feeder asks: by the
+        /// receiver's own key.
         fn ask_at(
             &self,
             query: &DeliveryQuery,
@@ -873,7 +919,7 @@ mod tests {
                     &self.selection,
                     Some(&self.identity),
                     query,
-                    (point, session()),
+                    (point, query.receiver),
                     now_ms,
                 )
                 .ok_or("no answer")?
@@ -933,7 +979,7 @@ mod tests {
                 &relay.selection,
                 Some(&relay.identity),
                 &asked,
-                (Some(relay.point), session()),
+                (Some(relay.point), feeder.public()),
                 now + 1_000,
             )
             .ok_or("no answer")?;
@@ -1044,7 +1090,7 @@ mod tests {
                     &relay.selection,
                     None,
                     &query(&feeder, 1, 1, 1),
-                    (None, session()),
+                    (None, prober()),
                     WATCHED
                 )
                 .is_none()
@@ -1065,35 +1111,42 @@ mod tests {
                     ..query(feeder, 0, 0, 0)
                 })
             };
-        // A thousand fresh keys, each granting: none is taken.
-        for _ in 0..1_000 {
+        // A thousand fresh keys, each granting (at the pace the keys that never fed are answered
+        // at, together): none is taken.
+        for at in 0..1_000 {
             let fresh = Identity::generate().map_err(text)?;
-            relay.ask(&grant_of(&fresh, T0)?, T0)?;
+            let now = T0 + at * PROBER_QUERY_EVERY_MS;
+            relay.ask(&grant_of(&fresh, now)?, now)?;
         }
         assert_eq!(relay.delivery.keyed(), 0);
         assert_eq!(relay.delivery.refused_keys(), 1_000);
         // A feeder that fed: taken.
+        let start = T0 + 1_000 * PROBER_QUERY_EVERY_MS;
         let feeder = Identity::generate().map_err(text)?;
-        relay.hold(&batch(&feeder, 1, 1)?, T0);
-        relay.ask(&grant_of(&feeder, T0 + 1)?, T0 + 1)?;
+        relay.hold(&batch(&feeder, 1, 1)?, start);
+        relay.ask(&grant_of(&feeder, start + 1)?, start + 1)?;
         assert_eq!(relay.delivery.keyed(), 1);
         // One that fed, but longer ago than `FED_WITHIN_MS`: not taken.
         let quiet = Identity::generate().map_err(text)?;
-        relay.hold(&batch(&quiet, 1, 1)?, T0);
-        let late = T0 + FED_WITHIN_MS + 1;
+        relay.hold(&batch(&quiet, 1, 1)?, start);
+        let late = start + FED_WITHIN_MS + 1;
         relay.ask(&grant_of(&quiet, late)?, late)?;
         assert_eq!(relay.delivery.keyed(), 1);
         Ok(())
     }
 
-    /// Item 21 of the sweep: a session is answered `SESSION_QUERIES` queries at once and one more
-    /// each `SESSION_QUERY_EVERY_MS`; past that it is not answered, and counted.
+    /// Item 21 of sweep 2, P21 of sweep 3: a prober is answered `PROBER_QUERIES` queries at once
+    /// and one more each `PROBER_QUERY_EVERY_MS`; past that it is not answered, and counted. The
+    /// allowance is in the record of the receiver that fed the relay, so reconnecting (a new
+    /// session, the same key) earns it nothing; another feeder has its own.
     #[test]
-    fn a_session_is_answered_at_its_allowance() -> Result {
+    fn a_prober_is_answered_at_its_allowance_however_often_it_reconnects() -> Result {
         let relay = Relay::new()?;
         let feeder = Identity::generate().map_err(text)?;
-        // Drawn like every other session, so no fresh one below is this one.
-        let this = session();
+        let other = Identity::generate().map_err(text)?;
+        relay.hold(&unsigned(&feeder.public(), FEEDING_BOOT, 0, 0)?, T0);
+        relay.hold(&unsigned(&other.public(), FEEDING_BOOT, 0, 0)?, T0);
+        let this = feeder.public();
         let ask = |now_ms: u64| {
             relay.delivery.answer_at(
                 &relay.selection,
@@ -1103,16 +1156,51 @@ mod tests {
                 now_ms,
             )
         };
-        for _ in 0..SESSION_QUERIES {
+        for _ in 0..PROBER_QUERIES {
             assert!(ask(T0).is_some());
         }
-        assert!(ask(T0).is_none());
-        assert!(ask(T0 + SESSION_QUERY_EVERY_MS - 1).is_none());
-        assert!(ask(T0 + SESSION_QUERY_EVERY_MS).is_some());
-        assert!(ask(T0 + SESSION_QUERY_EVERY_MS).is_none());
-        assert_eq!(relay.delivery.unanswered(), 3);
-        // Another session has its own.
-        assert!(relay.ask(&query(&feeder, 1, 0, 63), T0).is_ok());
+        // A session ends and the prober dials again, many times: still nothing until it earns it.
+        for _ in 0..16 {
+            assert!(ask(T0).is_none());
+        }
+        assert!(ask(T0 + PROBER_QUERY_EVERY_MS - 1).is_none());
+        assert!(ask(T0 + PROBER_QUERY_EVERY_MS).is_some());
+        assert!(ask(T0 + PROBER_QUERY_EVERY_MS).is_none());
+        assert_eq!(relay.delivery.unanswered(), 18);
+        // Another feeder has its own.
+        assert!(relay.ask(&query(&other, 1, 0, 63), T0).is_ok());
+        Ok(())
+    }
+
+    /// R-P21 of sweep 4: a key is free, so a prober that takes a fresh one for every connection
+    /// is answered no more than every key that never fed the relay is together, and takes nothing
+    /// from a feeder's own allowance, however many keys it makes.
+    #[test]
+    fn a_fresh_key_per_connection_earns_no_fresh_allowance() -> Result {
+        let relay = Relay::new()?;
+        let feeder = Identity::generate().map_err(text)?;
+        relay.hold(&unsigned(&feeder.public(), FEEDING_BOOT, 0, 0)?, T0);
+        let asked = |prober: PublicKey, now_ms: u64| {
+            relay
+                .delivery
+                .answer_at(
+                    &relay.selection,
+                    Some(&relay.identity),
+                    &query(&feeder, 1, 0, 63),
+                    (Some(relay.point), prober),
+                    now_ms,
+                )
+                .is_some()
+        };
+        let fresh = (0..1_000).filter(|_| asked(prober(), T0)).count();
+        assert_eq!(fresh, PROBER_QUERIES as usize);
+        // Earned back at the strangers' pace, not per key.
+        let later = T0 + PROBER_QUERY_EVERY_MS;
+        let fresh = (0..1_000).filter(|_| asked(prober(), later)).count();
+        assert_eq!(fresh, 1);
+        // The feeder's own allowance is untouched.
+        let own = (0..1_000).filter(|_| asked(feeder.public(), later)).count();
+        assert_eq!(own, PROBER_QUERIES as usize);
         Ok(())
     }
 
@@ -1448,6 +1536,39 @@ mod tests {
         assert!(asked(&churner, 0)?.is_empty());
         // An unknown boot of the churner may be one it forgot: not denied either.
         assert!(asked(&churner, boots + 5)?.is_empty());
+        Ok(())
+    }
+
+    /// P21 of sweep 3 and R-P21 of sweep 4, through the relay's own dispatch: a prober that asks
+    /// on a new connection each time (a new hub source), with the same key or a fresh one each
+    /// time, is answered no more than one allowance.
+    #[test]
+    fn a_probers_allowance_survives_its_reconnects() -> Result {
+        let hub = crate::hub::Hub::new(8);
+        hub.network()
+            .adopt_identity(Identity::generate().map_err(text)?);
+        let feeder = Identity::generate().map_err(text)?;
+        let same = prober();
+        let answered = (1..=8 * u64::from(PROBER_QUERIES))
+            .filter(|source| {
+                let key = if source % 2 == 0 { same } else { prober() };
+                let asker = crate::network::Asker {
+                    role: crate::network::AskerRole::Feeder,
+                    key,
+                    source: *source,
+                    loopback: false,
+                };
+                !hub.network()
+                    .handle(
+                        &hub,
+                        &asker,
+                        Record::DeliveryQuery(query(&feeder, 1, 0, 3)),
+                        T0,
+                    )
+                    .is_empty()
+            })
+            .count();
+        assert_eq!(answered, PROBER_QUERIES as usize);
         Ok(())
     }
 }

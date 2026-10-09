@@ -133,6 +133,10 @@ pub struct Traffic {
     pub receivers: Vec<Receiver>,
     messages: Vec<Vec<u8>>,
     period_s: u32,
+    /// The Unix time a GNSS-disciplined receiver's counter reads in the first second the
+    /// simulation plays (`second_of`'s second 1, its scenario's first second after the thin one):
+    /// what `frames` moves those counters from, so they read the run's own UTC time of day.
+    gps_first_unix_ms: u64,
     pub calibration: Calibration,
 }
 
@@ -323,10 +327,12 @@ impl Traffic {
             .sum::<usize>() as f64
             / period.max(1) as f64;
         let deduplicated_per_sec = expected_deduplicated(&heard_contents);
+        let first = Scenario::new(0);
         Ok(Self {
             receivers,
             messages,
             period_s: spec.period_s,
+            gps_first_unix_ms: first.midnight_unix_ms + (first.start_tod_s * 1000.0) as u64 + 1000,
             calibration: Calibration {
                 in_reach_per_sec,
                 probability,
@@ -340,8 +346,12 @@ impl Traffic {
     }
 
     /// The receptions `receiver` (by its place in `receivers`) makes in second `second` of the
-    /// run, as its decoder would hand them over, the counters moved on by the loops before it.
-    pub fn frames(&self, receiver: usize, second: u64, into: &mut Vec<Frame>) {
+    /// run, as its decoder would hand them over, the counters moved on by the loops before it. A
+    /// GNSS-disciplined receiver's counter is the UTC time of day, so it is moved to the run's
+    /// own: second `second` of a run whose second 0 began at `start_unix_ms` reads that wall clock,
+    /// as a real Radarcape's does, never the scenario's (else every model whose gauge is one
+    /// dates its solutions hours from the wall clock of the batches that carried them).
+    pub fn frames(&self, receiver: usize, second: u64, start_unix_ms: u64, into: &mut Vec<Frame>) {
         let Some(receiver) = self.receivers.get(receiver) else {
             return;
         };
@@ -365,7 +375,11 @@ impl Traffic {
             } else {
                 FrameKind::ModeSShort
             };
-            if let Ok(frame) = Frame::new(kind, advance(heard.stamp, moved, gps), 128, data) {
+            let mut stamp = advance(heard.stamp, moved, gps);
+            if gps {
+                stamp = shift_time_of_day(stamp, start_unix_ms, self.gps_first_unix_ms);
+            }
+            if let Ok(frame) = Frame::new(kind, stamp, 128, data) {
                 into.push(frame);
             }
         }
@@ -389,6 +403,19 @@ pub fn advance(stamp: u64, seconds: u64, gps: bool) -> u64 {
     }
 }
 
+/// Nanoseconds in a UTC day.
+const DAY_NANOS: i128 = 86_400 * 1_000_000_000;
+
+/// A Radarcape GPS counter (seconds of the UTC day above 30 bits of nanoseconds) that read
+/// `from_unix_ms` moved to read `to_unix_ms` instead, around the day.
+pub fn shift_time_of_day(stamp: u64, to_unix_ms: u64, from_unix_ms: u64) -> u64 {
+    let nanos = i128::from(stamp >> 30) * 1_000_000_000 + i128::from(stamp & ((1 << 30) - 1));
+    let shift = (i128::from(to_unix_ms) - i128::from(from_unix_ms)) * 1_000_000;
+    let moved = (nanos + shift).rem_euclid(DAY_NANOS);
+    let (seconds, nanos) = (moved / 1_000_000_000, moved % 1_000_000_000);
+    ((seconds as u64) << 30) | nanos as u64
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -399,6 +426,59 @@ mod tests {
         assert_eq!(advance(COUNTER_MASK, 1, false), TICKS_A_SECOND - 1);
         let stamp = (86_399 << 30) | 7;
         assert_eq!(advance(stamp, 2, true), (1 << 30) | 7);
+    }
+
+    #[test]
+    fn a_gps_counter_reads_the_runs_time_of_day() {
+        // 12:00:00.5 in the scenario, played in a run whose second 0 began at 06:54:57.25 UTC
+        // the scenario day's next day: it reads 06:54:57.75.
+        let day_ms = 86_400_000u64;
+        let scenario_ms = 20 * day_ms + 43_200_000;
+        let stamp = (43_200 << 30) | 500_000_000;
+        let run_ms = 21 * day_ms + 24_897_250;
+        assert_eq!(
+            shift_time_of_day(stamp, run_ms, scenario_ms),
+            (24_897 << 30) | 750_000_000
+        );
+        // Earlier in the day than the scenario's: around midnight, never negative.
+        let stamp = (10 << 30) | 1;
+        assert_eq!(
+            shift_time_of_day(stamp, scenario_ms - 20_000, scenario_ms),
+            ((86_390) << 30) | 1
+        );
+    }
+
+    #[test]
+    fn played_frames_of_a_gps_receiver_read_the_wall_clock() -> Result<(), String> {
+        let spec = Spec {
+            feeders: 120,
+            receptions_per_sec: 20.0,
+            aircraft: 300,
+            period_s: 3,
+            seed: 0,
+        };
+        let traffic = Traffic::build(&spec, 0..120)?;
+        let gps = traffic
+            .receivers
+            .iter()
+            .position(|each| each.clock == Clock::RadarcapeGps)
+            .ok_or("no GNSS receiver simulated")?;
+        let start_ms = 1_791_528_897_000u64;
+        for second in [0u64, 4, 7] {
+            let mut frames = Vec::new();
+            traffic.frames(gps, second, start_ms, &mut frames);
+            assert!(!frames.is_empty());
+            let second_of_day = (start_ms / 1000 + second) % 86_400;
+            for frame in &frames {
+                let read = frame.timestamp() >> 30;
+                // Within the second it is played in, give or take the simulated clock's error.
+                assert!(
+                    read == second_of_day || read + 1 == second_of_day || read == second_of_day + 1,
+                    "second {second}: read {read}, wall {second_of_day}"
+                );
+            }
+        }
+        Ok(())
     }
 
     #[test]
@@ -422,14 +502,14 @@ mod tests {
             assert_eq!(mine.index, theirs.index);
             assert_eq!(mine.identity.public(), theirs.identity.public());
             let (mut a, mut b) = (Vec::new(), Vec::new());
-            shard.frames(mine.index - 185, 4, &mut a);
-            whole.frames(theirs.index, 4, &mut b);
+            shard.frames(mine.index - 185, 4, 0, &mut a);
+            whole.frames(theirs.index, 4, 0, &mut b);
             assert_eq!(a, b);
         }
         // Each second is heard once a loop, counters later by the loop.
         let (mut first, mut again) = (Vec::new(), Vec::new());
-        whole.frames(0, 1, &mut first);
-        whole.frames(0, 4, &mut again);
+        whole.frames(0, 1, 0, &mut first);
+        whole.frames(0, 4, 0, &mut again);
         assert_eq!(first.len(), again.len());
         assert!(!first.is_empty());
         Ok(())

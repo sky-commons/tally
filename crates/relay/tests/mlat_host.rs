@@ -50,6 +50,7 @@ use tokio::time::timeout;
 const RELAY_THREADS: tally_relay::ingest::Threads = tally_relay::ingest::Threads {
     ingest: 2,
     message: 2,
+    seal: 2,
 };
 
 type Result<T = ()> = std::result::Result<T, String>;
@@ -122,6 +123,60 @@ impl MlatHost for Pinned {
     }
 }
 
+/// The tests of this binary, as the build runs them: one target each (`crates/relay/BUILD.bazel`,
+/// `_MLAT_HOST_TESTS`, each `--exact` with [`EVERY_TEST_HAS_ONE_TARGET`]), whose names the build
+/// hands the binary when it compiles it. None under Cargo, which runs every test of the binary at
+/// once and so selects none by name.
+const TARGETS: Option<&str> = option_env!("MLAT_HOST_TESTS");
+
+/// The guard every target runs beside its own test (`every_test_has_one_target`).
+const EVERY_TEST_HAS_ONE_TARGET: &str = "every_test_has_one_target";
+
+/// Sweep 3, N20: a target selects its test by exact name, and libtest runs no test at all, green,
+/// for a name it does not have. So every target runs this beside its own: the tests this binary
+/// has, as libtest lists them (the binary asked for its own list), are exactly the ones the
+/// build's targets name, so a test renamed, added or removed without its target fails every
+/// target, and no target can run nothing and pass.
+#[test]
+fn every_test_has_one_target() -> Result {
+    let Some(targets) = TARGETS else {
+        // Under Cargo every test here runs in this one binary: there is no target to miss one.
+        return Ok(());
+    };
+    let named: BTreeSet<&str> = targets.split_whitespace().collect();
+    let exe = std::env::current_exe().map_err(text)?;
+    let listed = std::process::Command::new(&exe)
+        .args(["--list", "--format", "terse"])
+        .output()
+        .map_err(text)?;
+    if !listed.status.success() {
+        return Err(format!("{} --list: {}", exe.display(), listed.status));
+    }
+    let listed = String::from_utf8(listed.stdout).map_err(text)?;
+    let tests: BTreeSet<&str> = listed
+        .lines()
+        .filter_map(|line| line.strip_suffix(": test"))
+        .filter(|test| *test != EVERY_TEST_HAS_ONE_TARGET)
+        .collect();
+    assert!(!tests.is_empty(), "libtest listed no tests: {listed}");
+    assert_eq!(
+        tests, named,
+        "the tests here and the targets that run them (crates/relay/BUILD.bazel, _MLAT_HOST_TESTS)"
+    );
+    // And the test this run was asked for is one of them.
+    let asked: Vec<String> = std::env::args()
+        .skip(1)
+        .filter(|arg| !arg.starts_with('-') && arg != EVERY_TEST_HAS_ONE_TARGET)
+        .collect();
+    for test in &asked {
+        assert!(
+            named.contains(test.as_str()),
+            "asked for {test}, which no target names"
+        );
+    }
+    Ok(())
+}
+
 /// The areas within about 150 km of the simulator's centre.
 fn areas() -> Result<Vec<Region>> {
     let (lat, lon) = sim::CENTRE;
@@ -150,8 +205,11 @@ fn wall_ms() -> u64 {
 }
 
 /// A scenario whose first 30 seconds fill the solved bins of the newest window already due by the
-/// relay's clock, and whose last 15 come after it: the first phase is solved the moment the relay
-/// steps, and the second is recent enough for that window's models to carry.
+/// relay's clock, and whose last 30 come after it: the first phase is solved the moment the relay
+/// steps, and the second is recent enough for that window's models to carry, and runs past the
+/// step they ripen at (`tally_mlat::engine::MODELS_RIPEN_MS` after the window step, about 22 s
+/// past the split), so provisional positions are solved under them before the next window comes
+/// due (about 47 s past it), whose models are of raw the client does not hold.
 fn recent(seed: u64) -> (Scenario, u64) {
     recent_at(seed, wall_ms())
 }
@@ -164,7 +222,7 @@ fn recent_at(seed: u64, now_ms: u64) -> (Scenario, u64) {
     let start_ms = (top - 5) as u64 * GRID_MS + 200;
     let split_ms = (top + 1) as u64 * GRID_MS;
     let scenario = Scenario {
-        duration_s: 45.0,
+        duration_s: 60.0,
         modes_aircraft: 16,
         midnight_unix_ms: start_ms - start_ms % 86_400_000,
         start_tod_s: (start_ms % 86_400_000) as f64 / 1000.0,

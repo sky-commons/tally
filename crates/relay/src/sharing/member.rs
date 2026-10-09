@@ -29,7 +29,13 @@
 //!   beneath it (its children, and theirs where they are full too), a manifest to them in every
 //!   stripe, and what was for it alone (a receipt, a have-summary, an ask) nowhere. The trees are
 //!   not changed: every relay still lays out the same ones, and the full member's children are fed
-//!   past it by whoever would have fed it.
+//!   past it by whoever would have fed it. Routing around is never taken for a fault, on either
+//!   side of it. The full member files no shortfall against a relay it turned away for the windows
+//!   that relay was routing around it: it keeps the same wait for it (`full::Wait`, the one rule
+//!   both ends apply to the same refusals), so it knows them exactly. And a child whose records
+//!   reached it past its parent, from above the parent in the stripe's tree (or from their origin)
+//!   before they could have been repaired, was not starved: the parent was being routed around, so
+//!   it files no shortfall against the parent and signs its receipt to whoever delivered instead.
 //! - **Demotion.** When most of a member's children in a stripe report it short for the same
 //!   window, and it did not itself report being starved then, every member drops it from the
 //!   trees for `groups::DEMOTION_MS`. Windows in which the trees changed (membership, or a seed
@@ -51,17 +57,18 @@ use tally_wire::batch::Hash;
 use tally_wire::record::{KIND_BATCH, KIND_RELAY_BATCH};
 use tally_wire::sharing::{MAX_HAVE_SECONDS, MAX_PIECES, receipt_digest};
 use tally_wire::{
-    Batch, Bytes, Check, HaveSummary, Identity, PieceManifest, PieceManifestContent, PublicKey,
-    Record, StripeAssignment, StripeReceipt, StripeReceiptContent,
+    Batch, Bytes, Check, HaveSummary, Identity, ParityChunk, PieceManifest, PieceManifestContent,
+    PublicKey, Record, StripeAssignment, StripeReceipt, StripeReceiptContent,
 };
 
 use crate::budget::{Charge, Gauge};
 use crate::directory::CLOCK_SKEW_MS;
 
+use super::full::Wait;
 use super::groups::{DEMOTION_MS, GroupKey};
 use super::parity::{Parity, id_of};
 use super::seeds::{SEED_ROTATION_SECONDS, epoch_of};
-use super::stripes::{Layout, PARITY_STRIPE, STRIPES, data_stripe, score};
+use super::stripes::{DATA_STRIPES, Layout, PARITY_STRIPE, STRIPES, data_stripe, score};
 
 /// After a second ends, how long an origin waits before signing its manifest and parity.
 pub const MANIFEST_DELAY_MS: u64 = 200;
@@ -91,8 +98,11 @@ pub const JUDGE_AFTER_MS: u64 = 2_000;
 pub const HORIZON_MS: u64 =
     RECEIPT_WINDOW_SECONDS * 1000 + RECEIPT_GRACE_MS + JUDGE_AFTER_MS + REPAIR_AFTER_MS;
 pub const HORIZON_SECONDS: u64 = HORIZON_MS.div_ceil(1000);
-/// The most bytes one answer to a `HaveSummary` carries.
-pub const REPAIR_PAGE_BYTES: usize = 256 * 1024;
+/// The most bytes one answer to a `HaveSummary` carries. It travels as one send over this relay's
+/// member link to the asker, so it is half what may wait for one link
+/// (`peers::WAITING_PER_LINK_BYTES` is twice it): a whole page and its records' overhead fit beside
+/// the stripes' own sends of the tick, never refused whole for being a page.
+pub const REPAIR_PAGE_BYTES: usize = 128 * 1024;
 /// The least time between two answers to one member's `HaveSummary`s.
 pub const ANSWER_INTERVAL_MS: u64 = REPAIR_INTERVAL_MS / 2;
 /// The most manifests held from one origin for one second of one group: `MAX_PIECES` records
@@ -340,6 +350,62 @@ struct Listed {
     whole: bool,
 }
 
+/// One thing a window's tree owes its members (a record, or a manifest's parity): who originated
+/// it, and the second it is listed in.
+struct Owed {
+    origins: BTreeSet<PublicKey>,
+    second: u64,
+}
+
+/// A relay this one turned away as full (`Reason::Full`, `link`): the wait the refusals gave it,
+/// by the rule the relay refused applies to them (`full::Wait`), and the spans it routed around
+/// this one, (start, end): in order and apart (each starts past the last's end and its slack), a
+/// refusal within one merged into it, so a relay turned away again and again while it waits holds
+/// one span, and a receipt check finds the span it asks about by search.
+#[derive(Clone, Debug, Default)]
+struct TurnedAway {
+    last: Option<Wait>,
+    spans: Vec<(u64, u64)>,
+}
+
+impl TurnedAway {
+    /// It routed around this relay from `start_ms` to `end_ms`: put in its place by start, and
+    /// merged with every span it touches, counting the slack, which covers the same moments. A
+    /// refusal comes after the last as a rule, so this is a merge into the last span or a push.
+    fn add(&mut self, start_ms: u64, end_ms: u64) {
+        let at = self.spans.partition_point(|(start, _)| *start <= start_ms);
+        self.spans.insert(at, (start_ms, end_ms));
+        let mut merged: Vec<(u64, u64)> = Vec::with_capacity(self.spans.len());
+        for (start, end) in self.spans.drain(..) {
+            match merged.last_mut() {
+                Some((_, last)) if start <= last.saturating_add(ROUTE_SLACK_MS) => {
+                    *last = (*last).max(end);
+                }
+                _ => merged.push((start, end)),
+            }
+        }
+        self.spans = merged;
+    }
+
+    /// Whether it was routing around this relay at any time from `from_ms` to `to_ms`.
+    fn during(&self, from_ms: u64, to_ms: u64) -> bool {
+        // The spans are apart and in order, so their ends are too: the first that reaches
+        // `from_ms` is the only one that may.
+        let first = self
+            .spans
+            .partition_point(|(_, end)| end.saturating_add(ROUTE_SLACK_MS) < from_ms);
+        self.spans
+            .get(first)
+            .is_some_and(|(start, _)| *start <= to_ms)
+    }
+}
+
+/// How long past a refusal's wait the relay refused may still be routing around this one: its
+/// wait starts when the `Goodbye` reaches it, a link's latency after this relay sent it.
+const ROUTE_SLACK_MS: u64 = 1_000;
+/// The longest record a group carries, encoded: what one record adds to a parity slice at most.
+const MAX_PIECE_LEN: usize = HEADER_LEN + tally_wire::record::MAX_BODY;
+
 struct HeldParity {
     parity: Arc<Parity>,
     at_ms: u64,
@@ -493,20 +559,27 @@ impl Group {
     }
 
     /// What every member of the window's tree in `stripe` is owed: every listed record of the
-    /// stripe (or, for the parity stripe, every listed manifest's parity), by origin.
-    fn owed(&self, window: u64, stripe: u8) -> BTreeMap<Hash, BTreeSet<PublicKey>> {
+    /// stripe (or, for the parity stripe, every listed manifest's parity), with its origins and the
+    /// second it is listed in.
+    fn owed(&self, window: u64, stripe: u8) -> BTreeMap<Hash, Owed> {
         let first = window * RECEIPT_WINDOW_SECONDS;
-        let mut owed: BTreeMap<Hash, BTreeSet<PublicKey>> = BTreeMap::new();
-        for (_, listed) in self
+        let mut owed: BTreeMap<Hash, Owed> = BTreeMap::new();
+        for (second, listed) in self
             .manifests
             .range(first..first + RECEIPT_WINDOW_SECONDS)
-            .flat_map(|(_, by_hash)| by_hash.iter())
+            .flat_map(|(second, by_hash)| by_hash.values().map(move |listed| (*second, listed)))
         {
+            let mut owe = |hash: Hash| {
+                let entry = owed.entry(hash).or_insert_with(|| Owed {
+                    origins: BTreeSet::new(),
+                    second,
+                });
+                entry.origins.insert(listed.origin);
+                entry.second = entry.second.min(second);
+            };
             if stripe == PARITY_STRIPE {
                 if !listed.hashes.is_empty() {
-                    owed.entry(id_of(&listed.manifest.hash()))
-                        .or_default()
-                        .insert(listed.origin);
+                    owe(id_of(&listed.manifest.hash()));
                 }
                 continue;
             }
@@ -515,10 +588,28 @@ impl Group {
                 .iter()
                 .filter(|hash| data_stripe(hash) == stripe)
             {
-                owed.entry(*hash).or_default().insert(listed.origin);
+                owe(*hash);
             }
         }
         owed
+    }
+
+    /// The members above `member` in `stripe`'s tree at `epoch`: its parent, the parent's, and so
+    /// on to the stripe's seed. Those are who send it a record past a full parent (`beneath`).
+    fn above(&self, stripe: u8, epoch: u64, member: &PublicKey) -> BTreeSet<PublicKey> {
+        let mut above = BTreeSet::new();
+        let mut at = *member;
+        while let Some(parent) = self
+            .layout
+            .place(stripe, epoch, &at)
+            .and_then(|place| place.parent)
+        {
+            if !above.insert(parent) {
+                break;
+            }
+            at = parent;
+        }
+        above
     }
 
     /// Who delivered `hash` (a record or a parity id), in order.
@@ -636,6 +727,9 @@ pub struct Member {
     /// The members that turned this relay's link away as full, while they are (`set_full`): what
     /// it sends is routed around them (`route`).
     full: BTreeSet<PublicKey>,
+    /// The relays this one turned away as full, and when each was routing around it
+    /// (`turned_away`): no shortfall is filed against one for those windows.
+    turned_away: BTreeMap<PublicKey, TurnedAway>,
     /// Groups the tick has visited since start: the work it did, which follows what the groups
     /// hold and never how many areas the relay takes.
     visits: u64,
@@ -656,6 +750,7 @@ impl Member {
             held: gauge.empty(),
             gauge,
             full: BTreeSet::new(),
+            turned_away: BTreeMap::new(),
             visits: 0,
             delivered: Vec::new(),
             demotions: Vec::new(),
@@ -684,11 +779,79 @@ impl Member {
         self.full = full;
     }
 
+    /// This relay turned `key`'s member link away as full at `now_ms`, asking it to stay away
+    /// `asked` (`link`, `Reason::Full`). It takes that as "this provider is full" and routes its
+    /// slice past this relay for the wait the one rule gives (`full::Wait`, which `peers` applies
+    /// to the same refusal), so for every window that wait covers it owes this relay nothing.
+    pub fn turned_away(&mut self, key: PublicKey, asked: std::time::Duration, now_ms: u64) {
+        let held = self.turned_away.entry(key).or_default();
+        let wait = Wait::after(held.last, asked, now_ms);
+        held.last = Some(wait);
+        held.add(now_ms, wait.until_ms);
+    }
+
+    /// The spans this relay holds of `key` routing around it (`turned_away`).
+    #[cfg(test)]
+    pub fn turned_away_spans(&self, key: &PublicKey) -> usize {
+        self.turned_away.get(key).map_or(0, |held| held.spans.len())
+    }
+
+    /// Whether this relay turned `key` away and it was routing around this relay at any time from
+    /// `from_ms` to `to_ms`.
+    pub fn routed_around_by(&self, key: &PublicKey, from_ms: u64, to_ms: u64) -> bool {
+        self.turned_away
+            .get(key)
+            .is_some_and(|held| held.during(from_ms, to_ms))
+    }
+
+    /// Forgets the refusals no window still to be receipted can overlap, and the waits that no
+    /// longer double the next.
+    fn forget_turned_away(&mut self, now_ms: u64) {
+        let horizon_ms = now_ms.saturating_sub(2 * HORIZON_MS);
+        self.turned_away.retain(|_, held| {
+            held.spans
+                .retain(|(_, end)| end.saturating_add(ROUTE_SLACK_MS) >= horizon_ms);
+            !held.spans.is_empty() || held.last.is_some_and(|wait| wait.remembered(now_ms))
+        });
+    }
+
+    /// Whether a parity chunk `from` sent may start reassembling here, and the most bytes its
+    /// whole may be: only for an origin manifest this relay holds, from a relay its group knows,
+    /// whose parity it does not hold yet, and with slice lengths its records can have (a stripe
+    /// with no record of the manifest has an empty slice, one with records at most their count of
+    /// the longest record), the whole as long as the longest slice. `None` otherwise: nothing is
+    /// held for it.
+    pub fn parity_room(&self, from: &PublicKey, chunk: &ParityChunk) -> Option<usize> {
+        let group = self.groups.get(&GroupKey::new(chunk.cell, chunk.product))?;
+        if *from == self.me
+            || !(group.members.contains(from) || group.leaves_only.contains(from))
+            || group.parity.contains_key(&id_of(&chunk.manifest))
+            || chunk.lens.len() != usize::from(DATA_STRIPES)
+        {
+            return None;
+        }
+        let listed = group.manifests.get(&chunk.second)?.get(&chunk.manifest)?;
+        let mut longest = 0usize;
+        for (stripe, len) in (0..DATA_STRIPES).zip(&chunk.lens) {
+            let records = listed
+                .hashes
+                .iter()
+                .filter(|hash| data_stripe(hash) == stripe)
+                .count();
+            let len = usize::try_from(*len).ok()?;
+            if (records == 0) != (len == 0) || len > records.saturating_mul(MAX_PIECE_LEN) {
+                return None;
+            }
+            longest = longest.max(len);
+        }
+        (usize::try_from(chunk.total).ok()? == longest).then_some(longest)
+    }
+
     /// What this relay sends, routed around the members that are full: what one would have been
     /// sent down a stripe goes to the members beneath it there (`Group::beneath`), a manifest to
     /// those beneath it in every stripe, and anything else addressed to it alone is not sent. An
-    /// answer to `asker` goes back as it is: it travels down the asker's own link, not one this
-    /// relay dials.
+    /// answer to `asker` (a repair page) is for it alone and is never routed past it: it goes to
+    /// it over this relay's member link, which sends nothing to a member full now (`peers`).
     fn route(&self, out: Vec<Outgoing>, asker: Option<&PublicKey>, now_ms: u64) -> Vec<Outgoing> {
         if self.full.is_empty() {
             return out;
@@ -1073,7 +1236,16 @@ impl Member {
             }
             return Vec::new();
         }
-        if !in_window(parity.second, now_ms)
+        // Only the parity of an origin manifest held: every edge carries a manifest before its
+        // parity (the origin sends the parity's seed the manifest first, a member floods one on
+        // taking it and takes a parity only after, a repair page leads with it), so a parity of
+        // nothing held is one nobody owes, and is not kept.
+        let listed = group
+            .manifests
+            .get(&parity.second)
+            .is_some_and(|by_hash| by_hash.contains_key(&parity.manifest));
+        if !listed
+            || !in_window(parity.second, now_ms)
             || !charge(&mut self.held, &mut self.stats, parity.len())
         {
             return Vec::new();
@@ -1212,7 +1384,13 @@ impl Member {
                 &mut self.delivered,
                 &mut self.stats,
             ));
-            out.extend(receipts(group, &self.identity, now_ms, &mut self.stats));
+            out.extend(receipts(
+                group,
+                &self.identity,
+                &self.turned_away,
+                now_ms,
+                &mut self.stats,
+            ));
             judge(group, now_ms, &mut self.demotions);
             expire_demotions(group, now_ms);
             out.extend(assign(group, &me, now_ms));
@@ -1220,6 +1398,7 @@ impl Member {
             release(&mut self.held, forget(group, now_ms));
             self.settle(key, now_ms);
         }
+        self.forget_turned_away(now_ms);
         self.route(out, None, now_ms)
     }
 }
@@ -1331,10 +1510,10 @@ fn owed_by(
     group
         .owed(window, stripe)
         .into_iter()
-        .filter(|(_, origins)| !origins.contains(child))
-        .filter(|(_, origins)| match parent {
+        .filter(|(_, owed)| !owed.origins.contains(child))
+        .filter(|(_, owed)| match parent {
             Some(parent) => parent == *deliverer,
-            None => origins.contains(deliverer),
+            None => owed.origins.contains(deliverer),
         })
         .map(|(hash, _)| hash)
         .collect()
@@ -1395,7 +1574,15 @@ fn originate_manifests(
                     whole: false,
                 },
             );
-            out.extend(flood(group, &me, None, now_ms, Message::Manifest(manifest)));
+            let flooded = flood(
+                group,
+                &me,
+                None,
+                now_ms,
+                Message::Manifest(manifest.clone()),
+            );
+            let neighbours: BTreeSet<PublicKey> = flooded.iter().map(|sent| sent.to).collect();
+            out.extend(flooded);
             if let Some(parity) = parity {
                 // Held for repair only if the store has room; sent down the parity stripe either
                 // way, as what this relay sends is never the store's.
@@ -1406,13 +1593,19 @@ fn originate_manifests(
                         from: Vec::new(),
                     });
                 }
-                out.extend(inject(
-                    group,
-                    &me,
-                    PARITY_STRIPE,
-                    Message::Parity(parity),
-                    now_ms,
-                ));
+                let sends = inject(group, &me, PARITY_STRIPE, Message::Parity(parity), now_ms);
+                // A member takes a parity only for a manifest it holds (`Member::parity`), so the
+                // parity's seed, which may share no tree edge with this relay, is sent the
+                // manifest first, down the same link.
+                for to in sends.iter().map(|sent| sent.to) {
+                    if !neighbours.contains(&to) {
+                        out.push(Outgoing {
+                            to,
+                            message: Message::Manifest(manifest.clone()),
+                        });
+                    }
+                }
+                out.extend(sends);
             }
         }
     }
@@ -1518,9 +1711,19 @@ fn rebuild(
 
 /// After each window and its grace: a receipt per stripe for each deliverer that owed this
 /// relay something, sent to the deliverer, and to the group when it was short.
+///
+/// Routing around (RFC-0174 §2.5, "A relay's members are bounded") is no shortfall on either side:
+/// a deliverer this relay turned away as full while it owed the window (`turned_away`) is owed
+/// nothing and gets no receipt, since it was sending its slice past this relay by the wait both
+/// keep; and when what the parent owed came first from above it in the stripe's tree (or from its
+/// origin) before it could have been a repair, the parent was being routed around: each who
+/// delivered past it is signed a receipt for what it delivered, which no member reads as short (it
+/// is not this relay's parent, so it owed this relay nothing), and no shortfall is filed against
+/// the parent, which is signed its receipt only if it delivered the rest itself.
 fn receipts(
     group: &mut Group,
     identity: &Identity,
+    turned_away: &BTreeMap<PublicKey, TurnedAway>,
     now_ms: u64,
     stats: &mut Stats,
 ) -> Vec<Outgoing> {
@@ -1538,51 +1741,62 @@ fn receipts(
     for window in windows {
         group.receipted.insert(window);
         let first = window * RECEIPT_WINDOW_SECONDS;
+        let end = first + RECEIPT_WINDOW_SECONDS;
         let epoch = epoch_of(first);
         for stripe in 0..STRIPES {
             let Some(place) = group.layout.place(stripe, epoch, &me) else {
                 continue;
             };
-            let owed = group.owed(window, stripe);
+            let owed_all = group.owed(window, stripe);
             let deliverers: BTreeSet<PublicKey> = match place.parent {
                 Some(parent) => [parent].into(),
-                None => owed.values().flatten().copied().collect(),
+                None => owed_all
+                    .values()
+                    .flat_map(|owed| owed.origins.iter())
+                    .copied()
+                    .collect(),
             };
             for deliverer in deliverers.into_iter().filter(|key| *key != me) {
+                if turned_away
+                    .get(&deliverer)
+                    .is_some_and(|held| held.during(first * 1000, end * 1000 + RECEIPT_GRACE_MS))
+                {
+                    continue;
+                }
                 let owed = owed_by(group, window, stripe, &me, &deliverer);
                 if owed.is_empty() {
                     continue;
                 }
-                let mut got: Vec<(u64, Hash)> = owed
-                    .iter()
-                    .filter_map(|hash| {
-                        group
-                            .senders(hash)
-                            .iter()
-                            .find(|(sender, _)| *sender == deliverer)
-                            .map(|(_, at)| (*at, *hash))
-                    })
-                    .collect();
-                got.sort();
-                let hashes: Vec<Hash> = got.iter().map(|(_, hash)| *hash).collect();
-                let content = StripeReceiptContent {
-                    parent: deliverer,
-                    cell: group.key.cell,
-                    product: group.key.product,
-                    stripe,
-                    stripes_of: STRIPES,
-                    first_second: first,
-                    last_second: first + RECEIPT_WINDOW_SECONDS - 1,
-                    records: u32::try_from(hashes.len()).unwrap_or(u32::MAX),
-                    bytes: hashes.iter().map(|hash| group.bytes_of(hash)).sum(),
-                    digest: receipt_digest(&hashes),
-                    issued_ms: now_ms,
+                let got = delivered_by(group, &owed, &deliverer);
+                let past = if place.parent == Some(deliverer) {
+                    routed_past(group, (stripe, epoch), &me, &deliverer, &owed, &owed_all)
+                } else {
+                    BTreeMap::new()
                 };
-                let Ok(receipt) = StripeReceipt::sign(identity, &content) else {
+                let routed_around = !past.is_empty();
+                for (router, got) in past {
+                    let Some((receipt, _)) =
+                        sign_receipt(group, identity, (router, stripe, first), &got, now_ms)
+                    else {
+                        continue;
+                    };
+                    stats.receipts += 1;
+                    out.push(Outgoing {
+                        to: router,
+                        message: Message::Receipt(receipt),
+                    });
+                }
+                // A parent routed around that did not deliver the rest itself is signed nothing:
+                // it was full, and a receipt short of what it owed would report it.
+                if routed_around && got.len() < owed.len() {
+                    continue;
+                }
+                let Some((receipt, content)) =
+                    sign_receipt(group, identity, (deliverer, stripe, first), &got, now_ms)
+                else {
                     continue;
                 };
                 stats.receipts += 1;
-                group.seen.insert(receipt.hash(), now_ms);
                 out.push(Outgoing {
                     to: deliverer,
                     message: Message::Receipt(receipt.clone()),
@@ -1601,6 +1815,92 @@ fn receipts(
         }
     }
     out
+}
+
+/// What of `owed` `deliverer` delivered, in the order it came.
+fn delivered_by(group: &Group, owed: &[Hash], deliverer: &PublicKey) -> Vec<Hash> {
+    let mut got: Vec<(u64, Hash)> = owed
+        .iter()
+        .filter_map(|hash| {
+            group
+                .senders(hash)
+                .iter()
+                .find(|(sender, _)| sender == deliverer)
+                .map(|(_, at)| (*at, *hash))
+        })
+        .collect();
+    got.sort();
+    got.into_iter().map(|(_, hash)| hash).collect()
+}
+
+/// What `parent` owed this relay in a window's stripe that reached it past the parent first, by
+/// who delivered it, each in the order it came: from a member above the parent in the stripe's
+/// tree, or from the record's origin, before its second settled (`REPAIR_AFTER_MS` after it
+/// ended: no repair is asked for a second before then, so what came sooner was pushed down the
+/// tree, past a parent that was full to the one that pushed it), and before the parent's own copy
+/// if it sent one.
+fn routed_past(
+    group: &Group,
+    (stripe, epoch): (u8, u64),
+    me: &PublicKey,
+    parent: &PublicKey,
+    owed: &[Hash],
+    owed_all: &BTreeMap<Hash, Owed>,
+) -> BTreeMap<PublicKey, Vec<Hash>> {
+    let above = group.above(stripe, epoch, parent);
+    let mut past: BTreeMap<PublicKey, Vec<(u64, Hash)>> = BTreeMap::new();
+    for hash in owed {
+        let Some(listed) = owed_all.get(hash) else {
+            continue;
+        };
+        let senders = group.senders(hash);
+        let parent_at = senders
+            .iter()
+            .find(|(sender, _)| sender == parent)
+            .map_or(u64::MAX, |(_, at)| *at);
+        let before_ms = parent_at.min((listed.second + 1) * 1000 + REPAIR_AFTER_MS);
+        if let Some((router, at)) = senders.iter().find(|(sender, at)| {
+            sender != me
+                && sender != parent
+                && *at < before_ms
+                && (above.contains(sender) || listed.origins.contains(sender))
+        }) {
+            past.entry(*router).or_default().push((*at, *hash));
+        }
+    }
+    past.into_iter()
+        .map(|(router, mut got)| {
+            got.sort();
+            (router, got.into_iter().map(|(_, hash)| hash).collect())
+        })
+        .collect()
+}
+
+/// This relay's signed receipt to `deliverer` for `hashes` (what it delivered) of a window's
+/// stripe, and what it says.
+fn sign_receipt(
+    group: &mut Group,
+    identity: &Identity,
+    (deliverer, stripe, first): (PublicKey, u8, u64),
+    hashes: &[Hash],
+    now_ms: u64,
+) -> Option<(StripeReceipt, StripeReceiptContent)> {
+    let content = StripeReceiptContent {
+        parent: deliverer,
+        cell: group.key.cell,
+        product: group.key.product,
+        stripe,
+        stripes_of: STRIPES,
+        first_second: first,
+        last_second: first + RECEIPT_WINDOW_SECONDS - 1,
+        records: u32::try_from(hashes.len()).unwrap_or(u32::MAX),
+        bytes: hashes.iter().map(|hash| group.bytes_of(hash)).sum(),
+        digest: receipt_digest(hashes),
+        issued_ms: now_ms,
+    };
+    let receipt = StripeReceipt::sign(identity, &content).ok()?;
+    group.seen.insert(receipt.hash(), now_ms);
+    Some((receipt, content))
 }
 
 /// Demotes a member most of whose children in a stripe reported it short for a window it was not

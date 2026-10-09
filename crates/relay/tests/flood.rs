@@ -2,26 +2,63 @@
 //! its memory stays within its budget. Four times the feeders its budget admits connect together;
 //! exactly the ceiling is admitted at Hello and the rest are turned away, and those admitted send
 //! batches of distinct receptions as fast as their ingest ceiling lets them while a subscriber
-//! never reads. Throughout, every store's gauge stays within its limit, the gauges together within
-//! what the budget leaves after its base, and every decoded batch alive is one some store holds.
+//! never reads. Throughout, every decoded batch alive is covered by a charge of the store holding
+//! it (`budget::Covered`, each decode once however many hold it), read at the same instant, and the
+//! batch byte store and the delivery tags hold no more than they are charged. No gauge's charge can
+//! pass its limit (`budget::Gauge`, its own tests) and the limits together are the budget
+//! (`budget`'s tests), so what this watches for is the one way past the budget: bytes held that no
+//! gauge was charged. The watch is shown to see such a holder, one batch of it, in the middle of
+//! the flood.
 //!
-//! Its own binary: what it measures (`tally_wire::decoded::live`) is the process's, so no other
-//! test may run beside it.
+//! A stage that stalls is held the same way, on the hub alone: what it holds past its share is
+//! refused, and nothing it holds is uncharged.
+//!
+//! Its own binary: what it measures (`tally_wire::decoded::live`) is the process's, so no test of
+//! another file runs beside these, and these run one at a time (`ALONE`), each once every decode
+//! the one before it held is gone (`alone`): before, a test could start while the last test's
+//! dropped relay was still letting its decodes go, and read them as its own uncharged.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use tally_relay::budget::Store;
-use tally_relay::fanout::Filter;
-use tally_relay::hub::Hub;
-use tally_relay::ingest::Threads;
+use tally_relay::fanout::{Fell, Filter};
+use tally_relay::hub::{Hub, Inbound, Origin};
+use tally_relay::ingest::{Stamp, Threads};
 use tally_wire::batch::format;
 use tally_wire::noise::{self, Session};
 use tally_wire::{Batch, BatchContent, Identity, Observation, PublicKey, Record, Role, Streams};
 use tokio::net::{TcpListener, TcpStream};
 
 type Result<T = ()> = std::result::Result<T, String>;
+
+/// Held by each test for its whole run: the decoded batches alive are the process's, so a test
+/// watching them runs alone.
+static ALONE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Runs alone, once every decoded batch the test before it held is gone: a relay that is dropped
+/// lets every decode go (its stages' threads end with it), and until they have, what they hold
+/// is no store of this test's hub.
+async fn alone() -> Result<tokio::sync::MutexGuard<'static, ()>> {
+    let alone = ALONE.lock().await;
+    let started = Instant::now();
+    loop {
+        let (batches, live) = tally_wire::decoded::live();
+        if batches == 0 {
+            return Ok(alone);
+        }
+        if started.elapsed() > Duration::from_secs(30) {
+            return Err(format!(
+                "{batches} decoded batches ({live} bytes) still alive from the test before"
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// 2026-10-04T00:00:00Z.
+const BASE_MS: u64 = 1_791_244_800_000;
 
 fn text(error: impl std::fmt::Display) -> String {
     error.to_string()
@@ -76,37 +113,105 @@ async fn connect(
         .map_err(text)
 }
 
-/// Every gauge within its limit, and the gauges together within the budget past its base.
-fn assert_within(hub: &Hub) {
-    let budget = hub.budget();
-    let mut limits = 0usize;
-    for store in Store::ALL {
-        let gauge = budget.gauge(store);
-        assert!(
-            gauge.held() <= gauge.limit() && gauge.peak() <= gauge.limit(),
-            "{store:?}: held {} and peak {} past its limit {}",
-            gauge.held(),
-            gauge.peak(),
-            gauge.limit()
-        );
-        limits += gauge.limit();
+/// How long a holder must be seen uncharged, in every sample, before it is one: a hand-off
+/// releases its charge a moment before it drops what it held, and a sample may fall between. A
+/// holder that keeps anything (a queue, a cache) is seen in every sample while it holds it.
+const UNCHARGED_FOR: Duration = Duration::from_millis(100);
+/// How often the watch samples while the relay runs.
+const SAMPLE_EVERY: Duration = Duration::from_millis(20);
+
+/// Every decoded batch alive is covered by a charge of the store holding it, read at the same
+/// instant (`Budget::decoded_held`), to the batch: no allowance carved and idle, and no decode two
+/// stores charge, stands in for one nobody does. And the batch byte store and the delivery tags
+/// hold no more than their gauges are charged. A store whose own charge cannot pass its limit by
+/// construction (`Gauge::take`) holds the relay to its budget only if nothing holds bytes it was
+/// not charged: that is what this watches for.
+#[derive(Default)]
+struct Watch {
+    /// Since when every sample has seen something uncharged.
+    since: Option<Instant>,
+    most_live: usize,
+}
+
+impl Watch {
+    fn sample(&mut self, hub: &Hub) -> Result {
+        let report = hub.memory_report();
+        let budget = hub.budget();
+        let decoded = budget.decoded_held();
+        self.most_live = self.most_live.max(decoded.live);
+        let mut uncharged = Vec::new();
+        if decoded.uncharged_batches() > 0 || decoded.uncharged() > 0 {
+            let stores: Vec<String> = Store::ALL
+                .iter()
+                .filter(|store| store.holds_decoded())
+                .map(|store| format!("{store:?} {}", budget.gauge(*store).held()))
+                .collect();
+            uncharged.push(format!(
+                "{} decoded batches ({} bytes) alive that no store's charge covers ({decoded:?}; \
+                 {}, oversize {})",
+                decoded.uncharged_batches(),
+                decoded.uncharged(),
+                stores.join(", "),
+                budget.oversize().held()
+            ));
+        }
+        for (store, held) in [
+            (Store::Batches, report.batches_held),
+            (Store::Delivery, report.delivery_held),
+        ] {
+            let charged = budget.gauge(store).held();
+            if held > charged {
+                uncharged.push(format!("{store:?} holds {held} bytes, charged {charged}"));
+            }
+        }
+        if uncharged.is_empty() {
+            self.since = None;
+            return Ok(());
+        }
+        let since = *self.since.get_or_insert_with(Instant::now);
+        if since.elapsed() >= UNCHARGED_FOR {
+            return Err(format!(
+                "uncharged in every sample for {:?}: {}",
+                since.elapsed(),
+                uncharged.join("; ")
+            ));
+        }
+        Ok(())
     }
-    for gauge in [budget.oversize(), budget.connection_buffers()] {
-        assert!(gauge.peak() <= gauge.limit(), "{:?}", gauge.report());
-        limits += gauge.limit();
+}
+
+/// The watch sees a holder no gauge charges, of one batch: a batch decoded here and kept, beside
+/// the relay in the middle of its flood, every connection's allowance carved and the stores
+/// holding megabytes. Before, the watch compared the
+/// decodes alive with what the stores holding them were charged, which counts every allowance
+/// carved whether it holds a batch or not and a decode two stores hold twice: about a megabyte of
+/// slack under this flood, so a holder of dozens of batches went unseen.
+async fn assert_watch_sees_one_leaked_batch(hub: &Hub) -> Result {
+    let receiver = Identity::generate().map_err(text)?;
+    let batch = busy_batch(&receiver, 0)?;
+    let kept =
+        tally_wire::Decoded::from_verified(batch, 0, 0).map_err(|error| error.error.to_string())?;
+    let mut watch = Watch::default();
+    let mut seen = None;
+    let started = Instant::now();
+    while seen.is_none() && started.elapsed() < 10 * UNCHARGED_FOR {
+        seen = watch.sample(hub).err();
+        tokio::time::sleep(SAMPLE_EVERY).await;
     }
-    assert!(
-        limits <= budget.memory() - budget.base(),
-        "the gauges' limits {limits} pass the budget's {} past its base",
-        budget.memory() - budget.base()
-    );
+    drop(kept);
+    match seen {
+        Some(_) => Ok(()),
+        None => Err("one decoded batch no store charged went unseen".to_owned()),
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn memory_stays_bounded_under_a_flood_of_many_feeders() -> Result {
+    let _alone = alone().await?;
     let threads = Threads {
         ingest: 2,
         message: 2,
+        seal: 2,
     };
     let hub = Arc::new(
         Hub::new(8)
@@ -197,16 +302,31 @@ async fn memory_stays_bounded_under_a_flood_of_many_feeders() -> Result {
         });
     }
     let started = Instant::now();
-    let mut most_live = 0usize;
-    while started.elapsed() < FLOOD {
-        assert_within(&hub);
-        let report = hub.memory_report();
-        most_live = most_live.max(report.decoded_live_bytes);
-        tokio::time::sleep(Duration::from_millis(20)).await;
+    let mut watch = Watch::default();
+    while started.elapsed() < FLOOD / 2 {
+        watch.sample(&hub)?;
+        tokio::time::sleep(SAMPLE_EVERY).await;
     }
+    // Halfway, with every store busy: one batch held where no gauge sees it is seen.
+    assert!(
+        watch.most_live > CEILING * RECEPTIONS as usize,
+        "the flood was not under way when the leak was tried"
+    );
+    assert_watch_sees_one_leaked_batch(&hub).await?;
+    // Let go, it is seen no more.
+    let mut watch_after = Watch::default();
+    while started.elapsed() < FLOOD {
+        watch_after.sample(&hub)?;
+        tokio::time::sleep(SAMPLE_EVERY).await;
+    }
+    watch.most_live = watch.most_live.max(watch_after.most_live);
     stop.store(true, Ordering::Relaxed);
     while floods.join_next().await.is_some() {}
-    assert_within(&hub);
+    let stopped = Instant::now();
+    while stopped.elapsed() < 2 * UNCHARGED_FOR {
+        watch.sample(&hub)?;
+        tokio::time::sleep(SAMPLE_EVERY).await;
+    }
 
     // The flood was a flood: several times what the stages between ingest and the sealer are
     // given, so a store that did not hold to its share would have grown past it.
@@ -216,16 +336,124 @@ async fn memory_stays_bounded_under_a_flood_of_many_feeders() -> Result {
         offered > 2 * epochs,
         "only {offered} bytes offered against the epochs' {epochs}"
     );
-    // Every decoded batch alive was held by some store, charged there, beside the one batch each
-    // ingest worker decodes (the relay's base): never more than the gauges' limits together.
-    let charged: usize = Store::ALL
-        .iter()
-        .map(|store| hub.budget().gauge(*store).limit())
-        .sum::<usize>()
-        + hub.budget().oversize().limit();
+    // The watch watched something: the flood's decoded batches, alive and charged.
     assert!(
-        most_live <= charged,
-        "{most_live} bytes of decoded batches alive at once, past the {charged} the stores hold"
+        watch.most_live > CEILING * RECEPTIONS as usize,
+        "the watch saw at most {} bytes of decoded batches alive",
+        watch.most_live
     );
+    Ok(())
+}
+
+/// RFC-0181 invariant 8, for the stages that can stall: a stage that never lets go cannot grow
+/// the relay's memory past its budget. Here the epoch never closes (every batch is stamped in one
+/// second and the ingest clock stands still), so the message exchange holds everything it is
+/// given, and nobody reads the one subscriber's queue. Ten times what the budget gives the epochs
+/// is ingested: the epoch is refused whole (counted) once its share is full, every decoded batch
+/// still alive is charged by the store holding it, the stalled subscriber is let go as fallen
+/// behind, holding nothing, and when the epoch does close what it held is let go.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stalled_stage_never_grows_past_the_budget() -> Result {
+    let _alone = alone().await?;
+    let hub = Arc::new(
+        Hub::clocked(8, Arc::new(|| 0))
+            .memory_for_feeders(4, false)
+            .staged(Threads {
+                ingest: 2,
+                message: 2,
+                seal: 2,
+            })?,
+    );
+    let stalled = hub.listen(
+        998,
+        Filter::Subscription(tally_relay::subscription::Subscription {
+            streams: Streams::RAW,
+            regions: Vec::new(),
+        }),
+    );
+    let epochs = hub.budget().gauge(Store::Epochs);
+    let fanout = hub.budget().gauge(Store::Fanout);
+    let receivers: Vec<Identity> = (0..8u8)
+        .map(|n| Identity::from_seed([n + 40; 32]))
+        .collect();
+    let mut watch = Watch::default();
+    let mut ingested = 0usize;
+    let mut sequence = 0u64;
+    while ingested < 10 * epochs.limit().max(fanout.limit()) {
+        for receiver in &receivers {
+            let batch = busy_batch(receiver, sequence)?;
+            ingested += batch.as_bytes().len();
+            let in_flight = hub.in_flight_for(&batch);
+            hub.ingest(Inbound {
+                source: 1,
+                batch,
+                origin: Origin::Elsewhere,
+                verify: true,
+                stamp: Some(Stamp {
+                    stamp_ms: BASE_MS + 500,
+                    ingest_seq: ingested as u64,
+                }),
+                in_flight,
+                refusal: None,
+            });
+        }
+        // The stages take each round in their own time, watched while they hold it.
+        watch.sample(&hub)?;
+        tokio::time::sleep(SAMPLE_EVERY).await;
+        sequence += 1;
+    }
+    hub.flush();
+    // The message threads take what the workers routed in their own time.
+    let started = Instant::now();
+    while epochs.refused() == 0 {
+        if started.elapsed() > Duration::from_secs(60) {
+            return Err("the epoch was never refused".to_owned());
+        }
+        watch.sample(&hub)?;
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    // Stalled: what is alive now is what the stalled stages hold, every byte of it charged.
+    let stalled_at = Instant::now();
+    while stalled_at.elapsed() < 2 * UNCHARGED_FOR {
+        watch.sample(&hub)?;
+        tokio::time::sleep(SAMPLE_EVERY).await;
+    }
+    assert!(
+        watch.most_live > 0,
+        "the stalled stages held no decoded batch: the watch watched nothing"
+    );
+    // The subscriber that never read was let go, holding nothing.
+    let mut got = Vec::new();
+    assert!(matches!(
+        stalled.try_recv_many(&mut got, 1_000_000),
+        Err(Fell::Behind(_))
+    ));
+    assert_eq!(stalled.queued_bytes(), 0);
+    // When the epoch closes it is refused whole and counted, and what it held is let go.
+    let end = BASE_MS + 2_000;
+    hub.advance(end);
+    let started = Instant::now();
+    while hub.network().products.watermark_ms() < end {
+        if started.elapsed() > Duration::from_secs(60) {
+            return Err("the epochs never closed".to_owned());
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(hub.network().products.report().epochs_refused >= 1);
+    assert_eq!(epochs.held(), 0);
+    let closed = Instant::now();
+    while closed.elapsed() < 2 * UNCHARGED_FOR {
+        watch.sample(&hub)?;
+        tokio::time::sleep(SAMPLE_EVERY).await;
+    }
+    let products = &hub.network().products;
+    let mut stream = 0usize;
+    for record in products.tick(None) {
+        if let Record::RelayBatch(batch) = record {
+            stream += batch.content().map_err(text)?.observations.len();
+        }
+    }
+    assert_eq!(stream, 0);
+    assert!(products.report().stream_refused >= 1);
     Ok(())
 }

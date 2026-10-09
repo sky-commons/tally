@@ -129,11 +129,12 @@ pub const DESCRIPTION_BYTES_HELD: usize = 64 * 1024 * 1024;
 /// | clock model parts awaiting manifests, and manifests' lists    | 96 MiB     |
 ///
 /// A connection's Noise buffers come from one pool (`tally_wire::noise`), and each connection
-/// carves what it may hold of them while it reads (`ingest::BUFFERS_PER_CONNECTION`) when it is
-/// admitted: a feeder from what it reserved (`Store::Buffers`), every other connection from room
-/// the plan sizes to the connection cap (`budget::Plan::connection_buffers`), so a peer trickling
-/// a message holds what was planned for it. The kernel's socket buffers for the fan-out's links are charged to the
-/// relay's cgroup beside it.
+/// carves what it may hold of them, reading and writing (`ingest::BUFFERS_PER_CONNECTION`), for
+/// its whole session: a feeder from what it reserved (`Store::Buffers`), every other connection
+/// from room the plan sizes to every connection but a feeder's the caps allow (this cap, the
+/// member sessions and the subscribers, `Hub::plan`, `budget::Plan::connection_buffers`), so a
+/// peer trickling a message, or reading slowly, holds what was planned for it. The kernel's
+/// socket buffers for the fan-out's links are charged to the relay's cgroup beside it.
 ///
 /// The members (the sessions over which other relays' data comes in) share one rate
 /// (`DEFAULT_MAX_MEMBER_BYTES_PER_SEC`), planned once as the feeders it is worth, and each member
@@ -141,8 +142,11 @@ pub const DESCRIPTION_BYTES_HELD: usize = 64 * 1024 * 1024;
 /// session the areas taken bring, at most this cap (`budget::members_for`,
 /// `budget::Budget::reserve_member`), so what they send is admitted the same way as a feeder's and
 /// never competes with feeders for room; past them a member is turned away as full
-/// (`Reason::Full`) and routed around (RFC-0174 §2.5). Every session, in or out, holds a place
-/// under this cap (`Hub::connection`, `Hub::dialled`). What members cost beyond that is bandwidth
+/// (`Reason::Full`) and routed around (RFC-0174 §2.5). This cap holds the sessions that have no
+/// place of their role's own: a connection not yet identified, a probe, an engine, a directory
+/// link, a dial that only sends (`Hub::connection`, `Hub::dialled`); a feeder, a subscriber and a
+/// member give their place under it up for their own (`hub::Connection::general`), so no role
+/// takes another's. What members cost beyond that is bandwidth
 /// in, up to their shared rate; an operator sizes `--max-member-bytes-per-sec` to the host's link.
 pub const DEFAULT_MAX_CONNECTIONS: usize = 2048;
 /// Per IPv4 address, or per IPv6 /64 (what one host is usually given), so one host cannot take
@@ -479,14 +483,17 @@ pub enum Origin {
 /// What the relay's memory holds (`Hub::memory_report`, `GET /memory`): the budget and its gauges,
 /// the one batch byte store's and the delivery tags' own counts of what they hold (kept apart from
 /// their charges, so each is read beside its gauge, `Store::Batches` and `Store::Delivery`, which
-/// hold them), and every decoded batch alive, whichever stores share it.
+/// hold them). Every decoded batch alive, whichever stores share it, is the budget's
+/// (`budget::MemoryReport::decoded`), read beside what those stores are charged.
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct MemoryReport {
     pub budget: crate::budget::MemoryReport,
+    /// What the sharing groups hold (records and parities), by their own count, beside
+    /// `Store::Batches`' gauge. The parities being reassembled are not in it: their room is its own
+    /// (`budget::MemoryReport::parity_assembly`), which counts them itself.
     pub batches_held: usize,
+    /// What the delivery tags hold, by their own count, beside `Store::Delivery`'s gauge.
     pub delivery_held: usize,
-    pub decoded_live: usize,
-    pub decoded_live_bytes: usize,
     /// Sharing members turned away for want of room in the members' pool.
     pub members_refused: u64,
 }
@@ -693,6 +700,9 @@ impl Directory {
 
 pub struct Hub {
     fanout: Arc<Router>,
+    /// Each subscriber queue's bytes when named (`Hub::queue_bytes`), else the budget's share: kept
+    /// so the router a replan builds (`Hub::memory`) bounds its queues the same.
+    queue_bytes: Option<usize>,
     /// The ingest workers and the message exchange (`ingest`, `exchange`).
     stages: Stages,
     /// Each raw shard's streams and stations, `SHARDS` of them.
@@ -738,11 +748,18 @@ pub struct Hub {
     max_member_bytes_per_sec: u64,
     /// The pace every member session shares (`ceiling::Pace`), at `max_member_bytes_per_sec`.
     member_pace: Arc<crate::ceiling::Pace>,
+    /// The records a second every member session's data shares (`ingest::RecordPace`), at the
+    /// feeders `max_member_bytes_per_sec` is worth (`Hub::member_records_per_sec`).
+    member_records: Arc<crate::ingest::RecordPace>,
     /// The areas taken (RFC-0174 §2.1): what the member sessions are planned from
     /// (`budget::members_for`).
     areas: Vec<Region>,
     /// Whether the relay holds MLAT raw: its plan's base and each feeder's cost (`Hub::memory`).
     holds_raw: bool,
+    /// The cores the relay runs on (`Hub::cores`): the feeders they carry bound the ceiling, and
+    /// its stages' threads follow the load admitted (`cores`). None for a test's hub, whose
+    /// feeders only its memory bounds and whose stages' threads it names.
+    cores: Option<usize>,
     /// The time the ingest ceilings read.
     ceiling_clock: crate::ceiling::Clock,
     accepted_relays: HashSet<PublicKey>,
@@ -777,11 +794,22 @@ impl Drop for Slot {
     }
 }
 
-/// Held for as long as one connection is open: its place under the relay's cap and under its
-/// source's.
+/// Held for as long as one connection is open: its place under its source's cap, and, until it
+/// is given up for a place of the connection's own role (`Connection::general`), under the
+/// relay's.
 pub struct Connection {
-    _relay: Slot,
+    general: Option<Slot>,
     _source: SourceSlot,
+}
+
+impl Connection {
+    /// Its place under the relay's connection cap, to hold while the connection has no place of
+    /// its own and to let go when it takes one: a feeder once it holds its reservation, a
+    /// subscriber its place among the subscribers, a relay its member's place. Each role is
+    /// bounded by its own cap, never by another's (`Hub::plan`).
+    pub fn general(&mut self) -> Option<Slot> {
+        self.general.take()
+    }
 }
 
 /// One connection's place among its source's.
@@ -825,6 +853,13 @@ impl Drop for SourceSlot {
     }
 }
 
+/// The records a second the members' rate of `bytes_per_sec` brings: the feeders it is worth, by
+/// the budget's one rule (`budget::feeders_for_rate`), each at
+/// `ingest::MEMBER_RECORDS_PER_FEEDER`.
+fn member_records_for(bytes_per_sec: u64) -> u64 {
+    crate::ingest::member_records_per_sec(crate::budget::feeders_for_rate(bytes_per_sec))
+}
+
 /// Who a connection counts against: its IPv4 address, or its IPv6 /64. An IPv4 address mapped
 /// into IPv6 (a dual-stack listener) is its IPv4 address.
 pub fn source_of(address: IpAddr) -> IpAddr {
@@ -841,7 +876,8 @@ impl Hub {
         Self::clocked(max_subscribers, crate::ingest::anchored_wall_clock())
     }
 
-    /// As `new`, its ingest clock `clock`.
+    /// As `new`, its ingest clock `clock`. Its budget is sized from its own plan (`Hub::plan`),
+    /// as every change to its caps resizes it.
     pub fn clocked(max_subscribers: usize, clock: Clock) -> Self {
         let network = Network::new();
         let budget = Budget::of_memory(
@@ -857,7 +893,8 @@ impl Hub {
             Gauges::of(&budget),
         );
         Self {
-            fanout: Arc::new(router(&budget)),
+            fanout: Arc::new(router(&budget, None)),
+            queue_bytes: None,
             stages,
             raw: (0..SHARDS)
                 .map(|_| Mutex::new(RawShard::new(SEEN_WINDOW)))
@@ -887,8 +924,12 @@ impl Hub {
             max_feeder_bytes_per_sec: DEFAULT_MAX_FEEDER_BYTES_PER_SEC,
             max_member_bytes_per_sec: DEFAULT_MAX_MEMBER_BYTES_PER_SEC,
             member_pace: Arc::new(crate::ceiling::Pace::new(DEFAULT_MAX_MEMBER_BYTES_PER_SEC)),
+            member_records: Arc::new(crate::ingest::RecordPace::new(member_records_for(
+                DEFAULT_MAX_MEMBER_BYTES_PER_SEC,
+            ))),
             areas: Vec::new(),
             holds_raw: false,
+            cores: None,
             ceiling_clock: crate::ceiling::system_clock(),
             accepted_relays: HashSet::new(),
             hints: Vec::new(),
@@ -898,9 +939,19 @@ impl Hub {
             network,
             members_refused: AtomicU64::new(0),
         }
+        .replanned()
     }
 
-    /// The stages on threads of their own (`threads`), the sealer on its own: what a relay runs.
+    /// The stages on as many threads as the load this hub plans to admit needs
+    /// (`Budget::threads`): what a relay runs. Built once the budget is final, so the threads
+    /// follow the ceiling and the members' rate it was sized to.
+    pub fn staged_as_planned(self) -> Result<Self, String> {
+        let threads = self.budget.threads();
+        self.staged(threads)
+    }
+
+    /// The stages on threads of their own (`threads`), the sealer on its own: a test's, which
+    /// names its threads.
     /// Built before the hub is shared, so nothing has been ingested yet. Every thread starts or
     /// this fails, and the relay with it: a stage short of a thread would close no epoch ever, or
     /// refuse every one.
@@ -919,14 +970,15 @@ impl Hub {
         let gauges = Gauges::of(&self.budget);
         // The sealer moves onto its thread wherever it is held: no exclusive hold is needed, so
         // it can never be left inline behind threaded stages.
-        self.network
-            .products
-            .on_thread(threads.message.max(1), pause.as_ref())?;
+        self.network.products.on_thread(threads, pause.as_ref())?;
         self.stages = Stages::threaded(
             clock,
             threads,
-            &self.network.products.sink(),
-            &gauges,
+            (
+                &self.network.products.sink(),
+                &gauges,
+                crate::ingest::Room::of(&self.budget),
+            ),
             pause,
         )?;
         Ok(self)
@@ -957,7 +1009,7 @@ impl Hub {
     pub fn memory(mut self, memory: usize, holds_raw: bool) -> Self {
         self.holds_raw = holds_raw;
         self.budget.resize(memory, self.plan());
-        self.fanout = Arc::new(router(&self.budget));
+        self.fanout = Arc::new(router(&self.budget, self.queue_bytes));
         self.network.charge_to(&self.budget);
         self
     }
@@ -977,8 +1029,31 @@ impl Hub {
     pub fn plan(&self) -> Plan {
         let members = crate::budget::members_for(&self.areas, self.holds_raw, self.max_connections);
         Plan::planned(self.holds_raw)
+            .with_feeder_ceiling(self.max_feeder_bytes_per_sec)
             .with_members(members, self.max_member_bytes_per_sec)
-            .with_connections(self.max_connections)
+            .with_connections(self.non_feeder_connections(members))
+            .with_cores(self.cores)
+    }
+
+    /// Runs on `cores` cores (`cores::cores_available`, or what `check` is told): the feeders it
+    /// admits are no more than they carry beside its members' rate (`cores::feeders_carried`), and
+    /// its stages' threads follow what it admits (`Hub::staged_as_planned`).
+    pub fn cores(mut self, cores: usize) -> Self {
+        self.cores = Some(cores);
+        self.replanned()
+    }
+
+    /// Every connection but a feeder's the relay holds at once, each by its own role's cap: those
+    /// under the connection cap (not yet identified, probes, engines, directory links, the dials
+    /// that hold no member's place), the member sessions (`members`), and the subscribers. A
+    /// feeder's are its reservation's. Before, the three shared the one cap, so the plan counted
+    /// some 128 members, 25 feeders and 64 subscribers in 128 connections, and a member past the
+    /// connections the others held was closed on before its handshake, with no word to route
+    /// around it by.
+    fn non_feeder_connections(&self, members: usize) -> usize {
+        self.max_connections
+            .saturating_add(members)
+            .saturating_add(self.max_subscribers)
     }
 
     /// Takes `areas` (RFC-0174 §2.1): the areas its sharing and MLAT choose from
@@ -1000,26 +1075,18 @@ impl Hub {
     /// Each subscriber's queue holds at most `bytes` (and `fanout::BEHIND_MS` of inbound), instead
     /// of the budget's share: a test's small queue, or an operator's.
     pub fn queue_bytes(mut self, bytes: usize) -> Self {
-        self.fanout = Arc::new(Router::charged(
-            Bounds {
-                max_bytes: bytes,
-                max_age_ms: BEHIND_MS,
-            },
-            self.budget.gauge(Store::Fanout),
-        ));
+        self.queue_bytes = Some(bytes);
+        self.fanout = Arc::new(router(&self.budget, self.queue_bytes));
         self
     }
 
     /// What the relay's memory holds, store by store (`GET /memory`).
     pub fn memory_report(&self) -> MemoryReport {
         let (sharing, _) = self.network.sharing.held();
-        let (decoded, decoded_bytes) = tally_wire::decoded::live();
         MemoryReport {
             budget: self.budget.report(),
             batches_held: sharing,
             delivery_held: self.network.delivery.held_bytes(),
-            decoded_live: decoded,
-            decoded_live_bytes: decoded_bytes,
             members_refused: self.members_refused.load(Ordering::Relaxed),
         }
     }
@@ -1054,7 +1121,10 @@ impl Hub {
     /// `bytes` the relay itself hands the ingest stage (a batch's, a description's), charged to
     /// `Store::Ingest`, the caller's thread waiting for room.
     pub fn in_flight_of(&self, bytes: usize) -> InFlight {
-        InFlight::trusted(&self.budget.gauge(Store::Ingest), bytes)
+        InFlight::trusted(
+            &self.budget.gauge(Store::Ingest),
+            crate::ingest::floored(bytes),
+        )
     }
 
     /// A connection's Noise buffers (`ingest::BUFFERS_PER_CONNECTION`), carved for as long as it
@@ -1221,7 +1291,8 @@ impl Hub {
     /// directory link may send, beyond its burst.
     pub fn max_feeder_bytes_per_sec(mut self, rate: u64) -> Self {
         self.max_feeder_bytes_per_sec = rate;
-        self
+        // The records a second it lets a feeder send are planned in the cores.
+        self.replanned()
     }
 
     /// The most bytes a second the sharing members may send, all together (their shared pace)
@@ -1230,12 +1301,30 @@ impl Hub {
     pub fn max_member_bytes_per_sec(mut self, rate: u64) -> Self {
         self.max_member_bytes_per_sec = rate;
         self.member_pace = Arc::new(crate::ceiling::Pace::new(rate));
+        self.member_records = Arc::new(crate::ingest::RecordPace::new(member_records_for(rate)));
         self.replanned()
     }
 
     /// The pace every member session shares.
     pub fn member_pace(&self) -> Arc<crate::ceiling::Pace> {
         Arc::clone(&self.member_pace)
+    }
+
+    /// The records a second every member session's data shares (`ingest::RecordPace`).
+    pub fn member_records(&self) -> Arc<crate::ingest::RecordPace> {
+        Arc::clone(&self.member_records)
+    }
+
+    /// The records a second one relay's session may send (`ingest::member_records_per_sec`): the
+    /// members' whole rate, as its byte ceiling is their whole rate's bytes.
+    pub fn member_records_per_sec(&self) -> u64 {
+        member_records_for(self.max_member_bytes_per_sec)
+    }
+
+    /// The records a second one feeder's (or subscriber's, engine's, probe's) session may send
+    /// (`ingest::records_per_sec` of its byte ceiling).
+    pub fn feeder_records_per_sec(&self) -> u64 {
+        crate::ingest::records_per_sec(self.max_feeder_bytes_per_sec)
     }
 
     pub fn hints(&self) -> &[RelayAddress] {
@@ -1276,24 +1365,29 @@ impl Hub {
         std::sync::Arc::clone(&self.ceiling_clock)
     }
 
-    /// A place under the connection cap for a session this relay dials itself (a member link, a
-    /// one-hop raw link, an upstream): every session in or out holds one, so the connections the
-    /// budget plans buffers and member sessions for (`budget::members_for`) are all of them.
+    /// A place under the connection cap for a session this relay dials itself that holds no place
+    /// of its own role (a member link that only sends, an upstream). A one-hop raw link is a
+    /// member session, and holds a member's place instead (`link::admit_member`).
     pub fn dialled(&self) -> Option<Slot> {
         Slot::take(&self.connections, self.max_connections)
     }
 
     /// A place for one more connection from `address`, or `None` when the relay, or that
-    /// address's source, holds as many as it will.
+    /// address's source, holds as many as it will. Taken before the handshake, when nothing says
+    /// what the connection is: it holds a place under the connection cap until it takes one of its
+    /// role's (`Connection::general`), so the cap bounds the connections not yet identified and
+    /// those whose role has no cap of its own (probes, engines, directory links), and a relay full
+    /// of feeders, subscribers or members still answers the next peer's handshake, and tells a
+    /// member it is full (`Reason::Full`) rather than closing on it unanswered.
     pub fn connection(&self, address: IpAddr) -> Option<Connection> {
         let source = SourceSlot::take(
             &self.per_address,
             source_of(address),
             self.max_connections_per_address,
         )?;
-        let relay = Slot::take(&self.connections, self.max_connections)?;
+        let general = Slot::take(&self.connections, self.max_connections)?;
         Some(Connection {
-            _relay: relay,
+            general: Some(general),
             _source: source,
         })
     }
@@ -1317,7 +1411,8 @@ impl Hub {
     /// Forwards a batch if it is new (see `Forwarded`): handed to the ingest worker that owns its
     /// receiver's shard, which admits, decodes (once, `ingest`), deduplicates and fans it out. On
     /// a hub whose stages run inline this happens before it returns, and the answer is whether it
-    /// was new; on threads it is the worker's, and this says only that it was handed over.
+    /// was new; on threads it is the worker's, and this says only that it was handed over (false
+    /// when the workers' queues held their bound, `ingest::Stages::refused`).
     pub fn ingest(self: &Arc<Self>, inbound: Inbound) -> bool {
         let Ok(receiver) = inbound.batch.receiver() else {
             return false;
@@ -1353,8 +1448,7 @@ impl Hub {
                     },
                 );
             }),
-        );
-        true
+        )
     }
 
     /// A receiver's batch, verified elsewhere, from `source`: as `ingest` with nothing to follow.
@@ -1413,7 +1507,15 @@ impl Hub {
         }
         // A format this build cannot read is still forwarded raw; it just adds nothing here.
         let (batch, decoded) = match Stages::decode(batch, stamp) {
-            Ok(decoded) => (decoded.batch().clone(), Some(decoded)),
+            Ok(decoded) => {
+                // Covering it from the moment it exists, then charged for what it holds, no more,
+                // until the epochs hold it. Covered first: shrinking releases bytes, which wakes
+                // whoever waits for room in the store, and a decode not yet covered when that
+                // thread runs first is one no charge covers for as long as this one waits.
+                in_flight.cover(&decoded);
+                in_flight.shrink_to(decoded.footprint());
+                (decoded.batch().clone(), Some(decoded))
+            }
             Err(undecodable) => (undecodable.batch, None),
         };
         let observations = decoded
@@ -1456,8 +1558,6 @@ impl Hub {
         }
         let cell = described.flatten();
         if let Some(decoded) = &decoded {
-            // Charged for what the decode holds, no more, until the epochs hold it.
-            in_flight.shrink_to(decoded.footprint());
             let area = self.network.products.area_for(&receiver);
             self.stages
                 .message()
@@ -1636,7 +1736,8 @@ impl Hub {
             return;
         };
         let worker = self.stages.worker_of(raw_shard(&receiver));
-        self.stages.run_stamped(
+        // Refused only past the workers' bound, counted there (`Stages::refused`).
+        let _handed = self.stages.run_stamped(
             worker,
             in_flight,
             stamp,
@@ -2040,8 +2141,17 @@ fn queue_bounds(budget: &Budget) -> Bounds {
 }
 
 /// The fan-out, its queues bounded each by `queue_bounds` and together by the budget's gauge.
-fn router(budget: &Budget) -> Router {
-    Router::charged(queue_bounds(budget), budget.gauge(Store::Fanout))
+/// The fan-out over `budget`'s share for subscriber queues, each queue holding `queue_bytes` when
+/// named (`Hub::queue_bytes`), else the budget's share.
+fn router(budget: &Budget, queue_bytes: Option<usize>) -> Router {
+    let bounds = match queue_bytes {
+        Some(max_bytes) => Bounds {
+            max_bytes,
+            max_age_ms: BEHIND_MS,
+        },
+        None => queue_bounds(budget),
+    };
+    Router::charged(bounds, budget.gauge(Store::Fanout))
 }
 
 fn now_ms() -> u64 {

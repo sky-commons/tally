@@ -306,17 +306,23 @@ fn the_same_stamped_trace_makes_the_same_bytes_on_any_number_of_threads() -> Res
         Threads {
             ingest: 1,
             message: 1,
+            seal: 1,
         },
         |_| Duration::ZERO,
     )?;
     assert!(!one.regional.is_empty(), "no regional product");
     assert!(!one.world.is_empty(), "no world product");
     assert!(!one.stream.is_empty(), "no deduplicated stream");
-    for (ingest, message) in [(2, 2), (8, 8), (8, 3)] {
-        let many = run(&trace, Threads { ingest, message }, |_| Duration::ZERO)?;
+    for (ingest, message, seal) in [(2, 2, 2), (8, 8, 8), (8, 3, 5), (2, 4, 1)] {
+        let threads = Threads {
+            ingest,
+            message,
+            seal,
+        };
+        let many = run(&trace, threads, |_| Duration::ZERO)?;
         assert_eq!(
             one, many,
-            "{ingest} ingest and {message} message threads differ"
+            "{ingest} ingest, {message} message and {seal} seal threads differ"
         );
     }
     Ok(())
@@ -336,17 +342,23 @@ fn stamped_by_the_ingest_clock_with_delays_inside_every_stage_the_bytes_are_the_
         Threads {
             ingest: 1,
             message: 1,
+            seal: 1,
         },
         None,
     )?;
     assert!(!steady.regional.is_empty(), "no regional product");
     assert!(!steady.world.is_empty(), "no world product");
     assert!(!steady.stream.is_empty(), "no deduplicated stream");
-    for (ingest, message) in [(4, 4), (8, 3)] {
-        let delayed = run_clocked(&trace, Threads { ingest, message }, Some(jitter(2_000)))?;
+    for (ingest, message, seal) in [(4, 4, 4), (8, 3, 2)] {
+        let threads = Threads {
+            ingest,
+            message,
+            seal,
+        };
+        let delayed = run_clocked(&trace, threads, Some(jitter(2_000)))?;
         assert_eq!(
             steady, delayed,
-            "{ingest} ingest and {message} message threads, delayed inside, differ"
+            "{ingest} ingest, {message} message and {seal} seal threads, delayed inside, differ"
         );
     }
     Ok(())
@@ -361,6 +373,7 @@ fn copies_of_a_message_up_to_two_seconds_apart_are_kept_once() -> Result {
     let hub = Arc::new(Hub::clocked(8, Arc::new(|| 0)).staged(Threads {
         ingest: 4,
         message: 4,
+        seal: 4,
     })?);
     hub.network().adopt_identity(Identity::from_seed([59; 32]));
     let message = airborne(
@@ -429,6 +442,7 @@ fn delays_injected_between_batches_change_nothing() -> Result {
     let threads = Threads {
         ingest: 4,
         message: 4,
+        seal: 4,
     };
     let steady = run(&trace, threads, |_| Duration::ZERO)?;
     // Pseudorandom pauses: the workers, the shards and the sealer each fall behind and catch up
@@ -454,6 +468,7 @@ fn a_message_heard_by_many_receivers_on_many_workers_is_kept_once_a_window() -> 
         Threads {
             ingest: 8,
             message: 8,
+            seal: 8,
         },
         |_| Duration::ZERO,
     )?;
@@ -496,6 +511,7 @@ async fn each_receivers_batches_reach_a_subscriber_in_order_described_first() ->
     let hub = Arc::new(Hub::clocked(8, Arc::new(|| 0)).staged(Threads {
         ingest: 8,
         message: 2,
+        seal: 2,
     })?);
     let listener = hub.listen(
         999,
@@ -605,6 +621,7 @@ async fn a_subscriber_that_falls_behind_is_let_go_whole_and_the_stream_refused_w
             .staged(Threads {
                 ingest: 2,
                 message: 2,
+                seal: 2,
             })?,
     );
     let raw = || {
@@ -672,129 +689,5 @@ async fn a_subscriber_that_falls_behind_is_let_go_whole_and_the_stream_refused_w
         seconds as usize
     );
     assert_eq!(hub.network().products.report().stream_refused, refused);
-    Ok(())
-}
-
-/// A batch of `count` distinct receptions from `receiver`, its sequence `sequence`.
-fn busy_batch(receiver: &Identity, sequence: u64, count: u32) -> Result<Batch> {
-    Batch::sign(
-        receiver,
-        &BatchContent {
-            boot_id: 9,
-            sequence,
-            counter_epoch: 0,
-            wall_ms: 0,
-            dropped: 0,
-            previous: [0; 32],
-            observations: (0..count)
-                .map(|n| Observation {
-                    format: format::MODE_S_LONG,
-                    timestamp: u64::from(n),
-                    signal: 0,
-                    // Distinct whatever the receiver and the batch: every reception is new.
-                    data: [
-                        &sequence.to_be_bytes()[..],
-                        &n.to_be_bytes(),
-                        &receiver.public().as_bytes()[..2],
-                    ]
-                    .concat(),
-                })
-                .collect(),
-        },
-    )
-    .map_err(text)
-}
-
-/// RFC-0181 invariant 8, for the stages that can stall: a stage that never lets go cannot grow
-/// the relay's memory past its budget. Here the epoch never closes (every batch is stamped in one
-/// second and the ingest clock stands still), so the message exchange holds everything it is
-/// given, and nobody reads the one subscriber's queue. Ten times what the budget gives the epochs
-/// is ingested: each store's gauge stays within its limit, the epoch is refused whole (counted)
-/// when it does close, and the stalled subscriber is let go as fallen behind, holding nothing.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_stalled_stage_never_grows_past_the_budget() -> Result {
-    use tally_relay::budget::Store;
-    let hub = Arc::new(
-        Hub::clocked(8, Arc::new(|| 0))
-            .memory_for_feeders(4, false)
-            .staged(Threads {
-                ingest: 2,
-                message: 2,
-            })?,
-    );
-    let stalled = hub.listen(
-        998,
-        Filter::Subscription(tally_relay::subscription::Subscription {
-            streams: Streams::RAW,
-            regions: Vec::new(),
-        }),
-    );
-    let epochs = hub.budget().gauge(Store::Epochs);
-    let fanout = hub.budget().gauge(Store::Fanout);
-    let receivers: Vec<Identity> = (0..8u8)
-        .map(|n| Identity::from_seed([n + 40; 32]))
-        .collect();
-    let mut ingested = 0usize;
-    let mut sequence = 0u64;
-    while ingested < 10 * epochs.limit().max(fanout.limit()) {
-        for receiver in &receivers {
-            let batch = busy_batch(receiver, sequence, 600)?;
-            ingested += batch.as_bytes().len();
-            let in_flight = hub.in_flight_for(&batch);
-            hub.ingest(Inbound {
-                source: 1,
-                batch,
-                origin: Origin::Elsewhere,
-                verify: true,
-                stamp: Some(Stamp {
-                    stamp_ms: BASE_MS + 500,
-                    ingest_seq: ingested as u64,
-                }),
-                in_flight,
-                refusal: None,
-            });
-        }
-        sequence += 1;
-    }
-    hub.flush();
-    // The message threads take what the workers routed in their own time.
-    let started = Instant::now();
-    while epochs.refused() == 0 {
-        if started.elapsed() > Duration::from_secs(60) {
-            return Err("the epoch was never refused".to_owned());
-        }
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
-    for gauge in [&epochs, &fanout] {
-        assert!(
-            gauge.peak() <= gauge.limit(),
-            "{:?}: peak {} past its limit {}",
-            gauge.store(),
-            gauge.peak(),
-            gauge.limit()
-        );
-    }
-    // The subscriber that never read was let go, holding nothing.
-    let mut got = Vec::new();
-    assert!(matches!(
-        stalled.try_recv_many(&mut got, 1_000_000),
-        Err(Fell::Behind(_))
-    ));
-    assert_eq!(stalled.queued_bytes(), 0);
-    // When the epoch closes it is refused whole and counted, and what it held is let go.
-    let end = BASE_MS + 2_000;
-    hub.advance(end);
-    let started = Instant::now();
-    while hub.network().products.watermark_ms() < end {
-        if started.elapsed() > Duration::from_secs(60) {
-            return Err("the epochs never closed".to_owned());
-        }
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
-    assert!(hub.network().products.report().epochs_refused >= 1);
-    assert_eq!(epochs.held(), 0);
-    let (stream, refused) = stream_of(&hub)?;
-    assert!(stream.is_empty());
-    assert!(refused >= 1);
     Ok(())
 }

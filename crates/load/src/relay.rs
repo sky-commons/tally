@@ -51,12 +51,13 @@ fn free_port(host: &str) -> Result<u16, String> {
 }
 
 /// Starts `bin` as a relay for `feeders`, with a fresh key, listening at `listen` (port 0: a free
-/// one) and serving its stats on loopback; `extra` follows the harness's own arguments, so it
-/// overrides them. Returns once it accepts connections.
+/// one) and serving its stats on loopback, hosting MLAT (`mlat`) or not (`--no-mlat`); `extra`
+/// follows the harness's own arguments, so it overrides them. Returns once it accepts connections.
 pub fn spawn(
     bin: &Path,
     listen: &str,
     max_upload: &str,
+    mlat: bool,
     extra: &[String],
     feeders: usize,
     state_dir: &Path,
@@ -105,7 +106,7 @@ pub fn spawn(
         .args(["--stats-listen", &stats])
         .args(["--max-connections", &connections])
         .args(["--max-connections-per-address", &connections])
-        .args(["--mlat-threads", "0"])
+        .args(if mlat { &[][..] } else { &["--no-mlat"][..] })
         .args(extra)
         .stdin(Stdio::null())
         .stdout(output)

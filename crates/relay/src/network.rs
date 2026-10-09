@@ -141,14 +141,16 @@ impl Network {
     }
 
     /// Every duty's store charged to its gauge of `budget` (`budget::Store`), the gauge's limit its
-    /// share and its only bound: the one batch byte store (sharing), the delivery tags, and what
-    /// the products hold. Called again when the budget is resized; the gauges are the budget's own
+    /// share and its only bound: the one batch byte store (sharing), the room parities are
+    /// reassembled in (`budget::Budget::parity_assembly`), the delivery tags, and what the products
+    /// hold. Called again when the budget is resized; the gauges are the budget's own
     /// for its life, so whoever holds one sees the new limit.
     pub fn charge_to(&self, budget: &crate::budget::Budget) {
         use crate::budget::Store;
         self.sharing.charge_to(budget.gauge(Store::Batches));
+        self.sharing.assemble_in(budget.parity_assembly());
         self.delivery.charge_to(budget.gauge(Store::Delivery));
-        self.products.charge_to(budget.gauge(Store::Products));
+        self.products.charge_to(budget);
     }
 
     /// Group records members have sent this relay.
@@ -215,7 +217,8 @@ impl Network {
                         &self.selection,
                         identity,
                         &query,
-                        (point, asker.source),
+                        // Rationed by the prober's key, never its connection (`delivery`).
+                        (point, asker.key),
                         hub.now_ms(),
                     )
                     .map(Record::DeliveryAnswer)
@@ -233,14 +236,24 @@ impl Network {
                 .into_iter()
                 .map(Record::ProviderOffer)
                 .collect(),
+            // Sharing answers nothing down the link a message came in on: what it sends, a repair
+            // page to the asker too, goes over this relay's own member links (`sharing`).
             Record::StripeAssignment(assignment) => {
-                self.sharing.assigned(asker, assignment, now_ms)
+                self.sharing.assigned(asker, assignment, now_ms);
+                Vec::new()
             }
-            Record::PieceManifest(manifest) => self.sharing.manifest(asker, manifest, now_ms),
-            Record::HaveSummary(have) => self.sharing.have(asker, have, now_ms),
+            Record::PieceManifest(manifest) => {
+                self.sharing.manifest(asker, manifest, now_ms);
+                Vec::new()
+            }
+            Record::HaveSummary(have) => {
+                self.sharing.have(asker, have, now_ms);
+                Vec::new()
+            }
             Record::StripeReceipt(receipt) => {
                 self.credit.record_receipt(receipt.clone(), now_ms);
-                self.sharing.receipt(asker, receipt, now_ms)
+                self.sharing.receipt(asker, receipt, now_ms);
+                Vec::new()
             }
             Record::FirehoseCredential(credential) => {
                 self.credit.presented(asker, credential, now_ms);
@@ -258,14 +271,24 @@ impl Network {
             }
             // The products take a record in by its stamp against their watermark, so it is
             // stamped by the ingest clock their watermark comes from (`products::Records`).
-            Record::WorldPositions(world) => self.products.world_from(asker, world, hub.now_ms()),
-            Record::WorldPrecise(world) => self.products.precise_from(asker, world, hub.now_ms()),
+            Record::WorldPositions(world) => {
+                self.products.world_from(asker, world, hub.now_ms());
+                Vec::new()
+            }
+            Record::WorldPrecise(world) => {
+                self.products.precise_from(asker, world, hub.now_ms());
+                Vec::new()
+            }
             Record::RegionalBatch(regional) => {
                 let record = Record::RegionalBatch(regional.clone());
                 self.from_peer(hub, asker, &record, now_ms);
-                self.products.regional_from(asker, regional, hub.now_ms())
+                self.products.regional_from(asker, regional, hub.now_ms());
+                Vec::new()
             }
-            Record::Parity(chunk) => self.sharing.parity_chunk(asker, chunk, now_ms),
+            Record::Parity(chunk) => {
+                self.sharing.parity_chunk(asker, chunk, now_ms);
+                Vec::new()
+            }
             // A bundler's index: checked, and passed on to whoever reads the parent cell.
             Record::BundleIndex(index) => {
                 if asker.role == AskerRole::Relay && index.verify().is_ok() {
@@ -533,9 +556,11 @@ impl Network {
         let Some(identity) = self.identity() else {
             return;
         };
-        let mut by_member: BTreeMap<PublicKey, Vec<Record>> = BTreeMap::new();
-        for (member, record) in self.sharing.take_outbox() {
-            by_member.entry(member).or_default().push(record);
+        // Each send carries its charge (`sharing::Addressed`) to the link, which holds it until
+        // the send is written (`peers`).
+        let mut by_member: BTreeMap<PublicKey, Vec<crate::sharing::Addressed>> = BTreeMap::new();
+        for sent in self.sharing.take_outbox() {
+            by_member.entry(sent.to).or_default().push(sent);
         }
         for (member, records) in by_member {
             let Some(address) = self.directory.address_of(&member) else {

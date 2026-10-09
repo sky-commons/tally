@@ -21,8 +21,14 @@
 [Unit]
 Description=Tally relay: verifies and forwards Tally receivers' batches
 Documentation=https://github.com/flightlines/tally
-After=network-online.target
-Wants=network-online.target
+# A relay stamps what it ingests by its own ingest clock, anchored to the wall clock it starts on
+# and never going back: started on a clock still seconds behind, it would refuse every feeder's
+# raw as ahead of it until it caught up. So it starts once
+# the clock is synchronized, where the host says so: time-sync.target is reached after a wait
+# service (systemd-time-wait-sync.service, chrony-wait.service) when one is enabled, and at once
+# where none is, so a host with no time daemon still starts its relay.
+After=network-online.target time-sync.target
+Wants=network-online.target time-sync.target
 
 [Service]
 Type=simple
