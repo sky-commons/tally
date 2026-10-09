@@ -129,11 +129,12 @@ pub const DESCRIPTION_BYTES_HELD: usize = 64 * 1024 * 1024;
 /// | clock model parts awaiting manifests, and manifests' lists    | 96 MiB     |
 ///
 /// A connection's Noise buffers come from one pool (`tally_wire::noise`), and each connection
-/// carves what it may hold of them while it reads (`ingest::BUFFERS_PER_CONNECTION`) when it is
-/// admitted: a feeder from what it reserved (`Store::Buffers`), every other connection from room
-/// the plan sizes to the connection cap (`budget::Plan::connection_buffers`), so a peer trickling
-/// a message holds what was planned for it. The kernel's socket buffers for the fan-out's links are charged to the
-/// relay's cgroup beside it.
+/// carves what it may hold of them, reading and writing (`ingest::BUFFERS_PER_CONNECTION`), for
+/// its whole session: a feeder from what it reserved (`Store::Buffers`), every other connection
+/// from room the plan sizes to every connection but a feeder's the caps allow (this cap, the
+/// member sessions and the subscribers, `Hub::plan`, `budget::Plan::connection_buffers`), so a
+/// peer trickling a message, or reading slowly, holds what was planned for it. The kernel's
+/// socket buffers for the fan-out's links are charged to the relay's cgroup beside it.
 ///
 /// The members (the sessions over which other relays' data comes in) share one rate
 /// (`DEFAULT_MAX_MEMBER_BYTES_PER_SEC`), planned once as the feeders it is worth, and each member
@@ -141,8 +142,11 @@ pub const DESCRIPTION_BYTES_HELD: usize = 64 * 1024 * 1024;
 /// session the areas taken bring, at most this cap (`budget::members_for`,
 /// `budget::Budget::reserve_member`), so what they send is admitted the same way as a feeder's and
 /// never competes with feeders for room; past them a member is turned away as full
-/// (`Reason::Full`) and routed around (RFC-0174 §2.5). Every session, in or out, holds a place
-/// under this cap (`Hub::connection`, `Hub::dialled`). What members cost beyond that is bandwidth
+/// (`Reason::Full`) and routed around (RFC-0174 §2.5). This cap holds the sessions that have no
+/// place of their role's own: a connection not yet identified, a probe, an engine, a directory
+/// link, a dial that only sends (`Hub::connection`, `Hub::dialled`); a feeder, a subscriber and a
+/// member give their place under it up for their own (`hub::Connection::general`), so no role
+/// takes another's. What members cost beyond that is bandwidth
 /// in, up to their shared rate; an operator sizes `--max-member-bytes-per-sec` to the host's link.
 pub const DEFAULT_MAX_CONNECTIONS: usize = 2048;
 /// Per IPv4 address, or per IPv6 /64 (what one host is usually given), so one host cannot take
@@ -479,14 +483,13 @@ pub enum Origin {
 /// What the relay's memory holds (`Hub::memory_report`, `GET /memory`): the budget and its gauges,
 /// the one batch byte store's and the delivery tags' own counts of what they hold (kept apart from
 /// their charges, so each is read beside its gauge, `Store::Batches` and `Store::Delivery`, which
-/// hold them), and every decoded batch alive, whichever stores share it.
+/// hold them). Every decoded batch alive, whichever stores share it, is the budget's
+/// (`budget::MemoryReport::decoded`), read beside what those stores are charged.
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct MemoryReport {
     pub budget: crate::budget::MemoryReport,
     pub batches_held: usize,
     pub delivery_held: usize,
-    pub decoded_live: usize,
-    pub decoded_live_bytes: usize,
     /// Sharing members turned away for want of room in the members' pool.
     pub members_refused: u64,
 }
@@ -777,11 +780,22 @@ impl Drop for Slot {
     }
 }
 
-/// Held for as long as one connection is open: its place under the relay's cap and under its
-/// source's.
+/// Held for as long as one connection is open: its place under its source's cap, and, until it
+/// is given up for a place of the connection's own role (`Connection::general`), under the
+/// relay's.
 pub struct Connection {
-    _relay: Slot,
+    general: Option<Slot>,
     _source: SourceSlot,
+}
+
+impl Connection {
+    /// Its place under the relay's connection cap, to hold while the connection has no place of
+    /// its own and to let go when it takes one: a feeder once it holds its reservation, a
+    /// subscriber its place among the subscribers, a relay its member's place. Each role is
+    /// bounded by its own cap, never by another's (`Hub::plan`).
+    pub fn general(&mut self) -> Option<Slot> {
+        self.general.take()
+    }
 }
 
 /// One connection's place among its source's.
@@ -841,7 +855,8 @@ impl Hub {
         Self::clocked(max_subscribers, crate::ingest::anchored_wall_clock())
     }
 
-    /// As `new`, its ingest clock `clock`.
+    /// As `new`, its ingest clock `clock`. Its budget is sized from its own plan (`Hub::plan`),
+    /// as every change to its caps resizes it.
     pub fn clocked(max_subscribers: usize, clock: Clock) -> Self {
         let network = Network::new();
         let budget = Budget::of_memory(
@@ -898,6 +913,7 @@ impl Hub {
             network,
             members_refused: AtomicU64::new(0),
         }
+        .replanned()
     }
 
     /// The stages on threads of their own (`threads`), the sealer on its own: what a relay runs.
@@ -978,7 +994,20 @@ impl Hub {
         let members = crate::budget::members_for(&self.areas, self.holds_raw, self.max_connections);
         Plan::planned(self.holds_raw)
             .with_members(members, self.max_member_bytes_per_sec)
-            .with_connections(self.max_connections)
+            .with_connections(self.non_feeder_connections(members))
+    }
+
+    /// Every connection but a feeder's the relay holds at once, each by its own role's cap: those
+    /// under the connection cap (not yet identified, probes, engines, directory links, the dials
+    /// that hold no member's place), the member sessions (`members`), and the subscribers. A
+    /// feeder's are its reservation's. Before, the three shared the one cap, so the plan counted
+    /// some 128 members, 25 feeders and 64 subscribers in 128 connections, and a member past the
+    /// connections the others held was closed on before its handshake, with no word to route
+    /// around it by.
+    fn non_feeder_connections(&self, members: usize) -> usize {
+        self.max_connections
+            .saturating_add(members)
+            .saturating_add(self.max_subscribers)
     }
 
     /// Takes `areas` (RFC-0174 §2.1): the areas its sharing and MLAT choose from
@@ -1013,13 +1042,10 @@ impl Hub {
     /// What the relay's memory holds, store by store (`GET /memory`).
     pub fn memory_report(&self) -> MemoryReport {
         let (sharing, _) = self.network.sharing.held();
-        let (decoded, decoded_bytes) = tally_wire::decoded::live();
         MemoryReport {
             budget: self.budget.report(),
             batches_held: sharing,
             delivery_held: self.network.delivery.held_bytes(),
-            decoded_live: decoded,
-            decoded_live_bytes: decoded_bytes,
             members_refused: self.members_refused.load(Ordering::Relaxed),
         }
     }
@@ -1054,7 +1080,10 @@ impl Hub {
     /// `bytes` the relay itself hands the ingest stage (a batch's, a description's), charged to
     /// `Store::Ingest`, the caller's thread waiting for room.
     pub fn in_flight_of(&self, bytes: usize) -> InFlight {
-        InFlight::trusted(&self.budget.gauge(Store::Ingest), bytes)
+        InFlight::trusted(
+            &self.budget.gauge(Store::Ingest),
+            crate::ingest::floored(bytes),
+        )
     }
 
     /// A connection's Noise buffers (`ingest::BUFFERS_PER_CONNECTION`), carved for as long as it
@@ -1276,24 +1305,29 @@ impl Hub {
         std::sync::Arc::clone(&self.ceiling_clock)
     }
 
-    /// A place under the connection cap for a session this relay dials itself (a member link, a
-    /// one-hop raw link, an upstream): every session in or out holds one, so the connections the
-    /// budget plans buffers and member sessions for (`budget::members_for`) are all of them.
+    /// A place under the connection cap for a session this relay dials itself that holds no place
+    /// of its own role (a member link that only sends, an upstream). A one-hop raw link is a
+    /// member session, and holds a member's place instead (`link::admit_member`).
     pub fn dialled(&self) -> Option<Slot> {
         Slot::take(&self.connections, self.max_connections)
     }
 
     /// A place for one more connection from `address`, or `None` when the relay, or that
-    /// address's source, holds as many as it will.
+    /// address's source, holds as many as it will. Taken before the handshake, when nothing says
+    /// what the connection is: it holds a place under the connection cap until it takes one of its
+    /// role's (`Connection::general`), so the cap bounds the connections not yet identified and
+    /// those whose role has no cap of its own (probes, engines, directory links), and a relay full
+    /// of feeders, subscribers or members still answers the next peer's handshake, and tells a
+    /// member it is full (`Reason::Full`) rather than closing on it unanswered.
     pub fn connection(&self, address: IpAddr) -> Option<Connection> {
         let source = SourceSlot::take(
             &self.per_address,
             source_of(address),
             self.max_connections_per_address,
         )?;
-        let relay = Slot::take(&self.connections, self.max_connections)?;
+        let general = Slot::take(&self.connections, self.max_connections)?;
         Some(Connection {
-            _relay: relay,
+            general: Some(general),
             _source: source,
         })
     }

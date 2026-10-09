@@ -1579,10 +1579,13 @@ async fn taking(
 /// is turned away with `Reason::Full`. The third takes that as "this provider is full": it routes
 /// what it would have sent the full relay to the next members of the area's trees, so its
 /// feeder's batches reach the second relay and its subscriber all the same, and it does not dial
-/// the full relay again for the wait it was given (so the full relay turns it away once, never in
-/// a loop).
+/// the full relay again for the wait it was given (so the full relay turns each relay away once,
+/// never in a loop). The feed runs past several receipt windows and their judgment, and routing
+/// around is no fault on either side (§2.6, "it is not demoted for it"): receipts are signed, no
+/// relay files a shortfall, and none demotes another.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_relay_whose_members_are_full_is_routed_around_and_the_data_still_arrives() -> Result {
+    use tally_relay::sharing::member::{JUDGE_AFTER_MS, RECEIPT_GRACE_MS, RECEIPT_WINDOW_SECONDS};
     let place = at(33.749, -84.388);
     let area = tally_wire::rendezvous::area_of(&place).map_err(text)?;
     let [full, next, third] = [
@@ -1636,7 +1639,10 @@ async fn a_relay_whose_members_are_full_is_routed_around_and_the_data_still_arri
     let feeder = Identity::generate().map_err(text)?;
     let mut feed = described_feeder(&third_relay, &feeder, Some(place)).await?;
     let mut subscriber = subscribe(&next_relay).await?;
-    let sent = 40;
+    // Twelve seconds of batches: at least one whole receipt window, its receipts and its judgment
+    // (`sharing::member::RECEIPT_WINDOW_SECONDS`, `RECEIPT_GRACE_MS`, `JUDGE_AFTER_MS`) fall
+    // inside the run, and the full relay's 60 s wait outlasts it.
+    let sent = 120;
     let author = feeder.public();
     let heard = tokio::spawn(async move {
         let mut sequences = std::collections::BTreeSet::new();
@@ -1659,22 +1665,53 @@ async fn a_relay_whose_members_are_full_is_routed_around_and_the_data_still_arri
             .map_err(text)?;
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    let got = tokio::time::timeout(Duration::from_secs(60), heard)
+    let fed_until = tally_relay::network::wall_ms();
+    let got = tokio::time::timeout(Duration::from_secs(30), heard)
         .await
         .map_err(|_| "the third relay's batches never all reached the second".to_owned())?
         .map_err(text)?;
     assert_eq!(got, sent);
-    // The full relay said so, and the third took it as full: routed around, not dialled again.
+    // Past the judgment of the last window the feed reached.
+    let window_ms = RECEIPT_WINDOW_SECONDS * 1000;
+    let judged_at =
+        fed_until - fed_until % window_ms + window_ms + RECEIPT_GRACE_MS + JUDGE_AFTER_MS + 1_000;
+    let wait = judged_at.saturating_sub(tally_relay::network::wall_ms());
+    tokio::time::sleep(Duration::from_millis(wait)).await;
+
+    // The full relay said so, and each relay it turned away took it as full: routed around, not
+    // dialled again, so it turned each away exactly once.
     let now = tally_relay::network::wall_ms();
     assert!(
         third_hub.network().peers.full(now).contains(&full.public()),
         "the third relay does not hold the first as full"
     );
+    let turned_away = [&next_hub, &third_hub]
+        .iter()
+        .filter(|hub| hub.network().peers.full(now).contains(&full.public()))
+        .count() as u64;
     let refused = full_hub.memory_report().members_refused;
-    assert!(
-        (1..=2).contains(&refused),
-        "the full relay turned links away {refused} times"
+    assert_eq!(
+        refused, turned_away,
+        "the full relay turned links away {refused} times, {turned_away} relays hold it as full"
     );
+    // Windows were receipted and judged, and nobody took the route-around for a fault.
+    let group = tally_relay::sharing::groups::GroupKey::new(area, tally_wire::Streams::RAW);
+    let mut receipts = 0;
+    for (hub, own) in hubs.iter().zip(keys) {
+        let (stats, _) = hub.network().sharing.stats();
+        receipts += stats.receipts;
+        assert_eq!(
+            stats.shortfalls, 0,
+            "a relay filed a shortfall after a route-around"
+        );
+        for key in keys.iter().filter(|key| **key != own) {
+            assert!(
+                !hub.network().sharing.groups.is_demoted(group, key),
+                "a relay demoted another after a route-around"
+            );
+        }
+    }
+    assert!(receipts > 0, "no receipt was signed: no window was judged");
     drop(held);
     Ok(())
 }

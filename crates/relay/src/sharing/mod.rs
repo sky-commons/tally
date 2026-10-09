@@ -13,6 +13,8 @@
 //! - `withdrawal`: the regions this relay stops forwarding in while its upload cap sheds the peers
 //!   it forwards to (§2.5, "The cap stays the ceiling").
 //! - `locks`: the one way every lock here is taken, so a panic never ends sharing.
+//! - `full`: how long a member that said it is full is routed around, the one rule both ends of
+//!   the refusal keep.
 //!
 //! [`Sharing`] is the network seam's face of it: the records links hand in, what this relay
 //! originates ([`Sharing::originate`]) and members send it ([`Sharing::received`]), parity chunks
@@ -34,6 +36,7 @@
 //! record of its class (`egress`), so an asker cannot draw the control reserve by asking.
 
 pub mod bundles;
+pub mod full;
 pub mod groups;
 pub mod locks;
 pub mod member;
@@ -63,7 +66,7 @@ use crate::selection::Taken;
 
 use self::groups::{ASK_LIFETIME_MS, GroupKey};
 use self::locks::lock;
-use self::member::{Arrival, HORIZON_SECONDS, Member, Message, Outgoing, Piece, record_hash};
+use self::member::{Arrival, Member, Message, Outgoing, Piece, record_hash};
 use self::withdrawal::Withdrawal;
 
 pub use self::seeds::{SEED_COPIES, seeded_bytes};
@@ -84,8 +87,19 @@ pub const SHARED_PRODUCTS: [Streams; 5] = [
     Streams::REGIONAL,
 ];
 
-/// The most addressed sends held for the links before the oldest are dropped.
-pub const OUTBOX_MAX: usize = 65_536;
+/// What one sender may have reassembling at once, in what it is charged: two parities of the
+/// longest a parity may be, each with its pieces' own cost. A sender's chunks are sent together, so
+/// an honest one has about one parity in flight a link, and the longest finishes within it; past
+/// its share its chunks are refused, and no other sender's room is taken.
+pub const ASSEMBLING_PER_SENDER: usize =
+    2 * assembling_cost(tally_wire::sharing::MAX_PARITY_LEN as usize);
+
+/// What reassembling a parity of `len` bytes is charged once it is whole, its chunks sent as its
+/// origin cuts them (`ParityChunk::chunks`): its bytes, each piece's own cost, and its own.
+pub const fn assembling_cost(len: usize) -> usize {
+    len + len.div_ceil(tally_wire::sharing::MAX_PARITY_CHUNK) * PIECE_OVERHEAD
+        + std::mem::size_of::<Assembling>()
+}
 /// How long a parity may take to arrive whole from its first chunk: its chunks are sent together,
 /// so one still missing a piece after this never will be.
 pub const PARITY_ASSEMBLY_MS: u64 = 10 * 1000;
@@ -96,7 +110,11 @@ pub struct Sharing {
     pub groups: groups::Groups,
     pub bundles: bundles::Bundles,
     member: Mutex<Option<Member>>,
-    outbox: Mutex<Vec<(PublicKey, Record)>>,
+    /// The addressed sends waiting for their links, each charged to the store's gauge from when it
+    /// is queued until it is handed on ([`Addressed`]); a send the gauge cannot take is refused,
+    /// counted (`outbox_refused`), never one already queued dropped.
+    outbox: Mutex<Vec<Addressed>>,
+    outbox_refused: AtomicU64,
     /// Parity chunks by (sender, manifest), until the parity is whole.
     assembling: Mutex<HashMap<(PublicKey, tally_wire::batch::Hash), Assembling>>,
     /// The last second bundle indexes were signed for.
@@ -137,17 +155,38 @@ pub struct Work {
     pub books: usize,
 }
 
+/// A send addressed to a member, waiting for the link to it: charged to the one batch byte store's
+/// gauge (`budget::Store::Batches`, the store of what sharing holds) for its encoded bytes while it
+/// waits, the charge handed on with it so whoever holds it next holds it charged. A piece shares
+/// its bytes with the record its group holds, so this counts them again while the send waits:
+/// never less than what is held.
+#[derive(Debug)]
+pub struct Addressed {
+    pub to: PublicKey,
+    pub record: Record,
+    pub charge: Charge,
+}
+
+/// A parity being reassembled: only the bytes received, charged as each chunk arrives, never its
+/// declared whole before it has come.
 struct Assembling {
     /// The first chunk, without its bytes: what every later chunk must agree with.
     first: ParityChunk,
-    bytes: Vec<u8>,
-    /// Its bytes and its own size, charged to the store's gauge while it is reassembled.
-    _charge: Charge,
-    /// The byte ranges written, disjoint and merged (start to end), and how many bytes they cover.
-    covered: BTreeMap<usize, usize>,
+    /// The whole's length, as the first chunk declared it and its manifest allows
+    /// (`Member::parity_room`).
+    total: usize,
+    /// The bytes received, by where they start: disjoint, each only what no earlier chunk covered.
+    pieces: BTreeMap<usize, Vec<u8>>,
+    /// The bytes `pieces` hold.
     filled: usize,
+    /// What it holds (its pieces, each with its own size, and its own), charged to the store's
+    /// gauge as it comes.
+    charge: Charge,
     started_ms: u64,
 }
+
+/// What one piece of a parity being reassembled costs beside its bytes.
+const PIECE_OVERHEAD: usize = std::mem::size_of::<(usize, Vec<u8>)>() + 32;
 
 impl Assembling {
     /// Whether `chunk` is a piece of the same parity as the first.
@@ -159,37 +198,50 @@ impl Assembling {
             && chunk.lens == self.first.lens
     }
 
-    /// Writes `bytes` at `start`; how many bytes it covered that no earlier chunk had. `None` past
-    /// the end.
-    fn write(&mut self, start: usize, bytes: &[u8]) -> Option<usize> {
+    /// What of `bytes` written at `start` no earlier chunk covered, as (start, bytes) pieces.
+    /// `None` past the end.
+    fn fresh(&self, start: usize, bytes: &[u8]) -> Option<Vec<(usize, Vec<u8>)>> {
         let end = start.checked_add(bytes.len())?;
-        self.bytes.get_mut(start..end)?.copy_from_slice(bytes);
-        let fresh = cover(&mut self.covered, start, end);
-        self.filled += fresh;
+        if end > self.total {
+            return None;
+        }
+        let mut fresh = Vec::new();
+        let mut at = start;
+        // The piece that starts before `start` may reach into it.
+        let before = self
+            .pieces
+            .range(..start)
+            .next_back()
+            .map(|(from, piece)| from + piece.len());
+        if let Some(reach) = before {
+            at = at.max(reach);
+        }
+        for (from, piece) in self.pieces.range(start..end) {
+            if *from > at {
+                fresh.push((at, bytes[at - start..*from - start].to_vec()));
+            }
+            at = at.max(from + piece.len());
+        }
+        if at < end {
+            fresh.push((at, bytes[at - start..].to_vec()));
+        }
         Some(fresh)
     }
-}
 
-/// Adds `start..end` to `covered` (disjoint ranges, start to end), merging what it touches; the
-/// bytes of it not covered before.
-fn cover(covered: &mut BTreeMap<usize, usize>, start: usize, end: usize) -> usize {
-    if start >= end {
-        return 0;
+    /// Every byte held, in order: the parity whole.
+    fn whole(self) -> Option<(ParityChunk, Vec<u8>)> {
+        if self.filled != self.total {
+            return None;
+        }
+        let mut xor = Vec::with_capacity(self.total);
+        for (from, piece) in self.pieces {
+            if from != xor.len() {
+                return None;
+            }
+            xor.extend_from_slice(&piece);
+        }
+        Some((self.first, xor))
     }
-    let touching: Vec<(usize, usize)> = covered
-        .range(..=end)
-        .filter(|(_, until)| **until >= start)
-        .map(|(from, until)| (*from, *until))
-        .collect();
-    let mut merged = (start, end);
-    let mut before = 0;
-    for (from, until) in touching {
-        covered.remove(&from);
-        before += until.min(end).saturating_sub(from.max(start));
-        merged = (merged.0.min(from), merged.1.max(until));
-    }
-    covered.insert(merged.0, merged.1);
-    (end - start) - before
 }
 
 /// The forwarding peers the egress has shed since the relay started: every class but control
@@ -210,6 +262,7 @@ impl Default for Sharing {
             bundles: bundles::Bundles::default(),
             member: Mutex::default(),
             outbox: Mutex::default(),
+            outbox_refused: AtomicU64::new(0),
             assembling: Mutex::default(),
             indexed_through: Mutex::default(),
             withdrawal: Mutex::default(),
@@ -311,65 +364,104 @@ impl Sharing {
 
     /// A chunk of a parity a member sent: held until the parity is whole, then taken in as the
     /// member's parity.
+    ///
+    /// Reassembled only for an origin manifest this relay holds, from a relay its group knows, and
+    /// only as long as that manifest's records allow (`Member::parity_room`); each chunk's bytes
+    /// are charged as they come (only what no earlier chunk covered), never the declared whole
+    /// ahead of them, and within the sender's share (`ASSEMBLING_PER_SENDER`). So a chunk for a
+    /// manifest nobody signed, or one declaring more than its records could be, holds nothing, and
+    /// a sender that never finishes holds what it sent, for `PARITY_ASSEMBLY_MS`, from its own
+    /// share.
     pub fn parity_chunk(&self, asker: &Asker, chunk: ParityChunk, now_ms: u64) -> DataReplies {
         if asker.role != AskerRole::Relay {
             return Vec::new();
         }
+        let key = (asker.key, chunk.manifest);
+        let fresh_start = !lock(&self.assembling).contains_key(&key);
+        // Asked of the member before the assembly is touched: the two locks are never held
+        // together.
+        let room = if fresh_start {
+            match self.with_member(|member| member.parity_room(&asker.key, &chunk)) {
+                Some(Some(total)) => Some(total),
+                _ => return Vec::new(),
+            }
+        } else {
+            None
+        };
         let whole = {
             let mut assembling = lock(&self.assembling);
             assembling.retain(|_, held| held.started_ms + PARITY_ASSEMBLY_MS > now_ms);
-            let key = (asker.key, chunk.manifest);
-            let Ok(total) = usize::try_from(chunk.total) else {
-                return Vec::new();
-            };
-            let held = match assembling.entry(key) {
-                std::collections::hash_map::Entry::Occupied(held) => held.into_mut(),
-                std::collections::hash_map::Entry::Vacant(vacant) => {
-                    if chunk.second.saturating_add(HORIZON_SECONDS) < now_ms / 1000 {
+            // What the sender has reassembling, this parity's part of it included.
+            let mut sender: usize = assembling
+                .iter()
+                .filter(|((sender, _), _)| *sender == asker.key)
+                .map(|(_, held)| held.charge.bytes())
+                .sum();
+            let held = match (assembling.entry(key), room) {
+                (std::collections::hash_map::Entry::Occupied(held), _) => held.into_mut(),
+                (std::collections::hash_map::Entry::Vacant(vacant), Some(total)) => {
+                    let gauge = Arc::clone(&lock(&self.gauge));
+                    let own = std::mem::size_of::<Assembling>();
+                    if sender.saturating_add(own) > ASSEMBLING_PER_SENDER {
                         return Vec::new();
                     }
-                    // Charged before it is held: past the store's share it is refused whole.
-                    let gauge = Arc::clone(&lock(&self.gauge));
-                    let Some(charge) =
-                        gauge.try_charge(total.saturating_add(std::mem::size_of::<Assembling>()))
-                    else {
+                    let Some(charge) = gauge.try_charge(own) else {
                         return Vec::new();
                     };
+                    sender += own;
                     vacant.insert(Assembling {
-                        bytes: vec![0; total],
-                        _charge: charge,
-                        covered: BTreeMap::new(),
-                        filled: 0,
-                        started_ms: now_ms,
                         first: ParityChunk {
                             bytes: Vec::new(),
                             ..chunk.clone()
                         },
+                        total,
+                        pieces: BTreeMap::new(),
+                        filled: 0,
+                        charge,
+                        started_ms: now_ms,
                     })
                 }
+                // It finished, or expired, while the member was asked: a stray chunk.
+                (std::collections::hash_map::Entry::Vacant(_), None) => return Vec::new(),
             };
-            let Ok(start) = usize::try_from(chunk.offset) else {
+            // What the chunk brings that no earlier one did, within the sender's share and
+            // charged before it is held: past either it is refused whole, and a parity it would
+            // have started is not kept.
+            let fresh = usize::try_from(chunk.offset)
+                .ok()
+                .filter(|_| held.agrees(&chunk))
+                .and_then(|start| held.fresh(start, &chunk.bytes))
+                .filter(|fresh| {
+                    let cost: usize = fresh
+                        .iter()
+                        .map(|(_, bytes)| bytes.len() + PIECE_OVERHEAD)
+                        .sum();
+                    sender.saturating_add(cost) <= ASSEMBLING_PER_SENDER
+                        && held.charge.try_grow(cost)
+                });
+            let Some(fresh) = fresh else {
+                if held.filled == 0 {
+                    assembling.remove(&key);
+                }
                 return Vec::new();
             };
-            if !held.agrees(&chunk) || held.write(start, &chunk.bytes).is_none() {
-                return Vec::new();
+            for (from, bytes) in fresh {
+                held.filled += bytes.len();
+                held.pieces.insert(from, bytes);
             }
-            if held.filled < held.bytes.len() {
+            if held.filled < held.total {
                 return Vec::new();
             }
             assembling.remove(&key)
         };
-        let Some(Assembling {
-            first,
-            bytes: xor,
-            _charge: assembled,
-            ..
-        }) = whole
-        else {
+        let Some(assembled) = whole else {
             return Vec::new();
         };
-        // Whole: its charge ends here, and the parity is charged again where it is held.
-        drop(assembled);
+        // Its charge is held while the whole is put together, and ends once it is
+        // (`Assembling::whole`): the parity is charged again where it is held (`Member::parity`).
+        let Some((first, xor)) = assembled.whole() else {
+            return Vec::new();
+        };
         let mut lens = [0u32; stripes::DATA_STRIPES as usize];
         if first.lens.len() != lens.len() {
             return Vec::new();
@@ -384,6 +476,24 @@ impl Sharing {
             xor,
         };
         self.drive(asker, Message::Parity(Arc::new(parity)), now_ms)
+    }
+
+    /// This relay turned `key`'s member link away as full at `now_ms`, asking it to stay away
+    /// `asked` (`link`, every `Goodbye` of reason `Full` it sends a relay): that relay routes its
+    /// slice past this one for the wait the one rule gives (`full::Wait`), so no shortfall is filed
+    /// against it for those windows (`Member::turned_away`).
+    pub fn turned_away(&self, key: PublicKey, asked: std::time::Duration, now_ms: u64) {
+        self.with_member(|member| member.turned_away(key, asked, now_ms));
+    }
+
+    /// What the member has done since start (records rebuilt, repairs, receipts and shortfalls),
+    /// and the sends refused for room before their links took them.
+    pub fn stats(&self) -> (member::Stats, u64) {
+        let stats = lock(&self.member)
+            .as_ref()
+            .map(Member::stats)
+            .unwrap_or_default();
+        (stats, self.outbox_refused.load(Ordering::Relaxed))
     }
 
     /// What this relay's groups hold (records and parities) and the parities being reassembled
@@ -404,7 +514,13 @@ impl Sharing {
         // parity being reassembled, so `/memory` sets it beside the gauge.
         let assembling: usize = lock(&self.assembling)
             .values()
-            .map(|held| held.bytes.len() + std::mem::size_of::<Assembling>())
+            .map(|held| {
+                held.pieces
+                    .values()
+                    .map(|bytes| bytes.len() + PIECE_OVERHEAD)
+                    .sum::<usize>()
+                    + std::mem::size_of::<Assembling>()
+            })
             .sum();
         lock(&self.member)
             .as_ref()
@@ -413,8 +529,9 @@ impl Sharing {
             })
     }
 
-    /// The addressed sends waiting for their links: (member, record).
-    pub fn take_outbox(&self) -> Vec<(PublicKey, Record)> {
+    /// The addressed sends waiting for their links, each with its charge, which whoever carries it
+    /// holds until it is written ([`Addressed`]).
+    pub fn take_outbox(&self) -> Vec<Addressed> {
         std::mem::take(&mut *lock(&self.outbox))
     }
 
@@ -767,15 +884,24 @@ impl Sharing {
         if out.is_empty() {
             return;
         }
+        let gauge = Arc::clone(&lock(&self.gauge));
+        let mut refused = 0;
         let mut outbox = lock(&self.outbox);
-        outbox.extend(out.into_iter().flat_map(|outgoing| {
+        for outgoing in out {
             let to = outgoing.to;
-            to_records(outgoing.message)
-                .into_iter()
-                .map(move |record| (to, record))
-        }));
-        let excess = outbox.len().saturating_sub(OUTBOX_MAX);
-        outbox.drain(..excess);
+            for record in to_records(outgoing.message) {
+                // Charged before it is queued: past the store's share the send is refused, and
+                // the member it was for repairs what it lacks.
+                match gauge.try_charge(record.encoded_len()) {
+                    Some(charge) => outbox.push(Addressed { to, record, charge }),
+                    None => refused += 1,
+                }
+            }
+        }
+        drop(outbox);
+        if refused > 0 {
+            self.outbox_refused.fetch_add(refused, Ordering::Relaxed);
+        }
     }
 }
 

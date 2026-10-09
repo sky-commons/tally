@@ -83,7 +83,7 @@ fn a_holders_bytes_are_what_it_allocated() {
     let (before, allocations_before) = live();
     let mut held = Held::with(Limits::UNBOUNDED, 4, SealedBins::new());
     for reception in &simulation.receptions {
-        held.add_one(reception);
+        held.add_one(reception, reception.wall_ms);
     }
     let (open, allocations) = live();
     covers(

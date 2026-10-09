@@ -1903,7 +1903,7 @@ fn world_cluster(scenario: &Scenario, window: Window, threads: usize) -> Result<
     let simulation = sim::run_into_in_time_order(scenario, &mut |reception, _| {
         measured.made += 1;
         let bin = bin_of(reception.wall_ms);
-        let added = held.add_one(&reception);
+        let added = held.add_one(&reception, reception.wall_ms);
         measured.wanted += added.new + added.late;
         measured.filtered += added.filtered;
         measured.late += added.late;

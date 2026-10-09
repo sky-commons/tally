@@ -148,7 +148,7 @@ impl Network {
         use crate::budget::Store;
         self.sharing.charge_to(budget.gauge(Store::Batches));
         self.delivery.charge_to(budget.gauge(Store::Delivery));
-        self.products.charge_to(budget.gauge(Store::Products));
+        self.products.charge_to(budget);
     }
 
     /// Group records members have sent this relay.
@@ -215,7 +215,8 @@ impl Network {
                         &self.selection,
                         identity,
                         &query,
-                        (point, asker.source),
+                        // Rationed by the prober's key, never its connection (`delivery`).
+                        (point, asker.key),
                         hub.now_ms(),
                     )
                     .map(Record::DeliveryAnswer)
@@ -533,9 +534,11 @@ impl Network {
         let Some(identity) = self.identity() else {
             return;
         };
-        let mut by_member: BTreeMap<PublicKey, Vec<Record>> = BTreeMap::new();
-        for (member, record) in self.sharing.take_outbox() {
-            by_member.entry(member).or_default().push(record);
+        // Each send carries its charge (`sharing::Addressed`) to the link, which holds it until
+        // the send is written (`peers`).
+        let mut by_member: BTreeMap<PublicKey, Vec<crate::sharing::Addressed>> = BTreeMap::new();
+        for sent in self.sharing.take_outbox() {
+            by_member.entry(sent.to).or_default().push(sent);
         }
         for (member, records) in by_member {
             let Some(address) = self.directory.address_of(&member) else {

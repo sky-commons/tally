@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 use tally_relay::hub::{Description, Hub, Inbound, Origin};
 use tally_relay::ingest::{Stamp, Threads};
 use tally_relay::mlat_host::{
-    HostedMlat, MlatHost, MlatReport, PROVISIONAL_BEHIND, STEP_MS, STEPS_BEHIND, Stage,
+    HostedMlat, MlatHost, MlatReport, PROVISIONAL_BEHIND, STEP_MS, Stage,
 };
 use tally_wire::{Identity, Location, PublicKey, ReceiverInfo, Record, Region, Regions};
 
@@ -209,8 +209,11 @@ fn mlat_run_with(
         });
         let mut next = 0;
         let mut step = (first / STEP_MS + 1) * STEP_MS;
-        // The host's tighter limit: its provisional steps'.
-        let ahead = PROVISIONAL_BEHIND.min(STEPS_BEHIND) as u64 * STEP_MS;
+        // The host's tighter limit: its provisional steps' (`PROVISIONAL_BEHIND`, below
+        // `STEPS_BEHIND`). A step handed in once every part of the one this many steps before it
+        // has reported finds at most that many not started behind the one running, so nothing is
+        // shed.
+        let ahead = (PROVISIONAL_BEHIND as u64 + 1) * STEP_MS;
         let since = Instant::now();
         while step <= until {
             // Within the host's limits (`PROVISIONAL_BEHIND` steps, the tighter, and
@@ -360,9 +363,11 @@ fn hosted_mlat_makes_the_same_bytes_on_any_threads_with_any_delays_and_the_refer
                 report.ingest_errors,
                 report.steps_shed,
                 report.provisional_steps_shed,
-                report.shed
+                report.shed,
+                report.provisional_models_late,
+                report.waiting_dropped
             ),
-            (0, 0, 0, 0, 0, 0, 0),
+            (0, 0, 0, 0, 0, 0, 0, 0, 0),
             "{ingest} threads, {delays:?}: {report:?}"
         );
         Ok(signed)
@@ -477,9 +482,11 @@ fn at_capacity_the_same_receivers_are_refused_whatever_the_order_and_the_threads
             (
                 report.steps_shed,
                 report.provisional_steps_shed,
-                report.shed
+                report.shed,
+                report.provisional_models_late,
+                report.waiting_dropped
             ),
-            (0, 0, 0),
+            (0, 0, 0, 0, 0),
             "{ingest} threads, {describing:?}, {delays:?}: {report:?}"
         );
         assert_eq!(
@@ -531,9 +538,11 @@ fn descriptions_midway_make_the_same_bytes_with_any_delays_and_the_reference_eng
                 report.steps_shed,
                 report.provisional_steps_shed,
                 report.shed,
-                report.steps_discarded
+                report.steps_discarded,
+                report.provisional_models_late,
+                report.waiting_dropped
             ),
-            (0, 0, 0, 0),
+            (0, 0, 0, 0, 0, 0),
             "{ingest} threads, {delays:?}: {report:?}"
         );
         assert!(report.orphans_expired > 0, "{report:?}");

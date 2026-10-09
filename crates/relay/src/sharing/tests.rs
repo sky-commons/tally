@@ -1179,39 +1179,197 @@ fn manifests_are_taken_from_members_each_within_its_own_share() -> Outcome {
     Ok(())
 }
 
-#[test]
-fn overlapping_parity_chunks_are_counted_once_and_a_stalled_parity_expires() -> Outcome {
+/// A relay serving `cell` with `origins` in its groups by their verified offers, its batch store's
+/// gauge `limit` bytes: what the seam's parity reassembly is checked against.
+fn serving_with_members(
+    cell: Region,
+    origins: &[&Identity],
+    limit: usize,
+) -> Result<(crate::hub::Hub, super::Sharing, Arc<Gauge>), String> {
+    let hub = crate::hub::Hub::new(8);
+    hub.network().selection.set_taken(vec![cell]);
     let sharing = super::Sharing::new();
-    let asker = relay(identity(1).public());
+    let gauge = Gauge::new(Store::Batches, limit);
+    sharing.charge_to(Arc::clone(&gauge));
+    for origin in origins {
+        hold_offer(&hub, origin, cell, 0b1111, START_MS)?;
+    }
+    let _ = sharing.tick_shed(&hub, Some(&identity(0)), 0, START_MS);
+    Ok((hub, sharing, gauge))
+}
+
+/// `count` hashes, as many in each data stripe as the others but for rounding.
+fn hashes(count: usize, salt: u8) -> Vec<Hash> {
+    (0..count)
+        .map(|index| {
+            let mut hash = [salt; 32];
+            // The stripe is read from the leading bytes (`stripe_of`): the index leads.
+            hash[..8].copy_from_slice(&(index as u64).to_le_bytes());
+            hash
+        })
+        .collect()
+}
+
+/// RFC-0174 §2.5, "A parity is checked against its manifest": a parity is reassembled only for an
+/// origin manifest the relay holds, from a relay its group knows, no longer than that manifest's
+/// records allow, and each chunk is charged as it arrives (only the bytes no earlier chunk
+/// covered), never its declared whole ahead of it. So a ~100-byte chunk declaring a parity of
+/// megabytes holds about 100 bytes, one for a manifest nobody signed or declaring more than its
+/// records could be holds nothing, and one sender's chunks fill its own share only.
+#[test]
+fn a_parity_is_reassembled_only_for_a_held_manifest_and_charged_as_its_chunks_arrive() -> Outcome {
+    use tally_wire::sharing::{MAX_PARITY_CHUNK, MAX_PARITY_LEN};
     let cell = area()?;
-    let chunk = |offset: u32, bytes: Vec<u8>, manifest: Hash| tally_wire::ParityChunk {
+    let group = GroupKey::new(cell, Streams::RAW);
+    let (origin, other) = (identity(1), identity(3));
+    let asker = relay(origin.public());
+    let (hub, sharing, gauge) = serving_with_members(cell, &[&origin, &other], usize::MAX)?;
+    let second = START_MS / 1000;
+    let now = START_MS + 300;
+    let held = |sharing: &super::Sharing| super::locks::lock(&sharing.assembling).len();
+    // What the gauge holds for reassembly: the member's sends to the group (a manifest flooded,
+    // an assignment) are let go first, as the links would take them.
+    let charged = |sharing: &super::Sharing| {
+        drop(sharing.take_outbox());
+        gauge.held()
+    };
+    // One record in each data stripe: each slice is at most one record long.
+    let few: Vec<Hash> = (0u64..)
+        .map(|index| {
+            let mut hash = [9; 32];
+            hash[..8].copy_from_slice(&index.to_le_bytes());
+            hash
+        })
+        .scan(BTreeSet::new(), |stripes, hash| {
+            Some(stripes.insert(data_stripe(&hash)).then_some(hash))
+        })
+        .flatten()
+        .take(usize::from(DATA_STRIPES))
+        .collect();
+    let signed = manifest(&origin, group, second, &few)?;
+    let _ = sharing.manifest(&asker, signed.clone(), now);
+    let longest = 60_000u32;
+    let chunk = |manifest: Hash, total: u32, offset: u32, bytes: Vec<u8>| tally_wire::ParityChunk {
         manifest,
         cell,
         product: Streams::RAW,
-        second: START_MS / 1000,
-        lens: vec![0; usize::from(DATA_STRIPES)],
-        total: 100,
+        second,
+        lens: vec![longest; usize::from(DATA_STRIPES)],
+        total,
         offset,
         bytes,
     };
-    let manifest = [3; 32];
-    let _ = sharing.parity_chunk(&asker, chunk(0, vec![1; 60], manifest), START_MS);
-    let _ = sharing.parity_chunk(&asker, chunk(0, vec![1; 60], manifest), START_MS);
-    // Sixty bytes of a hundred are covered: the parity is not whole.
-    if !super::locks::lock(&sharing.assembling).contains_key(&(asker.key, manifest)) {
-        return Err("a parity counted whole from one chunk sent twice".into());
+    // A manifest nobody signed: nothing held, nothing charged.
+    let _ = sharing.parity_chunk(&asker, chunk([3; 32], longest, 0, vec![1; 100]), now);
+    if held(&sharing) != 0 || charged(&sharing) != 0 {
+        return Err("a chunk for a manifest not held was reassembled".into());
     }
-    let _ = sharing.parity_chunk(&asker, chunk(60, vec![1; 40], manifest), START_MS);
-    if super::locks::lock(&sharing.assembling).contains_key(&(asker.key, manifest)) {
-        return Err("a whole parity still assembling".into());
+    // A whole longer than the manifest's records allow (one record in a slice) is refused.
+    let mut too_long = chunk(signed.hash(), MAX_PARITY_LEN, 0, vec![1; 100]);
+    too_long.lens = vec![MAX_PARITY_LEN; usize::from(DATA_STRIPES)];
+    let _ = sharing.parity_chunk(&asker, too_long, now);
+    // And a relay the group does not know is refused for a manifest it does hold.
+    let _ = sharing.parity_chunk(
+        &relay(identity(2).public()),
+        chunk(signed.hash(), longest, 0, vec![1; 100]),
+        now,
+    );
+    if held(&sharing) != 0 || charged(&sharing) != 0 {
+        return Err("a parity past its records, or from a stranger, was reassembled".into());
     }
-    // One left with a gap is dropped once it has had its time.
-    let stalled = [4; 32];
-    let _ = sharing.parity_chunk(&asker, chunk(0, vec![1; 60], stalled), START_MS);
-    let later = START_MS + super::PARITY_ASSEMBLY_MS + 1;
-    let _ = sharing.parity_chunk(&asker, chunk(0, vec![1; 10], [5; 32]), later);
-    if super::locks::lock(&sharing.assembling).contains_key(&(asker.key, stalled)) {
-        return Err("a stalled parity never expired".into());
+    // A first chunk of a held manifest is charged what it brought, never the whole declared.
+    let _ = sharing.parity_chunk(&asker, chunk(signed.hash(), longest, 0, vec![1; 100]), now);
+    let first = charged(&sharing);
+    if held(&sharing) != 1 || first == 0 || first >= 1_000 {
+        return Err(format!(
+            "a 100-byte first chunk of a {longest}-byte parity is charged {first} bytes"
+        ));
+    }
+    // The same bytes again add nothing; an overlapping chunk adds only what is new.
+    let _ = sharing.parity_chunk(&asker, chunk(signed.hash(), longest, 0, vec![1; 100]), now);
+    if charged(&sharing) != first {
+        return Err("a chunk sent twice was charged twice".into());
+    }
+    let _ = sharing.parity_chunk(&asker, chunk(signed.hash(), longest, 50, vec![1; 100]), now);
+    let overlapped = charged(&sharing) - first;
+    if !(50..1_000).contains(&overlapped) {
+        return Err(format!("an overlap of 50 new bytes charged {overlapped}"));
+    }
+    // A stalled parity is let go after its time, and its charge with it.
+    let later = now + super::PARITY_ASSEMBLY_MS + 1;
+    let _ = sharing.tick_shed(&hub, Some(&identity(0)), 0, later);
+    if held(&sharing) != 0 || charged(&sharing) != 0 {
+        return Err(format!(
+            "a stalled parity still held: {} assembling, {} bytes charged",
+            held(&sharing),
+            charged(&sharing)
+        ));
+    }
+
+    // One sender's chunks fill its own share only: with three manifests whose records allow the
+    // longest parity, it may reassemble two of the longest at once (each finishes within it), and
+    // a third is refused while they are.
+    let now = later;
+    let second = now / 1000;
+    let mut manifests = Vec::new();
+    for salt in 0..3u8 {
+        let mut listed = hashes(tally_wire::sharing::MAX_PIECES, 5);
+        listed.iter_mut().for_each(|hash| hash[31] = salt);
+        let signed = manifest(&origin, group, second, &listed)?;
+        let _ = sharing.manifest(&asker, signed.clone(), now);
+        manifests.push(signed.hash());
+    }
+    let longest_chunk = |manifest: Hash, offset: usize, len: usize| {
+        Ok::<_, String>(tally_wire::ParityChunk {
+            manifest,
+            cell,
+            product: Streams::RAW,
+            second,
+            lens: vec![MAX_PARITY_LEN; usize::from(DATA_STRIPES)],
+            total: MAX_PARITY_LEN,
+            offset: u32::try_from(offset).map_err(text)?,
+            bytes: vec![2; len],
+        })
+    };
+    let whole = MAX_PARITY_LEN as usize;
+    let last = whole - whole % MAX_PARITY_CHUNK;
+    for manifest in &manifests[..2] {
+        for offset in (0..last).step_by(MAX_PARITY_CHUNK) {
+            let _ = sharing.parity_chunk(
+                &asker,
+                longest_chunk(*manifest, offset, MAX_PARITY_CHUNK)?,
+                now,
+            );
+        }
+    }
+    if held(&sharing) != 2 {
+        return Err(format!("{} parities reassembling, not 2", held(&sharing)));
+    }
+    let _ = sharing.parity_chunk(
+        &asker,
+        longest_chunk(manifests[2], 0, MAX_PARITY_CHUNK)?,
+        now,
+    );
+    if held(&sharing) != 2 {
+        return Err("a sender past its share started another parity".into());
+    }
+    // Another sender's room is its own.
+    let theirs = manifest(&other, group, second, &few)?;
+    let _ = sharing.manifest(&relay(other.public()), theirs.clone(), now);
+    let mut first_of_theirs = chunk(theirs.hash(), longest, 0, vec![1; 100]);
+    first_of_theirs.second = second;
+    let _ = sharing.parity_chunk(&relay(other.public()), first_of_theirs, now);
+    if held(&sharing) != 3 {
+        return Err("another sender was refused for the first's share".into());
+    }
+    // The longest finishes within the share, and is taken as the member's parity.
+    let _ = sharing.parity_chunk(
+        &asker,
+        longest_chunk(manifests[0], last, whole - last)?,
+        now,
+    );
+    if held(&sharing) != 2 {
+        return Err("the longest parity did not finish within its sender's share".into());
     }
     Ok(())
 }
@@ -1532,7 +1690,7 @@ fn a_tick_with_the_world_taken_and_nothing_flowing_does_no_work() -> Outcome {
     let me = identity(0);
     let hub = crate::hub::Hub::new(8).advertising(vec![tally_wire::RelayAddress {
         key: me.public(),
-        address: "me.example:7450".to_owned(),
+        address: "198.51.100.7:7450".to_owned(),
     }]);
     let network = hub.network();
     network.adopt_identity(me.clone());
@@ -1707,6 +1865,85 @@ fn a_full_member_is_routed_around_to_the_members_beneath_it() -> Outcome {
     let (hash, piece) = in_stripe(3_000)?;
     if !sent_to(&member.originate(group, hash, piece, START_MS + 2_000)).contains(&seed) {
         return Err("the seed was not sent its stripe once it had room".into());
+    }
+    Ok(())
+}
+
+/// RFC-0174 §2.5 and §2.6: a member full to its parent is routed around, and that is no fault on
+/// either side of it. X turns its parent P away as full; P sends what X would have had straight to
+/// X's children, for the wait the one rule gives both (`full::Wait`). Over several receipt windows
+/// and their judgment nobody files a shortfall: X, against P, which it turned away; X's children,
+/// against X, whose records came from above it before any repair could have. Nobody is demoted,
+/// the trees never change, every member but X holds every record, and P holds the receipts of
+/// X's children for what it delivered to them past X.
+#[test]
+fn routing_around_a_full_member_files_no_shortfall_and_demotes_nobody() -> Outcome {
+    let mut sim = Sim::new(16, 20)?;
+    let origins = [0, 1, 2, 3];
+    let layout = sim.layout();
+    let epoch = epoch_of(sim.now / 1000);
+    // A member X with children in a data stripe, under a parent P: the one P has the fewest other
+    // children beside, so X's word alone would weigh most in P's judgment.
+    let (stripe, x, p, children) = (0..DATA_STRIPES)
+        .flat_map(|stripe| (0..sim.keys.len()).map(move |x| (stripe, x)))
+        .filter(|(_, x)| !origins.contains(x))
+        .filter_map(|(stripe, x)| {
+            let place = layout.place(stripe, epoch, &sim.keys[x])?;
+            let parent = place.parent?;
+            let p = *sim.index.get(&parent)?;
+            let siblings = layout.place(stripe, epoch, &parent)?.children.len();
+            (!place.children.is_empty()).then_some((siblings, stripe, x, p, place.children))
+        })
+        .min_by_key(|(siblings, ..)| *siblings)
+        .map(|(_, stripe, x, p, children)| (stripe, x, p, children))
+        .ok_or("no member with children under a parent")?;
+    let (x_key, p_key) = (sim.keys[x], sim.keys[p]);
+    // X turned P's link away as full: P routes around X, and X keeps the same wait for P.
+    sim.members[p].set_full(BTreeSet::from([x_key]));
+    sim.members[x].turned_away(p_key, std::time::Duration::from_secs(60), sim.now);
+    sim.feed(&origins, 3, 15)?;
+    let end = sim.now + 12_000;
+    sim.run_until(end);
+
+    let receipts: u64 = sim.members.iter().map(|m| m.stats().receipts).sum();
+    if receipts == 0 {
+        return Err("no receipt was signed: no window was judged".into());
+    }
+    let shortfalls: Vec<(usize, u64)> = sim
+        .members
+        .iter()
+        .enumerate()
+        .map(|(i, m)| (i, m.stats().shortfalls))
+        .filter(|(_, count)| *count > 0)
+        .collect();
+    if !shortfalls.is_empty() {
+        return Err(format!(
+            "shortfalls filed after a route-around (X {x}, P {p}): {shortfalls:?}"
+        ));
+    }
+    for i in sim.live() {
+        for other in sim.live() {
+            if sim.members[i].is_demoted(sim.group, &sim.keys[other]) {
+                return Err(format!("member {i} demoted {other} after a route-around"));
+            }
+        }
+        if sim.members[i].layout(sim.group) != Some(&layout) {
+            return Err(format!("member {i}'s trees changed after a route-around"));
+        }
+    }
+    sim.everyone_holds_everything(&[x].into())?;
+    // P's delivery past X is evidenced: each of X's children signed it a receipt in X's stripe.
+    for child in &children {
+        let signed = sim.receipts.iter().any(|(from, to, receipt)| {
+            sim.keys[*from] == *child
+                && *to == p
+                && receipt
+                    .content()
+                    .is_ok_and(|content| content.parent == p_key && content.stripe == stripe)
+        });
+        if !signed {
+            return Err("a child fed past its full parent signed its deliverer no receipt".into());
+        }
     }
     Ok(())
 }

@@ -57,12 +57,14 @@ fn what_mlat_uses_is_held_once_in_24_bytes_and_the_rest_is_never_held() {
                 (b'1', vec![1, 2], 12),
             ],
         ),
+        9_000,
     );
     assert_eq!((added.new, added.filtered), (1, 2));
     // The same reception again, in an earlier batch: held once, with the earlier wall clock.
     held.add(
         key,
         &content(6_000, &[(format::MODE_S_SHORT, reply.clone(), 10)]),
+        6_000,
     );
     held.seal_through(1);
     let bins = held.bins(0, 10);
@@ -71,7 +73,11 @@ fn what_mlat_uses_is_held_once_in_24_bytes_and_the_rest_is_never_held() {
     assert_eq!(bins[0].wall_ms(&bins[0].records[0]), 6_000);
     assert!(held.contains(&bins[0].id(0)));
     // A sealed bin takes nothing more: late, for every reader alike.
-    let late = held.add(key, &content(7_000, &[(format::MODE_S_SHORT, reply, 99)]));
+    let late = held.add(
+        key,
+        &content(7_000, &[(format::MODE_S_SHORT, reply, 99)]),
+        7_000,
+    );
     assert_eq!((late.late, late.new), (1, 0));
     held.forget_before(2);
     assert!(held.is_empty());
@@ -85,13 +91,13 @@ fn beyond_its_bytes_a_receivers_raw_of_the_bin_is_refused_whole() {
     let first = Identity::from_seed([1; 32]).public();
     let second = Identity::from_seed([2; 32]).public();
     let mut held = Held::new(4_000);
-    let taken = held.add(first, &content(1, &replies(10, 0)));
+    let taken = held.add(first, &content(1, &replies(10, 0)), 1);
     assert_eq!(taken.new, 10);
-    let refused = held.add(second, &content(1, &replies(400, 100)));
+    let refused = held.add(second, &content(1, &replies(400, 100)), 1);
     assert_eq!((refused.new, refused.refused), (0, 400));
     assert!(held.bytes() <= 4_000, "{}", held.bytes());
     // Refused for the bin: a later batch of it there is refused too, and counted.
-    let again = held.add(second, &content(2, &replies(1, 900)));
+    let again = held.add(second, &content(2, &replies(1, 900)), 2);
     assert_eq!(again.refused, 1);
     held.seal_through(0);
     let bins = held.bins(0, 0);
@@ -117,10 +123,10 @@ fn over_its_count_a_receivers_bin_is_refused_whole_in_any_order() {
     let mut sealed = Vec::new();
     for order in [[0, 1, 2], [2, 1, 0], [1, 2, 0]] {
         let mut held = Held::with(limits, 1, SealedBins::new());
-        held.add(quiet, &content(1_500, &replies(2, 50)));
+        held.add(quiet, &content(1_500, &replies(2, 50)), 1_500);
         let mut refused = 0;
         for at in order {
-            refused += held.add(busy, &batches[at]).refused;
+            refused += held.add(busy, &batches[at], batches[at].wall_ms).refused;
         }
         assert_eq!(refused, 8, "{order:?}");
         held.seal_through(1);
@@ -170,6 +176,7 @@ fn fill(receptions: &[Reception], opens: &mut [Open], owner: impl Fn(&PublicKey)
                 previous: [0; 32],
                 observations: vec![reception.observation.clone()],
             },
+            reception.wall_ms,
         );
     }
 }
@@ -182,7 +189,7 @@ fn sealing_any_split_by_receiver_gives_the_whole_holders_bin() {
         let receptions = sky(seed);
         let mut whole = Held::new(usize::MAX);
         for reception in &receptions {
-            whole.add_one(reception);
+            whole.add_one(reception, reception.wall_ms);
         }
         whole.seal_through(i64::MAX - 1);
         let expected = whole.bins(i64::MIN, i64::MAX - 1);
@@ -233,7 +240,7 @@ fn a_receiver_forgotten_is_gone_from_every_bin() {
     let gone = receptions[0].receiver;
     let mut held = Held::new(usize::MAX);
     for reception in &receptions {
-        held.add_one(reception);
+        held.add_one(reception, reception.wall_ms);
     }
     held.seal_through(bin_of(receptions[0].wall_ms));
     held.forget_receiver(&gone);
@@ -255,7 +262,7 @@ fn a_reader_of_the_sealed_bins_sees_what_the_holder_seals_and_forgets() {
     let sealed = SealedBins::new();
     let mut held = Held::with(Limits::UNBOUNDED, 2, sealed.clone());
     for reception in &receptions {
-        held.add_one(reception);
+        held.add_one(reception, reception.wall_ms);
     }
     assert!(sealed.is_empty());
     let first = bin_of(receptions.iter().map(|r| r.wall_ms).min().unwrap_or(0));
@@ -284,7 +291,7 @@ fn a_sealed_bin_costs_what_admission_reserves() {
     };
     let mut held = Held::new(usize::MAX);
     sim::run_into(&scenario, &mut |reception, _| {
-        held.add_one(&reception);
+        held.add_one(&reception, reception.wall_ms);
     });
     held.seal_through(i64::MAX - 1);
     let bins = held.bins(i64::MIN, i64::MAX - 1);
@@ -314,6 +321,7 @@ fn open_raw_costs_what_admission_reserves() {
                     batch * 1_000,
                     &replies(per_receiver / 5, n as u64 * 10_000 + batch * 1_000),
                 ),
+                batch * 1_000,
             );
         }
     }
@@ -359,7 +367,7 @@ fn a_bin_sealed_within_its_room_refuses_the_busiest_receivers_whole_whatever_the
     let whole = |order: &[usize], owners: usize| -> Vec<Fragment> {
         let mut opens: Vec<Open> = (0..owners).map(|_| Open::new(Limits::UNBOUNDED)).collect();
         for n in order {
-            opens[n % owners].add(keys[*n], &batch(*n));
+            opens[n % owners].add(keys[*n], &batch(*n), 1_000 + *n as u64);
         }
         opens
             .iter_mut()
@@ -469,8 +477,8 @@ fn raw_stamped_after_its_bins_step_is_late_whether_it_raced_ahead_or_not() -> Re
     Ok(())
 }
 
-/// Never ahead of the stamp (module docs): a holder that closes by the stamp opens no bin that
-/// begins more than `AHEAD_MS` past the batch's stamp. A receiver stamping its batches in the future
+/// Never ahead of the stamp (module docs): no holder, whether it closes by the stamp or by what it
+/// took, opens a bin that begins more than `AHEAD_MS` past the batch's stamp. A receiver stamping its batches in the future
 /// opens nothing its steps would never reach, is counted, and holds no byte; a clock a little ahead
 /// is a clock that disagrees, and is held; and a batch taken later than it came is bounded by the
 /// stamp it is taken at.
@@ -519,10 +527,26 @@ fn a_bin_far_ahead_of_its_batchs_stamp_is_refused_and_counted() -> Result<(), St
             .new,
         3
     );
-    // A holder that decides by what it took, with no stamp to bound by, holds what it is handed.
+    // A holder that decides lateness by what it took (one engine holding its own raw, the
+    // reference drive) refuses the same raw ahead of its stamp: whether a bin too far ahead opens
+    // never depends on how the holder was built (sweep 3, N9). Every way in takes a stamp.
+    let far_content = content(stamp + 60_000, &replies(4, 0));
+    let far = stamped(&liar, 9, far_content.clone(), stamp)?;
     let mut in_line = Open::new(Limits::UNBOUNDED);
-    let far = stamped(&liar, 9, content(stamp + 60_000, &replies(4, 0)), stamp)?;
-    assert_eq!(in_line.add_decoded(&far).new, 4);
+    assert_eq!(in_line.add_decoded(&far).ahead, 4);
+    let mut in_line = Open::new(Limits::UNBOUNDED);
+    assert_eq!(in_line.add(liar.public(), &far_content, stamp).ahead, 4);
+    let mut held = Held::new(usize::MAX);
+    assert_eq!(held.add_decoded(&far).ahead, 4);
+    assert_eq!(held.add(liar.public(), &far_content, stamp).ahead, 4);
+    let one = Reception {
+        receiver: liar.public(),
+        epoch: far_content.counter_epoch,
+        observation: far_content.observations[0].clone(),
+        wall_ms: far_content.wall_ms,
+    };
+    assert_eq!(held.add_one(&one, stamp).ahead, 1);
+    assert!(held.is_empty());
     Ok(())
 }
 
@@ -534,8 +558,8 @@ fn a_receiver_is_forgotten_only_after_the_bins_already_due() -> Result<(), Strin
     let other = Identity::from_seed([4; 32]);
     let mut open = Open::new(Limits::UNBOUNDED);
     for (n, wall) in [1_000u64, 6_000, 11_000].into_iter().enumerate() {
-        let mine = stamped(&receiver, n as u64, content(wall, &replies(2, 0)), 0)?;
-        let theirs = stamped(&other, n as u64, content(wall, &replies(1, 50)), 0)?;
+        let mine = stamped(&receiver, n as u64, content(wall, &replies(2, 0)), wall)?;
+        let theirs = stamped(&other, n as u64, content(wall, &replies(1, 50)), wall)?;
         open.add_decoded(&mine);
         open.add_decoded(&theirs);
     }
@@ -567,7 +591,7 @@ fn open_raw_asks_for_every_byte_before_it_holds_it() -> Result<(), String> {
                 receiver,
                 sequence,
                 content(wall_ms, &replies(count, wall_ms)),
-                0,
+                wall_ms,
             )?;
             sequence += 1;
             let added = open.add_decoded_taking(&batch, &mut |bytes| {
@@ -589,7 +613,12 @@ fn open_raw_asks_for_every_byte_before_it_holds_it() -> Result<(), String> {
     }
     // Refused: nothing more is held, and the batch's raw is counted refused.
     let before = open.bytes();
-    let batch = stamped(&receivers[0], sequence, content(30_000, &replies(50, 0)), 0)?;
+    let batch = stamped(
+        &receivers[0],
+        sequence,
+        content(30_000, &replies(50, 0)),
+        30_000,
+    )?;
     let added = open.add_decoded_taking(&batch, &mut |_| false);
     assert_eq!((added.new, added.refused), (0, 50));
     assert_eq!(open.bytes(), before);
@@ -599,7 +628,7 @@ fn open_raw_asks_for_every_byte_before_it_holds_it() -> Result<(), String> {
         &receivers[1],
         sequence + 1,
         content(31_000, &replies(400, 0)),
-        0,
+        31_000,
     )?;
     let added = open.add_decoded_taking(&big, &mut |_| {
         grants -= 1;
@@ -610,7 +639,7 @@ fn open_raw_asks_for_every_byte_before_it_holds_it() -> Result<(), String> {
         &receivers[1],
         sequence + 2,
         content(31_500, &replies(1, 900)),
-        0,
+        31_500,
     )?;
     assert_eq!(open.add_decoded_taking(&after, &mut |_| true).refused, 1);
     Ok(())

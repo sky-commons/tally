@@ -81,7 +81,7 @@ fn build() -> Result<World, String> {
                     _ => true,
                 };
                 if wanted {
-                    engine.ingest(record, 0)?;
+                    engine.ingest(record, tally_mlat::replay::sent_ms(record))?;
                 }
             }
             Ok(engine.step(now, now).0)

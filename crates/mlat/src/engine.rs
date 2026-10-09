@@ -361,7 +361,7 @@ impl Engine {
         };
         let (ingested, notes) = intake.ingest_verified(batch);
         if ingested == Ingested::Ignored && intake.described(&batch.receiver()).is_none() {
-            let orphaned = intake.hold_orphan(batch, now_ms, Box::new(()));
+            let orphaned = intake.hold_orphan(batch, now_ms);
             self.orphaned.dropped += orphaned.dropped;
         }
         self.provisional.hear_notes(batch, notes, now_ms);
@@ -694,13 +694,13 @@ mod tests {
             observation(2_000, format::MODE_S_SHORT),
         ];
         assert_eq!(
-            engine.ingest(&batch(&receiver, 1, 1, base + 900, second)?, 0)?,
+            engine.ingest(&batch(&receiver, 1, 1, base + 900, second)?, base + 900)?,
             Ingested::Batch {
                 new: 2,
                 filtered: 0
             }
         );
-        engine.ingest(&batch(&receiver, 1, 0, base + 500, first)?, 0)?;
+        engine.ingest(&batch(&receiver, 1, 0, base + 500, first)?, base + 500)?;
         // Sealed (its bin complete), the copy is gone and the earliest wall clock kept.
         let _ = engine.prepare(base + GRID_MS + 1_000, 0);
         assert_eq!(engine.held(), 2);
@@ -870,7 +870,7 @@ mod tests {
                 base,
                 vec![observation(1, format::MODE_S_SHORT)],
             )?,
-            0,
+            base,
         )?;
         // A second, far enough on that windows long after the first's still need it.
         let later = 1_000 + BEFORE + 3 * STRIDE;
@@ -882,7 +882,7 @@ mod tests {
                 later as u64 * GRID_MS,
                 vec![observation(2, format::MODE_S_SHORT)],
             )?,
-            0,
+            later as u64 * GRID_MS,
         )?;
         assert_eq!(engine.held(), 2);
         // A window is due once its last bin has ended and the settling time passed.

@@ -39,10 +39,13 @@
 //! beside the epoch's areas, from the receptions where the epoch's batches hold them, so it copies
 //! nothing and outlives none of them; its batches go out first among the epoch's records.
 //!
-//! What the sealer holds is charged to the relay's budget (`budget::Store::Products`): the signed
-//! records the hub has not yet taken (the deduplicated stream's among them), and the records
-//! waiting in their queue. An epoch whose products would pass it is refused whole, counted; a record is
-//! refused, counted (`records_refused`).
+//! What the sealer holds is charged to the relay's budget in two shares that never take each
+//! other's room: its own outputs, the signed records the hub has not yet taken (the deduplicated
+//! stream's among them), to `budget::Store::Products`; and what others hand it, the records waiting
+//! in their queue and the peers' regional batches waiting to be forwarded, to
+//! `budget::Store::Records`. An epoch whose products would pass the first is refused whole,
+//! counted; a record past the second is refused, counted (`records_refused`), and however many
+//! come, no epoch is refused for them.
 //!
 //! # The regional product
 //!
@@ -150,9 +153,11 @@ const FORWARD_HELD: usize = 4_096;
 /// Clock models remembered: their id and inputs hash. A world-scale relay publishes some 3,800
 /// a 40 s stride, and a provisional cites one up to 90 s old.
 const MODELS_REMEMBERED: usize = 50_000;
-/// Positions records waiting for a model they cite, and for how long.
-const WAITING_HELD: usize = 4_096;
+/// How long positions records wait for a model they cite: charged while they wait to the records'
+/// share (`budget::Store::Records`), their only bound.
 const WAITING_MS: u64 = 30_000;
+/// What one positions record waiting costs beside its bytes: its place in the list.
+const WAITING_OVERHEAD: usize = std::mem::size_of::<(u64, Positions, Charge)>();
 /// Fixes derived from origins this relay holds, by (origin, index), to check a peer's world fix
 /// that cites one of them.
 const DERIVED_REMEMBERED: usize = 200_000;
@@ -165,6 +170,23 @@ const EPOCH_QUEUE: usize = 4_096;
 /// the products' budget is planned for (`budget::Store::Products`). The hub takes them every
 /// `network::TICK`, a tenth of an epoch.
 pub const OUTBOX_EPOCHS: usize = 2;
+/// Epochs a record waits for the sealer while it keeps up: the sealer takes a record in once its
+/// watermark (an epoch's end) passes the record's stamp, and the watermark trails the ingest clock
+/// by the epochs the exchange holds (`seal::EPOCHS_HELD`), and the one it is taken in at.
+pub const RECORDS_EPOCHS: usize = crate::seal::EPOCHS_HELD as usize + 1;
+
+/// What one feeder's worth of receptions costs the records' share (`budget::Store::Records`) over
+/// the epochs a record waits (`RECORDS_EPOCHS`): every reception as an observation of a regional
+/// batch, the record that carries the most of them, held twice (waiting for the sealer, and to be
+/// forwarded), as if none were a copy. Positions, models and world records are a fraction of that.
+pub const fn records_per_feeder(receptions_per_sec: usize) -> usize {
+    receptions_per_sec
+        * 2
+        * (tally_wire::decoded::OBSERVATION_FIXED + 14)
+        * RECORDS_EPOCHS
+        * crate::seal::EPOCH_MS as usize
+        / 1_000
+}
 /// How often, in the products' time (the watermark), the deduplicated stream's losses since the
 /// last word are said, at most.
 const STREAM_SAID_EVERY_MS: u64 = 60_000;
@@ -195,8 +217,8 @@ pub struct ProductsReport {
     pub regional_stale: u64,
     /// Peers' regional batches taken but not forwarded for room (`FORWARD_HELD`).
     pub regional_forward_full: u64,
-    /// Records (positions, models, peers' products) not taken for room: the products' budget
-    /// (their gauge, `budget::Store::Products`) spent. Never an epoch.
+    /// Records (positions, models, peers' products) not taken for room: the records' share
+    /// (their gauge, `budget::Store::Records`) spent. Never an epoch.
     pub records_refused: u64,
     /// Receptions a message thread let go because their epoch had closed before they came: only
     /// a trace can stamp a batch behind its worker's tick.
@@ -221,7 +243,8 @@ pub struct ProductsReport {
     pub world_skipped: u64,
     /// Peers' world fixes that disagree with the origin they cite.
     pub world_refuted: u64,
-    /// Positions records not held to wait for their model, for room (`WAITING_HELD`).
+    /// Positions records not held to wait for their model, for room (the records' share,
+    /// `budget::Store::Records`).
     pub positions_waiting_full: u64,
     /// Positions records whose model never came within `WAITING_MS`.
     pub positions_waiting_expired: u64,
@@ -261,7 +284,8 @@ impl Gatherer {
     }
 }
 
-/// What the hub takes from the sealer, and what it is charged (`Store::Products`).
+/// What the hub takes from the sealer, and what it is charged: its own records to
+/// `Store::Products`, the peers' regional batches to forward to `Store::Records`.
 #[derive(Default)]
 struct Outbox {
     records: Vec<Record>,
@@ -296,14 +320,18 @@ struct Records {
 }
 
 /// What the sealer shares with the handle: its outbox, its records, its report, its watermark, its
-/// gauge.
+/// gauges.
 struct Shared {
     outbox: Mutex<Outbox>,
     records: Mutex<Records>,
     report: Mutex<ProductsReport>,
     /// The end of the newest epoch sealed: the products' time.
     watermark_ms: AtomicU64,
+    /// This relay's own outputs untaken (`Outbox::records`): `budget::Store::Products`.
     gauge: Mutex<Arc<Gauge>>,
+    /// What others hand the products, waiting (`Records`, `Outbox::forward`):
+    /// `budget::Store::Records`.
+    records_gauge: Mutex<Arc<Gauge>>,
 }
 
 impl Default for Shared {
@@ -314,6 +342,7 @@ impl Default for Shared {
             report: Mutex::default(),
             watermark_ms: AtomicU64::new(0),
             gauge: Mutex::new(Gauge::unlimited(Store::Products)),
+            records_gauge: Mutex::new(Gauge::unlimited(Store::Records)),
         }
     }
 }
@@ -322,6 +351,13 @@ impl Shared {
     fn gauge(&self) -> Arc<Gauge> {
         self.gauge.lock().map_or_else(
             |_| Gauge::unlimited(Store::Products),
+            |gauge| Arc::clone(&gauge),
+        )
+    }
+
+    fn records_gauge(&self) -> Arc<Gauge> {
+        self.records_gauge.lock().map_or_else(
+            |_| Gauge::unlimited(Store::Records),
             |gauge| Arc::clone(&gauge),
         )
     }
@@ -359,9 +395,9 @@ pub struct Sealing {
     regional_seen: Bounded<Hash, ()>,
     /// A model's id, and the hash of its inputs.
     models: Bounded<Hash, Hash>,
-    /// Positions waiting for the model they cite, by its id: when each arrived, and the record.
-    waiting: HashMap<Hash, Vec<(u64, Positions)>>,
-    waiting_count: usize,
+    /// Positions waiting for the model they cite, by its id: when each arrived, the record, and
+    /// what it is charged while it waits.
+    waiting: HashMap<Hash, Vec<(u64, Positions, Charge)>>,
     derived: Bounded<(Hash, u16), u64>,
     report: ProductsReport,
     /// The end of the newest epoch sealed.
@@ -509,11 +545,12 @@ impl Products {
     }
 
     /// A record for the sealer, stamped `stamp_ms` (no earlier than what the sealer has taken in)
-    /// and charged while it waits, its gauge its only bound; refused and counted when the products'
-    /// budget is full. It waits apart from the epochs, so it never takes an epoch's place.
+    /// and charged while it waits to the records' share (`Store::Records`), its only bound;
+    /// refused and counted when that share is full. It waits apart from the epochs and is charged
+    /// apart from what they make, so it never takes an epoch's place or its room.
     fn record(&self, stamp_ms: u64, hash: Hash, bytes: usize, input: Input) {
         let taken = self.shared.records.lock().is_ok_and(|mut records| {
-            let Some(charge) = self.shared.gauge().try_charge(bytes) else {
+            let Some(charge) = self.shared.records_gauge().try_charge(bytes) else {
                 return false;
             };
             let stamp_ms = stamp_ms.max(records.taken_before);
@@ -530,10 +567,14 @@ impl Products {
         }
     }
 
-    /// What the products hold is charged to `gauge` (the budget's `Store::Products`) from now on.
-    pub fn charge_to(&self, gauge: Arc<Gauge>) {
+    /// What the products hold is charged to `budget` from now on: their own outputs to its
+    /// `Store::Products`, what others hand them to its `Store::Records`.
+    pub fn charge_to(&self, budget: &crate::budget::Budget) {
         if let Ok(mut held) = self.shared.gauge.lock() {
-            *held = gauge;
+            *held = budget.gauge(Store::Products);
+        }
+        if let Ok(mut held) = self.shared.records_gauge.lock() {
+            *held = budget.gauge(Store::Records);
         }
     }
 
@@ -800,7 +841,6 @@ impl Sealing {
             regional_seen: Bounded::new(REGIONAL_REMEMBERED),
             models: Bounded::new(MODELS_REMEMBERED),
             waiting: HashMap::new(),
-            waiting_count: 0,
             derived: Bounded::new(DERIVED_REMEMBERED),
             report: ProductsReport::default(),
             watermark_ms: 0,
@@ -1088,8 +1128,7 @@ impl Sealing {
         let id = model.id();
         self.models.insert(id, manifest.inputs);
         if let Some(waiting) = self.waiting.remove(&id) {
-            self.waiting_count -= waiting.len();
-            for (arrived, positions) in waiting {
+            for (arrived, positions, _charge) in waiting {
                 if stamp_ms.saturating_sub(arrived) <= WAITING_MS {
                     self.take_positions(positions, arrived);
                 }
@@ -1136,7 +1175,7 @@ impl Sealing {
         let taken = self.taken.iter().any(|area| area.contains(content.cell));
         if taken && let Ok(mut outbox) = self.shared.outbox.lock() {
             if outbox.forward_charge.bytes() == 0 {
-                outbox.forward_charge = self.shared.gauge().empty();
+                outbox.forward_charge = self.shared.records_gauge().empty();
             }
             if outbox.forward.len() < FORWARD_HELD
                 && outbox.forward_charge.try_grow(regional.as_bytes().len())
@@ -1169,14 +1208,14 @@ impl Sealing {
                 }
             }
             Ok(Derived::NeedsModel(id)) => {
-                if self.waiting_count < WAITING_HELD {
-                    self.waiting
+                let cost = positions.as_bytes().len() + WAITING_OVERHEAD;
+                match self.shared.records_gauge().try_charge(cost) {
+                    Some(charge) => self
+                        .waiting
                         .entry(id)
                         .or_default()
-                        .push((stamp_ms, positions));
-                    self.waiting_count += 1;
-                } else {
-                    self.report.positions_waiting_full += 1;
+                        .push((stamp_ms, positions, charge)),
+                    None => self.report.positions_waiting_full += 1,
                 }
             }
             Err(_) => self.report.positions_underivable += 1,
@@ -1184,16 +1223,13 @@ impl Sealing {
     }
 
     fn expire_waiting(&mut self, now_ms: u64) {
-        let mut count = 0;
         let mut expired = 0;
         self.waiting.retain(|_, records| {
             let before = records.len();
-            records.retain(|(arrived, _)| now_ms.saturating_sub(*arrived) <= WAITING_MS);
+            records.retain(|(arrived, _, _)| now_ms.saturating_sub(*arrived) <= WAITING_MS);
             expired += (before - records.len()) as u64;
-            count += records.len();
             !records.is_empty()
         });
-        self.waiting_count = count;
         self.report.positions_waiting_expired += expired;
     }
 

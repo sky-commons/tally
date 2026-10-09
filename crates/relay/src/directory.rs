@@ -14,8 +14,11 @@
 //!   `VERIFIED_FOR_MS`, so its re-signed offers are held without a new dial.
 //! - **Buckets by network group.** The address a verified offer answered at puts it in a group (an
 //!   IPv4 /16, an IPv6 /32). A cell holds at most `OFFERS_PER_GROUP_IN_CELL` of one group and
-//!   `OFFERS_PER_CELL` in all (the relay's own offer aside), so a flood of keys from a few
-//!   networks displaces only itself. Past those, a group holds at most `OFFERS_PER_GROUP`
+//!   `OFFERS_PER_CELL` in all, so a flood of keys from a few networks displaces only itself. The
+//!   relay's own offers are no exception: they are held under the group of the address they
+//!   advertise, as every peer that verified them there holds them (`State::hold_own`; a host name
+//!   is resolved, as a peer's dial resolves it), and compete under every cap as a peer's would, so
+//!   this relay holds the same offers its peers do and lays out the same trees and MLAT choice. Past those, a group holds at most `OFFERS_PER_GROUP`
 //!   anywhere, a key at most `OFFERS_PER_KEY`, and the directory `OFFERS_HELD`: bounds on a flood,
 //!   which an honest network never reaches.
 //! - **Held by rank, never by arrival.** Every cap (a group's share of a cell, the cell, a group
@@ -36,6 +39,11 @@
 //!   newest kept, until its turn (`State::apply_deferred`). So a peer re-signing changed offers
 //!   in a loop costs the readers (the sharing trees, the MLAT choice) what an honest relay's
 //!   changes cost, however fast it signs.
+//! - **A re-signing that changes nothing is taken at most once per `RESIGNED_AT_MOST_EVERY_MS`**
+//!   per (key, cell), by the signed `issued_ms` (an honest relay re-signs a minute apart, ten
+//!   seconds at the least): one sooner is neither held nor gossiped. One taken replaces the held
+//!   offer in place (`State::renew`), so it moves no group, network or tier and costs no reader a
+//!   re-weigh.
 //! - **Checked once.** An offer's signature is verified and its content decoded when it arrives,
 //!   and what is held is that check (`Checked`): every reader gets it, so none verifies or decodes
 //!   a held offer again.
@@ -140,6 +148,11 @@ pub const OWN_RESIGN_EVERY_MS: u64 = 60 * 1000;
 pub const OFFER_LIFETIME_MS: u64 = 3 * OWN_RESIGN_EVERY_MS;
 /// The soonest the relay re-signs its own offers again when what they declare changes.
 pub const OWN_RESIGN_AT_MOST_EVERY_MS: u64 = 10 * 1000;
+/// The soonest, by the offers' own signed `issued_ms`, a peer's held offer for one cell is
+/// renewed by a re-signing that says the same: what an honest relay's re-signings are at the
+/// closest (`OWN_RESIGN_AT_MOST_EVERY_MS`), so one is never refused, and a peer re-signing in a
+/// loop is taken (and gossiped) no oftener, however fast it signs.
+pub const RESIGNED_AT_MOST_EVERY_MS: u64 = OWN_RESIGN_AT_MOST_EVERY_MS;
 /// The soonest a peer's held offer for one cell takes a change again: what a relay's own changes
 /// are held to (`OWN_RESIGN_AT_MOST_EVERY_MS`), so an honest relay's changes are never deferred
 /// but by the clocks between them.
@@ -148,6 +161,8 @@ pub const CHANGED_AT_MOST_EVERY_MS: u64 = OWN_RESIGN_AT_MOST_EVERY_MS;
 pub const QUERY_ANSWER_MAX: usize = 32;
 /// How long a dial may take to connect.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long after the relay's advertised host name failed to resolve it is tried again.
+const RESOLVE_AGAIN_MS: u64 = 10 * 1000;
 /// The products the relay offers for each region it takes: what it shares of them (§2.5, §2.11),
 /// with its relay duties on. With them off it hosts no feeders, so it has no raw of its own to seed
 /// or to pass an MLAT relay one hop, and its offers leave raw out (`own_products`).
@@ -172,11 +187,10 @@ fn own_products(duties: bool) -> Streams {
     }
 }
 
-/// Where an offer answered from: the unit a flood is bucketed by.
+/// Where an offer answered from: the unit a flood is bucketed by. The relay's own offers are in
+/// the group of the address they advertise, as its peers see them: there is no group of its own.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Group {
-    /// The relay's own offers.
-    Own,
     /// An IPv4 /16.
     V4(u16),
     /// An IPv6 /32.
@@ -187,7 +201,6 @@ impl Group {
     /// The group as one number, distinct per group: what a contribution counts witnesses by.
     pub fn as_u64(self) -> u64 {
         match self {
-            Self::Own => 0,
             Self::V4(prefix) => (1 << 32) | u64::from(prefix),
             Self::V6(prefix) => (2 << 32) | u64::from(prefix),
         }
@@ -252,8 +265,19 @@ struct State {
     evidence_gossip: Vec<EvidenceBundle>,
     /// When the relay's own evidence was last bundled.
     own_evidence_ms: Option<u64>,
-    /// The network group the relay's own advertised address is in, if it names an address.
+    /// The network group the relay's own advertised address is in, as a peer dialling it finds
+    /// it (`own_group_of`): what its own offers are held under. `None` until it is known (a host
+    /// name not yet resolved), and then its own offers are not held, as no peer holds them before
+    /// its dial.
     own_group: Option<Group>,
+    /// The relay's own offers as last signed (`resign`): held under `own_group` (`hold_own`).
+    own_offers: Vec<Checked>,
+    /// The advertised host name last resolved, the group it resolved to, and until when that is
+    /// taken without resolving again (`VERIFIED_FOR_MS`, as a peer trusts a verified address).
+    own_resolved: Option<(String, Group, u64)>,
+    /// The host name being resolved, and when it may be tried again: never while a resolution is
+    /// under way, `RESOLVE_AGAIN_MS` after one failed.
+    own_resolving: Option<(String, u64)>,
     /// The groups each key's held offers answered from, with how many offers each.
     key_groups: HashMap<PublicKey, BTreeMap<Group, usize>>,
     /// Each key's tier, weighed at `tiers_at`; cleared whenever what they are weighed from changes.
@@ -296,6 +320,9 @@ impl Default for State {
             evidence_gossip: Vec::new(),
             own_evidence_ms: None,
             own_group: None,
+            own_offers: Vec::new(),
+            own_resolved: None,
+            own_resolving: None,
             key_groups: HashMap::new(),
             tiers: HashMap::new(),
             tiers_at: 0,
@@ -767,17 +794,24 @@ impl Directory {
             .map(|held| held.offer.content().address.clone())
     }
 
-    /// Every live offer held, this relay's own included, each once: what a new directory link is
-    /// sent first.
+    /// Every live offer held, and this relay's own as last signed (held here or not: a peer
+    /// holds them by its own caps), each once: what a new directory link is sent first.
     pub fn live_offers(&self, now_ms: u64) -> Vec<ProviderOffer> {
         let state = lock(&self.state);
         let mut seen = HashSet::new();
+        let own = state
+            .own_offers
+            .iter()
+            .filter(|offer| live(offer.content(), now_ms));
         state
             .cells
             .values()
             .flat_map(HashMap::values)
-            .filter(|held| held.expires_ms > now_ms && seen.insert(held.offer.offer().hash()))
-            .map(|held| held.offer.offer().clone())
+            .filter(|held| held.expires_ms > now_ms)
+            .map(|held| &held.offer)
+            .chain(own)
+            .filter(|offer| seen.insert(offer.offer().hash()))
+            .map(|offer| offer.offer().clone())
             .collect()
     }
 
@@ -824,19 +858,18 @@ impl Directory {
         let offering = basis.is_some();
         let mut out = Vec::new();
         let mut evidence = Vec::new();
+        let mut resolve = None;
         let evidence_due = {
             let mut state = lock(&self.state);
             state.own = Some(identity.public());
-            let own_group = basis
-                .as_ref()
-                .and_then(|basis| basis.address.parse::<std::net::SocketAddr>().ok())
-                .map(|address| Group::of(address.ip()));
-            // The relay's own network is one no witness of its own may come from (`State::tier`).
-            if state.own_group != own_group {
-                state.own_group = own_group;
-                state.networks_moved();
-                state.tiers_moved();
-            }
+            let own_group = basis.as_ref().and_then(|basis| {
+                let (group, due) = state.own_group_of(&basis.address, now_ms);
+                if due {
+                    resolve = Some(basis.address.clone());
+                }
+                group
+            });
+            state.set_own_group(own_group, now_ms);
             state.expire(now_ms);
             if let Some(offers) = state.resign(identity, basis, now_ms) {
                 out.extend(offers);
@@ -858,6 +891,17 @@ impl Directory {
             }
         }
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            // The advertised host name, resolved as a peer's dial resolves it: the group its own
+            // offers are held under from then on.
+            if let Some(address) = resolve {
+                lock(&self.state).own_resolving = Some((address.clone(), u64::MAX));
+                let state = Arc::clone(&self.state);
+                runtime.spawn(async move {
+                    let group = resolved_group(&address).await;
+                    // By the clock of the tick that asked, the one its offers are held by.
+                    lock(&state).resolved(&address, group, now_ms);
+                });
+            }
             while let Some(pending) = self.next_to_verify() {
                 let state = Arc::clone(&self.state);
                 let identity = identity.clone();
@@ -946,6 +990,16 @@ impl Directory {
         }));
         lock(&self.state).hold(offer, group, now_ms)
     }
+}
+
+/// The group `address` (a `HOST:PORT`) is in as a dial to it finds it: the first address it
+/// resolves to, as `TcpStream::connect` tries first (`answers_as`).
+async fn resolved_group(address: &str) -> Option<Group> {
+    let mut addresses = tokio::time::timeout(CONNECT_TIMEOUT, tokio::net::lookup_host(address))
+        .await
+        .ok()?
+        .ok()?;
+    addresses.next().map(|address| Group::of(address.ip()))
 }
 
 /// Dials `address` and runs the handshake to `key`: the group it answered from, or `None` if it
@@ -1158,13 +1212,7 @@ impl State {
         cap: Cap,
         (cell, signer, group): (u64, PublicKey, Group),
     ) -> Vec<(u64, PublicKey)> {
-        let in_cell = || {
-            self.cells
-                .get(&cell)
-                .into_iter()
-                .flat_map(HashMap::values)
-                .filter(|held| held.group != Group::Own)
-        };
+        let in_cell = || self.cells.get(&cell).into_iter().flat_map(HashMap::values);
         match cap {
             Cap::GroupInCell => in_cell()
                 .filter(|held| held.group == group)
@@ -1189,10 +1237,7 @@ impl State {
                 .cells
                 .iter()
                 .flat_map(|(held_cell, offers)| {
-                    offers
-                        .values()
-                        .filter(|held| held.group != Group::Own)
-                        .map(move |held| (*held_cell, held.signer()))
+                    offers.values().map(move |held| (*held_cell, held.signer()))
                 })
                 .collect(),
         }
@@ -1205,7 +1250,7 @@ impl State {
             Cap::GroupInCell | Cap::Cell => self.under(cap, (cell, signer, group)).len(),
             Cap::Group => self.per_group.get(&group).map_or(0, HashSet::len),
             Cap::Key => self.per_key.get(&signer).map_or(0, HashSet::len),
-            Cap::Held => self.held - self.per_group.get(&Group::Own).map_or(0, HashSet::len),
+            Cap::Held => self.held,
         }
     }
 
@@ -1249,19 +1294,14 @@ impl State {
                     .get(of)
                     .into_iter()
                     .flat_map(BTreeMap::keys)
-                    .map(|group| match group {
-                        Group::Own => self.own_group.unwrap_or(Group::Own),
-                        group => *group,
-                    })
+                    .copied()
                     .collect();
                 groups.sort();
                 groups
             };
             let own_groups = groups_of(key);
             let child = |child: &PublicKey| -> Option<Unit> {
-                let group = groups_of(child)
-                    .into_iter()
-                    .find(|group| *group != Group::Own)?;
+                let group = groups_of(child).into_iter().next()?;
                 (!own_groups.contains(&group)).then_some(Unit::Network(group.as_u64()))
             };
             let feeder = |_: &PublicKey| false;
@@ -1434,22 +1474,32 @@ impl State {
             .map(|held| {
                 (
                     held.newest_ms(),
+                    held.issued_ms,
                     held.group,
                     held.changed_ms,
                     same_offer(held.offer.content(), &content),
                 )
             });
-        let mut changed_ms = now_ms;
-        if let Some((newest_ms, held_group, held_changed_ms, same)) = replacing {
+        let changed_ms = now_ms;
+        if let Some((newest_ms, held_issued_ms, held_group, held_changed_ms, same)) = replacing {
             if newest_ms >= content.issued_ms {
                 return false;
             }
             // Re-signed from the same network: its rank and its group are unchanged, so it keeps
             // its place. From another network it competes there as a newcomer. Re-signed saying
-            // what it said, it changes no answer, and supersedes any change waiting.
-            let quiet = held_group == group && same;
+            // what it said, it changes no answer and supersedes any change waiting: taken no
+            // sooner than `RESIGNED_AT_MOST_EVERY_MS` after the one held by their signed times,
+            // and then in place, moving nothing a reader or a tier is weighed from.
+            if held_group == group && same {
+                if content.issued_ms < held_issued_ms.saturating_add(RESIGNED_AT_MOST_EVERY_MS) {
+                    return false;
+                }
+                self.renew(cell_key, offer);
+                return true;
+            }
+            // The relay's own changes are held to `OWN_RESIGN_AT_MOST_EVERY_MS` where it signs.
             let due = held_changed_ms.saturating_add(CHANGED_AT_MOST_EVERY_MS);
-            if !quiet && group != Group::Own && now_ms < due {
+            if Some(signer) != self.own && now_ms < due {
                 if let Some(held) = self
                     .cells
                     .get_mut(&cell_key)
@@ -1460,19 +1510,15 @@ impl State {
                 }
                 return false;
             }
-            if quiet {
-                changed_ms = held_changed_ms;
-            }
-            self.remove(cell_key, &signer, quiet);
+            self.remove(cell_key, &signer);
             if held_group == group {
-                self.insert(offer, group, quiet, changed_ms);
+                self.insert(offer, group, changed_ms);
                 return true;
             }
         }
-        // The relay's own offers are always held (at most `OFFERS_PER_KEY`, checked before it
-        // starts: `offerable`) and count against no cap; they are ranked among the rest when
-        // answered.
-        if group != Group::Own {
+        // Every offer, the relay's own among them, is held under every cap by rank: so this relay
+        // holds what its peers hold of its own network, and its own offers no more than they do.
+        {
             let newcomer = (cell_key, signer, group);
             let mut given_up: Vec<(u64, PublicKey)> = Vec::new();
             for cap in Cap::ALL {
@@ -1501,10 +1547,10 @@ impl State {
                 }
             }
             for (cell, key) in given_up {
-                self.remove(cell, &key, false);
+                self.remove(cell, &key);
             }
         }
-        self.insert(offer, group, false, changed_ms);
+        self.insert(offer, group, changed_ms);
         true
     }
 
@@ -1530,10 +1576,9 @@ impl State {
         }
     }
 
-    /// Holds `offer`. `quiet` when it replaces one of its signer's for the cell that said the same
-    /// (`same_offer`): what the held offers answer is unchanged, so nothing that follows them is
-    /// told.
-    fn insert(&mut self, offer: Checked, group: Group, quiet: bool, changed_ms: u64) {
+    /// Holds `offer`, new for its signer and cell (or replacing one `remove`d): what the held
+    /// offers answer changes. A re-signing that says the same is `renew`ed instead.
+    fn insert(&mut self, offer: Checked, group: Group, changed_ms: u64) {
         let (signer, content) = (offer.signer(), offer.content());
         let cell_key = content.cell.as_u64();
         let expires_ms = expiry(content);
@@ -1565,20 +1610,44 @@ impl State {
         *self.expiries.entry(expires_ms).or_insert(0) += 1;
         self.held += 1;
         self.ranks.remove(&cell_key);
-        if !quiet {
-            self.changed_cell(cell_key);
-        }
+        self.changed_cell(cell_key);
         // A network a key answers from is what witnesses count by (`State::tier`): the tiers move
         // only when a key's networks do.
         if new_group {
             self.networks_moved();
-            if !quiet {
-                self.tiers_moved();
-            }
+            self.tiers_moved();
         }
     }
 
-    fn remove(&mut self, cell_key: u64, signer: &PublicKey, quiet: bool) {
+    /// The held offer of `offer`'s signer for its cell, re-signed saying the same (`same_offer`,
+    /// from the same group): swapped in place, its new bytes and lifetime, any change waiting
+    /// superseded. Its key, cell, group and rank are what they were, so nothing a reader follows
+    /// or a tier is weighed from moves, and nothing is told.
+    fn renew(&mut self, cell_key: u64, offer: Checked) {
+        let signer = offer.signer();
+        let Some(held) = self
+            .cells
+            .get_mut(&cell_key)
+            .and_then(|cell| cell.get_mut(&signer))
+        else {
+            return;
+        };
+        let was = held.expires_ms;
+        held.issued_ms = offer.content().issued_ms;
+        held.expires_ms = expiry(offer.content());
+        held.deferred = None;
+        held.offer = offer;
+        let now = held.expires_ms;
+        if let Some(count) = self.expiries.get_mut(&was) {
+            *count -= 1;
+            if *count == 0 {
+                self.expiries.remove(&was);
+            }
+        }
+        *self.expiries.entry(now).or_insert(0) += 1;
+    }
+
+    fn remove(&mut self, cell_key: u64, signer: &PublicKey) {
         let Some(cell) = self.cells.get_mut(&cell_key) else {
             return;
         };
@@ -1615,9 +1684,7 @@ impl State {
         }
         if left_group {
             self.networks_moved();
-            if !quiet {
-                self.tiers_moved();
-            }
+            self.tiers_moved();
         }
         if let Some(count) = self.expiries.get_mut(&held.expires_ms) {
             *count -= 1;
@@ -1627,9 +1694,7 @@ impl State {
         }
         self.held -= 1;
         self.ranks.remove(&cell_key);
-        if !quiet {
-            self.changed_cell(cell_key);
-        }
+        self.changed_cell(cell_key);
     }
 
     /// What `cell`'s held offers answer may have changed.
@@ -1694,7 +1759,7 @@ impl State {
             })
             .collect();
         for (cell, key) in expired {
-            self.remove(cell, &key, false);
+            self.remove(cell, &key);
         }
     }
 
@@ -1765,10 +1830,11 @@ impl State {
             .map(|(cell, _)| *cell)
             .collect();
         for cell in withdrawn {
-            self.remove(cell, &own, false);
+            self.remove(cell, &own);
         }
         self.own_signed_ms = now_ms;
         self.own_basis.clone_from(&basis);
+        self.own_offers.clear();
         let basis = basis?;
         let mut signed = Vec::new();
         for (cell, stripes) in basis.cells.iter().zip(&basis.stripes) {
@@ -1791,11 +1857,100 @@ impl State {
             let Some(checked) = checked(&offer, now_ms) else {
                 continue;
             };
-            if self.hold(checked, Group::Own, now_ms) {
-                signed.push(offer);
+            self.own_offers.push(checked);
+            // Gossiped whether or not held here: each peer holds it by its own caps, as this
+            // relay does, from the same offers.
+            signed.push(offer);
+        }
+        self.hold_own(now_ms);
+        Some(signed)
+    }
+
+    /// The group the relay's advertised `address` is in, as a peer's dial finds it: an address
+    /// named by number is its own group; a host name the group it last resolved to. `true` when
+    /// it is to be resolved now (never resolved, or resolved over `VERIFIED_FOR_MS` ago), and no
+    /// resolution of it is under way.
+    fn own_group_of(&self, address: &str, now_ms: u64) -> (Option<Group>, bool) {
+        if let Ok(address) = address.parse::<std::net::SocketAddr>() {
+            return (Some(Group::of(address.ip())), false);
+        }
+        let resolved = self
+            .own_resolved
+            .as_ref()
+            .filter(|(name, _, _)| name == address);
+        let resolving = self
+            .own_resolving
+            .as_ref()
+            .is_some_and(|(name, again_ms)| name == address && now_ms < *again_ms);
+        let due = resolved.is_none_or(|(_, _, until)| *until <= now_ms);
+        (resolved.map(|(_, group, _)| *group), due && !resolving)
+    }
+
+    /// `address` resolved to `group` (none: it did not resolve, and is tried again
+    /// `RESOLVE_AGAIN_MS` on): the relay's own offers are held under it from the next tick, by
+    /// the tick's clock (`own_group_of`).
+    fn resolved(&mut self, address: &str, group: Option<Group>, now_ms: u64) {
+        let Some(group) = group else {
+            self.own_resolving = Some((address.to_owned(), now_ms + RESOLVE_AGAIN_MS));
+            return;
+        };
+        if self
+            .own_resolving
+            .as_ref()
+            .is_some_and(|(name, _)| name == address)
+        {
+            self.own_resolving = None;
+        }
+        self.own_resolved = Some((address.to_owned(), group, now_ms + VERIFIED_FOR_MS));
+    }
+
+    /// The relay's own offers are in `group` from now on: they leave the one they were held
+    /// under and are held under this one by its caps. The relay's own network is also one no
+    /// witness of its own may come from (`State::tier`), which its offers' group says.
+    fn set_own_group(&mut self, group: Option<Group>, now_ms: u64) {
+        if self.own_group == group {
+            return;
+        }
+        self.own_group = group;
+        if let Some(own) = self.own {
+            let held: Vec<u64> = self
+                .per_key
+                .get(&own)
+                .into_iter()
+                .flatten()
+                .copied()
+                .collect();
+            for cell in held {
+                self.remove(cell, &own);
             }
         }
-        Some(signed)
+        self.networks_moved();
+        self.tiers_moved();
+        self.hold_own(now_ms);
+    }
+
+    /// Holds the relay's own offers as last signed under its own group, by every cap, as a peer
+    /// that verified them there holds them: one held already is left as it is. None while the
+    /// group is not known.
+    fn hold_own(&mut self, now_ms: u64) {
+        let (Some(own), Some(group)) = (self.own, self.own_group) else {
+            return;
+        };
+        for offer in self.own_offers.clone() {
+            let content = offer.content();
+            let cell = content.cell.as_u64();
+            let held = self.cells.get(&cell).and_then(|offers| offers.get(&own));
+            if !live(content, now_ms)
+                || held
+                    .is_some_and(|held| held.group == group && held.issued_ms >= content.issued_ms)
+            {
+                continue;
+            }
+            if held.is_some_and(|held| held.group != group) {
+                self.remove(cell, &own);
+            }
+            self.hold(offer, group, now_ms);
+        }
     }
 }
 
@@ -2554,9 +2709,10 @@ mod tests {
             directory.state.lock().map_err(text)?.gossip,
             vec![newest.clone()]
         );
-        // A re-signing saying the same is held at once, and tells no reader.
+        // A re-signing saying the same, its turn come (`RESIGNED_AT_MOST_EVERY_MS` by the signed
+        // times), is held at once, and tells no reader.
         let mut same = newest.content().map_err(text)?;
-        same.issued_ms += 1_000;
+        same.issued_ms += RESIGNED_AT_MOST_EVERY_MS;
         let quiet = sign(&relay, &same)?;
         assert!(directory.hold_verified(quiet.clone(), v4(1, 1), due + 1)?);
         assert_eq!(directory.offers_for(cell, due + 1), vec![quiet]);
@@ -2707,7 +2863,7 @@ mod tests {
         let identity = Identity::generate().map_err(text)?;
         let hub = Hub::new(8).advertising(vec![tally_wire::RelayAddress {
             key: identity.public(),
-            address: "me.example:7450".to_owned(),
+            address: "198.51.100.7:7450".to_owned(),
         }]);
         let cell = area()?;
         hub.network().selection.set_taken(vec![cell]);
@@ -2727,7 +2883,7 @@ mod tests {
         assert_eq!(directory.live_evidence(), vec![evidence.clone()]);
         let declared = offer.content().map_err(text)?;
         assert_eq!(declared.cell, cell);
-        assert_eq!(declared.address, "me.example:7450");
+        assert_eq!(declared.address, "198.51.100.7:7450");
         assert_eq!(declared.network, 64_496);
         assert_eq!(declared.expires_ms, NOW + OFFER_LIFETIME_MS);
         assert!(declared.products.contains(Streams::RAW));
@@ -2760,6 +2916,129 @@ mod tests {
                 .is_empty()
         );
         assert!(directory.is_empty());
+        Ok(())
+    }
+
+    /// A relay at `address` taking `cell`, its duties on.
+    fn own_relay(identity: &Identity, address: &str, cell: Region) -> Hub {
+        let hub = Hub::new(8).advertising(vec![tally_wire::RelayAddress {
+            key: identity.public(),
+            address: address.to_owned(),
+        }]);
+        hub.network().selection.set_taken(vec![cell]);
+        hub.network().admission.configure(64_496, true);
+        hub
+    }
+
+    /// The signers held for `cell`, sorted.
+    fn held_keys(directory: &Directory, cell: Region, now_ms: u64) -> Vec<PublicKey> {
+        let mut keys: Vec<PublicKey> = directory
+            .offers_for(cell, now_ms)
+            .iter()
+            .map(Checked::signer)
+            .collect();
+        keys.sort();
+        keys
+    }
+
+    /// Sweep 3, N6: the relay's own offer is held under the group of the address it advertises
+    /// and by every cap, as its peers hold it. Its network already holds a group's share of the
+    /// cell in peers' offers: the relay holds exactly what a peer that verified the same offers
+    /// holds (the top of the ranking of the five, four of them), never its own beside all four.
+    #[test]
+    fn the_relays_own_offer_is_held_by_its_networks_caps_as_its_peers_hold_it() -> Result {
+        let cell = area()?;
+        let identity = Identity::from_seed([71; 32]);
+        let hub = own_relay(&identity, "198.51.100.7:7450", cell);
+        let mine = Directory::new();
+        let published = mine.tick(&hub, Some(&identity), NOW);
+        let Some(Record::ProviderOffer(own)) = published.first() else {
+            return Err(format!("published {published:?}"));
+        };
+        let group = Group::of(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7)));
+        let peer = Directory::new();
+        peer.hold_verified(own.clone(), group, NOW)?;
+        for seed in 0..OFFERS_PER_GROUP_IN_CELL {
+            let neighbour = Identity::from_seed([72 + seed as u8; 32]);
+            let offer = sign(&neighbour, &content("198.51.7.1:7450", cell, NOW))?;
+            mine.offered(&relay_asker(neighbour.public()), offer.clone(), NOW);
+            lock(&mine.state).hold(checked(&offer, NOW).ok_or("unchecked")?, group, NOW);
+            peer.hold_verified(offer, group, NOW)?;
+        }
+        let held = held_keys(&mine, cell, NOW);
+        assert_eq!(held.len(), OFFERS_PER_GROUP_IN_CELL);
+        assert_eq!(held, held_keys(&peer, cell, NOW));
+        // Re-signed a minute on, it competes again, and both still hold the same.
+        mine.tick(&hub, Some(&identity), NOW + OWN_RESIGN_EVERY_MS);
+        assert_eq!(held_keys(&mine, cell, NOW + OWN_RESIGN_EVERY_MS), held);
+        Ok(())
+    }
+
+    /// Sweep 3, N6: a relay advertising a host name holds its own offers once the name resolves,
+    /// under the group it resolves to, as a peer's dial finds it; never before, under no group.
+    #[tokio::test]
+    async fn a_relay_advertising_a_host_name_holds_its_offers_under_the_group_it_resolves_to()
+    -> Result {
+        let cell = area()?;
+        let identity = Identity::from_seed([81; 32]);
+        let hub = own_relay(&identity, "localhost:7450", cell);
+        let directory = Directory::new();
+        directory.tick(&hub, Some(&identity), NOW);
+        let mut now = NOW;
+        for _ in 0..100 {
+            if !directory.offers_for(cell, now).is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            now += 100;
+            directory.tick(&hub, Some(&identity), now);
+        }
+        let state = lock(&directory.state);
+        let held = state
+            .cells
+            .get(&cell.as_u64())
+            .and_then(|offers| offers.get(&identity.public()))
+            .ok_or("the relay's own offer is not held")?;
+        let resolved = state.own_resolved.as_ref().map(|(_, group, _)| *group);
+        assert_eq!(Some(held.group), resolved);
+        assert!(matches!(held.group, Group::V4(0x7f00) | Group::V6(0)));
+        Ok(())
+    }
+
+    /// Sweep 3, N13: a peer re-signing an offer that says nothing new is taken at most once per
+    /// `RESIGNED_AT_MOST_EVERY_MS` by the signed times, never gossiped sooner; and one taken is
+    /// swapped in place, so it moves no ranking, version or tier a reader follows.
+    #[test]
+    fn a_re_signing_that_changes_nothing_is_taken_once_a_turn_and_in_place() -> Result {
+        let relay = Identity::from_seed([91; 32]);
+        let cell = area()?;
+        let directory = Directory::new();
+        let first = sign(&relay, &content("203.0.113.9:1", cell, NOW))?;
+        assert!(directory.hold_verified(first.clone(), v4(203, 0), NOW)?);
+        let ranked = directory.offers_for(cell, NOW);
+        let version = directory.version(NOW);
+        let _ = directory.take_changed_cells(NOW);
+        // Re-signed a millisecond apart, a thousand times: none taken.
+        for step in 1..=1_000 {
+            let again = sign(&relay, &content("203.0.113.9:1", cell, NOW + step))?;
+            assert!(!directory.hold_verified(again, v4(203, 0), NOW + step)?);
+        }
+        assert_eq!(directory.offers_for(cell, NOW + 1_000), vec![first]);
+        // Its turn come: taken, in place.
+        let at = NOW + RESIGNED_AT_MOST_EVERY_MS;
+        let renewed = sign(&relay, &content("203.0.113.9:1", cell, at))?;
+        assert!(directory.hold_verified(renewed.clone(), v4(203, 0), at)?);
+        {
+            let state = lock(&directory.state);
+            assert!(
+                state.ranks.contains_key(&cell.as_u64()),
+                "the cell's ranking was dropped: not renewed in place"
+            );
+        }
+        assert_eq!(directory.version(at).held, version.held);
+        assert!(directory.take_changed_cells(at).is_empty());
+        assert_eq!(directory.offers_for(cell, at), vec![renewed]);
+        assert_eq!(ranked.len(), 1);
         Ok(())
     }
 }

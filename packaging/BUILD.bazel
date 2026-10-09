@@ -1,0 +1,3 @@
+# The feeder's installer, for an operator's check of the seed list it ships (`install.sh
+# --check-seeds FILE`, which reads a seed list as an install does).
+exports_files(["install.sh"])

@@ -43,7 +43,8 @@ fn check(config: &Config) -> Result<(), String> {
     let plan = format!(
         "memory {}\nbase {}\noversize {}\nconnections {}\nconnection-buffers {}\n\
          per-feeder {}\nfeeders {}\nmembers {}\nper-member {}\nmember-feeders {}\n\
-         member-rate-pool {}\nmember-pool {}\nplanned {}\nheadroom {}\nlimit {}\n",
+         member-rate-pool {}\nmember-pool {}\nmember-links {}\nplanned {}\nheadroom {}\n\
+         limit {}\n",
         budget.memory(),
         budget.base(),
         budget.plan().oversize(),
@@ -56,6 +57,7 @@ fn check(config: &Config) -> Result<(), String> {
         budget.member_feeders(),
         budget.plan().member_rate_pool(),
         budget.plan().member_pool(),
+        budget.plan().member_links(),
         budget.planned(),
         HEADROOM_BYTES,
         config.memory_limit,
