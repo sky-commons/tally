@@ -43,6 +43,11 @@ pub fn spawn(
     start: tokio::time::Instant,
 ) {
     let local = traffic.receivers.len().max(1) as u32;
+    // The wall clock of `start`, which a GNSS-disciplined receiver's counter reads (`frames`).
+    let start_unix_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_millis() as u64)
+        .saturating_sub(start.elapsed().as_millis() as u64);
     for (at, receiver) in traffic.receivers.iter().enumerate() {
         let relay = relays[receiver.index % relays.len()].clone();
         let config = Config {
@@ -94,7 +99,7 @@ pub fn spawn(
                         .offered
                         .fetch_add(frames.len() as u64, Ordering::Relaxed);
                     frames.clear();
-                    traffic.frames(at, now, &mut frames);
+                    traffic.frames(at, now, start_unix_ms, &mut frames);
                     second = now;
                     handed = 0;
                 }
