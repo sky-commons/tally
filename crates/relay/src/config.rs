@@ -22,7 +22,8 @@ usage: tally-relay --key FILE [--key FILE]... --max-upload RATE [options]
                                    sockets, which it does not open), then print the plan
                                    (memory, base, oversize, connections, connection-buffers,
                                    per-feeder, feeders, memory-feeders, cores, core-feeders,
-                                   ingest-threads, message-threads, seal-threads, members,
+                                   ingest-threads, message-threads, seal-threads,
+                                   mlat-threads, members,
                                    per-member, member-feeders, member-rate-pool, member-pool,
                                    member-links, planned, headroom, limit) and exit 0.
                                    --memory-limit is the memory the relay will run in (the
@@ -112,15 +113,18 @@ usage: tally-relay --key FILE [--key FILE]... --max-upload RATE [options]
                          the relay before its budget turned a feeder away. The feeders admitted
                          are also no more than the cores it runs on (its CPU affinity and its
                          cgroup's quota) carry beside its members' rate, each stage at most
-                         50% busy, and each stage's threads follow what it admits
+                         50% busy and, where it hosts MLAT, MLAT's steps in the cores left, and
+                         each stage's threads, and MLAT's, follow what it admits
   --area CELL            an area this relay takes (an H3 cell, hex or decimal): it shares it
                          and, with relay duties on, may solve its MLAT (RFC-0174 §2.1);
                          repeatable
   --network ASN          the autonomous system this relay is on, declared in its signed
                          replies and offers so feeders pick two relays on different networks
                          (default 0, not said)
-  --mlat-threads N       threads for the MLAT this relay runs for the areas it is chosen to
-                         solve (default: every core; 0 runs none)
+  --no-mlat              run no MLAT for the areas this relay is chosen to solve. By default
+                         it does, on the cores its stages leave and below their priority,
+                         shedding what it falls behind on rather than delaying raw; hosting it
+                         costs each feeder memory and cores, so the same relay admits fewer
   --world                gather the live world product: one fix per aircraft per second from
                          every area's positions this relay receives, each second sealed 4 s
                          after it ends, MLAT aircraft by their provisional fixes (RFC-0174 §2.11).
@@ -171,8 +175,9 @@ pub struct Config {
     pub areas: Vec<Region>,
     /// The autonomous system declared (0: not said).
     pub network: u32,
-    /// Threads for the hosted MLAT; 0 runs none. Every core unless told.
-    pub mlat_threads: usize,
+    /// Hosts MLAT for the areas it is chosen to solve: on unless `--no-mlat`. Its threads are the
+    /// plan's (`Budget::mlat_threads`), never an operator's.
+    pub mlat: bool,
     /// Gathers the live world product, and the precise one.
     pub world: bool,
     pub world_precise: bool,
@@ -297,7 +302,7 @@ impl Config {
             max_upload: Cap::NONE,
             areas: Vec::new(),
             network: 0,
-            mlat_threads: cores,
+            mlat: true,
             world: false,
             world_precise: false,
             relay_duties: true,
@@ -364,11 +369,7 @@ impl Config {
                         .parse()
                         .map_err(|_| "--network needs an AS number".to_owned())?;
                 }
-                "--mlat-threads" => {
-                    config.mlat_threads = value()?
-                        .parse()
-                        .map_err(|_| "--mlat-threads needs a number".to_owned())?;
-                }
+                "--no-mlat" => config.mlat = false,
                 "--no-relay-duties" => config.relay_duties = false,
                 "--world" => config.world = true,
                 "--world-precise" => config.world_precise = true,

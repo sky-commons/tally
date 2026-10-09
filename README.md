@@ -77,8 +77,8 @@ what it takes with every relay that takes the same area, and offers it, signed, 
 carry: a relay that does not list itself signs no offer, so no other relay can verify it, choose it
 to solve an area's MLAT, or pass it an area's raw. `--network ASN` declares the autonomous system it is on, so feeders choose two relays on
 different networks. The duties of a full relay are on by default: it accepts feeders, runs MLAT
-for the areas it is chosen to solve on `--mlat-threads` threads (every core by default; 0 runs
-none), and seeds its feeders' data into their areas' sharing groups. `--no-relay-duties` turns all
+for the areas it is chosen to solve (on the cores its other work leaves, below its priority, so
+MLAT that falls behind sheds rather than delaying raw; `--no-mlat` runs none), and seeds its feeders' data into their areas' sharing groups. `--no-relay-duties` turns all
 three off, for a relay that only shares the areas it takes (a host behind NAT, or one with no
 cores to spare). `--world` gathers the live world product from every area's positions it receives
 (one fix per aircraft per second, sealed about 4 seconds after the second, MLAT by its provisional

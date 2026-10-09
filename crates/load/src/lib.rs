@@ -168,11 +168,13 @@ pub async fn run(config: Config) -> Result<String, String> {
             listen,
             max_upload,
             args,
+            mlat,
         } => {
             let relay = relay::spawn(
                 bin,
                 listen,
                 max_upload,
+                *mlat,
                 args,
                 config.spec.feeders,
                 &config.state_dir,

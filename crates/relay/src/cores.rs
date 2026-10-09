@@ -3,10 +3,12 @@
 //! never a fixed share of the host: the feeders its budget admits and the feeders its members'
 //! shared rate is worth (`Budget::load`), each at the planned rate (one batch a second of
 //! `PLANNED_RECEPTIONS_PER_SEC` receptions), over what one thread of that stage was measured to
-//! sustain, with [`BUSY_PERCENT`] of headroom ([`threads_for`]). And the feeders a relay admits
-//! are no more than its cores carry ([`feeders_carried`]): a feeder past them is turned away at
-//! its Hello as a feeder past the memory is, and a relay whose cores cannot carry its members'
-//! rate and one feeder beside it refuses to start (`Budget::check`).
+//! sustain, with [`BUSY_PERCENT`] of headroom ([`threads_for`]). A relay that hosts MLAT plans its
+//! engine in the same cores: the stages keep their half-busy share for raw, and MLAT's steps take
+//! what is left ([`mlat_threads_for`]), below the stages' priority (`mlat_host`, `Urgency`). And the feeders a relay admits are no more than
+//! its cores carry, the stages' share and MLAT's together ([`feeders_carried`]): a feeder past them
+//! is turned away at its Hello as a feeder past the memory is, and a relay whose cores cannot carry
+//! its members' rate and one feeder beside it refuses to start (`Budget::check`).
 //!
 //! Before, the stages took a quarter of the cores for ingest and an eighth for the message
 //! exchange whatever the load: a 10-core relay admitting 5,000 feeders (about 3 M receptions a
@@ -24,8 +26,10 @@
 //! (each batch's raw into its receivers' open bins), its sealer (the bins sealed) and its runtime
 //! (the raw links), measured apart (2,000 feeders, two MLAT threads), and plans by those.
 //!
-//! The hosted MLAT engine's own threads (`--mlat-threads`) are not planned here: the engine sheds
-//! whole steps it falls behind on, counted, and never pushes back on ingest (§10).
+//! Before, the hosted MLAT engine's threads were not planned (`--mlat-threads`, every core the
+//! relay saw by default): its window steps spread over every core beside the stages, at the
+//! stages' priority in its provisional steps, so on a relay hosting MLAT under load nothing kept a
+//! core for raw.
 
 use crate::budget::PLANNED_RECEPTIONS_PER_SEC;
 use crate::ingest::Threads;
@@ -76,6 +80,33 @@ pub const RUNTIME_FEEDERS_PER_CORE_HOLDING_RAW: usize = 8_000;
 /// Measured: one message thread 66% busy on average was saturated at each close, raw's p99 587 ms;
 /// two at 28% each, 41 ms.
 pub const BUSY_PERCENT: usize = 50;
+
+/// Nanoseconds of one core a second hosted MLAT's window steps cost a hosted feeder: the seals of
+/// its raw, each window step's fits and solutions (spread over the step's threads,
+/// `window::parallel`), and the engine's own thread that steps them. Measured (2026-10-09, the
+/// relay built `-c opt` with each MLAT thread adding its own run time (`/proc/thread-self/schedstat`)
+/// to its kind's count as it ended, on cores 0-9 of a 32-core host with the harness on 10-31, two
+/// areas, eight MLAT threads; a window step came about every 40 s, so each is taken whole, after
+/// the ramp): at 500 feeders a window step cost 10.0 and 11.0 cores-seconds (0.27 of a core), the
+/// seals 0.058 of a core and the engine's thread 0.008, 0.68 ms a feeder a second; at 2,000 a
+/// window step cost 39.4 cores-seconds every 41 s (0.96 of a core), the seals 0.21 and the engine's
+/// thread 0.085, 0.63 ms. 0.68 ms is planned as 0.70.
+pub const MLAT_WINDOW_NANOS_PER_FEEDER: usize = 700_000;
+/// The same of its provisional steps: weighing what each batch told its address shards and solving
+/// what is due, every second. Measured in the same runs, over each 10 s once the feeders were all
+/// up: 0.14 to 0.20 of a core at 500 feeders (0.41 ms a feeder a second at its most), and 0.72 to
+/// 0.80 at 2,000 (0.40 ms at its most). 0.41 ms.
+pub const MLAT_PROVISIONAL_NANOS_PER_FEEDER: usize = 410_000;
+
+/// The most of MLAT's share of the cores the plan fills with its measured cost. MLAT plans no
+/// headroom of its own, unlike a stage ([`BUSY_PERCENT`]): it runs below the stages' priority, so
+/// the half of the stages' share they leave idle on average is MLAT's too whenever they do not
+/// need it, and what it cannot do in time it sheds, counted (`mlat_host`, Behind), never pushing
+/// back on raw. Its window steps are bursty (a step every 40 s or so, each seconds of every thread
+/// it has), which a window step past the steps MLAT may be behind absorbs by shedding the empty
+/// steps queued behind it into the next (no window is lost); its provisional steps, every second,
+/// run above the window steps.
+pub const MLAT_BUSY_PERCENT: usize = 100;
 
 /// A nanosecond of one core, a second.
 const NANOS: usize = 1_000_000_000;
@@ -135,17 +166,73 @@ pub fn threads_for(load: usize, holds_raw: bool, cores: Option<usize>) -> Thread
     }
 }
 
-/// The planned feeders' worth of load `cores` cores carry, holding MLAT raw or not: every
-/// stage's work at the planned rate, the runtime's with it, in [`BUSY_PERCENT`] of them.
-pub fn load_carried(cores: usize, holds_raw: bool) -> usize {
+/// Nanoseconds of one core a second hosted MLAT costs one planned feeder: its window steps and its
+/// provisional steps, in a relay that hosts MLAT (`hosts_mlat`, the relay that holds MLAT raw), and
+/// nothing in one that does not.
+pub const fn mlat_per_feeder(hosts_mlat: bool) -> usize {
+    if hosts_mlat {
+        MLAT_WINDOW_NANOS_PER_FEEDER + MLAT_PROVISIONAL_NANOS_PER_FEEDER
+    } else {
+        0
+    }
+}
+
+/// Nanoseconds of one core a second the plan sets aside for `load` planned feeders' worth in the
+/// stages (every stage's work and the runtime's at [`BUSY_PERCENT`]), holding MLAT raw or not.
+fn stages_planned(load: usize, holds_raw: bool) -> usize {
     let per_feeder: usize = Work::ALL
         .iter()
         .map(|work| work.per_feeder(holds_raw))
         .sum();
+    load.saturating_mul(per_feeder)
+        .saturating_mul(100)
+        .div_ceil(BUSY_PERCENT)
+}
+
+/// The same for hosted MLAT's steps (at [`MLAT_BUSY_PERCENT`]): none where it is not hosted.
+fn mlat_planned(load: usize, hosts_mlat: bool) -> usize {
+    load.saturating_mul(mlat_per_feeder(hosts_mlat))
+        .saturating_mul(100)
+        .div_ceil(MLAT_BUSY_PERCENT)
+}
+
+/// The planned feeders' worth of load `cores` cores carry, holding MLAT raw (hosting MLAT) or not:
+/// every stage's work at the planned rate, the runtime's with it, in [`BUSY_PERCENT`] of their
+/// share, and beside them hosted MLAT's steps in [`MLAT_BUSY_PERCENT`] of what is left.
+pub fn load_carried(cores: usize, holds_raw: bool) -> usize {
+    let per_feeder = stages_planned(1, holds_raw).saturating_add(mlat_planned(1, holds_raw));
     cores
-        .saturating_mul(PLANNED_PER_THREAD)
+        .saturating_mul(NANOS)
         .checked_div(per_feeder)
         .unwrap_or(usize::MAX)
+}
+
+/// The threads hosted MLAT's steps are spread over for `load` planned feeders' worth, on `cores`
+/// cores when they are known: none where it is not hosted; else the cores the stages' share leaves,
+/// rounded up, at least one, or where the cores are not known as many as its measured cost at
+/// [`MLAT_BUSY_PERCENT`] needs, at least one. The load a relay admits is no more than its cores
+/// carry with MLAT's share beside the stages' ([`load_carried`]), so at its ceiling the cores left
+/// hold what MLAT needs on average. MLAT is given all of them, not only that, because its work is
+/// not even: a window step's comes at once every 40 s or so, and a provisional step carries a
+/// window step's models only if it reported within `tally_mlat::engine::MODELS_RIPEN_MS` (5 s), so
+/// the sooner a window step reports the fewer provisional steps start without it. Measured
+/// (2026-10-09, 2,000 feeders on 10 cores): on the three threads its average cost needs, a window
+/// step took 19 and 24 s, and 15 and 20 provisional steps a minute started without its models
+/// (`provisional_models_late`); on eight, 10 s and 6. Its threads run below the stages' priority,
+/// so the cores they share with the stages cost the stages nothing, and the relay's resident
+/// memory was the same on either (4.4 to 4.7 GB at its peak on three, 4.3 on eight).
+pub fn mlat_threads_for(load: usize, hosts_mlat: bool, cores: Option<usize>) -> usize {
+    if !hosts_mlat {
+        return 0;
+    }
+    match cores {
+        Some(cores) => cores
+            .saturating_mul(NANOS)
+            .saturating_sub(stages_planned(load, true))
+            .div_ceil(NANOS)
+            .max(1),
+        None => mlat_planned(load, true).div_ceil(NANOS).max(1),
+    }
 }
 
 /// The feeders `cores` cores carry beside `member_feeders`, the feeders the members' shared rate
@@ -221,24 +308,80 @@ mod tests {
             assert!(feeders_carried(1, holds_raw, 0) > 100);
             // The load carried grows with the cores.
             assert_eq!(load_carried(10, holds_raw) / 10, load_carried(1, holds_raw));
-            // At the load carried, the cores' planned share holds every stage's work.
+            // At the load carried, the cores hold every stage's work at BUSY_PERCENT and hosted
+            // MLAT's at MLAT_BUSY_PERCENT beside it.
             for cores in [1, 4, 10, 32] {
                 let load = load_carried(cores, holds_raw);
-                let spent: usize = Work::ALL
+                let stages: usize = Work::ALL
                     .iter()
                     .map(|work| load * work.per_feeder(holds_raw))
                     .sum();
-                assert!(spent <= cores * PLANNED_PER_THREAD, "{cores}");
+                let mlat = load * mlat_per_feeder(holds_raw);
+                assert!(
+                    stages * 100 / BUSY_PERCENT + mlat * 100 / MLAT_BUSY_PERCENT <= cores * NANOS,
+                    "{cores}"
+                );
             }
             // The members' rate is carried first.
             let four = load_carried(4, holds_raw);
             assert_eq!(feeders_carried(4, holds_raw, four), 0);
             assert_eq!(feeders_carried(4, holds_raw, 10), four - 10);
         }
-        // Holding raw, a core carries fewer.
+        // Hosting MLAT, a core carries fewer: its raw costs the stages more, and its steps are
+        // planned beside them.
         assert!(load_carried(10, true) < load_carried(10, false));
-        // 5,000 feeders without MLAT fit the 10 cores they were measured on.
+        assert!(
+            load_carried(10, true) * (stages_planned(1, true) + mlat_planned(1, true))
+                <= 10 * NANOS
+        );
+        // 5,000 feeders without MLAT fit the 10 cores they were measured on, and the 2,000 the
+        // MLAT runs measured fit them hosting it.
         assert!(load_carried(10, false) >= 5_000);
+        assert!(load_carried(10, true) >= 2_000);
         assert!(cores_available() >= 1);
+    }
+
+    /// RFC-0181 §10, "The cores": MLAT's steps are planned in the same cores as the stages. The
+    /// stages keep their half-busy share for raw; MLAT is given what is left, which at the load
+    /// the cores carry holds its measured cost; and a relay that does not host MLAT runs none.
+    #[test]
+    fn mlat_takes_the_cores_the_stages_leave_and_admission_keeps_them_enough() {
+        assert_eq!(mlat_threads_for(1_000, false, Some(10)), 0);
+        assert_eq!(mlat_threads_for(1_000, false, None), 0);
+        for cores in [1, 2, 4, 10, 32] {
+            let carried = load_carried(cores, true);
+            for load in [0, 1, carried / 2, carried] {
+                let threads = mlat_threads_for(load, true, Some(cores));
+                assert!(threads >= 1 && threads <= cores, "{cores} {load} {threads}");
+                // MLAT's threads are what is left beside the stages' share, and at the load
+                // carried what is left holds its planned cost.
+                let left = (cores * NANOS).saturating_sub(stages_planned(load, true));
+                assert_eq!(threads, left.div_ceil(NANOS).max(1), "{cores} {load}");
+                assert!(mlat_planned(load, true) <= left, "{cores} {load}");
+                assert!(
+                    threads * NANOS >= mlat_planned(load, true),
+                    "{cores} {load}"
+                );
+            }
+            // Past the load carried, what is left no longer holds it: admission stops there.
+            let past = carried + 1;
+            assert!(
+                mlat_planned(past, true)
+                    > (cores * NANOS).saturating_sub(stages_planned(past, true)),
+                "{cores}"
+            );
+        }
+        // Where the cores are not known, MLAT is given what its cost needs.
+        assert_eq!(mlat_threads_for(0, true, None), 1);
+        assert_eq!(
+            mlat_threads_for(10_000, true, None),
+            (10_000 * mlat_per_feeder(true)).div_ceil(NANOS)
+        );
+        // The measured 2,000 feeders on ten cores: MLAT keeps more than its cost.
+        let threads = mlat_threads_for(2_000, true, Some(10));
+        assert!(
+            threads * NANOS >= 2_000 * mlat_per_feeder(true),
+            "{threads}"
+        );
     }
 }

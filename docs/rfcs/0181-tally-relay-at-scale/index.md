@@ -495,8 +495,41 @@ Measured on main (tally-load, commit b3e3571809 on branch tally-load):
     process may run on (its affinity and its cgroup's quota, `std::thread::available_parallelism`);
     `tally-relay check --cores N` is told a deploy's, and prints `cores`, `core-feeders`,
     `memory-feeders` and each stage's threads beside the memory plan. `--ingest-threads` and
-    `--message-threads` are gone: no operator picks a stage's threads. The hosted MLAT engine's
-    threads are not planned: it sheds what it falls behind on and never pushes back on ingest.
+    `--message-threads` are gone: no operator picks a stage's threads.
+
+    **MLAT in the cores (decided 2026-10-09).** A relay that hosts MLAT plans its engine in the same
+    cores. The stages keep their half-busy share for raw; MLAT's steps get what is left. Each
+    hosted feeder costs MLAT its measured figure, `cores::MLAT_WINDOW_NANOS_PER_FEEDER` (seals,
+    window steps and the engine's thread, 0.70 ms of a core a second) and
+    `cores::MLAT_PROVISIONAL_NANOS_PER_FEEDER` (0.41 ms), planned at `cores::MLAT_BUSY_PERCENT`
+    (100%: MLAT runs below the stages, so the half of their share they leave idle is MLAT's too
+    whenever they do not need it, and what MLAT cannot do in time it sheds). The load the cores
+    carry is the most whose stages' share and MLAT's fit the cores together
+    (`cores::load_carried`), so admission with MLAT on is bounded so both fit, and MLAT's threads
+    are the cores the stages' share leaves for the load admitted, rounded up
+    (`cores::mlat_threads_for`, `Budget::mlat_threads`), which at the ceiling hold its cost. All of
+    them, not only its average need, because its work is not even: a window step's comes at once
+    every 40 s or so, and a provisional step carries a window step's models only if it reported
+    within `MODELS_RIPEN_MS` (5 s). On the three threads its average cost needs at 2,000 feeders, a
+    window step took 19 and 24 s and 15 and 20 provisional steps a minute started without its
+    models; on the seven the plan gives it, 9 to 11 s and 10 to 14. Every MLAT step
+    runs below the stages' priority (`mlat_host::Urgency`): provisional steps at nice 5, seals and
+    window steps at nice 10, the threads they spread over inheriting it, so on a relay short of
+    cores it is MLAT that waits and sheds whole steps, counted (`steps_shed`,
+    `provisional_steps_shed`, beside the steps it ran, `steps` and `provisional_steps`), never raw
+    that is delayed. No step holds a lock a stage waits on while it works: an address shard's
+    inbox, which the ingest workers hand notes to, is apart from the state a provisional step
+    weighs, and the step only swaps it out (`Shared::due`); the engine's own thread, which does
+    nothing long and takes the raw shards' locks, stays at the stages' priority.
+    `--mlat-threads` is gone: no operator can need a thread count the plan does not size, and its
+    one other use, turning MLAT off, is `--no-mlat`. `tally-relay check` prints `mlat-threads`.
+
+    Why (measured 2026-10-09, 2,000 feeders hosting MLAT on cores 0-9): `--mlat-threads`
+    defaulted to every core the relay saw, its window steps spread over all of them beside the
+    stages, and its provisional steps ran at the stages' priority, so nothing kept a core for raw.
+    Given two threads, MLAT took both whole (1.99 cores) and still fell behind, and raw's p99 was
+    220 ms; given eight, 162 ms. With MLAT planned and below the stages, 52 to 68 ms. The figures
+    and the runs are in "Sizing", "What the cores carry".
 
     Why (measured 2026-10-09, 5,000 feeders, about 3 M receptions a second, the relay on cores 0-9):
     the stages took a quarter of the cores for ingest and an eighth for the message exchange, so
@@ -670,6 +703,8 @@ thread sustained:
 | Sealer, MLAT raw held      | 1.21 M: 2, 0.370                                             | 3.2 M (305 ns)              |
 | Async runtime (10 workers) | 5,000 feeders: 0.404 to 0.412; 6,742: 0.516                  | 12,000 feeders a core       |
 | Async runtime, raw held    | 2,000 feeders: 0.243                                         | 8,000 feeders a core        |
+| MLAT window steps          | 500 feeders: 0.27 + seals 0.058 + engine 0.008; 2,000: 0.96 + 0.21 + 0.085 | 0.70 ms a feeder |
+| MLAT provisional steps     | 500 feeders: 0.14 to 0.20; 2,000: 0.72 to 0.80               | 0.41 ms a feeder            |
 
 The message exchange costs less a reception the more threads it has (a thread's shards fit its
 caches), and the slice each batch sends each thread cost nothing measurable beside its receptions,
@@ -694,6 +729,37 @@ three seal), the same harness and host as above:
 0.23.) Each run read 5,000 batches and 3.02 M receptions a second with nothing lost, and the relay
 admitted all 5,000. Before, with one message thread and two ingest workers, the same runs' raw p99
 was 266, 275, 1,067 and 587 ms.
+
+**Hosted MLAT in the same cores** (§10, "MLAT in the cores"). Its figures were measured with the
+relay built `-c opt` and each MLAT step thread, and every thread it spread its work over, adding
+its own run time (`/proc/thread-self/schedstat`) to its kind's count as it ended (a probe built for
+the measurement, not in the relay), the relay on cores 0-9 with eight MLAT threads so no provisional
+step was shed. A window step comes about every 40 s and costs seconds of every thread it has, so it
+is taken whole: 10.0 and 11.0 cores-seconds at 500 feeders, 39.4 at 2,000. Each figure is the most a
+feeder cost over the runs (`cores::MLAT_WINDOW_NANOS_PER_FEEDER`,
+`cores::MLAT_PROVISIONAL_NANOS_PER_FEEDER`), planned at 100% of what the stages leave
+(`cores::MLAT_BUSY_PERCENT`). Hosting MLAT, a planned feeder costs the stages 619 us of a core a
+second (its raw held), planned at 50% busy, and MLAT 1.11 ms: a core carries 427 feeders' worth, ten
+4,275, and with the members' 128 beside them ten cores admit 4,129 where they admitted 7,944 with
+MLAT unplanned. At 2,000 feeders and memory for 2,358, ten cores run one thread a stage and seven
+for MLAT.
+
+Three runs back to back at 2,000 feeders hosting MLAT, the plan's threads (one ingest, one
+message, one seal, seven MLAT), `--memory 14G`, the same harness and host (cores over the measured
+minute; MLAT's by its probe, its window steps over the minute holding two of them):
+
+| Run | Raw p50 | Raw p99 | Raw max | Ingest | Message | Sealer and helper | Runtime | MLAT engine | Window steps and seals | Provisional steps | Window steps run, shed | Provisional steps run, shed |
+| --- | ------- | ------- | ------- | ------ | ------- | ----------------- | ------- | ----------- | ---------------------- | ----------------- | ---------------------- | --------------------------- |
+| 1   | 2 ms    | 68 ms   | 104 ms  | 0.292  | 0.200   | 0.364             | 0.245   | 0.085       | 1.189 + 0.204          | 0.676             | 2, 10                  | 60, 0                       |
+| 2   | 2 ms    | 52 ms   | 107 ms  | 0.291  | 0.214   | 0.372             | 0.251   | 0.093       | 1.143 + 0.207          | 0.748             | 2, 11                  | 60, 0                       |
+| 3   | 2 ms    | 58 ms   | 111 ms  | 0.291  | 0.203   | 0.369             | 0.250   | 0.091       | 1.176 + 0.205          | 0.672             | 2, 14                  | 60, 0                       |
+
+Each run read 2,000 batches and 1.21 M receptions a second with nothing lost; resident memory peaked
+at 4.1 to 4.3 GB. Every provisional step ran. A window step took 9 to 11 s, so the empty steps the
+watermark passed behind it were shed into the next (`steps_shed`, no window lost) and as many
+provisional steps started without its models (`provisional_models_late`). Before, the same 2,000
+feeders with MLAT on two threads at the old defaults gave raw a p99 of 220 ms (max 284), and on
+eight 162 ms (max 282).
 
 **The deployed budgets** are `tally-relay check`'s to state, not this document's: the numbers move
 with every store's plan, and a figure copied here is wrong the next time one does. Before any feeder
