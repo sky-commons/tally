@@ -27,7 +27,8 @@
 //!   (`tally_wire::delivery::tag_keys_for`): a tag under an older key (a replay) is no proof.
 //! - **Keys on a schedule, never per audit.** The keys go to the members drawn at random for the
 //!   period (at most `KEYED_MEMBERS` of every member the feeder may ask, drawn afresh each period,
-//!   the keys of a member not drawn dropped: `Keyring`), every period, whether or not an audit
+//!   one per network known distinct first and only then the rest, the keys of a member not drawn
+//!   dropped: `Keyring`), every period, whether or not an audit
 //!   runs, so a member learns nothing of when one does or of which batches it covers, and cannot
 //!   tip off the relay audited. Only a member drawn and holding a key for the period is asked. The feeder keeps the bytes of the audited batches alone, and asks only
 //!   within `TAG_WINDOW_MS` of sending, the window a member keeps its tags for.
@@ -117,6 +118,13 @@ type MemberKeys = BTreeMap<u32, [u8; TAG_KEY_LEN]>;
 /// is given no key and its keys are dropped. So no fixed few are always the judges: whoever was
 /// keyed first (a set of keys that reached the feeder first after a restart) holds the set for a
 /// period at most, and every member of the area is drawn in turn.
+///
+/// **Networks before members.** The members asked are on networks known distinct (`members`), so
+/// the draw takes, at random, one member of each network known distinct from every member drawn
+/// before any second member of a network: many keys on a few networks win the places of those
+/// networks and no more, and every network the area has (up to `KEYED_MEMBERS`) holds a key, so
+/// a check can always ask the distinct networks there are. A member no longer a candidate (its
+/// offer expired, or it left the area) gives its place up before the places left are counted.
 #[derive(Default)]
 pub struct Keyring {
     keys: HashMap<PublicKey, MemberKeys>,
@@ -127,13 +135,15 @@ pub struct Keyring {
 
 impl Keyring {
     /// The members to give keys at `now_ms`, of `candidates` (every member the feeder may ask):
-    /// at the first draw of a key period, `KEYED_MEMBERS` of them at random, and every key of a
-    /// member not drawn dropped; later in the period, a member drawn stays drawn and a place left
-    /// is filled at random from the rest. The members drawn among `candidates`, and the keys
+    /// at the first draw of a key period, `KEYED_MEMBERS` of them at random, one per network known
+    /// distinct first (`rendezvous::distinct_networks`, the rule `members` asks by) and then the
+    /// rest, and every key of a member not drawn dropped; later in the period, a member drawn that
+    /// is still a candidate stays drawn, one that is not gives its place up, and a place left is
+    /// filled the same way from the rest. The members drawn among `candidates`, and the keys
     /// dropped (which a check already asked may still need to read its answers: `DeliveryChecker`).
     pub fn draw(
         &mut self,
-        candidates: &[PublicKey],
+        candidates: &[Member],
         now_ms: u64,
     ) -> (Vec<PublicKey>, Vec<(PublicKey, MemberKeys)>) {
         let period = key_period(now_ms);
@@ -141,16 +151,42 @@ impl Keyring {
             self.drawn_for = Some(period);
             self.drawn.clear();
         }
-        let mut rest: Vec<PublicKey> = candidates
+        let listed: HashSet<PublicKey> = candidates.iter().map(|member| member.relay.key).collect();
+        self.drawn.retain(|member| listed.contains(member));
+        let mut rest: Vec<&Member> = candidates
             .iter()
-            .filter(|candidate| !self.drawn.contains(*candidate))
-            .copied()
+            .filter(|candidate| !self.drawn.contains(&candidate.relay.key))
             .collect();
-        rest.sort_unstable_by(|one, other| one.as_bytes().cmp(other.as_bytes()));
-        rest.dedup();
+        rest.sort_unstable_by(|one, other| {
+            one.relay.key.as_bytes().cmp(other.relay.key.as_bytes())
+        });
+        rest.dedup_by(|one, other| one.relay.key == other.relay.key);
         shuffle(&mut rest);
+        let mut placed: Vec<Placement> = candidates
+            .iter()
+            .filter(|candidate| self.drawn.contains(&candidate.relay.key))
+            .map(Member::placement)
+            .collect();
+        // One per network known distinct from every member drawn, then the rest, each at random.
+        let (distinct, others): (Vec<&Member>, Vec<&Member>) =
+            rest.into_iter().partition(|member| {
+                let distinct = known(member)
+                    && placed
+                        .iter()
+                        .all(|other| distinct_networks(*other, member.placement()));
+                if distinct {
+                    placed.push(member.placement());
+                }
+                distinct
+            });
         let room = KEYED_MEMBERS.saturating_sub(self.drawn.len());
-        self.drawn.extend(rest.into_iter().take(room));
+        self.drawn.extend(
+            distinct
+                .into_iter()
+                .chain(others)
+                .take(room)
+                .map(|member| member.relay.key),
+        );
         let dropped: Vec<PublicKey> = self
             .keys
             .keys()
@@ -163,8 +199,8 @@ impl Keyring {
             .collect();
         let drawn = candidates
             .iter()
-            .filter(|candidate| self.drawn.contains(*candidate))
-            .copied()
+            .map(|candidate| candidate.relay.key)
+            .filter(|candidate| self.drawn.contains(candidate))
             .collect();
         (drawn, dropped)
     }
@@ -362,8 +398,7 @@ impl DeliveryChecker {
     /// (`Keyring::draw`). The keys of members not drawn are dropped, but for the check in flight,
     /// which reads its answers under them still.
     pub fn draw(&mut self, candidates: Vec<Member>, now_ms: u64) -> Vec<Member> {
-        let keys: Vec<PublicKey> = candidates.iter().map(|member| member.relay.key).collect();
-        let (drawn, dropped) = self.keyring.draw(&keys, now_ms);
+        let (drawn, dropped) = self.keyring.draw(&candidates, now_ms);
         if let Some(pending) = &mut self.pending {
             pending.dropped.extend(dropped);
         }
@@ -645,7 +680,6 @@ pub fn members(
     let mut candidates = candidates(offers, area, exclude, observed, now_ms);
     candidates.retain(|member| keyed(&member.relay.key));
     shuffle(&mut candidates);
-    let known = |member: &Member| member.network != 0 && member.host.is_some();
     let mut chosen: Vec<Member> = Vec::new();
     for member in candidates.iter().filter(|member| known(member)) {
         if chosen.len() < ASKED
@@ -666,6 +700,12 @@ pub fn members(
         chosen.push(unknown.clone());
     }
     chosen
+}
+
+/// Whether `member`'s network is known: it declares one and the feeder observed its address, as
+/// `rendezvous::distinct_networks` needs of both sides to call two networks distinct.
+fn known(member: &Member) -> bool {
+    member.network != 0 && member.host.is_some()
 }
 
 /// Every member of `area`'s sharing group the feeder may ask (the offers `members` chooses from,
@@ -807,6 +847,8 @@ mod tests {
 
     struct Setup {
         checker: DeliveryChecker,
+        /// The members drawn so far: every draw is of every candidate, as the feeder's is.
+        members: Vec<Member>,
         feeder: Identity,
         query: DeliveryQuery,
         batches: Vec<Batch>,
@@ -834,10 +876,17 @@ mod tests {
             Ok(member)
         }
 
-        /// Draws `member` (a place is left) and gives it its keys at `now_ms`.
+        /// Draws `member` beside the members so far (a place is left) and gives it its keys at
+        /// `now_ms`.
         fn give_keys(&mut self, member: PublicKey, now_ms: u64) -> Result<(), String> {
-            let drawn = self.checker.draw(vec![member_at(member)], now_ms);
-            assert_eq!(drawn.len(), 1, "a place was left");
+            if !self.members.iter().any(|known| known.relay.key == member) {
+                self.members.push(member_at(member));
+            }
+            let drawn = self.checker.draw(self.members.clone(), now_ms);
+            assert!(
+                drawn.iter().any(|drawn| drawn.relay.key == member),
+                "a place was left"
+            );
             self.checker
                 .keyring
                 .grant(&self.feeder, member, now_ms)
@@ -938,6 +987,7 @@ mod tests {
         assert_eq!(checker.checked_relays(), vec![relay]);
         Ok(Setup {
             checker,
+            members: Vec::new(),
             feeder,
             query,
             batches,
@@ -1232,7 +1282,7 @@ mod tests {
         let member = identity()?.public();
         let mut keyring = Keyring::default();
         let start = 100 * KEY_PERIOD_MS;
-        keyring.draw(&[member], start);
+        keyring.draw(&[member_at(member)], start);
         let first = keyring
             .grant(&feeder, member, start)
             .ok_or("no grant")?
@@ -1246,7 +1296,7 @@ mod tests {
         assert_eq!((first.current, first.next), (again.current, again.next));
         assert!(keyring.keyed(&member, start));
         assert!(!keyring.keyed(&identity()?.public(), start));
-        keyring.draw(&[member], start + KEY_PERIOD_MS);
+        keyring.draw(&[member_at(member)], start + KEY_PERIOD_MS);
         let next = keyring
             .grant(&feeder, member, start + KEY_PERIOD_MS)
             .ok_or("no grant")?
@@ -1255,7 +1305,7 @@ mod tests {
         assert_eq!(next.current, first.next);
         assert_ne!(next.next, first.next);
         // Three periods on, the first key is forgotten.
-        keyring.draw(&[member], start + 3 * KEY_PERIOD_MS);
+        keyring.draw(&[member_at(member)], start + 3 * KEY_PERIOD_MS);
         keyring.grant(&feeder, member, start + 3 * KEY_PERIOD_MS);
         assert!(keyring.key(&member, first.current.id).is_none());
         assert!(keyring.key(&member, first.current.id + 1).is_some());
@@ -1277,13 +1327,15 @@ mod tests {
         let start = 100 * KEY_PERIOD_MS;
         // The Sybils first: every place is theirs for this period, and the honest member, come a
         // moment later, has none.
-        let (drawn, _) = keyring.draw(&sybils, start);
+        let sybil_members: Vec<Member> = sybils.iter().copied().map(member_at).collect();
+        let (drawn, _) = keyring.draw(&sybil_members, start);
         assert_eq!(drawn.len(), KEYED_MEMBERS);
         for sybil in &sybils {
             keyring.grant(&feeder, *sybil, start).ok_or("no grant")?;
         }
         let everyone: Vec<PublicKey> = sybils.iter().copied().chain([honest]).collect();
-        let (drawn, _) = keyring.draw(&everyone, start + 1);
+        let everyone_members: Vec<Member> = everyone.iter().copied().map(member_at).collect();
+        let (drawn, _) = keyring.draw(&everyone_members, start + 1);
         assert!(!drawn.contains(&honest));
         assert!(keyring.grant(&feeder, honest, start + 1).is_none());
         // Each period after, a fresh draw: the honest member is drawn in turn (here each period
@@ -1292,7 +1344,7 @@ mod tests {
         let mut honest_drawn = 0;
         for period in 1..=40 {
             let now = start + period * KEY_PERIOD_MS;
-            let (drawn, dropped) = keyring.draw(&everyone, now);
+            let (drawn, dropped) = keyring.draw(&everyone_members, now);
             assert_eq!(drawn.len(), KEYED_MEMBERS);
             let left_out: Vec<PublicKey> = everyone
                 .iter()
@@ -1581,6 +1633,73 @@ mod tests {
                     .all(|member| member.relay.key != checked.public())
             );
         }
+        Ok(())
+    }
+
+    /// A member on network `network`, observed at `host`.
+    fn member_on(network: u32, host: [u8; 4]) -> Result<Member, String> {
+        Ok(Member {
+            relay: RelayAddress {
+                key: identity()?.public(),
+                address: "member.example:1".to_owned(),
+            },
+            network,
+            host: Some(IpAddr::from(host)),
+        })
+    }
+
+    /// Sweep 3, N19: many keys on a few networks win those networks' places and no more. Two
+    /// hostile networks of thirty members each beside six honest networks of one: every period,
+    /// every honest network is drawn (and so can be asked), and each hostile network holds what
+    /// is left beside its one place first.
+    #[test]
+    fn the_draw_takes_one_member_per_network_before_any_second() -> Result<(), String> {
+        let honest: Vec<Member> = (0..6_u8)
+            .map(|at| member_on(64_600 + u32::from(at), [198, 18, at, 1]))
+            .collect::<Result<_, _>>()?;
+        let mut everyone = honest.clone();
+        for hostile in 0..2_u8 {
+            for at in 0..30_u8 {
+                everyone.push(member_on(
+                    64_900 + u32::from(hostile),
+                    [203, hostile, 113, at],
+                )?);
+            }
+        }
+        let mut keyring = Keyring::default();
+        let start = 100 * KEY_PERIOD_MS;
+        for period in 0..20 {
+            let (drawn, _) = keyring.draw(&everyone, start + period * KEY_PERIOD_MS);
+            assert_eq!(drawn.len(), KEYED_MEMBERS);
+            for member in &honest {
+                assert!(
+                    drawn.contains(&member.relay.key),
+                    "an honest network was not drawn in period {period}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Sweep 3, N19: a member drawn whose offer has expired (no longer a candidate) gives its
+    /// place up within the period, and the place goes to one that is.
+    #[test]
+    fn a_member_no_longer_a_candidate_gives_its_place_up() -> Result<(), String> {
+        let members: Vec<Member> = (0..KEYED_MEMBERS)
+            .map(|_| identity().map(|member| member_at(member.public())))
+            .collect::<Result<_, _>>()?;
+        let mut keyring = Keyring::default();
+        let start = 100 * KEY_PERIOD_MS;
+        let (drawn, _) = keyring.draw(&members, start);
+        assert_eq!(drawn.len(), KEYED_MEMBERS);
+        // One offer expires, and a newcomer to the area is a candidate a moment later.
+        let newcomer = member_at(identity()?.public());
+        let mut now_candidates: Vec<Member> = members[1..].to_vec();
+        now_candidates.push(newcomer.clone());
+        let (drawn, _) = keyring.draw(&now_candidates, start + 1);
+        assert!(drawn.contains(&newcomer.relay.key));
+        assert!(!keyring.drawn.contains(&members[0].relay.key));
+        assert_eq!(keyring.drawn.len(), KEYED_MEMBERS);
         Ok(())
     }
 }

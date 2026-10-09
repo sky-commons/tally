@@ -271,8 +271,8 @@ it sends out is its own to cap.
 
 As built (2026-10-07), one `tally-relay` binary does all of it: `--area CELL` (repeatable) names
 the areas it takes, `--advertise HOST:PORT=KEY` where it answers, `--network ASN` the network it
-is on; MLAT runs in-process on `--mlat-threads` threads (every core by default, 0 for none) for
-the areas it is chosen to solve; `--no-relay-duties` turns off accepting feeders, MLAT and seeding
+is on; MLAT runs in-process (on the threads the cores' plan leaves it, RFC-0181 §10, "The cores";
+`--no-mlat` for none) for the areas it is chosen to solve; `--no-relay-duties` turns off accepting feeders, MLAT and seeding
 for a relay that only shares; `--world` and `--world-precise` gather the two world products
 (RFC-0174 §2.11). A relay whose signed offer it verified may connect to exchange its sharing
 group's records without being named by `--accept-relay`.

@@ -253,7 +253,10 @@ fn solve_one(
 }
 
 /// Runs `work` over `threads` contiguous runs, each with its own report, and puts the results
-/// back in order: the same whatever the cut.
+/// back in order: the same whatever the cut. The runs go on threads under the gate of the thread
+/// asking, if any (`tally_mlat_solver::gate`): a host's every kind of MLAT work spread over no more
+/// threads than its plan gave MLAT, background work letting provisional work in between two items.
+/// One run is done here, on no thread of its own.
 pub fn parallel<T: Sync, R: Send, P: Part>(
     threads: usize,
     work: &[T],
@@ -261,22 +264,17 @@ pub fn parallel<T: Sync, R: Send, P: Part>(
 ) -> (Vec<R>, P) {
     let threads = threads.clamp(1, work.len().max(1));
     let size = work.len().div_ceil(threads).max(1);
-    let runs: Vec<(Vec<R>, P)> = std::thread::scope(|scope| {
-        let handles: Vec<_> = work
-            .chunks(size)
-            .map(|chunk| {
-                let run = &run;
-                scope.spawn(move || {
-                    let mut report = P::default();
-                    let out = chunk.iter().map(|item| run(item, &mut report)).collect();
-                    (out, report)
-                })
+    let chunks: Vec<&[T]> = work.chunks(size).collect();
+    let runs: Vec<(Vec<R>, P)> = tally_mlat_solver::gate::on_threads(chunks, |chunk| {
+        let mut report = P::default();
+        let out = chunk
+            .iter()
+            .map(|item| {
+                tally_mlat_solver::gate::checkpoint();
+                run(item, &mut report)
             })
             .collect();
-        handles
-            .into_iter()
-            .map(|handle| handle.join().unwrap_or_else(|_| (Vec::new(), P::default())))
-            .collect()
+        (out, report)
     });
     let mut report = P::default();
     let mut out = Vec::with_capacity(work.len());

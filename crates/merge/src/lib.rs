@@ -770,7 +770,9 @@ impl Merge {
                 let Ok(content) = batch.content() else {
                     return Ok(Ingested::Ignored);
                 };
-                let added = self.held.add(key, &content);
+                // Taken in at the client's clock: raw of a bin further ahead of it than
+                // `held::AHEAD_MS` is refused here as every relay refuses it by its stamp.
+                let added = self.held.add(key, &content, now_ms);
                 // Bins are sealed when a model of their window is checked (its engine solved it,
                 // so its raw is in); what no window can still need is forgotten.
                 self.held

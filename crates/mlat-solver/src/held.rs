@@ -42,8 +42,10 @@
 //!   by the stamp watermark) decides it by the batch's ingest stamp instead: raw stamped at or after
 //!   the step that takes its bin is late whenever it arrives, so a batch that raced ahead of that
 //!   step is late exactly as one that came after it, and what is sealed never depends on which won.
-//! - **Never ahead of the stamp** ([`AHEAD_MS`]): the same holder opens no bin that begins more
-//!   than `AHEAD_MS` past the batch's stamp. A bin comes from the feeder's own signed wall clock,
+//! - **Never ahead of the stamp** ([`AHEAD_MS`]): no holder opens a bin that begins more than
+//!   `AHEAD_MS` past the batch's stamp, however it was built: every way in takes the stamp (a
+//!   decoded batch carries its own, a batch's content is handed in with its holder's), so a
+//!   reference engine and a hosted one refuse the same raw. A bin comes from the feeder's own signed wall clock,
 //!   which nothing else bounds, and a bin the steps never reach is never taken: a receiver stamping
 //!   its batches in the future would hold its open raw there for ever, and fill the store every
 //!   honest receiver's open raw is charged to. Such raw is refused and counted
@@ -774,8 +776,9 @@ impl Open {
         self.through
     }
 
-    /// Takes the wanted Mode S receptions of one verified batch of `receiver`.
-    pub fn add(&mut self, receiver: PublicKey, content: &BatchContent) -> Added {
+    /// Takes the wanted Mode S receptions of one verified batch of `receiver`, taken in at
+    /// `stamp_ms` (its ingest stamp, module docs, Never ahead).
+    pub fn add(&mut self, receiver: PublicKey, content: &BatchContent, stamp_ms: u64) -> Added {
         let room = self.limits.bytes;
         self.add_observations(
             receiver,
@@ -783,7 +786,7 @@ impl Open {
             content.wall_ms,
             content.observations.iter().map(ObsView::from),
             room,
-            None,
+            stamp_ms,
             &mut |_| true,
         )
     }
@@ -804,7 +807,7 @@ impl Open {
             decoded.wall_ms(),
             decoded.views(),
             room,
-            Some(decoded.stamp_ms()),
+            decoded.stamp_ms(),
             &mut |_| true,
         )
     }
@@ -824,36 +827,15 @@ impl Open {
             decoded.wall_ms(),
             decoded.views(),
             room,
-            Some(decoded.stamp_ms()),
-            take,
-        )
-    }
-
-    /// As `add_decoded_taking`, the batch taken as stamped `stamp_ms` (never earlier than its own
-    /// stamp): for a holder that takes a batch later than it came, as of the step that let it in (a
-    /// relay's raw shards taking a batch that waited for its receiver's description), so its raw is
-    /// late, or ahead, by that step and not by when it first came.
-    pub fn add_decoded_taking_at(
-        &mut self,
-        decoded: &Decoded,
-        stamp_ms: u64,
-        take: &mut dyn FnMut(usize) -> bool,
-    ) -> Added {
-        let room = self.limits.bytes;
-        self.add_observations(
-            decoded.receiver(),
-            decoded.counter_epoch(),
-            decoded.wall_ms(),
-            decoded.views(),
-            room,
-            Some(stamp_ms.max(decoded.stamp_ms())),
+            decoded.stamp_ms(),
             take,
         )
     }
 
     /// `room`: the bytes these open bins may grow to. `stamp_ms`: the batch's ingest stamp, which
-    /// decides lateness when the holder closes by one ([`Closing`]). `take`: asked for every byte
-    /// before it is allocated.
+    /// every way in passes (module docs, Never ahead): it bounds how far ahead a bin may open for
+    /// every holder alike, however it was built, and decides lateness when the holder closes by
+    /// one ([`Closing`]). `take`: asked for every byte before it is allocated.
     #[allow(clippy::too_many_arguments)]
     fn add_observations<'a>(
         &mut self,
@@ -862,7 +844,7 @@ impl Open {
         wall_ms: u64,
         observations: impl Iterator<Item = ObsView<'a>>,
         room: usize,
-        stamp_ms: Option<u64>,
+        stamp_ms: u64,
         take: &mut dyn FnMut(usize) -> bool,
     ) -> Added {
         let mut added = Added::default();
@@ -878,13 +860,13 @@ impl Open {
                 keep
             })
             .collect();
-        let (late_by_stamp, ahead) = match (self.closing, stamp_ms) {
-            (Some(closing), Some(stamp_ms)) => (
-                stamp_ms >= closing.close_at(bin),
-                bin > bin_of(stamp_ms.saturating_add(AHEAD_MS)),
-            ),
-            _ => (false, false),
-        };
+        // Never ahead, for every holder: the stamp is every way in's, so whether a bin too far
+        // ahead opens never depends on how the holder was built (a reference engine and a hosted
+        // one refuse the same raw).
+        let ahead = bin > bin_of(stamp_ms.saturating_add(AHEAD_MS));
+        let late_by_stamp = self
+            .closing
+            .is_some_and(|closing| stamp_ms >= closing.close_at(bin));
         if ahead {
             added.ahead = wanted.len();
             return added;
@@ -1043,25 +1025,10 @@ fn runs<T>(
 }
 
 /// Runs `work` on each of `inputs` on a thread of its own (here, when there is one), and returns
-/// the results in the inputs' order.
+/// the results in the inputs' order: under the gate of the thread asking, if any
+/// (`crate::gate::on_threads`), so a host's seals spread over no more threads than its plan gave it.
 fn on_threads<I: Send, R: Send>(inputs: Vec<I>, work: impl Fn(I) -> R + Sync) -> Vec<R> {
-    if inputs.len() <= 1 {
-        return inputs.into_iter().map(work).collect();
-    }
-    let work = &work;
-    std::thread::scope(|scope| {
-        let handles: Vec<_> = inputs
-            .into_iter()
-            .map(|input| scope.spawn(move || work(input)))
-            .collect();
-        handles
-            .into_iter()
-            .map(|handle| match handle.join() {
-                Ok(result) => result,
-                Err(panic) => std::panic::resume_unwind(panic),
-            })
-            .collect()
-    })
+    crate::gate::on_threads(inputs, work)
 }
 
 /// Splits `items` into owned runs at `runs`' boundaries.
@@ -1456,13 +1423,8 @@ impl Bin {
         self.find(id).is_some()
     }
 
-    /// This bin's raw, open again without `receiver`: what forgetting a receiver reseals.
-    fn reopen_without(&self, receiver: &PublicKey) -> Fragment {
-        let skip = self.receiver(receiver);
-        self.reopen_without_any(|index| Some(index) == skip)
-    }
-
-    /// This bin's raw, open again without the receivers (by index) `skip` names.
+    /// This bin's raw, open again without the receivers (by index) `skip` names: what forgetting
+    /// receivers reseals.
     fn reopen_without_any(&self, skip: impl Fn(u32) -> bool) -> Fragment {
         let mut fragment = Fragment::new(self.bin);
         for record in &self.records {
@@ -1605,20 +1567,46 @@ impl SealedBins {
         }
     }
 
-    /// Forgets `receiver` in every sealed bin (it left, or became unusable): the bins that held
-    /// it are sealed again without it, on up to `threads` threads, each built before it replaces
-    /// the old one, so a reader sees one bin or the other, never none. Rare.
+    /// Forgets `receiver` in every sealed bin (it left, or became unusable): as
+    /// [`SealedBins::forget_receivers`] of it alone.
     pub fn forget_receiver(&self, receiver: &PublicKey, threads: usize) {
+        self.forget_receivers(std::slice::from_ref(receiver), threads);
+    }
+
+    /// Forgets every one of `receivers` in every sealed bin (they left, or became unusable): each
+    /// bin that held any of them is sealed again once, without all of them (`without`), and
+    /// replaces the old one, so a reader sees one bin or the other, never none. Rare, and costs a
+    /// seal of each bin it touches, however many receivers left at once.
+    pub fn forget_receivers(&self, receivers: &[PublicKey], threads: usize) {
+        for bin in self.without(receivers, threads) {
+            self.insert(bin);
+        }
+    }
+
+    /// Each sealed bin that holds any of `receivers`, sealed again once without all of them, on up
+    /// to `threads` threads: for a holder that forgets them off its own thread and replaces the
+    /// bins on it (`insert`). Each is no larger than the bin it replaces.
+    pub fn without(&self, receivers: &[PublicKey], threads: usize) -> Vec<Bin> {
+        if receivers.is_empty() {
+            return Vec::new();
+        }
         let holding: Vec<Arc<Bin>> = self
             .read()
             .values()
-            .filter(|bin| bin.receiver(receiver).is_some())
+            .filter(|bin| receivers.iter().any(|key| bin.receiver(key).is_some()))
             .cloned()
             .collect();
-        for old in holding {
-            let fragment = old.reopen_without(receiver);
-            self.insert(Bin::seal_from(old.bin, vec![fragment], threads));
-        }
+        holding
+            .into_iter()
+            .map(|old| {
+                let skip: Vec<u32> = receivers
+                    .iter()
+                    .filter_map(|key| old.receiver(key))
+                    .collect();
+                let fragment = old.reopen_without_any(|index| skip.contains(&index));
+                Bin::seal_from(old.bin, vec![fragment], threads)
+            })
+            .collect()
     }
 }
 
@@ -1698,8 +1686,9 @@ impl Held {
         self.limits.bytes.saturating_sub(self.sealed.bytes())
     }
 
-    /// Takes the wanted Mode S receptions of one verified batch of `receiver`.
-    pub fn add(&mut self, receiver: PublicKey, content: &BatchContent) -> Added {
+    /// Takes the wanted Mode S receptions of one verified batch of `receiver`, taken in at
+    /// `stamp_ms` (its holder's clock when it took it, module docs, Never ahead).
+    pub fn add(&mut self, receiver: PublicKey, content: &BatchContent, stamp_ms: u64) -> Added {
         let room = self.room();
         self.open.add_observations(
             receiver,
@@ -1707,7 +1696,7 @@ impl Held {
             content.wall_ms,
             content.observations.iter().map(ObsView::from),
             room,
-            None,
+            stamp_ms,
             &mut |_| true,
         )
     }
@@ -1721,14 +1710,14 @@ impl Held {
             decoded.wall_ms(),
             decoded.views(),
             room,
-            None,
+            decoded.stamp_ms(),
             &mut |_| true,
         )
     }
 
-    /// Takes one reception, as `add` would within a batch of it: what a simulator at world scale
-    /// feeds without building batches.
-    pub fn add_one(&mut self, reception: &Reception) -> Added {
+    /// Takes one reception, as `add` would within a batch of it taken in at `stamp_ms`: what a
+    /// simulator at world scale feeds without building batches.
+    pub fn add_one(&mut self, reception: &Reception, stamp_ms: u64) -> Added {
         let room = self.room();
         self.open.add_observations(
             reception.receiver,
@@ -1736,7 +1725,7 @@ impl Held {
             reception.wall_ms,
             std::iter::once(ObsView::from(&reception.observation)),
             room,
-            None,
+            stamp_ms,
             &mut |_| true,
         )
     }
@@ -1809,6 +1798,7 @@ pub fn bins_of(receptions: &[Reception]) -> BTreeMap<i64, Arc<Bin>> {
                 previous: [0; 32],
                 observations,
             },
+            wall_ms,
         );
     }
     held.seal_through(i64::MAX - 1);

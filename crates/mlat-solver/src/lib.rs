@@ -520,6 +520,7 @@
 
 pub mod banded;
 pub mod clock;
+pub mod gate;
 pub mod geo;
 pub mod group;
 pub mod held;

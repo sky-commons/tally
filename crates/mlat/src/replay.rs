@@ -24,6 +24,18 @@ use tally_wire::Record;
 
 use crate::engine::Engine;
 
+/// When a record a receiver sent reaches an engine at the soonest, by the engine's clock: a batch
+/// when its receiver sealed it (its own wall clock), a description at once. For a test that hands
+/// an engine every record at once: an engine refuses raw of a bin too far ahead of the clock it
+/// takes the batch at (`tally_mlat_solver::held::AHEAD_MS`), so none is handed raw from the
+/// future.
+pub fn sent_ms(record: &Record) -> u64 {
+    match record {
+        Record::Batch(batch) => batch.content().map_or(0, |content| content.wall_ms),
+        _ => 0,
+    }
+}
+
 /// What `simulation`'s receivers publish, each record with when it reaches the engine: every
 /// description at the start, then each batch at its seal time plus its path's delay. Sorted by
 /// arrival. The simulation's receptions are rewritten in place to the wall clocks of the batches
@@ -72,20 +84,6 @@ pub fn arrivals(simulation: &mut Simulation, seed: u64) -> Result<Vec<(u64, Reco
     }
     out.sort_by_key(|(at, _)| *at);
     Ok(out)
-}
-
-/// What orders two descriptions taking effect at one step after their stamps: the receiver's key,
-/// then the bytes (a relay applies them in the same order).
-fn description_key(record: &Record) -> (Vec<u8>, Vec<u8>) {
-    match record {
-        Record::ReceiverInfo(info) => (
-            info.receiver()
-                .map(|key| key.as_bytes().to_vec())
-                .unwrap_or_default(),
-            info.as_bytes().to_vec(),
-        ),
-        _ => (Vec::new(), Vec::new()),
-    }
 }
 
 /// `delivered` (`arrivals` of `simulation`) with two receivers' descriptions moved midway, for a
@@ -160,20 +158,19 @@ pub fn replay(
     let mut next = 0;
     let mut published = Vec::new();
     let mut now = (first / tick_ms + 1) * tick_ms;
-    let mut descriptions: Vec<(u64, &Record)> = Vec::new();
+    let mut descriptions: Vec<(u64, tally_wire::ReceiverInfo)> = Vec::new();
     while now <= until_ms {
         while let Some((at, record)) = arrivals.get(next).filter(|(at, _)| *at < now) {
-            if matches!(record, Record::ReceiverInfo(_)) {
-                descriptions.push((*at, record));
+            if let Record::ReceiverInfo(info) = record {
+                descriptions.push((*at, info.clone()));
             } else {
                 engine.ingest(record, *at)?;
             }
             next += 1;
         }
         engine.expire_orphans(now);
-        descriptions.sort_by_cached_key(|(at, record)| (*at, description_key(record)));
-        for (at, record) in descriptions.drain(..) {
-            engine.ingest(record, at)?;
+        for (at, info) in crate::intake::taking_effect(descriptions.drain(..)) {
+            engine.ingest(&Record::ReceiverInfo(info), at)?;
         }
         for record in engine.provisional_step(now, now) {
             published.push((now, record));

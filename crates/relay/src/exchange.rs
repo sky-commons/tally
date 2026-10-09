@@ -31,6 +31,13 @@
 //! any part of it (RFC-0181 §10). The charge travels with the epoch's batches to the sealer and is
 //! released when the sealer is done with them.
 //!
+//! A batch's slices on other threads keep its decode alive, so a slice let go is not a decode let
+//! go: what a slice let go was charged (its share in the epoch, or its ingest charge) is held by
+//! its thread ([`Held`]) for as long as anything else holds the decode, and let go once nothing
+//! does. Before, a thread that refused an epoch released its slices' shares at once while another
+//! thread's slices of the same batches held them until the epoch closed there: hundreds of
+//! kilobytes of decoded batches alive, under a flood, that no store was charged.
+//!
 //! Whether an epoch is admitted is settled once, for every thread, before any commits it
 //! ([`Admission`]): each thread decides its part against what it remembers and holds the
 //! fingerprints it would add aside (its generation of that epoch), and only when every thread has
@@ -467,15 +474,53 @@ pub struct Frozen {
     pub regional: Vec<(Region, u32, u32)>,
 }
 
+/// What one reception may cost an epoch's word beside its batch's decode, at most: its place in
+/// the stream's decisions and in its area's (`Frozen::stream`, `Frozen::regional`), charged with
+/// the epoch's batches to `Store::Epochs` while the word waits for the sealer.
+pub const DECISION_BYTES_PER_RECEPTION: usize =
+    std::mem::size_of::<(u32, u32)>() + std::mem::size_of::<(Region, u32, u32)>();
+
+impl Frozen {
+    /// What a word holds beside its batches' decodes: itself, and its lists of batches and of
+    /// decisions, at `batches`, `stream` and `regional` entries.
+    pub const fn bytes_for(batches: usize, stream: usize, regional: usize) -> usize {
+        std::mem::size_of::<Self>()
+            + batches * std::mem::size_of::<Arc<Decoded>>()
+            + stream * std::mem::size_of::<(u32, u32)>()
+            + regional * std::mem::size_of::<(Region, u32, u32)>()
+    }
+
+    /// What it holds beside its batches' decodes now, by its lists' capacities.
+    pub fn own_bytes(&self) -> usize {
+        Self::bytes_for(
+            self.batches.capacity(),
+            self.stream.capacity(),
+            self.regional.capacity(),
+        )
+    }
+}
+
 /// Where closed epochs go: the sealer (`seal::Coordinator`). The word back when it could not take
 /// it now (its queue is full): the exchange holds it, charged, and offers it again, in order.
 pub type Sink = Arc<dyn Fn(Frozen) -> Result<(), Box<Frozen>> + Send + Sync>;
 
 /// How every message thread settles each epoch once ([`Admission`]), and hands the sealer one word
 /// for it: the epochs' parts posted, and each thread's progress.
+///
+/// What waits for the sealer is charged until the sealer takes it (`Store::Epochs`): an epoch's
+/// word its batches and its lists of decisions (each thread's part charged them before it decided
+/// any, and the word is merged within what they were charged), a refused epoch's word its own
+/// bytes. A refused word with no room is not queued: the sealer reads the gap in the words'
+/// numbers as an epoch lost on the way, refuses it and counts it (`seal::Coordinator`), as it does
+/// a word its queue had no room for. A word that only says how far a thread has closed replaces
+/// that thread's last such word when nothing was queued after it, so a stalled sealer is owed at
+/// most one of them per thread beside each epoch's. Before, every word waited uncharged, and a
+/// sealer behind for an hour was owed some 3,600 epochs' words and a marker per thread for each.
 pub struct Admission {
     threads: usize,
     sink: Sink,
+    /// What the words waiting for the sealer are charged to (`Store::Epochs`).
+    epochs: Arc<Gauge>,
     ledger: Mutex<Ledger>,
     /// Words waiting for the sealer: a flush takes the ledger only when there are any.
     waiting: AtomicUsize,
@@ -509,11 +554,13 @@ struct Settling {
 }
 
 impl Admission {
-    pub fn new(threads: usize, sink: Sink) -> Arc<Self> {
+    /// Settling for `threads` message threads, words for `sink`, those waiting charged to `epochs`.
+    pub fn new(threads: usize, sink: Sink, epochs: Arc<Gauge>) -> Arc<Self> {
         let threads = threads.max(1);
         Arc::new(Self {
             threads,
             sink,
+            epochs,
             ledger: Mutex::new(Ledger {
                 through: vec![None; threads],
                 verdicts: vec![None; threads],
@@ -580,7 +627,7 @@ impl Admission {
                     }
                     let (epoch, settling) = entry.remove_entry();
                     let word = settle(epoch, settling, ledger);
-                    ledger.push(word);
+                    ledger.push(word, &self.epochs);
                 }
                 ledger.frontier = Some(frontier);
                 for thread in 0..self.threads {
@@ -590,7 +637,7 @@ impl Admission {
                         closed_before: frontier,
                         ..Frozen::default()
                     };
-                    ledger.push(marker);
+                    ledger.push(marker, &self.epochs);
                 }
             }
             self.waiting.store(ledger.outbox.len(), Ordering::Release);
@@ -629,9 +676,39 @@ impl Admission {
 }
 
 impl Ledger {
-    /// Queues `word` for the sealer, with the late receptions not yet told.
-    fn push(&mut self, mut word: Frozen) {
-        word.late = std::mem::take(&mut self.late);
+    /// Queues `word` for the sealer, with the late receptions not yet told, charged to `epochs`
+    /// while it waits. A marker (no epoch) replaces its thread's marker queued after the last
+    /// epoch word, if any: the newer says all the older did. A refused epoch's word is charged its
+    /// own bytes, and with no room is not queued: the gap in thread 0's numbers it leaves tells the
+    /// sealer an epoch was lost, which it refuses and counts. An admitted epoch's word comes
+    /// charged (`settle`).
+    fn push(&mut self, mut word: Frozen, epochs: &Arc<Gauge>) {
+        let late = std::mem::take(&mut self.late);
+        if word.epoch.is_none() {
+            let since_last_epoch = self
+                .outbox
+                .iter_mut()
+                .rev()
+                .take_while(|queued| queued.epoch.is_none());
+            for queued in since_last_epoch {
+                if queued.thread == word.thread {
+                    queued.seq = queued.seq.max(word.seq);
+                    queued.closed_before = queued.closed_before.max(word.closed_before);
+                    queued.late += late;
+                    return;
+                }
+            }
+        } else if word.refused && word.charge.bytes() == 0 {
+            match epochs.try_charge(std::mem::size_of::<Frozen>()) {
+                Some(charge) => word.charge = charge,
+                None => {
+                    // Not queued: what it would have said of late receptions waits for the next.
+                    self.late += late;
+                    return;
+                }
+            }
+        }
+        word.late = late;
         self.outbox.push_back(word);
     }
 }
@@ -649,6 +726,14 @@ fn settle(epoch: Epoch, settling: Settling, ledger: &mut Ledger) -> Frozen {
     ledger.parts += 1;
     let mut admitted = !settling.refused;
     if admitted {
+        // Each list exactly as long as its parts' together: within what the parts were charged
+        // for theirs, which the word takes on.
+        word.batches
+            .reserve_exact(settling.parts.iter().map(|part| part.batches.len()).sum());
+        word.stream
+            .reserve_exact(settling.parts.iter().map(|part| part.stream.len()).sum());
+        word.regional
+            .reserve_exact(settling.parts.iter().map(|part| part.regional.len()).sum());
         for mut part in settling.parts {
             let at = word.batches.len() as u32;
             word.stream.extend(
@@ -711,6 +796,8 @@ pub struct MessageThread {
     /// after, against what that one kept.
     awaiting: Option<Epoch>,
     admission: Arc<Admission>,
+    /// What the slices it let go were charged, while their decodes live on elsewhere.
+    held: Held,
 }
 
 impl MessageThread {
@@ -735,10 +822,12 @@ impl MessageThread {
             closed_to: None,
             awaiting: None,
             admission,
+            held: Held::default(),
         }
     }
 
     pub fn take(&mut self, producer: usize, envelope: Envelope) {
+        self.held.sweep();
         match envelope {
             Envelope::Slice(slice, in_flight) => {
                 let epoch = slice.epoch();
@@ -754,16 +843,19 @@ impl MessageThread {
                     refused: false,
                 });
                 if open.refused {
+                    self.held.let_go(&slice, in_flight);
                     return;
                 }
                 if open.charge.try_grow(slice.share()) {
+                    open.charge.cover(&slice.decoded);
                     open.slices.push(slice);
+                    // The epoch holds its bytes now: the ingest charge is done.
+                    drop(in_flight);
                 } else {
                     // Past the budget: the whole epoch is refused, never a part of it.
-                    open.refuse();
+                    open.refuse(&mut self.held);
+                    self.held.let_go(&slice, in_flight);
                 }
-                // The epoch holds its bytes now (or let them go): the ingest charge is done.
-                drop(in_flight);
             }
             Envelope::Tick(stamp) => {
                 let watermark = self.watermark.tick(producer, stamp);
@@ -783,6 +875,7 @@ impl MessageThread {
     /// Takes up what waits on the other threads: an epoch they have settled since, and the words
     /// the sealer could not take before. Called between envelopes, and when none comes.
     pub fn resume(&mut self) {
+        self.held.sweep();
         self.settle();
         self.admission.flush();
     }
@@ -854,14 +947,35 @@ impl MessageThread {
             .saturating_mul(2)
             .saturating_mul(DEDUP_ENTRY_BYTES);
         let more = needed.saturating_sub(self.dedup.bytes());
-        let room = !open.refused && self.dedup.try_grow(more);
+        let Open {
+            mut slices,
+            mut charge,
+            refused,
+        } = open;
+        // And room for its word: its lists of batches and of decisions as long as they can be
+        // (every reception kept for the stream and for its area), charged with its batches before
+        // any is decided, so what waits for the sealer is charged all the way (`Admission`).
+        let batches_bytes = charge.bytes();
+        let in_areas: usize = slices
+            .iter()
+            .filter(|slice| slice.area.is_some())
+            .map(Slice::receptions)
+            .sum();
+        let room = !refused
+            && self.dedup.try_grow(more)
+            && charge.try_grow(Frozen::bytes_for(slices.len(), receptions, in_areas));
         if !room {
+            self.dedup
+                .shrink_to(self.held_slots().saturating_mul(DEDUP_ENTRY_BYTES));
+            Open {
+                slices,
+                charge,
+                refused,
+            }
+            .refuse(&mut self.held);
             self.admission.post(self.thread, epoch, None);
             return false;
         }
-        let Open {
-            mut slices, charge, ..
-        } = open;
         slices.sort_by(|a, b| {
             crate::seal::canonical(&a.decoded).cmp(&crate::seal::canonical(&b.decoded))
         });
@@ -869,8 +983,9 @@ impl MessageThread {
             thread: self.thread,
             epoch: Some(epoch),
             closed_before: epoch + 1,
-            charge,
             batches: Vec::with_capacity(slices.len()),
+            stream: Vec::with_capacity(receptions),
+            regional: Vec::with_capacity(in_areas),
             ..Frozen::default()
         };
         for (at, slice) in slices.iter().enumerate() {
@@ -889,6 +1004,11 @@ impl MessageThread {
             }
         }
         frozen.batches = slices.into_iter().map(|slice| slice.decoded).collect();
+        // The lists as decided, and their charge cut to them.
+        frozen.stream.shrink_to_fit();
+        frozen.regional.shrink_to_fit();
+        charge.shrink_to(batches_bytes + frozen.own_bytes());
+        frozen.charge = charge;
         // What the tables hold now, no more.
         self.dedup
             .shrink_to(self.held_slots().saturating_mul(DEDUP_ENTRY_BYTES));
@@ -915,11 +1035,62 @@ struct Open {
 }
 
 impl Open {
-    /// Refused whole: what it held is let go now.
-    fn refuse(&mut self) {
+    /// Refused whole: its slices are let go now, and what each was charged with them, but for a
+    /// slice whose decode something else still holds (another thread's slice of its batch): that
+    /// share is held while it does (`held`).
+    fn refuse(&mut self, held: &mut Held) {
         self.refused = true;
-        self.slices = Vec::new();
+        for slice in std::mem::take(&mut self.slices) {
+            // Its share covers its own decode, not every decode the epoch held.
+            let mut share = self.charge.split(slice.share());
+            share.uncover();
+            share.cover(&slice.decoded);
+            held.keep(&slice, Some(share), None);
+        }
         self.charge.shrink_to(0);
+        // It holds no decode now: a refused epoch stays open, holding nothing, until it closes.
+        self.charge.uncover();
+    }
+}
+
+/// What the slices a thread let go were charged, each kept while anything else still holds its
+/// decode (another thread's slice of its batch, another stage) and let go once nothing does
+/// (`sweep`, between envelopes), so a decode alive is never charged only part of its footprint.
+#[derive(Debug, Default)]
+struct Held {
+    parts: Vec<HeldPart>,
+}
+
+#[derive(Debug)]
+struct HeldPart {
+    decoded: std::sync::Weak<Decoded>,
+    _share: Option<Charge>,
+    _in_flight: Option<InFlight>,
+}
+
+impl Held {
+    /// `slice` let go, with what it was charged: kept while something else holds its decode,
+    /// dropped now otherwise.
+    fn keep(&mut self, slice: &Slice, share: Option<Charge>, in_flight: Option<InFlight>) {
+        if Arc::strong_count(&slice.decoded) > 1 {
+            self.parts.push(HeldPart {
+                decoded: Arc::downgrade(&slice.decoded),
+                _share: share,
+                _in_flight: in_flight,
+            });
+        }
+    }
+
+    /// A slice let go (its epoch refused here), with its ingest charge.
+    fn let_go(&mut self, slice: &Slice, in_flight: InFlight) {
+        self.keep(slice, None, Some(in_flight));
+    }
+
+    /// Lets go what was kept for a decode nothing holds any more.
+    fn sweep(&mut self) {
+        if !self.parts.is_empty() {
+            self.parts.retain(|part| part.decoded.strong_count() > 0);
+        }
     }
 }
 
@@ -939,7 +1110,7 @@ impl MessageExchange {
             0,
             1,
             1,
-            Admission::new(1, sink),
+            Admission::new(1, sink, Arc::clone(&gauges.epochs)),
             gauges,
         )))
     }
@@ -961,7 +1132,7 @@ impl MessageExchange {
             senders: Vec::with_capacity(threads),
             handles: Vec::with_capacity(threads),
         };
-        let admission = Admission::new(threads, Arc::clone(sink));
+        let admission = Admission::new(threads, Arc::clone(sink), Arc::clone(&gauges.epochs));
         for thread in 0..threads {
             let (sender, receiver) = sync_channel(QUEUE_SLICES * producers.max(1));
             let state = MessageThread::new(
@@ -1231,7 +1402,13 @@ mod tests {
             Err(_) => Err(Box::new(frozen)),
         });
         (
-            MessageThread::new(0, 1, 1, Admission::new(1, sink), Gauges::unlimited()),
+            MessageThread::new(
+                0,
+                1,
+                1,
+                Admission::new(1, sink, Gauge::unlimited(Store::Epochs)),
+                Gauges::unlimited(),
+            ),
             words,
         )
     }
@@ -1318,7 +1495,7 @@ mod tests {
             }
             Err(_) => Err(Box::new(frozen)),
         });
-        let admission = Admission::new(2, sink);
+        let admission = Admission::new(2, sink, Gauge::unlimited(Store::Epochs));
         // Thread 0's epochs hold one slice: a second refuses the epoch there.
         let tight = Gauges {
             epochs: Gauge::new(Store::Epochs, 1),
@@ -1340,6 +1517,94 @@ mod tests {
         Ok(())
     }
 
+    /// RFC-0181 §9: a batch split across two threads, refused on one, is charged its whole
+    /// footprint for as long as the other thread's slice keeps its decode alive, and let go once
+    /// nothing does. Before, the refusing thread let its share go at once, and the
+    /// decode lived on in the other thread's epoch, charged half, until that epoch closed: the
+    /// flood test's hundreds of kilobytes of decoded batches alive that no store was charged.
+    #[test]
+    fn a_batch_refused_on_one_thread_stays_charged_while_another_holds_it() -> Result<(), String> {
+        let sink: Sink = Arc::new(|_| Ok(()));
+        let epochs = Gauge::unlimited(Store::Epochs);
+        let admission = Admission::new(2, sink, Arc::clone(&epochs));
+        let ingest = Gauge::unlimited(Store::Ingest);
+        // Thread 0's epochs are full: its slice refuses the epoch there.
+        let tight = Gauges {
+            epochs: Gauge::new(Store::Epochs, 1),
+            dedup: Gauge::unlimited(Store::Dedup),
+        };
+        let _full = tight.epochs.try_charge(1);
+        let mut zero = MessageThread::new(0, 2, 1, Arc::clone(&admission), tight.clone());
+        let mut one = MessageThread::new(
+            1,
+            2,
+            1,
+            Arc::clone(&admission),
+            Gauges {
+                epochs: Arc::clone(&epochs),
+                dedup: Gauge::unlimited(Store::Dedup),
+            },
+        );
+        // One batch whose receptions fall on both threads.
+        let mut slices = Vec::new();
+        let mut n = 0u8;
+        while slices.len() < 2 {
+            n += 1;
+            let identity = Identity::generate().map_err(|error| error.to_string())?;
+            let content = BatchContent {
+                boot_id: 1,
+                sequence: 0,
+                counter_epoch: 0,
+                wall_ms: 0,
+                dropped: 0,
+                previous: [0; 32],
+                observations: (0..64u8)
+                    .map(|m| Observation {
+                        format: b'3',
+                        timestamp: 500,
+                        signal: 0,
+                        data: vec![m.wrapping_add(n); 14],
+                    })
+                    .collect(),
+            };
+            let batch = Batch::sign(&identity, &content).map_err(|error| error.to_string())?;
+            let decoded = Decoded::from_verified(batch, 500, 0)
+                .map_err(|undecodable| undecodable.error.to_string())?;
+            slices = split(&decoded, 2, None);
+        }
+        let footprint = slices[0].1.decoded.footprint();
+        let mut parts = slices.into_iter();
+        let ((_, first), (_, second)) = parts
+            .next()
+            .zip(parts.next())
+            .ok_or_else(|| "two slices".to_owned())?;
+        let (first_share, second_share) = (first.share(), second.share());
+        one.take(
+            0,
+            Envelope::Slice(second, InFlight::trusted(&ingest, second_share)),
+        );
+        zero.take(
+            0,
+            Envelope::Slice(first, InFlight::trusted(&ingest, first_share)),
+        );
+        // Refused on thread 0, alive on thread 1: charged whole between them.
+        assert_eq!(tight.epochs.held(), 1);
+        assert!(
+            epochs.held() + ingest.held() + 2 >= footprint,
+            "{} + {} charged for {footprint}",
+            epochs.held(),
+            ingest.held()
+        );
+        zero.take(0, tick(1_000));
+        assert!(epochs.held() + ingest.held() + 2 >= footprint);
+        // Settled once thread 1 closes it too: refused everywhere, its part let go, and with the
+        // decode gone, what thread 0 kept for it.
+        one.take(0, tick(1_000));
+        zero.resume();
+        assert_eq!((epochs.held(), ingest.held()), (0, 0));
+        Ok(())
+    }
+
     /// RFC-0181 §9: a slice's share of its batch's ingest charge is held down the queue and let
     /// go only once the epoch holds the bytes, or the slice is let go late.
     #[test]
@@ -1356,6 +1621,93 @@ mod tests {
         let late = copy_of(2, 600)?;
         thread.take(0, Envelope::Slice(late, InFlight::trusted(&ingest, share)));
         assert_eq!(ingest.held(), 0);
+        Ok(())
+    }
+
+    /// RFC-0181 §9: an epoch's word is charged its lists of decisions beside its batches, from
+    /// before any reception is decided until the sealer lets it go. They were charged nothing:
+    /// some 24 bytes a reception beside its decode waited uncounted for the sealer.
+    #[test]
+    fn an_epochs_word_is_charged_its_decisions_beside_its_batches() -> Result<(), String> {
+        let (mut thread, words) = thread();
+        for n in 1..=5 {
+            thread.take(0, Envelope::Slice(copy_of(n, 500)?, InFlight::free()));
+        }
+        thread.take(0, tick(2_000));
+        let words = words.lock().map_err(|error| error.to_string())?;
+        let word = words
+            .iter()
+            .find(|word| word.epoch == Some(0))
+            .ok_or("no word for epoch 0")?;
+        assert_eq!(word.stream.len(), 5);
+        let batches: usize = word.batches.iter().map(|batch| batch.footprint()).sum();
+        assert!(
+            word.charge.bytes() >= batches + word.own_bytes(),
+            "{} charged for {batches} of batches and {} of its own",
+            word.charge.bytes(),
+            word.own_bytes()
+        );
+        Ok(())
+    }
+
+    /// RFC-0181 §9: what waits for a stalled sealer is charged and bounded. A thousand epochs
+    /// refused while the sealer takes nothing leave as many refused words as the store holds and
+    /// one marker a thread; every other epoch is a gap in the words' numbers, which the sealer,
+    /// once it takes them, refuses and counts as lost: none goes unaccounted. Before, every word
+    /// and two markers an epoch waited, uncharged.
+    #[test]
+    fn what_waits_for_a_stalled_sealer_is_charged_and_bounded() -> Result<(), String> {
+        let taking = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let words = Arc::new(Mutex::new(Vec::new()));
+        let sink: Sink = {
+            let (taking, words) = (Arc::clone(&taking), Arc::clone(&words));
+            Arc::new(move |frozen| {
+                if !taking.load(Ordering::Relaxed) {
+                    return Err(Box::new(frozen));
+                }
+                match words.lock() {
+                    Ok(mut words) => {
+                        words.push(frozen);
+                        Ok(())
+                    }
+                    Err(_) => Err(Box::new(frozen)),
+                }
+            })
+        };
+        const ROOM: usize = 10;
+        let epochs = Gauge::new(Store::Epochs, ROOM * std::mem::size_of::<Frozen>());
+        let admission = Admission::new(2, sink, Arc::clone(&epochs));
+        const EPOCHS: u64 = 1_000;
+        for epoch in 0..EPOCHS {
+            admission.post(0, epoch, None);
+            admission.progress(0, epoch + 1);
+            admission.progress(1, epoch + 1);
+        }
+        let waiting = admission
+            .ledger
+            .lock()
+            .map_err(|error| error.to_string())?
+            .outbox
+            .len();
+        assert!(waiting <= ROOM * 3 + 2, "{waiting} words wait");
+        assert!(epochs.held() <= epochs.limit());
+        // The sealer takes them: every epoch is refused or counted lost, none merged.
+        taking.store(true, Ordering::Relaxed);
+        admission.flush();
+        let mut coordinator = crate::seal::Coordinator::new(2);
+        let (mut refused, mut lost) = (0, 0);
+        for word in std::mem::take(&mut *words.lock().map_err(|error| error.to_string())?) {
+            let ready = coordinator.take(word);
+            lost += ready.parts_lost;
+            for merged in ready.merged {
+                assert!(merged.refused);
+                refused += 1;
+            }
+        }
+        assert_eq!(refused, ROOM as u64);
+        assert_eq!(refused + lost, EPOCHS);
+        // The sealer done with them, their charges are let go.
+        assert_eq!(epochs.held(), 0);
         Ok(())
     }
 

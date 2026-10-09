@@ -93,7 +93,7 @@ fn the_same_raw_signs_the_same_bytes_whatever_the_order_copies_and_threads() -> 
     let now = after(&simulation);
     let mut first = engine(9, Vec::new(), 1);
     for record in infos.iter().chain(&batches) {
-        first.ingest(record, 0)?;
+        first.ingest(record, crate::replay::sent_ms(record))?;
     }
     let (one, report) = first.step(now, now);
     assert!(report.solved >= 100, "{report:?}");
@@ -105,10 +105,10 @@ fn the_same_raw_signs_the_same_bytes_whatever_the_order_copies_and_threads() -> 
         let mut rng = Rng::new(77 + threads as u64);
         let mut second = engine(9, Vec::new(), threads);
         for record in infos.iter().rev() {
-            second.ingest(record, 0)?;
+            second.ingest(record, crate::replay::sent_ms(record))?;
         }
         for record in delivered(&batches, &mut rng) {
-            second.ingest(record, 0)?;
+            second.ingest(record, crate::replay::sent_ms(record))?;
         }
         let (two, _) = second.step(now, now);
         assert_eq!(encoded(&one)?, encoded(&two)?, "{threads} threads");
@@ -224,17 +224,17 @@ fn engines_covering_a_footprint_publish_the_same_tile_and_one_not_covering_it_no
         .chain(&far_batches)
         .collect();
     for record in &all {
-        both.ingest(record, 0)?;
-        tiny.ingest(record, 0)?;
+        both.ingest(record, crate::replay::sent_ms(record))?;
+        tiny.ingest(record, crate::replay::sent_ms(record))?;
     }
     let mut rng = Rng::new(9);
     for record in far_infos.iter().chain(near_infos.iter().rev()) {
-        near_only.ingest(record, 0)?;
+        near_only.ingest(record, crate::replay::sent_ms(record))?;
     }
     let mut mixed: Vec<Record> = near_batches.clone();
     mixed.extend(far_batches.iter().cloned());
     for record in delivered(&mixed, &mut rng) {
-        near_only.ingest(record, 0)?;
+        near_only.ingest(record, crate::replay::sent_ms(record))?;
     }
     let now = after(&near).max(after(&far));
     let (a, report) = both.step(now, now);
@@ -270,7 +270,7 @@ fn a_window_fits_each_distinct_tile_its_targets_chose_once() -> Result<(), Strin
     let (infos, batches) = records(&simulation)?;
     let mut engine = engine(4, Vec::new(), 4);
     for record in infos.iter().chain(&batches) {
-        engine.ingest(record, 0)?;
+        engine.ingest(record, crate::replay::sent_ms(record))?;
     }
     let now = after(&simulation);
     let (records, report) = engine.step(now, now);
@@ -293,7 +293,7 @@ fn a_window_waits_until_it_has_ended_and_settled() -> Result<(), String> {
     let (infos, batches) = records(&simulation)?;
     let mut engine = engine(3, Vec::new(), 1);
     for record in infos.iter().chain(&batches) {
-        engine.ingest(record, 0)?;
+        engine.ingest(record, crate::replay::sent_ms(record))?;
     }
     let first = simulation
         .receptions

@@ -926,8 +926,8 @@ fn the_seam_admits_relays_that_ask_and_ignores_clients() -> Outcome {
         source: 2,
         loopback: false,
     };
-    let _ = sharing.assigned(&client, assignment, 1_000);
-    let _ = sharing.assigned(&relay, assignment, 1_000);
+    sharing.assigned(&client, assignment, 1_000);
+    sharing.assigned(&relay, assignment, 1_000);
     if sharing.groups.members(cell, Streams::RAW) != vec![relay.key] {
         return Err("the seam's membership".into());
     }
@@ -1179,39 +1179,251 @@ fn manifests_are_taken_from_members_each_within_its_own_share() -> Outcome {
     Ok(())
 }
 
-#[test]
-fn overlapping_parity_chunks_are_counted_once_and_a_stalled_parity_expires() -> Outcome {
+/// A relay serving `cell` with `origins` in its groups by their verified offers, its batch store's
+/// gauge `limit` bytes: what the seam's parity reassembly is checked against.
+fn serving_with_members(
+    cell: Region,
+    origins: &[&Identity],
+    limit: usize,
+) -> Result<(crate::hub::Hub, super::Sharing, Arc<Gauge>), String> {
+    let hub = crate::hub::Hub::new(8);
+    hub.network().selection.set_taken(vec![cell]);
     let sharing = super::Sharing::new();
-    let asker = relay(identity(1).public());
+    let gauge = Gauge::new(Store::Batches, limit);
+    sharing.charge_to(Arc::clone(&gauge));
+    for origin in origins {
+        hold_offer(&hub, origin, cell, 0b1111, START_MS)?;
+    }
+    let _ = sharing.tick_shed(&hub, Some(&identity(0)), 0, START_MS);
+    Ok((hub, sharing, gauge))
+}
+
+/// `count` hashes, as many in each data stripe as the others but for rounding.
+fn hashes(count: usize, salt: u8) -> Vec<Hash> {
+    (0..count)
+        .map(|index| {
+            let mut hash = [salt; 32];
+            // The stripe is read from the leading bytes (`stripe_of`): the index leads.
+            hash[..8].copy_from_slice(&(index as u64).to_le_bytes());
+            hash
+        })
+        .collect()
+}
+
+/// RFC-0174 §2.5, "A parity is checked against its manifest": a parity is reassembled only for an
+/// origin manifest the relay holds, from a relay its group knows, no longer than that manifest's
+/// records allow, and only as its origin cuts it (in order from the start, whole chunks but the
+/// last); each chunk is charged as it arrives, never its declared whole ahead of it.
+///
+/// Sweep 4, N2: and in a room of its own, sized as the budget plans it from the members' rate
+/// (`assembly_room`), never the batch store: a member that never finishes its parities fills its
+/// own part of that room and no more, the batch store holds none of it, and another sender's
+/// parity is still taken.
+#[test]
+fn a_parity_is_reassembled_in_its_own_room_only_as_its_origin_cuts_it() -> Outcome {
+    use tally_wire::sharing::{MAX_PARITY_CHUNK, MAX_PARITY_LEN};
     let cell = area()?;
-    let chunk = |offset: u32, bytes: Vec<u8>, manifest: Hash| tally_wire::ParityChunk {
-        manifest,
-        cell,
-        product: Streams::RAW,
-        second: START_MS / 1000,
-        lens: vec![0; usize::from(DATA_STRIPES)],
-        total: 100,
-        offset,
-        bytes,
+    let group = GroupKey::new(cell, Streams::RAW);
+    let (origin, other) = (identity(1), identity(3));
+    let asker = relay(origin.public());
+    // The batch store as small as a relay's may be; the room as the budget plans it at the
+    // members' default rate.
+    let (hub, sharing, gauge) = serving_with_members(cell, &[&origin, &other], 4 << 20)?;
+    let rate = 1 << 20;
+    let room = Gauge::new(Store::Batches, super::assembly_room(rate));
+    sharing.assemble_in(Arc::clone(&room));
+    let part = super::sender_part(room.limit());
+    let second = START_MS / 1000;
+    let now = START_MS + 300;
+    let held = |sharing: &super::Sharing| {
+        super::locks::lock(&sharing.assembling)
+            .values()
+            .map(|sender| sender.parities.len())
+            .sum::<usize>()
     };
-    let manifest = [3; 32];
-    let _ = sharing.parity_chunk(&asker, chunk(0, vec![1; 60], manifest), START_MS);
-    let _ = sharing.parity_chunk(&asker, chunk(0, vec![1; 60], manifest), START_MS);
-    // Sixty bytes of a hundred are covered: the parity is not whole.
-    if !super::locks::lock(&sharing.assembling).contains_key(&(asker.key, manifest)) {
-        return Err("a parity counted whole from one chunk sent twice".into());
+    // The batch store's charge once the member's sends to the group (a manifest flooded, an
+    // assignment) are let go, as the links would take them.
+    let batches = |sharing: &super::Sharing| {
+        drop(sharing.take_outbox());
+        gauge.held()
+    };
+    let signed_with = |origin: &Identity, salt: u8| {
+        let mut listed = hashes(tally_wire::sharing::MAX_PIECES, 5);
+        listed.iter_mut().for_each(|hash| hash[31] = salt);
+        manifest(origin, group, second, &listed)
+    };
+    let signed = signed_with(&origin, 0)?;
+    sharing.manifest(&asker, signed.clone(), now);
+    let chunk = |manifest: Hash, total: usize, offset: usize, len: usize| {
+        Ok::<_, String>(tally_wire::ParityChunk {
+            manifest,
+            cell,
+            product: Streams::RAW,
+            second,
+            lens: vec![u32::try_from(total).map_err(text)?; usize::from(DATA_STRIPES)],
+            total: u32::try_from(total).map_err(text)?,
+            offset: u32::try_from(offset).map_err(text)?,
+            bytes: vec![1; len],
+        })
+    };
+    let total = 3 * MAX_PARITY_CHUNK + 10;
+    // A manifest nobody signed: nothing held, nothing charged.
+    sharing.parity_chunk(&asker, chunk([3; 32], total, 0, MAX_PARITY_CHUNK)?, now);
+    // A whole longer than the manifest's records allow is refused.
+    let too_long = manifest(
+        &origin,
+        group,
+        second,
+        &hashes(usize::from(DATA_STRIPES) * 4, 6),
+    )?;
+    sharing.manifest(&asker, too_long.clone(), now);
+    sharing.parity_chunk(
+        &asker,
+        chunk(
+            too_long.hash(),
+            MAX_PARITY_LEN as usize,
+            0,
+            MAX_PARITY_CHUNK,
+        )?,
+        now,
+    );
+    // A relay the group does not know is refused for a manifest it does hold.
+    sharing.parity_chunk(
+        &relay(identity(2).public()),
+        chunk(signed.hash(), total, 0, MAX_PARITY_CHUNK)?,
+        now,
+    );
+    // Off the origin's cut: a start shorter than a chunk and not the whole, or one not at a
+    // chunk's place.
+    sharing.parity_chunk(&asker, chunk(signed.hash(), total, 0, 100)?, now);
+    sharing.parity_chunk(
+        &asker,
+        chunk(signed.hash(), total, 100, MAX_PARITY_CHUNK)?,
+        now,
+    );
+    if held(&sharing) != 0 || room.held() != 0 {
+        return Err("a chunk refused by its manifest, its sender or its cut was held".into());
     }
-    let _ = sharing.parity_chunk(&asker, chunk(60, vec![1; 40], manifest), START_MS);
-    if super::locks::lock(&sharing.assembling).contains_key(&(asker.key, manifest)) {
-        return Err("a whole parity still assembling".into());
+    // A start of a held manifest is charged what it brought, never the whole declared.
+    sharing.parity_chunk(
+        &asker,
+        chunk(signed.hash(), total, 0, MAX_PARITY_CHUNK)?,
+        now,
+    );
+    let first = room.held();
+    if held(&sharing) != 1 || !(MAX_PARITY_CHUNK..2 * MAX_PARITY_CHUNK).contains(&first) {
+        return Err(format!(
+            "a whole first chunk of a {total}-byte parity is charged {first} bytes"
+        ));
     }
-    // One left with a gap is dropped once it has had its time.
-    let stalled = [4; 32];
-    let _ = sharing.parity_chunk(&asker, chunk(0, vec![1; 60], stalled), START_MS);
-    let later = START_MS + super::PARITY_ASSEMBLY_MS + 1;
-    let _ = sharing.parity_chunk(&asker, chunk(0, vec![1; 10], [5; 32]), later);
-    if super::locks::lock(&sharing.assembling).contains_key(&(asker.key, stalled)) {
-        return Err("a stalled parity never expired".into());
+    // The start again begins it again: charged once.
+    sharing.parity_chunk(
+        &asker,
+        chunk(signed.hash(), total, 0, MAX_PARITY_CHUNK)?,
+        now,
+    );
+    if room.held() != first || held(&sharing) != 1 {
+        return Err("a start sent twice was charged twice".into());
+    }
+    // A chunk out of its place (the second skipped) lets the parity go: it can never be whole.
+    sharing.parity_chunk(
+        &asker,
+        chunk(signed.hash(), total, 2 * MAX_PARITY_CHUNK, MAX_PARITY_CHUNK)?,
+        now,
+    );
+    if held(&sharing) != 0 || room.held() != 0 {
+        return Err("a parity missing a chunk was still held".into());
+    }
+    // A stalled parity is let go after its time, and its charge with it.
+    sharing.parity_chunk(
+        &asker,
+        chunk(signed.hash(), total, 0, MAX_PARITY_CHUNK)?,
+        now,
+    );
+    let later = now + super::PARITY_ASSEMBLY_MS + 1;
+    let _ = sharing.tick_shed(&hub, Some(&identity(0)), 0, later);
+    if held(&sharing) != 0 || room.held() != 0 {
+        return Err(format!(
+            "a stalled parity still held: {} assembling, {} bytes charged",
+            held(&sharing),
+            room.held()
+        ));
+    }
+    // A whole parity in its cut is taken as the member's, and the room holds none of it after.
+    let now = later;
+    for offset in (0..total).step_by(MAX_PARITY_CHUNK) {
+        let len = MAX_PARITY_CHUNK.min(total - offset);
+        sharing.parity_chunk(&asker, chunk(signed.hash(), total, offset, len)?, now);
+    }
+    if held(&sharing) != 0 || room.held() != 0 {
+        return Err("a whole parity was still reassembling".into());
+    }
+
+    // A member that never finishes: the longest parity's chunks, sent past its part. It holds
+    // its part at most, then the parity is let go whole; the batch store holds none of it.
+    let stalled = signed_with(&origin, 2)?;
+    sharing.manifest(&asker, stalled.clone(), now);
+    let before = batches(&sharing);
+    let longest = MAX_PARITY_LEN as usize;
+    let mut peak = 0;
+    for offset in (0..longest - MAX_PARITY_CHUNK).step_by(MAX_PARITY_CHUNK) {
+        sharing.parity_chunk(
+            &asker,
+            chunk(stalled.hash(), longest, offset, MAX_PARITY_CHUNK)?,
+            now,
+        );
+        peak = peak.max(room.held());
+    }
+    if peak > part || peak + 2 * MAX_PARITY_CHUNK < part {
+        return Err(format!(
+            "one sender held {peak} bytes reassembling, its part {part} of {} B",
+            room.limit()
+        ));
+    }
+    if batches(&sharing) != before {
+        return Err(format!(
+            "reassembling charged the batch store: {before} then {} bytes",
+            batches(&sharing)
+        ));
+    }
+    // Another sender's parity is its own: taken and finished whatever the first did.
+    sharing.parity_chunk(
+        &asker,
+        chunk(stalled.hash(), longest, 0, MAX_PARITY_CHUNK)?,
+        now,
+    );
+    let theirs = signed_with(&other, 0)?;
+    sharing.manifest(&relay(other.public()), theirs.clone(), now);
+    sharing.parity_chunk(
+        &relay(other.public()),
+        chunk(theirs.hash(), total, 0, MAX_PARITY_CHUNK)?,
+        now,
+    );
+    if held(&sharing) != 2 {
+        return Err("another sender was refused for the first's part".into());
+    }
+    Ok(())
+}
+
+/// What the room is planned as holds everything the members' rate brings while a parity waits,
+/// at what it is charged: every chunk whole (the cut taken), each an unfinished parity's first
+/// (the most a chunk is charged).
+#[test]
+fn the_assembly_room_holds_what_the_members_rate_brings_while_a_parity_waits() -> Outcome {
+    use tally_wire::sharing::MAX_PARITY_CHUNK;
+    let rate: usize = 1 << 20;
+    let brought = rate * (super::PARITY_ASSEMBLY_MS / 1000) as usize + rate;
+    let chunks = brought.div_ceil(MAX_PARITY_CHUNK);
+    let charged =
+        brought + chunks * (super::PIECE_OVERHEAD + std::mem::size_of::<super::Assembling>());
+    if super::assembly_room(rate) < charged {
+        return Err(format!(
+            "the room {} is less than the {charged} B the rate brings while a parity waits",
+            super::assembly_room(rate)
+        ));
+    }
+    if super::sender_part(super::assembly_room(rate)) < 2 * rate {
+        return Err("a sender's part holds less than two seconds of the members' rate".into());
     }
     Ok(())
 }
@@ -1316,7 +1528,7 @@ fn a_relay_that_only_asked_is_in_no_tree() -> Outcome {
     let offered = identity(1);
     hold_offer(&hub, &offered, cell, 0b1111, START_MS)?;
     let asker = relay(identity(2).public());
-    let _ = sharing.assigned(
+    sharing.assigned(
         &asker,
         tally_wire::StripeAssignment {
             cell,
@@ -1532,7 +1744,7 @@ fn a_tick_with_the_world_taken_and_nothing_flowing_does_no_work() -> Outcome {
     let me = identity(0);
     let hub = crate::hub::Hub::new(8).advertising(vec![tally_wire::RelayAddress {
         key: me.public(),
-        address: "me.example:7450".to_owned(),
+        address: "198.51.100.7:7450".to_owned(),
     }]);
     let network = hub.network();
     network.adopt_identity(me.clone());
@@ -1707,6 +1919,187 @@ fn a_full_member_is_routed_around_to_the_members_beneath_it() -> Outcome {
     let (hash, piece) = in_stripe(3_000)?;
     if !sent_to(&member.originate(group, hash, piece, START_MS + 2_000)).contains(&seed) {
         return Err("the seed was not sent its stripe once it had room".into());
+    }
+    Ok(())
+}
+
+/// RFC-0174 §2.5 and §2.6: a member full to its parent is routed around, and that is no fault on
+/// either side of it. X turns its parent P away as full; P sends what X would have had straight to
+/// X's children, for the wait the one rule gives both (`full::Wait`). Over several receipt windows
+/// and their judgment nobody files a shortfall: X, against P, which it turned away; X's children,
+/// against X, whose records came from above it before any repair could have. Nobody is demoted,
+/// the trees never change, every member but X holds every record, and P holds the receipts of
+/// X's children for what it delivered to them past X.
+#[test]
+fn routing_around_a_full_member_files_no_shortfall_and_demotes_nobody() -> Outcome {
+    let mut sim = Sim::new(16, 20)?;
+    let origins = [0, 1, 2, 3];
+    let layout = sim.layout();
+    let epoch = epoch_of(sim.now / 1000);
+    // A member X with children in a data stripe, under a parent P: the one P has the fewest other
+    // children beside, so X's word alone would weigh most in P's judgment.
+    let (stripe, x, p, children) = (0..DATA_STRIPES)
+        .flat_map(|stripe| (0..sim.keys.len()).map(move |x| (stripe, x)))
+        .filter(|(_, x)| !origins.contains(x))
+        .filter_map(|(stripe, x)| {
+            let place = layout.place(stripe, epoch, &sim.keys[x])?;
+            let parent = place.parent?;
+            let p = *sim.index.get(&parent)?;
+            let siblings = layout.place(stripe, epoch, &parent)?.children.len();
+            (!place.children.is_empty()).then_some((siblings, stripe, x, p, place.children))
+        })
+        .min_by_key(|(siblings, ..)| *siblings)
+        .map(|(_, stripe, x, p, children)| (stripe, x, p, children))
+        .ok_or("no member with children under a parent")?;
+    let (x_key, p_key) = (sim.keys[x], sim.keys[p]);
+    // X turned P's link away as full: P routes around X, and X keeps the same wait for P.
+    sim.members[p].set_full(BTreeSet::from([x_key]));
+    sim.members[x].turned_away(p_key, std::time::Duration::from_secs(60), sim.now);
+    sim.feed(&origins, 3, 15)?;
+    let end = sim.now + 12_000;
+    sim.run_until(end);
+
+    let receipts: u64 = sim.members.iter().map(|m| m.stats().receipts).sum();
+    if receipts == 0 {
+        return Err("no receipt was signed: no window was judged".into());
+    }
+    let shortfalls: Vec<(usize, u64)> = sim
+        .members
+        .iter()
+        .enumerate()
+        .map(|(i, m)| (i, m.stats().shortfalls))
+        .filter(|(_, count)| *count > 0)
+        .collect();
+    if !shortfalls.is_empty() {
+        return Err(format!(
+            "shortfalls filed after a route-around (X {x}, P {p}): {shortfalls:?}"
+        ));
+    }
+    for i in sim.live() {
+        for other in sim.live() {
+            if sim.members[i].is_demoted(sim.group, &sim.keys[other]) {
+                return Err(format!("member {i} demoted {other} after a route-around"));
+            }
+        }
+        if sim.members[i].layout(sim.group) != Some(&layout) {
+            return Err(format!("member {i}'s trees changed after a route-around"));
+        }
+    }
+    sim.everyone_holds_everything(&[x].into())?;
+    // P's delivery past X is evidenced: each of X's children signed it a receipt in X's stripe.
+    for child in &children {
+        let signed = sim.receipts.iter().any(|(from, to, receipt)| {
+            sim.keys[*from] == *child
+                && *to == p
+                && receipt
+                    .content()
+                    .is_ok_and(|content| content.parent == p_key && content.stripe == stripe)
+        });
+        if !signed {
+            return Err("a child fed past its full parent signed its deliverer no receipt".into());
+        }
+    }
+    Ok(())
+}
+
+/// Sweep 4, N19: a relay turned away again and again while it waits holds one span of routing
+/// around this one, not one a refusal, and a receipt check still finds exactly the moments the
+/// spans cover: inside the wait, within its slack after, and nothing past it.
+#[test]
+fn refusals_while_a_relay_waits_are_one_span_and_found_by_search() -> Outcome {
+    let mut member = unlimited(identity(0));
+    let turned = identity(1).public();
+    let asked = std::time::Duration::from_secs(60);
+    // A refusal every 10 ms through the first wait: each lands inside the span the last gave.
+    for step in 0..6_000u64 {
+        member.turned_away(turned, asked, START_MS + step * 10);
+    }
+    let spans = member.turned_away_spans(&turned);
+    if spans != 1 {
+        return Err(format!("6,000 refusals inside one wait held {spans} spans"));
+    }
+    if !member.routed_around_by(&turned, START_MS + 30_000, START_MS + 31_000)
+        || !member.routed_around_by(&turned, START_MS - 5_000, START_MS)
+    {
+        return Err("a window inside the wait was not found".into());
+    }
+    // Long after every wait is over and remembered, a refusal starts a span of its own, and the
+    // gap between them is no span's.
+    let later = START_MS + 3_600_000;
+    member.turned_away(turned, asked, later);
+    let spans = member.turned_away_spans(&turned);
+    if spans != 2 {
+        return Err(format!("a refusal past the wait made {spans} spans, not 2"));
+    }
+    if member.routed_around_by(&turned, later - 600_000, later - 590_000) {
+        return Err("the gap between two waits was taken for routing around".into());
+    }
+    if !member.routed_around_by(&turned, later + 1_000, later + 2_000) {
+        return Err("the second wait was not found".into());
+    }
+    Ok(())
+}
+
+/// Sweep 4, N10: a repair page is never handed back down the link the summary came in on (the
+/// seam's `have` returns nothing), so no page waits uncharged in a link's replies. It waits in
+/// the outbox addressed to the asker, each record charged to the batch store from when it is
+/// queued until whoever carries it lets it go (`peers` holds the charge until the link writes it).
+#[test]
+fn a_repair_page_waits_charged_in_the_outbox_addressed_to_the_asker() -> Outcome {
+    let cell = area()?;
+    let group = GroupKey::new(cell, Streams::RAW);
+    let (origin, asker) = (identity(1), identity(3));
+    let (_hub, sharing, gauge) = serving_with_members(cell, &[&origin, &asker], usize::MAX)?;
+    let now = START_MS + 300;
+    let second = START_MS / 1000;
+    let (hash, piece) = record(&identity(10_000), 1, START_MS)?;
+    let batch = piece.record().ok_or("no record")?;
+    sharing.manifest(
+        &relay(origin.public()),
+        manifest(&origin, group, second, &[hash])?,
+        now,
+    );
+    sharing.received(&origin.public(), &batch, cell, Streams::RAW, now);
+    // What the member sent the group so far is taken, as the links would.
+    drop(sharing.take_outbox());
+    let before = gauge.held();
+    let have = tally_wire::HaveSummary {
+        cell,
+        product: Streams::RAW,
+        first_second: second,
+        seconds: vec![0],
+    };
+    sharing.have(&relay(asker.public()), have, now + 2_000);
+    let page = sharing.take_outbox();
+    let to_asker: Vec<&super::Addressed> = page
+        .iter()
+        .filter(|sent| sent.to == asker.public())
+        .collect();
+    if !to_asker
+        .iter()
+        .any(|sent| matches!(sent.record, Record::Batch(_)))
+    {
+        return Err(format!("the asker was sent no page: {} sends", page.len()));
+    }
+    for sent in &page {
+        if sent.charge.bytes() != sent.record.encoded_len() {
+            return Err(format!(
+                "a send of {} bytes waits charged {}",
+                sent.record.encoded_len(),
+                sent.charge.bytes()
+            ));
+        }
+    }
+    let charged: usize = page.iter().map(|sent| sent.charge.bytes()).sum();
+    if gauge.held() != before + charged {
+        return Err(format!(
+            "the store holds {} with the page waiting, {before} before and {charged} for it",
+            gauge.held()
+        ));
+    }
+    drop(page);
+    if gauge.held() != before {
+        return Err("the page's charge outlived it".into());
     }
     Ok(())
 }

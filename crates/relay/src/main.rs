@@ -34,32 +34,48 @@ async fn run() -> Result<(), String> {
 }
 
 /// `tally-relay check`: everything a start does before it reads its keys and opens its sockets,
-/// each refusal included (`prepare`), then the memory plan on stdout, one `name value` a line.
+/// each refusal included (`prepare`), then the plan on stdout, one `name value` a line: the
+/// memory's, the cores' and the stages' threads. Every part of what the relay holds before any
+/// feeder is printed from the plan's own list (`Plan::before_feeders_parts`), with their sum,
+/// `before-feeders`: a part the plan gains is a line printed, and `planned` is `before-feeders`
+/// and the feeders' shares.
 /// The keys are an operator's secrets, not its configuration: a throwaway key stands in for them.
 fn check(config: &Config) -> Result<(), String> {
     let identity = Identity::generate().map_err(|error| error.to_string())?;
     let (hub, _) = prepare(config, &identity)?;
     let budget = hub.budget();
-    let plan = format!(
-        "memory {}\nbase {}\noversize {}\nconnections {}\nconnection-buffers {}\n\
-         per-feeder {}\nfeeders {}\nmembers {}\nper-member {}\nmember-feeders {}\n\
-         member-rate-pool {}\nmember-pool {}\nplanned {}\nheadroom {}\nlimit {}\n",
-        budget.memory(),
-        budget.base(),
-        budget.plan().oversize(),
-        budget.plan().connections,
-        budget.plan().connection_buffers(),
-        budget.per_feeder().total(),
-        budget.ceiling(),
-        budget.members(),
-        budget.plan().per_member(),
-        budget.member_feeders(),
-        budget.plan().member_rate_pool(),
-        budget.plan().member_pool(),
-        budget.planned(),
-        HEADROOM_BYTES,
-        config.memory_limit,
-    );
+    let threads = budget.threads();
+    let plan = budget.plan();
+    let mut lines: Vec<(&str, usize)> = vec![("memory", budget.memory())];
+    lines.extend(plan.before_feeders_parts());
+    lines.extend([
+        ("before-feeders", plan.before_feeders()),
+        ("connections", plan.connections),
+        ("per-feeder", budget.per_feeder().total()),
+        ("feeders", budget.ceiling()),
+        ("memory-feeders", budget.memory_feeders()),
+        ("cores", config.cores),
+        ("core-feeders", plan.core_feeders().unwrap_or(usize::MAX)),
+        (
+            "feeder-records",
+            usize::try_from(plan.feeder_records_per_sec).unwrap_or(usize::MAX),
+        ),
+        ("ingest-threads", threads.ingest),
+        ("message-threads", threads.message),
+        ("seal-threads", threads.seal),
+        ("mlat-threads", budget.mlat_threads()),
+        ("members", budget.members()),
+        ("per-member", plan.per_member()),
+        ("member-feeders", budget.member_feeders()),
+        ("member-rate-pool", plan.member_rate_pool()),
+        ("planned", budget.planned()),
+        ("headroom", HEADROOM_BYTES),
+        ("limit", config.memory_limit),
+    ]);
+    let plan: String = lines
+        .iter()
+        .map(|(name, value)| format!("{name} {value}\n"))
+        .collect();
     let mut stdout = std::io::stdout();
     stdout
         .write_all(plan.as_bytes())
@@ -74,7 +90,7 @@ fn check(config: &Config) -> Result<(), String> {
 /// makes after reading its arguments (but for reading its keys and binding its sockets) is made
 /// here, so `check` refuses exactly what a start refuses.
 fn prepare(config: &Config, identity: &Identity) -> Result<(Arc<Hub>, bool), String> {
-    let hosts_mlat = config.relay_duties && config.mlat_threads > 0;
+    let hosts_mlat = config.relay_duties && config.mlat;
     let hub = Arc::new(
         Hub::new(config.max_subscribers)
             .advertising(config.hints())
@@ -88,8 +104,12 @@ fn prepare(config: &Config, identity: &Identity) -> Result<(Arc<Hub>, bool), Str
             .memory(config.memory, hosts_mlat)
             // Its areas, which the member sessions are planned from (`budget::members_for`).
             .taking(config.areas.clone())
-            // A stage short of a thread would close no epoch: the relay fails to start instead.
-            .staged(config.threads)?,
+            // Its cores, which bound the feeders it admits (`cores::feeders_carried`).
+            .cores(config.cores)
+            // Each stage on the threads the load it admits needs (`cores::threads_for`), and
+            // MLAT's steps on what the cores leave them (`cores::mlat_threads_for`). A stage
+            // short of a thread would close no epoch: the relay fails to start instead.
+            .staged_as_planned()?,
     );
     // A relay whose memory cannot hold its members' pool and a feeder beside it would refuse every
     // Hello, or its members: it refuses to start instead.
@@ -122,17 +142,24 @@ async fn serve(config: Config) -> Result<(), String> {
         egress::decimal(config.max_upload.most_a_month())
     );
     let (hub, hosted) = prepare(&config, &identities[0])?;
+    let budget = hub.budget();
+    let threads = budget.threads();
     eprintln!(
-        "tally-relay: {} of memory admits {} feeders ({} each) beside {} member sessions ({} \
-         each, and {} for their shared rate); {} ingest and {} message threads",
+        "tally-relay: admits {} feeders: {} of memory holds {} ({} each) beside {} member \
+         sessions ({} each, and {} for their shared rate), and its {} cores carry {}; {} ingest, \
+         {} message and {} seal threads for them",
+        budget.ceiling(),
         egress::decimal(config.memory as u64),
-        hub.budget().ceiling(),
-        egress::decimal(hub.budget().per_feeder().total() as u64),
-        hub.budget().members(),
-        egress::decimal(hub.budget().plan().per_member() as u64),
-        egress::decimal(hub.budget().plan().member_rate_pool() as u64),
-        config.threads.ingest,
-        config.threads.message,
+        budget.memory_feeders(),
+        egress::decimal(budget.per_feeder().total() as u64),
+        budget.members(),
+        egress::decimal(budget.plan().per_member() as u64),
+        egress::decimal(budget.plan().member_rate_pool() as u64),
+        config.cores,
+        budget.plan().core_feeders().unwrap_or(usize::MAX),
+        threads.ingest,
+        threads.message,
+        threads.seal,
     );
     eprintln!(
         "tally-relay: key {} listening on {}",
@@ -141,8 +168,9 @@ async fn serve(config: Config) -> Result<(), String> {
     );
     if hosted {
         eprintln!(
-            "tally-relay: hosting MLAT on {} threads for the areas it is chosen to solve",
-            config.mlat_threads
+            "tally-relay: hosting MLAT on {} threads for the areas it is chosen to solve, below \
+             the stages' priority",
+            budget.mlat_threads()
         );
     }
     if let Some(address) = &config.beast_out {
