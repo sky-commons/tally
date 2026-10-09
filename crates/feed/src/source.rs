@@ -80,6 +80,71 @@ impl TokenBucket {
     }
 }
 
+/// The wanted receptions a second (`tally_wire::modes::wanted_reception`) the relays this feeder
+/// publishes to take from it: each relay states its own in its `RateLimit` (`wanted_per_sec`), and
+/// the batcher sheds to the least any live session stated, before it signs, so every batch it
+/// seals is one every relay it goes to takes whole. A relay that states none (one that predates the
+/// field) holds the feeder to nothing here; a session's statement goes with it ([`Stating`]).
+#[derive(Default)]
+pub struct WantedCeilings {
+    stated: std::sync::Mutex<std::collections::HashMap<u64, u32>>,
+    sessions: std::sync::atomic::AtomicU64,
+    /// The least stated, or 0 for none.
+    least: AtomicU32,
+}
+
+/// One relay session's place in [`WantedCeilings`]: what it stated, until it is dropped with the
+/// session (however the session ends, its task aborted included).
+pub struct Stating {
+    ceilings: Arc<WantedCeilings>,
+    session: u64,
+}
+
+impl Stating {
+    /// The session's relay stated `wanted_per_sec` (or none) in its latest `RateLimit`.
+    pub fn state(&self, wanted_per_sec: Option<u32>) {
+        self.ceilings.change(|stated| match wanted_per_sec {
+            Some(wanted) => {
+                stated.insert(self.session, wanted);
+            }
+            None => {
+                stated.remove(&self.session);
+            }
+        });
+    }
+}
+
+impl Drop for Stating {
+    fn drop(&mut self) {
+        self.ceilings.change(|stated| {
+            stated.remove(&self.session);
+        });
+    }
+}
+
+impl WantedCeilings {
+    /// A new session's place, stating nothing yet.
+    pub fn session(self: &Arc<Self>) -> Stating {
+        Stating {
+            ceilings: Arc::clone(self),
+            session: self.sessions.fetch_add(1, Ordering::Relaxed),
+        }
+    }
+
+    fn change(&self, change: impl FnOnce(&mut std::collections::HashMap<u64, u32>)) {
+        if let Ok(mut stated) = self.stated.lock() {
+            change(&mut stated);
+            let least = stated.values().copied().min().unwrap_or(0);
+            self.least.store(least, Ordering::Relaxed);
+        }
+    }
+
+    /// The least wanted receptions a second a live session stated, if any did.
+    pub fn least(&self) -> Option<u32> {
+        Some(self.least.load(Ordering::Relaxed)).filter(|least| *least > 0)
+    }
+}
+
 /// Builds one boot's chain of signed batches.
 pub struct Batcher {
     identity: Identity,
@@ -93,6 +158,9 @@ pub struct Batcher {
     dropped: u32,
     last_counter: Option<u64>,
     bucket: TokenBucket,
+    /// The relays' wanted ceilings this batcher sheds to, and its bucket at the one it last read.
+    wanted: Arc<WantedCeilings>,
+    wanted_bucket: Option<(u32, TokenBucket)>,
 }
 
 impl Batcher {
@@ -116,7 +184,39 @@ impl Batcher {
             dropped: 0,
             last_counter: None,
             bucket: TokenBucket::new(ceiling),
+            wanted: Arc::default(),
+            wanted_bucket: None,
         }
+    }
+
+    /// Sheds wanted receptions to `ceilings` (what the relays it publishes to stated), counted as
+    /// dropped like anything over the owner's ceiling.
+    pub fn shedding_to(mut self, ceilings: Arc<WantedCeilings>) -> Self {
+        self.wanted = ceilings;
+        self
+    }
+
+    /// Whether a wanted reception fits under the least ceiling the relays stated now, and takes it.
+    /// A second's worth at once, as a relay holds it (`tally_relay::ingest::FEEDER_RECEPTIONS_BURST_SECS`
+    /// allows a second more for the batches' arrival). The bucket follows the ceiling as it
+    /// changes, keeping what it held.
+    fn wanted_fits(&mut self) -> bool {
+        let Some(ceiling) = self.wanted.least() else {
+            self.wanted_bucket = None;
+            return true;
+        };
+        let bucket = match &mut self.wanted_bucket {
+            Some((at, bucket)) if *at == ceiling => bucket,
+            held => {
+                let mut bucket = TokenBucket::new(ceiling);
+                if let Some((_, before)) = held.take() {
+                    bucket.tokens = before.tokens.min(bucket.burst);
+                    bucket.filled = before.filled;
+                }
+                &mut held.insert((ceiling, bucket)).1
+            }
+        };
+        bucket.take(1)
     }
 
     /// Takes what a reader sent. A batch is returned when the input had to seal one first.
@@ -154,7 +254,11 @@ impl Batcher {
     /// batch past what one message carries, what gathered before it is sealed first and returned.
     pub fn push(&mut self, observation: Observation) -> Result<Option<Batch>, String> {
         let cost = 1 + 6 + 1 + 2 + observation.data.len();
-        if cost > MAX_OBSERVATION_BYTES || !self.bucket.take(cost) {
+        // A wanted reception past the relays' ceiling is shed here, before it is signed: the
+        // relay would drop the batch it took past it (F4 of sweep 6).
+        let shed = tally_wire::modes::wanted_reception(observation.format, &observation.data)
+            && !self.wanted_fits();
+        if shed || cost > MAX_OBSERVATION_BYTES || !self.bucket.take(cost) {
             self.dropped = self.dropped.saturating_add(1);
             return Ok(None);
         }
@@ -458,6 +562,54 @@ mod tests {
 
     fn content(batch: &Batch) -> Result<BatchContent, String> {
         batch.content().map_err(|error| error.to_string())
+    }
+
+    /// F4 of sweep 6: the batcher sheds wanted receptions past the least ceiling a relay stated,
+    /// before it signs, counted in the batch's `dropped`; receptions MLAT never uses are held to
+    /// the owner's bytes alone; and with no relay stating one, nothing is shed.
+    #[test]
+    fn wanted_receptions_past_the_relays_ceiling_are_shed_before_signing() -> Result<(), String> {
+        let wanted = tally_wire::modes::with_parity(&[0x20, 0, 0x12, 0x34], 0x00ab_cdef);
+        let unwanted = [0x8d; 14];
+        let ceilings = Arc::new(WantedCeilings::default());
+        let stating = ceilings.session();
+        let mut batcher = batcher(10_000_000)?.shedding_to(Arc::clone(&ceilings));
+        let reception = |data: &[u8], format| Observation {
+            format,
+            timestamp: 1,
+            signal: 9,
+            data: data.to_vec(),
+        };
+        // Unstated: every reception is taken.
+        for _ in 0..500 {
+            batcher.push(reception(&wanted, tally_wire::batch::format::MODE_S_SHORT))?;
+        }
+        let all = content(&batcher.seal()?.ok_or("no batch")?)?;
+        assert_eq!((all.observations.len(), all.dropped), (500, 0));
+        stating.state(Some(100));
+        for _ in 0..500 {
+            batcher.push(reception(&wanted, tally_wire::batch::format::MODE_S_SHORT))?;
+            batcher.push(reception(&unwanted, tally_wire::batch::format::MODE_S_LONG))?;
+        }
+        let shed = content(&batcher.seal()?.ok_or("no batch")?)?;
+        let kept_wanted = shed
+            .observations
+            .iter()
+            .filter(|observation| {
+                tally_wire::modes::wanted_reception(observation.format, &observation.data)
+            })
+            .count();
+        // A second's worth of the ceiling at once, the rest shed and counted; none unwanted shed.
+        assert!((100..=101).contains(&kept_wanted), "{kept_wanted} kept");
+        assert_eq!(shed.observations.len() - kept_wanted, 500);
+        assert_eq!(shed.dropped as usize, 500 - kept_wanted);
+        // The session ends: its ceiling goes with it.
+        drop(stating);
+        for _ in 0..500 {
+            batcher.push(reception(&wanted, tally_wire::batch::format::MODE_S_SHORT))?;
+        }
+        assert_eq!(content(&batcher.seal()?.ok_or("no batch")?)?.dropped, 0);
+        Ok(())
     }
 
     #[test]

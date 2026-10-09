@@ -519,12 +519,23 @@ over it. As built:
   normal case: a model is a few kilobytes, about 6 KB at 30 members), its manifest, then the
   positions citing it. The manifest frames the specification's bytes rather than restating them,
   and carries the hash of the model's inputs, which is what a client matches models by.
-- The specification is version 4 (version 3's tile models, addressed citation and dropped clocks,
-  and from the calibration over real receivers below: a clock that declares GNSS discipline is
-  fitted as it behaves, a clock nothing places is dropped rather than failing its tile, and the
-  last jump scan is at the published estimate a verifier scans; version 2 added the gauge's rate
-  and the reference aircraft's position biases, version 1 had neither). A
+- The specification is version 5. Version 5 dates a free-running gauge's origin by the least
+  bound every cited reception of its clock gives (each was heard at or before its batch's wall
+  clock), not by its anchor batch's wall clock alone, which dated every transmission under such a
+  gauge up to a second late; rejects a sync message any receiver heard more than once in the
+  window, judged before any tile thins, since its receptions cannot be told apart; and starts the
+  fit robustly, so an event mixing two copies of a message costs the event, not the fit (RFC-0181
+  sweep 6, H-d and F8). Version 4 had version 3's tile models, addressed citation and dropped
+  clocks, and from the calibration over real receivers below: a clock that declares GNSS
+  discipline is fitted as it behaves, a clock nothing places is dropped rather than failing its
+  tile, and the last jump scan is at the published estimate a verifier scans; version 2 added the
+  gauge's rate and the reference aircraft's position biases, version 1 had neither. A
   model or solution names its version, and two relays agree exactly only under the same one.
+  Each version is a derivation, so the same raw gives each a different model: a verifier judges
+  only its own version (`tally_mlat_solver::judges`), and a model or solution of another is
+  unjudged, counted on its signature alone, never failed, so relays part-way through an upgrade
+  convict nobody. A fault proof of any version is still judged, by the tolerance the wire sets
+  for it (`tally_wire::Tolerance::for_spec`, the same for every version so far).
   From version 3 two signed models of one inputs that differ are not a fault (optimality is
   within tolerance, so honest relays may differ in the last bits); a proof of that form is
   refused.

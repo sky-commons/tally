@@ -198,7 +198,7 @@ fn a_configuration_the_relay_takes_is_accepted_with_its_plan() -> Result {
     // A key file that does not exist: check reads no key, which is an operator's secret.
     let checked = check(&[
         "--memory-limit",
-        "640M",
+        "800M",
         "--cores",
         "2",
         "--key",
@@ -218,7 +218,7 @@ fn a_configuration_the_relay_takes_is_accepted_with_its_plan() -> Result {
     assert_eq!(checked.get("memory")?, 560 << 20);
     // It hosts MLAT by default, on the threads its cores' plan gives it.
     assert!(checked.get("mlat-threads")? >= 1, "{:?}", checked.plan);
-    assert_eq!(checked.get("limit")?, 640 << 20);
+    assert_eq!(checked.get("limit")?, 800 << 20);
     // A base cell's groups reach every relay offering it or a cell under it, far more than 32:
     // the member sessions planned are the cap's worth.
     assert_eq!(checked.get("members")?, 32);
@@ -251,7 +251,9 @@ fn a_configuration_the_relay_takes_is_accepted_with_its_plan() -> Result {
         "1048576",
     ])?;
     assert!(whole.accepted, "{}", whole.refusal);
-    assert_eq!(whole.get("memory")?, (2 << 30) - whole.get("headroom")?);
+    // (to the byte the allocator's share rounds to: `budget::budget_within`)
+    let kept = whole.get("memory")? + whole.get("headroom")?;
+    assert!(kept <= 2 << 30 && kept + 2 >= 2 << 30, "{:?}", whole.plan);
     // No area taken: no group shared, no member session planned.
     assert_eq!(whole.get("members")?, 0);
     assert_plan_holds(&whole)
@@ -531,7 +533,10 @@ fn a_configuration_a_start_refuses_is_refused_and_says_why() -> Result {
                 "--memory",
                 memory,
             ],
-            "is above the 469762048 bytes this relay may plan",
+            &format!(
+                "is above the {} bytes this relay may plan",
+                tally_relay::budget::budget_within(512 << 20)
+            ),
         )?;
     }
     // The world product over a part of the world.

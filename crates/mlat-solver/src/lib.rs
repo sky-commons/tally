@@ -9,7 +9,9 @@
 //!
 //! This documentation is the specification (version [`clock::SPEC_VERSION`]; version 4 trusts no
 //! receiver's declaration of GNSS discipline beyond its timebase, from the calibration over real
-//! receivers, § The least-squares problem). It is written so an
+//! receivers, § The least-squares problem; version 5 dates a free-running gauge's origin by every
+//! cited reception of its clock and rejects a sync message any receiver heard twice in the
+//! window). A verifier judges its own version alone ([`verify::judges`]). It is written so an
 //! independent implementation makes the same discrete decisions: holding, windows, tiles,
 //! members and assignment are decided by content in integers (the tile module refuses floating
 //! point at compile time), grouping and the feasibility screen are exact integer arithmetic on raw
@@ -145,7 +147,12 @@
 //! verifier holding the same raw:
 //!
 //! 1. Candidates: per bin, the sealed bin's sync candidates (after ingest thinning) that two or
-//!    more members heard, each with the members' receptions of it.
+//!    more members heard, each with the members' receptions of it. A message any receiver (member
+//!    or not) heard more than once in the window, in one bin or across bins, is no candidate in
+//!    any bin: its bytes were sent more than once (an aircraft repeating a position byte for byte,
+//!    a replay), and which reception is of which transmission cannot be told, so an event of it
+//!    would mix receptions seconds apart. Judged over every receiver's records before any tile
+//!    thins, so every tile and engine rejects the same messages.
 //! 2. Sync aircraft: of the candidates' aircraft, at most `A_max = 16`, the lowest by rank
 //!    (BLAKE2s-256 over `"tally sync aircraft rank" 0x00`, the address and the window's first and
 //!    last bins); only their candidates are kept. Measured (100 receivers, 60 ADS-B and 40 Mode S
@@ -286,7 +293,12 @@
 //!
 //! ## Robustness, jumps and noise
 //!
-//! A round is one unit-weight step and two Huber steps (`k = 3`). Then each clock's reception
+//! A round is one robust step and two Huber steps (`k = 3`). The robust step starts from each
+//! event settled on its own at the starting clocks (as a published model's are), takes each
+//! clock's scale as 1.4826 times the median absolute residual of its receptions there (at least
+//! its nominal noise), and weighs every reception as the final steps do against that scale: one
+//! beyond 10 of them carries no weight, so a reception of another transmission of the same bytes
+//! seconds away costs its event, never the fit. Then each clock's reception
 //! residuals in linear-count order are scanned: at every split with at least 5 receptions on each
 //! side (and distinct counts across it), the step is the median of the 5 after minus the median
 //! of the 5 before, in standard deviations of the clock's own robust noise (1.4826 times the
@@ -351,9 +363,12 @@
 //! receptions' model times less their ranges, three Huber-weighted and eight final-weighted
 //! Gauss-Newton steps of its four parameters.
 //!
-//! Model time zero is a Unix time (`origin`): for a GNSS-disciplined gauge, its anchor
-//! (nanoseconds of the UTC day) on the day that lies within half a day of the wall clock of the
-//! gauge's anchor reception; for a free-running gauge, that wall clock itself.
+//! Model time zero is a Unix time (`origin`), from the wall clock of the gauge's anchor: the least,
+//! over the receptions of the gauge's clock (its piece) the inputs cite, of its batch's wall clock (milliseconds,
+//! as nanoseconds) less the gauge's nominal time from the anchor to it (a batch is signed after
+//! what it carries, so this is the latest the anchor can have been heard). For a GNSS-disciplined
+//! gauge, model time zero is its anchor (nanoseconds of the UTC day) on the day that lies within
+//! half a day of that wall clock; for a free-running gauge, that wall clock itself.
 //!
 //! # Grouping ([`group::group`])
 //!
@@ -560,7 +575,7 @@ pub use solve::{Solution, SolveError};
 pub use sync::{Assessment, Calibrated, FitError, calibrate, fit, fit_calibrated};
 pub use tile::Tile;
 pub use verify::{
-    Failure, ModelFailure, ModelVerdict, Verdict, verify, verify_assignment, verify_model,
+    Failure, ModelFailure, ModelVerdict, Verdict, judges, verify, verify_assignment, verify_model,
     verify_reach,
 };
 

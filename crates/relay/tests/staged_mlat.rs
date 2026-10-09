@@ -3,7 +3,7 @@
 //! ingest workers and sealed from them, and its provisional state in address shards; the host steps
 //! by the stamp watermark the products seal by, asked as the network task asks it, on a thread of
 //! its own, never waited on step by step, only kept within its limits of the watermark
-//! (`PROVISIONAL_BEHIND` and `STEPS_BEHIND`), past which a host sheds whole steps (`mlat_host`, Behind: what a host that cannot keep up does,
+//! (`PROVISIONAL_BEHIND` and `WINDOW_STEPS_BEHIND`), past which a host sheds whole steps (`mlat_host`, Behind: what a host that cannot keep up does,
 //! counted, and asserted here never to happen). The same stamped trace makes the same clock models,
 //! positions and provisional positions, byte for byte, on 1, 2 and 8 ingest workers and as many MLAT
 //! threads, with delays injected inside every stage of the host and between the batches, and they
@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 use tally_relay::hub::{Description, Hub, Inbound, Origin};
 use tally_relay::ingest::{Stamp, Threads};
 use tally_relay::mlat_host::{
-    HostedMlat, MlatHost, MlatReport, PROVISIONAL_BEHIND, STEP_MS, STEPS_BEHIND, Stage,
+    HostedMlat, MlatHost, MlatReport, PROVISIONAL_BEHIND, STEP_MS, Stage, WINDOW_STEPS_BEHIND,
 };
 use tally_wire::{Identity, Location, PublicKey, ReceiverInfo, Record, Region, Regions};
 
@@ -151,7 +151,7 @@ enum Delays {
 /// on the real concurrent path: the descriptions handed in as `describing` says, then each step's
 /// batches (each stamped when it arrived) handed to the ingest workers and every worker ticked to
 /// the step, never waiting for them, only for the host to be within its limits of the next
-/// (`PROVISIONAL_BEHIND`, `STEPS_BEHIND`; a host further behind sheds, which a relay's real-time watermark gives it the seconds
+/// (`PROVISIONAL_BEHIND`, `WINDOW_STEPS_BEHIND`; a host further behind sheds, which a relay's real-time watermark gives it the seconds
 /// not to); meanwhile another thread asks the host with the products' watermark as the network
 /// task does, never waiting for it either. Only at the end is the host waited on, once. Its records, provisional ones apart from the rest, each encoded in order; its
 /// report; and the receivers whose raw it held.
@@ -224,7 +224,7 @@ fn mlat_run_with(
         let mut next = 0;
         let mut step = (first / STEP_MS + 1) * STEP_MS;
         // The host's tighter limit: its provisional steps' (`PROVISIONAL_BEHIND`, below
-        // `STEPS_BEHIND`). A step handed in once every part of the one this many steps before it
+        // `WINDOW_STEPS_BEHIND`). A step handed in once every part of the one this many steps before it
         // has reported finds at most that many not started behind the one running, so nothing is
         // shed.
         let ahead = (PROVISIONAL_BEHIND as u64 + 1) * STEP_MS;
@@ -237,7 +237,7 @@ fn mlat_run_with(
         let since = Instant::now();
         while step <= until {
             // Within the host's limits (`PROVISIONAL_BEHIND` steps, the tighter, and
-            // `STEPS_BEHIND`), as a real-time watermark keeps it; and what it signed taken by the
+            // `WINDOW_STEPS_BEHIND`), as a real-time watermark keeps it; and what it signed taken by the
             // asker before the watermark moves on a step, as a real-time watermark moves a tenth
             // of a step between the network task's asks (a provisional step's records taken past
             // `PROVISIONAL_PUBLISH_MS` after it are late by the stamps, and refused).
@@ -626,7 +626,7 @@ fn descriptions_midway_make_the_same_bytes_with_any_delays_and_the_reference_eng
 }
 
 /// Sweep 4, R-N16 and N6: a window step that runs long, past the old ripening and past as many steps
-/// as `STEPS_BEHIND` (which sheds none: a window step is queued only at a step a window falls due
+/// as `WINDOW_STEPS_BEHIND` (which sheds none: a window step is queued only at a step a window falls due
 /// at, sweep 5, H-c; before, every step it ran past queued as one, and those past the limit were
 /// shed), changes no provisional byte: a provisional step carries exactly the models of the window steps
 /// `MODELS_RIPEN_MS` before it, by their stamp, and the ripening covers a window step on the
@@ -643,7 +643,7 @@ fn a_window_step_that_runs_long_changes_no_provisional_byte() -> Result {
     let areas = mlat_areas()?;
     const BEHIND: u64 = 10;
     const {
-        assert!(BEHIND * STEP_MS > (STEPS_BEHIND as u64 + 1) * STEP_MS);
+        assert!(BEHIND * STEP_MS > (WINDOW_STEPS_BEHIND as u64 + 1) * STEP_MS);
         assert!(BEHIND * STEP_MS <= tally_mlat::engine::MODELS_RIPEN_MS);
     }
     let (signed, report, _) = mlat_run_with(

@@ -23,7 +23,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use tally_relay::budget::{Covered, Store};
+use tally_relay::budget::{Covered, Lapses, Store};
 use tally_relay::fanout::{Fell, Filter};
 use tally_relay::hub::{Hub, Inbound, Origin};
 use tally_relay::ingest::{Stamp, Threads};
@@ -137,12 +137,45 @@ const SAMPLE_EVERY: Duration = Duration::from_millis(20);
 /// the batch byte store and the delivery tags hold no more than their gauges are charged. A store
 /// whose own charge cannot pass its limit by construction (`Gauge::take`) holds the relay to its
 /// budget only if nothing holds bytes it was not charged: that is what this watches for.
-#[derive(Default)]
+///
+/// Sampled, a holder that keeps a decode uncharged for less than the time between two samples
+/// goes unseen; so beside the samples the watch reads what [`Covered`] counted at every hand-off
+/// as it happened (N14 of sweep 6, `Covered::lapses`): a cover let go or lessened while its decode
+/// lives, leaving it short, and a decode let go that no charge ever covered. Those counters must
+/// not move over the test, but for the lapses the test makes itself ([`Watch::allow`]).
 struct Watch {
     most_live: usize,
+    /// The process's lapses when the watch began, and those the test made itself since.
+    lapses_from: Lapses,
 }
 
 impl Watch {
+    fn new() -> Self {
+        Self {
+            most_live: 0,
+            lapses_from: Covered::process().lapses(),
+        }
+    }
+
+    /// The test itself made `lapses` (to show they are counted): not the relay's.
+    fn allow(&mut self, lapses: Lapses) {
+        self.lapses_from.short_hand_offs += lapses.short_hand_offs;
+        self.lapses_from.never_covered += lapses.never_covered;
+    }
+
+    /// The hand-offs that lapsed since the watch began, the test's own aside.
+    fn lapsed(&self) -> Lapses {
+        let now = Covered::process().lapses();
+        Lapses {
+            short_hand_offs: now
+                .short_hand_offs
+                .saturating_sub(self.lapses_from.short_hand_offs),
+            never_covered: now
+                .never_covered
+                .saturating_sub(self.lapses_from.never_covered),
+        }
+    }
+
     fn sample(&mut self, hub: &Hub) -> Result {
         let report = hub.memory_report();
         let budget = hub.budget();
@@ -184,6 +217,15 @@ impl Watch {
                 short.iter().map(|(_, bytes)| bytes).sum::<usize>()
             ));
         }
+        // Between the samples: every hand-off judged as it was made.
+        let lapsed = self.lapsed();
+        if lapsed != Lapses::default() {
+            uncharged.push(format!(
+                "{} hand-offs left a live decode covered for less than its footprint, and {} \
+                 decodes were let go that no charge ever covered",
+                lapsed.short_hand_offs, lapsed.never_covered
+            ));
+        }
         if uncharged.is_empty() {
             return Ok(());
         }
@@ -192,21 +234,27 @@ impl Watch {
 }
 
 /// The watch sees a holder no gauge charges, of one batch, in one sample, and one a charge of a
-/// byte covers (N14): a batch decoded here and kept, beside
-/// the relay in the middle of its flood, every connection's allowance carved and the stores
-/// holding megabytes. Before, the watch compared the
-/// decodes alive with what the stores holding them were charged, which counts every allowance
-/// carved whether it holds a batch or not and a decode two stores hold twice: about a megabyte of
-/// slack under this flood, so a holder of dozens of batches went unseen.
+/// byte covers (N14): a batch decoded here and kept, beside the relay in the middle of its flood,
+/// every connection's allowance carved and the stores holding megabytes. Before, the watch
+/// compared the decodes alive with what the stores holding them were charged, which counts every
+/// allowance carved whether it holds a batch or not and a decode two stores hold twice: about a
+/// megabyte of slack under this flood, so a holder of dozens of batches went unseen.
+///
+/// And it sees a lapse no sample is there for (N14 of sweep 6): a decode whose charge is let go
+/// while it is kept, and one let go that no charge ever covered, each counted once at the moment
+/// it happened, however soon after it the decode goes. Before, the watch sampled every 20 ms and a
+/// holder that kept a decode uncharged between two samples was never seen.
 async fn assert_watch_sees_one_leaked_batch(hub: &Hub) -> Result {
     let receiver = Identity::generate().map_err(text)?;
-    let batch = busy_batch(&receiver, 0)?;
-    let kept =
-        tally_wire::Decoded::from_verified(batch, 0, 0).map_err(|error| error.error.to_string())?;
-    let mut watch = Watch::default();
+    let decode = |sequence| -> Result<Arc<tally_wire::Decoded>> {
+        tally_wire::Decoded::from_verified(busy_batch(&receiver, sequence)?, 0, 0)
+            .map_err(|error| error.error.to_string())
+    };
+    let kept = decode(0)?;
+    let mut watch = Watch::new();
     // Covered by nothing: seen in the one sample.
     let uncovered = watch.sample(hub).err();
-    let mut watch = Watch::default();
+    let mut watch = Watch::new();
     // Covered by a charge of one byte (N14): present, and still a batch held uncharged.
     let mut token = hub
         .budget()
@@ -216,15 +264,47 @@ async fn assert_watch_sees_one_leaked_batch(hub: &Hub) -> Result {
         .ok_or("no byte of room for the token charge")?;
     token.cover(&kept);
     let short = watch.sample(hub).err();
-    drop(token);
+    // Let go before its charge: no lapse.
     drop(kept);
+    drop(token);
     match (uncovered, short) {
-        (Some(_), Some(short)) if short.contains("less than their footprints") => Ok(()),
-        (None, _) => Err("one decoded batch no store charged went unseen".to_owned()),
-        (_, short) => Err(format!(
-            "one decoded batch covered by a charge of a byte went unseen: {short:?}"
-        )),
+        (Some(_), Some(short)) if short.contains("less than their footprints") => {}
+        (None, _) => return Err("one decoded batch no store charged went unseen".to_owned()),
+        (_, short) => {
+            return Err(format!(
+                "one decoded batch covered by a charge of a byte went unseen: {short:?}"
+            ));
+        }
     }
+    // Between samples: a decode whose whole charge is let go while it is held, and one that lived
+    // and went with no charge ever covering it, both gone before any sample could see them.
+    let mut watch = Watch::new();
+    let handed = decode(1)?;
+    let mut charge = hub
+        .budget()
+        .gauge(Store::Records)
+        .try_charge(handed.footprint())
+        .ok_or("no room for a decode's charge")?;
+    charge.cover(&handed);
+    drop(charge);
+    drop(handed);
+    drop(decode(2)?);
+    let lapsed = watch.lapsed();
+    if lapsed
+        != (Lapses {
+            short_hand_offs: 1,
+            never_covered: 1,
+        })
+    {
+        return Err(format!(
+            "a decode held past its charge, and one never covered, between samples: counted \
+             {lapsed:?}"
+        ));
+    }
+    if watch.sample(hub).is_ok() {
+        return Err("the watch passed the lapses it was not told of".to_owned());
+    }
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -324,7 +404,7 @@ async fn memory_stays_bounded_under_a_flood_of_many_feeders() -> Result {
         });
     }
     let started = Instant::now();
-    let mut watch = Watch::default();
+    let mut watch = Watch::new();
     while started.elapsed() < FLOOD / 2 {
         watch.sample(&hub)?;
         tokio::time::sleep(SAMPLE_EVERY).await;
@@ -335,8 +415,12 @@ async fn memory_stays_bounded_under_a_flood_of_many_feeders() -> Result {
         "the flood was not under way when the leak was tried"
     );
     assert_watch_sees_one_leaked_batch(&hub).await?;
-    // Let go, it is seen no more.
-    let mut watch_after = Watch::default();
+    // Let go, it is seen no more; the two lapses it made to be counted were its own.
+    watch.allow(Lapses {
+        short_hand_offs: 1,
+        never_covered: 1,
+    });
+    let mut watch_after = Watch::new();
     while started.elapsed() < FLOOD {
         watch_after.sample(&hub)?;
         tokio::time::sleep(SAMPLE_EVERY).await;
@@ -398,7 +482,7 @@ async fn a_stalled_stage_never_grows_past_the_budget() -> Result {
     let receivers: Vec<Identity> = (0..8u8)
         .map(|n| Identity::from_seed([n + 40; 32]))
         .collect();
-    let mut watch = Watch::default();
+    let mut watch = Watch::new();
     let mut ingested = 0usize;
     let mut sequence = 0u64;
     while ingested < 10 * epochs.limit().max(fanout.limit()) {

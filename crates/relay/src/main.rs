@@ -3,7 +3,6 @@
 use std::io::Write as _;
 use std::sync::Arc;
 
-use tally_relay::budget::HEADROOM_BYTES;
 use tally_relay::config::{Command, Config};
 use tally_relay::egress;
 use tally_relay::hub::Hub;
@@ -12,6 +11,8 @@ use tally_wire::Identity;
 use tokio::net::TcpListener;
 
 fn main() {
+    // What the allocator keeps is bounded (`budget::bound_the_allocator`), before any thread runs.
+    tally_relay::budget::bound_the_allocator();
     // Every panic ends the relay (`tally_relay::abort_on_any_panic`), set before any thread runs.
     tally_relay::abort_on_any_panic();
     serve_main();
@@ -75,7 +76,10 @@ fn check(config: &Config) -> Result<(), String> {
         ("member-feeders", budget.member_feeders()),
         ("member-rate-pool", plan.member_rate_pool()),
         ("planned", budget.planned()),
-        ("headroom", HEADROOM_BYTES),
+        (
+            "headroom",
+            tally_relay::budget::headroom_for(budget.memory()),
+        ),
         ("limit", config.memory_limit),
     ]);
     let plan: String = lines

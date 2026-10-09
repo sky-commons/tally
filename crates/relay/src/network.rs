@@ -90,6 +90,14 @@ pub enum AskerRole {
     Probe,
 }
 
+/// A member session's admission (`Network::admit_member`): its reservation from the members'
+/// pool and its part of the products' records, held together for as long as it is a member.
+#[must_use = "the member's place is given up as soon as it is dropped"]
+pub struct Membership {
+    _records: crate::products::RecordsPart,
+    _reservation: crate::budget::Reservation,
+}
+
 /// Every RFC-0174 duty of one relay.
 pub struct Network {
     identity: OnceLock<Identity>,
@@ -100,7 +108,7 @@ pub struct Network {
     pub sharing: Sharing,
     pub credit: Credit,
     pub products: Arc<Products>,
-    pub standing: Standing,
+    pub standing: Arc<Standing>,
     pub peers: Peers,
     mlat: OnceLock<Arc<dyn MlatHost>>,
     /// The areas last handed the hosted MLAT, and the generation of the choice they came from.
@@ -133,7 +141,7 @@ impl Network {
             sharing: Sharing::new(),
             credit: Credit::new(),
             products: Arc::new(Products::new()),
-            standing: Standing::new(),
+            standing: Arc::new(Standing::new()),
             peers: Peers::new(),
             mlat: OnceLock::new(),
             mlat_areas: Mutex::new((0, Regions::default())),
@@ -191,9 +199,13 @@ impl Network {
 
     /// The MLAT this relay runs (one program); none when its MLAT duty is off.
     pub fn host_mlat(&self, host: Arc<dyn MlatHost>) {
-        // Standing reads the engine's raw: one store of raw per relay (RFC-0181 §5).
+        // Standing reads the engine's raw: one store of raw per relay (RFC-0181 §5), and runs on
+        // its threads (`Standing::start`).
         if let Some(sealed) = host.sealed_bins() {
             self.standing.read_bins(sealed);
+            if let Err(error) = Standing::start(&self.standing, host.gate()) {
+                eprintln!("tally-relay: {error}");
+            }
         }
         let _ = self.mlat.set(host);
     }
@@ -360,21 +372,31 @@ impl Network {
         self.standing.model(record, now_ms);
     }
 
-    /// A session opened, as `asker`: one that may hand the products records (a relay's, an
-    /// engine's) has a part of the peers' share of them from now until it leaves
-    /// (`products::Products::joined`). Called once for every session, as it starts.
+    /// A session opened, as `asker`. Called once for every session, as it starts. It is given
+    /// no part of the products' records by opening: only a member's admission gives one
+    /// ([`Network::admit_member`]).
     pub fn joined(&self, asker: &Asker) {
-        if matches!(asker.role, AskerRole::Relay | AskerRole::Engine) {
-            self.products.joined(asker.source);
+        let _ = asker;
+    }
+
+    /// The session `source`, a relay's, is admitted as a member with `membership`, its
+    /// reservation from the members' pool (`budget::Budget::reserve_member`): from now until the
+    /// [`Membership`] returned is dropped it holds that reservation and a part of the peers'
+    /// share of the products' records (`products::Products::member`), the two as one, so the
+    /// sessions with a part are bounded as the members are, and no directory link, engine or
+    /// other session that is no member divides a member's part.
+    pub fn admit_member(&self, source: u64, membership: crate::budget::Reservation) -> Membership {
+        Membership {
+            _records: self.products.member(source),
+            _reservation: membership,
         }
     }
 
     /// The session `source` closed: whatever it was given ends with it (a client's credit, its
-    /// free-tier place, its part of the products' records). Called once for every session, as it
-    /// ends, whichever side dialled.
+    /// free-tier place). A member's part of the products' records ends with its [`Membership`].
+    /// Called once for every session, as it ends, whichever side dialled.
     pub fn left(&self, source: u64) {
         self.credit.left(source);
-        self.products.left(source);
     }
 
     /// A record this relay is the first relay to hold (its own feeder's batch, an engine's or its
@@ -623,30 +645,63 @@ impl Network {
     }
 }
 
-/// Runs the timed duties for as long as the relay runs: every `TICK`, what they publish goes into
-/// the hub's fan-out as the relay's own, and what they address to other relays goes to them.
-pub async fn run(hub: Arc<Hub>) {
-    let mut tick = tokio::time::interval(TICK);
-    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut raw_ms = 0;
-    loop {
-        tick.tick().await;
-        hub.idle();
-        let now_ms = wall_ms();
-        for record in hub.network().tick(&hub, now_ms) {
-            hub.publish_own(record);
-        }
-        // Positions held for their models past the wait go out even with nothing new coming.
-        hub.release_awaiting();
-        for (source, regional) in hub.network().products.take_forward() {
-            hub.publish_as(source, Record::RegionalBatch(regional));
-        }
-        let raw_due = now_ms.saturating_sub(raw_ms) >= crate::peers::RAW_EVERY_MS;
-        if raw_due {
-            raw_ms = now_ms;
-        }
-        hub.network().carry(&hub, now_ms, raw_due);
+/// Starts the timed duties on a thread of their own ("tally-duties"), for as long as the runtime
+/// that started them runs: every `TICK` after the last pass ended, what they publish goes into the
+/// hub's fan-out as the relay's own, and what they address to other relays goes to them (a link
+/// they open is spawned on that runtime, `runtime`).
+///
+/// Never on the async runtime's workers. A pass is synchronous work whose size follows what the
+/// relay holds and was handed (a window step's positions and models published at once, the
+/// sharing groups' manifests and parity, the directory), and a runtime worker held by it holds
+/// every task woken from it there with it: a pass that took ten seconds on a runtime worker held
+/// the subscribers' writers and feeders' readers it woke for those ten seconds, and raw's p99 went
+/// to seconds while the stages idled (sweep 6). The runtime does I/O only, as the ingest workers'
+/// and message threads' own threads already keep it (`ingest`).
+///
+/// The thread ends when the runtime does (the task holding its lifeline is dropped with it), so a
+/// relay a test runs and drops leaves no duties behind.
+pub fn start(hub: Arc<Hub>, runtime: tokio::runtime::Handle) {
+    let (lifeline, alive) = std::sync::mpsc::channel::<()>();
+    runtime.spawn(async move {
+        let _lifeline = lifeline;
+        std::future::pending::<()>().await
+    });
+    let spawned = std::thread::Builder::new()
+        .name("tally-duties".to_owned())
+        .spawn(move || {
+            let _runtime = runtime.enter();
+            let mut raw_ms = 0;
+            loop {
+                match alive.recv_timeout(TICK) {
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                    Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+                }
+                pass(&hub, &mut raw_ms);
+            }
+        });
+    if let Err(error) = spawned {
+        // The relay cannot run without its duties (its products would never be published).
+        panic!("tally-relay: the timed duties did not start: {error}");
     }
+}
+
+/// One pass of the timed duties (`start`).
+fn pass(hub: &Arc<Hub>, raw_ms: &mut u64) {
+    hub.idle();
+    let now_ms = wall_ms();
+    for record in hub.network().tick(hub, now_ms) {
+        hub.publish_own(record);
+    }
+    // Positions held for their models past the wait go out even with nothing new coming.
+    hub.release_awaiting();
+    for (source, regional) in hub.network().products.take_forward() {
+        hub.publish_as(source, Record::RegionalBatch(regional));
+    }
+    let raw_due = now_ms.saturating_sub(*raw_ms) >= crate::peers::RAW_EVERY_MS;
+    if raw_due {
+        *raw_ms = now_ms;
+    }
+    hub.network().carry(hub, now_ms, raw_due);
 }
 
 /// The finest cells a positions record or a clock model places aircraft at, for routing by
@@ -703,6 +758,76 @@ pub fn wall_ms() -> u64 {
 mod tests {
     use super::*;
     use tally_mlat_solver::geo::{self, Geodetic};
+
+    /// A hosted MLAT whose every ask takes `pass_ms`: a pass of the duties as long as one that
+    /// publishes a window step's solutions.
+    struct Slow {
+        pass_ms: u64,
+        asked: AtomicU64,
+    }
+
+    impl MlatHost for Slow {
+        fn set_areas(&self, _: Regions, _: Vec<tally_wire::ReceiverInfo>) {}
+
+        fn offer_description(&self, _: &tally_wire::ReceiverInfo, _: u64) {}
+
+        fn offer_batch(&self, _: &Arc<tally_wire::Decoded>, _: u64) {}
+
+        fn take_published(&self, _: u64) -> Vec<Record> {
+            self.asked.fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(self.pass_ms));
+            Vec::new()
+        }
+
+        fn cores(&self) -> u16 {
+            1
+        }
+
+        fn report(&self) -> crate::mlat_host::MlatReport {
+            crate::mlat_host::MlatReport::default()
+        }
+
+        fn sealed_bins(&self) -> Option<tally_mlat_solver::held::SealedBins> {
+            None
+        }
+    }
+
+    /// Sweep 6: a pass of the timed duties, however long, holds no task of the async runtime. Before,
+    /// the duties ran as a runtime task, and a pass that published a window step's solutions held its
+    /// worker ten seconds with every task woken there: raw's p99 went to seconds. Here the runtime
+    /// has one thread, and a task on it keeps its 10 ms beat through passes of a second each.
+    #[test]
+    fn a_long_pass_of_the_duties_holds_no_task_of_the_runtime() -> Result<(), String> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| error.to_string())?;
+        let hub = Arc::new(Hub::new(8));
+        let slow = Arc::new(Slow {
+            pass_ms: 1_000,
+            asked: AtomicU64::new(0),
+        });
+        hub.network()
+            .host_mlat(Arc::clone(&slow) as Arc<dyn MlatHost>);
+        let longest = runtime.block_on(async {
+            start(Arc::clone(&hub), tokio::runtime::Handle::current());
+            let started = std::time::Instant::now();
+            let mut last = std::time::Instant::now();
+            let mut longest = Duration::ZERO;
+            while started.elapsed() < Duration::from_millis(2_500) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                longest = longest.max(last.elapsed());
+                last = std::time::Instant::now();
+            }
+            longest
+        });
+        assert!(slow.asked.load(Ordering::SeqCst) >= 1, "no pass ran");
+        assert!(
+            longest < Duration::from_millis(500),
+            "a runtime task waited {longest:?} behind a pass"
+        );
+        Ok(())
+    }
     use tally_mlat_solver::tile::{LEVELS, Tile};
     use tally_wire::rendezvous::area_of_cell;
 

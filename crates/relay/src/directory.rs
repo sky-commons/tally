@@ -292,6 +292,9 @@ struct State {
     /// The host name being resolved, and when it may be tried again: never while a resolution is
     /// under way, `RESOLVE_AGAIN_MS` after one failed.
     own_resolving: Option<(String, u64)>,
+    /// Host names answered from here and not by the system's resolver: a test's, whose sandbox may
+    /// have no resolver at all (`Directory::pin_host`). Empty in a running relay.
+    hosts: HashMap<String, std::net::IpAddr>,
     /// The groups each key's held offers answered from, with how many offers each.
     key_groups: HashMap<PublicKey, BTreeMap<Group, usize>>,
     /// Each key's tier, weighed at `tiers_at`; cleared whenever what they are weighed from changes.
@@ -337,6 +340,7 @@ impl Default for State {
             own_offers: Vec::new(),
             own_resolved: None,
             own_resolving: None,
+            hosts: HashMap::new(),
             key_groups: HashMap::new(),
             tiers: HashMap::new(),
             tiers_at: 0,
@@ -631,6 +635,15 @@ impl Coverage {
     }
 }
 
+impl State {
+    /// `address` (a host name and port) as `Directory::pin_host` pinned its host, if it did.
+    fn pinned(&self, address: &str) -> Option<std::net::SocketAddr> {
+        let (host, port) = address.rsplit_once(':')?;
+        let ip = self.hosts.get(host)?;
+        Some(std::net::SocketAddr::new(*ip, port.parse().ok()?))
+    }
+}
+
 impl Directory {
     pub fn new() -> Self {
         Self::default()
@@ -639,6 +652,13 @@ impl Directory {
     /// The key the relay's own offers are signed with, once it has offered.
     pub fn own_key(&self) -> Option<PublicKey> {
         lock(&self.state).own
+    }
+
+    /// Answers `host` with `ip` whatever the system's resolver says: a test of resolving a host
+    /// name must not depend on the resolver of the machine (or sandbox) it runs in.
+    #[cfg(test)]
+    pub(crate) fn pin_host(&self, host: &str, ip: std::net::IpAddr) {
+        lock(&self.state).hosts.insert(host.to_owned(), ip);
     }
 
     #[cfg(test)]
@@ -923,8 +943,12 @@ impl Directory {
             if let Some(address) = resolve {
                 lock(&self.state).own_resolving = Some((address.clone(), u64::MAX));
                 let state = Arc::clone(&self.state);
+                let pinned = lock(&state).pinned(&address);
                 runtime.spawn(async move {
-                    let resolved = resolved_address(&address).await;
+                    let resolved = match pinned {
+                        Some(address) => Some(address),
+                        None => resolved_address(&address).await,
+                    };
                     // By the clock of the tick that asked.
                     lock(&state).resolved(&address, resolved, now_ms);
                 });
@@ -3052,6 +3076,9 @@ mod tests {
         }
         let hub = own_relay(&identity, &format!("localhost:{port}"), cell);
         let mine = Directory::new();
+        // The sandbox this runs in may have no resolver, so `localhost` is pinned to where the
+        // listener above answers.
+        mine.pin_host("localhost", std::net::Ipv4Addr::LOCALHOST.into());
         let mut now = NOW;
         let mut gossiped = mine.tick(&hub, Some(&identity), now);
         for _ in 0..100 {

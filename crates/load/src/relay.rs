@@ -54,14 +54,19 @@ fn free_port(host: &str) -> Result<u16, String> {
 /// one) and serving its stats on loopback, hosting MLAT (`mlat`) or not (`--no-mlat`); `extra`
 /// follows the harness's own arguments, so it overrides them. Returns once it accepts connections.
 pub fn spawn(
-    bin: &Path,
-    listen: &str,
-    max_upload: &str,
-    mlat: bool,
-    extra: &[String],
+    how: &crate::config::Spawn,
     feeders: usize,
     state_dir: &Path,
 ) -> Result<Spawned, String> {
+    let crate::config::Spawn {
+        bin,
+        listen,
+        max_upload,
+        args: extra,
+        mlat,
+        fit,
+    } = how;
+    let (mlat, fit) = (*mlat, *fit);
     std::fs::create_dir_all(state_dir)
         .map_err(|error| format!("{}: {error}", state_dir.display()))?;
     let identity = Identity::generate().map_err(|error| error.to_string())?;
@@ -81,6 +86,31 @@ pub fn spawn(
     let stats = format!("127.0.0.1:{}", free_port("127.0.0.1")?);
     // A feeder holds its session and, while it probes, a probe's.
     let connections = (2 * feeders + 1024).to_string();
+    let mut args: Vec<String> = vec![
+        "--key".into(),
+        key_file.display().to_string(),
+        "--max-upload".into(),
+        max_upload.into(),
+        "--listen".into(),
+        listen.clone(),
+        "--stats-listen".into(),
+        stats.clone(),
+        "--max-connections".into(),
+        connections.clone(),
+        "--max-connections-per-address".into(),
+        connections,
+    ];
+    if !mlat {
+        args.push("--no-mlat".into());
+    }
+    args.extend(extra.iter().cloned());
+    if fit {
+        let memory = fitted_memory(bin, &args, feeders)?;
+        eprintln!(
+            "tally-load: the relay's --memory is {memory} bytes, what {feeders} feeders need"
+        );
+        args.extend(["--memory".into(), memory.to_string()]);
+    }
     let log = state_dir.join("relay.log");
     let output =
         std::fs::File::create(&log).map_err(|error| format!("{}: {error}", log.display()))?;
@@ -99,15 +129,7 @@ pub fn spawn(
         });
     }
     let child = command
-        .arg("--key")
-        .arg(&key_file)
-        .args(["--max-upload", max_upload])
-        .args(["--listen", &listen])
-        .args(["--stats-listen", &stats])
-        .args(["--max-connections", &connections])
-        .args(["--max-connections-per-address", &connections])
-        .args(if mlat { &[][..] } else { &["--no-mlat"][..] })
-        .args(extra)
+        .args(&args)
         .stdin(Stdio::null())
         .stdout(output)
         .stderr(errors)
@@ -144,6 +166,123 @@ pub fn spawn(
         std::thread::sleep(Duration::from_millis(100));
     }
     Ok(spawned)
+}
+
+/// The least `--memory` that admits `feeders` to the relay `bin` started with `args`: what
+/// `tally-relay check` says it holds before any feeder and reserves for each
+/// (`Budget::memory_for`), as an operator sizing a deploy for them reads it.
+fn fitted_memory(bin: &Path, args: &[String], feeders: usize) -> Result<u64, String> {
+    let output = Command::new(bin)
+        .arg("check")
+        .args(args)
+        .output()
+        .map_err(|error| format!("{} check: {error}", bin.display()))?;
+    if !output.status.success() {
+        return Err(format!(
+            "{} check refused: {}",
+            bin.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let plan = String::from_utf8_lossy(&output.stdout);
+    let line = |name: &str| -> Result<u64, String> {
+        plan.lines()
+            .find_map(|line| line.strip_prefix(name)?.strip_prefix(' ')?.parse().ok())
+            .ok_or_else(|| format!("{} check printed no {name}", bin.display()))
+    };
+    Ok(line("before-feeders")? + line("per-feeder")? * feeders as u64)
+}
+
+/// What the relay's peak resident memory came to beside the memory it is budgeted (`GET /memory`)
+/// and the headroom it keeps below the memory it runs in (`budget::headroom_for`): the
+/// allocator's free pages not yet returned, stacks and the kernel's socket buffers that no store
+/// charges. Past the two, a relay sized for its load is throttled at `memory.high` or killed at
+/// `memory.max` (F3 of sweep 6).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Fit {
+    pub peak_bytes: u64,
+    pub budget_bytes: u64,
+    pub headroom_bytes: u64,
+}
+
+impl Fit {
+    /// Whether the peak stayed within the budget and the headroom.
+    pub fn within(&self) -> bool {
+        self.peak_bytes <= self.budget_bytes + self.headroom_bytes
+    }
+
+    /// The peak beyond the budget, which the headroom must hold.
+    pub fn over_budget(&self) -> u64 {
+        self.peak_bytes.saturating_sub(self.budget_bytes)
+    }
+}
+
+/// What the relay's stores and base are charged now (`GET /memory`): its base and every gauge's
+/// bytes held, beside which its resident memory is what the allocator keeps and what no store
+/// charges, which its headroom holds (`budget::headroom_for`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Charged {
+    pub base: u64,
+    pub held: u64,
+}
+
+impl Charged {
+    /// What its base and stores are charged together.
+    pub fn total(&self) -> u64 {
+        self.base + self.held
+    }
+}
+
+/// What the relay may be resident at most, having been charged at most `peak` bytes for its base
+/// and stores so far: those, and its headroom for them (`budget::headroom_for`). An allocator keeps
+/// what was once in use for reuse, so what the relay holds follows the most it was charged, not
+/// what it is charged now; past this it holds more than its plan keeps room for (F3 of sweep 6).
+pub fn resident_allowed(peak: u64) -> u64 {
+    peak + tally_relay::budget::headroom_for(usize::try_from(peak).unwrap_or(usize::MAX)) as u64
+}
+
+pub fn charged(stats: &str) -> Result<Charged, String> {
+    let body = get(stats, "/memory")?;
+    let json: serde_json::Value = serde_json::from_str(&body).map_err(|error| error.to_string())?;
+    let budget = json.get("budget").ok_or("no budget")?;
+    let held = |gauge: Option<&serde_json::Value>| {
+        gauge
+            .and_then(|gauge| gauge.get("held"))
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+    };
+    let stores: u64 = budget
+        .get("stores")
+        .and_then(serde_json::Value::as_array)
+        .map_or(0, |stores| {
+            stores.iter().map(|store| held(Some(store))).sum()
+        });
+    let rooms: u64 = [
+        "oversize",
+        "connection_buffers",
+        "member_links",
+        "parity_assembly",
+    ]
+    .iter()
+    .map(|room| held(budget.get(room)))
+    .sum();
+    Ok(Charged {
+        base: budget
+            .get("base")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
+        held: stores + rooms,
+    })
+}
+
+/// The relay's memory budget (`GET /memory`, the budget's `memory`).
+pub fn budget(stats: &str) -> Result<u64, String> {
+    let body = get(stats, "/memory")?;
+    let json: serde_json::Value = serde_json::from_str(&body).map_err(|error| error.to_string())?;
+    json.get("budget")
+        .and_then(|budget| budget.get("memory"))
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| format!("{stats}/memory: no budget memory"))
 }
 
 /// A process's CPU and memory at one moment.
@@ -267,9 +406,10 @@ pub fn admission(stats: &str) -> Result<Admission, String> {
 }
 
 /// What a relay hosting MLAT says of its window steps' clock fits (`GET /mlat`, `steps_total`):
-/// the clock models fitted and those whose fit failed, since it started, and why the last failed.
+/// the clock fits tried and those of them that failed, since it started, and why the last failed.
 #[derive(Clone, Debug, Default)]
 pub struct Fits {
+    /// Every fit tried, failed or not.
     pub fits: u64,
     pub unfitted: u64,
     /// Clocks the fits dropped as cut off from their gauge (`disconnected`).
@@ -279,12 +419,21 @@ pub struct Fits {
 }
 
 impl Fits {
-    /// The share of the fits tried between `before` and this that failed, if any were tried.
+    /// The share of the fits tried between `before` and this that failed, if any were tried. The
+    /// relay's `fits` counts every fit tried, those that failed among them (`unfitted`,
+    /// `tally_mlat::window`), so the share is `unfitted / fits`. Before, it was taken over
+    /// `fits + unfitted`, each failure counted twice in the whole: a window where about 87% of
+    /// fits failed read 45% (sweep 6, F8).
     pub fn failed_since(&self, before: &Self) -> Option<f64> {
-        let fits = self.fits.saturating_sub(before.fits);
+        let tried = self.fits.saturating_sub(before.fits);
         let unfitted = self.unfitted.saturating_sub(before.unfitted);
-        let tried = fits + unfitted;
-        (tried > 0).then(|| unfitted as f64 / tried as f64)
+        (tried > 0).then(|| unfitted.min(tried) as f64 / tried as f64)
+    }
+
+    /// The fits that succeeded between `before` and this.
+    pub fn fitted_since(&self, before: &Self) -> u64 {
+        let tried = self.fits.saturating_sub(before.fits);
+        tried.saturating_sub(self.unfitted.saturating_sub(before.unfitted))
     }
 }
 
@@ -370,6 +519,52 @@ mod tests {
     #[test]
     fn a_chunked_body_is_read_whole() {
         assert_eq!(dechunk("4\r\n{\"a\"\r\n3\r\n:1}\r\n0\r\n\r\n"), "{\"a\":1}");
+    }
+
+    /// Sweep 6, F8: `fits` counts every fit tried, so 348 of 400 failed is 87%, not the 46.5% of
+    /// `348 / (400 + 348)`.
+    #[test]
+    fn the_failure_share_is_the_failed_over_the_fits_tried() {
+        let before = Fits {
+            fits: 100,
+            unfitted: 2,
+            ..Fits::default()
+        };
+        let now = Fits {
+            fits: 500,
+            unfitted: 350,
+            ..Fits::default()
+        };
+        assert_eq!(now.failed_since(&before), Some(0.87));
+        assert_eq!(now.fitted_since(&before), 52);
+        assert_eq!(before.failed_since(&before), None);
+    }
+
+    /// F3 of sweep 6: the relay's peak resident memory is held to its budget and the headroom,
+    /// and no more.
+    #[test]
+    fn a_peak_past_the_budget_and_its_headroom_fails_the_run() {
+        let fit = |peak_bytes| Fit {
+            peak_bytes,
+            budget_bytes: 1_000,
+            headroom_bytes: 100,
+        };
+        assert!(fit(900).within());
+        assert!(fit(1_100).within());
+        assert_eq!(fit(1_100).over_budget(), 100);
+        assert!(!fit(1_101).within());
+    }
+
+    /// F3 of sweep 6: what the relay may hold follows the most it was charged.
+    #[test]
+    fn the_resident_memory_allowed_follows_the_most_charged() {
+        let headroom = tally_relay::budget::HEADROOM_BYTES as u64;
+        assert_eq!(resident_allowed(0), headroom);
+        let gib = 1u64 << 30;
+        assert_eq!(
+            resident_allowed(4 * gib),
+            4 * gib + headroom + 4 * gib * tally_relay::budget::ALLOCATOR_PERCENT as u64 / 100
+        );
     }
 
     #[test]

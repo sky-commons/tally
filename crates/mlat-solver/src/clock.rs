@@ -11,8 +11,10 @@ use crate::scope::{Citation, Window};
 /// or clock model names it; two engines agree exactly only under the same version. Version 2 added
 /// the gauge's rate and the sync aircraft's position biases; version 3 the tile models; version 4
 /// fits a GNSS-disciplined clock as it behaves (no prior ties it to the gauge's stamps) and drops a
-/// clock nothing places.
-pub const SPEC_VERSION: u16 = 4;
+/// clock nothing places; version 5 dates a free-running gauge's origin by the least bound every
+/// cited reception of its clock gives (not its anchor batch's wall clock alone), rejects a sync
+/// message any receiver heard more than once in the window, and starts the fit robustly.
+pub const SPEC_VERSION: u16 = 5;
 
 // Relays judge fault proofs by the tolerance the wire sets per version: a version the wire does
 // not know would make every proof of it unjudgeable (as bumping to 4 once did in `tally-merge`).

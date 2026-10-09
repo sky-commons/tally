@@ -373,3 +373,44 @@ fn solutions_are_packed_into_as_few_records_as_hold_them_in_order() -> Result<()
     );
     Ok(())
 }
+
+/// Sweep 6, N6: packing signs record after record, and on a gate of one permit a provisional step
+/// waits for one signing at most: a checkpoint comes before every one. Before, the packing of a
+/// window's solutions (tens of signings, each over up to the wire's largest record) was one item.
+/// And each record is signed once, over the prefix the wire measures it holds
+/// (`Positions::fitting`): before, each was found by signing ever shorter prefixes of all that was
+/// left, about twice what was left signed a record, and a window step of 80,000 solutions packed
+/// for two minutes on one thread.
+#[test]
+fn packing_signs_each_record_once_and_checkpoints_before_every_signing() -> Result<(), String> {
+    let identity = Identity::from_seed([4; 32]);
+    let all = (0..=255u8)
+        .cycle()
+        .take(700)
+        .map(solution)
+        .collect::<Result<Vec<_>, _>>()?;
+    let signed = std::cell::Cell::new(0u64);
+    let before = tally_mlat_solver::gate::checkpoints_here();
+    let records = pack_with(10, all, |sequence, run: &[tally_wire::Solution]| {
+        signed.set(signed.get() + 1);
+        Positions::sign_solutions(
+            &identity,
+            &SolutionsContent {
+                boot_id: 1,
+                sequence,
+                issued_ms: 2,
+                spec_version: SPEC_VERSION,
+                solutions: run.to_vec(),
+            },
+        )
+    });
+    let passed = tally_mlat_solver::gate::checkpoints_here() - before;
+    assert!(records.len() >= 2);
+    assert_eq!(signed.get(), records.len() as u64);
+    assert!(
+        passed >= signed.get(),
+        "{passed} checkpoints for {} signings",
+        signed.get()
+    );
+    Ok(())
+}

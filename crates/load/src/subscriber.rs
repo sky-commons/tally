@@ -111,6 +111,9 @@ pub struct Client {
     pub heard: Heard,
     pub counts: Counts,
     pub raw_latency: Mutex<Histogram>,
+    /// The most a raw batch took since the progress line last read it (`lib::progress`): when in
+    /// the run raw was slow, which the window's histogram does not say.
+    pub raw_max_since_ms: AtomicU64,
     pub dedup_latency: Mutex<Histogram>,
     /// Each provisional solution's transmission to its reading: RFC-0174 §2.4's fast MLAT.
     pub provisional_latency: Mutex<Histogram>,
@@ -444,6 +447,9 @@ fn decode(work: &std::sync::mpsc::Receiver<Work>, verify: bool, client: &Client)
             if let Ok(mut histogram) = client.raw_latency.lock() {
                 histogram.record(latency);
             }
+            client
+                .raw_max_since_ms
+                .fetch_max(latency, Ordering::Relaxed);
         } else {
             counts
                 .dedup_receptions

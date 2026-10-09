@@ -352,6 +352,8 @@ fn gather(inputs: &Inputs, second: u64, reversed: bool) -> Result<(Identity, Vec
     let relay = Identity::generate().map_err(err)?;
     let peer = Identity::generate().map_err(err)?.public();
     let products = Products::new();
+    // The peer that hands these in is a member admitted, as one is on its first data.
+    let _member = products.member(PEER);
     products.set_world(true);
     let now = second * 1_000 + 1_500;
     let mut shown: Vec<Record> = inputs
@@ -516,6 +518,8 @@ fn no_aircraft_has_two_fixes_in_one_second_and_a_late_fix_is_dropped() -> Result
     let origin = Identity::generate().map_err(err)?;
     let cell = area_of(&place(33.7, -84.4)).map_err(err)?;
     let products = Products::new();
+    // The peer that hands these in is a member admitted, as one is on its first data.
+    let _member = products.member(PEER);
     products.set_world(true);
     let mlat = Mlat::new()?;
     products.clock_model(&mlat.model, PEER, BASE_MS);
@@ -734,6 +738,8 @@ fn a_peer_regional_batch_is_forwarded_once_unchanged_within_the_areas_taken() ->
     let atlanta = area_of(&place(33.7, -84.4)).map_err(err)?;
     let chicago = area_of(&place(41.9, -87.6)).map_err(err)?;
     let products = Products::new();
+    // The peer that hands these in is a member admitted, as one is on its first data.
+    let _member = products.member(PEER);
     products.set_taken(vec![atlanta]);
     let now = BASE_MS + 100;
     let taken = regional(&origin, atlanta, 0, BASE_MS, adsb_second(&[1, 2], 0, false))?;
@@ -952,6 +958,8 @@ fn what_a_busy_area_and_the_world_cost_a_second() -> Result<()> {
     const WORLD_ADSB: u32 = 12_000;
     const WORLD_TARGETS: u32 = 5_400;
     let gatherer = Products::new();
+    // The peer that hands these in is a member admitted, as one is on its first data.
+    let _member = gatherer.member(PEER);
     gatherer.set_world(true);
     let peer = Identity::generate().map_err(err)?.public();
     let origin = Identity::generate().map_err(err)?;
@@ -1043,6 +1051,8 @@ fn the_precise_world_waits_for_finals_and_takes_no_provisional() -> Result<()> {
     let relay = Identity::generate().map_err(err)?;
     let peer = Identity::generate().map_err(err)?.public();
     let products = Products::new();
+    // The peer that hands these in is a member admitted, as one is on its first data.
+    let _member = products.member(PEER);
     products.set_world(true);
     products.set_world_precise(true);
     let now = second * 1_000 + 1_500;
@@ -1111,6 +1121,8 @@ fn the_precise_world_waits_for_finals_and_takes_no_provisional() -> Result<()> {
 #[test]
 fn every_drop_is_counted_by_why() -> Result<()> {
     let products = Products::new();
+    // The peer that hands these in is a member admitted, as one is on its first data.
+    let _member = products.member(PEER);
     products.set_world(true);
     let mlat = Mlat::new()?;
     // A fix a minute ahead of the relay's clock, under a model it holds: outside the window.
@@ -1185,6 +1197,8 @@ fn records_wait_apart_from_the_epochs_and_are_taken_in_by_stamp() -> Result<()> 
     use crate::budget::Store;
     // The flood: more records than their share holds, stamped far ahead so none is taken in.
     let products = Arc::new(Products::with_boot(1, 1));
+    // The peer that hands these in is a member admitted, as one is on its first data.
+    let _member = products.member(PEER);
     products.on_thread(
         crate::ingest::Threads {
             ingest: 1,
@@ -1200,9 +1214,9 @@ fn records_wait_apart_from_the_epochs_and_are_taken_in_by_stamp() -> Result<()> 
     let budget = products_budget(1 << 20, HELD * len);
     let gauge = budget.gauge(Store::Records);
     products.charge_to(&budget);
-    // One session floods, the only one open: it fills its own part of the share (`RecordsRoom`),
-    // the peers' whole part, no more.
-    let fits = super::session_part(super::peers_part(HELD * len), 1) / len;
+    // One member floods, the only one admitted: it fills its own part of the share
+    // (`RecordsRoom`), half the peers' (the other is this relay's own rebuilding's), no more.
+    let fits = super::session_part(super::peers_part(HELD * len), 2) / len;
     for _ in 0..fits + 10 {
         products.positions(&flood, PEER, BASE_MS + 1_000_000);
     }
@@ -1233,6 +1247,8 @@ fn records_wait_apart_from_the_epochs_and_are_taken_in_by_stamp() -> Result<()> 
     // outputs take their own room.
     let relay = Identity::generate().map_err(err)?;
     let products = Products::new();
+    // The peer that hands these in is a member admitted, as one is on its first data.
+    let _member = products.member(PEER);
     products.set_world(true);
     let mlat = Mlat::new()?;
     let second = BASE_MS / 1_000;
@@ -1246,10 +1262,11 @@ fn records_wait_apart_from_the_epochs_and_are_taken_in_by_stamp() -> Result<()> 
     products.clock_model(&mlat.model, PEER, BASE_MS);
     products.positions(&late, PEER, seals);
     products.positions(&in_time, PEER, seals - 1);
-    // The flood comes from another session than the engine's records: it fills a part of its
-    // own, half the peers' with two sessions open.
+    // The flood comes from another member than the engine's records: it fills a part of its
+    // own, a third of the peers' with two members admitted beside this relay's own rebuilding.
     const FLOODER: u64 = PEER + 1;
-    let fits = super::session_part(super::peers_part(limit), 2) / len;
+    let _flooder = products.member(FLOODER);
+    let fits = super::session_part(super::peers_part(limit), 3) / len;
     for _ in 0..fits + 10 {
         products.positions(&flood, FLOODER, BASE_MS + 1_000_000);
     }
@@ -1305,10 +1322,10 @@ fn own_output_and_each_session_have_a_part_of_the_records_share_whatever_came_fi
         products.adopt_identity(&own.engine);
         let budget = products_budget(1 << 20, limit);
         products.charge_to(&budget);
-        products.joined(HOSTILE);
-        for session in 1..=HONEST {
-            products.joined(session);
-        }
+        let _hostile = products.member(HOSTILE);
+        let _honest: Vec<_> = (1..=HONEST)
+            .map(|session| products.member(session))
+            .collect();
         let flood = || -> Result<()> {
             for key in &throwaway {
                 for sequence in 0..200 {
@@ -1373,12 +1390,70 @@ fn a_session_leaving_gives_its_part_to_those_open() -> Result<()> {
         }
         Ok(records - (products.report().records_refused - before))
     };
-    products.joined(1);
-    products.joined(2);
+    let _first = products.member(1);
+    let second = products.member(2);
+    let third = (super::session_part(peers, 3) / len) as u64;
+    assert_eq!(taken(1, 1_000, 0)?, third);
+    drop(second);
     let half = (super::session_part(peers, 2) / len) as u64;
-    assert_eq!(taken(1, 1_000, 0)?, half);
-    products.left(2);
-    let whole = (super::session_part(peers, 1) / len) as u64;
-    assert_eq!(taken(1, 1_000, 1_000)?, whole - half);
+    assert_eq!(taken(1, 1_000, 1_000)?, half - third);
+    Ok(())
+}
+
+/// Sweep 6, F2: only a session admitted as a member has a part of the records' share, so the
+/// sessions that divide it are the members that send records, bounded as the members are. Two
+/// thousand and forty-eight sessions that are no member (directory links and engines, each opened
+/// as every session is, `Network::joined`) leave the one member admitted the part it would have
+/// alone; a record one of them hands in is refused, having no part; and a member's part ends with
+/// its admission. When every relay and engine session had a part, each member's bound was the
+/// peers' share over 2,049.
+#[test]
+fn only_a_member_admitted_divides_the_records_share() -> Result<()> {
+    use crate::budget::{Budget, Plan};
+    let network = crate::network::Network::new();
+    let mlat = Mlat::new()?;
+    let one = |sequence: u64| mlat.solutions(&[0x00c0_0001], BASE_MS, 0, true, sequence);
+    let len = one(0)?.as_bytes().len();
+    let limit = 200 * len;
+    let ahead = BASE_MS + 1_000_000;
+    network.products.charge_to(&products_budget(1 << 20, limit));
+    let stranger = Identity::generate().map_err(err)?.public();
+    const OTHERS: u64 = 2_048;
+    for source in 100..100 + OTHERS {
+        network.joined(&Asker {
+            role: if source % 2 == 0 {
+                AskerRole::Relay
+            } else {
+                AskerRole::Engine
+            },
+            key: stranger,
+            source,
+            loopback: false,
+            address: None,
+        });
+    }
+    let plan = Plan::planned(false).with_members(1, crate::hub::DEFAULT_MAX_MEMBER_BYTES_PER_SEC);
+    let members = Budget::of_memory(Budget::memory_for(1, plan), plan);
+    const MEMBER: u64 = 1;
+    let membership =
+        network.admit_member(MEMBER, members.reserve_member().ok_or("no member's place")?);
+    let taken = |source: u64, records: u64, first: u64| -> Result<u64> {
+        let before = network.products.report().records_refused;
+        for sequence in first..first + records {
+            network.on_positions(&one(sequence)?, source, ahead);
+        }
+        Ok(records - (network.products.report().records_refused - before))
+    };
+    // Its part beside this relay's own rebuilding's, as if no other session were open.
+    let alone = (super::session_part(super::peers_part(limit), 2) / len) as u64;
+    assert!(alone > 1);
+    assert_eq!(taken(MEMBER, 2 * alone, 0)?, alone);
+    // A directory link and an engine have no part.
+    assert_eq!(taken(100, 1, 10_000)?, 0);
+    assert_eq!(taken(101, 1, 10_001)?, 0);
+    // Its admission ended: its part with it, and its reservation is the members' again.
+    drop(membership);
+    assert_eq!(taken(MEMBER, 1, 20_000)?, 0);
+    assert!(members.reserve_member().is_some());
     Ok(())
 }

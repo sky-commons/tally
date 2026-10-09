@@ -48,7 +48,9 @@
 //! /16 or an IPv6 /32, `directory::Group`, the unit every flood is bucketed by). A fresh key per
 //! connection therefore starts from what its network's strangers left, never from a full allowance
 //! of its own, and takes nothing from any feeder's; and one hostile prober, however many keys it
-//! makes, spends only its own network's allowance, never a stranger's elsewhere.
+//! makes, spends only its own network's allowance, never a stranger's elsewhere, however many
+//! networks it asks from: past the groups remembered, the one nearest to whole is forgotten for a
+//! new one, never a group shared by every network past them.
 //!
 //! The state is sharded by receiver, under a process-secret hash, so one lock is never every
 //! feeder's.
@@ -92,10 +94,11 @@ pub const FED_WITHIN_MS: u64 = TAG_WINDOW_MS;
 /// grants it keys once a minute. Every key that never fed the relay, together, is one prober.
 pub const PROBER_QUERIES: u32 = 4;
 pub const PROBER_QUERY_EVERY_MS: u64 = 1_000;
-/// The network groups whose strangers' allowances are remembered at most. An allowance earned back
-/// whole is no different from none and is forgotten first; past the bound, every further group's
-/// strangers share one allowance (`Strangers::overflow`), so a prober spread over more networks
-/// than this spends that one and never a remembered group's.
+/// The network groups whose strangers' allowances are remembered at most. Past the bound the group
+/// nearest to having earned its allowance back whole is forgotten to make room for a new one
+/// (`Strangers::spend`): a group that earned it back is no different from one never seen, so a
+/// new group always has an allowance of its own, and the groups kept are those that spent most,
+/// whose debts forgetting would forgive.
 pub const STRANGER_GROUPS: usize = 4_096;
 /// Locks the state is split under.
 const SHARDS: usize = 64;
@@ -130,46 +133,50 @@ pub struct Delivery {
 /// The strangers' allowances, one per network group (`Delivery::allowed`): a key costs nothing,
 /// an address in another network does, so strangers are rationed by where they ask from. A prober
 /// with no address (a stream that is no socket) is a group of its own, `None`.
+///
+/// At most `STRANGER_GROUPS` are remembered, and a new group past them takes the place of the one
+/// nearest to whole ([`Allowance::whole_at`], the least spent). Never one allowance every further
+/// group shares: then a prober spread over more networks than the bound (a botnet's) spent that
+/// one and every honest newcomer was refused. Nor the group that spent most: forgetting it
+/// forgives the largest debt, so a botnet cycling its groups would have each one's allowance
+/// back whole. Forgetting the least spent forgives the least there is, a newcomer is answered at
+/// once, and the groups that spent their allowances stay remembered, refused until they earn
+/// queries back.
 #[derive(Default)]
 struct Strangers {
     groups: HashMap<Option<Group>, Allowance>,
-    /// The one allowance every group past `STRANGER_GROUPS` shares.
-    overflow: Option<Allowance>,
-    /// When those earned back whole were last forgotten: again only once every allowance spent
-    /// then could have been earned back (`WHOLE_AFTER_MS`), so the map is scanned at most once in
-    /// that time, never a query.
-    swept_ms: Option<u64>,
+    /// Every group remembered, by when its allowance is whole again: the first is the one
+    /// forgotten for a new group.
+    by_whole: BTreeSet<(u64, Option<Group>)>,
 }
-
-/// How long an allowance spent to nothing takes to be earned back whole.
-const WHOLE_AFTER_MS: u64 = PROBER_QUERIES as u64 * PROBER_QUERY_EVERY_MS;
 
 impl Strangers {
     /// Spends one query of `group`'s strangers at `now_ms`, if one is left.
     fn spend(&mut self, group: Option<Group>, now_ms: u64) -> bool {
-        if let Some(allowance) = self.groups.get_mut(&group) {
-            return allowance.spend(now_ms);
-        }
-        if self.groups.len() >= STRANGER_GROUPS
-            && self
-                .swept_ms
-                .is_none_or(|swept| now_ms.saturating_sub(swept) >= WHOLE_AFTER_MS)
-        {
-            self.groups.retain(|_, allowance| !allowance.whole(now_ms));
-            self.swept_ms = Some(now_ms);
-        }
-        if self.groups.len() >= STRANGER_GROUPS {
-            return self
-                .overflow
-                .get_or_insert_with(|| Allowance::full(now_ms))
-                .spend(now_ms);
-        }
-        self.groups
-            .entry(group)
-            .or_insert_with(|| Allowance::full(now_ms))
-            .spend(now_ms)
+        let mut allowance = match self.groups.get(&group) {
+            Some(allowance) => {
+                self.by_whole.remove(&(allowance.whole_at(), group));
+                *allowance
+            }
+            None => {
+                if self.groups.len() >= STRANGER_GROUPS
+                    && let Some((_, least)) = self.by_whole.pop_first()
+                {
+                    self.groups.remove(&least);
+                }
+                Allowance::full(now_ms)
+            }
+        };
+        let spent = allowance.spend(now_ms);
+        self.by_whole.insert((allowance.whole_at(), group));
+        self.groups.insert(group, allowance);
+        spent
     }
 }
+
+/// How long an allowance spent to nothing takes to be earned back whole.
+#[cfg(test)]
+const WHOLE_AFTER_MS: u64 = PROBER_QUERIES as u64 * PROBER_QUERY_EVERY_MS;
 
 impl Default for Delivery {
     fn default() -> Self {
@@ -240,10 +247,12 @@ impl Allowance {
         }
     }
 
-    /// Whether it has earned back every query by `now_ms`: no different from a fresh one.
-    fn whole(&self, now_ms: u64) -> bool {
-        let earned = now_ms.saturating_sub(self.as_of_ms) / PROBER_QUERY_EVERY_MS;
-        u64::from(self.left).saturating_add(earned) >= u64::from(PROBER_QUERIES)
+    /// When it has earned back every query, and is no different from a fresh one: the later, the
+    /// more it has spent.
+    fn whole_at(&self) -> u64 {
+        let owed = u64::from(PROBER_QUERIES.saturating_sub(self.left));
+        self.as_of_ms
+            .saturating_add(owed.saturating_mul(PROBER_QUERY_EVERY_MS))
     }
 
     /// Spends one query at `now_ms` if one is left after what it earned since; false if none is.
@@ -1306,28 +1315,58 @@ mod tests {
         Ok(())
     }
 
-    /// The strangers' groups remembered are bounded: past `STRANGER_GROUPS` (those earned back
-    /// whole forgotten first), the further groups share one allowance, so a prober spread over
-    /// more networks than that is answered no more than one allowance past them.
+    /// Sweep 6, R3: the strangers' groups remembered are bounded, and a flood of groups past the
+    /// bound (a botnet's networks, here twice as many as are remembered, each spending every
+    /// query it is given) never refuses a newcomer: each network that asks after it is answered
+    /// its own allowance. The flood's groups that spent theirs stay remembered and refused, so
+    /// what is forgotten to make room is never the debt of a group that spent it; and once a
+    /// group has earned its allowance back it is the first forgotten. When every group past the
+    /// bound shared one allowance, the botnet spent it and every newcomer was refused.
     #[test]
-    fn strangers_past_the_groups_remembered_share_one_allowance() {
+    fn a_flood_of_groups_never_refuses_a_newcomer() {
         let mut strangers = Strangers::default();
-        let group = |n: usize| Some(Group::V4(u16::try_from(n).unwrap_or(u16::MAX)));
-        for n in 0..STRANGER_GROUPS {
-            assert!(strangers.spend(group(n), T0));
+        let group = |n: usize| Some(Group::V6(u32::try_from(n).unwrap_or(u32::MAX)));
+        let queries = PROBER_QUERIES as usize;
+        // The botnet floods first, from every one of its networks.
+        let botnet = 2 * STRANGER_GROUPS;
+        for n in 0..botnet {
+            while strangers.spend(group(n), T0) {}
         }
-        let past = (STRANGER_GROUPS..STRANGER_GROUPS + 100)
-            .filter(|n| strangers.spend(group(*n), T0))
-            .count();
-        assert_eq!(past, PROBER_QUERIES as usize);
         assert!(strangers.groups.len() <= STRANGER_GROUPS);
-        // Once the remembered groups have earned their queries back, they are forgotten, and a new
-        // group has an allowance of its own again.
-        let later = T0 + WHOLE_AFTER_MS;
-        let fresh = (0..2 * STRANGER_GROUPS)
-            .filter(|n| strangers.spend(group(STRANGER_GROUPS + 100 + n % 7), later))
-            .count();
-        assert_eq!(fresh, 7 * PROBER_QUERIES as usize);
+        // Newcomers, each from a network of its own: every one is answered its whole allowance.
+        let newcomers = 100;
+        let answered = (0..newcomers)
+            .map(|n| {
+                (0..2 * queries)
+                    .filter(|_| strangers.spend(group(botnet + n), T0 + 1))
+                    .count()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(answered, vec![queries; newcomers]);
+        assert!(strangers.groups.len() <= STRANGER_GROUPS);
+        // Each newcomer took the place of the network nearest to whole: a hundred of the botnet's,
+        // and every one of its networks still remembered is still refused.
+        let remembered: Vec<_> = (STRANGER_GROUPS..botnet)
+            .filter(|n| strangers.groups.contains_key(&group(*n)))
+            .collect();
+        assert!(remembered.len() >= STRANGER_GROUPS - newcomers);
+        assert!(
+            remembered
+                .iter()
+                .all(|n| !strangers.spend(group(*n), T0 + 1))
+        );
+        // Once the remembered groups have earned their queries back, a new group still has an
+        // allowance of its own, and so does each of the botnet's.
+        let later = T0 + 1 + WHOLE_AFTER_MS;
+        let fresh = (0..7)
+            .map(|n| {
+                (0..queries)
+                    .filter(|_| strangers.spend(group(10 * botnet + n), later))
+                    .count()
+            })
+            .sum::<usize>();
+        assert_eq!(fresh, 7 * queries);
+        assert!(strangers.spend(group(botnet - 1), later));
     }
 
     #[test]

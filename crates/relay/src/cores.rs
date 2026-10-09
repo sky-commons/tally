@@ -2,7 +2,8 @@
 //! memory half (`budget`). Each stage's threads follow the load the relay is planned to admit,
 //! never a fixed share of the host: the feeders its budget admits and the feeders its members'
 //! shared rate is worth (`Budget::load`), each at the planned rate (one batch a second of
-//! `PLANNED_RECEPTIONS_PER_SEC` receptions), over what one thread of that stage was measured to
+//! `PLANNED_RECEPTIONS_PER_SEC` receptions, the measured mean: the reception pace bounds abuse, it
+//! is not what the cores are planned for), over what one thread of that stage was measured to
 //! sustain, with [`BUSY_PERCENT`] of headroom ([`threads_for`]). The ingest workers' share is the
 //! more of those receptions and the records a second the source may send, each a signature
 //! verified whatever its size ([`Source`], `ingest::INGEST_NANOS_PER_RECORD`); the runtime's is each
@@ -201,9 +202,17 @@ impl Sessions {
         } else {
             0
         };
+        // The bursts new sessions are granted, from one shared pace whatever reconnects
+        // (`ingest::BURST_GRANTS`): planned once, as the directory's pace is.
+        let bursts = if self.general > 0 || self.subscribers > 0 {
+            crate::ingest::BURST_GRANTS.per_minute
+        } else {
+            0
+        };
         general
             .saturating_add(subscribers)
             .saturating_add(directory)
+            .saturating_add(bursts)
     }
 
     /// Nanoseconds of one core a second the plan sets aside for their records.
@@ -723,6 +732,7 @@ mod tests {
             2_048 * crate::ingest::GENERAL_RECORDS_PER_MINUTE
                 + 64 * crate::ingest::SUBSCRIBER_RECORDS.per_minute
                 + crate::ingest::DIRECTORY_RECORDS.per_minute
+                + crate::ingest::BURST_GRANTS.per_minute
         );
         assert_eq!(
             some.planned(),

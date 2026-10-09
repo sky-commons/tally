@@ -444,6 +444,8 @@ impl Known {
 struct RawShard {
     batches: Forwarded<PublicKey>,
     stations: Stations,
+    /// Its receivers' wanted receptions against their ceiling, by their batches' stamps.
+    ceilings: crate::ingest::ReceptionCeilings,
 }
 
 impl RawShard {
@@ -455,6 +457,7 @@ impl RawShard {
                 HASHES_REMEMBERED.div_ceil(SHARDS),
             ),
             stations: Stations::new(STATIONS_REMEMBERED.div_ceil(SHARDS)),
+            ceilings: crate::ingest::ReceptionCeilings::default(),
         }
     }
 }
@@ -502,6 +505,15 @@ pub struct MemoryReport {
     /// short.
     pub ingest_queued: usize,
     pub ingest_refused: u64,
+}
+
+/// Feeders' batches the relay dropped for taking their receiver past its wanted receptions a
+/// second (`Hub::over_reception_ceiling`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
+pub struct OverCeiling {
+    pub batches: u64,
+    /// The wanted receptions those batches carried.
+    pub wanted: u64,
 }
 
 /// A batch a link took in, on its way to the ingest stage.
@@ -757,10 +769,17 @@ pub struct Hub {
     /// The records a second every member session shares, all it sends (`ingest::RecordPace`), at
     /// the feeders `max_member_bytes_per_sec` is worth (`ingest::member_records_per_sec`).
     member_records: Arc<crate::ingest::RecordPace>,
-    /// The records a second every directory link shares, whoever dialled
-    /// (`ingest::DIRECTORY_RECORDS`): planned once, as the gossip it carries is one whatever the
-    /// links.
-    directory_records: Arc<crate::ingest::RecordPace>,
+    /// The records a second every directory link's network group is paced at, whoever dialled
+    /// (`ingest::DirectoryPaces`): equal shares of `ingest::DIRECTORY_RECORDS`, planned once, as
+    /// the gossip it carries is one whatever the links.
+    directory_records: Arc<crate::ingest::DirectoryPaces>,
+    /// What new sessions are granted of their roles' bursts, by network group
+    /// (`ingest::BurstGrants`).
+    burst_grants: crate::ingest::BurstGrants,
+    /// Feeders' batches dropped for taking their receiver past its wanted receptions a second
+    /// (`ingest::ReceptionCeilings`), and the wanted receptions they carried.
+    over_ceiling_batches: AtomicU64,
+    over_ceiling_receptions: AtomicU64,
     /// The areas taken (RFC-0174 §2.1): what the member sessions are planned from
     /// (`budget::members_for`).
     areas: Vec<Region>,
@@ -944,7 +963,10 @@ impl Hub {
             member_records: Arc::new(crate::ingest::RecordPace::new(member_records_for(
                 DEFAULT_MAX_MEMBER_BYTES_PER_SEC,
             ))),
-            directory_records: Arc::new(crate::ingest::DIRECTORY_RECORDS.pace()),
+            directory_records: crate::ingest::DirectoryPaces::new(crate::ingest::DIRECTORY_RECORDS),
+            burst_grants: crate::ingest::BurstGrants::default(),
+            over_ceiling_batches: AtomicU64::new(0),
+            over_ceiling_receptions: AtomicU64::new(0),
             areas: Vec::new(),
             holds_raw: false,
             cores: None,
@@ -1322,9 +1344,24 @@ impl Hub {
         Arc::clone(&self.member_records)
     }
 
-    /// The records a second every directory link shares (`ingest::DIRECTORY_RECORDS`).
-    pub fn directory_records(&self) -> Arc<crate::ingest::RecordPace> {
-        Arc::clone(&self.directory_records)
+    /// The directory links' paces, one share of `ingest::DIRECTORY_RECORDS` per network group
+    /// (`ingest::DirectoryPaces`).
+    pub fn directory_records(&self) -> &Arc<crate::ingest::DirectoryPaces> {
+        &self.directory_records
+    }
+
+    /// What new sessions are granted of their roles' bursts (`ingest::BurstGrants`).
+    pub fn burst_grants(&self) -> &crate::ingest::BurstGrants {
+        &self.burst_grants
+    }
+
+    /// Feeders' batches dropped so far for taking their receiver past its wanted receptions a
+    /// second (`ingest::FEEDER_RECEPTIONS_PER_SEC`), and the wanted receptions they carried.
+    pub fn over_reception_ceiling(&self) -> OverCeiling {
+        OverCeiling {
+            batches: self.over_ceiling_batches.load(Ordering::Relaxed),
+            wanted: self.over_ceiling_receptions.load(Ordering::Relaxed),
+        }
     }
 
     /// The records a second one feeder's session may send (`ingest::records_per_sec` of its byte
@@ -1525,6 +1562,26 @@ impl Hub {
             }
             Err(undecodable) => (undecodable.batch, None),
         };
+        // A feeder's batch that would take its receiver past its wanted receptions a second is
+        // dropped here, counted, never waited for on its read loop (F4 of sweep 6): the feeder
+        // was told the ceiling and sheds to it before it signs, so only one that predates it, or
+        // one that ignores it, meets this. By the batch's stamp, on the worker that owns the
+        // receiver's shard, so the same stamped batches are kept alike on any threads.
+        if let (Origin::Feeder(_), Some(decoded)) = (&origin, &decoded) {
+            let wanted = decoded
+                .views()
+                .filter(|view| tally_wire::modes::wanted_reception(view.format, view.data))
+                .count();
+            let within = shard
+                .lock()
+                .is_ok_and(|mut shard| shard.ceilings.take(receiver, wanted, stamp.stamp_ms));
+            if !within {
+                self.over_ceiling_batches.fetch_add(1, Ordering::Relaxed);
+                self.over_ceiling_receptions
+                    .fetch_add(wanted as u64, Ordering::Relaxed);
+                return false;
+            }
+        }
         let observations = decoded
             .as_ref()
             .map_or(0, |decoded| decoded.observations().len() as u64);
@@ -2112,7 +2169,7 @@ impl Hub {
 
     /// Time passed with nothing ingested: a hub whose stages run on the caller ticks by the
     /// ingest clock now, as an idle worker ticks itself (`ingest::TICK_MS`), so its epochs close
-    /// whether or not batches flow. Called by the timed duties (`network::run`).
+    /// whether or not batches flow. Called by the timed duties (`network::start`).
     pub fn idle(&self) {
         if self.stages.is_inline() {
             self.stages.advance(self.stages.now_ms());
