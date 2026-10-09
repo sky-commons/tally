@@ -518,21 +518,35 @@ fn summary(summary: &Summary) -> String {
         // A batch's time is when it was made: a feeder's seal for raw, and for the deduplicated
         // stream the end of the epoch the relay signed it for (`tally_relay::deduplicated`).
         // A provisional solution's time is its transmission's.
-        for (name, histogram, since, what) in [
-            ("latency: raw", &client.raw_latency, "sealed", "batches"),
+        for (name, stream, histogram, since, what) in [
+            (
+                "latency: raw",
+                tally_wire::Streams::RAW,
+                &client.raw_latency,
+                "sealed",
+                "batches",
+            ),
             (
                 "latency: deduplicated",
+                tally_wire::Streams::DEDUPLICATED,
                 &client.dedup_latency,
                 "epoch end",
                 "batches",
             ),
             (
                 "latency: provisional",
+                tally_wire::Streams::PROVISIONAL,
                 &client.provisional_latency,
                 "transmitted",
                 "solutions",
             ),
         ] {
+            // A stream not asked for has no latency, not an empty one: a row of "0 solutions"
+            // read as a relay that published none.
+            if config.streams.0 & stream.0 == 0 {
+                row(name, "not asked for (--streams)".to_owned());
+                continue;
+            }
             let histogram = histogram
                 .lock()
                 .map(|each| each.clone())
