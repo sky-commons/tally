@@ -30,7 +30,9 @@ For a spawned relay:
   --relay-arg ARG        one more argument to it, after the harness's own (so it overrides them);
                          repeatable. The harness passes --max-connections and
                          --max-connections-per-address of twice the feeders plus 1024 (a feeder
-                         holds a session and, while it probes, a probe) and --mlat-threads 0
+                         holds a session and, while it probes, a probe) and --no-mlat
+  --relay-mlat           let it host MLAT (no --no-mlat): it plans MLAT's memory and cores
+                         beside the stages, so it admits fewer feeders
 
 The load:
   --feeders N            simulated receivers in the whole run, across every shard (default 20000)
@@ -81,6 +83,8 @@ pub enum Relay {
         listen: String,
         max_upload: String,
         args: Vec<String>,
+        /// Whether it hosts MLAT (`--relay-mlat`): else it is started `--no-mlat`.
+        mlat: bool,
     },
     /// A relay already running, at one or more addresses under one key.
     Existing {
@@ -153,6 +157,7 @@ pub fn parse(args: impl Iterator<Item = String>) -> Result<Option<Config>, Strin
     let mut listen = "127.0.0.1:0".to_owned();
     let mut max_upload = "10Gbit/s".to_owned();
     let mut relay_args = Vec::new();
+    let mut relay_mlat = false;
     let mut addresses: Vec<RelayAddress> = Vec::new();
     let mut pid = None;
     let mut stats = None;
@@ -191,6 +196,7 @@ pub fn parse(args: impl Iterator<Item = String>) -> Result<Option<Config>, Strin
             "--relay-listen" => listen = value()?,
             "--max-upload" => max_upload = value()?,
             "--relay-arg" => relay_args.push(value()?),
+            "--relay-mlat" => relay_mlat = true,
             "--feeders" => spec.feeders = number(&flag, &value()?)?,
             "--shard" => config.shard = Shard::parse(&value()?)?,
             "--no-feeders" => config.run_feeders = false,
@@ -236,6 +242,7 @@ pub fn parse(args: impl Iterator<Item = String>) -> Result<Option<Config>, Strin
             listen,
             max_upload,
             args: relay_args,
+            mlat: relay_mlat,
         },
         (true, None) => {
             return Err(format!(

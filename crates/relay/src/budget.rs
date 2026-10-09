@@ -13,8 +13,9 @@
 //! routes around this one (RFC-0174 §2.5). The feeder ceiling is
 //! what the relay's budget holds of a feeder's cost after its own base ([`Plan::base`]:
 //! [`BASE_BYTES`], and [`MLAT_BASE_BYTES`] more when it hosts MLAT) and the members' pool, and no
-//! more than its cores carry beside the members' rate ([`Plan::core_feeders`], `cores`); its
-//! stages' threads follow what it admits ([`Budget::threads`]). The
+//! more than its cores carry beside the members' rate ([`Plan::core_feeders`], `cores`), hosted
+//! MLAT's steps planned in them beside the stages; its stages' threads, and MLAT's, follow what it
+//! admits ([`Budget::threads`], [`Budget::mlat_threads`]). The
 //! budget is `--memory`, by default the memory the relay runs in ([`memory_available`]: the lesser
 //! of its cgroup's `memory.high` and `memory.max`, else the host's) less [`HEADROOM_BYTES`], what
 //! no store charges. A Hello beyond the ceiling is refused ("no spare slot"), and a relay whose
@@ -363,7 +364,7 @@ pub struct Plan {
     /// (`cores::feeders_carried`); none for a plan only its memory bounds (a test's).
     pub cores: Option<usize>,
     /// Whether the relay holds MLAT raw (it hosts MLAT): the base, each feeder's cost in the
-    /// stores and in the cores follow it.
+    /// stores and in the cores (the stages' and MLAT's steps') follow it.
     pub holds_raw: bool,
 }
 
@@ -1027,8 +1028,9 @@ impl Budget {
                 "{cores} cores carry no feeder beside the {} feeders its members' shared rate is \
                  worth (--max-member-bytes-per-sec): planned at {}% busy, a core carries {} \
                  planned feeders' work (ingest, deduplication, sealing and the connections \
-                 together, RFC-0181 \"Sizing\"); give it more cores (the unit's CPUQuota, the \
-                 container's limits.cpu, its CPU affinity) or plan a slower members' rate",
+                 together, and hosted MLAT's steps beside them unless --no-mlat, RFC-0181 \
+                 \"Sizing\"); give it more cores (the unit's CPUQuota, the container's \
+                 limits.cpu, its CPU affinity), plan a slower members' rate or host no MLAT",
                 plan.member_feeders,
                 crate::cores::BUSY_PERCENT,
                 crate::cores::load_carried(1, plan.holds_raw),
@@ -1096,6 +1098,13 @@ impl Budget {
     pub fn threads(&self) -> crate::ingest::Threads {
         let plan = self.plan();
         crate::cores::threads_for(self.load(), plan.holds_raw, plan.cores)
+    }
+
+    /// The threads hosted MLAT's steps are spread over for the load admitted, in the cores the
+    /// stages leave (`cores::mlat_threads_for`): none for a relay that does not host MLAT.
+    pub fn mlat_threads(&self) -> usize {
+        let plan = self.plan();
+        crate::cores::mlat_threads_for(self.load(), plan.holds_raw, plan.cores)
     }
 
     /// Reserves one feeder's bytes in every store, or `None` when they do not fit (the Hello is

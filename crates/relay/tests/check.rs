@@ -161,8 +161,6 @@ fn a_configuration_the_relay_takes_is_accepted_with_its_plan() -> Result {
         "/nonexistent/relay.key",
         "--max-upload",
         "6Mbit/s",
-        "--mlat-threads",
-        "1",
         "--memory",
         "560M",
         "--max-connections",
@@ -174,6 +172,8 @@ fn a_configuration_the_relay_takes_is_accepted_with_its_plan() -> Result {
     ])?;
     assert!(checked.accepted, "{}", checked.refusal);
     assert_eq!(checked.get("memory")?, 560 << 20);
+    // It hosts MLAT by default, on the threads its cores' plan gives it.
+    assert!(checked.get("mlat-threads")? >= 1, "{:?}", checked.plan);
     assert_eq!(checked.get("limit")?, 640 << 20);
     // A base cell's groups reach every relay offering it or a cell under it, far more than 32:
     // the member sessions planned are the cap's worth.
@@ -228,8 +228,7 @@ fn the_stages_follow_the_load_admitted_and_the_cores_bound_it() -> Result {
             "k",
             "--max-upload",
             "10Gbit/s",
-            "--mlat-threads",
-            "0",
+            "--no-mlat",
             "--memory",
             memory,
             "--max-connections",
@@ -244,6 +243,7 @@ fn the_stages_follow_the_load_admitted_and_the_cores_bound_it() -> Result {
         assert!(checked.accepted, "{}", checked.refusal);
         assert_plan_holds(&checked)?;
         assert_eq!(checked.get("cores")?, cores.parse::<usize>().unwrap_or(0));
+        assert_eq!(checked.get("mlat-threads")?, 0, "{:?}", checked.plan);
         Ok(checked)
     };
     let expected = |checked: &Checked| -> Result<tally_relay::ingest::Threads> {
@@ -287,6 +287,67 @@ fn the_stages_follow_the_load_admitted_and_the_cores_bound_it() -> Result {
     );
     assert_eq!(threads(&small)?, expected(&small)?);
     assert!(threads(&small)?.message < threads(&measured)?.message);
+    Ok(())
+}
+
+/// A relay hosting MLAT plans its steps in the same cores (RFC-0181 §10, "The cores"): the stages
+/// keep the threads their load needs, MLAT is given the cores they leave, and the feeders admitted
+/// are no more than the cores carry with both, so the same cores admit fewer than without MLAT.
+/// The configuration the 2026-10-09 MLAT runs measured: 10 cores, two areas, memory to spare.
+#[test]
+fn hosted_mlat_takes_the_cores_the_stages_leave_and_bounds_admission() -> Result {
+    let on = |mlat: bool| -> Result<Checked> {
+        let mut args = vec![
+            "--memory-limit",
+            "32G",
+            "--cores",
+            "10",
+            "--key",
+            "k",
+            "--max-upload",
+            "10Gbit/s",
+            "--memory",
+            "24G",
+            "--max-connections",
+            "5024",
+            "--max-connections-per-address",
+            "5024",
+            "--area",
+            "801ffffffffffff",
+            "--area",
+            "8027fffffffffff",
+        ];
+        if !mlat {
+            args.push("--no-mlat");
+        }
+        let checked = check(&args)?;
+        assert!(checked.accepted, "{}", checked.refusal);
+        assert_plan_holds(&checked)?;
+        Ok(checked)
+    };
+    let (hosting, without) = (on(true)?, on(false)?);
+    let load = hosting.get("feeders")? + hosting.get("member-feeders")?;
+    // The cores bound it, below what its memory holds, and below what they carry without MLAT.
+    assert_eq!(hosting.get("feeders")?, hosting.get("core-feeders")?);
+    assert!(hosting.get("feeders")? < hosting.get("memory-feeders")?);
+    assert!(hosting.get("core-feeders")? < without.get("core-feeders")?);
+    assert_eq!(
+        hosting.get("core-feeders")?,
+        tally_relay::cores::feeders_carried(10, true, hosting.get("member-feeders")?)
+    );
+    // The 2,000 feeders measured hosting MLAT fit.
+    assert!(hosting.get("feeders")? >= 2_000, "{:?}", hosting.plan);
+    // MLAT takes what the stages leave; the stages' threads are their own plan's.
+    assert_eq!(
+        hosting.get("mlat-threads")?,
+        tally_relay::cores::mlat_threads_for(load, true, Some(10))
+    );
+    let stages = tally_relay::cores::threads_for(load, true, Some(10));
+    assert_eq!(hosting.get("ingest-threads")?, stages.ingest);
+    assert_eq!(hosting.get("message-threads")?, stages.message);
+    assert_eq!(hosting.get("seal-threads")?, stages.seal);
+    assert!(hosting.get("mlat-threads")? > 1, "{:?}", hosting.plan);
+    assert_eq!(without.get("mlat-threads")?, 0);
     Ok(())
 }
 

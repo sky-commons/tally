@@ -45,7 +45,8 @@ fn check(config: &Config) -> Result<(), String> {
     let plan = format!(
         "memory {}\nbase {}\noversize {}\nconnections {}\nconnection-buffers {}\n\
          per-feeder {}\nfeeders {}\nmemory-feeders {}\ncores {}\ncore-feeders {}\n\
-         ingest-threads {}\nmessage-threads {}\nseal-threads {}\nmembers {}\nper-member {}\n\
+         ingest-threads {}\nmessage-threads {}\nseal-threads {}\nmlat-threads {}\nmembers {}\n\
+         per-member {}\n\
          member-feeders {}\nmember-rate-pool {}\nmember-pool {}\nmember-links {}\n\
          planned {}\nheadroom {}\nlimit {}\n",
         budget.memory(),
@@ -61,6 +62,7 @@ fn check(config: &Config) -> Result<(), String> {
         threads.ingest,
         threads.message,
         threads.seal,
+        budget.mlat_threads(),
         budget.members(),
         budget.plan().per_member(),
         budget.member_feeders(),
@@ -85,7 +87,7 @@ fn check(config: &Config) -> Result<(), String> {
 /// makes after reading its arguments (but for reading its keys and binding its sockets) is made
 /// here, so `check` refuses exactly what a start refuses.
 fn prepare(config: &Config, identity: &Identity) -> Result<(Arc<Hub>, bool), String> {
-    let hosts_mlat = config.relay_duties && config.mlat_threads > 0;
+    let hosts_mlat = config.relay_duties && config.mlat;
     let hub = Arc::new(
         Hub::new(config.max_subscribers)
             .advertising(config.hints())
@@ -101,7 +103,8 @@ fn prepare(config: &Config, identity: &Identity) -> Result<(Arc<Hub>, bool), Str
             .taking(config.areas.clone())
             // Its cores, which bound the feeders it admits (`cores::feeders_carried`).
             .cores(config.cores)
-            // Each stage on the threads the load it admits needs (`cores::threads_for`). A stage
+            // Each stage on the threads the load it admits needs (`cores::threads_for`), and
+            // MLAT's steps on what the cores leave them (`cores::mlat_threads_for`). A stage
             // short of a thread would close no epoch: the relay fails to start instead.
             .staged_as_planned()?,
     );
@@ -162,8 +165,9 @@ async fn serve(config: Config) -> Result<(), String> {
     );
     if hosted {
         eprintln!(
-            "tally-relay: hosting MLAT on {} threads for the areas it is chosen to solve",
-            config.mlat_threads
+            "tally-relay: hosting MLAT on {} threads for the areas it is chosen to solve, below \
+             the stages' priority",
+            budget.mlat_threads()
         );
     }
     if let Some(address) = &config.beast_out {

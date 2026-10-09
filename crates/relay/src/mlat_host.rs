@@ -32,9 +32,9 @@
 //!   `provisional::SHARDS` address shards, each holding its aircraft's state (`provisional::Shard`)
 //!   and what it was told and has not weighed yet. Each provisional step weighs every shard's notes
 //!   stamped before it in the batches' order (`provisional::Order`), keeps or refuses each batch's
-//!   replies whole across every shard, finds what is due, all shards in parallel over
-//!   `--mlat-threads`, and solves the due work of all of them, ascending by aircraft
-//!   (`provisional::Plan::job`): the same stamped trace solves the same provisionals on any number
+//!   replies whole across every shard, finds what is due, all shards in parallel over the threads
+//!   the cores' plan leaves MLAT (`Budget::mlat_threads`), and solves the due work of all of them,
+//!   ascending by aircraft (`provisional::Plan::job`): the same stamped trace solves the same provisionals on any number
 //!   of ingest workers and step threads. The engine's thread holds only the models carried and the
 //!   sequences.
 //! - **Stepped by the stamp watermark, never by a clock** (RFC-0181 §4, invariants 1 to 3). The
@@ -72,8 +72,10 @@
 //!   step's and a shed step's) runs off it, one at a time and in order, each within what the ones
 //!   before it left. Window steps (a step's seal, then its window) run one at a time, in order,
 //!   and provisional steps (weighing every address shard, then solving what is due) one at a time,
-//!   in order, each off that thread and spread over `--mlat-threads`, the two kinds apart: a slow
-//!   window never holds a provisional position up. A provisional step carries the models of the
+//!   in order, each off that thread and spread over the plan's threads, the two kinds apart: a slow
+//!   window never holds a provisional position up. Every step runs below the stages' priority,
+//!   provisional steps above window steps and seals (`Urgency`), and holds no lock a stage waits
+//!   on, so a host short of cores delays MLAT, which sheds, and never raw. A provisional step carries the models of the
 //!   window steps `tally_mlat::engine::MODELS_RIPEN_MS` before it, as the engine solving in line
 //!   does; it waits for them only while it may wait at all (`PROVISIONAL_BEHIND`), and then starts
 //!   without those not yet reported, counted (`MlatReport::provisional_models_late`), adopting them
@@ -343,6 +345,9 @@ pub struct MlatReport {
     pub steps_discarded: u64,
     /// Window steps applied.
     pub steps: u64,
+    /// Provisional steps applied: beside `provisional_steps_shed`, what MLAT ran of the steps the
+    /// watermark passed, and what it shed.
+    pub provisional_steps: u64,
     /// The newest step's report, and every step's summed.
     pub last_step: Option<StepReport>,
     pub steps_total: StepReport,
@@ -518,7 +523,8 @@ impl Gauges {
 }
 
 /// The hosted MLAT a relay runs, if any: none when its relay duties are off (`--no-relay-duties`)
-/// or it offers no MLAT threads (`--mlat-threads 0`). Sized and charged by the relay's `budget`:
+/// or it runs no MLAT (`--no-mlat`). Its steps are spread over the threads its cores' plan leaves
+/// them (`Budget::mlat_threads`), and sized and charged by the relay's `budget`:
 /// its seats are the feeder ceiling ([`capacity`]), its sealed and open raw are the `Held` and
 /// `Open` stores', its provisional notes the `Notes` store's, its own tables the `Engine` store's
 /// and the batches waiting for a description the `Orphans` store's ([`Gauges::of`]). An error when
@@ -529,7 +535,7 @@ pub fn host_for(
     boot_id: u64,
     budget: &Budget,
 ) -> Result<Option<HostedMlat>, String> {
-    if !config.relay_duties || config.mlat_threads == 0 {
+    if !config.relay_duties || !config.mlat {
         return Ok(None);
     }
     HostedMlat::charging(
@@ -538,7 +544,7 @@ pub fn host_for(
         Settings {
             regions: Regions::default(),
             settle_ms: SETTLE_MS,
-            threads: config.mlat_threads,
+            threads: budget.mlat_threads().max(1),
             capacity: capacity(budget),
         },
         Gauges::of(budget),
@@ -729,49 +735,41 @@ struct Told {
     at_ms: u64,
 }
 
-/// One address shard of provisional solving (`provisional::Shard`), with what it was told and has
-/// not weighed yet.
+/// One address shard of provisional solving (`provisional::Shard`). What it was told and has not
+/// weighed yet is apart (`Shared::heard`), under a lock of its own: an ingest worker hands a batch's
+/// notes only to that, and never waits on this, which a provisional step holds while it weighs
+/// and steps the shard below the stages' priority (`PROVISIONAL_NICE`).
 #[derive(Default)]
 struct Listening {
-    heard: Vec<Heard>,
     /// The engine generation `state` is of.
     generation: u64,
     state: provisional_::Shard,
 }
 
 impl Listening {
-    /// Reads, for the engine of `generation` (what an older one heard is dropped, a newer one's
-    /// kept), everything heard in an interval before `through` that `refused` does not refuse, in
-    /// the batches' order: the receptions waiting here, and each batch's replies to keep or refuse
-    /// (`provisional::admit`).
+    /// Reads `due`, what was heard in an interval before the step (`Shared::due`), for the engine
+    /// of `generation` (what an older one heard is dropped), everything `refused` does not refuse,
+    /// in the batches' order: the receptions waiting here, and each batch's replies to keep or
+    /// refuse (`provisional::admit`).
     fn read(
         &mut self,
         generation: u64,
-        through: u64,
+        mut due: Vec<Heard>,
         refused: &BTreeSet<u64>,
     ) -> (usize, Vec<Taken>) {
         if self.generation != generation {
             self.state = provisional_::Shard::default();
             self.generation = generation;
         }
-        let (mut due, rest): (Vec<Heard>, Vec<Heard>) = std::mem::take(&mut self.heard)
-            .into_iter()
-            .partition(|heard| heard.interval < through);
-        self.heard = rest;
         due.sort_unstable_by_key(|heard| heard.order);
         let mut taken = Vec::new();
         for heard in due {
-            if heard.generation == generation {
-                if !refused.contains(&heard.interval) {
-                    taken.push(self.state.read(
-                        &heard.batch,
-                        &heard.notes[heard.range.clone()],
-                        heard.order,
-                    ));
-                }
-            } else if heard.generation > generation {
-                // Read by a raw shard already re-scoped for the engine about to start: kept for it.
-                self.heard.push(heard);
+            if heard.generation == generation && !refused.contains(&heard.interval) {
+                taken.push(self.state.read(
+                    &heard.batch,
+                    &heard.notes[heard.range.clone()],
+                    heard.order,
+                ));
             }
         }
         (self.state.waiting(), taken)
@@ -901,8 +899,12 @@ struct Shared {
     /// The descriptions not yet applied. Taken before any shard's lock, never after one.
     descriptions: Mutex<Descriptions>,
     /// The address shards of provisional solving, `provisional::SHARDS` of them, each locked by
-    /// an ingest worker to hand it a batch's notes and by a provisional step to weigh and step it.
+    /// the provisional step that weighs and steps it, and by no stage.
     listening: Box<[Mutex<Listening>]>,
+    /// What each address shard was told and has not weighed yet: locked by an ingest worker to
+    /// hand it a batch's notes, and by a step only to take what is due (`Shared::due`), never
+    /// while it weighs.
+    heard: Box<[Mutex<Vec<Heard>>]>,
     /// The notes told per step interval, and the bounds on one interval's count and bytes.
     intervals: Mutex<Intervals>,
     notes_per_step: usize,
@@ -971,6 +973,28 @@ impl Shared {
         self.listening[shard]
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn heard(&self, shard: usize) -> std::sync::MutexGuard<'_, Vec<Heard>> {
+        self.heard[shard]
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// What address shard `shard` heard in an interval before `through` for the engine of
+    /// `generation` or an older one, taken: the inbox is held only to swap it out and to put back
+    /// what is not due (later intervals, and a newer engine's, heard by a raw shard already
+    /// re-scoped for the engine about to start), so an ingest worker telling it never waits on a
+    /// step's weighing.
+    fn due(&self, shard: usize, generation: u64, through: u64) -> Vec<Heard> {
+        let heard = std::mem::take(&mut *self.heard(shard));
+        let (due, rest): (Vec<Heard>, Vec<Heard>) = heard
+            .into_iter()
+            .partition(|heard| heard.interval < through && heard.generation <= generation);
+        if !rest.is_empty() {
+            self.heard(shard).extend(rest);
+        }
+        due
     }
 
     /// Taken under a raw shard's lock, never before one.
@@ -1137,7 +1161,7 @@ impl Shared {
         let runs = provisional_::by_shard(&mut notes);
         let notes: Arc<[Note]> = notes.into();
         for (shard, range) in runs {
-            self.listening(shard).heard.push(Heard {
+            self.heard(shard).push(Heard {
                 interval,
                 order,
                 batch: Arc::clone(&batch),
@@ -1154,8 +1178,7 @@ impl Shared {
             return;
         }
         for shard in 0..provisional_::SHARDS {
-            self.listening(shard)
-                .heard
+            self.heard(shard)
                 .retain(|heard| !intervals.contains(&heard.interval));
         }
     }
@@ -1314,6 +1337,9 @@ impl HostedMlat {
             descriptions: Mutex::new(Descriptions::default()),
             listening: (0..provisional_::SHARDS)
                 .map(|_| Mutex::new(Listening::default()))
+                .collect(),
+            heard: (0..provisional_::SHARDS)
+                .map(|_| Mutex::new(Vec::new()))
                 .collect(),
             intervals: Mutex::new(Intervals::default()),
             notes_per_step: settings
@@ -2085,9 +2111,10 @@ impl Host {
                 plan.threads,
                 &shards,
                 |shard, _: &mut provisional::Report| {
+                    let due = shared.due(*shard, generation, through);
                     shared
                         .listening(*shard)
-                        .read(generation, through, &refused_intervals)
+                        .read(generation, due, &refused_intervals)
                 },
             );
             // Read: the batches the notes kept alive are let go.
@@ -2204,6 +2231,7 @@ impl Host {
                     let records = engine.apply_provisional(outcome);
                     let report = engine.provisional_report();
                     self.shared.count(|counts| {
+                        counts.provisional_steps += 1;
                         counts.refused += refused;
                         counts.shed += shed;
                         counts.provisional.add(&report);
@@ -2413,6 +2441,7 @@ impl Host {
         self.settle_sealed();
         for shard in 0..provisional_::SHARDS {
             self.shared.listening(shard).clear();
+            self.shared.heard(shard).clear();
         }
         self.shared
             .waiting
@@ -2593,33 +2622,56 @@ pub mod stepping {
     }
 }
 
-/// How a piece of the engine's work is scheduled against the rest of the relay's.
+/// How a piece of the engine's work is scheduled against the rest of the relay's. Every step runs
+/// below the stages' priority (RFC-0181 §10, "The cores"): the cores are planned so the stages'
+/// half-busy share and MLAT's fit together (`cores::mlat_threads_for`), and when MLAT needs more
+/// than its share it is MLAT that waits, and sheds the steps it falls behind on (counted), never
+/// raw that is delayed. Nothing a stage waits on is held by a step: a step takes the raw shards'
+/// complete bins and the address shards' notes on the engine's thread or by a swap
+/// (`Shared::due`), and weighs and solves with no stage's lock held. The engine's own thread does
+/// nothing that takes long and does take the raw shards' locks, so it stays at the stages'
+/// priority.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Urgency {
     /// Provisional solving: a provisional is due within seconds of its transmission (RFC-0174
-    /// §2.4), so it runs at the relay's own priority.
+    /// §2.4), so it runs below the stages and above the window steps (`PROVISIONAL_NICE`).
     Prompt,
     /// Seals and window steps: a final position comes 7 to 47 s after its transmission (the
     /// stride), and a window's fits take seconds of every core they are spread over. They run
-    /// below the relay's priority (`BACKGROUND_NICE`, inherited by the threads they spread over),
-    /// so on a busy host they yield the cores to provisional solving and to ingest, never the
-    /// other way round.
+    /// lowest (`BACKGROUND_NICE`), so on a busy host they yield the cores to the stages and to
+    /// provisional solving, never the other way round.
     Background,
 }
 
-/// How far below the relay's priority background work runs: a nice value, which Linux gives each
-/// thread its own and a thread's children inherit.
-const BACKGROUND_NICE: libc::c_int = 10;
+impl Urgency {
+    /// The nice value its threads run at, below the stages' (the relay's own, 0). Linux gives
+    /// each thread its own, and the threads a step spreads its work over (`window::parallel`)
+    /// inherit it. Each step of nice is about 1.25 times less weight against a thread at the
+    /// one above (the kernel's `sched_prio_to_weight`): at 5 a stage's thread outweighs a
+    /// provisional step's about 3 to 1, at 10 a window step's about 9 to 1.
+    const fn nice(self) -> libc::c_int {
+        match self {
+            Self::Prompt => PROVISIONAL_NICE,
+            Self::Background => BACKGROUND_NICE,
+        }
+    }
+}
 
-/// Lowers the calling thread's priority to `BACKGROUND_NICE` (a thread may always lower its own).
-fn run_in_background() {
+/// How far below the stages' priority provisional steps run: a nice value.
+const PROVISIONAL_NICE: libc::c_int = 5;
+/// How far below the stages' priority seals and window steps run: a nice value.
+const BACKGROUND_NICE: libc::c_int = 10;
+const _: () = assert!(0 < PROVISIONAL_NICE && PROVISIONAL_NICE < BACKGROUND_NICE);
+
+/// Lowers the calling thread's priority to `nice` (a thread may always lower its own).
+fn run_at(nice: libc::c_int) {
     // SAFETY: `gettid` and `setpriority` read and write no memory of this process; on Linux a
     // thread is addressed by its id as a process, so this changes this thread's nice value alone.
     // A failure leaves it at the relay's priority, which is only slower to yield.
     #[cfg(target_os = "linux")]
     unsafe {
         let tid = libc::gettid();
-        let _ = libc::setpriority(libc::PRIO_PROCESS, tid as libc::id_t, BACKGROUND_NICE);
+        let _ = libc::setpriority(libc::PRIO_PROCESS, tid as libc::id_t, nice);
     }
 }
 
@@ -2645,9 +2697,7 @@ fn spawn_or_run(urgency: Urgency, work: impl FnOnce() + Send + 'static) {
     let spawned = std::thread::Builder::new()
         .name("tally-mlat-step".to_owned())
         .spawn(move || {
-            if urgency == Urgency::Background {
-                run_in_background();
-            }
+            run_at(urgency.nice());
             if let Some(work) = theirs.lock().ok().and_then(|mut work| work.take()) {
                 work();
             }
@@ -2992,22 +3042,27 @@ mod tests {
             .ok_or_else(|| "no config".to_owned())
     }
 
-    /// The relay hosts MLAT when its duties are on and it offers threads, and never with
-    /// `--no-relay-duties`.
+    /// The relay hosts MLAT when its duties are on, unless told `--no-mlat`, on the threads its
+    /// cores' plan gives MLAT, and never with `--no-relay-duties`.
     #[test]
-    fn mlat_is_hosted_with_relay_duties_and_threads_and_never_without_duties() -> Result<(), String>
-    {
+    fn mlat_is_hosted_with_relay_duties_on_the_planned_threads_and_never_without_duties()
+    -> Result<(), String> {
         let base = "--key k --max-upload 8Mbit/s";
-        let budget = Budget::of_memory(64 << 30, crate::budget::Plan::planned(true));
+        let budget = Budget::of_memory(
+            64 << 30,
+            crate::budget::Plan::planned(true).with_cores(Some(32)),
+        );
         let host = |line: &str| -> Result<Option<HostedMlat>, String> {
             host_for(&config(line)?, identity(), 1, &budget)
         };
-        let hosted = host(&format!("{base} --mlat-threads 3"))?.ok_or("not hosted")?;
-        assert_eq!(hosted.cores(), 3);
-        // Duties are on by default, so a relay offers every core unless told otherwise.
-        assert!(host(base)?.is_some());
-        assert!(host(&format!("{base} --mlat-threads 0"))?.is_none());
-        assert!(host(&format!("{base} --mlat-threads 3 --no-relay-duties"))?.is_none());
+        // Duties and MLAT are on by default.
+        let hosted = host(base)?.ok_or("not hosted")?;
+        assert_eq!(usize::from(hosted.cores()), budget.mlat_threads());
+        assert!(budget.mlat_threads() > 1, "{}", budget.mlat_threads());
+        assert!(host(&format!("{base} --no-mlat"))?.is_none());
+        assert!(host(&format!("{base} --no-relay-duties"))?.is_none());
+        // The thread count is the plan's, not an operator's.
+        assert!(config(&format!("{base} --mlat-threads 3")).is_err());
         Ok(())
     }
 
@@ -3119,11 +3174,8 @@ mod tests {
             tell(shared, &calm, notes(most));
             // Nothing of the refused step is held, in any shard.
             for shard in 0..provisional_::SHARDS {
-                let listening = shared.listening(shard);
-                assert!(
-                    listening.heard.iter().all(|heard| heard.interval == 11),
-                    "{order:?}"
-                );
+                let heard = shared.heard(shard);
+                assert!(heard.iter().all(|heard| heard.interval == 11), "{order:?}");
             }
             // The step at 11 s weighs the 10th second: refused, both its batches counted.
             let weighed = shared.weigh_intervals(11_000);
@@ -3169,11 +3221,7 @@ mod tests {
             tell(shared, &told(4, 0, 11_200)?, notes(10));
             for shard in 0..provisional_::SHARDS {
                 assert!(
-                    shared
-                        .listening(shard)
-                        .heard
-                        .iter()
-                        .all(|heard| heard.interval == 11),
+                    shared.heard(shard).iter().all(|heard| heard.interval == 11),
                     "{order:?}"
                 );
             }
@@ -3229,8 +3277,7 @@ mod tests {
         for shard in 0..provisional_::SHARDS {
             assert!(
                 shared
-                    .listening(shard)
-                    .heard
+                    .heard(shard)
                     .iter()
                     .all(|heard| heard.interval != late)
             );
@@ -3676,6 +3723,58 @@ mod tests {
         );
         for bin in &common {
             assert!(hosted.get(*bin) == reference.get(*bin), "bin {bin}");
+        }
+        Ok(())
+    }
+
+    /// The nice value of the calling thread.
+    fn own_nice() -> libc::c_int {
+        // SAFETY: `gettid` and `getpriority` read and write no memory of this process.
+        unsafe { libc::getpriority(libc::PRIO_PROCESS, libc::gettid() as libc::id_t) }
+    }
+
+    /// RFC-0181 §10, "The cores": every MLAT step runs below the stages' priority, provisional
+    /// steps above seals and window steps, so a host short of cores delays MLAT, which sheds,
+    /// and never raw. (A thread may only lower its own priority: where the test already runs
+    /// lower than a step would, the step stays there.)
+    #[test]
+    fn every_step_runs_below_the_stages() -> Result<(), String> {
+        let mut simulation = sim::run(&scenario(17, 30.0));
+        let delivered = arrivals(&mut simulation, 3)?;
+        let first = delivered.first().map(|(at, _)| *at).ok_or("no raw")?;
+        let host = HostedMlat::new(identity(), BOOT, settings())?;
+        host.set_areas(areas()?, Vec::new());
+        let seen: Arc<Mutex<Vec<(Stage, libc::c_int)>>> = Arc::new(Mutex::new(Vec::new()));
+        let seeing = Arc::clone(&seen);
+        host.delaying(Arc::new(move |stage: Stage| {
+            if let Ok(mut seen) = seeing.lock() {
+                seen.push((stage, own_nice()));
+            }
+        }));
+        let until = delivered.last().map_or(0, |(at, _)| *at);
+        let mut next = 0;
+        for step in steps(first, until) {
+            while let Some((at, record)) = delivered.get(next).filter(|(at, _)| *at < step) {
+                offer(&host, record, *at);
+                next += 1;
+            }
+            host.take_published(step);
+            handled(&host);
+        }
+        quiet(&host);
+        let base = own_nice();
+        let seen = seen.lock().map(|seen| seen.clone()).unwrap_or_default();
+        for (stage, nice) in [
+            (Stage::Provisional, PROVISIONAL_NICE),
+            (Stage::Seal, BACKGROUND_NICE),
+            (Stage::Window, BACKGROUND_NICE),
+        ] {
+            let at: Vec<_> = seen.iter().filter(|(of, _)| *of == stage).collect();
+            assert!(!at.is_empty(), "no {stage:?} step ran: {seen:?}");
+            assert!(
+                at.iter().all(|(_, was)| *was == nice.max(base)),
+                "{stage:?} at {at:?}, the stages at {base}"
+            );
         }
         Ok(())
     }
