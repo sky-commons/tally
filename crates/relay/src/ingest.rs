@@ -63,13 +63,24 @@ pub const fn charge_for(wire: usize, inflated: usize, receptions: usize) -> usiz
 
 /// What `batch` is charged before it is decoded: as [`charge_for`], its inflated length and the
 /// most receptions it can hold read from its stated length (`Batch::inflated_len`, held to the
-/// wire's inflation rule; `Batch::receptions_at_most`), never its wire bytes alone. A batch of a
-/// format this build cannot read is never inflated or decoded, and costs its signed bytes.
+/// wire's inflation rule; `Batch::receptions_at_most`), never its wire bytes alone, and never less
+/// than [`CHARGE_FLOOR`]. A batch of a format this build cannot read is never inflated or decoded,
+/// and costs its signed bytes.
 pub fn charge_of(batch: &Batch) -> usize {
     let wire = batch.as_bytes().len();
-    match (batch.inflated_len(), batch.receptions_at_most()) {
+    floored(match (batch.inflated_len(), batch.receptions_at_most()) {
         (Ok(inflated), Ok(receptions)) => charge_for(wire, inflated, receptions),
         _ => charge_for(wire, 0, 0),
+    })
+}
+
+/// The least a record handed to the ingest workers is charged (a batch's [`charge_of`], a
+/// description's bytes): its bytes, or [`CHARGE_FLOOR`] if more.
+pub const fn floored(bytes: usize) -> usize {
+    if bytes < CHARGE_FLOOR {
+        CHARGE_FLOOR
+    } else {
+        bytes
     }
 }
 
@@ -88,11 +99,34 @@ pub const PLANNED_BATCH_CHARGE: usize = {
 /// of `Store::Ingest` (`budget::PerFeeder::planned`), and carves when its connection is admitted.
 pub const FEEDER_ALLOWANCE: usize = CREDIT * PLANNED_BATCH_CHARGE;
 
-/// What a connection holds of Noise buffers at most while it reads: the frame being read, the
-/// plaintext it is decrypted into, and then the records decoded from it, each at most a whole
-/// message, until every one is handed on. Carved when a connection is admitted, so a peer that
-/// sends a whole message and trickles the next holds what was planned for it and no more.
-pub const BUFFERS_PER_CONNECTION: usize = 2 * tally_wire::noise::MAX_MESSAGE;
+/// The most records one connection's allowance holds in the ingest stage at once, however small
+/// they are. Each costs an ingest worker a strict Ed25519 verification whatever its bytes, so a
+/// charge by bytes alone let a feeder sending 300-byte batches hold some 500 in the workers'
+/// queues at once, each a verification ahead of every honest batch behind it: some 25 such feeders
+/// kept the workers busy. Eight is four times what a planned feeder holds ([`CREDIT`]), so a member
+/// session forwarding many feeders' small batches still has room while each is verified.
+pub const RECORDS_IN_FLIGHT: usize = 8;
+
+/// The least one record is charged in the ingest stage until it is decoded ([`floored`]): a
+/// feeder's allowance over [`RECORDS_IN_FLIGHT`]. Once decoded, its charge shrinks to the
+/// decode's footprint: the verification is done.
+pub const CHARGE_FLOOR: usize = FEEDER_ALLOWANCE / RECORDS_IN_FLIGHT;
+// A batch at the planned rate is charged its bytes, never the floor, so the allowance holds the
+// batches it was sized for (`budget::PerFeeder::planned`'s ingest line).
+const _: () = assert!(PLANNED_BATCH_CHARGE >= CHARGE_FLOOR);
+
+/// What a connection holds of Noise buffers at most, both directions together
+/// (`tally_wire::noise::READER_BUFFERS`, `tally_wire::noise::WRITER_BUFFERS`, each a whole
+/// message): the reader's frame and its plaintext, then the plaintext and the records decoded
+/// from it, until every one is handed on; and the writer's plaintext and ciphertext for as long as
+/// a send waits on the peer (up to `noise::WRITE_TIMEOUT`). Carved when a connection is admitted
+/// and held for the session, so a peer that trickles a message, or reads slowly what it is sent,
+/// holds what was planned for it and no more. Before, only the reader's two were carved, while
+/// a send held two more for up to 30 s and the reader held a third while it decoded: some 2 GB
+/// outside every gauge at 20,000 slow subscribers.
+pub const BUFFERS_PER_CONNECTION: usize = (tally_wire::noise::READER_BUFFERS
+    + tally_wire::noise::WRITER_BUFFERS)
+    * tally_wire::noise::MAX_MESSAGE;
 
 /// What batches larger than their connection's whole allowance may hold past it, all
 /// connections together: such a batch takes its connection's whole allowance (it waits until
@@ -154,14 +188,22 @@ impl Threads {
 }
 
 /// One connection's allowance of bytes in the ingest stage (RFC-0181 §2, §10), carved from the
-/// relay's `Store::Ingest` when the connection is admitted and held for as long as it is: what a
-/// feeder reserved ([`FEEDER_ALLOWANCE`]), or a sharing member its feeders' worth. Each batch takes
-/// its charge ([`charge_of`]) from it before it is handed over, waiting while the connection holds
-/// its allowance (its socket unread), so no peer can hold the room another connection was given.
+/// relay's `Store::Ingest` when the connection is admitted and held for as long as it, or any
+/// batch it read, holds any of it: what a feeder reserved ([`FEEDER_ALLOWANCE`]), or a sharing
+/// member its feeders' worth. Each batch takes its charge ([`charge_of`]) from it before it is
+/// handed over, waiting while the connection holds its allowance (its socket unread), so no peer
+/// can hold the room another connection was given.
+///
+/// The carve is shared by the allowance and every charge taken from it ([`InFlight`]), and goes
+/// back to `Store::Ingest` with the last of them: a connection that ends with batches still
+/// queued for the workers leaves its carve held until they are done. Before, the carve went back
+/// when the read loop ended, while the batches it had read were charged only to the connection's
+/// own gauge: a peer that connected, sent a Hello and ~140 KB of batches, and hung up, again and
+/// again, queued work no store counted.
 pub struct Allowance {
     own: Arc<Gauge>,
     oversize: Arc<Gauge>,
-    _carved: Charge,
+    carved: Arc<Charge>,
 }
 
 impl Allowance {
@@ -172,13 +214,14 @@ impl Allowance {
         Some(Self {
             own: Gauge::new(Store::Ingest, bytes),
             oversize: Arc::clone(oversize),
-            _carved: carved,
+            carved: Arc::new(carved),
         })
     }
 
     /// One batch's charge of `bytes`, waiting while the connection holds its allowance. A batch
     /// larger than the whole allowance waits until the connection holds nothing, and takes the rest
-    /// from the oversize room ([`OVERSIZE_BYTES`]).
+    /// from the oversize room ([`OVERSIZE_BYTES`]). The charge holds the connection's carve until
+    /// it is let go.
     pub async fn acquire(&self, bytes: usize) -> InFlight {
         let own = bytes.min(self.own.limit());
         let charge = self.own.charge(own).await;
@@ -187,7 +230,11 @@ impl Allowance {
         } else {
             Charge::none()
         };
-        InFlight { charge, over }
+        InFlight {
+            charge,
+            over,
+            carved: Some(Arc::clone(&self.carved)),
+        }
     }
 
     /// Bytes of the allowance free now.
@@ -201,11 +248,14 @@ impl Allowance {
 /// ([`InFlight::trusted`]). Every batch handed to the stage carries one (`hub::Inbound`): it is
 /// shrunk to the decode's footprint once decoded, split with the batch's slices to the message
 /// exchange, and let go when the epochs hold the bytes (or the batch is let go), so the bytes
-/// between a socket and the epochs are charged all the way.
+/// between a socket and the epochs are charged all the way. Each part of it holds its
+/// connection's carve (`carved`): what the allowance was cut from `Store::Ingest` stays cut
+/// until the last batch the connection read is let go, whenever the connection ended.
 #[derive(Debug)]
 pub struct InFlight {
     charge: Charge,
     over: Charge,
+    carved: Option<Arc<Charge>>,
 }
 
 impl InFlight {
@@ -216,6 +266,7 @@ impl InFlight {
         Self {
             charge: block_on(gauge.charge(bytes)),
             over: Charge::none(),
+            carved: None,
         }
     }
 
@@ -225,6 +276,7 @@ impl InFlight {
         Self {
             charge: Charge::none(),
             over: Charge::none(),
+            carved: None,
         }
     }
 
@@ -248,7 +300,11 @@ impl InFlight {
     pub fn split(&mut self, bytes: usize) -> InFlight {
         let over = self.over.split(bytes);
         let charge = self.charge.split(bytes - over.bytes());
-        InFlight { charge, over }
+        InFlight {
+            charge,
+            over,
+            carved: self.carved.clone(),
+        }
     }
 }
 
@@ -271,16 +327,70 @@ fn block_on<F: std::future::Future>(future: F) -> F::Output {
     }
 }
 
-/// The ingest clock of a relay: the wall clock read once, at the start, and a monotonic clock
-/// after it, so a stamp never jumps with the wall clock (a step forward would hold every producer
-/// in the future, its epochs open and charged; a step back would hold them still) and stamps stay
-/// near the wall time feeders and peers read.
+/// The ingest clock of a relay: the wall clock, followed without ever going back and without
+/// ever jumping ([`Slewed`]). Stamps advance with a monotonic clock, between [`SLOWEST`] and
+/// [`FASTEST`] times its pace, closing on the wall clock whenever they are apart: a stamp never
+/// steps with the wall clock (a step forward would close every open epoch at once and shed the
+/// hosted MLAT's steps; a step back would hold every epoch open, charged), and stamps stay near
+/// the wall time feeders and peers read.
+///
+/// Before, the wall clock was read once, at the start, and only the monotonic clock after it: a
+/// relay started before the host's clock was synchronised (the unit now starts after
+/// `time-sync.target`), or a virtual machine suspended and resumed (the monotonic clock stops
+/// while it sleeps), stayed seconds behind the wall clock for as long as it ran, so every
+/// feeder's raw was refused as ahead of its stamp (`held::AHEAD_MS`, 1 s) and MLAT stopped,
+/// silently.
 pub fn anchored_wall_clock() -> Clock {
     let started = std::time::Instant::now();
-    let wall_ms = crate::network::wall_ms();
-    Arc::new(move || {
-        wall_ms.saturating_add(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX))
-    })
+    let slewed = Slewed::new(crate::network::wall_ms());
+    Arc::new(move || slewed.read(started.elapsed(), crate::network::wall_ms()))
+}
+
+/// The most the ingest clock runs ahead of a monotonic clock's pace while it catches up with a
+/// wall clock ahead of it: a gap of `g` closes in `g` (a stamp runs two seconds a second). Twice,
+/// so the deduplication's window (`exchange::DEDUP_WINDOW_MS`) never spans less than a second of
+/// arrivals while it closes, and an epoch never less than half a second.
+pub const FASTEST: f64 = 2.0;
+
+/// The least it runs while a wall clock behind it catches up: half the monotonic pace, so epochs
+/// still close while a gap of `g` closes in `2g`.
+pub const SLOWEST: f64 = 0.5;
+
+/// A clock that follows a wall clock it is read beside, never going back, its pace held between
+/// [`SLOWEST`] and [`FASTEST`] times a monotonic clock's: what [`anchored_wall_clock`] reads.
+/// Kept to fractions of a millisecond, so a clock read every microsecond still advances.
+pub struct Slewed {
+    /// The stamp last read, in milliseconds, and the monotonic time it was read at.
+    state: Mutex<(f64, Duration)>,
+}
+
+impl Slewed {
+    /// Starting at `wall_ms`, at monotonic time zero.
+    pub fn new(wall_ms: u64) -> Self {
+        Self {
+            state: Mutex::new((wall_ms as f64, Duration::ZERO)),
+        }
+    }
+
+    /// The stamp at monotonic time `monotonic`, the wall clock reading `wall_ms`: as far toward
+    /// the wall clock as the pace allows since the last read, never before it.
+    pub fn read(&self, monotonic: Duration, wall_ms: u64) -> u64 {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (stamp, at) = *state;
+        let elapsed = monotonic.saturating_sub(at).as_secs_f64() * 1_000.0;
+        let wall = wall_ms as f64;
+        let next = if wall > stamp + elapsed {
+            wall.min(stamp + elapsed * FASTEST)
+        } else {
+            wall.max(stamp + elapsed * SLOWEST)
+        }
+        .max(stamp);
+        *state = (next, monotonic.max(at));
+        next as u64
+    }
 }
 
 /// A connection's verdict from the ingest stage: a batch it sent failed its signature, so the
@@ -315,9 +425,12 @@ impl Refusal {
     }
 }
 
-/// Work for one worker, given its producer number. The relay hands a worker a batch only with its
-/// charge ([`Stages::run_charged`]), so what waits for the workers is bounded by `Store::Ingest`;
-/// anything else a worker is given (a tick, a flush) is the stage's own.
+/// Work for one worker, given its producer number. The relay hands a worker a record only with its
+/// charge ([`Stages::run_charged`], [`Stages::run_stamped`]), each at least [`CHARGE_FLOOR`] and
+/// holding its connection's carve until it is let go ([`Allowance`]), so what waits in a worker's
+/// queue is bounded by `Store::Ingest` and the oversize room: at most their bytes over
+/// [`CHARGE_FLOOR`] records, however many connections came and went. Anything else a worker is
+/// given is a trace's or a test's (`advance`, `flush`), which waits for it; a worker ticks itself.
 type Work = Box<dyn FnOnce(usize) + Send>;
 
 /// A batch's work for one worker: given its producer number and the batch's charge.
@@ -751,16 +864,143 @@ mod tests {
         Ok(())
     }
 
-    /// RFC-0181 invariant 2: the ingest clock is monotonic, read from the wall once.
+    /// RFC-0181 invariant 2: the relay's ingest clock is the wall clock now, never going back.
     #[test]
-    fn the_relays_clock_follows_the_wall_once_and_never_goes_back() {
+    fn the_relays_clock_follows_the_wall_and_never_goes_back() {
         let clock = anchored_wall_clock();
         let wall = crate::network::wall_ms();
         let first = clock();
         assert!(first.abs_diff(wall) < 60_000);
+        let mut last = first;
         for _ in 0..1_000 {
-            assert!(clock() >= first);
+            let now = clock();
+            assert!(now >= last);
+            last = now;
         }
+    }
+
+    /// A relay started behind the wall clock (before the host's clock was synchronised), or
+    /// resumed after a suspend (its monotonic clock stood still while it slept), catches up: its
+    /// stamps run at most twice the monotonic pace, never jump, and meet the wall clock in as long
+    /// as they were behind; then they follow it. Read every microsecond, they still advance. The
+    /// clock read once from the wall stayed the five seconds behind for ever.
+    #[test]
+    fn a_clock_behind_the_wall_catches_up_at_a_bounded_pace() {
+        let clock = Slewed::new(10_000);
+        let mut last = clock.read(Duration::ZERO, 15_000);
+        assert_eq!(last, 10_000);
+        let mut met = None;
+        for tenth in 1..=100u64 {
+            let monotonic = Duration::from_millis(100 * tenth);
+            let wall = 15_000 + 100 * tenth;
+            let stamp = clock.read(monotonic, wall);
+            assert!(stamp >= last && stamp - last <= 200, "{last} then {stamp}");
+            assert!(stamp <= wall);
+            if stamp == wall && met.is_none() {
+                met = Some(tenth);
+            }
+            last = stamp;
+        }
+        // Five seconds behind, two seconds a second: met after five seconds, and kept.
+        assert_eq!(met, Some(50));
+        assert_eq!(last, 25_000);
+        let fine = Slewed::new(0);
+        let mut stamp = 0;
+        for micro in 1..=5_000u64 {
+            stamp = fine.read(Duration::from_micros(micro), 1_000_000);
+        }
+        assert_eq!(stamp, 10);
+    }
+
+    /// A wall clock stepped back is never followed back: the stamps slow to half the monotonic
+    /// pace, so epochs still close, until the wall clock catches them up.
+    #[test]
+    fn a_clock_ahead_of_the_wall_slows_and_never_goes_back() {
+        let clock = Slewed::new(20_000);
+        let mut last = clock.read(Duration::ZERO, 20_000);
+        for tenth in 1..=100u64 {
+            let monotonic = Duration::from_millis(100 * tenth);
+            // The wall clock stepped back three seconds.
+            let wall = 17_000 + 100 * tenth;
+            let stamp = clock.read(monotonic, wall);
+            assert!(
+                stamp >= last + 50 && stamp - last <= 100,
+                "{last} then {stamp}"
+            );
+            last = stamp;
+        }
+        // Three seconds ahead, losing half a second a second: met after six seconds.
+        assert_eq!(last, 27_000);
+    }
+
+    /// RFC-0181 §2: a connection's carve outlives the connection while any batch it read holds a
+    /// charge. A peer that connects, sends a batch the workers have not taken, and hangs up, again
+    /// and again, holds `Store::Ingest` for every batch it left queued, so the next connection is
+    /// turned away once the store is full and nothing queues uncounted. Before, the carve went
+    /// back with the read loop, and the store said 0 while the batches waited.
+    #[tokio::test]
+    async fn a_connections_carve_is_held_until_the_last_batch_it_read_is_let_go() {
+        let ingest = Gauge::new(Store::Ingest, 300);
+        let oversize = Gauge::new(Store::Ingest, 1_000);
+        let mut queued = Vec::new();
+        let mut connected = 0;
+        while let Some(allowance) = Allowance::carve(&ingest, &oversize, 100) {
+            connected += 1;
+            // A batch handed to the workers, then the connection ends.
+            queued.push(allowance.acquire(40).await);
+            drop(allowance);
+            assert_eq!(ingest.held(), 100 * connected);
+            assert!(connected <= 3, "connected past the store");
+        }
+        assert_eq!(connected, 3);
+        // A slice of a queued batch still holds the carve after the rest goes.
+        let mut first = queued.remove(0);
+        let slice = first.split(10);
+        drop(first);
+        assert_eq!(ingest.held(), 300);
+        drop(slice);
+        assert_eq!(ingest.held(), 200);
+        drop(queued);
+        assert_eq!(ingest.held(), 0);
+    }
+
+    /// RFC-0181 §2: however small its records, a connection has at most `RECORDS_IN_FLIGHT` of
+    /// them waiting for, or in, the workers: each is charged at least `CHARGE_FLOOR`, the cost of
+    /// its verification. By bytes alone a 300-byte batch took some 500 places.
+    #[tokio::test]
+    async fn a_connection_holds_at_most_its_records_in_flight_however_small() -> Result<(), String>
+    {
+        let identity = tally_wire::Identity::generate().map_err(|error| error.to_string())?;
+        let tiny = Batch::sign(
+            &identity,
+            &tally_wire::BatchContent {
+                boot_id: 1,
+                sequence: 0,
+                counter_epoch: 0,
+                wall_ms: 0,
+                dropped: 0,
+                previous: [0; 32],
+                observations: Vec::new(),
+            },
+        )
+        .map_err(|error| error.to_string())?;
+        assert!(tiny.as_bytes().len() < 400);
+        assert_eq!(charge_of(&tiny), CHARGE_FLOOR);
+        let ingest = Gauge::unlimited(Store::Ingest);
+        let oversize = Gauge::new(Store::Ingest, OVERSIZE_BYTES);
+        let allowance = Allowance::carve(&ingest, &oversize, FEEDER_ALLOWANCE)
+            .ok_or("an allowance fits an unlimited store")?;
+        let mut held = Vec::new();
+        while let Ok(in_flight) =
+            tokio::time::timeout(Duration::ZERO, allowance.acquire(charge_of(&tiny))).await
+        {
+            held.push(in_flight);
+            if held.len() > 10 * RECORDS_IN_FLIGHT {
+                break;
+            }
+        }
+        assert_eq!(held.len(), RECORDS_IN_FLIGHT);
+        Ok(())
     }
 
     /// Opens a stalled stage's gate when dropped, so a test that fails never leaves a thread

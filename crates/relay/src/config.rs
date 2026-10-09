@@ -10,6 +10,9 @@ use crate::hub::{
 };
 use crate::ingest::Threads;
 
+/// Subscribers served before new ones are turned away, unless `--max-subscribers` says.
+const DEFAULT_MAX_SUBSCRIBERS: usize = 64;
+
 const USAGE: &str = "\
 usage: tally-relay --key FILE [--key FILE]... --max-upload RATE [options]
        tally-relay keygen          print a new key file to stdout and its public key to stderr
@@ -64,9 +67,13 @@ usage: tally-relay --key FILE [--key FILE]... --max-upload RATE [options]
                          firehose credential and this relay's evidence, which it presents to
                          every relay it reads (RFC-0174 §2.1); repeatable
   --max-subscribers N    subscribers served before new ones are turned away (default 64)
-  --max-connections N    connections held at once; beyond it a new one is closed before its
-                         handshake (default 2048). Each one's Noise buffers (128 KiB) are
-                         planned in the memory budget before any feeder
+  --max-connections N    connections held at once that have no place of their role's own (not
+                         yet identified, probes, engines, directory links, dials that only
+                         send); beyond it a new one is closed before its handshake
+                         (default 2048). A feeder, a subscriber and a member session give
+                         their place up for their own role's. Every connection's Noise buffers (256 KiB)
+                         are planned in the memory budget: a feeder's in its reservation, and
+                         these, the member sessions' and the subscribers' before any feeder
   --max-connections-per-address N
                          connections held at once from one IPv4 address or IPv6 /64; beyond
                          it a new one from there is closed before its handshake (default 16)
@@ -234,7 +241,7 @@ impl Config {
             advertise: Vec::new(),
             accept_relays: Vec::new(),
             clients: Vec::new(),
-            max_subscribers: 64,
+            max_subscribers: DEFAULT_MAX_SUBSCRIBERS,
             max_connections: DEFAULT_MAX_CONNECTIONS,
             max_connections_per_address: DEFAULT_MAX_CONNECTIONS_PER_ADDRESS,
             max_feeder_bytes_per_sec: DEFAULT_MAX_FEEDER_BYTES_PER_SEC,
@@ -522,7 +529,13 @@ mod tests {
         let ten = egress::decimal(Cap::bytes_per_sec(1_250_000).most_a_month());
         for stated in [
             floor,
+            format!("(default {DEFAULT_MAX_SUBSCRIBERS})"),
             format!("(default {DEFAULT_MAX_CONNECTIONS})"),
+            format!(
+                "Noise buffers ({} KiB)",
+                crate::ingest::BUFFERS_PER_CONNECTION.div_ceil(1024)
+            ),
+            format!("{} relays a cell", crate::directory::OFFERS_PER_CELL),
             format!("(default {DEFAULT_MAX_CONNECTIONS_PER_ADDRESS})"),
             format!("(default {DEFAULT_MAX_FEEDER_BYTES_PER_SEC})"),
             format!("(default {DEFAULT_MAX_MEMBER_BYTES_PER_SEC})"),

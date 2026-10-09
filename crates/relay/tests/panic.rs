@@ -1,8 +1,11 @@
 //! The relay's one panic mechanism (`tally_relay::abort_on_any_panic`, which `main` sets first):
 //! a panic on any thread ends the process, a tokio task's (which the runtime would otherwise catch
 //! and run on without) and a plain thread's (a stage's) alike. Each case runs this binary again as
-//! the process that panics, so what is asserted is how that process ends.
+//! the process that panics, so what is asserted is how that process ends. And the relay's own
+//! program sets it: the built `tally-relay` (named by the build, `TALLY_RELAY_BIN`; `cargo test`
+//! finds it itself) is made to panic as it reads its arguments, and ends as the hook ends it.
 
+use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
 
@@ -93,4 +96,28 @@ fn a_panicking_thread_ends_the_process() -> Result {
         return child(&part);
     }
     assert_aborted(&panicking("thread", "a_panicking_thread_ends_the_process")?)
+}
+
+/// The built relay program.
+fn relay_binary() -> Result<PathBuf> {
+    std::env::var_os("TALLY_RELAY_BIN")
+        .map(PathBuf::from)
+        .or_else(|| option_env!("CARGO_BIN_EXE_tally-relay").map(PathBuf::from))
+        .ok_or_else(|| "TALLY_RELAY_BIN names the relay (set by the build)".to_owned())
+}
+
+/// `tally-relay`'s `main` sets the hook before anything else: an argument that is not Unicode
+/// makes the program panic as it reads its arguments (`std::env::args`), on its main thread inside
+/// the runtime, and the process aborts with the hook's word. A program that did not set it would
+/// unwind and exit with 101, the hook's word never said, so this fails if `main` stops setting it
+/// or sets it after reading its arguments.
+#[test]
+fn the_relay_program_sets_the_hook_before_anything_runs() -> Result {
+    use std::os::unix::ffi::OsStrExt as _;
+    let not_unicode = std::ffi::OsStr::from_bytes(b"--memory\xff");
+    let output = Command::new(relay_binary()?)
+        .arg(not_unicode)
+        .output()
+        .map_err(|error| error.to_string())?;
+    assert_aborted(&output)
 }

@@ -3,15 +3,18 @@
 How Tally's binaries are installed on a Linux box with systemd (248 or later).
 
 - `install.sh` installs a feeder on a receiver:
-  `curl -fsSL https://github.com/flightlines/tally/releases/download/<version>/install.sh | sudo bash`.
-  It downloads `tally-feed` for x86_64 or aarch64 and the feeder's unit from the release, each
+  `curl -fsSL <release>/install.sh | sudo bash`, from the release its publisher published (the
+  publisher writes the release's address into the script as it publishes it, `PUBLISHED_RELEASE`;
+  `TALLY_RELEASE` overrides it). It downloads `tally-feed` for x86_64 or aarch64 and the feeder's unit from the release, each
   checked against the `.sha256` published beside it; finds readsb's BEAST output (`127.0.0.1:30005`)
   and dump978-fa's raw output (`127.0.0.1:30978`, added as `--uat`); reads the antenna's location
   from `TALLY_LAT`, `TALLY_LON`, `TALLY_ALT`, or an adsb.im / ultrafeeder `.env`, or
-  `/etc/default/readsb`; takes the relays to start from from `RELAYS` at the top of the script
-  (filled at release) or `TALLY_RELAYS`, and stops before installing anything if both are empty;
+  `/etc/default/readsb`; takes the relays to start from from a seed list, the release's `seeds` or
+  the file `TALLY_SEEDS` names, one `HOST:PORT=KEY OPERATOR` a line, and stops before installing
+  anything if the list names no relay or an entry names no operator (`install.sh --check-seeds
+FILE` reads a list the same way, installing nothing);
   makes `/etc/tally/key` if missing (root, mode 600); writes
-  `/etc/default/tally-feed` if missing, with those relays as `--relay` flags; and starts the service. Run again, it upgrades the binary
+  `/etc/default/tally-feed` if missing, with those relays as `--relay` flags, each beside its operator; and starts the service. Run again, it upgrades the binary
   and keeps the key and the defaults file. It installs no updater: the feeder never updates itself
   (RFC-0171 §3.5). The checksum guards a broken download, not a compromised release.
 - `systemd/tally-feed.service` runs the feeder as a dynamic user with no listening socket, at most
@@ -24,8 +27,10 @@ How Tally's binaries are installed on a Linux box with systemd (248 or later).
   sets it for the host's plan (`../README.md`, "What a relay costs"): the bill can never exceed the
   cap times the seconds in a month, so `10Mbit/s` is at most about 3.35 TB. The cap keeps no state.
 
-A release therefore carries `install.sh`, `tally-feed-x86_64-linux`, `tally-feed-aarch64-linux` and
-`tally-feed.service`, each with a `.sha256` whose first field is the file's hash. The binaries are
+A release therefore carries `install.sh`, `tally-feed-x86_64-linux`, `tally-feed-aarch64-linux`,
+`tally-feed.service` and `seeds`, each with a `.sha256` whose first field is the file's hash. The
+seed list is the publisher's configuration, not this repository's: each publisher ships the relays
+it starts feeders from, each naming its operator, and checks its list with `--check-seeds`. The binaries are
 built against the pinned Debian bullseye sysroot (`bazel build -c opt
 --platforms=//platforms:linux_aarch64 //crates/feed:tally-feed`), so they need only glibc 2.25 or
 newer and no C++ runtime: any Raspberry Pi OS from Buster on, and any current Linux.

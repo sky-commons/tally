@@ -56,6 +56,16 @@ const PREAMBLE_LEN: usize = 4 + 1 + 1 + 2 + KEY_HINT_LEN;
 /// The most message buffers the pool keeps idle; past it a buffer given back is freed.
 pub const POOL_IDLE: usize = 256;
 
+/// The most message buffers a session's reader holds at once: the frame and the plaintext it is
+/// decrypted into, then the plaintext alone while its records are decoded (the frame is given back
+/// first, `Reader::decrypt`). The records decoded are the caller's, at most a message's worth.
+/// What a relay plans for a connection is these and [`WRITER_BUFFERS`], each a whole message.
+pub const READER_BUFFERS: usize = 2;
+
+/// The most message buffers a session's writer holds at once: the plaintext being packed and the
+/// ciphertext it is sealed into, for as long as a send waits on the peer (`WRITE_TIMEOUT`).
+pub const WRITER_BUFFERS: usize = 2;
+
 static POOL: Pool = Pool::new(POOL_IDLE);
 
 /// Message buffers kept idle for the next message, at most `keep` of them, each `MAX_MESSAGE`
@@ -68,6 +78,12 @@ pub(crate) struct Pool {
     made: AtomicUsize,
     /// Buffers taken and not yet given back.
     out: AtomicUsize,
+    /// The most taken and not given back at once, ever.
+    #[cfg(test)]
+    peak: AtomicUsize,
+    /// The most taken and not given back while a reader decoded records.
+    #[cfg(test)]
+    decoding: AtomicUsize,
 }
 
 impl Pool {
@@ -77,6 +93,10 @@ impl Pool {
             keep,
             made: AtomicUsize::new(0),
             out: AtomicUsize::new(0),
+            #[cfg(test)]
+            peak: AtomicUsize::new(0),
+            #[cfg(test)]
+            decoding: AtomicUsize::new(0),
         }
     }
 
@@ -107,7 +127,9 @@ impl Buffer {
 
     fn take_from(pool: &'static Pool) -> Self {
         let pooled = pool.idle.lock().ok().and_then(|mut idle| idle.pop());
-        pool.out.fetch_add(1, Ordering::Relaxed);
+        let _out = pool.out.fetch_add(1, Ordering::Relaxed);
+        #[cfg(test)]
+        pool.peak.fetch_max(_out + 1, Ordering::Relaxed);
         let bytes = pooled.unwrap_or_else(|| {
             pool.made.fetch_add(1, Ordering::Relaxed);
             Vec::with_capacity(MAX_MESSAGE)
@@ -430,8 +452,9 @@ where
 }
 
 /// The receiving half of a session. It holds no buffer between messages: one is taken from the
-/// pool once a message's length has arrived, and another to decrypt into, and both go back once
-/// its records are decoded.
+/// pool once a message's length has arrived, and another to decrypt into; the first goes back once
+/// the message is decrypted, before its records are decoded, and the second once they are. At most
+/// [`READER_BUFFERS`] at once.
 pub struct Reader<S> {
     read: ReadHalf<S>,
     transport: Arc<StatelessTransportState>,
@@ -461,6 +484,19 @@ impl<S: AsyncRead> Reader<S> {
         let length = usize::from(u16::from_be_bytes(length));
         let mut message = Buffer::take_from(self.pool);
         self.read.read_exact(message.space(length)).await?;
+        let (plaintext, length) = self.decrypt(message, length)?;
+        #[cfg(test)]
+        self.pool
+            .decoding
+            .fetch_max(self.pool.out.load(Ordering::Relaxed), Ordering::Relaxed);
+        Record::decode_message(plaintext.written(length), out)?;
+        Ok(())
+    }
+
+    /// The plaintext of the frame `message` holds (its first `length` bytes), and its length. The
+    /// frame is taken by value and given back here, so what is decoded after is held beside the
+    /// plaintext alone, never beside its frame too.
+    fn decrypt(&mut self, message: Buffer, length: usize) -> Result<(Buffer, usize), WireError> {
         // The plaintext is shorter than its frame: room for the frame's length is room enough,
         // and is all a message makes the buffer zero again.
         let mut plaintext = Buffer::take_from(self.pool);
@@ -469,9 +505,9 @@ impl<S: AsyncRead> Reader<S> {
             message.written(length),
             plaintext.space(length),
         )?;
+        drop(message);
         self.nonce += 1;
-        Record::decode_message(plaintext.written(length), out)?;
-        Ok(())
+        Ok((plaintext, length))
     }
 
     /// Reads and drops whatever the peer still sends, undecrypted, until it closes or the read
@@ -485,7 +521,8 @@ impl<S: AsyncRead> Reader<S> {
 }
 
 /// The sending half of a session. Records are packed into as few messages as fit, in buffers
-/// taken from the pool for the send and given back after it: it holds none between sends.
+/// taken from the pool for the send and given back after it: it holds none between sends, and at
+/// most [`WRITER_BUFFERS`] during one.
 pub struct Writer<S> {
     write: WriteHalf<S>,
     transport: Arc<StatelessTransportState>,
@@ -863,6 +900,51 @@ mod tests {
         assert!(made <= 4, "{made} buffers allocated for 8 sessions");
         assert_eq!(pool.idle(), made);
         drop(sessions);
+        Ok(())
+    }
+
+    /// What a relay carves for a connection (`ingest::BUFFERS_PER_CONNECTION`) is the stated
+    /// most of each half: a reader holds its frame and plaintext, then decodes beside the
+    /// plaintext alone (it decoded beside the frame too: three messages' worth with its records),
+    /// and a writer holds its plaintext and ciphertext. Each side of the session below has a pool
+    /// of its own, so each half is counted alone.
+    #[tokio::test]
+    async fn each_half_holds_at_most_its_stated_buffers() -> Result<(), WireError> {
+        let relay = Identity::generate()?;
+        let feeder = Identity::generate()?;
+        let (theirs_pool, ours_pool) = (own_pool(16), own_pool(16));
+        let (near, far) = tokio::io::duplex(1 << 20);
+        let relay_key = relay.public();
+        let dial = tokio::spawn(async move {
+            initiate(
+                near,
+                &feeder,
+                &relay_key,
+                (Role::Feeder, &[]),
+                (MIN_VERSION, MAX_VERSION),
+                theirs_pool,
+            )
+            .await
+        });
+        let mut accepted = respond(far, std::slice::from_ref(&relay), ours_pool).await?;
+        let mut theirs = join(dial.await)??;
+        // The handshakes are done: what follows is the session's halves alone.
+        theirs_pool.peak.store(0, Ordering::Relaxed);
+        ours_pool.peak.store(0, Ordering::Relaxed);
+        ours_pool.decoding.store(0, Ordering::Relaxed);
+        // Several full messages one way, read on the other.
+        let records: Vec<Record> = (0..20_000)
+            .map(|nonce| Record::Echo(crate::probe::Echo { nonce }))
+            .collect();
+        theirs.writer.send(&records).await?;
+        let mut got = Vec::new();
+        while got.len() < records.len() {
+            accepted.session.reader.recv(&mut got).await?;
+        }
+        assert_eq!(got, records);
+        assert_eq!(theirs_pool.peak.load(Ordering::Relaxed), WRITER_BUFFERS);
+        assert_eq!(ours_pool.peak.load(Ordering::Relaxed), READER_BUFFERS);
+        assert_eq!(ours_pool.decoding.load(Ordering::Relaxed), 1);
         Ok(())
     }
 

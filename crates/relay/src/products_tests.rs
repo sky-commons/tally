@@ -1156,26 +1156,36 @@ fn every_drop_is_counted_by_why() -> Result<()> {
     Ok(())
 }
 
+/// A budget of one feeder whose products' outputs take `products` bytes and whose records waiting
+/// take `records`.
+fn products_budget(products: usize, records: usize) -> crate::budget::Budget {
+    let per_feeder = crate::budget::PerFeeder {
+        products,
+        records,
+        ..crate::budget::PerFeeder::default()
+    };
+    crate::budget::Budget::new(per_feeder.total(), per_feeder)
+}
+
 /// RFC-0181 §10 and invariant 1 for the records that are not epochs: they wait in a queue of their
-/// own, held by the products' gauge alone, so a peer flooding them is refused (counted) once the
-/// gauge is full and never costs this relay an epoch; and a
+/// own, held by a share of their own (`Store::Records`), so a peer flooding them is refused
+/// (counted) once that share is full and never costs this relay an epoch, neither its place in the
+/// sealer's queue nor the room its outputs take (`Store::Products`); and a
 /// world candidate is in time or late by its stamp against the watermark that seals its second,
 /// never by when it was handled: two candidates handed in together, before that watermark is
 /// reached, one stamped before it and one at it, are the first in time and the second late.
 #[test]
 fn records_wait_apart_from_the_epochs_and_are_taken_in_by_stamp() -> Result<()> {
-    // The flood: more records than the products' gauge holds, stamped far ahead so none is taken
-    // in.
+    use crate::budget::Store;
+    // The flood: more records than their share holds, stamped far ahead so none is taken in.
     let products = Arc::new(Products::with_boot(1, 1));
     products.on_thread(1, None)?;
     let mlat = Mlat::new()?;
     let flood = mlat.solutions(&[0x00c0_0001], BASE_MS, 0, true, 1)?;
     const HELD: usize = 1_000;
-    let gauge = crate::budget::Gauge::new(
-        crate::budget::Store::Products,
-        HELD * flood.as_bytes().len(),
-    );
-    products.charge_to(Arc::clone(&gauge));
+    let budget = products_budget(1 << 20, HELD * flood.as_bytes().len());
+    let gauge = budget.gauge(Store::Records);
+    products.charge_to(&budget);
     for _ in 0..HELD + 10 {
         products.positions(&flood, BASE_MS + 1_000_000);
     }
@@ -1201,18 +1211,27 @@ fn records_wait_apart_from_the_epochs_and_are_taken_in_by_stamp() -> Result<()> 
     let report = products.report();
     assert_eq!((report.records_refused, report.epochs_refused), (10, 0));
 
-    // By stamp: second `s` seals once the watermark reaches `(s + 1) s + WORLD_SETTLE_MS`.
+    // By stamp: second `s` seals once the watermark reaches `(s + 1) s + WORLD_SETTLE_MS`. And
+    // with the records' share full of a flood, the world second still seals and goes out: its
+    // outputs take their own room.
     let relay = Identity::generate().map_err(err)?;
     let products = Products::new();
     products.set_world(true);
     let mlat = Mlat::new()?;
     let second = BASE_MS / 1_000;
     let seals = sealed_at(second);
-    products.clock_model(&mlat.model, BASE_MS);
     let in_time = mlat.solutions(&[0x00c0_0001], BASE_MS + 100, 0, true, 1)?;
     let late = mlat.solutions(&[0x00c0_0002], BASE_MS + 200, 0, true, 2)?;
+    let wanted = mlat.model.as_bytes().len() + in_time.as_bytes().len() + late.as_bytes().len();
+    let budget = products_budget(64 * 1024, wanted + HELD * flood.as_bytes().len());
+    products.charge_to(&budget);
+    products.clock_model(&mlat.model, BASE_MS);
     products.positions(&late, seals);
     products.positions(&in_time, seals - 1);
+    for _ in 0..HELD + 10 {
+        products.positions(&flood, BASE_MS + 1_000_000);
+    }
+    assert_eq!(products.report().records_refused, 10);
     let mut addresses = Vec::new();
     for now in [seals, seals + 1] {
         for record in tick(&products, Some(&relay), now) {
@@ -1229,5 +1248,6 @@ fn records_wait_apart_from_the_epochs_and_are_taken_in_by_stamp() -> Result<()> 
     }
     assert_eq!(addresses, vec![(second, 0x00c0_0001)]);
     assert_eq!(products.report().world_late, 1);
+    assert_eq!(products.report().epochs_refused, 0);
     Ok(())
 }

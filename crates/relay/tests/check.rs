@@ -73,8 +73,9 @@ fn check(args: &[&str]) -> Result<Checked> {
 }
 
 /// The plan holds together: the budget is the memory, what it holds before any feeder taken first
-/// (its base, the oversize room, its connections' buffers and its members' pool: their shared
-/// rate's worth, planned once, and each member session's allowance), one feeder fits, each
+/// (its base, the oversize room, its connections' buffers, its members' pool: their shared rate's
+/// worth, planned once, and each member session's allowance, and what waits for its link to each
+/// member, a link's share each), one feeder fits, each
 /// admitted feeder's share fits in what is left, and the budget keeps the declared headroom below
 /// the memory the relay runs in. A relay holding member sessions plans their rate; one holding
 /// none (it takes no area) plans nothing for them.
@@ -91,9 +92,16 @@ fn assert_plan_holds(checked: &Checked) -> Result {
         checked.get("headroom")?,
         checked.get("limit")?,
     );
-    let (member_feeders, rate_pool) = (
+    let (member_feeders, rate_pool, links) = (
         checked.get("member-feeders")?,
         checked.get("member-rate-pool")?,
+        checked.get("member-links")?,
+    );
+    assert_eq!(
+        links,
+        members * tally_relay::peers::WAITING_PER_LINK_BYTES,
+        "{:?}",
+        checked.plan
     );
     assert!(feeders > 0, "a plan admitting no feeder was accepted");
     assert!(per_member > 0, "{:?}", checked.plan);
@@ -115,7 +123,10 @@ fn assert_plan_holds(checked: &Checked) -> Result {
         checked.plan
     );
     assert_eq!(pool, rate_pool + per_member * members);
-    assert_eq!(planned, base + oversize + buffers + pool + each * feeders);
+    assert_eq!(
+        planned,
+        base + oversize + buffers + pool + links + each * feeders
+    );
     assert!(
         planned <= memory && memory - planned < each,
         "{:?}",
@@ -141,25 +152,28 @@ fn a_configuration_the_relay_takes_is_accepted_with_its_plan() -> Result {
         "--memory",
         "560M",
         "--max-connections",
-        "128",
+        "32",
         "--max-member-bytes-per-sec",
-        "262144",
+        "131072",
         "--area",
         "8001fffffffffff",
     ])?;
     assert!(checked.accepted, "{}", checked.refusal);
     assert_eq!(checked.get("memory")?, 560 << 20);
-    assert_eq!(checked.get("connections")?, 128);
     assert_eq!(checked.get("limit")?, 640 << 20);
-    // A base cell's groups reach every relay offering it or a cell under it, far more than 128:
-    // every connection may be a member session.
-    assert_eq!(checked.get("members")?, 128);
-    // The members' rate is the feeders it is worth, once: 256 KiB/s is 32 feeders at 8 KiB/s, each
+    // A base cell's groups reach every relay offering it or a cell under it, far more than 32:
+    // the member sessions planned are the cap's worth.
+    assert_eq!(checked.get("members")?, 32);
+    // Every connection but a feeder's has its buffers planned, each role by its own cap: the 32
+    // under --max-connections, the member sessions and the subscribers (64 by default).
+    let members = checked.get("members")?;
+    assert_eq!(checked.get("connections")?, 32 + members + 64);
+    // The members' rate is the feeders it is worth, once: 128 KiB/s is 16 feeders at 8 KiB/s, each
     // a feeder's cost but for the connection buffers and the allowance each session takes itself.
     let (rate_pool, each) = (checked.get("member-rate-pool")?, checked.get("per-feeder")?);
-    assert_eq!(checked.get("member-feeders")?, 32);
+    assert_eq!(checked.get("member-feeders")?, 16);
     assert!(
-        rate_pool % 32 == 0 && rate_pool < 32 * each,
+        rate_pool % 16 == 0 && rate_pool < 16 * each,
         "{:?}",
         checked.plan
     );

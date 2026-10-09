@@ -68,7 +68,10 @@ pub fn abort_on_any_panic() {
 /// address's (beyond either, a connection is closed before its handshake), each counted and capped
 /// from its first byte (`egress::Socket`); and signs its own records (its products, the
 /// deduplicated stream among them, and its network records) with the newest key (`identities[0]`),
-/// for as long as the relay runs.
+/// for as long as the relay runs. The relay's cap counts only the connections that hold no place
+/// of their role's own (`hub::Connection::general`): a connection gives its place up once it is a
+/// feeder, a subscriber or a member, each bounded by its own cap and told when that is full, so a
+/// relay full of feeders still answers a member's handshake (`link::inbound`).
 pub async fn serve(listener: TcpListener, identities: Vec<Identity>, hub: Arc<Hub>) -> ! {
     if let Some(newest) = identities.first() {
         hub.network().adopt_identity(newest.clone());
@@ -78,7 +81,7 @@ pub async fn serve(listener: TcpListener, identities: Vec<Identity>, hub: Arc<Hu
     loop {
         match listener.accept().await {
             Ok((stream, peer)) => {
-                let Some(slot) = hub.connection(peer.ip()) else {
+                let Some(connection) = hub.connection(peer.ip()) else {
                     drop(stream);
                     continue;
                 };
@@ -86,8 +89,7 @@ pub async fn serve(listener: TcpListener, identities: Vec<Identity>, hub: Arc<Hu
                 let identities = Arc::clone(&identities);
                 let hub = Arc::clone(&hub);
                 tokio::spawn(async move {
-                    let _slot = slot;
-                    if let Err(error) = link::inbound(stream, &identities, hub).await {
+                    if let Err(error) = link::inbound(stream, &identities, hub, connection).await {
                         eprintln!("tally-relay: {peer}: {error}");
                     }
                 });

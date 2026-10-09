@@ -332,6 +332,17 @@ positions; clock models): the relays that take that area.
   out the same ones and the area's data still reaches every member but the full one, which repairs
   what it lacks once it has room. A relay hosting MLAT takes a raw link's place in its own pool
   before it dials it, so it never dials a link it would turn away itself.
+- **Routing around a full member files no shortfall, on either side** (as built, 2026-10-09). The
+  wait is one rule, read by both ends of the refusal (`sharing::full::Wait`): the relay turned
+  away keeps it for the member that refused it, and the full member keeps the same wait, from the
+  same refusal and the same asked time, for the relay it turned away (every `Goodbye` `Full` it
+  says to a relay that dialled it: a member's link, a directory link that is one, or another
+  relay's raw link). So the full member knows exactly when that relay was sending its slice past
+  it, and files no shortfall against it for any receipt window the wait covers, however much of a
+  stripe it was owed through that relay; the relay turned away files none against the full member,
+  which it was not sending to. Before, the full member counted every routed-around window as that
+  relay short, and a parent whose children were mostly full was demoted on every relay for the
+  demotion period, changing the trees for a refusal that was the child's own.
 - **Relay links carry the directory; data moves over member links** (as built). A relay links to
   another relay in two ways. A directory link (`--upstream` dials one, `--accept-relay` lets a key
   dial in) carries the directory and nothing else: signed offers and queries, echoes, delivery
@@ -391,7 +402,10 @@ trust: a bundle is checked record by record exactly as its cells would be.
   claims. A provider that turns a relay away as full (`Goodbye` `Full`: it holds every member it
   plans, §2.5) is skipped for that relay for the wait it names, doubled on each refusal after, and
   the next provider by the same order takes its place; it is not demoted for it, and it is tried
-  again once the wait has passed.
+  again once the wait has passed. One record of it serves every link to that provider: a raw
+  source that refuses a one-hop raw link as full is not dialled for raw, and is routed around for
+  sharing, by the same wait, as a member that refuses a member link is. Neither side files a
+  shortfall against the other for the windows the wait covers (§2.5).
 
 ### §2.7 Blocked aircraft (LADD and PIA) are the displayer's duty
 

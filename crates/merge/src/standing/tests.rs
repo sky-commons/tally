@@ -68,7 +68,7 @@ fn build() -> Result<World, String> {
         },
     );
     for record in &raw {
-        running.ingest(record, 0)?;
+        running.ingest(record, tally_mlat::replay::sent_ms(record))?;
     }
     let published = running.step(now, now).0;
     Ok(World {
@@ -794,7 +794,7 @@ fn the_ranking_is_a_function_of_the_records_held_not_of_when_they_arrived() -> R
             {
                 continue;
             }
-            engine.ingest(record, 0)?;
+            engine.ingest(record, tally_mlat::replay::sent_ms(record))?;
         }
         let published = engine.step(world.now, world.now).0;
         let solution = solutions(&published)?
