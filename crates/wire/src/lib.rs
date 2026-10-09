@@ -12,6 +12,7 @@ pub mod delivery;
 pub mod directory;
 pub mod fault_proof;
 pub mod key;
+pub mod modes;
 pub mod noise;
 pub mod observation_set;
 pub mod positions;

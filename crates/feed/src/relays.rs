@@ -34,7 +34,7 @@ use tokio::task::JoinSet;
 use crate::delivery_check::{self, Checking, DeliveryChecker, SAMPLED, Sent, Verdict};
 use crate::probe::{self, MOST_PER_ROUND, Measured, Probed, Prober, RANDOM_PER_ROUND, ROUND_EVERY};
 use crate::selection::{BandRendezvous, Choice, RelaySelection, failover_jitter};
-use crate::source::{TokenBucket, wall_ms};
+use crate::source::{Stating, TokenBucket, WantedCeilings, wall_ms};
 
 const HEARTBEAT: Duration = Duration::from_secs(30);
 const READ_TIMEOUT: Duration = Duration::from_secs(120);
@@ -899,6 +899,9 @@ pub struct Publishing {
     pub batches: broadcast::Sender<Arc<Record>>,
     /// The owner's ceiling, bytes a second.
     pub ceiling: u32,
+    /// The wanted receptions a second the relays state, which the batcher sheds to: each session
+    /// states its relay's (`source::WantedCeilings`).
+    pub wanted: Arc<WantedCeilings>,
     pub checker: DeliveryChecker,
     /// When the delivery checks run: `Checking::default()`.
     pub checking: Checking,
@@ -920,6 +923,7 @@ struct Publisher {
     identity: Identity,
     batches: broadcast::Sender<Arc<Record>>,
     ceiling: u32,
+    wanted: Arc<WantedCeilings>,
     checker: DeliveryChecker,
     checking: Checking,
     prober: Prober,
@@ -946,6 +950,7 @@ pub async fn run(publishing: Publishing) {
         identity: publishing.identity,
         batches: publishing.batches,
         ceiling: publishing.ceiling,
+        wanted: publishing.wanted,
         checker: publishing.checker,
         checking: publishing.checking,
         prober: publishing.prober,
@@ -1361,6 +1366,7 @@ impl Publisher {
             ledger: Arc::clone(&self.ledger),
             ceiling: self.ceiling,
             area: self.area,
+            wanted: Arc::clone(&self.wanted),
         };
         let identity = self.identity.clone();
         let batches = self.batches.subscribe();
@@ -1403,6 +1409,8 @@ struct Context {
     ledger: Arc<Ledger>,
     ceiling: u32,
     area: Option<Region>,
+    /// The relays' wanted ceilings the batcher sheds to: this session's statement is one.
+    wanted: Arc<WantedCeilings>,
 }
 
 /// One session with a relay: how it ended, and how long it was up (none if it never was).
@@ -1459,26 +1467,33 @@ async fn session(
 /// by the batcher, so a relay that asked nothing gets every batch. A relay that asked for less than
 /// the ceiling gets a bucket at its rate, deep enough that a whole batch always fits; the batches
 /// over it are skipped for that relay alone, and their sequence numbers say so.
+///
+/// The wanted receptions a second the relay states with it are the batcher's to keep to
+/// (`source::WantedCeilings`): a batch is signed once for every relay, so what is past them is shed
+/// before it is signed, never skipped here. What this session stated goes when it ends.
 struct Pace {
     ceiling: u32,
     bucket: Option<TokenBucket>,
     skipped: u64,
+    wanted: Stating,
 }
 
 impl Pace {
-    fn new(ceiling: u32) -> Self {
+    fn new(ceiling: u32, wanted: Stating) -> Self {
         Self {
             ceiling,
             bucket: None,
             skipped: 0,
+            wanted,
         }
     }
 
     /// A relay's `RateLimit`. One at or over the owner's ceiling asks for nothing the batcher
     /// does not already keep to.
-    fn limit(&mut self, bytes_per_sec: u32, burst: u32) {
+    fn limit(&mut self, bytes_per_sec: u32, burst: u32, wanted_per_sec: Option<u32>) {
         self.bucket = (bytes_per_sec < self.ceiling)
             .then(|| TokenBucket::with_burst(bytes_per_sec, burst.max(BURST_FLOOR)));
+        self.wanted.state(wanted_per_sec);
     }
 
     /// True if a batch of `bytes` goes to this relay now; counted as skipped if not.
@@ -1580,7 +1595,8 @@ fn heard(
             Record::RateLimit {
                 bytes_per_sec,
                 burst,
-            } => pace.limit(bytes_per_sec, burst),
+                wanted_per_sec,
+            } => pace.limit(bytes_per_sec, burst, wanted_per_sec),
             Record::Redirect {
                 retry_after_secs,
                 hints,
@@ -1621,7 +1637,7 @@ async fn publish<S: tokio::io::AsyncWrite>(
         context,
         writer,
         records,
-        pace: Pace::new(context.ceiling),
+        pace: Pace::new(context.ceiling, context.wanted.session()),
     };
     let mut info = directory.info();
     let mut owed = context.ledger.owed_changes();
@@ -1880,20 +1896,44 @@ mod tests {
         Ok(())
     }
 
+    fn pace(ceiling: u32) -> Pace {
+        Pace::new(ceiling, Arc::new(WantedCeilings::default()).session())
+    }
+
     #[test]
     fn a_relay_that_asked_nothing_is_not_paced() {
-        let mut pace = Pace::new(64_000);
+        let mut pace = pace(64_000);
         let now = Instant::now();
         assert!((0..100).all(|_| pace.admit(noise::MAX_PLAINTEXT, now)));
         // A relay asking for the ceiling or more asks for nothing.
-        pace.limit(64_000, 0);
+        pace.limit(64_000, 0, None);
         assert!((0..100).all(|_| pace.admit(noise::MAX_PLAINTEXT, now)));
+    }
+
+    /// F4 of sweep 6: what a relay states of its wanted receptions a second is the batcher's to
+    /// shed to, the least any live session stated: a session's statement holds while the session
+    /// does and goes when it ends, so a relay that is gone holds the feeder to nothing.
+    #[test]
+    fn each_sessions_wanted_ceiling_holds_the_batcher_while_it_lives() {
+        let ceilings = Arc::new(WantedCeilings::default());
+        let mut first = Pace::new(64_000, ceilings.session());
+        let mut second = Pace::new(64_000, ceilings.session());
+        assert_eq!(ceilings.least(), None);
+        first.limit(64_000, 64_000, Some(1_800));
+        second.limit(64_000, 64_000, Some(1_200));
+        assert_eq!(ceilings.least(), Some(1_200));
+        // A relay that states none in a later `RateLimit` (or predates the field) holds nothing.
+        second.limit(64_000, 64_000, None);
+        assert_eq!(ceilings.least(), Some(1_800));
+        drop(first);
+        assert_eq!(ceilings.least(), None);
+        drop(second);
     }
 
     #[test]
     fn a_relay_that_asked_for_less_gets_fewer_batches_never_none() {
-        let mut pace = Pace::new(64_000);
-        pace.limit(16_000, 1_000);
+        let mut pace = pace(64_000);
+        pace.limit(16_000, 1_000, None);
         let start = Instant::now();
         let batch = 48 * 1024 + 4_000;
         let mut sent = Vec::new();
@@ -2154,6 +2194,7 @@ mod tests {
             identity: feeder.clone(),
             batches: batches.clone(),
             ceiling: 64_000,
+            wanted: Arc::default(),
             checker: DeliveryChecker::load(&dir),
             checking: Checking {
                 every: Duration::from_secs(1),
@@ -2242,6 +2283,7 @@ mod tests {
             ledger: Arc::new(Ledger::default()),
             ceiling: 64_000,
             area: None,
+            wanted: Arc::default(),
         }
     }
 
@@ -2552,6 +2594,7 @@ mod tests {
             identity: feeder.clone(),
             batches: batches.clone(),
             ceiling: 64_000,
+            wanted: Arc::default(),
             checker: DeliveryChecker::default(),
             checking: Checking::default(),
             prober: |relay, me| {
@@ -2627,6 +2670,7 @@ mod tests {
             identity: feeder.clone(),
             batches: batches.clone(),
             ceiling: 64_000,
+            wanted: Arc::default(),
             checker: DeliveryChecker::default(),
             checking: Checking::default(),
             prober: |relay, me| {

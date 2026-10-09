@@ -81,7 +81,9 @@ impl Tolerance {
     pub const fn for_spec(spec_version: u16) -> Option<Self> {
         match spec_version {
             // About 1 m of latitude, 1 m of altitude, 3 m of light travel, 0.1% of a variance.
-            1..=4 => Some(Self {
+            // Version 5 changed what is derived (a gauge's origin, the sync messages kept), not
+            // how far two implementations' floating point may differ.
+            1..=5 => Some(Self {
                 position_e7: 10,
                 alt_mm: 1_000,
                 transmit_ns: 10,

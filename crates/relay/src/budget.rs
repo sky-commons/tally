@@ -17,8 +17,8 @@
 //! MLAT's steps planned in them beside the stages; its stages' threads, and MLAT's, follow what it
 //! admits ([`Budget::threads`], [`Budget::mlat_threads`]). The
 //! budget is `--memory`, by default the memory the relay runs in ([`memory_available`]: the lesser
-//! of its cgroup's `memory.high` and `memory.max`, else the host's) less [`HEADROOM_BYTES`], what
-//! no store charges. A Hello beyond the ceiling is refused ("no spare slot"), and a relay whose
+//! of its cgroup's `memory.high` and `memory.max`, else the host's) less its headroom for what no
+//! store charges ([`headroom_for`]: [`HEADROOM_BYTES`] and the allocator's share of the plan). A Hello beyond the ceiling is refused ("no spare slot"), and a relay whose
 //! budget cannot hold its members' pool and one feeder refuses to start ([`Budget::check`]). The
 //! MLAT engine's receiver limit comes from the same ceiling.
 //!
@@ -55,7 +55,7 @@ pub enum Store {
     /// MLAT's sealed raw (`Held`'s sealed bins), shared by the engine and standing.
     Held,
     /// MLAT's open raw: the bins not yet sealed, in the raw shards and on their way to sealing,
-    /// over a bin, its settling and the steps MLAT may fall behind (`mlat_host::STEPS_BEHIND`).
+    /// over a bin, its settling and the seals MLAT may fall behind (`mlat_host::SEALS_BEHIND`).
     Open,
     /// What batches told hosted MLAT's provisional solving and its step has not yet weighed: the
     /// decoded batches the notes keep alive, and the notes (`mlat_host::NOTES_PER_RECEIVER_STEP`),
@@ -621,25 +621,64 @@ pub fn feeders_for_rate(bytes_per_sec: u64) -> usize {
 
 /// The memory this relay runs in: the least of its cgroup's `memory.high` (past which the kernel
 /// throttles it) and `memory.max` (past which it kills it), its own cgroup's and every ancestor's,
-/// when any is a number; else the host's memory. The budget is this less [`HEADROOM_BYTES`]
-/// ([`budget_within`]).
+/// when any is a number; else the host's memory. The budget is this less its headroom
+/// ([`budget_within`], [`headroom_for`]).
 pub fn memory_available() -> usize {
     cgroup_limit()
         .or_else(host_memory)
         .unwrap_or(BASE_BYTES * 4)
 }
 
-/// What the relay holds that no store charges and no base plans: the allocator's free pages not
-/// yet given back, the threads' stacks, the kernel's socket buffers (charged to the relay's
-/// cgroup), the binary's own pages. Measured under 10 MiB at the public relay's shape (RFC-0181,
-/// "Sizing"); held at 64 MiB. The budget is the memory the relay runs in less this
-/// ([`budget_within`]), so a relay at its plan is still this far from being throttled or killed.
+/// What the relay holds that no store charges and no base plans, whatever its load: the threads'
+/// stacks, the kernel's socket buffers (charged to the relay's cgroup), the binary's own pages.
+/// Measured under 10 MiB at the public relay's shape (RFC-0181, "Sizing"); held at 64 MiB. The
+/// allocator's free pages are apart ([`ALLOCATOR_PERCENT`]): they grow with what the relay holds.
 pub const HEADROOM_BYTES: usize = 64 << 20;
 
-/// The budget of a relay that runs in `limit` bytes ([`memory_available`]): all of it but
-/// [`HEADROOM_BYTES`].
+/// The arenas glibc's allocator may keep (`M_ARENA_MAX`, [`bound_the_allocator`]). Each arena
+/// keeps the pages its threads freed for its own reuse, so what the allocator holds beyond what
+/// is live grows with the arenas, and glibc makes up to eight a core: at 2,000 feeders hosting MLAT
+/// on 16 cores it held up to 1.9 GB beside the 5.2 GB the stores were charged (sweep 6, F3). Eight:
+/// four held a fifth less but stood the stages' threads in line for them (raw's p90 29 to 35 ms
+/// against 11 to 19 with eight or with glibc's own count; RFC-0181, "MLAT and the allocator").
+pub const MALLOC_ARENAS: i32 = 8;
+
+/// What the allocator keeps for reuse beside what is live, as a percent of what it serves the plan:
+/// the relay's base and every store. Measured with [`MALLOC_ARENAS`] (2026-10-09, 2,000 feeders
+/// hosting MLAT, `tally-load`): resident less the base and every store's charge at most 973 MiB
+/// over 5,452 MiB planned in use, 17.8% ([`MEASURED_ALLOCATOR_PERCENT`]); planned at 25.
+pub const ALLOCATOR_PERCENT: usize = 25;
+
+/// The share measured ([`ALLOCATOR_PERCENT`]), which the plan must hold.
+pub const MEASURED_ALLOCATOR_PERCENT: usize = 18;
+const _: () = assert!(ALLOCATOR_PERCENT >= MEASURED_ALLOCATOR_PERCENT);
+
+/// Bounds what the allocator keeps (F3 of sweep 6): glibc's arenas capped at [`MALLOC_ARENAS`],
+/// set before any thread starts, so the pages it keeps for reuse stay within the share the plan
+/// holds for them ([`ALLOCATOR_PERCENT`]). Nothing trims on a hot path: before, a thread called
+/// `malloc_trim(0)` after each window step, which walks every arena with its lock held and stood
+/// every stage's thread in line for seconds; without it, glibc's arenas kept up to 1.9 GB beside
+/// what was live at 2,000 feeders, which the 64 MiB headroom was documented to cover and did not.
+/// Elsewhere than glibc, nothing.
+pub fn bound_the_allocator() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    // SAFETY: `mallopt` only sets a parameter of the allocator; called before any thread starts.
+    unsafe {
+        libc::mallopt(libc::M_ARENA_MAX, MALLOC_ARENAS);
+    }
+}
+
+/// What a relay planning `planned` bytes (its base and its stores) keeps below the memory it runs
+/// in: [`HEADROOM_BYTES`] and the allocator's share of what it plans ([`ALLOCATOR_PERCENT`]). A
+/// relay holding its whole plan is still within the memory it runs in.
+pub fn headroom_for(planned: usize) -> usize {
+    HEADROOM_BYTES.saturating_add(planned.saturating_mul(ALLOCATOR_PERCENT) / 100)
+}
+
+/// The budget of a relay that runs in `limit` bytes ([`memory_available`]): the most whose
+/// headroom ([`headroom_for`]) still fits beside it.
 pub fn budget_within(limit: usize) -> usize {
-    limit.saturating_sub(HEADROOM_BYTES)
+    limit.saturating_sub(HEADROOM_BYTES).saturating_mul(100) / (100 + ALLOCATOR_PERCENT)
 }
 
 /// The least of cgroup v2's `memory.high` and `memory.max` over this process's cgroup and its
@@ -890,8 +929,29 @@ pub struct Charge {
 /// Sharded by the decode's address so the stages' threads seldom meet on a lock: each decode's
 /// address, how many covers hold it and the decode itself, weakly (a cover keeps no decode alive;
 /// its allocation, and so its address, stays the decode's while a cover does).
+///
+/// It also judges every hand-off as it happens, not only when it is sampled (N14 of sweep 6): a
+/// cover let go or lessened while its decode lives, leaving the decode's covers holding less than
+/// its footprint, is a lapse counted there and then ([`Covered::lapses`]), and so is a decode that
+/// lived and was let go with no cover ever made for it. A sample sees what is held at its instant;
+/// these counters see every instant a hand-off made, so a holder that keeps a decode uncharged for
+/// less than the time between two samples is counted all the same.
 pub struct Covered {
     shards: [Mutex<BTreeMap<usize, CoverEntry>>; COVER_SHARDS],
+    /// Hand-offs that left a live decode's covers short of its footprint (or none).
+    short_hand_offs: AtomicU64,
+    /// Decodes let go that no charge had ever covered.
+    never_covered: AtomicU64,
+}
+
+/// What [`Covered`] counted at the hand-offs since the process started.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Lapses {
+    /// A cover let go or lessened while its decode lived, leaving it covered for less than its
+    /// footprint: the decode was held, from then, where no gauge was charged for all of it.
+    pub short_hand_offs: u64,
+    /// A decode alive and let go with no charge ever covering it.
+    pub never_covered: u64,
 }
 
 const COVER_SHARDS: usize = 64;
@@ -900,6 +960,8 @@ static COVERED: Covered = Covered::new();
 
 #[derive(Debug)]
 struct CoverEntry {
+    /// Its covers now. An entry whose covers are all let go while its decode lives stays, at
+    /// none, until the decode is let go ([`Covered::gone`]): it is a decode alive and uncovered.
     covers: usize,
     /// The bytes its covers' charges hold for it together ([`Cover::bytes`]).
     vouched: usize,
@@ -914,6 +976,26 @@ impl Covered {
     const fn new() -> Self {
         Self {
             shards: [const { Mutex::new(BTreeMap::new()) }; COVER_SHARDS],
+            short_hand_offs: AtomicU64::new(0),
+            never_covered: AtomicU64::new(0),
+        }
+    }
+
+    /// What the hand-offs left short, counted as each happened, since the process started.
+    pub fn lapses(&self) -> Lapses {
+        Lapses {
+            short_hand_offs: self.short_hand_offs.load(Ordering::Relaxed),
+            never_covered: self.never_covered.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Counts the hand-off just made to `entry` if it left a live decode short of its footprint.
+    /// A decode whose last strong reference has gone is being let go (its `gone` follows, taking
+    /// this lock), so it is not alive; one held anywhere is.
+    fn judge(&self, entry: &CoverEntry) {
+        let alive = !entry.gone && entry.decoded.strong_count() > 0;
+        if alive && entry.vouched < entry.footprint {
+            self.short_hand_offs.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -930,8 +1012,15 @@ impl Covered {
     /// The decode at `address` was let go and `live` no longer counts it: its covers, until they
     /// go, count for nothing.
     fn gone(&self, address: usize) {
-        if let Some(entry) = self.shard(address).get_mut(&address) {
-            entry.gone = true;
+        let mut shard = self.shard(address);
+        match shard.get_mut(&address) {
+            Some(entry) if entry.covers == 0 => {
+                shard.remove(&address);
+            }
+            Some(entry) => entry.gone = true,
+            None => {
+                self.never_covered.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 
@@ -962,7 +1051,10 @@ impl Covered {
         if let Some(entry) = shard.get_mut(&address) {
             entry.covers -= 1;
             entry.vouched = entry.vouched.saturating_sub(bytes);
-            if entry.covers == 0 {
+            self.judge(entry);
+            // Kept at no covers while its decode may yet be let go (`gone` removes it then), so
+            // a decode alive with none is known to have had one.
+            if entry.covers == 0 && entry.gone {
                 shard.remove(&address);
             }
         }
@@ -970,8 +1062,12 @@ impl Covered {
 
     /// One cover of the decode at `address` holds `bytes` less for it.
     fn lessen(&self, address: usize, bytes: usize) {
+        if bytes == 0 {
+            return;
+        }
         if let Some(entry) = self.shard(address).get_mut(&address) {
             entry.vouched = entry.vouched.saturating_sub(bytes);
+            self.judge(entry);
         }
     }
 
@@ -1005,7 +1101,8 @@ impl Covered {
             let shard = shard
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            for (address, entry) in shard.iter() {
+            // Only the covered: one alive with no cover left is what `with_live` counts apart.
+            for (address, entry) in shard.iter().filter(|(_, entry)| entry.covers > 0) {
                 if let Some(decoded) = entry.decoded.upgrade() {
                     if entry.vouched < decoded.footprint() {
                         short.push((*address, decoded.footprint() - entry.vouched));
@@ -1053,7 +1150,10 @@ impl Covered {
         let live = live();
         let (mut batches, mut bytes) = (0, 0);
         for shard in &shards {
-            for entry in shard.values().filter(|entry| !entry.gone) {
+            for entry in shard
+                .values()
+                .filter(|entry| !entry.gone && entry.covers > 0)
+            {
                 batches += 1;
                 bytes += entry.footprint;
             }
@@ -2133,10 +2233,90 @@ mod tests {
         }
     }
 
+    /// F3 of sweep 6: the memory a relay runs in holds its whole budget, the fixed headroom and the
+    /// allocator's share of the budget (at least what was measured), and no budget larger would.
+    /// Before, the budget was the memory less 64 MiB, while glibc's arenas kept up to 35% of what the
+    /// stores held beside it.
     #[test]
     fn the_budget_is_the_memory_run_in_less_the_headroom() {
-        assert_eq!(budget_within(640 << 20), 576 << 20);
+        for limit in [640 << 20, 672 << 20, 2 << 30, 16 << 30, 64 << 30] {
+            let budget = budget_within(limit);
+            assert!(budget + headroom_for(budget) <= limit, "{limit}");
+            assert!(budget + 1 + headroom_for(budget + 1) > limit - 1, "{limit}");
+            assert!(
+                limit - budget >= HEADROOM_BYTES + budget * MEASURED_ALLOCATOR_PERCENT / 100,
+                "{limit}"
+            );
+        }
         assert_eq!(budget_within(HEADROOM_BYTES - 1), 0);
+    }
+
+    /// F3 of sweep 6: once bounded, the allocator makes no more than [`MALLOC_ARENAS`] arenas
+    /// however many threads allocate at once (glibc makes up to eight a core otherwise). In a child
+    /// process of its own, which bounds the allocator before its threads allocate, as the relay's
+    /// `main` does.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[test]
+    fn the_allocator_keeps_no_more_arenas_than_planned() -> Result<(), String> {
+        const CHILD: &str = "TALLY_ARENAS_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            bound_the_allocator();
+            let arenas = arenas_after_threads(64)?;
+            // The main arena and the test thread's, made before the bound, beside the bound.
+            assert!(arenas <= MALLOC_ARENAS as usize + 2, "{arenas} arenas");
+            return Ok(());
+        }
+        let exe = std::env::current_exe().map_err(|error| error.to_string())?;
+        let status = std::process::Command::new(exe)
+            .args([
+                "--exact",
+                "budget::tests::the_allocator_keeps_no_more_arenas_than_planned",
+                "--test-threads=1",
+            ])
+            .env(CHILD, "1")
+            .status()
+            .map_err(|error| error.to_string())?;
+        assert!(status.success(), "the child: {status}");
+        Ok(())
+    }
+
+    /// The arenas glibc reports (`malloc_info`) once `threads` threads have each allocated while
+    /// all are alive.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    fn arenas_after_threads(threads: usize) -> Result<usize, String> {
+        let barrier = Arc::new(std::sync::Barrier::new(threads + 1));
+        let done = Arc::new(std::sync::Barrier::new(threads + 1));
+        let handles: Vec<_> = (0..threads)
+            .map(|_| {
+                let (barrier, done) = (Arc::clone(&barrier), Arc::clone(&done));
+                std::thread::spawn(move || {
+                    let held: Vec<Vec<u8>> = (0..64).map(|n| vec![n as u8; 4096]).collect();
+                    barrier.wait();
+                    done.wait();
+                    held.len()
+                })
+            })
+            .collect();
+        barrier.wait();
+        let path = std::env::temp_dir().join(format!("malloc-info-{}", std::process::id()));
+        // SAFETY: a file opened for writing, handed to glibc's `malloc_info` and closed.
+        unsafe {
+            let name = std::ffi::CString::new(path.display().to_string())
+                .map_err(|error| error.to_string())?;
+            let file = libc::fopen(name.as_ptr(), c"w".as_ptr());
+            if file.is_null() {
+                return Err("fopen".to_owned());
+            }
+            libc::malloc_info(0, file);
+            libc::fclose(file);
+        }
+        done.wait();
+        for handle in handles {
+            handle.join().map_err(|_| "a thread panicked".to_owned())?;
+        }
+        let info = std::fs::read_to_string(&path).map_err(|error| error.to_string())?;
+        let _ = std::fs::remove_file(&path);
+        Ok(info.matches("<heap nr=").count())
     }
 
     /// Every store's gauge is its share of the budget at the ceiling, and resizing the budget

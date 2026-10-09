@@ -1364,7 +1364,8 @@ async fn a_feeder_is_told_its_rate_limit_and_the_relays_hints_first() -> Result 
         vec![
             Record::RateLimit {
                 bytes_per_sec,
-                burst
+                burst,
+                wanted_per_sec: Some(tally_relay::ingest::FEEDER_RECEPTIONS_PER_SEC as u32),
             },
             Record::RelayList(vec![hint]),
         ]

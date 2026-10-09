@@ -12,6 +12,7 @@ pub mod subscriber;
 pub mod traffic;
 
 use std::fmt::Write as _;
+use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
@@ -69,6 +70,18 @@ fn check_host(
     Ok(())
 }
 
+/// What the simulation made, a line of the summary.
+fn made_line(made: &traffic::Made, feeders: usize) -> String {
+    format!(
+        "{:.0} receptions/s a receiver; {:.0} distinct transmissions/s, each heard by {:.1}; {:.0} \
+         distinct messages/s by their bytes",
+        made.per_sec(made.receptions) / feeders.max(1) as f64,
+        made.per_sec(made.transmissions),
+        made.receptions as f64 / made.transmissions.max(1) as f64,
+        made.per_sec(made.contents)
+    )
+}
+
 /// What one sample of the run saw.
 struct Moment {
     sample: Option<Sample>,
@@ -77,6 +90,8 @@ struct Moment {
     admission: Option<Admission>,
     /// The hosted MLAT's clock fits, where the relay hosts it (`relay::fits`).
     fits: Option<relay::Fits>,
+    /// What the relay's base and stores are charged (`relay::charged`).
+    charged: Option<relay::Charged>,
     offered: u64,
 }
 
@@ -102,6 +117,10 @@ impl Watch {
                 .stats
                 .as_deref()
                 .and_then(|stats| relay::fits(stats).ok()),
+            charged: self
+                .stats
+                .as_deref()
+                .and_then(|stats| relay::charged(stats).ok()),
             offered: self.counts.offered.load(Ordering::Relaxed),
         }
     }
@@ -117,50 +136,52 @@ pub async fn run(config: Config) -> Result<String, String> {
             pid,
             stats,
         } => (addresses.clone(), *pid, stats.clone(), None),
-        Relay::Spawn { .. } => (Vec::new(), None, None, None),
+        Relay::Spawn(_) => (Vec::new(), None, None, None),
     };
     if !config.simulate_only {
         check_host(
             &config,
             local,
             addresses.len().max(1),
-            matches!(config.relay, Relay::Spawn { .. }),
+            matches!(config.relay, Relay::Spawn(_)),
         )?;
     }
     let started = Instant::now();
     let traffic = if config.run_feeders {
         let local_range = range.clone();
         eprintln!(
-            "tally-load: simulating {} receivers ({} here), {} aircraft a cluster, {} s looped",
+            "tally-load: simulating {} receivers ({} here), {} aircraft a cluster, {} s forward \
+             in time as the run plays",
             config.spec.feeders,
             local_range.len(),
             config.spec.aircraft,
-            config.spec.period_s
+            config.spec.seconds
         );
         let spec = config.spec.clone();
-        let built = tokio::task::spawn_blocking(move || Traffic::build(&spec, local_range))
-            .await
-            .map_err(|error| error.to_string())??;
+        let built = tokio::task::spawn_blocking(move || {
+            Traffic::build(&spec, local_range, traffic::Pace::Run)
+        })
+        .await
+        .map_err(|error| error.to_string())??;
         let calibration = built.calibration;
         eprintln!(
-            "tally-load: simulated in {:.1} s: {:.0} receptions a second a receiver ({:.0} in \
-             reach, kept at {:.3}), {:.0} distinct transmissions a second, each heard by {:.1} \
-             receivers, {:.0} distinct messages a second by their bytes, about {:.0} a second for \
-             the deduplicated stream; {} receptions held",
+            "tally-load: measured in {:.1} s: a receiver hears {:.0} receptions a second in \
+             reach, kept at {:.3}",
             started.elapsed().as_secs_f64(),
-            calibration.per_sec,
             calibration.in_reach_per_sec,
             calibration.probability,
-            calibration.messages_per_sec,
-            calibration.receivers_per_message,
-            calibration.contents_per_sec,
-            calibration.deduplicated_per_sec,
-            built.held()
         );
         if config.simulate_only {
+            // The run's first seconds, as they are made.
+            built.begin(Instant::now());
+            let seconds = 5;
+            built.wait_for(seconds - 1);
+            let made = built.made(0..seconds);
             let own = Sample::read(None)?;
             return Ok(format!(
-                "tally-load: simulated only; this process holds {} MiB",
+                "tally-load: simulated only; over the first {seconds} s {}; this process holds {} \
+                 MiB",
+                made_line(&made, config.spec.feeders),
                 own.rss_kib / 1024
             ));
         }
@@ -169,22 +190,8 @@ pub async fn run(config: Config) -> Result<String, String> {
         None
     };
     let (addresses, pid, stats) = match &config.relay {
-        Relay::Spawn {
-            bin,
-            listen,
-            max_upload,
-            args,
-            mlat,
-        } => {
-            let relay = relay::spawn(
-                bin,
-                listen,
-                max_upload,
-                *mlat,
-                args,
-                config.spec.feeders,
-                &config.state_dir,
-            )?;
+        Relay::Spawn(how) => {
+            let relay = relay::spawn(how, config.spec.feeders, &config.state_dir)?;
             eprintln!(
                 "tally-load: relay pid {} at {}={} (log {}); other shards join with --relay {}={}",
                 relay.pid(),
@@ -239,6 +246,10 @@ pub async fn run(config: Config) -> Result<String, String> {
     let mut last = watch.moment();
     let mut window: Option<(Moment, Instant)> = None;
     let mut relay_peak_cores: f64 = 0.0;
+    // The most its base and stores were charged so far, and the most the relay was resident beyond
+    // that and the headroom for it at any sample (F3 of sweep 6): (beyond, resident, peak charged).
+    let mut peak_charged = 0u64;
+    let mut beyond: Option<(i64, u64, u64)> = None;
     loop {
         let elapsed = begin.elapsed();
         let next = if window.is_none() {
@@ -256,6 +267,14 @@ pub async fn run(config: Config) -> Result<String, String> {
             ));
         }
         let now = watch.moment();
+        if let (Some(sample), Some(charged)) = (&now.sample, now.charged) {
+            peak_charged = peak_charged.max(charged.total());
+            let rss = sample.rss_kib * 1024;
+            let over = rss as i64 - relay::resident_allowed(peak_charged) as i64;
+            if beyond.is_none_or(|(most, _, _)| over > most) {
+                beyond = Some((over, rss, peak_charged));
+            }
+        }
         let cores = match (&now.sample, &last.sample) {
             (Some(now), Some(before)) => Some(now.cores_since(before, watch.ticks)),
             _ => None,
@@ -283,7 +302,26 @@ pub async fn run(config: Config) -> Result<String, String> {
     let Some((start, at)) = window else {
         return Err("no window was measured".to_owned());
     };
+    // A relay named by its pid that cannot be read at the end is gone: no summary of it is one.
+    if let (Some(pid), None) = (watch.pid, &end.sample) {
+        return Err(format!(
+            "the relay (pid {pid}) could not be read at the end: it has gone"
+        ));
+    }
+    let window_start = at.duration_since(begin);
+    // The run's clock is the feeders' (`feeders::spawn`), started just before `begin`.
+    let run_second = |since_begin: Duration| since_begin.as_secs();
     let seconds = at.elapsed().as_secs_f64();
+    let fit = match (&end.sample, watch.stats.as_deref()) {
+        (Some(sample), Some(stats)) => Some(relay::Fit {
+            peak_bytes: sample.peak_rss_kib * 1024,
+            budget_bytes: relay::budget(stats)?,
+            headroom_bytes: tally_relay::budget::headroom_for(
+                usize::try_from(relay::budget(stats)?).unwrap_or(usize::MAX),
+            ) as u64,
+        }),
+        _ => None,
+    };
     let table = summary(&Summary {
         config: &config,
         local,
@@ -294,12 +332,37 @@ pub async fn run(config: Config) -> Result<String, String> {
         start: &start,
         end: &end,
         seconds,
+        measured: run_second(window_start)..run_second(begin.elapsed()),
         ticks: watch.ticks,
         relay_peak_cores,
+        fit,
+        beyond,
     });
     let _ = std::fs::remove_dir_all(config.state_dir.join("feeders"));
     drop(spawned);
-    Ok(table)
+    // F3 of sweep 6: the relay's peak resident memory is held to its budget and the headroom it
+    // keeps below the memory it runs in, whatever the allocator keeps; past them a relay sized
+    // for its load is throttled or killed.
+    if let Some((over, _, _)) = beyond
+        && over > 0
+    {
+        return Err(format!(
+            "{table}\nthe relay was resident {} MiB beyond the most its base and stores were \
+             charged and the headroom for them (`budget::headroom_for`)",
+            over >> 20
+        ));
+    }
+    match fit {
+        Some(fit) if !fit.within() => Err(format!(
+            "{table}\nthe relay's peak resident memory, {} MiB, passed its budget ({} MiB) and \
+             headroom ({} MiB) by {} MiB",
+            fit.peak_bytes >> 20,
+            fit.budget_bytes >> 20,
+            fit.headroom_bytes >> 20,
+            (fit.peak_bytes - fit.budget_bytes - fit.headroom_bytes) >> 20
+        )),
+        _ => Ok(table),
+    }
 }
 
 fn progress(
@@ -332,15 +395,17 @@ fn progress(
     }
     let _ = write!(
         line,
-        "; offered {:.0}/s",
-        now.offered.saturating_sub(before.offered) as f64 / seconds
+        "; offered {:.0}/s ({} waits for the simulation)",
+        now.offered.saturating_sub(before.offered) as f64 / seconds,
+        counts.behind.load(Ordering::Relaxed)
     );
     if watch.client.connected.load(Ordering::Relaxed) || delta.raw_batches > 0 {
         let _ = write!(
             line,
-            "; client {:.0} batches/s {:.0} receptions/s",
+            "; client {:.0} batches/s {:.0} receptions/s, raw at most {} ms",
             delta.raw_batches as f64 / seconds,
-            delta.raw_receptions as f64 / seconds
+            delta.raw_receptions as f64 / seconds,
+            watch.client.raw_max_since_ms.swap(0, Ordering::Relaxed)
         );
     }
     if let (Some(cores), Some(sample)) = (cores, now.sample) {
@@ -365,8 +430,13 @@ struct Summary<'a> {
     start: &'a Moment,
     end: &'a Moment,
     seconds: f64,
+    /// The run's seconds measured, for what the simulation made over them.
+    measured: Range<u64>,
     ticks: f64,
     relay_peak_cores: f64,
+    /// The relay's peak resident memory beside its budget and headroom, where it can be read.
+    fit: Option<relay::Fit>,
+    beyond: Option<(i64, u64, u64)>,
 }
 
 fn summary(summary: &Summary) -> String {
@@ -380,8 +450,11 @@ fn summary(summary: &Summary) -> String {
         start,
         end,
         seconds,
+        measured,
         ticks,
         relay_peak_cores,
+        fit,
+        beyond,
     } = summary;
     let seconds = seconds.max(1e-3);
     let rate = |count: u64| count as f64 / seconds;
@@ -408,23 +481,23 @@ fn summary(summary: &Summary) -> String {
         ),
     );
     if let Some(traffic) = traffic {
-        let calibration = traffic.calibration;
         row(
             "simulated traffic",
-            format!(
-                "{:.0} receptions/s a receiver; {:.0} distinct transmissions/s, each heard by \
-                 {:.1}; {:.0} distinct messages/s by their bytes",
-                calibration.per_sec,
-                calibration.messages_per_sec,
-                calibration.receivers_per_message,
-                calibration.contents_per_sec
-            ),
+            made_line(&traffic.made(measured.clone()), config.spec.feeders),
         );
         row(
             "offered to the feeders",
             format!(
                 "{:.0} receptions/s",
                 rate(end.offered.saturating_sub(start.offered))
+            ),
+        );
+        row(
+            "simulation",
+            format!(
+                "{} times a feeder waited for its second to be simulated (0 when the simulation \
+                 keeps ahead of the run)",
+                counts.behind.load(Ordering::Relaxed)
             ),
         );
     }
@@ -453,13 +526,14 @@ fn summary(summary: &Summary) -> String {
     if let (Some(now), Some(before)) = (&end.fits, &start.fits)
         && now.steps > 0
     {
-        // H-a: a harness whose clocks jumped at each loop failed most fits.
+        // `fits` counts every fit tried, the failed among them (`relay::Fits::failed_since`).
         row(
             "relay: MLAT clock fits",
             format!(
-                "{} fitted, {} failed this window ({}), {} clocks dropped as cut off, over {} \
-                 window steps; the last failure: {}",
+                "{} tried, {} fitted, {} failed this window ({}), {} clocks dropped as cut off, \
+                 over {} window steps; the last failure: {}",
                 now.fits.saturating_sub(before.fits),
+                now.fitted_since(before),
                 now.unfitted.saturating_sub(before.unfitted),
                 now.failed_since(before)
                     .map_or("none tried".to_owned(), |share| format!(
@@ -492,6 +566,32 @@ fn summary(summary: &Summary) -> String {
             ),
         );
     }
+    if let Some((over, rss, peak)) = beyond {
+        row(
+            "relay: beyond its plan",
+            format!(
+                "at its worst sample {} MiB resident, its base and stores charged at most {} MiB \
+                 so far, which with their headroom allow {} MiB: {}",
+                rss >> 20,
+                peak >> 20,
+                relay::resident_allowed(*peak) >> 20,
+                if *over <= 0 { "within" } else { "OVER" }
+            ),
+        );
+    }
+    if let Some(fit) = fit {
+        row(
+            "relay: peak vs budget",
+            format!(
+                "{} MiB peak resident, budget {} MiB, {} MiB past it of the {} MiB headroom: {}",
+                fit.peak_bytes >> 20,
+                fit.budget_bytes >> 20,
+                fit.over_budget() >> 20,
+                fit.headroom_bytes >> 20,
+                if fit.within() { "within" } else { "OVER" }
+            ),
+        );
+    }
     if config.subscriber {
         let delta = end.client - start.client;
         let publishing = client
@@ -516,10 +616,11 @@ fn summary(summary: &Summary) -> String {
             ),
         );
         let expected = traffic.map_or(String::new(), |traffic| {
+            let made = traffic.made(measured.clone());
             format!(
                 " (expected about {:.0}/s: the simulation's distinct messages, by the relay's \
                  rule; where its stamps fall moves it)",
-                traffic.calibration.deduplicated_per_sec
+                made.per_sec(made.deduplicated)
             )
         });
         row(

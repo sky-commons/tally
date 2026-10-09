@@ -26,13 +26,17 @@ pub struct Counts {
     pub failed: AtomicUsize,
     /// Receptions handed to the feeders' batchers.
     pub offered: AtomicU64,
+    /// Times a feeder found the second it was to hear not yet simulated, and waited: zero when the
+    /// simulation keeps ahead of the run.
+    pub behind: AtomicU64,
 }
 
 /// Starts this shard's feeders, the `i`-th of them after `ramp * i / n`, each publishing to one of
 /// `relays` (by its index in the run, so every address takes its share). Every feeder plays the
 /// simulation on one clock, from `start`: second `n` of the run is heard by every receiver in it
-/// during the same second, as one transmission is heard by every receiver in reach at once. A
-/// feeder that starts later joins the second being heard.
+/// during the same second, as one transmission is heard by every receiver in reach at once, and the
+/// simulation makes the run's seconds a few ahead of that clock. A feeder that starts later joins
+/// the second being heard.
 pub fn spawn(
     traffic: Arc<Traffic>,
     relays: &[RelayAddress],
@@ -48,6 +52,8 @@ pub fn spawn(
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |since| since.as_millis() as u64)
         .saturating_sub(start.elapsed().as_millis() as u64);
+    // The simulation runs a few seconds ahead of this clock (`Traffic::begin`).
+    traffic.begin(start.into_std());
     for (at, receiver) in traffic.receivers.iter().enumerate() {
         let relay = relays[receiver.index % relays.len()].clone();
         let config = Config {
@@ -99,9 +105,13 @@ pub fn spawn(
                         .offered
                         .fetch_add(frames.len() as u64, Ordering::Relaxed);
                     frames.clear();
-                    traffic.frames(at, now, start_unix_ms, &mut frames);
-                    second = now;
                     handed = 0;
+                    if !traffic.frames(at, now, start_unix_ms, &mut frames) {
+                        // Not yet simulated: tried again at the next slice.
+                        counts.behind.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                    second = now;
                 }
                 // The share of this second's receptions due by now.
                 let tenth = u64::from(elapsed.subsec_millis()) * SLICES_A_SECOND / 1000 + 1;

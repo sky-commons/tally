@@ -312,17 +312,23 @@ enum From {
 }
 
 /// The parts of the records' share (`Store::Records`): every peer's records together may hold all
-/// but [`OWN_PART`] of it, which is this relay's own output's alone; each session that may hand
-/// records in (`Products::joined`, or one that has handed one) at most the peers' part divided by
-/// how many such sessions are open now. So what is taken is decided by who sent it, never by which
-/// came first: a session flooding records is refused in its own part, every other session keeps
-/// its own, however many sessions there are, and this relay's own positions are never refused for
-/// any peer's.
+/// but [`OWN_PART`] of it, which is this relay's own output's alone; each session admitted as a
+/// member ([`Products::member`], held beside its member's reservation, `network::Membership`) at
+/// most the peers' part divided by how many members are admitted now, and this relay's own
+/// rebuilding (`hub::RELAY_ITSELF`) one part like a member's, always. A session that is no member
+/// (a directory link, an engine taking raw, a subscriber, a member's session not yet admitted)
+/// has no part, and a record it hands in is refused: so the divisor counts only the sessions
+/// that send records, a member is admitted on the first data it brings in, and its bound is
+/// never less than the peers' part over the members the plan admits (`budget::Plan::members`),
+/// however many other sessions are open. What is taken is decided by who sent it, never by
+/// which came first: a member flooding records is refused in its own part, every other member
+/// keeps its own, and this relay's own positions are never refused for any peer's.
 struct RecordsRoom {
     store: Arc<Gauge>,
     peers: Arc<Gauge>,
-    /// Each session open that may hand records in, with what its records hold now; a session's
-    /// part goes when it leaves (`Products::left`), and the parts of those open divide the peers'.
+    /// Each part, with what its records hold now: every member admitted, and this relay's own
+    /// rebuilding. A member's goes when its admission ends ([`RecordsPart`]'s drop), and the
+    /// parts left divide the peers'.
     sessions: HashMap<u64, Arc<AtomicUsize>>,
     /// How many there are: what each part's bound divides the peers' part by, read by a charge
     /// as it grows.
@@ -337,63 +343,68 @@ pub fn peers_part(limit: usize) -> usize {
     limit - limit / OWN_PART
 }
 
-/// What one session's records may hold of the peers' part of `limit` bytes, with `open` sessions
-/// that may hand records in open.
+/// What one part's records may hold of the peers' part of `limit` bytes, with `open` parts
+/// ([`RecordsRoom`]: the members admitted and this relay's own rebuilding).
 pub fn session_part(limit: usize, open: usize) -> usize {
     limit / open.max(1)
 }
 
 impl RecordsRoom {
     fn new(store: Arc<Gauge>) -> Self {
-        Self {
+        let mut room = Self {
             peers: store.share(peers_part),
             store,
             sessions: HashMap::new(),
             open: Arc::new(AtomicUsize::new(0)),
-        }
+        };
+        room.join(crate::hub::RELAY_ITSELF);
+        room
     }
 
-    /// Charged to `store` from now on; the sessions open stay open.
+    /// Charged to `store` from now on; the parts held stay.
     fn charge_to(&mut self, store: Arc<Gauge>) {
         self.peers = store.share(peers_part);
         self.store = store;
     }
 
-    /// `source`'s part, made if it has none: a session that may hand records in.
-    fn join(&mut self, source: u64) -> Arc<AtomicUsize> {
-        let part = Arc::clone(
-            self.sessions
-                .entry(source)
-                .or_insert_with(|| Arc::new(AtomicUsize::new(0))),
-        );
+    /// `source` has a part from now on: a member admitted ([`Products::member`]).
+    fn join(&mut self, source: u64) {
+        self.sessions
+            .entry(source)
+            .or_insert_with(|| Arc::new(AtomicUsize::new(0)));
         self.open.store(self.sessions.len(), Ordering::Release);
-        part
     }
 
-    /// `source` left: its part is gone, and the others divide the peers' part without it. What
-    /// its records hold stays charged until they are let go.
+    /// `source`'s admission ended: its part is gone, and the others divide the peers' part
+    /// without it. What its records hold stays charged until they are let go. This relay's own
+    /// rebuilding never leaves.
     fn leave(&mut self, source: u64) {
+        if source == crate::hub::RELAY_ITSELF {
+            return;
+        }
         self.sessions.remove(&source);
         self.open.store(self.sessions.len(), Ordering::Release);
     }
 
     /// `bytes` charged to the store, and for a peer's record to the peers' part and its
     /// session's; `None` when any is full.
+    /// `None` too for a session with no part: one that is no member admitted.
     fn charge(&mut self, from: From, bytes: usize) -> Option<Held> {
-        let mut held = self.empty(from);
+        let mut held = self.empty(from)?;
         held.grow(bytes).then_some(held)
     }
 
-    /// A charge of nothing yet in `from`'s parts, to grow ([`Held::grow`]).
-    fn empty(&mut self, from: From) -> Held {
+    /// A charge of nothing yet in `from`'s parts, to grow ([`Held::grow`]); `None` for a session
+    /// with no part.
+    fn empty(&mut self, from: From) -> Option<Held> {
         let From::Peer(source) = from else {
-            return Held {
+            return Some(Held {
                 store: self.store.empty(),
                 peer: None,
-            };
+            });
         };
-        let session = self.join(source);
-        Held {
+        let session = Arc::clone(self.sessions.get(&source)?);
+        Some(Held {
             store: self.store.empty(),
             peer: Some(SessionHeld {
                 peers: self.peers.empty(),
@@ -402,7 +413,7 @@ impl RecordsRoom {
                 session,
                 bytes: 0,
             }),
-        }
+        })
     }
 }
 
@@ -464,6 +475,25 @@ impl SessionHeld {
 impl Drop for SessionHeld {
     fn drop(&mut self) {
         self.session.fetch_sub(self.bytes, Ordering::SeqCst);
+    }
+}
+
+/// A member session's part of the records' share ([`RecordsRoom`], [`Products::member`]): held
+/// for as long as it is admitted, and gone, the others divided by one fewer, when this is
+/// dropped, however its admission ends.
+#[must_use = "the part is gone as soon as it is dropped"]
+pub struct RecordsPart {
+    shared: std::sync::Weak<Shared>,
+    source: u64,
+}
+
+impl Drop for RecordsPart {
+    fn drop(&mut self) {
+        if let Some(shared) = self.shared.upgrade()
+            && let Ok(mut room) = shared.room.lock()
+        {
+            room.leave(self.source);
+        }
     }
 }
 
@@ -874,20 +904,18 @@ impl Products {
         })
     }
 
-    /// Session `source` is open and may hand records in (a relay's, an engine's): it has a part of
-    /// the peers' share from now until it leaves, and every other session's part is divided by
-    /// one more ([`RecordsRoom`]). A session that hands a record in without having joined joins
-    /// then.
-    pub fn joined(&self, source: u64) {
+    /// Session `source` is admitted as a member: it has a part of the peers' share for as long as
+    /// the part returned is held, and every other part is divided by one more ([`RecordsRoom`]).
+    /// Only a member's admission holds one (`network::Network::admit_member`, beside its
+    /// reservation from the members' pool, so the parts are bounded as the members are); a
+    /// session that holds none has every record it hands in refused.
+    pub fn member(&self, source: u64) -> RecordsPart {
         if let Ok(mut room) = self.shared.room.lock() {
             room.join(source);
         }
-    }
-
-    /// Session `source` closed: its part is gone, and the others are divided by one fewer.
-    pub fn left(&self, source: u64) {
-        if let Ok(mut room) = self.shared.room.lock() {
-            room.leave(source);
+        RecordsPart {
+            shared: Arc::downgrade(&self.shared),
+            source,
         }
     }
 

@@ -10,6 +10,9 @@
 //! - `GET /mlat`: what the hosted MLAT has done and let go (`mlat_host::MlatReport`): batches
 //!   taken, offers refused for a full queue, signed records overflowed, every other drop by why,
 //!   and its step reports; 404 when the relay hosts no MLAT.
+//! - `GET /memory`: the memory budget, every store's gauge and the decoded batches alive
+//!   (`hub::MemoryReport`), and the feeders' batches dropped past their receiver's wanted
+//!   receptions a second (`over_reception_ceiling`).
 //! - `GET /products`: what the regional and world products have done and let go
 //!   (`products::ProductsReport`), every drop by why.
 //!
@@ -61,8 +64,21 @@ async fn products(State(hub): State<Arc<Hub>>) -> Response {
 
 /// The budget and every store's gauge, with what the stores that count their own bytes hold
 /// (the batch byte store, the delivery tags) and the decoded batches alive in all.
+/// `GET /memory`: the memory report, and beside it the feeders' batches dropped for taking their
+/// receiver past its wanted receptions a second (`Hub::over_reception_ceiling`).
+#[derive(serde::Serialize)]
+struct Memory {
+    #[serde(flatten)]
+    report: crate::hub::MemoryReport,
+    over_reception_ceiling: crate::hub::OverCeiling,
+}
+
 async fn memory(State(hub): State<Arc<Hub>>) -> Response {
-    axum::Json(hub.memory_report()).into_response()
+    axum::Json(Memory {
+        report: hub.memory_report(),
+        over_reception_ceiling: hub.over_reception_ceiling(),
+    })
+    .into_response()
 }
 
 async fn stations(State(hub): State<Arc<Hub>>) -> Response {

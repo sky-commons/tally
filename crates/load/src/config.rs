@@ -33,6 +33,10 @@ For a spawned relay:
                          holds a session and, while it probes, a probe) and --no-mlat
   --relay-mlat           let it host MLAT (no --no-mlat): it plans MLAT's memory and cores
                          beside the stages, so it admits fewer feeders
+  --relay-fit            give it --memory exactly what --feeders need (`tally-relay check`'s
+                         before-feeders and per-feeder), as a deploy sized for them is: the run
+                         then fails if the relay's peak resident memory passed that budget and
+                         the headroom the relay keeps below the memory it runs in
 
 The load:
   --feeders N            simulated receivers in the whole run, across every shard (default 20000)
@@ -49,8 +53,6 @@ The load:
                          and the US's are, but its 4,500 aircraft a cluster give a receiver at most
                          about 320 receptions a second, since a simulated aircraft sends about
                          3.4 messages a second; 9,000 reach 600)
-  --period SECS          seconds of simulated traffic, played forward then backward in a loop,
-                         so no aircraft and no receiver's clock jumps at a loop's end (default 5)
   --seed S               the simulation's seed (default 0: the world benchmark's clusters)
   --ceiling BYTES        each feeder's --ceiling (default 64000, the feeder's own default)
   --ramp SECS            start the feeders evenly over this long (default 60)
@@ -63,9 +65,15 @@ The load:
                          the live world before its second is sealed, 4 s after it ends)
   --no-verify            the subscriber does not check signatures
   --decode-threads N     threads the subscriber decodes batches on (default 4)
-  --simulate-only        simulate the traffic, print what it came to, and exit
+  --simulate-only        simulate the run's first seconds, print what they came to, and exit
   --state-dir DIR        where the feeders' state and the spawned relay's key and log go
                          (default $TMPDIR/tally-load-PID)
+
+The whole run (ramp, warm-up and measured window) is simulated forward in time as it is played, on
+a thread for each cluster, a few seconds ahead of the feeders: every aircraft flies on and every
+receiver's clock runs on for the whole run, and nothing is heard twice that a real sky would not
+repeat. A feeder that finds its next second not yet simulated waits, counted (the summary's
+simulation line).
 
 Limits of the host, checked at start:
   every feeder holds a socket and, while probing, another: `ulimit -n` must be at least twice the
@@ -75,24 +83,33 @@ Limits of the host, checked at start:
   127.0.0.2..127.0.0.N with --relay-listen 0.0.0.0:PORT, or more shards on more hosts).
 ";
 
+/// Seconds simulated past the measured window's end.
+const RUN_SPARE: Duration = Duration::from_secs(30);
+
 /// The relay under load.
 #[derive(Clone, Debug)]
 pub enum Relay {
     /// A relay the harness starts on this host.
-    Spawn {
-        bin: PathBuf,
-        listen: String,
-        max_upload: String,
-        args: Vec<String>,
-        /// Whether it hosts MLAT (`--relay-mlat`): else it is started `--no-mlat`.
-        mlat: bool,
-    },
+    Spawn(Spawn),
     /// A relay already running, at one or more addresses under one key.
     Existing {
         addresses: Vec<RelayAddress>,
         pid: Option<u32>,
         stats: Option<String>,
     },
+}
+
+/// A relay the harness starts: its binary and how it is started.
+#[derive(Clone, Debug)]
+pub struct Spawn {
+    pub bin: PathBuf,
+    pub listen: String,
+    pub max_upload: String,
+    pub args: Vec<String>,
+    /// Whether it hosts MLAT (`--relay-mlat`): else it is started `--no-mlat`.
+    pub mlat: bool,
+    /// Whether its `--memory` is exactly what the feeders need (`--relay-fit`).
+    pub fit: bool,
 }
 
 /// One slice of the feeders.
@@ -151,7 +168,7 @@ pub fn parse(args: impl Iterator<Item = String>) -> Result<Option<Config>, Strin
         feeders: 20_000,
         receptions_per_sec: 600.0,
         aircraft: 9_000,
-        period_s: 5,
+        seconds: 0,
         seed: 0,
     };
     let mut relay_bin = std::env::var_os("TALLY_RELAY").map(PathBuf::from);
@@ -159,6 +176,7 @@ pub fn parse(args: impl Iterator<Item = String>) -> Result<Option<Config>, Strin
     let mut max_upload = "10Gbit/s".to_owned();
     let mut relay_args = Vec::new();
     let mut relay_mlat = false;
+    let mut relay_fit = false;
     let mut addresses: Vec<RelayAddress> = Vec::new();
     let mut pid = None;
     let mut stats = None;
@@ -198,13 +216,13 @@ pub fn parse(args: impl Iterator<Item = String>) -> Result<Option<Config>, Strin
             "--max-upload" => max_upload = value()?,
             "--relay-arg" => relay_args.push(value()?),
             "--relay-mlat" => relay_mlat = true,
+            "--relay-fit" => relay_fit = true,
             "--feeders" => spec.feeders = number(&flag, &value()?)?,
             "--shard" => config.shard = Shard::parse(&value()?)?,
             "--no-feeders" => config.run_feeders = false,
             "--no-subscriber" => config.subscriber = false,
             "--receptions-per-sec" => spec.receptions_per_sec = number(&flag, &value()?)?,
             "--aircraft" => spec.aircraft = number(&flag, &value()?)?,
-            "--period" => spec.period_s = number(&flag, &value()?)?,
             "--seed" => spec.seed = number(&flag, &value()?)?,
             "--ceiling" => config.ceiling = number(&flag, &value()?)?,
             "--ramp" => config.ramp = seconds(&flag, &value()?)?,
@@ -218,11 +236,6 @@ pub fn parse(args: impl Iterator<Item = String>) -> Result<Option<Config>, Strin
             other => return Err(format!("unknown argument {other}\n\n{USAGE}")),
         }
     }
-    if spec.period_s < 3 {
-        // The relay forgets a message's bytes after two seconds (its deduplication window), so
-        // a loop shorter than three would replay messages it still remembers.
-        return Err("--period must be at least 3 seconds".to_owned());
-    }
     if spec.receptions_per_sec.is_nan() || spec.receptions_per_sec <= 0.0 {
         return Err("--receptions-per-sec must be above 0".to_owned());
     }
@@ -231,6 +244,9 @@ pub fn parse(args: impl Iterator<Item = String>) -> Result<Option<Config>, Strin
     {
         return Err("every --relay must name the same relay (one KEY)".to_owned());
     }
+    // The run simulated whole, and some to spare for the feeders' last second and the summary.
+    let run = config.ramp + config.warmup + config.duration + RUN_SPARE;
+    spec.seconds = u32::try_from(run.as_secs().saturating_add(1)).unwrap_or(u32::MAX);
     config.spec = spec;
     config.relay = match (addresses.is_empty(), relay_bin) {
         (false, _) => Relay::Existing {
@@ -238,13 +254,14 @@ pub fn parse(args: impl Iterator<Item = String>) -> Result<Option<Config>, Strin
             pid,
             stats,
         },
-        (true, Some(bin)) => Relay::Spawn {
+        (true, Some(bin)) => Relay::Spawn(Spawn {
             bin,
             listen,
             max_upload,
             args: relay_args,
             mlat: relay_mlat,
-        },
+            fit: relay_fit,
+        }),
         (true, None) => {
             return Err(format!(
                 "no relay: name --relay-bin (or set TALLY_RELAY) or --relay\n\n{USAGE}"

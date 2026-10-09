@@ -77,7 +77,7 @@ pub async fn serve(listener: TcpListener, identities: Vec<Identity>, hub: Arc<Hu
     if let Some(newest) = identities.first() {
         hub.network().adopt_identity(newest.clone());
     }
-    tokio::spawn(network::run(Arc::clone(&hub)));
+    network::start(Arc::clone(&hub), tokio::runtime::Handle::current());
     let identities = Arc::new(identities);
     loop {
         match listener.accept().await {

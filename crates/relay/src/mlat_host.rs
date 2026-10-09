@@ -83,7 +83,9 @@
 //!   (weighing every address shard, then solving what is due) one at a time, in order, the two
 //!   kinds apart: a slow window never holds a provisional position up. A provisional step with
 //!   nothing to weigh is done on the engine's thread, at once, on no runner. Every kind of work
-//!   together runs on the threads the plan gives MLAT (`Budget::mlat_threads`), never more
+//!   together, and the relay's standing, which MLAT's positions bring (`standing::Standing::start`,
+//!   on this gate, [`MlatHost::gate`]), runs on the threads the plan gives MLAT
+//!   (`Budget::mlat_threads`), never more
 //!   (`tally_mlat_solver::gate`: each thread at work holds one of them; provisional work is let in
 //!   before background work, between two of its items, and keeps one of them to itself). Every
 //!   runner runs below the relay's own priority, whatever it was started at, provisional steps
@@ -100,11 +102,16 @@
 //!   panic anywhere in the relay does (`EndOnUnwind`). Each kind that falls behind on its own
 //!   steps waits, up to its own limit; past it MLAT sheds, whole and counted, never by growing
 //!   (below, Behind).
-//! - **Behind** (RFC-0181 §9, §10). While more than `STEPS_BEHIND` window steps (steps a window
-//!   fell due at) wait not started, the oldest is shed, counted, its windows the next one's
+//! - **Behind** (RFC-0181 §9, §10). While more than `WINDOW_STEPS_BEHIND` window steps (steps a
+//!   window fell due at) wait not started, the oldest is shed, counted, its windows the next one's
 //!   (which solves every window due, as one that ran late would); nothing a window step queued
-//!   or running has still to solve is forgotten while it waits (`Engine::forget_by`'s floor), so
-//!   a window that waits is never solved without the bins it began with. While the watermark
+//!   or running has still to solve is forgotten by the stamps while it waits (`Engine::forget_by`'s
+//!   floor). The bins only that floor keeps live in the room the stamps' bins leave in the `Held`
+//!   store, and yield it to them, oldest first, counted (`MlatReport::waiting_bins_forgotten`),
+//!   so what a seal or a forget refuses is the stamps' alone (`Host::room`), however long a window
+//!   step ran or waited, and a window that waits is solved with the bins it began with whenever
+//!   the store has room for them. A host within its plan holds none: its window steps finish
+//!   before the stamps forget their first bin. While the watermark
 //!   passes more than `PROVISIONAL_BEHIND` (none) provisional steps that have not started, the
 //!   oldest of those is shed: what batches told it is let go, every batch of it counted
 //!   (`MlatReport::shed`), so a provisional step starts at its turn and its positions reach the
@@ -164,7 +171,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use tally_mlat::engine::{Capacity, Dropped, Engine, Ingested, MODELS_RIPEN_MS, Settings};
+use tally_mlat::engine::{
+    Capacity, Dropped, Engine, Ingested, MODELS_RIPEN_MS, Settings, kept_by_stamps,
+};
 use tally_mlat::intake::{
     Description, Intake, ORPHAN_MS, Orphans, Seats, signed_order, taking_effect,
 };
@@ -207,6 +216,11 @@ pub trait MlatHost: Send + Sync {
     /// The sealed bins of the raw it holds, shared: what the relay's standing reads (one store of
     /// raw per relay). None when it holds no raw of its own.
     fn sealed_bins(&self) -> Option<SealedBins>;
+    /// The threads the plan gives MLAT (`tally_mlat_solver::gate`), which work it brings beside
+    /// its own (the relay's standing) runs on too. None when it has no gate of its own.
+    fn gate(&self) -> Option<Arc<Gate>> {
+        None
+    }
 }
 
 /// One window step's report, as served: `tally_mlat::window::Report`, times in milliseconds.
@@ -330,8 +344,8 @@ pub struct MlatReport {
     /// Batches whose notes to provisional solving were let go because MLAT fell behind: their
     /// step was shed, or the `Notes` store could not hold their step's.
     pub shed: u64,
-    /// Window steps shed because more than `STEPS_BEHIND` of them (steps a window fell due at)
-    /// waited not started: their windows the next one's. A step's seal is never shed.
+    /// Window steps shed because more than `WINDOW_STEPS_BEHIND` of them (steps a window fell due
+    /// at) waited not started: their windows the next one's. A step's seal is never shed.
     pub steps_shed: u64,
     /// Provisional steps shed because the watermark passed more than `PROVISIONAL_BEHIND` of them
     /// not started: what batches told them let go (`shed`).
@@ -339,6 +353,11 @@ pub struct MlatReport {
     /// Window steps put off because the `Engine` store could not reserve their working set: each
     /// waits, and starts once it can, its windows as of its own step.
     pub windows_deferred: u64,
+    /// Sealed bins a waiting window step's floor kept past the stamps (module docs, Behind) let go,
+    /// oldest first, because the stamps' bins needed their room in the `Held` store: that window
+    /// step solves without them. Only a host behind its plan holds such a bin at all (a planned
+    /// window step finishes before the stamps forget its first bin).
+    pub waiting_bins_forgotten: u64,
     /// Signed records refused whole with their step's because those not yet taken held
     /// `PUBLISHED_BYTES`.
     pub overflowed: u64,
@@ -401,15 +420,23 @@ pub struct MlatReport {
 pub const STEP_MS: u64 = 1_000;
 /// How long after a bin's canonical window ends it is solved, so the raw of its last bin is in.
 pub const SETTLE_MS: u64 = 2_000;
-/// Window steps (the steps a window fell due at, about one a stride) that may wait not started (one
-/// is running) before the oldest is shed (module docs, Behind). And the steps' seals MLAT may fall
-/// behind by before the open raw they hold is past what the budget reserves (`OPEN_MS`): a seal
-/// takes milliseconds, so a host within its plan is never near it.
-pub const STEPS_BEHIND: usize = 4;
-/// How long after a bin ends its raw is held open at most: its settling, the seals MLAT may fall
-/// behind, and the step running. What the budget reserves for open raw (`Store::Open`); past it
-/// the shards refuse raw, counted.
-pub const OPEN_MS: u64 = SETTLE_MS + (STEPS_BEHIND as u64 + 1) * STEP_MS;
+/// Window steps (the steps a window fell due at, one a stride: `STRIDE` bins, 40 s) that may wait
+/// not started (one is running) before the oldest is shed (module docs, Behind). A count of window
+/// steps, never of the 1 s steps the watermark passes: nothing sized by the step clock reads it
+/// (sweep 6, F10: before, one `STEPS_BEHIND` was this and the seals' bound below, so the window
+/// queue's length set the open raw the budget reserves and the ripening checked against it).
+pub const WINDOW_STEPS_BEHIND: usize = 4;
+/// Steps' seals (one a step, 1 s each, a seal taking milliseconds) a host within its plan falls
+/// behind by at most: what the budget reserves open raw for (`OPEN_MS`) and what the ripening
+/// covers (`MODELS_RIPEN_MS`, below). Not a count anything sheds by: a seal is never shed (its
+/// bins are the windows'), so a host further behind holds its taken raw in the `Open` store, and
+/// past the store the shards refuse new raw, whole and counted (`observations_refused`), the store
+/// never past its limit.
+pub const SEALS_BEHIND: usize = 4;
+/// How long after a bin ends its raw is held open at most by a host within its plan: its settling,
+/// the seals it may fall behind (`SEALS_BEHIND`), and the seal running. What the budget reserves
+/// for open raw (`Store::Open`); past it the shards refuse raw, counted.
+pub const OPEN_MS: u64 = SETTLE_MS + (SEALS_BEHIND as u64 + 1) * STEP_MS;
 /// Provisional steps the watermark may pass that have not started (one may be running) before the
 /// oldest is shed (module docs, Behind): none. A provisional step starts at its turn, or, if the
 /// one before it is still running then, is let go when the next one's turn comes. The budget below
@@ -438,10 +465,10 @@ const _: () = assert!(
 );
 // A provisional step carries exactly the models of the windows that fell due `MODELS_RIPEN_MS` before
 // it, and is shed at its turn if one of them has not been solved (module docs, Threads): the
-// ripening is at least the steps a seal may fall behind and the one running, and it is a window
-// step's run on the planned threads besides (`MODELS_RIPEN_MS`), so a planned host's window steps
-// never shed one.
-const _: () = assert!(MODELS_RIPEN_MS >= (STEPS_BEHIND as u64 + 1) * STEP_MS);
+// ripening is at least the steps a seal may fall behind and the one running (`SEALS_BEHIND`, in
+// steps of the step clock), and it is a window step's run on the planned threads besides
+// (`MODELS_RIPEN_MS`), so a planned host's window steps never shed one.
+const _: () = assert!(MODELS_RIPEN_MS >= (SEALS_BEHIND as u64 + 1) * STEP_MS);
 /// Step intervals whose notes are held at most: the one the watermark is in and the next, the
 /// provisional steps that may wait (`PROVISIONAL_BEHIND`), and the step running until it reads its
 /// own. What the budget reserves for notes (`Store::Notes`, `notes_per_feeder`), and what each
@@ -1881,6 +1908,7 @@ impl HostedMlat {
             seals: VecDeque::new(),
             proposed: VecDeque::new(),
             provisional: None,
+            kept_from: i64::MIN,
             sealed_charge: gauges.held.empty(),
             held: gauges.held,
             engine_gauge: gauges.engine,
@@ -2199,6 +2227,10 @@ impl MlatHost for HostedMlat {
         Some(self.shared.sealed.clone())
     }
 
+    fn gate(&self) -> Option<Arc<Gate>> {
+        Some(Arc::clone(&self.shared.gate))
+    }
+
     fn report(&self) -> MlatReport {
         let mut report = self
             .shared
@@ -2249,6 +2281,10 @@ struct Host {
     /// Provisional steps the watermark has passed and that have not started, and the one running.
     proposed: VecDeque<u64>,
     provisional: Option<u64>,
+    /// The first bin the stamps keep, as of the last step whose seal is held
+    /// (`kept_by_stamps`): the sealed bins from it on are the stamps' alone, and those before it
+    /// are kept only by the floor of a window step still to be solved (`Engine::forget_by`).
+    kept_from: i64,
     /// What the sealed bins are charged to the `Held` store, taken before each is held.
     sealed_charge: Charge,
     held: Arc<Gauge>,
@@ -2395,14 +2431,14 @@ impl Host {
     }
 
     /// Starts the window step queued, unless one runs, and sheds the oldest queued past
-    /// `STEPS_BEHIND`; starts the next provisional step unless one runs, and sheds the oldest past
+    /// `WINDOW_STEPS_BEHIND`; starts the next provisional step unless one runs, and sheds the oldest past
     /// `PROVISIONAL_BEHIND` (module docs, Behind); a provisional step whose models (the windows
     /// that fell due `MODELS_RIPEN_MS` before it) have not all been solved at its turn is shed,
     /// counted, never started with others; publishes the count of steps in hand and the last step
     /// every part of which is done.
     fn advance(&mut self) {
         self.start_window();
-        while self.windows.len() > STEPS_BEHIND {
+        while self.windows.len() > WINDOW_STEPS_BEHIND {
             self.shed_window();
         }
         while self.provisional.is_none() {
@@ -2564,6 +2600,7 @@ impl Host {
         if let Some(engine) = self.engine.as_mut() {
             engine.forget_by(step_ms, settled, floor);
         }
+        self.kept_from = kept_by_stamps(step_ms, settled);
         self.settle_sealed();
     }
 
@@ -2580,6 +2617,7 @@ impl Host {
         if self.engine.is_none() || left.is_empty() {
             return;
         }
+        self.room_to_reseal();
         let generation = self.generation;
         let threads = self.settings.threads.max(1);
         self.sealing = Some((generation, None));
@@ -2879,8 +2917,13 @@ impl Host {
                         Resealed::Refused { bin, .. } => {
                             let records = self.shared.sealed.forget(bin) as u64;
                             self.settle_sealed();
-                            self.shared
-                                .count(|counts| counts.observations_refused += records);
+                            if bin < self.kept_from {
+                                self.shared
+                                    .count(|counts| counts.waiting_bins_forgotten += 1);
+                            } else {
+                                self.shared
+                                    .count(|counts| counts.observations_refused += records);
+                            }
                         }
                     }
                 }
@@ -2962,21 +3005,64 @@ impl Host {
     }
 
     /// The bytes the sealed bins may still grow by: within the engine's own bound and the relay's
-    /// `Held` store, both less what is sealed, functions of what was sealed and forgotten by the
-    /// steps' stamps, never of what is open now nor of how long a window step ran.
+    /// `Held` store, both less what the stamps keep sealed (`stamps_bytes`), so a function of what
+    /// was sealed and forgotten by the steps' stamps alone: never of what is open now, nor of how
+    /// long a window step ran or waited, nor of the bins its floor keeps (sweep 6, N1/F7: before,
+    /// the room was the store less every sealed bin, those a waiting window's floor kept
+    /// included, so a relay whose window steps ran long sealed receivers out of a bin that a
+    /// relay keeping up held, and the room passed the `SEALED_BINS_HELD` the store reserves).
     fn room(&self) -> usize {
-        let sealed = self.shared.sealed.bytes();
-        let engine = self.engine.as_ref().map_or(0, Engine::room);
-        engine.min(self.held.limit().saturating_sub(sealed))
+        let kept = self.stamps_bytes();
+        let engine = self.engine.as_ref().map_or(0, |engine| {
+            engine.settings().limits().bytes.saturating_sub(kept)
+        });
+        engine.min(self.held.limit().saturating_sub(kept))
     }
 
-    /// Makes sealed `bins` readable, each charged to the `Held` store before it is held: one the
-    /// store cannot hold (sealed within the room left, it never is) is refused whole. The
-    /// observations refused.
+    /// What the sealed bins the stamps keep cost (those from `kept_from` on, and the handle's own
+    /// bytes): every sealed byte but the bins only a waiting window step's floor keeps.
+    fn stamps_bytes(&self) -> usize {
+        let waiting: usize = self
+            .shared
+            .sealed
+            .bins(i64::MIN, self.kept_from.saturating_sub(1))
+            .iter()
+            .map(|bin| SealedBins::cost(bin))
+            .sum();
+        self.shared.sealed.bytes().saturating_sub(waiting)
+    }
+
+    /// Lets go of the oldest sealed bin only a waiting window step's floor keeps (one the stamps
+    /// forgot), counted (`MlatReport::waiting_bins_forgotten`): such a bin lives in the room the
+    /// stamps leave in the `Held` store, and yields it to the stamps' bins whenever they need it,
+    /// so it never decides what a seal or a forget refuses. False when there is none.
+    fn forget_waiting_bin(&mut self) -> bool {
+        let Some(oldest) = self.shared.sealed.numbers().first().copied() else {
+            return false;
+        };
+        if oldest >= self.kept_from {
+            return false;
+        }
+        self.shared.sealed.forget(oldest);
+        self.shared
+            .count(|counts| counts.waiting_bins_forgotten += 1);
+        self.settle_sealed();
+        true
+    }
+
+    /// Makes sealed `bins` readable, each charged to the `Held` store before it is held, the bins
+    /// only a waiting window step's floor keeps let go, oldest first, for room it needs: one the
+    /// store cannot hold even then (sealed within the room the stamps left, it never is) is
+    /// refused whole. The observations refused.
     fn hold(&mut self, bins: Vec<Bin>) -> u64 {
         let mut refused = 0;
         for bin in bins {
-            if self.sealed_charge.try_grow(SealedBins::cost(&bin)) {
+            let cost = SealedBins::cost(&bin);
+            let mut held = self.sealed_charge.try_grow(cost);
+            while !held && self.forget_waiting_bin() {
+                held = self.sealed_charge.try_grow(cost);
+            }
+            if held {
                 self.shared.sealed.insert(bin);
             } else {
                 refused += bin.records.len() as u64;
@@ -2987,10 +3073,30 @@ impl Host {
         refused
     }
 
+    /// Room for a forget's re-sealing before it starts: each bin it seals again is charged before
+    /// it is built and the old one let go after (`SealedBins::without_each`), so it needs a bin's
+    /// room beyond the sealed bins. The bins only a waiting window step's floor keeps are let go,
+    /// oldest first, until the store has that room beside the stamps' bins or none is left, so
+    /// whether one of the stamps' bins is refused is what the stamps' bins decide alone.
+    fn room_to_reseal(&mut self) {
+        let largest = self
+            .shared
+            .sealed
+            .bins(self.kept_from, i64::MAX)
+            .iter()
+            .map(|bin| SealedBins::cost(bin))
+            .max()
+            .unwrap_or(0);
+        while self.held.limit().saturating_sub(self.held.held()) < largest
+            && self.forget_waiting_bin()
+        {}
+    }
+
     /// The `Held` charge brought to what the sealed bins hold now: down when bins were forgotten,
     /// up for the handle's own bytes. A receiver forgotten in a bin seals it again without it
     /// (`SealedBins::forget_receiver`), never larger; were it larger and past the store, the
-    /// oldest bins are forgotten until it fits, counted refused.
+    /// oldest bins are forgotten until it fits: first those only a waiting window step's floor
+    /// keeps (`waiting_bins_forgotten`), then the stamps' (counted refused).
     fn settle_sealed(&mut self) {
         loop {
             let bytes = self.shared.sealed.bytes();
@@ -3005,14 +3111,14 @@ impl Host {
             let Some(oldest) = self.shared.sealed.numbers().first().copied() else {
                 return;
             };
-            let records = self
-                .shared
-                .sealed
-                .get(oldest)
-                .map_or(0, |bin| bin.records.len() as u64);
-            self.shared.sealed.forget_before(oldest + 1);
-            self.shared
-                .count(|counts| counts.observations_refused += records);
+            let records = self.shared.sealed.forget(oldest) as u64;
+            if oldest < self.kept_from {
+                self.shared
+                    .count(|counts| counts.waiting_bins_forgotten += 1);
+            } else {
+                self.shared
+                    .count(|counts| counts.observations_refused += records);
+            }
         }
     }
 
@@ -3109,6 +3215,7 @@ impl Host {
     /// them here, waiting on a provisional step's every read and settle).
     fn drop_steps(&mut self) {
         self.shared.sealed.clear();
+        self.kept_from = i64::MIN;
         self.settle_sealed();
         for shard in 0..provisional_::SHARDS {
             self.shared.heard(shard).clear();
@@ -3344,6 +3451,13 @@ impl Urgency {
     }
 }
 
+/// Lowers the calling thread to the priority of MLAT's background work (`Urgency::Background`):
+/// what a thread doing work the hosted MLAT brings beside its own runners (the relay's standing)
+/// runs at. False when it could not be lowered all the way (`run_at`).
+pub fn run_as_background() -> bool {
+    run_at(Urgency::Background.below())
+}
+
 /// How far below the stages' priority provisional steps run: nice steps.
 const PROVISIONAL_NICE: libc::c_int = 5;
 /// How far below the stages' priority seals, window steps and forgets run: nice steps.
@@ -3486,7 +3600,7 @@ mod tests {
     use std::sync::atomic::AtomicBool;
     use tally_mlat::replay::{arrivals, replay, scenario};
     use tally_mlat_solver::publish;
-    use tally_mlat_solver::scope::{BEFORE, STRIDE, Window, bin_of};
+    use tally_mlat_solver::scope::{AFTER, BEFORE, STRIDE, Window, bin_of};
     use tally_mlat_solver::sim;
     use tally_wire::rendezvous::AREA_RESOLUTION;
     use tally_wire::{Location, Region};
@@ -4175,7 +4289,7 @@ mod tests {
         }
         .close_at(first_bin(&delivered)?);
         let ripen = tally_mlat::engine::MODELS_RIPEN_MS;
-        let last = held_at + (STEPS_BEHIND as u64 + 3) * STEP_MS + ripen;
+        let last = held_at + (SEALS_BEHIND as u64 + 3) * STEP_MS + ripen;
         let mut next = 0;
         let mut published = Vec::new();
         for step in steps(first, last) {
@@ -4192,6 +4306,11 @@ mod tests {
             holding(&host, seals)?;
             let report = host.report();
             assert_eq!(report.steps_shed, 0, "at {step}: {report:?}");
+            // Seals `SEALS_BEHIND` steps behind are within what the budget reserves open raw for
+            // (`OPEN_MS`): no raw refused for room (sweep 6, F10).
+            if step <= held_at + SEALS_BEHIND as u64 * STEP_MS {
+                assert_eq!(report.observations_refused, 0, "at {step}: {report:?}");
+            }
             // Every provisional step runs at its turn until its models are the held window
             // step's: from `MODELS_RIPEN_MS` after it, each is shed at its turn, counted.
             let late = (step.saturating_sub(held_at + ripen) / STEP_MS) as usize
@@ -4437,7 +4556,7 @@ mod tests {
         let kept = tally_mlat_solver::scope::bin_of(away - STEP_MS - SETTLE_MS) - 1;
         let hold_from = closing.close_at(kept);
         assert!(hold_from < away);
-        let last = away + (STEPS_BEHIND as u64 + 3) * STEP_MS;
+        let last = away + (SEALS_BEHIND as u64 + 3) * STEP_MS;
         let mut next = 0;
         for step in steps(first, last) {
             if step >= hold_from {
@@ -4560,7 +4679,7 @@ mod tests {
     /// Sweep 5, H-c and N1: while a window step runs long (held shut on a gate past many steps,
     /// within the ripening), every step the watermark passes is still sealed, in its turn, on the
     /// seal runner and never on the engine's thread, and no step is shed (before, each step it ran
-    /// past queued as a window step behind it, and every one past `STEPS_BEHIND` was shed); and
+    /// past queued as a window step behind it, and every one past `WINDOW_STEPS_BEHIND` was shed); and
     /// each forgets by its own stamp what no window still to be solved needs, so the sealed bins
     /// are the reference engine's at the same step, byte for byte, however long the window step
     /// runs (before, only a window step that ran forgot, so the room a seal had was how long the
@@ -4604,7 +4723,7 @@ mod tests {
             _ => {}
         }));
         const HELD_STEPS: u64 = 12;
-        const { assert!(HELD_STEPS > STEPS_BEHIND as u64 + 1) };
+        const { assert!(HELD_STEPS > WINDOW_STEPS_BEHIND as u64 + 1) };
         let mut next = 0;
         let mut held_at: Option<(u64, Option<i64>)> = None;
         let mut last = first;
@@ -5327,8 +5446,73 @@ mod tests {
         Ok(())
     }
 
-    /// The child of `a_panic_in_mlat_work_ends_the_process`.
+    /// The part of MLAT a panic test's child makes panic.
     const PANIC_CHILD: &str = "TALLY_MLAT_PANIC_CHILD";
+
+    /// In the child of a panic test: a host fed a scenario past its first windows' steps, with a
+    /// panic injected at `part` (`panics_at`). It returns only if the host ran on with the part
+    /// that panicked gone, its steps in hand for ever; then the child ends cleanly, which the
+    /// parent refuses.
+    fn panicking_host(part: &str) -> Result<(), String> {
+        let mut simulation = sim::run(&scenario(17, 60.0));
+        let delivered = arrivals(&mut simulation, 3)?;
+        let first = delivered.first().map(|(at, _)| *at).ok_or("no raw")?;
+        let until = delivered.last().map_or(0, |(at, _)| *at) + 60_000;
+        let host = HostedMlat::new(identity(), BOOT, settings())?;
+        host.set_areas(areas()?, Vec::new());
+        let part = part.to_owned();
+        host.delaying(Arc::new(move |stage: Stage| {
+            let thread = std::thread::current();
+            match part.as_str() {
+                // A seal's runner.
+                "seal" => assert!(stage != Stage::Seal, "a seal panics"),
+                // A worker a provisional step's pass spreads its address shards over
+                // (`gate::on_threads`): a thread of no name, never the runner itself.
+                "worker" => assert!(
+                    !(stage == Stage::Reading && thread.name().is_none()),
+                    "a gate worker panics"
+                ),
+                // The engine's thread, applying a window step's outcome.
+                "engine" => assert!(
+                    !(stage == Stage::Apply && thread.name() == Some("tally-mlat")),
+                    "the engine's thread panics"
+                ),
+                _ => {}
+            }
+        }));
+        let mut next = 0;
+        for step in steps(first, until) {
+            while let Some((at, record)) = delivered.get(next).filter(|(at, _)| *at < step) {
+                offer(&host, record, *at);
+                next += 1;
+            }
+            host.take_published(step);
+            handled(&host);
+        }
+        let since = std::time::Instant::now();
+        while host.in_flight() > 0 && since.elapsed() < std::time::Duration::from_secs(20) {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        Ok(())
+    }
+
+    /// Runs `test` again as a child whose host panics at `part`, and holds that the child ended by
+    /// `SIGABRT`: MLAT that panicked ended the process rather than running on without the part.
+    fn ends_the_process(test: &str, part: &str) -> Result<(), String> {
+        if let Some(part) = std::env::var_os(PANIC_CHILD) {
+            return panicking_host(&part.to_string_lossy());
+        }
+        let status = std::process::Command::new(std::env::current_exe().map_err(text)?)
+            .args(["--exact", test, "--test-threads=1"])
+            .env(PANIC_CHILD, part)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map_err(text)?;
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(status.signal(), Some(libc::SIGABRT), "{part}: {status:?}");
+        Ok(())
+    }
 
     /// Sweep 5, N7: MLAT work that panics ends the process, as a panic anywhere in the relay does
     /// (`crate::abort_on_any_panic`), whether or not the relay's hook is set: a host whose seal
@@ -5336,47 +5520,31 @@ mod tests {
     /// seal's thread ended and MLAT stalled for good, silently). Run in a child of this test.
     #[test]
     fn a_panic_in_mlat_work_ends_the_process() -> Result<(), String> {
-        if std::env::var_os(PANIC_CHILD).is_some() {
-            let mut simulation = sim::run(&scenario(17, 30.0));
-            let delivered = arrivals(&mut simulation, 3)?;
-            let first = delivered.first().map(|(at, _)| *at).ok_or("no raw")?;
-            let until = delivered.last().map_or(0, |(at, _)| *at);
-            let host = HostedMlat::new(identity(), BOOT, settings())?;
-            host.set_areas(areas()?, Vec::new());
-            host.delaying(Arc::new(|stage: Stage| {
-                assert!(stage != Stage::Seal, "a seal panics");
-            }));
-            let mut next = 0;
-            for step in steps(first, until) {
-                while let Some((at, record)) = delivered.get(next).filter(|(at, _)| *at < step) {
-                    offer(&host, record, *at);
-                    next += 1;
-                }
-                host.take_published(step);
-                handled(&host);
-            }
-            // A host that ran on would come here, its steps in hand for ever: it ends cleanly,
-            // which the parent refuses.
-            let since = std::time::Instant::now();
-            while host.in_flight() > 0 && since.elapsed() < std::time::Duration::from_secs(20) {
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-            return Ok(());
-        }
-        let status = std::process::Command::new(std::env::current_exe().map_err(text)?)
-            .args([
-                "--exact",
-                "mlat_host::tests::a_panic_in_mlat_work_ends_the_process",
-                "--test-threads=1",
-            ])
-            .env(PANIC_CHILD, "1")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map_err(text)?;
-        use std::os::unix::process::ExitStatusExt;
-        assert_eq!(status.signal(), Some(libc::SIGABRT), "{status:?}");
-        Ok(())
+        ends_the_process(
+            "mlat_host::tests::a_panic_in_mlat_work_ends_the_process",
+            "seal",
+        )
+    }
+
+    /// Sweep 6, F13 (N7): a panic on a worker a step's pass spreads its items over is its step's
+    /// (`gate::on_threads` resumes it on the runner), so it ends the process as the runner's own
+    /// would: no pass swallows a worker's panic and reports a step it did not finish.
+    #[test]
+    fn a_panic_on_a_gate_worker_ends_the_process() -> Result<(), String> {
+        ends_the_process(
+            "mlat_host::tests::a_panic_on_a_gate_worker_ends_the_process",
+            "worker",
+        )
+    }
+
+    /// Sweep 6, F13 (N7): a panic on the engine's thread ends the process: before nothing would
+    /// show it, every later ask going to a thread that was gone and MLAT publishing nothing more.
+    #[test]
+    fn a_panic_on_the_engines_thread_ends_the_process() -> Result<(), String> {
+        ends_the_process(
+            "mlat_host::tests::a_panic_on_the_engines_thread_ends_the_process",
+            "engine",
+        )
     }
 
     /// Sweep 5, H-b: what a seal refuses for room is counted when the seal finishes, never held
@@ -5548,6 +5716,207 @@ mod tests {
             (1, 0, 0, 0),
             "{report:?}"
         );
+        Ok(())
+    }
+
+    /// Sweep 6, N1/F7: the stamps' keep (`kept_by_stamps`) is what `Engine::forget_by` keeps with
+    /// no floor, at every step; and it keeps every bin of a window until `MODELS_RIPEN_MS` after
+    /// the window falls due, so a window step that starts at its turn and finishes within the
+    /// ripening (a host within its plan) never leaves a bin to its floor alone.
+    #[test]
+    fn the_stamps_keep_what_the_engine_keeps_with_no_floor_and_a_planned_window_its_bins() {
+        let engine_at =
+            |sealed: &SealedBins| Engine::hosted(identity(), BOOT, settings(), sealed.clone());
+        let base = 1_000_000 * STEP_MS;
+        for n in 0..200 {
+            let step = base + n * STEP_MS;
+            let sealed = SealedBins::new();
+            for bin in bin_of(step) - 80..=bin_of(step) {
+                sealed.insert(Bin::seal_from(bin, vec![Fragment::new(bin)], 1));
+            }
+            let mut engine = engine_at(&sealed);
+            let settled = engine.settled(step);
+            engine.forget_by(step, settled, i64::MAX);
+            assert_eq!(
+                sealed.numbers().first().copied(),
+                Some(kept_by_stamps(step, settled)),
+                "at {step}"
+            );
+        }
+        let engine = engine_at(&SealedBins::new());
+        let mut before = engine.settled(base);
+        for n in 1..400 {
+            let step = base + n * STEP_MS;
+            let settled = engine.settled(step);
+            // Each window whose last bin this step settles (`AFTER` past a multiple of the stride).
+            for last in (before + 1..=settled).filter(|bin| (bin - AFTER).rem_euclid(STRIDE) == 0) {
+                let window = Window::canonical(last - AFTER);
+                assert_eq!(window.last, last);
+                let ripe = step + MODELS_RIPEN_MS;
+                assert!(
+                    kept_by_stamps(ripe, engine.settled(ripe)) <= window.first,
+                    "{window:?} due at {step}"
+                );
+            }
+            before = settled;
+        }
+    }
+
+    /// Sweep 6, N1/F7: what a seal refuses for room is the stamps' alone. A host whose window step
+    /// is held long past its turn (its floor keeping the bins the stamps forgot, `Engine::forget_by`)
+    /// in a `Held` store exactly as large as a host keeping up ever filled seals every bin as that
+    /// host does, byte for byte, step by step, and refuses nothing it does not: the bins only the
+    /// floor keeps yield their room to the stamps', oldest first, counted. Before, a seal's room was
+    /// the store less every sealed bin, the floor's included, so the held host sealed receivers out
+    /// of bins the other held, and two relays of one area sealed different raw.
+    #[test]
+    fn a_seals_room_is_the_stamps_whatever_a_waiting_window_steps_floor_keeps() -> Result<(), String>
+    {
+        let mut simulation = sim::run(&scenario(17, 240.0));
+        let delivered = arrivals(&mut simulation, 3)?;
+        let first = delivered.first().map(|(at, _)| *at).ok_or("no raw")?;
+        let until = delivered.last().map_or(0, |(at, _)| *at);
+        let areas = areas()?;
+        let threads = Settings {
+            threads: 3,
+            ..settings()
+        };
+        // A host keeping up: its sealed bins at every step, and the most its `Held` store held.
+        let keeping = Gauges::unlimited();
+        let reference = HostedMlat::charging(identity(), BOOT, threads.clone(), keeping.clone())?;
+        reference.set_areas(areas.clone(), Vec::new());
+        let mut at_step: BTreeMap<u64, Vec<Arc<Bin>>> = BTreeMap::new();
+        let mut next = 0;
+        for step in steps(first, until) {
+            while let Some((at, record)) = delivered.get(next).filter(|(at, _)| *at < step) {
+                offer(&reference, record, *at);
+                next += 1;
+            }
+            reference.take_published(step);
+            quiet(&reference);
+            let sealed = reference.sealed_bins().ok_or("no sealed bins")?;
+            at_step.insert(step, sealed.bins(i64::MIN, i64::MAX));
+        }
+        let kept = reference.report();
+        assert_eq!(kept.waiting_bins_forgotten, 0, "{kept:?}");
+        let limit = keeping.held.peak();
+        // The same, its second window step held shut for `HELD` steps, in a store of that size.
+        let gauges = Gauges {
+            held: Gauge::new(Store::Held, limit),
+            ..Gauges::unlimited()
+        };
+        let host = HostedMlat::charging(identity(), BOOT, threads, gauges.clone())?;
+        host.set_areas(areas, Vec::new());
+        let gate = Gate::shut();
+        let shut = Arc::clone(&gate);
+        let windows = Arc::new(AtomicUsize::new(0));
+        let held = Arc::new(AtomicBool::new(false));
+        let (counting, holding_window) = (Arc::clone(&windows), Arc::clone(&held));
+        host.delaying(Arc::new(move |stage: Stage| {
+            if stage == Stage::Window && counting.fetch_add(1, Ordering::SeqCst) == 1 {
+                holding_window.store(true, Ordering::SeqCst);
+                shut.pass();
+            }
+        }));
+        const HELD: u64 = 90;
+        let mut held_from = None;
+        let mut compared = 0;
+        let mut next = 0;
+        for step in steps(first, until) {
+            while let Some((at, record)) = delivered.get(next).filter(|(at, _)| *at < step) {
+                offer(&host, record, *at);
+                next += 1;
+            }
+            host.take_published(step);
+            handled(&host);
+            let since = std::time::Instant::now();
+            while host.sealed_stepped_ms() < step {
+                assert!(
+                    since.elapsed() < std::time::Duration::from_secs(60),
+                    "step {step} not sealed: {:?}",
+                    host.report()
+                );
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            if held_from.is_none() && held.load(Ordering::SeqCst) {
+                held_from = Some(step);
+            }
+            // Every bin the host keeping up holds, the held host holds alike.
+            let hosted = host.sealed_bins().ok_or("no sealed bins")?;
+            for bin in at_step.get(&step).ok_or("no reference step")? {
+                assert!(
+                    hosted.get(bin.bin).as_deref() == Some(&**bin),
+                    "bin {} at {step}: {:?}",
+                    bin.bin,
+                    host.report()
+                );
+                compared += 1;
+            }
+            if held_from.is_some_and(|from| step >= from + HELD * STEP_MS) {
+                break;
+            }
+        }
+        let held_from = held_from.ok_or("no window step was held")?;
+        let report = host.report();
+        assert!(compared > 0);
+        assert_eq!(
+            report.observations_refused, kept.observations_refused,
+            "held from {held_from}: {report:?}"
+        );
+        // The floor kept bins, and they yielded.
+        assert!(report.waiting_bins_forgotten > 0, "{report:?}");
+        assert!(gauges.held.peak() <= limit);
+        gate.open();
+        quiet(&host);
+        Ok(())
+    }
+
+    /// Sweep 6, R6: the receivers one change of areas lets go are forgotten together, in one
+    /// forget pass (`Command::Left` of all of them), each sealed bin that held any of them sealed
+    /// again once for all of them. Before, one `Left` a receiver had the first forgotten alone in
+    /// a pass of its own, every bin it held sealed twice.
+    #[test]
+    fn the_receivers_a_change_of_areas_lets_go_are_forgotten_in_one_pass() -> Result<(), String> {
+        let mut simulation = sim::run(&scenario(17, 60.0));
+        let delivered = arrivals(&mut simulation, 3)?;
+        let first = delivered.first().map(|(at, _)| *at).ok_or("no raw")?;
+        let until = delivered.last().map_or(0, |(at, _)| *at);
+        let host = HostedMlat::new(identity(), BOOT, settings())?;
+        host.set_areas(areas()?, Vec::new());
+        let passes = Arc::new(AtomicUsize::new(0));
+        let counting = Arc::clone(&passes);
+        host.delaying(Arc::new(move |stage: Stage| {
+            if stage == Stage::Forget {
+                counting.fetch_add(1, Ordering::SeqCst);
+            }
+        }));
+        drive(&host, &delivered, first, until);
+        let sealed = host.sealed_bins().ok_or("no sealed bins")?;
+        let held = |sealed: &SealedBins| -> BTreeSet<PublicKey> {
+            sealed
+                .bins(i64::MIN, i64::MAX)
+                .iter()
+                .flat_map(|bin| bin.receivers.clone())
+                .collect()
+        };
+        let before = held(&sealed);
+        passes.store(0, Ordering::SeqCst);
+        // One cell far from the receivers, outside its band: every one of them leaves, the
+        // engine staying (areas remain).
+        let (lat, lon) = sim::CENTRE;
+        let corner = Location {
+            lat_e7: ((lat - 10.0) * 1e7) as i32,
+            lon_e7: ((lon - 10.0) * 1e7) as i32,
+            alt_m: 0,
+            precision_m: 0,
+        };
+        let corner = Region::containing(&corner, AREA_RESOLUTION).map_err(text)?;
+        host.set_areas(Regions::new(vec![corner]), Vec::new());
+        quiet(&host);
+        let after = held(&sealed);
+        let left = before.difference(&after).count();
+        assert!(left >= 2, "{left} receivers left");
+        assert_eq!(passes.load(Ordering::SeqCst), 1);
         Ok(())
     }
 }

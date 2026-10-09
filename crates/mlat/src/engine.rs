@@ -472,15 +472,7 @@ impl Engine {
     /// what the sealed bins hold, and the room the next seal has, is the stamps' alone, as in line,
     /// and a window that waits is never solved without the bins it began with.
     pub fn forget_by(&mut self, now_ms: u64, settled: i64, floor: i64) {
-        // A window still to be solved solves bins after `settled - STRIDE`; nothing before its
-        // history is needed by the engine. Its raw is its host's one store, so it keeps what
-        // standing settles against too: a window and its stride behind the clock, and the spare
-        // bins (`held::RAW_SPARE_BINS`).
-        let keep = Window::canonical(settled + 1)
-            .first
-            .min(settled + 1 - BEFORE - STRIDE)
-            .min(bin_of(now_ms) - BEFORE - AFTER - STRIDE - RAW_SPARE_BINS)
-            .min(floor);
+        let keep = kept_by_stamps(now_ms, settled).min(floor);
         self.sealed.forget_before(keep);
         if let Some(intake) = self.intake.as_mut() {
             intake.forget_before(keep);
@@ -634,6 +626,20 @@ pub fn seal(fragments: Vec<Fragment>, threads: usize, room: usize) -> (Vec<Bin>,
         })
         .collect();
     (bins, refused)
+}
+
+/// The first bin the stamps alone keep at the step `now_ms` whose bins are sealed through
+/// `settled` (`Engine::forget_by` keeps no less, and from a waiting window's `floor` on as well): a
+/// window still to be solved solves bins after `settled - STRIDE`, so nothing before its history is
+/// needed by the engine; and its raw is its host's one store, so it keeps what standing settles
+/// against too: a window and its stride behind the clock, and the spare bins
+/// (`held::RAW_SPARE_BINS`). A host that charges the bins a waiting window holds beyond these to
+/// that window reads the line here.
+pub fn kept_by_stamps(now_ms: u64, settled: i64) -> i64 {
+    Window::canonical(settled + 1)
+        .first
+        .min(settled + 1 - BEFORE - STRIDE)
+        .min(bin_of(now_ms) - BEFORE - AFTER - STRIDE - RAW_SPARE_BINS)
 }
 
 #[cfg(test)]

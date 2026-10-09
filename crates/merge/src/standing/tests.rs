@@ -538,7 +538,9 @@ fn honest_receivers_earn_standing_the_same_at_every_keeper() -> Result<(), Strin
     assert_eq!(backward.standing().book().receivers(), book.receivers());
     // A relay that forwarded the same records: its standing reads the raw its hosted engine
     // sealed (one store of raw per relay), for receivers in the areas it holds raw for.
-    let relay = tally_relay::standing::Standing::new();
+    let relay = std::sync::Arc::new(tally_relay::standing::Standing::new());
+    // Standing takes records in on a thread of its own (sweep 6), as the relay starts it.
+    tally_relay::standing::Standing::start(&relay, None)?;
     let mut held = tally_mlat_solver::held::Held::new(1 << 30);
     for record in &records {
         if let Record::Batch(batch) = record {
@@ -568,6 +570,10 @@ fn honest_receivers_earn_standing_the_same_at_every_keeper() -> Result<(), Strin
         }
     }
     relay.tick(world.now + rule::SETTLE_MS + 1);
+    assert!(
+        relay.wait_idle(std::time::Duration::from_secs(120)),
+        "standing never finished taking the records in"
+    );
     for receiver in expected.keys() {
         assert_eq!(
             relay.of(receiver, Some(cell)),

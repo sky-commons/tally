@@ -359,6 +359,13 @@ pub enum Record {
     RateLimit {
         bytes_per_sec: u32,
         burst: u32,
+        /// The most wanted receptions a second (`modes::wanted_reception`) the relay takes from
+        /// this feeder's receiver, a second's worth at once: a feeder sheds what is past it before
+        /// it signs, counted in its batches' `dropped`, and the relay drops a batch that would take
+        /// the receiver past it rather than slow the feeder's connection (RFC-0181 §10). Appended
+        /// (§3.4): `None` from a relay that states none, and a feeder that predates it reads the
+        /// two fields before it and ignores it.
+        wanted_per_sec: Option<u32>,
     },
     /// The relay is closing the session.
     Goodbye {
@@ -555,9 +562,13 @@ impl Record {
             Self::RateLimit {
                 bytes_per_sec,
                 burst,
+                wanted_per_sec,
             } => {
                 out.extend_from_slice(&bytes_per_sec.to_be_bytes());
                 out.extend_from_slice(&burst.to_be_bytes());
+                if let Some(wanted) = wanted_per_sec {
+                    out.extend_from_slice(&wanted.to_be_bytes());
+                }
             }
             Self::Goodbye {
                 reason,
@@ -675,6 +686,10 @@ impl Record {
             KIND_RATE_LIMIT => Self::RateLimit {
                 bytes_per_sec: reader.u32()?,
                 burst: reader.u32()?,
+                // Appended: read when its bytes are there, as a relay that states it sends it.
+                wanted_per_sec: (reader.remaining() >= 4)
+                    .then(|| reader.u32())
+                    .transpose()?,
             },
             KIND_GOODBYE => Self::Goodbye {
                 reason: Reason::from_byte(reader.u8()?),
@@ -803,6 +818,11 @@ impl<'a> Body<'a> {
         self.at
     }
 
+    /// How many bytes are left to read.
+    pub(crate) fn remaining(&self) -> usize {
+        self.bytes.len().saturating_sub(self.at)
+    }
+
     pub(crate) fn bytes(&mut self, len: usize) -> Result<&'a [u8], WireError> {
         let slice = take(self.bytes, self.at, len)?;
         self.at += len;
@@ -879,6 +899,12 @@ mod tests {
             Record::RateLimit {
                 bytes_per_sec: 64_000,
                 burst: 128_000,
+                wanted_per_sec: None,
+            },
+            Record::RateLimit {
+                bytes_per_sec: 64_000,
+                burst: 128_000,
+                wanted_per_sec: Some(1_800),
             },
             Record::Goodbye {
                 reason: Reason::Full,
@@ -1361,6 +1387,42 @@ mod tests {
         let mut back = Vec::new();
         Record::decode_message(&message, &mut back)?;
         assert_eq!(back, vec![Record::Welcome { version: 1 }]);
+        Ok(())
+    }
+
+    /// A relay states a feeder's wanted receptions a second by appending it to `RateLimit`: the
+    /// record a feeder that predates it reads is the same two fields, byte for byte, with the
+    /// ceiling after them (which such a reader ignores, §3.4), and a relay that states none is read
+    /// as stating none.
+    #[test]
+    fn a_rate_limits_wanted_ceiling_is_appended_and_old_readers_read_the_rest()
+    -> Result<(), WireError> {
+        let stated = Record::RateLimit {
+            bytes_per_sec: 64_000,
+            burst: 128_000,
+            wanted_per_sec: Some(1_800),
+        };
+        let unstated = Record::RateLimit {
+            bytes_per_sec: 64_000,
+            burst: 128_000,
+            wanted_per_sec: None,
+        };
+        let (mut new, mut old) = (Vec::new(), Vec::new());
+        stated.encode(&mut new)?;
+        unstated.encode(&mut old)?;
+        assert_eq!(new.len(), old.len() + 4);
+        assert_eq!(new[3..old.len()], old[3..]);
+        assert_eq!(new[old.len()..], 1_800u32.to_be_bytes());
+        let mut back = Vec::new();
+        Record::decode_message(&new, &mut back)?;
+        Record::decode_message(&old, &mut back)?;
+        assert_eq!(back, vec![stated.clone(), unstated]);
+        // A later field after it is ignored in its turn.
+        new[2] += 2;
+        new.extend_from_slice(&[7, 7]);
+        let mut later = Vec::new();
+        Record::decode_message(&new, &mut later)?;
+        assert_eq!(later, vec![stated]);
         Ok(())
     }
 
