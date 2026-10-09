@@ -679,12 +679,20 @@ fn summary(summary: &Summary) -> String {
         if config.streams.0 & tally_wire::Streams::RAW.0 != 0
             && config.streams.0 & tally_wire::Streams::DEDUPLICATED.0 != 0
         {
-            let (heard, missing) = client.heard.coverage();
+            let latency = client
+                .dedup_latency
+                .lock()
+                .map_or(0, |histogram| histogram.max());
+            let coverage = client
+                .heard
+                .coverage(tally_feed::source::wall_ms(), latency);
             row(
                 "client: dedup coverage",
                 format!(
-                    "{missing} of the {heard} distinct messages read raw this window never in the \
-                     deduplicated stream (0 when the relay loses none)"
+                    "{} of the {} distinct messages read raw this window never in the \
+                     deduplicated stream (0 when the relay loses none); {} more read too late in \
+                     their session to judge (the stream is {} ms behind at most)",
+                    coverage.missing, coverage.judged, coverage.unjudged, latency
                 ),
             );
         }
