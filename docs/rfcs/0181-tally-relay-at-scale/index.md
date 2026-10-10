@@ -1259,12 +1259,34 @@ The same bed with the admission above (2026-10-10, `memory-bed.sh nomlat`, 8,000
 nothing was shed and no batch was missing from any sequence, raw p50 1 ms, p99 3 ms, p99.9 6 ms,
 857 MiB resident at the end and 866 MiB at the peak against 1,213 MiB allowed (the stores' charge
 and their headroom), trims at most 26 ms. At the default 600 (the harness offers 603, 4.82 M, half
-a percent over `R_max`) the shedder cut 73,240 batches, all `over_share`, about 6.6% of the
-batches, and resident was 861 and 889 MiB, raw p99 3 ms: demand over `R_max` is cut by fair share
-as written, and what is cut is several times the excess. The likely cause (not yet shown) is that
-a group's two-second use, 31 feeders, moves by more than the excess does, so a group is cut for a
-surge and another is not credited for a dip. Whether the level should be found over a longer
-window is open.
+a percent over `R_max`'s 4.8 M receptions, and a few percent over its 65.5 MB/s of bytes, which is the
+dimension that binds: a batch is judged on both) the first shedder cut 73,240 batches, all `over_share`, about 6.6% of the
+batches, and admitted 64.2 MB/s, 97.9% of the byte rate: the cut was about twice the excess. The
+cause (reproduced deterministically in `shed::tests`, 3,000 units, 2.2 times the excess at 5% over):
+a unit was held to the level by an exponentially windowed sum of two seconds of what it was
+admitted, which clips every surge of a unit near the level and credits none of its dips, and the
+level itself was found from the same noisy two-second rates (a feeder that sends a batch a second
+has a two-second rate that swings a quarter either way with the phase it is read at), so it sat
+above the level of the true rates: units were cut for their noise as well as their excess, and
+the bucket, not the rule, then cut whichever batch found it empty. The fix is two things. A unit
+holds a **credit** that fills at the level and is spent by what it is admitted, `shed::CREDIT_SECS`
+(4 s) deep: over any span it is admitted at most the level times the span plus the credit, so
+jitter around a mean under the level never cuts it and one over it is cut for its excess and no
+more. And the level a scan finds is **trimmed** (`Shedder::trimmed`) by the rate actually admitted
+since the last scan against `R_max`, down only, never below half, closing the gap in `TRIM_SECS`
+(1 s): the one correction that needs no estimate of any unit. The tests hold the cut within a
+quarter of the excess and two parts in a thousand of the demand over 0.5%, 5% and 20% over
+(`past_the_rate_the_cut_is_the_excess_not_a_multiple`), within a tenth once settled
+(`once_settled_the_cut_is_the_excess_within_a_tenth`), an honest unit under its share cut for a
+hundredth of a percent of its batches and the hostile ones cut first and held to what the honest
+leave (`jitter_never_cuts_an_honest_unit_under_its_share_and_the_hostile_go_first`). The same bed
+with the fix (2026-10-10, 120 s measured, `memory-bed.sh nomlat`, two runs): 31,582 and 32,883
+batches missing of about 960,000 (3.3% to 3.4%, the excess of the byte rate), 65.48 MB/s admitted
+(99.9% of `R_max`'s bytes), raw p50 1 ms, p99 3 ms, p99.9 7 ms, 869 to 878 MiB resident at the
+end and 888 to 894 MiB at the peak against 1,165 allowed. What stays open: an excess of about a
+percent or less moves the trim slower than the bucket absorbs it (a second of `R_max`), so for the
+first minutes the bucket carries it and, once it is empty, the cut falls on whichever batch finds
+it empty until the trim has brought the level under the units' rates.
 
 ## Invariants the tests hold
 1. Thread-count independence: same stamped trace at 1, 2, 8, 32 threads gives byte-identical MLAT

@@ -24,15 +24,30 @@
 //! The division is the water-filling one: a source wanting less than the level keeps all it
 //! wants, and the rest share what those leave; with demand within `R_max` there is no level at
 //! all, so a group of any size is cut for nothing. The level is found
-//! again every quarter of [`ACTIVE_MS`] from each unit's attempted rate (`State::levelled`). A
-//! source wanting no more than the level is admitted whenever the bucket holds its batch. A
-//! source wanting more is kept to the level by what it has been admitted over the last
-//! [`WINDOW_MS`] of stamps, and, while the bucket runs short, held back by a mark of the bucket's
-//! fill that rises with how many levels it wants (`1 - level / wanted`, times [`RESERVE`]), so the
-//! source furthest over is cut first, and of equal overage the one with the higher key-hash rank.
-//! What a source wants is what it attempted, admitted or cut, so a cut source does not become a
-//! guest again by being cut. Every cut is counted per source and reason ([`Cause`]) and reported
-//! on `/memory`.
+//! again every quarter of [`ACTIVE_MS`] from each unit's attempted rate (`Shedder::scanned`), and
+//! trimmed (`Shedder::trimmed`, below). Every unit holds a credit that fills at the level and is
+//! spent by what it is admitted, [`CREDIT_SECS`] deep: a unit is admitted a batch while its credit
+//! holds it, so over any span it is admitted at most the level times the span plus the credit, a
+//! unit wanting no more than the level is never cut by its jitter, and one wanting more is cut for
+//! its excess over the level and no more (a dip is kept to be spent on the next surge; before, the
+//! unit was held to the level by an exponentially windowed sum of two seconds, which clipped every
+//! surge and credited no dip, so units within a few percent of the level were cut for their noise
+//! as well as their excess). While the bucket runs short a unit wanting more than the level is also
+//! held back by a mark of the bucket's fill that rises with how many levels it wants
+//! (`1 - level / wanted`, times [`RESERVE`]), so the source furthest over is cut first, and of
+//! equal overage the one with the higher key-hash rank. What a source wants is what it attempted,
+//! admitted or cut, so a cut source does not become a guest again by being cut. Every cut is
+//! counted per source and reason ([`Cause`]) and reported on `/memory`.
+//!
+//! The level a scan finds is the water level of the units' *measured* wants, and a measure is
+//! noisy (a unit that sends a batch a second has a two-second rate that swings a quarter either
+//! way with the phase it is read at): the sum of rates clipped at a level is less than the clip of
+//! their sum, so the level found from noisy wants is above the level of the true rates, by more
+//! the nearer demand is to `R_max`. Units held to it are admitted more than `R_max`, and the
+//! bucket then cuts whichever batch finds it empty. So the level is trimmed: the rate actually
+//! admitted since the last scan, against `R_max`, scales it down (never up past the declared
+//! level, never below half) until the relay admits what it can carry, so the total cut over a
+//! window is the demand's excess and the units over the level are the ones cut.
 //!
 //! Closed-loop admission (by observed load) is not used: a Sybil connects quiet and then sends at
 //! pace. The allowance depends on the declared rate and the weights alone.
@@ -170,6 +185,19 @@ pub const ACTIVE_MS: u64 = 2_000;
 pub const RETAIN_MS: u64 = 4 * WINDOW_MS;
 /// The seconds of `R_max` the bucket holds: a second of arrivals bunched on the way.
 pub const BURST_SECS: f64 = 1.0;
+/// The seconds of its level a unit may bank: its credit's depth. A unit holds a credit that fills
+/// at the level a second and is spent by what it is admitted, so what it is admitted over any span
+/// is at most the level times the span plus this much, and a unit sending less than the level over
+/// the long run is never cut by its jitter, nor one sending more cut for more than its excess.
+pub const CREDIT_SECS: f64 = 4.0;
+/// The most the trim moves the level in one scan, and the least it leaves of it (see
+/// `Shedder::trimmed`).
+pub const TRIM_STEP: f64 = 0.05;
+/// The seconds in which the trim closes the gap between the rate admitted and `R_max`: a scan's
+/// own reading is noisy (a few percent, batches falling either side of its edge), so no one of
+/// them moves the level by more than its share of this.
+pub const TRIM_SECS: f64 = 1.0;
+pub const TRIM_FLOOR: f64 = 0.5;
 /// The part of the bucket only sources within their share may spend: the guarantee. A source over
 /// its share is cut once the bucket is below this, whatever its overage.
 pub const RESERVE: f64 = 0.1;
@@ -205,10 +233,10 @@ struct Bucket {
 }
 
 struct Use {
-    /// Decayed sums of what the unit attempted and of what was admitted, per dimension, as of
-    /// `at_ms`.
+    /// The decayed sum of what the unit attempted, per dimension, as of `at_ms`: what it wants.
     attempted: [f64; DIMS],
-    admitted: [f64; DIMS],
+    /// What it may still be admitted, per dimension: the credit, as of `at_ms`.
+    credit: [f64; DIMS],
     at_ms: u64,
     /// Nothing of it has been judged yet.
     fresh: bool,
@@ -222,6 +250,8 @@ struct Flow {
     ceiling: Rates,
     buckets: [Bucket; DIMS],
     at_ms: u64,
+    /// Everything admitted so far, per dimension: the trim reads the rate admitted from it.
+    admitted: [f64; DIMS],
 }
 
 /// A histogram of units by the rate they want, from which the water level is found without
@@ -289,6 +319,12 @@ struct Scan {
     at_ms: u64,
     began_ms: u64,
     wants: [Wants; DIMS],
+    /// The trim: the part of the declared level the relay's own rate leaves, per dimension, and
+    /// what was admitted and when it was last read.
+    trim: [f64; DIMS],
+    open: [f64; DIMS],
+    read_ms: u64,
+    read_admitted: [f64; DIMS],
 }
 
 /// The relay-wide rate, shared by every ingest worker.
@@ -391,6 +427,7 @@ impl Shedder {
                 ceiling,
                 buckets: [bucket(0), bucket(1)],
                 at_ms: 0,
+                admitted: [0.0; DIMS],
             }),
             bounded,
             tables: (0..if bounded { TABLES } else { 0 })
@@ -404,6 +441,10 @@ impl Shedder {
                 at_ms: 0,
                 began_ms: 0,
                 wants: [Wants::new(), Wants::new()],
+                trim: [1.0; DIMS],
+                open: [f64::INFINITY; DIMS],
+                read_ms: 0,
+                read_admitted: [0.0; DIMS],
             }),
             visits: AtomicU64::new(0),
             level: [level(0), level(1)],
@@ -441,7 +482,7 @@ impl Shedder {
 
     /// Whether `unit`'s batch costing `cost`, stamped `stamp_ms`, is admitted. A cut is counted
     /// (per source and reason) before this returns it. Takes the bucket's tokens when admitted.
-    /// The unit is judged on what it has attempted and been admitted including this batch, so a
+    /// The unit is judged on what it has attempted including this batch, so a
     /// unit's first batch, or its only one in a long while, is judged as the rate it would make.
     pub fn judge(&self, unit: Unit, cost: Cost, stamp_ms: u64) -> Result<(), Cause> {
         if !self.bounded {
@@ -507,7 +548,20 @@ impl Shedder {
             return Err(Cause::OverShare);
         };
         used.fresh = false;
-        // What it has attempted and been admitted, this batch included: a unit new to the table,
+        // Its credit: full for a unit new to the table (judged as the rate it would make alone),
+        // else what it held filled at the level since it was last judged. A level that is not yet
+        // set (demand within `R_max`) fills at `R_max`, the most any unit could be admitted.
+        let idle_s = now.saturating_sub(used.at_ms) as f64 / 1_000.0;
+        for dim in 0..DIMS {
+            let fill = self.level(dim).min(flow.rate.dims()[dim]);
+            let depth = fill * CREDIT_SECS;
+            used.credit[dim] = if fresh {
+                depth
+            } else {
+                (used.credit[dim] + fill * idle_s).min(depth)
+            };
+        }
+        // What it has attempted, this batch included: a unit new to the table,
         // or idle for a whole window, is judged on its batch as the rate it makes alone, never as
         // nothing. One with a history counts half of it (the sums are read just after an arrival,
         // when they stand at their highest: half a batch is what reads a steady rate unbiased).
@@ -527,21 +581,25 @@ impl Shedder {
                 .fold(0.0, f64::max)
         };
         let wants = times(used.attempted, attempted.map(|cost| (weight - 1.0) * cost));
-        let has = times(used.admitted, attempted.map(|cost| weight * cost));
+        let credited = (0..DIMS).all(|dim| used.credit[dim] >= attempted[dim]);
         let fits = (0..DIMS).all(|dim| flow.buckets[dim].tokens >= attempted[dim]);
         let verdict = if wants <= 1.0 {
-            fits.then_some(()).ok_or(Cause::RelayRate)
+            if !credited {
+                Err(Cause::OverShare)
+            } else {
+                fits.then_some(()).ok_or(Cause::RelayRate)
+            }
         } else {
-            // Over the level: kept to it by what it has been admitted, and, while the bucket is
-            // short, held back by a mark that rises with how far over it wants, a hair more for
-            // a higher key-hash rank: the furthest over goes first.
+            // Over the level: kept to it by its credit, and, while the bucket is short, held back
+            // by a mark that rises with how far over it wants, a hair more for a higher key-hash
+            // rank: the furthest over goes first.
             let ranked = wants * (1.0 + resolved.rank() * 1e-6);
             let mark = RESERVE * (1.0 - 1.0 / ranked);
             let surplus = (0..DIMS).all(|dim| {
                 let bucket = &flow.buckets[dim];
                 (bucket.tokens - attempted[dim]) / bucket.burst >= mark
             });
-            (has <= 1.0 && fits && surplus)
+            (credited && fits && surplus)
                 .then_some(())
                 .ok_or(Cause::OverShare)
         };
@@ -549,8 +607,14 @@ impl Shedder {
             for (bucket, cost) in flow.buckets.iter_mut().zip(attempted) {
                 bucket.tokens -= cost;
             }
-            for (sum, cost) in used.admitted.iter_mut().zip(attempted) {
-                *sum += cost;
+            for ((credit, admitted), cost) in used
+                .credit
+                .iter_mut()
+                .zip(&mut flow.admitted)
+                .zip(attempted)
+            {
+                *credit -= cost;
+                *admitted += cost;
             }
         }
         verdict
@@ -571,9 +635,12 @@ impl Shedder {
                 for (sum, cost) in used.attempted.iter_mut().zip(cost.dims()) {
                     *sum = (*sum - cost).max(0.0);
                 }
-                for (sum, cost) in used.admitted.iter_mut().zip(cost.dims()) {
-                    *sum = (*sum - cost).max(0.0);
+                for (credit, cost) in used.credit.iter_mut().zip(cost.dims()) {
+                    *credit += cost;
                 }
+            }
+            for (admitted, cost) in flow.admitted.iter_mut().zip(cost.dims()) {
+                *admitted = (*admitted - cost).max(0.0);
             }
         }
         self.count(unit, cause);
@@ -633,11 +700,47 @@ impl Shedder {
             self.visits.fetch_add(1, Ordering::Relaxed);
         }
         if scan.remaining == 0 {
-            let rate = self.flow().rate.dims();
-            for ((wants, rate), stored) in scan.wants.iter().zip(rate).zip(&self.level) {
-                stored.store(wants.level(rate).max(1.0).to_bits(), Ordering::Relaxed);
-            }
+            self.trimmed(&mut scan);
         }
+    }
+
+    /// Sets the level a scan found, trimmed to what the relay's own rate leaves.
+    ///
+    /// The scan's level is the water level of each unit's measured want, and a measure is noisy:
+    /// the sum of what units want, clipped at a level, is less than the clip of the sum, so a level
+    /// found from noisy wants is above the level of the true rates, and units held to it are
+    /// admitted more than `R_max` (the bucket then cuts whichever batch finds it empty, whoever it
+    /// is). The trim is the one correction that needs no estimate of any unit: the rate actually
+    /// admitted since the last scan, against the rate the bucket can carry (`R_max`, plus or
+    /// only (it never lets a unit more than its declared share), closing the gap in [`TRIM_SECS`], by at most [`TRIM_STEP`] a scan.
+    /// A unit's credit fills at the trimmed level, so the cut over any span is the excess of
+    /// demand over `R_max`, whichever units the noise puts over.
+    fn trimmed(&self, scan: &mut Scan) {
+        let (rate, admitted, now) = {
+            let flow = self.flow();
+            (flow.rate.dims(), flow.admitted, flow.at_ms)
+        };
+        let span_s = now.saturating_sub(scan.read_ms) as f64 / 1_000.0;
+        for dim in 0..DIMS {
+            let open = scan.wants[dim].level(rate[dim]);
+            scan.open[dim] = open;
+            if !open.is_finite() {
+                scan.trim[dim] = 1.0;
+            } else if span_s > 0.0 {
+                let admitted_rate = (admitted[dim] - scan.read_admitted[dim]) / span_s;
+                if admitted_rate > 0.0 {
+                    let step = (1.0 + span_s / TRIM_SECS * (rate[dim] / admitted_rate - 1.0))
+                        .clamp(1.0 - TRIM_STEP, 1.0 + TRIM_STEP);
+                    scan.trim[dim] = (scan.trim[dim] * step).clamp(TRIM_FLOOR, 1.0);
+                }
+            }
+            self.level[dim].store(
+                (open * scan.trim[dim]).max(1.0).to_bits(),
+                Ordering::Relaxed,
+            );
+        }
+        scan.read_ms = now;
+        scan.read_admitted = admitted;
     }
 
     fn count(&self, unit: Unit, cause: Cause) {
@@ -698,7 +801,7 @@ impl Use {
     fn new(at_ms: u64, room: Charge) -> Self {
         Self {
             attempted: [0.0; DIMS],
-            admitted: [0.0; DIMS],
+            credit: [0.0; DIMS],
             at_ms,
             fresh: true,
             _room: room,
@@ -708,7 +811,7 @@ impl Use {
     /// The sums faded from when they were last read to `now`.
     fn fade_to(&mut self, now: u64) {
         let fade = (-(now.saturating_sub(self.at_ms) as f64) / WINDOW_MS as f64).exp();
-        for sum in self.attempted.iter_mut().chain(&mut self.admitted) {
+        for sum in &mut self.attempted {
             *sum *= fade;
         }
         self.at_ms = self.at_ms.max(now);
@@ -1283,5 +1386,151 @@ mod tests {
             "{most} tables in one judgement"
         );
         assert!(rounds >= 2, "the level was found again, {rounds} times");
+    }
+
+    /// A tiny deterministic generator (no clock, no `rand`): the same jitter on every run.
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn next(&mut self) -> f64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (self.0 >> 11) as f64 / (1u64 << 53) as f64
+        }
+    }
+
+    /// `units` units each sending one batch a second of `mean` receptions (each batch 20% either way,
+    /// each arrival 50 ms either way), `seconds` of them, in stamp order, as
+    /// `(stamp, unit index, receptions)`.
+    fn jittered(
+        units: usize,
+        mean: &dyn Fn(usize) -> f64,
+        seconds: u64,
+        seed: u64,
+    ) -> Vec<(u64, usize, u64)> {
+        let mut rng = Lcg(seed);
+        let mut events = Vec::new();
+        for unit in 0..units {
+            let phase = (rng.next() * 1_000.0) as u64;
+            for second in 0..seconds {
+                let size = mean(unit) * (0.8 + 0.4 * rng.next());
+                let stamp = (1_000 + second * 1_000 + phase + (rng.next() * 100.0) as u64)
+                    .saturating_sub(50);
+                events.push((stamp, unit, size as u64));
+            }
+        }
+        events.sort_unstable();
+        events
+    }
+
+    /// What a replay of `events` (`(stamp, unit index, receptions)`) offered and kept, by whether
+    /// `of` picks the unit, from `from_ms` to `to_ms`.
+    fn tally_of(
+        shedder: &Shedder,
+        events: Vec<(u64, usize, u64)>,
+        from_ms: u64,
+        to_ms: u64,
+        of: impl Fn(usize) -> bool,
+    ) -> (u64, u64, u64, u64) {
+        let (mut picked, mut picked_kept, mut rest, mut rest_kept) = (0, 0, 0, 0);
+        for (stamp, unit, receptions) in events {
+            let kept = shedder
+                .judge(group(unit as u16), cost(receptions), stamp)
+                .is_ok();
+            if stamp < from_ms || stamp >= to_ms {
+                continue;
+            }
+            let (offered, admitted) = if of(unit) {
+                (&mut picked, &mut picked_kept)
+            } else {
+                (&mut rest, &mut rest_kept)
+            };
+            *offered += receptions;
+            if kept {
+                *admitted += receptions;
+            }
+        }
+        (picked, picked_kept, rest, rest_kept)
+    }
+
+    const BIG: Rates = Rates {
+        receptions_per_s: 1_000_000,
+        bytes_per_s: 1_000_000_000_000,
+    };
+
+    /// Past `R_max` the cut is the excess of demand over it, not a multiple: 3,000 units whose
+    /// batches jitter (each batch 20% either way, each arrival 50 ms either way, one a second)
+    /// around means that sum to 0.5%, 5% and 20% over. The cut over the run is what the demand
+    /// exceeds `R_max` by, at most a quarter more and two parts in a thousand of the demand (what
+    /// the credits' granularity of a batch costs), and at least the excess less the bucket's second
+    /// that absorbs the first of it. Before, the level was found from each unit's noisy two-second
+    /// rate and a unit was held to it by a window of two batches: units whose rates sat within a
+    /// few percent of the level, each clipped where its noise put it over, were cut for the noise
+    /// as well as the excess, 2.2 times the excess at 5% and 6.6% of the batches at the 0.5% the
+    /// 8,000-feeder bed offered.
+    #[test]
+    fn past_the_rate_the_cut_is_the_excess_not_a_multiple() {
+        let units = 3_000usize;
+        for (over, seconds) in [(0.005, 400u64), (0.05, 150), (0.2, 150)] {
+            let mean = 1_000_000.0 * (1.0 + over) / units as f64;
+            let shedder = Shedder::new(BIG, CEILING);
+            let events = jittered(units, &|_| mean, seconds, 11);
+            let (offered, kept, ..) = tally_of(&shedder, events, 0, u64::MAX, |_| true);
+            let cut = offered - kept;
+            let excess = offered as f64 - 1_000_000.0 * (seconds + 1) as f64;
+            assert!(
+                cut as f64 <= excess * 1.25 + offered as f64 * 0.002,
+                "{over}: cut {cut} of {offered}, the excess is {excess:.0}"
+            );
+            assert!(
+                cut as f64 >= excess - 1_000_000.0 - offered as f64 * 0.002,
+                "{over}: cut {cut} of {offered}, the excess is {excess:.0}, less the bucket's second"
+            );
+        }
+    }
+
+    /// The same, steady, after the level has settled: at 5% and 20% the cut in the last half of
+    /// the run is the excess within a tenth.
+    #[test]
+    fn once_settled_the_cut_is_the_excess_within_a_tenth() {
+        let units = 3_000usize;
+        for over in [0.05, 0.2] {
+            let mean = 1_000_000.0 * (1.0 + over) / units as f64;
+            let shedder = Shedder::new(BIG, CEILING);
+            let events = jittered(units, &|_| mean, 200, 5);
+            let (offered, kept, ..) = tally_of(&shedder, events, 100_000, 200_000, |_| true);
+            let cut = (offered - kept) as f64;
+            let excess = offered as f64 - 1_000_000.0 * 100.0;
+            assert!(
+                (cut - excess).abs() <= excess * 0.1,
+                "{over}: cut {cut} of {offered}, the excess is {excess:.0}"
+            );
+        }
+    }
+
+    /// 2,500 honest units that jitter around 72% of an equal share, beside 500 hostile ones at
+    /// three times the share, 10% past `R_max` all told: the honest are not cut (a hundredth of a
+    /// percent of their batches), the hostile are held to what the honest leave (a fifth cut), and
+    /// they are where the cut is.
+    #[test]
+    fn jitter_never_cuts_an_honest_unit_under_its_share_and_the_hostile_go_first() {
+        let units = 3_000usize;
+        let honest = |unit: usize| unit < 2_500;
+        let mean = |unit: usize| if honest(unit) { 240.0 } else { 1_000.0 };
+        let shedder = Shedder::new(BIG, CEILING);
+        let events = jittered(units, &mean, 150, 3);
+        let (honest_offered, honest_kept, hostile_offered, hostile_kept) =
+            tally_of(&shedder, events, 40_000, 140_000, honest);
+        assert!(
+            (honest_offered - honest_kept) * 10_000 <= honest_offered,
+            "honest units kept {honest_kept} of {honest_offered}"
+        );
+        let cut = (hostile_offered - hostile_kept) as f64 / hostile_offered as f64;
+        assert!(
+            (0.15..0.25).contains(&cut),
+            "hostile units cut {cut:.3} of {hostile_offered}, a fifth is the excess"
+        );
     }
 }
