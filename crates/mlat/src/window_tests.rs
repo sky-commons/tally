@@ -374,7 +374,7 @@ fn solutions_are_packed_into_as_few_records_as_hold_them_in_order() -> Result<()
     Ok(())
 }
 
-/// Sweep 6, N6: packing signs record after record, and on a gate of one permit a provisional step
+/// Packing signs record after record, and on a gate of one permit a provisional step
 /// waits for one signing at most: a checkpoint comes before every one. Before, the packing of a
 /// window's solutions (tens of signings, each over up to the wire's largest record) was one item.
 /// And each record is signed once, over the prefix the wire measures it holds

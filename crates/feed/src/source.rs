@@ -290,7 +290,7 @@ impl Batcher {
     ) -> Result<Option<Batch>, String> {
         let cost = 1 + 6 + 1 + 2 + observation.data.len();
         // A wanted reception past the relays' ceiling is shed here, before it is signed: the
-        // relay would drop the batch it took past it (F4 of sweep 6).
+        // relay would drop the batch it took past it.
         let shed = tally_wire::modes::wanted_reception(observation.format, &observation.data)
             && !self.wanted_fits(now);
         if shed || cost > MAX_OBSERVATION_BYTES || !self.bucket.take_at(cost, now) {
@@ -656,7 +656,7 @@ mod tests {
         batch.content().map_err(|error| error.to_string())
     }
 
-    /// F4 of sweep 6: the batcher sheds wanted receptions past the least ceiling a relay stated,
+    /// The batcher sheds wanted receptions past the least ceiling a relay stated,
     /// before it signs, counted in the batch's `dropped`; receptions MLAT never uses are held to
     /// the owner's bytes alone; and with no relay stating one, nothing is shed.
     #[test]

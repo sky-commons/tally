@@ -14,7 +14,7 @@ pub mod traffic;
 use std::fmt::Write as _;
 use std::ops::Range;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use tally_wire::RelayAddress;
@@ -102,6 +102,12 @@ fn made_line(made: &traffic::Made, feeders: usize) -> String {
     )
 }
 
+/// Whether too many reads of the relay's charges failed for resident memory to have been held to
+/// them: more than a tenth of the reads.
+fn charges_unread(reads: u64, misses: u64) -> bool {
+    reads > 0 && misses.saturating_mul(10) > reads
+}
+
 /// What one sample of the run saw.
 struct Moment {
     sample: Option<Sample>,
@@ -121,9 +127,49 @@ struct Watch {
     client: Arc<Client>,
     counts: Arc<feeders::Counts>,
     ticks: f64,
+    /// Reads of the relay's charges (`relay::charged`) tried and failed, and the last failure:
+    /// the check that resident memory stays within the charges and their headroom is made only at
+    /// a sample that read them, so a run that missed them has not made it (`memory_unchecked`).
+    charge_reads: AtomicU64,
+    charge_misses: AtomicU64,
+    last_miss: std::sync::Mutex<String>,
 }
 
 impl Watch {
+    /// `Some(why)` when too many of the reads of the relay's charges failed for the run to have
+    /// held its resident memory to them: more than a tenth of the reads, or none succeeded where
+    /// the relay's stats were to be read.
+    fn memory_unchecked(&self) -> Option<String> {
+        let reads = self.charge_reads.load(Ordering::Relaxed);
+        let misses = self.charge_misses.load(Ordering::Relaxed);
+        charges_unread(reads, misses).then(|| {
+            let last = self
+                .last_miss
+                .lock()
+                .map(|last| last.clone())
+                .unwrap_or_default();
+            format!(
+                "{misses} of {reads} reads of the relay's charges (GET /memory) failed, the last: \
+                 {last}; its resident memory was not held to them at those samples"
+            )
+        })
+    }
+
+    fn read_charged(&self) -> Option<relay::Charged> {
+        let stats = self.stats.as_deref()?;
+        self.charge_reads.fetch_add(1, Ordering::Relaxed);
+        match relay::charged(stats) {
+            Ok(charged) => Some(charged),
+            Err(error) => {
+                self.charge_misses.fetch_add(1, Ordering::Relaxed);
+                if let Ok(mut last) = self.last_miss.lock() {
+                    *last = error;
+                }
+                None
+            }
+        }
+    }
+
     fn moment(&self) -> Moment {
         Moment {
             sample: self.pid.and_then(|pid| Sample::read(Some(pid)).ok()),
@@ -137,10 +183,7 @@ impl Watch {
                 .stats
                 .as_deref()
                 .and_then(|stats| relay::fits(stats).ok()),
-            charged: self
-                .stats
-                .as_deref()
-                .and_then(|stats| relay::charged(stats).ok()),
+            charged: self.read_charged(),
             offered: self.counts.offered.load(Ordering::Relaxed),
         }
     }
@@ -283,6 +326,9 @@ pub async fn run(config: Config) -> Result<String, String> {
         client: Arc::clone(&client),
         counts: Arc::clone(&counts),
         ticks: relay::ticks_a_second(),
+        charge_reads: AtomicU64::new(0),
+        charge_misses: AtomicU64::new(0),
+        last_miss: std::sync::Mutex::new(String::new()),
     };
     let begin = Instant::now();
     let measure_from = config.ramp + config.warmup;
@@ -291,7 +337,7 @@ pub async fn run(config: Config) -> Result<String, String> {
     let mut window: Option<(Moment, Instant)> = None;
     let mut relay_peak_cores: f64 = 0.0;
     // The most its base and stores were charged so far, and the most the relay was resident beyond
-    // that and the headroom for it at any sample (F3 of sweep 6): (beyond, resident, peak charged).
+    // that and the headroom for it at any sample: (beyond, resident, peak charged).
     let mut peak_charged = 0u64;
     let mut beyond: Option<(i64, u64, u64)> = None;
     loop {
@@ -384,7 +430,10 @@ pub async fn run(config: Config) -> Result<String, String> {
     });
     let _ = std::fs::remove_dir_all(config.state_dir.join("feeders"));
     drop(spawned);
-    // F3 of sweep 6: the relay's peak resident memory is held to its budget and the headroom it
+    if let Some(why) = watch.memory_unchecked() {
+        return Err(format!("{table}\n{why}"));
+    }
+    // The relay's peak resident memory is held to its budget and the headroom it
     // keeps below the memory it runs in, whatever the allocator keeps; past them a relay sized
     // for its load is throttled or killed.
     if let Some((over, _, _)) = beyond
@@ -846,4 +895,21 @@ fn summary(summary: &Summary) -> String {
         let _ = writeln!(out, "  {name:<width$}  {value}");
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::charges_unread;
+
+    /// The harness's check that resident memory stays within the relay's charges
+    /// is made only at samples that read them, so a run whose reads mostly failed (a slow stats
+    /// endpoint) passed it without making it. Now it fails.
+    #[test]
+    fn a_run_that_could_not_read_the_charges_has_not_checked_its_memory() {
+        assert!(!charges_unread(0, 0));
+        assert!(!charges_unread(100, 0));
+        assert!(!charges_unread(100, 10));
+        assert!(charges_unread(100, 11));
+        assert!(charges_unread(20, 20));
+    }
 }

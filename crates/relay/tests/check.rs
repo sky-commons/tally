@@ -914,7 +914,7 @@ const TEN_CORES: [&str; 18] = [
     "8027fffffffffff",
 ];
 
-/// N15 of sweep 5: RFC-0181's figures for what ten cores carry are this test's printed output,
+/// RFC-0181's figures for what ten cores carry are this test's printed output,
 /// held equal to `tests/cores-10.txt`, never prose: the plan the relay prints for that
 /// configuration, hosting MLAT and not. A change to the cores' plan (a figure measured again, a
 /// cost planned that was not) fails here until the file is regenerated from what this test prints,

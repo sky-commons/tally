@@ -722,7 +722,7 @@ mod tests {
         );
     }
 
-    /// H-d: a provisional solution's latency is reported in its two halves, split at the stamp of
+    /// A provisional solution's latency is reported in its two halves, split at the stamp of
     /// the relay's step that solved it, beside the whole; one dated after that stamp is counted.
     #[test]
     fn a_provisional_solution_is_timed_to_its_steps_stamp_and_from_it() -> Result<(), String> {

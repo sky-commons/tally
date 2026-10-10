@@ -292,7 +292,7 @@ impl Positions {
     /// changes a record's length). Measured as `sign_format` lays a record out, one solution at a
     /// time, so a caller cutting a step's solutions into records signs each record once: cutting by
     /// signing ever shorter prefixes of all that is left (a binary search from the whole) cost a
-    /// window step of 80,000 solutions two minutes of one thread (sweep 6). A solution `sign_format`
+    /// window step of 80,000 solutions two minutes of one thread. A solution `sign_format`
     /// would refuse for its content is counted by its length all the same; signing says so.
     pub fn fitting(solutions: &[Solution]) -> usize {
         // Format to sequence, issued, specification version, and the three tables' counts.

@@ -80,7 +80,7 @@ pub const RUNTIME_FEEDERS_PER_CORE: usize = 12_000;
 pub const RUNTIME_FEEDERS_PER_CORE_HOLDING_RAW: usize = 8_000;
 
 /// Nanoseconds of the async runtime one record answered there costs at most, whatever its size
-/// (R4 of sweep 5): the records no ingest worker takes (an echo's reply signed, a delivery query's
+///: the records no ingest worker takes (an echo's reply signed, a delivery query's
 /// answer signed, a clock model, positions or a description verified, a fault proof's two records
 /// verified). The costliest is two signatures verified and the record parsed. Measured
 /// (2026-10-09, release build, one core of the 32-core build host, `ed25519-dalek` as the relay
@@ -204,7 +204,7 @@ impl Source {
 }
 
 /// The sessions a relay holds beside its feeders and its members' rate, whose records the cores
-/// carry on the async runtime (R4 of sweep 5), each paced at what its role legitimately sends
+/// carry on the async runtime, each paced at what its role legitimately sends
 /// (`ingest`'s `RolePace`s, `link::Paces`): every session under the connection cap (not yet
 /// identified, probes, engines; `--max-connections`) at the dearest of their paces
 /// (`ingest::GENERAL_RECORDS_PER_MINUTE`), every subscriber (`--max-subscribers`) at its own
@@ -308,8 +308,8 @@ impl Work {
     /// Nanoseconds of one core a second one planned feeder's worth from `source` costs this work,
     /// in a relay that holds MLAT raw (`holds_raw`) or not, at its busiest. The ingest workers' is
     /// the more of its planned receptions and its records a second at [`INGEST_NANOS_PER_RECORD`]
-    /// each (R-N12); the runtime's is its session's and every record answered there
-    /// ([`RUNTIME_NANOS_PER_RECORD`], R4 of sweep 5).
+    /// each; the runtime's is its session's and every record answered there
+    /// ([`RUNTIME_NANOS_PER_RECORD`]).
     pub const fn per_feeder(self, holds_raw: bool, source: Source) -> usize {
         let part = self.receptions_part(holds_raw);
         let records = source.records_per_sec() as usize;
@@ -615,7 +615,7 @@ mod tests {
         );
     }
 
-    /// R-N12: a record costs the ingest workers `INGEST_NANOS_PER_RECORD` whatever its receptions,
+    /// A record costs the ingest workers `INGEST_NANOS_PER_RECORD` whatever its receptions,
     /// so the members' feeder's worth (whose records come over links the relay does not meter per
     /// source) is planned at the more of its receptions and its records.
     #[test]
@@ -738,7 +738,7 @@ mod tests {
         }
     }
 
-    /// R4 of sweep 5: a source's records are paced together and any may be answered on the
+    /// A source's records are paced together and any may be answered on the
     /// runtime instead of taken by an ingest worker, so the members' records are planned wherever
     /// they are answered, and the cores hold every split of them between the two.
     #[test]
@@ -810,7 +810,7 @@ mod tests {
         );
     }
 
-    /// R4 of sweep 5: every session beside the feeders and the members is planned at its role's
+    /// Every session beside the feeders and the members is planned at its role's
     /// pace, before any feeder, so the more sessions a relay may hold the fewer connections its
     /// cores carry.
     #[test]

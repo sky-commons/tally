@@ -1218,7 +1218,7 @@ fn hashes(count: usize, salt: u8) -> Vec<Hash> {
 /// records allow, and only as its origin cuts it (in order from the start, whole chunks but the
 /// last); each chunk is charged as it arrives, never its declared whole ahead of it.
 ///
-/// Sweep 4, N2: and in a room of its own, sized as the budget plans it from the members' rate
+/// And in a room of its own, sized as the budget plans it from the members' rate
 /// (`assembly_room`), never the batch store: a member that never finishes its parities fills its
 /// own part of that room and no more, the batch store holds none of it, and another sender's
 /// parity is still taken.
@@ -1966,7 +1966,7 @@ fn routing_around_a_full_member_files_no_shortfall_and_demotes_nobody() -> Outco
     if receipts == 0 {
         return Err("no receipt was signed".into());
     }
-    // Sweep 5, R5: "nobody is demoted" is a verdict only from a judge that sat: every member
+    // "nobody is demoted" is a verdict only from a judge that sat: every member
     // weighed a window whose shortfalls could have demoted.
     let unjudged: Vec<usize> = sim
         .live()
@@ -2015,7 +2015,7 @@ fn routing_around_a_full_member_files_no_shortfall_and_demotes_nobody() -> Outco
     Ok(())
 }
 
-/// Sweep 4, N19: a relay turned away again and again while it waits holds one span of routing
+/// A relay turned away again and again while it waits holds one span of routing
 /// around this one, not one a refusal, and a receipt check still finds exactly the moments the
 /// spans cover: inside the wait, within its slack after, and nothing past it.
 #[test]
@@ -2053,7 +2053,7 @@ fn refusals_while_a_relay_waits_are_one_span_and_found_by_search() -> Outcome {
     Ok(())
 }
 
-/// Sweep 4, N10: a repair page is never handed back down the link the summary came in on (the
+/// A repair page is never handed back down the link the summary came in on (the
 /// seam's `have` returns nothing), so no page waits uncharged in a link's replies. It waits in
 /// the outbox addressed to the asker, each record charged to the batch store from when it is
 /// queued until whoever carries it lets it go (`peers` holds the charge until the link writes it).

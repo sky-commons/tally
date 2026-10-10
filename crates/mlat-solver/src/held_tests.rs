@@ -255,7 +255,7 @@ fn a_receiver_forgotten_is_gone_from_every_bin() {
     assert!(held.bytes() > reopened && held.bytes() < reopened + bins.len() * 1_024);
 }
 
-/// Sweep 4, N3: receivers that left together are forgotten in one pass, each bin that held any of
+/// Receivers that left together are forgotten in one pass, each bin that held any of
 /// them sealed again once without all of them: the bins are those forgetting them one by one
 /// makes, and a bin that held none of them is left as it was.
 #[test]
@@ -300,7 +300,7 @@ fn receivers_forgotten_together_are_forgotten_as_one_by_one() {
     assert_eq!(together.bytes(), one_by_one.bytes());
 }
 
-/// Sweep 5, N2: receivers forgotten bin by bin, each bin charged before it is built and handed
+/// Receivers forgotten bin by bin, each bin charged before it is built and handed
 /// back before the next is asked for, so the re-sealing never holds more than one bin beyond the
 /// sealed bins, and that one charged. A budget of one bin's cost re-seals them all, to the bins
 /// forgetting them at once makes; a budget below a bin's cost builds nothing for it and names it,
@@ -556,12 +556,12 @@ fn a_bin_sealed_within_its_room_refuses_the_busiest_receivers_whole_whatever_the
     assert_eq!((all, none), (unbounded, 0));
 }
 
-/// Sweep 5, H-b: a holder sized for its receivers seals every bin of theirs within what it
+/// A holder sized for its receivers seals every bin of theirs within what it
 /// reserved, and never refuses one whole, however busy: thinning holds each receiver to the kept
 /// ceiling in every bin (`KEPT_PER_RECEIVER_BIN`), its lowest-hash replies kept, and the
 /// reservation is that ceiling. Before, the reservation was the mean and nothing bounded one
 /// receiver: the receiver with the most records, the best placed, was refused whole. The bin is
-/// filled (sweep 6, F13): every receiver hears beyond the ceiling, the busiest three times it, so
+/// filled: every receiver hears beyond the ceiling, the busiest three times it, so
 /// the bin holds the ceiling of every receiver, what the reservation was sized for, and it fits.
 #[test]
 fn a_holder_sized_for_its_receivers_never_refuses_a_busy_one_whole() -> Result<(), String> {
@@ -617,7 +617,7 @@ fn a_holder_sized_for_its_receivers_never_refuses_a_busy_one_whole() -> Result<(
     Ok(())
 }
 
-/// Sweep 5, N6: on a gate of one permit (which can spare none for provisional work), a seal lets
+/// On a gate of one permit (which can spare none for provisional work), a seal lets
 /// a waiting provisional step in between two items of its own passes, here on the one thread it
 /// is given, where nothing lends the permit: the provisional work runs before the seal ends, not
 /// after it.
@@ -773,13 +773,13 @@ fn a_bin_far_ahead_of_its_batchs_stamp_is_refused_and_counted() -> Result<(), St
     )?;
     assert_eq!(open.add_decoded(&near).new, 5);
     // A batch is judged by its own stamp on every way in, however late it is taken (one that
-    // waited for its receiver's description too, sweep 4, R-P5): there is no way in that takes a
+    // waited for its receiver's description too): there is no way in that takes a
     // later stamp in its place.
     let early = stamped(&honest, 1, content(stamp + 6_000, &replies(3, 10)), stamp)?;
     assert_eq!(open.add_decoded_taking(&early, &mut |_| true).ahead, 3);
     // A holder that decides lateness by what it took (one engine holding its own raw, the
     // reference drive) refuses the same raw ahead of its stamp: whether a bin too far ahead opens
-    // never depends on how the holder was built (sweep 3, N9). Every way in takes a stamp.
+    // never depends on how the holder was built. Every way in takes a stamp.
     let far_content = content(stamp + 60_000, &replies(4, 0));
     let far = stamped(&liar, 9, far_content.clone(), stamp)?;
     let mut in_line = Open::new(Limits::UNBOUNDED);
@@ -895,7 +895,7 @@ fn open_raw_asks_for_every_byte_before_it_holds_it() -> Result<(), String> {
     Ok(())
 }
 
-/// Sweep 6, N6: on a gate of one permit a provisional step waits one item of background work at
+/// On a gate of one permit a provisional step waits one item of background work at
 /// most, so every pass of a seal and a reseal checkpoints at least once per
 /// `ITEMS_PER_CHECKPOINT` of its items: here a bin's raw opened again without receivers, and the
 /// sorts of a seal (every receiver's slot, every message by hash). Before, neither had a
@@ -932,12 +932,12 @@ fn a_reseal_and_a_seals_sorts_checkpoint_between_their_items() {
     );
 }
 
-/// Sweep 5 and 6, R6: forgetting receivers tests each record against a mask of the bin's
+/// Forgetting receivers tests each record against a mask of the bin's
 /// receivers by index, one lookup a record however many leave. Searched per record instead, a
 /// list of the leaving was quadratic: forgetting thousands of receivers at once cost thousands of
-/// key comparisons a record. Held by the work's ratio, not by a clock's absolute: opening a bin's
-/// raw again without half of its 2,000 receivers costs no more than without a single one (a pass
-/// over its records either way), where the search per record took tens of times as long.
+/// key comparisons a record. Held by the work counted, not by a clock: opening a bin's raw
+/// again without half of its 2,000 receivers visits the records as many times as without a single
+/// one (a pass over them either way).
 #[test]
 fn forgetting_many_receivers_at_once_costs_a_lookup_a_record() {
     const RECEIVERS: u32 = 2_000;
@@ -956,22 +956,28 @@ fn forgetting_many_receivers_at_once_costs_a_lookup_a_record() {
     let bin = Bin::seal_from(0, fragments, 1);
     assert_eq!(bin.records.len(), RECEIVERS as usize * 100);
     let leaving: Vec<PublicKey> = keys.iter().step_by(2).copied().collect();
-    let timed = |gone: &[PublicKey]| {
-        let mut best = std::time::Duration::MAX;
-        for _ in 0..3 {
-            let round = std::time::Instant::now();
-            let skip = bin.mask(gone);
-            let fragment = bin.reopen_without(&skip);
-            std::hint::black_box(fragment);
-            best = best.min(round.elapsed());
-        }
-        best
+    // The work is counted, not timed: a pass over a bin's records checkpoints once an
+    // `ITEMS_PER_CHECKPOINT` of its records, so the checkpoints passed are the records visited.
+    let visits = |gone: &[PublicKey]| {
+        let skip = bin.mask(gone);
+        let before = crate::gate::checkpoints_here();
+        let fragment = bin.reopen_without(&skip);
+        let passed = crate::gate::checkpoints_here() - before;
+        std::hint::black_box(fragment);
+        passed
     };
-    let one = timed(&leaving[..1]);
-    let half = timed(&leaving);
+    let one = visits(&leaving[..1]);
+    let half = visits(&leaving);
+    let pass = (bin.records.len() / ITEMS_PER_CHECKPOINT) as u64;
     assert!(
-        half < one * 3,
-        "without {} receivers {half:?}, without one {one:?}",
+        one >= pass,
+        "one receiver leaving: {one} checkpoints over {} records",
+        bin.records.len()
+    );
+    assert_eq!(
+        half,
+        one,
+        "without {} receivers {half} checkpoints, without one {one}: a pass over the records either way",
         leaving.len()
     );
 }

@@ -93,7 +93,7 @@ struct Intake {
 
 /// Every receiver's standing as this relay reads the records it forwards.
 ///
-/// A stage of its own (sweep 6). Taking a record in and settling cost the book's work for every
+/// A stage of its own. Taking a record in and settling cost the book's work for every
 /// solution (decoding each record, weighing each transmission against the sealed raw): some ten
 /// seconds of a core for one window step's solutions at 2,000 feeders. Done where a record was
 /// published, that was the timed duties' thread, then on the async runtime: the duties stood still
@@ -456,7 +456,7 @@ mod tests {
     use super::*;
     use tally_wire::Identity;
 
-    /// Sweep 6: what standing is handed returns at once, whatever its thread is doing with the book
+    /// What standing is handed returns at once, whatever its thread is doing with the book
     /// (here, the book held for the whole test), and is taken in by that thread; past its intake's
     /// bytes, refused and counted. Before, a record was taken in on the thread that handed it, under
     /// the book's lock: a window step's solutions held the relay's timed duties ten seconds.

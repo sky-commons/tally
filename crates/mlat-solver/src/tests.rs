@@ -1748,7 +1748,7 @@ fn a_free_running_gauge_30_ppm_fast_is_measured_and_covers_as_a_gnss_gauge() -> 
     Ok(())
 }
 
-/// Sweep 6, H-d: under a free-running gauge, a solution's Unix transmit time (the model's origin
+/// Under a free-running gauge, a solution's Unix transmit time (the model's origin
 /// plus its model time) is the transmission's own, to within tens of milliseconds. The origin was the
 /// anchor batch's wall clock, signed when the batch closed (in the simulator, at the next whole
 /// second), so every transmission was dated late by however long that batch had been open: up to
@@ -1827,7 +1827,7 @@ fn busiest_inputs(seed: u64) -> Result<(Simulation, Inputs)> {
     Ok((simulation, inputs))
 }
 
-/// Sweep 6, F8: a sync message whose bytes were sent twice, 2.87 s apart (an aircraft repeating
+/// A sync message whose bytes were sent twice, 2.87 s apart (an aircraft repeating
 /// a position byte for byte), and that some of its hearers heard the one time and some the other:
 /// its event mixes receptions seconds apart, and nothing in the bytes tells them apart. A fifth of
 /// a tile's position messages so mixed, the fit still fits, the events dropping out by the robust
@@ -1879,7 +1879,7 @@ fn a_fit_whose_events_mix_two_copies_of_their_bytes_drops_them_and_fits() -> Res
     Ok(())
 }
 
-/// Sweep 6, F8: a sync message one receiver heard twice in a window (here a repeat of its bytes
+/// A sync message one receiver heard twice in a window (here a repeat of its bytes
 /// 2.87 s later, in the next bin or the same, as the window's held bins show it) is no event of
 /// any tile: the window rejects it whole,
 /// judged over every receiver's records before any tile thins. Before, a tile kept the first of a
@@ -2442,8 +2442,7 @@ mod provisional;
 /// built by workers holding the gate's permits, and they finish. Before, the messages some
 /// receiver heard twice (`WindowIndex::repeated`) were found lazily by the first worker to build
 /// inputs while the others waited on it holding their permits; its checkpoints gave its own permit
-/// to the provisional thread, and it waited for one the waiting workers held, for ever (sweep 6:
-/// a relay's window steps stopped for good). The pass is given a minute; it takes well under one.
+/// to the provisional thread, and it waited for one the waiting workers held, for ever (a relay's window steps stopped for good). The pass is given a minute; it takes well under one.
 #[test]
 fn an_inputs_pass_on_a_contended_gate_finishes() -> Result {
     use crate::gate::{self, Gate, Urgency};

@@ -74,7 +74,7 @@ Measured on main (tally-load, commit b3e3571809 on branch tally-load):
    a network blip at the ceiling every reconnect was turned away for want of room for its
    allowance until the old carves drained, and a peer reconnecting in a loop could force it.
 
-   As built: a connection's records are paced as well as its bytes (`ingest::RecordPace`, R-N12).
+   As built: a connection's records are paced as well as its bytes (`ingest::RecordPace`).
    A record costs an ingest worker a strict verification whatever its size, so the allowance in
    bytes bounds how many records wait at once (`RECORDS_IN_FLIGHT`) but not how many a second: a
    feeder sending tiny batches within its 256 KiB/s was some 870 verifications a second, and a few
@@ -245,7 +245,7 @@ Measured on main (tally-load, commit b3e3571809 on branch tally-load):
    `mlat_host::kept_by_stamps`) are never charged against a seal: a seal's room is the `Held` store
    and the engine's bound less the bins the stamps keep (`Host::room`), and the floor's bins live in
    the room those leave, yielding it to them oldest first, counted (`waiting_bins_forgotten`), when a
-   seal or a forget's re-sealing needs it (sweep 6, N1/F7). Before, the room was the store less every
+   seal or a forget's re-sealing needs it. Before, the room was the store less every
    sealed bin, the floor's included, so a relay whose window steps ran long sealed receivers out of
    bins a relay keeping up held, and the room passed the `SEALED_BINS_HELD` (25) the store reserves.
    What a seal refuses is counted when it finishes,
@@ -289,13 +289,13 @@ Measured on main (tally-load, commit b3e3571809 on branch tally-load):
    `INTERVALS_HELD` (3) step intervals of a feeder's decoded batches and notes at `NOTES_HEADROOM`
    (four times) the planned rate, each interval bounded by its share of the store so a host that
    sheds nothing never fills it, and its open raw over the settle, the seals a planned host may fall
-   behind (`mlat_host::SEALS_BEHIND`, 4 steps of 1 s, a bound of its own: sweep 6, F10, before, one
+   behind (`mlat_host::SEALS_BEHIND`, 4 steps of 1 s, a bound of its own: before, one
    `STEPS_BEHIND` was both it and the window steps' bound above, though a window step is 40 s and a
    seal's step 1 s) and `AHEAD_MS` (`OPEN_MS`, 7 s, and 1 s ahead). A seal is never shed, so a host
    further behind holds its taken raw in `Store::Open`, and past the store the shards refuse new raw,
    whole and counted, the store never past its limit.
 
-   **A panic in hosted MLAT (decided 2026-10-09, sweep 5, N7).** It ends the relay, as a panic in
+   **A panic in hosted MLAT (decided 2026-10-09).** It ends the relay, as a panic in
    any other part does (`abort_on_any_panic`), not isolated and restarted: MLAT's state (the sealed
    bins standing reads, the address shards, the steps in hand) is shared with the rest of the
    relay through locks and charges a panic would leave poisoned or held, and a part restarted
@@ -306,7 +306,7 @@ Measured on main (tally-load, commit b3e3571809 on branch tally-load):
    (`gate::on_threads` re-raises it on the runner, never swallows it). Before, a runner's panic left
    no report, and MLAT stalled for good, silently. `mlat_host`'s tests hold each place a panic can
    start: a seal's runner, a gate worker inside a provisional step's pass, and the engine's thread
-   applying a window step (each a child process that must end by `SIGABRT`; sweep 6, F13).
+   applying a window step (each a child process that must end by `SIGABRT`).
 
    Measured at 20,000 feeders before the pool: the single sealer thread held a whole core and fell
    behind (deriving the regional batches' ADS-B fixes was 70% of it, `to_observation` 20%, signing
@@ -552,8 +552,8 @@ Measured on main (tally-load, commit b3e3571809 on branch tally-load):
    absorb), and the covers count each decode once however many stores hold it
    (`budget::Covered`), so the comparison is exact to the batch: one decode held where no gauge
    sees it shows, and the flood test leaks exactly one in the middle of a flood to prove it. A
-   sample sees only its instant, so every hand-off is judged as it is made too (`Covered::lapses`,
-   N14 of sweep 6): a cover let go or lessened while its decode lives, leaving it covered for less
+   sample sees only its instant, so every hand-off is judged as it is made too (`Covered::lapses`):
+   a cover let go or lessened while its decode lives, leaving it covered for less
    than its footprint, and a decode let go that no charge ever covered, are each counted there and
    then, and the flood test holds both at zero over the flood (and shows each counted once when made
    between two samples). Before, it sampled every 20 ms, and a holder that kept a decode uncharged
@@ -622,32 +622,89 @@ Measured on main (tally-load, commit b3e3571809 on branch tally-load):
     network group, §5), so it costs an admitted feeder, not a free key. Under overload the
     receivers solved are cut by the same rank, published by stamp: a window step that runs past
     `mlat_host::WINDOW_BUDGET_MS` (the ripening, 15 s, less three steps; 12 s) makes the host
-    decide a `Cut` (at most half its seats, aimed at three quarters of the budget), effective
-    `CUT_LEAD_STEPS` (5) past its watermark, which `MlatHost::take_cuts` hands the relay to publish
-    to the relays holding the area and `MlatHost::offer_cut` takes from them. The seats at a step
-    are the least any origin's newest cut at or before it asks for, applied at the step with its
-    descriptions (`Seats::set_cap`), so relays offered the same cuts solve the same receivers from
-    the same step and make byte-identical products (`staged_mlat`: the two cut tests). The
-    receivers cut stay described, waiting, and a host that cut lifts its cut when its window steps
-    run in half the budget. A cut offered after its step was applied takes effect at the next and
-    is counted (`cuts_late`).
+    decide a cut aimed at three quarters of the budget (at most half its solved receivers).
+
+    *The cut is a rank threshold, keyed by area* (decided 2026-10-10; before, a count of seats,
+    which relays with different described sets or seat limits applied to different receivers). It
+    says: in these areas, solve only the receivers whose rank draw (`tally_mlat::intake::draw`, the
+    public hash above) is below `below`, from the step `from_ms`. The host takes `below` from the
+    draw of the first receiver it cuts, so every relay holding the area solves exactly the
+    receivers ranked below it, whatever it has described, in whatever order, and however many seats
+    it has (`Seats::set_cutoffs`; `intake`'s `a_rank_threshold_leaves_the_same_receivers_on_every_relay`).
+    A relay with more seats and no cut of its own solves the same receivers as the one that cut. The
+    best ranked `MIN_CUT_SEATS` (8) are never cut, so one signer cannot stop a relay's MLAT, and a
+    cut asks for fewer receivers in its areas only: a receiver outside them is untouched.
+
+    *It stands for a time and is announced again.* A cut stands `CUT_TTL_STEPS` (40) steps from
+    the step it names and its signer announces it again every `CUT_REFRESH_STEPS` (10) while it
+    stands, each announcement `CUT_LEAD_STEPS` (5) past the watermark. The cut in force at a step is,
+    per area, the least threshold of each origin's newest announcement at or before the step that
+    has not expired (`mlat_host::Cuts::cutoffs_at`), applied at the step with the descriptions
+    (`Seats::set_cutoffs`). So a relay that was down, or whose link was, learns a standing cut at
+    the next announcement; a cut whose signer stopped announcing, or died, expires by the stamps
+    alone; and a lifting announcement (`below` of `u128::MAX`) takes effect at its step. An
+    announcement that arrives after its step keeps its stamp, and so its end: it takes effect at the
+    next step and is counted (`cuts_late`), and the relays agree again from the next announcement,
+    where before a late cut moved to the step after it arrived and disagreed with every relay
+    that had it on time. Tests: `mlat_host`'s `a_cut_stands_from_its_step_and_expires_unless_announced_again`
+    and `a_late_cut_keeps_its_stamp`.
+
+    *Who may cut an area, and what a cut may say.* A cut is accepted (`Network::take_cut`) only if it
+    verifies, is signed by the relay that sent it, and only for the areas its signer solves by its
+    verified offers (`selection::areas_solved_by`: the first `MLAT_RELAYS_PER_AREA` (3) of the
+    weighted rendezvous ranking of the offers covering the area): a relay that offers the raw but
+    ranks outside the three, one that signs for another's key, and a cut naming an area its signer
+    does not solve are refused and counted (`cuts_refused`) and change nothing
+    (`network`'s `only_an_areas_own_mlat_relays_may_cut_it_and_only_that_area`). Before, a cut was
+    accepted from any relay the host took raw from for any of its areas, applied to all of them with
+    no end, so one hostile relay could hold a victim's MLAT at its floor for good. What is left
+    to a signer among an area's three relays is bounded: the floor above, the expiry, and a stamp
+    that must be on the step grid, no later than `MAX_CUT_FROM_MS` (checked in
+    `MlatCutContent::check` and again with checked arithmetic where it is applied), unexpired and
+    within `CUT_AHEAD_MS` (one lifetime) of the watermark (`Cuts::offer`; `u64::MAX` used to
+    overflow the rounding). The table of cuts is bounded (64 origins, 256 areas an origin, 8
+    announcements ahead an area) and when it is full keeps the origins of the best rank and the
+    lowest areas, never the first to arrive, so a flood of keys cannot fill it ahead of the
+    area's relays (`the_origins_kept_are_the_best_ranked_whatever_order_they_came_in`).
+
+    *The seats of one place are shared.* The rank is public, so a grinder with many connections from
+    one place could take every seat its keys outrank. At most `SEATS_PER_CELL` (8) receivers of one
+    declared cell (`SEAT_CELL_RESOLUTION` 6, about 36 km²) hold a seat, the best ranked of them; the
+    rest stay described, waiting, and their raw still flows. The cell, not the network group, is
+    what the share is read from: a connection's network group is a fact only the relay holding the
+    connection has, so two relays could not agree on a seat decided by it, where a receiver's signed
+    place is the same everywhere (`many_receivers_at_one_place_hold_no_more_than_a_cells_share`).
+    Seating by credit is local to a relay for the same reason and is not used.
+
+    *The sheds beneath the cut.* Four sheds remain that are decided by how far behind a host is,
+    not by the stamps: a window step past `WINDOW_STEPS_BEHIND`, a provisional step past
+    `PROVISIONAL_BEHIND` or whose models are late, and the raw a full `Open` or `Held` store refuses
+    (`observations_refused`). Each is a bound on what MLAT holds, not the policy. They cannot be
+    decided by the stamps: a host that is behind has not yet reached the stamp that would decide, so
+    waiting for it is the unbounded growth the bound exists to stop. Their consequence for
+    determinism is bounded and counted: two relays holding one area that shed differently make
+    different provisional positions for the steps shed (a shed window step's windows are solved by
+    the next, as one that ran late would), never a different position for a step both ran. A
+    host within its plan sheds nothing, and the cut is what keeps an overloaded one within it.
 
     **The cut travels as a signed record** (`MlatCut`, kind 0x24, `tally_wire::cut`): the relay's
-    signature over the step it takes effect from (`from_ms`) and the seats it asks for. No existing
+    signature over the step it takes effect from (`from_ms`), the rank threshold (`below`) and the
+    areas it is for (at most `MAX_CUT_AREAS`, cells no finer than an area, strictly ascending; a
+    signer with more announces more records). No existing
     record fits (a group's records carry an area's data, and a group stripes them across its
     members), so it has a kind of its own, non-critical like every kind since version 2: a relay
     that predates it skips it whole (RFC-0171 §3.4) and applies no cut, which is the overload
-    behaviour it always had. `Network::tick` takes the hosted MLAT's decided cuts
+    behaviour it always had. The kind is new in this version, so its shape changed freely before
+    release. `Network::tick` takes the hosted MLAT's decided and refreshed cuts
     (`MlatHost::take_cuts`), signs each and addresses it, by the path sharing already uses for what
     it sends one member (`Sharing::address`, the outbox `Network::carry` sends down each member
     link), to every relay that offers the raw of an area this relay solves
-    (`Selection::raw_sources`). A relay that gets one (`Network::handle`) offers it to its host
-    (`MlatHost::offer_cut`) only if it verifies, is signed by the relay that sent it, and that relay
-    is one of its own raw sources; else it is refused and counted (`cuts_refused`), so a relay that
-    holds none of an area cannot cut its solving. `staged_mlat`'s
+    (`Selection::raw_sources`). A relay that gets one (`Network::handle`) offers the areas of it that
+    its signer solves to its host (`MlatHost::offer_cut`). `staged_mlat`'s
     `an_overloaded_relays_cut_reaches_the_relay_holding_its_area_and_both_make_the_same_bytes`
-    holds it: relay A, overloaded, signs the cut it decided, relay B takes it through
-    `Network::handle` and, though it never ran long, makes the same bytes as A.
+    holds it: relay A, overloaded, signs the cut it decided and its refreshes, relay B takes them
+    through `Network::handle` as they come due and, though it never ran long, makes the same bytes
+    as A.
 
     **Grinding, and what bounds it.** The rank that seats and cuts receivers is a public hash of the
     receiver's key under one seed, so every relay agrees without talking; the cost is that a key can
@@ -718,7 +775,7 @@ Measured on main (tally-load, commit b3e3571809 on branch tally-load):
     the ingest threads for it, and `check` prints `feeder-records`. The same records may instead be
     answered on the async runtime (an echo's reply signed, a delivery query's answered, a fault
     proof's two records verified), so the runtime is planned for every one of them beside a
-    feeder's session (`cores::RUNTIME_NANOS_PER_RECORD`, 60 us, R4 of sweep 5), and the cores hold
+    feeder's session (`cores::RUNTIME_NANOS_PER_RECORD`, 60 us), and the cores hold
     each source's records once, at the dearer of the two (`cores::spent_per_feeder`): one pace holds
     them all, so a record is taken by one or the other, never both. Before, the runtime was planned
     for a feeder's session alone (83 us of a core a second), while its eight records a second
@@ -755,7 +812,7 @@ Measured on main (tally-load, commit b3e3571809 on branch tally-load):
     second at 17 bytes each within 256 KiB/s: one connection could cost the stages 25 planned
     feeders'.
 
-    **Every session's records are paced by its role, and planned (R4 of sweep 5).** A record costs
+    **Every session's records are paced by its role, and planned.** A record costs
     the relay a signature checked or made whatever its bytes (`cores::RUNTIME_NANOS_PER_RECORD`, 60
     us), so each role's records are paced at what that role legitimately sends (`ingest`'s
     `RolePace`s, each with its reason; `link::Paces` picks the pace of what the sender is when each
@@ -785,6 +842,17 @@ Measured on main (tally-load, commit b3e3571809 on branch tally-load):
     rate on its own, and none of it was planned: the 2,048 connections the cap allows could send
     16,384 records a second, about a core the plan never held, and an evidence bundle's signatures
     were one token.
+
+    **Strangers are rationed twice.** A delivery query from a key that never fed the relay (a key
+    costs nothing to make) is answered from its network group's allowance (`PROBER_QUERIES`, four at
+    once and one more a second, `delivery::Strangers`), and from one allowance all strangers
+    together share (`STRANGER_BURST`, 128 at once and one more each `STRANGER_EVERY_MS`, 10 ms, so
+    100 a second). Each group is bounded alone, but a botnet holds 4,096 groups
+    (`STRANGER_GROUPS`) of four, 16,384 queries at once, each a signature check and a sealed answer
+    on the async runtime; the relay-wide allowance bounds what strangers can cost the relay however
+    many networks they ask from, and a query it refuses spends nothing of its group's. A feeder's
+    own queries are charged to its own allowance, never to the strangers'.
+    `delivery::tests::strangers_together_are_answered_a_relay_wide_rate` holds it.
 
     **MLAT in the cores (decided 2026-10-09).** A relay that hosts MLAT plans its engine in the same
     cores. The stages keep their half-busy share for raw; MLAT's steps get what is left. Each
@@ -909,10 +977,48 @@ threads, MLAT's seats and `tally-relay check` all read its `Admission`):
    routes all of it to loopback; 256 network groups, `--feeder-networks many`, the default on
    loopback), so a run measures honest feeders; before, all of them came from 127.0.0.1, one group
    and one share. `--feeder-networks one` puts them all in one group: the Sybil case.
+
+   *How a batch is judged* (decided 2026-10-10). A batch is judged on what its unit has attempted
+   and been admitted including the batch itself, so a unit's first batch, or its only one in a
+   long while (a unit idle for a window starts again), counts as the rate it would make; before, it
+   was judged on the use before it, a newcomer had none, and thousands of groups each sending one
+   large batch an interval drained the bucket and got honest units cut for `RelayRate`. The order
+   at the hub is: the record is checked for being new (`Forwarded::is_new`, remembering nothing),
+   then judged and charged, then the receiver's pace, and only a batch kept is remembered
+   (`Forwarded::admit`). A copy of a batch the relay already holds is neither judged nor charged (a
+   reconnecting feeder resending its backlog spends its share once), and a batch dropped for load
+   is no batch seen, so a member's copy of it is still new: relays holding one area end with the
+   same batches whichever one a feeder's pace happened to cut. A cut for the receiver's own pace
+   gives back everything the judgement took, the tokens and the unit's attempted and admitted.
+   Every unit weighs one: corroboration is a yes or a no (the relay holds no finer measure of a
+   receiver's credit), a corroborated receiver is a proven separate receiver and is worth what a
+   group is, and a weight above one would hand a key more than the groups of honest feeders it
+   competes with.
+   The units tracked are a store (`Store::Shed`, `shed::BYTES_PER_UNIT` 256 B each, two units a
+   connection, `UNITS_PER_CONNECTION`), so the table the relay keeps of senders is counted like
+   every other, and past its room every further unit shares one (`Unit::Overflow`): a flood of
+   new groups or keys neither grows the table nor is judged as far over. The water level is found
+   incrementally (`TABLES` 64 tables of units, two scanned with each judgement, a histogram of
+   wants rather than a sort), so no judgement and no worker waits on a walk of all the units, and
+   a unit is forgotten after `RETAIN_MS` (four windows) of silence.
+   *The members share their pace.* Sharing members' batches are paced by bytes and by receptions
+   (`ingest::MemberPace`): each session waits first for its own share of each (the rate over the
+   sessions using it now, max-min) and then for the total, so one member sending large batches
+   cannot take the pace from the rest, and a member's batches of many small receptions cannot
+   bring in more receptions than the plan holds (`feeders_for_rate` feeders' worth).
 5. **Waiting is fair** (`Gauge::charge_for`): a gauge serves its waiters in turn by source, deficit
    round robin with a quantum of `DRR_QUANTUM` (a planned batch's charge), instead of waking all and
    letting the race winner take the room. A newcomer queues while anyone waits, and a waiter that
-   gives up blocks no one.
+   gives up blocks no one. The source is the connection's network group for a feeder or any other
+   dialler (`ingest::network_source`, the unit the ingest rate is shared by, so a hundred
+   connections from one block of addresses are one turn, not a hundred), a member session's own
+   (`ingest::member_source`) for a sharing member, and `ingest::RELAY_SOURCE` for the relay's own
+   work; every `Gauge::charge_for` in the relay passes one (`Hub::allowance`,
+   `Hub::connection_buffers`, `ingest::Allowance::acquire`). `flood`'s
+   `the_oversize_room_is_shared_by_network_not_by_connection` holds it through the hub: four
+   connections of one network and twenty-four of another each ask for the oversize room over and
+   over, and the four are served about as often as the twenty-four (in turn, half of the room;
+   served first come first served, four in twenty-eight).
 6. **MLAT seats are their own pool, planned from what the connections leave.** Connections are
    planned first, at their floor and the windows of their mean rate, against the memory and the
    cores that remain after MLAT's share (`cores::MLAT_SHARE_PERCENT`, a quarter of each, kept
@@ -950,16 +1056,16 @@ relay's caps; output of the test, not prose):
 
 | Line                              | Without MLAT | Hosting MLAT |
 | --------------------------------- | ------------ | ------------ |
-| floor (a connection)              | 478,451      | 478,451      |
-| per-connection (floor + mean rate)| 1,390,174    | 1,390,174    |
+| floor (a connection)              | 478,963      | 478,963      |
+| per-connection (floor + mean rate)| 1,390,686    | 1,390,686    |
 | per-seat                          | 0            | 3,473,416    |
 | connection-limit                  | 17,324       | 9,416        |
-| connections-by-memory / by-cores  | 21,597 / 17,324 | 15,953 / 9,416 |
+| connections-by-memory / by-cores  | 21,589 / 17,324 | 15,947 / 9,416 |
 | connection-limit-bound            | cores        | cores        |
 | max-receptions-per-sec (`R_max`)  | 10,394,482   | 5,649,819    |
 | max-bytes-per-sec                 | 141,919,327  | 77,138,862   |
 | max-records-per-sec               | 34,648       | 18,832       |
-| rate-by-memory / by-cores         | 14,304,277 / 10,394,482 | 8,486,559 / 5,649,819 |
+| rate-by-memory / by-cores         | 14,298,396 / 10,394,482 | 8,483,343 / 5,649,819 |
 | feeders-at-mean / at-ceiling      | 17,324 / 3,464 | 9,416 / 1,883 |
 | mlat-seats (bound)                | 0            | 3,504 (cores) |
 | ingest / message / seal threads   | 5 / 5 / 4    | 4 / 3 / 4 (and 5 MLAT) |
@@ -971,7 +1077,7 @@ rest being MLAT's share, so they are fewer, bound by cores here; the seats are w
 connections leave, 3,504 of 9,416.)
 
 The 32 GB relay without MLAT is bound by its 16 cores at 17,324 connections, not by its memory
-(21,597). The 20,000 feeders the RFC sizes for need 19 cores at these figures (`check --cores 19`
+(21,589). The 20,000 feeders the RFC sizes for need 19 cores at these figures (`check --cores 19`
 admits 20,781), or the stages' costs measured lower; "feeders at the ceiling" is `R_max` over what one source is held to
 (`ingest::SOURCE_RECEPTIONS_PER_SEC`), what the relay carries if every feeder sends at its pace.
 Ten cores and 24 GB with the harness's two areas are `tests/cores-10.txt`, held equal to what the
@@ -1108,6 +1214,58 @@ lesser of a quarter of the plan and `ALLOCATOR_CAP_BYTES`, eight arenas of 320 M
 Setting the mmap threshold (128 KiB, 64 KiB with a 256 KiB trim threshold) did not reduce it:
 resident was 7.05 and 7.10 GiB against 6.7 to 6.8 GiB for the same run unchanged.
 
+**The allocator's retention is bounded, not measured once** (2026-10-10). Capping the arenas bounds
+how many hold free pages, not how much each keeps: `ARENA_RETENTION_BYTES` was one workload's
+reading, and a load that frees more in the middle of an arena would keep more, with nothing to
+return it. The relay now bounds it three ways, none on a hot path. `bound_the_allocator` fixes
+`M_MMAP_THRESHOLD` (4 MiB, so glibc does not raise it as large blocks are freed) and
+`M_TRIM_THRESHOLD` (16 MiB: an arena's free top beyond it is returned by the free that made it),
+before any thread starts; and `spawn_allocator_trimmer` starts one thread, at the lowest priority,
+that calls `malloc_trim(0)` every `TRIM_PERIOD` (5 s), which returns the free pages inside the arenas
+that the thresholds cannot reach. Nothing waits for it and no stage calls it (the engine's
+`malloc_trim` after each window step, above, stood every stage in line for seconds). A trim holds one
+arena's lock while it walks it: the slowest of 40 trims in a run was 69 to 117 ms hosting MLAT and 36
+ms without, served on `GET /memory` (`allocator.trims`, `trim_max_us`, `trim_last_us`), so the bound
+on what a stage can wait on an allocation because of it is read off the relay, not assumed.
+`budget::tests::the_trimmer_returns_the_arenas_free_pages` holds it: eight threads fill their arenas
+with 512 MiB of 4 KiB blocks and free seven in eight, and the process comes back to half its peak or
+less within 10 s; without the trimmer it stays at its peak (526 MiB of 525).
+
+Measured (2026-10-10, `infra/tally/memory-bed.sh`: the relay on `taskset -c 0-15`, the harness on
+16-31, a watchdog stopping only the harness if `MemAvailable` fell under 10 GB; `--relay-fit`, so
+`--memory` is what the feeders need; 60 s ramp, 30 s warm-up, 120 s measured; the relay hosting MLAT
+takes the two cluster cells and advertises itself, `--streams raw,dedup,provisional`, or it solves
+nothing and holds 400 MiB). The harness fails a run where resident memory passes the most the base
+and stores were charged and their headroom, or the budget and its headroom, or where more than a
+tenth of its reads of the charges failed (a run that could not read them has not checked):
+
+| 2,000 feeders hosting MLAT | Resident at the end | Peak | Worst margin to the bound | Raw p99 |
+| -------------------------- | ------------------- | ---- | ------------------------- | ------- |
+| glibc, eight arenas (before), four runs | 4,051 to 4,465 MiB | 4,296 to 4,619 MiB | 95 MiB over; 194, 178 inside | 28, 27, 253, 32 ms |
+| thresholds and trimmer, six runs | 2,724 to 3,243 MiB | 3,982 to 5,001 MiB | 374 or more inside | 33, 31, 30, 33, 32, 31 ms |
+| thresholds only, two runs | 3,511; 3,704 MiB | 3,801; 4,187 MiB | 345 inside (one run) | 26, 28 ms |
+| trimmer only, two runs | 3,300; 3,203 MiB | 4,036; 4,915 MiB | 1 run 64 MiB over | 30, 29 ms |
+
+Steady-state resident is about 1.1 GB lower with both. The peak is not: a transient (a window step's
+working set) is live, not retained, and no trim returns it; it is the headroom's to hold, and the
+old build's run and the trimmer-only build's run that passed the bound, by 95 and 64 MiB, are the
+reason it is checked at every sample. Raw p99 is within the run to run spread of the old build (27 to
+32 ms, and one 253 ms run with a window step in the measured window, as above); p50 is 1 ms in all.
+8,000 feeders without MLAT: 840 MiB resident at the end, 869 MiB peak, trims at most 36 ms, raw p99 3
+ms, against 963 and 973 MiB, 3 ms, before.
+
+The same bed with the admission above (2026-10-10, `memory-bed.sh nomlat`, 8,000 feeders, MLAT off,
+120 s measured): at 550 receptions a second a feeder (4.42 M offered against an `R_max` of 4.8 M)
+nothing was shed and no batch was missing from any sequence, raw p50 1 ms, p99 3 ms, p99.9 6 ms,
+857 MiB resident at the end and 866 MiB at the peak against 1,213 MiB allowed (the stores' charge
+and their headroom), trims at most 26 ms. At the default 600 (the harness offers 603, 4.82 M, half
+a percent over `R_max`) the shedder cut 73,240 batches, all `over_share`, about 6.6% of the
+batches, and resident was 861 and 889 MiB, raw p99 3 ms: demand over `R_max` is cut by fair share
+as written, and what is cut is several times the excess. The likely cause (not yet shown) is that
+a group's two-second use, 31 feeders, moves by more than the excess does, so a group is cut for a
+surge and another is not credited for a dip. Whether the level should be found over a longer
+window is open.
+
 ## Invariants the tests hold
 1. Thread-count independence: same stamped trace at 1, 2, 8, 32 threads gives byte-identical MLAT
    models, positions, provisionals, world/precise parts, standing, regional record sequence.
@@ -1218,7 +1376,7 @@ resident with 900 MiB live; with `MALLOC_ARENA_MAX=2`, 1,711 MiB).
 As built since: every store is charged before it holds a byte (§9), the steps MLAT may be behind
 are bounded and the oldest shed past them (§4, §10), the engine's own tables that grow with its
 receivers are a store (`Engine`), and after each window step the host handed the allocator's free
-pages back (`malloc_trim`; removed since, "MLAT and the allocator" below). A feeder then (the first sweep) reserved
+pages back (`malloc_trim`; removed since, "MLAT and the allocator" below). A feeder then (2026-10-07) reserved
 2.89 MB where MLAT is hosted (0.67 MB without it): sealed raw 0.75 MB, open raw 0.64 MB, notes
 0.39 MB, the engine's tables 0.45 MB; the base was 280 MiB (`BASE_BYTES`, `MLAT_BASE_BYTES`: 4 MiB and the signed records'
 4 MiB bound). Measured (2026-10-08, the same harness, the relay on cores 0-9, two areas, four MLAT
@@ -1237,7 +1395,7 @@ Four threads on that host did not keep up with the window steps at 500 feeders a
 step took 17 to 60 s), so MLAT shed whole steps, counted, and stayed within its stores; at the
 deployed shape it kept up and shed nothing. 576 MiB then admitted 107 MLAT feeders, not 167.
 
-Since (the second sweep, 2026-10-08), what hosting MLAT reserves a feeder is sealed raw 0.75 MB,
+Since (2026-10-08), what hosting MLAT reserves a feeder is sealed raw 0.75 MB,
 open raw 0.69 MB (the second a bin may open ahead of its stamp), notes 0.73 MB (sized from the
 same four times the planned rate their count is bounded by, over the four intervals a host that
 sheds nothing holds), the batches waiting for a description 0.13 MB (a store of their own) and the
@@ -1269,7 +1427,7 @@ numbering its records, applying them) was 0.144 to 0.164 of a core at 3.02 M rec
 0.144 at 4.61 M: it follows the epochs and the areas, not the receptions, so it bounds no feeder
 count.
 
-**What ten cores carry is the relay's to say, not this document's** (N15 of sweep 5). The connections
+**What ten cores carry is the relay's to say, not this document's**. The connections
 and the rate (`R_max`) the cores admit, the MLAT seats, and each stage's threads follow from the figures above, each record a source may
 send (`cores::Source::records_nanos`, at the dearer of an ingest worker's 30 us and the runtime's
 60 us, `cores::RUNTIME_NANOS_PER_RECORD`: a record answered on the runtime, an echo's reply signed or
@@ -1280,7 +1438,7 @@ for ten cores, the harness's two areas and 24 GB,
 hosting MLAT and not, which the `check` test (`the_cores_figures_the_rfc_quotes_are_the_relays_own`)
 prints and holds equal to what the relay plans, so a figure here can no more drift from the code
 than the file can. A figure of it copied into this document is the drift this file exists to
-prevent, so none is (N15 of sweep 6: this paragraph repeated the file's two feeder counts in its
+prevent, so none is (this paragraph repeated the file's two feeder counts in its
 prose, which nothing checked).
 
 Three runs back to back at 5,000 feeders, MLAT off, on the threads the relay then planned for that
@@ -1325,16 +1483,16 @@ Each run read 2,000 batches and 1.21 M receptions a second with nothing lost; re
 at 4.1 to 4.3 GB. Every provisional step ran. A window step took 9 to 11 s, so the empty steps the
 watermark passed behind it were shed into the next (`steps_shed`, no window lost) and as many
 provisional steps started without its models (`provisional_models_late`, then: the ripening was
-5 s; it is 15 s since, sweep 4). Before, the same 2,000
+5 s; it is 15 s since). Before, the same 2,000
 feeders with MLAT on two threads at the old defaults gave raw a p99 of 220 ms (max 284), and on
 eight 162 ms (max 282).
 
-**MLAT and the allocator** (2026-10-09, sweep 5). With the harness's clocks continuous across its
+**MLAT and the allocator** (2026-10-09). With the harness's clocks continuous across its
 loops (since replaced: `tally-load` now simulates the whole run forward in time as it plays, one
 thread a cluster a few seconds ahead of the feeders, `sim::run_into_in_time_order`, so no reception
 is heard twice; its looped period, played forward then backward, made every message heard again
 `2P - u` into each loop, and near a bin's edge a forward and a backward copy of one message met in
-one MLAT bin and failed the clock fits, sweep 6, F8 and F9), MLAT solved some twelve times what it had, and at 2,000 feeders hosting MLAT raw's p99 rose
+one MLAT bin and failed the clock fits), MLAT solved some twelve times what it had, and at 2,000 feeders hosting MLAT raw's p99 rose
 from 77 ms to 880 ms, a subscriber fell behind, and no stage thread waited on the run queue
 (`/proc/<tid>/schedstat`: every stage under 4% of its run time waiting). The cause was the engine's
 thread calling `malloc_trim(0)` after each window step: glibc walks every arena with that arena's
@@ -1342,8 +1500,9 @@ lock held, returning each free page, so every ingest worker, message thread and 
 allocated in an arena meanwhile waited for it, for seconds after a large step. MLAT ran below the
 stages and its trim stopped them. Holding large blocks to their own mappings instead
 (`M_MMAP_THRESHOLD` fixed at 128 KiB) moved the wait to the address space's lock (each free an
-unmapping by a thread at nice 10) and slowed the window steps by half. Nothing now returns the
-allocator's free pages on MLAT's behalf: it reuses them. Runs (2,000 feeders, MLAT on,
+unmapping by a thread at nice 10) and slowed the window steps by half. Nothing on MLAT's behalf
+returns the allocator's free pages: it reuses them (a thread of its own bounds what the arenas
+keep, "The allocator's retention is bounded" below). Runs (2,000 feeders, MLAT on,
 `--memory 16G`, three minutes measured with provisional positions read; relay on cores 0-9, harness
 on 10-31):
 
@@ -1356,7 +1515,7 @@ on 10-31):
 Resident memory without the trim is what the arenas keep for reuse beside what the stores hold, a
 fifth more at this load and well inside the plan's 16 GB.
 
-That was not bounded, and the headroom said it was (sweep 6, F3): `HEADROOM_BYTES` (64 MiB) was
+That was not bounded, and the headroom said it was: `HEADROOM_BYTES` (64 MiB) was
 documented as covering the allocator's unreturned pages, measured under 10 MiB with the trim in
 place. Measured again (2026-10-09, `tally-load` with the forward simulation below, 2,000 feeders
 hosting MLAT, the relay on cores 0-15 so its cores admit all 2,000, `--memory` what they need,
@@ -1394,14 +1553,14 @@ by 400 and 491 MiB, every run with the arenas capped stays 165 MiB or more insid
 
 Raw's p99 in these runs followed whether a window step fell in the measured window, under every
 allocator, not the allocator: seconds with one, under 200 ms without. The causes, found by stopping
-the relay's threads in the act (2026-10-09, sweep 6 reconcile), and each fixed where it was:
+the relay's threads in the act (2026-10-09), and each fixed where it was:
 
 - *MLAT barely ran.* A window step packed its solutions into records by signing ever shorter
   prefixes of all that was left, from the whole: about twice what was left signed for each record,
   two minutes of one thread for 80,000 solutions, while the provisional steps behind it were shed
   for want of its models. The wire now measures the longest prefix a record holds
   (`Positions::fitting`, the same layout `sign_format` writes) and each record is signed once.
-- *Window steps stopped for good.* The sync messages some receiver heard twice (sweep 6, F8) were
+- *Window steps stopped for good.* The sync messages some receiver heard twice were
   found lazily by the first of a pass's workers to need them, while the others waited on it holding
   their gate permits; its checkpoints gave its own permit to a provisional step and it then waited
   for one the waiting workers held. The window's index finds them as it is made, on the thread making
@@ -1449,7 +1608,7 @@ pool, 75 with it, 31 once the connections' buffers, the oversize room and a feed
 bytes were planned, 27 once every member session its areas bring was, 25 once the batch byte store
 planned the parities it holds beside its records (§6). Its caps were then set to admit 40 at least
 (`relay.yaml`, THE CAPS); 34 once MLAT's sealed raw was reserved at the kept ceiling every receiver
-is held to (`held::KEPT_CEILING_PER_S`, 300 a second) rather than its mean (2026-10-09, sweep 5 H-b),
+is held to (`held::KEPT_CEILING_PER_S`, 300 a second) rather than its mean (2026-10-09),
 so its limit was raised from 640 to 672 MiB, which admits 41 and still fits the node's 1,194 MiB
 beside readsb and the API (`relay.yaml`, THE FIT).
 
@@ -1467,3 +1626,17 @@ deployed args): idle on four cores, 9.2 MiB resident and 0.3% of a core over 60 
 again once its 128 member sessions were planned, on a host at load 60); under
 `tally-load` with 200 feeders offered and 107 admitted, 300 s, 391 MiB at its peak and 0.18 cores
 mean, MLAT shedding nothing. It fits its 672 MiB limit.
+
+**How late a free-running gauge's transmissions are dated** (a bound, not a fix). A free-running
+gauge (12 MHz) has no absolute time, so a clock model's origin is the wall clock of a signed batch
+that carried one of its receptions (`mlat_solver::sync::anchor_wall_ns`). A batch is signed after
+the receptions it carries, so each reception was heard at or before its batch's wall clock, and the
+origin is the least of those bounds over every batch of the gauge the fit cites. What remains is a
+lateness, never an earliness: the origin is late by how long the batch that gave the least bound
+stayed open after the last of the gauge's receptions it carries, plus the gauge's rate error over
+the span, 200 ppm at most. With a few of the gauge's receptions cited a second, some batch's last
+is near its signing, so tens of milliseconds
+(`tests::a_free_running_gauge_dates_transmissions_by_when_they_were_sent`); with one cited reception
+in a window it is that batch's open time, up to a second (the batch interval), which is the
+bound. A GNSS-disciplined gauge has no such lateness: its count is nanoseconds of the UTC day and
+the wall clock only picks the day.

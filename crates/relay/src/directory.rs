@@ -2682,7 +2682,7 @@ mod tests {
         Identity::from_seed(seed).public()
     }
 
-    /// Item 3 of the sweep: a full cap over many cells (a network group's, a key's) gives up the
+    /// A full cap over many cells (a network group's, a key's) gives up the
     /// lowest-ranked offer under it for a newcomer that outranks it, never "full, refused" by
     /// arrival, so the set held is the same whatever order the offers came in.
     #[test]
@@ -2721,7 +2721,7 @@ mod tests {
         Ok(())
     }
 
-    /// Item 3 of the sweep: the directory's own bound (`OFFERS_HELD`) gives up the lowest-ranked
+    /// The directory's own bound (`OFFERS_HELD`) gives up the lowest-ranked
     /// offer anywhere, the same set whatever the order.
     #[test]
     fn the_directorys_bound_keeps_the_same_offers_whatever_the_arrival_order() -> Result {
@@ -2753,7 +2753,7 @@ mod tests {
         Ok(())
     }
 
-    /// Item 4 of the sweep: a peer re-signing changed offers in a loop changes what its readers
+    /// A peer re-signing changed offers in a loop changes what its readers
     /// see at most once per `CHANGED_AT_MOST_EVERY_MS` per (key, cell); the newest change waiting
     /// is held when its turn comes, and a re-signing that changes nothing is held at once.
     #[test]
@@ -3019,7 +3019,7 @@ mod tests {
         keys
     }
 
-    /// Sweep 3, N6: the relay's own offer is held under the group of the address it advertises
+    /// The relay's own offer is held under the group of the address it advertises
     /// and by every cap, as its peers hold it. Its network already holds a group's share of the
     /// cell in peers' offers: the relay holds exactly what a peer that verified the same offers
     /// holds (the top of the ranking of the five, four of them), never its own beside all four.
@@ -3052,7 +3052,7 @@ mod tests {
         Ok(())
     }
 
-    /// R-P3 of sweep 4: a relay advertising a host name signs offers naming the address it
+    /// A relay advertising a host name signs offers naming the address it
     /// resolved to, and holds them under that address's group; a peer that verifies the gossiped
     /// offer by dialling the address it names holds it under the very same group. Neither
     /// resolves anything for the group.
@@ -3124,7 +3124,7 @@ mod tests {
         Ok(())
     }
 
-    /// R-P3 of sweep 4: an offer naming a host name is in no group every relay agrees on (each
+    /// An offer naming a host name is in no group every relay agrees on (each
     /// resolver may answer it differently), so it is not taken: never queued for a dial.
     #[test]
     fn an_offer_naming_a_host_name_is_not_taken() -> Result {
@@ -3140,7 +3140,7 @@ mod tests {
         Ok(())
     }
 
-    /// Sweep 3, N13: a peer re-signing an offer that says nothing new is taken at most once per
+    /// A peer re-signing an offer that says nothing new is taken at most once per
     /// `RESIGNED_AT_MOST_EVERY_MS` by the signed times, never gossiped sooner; and one taken is
     /// swapped in place, so it moves no ranking, version or tier a reader follows.
     #[test]

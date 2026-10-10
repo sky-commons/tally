@@ -170,7 +170,7 @@ const SAMPLE_DOMAIN: &[u8] = b"tally calibration sample";
 /// receiver's bin whole to fit ([`Bin::seal_within`] refuses only beyond the receivers it was
 /// sized for). Reserved at the mean instead, nothing bounded one receiver's share: a holder whose
 /// receivers kept more than the mean filled its sealed bins and then refused, whole, the
-/// receivers with the most records, which are the best placed (sweep 5, H-b, millions of
+/// receivers with the most records, which are the best placed (millions of
 /// observations a run). Twice the mean, because the receivers that keep more than the mean are
 /// those under busy airspace hearing more of the Mode S-only targets thinning keeps (sync is
 /// capped at `SYNC_PER_RECEIVER` a bin whatever the traffic): it doubles what a receiver's sealed
@@ -1084,8 +1084,7 @@ fn on_threads<I: Send, R: Send>(
 
 /// Sorts `items` by `key`, checkpointing every `ITEMS_PER_CHECKPOINT` comparisons: a sort of a
 /// bin's every message or every receiver's slot is one pass, and on a gate of one permit a
-/// provisional step waits a few hundred microseconds of it at most, never the whole sort (sweep 6,
-/// N6). The order is the sort's own, whatever the checkpoints.
+/// provisional step waits a few hundred microseconds of it at most, never the whole sort. The order is the sort's own, whatever the checkpoints.
 fn sort_checkpointed<T, K: Ord>(items: &mut [T], key: impl Fn(&T) -> K) {
     let mut compared = 0usize;
     items.sort_unstable_by(|a, b| {
@@ -1523,7 +1522,7 @@ impl Bin {
 
     /// Which of this bin's receivers (by index) `keys` names: a mask its records are tested against
     /// by index, so a pass over every record costs one lookup a record however many receivers
-    /// leave (sweep 5, R6: a list searched per record was quadratic in the receivers leaving).
+    /// leave (a list searched per record was quadratic in the receivers leaving).
     fn mask(&self, keys: &[PublicKey]) -> Vec<bool> {
         let mut skip = vec![false; self.receivers.len()];
         for key in keys {
@@ -1713,7 +1712,7 @@ impl SealedBins {
 
     /// Each sealed bin that holds any of `receivers`, in ascending order, sealed again without
     /// all of them on up to `threads` threads, one bin at a time, each charged before it is built
-    /// (sweep 5, N2): `charge` is asked for the bytes the bin about to be built may take
+    ///: `charge` is asked for the bytes the bin about to be built may take
     /// ([`SealedBins::cost`] of the bin it replaces: a bin sealed without some of its receivers is
     /// never larger), and what it grants (`G`, a charge its holder lets go of once the new bin is
     /// held in place of the old one and the holder's own charge for its sealed bins is settled) is

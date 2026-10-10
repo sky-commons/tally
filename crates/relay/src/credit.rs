@@ -843,7 +843,7 @@ fn newest_first<T>(mut dated: Vec<(u64, T)>, bytes: impl Fn(&T) -> &[u8]) -> Vec
 ///
 /// Every signature verified inside it is one token of `pace`, the pace the bundle's asker's
 /// records were taken by (`ingest::RecordPace::owe`), owed and paid before that connection's next
-/// record is read (R4 of sweep 5): a bundle is one record on the wire but up to
+/// record is read: a bundle is one record on the wire but up to
 /// `ingest::EVIDENCE_SIGNATURES` and its own verifications, some 3.5 ms of a core, while its record
 /// was planned as one (`cores::RUNTIME_NANOS_PER_RECORD`). Before, a session sending bundles at
 /// its records' pace had the relay verify some 130 times what the cores planned for it. `None`
@@ -1573,7 +1573,7 @@ mod tests {
         Ok(())
     }
 
-    /// R4 of sweep 5: every signature `check` verifies inside a bundle is a token of the pace its
+    /// Every signature `check` verifies inside a bundle is a token of the pace its
     /// asker's records were taken by, owed and paid before that connection's next record: a bundle
     /// of 6 descriptions and 4 receipts on a pace of one a second holds the next record 11 s (its
     /// ten signatures, then its own token).

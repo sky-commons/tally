@@ -401,7 +401,7 @@ fn goodbye(reason: Reason, retry_after_secs: u32) -> Record {
 /// (`sharing::full::Wait`, the rule its `peers::Peers::refused_full` applies to the same
 /// refusal): this relay files no shortfall against it for those windows (RFC-0174 §2.5). It takes
 /// a [`capacity::AtAdmission`], which only `admit_member` makes, so nothing else can excuse a
-/// peer: not the word said, and not a link the upload cap shed (N11), which the peer chooses by
+/// peer: not the word said, and not a link the upload cap shed, which the peer chooses by
 /// what it asks for (a peer flooding queries is the one the cap sheds).
 fn turning_away(hub: &Hub, peer: Peer, key: &PublicKey, refused: &capacity::AtAdmission) {
     if matches!(peer, Peer::Member | Peer::Relay | Peer::Engine(_)) {
@@ -525,7 +525,10 @@ where
 {
     let link = stream.link();
     let mut general = connection.general();
-    let buffers = hub.connection_buffers(false).await;
+    // Whose turn it waits in for room (`ingest::network_source`): its network group's.
+    let waits =
+        crate::ingest::network_source(crate::ingest::group_of(Some(connection.address())), 0);
+    let buffers = hub.connection_buffers(false, waits).await;
     // Every byte the peer sends is counted from the first, the handshake's included, as every
     // byte sent it is (`Socket`).
     let (stream, read) = Metered::new(stream);
@@ -601,7 +604,7 @@ where
         Peer::Subscriber => Kind::Taker,
         Peer::Probe => Kind::Probe,
     });
-    // The records a second it may send (R-N12, R4 of sweep 5), from its first, by its role and
+    // The records a second it may send, from its first, by its role and
     // its network group (`Paces`).
     let paces = Paces::of(&hub, peer, asker.address);
     // The echoes and delivery queries that lead what came with Hello are answered before anything
@@ -666,7 +669,10 @@ where
     // What it may have in the ingest stage, carved from what it reserved (a member's, from its
     // pool, when it is one): the batches its Hello carries are charged like every other.
     let mut admitted = match peer {
-        Peer::Feeder(_) => match hub.allowance(hub.budget().per_feeder().ingest) {
+        Peer::Feeder(_) => match hub.allowance(
+            hub.budget().per_feeder().ingest,
+            crate::ingest::network_source(crate::ingest::group_of(asker.address), source),
+        ) {
             Some(allowance) => Admitted {
                 allowance: Some(allowance),
                 ..Admitted::default()
@@ -690,7 +696,7 @@ where
     // and it gives up its place under the connection cap.
     let _buffers = match peer {
         Peer::Feeder(_) => {
-            let planned = hub.connection_buffers(true).await;
+            let planned = hub.connection_buffers(true, waits).await;
             drop((buffers, general.take()));
             planned
         }
@@ -955,7 +961,9 @@ async fn upstream_once(
     let _slot = hub
         .dialled()
         .ok_or_else(|| "no connection slot to dial with (--max-connections)".to_owned())?;
-    let _buffers = hub.connection_buffers(false).await;
+    let _buffers = hub
+        .connection_buffers(false, crate::ingest::RELAY_SOURCE)
+        .await;
     let stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(&upstream.address))
         .await
         .map_err(|_| "connect timed out".to_owned())?
@@ -1104,7 +1112,9 @@ async fn member_once(
                 ..Admitted::default()
             }
         };
-    let _buffers = hub.connection_buffers(false).await;
+    let _buffers = hub
+        .connection_buffers(false, crate::ingest::RELAY_SOURCE)
+        .await;
     let stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(&relay.address))
         .await
         .map_err(|_| "connect timed out".to_owned())?
@@ -1308,7 +1318,7 @@ enum Closing {
     },
     /// As `Saying`, a member refused at its admission (`End::Full`): a relay that dialled in is
     /// noted as routing around this one (`turning_away`) as it is said. Nothing else is: a link
-    /// the upload cap sheds ends `Saying` (N11).
+    /// the upload cap sheds ends `Saying`.
     Turning(capacity::AtAdmission),
 }
 
@@ -1491,8 +1501,9 @@ struct Admitted {
     /// A member's place: its reservation from the members' pool and its part of the products'
     /// records, held as one (`network::Membership`).
     membership: Option<crate::network::Membership>,
-    /// The members' shared rate (`ceiling::Pace`), which a member session's data waits for.
-    pace: Option<Arc<crate::ceiling::Pace>>,
+    /// The members' shared rate (`ingest::MemberPace`), in bytes and in receptions, of which this
+    /// session is held to an even share: what a member session's data waits for.
+    pace: Option<crate::ingest::MemberSession>,
     /// Whether this session is admitted as a member once its peer is one (`admit_member`): a
     /// session over which another relay's data may come in (one that relay dialled, or this
     /// relay's own one-hop raw link). A session this relay dialled to send a member what is
@@ -1538,12 +1549,16 @@ impl Admitted {
         // A member's waits first for the members' shared rate: together they bring in what was
         // planned for them, no more (`budget::Plan::with_members`).
         if let Some(pace) = &self.pace {
-            let wire = match record {
-                Record::Batch(batch) => batch.as_bytes().len(),
-                Record::ReceiverInfo(info) => info.as_bytes().len(),
-                _ => bytes,
+            let (wire, receptions) = match record {
+                Record::Batch(batch) => (batch.as_bytes().len(), batch.receptions().unwrap_or(0)),
+                Record::ReceiverInfo(info) => (info.as_bytes().len(), 0),
+                _ => (bytes, 0),
             };
-            pace.take(u64::try_from(wire).unwrap_or(u64::MAX)).await;
+            pace.take(
+                u64::try_from(wire).unwrap_or(u64::MAX),
+                u64::try_from(receptions).unwrap_or(u64::MAX),
+            )
+            .await;
         }
         Some(allowance.acquire(bytes).await)
     }
@@ -1569,26 +1584,30 @@ fn admit_member(hub: &Hub, source: u64) -> Result<Admitted, End> {
             budget.members()
         ))
     })?;
-    let allowance = hub.allowance(budget.plan().per_member()).ok_or_else(|| {
-        refused("turned away: no room for a member's ingest allowance".to_owned())
-    })?;
+    let allowance = hub
+        .allowance(
+            budget.plan().per_member(),
+            crate::ingest::member_source(source),
+        )
+        .ok_or_else(|| {
+            refused("turned away: no room for a member's ingest allowance".to_owned())
+        })?;
     Ok(Admitted {
         allowance: Some(allowance),
         membership: Some(hub.network().admit_member(source, membership)),
-        pace: Some(hub.member_pace()),
+        pace: Some(hub.member_pace().session()),
         joins: true,
         _general: None,
     })
 }
 
-/// What a connection's records wait for (R-N12, R4 of sweep 5), each role at what it legitimately
+/// What a connection's records wait for, each role at what it legitimately
 /// sends (`ingest`'s `RolePace`s, each with its reason), and what the cores plan for every session
 /// (`cores::Sessions`): a feeder's own, at its byte ceiling over `ingest::RECORD_BYTES`; a
 /// subscriber's, an engine's and a probe's own, at their role's pace, each starting with what its
-/// network group is granted of its burst (`ingest::BurstGrants`, F6 of sweep 6); every member
+/// network group is granted of its burst (`ingest::BurstGrants`); every member
 /// session's one pace, the members' records a second (`Hub::member_records`); and a directory
-/// link's, its network group's share of the directory's rate (`Hub::directory_records`, F5 of
-/// sweep 6), kept across that group's links, whoever dialled. A relay that dialled in is a
+/// link's, its network group's share of the directory's rate (`Hub::directory_records`), kept across that group's links, whoever dialled. A relay that dialled in is a
 /// directory link until its offer makes it a member (`Peer::now`), so each record waits for the
 /// pace of what its sender is when it is read. A feeder's receptions are never waited for here:
 /// it is told its wanted receptions a second (`RateLimit`) and the relay drops a batch past them
@@ -1692,7 +1711,7 @@ async fn read_loop<S: AsyncRead>(
             return Err(over_ceiling());
         }
         while let Some(record) = message.next().map_err(|error| error.to_string())? {
-            // Its place in the connection's records a second (R-N12): past it, the socket is not
+            // Its place in the connection's records a second: past it, the socket is not
             // read until the pace allows it.
             let pace = paces.take(hub, peer, &asker.key).await;
             // Its charge from the connection's allowance before it is handed over: with the
@@ -1747,7 +1766,7 @@ impl From<String> for Unhandled {
 
 /// A record `ingest` left to the network duties (`network::Network::handle`): their replies are
 /// handed to the write side at once (`Replying::hand_on`), never gathered across a message whose
-/// records are paced (N4).
+/// records are paced.
 /// The work a record brings beyond its one token (each signature inside an evidence bundle) is
 /// owed to the pace it was taken by (`pace`), and paid before the connection's next record.
 fn network(
@@ -2411,7 +2430,7 @@ async fn send_data<S: AsyncWrite>(
 }
 
 /// Ends a link the upload cap shed: it is told the relay is full, pointed at the relays this one
-/// knows. It is never excused its shortfalls (`turning_away`, N11): the cap sheds the peer asking
+/// knows. It is never excused its shortfalls (`turning_away`): the cap sheds the peer asking
 /// the most of its class, which a peer chooses (one flooding `ProviderQuery`s is it), so a shed
 /// excused would be a way to deliver nothing and never be filed short.
 fn shed(hub: &Hub) -> Result<(), Closing> {
@@ -3455,7 +3474,7 @@ mod tests {
         Ok(())
     }
 
-    /// RFC-0181 §9, sweep 3 N5: each role is held to its own cap, never another's. A relay whose
+    /// RFC-0181 §9: each role is held to its own cap, never another's. A relay whose
     /// connection cap is one still answers the next peer while a feeder is connected: the feeder
     /// gave its place under the cap up once it held its reservation. When the feeders, the
     /// subscribers and the members shared the cap, the next connection (a member's among them)
@@ -4034,7 +4053,7 @@ mod tests {
         Ok(())
     }
 
-    /// N1: a connection that overruns its ingest ceiling is told so (`Reason::OverCeiling`), never
+    /// A connection that overruns its ingest ceiling is told so (`Reason::OverCeiling`), never
     /// that this relay is full. A relay that dialled in and is turned away as full is noted as
     /// routing around this one and owes it nothing for that wait (`turning_away`), so a parent
     /// that overran its child's ceiling to be turned away delivered nothing and was never filed
@@ -4087,7 +4106,7 @@ mod tests {
         Ok(())
     }
 
-    /// N11: a link the upload cap sheds is told the relay is full and is never excused its
+    /// A link the upload cap sheds is told the relay is full and is never excused its
     /// shortfalls: it ends `Saying`, never `Turning`, the end `turning_away` notes. The cap sheds
     /// the peer asking the most of its class, so before, a peer flooding `ProviderQuery`s made
     /// itself the one shed, was noted as routing around this relay, and owed nothing for it.
@@ -4105,7 +4124,7 @@ mod tests {
         }
     }
 
-    /// N1: the one end that excuses a peer its shortfalls (`End::Full`, noted by `turning_away`)
+    /// The one end that excuses a peer its shortfalls (`End::Full`, noted by `turning_away`)
     /// is this relay's own capacity at a member's admission; an overrun of the peer's ceiling is
     /// an end that tells it so and notes nothing.
     #[test]
@@ -4122,7 +4141,7 @@ mod tests {
         ));
     }
 
-    /// N8: a directory link whose peer reads slowly is not ended two seconds into a send, as a
+    /// A directory link whose peer reads slowly is not ended two seconds into a send, as a
     /// subscriber's is: what it is sent is held whole and resent if it overflows, so its send
     /// keeps the writer's deadline (`noise::WRITE_TIMEOUT`). Here its peer reads nothing for five
     /// seconds while the relay's send of new offers waits on the pipe, then reads them all, and
@@ -4200,7 +4219,7 @@ mod tests {
         Ok(())
     }
 
-    /// N4: a connection's replies waiting for its write side hold at most `ingest::REPLIES_BYTES`
+    /// A connection's replies waiting for its write side hold at most `ingest::REPLIES_BYTES`
     /// of encoded bytes, carved with its buffers: answers past it are dropped, in order, and
     /// what a reply holds is the room's again once it is written or let go. Before, replies were
     /// gathered and queued uncharged, up to 64 lists of up to 32 offers each.
@@ -4223,7 +4242,7 @@ mod tests {
         assert_eq!(room.waiting(), 0);
     }
 
-    /// N4: each record's answers are handed to the write side as soon as the record is handled,
+    /// Each record's answers are handed to the write side as soon as the record is handled,
     /// never gathered across the message: a probe that sends forty echoes in one message, paced
     /// at eight a second, hears its first answer at once. Before, every answer to a message waited
     /// until its last record was read, about five seconds here and minutes for a 64 KiB message.
@@ -4253,7 +4272,7 @@ mod tests {
         Ok(())
     }
 
-    /// R-N12, R4 of sweep 5: a connection's records a second are held to its role's pace whatever
+    /// A connection's records a second are held to its role's pace whatever
     /// their bytes: a probe that sends forty echoes in one message (each a signature the relay
     /// makes) is answered over 32 s (`ingest::PROBE_RECORDS`: a round of eight at once, then one
     /// a second), not at once. Before, every role but a relay's was paced at a feeder's eight a
@@ -4316,7 +4335,7 @@ mod tests {
         .map_err(text)
     }
 
-    /// F4 of sweep 6, RFC-0181 §10: a feeder is told its receiver's wanted receptions a second in
+    /// RFC-0181 §10: a feeder is told its receiver's wanted receptions a second in
     /// its `RateLimit`, and past them the relay drops its batches, counted, by its batches' stamps,
     /// while its read loop takes every batch at once: six batches of 1,200 wanted sent together
     /// (7,200, twice the ceiling's two seconds) are all taken, those past the ceiling dropped whole
@@ -4395,7 +4414,7 @@ mod tests {
         Ok(())
     }
 
-    /// F6 of sweep 6: a session starts with `ingest::SESSION_BURST` of its role's burst and the
+    /// A session starts with `ingest::SESSION_BURST` of its role's burst and the
     /// rest only as its network group is granted it (`ingest::BurstGrants`), and the grant is kept
     /// by group across its sessions: a subscriber that reconnects at once finds its group's grants
     /// spent, so its new session holds no evidence's worth of burst. Before, every connection
@@ -4459,7 +4478,7 @@ mod tests {
         );
     }
 
-    /// F5 of sweep 6: every directory link's group has its own share of the directory's rate,
+    /// Every directory link's group has its own share of the directory's rate,
     /// kept across its links: a link that owes for its evidence (`credit::check`) waits on its own
     /// group's share alone, and its debt outlives its session, so its group's next link pays it;
     /// another group's link is let in at once. Before, every link shared one pace: one link's
