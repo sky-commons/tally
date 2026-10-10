@@ -390,7 +390,7 @@ mod tests {
             .collect()
     }
 
-    /// Sweep 3, N15: what sharing addressed a member keeps its store charge all the way into the
+    /// What sharing addressed a member keeps its store charge all the way into the
     /// link's queue, beside a charge to the link's share, and both are released only when the
     /// link drops them, once written. Past the link's share the newest is dropped whole, its
     /// charges with it, and the store holds nothing of it.
@@ -449,7 +449,7 @@ mod tests {
         Ok(())
     }
 
-    /// Sweep 3, N15, over a real link: sends to a member that never answers wait charged, never
+    /// Over a real link: sends to a member that never answers wait charged, never
     /// past the link's share (the rest refused, counted, their charges let go); and when the
     /// link is closed, everything it held is released.
     #[tokio::test]
@@ -501,7 +501,7 @@ mod tests {
         Ok(())
     }
 
-    /// Sweep 3, N18: a raw source that turned the link away as full is not dialled while its wait
+    /// A raw source that turned the link away as full is not dialled while its wait
     /// lasts, and is once it has passed; the other sources are kept meanwhile.
     #[tokio::test]
     async fn a_full_raw_source_is_routed_around_for_its_wait() -> Result<(), String> {

@@ -92,6 +92,10 @@ pub enum Store {
     /// (`products::Records`): a share apart from `Products`, so a flood of them refuses records,
     /// never an epoch (RFC-0181 §4, §10).
     Records,
+    /// The ingest rate's table of the sources it tracks (`shed::Shedder`): each source's decayed
+    /// use, over the sources a connection can bring (`shed::UNITS_PER_CONNECTION`). Past it the
+    /// shedder tracks no more and judges the rest as one (`shed::Unit::Overflow`).
+    Shed,
 }
 
 /// What a store's size follows (`Store::driver`).
@@ -107,7 +111,7 @@ pub enum Driver {
 }
 
 impl Store {
-    pub const ALL: [Self; 14] = [
+    pub const ALL: [Self; 15] = [
         Self::Batches,
         Self::Held,
         Self::Open,
@@ -122,6 +126,7 @@ impl Store {
         Self::Epochs,
         Self::Products,
         Self::Records,
+        Self::Shed,
     ];
 
     const fn index(self) -> usize {
@@ -145,6 +150,7 @@ impl Store {
             Self::Epochs => "epochs",
             Self::Products => "products",
             Self::Records => "records",
+            Self::Shed => "shed",
         }
     }
 
@@ -152,7 +158,7 @@ impl Store {
     /// (RFC-0181 §9, "Admission"). Every store answers, with no default.
     pub const fn driver(self) -> Driver {
         match self {
-            Self::Buffers | Self::Ingest | Self::Delivery => Driver::Connection,
+            Self::Buffers | Self::Ingest | Self::Delivery | Self::Shed => Driver::Connection,
             Self::Batches
             | Self::Dedup
             | Self::Fanout
@@ -182,7 +188,8 @@ impl Store {
             | Self::Delivery
             | Self::Buffers
             | Self::Products
-            | Self::Records => false,
+            | Self::Records
+            | Self::Shed => false,
         }
     }
 }
@@ -204,6 +211,7 @@ pub struct PerFeeder {
     pub epochs: usize,
     pub products: usize,
     pub records: usize,
+    pub shed: usize,
     /// A connection's pace state outside any store: its record pace, its reception bucket and its
     /// share's counters ([`PACE_STATE_BYTES`]). Part of a connection's floor.
     pub pace: usize,
@@ -257,6 +265,7 @@ impl PerFeeder {
             Store::Epochs => self.epochs = bytes,
             Store::Products => self.products = bytes,
             Store::Records => self.records = bytes,
+            Store::Shed => self.shed = bytes,
         }
     }
 
@@ -276,6 +285,7 @@ impl PerFeeder {
             Store::Epochs => self.epochs,
             Store::Products => self.products,
             Store::Records => self.records,
+            Store::Shed => self.shed,
         }
     }
 
@@ -418,6 +428,8 @@ impl PerFeeder {
             // The records waiting for the sealer, and to be forwarded, apart from the outputs
             // (`products::records_per_feeder`).
             records: crate::products::records_per_feeder(receptions),
+            // The sources the ingest rate tracks (`shed`): the ones a connection brings.
+            shed: crate::shed::BYTES_PER_UNIT * crate::shed::UNITS_PER_CONNECTION,
             pace: PACE_STATE_BYTES,
         }
     }
@@ -425,8 +437,8 @@ impl PerFeeder {
 
 /// What a connection's pace state holds outside any store: its record pace (`ingest::RecordPace`,
 /// a rate, a burst and a locked token count), its entry in the reception ceilings
-/// (`ingest::ReceptionCeilings`, a key and two numbers) and its share's counters in the ingest
-/// rate (`shed`), each tens of bytes in a map; planned at a kibibyte.
+/// (`ingest::ReceptionCeilings`, a key and two numbers), each tens of bytes in a map; planned at
+/// a kibibyte. (Its share of the ingest rate is a store, `Store::Shed`.)
 pub const PACE_STATE_BYTES: usize = 1 << 10;
 
 /// The rate the RFC sizes one feeder to: about 600 receptions and 8 KB of signed batches a second
@@ -973,7 +985,7 @@ pub const HEADROOM_BYTES: usize = 64 << 20;
 /// The arenas glibc's allocator may keep (`M_ARENA_MAX`, [`bound_the_allocator`]). Each arena
 /// keeps the pages its threads freed for its own reuse, so what the allocator holds beyond what
 /// is live grows with the arenas, and glibc makes up to eight a core: at 2,000 feeders hosting MLAT
-/// on 16 cores it held up to 1.9 GB beside the 5.2 GB the stores were charged (sweep 6, F3). Eight:
+/// on 16 cores it held up to 1.9 GB beside the 5.2 GB the stores were charged. Eight:
 /// four held a fifth less but stood the stages' threads in line for them (raw's p90 29 to 35 ms
 /// against 11 to 19 with eight or with glibc's own count; RFC-0181, "MLAT and the allocator").
 pub const MALLOC_ARENAS: i32 = 8;
@@ -1007,19 +1019,82 @@ pub const ARENA_RETENTION_BYTES: usize = 320 << 20;
 /// reserved 6.9 GB of a 32 GB relay for pages the measurement says never pass 2.6 GiB.
 pub const ALLOCATOR_CAP_BYTES: usize = MALLOC_ARENAS as usize * ARENA_RETENTION_BYTES;
 
-/// Bounds what the allocator keeps (F3 of sweep 6): glibc's arenas capped at [`MALLOC_ARENAS`],
-/// set before any thread starts, so the pages it keeps for reuse stay within the share the plan
-/// holds for them ([`ALLOCATOR_PERCENT`]). Nothing trims on a hot path: before, a thread called
-/// `malloc_trim(0)` after each window step, which walks every arena with its lock held and stood
-/// every stage's thread in line for seconds; without it, glibc's arenas kept up to 1.9 GB beside
-/// what was live at 2,000 feeders, which the 64 MiB headroom was documented to cover and did not.
-/// Elsewhere than glibc, nothing.
+/// The size above which glibc serves an allocation by `mmap` and hands it back on free, fixed so
+/// glibc does not raise it as large blocks are freed (it does, up to 32 MiB, until a trim
+/// threshold is set): a block this size or larger never joins an arena's free pages.
+pub const MMAP_THRESHOLD_BYTES: i32 = 4 << 20;
+
+/// The free space at the top of an arena above which a free gives it back to the kernel at once
+/// (`M_TRIM_THRESHOLD`). Glibc's own is 128 KiB until a large free raises it; fixed here so a
+/// burst of frees cannot leave an arena holding hundreds of MiB at its top. Free pages inside an
+/// arena, below its top, are not reached by this: [`TRIM_PERIOD`] returns those.
+pub const TRIM_THRESHOLD_BYTES: i32 = 16 << 20;
+
+/// How often the trimmer thread ([`spawn_allocator_trimmer`]) returns the arenas' interior free
+/// pages to the kernel. Nothing waits for it: no stage calls it, and a trim runs on a thread of
+/// its own, so the bound on what the allocator keeps does not depend on any hot path.
+pub const TRIM_PERIOD: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Trims taken, the slowest and the latest, in microseconds (`GET /memory`, `allocator`). A trim
+/// holds one arena's lock at a time while it walks it, so the slowest bounds how long a stage
+/// could have waited on an allocation (RFC-0181, "MLAT and the allocator").
+static TRIMS: AtomicU64 = AtomicU64::new(0);
+static TRIM_MAX_US: AtomicU64 = AtomicU64::new(0);
+static TRIM_LAST_US: AtomicU64 = AtomicU64::new(0);
+
+/// Bounds what the allocator keeps: glibc's arenas capped at [`MALLOC_ARENAS`],
+/// and its thresholds fixed ([`MMAP_THRESHOLD_BYTES`], [`TRIM_THRESHOLD_BYTES`]), set before any
+/// thread starts, so the pages it keeps for reuse stay within the share the plan holds for them
+/// ([`ALLOCATOR_PERCENT`]). What it keeps below an arena's top is returned by
+/// [`spawn_allocator_trimmer`]. Nothing trims on a hot path: before, a thread called
+/// `malloc_trim(0)` after each window step, which stood every stage's thread in line for seconds;
+/// without any trim, glibc's arenas kept up to 1.9 GB beside what was live at 2,000 feeders, which
+/// the 64 MiB headroom was documented to cover and did not. Elsewhere than glibc, nothing.
 pub fn bound_the_allocator() {
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     // SAFETY: `mallopt` only sets a parameter of the allocator; called before any thread starts.
     unsafe {
         libc::mallopt(libc::M_ARENA_MAX, MALLOC_ARENAS);
+        libc::mallopt(libc::M_MMAP_THRESHOLD, MMAP_THRESHOLD_BYTES);
+        libc::mallopt(libc::M_TRIM_THRESHOLD, TRIM_THRESHOLD_BYTES);
     }
+}
+
+/// Returns every arena's free pages to the kernel (`malloc_trim(0)`), once, and records how long
+/// it took. Called only by the trimmer thread, never by a stage.
+pub fn trim_the_allocator() -> std::time::Duration {
+    let began = std::time::Instant::now();
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    // SAFETY: `malloc_trim` only returns free pages of the allocator's own arenas.
+    unsafe {
+        libc::malloc_trim(0);
+    }
+    let took = began.elapsed();
+    let micros = u64::try_from(took.as_micros()).unwrap_or(u64::MAX);
+    TRIMS.fetch_add(1, Ordering::Relaxed);
+    TRIM_LAST_US.store(micros, Ordering::Relaxed);
+    TRIM_MAX_US.fetch_max(micros, Ordering::Relaxed);
+    took
+}
+
+/// Starts the thread that trims the allocator every `period` ([`TRIM_PERIOD`] in the relay):
+/// what the arenas keep free below their tops is bounded by what is freed in one period, not by
+/// the run's history. Its own thread, at the lowest priority, off every stage.
+pub fn spawn_allocator_trimmer(period: std::time::Duration) -> std::io::Result<()> {
+    std::thread::Builder::new()
+        .name("tally-malloc-trim".into())
+        .spawn(move || {
+            #[cfg(target_os = "linux")]
+            // SAFETY: `setpriority` on this thread's own id touches no memory of ours.
+            unsafe {
+                libc::setpriority(libc::PRIO_PROCESS, libc::gettid() as libc::id_t, 19);
+            }
+            loop {
+                std::thread::sleep(period);
+                trim_the_allocator();
+            }
+        })
+        .map(drop)
 }
 
 /// What the allocator holds now (`mallinfo2`, every arena): the bytes in use, the bytes it has
@@ -1037,6 +1112,11 @@ pub struct AllocatorReport {
     pub mapped: u64,
     /// Bytes the arenas took from the kernel (`arena`).
     pub arenas: u64,
+    /// Trims the trimmer thread has taken ([`spawn_allocator_trimmer`]).
+    pub trims: u64,
+    /// The slowest trim and the latest, in microseconds: what a stage's allocation could wait.
+    pub trim_max_us: u64,
+    pub trim_last_us: u64,
 }
 
 /// The allocator's holdings now ([`AllocatorReport`]); zeros where the allocator is not glibc's.
@@ -1050,6 +1130,9 @@ pub fn allocator_report() -> AllocatorReport {
             free: info.fordblks as u64,
             mapped: info.hblkhd as u64,
             arenas: info.arena as u64,
+            trims: TRIMS.load(Ordering::Relaxed),
+            trim_max_us: TRIM_MAX_US.load(Ordering::Relaxed),
+            trim_last_us: TRIM_LAST_US.load(Ordering::Relaxed),
         }
     }
     #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
@@ -1262,12 +1345,6 @@ impl Gauge {
         charge
     }
 
-    /// `bytes` charged, waiting for room while the store is full: for a store that pushes back.
-    /// The waiter is one source among those waiting ([`Gauge::charge_for`], source 0).
-    pub async fn charge(self: &Arc<Self>, bytes: usize) -> Charge {
-        self.charge_for(0, bytes).await
-    }
-
     /// `bytes` charged for `source`, waiting for room while the store is full. Waiters are served
     /// in turn by source, not by who wakes first: each source with a waiter takes its turn in
     /// arrival order, and in its turn is served up to a quantum of bytes (deficit round robin),
@@ -1450,7 +1527,7 @@ pub struct Charge {
 /// address, how many covers hold it and the decode itself, weakly (a cover keeps no decode alive;
 /// its allocation, and so its address, stays the decode's while a cover does).
 ///
-/// It also judges every hand-off as it happens, not only when it is sampled (N14 of sweep 6): a
+/// It also judges every hand-off as it happens, not only when it is sampled: a
 /// cover let go or lessened while its decode lives, leaving the decode's covers holding less than
 /// its footprint, is a lapse counted there and then ([`Covered::lapses`]), and so is a decode that
 /// lived and was let go with no cover ever made for it. A sample sees what is held at its instant;
@@ -1600,7 +1677,7 @@ impl Covered {
     }
 
     /// The decoded batches alive whose covers' charges hold less for them together than their
-    /// footprint, and the bytes they are short (N14 of sweep 5): a decode one charge of a byte
+    /// footprint, and the bytes they are short: a decode one charge of a byte
     /// covers is held as surely as one no charge covers, outside every gauge.
     pub fn short(&self) -> (usize, usize) {
         self.short_decodes()
@@ -1821,7 +1898,7 @@ impl Charge {
     /// raw handed to its seal, bytes going back to a carve). The part covers no decode: one handed
     /// on with a decode is split with it ([`Charge::split_covering`]).
     ///
-    /// Before, every part cloned every cover of the charge it came from (N5): an epoch refused
+    /// Before, every part cloned every cover of the charge it came from: an epoch refused
     /// whole split a share for each of its slices off a charge covering all of them, each split a
     /// lock taken per cover, so a refused epoch of `n` slices cost `n²` of them on the message
     /// thread. A part covers only the decode it is handed on with, so a split costs one cover at
@@ -1848,7 +1925,7 @@ impl Charge {
     ///
     /// The part's cover is made before this charge's own cover of the decode gives up what moved,
     /// so the decode's covers never hold less for it than its stores are charged, even for an
-    /// instant (N14).
+    /// instant.
     pub fn split_covering(&mut self, bytes: usize, decoded: &Arc<tally_wire::Decoded>) -> Charge {
         let address = Arc::as_ptr(decoded) as usize;
         // Counted where this charge's own cover of it is (a test's own), else the process's.
@@ -2503,7 +2580,7 @@ mod tests {
         tally_wire::Decoded::from_verified(batch, 0, 0).map_err(|error| error.error.to_string())
     }
 
-    /// R-P23: a decode is counted covered once however many charges and stores hold it, a charge
+    /// A decode is counted covered once however many charges and stores hold it, a charge
     /// that covers nothing (an allowance carved and idle) counts for no decode, a cover follows
     /// its charge through a split and an absorb, and a decode no charge covers is counted
     /// uncovered: to the batch, so one leaked batch shows.
@@ -2561,7 +2638,7 @@ mod tests {
         Ok(())
     }
 
-    /// N14 of sweep 5: a cover holds for its decode the bytes its charge was charged, never only
+    /// A cover holds for its decode the bytes its charge was charged, never only
     /// its presence: a decode covered by a charge of one byte is short of its footprint, and so is
     /// one whose charge was shrunk below it or split away from it; a decode handed on in parts
     /// (`split_covering`) is held whole by them together at every step, and a charge's covers
@@ -2887,7 +2964,7 @@ mod tests {
         }
     }
 
-    /// F3 of sweep 6: the memory a relay runs in holds its whole budget, the fixed headroom and the
+    /// The memory a relay runs in holds its whole budget, the fixed headroom and the
     /// allocator's share of the budget (at least what was measured), and no budget larger would.
     /// Before, the budget was the memory less 64 MiB, while glibc's arenas kept up to 35% of what the
     /// stores held beside it.
@@ -2917,7 +2994,7 @@ mod tests {
         assert_eq!(budget_within(HEADROOM_BYTES - 1), 0);
     }
 
-    /// F3 of sweep 6: once bounded, the allocator makes no more than [`MALLOC_ARENAS`] arenas
+    /// Once bounded, the allocator makes no more than [`MALLOC_ARENAS`] arenas
     /// however many threads allocate at once (glibc makes up to eight a core otherwise). In a child
     /// process of its own, which bounds the allocator before its threads allocate, as the relay's
     /// `main` does.
@@ -2937,6 +3014,92 @@ mod tests {
             .args([
                 "--exact",
                 "budget::tests::the_allocator_keeps_no_more_arenas_than_planned",
+                "--test-threads=1",
+            ])
+            .env(CHILD, "1")
+            .status()
+            .map_err(|error| error.to_string())?;
+        assert!(status.success(), "the child: {status}");
+        Ok(())
+    }
+
+    /// The bytes this process has resident now (`/proc/self/statm`).
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    fn resident_bytes() -> Result<u64, String> {
+        let statm = std::fs::read_to_string("/proc/self/statm").map_err(|e| e.to_string())?;
+        let pages: u64 = statm
+            .split_whitespace()
+            .nth(1)
+            .and_then(|field| field.parse().ok())
+            .ok_or("no resident field")?;
+        Ok(pages * 4096)
+    }
+
+    /// What the arenas keep free below their tops is returned by the trimmer
+    /// thread, not left to the run's history. Eight threads each fill an arena with 4 KiB blocks and
+    /// free seven in eight, so every arena is pages of free space between blocks that stay live
+    /// (which no top-trim reaches); the process comes back to a fraction of its peak within a few
+    /// trim periods. Without the trimmer it stays at the peak. In a child process of its own, so no
+    /// other test's memory is in the count.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[test]
+    fn the_trimmer_returns_the_arenas_free_pages() -> Result<(), String> {
+        const CHILD: &str = "TALLY_TRIM_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            bound_the_allocator();
+            spawn_allocator_trimmer(std::time::Duration::from_millis(100))
+                .map_err(|error| error.to_string())?;
+            const THREADS: usize = 8;
+            const BLOCKS: usize = 16_384; // 64 MiB a thread, 512 MiB in all
+            let filled = Arc::new(std::sync::Barrier::new(THREADS + 1));
+            let freed = Arc::new(std::sync::Barrier::new(THREADS + 1));
+            let handles: Vec<_> = (0..THREADS)
+                .map(|_| {
+                    let (filled, freed) = (Arc::clone(&filled), Arc::clone(&freed));
+                    std::thread::spawn(move || {
+                        let mut blocks: Vec<Option<Vec<u8>>> =
+                            (0..BLOCKS).map(|n| Some(vec![n as u8; 4096])).collect();
+                        filled.wait();
+                        for (at, block) in blocks.iter_mut().enumerate() {
+                            if at % 8 != 0 {
+                                *block = None;
+                            }
+                        }
+                        freed.wait();
+                        // Alive until the count is taken.
+                        filled.wait();
+                        std::hint::black_box(&blocks);
+                    })
+                })
+                .collect();
+            filled.wait();
+            let peak = resident_bytes()?;
+            freed.wait();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let mut now = resident_bytes()?;
+            while now > peak / 2 && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                now = resident_bytes()?;
+            }
+            filled.wait();
+            for handle in handles {
+                handle.join().map_err(|_| "a thread panicked".to_owned())?;
+            }
+            assert!(peak > 400 << 20, "peak only {} MiB", peak >> 20);
+            assert!(
+                now <= peak / 2,
+                "{} MiB resident of a {} MiB peak after the trimmer ran",
+                now >> 20,
+                peak >> 20
+            );
+            assert!(allocator_report().trims > 0);
+            return Ok(());
+        }
+        let exe = std::env::current_exe().map_err(|error| error.to_string())?;
+        let status = std::process::Command::new(exe)
+            .args([
+                "--exact",
+                "budget::tests::the_trimmer_returns_the_arenas_free_pages",
                 "--test-threads=1",
             ])
             .env(CHILD, "1")
@@ -3054,10 +3217,10 @@ mod tests {
     #[tokio::test]
     async fn a_gauge_that_pushes_back_waits_for_room() {
         let gauge = Gauge::new(Store::Ingest, 100);
-        let held = gauge.charge(80).await;
+        let held = gauge.charge_for(0, 80).await;
         let waiting = tokio::spawn({
             let gauge = Arc::clone(&gauge);
-            async move { gauge.charge(50).await.bytes() }
+            async move { gauge.charge_for(0, 50).await.bytes() }
         });
         tokio::task::yield_now().await;
         assert!(!waiting.is_finished());
@@ -3337,7 +3500,7 @@ mod tests {
     #[tokio::test]
     async fn a_newcomer_queues_behind_waiters_and_an_abandoned_waiter_blocks_no_one() {
         let gauge = Gauge::new(Store::Ingest, 100);
-        let held = gauge.charge(100).await;
+        let held = gauge.charge_for(0, 100).await;
         let big = tokio::spawn({
             let gauge = Arc::clone(&gauge);
             async move { gauge.charge_for(1, 100).await.bytes() }

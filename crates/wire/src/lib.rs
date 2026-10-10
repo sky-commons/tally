@@ -37,7 +37,9 @@ pub use clock_model::{
 pub use credit::{
     EvidenceBundle, EvidenceBundleContent, FirehoseCredential, FirehoseCredentialContent,
 };
-pub use cut::{MlatCut, MlatCutContent};
+pub use cut::{
+    CUT_REFRESH_STEPS, CUT_TTL_STEPS, MAX_CUT_AREAS, MAX_CUT_FROM_MS, MlatCut, MlatCutContent,
+};
 pub use decoded::{Decoded, FingerprintKey, ObsRef, ObsView, Undecodable};
 pub use delivery::{
     DeliveryAnswer, DeliveryAnswerContent, DeliveryQuery, Possession, SequenceRange, Tag, TagKey,

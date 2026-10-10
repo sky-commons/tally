@@ -1943,7 +1943,7 @@ mod tests {
         assert!((0..100).all(|_| pace.admit(noise::MAX_PLAINTEXT, now)));
     }
 
-    /// F4 of sweep 6: what a relay states of its wanted receptions a second is the batcher's to
+    /// What a relay states of its wanted receptions a second is the batcher's to
     /// shed to, the least any live session stated: a session's statement holds while the session
     /// does and goes when it ends, so a relay that is gone holds the feeder to nothing.
     #[test]

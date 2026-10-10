@@ -1312,7 +1312,7 @@ mod tests {
         Ok(())
     }
 
-    /// Item 14 of the sweep: the keyed members are drawn afresh at random each period, so a set
+    /// The keyed members are drawn afresh at random each period, so a set
     /// keyed first (Sybils that reached the feeder first after a restart) holds it a period at
     /// most: a member not drawn is given no key and its keys are dropped, and every member is
     /// drawn in turn.
@@ -1648,7 +1648,7 @@ mod tests {
         })
     }
 
-    /// Sweep 3, N19: many keys on a few networks win those networks' places and no more. Two
+    /// Many keys on a few networks win those networks' places and no more. Two
     /// hostile networks of thirty members each beside six honest networks of one: every period,
     /// every honest network is drawn (and so can be asked), and each hostile network holds what
     /// is left beside its one place first.
@@ -1681,7 +1681,7 @@ mod tests {
         Ok(())
     }
 
-    /// Sweep 3, N19: a member drawn whose offer has expired (no longer a candidate) gives its
+    /// A member drawn whose offer has expired (no longer a candidate) gives its
     /// place up within the period, and the place goes to one that is.
     #[test]
     fn a_member_no_longer_a_candidate_gives_its_place_up() -> Result<(), String> {

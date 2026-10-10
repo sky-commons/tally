@@ -288,13 +288,17 @@ fn mlat_run_cuts(
     if let Some(budget_ms) = cutting.budget_ms {
         host.budgeting(budget_ms);
     }
-    for cut in &cutting.offered {
-        host.offer_cut(*cut);
-    }
+    // The cuts other relays published, offered as the stamps reach the step `CUT_LEAD_STEPS` before
+    // each: as a link hands them in, never all at once before the first step.
+    let mut offered: Vec<Cut> = cutting.offered.clone();
+    offered.sort_by_key(|cut| cut.from_ms);
+    let mut offered = std::collections::VecDeque::from(offered);
     hub.network()
         .host_mlat(Arc::clone(&host) as Arc<dyn MlatHost>);
     host.set_areas(areas.clone(), Vec::new());
     let now = tally_relay::network::wall_ms();
+    let mut carried: std::collections::VecDeque<(u64, Record)> = Default::default();
+    let mut link = None;
     if let Some(neighbours) = &cutting.network {
         neighbouring(&hub, &neighbours.me, &neighbours.other, areas, now)?;
         let asker = tally_relay::network::Asker {
@@ -304,10 +308,23 @@ fn mlat_run_cuts(
             loopback: true,
             address: None,
         };
-        for record in &neighbours.carried {
-            hub.network()
-                .handle(&hub, &asker, record.clone(), now, None);
-        }
+        carried = neighbours
+            .carried
+            .iter()
+            .map(|record| {
+                let from_ms = match record {
+                    Record::MlatCut(cut) => {
+                        cut.content().map(|content| content.from_ms).unwrap_or(0)
+                    }
+                    _ => 0,
+                };
+                (from_ms, record.clone())
+            })
+            .collect();
+        carried
+            .make_contiguous()
+            .sort_by_key(|(from_ms, _)| *from_ms);
+        link = Some(asker);
     }
     describe_all(&hub, arrivals, describing)?;
     let first = arrivals.first().map(|(at, _)| *at).ok_or("no raw")?;
@@ -412,6 +429,24 @@ fn mlat_run_cuts(
                     });
                 }
                 next += 1;
+            }
+            // The cuts other relays published, as their step comes within `CUT_LEAD_STEPS`.
+            let lead = tally_relay::mlat_host::CUT_LEAD_STEPS * STEP_MS;
+            while offered
+                .front()
+                .is_some_and(|cut| cut.from_ms <= step + lead)
+            {
+                if let Some(cut) = offered.pop_front() {
+                    host.offer_cut(cut);
+                }
+            }
+            while carried
+                .front()
+                .is_some_and(|(from_ms, _)| *from_ms <= step + lead)
+            {
+                if let (Some((_, record)), Some(asker)) = (carried.pop_front(), &link) {
+                    hub.network().handle(&hub, asker, record, now, None);
+                }
             }
             // Everything stamped before the step is handed in: every worker ticks to it.
             hub.advance(step);
@@ -668,7 +703,7 @@ fn at_capacity_the_same_receivers_are_refused_whatever_the_order_and_the_threads
     Ok(())
 }
 
-/// RFC-0181 §4 and invariant 2 for descriptions (item 13 of the sweep): a receiver described again
+/// RFC-0181 §4 and invariant 2 for descriptions: a receiver described again
 /// midway (out of the areas, so it stops taking part, and back ten seconds later) and one whose
 /// first description comes halfway in (its batches before it waiting, those that waited too long
 /// let go), each description stamped when it came and taking effect at the step after, make the
@@ -756,9 +791,9 @@ fn descriptions_midway_make_the_same_bytes_with_any_delays_and_the_reference_eng
     Ok(())
 }
 
-/// Sweep 4, R-N16 and N6: a window step that runs long, past the old ripening and past as many steps
+/// A window step that runs long, past the old ripening and past as many steps
 /// as `WINDOW_STEPS_BEHIND` (which sheds none: a window step is queued only at a step a window falls due
-/// at, sweep 5, H-c; before, every step it ran past queued as one, and those past the limit were
+/// at; before, every step it ran past queued as one, and those past the limit were
 /// shed), changes no provisional byte: a provisional step carries exactly the models of the window steps
 /// `MODELS_RIPEN_MS` before it, by their stamp, and the ripening covers a window step on the
 /// planned threads (measured 9 to 11 s: here every window step that solves is held while the
@@ -856,6 +891,41 @@ fn cut_trace() -> Result<CutTrace> {
     Ok((delivered, areas, receivers, settings))
 }
 
+/// The draws of the trace's receivers, best first (`tally_mlat::intake::draw`).
+fn draws_of(delivered: &[(u64, Record)]) -> Result<Vec<u128>> {
+    let mut draws: Vec<u128> = Vec::new();
+    for (_, record) in delivered {
+        if let Record::ReceiverInfo(info) = record {
+            draws.push(tally_mlat::intake::draw(&info.receiver().map_err(text)?));
+        }
+    }
+    draws.sort_unstable();
+    Ok(draws)
+}
+
+/// The announcements of a standing cut, as its signer sends them: one every `CUT_REFRESH_MS` from
+/// `from_ms` to `until_ms`, each for `areas`.
+fn standing(
+    origin: PublicKey,
+    areas: &Regions,
+    below: u128,
+    from_ms: u64,
+    until_ms: u64,
+) -> Vec<Cut> {
+    let mut cuts = Vec::new();
+    let mut at = from_ms / STEP_MS * STEP_MS;
+    while at <= until_ms {
+        cuts.push(Cut {
+            from_ms: at,
+            origin,
+            below,
+            areas: areas.cells().to_vec(),
+        });
+        at += tally_relay::mlat_host::CUT_REFRESH_MS;
+    }
+    cuts
+}
+
 /// RFC-0181 §10, the cut by key rank: two relays holding one area, offered one published cut
 /// (from a step, so many seats), solve the same receivers from that step whatever order their
 /// descriptions came in, on any threads, with delays or none, and make the same bytes; the
@@ -871,11 +941,17 @@ fn two_relays_offered_one_cut_solve_the_same_receivers_and_make_the_same_bytes()
         receivers >= CUT + tally_relay::mlat_host::MIN_CUT_SEATS,
         "{receivers} receivers"
     );
-    let cut = Cut {
-        from_ms: (first + 20_000) / STEP_MS * STEP_MS,
-        origin: Identity::from_seed([9; 32]).public(),
-        seats: (receivers - CUT) as u32,
-    };
+    let until = delivered.last().map_or(0, |(at, _)| *at) + 60_000;
+    let draws = draws_of(&delivered)?;
+    // The cut asks for every receiver but the CUT worst ranked: the first receiver cut is the
+    // (receivers - CUT)th, and everything below its draw stays.
+    let cuts = standing(
+        Identity::from_seed([9; 32]).public(),
+        &areas,
+        draws[receivers - CUT],
+        first + 20_000,
+        until,
+    );
     let run = |ingest: usize, describing: Describing, delays: Delays, offered: Vec<Cut>| {
         mlat_run_cuts(
             &delivered,
@@ -899,15 +975,20 @@ fn two_relays_offered_one_cut_solve_the_same_receivers_and_make_the_same_bytes()
         1,
         Describing::Before { reversed: false },
         Delays::None,
-        vec![cut],
+        cuts.clone(),
     )?;
     let relay_b = run(
         8,
         Describing::Before { reversed: true },
         Delays::Seeded(6),
-        vec![cut],
+        cuts.clone(),
     )?;
-    let relay_c = run(2, Describing::Racing { seed: 4 }, Delays::None, vec![cut])?;
+    let relay_c = run(
+        2,
+        Describing::Racing { seed: 4 },
+        Delays::None,
+        cuts.clone(),
+    )?;
     let uncut = run(
         1,
         Describing::Before { reversed: false },
@@ -982,20 +1063,32 @@ fn an_overloaded_host_cuts_by_rank_and_a_peer_offered_the_cut_makes_the_same_byt
         "no cut: {:?}",
         overloaded.report
     );
-    assert_eq!(
-        overloaded.report.cuts_decided,
-        overloaded.cuts.len() as u64,
+    // Each decision is announced, and again while it stands.
+    assert!(
+        overloaded.report.cuts_decided >= 1,
+        "{:?}",
+        overloaded.report
+    );
+    assert!(
+        overloaded.cuts.len() as u64 >= overloaded.report.cuts_decided,
         "{:?}",
         overloaded.cuts
     );
     for cut in &overloaded.cuts {
         assert_eq!(cut.from_ms % STEP_MS, 0, "{cut:?}");
-        assert!(
-            cut.seats as usize >= tally_relay::mlat_host::MIN_CUT_SEATS,
-            "{cut:?}"
-        );
-        assert!((cut.seats as usize) < receivers, "{cut:?}");
+        assert!(!cut.areas.is_empty(), "{cut:?}");
+        assert!(cut.areas.len() <= tally_wire::MAX_CUT_AREAS, "{cut:?}");
     }
+    // A standing cut is announced again, at a later step with the same threshold, so a relay
+    // that started late or lost the first learns it, and it expires when no longer announced.
+    let refreshed = overloaded.cuts.iter().any(|cut| {
+        overloaded.cuts.iter().any(|later| {
+            later.below == cut.below
+                && later.below != u128::MAX
+                && later.from_ms >= cut.from_ms + tally_relay::mlat_host::CUT_REFRESH_MS
+        })
+    });
+    assert!(refreshed, "no refresh: {:?}", overloaded.cuts);
     // Nothing was shed by lateness: the cut came before it was needed.
     assert_eq!(
         (
@@ -1093,7 +1186,10 @@ fn an_overloaded_relays_cut_reaches_the_relay_holding_its_area_and_both_make_the
         signed.verify().map_err(text)?;
         assert_eq!(signed.signer().map_err(text)?, relay_a.public());
         let content = signed.content().map_err(text)?;
-        assert_eq!((content.from_ms, content.seats), (cut.from_ms, cut.seats));
+        assert_eq!(
+            (content.from_ms, content.below, content.areas.clone()),
+            (cut.from_ms, cut.below, cut.areas.clone())
+        );
         // And it travels as a record does.
         let mut bytes = Vec::new();
         record.encode(&mut bytes).map_err(text)?;
@@ -1153,7 +1249,8 @@ fn an_overloaded_relays_cut_reaches_the_relay_holding_its_area_and_both_make_the
                 &stranger,
                 &tally_wire::MlatCutContent {
                     from_ms: cut.from_ms,
-                    seats: cut.seats,
+                    below: cut.below,
+                    areas: cut.areas.clone(),
                 },
             )
             .map(Record::MlatCut)

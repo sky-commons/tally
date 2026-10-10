@@ -98,7 +98,7 @@ pub fn start(
     )?;
     tokio::spawn(relays::keep_saved(Arc::clone(&directory)));
     // What the relays state of the wanted receptions a second they take: each session states its
-    // relay's, and the batcher sheds to the least before it signs (F4 of sweep 6).
+    // relay's, and the batcher sheds to the least before it signs.
     let wanted = Arc::new(source::WantedCeilings::default());
     tokio::spawn(relays::run(Publishing {
         directory,

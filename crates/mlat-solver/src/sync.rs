@@ -2181,7 +2181,7 @@ fn attempt(
             // cut-off of their clock's scale carry no weight. A unit-weight first step let one
             // event mixing two copies of a message (receptions seconds apart) throw every offset
             // by millions of metres, and the steps after it left knots held by nothing but the
-            // rate prior (sweep 6, F8): the fit failed where contamination should only cost the
+            // rate prior: the fit failed where contamination should only cost the
             // event.
             let mut state = State::start(&problem);
             state.settle_events(&problem, &noise);
@@ -2479,7 +2479,7 @@ fn build_model(
 /// milliseconds (`tests::a_free_running_gauge_dates_transmissions_by_when_they_were_sent`), plus
 /// the gauge's rate over the window, 200 ppm at most, times its span. The anchor batch's wall clock alone, as
 /// before, dated every transmission under a free-running gauge late by however long that batch
-/// was open after it, up to a second (sweep 6, H-d).
+/// was open after it, up to a second.
 fn anchor_wall_ns(timebase: Timebase, anchor: i64, heard: &[(i64, u64)]) -> Option<u64> {
     heard
         .iter()
@@ -2605,7 +2605,7 @@ impl Calibrated {
     /// the places of its two knots' offsets held (each by its share of the interval) and the gauge's
     /// rate (by the reception's lever from the reference). Found once a reception, so a solution's
     /// covariance over every pair of its receptions looks each up once, not once a pair
-    /// (`weighed_covariance`; sweep 6: once a pair, two lists made and four places looked up for
+    /// (`weighed_covariance`: once a pair, two lists made and four places looked up for
     /// each, was a fifth of a window step's work).
     pub fn clock_weights(&self, time: &ModelTime, reference_ps: i128) -> ClockWeights {
         let f = time.fraction();

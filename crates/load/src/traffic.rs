@@ -14,8 +14,7 @@
 //! receiver's counter moved on by the clock error the loops would have carried. A reply heard `u`
 //! into the period was heard again, byte for byte, at `2P - u`; feeders seal at their own phases of
 //! the second, so near a bin's edge a forward and a backward copy of one message fell in one MLAT
-//! bin, receptions 2.9 s apart as one event, and a clock fit that took the event failed (sweep 6,
-//! F8 and F9). Before that, each loop replayed the period forward with every counter moved on by
+//! bin, receptions 2.9 s apart as one event, and a clock fit that took the event failed. Before that, each loop replayed the period forward with every counter moved on by
 //! the period exactly, so every aircraft and every free-running clock jumped at each boundary.
 //!
 //! A cluster's sky is made by a few threads at once (`World::hear`): every draw is keyed by the
@@ -825,7 +824,7 @@ mod tests {
         data.len() == 14 && data[0] >> 3 == 17 && data[4] >> 3 == 11
     }
 
-    /// F8 and F9 of sweep 6: over the whole run, no receiver hears an airborne position twice (its
+    /// Over the whole run, no receiver hears an airborne position twice (its
     /// bytes carry the aircraft's noisy CPR, so a real one is never repeated), and a
     /// free-running receiver's counter less a GNSS receiver's, for each position both heard, lies on
     /// one line (its clock's rate) to within its jitter. Before, the period played backward made

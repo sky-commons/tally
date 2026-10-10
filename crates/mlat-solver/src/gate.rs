@@ -9,8 +9,8 @@
 //! holds one idle. Provisional work is let in first, and never waits on background work for its
 //! first permit: of a gate of two or more permits, background work holds all but one at most
 //! ([`Gate::reserved`]), so a provisional step that arrives while seals and window steps hold every
-//! permit they may takes the one left at once, and runs on it however long their items are (sweep 5,
-//! N6: before, every permit could be background's, and a provisional step waited for one until a
+//! permit they may takes the one left at once, and runs on it however long their items are.
+//! Before, every permit could be background's, and a provisional step waited for one until a
 //! [`checkpoint`], which only the window's fits had: a seal or a scope pass held it up whole). A
 //! gate of one permit cannot spare one, so there background work gives its permit up between two
 //! items of its work whenever a provisional thread waits ([`checkpoint`], in every pass of the
@@ -249,7 +249,7 @@ pub fn checkpoint() {
 /// the permits it actually holds is done, whatever the permit count: of a gate of `N` permits,
 /// background work holds `N - 1` at most ([`Gate::reserved`]), and a pass cut into `N` fixed
 /// shares left its last share to start only once another had ended, taking about twice as long
-/// (sweep 6, F1: a ten-second window step took twenty on eight threads, past the models' ripening).
+/// (a ten-second window step took twenty on eight threads, past the models' ripening).
 /// A thread that gets its permit late finds what is left, or nothing. Which thread runs which
 /// input never changes the results. A worker's panic is this thread's: the workers are plain
 /// scoped threads, joined here, each panic raised again on this thread.
@@ -374,11 +374,11 @@ mod tests {
         assert_eq!(gated, free);
     }
 
-    /// Sweep 5, N6: background work never holds a gate's every permit when it has two or more, so
+    /// Background work never holds a gate's every permit when it has two or more, so
     /// a provisional step arriving while background work holds all it may starts at once, however
     /// long the background items run and with no checkpoint among them. Before, a background step
     /// spread over the gate's every permit held a provisional one up until an item ended. Judged
-    /// by order, not by a clock (sweep 6, F13): the background items end only once the prompt
+    /// by order, not by a clock: the background items end only once the prompt
     /// work has run (or after a minute, so a failure ends), and the prompt work must have run while
     /// none had ended.
     #[test]
@@ -434,7 +434,7 @@ mod tests {
         }
     }
 
-    /// Sweep 6, F1: a background pass under a gate of `N` permits, which may hold `N - 1` of them,
+    /// A background pass under a gate of `N` permits, which may hold `N - 1` of them,
     /// ends in the rounds its work takes over `N - 1` threads, not in twice them. Counted in
     /// rounds, not time: every item waits until `N - 1` items are in its round (or a long while,
     /// which only a starved round ever waits out), so the rounds a pass takes are its schedule's.

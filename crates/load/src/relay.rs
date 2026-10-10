@@ -102,6 +102,22 @@ pub fn spawn(
     ];
     if !mlat {
         args.push("--no-mlat".into());
+    } else {
+        // Hosting MLAT solves nothing until the relay is chosen for an area (`Selection::solved`),
+        // and it is chosen only among the relays that offer it: so it takes the two cells at the
+        // centres of the simulation's clusters and advertises itself, under its own key, at the
+        // address its feeders reach it by.
+        let reach = match host {
+            "0.0.0.0" | "[::]" | "::" => format!("127.0.0.1:{port}"),
+            _ => listen.clone(),
+        };
+        for cell in CLUSTER_CELLS {
+            args.extend(["--area".into(), (*cell).into()]);
+        }
+        args.extend([
+            "--advertise".into(),
+            format!("{reach}={}", identity.public()),
+        ]);
     }
     args.extend(extra.iter().cloned());
     if fit {
@@ -207,11 +223,15 @@ fn fitted_memory(bin: &Path, args: &[String], feeders: usize) -> Result<u64, Str
     Ok(line("before-feeders")? + total)
 }
 
+/// The cells at the centres of the simulation's two clusters, which a relay hosting MLAT under the
+/// harness takes (`spawn`).
+const CLUSTER_CELLS: &[&str] = &["801ffffffffffff", "8027fffffffffff"];
+
 /// What the relay's peak resident memory came to beside the memory it is budgeted (`GET /memory`)
 /// and the headroom it keeps below the memory it runs in (`budget::headroom_for`): the
 /// allocator's free pages not yet returned, stacks and the kernel's socket buffers that no store
 /// charges. Past the two, a relay sized for its load is throttled at `memory.high` or killed at
-/// `memory.max` (F3 of sweep 6).
+/// `memory.max`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Fit {
     pub peak_bytes: u64,
@@ -250,7 +270,7 @@ impl Charged {
 /// What the relay may be resident at most, having been charged at most `peak` bytes for its base
 /// and stores so far: those, and its headroom for them (`budget::headroom_for`). An allocator keeps
 /// what was once in use for reuse, so what the relay holds follows the most it was charged, not
-/// what it is charged now; past this it holds more than its plan keeps room for (F3 of sweep 6).
+/// what it is charged now; past this it holds more than its plan keeps room for.
 pub fn resident_allowed(peak: u64) -> u64 {
     peak + tally_relay::budget::headroom_for(usize::try_from(peak).unwrap_or(usize::MAX)) as u64
 }
@@ -437,7 +457,7 @@ impl Fits {
     /// relay's `fits` counts every fit tried, those that failed among them (`unfitted`,
     /// `tally_mlat::window`), so the share is `unfitted / fits`. Before, it was taken over
     /// `fits + unfitted`, each failure counted twice in the whole: a window where about 87% of
-    /// fits failed read 45% (sweep 6, F8).
+    /// fits failed read 45%.
     pub fn failed_since(&self, before: &Self) -> Option<f64> {
         let tried = self.fits.saturating_sub(before.fits);
         let unfitted = self.unfitted.saturating_sub(before.unfitted);
@@ -535,7 +555,7 @@ mod tests {
         assert_eq!(dechunk("4\r\n{\"a\"\r\n3\r\n:1}\r\n0\r\n\r\n"), "{\"a\":1}");
     }
 
-    /// Sweep 6, F8: `fits` counts every fit tried, so 348 of 400 failed is 87%, not the 46.5% of
+    /// `fits` counts every fit tried, so 348 of 400 failed is 87%, not the 46.5% of
     /// `348 / (400 + 348)`.
     #[test]
     fn the_failure_share_is_the_failed_over_the_fits_tried() {
@@ -554,7 +574,7 @@ mod tests {
         assert_eq!(before.failed_since(&before), None);
     }
 
-    /// F3 of sweep 6: the relay's peak resident memory is held to its budget and the headroom,
+    /// The relay's peak resident memory is held to its budget and the headroom,
     /// and no more.
     #[test]
     fn a_peak_past_the_budget_and_its_headroom_fails_the_run() {
@@ -569,7 +589,7 @@ mod tests {
         assert!(!fit(1_101).within());
     }
 
-    /// F3 of sweep 6: what the relay may hold follows the most it was charged.
+    /// What the relay may hold follows the most it was charged.
     #[test]
     fn the_resident_memory_allowed_follows_the_most_charged() {
         let headroom = tally_relay::budget::HEADROOM_BYTES as u64;

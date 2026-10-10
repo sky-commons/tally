@@ -128,7 +128,7 @@ const SAMPLE_EVERY: Duration = Duration::from_millis(20);
 /// instant (`Budget::decoded_held`), to the batch: no allowance carved and idle, and no decode two
 /// stores charge, stands in for one nobody does; and the charges covering each hold its footprint
 /// at least, together (`Covered::short_decodes`), to the byte, so a charge of a byte covering a
-/// batch is a batch held uncharged (N14 of sweep 5; before, only a cover's presence was checked).
+/// batch is a batch held uncharged (before, only a cover's presence was checked).
 /// One sample decides: every holder lets a decode go before, or with, its charge (an epoch's parts
 /// together, `exchange::Parts`; a slice let go, `exchange::Held`; a subscriber's item, its own
 /// claim on the charge, `fanout::Taken`), so a decode is never short or uncovered even for the
@@ -140,7 +140,7 @@ const SAMPLE_EVERY: Duration = Duration::from_millis(20);
 ///
 /// Sampled, a holder that keeps a decode uncharged for less than the time between two samples
 /// goes unseen; so beside the samples the watch reads what [`Covered`] counted at every hand-off
-/// as it happened (N14 of sweep 6, `Covered::lapses`): a cover let go or lessened while its decode
+/// as it happened (`Covered::lapses`): a cover let go or lessened while its decode
 /// lives, leaving it short, and a decode let go that no charge ever covered. Those counters must
 /// not move over the test, but for the lapses the test makes itself ([`Watch::allow`]).
 struct Watch {
@@ -234,13 +234,13 @@ impl Watch {
 }
 
 /// The watch sees a holder no gauge charges, of one batch, in one sample, and one a charge of a
-/// byte covers (N14): a batch decoded here and kept, beside the relay in the middle of its flood,
+/// byte covers: a batch decoded here and kept, beside the relay in the middle of its flood,
 /// every connection's allowance carved and the stores holding megabytes. Before, the watch
 /// compared the decodes alive with what the stores holding them were charged, which counts every
 /// allowance carved whether it holds a batch or not and a decode two stores hold twice: about a
 /// megabyte of slack under this flood, so a holder of dozens of batches went unseen.
 ///
-/// And it sees a lapse no sample is there for (N14 of sweep 6): a decode whose charge is let go
+/// And it sees a lapse no sample is there for: a decode whose charge is let go
 /// while it is kept, and one let go that no charge ever covered, each counted once at the moment
 /// it happened, however soon after it the decode goes. Before, the watch sampled every 20 ms and a
 /// holder that kept a decode uncharged between two samples was never seen.
@@ -255,7 +255,7 @@ async fn assert_watch_sees_one_leaked_batch(hub: &Hub) -> Result {
     // Covered by nothing: seen in the one sample.
     let uncovered = watch.sample(hub).err();
     let mut watch = Watch::new();
-    // Covered by a charge of one byte (N14): present, and still a batch held uncharged.
+    // Covered by a charge of one byte: present, and still a batch held uncharged.
     let mut token = hub
         .budget()
         // The peers' records' share: nothing of this flood's is in it.
@@ -561,5 +561,74 @@ async fn a_stalled_stage_never_grows_past_the_budget() -> Result {
     }
     assert_eq!(stream, 0);
     assert!(products.report().stream_refused >= 1);
+    Ok(())
+}
+
+/// The oversize room is shared by network, not by connection, end to end
+/// through the production path (`Hub::allowance` with the source `ingest::network_source` names
+/// for a connection's address, as a link takes it). Twenty-four connections from one network each
+/// ask for a batch that needs the oversize room, over and over; four connections from another
+/// network do the same. The room holds three such batches at once, so it is contended throughout.
+/// Served in turn by source, the four are served about as often as the twenty-four together;
+/// served first come first served (the source ignored, as when `charge_for` had no caller) they
+/// would be served four times in twenty-eight.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_oversize_room_is_shared_by_network_not_by_connection() -> Result {
+    const OWN: usize = 64 << 10;
+    const BATCH: usize = OWN + (20 << 20);
+    let hub = Arc::new(Hub::new(8).memory_for_feeders(CEILING, false));
+    let source = |address: &str, connection: u64| -> Result<u64> {
+        let address: std::net::IpAddr = address.parse().map_err(text)?;
+        Ok(tally_relay::ingest::network_source(
+            tally_relay::ingest::group_of(Some(address)),
+            connection,
+        ))
+    };
+    let stop = Arc::new(AtomicBool::new(false));
+    let greedy_served = Arc::new(AtomicU64::new(0));
+    let honest_served = Arc::new(AtomicU64::new(0));
+    let mut tasks = Vec::new();
+    for connection in 0..28u64 {
+        let honest = connection < 4;
+        let address = if honest {
+            "198.51.100.1"
+        } else {
+            "203.0.113.9"
+        };
+        let allowance = hub
+            .allowance(OWN, source(address, connection)?)
+            .ok_or("a connection's allowance fits the store")?;
+        let (stop, served) = (
+            Arc::clone(&stop),
+            Arc::clone(if honest {
+                &honest_served
+            } else {
+                &greedy_served
+            }),
+        );
+        tasks.push(tokio::spawn(async move {
+            while !stop.load(Ordering::Relaxed) {
+                let held = allowance.acquire(BATCH).await;
+                served.fetch_add(1, Ordering::Relaxed);
+                tokio::time::sleep(Duration::from_millis(1)).await;
+                drop(held);
+            }
+        }));
+    }
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    stop.store(true, Ordering::Relaxed);
+    for task in tasks {
+        task.await.map_err(text)?;
+    }
+    let (honest, greedy) = (
+        honest_served.load(Ordering::Relaxed),
+        greedy_served.load(Ordering::Relaxed),
+    );
+    let share = honest as f64 / (honest + greedy).max(1) as f64;
+    assert!(
+        share > 0.3, // in turn about a half; first come first served, 4/28
+        "the four-connection network was served {honest} times to the crowd's {greedy}: {share:.3} \
+         of the room, where first come first served gives it a seventh"
+    );
     Ok(())
 }

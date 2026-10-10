@@ -249,8 +249,7 @@ pub struct WindowIndex<'a> {
     /// (`repeated`), by hash, ascending: found as the index is made, on the thread making it.
     /// Never lazily, inside a pass: the first of a pass's workers to ask would find them while the
     /// others waited on it holding their gate permits, and its own checkpoints could give its
-    /// permit to a provisional step and wait for one the waiting workers held, for ever (sweep 6:
-    /// a relay's window steps stopped for good that way).
+    /// permit to a provisional step and wait for one the waiting workers held, for ever (a relay's window steps stopped for good that way).
     repeated: Vec<[u8; 32]>,
 }
 
@@ -259,7 +258,7 @@ pub struct WindowIndex<'a> {
 /// or across bins (one record in each). Such bytes are two transmissions, or more: an aircraft
 /// repeating a position message byte for byte (a stationary one does), or a recording replayed.
 /// Which reception is of which cannot be told from the bytes, so an event of them would mix
-/// receptions seconds apart; the window rejects the message whole (sweep 6, F8). Judged over every
+/// receptions seconds apart; the window rejects the message whole. Judged over every
 /// receiver's records before any tile thins, so every tile and every engine rejects the same.
 /// Each bin's candidates ascend by hash, so the bins are merged in one pass with nothing held but
 /// one message's receivers at a time.

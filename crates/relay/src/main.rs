@@ -253,6 +253,10 @@ async fn serve(config: Config) -> Result<(), String> {
         egress::decimal(config.max_upload.most_a_month())
     );
     let (hub, hosted) = prepare(&config, &identities[0])?;
+    // What the arenas keep free below their tops is returned on a thread of its own, off every
+    // stage (`budget::spawn_allocator_trimmer`).
+    tally_relay::budget::spawn_allocator_trimmer(tally_relay::budget::TRIM_PERIOD)
+        .map_err(|error| format!("the allocator's trimmer: {error}"))?;
     let budget = hub.budget();
     let threads = budget.threads();
     let admission = budget.admission();

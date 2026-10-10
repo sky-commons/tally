@@ -1291,7 +1291,7 @@ fn records_wait_apart_from_the_epochs_and_are_taken_in_by_stamp() -> Result<()> 
     Ok(())
 }
 
-/// Sweep 4, R-N14 and N11, and sweep 5, N3: the records the products are handed are charged to
+/// The records the products are handed are charged to
 /// the session that handed them in, never to the key that signed them, so what is taken never
 /// depends on what came first or on how many keys a peer signs with. One session forwarding
 /// records signed by many throwaway keys (more than the old eight parts) fills only its own part,
@@ -1371,7 +1371,7 @@ fn own_output_and_each_session_have_a_part_of_the_records_share_whatever_came_fi
     Ok(())
 }
 
-/// Sweep 5, N3: the peers' share is divided by the sessions open, so a session that leaves gives
+/// The peers' share is divided by the sessions open, so a session that leaves gives
 /// its part back to those that stay, and one that joins takes its part from them.
 #[test]
 fn a_session_leaving_gives_its_part_to_those_open() -> Result<()> {
@@ -1400,7 +1400,7 @@ fn a_session_leaving_gives_its_part_to_those_open() -> Result<()> {
     Ok(())
 }
 
-/// Sweep 6, F2: only a session admitted as a member has a part of the records' share, so the
+/// Only a session admitted as a member has a part of the records' share, so the
 /// sessions that divide it are the members that send records, bounded as the members are. Two
 /// thousand and forty-eight sessions that are no member (directory links and engines, each opened
 /// as every session is, `Network::joined`) leave the one member admitted the part it would have

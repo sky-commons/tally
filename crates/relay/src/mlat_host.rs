@@ -124,19 +124,37 @@
 //!   falls due and finish within the forgetting's grace never sheds, so the same stamped trace
 //!   still makes the same bytes; one that does not loses provisional positions, counted, and
 //!   never a window.
+//!   Each of these sheds (a window step past `WINDOW_STEPS_BEHIND`, a provisional step past
+//!   `PROVISIONAL_BEHIND` or whose models are late, the raw a full `Open` or `Held` store refuses,
+//!   `observations_refused`) is a bound on memory decided by how far behind this host is, not by
+//!   the stamps: two relays holding one area that shed differently make different provisional
+//!   positions for the steps shed (a shed window step's windows are solved by the next, as one
+//!   that ran late would). They are counted, and the cut beneath them is what keeps a host out of them:
+//!   RFC-0181 §10 states the consequence.
 //! - **Overload** (RFC-0181 §10). A window step that runs past `WINDOW_BUDGET_MS` (the models'
-//!   ripening less the steps a seal waits) is MLAT overloaded: the host cuts its seats to what
-//!   that run carries within the budget (`Host::judge`), a [`Cut`] from `CUT_LEAD_STEPS` past the
-//!   watermark, published for the relays holding the same areas ([`MlatHost::take_cuts`],
-//!   [`MlatHost::offer_cut`]). The seats at a step are the least any origin's newest cut at or
-//!   before it asks for, applied at the step like a description (`Host::apply`,
-//!   `Seats::set_cap`), and the receivers solved are the best ranked by key hash, so every relay
-//!   offered the same cuts solves the same receivers from the same step and makes the same
-//!   bytes: the cut is decided by rank and by stamp, never by how far behind one host was. The
-//!   receivers cut stay described and are counted refused (`MlatReport::receivers_refused`); a
-//!   host that cut lifts its cut the same way when its window steps run well within the budget.
-//!   The sheds of Behind remain beneath it, a bound on what is held and no longer the policy: a
-//!   host the cut keeps within its budget sheds nothing.
+//!   ripening less the steps a seal waits) is MLAT overloaded: the host cuts the receivers it
+//!   solves in its areas to what that run carries within the budget (`Host::judge`). The cut is a
+//!   rank threshold, the draw of the first receiver cut (`tally_mlat::intake::draw`), never a
+//!   count of seats: a [`Cut`] per area, from `CUT_LEAD_STEPS` past the watermark, published for
+//!   the relays holding the same areas ([`MlatHost::take_cuts`], [`MlatHost::offer_cut`]) and
+//!   announced again every `CUT_REFRESH_MS` while it stands, standing `CUT_TTL_MS` from each
+//!   announcement's step, so a relay that was down, or whose link was, learns a standing cut at
+//!   the next, and a cut its signer stopped announcing expires. The cut in force at a step is the
+//!   least threshold of each origin's newest announcement at or before it that has not expired, per
+//!   area, applied at the step like a description (`Host::apply`, `Seats::set_cutoffs`), and the
+//!   best ranked few (`MIN_CUT_SEATS`) are never cut. Every relay holding an area solves exactly
+//!   the receivers ranked below the threshold whatever it has described or has seats for, from
+//!   the same stamped step, and makes the same bytes: the cut is decided by rank and by stamp,
+//!   never by how far behind one host was. A cut that arrives after its step keeps its stamp
+//!   (and so its end): it takes effect at the next step, counted (`cuts_late`), and the relays
+//!   agree again from the next announcement. The receivers cut stay described and are counted
+//!   refused (`MlatReport::receivers_refused`); a host that cut lifts its cut the same way when its
+//!   window steps run well within the budget. What a cut may say is bounded where it is taken:
+//!   only the area's own MLAT relays may cut it (`Network::take_cut`), a stamp is on the step grid,
+//!   unexpired and no further ahead than `CUT_AHEAD_MS`, and the table of cuts keeps the origins
+//!   of the best rank and the lowest areas (`Cuts::offer`), never the first to arrive. The sheds
+//!   of Behind remain beneath it, and are no longer the policy: a host the cut keeps within its
+//!   budget sheds nothing.
 //! - **Capacity** (RFC-0181 §9). MLAT has its own pool of receiver seats, the count the budget
 //!   plans from the cores and memory the stages leave (`capacity`, `Budget::mlat_seats`). The
 //!   receivers seated are the best ranked of those described (`tally_mlat::intake::Seats`:
@@ -197,7 +215,7 @@ use tally_mlat::{area, provisional, window};
 use tally_mlat_solver::Site;
 use tally_mlat_solver::gate::{self, Gate};
 use tally_mlat_solver::held::{Bin, Closing, Fragment, Limits, Resealed, SealedBins};
-use tally_wire::{Decoded, Identity, PublicKey, ReceiverInfo, Record, Regions};
+use tally_wire::{Decoded, Identity, PublicKey, ReceiverInfo, Record, Region, Regions};
 
 use crate::budget::{Budget, Charge, Gauge, Store};
 use crate::config::Config;
@@ -247,15 +265,20 @@ pub trait MlatHost: Send + Sync {
 }
 
 /// An overload cut (module docs, Overload): from step `from_ms` (a multiple of `STEP_MS`), the
-/// relay `origin` asks that MLAT seat only the `seats` best ranked receivers
-/// (`tally_mlat::intake::Seats`). It is a fact of the stamps, not of a clock: the seats at a step
-/// are the least any origin's newest cut at or before that step asks for, so every relay offered
-/// the same cuts seats the same receivers at the same steps and makes the same bytes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+/// relay `origin` asks that MLAT solve, in the `areas` named, only the receivers whose rank draw
+/// (`tally_mlat::intake::draw`) is below `below`; `u128::MAX` lifts. A rank, not a count of seats:
+/// every relay holding an area solves exactly the receivers ranked below it. It stands for
+/// `CUT_TTL_STEPS` steps from `from_ms` and is announced again while it stands
+/// (`CUT_REFRESH_STEPS`). It is a fact of the stamps, not of a clock: the cut in force at a step
+/// is the least of each origin's newest announcement at or before the step that has not expired,
+/// so every relay offered the same announcements solves the same receivers at the same steps and
+/// makes the same bytes.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Cut {
     pub from_ms: u64,
     pub origin: PublicKey,
-    pub seats: u32,
+    pub below: u128,
+    pub areas: Vec<Region>,
 }
 
 /// One window step's report, as served: `tally_mlat::window::Report`, times in milliseconds.
@@ -441,6 +464,9 @@ pub struct MlatReport {
     /// effect at their step (the step was applied already: they take effect at the next).
     pub cuts_decided: u64,
     pub cuts_late: u64,
+    /// Cuts offered that were not kept: expired, stamped off the grid or too far ahead, or beyond
+    /// what the table holds (`Cuts::offer`).
+    pub cuts_unkept: u64,
     /// Cuts this relay addressed to the relays holding its areas, took from them, and refused
     /// (`Network`; filled when the report is served).
     pub cuts_sent: u64,
@@ -474,12 +500,24 @@ pub const WINDOW_TARGET_MS: u64 = WINDOW_BUDGET_MS * 3 / 4;
 /// Steps ahead of the watermark a cut takes effect, for the relay to publish it to its peers
 /// before any of them reaches the step.
 pub const CUT_LEAD_STEPS: u64 = 5;
-/// The fewest seats a cut leaves.
-pub const MIN_CUT_SEATS: usize = 8;
-/// Origins whose cuts are kept, and cuts kept of each: a relay's peers are few, and a cut is
-/// superseded by its origin's next.
+/// The fewest receivers a cut leaves solved: the best ranked of the relay's described, which no
+/// cut can unseat (`tally_mlat::intake::CUT_FLOOR_SEATS`).
+pub const MIN_CUT_SEATS: usize = tally_mlat::intake::CUT_FLOOR_SEATS;
+/// How long a cut stands from its step unless announced again, and the steps between a standing
+/// cut's announcements (`tally_wire::cut`).
+pub const CUT_TTL_MS: u64 = tally_wire::CUT_TTL_STEPS * STEP_MS;
+pub const CUT_REFRESH_MS: u64 = tally_wire::CUT_REFRESH_STEPS * STEP_MS;
+/// How far past the watermark a cut may be stamped: a cut for a later step is refused, so a
+/// signer cannot leave a cut waiting in the table for a step far ahead.
+pub const CUT_AHEAD_MS: u64 = CUT_TTL_MS;
+/// What the cut table holds, a bound on memory and not a policy: origins (those of the best rank,
+/// `tally_mlat::intake::draw`, are kept, never the first to come), the areas of each (the lowest
+/// cells), and announcements of one area not yet in force. A cut is accepted only from an area's
+/// own MLAT relays (`Network::take_cut`), which are few, so these bind nothing an honest network
+/// reaches.
 const CUT_ORIGINS: usize = 64;
-const CUTS_PER_ORIGIN: usize = 16;
+const CUT_AREAS_PER_ORIGIN: usize = 256;
+const CUTS_AHEAD_PER_AREA: usize = 8;
 
 /// The step clock's grid: the host steps at every multiple of it the watermark passes.
 pub const STEP_MS: u64 = 1_000;
@@ -488,7 +526,7 @@ pub const SETTLE_MS: u64 = 2_000;
 /// Window steps (the steps a window fell due at, one a stride: `STRIDE` bins, 40 s) that may wait
 /// not started (one is running) before the oldest is shed (module docs, Behind). A count of window
 /// steps, never of the 1 s steps the watermark passes: nothing sized by the step clock reads it
-/// (sweep 6, F10: before, one `STEPS_BEHIND` was this and the seals' bound below, so the window
+/// (before, one `STEPS_BEHIND` was this and the seals' bound below, so the window
 /// queue's length set the open raw the budget reserves and the ripening checked against it).
 pub const WINDOW_STEPS_BEHIND: usize = 4;
 /// Steps' seals (one a step, 1 s each, a seal taking milliseconds) a host within its plan falls
@@ -510,8 +548,7 @@ pub const PROVISIONAL_BEHIND: usize = 0;
 /// A provisional step's own run, and its records' way to the relay that gathers the live world:
 /// what is left of `products::WORLD_SETTLE_MS` once a transmission's provisional is due and its
 /// step starts (below). Held by the stamps: a step whose records are taken once the watermark is
-/// this far past it has them refused whole, counted (`MlatReport::provisional_steps_late`; sweep
-/// 4, R-P16: before, a step running 900 to 1,000 ms missed the world second unseen; sweep 5, R2:
+/// this far past it has them refused whole, counted (`MlatReport::provisional_steps_late`; before, a step running 900 to 1,000 ms missed the world second unseen, and
 /// before, it was the wall clock from its turn to its run's end, which left out the watermark's
 /// lag and the wait to be taken), and one that overruns its whole step has its next step shed
 /// (`PROVISIONAL_BEHIND`). The records' way on from here is `tally-load`'s provisional latency to
@@ -805,7 +842,7 @@ enum Finished {
     /// Receivers that stopped taking part, forgotten in every bin sealed before.
     Forgotten { generation: u64 },
     /// A window step's outcome, boxed (it is far larger than the others), with the `Engine` charge
-    /// of the step's working set, which holds it until it is applied (sweep 4, N17).
+    /// of the step's working set, which holds it until it is applied.
     Stepped(u64, Box<window::Outcome>, Charge, u64),
     /// Provisional step `step_ms`'s outcome, and the batches whose notes it refused with their
     /// step's for their count, and let go as shed.
@@ -865,8 +902,7 @@ struct Waiting {
 
 impl Shard {
     /// A batch into the intake, judged ahead or late by its own stamp however late it is taken
-    /// (one that waited for its description too, as the reference engine judges it: sweep 4,
-    /// R-P5), every byte of open raw it takes charged to `Open` before it is held
+    /// (one that waited for its description too, as the reference engine judges it), every byte of open raw it takes charged to `Open` before it is held
     /// (`Intake::ingest_verified_taking`).
     fn ingest(&mut self, batch: &Decoded) -> (Ingested, Vec<Note>) {
         let Self { intake, open, .. } = self;
@@ -1031,73 +1067,168 @@ struct Descriptions {
     asked_ms: u64,
 }
 
-/// The overload cuts known (module docs, Overload), by the relay that decided each.
+/// The overload cuts known (module docs, Overload): per relay that announced them, per area, by
+/// the step each takes effect from.
 #[derive(Default)]
 struct Cuts {
-    by_origin: BTreeMap<PublicKey, BTreeMap<u64, u32>>,
+    by_origin: BTreeMap<PublicKey, BTreeMap<u64, BTreeMap<u64, u128>>>,
     /// Decided here and not yet taken for publishing.
     decided: Vec<Cut>,
-    /// The seats of the newest cut this host decided, while it holds one under the limit: only a
-    /// host that cut lifts its cut (a cut offered by a peer is the peer's to lift).
-    own: Option<u32>,
+    /// The cut this host decided and announces again while it stands: only a host that cut lifts
+    /// its cut (a cut offered by a peer is the peer's to lift).
+    own: Option<Standing>,
     /// The last step whose cut was applied: one for a step at or before it takes effect at the
-    /// next (counted).
+    /// next (counted late), with the expiry its stamp gave it.
     applied_ms: Option<u64>,
 }
 
+/// The cut this host stands by: its rank threshold and the step of its newest announcement.
+#[derive(Clone)]
+struct Standing {
+    below: u128,
+    last_from_ms: u64,
+    areas: Vec<Region>,
+}
+
+/// What became of a cut offered (`Cuts::offer`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Offered {
+    Kept,
+    /// Kept, for a step applied already: it takes effect at the next, and counts late.
+    Late,
+    /// Not kept: malformed, expired, too far ahead, or beyond what the table holds.
+    Refused,
+}
+
 impl Cuts {
-    /// Takes `cut`; false when it was too late for its step (it takes effect at the next), or was
-    /// not kept for want of room.
-    fn offer(&mut self, mut cut: Cut) -> bool {
-        let mut on_time = true;
-        if let Some(applied) = self.applied_ms.filter(|applied| cut.from_ms <= *applied) {
-            cut.from_ms = applied + STEP_MS;
-            on_time = false;
+    /// The step the stamps have reached, as far as the host knows: the newest watermark it was
+    /// asked with (`asked_ms`), or the last step applied.
+    fn now_ms(&self, asked_ms: u64) -> u64 {
+        asked_ms.max(self.applied_ms.unwrap_or(0))
+    }
+
+    /// Takes `cut`. A cut whose step is not on the grid or is past `MAX_CUT_FROM_MS`, one that
+    /// expired already, and one stamped further ahead than `CUT_AHEAD_MS` are refused (checked
+    /// arithmetic throughout: no stamp a peer signs can overflow it); the table's bounds keep the
+    /// origins of the best rank and the lowest areas.
+    fn offer(&mut self, cut: &Cut, asked_ms: u64) -> Offered {
+        if !cut.from_ms.is_multiple_of(STEP_MS) || cut.from_ms > tally_wire::MAX_CUT_FROM_MS {
+            return Offered::Refused;
         }
-        cut.from_ms = cut.from_ms.div_ceil(STEP_MS) * STEP_MS;
+        let Some(expires_ms) = cut.from_ms.checked_add(CUT_TTL_MS) else {
+            return Offered::Refused;
+        };
+        let now = self.now_ms(asked_ms);
+        if now > 0 && (expires_ms <= now || cut.from_ms > now.saturating_add(CUT_AHEAD_MS)) {
+            return Offered::Refused;
+        }
         if !self.by_origin.contains_key(&cut.origin) && self.by_origin.len() >= CUT_ORIGINS {
-            return false;
+            let rank = |key: &PublicKey| (tally_mlat::intake::draw(key), *key);
+            let Some(worst) = self.by_origin.keys().max_by_key(|key| rank(key)).copied() else {
+                return Offered::Refused;
+            };
+            if rank(&cut.origin) >= rank(&worst) {
+                return Offered::Refused;
+            }
+            self.by_origin.remove(&worst);
         }
-        let entries = self.by_origin.entry(cut.origin).or_default();
-        entries.insert(cut.from_ms, cut.seats);
-        while entries.len() > CUTS_PER_ORIGIN {
-            entries.pop_first();
+        let areas = self.by_origin.entry(cut.origin).or_default();
+        let mut kept = false;
+        for area in &cut.areas {
+            let cell = area.as_u64();
+            if !areas.contains_key(&cell) && areas.len() >= CUT_AREAS_PER_ORIGIN {
+                let Some(highest) = areas.keys().next_back().copied() else {
+                    continue;
+                };
+                if cell >= highest {
+                    continue;
+                }
+                areas.remove(&highest);
+            }
+            let entries = areas.entry(cell).or_default();
+            entries.insert(cut.from_ms, cut.below);
+            // Those in force are one; the rest are ahead, bounded by their step.
+            while entries.range(now..).count() > CUTS_AHEAD_PER_AREA {
+                entries.pop_last();
+            }
+            kept = true;
         }
-        on_time
+        if !kept {
+            return Offered::Refused;
+        }
+        match self.applied_ms {
+            Some(applied) if cut.from_ms <= applied => Offered::Late,
+            _ => Offered::Kept,
+        }
     }
 
-    /// The seats asked for at `step_ms`: the least of each origin's newest cut at or before it,
-    /// none asking for any beyond `limit`.
-    fn seats_at(&self, step_ms: u64, limit: usize) -> usize {
-        self.by_origin
-            .values()
-            .filter_map(|entries| {
-                entries
-                    .range(..=step_ms)
-                    .next_back()
-                    .map(|(_, seats)| *seats)
-            })
-            .map(|seats| seats as usize)
-            .fold(limit, usize::min)
-            .max(MIN_CUT_SEATS.min(limit))
+    /// The cuts in force at `step_ms`: per area, the least threshold of each origin's newest
+    /// announcement at or before the step that has not expired by it. A lifting announcement
+    /// (`u128::MAX`) asks for nothing.
+    fn cutoffs_at(&self, step_ms: u64) -> Vec<(Region, u128)> {
+        let mut least: BTreeMap<u64, u128> = BTreeMap::new();
+        for areas in self.by_origin.values() {
+            for (cell, entries) in areas {
+                let Some((from_ms, below)) = entries.range(..=step_ms).next_back() else {
+                    continue;
+                };
+                if from_ms
+                    .checked_add(CUT_TTL_MS)
+                    .is_none_or(|end| end <= step_ms)
+                {
+                    continue;
+                }
+                let entry = least.entry(*cell).or_insert(*below);
+                *entry = (*entry).min(*below);
+            }
+        }
+        least
+            .into_iter()
+            .filter(|(_, below)| *below != u128::MAX)
+            .filter_map(|(cell, below)| Region::from_u64(cell).ok().map(|area| (area, below)))
+            .collect()
     }
 
-    /// `origin`'s newest cut, if any.
-    fn newest(&self, origin: &PublicKey) -> Option<(u64, u32)> {
-        self.by_origin
-            .get(origin)
-            .and_then(|entries| entries.iter().next_back().map(|(at, seats)| (*at, *seats)))
-    }
-
-    /// Forgets what a step at `step_ms` no longer needs: each origin's cuts before its newest at
-    /// or before the step.
+    /// Notes that the step at `step_ms` was applied, and forgets what it no longer needs: each
+    /// area's announcements before its newest at or before the step, those expired, and any
+    /// stamped past what `CUT_AHEAD_MS` allows (offered before the host knew the watermark).
     fn applied(&mut self, step_ms: u64) {
         self.applied_ms = Some(step_ms);
-        for entries in self.by_origin.values_mut() {
-            let keep = entries.range(..=step_ms).next_back().map(|(at, _)| *at);
-            if let Some(keep) = keep {
-                *entries = entries.split_off(&keep);
+        let ahead = step_ms.saturating_add(CUT_AHEAD_MS);
+        for areas in self.by_origin.values_mut() {
+            for entries in areas.values_mut() {
+                let keep = entries.range(..=step_ms).next_back().map(|(at, _)| *at);
+                if let Some(keep) = keep {
+                    *entries = entries.split_off(&keep);
+                }
+                entries.retain(|at, _| {
+                    *at <= ahead && at.checked_add(CUT_TTL_MS).is_some_and(|end| end > step_ms)
+                });
             }
+            areas.retain(|_, entries| !entries.is_empty());
+        }
+        self.by_origin.retain(|_, areas| !areas.is_empty());
+    }
+
+    /// Announces `below` for `areas` from `from_ms`: offered to this table and kept to be taken
+    /// for publishing (`MlatHost::take_cuts`), a record for each `MAX_CUT_AREAS` of the areas.
+    fn announce(
+        &mut self,
+        origin: PublicKey,
+        from_ms: u64,
+        below: u128,
+        areas: &[Region],
+        asked_ms: u64,
+    ) {
+        for chunk in areas.chunks(tally_wire::MAX_CUT_AREAS) {
+            let cut = Cut {
+                from_ms,
+                origin,
+                below,
+                areas: chunk.to_vec(),
+            };
+            self.offer(&cut, asked_ms);
+            self.decided.push(cut);
         }
     }
 }
@@ -1129,7 +1260,7 @@ struct Holder {
 /// oldest batches going first for its newest; and when the share is full, receivers that rank
 /// below the one offering (`Seats::draw_of`) give way, their oldest first, and one that ranks below
 /// every receiver holding is not held. So who is held never depends on arrival or on which thread
-/// offered first, and the share is never charged past (sweep 4, R-P15: before, one pool refused each
+/// offered first, and the share is never charged past (before, one pool refused each
 /// batch past it in arrival order). Its lock is taken last, under a raw shard's or the
 /// descriptions', never before either.
 struct WaitingRoom {
@@ -1229,7 +1360,7 @@ impl WaitingRoom {
     /// newest) and within the share, receivers that rank below it giving way, oldest first, and
     /// none above it (type docs); charges what they add to what is held, `bytes` less `replacing`
     /// (the caller lets the `replacing` bytes go only once this is charged, so what it replaces is
-    /// never charged twice: sweep 5, N13), and counts what it let go in `dropped`. `None` when it
+    /// never charged twice), and counts what it let go in `dropped`. `None` when it
     /// is not held: past its own bound, or with the share held by receivers that rank above it.
     fn admit(
         &mut self,
@@ -1506,6 +1637,7 @@ struct Shared {
     seats: Arc<Seats>,
     cuts: Mutex<Cuts>,
     cuts_late: AtomicU64,
+    cuts_unkept: AtomicU64,
     /// What a window step may run for before MLAT is overloaded: `WINDOW_BUDGET_MS`, or a test's.
     window_budget_ms: OnceLock<u64>,
     published: Mutex<Published>,
@@ -1522,7 +1654,7 @@ struct Shared {
     sealed_ms: AtomicU64,
     /// Whether an engine runs (the areas are not empty), and the last step an ask handed the
     /// engine's thread: an ask wakes it only when it passes a step not handed yet, and never with
-    /// no engine to step (sweep 5, R10).
+    /// no engine to step.
     solving: AtomicBool,
     ticked_ms: AtomicU64,
     /// The least stamp of a batch offered to the engine running: where its steps begin.
@@ -1554,10 +1686,10 @@ struct Shared {
     orphan_batches: Mutex<Orphans>,
     /// What the receptions waiting for provisional solving are charged to the `Engine` store:
     /// `provisional::WAITING_BYTES` each, taken before a step keeps them. Locked only to grow or
-    /// shrink it, never across a step's work (sweep 4, N16).
+    /// shrink it, never across a step's work.
     waiting: Mutex<Charge>,
     /// Receptions waiting for provisional solving, as the last provisional step left them: none,
-    /// and nothing heard, is a step with nothing to weigh, which takes no thread (sweep 4, N18).
+    /// and nothing heard, is a step with nothing to weigh, which takes no thread.
     receptions_waiting: AtomicUsize,
     /// Receptions waiting, at most (`Capacity::waiting`).
     most_waiting: usize,
@@ -1884,7 +2016,7 @@ impl Shared {
 
     /// Every step's records not yet taken, in order, as the relay takes them at watermark
     /// `watermark_ms`: a provisional step's that are late by then are refused whole and counted
-    /// (`MlatReport::provisional_steps_late`), by the stamps alone (sweep 5, R2: before, by the
+    /// (`MlatReport::provisional_steps_late`), by the stamps alone (before, by the
     /// wall clock from its turn to its run's end, which left out the watermark's lag and the wait
     /// to be taken, and made a test's verdict its machine's speed). `None`: taken as they are, by
     /// a caller that waited for the host (`HostedMlat::take_signed`).
@@ -2007,6 +2139,7 @@ impl HostedMlat {
             seats: Arc::clone(&seats),
             cuts: Mutex::new(Cuts::default()),
             cuts_late: AtomicU64::new(0),
+            cuts_unkept: AtomicU64::new(0),
             window_budget_ms: OnceLock::new(),
             published: Mutex::new(Published::default()),
             commands: AtomicUsize::new(0),
@@ -2068,7 +2201,7 @@ impl HostedMlat {
         let spawned = std::thread::Builder::new()
             .name("tally-mlat".to_owned())
             .spawn(move || {
-                // A panic on the engine's thread ends the process (sweep 5, N7).
+                // A panic on the engine's thread ends the process.
                 let _ends = EndOnUnwind;
                 host.run(&received);
             });
@@ -2208,7 +2341,7 @@ impl HostedMlat {
 
 impl Drop for HostedMlat {
     fn drop(&mut self) {
-        // The engine's thread wakes for messages alone (sweep 4, N18): this is its last.
+        // The engine's thread wakes for messages alone: this is its last.
         let _ = self.messages.send(Message::Stop);
     }
 }
@@ -2278,7 +2411,7 @@ impl MlatHost for HostedMlat {
         let generation = scope.generation;
         drop(scope);
         if !restart && !left.is_empty() {
-            // Every receiver the change let go, together (sweep 5, R6).
+            // Every receiver the change let go, together.
             self.send(Command::Left(generation, left));
         }
         let solving = !areas.is_empty();
@@ -2361,7 +2494,7 @@ impl MlatHost for HostedMlat {
             descriptions.asked_ms = descriptions.asked_ms.max(watermark_ms);
         }
         // The engine's thread is woken only for a step the watermark passed and no ask handed it
-        // yet, and never with no engine to step (sweep 5, R10: before, every ask woke it, ten
+        // yet, and never with no engine to step (before, every ask woke it, ten
         // times a second, areas or none). An ask dropped while the queue is full is the next
         // one's: its watermark is no older.
         let step = floor_step(watermark_ms);
@@ -2388,13 +2521,20 @@ impl MlatHost for HostedMlat {
     }
 
     fn offer_cut(&self, cut: Cut) {
+        let asked_ms = self.shared.descriptions().asked_ms;
         let mut cuts = self
             .shared
             .cuts
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !cuts.offer(cut) {
-            self.shared.cuts_late.fetch_add(1, Ordering::Relaxed);
+        match cuts.offer(&cut, asked_ms) {
+            Offered::Kept => {}
+            Offered::Late => {
+                self.shared.cuts_late.fetch_add(1, Ordering::Relaxed);
+            }
+            Offered::Refused => {
+                self.shared.cuts_unkept.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 
@@ -2426,6 +2566,7 @@ impl MlatHost for HostedMlat {
         report.waiting_dropped = shared.waiting_dropped.load(Ordering::Relaxed);
         report.priority_unset = shared.priority_unset.load(Ordering::Relaxed);
         report.cuts_late = shared.cuts_late.load(Ordering::Relaxed);
+        report.cuts_unkept = shared.cuts_unkept.load(Ordering::Relaxed);
         report.seat_cap = shared.seats.cap() as u64;
         report.seat_limit = shared.seats.limit() as u64;
         report.seats_taken = shared.seats.taken() as u64;
@@ -2480,8 +2621,7 @@ struct Host {
 impl Host {
     fn run(mut self, received: &Receiver<Message>) {
         self.settle_sealed();
-        // It wakes for a message and for nothing else: idle, it costs nothing (sweep 4, N18;
-        // before, it woke ten times a second to look whether it should stop).
+        // It wakes for a message and for nothing else: idle, it costs nothing (before, it woke ten times a second to look whether it should stop).
         while let Ok(message) = received.recv() {
             self.shared.wakeups.fetch_add(1, Ordering::Relaxed);
             match message {
@@ -2516,7 +2656,7 @@ impl Host {
     /// The watermark passed `watermark_ms`: every multiple of `STEP_MS` it passed and that is not
     /// stepped yet is, in order: its descriptions applied (`apply`), the receivers they let go
     /// forgotten in the sealed bins, and its complete bins taken and sealed in their turn
-    /// (`close`), every step whether or not a window falls due at it (sweep 5, H-c: before, a
+    /// (`close`), every step whether or not a window falls due at it (before, a
     /// step's seal waited for the window step before it, so every step a window step ran past was
     /// queued as one, and shed); and its provisional step proposed. The first step of an engine is
     /// the first multiple after the least stamp of its raw, which every batch stamped before the
@@ -2570,21 +2710,29 @@ impl Host {
         shared.orphans_expired.fetch_add(expired, Ordering::Relaxed);
         let mut told = Vec::new();
         let mut left = Vec::new();
-        // The cut in force at this step (module docs, Overload): the same on every relay offered
-        // the same cuts. The receivers it seats or unseats settle with the descriptions'.
+        // The cuts in force at this step (module docs, Overload): the same on every relay offered
+        // the same announcements. The receivers they seat or unseat settle with the descriptions'.
+        // A cut this host stands by is announced again once its refresh is due.
         let mut moved = {
             let mut cuts = shared
                 .cuts
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let seats = cuts.seats_at(step_ms, shared.seats.limit());
             cuts.applied(step_ms);
-            drop(cuts);
-            if seats == shared.seats.cap() {
-                Vec::new()
-            } else {
-                shared.seats.set_cap(seats)
+            if let Some(standing) = cuts.own.clone() {
+                let due = standing.last_from_ms.saturating_add(CUT_REFRESH_MS);
+                let from_ms = (step_ms / STEP_MS + CUT_LEAD_STEPS) * STEP_MS;
+                if from_ms >= due {
+                    let origin = self.identity.public();
+                    cuts.announce(origin, from_ms, standing.below, &standing.areas, step_ms);
+                    if let Some(own) = cuts.own.as_mut() {
+                        own.last_from_ms = from_ms;
+                    }
+                }
             }
+            let cutoffs = cuts.cutoffs_at(step_ms);
+            drop(cuts);
+            shared.seats.set_cutoffs(cutoffs)
         };
         let at = Some(step_ms.saturating_sub(1));
         for (_, info) in &due {
@@ -2646,7 +2794,7 @@ impl Host {
             // it, as the engine solving in line does: one of them not solved at its turn, it is
             // shed whole and counted, never started with other models, so a step that runs makes
             // the reference's bytes however long a window step ran or waited (module docs,
-            // Threads; sweep 4, N6; sweep 5, N8: a window step that waited or was put off counts
+            // Threads): a window step that waited or was put off counts
             // as solved only once it is).
             if self.windows_through() < step_ms.saturating_sub(MODELS_RIPEN_MS) {
                 self.shared
@@ -2758,8 +2906,8 @@ impl Host {
 
     /// Step `closed`'s bins are sealed and held: a window step is queued if a window falls due at
     /// it (and started, if none runs), and what no window still to be solved needs is forgotten
-    /// by its stamp, every step's seal alike, before the next seal reads the room it left (sweep 5,
-    /// N1: before, only a window step that ran forgot, so the room a seal had, and which receivers
+    /// by its stamp, every step's seal alike, before the next seal reads the room it left.
+    /// Before, only a window step that ran forgot, so the room a seal had, and which receivers
     /// it refused, was how long the window steps ran). Nothing a window step queued or running has
     /// still to solve is forgotten (`Engine::forget_by`'s floor): a host whose window steps start
     /// and finish within the grace the forgetting leaves them forgets exactly what the engine in
@@ -2803,9 +2951,9 @@ impl Host {
 
     /// Forgets receivers that left in every sealed bin off this thread, as background work (each
     /// bin that held any of them re-sealed once for all of them, `SealedBins::without_each`),
-    /// below the stages' priority and within MLAT's threads like a seal (sweep 4, N3: before, the
+    /// below the stages' priority and within MLAT's threads like a seal (before, the
     /// engine's thread re-sealed every bin once a receiver, at the stages' priority): no seal and
-    /// no other forget is done until it reports. Bin by bin (sweep 5, N2): each re-sealed bin is
+    /// no other forget is done until it reports. Bin by bin: each re-sealed bin is
     /// charged to the `Held` store before it is built, and held in place of the old one on this
     /// thread before the next is asked for, so the re-sealing holds at most one bin beyond the
     /// sealed bins, charged, and whether one is refused is what the bins held decide; one refused
@@ -2867,24 +3015,40 @@ impl Host {
     }
 
     /// A window step ran `ran_ms` (module docs, Overload): longer than `WINDOW_BUDGET_MS`, MLAT
-    /// is overloaded, and cuts its seats to what that run says it carries in `WINDOW_TARGET_MS`;
-    /// seats cut and a run well within the budget, it lifts the cut the same way. Either is a cut
-    /// from `CUT_LEAD_STEPS` past the watermark, published for the relays holding the same areas
-    /// ([`MlatHost::take_cuts`]): the receivers solved are decided by rank and the stamp of the
-    /// cut, never by how far behind this host happened to be.
+    /// is overloaded, and cuts the receivers it solves, in the areas it holds, to the best ranked
+    /// that run says it carries in `WINDOW_TARGET_MS`: a rank threshold (the draw of the first
+    /// receiver cut), so every relay holding an area solves the same receivers whatever each has
+    /// described. Receivers cut and a run well within the budget, it lifts the cut the same way.
+    /// Either is an announcement from `CUT_LEAD_STEPS` past the watermark, published for the relays
+    /// holding the same areas ([`MlatHost::take_cuts`]) and announced again while it stands
+    /// (`Host::apply`): the receivers solved are decided by rank and the stamp of the cut, never by
+    /// how far behind this host happened to be.
     fn judge(&mut self, ran_ms: u64) {
         let (Some(through), Some(_)) = (self.through_ms, self.engine.as_ref()) else {
             return;
         };
+        let areas = self
+            .shared
+            .scope
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .areas
+            .clone();
+        if areas.is_empty() {
+            return;
+        }
         let seats = &self.shared.seats;
-        let (cap, taken, limit) = (seats.cap(), seats.taken(), seats.limit());
-        let own_cut = self
+        let limit = seats.limit();
+        let scoped = seats.scoped(|area| areas.contains(area));
+        let (taken, total) = (scoped.seated, scoped.draws.len());
+        let origin = self.identity.public();
+        let own = self
             .shared
             .cuts
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .own
-            .is_some();
+            .clone();
         let budget = self
             .shared
             .window_budget_ms
@@ -2902,34 +3066,37 @@ impl Host {
             // part of it is the aircraft's, whatever the receivers), so a cut aimed at the
             // budget in one go would undershoot; the next window step judges again.
             carried.max(floor).max(taken / 2).min(taken - 1)
-        } else if own_cut && cap < limit && taken >= cap && ran_ms < budget / 2 {
-            let carried = (cap as u128 * u128::from(target) / u128::from(ran_ms.max(1))) as usize;
-            carried.min(limit).min(cap + cap / 4 + 1)
+        } else if own.is_some() && total > taken && ran_ms < budget / 2 {
+            let carried = (taken as u128 * u128::from(target) / u128::from(ran_ms.max(1))) as usize;
+            carried.min(taken + taken / 4 + 1)
         } else {
             return;
         };
-        if wanted == cap {
+        // The first receiver cut, by rank: everything below its draw stays.
+        let below = scoped.draws.get(wanted).copied().unwrap_or(u128::MAX);
+        if own
+            .as_ref()
+            .map_or(below == u128::MAX, |own| own.below == below)
+        {
             return;
         }
-        let origin = self.identity.public();
         let from_ms = (through / STEP_MS + CUT_LEAD_STEPS) * STEP_MS;
-        let cut = Cut {
-            from_ms,
-            origin,
-            seats: u32::try_from(wanted).unwrap_or(u32::MAX),
-        };
         let mut cuts = self
             .shared
             .cuts
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         // One cut in flight at a time: the next decision waits for this one to take effect.
-        if cuts.newest(&origin).is_some_and(|(at, _)| at > through) {
+        if own.as_ref().is_some_and(|own| own.last_from_ms > through) {
             return;
         }
-        cuts.offer(cut);
-        cuts.decided.push(cut);
-        cuts.own = (wanted < limit).then_some(cut.seats);
+        let cells = areas.cells();
+        cuts.announce(origin, from_ms, below, cells, through);
+        cuts.own = (below != u128::MAX).then(|| Standing {
+            below,
+            last_from_ms: from_ms,
+            areas: cells.to_vec(),
+        });
         drop(cuts);
         self.shared.count(|counts| counts.cuts_decided += 1);
     }
@@ -2963,7 +3130,7 @@ impl Host {
     /// provisional solving and solves what is due, carrying the models of the windows that fell due
     /// `MODELS_RIPEN_MS` before it. Done when it reports; its records are late from
     /// `PROVISIONAL_PUBLISH_MS` past it (`Shared::take_signed`). A step with nothing to weigh (nothing
-    /// heard, nothing waiting) is done here, on no thread (sweep 4, N18).
+    /// heard, nothing waiting) is done here, on no thread.
     fn start_provisional(&mut self, step_ms: u64) {
         let generation = self.generation;
         let most_waiting = self.shared.most_waiting;
@@ -3011,7 +3178,7 @@ impl Host {
             // Read every shard in the batches' order, then decide every batch whole across all of
             // them, then keep and find what is due: each pass all shards in parallel. An address
             // shard is held by its pass alone: no stage and not the engine's thread ever waits on
-            // it (sweep 5, R9).
+            // it.
             let (read, _) = window::parallel(
                 plan.threads,
                 &shards,
@@ -3030,7 +3197,7 @@ impl Host {
             // Charged before they are kept: the count admitted fits the `Engine` store's share
             // for them (`Capacity::waiting`), so the charge is refused only past the budget,
             // and then every batch's replies are, whole. The charge is locked only to grow it here
-            // and to bring it to what is left after, never across the pass (sweep 4, N16).
+            // and to bring it to what is left after, never across the pass.
             let kept: usize = sizes
                 .iter()
                 .filter(|(order, _)| !refused.contains(order))
@@ -3136,7 +3303,7 @@ impl Host {
                 let ran_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
                 // The working set's charge travels with the outcome until it is applied, so a
                 // finished window waiting for the engine's thread is never outside every store
-                // (sweep 4, N17).
+                //.
                 let _ = messages.send(Message::Finished(Finished::Stepped(
                     generation,
                     Box::new(outcome),
@@ -3148,8 +3315,8 @@ impl Host {
     }
 
     /// A seal's or a step's outcome, applied if its engine is still the one running; its report
-    /// kept. What a seal refused is counted when it finishes, whichever engine it was for (sweep 5,
-    /// H-b: before, it waited in the engine for its next window step, and went with the engine).
+    /// kept. What a seal refused is counted when it finishes, whichever engine it was for.
+    /// Before, it waited in the engine for its next window step, and went with the engine).
     fn finished(&mut self, finished: Finished) {
         match finished {
             Finished::Sealed {
@@ -3238,8 +3405,7 @@ impl Host {
                         counts.provisional.add(&report);
                     });
                     // Taken once the watermark is past its publish slot, they would reach the live
-                    // world after its second is sealed: refused whole then, counted (sweep 4,
-                    // R-P16; sweep 5, R2). Its state is applied all the same, so the steps after
+                    // world after its second is sealed: refused whole then, counted. Its state is applied all the same, so the steps after
                     // it weigh what the reference does.
                     self.publish(
                         records,
@@ -3278,7 +3444,7 @@ impl Host {
     /// The bytes the sealed bins may still grow by: within the engine's own bound and the relay's
     /// `Held` store, both less what the stamps keep sealed (`stamps_bytes`), so a function of what
     /// was sealed and forgotten by the steps' stamps alone: never of what is open now, nor of how
-    /// long a window step ran or waited, nor of the bins its floor keeps (sweep 6, N1/F7: before,
+    /// long a window step ran or waited, nor of the bins its floor keeps (before,
     /// the room was the store less every sealed bin, those a waiting window's floor kept
     /// included, so a relay whose window steps ran long sealed receivers out of a bin that a
     /// relay keeping up held, and the room passed the `SEALED_BINS_HELD` the store reserves).
@@ -3396,7 +3562,7 @@ impl Host {
     /// Takes every bin complete through `settled` out of every shard (a move under each shard's
     /// lock in turn: raw stamped at or after the step that takes it is late by its stamp, so what
     /// is taken is the same whenever this runs), with the `Open` charge of what was taken. What the
-    /// shards refused is counted now, as it was decided (sweep 5, H-b).
+    /// shards refused is counted now, as it was decided.
     fn take_complete(&mut self, settled: i64) -> (Vec<Fragment>, Vec<Charge>) {
         let mut fragments: Vec<Fragment> = Vec::new();
         let mut dropped = Dropped::default();
@@ -3482,7 +3648,7 @@ impl Host {
 
     /// An engine goes: its raw, what it was told, and its steps with it. The address shards'
     /// state and what it charged are let go on the provisional runner, after the step it may be
-    /// running: this thread never waits on an address shard (sweep 5, R9: before, it cleared
+    /// running: this thread never waits on an address shard (before, it cleared
     /// them here, waiting on a provisional step's every read and settle).
     fn drop_steps(&mut self) {
         self.shared.sealed.clear();
@@ -3740,8 +3906,8 @@ const _: () = assert!(0 < PROVISIONAL_NICE && PROVISIONAL_NICE < BACKGROUND_NICE
 
 /// Lowers the calling thread's priority `below` nice steps under its own (what the thread that
 /// started it had: the relay's), at most to the lowest; false when it could not be lowered all of
-/// them (sweep 4, N9: before, it set 5 or 10 outright, which on a relay started at nice 5 or more
-/// left MLAT level with the stages, or failed unseen; sweep 5, R7: a relay already near the lowest,
+/// them (before, it set 5 or 10 outright, which on a relay started at nice 5 or more
+/// left MLAT level with the stages, or failed unseen; a relay already near the lowest,
 /// at nice 19 none, has MLAT level with or less far below its stages than planned, counted). A
 /// thread may always lower its own.
 fn run_at(below: libc::c_int) -> bool {
@@ -3778,7 +3944,7 @@ enum Kind {
     Provisional,
 }
 
-/// MLAT's runners (sweep 5, R7): one thread each for the seals and forgets, the window steps and
+/// MLAT's runners: one thread each for the seals and forgets, the window steps and
 /// the provisional steps, started with the host, each at its urgency below the stages (`Urgency`,
 /// counted in `priority_unset` when it could not be), and living as long as the host does, each
 /// doing what it is handed one piece at a time, in the order handed, as one of the threads the
@@ -3844,7 +4010,7 @@ fn runner(name: &str, urgency: Urgency, shared: &Arc<Shared>) -> Result<Sender<W
     Ok(handing)
 }
 
-/// Ends the process when the thread it is held on unwinds (sweep 5, N7, decided): hosted MLAT that
+/// Ends the process when the thread it is held on unwinds (decided): hosted MLAT that
 /// panics ends the relay like every other part of it (`crate::abort_on_any_panic`, which the
 /// relay's program sets and which ends it before anything unwinds; a worker's panic inside a step
 /// is its step's, `gate::on_threads`). Held by the engine's thread and every runner, so a host
@@ -4511,13 +4677,13 @@ mod tests {
         Ok(first)
     }
 
-    /// RFC-0181 §9, §10, items 8 and 16 of the sweep (and N16 of sweep 3): a host whose seal is
+    /// RFC-0181 §9, §10: a host whose seal is
     /// held (shut on a gate) takes every later step's bins as the watermark passes it, each sealed
     /// in its turn once the held seal reports, and sheds no window step (whether a window falls due
-    /// at a step is known once its seal is held, sweep 5, H-c); its provisional steps keep running
+    /// at a step is known once its seal is held); its provisional steps keep running
     /// apart from the held seal, every one at its turn, until those from `MODELS_RIPEN_MS` after
     /// the held step, whose models it may not have, each of which is shed at its turn and counted,
-    /// never run with other models (sweep 4, N6). Opened, it catches up: every bin sealed, windows
+    /// never run with other models. Opened, it catches up: every bin sealed, windows
     /// solved, no store ever past its limit, nothing left in hand.
     #[test]
     fn a_host_whose_seal_is_held_seals_every_step_in_turn_and_holds_every_store()
@@ -4574,7 +4740,7 @@ mod tests {
             let report = host.report();
             assert_eq!(report.steps_shed, 0, "at {step}: {report:?}");
             // Seals `SEALS_BEHIND` steps behind are within what the budget reserves open raw for
-            // (`OPEN_MS`): no raw refused for room (sweep 6, F10).
+            // (`OPEN_MS`): no raw refused for room.
             if step <= held_at + SEALS_BEHIND as u64 * STEP_MS {
                 assert_eq!(report.observations_refused, 0, "at {step}: {report:?}");
             }
@@ -4678,7 +4844,7 @@ mod tests {
         Ok(())
     }
 
-    /// Item 15 of the sweep: batches of a receiver never described wait in their own store
+    /// Batches of a receiver never described wait in their own store
     /// (`Orphans`), never in `Notes`, and are let go by the steps, `ORPHAN_MS` after their stamps,
     /// whether or not another batch comes.
     #[test]
@@ -4714,7 +4880,7 @@ mod tests {
         Ok(())
     }
 
-    /// Item 13 of the sweep: descriptions take effect at the step after their stamps, wherever they
+    /// Descriptions take effect at the step after their stamps, wherever they
     /// fall. A receiver described again midway (out of the areas, so it stops taking part, and back
     /// a few seconds later) and one whose first description comes midway (its batches before it
     /// waiting, those that waited too long let go) make the same bytes in the hosted MLAT as in the
@@ -4773,7 +4939,7 @@ mod tests {
         Ok(())
     }
 
-    /// Sweep 3, N7: a receiver that stops taking part while a seal is off the engine's thread (a
+    /// A receiver that stops taking part while a seal is off the engine's thread (a
     /// later step's descriptions let it go while an earlier step's seal is held) is forgotten in
     /// the bins that seal was sealing and in the bins of the steps sealed after it, as the
     /// reference engine forgets it in every bin sealed before its step: the sealed bins are the
@@ -4895,7 +5061,7 @@ mod tests {
 
     /// RFC-0181 §10, "The cores": every MLAT step runs below the stages' priority, provisional
     /// steps above seals and window steps, so a host short of cores delays MLAT, which sheds,
-    /// and never raw. Below the relay's own priority, whatever it was started at (sweep 4, N9: a
+    /// and never raw. Below the relay's own priority, whatever it was started at (a
     /// relay started at nice 3 runs its provisional steps at 8, not 5).
     #[test]
     fn every_step_runs_below_the_stages() -> Result<(), String> {
@@ -4943,7 +5109,7 @@ mod tests {
         Ok(())
     }
 
-    /// Sweep 5, H-c and N1: while a window step runs long (held shut on a gate past many steps,
+    /// While a window step runs long (held shut on a gate past many steps,
     /// within the ripening), every step the watermark passes is still sealed, in its turn, on the
     /// seal runner and never on the engine's thread, and no step is shed (before, each step it ran
     /// past queued as a window step behind it, and every one past `WINDOW_STEPS_BEHIND` was shed); and
@@ -5082,7 +5248,7 @@ mod tests {
         Ok(())
     }
 
-    /// Sweep 3, N8: batches waiting for a description are held in one store for every raw shard,
+    /// Batches waiting for a description are held in one store for every raw shard,
     /// by rank: past the receivers it holds, the best drawn of those that came are held whatever
     /// the order they came in, and the store's share is never charged past (no charge refused).
     #[test]
@@ -5137,7 +5303,7 @@ mod tests {
         Ok(())
     }
 
-    /// Sweep 3, N17: a receiver re-signing its description in a loop holds one description a step,
+    /// A receiver re-signing its description in a loop holds one description a step,
     /// the newest it signed, charged by its bytes and let go when it is applied; an older one
     /// offered after it changes nothing, and the one applied is the newest.
     #[test]
@@ -5209,7 +5375,7 @@ mod tests {
         }
     }
 
-    /// Sweep 4, R-P5: a batch that waited for its receiver's description is judged ahead or late by
+    /// A batch that waited for its receiver's description is judged ahead or late by
     /// its own stamp, as the reference engine judges it, not by the stamp of the step that took
     /// it: a receiver whose clock runs a second and a half ahead of its stamp, described only
     /// after its batch came, has that batch's raw refused as ahead by both, and the bin it names is
@@ -5276,7 +5442,7 @@ mod tests {
         Ok(())
     }
 
-    /// Sweep 4, R-P15: batches waiting for a step's descriptions (a host behind on its watermark)
+    /// Batches waiting for a step's descriptions (a host behind on its watermark)
     /// are held by rank: with room for two receivers' batches, those of the two best drawn of three
     /// are held whatever the order they came in, the third's let go (counted), and the share is
     /// never charged past.
@@ -5341,7 +5507,7 @@ mod tests {
         Ok(())
     }
 
-    /// Sweep 4, R-P16, and sweep 5, R2: a provisional step's records are late by the stamps alone,
+    /// A provisional step's records are late by the stamps alone,
     /// as the live world they are for is sealed. Taken while the watermark is short of
     /// `PROVISIONAL_PUBLISH_MS` past their step, they are published however long the step ran on
     /// the wall clock (one here slowed past the publish slot); taken once the watermark has passed
@@ -5425,7 +5591,7 @@ mod tests {
         Ok(())
     }
 
-    /// Sweep 4, N3: receivers that leave are forgotten in the sealed bins off the engine's thread,
+    /// Receivers that leave are forgotten in the sealed bins off the engine's thread,
     /// as background work below the stages (each bin re-sealed once for all of them), and the bins
     /// are the reference's, byte for byte.
     #[test]
@@ -5470,7 +5636,7 @@ mod tests {
         Ok(())
     }
 
-    /// Sweep 4, N9: seals, window steps, forgets and provisional steps together never work on more
+    /// Seals, window steps, forgets and provisional steps together never work on more
     /// threads than the plan gives MLAT: on one, no two of them are ever at work at once, however
     /// the watermark runs ahead of them (before, each kind took the plan's threads of its own).
     #[test]
@@ -5529,7 +5695,7 @@ mod tests {
         waiting: AtomicBool,
     }
 
-    /// Sweep 4, N16: a provisional step holds no lock the engine's thread waits on while it works:
+    /// A provisional step holds no lock the engine's thread waits on while it works:
     /// held between deciding what it keeps and keeping it, the engine's thread still drops the
     /// engine (which empties what the step charged) at once.
     #[test]
@@ -5538,7 +5704,7 @@ mod tests {
         a_provisional_step_held_at(Stage::Weighing)
     }
 
-    /// Sweep 5, R9: nor while it reads an address shard, holding it: the engine's thread drops the
+    /// Nor while it reads an address shard, holding it: the engine's thread drops the
     /// engine without waiting on the shard (before, it cleared every shard itself, so it waited
     /// on each pass a provisional step made over them).
     #[test]
@@ -5609,7 +5775,7 @@ mod tests {
         Ok(())
     }
 
-    /// Sweep 4, N17: a window step's outcome is charged until it is applied: the working set's
+    /// A window step's outcome is charged until it is applied: the working set's
     /// charge travels with it, so one waiting for the engine's thread is never outside every store.
     #[test]
     fn a_window_steps_outcome_is_charged_until_it_is_applied() -> Result<(), String> {
@@ -5645,7 +5811,7 @@ mod tests {
         Ok(())
     }
 
-    /// Sweep 4, N18: an idle host costs nothing: its engine's thread wakes for no message, and a
+    /// An idle host costs nothing: its engine's thread wakes for no message, and a
     /// step with nothing to weigh, seal or solve takes no thread.
     #[test]
     fn an_idle_host_wakes_for_nothing_and_steps_with_nothing_on_no_thread() -> Result<(), String> {
@@ -5668,7 +5834,7 @@ mod tests {
         Ok(())
     }
 
-    /// Sweep 5, R10: an ask wakes the engine's thread only for a step the watermark passed that no
+    /// An ask wakes the engine's thread only for a step the watermark passed that no
     /// ask handed it yet, and never with no area to solve: a relay asking ten times a step, or an
     /// MLAT relay for nothing, costs it nothing (before, every ask woke it).
     #[test]
@@ -5694,7 +5860,7 @@ mod tests {
         Ok(())
     }
 
-    /// Sweep 5, R7: MLAT's work runs on runners started with the host, each lowered below the
+    /// MLAT's work runs on runners started with the host, each lowered below the
     /// stages as it starts; a relay already at the lowest priority, where nothing goes lower, has
     /// every one of them counted (before, a step's thread set nice 19 and called it lowered).
     #[test]
@@ -5781,7 +5947,7 @@ mod tests {
         Ok(())
     }
 
-    /// Sweep 5, N7: MLAT work that panics ends the process, as a panic anywhere in the relay does
+    /// MLAT work that panics ends the process, as a panic anywhere in the relay does
     /// (`crate::abort_on_any_panic`), whether or not the relay's hook is set: a host whose seal
     /// panicked never runs on with its steps waiting for a report that never comes (before, the
     /// seal's thread ended and MLAT stalled for good, silently). Run in a child of this test.
@@ -5793,7 +5959,7 @@ mod tests {
         )
     }
 
-    /// Sweep 6, F13 (N7): a panic on a worker a step's pass spreads its items over is its step's
+    /// A panic on a worker a step's pass spreads its items over is its step's
     /// (`gate::on_threads` resumes it on the runner), so it ends the process as the runner's own
     /// would: no pass swallows a worker's panic and reports a step it did not finish.
     #[test]
@@ -5804,7 +5970,7 @@ mod tests {
         )
     }
 
-    /// Sweep 6, F13 (N7): a panic on the engine's thread ends the process: before nothing would
+    /// A panic on the engine's thread ends the process: before nothing would
     /// show it, every later ask going to a thread that was gone and MLAT publishing nothing more.
     #[test]
     fn a_panic_on_the_engines_thread_ends_the_process() -> Result<(), String> {
@@ -5814,7 +5980,7 @@ mod tests {
         )
     }
 
-    /// Sweep 5, H-b: what a seal refuses for room is counted when the seal finishes, never held
+    /// What a seal refuses for room is counted when the seal finishes, never held
     /// for the next window step to report, so none is lost when the engine goes before one runs
     /// (before, it waited in the engine, and went with it).
     #[test]
@@ -5844,7 +6010,7 @@ mod tests {
         Ok(())
     }
 
-    /// Sweep 5, N13: a receiver's newer description in place of its older one for the same step
+    /// A receiver's newer description in place of its older one for the same step
     /// is charged what it adds, never both at once: in a share that holds the older and the newer
     /// but not the two together, the newer is held and the older let go, as the reference applies
     /// the newer (before, the newer was charged whole beside the older, refused, and the older
@@ -5897,7 +6063,7 @@ mod tests {
         Ok(())
     }
 
-    /// Sweep 5, N8: a window step put off at the step its window falls due (the `Engine` store
+    /// A window step put off at the step its window falls due (the `Engine` store
     /// full then) waits and starts once it can, its windows handed out as of its own step: no
     /// provisional step runs before they are solved as though they had been, and the models ripen
     /// by their own window's step, so every byte is the reference's (before, the step put off was
@@ -5986,7 +6152,7 @@ mod tests {
         Ok(())
     }
 
-    /// Sweep 6, N1/F7: the stamps' keep (`kept_by_stamps`) is what `Engine::forget_by` keeps with
+    /// The stamps' keep (`kept_by_stamps`) is what `Engine::forget_by` keeps with
     /// no floor, at every step; and it keeps every bin of a window until `MODELS_RIPEN_MS` after
     /// the window falls due, so a window step that starts at its turn and finishes within the
     /// ripening (a host within its plan) never leaves a bin to its floor alone.
@@ -6029,7 +6195,7 @@ mod tests {
         }
     }
 
-    /// Sweep 6, N1/F7: what a seal refuses for room is the stamps' alone. A host whose window step
+    /// What a seal refuses for room is the stamps' alone. A host whose window step
     /// is held long past its turn (its floor keeping the bins the stamps forgot, `Engine::forget_by`)
     /// in a `Held` store exactly as large as a host keeping up ever filled seals every bin as that
     /// host does, byte for byte, step by step, and refuses nothing it does not: the bins only the
@@ -6138,7 +6304,7 @@ mod tests {
         Ok(())
     }
 
-    /// Sweep 6, R6: the receivers one change of areas lets go are forgotten together, in one
+    /// The receivers one change of areas lets go are forgotten together, in one
     /// forget pass (`Command::Left` of all of them), each sealed bin that held any of them sealed
     /// again once for all of them. Before, one `Left` a receiver had the first forgotten alone in
     /// a pass of its own, every bin it held sealed twice.
@@ -6184,6 +6350,153 @@ mod tests {
         let left = before.difference(&after).count();
         assert!(left >= 2, "{left} receivers left");
         assert_eq!(passes.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    fn area_at(lat_e7: i32, lon_e7: i32) -> Result<Region, String> {
+        Region::containing(
+            &Location {
+                lat_e7,
+                lon_e7,
+                alt_m: 0,
+                precision_m: 0,
+            },
+            AREA_RESOLUTION,
+        )
+        .map_err(text)
+    }
+
+    fn cut_of(origin: PublicKey, from_ms: u64, below: u128, area: Region) -> Cut {
+        Cut {
+            from_ms,
+            origin,
+            below,
+            areas: vec![area],
+        }
+    }
+
+    fn origin(seed: u8) -> PublicKey {
+        Identity::from_seed([seed; 32]).public()
+    }
+
+    /// RFC-0181 §10: a cut is applied at its stamped step and stands for `CUT_TTL_MS` from it;
+    /// announced again (refreshed) it stands on, and unannounced it expires, by the stamps alone.
+    #[test]
+    fn a_cut_stands_from_its_step_and_expires_unless_announced_again() -> Result<(), String> {
+        let area = area_at(515_000_000, -1_000_000)?;
+        let who = origin(1);
+        let mut cuts = Cuts::default();
+        assert_eq!(cuts.offer(&cut_of(who, 10_000, 5, area), 0), Offered::Kept);
+        assert!(cuts.cutoffs_at(9_000).is_empty(), "before its step");
+        assert_eq!(cuts.cutoffs_at(10_000), vec![(area, 5)]);
+        assert_eq!(
+            cuts.cutoffs_at(10_000 + CUT_TTL_MS - STEP_MS),
+            vec![(area, 5)]
+        );
+        assert!(cuts.cutoffs_at(10_000 + CUT_TTL_MS).is_empty(), "expired");
+        // Announced again, it stands on past the first announcement's expiry.
+        assert_eq!(
+            cuts.offer(&cut_of(who, 10_000 + CUT_REFRESH_MS, 5, area), 0),
+            Offered::Kept
+        );
+        let past = 10_000 + CUT_TTL_MS;
+        assert_eq!(cuts.cutoffs_at(past), vec![(area, 5)]);
+        // Its signer's lifting announcement supersedes its older cut; another signer's does not
+        // lift it.
+        let other = origin(2);
+        cuts.offer(&cut_of(other, 10_000, u128::MAX, area), 0);
+        assert_eq!(cuts.cutoffs_at(past), vec![(area, 5)]);
+        cuts.offer(&cut_of(who, past, u128::MAX, area), 0);
+        assert!(cuts.cutoffs_at(past).is_empty());
+        Ok(())
+    }
+
+    /// A cut for a step already applied is kept with the stamp it was signed with: it takes effect
+    /// at the next step and ends when its stamp says, so a late relay and a prompt one agree again
+    /// as soon as the cut is announced again.
+    #[test]
+    fn a_late_cut_keeps_its_stamp() -> Result<(), String> {
+        let area = area_at(515_000_000, -1_000_000)?;
+        let mut cuts = Cuts::default();
+        cuts.applied(30_000);
+        assert_eq!(
+            cuts.offer(&cut_of(origin(1), 25_000, 7, area), 0),
+            Offered::Late
+        );
+        assert_eq!(cuts.cutoffs_at(31_000), vec![(area, 7)]);
+        assert!(cuts.cutoffs_at(25_000 + CUT_TTL_MS).is_empty());
+        Ok(())
+    }
+
+    /// A stamp a peer signs cannot overflow the table or leave a cut waiting for a step far ahead:
+    /// off the grid, past `MAX_CUT_FROM_MS`, expired already, or further ahead than `CUT_AHEAD_MS`
+    /// is refused, with checked arithmetic (`u64::MAX` used to overflow the rounding up).
+    #[test]
+    fn a_cut_stamped_off_the_grid_expired_or_far_ahead_is_refused() -> Result<(), String> {
+        let area = area_at(515_000_000, -1_000_000)?;
+        let who = origin(1);
+        let mut cuts = Cuts::default();
+        for from_ms in [
+            u64::MAX,
+            u64::MAX - STEP_MS + 1,
+            tally_wire::MAX_CUT_FROM_MS + STEP_MS,
+            12_345,
+        ] {
+            assert_eq!(
+                cuts.offer(&cut_of(who, from_ms, 1, area), 0),
+                Offered::Refused,
+                "{from_ms}"
+            );
+        }
+        // The stamps are at 100 s: one that ended before, and one beyond the horizon.
+        assert_eq!(
+            cuts.offer(&cut_of(who, 10_000, 1, area), 100_000),
+            Offered::Refused
+        );
+        assert_eq!(
+            cuts.offer(
+                &cut_of(who, 100_000 + CUT_AHEAD_MS + STEP_MS, 1, area),
+                100_000
+            ),
+            Offered::Refused
+        );
+        assert!(cuts.by_origin.is_empty(), "something was kept");
+        assert_eq!(
+            cuts.offer(&cut_of(who, 100_000 + CUT_AHEAD_MS, 1, area), 100_000),
+            Offered::Kept
+        );
+        // And what was offered before the host knew the stamps, past the horizon, goes when the
+        // first step is applied.
+        let mut early = Cuts::default();
+        early.offer(&cut_of(who, 5_000_000_000_000, 1, area), 0);
+        assert_eq!(early.by_origin.len(), 1);
+        early.applied(100_000);
+        assert!(early.by_origin.is_empty());
+        Ok(())
+    }
+
+    /// The table keeps the origins of the best rank, never the first to come: 70 origins offered in
+    /// any order leave the same 64.
+    #[test]
+    fn the_origins_kept_are_the_best_ranked_whatever_order_they_came_in() -> Result<(), String> {
+        let area = area_at(515_000_000, -1_000_000)?;
+        let origins: Vec<PublicKey> = (0..70u8).map(origin).collect();
+        let kept = |order: Vec<&PublicKey>| {
+            let mut cuts = Cuts::default();
+            for key in order {
+                cuts.offer(&cut_of(*key, 10_000, 3, area), 0);
+            }
+            cuts.by_origin.keys().copied().collect::<Vec<_>>()
+        };
+        let forward = kept(origins.iter().collect());
+        let backward = kept(origins.iter().rev().collect());
+        assert_eq!(forward.len(), CUT_ORIGINS);
+        assert_eq!(forward, backward);
+        let mut ranked = origins.clone();
+        ranked.sort_by_key(|key| (tally_mlat::intake::draw(key), *key));
+        let mut best: Vec<PublicKey> = ranked[..CUT_ORIGINS].to_vec();
+        best.sort_unstable();
+        assert_eq!(forward, best);
         Ok(())
     }
 }

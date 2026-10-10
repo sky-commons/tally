@@ -132,7 +132,7 @@ const TARGETS: Option<&str> = option_env!("MLAT_HOST_TESTS");
 /// The guard every target runs beside its own test (`every_test_has_one_target`).
 const EVERY_TEST_HAS_ONE_TARGET: &str = "every_test_has_one_target";
 
-/// Sweep 3, N20: a target selects its test by exact name, and libtest runs no test at all, green,
+/// A target selects its test by exact name, and libtest runs no test at all, green,
 /// for a name it does not have. So every target runs this beside its own: the tests this binary
 /// has, as libtest lists them (the binary asked for its own list), are exactly the ones the
 /// build's targets name, so a test renamed, added or removed without its target fails every
