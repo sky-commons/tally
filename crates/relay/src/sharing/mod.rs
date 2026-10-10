@@ -567,6 +567,23 @@ impl Sharing {
         })
     }
 
+    /// Addresses `record` to the relay `to` down the member link `carry` keeps, charged as every
+    /// send is: a record no group holds (an overload cut, `mlat_host::Cut`) that only the relay it
+    /// is for reads. False when the store's share is full.
+    pub fn address(&self, to: PublicKey, record: Record) -> bool {
+        let gauge = Arc::clone(&lock(&self.gauge));
+        match gauge.try_charge(record.encoded_len()) {
+            Some(charge) => {
+                lock(&self.outbox).push(Addressed { to, record, charge });
+                true
+            }
+            None => {
+                self.outbox_refused.fetch_add(1, Ordering::Relaxed);
+                false
+            }
+        }
+    }
+
     /// The addressed sends waiting for their links, each with its charge, which whoever carries it
     /// holds until it is written ([`Addressed`]).
     pub fn take_outbox(&self) -> Vec<Addressed> {

@@ -275,14 +275,21 @@ impl<'a> Problem<'a> {
             };
             (altitude, altitude.metres(), sigma)
         });
+        // Each reception's clock weights once, then every pair from them (`clock_weights`).
+        let weights: Vec<_> = items
+            .iter()
+            .map(|item| calibrated.clock_weights(&item.time, reference_ps))
+            .collect();
         let clock_m2 = items
             .iter()
-            .map(|a: &Item| {
+            .zip(&weights)
+            .map(|(a, weights_a): (&Item, _)| {
                 items
                     .iter()
-                    .map(|b| {
+                    .zip(&weights)
+                    .map(|(b, weights_b)| {
                         calibrated
-                            .clock_covariance(&a.time, &b.time, reference_ps)
+                            .weighed_covariance((&a.time, weights_a), (&b.time, weights_b))
                             .map(|value| value * C * C)
                     })
                     .collect::<Option<Vec<f64>>>()

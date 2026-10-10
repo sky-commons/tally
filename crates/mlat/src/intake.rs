@@ -15,22 +15,33 @@
 //! - **Room is shared, refusal is whole, and neither depends on order** (RFC-0181 §9). The
 //!   receivers seated across every intake of one engine are bounded by one count ([`Seats`],
 //!   `Capacity::receivers`), and who is seated is a function of who is described: the best ranked
-//!   (taking part first, then a draw no feeder can choose, [`draw`]), whatever order they came in
+//!   (taking part first, then the key-hash rank, [`draw`]), whatever order they came in
 //!   and whichever intake took them. A receiver outranked is refused whole (none of its raw held)
 //!   and counted, and one that loses its seat to a better ranked one is let go whole. A receiver's
 //!   raw of a bin beyond its share is refused whole (`held::Limits`); the holder's bytes are
 //!   checked on each whole bin as it is sealed (`held::Bin::seal_within`), never on arrival.
-//! - **The rank is no feeder's to choose** (RFC-0171 §9, critic 4: standing counts places, not
-//!   keys, and is a bar, not a ranking). Taking part is the bar. Among the receivers over it the
-//!   seat goes by a keyed hash of the receiver's key under a secret this process drew
-//!   ([`draw`], `tally_wire::FingerprintKey::process`, the message fingerprint's own key): a key is
-//!   free, so ranking by the key itself let anyone grind keys that outrank every honest receiver and
-//!   take the seats from them with one description each. Under a secret it cannot do better than
-//!   chance, whatever it grinds. Neither tenure nor standing serves instead: tenure (first come)
-//!   rewards whoever floods first and is decided by arrival order, which RFC-0181 §9 forbids;
-//!   receiver standing (RFC-0174 §2.12) is earned only by receptions the seated engine solves, so
-//!   ranking by it would keep a receiver once seated seated forever and one never seated out, and it
-//!   is a bar the merge applies to solutions, not an order of who may be heard.
+//! - **The rank is the receiver's own word, the same on every relay** (RFC-0181 §9, §10). Taking
+//!   part is the bar. Among the receivers over it the seat goes by a hash of the receiver's key
+//!   under a fixed fleet-wide seed ([`draw`]), so two relays holding one area seat the same
+//!   receivers whatever order the descriptions reached each, and an overloaded host's cut
+//!   ([`Seats::set_cutoffs`], a rank threshold published by stamp) leaves the same receivers on
+//!   every relay, whatever each has described or has seats for: before, the
+//!   seed was a secret each process drew, which no two relays shared, so the receivers one relay
+//!   refused another solved and their products could not match. What the secret bought was that a
+//!   key could not be ground to outrank honest ones; a key is not free here any more than a seat
+//!   is (every feeder is admitted at its connection, per credit and network group, before it can
+//!   describe at all, RFC-0181 §5), so grinding costs an admitted connection a rank, and a relay
+//!   that wants the rank unpredictable gives all its peers one seed ([`Seats::keyed`]). Neither
+//!   The seats of one declared place (a cell, [`SEAT_CELL_RESOLUTION`]) are shared out: at most
+//!   [`SEATS_PER_CELL`] of a cell's receivers hold one, the best ranked of them, so a grinder
+//!   holding many connections from one place takes no more than a cell's share (the network group
+//!   of a connection is a fact only the relay holding it has, which two relays cannot share, so the
+//!   share is read from the receiver's own signed place). Neither
+//!   tenure nor standing serves instead: tenure (first come) rewards whoever floods first and is
+//!   decided by arrival order, which RFC-0181 §9 forbids; receiver standing (RFC-0174 §2.12) is
+//!   earned only by receptions the seated engine solves, so ranking by it would keep a receiver
+//!   once seated seated forever and one never seated out, and it is a bar the merge applies to
+//!   solutions, not an order of who may be heard.
 //! - **A batch before its receiver's description** waits for it ([`Intake::hold_orphan`]): a batch
 //!   can reach a holder before its receiver's description (a repair, a rebuild from parity, a link
 //!   that died between them, or a description that takes effect at the next step), and is forwarded
@@ -55,7 +66,9 @@ use std::sync::{Arc, Mutex};
 use tally_mlat_solver::held::{Closing, Fragment, Limits, Open};
 use tally_mlat_solver::obs::MAX_SITE_PRECISION_M;
 use tally_mlat_solver::{Site, Timebase};
-use tally_wire::{Clock, Decoded, FingerprintKey, Location, PublicKey, ReceiverInfo, Regions};
+use tally_wire::{
+    Clock, Decoded, FingerprintKey, Location, PublicKey, ReceiverInfo, Region, Regions,
+};
 
 use crate::engine::{Dropped, Ingested};
 use crate::provisional::{Note, notes_of};
@@ -285,35 +298,122 @@ pub enum Place {
     Gone,
 }
 
-/// The domain of the seat draw under the process key (`tally_wire::decoded::keyed`).
+/// The domain of the seat draw (`tally_wire::decoded::keyed`).
 const SEAT_DOMAIN: u8 = tally_wire::decoded::keyed::SEAT_DRAW;
 
+/// The seed of the seat draw every relay shares (module docs): a constant, so the same receivers
+/// rank the same on every relay.
+const FLEET_SEED: [u8; 32] = *b"tally.mlat.seat.rank.fleet.v1...";
+
+/// The fleet-wide key of the seat draw: what [`Seats::new`] ranks by.
+pub fn fleet_key() -> FingerprintKey {
+    FingerprintKey::from_bytes(FLEET_SEED)
+}
+
 /// A receiver's draw for a seat (module docs): a keyed hash of its key under `secret`, the same for
-/// every intake of one engine, unknown outside the process, so no key can be ground to win it.
+/// every intake of one engine.
 pub fn draw_under(secret: &FingerprintKey, key: &PublicKey) -> u128 {
     secret.fingerprint(SEAT_DOMAIN, key.as_bytes())
 }
 
-/// [`draw_under`] this process's secret (`FingerprintKey::process`): what [`Seats::new`] ranks by.
+/// [`draw_under`] the fleet's seed: what [`Seats::new`] ranks by, the same on every relay.
 pub fn draw(key: &PublicKey) -> u128 {
-    draw_under(FingerprintKey::process(), key)
+    draw_under(&fleet_key(), key)
 }
 
 /// What decides who is seated: receivers that take part before those that do not, then by their
 /// draw (module docs), then by key (two draws of 128 bits never meet in practice; the key makes
 /// the order total). A receiver's rank is its own word and the relay's secret, never when it came.
+/// `cell` (its declared place, [`SEAT_CELL_RESOLUTION`], 0 for none) is what the cut and the share
+/// of a cell are read from; it follows the key, so it never changes the order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct Rank {
     idle: bool,
     draw: u128,
     key: PublicKey,
+    cell: u64,
+}
+
+/// The cell a receiver's declared place is held at ([`SEAT_CELL_RESOLUTION`]), if it declared one.
+fn seat_cell(location: Option<Location>) -> Option<Region> {
+    location.and_then(|location| Region::containing(&location, SEAT_CELL_RESOLUTION).ok())
+}
+
+/// The finest cell a receiver's declared place is held at for its share of the seats
+/// ([`SEATS_PER_CELL`]): about 36 km², a city's block of towns.
+pub const SEAT_CELL_RESOLUTION: u8 = 6;
+
+/// The most seats the receivers of one cell hold. A seat is for geometry, and receivers within a
+/// few kilometres of one another add nearly none to the solution of the next, where a grinder
+/// holding many connections from one place would otherwise take every seat its keys outrank
+/// (RFC-0181 §10, grinding). The receivers beyond it in a cell, by rank, stay described, waiting;
+/// their raw still flows. It is a function of the receivers described alone (their own word), so
+/// every relay holding them agrees; the network group of a connection is a fact only the relay
+/// holding it has, which two relays cannot share.
+pub const SEATS_PER_CELL: usize = 8;
+
+/// The best ranked receivers a cut can never unseat: a cut asks for fewer receivers, never none,
+/// so one signer cannot stop a relay's MLAT.
+pub const CUT_FLOOR_SEATS: usize = 8;
+
+/// The finest resolution a cut names (an area, `tally_wire::rendezvous::AREA_RESOLUTION`).
+const CUT_RESOLUTION: u8 = tally_wire::rendezvous::AREA_RESOLUTION;
+
+/// The rank thresholds cuts leave standing: per area cell, the draw a receiver in it must be
+/// below to be solved. Applied to every receiver whose cell lies in a named area.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct Cutoffs {
+    below: HashMap<u64, u128>,
+    /// Bit `r` set: some cut names a cell of resolution `r`.
+    resolutions: u16,
+}
+
+impl Cutoffs {
+    fn of(cuts: impl IntoIterator<Item = (Region, u128)>) -> Self {
+        let mut cutoffs = Self::default();
+        for (area, below) in cuts {
+            if below == u128::MAX || area.resolution() > CUT_RESOLUTION {
+                continue;
+            }
+            let entry = cutoffs.below.entry(area.as_u64()).or_insert(below);
+            *entry = (*entry).min(below);
+            cutoffs.resolutions |= 1 << area.resolution();
+        }
+        cutoffs
+    }
+
+    /// The draw a receiver of `cell` must be below: the least of the cuts naming a cell it lies
+    /// in; none (everything) where no cut does.
+    fn threshold(&self, cell: u64) -> u128 {
+        if self.below.is_empty() || cell == 0 {
+            return u128::MAX;
+        }
+        let Ok(cell) = Region::from_u64(cell) else {
+            return u128::MAX;
+        };
+        (0..=CUT_RESOLUTION)
+            .filter(|resolution| self.resolutions & (1 << resolution) != 0)
+            .filter_map(|resolution| cell.ancestor(resolution))
+            .filter_map(|ancestor| self.below.get(&ancestor.as_u64()).copied())
+            .min()
+            .unwrap_or(u128::MAX)
+    }
 }
 
 #[derive(Default)]
 struct Places {
     seated: BTreeSet<Rank>,
+    /// Described, eligible, outranked for a seat.
     waiting: BTreeSet<Rank>,
+    /// Described but not eligible for a seat now: cut by a standing cut, or beyond its cell's
+    /// share. Kept (described) so a lifted cut seats them again by rank.
+    held: BTreeSet<Rank>,
     ranks: HashMap<PublicKey, Rank>,
+    /// The ranks of each cell, for its share.
+    cells: HashMap<u64, BTreeSet<Rank>>,
+    cutoffs: Cutoffs,
+    /// Ranks whose eligibility may have changed since the last settle.
+    dirty: Vec<Rank>,
 }
 
 impl Places {
@@ -324,16 +424,77 @@ impl Places {
             None => Place::Gone,
         }
     }
+
+    /// The `CUT_FLOOR_SEATS` best ranked of every receiver described.
+    fn floor(&self) -> Vec<Rank> {
+        let mut best: Vec<Rank> = [&self.seated, &self.waiting, &self.held]
+            .into_iter()
+            .flat_map(|set| set.iter().take(CUT_FLOOR_SEATS).copied())
+            .collect();
+        best.sort_unstable();
+        best.truncate(CUT_FLOOR_SEATS);
+        best
+    }
+
+    /// Whether `rank` is within its cell's share.
+    fn within_share(&self, rank: &Rank) -> bool {
+        rank.cell == 0
+            || self
+                .cells
+                .get(&rank.cell)
+                .is_none_or(|cell| cell.iter().take(SEATS_PER_CELL).any(|held| held == rank))
+    }
+
+    /// Whether `rank` may hold a seat: within its cell's share, and below the cut standing for its
+    /// area unless it is among the `floor`.
+    fn eligible(&self, rank: &Rank, floor: &[Rank]) -> bool {
+        self.within_share(rank)
+            && (rank.draw < self.cutoffs.threshold(rank.cell) || floor.contains(rank))
+    }
+
+    /// Marks the ranks at the edge of `cell`'s share: what a change to the cell may have moved in
+    /// or out.
+    fn dirty_edge(&mut self, cell: u64) {
+        if let Some(ranks) = self.cells.get(&cell) {
+            let edge: Vec<Rank> = ranks
+                .iter()
+                .skip(SEATS_PER_CELL.saturating_sub(1))
+                .take(2)
+                .copied()
+                .collect();
+            self.dirty.extend(edge);
+        }
+    }
+
+    /// Forgets `rank` entirely.
+    fn forget(&mut self, rank: &Rank) {
+        self.seated.remove(rank);
+        self.waiting.remove(rank);
+        self.held.remove(rank);
+        self.ranks.remove(&rank.key);
+        if rank.cell != 0 {
+            if let Some(cell) = self.cells.get_mut(&rank.cell) {
+                cell.remove(rank);
+                if cell.is_empty() {
+                    self.cells.remove(&rank.cell);
+                }
+            }
+            self.dirty_edge(rank.cell);
+        }
+    }
 }
 
 /// The seats for described receivers, shared by every intake of one engine (RFC-0181 §9). Who is
 /// seated is a function of who is described, never of the order they came in or of which intake
-/// took them: the `limit` best ranked ([`Rank`]: taking part first, then the draw), and up to `limit`
-/// more waiting; beyond that the worst ranked are forgotten with their descriptions, which bounds
-/// what is remembered. A change re-settles every place, and says whose place changed, so each
-/// intake holding one of them settles it ([`Intake::settle`]). One limit: a receiver forgotten is
-/// not brought back when the ranks above it change later (a description moving another out of the
-/// regions); only its next description, or the relay's own on a change of areas, ranks it again.
+/// took them: the `limit` best ranked ([`Rank`]: taking part first, then the draw) of those
+/// eligible, and up to `limit` more waiting; beyond that the worst ranked are forgotten with their
+/// descriptions, which bounds what is remembered. Eligible: within the cell's share
+/// ([`SEATS_PER_CELL`]) and below the rank threshold a standing cut asks for in the receiver's
+/// area ([`Seats::set_cutoffs`]), the best [`CUT_FLOOR_SEATS`] aside. A change re-settles every
+/// place, and says whose place changed, so each intake holding one of them settles it
+/// ([`Intake::settle`]). One limit: a receiver forgotten is not brought back when the ranks above
+/// it change later (a description moving another out of the regions); only its next description,
+/// or the relay's own on a change of areas, ranks it again.
 #[derive(Debug)]
 pub struct Seats {
     limit: usize,
@@ -347,14 +508,25 @@ impl std::fmt::Debug for Places {
         f.debug_struct("Places")
             .field("seated", &self.seated.len())
             .field("waiting", &self.waiting.len())
+            .field("held", &self.held.len())
             .finish()
     }
 }
 
+/// The receivers of some areas as a cut judges them (`Seats::scoped`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Scoped {
+    /// How many hold a seat.
+    pub seated: usize,
+    /// The draws of those that take part and are within their cell's share, best first: what a
+    /// threshold can choose among.
+    pub draws: Vec<u128>,
+}
+
 impl Seats {
-    /// `limit` seats, drawn for under this process's secret ([`draw`]).
+    /// `limit` seats, drawn for under the fleet's seed ([`draw`]).
     pub fn new(limit: usize) -> Arc<Self> {
-        Self::keyed(limit, *FingerprintKey::process())
+        Self::keyed(limit, fleet_key())
     }
 
     /// `limit` seats, drawn for under `secret`: for a test that needs the same seats twice, or
@@ -379,28 +551,32 @@ impl Seats {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Ranks `key` (taking part or `idle`) among the described and settles every place. Every
-    /// other receiver whose place changed (its holder settles `key` itself).
-    fn rank(&self, key: PublicKey, idle: bool) -> Vec<PublicKey> {
+    /// Ranks `key` (taking part or `idle`, declared at `cell`) among the described and settles
+    /// every place. Every other receiver whose place changed (its holder settles `key` itself).
+    fn rank(&self, key: PublicKey, idle: bool, cell: Option<Region>) -> Vec<PublicKey> {
         let mut places = self.places();
-        let seated = match places.ranks.remove(&key) {
-            Some(old) => {
-                places.waiting.remove(&old);
-                places.seated.remove(&old)
-            }
-            None => false,
-        };
+        let was = places.ranks.get(&key).copied();
+        let seated = was.is_some_and(|old| places.seated.contains(&old));
+        if let Some(old) = was {
+            places.forget(&old);
+        }
         let rank = Rank {
             idle,
             draw: draw_under(&self.secret, &key),
             key,
+            cell: cell.map_or(0, Region::as_u64),
         };
         places.ranks.insert(key, rank);
+        if rank.cell != 0 {
+            places.cells.entry(rank.cell).or_default().insert(rank);
+            places.dirty_edge(rank.cell);
+        }
         if seated {
             places.seated.insert(rank);
         } else {
             places.waiting.insert(rank);
         }
+        places.dirty.push(rank);
         let mut changed = self.settle(&mut places);
         changed.retain(|other| *other != key);
         changed
@@ -410,42 +586,80 @@ impl Seats {
     fn remove(&self, keys: impl Iterator<Item = PublicKey>) -> Vec<PublicKey> {
         let mut places = self.places();
         for key in keys {
-            if let Some(rank) = places.ranks.remove(&key) {
-                places.seated.remove(&rank);
-                places.waiting.remove(&rank);
+            if let Some(rank) = places.ranks.get(&key).copied() {
+                places.forget(&rank);
             }
         }
         self.settle(&mut places)
     }
 
-    /// Seats the best ranked waiting while there is a seat or they outrank someone seated, and
-    /// forgets the worst waiting beyond `limit` of them. Whose place changed.
+    /// Moves the ranks marked dirty (and the edge of the floor) to the set their eligibility says,
+    /// seats the best ranked eligible waiting while there is a seat or they outrank someone seated,
+    /// and forgets the worst beyond `limit` of the waiting and of the held. Whose place changed.
     fn settle(&self, places: &mut Places) -> Vec<PublicKey> {
         let mut changed = Vec::new();
-        while let Some(best) = places.waiting.first().copied() {
-            if places.seated.len() < self.limit {
-                places.waiting.remove(&best);
-                places.seated.insert(best);
-                changed.push(best.key);
-                continue;
-            }
-            match places.seated.last().copied() {
-                Some(worst) if best < worst => {
-                    places.waiting.remove(&best);
-                    places.seated.remove(&worst);
-                    places.seated.insert(best);
-                    places.waiting.insert(worst);
-                    changed.extend([best.key, worst.key]);
+        loop {
+            // The edge of each set is always looked at again: the floor is the best ranked of all.
+            let edge: Vec<Rank> = [&places.seated, &places.waiting, &places.held]
+                .into_iter()
+                .flat_map(|set| set.iter().take(CUT_FLOOR_SEATS + 1).copied())
+                .collect();
+            places.dirty.extend(edge);
+            let dirty = std::mem::take(&mut places.dirty);
+            let floor = places.floor();
+            for rank in dirty {
+                let eligible = places.eligible(&rank, &floor);
+                if places.seated.contains(&rank) {
+                    if !eligible {
+                        places.seated.remove(&rank);
+                        places.held.insert(rank);
+                        changed.push(rank.key);
+                    }
+                } else if places.waiting.contains(&rank) {
+                    if !eligible {
+                        places.waiting.remove(&rank);
+                        places.held.insert(rank);
+                    }
+                } else if places.held.contains(&rank) && eligible {
+                    places.held.remove(&rank);
+                    places.waiting.insert(rank);
                 }
-                _ => break,
             }
-        }
-        while places.waiting.len() > self.limit {
-            let Some(worst) = places.waiting.pop_last() else {
+            while let Some(best) = places.waiting.first().copied() {
+                if places.seated.len() < self.limit {
+                    places.waiting.remove(&best);
+                    places.seated.insert(best);
+                    changed.push(best.key);
+                    continue;
+                }
+                match places.seated.last().copied() {
+                    Some(worst) if best < worst => {
+                        places.waiting.remove(&best);
+                        places.seated.remove(&worst);
+                        places.seated.insert(best);
+                        places.waiting.insert(worst);
+                        changed.extend([best.key, worst.key]);
+                    }
+                    _ => break,
+                }
+            }
+            while places.waiting.len() > self.limit {
+                let Some(worst) = places.waiting.last().copied() else {
+                    break;
+                };
+                places.forget(&worst);
+                changed.push(worst.key);
+            }
+            while places.held.len() > self.limit {
+                let Some(worst) = places.held.last().copied() else {
+                    break;
+                };
+                places.forget(&worst);
+                changed.push(worst.key);
+            }
+            if places.dirty.is_empty() {
                 break;
-            };
-            places.ranks.remove(&worst.key);
-            changed.push(worst.key);
+            }
         }
         changed.sort_unstable();
         changed.dedup();
@@ -464,6 +678,61 @@ impl Seats {
 
     pub fn limit(&self) -> usize {
         self.limit
+    }
+
+    /// The seats in use at most now: `limit`, or while a cut stands the receivers eligible for a
+    /// seat under it (at most `limit`).
+    pub fn cap(&self) -> usize {
+        let places = self.places();
+        if places.cutoffs.below.is_empty() {
+            self.limit
+        } else {
+            (places.seated.len() + places.waiting.len()).min(self.limit)
+        }
+    }
+
+    /// Makes `cuts` the cuts standing: a receiver whose declared place lies in an area a cut
+    /// names is solved only if its draw is below that cut's threshold (the least of the cuts
+    /// naming it), the best [`CUT_FLOOR_SEATS`] aside; a threshold of `u128::MAX` lifts. Settles
+    /// every place: whose changed, for each intake holding one to settle ([`Intake::settle`]).
+    /// The receivers cut stay described, held, so a lifted cut seats them again by rank. The same
+    /// cuts on every relay seat the same receivers (module docs): a threshold is a rank, which
+    /// does not depend on which receivers a relay has described or how many seats it has.
+    pub fn set_cutoffs(&self, cuts: impl IntoIterator<Item = (Region, u128)>) -> Vec<PublicKey> {
+        let cutoffs = Cutoffs::of(cuts);
+        let mut places = self.places();
+        if places.cutoffs == cutoffs {
+            return Vec::new();
+        }
+        places.cutoffs = cutoffs;
+        let all: Vec<Rank> = places.ranks.values().copied().collect();
+        places.dirty.extend(all);
+        self.settle(&mut places)
+    }
+
+    /// The receivers whose declared area `in_scope` accepts, as a cut over them judges them.
+    pub fn scoped(&self, in_scope: impl Fn(Region) -> bool) -> Scoped {
+        let places = self.places();
+        let mut scoped = Scoped::default();
+        for rank in places.ranks.values() {
+            let Some(area) = Region::from_u64(rank.cell)
+                .ok()
+                .and_then(|cell| cell.ancestor(CUT_RESOLUTION))
+            else {
+                continue;
+            };
+            if rank.idle || !in_scope(area) {
+                continue;
+            }
+            if places.seated.contains(rank) {
+                scoped.seated += 1;
+            }
+            if places.within_share(rank) {
+                scoped.draws.push(rank.draw);
+            }
+        }
+        scoped.draws.sort_unstable();
+        scoped
     }
 }
 
@@ -720,7 +989,9 @@ impl Intake {
         known.location = content.location;
         known.clock = content.clock;
         known.site = site;
-        let changed = self.seats.rank(key, site.is_none());
+        let changed = self
+            .seats
+            .rank(key, site.is_none(), seat_cell(content.location));
         let mut description = self.settle_all(changed, kept);
         if self.settle_was(&key, was, kept) {
             description.left.push(key);
@@ -825,7 +1096,11 @@ impl Intake {
             if let Some(known) = self.receivers.get_mut(key) {
                 known.site = *site;
             }
-            changed.extend(self.seats.rank(*key, site.is_none()));
+            changed.extend(self.seats.rank(
+                *key,
+                site.is_none(),
+                seat_cell(self.receivers.get(key).and_then(|known| known.location)),
+            ));
         }
         changed.sort_unstable();
         changed.dedup();
@@ -954,6 +1229,9 @@ mod tests {
     use super::*;
     use tally_wire::Identity;
 
+    /// `draw` of `Identity::from_seed([7; 32])`'s key.
+    const KNOWN_DRAW: u128 = 0xa152b57161dad4a033a9d8cbfd33dbb0;
+
     fn secret(seed: u8) -> FingerprintKey {
         FingerprintKey::from_bytes([seed; 32])
     }
@@ -974,9 +1252,9 @@ mod tests {
             for n in order {
                 if detour {
                     // Described first as taking part, then decided: a change of rank on the way.
-                    let _ = seats.rank(keys[*n], !idle(*n));
+                    let _ = seats.rank(keys[*n], !idle(*n), None);
                 }
-                let _ = seats.rank(keys[*n], idle(*n));
+                let _ = seats.rank(keys[*n], idle(*n), None);
             }
             keys.iter().map(|key| seats.place(key)).collect()
         };
@@ -1020,6 +1298,197 @@ mod tests {
         }
     }
 
+    /// RFC-0181 §9, §10: the rank is the same on every relay. A known answer, so the rank is
+    /// pinned to the fleet's seed and not to anything this process drew (before, each relay's own
+    /// secret: two relays holding one area seated different receivers, and an overloaded host's
+    /// cut left others than the peer's).
+    #[test]
+    fn the_seat_rank_is_the_same_on_every_relay() {
+        let key = Identity::from_seed([7; 32]).public();
+        assert_eq!(draw(&key), KNOWN_DRAW, "{:#x}", draw(&key));
+        assert_eq!(Seats::new(1).draw_of(&key), draw(&key));
+        // And not the process's secret.
+        assert_ne!(
+            draw(&key),
+            draw_under(FingerprintKey::process(), &key),
+            "ranked by the process's secret"
+        );
+    }
+
+    fn place_at(lat_e7: i32, lon_e7: i32) -> Location {
+        Location {
+            lat_e7,
+            lon_e7,
+            alt_m: 0,
+            precision_m: 0,
+        }
+    }
+
+    fn keys(count: u8) -> Vec<PublicKey> {
+        (0..count)
+            .map(|seed| Identity::from_seed([seed; 32]).public())
+            .collect()
+    }
+
+    fn seated_of(seats: &Seats, keys: &[PublicKey]) -> Vec<PublicKey> {
+        let mut seated: Vec<PublicKey> = keys
+            .iter()
+            .copied()
+            .filter(|key| seats.place(key) == Place::Seated)
+            .collect();
+        seated.sort_unstable();
+        seated
+    }
+
+    /// Receivers spread over `count` distinct cells (one each), so no cell's share binds.
+    fn spread(keys: &[PublicKey]) -> Vec<(PublicKey, Option<Region>)> {
+        keys.iter()
+            .enumerate()
+            .map(|(n, key)| {
+                let at = place_at(500_000_000 + n as i32 * 5_000_000, 100_000_000);
+                (*key, seat_cell(Some(at)))
+            })
+            .collect()
+    }
+
+    fn area_of_cell(cell: Option<Region>) -> Result<Region, String> {
+        cell.and_then(|cell| cell.ancestor(CUT_RESOLUTION))
+            .ok_or_else(|| "no area".to_owned())
+    }
+
+    /// RFC-0181 §10: the cut is a rank threshold keyed by area, so every relay holding the area
+    /// solves exactly the receivers ranked below it, whatever each has described or has seats
+    /// for, and whatever order the descriptions came in. A relay with more seats and no cut of its
+    /// own, a relay that described more receivers, and a relay that described them last first all
+    /// solve the same receivers; a lifted cut seats the rest again by rank.
+    #[test]
+    fn a_rank_threshold_leaves_the_same_receivers_on_every_relay() -> Result<(), String> {
+        let keys = keys(24);
+        let receivers = spread(&keys);
+        let mut by_draw: Vec<u128> = keys.iter().map(draw).collect();
+        by_draw.sort_unstable();
+        // The cut asks for the 10 best ranked of the area all these receivers are in.
+        let below = by_draw[10];
+        let cuts: Vec<(Region, u128)> = receivers
+            .iter()
+            .map(|(_, cell)| area_of_cell(*cell).map(|area| (area, below)))
+            .collect::<Result<_, _>>()?;
+        let expected: Vec<PublicKey> = {
+            let mut set: Vec<PublicKey> = keys
+                .iter()
+                .copied()
+                .filter(|key| draw(key) < below)
+                .collect();
+            set.sort_unstable();
+            set
+        };
+        assert_eq!(expected.len(), 10);
+        // Relays of different limits, orders and described sets (b described only 16 of them).
+        for (limit, count, reversed) in [(16, 24, false), (64, 24, true), (12, 24, false)] {
+            let seats = Seats::new(limit);
+            let mut order: Vec<&(PublicKey, Option<Region>)> = receivers.iter().collect();
+            if reversed {
+                order.reverse();
+            }
+            for (key, cell) in order.into_iter().take(count) {
+                let _ = seats.rank(*key, false, *cell);
+            }
+            seats.set_cutoffs(cuts.clone());
+            assert_eq!(seated_of(&seats, &keys), expected, "limit {limit}");
+            // The receivers cut are described, held back, not seated; only past the room kept
+            // for them (`limit` of them) are the worst forgotten.
+            let held = keys.iter().filter(|key| !expected.contains(key));
+            let mut waiting = 0;
+            for key in held {
+                assert_ne!(seats.place(key), Place::Seated, "limit {limit}");
+                waiting += usize::from(seats.place(key) == Place::Waiting);
+            }
+            assert_eq!(waiting, (24 - 10).min(limit), "limit {limit}");
+            // Lifted, they are seated again by rank, up to the limit.
+            seats.set_cutoffs(Vec::new());
+            let lifted = seated_of(&seats, &keys);
+            assert_eq!(lifted.len(), limit.min(24), "limit {limit}");
+            assert_eq!(seats.cap(), limit);
+        }
+        // A relay that never described the 6 worst ranked solves the same best 10.
+        let seats = Seats::new(64);
+        let mut worst: Vec<PublicKey> = keys.clone();
+        worst.sort_unstable_by_key(|key| std::cmp::Reverse(draw(key)));
+        for (key, cell) in &receivers {
+            if !worst[..6].contains(key) {
+                let _ = seats.rank(*key, false, *cell);
+            }
+        }
+        seats.set_cutoffs(cuts);
+        assert_eq!(seated_of(&seats, &keys), expected);
+        Ok(())
+    }
+
+    /// A cut is keyed by area: receivers in another area are not touched by it, and the best ranked
+    /// few are never cut (a cut asks for fewer receivers, never none).
+    #[test]
+    fn a_cut_binds_its_area_alone_and_leaves_the_floor() -> Result<(), String> {
+        let keys = keys(40);
+        let receivers = spread(&keys);
+        let seats = Seats::new(64);
+        for (key, cell) in &receivers {
+            let _ = seats.rank(*key, false, *cell);
+        }
+        assert_eq!(seated_of(&seats, &keys).len(), 40);
+        // Zero asked of the area of the first receiver alone.
+        let target = area_of_cell(receivers[0].1)?;
+        let in_target = |cell: Option<Region>| area_of_cell(cell) == Ok(target);
+        let members: Vec<PublicKey> = receivers
+            .iter()
+            .filter(|(_, cell)| in_target(*cell))
+            .map(|(key, _)| *key)
+            .collect();
+        seats.set_cutoffs([(target, 0)]);
+        let seated = seated_of(&seats, &keys);
+        // Everyone outside the area is seated; of the area, only what the floor holds.
+        for (key, cell) in &receivers {
+            if !in_target(*cell) {
+                assert!(seated.contains(key), "outside the area");
+            }
+        }
+        let kept = members.iter().filter(|key| seated.contains(key)).count();
+        assert!(kept <= CUT_FLOOR_SEATS, "{kept} of the area kept");
+        // The floor: the best ranked of all are seated whatever the cut.
+        let mut all: Vec<PublicKey> = keys.clone();
+        all.sort_unstable_by_key(draw);
+        for key in &all[..CUT_FLOOR_SEATS] {
+            assert!(seated.contains(key), "a floor receiver was cut");
+        }
+        Ok(())
+    }
+
+    /// A cell's share of the seats: many receivers declared at one place hold no more than
+    /// `SEATS_PER_CELL` of them, the best ranked, and the rest of the world is unaffected.
+    #[test]
+    fn many_receivers_at_one_place_hold_no_more_than_a_cells_share() {
+        let crowd = keys(30);
+        let alone = Identity::from_seed([200; 32]).public();
+        let seats = Seats::new(64);
+        let here = seat_cell(Some(place_at(515_000_000, -1_000_000)));
+        for key in &crowd {
+            let _ = seats.rank(*key, false, here);
+        }
+        let there = seat_cell(Some(place_at(480_000_000, 20_000_000)));
+        let _ = seats.rank(alone, false, there);
+        let seated = seated_of(&seats, &crowd);
+        assert_eq!(seated.len(), SEATS_PER_CELL);
+        let mut best: Vec<PublicKey> = crowd.clone();
+        best.sort_unstable_by_key(draw);
+        best.truncate(SEATS_PER_CELL);
+        best.sort_unstable();
+        assert_eq!(seated, best);
+        assert_eq!(seats.place(&alone), Place::Seated);
+        // One of the best leaving hands its share to the next, whatever order they came in.
+        let gone = seated[0];
+        let _ = seats.remove(std::iter::once(gone));
+        assert_eq!(seated_of(&seats, &crowd).len(), SEATS_PER_CELL);
+    }
+
     /// RFC-0171 §9 (critic 4) and the audit's grinding attack: a seat is not won by choosing a
     /// key. Keys that sort first win no more seats than any others; who is seated follows the
     /// relay's secret, so the same receivers under another secret are seated differently, and
@@ -1034,7 +1503,7 @@ mod tests {
         let seated = |secret: FingerprintKey| -> Vec<PublicKey> {
             let seats = Seats::keyed(LIMIT, secret);
             for key in &keys {
-                let _ = seats.rank(*key, false);
+                let _ = seats.rank(*key, false, None);
             }
             keys.iter()
                 .filter(|key| seats.place(key) == Place::Seated)
@@ -1060,7 +1529,7 @@ mod tests {
         assert_eq!(first, best);
     }
 
-    /// Sweep 3, N8: who waits for a description, for room, is decided by rank and never by
+    /// Who waits for a description, for room, is decided by rank and never by
     /// arrival. Past the intake's receivers the worst drawn is let go for a better drawn one, and
     /// past its bytes a receiver's oldest go first, so the same batches in any order leave the
     /// same batches held, every one let go counted, and the holder is asked for each batch's
@@ -1157,7 +1626,7 @@ mod tests {
         Ok(())
     }
 
-    /// Sweep 3, N17: of a receiver's descriptions taking effect at one step only the newest it
+    /// Of a receiver's descriptions taking effect at one step only the newest it
     /// signed applies, by `issued_ms` (an older one stamped later never wins), in any order; the
     /// rest are applied by stamp, then key. (One receiver's descriptions are its key, then
     /// `issued_ms` big-endian, so its bytes never order them otherwise: the stamp is the trap.)

@@ -274,34 +274,55 @@ impl Positions {
         }
         bytes.extend_from_slice(&count_u16(content.solutions.len())?.to_be_bytes());
         for solution in &content.solutions {
-            bytes.extend_from_slice(&solution.address.to_be_bytes());
-            let message = solution.observations.message();
-            // An `ObservationSet` bounds its message and its receptions to a byte each.
-            bytes.push(message.len() as u8);
-            bytes.extend_from_slice(message);
-            bytes.extend_from_slice(&solution.transmitted.unix_ms.to_be_bytes());
-            bytes.extend_from_slice(&solution.transmitted.sub_ms_ps.to_be_bytes());
-            bytes.extend_from_slice(&solution.lat_e7.to_be_bytes());
-            bytes.extend_from_slice(&solution.lon_e7.to_be_bytes());
-            bytes.extend_from_slice(&solution.alt_hae_mm.unwrap_or(NO_ALTITUDE).to_be_bytes());
-            for term in solution.covariance.terms() {
-                bytes.extend_from_slice(&term.to_bits().to_be_bytes());
-            }
-            bytes.extend_from_slice(&index_of(&clocks, &solution.clock_model)?.to_be_bytes());
-            bytes.extend_from_slice(&solution.addressed.hash);
-            bytes.extend_from_slice(&solution.addressed.count.to_be_bytes());
-            let receptions = solution.observations.receptions();
-            bytes.push(receptions.len() as u8);
-            for reception in receptions {
-                bytes.extend_from_slice(&index_of(&receivers, &reception.receiver)?.to_be_bytes());
-                bytes.extend_from_slice(&reception.epoch.to_be_bytes());
-                bytes.extend_from_slice(&reception.counter.to_be_bytes()[2..]);
-            }
+            put_solution(
+                &mut bytes,
+                solution,
+                index_of(&clocks, &solution.clock_model)?,
+                |receiver| index_of(&receivers, receiver),
+            )?;
         }
         if bytes.len() + SIGNATURE_LEN > MAX_POSITIONS_LEN {
             return Err(WireError::Oversize(bytes.len() + SIGNATURE_LEN));
         }
         Ok(Self::signed(identity, bytes))
+    }
+
+    /// How many of `solutions`, from the first, one record holds: the longest prefix whose record
+    /// is within `MAX_POSITIONS_LEN`, in any format, by any engine and under any numbering (none
+    /// changes a record's length). Measured as `sign_format` lays a record out, one solution at a
+    /// time, so a caller cutting a step's solutions into records signs each record once: cutting by
+    /// signing ever shorter prefixes of all that is left (a binary search from the whole) cost a
+    /// window step of 80,000 solutions two minutes of one thread. A solution `sign_format`
+    /// would refuse for its content is counted by its length all the same; signing says so.
+    pub fn fitting(solutions: &[Solution]) -> usize {
+        // Format to sequence, issued, specification version, and the three tables' counts.
+        let mut len = PREFIX_LEN + 8 + 2 + 2 + 2 + 2 + SIGNATURE_LEN;
+        let mut receivers: BTreeSet<PublicKey> = BTreeSet::new();
+        let mut clocks: BTreeSet<Hash> = BTreeSet::new();
+        let mut scratch = Vec::new();
+        for (at, solution) in solutions.iter().enumerate() {
+            scratch.clear();
+            if put_solution(&mut scratch, solution, 0, |_| Ok(0)).is_err() {
+                return at;
+            }
+            len += scratch.len();
+            if clocks.insert(solution.clock_model) {
+                len += solution.clock_model.len();
+            }
+            for reception in solution.observations.receptions() {
+                if receivers.insert(reception.receiver) {
+                    len += KEY_LEN;
+                }
+            }
+            if len > MAX_POSITIONS_LEN
+                || receivers.len() > usize::from(u16::MAX)
+                || clocks.len() > usize::from(u16::MAX)
+                || at >= usize::from(u16::MAX)
+            {
+                return at;
+            }
+        }
+        solutions.len()
     }
 
     pub(crate) fn signed(identity: &Identity, mut bytes: Vec<u8>) -> Self {
@@ -466,6 +487,41 @@ fn provisional_citation(format: u8, addressed: &AddressedCitation) -> Result<(),
             field: "provisional addressed citation",
             value: u64::from(addressed.count),
         });
+    }
+    Ok(())
+}
+
+/// One solution as a record lays it out, its clock model's index `clock` and each reception's
+/// receiver's from `receiver`: what `Positions::sign_format` writes and `Positions::fitting`
+/// measures, one layout for both.
+fn put_solution(
+    bytes: &mut Vec<u8>,
+    solution: &Solution,
+    clock: u16,
+    receiver: impl Fn(&PublicKey) -> Result<u16, WireError>,
+) -> Result<(), WireError> {
+    bytes.extend_from_slice(&solution.address.to_be_bytes());
+    let message = solution.observations.message();
+    // An `ObservationSet` bounds its message and its receptions to a byte each.
+    bytes.push(message.len() as u8);
+    bytes.extend_from_slice(message);
+    bytes.extend_from_slice(&solution.transmitted.unix_ms.to_be_bytes());
+    bytes.extend_from_slice(&solution.transmitted.sub_ms_ps.to_be_bytes());
+    bytes.extend_from_slice(&solution.lat_e7.to_be_bytes());
+    bytes.extend_from_slice(&solution.lon_e7.to_be_bytes());
+    bytes.extend_from_slice(&solution.alt_hae_mm.unwrap_or(NO_ALTITUDE).to_be_bytes());
+    for term in solution.covariance.terms() {
+        bytes.extend_from_slice(&term.to_bits().to_be_bytes());
+    }
+    bytes.extend_from_slice(&clock.to_be_bytes());
+    bytes.extend_from_slice(&solution.addressed.hash);
+    bytes.extend_from_slice(&solution.addressed.count.to_be_bytes());
+    let receptions = solution.observations.receptions();
+    bytes.push(receptions.len() as u8);
+    for reception in receptions {
+        bytes.extend_from_slice(&receiver(&reception.receiver)?.to_be_bytes());
+        bytes.extend_from_slice(&reception.epoch.to_be_bytes());
+        bytes.extend_from_slice(&reception.counter.to_be_bytes()[2..]);
     }
     Ok(())
 }
@@ -724,6 +780,42 @@ pub(crate) mod tests {
         for bad in [bad_time, bad_covariance, nan] {
             assert!(Positions::sign_solutions(&engine, &solutions(0, vec![bad])).is_err());
         }
+        Ok(())
+    }
+
+    /// `fitting` is exactly the longest prefix a record holds: that prefix signs, one more is
+    /// refused for its size, whatever mix of shared and new receivers and models the solutions
+    /// cite, in either format.
+    #[test]
+    fn fitting_is_the_longest_prefix_a_record_holds() -> Result<(), WireError> {
+        let engine = Identity::generate()?;
+        let mut all = Vec::new();
+        for at in 0..3_000u32 {
+            let model = [(at % 7) as u8; 32];
+            let seeds: Vec<u8> = (0..(3 + at % 9))
+                .map(|k| ((at * 13 + k * 31) % 251) as u8)
+                .collect::<BTreeSet<u8>>()
+                .into_iter()
+                .collect();
+            let mut one = solution(model, &seeds, at as i32)?;
+            one.addressed = Default::default();
+            all.push(one);
+        }
+        for start in [0, 1, 500, 1_700] {
+            let rest = &all[start..];
+            let fits = Positions::fitting(rest);
+            assert!(fits > 0 && fits < rest.len(), "{fits}");
+            for sign in [Positions::sign_solutions, Positions::sign_provisional] {
+                let record = sign(&engine, &solutions(9, rest[..fits].to_vec()))?;
+                assert!(record.as_bytes().len() <= MAX_POSITIONS_LEN);
+                assert!(matches!(
+                    sign(&engine, &solutions(9, rest[..=fits].to_vec())),
+                    Err(WireError::Oversize(_))
+                ));
+            }
+        }
+        assert_eq!(Positions::fitting(&all[..5]), 5);
+        assert_eq!(Positions::fitting(&[]), 0);
         Ok(())
     }
 

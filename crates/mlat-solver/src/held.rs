@@ -66,23 +66,9 @@ use crate::modes;
 use crate::obs::{ObservationId, Reception, message_hash};
 use crate::scope::{AFTER, BEFORE, GRID_MS, STRIDE, bin_of};
 
-/// The longest Mode S message.
-const LONG: usize = 14;
-
-/// Whether MLAT ever uses `data` (module docs, What is held).
-pub fn wanted(data: &[u8]) -> bool {
-    let Some(df) = modes::downlink_format(data) else {
-        return false;
-    };
-    match df {
-        0 | 4 | 5 | 11 | 16 | 20 | 21 => modes::address(data).is_some(),
-        17 | 18 => {
-            modes::airborne_position(data).is_some_and(|position| position.altitude.is_some())
-                || modes::nacp(data).is_some()
-        }
-        _ => false,
-    }
-}
+/// Whether MLAT ever uses a message (module docs, What is held): the network's one rule, which the
+/// feeder sheds by and the relay counts by too.
+pub use tally_wire::modes::{LONG, wanted};
 
 /// What one batch added.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -184,7 +170,7 @@ const SAMPLE_DOMAIN: &[u8] = b"tally calibration sample";
 /// receiver's bin whole to fit ([`Bin::seal_within`] refuses only beyond the receivers it was
 /// sized for). Reserved at the mean instead, nothing bounded one receiver's share: a holder whose
 /// receivers kept more than the mean filled its sealed bins and then refused, whole, the
-/// receivers with the most records, which are the best placed (sweep 5, H-b, millions of
+/// receivers with the most records, which are the best placed (millions of
 /// observations a run). Twice the mean, because the receivers that keep more than the mean are
 /// those under busy airspace hearing more of the Mode S-only targets thinning keeps (sync is
 /// capped at `SYNC_PER_RECEIVER` a bin whatever the traffic): it doubles what a receiver's sealed
@@ -256,22 +242,23 @@ fn thin(
             if distinct.len() < 2 {
                 continue;
             }
-            // Records of one message by one receiver are adjacent (identity order): the room
-            // each would leave its receiver, counted as they are taken.
+            // Records of one message by one receiver are adjacent (identity order), and a
+            // receiver keeps all of them or none: two of one message are the evidence the window
+            // rejects it by (`scope::WindowIndex::repeated`), which keeping one would erase.
             let mut kept: Vec<u32> = Vec::with_capacity(list.len());
-            let mut pending: Option<(usize, usize)> = None;
-            for record in list {
-                let receiver = receiver_of(*record);
-                let already = match pending {
-                    Some((at, count)) if at == receiver => count,
-                    _ => 0,
-                };
+            let mut start = 0;
+            while start < list.len() {
+                let receiver = receiver_of(list[start]);
+                let count = list[start..]
+                    .iter()
+                    .take_while(|record| receiver_of(**record) == receiver)
+                    .count();
                 if taken[receiver] < SYNC_PER_RECEIVER
-                    && kept_of[receiver] + already < KEPT_PER_RECEIVER_BIN
+                    && kept_of[receiver] + count <= KEPT_PER_RECEIVER_BIN
                 {
-                    kept.push(*record);
-                    pending = Some((receiver, already + 1));
+                    kept.extend_from_slice(&list[start..start + count]);
                 }
+                start += count;
             }
             let mut by: Vec<u32> = kept
                 .iter()
@@ -913,11 +900,8 @@ impl Open {
         let bin = bin_of(wall_ms);
         let wanted: Vec<ObsView<'a>> = observations
             .filter(|observation| {
-                let keep = matches!(
-                    observation.format,
-                    format::MODE_S_SHORT | format::MODE_S_LONG
-                ) && observation.data.len() <= LONG
-                    && wanted(observation.data);
+                let keep =
+                    tally_wire::modes::wanted_reception(observation.format, observation.data);
                 added.filtered += usize::from(!keep);
                 keep
             })
@@ -1086,11 +1070,28 @@ fn runs<T>(
     runs
 }
 
-/// Runs `work` on each of `inputs` on a thread of its own (here, when there is one), and returns
-/// the results in the inputs' order: under the gate of the thread asking, if any
-/// (`crate::gate::on_threads`), so a host's seals spread over no more threads than its plan gave it.
-fn on_threads<I: Send, R: Send>(inputs: Vec<I>, work: impl Fn(I) -> R + Sync) -> Vec<R> {
-    crate::gate::on_threads(inputs, work)
+/// Runs `work` on each of `inputs` on up to `threads` threads pulling them one at a time (here,
+/// when one would do), and returns the results in the inputs' order: under the gate of the thread
+/// asking, if any (`crate::gate::on_threads`), so a host's seals spread over no more threads than
+/// its plan gave it and end in about their work over the permits they hold.
+fn on_threads<I: Send, R: Send>(
+    threads: usize,
+    inputs: Vec<I>,
+    work: impl Fn(I) -> R + Sync,
+) -> Vec<R> {
+    crate::gate::on_threads(threads, inputs, work)
+}
+
+/// Sorts `items` by `key`, checkpointing every `ITEMS_PER_CHECKPOINT` comparisons: a sort of a
+/// bin's every message or every receiver's slot is one pass, and on a gate of one permit a
+/// provisional step waits a few hundred microseconds of it at most, never the whole sort. The order is the sort's own, whatever the checkpoints.
+fn sort_checkpointed<T, K: Ord>(items: &mut [T], key: impl Fn(&T) -> K) {
+    let mut compared = 0usize;
+    items.sort_unstable_by(|a, b| {
+        compared += 1;
+        every(compared, checkpoint);
+        key(a).cmp(&key(b))
+    });
 }
 
 /// Between two items of a seal's work (`crate::gate::checkpoint`): background work lets a waiting
@@ -1157,7 +1158,9 @@ impl Bin {
                 .flat_map(|fragment| fragment.slots)
                 .filter(|slot| !slot.refused && slot.raws.len > 0)
                 .collect();
-            slots.sort_by_key(|slot| slot.key);
+            // Keys are distinct within a fragment, and the fragments' order among equal keys is
+            // their raws' order, which the per-receiver sort below makes moot.
+            sort_checkpointed(&mut slots, |slot| slot.key);
             for slot in slots {
                 match lists.last_mut() {
                     Some((key, raws)) if *key == slot.key => raws.push(slot.raws),
@@ -1166,12 +1169,15 @@ impl Bin {
             }
         }
         let receivers: Vec<PublicKey> = lists.iter().map(|(key, _)| *key).collect();
-        let cut = runs(&lists, threads, |(_, chunks)| {
-            chunks.iter().map(|raws| raws.len).sum::<usize>()
-        });
+        // Pieces of about equal raw, several a thread, pulled by the threads (`on_threads`).
+        let cut = runs(
+            &lists,
+            threads * crate::gate::PIECES_PER_THREAD,
+            |(_, chunks)| chunks.iter().map(|raws| raws.len).sum::<usize>(),
+        );
         // Each receiver's raw on its own: in (epoch, counter, message bytes) order, of copies the
         // earliest wall clock first, then copies dropped.
-        let sorted: Vec<Vec<Vec<Raw>>> = on_threads(split_owned(lists, &cut), |run| {
+        let sorted: Vec<Vec<Vec<Raw>>> = on_threads(threads, split_owned(lists, &cut), |run| {
             run.into_iter()
                 .map(|(_, chunks)| {
                     checkpoint();
@@ -1191,28 +1197,29 @@ impl Bin {
         // The bin's messages, gathered once: each run's distinct ones split into parts by their
         // bytes, each part made (hashed, decoded) on its own, then all ordered by hash.
         let parts = cut.len();
-        let gathered: Vec<Vec<Vec<MessageKey>>> = on_threads(sorted.iter().collect(), |run| {
-            let mut by_part: Vec<Vec<MessageKey>> = vec![Vec::new(); parts];
-            for raws in run {
-                checkpoint();
-                for raw in raws {
-                    let key = raw.message();
-                    by_part[key.part(parts)].push(key);
+        let gathered: Vec<Vec<Vec<MessageKey>>> =
+            on_threads(threads, sorted.iter().collect(), |run| {
+                let mut by_part: Vec<Vec<MessageKey>> = vec![Vec::new(); parts];
+                for raws in run {
+                    checkpoint();
+                    for raw in raws {
+                        let key = raw.message();
+                        by_part[key.part(parts)].push(key);
+                    }
                 }
-            }
-            for keys in &mut by_part {
-                keys.sort_unstable();
-                keys.dedup();
-            }
-            by_part
-        });
+                for keys in &mut by_part {
+                    keys.sort_unstable();
+                    keys.dedup();
+                }
+                by_part
+            });
         let mut by_part: Vec<Vec<Vec<MessageKey>>> = (0..parts).map(|_| Vec::new()).collect();
         for run in gathered {
             for (part, keys) in run.into_iter().enumerate() {
                 by_part[part].push(keys);
             }
         }
-        let made: Vec<(Vec<MessageKey>, Vec<Message>)> = on_threads(by_part, |lists| {
+        let made: Vec<(Vec<MessageKey>, Vec<Message>)> = on_threads(threads, by_part, |lists| {
             let mut keys: Vec<MessageKey> = lists.into_iter().flatten().collect();
             keys.sort_unstable();
             keys.dedup();
@@ -1235,7 +1242,7 @@ impl Bin {
                     .map(move |(at, message)| (message.hash, part as u32, at as u32))
             })
             .collect();
-        order.sort_unstable();
+        sort_checkpointed(&mut order, |entry| *entry);
         let mut global: Vec<Vec<u32>> = made.iter().map(|(keys, _)| vec![0; keys.len()]).collect();
         let mut messages: Vec<Message> = Vec::with_capacity(order.len());
         for (index, (_, part, at)) in order.into_iter().enumerate() {
@@ -1268,7 +1275,7 @@ impl Bin {
                 first += receivers;
             }
             let (keys, global) = (&keys, &global);
-            on_threads(slices, |(first, run, slice)| {
+            on_threads(threads, slices, |(first, run, slice)| {
                 let mut at = 0;
                 for (offset, raws) in run.into_iter().enumerate() {
                     checkpoint();
@@ -1515,7 +1522,7 @@ impl Bin {
 
     /// Which of this bin's receivers (by index) `keys` names: a mask its records are tested against
     /// by index, so a pass over every record costs one lookup a record however many receivers
-    /// leave (sweep 5, R6: a list searched per record was quadratic in the receivers leaving).
+    /// leave (a list searched per record was quadratic in the receivers leaving).
     fn mask(&self, keys: &[PublicKey]) -> Vec<bool> {
         let mut skip = vec![false; self.receivers.len()];
         for key in keys {
@@ -1530,7 +1537,8 @@ impl Bin {
     /// receivers reseals.
     fn reopen_without(&self, skip: &[bool]) -> Fragment {
         let mut fragment = Fragment::new(self.bin);
-        for record in &self.records {
+        for (at, record) in self.records.iter().enumerate() {
+            every(at, checkpoint);
             if skip.get(record.receiver as usize).copied().unwrap_or(false) {
                 continue;
             }
@@ -1704,7 +1712,7 @@ impl SealedBins {
 
     /// Each sealed bin that holds any of `receivers`, in ascending order, sealed again without
     /// all of them on up to `threads` threads, one bin at a time, each charged before it is built
-    /// (sweep 5, N2): `charge` is asked for the bytes the bin about to be built may take
+    ///: `charge` is asked for the bytes the bin about to be built may take
     /// ([`SealedBins::cost`] of the bin it replaces: a bin sealed without some of its receivers is
     /// never larger), and what it grants (`G`, a charge its holder lets go of once the new bin is
     /// held in place of the old one and the holder's own charge for its sealed bins is settled) is

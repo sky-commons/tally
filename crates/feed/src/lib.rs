@@ -97,18 +97,25 @@ pub fn start(
         config.clock,
     )?;
     tokio::spawn(relays::keep_saved(Arc::clone(&directory)));
+    // What the relays state of the wanted receptions a second they take: each session states its
+    // relay's, and the batcher sheds to the least before it signs.
+    let wanted = Arc::new(source::WantedCeilings::default());
     tokio::spawn(relays::run(Publishing {
         directory,
         identity: identity.clone(),
         batches: batches.clone(),
         ceiling: config.ceiling,
+        wanted: Arc::clone(&wanted),
         checker: DeliveryChecker::load(&config.state_dir),
         checking: delivery_check::Checking::default(),
         prober: probe::measure,
+        source_address: config.source_address,
     }));
     let (inputs, intake) = source::channel();
     let batching = source::batch(
-        Batcher::new(identity, config.ceiling, config.clock),
+        Batcher::new(identity, config.ceiling, config.clock)
+            .shedding_to(wanted)
+            .compressing_at(config.deflate_level),
         intake,
         batches,
     );

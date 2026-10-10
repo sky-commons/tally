@@ -7,11 +7,13 @@ pub mod batch;
 pub mod beast;
 pub mod clock_model;
 pub mod credit;
+pub mod cut;
 pub mod decoded;
 pub mod delivery;
 pub mod directory;
 pub mod fault_proof;
 pub mod key;
+pub mod modes;
 pub mod noise;
 pub mod observation_set;
 pub mod positions;
@@ -34,6 +36,9 @@ pub use clock_model::{
 };
 pub use credit::{
     EvidenceBundle, EvidenceBundleContent, FirehoseCredential, FirehoseCredentialContent,
+};
+pub use cut::{
+    CUT_REFRESH_STEPS, CUT_TTL_STEPS, MAX_CUT_AREAS, MAX_CUT_FROM_MS, MlatCut, MlatCutContent,
 };
 pub use decoded::{Decoded, FingerprintKey, ObsRef, ObsView, Undecodable};
 pub use delivery::{

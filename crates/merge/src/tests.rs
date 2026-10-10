@@ -30,6 +30,8 @@ struct World {
 }
 
 const SETTLE_MS: u64 = 1_000;
+/// How late every simulated receiver host's wall clock reads (`build`).
+const HOST_CLOCK_LATE_MS: u64 = 400;
 
 fn build() -> Result<World, String> {
     let simulation = sim::run(&Scenario {
@@ -42,15 +44,24 @@ fn build() -> Result<World, String> {
         .iter()
         .map(|feed| Record::ReceiverInfo(feed.info.clone()))
         .collect();
-    raw.extend(
-        feeds
-            .iter()
-            .flat_map(|feed| feed.batches.iter().cloned().map(Record::Batch)),
-    );
+    // Every receiver's host clock reads `HOST_CLOCK_LATE_MS` late, as an unsynchronised one may:
+    // its batches carry that wall clock. A GNSS gauge's origin takes only the day from it; a
+    // free-running gauge's origin is dated by it, so the two engines' origins sit that far apart.
+    for feed in &feeds {
+        let mut previous = [0; 32];
+        for batch in &feed.batches {
+            let mut content = batch.content().map_err(text)?;
+            content.wall_ms += HOST_CLOCK_LATE_MS;
+            content.previous = previous;
+            let late = tally_wire::Batch::sign(&feed.identity, &content).map_err(text)?;
+            previous = late.hash();
+            raw.push(Record::Batch(late));
+        }
+    }
     let last = simulation
         .receptions
         .iter()
-        .map(|reception| bin_of(reception.wall_ms))
+        .map(|reception| bin_of(reception.wall_ms + HOST_CLOCK_LATE_MS))
         .max()
         .unwrap_or(0);
     let now = (Window::canonical(last).last + 1) as u64 * GRID_MS + SETTLE_MS;
@@ -157,18 +168,34 @@ fn fixes(merge: &Merge) -> Vec<&Fix> {
 /// `records` as another engine would have published the same content: every model re-signed by
 /// `identity`, and every solution citing its new id.
 fn resign(records: &[Record], identity: &Identity) -> Result<Vec<Record>, String> {
+    resign_as(records, identity, None)
+}
+
+/// As `resign`, every record naming specification version `spec` when given.
+fn resign_as(
+    records: &[Record],
+    identity: &Identity,
+    spec: Option<u16>,
+) -> Result<Vec<Record>, String> {
     let mut ids: BTreeMap<Hash, Hash> = BTreeMap::new();
     let mut out = Vec::new();
     for record in records {
         match record {
             Record::ClockModel(manifest) => {
-                let content = manifest.content(&[]).map_err(text)?;
+                let mut content = manifest.content(&[]).map_err(text)?;
+                if let Some(spec) = spec {
+                    // Its inputs' hash names the version, as another version's engine's would.
+                    content.spec_version = spec;
+                    let decoded = publish::decode(&content.model, spec).map_err(text)?;
+                    content.inputs = publish::inputs_id(&decoded);
+                }
                 let signed = ClockModel::sign(identity, &content).map_err(text)?;
                 ids.insert(manifest.id(), signed.manifest.id());
                 out.extend(signed.records());
             }
             Record::Positions(positions) => {
                 let mut content = positions.solutions().map_err(text)?;
+                content.spec_version = spec.unwrap_or(content.spec_version);
                 for solution in &mut content.solutions {
                     solution.clock_model = *ids.get(&solution.clock_model).ok_or("uncited")?;
                 }
@@ -372,6 +399,28 @@ fn the_tie_rule_is_weight_then_the_lowest_input_set_hash() -> Result<(), String>
 /// models of engines that held only part of it are not the client's to verify (their members
 /// and citations differ from what its raw gives), so they count on their signatures alone; and
 /// where two of those are incomparable, the client solves the transmission itself.
+/// A client holding the raw verifies only what its verifier implements: an engine on another
+/// specification version derives other models from the same raw, so its models are neither
+/// verified nor failed, and their solutions count on their signatures, not dropped.
+#[test]
+fn a_model_of_another_specification_version_counts_by_signature_and_is_not_failed()
+-> Result<(), String> {
+    let world = world()?;
+    let older = resign_as(
+        &world.full,
+        &Identity::from_seed([46; 32]),
+        Some(SPEC_VERSION - 1),
+    )?;
+    let mut merge = Merge::new(Settings::new(true));
+    feed(&mut merge, &world.raw, world.now)?;
+    feed(&mut merge, &older, world.now)?;
+    assert!(!fixes(&merge).is_empty());
+    for fix in fixes(&merge) {
+        assert_eq!(fix.check, Check::Signature, "{:06x}", fix.address);
+    }
+    Ok(())
+}
+
 #[test]
 fn holding_the_raw_verifies_every_model_and_solves_the_union_of_incomparable_sets()
 -> Result<(), String> {
@@ -668,7 +717,7 @@ fn identical_df11_replies_50_ms_apart_are_never_joined_and_a_tie_joins_the_same_
 }
 
 /// Two engines whose gauges' time origins are far apart (the west's GNSS, the east's a receiver's
-/// wall clock) solve one transmission; with every shared reception taken out of the east's, they
+/// wall clock, which reads `HOST_CLOCK_LATE_MS` late) solve one transmission; with every shared reception taken out of the east's, they
 /// are still matched, through the tie the west's receptions make in the east's model. The same
 /// receptions moved 50 ms later are not.
 #[test]

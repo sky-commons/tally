@@ -80,6 +80,71 @@ impl TokenBucket {
     }
 }
 
+/// The wanted receptions a second (`tally_wire::modes::wanted_reception`) the relays this feeder
+/// publishes to take from it: each relay states its own in its `RateLimit` (`wanted_per_sec`), and
+/// the batcher sheds to the least any live session stated, before it signs, so every batch it
+/// seals is one every relay it goes to takes whole. A relay that states none (one that predates the
+/// field) holds the feeder to nothing here; a session's statement goes with it ([`Stating`]).
+#[derive(Default)]
+pub struct WantedCeilings {
+    stated: std::sync::Mutex<std::collections::HashMap<u64, u32>>,
+    sessions: std::sync::atomic::AtomicU64,
+    /// The least stated, or 0 for none.
+    least: AtomicU32,
+}
+
+/// One relay session's place in [`WantedCeilings`]: what it stated, until it is dropped with the
+/// session (however the session ends, its task aborted included).
+pub struct Stating {
+    ceilings: Arc<WantedCeilings>,
+    session: u64,
+}
+
+impl Stating {
+    /// The session's relay stated `wanted_per_sec` (or none) in its latest `RateLimit`.
+    pub fn state(&self, wanted_per_sec: Option<u32>) {
+        self.ceilings.change(|stated| match wanted_per_sec {
+            Some(wanted) => {
+                stated.insert(self.session, wanted);
+            }
+            None => {
+                stated.remove(&self.session);
+            }
+        });
+    }
+}
+
+impl Drop for Stating {
+    fn drop(&mut self) {
+        self.ceilings.change(|stated| {
+            stated.remove(&self.session);
+        });
+    }
+}
+
+impl WantedCeilings {
+    /// A new session's place, stating nothing yet.
+    pub fn session(self: &Arc<Self>) -> Stating {
+        Stating {
+            ceilings: Arc::clone(self),
+            session: self.sessions.fetch_add(1, Ordering::Relaxed),
+        }
+    }
+
+    fn change(&self, change: impl FnOnce(&mut std::collections::HashMap<u64, u32>)) {
+        if let Ok(mut stated) = self.stated.lock() {
+            change(&mut stated);
+            let least = stated.values().copied().min().unwrap_or(0);
+            self.least.store(least, Ordering::Relaxed);
+        }
+    }
+
+    /// The least wanted receptions a second a live session stated, if any did.
+    pub fn least(&self) -> Option<u32> {
+        Some(self.least.load(Ordering::Relaxed)).filter(|least| *least > 0)
+    }
+}
+
 /// Builds one boot's chain of signed batches.
 pub struct Batcher {
     identity: Identity,
@@ -93,6 +158,10 @@ pub struct Batcher {
     dropped: u32,
     last_counter: Option<u64>,
     bucket: TokenBucket,
+    /// The relays' wanted ceilings this batcher sheds to, and its bucket at the one it last read.
+    wanted: Arc<WantedCeilings>,
+    wanted_bucket: Option<(u32, TokenBucket)>,
+    codec: Codec,
 }
 
 impl Batcher {
@@ -116,7 +185,48 @@ impl Batcher {
             dropped: 0,
             last_counter: None,
             bucket: TokenBucket::new(ceiling),
+            wanted: Arc::default(),
+            wanted_bucket: None,
+            codec: Codec::Deflate,
         }
+    }
+
+    /// Compresses at DEFLATE level `level` instead of the wire's own (`Codec::DeflateAt`).
+    pub fn compressing_at(mut self, level: Option<u8>) -> Self {
+        if let Some(level) = level {
+            self.codec = Codec::DeflateAt(level);
+        }
+        self
+    }
+
+    /// Sheds wanted receptions to `ceilings` (what the relays it publishes to stated), counted as
+    /// dropped like anything over the owner's ceiling.
+    pub fn shedding_to(mut self, ceilings: Arc<WantedCeilings>) -> Self {
+        self.wanted = ceilings;
+        self
+    }
+
+    /// Whether a wanted reception fits under the least ceiling the relays stated now, and takes it.
+    /// A second's worth at once, as a relay holds it (`tally_relay::ingest::FEEDER_RECEPTIONS_BURST_SECS`
+    /// allows a second more for the batches' arrival). The bucket follows the ceiling as it
+    /// changes, keeping what it held.
+    fn wanted_fits(&mut self, now: Instant) -> bool {
+        let Some(ceiling) = self.wanted.least() else {
+            self.wanted_bucket = None;
+            return true;
+        };
+        let bucket = match &mut self.wanted_bucket {
+            Some((at, bucket)) if *at == ceiling => bucket,
+            held => {
+                let mut bucket = TokenBucket::new(ceiling);
+                if let Some((_, before)) = held.take() {
+                    bucket.tokens = before.tokens.min(bucket.burst);
+                    bucket.filled = before.filled;
+                }
+                &mut held.insert((ceiling, bucket)).1
+            }
+        };
+        bucket.take_at(1, now)
     }
 
     /// Takes what a reader sent. A batch is returned when the input had to seal one first.
@@ -128,11 +238,27 @@ impl Batcher {
         }
     }
 
+    /// The frames one read of a decoder's port gave, as `observe` takes each: every batch that
+    /// sealed on the way (a full one) is appended to `sealed`.
+    pub fn take_frames(&mut self, frames: &[Frame], sealed: &mut Vec<Batch>) -> Result<(), String> {
+        let now = Instant::now();
+        for frame in frames {
+            sealed.extend(self.observe_at(frame, now)?);
+        }
+        Ok(())
+    }
+
     /// A 1090 MHz frame. A free-running counter that ran backwards seals what came before it, so
     /// a batch never holds counters from two epochs. A Radarcape's GPS counter is time of day and
     /// runs back every UTC midnight by design, so for it only a reconnect starts an epoch. A frame
     /// with no timestamp (0) says nothing about the counter.
     pub fn observe(&mut self, frame: &Frame) -> Result<Option<Batch>, String> {
+        self.observe_at(frame, Instant::now())
+    }
+
+    /// As `observe`, with the upload ceiling and the relays' wanted ceiling refilled to `now`: a
+    /// reader that hands over what one read decoded reads the clock once for all of it.
+    pub fn observe_at(&mut self, frame: &Frame, now: Instant) -> Result<Option<Batch>, String> {
         let counter = frame.timestamp();
         let mut sealed = None;
         if counter != 0 {
@@ -146,15 +272,28 @@ impl Batcher {
             self.last_counter = Some(counter);
         }
         // After a restart the batch is empty, so this reception cannot seal a second one.
-        let pushed = self.push(Observation::from_beast(frame))?;
+        let pushed = self.push_at(Observation::from_beast(frame), now)?;
         Ok(sealed.or(pushed))
     }
 
     /// A reception of any format, under the ceiling or dropped and counted. If it would take the
     /// batch past what one message carries, what gathered before it is sealed first and returned.
     pub fn push(&mut self, observation: Observation) -> Result<Option<Batch>, String> {
+        self.push_at(observation, Instant::now())
+    }
+
+    /// As `push`, at `now` (`observe_at`).
+    pub fn push_at(
+        &mut self,
+        observation: Observation,
+        now: Instant,
+    ) -> Result<Option<Batch>, String> {
         let cost = 1 + 6 + 1 + 2 + observation.data.len();
-        if cost > MAX_OBSERVATION_BYTES || !self.bucket.take(cost) {
+        // A wanted reception past the relays' ceiling is shed here, before it is signed: the
+        // relay would drop the batch it took past it.
+        let shed = tally_wire::modes::wanted_reception(observation.format, &observation.data)
+            && !self.wanted_fits(now);
+        if shed || cost > MAX_OBSERVATION_BYTES || !self.bucket.take_at(cost, now) {
             self.dropped = self.dropped.saturating_add(1);
             return Ok(None);
         }
@@ -201,7 +340,7 @@ impl Batcher {
             observations: std::mem::take(&mut self.observations),
         };
         // Compressed: every relay reads it (wire version 2 is the minimum).
-        let batch = Batch::sign_with(&self.identity, &content, Codec::Deflate)
+        let batch = Batch::sign_with(&self.identity, &content, self.codec)
             .map_err(|error| error.to_string())?;
         self.sequence += 1;
         self.previous = batch.hash();
@@ -239,28 +378,45 @@ pub enum Input {
     CounterRestarted,
 }
 
+/// What crosses the channel: one input, or the frames one read of a decoder's port decoded (one
+/// message for all of them, not one each).
+enum Message {
+    One(Input),
+    Frames(Vec<Frame>),
+}
+
 /// A source reader's end of the channel to the batcher.
 #[derive(Clone)]
 pub struct Inputs {
-    sender: mpsc::Sender<Input>,
+    sender: mpsc::Sender<Message>,
     overflow: Arc<AtomicU32>,
+    /// Receptions sent and not yet taken: the backlog is counted in receptions, whether they
+    /// crossed one at a time or a read's worth at once.
+    queued: Arc<AtomicU32>,
 }
 
 /// The batcher's end.
 pub struct Intake {
-    receiver: mpsc::Receiver<Input>,
+    receiver: mpsc::Receiver<Message>,
     overflow: Arc<AtomicU32>,
+    queued: Arc<AtomicU32>,
 }
 
 pub fn channel() -> (Inputs, Intake) {
     let (sender, receiver) = mpsc::channel(INPUT_BACKLOG);
     let overflow = Arc::new(AtomicU32::new(0));
+    let queued = Arc::new(AtomicU32::new(0));
     (
         Inputs {
             sender,
             overflow: Arc::clone(&overflow),
+            queued: Arc::clone(&queued),
         },
-        Intake { receiver, overflow },
+        Intake {
+            receiver,
+            overflow,
+            queued,
+        },
     )
 }
 
@@ -270,14 +426,36 @@ impl Inputs {
     /// for a source that is not a decoder's port: the load harness (`tally-load`) offers a
     /// simulated receiver's receptions here, so its batches are this batcher's own.
     pub fn offer(&self, input: Input) {
-        if let Err(mpsc::error::TrySendError::Full(_)) = self.sender.try_send(input) {
-            self.overflow.fetch_add(1, Ordering::Relaxed);
+        self.send(Message::One(input), 1);
+    }
+
+    /// Sends `message` of `count` receptions unless that would put more than `INPUT_BACKLOG`
+    /// receptions in the channel: then it is dropped, counted.
+    fn send(&self, message: Message, count: u32) {
+        let before = self.queued.fetch_add(count, Ordering::Relaxed);
+        if before.saturating_add(count) > INPUT_BACKLOG as u32
+            || self.sender.try_send(message).is_err()
+        {
+            self.queued.fetch_sub(count, Ordering::Relaxed);
+            self.overflow.fetch_add(count, Ordering::Relaxed);
+        }
+    }
+
+    /// The frames one read decoded, as `offer` takes one: if the batcher is behind, all of them
+    /// are dropped and counted.
+    pub fn offer_frames(&self, frames: Vec<Frame>) {
+        let count = u32::try_from(frames.len()).unwrap_or(u32::MAX);
+        if count > 0 {
+            self.send(Message::Frames(frames), count);
         }
     }
 
     /// An epoch change is not a reception and is never dropped.
     async fn counter_restarted(&self) {
-        let _ = self.sender.send(Input::CounterRestarted).await;
+        let _ = self
+            .sender
+            .send(Message::One(Input::CounterRestarted))
+            .await;
     }
 }
 
@@ -292,10 +470,26 @@ pub async fn batch(mut batcher: Batcher, mut intake: Intake, out: broadcast::Sen
                     flush(&mut batcher, &intake.overflow, &out);
                     return;
                 };
-                match batcher.take(input) {
-                    Ok(Some(batch)) => publish(&out, batch),
-                    Ok(None) => {}
-                    Err(error) => eprintln!("tally-feed: signing a batch: {error}"),
+                let taken = match &input {
+                    Message::One(_) => 1,
+                    Message::Frames(frames) => u32::try_from(frames.len()).unwrap_or(u32::MAX),
+                };
+                intake.queued.fetch_sub(taken, Ordering::Relaxed);
+                match input {
+                    Message::One(input) => match batcher.take(input) {
+                        Ok(Some(batch)) => publish(&out, batch),
+                        Ok(None) => {}
+                        Err(error) => eprintln!("tally-feed: signing a batch: {error}"),
+                    },
+                    Message::Frames(frames) => {
+                        let mut sealed = Vec::new();
+                        if let Err(error) = batcher.take_frames(&frames, &mut sealed) {
+                            eprintln!("tally-feed: signing a batch: {error}");
+                        }
+                        for batch in sealed {
+                            publish(&out, batch);
+                        }
+                    }
                 }
                 if batcher.is_full() {
                     flush(&mut batcher, &intake.overflow, &out);
@@ -349,11 +543,13 @@ async fn read_beast_stream(
         if length == 0 {
             return Err("closed".to_owned());
         }
+        let mut frames = Vec::new();
         decoder.push(&buffer[..length], |frame| {
             if !*refusing {
-                inputs.offer(Input::Frame(frame));
+                frames.push(frame);
             }
         });
+        inputs.offer_frames(frames);
         if decoder.is_merged() && !*refusing {
             *refusing = true;
             eprintln!(
@@ -458,6 +654,94 @@ mod tests {
 
     fn content(batch: &Batch) -> Result<BatchContent, String> {
         batch.content().map_err(|error| error.to_string())
+    }
+
+    /// The batcher sheds wanted receptions past the least ceiling a relay stated,
+    /// before it signs, counted in the batch's `dropped`; receptions MLAT never uses are held to
+    /// the owner's bytes alone; and with no relay stating one, nothing is shed.
+    #[test]
+    fn wanted_receptions_past_the_relays_ceiling_are_shed_before_signing() -> Result<(), String> {
+        let wanted = tally_wire::modes::with_parity(&[0x20, 0, 0x12, 0x34], 0x00ab_cdef);
+        let unwanted = [0x8d; 14];
+        let ceilings = Arc::new(WantedCeilings::default());
+        let stating = ceilings.session();
+        let mut batcher = batcher(10_000_000)?.shedding_to(Arc::clone(&ceilings));
+        let reception = |data: &[u8], format| Observation {
+            format,
+            timestamp: 1,
+            signal: 9,
+            data: data.to_vec(),
+        };
+        // Unstated: every reception is taken.
+        for _ in 0..500 {
+            batcher.push(reception(&wanted, tally_wire::batch::format::MODE_S_SHORT))?;
+        }
+        let all = content(&batcher.seal()?.ok_or("no batch")?)?;
+        assert_eq!((all.observations.len(), all.dropped), (500, 0));
+        stating.state(Some(100));
+        for _ in 0..500 {
+            batcher.push(reception(&wanted, tally_wire::batch::format::MODE_S_SHORT))?;
+            batcher.push(reception(&unwanted, tally_wire::batch::format::MODE_S_LONG))?;
+        }
+        let shed = content(&batcher.seal()?.ok_or("no batch")?)?;
+        let kept_wanted = shed
+            .observations
+            .iter()
+            .filter(|observation| {
+                tally_wire::modes::wanted_reception(observation.format, &observation.data)
+            })
+            .count();
+        // A second's worth of the ceiling at once, the rest shed and counted; none unwanted shed.
+        assert!((100..=101).contains(&kept_wanted), "{kept_wanted} kept");
+        assert_eq!(shed.observations.len() - kept_wanted, 500);
+        assert_eq!(shed.dropped as usize, 500 - kept_wanted);
+        // The session ends: its ceiling goes with it.
+        drop(stating);
+        for _ in 0..500 {
+            batcher.push(reception(&wanted, tally_wire::batch::format::MODE_S_SHORT))?;
+        }
+        assert_eq!(content(&batcher.seal()?.ok_or("no batch")?)?.dropped, 0);
+        Ok(())
+    }
+
+    /// The frames one read decoded take as each would one at a time: the same batches, in the
+    /// same order, a full one sealed on the way, and what the channel holds is counted in
+    /// receptions however they crossed it.
+    #[test]
+    fn a_reads_frames_batch_as_they_would_one_at_a_time() -> Result<(), String> {
+        let frames = (1..=4_000u64).map(frame).collect::<Result<Vec<_>, _>>()?;
+        let mut together = batcher(100_000_000)?;
+        let mut sealed = Vec::new();
+        together.take_frames(&frames, &mut sealed)?;
+        sealed.extend(together.seal()?);
+        assert!(sealed.len() >= 2, "a full batch seals on the way");
+        let counters = |batches: &[Batch]| -> Result<Vec<u64>, String> {
+            let mut all = Vec::new();
+            for batch in batches {
+                all.extend(
+                    content(batch)?
+                        .observations
+                        .iter()
+                        .map(|each| each.timestamp),
+                );
+            }
+            Ok(all)
+        };
+        assert_eq!(counters(&sealed)?, (1..=4_000).collect::<Vec<u64>>());
+        for pair in sealed.windows(2) {
+            assert_eq!(content(&pair[1])?.previous, pair[0].hash());
+        }
+        let (inputs, mut intake) = channel();
+        inputs.offer_frames(frames[..3_000].to_vec());
+        inputs.offer_frames(frames[..3_000].to_vec());
+        // 3,000 and 3,000 receptions against a backlog of 4,096: the second is dropped, counted.
+        assert_eq!(intake.overflow.load(Ordering::Relaxed), 3_000);
+        assert!(matches!(
+            intake.receiver.try_recv(),
+            Ok(Message::Frames(taken)) if taken.len() == 3_000
+        ));
+        assert!(intake.receiver.try_recv().is_err());
+        Ok(())
     }
 
     #[test]

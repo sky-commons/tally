@@ -580,7 +580,7 @@ mod tests {
             assert_eq!(decoded.batch(), &batch);
             let format = match codec {
                 Codec::Plain => crate::batch::BATCH_FORMAT,
-                Codec::Deflate => crate::batch::BATCH_FORMAT_DEFLATE,
+                Codec::Deflate | Codec::DeflateAt(_) => crate::batch::BATCH_FORMAT_DEFLATE,
             };
             assert_eq!(batch.format(), format);
             assert_eq!(decoded.inflated_len(), batch.inflated_len()?);

@@ -125,7 +125,7 @@ const _: () = assert!(PLANNED_BATCH_CHARGE >= CHARGE_FLOOR);
 /// ceiling sends fewer: at the default 256 KiB/s, eight a second, where it sends five at most.
 pub const RECORD_BYTES: u64 = 32 << 10;
 
-/// The records a second a connection held to `bytes_per_sec` may send (R-N12), at least one: its
+/// The records a second a connection held to `bytes_per_sec` may send, at least one: its
 /// ceiling over [`RECORD_BYTES`]. The ingest cores plan each feeder's worth of these
 /// ([`INGEST_NANOS_PER_RECORD`] each, `cores`). Before, a feeder sending tiny batches within its
 /// 256 KiB/s was some 870 signature checks a second, and a few dozen such feeders took every
@@ -146,6 +146,152 @@ pub const fn member_records_per_sec(member_feeders: usize) -> u64 {
     if records == 0 { 1 } else { records }
 }
 
+/// The members' shared rate, in bytes and in receptions a second, fair between member sessions
+/// (RFC-0181 §9). Both are the one rate `--max-member-bytes-per-sec` is worth, planned once as the
+/// feeders it is worth (`budget::feeders_for_rate`): a member's batch is a feeder's another relay
+/// kept, so what it brings in is bounded by its receptions as well as its bytes, or batches of many
+/// small receptions would bring in more than the plan holds. A session waits first for its own
+/// share of each (the rate over the sessions waiting now, [`FairPace`]) and then for the shared
+/// total, so one member sending large batches cannot take the rate from the rest, and the members
+/// together never pass it.
+pub struct MemberPace {
+    bytes: Arc<FairPace>,
+    receptions: Arc<FairPace>,
+}
+
+impl MemberPace {
+    /// The pace for `bytes_per_sec` all together, the receptions of the feeders it is worth.
+    pub fn new(bytes_per_sec: u64) -> Self {
+        let feeders = crate::budget::feeders_for_rate(bytes_per_sec) as u64;
+        Self {
+            bytes: Arc::new(FairPace::new(bytes_per_sec)),
+            receptions: Arc::new(FairPace::new(
+                feeders.saturating_mul(PLANNED_RECEPTIONS_PER_SEC as u64),
+            )),
+        }
+    }
+
+    /// A member session's place in it.
+    pub fn session(&self) -> MemberSession {
+        MemberSession {
+            bytes: FairSession::new(&self.bytes),
+            receptions: FairSession::new(&self.receptions),
+        }
+    }
+
+    /// Bytes a second, and receptions a second, all member sessions together.
+    pub fn rates(&self) -> (u64, u64) {
+        (self.bytes.total.rate(), self.receptions.total.rate())
+    }
+}
+
+/// One member session's place in the [`MemberPace`].
+pub struct MemberSession {
+    bytes: FairSession,
+    receptions: FairSession,
+}
+
+impl MemberSession {
+    /// Spends `bytes` and `receptions` of the session's share and the members' total, waiting
+    /// while it owes more than has refilled.
+    pub async fn take(&self, bytes: u64, receptions: u64) {
+        tokio::join!(self.bytes.take(bytes), self.receptions.take(receptions));
+    }
+}
+
+/// One rate several sessions share, divided evenly between those using it (max-min: a session
+/// using little leaves the rest to the others), under a total all of them share
+/// (`ceiling::Pace`). A session is using it if it took anything in the last second or the one
+/// before.
+struct FairPace {
+    total: crate::ceiling::Pace,
+    began: tokio::time::Instant,
+    /// The second counted now, and the sessions that took in it and in the second before.
+    using: Mutex<Using>,
+}
+
+#[derive(Default)]
+struct Using {
+    second: u64,
+    now: usize,
+    before: usize,
+}
+
+impl FairPace {
+    fn new(rate: u64) -> Self {
+        Self {
+            total: crate::ceiling::Pace::new(rate),
+            began: tokio::time::Instant::now(),
+            using: Mutex::new(Using::default()),
+        }
+    }
+
+    /// The sessions using the rate, `session` among them (it took in `second` or not yet).
+    fn sharing(&self, last: &mut Option<u64>) -> usize {
+        let second = self.began.elapsed().as_secs();
+        let Ok(mut using) = self.using.lock() else {
+            return 1;
+        };
+        if second > using.second {
+            using.before = if second == using.second + 1 {
+                using.now
+            } else {
+                0
+            };
+            using.now = 0;
+            using.second = second;
+        }
+        if *last != Some(second) {
+            *last = Some(second);
+            using.now += 1;
+        }
+        using.now.max(using.before).max(1)
+    }
+}
+
+struct FairSession {
+    pace: Arc<FairPace>,
+    /// Units still allowed (negative: owed), as of when, and the second it last counted itself
+    /// among the sessions using the rate.
+    state: Mutex<(f64, tokio::time::Instant, Option<u64>)>,
+}
+
+impl FairSession {
+    fn new(pace: &Arc<FairPace>) -> Self {
+        Self {
+            pace: Arc::clone(pace),
+            state: Mutex::new((
+                crate::ceiling::burst(pace.total.rate()) as f64,
+                tokio::time::Instant::now(),
+                None,
+            )),
+        }
+    }
+
+    async fn take(&self, units: u64) {
+        let rate = self.pace.total.rate();
+        let wait = {
+            let Ok(mut state) = self.state.lock() else {
+                return;
+            };
+            let now = tokio::time::Instant::now();
+            let elapsed = now.saturating_duration_since(state.1).as_secs_f64();
+            // This session and every other one using the rate: its share is an even part.
+            let sharing = self.pace.sharing(&mut state.2);
+            let share = (rate as f64 / sharing as f64).max(1.0);
+            let burst = crate::ceiling::burst(rate) as f64 / sharing as f64;
+            let allowed = (state.0 + elapsed * share).min(burst) - units as f64;
+            state.0 = allowed;
+            state.1 = now;
+            (allowed < 0.0 && rate > 0).then(|| Duration::from_secs_f64(-allowed / share))
+        };
+        if let Some(wait) = wait {
+            tokio::time::sleep(wait).await;
+        }
+        self.pace.total.take(units).await;
+    }
+}
+
 /// The records a second one planned feeder's worth of the members' rate may bring: four times the
 /// planned batch a second, the headroom the notes plan for feeders above their rate
 /// (`mlat_host::NOTES_HEADROOM`).
@@ -161,21 +307,104 @@ pub const MEMBER_RECORDS_PER_FEEDER: u64 = 4;
 /// ceiling (eight tiny records a second, 240 us) costs the workers some 1.8 times a planned one.
 pub const INGEST_NANOS_PER_RECORD: usize = 30_000;
 
-/// The receptions a second one feeder's connection may send, at most (RFC-0181 §10, "The cores",
-/// decided 2026-10-09): the one ceiling a receiver is held to, the same constant MLAT's raw holder
-/// sizes a receiver's open bins by (`tally_mlat_solver::held::Rates::MEASURED`, `ceiling_per_s`),
-/// three times the 600 a planned feeder sends (`budget::PLANNED_RECEPTIONS_PER_SEC`), which is what
-/// the cores are planned at. Past it the read loop waits before it takes the next batch, its socket
-/// unread, as it does for records ([`RecordPace`]): a feeder is slowed, never refused. Before, a
-/// feeder's receptions were bounded only by its bytes (256 KiB/s, some 15,000 receptions a second
-/// at 17 bytes each), so one feeder within its byte ceiling cost the stages 25 planned feeders'.
+/// The wanted receptions a second (`tally_wire::modes::wanted_reception`) one receiver's feeder may
+/// send, at most (RFC-0181 §10, "The cores", decided 2026-10-09): the one ceiling a receiver is
+/// held to, the same constant MLAT's raw holder sizes a receiver's open bins by
+/// (`tally_mlat_solver::held::Rates::MEASURED`, `ceiling_per_s`, which counts wanted receptions
+/// too), five times the 360 wanted a planned feeder sends of its 600 (`budget::PLANNED_RECEPTIONS_PER_SEC`).
+/// A feeder is told it with its `RateLimit` (`wanted_per_sec`) and sheds what is past it before it
+/// signs (`tally_feed::source::Batcher`), counted in its batches' `dropped`. The relay holds each
+/// receiver to it by its batches' stamps ([`ReceptionCeilings`]) and drops a batch that would take
+/// the receiver past it, counted (`Hub::over_reception_ceiling`), never slowing the read loop: a
+/// feeder's socket is read at the pace of its records and bytes alone, so a real-time feeder is
+/// never seconds behind. Before, the read loop waited for every reception, wanted
+/// or not, against a ceiling stated in wanted ones (1,800 wanted is some 3,000 in all), and the
+/// feeder, told nothing, fell behind by seconds while its batches went stale for MLAT.
 pub const FEEDER_RECEPTIONS_PER_SEC: u64 =
     tally_mlat_solver::held::Rates::MEASURED.ceiling_per_s as u64;
+
+/// The seconds of [`FEEDER_RECEPTIONS_PER_SEC`] a receiver may send at once, by its batches'
+/// stamps: the second a feeder keeping to its ceiling may seal in one batch (its own bucket holds
+/// a second, `tally_feed::source`), and a second for the batches' arrival to bunch on the way (a
+/// batch delayed, then the next on its heels), so a feeder that sheds to its ceiling is never
+/// dropped here.
+pub const FEEDER_RECEPTIONS_BURST_SECS: u64 = 2;
+
+/// Each receiver's wanted receptions against [`FEEDER_RECEPTIONS_PER_SEC`], by its batches' stamps
+/// (never a clock: the same stamped batches are kept or dropped alike on any number of threads,
+/// RFC-0181 invariant 1). A token bucket per receiver, kept in its raw shard and touched by the
+/// ingest worker that owns the shard alone, so a receiver's batches meet it in the order they were
+/// stamped. A receiver whose bucket has refilled holds nothing a fresh one would not, so it is
+/// forgotten once the map has grown past twice what it held after its last pruning: what is held
+/// is the receivers that sent within the last [`FEEDER_RECEPTIONS_BURST_SECS`].
+#[derive(Default)]
+pub struct ReceptionCeilings {
+    /// Tokens held (wanted receptions), as of a stamp.
+    held: std::collections::HashMap<tally_wire::PublicKey, (f64, u64)>,
+    pruned_to: usize,
+}
+
+impl ReceptionCeilings {
+    const RATE_PER_MS: f64 = FEEDER_RECEPTIONS_PER_SEC as f64 / 1_000.0;
+    const BURST: f64 = (FEEDER_RECEPTIONS_PER_SEC * FEEDER_RECEPTIONS_BURST_SECS) as f64;
+
+    fn refilled((tokens, at_ms): (f64, u64), stamp_ms: u64) -> f64 {
+        (tokens + stamp_ms.saturating_sub(at_ms) as f64 * Self::RATE_PER_MS).min(Self::BURST)
+    }
+
+    /// Whether `receiver`'s batch of `wanted` wanted receptions, stamped `stamp_ms`, is within its
+    /// ceiling: taken if it is, and if not, nothing is taken (the batch is dropped whole, so what
+    /// it would have spent stays for the next).
+    pub fn take(&mut self, receiver: tally_wire::PublicKey, wanted: usize, stamp_ms: u64) -> bool {
+        if self.held.len() > 2 * self.pruned_to.max(64) {
+            self.held
+                .retain(|_, held| Self::refilled(*held, stamp_ms) < Self::BURST);
+            self.pruned_to = self.held.len();
+        }
+        let held = self.held.entry(receiver).or_insert((Self::BURST, stamp_ms));
+        let tokens = Self::refilled(*held, stamp_ms);
+        let within = wanted as f64 <= tokens;
+        *held = (
+            if within {
+                tokens - wanted as f64
+            } else {
+                tokens
+            },
+            stamp_ms.max(held.1),
+        );
+        within
+    }
+
+    /// The receivers held now.
+    pub fn len(&self) -> usize {
+        self.held.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.held.is_empty()
+    }
+}
+
+/// The receptions a second (all of them, wanted or not) one source's share of the relay's rate is
+/// at most (`shed`): its wanted ceiling ([`FEEDER_RECEPTIONS_PER_SEC`]) over the wanted share of
+/// what a planned feeder hears (360 of its 600, `budget::PLANNED_RECEPTIONS_PER_SEC`).
+pub const SOURCE_RECEPTIONS_PER_SEC: u64 = FEEDER_RECEPTIONS_PER_SEC
+    * PLANNED_RECEPTIONS_PER_SEC as u64
+    / PLANNED_WANTED_RECEPTIONS_PER_SEC;
+/// The wanted receptions a second of a planned feeder's 600 (`tally_wire::modes::wanted_reception`).
+pub const PLANNED_WANTED_RECEPTIONS_PER_SEC: u64 = 360;
+
+/// The cores this host gives the process (`std::thread::available_parallelism`), at least one.
+pub fn host_cores() -> usize {
+    std::thread::available_parallelism().map_or(1, std::num::NonZero::get)
+}
 
 /// How fast, and how far ahead, one session of a role may send records: `per_minute` a minute,
 /// and `burst` at once from rest. What the cores plan for a session is its `per_minute`
 /// (`cores::Sessions`); its `burst` is what its role legitimately sends at once (with its Hello,
-/// or a credential and its evidence), taken once and refilled at `per_minute`. By the minute, since
+/// or a credential and its evidence), refilled at `per_minute`. A new session starts with
+/// [`SESSION_BURST`] of it and the rest only as it is granted ([`BurstGrants`]): so a peer that
+/// reconnects does not refill a burst outside the plan each time it dials. By the minute, since
 /// what most roles need is a heartbeat every 30 s and a few records when something changes, far
 /// under one a second.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -185,9 +414,232 @@ pub struct RolePace {
 }
 
 impl RolePace {
-    /// A pace of this role's, for one session (or, the directory's, shared by every link).
+    /// A pace of this role's, full from rest.
     pub fn pace(self) -> RecordPace {
         RecordPace::per_minute(self.per_minute, self.burst)
+    }
+
+    /// A new session's pace of this role's: [`SESSION_BURST`] of its burst, and as much of the
+    /// rest as `grants` give a session from `group` now (`BurstGrants::grant`).
+    pub fn session(self, grants: &BurstGrants, group: Option<Group>) -> RecordPace {
+        let base = self.burst.min(SESSION_BURST);
+        let granted = grants.grant(group, self.burst - base);
+        RecordPace::starting(self.per_minute, self.burst, base + granted)
+    }
+}
+
+/// The network group (`directory::Group`) a session's address is in, or `None` for one with no
+/// address (an in-process stream): the unit a pace that outlives sessions is kept by, since a key
+/// is free and an address in another network is not.
+pub type Group = crate::directory::Group;
+
+/// The group of `address`.
+pub fn group_of(address: Option<std::net::IpAddr>) -> Option<Group> {
+    address.map(Group::of)
+}
+
+/// What every new session starts with of its role's burst, whoever it is: what any role sends with
+/// its Hello but a credential's evidence (a probe's round, an engine's `Subscribe`, a feeder's
+/// second of records). The rest of a burst ([`SUBSCRIBER_RECORDS`]'s evidence) is granted
+/// ([`BurstGrants`]).
+pub const SESSION_BURST: u64 = 8;
+
+/// The burst tokens a minute, and at once, new sessions are granted past [`SESSION_BURST`], all
+/// groups together: what the cores plan for bursts (`cores::Sessions`), whatever the connections
+/// come and go. Sixteen evidence bundles' worth a minute, and the default subscriber cap's
+/// (`--max-subscribers`, 64) at once, so a relay's subscribers reconnecting together after it
+/// restarts each bring their credential's evidence at once.
+pub const BURST_GRANTS: RolePace = RolePace {
+    per_minute: 16 * EVIDENCE_SIGNATURES,
+    burst: 64 * EVIDENCE_SIGNATURES,
+};
+
+/// The burst tokens a minute, and at once, one network group's new sessions are granted: two
+/// evidence bundles' worth a minute and eight at once, so one network reconnecting as fast as it
+/// can takes an eighth of [`BURST_GRANTS`] at most and every other network's sessions still get
+/// theirs. Kept by group across its sessions, so a reconnect finds the grant its last one took.
+pub const GROUP_BURST_GRANTS: RolePace = RolePace {
+    per_minute: 2 * EVIDENCE_SIGNATURES,
+    burst: 8 * EVIDENCE_SIGNATURES,
+};
+
+/// What new sessions are granted of their roles' bursts past [`SESSION_BURST`]:
+/// a token bucket per network group ([`GROUP_BURST_GRANTS`]), kept across its sessions, under one
+/// the relay's groups share ([`BURST_GRANTS`]). A grant is taken from both, as much as both hold,
+/// never waited for: a session granted less starts with less and earns the rest at its role's
+/// pace. Before, every connection started with its role's whole burst, so a subscriber that
+/// reconnected as fast as it could had some 136 signatures verified a connection, against the
+/// twelve records a minute the cores planned for it.
+pub struct BurstGrants {
+    shared: RecordPace,
+    groups: Mutex<ByGroup>,
+}
+
+impl Default for BurstGrants {
+    fn default() -> Self {
+        Self::new(BURST_GRANTS, GROUP_BURST_GRANTS)
+    }
+}
+
+impl BurstGrants {
+    pub fn new(shared: RolePace, group: RolePace) -> Self {
+        Self {
+            shared: shared.pace(),
+            groups: Mutex::new(ByGroup::new(group)),
+        }
+    }
+
+    /// Up to `wanted` tokens for a new session from `group`, taken now: what both its group and
+    /// the shared grants hold, at most.
+    pub fn grant(&self, group: Option<Group>, wanted: u64) -> u64 {
+        if wanted == 0 {
+            return 0;
+        }
+        let Ok(mut groups) = self.groups.lock() else {
+            return 0;
+        };
+        let own = groups.get(group);
+        let granted = wanted.min(own.available()).min(self.shared.available());
+        own.take_now(granted);
+        self.shared.take_now(granted);
+        granted
+    }
+}
+
+/// Paces kept by network group, across that group's sessions: each made at `pace` the first time
+/// its group is seen, full. One whose bucket has refilled holds nothing a new one would not, so
+/// once the map has grown past twice what it held after its last pruning, those are forgotten:
+/// what is held is the groups that spent within one refill.
+struct ByGroup {
+    pace: RolePace,
+    held: std::collections::HashMap<Option<Group>, Arc<RecordPace>>,
+    pruned_to: usize,
+}
+
+impl ByGroup {
+    fn new(pace: RolePace) -> Self {
+        Self {
+            pace,
+            held: std::collections::HashMap::new(),
+            pruned_to: 0,
+        }
+    }
+
+    fn get(&mut self, group: Option<Group>) -> Arc<RecordPace> {
+        if self.held.len() > 2 * self.pruned_to.max(64) {
+            self.held
+                .retain(|_, pace| Arc::strong_count(pace) > 1 || !pace.is_full());
+            self.pruned_to = self.held.len();
+        }
+        let pace = self.pace;
+        Arc::clone(
+            self.held
+                .entry(group)
+                .or_insert_with(|| Arc::new(pace.pace())),
+        )
+    }
+}
+
+/// Every directory link's pace: one per network group, kept across that group's
+/// links (so what a link owes, its evidence's signatures, `credit::check`, is its group's and
+/// outlives its session), each at an equal share of [`DIRECTORY_RECORDS`] among the groups with
+/// a link now. The shares together are the one rate the cores plan for the directory, however
+/// many links; a group that sends as fast as it may, or owes for every bundle it sends, waits on
+/// its own share alone, and every other group's links keep theirs. Before, every link shared one
+/// pace: a link's evidence owed up to 128 tokens to it a bundle, so one hostile link held every
+/// other link's gossip back, and kept doing so after it hung up.
+pub struct DirectoryPaces {
+    pace: RolePace,
+    /// The groups with a link now: the share's divisor.
+    live: Arc<std::sync::atomic::AtomicUsize>,
+    groups: Mutex<std::collections::HashMap<Option<Group>, Arc<DirectoryGroup>>>,
+    pruned_to: std::sync::atomic::AtomicUsize,
+}
+
+struct DirectoryGroup {
+    pace: Arc<RecordPace>,
+    links: std::sync::atomic::AtomicUsize,
+}
+
+/// One directory link's place in its group's share, for as long as the link holds it.
+pub struct DirectoryLink {
+    paces: Arc<DirectoryPaces>,
+    group: Option<Group>,
+    held: Arc<DirectoryGroup>,
+}
+
+impl DirectoryLink {
+    /// Its group's pace, which its records wait for and its work beyond them is owed to.
+    pub fn pace(&self) -> Arc<RecordPace> {
+        Arc::clone(&self.held.pace)
+    }
+}
+
+impl Drop for DirectoryLink {
+    fn drop(&mut self) {
+        let Ok(mut groups) = self.paces.groups.lock() else {
+            return;
+        };
+        if self.held.links.fetch_sub(1, Ordering::SeqCst) == 1 {
+            self.paces.live.fetch_sub(1, Ordering::SeqCst);
+            // A group that owes nothing and has refilled is forgotten with its last link; one in
+            // debt is kept, so its debt is paid by its next link and no other group's.
+            if self.held.pace.is_full() {
+                groups.remove(&self.group);
+            }
+        }
+    }
+}
+
+impl DirectoryPaces {
+    pub fn new(pace: RolePace) -> Arc<Self> {
+        Arc::new(Self {
+            pace,
+            live: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            groups: Mutex::new(std::collections::HashMap::new()),
+            pruned_to: std::sync::atomic::AtomicUsize::new(0),
+        })
+    }
+
+    /// A link from `group` takes its place in its group's share.
+    pub fn join(self: &Arc<Self>, group: Option<Group>) -> Option<DirectoryLink> {
+        let mut groups = self.groups.lock().ok()?;
+        let pruned_to = self.pruned_to.load(Ordering::Relaxed);
+        if groups.len() > 2 * pruned_to.max(64) {
+            groups.retain(|_, held| held.links.load(Ordering::SeqCst) > 0 || !held.pace.is_full());
+            self.pruned_to.store(groups.len(), Ordering::Relaxed);
+        }
+        let pace = self.pace;
+        let live = Arc::clone(&self.live);
+        let held = Arc::clone(groups.entry(group).or_insert_with(|| {
+            Arc::new(DirectoryGroup {
+                pace: Arc::new(RecordPace::shared_by(pace, live)),
+                links: std::sync::atomic::AtomicUsize::new(0),
+            })
+        }));
+        if held.links.fetch_add(1, Ordering::SeqCst) == 0 {
+            self.live.fetch_add(1, Ordering::SeqCst);
+        }
+        Some(DirectoryLink {
+            paces: Arc::clone(self),
+            group,
+            held,
+        })
+    }
+
+    /// The groups with a link now.
+    pub fn groups_linked(&self) -> usize {
+        self.live.load(Ordering::SeqCst)
+    }
+
+    /// The groups whose pace is held now, linked or still owing.
+    pub fn groups_held(&self) -> usize {
+        self.groups.lock().map_or(0, |groups| groups.len())
+    }
+
+    /// The records a minute every group's share comes to together: the one rate planned.
+    pub fn per_minute(&self) -> u64 {
+        self.pace.per_minute
     }
 }
 
@@ -195,7 +647,7 @@ impl RolePace {
 /// descriptions and as many receipts, each a token of its asker's pace (`credit::check`).
 pub const EVIDENCE_SIGNATURES: u64 = 2 * tally_wire::credit::MAX_EVIDENCE as u64;
 
-/// A subscriber's session (R4 of sweep 5): a heartbeat every 30 s, a `Subscribe` when the regions
+/// A subscriber's session: a heartbeat every 30 s, a `Subscribe` when the regions
 /// it reads change, a firehose credential with its relay's evidence when it starts and each time
 /// the credential is renewed (at most hourly, `MAX_CREDENTIAL_LIFETIME_MS`), and a provider query
 /// or an echo now and then: twelve a minute, one every five seconds, holds them with room. Its
@@ -232,16 +684,15 @@ pub const GENERAL_RECORDS_PER_MINUTE: u64 = if PROBE_RECORDS.per_minute > ENGINE
 };
 
 /// Every directory link together (a relay that dialled in and is not a member: offers, queries,
-/// evidence, echoes, heartbeats, `subscription::on_directory_link`), one pace they share, as the
-/// members share theirs: the gossip a relay must take does not grow with the links it comes over
-/// (each offer is the same offer on every link), so a relay with many links is planned no more,
-/// and one link sending as fast as it may takes at most its turn (each link waits for its own
-/// token in order, so of `k` links sending at once each is let in once in `k`). Twice what the
-/// directory holds at its bound (`directory::OFFERS_HELD`), each offer re-signed once a minute
-/// (`OWN_RESIGN_EVERY_MS`), some 546 a second: half for the offers, half for the queries, echoes
-/// and the evidence and its signatures (each a token, `credit::check`). Gossip past it waits: an
-/// offer lives three re-signings and evidence a half-life of 30 minutes, so waiting seconds loses
-/// nothing.
+/// evidence, echoes, heartbeats, `subscription::on_directory_link`), one rate planned once, as the
+/// members' is: the gossip a relay must take does not grow with the links it comes over (each
+/// offer is the same offer on every link), so a relay with many links is planned no more. Shared
+/// out equally among the network groups with a link now ([`DirectoryPaces`]), so no group's links
+/// take another's share. Twice what the directory holds at its bound (`directory::OFFERS_HELD`),
+/// each offer re-signed once a minute (`OWN_RESIGN_EVERY_MS`), some 546 a second: half for the
+/// offers, half for the queries, echoes and the evidence and its signatures (each a token,
+/// `credit::check`). Gossip past it waits: an offer lives three re-signings and evidence a
+/// half-life of 30 minutes, so waiting seconds loses nothing.
 pub const DIRECTORY_RECORDS: RolePace = RolePace {
     per_minute: 2 * crate::directory::OFFERS_HELD as u64 * 60_000
         / crate::directory::OWN_RESIGN_EVERY_MS,
@@ -249,18 +700,20 @@ pub const DIRECTORY_RECORDS: RolePace = RolePace {
         / crate::directory::OWN_RESIGN_EVERY_MS,
 };
 
-/// A count a second, waited for: a connection's (or the member sessions', or the directory links')
-/// records a second ([`records_per_sec`], [`RolePace`]), or a feeder's receptions a second
-/// ([`FEEDER_RECEPTIONS_PER_SEC`]). A token bucket of `rate` a second and `burst` at once from
-/// rest. Past it the read loop waits before it takes the next record, its socket unread, so TCP
-/// holds the sender back as the ingest allowance does. Work a record brings beyond its one token
-/// (each signature inside an evidence bundle, `credit::check`) is owed ([`RecordPace::owe`]) and
-/// paid before the connection's next record is read. Read off tokio's clock, so a test that pauses
-/// time paces with it.
+/// A count a second, waited for: a connection's (or the member sessions', or a directory group's)
+/// records a second ([`records_per_sec`], [`RolePace`]). A token bucket of `rate` a second and
+/// `burst` at once from rest. Past it the read loop waits before it takes the next record, its
+/// socket unread, so TCP holds the sender back as the ingest allowance does. Work a record brings
+/// beyond its one token (each signature inside an evidence bundle, `credit::check`) is owed
+/// ([`RecordPace::owe`]) and paid before the connection's next record is read. A pace that is one
+/// share of a rate (a directory group's, [`DirectoryPaces`]) has its rate and burst divided by the
+/// shares held now. Read off tokio's clock, so a test that pauses time paces with it.
 pub struct RecordPace {
-    /// Tokens a second.
+    /// Tokens a second (the whole rate, for a share).
     rate: f64,
     burst: u64,
+    /// The shares the rate and burst are divided among, when it is one.
+    shares: Option<Arc<std::sync::atomic::AtomicUsize>>,
     /// Tokens still allowed (negative: owed), as of when.
     state: Mutex<(f64, tokio::time::Instant)>,
 }
@@ -278,29 +731,80 @@ impl RecordPace {
 
     /// `per_minute` a minute, `burst` at once.
     pub fn per_minute(per_minute: u64, burst: u64) -> Self {
+        Self::starting(per_minute, burst, burst)
+    }
+
+    /// `per_minute` a minute, `burst` at once, `start` of it held now.
+    pub fn starting(per_minute: u64, burst: u64, start: u64) -> Self {
         let burst = burst.max(1);
         Self {
             rate: per_minute.max(1) as f64 / 60.0,
             burst,
-            state: Mutex::new((burst as f64, tokio::time::Instant::now())),
+            shares: None,
+            state: Mutex::new((start.min(burst) as f64, tokio::time::Instant::now())),
         }
     }
 
-    /// Tokens a minute.
+    /// One share of `pace` among `shares` (at least one), full from rest.
+    fn shared_by(pace: RolePace, shares: Arc<std::sync::atomic::AtomicUsize>) -> Self {
+        let mut shared = pace.pace();
+        shared.shares = Some(shares);
+        let burst = shared.now().1;
+        shared.state = Mutex::new((burst, tokio::time::Instant::now()));
+        shared
+    }
+
+    /// Tokens a second and the burst, now: a share's, of the shares held now.
+    fn now(&self) -> (f64, f64) {
+        let shares = self
+            .shares
+            .as_ref()
+            .map_or(1, |shares| shares.load(Ordering::SeqCst).max(1)) as f64;
+        (self.rate / shares, (self.burst as f64 / shares).max(1.0))
+    }
+
+    /// Tokens a minute (a share's, now).
     pub fn per_minute_rate(&self) -> u64 {
-        (self.rate * 60.0).round() as u64
+        (self.now().0 * 60.0).round() as u64
+    }
+
+    /// Refilled to the moment: tokens held, the state's lock held.
+    fn refilled(&self) -> Option<(std::sync::MutexGuard<'_, (f64, tokio::time::Instant)>, f64)> {
+        let mut state = self.state.lock().ok()?;
+        let now = tokio::time::Instant::now();
+        let (rate, burst) = self.now();
+        let elapsed = now.saturating_duration_since(state.1).as_secs_f64();
+        let held = (state.0 + elapsed * rate).min(burst);
+        *state = (held, now);
+        Some((state, held))
     }
 
     /// Takes `count` tokens now, refilled to the moment: how long the pace then owes, if it does.
     fn spend(&self, count: u64) -> Option<Duration> {
-        let Ok(mut state) = self.state.lock() else {
-            return None;
-        };
-        let now = tokio::time::Instant::now();
-        let elapsed = now.saturating_duration_since(state.1).as_secs_f64();
-        let allowed = (state.0 + elapsed * self.rate).min(self.burst as f64) - count as f64;
-        *state = (allowed, now);
-        (allowed < 0.0).then(|| Duration::from_secs_f64(-allowed / self.rate))
+        let (mut state, held) = self.refilled()?;
+        let allowed = held - count as f64;
+        state.0 = allowed;
+        let rate = self.now().0;
+        (allowed < 0.0).then(|| Duration::from_secs_f64(-allowed / rate))
+    }
+
+    /// Whole tokens held now (none while it owes).
+    pub fn available(&self) -> u64 {
+        self.refilled()
+            .map_or(0, |(_, held)| if held > 0.0 { held as u64 } else { 0 })
+    }
+
+    /// Whether it holds its whole burst: as a fresh pace would, owing nothing.
+    pub fn is_full(&self) -> bool {
+        self.refilled()
+            .is_some_and(|(_, held)| held >= self.now().1)
+    }
+
+    /// `count` taken now, whatever it then owes; never waited for.
+    fn take_now(&self, count: u64) {
+        if count > 0 {
+            let _ = self.spend(count);
+        }
     }
 
     /// One record, waiting while the pace owes more than it has refilled.
@@ -308,7 +812,7 @@ impl RecordPace {
         self.take_many(1).await;
     }
 
-    /// `count` at once (a batch's receptions), waiting until the pace has refilled them.
+    /// `count` at once, waiting until the pace has refilled them.
     pub async fn take_many(&self, count: u64) {
         if let Some(wait) = self.spend(count) {
             tokio::time::sleep(wait).await;
@@ -341,7 +845,7 @@ pub const BUFFERS_PER_CONNECTION: usize = (tally_wire::noise::READER_BUFFERS
 /// for a provider query) hold at most while they wait for its write side, by their encoded bytes:
 /// a message's worth, carved with its buffers ([`BUFFERS_PER_CONNECTION`]). A reply past it is
 /// dropped (`link::ReplyRoom`): a peer that asks faster than it reads gets fewer answers, never
-/// more of the relay's memory. Before (N4), the answers to a whole message were gathered,
+/// more of the relay's memory. Before, the answers to a whole message were gathered,
 /// uncharged, while its records were paced at eight a second, and up to 64 such lists waited for
 /// the write side: one 64 KiB message of `ProviderQuery`s, each answered with up to 32 offers,
 /// held some 25 MB a connection for minutes.
@@ -421,6 +925,30 @@ pub struct Allowance {
     own: Arc<Gauge>,
     oversize: Arc<Gauge>,
     carve: Arc<Carve>,
+    /// Whose turn this connection's batches wait in when the oversize room is full
+    /// ([`Gauge::charge_for`]): its network group's ([`network_source`]) for a feeder, a member
+    /// session's own ([`member_source`]), so connections of one network share one turn.
+    source: u64,
+}
+
+/// The turn the relay's own batches wait in ([`Gauge::charge_for`]): a test's trace, a replay, a
+/// description it hands in.
+pub const RELAY_SOURCE: u64 = 0;
+
+/// The turn a feeder connection from `group` waits in for room in a gauge: its network group's,
+/// the same unit its share of the ingest rate is (`shed::Unit`), so a hundred connections from one
+/// block of addresses are one source in the queue, not a hundred. A connection with no address is
+/// a source of its own.
+pub fn network_source(group: Option<Group>, connection: u64) -> u64 {
+    match group {
+        Some(group) => group.as_u64(),
+        None => (3 << 32) | (connection & 0xffff_ffff),
+    }
+}
+
+/// The turn a sharing member's session waits in: its own.
+pub fn member_source(connection: u64) -> u64 {
+    (4 << 32) | (connection & 0xffff_ffff)
 }
 
 /// What of a connection's carve no charge has been lent: given back to `Store::Ingest` when the
@@ -507,12 +1035,18 @@ impl std::fmt::Debug for Carve {
 impl Allowance {
     /// `bytes` carved from `ingest` (the relay's `Store::Ingest`), batches larger than all of them
     /// taking the rest from `oversize`; `None` when `ingest` has no room for them.
-    pub fn carve(ingest: &Arc<Gauge>, oversize: &Arc<Gauge>, bytes: usize) -> Option<Self> {
+    pub fn carve(
+        ingest: &Arc<Gauge>,
+        oversize: &Arc<Gauge>,
+        bytes: usize,
+        source: u64,
+    ) -> Option<Self> {
         let carved = ingest.try_charge(bytes)?;
         Some(Self {
             own: Gauge::new(Store::Ingest, bytes),
             oversize: Arc::clone(oversize),
             carve: Arc::new(Carve(Mutex::new(carved))),
+            source,
         })
     }
 
@@ -521,9 +1055,9 @@ impl Allowance {
     /// from the oversize room ([`OVERSIZE_BYTES`]). The charge is lent its bytes of the carve.
     pub async fn acquire(&self, bytes: usize) -> InFlight {
         let own = bytes.min(self.own.limit());
-        let charge = self.own.charge(own).await;
+        let charge = self.own.charge_for(self.source, own).await;
         let over = if bytes > own {
-            self.oversize.charge(bytes - own).await
+            self.oversize.charge_for(self.source, bytes - own).await
         } else {
             Charge::none()
         };
@@ -565,7 +1099,7 @@ impl InFlight {
         Self {
             own: Charge::none(),
             store: Lent {
-                charge: block_on(gauge.charge(bytes)),
+                charge: block_on(gauge.charge_for(RELAY_SOURCE, bytes)),
                 home: std::sync::Weak::new(),
             },
             over: Charge::none(),
@@ -780,7 +1314,7 @@ impl Room {
 /// the workers at once; a sender past it waits for room.
 pub const CONTROL_QUEUED: usize = 64;
 
-/// The workers' queues (R-P9, R1): one a worker, each pushed only through [`lanes::Lanes`], whose
+/// The workers' queues: one a worker, each pushed only through [`lanes::Lanes`], whose
 /// two ways in count what they push. A charged record is counted against [`Room::records`], every
 /// worker together, and one past it is refused and counted, never queued; control work waits while
 /// [`CONTROL_QUEUED`] wait. A queue is a `VecDeque` behind its lane's lock with no way to push but
@@ -1365,8 +1899,8 @@ mod tests {
     async fn a_connection_holds_at_most_its_allowance_in_bytes() -> Result<(), String> {
         let ingest = Gauge::new(Store::Ingest, 300);
         let oversize = Gauge::new(Store::Ingest, 1_000);
-        let greedy = Allowance::carve(&ingest, &oversize, 100);
-        let honest = Allowance::carve(&ingest, &oversize, 100);
+        let greedy = Allowance::carve(&ingest, &oversize, 100, RELAY_SOURCE);
+        let honest = Allowance::carve(&ingest, &oversize, 100, RELAY_SOURCE);
         let (Some(greedy), Some(honest)) = (greedy, honest) else {
             return Err("two allowances fit the store".to_owned());
         };
@@ -1379,7 +1913,7 @@ mod tests {
             (greedy.available(), first.bytes() + second.bytes()),
             (0, 100)
         );
-        assert!(Allowance::carve(&ingest, &oversize, 101).is_none());
+        assert!(Allowance::carve(&ingest, &oversize, 101, RELAY_SOURCE).is_none());
         // The honest one is never held up by it.
         let mine = honest.acquire(100).await;
         assert_eq!(mine.bytes(), 100);
@@ -1395,6 +1929,127 @@ mod tests {
         drop(honest);
         assert_eq!(ingest.held(), 0);
         Ok(())
+    }
+
+    /// Waiting for the oversize room is fair between networks, end to end through the
+    /// connections' allowances: a network with four connections each waiting on a batch larger
+    /// than its allowance, queued first, does not keep a second network's one waiting behind all
+    /// four; the second is served after the first network's first. (Every waiter was one source
+    /// before, so the queue was first come, first served.)
+    #[tokio::test]
+    async fn waiting_for_the_oversize_room_is_fair_between_networks() -> Result<(), String> {
+        const OVER: usize = 200 * 1024;
+        let ingest = Gauge::new(Store::Ingest, 1 << 20);
+        let oversize = Gauge::new(Store::Ingest, OVER);
+        let carve = |group: u16, connection: u64| {
+            Allowance::carve(
+                &ingest,
+                &oversize,
+                100,
+                network_source(Some(Group::V4(group)), connection),
+            )
+            .ok_or_else(|| "the allowance fits".to_owned())
+        };
+        let greedy: Vec<_> = (0..4)
+            .map(|connection| carve(1, connection))
+            .collect::<Result<_, _>>()?;
+        let honest = carve(2, 9)?;
+        // The oversize room is held, so everyone below waits for it.
+        let held = oversize
+            .try_charge(OVER)
+            .ok_or("the room is free to take")?;
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let mut tasks = Vec::new();
+        for (n, allowance) in greedy.into_iter().enumerate() {
+            let order = Arc::clone(&order);
+            tasks.push(tokio::spawn(async move {
+                let batch = allowance.acquire(100 + OVER).await;
+                order
+                    .lock()
+                    .map(|mut order| order.push(format!("greedy {n}")))
+                    .ok();
+                drop(batch);
+            }));
+            tokio::task::yield_now().await;
+        }
+        let behind = Arc::clone(&order);
+        tasks.push(tokio::spawn(async move {
+            let batch = honest.acquire(100 + OVER).await;
+            behind
+                .lock()
+                .map(|mut order| order.push("honest".to_owned()))
+                .ok();
+            drop(batch);
+        }));
+        tokio::task::yield_now().await;
+        assert_eq!(oversize.waiting(), 5);
+        drop(held);
+        for task in tasks {
+            task.await.map_err(|error| error.to_string())?;
+        }
+        let order = order.lock().map_err(|error| error.to_string())?.clone();
+        let place = order.iter().position(|name| name == "honest");
+        assert!(
+            place.is_some_and(|place| place <= 1),
+            "the second network is served after the first network's first, not last: {order:?}"
+        );
+        Ok(())
+    }
+
+    /// Member sessions share the members' rate evenly between those using it: one that sends
+    /// large batches holds no more of it than one that sends small ones. (Behind one shared
+    /// pace, each waited for the debt of all, so throughput followed the size of a take: a 64 KiB
+    /// batch moved sixty-four times the bytes of a 1 KiB one.)
+    #[tokio::test(start_paused = true)]
+    async fn member_sessions_share_the_rate_evenly_whatever_their_batch_size() {
+        let pace = Arc::new(MemberPace::new(1 << 20));
+        let moved = Arc::new([AtomicU64::new(0), AtomicU64::new(0)]);
+        let started = tokio::time::Instant::now();
+        let mut tasks = Vec::new();
+        for (index, size) in [64u64 << 10, 1 << 10].into_iter().enumerate() {
+            let session = pace.session();
+            let moved = Arc::clone(&moved);
+            tasks.push(tokio::spawn(async move {
+                while started.elapsed() < Duration::from_secs(30) {
+                    session.take(size, 0).await;
+                    moved[index].fetch_add(size, Ordering::Relaxed);
+                }
+            }));
+        }
+        for task in tasks {
+            assert!(task.await.is_ok());
+        }
+        let (large, small) = (
+            moved[0].load(Ordering::Relaxed),
+            moved[1].load(Ordering::Relaxed),
+        );
+        assert!(
+            small * 10 >= large * 8 && small <= large * 12 / 10,
+            "large batches moved {large}, small ones {small}"
+        );
+        // And together they stayed within the members' rate and its burst.
+        assert!(large + small <= (30 << 20) + (1 << 20) + (256 << 10));
+    }
+
+    /// A member's batches are held to receptions as well as bytes: many small receptions in few
+    /// bytes cannot bring in more than the plan holds for the members' rate.
+    #[tokio::test(start_paused = true)]
+    async fn a_members_receptions_are_paced_beside_its_bytes() {
+        let pace = MemberPace::new(1 << 20);
+        let (_, receptions_per_sec) = pace.rates();
+        let session = pace.session();
+        let started = tokio::time::Instant::now();
+        for _ in 0..100 {
+            // 1 KiB carrying 10,000 receptions: a hundred of them are a million.
+            session.take(1 << 10, 10_000).await;
+        }
+        let needed = (1_000_000 - crate::ceiling::burst(receptions_per_sec)) as f64
+            / receptions_per_sec as f64;
+        assert!(
+            started.elapsed().as_secs_f64() >= needed * 0.9,
+            "{:?} for a million receptions at {receptions_per_sec} a second",
+            started.elapsed()
+        );
     }
 
     /// A charge shrinks to its decode and splits with its slices, nothing taken or released, and
@@ -1523,7 +2178,7 @@ mod tests {
         let oversize = Gauge::new(Store::Ingest, 1_000);
         let mut queued = Vec::new();
         let mut connected = 0;
-        while let Some(allowance) = Allowance::carve(&ingest, &oversize, 100) {
+        while let Some(allowance) = Allowance::carve(&ingest, &oversize, 100, RELAY_SOURCE) {
             connected += 1;
             // A batch handed to the workers, then the connection ends.
             queued.push(allowance.acquire(40).await);
@@ -1583,7 +2238,8 @@ mod tests {
     async fn a_batch_holds_its_own_bytes_of_the_carve_and_no_more() -> Result<(), String> {
         let ingest = Gauge::new(Store::Ingest, 300);
         let oversize = Gauge::new(Store::Ingest, 1_000);
-        let first = Allowance::carve(&ingest, &oversize, 100).ok_or("the first carve fits")?;
+        let first = Allowance::carve(&ingest, &oversize, 100, RELAY_SOURCE)
+            .ok_or("the first carve fits")?;
         let mut held = first.acquire(40).await;
         // Decoded smaller: what it let go is the open connection's again, not the store's.
         held.shrink_to(30);
@@ -1592,10 +2248,12 @@ mod tests {
         drop(first);
         assert_eq!(ingest.held(), 30);
         // Its peer reconnects, and another beside it: both fit beside the batch, a third not.
-        let second = Allowance::carve(&ingest, &oversize, 100).ok_or("a reconnect fits")?;
-        let third = Allowance::carve(&ingest, &oversize, 100).ok_or("a second one fits")?;
+        let second =
+            Allowance::carve(&ingest, &oversize, 100, RELAY_SOURCE).ok_or("a reconnect fits")?;
+        let third =
+            Allowance::carve(&ingest, &oversize, 100, RELAY_SOURCE).ok_or("a second one fits")?;
         assert_eq!(ingest.held(), 230);
-        assert!(Allowance::carve(&ingest, &oversize, 100).is_none());
+        assert!(Allowance::carve(&ingest, &oversize, 100, RELAY_SOURCE).is_none());
         // A slice of the old batch holds its share, the rest its own.
         let slice = held.split(10, &a_decode()?);
         drop(held);
@@ -1637,7 +2295,7 @@ mod tests {
         assert_eq!(charge_of(&tiny), CHARGE_FLOOR);
         let ingest = Gauge::unlimited(Store::Ingest);
         let oversize = Gauge::new(Store::Ingest, OVERSIZE_BYTES);
-        let allowance = Allowance::carve(&ingest, &oversize, FEEDER_ALLOWANCE)
+        let allowance = Allowance::carve(&ingest, &oversize, FEEDER_ALLOWANCE, RELAY_SOURCE)
             .ok_or("an allowance fits an unlimited store")?;
         let mut held = Vec::new();
         while let Ok(in_flight) =
@@ -1660,7 +2318,7 @@ mod tests {
         }
     }
 
-    /// R-P9: the workers' queues are bounded by construction, not only by what the charges admit.
+    /// The workers' queues are bounded by construction, not only by what the charges admit.
     /// The one worker is held at a gate while records are handed in: the queues take as many as
     /// the rooms admit (`Room::records`, here two) and refuse, counted, the next, letting its charge
     /// go at once; the worker let go runs the two it holds. Before, each worker's queue was an
@@ -1742,7 +2400,7 @@ mod tests {
         Ok(())
     }
 
-    /// R-N12: a connection's records a second are held to its byte ceiling over `RECORD_BYTES`,
+    /// A connection's records a second are held to its byte ceiling over `RECORD_BYTES`,
     /// whatever their bytes: at the default feeder ceiling, eight a second after a second's burst,
     /// so tiny batches sent as fast as the socket takes them are some eight signature checks a
     /// second, not the 870 they were. Paused time: each wait is the pace's exactly.

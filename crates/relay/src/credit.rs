@@ -471,6 +471,13 @@ impl Credit {
         );
     }
 
+    /// Whether `receiver` stands corroborated here at `now_ms` (`corroborate_receiver`, not yet
+    /// lapsed): the receivers the ingest rate (`shed`) gives a share of their own, where every
+    /// other is held to its network group's.
+    pub fn corroborated_receiver(&self, receiver: &PublicKey, now_ms: u64) -> bool {
+        corroborated(&self.state().corroborated_receivers, receiver, now_ms)
+    }
+
     /// A relay this relay corroborated first-hand (a sharing peer it dealt with): only such a
     /// relay's receipts earn the relay it signed them for any credit here.
     pub fn corroborate_relay(&self, relay: PublicKey, now_ms: u64) {
@@ -836,7 +843,7 @@ fn newest_first<T>(mut dated: Vec<(u64, T)>, bytes: impl Fn(&T) -> &[u8]) -> Vec
 ///
 /// Every signature verified inside it is one token of `pace`, the pace the bundle's asker's
 /// records were taken by (`ingest::RecordPace::owe`), owed and paid before that connection's next
-/// record is read (R4 of sweep 5): a bundle is one record on the wire but up to
+/// record is read: a bundle is one record on the wire but up to
 /// `ingest::EVIDENCE_SIGNATURES` and its own verifications, some 3.5 ms of a core, while its record
 /// was planned as one (`cores::RUNTIME_NANOS_PER_RECORD`). Before, a session sending bundles at
 /// its records' pace had the relay verify some 130 times what the cores planned for it. `None`
@@ -1566,7 +1573,7 @@ mod tests {
         Ok(())
     }
 
-    /// R4 of sweep 5: every signature `check` verifies inside a bundle is a token of the pace its
+    /// Every signature `check` verifies inside a bundle is a token of the pace its
     /// asker's records were taken by, owed and paid before that connection's next record: a bundle
     /// of 6 descriptions and 4 receipts on a pace of one a second holds the next record 11 s (its
     /// ten signatures, then its own token).

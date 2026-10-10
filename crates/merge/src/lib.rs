@@ -98,7 +98,7 @@ use tally_mlat_solver::obs::message_hash;
 use tally_mlat_solver::scope::{AFTER, BEFORE, STRIDE, Sites, Window, WindowIndex, bin_of};
 use tally_mlat_solver::standing::{Candidate, Claimed, Solved, consistent, decide};
 use tally_mlat_solver::{
-    Calibrated, ObservationId, Reach, Site, Tile, modes, publish, verify, verify_model,
+    Calibrated, ObservationId, Reach, Site, Tile, judges, modes, publish, verify, verify_model,
 };
 use tally_relay::bounded::Bounded;
 use tally_wire::batch::Hash;
@@ -561,6 +561,9 @@ enum RawCheck {
     Verified(Box<Calibrated>),
     /// The client's raw does not reproduce its inputs.
     NotHeld,
+    /// Of a specification version this client's verifier does not implement (`judges`): it
+    /// cannot say, so the model's solutions count by signature, as a model whose raw it lacks.
+    Unjudged,
     /// The model verifier failed it: nothing under it counts.
     Failed,
 }
@@ -1221,7 +1224,7 @@ impl Merge {
                     }
                 }
                 RawCheck::Failed => return None,
-                RawCheck::NotHeld | RawCheck::Unchecked => Check::Signature,
+                RawCheck::NotHeld | RawCheck::Unjudged | RawCheck::Unchecked => Check::Signature,
             }
         } else {
             Check::Signature
@@ -1272,6 +1275,13 @@ impl Merge {
         }
         let decoded = Arc::clone(&model.decoded);
         let decoded = &*decoded;
+        // Another version derives other inputs and another model from the same raw.
+        if !judges(decoded.spec) {
+            if let Some(model) = self.models.get_mut(id) {
+                model.raw = RawCheck::Unjudged;
+            }
+            return;
+        }
         // An engine solved the window, so its raw is in: sealed, it is what the engine held.
         self.held.seal_through(decoded.window.last);
         let sites = self.site_table();

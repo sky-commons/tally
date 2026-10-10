@@ -102,7 +102,7 @@ pub const NOISE_ROUNDS: (usize, usize) = (2, 3);
 pub const NOISE_MARGIN: f64 = 0.5;
 /// How little a clock's noise estimate may move for the rounds to stop early.
 pub const NOISE_SETTLED: f64 = 0.05;
-/// Huber-weighted steps after the unit-weight one.
+/// Huber-weighted steps after the robust first one (`start_scale`).
 pub const HUBER_STEPS: usize = 2;
 /// Final steps after the noise rounds, at least.
 pub const FINAL_STEPS: usize = 2;
@@ -428,8 +428,9 @@ struct ClockShape {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Shape {
     gauge: ClockKey,
-    /// The wall clock of the gauge's anchor reception.
-    anchor_wall_ms: u64,
+    /// The latest the gauge's anchor reception can have been heard by its own batches' wall clocks
+    /// (`anchor_wall_ns`), Unix nanoseconds.
+    anchor_wall_ns: u64,
     /// Sorted by key; the gauge among them.
     clocks: Vec<ClockShape>,
 }
@@ -438,7 +439,7 @@ impl Shape {
     fn of_model(model: &ClockModel) -> Self {
         Self {
             gauge: model.gauge,
-            anchor_wall_ms: 0,
+            anchor_wall_ns: 0,
             clocks: model
                 .pieces
                 .iter()
@@ -573,7 +574,7 @@ fn shape(
     // Shared events by ordered pair of clocks, as one table of n x n lists.
     let n = keys.len();
     let mut shared: Vec<Vec<(i64, i64)>> = vec![Vec::new(); n * n];
-    let mut anchor: Option<(i64, u64)> = None;
+    let mut heard: Vec<(i64, u64)> = Vec::new();
     for event in events {
         let list: Vec<(usize, &Rx<'_>)> = event
             .rx
@@ -583,11 +584,7 @@ fn shape(
             .collect();
         for (clock, rx) in &list {
             if *clock == gauge {
-                anchor = Some(match anchor {
-                    Some((at, wall)) if at < rx.linear => (at, wall),
-                    Some((at, wall)) if at == rx.linear => (at, wall.min(rx.wall_ms)),
-                    _ => (rx.linear, rx.wall_ms),
-                });
+                heard.push((rx.linear, rx.wall_ms));
             }
             for (other, other_rx) in &list {
                 if clock != other {
@@ -596,7 +593,20 @@ fn shape(
             }
         }
     }
-    let (anchor, anchor_wall_ms) = anchor.ok_or(FitError::Shape("no gauge anchor"))?;
+    let anchor = heard
+        .iter()
+        .map(|(linear, _)| *linear)
+        .min()
+        .ok_or(FitError::Shape("no gauge anchor"))?;
+    // Every reception of the gauge's clock the inputs cite bounds it, not its events' alone: the
+    // more of its batches, the closer one's last reception was to its signing.
+    let bounds: Vec<(i64, u64)> = rxs
+        .iter()
+        .filter(|rx| key_of(rx) == keys[gauge])
+        .map(|rx| (rx.linear, rx.wall_ms))
+        .collect();
+    let anchor_wall_ns = anchor_wall_ns(timebase_of(gauge), anchor, &bounds)
+        .ok_or(FitError::Shape("no gauge anchor"))?;
     // The walk from the gauge: the unmapped clock of lowest key that shares an event with a
     // mapped one takes its base from the mapped one it shares most events with (of equals, the
     // lowest key), as the lower median of the count differences.
@@ -660,7 +670,7 @@ fn shape(
         .collect();
     let mut shape = Shape {
         gauge: keys[gauge],
-        anchor_wall_ms,
+        anchor_wall_ns,
         clocks: clocks.clone(),
     };
     // Knots: from the interval of the earliest to that of the latest reception of a sync event
@@ -883,7 +893,6 @@ fn sigma_m(
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Weighting {
-    Unit,
     Huber,
     Final,
 }
@@ -892,7 +901,6 @@ impl Weighting {
     fn weight(self, z: f64) -> f64 {
         let z = z.abs();
         match self {
-            Self::Unit => 1.0,
             Self::Huber if z <= HUBER_K => 1.0,
             Self::Huber => HUBER_K / z,
             Self::Final if z <= HUBER_K => 1.0,
@@ -1796,6 +1804,33 @@ fn robust_noise(problem: &Problem<'_>, state: &State) -> BTreeMap<ClockKey, f64>
         .collect()
 }
 
+/// The scale of each clock's receptions at a fit's cold start, metres as noise seconds: 1.4826
+/// times the median absolute residual of its receptions with every event settled on its own at
+/// the starting clocks (`State::settle_events`), floored at the clock's nominal noise. What the
+/// first step weighs by, final-weighted: before any step the clocks are only their bases, so an
+/// honest free-running clock's residuals span its rate's drift over the window (milliseconds),
+/// and its own scale keeps them; a reception of another transmission of the same bytes, seconds
+/// away, is far beyond the cut-off of its clock's scale and carries no weight. Every clock with a
+/// row has one, so no clock is cut off for want of a count.
+fn start_scale(problem: &Problem<'_>, state: &State) -> BTreeMap<ClockKey, f64> {
+    let layout = problem.layout;
+    let residuals = state.residuals(problem);
+    let mut per_clock: BTreeMap<usize, Vec<f64>> = BTreeMap::new();
+    for (event_use, rows) in layout.events.iter().zip(&residuals) {
+        for (row, residual) in event_use.rows.iter().zip(rows) {
+            per_clock.entry(row.clock).or_default().push(residual.abs());
+        }
+    }
+    per_clock
+        .into_iter()
+        .map(|(clock, list)| {
+            let info = &layout.shape.clocks[clock];
+            let nominal = info.timebase.default_noise_s();
+            (info.key, (1.4826 * median(list) / C).max(nominal))
+        })
+        .collect()
+}
+
 fn estimate_noise(
     problem: &Problem<'_>,
     state: &State,
@@ -2141,8 +2176,17 @@ fn attempt(
             state
         }
         None => {
+            // The first step is robust (`start_scale`): each event settled on its own at the
+            // starting clocks, each clock's scale its residuals' there, and receptions beyond the
+            // cut-off of their clock's scale carry no weight. A unit-weight first step let one
+            // event mixing two copies of a message (receptions seconds apart) throw every offset
+            // by millions of metres, and the steps after it left knots held by nothing but the
+            // rate prior: the fit failed where contamination should only cost the
+            // event.
             let mut state = State::start(&problem);
-            state.step(&problem, &noise, Weighting::Unit)?;
+            state.settle_events(&problem, &noise);
+            let scale = start_scale(&problem, &state);
+            state.step(&problem, &scale, Weighting::Final)?;
             for _ in 0..HUBER_STEPS {
                 state.step(&problem, &noise, Weighting::Huber)?;
             }
@@ -2407,12 +2451,8 @@ fn build_model(
         .iter()
         .find(|clock| clock.key == shape.gauge)
         .ok_or(FitError::Shape("no gauge"))?;
-    let origin_unix_ns = origin_unix_ns(
-        gauge.timebase,
-        gauge.base,
-        shape.anchor_wall_ms.saturating_mul(1_000_000),
-    )
-    .ok_or(FitError::Shape("no origin"))?;
+    let origin_unix_ns = origin_unix_ns(gauge.timebase, gauge.base, shape.anchor_wall_ns)
+        .ok_or(FitError::Shape("no origin"))?;
     Ok(ClockModel {
         spec: SPEC_VERSION,
         tile: inputs.tile,
@@ -2427,6 +2467,28 @@ fn build_model(
         jumps,
         dropped: Vec::new(),
     })
+}
+
+/// The latest Unix time, nanoseconds, the gauge's anchor reception (linear count `anchor`) can
+/// have been heard at, by the wall clocks of the batches that carried the receptions of the gauge's
+/// clock the inputs cite, `heard` (linear count, batch wall clock in milliseconds): a batch is signed after the receptions it
+/// carries, so each reception was heard at or before its batch's wall clock, and the anchor at or
+/// before that less the gauge's nominal time from the anchor to it. The least of these is the
+/// bound, late by how long its batch stayed open after the last of its receptions cited: with a
+/// few of the gauge's receptions a second cited, some batch's last is near its signing, so tens of
+/// milliseconds (`tests::a_free_running_gauge_dates_transmissions_by_when_they_were_sent`), plus
+/// the gauge's rate over the window, 200 ppm at most, times its span. The anchor batch's wall clock alone, as
+/// before, dated every transmission under a free-running gauge late by however long that batch
+/// was open after it, up to a second.
+fn anchor_wall_ns(timebase: Timebase, anchor: i64, heard: &[(i64, u64)]) -> Option<u64> {
+    heard
+        .iter()
+        .map(|(linear, wall_ms)| {
+            let since_ns = timebase.elapsed_ps(i128::from(*linear) - i128::from(anchor)) / 1000;
+            i128::from(*wall_ms) * 1_000_000 - since_ns
+        })
+        .min()
+        .and_then(|ns| u64::try_from(ns).ok())
 }
 
 /// The Unix time of model time zero, given the wall clock (Unix nanoseconds) of the gauge's
@@ -2475,6 +2537,37 @@ pub struct Assessment {
     pub jump: Option<f64>,
 }
 
+/// A reception's clock error as places of the fit's covariance and their weights
+/// (`Calibrated::clock_weights`): its two knots' offsets, either of which the model may not hold,
+/// and the gauge's rate. At most three, held in place.
+#[derive(Clone, Copy, Debug)]
+pub struct ClockWeights {
+    terms: [(At, f64); 3],
+    len: usize,
+}
+
+impl Default for ClockWeights {
+    fn default() -> Self {
+        Self {
+            terms: [(At::Border(0), 0.0); 3],
+            len: 0,
+        }
+    }
+}
+
+impl ClockWeights {
+    fn push(&mut self, at: At, weight: f64) {
+        if let Some(slot) = self.terms.get_mut(self.len) {
+            *slot = (at, weight);
+            self.len += 1;
+        }
+    }
+
+    fn terms(&self) -> &[(At, f64)] {
+        &self.terms[..self.len]
+    }
+}
+
 impl Calibrated {
     /// The covariance, seconds squared, of the clock error of two receptions mapped through the
     /// model, about `reference_ps` (a model time of the same transmission: the gauge rate's error
@@ -2502,20 +2595,41 @@ impl Calibrated {
         (a, reference_a): (&ModelTime, i128),
         (b, reference_b): (&ModelTime, i128),
     ) -> Option<f64> {
-        let weights = |time: &ModelTime, reference_ps: i128| -> Vec<(At, f64)> {
-            let f = time.fraction();
-            let lever_m = (time.ps - reference_ps) as f64 * 1e-12 * C;
-            [(time.knot, 1.0 - f), (time.knot + 1, f)]
-                .into_iter()
-                .filter_map(|(knot, weight)| {
-                    self.places.get(&(time.piece, knot)).map(|at| (*at, weight))
-                })
-                .chain(std::iter::once((self.rate, lever_m * 1e-6)))
-                .collect()
-        };
+        self.weighed_covariance(
+            (a, &self.clock_weights(a, reference_a)),
+            (b, &self.clock_weights(b, reference_b)),
+        )
+    }
+
+    /// What a reception's clock error is made of, about `reference_ps` (`clock_cross_covariance`):
+    /// the places of its two knots' offsets held (each by its share of the interval) and the gauge's
+    /// rate (by the reception's lever from the reference). Found once a reception, so a solution's
+    /// covariance over every pair of its receptions looks each up once, not once a pair
+    /// (`weighed_covariance`: once a pair, two lists made and four places looked up for
+    /// each, was a fifth of a window step's work).
+    pub fn clock_weights(&self, time: &ModelTime, reference_ps: i128) -> ClockWeights {
+        let f = time.fraction();
+        let lever_m = (time.ps - reference_ps) as f64 * 1e-12 * C;
+        let mut weights = ClockWeights::default();
+        for (knot, weight) in [(time.knot, 1.0 - f), (time.knot + 1, f)] {
+            if let Some(at) = self.places.get(&(time.piece, knot)) {
+                weights.push(*at, weight);
+            }
+        }
+        weights.push(self.rate, lever_m * 1e-6);
+        weights
+    }
+
+    /// The covariance, seconds squared, of two receptions' clock errors, each with its
+    /// `clock_weights`: what `clock_cross_covariance` is, term for term in the same order.
+    pub fn weighed_covariance(
+        &self,
+        (a, weights_a): (&ModelTime, &ClockWeights),
+        (b, weights_b): (&ModelTime, &ClockWeights),
+    ) -> Option<f64> {
         let mut sum = 0.0;
-        for (x, wx) in weights(a, reference_a) {
-            for (y, wy) in weights(b, reference_b) {
+        for &(x, wx) in weights_a.terms() {
+            for &(y, wy) in weights_b.terms() {
                 sum += wx * wy * self.inverse.get(x, y)?;
             }
         }
@@ -2650,11 +2764,8 @@ pub fn check_shape(model: &ClockModel, inputs: &Inputs) -> Option<&'static str> 
     let Some(gauge) = model.gauge_piece() else {
         return Some("gauge");
     };
-    if origin_unix_ns(
-        gauge.timebase,
-        gauge.base,
-        derived.anchor_wall_ms.saturating_mul(1_000_000),
-    ) != Some(model.origin_unix_ns)
+    if origin_unix_ns(gauge.timebase, gauge.base, derived.anchor_wall_ns)
+        != Some(model.origin_unix_ns)
     {
         return Some("origin");
     }

@@ -1039,6 +1039,18 @@ fn the_model_verifier_refuses_tampering_and_an_undeclared_jump() -> Result {
     citation.input.hash[0] ^= 1;
     assert_eq!(failures(&citation), vec![ModelFailure::Citation]);
 
+    // Another specification version derives another model from the same raw: the verifier does
+    // not judge it, tampered or not, and neither passes nor fails it.
+    for mut other in [run.model.clone(), citation.clone()] {
+        other.spec = SPEC_VERSION - 1;
+        let verdict = verify_model(&other, &run.inputs).0;
+        assert_eq!(verdict.failures, vec![ModelFailure::Spec(SPEC_VERSION - 1)]);
+        assert!(!verdict.judged() && !verdict.passed());
+    }
+    assert!(verify_model(&run.model, &run.inputs).0.judged());
+    assert!(crate::judges(SPEC_VERSION) && !crate::judges(SPEC_VERSION - 1));
+    assert!(tally_wire::Tolerance::for_spec(SPEC_VERSION - 1).is_some());
+
     // A receiver whose counter steps by 3 microseconds mid-window.
     let mut scenario = Scenario {
         duration_s: 12.0,
@@ -1379,6 +1391,11 @@ fn the_verifier_accepts_honest_wire_solutions_and_rejects_tampered_ones() -> Res
             let claim = publish::claim(&run.model, &wire, SPEC_VERSION).map_err(text)?;
             let verdict = verify(&run.calibrated, pool, &claim);
             assert!(verdict.passed(), "{:?}", verdict.failures);
+            let mut other = claim.clone();
+            other.spec = SPEC_VERSION - 1;
+            let verdict = verify(&run.calibrated, pool, &other);
+            assert_eq!(verdict.failures, vec![Failure::Spec(SPEC_VERSION - 1)]);
+            assert!(!verdict.judged());
             crate::verify_assignment(&index, solved.address, &run.model, &wire.addressed)
                 .map_err(|failure| format!("{failure:?}"))?;
             honest += 1;
@@ -1728,6 +1745,220 @@ fn a_free_running_gauge_30_ppm_fast_is_measured_and_covers_as_a_gnss_gauge() -> 
     );
     assert!((free.rate() - disciplined.rate()).abs() < 0.02);
     assert!((0.93..=0.97).contains(&free.rate()), "{}", free.rate());
+    Ok(())
+}
+
+/// Under a free-running gauge, a solution's Unix transmit time (the model's origin
+/// plus its model time) is the transmission's own, to within tens of milliseconds. The origin was the
+/// anchor batch's wall clock, signed when the batch closed (in the simulator, at the next whole
+/// second), so every transmission was dated late by however long that batch had been open: up to
+/// a second, half a second on average. Now it is the latest the anchor can have been heard by
+/// every batch of the gauge's that the fit cites (`sync::anchor_wall_ns`).
+#[test]
+fn a_free_running_gauge_dates_transmissions_by_when_they_were_sent() -> Result {
+    let mut errors_ms: Vec<f64> = Vec::new();
+    for seed in 21..24 {
+        let scenario = Scenario {
+            duration_s: 20.0,
+            gps: Vec::new(),
+            ..Scenario::new(seed)
+        };
+        let simulation = sim::run(&scenario);
+        let truth = truth_of(&simulation);
+        let start_ns = scenario.midnight_unix_ms as f64 * 1e6 + scenario.start_tod_s * 1e9;
+        for run in run(&simulation.sites(), &simulation.receptions)? {
+            assert!(
+                !run.model
+                    .gauge_piece()
+                    .ok_or("no gauge")?
+                    .timebase
+                    .disciplined()
+            );
+            for solved in &run.solutions {
+                let first = solved
+                    .transmission
+                    .receptions
+                    .first()
+                    .ok_or("no reception")?;
+                let source = truth.get(&first.id).ok_or("no truth")?;
+                let sent_ns = start_ns + simulation.transmissions[*source].time * 1e9;
+                let dated_ns =
+                    run.model.origin_unix_ns as f64 + solved.solution.transmit_ps as f64 * 1e-3;
+                errors_ms.push((dated_ns - sent_ns) * 1e-6);
+            }
+        }
+    }
+    let n = errors_ms.len();
+    assert!(n > 100, "{n} solutions");
+    let worst = errors_ms
+        .iter()
+        .fold(0.0f64, |worst, error| worst.max(error.abs()));
+    let mean = errors_ms.iter().sum::<f64>() / n as f64;
+    eprintln!("{n} transmissions dated: mean error {mean:.3} ms, worst {worst:.3} ms");
+    // What is left is how long after its last cited reception the closest batch was signed: the
+    // simulator's batches close every second and a tile cites a few of the gauge's receptions a
+    // second, so tens of milliseconds (measured 16 ms mean, 89 ms worst; before, 702 and 937).
+    assert!(
+        mean.abs() < 40.0 && worst < 150.0,
+        "worst {worst} ms, mean {mean} ms"
+    );
+    Ok(())
+}
+
+/// The receivers' inputs of the busiest tile of a free-running scenario's middle window.
+fn busiest_inputs(seed: u64) -> Result<(Simulation, Inputs)> {
+    let simulation = sim::run(&Scenario {
+        duration_s: 40.0,
+        gps: Vec::new(),
+        ..tight(seed)
+    });
+    let bins = all_bins(&simulation.receptions);
+    let sites = Sites::new(&simulation.sites());
+    let all = windows(&bins, crate::scope::STRIDE);
+    let window = all.get(all.len() / 2).copied().ok_or("no window")?;
+    let index = WindowIndex::new(window, &bins, &sites);
+    let plan = index.plan();
+    let inputs = plan
+        .tiles()
+        .into_iter()
+        .filter_map(|tile| index.inputs(tile, &plan.members[&tile]))
+        .max_by_key(|inputs| inputs.sync.len())
+        .ok_or("no inputs")?;
+    Ok((simulation, inputs))
+}
+
+/// A sync message whose bytes were sent twice, 2.87 s apart (an aircraft repeating
+/// a position byte for byte), and that some of its hearers heard the one time and some the other:
+/// its event mixes receptions seconds apart, and nothing in the bytes tells them apart. A fifth of
+/// a tile's position messages so mixed, the fit still fits, the events dropping out by the robust
+/// first step's weights, and the model passes the verifier. Before, the first step was unit
+/// weighted: the mixed events threw every offset by millions of metres and the fit failed.
+#[test]
+fn a_fit_whose_events_mix_two_copies_of_their_bytes_drops_them_and_fits() -> Result {
+    let mut mixed_fits = 0;
+    for seed in 41..44 {
+        let (_, mut inputs) = busiest_inputs(seed)?;
+        let mut by_message: BTreeMap<Vec<u8>, Vec<usize>> = BTreeMap::new();
+        for (at, reception) in inputs.sync.iter().enumerate() {
+            if crate::modes::airborne_position(&reception.observation.data).is_some() {
+                by_message
+                    .entry(reception.observation.data.clone())
+                    .or_default()
+                    .push(at);
+            }
+        }
+        let mut mixed = 0;
+        for (n, (_, list)) in by_message.iter().enumerate() {
+            if n % 5 != 0 || list.len() < 3 {
+                continue;
+            }
+            // The later half of its hearers heard the copy sent 2.87 s after.
+            for at in &list[list.len() / 2..] {
+                let reception = &mut inputs.sync[*at];
+                reception.observation.timestamp += (2.87 * 12e6) as u64;
+                reception.wall_ms += 3_000;
+            }
+            mixed += 1;
+        }
+        assert!(mixed >= 10, "{mixed} events mixed of seed {seed}");
+        inputs.sync.sort_by_cached_key(Reception::id);
+        inputs.citation = Citation::of(&inputs.sync);
+        let (model, _) = crate::fit_calibrated(&inputs)
+            .map_err(|error| format!("seed {seed}, {mixed} events mixed: {error}"))?;
+        let (verdict, _) = verify_model(&model, &inputs);
+        assert!(verdict.passed(), "seed {seed}: {:?}", verdict.failures);
+        assert!(
+            model.pieces.len() * 2 >= inputs.scope.len(),
+            "seed {seed}: {} clocks of {} kept",
+            model.pieces.len(),
+            inputs.scope.len()
+        );
+        mixed_fits += 1;
+    }
+    assert_eq!(mixed_fits, 3);
+    Ok(())
+}
+
+/// A sync message one receiver heard twice in a window (here a repeat of its bytes
+/// 2.87 s later, in the next bin or the same, as the window's held bins show it) is no event of
+/// any tile: the window rejects it whole,
+/// judged over every receiver's records before any tile thins. Before, a tile kept the first of a
+/// receiver's records of it in each bin, so the event mixed the two transmissions.
+#[test]
+fn a_sync_message_a_receiver_heard_twice_is_no_event_of_any_tile() -> Result {
+    let simulation = sim::run(&Scenario {
+        duration_s: 40.0,
+        gps: Vec::new(),
+        ..tight(45)
+    });
+    let mut receptions = simulation.receptions.clone();
+    // Every tenth position message heard by three or more is sent again 2.87 s later.
+    let mut by_message: BTreeMap<Vec<u8>, Vec<usize>> = BTreeMap::new();
+    for (at, reception) in receptions.iter().enumerate() {
+        if crate::modes::airborne_position(&reception.observation.data).is_some() {
+            by_message
+                .entry(reception.observation.data.clone())
+                .or_default()
+                .push(at);
+        }
+    }
+    let mut repeated = 0;
+    for (n, list) in by_message.values().enumerate() {
+        if n % 10 != 0 || list.len() < 3 {
+            continue;
+        }
+        // Two of its hearers hear it again (a repeat heard by one alone is no sync candidate of
+        // its bin, so never held): alternately in the next bin and in the same one.
+        let later = if repeated % 2 == 0 { 3_000 } else { 0 };
+        for at in &list[..2] {
+            let mut again = receptions[*at].clone();
+            again.observation.timestamp += (2.87 * 12e6) as u64;
+            again.wall_ms += later;
+            receptions.push(again);
+        }
+        repeated += 1;
+    }
+    assert!(repeated >= 20, "{repeated} repeated");
+    let bins = all_bins(&receptions);
+    let sites = Sites::new(&simulation.sites());
+    let (mut events, mut twice) = (0, 0);
+    for window in windows(&bins, crate::scope::STRIDE) {
+        let index = WindowIndex::new(window, &bins, &sites);
+        // What the window holds: per sync message, every receiver's record of it, every bin.
+        let mut heard: BTreeMap<[u8; 32], Vec<tally_wire::PublicKey>> = BTreeMap::new();
+        for bin in index.bins() {
+            for candidate in &bin.candidates {
+                heard
+                    .entry(bin.messages[candidate.message as usize].hash)
+                    .or_default()
+                    .extend(candidate.records.iter().map(|record| {
+                        bin.receivers[bin.records[*record as usize].receiver as usize]
+                    }));
+            }
+        }
+        let doubled: BTreeSet<[u8; 32]> = heard
+            .into_iter()
+            .filter(|(_, keys)| keys.iter().collect::<BTreeSet<_>>().len() < keys.len())
+            .map(|(hash, _)| hash)
+            .collect();
+        twice += doubled.len();
+        let plan = index.plan();
+        for tile in plan.tiles() {
+            let Some(inputs) = index.inputs(tile, &plan.members[&tile]) else {
+                continue;
+            };
+            for reception in &inputs.sync {
+                let hash = crate::obs::message_hash(&reception.observation.data);
+                assert!(
+                    !doubled.contains(&hash),
+                    "a message heard twice is in tile {tile:?}'s sync"
+                );
+                events += 1;
+            }
+        }
+    }
+    assert!(twice >= 10, "{twice} messages heard twice in a window");
+    assert!(events > 1_000, "{events} sync receptions");
     Ok(())
 }
 
@@ -2206,3 +2437,64 @@ fn world_scale_one_node() -> Result {
 
 #[path = "provisional_tests.rs"]
 mod provisional;
+
+/// A window's inputs pass on a gate a provisional thread keeps asking of: every tile's inputs are
+/// built by workers holding the gate's permits, and they finish. Before, the messages some
+/// receiver heard twice (`WindowIndex::repeated`) were found lazily by the first worker to build
+/// inputs while the others waited on it holding their permits; its checkpoints gave its own permit
+/// to the provisional thread, and it waited for one the waiting workers held, for ever (a relay's window steps stopped for good). The pass is given a minute; it takes well under one.
+#[test]
+fn an_inputs_pass_on_a_contended_gate_finishes() -> Result {
+    use crate::gate::{self, Gate, Urgency};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let simulation = sim::run(&Scenario {
+        duration_s: 12.0,
+        ..Scenario::new(61)
+    });
+    let bins = all_bins(&simulation.receptions);
+    let sites = Sites::new(&simulation.sites());
+    let bin = bins.last().ok_or("no bins")?.bin;
+    let window = Window::canonical(bin);
+    let gate = Gate::new(3);
+    let done = Arc::new(AtomicBool::new(false));
+    let (sent, finished) = std::sync::mpsc::channel();
+    let prompt = {
+        let (gate, done) = (Arc::clone(&gate), Arc::clone(&done));
+        std::thread::spawn(move || {
+            while !done.load(Ordering::Relaxed) {
+                gate::enter(&gate, Urgency::Prompt, std::thread::yield_now);
+            }
+        })
+    };
+    {
+        let gate = Arc::clone(&gate);
+        let bins = bins.clone();
+        let sites = Sites::new(&simulation.sites());
+        std::thread::spawn(move || {
+            let built = gate::enter(&gate, Urgency::Background, || {
+                // Rounds of fresh indexes, so a lazily found table would be found inside a pass.
+                (0..8)
+                    .map(|_| {
+                        let index = WindowIndex::new(window, &bins, &sites);
+                        let plan = index.plan_on(4);
+                        let tiles = plan.tiles();
+                        gate::on_threads(4, tiles, |tile| {
+                            index.inputs(tile, &plan.members[&tile]).is_some()
+                        })
+                        .into_iter()
+                        .filter(|built| *built)
+                        .count()
+                    })
+                    .sum::<usize>()
+            });
+            let _ = sent.send(built);
+        });
+    }
+    let built = finished.recv_timeout(std::time::Duration::from_secs(60));
+    done.store(true, Ordering::Relaxed);
+    let _ = prompt.join();
+    let built = built.map_err(|_| "the pass did not finish: its workers wait on each other")?;
+    assert!(built > 0);
+    drop(sites);
+    Ok(())
+}

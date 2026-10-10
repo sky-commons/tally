@@ -160,6 +160,8 @@ async fn a_receivers_frames_reach_both_outputs_signed_and_unchanged() -> Result 
         location: Some(location),
         clock: Clock::Dump1090,
         ceiling: 1_000_000,
+        source_address: None,
+        deflate_level: None,
     }));
 
     // The subscriber gets the receiver's signed description and its batches, verified.
@@ -1364,7 +1366,8 @@ async fn a_feeder_is_told_its_rate_limit_and_the_relays_hints_first() -> Result 
         vec![
             Record::RateLimit {
                 bytes_per_sec,
-                burst
+                burst,
+                wanted_per_sec: Some(tally_relay::ingest::FEEDER_RECEPTIONS_PER_SEC as u32),
             },
             Record::RelayList(vec![hint]),
         ]
@@ -1596,11 +1599,10 @@ async fn taking(
 /// relay and its subscriber all the same, and it does not dial the full relay again for the wait
 /// it was given (so the full relay turns each relay away once, never in a loop). The feed runs
 /// past several receipt windows and their judgment, and routing around is no fault on either side
-/// (§2.6, "it is not demoted for it"), judged relay by relay (sweep 4, R-N20): the full relay
+/// (§2.6, "it is not demoted for it"), judged relay by relay: the full relay
 /// itself, which still takes the group's data over the session it admitted, and the second relay
 /// each receipt a judged window; the third, the origin of the only feed, is owed nothing and
-/// receipts none; every relay's judge weighed a window that could have demoted (sweep 5, R5:
-/// `member::Stats::judged`), and no relay files a shortfall or demotes another.
+/// receipts none; every relay's judge weighed a window that could have demoted (`member::Stats::judged`), and no relay files a shortfall or demotes another.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_relay_whose_members_are_full_is_routed_around_and_the_data_still_arrives() -> Result {
     use tally_relay::sharing::member::{JUDGE_AFTER_MS, RECEIPT_GRACE_MS, RECEIPT_WINDOW_SECONDS};
@@ -1726,7 +1728,7 @@ async fn a_relay_whose_members_are_full_is_routed_around_and_the_data_still_arri
             stats.receipts,
             if owed { "" } else { "not " }
         );
-        // The judge sat: a window steady enough to demote was weighed (sweep 5, R5), so the
+        // The judge sat: a window steady enough to demote was weighed, so the
         // shortfalls and demotions below are a verdict, not a judgment that never ran.
         assert!(
             stats.judged > 0,
