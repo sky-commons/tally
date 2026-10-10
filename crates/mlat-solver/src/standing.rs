@@ -828,11 +828,28 @@ impl Book {
         now_ms: u64,
         heard: impl Fn(&ObservationId, u64) -> Option<u64>,
     ) -> BTreeSet<PublicKey> {
+        self.settle_up_to(now_ms, heard, usize::MAX).0
+    }
+
+    /// As `settle`, `most` transmissions at most, earliest due first, and whether any due by
+    /// `now_ms` is left: a keeper that settles in pieces holds what it shares for one piece at a
+    /// time, and settles the same transmissions in the same order as at once.
+    pub fn settle_up_to(
+        &mut self,
+        now_ms: u64,
+        heard: impl Fn(&ObservationId, u64) -> Option<u64>,
+        most: usize,
+    ) -> (BTreeSet<PublicKey>, bool) {
         let mut changed = BTreeSet::new();
+        let mut settled = 0;
         while let Some(&(due_ms, number)) = self.deadlines.first() {
             if due_ms > now_ms {
                 break;
             }
+            if settled == most {
+                return (changed, true);
+            }
+            settled += 1;
             self.deadlines.remove(&(due_ms, number));
             let Some(pending) = self.pending.remove(&number) else {
                 continue;
@@ -840,7 +857,7 @@ impl Book {
             self.unindex(&pending);
             self.settle_one(&pending, &heard, &mut changed);
         }
-        changed
+        (changed, false)
     }
 
     fn settle_one(

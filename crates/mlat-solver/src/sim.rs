@@ -473,6 +473,271 @@ pub fn receiver_identity(seed: u64, index: usize) -> Identity {
     Identity::from_seed(bytes)
 }
 
+/// How far a receiver hears a transmission, metres, and the lowest elevation it does (degrees).
+const REACH_M: f64 = 400_000.0;
+const MIN_ELEVATION_DEG: f64 = 0.5;
+/// The side of a cell of the receivers' index, degrees: small enough that the cells a
+/// transmission looks in hold few receivers beyond its reach.
+const CELL_DEG: f64 = 0.5;
+/// Metres in a degree of latitude, the least (so a span in degrees is never short of the reach).
+const LAT_DEGREE_M: f64 = 110_500.0;
+
+/// A reception made by [`World::hear`]: who heard it, the wall clock of the batch that carries it,
+/// and the receiver's counter. The message is its transmission's.
+#[derive(Clone, Copy, Debug)]
+pub struct Heard {
+    pub receiver: usize,
+    pub wall_ms: u64,
+    pub counter: u64,
+}
+
+/// A scenario's receivers and transmissions, and the index that finds the receivers within reach
+/// of a transmission, which `run` and the load harness both hear from.
+pub struct World {
+    pub scenario: Scenario,
+    pub receivers: Vec<SimReceiver>,
+    pub transmissions: Vec<TruthTransmission>,
+    /// Each receiver's local vertical.
+    ups: Vec<Vec3>,
+    grid: Grid,
+}
+
+/// Receivers by cell of `CELL_DEG` degrees, row by row, each cell's in index order.
+struct Grid {
+    lat0: f64,
+    lon0: f64,
+    rows: usize,
+    cols: usize,
+    /// `starts[row * cols + col]..starts[row * cols + col + 1]` are the cell's in `items`.
+    starts: Vec<u32>,
+    items: Vec<u32>,
+}
+
+impl Grid {
+    fn new(receivers: &[SimReceiver]) -> Self {
+        let place = |receiver: &SimReceiver| {
+            (
+                f64::from(receiver.site.location.lat_e7) * 1e-7,
+                f64::from(receiver.site.location.lon_e7) * 1e-7,
+            )
+        };
+        let (mut lat0, mut lon0, mut lat1, mut lon1) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
+        for receiver in receivers {
+            let (lat, lon) = place(receiver);
+            lat0 = lat0.min(lat);
+            lat1 = lat1.max(lat);
+            lon0 = lon0.min(lon);
+            lon1 = lon1.max(lon);
+        }
+        if receivers.is_empty() {
+            (lat0, lon0, lat1, lon1) = (0.0, 0.0, 0.0, 0.0);
+        }
+        let rows = ((lat1 - lat0) / CELL_DEG).floor() as usize + 1;
+        let cols = ((lon1 - lon0) / CELL_DEG).floor() as usize + 1;
+        let mut grid = Self {
+            lat0,
+            lon0,
+            rows,
+            cols,
+            starts: vec![0; rows * cols + 1],
+            items: vec![0; receivers.len()],
+        };
+        let cells: Vec<usize> = receivers
+            .iter()
+            .map(|receiver| {
+                let (lat, lon) = place(receiver);
+                grid.row(lat) * cols + grid.col(lon)
+            })
+            .collect();
+        for cell in &cells {
+            grid.starts[cell + 1] += 1;
+        }
+        for cell in 0..rows * cols {
+            grid.starts[cell + 1] += grid.starts[cell];
+        }
+        let mut next = grid.starts.clone();
+        for (index, cell) in cells.iter().enumerate() {
+            grid.items[next[*cell] as usize] = index as u32;
+            next[*cell] += 1;
+        }
+        grid
+    }
+
+    fn row(&self, lat: f64) -> usize {
+        (((lat - self.lat0) / CELL_DEG).floor().max(0.0) as usize).min(self.rows - 1)
+    }
+
+    fn col(&self, lon: f64) -> usize {
+        (((lon - self.lon0) / CELL_DEG).floor().max(0.0) as usize).min(self.cols - 1)
+    }
+}
+
+/// SplitMix64's finaliser: a draw is a hash of its key, so it needs no stream and every process
+/// that asks for it gets the same.
+fn mix(mut z: u64) -> u64 {
+    z = z.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^ (z >> 31)
+}
+
+fn unit(bits: u64) -> f64 {
+    (bits >> 11) as f64 / (1u64 << 53) as f64
+}
+
+impl World {
+    fn new(
+        scenario: Scenario,
+        receivers: Vec<SimReceiver>,
+        transmissions: Vec<TruthTransmission>,
+    ) -> Self {
+        let ups = receivers
+            .iter()
+            .map(|receiver| {
+                geo::enu_basis(
+                    receiver.site.location.lat_e7 as f64 * 1e-7,
+                    receiver.site.location.lon_e7 as f64 * 1e-7,
+                )[2]
+            })
+            .collect();
+        let grid = Grid::new(&receivers);
+        Self {
+            scenario,
+            receivers,
+            transmissions,
+            ups,
+            grid,
+        }
+    }
+
+    /// The scenario's world with its transmissions: its receivers, aircraft and everything they
+    /// send, and nothing heard yet ([`World::hear`]).
+    pub fn build(scenario: &Scenario) -> Self {
+        let (world, _, _) = make(scenario);
+        world
+    }
+
+    /// The transmissions' indices in the order they were sent.
+    pub fn in_time_order(&self) -> Vec<usize> {
+        let mut order: Vec<usize> = (0..self.transmissions.len()).collect();
+        order.sort_by(|a, b| {
+            self.transmissions[*a]
+                .time
+                .total_cmp(&self.transmissions[*b].time)
+        });
+        order
+    }
+
+    /// Fills `into` with the receivers (by index, a superset of those in reach) near `transmission`.
+    fn near(&self, transmission: &TruthTransmission, into: &mut Vec<usize>) {
+        into.clear();
+        if self.receivers.is_empty() {
+            return;
+        }
+        let at = geo::from_ecef(transmission.ecef);
+        let grid = &self.grid;
+        let dlat = REACH_M / LAT_DEGREE_M;
+        let dlon = dlat / (at.lat_deg.abs() + dlat).min(85.0).to_radians().cos();
+        let (row0, row1) = (grid.row(at.lat_deg - dlat), grid.row(at.lat_deg + dlat));
+        let (col0, col1) = (grid.col(at.lon_deg - dlon), grid.col(at.lon_deg + dlon));
+        for row in row0..=row1 {
+            let from = grid.starts[row * grid.cols + col0] as usize;
+            let to = grid.starts[row * grid.cols + col1 + 1] as usize;
+            into.extend(grid.items[from..to].iter().map(|index| *index as usize));
+        }
+    }
+
+    /// The range, metres, at which `receiver` hears `transmission`, if it does.
+    fn in_reach(&self, transmission: &TruthTransmission, receiver: usize) -> Option<f64> {
+        let delta = linalg::sub(transmission.ecef, self.receivers[receiver].ecef);
+        let range = linalg::norm(delta);
+        if range > REACH_M {
+            return None;
+        }
+        let elevation = (linalg::dot(delta, self.ups[receiver]) / range)
+            .asin()
+            .to_degrees();
+        (elevation >= MIN_ELEVATION_DEG || elevation.is_nan()).then_some(range)
+    }
+
+    fn reception(
+        &self,
+        transmission: &TruthTransmission,
+        receiver: usize,
+        range: f64,
+        noise: f64,
+    ) -> Reception {
+        let receiver = &self.receivers[receiver];
+        let arrival = transmission.time + range / C;
+        let raw = receiver
+            .truth
+            .counter(arrival, self.scenario.start_tod_s, noise);
+        Reception {
+            receiver: receiver.key,
+            epoch: 1,
+            wall_ms: self.scenario.wall_ms(arrival),
+            observation: Observation {
+                format: if transmission.data.len() == 14 {
+                    format::MODE_S_LONG
+                } else {
+                    format::MODE_S_SHORT
+                },
+                timestamp: raw,
+                signal: 128,
+                data: transmission.data.clone(),
+            },
+        }
+    }
+
+    /// Appends to `into` what the receivers `mine` (indices) hear of transmission `index`, each
+    /// kept with `probability`; with `census`, the other receivers' too, but for their counters
+    /// (left 0), for a caller that counts the whole population. Every draw is keyed by the scenario's seed, the transmission and
+    /// the receiver, so what one receiver hears is the same whichever others are asked for and
+    /// in whatever order or thread: a shard of a run hears exactly its receivers' share of the
+    /// whole run's sky, and the work divides over threads. `near` is the caller's scratch.
+    pub fn hear(
+        &self,
+        index: usize,
+        mine: &std::ops::Range<usize>,
+        census: bool,
+        probability: f64,
+        near: &mut Vec<usize>,
+        into: &mut Vec<Heard>,
+    ) {
+        let transmission = &self.transmissions[index];
+        self.near(transmission, near);
+        let seed = mix(self.scenario.seed ^ mix(index as u64));
+        for &receiver in near.iter() {
+            let local = mine.contains(&receiver);
+            if !local && !census {
+                continue;
+            }
+            let Some(range) = self.in_reach(transmission, receiver) else {
+                continue;
+            };
+            let key = mix(seed ^ (receiver as u64).wrapping_mul(0xd6e8_feb8_6659_fd93));
+            let (kept, u, v) = (mix(key), mix(key ^ 1), mix(key ^ 2));
+            if unit(kept) >= probability {
+                continue;
+            }
+            let arrival = transmission.time + range / C;
+            let counter = if local {
+                let normal = (-2.0 * (1.0 - unit(u)).ln()).sqrt()
+                    * (2.0 * std::f64::consts::PI * unit(v)).cos();
+                let truth = &self.receivers[receiver].truth;
+                truth.counter(arrival, self.scenario.start_tod_s, truth.jitter_s * normal)
+            } else {
+                0
+            };
+            into.push(Heard {
+                receiver,
+                wall_ms: self.scenario.wall_ms(arrival),
+                counter,
+            });
+        }
+    }
+}
+
 /// Runs a scenario.
 pub fn run(scenario: &Scenario) -> Simulation {
     let mut receptions = Vec::new();
@@ -505,11 +770,9 @@ pub fn run_into_in_time_order(
     run_with(scenario, true, sink)
 }
 
-fn run_with(
-    scenario: &Scenario,
-    in_time_order: bool,
-    sink: &mut dyn FnMut(Reception, usize),
-) -> Simulation {
+/// The scenario's receivers, aircraft and transmissions as a world, and the generator its draws
+/// leave behind, which `run_with` goes on with.
+fn make(scenario: &Scenario) -> (World, Rng, Vec<SimAircraft>) {
     let mut rng = Rng::new(scenario.seed);
     let receivers: Vec<SimReceiver> = (0..scenario.receivers.min(usize::from(u16::MAX) - 1))
         .map(|index| {
@@ -669,76 +932,46 @@ fn run_with(
             });
         }
     }
-    // Receivers by 2-degree cell, so a transmission looks only at those within reach (400 km);
-    // in index order, as every one would be looked at, so the draws are the same.
-    let cell = |lat: f64, lon: f64| ((lat / 2.0).floor() as i32, (lon / 2.0).floor() as i32);
-    let mut cells: std::collections::HashMap<(i32, i32), Vec<usize>> =
-        std::collections::HashMap::new();
-    for (index, receiver) in receivers.iter().enumerate() {
-        let location = receiver.site.location;
-        cells
-            .entry(cell(
-                f64::from(location.lat_e7) * 1e-7,
-                f64::from(location.lon_e7) * 1e-7,
-            ))
-            .or_default()
-            .push(index);
-    }
-    let mut order: Vec<usize> = (0..transmissions.len()).collect();
-    if in_time_order {
-        order.sort_by(|a, b| transmissions[*a].time.total_cmp(&transmissions[*b].time));
-    }
+    (
+        World::new(scenario.clone(), receivers, transmissions),
+        rng,
+        aircraft,
+    )
+}
+
+fn run_with(
+    scenario: &Scenario,
+    in_time_order: bool,
+    sink: &mut dyn FnMut(Reception, usize),
+) -> Simulation {
+    let (world, mut rng, aircraft) = make(scenario);
+    let order = if in_time_order {
+        world.in_time_order()
+    } else {
+        (0..world.transmissions.len()).collect()
+    };
+    let mut near: Vec<usize> = Vec::new();
     for index in order {
-        let transmission = &transmissions[index];
-        let at = geo::from_ecef(transmission.ecef);
-        let (row, column) = cell(at.lat_deg, at.lon_deg);
-        let reach = (4.0 / at.lat_deg.to_radians().cos().max(0.2)).ceil() as i32;
-        let mut near: Vec<usize> = Vec::new();
-        for dr in -3..=3 {
-            for dc in -reach..=reach {
-                if let Some(list) = cells.get(&(row + dr, column + dc)) {
-                    near.extend(list);
-                }
-            }
-        }
+        let transmission = &world.transmissions[index];
+        world.near(transmission, &mut near);
+        // In index order, as every one would be looked at, so the draws are the same.
         near.sort_unstable();
-        for receiver in near.iter().map(|index| &receivers[*index]) {
-            let delta = linalg::sub(transmission.ecef, receiver.ecef);
-            let range = linalg::norm(delta);
-            let up = geo::enu_basis(
-                receiver.site.location.lat_e7 as f64 * 1e-7,
-                receiver.site.location.lon_e7 as f64 * 1e-7,
-            )[2];
-            let elevation = (linalg::dot(delta, up) / range).asin().to_degrees();
-            if range > 400_000.0 || elevation < 0.5 {
+        for &receiver in &near {
+            let Some(range) = world.in_reach(transmission, receiver) else {
                 continue;
-            }
+            };
             if rng.uniform() >= scenario.reception_probability {
                 continue;
             }
-            let arrival = transmission.time + range / C;
-            let noise = receiver.truth.jitter_s * rng.normal();
-            let raw = receiver.truth.counter(arrival, scenario.start_tod_s, noise);
-            sink(
-                Reception {
-                    receiver: receiver.key,
-                    epoch: 1,
-                    wall_ms: scenario.wall_ms(arrival),
-                    observation: Observation {
-                        format: if transmission.data.len() == 14 {
-                            format::MODE_S_LONG
-                        } else {
-                            format::MODE_S_SHORT
-                        },
-                        timestamp: raw,
-                        signal: 128,
-                        data: transmission.data.clone(),
-                    },
-                },
-                index,
-            );
+            let noise = world.receivers[receiver].truth.jitter_s * rng.normal();
+            sink(world.reception(transmission, receiver, range, noise), index);
         }
     }
+    let World {
+        receivers,
+        transmissions,
+        ..
+    } = world;
     Simulation {
         scenario: scenario.clone(),
         receivers,
@@ -746,5 +979,85 @@ fn run_with(
         transmissions,
         receptions: Vec::new(),
         sources: Vec::new(),
+    }
+}
+
+#[cfg(test)]
+mod world_tests {
+    use super::*;
+
+    fn world() -> World {
+        World::build(&Scenario {
+            receivers: 80,
+            adsb_aircraft: 30,
+            modes_aircraft: 10,
+            duration_s: 6.0,
+            reception_probability: 0.6,
+            ..Scenario::new(5)
+        })
+    }
+
+    fn heard(world: &World, mine: std::ops::Range<usize>, census: bool) -> Vec<(usize, Heard)> {
+        let (mut near, mut all) = (Vec::new(), Vec::new());
+        for index in 0..world.transmissions.len() {
+            world.hear(index, &mine, census, 0.6, &mut near, &mut all);
+        }
+        all.into_iter().map(|each| (each.receiver, each)).collect()
+    }
+
+    /// What a receiver hears is its own, whichever others are asked for: a shard hears its
+    /// receivers' share of the whole run's sky, counter for counter, and a census adds the rest's
+    /// receptions without their counters.
+    #[test]
+    fn a_receiver_hears_the_same_whichever_others_are_asked_for() {
+        let world = world();
+        let whole = heard(&world, 0..80, false);
+        assert!(whole.len() > 1_000, "{}", whole.len());
+        let shard = heard(&world, 20..35, false);
+        let theirs: Vec<_> = whole
+            .iter()
+            .filter(|(receiver, _)| (20..35).contains(receiver))
+            .collect();
+        assert_eq!(shard.len(), theirs.len());
+        for ((_, a), (_, b)) in shard.iter().zip(theirs) {
+            assert_eq!(
+                (a.receiver, a.wall_ms, a.counter),
+                (b.receiver, b.wall_ms, b.counter)
+            );
+        }
+        let census = heard(&world, 20..35, true);
+        assert_eq!(census.len(), whole.len());
+        assert!(
+            census
+                .iter()
+                .all(|(receiver, each)| (20..35).contains(receiver) || each.counter == 0)
+        );
+    }
+
+    /// The probability keeps that share of what is in reach, and the index finds exactly the
+    /// receivers a scan of every receiver would.
+    #[test]
+    fn the_index_finds_every_receiver_in_reach_and_the_probability_thins_them() {
+        let world = world();
+        let (mut near, mut kept) = (Vec::new(), Vec::new());
+        let (mut reach, mut hits) = (0usize, 0usize);
+        for index in 0..world.transmissions.len() {
+            let transmission = &world.transmissions[index];
+            let scan = (0..world.receivers.len())
+                .filter(|receiver| world.in_reach(transmission, *receiver).is_some())
+                .count();
+            world.near(transmission, &mut near);
+            let found = near
+                .iter()
+                .filter(|receiver| world.in_reach(transmission, **receiver).is_some())
+                .count();
+            assert_eq!(found, scan, "transmission {index}");
+            reach += scan;
+            kept.clear();
+            world.hear(index, &(0..80), false, 0.6, &mut near, &mut kept);
+            hits += kept.len();
+        }
+        let share = hits as f64 / reach as f64;
+        assert!((share - 0.6).abs() < 0.05, "{share} of {reach}");
     }
 }

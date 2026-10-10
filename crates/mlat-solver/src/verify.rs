@@ -71,6 +71,23 @@ impl Verdict {
     pub fn passed(&self) -> bool {
         self.failures.is_empty()
     }
+
+    /// False when the claim names a specification version this verifier does not implement
+    /// (`judges`): neither passed nor failed, and nothing else was checked.
+    pub fn judged(&self) -> bool {
+        !matches!(self.failures.as_slice(), [Failure::Spec(_)])
+    }
+}
+
+/// Whether this verifier can judge a model or claim of specification version `spec`. Each version
+/// is a derivation (version 5 dates a free-running gauge's origin by every cited reception of its
+/// clock and rejects a sync message any receiver heard twice; version 4 did neither), so the same
+/// raw gives each version a different model, and this build implements its own alone: a model or
+/// claim of another version is unjudged, never failed, so a fleet part-way through an upgrade
+/// convicts nobody for the version it runs. The wire's tolerance (`tally_wire::Tolerance::for_spec`)
+/// knows every version, so fault proofs of any are still judged.
+pub fn judges(spec: u16) -> bool {
+    spec == SPEC_VERSION
 }
 
 /// Verifies `claim` against `candidates` (every reception the verifier holds of the claimed
@@ -90,8 +107,9 @@ pub fn verify_reach(
 ) -> Verdict {
     let model = &calibrated.model;
     let mut failures = Vec::new();
-    if claim.spec != SPEC_VERSION {
+    if !judges(claim.spec) {
         failures.push(Failure::Spec(claim.spec));
+        return Verdict { failures };
     }
     if claim.observations.windows(2).any(|pair| pair[0] >= pair[1]) {
         failures.push(Failure::Unsorted);
@@ -130,8 +148,9 @@ pub fn verify_grouped(
     claim: &Solution,
 ) -> Verdict {
     let mut failures = Vec::new();
-    if claim.spec != SPEC_VERSION {
+    if !judges(claim.spec) {
         failures.push(Failure::Spec(claim.spec));
+        return Verdict { failures };
     }
     if claim.observations.windows(2).any(|pair| pair[0] >= pair[1]) {
         failures.push(Failure::Unsorted);
@@ -303,6 +322,12 @@ impl ModelVerdict {
     pub fn passed(&self) -> bool {
         self.failures.is_empty()
     }
+
+    /// False when the model names a specification version this verifier does not implement
+    /// (`judges`): neither passed nor failed, and nothing else was checked.
+    pub fn judged(&self) -> bool {
+        !matches!(self.failures.as_slice(), [ModelFailure::Spec(_)])
+    }
 }
 
 /// Verifies a published model against `inputs`, rebuilt by the verifier from its own raw for the
@@ -313,8 +338,9 @@ pub fn verify_model(
     inputs: &crate::scope::Inputs,
 ) -> (ModelVerdict, Option<Calibrated>) {
     let mut failures = Vec::new();
-    if model.spec != SPEC_VERSION {
+    if !judges(model.spec) {
         failures.push(ModelFailure::Spec(model.spec));
+        return (ModelVerdict { failures }, None);
     }
     if model.tile != inputs.tile || model.window != inputs.window || model.scope != inputs.scope {
         failures.push(ModelFailure::Scope);

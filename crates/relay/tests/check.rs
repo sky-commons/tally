@@ -33,17 +33,35 @@ fn packaged_unit() -> PathBuf {
 /// What `check` said: its exit, its stdout's plan (`name value` a line) and its stderr.
 struct Checked {
     accepted: bool,
-    plan: Vec<(String, usize)>,
+    plan: Vec<(String, String)>,
     refusal: String,
 }
 
 impl Checked {
-    fn get(&self, name: &str) -> Result<usize> {
+    /// A line as the text it printed (a figure, or a word: what bound it, `unbounded`).
+    fn text(&self, name: &str) -> Result<&str> {
         self.plan
             .iter()
             .find(|(key, _)| key == name)
-            .map(|(_, value)| *value)
+            .map(|(_, value)| value.as_str())
             .ok_or_else(|| format!("the plan has no {name}: {:?}", self.plan))
+    }
+
+    fn get(&self, name: &str) -> Result<usize> {
+        self.text(name)?
+            .parse()
+            .map_err(|_| format!("{name} is not a number: {:?}", self.plan))
+    }
+
+    /// A figure the cores may leave unbounded (`unbounded`: no cores planned), as a number.
+    fn bounded(&self, name: &str) -> Result<Option<usize>> {
+        match self.text(name)? {
+            "unbounded" => Ok(None),
+            text => text
+                .parse()
+                .map(Some)
+                .map_err(|_| format!("{name} is not a number: {:?}", self.plan)),
+        }
     }
 }
 
@@ -71,10 +89,9 @@ fn check(args: &[&str]) -> Result<Checked> {
             let (name, value) = line
                 .split_once(' ')
                 .ok_or_else(|| format!("{line}: expected `name value`"))?;
-            let value = value.parse().map_err(|_| format!("{line}: not a number"))?;
-            Ok((name.to_owned(), value))
+            Ok((name.to_owned(), value.to_owned()))
         })
-        .collect::<Result<Vec<_>>>()?;
+        .collect::<Result<Vec<(String, String)>>>()?;
     Ok(Checked {
         accepted: output.status.success(),
         plan,
@@ -82,16 +99,8 @@ fn check(args: &[&str]) -> Result<Checked> {
     })
 }
 
-/// The plan holds together: the budget is the memory, what it holds before any feeder taken first
-/// (every part the plan lists: its base, the oversize room, its connections' buffers, its members'
-/// pool: their shared rate's worth, planned once, and each member session's allowance, what waits
-/// for its link to each member, a link's share each, and the rest), one feeder fits, each
-/// admitted feeder's share fits in what is left, and the budget keeps the declared headroom below
-/// the memory the relay runs in. A relay holding member sessions plans their rate; one holding
-/// none (it takes no area) plans nothing for them. It admits the fewer of the feeders its memory
-/// holds and those its cores carry, and runs every stage on a thread at least.
-/// The load the plan admits (`cores::Load`): its feeders, each held to the records it prints, and
-/// the feeders its members' rate is worth, and its other sessions, each at its role's pace.
+/// The load the plan admits (`cores::Load`): `R_max`, its connections, its seats, the feeders its
+/// members' rate is worth, and its other sessions, each at its role's pace.
 fn load(checked: &Checked) -> Result<tally_relay::cores::Load> {
     let sessions = tally_relay::cores::Sessions {
         general: checked.get("general-sessions")?,
@@ -104,24 +113,36 @@ fn load(checked: &Checked) -> Result<tally_relay::cores::Load> {
         checked.plan
     );
     Ok(tally_relay::cores::Load {
-        feeders: checked.get("feeders")?,
+        receptions_per_sec: checked.get("max-receptions-per-sec")? as u64,
+        connections: checked.get("connection-limit")?,
+        seats: checked.get("mlat-seats")?,
         member_feeders: checked.get("member-feeders")?,
-        feeder_records_per_sec: checked.get("feeder-records")? as u64,
         sessions,
     })
 }
 
+/// The plan holds together (RFC-0181 §9, "Admission"): the budget is the memory, what it holds
+/// before any feeder taken first (every part the plan lists, each printed), the floors of the
+/// connections admitted, the windows of `R_max` and the members' rate in every rate-driven store,
+/// and the seats, all of it inside the memory, and the budget keeps the declared headroom (the
+/// allocator's share and the fixed one) below the memory the relay runs in. The connection limit
+/// is the fewer of what the memory and the cores carry, `R_max` the lesser of the two, each with
+/// what bound it, and every stage runs on a thread at least.
 fn assert_plan_holds(checked: &Checked) -> Result {
-    let (memory, base, each, feeders, members, per_member, pool, planned, headroom, limit) = (
+    let plan = &checked.plan;
+    let (memory, base, floor, connections, members, per_member, pool, planned) = (
         checked.get("memory")?,
         checked.get("base")?,
-        checked.get("per-feeder")?,
-        checked.get("feeders")?,
+        checked.get("floor")?,
+        checked.get("connection-limit")?,
         checked.get("members")?,
         checked.get("per-member")?,
         checked.get("member-pool")?,
         checked.get("planned")?,
+    );
+    let (headroom, allocator, limit) = (
         checked.get("headroom")?,
+        checked.get("allocator")?,
         checked.get("limit")?,
     );
     let (member_feeders, rate_pool, links) = (
@@ -132,64 +153,134 @@ fn assert_plan_holds(checked: &Checked) -> Result {
     assert_eq!(
         links,
         members * tally_relay::peers::WAITING_PER_LINK_BYTES,
-        "{:?}",
-        checked.plan
+        "{plan:?}"
     );
-    assert!(feeders > 0, "a plan admitting no feeder was accepted");
-    assert!(per_member > 0, "{:?}", checked.plan);
+    assert!(
+        connections > 0,
+        "a plan admitting no connection was accepted"
+    );
+    assert!(per_member > 0, "{plan:?}");
     assert_eq!(
         members == 0,
         member_feeders == 0 && rate_pool == 0,
-        "{:?}",
-        checked.plan
+        "{plan:?}"
     );
-    let (oversize, connections, buffers) = (
+    let (oversize, non_feeder, buffers) = (
         checked.get("oversize")?,
         checked.get("connections")?,
         checked.get("connection-buffers")?,
     );
-    assert!(oversize > 0, "{:?}", checked.plan);
+    assert!(oversize > 0, "{plan:?}");
     assert!(
-        connections > 0 && buffers % connections == 0 && buffers / connections > 0,
-        "{:?}",
-        checked.plan
+        non_feeder > 0 && buffers % non_feeder == 0 && buffers / non_feeder > 0,
+        "{plan:?}"
     );
     assert_eq!(pool, rate_pool + per_member * members);
-    // What it holds before any feeder is every part the plan lists, each printed, and the plan is
-    // that and the feeders' shares. The parts are the plan's own list (`before_feeders_parts`),
-    // never one written here, so a part the plan gains cannot be left out of the sum.
+    // What it holds before any feeder is every part the plan lists, each printed. The parts are
+    // the plan's own list (`before_feeders_parts`), never one written here, so a part the plan
+    // gains cannot be left out of the sum.
     let before = checked.get("before-feeders")?;
     let mut parts = 0;
     for (name, _) in tally_relay::budget::Plan::planned(false).before_feeders_parts() {
         parts += checked.get(name)?;
     }
-    assert_eq!(before, parts, "{:?}", checked.plan);
+    assert_eq!(before, parts, "{plan:?}");
     assert!(
         before >= base + oversize + buffers + pool + links,
-        "{:?}",
-        checked.plan
+        "{plan:?}"
     );
-    assert_eq!(planned, before + each * feeders, "{:?}", checked.plan);
-    let (memory_feeders, core_feeders) =
-        (checked.get("memory-feeders")?, checked.get("core-feeders")?);
+    // The connection limit: the fewer of the memory's and the cores'.
+    let by_memory = checked.get("connections-by-memory")?;
+    let by_cores = checked.bounded("connections-by-cores")?;
     assert_eq!(
-        feeders,
-        memory_feeders.min(core_feeders),
-        "{:?}",
-        checked.plan
+        connections,
+        by_memory.min(by_cores.unwrap_or(usize::MAX)),
+        "{plan:?}"
     );
-    assert!(planned <= memory, "{:?}", checked.plan);
-    // Bound by its memory, it plans all of it but less than a feeder.
+    let bound = checked.text("connection-limit-bound")?;
+    assert_eq!(
+        bound,
+        if by_cores.is_some_and(|cores| cores < by_memory) {
+            "cores"
+        } else {
+            "memory"
+        },
+        "{plan:?}"
+    );
+    // R_max: the lesser of what the memory and the cores carry, at least the connections' mean
+    // (connections are admitted at the planned mean), and the bytes and records it admits.
+    let rate = checked.get("max-receptions-per-sec")?;
+    let rate_memory = checked.get("rate-by-memory")?;
+    let rate_cores = checked.bounded("rate-by-cores")?;
+    assert_eq!(
+        rate,
+        rate_memory.min(rate_cores.unwrap_or(usize::MAX)),
+        "{plan:?}"
+    );
     assert!(
-        feeders < memory_feeders || memory - planned < each,
-        "{:?}",
-        checked.plan
+        rate >= connections * tally_relay::budget::PLANNED_RECEPTIONS_PER_SEC,
+        "{plan:?}"
     );
-    for stage in ["ingest-threads", "message-threads", "seal-threads"] {
-        assert!(checked.get(stage)? >= 1, "{stage}: {:?}", checked.plan);
+    assert_eq!(
+        checked.get("max-bytes-per-sec")?,
+        rate * tally_relay::budget::PLANNED_BYTES_PER_SEC
+            / tally_relay::budget::PLANNED_RECEPTIONS_PER_SEC,
+        "{plan:?}"
+    );
+    assert_eq!(
+        checked.get("feeders-at-mean")?,
+        rate / tally_relay::budget::PLANNED_RECEPTIONS_PER_SEC,
+        "{plan:?}"
+    );
+    assert!(
+        checked.get("feeders-at-ceiling")? <= checked.get("feeders-at-mean")?,
+        "{plan:?}"
+    );
+    assert!(
+        ["memory", "cores"].contains(&checked.text("rate-bound")?),
+        "{plan:?}"
+    );
+    // Every rate-driven store's limit is its window (bytes held per reception a second) times
+    // R_max and the members' rate; the connections' stores are their floors'.
+    let served = rate + checked.get("members-receptions-per-sec")?;
+    let mut gauges = 0;
+    for store in tally_relay::budget::Store::ALL {
+        let limit = checked.get(&format!("limit-{}", store.name()))?;
+        gauges += limit;
+        if store.driver() == tally_relay::budget::Driver::Rate {
+            let window = checked.get(&format!("window-{}", store.name()))?;
+            assert!(
+                limit <= window * served && limit + served >= window * served,
+                "{store:?}: {limit} is not {window} x {served}: {plan:?}"
+            );
+        }
     }
-    assert!(headroom > 0, "{:?}", checked.plan);
-    assert!(memory + headroom <= limit, "{:?}", checked.plan);
+    assert!(
+        gauges <= memory - base,
+        "the gauges pass the memory: {plan:?}"
+    );
+    assert!(planned <= memory, "{plan:?}");
+    assert!(planned >= before + floor * connections, "{plan:?}");
+    // MLAT's seats: none where it is not hosted, else what the connections leave of the memory and
+    // the cores (planned after them), no more than the connections, and a seat at least.
+    let hosted = checked.text("mlat-seats-bound")? != "not-hosted";
+    assert_eq!(checked.get("mlat-seats")? > 0, hosted, "{plan:?}");
+    assert!(checked.get("mlat-seats")? <= connections, "{plan:?}");
+    // The handshakes allowed at once are a core's worth of them.
+    assert!(
+        checked.get("handshakes-in-flight")? >= checked.get("cores")?,
+        "{plan:?}"
+    );
+    assert!(checked.get("handshakes-per-sec")? > 0, "{plan:?}");
+    for stage in ["ingest-threads", "message-threads", "seal-threads"] {
+        assert!(checked.get(stage)? >= 1, "{stage}: {plan:?}");
+    }
+    // The headroom is the fixed part and the allocator's share of what the budget plans.
+    assert!(
+        allocator > 0 && headroom == allocator + tally_relay::budget::HEADROOM_BYTES,
+        "{plan:?}"
+    );
+    assert!(memory + headroom <= limit, "{plan:?}");
     Ok(())
 }
 
@@ -198,7 +289,7 @@ fn a_configuration_the_relay_takes_is_accepted_with_its_plan() -> Result {
     // A key file that does not exist: check reads no key, which is an operator's secret.
     let checked = check(&[
         "--memory-limit",
-        "640M",
+        "800M",
         "--cores",
         "2",
         "--key",
@@ -218,7 +309,7 @@ fn a_configuration_the_relay_takes_is_accepted_with_its_plan() -> Result {
     assert_eq!(checked.get("memory")?, 560 << 20);
     // It hosts MLAT by default, on the threads its cores' plan gives it.
     assert!(checked.get("mlat-threads")? >= 1, "{:?}", checked.plan);
-    assert_eq!(checked.get("limit")?, 640 << 20);
+    assert_eq!(checked.get("limit")?, 800 << 20);
     // A base cell's groups reach every relay offering it or a cell under it, far more than 32:
     // the member sessions planned are the cap's worth.
     assert_eq!(checked.get("members")?, 32);
@@ -228,10 +319,14 @@ fn a_configuration_the_relay_takes_is_accepted_with_its_plan() -> Result {
     assert_eq!(checked.get("connections")?, 32 + members + 64);
     // The members' rate is the feeders it is worth, once: 128 KiB/s is 16 feeders at 8 KiB/s, each
     // a feeder's cost but for the connection buffers and the allowance each session takes itself.
-    let (rate_pool, each) = (checked.get("member-rate-pool")?, checked.get("per-feeder")?);
+    let (rate_pool, each) = (
+        checked.get("member-rate-pool")?,
+        checked.get("floor")? + tally_relay::budget::Plan::planned(true).per_rate.total(),
+    );
     assert_eq!(checked.get("member-feeders")?, 16);
     assert!(
-        rate_pool % 16 == 0 && rate_pool < 16 * each,
+        rate_pool % 16 == 0
+            && rate_pool < 16 * (each + tally_relay::budget::Plan::planned(true).per_seat.total()),
         "{:?}",
         checked.plan
     );
@@ -251,7 +346,9 @@ fn a_configuration_the_relay_takes_is_accepted_with_its_plan() -> Result {
         "1048576",
     ])?;
     assert!(whole.accepted, "{}", whole.refusal);
-    assert_eq!(whole.get("memory")?, (2 << 30) - whole.get("headroom")?);
+    // (to the byte the allocator's share rounds to: `budget::budget_within`)
+    let kept = whole.get("memory")? + whole.get("headroom")?;
+    assert!(kept <= 2 << 30 && kept + 2 >= 2 << 30, "{:?}", whole.plan);
     // No area taken: no group shared, no member session planned.
     assert_eq!(whole.get("members")?, 0);
     assert_plan_holds(&whole)
@@ -307,27 +404,36 @@ fn the_stages_follow_the_load_admitted_and_the_cores_bound_it() -> Result {
         })
     };
     let measured = on("10", "24G")?;
-    assert!(measured.get("feeders")? >= 5_000, "{:?}", measured.plan);
+    assert!(
+        measured.get("connection-limit")? >= 5_000,
+        "{:?}",
+        measured.plan
+    );
     assert_eq!(threads(&measured)?, expected(&measured)?);
     assert!(
         threads(&measured)?.message >= 2,
         "{:?}",
         threads(&measured)?
     );
-    // One core: the cores bound it, below what the memory holds.
+    // One core: the cores bound the connections and the rate, below what the memory holds.
     let one = on("1", "24G")?;
     assert!(
-        one.get("feeders")? == one.get("core-feeders")?
-            && one.get("feeders")? < one.get("memory-feeders")?,
+        one.bounded("connections-by-cores")? == Some(one.get("connection-limit")?)
+            && one.get("connection-limit")? < one.get("connections-by-memory")?
+            && one.text("connection-limit-bound")? == "cores"
+            && one.text("rate-bound")? == "cores"
+            && one.get("max-receptions-per-sec")? < one.get("rate-by-memory")?,
         "{:?}",
         one.plan
     );
     assert_eq!(threads(&one)?, expected(&one)?);
-    // Many cores and little memory: the memory bounds it, and the threads follow its feeders.
+    // Many cores and little memory: the memory bounds it, and the threads follow its rate.
     let small = on("32", "16G")?;
     assert!(
-        small.get("feeders")? == small.get("memory-feeders")?
-            && small.get("feeders")? < small.get("core-feeders")?,
+        small.get("connection-limit")? == small.get("connections-by-memory")?
+            && Some(small.get("connection-limit")?) < small.bounded("connections-by-cores")?
+            && small.text("connection-limit-bound")? == "memory"
+            && small.text("rate-bound")? == "memory",
         "{:?}",
         small.plan
     );
@@ -373,16 +479,31 @@ fn hosted_mlat_takes_the_cores_the_stages_leave_and_bounds_admission() -> Result
     };
     let (hosting, without) = (on(true)?, on(false)?);
     let load = load(&hosting)?;
-    // The cores bound it, below what its memory holds, and below what they carry without MLAT.
-    assert_eq!(hosting.get("feeders")?, hosting.get("core-feeders")?);
-    assert!(hosting.get("feeders")? < hosting.get("memory-feeders")?);
-    assert!(hosting.get("core-feeders")? < without.get("core-feeders")?);
+    // Hosting, the connections are fewer than without MLAT (MLAT's share of the memory and the
+    // cores is kept for its seats), and the seats are a pool of their own: planned from what the
+    // connections leave, never more than they are.
+    assert!(hosting.get("connection-limit")? < without.get("connection-limit")?);
+    assert!(hosting.get("max-receptions-per-sec")? < without.get("max-receptions-per-sec")?);
+    assert_eq!(without.get("mlat-seats")?, 0);
+    assert!(hosting.get("mlat-seats")? <= hosting.get("connection-limit")?);
     assert_eq!(
-        hosting.get("core-feeders")?,
-        tally_relay::cores::feeders_carried(10, true, load)
+        hosting.get("mlat-seats")?,
+        hosting
+            .get("mlat-seats-by-memory")?
+            .min(
+                hosting
+                    .bounded("mlat-seats-by-cores")?
+                    .unwrap_or(usize::MAX)
+            )
+            .min(hosting.get("connection-limit")?)
     );
-    // The 2,000 feeders measured hosting MLAT fit.
-    assert!(hosting.get("feeders")? >= 2_000, "{:?}", hosting.plan);
+    // The 2,000 feeders measured hosting MLAT fit, each with a seat.
+    assert!(hosting.get("mlat-seats")? >= 2_000, "{:?}", hosting.plan);
+    assert!(
+        hosting.get("connection-limit")? >= 2_000,
+        "{:?}",
+        hosting.plan
+    );
     // MLAT takes what the stages leave; the stages' threads are their own plan's.
     assert_eq!(
         hosting.get("mlat-threads")?,
@@ -531,7 +652,10 @@ fn a_configuration_a_start_refuses_is_refused_and_says_why() -> Result {
                 "--memory",
                 memory,
             ],
-            "is above the 469762048 bytes this relay may plan",
+            &format!(
+                "is above the {} bytes this relay may plan",
+                tally_relay::budget::budget_within(512 << 20)
+            ),
         )?;
     }
     // The world product over a part of the world.
@@ -736,7 +860,7 @@ fn the_packaged_unit_starts_a_relay_that_admits_feeders() -> Result {
             path.display(),
             area.map(|area| format!(" taking {area}"))
                 .unwrap_or_default(),
-            checked.get("feeders")?,
+            checked.get("connection-limit")?,
             checked.get("members")?
         );
     }
@@ -746,9 +870,16 @@ fn the_packaged_unit_starts_a_relay_that_admits_feeders() -> Result {
 /// The lines of `check`'s plan RFC-0181 ("Sizing", "What the cores carry") quotes, and the
 /// configuration it quotes them for: ten cores, the two areas the harness's clusters are, memory to
 /// spare (so the cores bound it), with hosted MLAT and without.
-const CORE_LINES: [&str; 11] = [
+const CORE_LINES: [&str; 20] = [
     "cores",
-    "core-feeders",
+    "connection-limit",
+    "connections-by-cores",
+    "connection-limit-bound",
+    "max-receptions-per-sec",
+    "rate-by-cores",
+    "rate-bound",
+    "mlat-seats",
+    "mlat-seats-bound",
     "feeder-records",
     "general-sessions",
     "subscriber-sessions",
@@ -758,6 +889,8 @@ const CORE_LINES: [&str; 11] = [
     "message-threads",
     "seal-threads",
     "mlat-threads",
+    "handshakes-in-flight",
+    "handshakes-per-sec",
 ];
 
 const TEN_CORES: [&str; 18] = [
@@ -781,7 +914,7 @@ const TEN_CORES: [&str; 18] = [
     "8027fffffffffff",
 ];
 
-/// N15 of sweep 5: RFC-0181's figures for what ten cores carry are this test's printed output,
+/// RFC-0181's figures for what ten cores carry are this test's printed output,
 /// held equal to `tests/cores-10.txt`, never prose: the plan the relay prints for that
 /// configuration, hosting MLAT and not. A change to the cores' plan (a figure measured again, a
 /// cost planned that was not) fails here until the file is regenerated from what this test prints,
@@ -802,7 +935,7 @@ fn the_cores_figures_the_rfc_quotes_are_the_relays_own() -> Result {
             TEN_CORES.join(" ")
         ));
         for line in CORE_LINES {
-            printed.push_str(&format!("{line} {}\n", checked.get(line)?));
+            printed.push_str(&format!("{line} {}\n", checked.text(line)?));
         }
     }
     print!("{printed}");
@@ -813,5 +946,60 @@ fn the_cores_figures_the_rfc_quotes_are_the_relays_own() -> Result {
          output there (`bazel test //tally/crates/relay:check --test_output=all`) and quote it in \
          RFC-0181, \"What the cores carry\":\n{printed}"
     );
+    Ok(())
+}
+
+/// The world's relay (RFC-0181 §9, "Admission"): 16 cores in a 32 GB container, no MLAT (it does
+/// not fit one box beside the world's feeders), the public relay's caps. The plan it prints is
+/// printed here, whole, so the RFC quotes what the relay says: its connection limit and `R_max`
+/// with what bound each, the feeders carried at the planned mean and at the ceiling a source is
+/// held to, every gauge's limit, the handshakes allowed at once and the totals against the
+/// memory with the allocator's share. And the same relay hosting MLAT, whose seats are its own
+/// pool and whose connections are fewer.
+#[test]
+fn the_world_relay_prints_what_it_admits() -> Result {
+    let world = |mlat: bool| -> Result<Checked> {
+        let mut args = vec![
+            "--memory-limit",
+            "32G",
+            "--cores",
+            "16",
+            "--key",
+            "k",
+            "--max-upload",
+            "10Gbit/s",
+            "--max-connections",
+            "1024",
+            "--max-connections-per-address",
+            "1024",
+            "--area",
+            "801ffffffffffff",
+        ];
+        if !mlat {
+            args.push("--no-mlat");
+        }
+        let checked = check(&args)?;
+        assert!(checked.accepted, "{}", checked.refusal);
+        assert_plan_holds(&checked)?;
+        println!(
+            "# tally-relay check {}{}",
+            args.join(" "),
+            if mlat { "" } else { " (without MLAT)" }
+        );
+        for (name, value) in &checked.plan {
+            println!("{name} {value}");
+        }
+        Ok(checked)
+    };
+    let (hosting, without) = (world(true)?, world(false)?);
+    // The relay's whole plan: the connections, the rate and what bound each.
+    assert!(
+        without.get("connection-limit")? > 15_000,
+        "{:?}",
+        without.plan
+    );
+    assert_eq!(without.get("mlat-seats")?, 0);
+    assert!(hosting.get("mlat-seats")? > 0);
+    assert!(hosting.get("connection-limit")? < without.get("connection-limit")?);
     Ok(())
 }

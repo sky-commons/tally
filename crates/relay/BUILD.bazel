@@ -152,7 +152,7 @@ rust_test(
 
 # Each test of the binary is its own target, so each runs alone and declares what it alone needs,
 # measured (2026-10-08, release build, `/usr/bin/time -v`, each test alone): the three
-# single-network tests are a relay or two over a 45 s scenario (60 s since sweep 4: models ripen
+# single-network tests are a relay or two over a 45 s scenario (60 s: models ripen
 # 15 s after their window step), the relays' clock walking it a step at a time (`TestClock`): at most 25 MiB resident and under a second of CPU each, up to 16 s (the
 # first waits for a window to come due). The three-relay test runs three relays through 2.5 min of
 # scenario: 76 MiB resident, 6 s of CPU in 150 s. The four-relay test waits out a dead relay's

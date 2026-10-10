@@ -292,6 +292,9 @@ struct State {
     /// The host name being resolved, and when it may be tried again: never while a resolution is
     /// under way, `RESOLVE_AGAIN_MS` after one failed.
     own_resolving: Option<(String, u64)>,
+    /// Host names answered from here and not by the system's resolver: a test's, whose sandbox may
+    /// have no resolver at all (`Directory::pin_host`). Empty in a running relay.
+    hosts: HashMap<String, std::net::IpAddr>,
     /// The groups each key's held offers answered from, with how many offers each.
     key_groups: HashMap<PublicKey, BTreeMap<Group, usize>>,
     /// Each key's tier, weighed at `tiers_at`; cleared whenever what they are weighed from changes.
@@ -337,6 +340,7 @@ impl Default for State {
             own_offers: Vec::new(),
             own_resolved: None,
             own_resolving: None,
+            hosts: HashMap::new(),
             key_groups: HashMap::new(),
             tiers: HashMap::new(),
             tiers_at: 0,
@@ -631,6 +635,15 @@ impl Coverage {
     }
 }
 
+impl State {
+    /// `address` (a host name and port) as `Directory::pin_host` pinned its host, if it did.
+    fn pinned(&self, address: &str) -> Option<std::net::SocketAddr> {
+        let (host, port) = address.rsplit_once(':')?;
+        let ip = self.hosts.get(host)?;
+        Some(std::net::SocketAddr::new(*ip, port.parse().ok()?))
+    }
+}
+
 impl Directory {
     pub fn new() -> Self {
         Self::default()
@@ -641,8 +654,15 @@ impl Directory {
         lock(&self.state).own
     }
 
+    /// Answers `host` with `ip` whatever the system's resolver says: a test of resolving a host
+    /// name must not depend on the resolver of the machine (or sandbox) it runs in.
     #[cfg(test)]
-    pub(crate) fn adopt_own_key(&self, key: PublicKey) {
+    pub(crate) fn pin_host(&self, host: &str, ip: std::net::IpAddr) {
+        lock(&self.state).hosts.insert(host.to_owned(), ip);
+    }
+
+    #[doc(hidden)]
+    pub fn adopt_own_key(&self, key: PublicKey) {
         lock(&self.state).own = Some(key);
     }
 
@@ -923,8 +943,12 @@ impl Directory {
             if let Some(address) = resolve {
                 lock(&self.state).own_resolving = Some((address.clone(), u64::MAX));
                 let state = Arc::clone(&self.state);
+                let pinned = lock(&state).pinned(&address);
                 runtime.spawn(async move {
-                    let resolved = resolved_address(&address).await;
+                    let resolved = match pinned {
+                        Some(address) => Some(address),
+                        None => resolved_address(&address).await,
+                    };
                     // By the clock of the tick that asked.
                     lock(&state).resolved(&address, resolved, now_ms);
                 });
@@ -983,9 +1007,10 @@ impl Directory {
         Some(pending)
     }
 
-    /// Holds an offer as verified from `group`, without a dial: for the relay's own path and tests.
-    #[cfg(test)]
-    pub(crate) fn hold_verified(
+    /// Holds an offer as verified from `group`, without a dial: for the relay's own path and tests
+    /// (also those of the integration suites, which have no peer to dial).
+    #[doc(hidden)]
+    pub fn hold_verified(
         &self,
         offer: ProviderOffer,
         group: Group,
@@ -2657,7 +2682,7 @@ mod tests {
         Identity::from_seed(seed).public()
     }
 
-    /// Item 3 of the sweep: a full cap over many cells (a network group's, a key's) gives up the
+    /// A full cap over many cells (a network group's, a key's) gives up the
     /// lowest-ranked offer under it for a newcomer that outranks it, never "full, refused" by
     /// arrival, so the set held is the same whatever order the offers came in.
     #[test]
@@ -2696,7 +2721,7 @@ mod tests {
         Ok(())
     }
 
-    /// Item 3 of the sweep: the directory's own bound (`OFFERS_HELD`) gives up the lowest-ranked
+    /// The directory's own bound (`OFFERS_HELD`) gives up the lowest-ranked
     /// offer anywhere, the same set whatever the order.
     #[test]
     fn the_directorys_bound_keeps_the_same_offers_whatever_the_arrival_order() -> Result {
@@ -2728,7 +2753,7 @@ mod tests {
         Ok(())
     }
 
-    /// Item 4 of the sweep: a peer re-signing changed offers in a loop changes what its readers
+    /// A peer re-signing changed offers in a loop changes what its readers
     /// see at most once per `CHANGED_AT_MOST_EVERY_MS` per (key, cell); the newest change waiting
     /// is held when its turn comes, and a re-signing that changes nothing is held at once.
     #[test]
@@ -2994,7 +3019,7 @@ mod tests {
         keys
     }
 
-    /// Sweep 3, N6: the relay's own offer is held under the group of the address it advertises
+    /// The relay's own offer is held under the group of the address it advertises
     /// and by every cap, as its peers hold it. Its network already holds a group's share of the
     /// cell in peers' offers: the relay holds exactly what a peer that verified the same offers
     /// holds (the top of the ranking of the five, four of them), never its own beside all four.
@@ -3027,7 +3052,7 @@ mod tests {
         Ok(())
     }
 
-    /// R-P3 of sweep 4: a relay advertising a host name signs offers naming the address it
+    /// A relay advertising a host name signs offers naming the address it
     /// resolved to, and holds them under that address's group; a peer that verifies the gossiped
     /// offer by dialling the address it names holds it under the very same group. Neither
     /// resolves anything for the group.
@@ -3052,6 +3077,9 @@ mod tests {
         }
         let hub = own_relay(&identity, &format!("localhost:{port}"), cell);
         let mine = Directory::new();
+        // The sandbox this runs in may have no resolver, so `localhost` is pinned to where the
+        // listener above answers.
+        mine.pin_host("localhost", std::net::Ipv4Addr::LOCALHOST.into());
         let mut now = NOW;
         let mut gossiped = mine.tick(&hub, Some(&identity), now);
         for _ in 0..100 {
@@ -3096,7 +3124,7 @@ mod tests {
         Ok(())
     }
 
-    /// R-P3 of sweep 4: an offer naming a host name is in no group every relay agrees on (each
+    /// An offer naming a host name is in no group every relay agrees on (each
     /// resolver may answer it differently), so it is not taken: never queued for a dial.
     #[test]
     fn an_offer_naming_a_host_name_is_not_taken() -> Result {
@@ -3112,7 +3140,7 @@ mod tests {
         Ok(())
     }
 
-    /// Sweep 3, N13: a peer re-signing an offer that says nothing new is taken at most once per
+    /// A peer re-signing an offer that says nothing new is taken at most once per
     /// `RESIGNED_AT_MOST_EVERY_MS` by the signed times, never gossiped sooner; and one taken is
     /// swapped in place, so it moves no ranking, version or tier a reader follows.
     #[test]

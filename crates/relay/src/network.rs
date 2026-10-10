@@ -19,7 +19,7 @@
 //! - `mlat_host`: the MLAT this relay runs for its areas (one program).
 //! - `peers`: the sessions it dials to sharing members and to the relays its MLAT takes raw from.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -90,6 +90,14 @@ pub enum AskerRole {
     Probe,
 }
 
+/// A member session's admission (`Network::admit_member`): its reservation from the members'
+/// pool and its part of the products' records, held together for as long as it is a member.
+#[must_use = "the member's place is given up as soon as it is dropped"]
+pub struct Membership {
+    _records: crate::products::RecordsPart,
+    _reservation: crate::budget::Reservation,
+}
+
 /// Every RFC-0174 duty of one relay.
 pub struct Network {
     identity: OnceLock<Identity>,
@@ -100,7 +108,7 @@ pub struct Network {
     pub sharing: Sharing,
     pub credit: Credit,
     pub products: Arc<Products>,
-    pub standing: Standing,
+    pub standing: Arc<Standing>,
     pub peers: Peers,
     mlat: OnceLock<Arc<dyn MlatHost>>,
     /// The areas last handed the hosted MLAT, and the generation of the choice they came from.
@@ -112,6 +120,15 @@ pub struct Network {
     /// taken: a relay link carries only the directory).
     shared_in: AtomicU64,
     data_on_directory_links: AtomicU64,
+    /// Overload cuts (`mlat_host::Cut`) this relay sent a relay holding its areas (one count a
+    /// relay it addressed), took from one, and refused (not signed by the relay that sent it, or
+    /// from one holding none of this relay's areas).
+    cuts_sent: AtomicU64,
+    cuts_received: AtomicU64,
+    cuts_refused: AtomicU64,
+    /// The areas each relay that signed a cut solves, as the directory named them when last asked
+    /// (`Network::solved_by`), so a flood of cuts costs one choice per relay and directory.
+    cut_signers: Mutex<HashMap<PublicKey, (crate::directory::Version, Regions)>>,
     /// Dials this relay's own links have started (`link::Redial`): upstreams, members, raw.
     dials: Arc<AtomicU64>,
 }
@@ -133,7 +150,7 @@ impl Network {
             sharing: Sharing::new(),
             credit: Credit::new(),
             products: Arc::new(Products::new()),
-            standing: Standing::new(),
+            standing: Arc::new(Standing::new()),
             peers: Peers::new(),
             mlat: OnceLock::new(),
             mlat_areas: Mutex::new((0, Regions::default())),
@@ -141,6 +158,10 @@ impl Network {
             models: Mutex::new(std::collections::VecDeque::new()),
             shared_in: AtomicU64::new(0),
             data_on_directory_links: AtomicU64::new(0),
+            cuts_sent: AtomicU64::new(0),
+            cuts_received: AtomicU64::new(0),
+            cuts_refused: AtomicU64::new(0),
+            cut_signers: Mutex::new(HashMap::new()),
             dials: Arc::new(AtomicU64::new(0)),
         }
     }
@@ -161,6 +182,15 @@ impl Network {
     /// Group records members have sent this relay.
     pub fn shared_in(&self) -> u64 {
         self.shared_in.load(Ordering::Relaxed)
+    }
+
+    /// The overload cuts sent, taken and refused (`Network::publish_cuts`, `Network::take_cut`).
+    pub fn cuts(&self) -> (u64, u64, u64) {
+        (
+            self.cuts_sent.load(Ordering::Relaxed),
+            self.cuts_received.load(Ordering::Relaxed),
+            self.cuts_refused.load(Ordering::Relaxed),
+        )
     }
 
     /// The count of dials this relay's own links have started, shared with each dial loop.
@@ -191,9 +221,13 @@ impl Network {
 
     /// The MLAT this relay runs (one program); none when its MLAT duty is off.
     pub fn host_mlat(&self, host: Arc<dyn MlatHost>) {
-        // Standing reads the engine's raw: one store of raw per relay (RFC-0181 §5).
+        // Standing reads the engine's raw: one store of raw per relay (RFC-0181 §5), and runs on
+        // its threads (`Standing::start`).
         if let Some(sealed) = host.sealed_bins() {
             self.standing.read_bins(sealed);
+            if let Err(error) = Standing::start(&self.standing, host.gate()) {
+                eprintln!("tally-relay: {error}");
+            }
         }
         let _ = self.mlat.set(host);
     }
@@ -315,8 +349,113 @@ impl Network {
                 }
                 Vec::new()
             }
+            Record::MlatCut(cut) => {
+                self.take_cut(asker, &cut, now_ms);
+                Vec::new()
+            }
             Record::EchoReply(_) => Vec::new(),
             _ => Vec::new(),
+        }
+    }
+
+    /// Publishes the overload cuts the hosted MLAT decided (`MlatHost::take_cuts`), each signed by
+    /// this relay and addressed, down the member links `carry` keeps, to every relay holding an
+    /// area it solves (`Selection::raw_sources`: the relays offering the area's raw), which offer it
+    /// to their hosts (`Network::take_cut`) to apply at the same stamped step. A cut is a few
+    /// hundred bytes; a standing one is announced again every `CUT_REFRESH_STEPS`, so a relay that
+    /// was down, or started late, learns it at the next, and a cut not announced again expires
+    /// (`mlat_host::CUT_TTL_MS`). One that reaches a relay after its step is that relay's
+    /// `cuts_late`, counted and never silent.
+    pub fn publish_cuts(&self, cuts: Vec<crate::mlat_host::Cut>, now_ms: u64) {
+        if cuts.is_empty() {
+            return;
+        }
+        let Some(identity) = self.identity() else {
+            return;
+        };
+        let sources = self.selection.raw_sources(&self.directory, now_ms);
+        for cut in cuts {
+            let content = tally_wire::MlatCutContent {
+                from_ms: cut.from_ms,
+                below: cut.below,
+                areas: cut.areas,
+            };
+            let Ok(signed) = tally_wire::MlatCut::sign(identity, &content) else {
+                continue;
+            };
+            let mut reached = HashSet::new();
+            for source in &sources {
+                if reached.insert(source.relay.key)
+                    && self
+                        .sharing
+                        .address(source.relay.key, Record::MlatCut(signed.clone()))
+                {
+                    self.cuts_sent.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+    }
+
+    /// The areas `relay` solves by its verified offers (`selection::areas_solved_by`), as the
+    /// directory holds them now: remembered per relay for as long as the directory's offers stay
+    /// as they were.
+    fn solved_by(&self, relay: &PublicKey, now_ms: u64) -> Regions {
+        const REMEMBERED: usize = 128;
+        let version = self.directory.version(now_ms);
+        if let Some(regions) = self.cut_signers.lock().ok().and_then(|held| {
+            held.get(relay)
+                .filter(|(held, _)| *held == version)
+                .map(|(_, regions)| regions.clone())
+        }) {
+            return regions;
+        }
+        let regions = crate::selection::areas_solved_by(&self.directory, relay, now_ms);
+        if let Ok(mut held) = self.cut_signers.lock() {
+            if held.len() >= REMEMBERED {
+                held.clear();
+            }
+            held.insert(*relay, (version, regions.clone()));
+        }
+        regions
+    }
+
+    /// An overload cut `asker`, a relay this one verified, sent: taken by the hosted MLAT for the
+    /// areas of it that `asker` solves, the first `MLAT_RELAYS_PER_AREA` of the offers covering
+    /// each (`selection::mlat_relays`), when it is signed by the relay that sent it; else refused
+    /// and counted. A cut is keyed by area and only the relays that solve an area may cut it: a
+    /// relay that merely offers raw, or holds nothing of the area, cannot cut its solving, and one
+    /// of the area's relays cannot cut an area it does not solve.
+    fn take_cut(&self, asker: &Asker, cut: &tally_wire::MlatCut, now_ms: u64) {
+        let Some(mlat) = self.mlat() else {
+            return;
+        };
+        let heard = asker.role == AskerRole::Relay
+            && cut.verify().is_ok()
+            && cut.signer().is_ok_and(|signer| signer == asker.key);
+        let content = cut.content().ok().filter(|_| heard);
+        let taken = content.and_then(|content| {
+            let held = self.solved_by(&asker.key, now_ms);
+            let areas: Vec<Region> = content
+                .areas
+                .iter()
+                .copied()
+                .filter(|area| held.contains(*area))
+                .collect();
+            (!areas.is_empty()).then_some(crate::mlat_host::Cut {
+                from_ms: content.from_ms,
+                origin: asker.key,
+                below: content.below,
+                areas,
+            })
+        });
+        match taken {
+            Some(cut) => {
+                self.cuts_received.fetch_add(1, Ordering::Relaxed);
+                mlat.offer_cut(cut);
+            }
+            None => {
+                self.cuts_refused.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 
@@ -360,21 +499,31 @@ impl Network {
         self.standing.model(record, now_ms);
     }
 
-    /// A session opened, as `asker`: one that may hand the products records (a relay's, an
-    /// engine's) has a part of the peers' share of them from now until it leaves
-    /// (`products::Products::joined`). Called once for every session, as it starts.
+    /// A session opened, as `asker`. Called once for every session, as it starts. It is given
+    /// no part of the products' records by opening: only a member's admission gives one
+    /// ([`Network::admit_member`]).
     pub fn joined(&self, asker: &Asker) {
-        if matches!(asker.role, AskerRole::Relay | AskerRole::Engine) {
-            self.products.joined(asker.source);
+        let _ = asker;
+    }
+
+    /// The session `source`, a relay's, is admitted as a member with `membership`, its
+    /// reservation from the members' pool (`budget::Budget::reserve_member`): from now until the
+    /// [`Membership`] returned is dropped it holds that reservation and a part of the peers'
+    /// share of the products' records (`products::Products::member`), the two as one, so the
+    /// sessions with a part are bounded as the members are, and no directory link, engine or
+    /// other session that is no member divides a member's part.
+    pub fn admit_member(&self, source: u64, membership: crate::budget::Reservation) -> Membership {
+        Membership {
+            _records: self.products.member(source),
+            _reservation: membership,
         }
     }
 
     /// The session `source` closed: whatever it was given ends with it (a client's credit, its
-    /// free-tier place, its part of the products' records). Called once for every session, as it
-    /// ends, whichever side dialled.
+    /// free-tier place). A member's part of the products' records ends with its [`Membership`].
+    /// Called once for every session, as it ends, whichever side dialled.
     pub fn left(&self, source: u64) {
         self.credit.left(source);
-        self.products.left(source);
     }
 
     /// A record this relay is the first relay to hold (its own feeder's batch, an engine's or its
@@ -564,6 +713,7 @@ impl Network {
                 self.standing.set_areas(&areas);
                 mlat.set_areas(areas, hub.descriptions());
             }
+            self.publish_cuts(mlat.take_cuts(), now_ms);
             let published = mlat.take_published(self.products.watermark_ms());
             // A model's parts come before its manifest; held first, they place it.
             for record in &published {
@@ -623,30 +773,63 @@ impl Network {
     }
 }
 
-/// Runs the timed duties for as long as the relay runs: every `TICK`, what they publish goes into
-/// the hub's fan-out as the relay's own, and what they address to other relays goes to them.
-pub async fn run(hub: Arc<Hub>) {
-    let mut tick = tokio::time::interval(TICK);
-    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut raw_ms = 0;
-    loop {
-        tick.tick().await;
-        hub.idle();
-        let now_ms = wall_ms();
-        for record in hub.network().tick(&hub, now_ms) {
-            hub.publish_own(record);
-        }
-        // Positions held for their models past the wait go out even with nothing new coming.
-        hub.release_awaiting();
-        for (source, regional) in hub.network().products.take_forward() {
-            hub.publish_as(source, Record::RegionalBatch(regional));
-        }
-        let raw_due = now_ms.saturating_sub(raw_ms) >= crate::peers::RAW_EVERY_MS;
-        if raw_due {
-            raw_ms = now_ms;
-        }
-        hub.network().carry(&hub, now_ms, raw_due);
+/// Starts the timed duties on a thread of their own ("tally-duties"), for as long as the runtime
+/// that started them runs: every `TICK` after the last pass ended, what they publish goes into the
+/// hub's fan-out as the relay's own, and what they address to other relays goes to them (a link
+/// they open is spawned on that runtime, `runtime`).
+///
+/// Never on the async runtime's workers. A pass is synchronous work whose size follows what the
+/// relay holds and was handed (a window step's positions and models published at once, the
+/// sharing groups' manifests and parity, the directory), and a runtime worker held by it holds
+/// every task woken from it there with it: a pass that took ten seconds on a runtime worker held
+/// the subscribers' writers and feeders' readers it woke for those ten seconds, and raw's p99 went
+/// to seconds while the stages idled. The runtime does I/O only, as the ingest workers'
+/// and message threads' own threads already keep it (`ingest`).
+///
+/// The thread ends when the runtime does (the task holding its lifeline is dropped with it), so a
+/// relay a test runs and drops leaves no duties behind.
+pub fn start(hub: Arc<Hub>, runtime: tokio::runtime::Handle) {
+    let (lifeline, alive) = std::sync::mpsc::channel::<()>();
+    runtime.spawn(async move {
+        let _lifeline = lifeline;
+        std::future::pending::<()>().await
+    });
+    let spawned = std::thread::Builder::new()
+        .name("tally-duties".to_owned())
+        .spawn(move || {
+            let _runtime = runtime.enter();
+            let mut raw_ms = 0;
+            loop {
+                match alive.recv_timeout(TICK) {
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                    Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+                }
+                pass(&hub, &mut raw_ms);
+            }
+        });
+    if let Err(error) = spawned {
+        // The relay cannot run without its duties (its products would never be published).
+        panic!("tally-relay: the timed duties did not start: {error}");
     }
+}
+
+/// One pass of the timed duties (`start`).
+fn pass(hub: &Arc<Hub>, raw_ms: &mut u64) {
+    hub.idle();
+    let now_ms = wall_ms();
+    for record in hub.network().tick(hub, now_ms) {
+        hub.publish_own(record);
+    }
+    // Positions held for their models past the wait go out even with nothing new coming.
+    hub.release_awaiting();
+    for (source, regional) in hub.network().products.take_forward() {
+        hub.publish_as(source, Record::RegionalBatch(regional));
+    }
+    let raw_due = now_ms.saturating_sub(*raw_ms) >= crate::peers::RAW_EVERY_MS;
+    if raw_due {
+        *raw_ms = now_ms;
+    }
+    hub.network().carry(hub, now_ms, raw_due);
 }
 
 /// The finest cells a positions record or a clock model places aircraft at, for routing by
@@ -703,6 +886,76 @@ pub fn wall_ms() -> u64 {
 mod tests {
     use super::*;
     use tally_mlat_solver::geo::{self, Geodetic};
+
+    /// A hosted MLAT whose every ask takes `pass_ms`: a pass of the duties as long as one that
+    /// publishes a window step's solutions.
+    struct Slow {
+        pass_ms: u64,
+        asked: AtomicU64,
+    }
+
+    impl MlatHost for Slow {
+        fn set_areas(&self, _: Regions, _: Vec<tally_wire::ReceiverInfo>) {}
+
+        fn offer_description(&self, _: &tally_wire::ReceiverInfo, _: u64) {}
+
+        fn offer_batch(&self, _: &Arc<tally_wire::Decoded>, _: u64) {}
+
+        fn take_published(&self, _: u64) -> Vec<Record> {
+            self.asked.fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(self.pass_ms));
+            Vec::new()
+        }
+
+        fn cores(&self) -> u16 {
+            1
+        }
+
+        fn report(&self) -> crate::mlat_host::MlatReport {
+            crate::mlat_host::MlatReport::default()
+        }
+
+        fn sealed_bins(&self) -> Option<tally_mlat_solver::held::SealedBins> {
+            None
+        }
+    }
+
+    /// A pass of the timed duties, however long, holds no task of the async runtime. Before,
+    /// the duties ran as a runtime task, and a pass that published a window step's solutions held its
+    /// worker ten seconds with every task woken there: raw's p99 went to seconds. Here the runtime
+    /// has one thread, and a task on it keeps its 10 ms beat through passes of a second each.
+    #[test]
+    fn a_long_pass_of_the_duties_holds_no_task_of_the_runtime() -> Result<(), String> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| error.to_string())?;
+        let hub = Arc::new(Hub::new(8));
+        let slow = Arc::new(Slow {
+            pass_ms: 1_000,
+            asked: AtomicU64::new(0),
+        });
+        hub.network()
+            .host_mlat(Arc::clone(&slow) as Arc<dyn MlatHost>);
+        let longest = runtime.block_on(async {
+            start(Arc::clone(&hub), tokio::runtime::Handle::current());
+            let started = std::time::Instant::now();
+            let mut last = std::time::Instant::now();
+            let mut longest = Duration::ZERO;
+            while started.elapsed() < Duration::from_millis(2_500) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                longest = longest.max(last.elapsed());
+                last = std::time::Instant::now();
+            }
+            longest
+        });
+        assert!(slow.asked.load(Ordering::SeqCst) >= 1, "no pass ran");
+        assert!(
+            longest < Duration::from_millis(500),
+            "a runtime task waited {longest:?} behind a pass"
+        );
+        Ok(())
+    }
     use tally_mlat_solver::tile::{LEVELS, Tile};
     use tally_wire::rendezvous::area_of_cell;
 
@@ -733,6 +986,178 @@ mod tests {
             }
         }
         assert!(checked > 1_000);
+        Ok(())
+    }
+
+    /// Takes every cut offered, as a hosted MLAT would.
+    #[derive(Default)]
+    struct Recording {
+        cuts: Mutex<Vec<crate::mlat_host::Cut>>,
+    }
+
+    impl MlatHost for Recording {
+        fn set_areas(&self, _: Regions, _: Vec<tally_wire::ReceiverInfo>) {}
+
+        fn offer_description(&self, _: &tally_wire::ReceiverInfo, _: u64) {}
+
+        fn offer_batch(&self, _: &Arc<tally_wire::Decoded>, _: u64) {}
+
+        fn take_published(&self, _: u64) -> Vec<Record> {
+            Vec::new()
+        }
+
+        fn cores(&self) -> u16 {
+            1
+        }
+
+        fn report(&self) -> crate::mlat_host::MlatReport {
+            crate::mlat_host::MlatReport::default()
+        }
+
+        fn sealed_bins(&self) -> Option<tally_mlat_solver::held::SealedBins> {
+            None
+        }
+
+        fn offer_cut(&self, cut: crate::mlat_host::Cut) {
+            if let Ok(mut cuts) = self.cuts.lock() {
+                cuts.push(cut);
+            }
+        }
+    }
+
+    /// RFC-0181 §10: a cut is keyed by area, and only an area's own MLAT relays (the first
+    /// `MLAT_RELAYS_PER_AREA` of the offers covering it) may cut it, and only for the areas they
+    /// solve. A relay that offers the area's raw but ranks outside them, a cut signed by another
+    /// key than the sender's, and a cut naming an area its signer does not solve change nothing,
+    /// where before a cut was accepted from any relay linked for any of the host's areas and
+    /// applied to all of them.
+    #[test]
+    fn only_an_areas_own_mlat_relays_may_cut_it_and_only_that_area() -> Result<(), String> {
+        use crate::directory::Group;
+        use tally_wire::{ProviderOffer, ProviderOfferContent, Streams};
+        let text = |error: &dyn std::fmt::Display| error.to_string();
+        let here = tally_wire::rendezvous::area_at(51.5, -0.1).map_err(|e| text(&e))?;
+        let elsewhere = tally_wire::rendezvous::area_at(48.8, 2.3).map_err(|e| text(&e))?;
+        let hub = Hub::new(8);
+        let network = hub.network();
+        let me = Identity::from_seed([60; 32]);
+        network.adopt_identity(me.clone());
+        network.directory.adopt_own_key(me.public());
+        let recording = Arc::new(Recording::default());
+        network.host_mlat(Arc::clone(&recording) as Arc<dyn MlatHost>);
+        let now = wall_ms();
+        let strong: Vec<Identity> = (0..5u8)
+            .map(|n| Identity::from_seed([70 + n; 32]))
+            .collect();
+        let hostile = Identity::from_seed([80; 32]);
+        let offer = |relay: &Identity, cell: Region, cores: u16, group: u32| {
+            ProviderOffer::sign(
+                relay,
+                &ProviderOfferContent {
+                    address: format!("{}:7450", relay.public().to_base64url()),
+                    cell,
+                    products: Streams::RAW,
+                    stripes_of: 1,
+                    stripes: 1,
+                    mlat_cores: cores,
+                    feeder_slots: 10,
+                    network: group,
+                    issued_ms: now,
+                    expires_ms: now + 600_000,
+                },
+            )
+            .map_err(|e| text(&e))
+        };
+        for (group, relay) in strong.iter().enumerate() {
+            network
+                .directory
+                .hold_verified(
+                    offer(relay, here, 64, 1 + group as u32)?,
+                    Group::V4(group as u16),
+                    now,
+                )
+                .map_err(|e| text(&e))?;
+        }
+        // The hostile relay offers the same raw, with one core to its name.
+        network
+            .directory
+            .hold_verified(offer(&hostile, here, 1, 99)?, Group::V4(99), now)
+            .map_err(|e| text(&e))?;
+        let solvers = crate::selection::mlat_relays(here, &network.directory, now);
+        assert_eq!(solvers.len(), tally_wire::rendezvous::MLAT_RELAYS_PER_AREA);
+        assert!(!solvers.contains(&hostile.public()), "{solvers:?}");
+        let legit = strong
+            .iter()
+            .find(|relay| solvers.contains(&relay.public()))
+            .ok_or("no solver")?;
+        // Elsewhere, every strong relay but the one chosen above offers, and the hostile one.
+        for (group, relay) in strong.iter().enumerate() {
+            if relay.public() != legit.public() {
+                network
+                    .directory
+                    .hold_verified(
+                        offer(relay, elsewhere, 64, 1 + group as u32)?,
+                        Group::V4(group as u16),
+                        now,
+                    )
+                    .map_err(|e| text(&e))?;
+            }
+        }
+        network
+            .directory
+            .hold_verified(offer(&hostile, elsewhere, 1, 99)?, Group::V4(99), now)
+            .map_err(|e| text(&e))?;
+        let solved_elsewhere = crate::selection::mlat_relays(elsewhere, &network.directory, now);
+        assert!(
+            !solved_elsewhere.contains(&legit.public()),
+            "{solved_elsewhere:?}"
+        );
+        let asker = |relay: &Identity| Asker {
+            role: AskerRole::Relay,
+            key: relay.public(),
+            source: 5,
+            loopback: true,
+            address: None,
+        };
+        let send =
+            |signer: &Identity, sender: &Identity, areas: Vec<Region>| -> Result<(), String> {
+                let signed = tally_wire::MlatCut::sign(
+                    signer,
+                    &tally_wire::MlatCutContent {
+                        from_ms: 10_000,
+                        below: 7,
+                        areas,
+                    },
+                )
+                .map_err(|e| text(&e))?;
+                network.handle(&hub, &asker(sender), Record::MlatCut(signed), now, None);
+                Ok(())
+            };
+        let taken = || {
+            recording
+                .cuts
+                .lock()
+                .map(|cuts| cuts.clone())
+                .unwrap_or_default()
+        };
+        // An out-ranked relay that offers the raw cannot cut the area, nor a solver cut an area
+        // it does not solve, nor one key sign for another.
+        send(&hostile, &hostile, vec![here])?;
+        send(legit, legit, vec![elsewhere])?;
+        send(&hostile, legit, vec![here])?;
+        assert!(taken().is_empty(), "{:?}", taken());
+        assert_eq!(network.cuts(), (0, 0, 3));
+        // An area's own relay cuts it, and of a cut naming two areas only the one it solves.
+        send(legit, legit, vec![here])?;
+        let mut both = vec![here, elsewhere];
+        both.sort_by_key(|area| area.as_u64());
+        send(legit, legit, both)?;
+        let cuts = taken();
+        assert_eq!(cuts.len(), 2, "{cuts:?}");
+        assert_eq!(cuts[0].areas, vec![here]);
+        assert_eq!(cuts[1].origin, legit.public());
+        assert_eq!(cuts[1].areas, vec![here], "an area it does not solve");
+        assert_eq!(network.cuts(), (0, 2, 3));
         Ok(())
     }
 }

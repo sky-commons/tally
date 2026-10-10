@@ -5,7 +5,6 @@
 //! held in the relay's fan-out.
 
 use std::collections::{HashMap, HashSet};
-use std::hash::{Hash as _, Hasher as _};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex};
@@ -73,33 +72,163 @@ counts!(
 );
 
 /// Each distinct message (by its format and bytes) the client read this window, in the raw stream
-/// and in the deduplicated one: every message heard raw is in the deduplicated stream at least once
-/// a few seconds when the relay loses nothing (its rule keeps a message at least once every
-/// `DEDUP_GENERATIONS` seconds), so one heard raw and never deduplicated is a message the relay lost.
+/// and in the deduplicated one, each with when (Unix ms, the client's clock) it was first read.
+///
+/// The relay keeps every message at least once every `DEDUP_GENERATIONS` seconds, so a message
+/// read raw and never in the deduplicated stream is one the relay lost, but only a message the
+/// stream has had the time to carry can be judged. The deduplicated stream is behind the raw one by
+/// an epoch and its latency, and a client that has fallen behind reads raw batches long after the
+/// relay stamped them. So a message is judged by its own arrival, never by the window's end
+/// (`Heard::coverage`): one read raw in the last `EPOCH_MS` plus the deduplicated stream's longest
+/// latency before a session's end (or the moment of asking), or soon after a session began (the
+/// copy kept may have been sent before it), is not yet a loss and is counted apart as `unjudged`.
+/// The deduplicated ids are kept `LOOKBACK_MS` before the window, since a copy of a message that a
+/// slow raw reader reads late was kept, and sent, earlier.
 #[derive(Default)]
 pub struct Heard {
-    /// Bumped when a window begins: a decoder's own messages of an older window are let go.
-    pub window: AtomicU64,
-    pub raw: Mutex<HashSet<u64>>,
-    pub dedup: Mutex<HashSet<u64>>,
+    /// When the window began (Unix ms): raw read before it is let go.
+    pub since_ms: AtomicU64,
+    pub raw: Mutex<Ids>,
+    pub dedup: Mutex<Ids>,
+    /// Each session of the window: when it began and, once it has, when it ended.
+    pub sessions: Mutex<Vec<(u64, Option<u64>)>>,
+}
+
+/// Message identities, which are hashes already, with when each was first read: kept as they are,
+/// not hashed again.
+pub type Ids = HashMap<u64, u64, std::hash::BuildHasherDefault<Passthrough>>;
+
+/// How long before a window the deduplicated stream's messages are kept.
+const LOOKBACK_MS: u64 = 120_000;
+
+/// The window's coverage of the raw stream by the deduplicated one.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Coverage {
+    /// Messages read raw this window that the deduplicated stream had the time to carry.
+    pub judged: usize,
+    /// Of them, those never in the deduplicated stream: what the relay lost.
+    pub missing: usize,
+    /// Messages read raw this window that cannot be judged yet (see `Heard`).
+    pub unjudged: usize,
+}
+
+/// A hasher for keys that are already hashes (`message_id`).
+#[derive(Default)]
+pub struct Passthrough(u64);
+
+impl std::hash::Hasher for Passthrough {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            self.0 = self.0.rotate_left(8) ^ u64::from(*byte);
+        }
+    }
+
+    fn write_u64(&mut self, value: u64) {
+        self.0 = value;
+    }
+}
+
+/// Folds `from` into `into`, keeping each message's first reading.
+fn absorb(into: &mut Ids, from: &mut Ids) {
+    for (id, at) in from.drain() {
+        into.entry(id)
+            .and_modify(|first| *first = (*first).min(at))
+            .or_insert(at);
+    }
 }
 
 impl Heard {
-    /// (Messages heard raw this window, of them never in the deduplicated stream.)
-    pub fn coverage(&self) -> (usize, usize) {
-        let (Ok(raw), Ok(dedup)) = (self.raw.lock(), self.dedup.lock()) else {
-            return (0, 0);
+    /// Begins a window at `now` (Unix ms).
+    pub fn begin(&self, now: u64) {
+        self.since_ms.store(now, Ordering::SeqCst);
+        if let Ok(mut raw) = self.raw.lock() {
+            raw.clear();
+        }
+        if let Ok(mut dedup) = self.dedup.lock() {
+            dedup.retain(|_, at| *at + LOOKBACK_MS >= now);
+        }
+        if let Ok(mut sessions) = self.sessions.lock() {
+            sessions.retain(|(_, end)| end.is_none());
+        }
+    }
+
+    /// A session began at `now`.
+    pub fn connected(&self, now: u64) {
+        if let Ok(mut sessions) = self.sessions.lock() {
+            sessions.push((now, None));
+        }
+    }
+
+    /// The session that was open ended at `now`.
+    pub fn disconnected(&self, now: u64) {
+        if let Ok(mut sessions) = self.sessions.lock()
+            && let Some(open) = sessions.iter_mut().rev().find(|(_, end)| end.is_none())
+        {
+            open.1 = Some(now);
+        }
+    }
+
+    /// Hands over what a decoder heard: raw read before the window is let go.
+    fn hand_over(&self, raw: &mut Ids, dedup: &mut Ids) {
+        let since = self.since_ms.load(Ordering::SeqCst);
+        raw.retain(|_, at| *at >= since);
+        if let Ok(mut held) = self.raw.lock() {
+            absorb(&mut held, raw);
+        }
+        if let Ok(mut held) = self.dedup.lock() {
+            absorb(&mut held, dedup);
+        }
+        raw.clear();
+        dedup.clear();
+    }
+
+    /// The window's coverage at `now` (Unix ms). `latency_ms` is the longest the deduplicated
+    /// stream took this window (an epoch's end to its reading).
+    pub fn coverage(&self, now: u64, latency_ms: u64) -> Coverage {
+        let (Ok(raw), Ok(dedup), Ok(sessions)) =
+            (self.raw.lock(), self.dedup.lock(), self.sessions.lock())
+        else {
+            return Coverage::default();
         };
-        (raw.len(), raw.difference(&dedup).count())
+        // A message is kept by the epoch of its first copy, up to the dedup window before the copy
+        // read raw, so one read this soon after a session began may have been kept, and sent,
+        // before the session was.
+        let begins = tally_relay::exchange::DEDUP_WINDOW_MS + tally_relay::seal::EPOCH_MS;
+        let settle = tally_relay::seal::EPOCH_MS + latency_ms;
+        let mut coverage = Coverage::default();
+        for (id, at) in raw.iter() {
+            let judged = sessions.iter().any(|(began, ended)| {
+                *at >= *began + begins && *at + settle <= ended.unwrap_or(now)
+            });
+            if judged {
+                coverage.judged += 1;
+                coverage.missing += usize::from(!dedup.contains_key(id));
+            } else {
+                coverage.unjudged += 1;
+            }
+        }
+        coverage
     }
 }
 
 /// A message's identity for `Heard`: its format and bytes, hashed.
+///
+/// Twelve million of these a second are made at the run's full rate, so it is a multiply and a
+/// fold a word, not SipHash.
 fn message_id(format: u8, data: &[u8]) -> u64 {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    format.hash(&mut hasher);
-    data.hash(&mut hasher);
-    hasher.finish()
+    let mut hash = 0x9e37_79b9_7f4a_7c15 ^ u64::from(format) ^ ((data.len() as u64) << 8);
+    for chunk in data.chunks(8) {
+        let mut word = [0u8; 8];
+        word[..chunk.len()].copy_from_slice(chunk);
+        hash = (hash ^ u64::from_le_bytes(word)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        hash ^= hash >> 31;
+    }
+    hash = (hash ^ (hash >> 30)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    hash ^ (hash >> 27)
 }
 
 /// How many batches a decoder reads before it hands its messages to `Heard`.
@@ -111,6 +240,9 @@ pub struct Client {
     pub heard: Heard,
     pub counts: Counts,
     pub raw_latency: Mutex<Histogram>,
+    /// The most a raw batch took since the progress line last read it (`lib::progress`): when in
+    /// the run raw was slow, which the window's histogram does not say.
+    pub raw_max_since_ms: AtomicU64,
     pub dedup_latency: Mutex<Histogram>,
     /// Each provisional solution's transmission to its reading: RFC-0174 §2.4's fast MLAT.
     pub provisional_latency: Mutex<Histogram>,
@@ -179,17 +311,12 @@ impl Client {
         if let Ok(mut receivers) = self.receivers.lock() {
             receivers.clear();
         }
-        self.heard.window.fetch_add(1, Ordering::SeqCst);
-        if let Ok(mut raw) = self.heard.raw.lock() {
-            raw.clear();
-        }
-        if let Ok(mut dedup) = self.heard.dedup.lock() {
-            dedup.clear();
-        }
+        self.heard.begin(wall_ms());
     }
 
     fn ended(&self, why: String) {
         self.connected.store(false, Ordering::Relaxed);
+        self.heard.disconnected(wall_ms());
         self.counts.disconnects.fetch_add(1, Ordering::Relaxed);
         if let Ok(mut endings) = self.endings.lock() {
             *endings.entry(why).or_default() += 1;
@@ -202,19 +329,52 @@ enum Work {
     Dedup(Batch, u64),
 }
 
-/// Reads `relay` for as long as the harness runs, reconnecting a second after a session ends.
-pub async fn run(
+/// Starts the client on a thread and runtime of its own: its session is one task that has to read
+/// a socket carrying the whole run's raw stream, and on the feeders' runtime, saturated by
+/// thousands of tasks, it waits its turn behind them and the relay drops it as too slow
+/// (`goodbye FellBehind`). A thread of its own gets the share of a core the scheduler gives any.
+pub fn start(
     relay: RelayAddress,
     streams: Streams,
     verify: bool,
     threads: usize,
+    sample: u32,
+    client: Arc<Client>,
+) {
+    let spawned = std::thread::Builder::new()
+        .name("tally-load-client".to_owned())
+        .spawn(move || {
+            match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => {
+                    runtime.block_on(run(relay, streams, verify, threads, sample, client));
+                }
+                Err(error) => eprintln!("tally-load: client runtime: {error}"),
+            }
+        });
+    if let Err(error) = spawned {
+        eprintln!("tally-load: client thread: {error}");
+    }
+}
+
+/// Reads `relay` for as long as the harness runs, reconnecting a second after a session ends.
+async fn run(
+    relay: RelayAddress,
+    streams: Streams,
+    verify: bool,
+    threads: usize,
+    sample: u32,
     client: Arc<Client>,
 ) {
     let workers: Vec<SyncSender<Work>> = (0..threads.max(1))
         .map(|_| {
             let (send, receive) = sync_channel(WAITING);
             let client = Arc::clone(&client);
-            std::thread::spawn(move || decode(&receive, verify, &client));
+            let _ = std::thread::Builder::new()
+                .name("tally-load-decode".to_owned())
+                .spawn(move || decode(&receive, verify, &client));
             send
         })
         .collect();
@@ -229,6 +389,8 @@ pub async fn run(
         workers,
         next: 0,
         newest: HashMap::new(),
+        sample: u64::from(sample.max(1)),
+        seen: 0,
     };
     loop {
         let why = session(&relay, &identity, streams, &client, &mut reading).await;
@@ -242,9 +404,19 @@ struct Reading {
     next: usize,
     /// Each receiver stream's newest sequence (receiver, boot).
     newest: HashMap<(PublicKey, u64), u64>,
+    /// One raw batch in this many is decoded (`--client-sample`); the rest are counted and
+    /// followed by sequence.
+    sample: u64,
+    seen: u64,
 }
 
 impl Reading {
+    /// Whether the next raw batch is one to decode.
+    fn sampled(&mut self) -> bool {
+        self.seen += 1;
+        self.seen.is_multiple_of(self.sample)
+    }
+
     fn hand(&mut self, work: Work, client: &Client) {
         self.next = (self.next + 1) % self.workers.len();
         if let Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) =
@@ -308,6 +480,7 @@ async fn session(
         }
     });
     client.connected.store(true, Ordering::Relaxed);
+    client.heard.connected(wall_ms());
     client.counts.sessions.fetch_add(1, Ordering::Relaxed);
     let mut got = Vec::new();
     let why = loop {
@@ -331,7 +504,14 @@ async fn session(
                             receivers.insert(receiver);
                         }
                     }
-                    reading.hand(Work::Raw(batch, now), client);
+                    if reading.sampled() {
+                        reading.hand(Work::Raw(batch, now), client);
+                    } else if let Ok(receptions) = batch.receptions() {
+                        // Not decoded: counted from the batch's own count, and no more.
+                        counts
+                            .raw_receptions
+                            .fetch_add(receptions as u64, Ordering::Relaxed);
+                    }
                 }
                 Record::RelayBatch(batch) => {
                     let counts = &client.counts;
@@ -373,29 +553,13 @@ async fn session(
 
 fn decode(work: &std::sync::mpsc::Receiver<Work>, verify: bool, client: &Client) {
     let counts = &client.counts;
-    let (mut raw_heard, mut dedup_heard) = (HashSet::new(), HashSet::new());
-    let mut window = client.heard.window.load(Ordering::SeqCst);
+    let (mut raw_heard, mut dedup_heard) = (Ids::default(), Ids::default());
     let mut since = 0;
-    let hand_over =
-        |raw_heard: &mut HashSet<u64>, dedup_heard: &mut HashSet<u64>, window: &mut u64| {
-            let now = client.heard.window.load(Ordering::SeqCst);
-            if now == *window {
-                if let Ok(mut raw) = client.heard.raw.lock() {
-                    raw.extend(raw_heard.drain());
-                }
-                if let Ok(mut dedup) = client.heard.dedup.lock() {
-                    dedup.extend(dedup_heard.drain());
-                }
-            }
-            raw_heard.clear();
-            dedup_heard.clear();
-            *window = now;
-        };
     loop {
         let work = match work.recv_timeout(Duration::from_millis(500)) {
             Ok(work) => work,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                hand_over(&mut raw_heard, &mut dedup_heard, &mut window);
+                client.heard.hand_over(&mut raw_heard, &mut dedup_heard);
                 since = 0;
                 continue;
             }
@@ -403,7 +567,7 @@ fn decode(work: &std::sync::mpsc::Receiver<Work>, verify: bool, client: &Client)
         };
         since += 1;
         if since >= HEARD_EVERY {
-            hand_over(&mut raw_heard, &mut dedup_heard, &mut window);
+            client.heard.hand_over(&mut raw_heard, &mut dedup_heard);
             since = 0;
         }
         let (batch, received, raw) = match work {
@@ -431,7 +595,9 @@ fn decode(work: &std::sync::mpsc::Receiver<Work>, verify: bool, client: &Client)
             &mut dedup_heard
         };
         for observation in &content.observations {
-            heard.insert(message_id(observation.format, &observation.data));
+            heard
+                .entry(message_id(observation.format, &observation.data))
+                .or_insert(received);
         }
         let latency = received.saturating_sub(content.wall_ms);
         if raw {
@@ -444,6 +610,9 @@ fn decode(work: &std::sync::mpsc::Receiver<Work>, verify: bool, client: &Client)
             if let Ok(mut histogram) = client.raw_latency.lock() {
                 histogram.record(latency);
             }
+            client
+                .raw_max_since_ms
+                .fetch_max(latency, Ordering::Relaxed);
         } else {
             counts
                 .dedup_receptions
@@ -493,7 +662,67 @@ mod tests {
         })
     }
 
-    /// H-d: a provisional solution's latency is reported in its two halves, split at the stamp of
+    fn ids(entries: &[(u64, u64)]) -> Ids {
+        entries.iter().copied().collect()
+    }
+
+    /// A message read raw in the last moments of the window has not had the time to come back in
+    /// the deduplicated stream, and is not a loss; one read raw earlier and never deduplicated is.
+    /// Before, every message read raw was judged at the window's end, so the epoch the stream is
+    /// always behind by showed as 1.7 to 8 percent of the messages lost with nothing lost.
+    #[test]
+    fn coverage_judges_only_what_the_stream_had_time_to_carry() {
+        let heard = Heard::default();
+        heard.begin(0);
+        heard.connected(0);
+        // Read raw at 10 s, 20 s and 59.5 s; the first two were kept, only the first came back.
+        let mut raw = ids(&[(1, 10_000), (2, 20_000), (3, 59_500)]);
+        let mut dedup = ids(&[(1, 11_000)]);
+        heard.hand_over(&mut raw, &mut dedup);
+        let coverage = heard.coverage(60_000, 1_000);
+        assert_eq!(
+            coverage,
+            Coverage {
+                judged: 2,
+                missing: 1,
+                unjudged: 1
+            }
+        );
+    }
+
+    /// A message read before a session's deduplicated stream could carry it, or just before the
+    /// session ended, is not judged; the raw stream a client reads late is judged by its arrival,
+    /// against deduplicated messages read before the window.
+    #[test]
+    fn coverage_leaves_out_a_sessions_edges_and_counts_late_raw_against_early_dedup() {
+        let heard = Heard::default();
+        heard.connected(0);
+        heard.begin(100_000);
+        heard.disconnected(120_000);
+        heard.connected(130_000);
+        let mut raw = ids(&[
+            (1, 105_000),
+            (2, 119_500),
+            (3, 130_500),
+            (4, 140_000),
+            (5, 50_000),
+        ]);
+        // Message 1 was kept before the window began (a slow raw reader), 4 never was, 5 is raw of
+        // before the window.
+        let mut dedup = ids(&[(1, 99_000)]);
+        heard.hand_over(&mut raw, &mut dedup);
+        let coverage = heard.coverage(150_000, 1_000);
+        assert_eq!(
+            coverage,
+            Coverage {
+                judged: 2,
+                missing: 1,
+                unjudged: 2
+            }
+        );
+    }
+
+    /// A provisional solution's latency is reported in its two halves, split at the stamp of
     /// the relay's step that solved it, beside the whole; one dated after that stamp is counted.
     #[test]
     fn a_provisional_solution_is_timed_to_its_steps_stamp_and_from_it() -> Result<(), String> {

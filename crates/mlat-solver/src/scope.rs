@@ -245,6 +245,61 @@ pub struct WindowIndex<'a> {
     /// Per bin, per receiver index, its usable site (looked up once).
     usable: Vec<Vec<Option<[i64; 3]>>>,
     sync_aircraft_max: Option<usize>,
+    /// The sync candidates' messages some receiver heard more than once in the window
+    /// (`repeated`), by hash, ascending: found as the index is made, on the thread making it.
+    /// Never lazily, inside a pass: the first of a pass's workers to ask would find them while the
+    /// others waited on it holding their gate permits, and its own checkpoints could give its
+    /// permit to a provisional step and wait for one the waiting workers held, for ever (a relay's window steps stopped for good that way).
+    repeated: Vec<[u8; 32]>,
+}
+
+/// The hashes of the sync candidates of `bins` (ascending by bin) that one receiver heard more
+/// than once anywhere among them, ascending: within one bin (two records of it by one receiver)
+/// or across bins (one record in each). Such bytes are two transmissions, or more: an aircraft
+/// repeating a position message byte for byte (a stationary one does), or a recording replayed.
+/// Which reception is of which cannot be told from the bytes, so an event of them would mix
+/// receptions seconds apart; the window rejects the message whole. Judged over every
+/// receiver's records before any tile thins, so every tile and every engine rejects the same.
+/// Each bin's candidates ascend by hash, so the bins are merged in one pass with nothing held but
+/// one message's receivers at a time.
+fn repeated(bins: &[Arc<Bin>]) -> Vec<[u8; 32]> {
+    let mut at = vec![0usize; bins.len()];
+    let mut out = Vec::new();
+    let mut keys: Vec<PublicKey> = Vec::new();
+    loop {
+        crate::gate::checkpoint();
+        let hash_of = |bin: &Bin, index: usize| {
+            bin.candidates
+                .get(index)
+                .map(|candidate| bin.messages[candidate.message as usize].hash)
+        };
+        let Some(lowest) = bins
+            .iter()
+            .zip(&at)
+            .filter_map(|(bin, index)| hash_of(bin, *index))
+            .min()
+        else {
+            return out;
+        };
+        keys.clear();
+        for (bin, index) in bins.iter().zip(at.iter_mut()) {
+            if hash_of(bin, *index) == Some(lowest) {
+                let candidate = &bin.candidates[*index];
+                keys.extend(
+                    candidate.records.iter().map(|record| {
+                        bin.receivers[bin.records[*record as usize].receiver as usize]
+                    }),
+                );
+                *index += 1;
+            }
+        }
+        let heard = keys.len();
+        keys.sort_unstable();
+        keys.dedup();
+        if keys.len() < heard {
+            out.push(lowest);
+        }
+    }
 }
 
 impl<'a> WindowIndex<'a> {
@@ -294,6 +349,7 @@ impl<'a> WindowIndex<'a> {
                 .or_default()
                 .push(at);
         }
+        let repeated = repeated(&bins);
         Self {
             window,
             bins,
@@ -302,7 +358,14 @@ impl<'a> WindowIndex<'a> {
             grid,
             usable,
             sync_aircraft_max,
+            repeated,
         }
+    }
+
+    /// The sync messages some receiver heard more than once in the window (`repeated`), by hash,
+    /// ascending: no tile's inputs take them.
+    pub fn repeated(&self) -> &[[u8; 32]] {
+        &self.repeated
     }
 
     pub fn bins(&self) -> &[Arc<Bin>] {
@@ -396,11 +459,12 @@ impl<'a> WindowIndex<'a> {
         Self: Sync,
     {
         let addresses = self.addresses();
-        let threads = threads.clamp(1, addresses.len().max(1));
-        let split = |count: usize| count.div_ceil(threads).max(1);
-        // Each target's hearers and its tile at every level.
+        // Each target's hearers and its tile at every level, in pieces pulled by the threads.
         let candidates: Vec<Candidates> = crate::gate::on_threads(
-            addresses.chunks(split(addresses.len())).collect(),
+            threads,
+            addresses
+                .chunks(crate::gate::piece(addresses.len(), threads))
+                .collect(),
             |chunk: &[u32]| {
                 chunk
                     .iter()
@@ -428,7 +492,10 @@ impl<'a> WindowIndex<'a> {
             .into_iter()
             .collect();
         let members: BTreeMap<Tile, Vec<PublicKey>> = crate::gate::on_threads(
-            tiles.chunks(split(tiles.len())).collect(),
+            threads,
+            tiles
+                .chunks(crate::gate::piece(tiles.len(), threads))
+                .collect(),
             |chunk: &[Tile]| {
                 chunk
                     .iter()
@@ -541,6 +608,7 @@ impl<'a> WindowIndex<'a> {
             hash: [u8; 32],
         }
         let mut events: Vec<Event<'_>> = Vec::new();
+        let repeated = self.repeated();
         for bin in &self.bins {
             let locals: Vec<(usize, u32)> = members
                 .iter()
@@ -563,16 +631,18 @@ impl<'a> WindowIndex<'a> {
                 let Some(address) = message.address else {
                     continue;
                 };
+                // Bytes some receiver heard twice in the window are more than one transmission:
+                // never an event (`repeated`).
+                if repeated.binary_search(&message.hash).is_ok() {
+                    continue;
+                }
                 let mut records = Vec::new();
                 let mut places = Vec::new();
                 for record in &candidate.records {
                     let local = bin.records[*record as usize].receiver;
                     if let Some(place) = place_of.get(&local) {
-                        // One receiver twice in one event: the fit drops it; keep the first.
-                        if places.last() != Some(place) {
-                            records.push(*record);
-                            places.push(*place);
-                        }
+                        records.push(*record);
+                        places.push(*place);
                     }
                 }
                 if places.len() >= 2 {

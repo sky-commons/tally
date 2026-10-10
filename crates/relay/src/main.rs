@@ -3,7 +3,6 @@
 use std::io::Write as _;
 use std::sync::Arc;
 
-use tally_relay::budget::HEADROOM_BYTES;
 use tally_relay::config::{Command, Config};
 use tally_relay::egress;
 use tally_relay::hub::Hub;
@@ -12,6 +11,8 @@ use tally_wire::Identity;
 use tokio::net::TcpListener;
 
 fn main() {
+    // What the allocator keeps is bounded (`budget::bound_the_allocator`), before any thread runs.
+    tally_relay::budget::bound_the_allocator();
     // Every panic ends the relay (`tally_relay::abort_on_any_panic`), set before any thread runs.
     tally_relay::abort_on_any_panic();
     serve_main();
@@ -34,11 +35,16 @@ async fn run() -> Result<(), String> {
 }
 
 /// `tally-relay check`: everything a start does before it reads its keys and opens its sockets,
-/// each refusal included (`prepare`), then the plan on stdout, one `name value` a line: the
-/// memory's, the cores' and the stages' threads. Every part of what the relay holds before any
-/// feeder is printed from the plan's own list (`Plan::before_feeders_parts`), with their sum,
-/// `before-feeders`: a part the plan gains is a line printed, and `planned` is `before-feeders`
-/// and the feeders' shares.
+/// each refusal included (`prepare`), then the plan on stdout, one `name value` a line (RFC-0181
+/// §9, "Admission"): the memory's, the cores' and the stages' threads. In order: what the relay
+/// holds before any feeder (every part from the plan's own list, `Plan::before_feeders_parts`, with
+/// their sum `before-feeders`); the floor a connection reserves and the connection limit with what
+/// bound it; `R_max` (receptions and bytes a second, and the records) with what bound it and the
+/// feeders it carries at the planned mean and at the ceiling a source is held to; every
+/// rate-driven store's limit as its window (bytes held per reception a second) times
+/// `R_max` and the members' rate; the MLAT seats and what bound them; the handshakes allowed at
+/// once; and the totals against the memory the relay runs in with the allocator's share:
+/// `planned` is `before-feeders`, the floors, the windows and the seats.
 /// The keys are an operator's secrets, not its configuration: a throwaway key stands in for them.
 fn check(config: &Config) -> Result<(), String> {
     let identity = Identity::generate().map_err(|error| error.to_string())?;
@@ -46,38 +52,136 @@ fn check(config: &Config) -> Result<(), String> {
     let budget = hub.budget();
     let threads = budget.threads();
     let plan = budget.plan();
-    let mut lines: Vec<(&str, usize)> = vec![("memory", budget.memory())];
-    lines.extend(plan.before_feeders_parts());
-    lines.extend([
-        ("before-feeders", plan.before_feeders()),
-        ("connections", plan.connections),
-        ("per-feeder", budget.per_feeder().total()),
-        ("feeders", budget.ceiling()),
-        ("memory-feeders", budget.memory_feeders()),
-        ("cores", config.cores),
-        ("core-feeders", plan.core_feeders().unwrap_or(usize::MAX)),
+    let admission = budget.admission();
+    let number = |value: usize| value.to_string();
+    let wide = |value: u64| value.to_string();
+    let optional =
+        |value: Option<u64>| value.map_or("unbounded".to_owned(), |value| value.to_string());
+    let mut lines: Vec<(String, String)> = vec![("memory".into(), number(budget.memory()))];
+    for (name, bytes) in plan.before_feeders_parts() {
+        lines.push((name.into(), number(bytes)));
+    }
+    let member_rate =
+        plan.member_feeders as u64 * tally_relay::budget::PLANNED_RECEPTIONS_PER_SEC as u64;
+    let mut fixed: Vec<(&str, String)> = vec![
+        ("before-feeders", number(plan.before_feeders())),
+        ("connections", number(plan.connections)),
+        ("floor", number(admission.floor)),
         (
-            "feeder-records",
-            usize::try_from(plan.feeder_records_per_sec).unwrap_or(usize::MAX),
+            "per-connection",
+            number(admission.floor + plan.per_rate.total()),
         ),
-        ("general-sessions", plan.sessions.general),
-        ("subscriber-sessions", plan.sessions.subscribers),
+        ("per-seat", number(plan.per_seat.total())),
+        (
+            "mlat-share-percent",
+            number(if plan.holds_raw {
+                tally_relay::cores::MLAT_SHARE_PERCENT
+            } else {
+                0
+            }),
+        ),
+        ("connection-limit", number(admission.connections)),
+        (
+            "connections-by-memory",
+            number(admission.connections_by_memory),
+        ),
+        (
+            "connections-by-cores",
+            optional(admission.connections_by_cores.map(|value| value as u64)),
+        ),
+        (
+            "connection-limit-bound",
+            admission.connections_bound.name().into(),
+        ),
+        ("max-receptions-per-sec", wide(admission.rate)),
+        ("max-bytes-per-sec", wide(admission.bytes_per_sec())),
+        ("max-records-per-sec", wide(admission.records_per_sec())),
+        ("rate-by-memory", wide(admission.rate_by_memory)),
+        ("rate-by-cores", optional(admission.rate_by_cores)),
+        ("rate-bound", admission.rate_bound.name().into()),
+        ("members-receptions-per-sec", wide(member_rate)),
+        ("feeders-at-mean", wide(admission.feeders_at_mean())),
+        ("feeders-at-ceiling", wide(admission.feeders_at_ceiling())),
+    ];
+    let mut gauges: Vec<(String, String)> = Vec::new();
+    for store in tally_relay::budget::Store::ALL {
+        let name = store.name();
+        gauges.push((format!("limit-{name}"), number(budget.store_bytes(store))));
+        if store.driver() == tally_relay::budget::Driver::Rate {
+            gauges.push((
+                format!("window-{name}"),
+                number(
+                    plan.per_rate
+                        .of(store)
+                        .div_ceil(tally_relay::budget::PLANNED_RECEPTIONS_PER_SEC),
+                ),
+            ));
+        }
+    }
+    let tail: Vec<(&str, String)> = vec![
+        ("mlat-seats", number(admission.seats)),
+        ("mlat-seats-by-memory", number(admission.seats_by_memory)),
+        (
+            "mlat-seats-by-cores",
+            wide(if plan.holds_raw {
+                admission
+                    .seats_by_cores
+                    .map_or(u64::MAX, |value| value as u64)
+            } else {
+                0
+            }),
+        ),
+        ("mlat-seats-bound", admission.seats_bound.name().into()),
+        ("cores", number(config.cores)),
+        ("feeder-records", wide(plan.feeder_records_per_sec)),
+        ("general-sessions", number(plan.sessions.general)),
+        ("subscriber-sessions", number(plan.sessions.subscribers)),
         (
             "session-records-per-minute",
-            usize::try_from(plan.sessions.records_per_minute()).unwrap_or(usize::MAX),
+            wide(plan.sessions.records_per_minute()),
         ),
-        ("ingest-threads", threads.ingest),
-        ("message-threads", threads.message),
-        ("seal-threads", threads.seal),
-        ("mlat-threads", budget.mlat_threads()),
-        ("members", budget.members()),
-        ("per-member", plan.per_member()),
-        ("member-feeders", budget.member_feeders()),
-        ("member-rate-pool", plan.member_rate_pool()),
-        ("planned", budget.planned()),
-        ("headroom", HEADROOM_BYTES),
-        ("limit", config.memory_limit),
-    ]);
+        ("ingest-threads", number(threads.ingest)),
+        ("message-threads", number(threads.message)),
+        ("seal-threads", number(threads.seal)),
+        ("mlat-threads", number(budget.mlat_threads())),
+        (
+            "handshakes-in-flight",
+            number(tally_relay::cores::handshakes_in_flight(config.cores)),
+        ),
+        (
+            "handshakes-per-sec",
+            wide(tally_relay::cores::handshake_pace_of(
+                tally_relay::cores::handshakes_in_flight(config.cores),
+            )),
+        ),
+        ("members", number(budget.members())),
+        ("per-member", number(plan.per_member())),
+        ("member-feeders", number(budget.member_feeders())),
+        ("member-rate-pool", number(plan.member_rate_pool())),
+        ("planned", number(budget.planned())),
+        (
+            "allocator",
+            number(
+                tally_relay::budget::headroom_for(budget.memory())
+                    - tally_relay::budget::HEADROOM_BYTES,
+            ),
+        ),
+        (
+            "headroom",
+            number(tally_relay::budget::headroom_for(budget.memory())),
+        ),
+        ("limit", number(config.memory_limit)),
+    ];
+    lines.extend(
+        fixed
+            .drain(..)
+            .map(|(name, value)| (name.to_owned(), value)),
+    );
+    lines.extend(gauges);
+    lines.extend(
+        tail.into_iter()
+            .map(|(name, value)| (name.to_owned(), value)),
+    );
     let plan: String = lines
         .iter()
         .map(|(name, value)| format!("{name} {value}\n"))
@@ -110,7 +214,8 @@ fn prepare(config: &Config, identity: &Identity) -> Result<(Arc<Hub>, bool), Str
             .memory(config.memory, hosts_mlat)
             // Its areas, which the member sessions are planned from (`budget::members_for`).
             .taking(config.areas.clone())
-            // Its cores, which bound the feeders it admits (`cores::feeders_carried`).
+            // Its cores, which bound the connections, the rate and the MLAT seats it admits
+            // (`budget::Plan::admit`).
             .cores(config.cores)
             // Each stage on the threads the load it admits needs (`cores::threads_for`), and
             // MLAT's steps on what the cores leave them (`cores::mlat_threads_for`). A stage
@@ -148,21 +253,32 @@ async fn serve(config: Config) -> Result<(), String> {
         egress::decimal(config.max_upload.most_a_month())
     );
     let (hub, hosted) = prepare(&config, &identities[0])?;
+    // What the arenas keep free below their tops is returned on a thread of its own, off every
+    // stage (`budget::spawn_allocator_trimmer`).
+    tally_relay::budget::spawn_allocator_trimmer(tally_relay::budget::TRIM_PERIOD)
+        .map_err(|error| format!("the allocator's trimmer: {error}"))?;
     let budget = hub.budget();
     let threads = budget.threads();
+    let admission = budget.admission();
     eprintln!(
-        "tally-relay: admits {} feeders: {} of memory holds {} ({} each) beside {} member \
-         sessions ({} each, and {} for their shared rate), and its {} cores carry {}; {} ingest, \
-         {} message and {} seal threads for them",
-        budget.ceiling(),
+        "tally-relay: admits {} connections ({} of memory holds {}, its {} cores carry {}; {} \
+         each), a rate of {} receptions a second ({} feeders at the planned mean) and {} MLAT \
+         seats, beside {} member sessions ({} each, and {} for their shared rate); {} ingest, {} \
+         message and {} seal threads",
+        admission.connections,
         egress::decimal(config.memory as u64),
-        budget.memory_feeders(),
-        egress::decimal(budget.per_feeder().total() as u64),
+        admission.connections_by_memory,
+        config.cores,
+        admission
+            .connections_by_cores
+            .map_or("any".to_owned(), |cores| cores.to_string()),
+        egress::decimal(admission.floor as u64),
+        admission.rate,
+        admission.feeders_at_mean(),
+        admission.seats,
         budget.members(),
         egress::decimal(budget.plan().per_member() as u64),
         egress::decimal(budget.plan().member_rate_pool() as u64),
-        config.cores,
-        budget.plan().core_feeders().unwrap_or(usize::MAX),
         threads.ingest,
         threads.message,
         threads.seal,

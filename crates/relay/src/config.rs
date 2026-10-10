@@ -23,11 +23,13 @@ usage: tally-relay --key FILE [--key FILE]... --max-upload RATE [options]
                                    (memory; what it holds before any feeder, each part: base,
                                    oversize, connection-buffers, member-pool, member-links,
                                    parity-assembly, and their sum, before-feeders;
-                                   connections, per-feeder, feeders, memory-feeders, cores,
-                                   core-feeders, feeder-records, ingest-threads,
-                                   message-threads, seal-threads, mlat-threads, members,
-                                   per-member, member-feeders, member-rate-pool, planned,
-                                   headroom, limit)
+                                   connections, the floor and per-connection costs,
+                                   connection-limit and R_max (max-receptions-per-sec) with what
+                                   bound each, every store's limit, mlat-seats, cores,
+                                   feeder-records, ingest-threads, message-threads, seal-threads,
+                                   mlat-threads, handshakes-in-flight, handshakes-per-sec,
+                                   members, per-member, member-feeders, member-rate-pool,
+                                   planned, headroom, limit)
                                    and exit 0.
                                    --memory-limit is the memory the relay will run in (the
                                    lesser of its cgroup's limits: a unit's MemoryHigh and
@@ -113,7 +115,8 @@ usage: tally-relay --key FILE [--key FILE]... --max-upload RATE [options]
                          holds is turned away at its Hello: no spare slot (default: the memory
                          the relay runs in, the lesser of its cgroup's memory.high and
                          memory.max, else the host's memory, less 64 MiB of headroom for what
-                         no store charges). Never above that: the kernel would throttle or kill
+                         no store charges and the allocator's free pages (25% of the plan, at most 2.5 GiB)).
+                         Never above that: the kernel would throttle or kill
                          the relay before its budget turned a feeder away. The feeders admitted
                          are also no more than the cores it runs on (its CPU affinity and its
                          cgroup's quota) carry beside its members' rate, each stage at most
@@ -393,13 +396,17 @@ impl Config {
             return Err(format!(
                 "--memory {} is above the {most} bytes this relay may plan: the {} bytes it runs \
                  in (the lesser of its cgroup's limits, else the host's memory) less {} of \
-                 headroom for what no store charges. Past it the kernel would throttle or kill \
+                 headroom for what no store charges and the allocator's free pages ({}% of the plan, at most {} \
+                 bytes). \
+                 Past it the kernel would throttle or kill \
                  the relay before its budget turned a feeder away; give it at most that, or \
                  raise the limit (the unit's MemoryHigh and MemoryMax, the container's \
                  limits.memory)",
                 config.memory,
                 config.memory_limit,
                 crate::budget::HEADROOM_BYTES,
+                crate::budget::ALLOCATOR_PERCENT,
+                crate::budget::ALLOCATOR_CAP_BYTES,
             ));
         }
         if (config.world || config.world_precise) && !covers_the_world(&config.areas) {
@@ -564,7 +571,7 @@ mod tests {
             ),
             (2048, 16, 262_144, 1_048_576)
         );
-        assert_eq!(config.memory, LIMIT - crate::budget::HEADROOM_BYTES);
+        assert_eq!(config.memory, crate::budget::budget_within(LIMIT));
         Ok(())
     }
 
@@ -587,6 +594,10 @@ mod tests {
             format!(
                 "less {} MiB of headroom",
                 crate::budget::HEADROOM_BYTES >> 20
+            ),
+            format!(
+                "the allocator's free pages ({}% of the plan",
+                crate::budget::ALLOCATOR_PERCENT
             ),
             format!(
                 "(N over {} KiB/s)",
@@ -792,8 +803,9 @@ mod tests {
         )
         .err()
         .unwrap_or_default();
+        let most = crate::budget::budget_within(1 << 30);
         assert!(
-            over.contains("is above the 1006632960 bytes this relay may plan"),
+            over.contains(&format!("is above the {most} bytes this relay may plan")),
             "{over}"
         );
         // The headroom is kept whatever --memory says: all of the limit is refused too.

@@ -257,35 +257,30 @@ fn solve_one(
     out
 }
 
-/// Runs `work` over `threads` contiguous runs, each with its own report, and puts the results
-/// back in order: the same whatever the cut. The runs go on threads under the gate of the thread
-/// asking, if any (`tally_mlat_solver::gate`): a host's every kind of MLAT work spread over no more
-/// threads than its plan gave MLAT, background work letting provisional work in between two items.
-/// One run is done here, on no thread of its own.
+/// Runs `run` on every item of `work` on up to `threads` threads, each item with a report of its
+/// own, and puts the results and reports back in the items' order: the same whatever the threads.
+/// The threads pull the items one at a time (`tally_mlat_solver::gate::on_threads`), under the
+/// gate of the thread asking, if any: a host's every kind of MLAT work spread over no more threads
+/// than its plan gave MLAT, background work letting provisional work in between two items, and a
+/// pass ending in about its work over the permits it holds, however few (cut into
+/// one fixed share a thread, a pass that held one permit fewer than its threads took twice as
+/// long). With one thread the items run here.
 pub fn parallel<T: Sync, R: Send, P: Part>(
     threads: usize,
     work: &[T],
     run: impl Fn(&T, &mut P) -> R + Sync,
 ) -> (Vec<R>, P) {
-    let threads = threads.clamp(1, work.len().max(1));
-    let size = work.len().div_ceil(threads).max(1);
-    let chunks: Vec<&[T]> = work.chunks(size).collect();
-    let runs: Vec<(Vec<R>, P)> = tally_mlat_solver::gate::on_threads(chunks, |chunk| {
-        let mut report = P::default();
-        let out = chunk
-            .iter()
-            .map(|item| {
-                tally_mlat_solver::gate::checkpoint();
-                run(item, &mut report)
-            })
-            .collect();
-        (out, report)
-    });
+    let runs: Vec<(R, P)> =
+        tally_mlat_solver::gate::on_threads(threads, work.iter().collect(), |item| {
+            let mut report = P::default();
+            let out = run(item, &mut report);
+            (out, report)
+        });
     let mut report = P::default();
     let mut out = Vec::with_capacity(work.len());
-    for (results, part) in runs {
+    for (result, part) in runs {
         report.add(&part);
-        out.extend(results);
+        out.push(result);
     }
     (out, report)
 }
@@ -354,6 +349,8 @@ impl Job {
             }
             // In tile order: each model with a solution, then its solutions citing it.
             for (tile, list) in by_tile {
+                // A model's signing and encoding is one item of the step.
+                tally_mlat_solver::gate::checkpoint();
                 let Some(found) = fitted.remove(&tile) else {
                     continue;
                 };
@@ -401,7 +398,10 @@ impl Job {
         report.positions = positions.len();
         report.positions_bytes = positions
             .iter()
-            .map(|record| encoded_len(&Record::Positions(record.clone())))
+            .map(|record| {
+                tally_mlat_solver::gate::checkpoint();
+                encoded_len(&Record::Positions(record.clone()))
+            })
             .sum();
         outcome.positions_sequence += positions.len() as u64;
         outcome
@@ -455,12 +455,19 @@ pub fn pack_with(
     let mut records = Vec::new();
     let mut rest = solutions.as_slice();
     while !rest.is_empty() {
-        // The longest prefix that fits: all of it, else a binary search between one (which
-        // always fits: a solution is at most a few kilobytes) and the first length that did not.
-        let (mut fits, mut fails) = (0, rest.len() + 1);
+        // The longest prefix one record holds, measured (`Positions::fitting`), signed once. Only
+        // when that prefix is refused for a solution's content is it searched below, between none
+        // and the length refused. Before, every record was found by signing ever shorter prefixes
+        // of all that was left, from the whole: a window step of 80,000 solutions spent two
+        // minutes of one thread here, and its provisional steps were shed for want of its models
+        //.
+        let mut take = Positions::fitting(rest);
+        let (mut fits, mut fails) = (0, take + 1);
         let mut signed = None;
-        let mut take = rest.len();
         while fits + 1 < fails {
+            // Each signing is one item: on a gate of one permit a provisional step waits for one
+            // at most, never the whole packing.
+            tally_mlat_solver::gate::checkpoint();
             match sign(sequence, &rest[..take]) {
                 Ok(record) => {
                     fits = take;

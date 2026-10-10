@@ -203,7 +203,7 @@ impl Slice {
 
     /// This slice's share of its batch's bytes (`Decoded::footprint`), by the receptions it
     /// carries, rounded up: a batch's slices together are charged the batch once, and never a
-    /// byte less (N14 of sweep 5: rounded down, a batch cut in `n` slices was charged up to `n - 1`
+    /// byte less (rounded down, a batch cut in `n` slices was charged up to `n - 1`
     /// bytes below what it holds, which a check by the byte sees).
     pub fn share(&self) -> usize {
         let all = self.decoded.observations().len().max(1);
@@ -1085,7 +1085,7 @@ impl Open {
         self.refused = true;
         for slice in std::mem::take(&mut self.slices) {
             // Its share covers its own decode, not every decode the epoch held: one cover a slice,
-            // never a copy of the epoch's (N5).
+            // never a copy of the epoch's.
             let share = self.charge.split_covering(slice.share(), &slice.decoded);
             held.keep(slice, Some(share), None);
         }
@@ -1529,7 +1529,7 @@ mod tests {
             }))
     }
 
-    /// N5: an epoch refused whole hands each slice's share on covering that slice's decode and
+    /// An epoch refused whole hands each slice's share on covering that slice's decode and
     /// no other, and no split along the way copies the epoch's covers: a part split off a charge
     /// covering many decodes covers none of them until it is split with one. Before, every split
     /// cloned every cover of the epoch's charge, a lock a cover, so refusing an epoch of `n`

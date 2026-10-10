@@ -28,6 +28,7 @@ use crate::fanout::{BEHIND_MS, Bounds, Filter, Listener, Router};
 use crate::ingest::{Clock, InFlight, Pause, Refusal, Stage, Stages, Stamp, Threads};
 use crate::network::{Asker, Network};
 use crate::parts::Parts;
+use crate::shed;
 use crate::stations::{STATIONS_REMEMBERED, StationReport, Stations, StationsReport};
 use crate::subscription::{Described, Subscription};
 
@@ -373,22 +374,39 @@ impl<A: std::hash::Hash + Eq + Clone> Forwarded<A> {
         }
     }
 
+    /// The sequence window the record would take, when it is new (`author`'s, under `boot`,
+    /// stamped `stamp_ms`): nothing is remembered. A batch is judged on this before anything is
+    /// spent on it, and remembered ([`Forwarded::admit`]) only once it is kept, so a batch dropped
+    /// for load is no batch seen: a copy of it that comes from a member is still new.
+    fn window_if_new(
+        &mut self,
+        hash: &Hash,
+        author: &A,
+        boot: u64,
+        sequence: u64,
+        stamp_ms: u64,
+    ) -> Option<Sequences> {
+        self.seen.rotate(stamp_ms);
+        if self.seen.contains(hash) {
+            return None;
+        }
+        let known = self.newest.get(author).and_then(|boots| boots.window(boot));
+        match known {
+            Some(window) => window.admit(sequence),
+            None => Some(Sequences::first(sequence)),
+        }
+    }
+
+    /// Whether the record is new, remembering nothing.
+    fn is_new(&mut self, hash: &Hash, author: &A, boot: u64, sequence: u64, stamp_ms: u64) -> bool {
+        self.window_if_new(hash, author, boot, sequence, stamp_ms)
+            .is_some()
+    }
+
     /// True, and remembered, when the record (`author`'s, under `boot`, stamped `stamp_ms`) is
     /// new.
     fn admit(&mut self, hash: Hash, author: A, boot: u64, sequence: u64, stamp_ms: u64) -> bool {
-        self.seen.rotate(stamp_ms);
-        if self.seen.contains(&hash) {
-            return false;
-        }
-        let known = self
-            .newest
-            .get(&author)
-            .and_then(|boots| boots.window(boot));
-        let window = match known {
-            Some(window) => window.admit(sequence),
-            None => Some(Sequences::first(sequence)),
-        };
-        let Some(window) = window else {
+        let Some(window) = self.window_if_new(&hash, &author, boot, sequence, stamp_ms) else {
             return false;
         };
         self.seen.insert(hash);
@@ -444,6 +462,8 @@ impl Known {
 struct RawShard {
     batches: Forwarded<PublicKey>,
     stations: Stations,
+    /// Its receivers' wanted receptions against their ceiling, by their batches' stamps.
+    ceilings: crate::ingest::ReceptionCeilings,
 }
 
 impl RawShard {
@@ -455,6 +475,7 @@ impl RawShard {
                 HASHES_REMEMBERED.div_ceil(SHARDS),
             ),
             stations: Stations::new(STATIONS_REMEMBERED.div_ceil(SHARDS)),
+            ceilings: crate::ingest::ReceptionCeilings::default(),
         }
     }
 }
@@ -471,9 +492,10 @@ pub struct OwnDescription {
 /// Where a batch came from, for what follows its admission.
 #[derive(Clone, Debug)]
 pub enum Origin {
-    /// The receiver's own feeder, with its description as its link holds it: seeded into the
-    /// receiver's sharing group by this relay, its origin.
-    Feeder(Option<Arc<OwnDescription>>),
+    /// The receiver's own feeder, with its description as its link holds it (seeded into the
+    /// receiver's sharing group by this relay, its origin) and the network group its connection
+    /// came from (what the ingest rate gives a share to, `shed`).
+    Feeder(Option<Arc<OwnDescription>>, Option<crate::ingest::Group>),
     /// A sharing member or a relay link: a piece of a group.
     Peer(Asker),
     /// Anywhere else (a subscriber, a test): forwarded, nothing more.
@@ -502,6 +524,49 @@ pub struct MemoryReport {
     /// short.
     pub ingest_queued: usize,
     pub ingest_refused: u64,
+    /// What the ingest rate cut, per source and reason (`shed`): every cut a feeder's batch met,
+    /// all at ingest, before it was signed or shared.
+    pub shed: crate::shed::ShedReport,
+    /// The handshakes in flight and the pace they are planned at (`Hub::handshake`).
+    pub handshakes: HandshakeReport,
+}
+
+/// The cap on concurrent Noise handshakes and what has met it (`Hub::handshake`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
+pub struct HandshakeReport {
+    /// The most that may run at once, from the runtime's cores (`cores::handshakes_in_flight`).
+    pub permits: usize,
+    pub in_flight: usize,
+    /// The most that ran at once so far.
+    pub peak: usize,
+    /// Connections waiting for a turn now.
+    pub waiting: usize,
+    /// Handshakes begun so far.
+    pub begun: u64,
+    /// The handshakes a second the cap is planned to pass (`cores::handshake_pace_of`).
+    pub planned_per_sec: u64,
+}
+
+/// A turn at the handshake, held until it is done (`Hub::handshake`).
+pub struct HandshakeTurn {
+    /// None only if the semaphore were closed, which nothing does.
+    _permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    running: Arc<AtomicUsize>,
+}
+
+impl Drop for HandshakeTurn {
+    fn drop(&mut self) {
+        self.running.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Feeders' batches the relay dropped for taking their receiver past its wanted receptions a
+/// second (`Hub::over_reception_ceiling`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
+pub struct OverCeiling {
+    pub batches: u64,
+    /// The wanted receptions those batches carried.
+    pub wanted: u64,
 }
 
 /// A batch a link took in, on its way to the ingest stage.
@@ -752,15 +817,33 @@ pub struct Hub {
     max_connections_per_address: usize,
     max_feeder_bytes_per_sec: u64,
     max_member_bytes_per_sec: u64,
-    /// The pace every member session shares (`ceiling::Pace`), at `max_member_bytes_per_sec`.
-    member_pace: Arc<crate::ceiling::Pace>,
+    /// The pace every member session shares (`ingest::MemberPace`), at `max_member_bytes_per_sec`.
+    member_pace: Arc<crate::ingest::MemberPace>,
     /// The records a second every member session shares, all it sends (`ingest::RecordPace`), at
     /// the feeders `max_member_bytes_per_sec` is worth (`ingest::member_records_per_sec`).
     member_records: Arc<crate::ingest::RecordPace>,
-    /// The records a second every directory link shares, whoever dialled
-    /// (`ingest::DIRECTORY_RECORDS`): planned once, as the gossip it carries is one whatever the
-    /// links.
-    directory_records: Arc<crate::ingest::RecordPace>,
+    /// The records a second every directory link's network group is paced at, whoever dialled
+    /// (`ingest::DirectoryPaces`): equal shares of `ingest::DIRECTORY_RECORDS`, planned once, as
+    /// the gossip it carries is one whatever the links.
+    directory_records: Arc<crate::ingest::DirectoryPaces>,
+    /// What new sessions are granted of their roles' bursts, by network group
+    /// (`ingest::BurstGrants`).
+    burst_grants: crate::ingest::BurstGrants,
+    /// Feeders' batches dropped for taking their receiver past its wanted receptions a second
+    /// (`ingest::ReceptionCeilings`), and the wanted receptions they carried.
+    over_ceiling_batches: AtomicU64,
+    over_ceiling_receptions: AtomicU64,
+    /// The relay-wide ingest rate (`shed`): unbounded until the plan names `R_max`
+    /// (`Hub::admitted_rate`).
+    shedder: crate::shed::Shedder,
+    admitted_rate: Option<crate::shed::Rates>,
+    /// Concurrent handshakes, capped from the runtime's cores (`Hub::handshake`).
+    handshakes: Arc<tokio::sync::Semaphore>,
+    handshake_permits: usize,
+    handshaking: Arc<AtomicUsize>,
+    handshake_peak: AtomicUsize,
+    handshake_waiting: AtomicUsize,
+    handshakes_begun: AtomicU64,
     /// The areas taken (RFC-0174 §2.1): what the member sessions are planned from
     /// (`budget::members_for`).
     areas: Vec<Region>,
@@ -940,11 +1023,26 @@ impl Hub {
             max_connections_per_address: DEFAULT_MAX_CONNECTIONS_PER_ADDRESS,
             max_feeder_bytes_per_sec: DEFAULT_MAX_FEEDER_BYTES_PER_SEC,
             max_member_bytes_per_sec: DEFAULT_MAX_MEMBER_BYTES_PER_SEC,
-            member_pace: Arc::new(crate::ceiling::Pace::new(DEFAULT_MAX_MEMBER_BYTES_PER_SEC)),
+            member_pace: Arc::new(crate::ingest::MemberPace::new(
+                DEFAULT_MAX_MEMBER_BYTES_PER_SEC,
+            )),
             member_records: Arc::new(crate::ingest::RecordPace::new(member_records_for(
                 DEFAULT_MAX_MEMBER_BYTES_PER_SEC,
             ))),
-            directory_records: Arc::new(crate::ingest::DIRECTORY_RECORDS.pace()),
+            directory_records: crate::ingest::DirectoryPaces::new(crate::ingest::DIRECTORY_RECORDS),
+            burst_grants: crate::ingest::BurstGrants::default(),
+            over_ceiling_batches: AtomicU64::new(0),
+            over_ceiling_receptions: AtomicU64::new(0),
+            shedder: crate::shed::Shedder::unbounded(),
+            admitted_rate: None,
+            handshakes: Arc::new(tokio::sync::Semaphore::new(
+                crate::cores::handshakes_in_flight(crate::ingest::host_cores()),
+            )),
+            handshake_permits: crate::cores::handshakes_in_flight(crate::ingest::host_cores()),
+            handshaking: Arc::new(AtomicUsize::new(0)),
+            handshake_peak: AtomicUsize::new(0),
+            handshake_waiting: AtomicUsize::new(0),
+            handshakes_begun: AtomicU64::new(0),
             areas: Vec::new(),
             holds_raw: false,
             cores: None,
@@ -1029,7 +1127,7 @@ impl Hub {
         self.budget.resize(memory, self.plan());
         self.fanout = Arc::new(router(&self.budget, self.queue_bytes));
         self.network.charge_to(&self.budget);
-        self
+        self.shedder_built()
     }
 
     /// The least memory that admits `feeders` beside everything this hub plans before any
@@ -1058,7 +1156,86 @@ impl Hub {
     /// its stages' threads follow what it admits (`Hub::staged_as_planned`).
     pub fn cores(mut self, cores: usize) -> Self {
         self.cores = Some(cores);
+        self.handshakes_capped(crate::cores::handshakes_in_flight(cores))
+    }
+
+    /// At most `permits` handshakes at once (`cores::handshakes_in_flight` of the cores): a
+    /// reconnect storm waits its turn, in the order it arrived, instead of every connection
+    /// running its key exchange at once beside the sessions already served. Before the hub is
+    /// shared.
+    pub fn handshakes_capped(mut self, permits: usize) -> Self {
+        let permits = permits.max(1);
+        self.handshake_permits = permits;
+        self.handshakes = Arc::new(tokio::sync::Semaphore::new(permits));
         self.replanned()
+    }
+
+    /// The relay-wide ingest rate `R_max` the plan sizes the stores for (`shed`): past it a
+    /// feeder's batches are cut at ingest, each source held to its fair share. A source's
+    /// ceiling is one receiver's own pace (`ingest::SOURCE_RECEPTIONS_PER_SEC`, and the feeder
+    /// byte ceiling).
+    pub fn admitted_rate(mut self, rate: crate::shed::Rates) -> Self {
+        self.admitted_rate = Some(rate);
+        self.shedder_built()
+    }
+
+    /// The rate the plan names (`Budget::max_receptions_per_sec`, `max_bytes_per_sec`) on a hub
+    /// that knows its cores, else the one `admitted_rate` pinned, else none.
+    fn shedder_built(mut self) -> Self {
+        let planned = self.cores.map(|_| crate::shed::Rates {
+            receptions_per_s: self.budget.max_receptions_per_sec(),
+            bytes_per_s: self.budget.max_bytes_per_sec(),
+        });
+        self.shedder = match self.admitted_rate.or(planned) {
+            Some(rate) => crate::shed::Shedder::new(
+                rate,
+                crate::shed::Rates {
+                    receptions_per_s: crate::ingest::SOURCE_RECEPTIONS_PER_SEC,
+                    bytes_per_s: self.max_feeder_bytes_per_sec,
+                },
+            )
+            .within(self.budget.gauge(Store::Shed)),
+            None => crate::shed::Shedder::unbounded(),
+        };
+        self
+    }
+
+    /// What the ingest rate has cut (`GET /memory`).
+    pub fn shed_report(&self) -> crate::shed::ShedReport {
+        self.shedder.report()
+    }
+
+    /// The ingest rate's shedder, for a test to read.
+    pub fn shedder(&self) -> &crate::shed::Shedder {
+        &self.shedder
+    }
+
+    /// A turn at a connection's Noise handshake: waits (in arrival order) while the cap of
+    /// concurrent handshakes (`handshakes_in_flight`) are running, and is held until the
+    /// handshake is done. The handshake's own timeout (`noise::HANDSHAKE_TIMEOUT`) bounds how
+    /// long a peer that stalls holds one.
+    pub async fn handshake(&self) -> HandshakeTurn {
+        self.handshake_waiting.fetch_add(1, Ordering::SeqCst);
+        let permit = Arc::clone(&self.handshakes).acquire_owned().await.ok();
+        self.handshake_waiting.fetch_sub(1, Ordering::SeqCst);
+        let running = self.handshaking.fetch_add(1, Ordering::SeqCst) + 1;
+        self.handshake_peak.fetch_max(running, Ordering::SeqCst);
+        self.handshakes_begun.fetch_add(1, Ordering::Relaxed);
+        HandshakeTurn {
+            _permit: permit,
+            running: Arc::clone(&self.handshaking),
+        }
+    }
+
+    pub fn handshake_report(&self) -> HandshakeReport {
+        HandshakeReport {
+            permits: self.handshake_permits,
+            in_flight: self.handshaking.load(Ordering::SeqCst),
+            peak: self.handshake_peak.load(Ordering::SeqCst),
+            waiting: self.handshake_waiting.load(Ordering::SeqCst),
+            begun: self.handshakes_begun.load(Ordering::Relaxed),
+            planned_per_sec: crate::cores::handshake_pace_of(self.handshake_permits),
+        }
     }
 
     /// Takes `areas` (RFC-0174 §2.1): the areas its sharing and MLAT choose from
@@ -1095,6 +1272,8 @@ impl Hub {
             members_refused: self.members_refused.load(Ordering::Relaxed),
             ingest_queued: self.stages.queued(),
             ingest_refused: self.stages.refused(),
+            shed: self.shedder.report(),
+            handshakes: self.handshake_report(),
         }
     }
 
@@ -1111,11 +1290,12 @@ impl Hub {
     /// A connection's ingest allowance of `bytes` (`ingest::Allowance`), carved from
     /// `Store::Ingest`: a feeder's (`ingest::FEEDER_ALLOWANCE`) or a member's, each within what it
     /// reserved. `None` when the store has no room for it.
-    pub fn allowance(&self, bytes: usize) -> Option<crate::ingest::Allowance> {
+    pub fn allowance(&self, bytes: usize, source: u64) -> Option<crate::ingest::Allowance> {
         crate::ingest::Allowance::carve(
             &self.budget.gauge(Store::Ingest),
             &self.budget.oversize(),
             bytes,
+            source,
         )
     }
 
@@ -1138,13 +1318,15 @@ impl Hub {
     /// is open, waiting for room: a feeder's from `Store::Buffers`, which its reservation planned,
     /// every other connection's from the room the plan sizes to the connection cap
     /// (`budget::Plan::connection_buffers`).
-    pub async fn connection_buffers(&self, feeder: bool) -> crate::budget::Charge {
+    pub async fn connection_buffers(&self, feeder: bool, source: u64) -> crate::budget::Charge {
         let gauge = if feeder {
             self.budget.gauge(Store::Buffers)
         } else {
             self.budget.connection_buffers()
         };
-        gauge.charge(crate::ingest::BUFFERS_PER_CONNECTION).await
+        gauge
+            .charge_for(source, crate::ingest::BUFFERS_PER_CONNECTION)
+            .await
     }
 
     /// RFC-0174's duties.
@@ -1299,7 +1481,7 @@ impl Hub {
     pub fn max_feeder_bytes_per_sec(mut self, rate: u64) -> Self {
         self.max_feeder_bytes_per_sec = rate;
         // The records a second it lets a feeder send are planned in the cores.
-        self.replanned()
+        self.shedder_built().replanned()
     }
 
     /// The most bytes a second the sharing members may send, all together (their shared pace)
@@ -1307,13 +1489,13 @@ impl Hub {
     /// worth: the budget is resized with it.
     pub fn max_member_bytes_per_sec(mut self, rate: u64) -> Self {
         self.max_member_bytes_per_sec = rate;
-        self.member_pace = Arc::new(crate::ceiling::Pace::new(rate));
+        self.member_pace = Arc::new(crate::ingest::MemberPace::new(rate));
         self.member_records = Arc::new(crate::ingest::RecordPace::new(member_records_for(rate)));
         self.replanned()
     }
 
-    /// The pace every member session shares.
-    pub fn member_pace(&self) -> Arc<crate::ceiling::Pace> {
+    /// The pace every member session shares, in bytes and receptions, fair between them.
+    pub fn member_pace(&self) -> Arc<crate::ingest::MemberPace> {
         Arc::clone(&self.member_pace)
     }
 
@@ -1322,9 +1504,24 @@ impl Hub {
         Arc::clone(&self.member_records)
     }
 
-    /// The records a second every directory link shares (`ingest::DIRECTORY_RECORDS`).
-    pub fn directory_records(&self) -> Arc<crate::ingest::RecordPace> {
-        Arc::clone(&self.directory_records)
+    /// The directory links' paces, one share of `ingest::DIRECTORY_RECORDS` per network group
+    /// (`ingest::DirectoryPaces`).
+    pub fn directory_records(&self) -> &Arc<crate::ingest::DirectoryPaces> {
+        &self.directory_records
+    }
+
+    /// What new sessions are granted of their roles' bursts (`ingest::BurstGrants`).
+    pub fn burst_grants(&self) -> &crate::ingest::BurstGrants {
+        &self.burst_grants
+    }
+
+    /// Feeders' batches dropped so far for taking their receiver past its wanted receptions a
+    /// second (`ingest::FEEDER_RECEPTIONS_PER_SEC`), and the wanted receptions they carried.
+    pub fn over_reception_ceiling(&self) -> OverCeiling {
+        OverCeiling {
+            batches: self.over_ceiling_batches.load(Ordering::Relaxed),
+            wanted: self.over_ceiling_receptions.load(Ordering::Relaxed),
+        }
     }
 
     /// The records a second one feeder's session may send (`ingest::records_per_sec` of its byte
@@ -1498,18 +1695,37 @@ impl Hub {
         // A test's delay, between the stamp and everything after it.
         self.stages.pause(Stage::Ingest);
         let shard = &self.raw[usize::from(raw_shard(&receiver).0)];
-        let new = shard.lock().is_ok_and(|mut shard| {
-            shard.batches.admit(
-                batch.hash(),
-                receiver,
-                batch.boot_id(),
-                batch.sequence(),
-                stamp.stamp_ms,
-            )
+        let (hash, boot, sequence) = (batch.hash(), batch.boot_id(), batch.sequence());
+        // A copy of a batch this relay already kept (a reconnect's resent backlog, a member's
+        // copy of a feeder's) is neither judged nor charged against anyone's share: whether a
+        // batch is new is asked first, and asked without remembering it. It is remembered only
+        // once it is kept (below), so a batch dropped for load or for its receiver's pace is no
+        // batch seen, and the copy a member sends of it is still new, here and on every relay.
+        let fresh = shard.lock().is_ok_and(|mut shard| {
+            shard
+                .batches
+                .is_new(&hash, &receiver, boot, sequence, stamp.stamp_ms)
         });
-        if !new {
+        if !fresh {
             // Not forwarded again, but a member that sent it still sent it (sharing's receipts).
             self.share(&origin, &Record::Batch(batch), stamp.stamp_ms);
+            return false;
+        }
+        // The ingest rate (`shed`): a feeder's batch past its source's fair share is cut here,
+        // before it is admitted, shared, signed over or sent anywhere, so nothing after this
+        // point ever refuses it. By its own stamp, counted per source and reason. A member's or a
+        // relay's batch is never cut: it was kept by the relay that took it from its feeder.
+        let unit = match &origin {
+            Origin::Feeder(_, group) => Some(self.shed_unit(&receiver, *group)),
+            _ => None,
+        };
+        let cost = shed::Cost {
+            receptions: batch.receptions().map_or(0, |n| n as u64),
+            bytes: batch.as_bytes().len() as u64,
+        };
+        if let Some(unit) = unit
+            && self.shedder.judge(unit, cost, stamp.stamp_ms).is_err()
+        {
             return false;
         }
         // A format this build cannot read is still forwarded raw; it just adds nothing here.
@@ -1525,6 +1741,39 @@ impl Hub {
             }
             Err(undecodable) => (undecodable.batch, None),
         };
+        // A feeder's batch that would take its receiver past its wanted receptions a second is
+        // dropped here, counted, never waited for on its read loop: the feeder
+        // was told the ceiling and sheds to it before it signs, so only one that predates it, or
+        // one that ignores it, meets this. By the batch's stamp, on the worker that owns the
+        // receiver's shard, so the same stamped batches are kept alike on any threads.
+        if let (Origin::Feeder(..), Some(decoded)) = (&origin, &decoded) {
+            let wanted = decoded
+                .views()
+                .filter(|view| tally_wire::modes::wanted_reception(view.format, view.data))
+                .count();
+            let within = shard
+                .lock()
+                .is_ok_and(|mut shard| shard.ceilings.take(receiver, wanted, stamp.stamp_ms));
+            if !within {
+                self.over_ceiling_batches.fetch_add(1, Ordering::Relaxed);
+                self.over_ceiling_receptions
+                    .fetch_add(wanted as u64, Ordering::Relaxed);
+                if let Some(unit) = unit {
+                    self.shedder.cut(unit, shed::Cause::ReceiverCeiling, cost);
+                }
+                return false;
+            }
+        }
+        // Kept: remembered now, in the same step as the receiver's pace was taken from.
+        let kept = shard.lock().is_ok_and(|mut shard| {
+            shard
+                .batches
+                .admit(hash, receiver, boot, sequence, stamp.stamp_ms)
+        });
+        if !kept {
+            self.share(&origin, &Record::Batch(batch), stamp.stamp_ms);
+            return false;
+        }
         let observations = decoded
             .as_ref()
             .map_or(0, |decoded| decoded.observations().len() as u64);
@@ -1536,7 +1785,7 @@ impl Hub {
                 observations,
                 stamp.stamp_ms,
             );
-            if matches!(origin, Origin::Feeder(_)) {
+            if matches!(origin, Origin::Feeder(..)) {
                 shard.stations.fed_by(&receiver, source);
             }
         }
@@ -1546,7 +1795,7 @@ impl Hub {
         // A feeder's description pushed out while it was not yet publishing comes back now that
         // it is, as one that is, before the batch: a subscriber is told who a receiver is first.
         if described.is_none()
-            && let Origin::Feeder(Some(own)) = &origin
+            && let Origin::Feeder(Some(own), _) = &origin
         {
             // On the worker that owns the receiver, stamped with its batch: offered to the hosted
             // MLAT here, before the batch, as a description of a receiver is offered.
@@ -1584,11 +1833,26 @@ impl Hub {
         true
     }
 
+    /// Whose share of the ingest rate a feeder's batch is charged to (`shed::Unit`): its
+    /// receiver, if this relay corroborated it, else its connection's network group.
+    fn shed_unit(&self, receiver: &PublicKey, group: Option<crate::ingest::Group>) -> shed::Unit {
+        if self.shedder.is_bounded()
+            && self
+                .network
+                .credit
+                .corroborated_receiver(receiver, crate::network::wall_ms())
+        {
+            shed::Unit::Corroborated(*receiver)
+        } else {
+            shed::Unit::Group(group)
+        }
+    }
+
     /// The network duties see where a batch came from: a feeder's own is seeded into its area's
     /// sharing group by this relay, its origin; a member's is a group piece.
     fn share(&self, origin: &Origin, record: &Record, stamp_ms: u64) {
         match origin {
-            Origin::Feeder(_) => self.network.originate(self, record, stamp_ms),
+            Origin::Feeder(..) => self.network.originate(self, record, stamp_ms),
             Origin::Peer(asker) => self.network.from_peer(self, asker, record, stamp_ms),
             Origin::Elsewhere => {}
         }
@@ -2112,7 +2376,7 @@ impl Hub {
 
     /// Time passed with nothing ingested: a hub whose stages run on the caller ticks by the
     /// ingest clock now, as an idle worker ticks itself (`ingest::TICK_MS`), so its epochs close
-    /// whether or not batches flow. Called by the timed duties (`network::run`).
+    /// whether or not batches flow. Called by the timed duties (`network::start`).
     pub fn idle(&self) {
         if self.stages.is_inline() {
             self.stages.advance(self.stages.now_ms());
@@ -2221,7 +2485,7 @@ mod tests {
         Ok(())
     }
 
-    /// R1: what the ingest workers' queues hold and refuse is served on `GET /memory`
+    /// What the ingest workers' queues hold and refuse is served on `GET /memory`
     /// (`MemoryReport::ingest_queued`, `ingest_refused`), read from the queues themselves. The one
     /// worker is held inside its first record while the queues fill to their bound
     /// (`ingest::Room::records`); the next is refused and counted, and the report says so. Before,
@@ -2323,6 +2587,9 @@ mod tests {
         )
         .map_err(|error| error.to_string())
     }
+
+    /// 2026-10-04T00:00:00Z.
+    const BASE_MS: u64 = 1_791_244_800_000;
 
     fn signed_batch(
         identity: &Identity,
@@ -2505,6 +2772,315 @@ mod tests {
         assert!(seen.contains(&[1; 32]));
         seen.rotate(12_000);
         assert!(!seen.contains(&[1; 32]));
+    }
+
+    /// Rate shedding is at ingest and nowhere else (RFC-0181 §10): over `R_max`, honest feeders
+    /// (a group each) keep every batch, fifty hostile keys behind one group hold one share and are
+    /// cut, each cut counted against that group and its reason, a member's batches are all kept
+    /// beside them, and nothing downstream (the workers' queue, the epochs) refuses a thing.
+    #[test]
+    fn over_the_rate_only_a_feeders_batches_are_cut_and_only_at_ingest() -> Result<(), String> {
+        let rate = shed::Rates {
+            receptions_per_s: 1_000,
+            bytes_per_s: 100_000_000,
+        };
+        let hub = Arc::new(Hub::new(8).admitted_rate(rate));
+        let honest: Vec<Identity> = (0..5u8).map(|n| Identity::from_seed([n + 1; 32])).collect();
+        let hostile: Vec<Identity> = (0..50u8)
+            .map(|n| Identity::from_seed([n + 100; 32]))
+            .collect();
+        let member = Identity::from_seed([250; 32]);
+        let batch = |identity: &Identity, sequence: u64, receptions: usize| {
+            signed_batch(
+                identity,
+                sequence,
+                (0..receptions)
+                    .map(|n| Observation {
+                        format: b'2',
+                        timestamp: n as u64,
+                        signal: 0,
+                        data: [
+                            &sequence.to_be_bytes()[..],
+                            &identity.public().as_bytes()[..4],
+                            &[n as u8],
+                        ]
+                        .concat(),
+                    })
+                    .collect(),
+            )
+        };
+        let asker = Asker {
+            role: crate::network::AskerRole::Relay,
+            key: member.public(),
+            source: 77,
+            loopback: true,
+            address: None,
+        };
+        let mut offered_hostile = 0u64;
+        let mut kept_hostile = 0u64;
+        let mut seconds = 0u64;
+        for tick in 0..60u64 {
+            let stamp_ms = BASE_MS + tick * 100;
+            seconds = tick / 10;
+            for (n, identity) in honest.iter().enumerate() {
+                let group = Some(crate::ingest::Group::V4(n as u16 + 1));
+                let batch = batch(identity, tick, 10)?;
+                let in_flight = hub.in_flight_for(&batch);
+                let kept = hub.ingest(Inbound {
+                    source: 1 + n as u64,
+                    batch,
+                    origin: Origin::Feeder(None, group),
+                    verify: false,
+                    stamp: Some(Stamp {
+                        stamp_ms: stamp_ms + n as u64,
+                        ingest_seq: tick,
+                    }),
+                    in_flight,
+                    refusal: None,
+                });
+                assert!(kept, "an honest feeder's batch was cut at tick {tick}");
+            }
+            for (n, identity) in hostile.iter().enumerate() {
+                let batch = batch(identity, tick, 100)?;
+                let in_flight = hub.in_flight_for(&batch);
+                offered_hostile += 100;
+                let kept = hub.ingest(Inbound {
+                    source: 100 + n as u64,
+                    batch,
+                    origin: Origin::Feeder(None, Some(crate::ingest::Group::V4(900))),
+                    verify: false,
+                    stamp: Some(Stamp {
+                        stamp_ms: stamp_ms + 10 + n as u64,
+                        ingest_seq: tick,
+                    }),
+                    in_flight,
+                    refusal: None,
+                });
+                if kept {
+                    kept_hostile += 100;
+                }
+            }
+            // A member's batch is a feeder's another relay already kept: never cut here.
+            let batch = batch(&member, tick, 10)?;
+            let in_flight = hub.in_flight_for(&batch);
+            assert!(
+                hub.ingest(Inbound {
+                    source: 77,
+                    batch,
+                    origin: Origin::Peer(asker),
+                    verify: false,
+                    stamp: Some(Stamp {
+                        stamp_ms: stamp_ms + 99,
+                        ingest_seq: tick
+                    }),
+                    in_flight,
+                    refusal: None,
+                }),
+                "a member's batch was refused at tick {tick}"
+            );
+        }
+        let report = hub.shed_report();
+        let cut = report.over_share.receptions + report.relay_rate.receptions;
+        assert_eq!(cut, offered_hostile - kept_hostile, "every cut is counted");
+        assert!(cut > 0, "the flood was cut");
+        // One share of the hostile group: what the honest leave of 1,000 a second, not fifty.
+        assert!(kept_hostile <= (seconds + 1) * 1_000, "{kept_hostile} kept");
+        assert!(
+            report
+                .sources
+                .iter()
+                .all(|cut| cut.source == "v4:3.132.0.0/16"),
+            "only the hostile group was cut: {:?}",
+            report.sources
+        );
+        assert_eq!(report.receiver_ceiling.batches, 0);
+        let memory = hub.memory_report();
+        assert_eq!(
+            memory.ingest_refused, 0,
+            "nothing was refused past the ingest rate"
+        );
+        assert_eq!(hub.network().products.report().epochs_refused, 0);
+        Ok(())
+    }
+
+    /// A batch of `n` distinct wanted receptions (short Mode S, downlink format 0).
+    fn wanted_batch(identity: &Identity, sequence: u64, n: usize) -> Result<Batch, String> {
+        signed_batch(
+            identity,
+            sequence,
+            (0..n)
+                .map(|n| Observation {
+                    format: b'2',
+                    timestamp: n as u64,
+                    signal: 0,
+                    data: vec![
+                        0,
+                        (sequence >> 8) as u8,
+                        sequence as u8,
+                        (n >> 8) as u8,
+                        n as u8,
+                        7,
+                        7,
+                    ],
+                })
+                .collect(),
+        )
+    }
+
+    fn feed(hub: &Arc<Hub>, source: u64, batch: Batch, origin: Origin, stamp_ms: u64) -> bool {
+        let in_flight = hub.in_flight_for(&batch);
+        hub.ingest(Inbound {
+            source,
+            batch,
+            origin,
+            verify: false,
+            stamp: Some(Stamp {
+                stamp_ms,
+                ingest_seq: 0,
+            }),
+            in_flight,
+            refusal: None,
+        })
+    }
+
+    /// A batch dropped for its receiver's pace is no batch seen: the copy a member sends of it
+    /// is still new, so every relay holding the area ends with the same batches whichever one a
+    /// feeder's pace happened to cut (before, the drop came after the batch was remembered, and a
+    /// member's copy was refused as a duplicate).
+    #[test]
+    fn a_batch_dropped_for_its_receivers_pace_is_still_new_to_a_member() -> Result<(), String> {
+        let hub = Arc::new(Hub::new(8));
+        let receiver = Identity::from_seed([5; 32]);
+        let member = Identity::from_seed([250; 32]);
+        let asker = Asker {
+            role: crate::network::AskerRole::Relay,
+            key: member.public(),
+            source: 77,
+            loopback: true,
+            address: None,
+        };
+        let burst =
+            crate::ingest::FEEDER_RECEPTIONS_PER_SEC * crate::ingest::FEEDER_RECEPTIONS_BURST_SECS;
+        let per = 500usize;
+        let count = burst as usize / per + 1;
+        let group = Some(crate::ingest::Group::V4(1));
+        let mut cut = None;
+        for sequence in 0..count as u64 {
+            let batch = wanted_batch(&receiver, sequence, per)?;
+            let again = batch.clone();
+            if !feed(&hub, 1, batch, Origin::Feeder(None, group), BASE_MS) {
+                cut = Some(again);
+            }
+        }
+        assert_eq!(
+            hub.over_reception_ceiling().batches,
+            1,
+            "one batch was past the pace"
+        );
+        let cut = cut.ok_or("the last batch is past the receiver's pace")?;
+        assert!(
+            feed(&hub, 77, cut, Origin::Peer(asker), BASE_MS + 1),
+            "a member's copy of a batch this relay dropped for load is new"
+        );
+        Ok(())
+    }
+
+    /// A copy of a batch this relay already kept is neither judged nor charged: a feeder that
+    /// reconnects and resends its backlog spends its group's share once, and the next group's
+    /// batch is not cut for the tokens the copies would have taken.
+    #[test]
+    fn copies_of_a_kept_batch_spend_no_share() -> Result<(), String> {
+        let rate = shed::Rates {
+            receptions_per_s: 3_000,
+            bytes_per_s: 100_000_000,
+        };
+        let hub = Arc::new(Hub::new(8).admitted_rate(rate));
+        let resender = Identity::from_seed([5; 32]);
+        let other = Identity::from_seed([6; 32]);
+        let first = wanted_batch(&resender, 0, 300)?;
+        let group = Some(crate::ingest::Group::V4(1));
+        assert!(feed(
+            &hub,
+            1,
+            first.clone(),
+            Origin::Feeder(None, group),
+            BASE_MS
+        ));
+        for _ in 0..30 {
+            assert!(!feed(
+                &hub,
+                1,
+                first.clone(),
+                Origin::Feeder(None, group),
+                BASE_MS
+            ));
+        }
+        let fresh = wanted_batch(&other, 0, 300)?;
+        assert!(
+            feed(
+                &hub,
+                2,
+                fresh,
+                Origin::Feeder(None, Some(crate::ingest::Group::V4(2))),
+                BASE_MS
+            ),
+            "thirty copies took nothing from the bucket"
+        );
+        let report = hub.shed_report();
+        assert_eq!(report.over_share.batches + report.relay_rate.batches, 0);
+        Ok(())
+    }
+
+    /// A receiver this relay corroborated has a share of its own even inside a flooded group:
+    /// fifty hostile keys behind one network are cut to one share while the corroborated key in
+    /// the same network keeps every batch.
+    #[test]
+    fn a_corroborated_receiver_keeps_its_share_inside_a_flooded_group() -> Result<(), String> {
+        let rate = shed::Rates {
+            receptions_per_s: 1_000,
+            bytes_per_s: 100_000_000,
+        };
+        let hub = Arc::new(Hub::new(8).admitted_rate(rate));
+        let proven = Identity::from_seed([9; 32]);
+        hub.network()
+            .credit
+            .corroborate_receiver(proven.public(), crate::network::wall_ms());
+        let hostile: Vec<Identity> = (0..50u8)
+            .map(|n| Identity::from_seed([n + 100; 32]))
+            .collect();
+        let group = Some(crate::ingest::Group::V4(900));
+        let mut cut_hostile = 0;
+        for tick in 0..60u64 {
+            let stamp_ms = BASE_MS + tick * 100;
+            let batch = wanted_batch(&proven, tick, 10)?;
+            assert!(
+                feed(&hub, 1, batch, Origin::Feeder(None, group), stamp_ms),
+                "the corroborated receiver's batch was cut at tick {tick}"
+            );
+            for (n, identity) in hostile.iter().enumerate() {
+                let batch = wanted_batch(identity, tick, 100)?;
+                if !feed(
+                    &hub,
+                    100 + n as u64,
+                    batch,
+                    Origin::Feeder(None, group),
+                    stamp_ms + 1 + n as u64,
+                ) {
+                    cut_hostile += 1;
+                }
+            }
+        }
+        assert!(cut_hostile > 0, "the flood was cut");
+        let report = hub.shed_report();
+        assert!(
+            report
+                .sources
+                .iter()
+                .all(|cut| cut.source.starts_with("v4:")),
+            "only the network was cut, never the corroborated key: {:?}",
+            report.sources
+        );
+        Ok(())
     }
 
     /// RFC-0181 §9: a batch handed in is charged to `Store::Ingest` until the epochs hold it.

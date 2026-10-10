@@ -9,8 +9,8 @@
 //! holds one idle. Provisional work is let in first, and never waits on background work for its
 //! first permit: of a gate of two or more permits, background work holds all but one at most
 //! ([`Gate::reserved`]), so a provisional step that arrives while seals and window steps hold every
-//! permit they may takes the one left at once, and runs on it however long their items are (sweep 5,
-//! N6: before, every permit could be background's, and a provisional step waited for one until a
+//! permit they may takes the one left at once, and runs on it however long their items are.
+//! Before, every permit could be background's, and a provisional step waited for one until a
 //! [`checkpoint`], which only the window's fits had: a seal or a scope pass held it up whole). A
 //! gate of one permit cannot spare one, so there background work gives its permit up between two
 //! items of its work whenever a provisional thread waits ([`checkpoint`], in every pass of the
@@ -229,6 +229,7 @@ pub fn lend<R>(wait: impl FnOnce() -> R) -> R {
 /// gives its permit up, and takes one again once the prompt work has its. Cheap (a thread-local
 /// read and an atomic load), so every pass of background work calls it between its items.
 pub fn checkpoint() {
+    PASSED.with(|passed| passed.set(passed.get() + 1));
     let yielding = HERE.with(|here| {
         here.borrow().as_ref().and_then(|here| {
             (here.holding && here.urgency == Urgency::Background && here.gate.prompt_waits())
@@ -241,33 +242,99 @@ pub fn checkpoint() {
     }
 }
 
-/// Runs `work` on each of `inputs`, each on a thread of its own under this thread's gate (here when
-/// there is only one), this thread's permit lent to them while it waits, and returns the results in
-/// the inputs' order. A worker's panic is this thread's.
-pub fn on_threads<I: Send, R: Send>(inputs: Vec<I>, work: impl Fn(I) -> R + Sync) -> Vec<R> {
-    if inputs.len() <= 1 {
-        return inputs.into_iter().map(work).collect();
+/// Runs `work` on each of `inputs` on at most `threads` threads under this thread's gate (here,
+/// item by item, when one would do), this thread's permit lent to them while it waits, and returns
+/// the results in the inputs' order. The threads pull the inputs one at a time from one shared
+/// index (work stealing), checkpointing between two, so the pass ends about when its work over
+/// the permits it actually holds is done, whatever the permit count: of a gate of `N` permits,
+/// background work holds `N - 1` at most ([`Gate::reserved`]), and a pass cut into `N` fixed
+/// shares left its last share to start only once another had ended, taking about twice as long
+/// (a ten-second window step took twenty on eight threads, past the models' ripening).
+/// A thread that gets its permit late finds what is left, or nothing. Which thread runs which
+/// input never changes the results. A worker's panic is this thread's: the workers are plain
+/// scoped threads, joined here, each panic raised again on this thread.
+pub fn on_threads<I: Send, R: Send>(
+    threads: usize,
+    inputs: Vec<I>,
+    work: impl Fn(I) -> R + Sync,
+) -> Vec<R> {
+    let workers = threads.clamp(1, inputs.len().max(1));
+    if workers <= 1 {
+        return inputs
+            .into_iter()
+            .map(|input| {
+                checkpoint();
+                work(input)
+            })
+            .collect();
     }
-    let work = &work;
+    let count = inputs.len();
+    let slots: Vec<Mutex<Option<I>>> = inputs
+        .into_iter()
+        .map(|input| Mutex::new(Some(input)))
+        .collect();
+    let next = AtomicUsize::new(0);
+    let (work, slots, next) = (&work, &slots, &next);
     let inherited = inherited();
-    lend(|| {
+    let pulled: Vec<Vec<(usize, R)>> = lend(|| {
         std::thread::scope(|scope| {
-            let handles: Vec<_> = inputs
-                .into_iter()
-                .map(|input| {
+            let handles: Vec<_> = (0..workers)
+                .map(|_| {
                     let inherited = inherited.clone();
-                    scope.spawn(move || inherited.run(|| work(input)))
+                    scope.spawn(move || {
+                        inherited.run(|| {
+                            let mut done = Vec::new();
+                            loop {
+                                let at = next.fetch_add(1, Ordering::Relaxed);
+                                if at >= count {
+                                    return done;
+                                }
+                                checkpoint();
+                                let input = slots[at]
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                    .take();
+                                if let Some(input) = input {
+                                    done.push((at, work(input)));
+                                }
+                            }
+                        })
+                    })
                 })
                 .collect();
             handles
                 .into_iter()
                 .map(|handle| match handle.join() {
-                    Ok(result) => result,
+                    Ok(done) => done,
                     Err(panic) => std::panic::resume_unwind(panic),
                 })
                 .collect()
         })
-    })
+    });
+    let mut results: Vec<Option<R>> = (0..count).map(|_| None).collect();
+    for (at, result) in pulled.into_iter().flatten() {
+        results[at] = Some(result);
+    }
+    results.into_iter().flatten().collect()
+}
+
+/// Inputs per item a pass over `len` cheap inputs on `threads` threads hands its workers at a time
+/// ([`on_threads`] of chunks this long): about `PIECES_PER_THREAD` pieces a thread, so a thread
+/// that comes late, or one whose pieces run long, costs the pass one piece at most.
+pub fn piece(len: usize, threads: usize) -> usize {
+    len.div_ceil(threads.max(1) * PIECES_PER_THREAD).max(1)
+}
+
+/// Pieces a pass of cheap inputs is cut into per thread (`piece`).
+pub const PIECES_PER_THREAD: usize = 16;
+
+/// Checkpoints this thread has passed: what a test reads to hold a pass to its items.
+pub fn checkpoints_here() -> u64 {
+    PASSED.with(std::cell::Cell::get)
+}
+
+thread_local! {
+    static PASSED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -291,48 +358,56 @@ mod tests {
             n * 2
         };
         let gated = enter(&gate, Urgency::Background, || {
-            on_threads((0..8).collect(), |n: usize| {
-                on_threads(vec![n, n + 100], item)
+            on_threads(8, (0..8).collect(), |n: usize| {
+                on_threads(2, vec![n, n + 100], item)
                     .into_iter()
                     .sum::<usize>()
             })
         });
         assert!(most.load(Ordering::SeqCst) <= 2, "{most:?}");
         assert!(gate.peak() <= 2, "{}", gate.peak());
-        let free: Vec<usize> = on_threads((0..8).collect(), |n: usize| {
-            on_threads(vec![n, n + 100], item)
+        let free: Vec<usize> = on_threads(8, (0..8).collect(), |n: usize| {
+            on_threads(2, vec![n, n + 100], item)
                 .into_iter()
                 .sum::<usize>()
         });
         assert_eq!(gated, free);
     }
 
-    /// Sweep 5, N6: background work never holds a gate's every permit when it has two or more, so
+    /// Background work never holds a gate's every permit when it has two or more, so
     /// a provisional step arriving while background work holds all it may starts at once, however
     /// long the background items run and with no checkpoint among them. Before, a background step
-    /// spread over the gate's every permit held a provisional one up until an item ended.
+    /// spread over the gate's every permit held a provisional one up until an item ended. Judged
+    /// by order, not by a clock: the background items end only once the prompt
+    /// work has run (or after a minute, so a failure ends), and the prompt work must have run while
+    /// none had ended.
     #[test]
     fn prompt_work_finds_a_permit_free_at_once_while_background_holds_all_it_may() {
         for permits in [2, 3, 8] {
             let gate = Gate::new(permits);
             let let_go = Arc::new(AtomicUsize::new(0));
             let running = Arc::new(AtomicUsize::new(0));
+            let ended = Arc::new(AtomicUsize::new(0));
             let (entered_tx, entered_rx) = std::sync::mpsc::channel();
             std::thread::scope(|scope| {
-                let (gate_b, let_go_b, running_b) =
-                    (Arc::clone(&gate), Arc::clone(&let_go), Arc::clone(&running));
+                let (gate_b, let_go_b, running_b, ended_b) = (
+                    Arc::clone(&gate),
+                    Arc::clone(&let_go),
+                    Arc::clone(&running),
+                    Arc::clone(&ended),
+                );
                 scope.spawn(move || {
                     enter(&gate_b, Urgency::Background, || {
-                        // Every item waits, with no checkpoint, until the prompt work has run (or
-                        // ten seconds, so a failure ends).
-                        on_threads((0..permits * 2).collect(), |_: usize| {
+                        // Every item waits, with no checkpoint, until the prompt work has run.
+                        on_threads(permits * 2, (0..permits * 2).collect(), |_: usize| {
                             running_b.fetch_add(1, Ordering::SeqCst);
                             let started = std::time::Instant::now();
                             while let_go_b.load(Ordering::SeqCst) == 0
-                                && started.elapsed() < Duration::from_secs(10)
+                                && started.elapsed() < Duration::from_secs(60)
                             {
                                 std::thread::sleep(Duration::from_millis(1));
                             }
+                            ended_b.fetch_add(1, Ordering::SeqCst);
                         });
                     });
                 });
@@ -341,21 +416,77 @@ mod tests {
                 while running.load(Ordering::SeqCst) < held {
                     std::thread::sleep(Duration::from_millis(1));
                 }
-                let asked = std::time::Instant::now();
-                let gate_p = Arc::clone(&gate);
+                let (gate_p, ended_p) = (Arc::clone(&gate), Arc::clone(&ended));
                 scope.spawn(move || {
                     enter(&gate_p, Urgency::Prompt, || {
-                        let _ = entered_tx.send(asked.elapsed());
+                        let _ = entered_tx.send(ended_p.load(Ordering::SeqCst));
                     });
                 });
-                let waited = entered_rx.recv_timeout(Duration::from_secs(5));
+                let ended_before = entered_rx.recv();
                 let_go.store(1, Ordering::SeqCst);
-                assert!(
-                    waited.is_ok_and(|waited| waited < Duration::from_secs(1)),
-                    "the prompt work waited for background work: {waited:?} of {permits}"
+                assert_eq!(
+                    ended_before,
+                    Ok(0),
+                    "the prompt work waited for background work to end an item, of {permits}"
                 );
             });
             assert!(gate.peak() <= permits, "{} of {permits}", gate.peak());
+        }
+    }
+
+    /// A background pass under a gate of `N` permits, which may hold `N - 1` of them,
+    /// ends in the rounds its work takes over `N - 1` threads, not in twice them. Counted in
+    /// rounds, not time: every item waits until `N - 1` items are in its round (or a long while,
+    /// which only a starved round ever waits out), so the rounds a pass takes are its schedule's.
+    /// Cut into `N` fixed shares, `N - 1` shares ran in `N - 1` full rounds, and the last share
+    /// started only after, one item a round: `2 (N - 1)` rounds. Pulled from one index, the
+    /// `N (N - 1)` items take `N` full rounds.
+    #[test]
+    fn a_background_pass_on_n_permits_takes_its_work_over_the_permits_it_holds() {
+        for permits in [2, 3, 4, 8] {
+            let gate = Gate::new(permits);
+            let width = permits - Gate::reserved(permits);
+            let items = permits * width;
+            let rounds = Mutex::new((0usize, 0usize));
+            let advanced = Condvar::new();
+            let full = AtomicUsize::new(0);
+            enter(&gate, Urgency::Background, || {
+                on_threads(permits, (0..items).collect(), |_: usize| {
+                    let mut state = rounds
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let mine = state.0;
+                    state.1 += 1;
+                    if state.1 == width {
+                        full.fetch_add(1, Ordering::SeqCst);
+                        *state = (mine + 1, 0);
+                        advanced.notify_all();
+                        return;
+                    }
+                    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                    while state.0 == mine {
+                        let left = deadline.saturating_duration_since(std::time::Instant::now());
+                        if left.is_zero() {
+                            // A starved round: it ends short.
+                            *state = (mine + 1, 0);
+                            advanced.notify_all();
+                            break;
+                        }
+                        state = advanced
+                            .wait_timeout(state, left)
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .0;
+                    }
+                });
+            });
+            let (taken, _) = *rounds
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert_eq!(
+                (taken, full.load(Ordering::SeqCst)),
+                (items / width, items / width),
+                "rounds taken and full of {items} items on {permits} permits"
+            );
         }
     }
 

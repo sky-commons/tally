@@ -11,6 +11,7 @@ use crate::WireError;
 use crate::batch::{Batch, ReceiverInfo};
 use crate::clock_model::{ClockModel, ClockModelPart};
 use crate::credit::{EvidenceBundle, FirehoseCredential};
+use crate::cut::MlatCut;
 use crate::delivery::{DeliveryAnswer, DeliveryQuery};
 use crate::directory::{ProviderOffer, ProviderQuery};
 use crate::fault_proof::FaultProof;
@@ -82,13 +83,16 @@ pub const KIND_WORLD_PRECISE: u8 = 0x21;
 // misreading one form as the other, and an answer's signed record is a format of its own too.
 pub const KIND_DELIVERY_QUERY: u8 = 0x22;
 pub const KIND_DELIVERY_ANSWER: u8 = 0x23;
+// RFC-0181 §10: a relay's overload cut of its MLAT seats, for the relays holding its areas.
+// Non-critical: a build that predates it skips it and applies no cut.
+pub const KIND_MLAT_CUT: u8 = 0x24;
 
 /// Kinds this build knows were retired: read as `Record::Retired`, never written.
 pub const RETIRED_KINDS: [u8; 2] = [KIND_POSSESSION_QUERY, KIND_POSSESSION_ANSWER];
 
 /// Every kind this build reads and writes, in kind order: what a table over kinds is checked
 /// against, so a kind added here and nowhere else is a failing test.
-pub const KINDS: [u8; 33] = [
+pub const KINDS: [u8; 34] = [
     KIND_HELLO,
     KIND_WELCOME,
     KIND_BATCH,
@@ -122,6 +126,7 @@ pub const KINDS: [u8; 33] = [
     KIND_WORLD_PRECISE,
     KIND_DELIVERY_QUERY,
     KIND_DELIVERY_ANSWER,
+    KIND_MLAT_CUT,
 ];
 
 const HEADER_LEN: usize = 3;
@@ -359,6 +364,13 @@ pub enum Record {
     RateLimit {
         bytes_per_sec: u32,
         burst: u32,
+        /// The most wanted receptions a second (`modes::wanted_reception`) the relay takes from
+        /// this feeder's receiver, a second's worth at once: a feeder sheds what is past it before
+        /// it signs, counted in its batches' `dropped`, and the relay drops a batch that would take
+        /// the receiver past it rather than slow the feeder's connection (RFC-0181 §10). Appended
+        /// (§3.4): `None` from a relay that states none, and a feeder that predates it reads the
+        /// two fields before it and ignores it.
+        wanted_per_sec: Option<u32>,
     },
     /// The relay is closing the session.
     Goodbye {
@@ -426,6 +438,8 @@ pub enum Record {
     BundleIndex(BundleIndex),
     /// One second of the precise world product (RFC-0174 §2.11).
     WorldPrecise(WorldPrecise),
+    /// A relay's signed overload cut of its MLAT seats (RFC-0181 §10).
+    MlatCut(MlatCut),
 }
 
 impl Record {
@@ -473,6 +487,7 @@ impl Record {
             Self::Parity(_) => KIND_PARITY,
             Self::BundleIndex(_) => KIND_BUNDLE_INDEX,
             Self::WorldPrecise(_) => KIND_WORLD_PRECISE,
+            Self::MlatCut(_) => KIND_MLAT_CUT,
             Self::Retired(kind) => *kind,
         }
     }
@@ -513,6 +528,7 @@ impl Record {
             Self::RegionalBatch(signed) => signed.as_bytes().len(),
             Self::BundleIndex(signed) => signed.as_bytes().len(),
             Self::WorldPrecise(signed) => signed.as_bytes().len(),
+            Self::MlatCut(signed) => signed.as_bytes().len(),
             _ => {
                 let mut out = Vec::new();
                 return match self.encode(&mut out) {
@@ -555,9 +571,13 @@ impl Record {
             Self::RateLimit {
                 bytes_per_sec,
                 burst,
+                wanted_per_sec,
             } => {
                 out.extend_from_slice(&bytes_per_sec.to_be_bytes());
                 out.extend_from_slice(&burst.to_be_bytes());
+                if let Some(wanted) = wanted_per_sec {
+                    out.extend_from_slice(&wanted.to_be_bytes());
+                }
             }
             Self::Goodbye {
                 reason,
@@ -599,6 +619,7 @@ impl Record {
             Self::Parity(chunk) => chunk.encode(out)?,
             Self::BundleIndex(signed) => out.extend_from_slice(signed.as_bytes()),
             Self::WorldPrecise(signed) => out.extend_from_slice(signed.as_bytes()),
+            Self::MlatCut(signed) => out.extend_from_slice(signed.as_bytes()),
             Self::Retired(kind) => {
                 out.truncate(start);
                 return Err(WireError::Invalid {
@@ -675,6 +696,10 @@ impl Record {
             KIND_RATE_LIMIT => Self::RateLimit {
                 bytes_per_sec: reader.u32()?,
                 burst: reader.u32()?,
+                // Appended: read when its bytes are there, as a relay that states it sends it.
+                wanted_per_sec: (reader.remaining() >= 4)
+                    .then(|| reader.u32())
+                    .transpose()?,
             },
             KIND_GOODBYE => Self::Goodbye {
                 reason: Reason::from_byte(reader.u8()?),
@@ -721,6 +746,7 @@ impl Record {
             KIND_PARITY => Self::Parity(ParityChunk::from_body(body)?),
             KIND_BUNDLE_INDEX => Self::BundleIndex(BundleIndex::from_bytes(body.to_vec())?),
             KIND_WORLD_PRECISE => Self::WorldPrecise(WorldPrecise::from_bytes(body.to_vec())?),
+            KIND_MLAT_CUT => Self::MlatCut(MlatCut::from_bytes(body.to_vec())?),
             KIND_POSSESSION_QUERY | KIND_POSSESSION_ANSWER => Self::Retired(kind),
             _ => return Self::unknown(kind, length),
         };
@@ -803,6 +829,11 @@ impl<'a> Body<'a> {
         self.at
     }
 
+    /// How many bytes are left to read.
+    pub(crate) fn remaining(&self) -> usize {
+        self.bytes.len().saturating_sub(self.at)
+    }
+
     pub(crate) fn bytes(&mut self, len: usize) -> Result<&'a [u8], WireError> {
         let slice = take(self.bytes, self.at, len)?;
         self.at += len;
@@ -879,6 +910,12 @@ mod tests {
             Record::RateLimit {
                 bytes_per_sec: 64_000,
                 burst: 128_000,
+                wanted_per_sec: None,
+            },
+            Record::RateLimit {
+                bytes_per_sec: 64_000,
+                burst: 128_000,
+                wanted_per_sec: Some(1_800),
             },
             Record::Goodbye {
                 reason: Reason::Full,
@@ -1361,6 +1398,42 @@ mod tests {
         let mut back = Vec::new();
         Record::decode_message(&message, &mut back)?;
         assert_eq!(back, vec![Record::Welcome { version: 1 }]);
+        Ok(())
+    }
+
+    /// A relay states a feeder's wanted receptions a second by appending it to `RateLimit`: the
+    /// record a feeder that predates it reads is the same two fields, byte for byte, with the
+    /// ceiling after them (which such a reader ignores, §3.4), and a relay that states none is read
+    /// as stating none.
+    #[test]
+    fn a_rate_limits_wanted_ceiling_is_appended_and_old_readers_read_the_rest()
+    -> Result<(), WireError> {
+        let stated = Record::RateLimit {
+            bytes_per_sec: 64_000,
+            burst: 128_000,
+            wanted_per_sec: Some(1_800),
+        };
+        let unstated = Record::RateLimit {
+            bytes_per_sec: 64_000,
+            burst: 128_000,
+            wanted_per_sec: None,
+        };
+        let (mut new, mut old) = (Vec::new(), Vec::new());
+        stated.encode(&mut new)?;
+        unstated.encode(&mut old)?;
+        assert_eq!(new.len(), old.len() + 4);
+        assert_eq!(new[3..old.len()], old[3..]);
+        assert_eq!(new[old.len()..], 1_800u32.to_be_bytes());
+        let mut back = Vec::new();
+        Record::decode_message(&new, &mut back)?;
+        Record::decode_message(&old, &mut back)?;
+        assert_eq!(back, vec![stated.clone(), unstated]);
+        // A later field after it is ignored in its turn.
+        new[2] += 2;
+        new.extend_from_slice(&[7, 7]);
+        let mut later = Vec::new();
+        Record::decode_message(&new, &mut later)?;
+        assert_eq!(later, vec![stated]);
         Ok(())
     }
 

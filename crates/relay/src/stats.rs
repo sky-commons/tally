@@ -10,6 +10,9 @@
 //! - `GET /mlat`: what the hosted MLAT has done and let go (`mlat_host::MlatReport`): batches
 //!   taken, offers refused for a full queue, signed records overflowed, every other drop by why,
 //!   and its step reports; 404 when the relay hosts no MLAT.
+//! - `GET /memory`: the memory budget, every store's gauge and the decoded batches alive
+//!   (`hub::MemoryReport`), and the feeders' batches dropped past their receiver's wanted
+//!   receptions a second (`over_reception_ceiling`).
 //! - `GET /products`: what the regional and world products have done and let go
 //!   (`products::ProductsReport`), every drop by why.
 //!
@@ -50,7 +53,11 @@ async fn egress(State(hub): State<Arc<Hub>>) -> Response {
 
 async fn mlat(State(hub): State<Arc<Hub>>) -> Response {
     match hub.network().mlat() {
-        Some(mlat) => axum::Json(mlat.report()).into_response(),
+        Some(mlat) => {
+            let mut report = mlat.report();
+            (report.cuts_sent, report.cuts_received, report.cuts_refused) = hub.network().cuts();
+            axum::Json(report).into_response()
+        }
         None => (StatusCode::NOT_FOUND, "this relay hosts no MLAT").into_response(),
     }
 }
@@ -61,8 +68,21 @@ async fn products(State(hub): State<Arc<Hub>>) -> Response {
 
 /// The budget and every store's gauge, with what the stores that count their own bytes hold
 /// (the batch byte store, the delivery tags) and the decoded batches alive in all.
+/// `GET /memory`: the memory report, and beside it the feeders' batches dropped for taking their
+/// receiver past its wanted receptions a second (`Hub::over_reception_ceiling`).
+#[derive(serde::Serialize)]
+struct Memory {
+    #[serde(flatten)]
+    report: crate::hub::MemoryReport,
+    over_reception_ceiling: crate::hub::OverCeiling,
+}
+
 async fn memory(State(hub): State<Arc<Hub>>) -> Response {
-    axum::Json(hub.memory_report()).into_response()
+    axum::Json(Memory {
+        report: hub.memory_report(),
+        over_reception_ceiling: hub.over_reception_ceiling(),
+    })
+    .into_response()
 }
 
 async fn stations(State(hub): State<Arc<Hub>>) -> Response {
@@ -234,7 +254,17 @@ mod tests {
         let (status, body) = get(address, "/mlat").await?;
         assert_eq!(status, 200, "{body}");
         let report: crate::mlat_host::MlatReport = serde_json::from_str(&body).map_err(text)?;
-        assert_eq!(report, crate::mlat_host::MlatReport::default());
+        // Nothing has happened, but the seats the host was planned (its capacity's receivers, here
+        // the default) are served: no cut is in force, so the cap is the limit.
+        assert_eq!(report.seat_cap, report.seat_limit, "{body}");
+        assert_eq!(
+            report,
+            crate::mlat_host::MlatReport {
+                seat_cap: report.seat_limit,
+                seat_limit: report.seat_limit,
+                ..crate::mlat_host::MlatReport::default()
+            }
+        );
         for counter in [
             "refused",
             "overflowed",
