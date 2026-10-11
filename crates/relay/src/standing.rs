@@ -489,11 +489,13 @@ mod tests {
                 let _ = done.send(());
             });
         }
+        // Handed while the book is held: a hand that waited for the book never returns while it
+        // is held, so this waits only on a hang (120 s), never on the machine's speed.
         finished
-            .recv_timeout(Duration::from_secs(5))
+            .recv_timeout(Duration::from_secs(120))
             .map_err(|_| "handing a record waited for the book")?;
         drop(held);
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + Duration::from_secs(120);
         while !standing.intake().records.is_empty() {
             assert!(std::time::Instant::now() < deadline, "never taken in");
             std::thread::sleep(Duration::from_millis(5));

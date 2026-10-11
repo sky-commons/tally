@@ -985,19 +985,39 @@ mod tests {
     }
 
     /// Paced, the simulation holds a few seconds ahead of the run's clock and no more: it has not
-    /// made the run's tenth second while the clock is in its first.
+    /// made the run's tenth second while the clock is in its first. Held against the second the
+    /// run's clock is in when the simulation is read, never against one the test assumes it is
+    /// still in: a loaded machine's clock moves on while the test waits, and the simulation with it.
     #[test]
     fn paced_the_simulation_runs_a_few_seconds_ahead() -> Result<(), String> {
         let spec = small(60, 20.0, 30);
         let traffic = Traffic::build(&spec, 0..60, Pace::Run)?;
         traffic.begin(Instant::now());
         traffic.wait_for(AHEAD_S - 1);
+        // Time to run as far ahead as it may; the bound below holds however long this lasts.
         std::thread::sleep(Duration::from_millis(300));
-        let ahead = traffic.whole_to();
-        assert!(ahead >= AHEAD_S - 1, "{ahead}");
-        assert!(ahead <= AHEAD_S + SETTLED_S + 2, "{ahead}");
+        // Read within one second of the run's clock: the clock the same before and after, so
+        // nothing read was made against a later second than `playing`.
         let mut frames = Vec::new();
-        assert!(!traffic.frames(0, ahead + 3, 0, &mut frames));
+        let (playing, ahead, made_past) = loop {
+            frames.clear();
+            let playing = traffic
+                .shared
+                .playing()
+                .ok_or("the run's clock never began")?;
+            let most = playing + AHEAD_S + SETTLED_S + 2;
+            let ahead = traffic.whole_to();
+            let made_past = traffic.frames(0, most + 1, 0, &mut frames);
+            if traffic.shared.playing() == Some(playing) {
+                break (playing, ahead, made_past);
+            }
+        };
+        assert!(ahead >= AHEAD_S - 1, "{ahead}");
+        assert!(
+            ahead <= playing + AHEAD_S + SETTLED_S + 2,
+            "{ahead} with the run's clock in second {playing}"
+        );
+        assert!(!made_past);
         assert!(frames.is_empty());
         Ok(())
     }

@@ -1874,6 +1874,10 @@ mod tests {
     use super::*;
     use crate::source::Batcher;
 
+    /// How long a test waits for the event it asserts before calling it a hang: a guard on a
+    /// feeder that never gets there, never a verdict on how fast the machine running the test is.
+    const HANG: Duration = Duration::from_secs(120);
+
     fn key() -> Result<PublicKey, String> {
         Ok(Identity::generate()
             .map_err(|error| error.to_string())?
@@ -2548,7 +2552,7 @@ mod tests {
                 .collect::<Vec<PublicKey>>()
         };
         // Until the reserve takes the swallower's place.
-        let waited = tokio::time::timeout(Duration::from_secs(60), async {
+        let waited = tokio::time::timeout(HANG, async {
             while let Some((relay, _)) = arrivals.recv().await {
                 if relay == reserve.key {
                     return;
@@ -2938,7 +2942,7 @@ mod tests {
         });
         let mut heard: HashSet<PublicKey> = HashSet::new();
         let serving: HashSet<PublicKey> = [fakes[0].key, fakes[2].key].into_iter().collect();
-        let waited = tokio::time::timeout(Duration::from_secs(60), async {
+        let waited = tokio::time::timeout(HANG, async {
             while heard != serving {
                 match arrivals.recv().await {
                     Some((relay, _)) => {
@@ -3017,12 +3021,18 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
         });
-        let arrived = tokio::time::timeout(Duration::from_secs(30), arrivals.recv()).await;
+        // A feeder that waited a whole round would wait `ROUND_EVERY`; one looking again at the
+        // backoff's pace arrives in seconds. Waited for well short of a round, and long enough
+        // that a loaded machine's seconds are never the verdict.
+        const { assert!(HANG.as_secs() < ROUND_EVERY.as_secs()) };
+        let arrived = tokio::time::timeout(HANG, arrivals.recv()).await;
         sending.abort();
         publisher.abort();
         match arrived {
             Ok(Some((key, _))) if key == relay.key => Ok(()),
-            _ => Err("the relay took no batch within 30 s of coming up".to_owned()),
+            _ => Err(format!(
+                "the relay took no batch within {HANG:?} of coming up"
+            )),
         }
     }
 

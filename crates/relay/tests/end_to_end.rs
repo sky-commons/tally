@@ -30,6 +30,10 @@ use tokio::net::{TcpListener, TcpStream};
 
 type Result<T = ()> = std::result::Result<T, String>;
 
+/// What a test that must name a deadline waits for an event before calling it a hang: a guard on a
+/// relay that never gets there, never a verdict on how fast the machine running the test is.
+const HANG: Duration = Duration::from_secs(120);
+
 fn text(error: impl std::fmt::Display) -> String {
     error.to_string()
 }
@@ -846,7 +850,7 @@ async fn no_session_but_a_member_publishes_positions_models_or_parts() -> Result
                 .send(std::slice::from_ref(record))
                 .await
                 .map_err(text)?;
-            tokio::time::timeout(Duration::from_secs(10), ended(&mut session))
+            tokio::time::timeout(HANG, ended(&mut session))
                 .await
                 .map_err(|_| format!("a {role:?} that published {record:?} was not cut off"))?;
         }
@@ -1405,7 +1409,7 @@ async fn a_feeder_beyond_the_memory_budget_is_refused_at_its_hello() -> Result {
     );
     // The first leaves; its slot is free for the next.
     drop(first);
-    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let deadline = std::time::Instant::now() + HANG;
     loop {
         let mut third = connect(&relay, &Identity::generate().map_err(text)?, Role::Feeder).await?;
         let mut answer = Vec::new();
@@ -1643,7 +1647,7 @@ async fn a_relay_whose_members_are_full_is_routed_around_and_the_data_still_arri
     }
     let keys = [full.public(), next.public(), third.public()];
     let hubs = [&full_hub, &next_hub, &third_hub];
-    tokio::time::timeout(Duration::from_secs(60), async {
+    tokio::time::timeout(HANG, async {
         loop {
             let found = hubs.iter().zip(keys).all(|(hub, own)| {
                 keys.iter()
@@ -1690,7 +1694,7 @@ async fn a_relay_whose_members_are_full_is_routed_around_and_the_data_still_arri
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     let fed_until = tally_relay::network::wall_ms();
-    let got = tokio::time::timeout(Duration::from_secs(30), heard)
+    let got = tokio::time::timeout(HANG, heard)
         .await
         .map_err(|_| "the third relay's batches never all reached the second".to_owned())?
         .map_err(text)?;
