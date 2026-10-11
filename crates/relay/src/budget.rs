@@ -1087,7 +1087,7 @@ pub fn spawn_allocator_trimmer(period: std::time::Duration) -> std::io::Result<(
             #[cfg(target_os = "linux")]
             // SAFETY: `setpriority` on this thread's own id touches no memory of ours.
             unsafe {
-                libc::setpriority(libc::PRIO_PROCESS, libc::gettid() as libc::id_t, 19);
+                libc::setpriority(libc::PRIO_PROCESS, crate::os::thread_id(), 19);
             }
             loop {
                 std::thread::sleep(period);
@@ -1097,7 +1097,7 @@ pub fn spawn_allocator_trimmer(period: std::time::Duration) -> std::io::Result<(
         .map(drop)
 }
 
-/// What the allocator holds now (`mallinfo2`, every arena): the bytes in use, the bytes it has
+/// What the allocator holds now (`os::allocator_holdings`, every arena): the bytes in use, the bytes it has
 /// taken from the kernel and keeps free for reuse, and what it maps apart. Served on `GET
 /// /memory`, so the allocator's share of the plan ([`ALLOCATOR_PERCENT`]) is read off a running
 /// relay rather than guessed: resident memory is these and what no allocation holds (stacks, the
@@ -1123,13 +1123,12 @@ pub struct AllocatorReport {
 pub fn allocator_report() -> AllocatorReport {
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     {
-        // SAFETY: `mallinfo2` only reads the allocator's counters.
-        let info = unsafe { libc::mallinfo2() };
+        let [in_use, free, mapped, arenas] = crate::os::allocator_holdings();
         AllocatorReport {
-            in_use: info.uordblks as u64,
-            free: info.fordblks as u64,
-            mapped: info.hblkhd as u64,
-            arenas: info.arena as u64,
+            in_use,
+            free,
+            mapped,
+            arenas,
             trims: TRIMS.load(Ordering::Relaxed),
             trim_max_us: TRIM_MAX_US.load(Ordering::Relaxed),
             trim_last_us: TRIM_LAST_US.load(Ordering::Relaxed),
