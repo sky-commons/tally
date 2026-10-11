@@ -6,8 +6,10 @@ run a relay or use the data. Nobody owns the network, including us.
 Pilots say "tally" on the radio when they have the traffic in sight. That is what this does,
 together.
 
-**Status: pre-release.** The protocol, the feeder and the relay work end to end in tests. Nothing
-is deployed for the public yet.
+**Status: early.** Releases are signed and public
+([releases](https://github.com/sky-commons/tally/releases)), one public relay runs
+(`relay.tally.flightlines.ai`, by Flightlines, the only operator in the seed list so far), and the
+first receivers feed it. The map and each station's numbers are at https://tally.flightlines.ai.
 
 ## How it works
 
@@ -33,6 +35,17 @@ is deployed for the public yet.
   your antenna on every relay, forever, and no operator can take it away.
 
 ## Run a feeder
+
+On a receiver that runs readsb (a Raspberry Pi image, adsb.im, a plain Debian box), the release's
+installer does all of it: it downloads `tally-feed` for the machine, checks its sha256, finds the
+decoders and the location, makes the key, and starts the service.
+
+```sh
+curl -fsSL https://github.com/sky-commons/tally/releases/latest/download/install.sh | sudo bash
+```
+
+As a container (`ghcr.io/sky-commons/tally-feed`, signed like the binaries), see
+[packaging/README.md](packaging/README.md). By hand:
 
 ```sh
 tally-feed init --key /etc/tally/key            # once: creates the key, prints its public half
