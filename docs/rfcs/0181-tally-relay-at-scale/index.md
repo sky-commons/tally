@@ -1176,6 +1176,49 @@ FellBehind`), so a 180 s window at full load reads p50 3 to 5 s, p99 60 s and is
 clean 180 s of raw latency at 12 M a second needs the client on its own box (`--no-feeders`
 against the same relay, `--shard i/n` for the feeders) or about 4 more cores.
 
+**The world baseline** (2026-10-11, the release's `-c opt` relay and harness at
+`origin/main` d5040288c3, MLAT off). The relay and a raw and deduplicated client
+(`--client-sample 8`) on anvil (16 cores, 32 threads), with 10,000 feeders beside them
+(`--shard 0/2`); the other 10,000 (`--shard 1/2`) in a pod of the Dell cluster's CI queue
+(`flightlines-ci-jobs`, lowest priority, half a core requested), across the 1 Gbit LAN;
+`--feeders 20000 --replay 4` on both, so every transmission is heard by about 205 feeders as in the
+world benchmark while each process simulates a quarter of the receivers (the Dell's cores are about a
+third of anvil's speed, and at `--replay 1` its simulation fell behind the feeders);
+`--max-connections 24000` and `--memory` 40.2 GB (this host's cgroup allows no more). Over the 240 s
+measured window, with all 20,000 held and none refused:
+
+| What                     | Measured                                                     |
+| ------------------------ | ------------------------------------------------------------ |
+| Delivered raw            | 12.09 M receptions/s, 20,000 batches/s, 169 MB/s             |
+| Losses                   | 0 batches missing, 0 late, 0 dropped by feeders              |
+| Dedup coverage           | 0 of 5.76 M distinct messages missing                        |
+| Raw latency (sealed to read) | p50 23 ms, p90 169 ms, p99 238 ms, p99.9 503 ms, max 5.7 s |
+| Deduplicated (epoch end to read) | p50 1,150 ms, p99 1,300 ms, max 1,366 ms             |
+| Relay CPU                | 9.5 cores mean, 10.8 peak                                    |
+| Relay resident           | 2.0 GB, 2.2 GB peak (plan 38.3 GB)                           |
+| Feeders' cost            | anvil's 10,000 offered 7.68 M/s on 7.3 cores; the Dell's 10,000, the sparser cluster, 4.41 M/s on 8.9 |
+
+The max and the p99.9 come from one minute (raw at most 0.8 to 5.7 s for 50 s, the relay at 10.5
+to 10.8 cores) with the rest of the window under 320 ms each interval; its cause was not found.
+So the relay itself carries the world's feeders on one box: the earlier runs' client falling behind
+70 to 100 s after full load was the harness and the relay sharing too few cores, not the relay. Two
+runs the same day showed it again from the other side: all 20,000 feeders on anvil (load average 38
+on 32 threads) and all 20,000 in the Dell pod (23 Dell cores, 18% CPU pressure, its simulation
+behind) each made raw latency climb about a second a second with feeders timing out, while the relay
+used 8 to 9 of its 32 cores with no thread above 70%.
+
+Two findings from the setup. **The relay plans buffers for every connection its cap allows**
+(`Budget::connection_buffers`, 327 kB each): the harness passed twice the feeders plus 1,024, which
+planned 13.5 GB for 41,024 connections and left 20,000 feeders not fitting 40 GB; it now passes a
+fifth more than the feeders (`tally/crates/load/src/relay.rs`), and 24,000 held 20,000 with none
+refused. **The plan is about eighteen times what the relay used**: 38.3 GB planned against 2.2 GB
+peak resident, nearly all of it the per-connection floor (479 kB) and the rate-driven stores'
+windows at `R_max` (`check`: batches 4.2 GB, dedup 5.1 GB, buffers 6.2 GB, epochs 3.2 GB, ingest
+2.6 GB, records 2.2 GB, fanout 1.6 GB, products 1.1 GB). Those are hard reservations against a
+hostile worst case, never overcommitted (Admission, above), so a box for the world's feeders needs
+about 40 GB of memory though it uses about 2. Whether each store's window is the worst case it
+must hold is open.
+
 *What the shedder cut.* Only `over_share`; none for a receiver's pace and none for `R_max` itself.
 Over a whole run 9,143 batches (5.3 M receptions, about 0.2%), 112,127 and 178,940 (2% to 3.5%) in
 the other two long ones. In the one run polled every 5 s the cuts came in two moments, 1,062 batches
