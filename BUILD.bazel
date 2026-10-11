@@ -4,5 +4,5 @@ exports_files(
         "Cargo.lock",
         "Cargo.toml",
     ],
-    visibility = ["//tally:__subpackages__"],
+    visibility = ["//:__subpackages__"],
 )

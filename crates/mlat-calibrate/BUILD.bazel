@@ -1,14 +1,14 @@
 load("@rules_rust//cargo:defs.bzl", "extract_cargo_lints")
 load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test", "rustfmt_test")
 
-package(default_visibility = ["//tally:__subpackages__"])
+package(default_visibility = ["//:__subpackages__"])
 
 exports_files(["Cargo.toml"])
 
 extract_cargo_lints(
     name = "cargo_lints",
     manifest = "Cargo.toml",
-    workspace = "//tally:Cargo.toml",
+    workspace = "//:Cargo.toml",
 )
 
 rust_library(
@@ -22,14 +22,14 @@ rust_library(
     lint_config = ":cargo_lints",
     version = "0.1.0",
     deps = [
-        "//tally/crates/mlat",
-        "//tally/crates/mlat-solver",
-        "//tally/crates/wire",
+        "//crates/mlat",
+        "//crates/mlat-solver",
+        "//crates/wire",
         "@tally_crates//:blake2",
     ],
 )
 
-# The calibration itself: `bazel run -c opt //tally/crates/mlat-calibrate:tally-mlat-calibrate -- <subset dir>` over a
+# The calibration itself: `bazel run -c opt //crates/mlat-calibrate:tally-mlat-calibrate -- <subset dir>` over a
 # LocaRDS subset fetched by `fetch.sh` (the crate documentation says what it measures). Not a
 # test: it reads a 1.2 GB dataset the build does not hold, and replays an hour of Europe through
 # the engine.

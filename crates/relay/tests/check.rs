@@ -943,7 +943,7 @@ fn the_cores_figures_the_rfc_quotes_are_the_relays_own() -> Result {
     assert!(
         held == printed,
         "tally/crates/relay/tests/cores-10.txt is not what the relay plans: write this test's \
-         output there (`bazel test //tally/crates/relay:check --test_output=all`) and quote it in \
+         output there (`bazel test //crates/relay:check --test_output=all`) and quote it in \
          RFC-0181, \"What the cores carry\":\n{printed}"
     );
     Ok(())

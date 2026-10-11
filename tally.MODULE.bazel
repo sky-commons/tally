@@ -1,7 +1,5 @@
-# Tally's third-party crates (RFC-0171 §3.10), resolved by crate_universe from tally's own
-# Cargo.toml and Cargo.lock. The monorepo's root MODULE.bazel includes this file; the public
-# repository's MODULE.bazel (tally/MODULE.bazel here, the root there) includes the same file, so
-# both builds resolve one dependency set. Labels say //tally:, which the mirror rewrites to //:.
+# Tally's third-party crates (RFC-0171 §3.10), resolved by crate_universe from the workspace's own
+# Cargo.toml and Cargo.lock; MODULE.bazel includes this file.
 
 tally_host_tools = use_extension("@rules_rust//rust:extensions.bzl", "rust_host_tools")
 tally_host_tools.host_tools(
@@ -13,9 +11,9 @@ use_repo(tally_host_tools, "tally_rust_host_tools")
 tally_crate = use_extension("@rules_rust//crate_universe:extensions.bzl", "crate")
 tally_crate.from_cargo(
     name = "tally_crates",
-    cargo_lockfile = "//tally:Cargo.lock",
+    cargo_lockfile = "//:Cargo.lock",
     host_tools = "@tally_rust_host_tools",
-    manifests = ["//tally:Cargo.toml"],
+    manifests = ["//:Cargo.toml"],
     # Cargo.lock is cargo's own: resolution fails rather than rewriting it.
     skip_cargo_lockfile_overwrite = True,
     supported_platform_triples = [

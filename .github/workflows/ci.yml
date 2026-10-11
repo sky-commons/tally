@@ -1,0 +1,33 @@
+# Every push to main and every pull request runs the whole build and its tests, as anyone cloning
+# the repository would (RFC-0180 §6). GitHub's own runners: a pull request from a fork runs here with
+# no credentials and nothing of anyone's infrastructure.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      # v4.2.2, pinned by commit.
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      # 0.14.0, pinned by commit: Bazel at .bazelversion, and a disk cache kept between runs.
+      - uses: bazel-contrib/setup-bazel@e8776f58fb6a6e9055cbaf1b38c52ccc5247e9c4
+        with:
+          bazelisk-cache: true
+          disk-cache: ${{ github.workflow }}
+          repository-cache: true
+      - run: bazel test --keep_going --lockfile_mode=error //...

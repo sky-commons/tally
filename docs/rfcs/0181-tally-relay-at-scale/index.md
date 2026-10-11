@@ -538,7 +538,7 @@ Measured on main (tally-load, commit b3e3571809 on branch tally-load):
    one feeder refuses to start (`Budget::check`). `tally-relay check` makes every refusal a start
    makes, along the start's own path, and prints the memory plan (the member sessions, each one's
    share, their rate's feeders and pool, the headroom); the packaged unit is held to it by
-   `//tally/crates/relay:check`, with no area and with a base cell taken, and an operator holds its
+   `//crates/relay:check`, with no area and with a base cell taken, and an operator holds its
    own deploy to it the same way (ours: `//infra/tally:relay_config_test`, which also holds that a
    relay taking areas plans their members and one taking none plans none). The gauges are served on
    `GET /memory`, beside the decoded batches alive and those some store's charge covers
@@ -1665,7 +1665,7 @@ a relay plans its base (with MLAT's where it hosts MLAT), the oversize room
 (`ingest::OVERSIZE_BYTES`), the Noise buffers of every connection but a feeder's its caps allow
 (`ingest::BUFFERS_PER_CONNECTION` each), its members' pool and every other part the plan lists, each
 on its own line of the plan and summed as `before-feeders`; a feeder then reserves `per-feeder`, and the budget keeps `headroom` below the memory it runs in. `bazel
-test //tally/crates/relay:check //infra/tally:relay_config_test --test_output=all` prints the plan
+test //crates/relay:check //infra/tally:relay_config_test --test_output=all` prints the plan
 of the packaged unit (as packaged, and with a base cell taken) and of each relay Flightlines
 deploys, and holds each to its limit. Every new line of the plan cost the public relay feeders it
 had been admitting without room for them (2026-10-08, as each landed): 107 before the members'

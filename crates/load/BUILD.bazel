@@ -1,14 +1,14 @@
 load("@rules_rust//cargo:defs.bzl", "extract_cargo_lints")
 load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test", "rustfmt_test")
 
-package(default_visibility = ["//tally:__subpackages__"])
+package(default_visibility = ["//:__subpackages__"])
 
 exports_files(["Cargo.toml"])
 
 extract_cargo_lints(
     name = "cargo_lints",
     manifest = "Cargo.toml",
-    workspace = "//tally:Cargo.toml",
+    workspace = "//:Cargo.toml",
 )
 
 rust_library(
@@ -22,25 +22,25 @@ rust_library(
     lint_config = ":cargo_lints",
     version = "0.1.0",
     deps = [
-        "//tally/crates/feed",
-        "//tally/crates/mlat-solver",
-        "//tally/crates/relay",
-        "//tally/crates/wire",
+        "//crates/feed",
+        "//crates/mlat-solver",
+        "//crates/relay",
+        "//crates/wire",
         "@tally_crates//:libc",
         "@tally_crates//:serde_json",
         "@tally_crates//:tokio",
     ],
 )
 
-# An operational tool, run by name: `bazel run -c opt //tally/crates/load:tally-load -- --help`.
+# An operational tool, run by name: `bazel run -c opt //crates/load:tally-load -- --help`.
 # It starts the relay built beside it (TALLY_RELAY) unless told of one already running. Run it
 # optimised: a debug relay and debug feeders measure the build, not the relay.
 rust_binary(
     name = "tally-load",
     srcs = ["src/main.rs"],
-    data = ["//tally/crates/relay:tally-relay"],
+    data = ["//crates/relay:tally-relay"],
     edition = "2024",
-    env = {"TALLY_RELAY": "$(rootpath //tally/crates/relay:tally-relay)"},
+    env = {"TALLY_RELAY": "$(rootpath //crates/relay:tally-relay)"},
     lint_config = ":cargo_lints",
     version = "0.1.0",
     deps = [

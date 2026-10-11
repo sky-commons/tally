@@ -1,0 +1,6 @@
+# The relays this repository's releases start a new feeder from (RFC-0180 §4): the release's
+# `seeds`, which packaging/install.sh reads (its header says the format), checked by
+# `install.sh --check-seeds`. One relay a line, HOST:PORT=KEY and the operator who runs it. Relays
+# other operators run join this list as they come; until it names more than one operator, Tally's
+# entry point is one operator's.
+relay.tally.flightlines.ai:10900=JHSEe+sJIFnbegZAoEvGzLcBKS1UYzgPBU7jpIuUJ8o= Flightlines

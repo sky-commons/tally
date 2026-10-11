@@ -3,7 +3,7 @@
 # calibration, checks it against the hashes below and unzips it beside itself:
 #
 #   tally/crates/mlat-calibrate/fetch.sh /data/johnny/datasets/locards 2
-#   bazel run -c opt //tally/crates/mlat-calibrate:tally-mlat-calibrate -- \
+#   bazel run -c opt //crates/mlat-calibrate:tally-mlat-calibrate -- \
 #       /data/johnny/datasets/locards/subset_2
 #
 # Nothing of the dataset is committed. Subset 1 was held back for the competition in the first

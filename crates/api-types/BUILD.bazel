@@ -1,7 +1,7 @@
 load("@rules_rust//cargo:defs.bzl", "extract_cargo_lints")
 load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test", "rustfmt_test")
 
-package(default_visibility = ["//tally:__subpackages__"])
+package(default_visibility = ["//:__subpackages__"])
 
 exports_files(["Cargo.toml"])
 
@@ -25,7 +25,7 @@ filegroup(
 extract_cargo_lints(
     name = "cargo_lints",
     manifest = "Cargo.toml",
-    workspace = "//tally:Cargo.toml",
+    workspace = "//:Cargo.toml",
 )
 
 rust_library(
