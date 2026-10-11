@@ -25,6 +25,14 @@ jobs:
         with:
           persist-credentials: false
       # 0.14.0, pinned by commit: Bazel at .bazelversion, and a disk cache kept between runs.
+      # The pinned LLVM unpacks to several GB, more than the runner's root disk has free: Bazel's
+      # output goes to the runner's second disk, and the SDKs Tally never uses go.
+      - name: room for the toolchain
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          sudo mkdir -p /mnt/bazel && sudo chown "$USER" /mnt/bazel
+          echo 'startup --output_user_root=/mnt/bazel' >> ~/.bazelrc
+          df -h / /mnt
       - uses: bazel-contrib/setup-bazel@e8776f58fb6a6e9055cbaf1b38c52ccc5247e9c4
         with:
           bazelisk-cache: true
