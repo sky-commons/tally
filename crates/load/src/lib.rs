@@ -34,13 +34,10 @@ const FEEDERS_NICE: libc::c_int = 5;
 /// behind starves the feeders it feeds), while a feeder that waits only delays its own batch.
 /// Run on each of the feeders' runtime threads as it starts. Failing, it leaves the thread as it is.
 pub fn lower_priority() {
-    // SAFETY: `gettid` and `setpriority` take and touch no memory of ours.
+    let tid = tally_relay::os::thread_id();
+    // SAFETY: `setpriority` takes and touches no memory of ours.
     unsafe {
-        let _ = libc::setpriority(
-            libc::PRIO_PROCESS,
-            libc::gettid() as libc::id_t,
-            FEEDERS_NICE,
-        );
+        let _ = libc::setpriority(libc::PRIO_PROCESS, tid, FEEDERS_NICE);
     }
 }
 

@@ -26,6 +26,7 @@ pub mod ingest;
 pub mod link;
 pub mod mlat_host;
 pub mod network;
+pub mod os;
 pub mod parts;
 pub mod peers;
 pub mod products;

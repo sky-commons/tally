@@ -3911,12 +3911,12 @@ const _: () = assert!(0 < PROVISIONAL_NICE && PROVISIONAL_NICE < BACKGROUND_NICE
 /// at nice 19 none, has MLAT level with or less far below its stages than planned, counted). A
 /// thread may always lower its own.
 fn run_at(below: libc::c_int) -> bool {
-    // SAFETY: `gettid`, `getpriority`, `setpriority` and `__errno_location` read and write no
+    // SAFETY: `getpriority`, `setpriority` and `__errno_location` read and write no
     // memory of this process but this thread's errno; on Linux a thread is addressed by its id as
     // a process, so this changes this thread's nice value alone.
     #[cfg(target_os = "linux")]
     unsafe {
-        let tid = libc::gettid() as libc::id_t;
+        let tid = crate::os::thread_id();
         // `getpriority` may return -1 as a value: errno, cleared first, tells a failure.
         *libc::__errno_location() = 0;
         let own = libc::getpriority(libc::PRIO_PROCESS, tid);
@@ -5046,16 +5046,18 @@ mod tests {
 
     /// The nice value of the calling thread.
     fn own_nice() -> libc::c_int {
-        // SAFETY: `gettid` and `getpriority` read and write no memory of this process.
-        unsafe { libc::getpriority(libc::PRIO_PROCESS, libc::gettid() as libc::id_t) }
+        let tid = crate::os::thread_id();
+        // SAFETY: `getpriority` reads and writes no memory of this process.
+        unsafe { libc::getpriority(libc::PRIO_PROCESS, tid) }
     }
 
     /// Lowers the calling thread's priority by `by` nice steps.
     fn lower_own(by: libc::c_int) {
         let target = (own_nice() + by).min(LOWEST_NICE);
+        let tid = crate::os::thread_id();
         // SAFETY: as `own_nice`; `setpriority` changes this thread's nice value alone.
         unsafe {
-            libc::setpriority(libc::PRIO_PROCESS, libc::gettid() as libc::id_t, target);
+            libc::setpriority(libc::PRIO_PROCESS, tid, target);
         }
     }
 
