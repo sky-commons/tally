@@ -2,4 +2,5 @@
 exports_files([
     "opt.bzl",
     "resources.bzl",
+    "version.bzl",
 ])

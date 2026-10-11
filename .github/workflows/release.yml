@@ -59,13 +59,21 @@ jobs:
           repository-cache: true
       # v3.8.1, pinned by commit.
       - uses: sigstore/cosign-installer@d7d6bc7722e3daa8354c50bcb52f4837da5e9b6a
-      - name: the installer's version is the tag
+      # The version is written in three places, one for each tool that reads it: the installer,
+      # Bazel's targets (build/version.bzl) and Cargo (Cargo.toml). A tag every one of them names.
+      - name: the version is the tag
         run: |
-          version="$(sed -n 's/^VERSION="\(.*\)"$/\1/p' packaging/install.sh)"
-          if [[ "$version" != "$GITHUB_REF_NAME" ]]; then
-            echo "packaging/install.sh says VERSION=$version; the tag is $GITHUB_REF_NAME" >&2
-            exit 1
-          fi
+          set -euo pipefail
+          want="${GITHUB_REF_NAME#v}"
+          installer="$(sed -n 's/^VERSION="v\(.*\)"$/\1/p' packaging/install.sh)"
+          bazel_version="$(sed -n 's/^VERSION = "\(.*\)"$/\1/p' build/version.bzl)"
+          cargo_version="$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\(.*\)"$/\1/p' Cargo.toml)"
+          for pair in "packaging/install.sh=$installer" "build/version.bzl=$bazel_version" "Cargo.toml=$cargo_version"; do
+            if [[ "${pair#*=}" != "$want" ]]; then
+              echo "${pair%%=*} says ${pair#*=}; the tag is $GITHUB_REF_NAME" >&2
+              exit 1
+            fi
+          done
       # Two test binaries at a time, as ci.yml says why.
       - name: test
         run: bazel test --keep_going --lockfile_mode=error --test_output=errors --local_test_jobs=2 //...

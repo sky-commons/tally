@@ -1,5 +1,6 @@
 load("@rules_rust//cargo:defs.bzl", "extract_cargo_lints")
 load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test", "rustfmt_test")
+load("//build:version.bzl", "VERSION")
 
 package(default_visibility = ["//:__subpackages__"])
 
@@ -20,7 +21,7 @@ rust_library(
     crate_name = "tally_feed",
     edition = "2024",
     lint_config = ":cargo_lints",
-    version = "0.1.0",
+    version = VERSION,
     deps = [
         "//crates/wire",
         "@tally_crates//:getrandom",
@@ -33,7 +34,7 @@ rust_binary(
     srcs = ["src/main.rs"],
     edition = "2024",
     lint_config = ":cargo_lints",
-    version = "0.1.0",
+    version = VERSION,
     deps = [
         ":feed",
         "@tally_crates//:tokio",
