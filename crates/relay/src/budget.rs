@@ -3037,8 +3037,8 @@ mod tests {
     /// What the arenas keep free below their tops is returned by the trimmer
     /// thread, not left to the run's history. Eight threads each fill an arena with 4 KiB blocks and
     /// free seven in eight, so every arena is pages of free space between blocks that stay live
-    /// (which no top-trim reaches); the process comes back to a fraction of its peak within a few
-    /// trim periods. Without the trimmer it stays at the peak. In a child process of its own, so no
+    /// (which no top-trim reaches); after one trim begun past the frees, the process is back to a
+    /// fraction of its peak. Without the trimmer it stays at the peak. In a child process of its own, so no
     /// other test's memory is in the count.
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     #[test]
@@ -3074,12 +3074,18 @@ mod tests {
             filled.wait();
             let peak = resident_bytes()?;
             freed.wait();
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-            let mut now = resident_bytes()?;
-            while now > peak / 2 && std::time::Instant::now() < deadline {
-                std::thread::sleep(std::time::Duration::from_millis(100));
-                now = resident_bytes()?;
+            // Every block is freed now. A trim counted two past this one began after the frees, so
+            // what it returned is all it can: wait for it by count, not by a clock, since the
+            // trimmer runs at the lowest priority and a loaded host may hold it off for seconds.
+            let before = allocator_report().trims;
+            let hang = std::time::Instant::now() + std::time::Duration::from_secs(120);
+            while allocator_report().trims < before + 2 {
+                if std::time::Instant::now() > hang {
+                    return Err("the trimmer took no trim in 120 s".to_owned());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
             }
+            let now = resident_bytes()?;
             filled.wait();
             for handle in handles {
                 handle.join().map_err(|_| "a thread panicked".to_owned())?;
