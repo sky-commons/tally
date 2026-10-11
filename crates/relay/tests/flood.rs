@@ -34,6 +34,10 @@ use tokio::net::{TcpListener, TcpStream};
 
 type Result<T = ()> = std::result::Result<T, String>;
 
+/// How long a test waits for the event it asserts before calling it a hang: a guard on a relay
+/// that never gets there, never a verdict on how fast the machine running the test is.
+const HANG: Duration = Duration::from_secs(120);
+
 /// Held by each test for its whole run: the decoded batches alive are the process's, so a test
 /// watching them runs alone.
 static ALONE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -49,7 +53,7 @@ async fn alone() -> Result<tokio::sync::MutexGuard<'static, ()>> {
         if batches == 0 {
             return Ok(alone);
         }
-        if started.elapsed() > Duration::from_secs(30) {
+        if started.elapsed() > HANG {
             return Err(format!(
                 "{batches} decoded batches ({live} bytes) still alive from the test before"
             ));
@@ -74,8 +78,6 @@ const OFFERED: usize = 4 * CEILING;
 const RECEPTIONS: u32 = 100;
 /// Bytes of each reception's message.
 const MESSAGE_BYTES: usize = 190;
-/// How long the admitted feeders flood.
-const FLOOD: Duration = Duration::from_secs(8);
 
 fn busy_batch(receiver: &Identity, sequence: u64) -> Result<Batch> {
     Batch::sign(
@@ -403,17 +405,24 @@ async fn memory_stays_bounded_under_a_flood_of_many_feeders() -> Result {
             }
         });
     }
+    // The flood runs by the bytes it offers, never by a span of the clock: halfway is the epochs'
+    // share offered once, the whole of it twice, however long a loaded machine takes to send it.
+    let epochs = hub.budget().gauge(Store::Epochs).limit();
+    let offered = || usize::try_from(sent.load(Ordering::Relaxed)).unwrap_or(usize::MAX);
     let started = Instant::now();
     let mut watch = Watch::new();
-    while started.elapsed() < FLOOD / 2 {
+    while offered() <= epochs || watch.most_live <= CEILING * RECEPTIONS as usize {
+        if started.elapsed() > HANG {
+            return Err(format!(
+                "the flood never got under way: {} bytes offered, at most {} alive",
+                offered(),
+                watch.most_live
+            ));
+        }
         watch.sample(&hub)?;
         tokio::time::sleep(SAMPLE_EVERY).await;
     }
     // Halfway, with every store busy: one batch held where no gauge sees it is seen.
-    assert!(
-        watch.most_live > CEILING * RECEPTIONS as usize,
-        "the flood was not under way when the leak was tried"
-    );
     assert_watch_sees_one_leaked_batch(&hub).await?;
     // Let go, it is seen no more; the two lapses it made to be counted were its own.
     watch.allow(Lapses {
@@ -421,7 +430,13 @@ async fn memory_stays_bounded_under_a_flood_of_many_feeders() -> Result {
         never_covered: 1,
     });
     let mut watch_after = Watch::new();
-    while started.elapsed() < FLOOD {
+    while offered() <= 2 * epochs {
+        if started.elapsed() > HANG {
+            return Err(format!(
+                "the flood offered only {} bytes against the epochs' {epochs}",
+                offered()
+            ));
+        }
         watch_after.sample(&hub)?;
         tokio::time::sleep(SAMPLE_EVERY).await;
     }
@@ -512,7 +527,7 @@ async fn a_stalled_stage_never_grows_past_the_budget() -> Result {
     // The message threads take what the workers routed in their own time.
     let started = Instant::now();
     while epochs.refused() == 0 {
-        if started.elapsed() > Duration::from_secs(60) {
+        if started.elapsed() > HANG {
             return Err("the epoch was never refused".to_owned());
         }
         watch.sample(&hub)?;
@@ -540,7 +555,7 @@ async fn a_stalled_stage_never_grows_past_the_budget() -> Result {
     hub.advance(end);
     let started = Instant::now();
     while hub.network().products.watermark_ms() < end {
-        if started.elapsed() > Duration::from_secs(60) {
+        if started.elapsed() > HANG {
             return Err("the epochs never closed".to_owned());
         }
         tokio::time::sleep(Duration::from_millis(5)).await;
@@ -571,7 +586,8 @@ async fn a_stalled_stage_never_grows_past_the_budget() -> Result {
 /// network do the same. The room holds three such batches at once, so it is contended throughout.
 /// Served in turn by source, the four are served about as often as the twenty-four together;
 /// served first come first served (the source ignored, as when `charge_for` had no caller) they
-/// would be served four times in twenty-eight.
+/// would be served four times in twenty-eight. Judged over a count of serves, never a span of the
+/// clock, so a loaded machine weighs as many as an idle one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_oversize_room_is_shared_by_network_not_by_connection() -> Result {
     const OWN: usize = 64 << 10;
@@ -615,7 +631,17 @@ async fn the_oversize_room_is_shared_by_network_not_by_connection() -> Result {
             }
         }));
     }
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    const SERVES: u64 = 1_000;
+    let started = Instant::now();
+    while honest_served.load(Ordering::Relaxed) + greedy_served.load(Ordering::Relaxed) < SERVES {
+        if started.elapsed() > HANG {
+            return Err(format!(
+                "the room served only {} batches",
+                honest_served.load(Ordering::Relaxed) + greedy_served.load(Ordering::Relaxed)
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
     stop.store(true, Ordering::Relaxed);
     for task in tasks {
         task.await.map_err(text)?;

@@ -304,9 +304,10 @@ mod tests {
         })
     }
 
-    /// Polls `done` every 20 ms for up to twenty seconds.
+    /// Polls `done` every 20 ms until it holds, failing only on a hang (120 s), never on how fast
+    /// the machine running the test is.
     async fn until(what: &str, done: impl Fn() -> bool) -> Result<(), String> {
-        tokio::time::timeout(Duration::from_secs(20), async {
+        tokio::time::timeout(Duration::from_secs(120), async {
             while !done() {
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }

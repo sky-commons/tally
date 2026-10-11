@@ -227,7 +227,7 @@ mod tests {
         SolutionsContent, Streams,
     };
 
-    use super::{Subscription, engine_grant};
+    use super::{Band, Subscription, areas_solved_by, engine_grant};
     use crate::directory::{Directory, Group};
     use crate::egress::{Class, Kind};
     use crate::hub::Item;
@@ -360,7 +360,13 @@ mod tests {
             band.iter()
                 .any(|region| region.resolution() < AREA_RESOLUTION - 1)
         );
-        let started = std::time::Instant::now();
+        // The work is counted, not timed: the band lookups one band of the engine's areas takes.
+        let before = tally_mlat::area::band_lookups_here();
+        let _ = Band::of(&areas_solved_by(&directory, &engine.public(), NOW));
+        let one_band = tally_mlat::area::band_lookups_here() - before;
+        assert!(one_band > 0);
+        let chunks = band.cells().chunks(tally_wire::record::MAX_REGIONS).len() as u64;
+        let before = tally_mlat::area::band_lookups_here();
         for chunk in band.cells().chunks(tally_wire::record::MAX_REGIONS) {
             let asked = Subscription {
                 streams: Streams::RAW,
@@ -371,11 +377,13 @@ mod tests {
                 asked
             );
         }
-        // Milliseconds; minutes before. Generous, for a loaded machine.
-        assert!(
-            started.elapsed() < std::time::Duration::from_secs(5),
-            "{:?}",
-            started.elapsed()
+        // One band a grant, however many regions it asks for (before, a band a region).
+        let looked_up = tally_mlat::area::band_lookups_here() - before;
+        assert_eq!(
+            looked_up,
+            chunks * one_band,
+            "{looked_up} band lookups for {chunks} grants of {} regions",
+            band.cells().len()
         );
         Ok(())
     }
