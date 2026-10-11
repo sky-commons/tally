@@ -1,4 +1,4 @@
-# A release (RFC-0180 §4): a tag vX.Y.Z builds the feeder and the relay for both platforms,
+# A release (RFC-0180 §4): a tag vX.Y.Z builds the feeder, the relay and the API for both platforms,
 # optimised and against the pinned sysroot, tests them, and publishes them on the tag's GitHub
 # release with the systemd units, the seed list and the installer (its PUBLISHED_RELEASE written to
 # this release), each with its .sha256, a cosign keyless signature bundle (.sigstore.json, the
@@ -61,8 +61,8 @@ jobs:
           mkdir dist
           for arch in x86_64 aarch64; do
             bazel build -c opt --lockfile_mode=error --platforms=//platforms:linux_$arch \
-              //crates/feed:tally-feed //crates/relay:tally-relay
-            for bin in tally-feed tally-relay; do
+              //crates/feed:tally-feed //crates/relay:tally-relay //crates/api:tally-api
+            for bin in tally-feed tally-relay tally-api; do
               path="$(bazel cquery -c opt --platforms=//platforms:linux_$arch --output=files \
                 //crates/${bin#tally-}:$bin 2>/dev/null)"
               install -m 0755 "$path" "dist/$bin-$arch-linux"
