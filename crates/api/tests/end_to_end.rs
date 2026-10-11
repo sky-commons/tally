@@ -25,7 +25,7 @@ use tally_merge::Merge;
 use tally_mlat_solver::sim::{self, Scenario, Simulation};
 use tally_relay::hub::Hub;
 use tally_relay::mlat_host::stepping::{self, Hosting};
-use tally_relay::mlat_host::{HostedMlat, MlatHost, MlatReport, SETTLE_MS};
+use tally_relay::mlat_host::{HostedMlat, MlatHost, MlatReport, SETTLE_MS, WindowClock};
 use tally_relay::stations::StationReport;
 use tally_wire::batch::ReceiverInfoContent;
 use tally_wire::noise;
@@ -37,7 +37,9 @@ use tokio::net::{TcpListener, TcpStream};
 
 type Result<T = ()> = std::result::Result<T, String>;
 
-const WAIT: Duration = Duration::from_secs(20);
+/// How long a test waits for the event it asserts before calling it a hang: a guard on a server
+/// that never gets there, never a verdict on how fast the machine running the test is.
+const WAIT: Duration = Duration::from_secs(120);
 /// The site whose pages read the API, as this test configures it (`--allow-origin`): the API
 /// allows no origin of its own accord.
 const SITE: &str = "https://site.example";
@@ -580,6 +582,8 @@ async fn mlat_relay(clock: &Arc<stepping::Clock>) -> Result<(RelayAddress, Arc<H
             threads: 4,
             capacity: tally_mlat::engine::Capacity::default(),
         },
+        // Its clock walks no faster than it keeps up (`stepping`): it is never overloaded.
+        WindowClock::KEEPING_UP,
     )?;
     host.set_areas(areas.clone(), Vec::new());
     let held = Arc::new(Held { host, areas });
@@ -603,7 +607,7 @@ async fn mlat_relay(clock: &Arc<stepping::Clock>) -> Result<(RelayAddress, Arc<H
 /// Waits until `hub` has `links` more links in its fan-out than `before`: from then on everything
 /// published reaches them. An event, not a sleep: a slow machine only waits longer.
 async fn listening(hub: &Hub, before: usize, links: usize) -> Result {
-    tokio::time::timeout(Duration::from_secs(60), async {
+    tokio::time::timeout(WAIT, async {
         while hub.listening() < before + links {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -710,13 +714,16 @@ async fn the_api_serves_one_merged_mlat_position_per_aircraft_from_two_relays() 
             (west_mlat as Arc<dyn Hosting>, west_walls),
             (east_mlat as Arc<dyn Hosting>, east_walls),
         ],
-        Duration::from_secs(60),
+        WAIT,
     );
 
     let mut merge = Merge::new(tally_merge::Settings::new(false));
     let last: Arc<Mutex<String>> = Arc::default();
     let url = format!("{api}/v1/aircraft?west=0&south=49&east=10&north=55");
-    let outcome = tokio::time::timeout(Duration::from_secs(180), async {
+    // The scenario at the wall clock's pace at most, and a hang guard beyond: the clock walks no
+    // faster than the relays keep up, so a loaded machine takes longer, and only a clock that
+    // stands still (the stepper's `WAIT`) or an API that never serves is a failure.
+    let outcome = tokio::time::timeout(Duration::from_secs(180) + WAIT, async {
         loop {
             while let Ok(record) = records.try_recv() {
                 merge.ingest(&record, 0).map_err(text)?;

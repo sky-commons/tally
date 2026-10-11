@@ -22,6 +22,10 @@ use tally_wire::{
 
 type Result<T = ()> = std::result::Result<T, String>;
 
+/// How long a test waits for the event it asserts before calling it a hang: a guard on a relay
+/// that never gets there, never a verdict on how fast the machine running the test is.
+const HANG: Duration = Duration::from_secs(120);
+
 fn text(error: impl std::fmt::Display) -> String {
     error.to_string()
 }
@@ -210,7 +214,7 @@ fn made(hub: &Hub, end_ms: u64) -> Result<Made> {
     let products = &hub.network().products;
     let started = Instant::now();
     while products.watermark_ms() < end_ms {
-        if started.elapsed() > Duration::from_secs(60) {
+        if started.elapsed() > HANG {
             return Err(format!(
                 "the products reached {} of {end_ms}",
                 products.watermark_ms()
@@ -416,7 +420,7 @@ fn copies_of_a_message_up_to_two_seconds_apart_are_kept_once() -> Result {
     let products = &hub.network().products;
     let started = Instant::now();
     while products.watermark_ms() < end_ms {
-        if started.elapsed() > Duration::from_secs(60) {
+        if started.elapsed() > HANG {
             return Err("the epochs never closed".to_owned());
         }
         std::thread::sleep(Duration::from_millis(5));
@@ -568,10 +572,10 @@ async fn each_receivers_batches_reach_a_subscriber_in_order_described_first() ->
     }
     let mut items: Vec<Item> = Vec::new();
     let wanted = RECEIVERS * (BATCHES as usize + 1);
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = Instant::now() + HANG;
     while items.len() < wanted {
         let mut got = Vec::new();
-        tokio::time::timeout(Duration::from_secs(60), listener.recv_many(&mut got, 512))
+        tokio::time::timeout(HANG, listener.recv_many(&mut got, 512))
             .await
             .map_err(|_| "the subscriber stopped hearing".to_owned())?
             .map_err(|fell| format!("{fell:?}"))?;
@@ -666,7 +670,7 @@ async fn a_subscriber_that_falls_behind_is_let_go_whole_and_the_stream_refused_w
     hub.advance(end);
     let started = Instant::now();
     while hub.network().products.watermark_ms() < end {
-        if started.elapsed() > Duration::from_secs(60) {
+        if started.elapsed() > HANG {
             return Err("the epochs never closed".to_owned());
         }
         tokio::time::sleep(Duration::from_millis(5)).await;

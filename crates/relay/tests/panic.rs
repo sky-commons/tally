@@ -7,7 +7,6 @@
 
 use std::path::PathBuf;
 use std::process::Command;
-use std::time::Duration;
 
 type Result<T = ()> = std::result::Result<T, String>;
 
@@ -16,8 +15,10 @@ const CHILD: &str = "TALLY_RELAY_PANIC_CHILD";
 /// What the child prints if it outlived the panic.
 const SURVIVED: &str = "survived the panic";
 
-/// The child: the relay's hook set, then a panic where `part` says, then a wait long enough that
-/// a process still running after it would print `SURVIVED`.
+/// The child: the relay's hook set, then a panic where `part` says, then, once the panic is
+/// over (the task or thread that panicked has ended), `SURVIVED` printed: a process the hook
+/// ended never gets there, and one it did not prints it however long the panic took on a loaded
+/// machine (before, a wait of five seconds stood for "the panic is over").
 fn child(part: &str) -> Result {
     tally_relay::abort_on_any_panic();
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -28,18 +29,17 @@ fn child(part: &str) -> Result {
     runtime.block_on(async {
         match part {
             "task" => {
-                // Tokio catches this panic and reports it to the task's handle, which nobody
-                // awaits: without the hook the runtime runs on.
-                drop(tokio::spawn(async {
-                    panic!("a connection's task panicked")
-                }));
+                // Tokio catches this panic and reports it to the task's handle, which the relay
+                // never awaits: without the hook the runtime runs on. Awaited here only to know
+                // the panic is over.
+                let _ = tokio::spawn(async { panic!("a connection's task panicked") }).await;
             }
             _ => {
-                // A stage's thread: without the hook it unwinds and ends alone.
-                drop(std::thread::spawn(|| panic!("a stage's thread panicked")));
+                // A stage's thread: without the hook it unwinds and ends alone. Joined here only
+                // to know the panic is over.
+                let _ = std::thread::spawn(|| panic!("a stage's thread panicked")).join();
             }
         }
-        tokio::time::sleep(Duration::from_secs(5)).await;
         println!("{SURVIVED}");
     });
     Ok(())

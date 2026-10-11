@@ -61,6 +61,7 @@ fn near_to(centre: LatLng, radius_km: f64, cell: CellIndex) -> bool {
 /// caller (the MLAT relay's raw links each second, every engine's grant, the engine's scope) asks
 /// for the same few areas again and again.
 fn band_of(area: CellIndex) -> Arc<[CellIndex]> {
+    BAND_LOOKUPS.with(|lookups| lookups.set(lookups.get() + 1));
     let memo = BANDS.get_or_init(|| Mutex::new(HashMap::new()));
     if let Some(band) = memo
         .lock()
@@ -77,6 +78,17 @@ fn band_of(area: CellIndex) -> Arc<[CellIndex]> {
         held.insert(u64::from(area), Arc::clone(&band));
     }
     band
+}
+
+/// Areas' bands this thread has looked up (remembered or walked): the work a band's building
+/// does, which a test reads to hold a grant or a band to the lookups its areas need rather than
+/// to a clock.
+pub fn band_lookups_here() -> u64 {
+    BAND_LOOKUPS.with(std::cell::Cell::get)
+}
+
+thread_local! {
+    static BAND_LOOKUPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// Every cell near `area` (`near`), sorted: walked outward from the area a neighbour at a time,

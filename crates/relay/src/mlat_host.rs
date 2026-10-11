@@ -132,7 +132,8 @@
 //!   that ran late would). They are counted, and the cut beneath them is what keeps a host out of them:
 //!   RFC-0181 §10 states the consequence.
 //! - **Overload** (RFC-0181 §10). A window step that runs past `WINDOW_BUDGET_MS` (the models'
-//!   ripening less the steps a seal waits) is MLAT overloaded: the host cuts the receivers it
+//!   ripening less the steps a seal waits), by the host's [`WindowClock`] (a relay's the wall
+//!   clock, a test's what it declares), is MLAT overloaded: the host cuts the receivers it
 //!   solves in its areas to what that run carries within the budget (`Host::judge`). The cut is a
 //!   rank threshold, the draw of the first receiver cut (`tally_mlat::intake::draw`), never a
 //!   count of seats: a [`Cut`] per area, from `CUT_LEAD_STEPS` past the watermark, published for
@@ -497,6 +498,44 @@ pub struct MlatReport {
 pub const WINDOW_BUDGET_MS: u64 = MODELS_RIPEN_MS - 3 * STEP_MS;
 /// What a cut aims a window step at: three quarters of the budget, so the step after it has room.
 pub const WINDOW_TARGET_MS: u64 = WINDOW_BUDGET_MS * 3 / 4;
+
+/// What a window step's run is judged by for overload (module docs, Overload; `Host::judge`):
+/// chosen by whoever builds the host, so a host's verdicts never follow how fast the machine
+/// running it happens to be unless it said so.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WindowClock {
+    /// The time a window step ran on the machine's clock, against `WINDOW_BUDGET_MS`: a relay's
+    /// (`host_for`).
+    Wall,
+    /// Every window step ran `ran_ms`, against a budget of `budget_ms`: a test's, whose host
+    /// keeps up or is overloaded as it declares, however loaded the machine running it is.
+    Declared { ran_ms: u64, budget_ms: u64 },
+}
+
+impl WindowClock {
+    /// A host that always keeps up: every window step well within its budget, so it never cuts.
+    pub const KEEPING_UP: Self = Self::Declared {
+        ran_ms: 0,
+        budget_ms: WINDOW_BUDGET_MS,
+    };
+
+    /// What a window step started at `started` ran for, by this clock.
+    fn ran_ms(self, started: std::time::Instant) -> u64 {
+        match self {
+            Self::Wall => u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            Self::Declared { ran_ms, .. } => ran_ms,
+        }
+    }
+
+    /// What a window step may run for before MLAT is overloaded.
+    fn budget_ms(self) -> u64 {
+        match self {
+            Self::Wall => WINDOW_BUDGET_MS,
+            Self::Declared { budget_ms, .. } => budget_ms,
+        }
+    }
+}
+
 /// Steps ahead of the watermark a cut takes effect, for the relay to publish it to its peers
 /// before any of them reaches the step.
 pub const CUT_LEAD_STEPS: u64 = 5;
@@ -723,6 +762,7 @@ pub fn host_for(
             capacity: capacity(budget),
         },
         Gauges::of(budget),
+        WindowClock::Wall,
     )
     .map(Some)
 }
@@ -1638,8 +1678,8 @@ struct Shared {
     cuts: Mutex<Cuts>,
     cuts_late: AtomicU64,
     cuts_unkept: AtomicU64,
-    /// What a window step may run for before MLAT is overloaded: `WINDOW_BUDGET_MS`, or a test's.
-    window_budget_ms: OnceLock<u64>,
+    /// What a window step's run is judged by for overload.
+    window_clock: WindowClock,
     published: Mutex<Published>,
     /// Commands sent and not yet done with; steps queued or running; asks taken.
     commands: AtomicUsize,
@@ -2065,8 +2105,22 @@ impl HostedMlat {
     /// `settings.regions` is ignored: the areas are `set_areas`'s. What it holds is charged to
     /// gauges of no budget: for a host built apart from a relay (a test's). An error when its
     /// thread cannot start.
-    pub fn new(identity: Identity, boot_id: u64, settings: Settings) -> Result<Self, String> {
-        Self::charging(identity, boot_id, settings, Gauges::unlimited())
+    ///
+    /// Its window steps are judged for overload by `window_clock`: a relay's by the wall clock
+    /// (`host_for`), a test's as it declares, so that its verdict is not the machine's speed.
+    pub fn new(
+        identity: Identity,
+        boot_id: u64,
+        settings: Settings,
+        window_clock: WindowClock,
+    ) -> Result<Self, String> {
+        Self::charging(
+            identity,
+            boot_id,
+            settings,
+            Gauges::unlimited(),
+            window_clock,
+        )
     }
 
     /// As `new`, everything it holds charged to the relay's stores before it is held (`gauges`,
@@ -2079,6 +2133,7 @@ impl HostedMlat {
         boot_id: u64,
         settings: Settings,
         gauges: Gauges,
+        window_clock: WindowClock,
     ) -> Result<Self, String> {
         let cores = u16::try_from(settings.threads).unwrap_or(u16::MAX);
         let (messages, received) = std::sync::mpsc::channel();
@@ -2140,7 +2195,7 @@ impl HostedMlat {
             cuts: Mutex::new(Cuts::default()),
             cuts_late: AtomicU64::new(0),
             cuts_unkept: AtomicU64::new(0),
-            window_budget_ms: OnceLock::new(),
+            window_clock,
             published: Mutex::new(Published::default()),
             commands: AtomicUsize::new(0),
             asks: AtomicU64::new(0),
@@ -2217,13 +2272,6 @@ impl HostedMlat {
     /// invariant 2). Set once; later calls are ignored.
     pub fn delaying(&self, delay: Delay) {
         let _ = self.shared.delay.set(delay);
-    }
-
-    /// What a window step may run for before MLAT is overloaded (module docs, Overload), in place
-    /// of `WINDOW_BUDGET_MS`: for a test that shows the cut without a window step of seconds.
-    /// Set once; later calls are ignored.
-    pub fn budgeting(&self, window_budget_ms: u64) {
-        let _ = self.shared.window_budget_ms.set(window_budget_ms);
     }
 
     /// Commands handed to the engine's thread and not yet done with, and steps queued or running:
@@ -3049,12 +3097,7 @@ impl Host {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .own
             .clone();
-        let budget = self
-            .shared
-            .window_budget_ms
-            .get()
-            .copied()
-            .unwrap_or(WINDOW_BUDGET_MS);
+        let budget = self.shared.window_clock.budget_ms();
         let target = budget / 4 * 3;
         let wanted = if ran_ms > budget {
             let carried = (taken as u128 * u128::from(target) / u128::from(ran_ms.max(1))) as usize;
@@ -3296,11 +3339,12 @@ impl Host {
             self.window = Some(Running { due_ms, first_bin });
             let messages = self.messages.clone();
             let shared = Arc::clone(&self.shared);
+            let clock = self.shared.window_clock;
             self.runners.hand(&self.shared, Kind::Window, move || {
                 let started = std::time::Instant::now();
                 shared.delay(Stage::Window);
                 let outcome = job.run();
-                let ran_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                let ran_ms = clock.ran_ms(started);
                 // The working set's charge travels with the outcome until it is applied, so a
                 // finished window waiting for the engine's thread is never outside every store
                 //.
@@ -4169,7 +4213,7 @@ mod tests {
         let until = delivered.last().map_or(0, |(at, _)| *at) + 60_000;
         let areas = areas()?;
 
-        let host = HostedMlat::new(identity(), BOOT, settings())?;
+        let host = HostedMlat::new(identity(), BOOT, settings(), WindowClock::KEEPING_UP)?;
         host.set_areas(areas.clone(), Vec::new());
         let hosted = drive(&host, &delivered, first, until);
 
@@ -4244,7 +4288,7 @@ mod tests {
             .into_iter()
             .next()
             .ok_or("no feed")?;
-        let host = HostedMlat::new(identity(), BOOT, settings())?;
+        let host = HostedMlat::new(identity(), BOOT, settings(), WindowClock::KEEPING_UP)?;
         host.set_areas(areas()?, Vec::new());
         let now = feed.batches[0].content().map_err(text)?.wall_ms;
         quiet(&host);
@@ -4273,7 +4317,7 @@ mod tests {
         let delivered = arrivals(&mut simulation, 3)?;
         let first = delivered.first().map(|(at, _)| *at).ok_or("no raw")?;
         let until = delivered.last().map_or(0, |(at, _)| *at) + 60_000;
-        let host = HostedMlat::new(identity(), BOOT, settings())?;
+        let host = HostedMlat::new(identity(), BOOT, settings(), WindowClock::KEEPING_UP)?;
         host.set_areas(Regions::default(), Vec::new());
         assert!(drive(&host, &delivered, first, until).is_empty());
         assert_eq!(host.ingested(), 0);
@@ -4293,7 +4337,7 @@ mod tests {
             .into_iter()
             .next()
             .ok_or("no feed")?;
-        let host = HostedMlat::new(identity(), BOOT, settings())?;
+        let host = HostedMlat::new(identity(), BOOT, settings(), WindowClock::KEEPING_UP)?;
         host.set_areas(areas()?, Vec::new());
         let now = feed.batches[0].content().map_err(text)?.wall_ms;
         let early = feed.batches.len().min(5);
@@ -4321,7 +4365,7 @@ mod tests {
         let delivered = arrivals(&mut simulation, 5)?;
         let first = delivered.first().map(|(at, _)| *at).ok_or("no raw")?;
         let last = delivered.last().map_or(0, |(at, _)| *at);
-        let host = HostedMlat::new(identity(), BOOT, settings())?;
+        let host = HostedMlat::new(identity(), BOOT, settings(), WindowClock::KEEPING_UP)?;
         host.set_areas(areas()?, Vec::new());
         // Every receiver describes itself at the start: before the areas are withdrawn.
         let half = first + (last - first) / 2;
@@ -4485,7 +4529,8 @@ mod tests {
         let busy = [told(1, 0, 10_100)?, told(2, 0, 10_900)?];
         let calm = told(3, 0, 11_500)?;
         for order in [[0, 1], [1, 0]] {
-            let host = HostedMlat::new(identity(), BOOT, settings.clone())?;
+            let host =
+                HostedMlat::new(identity(), BOOT, settings.clone(), WindowClock::KEEPING_UP)?;
             let shared = &host.shared;
             for at in order {
                 tell(shared, &busy[at], notes(most));
@@ -4532,7 +4577,13 @@ mod tests {
                 notes: Gauge::new(Store::Notes, INTERVALS_HELD * (one * 2 + one / 2)),
                 ..Gauges::unlimited()
             };
-            let host = HostedMlat::charging(identity(), BOOT, settings(), gauges.clone())?;
+            let host = HostedMlat::charging(
+                identity(),
+                BOOT,
+                settings(),
+                gauges.clone(),
+                WindowClock::KEEPING_UP,
+            )?;
             let shared = &host.shared;
             for at in order {
                 tell(shared, &batches[at], notes(10));
@@ -4573,7 +4624,13 @@ mod tests {
             notes: Gauge::new(Store::Notes, INTERVALS_HELD * 2 * one),
             ..Gauges::unlimited()
         };
-        let host = HostedMlat::charging(identity(), BOOT, settings(), gauges.clone())?;
+        let host = HostedMlat::charging(
+            identity(),
+            BOOT,
+            settings(),
+            gauges.clone(),
+            WindowClock::KEEPING_UP,
+        )?;
         let shared = &host.shared;
         let held = INTERVALS_HELD as u64;
         for interval in 10..10 + held {
@@ -4608,6 +4665,22 @@ mod tests {
         Ok(())
     }
 
+    /// How long a test waits for the event it asserts before calling it a hang: a guard on a host
+    /// that never gets there, never a verdict on how fast the machine running the test is.
+    const HANG: std::time::Duration = std::time::Duration::from_secs(120);
+
+    /// Waits until `done`, failing with `what` only if it never comes (`HANG`).
+    fn waiting_for(what: impl Fn() -> String, done: impl Fn() -> bool) -> Result<(), String> {
+        let since = std::time::Instant::now();
+        while !done() {
+            if since.elapsed() > HANG {
+                return Err(what());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        Ok(())
+    }
+
     /// Waits until the engine's thread has done every command handed to it so far.
     fn handled(host: &HostedMlat) {
         while host.shared.commands.load(Ordering::SeqCst) > 0 {
@@ -4615,21 +4688,19 @@ mod tests {
         }
     }
 
-    /// Waits until `host` has `steps` steps queued or running, a test's deadline failing one that
-    /// never does.
+    /// Waits until `host` has `steps` steps queued or running, failing one that never does
+    /// (`HANG`).
     fn holding(host: &HostedMlat, steps: usize) -> Result<(), String> {
-        let since = std::time::Instant::now();
-        loop {
-            handled(host);
-            let now = host.shared.steps.load(Ordering::SeqCst);
-            if now == steps {
-                return Ok(());
-            }
-            if since.elapsed() > std::time::Duration::from_secs(60) {
-                return Err(format!("{now} steps in hand, not {steps}"));
-            }
-            std::thread::sleep(std::time::Duration::from_millis(1));
-        }
+        waiting_for(
+            || {
+                let now = host.shared.steps.load(Ordering::SeqCst);
+                format!("{now} steps in hand, not {steps}")
+            },
+            || {
+                handled(host);
+                host.shared.steps.load(Ordering::SeqCst) == steps
+            },
+        )
     }
 
     /// A stage held shut until the test opens it, telling the test when something waits there.
@@ -4706,6 +4777,7 @@ mod tests {
                 ..settings()
             },
             gauges.clone(),
+            WindowClock::KEEPING_UP,
         )?;
         host.set_areas(areas()?, Vec::new());
         let gate = Gate::shut();
@@ -4834,7 +4906,7 @@ mod tests {
             .position(|(_, record)| matches!(record, Record::Batch(_)))
             .ok_or("no batch")?;
         delivered.insert(at, (delivered[at].0, last));
-        let host = HostedMlat::new(identity(), BOOT, settings())?;
+        let host = HostedMlat::new(identity(), BOOT, settings(), WindowClock::KEEPING_UP)?;
         host.set_areas(areas()?, Vec::new());
         drive(&host, &delivered, first, until);
         let report = host.report();
@@ -4854,7 +4926,13 @@ mod tests {
         let delivered = arrivals(&mut simulation, 3)?;
         let first = delivered.first().map(|(at, _)| *at).ok_or("no raw")?;
         let gauges = Gauges::unlimited();
-        let host = HostedMlat::charging(identity(), BOOT, settings(), gauges.clone())?;
+        let host = HostedMlat::charging(
+            identity(),
+            BOOT,
+            settings(),
+            gauges.clone(),
+            WindowClock::KEEPING_UP,
+        )?;
         host.set_areas(areas()?, Vec::new());
         // Every receiver's batches of the first two seconds, and no description at all.
         let early: Vec<&(u64, Record)> = delivered
@@ -4895,7 +4973,7 @@ mod tests {
         let until = plain.last().map_or(0, |(at, _)| *at) + 60_000;
         let areas = areas()?;
         let run = |delivered: &[(u64, Record)]| -> Result<_, String> {
-            let host = HostedMlat::new(identity(), BOOT, settings())?;
+            let host = HostedMlat::new(identity(), BOOT, settings(), WindowClock::KEEPING_UP)?;
             host.set_areas(areas.clone(), Vec::new());
             let hosted = drive(&host, delivered, first, until);
             let mut engine = Engine::new(identity(), BOOT, settings());
@@ -4922,7 +5000,7 @@ mod tests {
     /// into an empty queue.
     #[test]
     fn a_steps_records_are_published_whole_or_refused_whole() -> Result<(), String> {
-        let host = HostedMlat::new(identity(), BOOT, settings())?;
+        let host = HostedMlat::new(identity(), BOOT, settings(), WindowClock::KEEPING_UP)?;
         let step: Vec<Record> = (0..3).map(|_| Record::Heartbeat).collect();
         let bytes: usize = step.iter().map(Record::encoded_len).sum();
         host.shared.publish(step.clone(), bytes * 2, None);
@@ -4967,7 +5045,7 @@ mod tests {
             .map(|(at, _)| step_of(*at))
             .ok_or("no leaving")?;
         let areas = areas()?;
-        let host = HostedMlat::new(identity(), BOOT, settings())?;
+        let host = HostedMlat::new(identity(), BOOT, settings(), WindowClock::KEEPING_UP)?;
         host.set_areas(areas.clone(), Vec::new());
         let gate = Gate::shut();
         let shut = Arc::clone(&gate);
@@ -5072,7 +5150,7 @@ mod tests {
         let first = delivered.first().map(|(at, _)| *at).ok_or("no raw")?;
         // The relay started below the default: the engine's thread, started here, inherits it.
         lower_own(3);
-        let host = HostedMlat::new(identity(), BOOT, settings())?;
+        let host = HostedMlat::new(identity(), BOOT, settings(), WindowClock::KEEPING_UP)?;
         host.set_areas(areas()?, Vec::new());
         let seen: Arc<Mutex<Vec<(Stage, libc::c_int)>>> = Arc::new(Mutex::new(Vec::new()));
         let seeing = Arc::clone(&seen);
@@ -5133,7 +5211,7 @@ mod tests {
             threads: 3,
             ..settings()
         };
-        let host = HostedMlat::new(identity(), BOOT, threads.clone())?;
+        let host = HostedMlat::new(identity(), BOOT, threads.clone(), WindowClock::KEEPING_UP)?;
         host.set_areas(areas.clone(), Vec::new());
         let gate = Gate::shut();
         let shut = Arc::clone(&gate);
@@ -5169,16 +5247,20 @@ mod tests {
             }
             host.take_published(step);
             handled(&host);
-            // Every step's seal is held in its turn, the window step running or not.
-            let since = std::time::Instant::now();
-            while host.sealed_stepped_ms() < step {
-                assert!(
-                    since.elapsed() < std::time::Duration::from_secs(60),
-                    "step {step} not sealed: {:?}",
-                    host.report()
-                );
-                std::thread::sleep(std::time::Duration::from_millis(1));
+            // Until the hold, every step is done before the next, so the window step held is the
+            // fourth at its own step however fast the earlier ones ran, and the hold begins at
+            // the same step on any machine.
+            if held_at.is_none() {
+                waiting_for(
+                    || format!("step {step} never done: {:?}", host.report()),
+                    || host.in_flight() == 0 || held.load(Ordering::SeqCst),
+                )?;
             }
+            // Every step's seal is held in its turn, the window step running or not.
+            waiting_for(
+                || format!("step {step} not sealed: {:?}", host.report()),
+                || host.sealed_stepped_ms() >= step,
+            )?;
             last = step;
             match held_at {
                 None if held.load(Ordering::SeqCst) => {
@@ -5282,6 +5364,7 @@ mod tests {
                     ..settings()
                 },
                 gauges.clone(),
+                WindowClock::KEEPING_UP,
             )?;
             host.set_areas(areas()?, Vec::new());
             for at in order {
@@ -5323,7 +5406,13 @@ mod tests {
             orphans: Gauge::new(Store::Orphans, 64 << 20),
             ..Gauges::unlimited()
         };
-        let host = HostedMlat::charging(identity(), BOOT, settings(), gauges.clone())?;
+        let host = HostedMlat::charging(
+            identity(),
+            BOOT,
+            settings(),
+            gauges.clone(),
+            WindowClock::KEEPING_UP,
+        )?;
         host.set_areas(areas()?, Vec::new());
         // The engine's first step: from it on, a description waits for its own.
         let now = feed.batches[0].content().map_err(text)?.wall_ms;
@@ -5423,7 +5512,7 @@ mod tests {
         // Past the next window step that solves, which reports what the shards refused.
         let until = start + 45_000;
         let areas = areas()?;
-        let host = HostedMlat::new(identity(), BOOT, settings())?;
+        let host = HostedMlat::new(identity(), BOOT, settings(), WindowClock::KEEPING_UP)?;
         host.set_areas(areas.clone(), Vec::new());
         drive(&host, &changed, first, until);
         let mut engine = Engine::new(identity(), BOOT, settings());
@@ -5484,6 +5573,7 @@ mod tests {
                     ..settings()
                 },
                 gauges.clone(),
+                WindowClock::KEEPING_UP,
             )?;
             host.set_areas(areas()?, Vec::new());
             // The engine's first step: from it on, a batch stamped past it waits for its step.
@@ -5540,7 +5630,7 @@ mod tests {
             .next()
             .zip(solving.next())
             .ok_or("too few provisionals")?;
-        let host = HostedMlat::new(identity(), BOOT, settings())?;
+        let host = HostedMlat::new(identity(), BOOT, settings(), WindowClock::KEEPING_UP)?;
         host.set_areas(areas, Vec::new());
         let armed = Arc::new(AtomicBool::new(false));
         let arming = Arc::clone(&armed);
@@ -5605,7 +5695,7 @@ mod tests {
         let first = changed.first().map(|(at, _)| *at).ok_or("no raw")?;
         let until = changed.last().map_or(0, |(at, _)| *at) + 30_000;
         let areas = areas()?;
-        let host = HostedMlat::new(identity(), BOOT, settings())?;
+        let host = HostedMlat::new(identity(), BOOT, settings(), WindowClock::KEEPING_UP)?;
         host.set_areas(areas.clone(), Vec::new());
         // Each forget's nice value and thread name.
         type Seen = Arc<Mutex<Vec<(libc::c_int, Option<String>)>>>;
@@ -5655,6 +5745,7 @@ mod tests {
                 threads: 1,
                 ..settings()
             },
+            WindowClock::KEEPING_UP,
         )?;
         host.set_areas(areas()?, Vec::new());
         let running = Arc::new(AtomicUsize::new(0));
@@ -5721,7 +5812,7 @@ mod tests {
         let delivered = arrivals(&mut simulation, 3)?;
         let first = delivered.first().map(|(at, _)| *at).ok_or("no raw")?;
         let until = delivered.last().map_or(0, |(at, _)| *at);
-        let host = HostedMlat::new(identity(), BOOT, settings())?;
+        let host = HostedMlat::new(identity(), BOOT, settings(), WindowClock::KEEPING_UP)?;
         host.set_areas(areas()?, Vec::new());
         let held = Arc::new(Held {
             gate: Gate::shut(),
@@ -5754,24 +5845,17 @@ mod tests {
                 break;
             }
         }
-        let since = std::time::Instant::now();
-        while !held.waiting.load(Ordering::SeqCst) {
-            assert!(
-                since.elapsed() < std::time::Duration::from_secs(60),
-                "none held"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(1));
-        }
-        // No area: the engine and everything it charged go, on the engine's thread.
+        waiting_for(
+            || "none held".to_owned(),
+            || held.waiting.load(Ordering::SeqCst),
+        )?;
+        // No area: the engine and everything it charged go, on the engine's thread, while the
+        // step is still held: it is let go only after.
         host.set_areas(Regions::default(), Vec::new());
-        let since = std::time::Instant::now();
-        while host.shared.commands.load(Ordering::SeqCst) > 0 {
-            assert!(
-                since.elapsed() < std::time::Duration::from_secs(10),
-                "the engine's thread waits on the provisional step"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(1));
-        }
+        waiting_for(
+            || "the engine's thread waits on the provisional step".to_owned(),
+            || host.shared.commands.load(Ordering::SeqCst) == 0,
+        )?;
         held.gate.open();
         quiet(&host);
         Ok(())
@@ -5789,7 +5873,13 @@ mod tests {
             engine: Gauge::new(Store::Engine, usize::MAX),
             ..Gauges::unlimited()
         };
-        let host = HostedMlat::charging(identity(), BOOT, settings(), gauges.clone())?;
+        let host = HostedMlat::charging(
+            identity(),
+            BOOT,
+            settings(),
+            gauges.clone(),
+            WindowClock::KEEPING_UP,
+        )?;
         host.set_areas(areas()?, Vec::new());
         let seen: Arc<Mutex<Vec<usize>>> = Arc::new(Mutex::new(Vec::new()));
         let (seeing, engine) = (Arc::clone(&seen), Arc::clone(&gauges.engine));
@@ -5817,7 +5907,7 @@ mod tests {
     /// step with nothing to weigh, seal or solve takes no thread.
     #[test]
     fn an_idle_host_wakes_for_nothing_and_steps_with_nothing_on_no_thread() -> Result<(), String> {
-        let host = HostedMlat::new(identity(), BOOT, settings())?;
+        let host = HostedMlat::new(identity(), BOOT, settings(), WindowClock::KEEPING_UP)?;
         host.set_areas(areas()?, Vec::new());
         handled(&host);
         let woke = host.shared.wakeups.load(Ordering::SeqCst);
@@ -5841,7 +5931,7 @@ mod tests {
     /// MLAT relay for nothing, costs it nothing (before, every ask woke it).
     #[test]
     fn asks_wake_the_engines_thread_once_a_step_and_never_with_no_area() -> Result<(), String> {
-        let host = HostedMlat::new(identity(), BOOT, settings())?;
+        let host = HostedMlat::new(identity(), BOOT, settings(), WindowClock::KEEPING_UP)?;
         let wakeups = || host.shared.wakeups.load(Ordering::SeqCst);
         handled(&host);
         let woke = wakeups();
@@ -5872,7 +5962,7 @@ mod tests {
         let unset = std::thread::spawn(|| -> Result<u64, String> {
             lower_own(LOWEST_NICE);
             assert_eq!(own_nice(), LOWEST_NICE);
-            let host = HostedMlat::new(identity(), BOOT, settings())?;
+            let host = HostedMlat::new(identity(), BOOT, settings(), WindowClock::KEEPING_UP)?;
             Ok(host.report().priority_unset)
         })
         .join()
@@ -5893,7 +5983,7 @@ mod tests {
         let delivered = arrivals(&mut simulation, 3)?;
         let first = delivered.first().map(|(at, _)| *at).ok_or("no raw")?;
         let until = delivered.last().map_or(0, |(at, _)| *at) + 60_000;
-        let host = HostedMlat::new(identity(), BOOT, settings())?;
+        let host = HostedMlat::new(identity(), BOOT, settings(), WindowClock::KEEPING_UP)?;
         host.set_areas(areas()?, Vec::new());
         let part = part.to_owned();
         host.delaying(Arc::new(move |stage: Stage| {
@@ -5997,7 +6087,13 @@ mod tests {
             held: Gauge::new(Store::Held, 1),
             ..Gauges::unlimited()
         };
-        let host = HostedMlat::charging(identity(), BOOT, settings(), gauges)?;
+        let host = HostedMlat::charging(
+            identity(),
+            BOOT,
+            settings(),
+            gauges,
+            WindowClock::KEEPING_UP,
+        )?;
         host.set_areas(areas()?, Vec::new());
         drive(&host, &delivered, first, until);
         let report = host.report();
@@ -6091,7 +6187,13 @@ mod tests {
             engine: Gauge::new(Store::Engine, usize::MAX / 2),
             ..Gauges::unlimited()
         };
-        let host = HostedMlat::charging(identity(), BOOT, settings(), gauges.clone())?;
+        let host = HostedMlat::charging(
+            identity(),
+            BOOT,
+            settings(),
+            gauges.clone(),
+            WindowClock::KEEPING_UP,
+        )?;
         host.set_areas(areas, Vec::new());
         let working = Capacity::default()
             .receivers
@@ -6116,16 +6218,19 @@ mod tests {
                     .map(|record| (step, record)),
             );
             if block.is_some() {
-                let since = std::time::Instant::now();
-                while host.report().windows_deferred == 0 {
-                    assert!(
-                        since.elapsed() < std::time::Duration::from_secs(60),
-                        "nothing put off"
-                    );
-                    std::thread::sleep(std::time::Duration::from_millis(1));
-                }
+                waiting_for(
+                    || "nothing put off".to_owned(),
+                    || host.report().windows_deferred > 0,
+                )?;
                 handled(&host);
                 drop(block);
+                // The step's provisional solving done before the next step is asked for, as
+                // `quiet` waits for it at every other step: else the next one finds it running
+                // and is shed, however fast the machine.
+                waiting_for(
+                    || format!("step {step}'s provisional never done: {:?}", host.report()),
+                    || host.provisionals_stepped_ms() >= step,
+                )?;
             } else {
                 quiet(&host);
             }
@@ -6218,7 +6323,13 @@ mod tests {
         };
         // A host keeping up: its sealed bins at every step, and the most its `Held` store held.
         let keeping = Gauges::unlimited();
-        let reference = HostedMlat::charging(identity(), BOOT, threads.clone(), keeping.clone())?;
+        let reference = HostedMlat::charging(
+            identity(),
+            BOOT,
+            threads.clone(),
+            keeping.clone(),
+            WindowClock::KEEPING_UP,
+        )?;
         reference.set_areas(areas.clone(), Vec::new());
         let mut at_step: BTreeMap<u64, Vec<Arc<Bin>>> = BTreeMap::new();
         let mut next = 0;
@@ -6240,7 +6351,13 @@ mod tests {
             held: Gauge::new(Store::Held, limit),
             ..Gauges::unlimited()
         };
-        let host = HostedMlat::charging(identity(), BOOT, threads, gauges.clone())?;
+        let host = HostedMlat::charging(
+            identity(),
+            BOOT,
+            threads,
+            gauges.clone(),
+            WindowClock::KEEPING_UP,
+        )?;
         host.set_areas(areas, Vec::new());
         let gate = Gate::shut();
         let shut = Arc::clone(&gate);
@@ -6264,15 +6381,18 @@ mod tests {
             }
             host.take_published(step);
             handled(&host);
-            let since = std::time::Instant::now();
-            while host.sealed_stepped_ms() < step {
-                assert!(
-                    since.elapsed() < std::time::Duration::from_secs(60),
-                    "step {step} not sealed: {:?}",
-                    host.report()
-                );
-                std::thread::sleep(std::time::Duration::from_millis(1));
+            // Until the hold, every step is done before the next, as the host keeping up's were,
+            // so the window step held is the second at its own step on any machine.
+            if held_from.is_none() {
+                waiting_for(
+                    || format!("step {step} never done: {:?}", host.report()),
+                    || host.in_flight() == 0 || held.load(Ordering::SeqCst),
+                )?;
             }
+            waiting_for(
+                || format!("step {step} not sealed: {:?}", host.report()),
+                || host.sealed_stepped_ms() >= step,
+            )?;
             if held_from.is_none() && held.load(Ordering::SeqCst) {
                 held_from = Some(step);
             }
@@ -6316,7 +6436,7 @@ mod tests {
         let delivered = arrivals(&mut simulation, 3)?;
         let first = delivered.first().map(|(at, _)| *at).ok_or("no raw")?;
         let until = delivered.last().map_or(0, |(at, _)| *at);
-        let host = HostedMlat::new(identity(), BOOT, settings())?;
+        let host = HostedMlat::new(identity(), BOOT, settings(), WindowClock::KEEPING_UP)?;
         host.set_areas(areas()?, Vec::new());
         let passes = Arc::new(AtomicUsize::new(0));
         let counting = Arc::clone(&passes);

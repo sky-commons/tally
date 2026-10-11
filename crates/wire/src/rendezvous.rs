@@ -672,13 +672,17 @@ mod tests {
         let mut held = 0;
         let mut random_held = 0;
         let areas = areas_of(Region::from_u64(base_cell(30))?)?;
+        // The relays' keys are made once: a key is a point derived from its seed, 80,000 of them
+        // were most of this test's time, and what each trial varies is the area, the weights, the
+        // networks and the round trips, which the ranking reads beside the key.
+        let keys: Vec<PublicKey> = (0..RELAYS).map(key).collect();
         for trial in 0..TRIALS {
             let area = areas[trial % areas.len()];
             // Every relay's true round trip from the area (ms), and its declared spare slots.
             let relays: Vec<(Weighted, u64)> = (0..RELAYS)
                 .map(|seed| {
                     let weighted = Weighted {
-                        key: key(seed + 1000 * trial as u32),
+                        key: keys[seed as usize],
                         weight: 50 + random.below(500),
                         network: 1 + (random.below(40) as u32),
                         host: Some(host_of(seed + 1000 * trial as u32)),
