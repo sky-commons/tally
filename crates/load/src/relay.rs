@@ -84,8 +84,11 @@ pub fn spawn(
     };
     let listen = format!("{host}:{port}");
     let stats = format!("127.0.0.1:{}", free_port("127.0.0.1")?);
-    // A feeder holds its session and, while it probes, a probe's.
-    let connections = (2 * feeders + 1024).to_string();
+    // A feeder holds its session and, while it probes, a probe's; probes are brief, so a fifth
+    // more than the feeders holds them (20,000 feeders: 20,000 held and none refused at 24,000,
+    // RFC-0181 "The world baseline"). The relay plans Noise buffers for every connection the cap
+    // allows (`Budget::connection_buffers`), so twice the feeders cost it 13 GB it never used.
+    let connections = (feeders + feeders / 5 + 1024).to_string();
     let mut args: Vec<String> = vec![
         "--key".into(),
         key_file.display().to_string(),

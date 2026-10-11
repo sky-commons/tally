@@ -29,8 +29,9 @@ For a spawned relay:
   --max-upload RATE      its --max-upload (default 10Gbit/s)
   --relay-arg ARG        one more argument to it, after the harness's own (so it overrides them);
                          repeatable. The harness passes --max-connections and
-                         --max-connections-per-address of twice the feeders plus 1024 (a feeder
-                         holds a session and, while it probes, a probe) and --no-mlat
+                         --max-connections-per-address of the feeders and a fifth more, plus 1024
+                         (a feeder holds a session and, while it probes, a probe; the relay plans
+                         a connection's buffers for every connection the cap allows) and --no-mlat
   --relay-mlat           let it host MLAT (no --no-mlat): it plans MLAT's memory and cores
                          beside the stages, so it admits fewer feeders
   --relay-fit            give it --memory exactly what --feeders need (`tally-relay check`'s
