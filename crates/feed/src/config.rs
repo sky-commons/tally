@@ -12,10 +12,15 @@ use tally_wire::{Clock, Location, PublicKey, RelayAddress};
 pub const SEEDS: &[&str] = &[];
 
 const USAGE: &str = "\
-usage: tally-feed --key FILE [options]
+usage: tally-feed (--key FILE | --key-env NAME) [options]
        tally-feed init --key FILE      create the key file if it is missing, print its public key
+       tally-feed new-key              print a new identity's secret (line 1, the text a key file
+                                       holds) and its public key (line 2), writing no file
 
   --key FILE             this receiver's identity (keep it: it is the antenna's name forever)
+  --key-env NAME         the same identity, read from the environment variable NAME instead of a
+                         file (the text a key file holds, as `new-key` prints it), for a host that
+                         keeps secrets in its own configuration, such as a container's
   --source HOST:PORT     readsb's BEAST output (default 127.0.0.1:30005)
   --uat HOST:PORT        dump978-fa's raw output, for 978 MHz UAT (none by default; it is
                          usually 127.0.0.1:30978)
@@ -37,13 +42,24 @@ usage: tally-feed --key FILE [options]
 
 pub enum Command {
     Init(PathBuf),
+    NewKey,
     Run(Box<Config>),
     Done,
 }
 
+/// Where the receiver's identity is read from: exactly one of `--key` and `--key-env`. Either holds
+/// the same text, the identity's secret in base64 as `init` writes it and `new-key` prints it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Key {
+    File(PathBuf),
+    /// The name of an environment variable, never its value: the secret is read where it is used
+    /// (`crate::load`), so a printed `Config` cannot show it.
+    Env(String),
+}
+
 #[derive(Debug)]
 pub struct Config {
-    pub key_file: PathBuf,
+    pub key: Key,
     pub source: String,
     pub uat: Option<String>,
     /// The relays the owner named with `--relay`: candidates, never pinned (RFC-0174 §2.2).
@@ -66,13 +82,20 @@ pub struct Config {
 
 pub fn parse(args: impl Iterator<Item = String>) -> Result<Command, String> {
     let mut args = args.peekable();
+    if args.peek().map(String::as_str) == Some("new-key") {
+        args.next();
+        return match args.next() {
+            None => Ok(Command::NewKey),
+            Some(extra) => Err(format!("new-key takes no arguments, not {extra}\n{USAGE}")),
+        };
+    }
     let init = args.peek().map(String::as_str) == Some("init");
     if init {
         args.next();
     }
-    let mut key_file = None;
+    let (mut key_file, mut key_env) = (None, None);
     let mut config = Config {
-        key_file: PathBuf::new(),
+        key: Key::File(PathBuf::new()),
         source: "127.0.0.1:30005".to_owned(),
         uat: None,
         relays: Vec::new(),
@@ -89,6 +112,7 @@ pub fn parse(args: impl Iterator<Item = String>) -> Result<Command, String> {
         let mut value = || args.next().ok_or_else(|| format!("{flag} needs a value"));
         match flag.as_str() {
             "--key" => key_file = Some(PathBuf::from(value()?)),
+            "--key-env" => key_env = Some(value()?),
             "--source" => config.source = value()?,
             "--uat" => config.uat = Some(value()?),
             "--relay" => config.relays.push(parse_relay(&value()?)?),
@@ -113,11 +137,28 @@ pub fn parse(args: impl Iterator<Item = String>) -> Result<Command, String> {
             other => return Err(format!("unknown argument {other}\n{USAGE}")),
         }
     }
-    let key_file = key_file.ok_or_else(|| format!("--key is required\n{USAGE}"))?;
     if init {
+        // `init` makes a key file; a key held in the environment is made with `new-key`.
+        if key_env.is_some() {
+            return Err(format!(
+                "init writes a key file and takes --key FILE; make a key for --key-env with \
+                 new-key\n{USAGE}"
+            ));
+        }
+        let key_file = key_file.ok_or_else(|| format!("--key is required\n{USAGE}"))?;
         return Ok(Command::Init(key_file));
     }
-    config.key_file = key_file;
+    config.key = match (key_file, key_env) {
+        (Some(file), None) => Key::File(file),
+        (None, Some(name)) if name.is_empty() => {
+            return Err("--key-env needs a variable name".to_owned());
+        }
+        (None, Some(name)) => Key::Env(name),
+        (None, None) => return Err(format!("--key or --key-env is required\n{USAGE}")),
+        (Some(_), Some(_)) => {
+            return Err("--key and --key-env both name the identity: give one".to_owned());
+        }
+    };
     for seed in SEEDS {
         config.seeds.push(parse_relay(seed)?);
     }
@@ -263,6 +304,43 @@ mod tests {
             assert!(refused.contains("retired"), "{refused}");
         }
         assert!(run(&["--key", "k", "--home", &home]).is_err_and(|why| why.contains("--relay")));
+        Ok(())
+    }
+
+    #[test]
+    fn the_key_is_a_file_or_an_environment_variable() -> Result<(), String> {
+        assert_eq!(
+            run(&["--key", "/etc/tally/key"])?.key,
+            Key::File(PathBuf::from("/etc/tally/key"))
+        );
+        assert_eq!(
+            run(&["--key-env", "TALLY_KEY"])?.key,
+            Key::Env("TALLY_KEY".to_owned())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn exactly_one_key_is_required() {
+        assert!(run(&[]).is_err_and(|why| why.contains("--key or --key-env is required")));
+        assert!(
+            run(&["--key", "k", "--key-env", "TALLY_KEY"]).is_err_and(|why| why.contains("one"))
+        );
+        assert!(run(&["--key-env", ""]).is_err());
+        assert!(run(&["--key-env"]).is_err_and(|why| why.contains("needs a value")));
+    }
+
+    #[test]
+    fn new_key_takes_nothing_and_init_takes_a_file() -> Result<(), String> {
+        let parsed = |args: &[&str]| parse(args.iter().map(|arg| (*arg).to_owned()));
+        assert!(matches!(parsed(&["new-key"])?, Command::NewKey));
+        assert!(parsed(&["new-key", "--key", "k"]).is_err());
+        assert!(
+            matches!(parsed(&["init", "--key", "k"])?, Command::Init(path) if path == PathBuf::from("k"))
+        );
+        assert!(
+            parsed(&["init", "--key-env", "TALLY_KEY"]).is_err_and(|why| why.contains("new-key"))
+        );
         Ok(())
     }
 

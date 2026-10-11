@@ -46,3 +46,57 @@ it starts feeders from, each naming its operator, and checks its list with `--ch
 built against the pinned Debian bullseye sysroot (`bazel build -c opt
 --platforms=//platforms:linux_aarch64 //crates/feed:tally-feed`), so they need only glibc 2.25 or
 newer and no C++ runtime: any Raspberry Pi OS from Buster on, and any current Linux.
+
+## Run it as a container
+
+A host that runs each feeder as a container, such as adsb.im (docker compose, amd64 and arm64),
+runs the release's image, `ghcr.io/sky-commons/tally-feed:<tag>`
+(`container/Dockerfile`): the same `tally-feed` binary the release publishes, on distroless with no
+shell, its entrypoint the binary, so the service's `command` is the feeder's arguments. It runs as
+nonroot (65532) and keeps what it learns in `/var/lib/tally-feed`, a volume. The identity is an
+environment variable (`--key-env`) rather than a file, so the host keeps it in its own
+configuration. Make one once, and keep its first line as the secret; the second is the receiver's
+public key, its name:
+
+```sh
+docker run --rm ghcr.io/sky-commons/tally-feed:vX.Y.Z new-key
+```
+
+Then, beside the decoder (here adsb.im's `ultrafeeder`, whose BEAST output is port 30005), with a
+`--relay` for each `HOST:PORT=KEY` line of the release's `seeds`:
+
+```yaml
+services:
+  tally-feed:
+    image: ghcr.io/sky-commons/tally-feed:vX.Y.Z # or @sha256:..., as tally-feed-image.txt names it
+    restart: unless-stopped
+    environment:
+      TALLY_KEY: ${TALLY_KEY} # new-key's first line
+    command:
+      - --key-env
+      - TALLY_KEY
+      - --source
+      - ultrafeeder:30005
+      - --relay
+      - HOST:PORT=KEY
+      - --lat
+      - ${FEEDER_LAT}
+      - --lon
+      - ${FEEDER_LONG}
+      - --alt
+      - ${FEEDER_ALT_M}m
+    volumes:
+      - tally-feed:/var/lib/tally-feed
+volumes:
+  tally-feed:
+```
+
+A 978 MHz UAT decoder adds `--uat dump978:30978`. Every flag is `tally-feed --help`'s. The image
+is signed by the release workflow on its tag, like the binaries; check it before pinning it:
+
+```sh
+cosign verify ghcr.io/sky-commons/tally-feed:vX.Y.Z \
+  --certificate-identity-regexp '^https://github.com/sky-commons/tally/.github/workflows/release.yml@refs/tags/v' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+gh attestation verify oci://ghcr.io/sky-commons/tally-feed:vX.Y.Z --repo sky-commons/tally
+```

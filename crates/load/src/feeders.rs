@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
-use tally_feed::config::Config;
+use tally_feed::config::{Config, Key};
 use tally_wire::RelayAddress;
 
 use crate::traffic::Traffic;
@@ -95,7 +95,7 @@ pub fn spawn(run: Run, counts: Arc<Counts>, start: tokio::time::Instant) {
         let relay = relays[index % relays.len()].clone();
         let config = Config {
             // Never read: the identity is handed over (`tally_feed::start`).
-            key_file: state_dir.join("unused"),
+            key: Key::File(state_dir.join("unused")),
             source: String::new(),
             uat: None,
             relays: vec![relay],

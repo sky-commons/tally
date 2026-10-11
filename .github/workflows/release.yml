@@ -2,7 +2,11 @@
 # optimised and against the pinned sysroot, tests them, and publishes them on the tag's GitHub
 # release with the systemd units, the seed list and the installer (its PUBLISHED_RELEASE written to
 # this release), each with its .sha256, a cosign keyless signature bundle (.sigstore.json, the
-# identity this workflow on this repository's tag) and the build's provenance attestation.
+# identity this workflow on this repository's tag) and the build's provenance attestation. It then
+# pushes the feeder's container image (packaging/container/Dockerfile), for amd64 and arm64, built
+# from those same binaries, to ghcr.io/sky-commons/tally-feed:<tag>, signs its digest the same way,
+# attests its provenance in the registry, and names the digest in the release (tally-feed-image.txt
+# and the notes), so a host that pins the image by digest pins what this release built.
 #
 # Check a download:
 #   sha256sum -c tally-feed-aarch64-linux.sha256
@@ -10,6 +14,12 @@
 #     --certificate-identity-regexp '^https://github.com/sky-commons/tally/.github/workflows/release.yml@refs/tags/v' \
 #     --certificate-oidc-issuer https://token.actions.githubusercontent.com
 #   gh attestation verify tally-feed-aarch64-linux --repo sky-commons/tally
+#
+# Check the image (the tag, or better the digest tally-feed-image.txt names):
+#   cosign verify ghcr.io/sky-commons/tally-feed:vX.Y.Z \
+#     --certificate-identity-regexp '^https://github.com/sky-commons/tally/.github/workflows/release.yml@refs/tags/v' \
+#     --certificate-oidc-issuer https://token.actions.githubusercontent.com
+#   gh attestation verify oci://ghcr.io/sky-commons/tally-feed:vX.Y.Z --repo sky-commons/tally
 name: release
 
 on:
@@ -27,6 +37,10 @@ jobs:
       contents: write
       id-token: write
       attestations: write
+      # The feeder's image, pushed to this organisation's GitHub registry.
+      packages: write
+    env:
+      IMAGE: ghcr.io/sky-commons/tally-feed
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
@@ -86,7 +100,50 @@ jobs:
       - uses: actions/attest-build-provenance@c074443f1aee8d4aeeae555aebba3282517141b2
         with:
           subject-path: 'dist/tally-*-linux, dist/*.service, dist/seeds, dist/install.sh'
+      # The image is the binaries just signed, copied onto distroless (no RUN), so it needs no
+      # emulation for arm64: buildx alone, no QEMU.
+      # v4.4.1, pinned by commit.
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069
+      # v4.6.0, pinned by commit.
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      # v7.4.0, pinned by commit. BuildKit's own provenance is off: the image's provenance is the
+      # attestation below, the same kind and identity as the binaries'.
+      - id: image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc
+        with:
+          context: dist
+          file: packaging/container/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          provenance: false
+          tags: ${{ env.IMAGE }}:${{ github.ref_name }}
+      # Signed by digest, never by tag: a tag can be moved, the digest is what was built. The
+      # digest is written beside the binaries, checksummed and signed like them.
+      - name: sign the image
+        env:
+          DIGEST: ${{ steps.image.outputs.digest }}
+        run: |
+          set -euo pipefail
+          [[ "$DIGEST" == sha256:* ]]
+          cosign sign --yes "$IMAGE@$DIGEST"
+          echo "$IMAGE@$DIGEST" > dist/tally-feed-image.txt
+          cd dist
+          sha256sum tally-feed-image.txt > tally-feed-image.txt.sha256
+          cosign sign-blob --yes --bundle tally-feed-image.txt.sigstore.json tally-feed-image.txt > /dev/null
+      # v2.2.3, pinned by commit.
+      - uses: actions/attest-build-provenance@c074443f1aee8d4aeeae555aebba3282517141b2
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.image.outputs.digest }}
+          push-to-registry: true
       - name: publish
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" --verify-tag --title "$GITHUB_REF_NAME" --notes "Tally $GITHUB_REF_NAME. Install a feeder with \`curl -fsSL https://github.com/$GITHUB_REPOSITORY/releases/download/$GITHUB_REF_NAME/install.sh | sudo bash\`." dist/*
+        run: |
+          set -euo pipefail
+          image="$(cat dist/tally-feed-image.txt)"
+          gh release create "$GITHUB_REF_NAME" --verify-tag --title "$GITHUB_REF_NAME" --notes "Tally $GITHUB_REF_NAME. Install a feeder with \`curl -fsSL https://github.com/$GITHUB_REPOSITORY/releases/download/$GITHUB_REF_NAME/install.sh | sudo bash\`, or run it as a container: \`$image\` (\`$IMAGE:$GITHUB_REF_NAME\`)." dist/*
