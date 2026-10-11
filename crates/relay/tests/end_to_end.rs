@@ -12,7 +12,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tally_feed::config::Config;
+use tally_feed::config::{Config, Key};
 use tally_relay::hub::Hub;
 use tally_relay::link;
 use tally_relay::mlat_host::{MlatHost, MlatReport};
@@ -148,7 +148,7 @@ async fn a_receivers_frames_reach_both_outputs_signed_and_unchanged() -> Result 
         precision_m: 0,
     };
     tokio::spawn(tally_feed::run(Config {
-        key_file,
+        key: Key::File(key_file),
         source: source.to_string(),
         uat: None,
         relays: vec![RelayAddress {

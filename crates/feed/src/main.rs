@@ -6,6 +6,9 @@ use tally_feed::config::{self, Command};
 async fn main() {
     let result = match config::parse(std::env::args().skip(1)) {
         Ok(Command::Init(path)) => tally_feed::init(&path),
+        Ok(Command::NewKey) => tally_feed::new_key().map(|(secret, public)| {
+            println!("{secret}\n{public}");
+        }),
         Ok(Command::Run(config)) => tally_feed::run(*config).await,
         Ok(Command::Done) => Ok(()),
         Err(error) => Err(error),
