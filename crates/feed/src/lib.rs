@@ -15,7 +15,7 @@ use std::sync::Arc;
 use tally_wire::Identity;
 use tokio::sync::broadcast;
 
-use crate::config::Config;
+use crate::config::{Config, Key};
 use crate::delivery_check::DeliveryChecker;
 use crate::relays::{Directory, Publishing};
 use crate::source::Batcher;
@@ -37,6 +37,14 @@ pub fn init(path: &std::path::Path) -> Result<(), String> {
     write_private(path, &format!("{}\n", identity.to_base64()))?;
     println!("{}", identity.public());
     Ok(())
+}
+
+/// A fresh identity for a host that keeps its secrets in its own configuration (`--key-env`): its
+/// secret, the text a key file holds, and its public key, the receiver's name. Nothing is written;
+/// the caller prints both and the host stores the first.
+pub fn new_key() -> Result<(String, tally_wire::PublicKey), String> {
+    let identity = Identity::generate().map_err(|error| error.to_string())?;
+    Ok((identity.to_base64(), identity.public()))
 }
 
 #[cfg(unix)]
@@ -63,8 +71,37 @@ fn load(path: &std::path::Path) -> Result<Identity, String> {
     Identity::from_base64(&text).map_err(|error| format!("{}: {error}", path.display()))
 }
 
+/// The receiver's identity, from its key file or its environment variable.
+fn load_key(key: &Key) -> Result<Identity, String> {
+    match key {
+        Key::File(path) => load(path),
+        Key::Env(name) => from_env(name, std::env::var_os(name)),
+    }
+}
+
+/// An identity from the value of the environment variable `name`, which holds what a key file
+/// holds (surrounding whitespace is trimmed, as a file's newline is). Every error names the
+/// variable and never its value, nor the decoder's report of it, which can quote the secret's
+/// characters: a container's logs are often shared.
+fn from_env(name: &str, value: Option<std::ffi::OsString>) -> Result<Identity, String> {
+    let value = value.ok_or_else(|| format!("--key-env {name}: the variable is not set"))?;
+    let text = value
+        .to_str()
+        .ok_or_else(|| format!("--key-env {name}: the value is not text"))?
+        .trim();
+    if text.is_empty() {
+        return Err(format!("--key-env {name}: the variable is empty"));
+    }
+    Identity::from_base64(text).map_err(|_| {
+        format!(
+            "--key-env {name}: not a key (expected the base64 text `tally-feed new-key` prints \
+             on its first line)"
+        )
+    })
+}
+
 pub async fn run(config: Config) -> Result<(), String> {
-    let identity = load(&config.key_file)?;
+    let identity = load_key(&config.key)?;
     eprintln!("tally-feed: receiver {}", identity.public());
     let (inputs, batching) = start(identity, &config)?;
     tokio::spawn(source::read_beast(config.source, inputs.clone()));
@@ -78,7 +115,7 @@ pub async fn run(config: Config) -> Result<(), String> {
 
 /// Everything a feeder runs but its sources: the relay directory and its saving, the publisher
 /// (probing, choosing, the sessions, the delivery checks) and the batcher that owns the chain.
-/// Reads every field of `config` but `key_file`, `source` and `uat`, which are the caller's.
+/// Reads every field of `config` but `key`, `source` and `uat`, which are the caller's.
 /// Returns the batcher's input, which the sources offer their receptions to, and the batcher
 /// itself, which runs until every clone of the input is dropped. `run` feeds it from the
 /// receiver's decoders; the load harness (`tally-load`) from the MLAT simulator, so each of its
@@ -120,4 +157,31 @@ pub fn start(
         batches,
     );
     Ok((inputs, batching))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_new_key_loads_from_the_environment_as_the_printed_public_key() -> Result<(), String> {
+        let (secret, public) = new_key()?;
+        // As a host's configuration may hold it: with a newline after it.
+        let loaded = from_env("TALLY_KEY", Some(format!("{secret}\n").into()))?;
+        assert_eq!(loaded.public(), public);
+        assert_eq!(loaded.to_base64(), secret);
+        Ok(())
+    }
+
+    #[test]
+    fn a_bad_environment_key_names_the_variable_and_never_the_value() {
+        let secret = "not-a-key-but-secret";
+        for value in [None, Some(""), Some("  \n"), Some(secret), Some("AAAA")] {
+            let refused = from_env("TALLY_KEY", value.map(Into::into))
+                .err()
+                .unwrap_or_default();
+            assert!(refused.starts_with("--key-env TALLY_KEY: "), "{refused}");
+            assert!(!refused.contains(secret), "{refused}");
+        }
+    }
 }
