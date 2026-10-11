@@ -38,4 +38,6 @@ jobs:
           bazelisk-cache: true
           disk-cache: ${{ github.workflow }}
           repository-cache: true
-      - run: bazel test --keep_going --lockfile_mode=error --test_output=errors //...
+      # Two test binaries at a time: a runner has four slow cores, and a test's size is its deadline
+      # with the cores it was measured on, not a share of four with everything else running.
+      - run: bazel test --keep_going --lockfile_mode=error --test_output=errors --local_test_jobs=2 //...

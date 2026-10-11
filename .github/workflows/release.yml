@@ -52,8 +52,9 @@ jobs:
             echo "packaging/install.sh says VERSION=$version; the tag is $GITHUB_REF_NAME" >&2
             exit 1
           fi
+      # Two test binaries at a time, as ci.yml says why.
       - name: test
-        run: bazel test --keep_going --lockfile_mode=error --test_output=errors //...
+        run: bazel test --keep_going --lockfile_mode=error --test_output=errors --local_test_jobs=2 //...
       - name: build
         run: |
           set -euo pipefail
