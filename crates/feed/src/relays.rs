@@ -92,8 +92,27 @@ impl Source {
 }
 
 struct Known {
+    /// The address dialled: the one it was heard of at, or the newest its own signed offer named.
     relay: RelayAddress,
     source: Source,
+    /// `issued_ms` of the relay's own signed offer that set `relay.address`; none while the
+    /// address is only what it was heard of at.
+    offered_ms: Option<u64>,
+    /// The owner's or the seed's address for a relay its own offer has moved: still probed, so a
+    /// move to an address that does not answer leaves the feeder where it was.
+    fallback: Option<String>,
+}
+
+impl Known {
+    /// The addresses to probe for this relay: the one in use, then the owner's or the seed's.
+    fn addresses(&self) -> impl Iterator<Item = RelayAddress> + '_ {
+        std::iter::once(self.relay.clone()).chain(self.fallback.iter().map(|address| {
+            RelayAddress {
+                key: self.relay.key,
+                address: address.clone(),
+            }
+        }))
+    }
 }
 
 /// What the feeder knows of relays, oldest first, and which it is using.
@@ -116,7 +135,12 @@ impl Relays {
         if self.known.iter().any(|known| known.relay.key == relay.key) {
             return false;
         }
-        self.known.push(Known { relay, source });
+        self.known.push(Known {
+            relay,
+            source,
+            offered_ms: None,
+            fallback: None,
+        });
         if source.is_learned() {
             if self.count(|each| each == source) > HINTS_PER_SOURCE {
                 self.forget_oldest(|each| each == source);
@@ -125,6 +149,33 @@ impl Relays {
                 self.forget_oldest(Source::is_learned);
             }
         }
+        true
+    }
+
+    /// Moves a known relay to the address its own signed offer, issued at `issued_ms`, names
+    /// (RFC-0180 §5.1). Only an offer newer than the last one applied moves it, so a replayed old
+    /// offer cannot move it back. A hint is never this: a hint is another relay's word, an offer
+    /// is the relay's own, signed by the key the feeder will make it prove when it dials. The
+    /// owner's or the seed's address is kept as the fallback. False if nothing changed.
+    fn supersede(&mut self, key: &PublicKey, address: &str, issued_ms: u64) -> bool {
+        let Some(known) = self.known.iter_mut().find(|known| known.relay.key == *key) else {
+            return false;
+        };
+        if known.offered_ms.is_some_and(|applied| applied >= issued_ms) {
+            return false;
+        }
+        known.offered_ms = Some(issued_ms);
+        if known.relay.address == address {
+            return false;
+        }
+        let old = std::mem::replace(&mut known.relay.address, address.to_owned());
+        if matches!(known.source, Source::Configured | Source::Seed) && known.fallback.is_none() {
+            known.fallback = Some(old);
+        }
+        if known.fallback.as_deref() == Some(address) {
+            known.fallback = None;
+        }
+        self.changed = true;
         true
     }
 
@@ -146,19 +197,45 @@ impl Relays {
     }
 
     /// The learned relays as the state file keeps them, oldest first: `HOST:PORT=KEY from KEY`, or
-    /// the bare `HOST:PORT=KEY` of a relay learned from a relay not recorded.
+    /// the bare `HOST:PORT=KEY` of a relay learned from a relay not recorded; either ends
+    /// ` offered MS` when the relay's own offer issued at `MS` set the address. The owner's and
+    /// the seeds' relays come from the command line and the binary each run, so they are kept
+    /// only once their own offer has moved them, and then as that address.
     fn state(&self) -> String {
         let mut text = String::new();
         for known in &self.known {
-            let line = format!("{}={}", known.relay.address, known.relay.key);
+            let mut line = format!("{}={}", known.relay.address, known.relay.key);
             match known.source {
-                Source::Learned(from) => text.push_str(&format!("{line} from {from}\n")),
-                Source::Cached => text.push_str(&format!("{line}\n")),
-                Source::Configured | Source::Seed => {}
+                Source::Learned(from) => line.push_str(&format!(" from {from}")),
+                Source::Cached => {}
+                Source::Configured | Source::Seed if known.offered_ms.is_some() => {}
+                Source::Configured | Source::Seed => continue,
             }
+            if let Some(issued_ms) = known.offered_ms {
+                line.push_str(&format!(" offered {issued_ms}"));
+            }
+            text.push_str(&line);
+            text.push('\n');
         }
         text
     }
+}
+
+/// One measurement a relay, its fastest: a relay its own offer moved is probed at its new address
+/// and at the owner's or the seed's, and is chosen, and dialled, at whichever answered sooner.
+fn fastest_per_relay(mut measured: Vec<Measured>) -> Vec<Measured> {
+    let mut fastest: HashMap<PublicKey, Duration> = HashMap::new();
+    for each in &measured {
+        fastest
+            .entry(each.relay.key)
+            .and_modify(|rtt| *rtt = (*rtt).min(each.rtt))
+            .or_insert(each.rtt);
+    }
+    let mut kept = HashSet::new();
+    measured.retain(|each| {
+        fastest.get(&each.relay.key) == Some(&each.rtt) && kept.insert(each.relay.key)
+    });
+    measured
 }
 
 /// A number below `n`, for choosing among relays.
@@ -203,9 +280,13 @@ impl Directory {
         for relay in seeds {
             relays.add(relay, Source::Seed);
         }
-        for (relay, source) in read_relays(&state_dir.join("relays")) {
-            relays.add(relay, source);
+        for (relay, source, offered_ms) in read_relays(&state_dir.join("relays")) {
+            relays.add(relay.clone(), source);
+            if let Some(issued_ms) = offered_ms {
+                relays.supersede(&relay.key, &relay.address, issued_ms);
+            }
         }
+        relays.changed = false;
         let info = sign_info(&identity, location, clock, &[])?;
         Ok(Arc::new(Self {
             state_dir,
@@ -250,31 +331,41 @@ impl Directory {
         }
     }
 
-    /// An offer relay `from` passed on: kept if it verifies, is alive, and is for the feeder's
-    /// area or a cell above it; its relay is learned, and probed first.
+    /// An offer relay `from` passed on. If it verifies and is alive, a known relay it is newer for
+    /// moves to the address it names (`Relays::supersede`), whatever its cell. It is kept if it
+    /// is for the feeder's area or a cell above it; its relay is learned, and probed first.
     pub fn offered(&self, from: PublicKey, offer: ProviderOffer) {
-        let Some(area) = self.area() else {
-            return;
-        };
         let (Ok(signer), Ok(())) = (offer.signer(), offer.verify()) else {
             return;
         };
         let Ok(content) = offer.content() else {
             return;
         };
-        if content.expires_ms <= wall_ms() || !content.cell.contains(area) {
+        if content.expires_ms <= wall_ms() {
+            return;
+        }
+        if let Ok(mut relays) = self.relays.lock() {
+            relays.supersede(&signer, &content.address, content.issued_ms);
+        }
+        let Some(area) = self.area() else {
+            return;
+        };
+        if !content.cell.contains(area) {
             return;
         }
         self.learn(
             from,
             &[RelayAddress {
                 key: signer,
-                address: content.address,
+                address: content.address.clone(),
             }],
         );
         let Ok(mut relays) = self.relays.lock() else {
             return;
         };
+        // A relay this offer made known now carries its issue time, so an older one cannot move
+        // it.
+        relays.supersede(&signer, &content.address, content.issued_ms);
         relays
             .offers
             .retain(|kept| kept.signer().is_ok_and(|kept| kept != signer));
@@ -324,13 +415,13 @@ impl Directory {
             relays
                 .known
                 .iter()
-                .find(|known| known.relay.key == *key)
-                .map(|known| known.relay.clone())
+                .filter(|known| known.relay.key == *key)
+                .flat_map(Known::addresses)
+                .collect::<Vec<_>>()
         };
         let mut first: Vec<RelayAddress> = Vec::new();
         let push = |relay: RelayAddress, into: &mut Vec<RelayAddress>| {
-            if !relays.is_avoided(&relay.key, now) && !into.iter().any(|each| each.key == relay.key)
-            {
+            if !relays.is_avoided(&relay.key, now) && !into.contains(&relay) {
                 into.push(relay);
             }
         };
@@ -338,22 +429,22 @@ impl Directory {
             .held
             .iter()
             .chain(&offering)
-            .filter_map(find)
+            .flat_map(find)
             .chain(
                 relays
                     .known
                     .iter()
                     .filter(|known| matches!(known.source, Source::Configured))
-                    .map(|known| known.relay.clone()),
+                    .flat_map(Known::addresses),
             )
             .chain(
                 relays
                     .known
                     .iter()
                     .filter(|known| matches!(known.source, Source::Seed))
-                    .map(|known| known.relay.clone()),
+                    .flat_map(Known::addresses),
             )
-            .chain(last_band.iter().filter_map(find));
+            .chain(last_band.iter().flat_map(find));
         for relay in ordered {
             push(relay, &mut first);
         }
@@ -362,7 +453,7 @@ impl Directory {
         let mut rest: Vec<RelayAddress> = relays
             .known
             .iter()
-            .map(|known| known.relay.clone())
+            .flat_map(Known::addresses)
             .filter(|relay| !first.iter().any(|each| each.key == relay.key))
             .filter(|relay| !relays.is_avoided(&relay.key, now))
             .collect();
@@ -494,20 +585,29 @@ pub async fn keep_saved(directory: Arc<Directory>) {
     }
 }
 
-fn read_relays(path: &std::path::Path) -> Vec<(RelayAddress, Source)> {
+fn read_relays(path: &std::path::Path) -> Vec<(RelayAddress, Source, Option<u64>)> {
     std::fs::read_to_string(path)
         .map(|text| text.lines().filter_map(read_relay).collect())
         .unwrap_or_default()
 }
 
-fn read_relay(line: &str) -> Option<(RelayAddress, Source)> {
+fn read_relay(line: &str) -> Option<(RelayAddress, Source, Option<u64>)> {
     let line = line.trim();
+    let (line, offered_ms) = match line.rsplit_once(" offered ") {
+        Some((line, issued_ms)) => (line.trim(), Some(issued_ms.trim().parse().ok()?)),
+        None => (line, None),
+    };
     match line.split_once(" from ") {
         Some((relay, from)) => Some((
             crate::config::parse_relay(relay.trim()).ok()?,
             Source::Learned(PublicKey::from_base64(from.trim()).ok()?),
+            offered_ms,
         )),
-        None => Some((crate::config::parse_relay(line).ok()?, Source::Cached)),
+        None => Some((
+            crate::config::parse_relay(line).ok()?,
+            Source::Cached,
+            offered_ms,
+        )),
     }
 }
 
@@ -1222,10 +1322,13 @@ impl Publisher {
                 let mut measured: Vec<Measured> = Vec::new();
                 for each in probed {
                     self.directory.learn(each.measured.relay.key, &each.hints);
-                    if let Some(host) = each.measured.observed {
-                        self.observed.insert(each.measured.relay.key, host);
-                    }
                     measured.push(each.measured);
+                }
+                let measured = fastest_per_relay(measured);
+                for each in &measured {
+                    if let Some(host) = each.observed {
+                        self.observed.insert(each.relay.key, host);
+                    }
                 }
                 self.last_band = probe::band(&measured)
                     .iter()
@@ -1869,6 +1972,190 @@ mod tests {
         // The owner's relays come from the command line each run, never from the file.
         assert!(from(&again, Source::Configured).is_empty());
         std::fs::remove_dir_all(&state).map_err(|error| error.to_string())
+    }
+
+    /// A relay's own offer, signed by `identity`, naming `address`, issued at `issued_ms`.
+    fn own_offer(
+        identity: &Identity,
+        address: &str,
+        issued_ms: u64,
+    ) -> Result<ProviderOffer, String> {
+        ProviderOffer::sign(
+            identity,
+            &tally_wire::directory::ProviderOfferContent {
+                address: address.to_owned(),
+                cell: Region::containing(
+                    &Location {
+                        lat_e7: 0,
+                        lon_e7: 0,
+                        alt_m: 0,
+                        precision_m: 0,
+                    },
+                    0,
+                )
+                .map_err(|error| error.to_string())?,
+                products: Streams::RAW,
+                stripes_of: 1,
+                stripes: 1,
+                mlat_cores: 0,
+                feeder_slots: 1,
+                network: 0,
+                issued_ms,
+                expires_ms: wall_ms() + 600_000,
+            },
+        )
+        .map_err(|error| error.to_string())
+    }
+
+    fn address_of(directory: &Directory, key: &PublicKey) -> Option<String> {
+        directory
+            .known()
+            .into_iter()
+            .find(|(relay, _)| relay.key == *key)
+            .map(|(relay, _)| relay.address)
+    }
+
+    /// RFC-0180 §5.1: a relay renamed under feeders already running reaches them. Its own newer
+    /// signed offer moves it, whoever passed the offer on; an older offer, and another relay's
+    /// hint, never do; and the owner's address stays probed beside the new one.
+    #[test]
+    fn a_relays_own_newer_offer_moves_it_and_nothing_else_does() -> Result<(), String> {
+        let moving = Identity::generate().map_err(|error| error.to_string())?;
+        let owner = RelayAddress {
+            key: moving.public(),
+            address: "relay.old.example:10900".to_owned(),
+        };
+        let directory = directory_at(scratch(), vec![owner.clone()])?;
+        let passer = key()?;
+        let now = wall_ms();
+        directory.offered(passer, own_offer(&moving, "relay.new.example:10900", now)?);
+        assert_eq!(
+            address_of(&directory, &owner.key).as_deref(),
+            Some("relay.new.example:10900")
+        );
+        // An older offer, replayed, does not move it back.
+        directory.offered(
+            passer,
+            own_offer(&moving, "relay.older.example:10900", now - 1)?,
+        );
+        // Another relay's hint names it elsewhere: a hint is not the relay's word.
+        directory.learn(
+            passer,
+            &[RelayAddress {
+                key: owner.key,
+                address: "relay.hinted.example:10900".to_owned(),
+            }],
+        );
+        assert_eq!(
+            address_of(&directory, &owner.key).as_deref(),
+            Some("relay.new.example:10900")
+        );
+        // Both the new address and the owner's are probed; the new first.
+        let probed: Vec<String> = directory
+            .probe_set(&[])
+            .into_iter()
+            .filter(|relay| relay.key == owner.key)
+            .map(|relay| relay.address)
+            .collect();
+        assert_eq!(
+            probed,
+            vec!["relay.new.example:10900".to_owned(), owner.address.clone()]
+        );
+        // An offer that does not verify moves nothing.
+        let mut forged = own_offer(&moving, "relay.forged.example:10900", now + 1)?
+            .as_bytes()
+            .to_vec();
+        if let Some(last) = forged.last_mut() {
+            *last ^= 1;
+        }
+        let forged = ProviderOffer::from_bytes(forged).map_err(|error| error.to_string())?;
+        directory.offered(passer, forged);
+        assert_eq!(
+            address_of(&directory, &owner.key).as_deref(),
+            Some("relay.new.example:10900")
+        );
+        // A newer offer naming the owner's address again moves it back, with no fallback left.
+        directory.offered(passer, own_offer(&moving, &owner.address, now + 2)?);
+        let probed: Vec<RelayAddress> = directory
+            .probe_set(&[])
+            .into_iter()
+            .filter(|relay| relay.key == owner.key)
+            .collect();
+        assert_eq!(probed, vec![owner]);
+        Ok(())
+    }
+
+    /// The move outlives a restart: the owner's relay comes from the command line again, and the
+    /// state file moves it to where its own offer said, keeping the owner's as the fallback.
+    #[test]
+    fn a_move_is_remembered_across_restarts() -> Result<(), String> {
+        let state = scratch();
+        let moving = Identity::generate().map_err(|error| error.to_string())?;
+        let seed = Identity::generate().map_err(|error| error.to_string())?;
+        let owner = RelayAddress {
+            key: moving.public(),
+            address: "relay.old.example:10900".to_owned(),
+        };
+        let now = wall_ms();
+        let first = directory_at(state.clone(), vec![owner.clone()])?;
+        let learned = relay("learned.example:10900")?;
+        first.learn(seed.public(), std::slice::from_ref(&learned));
+        first.offered(
+            seed.public(),
+            own_offer(&moving, "relay.new.example:10900", now)?,
+        );
+        first.save();
+        let again = directory_at(state.clone(), vec![owner.clone()])?;
+        assert_eq!(
+            address_of(&again, &owner.key).as_deref(),
+            Some("relay.new.example:10900")
+        );
+        assert_eq!(from(&again, Source::Learned(seed.public())), vec![learned]);
+        let probed: Vec<String> = again
+            .probe_set(&[])
+            .into_iter()
+            .filter(|relay| relay.key == owner.key)
+            .map(|relay| relay.address)
+            .collect();
+        assert_eq!(
+            probed,
+            vec!["relay.new.example:10900".to_owned(), owner.address.clone()]
+        );
+        // What was applied is remembered too: an offer older than the saved one moves nothing.
+        again.offered(
+            seed.public(),
+            own_offer(&moving, "relay.older.example:10900", now - 1)?,
+        );
+        assert_eq!(
+            address_of(&again, &owner.key).as_deref(),
+            Some("relay.new.example:10900")
+        );
+        std::fs::remove_dir_all(&state).map_err(|error| error.to_string())
+    }
+
+    /// A relay probed at two addresses is one candidate, at the faster, in the order probed.
+    #[test]
+    fn a_relay_probed_twice_is_chosen_at_its_faster_address() -> Result<(), String> {
+        use crate::probe::tests::measured;
+        let moved = key()?;
+        let other = key()?;
+        let mut slow = measured(moved, 40, 1, 1);
+        slow.relay.address = "relay.old.example:10900".to_owned();
+        let mut fast = measured(moved, 10, 1, 1);
+        fast.relay.address = "relay.new.example:10900".to_owned();
+        let kept = fastest_per_relay(vec![measured(other, 20, 1, 2), slow, fast.clone()]);
+        let kept: Vec<(PublicKey, String)> = kept
+            .into_iter()
+            .map(|each| (each.relay.key, each.relay.address))
+            .collect();
+        assert_eq!(
+            kept,
+            vec![
+                (other, "relay-2-20.example:10900".to_owned()),
+                (moved, fast.relay.address)
+            ]
+        );
+        Ok(())
     }
 
     #[test]
