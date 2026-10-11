@@ -1,6 +1,5 @@
 # Tally (RFC-0171): a receiver publishes its raw receptions once, and anyone may run a relay.
-# This directory is self-contained: it builds with Cargo or Bazel on its own, references nothing
-# outside itself, and is mirrored to github.com/flightlines/tally with `//tally/` rewritten to `//`.
+# It builds with Cargo or Bazel on its own.
 [workspace]
 resolver = "2"
 members = ["crates/*"]
@@ -10,7 +9,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.96"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/flightlines/tally"
+repository = "https://github.com/sky-commons/tally"
 publish = false
 
 [workspace.dependencies]
@@ -74,8 +73,8 @@ expect_used = "deny"
 # optimised they take forty seconds (thirteen of wall time), and every engine test that solves
 # pays the same; either alone saves little. Debug assertions and overflow checks stay as the
 # profile has them, and results are the same to the bit either way (the golden test). Bazel says
-# the same: //tally/crates/mlat-solver:BUILD.bazel and the blake2 annotation in
-# //tally:tally.MODULE.bazel.
+# the same: //crates/mlat-solver:BUILD.bazel and the blake2 annotation in
+# //:tally.MODULE.bazel.
 [profile.dev.package.tally-mlat-solver]
 opt-level = 2
 

@@ -838,7 +838,7 @@ in either direction. The text below is kept as what was built.
 
 `tally/` is a self-contained Cargo workspace with its own Bazel module file: it references
 nothing outside itself and builds with `cargo` or Bazel alone. In the monorepo, the root module
-includes `//tally:tally.MODULE.bazel` (its crate repository, `tally_crates`), and the nested
+includes `//:tally.MODULE.bazel` (its crate repository, `tally_crates`), and the nested
 `tally/MODULE.bazel` is the module file the public repository uses (Bazel ignores a nested one).
 Copybara (pinned by hash, `//tools/mirror:copybara`) publishes `tally/` to
 `github.com/flightlines/tally` on every push to main that touches it
@@ -969,7 +969,7 @@ roughly $200 to $700 a month on budget hosting; today it is one server.
 4. **The feeder.** Built: publish from readsb's BEAST port with the ceiling, signed chained
    batches, counter epochs, MLAT echoes and merged streams kept out, the home, anchor and random
    slots, the relay cache, backoff, and the control records. End-to-end tests over loopback
-   sockets (`//tally/crates/relay:end_to_end`): a stand-in readsb's frames reach a subscriber
+   sockets (`//crates/relay:end_to_end`): a stand-in readsb's frames reach a subscriber
    signed and unchanged and the loopback BEAST output decoded and unchanged; a feeder publishing
    another receiver's batch is cut off and nothing in that name is forwarded; a batch arriving by
    two relays is forwarded once; a stalled subscriber is dropped while another keeps every batch.

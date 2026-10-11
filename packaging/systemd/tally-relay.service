@@ -20,7 +20,7 @@
 
 [Unit]
 Description=Tally relay: verifies and forwards Tally receivers' batches
-Documentation=https://github.com/flightlines/tally
+Documentation=https://github.com/sky-commons/tally
 # A relay stamps what it ingests by its own ingest clock, anchored to the wall clock it starts on
 # and never going back: started on a clock still seconds behind, it would refuse every feeder's
 # raw as ahead of it until it caught up. So it starts once
@@ -51,7 +51,7 @@ LimitNOFILE=65536
 # kernel's OOM killer inside its own cgroup and restarted (Restart=always), rather than taking the
 # host down with it. The relay's budget is MemoryHigh less its headroom: 64 MiB and a quarter of
 # the plan for the allocator's free pages (`budget::headroom_for`); 4G holds every member session a
-# base cell brings and feeders beside them (`tally-relay check`, held by //tally/crates/relay:check).
+# base cell brings and feeders beside them (`tally-relay check`, held by //crates/relay:check).
 MemoryHigh=4G
 MemoryMax=5G
 

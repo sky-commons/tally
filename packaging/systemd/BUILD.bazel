@@ -1,6 +1,6 @@
-# The packaged units. //tally/crates/relay:check holds the relay's to its memory budget, through
+# The packaged units. //crates/relay:check holds the relay's to its memory budget, through
 # `tally-relay check` (RFC-0181 §9).
 exports_files(
     ["tally-relay.service"],
-    visibility = ["//tally/crates/relay:__pkg__"],
+    visibility = ["//crates/relay:__pkg__"],
 )

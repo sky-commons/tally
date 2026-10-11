@@ -1,5 +1,5 @@
 # The platforms Tally ships for (RFC-0171 §10 step 6): a feeder on a Raspberry Pi or any 64-bit ARM
-# Linux, and x86_64 Linux. `bazel build --platforms=//tally/platforms:linux_aarch64 //tally/...`
+# Linux, and x86_64 Linux. `bazel build --platforms=//platforms:linux_aarch64 //...`
 # cross-compiles with the pinned LLVM and sysroot of the public module.
 platform(
     name = "linux_aarch64",

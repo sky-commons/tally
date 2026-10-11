@@ -1,0 +1,83 @@
+# A release (RFC-0180 §4): a tag vX.Y.Z builds the feeder and the relay for both platforms,
+# optimised and against the pinned sysroot, tests them, and publishes them on the tag's GitHub
+# release with the systemd units, the seed list and the installer (its PUBLISHED_RELEASE written to
+# this release), each with its .sha256, a cosign keyless signature bundle (.sigstore.json, the
+# identity this workflow on this repository's tag) and the build's provenance attestation.
+#
+# Check a download:
+#   sha256sum -c tally-feed-aarch64-linux.sha256
+#   cosign verify-blob tally-feed-aarch64-linux --bundle tally-feed-aarch64-linux.sigstore.json \
+#     --certificate-identity-regexp '^https://github.com/sky-commons/tally/.github/workflows/release.yml@refs/tags/v' \
+#     --certificate-oidc-issuer https://token.actions.githubusercontent.com
+#   gh attestation verify tally-feed-aarch64-linux --repo sky-commons/tally
+name: release
+
+on:
+  push:
+    tags: ['v*.*.*']
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - uses: bazel-contrib/setup-bazel@e8776f58fb6a6e9055cbaf1b38c52ccc5247e9c4
+        with:
+          bazelisk-cache: true
+          repository-cache: true
+      # v3.8.1, pinned by commit.
+      - uses: sigstore/cosign-installer@d7d6bc7722e3daa8354c50bcb52f4837da5e9b6a
+      - name: the installer's version is the tag
+        run: |
+          version="$(sed -n 's/^VERSION="\(.*\)"$/\1/p' packaging/install.sh)"
+          if [[ "$version" != "$GITHUB_REF_NAME" ]]; then
+            echo "packaging/install.sh says VERSION=$version; the tag is $GITHUB_REF_NAME" >&2
+            exit 1
+          fi
+      - name: test
+        run: bazel test --keep_going --lockfile_mode=error //...
+      - name: build
+        run: |
+          set -euo pipefail
+          mkdir dist
+          for arch in x86_64 aarch64; do
+            bazel build -c opt --lockfile_mode=error --platforms=//platforms:linux_$arch \
+              //crates/feed:tally-feed //crates/relay:tally-relay
+            for bin in tally-feed tally-relay; do
+              path="$(bazel cquery -c opt --platforms=//platforms:linux_$arch --output=files \
+                //crates/${bin#tally-}:$bin 2>/dev/null)"
+              install -m 0755 "$path" "dist/$bin-$arch-linux"
+            done
+          done
+          install -m 0644 packaging/systemd/tally-feed.service packaging/systemd/tally-relay.service \
+            packaging/seeds dist/
+          release="https://github.com/$GITHUB_REPOSITORY/releases/download/$GITHUB_REF_NAME"
+          sed "s#^PUBLISHED_RELEASE=\"\"\$#PUBLISHED_RELEASE=\"$release\"#" packaging/install.sh > dist/install.sh
+          grep -q "^PUBLISHED_RELEASE=\"$release\"$" dist/install.sh
+          bash dist/install.sh --check-seeds dist/seeds
+      - name: checksums and signatures
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          for file in *; do
+            sha256sum "$file" > "$file.sha256"
+            cosign sign-blob --yes --bundle "$file.sigstore.json" "$file" > /dev/null
+          done
+      # v2.2.3, pinned by commit.
+      - uses: actions/attest-build-provenance@c074443f1aee8d4aeeae555aebba3282517141b2
+        with:
+          subject-path: 'dist/tally-*-linux, dist/*.service, dist/seeds, dist/install.sh'
+      - name: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" --verify-tag --title "$GITHUB_REF_NAME" --notes "Tally $GITHUB_REF_NAME. Install a feeder with \`curl -fsSL https://github.com/$GITHUB_REPOSITORY/releases/download/$GITHUB_REF_NAME/install.sh | sudo bash\`." dist/*

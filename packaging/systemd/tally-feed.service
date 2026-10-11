@@ -7,7 +7,7 @@
 
 [Unit]
 Description=Tally feeder: publishes this receiver's receptions to Tally relays
-Documentation=https://github.com/flightlines/tally
+Documentation=https://github.com/sky-commons/tally
 After=network-online.target time-sync.target
 Wants=network-online.target
 

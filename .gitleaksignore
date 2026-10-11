@@ -1,0 +1,3 @@
+# Receivers' public keys in a test fixture, not secrets.
+96dcee72514b4f6ac34b48905aae2015d5d04cb7:crates/api-types/testdata/leaderboard.json:generic-api-key:19
+96dcee72514b4f6ac34b48905aae2015d5d04cb7:crates/api-types/testdata/leaderboard.json:generic-api-key:33
