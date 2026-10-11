@@ -887,12 +887,19 @@ mod tests {
     use super::*;
     use tally_mlat_solver::geo::{self, Geodetic};
 
-    /// A hosted MLAT whose every ask takes `pass_ms`: a pass of the duties as long as one that
-    /// publishes a window step's solutions.
+    /// A hosted MLAT whose every ask lasts until the runtime's task has beaten while it lasted
+    /// (`beats` moved past where it stood when the ask began): a pass of the duties as long as
+    /// one that publishes a window step's solutions, held for as long as it takes to see whether
+    /// the runtime's tasks go on meanwhile. Seen, it says so in `beat_seen`; a pass that holds the
+    /// runtime's only thread can never see one, and gives up at `HANG`.
     struct Slow {
-        pass_ms: u64,
+        beats: AtomicU64,
+        beat_seen: std::sync::atomic::AtomicBool,
         asked: AtomicU64,
     }
+
+    /// How long a test waits for the event it asserts before calling it a hang.
+    const HANG: Duration = Duration::from_secs(120);
 
     impl MlatHost for Slow {
         fn set_areas(&self, _: Regions, _: Vec<tally_wire::ReceiverInfo>) {}
@@ -903,7 +910,18 @@ mod tests {
 
         fn take_published(&self, _: u64) -> Vec<Record> {
             self.asked.fetch_add(1, Ordering::SeqCst);
-            std::thread::sleep(Duration::from_millis(self.pass_ms));
+            if self.beat_seen.load(Ordering::SeqCst) {
+                return Vec::new();
+            }
+            let before = self.beats.load(Ordering::SeqCst);
+            let since = std::time::Instant::now();
+            while since.elapsed() < HANG {
+                if self.beats.load(Ordering::SeqCst) > before {
+                    self.beat_seen.store(true, Ordering::SeqCst);
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
             Vec::new()
         }
 
@@ -923,7 +941,9 @@ mod tests {
     /// A pass of the timed duties, however long, holds no task of the async runtime. Before,
     /// the duties ran as a runtime task, and a pass that published a window step's solutions held its
     /// worker ten seconds with every task woken there: raw's p99 went to seconds. Here the runtime
-    /// has one thread, and a task on it keeps its 10 ms beat through passes of a second each.
+    /// has one thread, and a pass lasts until a task on it has beaten: it ends only if the runtime
+    /// went on while it ran, which no pass on the runtime's own thread can see (it gives up at
+    /// `HANG`, unseen). Held by that event, never by how long a beat took on a loaded machine.
     #[test]
     fn a_long_pass_of_the_duties_holds_no_task_of_the_runtime() -> Result<(), String> {
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -932,27 +952,24 @@ mod tests {
             .map_err(|error| error.to_string())?;
         let hub = Arc::new(Hub::new(8));
         let slow = Arc::new(Slow {
-            pass_ms: 1_000,
+            beats: AtomicU64::new(0),
+            beat_seen: std::sync::atomic::AtomicBool::new(false),
             asked: AtomicU64::new(0),
         });
         hub.network()
             .host_mlat(Arc::clone(&slow) as Arc<dyn MlatHost>);
-        let longest = runtime.block_on(async {
+        runtime.block_on(async {
             start(Arc::clone(&hub), tokio::runtime::Handle::current());
             let started = std::time::Instant::now();
-            let mut last = std::time::Instant::now();
-            let mut longest = Duration::ZERO;
-            while started.elapsed() < Duration::from_millis(2_500) {
+            while !slow.beat_seen.load(Ordering::SeqCst) && started.elapsed() < HANG {
                 tokio::time::sleep(Duration::from_millis(10)).await;
-                longest = longest.max(last.elapsed());
-                last = std::time::Instant::now();
+                slow.beats.fetch_add(1, Ordering::SeqCst);
             }
-            longest
         });
         assert!(slow.asked.load(Ordering::SeqCst) >= 1, "no pass ran");
         assert!(
-            longest < Duration::from_millis(500),
-            "a runtime task waited {longest:?} behind a pass"
+            slow.beat_seen.load(Ordering::SeqCst),
+            "no runtime task ran while a pass did"
         );
         Ok(())
     }

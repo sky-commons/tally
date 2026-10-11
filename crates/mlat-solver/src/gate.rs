@@ -379,7 +379,7 @@ mod tests {
     /// long the background items run and with no checkpoint among them. Before, a background step
     /// spread over the gate's every permit held a provisional one up until an item ended. Judged
     /// by order, not by a clock: the background items end only once the prompt
-    /// work has run (or after a minute, so a failure ends), and the prompt work must have run while
+    /// work has run (or after a hang guard, so a failure ends), and the prompt work must have run while
     /// none had ended.
     #[test]
     fn prompt_work_finds_a_permit_free_at_once_while_background_holds_all_it_may() {
@@ -403,7 +403,7 @@ mod tests {
                             running_b.fetch_add(1, Ordering::SeqCst);
                             let started = std::time::Instant::now();
                             while let_go_b.load(Ordering::SeqCst) == 0
-                                && started.elapsed() < Duration::from_secs(60)
+                                && started.elapsed() < Duration::from_secs(120)
                             {
                                 std::thread::sleep(Duration::from_millis(1));
                             }
@@ -436,8 +436,9 @@ mod tests {
 
     /// A background pass under a gate of `N` permits, which may hold `N - 1` of them,
     /// ends in the rounds its work takes over `N - 1` threads, not in twice them. Counted in
-    /// rounds, not time: every item waits until `N - 1` items are in its round (or a long while,
-    /// which only a starved round ever waits out), so the rounds a pass takes are its schedule's.
+    /// rounds, not time: every item waits until `N - 1` items are in its round (or a hang guard,
+    /// 120 s, which only a starved round ever waits out, and a loaded machine's late thread never
+    /// does), so the rounds a pass takes are its schedule's.
     /// Cut into `N` fixed shares, `N - 1` shares ran in `N - 1` full rounds, and the last share
     /// started only after, one item a round: `2 (N - 1)` rounds. Pulled from one index, the
     /// `N (N - 1)` items take `N` full rounds.
@@ -463,7 +464,7 @@ mod tests {
                         advanced.notify_all();
                         return;
                     }
-                    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                    let deadline = std::time::Instant::now() + Duration::from_secs(120);
                     while state.0 == mine {
                         let left = deadline.saturating_duration_since(std::time::Instant::now());
                         if left.is_zero() {

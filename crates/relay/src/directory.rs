@@ -3082,9 +3082,12 @@ mod tests {
         mine.pin_host("localhost", std::net::Ipv4Addr::LOCALHOST.into());
         let mut now = NOW;
         let mut gossiped = mine.tick(&hub, Some(&identity), now);
-        for _ in 0..100 {
-            if !mine.offers_for(cell, now).is_empty() {
-                break;
+        // Until its own offer is held (the host name resolved, then signed): waited for as long as
+        // that takes, failing only on a hang, never on how many ticks fit a span of the clock.
+        let started = std::time::Instant::now();
+        while mine.offers_for(cell, now).is_empty() {
+            if started.elapsed() > Duration::from_secs(120) {
+                return Err("its own offer was never held".into());
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
             now += 100;

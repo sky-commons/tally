@@ -2858,10 +2858,35 @@ mod tests {
         Ok(())
     }
 
+    /// Waits for `dials` to reach three, and says how long that took from `since`, before the
+    /// first: two waits of the dial schedule (1 s, then 2 s, each up to half again, `Backoff`)
+    /// lie between the first dial and the third, so it is 3 s at least however slow the machine,
+    /// where a loop that redials at once takes milliseconds. A dial loop that never dials a third
+    /// time fails it at `HANG`.
+    async fn third_dial(
+        dials: &std::sync::atomic::AtomicU64,
+        since: Instant,
+        settled: impl Fn(u64) -> bool,
+    ) -> Result<Duration, String> {
+        const HANG: Duration = Duration::from_secs(120);
+        timeout(HANG, async {
+            loop {
+                let dialled = dials.load(std::sync::atomic::Ordering::Relaxed);
+                if dialled >= 3 && settled(dialled) {
+                    return since.elapsed();
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .map_err(|_| "never dialled three times".to_owned())
+    }
+
     /// A relay that refuses this one (it never verified this relay's offer, so it asks gossip's
     /// wait, no longer than the dial schedule's own) and a peer that drops every connection at
     /// once are each dialled less and less often, whatever the role dialled: never again at once,
-    /// never in a loop (`Redial`).
+    /// never in a loop (`Redial`). Held by the dials counted and the schedule's waits, which a
+    /// loaded machine can only lengthen: never by how many dials fit a span of the wall clock.
     #[tokio::test]
     async fn a_dial_that_is_refused_or_dropped_is_not_retried_in_a_hot_loop() -> Result<(), String>
     {
@@ -2887,6 +2912,7 @@ mod tests {
                 streams: Streams::RAW,
                 regions: Vec::new(),
             };
+            let since = Instant::now();
             let dialling = tokio::spawn(member(
                 RelayAddress {
                     key: far_key,
@@ -2898,14 +2924,12 @@ mod tests {
                 Arc::clone(&hub),
                 outgoing,
             ));
-            // Waits of 1, 2 and 4 s (each up to half again): at most three dials in four seconds.
-            tokio::time::sleep(Duration::from_secs(4)).await;
+            let took = third_dial(&hub.network().dials(), since, |_| true).await?;
             dialling.abort();
-            let dials = hub
-                .network()
-                .dials()
-                .load(std::sync::atomic::Ordering::Relaxed);
-            assert!((2..=3).contains(&dials), "{role:?}: {dials} dials in 4 s");
+            assert!(
+                took >= Duration::from_secs(3),
+                "{role:?}: three dials in {took:?}"
+            );
         }
         // A peer that takes the connection and drops it unanswered.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -2922,6 +2946,7 @@ mod tests {
         });
         let hub = Arc::new(Hub::new(8));
         let (_sender, outgoing) = mpsc::channel(1);
+        let since = Instant::now();
         let dialling = tokio::spawn(member(
             RelayAddress {
                 key: Identity::generate().map_err(text)?.public(),
@@ -2933,15 +2958,14 @@ mod tests {
             Arc::clone(&hub),
             outgoing,
         ));
-        // Waits of 1, 2 and 4 s (each up to half again): at most three dials in four seconds.
-        tokio::time::sleep(Duration::from_secs(4)).await;
+        // Every dial counted reached the peer: waited for until the peer has taken as many as were
+        // counted, the next dial seconds away.
+        let took = third_dial(&hub.network().dials(), since, |dialled| {
+            accepted.load(std::sync::atomic::Ordering::Relaxed) == dialled
+        })
+        .await?;
         dialling.abort();
-        let dials = hub
-            .network()
-            .dials()
-            .load(std::sync::atomic::Ordering::Relaxed);
-        assert!((2..=3).contains(&dials), "{dials} dials in 4 s");
-        assert_eq!(accepted.load(std::sync::atomic::Ordering::Relaxed), dials);
+        assert!(took >= Duration::from_secs(3), "three dials in {took:?}");
         Ok(())
     }
 
@@ -4354,7 +4378,11 @@ mod tests {
             tally_mlat_solver::held::Rates::MEASURED.ceiling_per_s as u64
         );
         assert!(BATCHES * u64::from(EACH) > rate * crate::ingest::FEEDER_RECEPTIONS_BURST_SECS);
-        let hub = Arc::new(Hub::new(8).max_upload(roomy()));
+        // The ceiling is the batches' stamps' (`ingest::ReceptionCeilings`): every batch stamped at
+        // one instant, so what is kept and dropped is the burst's alone, however long the machine
+        // takes between reading one batch and the next.
+        let at = crate::network::wall_ms();
+        let hub = Arc::new(Hub::clocked(8, Arc::new(move || at)).max_upload(roomy()));
         let mut sent = Vec::new();
         for wanted in [true, false] {
             let feeder = Identity::generate().map_err(text)?;

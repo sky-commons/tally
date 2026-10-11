@@ -33,7 +33,7 @@ use tally_mlat_solver::{
 };
 use tally_relay::hub::Hub;
 use tally_relay::mlat_host::stepping::{Clock, Hosting, step};
-use tally_relay::mlat_host::{HostedMlat, MlatHost, MlatReport, SETTLE_MS};
+use tally_relay::mlat_host::{HostedMlat, MlatHost, MlatReport, SETTLE_MS, WindowClock};
 use tally_wire::noise;
 use tally_wire::rendezvous::AREA_RESOLUTION;
 use tally_wire::{
@@ -59,10 +59,12 @@ fn text(error: impl std::fmt::Display) -> String {
     error.to_string()
 }
 
-const WAIT: Duration = Duration::from_secs(90);
+/// How long a test waits for the event it asserts before calling it a hang: a guard on a relay
+/// that never gets there, never a verdict on how fast the machine running the test is.
+const WAIT: Duration = Duration::from_secs(180);
 /// How long the clock may stand still before the test says why (`stepping`): inside `WAIT`, so
 /// its reason comes before the client's deadline.
-const STOOD: Duration = Duration::from_secs(60);
+const STOOD: Duration = Duration::from_secs(120);
 
 /// Moves `clock` for as long as the test runs, every host fed every batch of `walls`
 /// (`stepping::step`).
@@ -276,6 +278,8 @@ fn pinned(identity: &Identity) -> Result<Arc<Pinned>> {
             threads: 4,
             capacity: tally_mlat::engine::Capacity::default(),
         },
+        // Its clock walks no faster than it keeps up (`stepping`): it is never overloaded.
+        WindowClock::KEEPING_UP,
     )?;
     // Solving from the first offer on: the relay's own network task re-states it every tick.
     let areas = Regions::new(areas);
@@ -811,6 +815,7 @@ async fn member(
                 threads: 2,
                 capacity: tally_mlat::engine::Capacity::default(),
             },
+            WindowClock::KEEPING_UP,
         )?,
     });
     network.host_mlat(Arc::clone(&mlat) as Arc<dyn MlatHost>);
@@ -1120,7 +1125,10 @@ async fn three_relays_share_solve_and_serve_verifiable_positions_and_both_world_
     // aircraft the live world drew in each second it sealed.
     let mut own: BTreeMap<(u32, u64), u64> = BTreeMap::new();
     let mut drawn: BTreeMap<u64, BTreeSet<u32>> = BTreeMap::new();
-    let outcome = timeout(Duration::from_secs(240), async {
+    // The scenario's 240 s at the wall clock's pace at most, and a hang guard beyond: the clock
+    // walks no faster than the relays keep up, so a loaded machine takes longer, and only a clock
+    // that stands still (`STOOD`) or a relay that never answers is a failure.
+    let outcome = timeout(Duration::from_secs(240) + WAIT, async {
         while !heard.done() {
             let record = records
                 .recv()
@@ -1519,9 +1527,10 @@ async fn of_four_relays_three_solve_an_area_and_a_dead_one_is_replaced_by_the_ne
         .chain([left_out])
         .collect();
     // Its last re-signing was at most `OWN_RESIGN_EVERY_MS` before it died, so its offers lapse
-    // within `OFFER_LIFETIME_MS` of the kill; a tick and a step on top.
+    // within `OFFER_LIFETIME_MS` of the kill; then ticks and steps, waited for as long as they
+    // take (`WAIT`, a hang guard): when it moved is held from below, which load cannot break.
     let lifetime = Duration::from_millis(tally_relay::directory::OFFER_LIFETIME_MS);
-    let margin = Duration::from_secs(15);
+    let margin = WAIT;
     timeout(lifetime + margin, async {
         loop {
             let choices = choices(&members);

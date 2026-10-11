@@ -245,6 +245,7 @@ mod tests {
                 threads: 1,
                 capacity: tally_mlat::engine::Capacity::default(),
             },
+            crate::mlat_host::WindowClock::KEEPING_UP,
         )?);
         let hub = Arc::new(Hub::new(8));
         hub.network().host_mlat(hosted);

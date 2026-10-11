@@ -19,6 +19,7 @@ use tally_relay::hub::{Description, Hub, Inbound, Origin};
 use tally_relay::ingest::{Stamp, Threads};
 use tally_relay::mlat_host::{
     Cut, HostedMlat, MlatHost, MlatReport, PROVISIONAL_BEHIND, STEP_MS, Stage, WINDOW_STEPS_BEHIND,
+    WindowClock,
 };
 use tally_wire::{Identity, Location, PublicKey, ReceiverInfo, Record, Region, Regions};
 
@@ -175,11 +176,19 @@ fn mlat_run_with(
     Ok((run.signed, run.report, run.held))
 }
 
-/// What a run of `mlat_run_cuts` is given to cut by: a window budget in place of the host's, and
-/// the cuts other relays published, offered before the first step.
+/// An overloaded host's window steps: each declares it ran 600 ms against a budget of 200, so
+/// every judgment is overload, the same however fast the machine running the test is.
+const OVERLOADED: WindowClock = WindowClock::Declared {
+    ran_ms: 600,
+    budget_ms: 200,
+};
+
+/// What a run of `mlat_run_cuts` is given to cut by: what its window steps declare they ran
+/// against what budget (none: a host that keeps up, `WindowClock::KEEPING_UP`), and the cuts other
+/// relays published, offered before the first step.
 #[derive(Clone, Debug, Default)]
 struct Cutting {
-    budget_ms: Option<u64>,
+    window_clock: Option<WindowClock>,
     offered: Vec<Cut>,
     /// The relays' network: this relay's key and the one other relay holding its areas, and the
     /// records that relay addressed this one, handed to the duties as a link hands them
@@ -259,6 +268,7 @@ fn mlat_run_cuts(
         Identity::from_seed([5; 32]),
         MLAT_BOOT,
         settings,
+        cutting.window_clock.unwrap_or(WindowClock::KEEPING_UP),
     )?);
     match delays {
         Delays::Seeded(seed) => {
@@ -284,9 +294,6 @@ fn mlat_run_cuts(
             }));
         }
         Delays::None => {}
-    }
-    if let Some(budget_ms) = cutting.budget_ms {
-        host.budgeting(budget_ms);
     }
     // The cuts other relays published, offered as the stamps reach the step `CUT_LEAD_STEPS` before
     // each: as a link hands them in, never all at once before the first step.
@@ -965,7 +972,7 @@ fn two_relays_offered_one_cut_solve_the_same_receivers_and_make_the_same_bytes()
             describing,
             delays,
             Cutting {
-                budget_ms: None,
+                window_clock: None,
                 offered,
                 network: None,
             },
@@ -1041,7 +1048,8 @@ fn an_overloaded_host_cuts_by_rank_and_a_peer_offered_the_cut_makes_the_same_byt
         message: 2,
         seal: 2,
     };
-    // Every window step is held 600 ms against a budget of 200: overload at the first.
+    // Every window step is held 600 ms, and declares it ran that long against a budget of 200:
+    // overload at the first.
     let overloaded = mlat_run_cuts(
         &delivered,
         &areas,
@@ -1053,7 +1061,7 @@ fn an_overloaded_host_cuts_by_rank_and_a_peer_offered_the_cut_makes_the_same_byt
             behind: 10,
         },
         Cutting {
-            budget_ms: Some(200),
+            window_clock: Some(OVERLOADED),
             offered: Vec::new(),
             network: None,
         },
@@ -1113,7 +1121,7 @@ fn an_overloaded_host_cuts_by_rank_and_a_peer_offered_the_cut_makes_the_same_byt
         Describing::Before { reversed: true },
         Delays::Seeded(7),
         Cutting {
-            budget_ms: None,
+            window_clock: None,
             offered: overloaded.cuts.clone(),
             network: None,
         },
@@ -1166,7 +1174,7 @@ fn an_overloaded_relays_cut_reaches_the_relay_holding_its_area_and_both_make_the
             behind: 10,
         },
         Cutting {
-            budget_ms: Some(200),
+            window_clock: Some(OVERLOADED),
             offered: Vec::new(),
             network: Some(Neighbours {
                 me: relay_a.clone(),
@@ -1211,7 +1219,7 @@ fn an_overloaded_relays_cut_reaches_the_relay_holding_its_area_and_both_make_the
             Describing::Before { reversed: true },
             delays,
             Cutting {
-                budget_ms: None,
+                window_clock: None,
                 offered: Vec::new(),
                 network: Some(Neighbours {
                     me: relay_b.clone(),
