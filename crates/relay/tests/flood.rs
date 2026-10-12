@@ -294,7 +294,7 @@ async fn memory_stays_bounded_under_a_flood_of_many_feeders() -> Result {
         seal: 2,
     };
     let hub = Arc::new(
-        Hub::new(8)
+        Hub::new(8, tally_relay::sharing::Deadlines::RELAY)
             .max_connections(4 * OFFERED)
             // Every feeder here is on loopback, one address.
             .max_connections_per_address(4 * OFFERED)
@@ -462,7 +462,7 @@ async fn memory_stays_bounded_under_a_flood_of_many_feeders() -> Result {
 async fn a_stalled_stage_never_grows_past_the_budget() -> Result {
     let _alone = alone().await?;
     let hub = Arc::new(
-        Hub::clocked(8, Arc::new(|| 0))
+        Hub::clocked(8, Arc::new(|| 0), tally_relay::sharing::Deadlines::RELAY)
             .memory_for_feeders(4, false)
             .staged(Threads {
                 ingest: 2,
@@ -581,7 +581,9 @@ async fn a_stalled_stage_never_grows_past_the_budget() -> Result {
 /// weighs as many as an idle one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_ingest_pool_is_shared_by_network_not_by_connection() -> Result {
-    let hub = Arc::new(Hub::new(8).memory_for_feeders(CEILING, false));
+    let hub = Arc::new(
+        Hub::new(8, tally_relay::sharing::Deadlines::RELAY).memory_for_feeders(CEILING, false),
+    );
     let batch = hub.budget().gauge(Store::Ingest).limit() / 3;
     let source = |address: &str, connection: u64| -> Result<u64> {
         let address: std::net::IpAddr = address.parse().map_err(text)?;

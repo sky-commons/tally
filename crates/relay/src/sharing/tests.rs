@@ -15,7 +15,7 @@ use tally_wire::{
 
 use super::bundles::{BundleIndex, Bundles, Omission, children};
 use super::groups::{GroupKey, Groups};
-use super::member::{Member, Message, Outgoing, Piece};
+use super::member::{Deadlines, Member, Message, Outgoing, Piece};
 use super::parity::Parity;
 use super::seeds::{
     SEED_COPIES, SEED_ROTATION_SECONDS, SEEDS, epoch_of, is_seed, seed_members, seeded_bytes,
@@ -78,6 +78,11 @@ struct Sim {
     down: BTreeSet<usize>,
     /// Members that take but forward nothing they did not originate.
     silent: BTreeSet<usize>,
+    /// Members that forward what they did not originate this much later than the rest: slow, not
+    /// silent.
+    slow: BTreeMap<usize, u64>,
+    /// What every member judges its deliverers by.
+    deadlines: Deadlines,
     /// The first time each member held each record, and how many times it was handed one.
     held_at: BTreeMap<(usize, Hash), u64>,
     handed: BTreeMap<(usize, Hash), u32>,
@@ -94,10 +99,19 @@ struct Sim {
 }
 
 impl Sim {
+    /// `count` members judging by a relay's deadlines, each message `delay_ms` on its way: the
+    /// clock is the simulation's, so no machine's load moves a delivery past a deadline.
     fn new(count: usize, delay_ms: u64) -> Result<Self, String> {
+        Self::judging_by(count, delay_ms, Deadlines::RELAY)
+    }
+
+    /// As `new`, every member judging by `deadlines`.
+    fn judging_by(count: usize, delay_ms: u64, deadlines: Deadlines) -> Result<Self, String> {
         let group = GroupKey::new(area()?, Streams::RAW);
         let keys = keys(count);
-        let mut members: Vec<Member> = (0..count).map(|i| unlimited(identity(i))).collect();
+        let mut members: Vec<Member> = (0..count)
+            .map(|i| Member::new(identity(i), Gauge::unlimited(Store::Batches), deadlines))
+            .collect();
         let index = keys.iter().enumerate().map(|(i, key)| (*key, i)).collect();
         let mut sim = Self {
             group,
@@ -112,6 +126,8 @@ impl Sim {
             seq: 0,
             down: BTreeSet::new(),
             silent: BTreeSet::new(),
+            slow: BTreeMap::new(),
+            deadlines,
             held_at: BTreeMap::new(),
             handed: BTreeMap::new(),
             originated: BTreeMap::new(),
@@ -154,6 +170,11 @@ impl Sim {
             if forwarded && self.silent.contains(&from) {
                 continue;
             }
+            let late_ms = if forwarded {
+                self.slow.get(&from).copied().unwrap_or(0)
+            } else {
+                0
+            };
             if let Message::Piece { hash, .. } = &outgoing.message
                 && !forwarded
             {
@@ -177,7 +198,7 @@ impl Sim {
             }
             self.seq += 1;
             self.queue
-                .push(Reverse((self.now + self.delay_ms, self.seq)));
+                .push(Reverse((self.now + self.delay_ms + late_ms, self.seq)));
             self.events.insert(
                 self.seq,
                 Event {
@@ -295,7 +316,7 @@ impl Sim {
     /// Every live member was handed every record originated by a live origin, once, and still
     /// holds those within the horizon (older ones it has let go, as it should).
     fn everyone_holds_everything(&self, excluded: &BTreeSet<usize>) -> Outcome {
-        let horizon_ms = super::member::HORIZON_SECONDS * 1000;
+        let horizon_ms = self.deadlines.horizon_seconds() * 1000;
         for (hash, (at, origin)) in &self.originated {
             if self.down.contains(origin) {
                 continue;
@@ -636,6 +657,75 @@ fn a_member_that_does_not_forward_is_reported_and_demoted() -> Outcome {
     Ok(())
 }
 
+/// The deadlines decide the verdict, and they are the member's given value, not the clock's: a
+/// member that forwards every record it did not originate 6 s late is reported short by a relay's
+/// deadlines (`Deadlines::RELAY`, whose 4 s receipt grace the last seconds of each window miss),
+/// and by deadlines whose grace outlasts its lag, the same deliveries on the same clock are no
+/// shortfall: every member judges, and nobody is reported or demoted.
+#[test]
+fn a_slow_member_is_reported_by_a_relays_deadlines_and_not_by_patient_ones() -> Outcome {
+    const LATE_MS: u64 = 6_000;
+    let origins = [0, 1, 2, 3];
+    let run = |deadlines: Deadlines| -> Result<(Sim, usize), String> {
+        let mut sim = Sim::judging_by(16, 20, deadlines)?;
+        let (slow, _) = sim
+            .interior_with_children(&origins)
+            .ok_or("no interior member with children")?;
+        sim.slow.insert(slow, LATE_MS);
+        sim.feed(&origins, 3, 10)?;
+        let end = sim.now + 15_000;
+        sim.run_until(end);
+        Ok((sim, slow))
+    };
+    // Reported short in a flooded receipt naming it: what a shortfall is.
+    let reported = |sim: &Sim, slow: usize| {
+        sim.receipts.iter().any(|(_, to, receipt)| {
+            *to != slow
+                && receipt
+                    .content()
+                    .is_ok_and(|content| content.parent == sim.keys[slow])
+        })
+    };
+
+    let (sim, slow) = run(Deadlines::RELAY)?;
+    let shortfalls: u64 = sim.members.iter().map(|m| m.stats().shortfalls).sum();
+    if shortfalls == 0 || !reported(&sim, slow) {
+        return Err(format!(
+            "a member {LATE_MS} ms late was not reported short by a relay's deadlines \
+             ({shortfalls} shortfalls)"
+        ));
+    }
+
+    let patient = Deadlines {
+        receipt_grace_ms: LATE_MS + 4_000,
+        ..Deadlines::RELAY
+    };
+    let (sim, slow) = run(patient)?;
+    let unjudged: Vec<usize> = sim
+        .live()
+        .into_iter()
+        .filter(|i| sim.members[*i].stats().judged == 0)
+        .collect();
+    if !unjudged.is_empty() {
+        return Err(format!("members that judged no window: {unjudged:?}"));
+    }
+    let shortfalls: u64 = sim.members.iter().map(|m| m.stats().shortfalls).sum();
+    if shortfalls != 0 || reported(&sim, slow) {
+        return Err(format!(
+            "{shortfalls} shortfalls of a member whose lag the grace outlasts"
+        ));
+    }
+    for i in sim.live() {
+        for other in sim.live() {
+            if sim.members[i].is_demoted(sim.group, &sim.keys[other]) {
+                return Err(format!("member {i} demoted {other}, who delivered in time"));
+            }
+        }
+    }
+    sim.everyone_holds_everything(&BTreeSet::new())?;
+    Ok(())
+}
+
 #[test]
 fn receipts_verify_and_name_what_was_delivered() -> Outcome {
     let mut sim = Sim::new(9, 20)?;
@@ -906,7 +996,7 @@ fn groups_hold_members_until_they_lapse_or_are_demoted() -> Outcome {
 
 #[test]
 fn the_seam_admits_relays_that_ask_and_ignores_clients() -> Outcome {
-    let sharing = super::Sharing::new();
+    let sharing = super::Sharing::new(Deadlines::RELAY);
     let cell = area()?;
     let assignment = tally_wire::StripeAssignment {
         cell,
@@ -1079,10 +1169,10 @@ fn a_have_summary_at_the_end_of_time_is_refused_not_a_panic() -> Outcome {
 
 #[test]
 fn a_poisoned_lock_does_not_end_sharing() -> Outcome {
-    let hub = crate::hub::Hub::new(8);
+    let hub = crate::hub::Hub::new(8, crate::sharing::Deadlines::RELAY);
     let cell = area()?;
     hub.network().selection.set_taken(vec![cell]);
-    let sharing = super::Sharing::new();
+    let sharing = super::Sharing::new(Deadlines::RELAY);
     let me = identity(0);
     let _ = sharing.tick_shed(&hub, Some(&me), 0, START_MS);
     // A panic while the member and the outbox are held poisons both locks.
@@ -1116,7 +1206,7 @@ fn a_poisoned_lock_does_not_end_sharing() -> Outcome {
 
 #[test]
 fn a_region_coarser_than_an_area_is_shared_in_its_areas_groups() -> Outcome {
-    let hub = crate::hub::Hub::new(8);
+    let hub = crate::hub::Hub::new(8, crate::sharing::Deadlines::RELAY);
     let area = area()?;
     let region = area.ancestor(1).ok_or("no region")?;
     hub.network().selection.set_taken(vec![region]);
@@ -1189,9 +1279,9 @@ fn serving_with_members(
     origins: &[&Identity],
     limit: usize,
 ) -> Result<(crate::hub::Hub, super::Sharing, Arc<Gauge>), String> {
-    let hub = crate::hub::Hub::new(8);
+    let hub = crate::hub::Hub::new(8, crate::sharing::Deadlines::RELAY);
     hub.network().selection.set_taken(vec![cell]);
-    let sharing = super::Sharing::new();
+    let sharing = super::Sharing::new(Deadlines::RELAY);
     let gauge = Gauge::new(Store::Batches, limit);
     sharing.charge_to(Arc::clone(&gauge));
     for origin in origins {
@@ -1486,6 +1576,63 @@ fn a_false_parity_is_dropped_and_a_true_one_after_it_rebuilds() -> Outcome {
     Ok(())
 }
 
+/// A parity rebuilds its stripe's whole slice, the records already held beside those missing. A
+/// member that holds part of a stripe when the true parity comes (one of its records arrived, the
+/// rest did not yet) rebuilds the rest from it and keeps it: the parity is not taken for false, so
+/// the member that delivered it is not reported short of it.
+#[test]
+fn a_true_parity_rebuilds_the_rest_of_a_stripe_partly_held_and_is_kept() -> Outcome {
+    let group = GroupKey::new(area()?, Streams::RAW);
+    let members = keys(4);
+    let mut member = unlimited(identity(0));
+    let _ = member.set_members(group, &members, &[], START_MS);
+    let origin = identity(1);
+    let receiver = identity(10_000);
+    let mut pieces = Vec::new();
+    for sequence in 0..24 {
+        pieces.push(record(&receiver, sequence, START_MS)?);
+    }
+    let second = START_MS / 1000;
+    let hashes: Vec<Hash> = pieces.iter().map(|(hash, _)| *hash).collect();
+    let signed = manifest(&origin, group, second, &hashes)?;
+    let lost = data_stripe(&hashes[0]);
+    let in_lost = hashes
+        .iter()
+        .filter(|hash| data_stripe(hash) == lost)
+        .count() as u64;
+    if in_lost < 2 {
+        return Err(format!("{in_lost} records in the stripe, not a part of it"));
+    }
+    let _ = member.receive(members[1], Message::Manifest(signed.clone()), START_MS);
+    // Every other stripe whole, and of this one only the first record.
+    for (hash, bytes) in &pieces {
+        if data_stripe(hash) != lost || *hash == hashes[0] {
+            let message = Message::Piece {
+                group,
+                hash: *hash,
+                piece: bytes.clone(),
+            };
+            let _ = member.receive(members[1], message, START_MS);
+        }
+    }
+    let views: Vec<(Hash, &Piece)> = pieces.iter().map(|(h, b)| (*h, b)).collect();
+    let parity = Parity::build(signed.hash(), group.cell, group.product, second, &views);
+    let _ = member.receive(members[2], Message::Parity(Arc::new(parity)), START_MS);
+    let _ = member.tick((second + 1) * 1000 + super::member::REBUILD_AFTER_MS);
+    if member.stats().rebuilt != in_lost - 1 || !hashes.iter().all(|hash| member.holds(group, hash))
+    {
+        return Err(format!(
+            "rebuilt {} of the {} the stripe lacked",
+            member.stats().rebuilt,
+            in_lost - 1
+        ));
+    }
+    if !member.holds_parity(group, &signed.hash()) {
+        return Err("a true parity was let go for a stripe held in part".into());
+    }
+    Ok(())
+}
+
 #[test]
 fn repair_is_answered_only_to_members_of_the_trees() -> Outcome {
     let group = GroupKey::new(area()?, Streams::RAW);
@@ -1524,7 +1671,7 @@ fn repair_is_answered_only_to_members_of_the_trees() -> Outcome {
 
 #[test]
 fn a_relay_that_only_asked_is_in_no_tree() -> Outcome {
-    let hub = crate::hub::Hub::new(8);
+    let hub = crate::hub::Hub::new(8, crate::sharing::Deadlines::RELAY);
     let cell = area()?;
     hub.network().selection.set_taken(vec![cell]);
     let sharing = &hub.network().sharing;
@@ -1593,7 +1740,7 @@ fn a_full_cap_withdraws_regions_one_at_a_time_in_a_fixed_order_and_takes_them_ba
         return Err("the last withdrawn was not taken back first".into());
     }
     // Through the seam: the relay is a leaf in the trees of what it withdrew from.
-    let hub = crate::hub::Hub::new(8);
+    let hub = crate::hub::Hub::new(8, crate::sharing::Deadlines::RELAY);
     hub.network().selection.set_taken(vec![area]);
     for index in 1..6 {
         hold_offer(&hub, &identity(index), area, 0b1111, START_MS)?;
@@ -1619,7 +1766,7 @@ fn a_full_cap_withdraws_regions_one_at_a_time_in_a_fixed_order_and_takes_them_ba
 
 /// A member charged to no budget: a test's, whose store has no bound.
 fn unlimited(identity: Identity) -> Member {
-    Member::new(identity, Gauge::unlimited(Store::Batches))
+    Member::new(identity, Gauge::unlimited(Store::Batches), Deadlines::RELAY)
 }
 
 /// The one batch byte store is held by its gauge alone (RFC-0181 §9): every record and parity a
@@ -1629,16 +1776,18 @@ fn unlimited(identity: Identity) -> Member {
 #[test]
 fn a_member_holds_records_for_its_repair_horizon_shared_and_its_gauge_is_what_it_holds() -> Outcome
 {
-    use super::member::{
-        HORIZON_MS, HORIZON_SECONDS, JUDGE_AFTER_MS, RECEIPT_GRACE_MS, RECEIPT_WINDOW_SECONDS,
-        REPAIR_AFTER_MS,
-    };
+    use super::member::RECEIPT_WINDOW_SECONDS;
     // The horizon is sharing's own duties end to end, not a round minute.
-    if HORIZON_MS
-        != RECEIPT_WINDOW_SECONDS * 1000 + RECEIPT_GRACE_MS + JUDGE_AFTER_MS + REPAIR_AFTER_MS
-        || !(12..=15).contains(&HORIZON_SECONDS)
+    let relay = Deadlines::RELAY;
+    let horizon_seconds = relay.horizon_seconds();
+    if relay.horizon_ms()
+        != RECEIPT_WINDOW_SECONDS * 1000
+            + relay.receipt_grace_ms
+            + relay.judge_after_ms
+            + relay.repair_after_ms
+        || !(12..=15).contains(&horizon_seconds)
     {
-        return Err(format!("a horizon of {HORIZON_SECONDS} s"));
+        return Err(format!("a horizon of {horizon_seconds} s"));
     }
     let group = GroupKey::new(area()?, Streams::RAW);
     let members = keys(4);
@@ -1646,9 +1795,9 @@ fn a_member_holds_records_for_its_repair_horizon_shared_and_its_gauge_is_what_it
     let (hash, piece) = record(&receiver, 1, START_MS)?;
     let len = piece.len();
     // The store's share: room for two such records a second over the horizon.
-    let limit = 2 * len * HORIZON_SECONDS as usize;
+    let limit = 2 * len * horizon_seconds as usize;
     let gauge = Gauge::new(Store::Batches, limit);
-    let mut member = Member::new(identity(0), std::sync::Arc::clone(&gauge));
+    let mut member = Member::new(identity(0), std::sync::Arc::clone(&gauge), Deadlines::RELAY);
     let _ = member.set_members(group, &members, &[], START_MS);
     let _ = member.originate(group, hash, piece.clone(), START_MS);
     // What it holds and hands on is the batch itself: its bytes are the batch's, not a copy.
@@ -1670,7 +1819,7 @@ fn a_member_holds_records_for_its_repair_horizon_shared_and_its_gauge_is_what_it
     }
     // Driven to its limit: past it a record is refused whole, and counted.
     let mut taken = 1;
-    for sequence in 2..(2 * HORIZON_SECONDS + 10) {
+    for sequence in 2..(2 * horizon_seconds + 10) {
         let (hash, piece) = record(&receiver, sequence, START_MS)?;
         let _ = member.originate(group, hash, piece, START_MS);
         if member.holds(group, &hash) {
@@ -1712,11 +1861,11 @@ fn a_member_holds_records_for_its_repair_horizon_shared_and_its_gauge_is_what_it
         ));
     }
     // Within the horizon it is held; past it, let go, and its bytes released with it.
-    let _ = member.tick(START_MS + HORIZON_SECONDS * 1000);
+    let _ = member.tick(START_MS + horizon_seconds * 1000);
     if !member.holds(group, &hash) {
         return Err("let go within the horizon".into());
     }
-    let _ = member.tick(START_MS + HORIZON_SECONDS * 1000 + 1_001);
+    let _ = member.tick(START_MS + horizon_seconds * 1000 + 1_001);
     if member.holds(group, &hash) || member.held_bytes() != 0 || gauge.held() != 0 {
         return Err(format!(
             "held past the horizon: {} bytes, {} charged",
@@ -1745,10 +1894,12 @@ fn world() -> Result<Vec<Region>, String> {
 #[test]
 fn a_tick_with_the_world_taken_and_nothing_flowing_does_no_work() -> Outcome {
     let me = identity(0);
-    let hub = crate::hub::Hub::new(8).advertising(vec![tally_wire::RelayAddress {
-        key: me.public(),
-        address: "198.51.100.7:7450".to_owned(),
-    }]);
+    let hub = crate::hub::Hub::new(8, crate::sharing::Deadlines::RELAY).advertising(vec![
+        tally_wire::RelayAddress {
+            key: me.public(),
+            address: "198.51.100.7:7450".to_owned(),
+        },
+    ]);
     let network = hub.network();
     network.adopt_identity(me.clone());
     let world = world()?;

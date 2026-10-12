@@ -83,6 +83,7 @@ use self::locks::lock;
 use self::member::{Arrival, Member, Message, Outgoing, Piece, record_hash};
 use self::withdrawal::Withdrawal;
 
+pub use self::member::Deadlines;
 pub use self::seeds::{SEED_COPIES, seeded_bytes};
 
 /// The products an area's group shares (§2.5: raw, positions, provisional positions, clock
@@ -143,6 +144,8 @@ pub const PARITY_ASSEMBLY_MS: u64 = 10 * 1000;
 pub const BUNDLE_INDEX_AFTER_SECONDS: u64 = 3;
 
 pub struct Sharing {
+    /// What the member judges its deliverers by, as the relay was built (`Member::new`).
+    deadlines: Deadlines,
     pub groups: groups::Groups,
     pub bundles: bundles::Bundles,
     member: Mutex<Option<Member>>,
@@ -350,9 +353,12 @@ pub fn forwarders_shed(report: &EgressReport) -> u64 {
         .sum()
 }
 
-impl Default for Sharing {
-    fn default() -> Self {
+impl Sharing {
+    /// Sharing whose member judges its deliverers by `deadlines` (a relay's `Deadlines::RELAY`;
+    /// `member::Deadlines`). There is no default: a caller names the deadlines its verdicts follow.
+    pub fn new(deadlines: Deadlines) -> Self {
         Self {
+            deadlines,
             groups: groups::Groups::default(),
             bundles: bundles::Bundles::default(),
             member: Mutex::default(),
@@ -367,12 +373,6 @@ impl Default for Sharing {
             relayout: Mutex::default(),
             laid_out: AtomicU64::new(0),
         }
-    }
-}
-
-impl Sharing {
-    pub fn new() -> Self {
-        Self::default()
     }
 
     /// A member asking this relay for stripes: it is a member of the group for a while, as its
@@ -730,7 +730,8 @@ impl Sharing {
         });
         let mut guard = lock(&self.member);
         let gauge = Arc::clone(&lock(&self.gauge));
-        let fresh = |identity: &Identity| Member::new(identity.clone(), Arc::clone(&gauge));
+        let fresh =
+            |identity: &Identity| Member::new(identity.clone(), Arc::clone(&gauge), self.deadlines);
         let member = guard.get_or_insert_with(|| fresh(identity));
         if member.key() != me {
             *member = fresh(identity);

@@ -268,7 +268,7 @@ fn mlat_run_cuts(
     // (`Store::Batches`, planned only beside members): an overload cut is addressed to a raw
     // source through it. Untaken, the store was planned nothing and held one cut at a time.
     let hub = Arc::new(
-        Hub::clocked(8, Arc::new(|| 0))
+        Hub::clocked(8, Arc::new(|| 0), tally_relay::sharing::Deadlines::RELAY)
             .taking(areas.cells().to_vec())
             .staged(threads)?,
     );

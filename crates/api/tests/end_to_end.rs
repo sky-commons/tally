@@ -91,7 +91,7 @@ async fn start_readsb() -> Result<(String, Asked)> {
 async fn start_relay() -> Result<(std::net::SocketAddr, tally_wire::PublicKey, String)> {
     let identity = Identity::generate().map_err(text)?;
     let key = identity.public();
-    let hub = Arc::new(Hub::new(8));
+    let hub = Arc::new(Hub::new(8, tally_relay::sharing::Deadlines::RELAY));
     let listener = TcpListener::bind("127.0.0.1:0").await.map_err(text)?;
     let address = listener.local_addr().map_err(text)?;
     let stats = TcpListener::bind("127.0.0.1:0").await.map_err(text)?;
@@ -571,7 +571,10 @@ async fn mlat_relay(clock: &Arc<stepping::Clock>) -> Result<(RelayAddress, Arc<H
     let listener = TcpListener::bind("127.0.0.1:0").await.map_err(text)?;
     let address = listener.local_addr().map_err(text)?;
     // Every feeder here comes from loopback: more than one host's share of connections.
-    let hub = Arc::new(Hub::clocked(8, clock.clock()).max_connections_per_address(64));
+    let hub = Arc::new(
+        Hub::clocked(8, clock.clock(), tally_relay::sharing::Deadlines::RELAY)
+            .max_connections_per_address(64),
+    );
     let areas = tally_wire::Regions::new(areas()?);
     let host = HostedMlat::new(
         identity.clone(),

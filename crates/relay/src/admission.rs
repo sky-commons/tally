@@ -112,7 +112,8 @@ mod tests {
 
     #[test]
     fn with_duties_off_nothing_is_declared_and_no_feeder_is_taken() -> Result<(), String> {
-        let hub = Hub::new(8).max_upload(Cap::bytes_per_sec(1_000_000));
+        let hub =
+            Hub::new(8, crate::sharing::Deadlines::RELAY).max_upload(Cap::bytes_per_sec(1_000_000));
         let admission = &hub.network().admission;
         admission.configure(64_512, false);
         let identity = Identity::generate().map_err(|error| error.to_string())?;
