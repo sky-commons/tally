@@ -10,15 +10,18 @@
 //! batch, so every subscriber reads each (receiver, boot) in admitted order, described first.
 //!
 //! Every item queued is charged once to the relay's budget (`budget::Store::Fanout`), however many
-//! queues hold it, and released when the last lets it go: a link takes it with its charge
+//! queues hold it, for what the fan-out allocates itself (the item and a slot in each queue that
+//! takes it, [`item_charge`]; a batch's decode and signed bytes are charged once, for their life,
+//! by their own allocations, `budget::Store::Decoded`, and no queue charges them again), and
+//! released when the last lets it go: a link takes it with its charge
 //! ([`Taken`]) and holds both while it gathers and sends it, so what waits for a slow socket is
 //! charged until the send returns. What a subscriber holds is what its queue holds and what its
 //! link took and has not yet sent (its items in hand, [`Hold`]), both: its bounds count both, and
 //! when an item would pass the budget, the subscriber holding the most of both is let go as fallen
 //! behind, and the next, until it fits. Letting a subscriber go lets go of its charges at once,
 //! those its link holds in hand among them ([`Hold`] is only a claim on a charge the subscriber
-//! keeps; an item still held whole, its decode with it, keeps a claim of its own until it is
-//! dropped, [`Taken`]), so the room the budget counted on is free before the next is ranked: before, only its
+//! keeps; an item still held whole keeps a claim of its own until it is dropped, [`Taken`]), so
+//! the room the budget counted on is free before the next is ranked: before, only its
 //! queue was cleared and its link let go of what it held in hand when it next woke, so a stalled
 //! socket holding its items in hand with an empty queue freed nothing, and an honest subscriber
 //! was let go in its place. A link let go stops its send at once ([`Listener::fallen`]), and no
@@ -186,13 +189,43 @@ pub enum Fell {
     Resync,
 }
 
-/// What an item costs a queue: a batch's one decode (its signed bytes among it,
-/// `Decoded::footprint`), or the record's encoded bytes.
+/// What an item keeps alive while a queue holds it, by which a subscriber is bounded and ranked
+/// ([`Bounds::max_bytes`], the laggard let go first): a batch's decode and its signed bytes
+/// (`Decoded::footprint`, `Batch::footprint`), or the record's encoded bytes. Not what the queue is
+/// charged: those are charged once, by their own allocations (`budget::Store::Decoded`), for as
+/// long as anything holds them ([`item_charge`]).
 pub fn item_bytes(item: &Item) -> usize {
-    match &item.decoded {
-        Some(decoded) => decoded.footprint(),
-        None => item.record.encoded_len(),
+    match (&item.decoded, &*item.record) {
+        (Some(decoded), Record::Batch(batch)) => decoded.footprint() + batch.footprint(),
+        (Some(decoded), _) => decoded.footprint(),
+        (None, record) => record.encoded_len(),
     }
+}
+
+/// What one item allocates once, whatever takes it: its record's `Arc` and the `Arc` of the one
+/// charge every queue holding it shares.
+pub const ITEM_BYTES: usize = 2 * tally_wire::decoded::ARC_HEADER
+    + std::mem::size_of::<Record>()
+    + std::mem::size_of::<Charge>();
+
+/// What one queue's slot for an item takes: the item's clone, its claim on the charge, its bytes
+/// and its stamp ([`Queued`]).
+pub const SLOT_BYTES: usize = std::mem::size_of::<(Queued, usize, u64)>();
+
+/// What the fan-out charges for an item `takers` queues take (`budget::Store::Fanout`): what it
+/// allocates itself, the item once ([`ITEM_BYTES`]) and a slot in each queue ([`SLOT_BYTES`]), and
+/// a record's bytes where no allocation of their own carries their charge (any record but a batch
+/// kept at ingest, whose signed bytes and decode are charged once for their life, whoever holds
+/// them, `budget::Store::Decoded`). Before, every item was charged its decode's footprint here as
+/// well as in the epochs, the notes and the orphans, and no queue's slots were charged at all.
+pub fn item_charge(item: &Item, takers: usize) -> usize {
+    let record = match &*item.record {
+        Record::Batch(batch) if batch.is_owned() => 0,
+        record => record.encoded_len(),
+    };
+    ITEM_BYTES
+        .saturating_add(takers.saturating_mul(SLOT_BYTES))
+        .saturating_add(record)
 }
 
 /// An item as a queue holds it: with the one charge every queue holding it shares.
@@ -203,12 +236,11 @@ type Queued = (Item, Arc<Charge>);
 /// (gathering it, sending it), released with the last holder.
 ///
 /// It holds a claim of its own on the charge beside its subscriber's (`charge`), declared after
-/// the item, so its decode goes before that claim (Rust drops a struct's fields in order): a
-/// subscriber let go releases what it holds in hand at once ([`Hold`]), but a charge whose decode
-/// a link still holds in a `Taken` stays until the `Taken` is dropped, never a moment past the
-/// decode. A link that keeps an item past taking it keeps only its [`Hold`] (`Taken::hold`), which
-/// holds no decode. Before, letting a subscriber go released the charges of items its link still
-/// held whole, and the decodes stayed alive uncharged until the link next woke.
+/// the item, so the item's own allocation goes before that claim (Rust drops a struct's fields in
+/// order): a subscriber let go releases what it holds in hand at once ([`Hold`]), but the charge of
+/// an item a link still holds in a `Taken` stays until the `Taken` is dropped. A link that keeps an
+/// item past taking it keeps only its [`Hold`] (`Taken::hold`). The decode the item keeps alive is
+/// charged by itself, whoever holds it.
 #[derive(Debug)]
 pub struct Taken {
     item: Item,
@@ -504,6 +536,30 @@ impl Router {
         self.bounds
     }
 
+    /// Lets go the subscriber that keeps the most alive (its queue and what its link holds in
+    /// hand, by [`item_bytes`]), as fallen behind: what a store holding decodes does when it has
+    /// no room for the next (`hub`, `budget::Store::Decoded`), as the fan-out's own gauge does for
+    /// an item. A subscriber is the one holder of a decode that may let it go without loss to
+    /// anyone else, and it is told. False when no subscriber holds anything.
+    pub fn let_go_largest(&self) -> bool {
+        let Ok(index) = self.index.read() else {
+            return false;
+        };
+        let largest = index
+            .entries
+            .iter()
+            .filter_map(|entry| Some((entry.subscriber.holding()?, &entry.subscriber)))
+            .filter(|(held, _)| *held > 0)
+            .max_by_key(|(held, _)| *held);
+        match largest {
+            Some((_, laggard)) => {
+                laggard.let_go();
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Offers `item` to every subscriber that takes it. Never waits on a subscriber: one whose
     /// queue is past its bounds is let go.
     pub fn publish(&self, item: Item) {
@@ -543,16 +599,14 @@ impl Router {
             return;
         }
         let bytes = item_bytes(&item);
+        let charged = item_charge(&item, takers.len());
         // Room in the budget, made by letting go whoever holds most, as many as it takes. Charged
         // once whatever holds it, before any queue holds it; released when the last queue lets it
         // go.
         let mut charge = None;
         for _ in 0..=index.entries.len() {
-            if self.gauge.fits(bytes) || self.gauge.held() == 0 {
-                charge = self.gauge.try_charge(bytes);
-                if let (Some(charge), Some(decoded)) = (&mut charge, &item.decoded) {
-                    charge.cover(decoded);
-                }
+            if self.gauge.fits(charged) || self.gauge.held() == 0 {
+                charge = self.gauge.try_charge(charged);
                 if charge.is_some() {
                     break;
                 }
@@ -847,6 +901,55 @@ mod tests {
         Ok(())
     }
 
+    /// RFC-0181, "Memory is charged once, for its life": the fan-out is charged what it allocates
+    /// for an item, the item once and a slot in each queue that takes it, and a record's bytes
+    /// only where no allocation of their own carries their charge: a batch kept at ingest, whose
+    /// signed bytes are owned and charged for their life, costs its queues their slots and no
+    /// more, however large it is.
+    #[test]
+    fn an_item_is_charged_its_slots_and_never_an_owned_batchs_bytes() -> Result<(), String> {
+        let identity = tally_wire::Identity::from_seed([3; 32]);
+        let batch = tally_wire::Batch::sign(
+            &identity,
+            &tally_wire::BatchContent {
+                boot_id: 1,
+                sequence: 1,
+                counter_epoch: 0,
+                wall_ms: 0,
+                dropped: 0,
+                previous: [0; 32],
+                observations: vec![tally_wire::Observation {
+                    format: b'U',
+                    timestamp: 1,
+                    signal: 0,
+                    data: vec![7; 432],
+                }],
+            },
+        )
+        .map_err(|error| error.to_string())?;
+        let item = |batch: tally_wire::Batch| Item {
+            source: 1,
+            record: Arc::new(Record::Batch(batch)),
+            cell: None,
+            points: None,
+            decoded: None,
+            stamp_ms: 0,
+        };
+        let plain = item(batch.clone());
+        assert_eq!(
+            item_charge(&plain, 3),
+            ITEM_BYTES + 3 * SLOT_BYTES + plain.record.encoded_len()
+        );
+        let owned = batch
+            .owned_by(|_| Some(Box::new(()) as tally_wire::decoded::Owner))
+            .map_err(|_| "owned".to_owned())?;
+        let owned = item(owned);
+        assert_eq!(item_charge(&owned, 3), ITEM_BYTES + 3 * SLOT_BYTES);
+        // What it keeps alive, by which its subscriber is bounded, is still its bytes.
+        assert_eq!(item_bytes(&owned), owned.record.encoded_len());
+        Ok(())
+    }
+
     /// RFC-0181 §8: an item's charge is let go when the last holder lets it go, the link that
     /// took it among them, never when it leaves the queue.
     #[test]
@@ -866,7 +969,9 @@ mod tests {
                 regions: Vec::new(),
             }),
         );
-        router.publish(info_item(None, 0)?);
+        let item = info_item(None, 0)?;
+        let kept = item_bytes(&item);
+        router.publish(item);
         let held = gauge.held();
         assert!(held > 0);
         let mut out = Vec::new();
@@ -874,7 +979,7 @@ mod tests {
         assert_eq!((world.queued_bytes(), gauge.held()), (0, held));
         // What a link keeps of it while it sends keeps its charge, and counts in its hand.
         let sending = out.pop().map(Taken::hold).ok_or("nothing taken")?;
-        assert_eq!((gauge.held(), world.in_hand()), (held, held));
+        assert_eq!((gauge.held(), world.in_hand()), (held, kept));
         drop(sending);
         assert_eq!((gauge.held(), world.in_hand()), (0, 0));
         Ok(())
@@ -887,8 +992,10 @@ mod tests {
     /// one kept its charges for the 30 s its send could wait.
     #[tokio::test]
     async fn a_link_holding_items_in_hand_is_let_go_before_an_honest_queue() -> Result<(), String> {
+        // What a subscriber holds, and what the fan-out is charged for an item one queue takes.
         let unit = item_bytes(&info_item(None, 0)?);
-        let gauge = Gauge::new(Store::Fanout, 8 * unit);
+        let charged = item_charge(&info_item(None, 0)?, 1);
+        let gauge = Gauge::new(Store::Fanout, 8 * charged);
         let router = Arc::new(Router::charged(
             Bounds {
                 max_bytes: 1 << 20,
@@ -920,7 +1027,7 @@ mod tests {
         for _ in 0..2 {
             router.publish(info_item(Some(paris), 0)?);
         }
-        assert_eq!(gauge.held(), 8 * unit);
+        assert_eq!(gauge.held(), 8 * charged);
         // One more for the honest subscriber does not fit: the stalled one holds the most, and
         // letting it go frees what it holds in hand at once, while its link still has the claims:
         // the honest one keeps all three. Before, only the stalled one's (empty) queue was
@@ -928,9 +1035,9 @@ mod tests {
         // still holds whole stays charged until it is dropped, never a moment past it: its
         // `Taken` holds a claim of its own.
         router.publish(info_item(Some(paris), 0)?);
-        assert_eq!((gauge.held(), stalled.in_hand()), (4 * unit, 0));
+        assert_eq!((gauge.held(), stalled.in_hand()), (4 * charged, 0));
         drop(whole);
-        assert_eq!(gauge.held(), 3 * unit);
+        assert_eq!(gauge.held(), 3 * charged);
         let mut out = Vec::new();
         assert_eq!(honest.try_recv_many(&mut out, 10), Ok(3));
         assert_eq!(
@@ -949,7 +1056,7 @@ mod tests {
         assert!(!told(&honest));
         // Its link letting go of the items later releases nothing twice.
         drop(in_hand);
-        assert_eq!((stalled.in_hand(), gauge.held()), (0, 3 * unit));
+        assert_eq!((stalled.in_hand(), gauge.held()), (0, 3 * charged));
         Ok(())
     }
 

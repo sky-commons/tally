@@ -1069,6 +1069,7 @@ async fn answers_as(address: &str, identity: &Identity, key: &PublicKey) -> bool
     else {
         return false;
     };
+    crate::sockets::configure(&stream, crate::sockets::Role::Feeder);
     matches!(
         noise::connect(stream, identity, key, tally_wire::Role::Subscriber).await,
         Ok(_) | Err(WireError::Refused { .. })

@@ -21,22 +21,25 @@
 //!   `tally_mlat::provisional::shard_of`); the world candidates arrive per record, not per
 //!   reception, and one sealer owns them whole (`products::Sealer`).
 //!
-//! What a thread holds is charged to the relay's budget (`budget`): each open epoch's decoded
-//! batches to [`Store::Epochs`] (a batch's share by the receptions its slice carries), and its
-//! [`DEDUP_GENERATIONS`] generations of fingerprints to [`Store::Dedup`]. A slice comes down its
-//! queue with its share of the batch's ingest charge (`ingest::InFlight`), let go only once the
-//! epoch holds it (or the slice is let go), so the queues are charged in bytes all the way. An
-//! epoch that would pass either store on any thread is refused whole: its slices are let go, and
-//! the sealer is told it was refused ([`Frozen::refused`]), so it counts it and makes no product of
-//! any part of it (RFC-0181 §10). The charge travels with the epoch's batches to the sealer and is
-//! released when the sealer is done with them.
+//! What a thread allocates is charged to the relay's budget (`budget`): each open epoch's slices,
+//! their runs and the places its receptions take in the epoch's decisions to [`Store::Epochs`]
+//! ([`Slice::bytes`]), and its [`DEDUP_GENERATIONS`] generations of fingerprints to
+//! [`Store::Dedup`], allocated once at the capacity the plan reserved and held for the thread's
+//! life ([`Generation`]). The decodes the slices share are not charged here: each is charged once, for
+//! its life, inside itself, by the ingest stage that made it (`budget::Store::Decoded`), however
+//! many threads, epochs and other stages hold it, and let go with its last holder. An epoch that
+//! would pass the epochs' store, or hold more receptions on a thread than its generation of
+//! fingerprints holds, is refused whole: its slices are let go, and the sealer is
+//! told it was refused ([`Frozen::refused`]), so it counts it and makes no product of any part of
+//! it (RFC-0181 §10). The epochs' room is planned for the receptions `R_max` admits over the epochs
+//! held, so it is also what holds the epochs to their window: past it they refuse, and the decodes
+//! they would keep alive are let go. The charge travels with the epoch's word to the sealer and is
+//! released when the sealer is done with it.
 //!
-//! A batch's slices on other threads keep its decode alive, so a slice let go is not a decode let
-//! go: what a slice let go was charged (its share in the epoch, or its ingest charge) is held by
-//! its thread ([`Held`]) for as long as anything else holds the decode, and let go once nothing
-//! does. Before, a thread that refused an epoch released its slices' shares at once while another
-//! thread's slices of the same batches held them until the epoch closed there: hundreds of
-//! kilobytes of decoded batches alive, under a flood, that no store was charged.
+//! Before, each epoch charged its slices' shares of their decodes' footprints, which the fan-out,
+//! MLAT's notes and orphans and the ingest allowance charged again, and a slice let go was held,
+//! charged, while another thread's slice of its batch kept the decode alive: one decode, charged
+//! in up to four stores, and the plan summed their windows.
 //!
 //! Whether an epoch is admitted is settled once, for every thread, before any commits it
 //! ([`Admission`]): each thread decides its part against what it remembers and holds the
@@ -57,8 +60,7 @@
 //! can stamp one behind its producer's tick) is late: let go and counted ([`Frozen::late`]), never
 //! decided in a later epoch and never costing another epoch anything.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::hash::{BuildHasher, Hasher};
+use std::collections::{BTreeMap, VecDeque};
 use std::ops::Range;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
@@ -69,7 +71,7 @@ use std::time::Duration;
 use tally_wire::{Decoded, ObsRef, PublicKey, Region};
 
 use crate::budget::{Budget, Charge, Gauge, Store};
-use crate::ingest::{InFlight, Pause, Stage, Stamp, TICK_MS};
+use crate::ingest::{Pause, Stage, Stamp, TICK_MS};
 use crate::seal::{Closer, EPOCH_MS, Epoch};
 
 /// Logical shards per exchange: fixed, so a key's shard never depends on how many threads run.
@@ -79,9 +81,22 @@ pub const SHARDS: usize = 256;
 /// feeder's batches per producer at the RFC's rate, bounded whatever the shard's speed.
 pub const QUEUE_SLICES: usize = 1_024;
 
-/// One fingerprint remembered, as the table holds it: the key, what was kept of it, and the table's
-/// control byte, at the table's most loaded (seven eighths full).
-pub const DEDUP_ENTRY_BYTES: usize = (std::mem::size_of::<(u128, Areas)>() + 1) * 8 / 7;
+/// What a generation allocates for each entry of its capacity ([`Generation`]): a slot and a half
+/// (its table is at most two thirds full, [`DEDUP_SLOTS_PER_ENTRY`]), the entry's place in the list
+/// that clears it, and one link of the areas it was kept for. Allocated once, at the thread's
+/// start, for the relay's life.
+pub const DEDUP_ENTRY_BYTES: usize = DEDUP_SLOT_BYTES * DEDUP_SLOTS_PER_ENTRY.0
+    / DEDUP_SLOTS_PER_ENTRY.1
+    + std::mem::size_of::<u32>()
+    + std::mem::size_of::<Link>();
+
+/// A table slot: the fingerprint and its mark ([`Generation`]), five 32-bit words.
+const DEDUP_SLOT_BYTES: usize = SLOT_WORDS * std::mem::size_of::<u32>();
+
+/// Slots a generation's table holds for each entry of its capacity, as a fraction: at most two
+/// thirds full, so a probe for a fingerprint not held (most of them: each reception looks in
+/// every generation) reads about five slots, two cache lines, before an empty one ends it.
+const DEDUP_SLOTS_PER_ENTRY: (usize, usize) = (3, 2);
 
 /// How far apart two copies of one message may be stamped and still be one message: the
 /// deduplication's window, at least. The relay's deduplication before the stages held two 2 s
@@ -98,31 +113,62 @@ pub const DEDUP_WINDOW_MS: u64 = 2_000;
 pub const DEDUP_GENERATIONS: usize = (DEDUP_WINDOW_MS / EPOCH_MS) as usize + 1;
 const _: () = assert!(DEDUP_GENERATIONS >= 2);
 
-/// Table slots one reception may take at the worst, every reception new: the epoch being decided
-/// reserves two for each (a table grows by doubling) beside each older generation's one, which a
-/// rotation may leave at up to twice its entries.
-pub const DEDUP_SLOTS_PER_RECEPTION: usize = 2 * DEDUP_GENERATIONS;
+/// Entries of capacity ([`DEDUP_ENTRY_BYTES`] each) the generations hold for each reception an
+/// epoch at the planned rate, all generations together: each generation holds a third more than
+/// a thread's share of an epoch, every reception new. A thread's share is its shards' (the
+/// fingerprint's low byte, uniform under the process's key, which no peer knows), so the
+/// receptions it takes in an epoch at the planned rate pass its share by a third only at many
+/// standard deviations (one at 150 receptions a share, eleven at 10,000). The tables are allocated
+/// at this capacity once and never grow, so no epoch is charged room for a table to double.
+pub const DEDUP_SLOTS_PER_RECEPTION: usize =
+    DEDUP_GENERATIONS * DEDUP_CAPACITY_MARGIN.0 / DEDUP_CAPACITY_MARGIN.1;
+const _: () =
+    assert!((DEDUP_GENERATIONS * DEDUP_CAPACITY_MARGIN.0).is_multiple_of(DEDUP_CAPACITY_MARGIN.1));
 
-/// The gauges the message exchange charges.
+/// A generation's capacity over its thread's share of an epoch at the planned rate, as a fraction.
+const DEDUP_CAPACITY_MARGIN: (usize, usize) = (4, 3);
+
+/// What the generations of fingerprints cost, all generations together, for each reception a
+/// second of the planned rate: the plan's dedup line is this times the rate (`budget`).
+pub const DEDUP_BYTES_PER_RECEPTION_PER_SEC: usize =
+    DEDUP_SLOTS_PER_RECEPTION * DEDUP_ENTRY_BYTES * EPOCH_MS as usize / 1_000;
+
+/// Receptions an epoch an exchange made for a test sizes its generations for (`Gauges::unlimited`).
+pub const TEST_DEDUP_RECEPTIONS: usize = 1 << 16;
+
+/// The gauges the message exchange charges, and the receptions an epoch its generations of
+/// fingerprints are sized for.
 #[derive(Clone, Debug)]
 pub struct Gauges {
     pub epochs: Arc<Gauge>,
     pub dedup: Arc<Gauge>,
+    /// Receptions an epoch, relay-wide, the generations are allocated for, once: what the plan
+    /// reserved for them ([`Gauges::of`]).
+    pub dedup_receptions: usize,
 }
 
 impl Gauges {
+    /// The budget's gauges, and the generations sized to what the plan reserved for them: the
+    /// dedup store's limit over what a reception an epoch costs them
+    /// ([`DEDUP_SLOTS_PER_RECEPTION`] entries of [`DEDUP_ENTRY_BYTES`]), so what they allocate
+    /// is what the plan holds for them. Taken when the exchange is made, so made after the
+    /// budget's last resize.
     pub fn of(budget: &Budget) -> Self {
+        let dedup = budget.gauge(Store::Dedup);
         Self {
+            dedup_receptions: dedup.limit().saturating_sub(DEDUP_FIXED_BYTES)
+                / (DEDUP_SLOTS_PER_RECEPTION * DEDUP_ENTRY_BYTES),
             epochs: budget.gauge(Store::Epochs),
-            dedup: budget.gauge(Store::Dedup),
+            dedup,
         }
     }
 
-    /// Never full: for a test's exchange.
+    /// Never full: for a test's exchange, its generations sized for [`TEST_DEDUP_RECEPTIONS`].
     pub fn unlimited() -> Self {
         Self {
             epochs: Gauge::unlimited(Store::Epochs),
             dedup: Gauge::unlimited(Store::Dedup),
+            dedup_receptions: TEST_DEDUP_RECEPTIONS,
         }
     }
 }
@@ -201,21 +247,32 @@ impl Slice {
         self.ranges.iter().map(|range| range.len()).sum()
     }
 
-    /// This slice's share of its batch's bytes (`Decoded::footprint`), by the receptions it
-    /// carries, rounded up: a batch's slices together are charged the batch once, and never a
-    /// byte less (rounded down, a batch cut in `n` slices was charged up to `n - 1`
-    /// bytes below what it holds, which a check by the byte sees).
-    pub fn share(&self) -> usize {
-        let all = self.decoded.observations().len().max(1);
-        (self.decoded.footprint() * self.receptions()).div_ceil(all)
+    /// What its epoch allocates for it while it waits to be sealed: the slice itself and its runs
+    /// in the epoch's list, its batch's place in the word, and each of its receptions' places in
+    /// the epoch's decisions, at the most (every reception kept for the stream and for its area,
+    /// [`DECISION_BYTES_PER_RECEPTION`]). Never its decode, which charges itself.
+    pub fn bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + std::mem::size_of_val(&*self.ranges)
+            + std::mem::size_of::<Arc<Decoded>>()
+            + self.receptions() * DECISION_BYTES_PER_RECEPTION
     }
 }
+
+/// What the epochs allocate for one reception at most ([`Slice::bytes`]): a slice and a run of
+/// its own (a batch cut into as many slices as it has receptions), its batch's place in the word,
+/// and its place in the decisions. What `Store::Epochs` is planned at a reception
+/// (`budget::PerFeeder::planned`).
+pub const EPOCH_BYTES_PER_RECEPTION: usize = std::mem::size_of::<Slice>()
+    + std::mem::size_of::<Range<u32>>()
+    + std::mem::size_of::<Arc<Decoded>>()
+    + DECISION_BYTES_PER_RECEPTION;
 
 /// What travels down a thread's queue.
 #[derive(Debug)]
 pub enum Envelope {
-    /// A slice, and its share of its batch's ingest charge: let go once the epoch holds it.
-    Slice(Slice, InFlight),
+    /// A slice: its decode charged by itself, whatever holds it.
+    Slice(Slice),
     /// Everything this producer sends from now on is stamped at or after this.
     Tick(Stamp),
 }
@@ -286,88 +343,178 @@ impl Watermark {
     }
 }
 
-/// Hashes a fingerprint by its high half: the fingerprint is already a keyed pseudorandom value
-/// (`tally_wire::decoded`), and its low bits choose the shard, so hashing it again buys nothing.
-#[derive(Clone, Copy, Default)]
-pub struct ByFingerprint;
+/// A table slot's words: the fingerprint's four and its mark.
+const SLOT_WORDS: usize = 5;
+/// A mark's bit for a slot that holds a fingerprint; an empty slot's mark is zero.
+const OCCUPIED: u32 = 1 << 31;
+/// A mark's bit for a message kept for the hub's stream.
+const STREAM: u32 = 1 << 30;
+/// A mark's low bits: the first link of the areas it was kept for, numbered from one (zero: none).
+const HEAD: u32 = STREAM - 1;
+/// The most entries one generation holds: its links are numbered in a mark's low bits.
+const MAX_ENTRIES: usize = HEAD as usize;
 
-/// The hasher of [`ByFingerprint`].
-#[derive(Default)]
-pub struct FingerprintHasher(u64);
+/// One area a message was kept for, and the next (numbered from one; zero ends the list). The
+/// area's number in two words, so a link is three words, not padded to four.
+#[derive(Clone, Copy, Debug)]
+struct Link {
+    area: [u32; 2],
+    next: u32,
+}
 
-impl Hasher for FingerprintHasher {
-    fn finish(&self) -> u64 {
-        self.0
+impl Link {
+    fn area(region: Region) -> [u32; 2] {
+        let number = region.as_u64();
+        [number as u32, (number >> 32) as u32]
     }
+}
 
-    fn write(&mut self, bytes: &[u8]) {
-        // Only `write_u128` is ever called; anything else is folded in, never ignored.
-        for byte in bytes {
-            self.0 = self.0.rotate_left(8) ^ u64::from(*byte);
+/// One generation: the messages one epoch kept, on one thread. A fixed table allocated once at
+/// its capacity, never grown and never shrunk: open addressing over `slots` (each a fingerprint
+/// and its mark: kept for the stream, and the first of the areas it was kept for), probed from the
+/// fingerprint's high half (its low byte chose the shard, so it is the same across a shard), at
+/// most two thirds full. The areas a message was kept for (almost always none or one) are a list
+/// through `links`, one link a reception at most, so an entry is the fingerprint and an index,
+/// never an allocation of its own. Every entry's slot is listed in `filled`, so clearing it costs
+/// what it held, not its capacity: the table's untouched pages are never touched.
+///
+/// It holds at most `capacity` entries and links, and an epoch's receptions on its thread are
+/// counted before any is decided ([`MessageThread::close`]): an epoch with more than its
+/// generation holds is refused whole, as any epoch past its room is, never decided in part. Each
+/// reception adds at most one entry and one link, so the table never fills mid-epoch.
+pub struct Generation {
+    slots: Box<[u32]>,
+    filled: Vec<u32>,
+    links: Vec<Link>,
+    capacity: usize,
+}
+
+impl Generation {
+    /// A generation holding up to `capacity` entries, allocated now: the slots zeroed (an empty
+    /// table, from the kernel's zero pages where it is mapped apart), the lists reserved.
+    pub fn with_capacity(capacity: usize) -> Self {
+        let capacity = capacity.min(MAX_ENTRIES);
+        // One slot more than the fraction, so a table at capacity always has an empty slot that
+        // ends a probe.
+        let slots = capacity * DEDUP_SLOTS_PER_ENTRY.0 / DEDUP_SLOTS_PER_ENTRY.1 + 1;
+        Self {
+            slots: vec![0u32; slots * SLOT_WORDS].into_boxed_slice(),
+            filled: Vec::with_capacity(capacity),
+            links: Vec::with_capacity(capacity),
+            capacity,
         }
     }
 
-    fn write_u128(&mut self, value: u128) {
-        self.0 = (value >> 64) as u64;
-    }
-}
-
-impl BuildHasher for ByFingerprint {
-    type Hasher = FingerprintHasher;
-
-    fn build_hasher(&self) -> FingerprintHasher {
-        FingerprintHasher::default()
-    }
-}
-
-/// What one generation recorded of a message: whether it was kept for the hub's stream, and the
-/// areas it was kept for, almost always none or one. The two are separate windows: a message kept
-/// in an area does not count as kept for the stream, and the other way round, so a message heard in
-/// one area after another keeps its place in the stream's window and not the areas'.
-#[derive(Clone, Debug, Default)]
-struct Areas {
-    stream: bool,
-    first: Option<Region>,
-    more: Vec<Region>,
-}
-
-impl Areas {
-    fn holds(&self, area: Region) -> bool {
-        self.first == Some(area) || self.more.contains(&area)
+    /// The bytes it allocated, for its life.
+    pub fn bytes(&self) -> usize {
+        self.slots.len() * std::mem::size_of::<u32>()
+            + self.filled.capacity() * std::mem::size_of::<u32>()
+            + self.links.capacity() * std::mem::size_of::<Link>()
     }
 
-    fn add(&mut self, area: Region) {
-        if self.holds(area) {
-            return;
-        }
-        if self.first.is_none() {
-            self.first = Some(area);
-        } else {
-            self.more.push(area);
+    fn key(fp: u128) -> [u32; 4] {
+        [
+            fp as u32,
+            (fp >> 32) as u32,
+            (fp >> 64) as u32,
+            (fp >> 96) as u32,
+        ]
+    }
+
+    /// The slot holding `fp`, or the empty one where it would go.
+    fn find(&self, fp: u128) -> usize {
+        let key = Self::key(fp);
+        let count = self.slots.len() / SLOT_WORDS;
+        // The high half scaled onto the slots: uniform, with no power of two.
+        let mut slot = ((u128::from((fp >> 64) as u64) * count as u128) >> 64) as usize;
+        loop {
+            let words = &self.slots[slot * SLOT_WORDS..(slot + 1) * SLOT_WORDS];
+            if words[4] == 0 || words[..4] == key {
+                return slot;
+            }
+            slot = if slot + 1 == count { 0 } else { slot + 1 };
         }
     }
+
+    /// The mark of `fp`, zero if it holds none.
+    fn mark(&self, fp: u128) -> u32 {
+        self.slots[self.find(fp) * SLOT_WORDS + 4]
+    }
+
+    /// Whether the areas listed from `mark` hold `area`.
+    fn holds(&self, mark: u32, area: Region) -> bool {
+        let area = Link::area(area);
+        let mut next = mark & HEAD;
+        while let Some(link) = next
+            .checked_sub(1)
+            .and_then(|at| self.links.get(at as usize))
+        {
+            if link.area == area {
+                return true;
+            }
+            next = link.next;
+        }
+        false
+    }
+
+    /// Keeps `fp` for the stream if `stream`, and for `area` if one: the caller has found it kept
+    /// for neither here. False, keeping nothing, when it is full (an epoch counted against its
+    /// capacity never finds it so).
+    fn keep(&mut self, fp: u128, stream: bool, area: Option<Region>) -> bool {
+        let slot = self.find(fp);
+        let at = slot * SLOT_WORDS;
+        let mut mark = self.slots[at + 4];
+        if (mark == 0 && self.filled.len() >= self.capacity)
+            || (area.is_some() && self.links.len() >= self.capacity)
+        {
+            return false;
+        }
+        if mark == 0 {
+            self.slots[at..at + 4].copy_from_slice(&Self::key(fp));
+            self.filled.push(slot as u32);
+            mark = OCCUPIED;
+        }
+        if stream {
+            mark |= STREAM;
+        }
+        if let Some(area) = area {
+            self.links.push(Link {
+                area: Link::area(area),
+                next: mark & HEAD,
+            });
+            mark = (mark & !HEAD) | self.links.len() as u32;
+        }
+        self.slots[at + 4] = mark;
+        true
+    }
+
+    /// Forgets every entry, touching only the slots they held.
+    fn clear(&mut self) {
+        for slot in self.filled.drain(..) {
+            let at = slot as usize * SLOT_WORDS;
+            self.slots[at..at + SLOT_WORDS].fill(0);
+        }
+        self.links.clear();
+    }
+
+    fn len(&self) -> usize {
+        self.filled.len()
+    }
 }
 
-type Heard = HashMap<u128, Areas, ByFingerprint>;
-
-/// One message shard: the messages kept in the epoch being decided and the
-/// `DEDUP_GENERATIONS - 1` before it, one generation an epoch, rotated as the epochs close (so
-/// forgetting costs nothing per message). A message is new to the stream when no generation kept it
-/// for the stream, and new to an area when none kept it for that area: each is remembered across
-/// `DEDUP_GENERATIONS` epochs, apart, so two copies stamped up to `DEDUP_WINDOW_MS` apart are one.
+/// The message shards one thread owns, together: the messages kept in the epoch being decided and
+/// the `DEDUP_GENERATIONS - 1` before it, one generation an epoch, rotated as the epochs close (so
+/// forgetting costs what was kept, never a walk of the table). A message is new to the stream when
+/// no generation kept it for the stream, and new to an area when none kept it for that area: each
+/// is remembered across `DEDUP_GENERATIONS` epochs, apart, so two copies stamped up to
+/// `DEDUP_WINDOW_MS` apart are one. Its shards share its tables: a fingerprint is in one shard,
+/// so one table keyed by fingerprint holds them all, and a thread's share of an epoch varies less
+/// than a shard's.
 pub struct MessageShard {
-    generations: [Heard; DEDUP_GENERATIONS],
+    /// Boxed, so a thread's state stays small where it is moved.
+    generations: Box<[Generation; DEDUP_GENERATIONS]>,
     /// The generation of the epoch being decided.
     current: usize,
-}
-
-impl Default for MessageShard {
-    fn default() -> Self {
-        Self {
-            generations: std::array::from_fn(|_| Heard::default()),
-            current: 0,
-        }
-    }
 }
 
 /// What a message shard decided of one reception.
@@ -380,49 +527,48 @@ pub struct Decision {
 }
 
 impl MessageShard {
-    /// Decides one reception of message `fp` by a receiver in `area`, and remembers it.
+    /// Generations of `capacity` entries each, allocated now and never again.
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            generations: Box::new(std::array::from_fn(|_| Generation::with_capacity(capacity))),
+            current: 0,
+        }
+    }
+
+    /// The entries each generation holds at most: an epoch with more receptions on this thread is
+    /// refused before any is decided.
+    pub fn capacity(&self) -> usize {
+        self.generations[self.current].capacity
+    }
+
+    /// Decides one reception of message `fp` by a receiver in `area`, and remembers it. Kept and
+    /// not remembered only past the generation's capacity, which an epoch counted against it
+    /// never reaches.
     pub fn decide(&mut self, fp: u128, area: Option<Region>) -> Decision {
         let mut stream = true;
         let mut regional = area.is_some();
-        for heard in self
-            .generations
-            .iter()
-            .filter_map(|generation| generation.get(&fp))
-        {
-            stream &= !heard.stream;
-            regional &= area.is_some_and(|area| !heard.holds(area));
+        for generation in self.generations.iter() {
+            let mark = generation.mark(fp);
+            if mark == 0 {
+                continue;
+            }
+            stream &= mark & STREAM == 0;
+            regional &= area.is_some_and(|area| !generation.holds(mark, area));
         }
         if stream || regional {
-            let heard = self.generations[self.current].entry(fp).or_default();
-            heard.stream |= stream;
-            if let Some(area) = area.filter(|_| regional) {
-                heard.add(area);
-            }
+            self.generations[self.current].keep(fp, stream, area.filter(|_| regional));
         }
         Decision { stream, regional }
     }
 
-    /// `epochs` epochs begin after the one last decided: each takes the oldest generation's table,
-    /// cleared (kept, unless it is much larger than what the others hold, so a burst's table does
-    /// not outlive it). `DEDUP_GENERATIONS` or more forget everything.
+    /// `epochs` epochs begin after the one last decided: each takes the oldest generation, cleared.
+    /// `DEDUP_GENERATIONS` or more forget everything.
     pub fn rotate(&mut self, epochs: u64) {
         let steps = usize::try_from(epochs)
             .map_or(DEDUP_GENERATIONS, |epochs| epochs.min(DEDUP_GENERATIONS));
         for _ in 0..steps {
             self.current = (self.current + 1) % DEDUP_GENERATIONS;
             self.generations[self.current].clear();
-            // What the others hold: an epoch's worth, as this one will again.
-            let held = self
-                .generations
-                .iter()
-                .map(HashMap::len)
-                .max()
-                .unwrap_or(0)
-                .max(64);
-            let oldest = &mut self.generations[self.current];
-            if oldest.capacity() > 2 * held {
-                oldest.shrink_to(held);
-            }
         }
     }
 
@@ -432,20 +578,56 @@ impl MessageShard {
         self.generations[self.current].clear();
     }
 
-    /// The table slots every generation holds: what they cost (`DEDUP_ENTRY_BYTES` each).
-    pub fn capacity(&self) -> usize {
-        self.generations.iter().map(HashMap::capacity).sum()
+    /// The bytes every generation allocated, for the thread's life.
+    pub fn bytes(&self) -> usize {
+        self.generations.iter().map(Generation::bytes).sum()
     }
 
     /// Fingerprints held.
     pub fn len(&self) -> usize {
-        self.generations.iter().map(HashMap::len).sum()
+        self.generations.iter().map(Generation::len).sum()
     }
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 }
+
+/// The entries each generation of `thread` of `threads` holds for `receptions` an epoch,
+/// relay-wide: its shards' share ([`SHARDS`], uniform by fingerprint), a third more
+/// ([`DEDUP_SLOTS_PER_RECEPTION`]).
+pub fn dedup_capacity(receptions: usize, thread: usize, threads: usize) -> usize {
+    let owned = (thread..SHARDS).step_by(threads.max(1)).count();
+    let share = (receptions as u128 * owned as u128 / SHARDS as u128) as usize;
+    share.saturating_mul(DEDUP_CAPACITY_MARGIN.0) / DEDUP_CAPACITY_MARGIN.1
+}
+
+/// What every message thread's generations allocate for `receptions` an epoch on `threads`
+/// threads: at most `receptions` times [`DEDUP_SLOTS_PER_RECEPTION`] entries of
+/// [`DEDUP_ENTRY_BYTES`], and [`DEDUP_FIXED_BYTES`].
+pub fn dedup_bytes(receptions: usize, threads: usize) -> usize {
+    (0..threads.max(1))
+        .map(|thread| {
+            let capacity = dedup_capacity(receptions, thread, threads).min(MAX_ENTRIES);
+            DEDUP_GENERATIONS * generation_bytes(capacity)
+        })
+        .sum()
+}
+
+/// What one generation of `capacity` entries allocates (`Generation::with_capacity`).
+const fn generation_bytes(capacity: usize) -> usize {
+    let slots = capacity * DEDUP_SLOTS_PER_ENTRY.0 / DEDUP_SLOTS_PER_ENTRY.1 + 1;
+    slots * DEDUP_SLOT_BYTES + capacity * (std::mem::size_of::<u32>() + std::mem::size_of::<Link>())
+}
+
+/// What a thread's generations allocate beyond [`DEDUP_ENTRY_BYTES`] an entry: each table's one
+/// slot more than its fraction (`Generation::with_capacity`).
+const DEDUP_FIXED_BYTES_PER_THREAD: usize = DEDUP_GENERATIONS * DEDUP_SLOT_BYTES;
+
+/// What the generations allocate beyond [`DEDUP_ENTRY_BYTES`] an entry, relay-wide, on any number
+/// of message threads up to [`SHARDS`] (a thread past it owns no shard): the plan's dedup line is
+/// this beside the rate's ([`DEDUP_BYTES_PER_RECEPTION_PER_SEC`]).
+pub const DEDUP_FIXED_BYTES: usize = SHARDS * DEDUP_FIXED_BYTES_PER_THREAD;
 
 /// What one message thread hands the sealer: an epoch it closed that held receptions (the
 /// batches they came from, and which are new to the stream and to an area, each as (batch,
@@ -472,19 +654,15 @@ pub struct Frozen {
     pub batches: Vec<Arc<Decoded>>,
     pub stream: Vec<(u32, u32)>,
     pub regional: Vec<(Region, u32, u32)>,
-    /// What its batches are charged (`Store::Epochs`), released when the sealer lets them go.
-    /// Declared after `batches`, so a word dropped lets its decodes go before their charge (Rust
-    /// drops a struct's fields in order): never a decode alive past what it is charged. Words held
-    /// together (one epoch's parts) are let go together, every part's batches first ([`Parts`]).
+    /// What the word allocates itself (`Store::Epochs`: its lists, [`Frozen::own_bytes`]),
+    /// released when the sealer lets it go. Its batches' decodes are charged by themselves.
     pub charge: Charge,
 }
 
 /// One epoch's parts held together, gathered across message threads (`Settling`, and the sealer's
-/// `seal::Coordinator`): a batch cut into several threads' slices is in several parts, each charged
-/// its slices' share, so letting the parts go one by one (each its batches, then its charge) would
-/// leave such a decode alive, charged for less than it holds, between the first part's charge and
-/// the last part's batches. Let go, every part's batches go before any part's charge. Before, the
-/// flood check sampled twice before it called a short decode a holder, to step over that moment.
+/// `seal::Coordinator`). Let go, every part's batches go before any part's charge, as each word's
+/// own fields are dropped: what a part's charge holds is its lists, and the decodes its batches
+/// share are charged by themselves, so the order costs nothing and no part outlives its charge.
 #[derive(Debug, Default)]
 pub struct Parts(Vec<Frozen>);
 
@@ -822,15 +1000,15 @@ fn settle(epoch: Epoch, settling: Settling, ledger: &mut Ledger) -> Frozen {
 /// The state one message thread owns: its logical shards, its watermark, its open epochs.
 pub struct MessageThread {
     thread: usize,
-    threads: usize,
-    /// Its shards, `thread`, `thread + threads`, ... at `shard / threads`.
-    shards: Vec<MessageShard>,
+    /// Its shards, `thread`, `thread + threads`, ..., their generations in one table each.
+    messages: MessageShard,
     watermark: Watermark,
     closer: Closer,
     open: BTreeMap<Epoch, Open>,
     gauges: Gauges,
-    /// What the generations' tables are charged (`Store::Dedup`).
-    dedup: Charge,
+    /// What the generations' tables are charged (`Store::Dedup`): all they allocated, from the
+    /// thread's start to its end; none if the store could not hold them.
+    dedup: Option<Charge>,
     /// The last epoch decided: its shards' generations are its and the ones before.
     decided: Option<Epoch>,
     /// Every epoch before this is closed by the watermark: no slice of it will be taken.
@@ -839,8 +1017,6 @@ pub struct MessageThread {
     /// after, against what that one kept.
     awaiting: Option<Epoch>,
     admission: Arc<Admission>,
-    /// What the slices it let go were charged, while their decodes live on elsewhere.
-    held: Held,
 }
 
 impl MessageThread {
@@ -851,13 +1027,19 @@ impl MessageThread {
         admission: Arc<Admission>,
         gauges: Gauges,
     ) -> Self {
-        let owned = (thread..SHARDS).step_by(threads.max(1)).count();
+        // Its generations, allocated once at the capacity the plan reserved and charged for the
+        // thread's life; none when the store cannot hold them (`MessageThread::tables_charged`),
+        // and then every epoch with a reception is refused here.
+        let capacity = dedup_capacity(gauges.dedup_receptions, thread, threads);
+        let dedup = gauges
+            .dedup
+            .try_charge(DEDUP_GENERATIONS * generation_bytes(capacity));
+        let capacity = if dedup.is_some() { capacity } else { 0 };
         Self {
-            dedup: gauges.dedup.empty(),
+            dedup,
             gauges,
             thread,
-            threads: threads.max(1),
-            shards: (0..owned).map(|_| MessageShard::default()).collect(),
+            messages: MessageShard::with_capacity(capacity),
             watermark: Watermark::new(producers),
             closer: Closer::default(),
             open: BTreeMap::new(),
@@ -865,14 +1047,12 @@ impl MessageThread {
             closed_to: None,
             awaiting: None,
             admission,
-            held: Held::default(),
         }
     }
 
     pub fn take(&mut self, producer: usize, envelope: Envelope) {
-        self.held.sweep();
         match envelope {
-            Envelope::Slice(slice, in_flight) => {
+            Envelope::Slice(slice) => {
                 let epoch = slice.epoch();
                 if self.closer.closed(epoch) {
                     // Its epoch is decided and gone: late, let go, counted at the next word.
@@ -886,18 +1066,13 @@ impl MessageThread {
                     refused: false,
                 });
                 if open.refused {
-                    self.held.let_go(slice, in_flight);
                     return;
                 }
-                if open.charge.try_grow(slice.share()) {
-                    open.charge.cover(&slice.decoded);
+                if open.charge.try_grow(slice.bytes()) {
                     open.slices.push(slice);
-                    // The epoch holds its bytes now: the ingest charge is done.
-                    drop(in_flight);
                 } else {
                     // Past the budget: the whole epoch is refused, never a part of it.
-                    open.refuse(&mut self.held);
-                    self.held.let_go(slice, in_flight);
+                    open.refuse();
                 }
             }
             Envelope::Tick(stamp) => {
@@ -918,7 +1093,6 @@ impl MessageThread {
     /// Takes up what waits on the other threads: an epoch they have settled since, and the words
     /// the sealer could not take before. Called between envelopes, and when none comes.
     pub fn resume(&mut self) {
-        self.held.sweep();
         self.settle();
         self.admission.flush();
     }
@@ -944,11 +1118,7 @@ impl MessageThread {
                 if !admitted {
                     // Refused on some thread: nothing of it is published, so nothing of it is
                     // remembered.
-                    self.shards
-                        .iter_mut()
-                        .for_each(MessageShard::forget_current);
-                    self.dedup
-                        .shrink_to(self.held_slots().saturating_mul(DEDUP_ENTRY_BYTES));
+                    self.messages.forget_current();
                 }
                 self.awaiting = None;
             }
@@ -973,49 +1143,36 @@ impl MessageThread {
         // The generations follow the epochs by number, not by which held anything: the
         // `DEDUP_GENERATIONS - 1` epochs before this one are remembered, older ones are not.
         if let Some(last) = self.decided {
-            let epochs = epoch.saturating_sub(last);
-            self.shards
-                .iter_mut()
-                .for_each(|shard| shard.rotate(epochs));
+            self.messages.rotate(epoch.saturating_sub(last));
         }
         self.decided = Some(epoch);
-        // Room for every reception of the epoch to be new, before any is decided: an epoch the
-        // fingerprints' budget cannot hold is refused whole, never decided in part.
+        // Room for every reception of the epoch to be new, before any is decided: the generation
+        // being decided is empty (rotated, or forgotten when refused) and holds its capacity, so
+        // an epoch with more receptions here than that is refused whole, never decided in part.
+        // Its tables never grow: what they cost was charged when the thread started.
         let receptions: usize = open.slices.iter().map(Slice::receptions).sum();
-        // The charge already covers the tables as they stand (set at the last close; a rotation
-        // never grows them).
-        // A table grows by doubling, so deciding them may at most double what the tables and the
-        // new entries take; the charge is cut to what they hold once decided.
-        let needed = (self.held_slots() + receptions)
-            .saturating_mul(2)
-            .saturating_mul(DEDUP_ENTRY_BYTES);
-        let more = needed.saturating_sub(self.dedup.bytes());
+        let fits = receptions <= self.messages.capacity();
         let Open {
             mut slices,
             mut charge,
             refused,
         } = open;
-        // And room for its word: its lists of batches and of decisions as long as they can be
-        // (every reception kept for the stream and for its area), charged with its batches before
-        // any is decided, so what waits for the sealer is charged all the way (`Admission`).
-        let batches_bytes = charge.bytes();
+        // Its word's lists of batches and of decisions, as long as they can be (every reception
+        // kept for the stream and for its area), were charged with its slices
+        // (`Slice::bytes`), so what waits for the sealer is charged all the way (`Admission`).
         let in_areas: usize = slices
             .iter()
             .filter(|slice| slice.area.is_some())
             .map(Slice::receptions)
             .sum();
-        let room = !refused
-            && self.dedup.try_grow(more)
-            && charge.try_grow(Frozen::bytes_for(slices.len(), receptions, in_areas));
+        let room = !refused && fits;
         if !room {
-            self.dedup
-                .shrink_to(self.held_slots().saturating_mul(DEDUP_ENTRY_BYTES));
             Open {
                 slices,
                 charge,
                 refused,
             }
-            .refuse(&mut self.held);
+            .refuse();
             self.admission.post(self.thread, epoch, None);
             return false;
         }
@@ -1034,8 +1191,7 @@ impl MessageThread {
         for (at, slice) in slices.iter().enumerate() {
             let at = at as u32;
             for (index, obs) in slice.observations() {
-                let shard = usize::from(message_shard(obs.fp).0) / self.threads;
-                let decision = self.shards[shard].decide(obs.fp, slice.area);
+                let decision = self.messages.decide(obs.fp, slice.area);
                 if decision.stream {
                     frozen.stream.push((at, index));
                 }
@@ -1047,26 +1203,24 @@ impl MessageThread {
             }
         }
         frozen.batches = slices.into_iter().map(|slice| slice.decoded).collect();
-        // The lists as decided, and their charge cut to them.
+        // The lists as decided, and their charge cut to them: the slices are let go.
         frozen.stream.shrink_to_fit();
         frozen.regional.shrink_to_fit();
-        charge.shrink_to(batches_bytes + frozen.own_bytes());
+        charge.shrink_to(frozen.own_bytes());
         frozen.charge = charge;
-        // What the tables hold now, no more.
-        self.dedup
-            .shrink_to(self.held_slots().saturating_mul(DEDUP_ENTRY_BYTES));
         self.admission.post(self.thread, epoch, Some(frozen));
         true
     }
 
     /// Fingerprints held across its shards.
     pub fn held(&self) -> usize {
-        self.shards.iter().map(MessageShard::len).sum()
+        self.messages.len()
     }
 
-    /// Table slots its shards' generations hold.
-    fn held_slots(&self) -> usize {
-        self.shards.iter().map(MessageShard::capacity).sum()
+    /// Whether its generations were allocated: false only when the dedup store could not hold
+    /// what the plan sized them for, a relay that must not start (`MessageExchange::threads`).
+    pub fn tables_charged(&self) -> bool {
+        self.dedup.is_some()
     }
 }
 
@@ -1078,69 +1232,13 @@ struct Open {
 }
 
 impl Open {
-    /// Refused whole: its slices are let go now, and what each was charged with them, but for a
-    /// slice whose decode something else still holds (another thread's slice of its batch): that
-    /// share is held while it does (`held`).
-    fn refuse(&mut self, held: &mut Held) {
+    /// Refused whole: its slices are let go now, and what they were charged with them. A decode
+    /// another thread's slice or another stage still holds stays charged by itself.
+    fn refuse(&mut self) {
         self.refused = true;
-        for slice in std::mem::take(&mut self.slices) {
-            // Its share covers its own decode, not every decode the epoch held: one cover a slice,
-            // never a copy of the epoch's.
-            let share = self.charge.split_covering(slice.share(), &slice.decoded);
-            held.keep(slice, Some(share), None);
-        }
+        self.slices.clear();
+        // A refused epoch stays open, holding nothing, until it closes.
         self.charge.shrink_to(0);
-        // It holds no decode now: a refused epoch stays open, holding nothing, until it closes.
-        self.charge.uncover();
-    }
-}
-
-/// What the slices a thread let go were charged, each kept while anything else still holds its
-/// decode (another thread's slice of its batch, another stage) and let go once nothing does
-/// (`sweep`, between envelopes), so a decode alive is never charged only part of its footprint.
-#[derive(Debug, Default)]
-struct Held {
-    parts: Vec<HeldPart>,
-}
-
-/// A slice's charge kept while anything else holds its decode, by a weak hold: two threads' parts
-/// of one decode must not keep each other. A cover whose decode is gone counts for nothing
-/// (`budget::Covered::gone`), so what lingers here until the next sweep is never counted.
-#[derive(Debug)]
-struct HeldPart {
-    decoded: std::sync::Weak<Decoded>,
-    _share: Option<Charge>,
-    _in_flight: Option<InFlight>,
-}
-
-impl Held {
-    /// `slice` let go, with what it was charged: kept while something else holds its decode,
-    /// dropped now otherwise, the slice first: its decode is never alive past its charge, even
-    /// for the instant between the two. Taken by value so no caller holds the slice on past it.
-    fn keep(&mut self, slice: Slice, share: Option<Charge>, in_flight: Option<InFlight>) {
-        if Arc::strong_count(&slice.decoded) > 1 {
-            self.parts.push(HeldPart {
-                decoded: Arc::downgrade(&slice.decoded),
-                _share: share,
-                _in_flight: in_flight,
-            });
-            drop(slice);
-        } else {
-            drop(slice);
-            drop((share, in_flight));
-        }
-    }
-
-    /// A slice let go (its epoch refused here), with its ingest charge.
-    fn let_go(&mut self, slice: Slice, in_flight: InFlight) {
-        self.keep(slice, None, Some(in_flight));
-    }
-
-    /// Lets go what was kept for a decode nothing holds any more.
-    fn sweep(&mut self) {
-        if !self.parts.is_empty() {
-            self.parts.retain(|part| part.decoded.strong_count() > 0);
-        }
     }
 }
 
@@ -1192,6 +1290,18 @@ impl MessageExchange {
                 Arc::clone(&admission),
                 gauges.clone(),
             );
+            if !state.tables_charged() {
+                // Dropping `exchange` stops and joins the threads already started.
+                return Err(format!(
+                    "message thread {thread} of {threads}: the dedup store cannot hold its \
+                     generations of fingerprints ({} receptions an epoch: {} bytes for every \
+                     thread, the store's limit {}, {} already charged)",
+                    gauges.dedup_receptions,
+                    dedup_bytes(gauges.dedup_receptions, threads),
+                    gauges.dedup.limit(),
+                    gauges.dedup.held(),
+                ));
+            }
             let pause = pause.cloned();
             let handle = std::thread::Builder::new()
                 .name(format!("tally-message-{thread}"))
@@ -1215,25 +1325,11 @@ impl MessageExchange {
     }
 
     /// Routes a batch's receptions to their shards' threads, waiting while a thread's queue is
-    /// full, each slice with its share of the batch's charge (`in_flight`), so the bytes waiting in
-    /// the queues are charged until the epochs hold them. What no slice carries is let go here.
-    pub fn route(
-        &self,
-        producer: usize,
-        decoded: &Arc<Decoded>,
-        area: Option<Region>,
-        mut in_flight: InFlight,
-    ) {
-        let slices = split(decoded, self.width(), area);
-        let last = slices.len().saturating_sub(1);
-        for (at, (thread, slice)) in slices.into_iter().enumerate() {
-            let share = if at == last {
-                in_flight.bytes()
-            } else {
-                slice.share()
-            };
-            let charge = in_flight.split(share, decoded);
-            self.send(producer, thread, Envelope::Slice(slice, charge));
+    /// full. The decode the slices share is charged by itself while they wait
+    /// (`budget::Store::Decoded`), so the queues hold nothing uncharged.
+    pub fn route(&self, producer: usize, decoded: &Arc<Decoded>, area: Option<Region>) {
+        for (thread, slice) in split(decoded, self.width(), area) {
+            self.send(producer, thread, Envelope::Slice(slice));
         }
     }
 
@@ -1291,6 +1387,7 @@ fn run(mut state: MessageThread, receiver: &Receiver<(usize, Envelope)>, pause: 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
     use tally_wire::{Batch, BatchContent, Identity, Observation};
 
     fn decoded(count: u8, stamp_ms: u64, ingest_seq: u64) -> Result<Arc<Decoded>, String> {
@@ -1364,7 +1461,7 @@ mod tests {
             .map_err(|error| error.to_string())
         };
         let (a, b) = (area(337_490_000)?, area(407_490_000)?);
-        let mut shard = MessageShard::default();
+        let mut shard = MessageShard::with_capacity(64);
         let new = |stream, regional| Decision { stream, regional };
         assert_eq!(shard.decide(7, Some(a)), new(true, true));
         assert_eq!(shard.decide(7, Some(a)), new(false, false));
@@ -1402,7 +1499,7 @@ mod tests {
             .map_err(|error| error.to_string())
         };
         let areas = [area(337_490_000)?, area(407_490_000)?, area(457_490_000)?];
-        let mut shard = MessageShard::default();
+        let mut shard = MessageShard::with_capacity(64);
         let mut kept = 0;
         for epoch in 0..12usize {
             // Heard every epoch, in an area the last epoch did not hear it in.
@@ -1412,6 +1509,160 @@ mod tests {
         }
         assert_eq!(kept, 12 / DEDUP_GENERATIONS);
         Ok(())
+    }
+
+    /// The generations are allocated once, at their capacity, and never grow or shrink: a
+    /// generation filled to its capacity (half its messages heard in two areas, half for the
+    /// stream alone: every entry and every link it holds), rotated and filled again, allocates
+    /// nothing more and holds what it kept. Before, a table doubled as it filled,
+    /// mid-epoch, and the plan held room for every table to double.
+    #[test]
+    fn a_generation_holds_its_capacity_and_never_grows() -> Result<(), String> {
+        let area = |lat_e7| {
+            Region::containing(
+                &tally_wire::Location {
+                    lat_e7,
+                    lon_e7: -843_880_000,
+                    alt_m: 0,
+                    precision_m: 0,
+                },
+                4,
+            )
+            .map_err(|error| error.to_string())
+        };
+        let (a, b) = (area(337_490_000)?, area(407_490_000)?);
+        let capacity = 1_000;
+        let mut shard = MessageShard::with_capacity(capacity);
+        let allocated = shard.bytes();
+        assert_eq!(allocated, DEDUP_GENERATIONS * generation_bytes(capacity));
+        assert!(allocated <= DEDUP_GENERATIONS * (capacity * DEDUP_ENTRY_BYTES + DEDUP_SLOT_BYTES));
+        // Fingerprints spread as the keyed ones are: the low byte any shard, the high half any slot.
+        let fp = |n: u64| (u128::from(n.wrapping_mul(0x9e37_79b9_7f4a_7c15)) << 64) | u128::from(n);
+        for round in 0..2 * DEDUP_GENERATIONS as u64 {
+            for n in 0..capacity as u64 {
+                let message = fp(round * capacity as u64 + n);
+                if n < capacity as u64 / 2 {
+                    assert_eq!(
+                        shard.decide(message, Some(a)),
+                        Decision {
+                            stream: true,
+                            regional: true
+                        }
+                    );
+                    assert_eq!(
+                        shard.decide(message, Some(b)),
+                        Decision {
+                            stream: false,
+                            regional: true
+                        }
+                    );
+                } else {
+                    assert_eq!(
+                        shard.decide(message, None),
+                        Decision {
+                            stream: true,
+                            regional: false
+                        }
+                    );
+                }
+            }
+            // Every one of them remembered, in its areas.
+            for n in 0..capacity as u64 {
+                let message = fp(round * capacity as u64 + n);
+                let area = if n < capacity as u64 / 2 {
+                    Some(b)
+                } else {
+                    None
+                };
+                assert_eq!(
+                    shard.decide(message, area),
+                    Decision {
+                        stream: false,
+                        regional: false
+                    }
+                );
+            }
+            assert_eq!(shard.bytes(), allocated);
+            shard.rotate(1);
+        }
+        // Past its links, a generation keeps no more and grows no more.
+        let mut full = MessageShard::with_capacity(2);
+        for n in 0..4 {
+            full.decide(fp(n), Some(a));
+        }
+        assert_eq!(full.len(), 2);
+        assert_eq!(full.bytes(), DEDUP_GENERATIONS * generation_bytes(2));
+        Ok(())
+    }
+
+    /// An epoch with more receptions on a thread than its generation holds is refused whole,
+    /// before any is decided, and forgotten: the next epoch, within it, is decided as if the
+    /// refused one never was. Which epoch is refused follows its receptions alone.
+    #[test]
+    fn an_epoch_past_the_generations_capacity_is_refused_whole() -> Result<(), String> {
+        let words = Arc::new(Mutex::new(Vec::new()));
+        let kept = Arc::clone(&words);
+        let sink: Sink = Arc::new(move |frozen| match kept.lock() {
+            Ok(mut kept) => {
+                kept.push(frozen);
+                Ok(())
+            }
+            Err(_) => Err(Box::new(frozen)),
+        });
+        // Three receptions an epoch planned: a generation of four, on one thread.
+        let gauges = Gauges {
+            dedup_receptions: 3,
+            ..Gauges::unlimited()
+        };
+        let mut thread = MessageThread::new(
+            0,
+            1,
+            1,
+            Admission::new(1, sink, Gauge::unlimited(Store::Epochs)),
+            gauges,
+        );
+        assert!(thread.tables_charged());
+        assert_eq!(thread.messages.capacity(), 4);
+        for n in 1..=5 {
+            thread.take(0, Envelope::Slice(copy_of(n, 100)?));
+        }
+        thread.take(0, tick(1_000));
+        for n in 1..=4 {
+            thread.take(0, Envelope::Slice(copy_of(n, 1_100)?));
+        }
+        thread.take(0, tick(2_000));
+        thread.take(0, tick(3_000));
+        assert_eq!(word_of(&words, 0)?, Some((true, Vec::new())));
+        let (refused, mut kept) = word_of(&words, 1)?.ok_or("no word for epoch 1")?;
+        kept.sort_unstable();
+        assert!(!refused);
+        assert_eq!(kept, vec![1, 2, 3, 4]);
+        Ok(())
+    }
+
+    /// What the plan holds for the generations ([`DEDUP_BYTES_PER_RECEPTION_PER_SEC`] a reception
+    /// a second, and [`DEDUP_FIXED_BYTES`]) is at least what they allocate on any number of
+    /// threads, and a store holding exactly that sizes them to fit it ([`Gauges::of`]'s inverse).
+    #[test]
+    fn the_plan_holds_what_the_generations_allocate() {
+        for receptions in [0, 1, 3, 255, 256, 10_000, 1_234_567, 12_470_000] {
+            let planned =
+                receptions * DEDUP_SLOTS_PER_RECEPTION * DEDUP_ENTRY_BYTES + DEDUP_FIXED_BYTES;
+            for threads in [1, 2, 3, 7, 16, 64, 256] {
+                assert!(
+                    dedup_bytes(receptions, threads) <= planned,
+                    "{receptions} on {threads}: {} > {planned}",
+                    dedup_bytes(receptions, threads)
+                );
+            }
+            let sized = planned.saturating_sub(DEDUP_FIXED_BYTES)
+                / (DEDUP_SLOTS_PER_RECEPTION * DEDUP_ENTRY_BYTES);
+            assert_eq!(sized, receptions);
+        }
+        assert_eq!(
+            DEDUP_BYTES_PER_RECEPTION_PER_SEC,
+            DEDUP_SLOTS_PER_RECEPTION * DEDUP_ENTRY_BYTES * EPOCH_MS as usize / 1_000
+        );
     }
 
     /// One batch from a receiver of its own, holding message `n` once.
@@ -1487,7 +1738,7 @@ mod tests {
             (2, 2_999),
             (1, 3_000),
         ] {
-            thread.take(0, Envelope::Slice(copy_of(n, stamp_ms)?, InFlight::free()));
+            thread.take(0, Envelope::Slice(copy_of(n, stamp_ms)?));
         }
         thread.take(0, tick(10_000));
         let words = words.lock().map_err(|error| error.to_string())?;
@@ -1529,57 +1780,45 @@ mod tests {
             }))
     }
 
-    /// An epoch refused whole hands each slice's share on covering that slice's decode and
-    /// no other, and no split along the way copies the epoch's covers: a part split off a charge
-    /// covering many decodes covers none of them until it is split with one. Before, every split
-    /// cloned every cover of the epoch's charge, a lock a cover, so refusing an epoch of `n`
-    /// slices took `n²` of them on the message thread.
+    /// An epoch refused whole lets its slices go and releases what it was charged for them, all of
+    /// it: what it charged was what it allocated for them, never their decodes, which charge
+    /// themselves and go with their last holder.
     #[test]
-    fn a_refused_epochs_shares_each_cover_their_own_decode_and_copy_no_other() -> Result<(), String>
-    {
-        let covered = crate::budget::Covered::process();
+    fn a_refused_epoch_lets_its_slices_go_and_holds_no_charge() -> Result<(), String> {
         let decodes = (0..4u64)
             .map(|at| decoded(20, 0, at))
             .collect::<Result<Vec<_>, String>>()?;
         let epochs = Gauge::unlimited(Store::Epochs);
+        let slices: Vec<Slice> = decodes
+            .iter()
+            .map(|decode| Slice {
+                decoded: Arc::clone(decode),
+                ranges: std::iter::once(0..20).collect(),
+                area: None,
+            })
+            .collect();
         let mut charge = epochs.empty();
-        for decode in &decodes {
-            assert!(charge.try_grow(decode.footprint()));
-            charge.cover(decode);
+        for slice in &slices {
+            assert!(charge.try_grow(slice.bytes()));
         }
-        // A plain split moves bytes and copies no cover.
-        let part = charge.split(10);
-        assert!(decodes.iter().all(|decode| covered.covers_of(decode) == 1));
-        // Split with a decode, the part covers that one alone.
-        let with_first = charge.split_covering(10, &decodes[0]);
-        assert_eq!(covered.covers_of(&decodes[0]), 2);
-        assert!(
-            decodes[1..]
-                .iter()
-                .all(|decode| covered.covers_of(decode) == 1)
+        // What a slice costs its epoch is its own and its receptions' decisions, never its decode.
+        assert_eq!(
+            slices[0].bytes(),
+            std::mem::size_of::<Slice>()
+                + std::mem::size_of::<Range<u32>>()
+                + std::mem::size_of::<Arc<Decoded>>()
+                + 20 * DECISION_BYTES_PER_RECEPTION
         );
-        drop((part, with_first));
-        // Refused whole: each kept share covers its own decode, the epoch's charge none.
+        assert!(slices[0].bytes() <= 20 * EPOCH_BYTES_PER_RECEPTION);
         let mut open = Open {
-            slices: decodes
-                .iter()
-                .map(|decode| Slice {
-                    decoded: Arc::clone(decode),
-                    ranges: std::iter::once(0..20).collect(),
-                    area: None,
-                })
-                .collect(),
+            slices,
             charge,
             refused: false,
         };
-        let mut held = Held::default();
-        open.refuse(&mut held);
-        assert!(open.refused);
-        assert_eq!(open.charge.bytes(), 0);
-        assert!(decodes.iter().all(|decode| covered.covers_of(decode) == 1));
-        assert_eq!(held.parts.len(), decodes.len());
-        drop(held);
-        assert!(decodes.iter().all(|decode| covered.covers_of(decode) == 0));
+        open.refuse();
+        assert!(open.refused && open.slices.is_empty());
+        assert_eq!((open.charge.bytes(), epochs.held()), (0, 0));
+        assert!(decodes.iter().all(|decode| Arc::strong_count(decode) == 1));
         Ok(())
     }
 
@@ -1604,15 +1843,16 @@ mod tests {
         let tight = Gauges {
             epochs: Gauge::new(Store::Epochs, 1),
             dedup: Gauge::unlimited(Store::Dedup),
+            dedup_receptions: TEST_DEDUP_RECEPTIONS,
         };
         let mut zero = MessageThread::new(0, 2, 1, Arc::clone(&admission), tight);
         let mut one = MessageThread::new(1, 2, 1, Arc::clone(&admission), Gauges::unlimited());
-        one.take(0, Envelope::Slice(copy_of(7, 500)?, InFlight::free()));
-        zero.take(0, Envelope::Slice(copy_of(1, 500)?, InFlight::free()));
-        zero.take(0, Envelope::Slice(copy_of(2, 600)?, InFlight::free()));
+        one.take(0, Envelope::Slice(copy_of(7, 500)?));
+        zero.take(0, Envelope::Slice(copy_of(1, 500)?));
+        zero.take(0, Envelope::Slice(copy_of(2, 600)?));
         // Thread 1 closes epoch 0 first, deciding message 7 in it; thread 0 then refuses it.
         one.take(0, tick(1_000));
-        one.take(0, Envelope::Slice(copy_of(7, 1_500)?, InFlight::free()));
+        one.take(0, Envelope::Slice(copy_of(7, 1_500)?));
         zero.take(0, tick(1_000));
         one.take(0, tick(2_000));
         zero.take(0, tick(2_000));
@@ -1621,21 +1861,23 @@ mod tests {
         Ok(())
     }
 
-    /// RFC-0181 §9: a batch split across two threads, refused on one, is charged its whole
-    /// footprint for as long as the other thread's slice keeps its decode alive, and let go once
-    /// nothing does. Before, the refusing thread let its share go at once, and the
-    /// decode lived on in the other thread's epoch, charged half, until that epoch closed: the
-    /// flood test's hundreds of kilobytes of decoded batches alive that no store was charged.
+    /// RFC-0181, "Memory is charged once, for its life": a batch split across two threads is
+    /// charged once, by its decode and its signed bytes, whichever threads hold it and whether its
+    /// epoch is refused on one of them; each thread's epochs are charged what they allocate for
+    /// their slices and no more. Before, each thread charged its slice's share of the decode, a
+    /// refused one kept that share while the other's slice held the decode, and the decode was
+    /// charged again in every subscriber's queue.
     #[test]
-    fn a_batch_refused_on_one_thread_stays_charged_while_another_holds_it() -> Result<(), String> {
+    fn a_batch_split_across_threads_is_charged_once_by_its_decode() -> Result<(), String> {
         let sink: Sink = Arc::new(|_| Ok(()));
         let epochs = Gauge::unlimited(Store::Epochs);
         let admission = Admission::new(2, sink, Arc::clone(&epochs));
-        let ingest = Gauge::unlimited(Store::Ingest);
+        let store = Gauge::unlimited(Store::Decoded);
         // Thread 0's epochs are full: its slice refuses the epoch there.
         let tight = Gauges {
             epochs: Gauge::new(Store::Epochs, 1),
             dedup: Gauge::unlimited(Store::Dedup),
+            dedup_receptions: TEST_DEDUP_RECEPTIONS,
         };
         let _full = tight.epochs.try_charge(1);
         let mut zero = MessageThread::new(0, 2, 1, Arc::clone(&admission), tight.clone());
@@ -1647,9 +1889,10 @@ mod tests {
             Gauges {
                 epochs: Arc::clone(&epochs),
                 dedup: Gauge::unlimited(Store::Dedup),
+                dedup_receptions: TEST_DEDUP_RECEPTIONS,
             },
         );
-        // One batch whose receptions fall on both threads.
+        // One batch whose receptions fall on both threads, decoded as ingest decodes it.
         let mut slices = Vec::new();
         let mut n = 0u8;
         while slices.len() < 2 {
@@ -1672,70 +1915,53 @@ mod tests {
                     .collect(),
             };
             let batch = Batch::sign(&identity, &content).map_err(|error| error.to_string())?;
-            let decoded = Decoded::from_verified(batch, 500, 0)
-                .map_err(|undecodable| undecodable.error.to_string())?;
+            let decoded = crate::ingest::Stages::decode_owned(
+                batch,
+                Stamp {
+                    stamp_ms: 500,
+                    ingest_seq: 0,
+                },
+                &store,
+                crate::budget::Covered::process(),
+            )
+            .map_err(|error| format!("{error:?}"))?;
             slices = split(&decoded, 2, None);
         }
-        let footprint = slices[0].1.decoded.footprint();
+        let decoded = Arc::clone(&slices[0].1.decoded);
+        let once = decoded.footprint() + decoded.batch().footprint();
         let mut parts = slices.into_iter();
         let ((_, first), (_, second)) = parts
             .next()
             .zip(parts.next())
             .ok_or_else(|| "two slices".to_owned())?;
-        let (first_share, second_share) = (first.share(), second.share());
-        one.take(
-            0,
-            Envelope::Slice(second, InFlight::trusted(&ingest, second_share)),
-        );
-        zero.take(
-            0,
-            Envelope::Slice(first, InFlight::trusted(&ingest, first_share)),
-        );
-        // Refused on thread 0, alive on thread 1: charged whole between them.
+        let second_bytes = second.bytes();
+        one.take(0, Envelope::Slice(second));
+        zero.take(0, Envelope::Slice(first));
+        // Refused on thread 0, held on thread 1: the decode charged once, by itself, and thread
+        // 1's epoch only what it allocated for its slice.
         assert_eq!(tight.epochs.held(), 1);
-        assert!(
-            epochs.held() + ingest.held() + 2 >= footprint,
-            "{} + {} charged for {footprint}",
-            epochs.held(),
-            ingest.held()
-        );
+        assert_eq!(epochs.held(), second_bytes);
+        assert_eq!(store.held(), once);
+        // Settled once thread 1 closes it too: refused everywhere, its slices let go.
         zero.take(0, tick(1_000));
-        assert!(epochs.held() + ingest.held() + 2 >= footprint);
-        // Settled once thread 1 closes it too: refused everywhere, its part let go, and with the
-        // decode gone, what thread 0 kept for it.
         one.take(0, tick(1_000));
         zero.resume();
-        assert_eq!((epochs.held(), ingest.held()), (0, 0));
+        assert_eq!(epochs.held(), 0);
+        assert_eq!(store.held(), once);
+        drop(decoded);
+        assert_eq!(store.held(), 0);
         Ok(())
     }
 
-    /// RFC-0181 §9: a slice's share of its batch's ingest charge is held down the queue and let
-    /// go only once the epoch holds the bytes, or the slice is let go late.
-    #[test]
-    fn a_slices_ingest_charge_is_held_until_its_epoch_holds_it() -> Result<(), String> {
-        let (mut thread, _) = thread();
-        let ingest = Gauge::unlimited(Store::Ingest);
-        let slice = copy_of(1, 500)?;
-        let share = slice.share();
-        let envelope = Envelope::Slice(slice, InFlight::trusted(&ingest, share));
-        assert_eq!(ingest.held(), share);
-        thread.take(0, envelope);
-        assert_eq!(ingest.held(), 0);
-        thread.take(0, tick(2_000));
-        let late = copy_of(2, 600)?;
-        thread.take(0, Envelope::Slice(late, InFlight::trusted(&ingest, share)));
-        assert_eq!(ingest.held(), 0);
-        Ok(())
-    }
-
-    /// RFC-0181 §9: an epoch's word is charged its lists of decisions beside its batches, from
-    /// before any reception is decided until the sealer lets it go. They were charged nothing:
-    /// some 24 bytes a reception beside its decode waited uncounted for the sealer.
+    /// RFC-0181 §9: an epoch's word is charged its lists of decisions, from before any reception
+    /// is decided (with its slices, at the most they can be) until the sealer lets it go, and
+    /// nothing for its batches, whose decodes charge themselves. The lists were charged nothing
+    /// once: some 24 bytes a reception waited uncounted for the sealer.
     #[test]
     fn an_epochs_word_is_charged_its_decisions_beside_its_batches() -> Result<(), String> {
         let (mut thread, words) = thread();
         for n in 1..=5 {
-            thread.take(0, Envelope::Slice(copy_of(n, 500)?, InFlight::free()));
+            thread.take(0, Envelope::Slice(copy_of(n, 500)?));
         }
         thread.take(0, tick(2_000));
         let words = words.lock().map_err(|error| error.to_string())?;
@@ -1744,10 +1970,12 @@ mod tests {
             .find(|word| word.epoch == Some(0))
             .ok_or("no word for epoch 0")?;
         assert_eq!(word.stream.len(), 5);
+        // Its own bytes (and what the sealer's queue holds for a word), never its decodes'.
         let batches: usize = word.batches.iter().map(|batch| batch.footprint()).sum();
         assert!(
-            word.charge.bytes() >= batches + word.own_bytes(),
-            "{} charged for {batches} of batches and {} of its own",
+            word.charge.bytes() >= word.own_bytes()
+                && word.charge.bytes() < word.own_bytes() + batches,
+            "{} charged for {} of its own beside {batches} of decodes",
             word.charge.bytes(),
             word.own_bytes()
         );
@@ -1820,11 +2048,11 @@ mod tests {
     #[test]
     fn a_late_slice_is_counted_and_never_decided_or_costs_another_epoch() -> Result<(), String> {
         let (mut thread, words) = thread();
-        thread.take(0, Envelope::Slice(copy_of(1, 500)?, InFlight::free()));
+        thread.take(0, Envelope::Slice(copy_of(1, 500)?));
         thread.take(0, tick(2_000));
         // Epoch 0 is closed: a slice stamped in it is late. Epoch 2's is not.
-        thread.take(0, Envelope::Slice(copy_of(2, 600)?, InFlight::free()));
-        thread.take(0, Envelope::Slice(copy_of(3, 2_100)?, InFlight::free()));
+        thread.take(0, Envelope::Slice(copy_of(2, 600)?));
+        thread.take(0, Envelope::Slice(copy_of(3, 2_100)?));
         thread.take(0, tick(4_000));
         let words = words.lock().map_err(|error| error.to_string())?;
         assert_eq!(words.iter().map(|word| word.late).sum::<u64>(), 1);

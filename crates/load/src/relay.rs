@@ -294,15 +294,10 @@ pub fn charged(stats: &str) -> Result<Charged, String> {
         .map_or(0, |stores| {
             stores.iter().map(|store| held(Some(store))).sum()
         });
-    let rooms: u64 = [
-        "oversize",
-        "connection_buffers",
-        "member_links",
-        "parity_assembly",
-    ]
-    .iter()
-    .map(|room| held(budget.get(room)))
-    .sum();
+    let rooms: u64 = ["connection_buffers", "member_links", "parity_assembly"]
+        .iter()
+        .map(|room| held(budget.get(room)))
+        .sum();
     Ok(Charged {
         base: budget
             .get("base")

@@ -47,6 +47,18 @@ pub mod seeds;
 pub mod stripes;
 pub mod withdrawal;
 
+/// What a send waiting in the outbox allocates, as it is charged: a batch kept at ingest, whose
+/// signed bytes carry their own charge for their life (`Batch::owned_by`), only its place; any
+/// other record its encoded bytes, which are its own.
+fn addressed_len(record: &Record) -> usize {
+    match record {
+        Record::Batch(batch) | Record::RelayBatch(batch) if batch.is_owned() => {
+            std::mem::size_of::<Addressed>()
+        }
+        record => record.encoded_len(),
+    }
+}
+
 #[cfg(test)]
 mod tests;
 
@@ -572,7 +584,7 @@ impl Sharing {
     /// is for reads. False when the store's share is full.
     pub fn address(&self, to: PublicKey, record: Record) -> bool {
         let gauge = Arc::clone(&lock(&self.gauge));
-        match gauge.try_charge(record.encoded_len()) {
+        match gauge.try_charge(addressed_len(&record)) {
             Some(charge) => {
                 lock(&self.outbox).push(Addressed { to, record, charge });
                 true
@@ -942,7 +954,7 @@ impl Sharing {
             for record in to_records(outgoing.message) {
                 // Charged before it is queued: past the store's share the send is refused, and
                 // the member it was for repairs what it lacks.
-                match gauge.try_charge(record.encoded_len()) {
+                match gauge.try_charge(addressed_len(&record)) {
                     Some(charge) => outbox.push(Addressed { to, record, charge }),
                     None => refused += 1,
                 }
