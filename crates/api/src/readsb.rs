@@ -97,6 +97,8 @@ pub fn aircraft(entry: &Entry, now_ms: u64) -> Option<Aircraft> {
         baro_rate_fpm: entry.baro_rate.map(round_i32),
         on_ground,
         last_heard_at_ms: now_ms.saturating_sub(entry.seen.map_or(0, millis)),
+        // seam stub (RFC-0184): the position's own time is readsb's `seen_pos`
+        position_at_ms: now_ms.saturating_sub(entry.seen.map_or(0, millis)),
         position_source: PositionSource::Adsb,
         mlat: None,
     })
