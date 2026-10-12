@@ -642,17 +642,29 @@ pub const NOTES_PER_RECEIVER_STEP: usize =
 /// whole bound are taken only into an empty queue, so one is never refused forever.
 pub const PUBLISHED_BYTES: usize = 4 << 20;
 
-/// What one feeder's notes to provisional solving cost the `Notes` store, given what a second of
-/// its batches costs decoded (`decoded_per_sec`, at the planned rate): every interval held
-/// (`INTERVALS_HELD`) of the batches the notes keep alive and the notes, at `NOTES_HEADROOM` times
-/// the planned rate, the same figure that bounds a step's count. Each interval may hold this over
+/// What one note to provisional solving costs the `Notes` store at most (`Shared::tell`): the note,
+/// its share of the address shards' entries for its batch (a batch's notes fall in no more shards
+/// than they are) and of the shared list they are kept in. Not the decode the notes keep alive,
+/// which is charged once, for its life, by itself (`budget::Store::Decoded`).
+pub const NOTE_BYTES: usize =
+    std::mem::size_of::<Note>() + std::mem::size_of::<Heard>() + tally_wire::decoded::ARC_HEADER;
+
+/// What a batch's `notes`, falling in `runs` address shards, cost the `Notes` store once told
+/// (`Shared::tell`): themselves in their shared list, and an entry in each address shard they fall
+/// in. The batch they keep alive is charged by itself.
+fn notes_bytes(notes: &[Note], runs: usize) -> usize {
+    std::mem::size_of_val(notes)
+        .saturating_add(tally_wire::decoded::ARC_HEADER)
+        .saturating_add(runs.saturating_mul(std::mem::size_of::<Heard>()))
+}
+
+/// What one feeder's notes to provisional solving cost the `Notes` store: every interval held
+/// (`INTERVALS_HELD`) of its notes ([`NOTE_BYTES`] each), at `NOTES_HEADROOM` times the planned
+/// rate, the same figure that bounds a step's count. Each interval may hold this over
 /// `INTERVALS_HELD` a seat; past it the interval's notes are refused whole, by the trace.
-pub fn notes_per_feeder(decoded_per_sec: usize) -> usize {
+pub const fn notes_per_feeder() -> usize {
     let step = STEP_MS as usize;
-    INTERVALS_HELD
-        * NOTES_HEADROOM
-        * (decoded_per_sec * step / 1_000
-            + PLANNED_NOTES_PER_SEC * step / 1_000 * std::mem::size_of::<Note>())
+    INTERVALS_HELD * NOTES_HEADROOM * (PLANNED_NOTES_PER_SEC * step / 1_000 * NOTE_BYTES)
 }
 
 /// How far past the last step whose descriptions are applied a batch may be stamped and wait for
@@ -666,13 +678,27 @@ pub const WAITING_MS: u64 = crate::seal::EPOCHS_HELD * crate::seal::EPOCH_MS + S
 /// the store holds (descriptions are charged by their bytes; a few hundred is usual).
 pub const PLANNED_DESCRIPTION_BYTES: usize = 512;
 
-/// What one feeder costs the `Orphans` store, given what a second of its batches costs decoded:
-/// its batches waiting for a description that has not come, `intake::ORPHAN_MS` of them, the
-/// longest one waits; and its batches and description waiting for a step's descriptions to be
-/// applied, `WAITING_MS` of them. The host splits the store between the two by those times
+/// What holding one batch until its step's descriptions are applied costs the `Orphans` store
+/// (`WaitingRoom::hold_batch`): its place in its receiver's queue, with its charge. Not the decode
+/// it keeps alive, charged once for its life by itself (`budget::Store::Decoded`).
+pub const WAITING_BYTES: usize =
+    std::mem::size_of::<(Arc<Decoded>, Waiting)>() + 2 * std::mem::size_of::<usize>();
+
+/// What one feeder costs the `Orphans` store: its batches' places waiting for a description that
+/// has not come (`intake::ORPHAN_BYTES` each), `intake::ORPHAN_MS` of them, the longest one waits;
+/// and its batches' places (`WAITING_BYTES`) and description waiting for a step's descriptions to
+/// be applied, `WAITING_MS` of them, at the records a planned feeder sends
+/// (`cores::RECORDS_PER_PLANNED_FEEDER`). The host splits the store between the two by those times
 /// (`Room::of`), and neither share is ever charged past.
-pub fn orphans_per_feeder(decoded_per_sec: usize) -> usize {
-    (decoded_per_sec + PLANNED_DESCRIPTION_BYTES) * (ORPHAN_MS + WAITING_MS) as usize / 1_000
+pub const fn orphans_per_feeder() -> usize {
+    let entry = if tally_mlat::intake::ORPHAN_BYTES > WAITING_BYTES {
+        tally_mlat::intake::ORPHAN_BYTES
+    } else {
+        WAITING_BYTES
+    };
+    (crate::cores::RECORDS_PER_PLANNED_FEEDER as usize * entry + PLANNED_DESCRIPTION_BYTES)
+        * (ORPHAN_MS + WAITING_MS) as usize
+        / 1_000
 }
 
 /// The `Orphans` store split (`orphans_per_feeder`): the batches waiting for a description that has
@@ -1488,8 +1514,7 @@ impl WaitingRoom {
     fn hold_batch(&mut self, shard: u16, batch: &Arc<Decoded>) -> u64 {
         let key = batch.receiver();
         let mut dropped = 0;
-        if let Some(mut charge) = self.admit(key, shard, batch.footprint(), 0, &mut dropped) {
-            charge._store.cover(batch);
+        if let Some(charge) = self.admit(key, shard, WAITING_BYTES, 0, &mut dropped) {
             if let Some(holder) = self.holders.get_mut(&key) {
                 holder.bytes += charge.bytes;
             }
@@ -1839,10 +1864,9 @@ impl Shared {
                 orphan_batches.set_room(Room::of(orphans.limit()).orphans);
                 let dropped = orphan_batches
                     .hold(batch, batch.stamp_ms(), |bytes| {
-                        orphans.try_charge(bytes).map(|mut charge| {
-                            charge.cover(batch);
-                            Box::new(charge) as Box<dyn Any + Send>
-                        })
+                        orphans
+                            .try_charge(bytes)
+                            .map(|charge| Box::new(charge) as Box<dyn Any + Send>)
                     })
                     .dropped;
                 self.orphans_dropped.fetch_add(dropped, Ordering::Relaxed);
@@ -1908,6 +1932,7 @@ impl Shared {
             at_ms,
         } = told;
         let order = Order::of(&batch, batch.stamp_ms());
+        let runs = provisional_::by_shard(&mut notes);
         let interval = {
             let mut intervals = self.intervals();
             // Never before a step already weighed: no batch is told after the step of its stamp
@@ -1922,16 +1947,12 @@ impl Shared {
             if entry.refused {
                 return;
             }
-            let bytes = batch
-                .footprint()
-                .saturating_add(std::mem::size_of_val(notes.as_slice()));
+            let bytes = notes_bytes(&notes, runs.len());
             entry.notes = entry.notes.saturating_add(notes.len());
             entry.bytes = entry.bytes.saturating_add(bytes);
             let over = entry.notes > self.notes_per_step || entry.bytes > self.notes_bytes_per_step;
             let grown = !over && entry.charge.try_grow(bytes);
-            if grown {
-                entry.charge.cover(&batch);
-            } else {
+            if !grown {
                 entry.shed = !over;
                 entry.refused = true;
                 entry.charge = Charge::none();
@@ -1941,7 +1962,6 @@ impl Shared {
             }
             interval
         };
-        let runs = provisional_::by_shard(&mut notes);
         let notes: Arc<[Note]> = notes.into();
         for (shard, range) in runs {
             self.heard(shard).push(Heard {
@@ -4570,7 +4590,12 @@ mod tests {
             told(2, 0, 10_500)?,
             told(3, 0, 10_900)?,
         ];
-        let one = batches[0].footprint() + 10 * std::mem::size_of::<Note>();
+        // What one batch's ten notes cost the store (their decode charges itself).
+        let one = {
+            let mut ten = notes(10);
+            let runs = provisional_::by_shard(&mut ten).len();
+            notes_bytes(&ten, runs)
+        };
         for order in [[0, 1, 2], [2, 0, 1], [1, 2, 0]] {
             // Two and a half batches a step.
             let gauges = Gauges {
@@ -4617,8 +4642,11 @@ mod tests {
         let notes = |count: u32| -> Vec<Note> {
             (0..count).map(|n| Note::Position(0x40_0000 + n)).collect()
         };
-        let probe = told(1, 0, 10_100)?;
-        let one = probe.footprint() + 10 * std::mem::size_of::<Note>();
+        let one = {
+            let mut ten = notes(10);
+            let runs = provisional_::by_shard(&mut ten).len();
+            notes_bytes(&ten, runs)
+        };
         // Each interval may hold two; the store holds `INTERVALS_HELD` of them.
         let gauges = Gauges {
             notes: Gauge::new(Store::Notes, INTERVALS_HELD * 2 * one),
@@ -5549,7 +5577,8 @@ mod tests {
             .collect();
         drawn.sort_unstable();
         let best: BTreeSet<PublicKey> = drawn[..2].iter().map(|(_, key)| *key).collect();
-        let footprint = told(SEEDS[0], 1, 0)?.footprint();
+        // What a batch waiting costs the store (its decode charges itself).
+        let footprint = WAITING_BYTES;
         // A store whose share for what waits holds two receivers' batches and not a third's.
         let mut limit = 7 * EACH as usize * footprint;
         while Room::of(limit).waiting >= (2 * EACH as usize + 1) * footprint {

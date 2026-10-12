@@ -42,6 +42,18 @@ pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 /// treated as gone, so a stalled reader can never hold a writer, and with it a session, forever.
 pub const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How long a message's body may take to arrive once its length has (RFC-0181, "Memory is charged
+/// once, for its life"). A reader takes a whole message's buffer when the length arrives, so a peer
+/// that states a length and then trickles its bytes would hold that buffer, and with it the
+/// connection's floor, for as long as it kept a byte coming. Past this the session ends with
+/// `Timeout`. 30 s carries a full 64 KiB frame at 2.2 KB a second (about 18 kbit/s), below a 2G
+/// uplink's worst and far below any feeder's: a feeder sends about 8 KB a second in all, so an
+/// honest frame takes seconds on the slowest link that keeps up with its own receiver at all. It is
+/// the writer's deadline ([`WRITE_TIMEOUT`]) on the other side, so either side of a session holds a
+/// message's buffers on a stalled peer for the same bound. The wait for a length holds no buffer,
+/// and is the caller's to bound.
+pub const FRAME_DEADLINE: Duration = Duration::from_secs(30);
+
 /// The largest Noise message, ciphertext and tag together.
 pub const MAX_MESSAGE: usize = 65_535;
 const TAG_LEN: usize = 16;
@@ -525,13 +537,17 @@ impl<S: AsyncRead> Reader<S> {
     /// plaintext and the one record taken, whatever the records are: a 64 KiB message of
     /// three-byte records is some 21,800 of them, and decoded together they were several
     /// megabytes per connection, outside every plan. An end of stream is an `Io` error of kind
-    /// `UnexpectedEof`. The caller bounds the wait.
+    /// `UnexpectedEof`. The caller bounds the wait for a message to begin; once its length has
+    /// arrived its body must arrive within [`FRAME_DEADLINE`], or this fails with `Timeout` and the
+    /// session must end (it is mid-frame).
     pub async fn recv_message(&mut self) -> Result<Message, WireError> {
         let mut length = [0; 2];
         self.read.read_exact(&mut length).await?;
         let length = usize::from(u16::from_be_bytes(length));
         let mut message = Buffer::take_from(self.pool);
-        self.read.read_exact(message.space(length)).await?;
+        tokio::time::timeout(FRAME_DEADLINE, self.read.read_exact(message.space(length)))
+            .await
+            .map_err(|_| WireError::Timeout)??;
         let (plaintext, length) = self.decrypt(message, length)?;
         #[cfg(test)]
         self.pool
@@ -945,6 +961,55 @@ mod tests {
             Err(WireError::Timeout)
         ));
         drop(accepted);
+        Ok(())
+    }
+
+    /// A peer that states a frame's length and sends its bytes one a second (a whole frame would
+    /// take 18 hours) is closed at the frame's deadline, not when it stops: the buffer the reader
+    /// took for the frame is held for [`FRAME_DEADLINE`] at most, and given back.
+    #[tokio::test]
+    async fn a_trickled_frame_is_closed_at_its_deadline() -> Result<(), WireError> {
+        let pool = own_pool(4);
+        let relay = Identity::generate()?;
+        let feeder = Identity::generate()?;
+        let (near, far) = tokio::io::duplex(1 << 16);
+        let relay_key = relay.public();
+        let dial = tokio::spawn(async move {
+            initiate(
+                near,
+                &feeder,
+                &relay_key,
+                (Role::Feeder, &[]),
+                (MIN_VERSION, MAX_VERSION),
+                pool,
+            )
+            .await
+        });
+        let mut accepted = respond(far, std::slice::from_ref(&relay), pool).await?;
+        let mut theirs = join(dial.await)??;
+        tokio::time::pause();
+        // The largest frame's length, then a byte a second, never the frame.
+        let trickle = tokio::spawn(async move {
+            let write = &mut theirs.writer.write;
+            let mut sent = write.write_all(&u16::MAX.to_be_bytes()).await;
+            while sent.is_ok() {
+                sent = write.write_all(&[0]).await;
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        });
+        let began = tokio::time::Instant::now();
+        let read = accepted.session.reader.recv_message().await;
+        let waited = began.elapsed();
+        assert!(matches!(read, Err(WireError::Timeout)), "{:?}", read.err());
+        // Closed at the deadline, to the trickle's second: not before, and not when it stops.
+        assert!(waited >= FRAME_DEADLINE, "{waited:?}");
+        assert!(
+            waited < FRAME_DEADLINE + Duration::from_secs(2),
+            "{waited:?}"
+        );
+        // And the frame's buffer is given back.
+        assert_eq!(pool.out.load(Ordering::Relaxed), 0);
+        trickle.abort();
         Ok(())
     }
 

@@ -80,7 +80,10 @@ impl Rates {
     }
 }
 
-/// What one batch costs the rate: the receptions it states and its bytes on the wire.
+/// What one batch costs the rate: the receptions it states and its bytes as the relay charges
+/// them (`ingest::charge_of`: signed, inflated and referenced), the unit `R_max`'s bytes and every
+/// store holding a decode are planned in. Before, its bytes on the wire: a batch inflated to the
+/// wire's limit cost its share an eighth of what it cost the stores.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Cost {
     pub receptions: u64,

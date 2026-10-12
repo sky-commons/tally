@@ -5,8 +5,8 @@
 //! and released when it leaves ([`Reservation`] dropped). A sharing member is a session over which
 //! another relay's data comes in (a relay whose offer this one verified dialling it, or this relay's
 //! own one-hop raw link): the members together are planned once, as the feeders their one shared
-//! rate is worth, and each member session carves its ingest allowance from a pool sized at start
-//! for every member session the protocol lets this relay's areas bring, at most its connections
+//! rate is worth, and each member session holds one of the places planned at start for every
+//! member session the protocol lets this relay's areas bring, at most its connections
 //! ([`members_for`], [`Plan::with_members`], [`Budget::reserve_member`]): feeders can never take
 //! the room members were planned, and a member is never refused because feeders came first. Past
 //! the sessions planned a member is turned away as full (`Reason::Full`), and the relay it was
@@ -34,9 +34,17 @@
 //! counted), the fan-out lets its laggard go, and hosted MLAT sheds whole steps it is behind on
 //! (`mlat_host`). The gauges are served on `--stats-listen` (`GET /memory`).
 //!
+//! Each allocation is charged once, by its owner, for its life (RFC-0181, "Memory is charged once,
+//! for its life"): a batch's decode and its signed bytes carry their charges inside their own
+//! shared allocations ([`Store::Decoded`]), and every other holder charges only what it allocates
+//! itself (an epoch's decisions, a queue's slots, a note, an entry). So a store's window is the
+//! deadline its holders enforce, the decodes' the longest of theirs ([`decoded_window_ms`]), never
+//! a sum, and [`Covered`] holds equality: every decode alive charged exactly once.
+//!
 //! The per-feeder costs are planning figures at the rate the RFC sizes a feeder to
-//! ([`PLANNED_RECEPTIONS_PER_SEC`], [`PLANNED_BYTES_PER_SEC`]) times each store's own window,
-//! named where the store defines it, so a store that changes its window changes its reservation.
+//! ([`PLANNED_RECEPTIONS_PER_SEC`], and its bytes as charged, [`PLANNED_CHARGED_BYTES_PER_SEC`])
+//! times each store's own window, named where the store defines it, so a store that changes its
+//! window changes its reservation.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -49,8 +57,9 @@ use tokio::sync::oneshot;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Store {
-    /// The one batch byte store, over the sharing repair horizon: the records the sharing groups
-    /// hold, their parities, and the parities being reassembled (`sharing`).
+    /// What the sharing groups allocate themselves over the repair horizon (`sharing`): their
+    /// parities, the outbox addressed to members, and an entry for each record they hold. Not a
+    /// record's signed bytes, which are their batch's own allocation ([`Store::Decoded`]).
     Batches,
     /// MLAT's sealed raw (`Held`'s sealed bins), shared by the engine and standing.
     Held,
@@ -58,31 +67,38 @@ pub enum Store {
     /// over a bin, its settling and the seals MLAT may fall behind (`mlat_host::SEALS_BEHIND`).
     Open,
     /// What batches told hosted MLAT's provisional solving and its step has not yet weighed: the
-    /// decoded batches the notes keep alive, and the notes (`mlat_host::NOTES_PER_RECEIVER_STEP`),
-    /// over the step intervals MLAT may fall behind; and the batches of receivers not yet described.
+    /// notes (`mlat_host::NOTES_PER_RECEIVER_STEP`) and their entries, over the step intervals MLAT
+    /// may fall behind. Not the decodes the notes keep alive: those are [`Store::Decoded`]'s.
     Notes,
     /// The hosted engine's own tables that grow with its receivers: the receptions waiting for
     /// provisional solving (`tally_mlat::engine::Capacity::waiting`) and a window step's working
     /// set while it runs (`mlat_host::SOLVE_BYTES_PER_RECEIVER`).
     Engine,
-    /// Hosted MLAT's batches waiting for their receiver's description: one not yet come
-    /// (`tally_mlat::intake::Intake::hold_orphan`), or one taking effect at a step not yet applied
-    /// (`mlat_host`, Descriptions), over `tally_mlat::intake::ORPHAN_MS`.
+    /// Hosted MLAT's entries for batches waiting for their receiver's description: one not yet
+    /// come (`tally_mlat::intake::Orphans::hold`), or one taking effect at a step not yet applied
+    /// (`mlat_host`, Descriptions), over `tally_mlat::intake::ORPHAN_MS`; and the descriptions
+    /// waiting. The decodes they keep alive are [`Store::Decoded`]'s.
     Orphans,
     /// The message exchange's generations of fingerprints (`exchange::DEDUP_GENERATIONS`).
     Dedup,
-    /// Subscriber queues' share of one feeder's inbound.
+    /// Subscriber queues: each item's own allocation and its slot in every queue that takes it
+    /// (`fanout::item_charge`), over `fanout::BEHIND_MS`. Not a batch's decode or signed bytes.
     Fanout,
-    /// Delivery tags over the audit window.
+    /// Delivery tags over the audit window, at the most one receiver may hold
+    /// (`delivery::PER_RECEIVER_BYTES`).
     Delivery,
     /// Connection buffers: a feeder connection's Noise buffers, reading and writing, for its whole
     /// session (`ingest::BUFFERS_PER_CONNECTION`).
     Buffers,
-    /// Batches read off connections and waiting for, or in, the ingest stage, or on their way to
-    /// the epochs: each connection's allowance (`ingest::Allowance`), in bytes as charged.
+    /// Records read off connections and waiting for an ingest worker, until they are decoded:
+    /// one pool every connection waits for in turn by source (`ingest::Allowance`), in bytes as
+    /// charged (`ingest::charge_of`), sized at the rate the workers admit over the time a record
+    /// may wait for one (`ingest::INGEST_WAIT_MS`).
     Ingest,
-    /// Decoded batches between ingest and the sealer: each epoch open in the message exchange,
-    /// closing, and waiting at the sealer (`seal::EPOCHS_HELD`).
+    /// What the epochs allocate themselves between ingest and the sealer: each reception's place
+    /// in its epoch's decisions and each batch's in its word (`exchange::DECISION_BYTES_PER_RECEPTION`),
+    /// for each epoch open, closing and waiting at the sealer (`seal::EPOCHS_HELD`). Not the
+    /// decodes the epochs hold: those are [`Store::Decoded`]'s.
     Epochs,
     /// What the sealer has signed and the hub has not yet taken (the deduplicated stream's
     /// batches and the products): this relay's own outputs, never a peer's record.
@@ -96,6 +112,13 @@ pub enum Store {
     /// use, over the sources a connection can bring (`shed::UNITS_PER_CONNECTION`). Past it the
     /// shedder tracks no more and judges the rest as one (`shed::Unit::Overflow`).
     Shed,
+    /// Every batch kept at ingest, as two allocations each charged once for its life: its decode
+    /// (`tally_wire::Decoded`, the charge inside its shared allocation, `Decoded::from_verified_owned`)
+    /// and its signed bytes (`Batch::owned_by`). However many stages hold them, neither is charged
+    /// again: each holder charges only what it allocates itself. Its window is the longest any
+    /// holder keeps a decode (`decoded_window_ms`), and on a relay with sharing members the time
+    /// the signed bytes outlive their decode in the groups (`sharing::member::HORIZON_MS`).
+    Decoded,
 }
 
 /// What a store's size follows (`Store::driver`).
@@ -111,7 +134,7 @@ pub enum Driver {
 }
 
 impl Store {
-    pub const ALL: [Self; 15] = [
+    pub const ALL: [Self; 16] = [
         Self::Batches,
         Self::Held,
         Self::Open,
@@ -127,6 +150,7 @@ impl Store {
         Self::Products,
         Self::Records,
         Self::Shed,
+        Self::Decoded,
     ];
 
     const fn index(self) -> usize {
@@ -151,6 +175,7 @@ impl Store {
             Self::Products => "products",
             Self::Records => "records",
             Self::Shed => "shed",
+            Self::Decoded => "decoded",
         }
     }
 
@@ -158,29 +183,39 @@ impl Store {
     /// (RFC-0181 §9, "Admission"). Every store answers, with no default.
     pub const fn driver(self) -> Driver {
         match self {
-            Self::Buffers | Self::Ingest | Self::Delivery | Self::Shed => Driver::Connection,
+            Self::Buffers | Self::Delivery | Self::Shed => Driver::Connection,
             Self::Batches
             | Self::Dedup
             | Self::Fanout
+            | Self::Ingest
             | Self::Epochs
             | Self::Products
-            | Self::Records => Driver::Rate,
-            Self::Held | Self::Open | Self::Notes | Self::Engine | Self::Orphans => Driver::Seat,
+            | Self::Decoded => Driver::Rate,
+            // Records are written by the members' sessions and this relay's MLAT, never by a
+            // feeder's receptions: the seats, and the members' rate (`Plan::member_unit`).
+            Self::Held
+            | Self::Open
+            | Self::Notes
+            | Self::Engine
+            | Self::Orphans
+            | Self::Records => Driver::Seat,
         }
     }
 
-    /// Whether this store holds decoded batches (`tally_wire::Decoded`), each charged at least its
-    /// footprint, or its slices' shares of it, for as long as the store holds it: what
-    /// [`Budget::decoded_charged`] sums. Every store answers here, with no default, so a store
-    /// added is a decision made, not one forgotten.
+    /// Whether this store is charged for decoded batches (`tally_wire::Decoded`), each its
+    /// footprint exactly, once, for its life: what [`Budget::decoded_charged`] reads. Every store
+    /// answers here, with no default, so a store added is a decision made, not one forgotten.
     pub const fn holds_decoded(self) -> bool {
         match self {
-            // A connection's batches read and decoded, the epochs', a subscriber queue's, the
-            // batches provisional solving was told and those waiting for a description.
-            Self::Ingest | Self::Epochs | Self::Fanout | Self::Notes | Self::Orphans => true,
-            // Records and parities, MLAT's own raw and tables, fingerprints, tags, Noise buffers,
-            // signed products: bytes of their own, never a decode kept alive.
-            Self::Batches
+            Self::Decoded => true,
+            // What every other holder of a decode charges is what it allocates itself (an epoch's
+            // decisions, a queue's slots, a note, an entry): never the decode it keeps alive.
+            Self::Ingest
+            | Self::Epochs
+            | Self::Fanout
+            | Self::Notes
+            | Self::Orphans
+            | Self::Batches
             | Self::Held
             | Self::Open
             | Self::Engine
@@ -212,9 +247,13 @@ pub struct PerFeeder {
     pub products: usize,
     pub records: usize,
     pub shed: usize,
+    pub decoded: usize,
     /// A connection's pace state outside any store: its record pace, its reception bucket and its
     /// share's counters ([`PACE_STATE_BYTES`]). Part of a connection's floor.
     pub pace: usize,
+    /// What the kernel charges a feeder's socket at most, outside any store: its buffers pinned
+    /// (`sockets::FEEDER_KERNEL_BYTES`). Part of a connection's floor.
+    pub sockets: usize,
 }
 
 impl PerFeeder {
@@ -228,12 +267,13 @@ impl PerFeeder {
         }
         if driver == Driver::Connection {
             kept.pace = self.pace;
+            kept.sockets = self.sockets;
         }
         kept
     }
 
-    /// What a connection costs whatever it sends: its buffers, ingest allowance, delivery tags
-    /// and pace state.
+    /// What a connection costs whatever it sends: its Noise buffers, its kernel socket buffers, its
+    /// delivery tags and its pace and shed state.
     pub fn floor(&self) -> Self {
         self.only(Driver::Connection)
     }
@@ -266,6 +306,7 @@ impl PerFeeder {
             Store::Products => self.products = bytes,
             Store::Records => self.records = bytes,
             Store::Shed => self.shed = bytes,
+            Store::Decoded => self.decoded = bytes,
         }
     }
 
@@ -286,18 +327,18 @@ impl PerFeeder {
             Store::Products => self.products,
             Store::Records => self.records,
             Store::Shed => self.shed,
+            Store::Decoded => self.decoded,
         }
     }
 
     /// What one feeder's worth of the members' shared rate costs each store: a feeder's, but for
-    /// the connection buffers, which each member's connection takes from the connections' room
-    /// (`Plan::connection_buffers`), and the ingest allowance, which each member session carves on
-    /// its own (`Plan::per_member`), never from the rate's worth.
+    /// the connection's own buffers and sockets, which each member's connection takes from the
+    /// connections' room (`Plan::connection_buffers`, `Plan::connection_sockets`), and its pace.
     pub fn as_member(&self) -> Self {
         Self {
             buffers: 0,
-            ingest: 0,
             pace: 0,
+            sockets: 0,
             ..*self
         }
     }
@@ -306,6 +347,7 @@ impl PerFeeder {
     pub fn plus(&self, other: &Self) -> Self {
         let mut sum = Self {
             pace: self.pace.saturating_add(other.pace),
+            sockets: self.sockets.saturating_add(other.sockets),
             ..Self::default()
         };
         for store in Store::ALL {
@@ -318,36 +360,58 @@ impl PerFeeder {
     pub fn total(&self) -> usize {
         Store::ALL
             .iter()
-            .fold(self.pace, |sum, store| sum.saturating_add(self.of(*store)))
+            .fold(self.pace.saturating_add(self.sockets), |sum, store| {
+                sum.saturating_add(self.of(*store))
+            })
     }
 
-    /// What one feeder at the planned rate costs each store over that store's window. `holds_raw`:
-    /// whether this relay holds MLAT raw (`Held`, `Open`) at all, which it does only when it hosts
-    /// MLAT.
+    /// What one feeder at the planned rate costs each store over that store's window, on a relay
+    /// with no sharing member and no session listening. `holds_raw`: whether this relay holds
+    /// MLAT raw (`Held`, `Open`) at all, which it does only when it hosts MLAT.
     pub fn planned(holds_raw: bool) -> Self {
+        Self::planned_for(holds_raw, false, 0)
+    }
+
+    /// What one feeder at the planned rate costs each store over that store's window
+    /// ([`PerFeeder::planned`]), on a relay whose sharing groups hold members' records
+    /// (`sharing`: it has sharing members) or not, with `listeners` sessions that may take a batch
+    /// from the fan-out (those under the connection cap and the subscribers). A byte-driven store
+    /// is sized by a planned feeder's charged bytes (`PLANNED_CHARGED_BYTES_PER_SEC`), the unit
+    /// `R_max` caps them in, never by an assumed reception size; a reception-driven one by its
+    /// receptions.
+    pub fn planned_for(holds_raw: bool, sharing: bool, listeners: usize) -> Self {
         let receptions = PLANNED_RECEPTIONS_PER_SEC;
-        let bytes = PLANNED_BYTES_PER_SEC;
-        // One second of one feeder's batches as the stages hold them: signed, inflated once, each
-        // reception referenced (`tally_wire::Decoded::footprint`).
-        let decoded = bytes + receptions * DECODED_BYTES_PER_RECEPTION;
+        let charged = PLANNED_CHARGED_BYTES_PER_SEC;
+        // The signed bytes the rate admits with them, at most (`ingest::rate_cost`).
+        let signed = charged / crate::ingest::CHARGED_PER_SIGNED;
+        let records = crate::cores::RECORDS_PER_PLANNED_FEEDER as usize;
+        let horizon_ms = crate::sharing::member::HORIZON_MS as usize;
+        let decoded_ms = decoded_window_ms(holds_raw) as usize;
         Self {
-            // The one batch byte store, over the sharing repair horizon: the records, and their
-            // parities, which the groups hold as long and charge to the same gauge. A parity is
-            // as long as its manifest's longest stripe slice: a third of its records in a busy
-            // area, all of them in one with a record a second (measured 2026-10-08, 5,000
-            // feeders: parities 0.72 of the records), so it is planned at the most it can be,
-            // its records' bytes and its own overhead (`sharing::parity::OVERHEAD`) a second.
-            // And what sharing addresses to members waiting in its outbox for the next network
-            // tick (`network::TICK`), charged to the same gauge (`sharing::Addressed`): a second's
-            // records and parity sent to each child of its stripe trees (`stripes::FANOUT`), a
-            // tick of it. (Once handed to a member's link, a send keeps this charge and takes its
-            // link's share too, `Plan::member_links`.)
-            batches: (2 * bytes + crate::sharing::parity::OVERHEAD)
-                * crate::sharing::member::HORIZON_SECONDS as usize
-                + (2 * bytes + crate::sharing::parity::OVERHEAD)
-                    * crate::sharing::stripes::FANOUT
-                    * crate::network::TICK.as_millis() as usize
-                    / 1_000,
+            // What the sharing groups allocate themselves over the repair horizon, on a relay
+            // with sharing members only: a record's entry (its piece, the signed bytes being its
+            // batch's own allocation, `Store::Decoded`), and its parity, which the groups hold as
+            // long. A parity is as long as its manifest's longest stripe slice, at most its
+            // records' signed bytes, which the rate holds to its bytes over
+            // `ingest::CHARGED_PER_SIGNED` (`ingest::rate_cost`); and its
+            // own overhead (`sharing::parity::OVERHEAD`) a second. And the parities addressed to
+            // members waiting in the outbox for the next network tick (`network::TICK`), a second's
+            // to each child of the stripe trees (`stripes::FANOUT`), a tick of it. (Once handed to a
+            // member's link, a send keeps this charge and takes its link's share too,
+            // `Plan::member_links`.) Not rounded up: the horizon is in milliseconds.
+            batches: if sharing {
+                (records * crate::sharing::member::PIECE_ENTRY_BYTES
+                    + signed
+                    + crate::sharing::parity::OVERHEAD)
+                    * horizon_ms
+                    / 1_000
+                    + (signed + crate::sharing::parity::OVERHEAD)
+                        * crate::sharing::stripes::FANOUT
+                        * crate::network::TICK.as_millis() as usize
+                        / 1_000
+            } else {
+                0
+            },
             // MLAT's sealed raw (`Held`): the sealed bins a holder keeps, at the rates measured
             // (`held::Rates::MEASURED`).
             held: if holds_raw {
@@ -367,19 +431,20 @@ impl PerFeeder {
             } else {
                 0
             },
-            // Provisional solving's notes, where MLAT is hosted: a batch told is held (its decode
-            // kept alive, and its notes) until the step after its stamp's interval weighs it, over
-            // the intervals a host that sheds nothing holds, at the headroom a step's notes are
-            // bounded by (`mlat_host::notes_per_feeder`: the count and the bytes from one figure).
+            // Provisional solving's notes, where MLAT is hosted: a batch's notes held until the
+            // step after its stamp's interval weighs them, over the intervals a host that sheds
+            // nothing holds, at the headroom a step's notes are bounded by
+            // (`mlat_host::notes_per_feeder`: the count and the bytes from one figure). The decodes
+            // they keep alive are `decoded`'s, inside its window.
             notes: if holds_raw {
-                crate::mlat_host::notes_per_feeder(decoded)
+                crate::mlat_host::notes_per_feeder()
             } else {
                 0
             },
-            // Hosted MLAT's batches waiting for a description (`Orphans`), over the longest one
-            // waits (`mlat_host::orphans_per_feeder`).
+            // Hosted MLAT's entries for batches waiting for a description (`Orphans`), over the
+            // longest one waits (`mlat_host::orphans_per_feeder`).
             orphans: if holds_raw {
-                crate::mlat_host::orphans_per_feeder(decoded)
+                crate::mlat_host::orphans_per_feeder()
             } else {
                 0
             },
@@ -393,46 +458,110 @@ impl PerFeeder {
             },
             // `exchange::DEDUP_GENERATIONS` generations of fingerprints, one epoch each, the
             // deduplication's window (`exchange::DEDUP_WINDOW_MS`), as if no reception were a copy
-            // of another's, with the tables' room to grow.
-            dedup: receptions
-                * crate::exchange::DEDUP_SLOTS_PER_RECEPTION
-                * crate::exchange::DEDUP_ENTRY_BYTES
-                * crate::seal::EPOCH_MS as usize
-                / 1_000,
-            // A subscriber's queue holds `BEHIND_MS` of inbound: the batches, and while they wait
-            // their one decode.
-            fanout: decoded * crate::fanout::BEHIND_MS as usize / 1_000,
-            // A delivery tag per batch over the audit window (`delivery`).
-            delivery: crate::delivery::PER_FEEDER_BYTES,
+            // of another's, allocated once at their capacity
+            // (`exchange::DEDUP_BYTES_PER_RECEPTION_PER_SEC`; what they allocate whatever the rate,
+            // `exchange::DEDUP_FIXED_BYTES`, is held before any feeder, `Plan::before_feeders`).
+            dedup: receptions * crate::exchange::DEDUP_BYTES_PER_RECEPTION_PER_SEC,
+            // A subscriber's queue holds `BEHIND_MS` of inbound: each item's own allocation once,
+            // and its slot in the queue of every session that may take it (`fanout::item_charge`);
+            // nothing where no session listens (an item no queue takes is not charged).
+            fanout: if listeners == 0 {
+                0
+            } else {
+                records
+                    * (crate::fanout::ITEM_BYTES + listeners * crate::fanout::SLOT_BYTES)
+                    * crate::fanout::BEHIND_MS as usize
+                    / 1_000
+            },
+            // A delivery tag per batch over the audit window, at the most one receiver may hold
+            // (`delivery::PER_RECEIVER_BYTES`), whatever it sends.
+            delivery: crate::delivery::PER_RECEIVER_BYTES,
             // A feeder's connection: its Noise buffers in both directions, the reader's frame and
             // plaintext and the writer's (`ingest::BUFFERS_PER_CONNECTION`), carved when it is
             // admitted. What the Noise pool keeps idle is the process's (`BASE_BYTES`).
             buffers: crate::ingest::BUFFERS_PER_CONNECTION,
-            // A feeder connection's allowance of batches read and not yet held by the epochs, in
-            // bytes as they are charged (`ingest::charge_of`: signed, inflated and referenced, and
-            // at least `ingest::CHARGE_FLOOR` a record), carved from this store when it is admitted
-            // (`ingest::FEEDER_ALLOWANCE`, which a planned batch fills unfloored: this module's
-            // tests hold it).
-            ingest: crate::ingest::FEEDER_ALLOWANCE,
-            // The decoded batches of the epochs between ingest and the sealer, and each reception's
-            // place in the epoch's decisions while its word waits for the sealer
-            // (`exchange::DECISION_BYTES_PER_RECEPTION`).
-            epochs: (decoded + receptions * crate::exchange::DECISION_BYTES_PER_RECEPTION)
+            // The records read and not yet decoded, in one pool every connection waits for in
+            // turn (`ingest::Allowance`): what the workers take a second, charged
+            // (`ingest::charge_of`, and at least `ingest::CHARGE_FLOOR` a record), over the time a
+            // record may wait for a worker (`ingest::INGEST_WAIT_MS`, Little's law).
+            ingest: charged.max(records * crate::ingest::CHARGE_FLOOR)
+                * crate::ingest::INGEST_WAIT_MS as usize
+                / 1_000,
+            // What the epochs allocate between ingest and the sealer: each reception's slice, its
+            // run and its place in the epoch's decisions, and its batch's place in the word
+            // (`exchange::EPOCH_BYTES_PER_RECEPTION`), over the epochs held.
+            epochs: receptions
+                * crate::exchange::EPOCH_BYTES_PER_RECEPTION
                 * crate::seal::EPOCHS_HELD as usize
                 * crate::seal::EPOCH_MS as usize
                 / 1_000,
             // What the sealer signed of those epochs and the hub has not taken: every reception
             // twice as a signed record's observation, in the deduplicated stream and in its area's
-            // regional batch, as if none were a copy (`products::OUTBOX_EPOCHS`).
-            products: receptions * PRODUCT_BYTES_PER_RECEPTION * crate::products::OUTBOX_EPOCHS,
-            // The records waiting for the sealer, and to be forwarded, apart from the outputs
-            // (`products::records_per_feeder`).
-            records: crate::products::records_per_feeder(receptions),
+            // regional batch, as if none were a copy (`products::OUTBOX_EPOCHS`). An observation is
+            // its bytes inflated, which are at most `INFLATED_PER_CHARGED` of what its batch was
+            // charged.
+            products: 2 * inflated_of_charged(charged) * crate::products::OUTBOX_EPOCHS,
+            // The records waiting for the sealer, and to be forwarded, apart from the outputs:
+            // written by MLAT's seats (`seat`) and the members' sessions (`Plan::member_unit`),
+            // never by a feeder's receptions.
+            records: if holds_raw {
+                crate::products::records_per_feeder(receptions)
+            } else {
+                0
+            },
             // The sources the ingest rate tracks (`shed`): the ones a connection brings.
             shed: crate::shed::BYTES_PER_UNIT * crate::shed::UNITS_PER_CONNECTION,
+            // Every batch kept, its decode and its signed bytes, each charged once for its life,
+            // at most what it was charged at ingest: over the longest any holder keeps a decode
+            // (`decoded_window_ms`), and where the sharing groups hold its signed bytes, those
+            // (the rate's bytes over `ingest::CHARGED_PER_SIGNED`, `ingest::rate_cost`) over the
+            // repair horizon, for the time they outlive the decode.
+            decoded: charged * decoded_ms / 1_000
+                + if sharing {
+                    signed * horizon_ms.saturating_sub(decoded_ms) / 1_000
+                } else {
+                    0
+                },
             pace: PACE_STATE_BYTES,
+            sockets: crate::sockets::FEEDER_KERNEL_BYTES,
         }
     }
+}
+
+/// What a decode is held for at most, by the holder that keeps it longest, each by a deadline its
+/// code enforces: the epochs held between ingest and the sealer (`seal::EPOCHS_HELD`), a
+/// subscriber's queue (`fanout::BEHIND_MS`), and where MLAT is hosted its notes' intervals
+/// (`mlat_host::INTERVALS_HELD` steps) and a batch waiting for its description and then for its
+/// step (`intake::ORPHAN_MS`, `mlat_host::WAITING_MS`). A decode alive is younger than this, so
+/// the decodes alive are at most the rate over it: the longest, never the sum of the holders'
+/// windows, since one decode held by all of them is one decode.
+pub const fn decoded_window_ms(holds_raw: bool) -> u64 {
+    let epochs = crate::seal::EPOCHS_HELD * crate::seal::EPOCH_MS;
+    let mut window = if epochs > crate::fanout::BEHIND_MS {
+        epochs
+    } else {
+        crate::fanout::BEHIND_MS
+    };
+    if holds_raw {
+        let notes = crate::mlat_host::INTERVALS_HELD as u64 * crate::mlat_host::STEP_MS;
+        let orphans = tally_mlat::intake::ORPHAN_MS + crate::mlat_host::WAITING_MS;
+        if notes > window {
+            window = notes;
+        }
+        if orphans > window {
+            window = orphans;
+        }
+    }
+    window
+}
+
+/// What a batch charged `charged` bytes holds at most as observations, inflated: a batch is
+/// charged a reference for every reception its inflated bytes can hold (`ingest::charge_of`,
+/// `Batch::receptions_at_most`), so its inflated bytes are at most the fixed part of an
+/// observation over that and a reference.
+pub const fn inflated_of_charged(charged: usize) -> usize {
+    charged * tally_wire::decoded::OBSERVATION_FIXED
+        / (tally_wire::decoded::OBSERVATION_FIXED + std::mem::size_of::<tally_wire::ObsRef>())
 }
 
 /// What a connection's pace state holds outside any store: its record pace (`ingest::RecordPace`,
@@ -445,15 +574,11 @@ pub const PACE_STATE_BYTES: usize = 1 << 10;
 /// (RFC-0181, "Requirement").
 pub const PLANNED_RECEPTIONS_PER_SEC: usize = 600;
 pub const PLANNED_BYTES_PER_SEC: usize = 8 * 1024;
-/// One reception in a decoded batch: its reference, and its encoded observation in the inflated
-/// bytes (the fixed part and a 14-byte Mode S message).
-const DECODED_BYTES_PER_RECEPTION: usize =
-    std::mem::size_of::<tally_wire::ObsRef>() + tally_wire::decoded::OBSERVATION_FIXED + 14;
-/// One reception as the products hold it before the hub takes them: its encoded observation (the
-/// fixed part and a 14-byte Mode S message) in two signed records, the deduplicated stream's batch
-/// and its area's regional batch. Both are signed from the epoch's batches, so neither holds an
-/// owned copy (`deduplicated::Stream::sign`, `tally_wire::RegionalBatch::sign_draft`).
-const PRODUCT_BYTES_PER_RECEPTION: usize = 2 * (tally_wire::decoded::OBSERVATION_FIXED + 14);
+/// That feeder's batches as the relay charges them (`ingest::charge_of`: signed, inflated, a
+/// reference for each reception they can hold, and the headers of the allocations they make), one
+/// batch a second: the unit `R_max`'s bytes are counted in (`Admission::bytes_per_sec`), the
+/// shedder judges a batch by, and every byte-driven store is sized from.
+pub const PLANNED_CHARGED_BYTES_PER_SEC: usize = crate::ingest::PLANNED_BATCH_CHARGE;
 /// What the relay holds whatever its feeders: descriptions, stream tables, the runtime and the one
 /// batch each ingest worker is decoding (256 MiB), and the connection buffers the Noise pool keeps
 /// idle (`noise::POOL_IDLE` messages). Measured (RFC-0181, "Sizing", 2026-10-07): resident memory
@@ -482,18 +607,21 @@ pub const MLAT_BASE_BYTES: usize = (4 << 20) + crate::mlat_host::PUBLISHED_BYTES
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Plan {
     pub base: usize,
-    /// What one connection costs whatever it sends: its floor (buffers, ingest allowance, delivery
-    /// tags, pace state), reserved when it is admitted ([`Budget::reserve`]). Not the rate-driven
-    /// stores', which follow the relay-wide rate, nor MLAT's, which follow its seats.
+    /// What one connection costs whatever it sends: its floor (Noise and kernel socket buffers,
+    /// delivery tags at the per-receiver cap, pace and shed state), reserved when it is admitted
+    /// ([`Budget::reserve`]). Not the rate-driven stores', which follow the relay-wide rate, nor
+    /// MLAT's, which follow its seats.
     pub per_feeder: PerFeeder,
     /// What one planned feeder's rate (600 receptions a second) costs the rate-driven stores over
     /// their windows: a gauge's limit is this over [`PLANNED_RECEPTIONS_PER_SEC`] times the
-    /// relay-wide rate `R_max` and the members' rate.
+    /// relay-wide rate `R_max` and the members' rate. It follows whether the relay has sharing
+    /// members and how many sessions may listen ([`PerFeeder::planned_for`]), set again by
+    /// [`Plan::with_members`] and [`Plan::with_sessions`].
     pub per_rate: PerFeeder,
     /// What one MLAT seat costs the seat stores (all zero where MLAT is not hosted).
     pub per_seat: PerFeeder,
-    /// The member sessions the relay holds at once ([`members_for`]): each carves its ingest
-    /// allowance ([`Plan::per_member`]).
+    /// The member sessions the relay holds at once ([`members_for`]), each holding a place of them
+    /// ([`Budget::reserve_member`]).
     pub members: usize,
     /// The feeders the members' one shared rate (`--max-member-bytes-per-sec`, all of them
     /// together) is worth: planned once, however many members carry it.
@@ -691,12 +819,62 @@ impl Plan {
             },
             ..self
         }
+        .rate_replanned()
     }
 
-    /// The room batches past their connection's whole allowance take, one at a time
-    /// (`ingest::OVERSIZE_BYTES`).
-    pub fn oversize(&self) -> usize {
-        crate::ingest::OVERSIZE_BYTES
+    /// The rate-driven stores' costs again for what the plan now holds: whether it has sharing
+    /// members (its groups then hold their records' signed bytes and parities over the horizon)
+    /// and how many sessions may take a batch from the fan-out.
+    fn rate_replanned(self) -> Self {
+        Self {
+            per_rate: PerFeeder::planned_for(
+                self.holds_raw,
+                self.members > 0,
+                self.sessions
+                    .general
+                    .saturating_add(self.sessions.subscribers),
+            )
+            .rate(),
+            ..self
+        }
+    }
+
+    /// The kernel's socket buffers of every connection but a feeder's (whose are its floor's,
+    /// `PerFeeder::sockets`), each place counted once, at what its role pins (`sockets`). Every
+    /// connection under the connection cap at a feeder's, since a connection holds more only while
+    /// it holds a place counted here. Each member place a member's: a session admitted as a member
+    /// and a raw link dialled as an engine (`link::admit_member`) both leave the cap for it. Each
+    /// subscriber place a subscriber's, outside the cap as well. Two places are taken by connections
+    /// that keep their place under the cap, so they are counted past a feeder's only by what they
+    /// pin more: an engine place (`Hub::engine_place`, as many as the member sessions) and a link
+    /// dialled to a member that only sends (`Hub::dialled`, at most as many as the member sessions,
+    /// `peers`). Both are under the cap together, so at most the cap of them hold either, the
+    /// dearer (an engine's) counted first. Before, both were counted whole beside the cap's feeder
+    /// buffers, a feeder's twice for each.
+    pub fn connection_sockets(&self) -> usize {
+        use crate::sockets::{
+            ENGINE_KERNEL_BYTES, FEEDER_KERNEL_BYTES, MEMBER_KERNEL_BYTES, SUBSCRIBER_KERNEL_BYTES,
+        };
+        let general = self.sessions.general;
+        // Each of the two holds at most the member sessions' count of places; the dearer is
+        // filled first, whichever it is, and the other takes what the cap leaves.
+        let (engine, dialled) = (
+            ENGINE_KERNEL_BYTES.saturating_sub(FEEDER_KERNEL_BYTES),
+            MEMBER_KERNEL_BYTES.saturating_sub(FEEDER_KERNEL_BYTES),
+        );
+        let (first, second) = (engine.max(dialled), engine.min(dialled));
+        let firsts = self.members.min(general);
+        let seconds = self.members.min(general - firsts);
+        general
+            .saturating_mul(FEEDER_KERNEL_BYTES)
+            .saturating_add(self.members.saturating_mul(MEMBER_KERNEL_BYTES))
+            .saturating_add(
+                self.sessions
+                    .subscribers
+                    .saturating_mul(SUBSCRIBER_KERNEL_BYTES),
+            )
+            .saturating_add(firsts.saturating_mul(first))
+            .saturating_add(seconds.saturating_mul(second))
     }
 
     /// The Noise buffers of every connection but a feeder's the caps allow
@@ -716,7 +894,8 @@ impl Plan {
     }
 
     /// What the members' shared rate (`--max-member-bytes-per-sec`) brings in a second at most, as
-    /// planned: the feeders it is worth, each at the planned rate (no less than the rate itself).
+    /// planned: the feeders it is worth, each at the planned rate (no less than the rate itself),
+    /// in signed bytes.
     pub fn member_bytes_per_sec(&self) -> usize {
         self.member_feeders.saturating_mul(PLANNED_BYTES_PER_SEC)
     }
@@ -729,16 +908,19 @@ impl Plan {
     }
 
     /// Every part of what the relay holds before any feeder, each under the name `tally-relay
-    /// check` prints it by: its base, the oversize room, the connections' buffers, the members'
-    /// pool, what waits for the member links and the parities being reassembled. The one list
-    /// [`Plan::before_feeders`] sums and `check` prints, so a part planned is a part printed: a
-    /// room added here and nowhere else is in both, and the deploy checks that add the lines up
-    /// (`before-feeders`) never sum a list of their own.
-    pub fn before_feeders_parts(&self) -> [(&'static str, usize); 6] {
+    /// check` prints it by: its base, what the fingerprints' tables allocate whatever the rate
+    /// (charged to `Store::Dedup` beside the rate's), the connections' Noise buffers and kernel
+    /// socket buffers,
+    /// the members' pool, what waits for the member links and the parities being reassembled. The
+    /// one list [`Plan::before_feeders`] sums and `check` prints, so a part planned is a part
+    /// printed: a room added here and nowhere else is in both, and the deploy checks that add the
+    /// lines up (`before-feeders`) never sum a list of their own.
+    pub fn before_feeders_parts(&self) -> [(&'static str, usize); 7] {
         [
             ("base", self.base),
-            ("oversize", self.oversize()),
+            ("dedup-tables", crate::exchange::DEDUP_FIXED_BYTES),
             ("connection-buffers", self.connection_buffers()),
+            ("connection-sockets", self.connection_sockets()),
             ("member-pool", self.member_pool()),
             ("member-links", self.member_links()),
             ("parity-assembly", self.parity_assembly()),
@@ -768,6 +950,7 @@ impl Plan {
             },
             ..self
         }
+        .rate_replanned()
     }
 
     /// The feeders the members' shared rate is planned as.
@@ -775,36 +958,32 @@ impl Plan {
         self.member_feeders
     }
 
-    /// One member session's own bytes: its ingest allowance, a feeder's ([`CREDIT`] planned batches,
-    /// `ingest::FEEDER_ALLOWANCE`), since what it forwards arrives as feeders' batches.
-    ///
-    /// [`CREDIT`]: crate::ingest::CREDIT
-    pub fn per_member(&self) -> usize {
-        self.per_feeder.ingest
-    }
-
-    /// What the members' shared rate holds in every store but their sessions' allowances
-    /// (`PerFeeder::as_member`, the rate's feeders' worth).
+    /// What the members' shared rate holds in every store (`PerFeeder::as_member`, the rate's
+    /// feeders' worth). A member session holds nothing of its own beside it: what it reads waits
+    /// in the one ingest pool (`Store::Ingest`), its records counted by its credit.
     pub fn member_rate_pool(&self) -> usize {
         self.member_unit()
             .total()
             .saturating_mul(self.member_feeders)
     }
 
-    /// What one feeder's worth of the members' shared rate costs every store but their sessions'
-    /// allowances: the floor's delivery tags, the rate-driven stores' windows and, hosting MLAT, a
-    /// seat's raw (the raw links bring other relays' feeders').
+    /// What one feeder's worth of the members' shared rate costs every store: the floor's
+    /// delivery tags and shed state, the rate-driven stores' windows, the records the members'
+    /// sessions write (positions, models, peers' regional batches; `products::records_per_feeder`)
+    /// and, hosting MLAT, a seat's raw (the raw links bring other relays' feeders').
     pub fn member_unit(&self) -> PerFeeder {
-        self.per_feeder
+        let mut unit = self
+            .per_feeder
             .as_member()
             .plus(&self.per_rate)
-            .plus(&self.per_seat)
+            .plus(&self.per_seat);
+        unit.records = crate::products::records_per_feeder(PLANNED_RECEPTIONS_PER_SEC);
+        unit
     }
 
-    /// The members' pool: their shared rate's worth, and every member session's allowance.
+    /// The members' pool: their shared rate's worth.
     pub fn member_pool(&self) -> usize {
         self.member_rate_pool()
-            .saturating_add(self.per_member().saturating_mul(self.members))
     }
 }
 
@@ -866,11 +1045,14 @@ pub struct Admission {
 }
 
 impl Admission {
-    /// `R_max` in bytes a second, at the planned mean's bytes to receptions.
+    /// `R_max` in bytes a second, as batches are charged (`ingest::charge_of`), at the planned
+    /// mean's charged bytes to receptions: what every store holding a batch's decode or its bytes
+    /// is sized from, and what the shedder judges a batch's bytes by, whatever a feeder puts in
+    /// its batches (an inflated one is charged its inflated bytes).
     pub fn bytes_per_sec(&self) -> u64 {
         mul_div(
             self.rate,
-            PLANNED_BYTES_PER_SEC as u128,
+            PLANNED_CHARGED_BYTES_PER_SEC as u128,
             PLANNED_RECEPTIONS_PER_SEC as u128,
         )
     }
@@ -1316,7 +1498,6 @@ impl Gauge {
         Some(Charge {
             gauge: Some(Arc::clone(self)),
             bytes,
-            covers: Vec::new(),
         })
     }
 
@@ -1325,7 +1506,6 @@ impl Gauge {
         Charge {
             gauge: Some(Arc::clone(self)),
             bytes: 0,
-            covers: Vec::new(),
         }
     }
 
@@ -1500,53 +1680,50 @@ struct Queue {
 /// a planned batch's charge, so a source of planned batches is served about one in its turn.
 pub const DRR_QUANTUM: usize = 128 << 10;
 
-/// Bytes a store holds for one thing, released when it is dropped, and the decoded batches it is
-/// charged for holding ([`Charge::cover`]), each counted once in the process's [`Covered`] for as
-/// long as any charge covers it.
+/// Bytes a store holds for one thing, released when it is dropped.
 #[derive(Debug, Default)]
 pub struct Charge {
     gauge: Option<Arc<Gauge>>,
     bytes: usize,
-    covers: Vec<Cover>,
 }
 
-/// The decoded batches alive that some store's charge covers ([`Charge::cover`]), each counted
-/// once however many stores and charges hold it: what [`Budget::decoded_held`] sets beside the
-/// decodes alive (`tally_wire::decoded::live`), so one decode alive that no charge covers shows,
-/// whatever the stores hold beside it. One a process ([`Covered::process`]), as the decodes alive
-/// are counted once a process.
+/// Every decoded batch alive and the charge made for it (RFC-0181, "Memory is charged once, for
+/// its life"): a decode is charged once, by the ingest stage that made it, inside its own shared
+/// allocation (`tally_wire::Decoded::from_verified_owned`), and that charge goes when the decode's
+/// last holder lets it go. So each decode alive has exactly one charge, of exactly its footprint,
+/// however many stores hold it; what [`Budget::decoded_held`] sets beside the decodes alive
+/// (`tally_wire::decoded::live`). One a process ([`Covered::process`]), as the decodes alive are
+/// counted once a process.
 ///
-/// Before, the check summed the gauges of the stores that hold decodes. A connection's allowance
-/// is carved whole from `Store::Ingest` when it is admitted (`ingest::Allowance`) and stays
-/// carved while it reads nothing, and a decode in the epochs and a subscriber's queue is charged
-/// by both: the sum ran about a megabyte past the decodes alive under a flood, and a holder
-/// keeping dozens of batches uncharged was inside it.
+/// Before, every store that held a decode charged it, in full or by its slices' shares (the
+/// epochs, every subscriber queue's item, MLAT's notes and orphans, the ingest allowance until the
+/// epochs took it), and this checked only that the charges were at least the footprint: one
+/// decode held by four stores was charged four times, and over-charging was invisible by
+/// construction. Equality is the check now: a decode charged twice shows as surely as one charged
+/// never.
 ///
-/// Sharded by the decode's address so the stages' threads seldom meet on a lock: each decode's
-/// address, how many covers hold it and the decode itself, weakly (a cover keeps no decode alive;
-/// its allocation, and so its address, stays the decode's while a cover does).
+/// A decode is entered when its charge is made, before it is counted alive, and leaves when it
+/// is let go, after it stops being counted (`tally_wire::decoded::on_drop`), so with every shard
+/// locked a decode `live` counts and this does not is one alive with no charge. Sharded by the
+/// decode's address so the stages' threads seldom meet on a lock.
 ///
-/// It also judges every hand-off as it happens, not only when it is sampled: a
-/// cover let go or lessened while its decode lives, leaving the decode's covers holding less than
-/// its footprint, is a lapse counted there and then ([`Covered::lapses`]), and so is a decode that
-/// lived and was let go with no cover ever made for it. A sample sees what is held at its instant;
-/// these counters see every instant a hand-off made, so a holder that keeps a decode uncharged for
-/// less than the time between two samples is counted all the same.
+/// It also judges every charge as it is made and every decode as it goes: a decode charged a
+/// second time while it lives, and a decode let go that was never charged, are each counted there
+/// and then ([`Covered::lapses`]), so a lapse between two samples of a watch is seen all the same.
 pub struct Covered {
     shards: [Mutex<BTreeMap<usize, CoverEntry>>; COVER_SHARDS],
-    /// Hand-offs that left a live decode's covers short of its footprint (or none).
-    short_hand_offs: AtomicU64,
-    /// Decodes let go that no charge had ever covered.
+    /// Charges made for a decode that already had one.
+    charged_twice: AtomicU64,
+    /// Decodes let go that no charge had ever been made for.
     never_covered: AtomicU64,
 }
 
-/// What [`Covered`] counted at the hand-offs since the process started.
+/// What [`Covered`] counted as charges were made and decodes let go, since the process started.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Lapses {
-    /// A cover let go or lessened while its decode lived, leaving it covered for less than its
-    /// footprint: the decode was held, from then, where no gauge was charged for all of it.
-    pub short_hand_offs: u64,
-    /// A decode alive and let go with no charge ever covering it.
+    /// A decode charged again while it lived: held once, charged twice.
+    pub charged_twice: u64,
+    /// A decode alive and let go with no charge ever made for it.
     pub never_covered: u64,
 }
 
@@ -1556,46 +1733,38 @@ static COVERED: Covered = Covered::new();
 
 #[derive(Debug)]
 struct CoverEntry {
-    /// Its covers now. An entry whose covers are all let go while its decode lives stays, at
-    /// none, until the decode is let go ([`Covered::gone`]): it is a decode alive and uncovered.
-    covers: usize,
-    /// The bytes its covers' charges hold for it together ([`Cover::bytes`]).
-    vouched: usize,
-    /// Its footprint, read when it was first covered: what it counts for while it is alive.
+    /// The charges made for it: one, unless it was charged twice.
+    charges: usize,
+    /// What they hold for it together.
+    charged: usize,
+    /// Its footprint, read when it was charged: what it counts for while it is alive.
     footprint: usize,
-    /// Let go (`tally_wire::decoded::on_drop`): no longer counted alive, whatever its covers.
-    gone: bool,
-    decoded: Weak<tally_wire::Decoded>,
+}
+
+impl std::fmt::Debug for Covered {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Covered")
+    }
 }
 
 impl Covered {
     const fn new() -> Self {
         Self {
             shards: [const { Mutex::new(BTreeMap::new()) }; COVER_SHARDS],
-            short_hand_offs: AtomicU64::new(0),
+            charged_twice: AtomicU64::new(0),
             never_covered: AtomicU64::new(0),
         }
     }
 
-    /// What the hand-offs left short, counted as each happened, since the process started.
+    /// What was counted as it happened, since the process started.
     pub fn lapses(&self) -> Lapses {
         Lapses {
-            short_hand_offs: self.short_hand_offs.load(Ordering::Relaxed),
+            charged_twice: self.charged_twice.load(Ordering::Relaxed),
             never_covered: self.never_covered.load(Ordering::Relaxed),
         }
     }
 
-    /// Counts the hand-off just made to `entry` if it left a live decode short of its footprint.
-    /// A decode whose last strong reference has gone is being let go (its `gone` follows, taking
-    /// this lock), so it is not alive; one held anywhere is.
-    fn judge(&self, entry: &CoverEntry) {
-        let alive = !entry.gone && entry.decoded.strong_count() > 0;
-        if alive && entry.vouched < entry.footprint {
-            self.short_hand_offs.fetch_add(1, Ordering::Relaxed);
-        }
-    }
-
-    /// The process's: every charge's covers ([`Charge::cover`]). Told each decode as it leaves
+    /// The process's: every decode's charge ([`Covered::own`]). Told each decode as it leaves
     /// `tally_wire::decoded::live` ([`Covered::gone`]).
     pub fn process() -> &'static Self {
         static TOLD: std::sync::Once = std::sync::Once::new();
@@ -1605,18 +1774,36 @@ impl Covered {
         &COVERED
     }
 
-    /// The decode at `address` was let go and `live` no longer counts it: its covers, until they
-    /// go, count for nothing.
-    fn gone(&self, address: usize) {
+    /// `decoded` was charged `charged` bytes for its life, by the charge inside it: called once
+    /// it is shared and before it is counted alive (`Decoded::from_verified_owned`'s `held`). A
+    /// second charge for a decode that has one is counted ([`Lapses::charged_twice`]).
+    pub fn own(&self, decoded: &Arc<tally_wire::Decoded>, charged: usize) {
+        let address = Arc::as_ptr(decoded) as usize;
         let mut shard = self.shard(address);
         match shard.get_mut(&address) {
-            Some(entry) if entry.covers == 0 => {
-                shard.remove(&address);
+            Some(entry) => {
+                entry.charges += 1;
+                entry.charged += charged;
+                self.charged_twice.fetch_add(1, Ordering::Relaxed);
             }
-            Some(entry) => entry.gone = true,
             None => {
-                self.never_covered.fetch_add(1, Ordering::Relaxed);
+                shard.insert(
+                    address,
+                    CoverEntry {
+                        charges: 1,
+                        charged,
+                        footprint: decoded.footprint(),
+                    },
+                );
             }
+        }
+    }
+
+    /// The decode at `address` was let go and `live` no longer counts it: its entry goes, and its
+    /// charge with it as the decode's fields are dropped.
+    fn gone(&self, address: usize) {
+        if self.shard(address).remove(&address).is_none() {
+            self.never_covered.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -1627,109 +1814,56 @@ impl Covered {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    fn add(&self, decoded: &Arc<tally_wire::Decoded>, bytes: usize) -> usize {
-        let address = Arc::as_ptr(decoded) as usize;
-        let mut shard = self.shard(address);
-        let entry = shard.entry(address).or_insert_with(|| CoverEntry {
-            covers: 0,
-            vouched: 0,
-            footprint: decoded.footprint(),
-            gone: false,
-            decoded: Arc::downgrade(decoded),
-        });
-        entry.covers += 1;
-        entry.vouched += bytes;
-        address
-    }
-
-    fn remove(&self, address: usize, bytes: usize) {
-        let mut shard = self.shard(address);
-        if let Some(entry) = shard.get_mut(&address) {
-            entry.covers -= 1;
-            entry.vouched = entry.vouched.saturating_sub(bytes);
-            self.judge(entry);
-            // Kept at no covers while its decode may yet be let go (`gone` removes it then), so
-            // a decode alive with none is known to have had one.
-            if entry.covers == 0 && entry.gone {
-                shard.remove(&address);
-            }
-        }
-    }
-
-    /// One cover of the decode at `address` holds `bytes` less for it.
-    fn lessen(&self, address: usize, bytes: usize) {
-        if bytes == 0 {
-            return;
-        }
-        if let Some(entry) = self.shard(address).get_mut(&address) {
-            entry.vouched = entry.vouched.saturating_sub(bytes);
-            self.judge(entry);
-        }
-    }
-
-    /// The bytes the charges covering `decoded` hold for it together.
-    pub fn vouched_for(&self, decoded: &Arc<tally_wire::Decoded>) -> usize {
+    /// The bytes charged for `decoded`, together.
+    pub fn charged_for(&self, decoded: &Arc<tally_wire::Decoded>) -> usize {
         let address = Arc::as_ptr(decoded) as usize;
         self.shard(address)
             .get(&address)
-            .map_or(0, |entry| entry.vouched)
+            .map_or(0, |entry| entry.charged)
     }
 
-    /// The decoded batches alive whose covers' charges hold less for them together than their
-    /// footprint, and the bytes they are short: a decode one charge of a byte
-    /// covers is held as surely as one no charge covers, outside every gauge.
-    pub fn short(&self) -> (usize, usize) {
-        self.short_decodes()
+    /// How many charges were made for `decoded` while it lives: one, for a decode charged once.
+    pub fn charges_of(&self, decoded: &Arc<tally_wire::Decoded>) -> usize {
+        let address = Arc::as_ptr(decoded) as usize;
+        self.shard(address)
+            .get(&address)
+            .map_or(0, |entry| entry.charges)
+    }
+
+    /// The decoded batches alive charged other than once for exactly their footprint, and the
+    /// bytes their charges are off by: a decode charged a byte, or charged twice, is held where the
+    /// plan does not say it is.
+    pub fn inexact(&self) -> (usize, usize) {
+        self.inexact_decodes()
             .iter()
-            .fold((0, 0), |(batches, bytes), (_, short)| {
-                (batches + 1, bytes + short)
+            .fold((0, 0), |(batches, bytes), (_, off)| {
+                (batches + 1, bytes + off)
             })
     }
 
-    /// The same, each by its address (which is its own while it is alive) and what it is short:
-    /// a check that sees the same decode short twice knows it is held so, not caught in a hand-off.
-    pub fn short_decodes(&self) -> Vec<(usize, usize)> {
-        let mut short = Vec::new();
-        // The decodes looked at are let go once their shard's lock is: one this held last is let
-        // go here, and its going takes that lock (`Covered::gone`).
-        let mut looked_at = Vec::new();
+    /// The same, each by its address (which is its own while it is alive) and what its charges
+    /// are off by.
+    pub fn inexact_decodes(&self) -> Vec<(usize, usize)> {
+        let mut inexact = Vec::new();
         for shard in &self.shards {
             let shard = shard
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            // Only the covered: one alive with no cover left is what `with_live` counts apart.
-            for (address, entry) in shard.iter().filter(|(_, entry)| entry.covers > 0) {
-                if let Some(decoded) = entry.decoded.upgrade() {
-                    if entry.vouched < decoded.footprint() {
-                        short.push((*address, decoded.footprint() - entry.vouched));
-                    }
-                    looked_at.push(decoded);
+            for (address, entry) in shard.iter() {
+                if entry.charges != 1 || entry.charged != entry.footprint {
+                    inexact.push((*address, entry.charged.abs_diff(entry.footprint)));
                 }
             }
-            drop(shard);
-            looked_at.clear();
         }
-        short
+        inexact
     }
 
-    /// How many charges cover `decoded` now.
-    pub fn covers_of(&self, decoded: &Arc<tally_wire::Decoded>) -> usize {
-        let address = Arc::as_ptr(decoded) as usize;
-        self.shard(address)
-            .get(&address)
-            .map_or(0, |entry| entry.covers)
-    }
-
-    /// The decoded batches some charge covers, each once, and the bytes they hold
-    /// (`Decoded::footprint`), beside `live` (the decodes alive, `tally_wire::decoded::live`) read
-    /// at the same instant: every shard locked while both are read. A decode is covered before it
-    /// is counted alive (`Decoded::from_verified_held`, its cover taking its shard's lock), and
-    /// marked gone after it stops being counted (`Covered::gone`, taking the lock too), so with
-    /// every lock held a decode `live` counts and no charge covers is one no charge covers; one
-    /// whose cover outlasts it (a share kept until a sweep) counts for nothing once gone, and one
-    /// caught between the two counts as covered for that instant. Before, the two were read at
-    /// different instants and a check needed two samples to step over a decode made or dropped
-    /// between them.
+    /// The decoded batches charged, each once, and the bytes they hold (`Decoded::footprint`),
+    /// beside `live` (the decodes alive, `tally_wire::decoded::live`) read at the same instant:
+    /// every shard locked while both are read. A decode is entered before it is counted alive and
+    /// leaves after it stops being counted, so with every lock held a decode `live` counts and
+    /// none was charged for is one alive uncharged; one caught between the two counts as charged
+    /// for that instant.
     pub fn with_live(
         &self,
         live: impl FnOnce() -> (usize, usize),
@@ -1746,10 +1880,7 @@ impl Covered {
         let live = live();
         let (mut batches, mut bytes) = (0, 0);
         for shard in &shards {
-            for entry in shard
-                .values()
-                .filter(|entry| !entry.gone && entry.covers > 0)
-            {
+            for entry in shard.values() {
                 batches += 1;
                 bytes += entry.footprint;
             }
@@ -1757,49 +1888,9 @@ impl Covered {
         ((batches, bytes), live)
     }
 
-    /// The decoded batches some charge covers, each once, and the bytes they hold.
+    /// The decoded batches charged, each once, and the bytes they hold.
     pub fn now(&self) -> (usize, usize) {
         self.with_live(|| (0, 0)).0
-    }
-}
-
-/// One charge's hold on one decoded batch ([`Charge::cover`]): counted in its [`Covered`] while
-/// it lives, with the bytes of its charge it holds for the decode. A charge's covers together hold
-/// no more than its bytes (`Charge::settle`), so what the covers of a decode hold is what the
-/// stores holding it are charged for it.
-#[derive(Debug)]
-struct Cover {
-    covered: &'static Covered,
-    address: usize,
-    bytes: usize,
-}
-
-impl std::fmt::Debug for Covered {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("Covered")
-    }
-}
-
-impl Cover {
-    fn new(covered: &'static Covered, decoded: &Arc<tally_wire::Decoded>, bytes: usize) -> Self {
-        Self {
-            covered,
-            address: covered.add(decoded, bytes),
-            bytes,
-        }
-    }
-
-    /// Holds `bytes` less for its decode.
-    fn lessen(&mut self, bytes: usize) {
-        let bytes = bytes.min(self.bytes);
-        self.bytes -= bytes;
-        self.covered.lessen(self.address, bytes);
-    }
-}
-
-impl Drop for Cover {
-    fn drop(&mut self) {
-        self.covered.remove(self.address, self.bytes);
     }
 }
 
@@ -1811,62 +1902,6 @@ impl Charge {
 
     pub fn bytes(&self) -> usize {
         self.bytes
-    }
-
-    /// This charge is for holding `decoded` (or its share of it): the decode is counted as charged
-    /// ([`Covered`]) for as long as this charge, or any part split from it or absorbing it, lives.
-    /// Every store that holds decoded batches covers each with the charge it takes for it, so a
-    /// decode alive with no cover is one held where no gauge sees it (`Budget::decoded_held`).
-    pub fn cover(&mut self, decoded: &Arc<tally_wire::Decoded>) {
-        self.cover_in(Covered::process(), decoded);
-    }
-
-    /// This charge holds no decode any more: its bytes go back to a pool that holds none (an
-    /// allowance's carve, `ingest::Allowance`), which would otherwise count every decode its
-    /// charges were lent for as covered for as long as the connection lasts.
-    pub fn uncover(&mut self) {
-        self.covers.clear();
-    }
-
-    /// As [`Charge::cover`], counted in `covered`: a test's own. The cover holds for the decode
-    /// what this charge holds and its other covers do not, up to the decode's footprint.
-    fn cover_in(&mut self, covered: &'static Covered, decoded: &Arc<tally_wire::Decoded>) {
-        let free = self.bytes.saturating_sub(self.vouched());
-        self.covers
-            .push(Cover::new(covered, decoded, free.min(decoded.footprint())));
-    }
-
-    /// What its covers hold for their decodes together.
-    fn vouched(&self) -> usize {
-        self.covers.iter().map(|cover| cover.bytes).sum()
-    }
-
-    /// Its covers made to hold no more than its bytes once they have fallen (split off, released):
-    /// the cover of the decode at `first` (one handed on with a part) gives up its hold first, then
-    /// the newest. Never more than they hold, so a decode's covers hold what its stores are charged.
-    fn settle(&mut self, first: Option<usize>) {
-        let mut over = self.vouched().saturating_sub(self.bytes);
-        if over == 0 {
-            return;
-        }
-        if let Some(address) = first
-            && let Some(cover) = self
-                .covers
-                .iter_mut()
-                .find(|cover| cover.address == address)
-        {
-            let less = over.min(cover.bytes);
-            cover.lessen(less);
-            over -= less;
-        }
-        for cover in self.covers.iter_mut().rev() {
-            if over == 0 {
-                break;
-            }
-            let less = over.min(cover.bytes);
-            cover.lessen(less);
-            over -= less;
-        }
     }
 
     /// Whether `bytes` more would fit on its gauge now (a charge of nothing fits only nothing).
@@ -1894,49 +1929,14 @@ impl Charge {
 
     /// `bytes` of this charge (all of it, if it holds less) moved into a charge of their own on the
     /// same gauge, nothing taken or released: what a store hands on with the thing it holds (open
-    /// raw handed to its seal, bytes going back to a carve). The part covers no decode: one handed
-    /// on with a decode is split with it ([`Charge::split_covering`]).
-    ///
-    /// Before, every part cloned every cover of the charge it came from: an epoch refused
-    /// whole split a share for each of its slices off a charge covering all of them, each split a
-    /// lock taken per cover, so a refused epoch of `n` slices cost `n²` of them on the message
-    /// thread. A part covers only the decode it is handed on with, so a split costs one cover at
-    /// most, whatever the charge it comes from covers.
+    /// raw handed to its seal, bytes going back).
     pub fn split(&mut self, bytes: usize) -> Charge {
-        let part = self.part(bytes);
-        self.settle(None);
-        part
-    }
-
-    /// `bytes` of this charge moved into a part of their own, its covers not yet settled.
-    fn part(&mut self, bytes: usize) -> Charge {
         let bytes = bytes.min(self.bytes);
         self.bytes -= bytes;
         Charge {
             gauge: self.gauge.clone(),
             bytes,
-            covers: Vec::new(),
         }
-    }
-
-    /// As [`Charge::split`], the part handed on with `decoded` (a batch's slice with its share, a
-    /// refused slice's share kept while its decode lives): it covers that decode and no other.
-    ///
-    /// The part's cover is made before this charge's own cover of the decode gives up what moved,
-    /// so the decode's covers never hold less for it than its stores are charged, even for an
-    /// instant.
-    pub fn split_covering(&mut self, bytes: usize, decoded: &Arc<tally_wire::Decoded>) -> Charge {
-        let address = Arc::as_ptr(decoded) as usize;
-        // Counted where this charge's own cover of it is (a test's own), else the process's.
-        let covered = self
-            .covers
-            .iter()
-            .find(|cover| cover.address == address)
-            .map_or_else(Covered::process, |cover| cover.covered);
-        let mut part = self.part(bytes);
-        part.cover_in(covered, decoded);
-        self.settle(Some(address));
-        part
     }
 
     /// Releases all but `bytes` of this charge.
@@ -1946,7 +1946,6 @@ impl Charge {
         {
             gauge.release(self.bytes - bytes);
             self.bytes = bytes;
-            self.settle(None);
         }
     }
 }
@@ -1969,7 +1968,6 @@ impl Charge {
             self.gauge = other.gauge.clone();
         }
         self.bytes += other.bytes;
-        self.covers.append(&mut other.covers);
         other.bytes = 0;
         other.gauge = None;
         Ok(())
@@ -2009,11 +2007,9 @@ pub struct Budget {
     /// (`Plan::before_feeders`).
     total: usize,
     reserved: Arc<AtomicUsize>,
-    /// Bytes the admitted members hold of their pool.
+    /// The member sessions admitted, of those planned (`Plan::members`).
     members_reserved: Arc<AtomicUsize>,
     gauges: Arc<[Arc<Gauge>]>,
-    /// Batches past their connection's whole allowance, one at a time (`Plan::oversize`).
-    oversize: Arc<Gauge>,
     /// Every connection's Noise buffers but a feeder's (`Plan::connection_buffers`).
     connection_buffers: Arc<Gauge>,
     /// What waits for the member links this relay dials (`Plan::member_links`).
@@ -2050,7 +2046,6 @@ impl Budget {
             reserved: Arc::new(AtomicUsize::new(0)),
             members_reserved: Arc::new(AtomicUsize::new(0)),
             gauges,
-            oversize: Gauge::new(Store::Ingest, 0),
             connection_buffers: Gauge::new(Store::Buffers, 0),
             member_links: Gauge::new(Store::Batches, 0),
             parity_assembly: Gauge::new(Store::Batches, 0),
@@ -2073,16 +2068,9 @@ impl Budget {
             self.gauges[store.index()].set_limit(self.store_bytes(store));
         }
         let plan = self.plan();
-        self.oversize.set_limit(plan.oversize());
         self.connection_buffers.set_limit(plan.connection_buffers());
         self.member_links.set_limit(plan.member_links());
         self.parity_assembly.set_limit(plan.parity_assembly());
-    }
-
-    /// The room a batch past its connection's whole allowance takes (`ingest::Allowance`), one at
-    /// a time: the same gauge for the budget's life.
-    pub fn oversize(&self) -> Arc<Gauge> {
-        Arc::clone(&self.oversize)
     }
 
     /// The room every connection but a feeder's carves its Noise buffers from: the same gauge for
@@ -2151,27 +2139,25 @@ impl Budget {
         if self.memory < needed || admission.connections == 0 {
             return Err(format!(
                 "{} bytes of memory admit no feeder beside {} member sessions: the relay needs {} \
-                 bytes for itself, {} for batches past their connection's allowance, {} for the \
-                 Noise buffers of its {} connections (--max-connections), {} for its members' shared \
-                 rate ({} feeders' worth at --max-member-bytes-per-sec) and {} for each member \
-                 session (as many as its areas bring, at most its connections) and {} more for what \
-                 waits for its link to each, {} for the parities its members' rate reassembles at \
-                 once (the parity-assembly room), and {} for each connection ({} of them its floor, \
-                 the rest the windows of the planned rate{}), {needed} in all for these \
-                 and one; give it more (--memory, or the \
-                 memory it runs in: the unit's MemoryHigh and MemoryMax, the container's \
-                 limits.memory), or plan fewer connections or a slower members' rate \
-                 (--max-connections, --max-member-bytes-per-sec)",
+                 bytes for itself, {} for the Noise buffers and {} for the kernel's socket buffers \
+                 of its {} connections (--max-connections), {} for its members' shared rate ({} \
+                 feeders' worth at --max-member-bytes-per-sec), {} for what waits for its link to \
+                 each member session (as many as its areas bring, at most its connections), {} for \
+                 the parities its members' rate reassembles at once (the parity-assembly room), and \
+                 {} for each connection ({} of them its floor, the rest the windows of the planned \
+                 rate{}), {needed} in all for these and one; give it more (--memory, or the memory \
+                 it runs in: the unit's MemoryHigh and MemoryMax, the container's limits.memory), \
+                 or plan fewer connections or a slower members' rate (--max-connections, \
+                 --max-member-bytes-per-sec)",
                 self.memory,
                 self.plan.members,
                 self.plan.base,
-                plan.oversize(),
                 plan.connection_buffers(),
+                plan.connection_sockets(),
                 self.plan.connections,
                 plan.member_rate_pool(),
                 self.plan.member_feeders,
-                plan.per_member(),
-                crate::peers::WAITING_PER_LINK_BYTES,
+                plan.member_links(),
                 plan.parity_assembly(),
                 Self::memory_for(1, plan) - plan.before_feeders(),
                 plan.per_feeder.total(),
@@ -2291,17 +2277,12 @@ impl Budget {
         )
     }
 
-    /// Reserves one member session's own bytes (its ingest allowance, `Plan::per_member`) from the
-    /// members' pool, for as long as it is a member, or `None` when every member session planned
-    /// is admitted. The members' shared rate is planned whole at start; members never reserve from
-    /// the feeders' room, so a relay full of feeders still takes the members it was planned for.
+    /// Reserves one of the member sessions planned (`Plan::members`), for as long as it is a
+    /// member, or `None` when every one is admitted. The members' shared rate is planned whole at
+    /// start; members never reserve from the feeders' room, so a relay full of feeders still takes
+    /// the members it was planned for.
     pub fn reserve_member(&self) -> Option<Reservation> {
-        let plan = self.plan();
-        Self::take(
-            &self.members_reserved,
-            plan.per_member(),
-            plan.per_member().saturating_mul(plan.members),
-        )
+        Self::take(&self.members_reserved, 1, self.plan().members)
     }
 
     fn take(reserved: &Arc<AtomicUsize>, needed: usize, room: usize) -> Option<Reservation> {
@@ -2321,7 +2302,7 @@ impl Budget {
         self.reserved.load(Ordering::Acquire)
     }
 
-    /// Bytes the admitted members hold of their pool.
+    /// The member sessions admitted.
     pub fn members_reserved(&self) -> usize {
         self.members_reserved.load(Ordering::Acquire)
     }
@@ -2382,8 +2363,7 @@ impl Budget {
 
     /// What every admitted connection, the rate and the members together may hold in `store`:
     /// the connections' floors, the store's window of `R_max` and of the members' rate (RFC-0181
-    /// §10: `limit = window x (R_max + members' rate)`), the seats', and each member session's
-    /// allowance.
+    /// §10: `limit = window x (R_max + members' rate)`), and the seats'.
     pub fn store_bytes(&self, store: Store) -> usize {
         let admission = self.admission();
         let floors = self
@@ -2398,8 +2378,9 @@ impl Budget {
             .member_unit()
             .of(store)
             .saturating_mul(self.plan.member_feeders);
-        let sessions = if store == Store::Ingest {
-            self.plan().per_member().saturating_mul(self.plan.members)
+        // The fingerprints' tables allocate this whatever the rate (`Plan::before_feeders`).
+        let fixed = if store == Store::Dedup {
+            crate::exchange::DEDUP_FIXED_BYTES
         } else {
             0
         };
@@ -2407,7 +2388,7 @@ impl Budget {
             .saturating_add(rate)
             .saturating_add(seats)
             .saturating_add(members)
-            .saturating_add(sessions)
+            .saturating_add(fixed)
     }
 
     /// The gauge of `store`: the same one for the budget's life, whatever it is resized to.
@@ -2415,42 +2396,38 @@ impl Budget {
         Arc::clone(&self.gauges[store.index()])
     }
 
-    /// What the stores holding decoded batches ([`Store::holds_decoded`]) and the oversize room
-    /// are charged now.
+    /// What the stores holding decoded batches ([`Store::holds_decoded`]) are charged now: the
+    /// decodes and the batches' signed bytes.
     pub fn decoded_charged(&self) -> usize {
         Store::ALL
             .iter()
             .filter(|store| store.holds_decoded())
             .map(|store| self.gauges[store.index()].held())
-            .fold(self.oversize.held(), usize::saturating_add)
+            .fold(0, usize::saturating_add)
     }
 
-    /// The decoded batches alive in this process (`tally_wire::decoded::live`) beside those some
-    /// store's charge covers ([`Covered`], each decode once however many hold it), the covers read
-    /// on both sides of the count and the larger kept, so a batch handed from one store to the next
-    /// while they are read is not taken for one nobody holds; and what the stores holding decodes
-    /// are charged ([`Budget::decoded_charged`]), for the report. Every decoded batch is covered
-    /// by the charge it is decoded under (its connection's allowance, `ingest::InFlight`) and by
-    /// every store's that holds it after, so a decode alive with no cover, other than a hand-off
-    /// caught between its release and its drop, is a holder no gauge sees: the bytes that would
-    /// grow past the budget. Exact to the batch: no allowance carved and idle, and no decode two
-    /// stores hold, stands in for one.
+    /// The decoded batches alive in this process (`tally_wire::decoded::live`) beside those
+    /// charged ([`Covered`], read at the same instant), those charged other than once for exactly
+    /// their footprint, and what the store holding decodes is charged
+    /// ([`Budget::decoded_charged`]), for the report. Every decode is charged once, inside itself,
+    /// by the ingest stage that made it, so a decode alive uncharged, or charged twice or for
+    /// other than its footprint, is a decode the plan does not hold as it says: exact to the batch
+    /// and to the byte.
     pub fn decoded_held(&self) -> DecodedHeld {
         let (covered, (batches, live)) = Covered::process().with_live(tally_wire::decoded::live);
-        let short = Covered::process().short();
+        let inexact = Covered::process().inexact();
         DecodedHeld {
             batches,
             live,
             covered_batches: covered.0,
             covered: covered.1,
-            short_batches: short.0,
-            short: short.1,
+            inexact_batches: inexact.0,
+            inexact: inexact.1,
             charged: self.decoded_charged(),
         }
     }
 
     pub fn report(&self) -> MemoryReport {
-        let plan = self.plan();
         MemoryReport {
             memory: self.memory,
             base: self.plan.base,
@@ -2460,12 +2437,10 @@ impl Budget {
             allocator: allocator_report(),
             reserved: self.reserved(),
             members: self.plan.members,
-            per_member: plan.per_member(),
             member_feeders: self.plan.member_feeders,
             members_reserved: self.members_reserved(),
             stores: self.gauges.iter().map(|gauge| gauge.report()).collect(),
             decoded: self.decoded_held(),
-            oversize: self.oversize.report(),
             connection_buffers: self.connection_buffers.report(),
             member_links: self.member_links.report(),
             parity_assembly: self.parity_assembly.report(),
@@ -2487,15 +2462,12 @@ pub struct MemoryReport {
     pub allocator: AllocatorReport,
     pub reserved: usize,
     pub members: usize,
-    pub per_member: usize,
     pub member_feeders: usize,
     pub members_reserved: usize,
     pub stores: Vec<GaugeReport>,
     /// The decoded batches alive beside what the stores holding them are charged
     /// (`Budget::decoded_held`): `live` past `charged` is a holder no gauge sees.
     pub decoded: DecodedHeld,
-    /// Batches past their connection's whole allowance (`Plan::oversize`).
-    pub oversize: GaugeReport,
     /// Every connection's Noise buffers but a feeder's (`Plan::connection_buffers`).
     pub connection_buffers: GaugeReport,
     /// What waits for the member links (`Plan::member_links`).
@@ -2511,26 +2483,25 @@ pub struct DecodedHeld {
     /// Decoded batches alive in the process, and the bytes they hold (`Decoded::footprint`).
     pub batches: usize,
     pub live: usize,
-    /// Of those, the batches some store's charge covers ([`Covered`]), each once, and their bytes.
+    /// Of those, the batches charged ([`Covered`]), each once, and their bytes.
     pub covered_batches: usize,
     pub covered: usize,
-    /// What the stores holding decoded batches, and the oversize room, are charged: their room
-    /// in use, allowances carved and idle among it, and a decode held twice charged twice.
+    /// What the store holding decoded batches is charged: every decode's own charge, and every
+    /// batch's signed bytes beside them.
     pub charged: usize,
-    /// Of the covered batches, those whose covers' charges hold less for them together than their
-    /// footprint, and the bytes they are short ([`Covered::short`]): held past what any gauge was
-    /// charged, however many charges cover them.
-    pub short_batches: usize,
-    pub short: usize,
+    /// Of the charged batches, those charged other than once for exactly their footprint, and the
+    /// bytes their charges are off by ([`Covered::inexact`]).
+    pub inexact_batches: usize,
+    pub inexact: usize,
 }
 
 impl DecodedHeld {
-    /// Decoded bytes alive that no store's charge covers.
+    /// Decoded bytes alive that no charge holds.
     pub fn uncharged(&self) -> usize {
         self.live.saturating_sub(self.covered)
     }
 
-    /// Decoded batches alive that no store's charge covers.
+    /// Decoded batches alive that no charge holds.
     pub fn uncharged_batches(&self) -> usize {
         self.batches.saturating_sub(self.covered_batches)
     }
@@ -2553,10 +2524,10 @@ impl Drop for Reservation {
 mod tests {
     use super::*;
 
-    /// A decoded batch of `receptions` receptions, its own.
-    fn decoded(receptions: u32) -> Result<Arc<tally_wire::Decoded>, String> {
+    /// A signed batch of `receptions` receptions, its own.
+    fn signed(receptions: u32) -> Result<tally_wire::Batch, String> {
         let receiver = tally_wire::Identity::generate().map_err(|error| error.to_string())?;
-        let batch = tally_wire::Batch::sign(
+        tally_wire::Batch::sign_with(
             &receiver,
             &tally_wire::BatchContent {
                 boot_id: 1,
@@ -2574,124 +2545,96 @@ mod tests {
                     })
                     .collect(),
             },
+            tally_wire::batch::Codec::Deflate,
         )
-        .map_err(|error| error.to_string())?;
-        tally_wire::Decoded::from_verified(batch, 0, 0).map_err(|error| error.error.to_string())
+        .map_err(|error| error.to_string())
     }
 
-    /// A decode is counted covered once however many charges and stores hold it, a charge
-    /// that covers nothing (an allowance carved and idle) counts for no decode, a cover follows
-    /// its charge through a split and an absorb, and a decode no charge covers is counted
-    /// uncovered: to the batch, so one leaked batch shows.
+    /// `batch` decoded as the ingest stage decodes it (`ingest::Stages::decode_owned`), its bytes
+    /// and its decode charged to `gauge`, entered in `covered`.
+    fn owned(
+        batch: tally_wire::Batch,
+        gauge: &Arc<Gauge>,
+        covered: &'static Covered,
+    ) -> Result<Arc<tally_wire::Decoded>, String> {
+        crate::ingest::Stages::decode_owned(batch, crate::ingest::Stamp::default(), gauge, covered)
+            .map_err(|error| format!("{error:?}"))
+    }
+
+    /// A batch's decode and its signed bytes are each charged once, inside their own allocations,
+    /// for their life: however many stores hold them (the epochs, a subscriber's queue, MLAT's
+    /// notes, the sharing groups' copies of the batch), the store is charged the two footprints and
+    /// no more, the decode is entered once with its charge equal to its footprint, and the charges
+    /// go with the last holder of each, the bytes outliving the decode when something keeps the
+    /// batch. A store with no room refuses the batch whole, its bytes and its decode.
     #[test]
-    fn each_decode_is_covered_once_and_an_idle_carve_covers_none() -> Result<(), String> {
+    fn a_decode_and_its_bytes_are_each_charged_once_for_their_life() -> Result<(), String> {
         let covered: &'static Covered = Box::leak(Box::new(Covered::new()));
-        let plan = Plan::planned(false);
-        let budget = Budget::of_memory(Budget::memory_for(4, plan), plan);
-        // An allowance carved and idle: charged, covering nothing.
-        let idle = budget.gauge(Store::Ingest).try_charge(4 << 10);
-        assert!(idle.is_some());
+        let gauge = Gauge::new(Store::Decoded, 1 << 20);
+        let batch = signed(40)?;
+        let charged = crate::ingest::charge_of(&batch);
+        let decoded = owned(batch, &gauge, covered)?;
+        assert!(decoded.is_owned() && decoded.batch().is_owned());
+        let both = decoded.footprint() + decoded.batch().footprint();
+        assert_eq!(gauge.held(), both);
+        // What ingest charged before the decode bounds what the two are charged for their life.
+        assert!(
+            both <= charged,
+            "{both} past the {charged} charged at ingest"
+        );
+        assert_eq!(covered.now(), (1, decoded.footprint()));
+        assert_eq!(covered.charges_of(&decoded), 1);
+        assert_eq!(covered.charged_for(&decoded), decoded.footprint());
+        assert_eq!(covered.inexact(), (0, 0));
+        // Held by four stores and the groups: still the two charges, once each.
+        let holders: Vec<_> = (0..4).map(|_| Arc::clone(&decoded)).collect();
+        let kept = decoded.batch().clone();
+        assert_eq!(gauge.held(), both);
+        assert_eq!(covered.charges_of(&decoded), 1);
+        // The decode let go by every holder: its charge goes, the bytes the groups keep stay.
+        let address = Arc::as_ptr(&decoded) as usize;
+        drop((holders, decoded));
+        // (Told by the process's hook in a relay; this test's own is told here.)
+        covered.gone(address);
+        assert_eq!(gauge.held(), kept.footprint());
         assert_eq!(covered.now(), (0, 0));
-        let (one, two, leaked) = (decoded(40)?, decoded(60)?, decoded(80)?);
-        // `one` in the epochs and in a subscriber's queue, charged by both: counted once.
-        let mut epochs = budget.gauge(Store::Epochs).empty();
-        assert!(epochs.try_grow(one.footprint()));
-        epochs.cover_in(covered, &one);
-        let mut queue = budget.gauge(Store::Fanout).empty();
-        assert!(queue.try_grow(one.footprint()));
-        queue.cover_in(covered, &one);
-        assert_eq!(covered.covers_of(&one), 2);
-        assert_eq!(covered.now(), (1, one.footprint()));
-        // `two`, charged whole and split across its slices: each part covers it.
-        let mut in_flight = budget.gauge(Store::Epochs).empty();
-        assert!(in_flight.try_grow(two.footprint()));
-        in_flight.cover_in(covered, &two);
-        let mut slice = in_flight.split(two.footprint() / 2);
-        slice.cover_in(covered, &two);
-        assert_eq!(covered.covers_of(&two), 2);
-        assert_eq!(covered.now(), (2, one.footprint() + two.footprint()));
-        // The slice's charge absorbed into the epoch's: the cover moves with it.
-        assert!(epochs.absorb(slice).is_ok());
-        assert_eq!(covered.covers_of(&two), 2);
-        drop(in_flight);
-        assert_eq!(covered.covers_of(&two), 1);
-        // `leaked` is alive and covered by nothing: everything else is counted, it is not.
-        assert_eq!(covered.covers_of(&leaked), 0);
-        assert_eq!(covered.now(), (2, one.footprint() + two.footprint()));
-        // Every charge let go: nothing covered, whatever is still alive.
-        drop((epochs, queue));
-        assert_eq!(covered.now(), (0, 0));
-        assert_eq!(covered.covers_of(&one), 0);
-        // A cover keeps no decode alive; one whose decode is gone counts as covered until it goes
-        // (a dying decode, `Covered::with_live`), and is never short.
-        let mut late = budget.gauge(Store::Notes).empty();
-        late.cover_in(covered, &leaked);
-        let weak = Arc::downgrade(&leaked);
-        let footprint = leaked.footprint();
-        drop(leaked);
-        assert!(weak.upgrade().is_none());
-        assert_eq!(covered.now(), (1, footprint));
-        assert_eq!(covered.short(), (0, 0));
-        drop(late);
-        assert_eq!(covered.now(), (0, 0));
+        drop(kept);
+        assert_eq!(gauge.held(), 0);
+        // No room: the batch comes back, nothing charged, nothing entered.
+        let full = Gauge::new(Store::Decoded, 64);
+        assert!(owned(signed(40)?, &full, covered).is_err());
+        assert_eq!((full.held(), covered.now()), (0, (0, 0)));
+        assert_eq!(covered.lapses(), Lapses::default());
         Ok(())
     }
 
-    /// A cover holds for its decode the bytes its charge was charged, never only
-    /// its presence: a decode covered by a charge of one byte is short of its footprint, and so is
-    /// one whose charge was shrunk below it or split away from it; a decode handed on in parts
-    /// (`split_covering`) is held whole by them together at every step, and a charge's covers
-    /// together never hold more than its bytes.
+    /// A decode charged a second time, and one let go that was never charged, are each counted as
+    /// they happen, and the decode charged twice is inexact until it goes: the equality the flood
+    /// suite holds is seen to fail both ways.
     #[test]
-    fn a_cover_holds_what_its_charge_was_charged_and_no_more() -> Result<(), String> {
+    fn a_decode_charged_twice_or_never_is_counted() -> Result<(), String> {
         let covered: &'static Covered = Box::leak(Box::new(Covered::new()));
-        let plan = Plan::planned(false);
-        let budget = Budget::of_memory(Budget::memory_for(4, plan), plan);
-        let (one, two) = (decoded(40)?, decoded(60)?);
-        // A byte's charge covering a whole decode: covered, and short of all but that byte.
-        let mut token = budget.gauge(Store::Notes).empty();
-        assert!(token.try_grow(1));
-        token.cover_in(covered, &one);
-        assert_eq!(covered.now(), (1, one.footprint()));
-        assert_eq!(covered.short(), (1, one.footprint() - 1));
-        // Charged its footprint beside it: whole.
-        let mut queue = budget.gauge(Store::Fanout).empty();
-        assert!(queue.try_grow(one.footprint()));
-        queue.cover_in(covered, &one);
-        assert_eq!(covered.short(), (0, 0));
-        drop(token);
-        assert_eq!(covered.short(), (0, 0));
-        // Shrunk below it: short by what was released.
-        queue.shrink_to(one.footprint() - 10);
-        assert_eq!(covered.short(), (1, 10));
-        drop(queue);
-        // One charge covering two decodes holds each its own bytes, never one's for the other.
-        let mut epoch = budget.gauge(Store::Epochs).empty();
-        assert!(epoch.try_grow(one.footprint()));
-        epoch.cover_in(covered, &one);
-        assert!(epoch.try_grow(two.footprint() / 2));
-        epoch.cover_in(covered, &two);
-        assert_eq!(covered.vouched_for(&one), one.footprint());
-        assert_eq!(covered.vouched_for(&two), two.footprint() / 2);
-        // Handed on in a part with `one`: the part holds it and the epoch gives up as much for it,
-        // never for `two`.
-        let part = epoch.split_covering(one.footprint(), &one);
-        assert_eq!(covered.vouched_for(&one), one.footprint());
-        assert_eq!(covered.vouched_for(&two), two.footprint() / 2);
-        assert_eq!(covered.covers_of(&one), 2);
-        // A split carrying no decode leaves the charge's covers no more than its bytes.
-        let back = epoch.split(two.footprint() / 4);
+        let gauge = Gauge::unlimited(Store::Decoded);
+        let decoded = owned(signed(20)?, &gauge, covered)?;
+        covered.own(&decoded, decoded.footprint());
+        assert_eq!(covered.charges_of(&decoded), 2);
+        assert_eq!(covered.inexact(), (1, decoded.footprint()));
+        assert_eq!(covered.lapses().charged_twice, 1);
+        // Counted once however many charges it has.
+        assert_eq!(covered.now(), (1, decoded.footprint()));
+        let address = Arc::as_ptr(&decoded) as usize;
+        drop(decoded);
+        covered.gone(address);
+        assert_eq!(covered.inexact(), (0, 0));
+        // One let go that no charge was ever made for.
+        covered.gone(address);
         assert_eq!(
-            covered.vouched_for(&two),
-            two.footprint() / 2 - two.footprint() / 4
+            covered.lapses(),
+            Lapses {
+                charged_twice: 1,
+                never_covered: 1,
+            }
         );
-        // Absorbed, both the bytes and the covers move: nothing is held twice or lost.
-        let mut joined = budget.gauge(Store::Epochs).empty();
-        assert!(joined.absorb(part).is_ok());
-        assert_eq!(covered.vouched_for(&one), one.footprint());
-        drop((back, epoch, joined));
-        assert_eq!(covered.now(), (0, 0));
-        assert_eq!(covered.short(), (0, 0));
         Ok(())
     }
 
@@ -2735,11 +2678,22 @@ mod tests {
                     | Store::Notes
                     | Store::Engine
                     | Store::Orphans
+                    | Store::Records
+                    | Store::Batches
                     | Store::Buffers
+                    | Store::Fanout
             ) {
                 assert!(without.of(store) > 0, "{store:?}");
             }
         }
+        // Records are written by MLAT's seats and the members, never a feeder: none without MLAT.
+        assert_eq!(without.records, 0);
+        assert!(with.records > 0);
+        // The sharing groups' own bytes only on a relay with sharing members, and a queue's slots
+        // only for sessions that may listen.
+        assert_eq!((without.batches, without.fanout), (0, 0));
+        let shared = PerFeeder::planned_for(false, true, 64);
+        assert!(shared.batches > 0 && shared.fanout > 0);
         // A relay of 64 GiB holds thousands of planned feeders, never none.
         let budget = Budget::of_memory(64 << 30, Plan::planned(true));
         assert!(budget.ceiling() > 1_000);
@@ -2834,14 +2788,13 @@ mod tests {
         );
     }
 
-    /// The members' shared rate is planned once, as the feeders it is worth, and each member
-    /// session carves its allowance from a pool of its own: feeders filling their room leave the
-    /// members' pool whole, and the pool holds exactly the member sessions it was sized for.
+    /// The members' shared rate is planned once, as the feeders it is worth, and the member
+    /// sessions hold places of their own: feeders filling their room leave the members' pool
+    /// whole, and the pool holds exactly the member sessions it was sized for.
     #[test]
     fn members_reserve_from_their_own_pool_sized_at_start() {
         let per_feeder = PerFeeder {
             batches: 10,
-            ingest: 3,
             ..PerFeeder::default()
         };
         let plan = Plan {
@@ -2858,15 +2811,18 @@ mod tests {
             feeder_records_per_sec: 1,
         }
         .with_members(2, 3 * PLANNED_BYTES_PER_SEC as u64 + 1);
-        // The rate is worth four feeders, planned once for both sessions.
+        // Its rate's costs this test's own, not the ones the members would plan.
+        let plan = Plan {
+            per_rate: PerFeeder::default(),
+            ..plan
+        };
+        // The rate is worth four feeders, planned once for both sessions: each feeder's worth a
+        // floor's batches and the records the members' sessions write.
         assert_eq!(plan.member_feeders, 4);
+        let records = crate::products::records_per_feeder(PLANNED_RECEPTIONS_PER_SEC);
         assert_eq!(
-            (
-                plan.per_member(),
-                plan.member_rate_pool(),
-                plan.member_pool()
-            ),
-            (3, 40, 46)
+            (plan.member_rate_pool(), plan.member_pool()),
+            (4 * (10 + records), 4 * (10 + records))
         );
         // Room for the pool and three feeders.
         let budget = Budget::of_memory(Budget::memory_for(3, plan), plan);
@@ -2878,13 +2834,13 @@ mod tests {
         let first = budget.reserve_member();
         let second = budget.reserve_member();
         assert!(first.is_some() && second.is_some());
-        assert_eq!(budget.members_reserved(), 6);
+        assert_eq!(budget.members_reserved(), 2);
         assert!(budget.reserve_member().is_none());
         drop(first);
         assert!(budget.reserve_member().is_some());
-        // The gauges are sized for the feeders, the members' rate and each session's allowance.
+        // The gauges are sized for the feeders and the members' rate.
         assert_eq!(budget.gauge(Store::Batches).limit(), 10 * (3 + 4));
-        assert_eq!(budget.gauge(Store::Ingest).limit(), 3 * 3 + 3 * 2);
+        assert_eq!(budget.gauge(Store::Records).limit(), records * 4);
         // A member's one connection takes its buffers from the connections' room, never from the
         // members' rate.
         let buffered = Plan {
@@ -2894,7 +2850,7 @@ mod tests {
             },
             ..plan
         };
-        assert_eq!(buffered.member_pool(), 46);
+        assert_eq!(buffered.member_pool(), 4 * (10 + records));
         let budget = Budget::of_memory(Budget::memory_for(3, buffered), buffered);
         assert_eq!(budget.gauge(Store::Buffers).limit(), 5 * 3);
         // A relay holding no member plans no rate for them.
@@ -3235,14 +3191,118 @@ mod tests {
         assert_eq!(gauge.held(), 0);
     }
 
-    /// A feeder's ingest line is its connection's allowance; that a batch at the planned rate is
-    /// charged its bytes, not the floor, so the allowance holds the batches it was sized for, the
-    /// compiler holds (`ingest::CHARGE_FLOOR`).
+    /// The batch byte store is planned only on a relay with sharing members, and the decodes'
+    /// window is the longest holder's deadline, not the sum of the holders': a relay alone plans no
+    /// sharing groups and holds a decode for its epochs (the longest of the epochs and a
+    /// subscriber's queue); one with members holds the signed bytes over the repair horizon, for
+    /// the time they outlive the decode, in milliseconds (not rounded up to whole seconds); one
+    /// hosting MLAT holds a decode as long as its notes and its orphans may.
     #[test]
-    fn the_ingest_line_is_the_allowance_a_planned_batch_fills() {
+    fn a_relay_with_no_sharing_members_plans_no_batches_and_the_window_is_the_longest() {
+        let epochs = crate::seal::EPOCHS_HELD * crate::seal::EPOCH_MS;
         assert_eq!(
-            PerFeeder::planned(false).ingest,
-            crate::ingest::FEEDER_ALLOWANCE
+            decoded_window_ms(false),
+            epochs.max(crate::fanout::BEHIND_MS)
+        );
+        assert_eq!(
+            decoded_window_ms(true),
+            epochs
+                .max(crate::fanout::BEHIND_MS)
+                .max(crate::mlat_host::INTERVALS_HELD as u64 * crate::mlat_host::STEP_MS)
+                .max(tally_mlat::intake::ORPHAN_MS + crate::mlat_host::WAITING_MS)
+        );
+        let alone = Plan::planned(false).with_sessions(1_024, 64);
+        assert_eq!(alone.members, 0);
+        assert_eq!(alone.per_rate.batches, 0);
+        assert_eq!(
+            alone.per_rate.decoded,
+            PLANNED_CHARGED_BYTES_PER_SEC * decoded_window_ms(false) as usize / 1_000
+        );
+        let budget = Budget::of_memory(Budget::memory_for(100, alone), alone);
+        assert_eq!(budget.gauge(Store::Batches).limit(), 0);
+        let shared = Plan::planned(false)
+            .with_members(4, 16 * PLANNED_BYTES_PER_SEC as u64)
+            .with_sessions(1_024, 64);
+        assert!(shared.per_rate.batches > 0);
+        // With members, the decode is held for its window and the signed bytes the rate admits
+        // with it (its charged bytes over `CHARGED_PER_SIGNED`) for the rest of the horizon:
+        // more than a relay alone, less than the whole decode over the horizon.
+        let window = decoded_window_ms(false) as usize;
+        let horizon = crate::sharing::member::HORIZON_MS as usize;
+        let signed = PLANNED_CHARGED_BYTES_PER_SEC / crate::ingest::CHARGED_PER_SIGNED;
+        assert_eq!(
+            shared.per_rate.decoded,
+            PLANNED_CHARGED_BYTES_PER_SEC * window / 1_000 + signed * (horizon - window) / 1_000
+        );
+        assert!(shared.per_rate.decoded > alone.per_rate.decoded);
+        assert!(
+            shared.per_rate.decoded < PLANNED_CHARGED_BYTES_PER_SEC * horizon / 1_000,
+            "the decode is not held over the horizon, only its signed bytes"
+        );
+        // Records are the members' and the seats', never the feeders' rate's.
+        assert_eq!(shared.per_rate.records, 0);
+        assert!(shared.member_unit().records > 0);
+    }
+
+    /// Each connection's kernel buffers are counted once, by the place it holds: the cap's at a
+    /// feeder's, the member and subscriber places (which leave the cap) at theirs, and the engine
+    /// places and the links dialled to members (which keep their place under the cap) only past a
+    /// feeder's, at most the cap of them together.
+    #[test]
+    fn a_connection_s_sockets_are_counted_once_by_the_place_it_holds() {
+        use crate::sockets::{
+            ENGINE_KERNEL_BYTES as ENGINE, FEEDER_KERNEL_BYTES as FEEDER,
+            MEMBER_KERNEL_BYTES as MEMBER, SUBSCRIBER_KERNEL_BYTES as SUBSCRIBER,
+        };
+        let with = |members: usize, general: usize| {
+            Plan::planned(false)
+                .with_members(members, 16 * PLANNED_BYTES_PER_SEC as u64)
+                .with_sessions(general, 64)
+                .connection_sockets()
+        };
+        let cap_and_subscribers = |general: usize| general * FEEDER + 64 * SUBSCRIBER;
+        assert_eq!(with(0, 100), cap_and_subscribers(100));
+        // Fewer members than the cap: every engine place and every dialled link may be held.
+        assert_eq!(
+            with(10, 100),
+            cap_and_subscribers(100)
+                + 10 * MEMBER
+                + 10 * (ENGINE - FEEDER)
+                + 10 * (MEMBER - FEEDER)
+        );
+        // As many members as the cap: the cap's places are all engines', the dearer, and no link
+        // is left a place to dial with.
+        const { assert!(ENGINE > MEMBER) };
+        assert_eq!(
+            with(100, 100),
+            cap_and_subscribers(100) + 100 * MEMBER + 100 * (ENGINE - FEEDER)
+        );
+        assert_eq!(
+            with(60, 100),
+            cap_and_subscribers(100)
+                + 60 * MEMBER
+                + 60 * (ENGINE - FEEDER)
+                + 40 * (MEMBER - FEEDER)
+        );
+    }
+
+    /// The ingest pool is the rate the workers take over the time a record waits for one, never
+    /// a carve a connection: a connection's floor holds none of it, and the pool follows the rate.
+    #[test]
+    fn the_ingest_pool_is_the_rate_over_the_wait_not_a_carve_a_connection() {
+        let planned = PerFeeder::planned(false);
+        assert_eq!(Store::Ingest.driver(), Driver::Rate);
+        assert_eq!(planned.floor().ingest, 0);
+        assert_eq!(
+            planned.ingest,
+            PLANNED_CHARGED_BYTES_PER_SEC * crate::ingest::INGEST_WAIT_MS as usize / 1_000
+        );
+        let plan = Plan::planned(false);
+        let small = Budget::of_memory(Budget::memory_for(10, plan), plan);
+        let large = Budget::of_memory(Budget::memory_for(1_000, plan), plan);
+        assert_eq!(
+            large.gauge(Store::Ingest).limit(),
+            100 * small.gauge(Store::Ingest).limit()
         );
     }
 
@@ -3260,10 +3320,9 @@ mod tests {
         }
     }
 
-    /// What the stores holding decoded batches are charged is theirs and the oversize room's,
-    /// never another store's.
+    /// What the stores holding decoded batches are charged is theirs, never another store's.
     #[test]
-    fn the_decoded_charge_is_the_decoded_stores_and_the_oversize_rooms() {
+    fn the_decoded_charge_is_the_decoded_store_alone() {
         let plan = Plan::planned(false);
         let budget = Budget::of_memory(Budget::memory_for(4, plan), plan);
         let mut charges = Vec::new();
@@ -3276,11 +3335,11 @@ mod tests {
             .filter(|(_, store)| store.holds_decoded())
             .map(|(n, _)| 1 << n)
             .sum();
+        assert_eq!(decoded, 1 << Store::Decoded.index());
         assert_eq!(budget.decoded_charged(), decoded);
-        charges.extend(budget.oversize().try_charge(1 << 20));
         charges.extend(budget.connection_buffers().try_charge(1 << 21));
-        assert_eq!(budget.decoded_charged(), decoded + (1 << 20));
-        assert_eq!(budget.report().decoded.charged, decoded + (1 << 20));
+        assert_eq!(budget.decoded_charged(), decoded);
+        assert_eq!(budget.report().decoded.charged, decoded);
         drop(charges);
         assert_eq!(budget.decoded_charged(), 0);
     }
@@ -3311,7 +3370,17 @@ mod tests {
                     "{store:?}"
                 );
             }
-            assert!(plan.per_feeder.total() < full.total() / 2);
+            // The floor is the connection stores', its pace and its kernel sockets: nothing it sends.
+            assert_eq!(
+                plan.per_feeder.total(),
+                Store::ALL
+                    .iter()
+                    .filter(|store| store.driver() == Driver::Connection)
+                    .map(|store| full.of(*store))
+                    .sum::<usize>()
+                    + PACE_STATE_BYTES
+                    + crate::sockets::FEEDER_KERNEL_BYTES
+            );
             let budget = Budget::of_memory(Budget::memory_for(3, plan), plan);
             let one = budget.reserve();
             assert!(one.is_some());
@@ -3336,17 +3405,18 @@ mod tests {
             for store in Store::ALL {
                 let limit = budget.gauge(store).limit();
                 let expected = match store.driver() {
+                    // The fingerprints' tables' fixed part beside the rate's (`Plan::before_feeders`).
+                    Driver::Rate if store == Store::Dedup => {
+                        plan.per_rate.of(store) * (rate as usize + members * 600) / 600
+                            + crate::exchange::DEDUP_FIXED_BYTES
+                    }
                     Driver::Rate => plan.per_rate.of(store) * (rate as usize + members * 600) / 600,
                     Driver::Connection => {
                         plan.per_feeder.of(store) * connections
                             + plan.member_unit().of(store) * members
-                            + if store == Store::Ingest {
-                                plan.per_member() * plan.members
-                            } else {
-                                0
-                            }
                     }
-                    Driver::Seat => 0,
+                    // No seats without MLAT; the members' records are theirs.
+                    Driver::Seat => plan.member_unit().of(store) * members,
                 };
                 assert_eq!(limit, expected, "{store:?} at {connections}");
             }
@@ -3389,9 +3459,10 @@ mod tests {
         let budget = Budget::of_memory(memory, plan.with_cores(Some(8)));
         assert_eq!(budget.max_receptions_per_sec(), few.rate);
         assert_eq!(budget.max_bytes_per_sec(), few.bytes_per_sec());
+        // In charged bytes, the unit the stores are planned in and the shedder judges by.
         assert_eq!(
             budget.max_bytes_per_sec(),
-            few.rate * PLANNED_BYTES_PER_SEC as u64 / PLANNED_RECEPTIONS_PER_SEC as u64
+            few.rate * PLANNED_CHARGED_BYTES_PER_SEC as u64 / PLANNED_RECEPTIONS_PER_SEC as u64
         );
         assert_eq!(
             budget.max_records_per_sec(),
@@ -3458,7 +3529,8 @@ mod tests {
             if store.driver() == Driver::Seat {
                 assert_eq!(
                     budget.gauge(store).limit(),
-                    plan.per_seat.of(store) * seats,
+                    plan.per_seat.of(store) * seats
+                        + plan.member_unit().of(store) * plan.member_feeders,
                     "{store:?}"
                 );
             }

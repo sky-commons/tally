@@ -1,17 +1,17 @@
-# tally-relay check --memory-limit 32G --cores 10 --key k --max-upload 10Gbit/s --memory 24G --max-connections 5024 --max-connections-per-address 5024 --area 801ffffffffffff --area 8027fffffffffff, hosting MLAT
+# tally-relay check --memory-limit 32G --cores 10 --key k --max-upload 10Gbit/s --memory 24G --max-connections 2048 --max-connections-per-address 2048 --area 801ffffffffffff --area 8027fffffffffff, hosting MLAT
 cores 10
-connection-limit 5755
-connections-by-cores 5755
+connection-limit 5777
+connections-by-cores 5777
 connection-limit-bound cores
-max-receptions-per-sec 3453353
-rate-by-cores 3453353
+max-receptions-per-sec 3466297
+rate-by-cores 3466297
 rate-bound cores
-mlat-seats 2141
+mlat-seats 2149
 mlat-seats-bound cores
 feeder-records 8
-general-sessions 5024
+general-sessions 2048
 subscriber-sessions 64
-session-records-per-minute 65728
+session-records-per-minute 47872
 member-feeders 128
 ingest-threads 3
 message-threads 2
@@ -19,20 +19,20 @@ seal-threads 3
 mlat-threads 3
 handshakes-in-flight 2500
 handshakes-per-sec 25000
-# tally-relay check --memory-limit 32G --cores 10 --key k --max-upload 10Gbit/s --memory 24G --max-connections 5024 --max-connections-per-address 5024 --area 801ffffffffffff --area 8027fffffffffff, without MLAT (--no-mlat)
+# tally-relay check --memory-limit 32G --cores 10 --key k --max-upload 10Gbit/s --memory 24G --max-connections 2048 --max-connections-per-address 2048 --area 801ffffffffffff --area 8027fffffffffff, without MLAT (--no-mlat)
 cores 10
-connection-limit 10666
-connections-by-cores 10666
+connection-limit 10706
+connections-by-cores 10706
 connection-limit-bound cores
-max-receptions-per-sec 6400280
-rate-by-cores 6400280
+max-receptions-per-sec 6423772
+rate-by-cores 6423772
 rate-bound cores
 mlat-seats 0
 mlat-seats-bound not-hosted
 feeder-records 8
-general-sessions 5024
+general-sessions 2048
 subscriber-sessions 64
-session-records-per-minute 65728
+session-records-per-minute 47872
 member-feeders 128
 ingest-threads 3
 message-threads 3

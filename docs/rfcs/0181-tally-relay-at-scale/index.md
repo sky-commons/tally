@@ -1056,36 +1056,41 @@ relay's caps; output of the test, not prose):
 
 | Line                              | Without MLAT | Hosting MLAT |
 | --------------------------------- | ------------ | ------------ |
-| floor (a connection)              | 478,963      | 478,963      |
-| per-connection (floor + mean rate)| 1,390,686    | 1,390,686    |
-| per-seat                          | 0            | 3,473,416    |
+| floor (a connection)              | 590,779      | 590,779      |
+| per-connection (floor + mean rate)| 1,667,720    | 1,909,208    |
+| per-seat                          | 0            | 3,256,264    |
+| before-feeders                    | 2,346,783,808 | 2,788,139,072 |
 | connection-limit                  | 17,324       | 9,416        |
-| connections-by-memory / by-cores  | 21,589 / 17,324 | 15,947 / 9,416 |
+| connections-by-memory / by-cores  | 17,545 / 17,324 | 11,321 / 9,416 |
 | connection-limit-bound            | cores        | cores        |
-| max-receptions-per-sec (`R_max`)  | 10,394,482   | 5,649,819    |
-| max-bytes-per-sec                 | 141,919,327  | 77,138,862   |
-| max-records-per-sec               | 34,648       | 18,832       |
-| rate-by-memory / by-cores         | 14,298,396 / 10,394,482 | 8,483,343 / 5,649,819 |
-| feeders-at-mean / at-ceiling      | 17,324 / 3,464 | 9,416 / 1,883 |
-| mlat-seats (bound)                | 0            | 3,504 (cores) |
+| max-receptions-per-sec (`R_max`)  | 10,394,482   | 5,650,933    |
+| max-bytes-per-sec                 | 1,195,296,133 | 649,819,622 |
+| max-records-per-sec               | 34,648       | 18,836       |
+| rate-by-memory / by-cores         | 10,600,489 / 10,394,482 | 5,650,933 / 5,767,688 |
+| rate-bound                        | cores        | memory       |
+| feeders-at-mean / at-ceiling      | 17,324 / 3,464 | 9,418 / 1,883 |
+| mlat-seats (bound)                | 0            | 3,329 (memory) |
 | ingest / message / seal threads   | 5 / 5 / 4    | 4 / 3 / 4 (and 5 MLAT) |
 | handshakes-in-flight / per-sec    | 4,000 / 40,000 | 4,000 / 40,000 |
 | allocator (the share kept)        | 2,684,354,560 | 2,684,354,560 |
 
 (Hosting MLAT, the connections are planned from three quarters of the memory and the cores, the
-rest being MLAT's share, so they are fewer, bound by cores here; the seats are what the
-connections leave, 3,504 of 9,416.)
+rest being MLAT's share, so they are fewer, bound by cores here; `R_max` and the seats are bound by
+the memory, the seats being what the connections leave, 3,329 of 9,416. `max-bytes-per-sec` is in
+the unit the stores charge, `ingest::rate_cost`, "Memory is charged once".)
 
-The 32 GB relay without MLAT is bound by its 16 cores at 17,324 connections, not by its memory
-(21,589). The 20,000 feeders the RFC sizes for need 19 cores at these figures (`check --cores 19`
-admits 20,781), or the stages' costs measured lower; "feeders at the ceiling" is `R_max` over what one source is held to
+The 32 GB relay without MLAT is bound by its 16 cores at 17,324 connections, just under its memory
+(17,545). The 20,000 feeders the RFC sizes for need 19 cores at these figures (`check --cores 19`
+carries 20,626) and 36 GB (`check --memory-limit 36G --cores 19` admits 20,121, bound by memory),
+or the stages' costs measured lower; "feeders at the ceiling" is `R_max` over what one source is held to
 (`ingest::SOURCE_RECEPTIONS_PER_SEC`), what the relay carries if every feeder sends at its pace.
 Ten cores and 24 GB with the harness's two areas are `tests/cores-10.txt`, held equal to what the
 relay prints.
 
 **The world relay run on this box, and what it showed** (2026-10-09, `tally-load` built `-c opt`, MLAT
-off). The plan for 20,000 feeders is 19 cores: `check --cores 16` admits 17,324 connections,
-`--cores 19` admits 20,781 (bound by cores, as the table above says), so the relay ran on
+off). The plan for 20,000 feeders was then 19 cores: `check --cores 16` admitted 17,324 connections,
+`--cores 19` 20,781 (bound by cores; since memory is charged once for its life, 32 GB holds fewer, as
+the table above says), so the relay ran on
 `taskset -c 0-18` with `--memory 30G` (the plan's 30.6 GB of limits, not allocated until used) and
 the harness on the other 13 cores, a watchdog killing only the harness if `MemAvailable` fell under
 10 GB (it never did). Three things the run found:
@@ -1214,10 +1219,10 @@ fifth more than the feeders (`tally/crates/load/src/relay.rs`), and 24,000 held 
 refused. **The plan is about eighteen times what the relay used**: 38.3 GB planned against 2.2 GB
 peak resident, nearly all of it the per-connection floor (479 kB) and the rate-driven stores'
 windows at `R_max` (`check`: batches 4.2 GB, dedup 5.1 GB, buffers 6.2 GB, epochs 3.2 GB, ingest
-2.6 GB, records 2.2 GB, fanout 1.6 GB, products 1.1 GB). Those are hard reservations against a
-hostile worst case, never overcommitted (Admission, above), so a box for the world's feeders needs
-about 40 GB of memory though it uses about 2. Whether each store's window is the worst case it
-must hold is open.
+2.6 GB, records 2.2 GB, fanout 1.6 GB, products 1.1 GB). They were meant as hard reservations against a
+hostile worst case (Admission, above), so a box for the world's feeders needed about 40 GB of
+memory though it used about 2. They were neither: one decode was charged in several stores, and
+some memory in none ("Memory is charged once, for its life", below).
 
 *What the shedder cut.* Only `over_share`; none for a receiver's pace and none for `R_max` itself.
 Over a whole run 9,143 batches (5.3 M receptions, about 0.2%), 112,127 and 178,940 (2% to 3.5%) in
@@ -1330,6 +1335,129 @@ end and 888 to 894 MiB at the peak against 1,165 allowed. What stays open: an ex
 percent or less moves the trim slower than the bucket absorbs it (a second of `R_max`), so for the
 first minutes the bucket carries it and, once it is empty, the cut falls on whichever batch finds
 it empty until the trim has brought the level under the units' rates.
+
+## Memory is charged once, for its life (decided 2026-10-11)
+
+**What was wrong.** The world baseline planned 38.3 GB and peaked at 2.2 GB. Two independent
+reviews of the plan against the code found the gap is not slack against an attacker, and that the
+plan was not a hard bound either:
+
+- **One allocation was charged in several stores at once.** A batch's decode (`Arc<Decoded>`) is
+  charged in full by the epochs (`Slice::share`), again by every subscriber queue's fanout charge,
+  again by MLAT's notes and orphans, and its wire bytes again by the sharing group's batches. The
+  plan summed those stores' windows (epochs 3 s, fanout 2 s, batches 13 s) though one decode lives
+  only as long as its longest holder. `Covered` checked that the charges were at least the
+  footprint, so over-charging was invisible by construction.
+- **The rate was capped in one unit and the stores charged in another.** The shedder's byte
+  bucket judged wire bytes; the stores charge decoded bytes (`ingest::charge_of`), which a batch
+  inflated up to `MAX_INFLATION` (8x) makes about 2.2 times the plan's per-reception figure. Every
+  decode-holding store could be overrun by a feeder within its share, and an epoch over its room
+  is refused whole, honest receptions with it.
+- **Stores were driven by rates that never reach them.** Records were planned at `R_max`, but a
+  feeder's receptions go to the products; only members' sessions and this relay's MLAT write
+  records. The batches were planned on a relay with no sharing group. The ingest allowance was a
+  carve per connection, though the workers drain at most `R_max` and the time a batch waits is
+  what bounds it (Little's law).
+- **Some memory was charged nowhere.** Kernel socket buffers (no `SO_RCVBUF` or `SO_SNDBUF` was
+  set; autotuned, they are the cgroup's: about 3 GB at 24,000 sockets against a 64 MiB headroom),
+  the capacity of the inflated plain bytes (`Decoded::footprint` counted `len`), the `Arc` and
+  `Bytes` headers, a dedup entry's `Vec` of areas, and delivery tags past the planned rate (the cap
+  is twice it).
+
+**The model.**
+
+1. **The rate is capped in the unit the stores charge.** `R_max`'s byte dimension is a batch's
+   cost of the rate (`ingest::rate_cost`): its charge (`ingest::charge_of`: wire, inflated and
+   referenced), or `ingest::CHARGED_PER_SIGNED` (a planned batch's charge over its signed bytes)
+   times its signed bytes if that is more. The shedder and the members' pace judge a batch by it.
+   So `R_max` bounds what every decode-holding store receives, and the signed bytes the sharing
+   groups keep past the decode at `R_max` over `CHARGED_PER_SIGNED`, whatever a feeder puts in its
+   batches: one padded with empty DEFLATE blocks, or of a format this build cannot read, is nearly
+   all signed bytes and pays for them. A batch at the planned mix costs its charge.
+2. **Each allocation is charged once, by its owner, for its life.** A decode carries its charge
+   inside its shared allocation and gives it back when the last holder drops it; its wire bytes
+   are their own allocation (`Bytes::from_owner`) with their own charge, so the decode and the
+   batch bytes are each counted once however many stores hold them. Both are charged at capacity
+   with their headers (the inflated bytes are allocated at their stated length). A holder charges
+   only what it allocates itself (a queue's slots, an epoch's decisions, a note's entry).
+   `Covered` holds equality: every live decode is charged exactly once.
+3. **A store's window is a deadline the code enforces, and its driver is its real inflow.** The
+   decode store's window is its longest holder's deadline (the epochs held, the fanout's
+   `BEHIND_MS`, MLAT's notes interval), not their sum. Records are driven by members' rate and the
+   MLAT seats, not `R_max`. Batches are planned only on a relay with sharing members, for the time
+   the wire bytes outlive their decode. The ingest allowance is one pool, worker throughput over
+   the time a batch may wait for a worker, shared by source with fair waiting (5. above); a
+   connection's credit is a count, not reserved bytes.
+4. **The floor is what one hostile connection can pin indefinitely, and all of it is counted.**
+   Its Noise buffers stay per connection (a peer that states a frame's length and trickles it
+   holds a reader buffer; one that never reads holds the writer's), now with a deadline on each
+   frame (`noise::FRAME_DEADLINE`, 30 s) so a trickle is closed. Its kernel socket buffers are
+   pinned (`sockets`: `SO_RCVBUF`, `SO_SNDBUF` and `TCP_WINDOW_CLAMP`) and counted at what the
+   kernel charges for them, twice what is asked and a packet past each. Every connection holds a
+   feeder's (32 KiB in, 16 KiB out) until it holds a place the plan counts for more: a subscriber
+   place (512 KiB out), a member session or a link dialled to a member (64 KiB each way; members
+   bring in together at most the members' shared rate), or an engine place (128 KiB out; as many
+   as the member sessions, `Hub::engine_place`). So a connection still in its handshake, a
+   directory link, a relay not yet admitted and an engine past the places pin a feeder's, and the
+   plan is the connection cap at a feeder's and the counted places at theirs, each once
+   (`Plan::connection_sockets`): a member or subscriber place leaves the cap, so it is counted
+   whole; an engine place and a link dialled to a member keep their place under the cap, so they
+   are counted only past a feeder's, at most the cap of them together. Its delivery tags are counted at the per-receiver cap, not the
+   planned rate. Its pace and shed state as before.
+5. **Fixed-size tables are sized once.** The dedup generations are allocated once, at the
+   capacity the plan reserved (`R_max` over an epoch, a third more, at most two thirds full), with
+   a compact entry (the fingerprint and a mark word whose low bits index a fixed list of the areas
+   it was kept for), so they never grow mid-epoch and their slack is gone from the plan. An epoch
+   with more receptions on a thread than its generation holds is refused whole before anything is
+   decided, by the refusal the epochs already had, so two relays never decide part of one. The
+   stages are let go before new ones are made (`Hub::release_stages`): each allocates its tables
+   at the planned capacity, and two at once would be twice the plan.
+6. **The allocator is bounded where it can be.** The arenas are capped (`M_ARENA_MAX`, at
+   `budget::MALLOC_ARENAS`), large allocations go to `mmap` and back on free (`M_MMAP_THRESHOLD`
+   fixed at 4 MiB), each arena's free top is returned past 16 MiB (`M_TRIM_THRESHOLD`), and the
+   trimmer returns free pages inside the arenas every 5 s (`budget::bound_the_allocator`,
+   `budget::spawn_allocator_trimmer`, as before this change). What no
+   setting bounds is the fragments left within pages still in use, so the share the plan keeps for
+   the allocator stays the measured one (`ARENA_RETENTION_BYTES` an arena), not a constant derived
+   from the settings, which would under-plan.
+
+**Rejected.** Admission or sizing by measured resident memory: two relays with one configuration
+would admit different counts by their fragmentation history, the determinism the plan from
+constants exists to give. One global gauge for everything: a slow-subscriber flood would take the
+room the epochs need. Pooled Noise buffers: a trickler holds one for its frame's deadline whatever
+the pool, so a pool trades the floor for honest frames waiting on hostile ones; per connection,
+each connection's worst case is its own.
+
+**What it holds** (the tests): `Covered`'s equality over every store under the `flood` suite; a
+feeder sending batches at `MAX_INFLATION` within its share overruns no store and is shed by its
+charged bytes; a trickled frame is closed at its deadline; a relay with no sharing members plans no
+batches; every role's socket is granted no more than it is charged; a generation holds its
+capacity and never grows, and an epoch past it is refused whole; `check` prints the plan line by
+line, and `tests/cores-10.txt` and the world relay's table above are regenerated from it.
+
+**What it changed.** The plan did not shrink: it was not a bound before, and now is. The world
+relay of the table above (32 GB, 16 cores, one base cell, `--max-connections 1024`, no MLAT)
+admitted 17,324 connections bound by its cores, with kernel buffers, subscriber queue slots,
+padded and inflated batches and the stages' second set of tables outside the plan; it still admits
+17,324 bound by its cores, its memory now holding 17,545 (it held 21,589), with all of them inside
+it (`check`): before any feeder 2.3 GB (0.9 GB of it the kernel's socket buffers of the connection
+cap, the member sessions, the links dialled to members and the engine places, each counted once by
+the place it holds), a connection's floor 591 kB, and each reception a second of `R_max` about 1,795
+bytes over its windows (fanout 582, decoded 482, epochs 216, batches 194, dedup 184, products 110,
+ingest 29). The largest line is the subscriber queues' slots, every listener the plan counts
+holding every batch for `BEHIND_MS`: the honest worst case for a relay whose listeners all take raw.
+The gap to the 2.2 GB the world baseline used is the distance between honest feeders and the worst
+a hostile one can make within its share, which the plan must keep.
+
+Configurations that held only because these were outside the plan were resized, each to what
+`check` now admits. The packaged unit (`packaging/systemd/tally-relay.service`) is `MemoryHigh=6G`
+and `MemoryMax=7G`, not 4G and 5G: a relay taking a base cell plans the 2,048 member sessions the
+default cap allows, each with its kernel buffers, a link dialled to it and an engine's place, 4.6
+GB before any feeder, and 6G admits 159 feeders beside them. `tests/cores-10.txt` (ten cores, 24
+GB, the harness's two areas) caps connections at 2,048, not 5,024: a relay taking base cells plans
+a member session for every connection the cap allows, and every connection under the cap may
+listen to the fan-out (the fanout's window grows with the cap: 582 bytes at 1,024, 2,715 at
+5,024), so at 5,024 the memory, not the cores, bound it, where the file is what the cores carry.
 
 ## Invariants the tests hold
 1. Thread-count independence: same stamped trace at 1, 2, 8, 32 threads gives byte-identical MLAT
@@ -1661,10 +1789,12 @@ admission redesign's to settle.
 
 **The deployed budgets** are `tally-relay check`'s to state, not this document's: the numbers move
 with every store's plan, and a figure copied here is wrong the next time one does. Before any feeder
-a relay plans its base (with MLAT's where it hosts MLAT), the oversize room
-(`ingest::OVERSIZE_BYTES`), the Noise buffers of every connection but a feeder's its caps allow
-(`ingest::BUFFERS_PER_CONNECTION` each), its members' pool and every other part the plan lists, each
-on its own line of the plan and summed as `before-feeders`; a feeder then reserves `per-feeder`, and the budget keeps `headroom` below the memory it runs in. `bazel
+a relay plans its base (with MLAT's where it hosts MLAT), the Noise buffers of every connection but
+a feeder's its caps allow (`ingest::BUFFERS_PER_CONNECTION` each) and their kernel socket buffers
+(`connection-sockets`, "Memory is charged once"), its members' pool and every other part the plan
+lists, each on its own line of the plan and summed as `before-feeders`; a feeder then reserves its
+`floor` and its rate's windows (`per-connection`), and the budget keeps `headroom` below the memory
+it runs in. `bazel
 test //crates/relay:check //infra/tally:relay_config_test --test_output=all` prints the plan
 of the packaged unit (as packaged, and with a base cell taken) and of each relay Flightlines
 deploys, and holds each to its limit. Every new line of the plan cost the public relay feeders it

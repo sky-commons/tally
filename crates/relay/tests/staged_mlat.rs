@@ -263,7 +263,15 @@ fn mlat_run_cuts(
     delays: Delays,
     cutting: Cutting,
 ) -> Result<Run> {
-    let hub = Arc::new(Hub::clocked(8, Arc::new(|| 0)).staged(threads)?);
+    // It takes the areas it solves, as a relay hosting MLAT for them does, so its budget plans
+    // the member sessions they bring and what sharing holds and addresses them
+    // (`Store::Batches`, planned only beside members): an overload cut is addressed to a raw
+    // source through it. Untaken, the store was planned nothing and held one cut at a time.
+    let hub = Arc::new(
+        Hub::clocked(8, Arc::new(|| 0))
+            .taking(areas.cells().to_vec())
+            .staged(threads)?,
+    );
     let host = Arc::new(HostedMlat::new(
         Identity::from_seed([5; 32]),
         MLAT_BOOT,
