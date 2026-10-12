@@ -1,0 +1,6 @@
+# The lint CI runs beside the tests (.github/workflows/ci.yml): clippy over every Rust target, each
+# warning an error, with the lints each crate's Cargo.toml names (`extract_cargo_lints`).
+#   bazel build --config=lint //...
+build:lint --aspects=@rules_rust//rust:defs.bzl%rust_clippy_aspect
+build:lint --output_groups=+clippy_checks
+build:lint --@rules_rust//rust/settings:clippy_flag=-Dwarnings
