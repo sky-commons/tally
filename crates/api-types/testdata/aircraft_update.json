@@ -1,0 +1,47 @@
+{
+  "now_ms": 1791220001250,
+  "sent_at_ms": 1791220001430,
+  "feed": "live",
+  "full": false,
+  "aircraft": [
+    {
+      "hex": "a1b2c3",
+      "flight": "UAL123",
+      "lat": 37.5,
+      "lon": -122.2525,
+      "alt_baro_ft": 35000,
+      "gs_kt": 451.5,
+      "track_deg": 271.0,
+      "baro_rate_fpm": -640,
+      "on_ground": false,
+      "last_heard_at_ms": 1791220001150,
+      "position_at_ms": 1791220001150,
+      "position_source": "adsb",
+      "mlat": null
+    },
+    {
+      "hex": "c0ffee",
+      "flight": null,
+      "lat": 37.711,
+      "lon": -122.451,
+      "alt_baro_ft": 12000,
+      "gs_kt": 137.8028855874962,
+      "track_deg": 321.6523811413246,
+      "baro_rate_fpm": null,
+      "on_ground": false,
+      "last_heard_at_ms": 1791220001125,
+      "position_at_ms": 1791220001125,
+      "position_source": "mlat",
+      "mlat": {
+        "horizontal_sigma_m": 42.5,
+        "check": "model",
+        "kind": "final",
+        "confidence": "standing",
+        "contested": false
+      }
+    }
+  ],
+  "gone": [
+    "abcdef"
+  ]
+}

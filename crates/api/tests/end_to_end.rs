@@ -1,7 +1,8 @@
 //! The API between a real relay and a stand-in readsb: a receiver feeds the relay
 //! (`tally_relay::serve`) directly, the relay reports it on its stats listener
 //! (`tally_relay::stats`), a stand-in readsb answers its own API queries, and the API serves all
-//! three endpoints from them over loopback HTTP, with CORS, caching and the rate limit on each.
+//! three endpoints from them over loopback HTTP, with CORS, caching and the rate limit on each, and
+//! pushes a viewport's aircraft as a stream.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -12,14 +13,15 @@ use hyper::body::Bytes;
 use hyper::header::{
     ACCESS_CONTROL_ALLOW_HEADERS, ACCESS_CONTROL_ALLOW_METHODS, ACCESS_CONTROL_ALLOW_ORIGIN,
     ACCESS_CONTROL_EXPOSE_HEADERS, ACCESS_CONTROL_MAX_AGE, ACCESS_CONTROL_REQUEST_HEADERS,
-    ACCESS_CONTROL_REQUEST_METHOD, CACHE_CONTROL, ORIGIN,
+    ACCESS_CONTROL_REQUEST_METHOD, CACHE_CONTROL, CONTENT_TYPE, ORIGIN, RETRY_AFTER,
 };
 use hyper::{HeaderMap, Method, Request, StatusCode};
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 use tally_api::Settings;
 use tally_api_types::{
-    Aircraft, AircraftResponse, MlatCheck, Network, Position, PositionSource, Station,
+    Aircraft, AircraftResponse, AircraftUpdate, Feed, MlatCheck, Network, Position, PositionSource,
+    SourceCounts, Station,
 };
 use tally_merge::Merge;
 use tally_mlat_solver::sim::{self, Scenario, Simulation};
@@ -55,36 +57,71 @@ fn text(error: impl std::fmt::Display) -> String {
     error.to_string()
 }
 
-/// What the stand-in readsb answers every query with, and the queries it was asked.
+/// What the stand-in readsb answers every query with, and the queries it was asked: a1b2c3's last
+/// message is newer than its position.
 const READSB: &str = r#"{
     "now": 1791220000.25,
     "resultCount": 2,
     "ptime": 0.1,
     "aircraft": [
-        {"hex": "a1b2c3", "flight": "UAL123  ", "alt_baro": 35000, "gs": 451.5, "track": 271.0,
-         "baro_rate": 64, "lat": 37.5, "lon": -122.25, "seen": 0.5},
-        {"hex": "abcdef", "alt_baro": "ground", "lat": 37.62, "lon": -122.38, "seen": 2}
+        {"hex": "a1b2c3", "type": "adsb_icao", "flight": "UAL123  ", "alt_baro": 35000,
+         "gs": 451.5, "track": 271.0, "baro_rate": 64, "lat": 37.5, "lon": -122.25,
+         "seen": 0.5, "seen_pos": 1.0},
+        {"hex": "abcdef", "type": "adsr_icao", "alt_baro": "ground", "lat": 37.62, "lon": -122.38,
+         "seen": 2}
+    ]
+}"#;
+
+/// readsb a second on: a1b2c3 has a new position, and abcdef is no longer heard.
+const READSB_LATER: &str = r#"{
+    "now": 1791220001.25,
+    "aircraft": [
+        {"hex": "a1b2c3", "type": "adsb_icao", "flight": "UAL123  ", "alt_baro": 35000,
+         "gs": 451.5, "track": 271.0, "baro_rate": 64, "lat": 37.51, "lon": -122.25,
+         "seen": 0.1, "seen_pos": 0.2}
+    ]
+}"#;
+
+/// readsb another second on: a1b2c3 was heard (a velocity message), its position not.
+const READSB_HEARD: &str = r#"{
+    "now": 1791220002.25,
+    "aircraft": [
+        {"hex": "a1b2c3", "type": "adsb_icao", "flight": "UAL123  ", "alt_baro": 35000,
+         "gs": 451.5, "track": 271.0, "baro_rate": 64, "lat": 37.51, "lon": -122.25,
+         "seen": 0.1, "seen_pos": 1.2}
     ]
 }"#;
 
 type Asked = Arc<Mutex<Vec<String>>>;
+/// What the stand-in readsb answers, which a test may change.
+type Answer = Arc<Mutex<&'static str>>;
 
-async fn readsb(State(asked): State<Asked>, RawQuery(query): RawQuery) -> &'static str {
+async fn readsb(
+    State((asked, answer)): State<(Asked, Answer)>,
+    RawQuery(query): RawQuery,
+) -> &'static str {
     if let Ok(mut asked) = asked.lock() {
         asked.push(query.unwrap_or_default());
     }
-    READSB
+    answer.lock().map_or(READSB, |answer| *answer)
 }
 
 async fn start_readsb() -> Result<(String, Asked)> {
+    let (url, asked, _) = start_readsb_answering().await?;
+    Ok((url, asked))
+}
+
+/// A stand-in readsb answering `READSB` until the test changes its answer.
+async fn start_readsb_answering() -> Result<(String, Asked, Answer)> {
     let asked: Asked = Arc::default();
+    let answer: Answer = Arc::new(Mutex::new(READSB));
     let listener = TcpListener::bind("127.0.0.1:0").await.map_err(text)?;
     let address = listener.local_addr().map_err(text)?;
     let app = axum::Router::new()
         .fallback(readsb)
-        .with_state(Arc::clone(&asked));
+        .with_state((Arc::clone(&asked), Arc::clone(&answer)));
     tokio::spawn(async move { axum::serve(listener, app).await });
-    Ok((format!("http://{address}"), asked))
+    Ok((format!("http://{address}"), asked, answer))
 }
 
 /// A real relay with its stats listener: the relay's address and key, and the stats URL.
@@ -243,6 +280,42 @@ async fn until<T: serde::de::DeserializeOwned>(
     .map_err(|_| format!("{url} never answered as expected"))
 }
 
+/// The aircraft the stand-in readsb's first answer is, as the API serves them.
+fn expected() -> Vec<Aircraft> {
+    vec![
+        Aircraft {
+            hex: "a1b2c3".to_owned(),
+            flight: Some("UAL123".to_owned()),
+            lat: 37.5,
+            lon: -122.25,
+            alt_baro_ft: Some(35_000),
+            gs_kt: Some(451.5),
+            track_deg: Some(271.0),
+            baro_rate_fpm: Some(64),
+            on_ground: false,
+            last_heard_at_ms: 1_791_220_000_250 - 500,
+            position_at_ms: 1_791_220_000_250 - 1_000,
+            position_source: PositionSource::Adsb,
+            mlat: None,
+        },
+        Aircraft {
+            hex: "abcdef".to_owned(),
+            flight: None,
+            lat: 37.62,
+            lon: -122.38,
+            alt_baro_ft: None,
+            gs_kt: None,
+            track_deg: None,
+            baro_rate_fpm: None,
+            on_ground: true,
+            last_heard_at_ms: 1_791_220_000_250 - 2_000,
+            position_at_ms: 1_791_220_000_250 - 2_000,
+            position_source: PositionSource::Adsr,
+            mlat: None,
+        },
+    ]
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn the_api_serves_aircraft_the_network_and_a_station_from_readsb_and_a_real_relay() -> Result
 {
@@ -321,6 +394,14 @@ async fn the_api_serves_aircraft_the_network_and_a_station_from_readsb_and_a_rea
         ),
         (1, 1, 2)
     );
+    assert_eq!(
+        network.aircraft_by_source,
+        SourceCounts {
+            adsb: 1,
+            adsr: 1,
+            ..SourceCounts::default()
+        }
+    );
     assert!(network.messages_per_sec >= 0.0);
     assert_eq!(header(&headers, &CACHE_CONTROL), "public, max-age=15");
 
@@ -333,37 +414,9 @@ async fn the_api_serves_aircraft_the_network_and_a_station_from_readsb_and_a_rea
     assert_eq!(header(&headers, &CACHE_CONTROL), "public, max-age=2");
     assert_eq!(header(&headers, &ACCESS_CONTROL_ALLOW_ORIGIN), SITE);
     let answer: AircraftResponse = json(&body)?;
-    let expected = vec![
-        Aircraft {
-            hex: "a1b2c3".to_owned(),
-            flight: Some("UAL123".to_owned()),
-            lat: 37.5,
-            lon: -122.25,
-            alt_baro_ft: Some(35_000),
-            gs_kt: Some(451.5),
-            track_deg: Some(271.0),
-            baro_rate_fpm: Some(64),
-            on_ground: false,
-            last_heard_at_ms: 1_791_220_000_250 - 500,
-            position_source: PositionSource::Adsb,
-            mlat: None,
-        },
-        Aircraft {
-            hex: "abcdef".to_owned(),
-            flight: None,
-            lat: 37.62,
-            lon: -122.38,
-            alt_baro_ft: None,
-            gs_kt: None,
-            track_deg: None,
-            baro_rate_fpm: None,
-            on_ground: true,
-            last_heard_at_ms: 1_791_220_000_250 - 2_000,
-            position_source: PositionSource::Adsb,
-            mlat: None,
-        },
-    ];
+    let expected = expected();
     assert_eq!(answer.now_ms, 1_791_220_000_250);
+    assert!(answer.sent_at_ms > 0);
     assert_eq!(answer.aircraft, expected);
     let queries = asked.lock().map_err(text)?.clone();
     assert!(
@@ -470,6 +523,176 @@ async fn a_preflight_allows_what_the_client_core_sends_and_costs_no_token() -> R
         "retry-after"
     );
     assert_eq!(header(&headers, &ACCESS_CONTROL_ALLOW_ORIGIN), SITE);
+    Ok(())
+}
+
+/// An open stream: its body, read a block (an event or a comment) at a time.
+struct Events {
+    body: hyper::body::Incoming,
+    buffer: String,
+}
+
+impl Events {
+    /// The next block, without the blank line that ends it.
+    async fn block(&mut self) -> Result<String> {
+        loop {
+            if let Some(end) = self.buffer.find("\n\n") {
+                let block = self.buffer[..end].to_owned();
+                self.buffer.drain(..end + 2);
+                return Ok(block);
+            }
+            let frame = tokio::time::timeout(WAIT, self.body.frame())
+                .await
+                .map_err(|_| "the stream sent nothing".to_owned())?
+                .ok_or("the stream ended")?
+                .map_err(text)?;
+            if let Ok(data) = frame.into_data() {
+                self.buffer.push_str(&String::from_utf8_lossy(&data));
+            }
+        }
+    }
+
+    /// The next `aircraft` event, past any comment.
+    async fn update(&mut self) -> Result<AircraftUpdate> {
+        loop {
+            let block = self.block().await?;
+            if block.starts_with(':') {
+                continue;
+            }
+            let data = block
+                .strip_prefix("event: aircraft\ndata: ")
+                .ok_or_else(|| format!("not an aircraft event: {block:?}"))?;
+            return serde_json::from_str(data).map_err(|error| format!("{error}: {data}"));
+        }
+    }
+}
+
+/// Opens a stream from the public site's origin: its status and headers once they come, and its
+/// body to read.
+async fn stream(url: &str) -> Result<(StatusCode, HeaderMap, Events)> {
+    let request = Request::get(url)
+        .header(ORIGIN, SITE)
+        .body(Empty::<Bytes>::new())
+        .map_err(text)?;
+    let client = Client::builder(TokioExecutor::new()).build_http::<Empty<Bytes>>();
+    let response = tokio::time::timeout(WAIT, client.request(request))
+        .await
+        .map_err(|_| format!("{url}: no answer"))?
+        .map_err(text)?;
+    let (parts, body) = response.into_parts();
+    Ok((
+        parts.status,
+        parts.headers,
+        Events {
+            body,
+            buffer: String::new(),
+        },
+    ))
+}
+
+/// THE STREAM (RFC-0184): every aircraft in the viewport first, then only what changed and what
+/// left, a comment while nothing changes (a message that moved no position is no change), and at
+/// most four streams open from one address.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stream_pushes_every_aircraft_then_what_changed_and_holds_an_address_to_four() -> Result {
+    let (readsb_url, asked, answer) = start_readsb_answering().await?;
+    let mut settings = settings("http://127.0.0.1:9", readsb_url);
+    settings.stream_heartbeat = Duration::from_millis(300);
+    let api = start_api(settings).await?;
+    let url = format!("{api}/v1/aircraft/stream?west=-123&south=37&east=-121&north=38");
+
+    // Refused as `/v1/aircraft` refuses, and never cached.
+    for (query, refused) in [
+        (
+            "west=-130&south=0&east=-60&north=10",
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "west=-123&south=37&east=-121&north=38&feed=precise",
+            StatusCode::SERVICE_UNAVAILABLE,
+        ),
+    ] {
+        let (status, headers, _) = get(&format!("{api}/v1/aircraft/stream?{query}")).await?;
+        assert_eq!(status, refused, "{query}");
+        assert_eq!(header(&headers, &CACHE_CONTROL), "no-store");
+        assert_eq!(header(&headers, &ACCESS_CONTROL_ALLOW_ORIGIN), SITE);
+    }
+
+    let (status, headers, mut events) = stream(&url).await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(header(&headers, &CONTENT_TYPE), "text/event-stream");
+    assert_eq!(header(&headers, &CACHE_CONTROL), "no-store");
+    assert_eq!(header(&headers, &ACCESS_CONTROL_ALLOW_ORIGIN), SITE);
+    let first = events.update().await?;
+    assert_eq!(
+        (first.full, first.feed, first.now_ms, first.gone.len()),
+        (true, Feed::Live, 1_791_220_000_250, 0)
+    );
+    assert_eq!(first.aircraft, expected());
+    assert!(first.sent_at_ms > 0);
+    // One read of every aircraft readsb positions, not a box per stream.
+    let queries = asked.lock().map_err(text)?.clone();
+    assert!(queries.contains(&"all_with_pos".to_owned()), "{queries:?}");
+    assert!(
+        !queries.iter().any(|query| query.starts_with("box=")),
+        "{queries:?}"
+    );
+
+    // Nothing changes: a comment keeps the stream open.
+    assert!(events.block().await?.starts_with(':'));
+
+    // a1b2c3 moves and abcdef goes silent: only those.
+    *answer.lock().map_err(text)? = READSB_LATER;
+    let update = events.update().await?;
+    let moved = Aircraft {
+        lat: 37.51,
+        last_heard_at_ms: 1_791_220_001_150,
+        position_at_ms: 1_791_220_001_050,
+        ..expected()[0].clone()
+    };
+    assert_eq!(
+        (update.full, update.now_ms, update.aircraft, update.gone),
+        (
+            false,
+            1_791_220_001_250,
+            vec![moved],
+            vec!["abcdef".to_owned()]
+        )
+    );
+
+    // A velocity message alone: heard later, the position where it was, nothing to send.
+    *answer.lock().map_err(text)? = READSB_HEARD;
+    for _ in 0..3 {
+        let block = events.block().await?;
+        assert!(block.starts_with(':'), "{block:?}");
+    }
+
+    // Three more from the same address are open; a fifth is refused, and not cached.
+    let mut open = Vec::new();
+    for _ in 0..3 {
+        let (status, _, events) = stream(&url).await?;
+        assert_eq!(status, StatusCode::OK);
+        open.push(events);
+    }
+    let (status, headers, _) = get(&url).await?;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(header(&headers, &CACHE_CONTROL), "no-store");
+    assert_eq!(header(&headers, &ACCESS_CONTROL_ALLOW_ORIGIN), SITE);
+    assert!(!header(&headers, &RETRY_AFTER).is_empty());
+
+    // One closed gives its place back, once the API notices (its next write fails).
+    drop(events);
+    tokio::time::timeout(WAIT, async {
+        loop {
+            if let Ok((StatusCode::OK, _, events)) = stream(&url).await {
+                return events;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .map_err(|_| "a closed stream never gave its place back".to_owned())?;
+    drop(open);
     Ok(())
 }
 
