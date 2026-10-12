@@ -5,4 +5,4 @@ that either disagrees with (.github/workflows/release.yml), so a release names o
 three places that cannot drift: this file, Cargo.toml and packaging/install.sh.
 """
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
