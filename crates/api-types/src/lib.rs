@@ -6,7 +6,8 @@
 //!
 //! - an INSTANT is `*_at_ms`, Unix milliseconds on the API's own clock, beside the response's
 //!   `now_ms` (when the API's data was current, on the same clock), so a client ages an instant
-//!   against `now_ms` and never against its own clock;
+//!   against `now_ms`, or by its own clock through the offset an aircraft answer's `sent_at_ms`
+//!   gives it (RFC-0184), never by its own clock read as the API's;
 //! - a SPAN is `*_for_ms`, a count of milliseconds.
 //!
 //! A client may ignore a field it does not read; a field a type states is always present (an
@@ -337,6 +338,10 @@ pub mod fixtures {
     /// `GET /v1/aircraft`: three aircraft: one named and airborne, one unnamed on the ground, both
     /// at their ADS-B positions, and one readsb holds no position for, at its MLAT position.
     pub const AIRCRAFT: &str = include_str!("../testdata/aircraft.json");
+    /// One `aircraft` event of `GET /v1/aircraft/stream` after its first, to a client holding
+    /// `AIRCRAFT`: the aircraft that moved since (one by readsb, one by its next MLAT fix, moving by
+    /// its last two) and the address no longer heard.
+    pub const AIRCRAFT_UPDATE: &str = include_str!("../testdata/aircraft_update.json");
     /// `GET /v1/aircraft?...&feed=precise`: one second of the precise world product, an ADS-B
     /// aircraft and an MLAT one.
     pub const AIRCRAFT_PRECISE: &str = include_str!("../testdata/aircraft_precise.json");
@@ -379,6 +384,7 @@ mod tests {
     fn every_fixture_is_its_type_whole() -> Result<(), String> {
         whole::<AircraftResponse>(fixtures::AIRCRAFT)?;
         whole::<AircraftResponse>(fixtures::AIRCRAFT_PRECISE)?;
+        whole::<AircraftUpdate>(fixtures::AIRCRAFT_UPDATE)?;
         whole::<Network>(fixtures::NETWORK)?;
         whole::<Station>(fixtures::STATION)?;
         whole::<Station>(fixtures::STATION_BARE)?;

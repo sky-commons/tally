@@ -43,15 +43,22 @@ had no speed or track, so a client could not move it between fixes.
    once per tick for every open stream (one read shared, not one per viewer), streams sit outside
    the request timeout and the in-flight limit, and one address holds at most 4 open streams. It
    is `Cache-Control: no-store`. `/v1/aircraft` stays, for clients that poll.
-6. **Faster upstream.** The feeder seals at most every 250 ms (it already seals early at 48 KiB),
-   and the API's readsb writes its answer every 200 ms. A batch's fixed cost is 172 bytes and one
-   Ed25519 verification, so four a second per feeder is 688 bytes a second and four
-   verifications: the relay's memory plan charges receptions, not batches, and is unchanged.
+6. **readsb answers every 200 ms.** The API's readsb runs `--write-json-every 0.2`, so its answer
+   is at most 200 ms old rather than a second.
+7. **The feeder still seals about once a second.** Sealing every 250 ms was measured and refused:
+   over 40 simulated feeders it costs each feeder 14% more upload (1,158 B/s: 516 B of per-batch
+   overhead and about 640 B of worse compression in smaller batches), and five relay constants
+   that plan one batch a second (delivery tags, member and per-feeder record paces, the planned
+   batch charge, the small-relay record floor) would have to be re-planned, which takes the public
+   relay from 47 feeders at the planned mean to 43. It would cut the mean delay by 375 ms, which no
+   viewer sees once the client blends corrections (Flightlines RFC-0185 §3). A later change that
+   wants a faster seal makes the batch cadence one constant in `tally-wire` that the feeder and the
+   relay's plan both derive from.
 
 ## What a client gets
 
-From radio to the API's answer: about 125 ms (seal) plus 100 ms (readsb) plus transit on
-average, under half a second. The stream adds no cache and no poll. A client that renders at
+From radio to the API's answer: about 500 ms (seal) plus 100 ms (readsb) plus transit on
+average, under a second. The stream adds no cache and no poll. A client that renders at
 display rate, projects each position from `position_at_ms` and blends corrections (rather than
 snapping) shows the network as it is heard.
 

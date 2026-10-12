@@ -7,7 +7,11 @@
 //! - `GET /v1/aircraft?west=&south=&east=&north=`: aircraft in a viewport of at most 60 degrees
 //!   each way (`area`), from readsb's `?box=` query, per request, and the merged MLAT position of
 //!   every aircraft in it readsb holds no position for (`mlat`), each saying which it is.
-//! - `GET /v1/network`: receivers online and known, their messages a second, and aircraft held.
+//! - `GET /v1/aircraft/stream?west=&south=&east=&north=`: the same viewport pushed as Server-Sent
+//!   Events (`stream`, RFC-0184): every aircraft, then what changed at most every 250 ms, from one
+//!   read of readsb shared by every open stream.
+//! - `GET /v1/network`: receivers online and known, their messages a second, and aircraft held,
+//!   by where each position came from.
 //! - `GET /v1/stations/{key}`: one receiver, the key as base64url without padding.
 //! - `GET /v1/stations/{key}/stats`: what one feeder gave the network over the last day (`feeders`),
 //!   computed by this API as a client from public signed records, never by a relay.
@@ -17,7 +21,8 @@
 //!
 //! Every response carries CORS for the configured origins and a `Cache-Control` for the edge.
 //! Each client is held to a token bucket (`limit`), requests in flight and connections are
-//! capped, and every request, header read and upstream read has a deadline.
+//! capped, and every request, header read and upstream read has a deadline; a stream instead is
+//! held to a few open at once per client, and lasts as long as its connection.
 
 pub mod area;
 pub mod config;
@@ -27,6 +32,7 @@ pub mod mlat;
 pub mod readsb;
 pub mod routes;
 pub mod snapshot;
+pub mod stream;
 pub mod upstream;
 
 #[cfg(test)]
@@ -81,6 +87,8 @@ pub struct Settings {
     pub max_connections: usize,
     /// How often the relay's stations and readsb's count are read.
     pub refresh: Duration,
+    /// How long a stream may send nothing before it sends a comment, so the edge keeps it open.
+    pub stream_heartbeat: Duration,
     /// Where MLAT positions come from.
     pub mlat: mlat::Settings,
 }
@@ -97,6 +105,7 @@ impl Settings {
             max_requests: DEFAULT_MAX_REQUESTS,
             max_connections: DEFAULT_MAX_CONNECTIONS,
             refresh: snapshot::DEFAULT_REFRESH,
+            stream_heartbeat: stream::HEARTBEAT,
             mlat: mlat::Settings::default(),
         }
     }
@@ -114,6 +123,10 @@ pub struct App {
     pub feeders: Arc<Mutex<feeders::Ledger>>,
     /// The receivers with standing, as the merge's ledger says (`mlat::with_standing`).
     pub standing: Arc<RwLock<Arc<BTreeSet<tally_wire::PublicKey>>>>,
+    /// readsb's aircraft as every open stream reads them, one read shared.
+    pub live: stream::Live,
+    /// The streams each client holds open.
+    pub streams: stream::Open,
 }
 
 impl App {
@@ -126,6 +139,8 @@ impl App {
             mlat: Arc::default(),
             feeders: Arc::default(),
             standing: Arc::default(),
+            live: stream::Live::default(),
+            streams: stream::Open::default(),
             settings,
         }
     }
@@ -161,10 +176,15 @@ impl App {
                 self.compute_board();
             }
             match aircraft.and_then(|body| readsb::parse(&body)) {
-                Ok(answer) => self.snapshot.set_aircraft(
-                    u32::try_from(answer.count()).unwrap_or(u32::MAX),
-                    Instant::now(),
-                ),
+                Ok(answer) => {
+                    // readsb's positioned aircraft and those only Tally MLAT places, each once.
+                    let mlat = self
+                        .mlat
+                        .current(routes::wall_ms(), self.settings.mlat.max_age);
+                    let aircraft = mlat::answer(answer.positioned(), &mlat);
+                    self.snapshot
+                        .set_aircraft(snapshot::count(&aircraft), Instant::now());
+                }
                 Err(error) => eprintln!("tally-api: {error}"),
             }
         }

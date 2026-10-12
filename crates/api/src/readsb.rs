@@ -1,8 +1,9 @@
 //! readsb's JSON, as its API port (`--net-api-port`) and `aircraft.json` write it
 //! (github.com/wiedehopf/readsb, README-json.md), read into the public shape. readsb is the
 //! decoder (RFC-0119 §3.3); this only renames its fields, states when each aircraft was last heard
-//! as an instant on readsb's clock (readsb says how many seconds before its `now`), and drops the
-//! aircraft it holds no position for.
+//! and when its position was as instants on readsb's clock (readsb says how many seconds before its
+//! `now`), names where the position came from (readsb's `type`), and drops the aircraft it holds no
+//! position for.
 
 use serde::Deserialize;
 
@@ -14,9 +15,6 @@ use tally_api_types::{Aircraft, PositionSource};
 pub struct Answer {
     /// Unix seconds, with a fraction, when readsb's data was current.
     pub now: f64,
-    /// The API's count of aircraft in its answer, when it states one.
-    #[serde(rename = "resultCount")]
-    pub result_count: Option<u64>,
     /// `aircraft` in `aircraft.json` and the API; `ac` in the API's ADSBExchange v2 form (`&jv2`).
     #[serde(default, alias = "ac")]
     pub aircraft: Vec<Entry>,
@@ -34,6 +32,11 @@ pub struct Entry {
     pub baro_rate: Option<f64>,
     /// Seconds before `now` the last message was heard.
     pub seen: Option<f64>,
+    /// Seconds before `now` the position was last updated: what a client projects from.
+    pub seen_pos: Option<f64>,
+    /// Where readsb's data on it came from (`adsb_icao`, `mlat`, `tisb_other`, ...).
+    #[serde(rename = "type")]
+    pub kind: Option<String>,
 }
 
 /// `alt_baro`: feet, or the word `ground`.
@@ -64,15 +67,33 @@ pub fn now_ms(answer: &Answer) -> u64 {
 }
 
 impl Answer {
-    /// How many aircraft it holds: its stated count, or those it lists.
-    pub fn count(&self) -> u64 {
-        self.result_count.unwrap_or(self.aircraft.len() as u64)
+    /// The public form of every entry it gives a position for, in its order.
+    pub fn positioned(&self) -> Vec<Aircraft> {
+        let now_ms = now_ms(self);
+        self.aircraft
+            .iter()
+            .filter_map(|entry| aircraft(entry, now_ms))
+            .collect()
+    }
+}
+
+/// Where a position readsb decoded came from, by its `type` (the doc of each `PositionSource`
+/// names readsb's words): readsb's own `mlat` is not Tally's, so it is `Other`, as is an entry
+/// that names none.
+pub fn source(kind: Option<&str>) -> PositionSource {
+    match kind {
+        Some("adsb_icao" | "adsb_icao_nt" | "adsb_other") => PositionSource::Adsb,
+        Some("adsr_icao" | "adsr_other") => PositionSource::Adsr,
+        Some("tisb_icao" | "tisb_other" | "tisb_trackfile") => PositionSource::Tisb,
+        _ => PositionSource::Other,
     }
 }
 
 /// The public form of one entry of an answer current at `now_ms`, or `None` when readsb holds no
-/// position for it. readsb's `seen` (seconds before `now`) becomes the instant it was last heard;
-/// an entry that states no `seen` was heard at `now`.
+/// position for it. readsb's `seen` (seconds before `now`) becomes the instant it was last heard
+/// and its `seen_pos` the instant of its position (its `seen` when it states no `seen_pos`); an
+/// entry that states neither was heard at `now`. A position is a message, so the last heard is
+/// never before it.
 pub fn aircraft(entry: &Entry, now_ms: u64) -> Option<Aircraft> {
     let (lat, lon) = (entry.lat?, entry.lon?);
     let (alt_baro_ft, on_ground) = match &entry.alt_baro {
@@ -86,6 +107,8 @@ pub fn aircraft(entry: &Entry, now_ms: u64) -> Option<Aircraft> {
         .map(str::trim)
         .filter(|flight| !flight.is_empty())
         .map(str::to_owned);
+    let before = |seconds: Option<f64>| now_ms.saturating_sub(seconds.map_or(0, millis));
+    let position_at_ms = before(entry.seen_pos.or(entry.seen));
     Some(Aircraft {
         hex: entry.hex.to_ascii_lowercase(),
         flight,
@@ -96,10 +119,9 @@ pub fn aircraft(entry: &Entry, now_ms: u64) -> Option<Aircraft> {
         track_deg: entry.track,
         baro_rate_fpm: entry.baro_rate.map(round_i32),
         on_ground,
-        last_heard_at_ms: now_ms.saturating_sub(entry.seen.map_or(0, millis)),
-        // seam stub (RFC-0184): the position's own time is readsb's `seen_pos`
-        position_at_ms: now_ms.saturating_sub(entry.seen.map_or(0, millis)),
-        position_source: PositionSource::Adsb,
+        last_heard_at_ms: before(entry.seen).max(position_at_ms),
+        position_at_ms,
+        position_source: source(entry.kind.as_deref()),
         mlat: None,
     })
 }
@@ -136,7 +158,7 @@ mod tests {
     #[test]
     fn readsbs_answer_is_read_into_the_public_shape() -> Result<(), String> {
         let answer = parse(ANSWER.as_bytes())?;
-        assert_eq!((now_ms(&answer), answer.count()), (1_791_220_000_400, 4));
+        assert_eq!(now_ms(&answer), 1_791_220_000_400);
         let now = now_ms(&answer);
         let aircraft: Vec<Aircraft> = answer
             .aircraft
@@ -157,6 +179,7 @@ mod tests {
                     baro_rate_fpm: Some(-64),
                     on_ground: false,
                     last_heard_at_ms: 1_791_220_000_200,
+                    position_at_ms: 1_791_219_999_900,
                     position_source: PositionSource::Adsb,
                     mlat: None,
                 },
@@ -171,7 +194,9 @@ mod tests {
                     baro_rate_fpm: None,
                     on_ground: true,
                     last_heard_at_ms: 1_791_219_999_150,
-                    position_source: PositionSource::Adsb,
+                    // No `seen_pos`: its `seen`. No `type`: a source readsb does not name.
+                    position_at_ms: 1_791_219_999_150,
+                    position_source: PositionSource::Other,
                     mlat: None,
                 },
                 // A non-ICAO address keeps readsb's mark; one with no position is left out.
@@ -186,7 +211,8 @@ mod tests {
                     baro_rate_fpm: None,
                     on_ground: false,
                     last_heard_at_ms: 1_791_220_000_400,
-                    position_source: PositionSource::Adsb,
+                    position_at_ms: 1_791_220_000_400,
+                    position_source: PositionSource::Tisb,
                     mlat: None,
                 },
             ]
@@ -194,12 +220,68 @@ mod tests {
         Ok(())
     }
 
+    /// A velocity or altitude message moves `seen` and not `seen_pos`: the aircraft is heard
+    /// later, and its position keeps the instant it was heard at.
     #[test]
-    fn the_v2_form_and_an_answer_with_no_count_are_read_too() -> Result<(), String> {
+    fn a_message_without_a_position_does_not_move_the_positions_instant() -> Result<(), String> {
+        let at = |now: f64, seen: f64, seen_pos: f64| -> Result<(u64, u64), String> {
+            let text = format!(
+                r#"{{"now": {now}, "aircraft": [{{"hex": "a1b2c3", "type": "adsb_icao",
+                    "lat": 37.5, "lon": -122.25, "seen": {seen}, "seen_pos": {seen_pos}}}]}}"#
+            );
+            let one = parse(text.as_bytes())?
+                .positioned()
+                .pop()
+                .ok_or("no aircraft")?;
+            Ok((one.last_heard_at_ms, one.position_at_ms))
+        };
+        assert_eq!(
+            at(1_791_220_000.0, 0.0, 0.0)?,
+            (1_791_220_000_000, 1_791_220_000_000)
+        );
+        // A second on, only a velocity message since: heard later, positioned as before.
+        assert_eq!(
+            at(1_791_220_001.0, 0.2, 1.0)?,
+            (1_791_220_000_800, 1_791_220_000_000)
+        );
+        // `seen` rounded below `seen_pos` never puts the last heard before the position.
+        assert_eq!(
+            at(1_791_220_001.0, 0.5, 0.4)?,
+            (1_791_220_000_600, 1_791_220_000_600)
+        );
+        Ok(())
+    }
+
+    /// readsb's every `type`, as the doc of each `PositionSource` names them.
+    #[test]
+    fn readsbs_type_names_the_positions_source() {
+        for (kind, expected) in [
+            ("adsb_icao", PositionSource::Adsb),
+            ("adsb_icao_nt", PositionSource::Adsb),
+            ("adsb_other", PositionSource::Adsb),
+            ("adsr_icao", PositionSource::Adsr),
+            ("adsr_other", PositionSource::Adsr),
+            ("tisb_icao", PositionSource::Tisb),
+            ("tisb_other", PositionSource::Tisb),
+            ("tisb_trackfile", PositionSource::Tisb),
+            ("adsc", PositionSource::Other),
+            ("mode_s", PositionSource::Other),
+            ("other", PositionSource::Other),
+            // readsb's own MLAT is not Tally's.
+            ("mlat", PositionSource::Other),
+            ("something_new", PositionSource::Other),
+        ] {
+            assert_eq!(source(Some(kind)), expected, "{kind}");
+        }
+        assert_eq!(source(None), PositionSource::Other);
+    }
+
+    #[test]
+    fn the_v2_form_and_an_answer_with_no_aircraft_are_read_too() -> Result<(), String> {
         let answer = parse(br#"{"now": 1.5, "ac": [{"hex": "a1b2c3", "lat": 1, "lon": 2}]}"#)?;
-        assert_eq!((now_ms(&answer), answer.count()), (1_500, 1));
+        assert_eq!((now_ms(&answer), answer.positioned().len()), (1_500, 1));
         let empty = parse(br#"{"now": 2}"#)?;
-        assert_eq!(empty.count(), 0);
+        assert!(empty.positioned().is_empty());
         assert!(parse(b"<html>").is_err());
         Ok(())
     }

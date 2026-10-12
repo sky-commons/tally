@@ -189,8 +189,21 @@ public signed records; no relay computes them.
   (the answer's `feed` says which was served, and its `now_ms` is that product's own second). With
   no recent precise product to serve (none has come from the relays, or the newest is older than
   the age limit beyond its own delay) it answers `503` with `{"error":"precise_unavailable"}`,
-  never an empty sky
-- `GET /v1/network`
+  never an empty sky. Each aircraft's `position_at_ms` is when its position was heard (readsb's
+  `seen_pos`; for MLAT, the transmission's time), which a client projects from, and
+  `last_heard_at_ms` when any message was; `position_source` is `adsb`, `mlat` (Tally MLAT), `adsr`,
+  `tisb` or `other`, from readsb's `type`; an MLAT aircraft's speed and track are derived from its
+  last two fixes. `sent_at_ms` says when the answer was sent, so a client can measure its clock's
+  offset from the API's
+- `GET /v1/aircraft/stream?west=&south=&east=&north=` (the same query): Server-Sent Events, never
+  cached (RFC-0184). Each `aircraft` event's data is an `AircraftUpdate`: the first `full` (every
+  aircraft in the box), then at most every 250 ms the aircraft that changed and the `gone`
+  addresses, and a comment every 15 s while nothing changes. One read of readsb (every 200 ms,
+  while any stream is open) serves every stream; an address holds at most 4 open streams (a fifth
+  is answered `429`). With `&feed=precise` each new second of the precise product is sent whole.
+  Run readsb with `--write-json-every 0.2` so its answer is as fresh as the stream's
+- `GET /v1/network`: receivers, their message rate, and `aircraft` (readsb's positioned aircraft
+  and those only Tally MLAT places) with `aircraft_by_source` summing to it
 - `GET /v1/stations/KEY` (the key as base64url without padding), `GET /v1/stations/KEY/stats`
 - `GET /v1/leaderboards`, `GET /v1/leaderboards/AREA`
 
@@ -198,7 +211,7 @@ The JSON is declared once, in `crates/api-types` (`tally-api-types`, serde only)
 in Rust can depend on rather than restate; `crates/api-types/testdata` holds one answer of each
 endpoint exactly as the API writes it. Every time field says what it is: an instant is `*_at_ms`
 (Unix milliseconds on the API's clock, beside the answer's `now_ms`, so a client ages it against
-`now_ms` and never against its own clock), and a span is `*_for_ms`.
+`now_ms`, or by its own clock through the offset `sent_at_ms` gives it), and a span is `*_for_ms`.
 
 Each client is rate limited (`--rate`, `--burst`), and CORS allows `--allow-origin` (repeatable; no origin unless named),
 answering a preflight for `GET` with the `accept` and `traceparent` request headers and exposing
