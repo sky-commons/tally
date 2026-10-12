@@ -152,7 +152,7 @@ mod tests {
     #[tokio::test]
     async fn the_stations_are_served_as_json_with_what_their_descriptions_declare()
     -> Result<(), String> {
-        let hub = Arc::new(Hub::new(8));
+        let hub = Arc::new(Hub::new(8, crate::sharing::Deadlines::RELAY));
         let receiver = Identity::generate().map_err(text)?;
         let key = receiver.public();
         let location = Location {
@@ -224,7 +224,7 @@ mod tests {
     /// hosts no MLAT says so.
     #[tokio::test]
     async fn the_products_and_mlat_counters_are_served() -> Result<(), String> {
-        let hub = Arc::new(Hub::new(8));
+        let hub = Arc::new(Hub::new(8, crate::sharing::Deadlines::RELAY));
         let listener = TcpListener::bind("127.0.0.1:0").await.map_err(text)?;
         let address = listener.local_addr().map_err(text)?;
         tokio::spawn(serve(listener, Arc::clone(&hub)));
@@ -247,7 +247,7 @@ mod tests {
             },
             crate::mlat_host::WindowClock::KEEPING_UP,
         )?);
-        let hub = Arc::new(Hub::new(8));
+        let hub = Arc::new(Hub::new(8, crate::sharing::Deadlines::RELAY));
         hub.network().host_mlat(hosted);
         let listener = TcpListener::bind("127.0.0.1:0").await.map_err(text)?;
         let address = listener.local_addr().map_err(text)?;

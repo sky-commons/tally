@@ -248,7 +248,7 @@ fn made(hub: &Hub, end_ms: u64) -> Result<Made> {
 /// trace: each batch waiting `delay(n)` first.
 fn run(trace: &Trace, threads: Threads, delay: impl Fn(usize) -> Duration) -> Result<Made> {
     let hub = Arc::new(
-        Hub::clocked(8, Arc::new(|| 0))
+        Hub::clocked(8, Arc::new(|| 0), tally_relay::sharing::Deadlines::RELAY)
             .product_boots(42)
             .staged(threads)?,
     );
@@ -270,9 +270,13 @@ fn run_clocked(trace: &Trace, threads: Threads, pause: Option<Pause>) -> Result<
     let clock = Arc::new(AtomicU64::new(BASE_MS));
     let reading = Arc::clone(&clock);
     let hub = Arc::new(
-        Hub::clocked(8, Arc::new(move || reading.load(Ordering::SeqCst)))
-            .product_boots(42)
-            .staged_pausing(threads, pause)?,
+        Hub::clocked(
+            8,
+            Arc::new(move || reading.load(Ordering::SeqCst)),
+            tally_relay::sharing::Deadlines::RELAY,
+        )
+        .product_boots(42)
+        .staged_pausing(threads, pause)?,
     );
     start(&hub, trace);
     for (second, batches) in trace.batches.chunks(FEEDERS).enumerate() {
@@ -375,11 +379,15 @@ fn stamped_by_the_ingest_clock_with_delays_inside_every_stage_the_bytes_are_the_
 /// window is. With one epoch and the one before, the copy two seconds on was kept again.
 #[test]
 fn copies_of_a_message_up_to_two_seconds_apart_are_kept_once() -> Result {
-    let hub = Arc::new(Hub::clocked(8, Arc::new(|| 0)).staged(Threads {
-        ingest: 4,
-        message: 4,
-        seal: 4,
-    })?);
+    let hub = Arc::new(
+        Hub::clocked(8, Arc::new(|| 0), tally_relay::sharing::Deadlines::RELAY).staged(
+            Threads {
+                ingest: 4,
+                message: 4,
+                seal: 4,
+            },
+        )?,
+    );
     hub.network().adopt_identity(Identity::from_seed([59; 32]));
     let message = airborne(
         0x00a0_0001,
@@ -513,11 +521,15 @@ fn a_message_heard_by_many_receivers_on_many_workers_is_kept_once_a_window() -> 
 async fn each_receivers_batches_reach_a_subscriber_in_order_described_first() -> Result {
     // The ingest clock stopped: signing these batches takes real seconds in a debug build, and
     // a subscriber is let go two seconds of inbound behind, which is not what this reads.
-    let hub = Arc::new(Hub::clocked(8, Arc::new(|| 0)).staged(Threads {
-        ingest: 8,
-        message: 2,
-        seal: 2,
-    })?);
+    let hub = Arc::new(
+        Hub::clocked(8, Arc::new(|| 0), tally_relay::sharing::Deadlines::RELAY).staged(
+            Threads {
+                ingest: 8,
+                message: 2,
+                seal: 2,
+            },
+        )?,
+    );
     let listener = hub.listen(
         999,
         Filter::Subscription(tally_relay::subscription::Subscription {
@@ -624,7 +636,7 @@ async fn a_subscriber_that_falls_behind_is_let_go_whole_and_the_stream_refused_w
     // of all forty were held together, which the store planned in what the rate is charged holds
     // just, and the products, planned the same way, held all forty epochs.)
     let hub = Arc::new(
-        Hub::clocked(8, Arc::new(|| 0))
+        Hub::clocked(8, Arc::new(|| 0), tally_relay::sharing::Deadlines::RELAY)
             // No area taken, so no member's share beside the feeder's: the stores hold exactly
             // what it is planned.
             .memory_for_feeders(1, false)

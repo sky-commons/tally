@@ -1818,7 +1818,7 @@ mod tests {
     /// time, is answered no more than one allowance.
     #[test]
     fn a_probers_allowance_survives_its_reconnects() -> Result {
-        let hub = crate::hub::Hub::new(8);
+        let hub = crate::hub::Hub::new(8, crate::sharing::Deadlines::RELAY);
         hub.network()
             .adopt_identity(Identity::generate().map_err(text)?);
         let feeder = Identity::generate().map_err(text)?;

@@ -982,15 +982,25 @@ pub fn source_of(address: IpAddr) -> IpAddr {
 
 impl Hub {
     /// A hub whose stages run on the caller (`ingest::Stages::inline`), by the system clock, its
-    /// budget `DEFAULT_MEMORY`: what a test builds. A relay is then `staged` onto its threads.
-    pub fn new(max_subscribers: usize) -> Self {
-        Self::clocked(max_subscribers, crate::ingest::anchored_wall_clock())
+    /// budget `DEFAULT_MEMORY`: what a test builds. A relay is then `staged` onto its threads. Its
+    /// sharing judges deliverers by `deadlines` (a relay's `sharing::Deadlines::RELAY`; a test
+    /// asserting a verdict over real links declares its own, `sharing::member::Deadlines`).
+    pub fn new(max_subscribers: usize, deadlines: crate::sharing::Deadlines) -> Self {
+        Self::clocked(
+            max_subscribers,
+            crate::ingest::anchored_wall_clock(),
+            deadlines,
+        )
     }
 
     /// As `new`, its ingest clock `clock`. Its budget is sized from its own plan (`Hub::plan`),
     /// as every change to its caps resizes it.
-    pub fn clocked(max_subscribers: usize, clock: Clock) -> Self {
-        let network = Network::new();
+    pub fn clocked(
+        max_subscribers: usize,
+        clock: Clock,
+        deadlines: crate::sharing::Deadlines,
+    ) -> Self {
+        let network = Network::new(deadlines);
         let budget = Budget::of_memory(
             DEFAULT_MEMORY,
             Plan::planned(false)
@@ -2523,7 +2533,7 @@ mod tests {
     /// once passed one round a loop of their one-hop raw links for ever, thousands a second.
     #[test]
     fn a_bundle_index_that_comes_back_is_not_passed_on_again() -> Result<(), String> {
-        let hub = Hub::new(8);
+        let hub = Hub::new(8, crate::sharing::Deadlines::RELAY);
         let out = hub.listen(u64::MAX, Filter::Everything);
         let parent = Region::containing(
             &tally_wire::Location {
@@ -2568,7 +2578,9 @@ mod tests {
             message: 1,
             seal: 1,
         };
-        let hub = Hub::new(1).memory(64 << 20, false).staged(threads)?;
+        let hub = Hub::new(1, crate::sharing::Deadlines::RELAY)
+            .memory(64 << 20, false)
+            .staged(threads)?;
         let bound = crate::ingest::Room::of(hub.budget()).records();
         let gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
         let (started, running) = std::sync::mpsc::channel::<()>();
@@ -2691,7 +2703,7 @@ mod tests {
     #[test]
     fn a_flood_of_descriptions_never_forgets_a_receiver_that_is_publishing() -> Result<(), String> {
         const CAP: usize = 200;
-        let mut hub = Hub::new(8);
+        let mut hub = Hub::new(8, crate::sharing::Deadlines::RELAY);
         hub.receivers = Receivers::new(1, CAP, DESCRIPTION_BYTES_HELD);
         let hub = Arc::new(hub);
         let (honest, honest_key) = key()?;
@@ -2727,7 +2739,7 @@ mod tests {
 
     #[test]
     fn when_full_the_receiver_least_recently_active_is_forgotten() -> Result<(), String> {
-        let mut hub = Hub::new(8);
+        let mut hub = Hub::new(8, crate::sharing::Deadlines::RELAY);
         hub.receivers = Receivers::new(1, 2, DESCRIPTION_BYTES_HELD);
         let (stranger, _) = key()?;
         let info = signed_info(&stranger)?;
@@ -2766,6 +2778,7 @@ mod tests {
         let hub = Arc::new(Hub::clocked(
             8,
             Arc::new(move || reading.load(Ordering::Relaxed)),
+            crate::sharing::Deadlines::RELAY,
         ));
         for n in 0..4u64 {
             let (receiver, receiver_key) = key()?;
@@ -2811,7 +2824,7 @@ mod tests {
             source_of(parse("2001:db8:1:2:aaaa:bbbb:cccc:dddd")?),
             parse("2001:db8:1:2::")?
         );
-        let hub = Hub::new(8).max_connections_per_address(2);
+        let hub = Hub::new(8, crate::sharing::Deadlines::RELAY).max_connections_per_address(2);
         let a = parse("2001:db8:1:2::1")?;
         let b = parse("2001:db8:1:2::2")?;
         let held = (hub.connection(a), hub.connection(b));
@@ -2855,7 +2868,7 @@ mod tests {
             receptions_per_s: 1_000,
             bytes_per_s: 100_000_000,
         };
-        let hub = Arc::new(Hub::new(8).admitted_rate(rate));
+        let hub = Arc::new(Hub::new(8, crate::sharing::Deadlines::RELAY).admitted_rate(rate));
         let honest: Vec<Identity> = (0..5u8).map(|n| Identity::from_seed([n + 1; 32])).collect();
         let hostile: Vec<Identity> = (0..50u8)
             .map(|n| Identity::from_seed([n + 100; 32]))
@@ -2984,7 +2997,11 @@ mod tests {
     #[test]
     fn an_inflated_feeder_is_shed_by_its_charged_bytes_and_overruns_no_store() -> Result<(), String>
     {
-        let hub = Arc::new(Hub::new(8).cores(64).memory_for_feeders(4, false));
+        let hub = Arc::new(
+            Hub::new(8, crate::sharing::Deadlines::RELAY)
+                .cores(64)
+                .memory_for_feeders(4, false),
+        );
         let rate = hub
             .shed_report()
             .rate
@@ -3130,7 +3147,7 @@ mod tests {
     /// member's copy was refused as a duplicate).
     #[test]
     fn a_batch_dropped_for_its_receivers_pace_is_still_new_to_a_member() -> Result<(), String> {
-        let hub = Arc::new(Hub::new(8));
+        let hub = Arc::new(Hub::new(8, crate::sharing::Deadlines::RELAY));
         let receiver = Identity::from_seed([5; 32]);
         let member = Identity::from_seed([250; 32]);
         let asker = Asker {
@@ -3175,7 +3192,7 @@ mod tests {
             receptions_per_s: 3_000,
             bytes_per_s: 100_000_000,
         };
-        let hub = Arc::new(Hub::new(8).admitted_rate(rate));
+        let hub = Arc::new(Hub::new(8, crate::sharing::Deadlines::RELAY).admitted_rate(rate));
         let resender = Identity::from_seed([5; 32]);
         let other = Identity::from_seed([6; 32]);
         let first = wanted_batch(&resender, 0, 300)?;
@@ -3221,7 +3238,7 @@ mod tests {
             receptions_per_s: 1_000,
             bytes_per_s: 100_000_000,
         };
-        let hub = Arc::new(Hub::new(8).admitted_rate(rate));
+        let hub = Arc::new(Hub::new(8, crate::sharing::Deadlines::RELAY).admitted_rate(rate));
         let proven = Identity::from_seed([9; 32]);
         hub.network()
             .credit
@@ -3267,7 +3284,7 @@ mod tests {
     /// RFC-0181 §9: a batch handed in is charged to `Store::Ingest` until the epochs hold it.
     #[test]
     fn a_batch_is_charged_until_the_epochs_hold_it() -> Result<(), String> {
-        let hub = Arc::new(Hub::new(8));
+        let hub = Arc::new(Hub::new(8, crate::sharing::Deadlines::RELAY));
         let (receiver, receiver_key) = key()?;
         let ingest = hub.budget().gauge(Store::Ingest);
         let epochs = hub.budget().gauge(Store::Epochs);
@@ -3303,7 +3320,7 @@ mod tests {
 
     #[test]
     fn descriptions_are_held_to_bytes_as_well_as_count() -> Result<(), String> {
-        let mut hub = Hub::new(8);
+        let mut hub = Hub::new(8, crate::sharing::Deadlines::RELAY);
         let (stranger, _) = key()?;
         let info = signed_info(&stranger)?;
         let size = info.as_bytes().len();
@@ -3448,7 +3465,7 @@ mod tests {
 
     #[test]
     fn provisional_positions_are_a_stream_of_their_own() -> Result<(), String> {
-        let hub = Hub::new(8);
+        let hub = Hub::new(8, crate::sharing::Deadlines::RELAY);
         let (engine, engine_key) = key()?;
         let provisional = |sequence: u64| {
             Positions::sign_provisional(
@@ -3473,7 +3490,7 @@ mod tests {
 
     #[test]
     fn a_restarted_engine_is_a_new_stream_not_a_replay() -> Result<(), String> {
-        let hub = Hub::new(8);
+        let hub = Hub::new(8, crate::sharing::Deadlines::RELAY);
         let (engine, engine_key) = key()?;
         assert!(hub.publish_positions(1, signed_positions(&engine, 1, 1_000)?, engine_key));
         // A new boot at 0 is forwarded; the old boot far behind is still refused.
@@ -3506,7 +3523,7 @@ mod tests {
     #[test]
     fn a_large_models_parts_go_out_ahead_of_its_manifest_and_forged_ones_never()
     -> Result<(), String> {
-        let hub = Hub::new(8);
+        let hub = Hub::new(8, crate::sharing::Deadlines::RELAY);
         let out = hub.listen(u64::MAX, Filter::Everything);
         let (engine, engine_key) = key()?;
         let model: Vec<u8> = (0..3 * tally_wire::clock_model::PART_LEN as u64)
@@ -3560,7 +3577,7 @@ mod tests {
     #[test]
     fn clock_models_are_forwarded_once_per_id_and_windowed_apart_from_positions()
     -> Result<(), String> {
-        let hub = Hub::new(8);
+        let hub = Hub::new(8, crate::sharing::Deadlines::RELAY);
         let (engine, engine_key) = key()?;
         let model = signed_clock_model(&engine, 1, 1_000)?;
         assert!(hub.publish_clock_model(1, model.clone(), engine_key));
@@ -3577,7 +3594,7 @@ mod tests {
     /// repair, over a link that died between them) wait for it, and go out after it.
     #[test]
     fn positions_go_out_after_the_model_they_cite() -> Result<(), String> {
-        let hub = Hub::new(8);
+        let hub = Hub::new(8, crate::sharing::Deadlines::RELAY);
         let out = hub.listen(u64::MAX, Filter::Everything);
         let (engine, engine_key) = key()?;
         let model = signed_clock_model(&engine, 1, 0)?;
@@ -3641,7 +3658,7 @@ mod tests {
 
     #[test]
     fn a_fault_proof_is_forwarded_once() -> Result<(), String> {
-        let hub = Hub::new(8);
+        let hub = Hub::new(8, crate::sharing::Deadlines::RELAY);
         let (engine, _) = key()?;
         let a = signed_positions(&engine, 1, 0)?;
         let b = signed_positions(&engine, 1, 1)?;
@@ -3693,7 +3710,7 @@ mod tests {
         use tally_wire::Streams;
         const RECEIVERS: usize = RECEIVERS_REMEMBERED;
         // One shard of them all, so every one is held.
-        let mut hub = Hub::new(8);
+        let mut hub = Hub::new(8, crate::sharing::Deadlines::RELAY);
         hub.receivers = Receivers::new(1, RECEIVERS, DESCRIPTION_BYTES_HELD);
         let hub = Arc::new(hub);
         let (stranger, _) = key()?;
@@ -3783,7 +3800,7 @@ mod tests {
     fn a_new_receiver_is_described_in_a_table_full_of_receivers_that_publish() -> Result<(), String>
     {
         // One shard of them all: the order of forgetting, apart from the sharding.
-        let mut hub = Hub::new(8);
+        let mut hub = Hub::new(8, crate::sharing::Deadlines::RELAY);
         hub.receivers = Receivers::new(1, RECEIVERS_REMEMBERED, DESCRIPTION_BYTES_HELD);
         let hub = Arc::new(hub);
         let (stranger, _) = key()?;

@@ -330,11 +330,14 @@ mod tests {
         // The linked relay hosts ten feeders and vouches for the client; the serving relay has
         // corroborated those feeders first-hand, and rations its clients.
         let linked_hub = Arc::new(
-            Hub::new(8)
+            Hub::new(8, tally_relay::sharing::Deadlines::RELAY)
                 .max_upload(Cap::bytes_per_sec(1 << 30))
                 .vouching_for([client.public(), stranger.public()]),
         );
-        let serving_hub = Arc::new(Hub::new(8).max_upload(Cap::bytes_per_sec(1 << 30)));
+        let serving_hub = Arc::new(
+            Hub::new(8, tally_relay::sharing::Deadlines::RELAY)
+                .max_upload(Cap::bytes_per_sec(1 << 30)),
+        );
         serving_hub.network().credit.set_upload_cap(1 << 30);
         linked_hub.network().credit.adopt_identity(linked.public());
         for _ in 0..10 {

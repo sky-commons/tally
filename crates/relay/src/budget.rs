@@ -117,7 +117,8 @@ pub enum Store {
     /// and its signed bytes (`Batch::owned_by`). However many stages hold them, neither is charged
     /// again: each holder charges only what it allocates itself. Its window is the longest any
     /// holder keeps a decode (`decoded_window_ms`), and on a relay with sharing members the time
-    /// the signed bytes outlive their decode in the groups (`sharing::member::HORIZON_MS`).
+    /// the signed bytes outlive their decode in the groups (`sharing::Deadlines::horizon_ms`, a
+    /// relay's).
     Decoded,
 }
 
@@ -385,7 +386,9 @@ impl PerFeeder {
         // The signed bytes the rate admits with them, at most (`ingest::rate_cost`).
         let signed = charged / crate::ingest::CHARGED_PER_SIGNED;
         let records = crate::cores::RECORDS_PER_PLANNED_FEEDER as usize;
-        let horizon_ms = crate::sharing::member::HORIZON_MS as usize;
+        // A relay's horizon: the plan is a relay's. A test hub declaring longer deadlines holds
+        // its groups longer than planned, bounded still by the same gauge.
+        let horizon_ms = crate::sharing::Deadlines::RELAY.horizon_ms() as usize;
         let decoded_ms = decoded_window_ms(holds_raw) as usize;
         Self {
             // What the sharing groups allocate themselves over the repair horizon, on a relay
@@ -3228,7 +3231,7 @@ mod tests {
         // with it (its charged bytes over `CHARGED_PER_SIGNED`) for the rest of the horizon:
         // more than a relay alone, less than the whole decode over the horizon.
         let window = decoded_window_ms(false) as usize;
-        let horizon = crate::sharing::member::HORIZON_MS as usize;
+        let horizon = crate::sharing::Deadlines::RELAY.horizon_ms() as usize;
         let signed = PLANNED_CHARGED_BYTES_PER_SEC / crate::ingest::CHARGED_PER_SIGNED;
         assert_eq!(
             shared.per_rate.decoded,

@@ -245,7 +245,7 @@ async fn relay(
     let address = listener.local_addr().map_err(text)?;
     // Every feeder here comes from loopback: more than one host's share of connections.
     let hub = Arc::new(
-        Hub::clocked(8, clock.clock())
+        Hub::clocked(8, clock.clock(), tally_relay::sharing::Deadlines::RELAY)
             .accepting_relays(relays.iter().copied())
             .max_connections_per_address(64)
             .staged(RELAY_THREADS)?,
@@ -704,7 +704,7 @@ async fn offering(
         address: listener.local_addr().map_err(text)?.to_string(),
     };
     let hub = Arc::new(
-        Hub::clocked(64, clock.clock())
+        Hub::clocked(64, clock.clock(), tally_relay::sharing::Deadlines::RELAY)
             .advertising(vec![address.clone()])
             .accepting_relays(relays.iter().copied())
             .max_connections_per_address(256)
@@ -793,7 +793,7 @@ async fn member(
     // Subscribers here: the client, the other relays' one-hop raw links (one per chunk of the
     // border band) and their directory checks.
     let hub = Arc::new(
-        Hub::clocked(64, clock.clock())
+        Hub::clocked(64, clock.clock(), tally_relay::sharing::Deadlines::RELAY)
             .advertising(vec![address.clone()])
             .accepting_relays(relays.iter().copied())
             .max_connections_per_address(256)
