@@ -16,6 +16,7 @@ use tally_feed::config::{Config, Key};
 use tally_relay::hub::Hub;
 use tally_relay::link;
 use tally_relay::mlat_host::{MlatHost, MlatReport};
+use tally_relay::sharing::Deadlines;
 use tally_wire::batch::ReceiverInfoContent;
 use tally_wire::beast::Decoder;
 use tally_wire::noise::{self, Session};
@@ -135,7 +136,7 @@ async fn a_receivers_frames_reach_both_outputs_signed_and_unchanged() -> Result 
     let sent = frames(500)?;
     let (publishing, ready) = tokio::sync::watch::channel(false);
     let source = readsb(sent.clone(), ready).await?;
-    let relay = relay(Hub::new(8)).await?;
+    let relay = relay(Hub::new(8, Deadlines::RELAY)).await?;
     let mut subscriber = subscribe(&relay).await?;
     let mut beast = TcpStream::connect(relay.beast_out).await.map_err(text)?;
 
@@ -243,7 +244,7 @@ fn batch(identity: &Identity, sequence: u64) -> Result<Batch> {
 
 #[tokio::test]
 async fn a_feeder_publishing_someone_elses_batch_is_cut_off_and_nothing_is_forwarded() -> Result {
-    let relay = relay(Hub::new(8)).await?;
+    let relay = relay(Hub::new(8, Deadlines::RELAY)).await?;
     let mut subscriber = subscribe(&relay).await?;
     let impostor = Identity::generate().map_err(text)?;
     let victim = Identity::generate().map_err(text)?;
@@ -272,7 +273,7 @@ async fn a_feeder_publishing_someone_elses_batch_is_cut_off_and_nothing_is_forwa
 
 #[tokio::test]
 async fn a_batch_arriving_twice_is_forwarded_once() -> Result {
-    let relay = relay(Hub::new(8)).await?;
+    let relay = relay(Hub::new(8, Deadlines::RELAY)).await?;
     let mut subscriber = subscribe(&relay).await?;
     let receiver = Identity::generate().map_err(text)?;
     let once = batch(&receiver, 0)?;
@@ -302,7 +303,7 @@ async fn a_stalled_subscriber_is_dropped_and_the_others_keep_every_batch() -> Re
     // stops reading falls behind quickly, and an ingest ceiling far above the flood this feeder
     // sends to make that happen.
     let relay = relay(
-        Hub::new(8)
+        Hub::new(8, Deadlines::RELAY)
             .queue_bytes(1 << 20)
             .max_feeder_bytes_per_sec(1 << 30),
     )
@@ -539,7 +540,7 @@ fn at(lat: f64, lon: f64) -> Location {
 
 #[tokio::test]
 async fn a_regional_subscriber_hears_only_receivers_inside_its_region() -> Result {
-    let relay = relay(Hub::new(8)).await?;
+    let relay = relay(Hub::new(8, Deadlines::RELAY)).await?;
     let palo_alto = at(37.44, -122.14);
     let inside = Identity::generate().map_err(text)?;
     let outside = Identity::generate().map_err(text)?;
@@ -604,7 +605,7 @@ async fn a_regional_subscriber_hears_only_receivers_inside_its_region() -> Resul
 
 #[tokio::test]
 async fn two_receivers_hearing_one_message_are_one_copy_in_the_relays_signed_stream() -> Result {
-    let relay = relay(Hub::new(8)).await?;
+    let relay = relay(Hub::new(8, Deadlines::RELAY)).await?;
     let beacon = Identity::generate().map_err(text)?;
     let _beacon_feed = described_feeder(&relay, &beacon, None).await?;
     let (mut subscriber, _) = subscribed(
@@ -754,7 +755,7 @@ impl MlatHost for Scripted {
 
 /// A relay hosting `mlat`, under `identity`.
 async fn relay_hosting(identity: Identity, mlat: Arc<Scripted>) -> Result<Relay> {
-    let hub = Hub::new(8);
+    let hub = Hub::new(8, Deadlines::RELAY);
     hub.network().host_mlat(mlat);
     relay_as(hub, identity).await
 }
@@ -821,7 +822,7 @@ async fn a_relays_own_mlat_reaches_the_subscribers_of_each_stream() -> Result {
 /// standalone path; a feeder's; a subscriber's) is cut off, and nothing it sent is forwarded.
 #[tokio::test]
 async fn no_session_but_a_member_publishes_positions_models_or_parts() -> Result {
-    let relay = relay(Hub::new(8)).await?;
+    let relay = relay(Hub::new(8, Deadlines::RELAY)).await?;
     let beacon = Identity::generate().map_err(text)?;
     let _beacon_feed = described_feeder(&relay, &beacon, None).await?;
     let (mut subscriber, _) = subscribed(
@@ -945,7 +946,7 @@ fn clock_model(engine: &Identity, sequence: u64) -> Result<ClockModel> {
 #[tokio::test]
 async fn a_fault_proof_from_anyone_is_checked_then_forwarded_and_a_false_one_ends_the_session()
 -> Result {
-    let relay = relay(Hub::new(8)).await?;
+    let relay = relay(Hub::new(8, Deadlines::RELAY)).await?;
     let beacon = Identity::generate().map_err(text)?;
     let _beacon_feed = described_feeder(&relay, &beacon, None).await?;
     let (mut listener, _) = subscribed(
@@ -1014,7 +1015,7 @@ async fn at_capacity_a_subscriber_is_redirected_to_the_advertised_relays() -> Re
             address: "relay-b.example:10900".to_owned(),
         },
     ];
-    let relay = relay(Hub::new(1).advertising(hints.clone())).await?;
+    let relay = relay(Hub::new(1, Deadlines::RELAY).advertising(hints.clone())).await?;
     let beacon = Identity::generate().map_err(text)?;
     // A feeder is offered the same relays as soon as it connects.
     let mut feed = described_feeder(&relay, &beacon, None).await?;
@@ -1062,7 +1063,7 @@ async fn told(session: &mut Session<TcpStream>) -> Result<Option<Record>> {
 #[tokio::test]
 async fn a_key_the_operator_did_not_accept_as_a_relay_is_refused() -> Result {
     let accepted = Identity::generate().map_err(text)?;
-    let relay = relay(Hub::new(8).accepting_relays([accepted.public()])).await?;
+    let relay = relay(Hub::new(8, Deadlines::RELAY).accepting_relays([accepted.public()])).await?;
     let mut subscriber = subscribe(&relay).await?;
     let stranger = Identity::generate().map_err(text)?;
     let mut session = connect(&relay, &stranger, Role::Relay).await?;
@@ -1102,7 +1103,7 @@ async fn a_key_the_operator_did_not_accept_as_a_relay_is_refused() -> Result {
 async fn a_batch_replayed_after_its_hash_is_forgotten_is_not_forwarded() -> Result {
     // A hash window short enough to pass several times inside the test.
     let window = Duration::from_millis(50);
-    let relay = relay(Hub::new(8).remembering_hashes_for(window)).await?;
+    let relay = relay(Hub::new(8, Deadlines::RELAY).remembering_hashes_for(window)).await?;
     let mut subscriber = subscribe(&relay).await?;
     let receiver = Identity::generate().map_err(text)?;
     let mut feed = connect(&relay, &receiver, Role::Feeder).await?;
@@ -1138,7 +1139,7 @@ async fn a_batch_replayed_after_its_hash_is_forgotten_is_not_forwarded() -> Resu
 
 #[tokio::test]
 async fn a_relays_own_batch_is_never_forwarded_as_a_receivers() -> Result {
-    let relay = relay(Hub::new(8)).await?;
+    let relay = relay(Hub::new(8, Deadlines::RELAY)).await?;
     let mut subscriber = subscribe(&relay).await?;
     let feeder = Identity::generate().map_err(text)?;
     let mut session = connect(&relay, &feeder, Role::Feeder).await?;
@@ -1171,7 +1172,7 @@ async fn a_relays_own_batch_is_never_forwarded_as_a_receivers() -> Result {
 
 #[tokio::test]
 async fn a_subscribe_naming_too_many_regions_ends_the_session() -> Result {
-    let relay = relay(Hub::new(8)).await?;
+    let relay = relay(Hub::new(8, Deadlines::RELAY)).await?;
     let mut session = subscribe(&relay).await?;
     let regions = (0..65)
         .map(|n| Region::containing(&at(f64::from(n) - 32.0, 0.0), 3).map_err(text))
@@ -1198,7 +1199,7 @@ async fn a_subscribe_naming_too_many_regions_ends_the_session() -> Result {
 /// relay is full, which would excuse a relay told it its shortfalls (`link::End::Full`).
 #[tokio::test]
 async fn a_feeder_over_its_ingest_ceiling_is_told_it_is_over_and_dropped() -> Result {
-    let relay = relay(Hub::new(8).max_feeder_bytes_per_sec(1)).await?;
+    let relay = relay(Hub::new(8, Deadlines::RELAY).max_feeder_bytes_per_sec(1)).await?;
     let receiver = Identity::generate().map_err(text)?;
     let mut feed = connect(&relay, &receiver, Role::Feeder).await?;
     let big: Vec<Observation> = frames(2_000)?.iter().map(Observation::from_beast).collect();
@@ -1240,7 +1241,7 @@ async fn a_feeder_over_its_ingest_ceiling_is_told_it_is_over_and_dropped() -> Re
 
 #[tokio::test]
 async fn beyond_the_connection_cap_a_connection_is_closed_before_its_handshake() -> Result {
-    let relay = relay(Hub::new(8).max_connections(1)).await?;
+    let relay = relay(Hub::new(8, Deadlines::RELAY).max_connections(1)).await?;
     let beacon = Identity::generate().map_err(text)?;
     let mut held = described_feeder(&relay, &beacon, None).await?;
     held.writer.send(&[Record::Heartbeat]).await.map_err(text)?;
@@ -1253,7 +1254,7 @@ async fn beyond_the_connection_cap_a_connection_is_closed_before_its_handshake()
 
 #[tokio::test]
 async fn a_subscribe_sent_with_hello_decides_the_first_byte() -> Result {
-    let relay = relay(Hub::new(8)).await?;
+    let relay = relay(Hub::new(8, Deadlines::RELAY)).await?;
     let palo_alto = at(37.44, -122.14);
     let outside = Identity::generate().map_err(text)?;
     let mut outside_feed = described_feeder(&relay, &outside, Some(at(51.5, -0.12))).await?;
@@ -1315,7 +1316,7 @@ async fn a_subscribe_sent_with_hello_decides_the_first_byte() -> Result {
 #[tokio::test]
 async fn beyond_its_addresss_cap_a_connection_is_closed_before_its_handshake_and_others_connect()
 -> Result {
-    let relay = relay(Hub::new(8)).await?;
+    let relay = relay(Hub::new(8, Deadlines::RELAY)).await?;
     // Sixteen connections from one address that never begin a handshake hold its whole share.
     let mut held = Vec::new();
     for _ in 0..tally_relay::hub::DEFAULT_MAX_CONNECTIONS_PER_ADDRESS {
@@ -1355,7 +1356,7 @@ async fn a_feeder_is_told_its_rate_limit_and_the_relays_hints_first() -> Result 
     };
     let ceiling = 100_000;
     let relay = relay(
-        Hub::new(8)
+        Hub::new(8, Deadlines::RELAY)
             .advertising(vec![hint.clone()])
             .max_feeder_bytes_per_sec(ceiling),
     )
@@ -1388,7 +1389,7 @@ async fn a_feeder_beyond_the_memory_budget_is_refused_at_its_hello() -> Result {
         key: Identity::generate().map_err(text)?.public(),
         address: "other.example:10900".to_owned(),
     };
-    let hub = Hub::new(8)
+    let hub = Hub::new(8, Deadlines::RELAY)
         .advertising(vec![hint.clone()])
         .memory_for_feeders(1, false);
     assert_eq!(hub.budget().ceiling(), 1);
@@ -1430,7 +1431,7 @@ async fn a_feeder_beyond_the_memory_budget_is_refused_at_its_hello() -> Result {
 #[tokio::test]
 async fn a_model_fault_proof_is_checked_then_forwarded_and_a_false_one_ends_the_session() -> Result
 {
-    let relay = relay(Hub::new(8)).await?;
+    let relay = relay(Hub::new(8, Deadlines::RELAY)).await?;
     let beacon = Identity::generate().map_err(text)?;
     let _beacon_feed = described_feeder(&relay, &beacon, None).await?;
     let (mut listener, _) = subscribed(
@@ -1487,7 +1488,7 @@ async fn a_model_fault_proof_is_checked_then_forwarded_and_a_false_one_ends_the_
 /// signed, naming the query's nonce. What the answers declare is each duty's.
 #[tokio::test]
 async fn a_probe_and_a_delivery_query_are_answered_signed_by_the_relay() -> Result {
-    let relay = relay(Hub::new(8)).await?;
+    let relay = relay(Hub::new(8, Deadlines::RELAY)).await?;
     let feeder = Identity::generate().map_err(text)?;
     let stream = TcpStream::connect(relay.address).await.map_err(text)?;
     let mut session = noise::connect_with(
@@ -1558,17 +1559,19 @@ async fn a_probe_and_a_delivery_query_are_answered_signed_by_the_relay() -> Resu
 }
 
 /// A relay that takes `areas`, advertising its own address so its offers can be verified, on
-/// network `asn`, accepting `relays` on directory links.
+/// network `asn`, accepting `relays` on directory links, judging the members it shares with by
+/// `deadlines`.
 async fn taking(
     identity: Identity,
     areas: &[Region],
     asn: u32,
     relays: &[PublicKey],
+    deadlines: Deadlines,
 ) -> Result<(Relay, Arc<Hub>)> {
     let listener = TcpListener::bind("127.0.0.1:0").await.map_err(text)?;
     let address = listener.local_addr().map_err(text)?;
     let hub = Arc::new(
-        Hub::new(8)
+        Hub::new(8, deadlines)
             .advertising(vec![RelayAddress {
                 key: identity.public(),
                 address: address.to_string(),
@@ -1606,10 +1609,19 @@ async fn taking(
 /// (§2.6, "it is not demoted for it"), judged relay by relay: the full relay
 /// itself, which still takes the group's data over the session it admitted, and the second relay
 /// each receipt a judged window; the third, the origin of the only feed, is owed nothing and
-/// receipts none; every relay's judge weighed a window that could have demoted (`member::Stats::judged`), and no relay files a shortfall or demotes another.
+/// receipts none; every relay's judge weighed a window that could have demoted
+/// (`member::Stats::judged`), and no relay files a shortfall or demotes another.
+///
+/// The relays judge one another by [`PATIENT`], not a relay's deadlines: the links are real and
+/// the clock is the machine's, so under a relay's 4 s receipt grace a machine busy enough (a
+/// four-core runner running two test binaries at once) delivers a record late and a shortfall is
+/// filed for the machine's load, not for routing around. That a late or missing delivery is
+/// filed under a relay's deadlines is the sharing tests' to show, on the simulation's clock
+/// (`sharing::tests`: `a_member_that_does_not_forward_is_reported_and_demoted`,
+/// `a_slow_member_is_reported_by_a_relays_deadlines_and_not_by_patient_ones`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_relay_whose_members_are_full_is_routed_around_and_the_data_still_arrives() -> Result {
-    use tally_relay::sharing::member::{JUDGE_AFTER_MS, RECEIPT_GRACE_MS, RECEIPT_WINDOW_SECONDS};
+    use tally_relay::sharing::member::RECEIPT_WINDOW_SECONDS;
     let place = at(33.749, -84.388);
     let area = tally_wire::rendezvous::area_of(&place).map_err(text)?;
     let [full, next, third] = [
@@ -1618,9 +1630,9 @@ async fn a_relay_whose_members_are_full_is_routed_around_and_the_data_still_arri
         Identity::generate().map_err(text)?,
     ];
     let joining = [next.public(), third.public()];
-    let (_, full_hub) = taking(full.clone(), &[area], 64_531, &joining).await?;
-    let (next_relay, next_hub) = taking(next.clone(), &[area], 64_532, &[]).await?;
-    let (third_relay, third_hub) = taking(third.clone(), &[area], 64_533, &[]).await?;
+    let (_, full_hub) = taking(full.clone(), &[area], 64_531, &joining, PATIENT).await?;
+    let (next_relay, next_hub) = taking(next.clone(), &[area], 64_532, &[], PATIENT).await?;
+    let (third_relay, third_hub) = taking(third.clone(), &[area], 64_533, &[], PATIENT).await?;
     // The full relay's member pool held, every session its plan admits but one.
     let mut held = Vec::new();
     while held.len() + 1 < full_hub.budget().members() {
@@ -1668,7 +1680,7 @@ async fn a_relay_whose_members_are_full_is_routed_around_and_the_data_still_arri
     let mut feed = described_feeder(&third_relay, &feeder, Some(place)).await?;
     let mut subscriber = subscribe(&next_relay).await?;
     // Twelve seconds of batches: at least one whole receipt window, its receipts and its judgment
-    // (`sharing::member::RECEIPT_WINDOW_SECONDS`, `RECEIPT_GRACE_MS`, `JUDGE_AFTER_MS`) fall
+    // (`sharing::member::RECEIPT_WINDOW_SECONDS`, and `PATIENT`'s grace and judgment) fall
     // inside the run, and the full relay's 60 s wait outlasts it.
     let sent = 120;
     let author = feeder.public();
@@ -1701,8 +1713,11 @@ async fn a_relay_whose_members_are_full_is_routed_around_and_the_data_still_arri
     assert_eq!(got, sent);
     // Past the judgment of the last window the feed reached.
     let window_ms = RECEIPT_WINDOW_SECONDS * 1000;
-    let judged_at =
-        fed_until - fed_until % window_ms + window_ms + RECEIPT_GRACE_MS + JUDGE_AFTER_MS + 1_000;
+    let judged_at = fed_until - fed_until % window_ms
+        + window_ms
+        + PATIENT.receipt_grace_ms
+        + PATIENT.judge_after_ms
+        + 1_000;
     let wait = judged_at.saturating_sub(tally_relay::network::wall_ms());
     tokio::time::sleep(Duration::from_millis(wait)).await;
 
@@ -1752,6 +1767,22 @@ async fn a_relay_whose_members_are_full_is_routed_around_and_the_data_still_arri
     drop(held);
     Ok(())
 }
+
+/// What the route-around test's relays judge one another by: a relay's deadlines
+/// (`Deadlines::RELAY`) each stretched past any delay a loaded machine adds to a delivery between
+/// relays on one host, so a shortfall or demotion there is routing around failing and never the
+/// machine's share of the CPU. A second is settled (no repair asked, and what came from above a
+/// full parent counted as routed past it) 8 s after it ends, not 1.5 s; receipts are signed 15 s
+/// after their window, not 4 s; judged 3 s after that, not 2 s; and a refusal's span is
+/// stretched 5 s, not 1 s. Bounded above by the full relay's 60 s wait
+/// (`link::MEMBERS_FULL_RETRY_SECS`), which the run, the window and its judgment must stay inside:
+/// a relay that dialled it again would be turned away twice.
+const PATIENT: Deadlines = Deadlines {
+    repair_after_ms: 8_000,
+    receipt_grace_ms: 15_000,
+    judge_after_ms: 3_000,
+    route_slack_ms: 5_000,
+};
 
 /// A batch of `identity`'s stamped `wall_ms`, as a live feeder sends one.
 fn fresh_batch(identity: &Identity, sequence: u64, wall_ms: u64) -> Result<Batch> {

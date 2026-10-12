@@ -201,25 +201,28 @@ fn check(config: &Config) -> Result<(), String> {
 fn prepare(config: &Config, identity: &Identity) -> Result<(Arc<Hub>, bool), String> {
     let hosts_mlat = config.relay_duties && config.mlat;
     let hub = Arc::new(
-        Hub::new(config.max_subscribers)
-            .advertising(config.hints())
-            .accepting_relays(config.accept_relays.iter().copied())
-            .vouching_for(config.clients.iter().copied())
-            .max_connections(config.max_connections)
-            .max_connections_per_address(config.max_connections_per_address)
-            .max_feeder_bytes_per_sec(config.max_feeder_bytes_per_sec)
-            .max_member_bytes_per_sec(config.max_member_bytes_per_sec)
-            .max_upload(config.max_upload)
-            .memory(config.memory, hosts_mlat)
-            // Its areas, which the member sessions are planned from (`budget::members_for`).
-            .taking(config.areas.clone())
-            // Its cores, which bound the connections, the rate and the MLAT seats it admits
-            // (`budget::Plan::admit`).
-            .cores(config.cores)
-            // Each stage on the threads the load it admits needs (`cores::threads_for`), and
-            // MLAT's steps on what the cores leave them (`cores::mlat_threads_for`). A stage
-            // short of a thread would close no epoch: the relay fails to start instead.
-            .staged_as_planned()?,
+        Hub::new(
+            config.max_subscribers,
+            tally_relay::sharing::Deadlines::RELAY,
+        )
+        .advertising(config.hints())
+        .accepting_relays(config.accept_relays.iter().copied())
+        .vouching_for(config.clients.iter().copied())
+        .max_connections(config.max_connections)
+        .max_connections_per_address(config.max_connections_per_address)
+        .max_feeder_bytes_per_sec(config.max_feeder_bytes_per_sec)
+        .max_member_bytes_per_sec(config.max_member_bytes_per_sec)
+        .max_upload(config.max_upload)
+        .memory(config.memory, hosts_mlat)
+        // Its areas, which the member sessions are planned from (`budget::members_for`).
+        .taking(config.areas.clone())
+        // Its cores, which bound the connections, the rate and the MLAT seats it admits
+        // (`budget::Plan::admit`).
+        .cores(config.cores)
+        // Each stage on the threads the load it admits needs (`cores::threads_for`), and
+        // MLAT's steps on what the cores leave them (`cores::mlat_threads_for`). A stage
+        // short of a thread would close no epoch: the relay fails to start instead.
+        .staged_as_planned()?,
     );
     // A relay whose memory cannot hold its members' pool and a feeder beside it would refuse every
     // Hello, or its members: it refuses to start instead.

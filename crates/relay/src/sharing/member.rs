@@ -49,6 +49,15 @@
 //! is scheduled for when its next duty falls (now, while it holds records; else the next seed
 //! rotation or anti-entropy ask while it has other members, and the end of a demotion), so a tick
 //! with nothing due does no work whatever the groups held.
+//!
+//! **Deadlines are given, not read.** A verdict on a deliverer (a receipt short of what it owed, a
+//! shortfall, a demotion) is a comparison of when things arrived against a deadline: what came
+//! after the receipt grace is not counted to whoever delivered it. The deadlines are a value the
+//! member is built with (`Deadlines`), never a constant inside the logic: a relay passes
+//! `Deadlines::RELAY`, and a test that judges a delivery over real links declares its own, past
+//! anything the machine running it can delay, so its verdict follows what was delivered and not
+//! the machine's load. Everything that follows from them (the horizon what is held for, the
+//! windows a refusal covers) is read from the same value.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -74,8 +83,6 @@ use super::stripes::{DATA_STRIPES, Layout, PARITY_STRIPE, STRIPES, data_stripe, 
 pub const MANIFEST_DELAY_MS: u64 = 200;
 /// After a second ends, when a member first tries to rebuild a stripe it lacks from parity.
 pub const REBUILD_AFTER_MS: u64 = 700;
-/// After a second ends, when a member first asks another for what it still lacks.
-pub const REPAIR_AFTER_MS: u64 = 1_500;
 /// The least time between two asks for repair in one group.
 pub const REPAIR_INTERVAL_MS: u64 = 500;
 /// How often a member compares holdings with another even with nothing known missing, so a
@@ -84,20 +91,61 @@ pub const ANTI_ENTROPY_MS: u64 = 5_000;
 /// The seconds one receipt covers. Divides `SEED_ROTATION_SECONDS`, so rotations fall between
 /// windows.
 pub const RECEIPT_WINDOW_SECONDS: u64 = 5;
-/// After a window ends, how long a child waits (for rebuilds and repairs to arrive from its
-/// parent) before signing its receipts.
-pub const RECEIPT_GRACE_MS: u64 = 4_000;
-/// After the receipts of a window, how long before the group judges it.
-pub const JUDGE_AFTER_MS: u64 = 2_000;
-/// How far back a member holds records and manifests: as long as its own duties need them, and no
-/// longer. A record of a window's first second is owed in that window's receipts, signed
-/// `RECEIPT_GRACE_MS` after the window ends, judged `JUDGE_AFTER_MS` after that, and a member short
-/// of it asks for repair from `REPAIR_AFTER_MS` on; so the horizon is the window, the grace, the
-/// judgment and the repair delay, 12.5 s, rounded up to whole seconds. It is the one batch byte
-/// store's window (RFC-0181 §6): what a relay holds of a batch's bytes after it is passed on.
-pub const HORIZON_MS: u64 =
-    RECEIPT_WINDOW_SECONDS * 1000 + RECEIPT_GRACE_MS + JUDGE_AFTER_MS + REPAIR_AFTER_MS;
-pub const HORIZON_SECONDS: u64 = HORIZON_MS.div_ceil(1000);
+
+/// The deadlines a member judges its deliverers by: what arrives after one is not counted to who
+/// delivered it, so a member that delivered late is reported short (a shortfall) and, judged,
+/// demoted. They are a value the member is built with (`Member::new`, through `Sharing::new` and
+/// the hub), never read inside its logic, so no caller gets them by default: a relay's are
+/// [`Deadlines::RELAY`], and a test that judges deliveries over real links and the machine's clock
+/// declares its own, past anything the machine running it can delay, so the verdict it asserts
+/// follows what was delivered and not how loaded the machine is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Deadlines {
+    /// After a second ends, when it is settled: a member first asks another for what it still
+    /// lacks of it, and what reached it before then from above its parent in the stripe's tree (or
+    /// from the record's origin) was pushed past the parent, which was being routed around, and not
+    /// a repair (`routed_past`).
+    pub repair_after_ms: u64,
+    /// After a window ends, how long a child waits (for rebuilds and repairs to arrive from its
+    /// parent) before signing its receipts. What its deliverer delivered later is not on them.
+    pub receipt_grace_ms: u64,
+    /// After the receipts of a window, how long before the group judges it. A report (a
+    /// shortfall, or a deliverer's own starvation, which excuses it) that arrives later is not
+    /// weighed.
+    pub judge_after_ms: u64,
+    /// How long past a refusal's wait the relay refused may still be routing around this one: its
+    /// wait starts when the `Goodbye` reaches it, a link's latency after this relay sent it.
+    pub route_slack_ms: u64,
+}
+
+impl Deadlines {
+    /// A relay's.
+    pub const RELAY: Self = Self {
+        repair_after_ms: 1_500,
+        receipt_grace_ms: 4_000,
+        judge_after_ms: 2_000,
+        route_slack_ms: 1_000,
+    };
+
+    /// How far back a member holds records and manifests: as long as its own duties need them, and
+    /// no longer. A record of a window's first second is owed in that window's receipts, signed
+    /// `receipt_grace_ms` after the window ends, judged `judge_after_ms` after that, and a member
+    /// short of it asks for repair from `repair_after_ms` on; so the horizon is the window, the
+    /// grace, the judgment and the repair delay (a relay's, 12.5 s). A relay's is the one batch
+    /// byte store's window (RFC-0181 §6): what it holds of a batch's bytes after it is passed on.
+    pub const fn horizon_ms(self) -> u64 {
+        RECEIPT_WINDOW_SECONDS * 1000
+            + self.receipt_grace_ms
+            + self.judge_after_ms
+            + self.repair_after_ms
+    }
+
+    /// The horizon rounded up to whole seconds: what is held is kept by its second.
+    pub const fn horizon_seconds(self) -> u64 {
+        self.horizon_ms().div_ceil(1000)
+    }
+}
+
 /// The most bytes one answer to a `HaveSummary` carries. It travels as one send over this relay's
 /// member link to the asker, so it is half what may wait for one link
 /// (`peers::WAITING_PER_LINK_BYTES` is twice it): a whole page and its records' overhead fit beside
@@ -392,15 +440,16 @@ struct TurnedAway {
 
 impl TurnedAway {
     /// It routed around this relay from `start_ms` to `end_ms`: put in its place by start, and
-    /// merged with every span it touches, counting the slack, which covers the same moments. A
-    /// refusal comes after the last as a rule, so this is a merge into the last span or a push.
-    fn add(&mut self, start_ms: u64, end_ms: u64) {
+    /// merged with every span it touches, counting the slack (`Deadlines::route_slack_ms`), which
+    /// covers the same moments. A refusal comes after the last as a rule, so this is a merge into
+    /// the last span or a push.
+    fn add(&mut self, start_ms: u64, end_ms: u64, slack_ms: u64) {
         let at = self.spans.partition_point(|(start, _)| *start <= start_ms);
         self.spans.insert(at, (start_ms, end_ms));
         let mut merged: Vec<(u64, u64)> = Vec::with_capacity(self.spans.len());
         for (start, end) in self.spans.drain(..) {
             match merged.last_mut() {
-                Some((_, last)) if start <= last.saturating_add(ROUTE_SLACK_MS) => {
+                Some((_, last)) if start <= last.saturating_add(slack_ms) => {
                     *last = (*last).max(end);
                 }
                 _ => merged.push((start, end)),
@@ -409,22 +458,20 @@ impl TurnedAway {
         self.spans = merged;
     }
 
-    /// Whether it was routing around this relay at any time from `from_ms` to `to_ms`.
-    fn during(&self, from_ms: u64, to_ms: u64) -> bool {
+    /// Whether it was routing around this relay at any time from `from_ms` to `to_ms`, each span
+    /// counted with its slack.
+    fn during(&self, from_ms: u64, to_ms: u64, slack_ms: u64) -> bool {
         // The spans are apart and in order, so their ends are too: the first that reaches
         // `from_ms` is the only one that may.
         let first = self
             .spans
-            .partition_point(|(_, end)| end.saturating_add(ROUTE_SLACK_MS) < from_ms);
+            .partition_point(|(_, end)| end.saturating_add(slack_ms) < from_ms);
         self.spans
             .get(first)
             .is_some_and(|(start, _)| *start <= to_ms)
     }
 }
 
-/// How long past a refusal's wait the relay refused may still be routing around this one: its
-/// wait starts when the `Goodbye` reaches it, a link's latency after this relay sent it.
-const ROUTE_SLACK_MS: u64 = 1_000;
 /// The longest record a group carries, encoded: what one record adds to a parity slice at most.
 const MAX_PIECE_LEN: usize = HEADER_LEN + tally_wire::record::MAX_BODY;
 
@@ -436,6 +483,8 @@ struct HeldParity {
 
 struct Group {
     key: GroupKey,
+    /// The member's deadlines (`Member::new`): every timed verdict of the group reads them.
+    deadlines: Deadlines,
     /// When the tick next visits it (`Member::settle`), if ever.
     due_ms: Option<u64>,
     members: Vec<PublicKey>,
@@ -472,9 +521,10 @@ struct Group {
 }
 
 impl Group {
-    fn new(key: GroupKey, me: PublicKey) -> Self {
+    fn new(key: GroupKey, me: PublicKey, deadlines: Deadlines) -> Self {
         Self {
             key,
+            deadlines,
             due_ms: None,
             members: vec![me],
             leaves_only: Vec::new(),
@@ -573,7 +623,7 @@ impl Group {
             return false;
         }
         let from = (first * 1000).saturating_sub(1000);
-        let to = end * 1000 + RECEIPT_GRACE_MS;
+        let to = end * 1000 + self.deadlines.receipt_grace_ms;
         !self
             .changed_ms
             .iter()
@@ -724,7 +774,7 @@ impl Group {
             wake = wake.min(*until);
         }
         if let Some(changed) = self.changed_ms.iter().min() {
-            wake = wake.min(changed + 2 * HORIZON_SECONDS * 1000 + 1);
+            wake = wake.min(changed + 2 * self.deadlines.horizon_seconds() * 1000 + 1);
         }
         if let Some(at) = self.answered.values().min() {
             wake = wake.min(at + ANSWER_INTERVAL_MS);
@@ -737,6 +787,9 @@ impl Group {
 pub struct Member {
     identity: Identity,
     me: PublicKey,
+    /// What it judges its deliverers by (`Deadlines`), as it was built: each group it holds keeps
+    /// a copy.
+    deadlines: Deadlines,
     groups: BTreeMap<GroupKey, Group>,
     /// The held groups by when the tick next visits them.
     due: BTreeSet<(u64, GroupKey)>,
@@ -761,12 +814,14 @@ pub struct Member {
 }
 
 impl Member {
-    /// A member whose groups hold what `gauge` (the budget's `Store::Batches`) takes.
-    pub fn new(identity: Identity, gauge: Arc<Gauge>) -> Self {
+    /// A member whose groups hold what `gauge` (the budget's `Store::Batches`) takes, judging its
+    /// deliverers by `deadlines` (a relay's `Deadlines::RELAY`).
+    pub fn new(identity: Identity, gauge: Arc<Gauge>, deadlines: Deadlines) -> Self {
         let me = identity.public();
         Self {
             identity,
             me,
+            deadlines,
             groups: BTreeMap::new(),
             due: BTreeSet::new(),
             held: gauge.empty(),
@@ -809,7 +864,7 @@ impl Member {
         let held = self.turned_away.entry(key).or_default();
         let wait = Wait::after(held.last, asked, now_ms);
         held.last = Some(wait);
-        held.add(now_ms, wait.until_ms);
+        held.add(now_ms, wait.until_ms, self.deadlines.route_slack_ms);
     }
 
     /// The spans this relay holds of `key` routing around it (`turned_away`).
@@ -821,18 +876,20 @@ impl Member {
     /// Whether this relay turned `key` away and it was routing around this relay at any time from
     /// `from_ms` to `to_ms`.
     pub fn routed_around_by(&self, key: &PublicKey, from_ms: u64, to_ms: u64) -> bool {
+        let slack_ms = self.deadlines.route_slack_ms;
         self.turned_away
             .get(key)
-            .is_some_and(|held| held.during(from_ms, to_ms))
+            .is_some_and(|held| held.during(from_ms, to_ms, slack_ms))
     }
 
     /// Forgets the refusals no window still to be receipted can overlap, and the waits that no
     /// longer double the next.
     fn forget_turned_away(&mut self, now_ms: u64) {
-        let horizon_ms = now_ms.saturating_sub(2 * HORIZON_MS);
+        let horizon_ms = now_ms.saturating_sub(2 * self.deadlines.horizon_ms());
+        let slack_ms = self.deadlines.route_slack_ms;
         self.turned_away.retain(|_, held| {
             held.spans
-                .retain(|(_, end)| end.saturating_add(ROUTE_SLACK_MS) >= horizon_ms);
+                .retain(|(_, end)| end.saturating_add(slack_ms) >= horizon_ms);
             !held.spans.is_empty() || held.last.is_some_and(|wait| wait.remembered(now_ms))
         });
     }
@@ -982,10 +1039,10 @@ impl Member {
     /// Holds `group` for a message about to be handed in (`receive`), which lets it go again if
     /// the message leaves it with nothing.
     pub fn join(&mut self, group: GroupKey) {
-        let me = self.me;
+        let (me, deadlines) = (self.me, self.deadlines);
         self.groups
             .entry(group)
-            .or_insert_with(|| Group::new(group, me));
+            .or_insert_with(|| Group::new(group, me, deadlines));
     }
 
     /// The origin manifests held of `second`, by group: what the bundle indexes over it digest.
@@ -1023,6 +1080,14 @@ impl Member {
             .is_some_and(|group| group.pieces.contains_key(hash))
     }
 
+    /// Whether `group` holds the parity of the manifest `manifest` (its hash).
+    #[cfg(test)]
+    pub fn holds_parity(&self, group: GroupKey, manifest: &Hash) -> bool {
+        self.groups
+            .get(&group)
+            .is_some_and(|group| group.parity.contains_key(&id_of(manifest)))
+    }
+
     pub fn is_demoted(&self, group: GroupKey, member: &PublicKey) -> bool {
         self.groups
             .get(&group)
@@ -1048,11 +1113,11 @@ impl Member {
         leaves_only: &[PublicKey],
         now_ms: u64,
     ) -> Vec<Outgoing> {
-        let me = self.me;
+        let (me, deadlines) = (self.me, self.deadlines);
         let group = self
             .groups
             .entry(key)
-            .or_insert_with(|| Group::new(key, me));
+            .or_insert_with(|| Group::new(key, me, deadlines));
         let mut members = members.to_vec();
         members.push(me);
         members.sort();
@@ -1103,7 +1168,7 @@ impl Member {
         piece: Piece,
         now_ms: u64,
     ) -> Vec<Outgoing> {
-        let me = self.me;
+        let (me, deadlines) = (self.me, self.deadlines);
         let held = self
             .groups
             .get(&key)
@@ -1114,7 +1179,7 @@ impl Member {
         let group = self
             .groups
             .entry(key)
-            .or_insert_with(|| Group::new(key, me));
+            .or_insert_with(|| Group::new(key, me, deadlines));
         group.own.entry(now_ms / 1000).or_default().insert(hash);
         if held {
             self.settle(key, now_ms);
@@ -1219,7 +1284,7 @@ impl Member {
         // Only a member originates into the group (a demoted one too: it is out of the trees, not
         // the group, and still holds its feeders); each origin has its own share of a second.
         if group.seen.contains_key(&hash)
-            || !in_window(content.second, now_ms)
+            || !in_window(content.second, now_ms, group.deadlines)
             || !(group.members.contains(&origin) || group.demoted.contains_key(&origin))
             || group.manifests.get(&content.second).is_some_and(|by_hash| {
                 by_hash
@@ -1267,7 +1332,7 @@ impl Member {
             .get(&parity.second)
             .is_some_and(|by_hash| by_hash.contains_key(&parity.manifest));
         if !listed
-            || !in_window(parity.second, now_ms)
+            || !in_window(parity.second, now_ms, group.deadlines)
             || !charge(&mut self.held, &mut self.stats, parity.len())
         {
             return Vec::new();
@@ -1293,7 +1358,7 @@ impl Member {
             return Vec::new();
         };
         if group.seen.contains_key(&hash)
-            || !in_window(content.first_second, now_ms)
+            || !in_window(content.first_second, now_ms, group.deadlines)
             || receipt.verify().is_err()
         {
             return Vec::new();
@@ -1682,20 +1747,34 @@ fn rebuild(
                 .filter(|hash| data_stripe(hash) != stripe)
                 .filter_map(|hash| group.pieces.get(hash).map(|held| (*hash, &held.piece)))
                 .collect();
+            // The parity rebuilds the stripe's whole slice: every record the manifest lists in
+            // it, those already held beside those missing. A true parity rebuilds exactly those,
+            // each once; one held is matched and not taken again. Only a slice that is not the
+            // listed records is a false parity: one holding part of the stripe when its parity
+            // came is no reason to let a true parity go (and, its parity let go, to report the
+            // parent that delivered it short).
+            let in_stripe: BTreeSet<Hash> = listed
+                .hashes
+                .iter()
+                .filter(|hash| data_stripe(hash) == stripe)
+                .copied()
+                .collect();
             let mut matched = BTreeSet::new();
             let mut extra = false;
             for bytes in held.parity.rebuild(stripe, &others).unwrap_or_default() {
                 let piece = Piece::from_encoded(bytes);
                 match piece.as_ref().and_then(Piece::hash) {
-                    Some(hash) if missing.contains(&hash) && matched.insert(hash) => {
-                        if let Some(piece) = piece {
+                    Some(hash) if in_stripe.contains(&hash) && matched.insert(hash) => {
+                        if let Some(piece) = piece
+                            && missing.contains(&hash)
+                        {
                             found.push((hash, piece));
                         }
                     }
                     _ => extra = true,
                 }
             }
-            if extra || matched.len() != missing.len() {
+            if extra || matched != in_stripe {
                 false_parity.push(id);
             }
         }
@@ -1750,12 +1829,13 @@ fn receipts(
     stats: &mut Stats,
 ) -> Vec<Outgoing> {
     let me = identity.public();
+    let deadlines = group.deadlines;
     let windows: BTreeSet<u64> = group
         .manifests
         .keys()
         .map(|second| second / RECEIPT_WINDOW_SECONDS)
         .filter(|window| {
-            (window + 1) * RECEIPT_WINDOW_SECONDS * 1000 + RECEIPT_GRACE_MS <= now_ms
+            (window + 1) * RECEIPT_WINDOW_SECONDS * 1000 + deadlines.receipt_grace_ms <= now_ms
                 && !group.receipted.contains(window)
         })
         .collect();
@@ -1779,10 +1859,13 @@ fn receipts(
                     .collect(),
             };
             for deliverer in deliverers.into_iter().filter(|key| *key != me) {
-                if turned_away
-                    .get(&deliverer)
-                    .is_some_and(|held| held.during(first * 1000, end * 1000 + RECEIPT_GRACE_MS))
-                {
+                if turned_away.get(&deliverer).is_some_and(|held| {
+                    held.during(
+                        first * 1000,
+                        end * 1000 + deadlines.receipt_grace_ms,
+                        deadlines.route_slack_ms,
+                    )
+                }) {
                     continue;
                 }
                 let owed = owed_by(group, window, stripe, &me, &deliverer);
@@ -1857,10 +1940,10 @@ fn delivered_by(group: &Group, owed: &[Hash], deliverer: &PublicKey) -> Vec<Hash
 
 /// What `parent` owed this relay in a window's stripe that reached it past the parent first, by
 /// who delivered it, each in the order it came: from a member above the parent in the stripe's
-/// tree, or from the record's origin, before its second settled (`REPAIR_AFTER_MS` after it
-/// ended: no repair is asked for a second before then, so what came sooner was pushed down the
-/// tree, past a parent that was full to the one that pushed it), and before the parent's own copy
-/// if it sent one.
+/// tree, or from the record's origin, before its second settled (`Deadlines::repair_after_ms`
+/// after it ended: no repair is asked for a second before then, so what came sooner was pushed
+/// down the tree, past a parent that was full to the one that pushed it), and before the parent's
+/// own copy if it sent one.
 fn routed_past(
     group: &Group,
     (stripe, epoch): (u8, u64),
@@ -1880,7 +1963,7 @@ fn routed_past(
             .iter()
             .find(|(sender, _)| sender == parent)
             .map_or(u64::MAX, |(_, at)| *at);
-        let before_ms = parent_at.min((listed.second + 1) * 1000 + REPAIR_AFTER_MS);
+        let before_ms = parent_at.min((listed.second + 1) * 1000 + group.deadlines.repair_after_ms);
         if let Some((router, at)) = senders.iter().find(|(sender, at)| {
             sender != me
                 && sender != parent
@@ -1933,12 +2016,15 @@ fn judge(
     demotions: &mut Vec<(GroupKey, PublicKey, u64)>,
     stats: &mut Stats,
 ) {
+    let deadlines = group.deadlines;
     let due: Vec<u64> = group
         .receipted
         .iter()
         .copied()
         .filter(|window| {
-            (window + 1) * RECEIPT_WINDOW_SECONDS * 1000 + RECEIPT_GRACE_MS + JUDGE_AFTER_MS
+            (window + 1) * RECEIPT_WINDOW_SECONDS * 1000
+                + deadlines.receipt_grace_ms
+                + deadlines.judge_after_ms
                 <= now_ms
                 && !group.judged.contains(window)
         })
@@ -2039,11 +2125,12 @@ fn repair(group: &mut Group, me: &PublicKey, now_ms: u64, stats: &mut Stats) -> 
         return Vec::new();
     }
     let now_second = now_ms / 1000;
-    let first = now_second.saturating_sub(HORIZON_SECONDS);
+    let deadlines = group.deadlines;
+    let first = now_second.saturating_sub(deadlines.horizon_seconds());
     let lacking = group
         .manifests
         .range(first..)
-        .take_while(|(second, _)| (*second + 1) * 1000 + REPAIR_AFTER_MS <= now_ms)
+        .take_while(|(second, _)| (*second + 1) * 1000 + deadlines.repair_after_ms <= now_ms)
         .any(|(second, _)| !group.whole(*second));
     let anti_entropy = now_ms >= group.anti_entropy_at_ms;
     if !lacking && !anti_entropy {
@@ -2077,7 +2164,7 @@ fn repair(group: &mut Group, me: &PublicKey, now_ms: u64, stats: &mut Stats) -> 
         let second = first + offset;
         // A second still arriving is not asked for; one with no manifest is, so a manifest that
         // never came is found.
-        let settled = (second + 1) * 1000 + REPAIR_AFTER_MS <= now_ms;
+        let settled = (second + 1) * 1000 + deadlines.repair_after_ms <= now_ms;
         if (!settled || group.whole(second))
             && let Some(byte) = seconds.get_mut(usize::try_from(offset / 8).unwrap_or(0))
         {
@@ -2098,7 +2185,8 @@ fn repair(group: &mut Group, me: &PublicKey, now_ms: u64, stats: &mut Stats) -> 
 
 /// Forgets what is past the horizon. The bytes it let go (records and parities).
 fn forget(group: &mut Group, now_ms: u64) -> usize {
-    let horizon_ms = now_ms.saturating_sub(HORIZON_SECONDS * 1000);
+    let horizon_seconds = group.deadlines.horizon_seconds();
+    let horizon_ms = now_ms.saturating_sub(horizon_seconds * 1000);
     let horizon_second = horizon_ms / 1000;
     let horizon_window = horizon_second / RECEIPT_WINDOW_SECONDS;
     let mut freed = 0;
@@ -2133,7 +2221,7 @@ fn forget(group: &mut Group, now_ms: u64) -> usize {
         .retain(|(window, _, _)| *window >= horizon_window);
     group
         .changed_ms
-        .retain(|changed| *changed + 2 * HORIZON_SECONDS * 1000 >= now_ms);
+        .retain(|changed| *changed + 2 * horizon_seconds * 1000 >= now_ms);
     freed
 }
 
@@ -2154,7 +2242,8 @@ fn release(held: &mut Charge, freed: usize) {
 
 /// Whether a signed `second` is one this relay holds things for: within the horizon behind its
 /// clock, and no further ahead than `SKEW_SECONDS`. Overflow-free for any `second`.
-fn in_window(second: u64, now_ms: u64) -> bool {
+fn in_window(second: u64, now_ms: u64, deadlines: Deadlines) -> bool {
     let now = now_ms / 1000;
-    second.saturating_add(HORIZON_SECONDS) >= now && second <= now.saturating_add(SKEW_SECONDS)
+    second.saturating_add(deadlines.horizon_seconds()) >= now
+        && second <= now.saturating_add(SKEW_SECONDS)
 }

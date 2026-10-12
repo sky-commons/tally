@@ -2862,10 +2862,12 @@ mod tests {
     #[test]
     fn a_withdrawn_cell_is_offered_with_no_stripes() -> Result {
         let identity = Identity::generate().map_err(text)?;
-        let hub = Hub::new(8).advertising(vec![tally_wire::RelayAddress {
-            key: identity.public(),
-            address: "me.example:7450".to_owned(),
-        }]);
+        let hub = Hub::new(8, crate::sharing::Deadlines::RELAY).advertising(vec![
+            tally_wire::RelayAddress {
+                key: identity.public(),
+                address: "me.example:7450".to_owned(),
+            },
+        ]);
         let cell = area()?;
         hub.network().selection.set_taken(vec![cell]);
         let sharing = &hub.network().sharing;
@@ -2940,10 +2942,12 @@ mod tests {
     #[test]
     fn the_relay_offers_what_it_takes_re_signs_and_withdraws() -> Result {
         let identity = Identity::generate().map_err(text)?;
-        let hub = Hub::new(8).advertising(vec![tally_wire::RelayAddress {
-            key: identity.public(),
-            address: "198.51.100.7:7450".to_owned(),
-        }]);
+        let hub = Hub::new(8, crate::sharing::Deadlines::RELAY).advertising(vec![
+            tally_wire::RelayAddress {
+                key: identity.public(),
+                address: "198.51.100.7:7450".to_owned(),
+            },
+        ]);
         let cell = area()?;
         hub.network().selection.set_taken(vec![cell]);
         hub.network().admission.configure(64_496, true);
@@ -3000,10 +3004,12 @@ mod tests {
 
     /// A relay at `address` taking `cell`, its duties on.
     fn own_relay(identity: &Identity, address: &str, cell: Region) -> Hub {
-        let hub = Hub::new(8).advertising(vec![tally_wire::RelayAddress {
-            key: identity.public(),
-            address: address.to_owned(),
-        }]);
+        let hub = Hub::new(8, crate::sharing::Deadlines::RELAY).advertising(vec![
+            tally_wire::RelayAddress {
+                key: identity.public(),
+                address: address.to_owned(),
+            },
+        ]);
         hub.network().selection.set_taken(vec![cell]);
         hub.network().admission.configure(64_496, true);
         hub

@@ -789,7 +789,7 @@ fn the_products_are_routed_by_their_stream_bits_and_the_regional_by_its_cell() -
     let chicago = area_of(&place(41.9, -87.6)).map_err(err)?;
     let batch = regional(&relay, atlanta, 0, BASE_MS, adsb_second(&[1], 0, false))?;
     // The hub routes the relay's own regional batch by the cell it signed.
-    let hub = Hub::new(4);
+    let hub = Hub::new(4, crate::sharing::Deadlines::RELAY);
     let listener = hub.listen(u64::MAX, Filter::Everything);
     hub.publish_own(Record::RegionalBatch(batch.clone()));
     let item = listener.try_recv().ok_or("nothing routed")?;
@@ -1409,7 +1409,7 @@ fn a_session_leaving_gives_its_part_to_those_open() -> Result<()> {
 #[test]
 fn only_a_member_admitted_divides_the_records_share() -> Result<()> {
     use crate::budget::{Budget, Plan};
-    let network = crate::network::Network::new();
+    let network = crate::network::Network::new(crate::sharing::Deadlines::RELAY);
     let mlat = Mlat::new()?;
     let one = |sequence: u64| mlat.solutions(&[0x00c0_0001], BASE_MS, 0, true, sequence);
     let len = one(0)?.as_bytes().len();

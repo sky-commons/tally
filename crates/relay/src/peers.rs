@@ -54,7 +54,7 @@ const WAITING_PER_LINK: usize = 1_024;
 /// the relay plans is planned for its link (`budget::Plan::member_links`), so one slow member holds
 /// no more than this. A link gets one send a network tick (`network::TICK`, 100 ms), a stripe
 /// slice of a kilobyte or so each: some 256 of them, 25 s of sends, far past the point
-/// (`sharing::member::REPAIR_AFTER_MS`) where the member asks again for what it lacks, so a link
+/// (`sharing::Deadlines::repair_after_ms`) where the member asks again for what it lacks, so a link
 /// this far behind holds nothing its member still waits for. (At 1 MiB, a relay taking a base
 /// cell planned 2 GiB for its 2,048 member links alone.) Twice a repair page, which is one send
 /// down this link (`sharing::member::REPAIR_PAGE_BYTES`), so a page always fits.
@@ -467,7 +467,7 @@ mod tests {
             4,
         )
         .map_err(|error| error.to_string())?;
-        let hub = Arc::new(Hub::new(8).taking(vec![area]));
+        let hub = Arc::new(Hub::new(8, crate::sharing::Deadlines::RELAY).taking(vec![area]));
         assert!(hub.budget().member_links().limit() >= WAITING_PER_LINK_BYTES);
         let identity = Identity::generate().map_err(|error| error.to_string())?;
         let peers = Peers::new();
@@ -505,7 +505,7 @@ mod tests {
     /// lasts, and is once it has passed; the other sources are kept meanwhile.
     #[tokio::test]
     async fn a_full_raw_source_is_routed_around_for_its_wait() -> Result<(), String> {
-        let hub = Arc::new(Hub::new(8));
+        let hub = Arc::new(Hub::new(8, crate::sharing::Deadlines::RELAY));
         let identity = Identity::generate().map_err(|error| error.to_string())?;
         let peers = Peers::new();
         let source = |key: PublicKey| RawSource {
