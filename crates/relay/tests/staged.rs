@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use tally_mlat_solver::modes::{self, LatLon};
+use tally_relay::budget::Store;
 use tally_relay::fanout::{Fell, Filter};
 use tally_relay::hub::{Hub, Inbound, Item, Origin};
 use tally_relay::ingest::{Pause, Stage, Stamp, Threads};
@@ -613,9 +614,15 @@ async fn each_receivers_batches_reach_a_subscriber_in_order_described_first() ->
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_subscriber_that_falls_behind_is_let_go_whole_and_the_stream_refused_whole_counted()
 -> Result {
-    // A budget of one feeder: the products hold some thirty-five epochs of this stream signed
-    // (`budget::PerFeeder::planned`'s products, about 1.6 kB an epoch), so forty seconds of it
-    // overflow.
+    // A budget of one feeder: the products hold what `budget::PerFeeder::planned`'s products plan
+    // for it, some forty epochs of this stream signed (about 1.6 kB an epoch). The stream is as
+    // many seconds as twice that limit in kilobytes, so it overflows whatever the plan holds while
+    // an epoch costs more than half a kilobyte. Its clock steps with it, a second at a time, so
+    // each epoch closes as its second ends and its decode is let go, as a relay's would be: every
+    // store but the products holds only its window, and nothing is lost but what they refuse.
+    // (Before, forty seconds were fed at once with the clock held and then stepped: the decodes
+    // of all forty were held together, which the store planned in what the rate is charged holds
+    // just, and the products, planned the same way, held all forty epochs.)
     let hub = Arc::new(
         Hub::clocked(8, Arc::new(|| 0))
             // No area taken, so no member's share beside the feeder's: the stores hold exactly
@@ -637,7 +644,7 @@ async fn a_subscriber_that_falls_behind_is_let_go_whole_and_the_stream_refused_w
     let stalled = hub.listen(998, raw());
     hub.network().adopt_identity(Identity::from_seed([4; 32]));
     let receiver = Identity::from_seed([3; 32]);
-    let seconds = 40u64;
+    let seconds = 2 * hub.budget().gauge(Store::Products).limit() as u64 / 1_000;
     for second in 0..seconds {
         let batch = Batch::sign(
             &receiver,
@@ -665,6 +672,7 @@ async fn a_subscriber_that_falls_behind_is_let_go_whole_and_the_stream_refused_w
             in_flight,
             refusal: None,
         });
+        hub.advance(BASE_MS + second * 1_000);
     }
     let end = BASE_MS + (seconds + 1) * 1_000;
     hub.advance(end);
@@ -693,5 +701,7 @@ async fn a_subscriber_that_falls_behind_is_let_go_whole_and_the_stream_refused_w
         seconds as usize
     );
     assert_eq!(hub.network().products.report().stream_refused, refused);
+    // And nothing before the products: every batch was decoded and every epoch decided.
+    assert_eq!(hub.memory_report().decoded_refused, 0);
     Ok(())
 }

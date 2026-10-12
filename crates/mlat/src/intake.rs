@@ -94,10 +94,16 @@ pub const ORPHAN_MS: u64 = 3_000;
 struct Orphan {
     batch: Arc<Decoded>,
     stamp_ms: u64,
-    /// What it holds (`Decoded::footprint`), within the intake's bytes a receiver.
+    /// What it costs its holder ([`ORPHAN_BYTES`]), within the intake's bytes a receiver.
     bytes: usize,
     _hold: Box<dyn Any + Send>,
 }
+
+/// What holding one batch for its description costs: its place in the queue, with its charge. Not
+/// the decode it keeps alive, which a relay charges once for its life, however many hold it
+/// (`tally_relay::budget::Store::Decoded`); the intake's room bounds how many it holds, and
+/// `ORPHAN_MS` how long.
+pub const ORPHAN_BYTES: usize = std::mem::size_of::<Orphan>() + 2 * std::mem::size_of::<usize>();
 
 /// What holding, expiring or taking batches waiting for a description let go.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -196,7 +202,7 @@ impl Orphans {
     ) -> Orphaned {
         let mut orphaned = Orphaned::default();
         let key = batch.receiver();
-        let bytes = batch.footprint();
+        let bytes = ORPHAN_BYTES;
         if bytes > self.bytes_per_receiver || self.receivers == 0 {
             orphaned.dropped += 1;
             return orphaned;
@@ -1562,7 +1568,7 @@ mod tests {
                 batches.push(batch(sender, sequence)?);
             }
         }
-        let one = batches[0].footprint();
+        let one = ORPHAN_BYTES;
         let held = |order: &[usize]| -> (Vec<(PublicKey, u64)>, u64) {
             let seats = Seats::keyed(8, secret(4));
             // Three receivers, two batches each.

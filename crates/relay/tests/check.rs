@@ -130,13 +130,12 @@ fn load(checked: &Checked) -> Result<tally_relay::cores::Load> {
 /// what bound it, and every stage runs on a thread at least.
 fn assert_plan_holds(checked: &Checked) -> Result {
     let plan = &checked.plan;
-    let (memory, base, floor, connections, members, per_member, pool, planned) = (
+    let (memory, base, floor, connections, members, pool, planned) = (
         checked.get("memory")?,
         checked.get("base")?,
         checked.get("floor")?,
         checked.get("connection-limit")?,
         checked.get("members")?,
-        checked.get("per-member")?,
         checked.get("member-pool")?,
         checked.get("planned")?,
     );
@@ -159,23 +158,28 @@ fn assert_plan_holds(checked: &Checked) -> Result {
         connections > 0,
         "a plan admitting no connection was accepted"
     );
-    assert!(per_member > 0, "{plan:?}");
     assert_eq!(
         members == 0,
         member_feeders == 0 && rate_pool == 0,
         "{plan:?}"
     );
-    let (oversize, non_feeder, buffers) = (
-        checked.get("oversize")?,
+    let (sockets, non_feeder, buffers) = (
+        checked.get("connection-sockets")?,
         checked.get("connections")?,
         checked.get("connection-buffers")?,
     );
-    assert!(oversize > 0, "{plan:?}");
+    // Every connection but a feeder's has its kernel socket buffers planned, at least a feeder's.
+    assert!(
+        sockets >= non_feeder * tally_relay::sockets::FEEDER_KERNEL_BYTES,
+        "{plan:?}"
+    );
     assert!(
         non_feeder > 0 && buffers % non_feeder == 0 && buffers / non_feeder > 0,
         "{plan:?}"
     );
-    assert_eq!(pool, rate_pool + per_member * members);
+    // A member session holds nothing of its own beside the members' rate: its records wait in the
+    // one ingest pool.
+    assert_eq!(pool, rate_pool);
     // What it holds before any feeder is every part the plan lists, each printed. The parts are
     // the plan's own list (`before_feeders_parts`), never one written here, so a part the plan
     // gains cannot be left out of the sum.
@@ -186,7 +190,7 @@ fn assert_plan_holds(checked: &Checked) -> Result {
     }
     assert_eq!(before, parts, "{plan:?}");
     assert!(
-        before >= base + oversize + buffers + pool + links,
+        before >= base + buffers + sockets + pool + links,
         "{plan:?}"
     );
     // The connection limit: the fewer of the memory's and the cores'.
@@ -221,9 +225,10 @@ fn assert_plan_holds(checked: &Checked) -> Result {
         rate >= connections * tally_relay::budget::PLANNED_RECEPTIONS_PER_SEC,
         "{plan:?}"
     );
+    // R_max's bytes are charged bytes (`ingest::charge_of`), the unit the stores are planned in.
     assert_eq!(
         checked.get("max-bytes-per-sec")?,
-        rate * tally_relay::budget::PLANNED_BYTES_PER_SEC
+        rate * tally_relay::budget::PLANNED_CHARGED_BYTES_PER_SEC
             / tally_relay::budget::PLANNED_RECEPTIONS_PER_SEC,
         "{plan:?}"
     );
@@ -249,6 +254,12 @@ fn assert_plan_holds(checked: &Checked) -> Result {
         gauges += limit;
         if store.driver() == tally_relay::budget::Driver::Rate {
             let window = checked.get(&format!("window-{}", store.name()))?;
+            // The fingerprints' tables' fixed part is held before any feeder, beside the rate's.
+            let limit = if store == tally_relay::budget::Store::Dedup {
+                limit - checked.get("dedup-tables")?
+            } else {
+                limit
+            };
             assert!(
                 limit <= window * served && limit + served >= window * served,
                 "{store:?}: {limit} is not {window} x {served}: {plan:?}"
@@ -318,15 +329,15 @@ fn a_configuration_the_relay_takes_is_accepted_with_its_plan() -> Result {
     let members = checked.get("members")?;
     assert_eq!(checked.get("connections")?, 32 + members + 64);
     // The members' rate is the feeders it is worth, once: 128 KiB/s is 16 feeders at 8 KiB/s, each
-    // a feeder's cost but for the connection buffers and the allowance each session takes itself.
+    // a feeder's cost but for the connection's own buffers and sockets, which each session takes
+    // from the connections' room.
     let (rate_pool, each) = (
         checked.get("member-rate-pool")?,
-        checked.get("floor")? + tally_relay::budget::Plan::planned(true).per_rate.total(),
+        checked.get("per-connection")? + checked.get("per-seat")?,
     );
     assert_eq!(checked.get("member-feeders")?, 16);
     assert!(
-        rate_pool % 16 == 0
-            && rate_pool < 16 * (each + tally_relay::budget::Plan::planned(true).per_seat.total()),
+        rate_pool % 16 == 0 && rate_pool < 16 * each,
         "{:?}",
         checked.plan
     );
@@ -356,33 +367,15 @@ fn a_configuration_the_relay_takes_is_accepted_with_its_plan() -> Result {
 
 /// The stages' threads follow the load the relay admits, never the host's cores alone, and its
 /// cores bound what it admits (`tally_relay::cores`): the configuration measured on 2026-10-09
-/// (10 cores, memory for 5,000 feeders and more) runs more than one message thread, the same
-/// memory on one core admits what one core carries, and a relay of many cores and little memory
-/// runs the threads its few feeders need.
+/// (`TEN_CORES`: 10 cores, memory for 5,000 feeders and more) runs more than one message thread,
+/// the same memory on one core admits what one core carries, and a relay of many cores and little
+/// memory runs the threads its few feeders need.
 #[test]
 fn the_stages_follow_the_load_admitted_and_the_cores_bound_it() -> Result {
-    let on = |cores: &str, memory: &str| -> Result<Checked> {
-        let checked = check(&[
-            "--memory-limit",
-            "32G",
-            "--cores",
-            cores,
-            "--key",
-            "k",
-            "--max-upload",
-            "10Gbit/s",
-            "--no-mlat",
-            "--memory",
-            memory,
-            "--max-connections",
-            "11024",
-            "--max-connections-per-address",
-            "11024",
-            "--area",
-            "801ffffffffffff",
-            "--area",
-            "8027fffffffffff",
-        ])?;
+    let on = |cores: &'static str, memory: &'static str| -> Result<Checked> {
+        let mut args = ten_cores(cores, memory);
+        args.push("--no-mlat");
+        let checked = check(&args)?;
         assert!(checked.accepted, "{}", checked.refusal);
         assert_plan_holds(&checked)?;
         assert_eq!(checked.get("cores")?, cores.parse::<usize>().unwrap_or(0));
@@ -445,30 +438,12 @@ fn the_stages_follow_the_load_admitted_and_the_cores_bound_it() -> Result {
 /// A relay hosting MLAT plans its steps in the same cores (RFC-0181 §10, "The cores"): the stages
 /// keep the threads their load needs, MLAT is given the cores they leave, and the feeders admitted
 /// are no more than the cores carry with both, so the same cores admit fewer than without MLAT.
-/// The configuration the 2026-10-09 MLAT runs measured: 10 cores, two areas, memory to spare.
+/// The configuration the 2026-10-09 MLAT runs measured (`TEN_CORES`): 10 cores, two areas, memory
+/// to spare.
 #[test]
 fn hosted_mlat_takes_the_cores_the_stages_leave_and_bounds_admission() -> Result {
     let on = |mlat: bool| -> Result<Checked> {
-        let mut args = vec![
-            "--memory-limit",
-            "32G",
-            "--cores",
-            "10",
-            "--key",
-            "k",
-            "--max-upload",
-            "10Gbit/s",
-            "--memory",
-            "24G",
-            "--max-connections",
-            "5024",
-            "--max-connections-per-address",
-            "5024",
-            "--area",
-            "801ffffffffffff",
-            "--area",
-            "8027fffffffffff",
-        ];
+        let mut args = TEN_CORES.to_vec();
         if !mlat {
             args.push("--no-mlat");
         }
@@ -893,6 +868,12 @@ const CORE_LINES: [&str; 20] = [
     "handshakes-per-sec",
 ];
 
+/// Ten cores, 24 GB and the harness's two areas, the configuration the 2026-10-09 runs measured,
+/// with the connection cap at 2,048 so the memory is to spare. A relay taking a base cell plans a
+/// member session for every connection the cap allows, and each holds its kernel socket buffers,
+/// a link dialled to it and an engine's place (`budget::Plan::connection_sockets`), and every
+/// connection under the cap may listen to the fan-out: at 5,024 they took some 10 GB before any
+/// feeder and the memory, not the cores, bound what it admits.
 const TEN_CORES: [&str; 18] = [
     "--memory-limit",
     "32G",
@@ -905,14 +886,25 @@ const TEN_CORES: [&str; 18] = [
     "--memory",
     "24G",
     "--max-connections",
-    "5024",
+    "2048",
     "--max-connections-per-address",
-    "5024",
+    "2048",
     "--area",
     "801ffffffffffff",
     "--area",
     "8027fffffffffff",
 ];
+
+/// `TEN_CORES` on `cores` and `memory` instead.
+fn ten_cores(cores: &'static str, memory: &'static str) -> Vec<&'static str> {
+    let mut args = TEN_CORES.to_vec();
+    for (flag, value) in [("--cores", cores), ("--memory", memory)] {
+        if let Some(at) = args.iter().position(|arg| *arg == flag) {
+            args[at + 1] = value;
+        }
+    }
+    args
+}
 
 /// RFC-0181's figures for what ten cores carry are this test's printed output,
 /// held equal to `tests/cores-10.txt`, never prose: the plan the relay prints for that

@@ -215,7 +215,27 @@ pub struct Batch {
     bytes: Bytes,
     /// Shared with every clone, so a batch (and every record holding one) stays small.
     kept: std::sync::Arc<Kept>,
+    /// Its bytes carry their own charge ([`Batch::owned_by`]): every holder shares them, and none
+    /// charges them again.
+    owned: bool,
 }
+
+/// A batch's signed bytes with their owner's charge beside them, in the one allocation `Bytes`
+/// shares (`Bytes::from_owner`): the charge goes when the last holder of the bytes lets them go.
+struct OwnedBytes {
+    bytes: Vec<u8>,
+    _owner: crate::decoded::Owner,
+}
+
+impl AsRef<[u8]> for OwnedBytes {
+    fn as_ref(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+/// What `Bytes::from_owner` allocates beside the owner: its reference count.
+pub const OWNED_HEADER: usize =
+    std::mem::size_of::<std::sync::atomic::AtomicUsize>() + std::mem::size_of::<OwnedBytes>();
 
 /// What a batch keeps of its bytes once worked out: its signer's key, and its hash.
 #[derive(Debug)]
@@ -360,6 +380,7 @@ impl Batch {
         Ok(Self {
             bytes: Bytes::from(bytes),
             kept: Kept::new(identity.point()),
+            owned: false,
         })
     }
 
@@ -377,6 +398,48 @@ impl Batch {
         Ok(Self {
             bytes,
             kept: Kept::new(signer),
+            owned: false,
+        })
+    }
+
+    /// What its signed bytes take as an allocation of their own: their bytes and the header of
+    /// the one allocation every holder shares ([`Batch::owned_by`]). What a holder that keeps the
+    /// batch past its decode is charged for them, once (`Decoded::footprint` leaves them out).
+    pub fn footprint(&self) -> usize {
+        self.bytes.len() + OWNED_HEADER
+    }
+
+    /// Whether its bytes carry their own charge ([`Batch::owned_by`]): a holder of it charges
+    /// only what it allocates itself.
+    pub fn is_owned(&self) -> bool {
+        self.owned
+    }
+
+    /// The same batch, its signed bytes charged once for their life by `owner`, told their
+    /// [`Batch::footprint`]: the bytes moved (not copied, when nothing else holds them) into one
+    /// allocation with the charge beside them, which every clone shares and the last lets go.
+    /// `None` from `owner` refuses them, and the batch comes back as it was.
+    pub fn owned_by(
+        self,
+        owner: impl FnOnce(usize) -> Option<crate::decoded::Owner>,
+    ) -> Result<Self, Self> {
+        if self.owned {
+            return Ok(self);
+        }
+        let Some(charge) = owner(self.footprint()) else {
+            return Err(self);
+        };
+        let Self { bytes, kept, .. } = self;
+        // Unique and made from a `Vec` (a batch read off a link is): moved, not copied.
+        let mut bytes = Vec::from(bytes);
+        bytes.shrink_to_fit();
+        Ok(Self {
+            bytes: Bytes::from_owner(OwnedBytes {
+                bytes,
+                _owner: charge,
+            }),
+            kept,
+            owned: true,
         })
     }
 
@@ -560,17 +623,23 @@ impl Batch {
             Layout::Plain(range) => return Ok((header, self.bytes.slice(range))),
             Layout::Deflate { stated, stream } => (stated, stream),
         };
-        // Stops at `stated`: a stream that would inflate further is refused there.
-        let inflated =
-            miniz_oxide::inflate::decompress_to_vec_with_limit(&self.bytes[stream], stated)
-                .map_err(|_| WireError::Invalid {
-                    field: "compressed batch",
-                    value: stated as u64,
-                })?;
-        if inflated.len() != stated {
+        // Allocated once at its stated length, never grown (a growing buffer doubles, and holds
+        // up to twice what it inflated to); a stream that would inflate further is refused there.
+        let mut inflated = vec![0; stated];
+        let written = miniz_oxide::inflate::decompress_slice_iter_to_slice(
+            &mut inflated,
+            std::iter::once(&self.bytes[stream]),
+            false,
+            true,
+        )
+        .map_err(|_| WireError::Invalid {
+            field: "compressed batch",
+            value: stated as u64,
+        })?;
+        if written != stated {
             return Err(WireError::Invalid {
                 field: "compressed batch length",
-                value: inflated.len() as u64,
+                value: written as u64,
             });
         }
         Ok((header, Bytes::from(inflated)))

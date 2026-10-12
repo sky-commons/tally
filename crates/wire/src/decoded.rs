@@ -186,6 +186,20 @@ pub struct Undecodable {
     pub error: WireError,
 }
 
+/// What a decode holds for its life beside its own bytes: its holder's charge for them (a relay's,
+/// `tally_relay::budget::Charge`), let go with the decode's last reference and never before it, so
+/// however many stages share the decode its bytes are charged once, by whoever made it.
+pub type Owner = Box<dyn std::any::Any + Send + Sync>;
+
+/// Why a verified batch was not made a decode: it does not decode (a format this build cannot
+/// read: still forwarded raw), or its owner had no room for it (`Decoded::from_verified_owned`).
+#[derive(Debug)]
+pub enum NotDecoded {
+    Undecodable(Box<Undecodable>),
+    /// The owner refused the decode's bytes: the batch, untouched.
+    NoRoom(Batch),
+}
+
 /// A verified batch decoded once (module docs). Immutable; shared as `Arc<Decoded>`.
 #[derive(Debug)]
 pub struct Decoded {
@@ -201,7 +215,26 @@ pub struct Decoded {
     ingest_seq: u64,
     plain: Bytes,
     obs: Box<[ObsRef]>,
+    /// Its charge, released when the last holder lets it go (after `live` stops counting it).
+    owner: Option<Held>,
+    /// Counted in `live`: set once it is shared, so one refused before that is never uncounted.
+    counted: bool,
 }
+
+/// An [`Owner`], printed by its presence only.
+struct Held(#[allow(dead_code)] Owner);
+
+impl std::fmt::Debug for Held {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Owner")
+    }
+}
+
+/// What an `Arc` adds to what it holds: its two reference counts.
+pub const ARC_HEADER: usize = 2 * std::mem::size_of::<usize>();
+/// What `Bytes` of a `Vec` adds once it is shared (cloned or sliced): its shared header (the
+/// buffer, its capacity and a reference count), allocated on the first clone.
+pub const BYTES_HEADER: usize = 3 * std::mem::size_of::<usize>();
 
 /// Every `Decoded` alive in this process: how many, and the bytes they hold
 /// ([`Decoded::footprint`]). A relay's stages share each one, so this is what every queue and
@@ -233,6 +266,10 @@ pub fn on_drop(hook: fn(usize)) -> bool {
 
 impl Drop for Decoded {
     fn drop(&mut self) {
+        // Never shared: never counted, and nothing tracks it.
+        if !self.counted {
+            return;
+        }
         LIVE_COUNT.fetch_sub(1, Ordering::Relaxed);
         LIVE_BYTES.fetch_sub(self.footprint(), Ordering::Relaxed);
         if let Some(hook) = ON_DROP.get() {
@@ -242,16 +279,28 @@ impl Drop for Decoded {
 }
 
 impl Decoded {
-    /// What this decode holds in memory: the signed batch, its inflated bytes when they are its
-    /// own allocation, the receptions' references and the struct itself.
+    /// What this decode allocated itself: the struct in its `Arc` (and the counts beside it), its
+    /// inflated bytes when they are its own allocation (at their capacity, with the header `Bytes`
+    /// adds once they are shared) and the receptions' references. Not the signed batch: those bytes
+    /// are their own allocation, shared with every holder of the batch, and charged on their own
+    /// (`Batch::footprint`), so the two are each counted once however many stages hold them.
     pub fn footprint(&self) -> usize {
         let batch = self.batch.as_bytes();
         let shares_batch = self.plain.as_ptr() >= batch.as_ptr()
             && self.plain.as_ptr() < batch.as_ptr().wrapping_add(batch.len());
-        std::mem::size_of::<Self>()
-            + batch.len()
-            + if shares_batch { 0 } else { self.plain.len() }
+        ARC_HEADER
+            + std::mem::size_of::<Self>()
+            + if shares_batch {
+                0
+            } else {
+                self.plain.len() + BYTES_HEADER
+            }
             + std::mem::size_of_val(&*self.obs)
+    }
+
+    /// Whether it carries its own charge ([`Decoded::from_verified_owned`]).
+    pub fn is_owned(&self) -> bool {
+        self.owner.is_some()
     }
 
     /// Decodes `batch`, whose signature the caller has already verified (this does not verify it),
@@ -275,58 +324,75 @@ impl Decoded {
         stamp_ms: u64,
         ingest_seq: u64,
     ) -> Result<Arc<Self>, Box<Undecodable>> {
-        Self::from_verified_keyed_held(batch, key, (stamp_ms, ingest_seq), |_| {})
+        Self::decode_unshared(batch, key, stamp_ms, ingest_seq)
+            .map(|decoded| Self::shared(decoded, |_| {}))
     }
 
-    /// As `from_verified`, `held` given the decode before it is counted alive ([`live`]): a
-    /// holder that charges it there (a relay's charge covering it, `tally_relay::budget::Covered`)
-    /// is never seen with a decode alive that nothing has charged, not even for the instant
-    /// between its making and its charge.
-    pub fn from_verified_held(
+    /// As `from_verified`, the decode charged for its life by `owner`, which is told the decode's
+    /// own bytes ([`Decoded::footprint`]) before it is shared and keeps what it returns inside the
+    /// decode, let go with its last reference (after `live` has stopped counting it); `None` from
+    /// `owner` refuses the decode, and the batch comes back ([`NotDecoded::NoRoom`]). `held` is
+    /// given the decode once it is shared and before it is counted alive ([`live`]): a holder that
+    /// tracks its charge there (a relay's, `tally_relay::budget::Covered`) is never seen with a
+    /// decode alive that nothing has charged, not even for an instant. So a decode is charged
+    /// exactly once, by whoever made it, however many stages share it, and none is alive that its
+    /// own charge does not hold.
+    pub fn from_verified_owned(
         batch: Batch,
         stamp_ms: u64,
         ingest_seq: u64,
+        owner: impl FnOnce(&Self) -> Option<Owner>,
         held: impl FnOnce(&Arc<Self>),
-    ) -> Result<Arc<Self>, Box<Undecodable>> {
-        Self::from_verified_keyed_held(
-            batch,
-            FingerprintKey::process(),
-            (stamp_ms, ingest_seq),
-            held,
-        )
+    ) -> Result<Arc<Self>, NotDecoded> {
+        let mut decoded =
+            match Self::decode_unshared(batch, FingerprintKey::process(), stamp_ms, ingest_seq) {
+                Ok(decoded) => decoded,
+                Err(undecodable) => return Err(NotDecoded::Undecodable(undecodable)),
+            };
+        match owner(&decoded) {
+            Some(charge) => decoded.owner = Some(Held(charge)),
+            None => return Err(NotDecoded::NoRoom(decoded.batch.clone())),
+        }
+        Ok(Self::shared(decoded, held))
     }
 
-    fn from_verified_keyed_held(
+    /// The batch decoded, not yet shared nor counted alive.
+    fn decode_unshared(
         batch: Batch,
         key: &FingerprintKey,
-        (stamp_ms, ingest_seq): (u64, u64),
-        held: impl FnOnce(&Arc<Self>),
-    ) -> Result<Arc<Self>, Box<Undecodable>> {
+        stamp_ms: u64,
+        ingest_seq: u64,
+    ) -> Result<Self, Box<Undecodable>> {
         match Self::decode(&batch, key) {
-            Ok((receiver, header, plain, obs)) => {
-                let decoded = Self {
-                    batch,
-                    receiver,
-                    boot_id: header.boot_id,
-                    sequence: header.sequence,
-                    counter_epoch: header.counter_epoch,
-                    wall_ms: header.wall_ms,
-                    dropped: header.dropped,
-                    previous: header.previous,
-                    stamp_ms,
-                    ingest_seq,
-                    plain,
-                    obs,
-                };
-                let footprint = decoded.footprint();
-                let decoded = Arc::new(decoded);
-                held(&decoded);
-                LIVE_COUNT.fetch_add(1, Ordering::Relaxed);
-                LIVE_BYTES.fetch_add(footprint, Ordering::Relaxed);
-                Ok(decoded)
-            }
+            Ok((receiver, header, plain, obs)) => Ok(Self {
+                batch,
+                receiver,
+                boot_id: header.boot_id,
+                sequence: header.sequence,
+                counter_epoch: header.counter_epoch,
+                wall_ms: header.wall_ms,
+                dropped: header.dropped,
+                previous: header.previous,
+                stamp_ms,
+                ingest_seq,
+                plain,
+                obs,
+                owner: None,
+                counted: false,
+            }),
             Err(error) => Err(Box::new(Undecodable { batch, error })),
         }
+    }
+
+    /// `decoded` shared, `held` told, then counted alive.
+    fn shared(mut decoded: Self, held: impl FnOnce(&Arc<Self>)) -> Arc<Self> {
+        let footprint = decoded.footprint();
+        decoded.counted = true;
+        let decoded = Arc::new(decoded);
+        held(&decoded);
+        LIVE_COUNT.fetch_add(1, Ordering::Relaxed);
+        LIVE_BYTES.fetch_add(footprint, Ordering::Relaxed);
+        decoded
     }
 
     #[allow(clippy::type_complexity)]

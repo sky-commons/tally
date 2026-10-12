@@ -1089,6 +1089,12 @@ impl<S> Socket<S> {
     pub fn egress(&self) -> &Arc<Egress> {
         &self.egress
     }
+
+    /// The stream it counts, to read its socket's options (`sockets::Tunable`), never to write
+    /// around the count.
+    pub fn get_ref(&self) -> &S {
+        &self.inner
+    }
 }
 
 impl<S: AsyncRead + Unpin> AsyncRead for Socket<S> {
@@ -1204,7 +1210,10 @@ impl axum::serve::Listener for Listener {
     async fn accept(&mut self) -> (Self::Io, Self::Addr) {
         loop {
             match self.listener.accept().await {
-                Ok((stream, peer)) => return (self.egress.socket(stream, Some(peer.ip())), peer),
+                Ok((stream, peer)) => {
+                    crate::sockets::configure(&stream, crate::sockets::Role::Feeder);
+                    return (self.egress.socket(stream, Some(peer.ip())), peer);
+                }
                 Err(error) => {
                     eprintln!("tally-relay: stats accept: {error}");
                     tokio::time::sleep(Duration::from_millis(100)).await;

@@ -39,8 +39,8 @@ async fn run() -> Result<(), String> {
 /// §9, "Admission"): the memory's, the cores' and the stages' threads. In order: what the relay
 /// holds before any feeder (every part from the plan's own list, `Plan::before_feeders_parts`, with
 /// their sum `before-feeders`); the floor a connection reserves and the connection limit with what
-/// bound it; `R_max` (receptions and bytes a second, and the records) with what bound it and the
-/// feeders it carries at the planned mean and at the ceiling a source is held to; every
+/// bound it; `R_max` (receptions and its bytes a second, `ingest::rate_cost`, and the records)
+/// with what bound it and the feeders it carries at the planned mean and at the ceiling a source is held to; every
 /// rate-driven store's limit as its window (bytes held per reception a second) times
 /// `R_max` and the members' rate; the MLAT seats and what bound them; the handshakes allowed at
 /// once; and the totals against the memory the relay runs in with the allocator's share:
@@ -155,7 +155,6 @@ fn check(config: &Config) -> Result<(), String> {
             )),
         ),
         ("members", number(budget.members())),
-        ("per-member", number(plan.per_member())),
         ("member-feeders", number(budget.member_feeders())),
         ("member-rate-pool", number(plan.member_rate_pool())),
         ("planned", number(budget.planned())),
@@ -263,8 +262,8 @@ async fn serve(config: Config) -> Result<(), String> {
     eprintln!(
         "tally-relay: admits {} connections ({} of memory holds {}, its {} cores carry {}; {} \
          each), a rate of {} receptions a second ({} feeders at the planned mean) and {} MLAT \
-         seats, beside {} member sessions ({} each, and {} for their shared rate); {} ingest, {} \
-         message and {} seal threads",
+         seats, beside {} member sessions ({} for their shared rate); {} ingest, {} message and {} \
+         seal threads",
         admission.connections,
         egress::decimal(config.memory as u64),
         admission.connections_by_memory,
@@ -277,7 +276,6 @@ async fn serve(config: Config) -> Result<(), String> {
         admission.feeders_at_mean(),
         admission.seats,
         budget.members(),
-        egress::decimal(budget.plan().per_member() as u64),
         egress::decimal(budget.plan().member_rate_pool() as u64),
         threads.ingest,
         threads.message,

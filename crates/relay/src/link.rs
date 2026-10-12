@@ -521,9 +521,12 @@ pub async fn inbound<S>(
     mut connection: Connection,
 ) -> Result<(), String>
 where
-    S: AsyncRead + AsyncWrite + Send + Unpin,
+    S: AsyncRead + AsyncWrite + Send + Unpin + crate::sockets::Tunable,
 {
     let link = stream.link();
+    // Its kernel buffers are a feeder's until it holds a place counted for a larger role
+    // (`sockets`): a subscriber's, a member's or an engine's.
+    let tuner = crate::sockets::Tunable::tuner(&stream);
     let mut general = connection.general();
     // Whose turn it waits in for room (`ingest::network_source`): its network group's.
     let waits =
@@ -666,21 +669,15 @@ where
         },
         _ => None,
     };
-    // What it may have in the ingest stage, carved from what it reserved (a member's, from its
-    // pool, when it is one): the batches its Hello carries are charged like every other.
+    // What it may have in the ingest stage (a member's, when it is one): the batches its Hello
+    // carries are charged like every other.
     let mut admitted = match peer {
-        Peer::Feeder(_) => match hub.allowance(
-            hub.budget().per_feeder().ingest,
-            crate::ingest::network_source(crate::ingest::group_of(asker.address), source),
-        ) {
-            Some(allowance) => Admitted {
-                allowance: Some(allowance),
-                ..Admitted::default()
-            },
-            None => {
-                farewell(&mut session.reader, &mut session.writer, full(&hub)).await;
-                return Err("turned away: no room for its ingest allowance".to_owned());
-            }
+        Peer::Feeder(_) => Admitted {
+            allowance: Some(hub.allowance(
+                crate::ingest::CREDIT,
+                crate::ingest::network_source(crate::ingest::group_of(asker.address), source),
+            )),
+            ..Admitted::default()
         },
         // A relay that dialled in is admitted as a member once its offer is verified and it
         // brings data in (`Admitted::charge`), and holds its place under the connection cap
@@ -688,6 +685,7 @@ where
         Peer::Member | Peer::Relay => Admitted {
             joins: true,
             _general: general.take(),
+            tuner: Some(tuner),
             ..Admitted::default()
         },
         Peer::Subscriber | Peer::Engine(_) | Peer::Probe => Admitted::default(),
@@ -804,13 +802,20 @@ where
         Peer::Probe => (Vec::new(), None, None),
         // An engine takes no place among the subscribers (`Hub::engine`): it is a duty of the
         // network, bounded by its grant, and this relay's own one-hop raw links dial as one.
+        // It is given an engine's buffers while it holds one of the engines' places
+        // (`Hub::engine_place`), as many as the member sessions planned; past them it is served
+        // as any connection, at a feeder's.
         Peer::Engine(_) => {
             let current = subscription.borrow_and_update().clone();
             let fan_out = FanOut {
                 infos: hub.engine(&current),
                 wants: Wants::subscription(current, subscription),
             };
-            (Vec::new(), Some(fan_out), None)
+            let place = hub.engine_place();
+            if place.is_some() {
+                tuner.set(crate::sockets::Role::Engine);
+            }
+            (Vec::new(), Some(fan_out), place)
         }
         Peer::Subscriber => {
             let current = subscription.borrow_and_update().clone();
@@ -822,8 +827,9 @@ where
                 farewell(&mut session.reader, &mut session.writer, redirect).await;
                 return Err("at subscriber capacity".to_owned());
             };
-            // Its place is among the subscribers now.
+            // Its place is among the subscribers now, and its buffers a subscriber's.
             drop(general.take());
+            tuner.set(crate::sockets::Role::Subscriber);
             let fan_out = FanOut {
                 infos,
                 wants: Wants::subscription(current, subscription),
@@ -968,6 +974,8 @@ async fn upstream_once(
         .await
         .map_err(|_| "connect timed out".to_owned())?
         .map_err(|error| error.to_string())?;
+    // A directory link carries offers and queries, never data: a feeder's buffers.
+    crate::sockets::configure(&stream, crate::sockets::Role::Feeder);
     let peer = stream.peer_addr().ok().map(|address| address.ip());
     let stream = hub.egress().socket(stream, peer);
     let link = stream.link();
@@ -1119,6 +1127,7 @@ async fn member_once(
         .await
         .map_err(|_| "connect timed out".to_owned())?
         .map_err(|error| error.to_string())?;
+    crate::sockets::configure(&stream, crate::sockets::Role::Member);
     let address = stream.peer_addr().ok().map(|address| address.ip());
     let stream = hub.egress().socket(stream, address);
     let link = stream.link();
@@ -1492,8 +1501,8 @@ impl Replying {
 }
 
 /// What a connection that publishes batches was admitted with (RFC-0181 §2, §9): its allowance
-/// in the ingest stage, carved from `Store::Ingest` within what it reserved, and a member
-/// session's reservation from the members' pool and the pace the members share. A connection that
+/// in the ingest stage (a count of records, each charged to the one ingest pool, `Store::Ingest`),
+/// and a member session's place among those planned and the pace the members share. A connection that
 /// publishes none has neither, and a batch from it never reaches the stage (`Peer::permit`).
 #[derive(Default)]
 struct Admitted {
@@ -1512,6 +1521,9 @@ struct Admitted {
     /// Its place under the connection cap (`hub::Connection::general`, `Hub::dialled`), held
     /// until it holds a member's (`admit_member`, which replaces this admission whole).
     _general: Option<crate::hub::Slot>,
+    /// The session's socket buffers, a feeder's until it is admitted as a member, then a
+    /// member's (`sockets`); `None` for a session that never may be one.
+    tuner: Option<crate::sockets::Tuner>,
 }
 
 impl Admitted {
@@ -1531,7 +1543,12 @@ impl Admitted {
             && !crate::subscription::on_directory_link(record)
             && matches!(peer.now(hub, key), Peer::Member)
         {
+            let tuner = self.tuner;
             *self = admit_member(hub, source)?;
+            self.tuner = tuner;
+            if let Some(tuner) = tuner {
+                tuner.set(crate::sockets::Role::Member);
+            }
         }
         Ok(self.in_flight(record).await)
     }
@@ -1547,15 +1564,19 @@ impl Admitted {
         };
         let allowance = self.allowance.as_ref()?;
         // A member's waits first for the members' shared rate: together they bring in what was
-        // planned for them, no more (`budget::Plan::with_members`).
+        // planned for them, no more (`budget::Plan::with_members`), in the bytes the stores are
+        // planned in (`ingest::rate_cost`), whatever its batches inflate or pad to.
         if let Some(pace) = &self.pace {
-            let (wire, receptions) = match record {
-                Record::Batch(batch) => (batch.as_bytes().len(), batch.receptions().unwrap_or(0)),
+            let (charged, receptions) = match record {
+                Record::Batch(batch) => (
+                    crate::ingest::rate_cost(batch),
+                    batch.receptions().unwrap_or(0),
+                ),
                 Record::ReceiverInfo(info) => (info.as_bytes().len(), 0),
                 _ => (bytes, 0),
             };
             pace.take(
-                u64::try_from(wire).unwrap_or(u64::MAX),
+                u64::try_from(charged).unwrap_or(u64::MAX),
                 u64::try_from(receptions).unwrap_or(u64::MAX),
             )
             .await;
@@ -1564,9 +1585,8 @@ impl Admitted {
     }
 }
 
-/// A member session's admission: its own bytes (its ingest allowance) reserved from the members'
-/// pool, sized at start for the member sessions the relay's plan admits (`budget::members_for`),
-/// its allowance carved, and the members' shared pace. Past them it is turned away, counted, with
+/// A member session's admission: one of the member sessions the relay's plan admits
+/// (`budget::members_for`), its ingest allowance, and the members' shared pace. Past them it is turned away, counted, with
 /// `Reason::Full` (RFC-0174 §2.5, "A relay's members are bounded"): the relay that dialled routes
 /// around this one, to the next members of its trees, for the wait it is given.
 fn admit_member(hub: &Hub, source: u64) -> Result<Admitted, End> {
@@ -1584,20 +1604,17 @@ fn admit_member(hub: &Hub, source: u64) -> Result<Admitted, End> {
             budget.members()
         ))
     })?;
-    let allowance = hub
-        .allowance(
-            budget.plan().per_member(),
-            crate::ingest::member_source(source),
-        )
-        .ok_or_else(|| {
-            refused("turned away: no room for a member's ingest allowance".to_owned())
-        })?;
+    let allowance = hub.allowance(
+        crate::ingest::RECORDS_IN_FLIGHT,
+        crate::ingest::member_source(source),
+    );
     Ok(Admitted {
         allowance: Some(allowance),
         membership: Some(hub.network().admit_member(source, membership)),
         pace: Some(hub.member_pace().session()),
         joins: true,
         _general: None,
+        tuner: None,
     })
 }
 
@@ -2674,6 +2691,7 @@ pub async fn serve_beast(listener: TcpListener, hub: Arc<Hub>) {
             tokio::time::sleep(Duration::from_millis(100)).await;
             continue;
         };
+        crate::sockets::configure(&stream, crate::sockets::Role::Subscriber);
         let out = hub.listen(hub.connection_id(), Filter::Beast);
         let stream = hub.egress().socket(stream, Some(peer.ip()));
         // It takes data and gives none: a plain subscriber, to the cap.
@@ -3323,6 +3341,8 @@ mod tests {
         inner: tokio::io::DuplexStream,
         written: Arc<std::sync::atomic::AtomicU64>,
     }
+
+    impl crate::sockets::Tunable for Tap {}
 
     impl AsyncRead for Tap {
         fn poll_read(
