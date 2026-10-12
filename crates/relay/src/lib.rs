@@ -34,6 +34,7 @@ pub mod seal;
 pub mod selection;
 pub mod sharing;
 pub mod shed;
+pub mod sockets;
 pub mod standing;
 pub mod stations;
 pub mod stats;
@@ -84,6 +85,8 @@ pub async fn serve(listener: TcpListener, identities: Vec<Identity>, hub: Arc<Hu
     loop {
         match listener.accept().await {
             Ok((stream, peer)) => {
+                // A feeder's kernel buffers until its handshake names its role (`sockets`).
+                sockets::configure(&stream, sockets::Role::Feeder);
                 let Some(connection) = hub.connection(peer.ip()) else {
                     drop(stream);
                     continue;

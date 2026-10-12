@@ -14,7 +14,8 @@
 //! about 12 KB a feeder ([`PER_FEEDER_BYTES`]), 240 MB at 20,000 feeders, where holding the
 //! batches themselves for the same window would be some 8 GB. Bounded per receiver by
 //! [`ENTRIES_PER_RECEIVER`] (twice a feeder's rate over the window), so one receiver, however
-//! fast it sends, fills only its own share, and in all by the store's gauge (the budget's
+//! fast it sends, fills only its own share, which is what each feeder's connection is planned at
+//! ([`PER_RECEIVER_BYTES`], its floor), and in all by the store's gauge (the budget's
 //! `Store::Delivery`, [`Delivery::charge_to`]), which every entry is charged to before it is held
 //! and released from as it is let go, and which is the store's only bound in all; past either a
 //! batch is refused whole (no tag, and never denied) and counted.
@@ -80,6 +81,11 @@ pub const PER_FEEDER_BYTES: usize = TAG_BYTES * (TAG_WINDOW_MS / 1000) as usize;
 /// the window, room for a burst. Past it that receiver's batch is refused whole and counted; no
 /// other receiver's is.
 pub const ENTRIES_PER_RECEIVER: usize = 2 * (TAG_WINDOW_MS / 1000) as usize;
+/// What one receiver can hold of the store whatever it sends: its entries to the cap
+/// ([`ENTRIES_PER_RECEIVER`]). What a feeder's connection reserves (its floor), so a feeder
+/// sending past a batch a second fills what was planned for it and no more. Before, a feeder was
+/// planned at a batch a second ([`PER_FEEDER_BYTES`]) and the cap was twice it.
+pub const PER_RECEIVER_BYTES: usize = TAG_BYTES * ENTRIES_PER_RECEIVER;
 /// The most streams (receiver and boot) whose horizon is remembered.
 pub const STREAMS_REMEMBERED: usize = 100_000;
 /// The most boots of one receiver whose streams are remembered: past it the receiver's stream held

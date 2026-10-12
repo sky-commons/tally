@@ -1,12 +1,14 @@
 //! The ingest stage (RFC-0181 §2): where a batch becomes one immutable [`Decoded`], once, before
 //! any other stage reads it. A connection task does I/O only and holds at most its [`Allowance`]
-//! of batches in flight, counted in bytes as each batch is charged ([`charge_of`]: its signed
+//! of records in flight, a count ([`CREDIT`]), each charged in bytes ([`charge_of`]: its signed
 //! bytes, what it inflates to and its receptions' references, from the batch alone before it is
-//! decoded), carved from the relay's `Store::Ingest` when the connection is admitted; out of
-//! allowance it stops reading its socket, so TCP pushes back on the feeder (whose signed `dropped`
-//! records its own loss), no connection can take another's room, and nothing queues unbounded.
-//! A batch's charge ([`InFlight`]) travels with it to the message exchange and is let go only once
-//! the epochs hold its bytes (`exchange`). The work
+//! decoded) to the relay's one ingest pool (`Store::Ingest`), which every connection waits for in
+//! turn by source (`budget::Gauge::charge_for`); out of credit or of room it stops reading its
+//! socket, so TCP pushes back on the feeder (whose signed `dropped` records its own loss), no
+//! source can take another's turn, and nothing queues unbounded. A batch's charge ([`InFlight`])
+//! is let go once it is decoded: from then its decode and its signed bytes are each charged once,
+//! for their life, inside their own allocations (`Store::Decoded`, [`Stages::decode_owned`]),
+//! whichever stages hold them. The work
 //! (verify, hash, admit, inflate, decode, route) runs on a [`Pool`] of dedicated OS threads sized
 //! from the load the relay is planned to admit ([`Threads`], `cores::threads_for`), never on the
 //! async runtime's workers, so a burst of verification never stalls a heartbeat or an egress
@@ -48,19 +50,29 @@ use tokio::sync::Notify;
 
 use crate::budget::{Charge, Gauge, PLANNED_BYTES_PER_SEC, PLANNED_RECEPTIONS_PER_SEC, Store};
 use crate::exchange::{Gauges, MessageExchange, Sink};
+use tally_wire::decoded::NotDecoded;
 
-/// Batches at the planned rate one feeder's connection may have in the ingest stage at once. Two:
-/// one being worked on, one read and waiting, so a connection's socket is read while its previous
-/// batch is decoded. What it holds is counted in bytes ([`FEEDER_ALLOWANCE`]), never in batches,
-/// so a peer sending large batches holds no more than one sending small ones.
+/// Records one feeder's connection may have in the ingest stage at once. Two: one being worked on,
+/// one read and waiting, so a connection's socket is read while its previous batch is decoded. A
+/// count, never bytes: what each holds is charged to the one ingest pool, which every connection
+/// waits for in turn by source, so a peer sending large batches waits for its bytes as one sending
+/// small ones does, and no connection holds room it does not use.
 pub const CREDIT: usize = 2;
 
-/// What a batch costs in the stages before the epochs hold it, from what the batch states: the
-/// decode's struct, its signed bytes (`wire`), its observations inflated (`inflated`) and a
+/// What a batch costs from the moment it is read, from what the batch states: the decode's struct
+/// in its `Arc`, its signed bytes (`wire`) in the allocation that carries their charge
+/// (`Batch::owned_by`), its observations inflated (`inflated`) with the header `Bytes` adds, and a
 /// reference for each reception it can hold (`receptions`). At least `Decoded::footprint` of its
-/// decode, so a charge taken before the decode covers it.
+/// decode and `Batch::footprint` of its bytes together, so what is charged at ingest bounds what
+/// the decode and the bytes are charged for their life.
 pub const fn charge_for(wire: usize, inflated: usize, receptions: usize) -> usize {
-    std::mem::size_of::<Decoded>() + wire + inflated + receptions * std::mem::size_of::<ObsRef>()
+    tally_wire::decoded::ARC_HEADER
+        + std::mem::size_of::<Decoded>()
+        + wire
+        + tally_wire::batch::OWNED_HEADER
+        + inflated
+        + tally_wire::decoded::BYTES_HEADER
+        + receptions * std::mem::size_of::<ObsRef>()
 }
 
 /// What `batch` is charged before it is decoded: as [`charge_for`], its inflated length and the
@@ -76,6 +88,25 @@ pub fn charge_of(batch: &Batch) -> usize {
     })
 }
 
+/// How many charged bytes a planned batch costs for each of its signed bytes, rounded down: a
+/// planned second of a feeder's batches, as charged ([`PLANNED_BATCH_CHARGE`]), over its signed
+/// bytes (`budget::PLANNED_BYTES_PER_SEC`).
+pub const CHARGED_PER_SIGNED: usize = PLANNED_BATCH_CHARGE / PLANNED_BYTES_PER_SEC;
+const _: () = assert!(CHARGED_PER_SIGNED >= 1);
+
+/// What `batch` costs of the relay-wide rate (`R_max`'s bytes) and of a member's pace: its charge
+/// ([`charge_of`]), or [`CHARGED_PER_SIGNED`] times its signed bytes if that is more. The stores
+/// that hold a decode are planned in charged bytes, which the charge bounds; the sharing groups
+/// hold the signed bytes past the decode, over the repair horizon, which the charge alone does not
+/// bound: a batch of a format this build cannot read, or one padded with empty DEFLATE blocks, is
+/// nearly all signed bytes for what it is charged. Weighed this way, a second of admitted batches
+/// carries at most `R_max`'s bytes over [`CHARGED_PER_SIGNED`] of signed bytes, what the groups
+/// are planned for (`budget::PerFeeder::planned_for`), and a batch at the planned mix costs its
+/// charge, as before.
+pub fn rate_cost(batch: &Batch) -> usize {
+    charge_of(batch).max(batch.as_bytes().len().saturating_mul(CHARGED_PER_SIGNED))
+}
+
 /// The least a record handed to the ingest workers is charged (a batch's [`charge_of`], a
 /// description's bytes): its bytes, or [`CHARGE_FLOOR`] if more.
 pub const fn floored(bytes: usize) -> usize {
@@ -87,7 +118,8 @@ pub const fn floored(bytes: usize) -> usize {
 }
 
 /// A batch at the planned rate (RFC-0181, "Requirement": a second of a feeder's batches, its
-/// receptions each a 14-byte Mode S message), as [`charge_of`] charges it.
+/// receptions each a 14-byte Mode S message), as [`charge_of`] charges it: what `R_max`'s bytes
+/// are counted in a planned feeder's worth of (`budget::PLANNED_CHARGED_BYTES_PER_SEC`).
 pub const PLANNED_BATCH_CHARGE: usize = {
     let inflated = 4 + PLANNED_RECEPTIONS_PER_SEC * (tally_wire::decoded::OBSERVATION_FIXED + 14);
     charge_for(
@@ -97,25 +129,28 @@ pub const PLANNED_BATCH_CHARGE: usize = {
     )
 };
 
-/// One feeder connection's allowance: [`CREDIT`] planned batches, in bytes. What a feeder reserves
-/// of `Store::Ingest` (`budget::PerFeeder::planned`), and carves when its connection is admitted.
-pub const FEEDER_ALLOWANCE: usize = CREDIT * PLANNED_BATCH_CHARGE;
-
-/// The most records one connection's allowance holds in the ingest stage at once, however small
-/// they are. Each costs an ingest worker a strict Ed25519 verification whatever its bytes, so a
-/// charge by bytes alone let a feeder sending 300-byte batches hold some 500 in the workers'
-/// queues at once, each a verification ahead of every honest batch behind it: some 25 such feeders
-/// kept the workers busy. Eight is four times what a planned feeder holds ([`CREDIT`]), so a member
-/// session forwarding many feeders' small batches still has room while each is verified.
+/// The most records one member session holds in the ingest stage at once, however small they are
+/// (a feeder's connection holds [`CREDIT`]). Each costs an ingest worker a strict Ed25519
+/// verification whatever its bytes, so the count bounds the verifications one session has waiting
+/// ahead of every honest batch behind them. Eight, four times a feeder's, so a member session
+/// forwarding many feeders' small batches still has room while each is verified.
 pub const RECORDS_IN_FLIGHT: usize = 8;
 
-/// The least one record is charged in the ingest stage until it is decoded ([`floored`]): a
-/// feeder's allowance over [`RECORDS_IN_FLIGHT`]. Once decoded, its charge shrinks to the
-/// decode's footprint: the verification is done.
-pub const CHARGE_FLOOR: usize = FEEDER_ALLOWANCE / RECORDS_IN_FLIGHT;
-// A batch at the planned rate is charged its bytes, never the floor, so the allowance holds the
-// batches it was sized for (`budget::PerFeeder::planned`'s ingest line).
+/// The least one record is charged in the ingest pool until it is decoded ([`floored`]): a
+/// planned batch's charge, [`CREDIT`] of them, over [`RECORDS_IN_FLIGHT`], so the pool's room
+/// bounds the records waiting for the workers ([`Room::records`]) however small they are.
+pub const CHARGE_FLOOR: usize = CREDIT * PLANNED_BATCH_CHARGE / RECORDS_IN_FLIGHT;
+// A batch at the planned rate is charged its bytes, never the floor.
 const _: () = assert!(PLANNED_BATCH_CHARGE >= CHARGE_FLOOR);
+
+/// How long a record read may wait for an ingest worker, as the ingest pool is planned
+/// (`Store::Ingest`: what the workers take a second times this, Little's law). The workers are
+/// planned at `cores::BUSY_PERCENT`, so a record's wait is its share of a busy moment: the ones
+/// measured are the hundred milliseconds or so around an epoch's close, when the message threads
+/// stop taking slices and the workers routing to them wait (RFC-0181, "BUSY_PERCENT stays 50").
+/// A quarter of a second holds that with room; past it the pool is full and the connections wait
+/// for it in turn, their sockets unread.
+pub const INGEST_WAIT_MS: u64 = 250;
 
 /// The bytes of its byte ceiling each record a connection sends is paced as, at least
 /// ([`records_per_sec`]): whatever its bytes, a record costs the relay a fixed amount (a signature
@@ -150,7 +185,9 @@ pub const fn member_records_per_sec(member_feeders: usize) -> u64 {
 /// (RFC-0181 §9). Both are the one rate `--max-member-bytes-per-sec` is worth, planned once as the
 /// feeders it is worth (`budget::feeders_for_rate`): a member's batch is a feeder's another relay
 /// kept, so what it brings in is bounded by its receptions as well as its bytes, or batches of many
-/// small receptions would bring in more than the plan holds. A session waits first for its own
+/// small receptions would bring in more than the plan holds. Its bytes are charged bytes
+/// ([`charge_of`]), the unit the stores are planned in, those feeders' worth of them: a member
+/// forwarding inflated batches brings in no more than the plan holds either. A session waits first for its own
 /// share of each (the rate over the sessions waiting now, [`FairPace`]) and then for the shared
 /// total, so one member sending large batches cannot take the rate from the rest, and the members
 /// together never pass it.
@@ -160,11 +197,14 @@ pub struct MemberPace {
 }
 
 impl MemberPace {
-    /// The pace for `bytes_per_sec` all together, the receptions of the feeders it is worth.
+    /// The pace for `bytes_per_sec` of signed batches all together: the charged bytes and the
+    /// receptions of the feeders it is worth.
     pub fn new(bytes_per_sec: u64) -> Self {
         let feeders = crate::budget::feeders_for_rate(bytes_per_sec) as u64;
         Self {
-            bytes: Arc::new(FairPace::new(bytes_per_sec)),
+            bytes: Arc::new(FairPace::new(
+                feeders.saturating_mul(PLANNED_BATCH_CHARGE as u64),
+            )),
             receptions: Arc::new(FairPace::new(
                 feeders.saturating_mul(PLANNED_RECEPTIONS_PER_SEC as u64),
             )),
@@ -851,13 +891,6 @@ pub const BUFFERS_PER_CONNECTION: usize = (tally_wire::noise::READER_BUFFERS
 /// held some 25 MB a connection for minutes.
 pub const REPLIES_BYTES: usize = tally_wire::noise::MAX_MESSAGE;
 
-/// What batches larger than their connection's whole allowance may hold past it, all
-/// connections together: such a batch takes its connection's whole allowance (it waits until
-/// nothing else of that connection is in flight) and the rest from here, waiting for room. Planned
-/// in the budget on its own line, beside the base (`budget::Plan::oversize`), and its gauge is the
-/// budget's (`budget::Budget::oversize`).
-pub const OVERSIZE_BYTES: usize = 64 << 20;
-
 /// How often an idle worker ticks the message exchange, and the least advance of its stamps that
 /// makes a busy one tick: a shard's watermark is at most this behind the ingest clock.
 pub const TICK_MS: u64 = 10;
@@ -902,30 +935,23 @@ pub struct Threads {
     pub seal: usize,
 }
 
-/// One connection's allowance of bytes in the ingest stage (RFC-0181 §2, §10), carved from the
-/// relay's `Store::Ingest` when the connection is admitted and held for as long as the connection
-/// is: what a feeder reserved ([`FEEDER_ALLOWANCE`]), or a sharing member its feeders' worth. Each
-/// batch takes its charge ([`charge_of`]) from it before it is handed over, waiting while the
-/// connection holds its allowance (its socket unread), so no peer can hold the room another
-/// connection was given.
+/// One connection's allowance in the ingest stage (RFC-0181 §2, §10, "Memory is charged once, for
+/// its life"): a count of records it may have read and not yet decoded ([`CREDIT`] for a feeder,
+/// [`RECORDS_IN_FLIGHT`] for a member session), each charged its bytes ([`charge_of`]) to the one
+/// ingest pool (`Store::Ingest`), waiting for room in turn by source (`Gauge::charge_for`). A
+/// connection out of credit or waiting for room stops reading its socket.
 ///
-/// A charge is lent its own bytes of the carve ([`Lent`]), and nothing more: while the connection
-/// is open they go back to the carve when the charge is let go, and once it has ended they go back
-/// to `Store::Ingest` then; the rest of the carve goes back the moment the connection ends. So a
-/// batch the connection read holds what it is charged, whoever holds it and for however long, and
-/// a connection that ends with batches still queued for the workers holds the store for those
-/// batches alone. Before, every charge held the whole carve (some 68 KB for a feeder) until the
-/// last of them was let go, and a decode held on (orphans for 3 s, subscriber queues, the notes,
-/// the exchange's held parts) kept it: after a network blip at the ceiling, every reconnect was
-/// turned away for want of room for its allowance until the old carves drained, and a churner
-/// could force it. And before that, the carve went back when the read loop ended while the batches
-/// it had read were charged only to the connection's own gauge: a peer that connected, sent a
-/// Hello and ~140 KB of batches, and hung up, again and again, queued work no store counted.
+/// Before, each connection carved two planned batches' bytes (some 137 kB) from `Store::Ingest`
+/// when it was admitted and held them for its life, used or not, and a batch larger than all of it
+/// took the rest from an oversize room: 2.6 GB of the world relay's plan held for connections that
+/// mostly held nothing. What waits for a worker is the rate the workers take over the time a
+/// record waits for one (Little's law, [`INGEST_WAIT_MS`]), whatever the connections, so the pool
+/// is sized by that; a connection's credit stays a count, which bounds the verifications one
+/// connection has waiting.
 pub struct Allowance {
-    own: Arc<Gauge>,
-    oversize: Arc<Gauge>,
-    carve: Arc<Carve>,
-    /// Whose turn this connection's batches wait in when the oversize room is full
+    pool: Arc<Gauge>,
+    credit: Arc<tokio::sync::Semaphore>,
+    /// Whose turn this connection's records wait in when the pool is full
     /// ([`Gauge::charge_for`]): its network group's ([`network_source`]) for a feeder, a member
     /// session's own ([`member_source`]), so connections of one network share one turn.
     source: u64,
@@ -951,144 +977,44 @@ pub fn member_source(connection: u64) -> u64 {
     (4 << 32) | (connection & 0xffff_ffff)
 }
 
-/// What of a connection's carve no charge has been lent: given back to `Store::Ingest` when the
-/// connection's [`Allowance`] is dropped, with it.
-struct Carve(Mutex<Charge>);
-
-impl Carve {
-    /// `bytes` of the carve lent to a charge (all of it, if less is left: never, while the
-    /// connection's own gauge holds its charges to the allowance).
-    fn lend(self: &Arc<Self>, bytes: usize) -> Lent {
-        let charge = self
-            .0
-            .lock()
-            .map(|mut carve| carve.split(bytes))
-            .unwrap_or_default();
-        Lent {
-            charge,
-            home: Arc::downgrade(self),
-        }
-    }
-
-    /// `charge` back in the carve.
-    fn repay(&self, mut charge: Charge) {
-        // The carve holds no decode: what the charge was lent for is not covered by it.
-        charge.uncover();
-        if let Ok(mut carve) = self.0.lock() {
-            // Lent from this carve, so on its gauge: absorbed whole.
-            let _ = carve.absorb(charge);
-        }
-    }
-}
-
-/// Bytes of `Store::Ingest` one charge holds: lent from its connection's [`Carve`], to which they go
-/// back when let go while the connection is open (else to the store, as the charge drops), or
-/// charged to the store directly (`InFlight::trusted`), with no carve to go back to.
-#[derive(Debug, Default)]
-struct Lent {
-    charge: Charge,
-    home: std::sync::Weak<Carve>,
-}
-
-impl Lent {
-    fn bytes(&self) -> usize {
-        self.charge.bytes()
-    }
-
-    /// All but `bytes` let go.
-    fn shrink_to(&mut self, bytes: usize) {
-        let excess = self.charge.bytes().saturating_sub(bytes);
-        let back = self.charge.split(excess);
-        self.give_back(back);
-    }
-
-    /// `bytes` of it (all, if it holds less) moved into a charge of their own, lent from the same
-    /// carve, covering `decoded` (`budget::Charge::split_covering`).
-    fn split_covering(&mut self, bytes: usize, decoded: &Arc<tally_wire::Decoded>) -> Self {
-        Self {
-            charge: self.charge.split_covering(bytes, decoded),
-            home: self.home.clone(),
-        }
-    }
-
-    fn give_back(&self, charge: Charge) {
-        match self.home.upgrade() {
-            Some(carve) => carve.repay(charge),
-            None => drop(charge),
-        }
-    }
-}
-
-impl Drop for Lent {
-    fn drop(&mut self) {
-        let charge = std::mem::take(&mut self.charge);
-        self.give_back(charge);
-    }
-}
-
-impl std::fmt::Debug for Carve {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("Carve")
-    }
-}
-
 impl Allowance {
-    /// `bytes` carved from `ingest` (the relay's `Store::Ingest`), batches larger than all of them
-    /// taking the rest from `oversize`; `None` when `ingest` has no room for them.
-    pub fn carve(
-        ingest: &Arc<Gauge>,
-        oversize: &Arc<Gauge>,
-        bytes: usize,
-        source: u64,
-    ) -> Option<Self> {
-        let carved = ingest.try_charge(bytes)?;
-        Some(Self {
-            own: Gauge::new(Store::Ingest, bytes),
-            oversize: Arc::clone(oversize),
-            carve: Arc::new(Carve(Mutex::new(carved))),
+    /// `records` records at once in the ingest stage, each charged to `pool` (the relay's
+    /// `Store::Ingest`), waiting in `source`'s turn.
+    pub fn new(pool: &Arc<Gauge>, records: usize, source: u64) -> Self {
+        Self {
+            pool: Arc::clone(pool),
+            credit: Arc::new(tokio::sync::Semaphore::new(records.max(1))),
             source,
-        })
-    }
-
-    /// One batch's charge of `bytes`, waiting while the connection holds its allowance. A batch
-    /// larger than the whole allowance waits until the connection holds nothing, and takes the rest
-    /// from the oversize room ([`OVERSIZE_BYTES`]). The charge is lent its bytes of the carve.
-    pub async fn acquire(&self, bytes: usize) -> InFlight {
-        let own = bytes.min(self.own.limit());
-        let charge = self.own.charge_for(self.source, own).await;
-        let over = if bytes > own {
-            self.oversize.charge_for(self.source, bytes - own).await
-        } else {
-            Charge::none()
-        };
-        InFlight {
-            store: self.carve.lend(own),
-            own: charge,
-            over,
         }
     }
 
-    /// Bytes of the allowance free now.
+    /// One record's charge of `bytes`, waiting while the connection holds all its credit, then for
+    /// room in the pool in its source's turn. A record larger than the whole pool waits until the
+    /// pool holds nothing else (`Gauge::charge_for`).
+    pub async fn acquire(&self, bytes: usize) -> InFlight {
+        let credit = Arc::clone(&self.credit).acquire_owned().await.ok();
+        let charge = self.pool.charge_for(self.source, bytes).await;
+        InFlight {
+            charge,
+            _credit: credit,
+        }
+    }
+
+    /// Records it may still have read now.
     pub fn available(&self) -> usize {
-        self.own.limit().saturating_sub(self.own.held())
+        self.credit.available_permits()
     }
 }
 
-/// One batch's charge in the ingest stage ([`charge_of`]), from its connection's [`Allowance`]
+/// One record's charge in the ingest stage ([`charge_of`]), from its connection's [`Allowance`]
 /// or, for a batch the relay itself hands in, from `Store::Ingest` directly
-/// ([`InFlight::trusted`]). Every batch handed to the stage carries one (`hub::Inbound`): it is
-/// shrunk to the decode's footprint once decoded, split with the batch's slices to the message
-/// exchange, and let go when the epochs hold the bytes (or the batch is let go), so the bytes
-/// between a socket and the epochs are charged all the way. What it holds of `Store::Ingest` is its
-/// own bytes and no more ([`Lent`]), however long something holds it.
+/// ([`InFlight::trusted`]). Every batch handed to the stage carries one (`hub::Inbound`) until it
+/// is decoded ([`Stages::decode_owned`]): from then its decode and its signed bytes carry charges
+/// of their own for their life, and this one is let go, with the connection's credit.
 #[derive(Debug)]
 pub struct InFlight {
-    /// Against its connection's allowance (none for a trusted batch): what bounds the connection.
-    own: Charge,
-    /// Its bytes of `Store::Ingest`, the same as `own` for a connection's batch.
-    store: Lent,
-    /// What a batch past its connection's whole allowance takes from the oversize room.
-    over: Charge,
+    charge: Charge,
+    _credit: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
 impl InFlight {
@@ -1097,12 +1023,8 @@ impl InFlight {
     /// wait. A charge larger than the whole limit waits until nothing else is held.
     pub fn trusted(gauge: &Arc<Gauge>, bytes: usize) -> Self {
         Self {
-            own: Charge::none(),
-            store: Lent {
-                charge: block_on(gauge.charge_for(RELAY_SOURCE, bytes)),
-                home: std::sync::Weak::new(),
-            },
-            over: Charge::none(),
+            charge: block_on(gauge.charge_for(RELAY_SOURCE, bytes)),
+            _credit: None,
         }
     }
 
@@ -1110,51 +1032,22 @@ impl InFlight {
     #[cfg(test)]
     pub fn free() -> Self {
         Self {
-            own: Charge::none(),
-            store: Lent::default(),
-            over: Charge::none(),
+            charge: Charge::none(),
+            _credit: None,
         }
     }
 
     pub fn bytes(&self) -> usize {
-        self.store.bytes() + self.over.bytes()
-    }
-
-    /// This charge is for holding `decoded` (`budget::Charge::cover`), and so is every part split
-    /// from it with it ([`InFlight::split`]). Covered once it is shrunk to the decode (`shrink_to`), so what goes back to the
-    /// carve covers nothing.
-    pub fn cover(&mut self, decoded: &Arc<tally_wire::Decoded>) {
-        self.store.charge.cover(decoded);
-        self.over.cover(decoded);
-    }
-
-    /// Releases all but `bytes` (the oversize room's first): the decode is no larger.
-    pub fn shrink_to(&mut self, bytes: usize) {
-        let base = self.store.bytes();
-        if bytes < base {
-            self.over.shrink_to(0);
-            self.store.shrink_to(bytes);
-            self.own.shrink_to(bytes);
-        } else {
-            self.over.shrink_to(bytes - base);
-        }
-    }
-
-    /// `bytes` of this charge (all of it, if it holds less) moved into a charge of their own,
-    /// nothing taken or released: a slice's share, handed on with it, covering its decode
-    /// `decoded` and no other (`budget::Charge::split_covering`).
-    pub fn split(&mut self, bytes: usize, decoded: &Arc<tally_wire::Decoded>) -> InFlight {
-        let over = self.over.split_covering(bytes, decoded);
-        let rest = bytes - over.bytes();
-        InFlight {
-            own: self.own.split(rest),
-            store: self.store.split_covering(rest, decoded),
-            over,
-        }
+        self.charge.bytes()
     }
 }
 
-/// Runs `future` to its end on the calling thread, parked between polls.
+/// Runs `future` to its end on the calling thread, parked between polls, outside tokio's
+/// cooperative budget (`tokio::task::unconstrained`). The caller may be a thread of a tokio
+/// runtime (a test's or a replay's task handing batches in): there each receive of a waiter's
+/// grant spends the task's budget, which only a return to the scheduler renews, so past its 128th
+/// wait every poll was told to yield and woke itself, and the caller spun forever with its charge
+/// granted. Parked here, it never returns to the scheduler, so the budget is not its to keep.
 fn block_on<F: std::future::Future>(future: F) -> F::Output {
     struct Unpark(std::thread::Thread);
     impl std::task::Wake for Unpark {
@@ -1164,7 +1057,7 @@ fn block_on<F: std::future::Future>(future: F) -> F::Output {
     }
     let waker = std::task::Waker::from(Arc::new(Unpark(std::thread::current())));
     let mut context = std::task::Context::from_waker(&waker);
-    let mut future = std::pin::pin!(future);
+    let mut future = std::pin::pin!(tokio::task::unconstrained(future));
     loop {
         if let std::task::Poll::Ready(output) = future.as_mut().poll(&mut context) {
             return output;
@@ -1273,37 +1166,34 @@ impl Refusal {
 
 /// Work for one worker, given its producer number. The relay hands a worker a record only with its
 /// charge ([`Stages::run_charged`], [`Stages::run_stamped`]), each at least [`CHARGE_FLOOR`] of
-/// `Store::Ingest` and the oversize room, so the records the charges admit are at most their bytes
-/// over [`CHARGE_FLOOR`] ([`Room::records`]), however many connections came and went; and the
+/// `Store::Ingest`, so the records the charges admit are at most its bytes over [`CHARGE_FLOOR`]
+/// ([`Room::records`]), however many connections came and went; and the
 /// workers' queues take no more than that, whatever the charges say ([`lanes::Lanes`]). Anything else a
 /// worker is given is a trace's or a test's (`advance`, `flush`), at most [`CONTROL_QUEUED`] at
 /// once, its sender waiting for room; a worker ticks itself.
 type Work = Box<dyn FnOnce(usize) + Send>;
 
-/// The rooms a record handed to the ingest workers is charged to: `Store::Ingest` and the
-/// oversize room (`Budget::oversize`). What bounds the workers' queues ([`Room::records`]).
+/// The room a record handed to the ingest workers is charged to: `Store::Ingest`, the one pool.
+/// What bounds the workers' queues ([`Room::records`]).
 #[derive(Clone)]
 pub struct Room {
     pub ingest: Arc<Gauge>,
-    pub oversize: Arc<Gauge>,
 }
 
 impl Room {
-    /// The rooms of a relay's budget.
+    /// The room of a relay's budget.
     pub fn of(budget: &crate::budget::Budget) -> Self {
         Self {
             ingest: budget.gauge(Store::Ingest),
-            oversize: budget.oversize(),
         }
     }
 
-    /// The most records the two rooms admit at once, each charged at least [`CHARGE_FLOOR`] (and
-    /// one, however large, while nothing else is held): read from their limits now, so a budget
-    /// resized is followed.
+    /// The most records the pool admits at once, each charged at least [`CHARGE_FLOOR`] (and one,
+    /// however large, while nothing else is held): read from its limit now, so a budget resized is
+    /// followed.
     pub fn records(&self) -> usize {
         self.ingest
             .limit()
-            .saturating_add(self.oversize.limit())
             .checked_div(CHARGE_FLOOR)
             .unwrap_or(usize::MAX)
             .max(1)
@@ -1788,16 +1678,40 @@ impl Stages {
         Decoded::from_verified(batch, stamp.stamp_ms, stamp.ingest_seq)
     }
 
-    /// As `decode`, covered by `in_flight` before it is counted alive
-    /// (`Decoded::from_verified_held`): never a decode alive no charge covers, even for an instant.
-    pub fn decode_covered(
+    /// As `decode`, the batch's signed bytes and its decode each charged once, for their life, to
+    /// `gauge` (the relay's `Store::Decoded`): the bytes in the allocation every holder of the batch
+    /// shares (`Batch::owned_by`), the decode inside its own (`Decoded::from_verified_owned`), and
+    /// each let go with its last holder, never before it, whichever stages share them. The decode
+    /// is entered in `covered` (the process's, `budget::Covered`) before it is counted alive, so no
+    /// decode is ever alive uncharged, even for an instant. A batch the store has no room for comes
+    /// back ([`NotDecoded::NoRoom`]), as one of a format this build cannot read does
+    /// ([`NotDecoded::Undecodable`], its bytes charged).
+    pub fn decode_owned(
         batch: Batch,
         stamp: Stamp,
-        in_flight: &mut InFlight,
-    ) -> Result<Arc<Decoded>, Box<Undecodable>> {
-        Decoded::from_verified_held(batch, stamp.stamp_ms, stamp.ingest_seq, |decoded| {
-            in_flight.cover(decoded);
-        })
+        gauge: &Arc<Gauge>,
+        covered: &'static crate::budget::Covered,
+    ) -> Result<Arc<Decoded>, NotDecoded> {
+        let batch = batch
+            .owned_by(|bytes| {
+                gauge
+                    .try_charge(bytes)
+                    .map(|charge| Box::new(charge) as tally_wire::decoded::Owner)
+            })
+            .map_err(NotDecoded::NoRoom)?;
+        let charged = std::cell::Cell::new(0);
+        Decoded::from_verified_owned(
+            batch,
+            stamp.stamp_ms,
+            stamp.ingest_seq,
+            |decoded| {
+                charged.set(decoded.footprint());
+                gauge
+                    .try_charge(charged.get())
+                    .map(|charge| Box::new(charge) as tally_wire::decoded::Owner)
+            },
+            |decoded| covered.own(decoded, charged.get()),
+        )
     }
 
     pub fn message(&self) -> &MessageExchange {
@@ -1891,79 +1805,93 @@ mod tests {
         assert_eq!(stages.stamp(0).stamp_ms, 100);
     }
 
-    /// RFC-0181 §2: a connection's allowance is bytes carved from `Store::Ingest` when it is
-    /// admitted, so a peer sending large batches holds its own allowance and never another's. One
-    /// batch past the whole allowance waits until its connection holds nothing, and takes the
-    /// rest from the oversize room.
+    /// A batch the relay hands in itself waits for room on its own thread, however many times it
+    /// waits, a task of a tokio runtime among them: each wait is outside tokio's cooperative
+    /// budget, so the 129th is served as the first was. (Inside the budget, a task that waited
+    /// 128 times without returning to the scheduler spun on its granted charge forever.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_trusted_charge_waits_any_number_of_times_on_a_runtime_s_thread() {
+        let gauge = Gauge::new(Store::Ingest, 10);
+        let mut held = InFlight::trusted(&gauge, 10);
+        for _ in 0..300 {
+            let release = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_micros(200));
+                drop(held);
+            });
+            held = InFlight::trusted(&gauge, 10);
+            assert!(release.join().is_ok());
+        }
+        assert_eq!(gauge.held(), 10);
+        assert!(gauge.waited() > 128, "{}", gauge.waited());
+    }
+
+    /// RFC-0181 §2, "Memory is charged once, for its life": a connection's allowance is a count of
+    /// records, each charged its bytes to the one pool. A connection out of credit waits whatever
+    /// room the pool has, so it never holds more than its records' worth of anyone's room; one
+    /// with credit waits for room while the pool is full; and a record larger than the whole pool
+    /// waits until the pool holds nothing. A connection that holds nothing holds no room.
     #[tokio::test]
-    async fn a_connection_holds_at_most_its_allowance_in_bytes() -> Result<(), String> {
-        let ingest = Gauge::new(Store::Ingest, 300);
-        let oversize = Gauge::new(Store::Ingest, 1_000);
-        let greedy = Allowance::carve(&ingest, &oversize, 100, RELAY_SOURCE);
-        let honest = Allowance::carve(&ingest, &oversize, 100, RELAY_SOURCE);
-        let (Some(greedy), Some(honest)) = (greedy, honest) else {
-            return Err("two allowances fit the store".to_owned());
-        };
-        assert_eq!(ingest.held(), 200);
-        // The greedy connection holds all of its own, and a third would not be carved past the
-        // store.
-        let first = greedy.acquire(60).await;
-        let second = greedy.acquire(40).await;
-        assert_eq!(
-            (greedy.available(), first.bytes() + second.bytes()),
-            (0, 100)
-        );
-        assert!(Allowance::carve(&ingest, &oversize, 101, RELAY_SOURCE).is_none());
-        // The honest one is never held up by it.
+    async fn a_connection_holds_its_credit_and_its_records_bytes_and_no_more() -> Result<(), String>
+    {
+        let pool = Gauge::new(Store::Ingest, 300);
+        let greedy = Allowance::new(&pool, 2, network_source(Some(Group::V4(1)), 1));
+        let honest = Allowance::new(&pool, 2, network_source(Some(Group::V4(2)), 2));
+        // Admitted, neither holds anything.
+        assert_eq!(pool.held(), 0);
+        let first = greedy.acquire(100).await;
+        let second = greedy.acquire(100).await;
+        assert_eq!((greedy.available(), pool.held()), (0, 200));
+        // Out of credit, the greedy one waits though the pool has room.
+        let third = tokio::time::timeout(Duration::from_millis(20), greedy.acquire(10)).await;
+        assert!(third.is_err());
+        // The honest one takes the room left, then waits for room as the pool is full.
         let mine = honest.acquire(100).await;
-        assert_eq!(mine.bytes(), 100);
-        drop(mine);
-        // A batch larger than the allowance waits for its connection to hold nothing.
-        let waiting = tokio::spawn(async move { greedy.acquire(250).await.bytes() });
+        assert_eq!(pool.held(), 300);
+        let waiting = tokio::spawn(async move {
+            let more = honest.acquire(50).await;
+            (more.bytes(), honest)
+        });
         tokio::task::yield_now().await;
         assert!(!waiting.is_finished());
-        drop((first, second));
-        assert_eq!(waiting.await.ok(), Some(250));
-        // Its batch let go, and the connection gone with it: only the honest one's carve is held.
-        assert_eq!((oversize.held(), ingest.held()), (0, 100));
+        drop(first);
+        let (more, honest) = waiting.await.map_err(|error| error.to_string())?;
+        assert_eq!(more, 50);
+        drop((second, mine));
+        // A record larger than the whole pool waits for it to hold nothing, then takes it.
+        let large = tokio::spawn(async move { greedy.acquire(1_000).await.bytes() });
+        tokio::task::yield_now().await;
+        assert_eq!(large.await.ok(), Some(1_000));
+        assert_eq!(pool.held(), 0);
         drop(honest);
-        assert_eq!(ingest.held(), 0);
         Ok(())
     }
 
-    /// Waiting for the oversize room is fair between networks, end to end through the
-    /// connections' allowances: a network with four connections each waiting on a batch larger
-    /// than its allowance, queued first, does not keep a second network's one waiting behind all
-    /// four; the second is served after the first network's first. (Every waiter was one source
-    /// before, so the queue was first come, first served.)
+    /// Waiting for the ingest pool is fair between networks, end to end through the connections'
+    /// allowances: a network with four connections each waiting on a record, queued first, does
+    /// not keep a second network's one waiting behind all four; the second is served after the
+    /// first network's first. (Every waiter was one source before, so the queue was first come,
+    /// first served.)
     #[tokio::test]
-    async fn waiting_for_the_oversize_room_is_fair_between_networks() -> Result<(), String> {
-        const OVER: usize = 200 * 1024;
-        let ingest = Gauge::new(Store::Ingest, 1 << 20);
-        let oversize = Gauge::new(Store::Ingest, OVER);
-        let carve = |group: u16, connection: u64| {
-            Allowance::carve(
-                &ingest,
-                &oversize,
-                100,
+    async fn waiting_for_the_pool_is_fair_between_networks() -> Result<(), String> {
+        const RECORD: usize = 200 * 1024;
+        let pool = Gauge::new(Store::Ingest, RECORD);
+        let allowance = |group: u16, connection: u64| {
+            Allowance::new(
+                &pool,
+                CREDIT,
                 network_source(Some(Group::V4(group)), connection),
             )
-            .ok_or_else(|| "the allowance fits".to_owned())
         };
-        let greedy: Vec<_> = (0..4)
-            .map(|connection| carve(1, connection))
-            .collect::<Result<_, _>>()?;
-        let honest = carve(2, 9)?;
-        // The oversize room is held, so everyone below waits for it.
-        let held = oversize
-            .try_charge(OVER)
-            .ok_or("the room is free to take")?;
+        let greedy: Vec<_> = (0..4).map(|connection| allowance(1, connection)).collect();
+        let honest = allowance(2, 9);
+        // The pool is held, so everyone below waits for it.
+        let held = pool.try_charge(RECORD).ok_or("the pool is free to take")?;
         let order = Arc::new(Mutex::new(Vec::new()));
         let mut tasks = Vec::new();
         for (n, allowance) in greedy.into_iter().enumerate() {
             let order = Arc::clone(&order);
             tasks.push(tokio::spawn(async move {
-                let batch = allowance.acquire(100 + OVER).await;
+                let batch = allowance.acquire(RECORD).await;
                 order
                     .lock()
                     .map(|mut order| order.push(format!("greedy {n}")))
@@ -1974,7 +1902,7 @@ mod tests {
         }
         let behind = Arc::clone(&order);
         tasks.push(tokio::spawn(async move {
-            let batch = honest.acquire(100 + OVER).await;
+            let batch = honest.acquire(RECORD).await;
             behind
                 .lock()
                 .map(|mut order| order.push("honest".to_owned()))
@@ -1982,7 +1910,7 @@ mod tests {
             drop(batch);
         }));
         tokio::task::yield_now().await;
-        assert_eq!(oversize.waiting(), 5);
+        assert_eq!(pool.waiting(), 5);
         drop(held);
         for task in tasks {
             task.await.map_err(|error| error.to_string())?;
@@ -2027,8 +1955,14 @@ mod tests {
             small * 10 >= large * 8 && small <= large * 12 / 10,
             "large batches moved {large}, small ones {small}"
         );
-        // And together they stayed within the members' rate and its burst.
-        assert!(large + small <= (30 << 20) + (1 << 20) + (256 << 10));
+        // And together they stayed within the members' rate and its burst, in charged bytes: the
+        // feeders 1 MiB/s of signed batches is worth, each a planned batch's charge a second.
+        let (rate, _) = pace.rates();
+        assert_eq!(
+            rate,
+            crate::budget::feeders_for_rate(1 << 20) as u64 * PLANNED_BATCH_CHARGE as u64
+        );
+        assert!(large + small <= 30 * rate + crate::ceiling::burst(rate) + (256 << 10));
     }
 
     /// A member's batches are held to receptions as well as bytes: many small receptions in few
@@ -2052,47 +1986,58 @@ mod tests {
         );
     }
 
-    /// A charge shrinks to its decode and splits with its slices, nothing taken or released, and
-    /// what a batch charges before it is decoded covers the decode.
+    /// What a batch is charged before it is decoded bounds what its decode and its signed bytes
+    /// are charged for their life, plain or inflated: the ingest charge is let go at the decode,
+    /// the two charged by themselves from then (`Stages::decode_owned`). Its inflated bytes are
+    /// allocated at their stated length, never at a growing buffer's capacity.
     #[test]
-    fn a_batch_charge_covers_its_decode_and_splits_with_its_slices() -> Result<(), String> {
+    fn a_batch_charge_bounds_its_decode_and_bytes_and_is_let_go_there() -> Result<(), String> {
         let identity = tally_wire::Identity::generate().map_err(|error| error.to_string())?;
-        let batch = Batch::sign(
-            &identity,
-            &tally_wire::BatchContent {
-                boot_id: 1,
-                sequence: 0,
-                counter_epoch: 0,
-                wall_ms: 0,
-                dropped: 0,
-                previous: [0; 32],
-                observations: (0..40u8)
-                    .map(|n| tally_wire::Observation {
-                        format: b'3',
-                        timestamp: u64::from(n),
-                        signal: 0,
-                        data: vec![n; 14],
-                    })
-                    .collect(),
-            },
-        )
-        .map_err(|error| error.to_string())?;
-        let charge = charge_of(&batch);
-        let decoded = Stages::decode(batch, Stamp::default())
-            .map_err(|undecodable| undecodable.error.to_string())?;
-        assert!(charge >= decoded.footprint());
-        let gauge = Gauge::new(Store::Ingest, charge);
-        let mut in_flight = InFlight::trusted(&gauge, charge);
-        in_flight.shrink_to(decoded.footprint());
-        assert_eq!(gauge.held(), decoded.footprint());
-        let slice = in_flight.split(100, &decoded);
-        assert_eq!(
-            (slice.bytes(), in_flight.bytes(), gauge.held()),
-            (100, decoded.footprint() - 100, decoded.footprint())
-        );
-        drop(slice);
-        drop(in_flight);
-        assert_eq!(gauge.held(), 0);
+        for codec in [
+            tally_wire::batch::Codec::Plain,
+            tally_wire::batch::Codec::Deflate,
+        ] {
+            let batch = Batch::sign_with(
+                &identity,
+                &tally_wire::BatchContent {
+                    boot_id: 1,
+                    sequence: 0,
+                    counter_epoch: 0,
+                    wall_ms: 0,
+                    dropped: 0,
+                    previous: [0; 32],
+                    observations: (0..40u8)
+                        .map(|n| tally_wire::Observation {
+                            format: b'3',
+                            timestamp: u64::from(n),
+                            signal: 0,
+                            data: vec![n; 14],
+                        })
+                        .collect(),
+                },
+                codec,
+            )
+            .map_err(|error| error.to_string())?;
+            let charge = charge_of(&batch);
+            let pool = Gauge::new(Store::Ingest, charge);
+            let in_flight = InFlight::trusted(&pool, charge);
+            let decoded_store = Gauge::unlimited(Store::Decoded);
+            let decoded = Stages::decode_owned(
+                batch,
+                Stamp::default(),
+                &decoded_store,
+                crate::budget::Covered::process(),
+            )
+            .map_err(|error| format!("{error:?}"))?;
+            drop(in_flight);
+            assert_eq!(pool.held(), 0);
+            let both = decoded.footprint() + decoded.batch().footprint();
+            assert_eq!(decoded_store.held(), both);
+            assert!(charge >= both, "{codec:?}: {charge} charged, {both} held");
+            assert_eq!(decoded.plain().len(), decoded.inflated_len());
+            drop(decoded);
+            assert_eq!(decoded_store.held(), 0);
+        }
         Ok(())
     }
 
@@ -2168,112 +2113,34 @@ mod tests {
     /// RFC-0181 §2: a batch a connection read holds the store for its own bytes for as long as
     /// anything holds it, whenever the connection ended. A peer that connects, sends a batch the
     /// workers have not taken, and hangs up, again and again, holds `Store::Ingest` for every batch
-    /// it left queued, so the next connection is turned away once the store is full and nothing
-    /// queues uncounted. Before, the carve went back with the read loop, and the store said 0
-    /// while the batches waited.
+    /// it left queued and nothing more: the pool's room is what is queued, whoever connected.
     #[tokio::test]
-    async fn a_batch_a_connection_left_holds_the_store_for_its_own_bytes() -> Result<(), String> {
-        let decoded = a_decode()?;
-        let ingest = Gauge::new(Store::Ingest, 300);
-        let oversize = Gauge::new(Store::Ingest, 1_000);
+    async fn a_batch_a_connection_left_holds_the_pool_for_its_own_bytes() -> Result<(), String> {
+        let pool = Gauge::new(Store::Ingest, 300);
         let mut queued = Vec::new();
-        let mut connected = 0;
-        while let Some(allowance) = Allowance::carve(&ingest, &oversize, 100, RELAY_SOURCE) {
-            connected += 1;
+        for connected in 1..=7 {
+            let allowance = Allowance::new(&pool, CREDIT, RELAY_SOURCE);
             // A batch handed to the workers, then the connection ends.
-            queued.push(allowance.acquire(40).await);
+            match tokio::time::timeout(Duration::from_millis(20), allowance.acquire(40)).await {
+                Ok(in_flight) => queued.push(in_flight),
+                Err(_) => break,
+            }
             drop(allowance);
-            assert_eq!(ingest.held(), 40 * connected);
-            assert!(connected <= 6, "connected past the store");
+            assert_eq!(pool.held(), 40 * connected);
         }
-        // Five batches left behind, and room for one more allowance beside them.
-        assert_eq!(connected, 6);
-        // A slice of a queued batch still holds its share after the rest goes.
-        let mut first = queued.remove(0);
-        let slice = first.split(10, &decoded);
-        drop(first);
-        assert_eq!(ingest.held(), 210);
-        drop(slice);
-        assert_eq!(ingest.held(), 200);
+        // Seven batches left behind, each holding its own bytes and no more.
+        assert_eq!(queued.len(), 7);
+        drop(queued.remove(0));
+        assert_eq!(pool.held(), 240);
         drop(queued);
-        assert_eq!(ingest.held(), 0);
+        assert_eq!(pool.held(), 0);
         Ok(())
     }
 
-    /// A signed batch of forty receptions, decoded.
-    fn a_decode() -> Result<Arc<Decoded>, String> {
-        let identity = tally_wire::Identity::generate().map_err(|error| error.to_string())?;
-        let batch = Batch::sign(
-            &identity,
-            &tally_wire::BatchContent {
-                boot_id: 1,
-                sequence: 0,
-                counter_epoch: 0,
-                wall_ms: 0,
-                dropped: 0,
-                previous: [0; 32],
-                observations: (0..40u8)
-                    .map(|n| tally_wire::Observation {
-                        format: b'3',
-                        timestamp: u64::from(n),
-                        signal: 0,
-                        data: vec![n; 14],
-                    })
-                    .collect(),
-            },
-        )
-        .map_err(|error| error.to_string())?;
-        Stages::decode(batch, Stamp::default()).map_err(|undecodable| undecodable.error.to_string())
-    }
-
-    /// RFC-0181 §2: what a batch holds of `Store::Ingest` is its own bytes, never its connection's
-    /// whole carve. A connection ends while a batch it read is still held (its decode in the
-    /// orphans, a subscriber's queue, the exchange's held parts), and its peer reconnects at once:
-    /// the new connection's allowance fits beside that batch's bytes. Before, every charge held
-    /// the whole carve until the last of them was let go, so after a network blip at the ceiling
-    /// every reconnect was turned away ("no room for its ingest allowance") until the old decodes
-    /// were gone, and a churner could keep it so. While a connection is open, what its charges let
-    /// go goes back to its own carve, never to the store, so it keeps its whole allowance.
-    #[tokio::test]
-    async fn a_batch_holds_its_own_bytes_of_the_carve_and_no_more() -> Result<(), String> {
-        let ingest = Gauge::new(Store::Ingest, 300);
-        let oversize = Gauge::new(Store::Ingest, 1_000);
-        let first = Allowance::carve(&ingest, &oversize, 100, RELAY_SOURCE)
-            .ok_or("the first carve fits")?;
-        let mut held = first.acquire(40).await;
-        // Decoded smaller: what it let go is the open connection's again, not the store's.
-        held.shrink_to(30);
-        assert_eq!((ingest.held(), first.available()), (100, 70));
-        // The connection ends, its batch still held: the store holds the batch's bytes alone.
-        drop(first);
-        assert_eq!(ingest.held(), 30);
-        // Its peer reconnects, and another beside it: both fit beside the batch, a third not.
-        let second =
-            Allowance::carve(&ingest, &oversize, 100, RELAY_SOURCE).ok_or("a reconnect fits")?;
-        let third =
-            Allowance::carve(&ingest, &oversize, 100, RELAY_SOURCE).ok_or("a second one fits")?;
-        assert_eq!(ingest.held(), 230);
-        assert!(Allowance::carve(&ingest, &oversize, 100, RELAY_SOURCE).is_none());
-        // A slice of the old batch holds its share, the rest its own.
-        let slice = held.split(10, &a_decode()?);
-        drop(held);
-        assert_eq!(ingest.held(), 210);
-        drop(slice);
-        assert_eq!(ingest.held(), 200);
-        // An open connection's charges come from its carve and go back to it: the store holds the
-        // two carves whatever they lend.
-        let lent = second.acquire(100).await;
-        assert_eq!((ingest.held(), second.available()), (200, 0));
-        drop(lent);
-        assert_eq!((ingest.held(), second.available()), (200, 100));
-        drop((second, third));
-        assert_eq!(ingest.held(), 0);
-        Ok(())
-    }
-
-    /// RFC-0181 §2: however small its records, a connection has at most `RECORDS_IN_FLIGHT` of
-    /// them waiting for, or in, the workers: each is charged at least `CHARGE_FLOOR`, the cost of
-    /// its verification. By bytes alone a 300-byte batch took some 500 places.
+    /// RFC-0181 §2: however small its records, a connection has at most its credit of them waiting
+    /// for, or in, the workers (a member session `RECORDS_IN_FLIGHT`), each charged at least
+    /// `CHARGE_FLOOR`, the cost of its verification. By bytes alone a 300-byte batch took some 500
+    /// places.
     #[tokio::test]
     async fn a_connection_holds_at_most_its_records_in_flight_however_small() -> Result<(), String>
     {
@@ -2293,10 +2160,8 @@ mod tests {
         .map_err(|error| error.to_string())?;
         assert!(tiny.as_bytes().len() < 400);
         assert_eq!(charge_of(&tiny), CHARGE_FLOOR);
-        let ingest = Gauge::unlimited(Store::Ingest);
-        let oversize = Gauge::new(Store::Ingest, OVERSIZE_BYTES);
-        let allowance = Allowance::carve(&ingest, &oversize, FEEDER_ALLOWANCE, RELAY_SOURCE)
-            .ok_or("an allowance fits an unlimited store")?;
+        let pool = Gauge::unlimited(Store::Ingest);
+        let allowance = Allowance::new(&pool, RECORDS_IN_FLIGHT, RELAY_SOURCE);
         let mut held = Vec::new();
         while let Ok(in_flight) =
             tokio::time::timeout(Duration::ZERO, allowance.acquire(charge_of(&tiny))).await
@@ -2310,11 +2175,10 @@ mod tests {
         Ok(())
     }
 
-    /// Rooms that bound nothing: a test's stages.
+    /// A room that bounds nothing: a test's stages.
     fn unlimited_room() -> Room {
         Room {
             ingest: Gauge::unlimited(Store::Ingest),
-            oversize: Gauge::unlimited(Store::Ingest),
         }
     }
 
@@ -2328,7 +2192,6 @@ mod tests {
     fn the_workers_queues_hold_no_more_than_the_rooms_admit() -> Result<(), String> {
         let room = Room {
             ingest: Gauge::new(Store::Ingest, 2 * CHARGE_FLOOR),
-            oversize: Gauge::new(Store::Ingest, 0),
         };
         assert_eq!(room.records(), 2);
         let sink: Sink = Arc::new(|_| Ok(()));
@@ -2532,9 +2395,7 @@ mod tests {
                 Box::new(move |producer| {
                     let stamp = working.stamp(producer);
                     if let Ok(decoded) = Stages::decode(batch, stamp) {
-                        working
-                            .message()
-                            .route(producer, &decoded, None, InFlight::free());
+                        working.message().route(producer, &decoded, None);
                     }
                     let _ = done.send(());
                 }),

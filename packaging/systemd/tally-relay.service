@@ -50,10 +50,12 @@ LimitNOFILE=65536
 # A relay under memory pressure is throttled past MemoryHigh and, past MemoryMax, killed by the
 # kernel's OOM killer inside its own cgroup and restarted (Restart=always), rather than taking the
 # host down with it. The relay's budget is MemoryHigh less its headroom: 64 MiB and a quarter of
-# the plan for the allocator's free pages (`budget::headroom_for`); 4G holds every member session a
-# base cell brings and feeders beside them (`tally-relay check`, held by //crates/relay:check).
-MemoryHigh=4G
-MemoryMax=5G
+# the plan for the allocator's free pages (`budget::headroom_for`); 6G holds every member session a
+# base cell brings (the 2,048 the default connection cap allows, each with its kernel socket
+# buffers, its link's and an engine's place) and feeders beside them (`tally-relay check`, held by
+# //crates/relay:check). 4G held them only while those buffers were planned nowhere.
+MemoryHigh=6G
+MemoryMax=7G
 
 NoNewPrivileges=yes
 ProtectSystem=strict

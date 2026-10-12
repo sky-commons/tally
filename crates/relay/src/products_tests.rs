@@ -53,8 +53,7 @@ impl Staged {
     /// A receiver's batch, decoded and stamped: into its area's regional product, if any.
     fn feed(&self, batch: &Arc<Decoded>) {
         let area = self.products.area_for(&batch.receiver());
-        self.exchange
-            .route(0, batch, area, crate::ingest::InFlight::free());
+        self.exchange.route(0, batch, area);
         self.exchange.tick(0, stamp(batch.stamp_ms()));
     }
 

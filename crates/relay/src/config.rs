@@ -21,14 +21,15 @@ usage: tally-relay --key FILE [--key FILE]... --max-upload RATE [options]
                                    (but for the key files, which it does not read, and the
                                    sockets, which it does not open), then print the plan
                                    (memory; what it holds before any feeder, each part: base,
-                                   oversize, connection-buffers, member-pool, member-links,
-                                   parity-assembly, and their sum, before-feeders;
+                                   connection-buffers, connection-sockets, member-pool,
+                                   member-links, parity-assembly, and their sum,
+                                   before-feeders;
                                    connections, the floor and per-connection costs,
                                    connection-limit and R_max (max-receptions-per-sec) with what
                                    bound each, every store's limit, mlat-seats, cores,
                                    feeder-records, ingest-threads, message-threads, seal-threads,
                                    mlat-threads, handshakes-in-flight, handshakes-per-sec,
-                                   members, per-member, member-feeders, member-rate-pool,
+                                   members, member-feeders, member-rate-pool,
                                    planned, headroom, limit)
                                    and exit 0.
                                    --memory-limit is the memory the relay will run in (the

@@ -138,6 +138,12 @@ pub enum Piece {
 /// A record's header: kind, then its body's length.
 const HEADER_LEN: usize = 3;
 
+/// What a group holds for one record beside its signed bytes: its entry by hash and the shared
+/// batch it names ([`Piece::held_len`]).
+pub const PIECE_ENTRY_BYTES: usize = std::mem::size_of::<(Hash, Held)>()
+    + tally_wire::decoded::ARC_HEADER
+    + std::mem::size_of::<Batch>();
+
 impl Piece {
     /// The piece of a record, without copying a batch's bytes. `None` for a record that does not
     /// encode.
@@ -187,6 +193,18 @@ impl Piece {
         match self {
             Self::Batch(batch) | Self::RelayBatch(batch) => Some(batch.hash()),
             Self::Encoded(bytes) => piece_hash(bytes),
+        }
+    }
+
+    /// What holding it allocates, as the groups are charged for it (`budget::Store::Batches`):
+    /// a batch kept at ingest, whose signed bytes carry their own charge for their life
+    /// (`Batch::owned_by`, `budget::Store::Decoded`), only its place ([`PIECE_ENTRY_BYTES`]); any
+    /// other piece its encoded bytes, which are its own. Before, every batch was charged its bytes
+    /// here and again in its decode, in the epochs and in each subscriber's queue.
+    pub fn held_len(&self) -> usize {
+        match self {
+            Self::Batch(batch) | Self::RelayBatch(batch) if batch.is_owned() => PIECE_ENTRY_BYTES,
+            _ => self.len(),
         }
     }
 
@@ -643,7 +661,7 @@ impl Group {
 
     /// Holds a piece, counting its bytes, which its caller has charged (`Member::charge`).
     fn hold(&mut self, hash: Hash, piece: Piece, at_ms: u64, from: Vec<(PublicKey, u64)>) {
-        self.bytes += piece.len();
+        self.bytes += piece.held_len();
         self.pieces.insert(hash, Held { piece, at_ms, from });
     }
 
@@ -918,7 +936,7 @@ impl Member {
                 group
                     .pieces
                     .values()
-                    .map(|held| held.piece.len())
+                    .map(|held| held.piece.held_len())
                     .sum::<usize>()
                     + group
                         .parity
@@ -1090,7 +1108,7 @@ impl Member {
             .groups
             .get(&key)
             .is_some_and(|group| group.pieces.contains_key(&hash));
-        if !held && !self.charge(piece.len()) {
+        if !held && !self.charge(piece.held_len()) {
             return Vec::new();
         }
         let group = self
@@ -1156,7 +1174,7 @@ impl Member {
             self.stats.duplicates += 1;
             return Vec::new();
         }
-        if piece.hash() != Some(hash) || !self.charge(piece.len()) {
+        if piece.hash() != Some(hash) || !self.charge(piece.held_len()) {
             return Vec::new();
         }
         let Some(group) = self.groups.get_mut(&key) else {
@@ -1690,7 +1708,7 @@ fn rebuild(
         if group.pieces.contains_key(&hash) {
             continue;
         }
-        if !charge(held, stats, piece.len()) {
+        if !charge(held, stats, piece.held_len()) {
             continue;
         }
         group.hold(hash, piece.clone(), now_ms, Vec::new());
@@ -2087,7 +2105,7 @@ fn forget(group: &mut Group, now_ms: u64) -> usize {
     group.pieces.retain(|_, held| {
         let keep = held.at_ms >= horizon_ms;
         if !keep {
-            freed += held.piece.len();
+            freed += held.piece.held_len();
         }
         keep
     });

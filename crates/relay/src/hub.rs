@@ -135,12 +135,13 @@ pub const DESCRIPTION_BYTES_HELD: usize = 64 * 1024 * 1024;
 /// from room the plan sizes to every connection but a feeder's the caps allow (this cap, the
 /// member sessions and the subscribers, `Hub::plan`, `budget::Plan::connection_buffers`), so a
 /// peer trickling a message, or reading slowly, holds what was planned for it. The kernel's
-/// socket buffers for the fan-out's links are charged to the relay's cgroup beside it.
+/// socket buffers are pinned per role (`sockets`) and planned beside them
+/// (`budget::Plan::connection_sockets`, and a feeder's floor).
 ///
 /// The members (the sessions over which other relays' data comes in) share one rate
 /// (`DEFAULT_MAX_MEMBER_BYTES_PER_SEC`), planned once as the feeders it is worth, and each member
-/// session carves its ingest allowance from the members' own pool, sized at start for every member
-/// session the areas taken bring, at most this cap (`budget::members_for`,
+/// session holds one of the places planned at start for every member session the areas taken
+/// bring, at most this cap (`budget::members_for`,
 /// `budget::Budget::reserve_member`), so what they send is admitted the same way as a feeder's and
 /// never competes with feeders for room; past them a member is turned away as full
 /// (`Reason::Full`) and routed around (RFC-0174 §2.5). This cap holds the sessions that have no
@@ -524,6 +525,11 @@ pub struct MemoryReport {
     /// short.
     pub ingest_queued: usize,
     pub ingest_refused: u64,
+    /// Batches admitted by the ingest rate and let go before their decode for want of room for it
+    /// and their signed bytes (`Store::Decoded`, whose gauge counts each refusal too): none while
+    /// every holder keeps a decode no longer than its deadline, the store being planned for the rate
+    /// over the longest of them (`budget::decoded_window_ms`).
+    pub decoded_refused: u64,
     /// What the ingest rate cut, per source and reason (`shed`): every cut a feeder's batch met,
     /// all at ingest, before it was signed or shared.
     pub shed: crate::shed::ShedReport,
@@ -580,8 +586,8 @@ pub struct Inbound {
     pub stamp: Option<Stamp>,
     /// Its charge in the ingest stage (`ingest::charge_of`), from its connection's allowance or,
     /// handed in by the relay itself, from `Store::Ingest` (`Hub::in_flight_for`): no batch reaches
-    /// the stage uncharged. Shrunk to its decode, carried with its slices to the message exchange,
-    /// released when the epochs hold it or it is let go.
+    /// the stage uncharged. Released once it is decoded, its decode and its signed bytes then
+    /// charged by themselves for their life (`ingest::Stages::decode_owned`), or once it is let go.
     pub in_flight: InFlight,
     /// Where a refused signature ends the connection.
     pub refusal: Option<Arc<Refusal>>,
@@ -810,6 +816,9 @@ pub struct Hub {
     next_connection: AtomicU64,
     subscribers: Arc<AtomicUsize>,
     max_subscribers: usize,
+    /// The engines given an engine's socket buffers (`engine_place`), at most the member
+    /// sessions planned (`budget::Plan::connection_sockets`).
+    engines: Arc<AtomicUsize>,
     connections: Arc<AtomicUsize>,
     max_connections: usize,
     /// Connections held per source (`source_of`), each entry removed when its last one ends.
@@ -832,6 +841,8 @@ pub struct Hub {
     /// Feeders' batches dropped for taking their receiver past its wanted receptions a second
     /// (`ingest::ReceptionCeilings`), and the wanted receptions they carried.
     over_ceiling_batches: AtomicU64,
+    /// Batches let go before their decode for want of room in `Store::Decoded`.
+    decoded_refused: AtomicU64,
     over_ceiling_receptions: AtomicU64,
     /// The relay-wide ingest rate (`shed`): unbounded until the plan names `R_max`
     /// (`Hub::admitted_rate`).
@@ -1017,6 +1028,7 @@ impl Hub {
             next_connection: AtomicU64::new(RELAY_ITSELF + 1),
             subscribers: Arc::new(AtomicUsize::new(0)),
             max_subscribers,
+            engines: Arc::new(AtomicUsize::new(0)),
             connections: Arc::new(AtomicUsize::new(0)),
             max_connections: DEFAULT_MAX_CONNECTIONS,
             per_address: Arc::new(Mutex::new(HashMap::new())),
@@ -1032,6 +1044,7 @@ impl Hub {
             directory_records: crate::ingest::DirectoryPaces::new(crate::ingest::DIRECTORY_RECORDS),
             burst_grants: crate::ingest::BurstGrants::default(),
             over_ceiling_batches: AtomicU64::new(0),
+            decoded_refused: AtomicU64::new(0),
             over_ceiling_receptions: AtomicU64::new(0),
             shedder: crate::shed::Shedder::unbounded(),
             admitted_rate: None,
@@ -1083,6 +1096,7 @@ impl Hub {
         pause: Option<Pause>,
     ) -> Result<Self, String> {
         let clock = self.stages.clock();
+        self.release_stages();
         let gauges = Gauges::of(&self.budget);
         // The sealer moves onto its thread wherever it is held: no exclusive hold is needed, so
         // it can never be left inline behind threaded stages.
@@ -1105,9 +1119,8 @@ impl Hub {
     /// compare byte for byte by. Built before the hub is shared or staged.
     pub fn product_boots(mut self, boot_id: u64) -> Self {
         let clock = self.stages.clock();
-        let unused: Sink = Arc::new(|_| Ok(()));
+        self.release_stages();
         let gauges = Gauges::of(&self.budget);
-        self.stages = Stages::inline(Arc::clone(&clock), unused, gauges.clone());
         self.network.products = Arc::new(crate::products::Products::with_boots(
             boot_id,
             boot_id.wrapping_add(1),
@@ -1116,6 +1129,19 @@ impl Hub {
         self.network.charge_to(&self.budget);
         self.stages = Stages::inline(clock, self.network.products.sink(), gauges);
         self
+    }
+
+    /// Lets go of the stages, and with them the fingerprints' tables they charged, before new ones
+    /// are made: stages allocate their tables at the capacity the plan reserved
+    /// (`exchange::Gauges::of`), so the old and the new held at once would be twice the plan and
+    /// the new ones refused. What stands in until then holds no table and is charged nothing.
+    fn release_stages(&mut self) {
+        let unused: Sink = Arc::new(|_| Ok(()));
+        let none = Gauges {
+            dedup_receptions: 0,
+            ..Gauges::unlimited()
+        };
+        self.stages = Stages::inline(self.stages.clock(), unused, none);
     }
 
     /// The relay may use `memory` bytes, and holds MLAT raw (`holds_raw`: it hosts MLAT) or not:
@@ -1127,7 +1153,25 @@ impl Hub {
         self.budget.resize(memory, self.plan());
         self.fanout = Arc::new(router(&self.budget, self.queue_bytes));
         self.network.charge_to(&self.budget);
-        self.shedder_built()
+        self.inline_restaged().shedder_built()
+    }
+
+    /// Stages run by the caller made again for the budget as it now stands: their fingerprints'
+    /// tables are allocated at the capacity the plan reserved when they were made
+    /// (`exchange::Gauges::of`), so the ones made for an earlier plan would hold what that plan
+    /// reserved, not this one's. Threaded stages are made once the budget is final
+    /// (`Hub::staged`), and are left as they are.
+    fn inline_restaged(mut self) -> Self {
+        if self.stages.is_inline() {
+            let clock = self.stages.clock();
+            self.release_stages();
+            self.stages = Stages::inline(
+                clock,
+                self.network.products.sink(),
+                Gauges::of(&self.budget),
+            );
+        }
+        self
     }
 
     /// The least memory that admits `feeders` beside everything this hub plans before any
@@ -1272,6 +1316,7 @@ impl Hub {
             members_refused: self.members_refused.load(Ordering::Relaxed),
             ingest_queued: self.stages.queued(),
             ingest_refused: self.stages.refused(),
+            decoded_refused: self.decoded_refused.load(Ordering::Relaxed),
             shed: self.shedder.report(),
             handshakes: self.handshake_report(),
         }
@@ -1287,16 +1332,11 @@ impl Hub {
         self.members_refused.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// A connection's ingest allowance of `bytes` (`ingest::Allowance`), carved from
-    /// `Store::Ingest`: a feeder's (`ingest::FEEDER_ALLOWANCE`) or a member's, each within what it
-    /// reserved. `None` when the store has no room for it.
-    pub fn allowance(&self, bytes: usize, source: u64) -> Option<crate::ingest::Allowance> {
-        crate::ingest::Allowance::carve(
-            &self.budget.gauge(Store::Ingest),
-            &self.budget.oversize(),
-            bytes,
-            source,
-        )
+    /// A connection's ingest allowance (`ingest::Allowance`): `records` records at once
+    /// (`ingest::CREDIT` for a feeder, `ingest::RECORDS_IN_FLIGHT` for a member session), each
+    /// charged to the one ingest pool (`Store::Ingest`) in `source`'s turn.
+    pub fn allowance(&self, records: usize, source: u64) -> crate::ingest::Allowance {
+        crate::ingest::Allowance::new(&self.budget.gauge(Store::Ingest), records, source)
     }
 
     /// A batch the relay itself hands in (a test's trace, a replay): charged to `Store::Ingest`
@@ -1675,7 +1715,7 @@ impl Hub {
             origin,
             verify,
             stamp,
-            mut in_flight,
+            in_flight,
             refusal,
         } = inbound;
         let Ok(receiver) = batch.receiver() else {
@@ -1719,27 +1759,46 @@ impl Hub {
             Origin::Feeder(_, group) => Some(self.shed_unit(&receiver, *group)),
             _ => None,
         };
+        // Judged by its cost of the rate (`ingest::rate_cost`: what it is charged, the unit
+        // `R_max`'s bytes and every store holding its decode are planned in, or its signed bytes
+        // weighed for the groups that hold them longer): a batch inflated past the planned mean, or
+        // padded, costs its share what it costs the stores, never only its bytes on the wire.
         let cost = shed::Cost {
             receptions: batch.receptions().map_or(0, |n| n as u64),
-            bytes: batch.as_bytes().len() as u64,
+            bytes: crate::ingest::rate_cost(&batch) as u64,
         };
         if let Some(unit) = unit
             && self.shedder.judge(unit, cost, stamp.stamp_ms).is_err()
         {
             return false;
         }
-        // A format this build cannot read is still forwarded raw; it just adds nothing here.
-        let (batch, decoded) = match Stages::decode_covered(batch, stamp, &mut in_flight) {
-            Ok(decoded) => {
-                // Covered from before it is counted alive (`Stages::decode_covered`), then charged
-                // for what it holds, no more, until the epochs hold it. Covered first: shrinking
-                // releases bytes, which wakes whoever waits for room in the store, and a decode not
-                // yet covered when that thread runs first is one no charge covers for as long as
-                // this one waits.
-                in_flight.shrink_to(decoded.footprint());
-                (decoded.batch().clone(), Some(decoded))
+        // Its signed bytes and its decode each charged once, for their life, to `Store::Decoded`
+        // (`Stages::decode_owned`), whichever stages hold them from here: the ingest charge is
+        // done. A format this build cannot read is still forwarded raw, its bytes charged; it
+        // just adds nothing here. One the store has no room for is let go, counted.
+        let store = self.budget.gauge(Store::Decoded);
+        let covered = crate::budget::Covered::process();
+        let mut decoded = Stages::decode_owned(batch, stamp, &store, covered);
+        // No room: the subscribers keeping the most alive are let go, as fallen behind, while
+        // that makes room (a decode an epoch or MLAT still holds stays), as the fan-out's own
+        // gauge lets them go for an item.
+        while let Err(tally_wire::decoded::NotDecoded::NoRoom(batch)) = decoded {
+            if !self.fanout.let_go_largest() {
+                decoded = Err(tally_wire::decoded::NotDecoded::NoRoom(batch));
+                break;
             }
-            Err(undecodable) => (undecodable.batch, None),
+            decoded = Stages::decode_owned(batch, stamp, &store, covered);
+        }
+        drop(in_flight);
+        let (batch, decoded) = match decoded {
+            Ok(decoded) => (decoded.batch().clone(), Some(decoded)),
+            Err(tally_wire::decoded::NotDecoded::Undecodable(undecodable)) => {
+                (undecodable.batch, None)
+            }
+            Err(tally_wire::decoded::NotDecoded::NoRoom(_)) => {
+                self.decoded_refused.fetch_add(1, Ordering::Relaxed);
+                return false;
+            }
         };
         // A feeder's batch that would take its receiver past its wanted receptions a second is
         // dropped here, counted, never waited for on its read loop: the feeder
@@ -1815,9 +1874,7 @@ impl Hub {
         let cell = described.flatten();
         if let Some(decoded) = &decoded {
             let area = self.network.products.area_for(&receiver);
-            self.stages
-                .message()
-                .route(producer, decoded, area, in_flight);
+            self.stages.message().route(producer, decoded, area);
         }
         self.network.on_batch(decoded.as_ref(), stamp.stamp_ms);
         let record = Record::Batch(batch);
@@ -2341,6 +2398,14 @@ impl Hub {
         self.infos_for(subscription)
     }
 
+    /// One of the engines' places, which gives an engine its socket buffers
+    /// (`sockets::Role::Engine`): as many as the member sessions planned, since an engine is a
+    /// member relay's MLAT, so the kernel's buffers for them are planned
+    /// (`budget::Plan::connection_sockets`). `None` past them: the engine is served at a feeder's.
+    pub fn engine_place(&self) -> Option<Slot> {
+        Slot::take(&self.engines, self.budget().members())
+    }
+
     /// Every description, for a link to another relay, which does not count against the
     /// subscriber cap (it carries load as well as takes it). It joins the fan-out after sending
     /// them, as a subscriber does (see `subscribe`).
@@ -2401,12 +2466,18 @@ impl Hub {
 }
 
 /// Unix milliseconds now, as the station reports state times.
-/// Each subscriber's queue bounds: `BEHIND_MS` of inbound, and the bytes the budget gives the
-/// fan-out (every admitted feeder's share: the queues share each record, so one queue may hold
-/// all of it), at least `MIN_QUEUE_BYTES`.
+/// Each subscriber's queue bounds: `BEHIND_MS` of inbound, and the bytes it may keep alive
+/// (`fanout::item_bytes`: the decodes and signed bytes `R_max` and the members' rate bring in
+/// over `BEHIND_MS`, as charged; the queues share each, so one queue may hold all of it), at least
+/// `MIN_QUEUE_BYTES`.
 fn queue_bounds(budget: &Budget) -> Bounds {
+    let charged = budget.max_bytes_per_sec().saturating_add(
+        (budget.member_feeders() as u64)
+            .saturating_mul(crate::budget::PLANNED_CHARGED_BYTES_PER_SEC as u64),
+    );
+    let behind = usize::try_from(charged.saturating_mul(BEHIND_MS) / 1_000).unwrap_or(usize::MAX);
     Bounds {
-        max_bytes: budget.store_bytes(Store::Fanout).max(MIN_QUEUE_BYTES),
+        max_bytes: behind.max(MIN_QUEUE_BYTES),
         max_age_ms: BEHIND_MS,
     }
 }
@@ -2899,6 +2970,116 @@ mod tests {
             memory.ingest_refused, 0,
             "nothing was refused past the ingest rate"
         );
+        assert_eq!(hub.network().products.report().epochs_refused, 0);
+        Ok(())
+    }
+
+    /// RFC-0181, "Memory is charged once, for its life" (model point 1): `R_max`'s bytes are the
+    /// bytes a batch is charged (`ingest::charge_of`), and a feeder is judged by them. One feeder,
+    /// well within its share of the receptions, sends batches inflated as far as the wire allows
+    /// (`MAX_INFLATION`) of the longest receptions (UAT uplinks): on the wire it sends a tenth of
+    /// `R_max`'s bytes, so judged by its wire bytes it was admitted whole, and its decodes passed
+    /// the stores planned from `R_max`. Judged by what they are charged it is cut to `R_max`'s
+    /// bytes, counted, and no store holding its decodes is overrun: none is refused room.
+    #[test]
+    fn an_inflated_feeder_is_shed_by_its_charged_bytes_and_overruns_no_store() -> Result<(), String>
+    {
+        let hub = Arc::new(Hub::new(8).cores(64).memory_for_feeders(4, false));
+        let rate = hub
+            .shed_report()
+            .rate
+            .ok_or("the hub sheds at the rate it plans")?;
+        assert_eq!(rate.bytes_per_s, hub.budget().max_bytes_per_sec());
+        let feeder = Identity::from_seed([61; 32]);
+        // Ten uplinks a batch, each nine copies of 48 bytes of its own: DEFLATE carries them in
+        // about an eighth of their bytes.
+        let batch = |sequence: u64| -> Result<Batch, String> {
+            let mut state = sequence.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+            let observations = (0..10u64)
+                .map(|n| {
+                    let block: Vec<u8> = (0..48)
+                        .map(|_| {
+                            state ^= state << 13;
+                            state ^= state >> 7;
+                            state ^= state << 17;
+                            state as u8
+                        })
+                        .collect();
+                    Observation {
+                        format: b'U',
+                        timestamp: n,
+                        signal: 0,
+                        data: block.repeat(9),
+                    }
+                })
+                .collect();
+            Batch::sign_with(
+                &feeder,
+                &BatchContent {
+                    boot_id: 1,
+                    sequence,
+                    counter_epoch: 0,
+                    wall_ms: 0,
+                    dropped: 0,
+                    previous: [0; 32],
+                    observations,
+                },
+                tally_wire::batch::Codec::Deflate,
+            )
+            .map_err(|error| error.to_string())
+        };
+        let probe = batch(0)?;
+        let inflation = probe.inflated_len().map_err(|error| error.to_string())? as f64
+            / probe.as_bytes().len() as f64;
+        assert_eq!(probe.format(), tally_wire::batch::BATCH_FORMAT_DEFLATE);
+        assert!(
+            inflation > 5.0 && inflation <= tally_wire::batch::MAX_INFLATION as f64,
+            "inflated {inflation:.1} times"
+        );
+        const SECONDS: u64 = 6;
+        const PER_SECOND: u64 = 50;
+        let (mut wire, mut charged, mut receptions, mut admitted) = (0u64, 0u64, 0u64, 0u64);
+        for tick in 0..SECONDS * PER_SECOND {
+            let batch = batch(tick + 1)?;
+            let cost = crate::ingest::charge_of(&batch) as u64;
+            wire += batch.as_bytes().len() as u64;
+            charged += cost;
+            receptions += 10;
+            let kept = feed(
+                &hub,
+                1,
+                batch,
+                Origin::Feeder(None, Some(crate::ingest::Group::V4(7))),
+                BASE_MS + tick * 1_000 / PER_SECOND,
+            );
+            if kept {
+                admitted += cost;
+            }
+        }
+        // Within its share of the receptions, and a fraction of R_max's bytes on the wire: by
+        // its wire bytes it was never cut. By what it is charged it is past R_max.
+        assert!(
+            receptions < SECONDS * rate.receptions_per_s / 4,
+            "{receptions}"
+        );
+        assert!(wire < SECONDS * rate.bytes_per_s / 4, "{wire} on the wire");
+        assert!(
+            charged > 2 * SECONDS * rate.bytes_per_s,
+            "{charged} charged"
+        );
+        // Cut to R_max's bytes (and its burst), counted.
+        let report = hub.shed_report();
+        assert!(report.over_share.batches + report.relay_rate.batches > 0);
+        assert!(
+            admitted <= (SECONDS + 2) * rate.bytes_per_s,
+            "{admitted} admitted against {} a second",
+            rate.bytes_per_s
+        );
+        // No store holding its decodes or its bytes was overrun.
+        let decoded = hub.budget().gauge(Store::Decoded);
+        assert_eq!(hub.memory_report().decoded_refused, 0);
+        assert_eq!(decoded.refused(), 0);
+        assert!(decoded.peak() <= decoded.limit());
         assert_eq!(hub.network().products.report().epochs_refused, 0);
         Ok(())
     }
