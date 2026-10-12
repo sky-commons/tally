@@ -70,7 +70,7 @@ const REFUSED_RETRY_SECS: u32 = 86_400;
 /// minutes). A refusal for that is a wait for gossip, not a verdict. Offers spread and are verified
 /// within seconds, and two relays learn of each other in either order, so a member dials one that
 /// has not verified it yet as often as not; asked to stay away a re-signing (a minute), its slice
-/// for that member waited a minute, past the repair horizon (`sharing::member::HORIZON_MS`), and
+/// for that member waited a minute, past the repair horizon (`sharing::Deadlines::horizon_ms`), and
 /// reached it that late or, past its link's share (`peers::WAITING_PER_LINK_BYTES`), not at all.
 /// Its doubling still spaces out a relay whose offer
 /// is never verified, and it is never the day a broken peer is given.
@@ -2771,7 +2771,7 @@ mod tests {
         let storm = 60;
         let permits = 4;
         let hub = Arc::new(
-            Hub::new(8)
+            Hub::new(8, crate::sharing::Deadlines::RELAY)
                 .max_connections_per_address(storm * 2)
                 .max_connections(storm * 2)
                 .max_upload(roomy())
@@ -2858,15 +2858,23 @@ mod tests {
             .await
             .map_err(text)?;
         let address = listener.local_addr().map_err(text)?.to_string();
-        tokio::spawn(crate::serve(listener, vec![parent], Arc::new(Hub::new(8))));
+        tokio::spawn(crate::serve(
+            listener,
+            vec![parent],
+            Arc::new(Hub::new(8, crate::sharing::Deadlines::RELAY)),
+        ));
         let child = Identity::generate().map_err(text)?;
         let upstream = Upstream {
             address,
             key: parent_key,
         };
-        let asked = upstream_once(&upstream, &child, &Arc::new(Hub::new(8)))
-            .await?
-            .map(|away| away.wait);
+        let asked = upstream_once(
+            &upstream,
+            &child,
+            &Arc::new(Hub::new(8, crate::sharing::Deadlines::RELAY)),
+        )
+        .await?
+        .map(|away| away.wait);
         // Neither accepted nor verified: asked to wait gossip's time (its own schedule's first
         // step), never a re-signing's, so a member whose offer is still spreading is not kept out.
         assert_eq!(
@@ -2915,7 +2923,11 @@ mod tests {
                 .await
                 .map_err(text)?;
             let address = listener.local_addr().map_err(text)?.to_string();
-            tokio::spawn(crate::serve(listener, vec![far], Arc::new(Hub::new(8))));
+            tokio::spawn(crate::serve(
+                listener,
+                vec![far],
+                Arc::new(Hub::new(8, crate::sharing::Deadlines::RELAY)),
+            ));
             // A relay taking an area, so a raw link has its place in the members' pool.
             let area = tally_wire::rendezvous::area_of(&tally_wire::Location {
                 lat_e7: 337_490_000,
@@ -2924,7 +2936,7 @@ mod tests {
                 precision_m: 0,
             })
             .map_err(text)?;
-            let hub = Arc::new(Hub::new(8).taking(vec![area]));
+            let hub = Arc::new(Hub::new(8, crate::sharing::Deadlines::RELAY).taking(vec![area]));
             let (_sender, outgoing) = mpsc::channel(1);
             let subscribe = Record::Subscribe {
                 streams: Streams::RAW,
@@ -2962,7 +2974,7 @@ mod tests {
                 drop(stream);
             }
         });
-        let hub = Arc::new(Hub::new(8));
+        let hub = Arc::new(Hub::new(8, crate::sharing::Deadlines::RELAY));
         let (_sender, outgoing) = mpsc::channel(1);
         let since = Instant::now();
         let dialling = tokio::spawn(member(
@@ -3017,7 +3029,12 @@ mod tests {
             address,
             key: parent_key,
         };
-        let asked = upstream_once(&upstream, &child, &Arc::new(Hub::new(8))).await?;
+        let asked = upstream_once(
+            &upstream,
+            &child,
+            &Arc::new(Hub::new(8, crate::sharing::Deadlines::RELAY)),
+        )
+        .await?;
         // And that it said it is full, which a dialler of data routes around.
         assert_eq!(
             asked,
@@ -3066,7 +3083,9 @@ mod tests {
         // The ingest clock stopped: signing the batches below takes real seconds in a debug
         // build, and a subscriber is let go two seconds of inbound behind, which is not what
         // this measures.
-        let hub = Arc::new(Hub::clocked(1, Arc::new(|| 0)).max_upload(roomy()));
+        let hub = Arc::new(
+            Hub::clocked(1, Arc::new(|| 0), crate::sharing::Deadlines::RELAY).max_upload(roomy()),
+        );
         let relay = Identity::generate().map_err(text)?;
         let relay_key = relay.public();
         let (near, far) = tokio::io::duplex(64 * 1024);
@@ -3130,7 +3149,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_beast_out_client_that_never_reads_is_dropped_at_its_deadline() -> Result<(), String>
     {
-        let hub = Arc::new(Hub::new(1).max_upload(roomy()));
+        let hub = Arc::new(Hub::new(1, crate::sharing::Deadlines::RELAY).max_upload(roomy()));
         let (unread, far) = tokio::io::duplex(1024);
         let far = hub.egress().socket(far, None);
         let out = hub.listen(hub.connection_id(), Filter::Beast);
@@ -3243,7 +3262,7 @@ mod tests {
         let clock: crate::ingest::Clock =
             Arc::new(move || 1_000_000 + u64::try_from(started.elapsed().as_millis()).unwrap_or(0));
         let hub = Arc::new(
-            Hub::clocked(1, clock)
+            Hub::clocked(1, clock, crate::sharing::Deadlines::RELAY)
                 .queue_bytes(RING * 512)
                 .max_upload(roomy()),
         );
@@ -3467,7 +3486,7 @@ mod tests {
     #[tokio::test]
     async fn a_probe_is_answered_never_admitted_and_ended_when_it_sends_anything_else()
     -> Result<(), String> {
-        let hub = Arc::new(Hub::new(8).max_upload(roomy()));
+        let hub = Arc::new(Hub::new(8, crate::sharing::Deadlines::RELAY).max_upload(roomy()));
         hub.network()
             .adopt_identity(Identity::generate().map_err(text)?);
         let mut probe = dial_pipe(&hub)?;
@@ -3525,7 +3544,11 @@ mod tests {
     /// was closed on before its handshake, with no word to route around it by.
     #[tokio::test]
     async fn a_connected_feeder_holds_no_place_under_the_connection_cap() -> Result<(), String> {
-        let hub = Arc::new(Hub::new(8).max_upload(roomy()).max_connections(1));
+        let hub = Arc::new(
+            Hub::new(8, crate::sharing::Deadlines::RELAY)
+                .max_upload(roomy())
+                .max_connections(1),
+        );
         hub.network()
             .adopt_identity(Identity::generate().map_err(text)?);
         let mut feeding = dial_pipe(&hub)?;
@@ -3605,7 +3628,7 @@ mod tests {
     async fn an_engine_is_a_verified_relays_takes_no_subscriber_place_and_publishes_nothing()
     -> Result<(), String> {
         // One subscriber place, taken.
-        let hub = Arc::new(Hub::new(1).max_upload(roomy()));
+        let hub = Arc::new(Hub::new(1, crate::sharing::Deadlines::RELAY).max_upload(roomy()));
         let mut subscriber = dial_pipe(&hub)?;
         let _subscribed = connected(&mut subscriber, Role::Subscriber).await?;
         timeout(Duration::from_secs(10), async {
@@ -3660,7 +3683,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_relay_with_no_feeder_slot_answers_a_probe_and_gives_it_none() -> Result<(), String> {
-        let hub = Arc::new(Hub::new(8).max_upload(roomy()));
+        let hub = Arc::new(Hub::new(8, crate::sharing::Deadlines::RELAY).max_upload(roomy()));
         hub.network()
             .adopt_identity(Identity::generate().map_err(text)?);
         // Duties off: no feeder slot, so a feeder is turned away.
@@ -3705,7 +3728,7 @@ mod tests {
     /// A repair page goes over this relay's own member link to the asker (`sharing`, `peers`).
     #[tokio::test]
     async fn no_data_goes_back_down_the_session_it_was_asked_on() -> Result<(), String> {
-        let hub = Arc::new(Hub::new(8).max_upload(roomy()));
+        let hub = Arc::new(Hub::new(8, crate::sharing::Deadlines::RELAY).max_upload(roomy()));
         let relay = Identity::generate().map_err(text)?;
         let receiver = Identity::generate().map_err(text)?;
         let echo = hub
@@ -3782,7 +3805,11 @@ mod tests {
             key: Identity::generate().map_err(text)?.public(),
             address: "elsewhere.example:10900".to_owned(),
         };
-        let hub = Arc::new(Hub::new(8).advertising(vec![hint]).max_upload(roomy()));
+        let hub = Arc::new(
+            Hub::new(8, crate::sharing::Deadlines::RELAY)
+                .advertising(vec![hint])
+                .max_upload(roomy()),
+        );
         let egress = Arc::clone(hub.egress());
         let mut counted = 0;
 
@@ -3896,7 +3923,7 @@ mod tests {
             while accepted.session.reader.recv(&mut records).await.is_ok() {}
             Ok::<u64, String>(read.load(std::sync::atomic::Ordering::Relaxed))
         });
-        let child = Arc::new(Hub::new(8));
+        let child = Arc::new(Hub::new(8, crate::sharing::Deadlines::RELAY));
         let upstream = Upstream {
             address,
             key: parent_key,
@@ -3912,7 +3939,7 @@ mod tests {
         assert_eq!(child.egress().billed(), 0);
 
         // Beast-out.
-        let hub = Arc::new(Hub::new(8));
+        let hub = Arc::new(Hub::new(8, crate::sharing::Deadlines::RELAY));
         let beast = TcpListener::bind("127.0.0.1:0").await.map_err(text)?;
         let beast_address = beast.local_addr().map_err(text)?;
         tokio::spawn(serve_beast(beast, Arc::clone(&hub)));
@@ -3938,7 +3965,7 @@ mod tests {
         assert_eq!(hub.egress().loopback(), received);
 
         // The stats endpoint, which reports the cap.
-        let hub = Arc::new(Hub::new(8));
+        let hub = Arc::new(Hub::new(8, crate::sharing::Deadlines::RELAY));
         let stats = TcpListener::bind("127.0.0.1:0").await.map_err(text)?;
         let stats_address = stats.local_addr().map_err(text)?;
         tokio::spawn(crate::stats::serve(stats, Arc::clone(&hub)));
@@ -3972,7 +3999,8 @@ mod tests {
             key: Identity::generate().map_err(text)?.public(),
             address: "elsewhere.example:10900".to_owned(),
         };
-        let hub = Arc::new(Hub::new(8).advertising(vec![hint.clone()]));
+        let hub =
+            Arc::new(Hub::new(8, crate::sharing::Deadlines::RELAY).advertising(vec![hint.clone()]));
         // Duties off: every feeder is turned away at admission, pointed at the relays known.
         hub.network().admission.configure(0, false);
         let relay = Identity::generate().map_err(text)?;
@@ -4030,7 +4058,7 @@ mod tests {
             crate::egress::FEEDER_COMMITMENT_BYTES_PER_SEC * 3 / 2,
         );
         let hub = Arc::new(
-            Hub::new(8)
+            Hub::new(8, crate::sharing::Deadlines::RELAY)
                 .accepting_relays([accepted.public()])
                 .advertising(vec![hint])
                 .max_upload(cap),
@@ -4107,7 +4135,7 @@ mod tests {
     {
         let still = std::time::Instant::now();
         let hub = Arc::new(
-            Hub::new(1)
+            Hub::new(1, crate::sharing::Deadlines::RELAY)
                 .max_upload(roomy())
                 .max_feeder_bytes_per_sec(1_000)
                 .ceiling_clock_from(Arc::new(move || still)),
@@ -4156,7 +4184,7 @@ mod tests {
     /// itself the one shed, was noted as routing around this relay, and owed nothing for it.
     #[test]
     fn a_link_the_cap_sheds_is_told_full_and_never_excused() {
-        let hub = Hub::new(1);
+        let hub = Hub::new(1, crate::sharing::Deadlines::RELAY);
         match shed(&hub) {
             Err(Closing::Saying { last, why }) => {
                 assert_eq!(*last, full(&hub));
@@ -4174,7 +4202,7 @@ mod tests {
     #[test]
     fn only_a_capacity_refusal_turns_a_relay_away_as_full() {
         // A hub that plans no member session has no member slot.
-        let hub = Hub::new(1);
+        let hub = Hub::new(1, crate::sharing::Deadlines::RELAY);
         assert!(matches!(admit_member(&hub, 0), Err(End::Full(_))));
         assert!(matches!(
             over_ceiling(),
@@ -4195,7 +4223,7 @@ mod tests {
     async fn a_slow_directory_link_keeps_its_write_deadline() -> Result<(), String> {
         let peer = Identity::generate().map_err(text)?;
         let hub = Arc::new(
-            Hub::new(1)
+            Hub::new(1, crate::sharing::Deadlines::RELAY)
                 .max_upload(roomy())
                 .accepting_relays([peer.public()]),
         );
@@ -4292,7 +4320,7 @@ mod tests {
     /// until its last record was read, about five seconds here and minutes for a 64 KiB message.
     #[tokio::test(start_paused = true)]
     async fn each_records_answers_are_sent_as_it_is_handled() -> Result<(), String> {
-        let hub = Arc::new(Hub::new(8).max_upload(roomy()));
+        let hub = Arc::new(Hub::new(8, crate::sharing::Deadlines::RELAY).max_upload(roomy()));
         hub.network()
             .adopt_identity(Identity::generate().map_err(text)?);
         let mut probe = dial_pipe(&hub)?;
@@ -4323,7 +4351,7 @@ mod tests {
     /// second, and none of them was planned in the cores.
     #[tokio::test(start_paused = true)]
     async fn a_connections_records_are_paced_whatever_their_bytes() -> Result<(), String> {
-        let hub = Arc::new(Hub::new(8).max_upload(roomy()));
+        let hub = Arc::new(Hub::new(8, crate::sharing::Deadlines::RELAY).max_upload(roomy()));
         hub.network()
             .adopt_identity(Identity::generate().map_err(text)?);
         let pace = crate::ingest::PROBE_RECORDS;
@@ -4402,7 +4430,10 @@ mod tests {
         // one instant, so what is kept and dropped is the burst's alone, however long the machine
         // takes between reading one batch and the next.
         let at = crate::network::wall_ms();
-        let hub = Arc::new(Hub::clocked(8, Arc::new(move || at)).max_upload(roomy()));
+        let hub = Arc::new(
+            Hub::clocked(8, Arc::new(move || at), crate::sharing::Deadlines::RELAY)
+                .max_upload(roomy()),
+        );
         let mut sent = Vec::new();
         for wanted in [true, false] {
             let feeder = Identity::generate().map_err(text)?;
@@ -4469,7 +4500,7 @@ mod tests {
     /// started with its role's whole burst (136 tokens), however often its peer dialled.
     #[tokio::test(start_paused = true)]
     async fn a_reconnecting_subscriber_does_not_refill_its_burst() {
-        let hub = Hub::new(8);
+        let hub = Hub::new(8, crate::sharing::Deadlines::RELAY);
         let pace = crate::ingest::SUBSCRIBER_RECORDS;
         let group = Some(std::net::IpAddr::from([198, 51, 100, 7]));
         let neighbour = Some(std::net::IpAddr::from([198, 51, 9, 9]));
@@ -4535,7 +4566,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_directory_links_debt_is_its_groups_alone_and_outlives_its_session()
     -> Result<(), String> {
-        let hub = Hub::new(8);
+        let hub = Hub::new(8, crate::sharing::Deadlines::RELAY);
         let hostile = Some(std::net::IpAddr::from([198, 51, 100, 7]));
         let honest = Some(std::net::IpAddr::from([203, 0, 113, 7]));
         let paces = hub.directory_records();

@@ -133,21 +133,17 @@ pub struct Network {
     dials: Arc<AtomicU64>,
 }
 
-impl Default for Network {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl Network {
-    pub fn new() -> Self {
+    /// Every duty of a relay, its sharing judging deliverers by `deadlines` (a relay's
+    /// `sharing::Deadlines::RELAY`).
+    pub fn new(deadlines: crate::sharing::Deadlines) -> Self {
         Self {
             identity: OnceLock::new(),
             admission: Admission::new(),
             delivery: Delivery::new(),
             directory: Directory::new(),
             selection: Selection::new(),
-            sharing: Sharing::new(),
+            sharing: Sharing::new(deadlines),
             credit: Credit::new(),
             products: Arc::new(Products::new()),
             standing: Arc::new(Standing::new()),
@@ -950,7 +946,7 @@ mod tests {
             .enable_all()
             .build()
             .map_err(|error| error.to_string())?;
-        let hub = Arc::new(Hub::new(8));
+        let hub = Arc::new(Hub::new(8, crate::sharing::Deadlines::RELAY));
         let slow = Arc::new(Slow {
             beats: AtomicU64::new(0),
             beat_seen: std::sync::atomic::AtomicBool::new(false),
@@ -1055,7 +1051,7 @@ mod tests {
         let text = |error: &dyn std::fmt::Display| error.to_string();
         let here = tally_wire::rendezvous::area_at(51.5, -0.1).map_err(|e| text(&e))?;
         let elsewhere = tally_wire::rendezvous::area_at(48.8, 2.3).map_err(|e| text(&e))?;
-        let hub = Hub::new(8);
+        let hub = Hub::new(8, crate::sharing::Deadlines::RELAY);
         let network = hub.network();
         let me = Identity::from_seed([60; 32]);
         network.adopt_identity(me.clone());
