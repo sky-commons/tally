@@ -3,5 +3,12 @@
   "receivers_online": 1,
   "receivers_total": 1,
   "messages_per_sec": 42.25,
-  "aircraft": 311
+  "aircraft": 311,
+  "aircraft_by_source": {
+    "adsb": 290,
+    "mlat": 12,
+    "adsr": 3,
+    "tisb": 5,
+    "other": 1
+  }
 }

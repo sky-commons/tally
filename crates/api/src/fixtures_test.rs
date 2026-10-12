@@ -7,6 +7,8 @@ use tally_api_types::fixtures;
 use tally_relay::stations::{StationLocation, StationReport, StationsReport};
 use tally_wire::Identity;
 
+use tally_api_types::{Aircraft, SourceCounts};
+
 use crate::mlat::Served;
 use crate::snapshot::Stations;
 use crate::{mlat, readsb};
@@ -17,17 +19,33 @@ fn station_key() -> tally_wire::PublicKey {
 }
 
 const NOW_MS: u64 = 1_791_220_000_250;
+/// When the API sent the answers that say so: a little after their data was current.
+const SENT_AT_MS: u64 = 1_791_220_000_430;
 
-/// readsb's answer the aircraft fixture is the API's reading of.
+/// readsb's answer the aircraft fixture is the API's reading of: a1b2c3's last message (1.5 s ago)
+/// is newer than its position (2 s ago).
 const READSB: &str = r#"{
     "now": 1791220000.25,
     "resultCount": 2,
     "aircraft": [
-        {"hex": "A1B2C3", "flight": "UAL123  ", "alt_baro": 35000, "gs": 451.5, "track": 271.0,
-         "baro_rate": -640, "lat": 37.5, "lon": -122.25, "seen": 1.5},
-        {"hex": "abcdef", "flight": "        ", "alt_baro": "ground", "lat": 37.62,
-         "lon": -122.38, "seen": 0},
-        {"hex": "c0ffee", "alt_baro": 12000, "seen": 3.0}
+        {"hex": "A1B2C3", "type": "adsb_icao", "flight": "UAL123  ", "alt_baro": 35000,
+         "gs": 451.5, "track": 271.0, "baro_rate": -640, "lat": 37.5, "lon": -122.25,
+         "seen": 1.5, "seen_pos": 2.0},
+        {"hex": "abcdef", "type": "tisb_other", "flight": "        ", "alt_baro": "ground",
+         "lat": 37.62, "lon": -122.38, "seen": 0, "seen_pos": 0},
+        {"hex": "c0ffee", "type": "mode_s", "alt_baro": 12000, "seen": 3.0}
+    ]
+}"#;
+
+/// readsb's answer a second later, which the update fixture is the change to: a1b2c3 has a new
+/// position, and abcdef is no longer heard.
+const READSB_LATER: &str = r#"{
+    "now": 1791220001.25,
+    "aircraft": [
+        {"hex": "A1B2C3", "type": "adsb_icao", "flight": "UAL123  ", "alt_baro": 35000,
+         "gs": 451.5, "track": 271.0, "baro_rate": -640, "lat": 37.5, "lon": -122.2525,
+         "seen": 0.1, "seen_pos": 0.1},
+        {"hex": "c0ffee", "type": "mode_s", "alt_baro": 12000, "seen": 0.5}
     ]
 }"#;
 
@@ -78,7 +96,22 @@ fn the_station_key_is_the_fixtures() {
 /// for (served at readsb's ADS-B position, not this one), and one of c0ffee, which readsb names
 /// but gives no position for.
 fn mlat_positions() -> Vec<Served> {
-    let one = |address: u32, lat: f64, lon: f64| Served {
+    vec![
+        mlat_fix(0xa1b2c3, 37.6, -122.3, 1_791_219_999_125),
+        mlat_fix(0xc0ffee, 37.71, -122.45, 1_791_219_999_125),
+    ]
+}
+
+/// The merged MLAT positions two seconds on: each aircraft's next fix, a little north-west.
+fn mlat_positions_later() -> Vec<Served> {
+    vec![
+        mlat_fix(0xa1b2c3, 37.601, -122.301, 1_791_220_001_125),
+        mlat_fix(0xc0ffee, 37.711, -122.451, 1_791_220_001_125),
+    ]
+}
+
+fn mlat_fix(address: u32, lat: f64, lon: f64, transmitted_ms: u64) -> Served {
+    Served {
         address,
         lat,
         lon,
@@ -89,9 +122,10 @@ fn mlat_positions() -> Vec<Served> {
         confidence: tally_api_types::MlatConfidence::Standing,
         contested: false,
         source: tally_api_types::PositionSource::Mlat,
-        transmitted_ms: 1_791_219_999_125,
-    };
-    vec![one(0xa1b2c3, 37.6, -122.3), one(0xc0ffee, 37.71, -122.45)]
+        transmitted_ms,
+        gs_kt: None,
+        track_deg: None,
+    }
 }
 
 /// The precise world feed's answer: one second of the precise world product, an ADS-B aircraft
@@ -111,6 +145,8 @@ fn the_precise_feed_answer_is_the_fixture() -> Result<(), String> {
         contested: false,
         source,
         transmitted_ms: 1_791_219_908_100,
+        gs_kt: None,
+        track_deg: None,
     };
     let served = [
         one(
@@ -125,28 +161,62 @@ fn the_precise_feed_answer_is_the_fixture() -> Result<(), String> {
         ),
     ];
     same(
-        &crate::routes::precise_answer(&served, 1_791_219_908_000),
+        &crate::routes::precise_answer(&served, 1_791_219_908_000, SENT_AT_MS),
         fixtures::AIRCRAFT_PRECISE,
     )
 }
 
+/// The live feed of a readsb answer and the MLAT positions served beside it, as the API lists them.
+fn live(readsb: &str, positions: &mlat::Positions) -> Result<(u64, Vec<Aircraft>), String> {
+    let answer = readsb::parse(readsb.as_bytes())?;
+    let mlat = positions.current(0, std::time::Duration::MAX);
+    Ok((
+        readsb::now_ms(&answer),
+        mlat::answer(answer.positioned(), &mlat),
+    ))
+}
+
 #[test]
 fn the_aircraft_answer_is_the_fixture() -> Result<(), String> {
-    let answer = readsb::parse(READSB.as_bytes())?;
-    let now_ms = readsb::now_ms(&answer);
-    let adsb = answer
-        .aircraft
-        .iter()
-        .filter_map(|entry| readsb::aircraft(entry, now_ms))
-        .collect();
-    let aircraft = mlat::answer(adsb, &mlat_positions());
+    let positions = mlat::Positions::default();
+    positions.set(mlat_positions());
+    let (now_ms, aircraft) = live(READSB, &positions)?;
     same(
         &tally_api_types::AircraftResponse {
             now_ms,
             feed: tally_api_types::Feed::Live,
             aircraft,
+            sent_at_ms: SENT_AT_MS,
         },
         fixtures::AIRCRAFT,
+    )
+}
+
+/// The stream's update a second after the aircraft fixture's answer, to a client holding it: the
+/// aircraft that moved (a1b2c3 by readsb, c0ffee by its next MLAT fix, now moving by the two) and
+/// the one no longer heard.
+#[test]
+fn the_streams_update_is_the_fixture() -> Result<(), String> {
+    let positions = mlat::Positions::default();
+    positions.set(mlat_positions());
+    let (_, first) = live(READSB, &positions)?;
+    let mut sent = first
+        .into_iter()
+        .map(|one| (one.hex.clone(), one))
+        .collect();
+    positions.set(mlat_positions_later());
+    let (now_ms, later) = live(READSB_LATER, &positions)?;
+    let (aircraft, gone) = crate::stream::changes(&mut sent, later);
+    same(
+        &tally_api_types::AircraftUpdate {
+            now_ms,
+            sent_at_ms: SENT_AT_MS + 1_000,
+            feed: tally_api_types::Feed::Live,
+            full: false,
+            aircraft,
+            gone,
+        },
+        fixtures::AIRCRAFT_UPDATE,
     )
 }
 
@@ -177,7 +247,14 @@ fn the_network_and_station_answers_are_the_fixtures() -> Result<(), String> {
         },
         Some(&earlier(place, Some("tally-feed 0.3.1"))),
     );
-    same(&located.network(311), fixtures::NETWORK)?;
+    let counts = SourceCounts {
+        adsb: 290,
+        mlat: 12,
+        adsr: 3,
+        tisb: 5,
+        other: 1,
+    };
+    same(&located.network(counts), fixtures::NETWORK)?;
     same(
         &located.station(&station_key()).ok_or("no station")?,
         fixtures::STATION,

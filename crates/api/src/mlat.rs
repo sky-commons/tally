@@ -4,7 +4,7 @@
 //! ADS-B position for. The merge runs on a thread of its own; what requests read is the snapshot it
 //! publishes, every aircraft's current fix.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
@@ -14,7 +14,7 @@ use tally_wire::{Identity, PublicKey, Record, RelayAddress};
 use tokio::sync::mpsc;
 
 use crate::area::Area;
-use crate::feeders::{Ledger, Verdict};
+use crate::feeders::{LatLon, Ledger, Verdict};
 
 /// How old an MLAT position may be and still be served, by default: readsb's own horizon for an
 /// aircraft it has stopped hearing.
@@ -23,6 +23,13 @@ pub const DEFAULT_MAX_AGE: Duration = Duration::from_secs(60);
 const PUBLISH_EVERY: Duration = Duration::from_millis(500);
 /// Records waiting for the merge; beyond it a relay's session waits.
 const INBOUND: usize = 4_096;
+/// The nearest in time two fixes of an aircraft may be for its velocity to be taken from them:
+/// closer, their uncertainty swamps the distance between them.
+pub const VELOCITY_MIN_SPAN_MS: u64 = 1_000;
+/// The furthest apart: beyond it the aircraft may have turned between them.
+pub const VELOCITY_MAX_SPAN_MS: u64 = 60_000;
+/// Metres a second in a knot (an international nautical mile, 1852 m, an hour).
+const KNOTS_PER_M_S: f64 = 3_600.0 / 1_852.0;
 /// How far past the API's own clock a precise world second may be and still be taken: the skew
 /// between a relay's clock and the API's. A precise second is sealed about 90 s after it ends, so
 /// an honest one is never ahead of either clock; one further ahead is a relay's lie, which would
@@ -86,6 +93,10 @@ pub struct Served {
     /// MLAT, or (in the precise world feed) the aircraft's own broadcast.
     pub source: PositionSource,
     pub transmitted_ms: u64,
+    /// Ground speed and track over the ground from the fix served before this one of the same
+    /// aircraft (`velocity`); `None` without one that qualifies.
+    pub gs_kt: Option<f64>,
+    pub track_deg: Option<f64>,
 }
 
 impl Served {
@@ -102,8 +113,8 @@ impl Served {
             lat: self.lat,
             lon: self.lon,
             alt_baro_ft: self.altitude_ft,
-            gs_kt: None,
-            track_deg: None,
+            gs_kt: self.gs_kt,
+            track_deg: self.track_deg,
             baro_rate_fpm: None,
             on_ground: false,
             last_heard_at_ms: self.transmitted_ms,
@@ -160,9 +171,43 @@ pub fn served(merge: &Merge) -> Vec<Served> {
                 contested,
                 source: PositionSource::Mlat,
                 transmitted_ms: fix.transmitted.unix_ms,
+                gs_kt: None,
+                track_deg: None,
             }
         })
         .collect()
+}
+
+/// The ground speed (knots) and track (degrees true) of an aircraft that moved from `before` to
+/// `after`, two fixes of it: along the great circle between them, the speed its length over their
+/// time apart and the track its initial bearing. `None` unless both are MLAT fixes whose receivers
+/// have standing and they are `VELOCITY_MIN_SPAN_MS` to `VELOCITY_MAX_SPAN_MS` apart; no track
+/// when they are at one place.
+pub fn velocity(before: &Served, after: &Served) -> Option<(f64, Option<f64>)> {
+    let standing = |one: &Served| {
+        one.source == PositionSource::Mlat && one.confidence == MlatConfidence::Standing
+    };
+    if !standing(before) || !standing(after) || before.address != after.address {
+        return None;
+    }
+    let span_ms = after.transmitted_ms.checked_sub(before.transmitted_ms)?;
+    if !(VELOCITY_MIN_SPAN_MS..=VELOCITY_MAX_SPAN_MS).contains(&span_ms) {
+        return None;
+    }
+    let (from, to) = (
+        LatLon {
+            lat: before.lat,
+            lon: before.lon,
+        },
+        LatLon {
+            lat: after.lat,
+            lon: after.lon,
+        },
+    );
+    let metres = from.distance_m(to);
+    let gs_kt = metres / (span_ms as f64 / 1_000.0) * KNOTS_PER_M_S;
+    let track = (metres > 0.0).then(|| from.bearing_deg(to));
+    Some((gs_kt, track))
 }
 
 /// The newest whole second of the precise world product held: the second (Unix seconds) and its
@@ -173,19 +218,64 @@ pub struct Precise {
     pub served: Arc<Vec<Served>>,
 }
 
-/// What requests read: the latest snapshot of the live feed (the merge's), and the newest whole
-/// second of the precise world product, if any has come.
+/// What requests read: the latest snapshot of the live feed (the merge's), each aircraft moving
+/// by its last two served fixes, and the newest whole second of the precise world product, if any
+/// has come.
 #[derive(Default)]
 pub struct Positions {
     served: RwLock<Arc<Vec<Served>>>,
+    /// Each aircraft's fix served before its current one, of an earlier transmission: what its
+    /// velocity is taken from.
+    before: Mutex<HashMap<u32, Served>>,
     precise: RwLock<Option<Precise>>,
 }
 
 impl Positions {
-    pub fn set(&self, served: Vec<Served>) {
-        if let Ok(mut held) = self.served.write() {
-            *held = Arc::new(served);
+    /// Serves `served`, the merge's current fixes, each with its velocity from the fix of the same
+    /// aircraft served before it: a fix of a later transmission than the one held makes the held
+    /// one the earlier; one of the same transmission (a final replacing a provisional) replaces it
+    /// and keeps the earlier; one of an earlier transmission (a provisional retracted) keeps only an
+    /// earlier fix still before it. An aircraft no longer served is forgotten.
+    pub fn set(&self, mut served: Vec<Served>) {
+        let Ok(mut held) = self.served.write() else {
+            return;
+        };
+        let Ok(mut before) = self.before.lock() else {
+            return;
+        };
+        let current: HashMap<u32, &Served> = held.iter().map(|one| (one.address, one)).collect();
+        let mut next = HashMap::with_capacity(served.len());
+        for one in &mut served {
+            let earlier = match current.get(&one.address) {
+                Some(now) if now.transmitted_ms < one.transmitted_ms => Some((*now).clone()),
+                _ => before
+                    .remove(&one.address)
+                    .filter(|earlier| earlier.transmitted_ms < one.transmitted_ms),
+            };
+            let (gs_kt, track_deg) =
+                match earlier.as_ref().and_then(|earlier| velocity(earlier, one)) {
+                    Some((gs_kt, track_deg)) => (Some(gs_kt), track_deg),
+                    None => (None, None),
+                };
+            (one.gs_kt, one.track_deg) = (gs_kt, track_deg);
+            if let Some(earlier) = earlier {
+                next.insert(one.address, earlier);
+            }
         }
+        *before = next;
+        *held = Arc::new(served);
+    }
+
+    /// Every live position no older than `max_age` before `now_ms`, in address order.
+    pub fn current(&self, now_ms: u64, max_age: Duration) -> Vec<Served> {
+        let Ok(held) = self.served.read() else {
+            return Vec::new();
+        };
+        let oldest = now_ms.saturating_sub(u64::try_from(max_age.as_millis()).unwrap_or(u64::MAX));
+        held.iter()
+            .filter(|one| one.transmitted_ms >= oldest)
+            .cloned()
+            .collect()
     }
 
     pub fn set_precise(&self, second: u64, served: Vec<Served>) {
@@ -227,7 +317,7 @@ impl Positions {
         let Ok(held) = self.served.read() else {
             return Vec::new();
         };
-        let oldest = now_ms.saturating_sub(max_age.as_millis() as u64);
+        let oldest = now_ms.saturating_sub(u64::try_from(max_age.as_millis()).unwrap_or(u64::MAX));
         held.iter()
             .filter(|one| one.transmitted_ms >= oldest && area.contains(one.lat, one.lon))
             .cloned()
@@ -387,6 +477,8 @@ impl PreciseWorld {
                     PositionSource::Adsb
                 },
                 transmitted_ms: fix.transmitted.unix_ms,
+                gs_kt: None,
+                track_deg: None,
             })
             .collect()
     }
@@ -429,6 +521,8 @@ mod tests {
             contested: false,
             source: PositionSource::Mlat,
             transmitted_ms,
+            gs_kt: None,
+            track_deg: None,
         }
     }
 
@@ -586,6 +680,79 @@ mod tests {
             None
         );
         Ok(())
+    }
+
+    /// The velocity of what `positions` serves of `address`.
+    fn moving(positions: &Positions, address: u32) -> Option<(Option<f64>, Option<f64>)> {
+        positions
+            .current(0, Duration::MAX)
+            .into_iter()
+            .find(|one| one.address == address)
+            .map(|one| (one.gs_kt, one.track_deg))
+    }
+
+    /// An MLAT aircraft moves by its last two served fixes: ground speed along the great circle
+    /// between them over their time apart, track its initial bearing.
+    #[test]
+    fn an_mlat_aircraft_moves_by_its_last_two_served_fixes() -> Result<(), String> {
+        let positions = Positions::default();
+        positions.set(vec![one(1, 52.0, 100_000)]);
+        // One fix: nothing to move by.
+        assert_eq!(moving(&positions, 1), Some((None, None)));
+        // A hundredth of a degree north in ten seconds.
+        positions.set(vec![one(1, 52.01, 110_000)]);
+        let (gs, track) = moving(&positions, 1).ok_or("not served")?;
+        let expected = 0.01_f64.to_radians() * 6_371_008.8 / 10.0 * 3_600.0 / 1_852.0;
+        assert!((gs.ok_or("no speed")? - expected).abs() < 1e-6, "{gs:?}");
+        assert!(track.ok_or("no track")?.abs() < 1e-6, "{track:?}");
+        // A fix of the same transmission (a final replacing a provisional) replaces it: the
+        // velocity is still taken from the fix before.
+        positions.set(vec![one(1, 52.01, 110_000), one(2, 52.0, 110_000)]);
+        let (_, track) = moving(&positions, 1).ok_or("not served")?;
+        assert!(track.ok_or("no track")?.abs() < 1e-6);
+        // Republished unchanged: the same velocity, not a standing still.
+        positions.set(vec![one(1, 52.01, 110_000)]);
+        assert!(moving(&positions, 1).ok_or("not served")?.0.is_some());
+        // Westward: track 270.
+        positions.set(vec![Served {
+            lon: 4.99,
+            ..one(1, 52.01, 120_000)
+        }]);
+        let (_, track) = moving(&positions, 1).ok_or("not served")?;
+        assert!((track.ok_or("no track")? - 270.0).abs() < 0.01, "{track:?}");
+        Ok(())
+    }
+
+    /// Fixes closer than a second or further than a minute apart, or either without standing,
+    /// give no velocity; nor do two at one place give a track.
+    #[test]
+    fn a_velocity_needs_two_standing_fixes_a_second_to_a_minute_apart() {
+        let at = |lat, transmitted_ms| one(1, lat, transmitted_ms);
+        let unconfirmed = Served {
+            confidence: MlatConfidence::Unconfirmed,
+            ..at(52.01, 110_000)
+        };
+        assert!(velocity(&at(52.0, 100_000), &at(52.01, 101_000)).is_some());
+        assert!(velocity(&at(52.0, 100_000), &at(52.01, 160_000)).is_some());
+        for (before, after) in [
+            (at(52.0, 100_000), at(52.01, 100_999)),
+            (at(52.0, 100_000), at(52.01, 160_001)),
+            (at(52.01, 110_000), at(52.0, 100_000)),
+            (at(52.0, 100_000), unconfirmed.clone()),
+            (unconfirmed, at(52.0, 120_000)),
+            (one(2, 52.0, 100_000), at(52.01, 110_000)),
+        ] {
+            assert_eq!(velocity(&before, &after), None, "{before:?} {after:?}");
+        }
+        assert_eq!(
+            velocity(&at(52.0, 100_000), &at(52.0, 110_000)),
+            Some((0.0, None))
+        );
+        // Through `Positions`: a fix half a second after the last is served still, unmoving.
+        let positions = Positions::default();
+        positions.set(vec![at(52.0, 100_000)]);
+        positions.set(vec![at(52.01, 100_500)]);
+        assert_eq!(moving(&positions, 1), Some((None, None)));
     }
 
     #[test]

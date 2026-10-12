@@ -29,6 +29,7 @@ rust_library(
         "//crates/relay",
         "//crates/wire",
         "@tally_crates//:axum",
+        "@tally_crates//:futures-util",
         "@tally_crates//:h3o",
         "@tally_crates//:http-body-util",
         "@tally_crates//:hyper",
