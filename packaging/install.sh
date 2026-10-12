@@ -41,7 +41,7 @@
 # saying why; it installs nothing and needs no root.
 set -euo pipefail
 
-VERSION="v0.1.0"
+VERSION="v0.2.0"
 # Where this release is published, whose `tally-feed` binaries, unit and seed list this script
 # installs. The source names no publisher: the publisher writes its release's address here when it
 # publishes it, and TALLY_RELEASE overrides it.
