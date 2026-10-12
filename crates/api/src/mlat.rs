@@ -107,6 +107,7 @@ impl Served {
             baro_rate_fpm: None,
             on_ground: false,
             last_heard_at_ms: self.transmitted_ms,
+            position_at_ms: self.transmitted_ms,
             position_source: self.source,
             mlat: (self.source == PositionSource::Mlat).then_some(Mlat {
                 horizontal_sigma_m: self.horizontal_sigma_m,

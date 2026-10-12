@@ -102,6 +102,11 @@ impl Stations {
             receivers_total: self.total,
             messages_per_sec: self.messages_per_sec,
             aircraft,
+            // seam stub (RFC-0184): counted by source
+            aircraft_by_source: tally_api_types::SourceCounts {
+                adsb: aircraft,
+                ..Default::default()
+            },
         }
     }
 }

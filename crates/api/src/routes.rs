@@ -140,6 +140,7 @@ async fn aircraft(
         now_ms,
         feed: Feed::Live,
         aircraft,
+        sent_at_ms: wall_ms(),
     })
     .into_response()
 }
@@ -348,6 +349,7 @@ pub(crate) fn precise_answer(served: &[mlat::Served], second_ms: u64) -> Aircraf
         now_ms,
         feed: Feed::Precise,
         aircraft,
+        sent_at_ms: wall_ms(),
     }
 }
 
