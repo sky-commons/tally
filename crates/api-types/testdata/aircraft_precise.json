@@ -13,6 +13,7 @@
       "baro_rate_fpm": null,
       "on_ground": false,
       "last_heard_at_ms": 1791219908100,
+      "position_at_ms": 1791219908100,
       "position_source": "adsb",
       "mlat": null
     },
@@ -27,6 +28,7 @@
       "baro_rate_fpm": null,
       "on_ground": false,
       "last_heard_at_ms": 1791219908100,
+      "position_at_ms": 1791219908100,
       "position_source": "mlat",
       "mlat": {
         "horizontal_sigma_m": 61.25,
@@ -36,5 +38,6 @@
         "contested": false
       }
     }
-  ]
+  ],
+  "sent_at_ms": 1791220000430
 }

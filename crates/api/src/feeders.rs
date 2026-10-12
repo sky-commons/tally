@@ -185,12 +185,24 @@ impl LatLon {
     }
 
     /// Great-circle distance, metres.
-    fn distance_m(self, other: Self) -> f64 {
+    pub(crate) fn distance_m(self, other: Self) -> f64 {
         let (a, b) = (self.lat.to_radians(), other.lat.to_radians());
         let dlat = b - a;
         let dlon = (other.lon - self.lon).to_radians();
         let h = (dlat / 2.0).sin().powi(2) + a.cos() * b.cos() * (dlon / 2.0).sin().powi(2);
         2.0 * EARTH_RADIUS_M * h.sqrt().min(1.0).asin()
+    }
+
+    /// The initial bearing of the great circle from here to `other`, degrees clockwise from true
+    /// north, at least 0 and below 360.
+    pub(crate) fn bearing_deg(self, other: Self) -> f64 {
+        let (a, b) = (self.lat.to_radians(), other.lat.to_radians());
+        let dlon = (other.lon - self.lon).to_radians();
+        let y = dlon.sin() * b.cos();
+        let x = a.cos() * b.sin() - a.sin() * b.cos() * dlon.cos();
+        let degrees = y.atan2(x).to_degrees().rem_euclid(360.0);
+        // -0.0 and a rounding up to 360 both read as north.
+        if degrees >= 360.0 { 0.0 } else { degrees + 0.0 }
     }
 }
 

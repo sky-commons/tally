@@ -1,4 +1,4 @@
-//! What the API holds between requests: the relay's station reports, readsb's aircraft count and
+//! What the API holds between requests: the relay's station reports, the aircraft count and
 //! the feeder figures, each read or computed on a schedule (`refresh`) rather than per request, so a crowd of clients costs the
 //! relay and readsb nothing more. A value older than `STALE_AFTER` is not served.
 
@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use tally_relay::stations::{StationReport, StationsReport};
 use tally_wire::PublicKey;
 
-use tally_api_types::{Network, Position, Station};
+use tally_api_types::{Aircraft, Network, Position, PositionSource, SourceCounts, Station};
 
 use crate::feeders::Board;
 
@@ -95,15 +95,48 @@ impl Stations {
         })
     }
 
-    pub fn network(&self, aircraft: u32) -> Network {
+    /// The network's totals, with `aircraft` counted by source (`count`).
+    pub fn network(&self, aircraft: SourceCounts) -> Network {
         Network {
             now_ms: self.now_ms,
             receivers_online: self.online,
             receivers_total: self.total,
             messages_per_sec: self.messages_per_sec,
-            aircraft,
+            aircraft: total(&aircraft),
+            aircraft_by_source: aircraft,
         }
     }
+}
+
+/// `aircraft` (each once, as `crate::mlat::answer` lists them: readsb's positioned aircraft, then
+/// those only Tally MLAT places) counted by where each position came from.
+pub fn count(aircraft: &[Aircraft]) -> SourceCounts {
+    let mut counts = SourceCounts::default();
+    for one in aircraft {
+        let slot = match one.position_source {
+            PositionSource::Adsb => &mut counts.adsb,
+            PositionSource::Mlat => &mut counts.mlat,
+            PositionSource::Adsr => &mut counts.adsr,
+            PositionSource::Tisb => &mut counts.tisb,
+            PositionSource::Other => &mut counts.other,
+        };
+        *slot = slot.saturating_add(1);
+    }
+    counts
+}
+
+/// What the counts sum to.
+pub fn total(counts: &SourceCounts) -> u32 {
+    let SourceCounts {
+        adsb,
+        mlat,
+        adsr,
+        tisb,
+        other,
+    } = *counts;
+    [adsb, mlat, adsr, tisb, other]
+        .into_iter()
+        .fold(0, u32::saturating_add)
 }
 
 fn saturating_u32(count: usize) -> u32 {
@@ -119,7 +152,7 @@ struct Held<T> {
 #[derive(Default)]
 pub struct Snapshot {
     stations: RwLock<Option<Held<Arc<Stations>>>>,
-    aircraft: RwLock<Option<Held<u32>>>,
+    aircraft: RwLock<Option<Held<SourceCounts>>>,
     board: RwLock<Option<Held<Arc<Board>>>>,
 }
 
@@ -133,7 +166,7 @@ impl Snapshot {
         }
     }
 
-    pub fn set_aircraft(&self, count: u32, at: Instant) {
+    pub fn set_aircraft(&self, count: SourceCounts, at: Instant) {
         if let Ok(mut held) = self.aircraft.write() {
             *held = Some(Held { at, value: count });
         }
@@ -168,7 +201,7 @@ impl Snapshot {
         held.as_ref().map(|held| Arc::clone(&held.value))
     }
 
-    pub fn aircraft(&self, now: Instant) -> Option<u32> {
+    pub fn aircraft(&self, now: Instant) -> Option<SourceCounts> {
         let held = self.aircraft.read().ok()?;
         let held = held.as_ref()?;
         fresh(held.at, now).then_some(held.value)
@@ -221,7 +254,11 @@ mod tests {
             },
             None,
         );
-        assert_eq!(first.network(12).messages_per_sec, 0.0);
+        let twelve = SourceCounts {
+            adsb: 12,
+            ..SourceCounts::default()
+        };
+        assert_eq!(first.network(twelve).messages_per_sec, 0.0);
         let stations = Stations::from_report(
             StationsReport {
                 now_ms: 13_000,
@@ -233,7 +270,7 @@ mod tests {
             },
             Some(&first),
         );
-        let network = stations.network(12);
+        let network = stations.network(twelve);
         assert_eq!(
             (
                 network.now_ms,
@@ -254,7 +291,10 @@ mod tests {
             },
             Some(&stations),
         );
-        assert_eq!(restarted.network(0).messages_per_sec, 0.0);
+        assert_eq!(
+            restarted.network(SourceCounts::default()).messages_per_sec,
+            0.0
+        );
         let station = stations.station(&a).ok_or("no station")?;
         assert_eq!(
             (station.key, station.batches, station.gaps, station.location),
@@ -271,13 +311,78 @@ mod tests {
         Ok(())
     }
 
+    /// The network's aircraft are readsb's positioned ones and those only Tally MLAT places, each
+    /// once, and the counts by source sum to them.
+    #[test]
+    fn the_aircraft_counted_by_source_sum_to_the_networks_aircraft() -> Result<(), String> {
+        let readsb = crate::readsb::parse(
+            br#"{"now": 1791220000, "aircraft": [
+                {"hex": "a1b2c3", "type": "adsb_icao", "lat": 1, "lon": 2},
+                {"hex": "a1b2c4", "type": "adsb_icao_nt", "lat": 1, "lon": 2},
+                {"hex": "a1b2c5", "type": "adsr_icao", "lat": 1, "lon": 2},
+                {"hex": "a1b2c6", "type": "tisb_trackfile", "lat": 1, "lon": 2},
+                {"hex": "a1b2c7", "type": "mlat", "lat": 1, "lon": 2},
+                {"hex": "a1b2c8", "type": "adsb_icao"}
+            ]}"#,
+        )?;
+        let mlat = |address| crate::mlat::Served {
+            address,
+            lat: 1.0,
+            lon: 2.0,
+            altitude_ft: None,
+            horizontal_sigma_m: 30.0,
+            check: tally_api_types::MlatCheck::Model,
+            kind: tally_api_types::MlatKind::Final,
+            confidence: tally_api_types::MlatConfidence::Standing,
+            contested: false,
+            source: PositionSource::Mlat,
+            transmitted_ms: 1_791_220_000_000,
+            gs_kt: None,
+            track_deg: None,
+        };
+        // a1b2c3 readsb places itself; a1b2c8 readsb names without a position, so MLAT places it,
+        // as it does c0ffee, which readsb does not name.
+        let aircraft = crate::mlat::answer(
+            readsb.positioned(),
+            &[mlat(0xa1b2c3), mlat(0xa1b2c8), mlat(0xc0ffee)],
+        );
+        let counts = count(&aircraft);
+        assert_eq!(
+            counts,
+            SourceCounts {
+                adsb: 2,
+                mlat: 2,
+                adsr: 1,
+                tisb: 1,
+                other: 1,
+            }
+        );
+        let stations = Stations::from_report(
+            StationsReport {
+                now_ms: 1,
+                stations: Vec::new(),
+            },
+            None,
+        );
+        let network = stations.network(counts);
+        assert_eq!(
+            (network.aircraft, total(&network.aircraft_by_source)),
+            (7, 7)
+        );
+        Ok(())
+    }
+
     #[test]
     fn a_value_is_not_served_once_stale() {
         let snapshot = Snapshot::default();
         let at = Instant::now();
+        let seven = SourceCounts {
+            adsb: 7,
+            ..SourceCounts::default()
+        };
         assert_eq!(snapshot.aircraft(at), None);
-        snapshot.set_aircraft(7, at);
-        assert_eq!(snapshot.aircraft(at + STALE_AFTER), Some(7));
+        snapshot.set_aircraft(seven, at);
+        assert_eq!(snapshot.aircraft(at + STALE_AFTER), Some(seven));
         assert_eq!(
             snapshot.aircraft(at + STALE_AFTER + Duration::from_millis(1)),
             None

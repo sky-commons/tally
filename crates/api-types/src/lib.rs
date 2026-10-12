@@ -6,7 +6,8 @@
 //!
 //! - an INSTANT is `*_at_ms`, Unix milliseconds on the API's own clock, beside the response's
 //!   `now_ms` (when the API's data was current, on the same clock), so a client ages an instant
-//!   against `now_ms` and never against its own clock;
+//!   against `now_ms`, or by its own clock through the offset an aircraft answer's `sent_at_ms`
+//!   gives it (RFC-0184), never by its own clock read as the API's;
 //! - a SPAN is `*_for_ms`, a count of milliseconds.
 //!
 //! A client may ignore a field it does not read; a field a type states is always present (an
@@ -34,6 +35,31 @@ pub struct AircraftResponse {
     /// Which feed was served: what the client asked for (`live` when it named none).
     pub feed: Feed,
     pub aircraft: Vec<Aircraft>,
+    /// When the API sent this answer: Unix milliseconds on the API's clock. A client that holds the
+    /// least of (its receipt time minus `sent_at_ms`) over its answers holds the offset between the
+    /// two clocks, transit included, and ages every instant by its own clock through it: a cached or
+    /// slow answer then shows as late rather than moving the offset.
+    pub sent_at_ms: u64,
+}
+
+/// `GET /v1/aircraft/stream?west=&south=&east=&north=[&feed=live|precise]`: the same viewport's
+/// aircraft pushed as Server-Sent Events (RFC-0184), never cached. The first `aircraft` event is
+/// `full` (every aircraft in the box); each later one carries the aircraft whose position or state
+/// changed since the event before it and the addresses that left the box or went silent. A comment
+/// line keeps the stream open while nothing changes.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AircraftUpdate {
+    /// When the data was current, as in [`AircraftResponse::now_ms`].
+    pub now_ms: u64,
+    /// When the API sent this event, as in [`AircraftResponse::sent_at_ms`].
+    pub sent_at_ms: u64,
+    pub feed: Feed,
+    /// Whether `aircraft` is every aircraft in the box (the client replaces what it holds) or only
+    /// those that changed (the client updates them in place).
+    pub full: bool,
+    pub aircraft: Vec<Aircraft>,
+    /// Addresses the client holds that left the box or went silent; empty in a `full` event.
+    pub gone: Vec<String>,
 }
 
 /// Which feed of positions a client reads (RFC-0174 §2.11), its choice.
@@ -66,23 +92,46 @@ pub struct Aircraft {
     pub track_deg: Option<f64>,
     pub baro_rate_fpm: Option<i32>,
     pub on_ground: bool,
-    /// When its last message was heard (for an MLAT position, when the transmission it was
-    /// solved from was sent): Unix milliseconds on the API's clock, at or before `now_ms`.
+    /// When its last message of any kind was heard: Unix milliseconds on the API's clock, at or
+    /// before `now_ms`. Says whether the aircraft is still heard, not how old its position is.
     pub last_heard_at_ms: u64,
+    /// When the position in `lat` and `lon` was heard (for an MLAT position, when the transmission
+    /// it was solved from was sent): Unix milliseconds on the API's clock, at or before
+    /// `last_heard_at_ms`. A client projects the position forward from this instant, never from
+    /// `last_heard_at_ms`, which a velocity or altitude message moves without a new position.
+    pub position_at_ms: u64,
     /// Where `lat` and `lon` came from.
     pub position_source: PositionSource,
     /// An MLAT position's uncertainty and how it was checked; `null` for an ADS-B position.
     pub mlat: Option<Mlat>,
 }
 
-/// Where an aircraft's position came from.
+/// Where an aircraft's position came from: readsb's own `type` for a position it decoded, or
+/// Tally's MLAT.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PositionSource {
-    /// The aircraft's own broadcast, as readsb decoded it.
+    /// The aircraft's own ADS-B broadcast (readsb `adsb_icao`, `adsb_icao_nt`, `adsb_other`).
     Adsb,
     /// Multilateration: solved by Tally MLAT engines from receivers' timestamps.
     Mlat,
+    /// Rebroadcast by a ground station of what an aircraft sent on the other link (readsb
+    /// `adsr_icao`, `adsr_other`).
+    Adsr,
+    /// A ground station's radar track (readsb `tisb_icao`, `tisb_other`, `tisb_trackfile`).
+    Tisb,
+    /// Any other source readsb names (`adsc`, `mode_s`, `other`, its own `mlat`).
+    Other,
+}
+
+/// Aircraft counted by where each one's position came from.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceCounts {
+    pub adsb: u32,
+    pub mlat: u32,
+    pub adsr: u32,
+    pub tisb: u32,
+    pub other: u32,
 }
 
 /// What an MLAT position is worth.
@@ -147,8 +196,10 @@ pub struct Network {
     pub receivers_online: u32,
     pub receivers_total: u32,
     pub messages_per_sec: f64,
-    /// Aircraft the decoder holds a position for.
+    /// Aircraft with a position: the decoder's, and those only Tally MLAT places.
     pub aircraft: u32,
+    /// `aircraft` by where each position came from; the counts sum to `aircraft`.
+    pub aircraft_by_source: SourceCounts,
 }
 
 /// `GET /v1/stations/{key}`, the key in the path as base64url without padding: one receiver.
@@ -287,6 +338,10 @@ pub mod fixtures {
     /// `GET /v1/aircraft`: three aircraft: one named and airborne, one unnamed on the ground, both
     /// at their ADS-B positions, and one readsb holds no position for, at its MLAT position.
     pub const AIRCRAFT: &str = include_str!("../testdata/aircraft.json");
+    /// One `aircraft` event of `GET /v1/aircraft/stream` after its first, to a client holding
+    /// `AIRCRAFT`: the aircraft that moved since (one by readsb, one by its next MLAT fix, moving by
+    /// its last two) and the address no longer heard.
+    pub const AIRCRAFT_UPDATE: &str = include_str!("../testdata/aircraft_update.json");
     /// `GET /v1/aircraft?...&feed=precise`: one second of the precise world product, an ADS-B
     /// aircraft and an MLAT one.
     pub const AIRCRAFT_PRECISE: &str = include_str!("../testdata/aircraft_precise.json");
@@ -329,6 +384,7 @@ mod tests {
     fn every_fixture_is_its_type_whole() -> Result<(), String> {
         whole::<AircraftResponse>(fixtures::AIRCRAFT)?;
         whole::<AircraftResponse>(fixtures::AIRCRAFT_PRECISE)?;
+        whole::<AircraftUpdate>(fixtures::AIRCRAFT_UPDATE)?;
         whole::<Network>(fixtures::NETWORK)?;
         whole::<Station>(fixtures::STATION)?;
         whole::<Station>(fixtures::STATION_BARE)?;

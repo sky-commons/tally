@@ -846,6 +846,7 @@ name = "tally-api"
 version = "0.2.0"
 dependencies = [
  "axum",
+ "futures-util",
  "h3o",
  "http-body-util",
  "hyper",

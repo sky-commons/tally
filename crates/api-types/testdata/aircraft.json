@@ -13,6 +13,7 @@
       "baro_rate_fpm": -640,
       "on_ground": false,
       "last_heard_at_ms": 1791219998750,
+      "position_at_ms": 1791219998250,
       "position_source": "adsb",
       "mlat": null
     },
@@ -27,7 +28,8 @@
       "baro_rate_fpm": null,
       "on_ground": true,
       "last_heard_at_ms": 1791220000250,
-      "position_source": "adsb",
+      "position_at_ms": 1791220000250,
+      "position_source": "tisb",
       "mlat": null
     },
     {
@@ -41,6 +43,7 @@
       "baro_rate_fpm": null,
       "on_ground": false,
       "last_heard_at_ms": 1791219999125,
+      "position_at_ms": 1791219999125,
       "position_source": "mlat",
       "mlat": {
         "horizontal_sigma_m": 42.5,
@@ -50,5 +53,6 @@
         "contested": false
       }
     }
-  ]
+  ],
+  "sent_at_ms": 1791220000430
 }
