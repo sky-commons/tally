@@ -336,7 +336,7 @@ mod tests {
         assert!(matches!(parsed(&["new-key"])?, Command::NewKey));
         assert!(parsed(&["new-key", "--key", "k"]).is_err());
         assert!(
-            matches!(parsed(&["init", "--key", "k"])?, Command::Init(path) if path == PathBuf::from("k"))
+            matches!(parsed(&["init", "--key", "k"])?, Command::Init(path) if path == std::path::Path::new("k"))
         );
         assert!(
             parsed(&["init", "--key-env", "TALLY_KEY"]).is_err_and(|why| why.contains("new-key"))
