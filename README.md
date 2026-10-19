@@ -205,7 +205,8 @@ public signed records; no relay computes them.
 - `GET /v1/network`: receivers, their message rate, and `aircraft` (readsb's positioned aircraft
   and those only Tally MLAT places) with `aircraft_by_source` summing to it
 - `GET /v1/stations/KEY` (the key as base64url without padding), `GET /v1/stations/KEY/stats`
-- `GET /v1/leaderboards`, `GET /v1/leaderboards/AREA`
+- `GET /v1/leaderboards`, `GET /v1/leaderboards/AREA`: every area with a feeder, its `receivers`
+  beside the `ranked` among them, and an area's feeders without standing as `unranked`
 
 The JSON is declared once, in `crates/api-types` (`tally-api-types`, serde only), which a client
 in Rust can depend on rather than restate; `crates/api-types/testdata` holds one answer of each

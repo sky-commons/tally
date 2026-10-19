@@ -322,6 +322,9 @@ main() {
   printf '\ntally-feed %s is running (systemctl status tally-feed; journalctl -u tally-feed).\n' \
     "$VERSION"
   printf "\nThis receiver's public key, its name on the network:\n\n  %s\n\n" "$public"
+  # The site names a station by its key as base64url without padding, as the API's paths do.
+  printf 'Its page: https://tally.skycommons.org/feeders/%s\n\n' \
+    "$(printf '%s' "$public" | tr '+/' '-_' | tr -d '=')"
   printf "What it publishes: every reception this receiver's decoders report, signed with that\n"
   printf 'key, and the location in %s. Anyone can read both.\n' "$DEFAULTS"
   if [[ -n $precision && $precision != 0 ]]; then

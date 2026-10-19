@@ -275,7 +275,8 @@ pub struct Ranks {
     pub of: u32,
 }
 
-/// `GET /v1/leaderboards`: every area with a ranked feeder, the most ranked first.
+/// `GET /v1/leaderboards`: every area with a feeder the API has figures for over the window, ranked
+/// or not, the most ranked first, then the most feeders, then by area.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Leaderboards {
     /// When the boards were computed: Unix milliseconds on the API's clock.
@@ -294,11 +295,15 @@ pub struct LeaderboardArea {
     pub center: Position,
     /// Feeders ranked in it.
     pub ranked: u32,
+    /// Feeders the API has figures for in it over the window, ranked or not: `ranked` of them have
+    /// standing.
+    pub receivers: u32,
 }
 
 /// `GET /v1/leaderboards/{area}`: one area's two leaderboards, each its first feeders. Ranked by
 /// what a feeder adds that no one else does (unique coverage) and by how much it helps MLAT, never
-/// by raw message counts; only feeders with standing are ranked.
+/// by raw message counts; only feeders with standing are ranked, and the rest are listed apart
+/// (`unranked`), so an area with feeders but none ranked answers both boards empty.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Leaderboard {
     /// When the boards were computed: Unix milliseconds on the API's clock.
@@ -308,10 +313,22 @@ pub struct Leaderboard {
     pub center: Position,
     /// Feeders ranked in the area, of which each board lists the first.
     pub ranked: u32,
+    /// Feeders the API has figures for in the area over the window, ranked or not.
+    pub receivers: u32,
     /// By unique coverage, then MLAT help, then key.
     pub by_unique_coverage: Vec<LeaderboardEntry>,
     /// By MLAT help, then unique coverage, then key.
     pub by_mlat: Vec<LeaderboardEntry>,
+    /// The area's feeders without standing, by key (as `key` sorts); at most as many as each board
+    /// lists.
+    pub unranked: Vec<UnrankedFeeder>,
+}
+
+/// One feeder an area lists but does not rank: it has no standing.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct UnrankedFeeder {
+    /// The receiver's public key as tally prints it (standard base64), as a board would list it.
+    pub key: String,
 }
 
 /// One feeder on a leaderboard.
@@ -361,6 +378,9 @@ pub mod fixtures {
     pub const LEADERBOARDS: &str = include_str!("../testdata/leaderboards.json");
     /// `GET /v1/leaderboards/{area}`: the area `LEADERBOARDS` lists.
     pub const LEADERBOARD: &str = include_str!("../testdata/leaderboard.json");
+    /// `GET /v1/leaderboards/{area}`: the same area while no feeder in it has standing, so both
+    /// boards are empty and every feeder there is `unranked`.
+    pub const LEADERBOARD_UNRANKED: &str = include_str!("../testdata/leaderboard_unranked.json");
 }
 
 #[cfg(test)]
@@ -391,7 +411,8 @@ mod tests {
         whole::<FeederStats>(fixtures::FEEDER_STATS)?;
         whole::<FeederStats>(fixtures::FEEDER_STATS_UNRANKED)?;
         whole::<Leaderboards>(fixtures::LEADERBOARDS)?;
-        whole::<Leaderboard>(fixtures::LEADERBOARD)
+        whole::<Leaderboard>(fixtures::LEADERBOARD)?;
+        whole::<Leaderboard>(fixtures::LEADERBOARD_UNRANKED)
     }
 
     #[test]

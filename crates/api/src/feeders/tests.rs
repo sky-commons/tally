@@ -321,8 +321,84 @@ fn only_feeders_with_standing_are_ranked_and_by_what_only_they_add() -> Result<(
     assert_eq!(listed.areas[0].area, area.to_string());
     // Without standing, nobody is ranked anywhere.
     let none = ledger(&records()).board(T + 60_000, |_| false);
-    assert!(none.leaderboards().areas.is_empty() && stats(&none, 7).ranks.is_none());
+    assert!(stats(&none, 7).ranks.is_none());
     assert!(!stats(&none, 7).standing);
+    Ok(())
+}
+
+/// An area too new for standing is listed all the same: its receivers counted, none ranked, each
+/// of them unranked. C states no place, so no area holds it.
+#[test]
+fn an_area_with_feeders_but_none_ranked_is_listed_with_its_receivers() -> Result<(), String> {
+    let board = ledger(&records()).board(T + 60_000, |_| false);
+    let named = stats(&board, 7).area.ok_or("no area")?;
+    let listed = board.leaderboards();
+    assert_eq!(listed.areas.len(), 1);
+    let only = &listed.areas[0];
+    assert_eq!(
+        (only.area.as_str(), only.ranked, only.receivers),
+        (named.as_str(), 0, 2)
+    );
+    let area = parse_area(&named).ok_or("not an area")?;
+    let boards = board.leaderboard(&area).ok_or("no board")?;
+    assert_eq!((boards.ranked, boards.receivers), (0, 2));
+    assert!(boards.by_unique_coverage.is_empty() && boards.by_mlat.is_empty());
+    let mut keys = [stats(&board, 7).key, stats(&board, 8).key];
+    keys.sort();
+    let unranked: Vec<&str> = boards.unranked.iter().map(|one| one.key.as_str()).collect();
+    assert_eq!(unranked, keys);
+    Ok(())
+}
+
+/// `unranked` is exactly the area's feeders without standing: a ranked feeder is never in it.
+#[test]
+fn unranked_lists_exactly_the_feeders_without_standing() -> Result<(), String> {
+    let only_a = |key: &PublicKey| *key == identity(7).public();
+    let board = ledger(&records()).board(T + 60_000, only_a);
+    let (a, b) = (stats(&board, 7), stats(&board, 8));
+    let area = parse_area(a.area.as_deref().ok_or("no area")?).ok_or("not an area")?;
+    let boards = board.leaderboard(&area).ok_or("no board")?;
+    assert_eq!((boards.ranked, boards.receivers), (1, 2));
+    assert_eq!(boards.unranked, vec![UnrankedFeeder { key: b.key }]);
+    for entry in boards.by_unique_coverage.iter().chain(&boards.by_mlat) {
+        assert!(boards.unranked.iter().all(|one| one.key != entry.key));
+    }
+    assert_eq!(boards.by_unique_coverage[0].key, a.key);
+    // With standing for both, nobody is unranked.
+    let both = ledger(&records()).board(T + 60_000, standing);
+    let boards = both.leaderboard(&area).ok_or("no board")?;
+    assert_eq!((boards.ranked, boards.receivers), (2, 2));
+    assert!(boards.unranked.is_empty());
+    Ok(())
+}
+
+/// Areas are listed the most ranked first, then the most feeders, then by area.
+#[test]
+fn areas_are_listed_by_ranked_then_receivers() -> Result<(), String> {
+    let (a, b, d) = (identity(7), identity(8), identity(10));
+    let far = LatLon {
+        lat: 51.5,
+        lon: -0.1,
+    };
+    let mut ledger = Ledger::default();
+    ledger.locate([(a.public(), A_AT), (b.public(), B_AT), (d.public(), far)]);
+    for who in [&a, &b, &d] {
+        ledger.ingest(&batch(who, 0, T, &[df11(X.0)]), T, &ALL);
+    }
+    // Nobody ranked: A's and B's area holds two receivers, D's one.
+    let board = ledger.board(T + 60_000, |_| false);
+    let listed: Vec<(u32, u32)> = board
+        .leaderboards()
+        .areas
+        .iter()
+        .map(|area| (area.ranked, area.receivers))
+        .collect();
+    assert_eq!(listed, [(0, 2), (0, 1)]);
+    // D ranked: its area of one comes first.
+    let board = ledger.board(T + 60_000, |key| *key == d.public());
+    let listed = board.leaderboards();
+    assert_eq!(Some(listed.areas[0].area.clone()), area_name(far));
+    assert_eq!((listed.areas[1].ranked, listed.areas[1].receivers), (0, 2));
     Ok(())
 }
 
