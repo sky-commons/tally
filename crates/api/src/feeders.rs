@@ -38,7 +38,9 @@
 //! **Leaderboards** rank, per area (`tally_wire::rendezvous::area_at` of where a receiver says it
 //! is, the network's own areas), by unique coverage and by MLAT help, never by raw message counts, and rank
 //! only receivers with standing (RFC-0174 §2.12, the merge's ledger): a new key, or one whose
-//! receptions keep disagreeing with verified fixes, is listed nowhere.
+//! receptions keep disagreeing with verified fixes, is ranked nowhere. Every area with a receiver
+//! is listed all the same, with how many it holds and which of them are unranked, so an area too
+//! new for MLAT (and so for standing) shows its receivers rather than nothing.
 //!
 //! Memory is bounded: receivers, aircraft and cited observation sets each by count, least recently
 //! active forgotten first (`Bounded`), and each receiver's aircraft and cells by `MAX_PER_FEEDER`.
@@ -48,6 +50,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use h3o::{CellIndex, LatLng, Resolution};
 use tally_api_types::{
     FeederStats, Leaderboard, LeaderboardArea, LeaderboardEntry, Leaderboards, Position, Ranks,
+    UnrankedFeeder,
 };
 use tally_mlat_solver::modes;
 use tally_relay::bounded::Bounded;
@@ -72,7 +75,7 @@ pub const FRESH_WITHIN_MS: u64 = 120_000;
 pub const MAX_RANGE_M: f64 = 600_000.0;
 /// Coverage cells: H3 resolution 5, about 250 km² each.
 pub const COVERAGE_RESOLUTION: Resolution = Resolution::Five;
-/// Feeders each leaderboard lists.
+/// Feeders each leaderboard lists, and an area's unranked feeders at most.
 pub const BOARD_LENGTH: usize = 20;
 /// Receivers held.
 pub const MAX_FEEDERS: usize = 8_192;
@@ -598,7 +601,7 @@ impl Board {
         }
     }
 
-    /// One area's boards, `None` when it ranks no one.
+    /// One area's boards, `None` when no feeder with figures is in it.
     pub fn leaderboard(&self, area: &CellIndex) -> Option<Leaderboard> {
         self.areas.get(&area.to_string()).cloned()
     }
@@ -641,21 +644,23 @@ fn entry(rank: usize, stats: &FeederStats) -> LeaderboardEntry {
     }
 }
 
-/// Ranks every feeder with standing and an area within its area, and builds the boards.
+/// Ranks every feeder with standing and an area within its area, and builds the boards: one for
+/// every area a feeder is in, ranked or not.
 fn rank(now_ms: u64, window_for_ms: u64, mut feeders: BTreeMap<PublicKey, FeederStats>) -> Board {
     let mut by_area: BTreeMap<String, Vec<PublicKey>> = BTreeMap::new();
     for (key, stats) in &feeders {
-        if let (true, Some(area)) = (stats.standing, &stats.area) {
+        if let Some(area) = &stats.area {
             by_area.entry(area.clone()).or_default().push(*key);
         }
     }
     let mut areas = BTreeMap::new();
     let mut index = Vec::new();
     for (area, keys) in by_area {
-        let mut ranked: Vec<FeederStats> = keys
+        let receivers = u32::try_from(keys.len()).unwrap_or(u32::MAX);
+        let (mut ranked, unranked): (Vec<FeederStats>, Vec<FeederStats>) = keys
             .iter()
             .filter_map(|key| feeders.get(key).cloned())
-            .collect();
+            .partition(|stats| stats.standing);
         let of = u32::try_from(ranked.len()).unwrap_or(u32::MAX);
         ranked.sort_by(by_unique);
         let by_unique_coverage: Vec<LeaderboardEntry> = ranked
@@ -669,14 +674,19 @@ fn rank(now_ms: u64, window_for_ms: u64, mut feeders: BTreeMap<PublicKey, Feeder
             .enumerate()
             .map(|(n, s)| entry(n, s))
             .collect();
-        for (key, stats) in &mut feeders {
-            if stats.area.as_ref() != Some(&area) || !stats.standing {
+        let mut unranked: Vec<UnrankedFeeder> = unranked
+            .into_iter()
+            .map(|stats| UnrankedFeeder { key: stats.key })
+            .collect();
+        unranked.sort_by(|a, b| a.key.cmp(&b.key));
+        for key in &keys {
+            let Some(stats) = feeders.get_mut(key).filter(|stats| stats.standing) else {
                 continue;
-            }
+            };
             let place = |board: &[LeaderboardEntry]| {
                 board
                     .iter()
-                    .find(|entry| entry.key == key.to_base64())
+                    .find(|entry| entry.key == stats.key)
                     .map_or(0, |entry| entry.rank)
             };
             stats.ranks = Some(Ranks {
@@ -698,6 +708,7 @@ fn rank(now_ms: u64, window_for_ms: u64, mut feeders: BTreeMap<PublicKey, Feeder
             area: area.clone(),
             center,
             ranked: of,
+            receivers,
         });
         areas.insert(
             area.clone(),
@@ -707,12 +718,19 @@ fn rank(now_ms: u64, window_for_ms: u64, mut feeders: BTreeMap<PublicKey, Feeder
                 area,
                 center,
                 ranked: of,
+                receivers,
                 by_unique_coverage: by_unique_coverage.into_iter().take(BOARD_LENGTH).collect(),
                 by_mlat: by_mlat.into_iter().take(BOARD_LENGTH).collect(),
+                unranked: unranked.into_iter().take(BOARD_LENGTH).collect(),
             },
         );
     }
-    index.sort_by(|a, b| b.ranked.cmp(&a.ranked).then(a.area.cmp(&b.area)));
+    index.sort_by(|a, b| {
+        b.ranked
+            .cmp(&a.ranked)
+            .then(b.receivers.cmp(&a.receivers))
+            .then(a.area.cmp(&b.area))
+    });
     Board {
         now_ms,
         window_for_ms,

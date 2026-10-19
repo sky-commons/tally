@@ -15,9 +15,9 @@
 //! - `GET /v1/stations/{key}`: one receiver, the key as base64url without padding.
 //! - `GET /v1/stations/{key}/stats`: what one feeder gave the network over the last day (`feeders`),
 //!   computed by this API as a client from public signed records, never by a relay.
-//! - `GET /v1/leaderboards` and `GET /v1/leaderboards/{area}`: the areas whose feeders are ranked,
-//!   and one area's two leaderboards (by unique coverage and by MLAT help; only feeders with
-//!   standing).
+//! - `GET /v1/leaderboards` and `GET /v1/leaderboards/{area}`: every area with a feeder, ranked or
+//!   not, and one area's two leaderboards (by unique coverage and by MLAT help; only feeders with
+//!   standing) and its feeders without standing.
 //!
 //! Every response carries CORS for the configured origins and a `Cache-Control` for the edge.
 //! Each client is held to a token bucket (`limit`), requests in flight and connections are
