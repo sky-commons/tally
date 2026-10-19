@@ -7,6 +7,7 @@
     "lon": -122.134251
   },
   "ranked": 2,
+  "receivers": 2,
   "by_unique_coverage": [
     {
       "rank": 1,
@@ -34,5 +35,6 @@
       "unique_coverage_km2": 0.0,
       "mlat_positions": 1
     }
-  ]
+  ],
+  "unranked": []
 }

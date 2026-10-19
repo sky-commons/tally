@@ -243,7 +243,10 @@ async fn leaderboard(State(app): State<Arc<App>>, Path(area): Path<String>) -> R
     };
     match board(&app).map(|board| board.leaderboard(&area)) {
         Ok(Some(boards)) => axum::Json(boards).into_response(),
-        Ok(None) => refuse(StatusCode::NOT_FOUND, "no feeder is ranked in this area"),
+        Ok(None) => refuse(
+            StatusCode::NOT_FOUND,
+            "no feeder has figures in this area in the last day",
+        ),
         Err(why) => refuse(StatusCode::SERVICE_UNAVAILABLE, why),
     }
 }

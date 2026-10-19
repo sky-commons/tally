@@ -1,0 +1,21 @@
+{
+  "now_ms": 1791220060000,
+  "window_for_ms": 60000,
+  "area": "832834fffffffff",
+  "center": {
+    "lat": 37.097866,
+    "lon": -122.134251
+  },
+  "ranked": 0,
+  "receivers": 2,
+  "by_unique_coverage": [],
+  "by_mlat": [],
+  "unranked": [
+    {
+      "key": "6kpsY+KcUgq+9VB7Ey7F+ZVHdq6+vnuSQh7qaRRG0iw="
+    },
+    {
+      "key": "E5j2LG0aRXxRumpLXz29L2n8qTIWIY3ImX5Ba9F9k8o="
+    }
+  ]
+}

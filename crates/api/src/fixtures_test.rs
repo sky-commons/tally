@@ -299,5 +299,12 @@ fn the_feeder_and_leaderboard_answers_are_the_fixtures() -> Result<(), String> {
     same(
         &board.leaderboard(&area).ok_or("no board")?,
         fixtures::LEADERBOARD,
+    )?;
+    // The same records while no feeder has standing: the area is answered, nobody is ranked.
+    use crate::feeders::tests::{T, ledger, records};
+    let unranked = ledger(&records()).board(T + 60_000, |_| false);
+    same(
+        &unranked.leaderboard(&area).ok_or("no board")?,
+        fixtures::LEADERBOARD_UNRANKED,
     )
 }
