@@ -180,7 +180,7 @@ tally-api --relay-stats http://127.0.0.1:10901 --readsb http://127.0.0.1:30152 \
 
 `--routes DIR` is a checkout of [VRS standing data](https://github.com/vradarserver/standing-data)
 (CC0), its `routes/` and `airports/` CSV files, which the operator keeps current (daily, say, with
-`git -C DIR pull`); the API reads it at start and again when its files change or hourly. Fetch it
+`git -C DIR pull`); the API reads it at start and again whenever its files change. Fetch it
 once with `git clone --depth 1 --filter=blob:none --sparse https://github.com/vradarserver/standing-data DIR && git -C DIR sparse-checkout set routes airports`.
 Without it the routes answer `404`.
 
