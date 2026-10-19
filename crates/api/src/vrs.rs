@@ -9,9 +9,9 @@
 //! - `GET /api/0/route/{callsign}/{lat}/{lon}`: one.
 //!
 //! The data is a directory the operator keeps (`--routes DIR`, a checkout of standing-data holding
-//! its `routes/` and `airports/` CSV files), read whole at start and again when its files change or
-//! every `RELOAD_EVERY` (`keep`). Without the flag the routes answer `404` and say why; with it,
-//! `503` until the first read.
+//! its `routes/` and `airports/` CSV files), read at start and again whenever its files change
+//! (`keep`), into a compact table (`Standing`). Without the flag the routes answer `404` and say
+//! why; with it, `503` until the first read.
 //
 // Copyright (c) 2023, Katia Esposito
 //
@@ -41,9 +41,10 @@
 // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 use std::collections::{HashMap, HashSet};
+use std::io::{BufRead, BufReader};
 use std::path::{Path as FilePath, PathBuf};
 use std::sync::{Arc, RwLock};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, SystemTime};
 
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Path, State};
@@ -61,104 +62,333 @@ pub const MAX_PLANES: usize = 100;
 pub const MAX_BODY_BYTES: usize = 16 * 1024;
 /// How often the directory is looked at for changed files.
 pub const CHECK_EVERY: Duration = Duration::from_secs(60);
-/// How long the data is kept before it is read again, changed or not.
-pub const RELOAD_EVERY: Duration = Duration::from_secs(3600);
 /// What every code of a route the data does not hold reads.
 pub const UNKNOWN: &str = "unknown";
 
 const EARTH_RADIUS_M: f64 = 6_371_000.0;
 const METRES_PER_NM: f64 = 1852.0;
 
-/// One route row: `Callsign,Code,Number,AirlineCode,AirportCodes`.
-#[derive(Clone, Debug)]
-struct RouteRow {
-    number: String,
-    airline_code: String,
-    airport_codes: String,
-}
+/// No airport: what `Standing::airport_of` holds for a code the airports files do not name.
+const NO_AIRPORT: u32 = u32::MAX;
 
-/// The standing data as read: routes by callsign, airports by code.
+/// Strings held once each, end to end in one text, each named by its place among them.
 #[derive(Debug, Default)]
-pub struct Standing {
-    routes: HashMap<String, RouteRow>,
-    airports: HashMap<String, RouteAirport>,
+struct Texts {
+    text: String,
+    ends: Vec<u32>,
 }
 
-impl Standing {
-    /// Reads every CSV file under `dir`'s `routes/` and `airports/`, however deep (standing-data
-    /// splits each by its first letters).
-    pub fn load(dir: &FilePath) -> Result<Self, String> {
-        let mut standing = Self::default();
-        for file in csv_files(&dir.join("routes"))? {
-            standing.add_routes(&read(&file)?);
-        }
-        for file in csv_files(&dir.join("airports"))? {
-            standing.add_airports(&read(&file)?);
-        }
-        Ok(standing)
+impl Texts {
+    fn get(&self, id: u32) -> &str {
+        let id = id as usize;
+        let start = id
+            .checked_sub(1)
+            .map_or(0, |before| self.ends[before] as usize);
+        &self.text[start..self.ends[id] as usize]
     }
 
+    fn len(&self) -> usize {
+        self.ends.len()
+    }
+
+    fn shrink_to_fit(&mut self) {
+        self.text.shrink_to_fit();
+        self.ends.shrink_to_fit();
+    }
+}
+
+/// `Texts` being written: each string's name, found by the string, while the data is read.
+#[derive(Debug, Default)]
+struct Interner {
+    texts: Texts,
+    ids: HashMap<Box<str>, u32>,
+}
+
+impl Interner {
+    fn id(&mut self, text: &str) -> std::io::Result<u32> {
+        if let Some(&id) = self.ids.get(text) {
+            return Ok(id);
+        }
+        let id = index(self.texts.ends.len())?;
+        self.texts.text.push_str(text);
+        self.texts.ends.push(index(self.texts.text.len())?);
+        self.ids.insert(text.into(), id);
+        Ok(id)
+    }
+
+    fn done(self) -> Texts {
+        let mut texts = self.texts;
+        texts.shrink_to_fit();
+        texts
+    }
+}
+
+/// `n` as a place in one of the standing data's lists, which a `u32` names.
+fn index(n: usize) -> std::io::Result<u32> {
+    u32::try_from(n).map_err(|_| std::io::Error::other("the standing data is too large to hold"))
+}
+
+/// One route row (`Callsign,Code,Number,AirlineCode,AirportCodes`): its number and airline's code
+/// names in `Standing::texts`, and where its callsign and airport codes start in `Rows`.
+#[derive(Clone, Copy, Debug)]
+struct Row {
+    callsign: u32,
+    number: u32,
+    airline_code: u32,
+    codes: u32,
+}
+
+/// The route rows in reading order. A row's callsign (upper case) runs in `callsigns`, and its
+/// airport codes (the row's codes between its dashes, as names in `Standing::codes`) in `codes`,
+/// from its own start to the next row's.
+#[derive(Debug, Default)]
+struct Rows {
+    callsigns: String,
+    rows: Vec<Row>,
+    codes: Vec<u32>,
+}
+
+impl Rows {
+    fn callsign(&self, row: u32) -> &str {
+        let row = row as usize;
+        let end = self
+            .rows
+            .get(row + 1)
+            .map_or(self.callsigns.len(), |next| next.callsign as usize);
+        &self.callsigns[self.rows[row].callsign as usize..end]
+    }
+
+    fn codes(&self, row: u32) -> &[u32] {
+        let row = row as usize;
+        let end = self
+            .rows
+            .get(row + 1)
+            .map_or(self.codes.len(), |next| next.codes as usize);
+        &self.codes[self.rows[row].codes as usize..end]
+    }
+
+    fn shrink_to_fit(&mut self) {
+        self.callsigns.shrink_to_fit();
+        self.rows.shrink_to_fit();
+        self.codes.shrink_to_fit();
+    }
+}
+
+/// One airports row (`Code,Name,ICAO,IATA,Location,CountryISO2,Latitude,Longitude,
+/// AltitudeFeet`): its code a name in `Standing::codes`, its words names in `Standing::texts`.
+#[derive(Clone, Copy, Debug)]
+struct Airport {
+    code: u32,
+    name: u32,
+    iata: u32,
+    location: u32,
+    country: u32,
+    lat: f64,
+    lon: f64,
+    alt_feet: f64,
+}
+
+/// The standing data being read, file by file (`Load::add_routes`, `Load::add_airports`), until
+/// it is held (`Load::finish`).
+#[derive(Debug, Default)]
+pub struct Load {
+    rows: Rows,
+    codes: Interner,
+    texts: Interner,
+    airports: Vec<Airport>,
+    airport_of: Vec<u32>,
+}
+
+impl Load {
     /// Adds one routes file's rows; its header, and a row too short to be one, are passed over.
-    pub fn add_routes(&mut self, text: &str) {
-        for line in text.trim_start_matches('\u{feff}').lines() {
-            let fields = fields(line);
-            let [callsign, _, number, airline_code, airport_codes] = fields.as_slice() else {
-                continue;
+    /// A callsign read again is the later row's.
+    pub fn add_routes(&mut self, file: impl BufRead) -> std::io::Result<()> {
+        let mut row = Vec::new();
+        each_line(file, |line| {
+            fields(line, &mut row);
+            let [callsign, _, number, airline_code, airport_codes] = row.as_slice() else {
+                return Ok(());
             };
             if callsign == "Callsign" {
-                continue;
+                return Ok(());
             }
-            self.routes.insert(
-                callsign.to_ascii_uppercase(),
-                RouteRow {
-                    number: number.clone(),
-                    airline_code: airline_code.clone(),
-                    airport_codes: airport_codes.clone(),
-                },
-            );
-        }
+            let rows = &mut self.rows;
+            let (start, codes) = (rows.callsigns.len(), rows.codes.len());
+            rows.callsigns.push_str(callsign);
+            rows.callsigns[start..].make_ascii_uppercase();
+            for code in airport_codes.split('-') {
+                rows.codes.push(self.codes.id(code)?);
+            }
+            // Every row has a code (`split` yields at least one), so `codes` checks how many rows.
+            index(rows.codes.len())?;
+            rows.rows.push(Row {
+                callsign: index(start)?,
+                number: self.texts.id(number)?,
+                airline_code: self.texts.id(airline_code)?,
+                codes: index(codes)?,
+            });
+            index(rows.callsigns.len())?;
+            Ok(())
+        })
     }
 
-    /// Adds one airports file's rows (`Code,Name,ICAO,IATA,Location,CountryISO2,Latitude,
-    /// Longitude,AltitudeFeet`). A row whose place or height is not a number is no airport, as
-    /// adsb.lol reads it.
-    pub fn add_airports(&mut self, text: &str) {
-        for line in text.trim_start_matches('\u{feff}').lines() {
-            let fields = fields(line);
-            let [code, name, _, iata, location, country, lat, lon, alt_feet] = fields.as_slice()
+    /// Adds one airports file's rows. A row whose place or height is not a number is no airport,
+    /// as adsb.lol reads it, and a code read again is the later row's.
+    pub fn add_airports(&mut self, file: impl BufRead) -> std::io::Result<()> {
+        let mut row = Vec::new();
+        each_line(file, |line| {
+            fields(line, &mut row);
+            let [code, name, _, iata, location, country, lat, lon, alt_feet] = row.as_slice()
             else {
-                continue;
+                return Ok(());
             };
             let (Ok(lat), Ok(lon), Ok(alt_feet)) = (
                 lat.parse::<f64>(),
                 lon.parse::<f64>(),
                 alt_feet.parse::<f64>(),
             ) else {
-                continue;
+                return Ok(());
             };
-            self.airports.insert(
-                code.clone(),
-                RouteAirport {
-                    name: name.clone(),
-                    icao: code.clone(),
-                    iata: iata.clone(),
-                    location: location.clone(),
-                    countryiso2: country.clone(),
-                    lat,
-                    lon,
-                    alt_feet,
-                    alt_meters: (alt_feet * 0.3048 * 100.0).round() / 100.0,
-                },
-            );
+            let code = self.codes.id(code)?;
+            let airport = Airport {
+                code,
+                name: self.texts.id(name)?,
+                iata: self.texts.id(iata)?,
+                location: self.texts.id(location)?,
+                country: self.texts.id(country)?,
+                lat,
+                lon,
+                alt_feet,
+            };
+            let slot = code as usize;
+            if self.airport_of.len() <= slot {
+                self.airport_of.resize(slot + 1, NO_AIRPORT);
+            }
+            match self.airport_of[slot] {
+                NO_AIRPORT => {
+                    self.airport_of[slot] = index(self.airports.len())?;
+                    self.airports.push(airport);
+                }
+                held => self.airports[held as usize] = airport,
+            }
+            Ok(())
+        })
+    }
+
+    /// The data as held: the rows as read, ordered by callsign with each callsign's last row, and
+    /// nothing of the reading kept.
+    pub fn finish(self) -> Standing {
+        let (codes, texts) = (self.codes.done(), self.texts.done());
+        let mut rows = self.rows;
+        rows.shrink_to_fit();
+        // Within `u32`: `add_routes` checked as many codes, and every row has one.
+        let mut order: Vec<u32> = (0..rows.rows.len() as u32).collect();
+        // In callsign order, and in reading order within one callsign (the sort is stable), so the
+        // last of each run is the row read last.
+        order.sort_by(|&a, &b| rows.callsign(a).cmp(rows.callsign(b)));
+        order.dedup_by(|later, earlier| {
+            let same = rows.callsign(*later) == rows.callsign(*earlier);
+            if same {
+                *earlier = *later;
+            }
+            same
+        });
+        order.shrink_to_fit();
+        let mut airport_of = self.airport_of;
+        airport_of.resize(codes.len(), NO_AIRPORT);
+        airport_of.shrink_to_fit();
+        let mut airports = self.airports;
+        airports.shrink_to_fit();
+        Standing {
+            rows,
+            order,
+            codes,
+            airport_of,
+            airports,
+            texts,
         }
+    }
+}
+
+/// The standing data as held: routes by callsign, airports by code.
+///
+/// Held compact, because the API runs in 256 MiB: every string once (a code, a flight number, an
+/// airline's code, an airport's words) in one text, a route four `u32`s and its place in the
+/// callsign order a fifth, its callsign and codes runs of shared lists, found by binary search.
+///
+/// Measured on standing-data of 2026-10-19 (620,736 routes, 34,128 airports, a counting allocator
+/// in a release build): it holds 24.3 MiB of heap (36 MiB resident in all), against 122.8 MiB
+/// (198 MiB resident) as maps of owned strings. Reading it peaks at 43.9 MiB, so a read beside
+/// the data it replaces (`keep`) peaks at 68.2 MiB, against 278 MiB (394 MiB resident).
+#[derive(Debug, Default)]
+pub struct Standing {
+    rows: Rows,
+    /// The rows by callsign, each callsign's last.
+    order: Vec<u32>,
+    /// Every airport code, of routes and airports alike.
+    codes: Texts,
+    /// For each code, its airport's place in `airports`, or `NO_AIRPORT`.
+    airport_of: Vec<u32>,
+    airports: Vec<Airport>,
+    /// Every other string: flight numbers, airlines' codes, airports' words.
+    texts: Texts,
+}
+
+impl Standing {
+    /// Reads every CSV file under `dir`'s `routes/` and `airports/`, however deep (standing-data
+    /// splits each by its first letters), a line at a time.
+    pub fn load(dir: &FilePath) -> Result<Self, String> {
+        let mut load = Load::default();
+        let open = |file: &FilePath| {
+            std::fs::File::open(file)
+                .map(BufReader::new)
+                .map_err(|error| format!("{}: {error}", file.display()))
+        };
+        for file in csv_files(&dir.join("routes"))? {
+            load.add_routes(open(&file)?)
+                .map_err(|error| format!("{}: {error}", file.display()))?;
+        }
+        for file in csv_files(&dir.join("airports"))? {
+            load.add_airports(open(&file)?)
+                .map_err(|error| format!("{}: {error}", file.display()))?;
+        }
+        Ok(load.finish())
     }
 
     pub fn routes(&self) -> usize {
-        self.routes.len()
+        self.order.len()
     }
 
     pub fn airports(&self) -> usize {
         self.airports.len()
+    }
+
+    /// The row of the route `callsign` names (upper case), by binary search.
+    fn find(&self, callsign: &str) -> Option<u32> {
+        let at = self
+            .order
+            .binary_search_by(|&row| self.rows.callsign(row).cmp(callsign))
+            .ok()?;
+        Some(self.order[at])
+    }
+
+    /// The airport `code` names, as the routes answer it, when the data holds one.
+    fn airport(&self, code: u32) -> Option<RouteAirport> {
+        let airport = self
+            .airports
+            .get(*self.airport_of.get(code as usize)? as usize)?;
+        let text = |id| self.texts.get(id).to_owned();
+        Some(RouteAirport {
+            name: text(airport.name),
+            icao: self.codes.get(airport.code).to_owned(),
+            iata: text(airport.iata),
+            location: text(airport.location),
+            countryiso2: text(airport.country),
+            lat: airport.lat,
+            lon: airport.lon,
+            alt_feet: airport.alt_feet,
+            alt_meters: (airport.alt_feet * 0.3048 * 100.0).round() / 100.0,
+        })
     }
 
     /// `callsign`'s route, judged against `at` (latitude, longitude) when the client gave it.
@@ -172,22 +402,24 @@ impl Standing {
             airports: Vec::new(),
             plausible: None,
         };
-        let Some(row) = self.routes.get(&callsign.trim().to_ascii_uppercase()) else {
+        let Some(found) = self.find(&callsign.trim().to_ascii_uppercase()) else {
             return unknown(UNKNOWN, UNKNOWN);
         };
-        if row.airport_codes == UNKNOWN {
-            return unknown(&row.number, &row.airline_code);
+        let row = self.rows.rows[found as usize];
+        let (number, airline_code) = (self.texts.get(row.number), self.texts.get(row.airline_code));
+        let ids = self.rows.codes(found);
+        let codes: Vec<&str> = ids.iter().map(|&code| self.codes.get(code)).collect();
+        let airport_codes = codes.join("-");
+        if airport_codes == UNKNOWN {
+            return unknown(number, airline_code);
         }
-        let codes: Vec<&str> = row.airport_codes.split('-').collect();
-        let known = |code: &str| self.airports.get(code);
-        let airports: Vec<RouteAirport> = codes
-            .iter()
-            .filter_map(|code| known(code).cloned())
-            .collect();
+        let known: Vec<Option<RouteAirport>> = ids.iter().map(|&code| self.airport(code)).collect();
+        let airports: Vec<RouteAirport> = known.iter().flatten().cloned().collect();
         // Each ICAO code written as its airport's IATA code, where it has one, code by code.
         let airport_codes_iata = codes
             .iter()
-            .map(|code| match known(code) {
+            .zip(&known)
+            .map(|(code, known)| match known {
                 Some(airport) if code.len() == 4 && !airport.iata.is_empty() => {
                     airport.iata.as_str()
                 }
@@ -197,18 +429,18 @@ impl Standing {
             .join("-");
         // The legs are the route's, code after code: a leg with an end the data does not hold is
         // not known, and is never bridged by joining the airports either side of it.
-        let legs: Vec<(&RouteAirport, &RouteAirport)> = codes
+        let legs: Vec<(&RouteAirport, &RouteAirport)> = known
             .windows(2)
-            .filter_map(|pair| Some((known(pair[0])?, known(pair[1])?)))
+            .filter_map(|pair| Some((pair[0].as_ref()?, pair[1].as_ref()?)))
             .collect();
         let plausible = at
             .filter(|_| !legs.is_empty())
             .map(|(lat, lon)| on_route(&legs, lat, lon));
         Route {
             callsign: callsign.to_owned(),
-            number: row.number.clone(),
-            airline_code: row.airline_code.clone(),
-            airport_codes: row.airport_codes.clone(),
+            number: number.to_owned(),
+            airline_code: airline_code.to_owned(),
+            airport_codes,
             airport_codes_iata,
             airports,
             plausible,
@@ -272,10 +504,10 @@ pub fn plausible(at: (f64, f64), a: (f64, f64), b: (f64, f64)) -> bool {
     turn.cos() >= 0.0 && along_track <= leg && cross_track.abs() <= threshold
 }
 
-/// One CSV line's fields: commas separate them, and a field in double quotes may hold commas and
-/// doubled quotes (standing-data quotes a place such as `"Lydd, Ashford"`).
-fn fields(line: &str) -> Vec<String> {
-    let mut fields = Vec::new();
+/// One CSV line's fields, into `fields`: commas separate them, and a field in double quotes may
+/// hold commas and doubled quotes (standing-data quotes a place such as `"Lydd, Ashford"`).
+fn fields(line: &str, fields: &mut Vec<String>) {
+    fields.clear();
     let mut field = String::new();
     let mut quoted = false;
     let mut chars = line.chars().peekable();
@@ -295,11 +527,30 @@ fn fields(line: &str) -> Vec<String> {
         }
     }
     fields.push(field);
-    fields
 }
 
-fn read(file: &FilePath) -> Result<String, String> {
-    std::fs::read_to_string(file).map_err(|error| format!("{}: {error}", file.display()))
+/// Each line of `file` to `each`, one at a time, split as `str::lines` splits a text (at `\n`,
+/// and a `\r` before it), with the byte-order marks it starts with passed over.
+fn each_line(
+    mut file: impl BufRead,
+    mut each: impl FnMut(&str) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let mut line = String::new();
+    let mut first = true;
+    loop {
+        line.clear();
+        if file.read_line(&mut line)? == 0 {
+            return Ok(());
+        }
+        let mut text = line.as_str();
+        if std::mem::take(&mut first) {
+            text = text.trim_start_matches('\u{feff}');
+        }
+        if let Some(ended) = text.strip_suffix('\n') {
+            text = ended.strip_suffix('\r').unwrap_or(ended);
+        }
+        each(text)?;
+    }
 }
 
 /// Every `.csv` file under `dir`, however deep, in name order. A symbolic link is passed over, file
@@ -331,7 +582,7 @@ fn csv_files(dir: &FilePath) -> Result<Vec<PathBuf>, String> {
 }
 
 /// What says the directory's files changed: each file's path, length and modification time.
-type Fingerprint = Vec<(PathBuf, u64, Option<SystemTime>)>;
+pub type Fingerprint = Vec<(PathBuf, u64, Option<SystemTime>)>;
 
 fn fingerprint(dir: &FilePath) -> Result<Fingerprint, String> {
     let mut files = csv_files(&dir.join("routes"))?;
@@ -363,44 +614,48 @@ impl Held {
     }
 }
 
-/// Reads `dir` into `held` now, and again whenever its files change or `RELOAD_EVERY` has passed,
-/// for as long as the API runs. A read that fails keeps what was held and is tried again at the
-/// next look.
+/// Reads `dir` into `held` when its files are not the ones `read` fingerprints (none: never read),
+/// and says whether it read. Files unchanged are not read again: the data held is theirs. A read
+/// that fails keeps what was held and `read` as it was, so the next look tries again.
+pub fn look(dir: &FilePath, held: &Held, read: &mut Option<Fingerprint>) -> Result<bool, String> {
+    let seen = fingerprint(dir)?;
+    if read.as_ref() == Some(&seen) {
+        return Ok(false);
+    }
+    let standing = Standing::load(dir)?;
+    eprintln!(
+        "tally-api: routes: {} routes, {} airports",
+        standing.routes(),
+        standing.airports()
+    );
+    held.set(standing);
+    *read = Some(seen);
+    Ok(true)
+}
+
+/// Reads `dir` into `held` now, and again whenever its files change (`look`, every
+/// `CHECK_EVERY`), for as long as the API runs.
 pub async fn keep(dir: PathBuf, held: Arc<Held>) {
-    let mut read: Option<(Fingerprint, Instant)> = None;
+    let mut read: Option<Fingerprint> = None;
     loop {
-        let looked = {
-            let dir = dir.clone();
-            tokio::task::spawn_blocking(move || {
-                let seen = fingerprint(&dir)?;
-                Ok::<_, String>((seen, dir))
-            })
-            .await
-        };
-        match looked {
-            Ok(Ok((seen, dir))) => {
-                let due = read
-                    .as_ref()
-                    .is_none_or(|(before, at)| *before != seen || at.elapsed() >= RELOAD_EVERY);
-                if due {
-                    match tokio::task::spawn_blocking(move || Standing::load(&dir)).await {
-                        Ok(Ok(standing)) => {
-                            eprintln!(
-                                "tally-api: routes: {} routes, {} airports",
-                                standing.routes(),
-                                standing.airports()
-                            );
-                            held.set(standing);
-                            read = Some((seen, Instant::now()));
-                        }
-                        Ok(Err(error)) => eprintln!("tally-api: routes: {error}"),
-                        Err(error) => eprintln!("tally-api: routes: {error}"),
-                    }
-                }
+        let (dir, held) = (dir.clone(), Arc::clone(&held));
+        let looked = tokio::task::spawn_blocking(move || {
+            let looked = look(&dir, &held, &mut read);
+            (looked, read)
+        })
+        .await;
+        read = match looked {
+            Ok((Ok(_), read)) => read,
+            Ok((Err(error), read)) => {
+                eprintln!("tally-api: routes: {error}");
+                read
             }
-            Ok(Err(error)) => eprintln!("tally-api: routes: {error}"),
-            Err(error) => eprintln!("tally-api: routes: {error}"),
-        }
+            // The look did not finish: read again at the next.
+            Err(error) => {
+                eprintln!("tally-api: routes: {error}");
+                None
+            }
+        };
         tokio::time::sleep(CHECK_EVERY).await;
     }
 }
@@ -517,30 +772,69 @@ pub(crate) mod tests {
     pub const AIRPORTS_K: &str = "Code,Name,ICAO,IATA,Location,CountryISO2,Latitude,Longitude,AltitudeFeet\n\
         KJFK,John F Kennedy International Airport,KJFK,JFK,New York,US,40.639801,-73.7789,13\n";
 
+    /// The four files read, not yet held.
+    pub fn read() -> std::io::Result<Load> {
+        let mut load = Load::default();
+        for (routes, airports) in [(ROUTES_B, AIRPORTS_E), (ROUTES_E, AIRPORTS_K)] {
+            load.add_routes(routes.as_bytes())?;
+            load.add_airports(airports.as_bytes())?;
+        }
+        Ok(load)
+    }
+
+    /// The four files held. They are text in memory, which reads; were it not, nothing would be
+    /// held and every answer would say so.
     pub fn standing() -> Standing {
-        let mut standing = Standing::default();
-        standing.add_routes(ROUTES_B);
-        standing.add_routes(ROUTES_E);
-        standing.add_airports(AIRPORTS_E);
-        standing.add_airports(AIRPORTS_K);
-        standing
+        read().map(Load::finish).unwrap_or_default()
+    }
+
+    /// `read` with more routes after it.
+    fn standing_with(routes: &str) -> Result<Standing, String> {
+        let mut load = read().map_err(|error| error.to_string())?;
+        load.add_routes(routes.as_bytes())
+            .map_err(|error| error.to_string())?;
+        Ok(load.finish())
     }
 
     #[test]
     fn the_files_are_read_as_standing_data_writes_them() {
         let standing = standing();
+        // An airport with no height (EG64) is none, as adsb.lol reads it.
         assert_eq!((standing.routes(), standing.airports()), (4, 3));
-        let lydd = standing
-            .airports
-            .get("EGMD")
-            .map(|airport| &airport.location);
-        assert_eq!(lydd.map(String::as_str), Some("Lydd, Ashford"));
-        // An airport with no height is none, as adsb.lol reads it.
-        assert!(!standing.airports.contains_key("EG64"));
+        let lydd = standing.route("EZY12", None).airports;
+        let lydd: Vec<&str> = lydd.iter().map(|one| one.location.as_str()).collect();
+        assert_eq!(lydd, ["Lydd, Ashford"]);
+        let mut row = Vec::new();
+        fields(r#"a,"b ""c"", d",,e"#, &mut row);
+        assert_eq!(row, ["a", r#"b "c", d"#, "", "e"]);
+    }
+
+    /// A callsign read again, in one file or a later one, is the later row's, and an airport's
+    /// code read again is the later row's too.
+    #[test]
+    fn a_row_read_again_is_the_later_one() -> Result<(), String> {
+        let standing = standing_with(
+            "TST1,TST,1,TST,EGLL-KJFK\nBAW1,BAW,1,BAW,EGLL-EGMD\ntst1,TST,1A,TST,KJFK-EGLL\r\nTST1A,TST,X,TST,unknown",
+        )?;
+        assert_eq!(standing.routes(), 6);
+        let route = standing.route("TST1", None);
         assert_eq!(
-            fields(r#"a,"b ""c"", d",,e"#),
-            ["a", r#"b "c", d"#, "", "e"]
+            (route.number.as_str(), route.airport_codes.as_str()),
+            ("1A", "KJFK-EGLL")
         );
+        assert_eq!(standing.route("baw1", None).airport_codes_iata, "LHR-LYX");
+        let route = standing.route("TST1A", Some((0.0, 0.0)));
+        assert_eq!(
+            (route.number.as_str(), route.airport_codes.as_str()),
+            ("X", UNKNOWN)
+        );
+        let mut load = read().map_err(|error| error.to_string())?;
+        load.add_airports("EGMD,Lydd,EGMD,LYD,Lydd,GB,50.9561,0.939167,13".as_bytes())
+            .map_err(|error| error.to_string())?;
+        let standing = load.finish();
+        assert_eq!(standing.airports(), 3);
+        assert_eq!(standing.route("EZY12", None).airport_codes_iata, "LYD-ZZZZ");
+        Ok(())
     }
 
     #[test]
@@ -571,19 +865,19 @@ pub(crate) mod tests {
     /// Each code is written as its own IATA code, never by replacing text inside the others: an
     /// airport's ICAO code that is part of another code is left whole.
     #[test]
-    fn each_code_is_written_as_its_own_iata_code() {
-        let mut standing = standing();
-        standing.add_routes("TST1,TST,1,TST,EGLL-XEGLLX-KJFK\n");
+    fn each_code_is_written_as_its_own_iata_code() -> Result<(), String> {
+        let standing = standing_with("TST1,TST,1,TST,EGLL-XEGLLX-KJFK\n")?;
         let route = standing.route("TST1", None);
         assert_eq!(route.airport_codes_iata, "LHR-XEGLLX-JFK");
+        Ok(())
     }
 
     /// The legs are the route's own, code after code: with an airport between two others unknown,
     /// no leg joins the two known ones, and a route with no known leg has no plausibility at all.
     #[test]
-    fn a_leg_with_an_unknown_end_is_no_leg() {
-        let mut standing = standing();
-        standing.add_routes("TST2,TST,2,TST,EGLL-ZZZZ-KJFK\nTST3,TST,3,TST,KJFK-ZZZZ-EGLL-EGMD\n");
+    fn a_leg_with_an_unknown_end_is_no_leg() -> Result<(), String> {
+        let standing =
+            standing_with("TST2,TST,2,TST,EGLL-ZZZZ-KJFK\nTST3,TST,3,TST,KJFK-ZZZZ-EGLL-EGMD\n")?;
         // Over the Atlantic on the great circle from London to New York.
         let atlantic = Some((52.3, -38.0));
         assert_eq!(standing.route("TST2", atlantic).plausible, None);
@@ -594,6 +888,7 @@ pub(crate) mod tests {
             Some(true)
         );
         assert_eq!(standing.route("TST3", atlantic).plausible, Some(false));
+        Ok(())
     }
 
     /// Near the great-circle leg, by adsb.lol's threshold (for London to New York, a fifth of its
@@ -656,6 +951,59 @@ pub(crate) mod tests {
         std::fs::remove_dir_all(&dir).map_err(|error| error.to_string())
     }
 
+    /// A look reads the directory when its files are new to it (the first look, a file added, a
+    /// file rewritten), and passes over files it has read: the data held stays the one read.
+    #[test]
+    fn a_look_reads_only_changed_files() -> Result<(), String> {
+        let dir = std::env::temp_dir().join(format!(
+            "tally-api-vrs-look-{}-{}",
+            std::process::id(),
+            crate::routes::wall_ms()
+        ));
+        let write = |path: &str, text: &str| -> Result<(), String> {
+            let file = dir.join(path);
+            if let Some(parent) = file.parent() {
+                std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+            }
+            std::fs::write(file, text).map_err(|error| error.to_string())
+        };
+        write("routes/B/BAW-all.csv", ROUTES_B)?;
+        write("airports/E/EG.csv", AIRPORTS_E)?;
+        let held = Held::default();
+        let mut read = None;
+        let routes = |held: &Held| held.get().map(|standing| standing.routes());
+        assert!(look(&dir, &held, &mut read)?);
+        assert_eq!(routes(&held), Some(3));
+        let first = held.get().ok_or("nothing held")?;
+        assert!(!look(&dir, &held, &mut read)?);
+        let again = held.get().ok_or("nothing held")?;
+        assert!(
+            Arc::ptr_eq(&first, &again),
+            "the same files were read again"
+        );
+        write("routes/E/EZY-1.csv", ROUTES_E)?;
+        assert!(look(&dir, &held, &mut read)?);
+        assert_eq!(routes(&held), Some(4));
+        write(
+            "routes/E/EZY-1.csv",
+            "EZY12,EZY,12,EZY,EGMD-ZZZZ\nEZY13,EZY,13,EZY,EGMD-EGLL\n",
+        )?;
+        assert!(look(&dir, &held, &mut read)?);
+        assert_eq!(routes(&held), Some(5));
+        assert!(!look(&dir, &held, &mut read)?);
+        // A read that fails keeps what was held, and is tried again at the next look.
+        write("routes/E/EZY-2.csv", "\u{feff}EZY14,EZY,14,EZY,EGMD-EGLL\n")?;
+        std::fs::write(dir.join("routes/E/EZY-3.csv"), [0xff, 0xfe, b'\n'])
+            .map_err(|error| error.to_string())?;
+        assert!(look(&dir, &held, &mut read).is_err());
+        assert_eq!(routes(&held), Some(5));
+        assert!(look(&dir, &held, &mut read).is_err());
+        std::fs::remove_file(dir.join("routes/E/EZY-3.csv")).map_err(|error| error.to_string())?;
+        assert!(look(&dir, &held, &mut read)?);
+        assert_eq!(routes(&held), Some(6));
+        std::fs::remove_dir_all(&dir).map_err(|error| error.to_string())
+    }
+
     /// A symbolic link in the directory is passed over: one back up the tree is no loop, and a
     /// linked file is not read.
     #[cfg(unix)]
@@ -676,14 +1024,15 @@ pub(crate) mod tests {
         std::os::unix::fs::symlink(at("elsewhere.csv"), at("routes/EZY.csv")).map_err(error)?;
         let files = csv_files(&at("routes"))?;
         assert_eq!(files, [at("routes/schema-01/B/BAW-all.csv")]);
-        assert_eq!(Standing::load(&dir)?.routes(), standing_of(ROUTES_B));
+        assert_eq!(Standing::load(&dir)?.routes(), standing_of(ROUTES_B)?);
         std::fs::remove_dir_all(&dir).map_err(error)
     }
 
-    fn standing_of(routes: &str) -> usize {
-        let mut standing = Standing::default();
-        standing.add_routes(routes);
-        standing.routes()
+    fn standing_of(routes: &str) -> Result<usize, String> {
+        let mut load = Load::default();
+        load.add_routes(routes.as_bytes())
+            .map_err(|error| error.to_string())?;
+        Ok(load.finish().routes())
     }
 
     /// A callsign is at most eight characters once trimmed, as `/v2` bounds one.

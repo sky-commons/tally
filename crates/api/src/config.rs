@@ -40,8 +40,8 @@ usage: tally-api --relay-stats URL --readsb URL [options]
                          §2.1); needs --key. Without it every relay serves the free tier
   --mlat-max-age-secs N  the oldest MLAT position served (default 60)
   --routes DIR           a checkout of VRS standing data (its routes/ and airports/ CSV files),
-                         which the operator keeps current; read at start and again when its files
-                         change or hourly (default none: the routes answer 404)
+                         which the operator keeps current; read at start and again whenever its
+                         files change (default none: the routes answer 404)
 ";
 
 #[derive(Debug)]
