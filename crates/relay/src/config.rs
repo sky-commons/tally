@@ -1,5 +1,7 @@
 //! The relay's command line. Everything a relay is told comes from its operator, here.
 
+use std::net::SocketAddr;
+
 use tally_wire::{Identity, PublicKey, Region, RelayAddress};
 
 use crate::egress::Cap;
@@ -59,7 +61,9 @@ usage: tally-relay --key FILE [--key FILE]... --max-upload RATE [options]
                          (bind it to loopback: it is unauthenticated)
   --stats-listen ADDR    serve each receiver's traffic as JSON here (GET /stations,
                          GET /stations/KEY), and the cap and what it carries (GET /egress),
-                         for tally-api (bind it to loopback: it is unauthenticated)
+                         for tally-api. It is unauthenticated and names where each feeder
+                         feeds from, so it takes a loopback address only (127.0.0.1:PORT or
+                         [::1]:PORT) and the relay refuses any other
   --upstream HOST:PORT=KEY
                          a relay to link with for the directory (offers and queries, never
                          data: that travels the sharing groups); repeatable
@@ -157,7 +161,9 @@ pub struct Config {
     pub key_files: Vec<String>,
     pub listen: String,
     pub beast_out: Option<String>,
-    pub stats_listen: Option<String>,
+    /// Where the station reports are served (`--stats-listen`): a loopback address, always, since
+    /// they name every feeder's address (`parse_stats_listen`).
+    pub stats_listen: Option<SocketAddr>,
     pub upstreams: Vec<Upstream>,
     pub advertise: Vec<RelayAddress>,
     pub accept_relays: Vec<PublicKey>,
@@ -324,7 +330,7 @@ impl Config {
                 "--max-upload" => max_upload = Some(Cap::parse(&value()?)?),
                 "--listen" => config.listen = value()?,
                 "--beast-out" => config.beast_out = Some(value()?),
-                "--stats-listen" => config.stats_listen = Some(value()?),
+                "--stats-listen" => config.stats_listen = Some(parse_stats_listen(&value()?)?),
                 "--upstream" => config.upstreams.push(parse_upstream(&value()?)?),
                 "--advertise" => {
                     let Upstream { address, key } = parse_upstream(&value()?)?;
@@ -503,6 +509,24 @@ pub fn covers_the_world(areas: &[Region]) -> bool {
         })
         .collect();
     named == tally_wire::Regions::world()
+}
+
+/// `--stats-listen`'s address, which must be loopback: the reports it serves are unauthenticated
+/// and name where each feeder feeds from (`StationReport::address`), so a bind anyone else could
+/// reach is refused rather than trusted to a firewall. A name is refused too, since what it
+/// resolves to is not known here.
+pub fn parse_stats_listen(text: &str) -> Result<SocketAddr, String> {
+    let address: SocketAddr = text.parse().map_err(|_| {
+        format!("--stats-listen {text}: not an address and port, such as 127.0.0.1:10901")
+    })?;
+    if !address.ip().to_canonical().is_loopback() {
+        return Err(format!(
+            "--stats-listen {text}: not a loopback address. The stats listener is \
+             unauthenticated and names every feeder's address, so it is served on loopback only \
+             (127.0.0.1:PORT or [::1]:PORT)"
+        ));
+    }
+    Ok(address)
 }
 
 pub fn parse_upstream(text: &str) -> Result<Upstream, String> {
@@ -845,7 +869,41 @@ mod tests {
             "--stats-listen",
             "127.0.0.1:10901",
         ])?;
-        assert_eq!(config.stats_listen.as_deref(), Some("127.0.0.1:10901"));
+        assert_eq!(config.stats_listen, Some(([127, 0, 0, 1], 10901).into()));
+        Ok(())
+    }
+
+    /// The stats listener names every feeder's address, so only loopback is ever bound.
+    #[test]
+    fn the_stats_listener_is_loopback_or_the_relay_refuses_to_start() -> Result<(), String> {
+        for loopback in ["127.0.0.1:10901", "127.8.9.10:1", "[::1]:10901"] {
+            assert!(
+                parse_stats_listen(loopback)?.ip().is_loopback(),
+                "{loopback}"
+            );
+        }
+        for open in [
+            "0.0.0.0:10901",
+            "[::]:10901",
+            "203.0.113.7:10901",
+            "[2001:db8::1]:10901",
+            "localhost:10901",
+            "127.0.0.1",
+        ] {
+            let refused = parse_stats_listen(open).err().unwrap_or_default();
+            assert!(refused.contains("--stats-listen"), "{open}: {refused}");
+        }
+        let refused = config(&[
+            "--key",
+            "k",
+            "--max-upload",
+            "10Mbit/s",
+            "--stats-listen",
+            "0.0.0.0:10901",
+        ])
+        .err()
+        .unwrap_or_default();
+        assert!(refused.contains("not a loopback address"), "{refused}");
         Ok(())
     }
 

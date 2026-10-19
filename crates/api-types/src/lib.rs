@@ -226,6 +226,29 @@ pub struct Station {
     pub software: Option<String>,
 }
 
+/// `GET /v1/me`: the stations connected now from the asking client's own host (its IPv4 address or
+/// IPv6 /64), as the relay saw it (an "am I feeding" check); empty when none is. Never any other station, and
+/// never cached, since it depends on who asks.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MeResponse {
+    /// When the relay reported them: Unix milliseconds on the API's clock.
+    pub now_ms: u64,
+    /// By key, as `key` sorts.
+    pub stations: Vec<MeStation>,
+}
+
+/// One station of the asking client's address.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MeStation {
+    /// The receiver's public key as tally prints it (standard base64).
+    pub key: String,
+    /// The relay forwarded a batch of it recently.
+    pub online: bool,
+    pub messages_per_sec: f64,
+    /// When the relay last forwarded a batch of it: Unix milliseconds on the API's clock.
+    pub last_seen_at_ms: u64,
+}
+
 /// `GET /v1/stations/{key}/stats`, the key as base64url without padding: what one feeder gave the
 /// network over the window, as the API computes it (RFC-0174 §2.12) from public signed data alone
 /// (the feeder's signed batches, the signed positions that cite its receptions, and its standing),
@@ -349,6 +372,66 @@ pub struct Position {
     pub lon: f64,
 }
 
+/// `POST /api/0/routeset`'s body, as tar1090 sends it (its `routeApiUrl`) and adsb.lol's API reads
+/// it: at most 100 callsigns, each with where the aircraft is, if the client knows.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RouteSetRequest {
+    pub planes: Vec<RoutePlane>,
+}
+
+/// One callsign a client asks the route of.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RoutePlane {
+    pub callsign: String,
+    /// Where the aircraft is, in degrees; `null` or absent when the client does not know (tar1090
+    /// leaves them out replaying a trace), and then the route is not judged (`plausible` `null`).
+    pub lat: Option<f64>,
+    pub lng: Option<f64>,
+}
+
+/// A callsign's scheduled route, as VRS standing data names it, in adsb.lol's shape: the answer to
+/// `GET /api/0/route/{callsign}/{lat}/{lon}` and each element of `POST /api/0/routeset`'s, which
+/// lists one per distinct callsign asked, in the order asked. A callsign the data does not hold is
+/// answered with every code `unknown` and no airport.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Route {
+    /// The callsign as the client asked it.
+    pub callsign: String,
+    /// The flight number, or `unknown`.
+    pub number: String,
+    /// The operator's ICAO code, or `unknown`.
+    pub airline_code: String,
+    /// The airports in order, ICAO codes joined by `-` (`EGLL-KJFK`), or `unknown`.
+    pub airport_codes: String,
+    /// `airport_codes` with each ICAO code that has an IATA one written as it (`LHR-JFK`).
+    #[serde(rename = "_airport_codes_iata")]
+    pub airport_codes_iata: String,
+    /// The airports of `airport_codes` the data holds, in order.
+    #[serde(rename = "_airports")]
+    pub airports: Vec<RouteAirport>,
+    /// Whether the aircraft is where the route would put it (near a leg's great circle, adsb.lol's
+    /// check); `null` when the route is unknown or the client gave no position. tar1090 marks a
+    /// route `??` when it is `false`.
+    pub plausible: Option<bool>,
+}
+
+/// One airport of a route, as VRS standing data describes it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RouteAirport {
+    pub name: String,
+    pub icao: String,
+    /// Empty when it has none.
+    pub iata: String,
+    /// The place it serves.
+    pub location: String,
+    pub countryiso2: String,
+    pub lat: f64,
+    pub lon: f64,
+    pub alt_feet: f64,
+    /// `alt_feet` in metres, to the centimetre.
+    pub alt_meters: f64,
+}
+
 /// One answer of each endpoint, exactly as `tally-api` writes it (`testdata/`). `tally-api`'s test
 /// holds its own serialised answers equal to these; a client's test reads them.
 pub mod fixtures {
@@ -370,6 +453,8 @@ pub mod fixtures {
     pub const STATION_BARE: &str = include_str!("../testdata/station_bare.json");
     /// The key the station fixtures name, as base64url without padding (the path's form).
     pub const STATION_KEY_URL: &str = "6kpsY-KcUgq-9VB7Ey7F-ZVHdq6-vnuSQh7qaRRG0iw";
+    /// `GET /v1/me`: the one station of the asking client's address.
+    pub const ME: &str = include_str!("../testdata/me.json");
     /// `GET /v1/stations/{key}/stats`: a located feeder with standing, ranked in its area.
     pub const FEEDER_STATS: &str = include_str!("../testdata/feeder_stats.json");
     /// `GET /v1/stations/{key}/stats`: a feeder that states no place and has no standing.
@@ -381,6 +466,11 @@ pub mod fixtures {
     /// `GET /v1/leaderboards/{area}`: the same area while no feeder in it has standing, so both
     /// boards are empty and every feeder there is `unranked`.
     pub const LEADERBOARD_UNRANKED: &str = include_str!("../testdata/leaderboard_unranked.json");
+    /// `POST /api/0/routeset`: two callsigns asked, one known and flown where its route goes, one
+    /// the data does not hold.
+    pub const ROUTESET: &str = include_str!("../testdata/routeset.json");
+    /// The request `ROUTESET` answers, as tar1090 sends it.
+    pub const ROUTESET_REQUEST: &str = include_str!("../testdata/routeset_request.json");
 }
 
 #[cfg(test)]
@@ -412,7 +502,19 @@ mod tests {
         whole::<FeederStats>(fixtures::FEEDER_STATS_UNRANKED)?;
         whole::<Leaderboards>(fixtures::LEADERBOARDS)?;
         whole::<Leaderboard>(fixtures::LEADERBOARD)?;
-        whole::<Leaderboard>(fixtures::LEADERBOARD_UNRANKED)
+        whole::<Leaderboard>(fixtures::LEADERBOARD_UNRANKED)?;
+        whole::<MeResponse>(fixtures::ME)?;
+        whole::<Vec<Route>>(fixtures::ROUTESET)?;
+        whole::<RouteSetRequest>(fixtures::ROUTESET_REQUEST)
+    }
+
+    /// tar1090 leaves a plane's position out when it has none to give: the request is still read.
+    #[test]
+    fn a_plane_without_a_position_is_asked() -> Result<(), String> {
+        let asked: RouteSetRequest = serde_json::from_str(r#"{"planes":[{"callsign":"BAW1"}]}"#)
+            .map_err(|e| e.to_string())?;
+        assert_eq!((asked.planes[0].lat, asked.planes[0].lng), (None, None));
+        Ok(())
     }
 
     #[test]

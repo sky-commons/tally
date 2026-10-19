@@ -302,7 +302,7 @@ async fn serve(config: Config) -> Result<(), String> {
             .map_err(|error| format!("beast-out {address}: {error}"))?;
         tokio::spawn(link::serve_beast(listener, Arc::clone(&hub)));
     }
-    if let Some(address) = &config.stats_listen {
+    if let Some(address) = config.stats_listen {
         let listener = TcpListener::bind(address)
             .await
             .map_err(|error| format!("stats-listen {address}: {error}"))?;

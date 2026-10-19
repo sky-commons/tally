@@ -1,7 +1,8 @@
 //! The endpoints, and the guard every request passes: a CORS preflight answered at once, else
 //! the client's token bucket, the cap on requests in flight and the request's deadline (a stream,
 //! which lasts as long as its connection, its own cap instead: `stream`), then CORS and
-//! `Cache-Control` on whatever answers.
+//! `Cache-Control` on whatever answers: no `Cache-Control` but `no-store` for what depends on who
+//! asks (`/v1/me`) or is not a read (`POST`).
 
 use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -10,18 +11,18 @@ use std::time::{Duration, Instant};
 
 use axum::Router;
 use axum::extract::rejection::QueryRejection;
-use axum::extract::{Path, Query, Request, State};
-use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
+use axum::extract::{DefaultBodyLimit, Extension, Path, Query, Request, State};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use serde::Deserialize;
 use tally_api_types::{Aircraft, AircraftResponse, Feed};
 use tally_wire::PublicKey;
 
 use crate::area::Area;
 use crate::feeders::{Board, parse_area};
-use crate::{App, mlat, readsb, stream};
+use crate::{App, mlat, readsb, stream, v2, vrs};
 
 /// How long the edge may keep an aircraft answer: aircraft move.
 pub const AIRCRAFT_MAX_AGE_SECS: u32 = 2;
@@ -33,13 +34,13 @@ pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// The request headers a browser may send cross-origin, beyond the ones CORS always allows: what a
 /// client asks with. The Flightlines client core stamps W3C trace context (`traceparent`) on every
 /// request and asks for JSON (`accept`), so a preflight that did not allow both would refuse its
-/// every read.
-pub const ALLOW_HEADERS: &str = "accept, traceparent";
+/// every read; tar1090 posts its routeset as JSON (`content-type`).
+pub const ALLOW_HEADERS: &str = "accept, content-type, traceparent";
 /// The response headers a page may read cross-origin, beyond the safelisted ones: `Retry-After`,
 /// which a client honours after a `429`.
 pub const EXPOSE_HEADERS: &str = "retry-after";
-/// The one method the API answers.
-pub const ALLOW_METHODS: &str = "GET";
+/// The methods the API answers: reads, and tar1090's routeset.
+pub const ALLOW_METHODS: &str = "GET, POST";
 /// How long a browser may keep a preflight's answer, in seconds (browsers cap it lower).
 pub const PREFLIGHT_MAX_AGE_SECS: u32 = 86_400;
 
@@ -47,13 +48,24 @@ pub const PREFLIGHT_MAX_AGE_SECS: u32 = 86_400;
 /// world product: a client draws it as the feed being unavailable, not as an empty sky.
 pub const PRECISE_UNAVAILABLE: &str = "precise_unavailable";
 
+/// The path of the asking client's own stations.
+pub const ME: &str = "/v1/me";
+
 /// The connection's peer, set on every request by `serve`.
 #[derive(Clone, Copy, Debug)]
 pub struct Peer(pub SocketAddr);
 
-/// The client a request counts against (`client_of`), set on every request by the guard.
+/// Who a request is from (`client_of`), set on every request by the guard.
 #[derive(Clone, Copy, Debug)]
-pub struct Client(pub IpAddr);
+pub struct Client {
+    /// Who the request counts against: the proxy's header when one is configured and parses,
+    /// else the connection's peer, else one shared client.
+    pub counts_as: IpAddr,
+    /// The client's own address, only when it is known: the proxy's header when one is
+    /// configured (never the proxy's own address when the header is missing or does not parse),
+    /// else the connection's peer. Only this ever names a client's stations (`GET /v1/me`).
+    pub address: Option<IpAddr>,
+}
 
 pub fn router(app: Arc<App>) -> Router {
     Router::new()
@@ -64,6 +76,13 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/v1/stations/{key}/stats", get(feeder))
         .route("/v1/leaderboards", get(leaderboards))
         .route("/v1/leaderboards/{area}", get(leaderboard))
+        .route(ME, get(me))
+        .route(
+            "/api/0/routeset",
+            post(vrs::routeset).layer(DefaultBodyLimit::max(vrs::MAX_BODY_BYTES)),
+        )
+        .route("/api/0/route/{callsign}/{lat}/{lon}", get(vrs::route))
+        .merge(v2::router())
         .layer(middleware::from_fn_with_state(Arc::clone(&app), guard))
         .with_state(app)
 }
@@ -200,6 +219,18 @@ async fn station(State(app): State<Arc<App>>, Path(key): Path<String>) -> Respon
     }
 }
 
+/// The connected stations whose session came from the asking client's address
+/// (`Stations::mine`); none when its address is not known.
+async fn me(State(app): State<Arc<App>>, Extension(client): Extension<Client>) -> Response {
+    match app.snapshot.stations(Instant::now()) {
+        Some(stations) => axum::Json(stations.mine(client.address)).into_response(),
+        None => refuse(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "stations are not known yet",
+        ),
+    }
+}
+
 /// The feeder figures, or why there are none (answered `503`).
 fn board(app: &App) -> Result<Arc<Board>, &'static str> {
     if app.settings.mlat.relays.is_empty() {
@@ -265,19 +296,21 @@ pub fn refuse(status: StatusCode, why: &str) -> Response {
 async fn guard(State(app): State<Arc<App>>, mut request: Request, next: Next) -> Response {
     let path = request.uri().path();
     let streamed = path == stream::PATH;
-    let max_age = if path == "/v1/aircraft" {
+    // Kept by no one: a stream (pushed), an answer that depends on who asks, and a write.
+    let kept = !streamed && path != ME && request.method() != Method::POST;
+    let max_age = if path == "/v1/aircraft" || path.starts_with("/v2/") {
         AIRCRAFT_MAX_AGE_SECS
     } else {
         OTHER_MAX_AGE_SECS
     };
     let origin = allowed_origin(&app.settings.allow_origins, request.headers());
     let client = client_of(&app, &request);
-    request.extensions_mut().insert(Client(client));
+    request.extensions_mut().insert(client);
     // A preflight is answered here and costs the client nothing: it reads nothing upstream, and a
     // refused one would reach the page as a failed connection rather than as the refusal it was.
     let mut response = if request.method() == Method::OPTIONS {
         preflight()
-    } else if !app.limiter.admit(client, Instant::now()) {
+    } else if !app.limiter.admit(client.counts_as, Instant::now()) {
         let mut response = refuse(StatusCode::TOO_MANY_REQUESTS, "too many requests");
         response
             .headers_mut()
@@ -307,11 +340,11 @@ async fn guard(State(app): State<Arc<App>>, mut request: Request, next: Next) ->
     if app.settings.allow_origins.len() > 1 {
         headers.insert(header::VARY, HeaderValue::from_static("Origin"));
     }
-    let cache = if streamed {
-        // Pushed, never kept: and a refusal of a stream is no answer to keep either.
-        HeaderValue::from_static("no-store")
-    } else {
+    let cache = if kept {
         cache_control(status, max_age)
+    } else {
+        // A refusal of any of them is no answer to keep either.
+        HeaderValue::from_static("no-store")
     };
     headers.insert(header::CACHE_CONTROL, cache);
     response
@@ -359,22 +392,26 @@ pub fn allowed_origin(allowed: &[String], headers: &HeaderMap) -> Option<HeaderV
     HeaderValue::from_str(chosen).ok()
 }
 
-/// Who a request counts against: the proxy's header when one is configured and parses, else the
-/// connection's peer. A request with neither (never from `serve`) counts as one shared client.
-fn client_of(app: &App, request: &Request) -> IpAddr {
-    let from_header = app.settings.client_ip_header.as_ref().and_then(|name| {
-        request
-            .headers()
-            .get(name)?
-            .to_str()
-            .ok()?
-            .trim()
-            .parse()
-            .ok()
-    });
-    from_header
-        .or_else(|| request.extensions().get::<Peer>().map(|peer| peer.0.ip()))
-        .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED))
+/// Who a request is from (`Client`). Behind a proxy (`--client-ip-header`) the peer is the proxy,
+/// so a request whose header is missing or does not parse still counts against the proxy, but has
+/// no address of its own. A request with no peer (never from `serve`) counts as one shared client.
+fn client_of(app: &App, request: &Request) -> Client {
+    let peer = request.extensions().get::<Peer>().map(|peer| peer.0.ip());
+    let address = match &app.settings.client_ip_header {
+        Some(name) => from_header(request.headers(), name),
+        None => peer,
+    };
+    Client {
+        counts_as: address
+            .or(peer)
+            .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
+        address,
+    }
+}
+
+/// The address the proxy's header `name` names, if it is there and parses.
+fn from_header(headers: &HeaderMap, name: &HeaderName) -> Option<IpAddr> {
+    headers.get(name)?.to_str().ok()?.trim().parse().ok()
 }
 
 /// The precise feed's answer, sent at `sent_at_ms`, from the precise positions of the product's

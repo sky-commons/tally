@@ -57,11 +57,25 @@ neither is modified.
   `/v2/point/{lat}/{lon}/{radius}` (`/v2/lat/{lat}/lon/{lon}/dist/{radius}`, radius at most 250 nm)
   and `/v2/closest/{lat}/{lon}/{radius}`. Each is one query of readsb's API port.
 - **Routes:** `POST /api/0/routeset` (the shape tar1090's `routeApiUrl` asks) and
-  `GET /api/0/route/{callsign}/{lat}/{lon}`, from VRS standing-data (CC0, refreshed daily), with
-  adsb.lol's plausibility check against where the aircraft is.
-- **`GET /v1/me`:** the stations whose newest session came from the asking client's address (the
-  relay's `/stations` names each session's address, on its loopback stats port only). Nothing but
-  the asker's own stations is ever answered.
+  `GET /api/0/route/{callsign}/{lat}/{lon}`, from VRS standing-data (CC0, refreshed daily), each
+  judged against where the aircraft is. The judgment keeps adsb.lol's threshold (50 nm or a fifth
+  of the leg, whichever is more) and its rounding (three decimals), but measures the real distance
+  from the aircraft to the great-circle leg (an end, or the cross-track foot between them). Its
+  check cannot be ported as written: `calc_plausible` tests the tuple `_plausible_sync` returns,
+  which is always true, so every route reads plausible, and the distance it compares is not a
+  distance from the leg, so an aircraft arriving at the second airport fails it. The legs are the
+  route's own, code after code; a leg with an airport the data does not hold is skipped, never
+  bridged, and a route with no known leg is judged `null`. A callsign is at most eight characters
+  and a routeset body at most 16 KiB.
+- **`GET /v1/me`:** the asking client's own stations, and nothing else, ever. A station is the
+  asker's while a session of it is connected to the relay from the asker's host: an IPv4 address
+  exactly, or an IPv6 /64 (a dual-stack home feeds and browses from different addresses of one
+  /64), an IPv4 address written as IPv6 the same as itself. Only a connected session has an
+  address: once it ends the relay drops it, since a dynamic address may be reassigned to a
+  stranger. A client whose address is not known (behind the proxy, a missing or unparseable
+  client header, never the proxy's own address), or is loopback or unspecified, is answered none.
+  The relay's `/stations` names each connected session's address, and its stats port is loopback
+  only by refusal: `--stats-listen` on any other address stops the relay at start.
 
 ## §3 Everything else
 
