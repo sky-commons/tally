@@ -494,9 +494,14 @@ pub struct OwnDescription {
 #[derive(Clone, Debug)]
 pub enum Origin {
     /// The receiver's own feeder, with its description as its link holds it (seeded into the
-    /// receiver's sharing group by this relay, its origin) and the network group its connection
-    /// came from (what the ingest rate gives a share to, `shed`).
-    Feeder(Option<Arc<OwnDescription>>, Option<crate::ingest::Group>),
+    /// receiver's sharing group by this relay, its origin), the network group its connection
+    /// came from (what the ingest rate gives a share to, `shed`) and the address it came from (its
+    /// station report's, `stations`).
+    Feeder(
+        Option<Arc<OwnDescription>>,
+        Option<crate::ingest::Group>,
+        Option<IpAddr>,
+    ),
     /// A sharing member or a relay link: a piece of a group.
     Peer(Asker),
     /// Anywhere else (a subscriber, a test): forwarded, nothing more.
@@ -1766,7 +1771,7 @@ impl Hub {
         // point ever refuses it. By its own stamp, counted per source and reason. A member's or a
         // relay's batch is never cut: it was kept by the relay that took it from its feeder.
         let unit = match &origin {
-            Origin::Feeder(_, group) => Some(self.shed_unit(&receiver, *group)),
+            Origin::Feeder(_, group, _) => Some(self.shed_unit(&receiver, *group)),
             _ => None,
         };
         // Judged by its cost of the rate (`ingest::rate_cost`: what it is charged, the unit
@@ -1854,8 +1859,8 @@ impl Hub {
                 observations,
                 stamp.stamp_ms,
             );
-            if matches!(origin, Origin::Feeder(..)) {
-                shard.stations.fed_by(&receiver, source);
+            if let Origin::Feeder(_, _, address) = &origin {
+                shard.stations.fed_by(&receiver, source, *address);
             }
         }
         // The receiver is publishing, so its description is the last to be forgotten: one lock,
@@ -1864,7 +1869,7 @@ impl Hub {
         // A feeder's description pushed out while it was not yet publishing comes back now that
         // it is, as one that is, before the batch: a subscriber is told who a receiver is first.
         if described.is_none()
-            && let Origin::Feeder(Some(own), _) = &origin
+            && let Origin::Feeder(Some(own), ..) = &origin
         {
             // On the worker that owns the receiver, stamped with its batch: offered to the hosted
             // MLAT here, before the batch, as a description of a receiver is offered.
@@ -1925,10 +1930,11 @@ impl Hub {
         }
     }
 
-    /// Connection `source`, a feeder publishing as `receiver`, had a new batch forwarded.
-    pub fn fed_by(&self, receiver: &PublicKey, source: u64) {
+    /// Connection `source`, a feeder publishing as `receiver` from `address`, had a new batch
+    /// forwarded.
+    pub fn fed_by(&self, receiver: &PublicKey, source: u64, address: Option<IpAddr>) {
         if let Ok(mut shard) = self.raw[usize::from(raw_shard(receiver).0)].lock() {
-            shard.stations.fed_by(receiver, source);
+            shard.stations.fed_by(receiver, source, address);
         }
     }
 
@@ -2913,7 +2919,7 @@ mod tests {
                 let kept = hub.ingest(Inbound {
                     source: 1 + n as u64,
                     batch,
-                    origin: Origin::Feeder(None, group),
+                    origin: Origin::Feeder(None, group, None),
                     verify: false,
                     stamp: Some(Stamp {
                         stamp_ms: stamp_ms + n as u64,
@@ -2931,7 +2937,7 @@ mod tests {
                 let kept = hub.ingest(Inbound {
                     source: 100 + n as u64,
                     batch,
-                    origin: Origin::Feeder(None, Some(crate::ingest::Group::V4(900))),
+                    origin: Origin::Feeder(None, Some(crate::ingest::Group::V4(900)), None),
                     verify: false,
                     stamp: Some(Stamp {
                         stamp_ms: stamp_ms + 10 + n as u64,
@@ -3066,7 +3072,7 @@ mod tests {
                 &hub,
                 1,
                 batch,
-                Origin::Feeder(None, Some(crate::ingest::Group::V4(7))),
+                Origin::Feeder(None, Some(crate::ingest::Group::V4(7)), None),
                 BASE_MS + tick * 1_000 / PER_SECOND,
             );
             if kept {
@@ -3166,7 +3172,7 @@ mod tests {
         for sequence in 0..count as u64 {
             let batch = wanted_batch(&receiver, sequence, per)?;
             let again = batch.clone();
-            if !feed(&hub, 1, batch, Origin::Feeder(None, group), BASE_MS) {
+            if !feed(&hub, 1, batch, Origin::Feeder(None, group, None), BASE_MS) {
                 cut = Some(again);
             }
         }
@@ -3201,7 +3207,7 @@ mod tests {
             &hub,
             1,
             first.clone(),
-            Origin::Feeder(None, group),
+            Origin::Feeder(None, group, None),
             BASE_MS
         ));
         for _ in 0..30 {
@@ -3209,7 +3215,7 @@ mod tests {
                 &hub,
                 1,
                 first.clone(),
-                Origin::Feeder(None, group),
+                Origin::Feeder(None, group, None),
                 BASE_MS
             ));
         }
@@ -3219,7 +3225,7 @@ mod tests {
                 &hub,
                 2,
                 fresh,
-                Origin::Feeder(None, Some(crate::ingest::Group::V4(2))),
+                Origin::Feeder(None, Some(crate::ingest::Group::V4(2)), None),
                 BASE_MS
             ),
             "thirty copies took nothing from the bucket"
@@ -3252,7 +3258,7 @@ mod tests {
             let stamp_ms = BASE_MS + tick * 100;
             let batch = wanted_batch(&proven, tick, 10)?;
             assert!(
-                feed(&hub, 1, batch, Origin::Feeder(None, group), stamp_ms),
+                feed(&hub, 1, batch, Origin::Feeder(None, group, None), stamp_ms),
                 "the corroborated receiver's batch was cut at tick {tick}"
             );
             for (n, identity) in hostile.iter().enumerate() {
@@ -3261,7 +3267,7 @@ mod tests {
                     &hub,
                     100 + n as u64,
                     batch,
-                    Origin::Feeder(None, group),
+                    Origin::Feeder(None, group, None),
                     stamp_ms + 1 + n as u64,
                 ) {
                     cut_hostile += 1;

@@ -1,0 +1,11 @@
+{
+  "now_ms": 1791220000250,
+  "stations": [
+    {
+      "key": "6kpsY+KcUgq+9VB7Ey7F+ZVHdq6+vnuSQh7qaRRG0iw=",
+      "online": true,
+      "messages_per_sec": 42.25,
+      "last_seen_at_ms": 1791219999250
+    }
+  ]
+}

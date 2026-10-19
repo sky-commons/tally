@@ -1830,9 +1830,11 @@ fn ingest(
             // station counters, a forgotten description given again, the sharing duties) follows
             // there too, in the receiver's order.
             let origin = match peer {
-                Peer::Feeder(_) => {
-                    Origin::Feeder(described.clone(), crate::ingest::group_of(asker.address))
-                }
+                Peer::Feeder(_) => Origin::Feeder(
+                    described.clone(),
+                    crate::ingest::group_of(asker.address),
+                    asker.address,
+                ),
                 Peer::Member | Peer::Relay => Origin::Peer(*asker),
                 Peer::Subscriber | Peer::Engine(_) | Peer::Probe => Origin::Elsewhere,
             };

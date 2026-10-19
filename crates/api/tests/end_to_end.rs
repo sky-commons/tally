@@ -2,13 +2,14 @@
 //! (`tally_relay::serve`) directly, the relay reports it on its stats listener
 //! (`tally_relay::stats`), a stand-in readsb answers its own API queries, and the API serves all
 //! three endpoints from them over loopback HTTP, with CORS, caching and the rate limit on each, and
-//! pushes a viewport's aircraft as a stream.
+//! pushes a viewport's aircraft as a stream; it answers a client its own stations, the ADS-B
+//! Exchange-compatible `/v2` from readsb, and routes from a standing-data directory.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::extract::{RawQuery, State};
-use http_body_util::{BodyExt, Empty};
+use http_body_util::{BodyExt, Empty, Full};
 use hyper::body::Bytes;
 use hyper::header::{
     ACCESS_CONTROL_ALLOW_HEADERS, ACCESS_CONTROL_ALLOW_METHODS, ACCESS_CONTROL_ALLOW_ORIGIN,
@@ -20,8 +21,8 @@ use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 use tally_api::Settings;
 use tally_api_types::{
-    Aircraft, AircraftResponse, AircraftUpdate, Feed, MlatCheck, Network, Position, PositionSource,
-    SourceCounts, Station,
+    Aircraft, AircraftResponse, AircraftUpdate, Feed, MeResponse, MlatCheck, Network, Position,
+    PositionSource, SourceCounts, Station, fixtures,
 };
 use tally_merge::Merge;
 use tally_mlat_solver::sim::{self, Scenario, Simulation};
@@ -92,6 +93,10 @@ const READSB_HEARD: &str = r#"{
     ]
 }"#;
 
+/// What the stand-in readsb answers a query in ADS-B Exchange's v2 form (`&jv2`): readsb's own v2
+/// shape, which `/v2` serves as it is.
+const READSB_V2: &str = r#"{"ac":[{"hex":"a1b2c3","type":"adsb_icao","flight":"UAL123  ","r":"N12345","t":"B738","alt_baro":35000,"gs":451.5,"track":271.0,"squawk":"1200","lat":37.5,"lon":-122.25,"nic":8,"rc":186,"seen_pos":1.0,"messages":4521,"seen":0.5,"rssi":-20.1,"mlat":[],"tisb":[]}],"msg":"No error","now":1791220000250,"total":1,"ctime":1791220000250,"ptime":0}"#;
+
 type Asked = Arc<Mutex<Vec<String>>>;
 /// What the stand-in readsb answers, which a test may change.
 type Answer = Arc<Mutex<&'static str>>;
@@ -100,8 +105,13 @@ async fn readsb(
     State((asked, answer)): State<(Asked, Answer)>,
     RawQuery(query): RawQuery,
 ) -> &'static str {
+    let query = query.unwrap_or_default();
+    let v2 = query.ends_with("&jv2");
     if let Ok(mut asked) = asked.lock() {
-        asked.push(query.unwrap_or_default());
+        asked.push(query);
+    }
+    if v2 {
+        return READSB_V2;
     }
     answer.lock().map_or(READSB, |answer| *answer)
 }
@@ -218,18 +228,63 @@ async fn get(url: &str) -> Result<(StatusCode, HeaderMap, Bytes)> {
     send(url, request).await
 }
 
+/// `GET url` from the public site's origin, as a proxy names the client `client` (`TEST_CLIENT`).
+async fn get_as(url: &str, client: &str) -> Result<(StatusCode, HeaderMap, Bytes)> {
+    let request = Request::get(url)
+        .header(ORIGIN, SITE)
+        .header(TEST_CLIENT, client)
+        .body(Empty::new())
+        .map_err(text)?;
+    send(url, request).await
+}
+
+/// The header the test's proxy names a client by (`--client-ip-header`).
+const TEST_CLIENT: &str = "x-test-client";
+
 /// The preflight a browser sends before a `GET` that carries `traceparent` and `accept`, as a
 /// browser client sends every read.
 async fn preflight(url: &str) -> Result<(StatusCode, HeaderMap, Bytes)> {
+    preflight_for(url, "GET", "accept,traceparent").await
+}
+
+/// The preflight a browser sends before `method` with `headers`.
+async fn preflight_for(
+    url: &str,
+    method: &str,
+    headers: &str,
+) -> Result<(StatusCode, HeaderMap, Bytes)> {
     let request = Request::builder()
         .method(Method::OPTIONS)
         .uri(url)
         .header(ORIGIN, SITE)
-        .header(ACCESS_CONTROL_REQUEST_METHOD, "GET")
-        .header(ACCESS_CONTROL_REQUEST_HEADERS, "accept,traceparent")
+        .header(ACCESS_CONTROL_REQUEST_METHOD, method)
+        .header(ACCESS_CONTROL_REQUEST_HEADERS, headers)
         .body(Empty::new())
         .map_err(text)?;
     send(url, request).await
+}
+
+/// `POST url` with a JSON `body` from the public site's origin, as tar1090 posts its routeset.
+async fn post(url: &str, body: &str) -> Result<(StatusCode, HeaderMap, Bytes)> {
+    let request = Request::post(url)
+        .header(ORIGIN, SITE)
+        .header(CONTENT_TYPE, "application/json; charset=utf-8")
+        .body(Full::new(Bytes::from(body.to_owned())))
+        .map_err(text)?;
+    let client = Client::builder(TokioExecutor::new()).build_http::<Full<Bytes>>();
+    let response = tokio::time::timeout(WAIT, client.request(request))
+        .await
+        .map_err(|_| format!("{url}: no answer"))?
+        .map_err(text)?;
+    let status = response.status();
+    let headers = response.headers().clone();
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .map_err(text)?
+        .to_bytes();
+    Ok((status, headers, body))
 }
 
 async fn send(url: &str, request: Request<Empty<Bytes>>) -> Result<(StatusCode, HeaderMap, Bytes)> {
@@ -343,6 +398,7 @@ async fn the_api_serves_aircraft_the_network_and_a_station_from_readsb_and_a_rea
 
     let mut settings = settings(stats_url, readsb_url);
     settings.refresh = Duration::from_millis(100);
+    settings.client_ip_header = Some(hyper::header::HeaderName::from_static(TEST_CLIENT));
     let api = start_api(settings).await?;
 
     // A station, by its key in the URL's form.
@@ -380,6 +436,32 @@ async fn the_api_serves_aircraft_the_network_and_a_station_from_readsb_and_a_rea
     assert_eq!(header(&headers, &ACCESS_CONTROL_ALLOW_ORIGIN), SITE);
     let (status, _, _) = get(&format!("{api}/v1/stations/not-a-key")).await?;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // The asker's own stations (matched per host in `snapshot`'s tests): this receiver fed the
+    // relay from loopback, which is no feeder's host, so no asker is answered it, not even one
+    // the proxy names as loopback. Behind a proxy, a request whose header is missing or does not
+    // parse has no address of its own and is answered none, never the proxy's. Never cached: the
+    // answer is the asker's.
+    for (asker, named) in [
+        (None, "no header"),
+        (Some("not-an-address"), "a header that does not parse"),
+        (Some("198.51.100.9"), "a stranger"),
+        (Some("127.0.0.1"), "loopback"),
+    ] {
+        let url = format!("{api}/v1/me");
+        let (status, headers, body) = match asker {
+            Some(asker) => get_as(&url, asker).await?,
+            None => get(&url).await?,
+        };
+        assert_eq!(status, StatusCode::OK, "{named}");
+        assert!(json::<MeResponse>(&body)?.stations.is_empty(), "{named}");
+        assert_eq!(header(&headers, &CACHE_CONTROL), "no-store", "{named}");
+        assert_eq!(
+            header(&headers, &ACCESS_CONTROL_ALLOW_ORIGIN),
+            SITE,
+            "{named}"
+        );
+    }
 
     // The network: the one receiver, and readsb's count.
     let (headers, network) = until::<Network>(&format!("{api}/v1/network"), |network| {
@@ -499,7 +581,7 @@ async fn a_preflight_allows_what_the_client_core_sends_and_costs_no_token() -> R
         assert_eq!(status, StatusCode::NO_CONTENT, "{path}");
         assert!(body.is_empty());
         assert_eq!(header(&headers, &ACCESS_CONTROL_ALLOW_ORIGIN), SITE);
-        assert_eq!(header(&headers, &ACCESS_CONTROL_ALLOW_METHODS), "GET");
+        assert_eq!(header(&headers, &ACCESS_CONTROL_ALLOW_METHODS), "GET, POST");
         let allowed: Vec<&str> = header(&headers, &ACCESS_CONTROL_ALLOW_HEADERS)
             .split(',')
             .map(str::trim)
@@ -524,6 +606,176 @@ async fn a_preflight_allows_what_the_client_core_sends_and_costs_no_token() -> R
     );
     assert_eq!(header(&headers, &ACCESS_CONTROL_ALLOW_ORIGIN), SITE);
     Ok(())
+}
+
+/// `/v2`: each path one query of readsb in v2 form, as adsb.lol asks it, answered as readsb
+/// writes it, cached as an aircraft answer is; a malformed value refused before readsb is asked.
+#[tokio::test(flavor = "multi_thread")]
+async fn v2_asks_readsb_as_adsb_lol_does_and_serves_its_answer() -> Result {
+    let (readsb_url, asked) = start_readsb().await?;
+    let api = start_api(settings("http://127.0.0.1:9", readsb_url)).await?;
+    let readsb_v2: serde_json::Value = serde_json::from_str(READSB_V2).map_err(text)?;
+    for (path, query) in [
+        ("hex/A1B2C3", "find_hex=a1b2c3&jv2"),
+        ("icao/a1b2c3,c0ffee", "find_hex=a1b2c3,c0ffee&jv2"),
+        ("callsign/UAL123", "find_callsign=UAL123&jv2"),
+        ("registration/N12345", "find_reg=N12345&jv2"),
+        ("reg/G-KELS", "find_reg=G-KELS&jv2"),
+        ("type/B738", "find_type=B738&jv2"),
+        ("squawk/1200", "all&filter_squawk=1200&jv2"),
+        ("sqk/7700", "all&filter_squawk=7700&jv2"),
+        ("mil", "all&filter_mil&jv2"),
+        ("ladd", "all&filter_ladd&jv2"),
+        ("pia", "all&filter_pia&jv2"),
+        ("point/37.5/-122.25/25", "circle=37.5,-122.25,25&jv2"),
+        (
+            "lat/37.5/lon/-122.25/dist/250",
+            "circle=37.5,-122.25,250&jv2",
+        ),
+        ("closest/37.5/-122.25/10", "closest=37.5,-122.25,10&jv2"),
+    ] {
+        let (status, headers, body) = get(&format!("{api}/v2/{path}")).await?;
+        assert_eq!(status, StatusCode::OK, "{path}");
+        assert_eq!(json::<serde_json::Value>(&body)?, readsb_v2, "{path}");
+        assert_eq!(header(&headers, &CONTENT_TYPE), "application/json");
+        assert_eq!(header(&headers, &CACHE_CONTROL), "public, max-age=2");
+        assert_eq!(header(&headers, &ACCESS_CONTROL_ALLOW_ORIGIN), SITE);
+        // The refresh reads readsb beside it: the v2 query asked last is this path's.
+        let queries = asked.lock().map_err(text)?.clone();
+        let last = queries.iter().rev().find(|asked| asked.ends_with("&jv2"));
+        assert_eq!(last.map(String::as_str), Some(query), "{path}");
+    }
+    let v2_asked = |asked: &Asked| -> Result<usize> {
+        Ok(asked
+            .lock()
+            .map_err(text)?
+            .iter()
+            .filter(|query| query.ends_with("&jv2"))
+            .count())
+    };
+    let before = v2_asked(&asked)?;
+    for path in [
+        "hex/a1b2c",
+        "hex/a1b2c3;all",
+        "callsign/UAL%20123",
+        "squawk/7800",
+        "point/91/0/10",
+        "point/37.5/-122.25/251",
+        "closest/37.5/-200/10",
+        "lat/37.5/lon/-122.25/dist/-1",
+    ] {
+        let (status, headers, _) = get(&format!("{api}/v2/{path}")).await?;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{path}");
+        assert_eq!(header(&headers, &ACCESS_CONTROL_ALLOW_ORIGIN), SITE);
+    }
+    assert_eq!(v2_asked(&asked)?, before);
+    Ok(())
+}
+
+/// Routes: none without `--routes`, saying why; with it, tar1090's routeset and the one-callsign
+/// route answered from the directory's standing data, a preflight allowing the post, and a post
+/// never cached.
+#[tokio::test(flavor = "multi_thread")]
+async fn routes_are_answered_from_standing_data_as_tar1090_asks() -> Result {
+    let (readsb_url, _) = start_readsb().await?;
+    let api = start_api(settings("http://127.0.0.1:9", readsb_url.clone())).await?;
+    let (status, _, body) =
+        post(&format!("{api}/api/0/routeset"), fixtures::ROUTESET_REQUEST).await?;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(
+        String::from_utf8_lossy(&body).contains("--routes"),
+        "{body:?}"
+    );
+
+    let dir = std::env::temp_dir().join(format!(
+        "tally-api-routes-{}-{}",
+        std::process::id(),
+        wall_ms()
+    ));
+    for (path, rows) in [
+        (
+            "routes/schema-01/B/BAW-all.csv",
+            "\u{feff}Callsign,Code,Number,AirlineCode,AirportCodes\nBAW1,BAW,1,BAW,EGLL-KJFK\n",
+        ),
+        (
+            "airports/schema-01/E/EG.csv",
+            "Code,Name,ICAO,IATA,Location,CountryISO2,Latitude,Longitude,AltitudeFeet\n\
+             EGLL,London Heathrow Airport,EGLL,LHR,London,GB,51.4706,-0.461941,83\n",
+        ),
+        (
+            "airports/schema-01/K/KJ.csv",
+            "Code,Name,ICAO,IATA,Location,CountryISO2,Latitude,Longitude,AltitudeFeet\n\
+             KJFK,John F Kennedy International Airport,KJFK,JFK,New York,US,40.639801,-73.7789,13\n",
+        ),
+    ] {
+        let file = dir.join(path);
+        std::fs::create_dir_all(file.parent().ok_or("no parent")?).map_err(text)?;
+        std::fs::write(file, rows).map_err(text)?;
+    }
+    let mut routed = settings("http://127.0.0.1:9", readsb_url);
+    routed.routes = Some(dir.clone());
+    let api = start_api(routed).await?;
+    let url = format!("{api}/api/0/routeset");
+    let (status, headers, body) = tokio::time::timeout(WAIT, async {
+        loop {
+            match post(&url, fixtures::ROUTESET_REQUEST).await {
+                Ok((StatusCode::SERVICE_UNAVAILABLE, ..)) => {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                answered => return answered,
+            }
+        }
+    })
+    .await
+    .map_err(|_| "the routes were never read".to_owned())??;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(
+        json::<serde_json::Value>(&body)?,
+        serde_json::from_str::<serde_json::Value>(fixtures::ROUTESET).map_err(text)?
+    );
+    assert_eq!(header(&headers, &CACHE_CONTROL), "no-store");
+    assert_eq!(header(&headers, &ACCESS_CONTROL_ALLOW_ORIGIN), SITE);
+
+    let (status, headers, _) = preflight_for(&url, "POST", "content-type").await?;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(header(&headers, &ACCESS_CONTROL_ALLOW_METHODS), "GET, POST");
+    assert!(header(&headers, &ACCESS_CONTROL_ALLOW_HEADERS).contains("content-type"));
+
+    for refused in ["{\"planes\":[]}", "not json", "{}"] {
+        assert_eq!(
+            post(&url, refused).await?.0,
+            StatusCode::BAD_REQUEST,
+            "{refused}"
+        );
+    }
+    let many = format!(
+        "{{\"planes\":[{}]}}",
+        vec![r#"{"callsign":"BAW1","lat":51.6,"lng":-1.0}"#; 101].join(",")
+    );
+    assert_eq!(post(&url, &many).await?.0, StatusCode::BAD_REQUEST);
+    // A callsign longer than eight characters, and a body past 16 KiB, are refused unread.
+    let long = r#"{"planes":[{"callsign":"ABCDEFGHI","lat":51.6,"lng":-1.0}]}"#;
+    assert_eq!(post(&url, long).await?.0, StatusCode::BAD_REQUEST);
+    let huge = format!(
+        "{{\"planes\":[{{\"callsign\":\"BAW1\",\"lat\":51.6,\"lng\":-1.0,\"pad\":\"{}\"}}]}}",
+        "x".repeat(16 * 1024)
+    );
+    assert_eq!(post(&url, &huge).await?.0, StatusCode::PAYLOAD_TOO_LARGE);
+
+    // One callsign, over Sydney: the route is London to New York, so not where it would be.
+    let (status, headers, body) = get(&format!("{api}/api/0/route/BAW1/-33.9/151.2")).await?;
+    assert_eq!(status, StatusCode::OK);
+    let route: tally_api_types::Route = json(&body)?;
+    assert_eq!(
+        (route.airport_codes_iata.as_str(), route.plausible),
+        ("LHR-JFK", Some(false))
+    );
+    assert_eq!(header(&headers, &CACHE_CONTROL), "public, max-age=15");
+    let (status, _, _) = get(&format!("{api}/api/0/route/BAW1/north/151.2")).await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, _, _) = get(&format!("{api}/api/0/route/ABCDEFGHI/-33.9/151.2")).await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    std::fs::remove_dir_all(&dir).map_err(text)
 }
 
 /// An open stream: its body, read a block (an event or a comment) at a time.
