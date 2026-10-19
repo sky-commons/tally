@@ -6,7 +6,9 @@
 # pushes the feeder's container image (packaging/container/Dockerfile), for amd64 and arm64, built
 # from those same binaries, to ghcr.io/sky-commons/tally-feed:<tag>, signs its digest the same way,
 # attests its provenance in the registry, and names the digest in the release (tally-feed-image.txt
-# and the notes), so a host that pins the image by digest pins what this release built.
+# and the notes), so a host that pins the image by digest pins what this release built. The map
+# bundle (packaging/map/Dockerfile, RFC-0187 §1) is built, pushed to
+# ghcr.io/sky-commons/tally-map:<tag>, signed, attested and named (tally-map-image.txt) the same way.
 #
 # Check a download:
 #   sha256sum -c tally-feed-aarch64-linux.sha256
@@ -20,6 +22,7 @@
 #     --certificate-identity-regexp '^https://github.com/sky-commons/tally/.github/workflows/release.yml@refs/tags/v' \
 #     --certificate-oidc-issuer https://token.actions.githubusercontent.com
 #   gh attestation verify oci://ghcr.io/sky-commons/tally-feed:vX.Y.Z --repo sky-commons/tally
+# and the same for ghcr.io/sky-commons/tally-map (tally-map-image.txt).
 name: release
 
 on:
@@ -37,10 +40,11 @@ jobs:
       contents: write
       id-token: write
       attestations: write
-      # The feeder's image, pushed to this organisation's GitHub registry.
+      # The feeder's and the map's images, pushed to this organisation's GitHub registry.
       packages: write
     env:
       IMAGE: ghcr.io/sky-commons/tally-feed
+      MAP_IMAGE: ghcr.io/sky-commons/tally-map
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
@@ -108,8 +112,13 @@ jobs:
       - uses: actions/attest-build-provenance@c074443f1aee8d4aeeae555aebba3282517141b2
         with:
           subject-path: 'dist/tally-*-linux, dist/*.service, dist/seeds, dist/install.sh'
-      # The image is the binaries just signed, copied onto distroless (no RUN), so it needs no
-      # emulation for arm64: buildx alone, no QEMU.
+      # The feeder's image is the binaries just signed, copied onto distroless (no RUN), so it
+      # needs no emulation for arm64; the map image installs Debian's packages (a RUN), so its
+      # arm64 half runs under QEMU, registered before buildx makes its builder.
+      # v4.4.0, pinned by commit.
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1
+        with:
+          platforms: arm64
       # v4.4.1, pinned by commit.
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069
       # v4.6.0, pinned by commit.
@@ -148,10 +157,39 @@ jobs:
           subject-name: ${{ env.IMAGE }}
           subject-digest: ${{ steps.image.outputs.digest }}
           push-to-registry: true
+      # v7.4.0, pinned by commit. Its context is packaging/map; every input it fetches is pinned
+      # there by digest, version or sha256.
+      - id: map-image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc
+        with:
+          context: packaging/map
+          file: packaging/map/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          provenance: false
+          tags: ${{ env.MAP_IMAGE }}:${{ github.ref_name }}
+      - name: sign the map image
+        env:
+          DIGEST: ${{ steps.map-image.outputs.digest }}
+        run: |
+          set -euo pipefail
+          [[ "$DIGEST" == sha256:* ]]
+          cosign sign --yes "$MAP_IMAGE@$DIGEST"
+          echo "$MAP_IMAGE@$DIGEST" > dist/tally-map-image.txt
+          cd dist
+          sha256sum tally-map-image.txt > tally-map-image.txt.sha256
+          cosign sign-blob --yes --bundle tally-map-image.txt.sigstore.json tally-map-image.txt > /dev/null
+      # v2.2.3, pinned by commit.
+      - uses: actions/attest-build-provenance@c074443f1aee8d4aeeae555aebba3282517141b2
+        with:
+          subject-name: ${{ env.MAP_IMAGE }}
+          subject-digest: ${{ steps.map-image.outputs.digest }}
+          push-to-registry: true
       - name: publish
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           image="$(cat dist/tally-feed-image.txt)"
-          gh release create "$GITHUB_REF_NAME" --verify-tag --title "$GITHUB_REF_NAME" --notes "Tally $GITHUB_REF_NAME. Install a feeder with \`curl -fsSL https://github.com/$GITHUB_REPOSITORY/releases/download/$GITHUB_REF_NAME/install.sh | sudo bash\`, or run it as a container: \`$image\` (\`$IMAGE:$GITHUB_REF_NAME\`)." dist/*
+          map_pinned="$(cat dist/tally-map-image.txt)"
+          gh release create "$GITHUB_REF_NAME" --verify-tag --title "$GITHUB_REF_NAME" --notes "Tally $GITHUB_REF_NAME. Install a feeder with \`curl -fsSL https://github.com/$GITHUB_REPOSITORY/releases/download/$GITHUB_REF_NAME/install.sh | sudo bash\`, or run it as a container: \`$image\` (\`$IMAGE:$GITHUB_REF_NAME\`). The map, to run beside a relay: \`$map_pinned\` (\`$MAP_IMAGE:$GITHUB_REF_NAME\`)." dist/*

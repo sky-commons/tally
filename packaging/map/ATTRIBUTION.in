@@ -1,0 +1,13 @@
+This archive is one UTC day of a Tally relay's globe history: what readsb, decoding the relay's
+ADS-B, wrote for that day (each aircraft's trace and the heatmap), as the tally-map image packs it
+(github.com/sky-commons/tally, packaging/map).
+
+The data in it is made available under the Open Database License (ODbL) 1.0:
+https://opendatacommons.org/licenses/odbl/1-0/
+
+Each aircraft's registration, ICAO type code, type description and military and interesting
+flags in it come from Mictronics' aircraft database, made available under the Open Data Commons
+Attribution License (ODC-By) 1.0 (https://opendatacommons.org/licenses/by/1-0/), at commit
+@MICTRONICS_COMMIT@ of https://github.com/Mictronics/aircraft-database.
+Attribution: Aircraft data: Mictronics aircraft database, ODC-By 1.0.
+Its licence is LICENSE-aircraft-database, beside this file.
