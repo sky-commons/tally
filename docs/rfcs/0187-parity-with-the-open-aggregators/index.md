@@ -41,6 +41,17 @@ commit, and nginx. It is one more thing a relay operator runs, not a Flightlines
 - nginx serves tar1090 on `:8080`, with readsb's JSON at `/data/` and history at `/globe_history/`.
 - tar1090's config is written at start from the environment: the page's title, and
   `TALLY_MAP_API`, the `tally-api` origin its routes are asked of (§2).
+- What the map sends is bounded by a ceiling its operator states, `TALLY_MAP_MAX_UPLOAD`, in the
+  relay's `--max-upload` units, since a relay host's plan is billed for both (the reference
+  deployment is a Lightsail node whose whole plan is 3 TB a month). nginx has no shared budget of
+  bytes, only a rate per response and a count of responses at once, so every response is in one
+  class (the live JSON and the page; the history; the archives), each class a zone keyed on a
+  constant holding it to a number of slots at a rate derived from the ceiling, and the classes'
+  slots times rates add up to the ceiling. Each visitor is also held to its share of slots and to
+  a request rate, keyed on its own address: behind a proxy, the address the proxy's header names
+  (`TALLY_MAP_CLIENT_IP_HEADER`), believed only from the proxies named
+  (`TALLY_MAP_TRUSTED_PROXIES`). A refusal is `429` or `503` with `Retry-After`. The image's
+  README gives the figures.
 - The aircraft database is a file baked into the image at release, from a source whose licence
   lets anyone redistribute it (CC0, public domain, ODbL, CC BY, or ODC-By 1.0, the Open Data
   Commons Attribution License, the database counterpart of CC BY). The image's README names it.
@@ -98,7 +109,10 @@ neither is modified.
   readsb was not running through (the container started after it) is packed as
   `YYYY-MM-DD.partial.tar`, since its last traces may be missing, and a release marks it so.
   The image keeps the newest 7 archives, and deletes a day's history once it is older than
-  `TALLY_MAP_HISTORY_DAYS` (default 8) and packed, never before.
+  `TALLY_MAP_HISTORY_DAYS` (default 8) and packed, never before. The archives are sent within the
+  map's ceiling (§1), two at once and one to a visitor; `TALLY_MAP_ARCHIVE_PUBLIC=off` answers 404
+  to a request without the bearer token in `TALLY_MAP_ARCHIVE_TOKEN_FILE`, so an operator can keep
+  them off its public name while its release job still fetches them.
 - **ACARS, VDL2 and HFDL:** `tally-feed --acars HOST:PORT` publishes a local decoder's JSON lines in
   its signed batches, as `--uat` does, and they join the daily release.
 - **Previews and short URLs** (`/<hex>`, `/<registration>`), a status page and a hardware guide on
