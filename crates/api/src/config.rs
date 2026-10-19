@@ -39,6 +39,9 @@ usage: tally-api --relay-stats URL --readsb URL [options]
                          to every relay read, which serves it on that relay's credit (RFC-0174
                          §2.1); needs --key. Without it every relay serves the free tier
   --mlat-max-age-secs N  the oldest MLAT position served (default 60)
+  --routes DIR           a checkout of VRS standing data (its routes/ and airports/ CSV files),
+                         which the operator keeps current; read at start and again when its files
+                         change or hourly (default none: the routes answer 404)
 ";
 
 #[derive(Debug)]
@@ -92,6 +95,7 @@ impl Config {
                     }
                     linked_relay = Some(RelayAddress::parse(&value()?)?);
                 }
+                "--routes" => settings.routes = Some(value()?.into()),
                 "--mlat-max-age-secs" => {
                     settings.mlat.max_age = Duration::from_secs(count(&flag, &value()?)? as u64);
                 }
@@ -167,6 +171,19 @@ mod tests {
             (DEFAULT_MAX_REQUESTS, DEFAULT_MAX_CONNECTIONS)
         );
         assert!(settings.client_ip_header.is_none());
+        assert!(settings.routes.is_none());
+        let config = parse(&[
+            "--relay-stats",
+            "r",
+            "--readsb",
+            "s",
+            "--routes",
+            "/var/lib/tally/standing-data",
+        ])?;
+        assert_eq!(
+            config.settings.routes,
+            Some("/var/lib/tally/standing-data".into())
+        );
         Ok(())
     }
 
@@ -293,6 +310,7 @@ mod tests {
             format!("(default {})", crate::snapshot::DEFAULT_REFRESH.as_secs()),
             "(default none: no other site's page may read the API)".to_owned(),
             format!("(default {})", crate::mlat::DEFAULT_MAX_AGE.as_secs()),
+            "(default none: the routes answer 404)".to_owned(),
         ] {
             assert!(USAGE.contains(&stated), "the help does not say {stated}");
         }

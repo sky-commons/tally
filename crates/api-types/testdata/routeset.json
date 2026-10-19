@@ -1,0 +1,43 @@
+[
+  {
+    "callsign": "BAW1",
+    "number": "1",
+    "airline_code": "BAW",
+    "airport_codes": "EGLL-KJFK",
+    "_airport_codes_iata": "LHR-JFK",
+    "_airports": [
+      {
+        "name": "London Heathrow Airport",
+        "icao": "EGLL",
+        "iata": "LHR",
+        "location": "London",
+        "countryiso2": "GB",
+        "lat": 51.4706,
+        "lon": -0.461941,
+        "alt_feet": 83.0,
+        "alt_meters": 25.3
+      },
+      {
+        "name": "John F Kennedy International Airport",
+        "icao": "KJFK",
+        "iata": "JFK",
+        "location": "New York",
+        "countryiso2": "US",
+        "lat": 40.639801,
+        "lon": -73.7789,
+        "alt_feet": 13.0,
+        "alt_meters": 3.96
+      }
+    ],
+    "plausible": true
+  },
+  {
+    "callsign": "NOPE1",
+    "number": "unknown",
+    "airline_code": "unknown",
+    "airport_codes": "unknown",
+    "_airport_codes_iata": "unknown",
+    "_airports": [],
+    "plausible": null
+  }
+]

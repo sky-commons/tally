@@ -12,6 +12,8 @@
 //! of it is forwarded, so a churn of throwaway keys forgets itself oldest first and a receiver that
 //! keeps publishing keeps its place. Only a forwarded batch, which its key signed, creates a row.
 
+use std::net::IpAddr;
+
 use serde::{Deserialize, Serialize};
 use tally_wire::{Location, PublicKey};
 
@@ -55,6 +57,13 @@ pub struct StationReport {
     pub location: Option<StationLocation>,
     /// The feeder software its newest description names.
     pub software: Option<String>,
+    /// The address (no port) its connected session came from, as the socket saw it; `null` while
+    /// no session of it is connected. An address is a session's, never the receiver's: once the
+    /// session ends the address may be anyone's (a dynamic IP reassigned), so it goes with it.
+    /// Who feeds from where is the operator's to know, never the public's: this report is served
+    /// on loopback only (`config::parse_stats_listen`), and `tally-api` answers a client only the
+    /// connected stations of the client's own address (`GET /v1/me`).
+    pub address: Option<String>,
 }
 
 /// A receiver's declared location, in degrees and metres.
@@ -83,6 +92,8 @@ struct Tally {
     sessions: u64,
     /// The connection currently feeding it directly, if one is.
     session: Option<u64>,
+    /// The address `session` connected from, held only while `session` is.
+    address: Option<IpAddr>,
     first_seen_ms: u64,
     last_seen_ms: u64,
     batches: u64,
@@ -97,6 +108,7 @@ impl Tally {
         Self {
             sessions: 0,
             session: None,
+            address: None,
             first_seen_ms: now_ms,
             last_seen_ms: now_ms,
             batches: 0,
@@ -139,6 +151,7 @@ impl Tally {
             observations: self.observations,
             location: None,
             software: None,
+            address: self.address.map(|address| address.to_string()),
         }
     }
 }
@@ -173,24 +186,27 @@ impl Stations {
         }
     }
 
-    /// Connection `source`, a feeder publishing as `receiver`, just had a new batch forwarded: the
-    /// first one on it counts a session.
-    pub fn fed_by(&mut self, receiver: &PublicKey, source: u64) {
+    /// Connection `source`, a feeder publishing as `receiver` from `address`, just had a new batch
+    /// forwarded: the first one on it counts a session, and its address is the receiver's. An IPv4
+    /// client of a dual-stack socket is named as IPv4 (`::ffff:a.b.c.d` is `a.b.c.d`).
+    pub fn fed_by(&mut self, receiver: &PublicKey, source: u64, address: Option<IpAddr>) {
         if let Some(tally) = self.table.get_mut(receiver)
             && tally.session != Some(source)
         {
             tally.session = Some(source);
             tally.sessions += 1;
+            tally.address = address.map(|address| address.to_canonical());
         }
     }
 
-    /// Connection `source` of a feeder publishing as `receiver` ended. A newer connection of the
-    /// same receiver stays its session.
+    /// Connection `source` of a feeder publishing as `receiver` ended, and its address with it. A
+    /// newer connection of the same receiver stays its session, with its own address.
     pub fn left(&mut self, receiver: &PublicKey, source: u64) {
         if let Some(tally) = self.table.get_mut(receiver)
             && tally.session == Some(source)
         {
             tally.session = None;
+            tally.address = None;
         }
     }
 
@@ -305,19 +321,52 @@ mod tests {
         let receiver = key()?;
         let mut stations = Stations::new(8);
         // No row until a batch: a connection alone creates nothing.
-        stations.fed_by(&receiver, 5);
+        stations.fed_by(&receiver, 5, None);
         assert!(stations.is_empty());
         stations.forwarded(receiver, 1, 0, 1, 0);
-        stations.fed_by(&receiver, 5);
-        stations.fed_by(&receiver, 5);
+        stations.fed_by(&receiver, 5, None);
+        stations.fed_by(&receiver, 5, None);
         // The feeder reconnects before its old connection is noticed gone.
-        stations.fed_by(&receiver, 6);
+        stations.fed_by(&receiver, 6, None);
         stations.left(&receiver, 5);
         let report = stations.report(&receiver, 0).ok_or("no report")?;
         assert_eq!((report.sessions, report.connected), (2, true));
         stations.left(&receiver, 6);
         let report = stations.report(&receiver, 0).ok_or("no report")?;
         assert_eq!((report.sessions, report.connected), (2, false));
+        Ok(())
+    }
+
+    /// The address is the connected session's, without its port, an IPv4 client of a dual-stack
+    /// socket named as IPv4; none before the receiver fed this relay directly and none once its
+    /// session ended, since the address may then be a stranger's.
+    #[test]
+    fn the_address_is_the_connected_sessions_only() -> Result<(), String> {
+        let receiver = key()?;
+        let mut stations = Stations::new(8);
+        let address = |stations: &Stations| {
+            stations
+                .report(&receiver, 0)
+                .and_then(|report| report.address)
+        };
+        stations.forwarded(receiver, 1, 0, 1, 0);
+        assert_eq!(address(&stations), None);
+        let home: IpAddr = "::ffff:203.0.113.7".parse().map_err(|_| "not an address")?;
+        stations.fed_by(&receiver, 5, Some(home));
+        assert_eq!(address(&stations).as_deref(), Some("203.0.113.7"));
+        // The same session again changes nothing; a new one from elsewhere is the address now,
+        // even before the old one is noticed gone.
+        let away: IpAddr = "2001:db8::1".parse().map_err(|_| "not an address")?;
+        stations.fed_by(&receiver, 5, Some(away));
+        assert_eq!(address(&stations).as_deref(), Some("203.0.113.7"));
+        stations.fed_by(&receiver, 6, Some(away));
+        stations.left(&receiver, 5);
+        assert_eq!(address(&stations).as_deref(), Some("2001:db8::1"));
+        // A session that ends takes its address with it.
+        stations.left(&receiver, 6);
+        assert_eq!(address(&stations), None);
+        let report = stations.report(&receiver, 0).ok_or("no report")?;
+        assert!(!report.connected);
         Ok(())
     }
 

@@ -3,13 +3,17 @@
 //! relay and readsb nothing more. A value older than `STALE_AFTER` is not served.
 
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
+use tally_relay::hub::source_of;
 use tally_relay::stations::{StationReport, StationsReport};
 use tally_wire::PublicKey;
 
-use tally_api_types::{Aircraft, Network, Position, PositionSource, SourceCounts, Station};
+use tally_api_types::{
+    Aircraft, MeResponse, MeStation, Network, Position, PositionSource, SourceCounts, Station,
+};
 
 use crate::feeders::Board;
 
@@ -93,6 +97,50 @@ impl Stations {
             }),
             software: report.software.clone(),
         })
+    }
+
+    /// The stations connected now from `client`'s host, by key. A host is what the relay counts a
+    /// connection against (`source_of`): an IPv4 address exactly, an IPv6 /64 (a dual-stack home
+    /// feeds from one temporary address and browses from another in the same /64), an IPv4
+    /// address written as IPv6 (`::ffff:a.b.c.d`) the same as itself. Only a connected session
+    /// has an address: once it ends the address may be a stranger's (a dynamic IP reassigned), so
+    /// a station whose session ended is no one's. No stations when the client's address is not
+    /// known (`routes::Client`), or is loopback or unspecified (a local process or a proxy, never
+    /// a feeder's host).
+    pub fn mine(&self, client: Option<IpAddr>) -> MeResponse {
+        let client = client
+            .map(|client| client.to_canonical())
+            .filter(|client| !client.is_loopback() && !client.is_unspecified())
+            .map(source_of);
+        let mut keys: Vec<&PublicKey> = self
+            .by_key
+            .iter()
+            .filter(|(_, report)| {
+                report.connected
+                    && report
+                        .address
+                        .as_deref()
+                        .and_then(|address| address.parse::<IpAddr>().ok())
+                        .is_some_and(|address| Some(source_of(address)) == client)
+            })
+            .map(|(key, _)| key)
+            .collect();
+        keys.sort_unstable();
+        MeResponse {
+            now_ms: self.now_ms,
+            stations: keys
+                .into_iter()
+                .filter_map(|key| {
+                    let report = self.by_key.get(key)?;
+                    Some(MeStation {
+                        key: report.key.clone(),
+                        online: report.online,
+                        messages_per_sec: self.rates.get(key).copied().unwrap_or(0.0),
+                        last_seen_at_ms: report.last_seen_ms,
+                    })
+                })
+                .collect(),
+        }
     }
 
     /// The network's totals, with `aircraft` counted by source (`count`).
@@ -236,7 +284,114 @@ mod tests {
                 precision_m: 0,
             }),
             software: Some("tally-feed 0.1.0".to_owned()),
+            address: None,
         }
+    }
+
+    /// A client is answered the connected stations of its own host and none other: not one on
+    /// another address, not one the relay names no address for, not one whose session ended,
+    /// whatever the client's address is written as.
+    #[test]
+    fn a_client_is_answered_only_its_own_addresss_stations() -> Result<(), String> {
+        let at = |key: &PublicKey, address: Option<&str>| StationReport {
+            address: address.map(str::to_owned),
+            ..report(key, true, 10)
+        };
+        let mut keys: Vec<PublicKey> = (0..5)
+            .map(|seed| Identity::from_seed([seed; 32]).public())
+            .collect();
+        keys.sort_unstable();
+        let stations = Stations::from_report(
+            StationsReport {
+                now_ms: 5_000,
+                stations: vec![
+                    at(&keys[3], Some("203.0.113.7")),
+                    at(&keys[0], Some("203.0.113.7")),
+                    at(&keys[1], Some("203.0.113.8")),
+                    at(&keys[2], None),
+                    // Its session ended: the address it named is no longer its own.
+                    StationReport {
+                        connected: false,
+                        ..at(&keys[4], Some("203.0.113.7"))
+                    },
+                ],
+            },
+            None,
+        );
+        let home: IpAddr = "203.0.113.7".parse().map_err(|_| "not an address")?;
+        let mine = stations.mine(Some(home));
+        assert_eq!(mine.now_ms, 5_000);
+        let named: Vec<&str> = mine.stations.iter().map(|one| one.key.as_str()).collect();
+        assert_eq!(named, [keys[0].to_base64(), keys[3].to_base64()]);
+        assert!(
+            mine.stations
+                .iter()
+                .all(|one| one.online && one.last_seen_at_ms == 2)
+        );
+        // The same client through a dual-stack socket.
+        let mapped: IpAddr = "::ffff:203.0.113.7".parse().map_err(|_| "not an address")?;
+        assert_eq!(stations.mine(Some(mapped)), mine);
+        let stranger: IpAddr = "198.51.100.1".parse().map_err(|_| "not an address")?;
+        assert!(stations.mine(Some(stranger)).stations.is_empty());
+        // No address known, or one that is no feeder's host, names no station.
+        assert!(stations.mine(None).stations.is_empty());
+        Ok(())
+    }
+
+    /// IPv6 is matched by /64, as the relay counts a host: a dual-stack home's feeder and browser
+    /// use different addresses of one /64. IPv4 is matched exactly.
+    #[test]
+    fn an_ipv6_host_is_its_64_and_an_ipv4_host_its_address() -> Result<(), String> {
+        let mut keys: Vec<PublicKey> = (0..2)
+            .map(|seed| Identity::from_seed([seed; 32]).public())
+            .collect();
+        keys.sort_unstable();
+        let at = |key: &PublicKey, address: &str| StationReport {
+            address: Some(address.to_owned()),
+            ..report(key, true, 10)
+        };
+        let stations = Stations::from_report(
+            StationsReport {
+                now_ms: 5_000,
+                stations: vec![
+                    at(&keys[0], "2001:db8:1:2:aaaa::1"),
+                    at(&keys[1], "203.0.113.7"),
+                ],
+            },
+            None,
+        );
+        let named = |client: &str| -> Result<Vec<String>, String> {
+            let client: IpAddr = client.parse().map_err(|_| "not an address")?;
+            Ok(stations
+                .mine(Some(client))
+                .stations
+                .into_iter()
+                .map(|one| one.key)
+                .collect())
+        };
+        // Another address in the same /64 is the same home.
+        assert_eq!(
+            named("2001:db8:1:2:bbbb:cccc:dddd:eeee")?,
+            [keys[0].to_base64()]
+        );
+        // The next /64 is not.
+        assert!(named("2001:db8:1:3:aaaa::1")?.is_empty());
+        // IPv4 exactly, written either way; its neighbour is a stranger.
+        assert_eq!(named("::ffff:203.0.113.7")?, [keys[1].to_base64()]);
+        assert!(named("203.0.113.8")?.is_empty());
+        // A loopback or unspecified client is no feeder's host, even beside a station that names one.
+        let local = Stations::from_report(
+            StationsReport {
+                now_ms: 5_000,
+                stations: vec![at(&keys[0], "127.0.0.1"), at(&keys[1], "::")],
+            },
+            None,
+        );
+        for client in ["127.0.0.1", "::1", "::ffff:127.0.0.1", "0.0.0.0", "::"] {
+            let client: IpAddr = client.parse().map_err(|_| "not an address")?;
+            assert!(local.mine(Some(client)).stations.is_empty(), "{client}");
+        }
+        Ok(())
     }
 
     /// The rates are the API's: each station's change in forwarded observations between two

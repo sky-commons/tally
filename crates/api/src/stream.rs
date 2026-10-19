@@ -330,7 +330,9 @@ fn event(update: &AircraftUpdate) -> Result<Event, axum::Error> {
 /// before the stream's `200`, so a client that cannot be served is told why in its status.
 pub async fn open(
     State(app): State<Arc<App>>,
-    Extension(Client(client)): Extension<Client>,
+    Extension(Client {
+        counts_as: client, ..
+    }): Extension<Client>,
     viewport: Result<Query<Viewport>, QueryRejection>,
 ) -> Response {
     let (area, feed) = match routes::viewport(viewport) {

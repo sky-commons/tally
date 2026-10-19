@@ -70,6 +70,7 @@ fn report_of(
         observations,
         location,
         software: software.map(str::to_owned),
+        address: Some("203.0.113.7".to_owned()),
     }
 }
 
@@ -269,6 +270,19 @@ fn the_network_and_station_answers_are_the_fixtures() -> Result<(), String> {
     same(
         &bare.station(&station_key()).ok_or("no station")?,
         fixtures::STATION_BARE,
+    )?;
+    let home: std::net::IpAddr = "203.0.113.7".parse().map_err(|_| "not an address")?;
+    same(&located.mine(Some(home)), fixtures::ME)
+}
+
+/// The routes of the request tar1090 sends, over the routes module's own standing data.
+#[test]
+fn the_routeset_answer_is_the_fixture() -> Result<(), String> {
+    let asked: tally_api_types::RouteSetRequest =
+        serde_json::from_str(fixtures::ROUTESET_REQUEST).map_err(|e| e.to_string())?;
+    same(
+        &crate::vrs::routes_of(&crate::vrs::tests::standing(), &asked.planes),
+        fixtures::ROUTESET,
     )
 }
 
