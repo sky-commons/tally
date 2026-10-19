@@ -223,6 +223,15 @@ would hold every visitor to one bucket. `--client-ip-header CF-Connecting-IP` re
 address from the header Cloudflare sets instead. Set it only when every request comes through that
 proxy: a client that reaches the API directly could otherwise name any address it likes.
 
+## Run the map
+
+The release's second image, `ghcr.io/sky-commons/tally-map`, is a full aircraft map of what a relay
+hears (tar1090 over readsb, with an open aircraft database), for a relay operator to run beside
+the relay. Its readsb reads the relay's `--beast-out` and serves the query API `tally-api --readsb`
+reads, so one decoder serves the map and the API. It also packs each day's history into one
+archive for the open data releases. How to run it, its settings and its licences:
+[packaging/map/README.md](packaging/map/README.md).
+
 ## Build
 
 ```sh
