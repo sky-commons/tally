@@ -18,6 +18,12 @@
 //! - `GET /v1/leaderboards` and `GET /v1/leaderboards/{area}`: every area with a feeder, ranked or
 //!   not, and one area's two leaderboards (by unique coverage and by MLAT help; only feeders with
 //!   standing) and its feeders without standing.
+//! - `GET /v1/me`: the stations connected now from the asking client's host, as the relay's
+//!   loopback stats name it (RFC-0187 §2, `Stations::mine`); never any other, and never cached.
+//! - `GET /v2/...`: the ADS-B Exchange-compatible API adsb.lol serves, each path one query of
+//!   readsb's, answered as readsb writes it (`v2`).
+//! - `POST /api/0/routeset` and `GET /api/0/route/{callsign}/{lat}/{lon}`: routes from VRS
+//!   standing data, as adsb.lol answers them to tar1090 (`vrs`).
 //!
 //! Every response carries CORS for the configured origins and a `Cache-Control` for the edge.
 //! Each client is held to a token bucket (`limit`), requests in flight and connections are
@@ -34,11 +40,14 @@ pub mod routes;
 pub mod snapshot;
 pub mod stream;
 pub mod upstream;
+pub mod v2;
+pub mod vrs;
 
 #[cfg(test)]
 mod fixtures_test;
 
 use std::collections::BTreeSet;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
@@ -91,6 +100,9 @@ pub struct Settings {
     pub stream_heartbeat: Duration,
     /// Where MLAT positions come from.
     pub mlat: mlat::Settings,
+    /// A checkout of VRS standing data (its `routes/` and `airports/`), which the routes answer
+    /// from; none answers them `404`.
+    pub routes: Option<PathBuf>,
 }
 
 impl Settings {
@@ -107,6 +119,7 @@ impl Settings {
             refresh: snapshot::DEFAULT_REFRESH,
             stream_heartbeat: stream::HEARTBEAT,
             mlat: mlat::Settings::default(),
+            routes: None,
         }
     }
 }
@@ -127,6 +140,8 @@ pub struct App {
     pub live: stream::Live,
     /// The streams each client holds open.
     pub streams: stream::Open,
+    /// The standing data the routes answer from, read by `vrs::keep`.
+    pub routes: Arc<vrs::Held>,
 }
 
 impl App {
@@ -141,6 +156,7 @@ impl App {
             standing: Arc::default(),
             live: stream::Live::default(),
             streams: stream::Open::default(),
+            routes: Arc::default(),
             settings,
         }
     }
@@ -236,6 +252,9 @@ impl App {
 pub async fn serve(listener: TcpListener, settings: Settings) -> ! {
     let app = Arc::new(App::new(settings));
     tokio::spawn(Arc::clone(&app).refresh());
+    if let Some(dir) = &app.settings.routes {
+        tokio::spawn(vrs::keep(dir.clone(), Arc::clone(&app.routes)));
+    }
     if let Err(error) = mlat::start(
         &app.settings.mlat,
         Arc::clone(&app.mlat),

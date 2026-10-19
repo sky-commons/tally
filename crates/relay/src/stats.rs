@@ -1,9 +1,12 @@
 //! The relay's station reports over HTTP (`--stats-listen`): read-only JSON, unauthenticated, for
-//! a process on the same host such as `tally-api`. Bind it to loopback.
+//! a process on the same host such as `tally-api`. It binds loopback only: the relay refuses any
+//! other address (`config::parse_stats_listen`).
 //!
 //! - `GET /stations`: every station held (`StationsReport`).
 //! - `GET /stations/{key}`: one (`StationReport`), the key as base64url without padding; 400 when
-//!   it is not a key, 404 when the relay holds nothing for it.
+//!   it is not a key, 404 when the relay holds nothing for it. Each names the address its connected
+//!   session came from, which is why this listener is loopback's alone: `tally-api` answers a
+//!   client only the stations of its own address (its `GET /v1/me`).
 //! - `GET /egress`: the upload cap and what it carries (`egress::EgressReport`): the cap and the
 //!   most it lets out in a month, billed and loopback bytes sent, the headroom left, each priority
 //!   class's rate, demand, waiting sends and queued bytes and peers shed, and feeders turned away.
@@ -176,7 +179,11 @@ mod tests {
         for sequence in [0, 1, 3] {
             hub.publish_batch(9, batch(&receiver, sequence)?, key);
         }
-        hub.fed_by(&key, 9);
+        hub.fed_by(
+            &key,
+            9,
+            Some(std::net::Ipv4Addr::new(198, 51, 100, 4).into()),
+        );
 
         let listener = TcpListener::bind("127.0.0.1:0").await.map_err(text)?;
         let address = listener.local_addr().map_err(text)?;
@@ -205,6 +212,7 @@ mod tests {
         );
         assert_eq!(one.location, Some(location.into()));
         assert_eq!(one.software.as_deref(), Some("tally-feed 0.1.0"));
+        assert_eq!(one.address.as_deref(), Some("198.51.100.4"));
 
         // The feeder leaves: still known, no longer connected.
         hub.left(&key, 9);

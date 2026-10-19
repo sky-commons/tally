@@ -81,8 +81,10 @@ unauthenticated: bind it to loopback.
 
 `--stats-listen 127.0.0.1:10901` serves what the relay knows of each receiver's traffic as JSON
 (`GET /stations`, `GET /stations/KEY` with the key as base64url): sessions, first and last seen,
-batches, sequence gaps, observations, messages a second, and the location and software its
-description declares. It is unauthenticated too: bind it to loopback.
+batches, sequence gaps, observations, messages a second, the location and software its
+description declares, and the `address` its connected session came from. It is unauthenticated too,
+and names where each feeder feeds from, so it binds loopback only: the relay refuses to start on
+any other address (`0.0.0.0`, a public one, or a name).
 
 `--area CELL` names an area the relay takes (an H3 cell, hex or decimal; repeatable). It shares
 what it takes with every relay that takes the same area, and offers it, signed, to the network.
@@ -167,13 +169,20 @@ Prices change: read your own plan before you set the cap.
 `tally-api` serves public, read-only JSON beside a relay: aircraft in a viewport (from a readsb fed
 by the relay's `--beast-out`, through readsb's own API port, with the network's MLAT positions
 merged in), network totals, each station's stats (from the relay's `--stats-listen`), and each
-feeder's figures and the area leaderboards.
+feeder's figures and the area leaderboards; and, as adsb.lol serves them, the ADS-B
+Exchange-compatible `/v2` and routes (RFC-0187 §2).
 
 ```sh
 tally-api --relay-stats http://127.0.0.1:10901 --readsb http://127.0.0.1:30152 \
-  --relay 127.0.0.1:10900=<relay key> --mlat-raw \
+  --relay 127.0.0.1:10900=<relay key> --mlat-raw --routes /var/lib/tally/standing-data \
   --listen 127.0.0.1:10902 --client-ip-header CF-Connecting-IP
 ```
+
+`--routes DIR` is a checkout of [VRS standing data](https://github.com/vradarserver/standing-data)
+(CC0), its `routes/` and `airports/` CSV files, which the operator keeps current (daily, say, with
+`git -C DIR pull`); the API reads it at start and again when its files change or hourly. Fetch it
+once with `git clone --depth 1 --filter=blob:none --sparse https://github.com/vradarserver/standing-data DIR && git -C DIR sparse-checkout set routes airports`.
+Without it the routes answer `404`.
 
 `--relay` (repeatable) is where the API reads the network's MLAT positions and its world products.
 Feeder figures and leaderboards need both it and `--mlat-raw`: a receiver ranks only with standing,
@@ -207,6 +216,19 @@ public signed records; no relay computes them.
 - `GET /v1/stations/KEY` (the key as base64url without padding), `GET /v1/stations/KEY/stats`
 - `GET /v1/leaderboards`, `GET /v1/leaderboards/AREA`: every area with a feeder, its `receivers`
   beside the `ranked` among them, and an area's feeders without standing as `unranked`
+- `GET /v1/me`: "am I feeding": the stations connected now from the asking client's host (its
+  IPv4 address, or its IPv6 /64, as `--client-ip-header` names it; none when the header is missing,
+  or the address is loopback), each `key`, `online`, `messages_per_sec` and
+  `last_seen_at_ms`; never another's, never cached
+- `GET /v2/hex/HEX` (`/v2/icao/`), `/v2/callsign/CS`, `/v2/registration/REG` (`/v2/reg/`),
+  `/v2/type/TYPE`, `/v2/squawk/SQ` (`/v2/sqk/`), `/v2/mil`, `/v2/ladd`, `/v2/pia`,
+  `/v2/point/LAT/LON/NM` (`/v2/lat/LAT/lon/LON/dist/NM`, at most 250 nm) and
+  `/v2/closest/LAT/LON/NM`: ADS-B Exchange's v2 answer (`ac`, `msg`, `now`, `total`, `ctime`,
+  `ptime`), each one query of readsb's API port served as readsb writes it; a value may be a
+  comma-separated list, and a malformed one is `400`
+- `POST /api/0/routeset` (tar1090's `routeApiUrl`: `{"planes":[{"callsign","lat","lng"}]}`, at
+  most 100) and `GET /api/0/route/CALLSIGN/LAT/LON`: adsb.lol's route shape, `plausible` when the
+  aircraft is near a leg's great circle
 
 The JSON is declared once, in `crates/api-types` (`tally-api-types`, serde only), which a client
 in Rust can depend on rather than restate; `crates/api-types/testdata` holds one answer of each
@@ -215,8 +237,9 @@ endpoint exactly as the API writes it. Every time field says what it is: an inst
 `now_ms`, or by its own clock through the offset `sent_at_ms` gives it), and a span is `*_for_ms`.
 
 Each client is rate limited (`--rate`, `--burst`), and CORS allows `--allow-origin` (repeatable; no origin unless named),
-answering a preflight for `GET` with the `accept` and `traceparent` request headers and exposing
-`Retry-After`. `tally-api --help` lists the rest.
+answering a preflight for `GET` and `POST` with the `accept`, `content-type` and `traceparent`
+request headers and exposing `Retry-After`; a map whose routes come from this API names its origin
+here. `tally-api --help` lists the rest.
 
 Behind Cloudflare (or any proxy), every request arrives from the proxy's address, so the rate limit
 would hold every visitor to one bucket. `--client-ip-header CF-Connecting-IP` reads each client's

@@ -1,0 +1,6 @@
+{
+  "planes": [
+    { "callsign": "BAW1", "lat": 51.6, "lng": -1.0 },
+    { "callsign": "NOPE1", "lat": 51.0, "lng": 0.0 }
+  ]
+}
