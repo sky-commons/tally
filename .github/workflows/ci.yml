@@ -43,3 +43,9 @@ jobs:
       - run: bazel test --keep_going --lockfile_mode=error --test_output=errors --local_test_jobs=2 //...
       # Clippy over every Rust target, each warning an error (.bazelrc's `lint`).
       - run: bazel build --keep_going --lockfile_mode=error --config=lint //...
+      # The release's cross builds, so a change that breaks one fails here and not on a tag: every
+      # program for aarch64, the feeder for armv7 (release.yml).
+      - run: |
+          bazel build --lockfile_mode=error --platforms=//platforms:linux_aarch64 \
+            //crates/feed:tally-feed //crates/relay:tally-relay //crates/api:tally-api
+          bazel build --lockfile_mode=error --platforms=//platforms:linux_armv7 //crates/feed:tally-feed

@@ -16,6 +16,7 @@ use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
 use tokio::sync::{broadcast, mpsc};
 
+use crate::health::Health;
 use crate::uat::{self, Lines};
 
 /// How often a batch is sealed, at most.
@@ -500,12 +501,14 @@ pub async fn batch(mut batcher: Batcher, mut intake: Intake, out: broadcast::Sen
     }
 }
 
-/// Reads readsb's BEAST output for as long as the feeder runs.
-pub async fn read_beast(address: String, inputs: Inputs) {
+/// Reads readsb's BEAST output for as long as the feeder runs, telling `health` each time it
+/// sends bytes.
+pub async fn read_beast(address: String, inputs: Inputs, health: Arc<Health>) {
     let mut backoff = Backoff::new();
     let mut refusing = false;
     loop {
-        if let Err(error) = read_beast_once(&address, &inputs, &mut backoff, &mut refusing).await {
+        let reading = read_beast_once(&address, &inputs, &health, &mut backoff, &mut refusing);
+        if let Err(error) = reading.await {
             eprintln!("tally-feed: source {address}: {error}");
         }
         tokio::time::sleep(backoff.wait()).await;
@@ -515,13 +518,14 @@ pub async fn read_beast(address: String, inputs: Inputs) {
 async fn read_beast_once(
     address: &str,
     inputs: &Inputs,
+    health: &Health,
     backoff: &mut Backoff,
     refusing: &mut bool,
 ) -> Result<(), String> {
     let stream = connect(address).await?;
     backoff.reset();
     eprintln!("tally-feed: reading {address}");
-    let result = read_beast_stream(stream, address, inputs, refusing).await;
+    let result = read_beast_stream(stream, address, inputs, health, refusing).await;
     // The counter may restart with the next connection (readsb restarted, or a different one).
     inputs.counter_restarted().await;
     result
@@ -531,6 +535,7 @@ async fn read_beast_stream(
     mut stream: TcpStream,
     address: &str,
     inputs: &Inputs,
+    health: &Health,
     refusing: &mut bool,
 ) -> Result<(), String> {
     let mut decoder = Decoder::new();
@@ -543,6 +548,7 @@ async fn read_beast_stream(
         if length == 0 {
             return Err("closed".to_owned());
         }
+        health.source_heard();
         let mut frames = Vec::new();
         decoder.push(&buffer[..length], |frame| {
             if !*refusing {

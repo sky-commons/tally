@@ -18,6 +18,8 @@ rust_library(
         ["src/**/*.rs"],
         exclude = ["src/main.rs"],
     ),
+    # The release's seed list, compiled in (`config::SEEDS`).
+    compile_data = ["//packaging:seeds"],
     crate_name = "tally_feed",
     edition = "2024",
     lint_config = ":cargo_lints",
@@ -25,6 +27,7 @@ rust_library(
     deps = [
         "//crates/wire",
         "@tally_crates//:getrandom",
+        "@tally_crates//:libc",
         "@tally_crates//:tokio",
     ],
 )

@@ -232,11 +232,28 @@ fn publishes_nothing(record: &Record) -> Permit {
     }
 }
 
-/// Held while a feeder is connected: its end ends the feeder's session in the station reports.
+/// Held while a feeder is connected: it is connected in the station reports from its start, and
+/// its end ends the feeder's session there.
 struct Feeding {
     hub: Arc<Hub>,
     receiver: PublicKey,
     source: u64,
+}
+
+impl Feeding {
+    fn open(
+        hub: Arc<Hub>,
+        receiver: PublicKey,
+        source: u64,
+        address: Option<std::net::IpAddr>,
+    ) -> Self {
+        hub.opened(&receiver, source, address);
+        Self {
+            hub,
+            receiver,
+            source,
+        }
+    }
 }
 
 impl Drop for Feeding {
@@ -700,13 +717,15 @@ where
         }
         _ => buffers,
     };
-    // A feeder's session in the station reports ends with this connection, however it ends.
+    // A feeder is connected in the station reports from here, whether or not it ever sends a
+    // batch, and its session there ends with this connection, however it ends.
     let _feeding = match peer {
-        Peer::Feeder(receiver) => Some(Feeding {
-            hub: Arc::clone(&hub),
+        Peer::Feeder(receiver) => Some(Feeding::open(
+            Arc::clone(&hub),
             receiver,
             source,
-        }),
+            asker.address,
+        )),
         _ => None,
     };
     // Before any `Subscribe`, the role is granted what it would be for the version 1 default: so a

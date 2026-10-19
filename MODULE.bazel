@@ -9,8 +9,12 @@ bazel_dep(name = "rules_rust", version = "0.74.0")
 rust = use_extension("@rules_rust//rust:extensions.bzl", "rust")
 rust.toolchain(
     edition = "2024",
-    # A feeder runs on a Raspberry Pi: aarch64 is a release target beside the host's.
-    extra_target_triples = ["aarch64-unknown-linux-gnu"],
+    # A feeder runs on a Raspberry Pi: aarch64 is a release target beside the host's, and armv7
+    # hard-float for 32-bit Raspberry Pi OS and the PiAware image (the feeder only).
+    extra_target_triples = [
+        "aarch64-unknown-linux-gnu",
+        "armv7-unknown-linux-gnueabihf",
+    ],
     versions = ["1.96.0"],
 )
 use_repo(rust, "rust_toolchains")
@@ -47,6 +51,15 @@ http_archive(
     urls = ["https://commondatastorage.googleapis.com/chrome-linux-sysroot/52d61d4446ffebfaa3dda2cd02da4ab4876ff237853f46d273e7f9b666652e1d"],
 )
 
+# Chromium's bullseye_armhf, glibc 2.31 like the others: for the 32-bit ARM feeder.
+http_archive(
+    name = "sysroot_linux_armv7",
+    build_file_content = _SYSROOT_BUILD,
+    sha256 = "d78a9e2739dd4cce413dc8629ad0be840591c6456f9a4c6ed4b29ecf2a4257f3",
+    type = "tar.xz",
+    urls = ["https://commondatastorage.googleapis.com/chrome-linux-sysroot/d78a9e2739dd4cce413dc8629ad0be840591c6456f9a4c6ed4b29ecf2a4257f3"],
+)
+
 http_archive(
     name = "sysroot_linux_aarch64",
     build_file_content = _SYSROOT_BUILD,
@@ -58,9 +71,12 @@ http_archive(
 llvm = use_extension("@toolchains_llvm//toolchain/extensions:llvm.bzl", "llvm")
 llvm.toolchain(
     llvm_version = "22.1.8",
-    # The aarch64 sysroot carries only a shared libstdc++. Tally is Rust and uses no C++, so with
+    # The ARM sysroots carry only a shared libstdc++. Tally is Rust and uses no C++, so with
     # --as-needed the binaries do not end up depending on it.
-    stdlib = {"linux-aarch64": "dynamic-stdc++"},
+    stdlib = {
+        "linux-aarch64": "dynamic-stdc++",
+        "linux-armv7": "dynamic-stdc++",
+    },
 )
 llvm.sysroot(
     name = "llvm_toolchain",
@@ -71,6 +87,11 @@ llvm.sysroot(
     name = "llvm_toolchain",
     label = "@sysroot_linux_aarch64//:sysroot",
     targets = ["linux-aarch64"],
+)
+llvm.sysroot(
+    name = "llvm_toolchain",
+    label = "@sysroot_linux_armv7//:sysroot",
+    targets = ["linux-armv7"],
 )
 use_repo(llvm, "llvm_toolchain")
 

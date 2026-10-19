@@ -62,6 +62,7 @@ fn report_of(
         key: station_key().to_base64(),
         online: true,
         connected: true,
+        connected_since_ms: Some(NOW_MS - 3_600_000),
         sessions: 2,
         first_seen_ms: NOW_MS - 3_600_000,
         last_seen_ms: NOW_MS - 1_000,
@@ -271,6 +272,50 @@ fn the_network_and_station_answers_are_the_fixtures() -> Result<(), String> {
         &bare.station(&station_key()).ok_or("no station")?,
         fixtures::STATION_BARE,
     )?;
+    // Connected two minutes ago, its decoder silent: the relay has forwarded no batch of it.
+    let connected_ms = NOW_MS - 120_000;
+    let silent = Stations::from_report(
+        StationsReport {
+            now_ms: NOW_MS,
+            stations: vec![StationReport {
+                key: station_key().to_base64(),
+                online: false,
+                connected: true,
+                connected_since_ms: Some(connected_ms),
+                sessions: 0,
+                first_seen_ms: connected_ms,
+                last_seen_ms: connected_ms,
+                batches: 0,
+                gaps: 0,
+                observations: 0,
+                location: None,
+                software: Some("tally-feed 0.3.0".to_owned()),
+                address: None,
+            }],
+        },
+        None,
+    );
+    same(
+        &silent.station(&station_key()).ok_or("no station")?,
+        fixtures::STATION_SILENT,
+    )?;
+    // Fed, then left: last forwarded ten minutes ago, no longer connected.
+    let mut left = report(place, Some("tally-feed 0.3.1"));
+    left.online = false;
+    left.connected = false;
+    left.connected_since_ms = None;
+    left.last_seen_ms = NOW_MS - 600_000;
+    let offline = Stations::from_report(
+        StationsReport {
+            now_ms: NOW_MS,
+            stations: vec![left],
+        },
+        None,
+    );
+    same(
+        &offline.station(&station_key()).ok_or("no station")?,
+        fixtures::STATION_OFFLINE,
+    )?;
     let home: std::net::IpAddr = "203.0.113.7".parse().map_err(|_| "not an address")?;
     same(&located.mine(Some(home)), fixtures::ME)
 }
@@ -284,6 +329,70 @@ fn the_routeset_answer_is_the_fixture() -> Result<(), String> {
         &crate::vrs::routes_of(&crate::vrs::tests::standing(), &asked.planes),
         fixtures::ROUTESET,
     )
+}
+
+/// Every number in `value`, wherever it sits.
+fn numbers(value: &serde_json::Value, into: &mut Vec<f64>) {
+    match value {
+        serde_json::Value::Number(number) => into.extend(number.as_f64()),
+        serde_json::Value::Array(items) => items.iter().for_each(|item| numbers(item, into)),
+        serde_json::Value::Object(fields) => fields.values().for_each(|item| numbers(item, into)),
+        _ => {}
+    }
+}
+
+/// No public answer that names a station carries its exact place: the station answer and the
+/// network's, as the API writes them, hold neither coordinate the receiver declared, and the
+/// API holds no exact place once it has read the relay's report.
+#[test]
+fn no_public_answer_carries_a_receivers_exact_place() -> Result<(), String> {
+    let (lat, lon) = (37.512_345_6, -122.251_234_5);
+    let stations = Stations::from_report(
+        StationsReport {
+            now_ms: NOW_MS,
+            stations: vec![report(
+                Some(StationLocation {
+                    lat,
+                    lon,
+                    alt_m: 10,
+                    precision_m: 0,
+                }),
+                Some("tally-feed 0.3.1"),
+            )],
+        },
+        None,
+    );
+    let station = stations.station(&station_key()).ok_or("no station")?;
+    let pin = station.location.ok_or("no pin")?;
+    let mut written = Vec::new();
+    numbers(
+        &serde_json::to_value(&station).map_err(|e| e.to_string())?,
+        &mut written,
+    );
+    numbers(
+        &serde_json::to_value(stations.network(SourceCounts::default()))
+            .map_err(|e| e.to_string())?,
+        &mut written,
+    );
+    for exact in [lat, lon] {
+        assert!(!written.contains(&exact), "{exact} served");
+    }
+    // Near it: inside its 0.05 degree cell.
+    assert!(
+        (pin.lat - lat).abs() < 0.05 && (pin.lon - lon).abs() < 0.07,
+        "{pin:?}"
+    );
+    assert!(stations.by_key.values().all(|held| held.location.is_none()));
+    // The fixtures say the same of theirs: the place they were made from is not in them.
+    for fixture in [fixtures::STATION, fixtures::STATION_OFFLINE] {
+        let mut served = Vec::new();
+        numbers(
+            &serde_json::from_str(fixture).map_err(|e| e.to_string())?,
+            &mut served,
+        );
+        assert!(!served.contains(&37.5) && !served.contains(&-122.25));
+    }
+    Ok(())
 }
 
 /// The feeder figures and boards the fixtures are: the feeders module's own records (two located

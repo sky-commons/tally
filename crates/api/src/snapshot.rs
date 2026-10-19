@@ -13,6 +13,7 @@ use tally_wire::PublicKey;
 
 use tally_api_types::{
     Aircraft, MeResponse, MeStation, Network, Position, PositionSource, SourceCounts, Station,
+    StationState,
 };
 
 use crate::feeders::Board;
@@ -28,7 +29,13 @@ pub const STALE_AFTER: Duration = Duration::from_secs(60);
 /// the API's own, the change in its forwarded observations since the previous report.
 pub struct Stations {
     pub now_ms: u64,
+    /// The relay's reports, each without its place (`location` is always `None` here): the API
+    /// holds no receiver's exact place, only its public pin (`places`).
     pub by_key: HashMap<PublicKey, StationReport>,
+    /// Where the API may say each receiver is (`privacy::public_location`): about 5 km from its
+    /// place, or absent when it declares none. Every receiver place the API serves, or
+    /// computes a served figure from, is read here.
+    pub places: HashMap<PublicKey, Position>,
     /// Observations a second, per station, between the previous report and this one.
     pub rates: HashMap<PublicKey, f64>,
     pub online: u32,
@@ -42,13 +49,26 @@ impl Stations {
     /// restarted).
     pub fn from_report(report: StationsReport, previous: Option<&Self>) -> Self {
         let mut by_key = HashMap::with_capacity(report.stations.len());
-        for station in report.stations {
+        let mut places = HashMap::new();
+        for mut station in report.stations {
             // A key the relay printed is always one; one that is not is skipped, not trusted.
             if let Ok(key) = PublicKey::from_base64(&station.key) {
+                // The one door a receiver's place comes in by: blurred here, the exact place
+                // dropped.
+                if let Some(pin) = crate::privacy::public_location(&key, &station) {
+                    places.insert(key, pin);
+                }
+                station.location = None;
                 by_key.insert(key, station);
             }
         }
         let online = by_key.values().filter(|station| station.online).count();
+        // The network's receivers are those that have fed: a connection with nothing forwarded
+        // is a station of its own page, not one of the network's.
+        let total = by_key
+            .values()
+            .filter(|station| station.batches > 0)
+            .count();
         let rates: HashMap<PublicKey, f64> = by_key
             .iter()
             .map(|(key, station)| {
@@ -74,10 +94,11 @@ impl Stations {
         Self {
             now_ms: report.now_ms,
             online: saturating_u32(online),
-            total: saturating_u32(by_key.len()),
+            total: saturating_u32(total),
             messages_per_sec,
             rates,
             by_key,
+            places,
         }
     }
 
@@ -86,15 +107,14 @@ impl Stations {
             now_ms: self.now_ms,
             key: report.key.clone(),
             online: report.online,
+            state: state_of(report),
+            connected_since_at_ms: report.connected_since_ms,
             first_seen_at_ms: report.first_seen_ms,
             last_seen_at_ms: report.last_seen_ms,
             messages_per_sec: self.rates.get(key).copied().unwrap_or(0.0),
             batches: report.batches,
             gaps: report.gaps,
-            location: report.location.map(|location| Position {
-                lat: location.lat,
-                lon: location.lon,
-            }),
+            location: self.places.get(key).copied(),
             software: report.software.clone(),
         })
     }
@@ -153,6 +173,18 @@ impl Stations {
             aircraft: total(&aircraft),
             aircraft_by_source: aircraft,
         }
+    }
+}
+
+/// What a station is doing, from the relay's report: feeding while a batch of it was forwarded
+/// recently, else silent while a feeder connection of it is open, else offline.
+pub fn state_of(report: &StationReport) -> StationState {
+    if report.online {
+        StationState::Feeding
+    } else if report.connected {
+        StationState::Silent
+    } else {
+        StationState::Offline
     }
 }
 
@@ -271,6 +303,7 @@ mod tests {
             key: key.to_base64(),
             online,
             connected: online,
+            connected_since_ms: online.then_some(1),
             sessions: 1,
             first_seen_ms: 1,
             last_seen_ms: 2,
@@ -452,17 +485,91 @@ mod tests {
         );
         let station = stations.station(&a).ok_or("no station")?;
         assert_eq!(
-            (station.key, station.batches, station.gaps, station.location),
-            (
-                a.to_base64(),
-                3,
-                4,
-                Some(Position {
-                    lat: 37.5,
-                    lon: -122.25
-                })
-            )
+            (station.key.clone(), station.batches, station.gaps),
+            (a.to_base64(), 3, 4)
         );
+        // Served at its public pin, never its place.
+        let pin = station.location.ok_or("no pin")?;
+        assert!(pin.lat != 37.5 && pin.lon != -122.25, "{pin:?}");
+        assert!((pin.lat - 37.5).abs() < 0.05 && (pin.lon - -122.25).abs() < 0.07);
+        assert!(
+            stations
+                .by_key
+                .values()
+                .all(|report| report.location.is_none())
+        );
+        Ok(())
+    }
+
+    /// A station is feeding while a batch of it was forwarded recently, wherever it is connected;
+    /// silent while connected with none; offline otherwise. One connected that never fed is
+    /// served, placed nowhere, and is not one of the network's receivers.
+    #[test]
+    fn a_stations_state_is_feeding_silent_or_offline() -> Result<(), String> {
+        let feeding = Identity::generate().map_err(|e| e.to_string())?.public();
+        let elsewhere = Identity::generate().map_err(|e| e.to_string())?.public();
+        let quiet = Identity::generate().map_err(|e| e.to_string())?.public();
+        let silent = Identity::generate().map_err(|e| e.to_string())?.public();
+        let gone = Identity::generate().map_err(|e| e.to_string())?.public();
+        let mut through_another = report(&elsewhere, true, 10);
+        through_another.connected = false;
+        through_another.connected_since_ms = None;
+        let mut went_quiet = report(&quiet, false, 10);
+        went_quiet.connected = true;
+        went_quiet.connected_since_ms = Some(1);
+        let never_fed = StationReport {
+            key: silent.to_base64(),
+            online: false,
+            connected: true,
+            connected_since_ms: Some(7_000),
+            sessions: 0,
+            first_seen_ms: 7_000,
+            last_seen_ms: 7_000,
+            batches: 0,
+            gaps: 0,
+            observations: 0,
+            location: None,
+            software: Some("tally-feed 0.3.0".to_owned()),
+            address: None,
+        };
+        let stations = Stations::from_report(
+            StationsReport {
+                now_ms: 9_000,
+                stations: vec![
+                    report(&feeding, true, 10),
+                    through_another,
+                    went_quiet,
+                    never_fed,
+                    report(&gone, false, 10),
+                ],
+            },
+            None,
+        );
+        let state = |key| stations.station(key).map(|station| station.state);
+        assert_eq!(state(&feeding), Some(StationState::Feeding));
+        assert_eq!(state(&elsewhere), Some(StationState::Feeding));
+        assert_eq!(state(&quiet), Some(StationState::Silent));
+        assert_eq!(state(&silent), Some(StationState::Silent));
+        assert_eq!(state(&gone), Some(StationState::Offline));
+        let never = stations.station(&silent).ok_or("no silent station")?;
+        assert_eq!(
+            (
+                never.connected_since_at_ms,
+                never.first_seen_at_ms,
+                never.batches,
+                never.location
+            ),
+            (Some(7_000), 7_000, 0, None)
+        );
+        assert_eq!(
+            stations
+                .station(&gone)
+                .ok_or("no gone station")?
+                .connected_since_at_ms,
+            None
+        );
+        let network = stations.network(SourceCounts::default());
+        assert_eq!((network.receivers_online, network.receivers_total), (2, 4));
         Ok(())
     }
 

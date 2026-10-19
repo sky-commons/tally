@@ -35,6 +35,7 @@ pub mod config;
 pub mod feeders;
 pub mod limit;
 pub mod mlat;
+pub mod privacy;
 pub mod readsb;
 pub mod routes;
 pub mod snapshot;
@@ -208,29 +209,29 @@ impl App {
 }
 
 impl App {
-    /// Computes the feeder figures and leaderboards now, over where the relay's stations say each
-    /// receiver is (from its own signed description) and the merge's standing.
+    /// Computes the feeder figures and leaderboards now, over where the API may say each receiver
+    /// is (its public pin, `privacy::public_location`, from its own signed description) and the
+    /// merge's standing: a figure that places a feeder (its area, its range) is computed from the
+    /// pin anyone may read, never the exact place.
     pub fn compute_board(&self) {
-        let locations: Vec<(tally_wire::PublicKey, feeders::LatLon)> = self
-            .snapshot
-            .stations(Instant::now())
-            .map(|stations| {
+        // `None` while the stations are not known: the places held stay. Known, they replace them,
+        // so a receiver that stops declaring a place loses it.
+        let locations: Option<Vec<(tally_wire::PublicKey, feeders::LatLon)>> =
+            self.snapshot.stations(Instant::now()).map(|stations| {
                 stations
-                    .by_key
+                    .places
                     .iter()
-                    .filter_map(|(key, report)| {
-                        let at = report.location?;
-                        Some((
+                    .map(|(key, pin)| {
+                        (
                             *key,
                             feeders::LatLon {
-                                lat: at.lat,
-                                lon: at.lon,
+                                lat: pin.lat,
+                                lon: pin.lon,
                             },
-                        ))
+                        )
                     })
                     .collect()
-            })
-            .unwrap_or_default();
+            });
         let standing = self
             .standing
             .read()
@@ -239,7 +240,7 @@ impl App {
         let Ok(mut ledger) = self.feeders.lock() else {
             return;
         };
-        if !locations.is_empty() {
+        if let Some(locations) = locations {
             ledger.locate(locations);
         }
         let board = ledger.board(routes::wall_ms(), |key| standing.contains(key));

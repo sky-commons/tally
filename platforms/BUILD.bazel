@@ -1,10 +1,22 @@
 # The platforms Tally ships for (RFC-0171 §10 step 6): a feeder on a Raspberry Pi or any 64-bit ARM
-# Linux, and x86_64 Linux. `bazel build --platforms=//platforms:linux_aarch64 //...`
-# cross-compiles with the pinned LLVM and sysroot of the public module.
+# Linux, and x86_64 Linux; and the feeder alone on 32-bit ARM (armv7 hard-float: 32-bit Raspberry
+# Pi OS on a Pi 2 or later, and the PiAware image). `bazel build
+# --platforms=//platforms:linux_aarch64 //...` cross-compiles with the pinned LLVM and sysroot of
+# the public module.
 platform(
     name = "linux_aarch64",
     constraint_values = [
         "@platforms//cpu:aarch64",
+        "@platforms//os:linux",
+    ],
+)
+
+# ARMv7 with VFP and hard-float calls, glibc: Rust's armv7-unknown-linux-gnueabihf. Not ARMv6, so
+# not a Pi 1 or Pi Zero (the first): those are what Debian's armhf excludes too.
+platform(
+    name = "linux_armv7",
+    constraint_values = [
+        "@platforms//cpu:armv7",
         "@platforms//os:linux",
     ],
 )
