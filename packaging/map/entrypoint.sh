@@ -15,6 +15,15 @@
 #   TALLY_MAP_HISTORY_DAYS  days of globe history kept, once each is archived (default 8)
 #   TALLY_MAP_IPV6        on or off: nginx also listens on [::]:8080 (default on where the
 #                         container has IPv6, /proc/net/if_inet6)
+#   TALLY_MAP_MAX_UPLOAD  required: the most nginx sends a second, all clients together, as
+#                         tally-relay's --max-upload takes it (6Mbit/s, 500kB/s, 1MiB/s)
+#   TALLY_MAP_CLIENT_IP_HEADER  the header a trusted proxy names the client in (CF-Connecting-IP);
+#                         unset, each client is the address it connects from
+#   TALLY_MAP_TRUSTED_PROXIES  the proxies whose header is believed, CIDRs or addresses separated
+#                         by commas or spaces; set exactly when TALLY_MAP_CLIENT_IP_HEADER is
+#   TALLY_MAP_ARCHIVE_PUBLIC  on or off: /archive/ is open to anyone (default on); off, only to a
+#                         request carrying the token
+#   TALLY_MAP_ARCHIVE_TOKEN_FILE  a file holding that token, required when the archive is off
 set -euo pipefail
 
 fail() {
@@ -157,6 +166,157 @@ on) echo "listen [::]:8080 default_server;" >/run/tally-map/listen-ipv6.conf ;;
 off) : >/run/tally-map/listen-ipv6.conf ;;
 *) fail "TALLY_MAP_IPV6 is '$ipv6'; it is on or off" ;;
 esac
+
+# rate_bytes RATE: RATE in bytes a second, as tally-relay's --max-upload reads it: 6Mbit/s, 2MB/s,
+# 500kbit/s, 1.5Gbit/s, or the binary KiB/s, MiB/s and GiB/s; kB, MB, GB and the bit units are
+# decimal, as hosts and links state them. Rounded down, so it never reads more than was stated.
+rate_bytes() {
+	local whole fraction unit scale divisor=1000
+	[[ "$1" =~ ^([0-9]{1,6})(\.([0-9]{1,3}))?(kbit|Mbit|Gbit|kB|KB|MB|GB|KiB|MiB|GiB)/s$ ]] ||
+		return 1
+	whole="${BASH_REMATCH[1]}"
+	fraction="${BASH_REMATCH[3]}000"
+	fraction="${fraction:0:3}"
+	unit="${BASH_REMATCH[4]}"
+	case "$unit" in
+	kbit) scale=1000 divisor=8000 ;;
+	Mbit) scale=1000000 divisor=8000 ;;
+	Gbit) scale=1000000000 divisor=8000 ;;
+	kB | KB) scale=1000 ;;
+	MB) scale=1000000 ;;
+	GB) scale=1000000000 ;;
+	KiB) scale=1024 ;;
+	MiB) scale=1048576 ;;
+	GiB) scale=1073741824 ;;
+	esac
+	echo $(((10#$whole * 1000 + 10#$fraction) * scale / divisor))
+}
+
+# What nginx sends is bounded by one figure the operator states, TALLY_MAP_MAX_UPLOAD, the ceiling.
+# nginx has no shared budget of bytes: limit_rate holds one response to a rate, and limit_conn
+# holds a zone to a number of responses at once. So every response nginx sends is in one class
+# below, and each class is a zone keyed on a constant (every client together) holding it to its
+# slots, each response sent at the class's rate: a class sends at most slots x rate, and the
+# classes' shares add up to the ceiling, so all of them together never send more than the ceiling
+# (plus each response's first second, which nginx's limit_rate lets out at once). The rates are
+# rounded down. The cost of a hard ceiling is that a response is held to its slot's rate even
+# when the others are idle.
+#
+#   class    serves                 share  slots  a slot's rate  one client at once
+#   live     /data/, and the page   8/16   8      ceiling/16     4 (of /data/)
+#   history  /globe_history/        4/16   4      ceiling/16     2
+#   archive  /archive/              4/16   2      ceiling/8      1
+#
+# The page (tar1090's own files) has no per-client limit, since a browser asks for its files all at
+# once and one refused breaks the page; its files are fixed, cacheable for two weeks, and share the
+# live class's slots. Every client is also held to 20 requests a second over /data/,
+# /globe_history/ and /archive/, with 40 more queued (nginx.conf's client_req): what one map page
+# asks, not a figure of bytes, so it does not move with the ceiling.
+max_upload="${TALLY_MAP_MAX_UPLOAD:-}"
+[[ -n "$max_upload" ]] ||
+	fail "TALLY_MAP_MAX_UPLOAD is unset; it is the most the map sends a second, as tally-relay's --max-upload takes it (README.md)"
+ceiling="$(rate_bytes "$max_upload")" ||
+	fail "TALLY_MAP_MAX_UPLOAD is '$max_upload'; it is a rate such as 6Mbit/s or 500kB/s (kbit, Mbit, Gbit, kB, MB, GB, KiB, MiB or GiB, a second)"
+live_slots=8 history_slots=4 archive_slots=2
+live_rate=$((ceiling * 8 / 16 / live_slots))
+history_rate=$((ceiling * 4 / 16 / history_slots))
+archive_rate=$((ceiling * 4 / 16 / archive_slots))
+# limit_rate 0 is no limit at all, so a rate that rounds to nothing is refused, never written.
+((live_rate > 0 && history_rate > 0 && archive_rate > 0)) ||
+	fail "TALLY_MAP_MAX_UPLOAD is '$max_upload'; it is too small to share, at least 16 bytes a second"
+echo "tally-map: sending at most $ceiling bytes a second: live ${live_slots}x$live_rate," \
+	"history ${history_slots}x$history_rate, archive ${archive_slots}x$archive_rate" >&2
+
+# Who a client is: the address it connects from, or, from a trusted proxy, the address its header
+# names (nginx's realip). A client reaching nginx directly cannot name itself, since the header is
+# read only from the proxies named.
+client_header="${TALLY_MAP_CLIENT_IP_HEADER:-}"
+trusted="${TALLY_MAP_TRUSTED_PROXIES:-}"
+realip=""
+if [[ -n "$client_header" || -n "$trusted" ]]; then
+	[[ "$client_header" =~ ^[A-Za-z0-9-]+$ ]] ||
+		fail "TALLY_MAP_CLIENT_IP_HEADER is '$client_header'; it is a header name, such as CF-Connecting-IP, set with TALLY_MAP_TRUSTED_PROXIES"
+	read -r -a proxies <<<"${trusted//,/ }"
+	((${#proxies[@]} > 0)) ||
+		fail "TALLY_MAP_TRUSTED_PROXIES is unset; it names the proxies whose $client_header is believed"
+	for proxy in "${proxies[@]}"; do
+		[[ "$proxy" =~ ^[0-9A-Fa-f:.]+(/[0-9]{1,3})?$ ]] ||
+			fail "TALLY_MAP_TRUSTED_PROXIES holds '$proxy'; it is a list of CIDRs or addresses"
+		realip+="set_real_ip_from $proxy;"$'\n'
+	done
+	realip+="real_ip_header $client_header;"
+fi
+
+# The archive's gate. Open, anyone may fetch it, and shared caches may keep it. Closed, a request
+# is answered 404 unless it carries `Authorization: Bearer TOKEN`, and the answers are private, so
+# no shared cache keeps one for another client. nginx compares the token as a regular expression
+# does, not in constant time; the token is long and random, so what its timing could tell is
+# nothing a client can act on.
+archive_public="${TALLY_MAP_ARCHIVE_PUBLIC:-on}"
+token_file="${TALLY_MAP_ARCHIVE_TOKEN_FILE:-}"
+case "$archive_public" in
+on)
+	[[ -z "$token_file" ]] ||
+		fail "TALLY_MAP_ARCHIVE_TOKEN_FILE is set but the archive is public; set TALLY_MAP_ARCHIVE_PUBLIC=off to close it"
+	archive_gate="map \$host \$archive_token_ok { default 1; }"
+	archive_scope=public
+	;;
+off)
+	[[ -n "$token_file" ]] ||
+		fail "TALLY_MAP_ARCHIVE_PUBLIC is off; TALLY_MAP_ARCHIVE_TOKEN_FILE names the file holding the token that opens it"
+	[[ -r "$token_file" ]] || fail "TALLY_MAP_ARCHIVE_TOKEN_FILE $token_file is not readable by uid $(id -u)"
+	token="$(<"$token_file")"
+	[[ "$token" =~ ^[A-Za-z0-9_-]{32,}$ ]] ||
+		fail "TALLY_MAP_ARCHIVE_TOKEN_FILE holds no token: one line of at least 32 letters, digits, _ or - (openssl rand -hex 32)"
+	archive_gate="map \$http_authorization \$archive_token_ok { default 0; \"~^Bearer $token\$\" 1; }"
+	archive_scope=private
+	;;
+*) fail "TALLY_MAP_ARCHIVE_PUBLIC is '$archive_public'; it is on or off" ;;
+esac
+
+# The limits, as nginx.conf includes them: the zones, who a client is and the archive's gate in
+# the http block, and each class's limits in the locations it serves. The token is in the gate,
+# so the file is the image user's alone.
+(
+	umask 077
+	cat >/run/tally-map/limits.conf.new <<-EOF
+		# Written by the tally-map image at start, from its environment (entrypoint.sh).
+		map \$host \$everyone { default all; }
+		limit_conn_zone \$everyone zone=live:1m;
+		limit_conn_zone \$everyone zone=history:1m;
+		limit_conn_zone \$everyone zone=archive:1m;
+		limit_conn_zone \$binary_remote_addr zone=client_live:10m;
+		limit_conn_zone \$binary_remote_addr zone=client_history:10m;
+		limit_conn_zone \$binary_remote_addr zone=client_archive:10m;
+		limit_req_zone \$binary_remote_addr zone=client_req:10m rate=20r/s;
+		$realip
+		$archive_gate
+		map \$host \$archive_scope { default $archive_scope; }
+	EOF
+	mv /run/tally-map/limits.conf.new /run/tally-map/limits.conf
+)
+cat >/run/tally-map/class-page.conf <<EOF
+limit_conn live $live_slots;
+limit_rate $live_rate;
+EOF
+cat >/run/tally-map/class-live.conf <<EOF
+limit_conn live $live_slots;
+limit_conn client_live 4;
+limit_req zone=client_req burst=40;
+limit_rate $live_rate;
+EOF
+cat >/run/tally-map/class-history.conf <<EOF
+limit_conn history $history_slots;
+limit_conn client_history 2;
+limit_req zone=client_req burst=40;
+limit_rate $history_rate;
+EOF
+cat >/run/tally-map/class-archive.conf <<EOF
+limit_conn archive $archive_slots;
+limit_conn client_archive 1;
+limit_req zone=client_req burst=40;
+limit_rate $archive_rate;
+EOF
 
 # A JavaScript string literal of $1: backslashes and quotes escaped, and no control character,
 # which could end the literal or the line.

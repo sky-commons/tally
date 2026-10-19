@@ -16,14 +16,16 @@ relay host's network. Beside a relay started with `--beast-out 127.0.0.1:30105`:
 
 ```sh
 docker run -d --name tally-map --restart unless-stopped --network host --stop-timeout 30 \
-  -e TALLY_MAP_API=https://api.example.org \
+  -e TALLY_MAP_MAX_UPLOAD=2Mbit/s -e TALLY_MAP_API=https://api.example.org \
   -v tally-map:/var/globe_history --tmpfs /run/readsb:uid=100,gid=65534 \
   ghcr.io/sky-commons/tally-map:vX.Y.Z
 ```
 
 `--stop-timeout 30` gives readsb time to write its state on the way down. `/run/readsb` is where
 readsb rewrites its live JSON every second; a tmpfs (memory, owned by the image's user, uid 100)
-keeps those writes off the disk. The map is then at `http://HOST:8080/`. Put it behind the host's TLS proxy to publish it.
+keeps those writes off the disk. `TALLY_MAP_MAX_UPLOAD` is required: the most the map sends a
+second (below, "What it sends"). The map is then at `http://HOST:8080/`. Put it behind the host's
+TLS proxy to publish it.
 
 The relay and the API run from the release's binaries (the top-level README, "Run a relay" and
 "Run the API"); there is no image of either yet. With compose, the map beside them on the same
@@ -39,6 +41,7 @@ services:
     environment:
       TALLY_MAP_BEAST: 127.0.0.1:30105 # tally-relay --beast-out 127.0.0.1:30105
       TALLY_MAP_API: https://api.example.org # tally-api, for routes
+      TALLY_MAP_MAX_UPLOAD: 2Mbit/s # the most the map sends a second, all visitors together
     volumes:
       - tally-map:/var/globe_history
     tmpfs:
@@ -66,15 +69,85 @@ gh attestation verify oci://ghcr.io/sky-commons/tally-map:vX.Y.Z --repo sky-comm
 
 ## Settings
 
-| Variable                 | Default           | What it is                                                                                                                                       |
-| ------------------------ | ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `TALLY_MAP_BEAST`        | `127.0.0.1:30105` | The relay's `--beast-out`, `HOST:PORT` (or readsb's `HOST,PORT`). readsb dials it and redials every 5 s while it is down.                        |
-| `TALLY_MAP_TITLE`        | `Tally`           | The page's title.                                                                                                                                |
-| `TALLY_MAP_API`          | unset             | The `tally-api` origin (`https://host[:port]`, no path). The map asks it for routes at `/api/0/routeset`. Unset, routes are off.                 |
-| `TALLY_MAP_READSB_API`   | `127.0.0.1:30152` | Where readsb's query API listens, which `tally-api --readsb http://127.0.0.1:30152` reads. Keep it on loopback: it is unauthenticated.           |
-| `TALLY_MAP_JSON_EVERY`   | `1`               | Seconds between readsb's writes of its JSON and its API's updates. `tally-api`'s streams want `0.2` (the top-level README, "Run the API").       |
-| `TALLY_MAP_HISTORY_DAYS` | `8`               | Days of globe history kept (below). A day older is deleted once it is archived, never before; the map's history and heatmap reach back this far. |
-| `TALLY_MAP_IPV6`         | on with IPv6      | `on` or `off`: nginx also listens on `[::]:8080`. On by default where the container has IPv6 (`/proc/net/if_inet6`), off where it has none.      |
+| Variable                       | Default           | What it is                                                                                                                                       |
+| ------------------------------ | ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `TALLY_MAP_BEAST`              | `127.0.0.1:30105` | The relay's `--beast-out`, `HOST:PORT` (or readsb's `HOST,PORT`). readsb dials it and redials every 5 s while it is down.                        |
+| `TALLY_MAP_TITLE`              | `Tally`           | The page's title.                                                                                                                                |
+| `TALLY_MAP_API`                | unset             | The `tally-api` origin (`https://host[:port]`, no path). The map asks it for routes at `/api/0/routeset`. Unset, routes are off.                 |
+| `TALLY_MAP_READSB_API`         | `127.0.0.1:30152` | Where readsb's query API listens, which `tally-api --readsb http://127.0.0.1:30152` reads. Keep it on loopback: it is unauthenticated.           |
+| `TALLY_MAP_JSON_EVERY`         | `1`               | Seconds between readsb's writes of its JSON and its API's updates. `tally-api`'s streams want `0.2` (the top-level README, "Run the API").       |
+| `TALLY_MAP_HISTORY_DAYS`       | `8`               | Days of globe history kept (below). A day older is deleted once it is archived, never before; the map's history and heatmap reach back this far. |
+| `TALLY_MAP_IPV6`               | on with IPv6      | `on` or `off`: nginx also listens on `[::]:8080`. On by default where the container has IPv6 (`/proc/net/if_inet6`), off where it has none.      |
+| `TALLY_MAP_MAX_UPLOAD`         | required          | The most nginx sends a second, every visitor together: a rate as `tally-relay --max-upload` takes it (`2Mbit/s`, `250kB/s`, `1MiB/s`). Below.    |
+| `TALLY_MAP_CLIENT_IP_HEADER`   | unset             | The header a proxy in front names each visitor in (`CF-Connecting-IP` behind Cloudflare). Unset, a visitor is the address it connects from.      |
+| `TALLY_MAP_TRUSTED_PROXIES`    | unset             | The proxies whose header is believed: CIDRs or addresses, separated by commas or spaces. Set exactly when `TALLY_MAP_CLIENT_IP_HEADER` is.       |
+| `TALLY_MAP_ARCHIVE_PUBLIC`     | `on`              | `on` or `off`: `/archive/` is open to anyone. Off, it answers 404 to any request without the token below.                                        |
+| `TALLY_MAP_ARCHIVE_TOKEN_FILE` | unset             | A file holding that token (one line of at least 32 letters, digits, `_` or `-`: `openssl rand -hex 32`), readable by uid 100. Required when off. |
+
+## What it sends
+
+Everything the map sends is bounded by one figure, `TALLY_MAP_MAX_UPLOAD`, the ceiling: the map
+sends no more than that a second, whatever its visitors ask, so its month is at most the ceiling
+times 2,678,400 (the seconds in 31 days), plus a second's burst on each response. `2Mbit/s` is at
+most 670 GB in 31 days. It takes the same units as the relay's `--max-upload` (bits a second as
+links are stated, bytes a second, or the binary units), so the two caps of one host add up in the
+same terms against its plan: on the top-level README's Lightsail example, the relay's `6Mbit/s` and
+the map's `2Mbit/s` are at most 2.68 TB of the plan's 3 TB, leaving about 0.3 TB for what comes in.
+
+nginx has no shared budget of bytes. It can hold one response to a rate (`limit_rate`) and a group
+of responses to a number at once (`limit_conn`). So the image puts every response in one of three
+classes, each a number of slots at a rate, and derives every slot's rate from the ceiling at start
+(rounded down, and printed in the container's log):
+
+| Class   | Serves                             | Share of the ceiling | Slots, all visitors | A slot's rate | One visitor at once |
+| ------- | ---------------------------------- | -------------------- | ------------------- | ------------- | ------------------- |
+| live    | `/data/`, and the page's own files | half                 | 8                   | ceiling / 16  | 4 (of `/data/`)     |
+| history | `/globe_history/`                  | a quarter            | 4                   | ceiling / 16  | 2                   |
+| archive | `/archive/`                        | a quarter            | 2                   | ceiling / 8   | 1                   |
+
+The slots times the rates add up to the ceiling, so all of them together cannot send more. At
+`2Mbit/s` (250,000 bytes a second), a live or history response goes at 15,625 bytes a second and an
+archive at 31,250; at `8Mbit/s`, four times that. The cost of a hard ceiling is that a response
+keeps to its slot's rate even when the other slots are idle.
+
+A request that finds its class's slots taken, or its visitor's share of them, is answered `503`;
+a visitor asking more than 20 requests a second over `/data/`, `/globe_history/` and `/archive/`
+(with 40 more queued) is answered `429`, a figure of what one map page asks, not of bytes, so it
+does not move with the ceiling. Each says when to come back in `Retry-After` (1 s for the page and
+`/data/`, 5 s for the history, 60 s for an archive). The page's own files have no per-visitor
+limit, since a browser asks for them all at once and one refused breaks the page; they are fixed,
+and a caching proxy keeps them two weeks (`Cache-Control`), so few reach the map. A request refused
+before it is served (a limit's answer, a closed archive's 404) is an error page of a couple of
+hundred bytes, no larger than the request.
+
+**Who a visitor is.** Behind a proxy every request comes from the proxy's address, so every
+visitor would share one visitor's limits. `TALLY_MAP_CLIENT_IP_HEADER` names the header the proxy
+puts the visitor's address in, and `TALLY_MAP_TRUSTED_PROXIES` the proxies believed (nginx's
+`realip`): a request from anywhere else is the address it comes from, whatever header it carries.
+Behind a Cloudflare tunnel, `cloudflared` on the same host connects from loopback:
+
+```sh
+-e TALLY_MAP_CLIENT_IP_HEADER=CF-Connecting-IP -e TALLY_MAP_TRUSTED_PROXIES=127.0.0.1,::1
+```
+
+A visitor is one address; an IPv6 visitor holding a whole /64 can be many, but no more than the
+ceiling between them.
+
+**Closing the archive.** A release job needs the archives; nobody else need fetch them from the
+map's public name. With `TALLY_MAP_ARCHIVE_PUBLIC=off`, `/archive/` answers 404 (cached by nobody)
+unless the request carries `Authorization: Bearer TOKEN`, the token in
+`TALLY_MAP_ARCHIVE_TOKEN_FILE`, and what it serves is `Cache-Control: private`, so no shared cache
+keeps it for another visitor:
+
+```sh
+openssl rand -hex 32 > archive-token && chmod 644 archive-token
+docker run ... -e TALLY_MAP_ARCHIVE_PUBLIC=off -e TALLY_MAP_ARCHIVE_TOKEN_FILE=/run/secrets/archive-token \
+  -v "$PWD/archive-token:/run/secrets/archive-token:ro" ...
+curl -sO -H "Authorization: Bearer $(cat archive-token)" https://map.example.org/archive/2026-10-18.tar
+```
+
+nginx compares the token as a regular expression does, not in constant time; a token of 64 random
+characters leaves its timing nothing worth telling.
 
 ## Ports and storage
 
@@ -116,7 +189,9 @@ the relay's host:
 - The newest 7 are kept; older ones are deleted. A day's history is deleted only once it is
   archived and older than `TALLY_MAP_HISTORY_DAYS`.
 - nginx serves them at `/archive/`: the directory listing (cached a minute) names the days on hand,
-  and each `.tar` and `.sha256` is cached two weeks, since it never changes once named.
+  and each `.tar` and `.sha256` is cached two weeks, since it never changes once named. Two are
+  sent at once, one to a visitor, each at an eighth of the ceiling (above, "What it sends"), and
+  `TALLY_MAP_ARCHIVE_PUBLIC=off` keeps them to a release job holding the token.
 
 ```sh
 curl -s http://HOST:8080/archive/                    # the days on hand
