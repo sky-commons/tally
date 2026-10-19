@@ -1,12 +1,16 @@
-# A release (RFC-0180 §4): a tag vX.Y.Z builds the feeder, the relay and the API for both platforms,
-# optimised and against the pinned sysroot, tests them, and publishes them on the tag's GitHub
+# A release (RFC-0180 §4): a tag vX.Y.Z builds the feeder, the relay and the API for x86_64 and
+# aarch64, and the feeder alone for armv7 (32-bit Raspberry Pi OS, the PiAware image), optimised
+# and against the pinned sysroots, tests them, and publishes them on the tag's GitHub
 # release with the systemd units, the seed list and the installer (its PUBLISHED_RELEASE written to
 # this release), each with its .sha256, a cosign keyless signature bundle (.sigstore.json, the
 # identity this workflow on this repository's tag) and the build's provenance attestation. It then
-# pushes the feeder's container image (packaging/container/Dockerfile), for amd64 and arm64, built
-# from those same binaries, to ghcr.io/sky-commons/tally-feed:<tag>, signs its digest the same way,
-# attests its provenance in the registry, and names the digest in the release (tally-feed-image.txt
-# and the notes), so a host that pins the image by digest pins what this release built. The map
+# pushes the feeder's container image (packaging/container/Dockerfile), for amd64, arm64 and
+# arm/v7, built from those same binaries, to ghcr.io/sky-commons/tally-feed:<tag> and to its major
+# tag (:0 for every 0.x release, :1 for 1.x), signs its digest the same way, attests its
+# provenance in the registry, and names the digest in the release (tally-feed-image.txt and the
+# notes), so a host that pins the image by digest pins what this release built. Both tags name
+# the one digest, so the one signature and attestation cover both; the major tag moves to each
+# new release of its major, which is what a compose file that names it follows. The map
 # bundle (packaging/map/Dockerfile, RFC-0187 §1) is built, pushed to
 # ghcr.io/sky-commons/tally-map:<tag>, signed, attested and named (tally-map-image.txt) the same way.
 #
@@ -19,6 +23,7 @@
 #
 # Check the image (the tag, or better the digest tally-feed-image.txt names):
 #   cosign verify ghcr.io/sky-commons/tally-feed:vX.Y.Z \
+#     (or :X, the major tag: the same digest, so the same signature)
 #     --certificate-identity-regexp '^https://github.com/sky-commons/tally/.github/workflows/release.yml@refs/tags/v' \
 #     --certificate-oidc-issuer https://token.actions.githubusercontent.com
 #   gh attestation verify oci://ghcr.io/sky-commons/tally-feed:vX.Y.Z --repo sky-commons/tally
@@ -85,10 +90,16 @@ jobs:
         run: |
           set -euo pipefail
           mkdir dist
-          for arch in x86_64 aarch64; do
-            bazel build -c opt --lockfile_mode=error --platforms=//platforms:linux_$arch \
-              //crates/feed:tally-feed //crates/relay:tally-relay //crates/api:tally-api
-            for bin in tally-feed tally-relay tally-api; do
+          # Every program for the 64-bit platforms; the feeder alone for 32-bit ARM, where only
+          # receivers run.
+          for build in x86_64:tally-feed,tally-relay,tally-api aarch64:tally-feed,tally-relay,tally-api \
+            armv7:tally-feed; do
+            arch="${build%%:*}"
+            IFS=, read -ra bins <<< "${build#*:}"
+            targets=()
+            for bin in "${bins[@]}"; do targets+=("//crates/${bin#tally-}:$bin"); done
+            bazel build -c opt --lockfile_mode=error --platforms=//platforms:linux_$arch "${targets[@]}"
+            for bin in "${bins[@]}"; do
               path="$(bazel cquery -c opt --platforms=//platforms:linux_$arch --output=files \
                 //crates/${bin#tally-}:$bin 2>/dev/null)"
               install -m 0755 "$path" "dist/$bin-$arch-linux"
@@ -113,8 +124,8 @@ jobs:
         with:
           subject-path: 'dist/tally-*-linux, dist/*.service, dist/seeds, dist/install.sh'
       # The feeder's image is the binaries just signed, copied onto distroless (no RUN), so it
-      # needs no emulation for arm64; the map image installs Debian's packages (a RUN), so its
-      # arm64 half runs under QEMU, registered before buildx makes its builder.
+      # needs no emulation for arm64 or arm/v7; the map image installs Debian's packages (a RUN),
+      # so its arm64 half runs under QEMU, registered before buildx makes its builder.
       # v4.4.0, pinned by commit.
       - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1
         with:
@@ -127,6 +138,21 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ github.token }}
+      # The image's tags: the release's own, and its major's (`0` for v0.x.y), which follows the
+      # newest release of that major.
+      - id: tags
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          major="${version%%.*}"
+          [[ "$major" =~ ^[0-9]+$ ]]
+          {
+            echo 'list<<TAGS'
+            echo "$IMAGE:$GITHUB_REF_NAME"
+            echo "$IMAGE:$major"
+            echo 'TAGS'
+            echo "major=$major"
+          } >> "$GITHUB_OUTPUT"
       # v7.4.0, pinned by commit. BuildKit's own provenance is off: the image's provenance is the
       # attestation below, the same kind and identity as the binaries'.
       - id: image
@@ -134,10 +160,10 @@ jobs:
         with:
           context: dist
           file: packaging/container/Dockerfile
-          platforms: linux/amd64,linux/arm64
+          platforms: linux/amd64,linux/arm64,linux/arm/v7
           push: true
           provenance: false
-          tags: ${{ env.IMAGE }}:${{ github.ref_name }}
+          tags: ${{ steps.tags.outputs.list }}
       # Signed by digest, never by tag: a tag can be moved, the digest is what was built. The
       # digest is written beside the binaries, checksummed and signed like them.
       - name: sign the image
@@ -188,8 +214,9 @@ jobs:
       - name: publish
         env:
           GH_TOKEN: ${{ github.token }}
+          MAJOR: ${{ steps.tags.outputs.major }}
         run: |
           set -euo pipefail
           image="$(cat dist/tally-feed-image.txt)"
           map_pinned="$(cat dist/tally-map-image.txt)"
-          gh release create "$GITHUB_REF_NAME" --verify-tag --title "$GITHUB_REF_NAME" --notes "Tally $GITHUB_REF_NAME. Install a feeder with \`curl -fsSL https://github.com/$GITHUB_REPOSITORY/releases/download/$GITHUB_REF_NAME/install.sh | sudo bash\`, or run it as a container: \`$image\` (\`$IMAGE:$GITHUB_REF_NAME\`). The map, to run beside a relay: \`$map_pinned\` (\`$MAP_IMAGE:$GITHUB_REF_NAME\`)." dist/*
+          gh release create "$GITHUB_REF_NAME" --verify-tag --title "$GITHUB_REF_NAME" --notes "Tally $GITHUB_REF_NAME. Install a feeder with \`curl -fsSL https://github.com/$GITHUB_REPOSITORY/releases/download/$GITHUB_REF_NAME/install.sh | sudo bash\`, or run it as a container: \`$image\` (\`$IMAGE:$GITHUB_REF_NAME\`, or \`$IMAGE:$MAJOR\` to follow every $MAJOR.x release). The map, to run beside a relay: \`$map_pinned\` (\`$MAP_IMAGE:$GITHUB_REF_NAME\`)." dist/*

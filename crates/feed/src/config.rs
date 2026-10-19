@@ -5,22 +5,71 @@ use std::path::PathBuf;
 
 use tally_wire::{Clock, Location, PublicKey, RelayAddress};
 
-/// Relays shipped in the binary, as `HOST:PORT=KEY`, known like any `--relay`. Before the public
-/// release this lists relays run by several independent operators, never one: a single built-in
-/// seed is a party that can steer every new feeder (RFC-0171 §3.5, §3.7). It is only a starting
-/// point; the feeder learns relays from relays and keeps what it learned.
-pub const SEEDS: &[&str] = &[];
+/// The relays shipped in the binary, known like any `--relay`: the release's seed list,
+/// packaging/seeds, compiled in, so the binary, the image built from it and the `seeds` file the
+/// installer reads are one list. Its format is the installer's (one `HOST:PORT=KEY OPERATOR` a
+/// line, `#` comments); the feeder reads the first field. Until it names relays of several
+/// independent operators, a single operator can steer every new feeder (RFC-0171 §3.5, §3.7). It
+/// is only a starting point; the feeder learns relays from relays and keeps what it learned.
+pub const SEEDS: &str = include_str!("../../../packaging/seeds");
+
+/// The relays `SEEDS` names.
+pub fn seeds() -> Result<Vec<RelayAddress>, String> {
+    SEEDS
+        .lines()
+        .map(|line| line.split_once('#').map_or(line, |(before, _)| before))
+        .filter_map(|line| line.split_whitespace().next())
+        .map(parse_relay)
+        .collect()
+}
+
+/// The environment variables a container is configured by, in the idiom of the sdr-enthusiasts
+/// images (ultrafeeder and the feeders beside it), each used only where its flag is not given:
+/// a flag always wins.
+///
+/// - `BEASTHOST`, `BEASTPORT` (default 30005): `--source BEASTHOST:BEASTPORT`.
+/// - `LAT` or `READSB_LAT`, `LONG` or `READSB_LON`: `--lat`, `--lon`.
+/// - `ALT` or `READSB_ALT`: `--alt`, a bare number or with `m` or `ft` (`15m`, `45ft`), as
+///   ultrafeeder takes it and hands it to mlat-client.
+/// - `TALLY_KEY`: the identity's text, as `--key-env TALLY_KEY`.
+/// - `TALLY_STATE`: `--state`.
+///
+/// An empty variable is an unset one, as a compose file's `${UNSET}` makes it.
+pub const ENVIRONMENT: &[&str] = &[
+    "BEASTHOST",
+    "BEASTPORT",
+    "LAT",
+    "READSB_LAT",
+    "LONG",
+    "READSB_LON",
+    "ALT",
+    "READSB_ALT",
+    "TALLY_KEY",
+    "TALLY_STATE",
+];
+
+/// The variable a key held in the environment is read from when no flag names one.
+pub const KEY_VARIABLE: &str = "TALLY_KEY";
+
+/// The key file's name in the state directory when no flag and no `TALLY_KEY` names the key.
+pub const KEPT_KEY: &str = "key";
 
 const USAGE: &str = "\
-usage: tally-feed (--key FILE | --key-env NAME) [options]
+usage: tally-feed [--key FILE | --key-env NAME] [options]
        tally-feed init --key FILE      create the key file if it is missing, print its public key
        tally-feed new-key              print a new identity's secret (line 1, the text a key file
                                        holds) and its public key (line 2), writing no file
+       tally-feed health [--state DIR] say whether the feeder running with this state directory
+                                       is publishing to a relay and reading its decoder (exit 0)
+                                       or not (exit 1), from the status file it keeps there
 
   --key FILE             this receiver's identity (keep it: it is the antenna's name forever)
   --key-env NAME         the same identity, read from the environment variable NAME instead of a
                          file (the text a key file holds, as `new-key` prints it), for a host that
-                         keeps secrets in its own configuration, such as a container's
+                         keeps secrets in its own configuration, such as a container's.
+                         With neither, the key is the file `key` in the state directory, made
+                         on the first run if it is missing (TALLY_KEY in the environment, when
+                         set, is used as --key-env TALLY_KEY instead)
   --source HOST:PORT     readsb's BEAST output (default 127.0.0.1:30005)
   --uat HOST:PORT        dump978-fa's raw output, for 978 MHz UAT (none by default; it is
                          usually 127.0.0.1:30978)
@@ -30,19 +79,33 @@ usage: tally-feed (--key FILE | --key-env NAME) [options]
   --state DIR            where learned relays and relays found swallowing are kept
                          (default /var/lib/tally-feed)
   --lat DEG --lon DEG --alt ALT
-                         the antenna's position, published exactly unless --precision says
-                         otherwise (MLAT needs it exact); ALT is metres above the ellipsoid,
-                         as a bare number or with a unit, as mlat-client takes it: 34, 34m,
-                         112ft (feet are converted to the nearest metre)
-  --precision M          how far the published position may be from the antenna (default 0)
+                         the antenna's position, sent exactly to relays (MLAT needs it exact);
+                         ALT is the height as mlat-client takes it, a bare number or with a
+                         unit: 34, 34m, 112ft (feet are converted to the nearest metre). Public
+                         surfaces (the map, station pages, the API) show it blurred to about
+                         5 km
+  --precision M          expert only: round the position to a grid of M-metre cells before
+                         anything is signed or sent, so not even relay operators see the exact
+                         one (latitude to the nearest M metres from the equator, longitude to
+                         the nearest M metres from the prime meridian at the cell's latitude;
+                         altitude kept; within M of the antenna). Default 0, exact. Above 30 m
+                         the MLAT solver leaves the receiver out entirely: it still feeds ADS-B
+                         but contributes nothing to MLAT
   --clock NAME           the receiver's clock: dump1090 (RTL-SDR, the default), beast,
                          radarcape_12mhz, radarcape_gps
   --ceiling BYTES        the most this feeder sends each relay per second (default 64000)
+
+The environment configures what no flag does, as an sdr-enthusiasts container is configured:
+BEASTHOST and BEASTPORT (default 30005) for --source, LAT (or READSB_LAT), LONG (or READSB_LON)
+and ALT (or READSB_ALT) for the position, TALLY_KEY and TALLY_STATE. A flag always wins;
+--precision is a flag only.
 ";
 
 pub enum Command {
     Init(PathBuf),
     NewKey,
+    /// `health`: judge the status file in this state directory (`health::check`).
+    Health(PathBuf),
     Run(Box<Config>),
     Done,
 }
@@ -55,6 +118,9 @@ pub enum Key {
     /// The name of an environment variable, never its value: the secret is read where it is used
     /// (`crate::load`), so a printed `Config` cannot show it.
     Env(String),
+    /// A key file the feeder keeps itself, made on the first run if it is missing: what a feeder
+    /// named no key runs with, `KEPT_KEY` in its state directory. A container's volume holds it.
+    Kept(PathBuf),
 }
 
 #[derive(Debug)]
@@ -80,7 +146,18 @@ pub struct Config {
     pub deflate_level: Option<u8>,
 }
 
+/// The command line alone, as if the environment held none of `ENVIRONMENT`.
 pub fn parse(args: impl Iterator<Item = String>) -> Result<Command, String> {
+    parse_with(args, &|_| None)
+}
+
+/// The command line, with `env` (a variable's value by name) for what no flag gives
+/// (`ENVIRONMENT`).
+pub fn parse_with(
+    args: impl Iterator<Item = String>,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Result<Command, String> {
+    let env = |name: &str| env(name).filter(|value| !value.trim().is_empty());
     let mut args = args.peekable();
     if args.peek().map(String::as_str) == Some("new-key") {
         args.next();
@@ -88,6 +165,21 @@ pub fn parse(args: impl Iterator<Item = String>) -> Result<Command, String> {
             None => Ok(Command::NewKey),
             Some(extra) => Err(format!("new-key takes no arguments, not {extra}\n{USAGE}")),
         };
+    }
+    if args.peek().map(String::as_str) == Some("health") {
+        args.next();
+        let mut state = env("TALLY_STATE").map(PathBuf::from);
+        while let Some(flag) = args.next() {
+            match flag.as_str() {
+                "--state" => {
+                    state = Some(PathBuf::from(args.next().ok_or("--state needs a value")?));
+                }
+                other => return Err(format!("health takes --state DIR, not {other}\n{USAGE}")),
+            }
+        }
+        return Ok(Command::Health(
+            state.unwrap_or_else(|| PathBuf::from(DEFAULT_STATE)),
+        ));
     }
     let init = args.peek().map(String::as_str) == Some("init");
     if init {
@@ -100,30 +192,37 @@ pub fn parse(args: impl Iterator<Item = String>) -> Result<Command, String> {
         uat: None,
         relays: Vec::new(),
         seeds: Vec::new(),
-        state_dir: PathBuf::from("/var/lib/tally-feed"),
+        state_dir: PathBuf::from(DEFAULT_STATE),
         location: None,
         clock: Clock::Dump1090,
         ceiling: 64_000,
         source_address: None,
         deflate_level: None,
     };
-    let (mut lat, mut lon, mut alt, mut precision) = (None, None, None, 0u32);
+    let (mut lat, mut lon, mut alt, mut precision) = (None, None, None, None);
+    let (mut source, mut state) = (false, false);
     while let Some(flag) = args.next() {
         let mut value = || args.next().ok_or_else(|| format!("{flag} needs a value"));
         match flag.as_str() {
             "--key" => key_file = Some(PathBuf::from(value()?)),
             "--key-env" => key_env = Some(value()?),
-            "--source" => config.source = value()?,
+            "--source" => {
+                config.source = value()?;
+                source = true;
+            }
             "--uat" => config.uat = Some(value()?),
             "--relay" => config.relays.push(parse_relay(&value()?)?),
             // Retired with the home, anchor and random slots (RFC-0174 §2.2), and refused, so no
             // command line goes on saying what the feeder no longer does.
             "--home" | "--relays" => return Err(retired(&flag)),
-            "--state" => config.state_dir = PathBuf::from(value()?),
+            "--state" => {
+                config.state_dir = PathBuf::from(value()?);
+                state = true;
+            }
             "--lat" => lat = Some(degrees(&flag, &value()?, 90.0)?),
             "--lon" => lon = Some(degrees(&flag, &value()?, 180.0)?),
             "--alt" => alt = Some(altitude(&flag, &value()?)?),
-            "--precision" => precision = number(&flag, &value()?)?,
+            "--precision" => precision = Some(number(&flag, &value()?)?),
             "--clock" => {
                 let name = value()?;
                 config.clock =
@@ -148,29 +247,58 @@ pub fn parse(args: impl Iterator<Item = String>) -> Result<Command, String> {
         let key_file = key_file.ok_or_else(|| format!("--key is required\n{USAGE}"))?;
         return Ok(Command::Init(key_file));
     }
+    // What no flag gave, from the environment.
+    if !source && let Some(host) = env("BEASTHOST") {
+        let port = env("BEASTPORT").unwrap_or_else(|| "30005".to_owned());
+        config.source = format!("{}:{}", host.trim(), port.trim());
+    }
+    if !state && let Some(dir) = env("TALLY_STATE") {
+        config.state_dir = PathBuf::from(dir);
+    }
+    let either = |one: &str, other: &str| {
+        env(one)
+            .map(|value| (one.to_owned(), value))
+            .or_else(|| env(other).map(|value| (other.to_owned(), value)))
+    };
+    if lat.is_none()
+        && let Some((name, text)) = either("LAT", "READSB_LAT")
+    {
+        lat = Some(degrees(&name, text.trim(), 90.0)?);
+    }
+    if lon.is_none()
+        && let Some((name, text)) = either("LONG", "READSB_LON")
+    {
+        lon = Some(degrees(&name, text.trim(), 180.0)?);
+    }
+    if alt.is_none()
+        && let Some((name, text)) = either("ALT", "READSB_ALT")
+    {
+        alt = Some(altitude(&name, &text)?);
+    }
+    if key_file.is_none() && key_env.is_none() && env(KEY_VARIABLE).is_some() {
+        key_env = Some(KEY_VARIABLE.to_owned());
+    }
     config.key = match (key_file, key_env) {
         (Some(file), None) => Key::File(file),
         (None, Some(name)) if name.is_empty() => {
             return Err("--key-env needs a variable name".to_owned());
         }
         (None, Some(name)) => Key::Env(name),
-        (None, None) => return Err(format!("--key or --key-env is required\n{USAGE}")),
+        (None, None) => Key::Kept(config.state_dir.join(KEPT_KEY)),
         (Some(_), Some(_)) => {
             return Err("--key and --key-env both name the identity: give one".to_owned());
         }
     };
-    for seed in SEEDS {
-        config.seeds.push(parse_relay(seed)?);
-    }
+    config.seeds = seeds()?;
     config.location = match (lat, lon) {
         (Some(lat_e7), Some(lon_e7)) => Some(Location {
             lat_e7,
             lon_e7,
             alt_m: alt.unwrap_or(0),
-            precision_m: precision,
+            precision_m: precision.unwrap_or(0),
         }),
         (None, None) => None,
-        _ => return Err("--lat and --lon go together".to_owned()),
+        _ => return Err("--lat and --lon (LAT and LONG) go together".to_owned()),
     };
     Ok(Command::Run(Box::new(config)))
 }
@@ -184,6 +312,9 @@ fn retired(flag: &str) -> String {
     };
     format!("{flag} was retired with the home, anchor and random slots (RFC-0174 §2.2); {instead}")
 }
+
+/// Where a feeder keeps its state unless `--state` says otherwise.
+pub const DEFAULT_STATE: &str = "/var/lib/tally-feed";
 
 pub fn parse_relay(text: &str) -> Result<RelayAddress, String> {
     let (address, key) = text
@@ -241,17 +372,187 @@ mod tests {
     }
 
     #[test]
-    fn every_seed_is_a_relay_address() -> Result<(), String> {
-        for seed in SEEDS {
-            parse_relay(seed)?;
-        }
+    fn the_release_seed_list_is_compiled_in_and_every_line_is_a_relay() -> Result<(), String> {
+        let seeds = seeds()?;
+        assert!(!seeds.is_empty(), "packaging/seeds names no relay");
+        let lines = SEEDS
+            .lines()
+            .filter(|line| !line.trim().is_empty() && !line.trim_start().starts_with('#'))
+            .count();
+        assert_eq!(seeds.len(), lines);
         Ok(())
     }
 
     #[test]
     fn seeds_join_the_relays_the_owner_named() -> Result<(), String> {
         let config = run(&["--key", "k"])?;
-        assert_eq!((config.relays.len(), config.seeds.len()), (0, SEEDS.len()));
+        assert_eq!((config.relays.len(), config.seeds), (0, seeds()?));
+        Ok(())
+    }
+
+    fn with_env(args: &[&str], vars: &[(&str, &str)]) -> Result<Config, String> {
+        let vars: Vec<(String, String)> = vars
+            .iter()
+            .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+            .collect();
+        let env = move |name: &str| {
+            vars.iter()
+                .find(|(each, _)| each == name)
+                .map(|(_, value)| value.clone())
+        };
+        match parse_with(args.iter().map(|arg| (*arg).to_owned()), &env)? {
+            Command::Run(config) => Ok(*config),
+            _ => Err("not a run".to_owned()),
+        }
+    }
+
+    #[test]
+    fn a_container_is_one_environment_block() -> Result<(), String> {
+        let config = with_env(
+            &[],
+            &[
+                ("BEASTHOST", "ultrafeeder"),
+                ("LAT", "33.9425361"),
+                ("LONG", "-118.4080749"),
+                ("ALT", "45ft"),
+                ("PRECISION", "500"),
+            ],
+        )?;
+        // Rounding is a flag, never the environment's.
+        assert_eq!(config.source, "ultrafeeder:30005");
+        assert_eq!(
+            config.location,
+            Some(Location {
+                lat_e7: 339_425_361,
+                lon_e7: -1_184_080_749,
+                alt_m: 14,
+                precision_m: 0,
+            })
+        );
+        assert_eq!(
+            config.key,
+            Key::Kept(PathBuf::from("/var/lib/tally-feed/key"))
+        );
+        let config = with_env(
+            &[],
+            &[
+                ("BEASTHOST", "readsb"),
+                ("BEASTPORT", "30105"),
+                ("READSB_LAT", "51.5"),
+                ("READSB_LON", "-0.12"),
+                ("READSB_ALT", "15m"),
+                ("TALLY_KEY", "secret"),
+                ("TALLY_STATE", "/data"),
+            ],
+        )?;
+        assert_eq!(config.source, "readsb:30105");
+        let location = config.location.ok_or("no location")?;
+        assert_eq!((location.alt_m, location.precision_m), (15, 0));
+        assert_eq!(config.key, Key::Env("TALLY_KEY".to_owned()));
+        assert_eq!(config.state_dir, PathBuf::from("/data"));
+        Ok(())
+    }
+
+    #[test]
+    fn a_flag_wins_over_the_environment_and_empty_is_unset() -> Result<(), String> {
+        let config = with_env(
+            &[
+                "--source",
+                "127.0.0.1:30005",
+                "--lat",
+                "1",
+                "--lon",
+                "2",
+                "--alt",
+                "3",
+                "--precision",
+                "20",
+                "--key",
+                "/etc/tally/key",
+                "--state",
+                "/s",
+            ],
+            &[
+                ("BEASTHOST", "ultrafeeder"),
+                ("LAT", "33.9"),
+                ("LONG", "-118.4"),
+                ("ALT", "45ft"),
+                ("TALLY_KEY", "secret"),
+                ("TALLY_STATE", "/data"),
+            ],
+        )?;
+        assert_eq!(config.source, "127.0.0.1:30005");
+        assert_eq!(
+            config.location,
+            Some(Location {
+                lat_e7: 10_000_000,
+                lon_e7: 20_000_000,
+                alt_m: 3,
+                precision_m: 20,
+            })
+        );
+        assert_eq!(config.key, Key::File(PathBuf::from("/etc/tally/key")));
+        assert_eq!(config.state_dir, PathBuf::from("/s"));
+        let config = with_env(
+            &[],
+            &[
+                ("BEASTHOST", " "),
+                ("LAT", ""),
+                ("LONG", ""),
+                ("TALLY_KEY", ""),
+            ],
+        )?;
+        assert_eq!(
+            (config.source.as_str(), config.location, &config.key),
+            (
+                "127.0.0.1:30005",
+                None,
+                &Key::Kept(PathBuf::from("/var/lib/tally-feed/key"))
+            )
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_bad_environment_value_is_refused_by_name() {
+        for (name, value) in [("LAT", "north"), ("ALT", "m"), ("LONG", "east")] {
+            let mut vars = vec![("LAT", "33.9"), ("LONG", "-118.4")];
+            vars.retain(|(each, _)| *each != name);
+            vars.push((name, value));
+            assert!(
+                with_env(&[], &vars).is_err_and(|why| why.starts_with(name)),
+                "{name}={value} was taken"
+            );
+        }
+        assert!(with_env(&[], &[("LAT", "33.9")]).is_err_and(|why| why.contains("go together")));
+    }
+
+    #[test]
+    fn health_reads_the_state_directory() -> Result<(), String> {
+        let parsed = |args: &[&str], vars: &[(&str, &str)]| {
+            let vars: Vec<(String, String)> = vars
+                .iter()
+                .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+                .collect();
+            parse_with(
+                args.iter().map(|arg| (*arg).to_owned()),
+                &move |name: &str| {
+                    vars.iter()
+                        .find(|(each, _)| each == name)
+                        .map(|(_, value)| value.clone())
+                },
+            )
+        };
+        assert!(
+            matches!(parsed(&["health"], &[])?, Command::Health(dir) if dir == std::path::Path::new(DEFAULT_STATE))
+        );
+        assert!(
+            matches!(parsed(&["health", "--state", "/s"], &[("TALLY_STATE", "/e")])?, Command::Health(dir) if dir == std::path::Path::new("/s"))
+        );
+        assert!(
+            matches!(parsed(&["health"], &[("TALLY_STATE", "/e")])?, Command::Health(dir) if dir == std::path::Path::new("/e"))
+        );
+        assert!(parsed(&["health", "--key", "k"], &[]).is_err());
         Ok(())
     }
 
@@ -321,8 +622,11 @@ mod tests {
     }
 
     #[test]
-    fn exactly_one_key_is_required() {
-        assert!(run(&[]).is_err_and(|why| why.contains("--key or --key-env is required")));
+    fn at_most_one_key_and_none_is_the_kept_one() {
+        assert!(
+            run(&["--state", "/s"])
+                .is_ok_and(|config| config.key == Key::Kept(PathBuf::from("/s/key")))
+        );
         assert!(
             run(&["--key", "k", "--key-env", "TALLY_KEY"]).is_err_and(|why| why.contains("one"))
         );

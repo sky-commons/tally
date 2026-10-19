@@ -11,6 +11,14 @@
 //! The table is bounded like the relay's others (`Bounded`): a receiver is active whenever a batch
 //! of it is forwarded, so a churn of throwaway keys forgets itself oldest first and a receiver that
 //! keeps publishing keeps its place. Only a forwarded batch, which its key signed, creates a row.
+//!
+//! Beside the table, the feeder connections open now, by the receiver key each one's Noise
+//! handshake proved (RFC-0171 §3.2): a feeder whose decoder sends nothing seals no batch, so it
+//! has no row, yet it is connected, and a report says so (`connected`, with no batch forwarded).
+//! These are bounded by the feeder connections the relay admits, and each goes with its
+//! connection, so no stranger grows them by inventing keys and none of them pushes a row out.
+
+use std::collections::HashMap;
 
 use std::net::IpAddr;
 
@@ -42,18 +50,24 @@ pub struct StationReport {
     pub key: String,
     /// A batch of it was forwarded within `ONLINE_WITHIN_MS`.
     pub online: bool,
-    /// It is feeding this relay directly right now.
+    /// A feeder connection of it to this relay is open now, whether or not it sends batches.
     pub connected: bool,
+    /// Unix milliseconds when the oldest of its open feeder connections to this relay opened;
+    /// `None` when none is open. Absent from a relay older than this field, read as `None`.
+    #[serde(default)]
+    pub connected_since_ms: Option<u64>,
     /// How many times it has fed this relay directly: a connection that forwarded a new batch.
     pub sessions: u64,
-    /// Unix milliseconds of the first and the newest batch of it forwarded.
+    /// Unix milliseconds of the first and the newest batch of it forwarded; for a receiver
+    /// connected that has had no batch forwarded (`batches` 0), both are when it connected.
     pub first_seen_ms: u64,
     pub last_seen_ms: u64,
     pub batches: u64,
     /// Sequences of its current and earlier boots that were skipped and have not arrived late.
     pub gaps: u64,
     pub observations: u64,
-    /// Where its newest description says it is, if the relay holds one that says.
+    /// Where its newest description says it is, if the relay holds one that says and a batch of
+    /// it was forwarded: a receiver only connected is placed nowhere.
     pub location: Option<StationLocation>,
     /// The feeder software its newest description names.
     pub software: Option<String>,
@@ -138,11 +152,18 @@ impl Tally {
         });
     }
 
-    fn report(&self, key: &PublicKey, now_ms: u64) -> StationReport {
+    fn report(
+        &self,
+        key: &PublicKey,
+        connected_since_ms: Option<u64>,
+        address: Option<String>,
+        now_ms: u64,
+    ) -> StationReport {
         StationReport {
             key: key.to_base64(),
             online: now_ms.saturating_sub(self.last_seen_ms) <= ONLINE_WITHIN_MS,
-            connected: self.session.is_some(),
+            connected: connected_since_ms.is_some(),
+            connected_since_ms,
             sessions: self.sessions,
             first_seen_ms: self.first_seen_ms,
             last_seen_ms: self.last_seen_ms,
@@ -151,19 +172,89 @@ impl Tally {
             observations: self.observations,
             location: None,
             software: None,
-            address: self.address.map(|address| address.to_string()),
+            address,
         }
+    }
+}
+
+/// A receiver connected that has had no batch forwarded: what its report says.
+fn connected_only(key: &PublicKey, since_ms: u64, address: Option<String>) -> StationReport {
+    StationReport {
+        key: key.to_base64(),
+        online: false,
+        connected: true,
+        connected_since_ms: Some(since_ms),
+        sessions: 0,
+        first_seen_ms: since_ms,
+        last_seen_ms: since_ms,
+        batches: 0,
+        gaps: 0,
+        observations: 0,
+        location: None,
+        software: None,
+        address,
     }
 }
 
 pub struct Stations {
     table: Bounded<PublicKey, Tally>,
+    /// The feeder connections open now, by receiver: each one's id, when it opened, and the
+    /// address it came from.
+    connections: HashMap<PublicKey, Vec<(u64, u64, Option<IpAddr>)>>,
 }
 
 impl Stations {
     pub fn new(capacity: usize) -> Self {
         Self {
             table: Bounded::new(capacity),
+            connections: HashMap::new(),
+        }
+    }
+
+    /// When the oldest open feeder connection of `receiver` opened, if one is open.
+    fn connected_since(&self, receiver: &PublicKey) -> Option<u64> {
+        self.connections
+            .get(receiver)?
+            .iter()
+            .map(|(_, opened_ms, _)| *opened_ms)
+            .min()
+    }
+
+    /// The address of the newest open feeder connection of `receiver`, if one is open and its
+    /// address is known.
+    fn connected_address(&self, receiver: &PublicKey) -> Option<IpAddr> {
+        self.connections
+            .get(receiver)?
+            .iter()
+            .max_by_key(|(id, opened_ms, _)| (*opened_ms, *id))
+            .and_then(|(_, _, address)| *address)
+    }
+
+    /// The address a report names: the session that fed it, else its newest open connection's.
+    fn address_of(&self, receiver: &PublicKey, tally: Option<&Tally>) -> Option<String> {
+        tally
+            .and_then(|tally| tally.address)
+            .or_else(|| self.connected_address(receiver))
+            .map(|address| address.to_string())
+    }
+
+    /// Connection `source`, its Noise handshake proving it is `receiver`'s feeder, was admitted
+    /// at `now_ms` from `address`: the receiver is connected from now until it leaves, whether or
+    /// not it sends. An IPv4 client of a dual-stack socket is named as IPv4.
+    pub fn opened(
+        &mut self,
+        receiver: PublicKey,
+        source: u64,
+        now_ms: u64,
+        address: Option<IpAddr>,
+    ) {
+        let open = self.connections.entry(receiver).or_default();
+        if !open.iter().any(|(id, _, _)| *id == source) {
+            open.push((
+                source,
+                now_ms,
+                address.map(|address| address.to_canonical()),
+            ));
         }
     }
 
@@ -200,7 +291,8 @@ impl Stations {
     }
 
     /// Connection `source` of a feeder publishing as `receiver` ended, and its address with it. A
-    /// newer connection of the same receiver stays its session, with its own address.
+    /// newer connection of the same receiver stays its session, with its own address, and keeps
+    /// it connected.
     pub fn left(&mut self, receiver: &PublicKey, source: u64) {
         if let Some(tally) = self.table.get_mut(receiver)
             && tally.session == Some(source)
@@ -208,21 +300,49 @@ impl Stations {
             tally.session = None;
             tally.address = None;
         }
+        if let Some(open) = self.connections.get_mut(receiver) {
+            open.retain(|(id, _, _)| *id != source);
+            if open.is_empty() {
+                self.connections.remove(receiver);
+            }
+        }
     }
 
-    /// `receiver`'s report, without the location and software its description carries.
+    /// `receiver`'s report, without the location and software its description carries: its row,
+    /// or, connected with no batch forwarded, what its connection alone says.
     pub fn report(&self, receiver: &PublicKey, now_ms: u64) -> Option<StationReport> {
-        self.table
-            .get(receiver)
-            .map(|tally| tally.report(receiver, now_ms))
+        let since = self.connected_since(receiver);
+        match self.table.get(receiver) {
+            Some(tally) => Some(tally.report(
+                receiver,
+                since,
+                self.address_of(receiver, Some(tally)),
+                now_ms,
+            )),
+            None => {
+                since.map(|since| connected_only(receiver, since, self.address_of(receiver, None)))
+            }
+        }
     }
 
-    /// Every receiver held, with its key, unordered.
+    /// Every receiver held or connected, with its key, unordered.
     pub fn reports(&self, now_ms: u64) -> Vec<(PublicKey, StationReport)> {
-        self.table
-            .iter()
-            .map(|(key, tally)| (*key, tally.report(key, now_ms)))
-            .collect()
+        let held = self.table.iter().map(|(key, tally)| {
+            let address = self.address_of(key, Some(tally));
+            (
+                *key,
+                tally.report(key, self.connected_since(key), address, now_ms),
+            )
+        });
+        let connected = self
+            .connections
+            .keys()
+            .filter(|key| self.table.get(key).is_none())
+            .filter_map(|key| {
+                let since = self.connected_since(key)?;
+                Some((*key, connected_only(key, since, self.address_of(key, None))))
+            });
+        held.chain(connected).collect()
     }
 
     pub fn len(&self) -> usize {
@@ -321,12 +441,14 @@ mod tests {
         let receiver = key()?;
         let mut stations = Stations::new(8);
         // No row until a batch: a connection alone creates nothing.
+        stations.opened(receiver, 5, 0, None);
         stations.fed_by(&receiver, 5, None);
         assert!(stations.is_empty());
         stations.forwarded(receiver, 1, 0, 1, 0);
         stations.fed_by(&receiver, 5, None);
         stations.fed_by(&receiver, 5, None);
         // The feeder reconnects before its old connection is noticed gone.
+        stations.opened(receiver, 6, 0, None);
         stations.fed_by(&receiver, 6, None);
         stations.left(&receiver, 5);
         let report = stations.report(&receiver, 0).ok_or("no report")?;
@@ -367,6 +489,79 @@ mod tests {
         assert_eq!(address(&stations), None);
         let report = stations.report(&receiver, 0).ok_or("no report")?;
         assert!(!report.connected);
+        Ok(())
+    }
+
+    /// A feeder whose decoder sends nothing seals no batch, yet its handshake proved its key: it
+    /// is reported connected with nothing forwarded, placed nowhere, until its connection ends.
+    #[test]
+    fn a_connected_feeder_that_sends_nothing_is_reported_until_it_leaves() -> Result<(), String> {
+        let receiver = key()?;
+        let mut stations = Stations::new(8);
+        stations.opened(receiver, 5, 1_000, None);
+        // A second connection of it, before the first is noticed gone, keeps the older instant.
+        stations.opened(receiver, 6, 4_000, None);
+        // No row: the table holds only receivers a batch of which was forwarded.
+        assert!(stations.is_empty());
+        let report = stations.report(&receiver, 9_000).ok_or("no report")?;
+        assert_eq!(
+            (
+                report.online,
+                report.connected,
+                report.connected_since_ms,
+                report.batches,
+                report.sessions,
+                report.first_seen_ms,
+                report.last_seen_ms,
+                report.location
+            ),
+            (false, true, Some(1_000), 0, 0, 1_000, 1_000, None)
+        );
+        assert_eq!(stations.reports(9_000).len(), 1);
+        stations.left(&receiver, 5);
+        let report = stations.report(&receiver, 9_000).ok_or("no report")?;
+        assert_eq!(report.connected_since_ms, Some(4_000));
+        stations.left(&receiver, 6);
+        assert_eq!(stations.report(&receiver, 9_000), None);
+        assert!(stations.reports(9_000).is_empty());
+        Ok(())
+    }
+
+    /// A feeder that fed and whose decoder then went quiet, still connected, is connected and not
+    /// online; once its connection ends it is neither, and its row and counts stay.
+    #[test]
+    fn a_feeder_that_went_quiet_is_connected_and_then_offline() -> Result<(), String> {
+        let receiver = key()?;
+        let mut stations = Stations::new(8);
+        stations.opened(receiver, 5, 0, None);
+        stations.forwarded(receiver, 1, 0, 10, 1_000);
+        stations.fed_by(&receiver, 5, None);
+        let quiet = stations
+            .report(&receiver, 1_000 + ONLINE_WITHIN_MS + 1)
+            .ok_or("no report")?;
+        assert_eq!(
+            (
+                quiet.online,
+                quiet.connected,
+                quiet.connected_since_ms,
+                quiet.batches
+            ),
+            (false, true, Some(0), 1)
+        );
+        stations.left(&receiver, 5);
+        let gone = stations
+            .report(&receiver, 1_000 + ONLINE_WITHIN_MS + 1)
+            .ok_or("no report")?;
+        assert_eq!(
+            (
+                gone.online,
+                gone.connected,
+                gone.connected_since_ms,
+                gone.last_seen_ms
+            ),
+            (false, false, None, 1_000)
+        );
+        assert_eq!(stations.reports(0).len(), 1);
         Ok(())
     }
 
