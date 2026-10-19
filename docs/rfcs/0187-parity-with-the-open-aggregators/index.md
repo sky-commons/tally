@@ -42,7 +42,16 @@ commit, and nginx. It is one more thing a relay operator runs, not a Flightlines
 - tar1090's config is written at start from the environment: the page's title, and
   `TALLY_MAP_API`, the `tally-api` origin its routes are asked of (§2).
 - The aircraft database is a file baked into the image at release, from a source whose licence
-  lets anyone redistribute it (CC0, public domain, ODbL or CC BY). The image's README names it.
+  lets anyone redistribute it (CC0, public domain, ODbL, CC BY, or ODC-By 1.0, the Open Data
+  Commons Attribution License, the database counterpart of CC BY). The image's README names it.
+  The source is Mictronics' aircraft database (github.com/Mictronics/aircraft-database, ODC-By
+  1.0), at a pinned commit; the map credits it on its page, serves its licence beside it, and
+  names it in each daily archive. Rejected:
+  - tar1090-db, tar1090's usual database: it states no licence, and merges an ADS-B Exchange
+    download that states none either.
+  - The OpenSky Network's aircraft database: its terms license non-profit research, education
+    and government use only, which no open release can carry.
+  - The FAA's releasable aircraft file: public domain, but it covers only US-registered aircraft.
 
 tar1090 is GPL-2.0+ and readsb GPL-3.0+: the image carries their sources' URLs and commits, and
 neither is modified.
@@ -82,7 +91,14 @@ neither is modified.
 - **MLAT health:** each station's MLAT figures (peers it is synchronised with, clock error) on its
   page and a network sync map, from the clock models relays already sign.
 - **Open data releases:** each day's readsb history as a GitHub release of the Sky Commons
-  organisation, under ODbL.
+  organisation, under ODbL. The map image packs each UTC day D into one tar at
+  `/archive/YYYY-MM-DD.tar` (its `.sha256` written first), with an ATTRIBUTION file naming the
+  ODbL and the aircraft database's ODC-By source. readsb writes D's traces until 00:55 UTC on
+  D+1 and compresses them at 00:56, so D is packed from 01:15 UTC on D+1; a day whose 00:55 UTC
+  readsb was not running through (the container started after it) is packed as
+  `YYYY-MM-DD.partial.tar`, since its last traces may be missing, and a release marks it so.
+  The image keeps the newest 7 archives, and deletes a day's history once it is older than
+  `TALLY_MAP_HISTORY_DAYS` (default 8) and packed, never before.
 - **ACARS, VDL2 and HFDL:** `tally-feed --acars HOST:PORT` publishes a local decoder's JSON lines in
   its signed batches, as `--uat` does, and they join the daily release.
 - **Previews and short URLs** (`/<hex>`, `/<registration>`), a status page and a hardware guide on
