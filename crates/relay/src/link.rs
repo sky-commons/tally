@@ -14,6 +14,7 @@
 //! (`full`), and a feeder the cap cannot carry is turned away before it publishes anything.
 
 use std::collections::HashMap;
+use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -2843,22 +2844,30 @@ fn fell_behind(kind: Kind) -> Result<(), Closing> {
 }
 
 /// Serves plain BEAST of every reception to whoever connects (a local readsb, which a public map
-/// and `tally-api` read). Each frame is a reception's client form (`tally_wire::ClientObsView`):
-/// its message, with the counter and signal level zero, since a receiver's counters and signal
-/// levels against the aircraft positions anyone reads place it, and what is decoded from here is
-/// published. It is unauthenticated and uncapped (loopback is never billed), so a listener bound
-/// anywhere but loopback is refused before anything is served (`sockets::loopback_only`), as the
-/// stats endpoint's is.
-pub async fn serve_beast(listener: TcpListener, hub: Arc<Hub>) -> std::io::Result<()> {
+/// and `tally-api` read), at most `Hub::beast_clients` at once (`--max-beast-clients`): one past
+/// them is closed as it is accepted (`listeners::Acceptor`, `beast-out` on `GET /listeners`). Each
+/// frame is a reception's client form (`tally_wire::ClientObsView`): its message, with the counter
+/// and signal level zero, since a receiver's counters and signal levels against the aircraft
+/// positions anyone reads place it, and what is decoded from here is published. It is
+/// unauthenticated and never billed, so a listener bound anywhere but loopback is refused before
+/// anything is served (`sockets::loopback_only`), as the stats endpoint's is. Otherwise it returns
+/// only when its listener has accepted nothing for `listeners::STARVED_AFTER`, which ends the
+/// relay.
+pub async fn serve_beast(listener: TcpListener, hub: Arc<Hub>) -> std::io::Result<Infallible> {
     crate::sockets::loopback_only(&listener, "--beast-out")?;
+    let mut acceptor = crate::listeners::Acceptor::new(
+        listener,
+        hub.listeners().gauge("beast-out"),
+        Arc::clone(hub.egress()),
+        crate::sockets::Role::Subscriber,
+    )
+    .capped(hub.beast_clients());
     loop {
-        let Ok((stream, peer)) = listener.accept().await else {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            continue;
+        let (stream, peer) = match acceptor.next().await {
+            Ok(accepted) => accepted,
+            Err(starved) => return Err(std::io::Error::other(starved.to_string())),
         };
-        crate::sockets::configure(&stream, crate::sockets::Role::Subscriber);
         let out = hub.listen(hub.connection_id(), Filter::Beast);
-        let stream = hub.egress().socket(stream, Some(peer.ip()));
         // It takes data and gives none: a plain subscriber, to the cap.
         stream.link().set_kind(Kind::Taker);
         tokio::spawn(async move {
@@ -2870,46 +2879,64 @@ pub async fn serve_beast(listener: TcpListener, hub: Arc<Hub>) -> std::io::Resul
 }
 
 /// Writes every reception to one client, each write held to `deadline` and granted by the upload
-/// cap as a plain subscriber's (a loopback client, the usual one, is never held to it).
-async fn beast_client<W: AsyncWrite + Unpin>(
-    mut stream: Socket<W>,
+/// cap as a plain subscriber's (a loopback client, the usual one, is never held to it), at most
+/// `SEND_BYTES` (beyond the batch that crosses it) at a time. The client sends nothing, and the
+/// relay only writes to it, so its end is read for (`listeners::send_only`): a client that hangs
+/// up is let go at once, not at the next write, which may not come while nothing is received.
+/// Ended by the client, it is `Ok`.
+async fn beast_client<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: Socket<S>,
     out: Listener,
     deadline: Duration,
 ) -> Result<(), String> {
     let link = stream.link();
     let egress = Arc::clone(stream.egress());
-    let mut bytes = Vec::new();
-    let mut items: Vec<Taken> = Vec::new();
-    loop {
-        if let Err(fell) = out.recv_many(&mut items, SEND_BATCH).await {
-            return Err(format!("fell behind ({fell:?})"));
-        }
-        bytes.clear();
-        // Each batch's one decode (`hub::Item::decoded`); the router offers only batches with one.
-        for decoded in items.iter().filter_map(|item| item.decoded.as_ref()) {
-            // Each reception in its client form: the message, no counter, no signal level.
-            for frame in decoded
-                .views()
-                .filter_map(|view| tally_wire::ClientObsView::from(view).to_beast())
-            {
-                frame.encode_beast(&mut bytes);
+    crate::listeners::send_only(stream, |mut stream| async move {
+        let mut bytes = Vec::new();
+        let mut items: Vec<Taken> = Vec::new();
+        loop {
+            if let Err(fell) = out.recv_many(&mut items, SEND_BATCH).await {
+                return Err(format!("fell behind ({fell:?})"));
+            }
+            let mut taken = items.drain(..).peekable();
+            while taken.peek().is_some() {
+                bytes.clear();
+                // Their charges are held until their bytes are written; their decodes are not,
+                // once encoded (`fanout::Taken::hold`), so none waits on the socket beside a
+                // charge its subscriber may let go.
+                let mut holds: Vec<crate::fanout::Hold> = Vec::new();
+                while bytes.len() < SEND_BYTES
+                    && let Some(item) = taken.next()
+                {
+                    // Each batch's one decode (`hub::Item::decoded`); the router offers only
+                    // batches with one.
+                    if let Some(decoded) = item.decoded.as_ref() {
+                        // Each reception in its client form: the message, no counter, no signal
+                        // level.
+                        for frame in decoded
+                            .views()
+                            .filter_map(|view| tally_wire::ClientObsView::from(view).to_beast())
+                        {
+                            frame.encode_beast(&mut bytes);
+                        }
+                    }
+                    holds.push(item.hold());
+                }
+                if bytes.is_empty() {
+                    continue;
+                }
+                if egress.grant(&link, Class::Taker, bytes.len()).await == Err(Shed) {
+                    return Err("shed: the upload cap cannot carry it".to_owned());
+                }
+                tokio::time::timeout(deadline, stream.write_all(&bytes))
+                    .await
+                    .map_err(|_| "write timed out".to_owned())?
+                    .map_err(|error| error.to_string())?;
+                drop(holds);
             }
         }
-        // Their charges are held until their bytes are written; their decodes are not, once
-        // encoded (`fanout::Taken::hold`), so none waits on the socket beside a charge its
-        // subscriber may let go.
-        let _holds: Vec<crate::fanout::Hold> = items.drain(..).map(Taken::hold).collect();
-        if bytes.is_empty() {
-            continue;
-        }
-        if egress.grant(&link, Class::Taker, bytes.len()).await == Err(Shed) {
-            return Err("shed: the upload cap cannot carry it".to_owned());
-        }
-        tokio::time::timeout(deadline, stream.write_all(&bytes))
-            .await
-            .map_err(|_| "write timed out".to_owned())?
-            .map_err(|error| error.to_string())?;
-    }
+    })
+    .await
 }
 
 #[cfg(test)]
@@ -3405,6 +3432,69 @@ mod tests {
             .map_err(text)?;
         assert_eq!(ended, Err("write timed out".to_owned()));
         drop(unread);
+        Ok(())
+    }
+
+    /// Waits (a bounded poll) until `holds` of `hub`'s listener `name` is true of its count of
+    /// open connections.
+    async fn open_on(
+        hub: &Hub,
+        name: &'static str,
+        holds: impl Fn(usize) -> bool,
+    ) -> Result<(), String> {
+        let gauge = hub.listeners().gauge(name);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !holds(gauge.open()) {
+            if Instant::now() > deadline {
+                return Err(format!("{name} holds {} open", gauge.open()));
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        Ok(())
+    }
+
+    /// The defect of 2026-10-18: a local readsb that hangs up and reconnects whenever its input
+    /// goes quiet, with nothing flowing, left a socket in CLOSE-WAIT each time, since a client
+    /// that is only written to was let go only by a write. Its end is read for now, so however
+    /// often it comes and goes the relay holds nothing of it.
+    #[tokio::test]
+    async fn a_beast_out_client_that_comes_and_goes_with_nothing_flowing_leaves_nothing_held()
+    -> Result<(), String> {
+        let hub = Arc::new(Hub::new(1, crate::sharing::Deadlines::RELAY).serving_beast(2));
+        let beast = TcpListener::bind("127.0.0.1:0").await.map_err(text)?;
+        let address = beast.local_addr().map_err(text)?;
+        tokio::spawn(serve_beast(beast, Arc::clone(&hub)));
+        for _ in 0..50 {
+            let client = TcpStream::connect(address).await.map_err(text)?;
+            open_on(&hub, "beast-out", |open| open == 1).await?;
+            drop(client);
+            open_on(&hub, "beast-out", |open| open == 0).await?;
+        }
+        // Its place in the fan-out is let go with it.
+        assert_eq!(hub.listening(), 0);
+        let report = hub.listeners().gauge("beast-out").report();
+        assert_eq!((report.accepted, report.refused), (50, 0));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_beast_out_client_past_the_cap_is_closed_as_it_connects() -> Result<(), String> {
+        use tokio::io::AsyncReadExt;
+        let hub = Arc::new(Hub::new(1, crate::sharing::Deadlines::RELAY).serving_beast(2));
+        let beast = TcpListener::bind("127.0.0.1:0").await.map_err(text)?;
+        let address = beast.local_addr().map_err(text)?;
+        tokio::spawn(serve_beast(beast, Arc::clone(&hub)));
+        let _first = TcpStream::connect(address).await.map_err(text)?;
+        let _second = TcpStream::connect(address).await.map_err(text)?;
+        open_on(&hub, "beast-out", |open| open == 2).await?;
+        let mut third = TcpStream::connect(address).await.map_err(text)?;
+        let mut byte = [0; 1];
+        let read = timeout(Duration::from_secs(10), third.read(&mut byte))
+            .await
+            .map_err(|_| "the third client was served".to_owned())?;
+        assert!(matches!(read, Ok(0) | Err(_)), "{read:?}");
+        let report = hub.listeners().gauge("beast-out").report();
+        assert_eq!((report.open, report.refused), (2, 1));
         Ok(())
     }
 
@@ -4192,7 +4282,7 @@ mod tests {
         assert_eq!(child.egress().billed(), 0);
 
         // Beast-out.
-        let hub = Arc::new(Hub::new(8, crate::sharing::Deadlines::RELAY));
+        let hub = Arc::new(Hub::new(8, crate::sharing::Deadlines::RELAY).serving_beast(1));
         let beast = TcpListener::bind("127.0.0.1:0").await.map_err(text)?;
         let beast_address = beast.local_addr().map_err(text)?;
         tokio::spawn(serve_beast(beast, Arc::clone(&hub)));

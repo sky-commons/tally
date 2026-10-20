@@ -40,7 +40,7 @@
 
 use std::collections::HashMap;
 use std::io;
-use std::net::{IpAddr, SocketAddr};
+use std::net::IpAddr;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
@@ -50,7 +50,6 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use tally_wire::Record;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Notify, oneshot};
 use tokio::time::{Instant, Sleep};
 
@@ -842,6 +841,7 @@ impl Egress {
             link,
             egress: Arc::clone(self),
             waiting: None,
+            _open: None,
         }
     }
 
@@ -1094,6 +1094,9 @@ pub struct Socket<S> {
     egress: Arc<Egress>,
     /// While the bucket is empty, when control may next be taken.
     waiting: Option<Pin<Box<Sleep>>>,
+    /// An accepted connection's place among its listener's open ones (`listeners`), given back
+    /// when the socket is dropped.
+    _open: Option<crate::listeners::Open>,
 }
 
 impl<S> Socket<S> {
@@ -1103,6 +1106,14 @@ impl<S> Socket<S> {
 
     pub fn egress(&self) -> &Arc<Egress> {
         &self.egress
+    }
+
+    /// The same socket holding `open`, its connection's place among its listener's open ones
+    /// (`listeners::Acceptor`), until it is dropped.
+    #[must_use]
+    pub fn holding(mut self, open: crate::listeners::Open) -> Self {
+        self._open = Some(open);
+        self
     }
 
     /// The stream it counts, to read its socket's options (`sockets::Tunable`), never to write
@@ -1201,44 +1212,6 @@ impl<S> Drop for Socket<S> {
         if let Ok(mut pacer) = self.egress.pacer.lock() {
             pacer.forget(self.link.id);
         }
-    }
-}
-
-/// A TCP listener whose every accepted stream is a [`Socket`]: what the stats endpoint serves on.
-/// Bound to loopback, as it should be, nothing it writes is capped; on any other address its
-/// responses are control, capped like any.
-pub struct Listener {
-    listener: TcpListener,
-    egress: Arc<Egress>,
-}
-
-impl Listener {
-    pub fn new(listener: TcpListener, egress: Arc<Egress>) -> Self {
-        Self { listener, egress }
-    }
-}
-
-impl axum::serve::Listener for Listener {
-    type Io = Socket<TcpStream>;
-    type Addr = SocketAddr;
-
-    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
-        loop {
-            match self.listener.accept().await {
-                Ok((stream, peer)) => {
-                    crate::sockets::configure(&stream, crate::sockets::Role::Feeder);
-                    return (self.egress.socket(stream, Some(peer.ip())), peer);
-                }
-                Err(error) => {
-                    eprintln!("tally-relay: stats accept: {error}");
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                }
-            }
-        }
-    }
-
-    fn local_addr(&self) -> io::Result<Self::Addr> {
-        self.listener.local_addr()
     }
 }
 

@@ -1005,6 +1005,11 @@ pub struct Hub {
     network: Network,
     /// Sharing members turned away because the members' pool was full (`Budget::reserve_member`).
     members_refused: AtomicU64,
+    /// The beast-out clients served at once (`--max-beast-clients`), none where the relay serves
+    /// no beast-out (`Hub::serving_beast`): planned as subscribers are.
+    beast_clients: usize,
+    /// Every listener's connections and accepts (`listeners`, `GET /listeners`).
+    listeners: crate::listeners::Listeners,
 }
 
 /// Held for as long as a subscriber (or a connection) is served; releases its place when dropped.
@@ -1208,6 +1213,8 @@ impl Hub {
             egress: Arc::new(Egress::new(Cap::NONE)),
             network,
             members_refused: AtomicU64::new(0),
+            beast_clients: 0,
+            listeners: crate::listeners::Listeners::default(),
         }
         .replanned()
     }
@@ -1332,7 +1339,12 @@ impl Hub {
         Plan::planned(self.holds_raw)
             .with_feeder_ceiling(self.max_feeder_bytes_per_sec)
             .with_members(members, self.max_member_bytes_per_sec)
-            .with_sessions(self.max_connections, self.max_subscribers)
+            // A beast-out client takes from the fan-out, holds a subscriber's kernel buffers and
+            // writes from a buffer of its own: a subscriber's session to the plan.
+            .with_sessions(
+                self.max_connections,
+                self.max_subscribers.saturating_add(self.beast_clients),
+            )
             .with_cores(self.cores)
     }
 
@@ -1692,6 +1704,38 @@ impl Hub {
     pub fn figures_every(self, every_ms: u64) -> Self {
         self.network.figures.publish_every(every_ms);
         self
+    }
+
+    /// Serves at most `clients` beast-out clients at once (`--max-beast-clients`, where
+    /// `--beast-out` is given; none otherwise), each planned as a subscriber's session; one past
+    /// them is closed as it is accepted (`link::serve_beast`).
+    pub fn serving_beast(mut self, clients: usize) -> Self {
+        self.beast_clients = clients;
+        self.replanned()
+    }
+
+    /// The beast-out clients served at once (`Hub::serving_beast`).
+    pub fn beast_clients(&self) -> usize {
+        self.beast_clients
+    }
+
+    /// Every listener's gauge (`listeners`).
+    pub fn listeners(&self) -> &crate::listeners::Listeners {
+        &self.listeners
+    }
+
+    /// The descriptors the relay may hold at once, by its caps: every connection the plan counts
+    /// (those under the connection cap, the dials among them; the member sessions; the
+    /// subscribers and the beast-out clients), every feeder admitted, the stats' connections, and
+    /// what the process holds beside them (`listeners::OTHER_DESCRIPTORS`). What the relay asks
+    /// the kernel for before it serves (`listeners::raise_open_files`).
+    pub fn descriptors(&self) -> usize {
+        self.budget
+            .plan()
+            .connections
+            .saturating_add(self.budget.admission().connections)
+            .saturating_add(crate::stats::MAX_CONNECTIONS)
+            .saturating_add(crate::listeners::OTHER_DESCRIPTORS)
     }
 
     /// Connections from one source (`source_of`) served at once before a new one from it is
