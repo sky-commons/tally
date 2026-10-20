@@ -26,6 +26,9 @@
 //! - **Checked**: every one is read back and verified with the model carried (`verify_reach`)
 //!   against the receptions it was solved from, as any checker would
 //!   (`publish::solve_published`); one that fails is dropped and counted.
+//! - **Published twice**: raw (format 4, relay-only) and tagged (format 6, what a client is sent),
+//!   each reception's tag under the reception key of the record its model's scope names
+//!   (`Carried::keys`), numbered in the one provisional sequence, raw first.
 //! - **Sharded by aircraft** (RFC-0181 §3): everything but the models belongs to one aircraft, so
 //!   it is held in [`SHARDS`] address shards over a keyed hash of the address ([`shard_of`]), each
 //!   weighed and stepped on its own; the models ([`Book`]) are the engine's, shared read-only with
@@ -50,13 +53,13 @@ use std::sync::Arc;
 use tally_mlat_solver::held::sampled;
 use tally_mlat_solver::scope::{GRID_MS, Window, bin_of};
 use tally_mlat_solver::{
-    Calibrated, Citation, ClockModel as Model, MAX_CARRY_PS, ObservationId, Reach, Reception,
-    SPEC_VERSION, Tile, Transmission, Unpublished, modes, publish,
+    Calibrated, Citation, ClockModel as Model, MAX_CARRY_PS, ObservationId, Reach, Reception, Tile,
+    Transmission, Unpublished, modes, publish,
 };
 use tally_wire::batch::Hash;
-use tally_wire::{Decoded, Identity, Positions, PublicKey, Record, SolutionsContent};
+use tally_wire::{Decoded, Identity, Positions, PublicKey, Record, TaggedSolution};
 
-use crate::window::{Part, parallel};
+use crate::window::{Keys, Part, pack_with, parallel, solutions_content};
 
 /// How long after the first of a transmission's receptions arrives it is solved.
 pub const SETTLE_MS: u64 = 1_100;
@@ -82,6 +85,9 @@ pub struct Carried {
     pub window: Window,
     /// The signed manifest's id, which a provisional cites.
     pub id: Hash,
+    /// Its scope's reception keys: what a provisional under it is tagged with for clients. Empty
+    /// when one was missing; its provisionals are then published raw only.
+    pub keys: Keys,
     pub model: Model,
     pub calibrated: Calibrated,
 }
@@ -110,7 +116,11 @@ pub struct Report {
     pub unmodelled: usize,
     /// Receptions dropped for room.
     pub dropped: usize,
+    /// Raw records (relay-only) and tagged records (what a client is sent).
     pub records: usize,
+    pub tagged_records: usize,
+    /// Solutions published raw that could not be tagged.
+    pub untagged: usize,
 }
 
 impl Part for Report {
@@ -122,6 +132,8 @@ impl Part for Report {
         self.unmodelled += other.unmodelled;
         self.dropped += other.dropped;
         self.records += other.records;
+        self.tagged_records += other.tagged_records;
+        self.untagged += other.untagged;
     }
 }
 
@@ -802,28 +814,49 @@ impl Provisional {
 impl Job {
     pub fn run(self) -> Outcome {
         let (solved, mut report) = parallel(self.threads, &self.work, solve_one);
-        let solutions: Vec<tally_wire::Solution> = solved.into_iter().flatten().collect();
-        let records = crate::window::pack_with(
+        let mut solutions: Vec<tally_wire::Solution> = Vec::new();
+        let mut tagged: Vec<TaggedSolution> = Vec::new();
+        for (solution, tag) in solved.into_iter().flatten() {
+            match tag {
+                Some(tag) => tagged.push(tag),
+                None => report.untagged += 1,
+            }
+            solutions.push(solution);
+        }
+        let content = |sequence: u64| (self.boot_id, sequence, self.issued_ms);
+        let records = pack_with(
             self.sequence,
             solutions,
+            Positions::fitting,
             |sequence, run: &[tally_wire::Solution]| {
                 Positions::sign_provisional(
                     &self.identity,
-                    &SolutionsContent {
-                        boot_id: self.boot_id,
-                        sequence,
-                        issued_ms: self.issued_ms,
-                        spec_version: SPEC_VERSION,
-                        solutions: run.to_vec(),
-                    },
+                    &solutions_content(content(sequence), run),
+                )
+            },
+        );
+        let sequence = self.sequence + records.len() as u64;
+        let tagged = pack_with(
+            sequence,
+            tagged,
+            Positions::fitting_tagged,
+            |sequence, run: &[TaggedSolution]| {
+                Positions::sign_tagged_provisional(
+                    &self.identity,
+                    &solutions_content(content(sequence), run),
                 )
             },
         );
         report.records = records.len();
+        report.tagged_records = tagged.len();
         report.add(&self.report);
         Outcome {
-            sequence: self.sequence + records.len() as u64,
-            records: records.into_iter().map(Record::Provisional).collect(),
+            sequence: sequence + tagged.len() as u64,
+            records: records
+                .into_iter()
+                .chain(tagged)
+                .map(Record::Provisional)
+                .collect(),
             report,
         }
     }
@@ -834,7 +867,7 @@ impl Job {
 fn solve_one(
     (carried, transmission): &(Arc<Carried>, Transmission),
     report: &mut Report,
-) -> Option<tally_wire::Solution> {
+) -> Option<(tally_wire::Solution, Option<TaggedSolution>)> {
     report.transmissions += 1;
     match publish::solve_published(
         &carried.calibrated,
@@ -844,10 +877,14 @@ fn solve_one(
     ) {
         Ok((_, wire)) => {
             report.solved += 1;
-            Some(tally_wire::Solution {
+            let solution = tally_wire::Solution {
                 addressed: tally_wire::AddressedCitation::default(),
                 ..wire
-            })
+            };
+            let tagged = solution
+                .tagged(|receiver| carried.keys.get(receiver).copied())
+                .ok();
+            Some((solution, tagged))
         }
         Err(Unpublished::Refuted(_)) => {
             report.rejected += 1;

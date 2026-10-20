@@ -1,9 +1,12 @@
 //! One program, end to end (RFC-0174 §2.1, §2.3): the simulator's receivers feed a real relay as
-//! feeders, the relay hosts the MLAT engine for the area they are in, and a plain client of that
-//! relay receives clock models, positions and provisional positions signed by the relay's own key,
-//! with no engine process and no engine link anywhere. The client checks them as anyone would:
-//! every model by the model verifier against the raw, every solution as a claim under the model it
-//! cites. Then the same across two relays: the feeders on a relay that solves nothing, whose raw
+//! feeders, the relay hosts the MLAT engine for the area they are in, and what it signs with its
+//! own key reaches its readers, with no engine process and no engine link anywhere. A relay link
+//! is handed the clock models and raw positions (read in process, as a member's sharing carries
+//! them: [`relay_view`]), and the test checks them as any relay would: every model by the model
+//! verifier against the raw, every solution as a claim under the model it cites. A plain client of
+//! the relay is sent their client forms alone (RFC-0171 §3.5): positions tagged, and passed only
+//! once the relay checked them against its own raw; model summaries; never raw, a site or a full
+//! model. Then the same across two relays: the feeders on a relay that solves nothing, whose raw
 //! reaches the relay that solves their area in one hop. Then RFC-0174 whole, across three relays
 //! that find one another from signed offers alone: selection, one-hop raw, sharing, and the
 //! regional and both world products, each checked by the client. And the choice itself across four
@@ -31,9 +34,11 @@ use tally_mlat_solver::sim::{self, Scenario, Simulation};
 use tally_mlat_solver::{
     Calibrated, ClockModel as Model, Reception, publish, verify, verify_model,
 };
+use tally_relay::fanout::Filter;
 use tally_relay::hub::Hub;
 use tally_relay::mlat_host::stepping::{Clock, Hosting, step};
 use tally_relay::mlat_host::{HostedMlat, MlatHost, MlatReport, SETTLE_MS, WindowClock};
+use tally_relay::subscription::Subscription;
 use tally_wire::noise;
 use tally_wire::rendezvous::AREA_RESOLUTION;
 use tally_wire::{
@@ -41,6 +46,7 @@ use tally_wire::{
     RelayAddress, Role, Streams,
 };
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::mpsc;
 use tokio::time::timeout;
 
 /// Each relay's stages on threads of their own, as a relay runs them (`Hub::staged`): its seals
@@ -96,11 +102,11 @@ impl Hosting for Pinned {
 }
 
 impl MlatHost for Pinned {
-    fn set_areas(&self, _chosen: Regions, descriptions: Vec<tally_wire::ReceiverInfo>) {
+    fn set_areas(&self, _chosen: Regions, descriptions: Vec<tally_mlat::intake::SiteRecord>) {
         self.host.set_areas(self.areas.clone(), descriptions);
     }
 
-    fn offer_description(&self, info: &tally_wire::ReceiverInfo, stamp_ms: u64) {
+    fn offer_description(&self, info: &tally_mlat::intake::SiteRecord, stamp_ms: u64) {
         self.host.offer_description(info, stamp_ms);
     }
 
@@ -301,20 +307,131 @@ async fn client(relay: &RelayAddress) -> Result<Reader<TcpStream>> {
     session
         .writer
         .send(&[Record::Subscribe {
-            streams: Streams::POSITIONS
-                .with(Streams::CLOCK_MODELS)
-                .with(Streams::PROVISIONAL),
+            streams: mlat_streams(),
             regions: Vec::new(),
         }])
         .await
         .map_err(text)?;
-    // The writing half stays open for as long as the client reads.
+    // The writing half stays open for as long as the client reads, and says it is there as a
+    // real client does.
     tokio::spawn(async move {
-        let writer = session.writer;
-        std::future::pending::<()>().await;
-        drop(writer);
+        let mut writer = session.writer;
+        let mut heartbeat = tokio::time::interval(Duration::from_secs(20));
+        loop {
+            heartbeat.tick().await;
+            if writer.send(&[Record::Heartbeat]).await.is_err() {
+                return;
+            }
+        }
     });
     Ok(session.reader)
+}
+
+/// What `hub`'s fan-out hands a relay link subscribed to `streams` of the whole world, record by
+/// record: the clock models and raw positions a member's sharing carries to other relays, which
+/// no test session can hold, read in process and as fast as they come (the checks are slower
+/// than the stream).
+fn relay_view(hub: &Hub, streams: Streams) -> mpsc::UnboundedReceiver<Record> {
+    let listener = hub.listen(
+        u64::MAX - 1,
+        Filter::Subscription(Subscription {
+            streams,
+            regions: Vec::new(),
+        }),
+    );
+    let (sent, received) = mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        let mut taken = Vec::new();
+        while listener.recv_many(&mut taken, 256).await.is_ok() {
+            for one in taken.drain(..) {
+                if sent.send((*one.into_item().record).clone()).is_err() {
+                    return;
+                }
+            }
+        }
+    });
+    received
+}
+
+/// A client's session read as fast as the relay sends, record by record.
+fn pumped(mut reader: Reader<TcpStream>) -> mpsc::UnboundedReceiver<Record> {
+    let (sent, received) = mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        let mut got = Vec::new();
+        while reader.recv(&mut got).await.is_ok() {
+            for record in got.drain(..) {
+                if sent.send(record).is_err() {
+                    return;
+                }
+            }
+        }
+    });
+    received
+}
+
+/// What no client may be sent (RFC-0171 §3.5): raw, a site, a description that carries one, a
+/// regional batch's counters, raw positions, or a full clock model.
+fn relay_only(record: &Record) -> bool {
+    match record {
+        Record::ReceiverInfo(info) => info.carries_site(),
+        Record::Batch(_)
+        | Record::RelayBatch(_)
+        | Record::RegionalBatch(_)
+        | Record::ReceiverSite(_)
+        | Record::ClockModel(_)
+        | Record::ClockModelPart(_) => true,
+        Record::Positions(positions) | Record::Provisional(positions) => !positions.is_tagged(),
+        _ => false,
+    }
+}
+
+/// What a client was sent of the MLAT.
+#[derive(Debug, Default)]
+struct Told {
+    finals: usize,
+    provisional: usize,
+    summaries: usize,
+}
+
+/// Reads a client until it holds a tagged final, a model summary and, if `provisional`, a tagged
+/// provisional, each signed by one of `relays`; fails on anything no client may be sent.
+async fn told(
+    client: &mut mpsc::UnboundedReceiver<Record>,
+    relays: &[PublicKey],
+    provisional: bool,
+) -> Result<Told> {
+    let mut told = Told::default();
+    let outcome = timeout(WAIT, async {
+        while told.finals == 0 || told.summaries == 0 || (provisional && told.provisional == 0) {
+            let record = client
+                .recv()
+                .await
+                .ok_or("the relay closed the client's session")?;
+            assert!(!relay_only(&record), "a client was sent {record:?}");
+            match &record {
+                Record::Positions(positions) | Record::Provisional(positions) => {
+                    positions.verify().map_err(text)?;
+                    assert!(relays.contains(&positions.engine().map_err(text)?));
+                    if positions.is_provisional() {
+                        told.provisional += 1;
+                    } else {
+                        told.finals += 1;
+                    }
+                }
+                Record::ClientClockModel(summary) => {
+                    assert!(relays.contains(&summary.signer().map_err(text)?));
+                    told.summaries += 1;
+                }
+                _ => {}
+            }
+        }
+        Ok::<_, String>(())
+    })
+    .await;
+    match outcome {
+        Ok(result) => result.map(|()| told),
+        Err(_) => Err(format!("before the deadline: {told:?}")),
+    }
 }
 
 /// Waits until `hub` has `links` more links in its fan-out than `before`.
@@ -351,22 +468,31 @@ async fn feed(
                 batches.push((wall, Record::Batch(batch)));
             }
         }
-        sending(session, Record::ReceiverInfo(feed.info), batches, clock);
+        sending(
+            session,
+            vec![
+                Record::ReceiverInfo(feed.info),
+                Record::ReceiverSite(feed.site),
+            ],
+            batches,
+            clock,
+        );
     }
     Ok(walls)
 }
 
-/// A feeder's session sending `description`, then each of `batches` once `clock` reaches its wall
-/// clock; connected for as long as the test runs, as a real feeder stays.
+/// A feeder's session sending `described` (its description and its site), then each of
+/// `batches` once `clock` reaches its wall clock; connected for as long as the test runs, as a
+/// real feeder stays.
 fn sending(
     mut session: tally_wire::noise::Session<TcpStream>,
-    description: Record,
+    described: Vec<Record>,
     batches: Vec<(u64, Record)>,
     clock: &Arc<Clock>,
 ) {
     let clock = Arc::clone(clock);
     tokio::spawn(async move {
-        if session.writer.send(&[description]).await.is_err() {
+        if session.writer.send(&described).await.is_err() {
             return;
         }
         for (wall, record) in batches {
@@ -476,7 +602,7 @@ fn check_positions(
     Ok(content.solutions.len())
 }
 
-/// What the client heard.
+/// What a relay link was handed, checked.
 #[derive(Debug, Default)]
 struct Heard {
     verified: usize,
@@ -484,10 +610,10 @@ struct Heard {
     provisional: usize,
 }
 
-/// Reads the client until `want` final solutions are verified and, if `provisional`, a
+/// Reads a relay link until `want` final solutions are verified and, if `provisional`, a
 /// provisional position citing a model it holds has come.
 async fn listen(
-    reader: &mut Reader<TcpStream>,
+    reader: &mut mpsc::UnboundedReceiver<Record>,
     relay: PublicKey,
     raw: &Raw,
     want: usize,
@@ -498,15 +624,23 @@ async fn listen(
     let mut heard = Heard::default();
     let outcome = timeout(WAIT, async {
         while heard.verified < want || (provisional && heard.provisional == 0) {
-            let mut got = Vec::new();
-            reader.recv(&mut got).await.map_err(text)?;
-            for record in got {
+            let record = reader
+                .recv()
+                .await
+                .ok_or("the relay's fan-out let its relay link go")?;
+            {
                 let assembled = match record {
                     Record::ClockModelPart(part) => assembler.part(part),
                     Record::ClockModel(model) => {
                         model.verify().map_err(text)?;
                         assert_eq!(model.engine().map_err(text)?, relay);
                         assembler.manifest(model).map_err(text)?
+                    }
+                    // A relay link is handed the client forms too; the raw ones are what it checks.
+                    Record::Positions(positions) | Record::Provisional(positions)
+                        if positions.is_tagged() =>
+                    {
+                        None
                     }
                     Record::Positions(positions) => {
                         heard.verified += check_positions(&positions, relay, &models, raw)?;
@@ -544,6 +678,27 @@ async fn listen(
     }
 }
 
+/// The MLAT's streams, as a relay link and a client subscribe to them.
+fn mlat_streams() -> Streams {
+    Streams::POSITIONS
+        .with(Streams::CLOCK_MODELS)
+        .with(Streams::PROVISIONAL)
+}
+
+/// A relay link's records checked (`listen`), then what a client was sent of the same (`told`).
+async fn read_both(
+    view: &mut mpsc::UnboundedReceiver<Record>,
+    client: &mut mpsc::UnboundedReceiver<Record>,
+    relay: PublicKey,
+    raw: &Raw,
+    want: usize,
+    provisional: bool,
+) -> Result<(Heard, Told)> {
+    let heard = listen(view, relay, raw, want, provisional).await?;
+    let told = told(client, &[relay], provisional).await?;
+    Ok((heard, told))
+}
+
 /// What a test heard, or why not: the clock's own error first when it stood still (a relay that
 /// never caught up), which the client's deadline only follows from. The clock stops with the test.
 async fn settled<T>(heard: Result<T>, stepper: tokio::task::JoinHandle<Result>) -> Result<T> {
@@ -575,13 +730,15 @@ async fn feeders_of_a_relay_hosting_mlat_give_its_clients_verifiable_positions_a
     let mlat = pinned(&identity)?;
     let (relay, hub) = relay(identity, &[], Some(Arc::clone(&mlat)), &clock).await?;
     let before = hub.listening();
-    let mut reader = client(&relay).await?;
-    listening(&hub, before, 1).await?;
+    let mut view = relay_view(&hub, mlat_streams());
+    let mut client = pumped(client(&relay).await?);
+    listening(&hub, before, 2).await?;
     let walls = feed(&simulation, &relay, &clock, first_window(split_ms)).await?;
     let stepper = stepping(clock, vec![Arc::clone(&mlat) as Arc<dyn Hosting>], walls);
-    let heard = listen(&mut reader, relay.key, &raw, 100, true).await;
-    let heard = settled(heard, stepper).await?;
+    let heard = read_both(&mut view, &mut client, relay.key, &raw, 100, true).await;
+    let (heard, told) = settled(heard, stepper).await?;
     assert!(heard.models > 0, "{heard:?}");
+    assert!(told.finals > 0 && told.summaries > 0, "{told:?}");
     // Nothing offered was let go, and the steps' reports were kept.
     let report = mlat.host.report();
     assert_eq!((report.refused, report.overflowed), (0, 0), "{report:?}");
@@ -605,13 +762,15 @@ async fn every_final_a_relay_publishes_passes_the_verifier_seed_53() -> Result {
     let mlat = pinned(&identity)?;
     let (relay, hub) = relay(identity, &[], Some(Arc::clone(&mlat)), &clock).await?;
     let before = hub.listening();
-    let mut reader = client(&relay).await?;
-    listening(&hub, before, 1).await?;
+    let mut view = relay_view(&hub, mlat_streams());
+    let mut client = pumped(client(&relay).await?);
+    listening(&hub, before, 2).await?;
     let walls = feed(&simulation, &relay, &clock, first_window(split_ms)).await?;
     let stepper = stepping(clock, vec![Arc::clone(&mlat) as Arc<dyn Hosting>], walls);
-    let heard = listen(&mut reader, relay.key, &raw, 100, false).await;
-    let heard = settled(heard, stepper).await?;
+    let heard = read_both(&mut view, &mut client, relay.key, &raw, 100, false).await;
+    let (heard, told) = settled(heard, stepper).await?;
     assert!(heard.models > 0, "{heard:?}");
+    assert!(told.finals > 0 && told.summaries > 0, "{told:?}");
     Ok(())
 }
 
@@ -677,13 +836,15 @@ async fn raw_from_a_relay_that_solves_nothing_reaches_the_relay_that_solves_its_
     .await
     .map_err(|_| "the solver never linked to the feeders' relay for raw".to_owned())?;
     let before = solver_hub.listening();
-    let mut reader = client(&solver).await?;
-    listening(&solver_hub, before, 1).await?;
+    let mut view = relay_view(&solver_hub, mlat_streams());
+    let mut client = pumped(client(&solver).await?);
+    listening(&solver_hub, before, 2).await?;
     let walls = feed(&simulation, &feeders, &clock, first_window(split_ms)).await?;
     let stepper = stepping(clock, vec![Arc::clone(&mlat) as Arc<dyn Hosting>], walls);
-    let heard = listen(&mut reader, solver.key, &raw, 40, false).await;
-    let heard = settled(heard, stepper).await?;
+    let heard = read_both(&mut view, &mut client, solver.key, &raw, 40, false).await;
+    let (heard, told) = settled(heard, stepper).await?;
     assert!(heard.models > 0, "{heard:?}");
+    assert!(told.finals > 0 && told.summaries > 0, "{told:?}");
     Ok(())
 }
 
@@ -737,11 +898,11 @@ impl Hosting for Gated {
 }
 
 impl MlatHost for Gated {
-    fn set_areas(&self, chosen: Regions, descriptions: Vec<tally_wire::ReceiverInfo>) {
+    fn set_areas(&self, chosen: Regions, descriptions: Vec<tally_mlat::intake::SiteRecord>) {
         self.host.set_areas(chosen, descriptions);
     }
 
-    fn offer_description(&self, info: &tally_wire::ReceiverInfo, stamp_ms: u64) {
+    fn offer_description(&self, info: &tally_mlat::intake::SiteRecord, stamp_ms: u64) {
         self.host.offer_description(info, stamp_ms);
     }
 
@@ -919,12 +1080,13 @@ fn confirm_model(model: Model, raw: &Raw) -> Result<Option<Checked>> {
 /// (`--upstream`) to the first, which accepts them (`--accept-relay`), and those links carry the
 /// directory and nothing else. From the offers alone each relay verifies the others, `selection` chooses the
 /// MLAT relays of each area (all three: k is three), each keeps one-hop raw links to the others,
-/// and the sharing groups carry each relay's feeders' data (descriptions first) to the rest. The
-/// client, on the relay that gathers both world products, receives clock models and final
+/// and the sharing groups carry each relay's feeders' data (descriptions first) to the rest. A
+/// relay link of the relay that gathers both world products is handed clock models and final
 /// positions from more than one relay, checked against the raw by the model verifier and the
 /// claim check; the regional product; a live world whose fixes it traces to the records they cite,
 /// multilaterated ones among them (provisional positions, under models carried); and a precise
-/// world whose MLAT fixes it traces to the final positions they cite. Every record of data crosses
+/// world whose MLAT fixes it traces to the final positions they cite. A plain client of that relay
+/// is sent each product's client form and nothing a client may not be (RFC-0171 §3.5). Every record of data crosses
 /// between relays over member links: each relay takes group records from its members, and no
 /// directory link carries any.
 ///
@@ -1025,6 +1187,15 @@ async fn three_relays_share_solve_and_serve_verifiable_positions_and_both_world_
     let feeds = simulation.feeds().map_err(text)?;
 
     let client = &members[0];
+    let every = Streams::POSITIONS
+        .with(Streams::CLOCK_MODELS)
+        .with(Streams::PROVISIONAL)
+        .with(Streams::REGIONAL)
+        .with(Streams::WORLD)
+        .with(Streams::WORLD_PRECISE);
+    // What a relay link of the client's relay is handed, checked below as any relay would: the
+    // models, the raw positions and the regional batches with their counters.
+    let mut records = relay_view(&client.hub, every);
     let stream = TcpStream::connect(&client.address.address)
         .await
         .map_err(text)?;
@@ -1039,12 +1210,7 @@ async fn three_relays_share_solve_and_serve_verifiable_positions_and_both_world_
     session
         .writer
         .send(&[Record::Subscribe {
-            streams: Streams::POSITIONS
-                .with(Streams::CLOCK_MODELS)
-                .with(Streams::PROVISIONAL)
-                .with(Streams::REGIONAL)
-                .with(Streams::WORLD)
-                .with(Streams::WORLD_PRECISE),
+            streams: every,
             regions: Vec::new(),
         }])
         .await
@@ -1062,19 +1228,32 @@ async fn three_relays_share_solve_and_serve_verifiable_positions_and_both_world_
             }
         }
     });
-    // Each record as it reached the client: the checks below take their time (a model is verified
-    // against the raw), and the session is read meanwhile.
-    let (received, mut records) = tokio::sync::mpsc::unbounded_channel::<Record>();
-    tokio::spawn(async move {
-        let mut got = Vec::new();
-        while reader.recv(&mut got).await.is_ok() {
-            for record in got.drain(..) {
-                if received.send(record).is_err() {
-                    return;
+    // The client is sent the client forms alone: what it was sent, kind by kind, and anything no
+    // client may be sent, counted as it comes.
+    let sent_to_client = Arc::new(std::sync::Mutex::new(BTreeMap::<&'static str, usize>::new()));
+    {
+        let sent_to_client = Arc::clone(&sent_to_client);
+        tokio::spawn(async move {
+            let mut got = Vec::new();
+            while reader.recv(&mut got).await.is_ok() {
+                for record in got.drain(..) {
+                    let kind = match &record {
+                        record if relay_only(record) => "relay-only",
+                        Record::Positions(_) => "positions",
+                        Record::Provisional(_) => "provisional",
+                        Record::ClientClockModel(_) => "model summary",
+                        Record::ClientRegionalBatch(_) => "regional",
+                        Record::WorldPositions(_) => "world",
+                        Record::WorldPrecise(_) => "precise world",
+                        _ => continue,
+                    };
+                    if let Ok(mut sent) = sent_to_client.lock() {
+                        *sent.entry(kind).or_default() += 1;
+                    }
                 }
             }
-        }
-    });
+        });
+    }
 
     // A third of the receivers on each relay, each naming the relay it chose (as tally-feed's
     // description does: that relay is the origin of its regional product), each batch sent once
@@ -1088,9 +1267,10 @@ async fn three_relays_share_solve_and_serve_verifiable_positions_and_both_world_
         let session = noise::connect(stream, &feed.identity, &relay.key, Role::Feeder)
             .await
             .map_err(text)?;
-        let mut described = feed.info.content().map_err(text)?;
+        let mut described = feed.info.public().map_err(text)?;
         described.relays = vec![relay.key];
-        let info = tally_wire::ReceiverInfo::sign(&feed.identity, &described).map_err(text)?;
+        let info =
+            tally_wire::ReceiverInfo::sign_public(&feed.identity, &described).map_err(text)?;
         let mut batches = Vec::new();
         for batch in feed.batches {
             let wall = batch.content().map_err(text)?.wall_ms;
@@ -1099,7 +1279,12 @@ async fn three_relays_share_solve_and_serve_verifiable_positions_and_both_world_
                 batches.push((wall, Record::Batch(batch)));
             }
         }
-        sending(session, Record::ReceiverInfo(info), batches, &clock);
+        sending(
+            session,
+            vec![Record::ReceiverInfo(info), Record::ReceiverSite(feed.site)],
+            batches,
+            &clock,
+        );
     }
     // Once the window comes due on the wall clock, the clock walks the scenario from its start, its
     // past as fast as the relays keep up: every relay's engine is offered every receiver's batches,
@@ -1133,13 +1318,19 @@ async fn three_relays_share_solve_and_serve_verifiable_positions_and_both_world_
             let record = records
                 .recv()
                 .await
-                .ok_or("the relay closed the client's session")?;
+                .ok_or("the relay's fan-out let its relay link go")?;
             let assembled = match &record {
                 Record::ClockModelPart(part) => assembler.part(part.clone()),
                 Record::ClockModel(model) => {
                     model.verify().map_err(text)?;
                     assert!(keys.contains(&model.engine().map_err(text)?));
                     assembler.manifest(model.clone()).map_err(text)?
+                }
+                // A relay link is handed the client forms too; the raw ones are what it checks.
+                Record::Positions(positions) | Record::Provisional(positions)
+                    if positions.is_tagged() =>
+                {
+                    None
                 }
                 Record::Positions(positions) => {
                     positions.verify().map_err(text)?;
@@ -1251,6 +1442,25 @@ async fn three_relays_share_solve_and_serve_verifiable_positions_and_both_world_
         Err(_) => Err(format!("before the deadline: {heard:?}")),
     };
     settled(outcome, stepper).await?;
+    // The client was sent every product's client form, and nothing a client may not be.
+    let sent = sent_to_client
+        .lock()
+        .map_err(|_| "the client's count was poisoned")?
+        .clone();
+    eprintln!("sent to the client: {sent:?}");
+    assert_eq!(sent.get("relay-only"), None, "{sent:?}");
+    for kind in [
+        "positions",
+        "model summary",
+        "regional",
+        "world",
+        "precise world",
+    ] {
+        assert!(
+            sent.get(kind).is_some_and(|n| *n > 0),
+            "no {kind}: {sent:?}"
+        );
+    }
     for (members_up, raw_up) in links {
         assert!(raw_up >= 2, "one-hop raw links: {raw_up}");
         assert!(members_up >= 1, "sharing member links: {members_up}");

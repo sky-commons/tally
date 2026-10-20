@@ -604,9 +604,10 @@ fn an_install_waits_for_publishing_and_prints_the_station_page() -> Result {
         ),
         "{out}"
     );
-    // Exact to the relays and blurred on every public page, said in one line; no flag for it.
+    // Exact to the relays alone, and only the public cell anywhere else, said in one line; no
+    // flag for it.
     assert!(
-        out.contains("Your exact location goes to Tally relays for MLAT. Relays show only a spot within about 5 km on any public page."),
+        out.contains("Your exact location goes only to Tally relays, for MLAT. Nothing a data user reads contains it; public maps show only the ~5 km area."),
         "{out}"
     );
     let written = sandbox.read("root/etc/default/tally-feed")?;
@@ -673,7 +674,7 @@ fn an_ultrafeeder_container_with_no_host_beast_gets_the_compose_route() -> Resul
         "- LAT=47.6",
         "- LONG=-122.3",
         "- ALT=120m",
-        "Your exact location goes to Tally relays for MLAT.",
+        "Your exact location goes only to Tally relays, for MLAT.",
     ] {
         assert!(out.contains(needed), "{needed:?}: {out}");
     }

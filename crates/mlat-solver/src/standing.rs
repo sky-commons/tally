@@ -2,8 +2,8 @@
 //! batches, engines' signed clock models and solutions), how far each receiver's receptions are to
 //! be believed, and when a bigger answer may replace a smaller one. Every party that reads the same
 //! records computes the same standing, so it is never on the wire. Relays (`tally-relay`'s
-//! `standing`) and clients (`tally-merge`) each keep a [`Book`] of it; both decide which of one
-//! transmission's solutions stands by [`decide`].
+//! `standing`), which hold those records, keep a [`Book`] of it; relays and clients (`tally-merge`)
+//! both decide which of one transmission's solutions stands by [`decide`].
 //!
 //! # The attack it answers
 //!
@@ -68,9 +68,14 @@
 //! receivers can sign their batches early with receptions computed from honest ones and publish
 //! the earliest solution itself, and so farm standing. It is bounded: one key's weight is at most
 //! one honest receiver's, earning is capped per period and decays, and standing never lets a
-//! disagreeing superset win. A keeper that does not hold raw (a client without `raw`) can check
-//! agreement but cannot see who heard what when, so it earns nobody standing and labels every
-//! position unconfirmed.
+//! disagreeing superset win.
+//!
+//! Standing is a relay's (`tally-relay`'s `standing`): it holds the raw, the full models and the
+//! raw solutions. A client holds none of them (wire version 3: a receiver's counters and a model's
+//! sites and offsets give its site), only tagged solutions and models' summaries, so it cannot
+//! see who heard what when, nor map a reception through a model: it decides between one
+//! transmission's tagged solutions by [`decide`] (agreement and the tie rule, over tag sets,
+//! [`Set`]) with no standing (`tally-merge`).
 //!
 //! The solver's gating by standing ([`ReceiverStanding::gated`]): a receiver whose standing is
 //! below `-GATED_BELOW` is one the specification's outlier rule should leave out.
@@ -80,7 +85,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use tally_wire::batch::Hash;
-use tally_wire::{EnuCovariance, ObservationSet, PublicKey, Relation, TransmitTime};
+use tally_wire::{EnuCovariance, ObservationSet, PublicKey, Relation, TaggedSet, TransmitTime};
 
 use crate::clock::{ClockModel, Reach};
 use crate::geo::{self, C, Geodetic};
@@ -396,9 +401,29 @@ pub fn under(model: &ClockModel, wire: &tally_wire::Solution, spec: u16) -> bool
         && publish::claim(model, wire, spec).is_ok()
 }
 
+/// An observation set as the rule compares two: a relay's raw `ObservationSet`, or the
+/// `TaggedSet` a client is sent (each reception its tag), which relate alike.
+pub trait Set {
+    fn relation(&self, other: &Self) -> Relation;
+}
+
+impl Set for ObservationSet {
+    fn relation(&self, other: &Self) -> Relation {
+        ObservationSet::relation(self, other)
+    }
+}
+
+impl Set for TaggedSet {
+    fn relation(&self, other: &Self) -> Relation {
+        TaggedSet::relation(self, other)
+    }
+}
+
 /// One solution as the rule weighs it.
 pub trait Candidate {
-    fn observations(&self) -> &ObservationSet;
+    /// What its observations are: raw (a relay's) or tagged (a client's).
+    type Set: Set;
+    fn observations(&self) -> &Self::Set;
     fn model_inputs(&self) -> &Hash;
     fn claimed(&self) -> Claimed;
     /// The sum of its receptions' receivers' weights, thousandths.
@@ -592,6 +617,8 @@ impl Solved {
 }
 
 impl Candidate for Weighed<'_> {
+    type Set = ObservationSet;
+
     fn observations(&self) -> &ObservationSet {
         &self.solved.observations
     }
@@ -1089,6 +1116,8 @@ mod tests {
     }
 
     impl Candidate for Item {
+        type Set = ObservationSet;
+
         fn observations(&self) -> &ObservationSet {
             &self.observations
         }

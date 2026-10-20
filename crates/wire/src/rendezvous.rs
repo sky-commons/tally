@@ -62,6 +62,15 @@ pub fn area_of_cell(cell: Region) -> Option<Region> {
     cell.ancestor(AREA_RESOLUTION)
 }
 
+/// The area a receiver is grouped, selected and published in: its public cell's parent at
+/// `AREA_RESOLUTION` (RFC-0174 §2.2, RFC-0171 §3.6). Never `area_of` its site: H3 cells do not
+/// nest exactly, so the area a site lies in can differ from its public cell's parent, and a
+/// relay that grouped by it would tell any reader of an area's records which side of an area's
+/// edge a receiver sits inside its public cell. `None` for a cell coarser than an area.
+pub fn area_of_public(public: Region) -> Option<Region> {
+    area_of_cell(public)
+}
+
 /// The areas a region is made of: itself when it is an area, the area it lies in when it is
 /// finer, and every area under it when it is coarser (at most 343, under a resolution 0 cell).
 pub fn areas_of(region: Region) -> Result<Vec<Region>, WireError> {

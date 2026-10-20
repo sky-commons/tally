@@ -3,116 +3,86 @@
 //! holds one current solution per aircraft here, and holds it the same whatever order the records
 //! arrived in and however many copies of each did.
 //!
-//! What it takes: `Positions` (format 3), provisional positions (`Record::Provisional`), tile
-//! `ClockModel` manifests and their
-//! `ClockModelPart`s, `FaultProof`s, and, when the client subscribes raw (`Settings::raw`),
-//! receivers' signed `Batch`es and `ReceiverInfo`s. What it holds per aircraft is a [`Track`]: its latest transmissions, each with the
-//! [`Fix`] kept and the alternatives it was preferred to.
+//! What it takes is what a client is sent ([`ClientRecord`], wire version 3): tagged `Positions`
+//! (format 5), tagged provisional positions (format 6), engines' `ClientClockModel`s (a model's
+//! summary: its id, inputs hash and window, nothing of which receivers it is of) and tagged
+//! `FaultProof`s. A client is never sent a receiver's site, its raw counters, a full model or a
+//! model's members, so
+//! it holds no raw and solves nothing itself: what checks and joins solutions here works on tag
+//! sets (`TaggedSet`), each reception a 16-byte tag only a relay holding the receiver's site and
+//! the raw can rematch (`tally_mlat_solver::publish::rematch`). What it holds per aircraft is a
+//! [`Track`]: its latest transmissions, each with the [`Fix`] kept and the alternatives it was
+//! preferred to.
 //!
-//! - **Every solution is checked against the model it cites before it counts.** The model must be
-//!   held, reassembled and checked part by part against its signed manifest (`Assembler`), read
-//!   under the specification it names, and its manifest's inputs hash must be the hash of what the
-//!   decoded model says it is a function of. The solution's message must name its aircraft,
-//!   every reception it cites must be of a member of the model's tile, and it must read back as a
-//!   claim under the model. That is the check without raw: signatures and content addresses
-//!   only, and the fix says so ([`Check::Signature`]). When the client holds the raw the model
-//!   was fitted from (it rebuilds the tile's members and input citation from its own raw and the
-//!   receivers' descriptions, and they are the model's exactly), the model is verified by the
-//!   model verifier, once; every solution under it by the solution verifier against the
-//!   client's own receptions, and by the assignment check (its tile is the one the rule gives
-//!   the aircraft, from the client's raw); a model or a solution that fails is dropped
-//!   ([`Check::Model`]). A client whose raw does not reproduce the citation (or the solution's
-//!   addressed citation) does not hold that raw, and falls back to the signature check. Bins are
-//!   sealed when a model of their window is checked: its engine solved it, so its raw is in.
+//! - **Every solution is checked against the model it cites before it counts**, by signatures
+//!   and content addresses: the record verifies under its engine's key; the model summary it cites
+//!   is held, signed by the same engine, and of the specification the record names; and the
+//!   solution's message names its aircraft. A client cannot verify a model or a solution from raw
+//!   (it holds neither the raw nor the sites): a relay does (`tally_relay`'s standing).
 //! - **Solutions merge per transmission, and only on evidence** (`Merge::same_transmission`). Two
 //!   solutions are of one transmission when they name one aircraft with the same message bytes
-//!   and either share a reception, or are tied through a clock model: a receiver one solution
-//!   cites is a clock of the other's model, which maps that reception to its own model time, and
-//!   less the range from the other's position that is the other's transmit time within
-//!   `TIE_NS` (every such receiver agreeing). A receiver in both with no reception in common heard
-//!   two transmissions. Nothing else joins: not transmit times, which two models state on origins
-//!   that agree only as well as their gauges' wall clocks (0.9 s apart in the simulator), and not
-//!   the bytes, which a Mode S reply (DF4, 5, 11, 20, 21) repeats exactly milliseconds apart to
-//!   another interrogator (a false join is invisible to any chi-square: each side fits itself).
-//!   A solution tied to more than one held transmission joins none. What is lost: two engines
-//!   whose solutions share no reception and no receiver of either's model are never merged, and
-//!   the aircraft's track holds both as separate transmissions (its current position is then the
-//!   latest by transmit time, which is the one place a transmit time across models is compared).
-//!   An aircraft's track holds its latest `TRANSMISSIONS` transmissions; its current position is
-//!   the latest one's fix.
-//! - **Within one transmission, by the full input set** (the observation set and the cited model's
-//!   inputs hash together): the same set is a duplicate, dropped, its signer added to the fix's
-//!   engines; a superset of observations wins only if it agrees with the smaller fix within the
-//!   smaller's covariance (RFC-0174 §2.12, `tally_mlat_solver::standing::decide`): one that does
-//!   not is contested, a fault, never the answer, kept as evidence (`Transmission::refused`,
-//!   `Transmission::contests`, `Merge::contested`) while the smaller stands, and only a smaller fix
-//!   consistent with its own receptions refuses anything (`Fix::consistent`); with the same model
-//!   inputs, an agreeing superset drops the subset; anything else is incomparable and never
-//!   averaged. Holding the raw of both, the client solves
-//!   the transmission itself from its raw, the aircraft's tile by the assignment rule
-//!   ([`Check::Resolved`]). Otherwise the one
-//!   that ranks first is kept and the other recorded as an alternative.
-//! - **The rule ranks by standing, then the tie rule** (RFC-0174 §2.12): first by the standing of
-//!   the solution's receivers (`Fix::standing`, from the client's `StandingLedger`, so ten new
-//!   keys add nothing), then by weight (the observations the solution cites plus the input count
-//!   of its model's citation), then by the lowest input set hash (`input_set`). A position fewer
-//!   than the solver's minimum of whose receivers have standing is labelled
-//!   `Confidence::Unconfirmed`. Standing is a function of the public records, so clients holding
-//!   the same records keep the same one.
-//! - **A fault proof convicts its signers.** A checked `FaultProof` (two solutions of one
-//!   observation set under one model that disagree; two different models of one inputs are no
-//!   fault from specification version 3, where optimality, not bytes, is the rule) marks each
-//!   engine it names as
-//!   faulted: what it signed is dropped from every track (a fix any other engine also signed
-//!   stands on that engine's word; a transmission whose fix is dropped keeps its best alternative), its
-//!   models are forgotten, and nothing it signs later counts.
-//! - **Provisional fixes** (`Record::Provisional`) are checked as a final solution is without raw
-//!   (their model held and whole, their receptions its members, a claim under it read back:
-//!   [`Check::Signature`]; the raw the model was fitted from cannot reach receptions newer than
-//!   its window) and held apart from the final transmissions, per aircraft, at most
-//!   `PROVISIONAL_PER_SECOND` a signer a second of transmit time and `PROVISIONALS_PER_AIRCRAFT`
-//!   in all. What is served ([`Track::served`]) is the latest final fix, unless a provisional one
-//!   is later by transmit time. A final fix of the same transmission (`same_transmission`)
-//!   supersedes a provisional one, which is then forgotten (one arriving after it is not held); a
-//!   final fix of the aircraft within `CONFIRM_WITHIN_MS` that puts it inside `CONFIRM_GATE` (both
-//!   horizontal covariances and `CONFIRM_SPEED_M_PER_S` of motion) confirms it. A client learns
-//!   of a retraction by the deadline rule, needing no message: one neither superseded nor
-//!   confirmed `PROVISIONAL_DEADLINE_MS` after it arrived, by the client's clock, is retracted,
-//!   forgotten and counted against its signers ([`Merge::retractions`]). Each fix held ends
-//!   superseded, confirmed, retracted or forgotten ([`ProvisionalCounts`]).
+//!   and share a tag: a tag is one receiver's one reception of those bytes, so two sets that share
+//!   one are of one transmission. Nothing else joins: not transmit times, which two models state on
+//!   origins that agree only as well as their gauges' wall clocks (0.9 s apart in the simulator),
+//!   and not the bytes, which a Mode S reply (DF4, 5, 11, 20, 21) repeats exactly milliseconds
+//!   apart to another interrogator (a false join is invisible to any chi-square: each side fits
+//!   itself). A solution sharing a tag with more than one held transmission joins none. What is
+//!   lost: two engines whose solutions share no reception are never merged, and the aircraft's
+//!   track holds both as separate transmissions (its current position is then the latest by
+//!   transmit time, which is the one place a transmit time across models is compared). A tie
+//!   through a model (mapping one solution's receptions through the other's clocks) needs the
+//!   receivers' sites and offsets, which a client is not sent. An aircraft's track holds its latest
+//!   `TRANSMISSIONS` transmissions; its current position is the latest one's fix.
+//! - **Within one transmission, by the full input set** (the tag set and the cited model's inputs
+//!   hash together, `tally_wire::products::input_set`): the same set is a duplicate, dropped, its
+//!   signer added to the fix's engines; a superset of tags wins only if it agrees with the smaller
+//!   fix within the smaller's covariance (RFC-0174 §2.12, `tally_mlat_solver::standing::decide`):
+//!   one that does not is contested, a fault, never the answer, kept as evidence
+//!   (`Transmission::refused`, `Transmission::contests`, `Merge::contested`) while the smaller
+//!   stands; with the same model inputs, an agreeing superset drops the subset; anything else is
+//!   incomparable and never averaged: the one that ranks first is kept and the other recorded as an
+//!   alternative.
+//! - **The rule ranks by the tie rule** (the rule's `rank` with no standing, which is a relay's):
+//!   by weight (the tags the solution cites), then by the lowest input set hash (`input_set`). A
+//!   client cannot tell whether a smaller fix agrees with its own receptions (that needs its
+//!   model's sites), so every fix here may refuse a disagreeing superset; a relay, which can, drops
+//!   one that does not before it forwards it.
+//! - **A fault proof convicts its signers.** A checked tagged `FaultProof` (two solutions of one
+//!   tag set under one model that disagree) marks each engine it names as faulted: what it signed
+//!   is dropped from every track (a fix any other engine also signed stands on that engine's word;
+//!   a transmission whose fix is dropped keeps its best alternative), its models are forgotten,
+//!   and nothing it signs later counts.
+//! - **Provisional fixes** (`ClientRecord::Provisional`) are checked as a final solution is and
+//!   held apart from the final transmissions, per aircraft, at most `PROVISIONAL_PER_SECOND` a
+//!   signer a second of transmit time and `PROVISIONALS_PER_AIRCRAFT` in all. What is served
+//!   ([`Track::served`]) is the latest final fix, unless a provisional one is later by transmit
+//!   time. A final fix of the same transmission (`same_transmission`) supersedes a provisional one,
+//!   which is then forgotten (one arriving after it is not held); a final fix of the aircraft
+//!   within `CONFIRM_WITHIN_MS` that puts it inside `CONFIRM_GATE` (both horizontal covariances and
+//!   `CONFIRM_SPEED_M_PER_S` of motion) confirms it. A client learns of a retraction by the
+//!   deadline rule, needing no message: one neither superseded nor confirmed
+//!   `PROVISIONAL_DEADLINE_MS` after it arrived, by the client's clock, is retracted, forgotten and
+//!   counted against its signers ([`Merge::retractions`]). Each fix held ends superseded,
+//!   confirmed, retracted or forgotten ([`ProvisionalCounts`]).
 //! - **Memory is bounded**, every table least-recently-active first (the relay's `Bounded`):
-//!   tracks, models, solutions waiting for their model, faulted keys, receiver descriptions and
-//!   resolved fits by count, and raw (`Held`) by bytes, forgotten by bin as the caller's clock
-//!   moves on.
+//!   tracks, models, solutions waiting for their model and faulted keys by count.
 
+pub mod contest;
 pub mod link;
-pub mod standing;
 
-pub use standing::{Confidence, Contest, StandingLedger, SupersetVerdict, superset_verdict};
+pub use contest::{Contest, SupersetVerdict, superset_verdict};
 
 use std::collections::BTreeSet;
-use std::sync::Arc;
 
-use tally_mlat_solver::held::Held;
-use tally_mlat_solver::obs::message_hash;
-use tally_mlat_solver::scope::{AFTER, BEFORE, STRIDE, Sites, Window, WindowIndex, bin_of};
-use tally_mlat_solver::standing::{Candidate, Claimed, Solved, consistent, decide};
-use tally_mlat_solver::{
-    Calibrated, ObservationId, Reach, Site, Tile, judges, modes, publish, verify, verify_model,
-};
+use tally_mlat_solver::modes;
+use tally_mlat_solver::standing::{Candidate, Claimed, decide};
 use tally_relay::bounded::Bounded;
 use tally_wire::batch::Hash;
-use tally_wire::clock_model::Assembler;
 use tally_wire::{
-    ClockModel, FaultProof, ObservationSet, Positions, PublicKey, Record, Relation, Tolerance,
-    TransmitTime,
+    ClientClockModel, ClientFaultProof, ClientRecord, Positions, PublicKey, TaggedSet,
+    TaggedSolution, Tolerance, TransmitTime,
 };
 
-/// How closely a reception mapped through another solution's clock model must put that solution's
-/// transmit time for the two to be tied: well above two honest models' disagreement (clock error
-/// of tens of nanoseconds, and the two positions' difference in range, a few hundred metres),
-/// and a thousandth of the closest two Mode S replies to different interrogators come.
-pub const TIE_NS: u64 = 2_000;
 /// Transmissions kept per aircraft, the latest. Two engines' transmit times are on their models'
 /// own time origins, which agree only as well as the gauges' wall clocks when neither is GNSS
 /// disciplined, so one aircraft's transmissions are held a few at a time and a solution joins the
@@ -142,59 +112,29 @@ pub const CONFIRM_SPEED_M_PER_S: f64 = 300.0;
 /// The gate a final fix must put a provisional one inside to confirm it: chi-square with two
 /// degrees of freedom at 0.999.
 pub const CONFIRM_GATE: f64 = 13.815_51;
-/// Bins of raw kept behind the caller's clock beyond a canonical window, for the settling time and
-/// a relay's delay.
-const RAW_SPARE_BINS: i64 = 4;
 
 /// How much the client holds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Settings {
-    /// The client also subscribes raw, and verifies and re-solves from it.
-    pub raw: bool,
     pub max_aircraft: usize,
     pub max_models: usize,
-    /// Bytes of clock model parts waiting for their manifest.
-    pub max_model_bytes: usize,
     /// Models solutions are waiting for.
     pub max_pending: usize,
     pub max_faulted: usize,
-    /// Bytes of raw held, when `raw` (`tally_mlat_solver::held`).
-    pub max_held: usize,
-    /// Receivers whose descriptions are held, when `raw`.
-    pub max_receivers: usize,
-    /// Fits of unions the client solved itself, remembered.
-    pub max_resolved: usize,
     /// Provisional fixes held in all, waiting for a final one.
     pub max_provisional: usize,
 }
 
-impl Settings {
-    pub fn new(raw: bool) -> Self {
+impl Default for Settings {
+    fn default() -> Self {
         Self {
-            raw,
             max_aircraft: 65_536,
             max_models: 16_384,
-            max_model_bytes: 64 << 20,
             max_pending: 1_024,
             max_faulted: 4_096,
-            max_held: 4 << 30,
-            max_receivers: 32_768,
-            max_resolved: 1_024,
             max_provisional: 262_144,
         }
     }
-}
-
-/// How a fix was checked.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum Check {
-    /// The model by the model verifier and the solution by the solution verifier, from the
-    /// client's own raw.
-    Model,
-    /// Signatures and content addresses only: the client does not hold the model's raw.
-    Signature,
-    /// The client solved the union of incomparable solutions itself, from its own raw.
-    Resolved,
 }
 
 /// Whether a fix is final or provisional.
@@ -224,62 +164,34 @@ pub struct Fix {
     pub horizontal_sigma_m: f64,
     /// The position's covariance as published, east-north-up metres squared.
     pub covariance: tally_wire::EnuCovariance,
-    pub observations: ObservationSet,
-    /// The cited model's id (`ClockModel::id`); a resolved fix's own model's inputs hash.
+    /// The message and its receptions' tags.
+    pub observations: TaggedSet,
+    /// The cited model's id (`ClockModel::id`, as its `ClientClockModel` names it).
     pub model: Hash,
-    /// The cited model's inputs hash (`Manifest::inputs`).
+    /// The cited model's inputs hash.
     pub model_inputs: Hash,
-    /// BLAKE2s-256 over `"tally merge input set" 0x00`, the observation set hash and the model
-    /// inputs hash: the full input set's identity.
+    /// BLAKE2s-256 over `"tally merge input set" 0x00`, the tag set hash and the model inputs
+    /// hash: the full input set's identity.
     pub input_set: Hash,
-    /// Observations cited plus the model citation's input count.
+    /// The tags cited: the tie rule's weight.
     pub weight: u64,
-    pub check: Check,
-    /// The engines that signed it (and the model it cites); none for a resolved fix.
+    /// The engines that signed it (and the model it cites).
     pub engines: BTreeSet<PublicKey>,
-    /// Its receptions' receivers' standing at its transmit time, thousandths summed, as the
-    /// merge's ledger holds it now (re-read whenever a receiver it cites changes standing, never
-    /// frozen when the fix arrived): what it ranks by before its count (RFC-0174 §2.12).
-    pub standing: u64,
-    /// Whether its receivers carry it, as the ledger holds it now: an `Unconfirmed` position is
-    /// drawn labelled so. A fix not consistent with its own receptions is always unconfirmed.
-    pub confidence: Confidence,
-    /// Whether it agrees with its own receptions under its own model, which anyone can tell
-    /// without raw (`tally_mlat_solver::standing::consistent`). Only a consistent fix refuses a
-    /// superset that disagrees with it.
-    pub consistent: bool,
 }
 
 impl Fix {
-    /// The rule's order (`tally_mlat_solver::standing::rank`): resolved first, then standing,
-    /// then the tie rule's weight, then the lowest input set hash. The less ranks first.
+    /// The rule's order (`tally_mlat_solver::standing::rank`): the tie rule's weight, then the
+    /// lowest input set hash. The less ranks first.
     #[cfg(test)]
     fn rank(&self) -> (bool, std::cmp::Reverse<u64>, std::cmp::Reverse<u64>, Hash) {
         tally_mlat_solver::standing::rank(self)
     }
-
-    /// Whether it cites a reception of one of `receivers`.
-    fn cites(&self, receivers: &BTreeSet<PublicKey>) -> bool {
-        self.observations
-            .receptions()
-            .iter()
-            .any(|reception| receivers.contains(&reception.receiver))
-    }
-
-    /// Its position, ECEF metres, when it states a height.
-    fn ecef(&self) -> Option<[f64; 3]> {
-        Some(tally_mlat_solver::geo::to_ecef(
-            tally_mlat_solver::geo::Geodetic {
-                lat_deg: f64::from(self.lat_e7) * 1e-7,
-                lon_deg: f64::from(self.lon_e7) * 1e-7,
-                height_m: f64::from(self.alt_hae_mm?) / 1000.0,
-            },
-        ))
-    }
 }
 
 impl Candidate for Fix {
-    fn observations(&self) -> &ObservationSet {
+    type Set = TaggedSet;
+
+    fn observations(&self) -> &TaggedSet {
         &self.observations
     }
 
@@ -288,11 +200,12 @@ impl Candidate for Fix {
     }
 
     fn claimed(&self) -> Claimed {
-        standing::claimed(self)
+        contest::claimed(self)
     }
 
+    /// Standing is a relay's: a client cannot tell who heard what when.
     fn standing(&self) -> u64 {
-        self.standing
+        0
     }
 
     fn weight(&self) -> u64 {
@@ -303,34 +216,23 @@ impl Candidate for Fix {
         self.input_set
     }
 
+    /// Whether it agrees with its own receptions under its own model needs the model's sites,
+    /// which a client is not sent: a relay drops one that does not before it forwards it.
     fn consistent(&self) -> bool {
-        self.consistent
-    }
-
-    fn preferred(&self) -> bool {
-        self.check == Check::Resolved
+        true
     }
 }
 
-/// Whether the two share a reception, and whether a receiver is in both.
-fn in_common(a: &ObservationSet, b: &ObservationSet) -> (bool, bool) {
-    let theirs = b.receptions();
-    let mut receiver = false;
-    for reception in a.receptions() {
-        if theirs.contains(reception) {
-            return (true, true);
-        }
-        receiver |= theirs
-            .iter()
-            .any(|other| other.receiver == reception.receiver && other.epoch == reception.epoch);
-    }
-    (false, receiver)
+/// Whether the two share a tag: a reception in common.
+fn in_common(a: &TaggedSet, b: &TaggedSet) -> bool {
+    let theirs = b.tags();
+    a.tags().iter().any(|tag| theirs.binary_search(tag).is_ok())
 }
 
 /// The solutions of one transmission the merge holds, as the rule decides them
 /// (`tally_mlat_solver::standing::decide`, RFC-0174 §2.12): none dominated by another (the same
-/// model's inputs and a subset of an agreeing superset's observations), none refused (a superset
-/// that disagrees with a smaller fix: contested, a fault, never the answer), best first by `order`,
+/// model's inputs and a subset of an agreeing superset's tags), none refused (a superset that
+/// disagrees with a smaller fix: contested, a fault, never the answer), best first by `order`,
 /// at most `ALTERNATIVES` after the first. A function of the set of solutions taken, whatever order
 /// they came in.
 #[derive(Clone, Debug, PartialEq)]
@@ -344,22 +246,14 @@ pub struct Transmission {
 }
 
 impl Transmission {
-    fn new(fix: Fix, ledger: &StandingLedger) -> Self {
+    fn new(fix: Fix) -> Self {
         let mut transmission = Self {
             fixes: vec![fix],
             refused: Vec::new(),
             contests: Vec::new(),
         };
-        transmission.normalize(ledger);
+        transmission.normalize();
         transmission
-    }
-
-    /// Whether a fix it holds (kept or refused) cites a reception of one of `receivers`.
-    fn cites(&self, receivers: &BTreeSet<PublicKey>) -> bool {
-        self.fixes
-            .iter()
-            .chain(&self.refused)
-            .any(|fix| fix.cites(receivers))
     }
 
     /// Whether the transmission is contested: a superset of one of its fixes disagreed with it.
@@ -377,10 +271,9 @@ impl Transmission {
         &self.fixes[1..]
     }
 
-    /// Puts the fixes in their canonical form, by the rule, each weighed by its receivers'
-    /// standing as `ledger` holds it now (never as it was when the fix arrived), so the same fixes
-    /// under the same ledger rank the same in any arrival order.
-    fn normalize(&mut self, ledger: &StandingLedger) {
+    /// Puts the fixes in their canonical form, by the rule, so the same fixes rank the same in any
+    /// arrival order.
+    fn normalize(&mut self) {
         let mut fixes = std::mem::take(&mut self.fixes);
         fixes.append(&mut self.refused);
         let mut kept: Vec<Fix> = Vec::with_capacity(fixes.len());
@@ -389,9 +282,6 @@ impl Transmission {
                 Some(held) => held.engines.extend(fix.engines),
                 None => kept.push(fix),
             }
-        }
-        for fix in &mut kept {
-            ledger.weigh(fix);
         }
         let decision = decide(&kept);
         let mut contests: Vec<Contest> = decision
@@ -510,12 +400,8 @@ pub enum Ingested {
         dropped: usize,
         pending: usize,
     },
-    /// A model completed and held.
+    /// A model summary held.
     Model,
-    /// Raw observations new to the held set.
-    Raw {
-        new: usize,
-    },
     /// A checked fault proof.
     Fault,
     /// Provisional solutions taken: how many are held, and how many were not (failed a check,
@@ -545,60 +431,30 @@ pub struct ProvisionalCounts {
     pub forgotten: u64,
 }
 
-/// What a held model is and what checking it showed.
+/// What a held model summary says, as the merge needs it.
 struct Model {
-    engine: PublicKey,
     spec: u16,
     inputs: Hash,
-    decoded: Arc<tally_mlat_solver::ClockModel>,
-    raw: RawCheck,
 }
 
-enum RawCheck {
-    /// Not looked at yet (the raw it needs may still be arriving).
-    Unchecked,
-    /// The client's raw reproduces the model's inputs and the model verifier passed it.
-    Verified(Box<Calibrated>),
-    /// The client's raw does not reproduce its inputs.
-    NotHeld,
-    /// Of a specification version this client's verifier does not implement (`judges`): it
-    /// cannot say, so the model's solutions count by signature, as a model whose raw it lacks.
-    Unjudged,
-    /// The model verifier failed it: nothing under it counts.
-    Failed,
-}
+/// A model is held by its id and the engine that signed its summary: a summary another key signs
+/// naming the same id is that key's claim alone, and counts only for that key's own solutions.
+type ModelKey = (Hash, PublicKey);
 
-/// A tile the client fitted itself from its raw, and what solving under it needs.
-struct Resolver {
-    model: tally_mlat_solver::ClockModel,
-    inputs: Hash,
-    calibrated: Calibrated,
-}
-
-/// What a resolved fit is keyed by: the tile, its window, and its input citation.
-type ResolveKey = (Tile, Window, Hash);
-
-/// Solutions waiting for their model: signer, specification, issue time, solution.
-type Waiting = Vec<(PublicKey, u16, u64, tally_wire::Solution)>;
+/// Solutions waiting for their model: specification and solution.
+type Waiting = Vec<(u16, TaggedSolution)>;
 
 pub struct Merge {
     settings: Settings,
     tracks: Bounded<u32, Track>,
-    models: Bounded<Hash, Model>,
-    assembler: Assembler,
-    pending: Bounded<Hash, Waiting>,
+    models: Bounded<ModelKey, Model>,
+    pending: Bounded<ModelKey, Waiting>,
     faulted: Bounded<PublicKey, ()>,
-    held: Held,
-    /// The receivers described, raw mode only: their newest description's issue time and site.
-    sites: Bounded<PublicKey, (u64, Site)>,
-    resolved: Bounded<ResolveKey, Option<Resolver>>,
     /// Every provisional fix held, by (deadline, aircraft, input set): what `expire` walks.
     deadlines: BTreeSet<(u64, u32, Hash)>,
     /// Provisional fixes each signer had retracted.
     retracted: Bounded<PublicKey, u64>,
     counts: ProvisionalCounts,
-    /// Receivers' standing (RFC-0174 §2.12).
-    ledger: StandingLedger,
     /// Supersets refused for disagreeing with a smaller fix, since the merge began.
     contested: u64,
 }
@@ -625,16 +481,11 @@ impl Merge {
             settings,
             tracks: Bounded::new(settings.max_aircraft),
             models: Bounded::new(settings.max_models),
-            assembler: Assembler::new(settings.max_model_bytes, settings.max_pending),
             pending: Bounded::new(settings.max_pending),
             faulted: Bounded::new(settings.max_faulted),
-            held: Held::new(if settings.raw { settings.max_held } else { 0 }),
-            sites: Bounded::new(settings.max_receivers),
-            resolved: Bounded::new(settings.max_resolved),
             deadlines: BTreeSet::new(),
             retracted: Bounded::new(settings.max_faulted),
             counts: ProvisionalCounts::default(),
-            ledger: StandingLedger::new(settings.max_provisional, settings.max_receivers),
             contested: 0,
         }
     }
@@ -645,45 +496,9 @@ impl Merge {
     }
 
     /// Lets the caller's clock move to `now_ms` with no record: provisional fixes past their
-    /// deadline are retracted, and transmissions due are settled for standing.
+    /// deadline are retracted.
     pub fn tick(&mut self, now_ms: u64) {
         self.expire(now_ms);
-        let changed = self.ledger.settle(now_ms, &self.held);
-        if !changed.is_empty() {
-            self.reweigh(&changed);
-        }
-    }
-
-    /// Every held fix citing one of `receivers`, whose standing just changed, weighed again and
-    /// its transmission ranked again: the ranking is a function of the fixes held and the ledger,
-    /// never of when either arrived.
-    fn reweigh(&mut self, receivers: &BTreeSet<PublicKey>) {
-        let addresses: Vec<u32> = self.tracks.iter().map(|(address, _)| *address).collect();
-        for address in addresses {
-            let Some(track) = self.tracks.get_mut(&address) else {
-                continue;
-            };
-            let mut ranked = false;
-            for transmission in &mut track.transmissions {
-                if transmission.cites(receivers) {
-                    transmission.normalize(&self.ledger);
-                    ranked = true;
-                }
-            }
-            for held in &mut track.provisional {
-                if held.fix.cites(receivers) {
-                    self.ledger.weigh(&mut held.fix);
-                }
-            }
-            if ranked {
-                track.arrange();
-            }
-        }
-    }
-
-    /// Receivers' standing as this client reads the records (RFC-0174 §2.12).
-    pub fn standing(&self) -> &StandingLedger {
-        &self.ledger
     }
 
     /// Supersets refused for disagreeing with a smaller fix of their transmission, since the merge
@@ -716,12 +531,11 @@ impl Merge {
     /// Whether the merge holds `solution` as a final fix of its aircraft: it passed every check
     /// and the rule keeps it (ranked, not refused, dominated or dropped). A client that credits
     /// anyone for a published position asks this, never the record alone.
-    pub fn holds(&self, solution: &tally_wire::Solution) -> bool {
+    pub fn holds(&self, solution: &TaggedSolution) -> bool {
         self.tracks.get(&solution.address).is_some_and(|track| {
             track.transmissions.iter().any(|transmission| {
                 transmission.fixes.iter().any(|fix| {
                     fix.kind == Kind::Final
-                        && fix.check != Check::Resolved
                         && fix.model == solution.clock_model
                         && fix.observations == solution.observations
                 })
@@ -729,30 +543,8 @@ impl Merge {
         })
     }
 
-    /// Whether `reception` of `message`, transmitted at `transmitted_ms`, is in its receiver's
-    /// own signed raw as the merge holds it (`Settings::raw`; without raw, never).
-    pub fn heard(
-        &self,
-        reception: &tally_wire::Reception,
-        message: &[u8],
-        transmitted_ms: u64,
-    ) -> bool {
-        let id = ObservationId {
-            receiver: reception.receiver,
-            epoch: reception.epoch,
-            timestamp: reception.counter,
-            message: message_hash(message),
-        };
-        tally_mlat_solver::standing::heard_in(&self.held, &id, transmitted_ms).is_some()
-    }
-
     pub fn is_faulted(&self, engine: &PublicKey) -> bool {
         self.faulted.get(engine).is_some()
-    }
-
-    /// Raw observations held.
-    pub fn held(&self) -> usize {
-        self.held.len()
     }
 
     /// Models held.
@@ -761,117 +553,46 @@ impl Merge {
     }
 
     /// Takes one record a relay delivered. `now_ms` is the client's wall clock, which decides
-    /// only when raw is forgotten and when a provisional fix's deadline has passed. An error is a record that claimed to be signed and is not.
-    pub fn ingest(&mut self, record: &Record, now_ms: u64) -> Result<Ingested, String> {
+    /// only when a provisional fix's deadline has passed. An error is a record that claimed to be
+    /// signed and is not.
+    pub fn ingest(&mut self, record: &ClientRecord, now_ms: u64) -> Result<Ingested, String> {
         self.tick(now_ms);
         match record {
-            Record::Batch(batch) if self.settings.raw => {
-                let key = batch.receiver().map_err(|error| error.to_string())?;
-                batch
-                    .verify()
-                    .map_err(|error| format!("batch of {key}: {error}"))?;
-                let Ok(content) = batch.content() else {
-                    return Ok(Ingested::Ignored);
-                };
-                // Taken in at the client's clock: raw of a bin further ahead of it than
-                // `held::AHEAD_MS` is refused here as every relay refuses it by its stamp.
-                let added = self.held.add(key, &content, now_ms);
-                // Bins are sealed when a model of their window is checked (its engine solved it,
-                // so its raw is in); what no window can still need is forgotten.
-                self.held
-                    .forget_before(bin_of(now_ms) - BEFORE - AFTER - STRIDE - RAW_SPARE_BINS);
-                Ok(Ingested::Raw { new: added.new })
+            ClientRecord::ClockModel(model) => self.model(model),
+            ClientRecord::Positions(positions) => self.positions(positions.get()),
+            ClientRecord::Provisional(positions) => {
+                self.provisional_positions(positions.get(), now_ms)
             }
-            Record::ReceiverInfo(info) if self.settings.raw => {
-                let key = info.receiver().map_err(|error| error.to_string())?;
-                info.verify()
-                    .map_err(|error| format!("receiver info of {key}: {error}"))?;
-                let Ok(content) = info.content() else {
-                    return Ok(Ingested::Ignored);
-                };
-                let Some(location) = content.location else {
-                    return Ok(Ingested::Ignored);
-                };
-                if self
-                    .sites
-                    .get(&key)
-                    .is_some_and(|(issued, _)| *issued >= content.issued_ms)
-                {
-                    return Ok(Ingested::Ignored);
-                }
-                self.sites.insert_active(
-                    key,
-                    (
-                        content.issued_ms,
-                        Site {
-                            receiver: key,
-                            clock: content.clock,
-                            location,
-                        },
-                    ),
-                );
-                Ok(Ingested::Ignored)
-            }
-            Record::ClockModel(model) => {
-                let engine = model.engine().map_err(|error| error.to_string())?;
-                if self.is_faulted(&engine) {
-                    return Ok(Ingested::Ignored);
-                }
-                match self
-                    .assembler
-                    .manifest(model.clone())
-                    .map_err(|error| format!("clock model of {engine}: {error}"))?
-                {
-                    Some((manifest, content)) => Ok(self.hold_model(&manifest, content)),
-                    None => Ok(Ingested::Ignored),
-                }
-            }
-            Record::ClockModelPart(part) => match self.assembler.part(part.clone()) {
-                Some((manifest, content)) => Ok(self.hold_model(&manifest, content)),
-                None => Ok(Ingested::Ignored),
-            },
-            Record::Positions(positions) => self.positions(positions),
-            Record::Provisional(positions) => self.provisional_positions(positions, now_ms),
-            Record::FaultProof(proof) => Ok(self.fault_proof(proof)),
+            ClientRecord::FaultProof(proof) => Ok(self.fault_proof(proof)),
             _ => Ok(Ingested::Ignored),
         }
     }
 
-    fn hold_model(
-        &mut self,
-        manifest: &ClockModel,
-        content: tally_wire::ClockModelContent,
-    ) -> Ingested {
-        let Ok(engine) = manifest.engine() else {
-            return Ingested::Ignored;
-        };
+    fn model(&mut self, model: &ClientClockModel) -> Result<Ingested, String> {
+        let engine = model.signer().map_err(|error| error.to_string())?;
+        model
+            .verify()
+            .map_err(|error| format!("clock model of {engine}: {error}"))?;
         if self.is_faulted(&engine) {
-            return Ingested::Ignored;
+            return Ok(Ingested::Ignored);
         }
-        // Read under the specification it names, and it must be a function of what it says.
-        let Ok(decoded) = publish::decode(&content.model, content.spec_version) else {
-            return Ingested::Ignored;
+        let Ok(content) = model.content() else {
+            return Ok(Ingested::Ignored);
         };
-        if publish::inputs_id(&decoded) != content.inputs {
-            return Ingested::Ignored;
-        }
-        let id = manifest.id();
+        let key = (content.model, engine);
         self.models.insert_active(
-            id,
+            key,
             Model {
-                engine,
                 spec: content.spec_version,
                 inputs: content.inputs,
-                decoded: Arc::new(decoded),
-                raw: RawCheck::Unchecked,
             },
         );
-        if let Some(waiting) = self.pending.remove(&id) {
-            for (engine, spec, issued_ms, solution) in waiting {
-                self.solution(engine, spec, issued_ms, solution, &mut Tally::default());
+        if let Some(waiting) = self.pending.remove(&key) {
+            for (spec, solution) in waiting {
+                self.solution(engine, spec, solution, &mut Tally::default());
             }
         }
-        Ingested::Model
+        Ok(Ingested::Model)
     }
 
     fn positions(&mut self, positions: &Positions) -> Result<Ingested, String> {
@@ -879,21 +600,15 @@ impl Merge {
         positions
             .verify()
             .map_err(|error| format!("positions of {engine}: {error}"))?;
-        if self.is_faulted(&engine) {
+        if self.is_faulted(&engine) || positions.is_provisional() {
             return Ok(Ingested::Ignored);
         }
-        let Ok(content) = positions.solutions() else {
+        let Ok(content) = positions.tagged_solutions() else {
             return Ok(Ingested::Ignored);
         };
         let mut tally = Tally::default();
         for solution in content.solutions {
-            self.solution(
-                engine,
-                content.spec_version,
-                content.issued_ms,
-                solution,
-                &mut tally,
-            );
+            self.solution(engine, content.spec_version, solution, &mut tally);
         }
         Ok(Ingested::Solutions {
             accepted: tally.accepted,
@@ -907,24 +622,22 @@ impl Merge {
         &mut self,
         engine: PublicKey,
         spec: u16,
-        issued_ms: u64,
-        solution: tally_wire::Solution,
+        solution: TaggedSolution,
         tally: &mut Tally,
     ) {
-        let id = solution.clock_model;
-        if self.models.get(&id).is_none() {
+        let key = (solution.clock_model, engine);
+        if self.models.get(&key).is_none() {
             // Its model is on its way by another path, or never coming: held a while, bounded.
-            match self.pending.get_mut(&id) {
+            match self.pending.get_mut(&key) {
                 Some(waiting) if waiting.len() < PENDING_PER_MODEL => {
-                    waiting.push((engine, spec, issued_ms, solution))
+                    waiting.push((spec, solution))
                 }
                 Some(_) => {
                     tally.dropped += 1;
                     return;
                 }
                 None => {
-                    self.pending
-                        .insert_active(id, vec![(engine, spec, issued_ms, solution)]);
+                    self.pending.insert_active(key, vec![(spec, solution)]);
                 }
             }
             tally.pending += 1;
@@ -932,7 +645,6 @@ impl Merge {
         }
         match self.check(engine, spec, &solution, Kind::Final) {
             Some(fix) => {
-                self.ledger_takes(spec, issued_ms, &solution, Kind::Final);
                 let settled = fix.clone();
                 match self.merge(fix) {
                     Merged::Changed => tally.accepted += 1,
@@ -950,25 +662,6 @@ impl Merge {
         }
     }
 
-    /// A checked solution, to the standing ledger: every solution of a transmission, final or
-    /// provisional, held or not, is evidence of who heard it first and who agreed.
-    fn ledger_takes(&mut self, spec: u16, issued_ms: u64, wire: &tally_wire::Solution, kind: Kind) {
-        let Some(model) = self.models.get(&wire.clock_model) else {
-            return;
-        };
-        let (decoded, inputs) = (Arc::clone(&model.decoded), model.inputs);
-        if let Some(solved) = Solved::new(
-            wire,
-            spec,
-            issued_ms,
-            kind == Kind::Provisional,
-            decoded,
-            inputs,
-        ) {
-            self.ledger.solved(solved);
-        }
-    }
-
     fn provisional_positions(
         &mut self,
         positions: &Positions,
@@ -981,20 +674,12 @@ impl Merge {
         if self.is_faulted(&engine) || !positions.is_provisional() {
             return Ok(Ingested::Ignored);
         }
-        let Ok(content) = positions.solutions() else {
+        let Ok(content) = positions.tagged_solutions() else {
             return Ok(Ingested::Ignored);
         };
         let (mut accepted, mut dropped) = (0, 0);
         for solution in content.solutions {
             let checked = self.check(engine, content.spec_version, &solution, Kind::Provisional);
-            if checked.is_some() {
-                self.ledger_takes(
-                    content.spec_version,
-                    content.issued_ms,
-                    &solution,
-                    Kind::Provisional,
-                );
-            }
             let held = checked.is_some_and(|fix| self.hold_provisional(fix, engine, now_ms));
             if held {
                 accepted += 1;
@@ -1015,9 +700,7 @@ impl Merge {
             Some(track) => {
                 let finals = || track.transmissions.iter().flat_map(|held| &held.fixes);
                 (
-                    finals().any(|held| {
-                        Self::same_transmission_in(&self.models, &self.resolved, held, &fix)
-                    }),
+                    finals().any(|held| same_transmission(held, &fix)),
                     finals().any(|held| agree(held, &fix)),
                 )
             }
@@ -1097,7 +780,7 @@ impl Merge {
         };
         let mut superseded = Vec::new();
         for (at, held) in track.provisional.iter_mut().enumerate() {
-            if Self::same_transmission_in(&self.models, &self.resolved, settled, &held.fix) {
+            if same_transmission(settled, &held.fix) {
                 superseded.push(at);
             } else if held.standing == Standing::Waiting && agree(settled, &held.fix) {
                 held.standing = Standing::Confirmed;
@@ -1147,88 +830,27 @@ impl Merge {
         }
     }
 
-    /// The solution as a fix, if it passes every check the client can make.
+    /// The solution as a fix, if it passes every check a client can make (crate docs): its model
+    /// summary held, signed by its own engine and of its specification, and its message naming its
+    /// aircraft.
     fn check(
         &mut self,
         engine: PublicKey,
         spec: u16,
-        wire: &tally_wire::Solution,
+        wire: &TaggedSolution,
         kind: Kind,
     ) -> Option<Fix> {
-        // A provisional is checked by signatures and content addresses: the raw its model was
-        // fitted from does not reach its receptions, which are newer than the model's window.
-        let raw = self.settings.raw && kind == Kind::Final;
-        self.models.touch(&wire.clock_model);
-        let model = self.models.get(&wire.clock_model)?;
-        if self.is_faulted(&model.engine) || model.spec != spec {
+        let key = (wire.clock_model, engine);
+        self.models.touch(&key);
+        let model = self.models.get(&key)?;
+        if model.spec != spec {
             return None;
         }
-        let decoded = Arc::clone(&model.decoded);
-        let decoded = &*decoded;
         let message = wire.observations.message();
         if modes::address(message) != Some(wire.address) {
             return None;
         }
-        let scope: BTreeSet<PublicKey> = decoded.scope.iter().map(|site| site.receiver).collect();
-        if !wire
-            .observations
-            .receptions()
-            .iter()
-            .all(|reception| scope.contains(&reception.receiver))
-        {
-            return None;
-        }
-        let claim = publish::claim(decoded, wire, spec).ok()?;
-        let reach = match kind {
-            Kind::Final => Reach::Window,
-            Kind::Provisional => Reach::Carried,
-        };
-        let consistent = consistent(decoded, reach, &wire.observations, &Claimed::of(wire));
-        let model_engine = model.engine;
         let inputs = model.inputs;
-        let weight = wire.observations.receptions().len() as u64 + u64::from(decoded.input.count);
-        let check = if raw {
-            self.raw_check(&wire.clock_model);
-            let model = self.models.get(&wire.clock_model)?;
-            match &model.raw {
-                RawCheck::Verified(calibrated) => {
-                    // The tile must be the one the assignment rule gives the aircraft, recomputed
-                    // from the client's raw; when the client's raw is not the solution's
-                    // (its addressed citation differs), it cannot say.
-                    let sites = self.site_table();
-                    let bins = self.held.bins(decoded.window.first, decoded.window.last);
-                    let index = WindowIndex::new(decoded.window, &bins, &sites);
-                    match tally_mlat_solver::verify_assignment(
-                        &index,
-                        wire.address,
-                        decoded,
-                        &wire.addressed,
-                    ) {
-                        Err(tally_mlat_solver::Failure::Tile) => return None,
-                        Err(_) => Check::Signature,
-                        Ok(()) => {
-                            let mut members = std::collections::BTreeMap::new();
-                            let assignment = index.assign(wire.address, &mut members)?;
-                            let candidates = index.receptions(wire.address, &assignment.scope);
-                            let known: BTreeSet<ObservationId> =
-                                candidates.iter().map(|reception| reception.id()).collect();
-                            if claim.observations.iter().all(|id| known.contains(id)) {
-                                if !verify(calibrated, &candidates, &claim).passed() {
-                                    return None;
-                                }
-                                Check::Model
-                            } else {
-                                Check::Signature
-                            }
-                        }
-                    }
-                }
-                RawCheck::Failed => return None,
-                RawCheck::NotHeld | RawCheck::Unjudged | RawCheck::Unchecked => Check::Signature,
-            }
-        } else {
-            Check::Signature
-        };
         Some(Fix {
             kind,
             address: wire.address,
@@ -1243,102 +865,36 @@ impl Merge {
             observations: wire.observations.clone(),
             model: wire.clock_model,
             model_inputs: inputs,
-            weight,
-            check,
-            engines: [engine, model_engine].into_iter().collect(),
-            standing: self
-                .ledger
-                .standing_of(&wire.observations, wire.transmitted),
-            confidence: if consistent {
-                self.ledger.confidence(&wire.observations, wire.transmitted)
-            } else {
-                Confidence::Unconfirmed
-            },
-            consistent,
+            weight: wire.observations.tags().len() as u64,
+            engines: [engine].into_iter().collect(),
         })
-    }
-
-    /// Every receiver the client has a description of.
-    fn site_table(&self) -> Sites {
-        let sites: Vec<Site> = self.sites.values().map(|(_, site)| *site).collect();
-        Sites::new(&sites)
-    }
-
-    /// Checks a held model against the client's own raw, once: the tile's members and input
-    /// citation rebuilt from it must be the model's exactly, and the model verifier must pass it.
-    fn raw_check(&mut self, id: &Hash) {
-        let Some(model) = self.models.get(id) else {
-            return;
-        };
-        if !matches!(model.raw, RawCheck::Unchecked) {
-            return;
-        }
-        let decoded = Arc::clone(&model.decoded);
-        let decoded = &*decoded;
-        // Another version derives other inputs and another model from the same raw.
-        if !judges(decoded.spec) {
-            if let Some(model) = self.models.get_mut(id) {
-                model.raw = RawCheck::Unjudged;
-            }
-            return;
-        }
-        // An engine solved the window, so its raw is in: sealed, it is what the engine held.
-        self.held.seal_through(decoded.window.last);
-        let sites = self.site_table();
-        let bins = self.held.bins(decoded.window.first, decoded.window.last);
-        let index = WindowIndex::new(decoded.window, &bins, &sites);
-        let members = index.members(decoded.tile);
-        let outcome = match index.inputs(decoded.tile, &members) {
-            Some(inputs) if inputs.scope == decoded.scope && inputs.citation == decoded.input => {
-                match verify_model(decoded, &inputs) {
-                    (verdict, Some(calibrated)) if verdict.passed() => {
-                        RawCheck::Verified(Box::new(calibrated))
-                    }
-                    _ => RawCheck::Failed,
-                }
-            }
-            _ => RawCheck::NotHeld,
-        };
-        if let Some(model) = self.models.get_mut(id) {
-            model.raw = outcome;
-        }
     }
 
     fn merge(&mut self, fix: Fix) -> Merged {
         let address = fix.address;
-        let Some(track) = self.tracks.get(&address) else {
+        let Some(track) = self.tracks.get_mut(&address) else {
             let mut track = Track::new(address);
-            track
-                .transmissions
-                .push(Transmission::new(fix, &self.ledger));
+            track.transmissions.push(Transmission::new(fix));
             self.tracks.insert_active(address, track);
             return Merged::Changed;
         };
-        // The held transmissions it is tied to; it joins one only when exactly one.
+        // The held transmissions it shares a tag with; it joins one only when exactly one.
         let tied: Vec<usize> = track
             .transmissions
             .iter()
             .enumerate()
             .filter(|(_, transmission)| {
-                transmission.fixes.iter().any(|held| {
-                    Self::same_transmission_in(&self.models, &self.resolved, held, &fix)
-                })
+                transmission
+                    .fixes
+                    .iter()
+                    .any(|held| same_transmission(held, &fix))
             })
             .map(|(at, _)| at)
             .collect();
-        let Some(track) = self.tracks.get_mut(&address) else {
-            return Merged::Dropped;
-        };
-        let at = match tied.as_slice() {
-            [at] => Some(*at),
-            _ => None,
-        };
-        let Some(at) = at else {
+        let [at] = tied.as_slice() else {
             // A transmission not held: one more, the oldest forgotten beyond the bound.
             let input_set = fix.input_set;
-            track
-                .transmissions
-                .push(Transmission::new(fix, &self.ledger));
+            track.transmissions.push(Transmission::new(fix));
             track.arrange();
             let kept = track
                 .transmissions
@@ -1351,7 +907,7 @@ impl Merge {
                 Merged::Dropped
             };
         };
-        let transmission = &mut track.transmissions[at];
+        let transmission = &mut track.transmissions[*at];
         if let Some(same) = transmission
             .fixes
             .iter_mut()
@@ -1361,25 +917,6 @@ impl Merge {
             return Merged::Duplicate;
         }
         let before = transmission.current().input_set;
-        // Incomparable with what is kept: never averaged. Solved over the union by whoever holds
-        // its raw.
-        let comparable = |held: &Fix| {
-            held.model_inputs == fix.model_inputs
-                && fix.observations.relation(&held.observations) != Relation::Incomparable
-        };
-        let partner = transmission
-            .fixes
-            .iter()
-            .find(|held| !comparable(held))
-            .cloned();
-        let resolved = match partner {
-            Some(partner) if self.settings.raw => self.resolve(&partner, &fix),
-            _ => None,
-        };
-        let Some(track) = self.tracks.get_mut(&address) else {
-            return Merged::Dropped;
-        };
-        let transmission = &mut track.transmissions[at];
         let input_set = fix.input_set;
         let was_refused: BTreeSet<Hash> = transmission
             .refused
@@ -1387,8 +924,7 @@ impl Merge {
             .map(|held| held.input_set)
             .collect();
         transmission.fixes.push(fix);
-        transmission.fixes.extend(resolved);
-        transmission.normalize(&self.ledger);
+        transmission.normalize();
         self.contested += transmission
             .refused
             .iter()
@@ -1414,149 +950,14 @@ impl Merge {
         }
     }
 
-    /// The client's own solution of a transmission two incomparable solutions are of, from its
-    /// raw: the aircraft's tile by the assignment rule, fitted, and the transmission (the group
-    /// holding either solution's receptions) solved and verified as an engine would. `None` when
-    /// the client does not hold every cited observation, or the solutions are of different
-    /// windows, or nothing solves.
-    fn resolve(&mut self, a: &Fix, b: &Fix) -> Option<Fix> {
-        let (first, second) = (self.model_of(a)?, self.model_of(b)?);
-        if first.window != second.window {
-            return None;
-        }
-        let window = first.window;
-        let message = a.observations.message();
-        let hash = message_hash(message);
-        let union = a.observations.union(&b.observations)?.ok()?;
-        let all_held = union.receptions().iter().all(|reception| {
-            self.held.contains(&ObservationId {
-                receiver: reception.receiver,
-                epoch: reception.epoch,
-                timestamp: reception.counter,
-                message: hash,
-            })
-        });
-        if !all_held {
-            return None;
-        }
-        self.held.seal_through(window.last);
-        let sites = self.site_table();
-        let bins = self.held.bins(window.first, window.last);
-        let index = WindowIndex::new(window, &bins, &sites);
-        let mut members = std::collections::BTreeMap::new();
-        let assignment = index.assign(a.address, &mut members)?;
-        let inputs = index.inputs(assignment.tile, &members[&assignment.tile])?;
-        let key: ResolveKey = (assignment.tile, window, inputs.citation.hash);
-        if self.resolved.get(&key).is_none() {
-            let fitted =
-                tally_mlat_solver::fit_calibrated(&inputs)
-                    .ok()
-                    .map(|(model, calibrated)| Resolver {
-                        inputs: publish::inputs_id(&model),
-                        model,
-                        calibrated,
-                    });
-            self.resolved.insert_active(key, fitted);
-        }
-        let resolver = self.resolved.get(&key)?.as_ref()?;
-        let candidates = index.receptions(a.address, &assignment.scope);
-        let cited: BTreeSet<(PublicKey, u32, u64)> = union
-            .receptions()
-            .iter()
-            .map(|reception| (reception.receiver, reception.epoch, reception.counter))
-            .collect();
-        let grouping = tally_mlat_solver::group(&resolver.model, &candidates);
-        let transmission = grouping.transmissions.iter().find(|transmission| {
-            transmission.data == message
-                && transmission.receptions.iter().any(|timed| {
-                    cited.contains(&(timed.id.receiver, timed.id.epoch, timed.id.timestamp))
-                })
-        })?;
-        let addressed = index.addressed_citation(a.address);
-        let (solution, wire) =
-            publish::solve_published(&resolver.calibrated, transmission, [0; 32], addressed)
-                .ok()?;
-        let standing = self
-            .ledger
-            .standing_of(&wire.observations, wire.transmitted);
-        let confidence = self.ledger.confidence(&wire.observations, wire.transmitted);
-        Some(Fix {
-            kind: Kind::Final,
-            address: wire.address,
-            transmitted: wire.transmitted,
-            lat_e7: wire.lat_e7,
-            lon_e7: wire.lon_e7,
-            alt_hae_mm: wire.alt_hae_mm,
-            altitude_ft: barometric_ft(message),
-            horizontal_sigma_m: solution.horizontal_sigma_m(),
-            covariance: wire.covariance,
-            input_set: input_set(&wire.observations, &resolver.inputs),
-            weight: wire.observations.receptions().len() as u64
-                + u64::from(resolver.model.input.count),
-            observations: wire.observations,
-            model: resolver.inputs,
-            model_inputs: resolver.inputs,
-            check: Check::Resolved,
-            engines: BTreeSet::new(),
-            standing,
-            confidence,
-            consistent: true,
-        })
-    }
-
-    /// The model a fix was solved under: an engine's held model, or a union the client fitted.
-    fn model_of(&self, fix: &Fix) -> Option<tally_mlat_solver::ClockModel> {
-        Self::model_in(&self.models, &self.resolved, fix).cloned()
-    }
-
-    fn model_in<'a>(
-        models: &'a Bounded<Hash, Model>,
-        resolved: &'a Bounded<ResolveKey, Option<Resolver>>,
-        fix: &Fix,
-    ) -> Option<&'a tally_mlat_solver::ClockModel> {
-        match fix.check {
-            Check::Resolved => resolved
-                .values()
-                .flatten()
-                .find(|resolver| resolver.inputs == fix.model)
-                .map(|resolver| &resolver.model),
-            _ => models.get(&fix.model).map(|model| &*model.decoded),
-        }
-    }
-
-    /// Whether two solutions are of one transmission (crate docs, § Solutions merge per
-    /// transmission): one aircraft, the same bytes, and a reception in common or a tie through
-    /// either's clock model; never when a receiver is in both without a reception in common.
+    /// Whether two fixes are of one transmission (crate docs, § Solutions merge per
+    /// transmission): one aircraft, the same bytes, and a tag in common.
     pub fn same_transmission(&self, a: &Fix, b: &Fix) -> bool {
-        Self::same_transmission_in(&self.models, &self.resolved, a, b)
+        same_transmission(a, b)
     }
 
-    fn same_transmission_in(
-        models: &Bounded<Hash, Model>,
-        resolved: &Bounded<ResolveKey, Option<Resolver>>,
-        a: &Fix,
-        b: &Fix,
-    ) -> bool {
-        if a.address != b.address || a.observations.message() != b.observations.message() {
-            return false;
-        }
-        match in_common(&a.observations, &b.observations) {
-            (true, _) => true,
-            (false, true) => false,
-            (false, false) => {
-                let tie = |from: &Fix, onto: &Fix| {
-                    Self::model_in(models, resolved, onto).and_then(|model| tied(model, from, onto))
-                };
-                // Every model that can say must say yes, and one at least must.
-                match (tie(a, b), tie(b, a)) {
-                    (None, None) => false,
-                    (one, other) => one.unwrap_or(true) && other.unwrap_or(true),
-                }
-            }
-        }
-    }
-
-    fn fault_proof(&mut self, proof: &FaultProof) -> Ingested {
+    fn fault_proof(&mut self, proof: &ClientFaultProof) -> Ingested {
+        let proof = proof.get();
         let Some(tolerance) = proof.spec_version().ok().and_then(Tolerance::for_spec) else {
             return Ingested::Ignored;
         };
@@ -1572,14 +973,14 @@ impl Merge {
     /// Marks `engine` faulted and drops everything that stands on its word alone.
     fn convict(&mut self, engine: PublicKey) {
         self.faulted.insert_active(engine, ());
-        let models: Vec<Hash> = self
+        let models: Vec<ModelKey> = self
             .models
             .iter()
-            .filter(|(_, model)| model.engine == engine)
-            .map(|(id, _)| *id)
+            .filter(|((_, signer), _)| *signer == engine)
+            .map(|(key, _)| *key)
             .collect();
-        for id in models {
-            self.models.remove(&id);
+        for key in models {
+            self.models.remove(&key);
         }
         let addresses: Vec<u32> = self.tracks.iter().map(|(address, _)| *address).collect();
         for address in addresses {
@@ -1588,16 +989,12 @@ impl Merge {
             };
             for transmission in &mut track.transmissions {
                 let stands = |fix: &mut Fix| {
-                    // A fix the client solved itself stands on the receivers' signed raw.
-                    if fix.check == Check::Resolved {
-                        return true;
-                    }
                     fix.engines.remove(&engine);
                     !fix.engines.is_empty()
                 };
                 transmission.fixes.retain_mut(stands);
                 transmission.refused.retain_mut(stands);
-                transmission.normalize(&self.ledger);
+                transmission.normalize();
             }
             let before = track.provisional.len();
             let deadlines = &mut self.deadlines;
@@ -1618,36 +1015,18 @@ impl Merge {
     }
 }
 
+/// Whether two fixes are of one transmission: one aircraft, the same bytes, a tag in common.
+fn same_transmission(a: &Fix, b: &Fix) -> bool {
+    a.address == b.address
+        && a.observations.message() == b.observations.message()
+        && in_common(&a.observations, &b.observations)
+}
+
 /// Which of two fixes of one transmission ranks first, by the rule
 /// (`tally_mlat_solver::standing::rank`).
 #[cfg(test)]
 fn order(a: &Fix, b: &Fix) -> std::cmp::Ordering {
     a.rank().cmp(&b.rank())
-}
-
-/// Whether `from`'s receptions, mapped through `model` (the model `onto` was solved under), put
-/// `onto`'s transmit time where it is: `None` when no receiver `from` cites is a clock of the
-/// model (or `onto` states no height), else whether every one that is agrees within `TIE_NS`.
-fn tied(model: &tally_mlat_solver::ClockModel, from: &Fix, onto: &Fix) -> Option<bool> {
-    let position = onto.ecef()?;
-    let transmitted = i128::try_from(onto.transmitted.unix_ps()).ok()?;
-    let origin_ps = i128::from(model.origin_unix_ns) * 1_000;
-    let mut any = None;
-    for reception in from.observations.receptions() {
-        let Some(time) = model.time(&reception.receiver, reception.epoch, reception.counter) else {
-            continue;
-        };
-        let site = tally_mlat_solver::geo::from_mm(model.pieces[time.piece].site_mm);
-        let range = tally_mlat_solver::linalg::norm(tally_mlat_solver::linalg::sub(position, site));
-        let range_ps = (range / tally_mlat_solver::geo::C * 1e12).round() as i128;
-        let predicted = origin_ps + time.ps - range_ps;
-        let agrees = predicted.abs_diff(transmitted) <= u128::from(TIE_NS) * 1_000;
-        if !agrees {
-            return Some(false);
-        }
-        any = Some(true);
-    }
-    any
 }
 
 /// Whether a final fix confirms a provisional one (crate docs, § Provisional fixes): one aircraft,
@@ -1687,9 +1066,9 @@ fn agree(settled: &Fix, early: &Fix) -> bool {
     distance <= CONFIRM_GATE
 }
 
-/// The full input set's identity: BLAKE2s-256 over `"tally merge input set" 0x00`, the
-/// observation set hash and the model inputs hash (the rule's).
-pub fn input_set(observations: &ObservationSet, model_inputs: &Hash) -> Hash {
+/// The full input set's identity: BLAKE2s-256 over `"tally merge input set" 0x00`, the tag set
+/// hash and the model inputs hash (the rule's).
+pub fn input_set(observations: &TaggedSet, model_inputs: &Hash) -> Hash {
     tally_wire::products::input_set(observations, model_inputs)
 }
 

@@ -649,7 +649,7 @@ fn the_regional_product_holds_one_copy_of_each_message_per_area_signed_as_origin
         } else {
             vec![relay.public()]
         };
-        products.described(&described(&feeder, location, relays)?);
+        products.described(&described(&feeder, location, relays)?, Some(location));
         feeders.push(feeder);
     }
     for (n, feeder) in feeders.iter().enumerate() {
@@ -710,8 +710,16 @@ fn the_regional_product_holds_one_copy_of_each_message_per_area_signed_as_origin
     let later = feeder_batch(&feeders[0], 2, shared.clone(), (BASE_MS + 4_000, 11))?;
     staged.feed(&later);
     let out = staged.tick(BASE_MS + 5_000);
-    // The epoch's deduplicated stream first, then its one area's regional batch.
-    assert_eq!(out.len(), 2);
+    // The epoch's deduplicated stream first, then its one area's regional batch and its client
+    // form: the same receptions, counters stripped, signed by the same origin.
+    assert_eq!(out.len(), 3);
+    match (&out[1], &out[2]) {
+        (Record::RegionalBatch(regional), Record::ClientRegionalBatch(client)) => {
+            let regional = regional.content().map_err(err)?;
+            assert_eq!(client.content().map_err(err)?, regional.for_clients());
+        }
+        _ => return Err("no client form after the regional batch".to_owned()),
+    }
     match &out[0] {
         Record::RelayBatch(batch) => {
             batch.verify_as_relay().map_err(err)?;
@@ -808,6 +816,7 @@ fn the_products_are_routed_by_their_stream_bits_and_the_regional_by_its_cell() -
         points: None,
         decoded: None,
         stamp_ms: 0,
+        client: None,
     };
     let wants = |streams: Streams, regions: Vec<Region>, item: &Item| {
         Subscription { streams, regions }.wants(item)
@@ -898,7 +907,10 @@ fn what_a_busy_area_and_the_world_cost_a_second() -> Result<()> {
         .collect::<std::result::Result<_, _>>()
         .map_err(err)?;
     for feeder in &feeders {
-        products.described(&described(feeder, location, vec![relay.public()])?);
+        products.described(
+            &described(feeder, location, vec![relay.public()])?,
+            Some(location),
+        );
     }
     let addresses: Vec<u32> = (0x00a1_0000..0x00a1_0000 + AIRCRAFT).collect();
     let mut regional_records = Vec::new();
@@ -1454,5 +1466,44 @@ fn only_a_member_admitted_divides_the_records_share() -> Result<()> {
     drop(membership);
     assert_eq!(taken(MEMBER, 1, 20_000)?, 0);
     assert!(members.reserve_member().is_some());
+    Ok(())
+}
+
+/// A site whose own area (`area_of`) is not its public cell's parent: where H3's cells do not nest
+/// exactly, along an area's edge. Found by walking a line across one; there is always one.
+fn straddling() -> Result<Location> {
+    for step in 0..20_000 {
+        let site = place(33.0 + f64::from(step) * 0.000_5, -84.4);
+        let public = Region::public_cell(&site).map_err(err)?;
+        let parent = tally_wire::rendezvous::area_of_public(public).ok_or("no parent")?;
+        if area_of(&site).map_err(err)? != parent {
+            return Ok(site);
+        }
+    }
+    Err("no site off its public cell's area along the line".to_owned())
+}
+
+/// A receiver's area is its public cell's parent at `AREA_RESOLUTION`, never the area its site
+/// lies in: its regional product and its raw's sharing group are both its public cell's area, so
+/// neither tells a client which side of an area's edge the receiver sits inside its public cell.
+#[test]
+fn a_receivers_area_is_its_public_cells_parent_never_its_sites() -> Result<()> {
+    let relay = Identity::generate().map_err(err)?;
+    let staged = Staged::new(&relay);
+    let site = straddling()?;
+    let public = Region::public_cell(&site).map_err(err)?;
+    let parent = tally_wire::rendezvous::area_of_public(public).ok_or("no parent")?;
+    assert_ne!(area_of(&site).map_err(err)?, parent);
+    let feeder = Identity::generate().map_err(err)?;
+    staged
+        .products
+        .described(&described(&feeder, site, vec![relay.public()])?, Some(site));
+    assert_eq!(staged.products.area_for(&feeder.public()), Some(parent));
+    let batch = feeder_batch(&feeder, 0, Vec::new(), (BASE_MS, 0))?;
+    let record = Record::Batch(batch.batch().clone());
+    assert_eq!(
+        crate::sharing::group_of(&record, Some(public)),
+        Some((parent, Streams::RAW))
+    );
     Ok(())
 }

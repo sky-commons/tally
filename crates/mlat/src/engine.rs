@@ -7,9 +7,11 @@
 //! records in any order leave the same state, and the same state solves to the same bytes
 //! (`window`).
 //!
-//! - A receiver takes part on its own signed word only: its newest `ReceiverInfo` verifies, places
-//!   it inside the engine's regions, and names a clock the solver specification knows with a
-//!   location no coarser than it allows (`tally_mlat_solver::obs::MAX_SITE_PRECISION_M`).
+//! - A receiver takes part on its own signed word only: its newest site-bearing record (its
+//!   `ReceiverSite`, or an old feeder's format 1 `ReceiverInfo`, `intake::SiteRecord`) verifies,
+//!   places it inside the engine's regions, and names a clock the solver specification knows with a
+//!   location no coarser than it allows (`tally_mlat_solver::obs::MAX_SITE_PRECISION_M`). A
+//!   format 2 description carries no site and places nobody.
 //! - A batch is used once: it must verify, be from a receiver that takes part, and carry a
 //!   (boot, sequence) not already used and not too far behind that boot's newest (§3.1), so a batch
 //!   two relays deliver, or a relay replays, adds nothing.
@@ -35,12 +37,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use tally_mlat_solver::Site;
 use tally_mlat_solver::held::{Bin, Fragment, Limits, RAW_SPARE_BINS, Rates, SealedBins};
 use tally_mlat_solver::scope::{AFTER, BEFORE, STRIDE, Window, bin_of};
 use tally_wire::{Batch, Decoded, Identity, PublicKey, Record, Regions};
 
-use crate::intake::{Intake, Orphaned, Seats};
+use crate::intake::{Intake, Orphaned, Seats, SiteRecord, Sited};
 use crate::provisional::{self, Provisional};
 use crate::window::{Job, Outcome, Report};
 
@@ -285,13 +286,15 @@ impl Engine {
     /// host's intakes do.
     pub fn ingest(&mut self, record: &Record, now_ms: u64) -> Result<Ingested, String> {
         match record {
-            Record::ReceiverInfo(info) => {
-                let Some(intake) = self.intake.as_mut() else {
+            Record::ReceiverSite(_) | Record::ReceiverInfo(_) => {
+                // A format 2 description carries no site: it places nobody.
+                let (Some(intake), Some(site)) = (self.intake.as_mut(), SiteRecord::of(record))
+                else {
                     return Ok(Ingested::Ignored);
                 };
                 // One intake holds every receiver, so no other intake's receiver moves.
-                let described = intake.describe(info)?;
-                let key = info.receiver().map_err(|error| error.to_string())?;
+                let described = intake.describe(&site)?;
+                let key = site.receiver().map_err(|error| error.to_string())?;
                 // The batches that waited for it, taken now as they would have been then.
                 for (batch, stamp_ms) in intake.take_orphans(&key) {
                     let (_, notes) = intake.ingest_verified(&batch);
@@ -407,7 +410,7 @@ impl Engine {
         let threads = self.settings.threads.max(1);
         let intake = self.intake.as_mut()?;
         let fragments = intake.take_through(settled);
-        let sites: Vec<Site> = intake.sites().collect();
+        let sites: Vec<Sited> = intake.sites().collect();
         let dropped = intake.take_dropped();
         self.add_dropped(dropped);
         let (bins, refused) = seal(fragments, threads, self.room());
@@ -427,13 +430,14 @@ impl Engine {
     }
 
     /// As `prepare`, for an engine whose host sealed every bin through `settled` (the latest bin
-    /// complete by `now_ms`, `settled`) and holds the receivers taking part, `sites`, in key order.
+    /// complete by `now_ms`, `settled`) and holds the receivers taking part, `sites`, in key order
+    /// (`intake::Intake::sites`: each with its reception key).
     pub fn prepare_sealed(
         &mut self,
         now_ms: u64,
         issued_ms: u64,
         settled: i64,
-        sites: Vec<Site>,
+        sites: Vec<Sited>,
     ) -> Option<Job> {
         let windows: Vec<Window> = self
             .sealed
@@ -676,7 +680,21 @@ mod tests {
         }
     }
 
+    /// A new feeder's site.
     fn info(receiver: &Identity, issued_ms: u64, location: Location, clock: Clock) -> Record {
+        let content = tally_wire::ReceiverSiteContent {
+            issued_ms,
+            location,
+            clock,
+        };
+        match tally_wire::ReceiverSite::sign(receiver, &content) {
+            Ok(site) => Record::ReceiverSite(site),
+            Err(_) => Record::Heartbeat,
+        }
+    }
+
+    /// An old feeder's format 1 description, its site in it.
+    fn old_info(receiver: &Identity, issued_ms: u64, location: Location, clock: Clock) -> Record {
         let content = ReceiverInfoContent {
             issued_ms,
             location: Some(location),
@@ -688,6 +706,76 @@ mod tests {
             Ok(info) => Record::ReceiverInfo(info),
             Err(_) => Record::Heartbeat,
         }
+    }
+
+    /// A new feeder's format 2 description: its public cell, no site.
+    fn public_info(
+        receiver: &Identity,
+        issued_ms: u64,
+        location: Location,
+    ) -> Result<Record, String> {
+        ReceiverInfo::sign_public(
+            receiver,
+            &tally_wire::batch::PublicInfoContent {
+                issued_ms,
+                cell: Some(Region::public_cell(&location).map_err(text)?),
+                clock: Clock::Dump1090,
+                software: "test".to_owned(),
+                relays: Vec::new(),
+            },
+        )
+        .map(Record::ReceiverInfo)
+        .map_err(text)
+    }
+
+    /// Sites come from site-bearing records only: a `ReceiverSite`, or an old feeder's format 1
+    /// description; a format 2 description places nobody, and a site's reissue (a new record, so
+    /// a new site id and reception key) is what the engine then holds.
+    #[test]
+    fn a_receiver_is_placed_by_its_site_bearing_record_alone() -> Result<(), String> {
+        let mut engine = engine()?;
+        let (new, old, public) = (
+            Identity::generate().map_err(text)?,
+            Identity::generate().map_err(text)?,
+            Identity::generate().map_err(text)?,
+        );
+        assert_eq!(
+            engine.ingest(&public_info(&public, 1, location())?, 0)?,
+            Ingested::Ignored
+        );
+        assert_eq!(engine.described(&public.public()), None);
+        assert_eq!(
+            engine.ingest(&public_info(&new, 1, location())?, 0)?,
+            Ingested::Ignored
+        );
+        let site = info(&new, 1, location(), Clock::Dump1090);
+        assert_eq!(engine.ingest(&site, 0)?, Ingested::Described);
+        let described = old_info(&old, 1, location(), Clock::Dump1090);
+        assert_eq!(engine.ingest(&described, 0)?, Ingested::Described);
+        assert_eq!(engine.taking_part(), 2);
+        let intake = engine.intake.as_ref().ok_or("no intake")?;
+        let sites: Vec<Sited> = intake.sites().collect();
+        let of = |record: &Record| SiteRecord::of(record).ok_or("not site-bearing");
+        for (key, record) in [(new.public(), &site), (old.public(), &described)] {
+            let held = sites
+                .iter()
+                .find(|sited| sited.site.receiver == key)
+                .ok_or("not taking part")?;
+            assert_eq!(held.site.id, of(record)?.site_id());
+            assert_eq!(held.key, of(record)?.reception_key());
+            assert_eq!(held.site.location, location());
+        }
+        // Reissued: the newer record's id and key.
+        let reissued = info(&new, 2, location(), Clock::Dump1090);
+        engine.ingest(&reissued, 0)?;
+        let intake = engine.intake.as_ref().ok_or("no intake")?;
+        let held = intake
+            .sites()
+            .find(|sited| sited.site.receiver == new.public())
+            .ok_or("not taking part")?;
+        assert_eq!(held.site.id, of(&reissued)?.site_id());
+        assert_ne!(held.site.id, of(&site)?.site_id());
+        Ok(())
     }
 
     fn observation(timestamp: u64, format: u8) -> Observation {

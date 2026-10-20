@@ -87,6 +87,9 @@ pub enum Store {
     /// Delivery tags over the audit window, at the most one receiver may hold
     /// (`delivery::PER_RECEIVER_BYTES`).
     Delivery,
+    /// The feeder figures' rows (`figures`): each receiver's, charged once for all it may grow to
+    /// (`figures::PER_RECEIVER_BYTES`), its share of the tables every row shares included.
+    Figures,
     /// Connection buffers: a feeder connection's Noise buffers, reading and writing, for its whole
     /// session (`ingest::BUFFERS_PER_CONNECTION`).
     Buffers,
@@ -135,7 +138,7 @@ pub enum Driver {
 }
 
 impl Store {
-    pub const ALL: [Self; 16] = [
+    pub const ALL: [Self; 17] = [
         Self::Batches,
         Self::Held,
         Self::Open,
@@ -145,6 +148,7 @@ impl Store {
         Self::Dedup,
         Self::Fanout,
         Self::Delivery,
+        Self::Figures,
         Self::Buffers,
         Self::Ingest,
         Self::Epochs,
@@ -170,6 +174,7 @@ impl Store {
             Self::Dedup => "dedup",
             Self::Fanout => "fanout",
             Self::Delivery => "delivery",
+            Self::Figures => "figures",
             Self::Buffers => "buffers",
             Self::Ingest => "ingest",
             Self::Epochs => "epochs",
@@ -184,7 +189,7 @@ impl Store {
     /// (RFC-0181 §9, "Admission"). Every store answers, with no default.
     pub const fn driver(self) -> Driver {
         match self {
-            Self::Buffers | Self::Delivery | Self::Shed => Driver::Connection,
+            Self::Buffers | Self::Delivery | Self::Figures | Self::Shed => Driver::Connection,
             Self::Batches
             | Self::Dedup
             | Self::Fanout
@@ -222,6 +227,7 @@ impl Store {
             | Self::Engine
             | Self::Dedup
             | Self::Delivery
+            | Self::Figures
             | Self::Buffers
             | Self::Products
             | Self::Records
@@ -242,6 +248,7 @@ pub struct PerFeeder {
     pub dedup: usize,
     pub fanout: usize,
     pub delivery: usize,
+    pub figures: usize,
     pub buffers: usize,
     pub ingest: usize,
     pub epochs: usize,
@@ -301,6 +308,7 @@ impl PerFeeder {
             Store::Dedup => self.dedup = bytes,
             Store::Fanout => self.fanout = bytes,
             Store::Delivery => self.delivery = bytes,
+            Store::Figures => self.figures = bytes,
             Store::Buffers => self.buffers = bytes,
             Store::Ingest => self.ingest = bytes,
             Store::Epochs => self.epochs = bytes,
@@ -322,6 +330,7 @@ impl PerFeeder {
             Store::Dedup => self.dedup,
             Store::Fanout => self.fanout,
             Store::Delivery => self.delivery,
+            Store::Figures => self.figures,
             Store::Buffers => self.buffers,
             Store::Ingest => self.ingest,
             Store::Epochs => self.epochs,
@@ -479,6 +488,8 @@ impl PerFeeder {
             // A delivery tag per batch over the audit window, at the most one receiver may hold
             // (`delivery::PER_RECEIVER_BYTES`), whatever it sends.
             delivery: crate::delivery::PER_RECEIVER_BYTES,
+            // A receiver's feeder figures row, whatever it sends (`figures::PER_RECEIVER_BYTES`).
+            figures: crate::figures::PER_RECEIVER_BYTES,
             // A feeder's connection: its Noise buffers in both directions, the reader's frame and
             // plaintext and the writer's (`ingest::BUFFERS_PER_CONNECTION`), carved when it is
             // admitted. What the Noise pool keeps idle is the process's (`BASE_BYTES`).

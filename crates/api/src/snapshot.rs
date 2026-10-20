@@ -25,16 +25,16 @@ pub const DEFAULT_REFRESH: Duration = Duration::from_secs(5);
 pub const STALE_AFTER: Duration = Duration::from_secs(60);
 
 /// The relay's stations, by key, with the network's totals over them. The relay reports counts
-/// only (RFC-0174 §2.12: no relay computes a feeder's figures); each station's message rate is
-/// the API's own, the change in its forwarded observations since the previous report.
+/// only (a feeder's figures are the signed record of `crate::feeders`); each station's message
+/// rate is the API's own, the change in its forwarded observations since the previous report.
 pub struct Stations {
     pub now_ms: u64,
-    /// The relay's reports, each without its place (`location` is always `None` here): the API
-    /// holds no receiver's exact place, only its public pin (`places`).
+    /// The relay's reports: each carries a station's public cell at most, never a site (the
+    /// relay's stats hold none).
     pub by_key: HashMap<PublicKey, StationReport>,
-    /// Where the API may say each receiver is (`privacy::public_location`): about 5 km from its
-    /// place, or absent when it declares none. Every receiver place the API serves, or
-    /// computes a served figure from, is read here.
+    /// Where the API may say each receiver is (`privacy::public_location`): a pin inside its
+    /// public cell, or absent when it states none. Every receiver place the API serves is read
+    /// here.
     pub places: HashMap<PublicKey, Position>,
     /// Observations a second, per station, between the previous report and this one.
     pub rates: HashMap<PublicKey, f64>,
@@ -50,15 +50,13 @@ impl Stations {
     pub fn from_report(report: StationsReport, previous: Option<&Self>) -> Self {
         let mut by_key = HashMap::with_capacity(report.stations.len());
         let mut places = HashMap::new();
-        for mut station in report.stations {
+        for station in report.stations {
             // A key the relay printed is always one; one that is not is skipped, not trusted.
             if let Ok(key) = PublicKey::from_base64(&station.key) {
-                // The one door a receiver's place comes in by: blurred here, the exact place
-                // dropped.
+                // The one door a receiver's place comes in by: its public cell, pinned.
                 if let Some(pin) = crate::privacy::public_location(&key, &station) {
                     places.insert(key, pin);
                 }
-                station.location = None;
                 by_key.insert(key, station);
             }
         }
@@ -295,8 +293,20 @@ fn fresh(at: Instant, now: Instant) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tally_relay::stations::StationLocation;
-    use tally_wire::Identity;
+    use tally_relay::stations::cell_name;
+    use tally_wire::{Identity, Location, Region};
+
+    /// The public cell a station at 37.5, -122.25 states, as the relay names it.
+    fn cell() -> Option<String> {
+        Region::public_cell(&Location {
+            lat_e7: 375_000_000,
+            lon_e7: -1_222_500_000,
+            alt_m: 10,
+            precision_m: 0,
+        })
+        .ok()
+        .map(cell_name)
+    }
 
     fn report(key: &PublicKey, online: bool, observations: u64) -> StationReport {
         StationReport {
@@ -310,12 +320,7 @@ mod tests {
             batches: 3,
             gaps: 4,
             observations,
-            location: Some(StationLocation {
-                lat: 37.5,
-                lon: -122.25,
-                alt_m: 10,
-                precision_m: 0,
-            }),
+            cell: cell(),
             software: Some("tally-feed 0.1.0".to_owned()),
             address: None,
         }
@@ -488,16 +493,16 @@ mod tests {
             (station.key.clone(), station.batches, station.gaps),
             (a.to_base64(), 3, 4)
         );
-        // Served at its public pin, never its place.
+        // Served at its pin inside its public cell, the finest the relay told the API.
         let pin = station.location.ok_or("no pin")?;
-        assert!(pin.lat != 37.5 && pin.lon != -122.25, "{pin:?}");
-        assert!((pin.lat - 37.5).abs() < 0.05 && (pin.lon - -122.25).abs() < 0.07);
-        assert!(
-            stations
-                .by_key
-                .values()
-                .all(|report| report.location.is_none())
-        );
+        let pinned = Region::public_cell(&Location {
+            lat_e7: (pin.lat * 1e7).round() as i32,
+            lon_e7: (pin.lon * 1e7).round() as i32,
+            alt_m: 0,
+            precision_m: 0,
+        })
+        .map_err(|e| e.to_string())?;
+        assert_eq!(Some(cell_name(pinned)), cell());
         Ok(())
     }
 
@@ -528,7 +533,7 @@ mod tests {
             batches: 0,
             gaps: 0,
             observations: 0,
-            location: None,
+            cell: None,
             software: Some("tally-feed 0.3.0".to_owned()),
             address: None,
         };

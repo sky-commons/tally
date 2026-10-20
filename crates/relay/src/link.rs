@@ -20,7 +20,7 @@ use std::time::Duration;
 use tally_wire::backoff::Backoff;
 use tally_wire::fault_proof::{FAULT_PROOF_FORMAT, MODEL_FAULT_PROOF_FORMAT};
 use tally_wire::noise::{self, Accepted, Reader, Writer};
-use tally_wire::{Identity, PublicKey, Reason, Record, Role, Tolerance};
+use tally_wire::{ClientRecord, Identity, PublicKey, Reason, Record, Role, Tolerance};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, watch};
@@ -33,8 +33,9 @@ use crate::fanout::{Fell, Filter, Listener, Taken};
 use crate::hub::{Connection, Description, Hub, Inbound, Item, Origin, OwnDescription, RelayTrust};
 use crate::ingest::{Allowance, InFlight, RecordPace, Refusal};
 use crate::network::{Asker, AskerRole};
+use crate::outbound::{Column, Sendable, Typed};
 use crate::peers::Queued;
-use crate::subscription::{Subscription, directory_wants, on_directory_link};
+use crate::subscription::{ClientSubscription, Subscription, directory_wants, on_directory_link};
 use tally_wire::RelayAddress;
 use tally_wire::record::MAX_REGIONS;
 
@@ -165,9 +166,10 @@ impl Peer {
             Self::Relay if on_directory_link(record) => Permit::Take,
             Self::Relay => Permit::Drop,
             Self::Feeder(own) => match (record, signer(record)) {
-                (Record::Batch(_) | Record::ReceiverInfo(_), Some((_, Ok(key)))) if key == own => {
-                    Permit::Take
-                }
+                (
+                    Record::Batch(_) | Record::ReceiverInfo(_) | Record::ReceiverSite(_),
+                    Some((_, Ok(key))),
+                ) if key == own => Permit::Take,
                 _ => publishes_nothing(record),
             },
             Self::Subscriber | Self::Engine(_) => publishes_nothing(record),
@@ -194,7 +196,12 @@ impl Peer {
     /// role nothing, as it subscribes to nothing.
     fn grant(self, hub: &Hub, asker: &Asker, asked: Subscription, now_ms: u64) -> Subscription {
         match self {
-            Self::Subscriber => hub.network().credit.admit(asker, asked, now_ms),
+            // A client's regions no finer than a public cell (`Subscription::for_client`).
+            Self::Subscriber => {
+                hub.network()
+                    .credit
+                    .admit(asker, asked.for_client().into_subscription(), now_ms)
+            }
             Self::Engine(key) => {
                 crate::subscription::engine_grant(&hub.network().directory, &key, &asked, now_ms)
             }
@@ -208,9 +215,11 @@ fn signer(record: &Record) -> Option<(&'static str, Result<PublicKey, tally_wire
     match record {
         Record::Batch(batch) => Some(("a batch", batch.receiver())),
         Record::ReceiverInfo(info) => Some(("receiver info", info.receiver())),
+        Record::ReceiverSite(site) => Some(("a receiver site", site.receiver())),
         Record::Positions(positions) => Some(("positions", positions.engine())),
         Record::Provisional(positions) => Some(("provisional positions", positions.engine())),
         Record::ClockModel(model) => Some(("a clock model", model.engine())),
+        Record::ClientClockModel(model) => Some(("a clock model", model.signer())),
         _ => None,
     }
 }
@@ -267,34 +276,65 @@ impl Drop for Feeding {
 /// batch the link hands the ingest stage, which acts on it there.
 type Described = Arc<OwnDescription>;
 
-/// Which records on the fan-out a link is sent.
+/// Which records on the fan-out a link is sent. A client's and an engine's are different
+/// types, so no client path can route by what only a relay may (`ClientSubscription`).
 enum Wants {
     /// Another relay: the directory only (`directory_wants`).
     Directory,
-    /// A subscriber or engine: the subscription in effect, which the write side alone changes, so
-    /// a newly covered receiver is described before any of its batches is let through.
-    Subscription {
+    /// An engine: its subscription in effect, by its receivers' sites (`Subscription::wants`).
+    Engine {
         current: Subscription,
-        /// Every `Subscribe` the read side took, the latest only.
-        updates: watch::Receiver<Subscription>,
-        /// When the next change may take effect (`SUBSCRIBE_EVERY`).
-        next: Instant,
+        changes: Changes,
+    },
+    /// A client: its subscription in effect, by each item's client place, and only what has a
+    /// client form (`ClientSubscription::serves`).
+    Client {
+        current: ClientSubscription,
+        changes: Changes,
     },
 }
 
-impl Wants {
-    fn subscription(current: Subscription, updates: watch::Receiver<Subscription>) -> Self {
-        Self::Subscription {
-            current,
+/// The subscriptions a link's read side took, which its write side alone applies, so a newly
+/// covered receiver is described before anything placed by it is let through.
+struct Changes {
+    /// Every `Subscribe` the read side took, the latest only.
+    updates: watch::Receiver<Subscription>,
+    /// When the next change may take effect (`SUBSCRIBE_EVERY`).
+    next: Instant,
+}
+
+impl Changes {
+    fn new(updates: watch::Receiver<Subscription>) -> Self {
+        Self {
             updates,
             next: Instant::now(),
+        }
+    }
+}
+
+impl Wants {
+    fn engine(current: Subscription, updates: watch::Receiver<Subscription>) -> Self {
+        Self::Engine {
+            current,
+            changes: Changes::new(updates),
+        }
+    }
+
+    fn client(current: ClientSubscription, updates: watch::Receiver<Subscription>) -> Self {
+        Self::Client {
+            current,
+            changes: Changes::new(updates),
         }
     }
 
     fn wants(&self, item: &Item) -> bool {
         match self {
             Self::Directory => directory_wants(item),
-            Self::Subscription { current, .. } => current.wants(item),
+            Self::Engine { current, .. } => current.wants(item),
+            Self::Client { current, .. } => item
+                .client
+                .as_ref()
+                .is_some_and(|client| current.serves(client)),
         }
     }
 
@@ -302,19 +342,32 @@ impl Wants {
     /// last; a relay's never changes. It takes effect at `apply`, once the descriptions it newly
     /// covers are sent.
     async fn changed(&mut self) -> Subscription {
-        if let Self::Subscription { updates, next, .. } = self {
-            tokio::time::sleep_until(*next).await;
-            if updates.changed().await.is_ok() {
-                *next = Instant::now() + SUBSCRIBE_EVERY;
-                return updates.borrow_and_update().clone();
+        if let Self::Engine { changes, .. } | Self::Client { changes, .. } = self {
+            tokio::time::sleep_until(changes.next).await;
+            if changes.updates.changed().await.is_ok() {
+                changes.next = Instant::now() + SUBSCRIBE_EVERY;
+                return changes.updates.borrow_and_update().clone();
             }
         }
         std::future::pending().await
     }
 
+    /// The descriptions `subscription` covers, to send before it takes effect: an engine's by
+    /// their sites, a client's by their public cells (`Hub::client_infos`).
+    fn infos(&self, hub: &Hub, subscription: &Subscription) -> Vec<Item> {
+        match self {
+            Self::Directory => Vec::new(),
+            Self::Engine { .. } => hub.engine(subscription),
+            Self::Client { .. } => hub.client_infos(&subscription.clone().for_client()),
+        }
+    }
+
     fn apply(&mut self, subscription: Subscription) {
-        if let Self::Subscription { current, .. } = self {
-            *current = subscription;
+        match self {
+            Self::Directory => {}
+            Self::Engine { current, .. } => *current = subscription,
+            // Clamped again however it came: a client's regions are no finer than a public cell.
+            Self::Client { current, .. } => *current = subscription.for_client(),
         }
     }
 
@@ -322,7 +375,8 @@ impl Wants {
     fn filter(&self) -> Filter {
         match self {
             Self::Directory => Filter::Directory,
-            Self::Subscription { current, .. } => Filter::Subscription(current.clone()),
+            Self::Engine { current, .. } => Filter::Subscription(current.clone()),
+            Self::Client { current, .. } => Filter::Client(current.clone()),
         }
     }
 }
@@ -390,7 +444,10 @@ impl From<String> for End {
 /// the last word the kernel had not yet sent, so a feeder still publishing when it is redirected
 /// would otherwise never read why. A peer that does not take the last word in time is not waited
 /// on further: the writer may be mid-message, and nothing more can be said.
-async fn farewell<S>(reader: &mut Reader<S>, writer: &mut Writer<S>, last: Record)
+///
+/// The last word is a `ClientRecord` (a `Goodbye` or a `Redirect`): what every peer, a client
+/// included, may be sent, so no path ends a client's session saying more.
+async fn farewell<S>(reader: &mut Reader<S>, writer: &mut Writer<S>, last: ClientRecord)
 where
     S: AsyncRead + AsyncWrite,
 {
@@ -405,8 +462,8 @@ where
 }
 
 /// A `Goodbye` with `reason`.
-fn goodbye(reason: Reason, retry_after_secs: u32) -> Record {
-    Record::Goodbye {
+fn goodbye(reason: Reason, retry_after_secs: u32) -> ClientRecord {
+    ClientRecord::Goodbye {
         reason,
         retry_after_secs,
     }
@@ -436,7 +493,7 @@ fn turning_away(hub: &Hub, peer: Peer, key: &PublicKey, refused: &capacity::AtAd
 mod capacity {
     use std::time::Duration;
 
-    use tally_wire::{Reason, Record};
+    use tally_wire::{ClientRecord, Reason};
 
     pub(super) struct AtAdmission {
         retry_after_secs: u32,
@@ -453,7 +510,7 @@ mod capacity {
         }
 
         /// What the peer is told: this relay is full.
-        pub(super) fn last(&self) -> Record {
+        pub(super) fn last(&self) -> ClientRecord {
             super::goodbye(Reason::Full, self.retry_after_secs)
         }
 
@@ -474,14 +531,14 @@ mod capacity {
 
 /// What a peer turned away for the relay's capacity is told: the relays it may try instead, or that
 /// the relay is full if it knows none.
-fn full(hub: &Hub) -> Record {
+fn full(hub: &Hub) -> ClientRecord {
     if hub.hints().is_empty() {
-        Record::Goodbye {
+        ClientRecord::Goodbye {
             reason: Reason::Full,
             retry_after_secs: FULL_RETRY_SECS,
         }
     } else {
-        Record::Redirect {
+        ClientRecord::Redirect {
             retry_after_secs: FULL_RETRY_SECS,
             hints: hub.hints().to_vec(),
         }
@@ -566,6 +623,11 @@ where
         role,
         mut first,
     } = accepted.map_err(|error| error.to_string())?;
+    // What its write side may carry, by the role its handshake established and the version it
+    // agreed (`outbound`): a client link sends `ClientRecord`s alone. A relay or an engine older
+    // than version 3 has no column: the handshake refused it (`tally_wire::least_version`), and
+    // the type makes this side refuse it too.
+    let column = Column::of(role, session.version).map_err(|too_old| too_old.to_string())?;
     let source = hub.connection_id();
     let peer = match role {
         Role::Feeder => Peer::Feeder(key),
@@ -650,9 +712,7 @@ where
         return Err("a probe sent more than echoes and delivery queries".to_owned());
     }
     if !echoed.is_empty() {
-        session
-            .writer
-            .send(&echoed)
+        crate::outbound::send_as(column, &mut session.writer, echoed)
             .await
             .map_err(|error| error.to_string())?;
     }
@@ -828,7 +888,7 @@ where
             let current = subscription.borrow_and_update().clone();
             let fan_out = FanOut {
                 infos: hub.engine(&current),
-                wants: Wants::subscription(current, subscription),
+                wants: Wants::engine(current, subscription),
             };
             let place = hub.engine_place();
             if place.is_some() {
@@ -837,9 +897,9 @@ where
             (Vec::new(), Some(fan_out), place)
         }
         Peer::Subscriber => {
-            let current = subscription.borrow_and_update().clone();
+            let current = subscription.borrow_and_update().clone().for_client();
             let Some((infos, slot)) = hub.subscribe(&current) else {
-                let redirect = Record::Redirect {
+                let redirect = ClientRecord::Redirect {
                     retry_after_secs: FULL_RETRY_SECS,
                     hints: hub.hints().to_vec(),
                 };
@@ -851,7 +911,7 @@ where
             tuner.set(crate::sockets::Role::Subscriber);
             let fan_out = FanOut {
                 infos,
-                wants: Wants::subscription(current, subscription),
+                wants: Wants::client(current, subscription),
             };
             (Vec::new(), Some(fan_out), Some(slot))
         }
@@ -864,6 +924,7 @@ where
         peer,
         &link,
         Serving {
+            column,
             greeting,
             fan_out,
             subscribe: steer,
@@ -1004,6 +1065,8 @@ async fn upstream_once(
         // A parent that does not accept this relay says how long to stay away.
         Err(error) => return refused(error),
     };
+    // A parent older than version 3 is no relay of this one's (`outbound::Column::of`).
+    let column = Column::of(Role::Relay, session.version).map_err(|too_old| too_old.to_string())?;
     let source = hub.connection_id();
     let asker = Asker {
         role: AskerRole::Relay,
@@ -1020,6 +1083,7 @@ async fn upstream_once(
         Peer::Relay,
         &link,
         Serving {
+            column,
             leaving: Leaving::join(hub, &asker),
             greeting: Vec::new(),
             fan_out: Some(directory_fan_out()),
@@ -1155,6 +1219,8 @@ async fn member_once(
         Ok(session) => session,
         Err(error) => return refused(error),
     };
+    // A member older than version 3 is no member of this one's (`outbound::Column::of`).
+    let column = Column::of(role, session.version).map_err(|too_old| too_old.to_string())?;
     let asker = Asker {
         role: AskerRole::Relay,
         key: relay.key,
@@ -1171,6 +1237,7 @@ async fn member_once(
         Peer::Member,
         &link,
         Serving {
+            column,
             greeting: Vec::new(),
             fan_out: None,
             subscribe: None,
@@ -1215,6 +1282,8 @@ impl Drop for Leaving {
 
 /// What a connection is told and given, beside what it publishes.
 struct Serving<'a> {
+    /// What its write side may carry, by the peer's role and version (`outbound::Column`).
+    column: Column,
     /// Sent once, first.
     greeting: Vec<Record>,
     fan_out: Option<FanOut>,
@@ -1341,7 +1410,7 @@ type Farewell = Closing;
 enum Closing {
     Silent(String),
     Saying {
-        last: Box<Record>,
+        last: Box<ClientRecord>,
         why: String,
     },
     /// As `Saying`, a member refused at its admission (`End::Full`): a relay that dialled in is
@@ -1372,6 +1441,7 @@ where
     S: AsyncRead + AsyncWrite + Send,
 {
     let Serving {
+        column,
         greeting,
         fan_out,
         subscribe,
@@ -1447,26 +1517,48 @@ where
             }
         }
     };
+    let inputs = Inputs {
+        farewells: &mut farewells,
+        replies: &mut replies,
+        outgoing,
+        client: (asker.role == AskerRole::Client && !asker.loopback).then_some(asker),
+        steer: subscribe,
+        vouched: (asker.role == AskerRole::Client && hub.network().credit.vouches_for(&asker.key))
+            .then_some(asker),
+    };
+    // The write side typed by the link's column (`outbound`): a client's holds and sends
+    // `ClientRecord`s alone.
+    let writing = async {
+        match column {
+            Column::Sites => {
+                write_loop::<S, Arc<Record>>(
+                    Typed::new(&mut *writer),
+                    hub,
+                    source,
+                    link,
+                    greeting,
+                    fan_out,
+                    inputs,
+                )
+                .await
+            }
+            Column::Client => {
+                write_loop::<S, Arc<ClientRecord>>(
+                    Typed::new(&mut *writer),
+                    hub,
+                    source,
+                    link,
+                    greeting,
+                    fan_out,
+                    inputs,
+                )
+                .await
+            }
+        }
+    };
     let closing = tokio::select! {
         result = reading => return result,
-        result = write_loop(
-            writer,
-            hub,
-            source,
-            link,
-            greeting,
-            fan_out,
-            Inputs {
-                farewells: &mut farewells,
-                replies: &mut replies,
-                outgoing,
-                client: (asker.role == AskerRole::Client && !asker.loopback).then_some(asker),
-                steer: subscribe,
-                vouched: (asker.role == AskerRole::Client
-                    && hub.network().credit.vouches_for(&asker.key))
-                .then_some(asker),
-            },
-        ) => result,
+        result = writing => result,
     };
     match closing {
         Ok(()) => Ok(None),
@@ -1579,6 +1671,7 @@ impl Admitted {
         let bytes = match record {
             Record::Batch(batch) => crate::ingest::charge_of(batch),
             Record::ReceiverInfo(info) => crate::ingest::floored(info.as_bytes().len()),
+            Record::ReceiverSite(site) => crate::ingest::floored(site.as_bytes().len()),
             _ => return None,
         };
         let allowance = self.allowance.as_ref()?;
@@ -1592,6 +1685,7 @@ impl Admitted {
                     batch.receptions().unwrap_or(0),
                 ),
                 Record::ReceiverInfo(info) => (info.as_bytes().len(), 0),
+                Record::ReceiverSite(site) => (site.as_bytes().len(), 0),
                 _ => (bytes, 0),
             };
             pace.take(
@@ -1881,10 +1975,10 @@ fn ingest(
             let receiver = info.receiver().map_err(|error| error.to_string())?;
             info.verify().map_err(|error| error.to_string())?;
             // A format this build cannot read still forwards; it just never replaces a known one,
-            // and places its receiver nowhere.
-            let (issued_ms, place) = info
-                .content()
-                .map_or((0, None), |content| (content.issued_ms, content.location));
+            // and places its receiver nowhere. A format 1 description carries its site (`place`);
+            // a format 2 one is paired with its `ReceiverSite` (`Hub::keep_site`).
+            let issued_ms = info.issued_ms().unwrap_or(0);
+            let place = info.content().ok().and_then(|content| content.location);
             // Only a feeder's own is kept on its link: a relay forwards many receivers'.
             if matches!(peer, Peer::Feeder(_))
                 && described
@@ -1895,6 +1989,7 @@ fn ingest(
                     info: info.clone(),
                     issued_ms,
                     place,
+                    site: described.as_ref().and_then(|own| own.site.clone()),
                 }));
             }
             // Charged like a batch, and for the same reason: it passes the ingest stage.
@@ -1916,6 +2011,29 @@ fn ingest(
                 stamp: None,
                 in_flight,
             });
+        }
+        Record::ReceiverSite(site) => {
+            let receiver = site.receiver().map_err(|error| error.to_string())?;
+            site.verify().map_err(|error| error.to_string())?;
+            // A feeder's own is kept on its link beside its description, given again with it.
+            if matches!(peer, Peer::Feeder(_))
+                && let Some(own) = described.as_ref()
+            {
+                *described = Some(Arc::new(OwnDescription {
+                    site: Some(site.clone()),
+                    ..OwnDescription::clone(own)
+                }));
+            }
+            // Charged like a description, and for the same reason.
+            let Some(in_flight) = in_flight else {
+                return Err(End::Told {
+                    reason: Reason::Protocol,
+                    retry_after_secs: REFUSED_RETRY_SECS,
+                    why: "sent a site on a connection admitted to publish none".to_owned(),
+                }
+                .into());
+            };
+            hub.keep_site(source, site, receiver, None, in_flight);
         }
         Record::Positions(positions) => {
             let engine = positions.engine().map_err(|error| error.to_string())?;
@@ -1939,6 +2057,13 @@ fn ingest(
         Record::ClockModelPart(part) => {
             hub.network().hold_part(&part);
             hub.publish_clock_model_part(source, part);
+        }
+        // A clock model as a client reads it (no sites, no offsets), published beside its full
+        // model by the engine that signed both.
+        Record::ClientClockModel(model) => {
+            model.verify().map_err(|error| error.to_string())?;
+            share(hub, peer, asker, &Record::ClientClockModel(model.clone()));
+            hub.publish_client_clock_model(source, model);
         }
         // Anyone may prove a fault, and every proof is checked before it is forwarded. One this
         // relay cannot judge (a proof format or a solver spec version it does not know) is not
@@ -2007,6 +2132,7 @@ fn ingest(
         | Record::WorldPositions(_)
         | Record::WorldPrecise(_)
         | Record::RegionalBatch(_)
+        | Record::ClientRegionalBatch(_)
         | Record::Parity(_)
         | Record::BundleIndex(_)
         | Record::MlatCut(_)) => return Err(Unhandled::Network(record)),
@@ -2114,8 +2240,8 @@ fn allowed(hub: &Hub, client: &Asker) -> u64 {
 
 // The write side's every input, each its own: what to say first, what to forward, what to answer
 // and when to say goodbye.
-async fn write_loop<S: AsyncWrite>(
-    writer: &mut Writer<S>,
+async fn write_loop<S: AsyncWrite, P: Sendable>(
+    mut writer: Typed<'_, S, P>,
     hub: &Hub,
     source: u64,
     link: &Arc<Link>,
@@ -2138,8 +2264,9 @@ async fn write_loop<S: AsyncWrite>(
     let mut pace = client.map(|client| ClientPace::new(client, hub));
     let mut heartbeat = tokio::time::interval(HEARTBEAT);
     let mut told = Told::new();
+    let writer = &mut writer;
     writer
-        .send(&greeting)
+        .send_records(greeting)
         .await
         .map_err(|error| error.to_string())?;
     // The answers to what came with its `Hello`, before anything of the streams.
@@ -2151,7 +2278,7 @@ async fn write_loop<S: AsyncWrite>(
             tokio::select! {
                 _ = heartbeat.tick() => {
                     writer
-                        .send(&[Record::Heartbeat])
+                        .send_records([Record::Heartbeat])
                         .await
                         .map_err(|error| error.to_string())?;
                 }
@@ -2165,7 +2292,7 @@ async fn write_loop<S: AsyncWrite>(
                 // What is addressed to a member: a stripe slice, a manifest, a receipt.
                 Some(addressed) = addressed(&mut outgoing) => {
                     let (records, written) = addressed.into_parts();
-                    let records = told.before_batches(hub, records);
+                    let records = typed::<P>(told.before_batches(hub, records));
                     send_data(writer, hub, link, Class::Forwarded, &records).await?;
                     drop(written);
                 }
@@ -2179,10 +2306,10 @@ async fn write_loop<S: AsyncWrite>(
     // or gossiped in between (each is published once) is in one or the other, never neither.
     let directory = matches!(wants, Wants::Directory);
     let early = directory.then(|| hub.listen(source, wants.filter()));
-    let infos: Vec<Arc<Record>> = if directory {
-        live_offers(hub)
+    let infos: Vec<P> = if directory {
+        typed::<P>(live_offers(hub))
     } else {
-        infos.into_iter().map(|item| item.record).collect()
+        infos.iter().filter_map(P::of_item).collect()
     };
     for part in parts(&infos) {
         send_data(writer, hub, link, described_class(kind), part).await?;
@@ -2230,7 +2357,7 @@ async fn write_loop<S: AsyncWrite>(
             }
             Some(addressed) = addressed(&mut outgoing) => {
                 let (records, written) = addressed.into_parts();
-                let records = told.before_batches(hub, records);
+                let records = typed::<P>(told.before_batches(hub, records));
                 send_data(writer, hub, link, Class::Forwarded, &records).await?;
                 drop(written);
             }
@@ -2240,10 +2367,10 @@ async fn write_loop<S: AsyncWrite>(
                 // in effect, so a large directory never leaves the link fallen behind. A
                 // description that changes meanwhile and only the new subscription covers reaches
                 // it at its receiver's next description, as on joining (`Hub::subscribe`).
-                let infos: Vec<Arc<Record>> = hub
-                    .infos_for(&subscription)
-                    .into_iter()
-                    .map(|item| item.record)
+                let infos: Vec<P> = wants
+                    .infos(hub, &subscription)
+                    .iter()
+                    .filter_map(P::of_item)
                     .collect();
                 for part in parts(&infos) {
                     send_data(writer, hub, link, described_class(kind), part).await?;
@@ -2274,7 +2401,7 @@ async fn write_loop<S: AsyncWrite>(
             () = link.shed() => return shed(hub),
             _ = heartbeat.tick() => {
                 writer
-                    .send(&[Record::Heartbeat])
+                    .send_records([Record::Heartbeat])
                     .await
                     .map_err(|error| error.to_string())?;
             }
@@ -2327,16 +2454,11 @@ impl Told {
                     }
                     Vec::new()
                 }
-                Record::Positions(positions) | Record::Provisional(positions) => positions
-                    .solutions()
-                    .map(|content| {
-                        content
-                            .solutions
-                            .iter()
-                            .map(|solution| solution.clock_model)
-                            .collect()
-                    })
-                    .unwrap_or_default(),
+                Record::Positions(positions) | Record::Provisional(positions) => {
+                    crate::network::solved(positions)
+                        .map(|solved| solved.into_iter().map(|one| one.clock_model).collect())
+                        .unwrap_or_default()
+                }
                 _ => Vec::new(),
             };
             for id in cited {
@@ -2350,7 +2472,7 @@ impl Told {
             }
             if let Record::Batch(batch) = &record
                 && let Ok(receiver) = batch.receiver()
-                && let Some((info, issued_ms)) = hub.description_of(&receiver)
+                && let Some((described, issued_ms)) = hub.description_of(&receiver)
                 && self
                     .sent
                     .get(&receiver)
@@ -2360,7 +2482,9 @@ impl Told {
                     self.sent.clear();
                 }
                 self.sent.insert(receiver, issued_ms);
-                out.push(info);
+                // Its description and its site: the link's column keeps the site off a member
+                // that does not carry sites (`outbound`).
+                out.extend(described);
             }
             out.push(Arc::new(record));
         }
@@ -2380,20 +2504,22 @@ impl Told {
 /// is control to it at once, as an echo's reply must be; the rest (offers to a directory link) by
 /// class through the upload cap (`send_data`). Their bytes stay held in the connection's
 /// [`ReplyRoom`] until they are written.
-async fn reply<S: AsyncWrite>(
-    writer: &mut Writer<S>,
+async fn reply<S: AsyncWrite, P: Sendable>(
+    writer: &mut Typed<'_, S, P>,
     hub: &Hub,
     link: &Arc<Link>,
     mut answers: Reply,
 ) -> Result<(), Closing> {
     let kind = link.kind();
     let mut control = Vec::new();
-    let mut by_class: [Vec<Arc<Record>>; Class::ALL.len()] = Default::default();
-    for record in std::mem::take(&mut answers.records)
-        .into_iter()
-        .map(Arc::new)
-    {
-        match Class::of(&record, kind) {
+    let mut by_class: [Vec<P>; Class::ALL.len()] = Default::default();
+    for record in typed::<P>(
+        std::mem::take(&mut answers.records)
+            .into_iter()
+            .map(Arc::new)
+            .collect(),
+    ) {
+        match Class::of_kind(record.kind(), kind) {
             Class::Control => control.push(record),
             class => by_class[class as usize].push(record),
         }
@@ -2415,8 +2541,8 @@ async fn reply<S: AsyncWrite>(
 
 /// Signs a vouched client a fresh credential and this relay's evidence (`Credit::vouch`), and
 /// sends both: control, a few kilobytes a quarter hour.
-async fn vouch<S: AsyncWrite>(
-    writer: &mut Writer<S>,
+async fn vouch<S: AsyncWrite, P: Sendable>(
+    writer: &mut Typed<'_, S, P>,
     hub: &Hub,
     client: Option<&Asker>,
 ) -> Result<(), Closing> {
@@ -2432,12 +2558,17 @@ async fn vouch<S: AsyncWrite>(
         return Ok(());
     };
     writer
-        .send(&[
+        .send_records([
             Record::FirehoseCredential(credential),
             Record::EvidenceBundle(evidence),
         ])
         .await
         .map_err(|error| Closing::Silent(error.to_string()))
+}
+
+/// What a link's column carries of `records`, in order; the rest is withheld (`outbound`).
+fn typed<P: Sendable>(records: Vec<Arc<Record>>) -> Vec<P> {
+    records.into_iter().filter_map(P::of_record).collect()
 }
 
 /// The class of a dump of receiver descriptions to a link of `kind`: theirs, as a description is.
@@ -2451,13 +2582,16 @@ fn described_class(kind: Kind) -> Class {
 
 /// Sends records of one `class` a peer asked for, once the pacer grants their bytes. A link shed
 /// while it waits is told the relay is full, and ends.
-async fn send_data<S: AsyncWrite>(
-    writer: &mut Writer<S>,
+async fn send_data<S: AsyncWrite, P: Sendable>(
+    writer: &mut Typed<'_, S, P>,
     hub: &Hub,
     link: &Arc<Link>,
     class: Class,
-    records: &[Arc<Record>],
+    records: &[P],
 ) -> Result<(), Closing> {
+    if records.is_empty() {
+        return Ok(());
+    }
     match hub.egress().grant(link, class, wire_cost(records)).await {
         Ok(()) => writer
             .send(records)
@@ -2480,12 +2614,12 @@ fn shed(hub: &Hub) -> Result<(), Closing> {
 
 /// Sends everything waiting on the fan-out that `wants` takes, until none is waiting. False when
 /// the link has already fallen behind.
-async fn catch_up<S: AsyncWrite>(
-    writer: &mut Writer<S>,
+async fn catch_up<S: AsyncWrite, P: Sendable>(
+    writer: &mut Typed<'_, S, P>,
     hub: &Hub,
     link: &Arc<Link>,
     out: &Listener,
-    pending: &mut Pending,
+    pending: &mut Pending<P>,
     source: u64,
     wants: &Wants,
 ) -> Result<bool, Closing> {
@@ -2514,7 +2648,7 @@ async fn catch_up<S: AsyncWrite>(
 }
 
 /// `records` in consecutive parts of about `DUMP_BYTES` each, every part at least one record.
-fn parts(records: &[Arc<Record>]) -> Vec<&[Arc<Record>]> {
+fn parts<P: Sendable>(records: &[P]) -> Vec<&[P]> {
     let mut parts = Vec::new();
     let mut start = 0;
     let mut bytes = 0;
@@ -2533,11 +2667,11 @@ fn parts(records: &[Arc<Record>]) -> Vec<&[Arc<Record>]> {
 }
 
 /// Records gathered for one send, at most `SEND_BATCH` of them and about `SEND_BYTES`, each in its
-/// class, classified once as it is kept.
-struct Pending {
+/// class, classified once as it is kept, each in its link's column's type (`outbound`).
+struct Pending<P> {
     kind: Kind,
     /// By class, highest first; order within a class is the fan-out's.
-    by_class: [Vec<Arc<Record>>; Class::ALL.len()],
+    by_class: [Vec<P>; Class::ALL.len()],
     /// What the link holds of the fan-out's items gathered (`fanout::Hold`: their charges to
     /// `budget::Store::Fanout`, and their bytes in its subscriber's hand), held until they are
     /// sent: what waits on a slow socket here is still charged, and ranks the link.
@@ -2560,7 +2694,7 @@ struct Pending {
 /// sharing member was dropped with it.
 const IN_HAND_MS: Duration = Duration::from_millis(crate::fanout::BEHIND_MS);
 
-impl Pending {
+impl<P: Sendable> Pending<P> {
     fn new(kind: Kind) -> Self {
         Self {
             kind,
@@ -2574,12 +2708,16 @@ impl Pending {
 
     /// Never send a record back down the connection it came in on, nor one the link did not ask
     /// for.
+    /// Only what the link's column carries of it (`Sendable::of_item`), the rest withheld.
     fn keep(&mut self, taken: Taken, source: u64, wants: &Wants) {
-        if taken.source != source && wants.wants(&taken) {
-            let class = Class::of(&taken.record, self.kind);
-            self.bytes += taken.record.encoded_len();
+        if taken.source != source
+            && wants.wants(&taken)
+            && let Some(record) = P::of_item(&taken)
+        {
+            let class = Class::of_kind(record.kind(), self.kind);
+            self.bytes += record.encoded_len();
             self.records += 1;
-            self.by_class[class as usize].push(Arc::clone(&taken.record));
+            self.by_class[class as usize].push(record);
             self.holds.push(taken.hold());
             self.since.get_or_insert_with(Instant::now);
         }
@@ -2596,7 +2734,7 @@ impl Pending {
     /// told so if nothing of a message is written, else closed on mid-message.
     async fn send<S: AsyncWrite>(
         &mut self,
-        writer: &mut Writer<S>,
+        writer: &mut Typed<'_, S, P>,
         (hub, link): (&Hub, &Arc<Link>),
         pace: Option<&mut ClientPace>,
         out: &Listener,
@@ -2661,7 +2799,7 @@ impl Pending {
 /// What `records` cost on the wire, at most: each record's bytes and its three-byte header, and
 /// for each Noise message (one per record at worst, and every half message at most) its tag and
 /// two-byte length. The socket counts what is really written; this is what is granted first.
-fn wire_cost(records: &[Arc<Record>]) -> usize {
+fn wire_cost<P: Sendable>(records: &[P]) -> usize {
     const MESSAGE_OVERHEAD: usize = 2 + 16;
     let bytes: usize = records.iter().map(|record| record.encoded_len()).sum();
     let messages = records
@@ -2672,13 +2810,13 @@ fn wire_cost(records: &[Arc<Record>]) -> usize {
 }
 
 /// Sends a directory link that fell behind the fan-out the directory held now, whole.
-async fn resync_directory<S: AsyncWrite>(
-    writer: &mut Writer<S>,
+async fn resync_directory<S: AsyncWrite, P: Sendable>(
+    writer: &mut Typed<'_, S, P>,
     hub: &Hub,
     link: &Arc<Link>,
     kind: Kind,
 ) -> Result<(), Closing> {
-    for part in parts(&live_offers(hub)) {
+    for part in parts(&typed::<P>(live_offers(hub))) {
         send_data(writer, hub, link, described_class(kind), part).await?;
     }
     Ok(())
@@ -2704,9 +2842,15 @@ fn fell_behind(kind: Kind) -> Result<(), Closing> {
     })
 }
 
-/// Serves plain BEAST of every reception to whoever connects (a local readsb). Unauthenticated,
-/// so the operator binds it to loopback.
-pub async fn serve_beast(listener: TcpListener, hub: Arc<Hub>) {
+/// Serves plain BEAST of every reception to whoever connects (a local readsb, which a public map
+/// and `tally-api` read). Each frame is a reception's client form (`tally_wire::ClientObsView`):
+/// its message, with the counter and signal level zero, since a receiver's counters and signal
+/// levels against the aircraft positions anyone reads place it, and what is decoded from here is
+/// published. It is unauthenticated and uncapped (loopback is never billed), so a listener bound
+/// anywhere but loopback is refused before anything is served (`sockets::loopback_only`), as the
+/// stats endpoint's is.
+pub async fn serve_beast(listener: TcpListener, hub: Arc<Hub>) -> std::io::Result<()> {
+    crate::sockets::loopback_only(&listener, "--beast-out")?;
     loop {
         let Ok((stream, peer)) = listener.accept().await else {
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -2743,7 +2887,11 @@ async fn beast_client<W: AsyncWrite + Unpin>(
         bytes.clear();
         // Each batch's one decode (`hub::Item::decoded`); the router offers only batches with one.
         for decoded in items.iter().filter_map(|item| item.decoded.as_ref()) {
-            for frame in decoded.views().filter_map(|view| view.to_beast()) {
+            // Each reception in its client form: the message, no counter, no signal level.
+            for frame in decoded
+                .views()
+                .filter_map(|view| tally_wire::ClientObsView::from(view).to_beast())
+            {
                 frame.encode_beast(&mut bytes);
             }
         }
@@ -3093,6 +3241,58 @@ mod tests {
         .map_err(text)
     }
 
+    /// Receivers' descriptions and relays' feeder figures, the whole world.
+    fn figures_wanted() -> Record {
+        Record::Subscribe {
+            streams: Streams::RAW.with(Streams::FEEDER_FIGURES),
+            regions: Vec::new(),
+        }
+    }
+
+    /// A relay's feeder figures, `count` receivers of one area, issued at the start of hour
+    /// `issued_hour` (figures are of whole hours): a record a client subscribed to them is sent.
+    fn figures(relay: &Identity, issued_hour: u64, count: usize) -> Result<Record, String> {
+        let issued_ms = issued_hour * tally_wire::FIGURES_BUCKET_MS;
+        let place = tally_wire::Location {
+            lat_e7: 337_490_000,
+            lon_e7: -843_880_000,
+            alt_m: 0,
+            precision_m: 0,
+        };
+        let cell = tally_wire::Region::public_cell(&place).map_err(text)?;
+        let area = tally_wire::rendezvous::area_of_public(cell).ok_or("no area")?;
+        let mut feeders: Vec<tally_wire::FeederFigure> = (0..count)
+            .map(|n| {
+                let mut seed = [3; 32];
+                seed[..8].copy_from_slice(&(n as u64).to_be_bytes());
+                tally_wire::FeederFigure {
+                    receiver: Identity::from_seed(seed).public(),
+                    cell: Some(cell),
+                    uptime_permille: 1000,
+                    messages: n as u64,
+                    aircraft: 1,
+                    range_m: None,
+                    coverage_dkm2: 0,
+                    unique_coverage_dkm2: 0,
+                    mlat_positions: 0,
+                    standing: false,
+                }
+            })
+            .collect();
+        feeders.sort_by_key(|figure| *figure.receiver.as_bytes());
+        tally_wire::FeederFigures::sign(
+            relay,
+            &tally_wire::FeederFiguresContent {
+                issued_ms,
+                window_for_ms: tally_wire::FIGURES_BUCKET_MS,
+                area: Some(area),
+                feeders,
+            },
+        )
+        .map(Record::FeederFigures)
+        .map_err(text)
+    }
+
     /// RFC-0181 §8: a subscriber that keeps its read deadline alive and never reads holds what
     /// its link took from the fan-out no longer than a queue may hold inbound
     /// (`fanout::BEHIND_MS`): its send is given up then, and the session ends as fallen behind.
@@ -3115,11 +3315,12 @@ mod tests {
             let hub = Arc::clone(&hub);
             async move { inbound(far, &[relay], Arc::clone(&hub), loopback(&hub)?).await }
         });
-        let session = noise::connect(
+        let session = noise::connect_with(
             near,
             &Identity::generate().map_err(text)?,
             &relay_key,
             Role::Subscriber,
+            &[figures_wanted()],
         )
         .await
         .map_err(text)?;
@@ -3140,10 +3341,13 @@ mod tests {
         .map_err(|_| "the subscriber was never served".to_owned())?;
         // Many times what the pipe holds, and far less than the fan-out's slack, so the relay's
         // write blocks rather than the subscriber falling behind.
-        let receiver = Identity::generate().map_err(text)?;
+        let signer = Identity::generate().map_err(text)?;
+        let records = (0..64)
+            .map(|issued| figures(&signer, issued, 600))
+            .collect::<Result<Vec<_>, _>>()?;
         let started = Instant::now();
-        for sequence in 0..64 {
-            hub.publish_batch(999, batch(&receiver, sequence, 1_000)?, receiver.public());
+        for record in records {
+            hub.publish_own(record);
         }
         let ended = timeout(noise::WRITE_TIMEOUT, serving)
             .await
@@ -3163,6 +3367,24 @@ mod tests {
         assert_eq!(hub.subscribers(), 0);
         drop(unread);
         beating.abort();
+        Ok(())
+    }
+
+    /// The BEAST output is raw, relay-only data: a listener bound anywhere but loopback is refused
+    /// before anything is served.
+    #[tokio::test]
+    async fn beast_out_off_loopback_is_refused() -> Result<(), String> {
+        let hub = Arc::new(Hub::new(8, crate::sharing::Deadlines::RELAY));
+        let listener = TcpListener::bind("0.0.0.0:0").await.map_err(text)?;
+        let refused = timeout(Duration::from_secs(5), serve_beast(listener, hub))
+            .await
+            .map_err(|_| "an off-loopback BEAST output was served".to_owned())?;
+        assert!(
+            refused
+                .as_ref()
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::InvalidInput),
+            "{refused:?}"
+        );
         Ok(())
     }
 
@@ -3190,7 +3412,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_session_changes_its_subscription_at_most_once_a_second() -> Result<(), String> {
         let (subscribe, updates) = watch::channel(Subscription::default());
-        let mut wants = Wants::subscription(Subscription::default(), updates);
+        let mut wants = Wants::engine(Subscription::default(), updates);
         let to = |streams| Subscription {
             streams,
             regions: Vec::new(),
@@ -3240,6 +3462,7 @@ mod tests {
                 points: None,
                 decoded: None,
                 stamp_ms: 0,
+                client: None,
             })
         );
         Ok(())
@@ -3259,7 +3482,7 @@ mod tests {
         for record in records {
             match record {
                 Record::ReceiverInfo(_) => *infos += 1,
-                Record::Batch(_) => *batches += 1,
+                Record::FeederFigures(_) => *batches += 1,
                 Record::Goodbye { reason, .. } => return Err(format!("dropped: {reason:?}")),
                 _ => {}
             }
@@ -3272,7 +3495,6 @@ mod tests {
     async fn a_subscriber_joining_a_large_directory_gets_all_of_it_and_is_not_dropped()
     -> Result<(), String> {
         use tally_wire::Clock;
-        use tally_wire::batch::ReceiverInfoContent;
         const DESCRIBED: usize = 4_000;
         // A queue far smaller than the directory: one send of the whole of it would leave the
         // subscriber behind. About `RING` of the small batches below.
@@ -3288,11 +3510,12 @@ mod tests {
                 .max_upload(roomy()),
         );
         let author = Identity::generate().map_err(text)?;
-        let info = ReceiverInfo::sign(
+        // Format 2: what a client is sent of a description (a format 1 one is relay-only).
+        let info = ReceiverInfo::sign_public(
             &author,
-            &ReceiverInfoContent {
+            &tally_wire::batch::PublicInfoContent {
                 issued_ms: 1,
-                location: None,
+                cell: None,
                 clock: Clock::Dump1090,
                 software: "x".repeat(200),
                 relays: Vec::new(),
@@ -3311,11 +3534,12 @@ mod tests {
             let hub = Arc::clone(&hub);
             async move { inbound(far, &[relay], Arc::clone(&hub), loopback(&hub)?).await }
         });
-        let session = noise::connect(
+        let session = noise::connect_with(
             near,
             &Identity::generate().map_err(text)?,
             &relay_key,
             Role::Subscriber,
+            &[figures_wanted()],
         )
         .await
         .map_err(text)?;
@@ -3327,11 +3551,12 @@ mod tests {
         })
         .await
         .map_err(|_| "the subscriber was never served".to_owned())?;
-        // While its first send waits on it, the fan-out moves on by many times the ring.
-        let receiver = Identity::generate().map_err(text)?;
+        // While its first send waits on it, the fan-out moves on by many times the ring: data a
+        // client takes (a relay's figures; receivers' raw is relay-only), one small record each.
+        let signer = Identity::generate().map_err(text)?;
         let mut sequence = 0;
         for _ in 0..4 * RING {
-            hub.publish_batch(999, batch(&receiver, sequence, 1)?, receiver.public());
+            hub.publish_own(figures(&signer, sequence, 1)?);
             sequence += 1;
         }
         let (mut infos, mut batches) = (0, 0);
@@ -3341,25 +3566,19 @@ mod tests {
         assert_eq!((infos, batches), (DESCRIBED, 0));
         // Joined the fan-out once the directory was sent.
         tokio::time::sleep(Duration::from_millis(100)).await;
-        hub.publish_batch(999, batch(&receiver, sequence, 1)?, receiver.public());
+        hub.publish_own(figures(&signer, sequence, 1)?);
         sequence += 1;
         while batches < 1 {
             read_some(&mut reader, &mut infos, &mut batches).await?;
         }
         // Changing what it wants sends the directory again, in parts, while batches keep coming
         // one per read: more of them during the dump than the ring holds, all delivered.
-        writer
-            .send(&[Record::Subscribe {
-                streams: Streams::RAW,
-                regions: Vec::new(),
-            }])
-            .await
-            .map_err(text)?;
+        writer.send(&[figures_wanted()]).await.map_err(text)?;
         let (mut again, mut during) = (0, 0);
         let mut published = 0;
         while again < DESCRIBED {
             read_some(&mut reader, &mut again, &mut during).await?;
-            hub.publish_batch(999, batch(&receiver, sequence, 1)?, receiver.public());
+            hub.publish_own(figures(&signer, sequence, 1)?);
             sequence += 1;
             published += 1;
         }
@@ -3785,9 +4004,14 @@ mod tests {
             let mut replies = Replies::new(peer, &link);
             replies.replying.hand_on(&hub, &key, answers()?);
             let waiting = replies.waiting.try_recv().map_err(text)?;
-            reply(&mut accepted.session.writer, &hub, &link, waiting)
-                .await
-                .map_err(|_| "the reply failed".to_owned())?;
+            reply(
+                &mut Typed::<_, Arc<Record>>::new(&mut accepted.session.writer),
+                &hub,
+                &link,
+                waiting,
+            )
+            .await
+            .map_err(|_| "the reply failed".to_owned())?;
             accepted
                 .session
                 .writer
@@ -3865,20 +4089,28 @@ mod tests {
         assert_eq!(egress.billed() - counted, written(&stranger_relay));
         counted = egress.billed();
 
-        // A subscriber: the directory, the batches it asked for, and the redirect it is shed with.
+        // A subscriber: the directory, the data it asked for, and the redirect it is shed with.
         let mut subscriber = dial_pipe(&hub)?;
-        let mut session = connected(&mut subscriber, Role::Subscriber).await?;
+        let near = subscriber.near.take().ok_or("dialled twice")?;
+        let mut session = noise::connect_with(
+            near,
+            &Identity::generate().map_err(text)?,
+            &subscriber.relay_key,
+            Role::Subscriber,
+            &[figures_wanted()],
+        )
+        .await
+        .map_err(text)?;
         while hub.subscribers() == 0 {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        let receiver = Identity::generate().map_err(text)?;
-        hub.publish_batch(999, batch(&receiver, 0, 100)?, receiver.public());
+        hub.publish_own(figures(&Identity::generate().map_err(text)?, 1, 100)?);
         let mut got_batch = false;
         while !got_batch {
             got_batch = next(&mut session.reader)
                 .await?
                 .iter()
-                .any(|record| matches!(record, Record::Batch(_)));
+                .any(|record| matches!(record, Record::FeederFigures(_)));
         }
         egress.shed_link(&subscriber.link);
         let mut told = None;
@@ -4309,6 +4541,258 @@ mod tests {
             }
         }
         assert!(!dialled.serving.is_finished());
+        Ok(())
+    }
+
+    /// Every record `reader` is sent until it has been quiet for half a second (at most `limit`
+    /// messages).
+    async fn drain(
+        reader: &mut Reader<tokio::io::DuplexStream>,
+        limit: usize,
+    ) -> Result<Vec<Record>, String> {
+        let mut all = Vec::new();
+        for _ in 0..limit {
+            let mut records = Vec::new();
+            match timeout(Duration::from_millis(500), reader.recv(&mut records)).await {
+                Ok(Ok(())) => all.extend(records),
+                Ok(Err(error)) => return Err(text(error)),
+                Err(_) => break,
+            }
+        }
+        Ok(all)
+    }
+
+    /// What no client may read, as bytes: each site's coordinates and its finest cell.
+    fn site_canaries(sites: &[Location]) -> Result<Vec<Vec<u8>>, String> {
+        let mut canaries = Vec::new();
+        for site in sites {
+            canaries.push(site.lat_e7.to_be_bytes().to_vec());
+            canaries.push(site.lon_e7.to_be_bytes().to_vec());
+            let point = tally_wire::Region::point(site).map_err(text)?;
+            canaries.push(point.as_u64().to_be_bytes().to_vec());
+        }
+        Ok(canaries)
+    }
+
+    /// No byte a client is sent says a site: no site-bearing record, no raw batch, and no
+    /// coordinate or finest cell of a site anywhere in what it reads.
+    fn assert_no_site(records: &[Record], canaries: &[Vec<u8>]) -> Result<(), String> {
+        for record in records {
+            assert!(!crate::outbound::bears_site(record), "{record:?}");
+            assert!(
+                crate::outbound::client_form(record).is_some(),
+                "a relay-only record reached a client: kind {}",
+                record.kind()
+            );
+            let mut bytes = Vec::new();
+            record.encode(&mut bytes).map_err(text)?;
+            for canary in canaries {
+                assert!(
+                    !bytes
+                        .windows(canary.len())
+                        .any(|window| window == canary.as_slice()),
+                    "a site's bytes in kind {}",
+                    record.kind()
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// THE CANARY, over real sessions: an old feeder describes itself in format 1 (its site in the
+    /// description) and a new one in format 2 with its site apart; both send raw. A subscriber in
+    /// the fan-out, and one joining after (the directory's answer), read every stream a client
+    /// may ask for and never a site, a raw batch, or a site's bytes; the old feeder's description
+    /// reaches no client at all. A version 3 relay's engine is sent both sites, the format 1
+    /// description among them.
+    #[tokio::test]
+    async fn a_client_never_reads_a_site_and_a_relay_of_version_three_does() -> Result<(), String> {
+        use tally_wire::batch::{PublicInfoContent, ReceiverInfoContent};
+        let peer = Identity::generate().map_err(text)?;
+        let hub = Arc::new(Hub::new(8, crate::sharing::Deadlines::RELAY).max_upload(roomy()));
+        verified(&hub, &peer)?;
+        let every = Streams::RAW
+            .with(Streams::POSITIONS)
+            .with(Streams::PROVISIONAL)
+            .with(Streams::CLOCK_MODELS)
+            .with(Streams::DEDUPLICATED)
+            .with(Streams::REGIONAL)
+            .with(Streams::WORLD)
+            .with(Streams::WORLD_PRECISE)
+            .with(Streams::FEEDER_FIGURES);
+        let subscribe = Record::Subscribe {
+            streams: every,
+            regions: Vec::new(),
+        };
+        let mut early = dial_pipe(&hub)?;
+        let mut watching = connected(&mut early, Role::Subscriber).await?;
+        watching
+            .writer
+            .send(std::slice::from_ref(&subscribe))
+            .await
+            .map_err(text)?;
+        while hub.subscribers() == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let (old_site, new_site) = (
+            Location {
+                lat_e7: 338_012_345,
+                lon_e7: -843_012_345,
+                alt_m: 88,
+                precision_m: 0,
+            },
+            Location {
+                lat_e7: 337_501_234,
+                lon_e7: -843_887_654,
+                alt_m: 301,
+                precision_m: 0,
+            },
+        );
+        let canaries = site_canaries(&[old_site, new_site])?;
+        // The old feeder: format 1, its site in its description.
+        let old = Identity::generate().map_err(text)?;
+        let mut old_feed = dial_pipe(&hub)?;
+        let mut session = connected_as(&mut old_feed, Role::Feeder, &old).await?;
+        let described = ReceiverInfo::sign(
+            &old,
+            &ReceiverInfoContent {
+                issued_ms: crate::network::wall_ms(),
+                location: Some(old_site),
+                clock: tally_wire::Clock::Dump1090,
+                software: "tally-feed 0.2".to_owned(),
+                relays: Vec::new(),
+            },
+        )
+        .map_err(text)?;
+        session
+            .writer
+            .send(&[
+                Record::ReceiverInfo(described),
+                Record::Batch(batch(&old, 0, 20)?),
+            ])
+            .await
+            .map_err(text)?;
+        // The new feeder: its public cell described, its site apart.
+        let new = Identity::generate().map_err(text)?;
+        let mut new_feed = dial_pipe(&hub)?;
+        let mut new_session = connected_as(&mut new_feed, Role::Feeder, &new).await?;
+        let now = crate::network::wall_ms();
+        let public = ReceiverInfo::sign_public(
+            &new,
+            &PublicInfoContent {
+                issued_ms: now,
+                cell: Some(tally_wire::Region::public_cell(&new_site).map_err(text)?),
+                clock: tally_wire::Clock::Dump1090,
+                software: "tally-feed 0.3".to_owned(),
+                relays: Vec::new(),
+            },
+        )
+        .map_err(text)?;
+        let site = tally_wire::ReceiverSite::sign(
+            &new,
+            &tally_wire::ReceiverSiteContent {
+                issued_ms: now,
+                location: new_site,
+                clock: tally_wire::Clock::Dump1090,
+            },
+        )
+        .map_err(text)?;
+        new_session
+            .writer
+            .send(&[
+                Record::ReceiverInfo(public),
+                Record::ReceiverSite(site),
+                Record::Batch(batch(&new, 0, 20)?),
+            ])
+            .await
+            .map_err(text)?;
+        // The fan-out's client: the new feeder's public description, and nothing of a site.
+        let mut read = Vec::new();
+        timeout(Duration::from_secs(30), async {
+            loop {
+                let more = drain(&mut watching.reader, 64).await?;
+                read.extend(more);
+                if read
+                    .iter()
+                    .any(|record| matches!(record, Record::ReceiverInfo(info) if info.receiver().ok() == Some(new.public())))
+                {
+                    return Ok::<(), String>(());
+                }
+            }
+        })
+        .await
+        .map_err(|_| "the subscriber was never sent the new feeder's description".to_owned())??;
+        read.extend(drain(&mut watching.reader, 64).await?);
+        assert_no_site(&read, &canaries)?;
+        assert!(!read.iter().any(|record| matches!(record, Record::ReceiverInfo(info) if info.receiver().ok() == Some(old.public()))));
+        // A client joining now: the directory's answer.
+        let mut late = dial_pipe(&hub)?;
+        let mut joining = connected(&mut late, Role::Subscriber).await?;
+        joining.writer.send(&[subscribe]).await.map_err(text)?;
+        let answered = drain(&mut joining.reader, 64).await?;
+        assert!(
+            answered
+                .iter()
+                .any(|record| matches!(record, Record::ReceiverInfo(_))),
+            "the joining client was answered nothing"
+        );
+        assert_no_site(&answered, &canaries)?;
+        // A version 3 relay's engine, taking the area's raw, is sent both sites: the format 1
+        // description and the new site.
+        let mut relay_link = dial_pipe(&hub)?;
+        let mut relay_session = connected_as(&mut relay_link, Role::Engine, &peer).await?;
+        relay_session
+            .writer
+            .send(&[Record::Subscribe {
+                streams: Streams::RAW,
+                regions: vec![tally_wire::rendezvous::area_of(&new_site).map_err(text)?],
+            }])
+            .await
+            .map_err(text)?;
+        // Read until both sites have come, under a bounded deadline rather than a quiet spell: an
+        // unoptimised build under load can be slower to answer than any one silence.
+        let mut to_relay = Vec::new();
+        let both = |read: &[Record]| {
+            let kinds = |wanted: fn(&Record) -> bool| {
+                read.iter()
+                    .any(|record| crate::outbound::bears_site(record) && wanted(record))
+            };
+            kinds(|record| matches!(record, Record::ReceiverInfo(_)))
+                && kinds(|record| matches!(record, Record::ReceiverSite(_)))
+        };
+        let _ = timeout(Duration::from_secs(30), async {
+            while !both(&to_relay) {
+                let mut records = Vec::new();
+                relay_session
+                    .reader
+                    .recv(&mut records)
+                    .await
+                    .map_err(text)?;
+                to_relay.extend(records);
+            }
+            Ok::<(), String>(())
+        })
+        .await;
+        let sites: Vec<&Record> = to_relay
+            .iter()
+            .filter(|record| crate::outbound::bears_site(record))
+            .collect();
+        assert!(
+            sites
+                .iter()
+                .any(|record| matches!(record, Record::ReceiverInfo(_))),
+            "the old feeder's format 1 description never reached a relay: {:?}",
+            to_relay
+                .iter()
+                .map(|record| (record.kind(), crate::outbound::bears_site(record)))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            sites
+                .iter()
+                .any(|record| matches!(record, Record::ReceiverSite(_))),
+            "the new feeder's site never reached a relay"
+        );
         Ok(())
     }
 

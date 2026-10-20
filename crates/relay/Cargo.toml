@@ -18,6 +18,8 @@ path = "src/main.rs"
 
 [dependencies]
 axum.workspace = true
+# The feeder figures' coverage cells and public cell centres (`figures`).
+h3o.workspace = true
 # A thread's scheduling priority (`mlat_host`: seals and window steps yield to provisional
 # solving).
 libc.workspace = true

@@ -339,6 +339,12 @@ api="${api%/}"
 	# shows it; its licence is served beside it, at /db-*/LICENSE.txt.
 	echo 'imageConfigText = "Aircraft data: Mictronics aircraft database, ODC-By 1.0";'
 	echo 'imageConfigLink = "https://github.com/Mictronics/aircraft-database";'
+	# No receiver is placed on the map (docs/relay-operators.md): readsb below is given no
+	# location, so receiver.json names none and no aircraft carries a distance from one; and
+	# tar1090 draws no site marker, range rings or range outline even if one were named.
+	echo 'SiteShow = false;'
+	echo 'SiteCircles = false;'
+	echo 'actual_range_show = false;'
 	if [[ -n "$api" ]]; then
 		[[ "$api" =~ ^https?://[^/[:space:]]+$ ]] ||
 			fail "TALLY_MAP_API is '$api'; it is the tally-api origin, such as https://api.example.org"
@@ -364,6 +370,11 @@ stop() {
 stopping=""
 trap 'stopping=1; stop' TERM INT
 
+# readsb has no receiver location (no --lat or --lon): it decodes a network, not one
+# receiver, and what it writes is served publicly, so it names no site, writes no range
+# outline and gives no aircraft a distance or direction from one. What it reads is the relay's
+# --beast-out, each frame's message alone, with no receiver's counter or signal level.
+#
 # When this readsb started: a day whose 00:55 UTC came before it may lack its last traces (the
 # archiver above).
 readsb_started="$(date -u +%s)"

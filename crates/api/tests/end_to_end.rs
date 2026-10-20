@@ -21,20 +21,21 @@ use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 use tally_api::Settings;
 use tally_api_types::{
-    Aircraft, AircraftResponse, AircraftUpdate, Feed, MeResponse, MlatCheck, Network,
+    Aircraft, AircraftResponse, AircraftUpdate, Feed, FeederStats, MeResponse, MlatCheck, Network,
     PositionSource, SourceCounts, Station, fixtures,
 };
 use tally_merge::Merge;
+use tally_mlat::intake::SiteRecord;
 use tally_mlat_solver::sim::{self, Scenario, Simulation};
 use tally_relay::hub::Hub;
 use tally_relay::mlat_host::stepping::{self, Hosting};
 use tally_relay::mlat_host::{HostedMlat, MlatHost, MlatReport, SETTLE_MS, WindowClock};
 use tally_relay::stations::StationReport;
-use tally_wire::batch::ReceiverInfoContent;
+use tally_wire::batch::PublicInfoContent;
 use tally_wire::noise;
 use tally_wire::{
-    Batch, BatchContent, Clock, Identity, Location, Observation, ReceiverInfo, Record, Region,
-    RelayAddress, Role,
+    Batch, BatchContent, Clock, Identity, Location, Observation, ReceiverInfo, ReceiverSite,
+    ReceiverSiteContent, Record, Region, RelayAddress, Role,
 };
 use tokio::net::{TcpListener, TcpStream};
 
@@ -95,7 +96,7 @@ const READSB_HEARD: &str = r#"{
 
 /// What the stand-in readsb answers a query in ADS-B Exchange's v2 form (`&jv2`): readsb's own v2
 /// shape, which `/v2` serves as it is.
-const READSB_V2: &str = r#"{"ac":[{"hex":"a1b2c3","type":"adsb_icao","flight":"UAL123  ","r":"N12345","t":"B738","alt_baro":35000,"gs":451.5,"track":271.0,"squawk":"1200","lat":37.5,"lon":-122.25,"nic":8,"rc":186,"seen_pos":1.0,"messages":4521,"seen":0.5,"rssi":-20.1,"mlat":[],"tisb":[]}],"msg":"No error","now":1791220000250,"total":1,"ctime":1791220000250,"ptime":0}"#;
+const READSB_V2: &str = r#"{"ac":[{"hex":"a1b2c3","type":"adsb_icao","flight":"UAL123  ","r":"N12345","t":"B738","alt_baro":35000,"gs":451.5,"track":271.0,"squawk":"1200","lat":37.5,"lon":-122.25,"nic":8,"rc":186,"seen_pos":1.0,"messages":4521,"seen":0.5,"rssi":-20.1,"r_dst":12.3,"r_dir":45.6,"mlat":[],"tisb":[]}],"msg":"No error","now":1791220000250,"total":1,"ctime":1791220000250,"ptime":0}"#;
 
 type Asked = Arc<Mutex<Vec<String>>>;
 /// What the stand-in readsb answers, which a test may change.
@@ -134,11 +135,17 @@ async fn start_readsb_answering() -> Result<(String, Asked, Answer)> {
     Ok((format!("http://{address}"), asked, answer))
 }
 
-/// A real relay with its stats listener: the relay's address and key, and the stats URL.
-async fn start_relay() -> Result<(std::net::SocketAddr, tally_wire::PublicKey, String)> {
+/// A real relay with its stats listener, on `clock` (its ingest clock, `Hub::clocked`): the relay's
+/// address and key, and the stats URL. It signs its feeder figures every 200 ms by that clock, so a
+/// test that moves the clock past the hour it fed reads that hour's figures without waiting it out.
+async fn start_relay(
+    clock: &Arc<stepping::Clock>,
+) -> Result<(std::net::SocketAddr, tally_wire::PublicKey, String)> {
     let identity = Identity::generate().map_err(text)?;
     let key = identity.public();
-    let hub = Arc::new(Hub::new(8, tally_relay::sharing::Deadlines::RELAY));
+    let hub = Arc::new(
+        Hub::clocked(8, clock.clock(), tally_relay::sharing::Deadlines::RELAY).figures_every(200),
+    );
     let listener = TcpListener::bind("127.0.0.1:0").await.map_err(text)?;
     let address = listener.local_addr().map_err(text)?;
     let stats = TcpListener::bind("127.0.0.1:0").await.map_err(text)?;
@@ -157,7 +164,7 @@ fn location() -> Location {
     }
 }
 
-fn batch(receiver: &Identity, sequence: u64) -> Result<Batch> {
+fn batch(receiver: &Identity, sequence: u64, wall_ms: u64) -> Result<Batch> {
     let observations = (0..3u8)
         .map(|n| Observation {
             format: b'2',
@@ -172,7 +179,7 @@ fn batch(receiver: &Identity, sequence: u64) -> Result<Batch> {
             boot_id: 7,
             sequence,
             counter_epoch: 0,
-            wall_ms: 0,
+            wall_ms,
             dropped: 0,
             previous: [0; 32],
             observations,
@@ -181,28 +188,42 @@ fn batch(receiver: &Identity, sequence: u64) -> Result<Batch> {
     .map_err(text)
 }
 
-/// A receiver feeding the relay directly: its description, then batches 0, 1, 2 and 4 (3 never
-/// arrives). The connection stays open for the rest of the test.
-async fn feed(relay: std::net::SocketAddr, relay_key: &tally_wire::PublicKey) -> Result<Identity> {
+/// A receiver feeding the relay directly, as a version 3 feeder does: its public description (its
+/// public cell, no site) and its site (relay-only), then batches 0, 1, 2 and 4 (3 never arrives),
+/// each at `wall_ms` by its clock. The connection stays open for the rest of the test.
+async fn feed(
+    relay: std::net::SocketAddr,
+    relay_key: &tally_wire::PublicKey,
+    wall_ms: u64,
+) -> Result<Identity> {
     let receiver = Identity::generate().map_err(text)?;
     let stream = TcpStream::connect(relay).await.map_err(text)?;
     let mut session = noise::connect(stream, &receiver, relay_key, Role::Feeder)
         .await
         .map_err(text)?;
-    let info = ReceiverInfo::sign(
+    let info = ReceiverInfo::sign_public(
         &receiver,
-        &ReceiverInfoContent {
+        &PublicInfoContent {
             issued_ms: 1,
-            location: Some(location()),
+            cell: Some(Region::public_cell(&location()).map_err(text)?),
             clock: Clock::Dump1090,
             software: "tally-feed test".to_owned(),
             relays: Vec::new(),
         },
     )
     .map_err(text)?;
-    let mut records = vec![Record::ReceiverInfo(info)];
+    let site = ReceiverSite::sign(
+        &receiver,
+        &ReceiverSiteContent {
+            issued_ms: 1,
+            location: location(),
+            clock: Clock::Dump1090,
+        },
+    )
+    .map_err(text)?;
+    let mut records = vec![Record::ReceiverInfo(info), Record::ReceiverSite(site)];
     for sequence in [0, 1, 2, 4] {
-        records.push(Record::Batch(batch(&receiver, sequence)?));
+        records.push(Record::Batch(batch(&receiver, sequence, wall_ms)?));
     }
     session.writer.send(&records).await.map_err(text)?;
     tokio::spawn(async move {
@@ -375,8 +396,11 @@ fn expected() -> Vec<Aircraft> {
 async fn the_api_serves_aircraft_the_network_and_a_station_from_readsb_and_a_real_relay() -> Result
 {
     let (readsb_url, asked) = start_readsb().await?;
-    let (relay, relay_key, stats_url) = start_relay().await?;
-    let receiver = feed(relay, &relay_key).await?;
+    // The relay's clock stands an hour back while it is fed, and is moved to the wall clock once
+    // the station is read: the hour it was fed in has passed, so its figures are published.
+    let clock = stepping::Clock::at(wall_ms() - tally_wire::FIGURES_BUCKET_MS);
+    let (relay, relay_key, stats_url) = start_relay(&clock).await?;
+    let receiver = feed(relay, &relay_key, clock.now()).await?;
     let key = receiver.public();
 
     // The relay's own report: one direct session, four batches, the one gap.
@@ -399,6 +423,11 @@ async fn the_api_serves_aircraft_the_network_and_a_station_from_readsb_and_a_rea
     let mut settings = settings(stats_url, readsb_url);
     settings.refresh = Duration::from_millis(100);
     settings.client_ip_header = Some(hyper::header::HeaderName::from_static(TEST_CLIENT));
+    // The API reads the relay as any client does: its feeder figures among what it reads.
+    settings.mlat.relays = vec![RelayAddress {
+        key: relay_key,
+        address: relay.to_string(),
+    }];
     let api = start_api(settings).await?;
 
     // A station, by its key in the URL's form.
@@ -416,13 +445,22 @@ async fn the_api_serves_aircraft_the_network_and_a_station_from_readsb_and_a_rea
         ),
         (key.to_base64().as_str(), true, 1, Some("tally-feed test"))
     );
-    // Served at its public pin, about 5 km from where it says it is, never the place itself.
+    // Served at a pin inside its public cell, never the place itself: the relay told the API
+    // the cell and nothing finer.
     let pin = station.location.ok_or("no pin")?;
     assert!(pin.lat != 37.41 && pin.lon != -122.1, "{pin:?}");
-    assert!(
-        (pin.lat - 37.41).abs() < 0.05 && (pin.lon - -122.1).abs() < 0.07,
-        "{pin:?}"
-    );
+    let pinned = Region::public_cell(&Location {
+        lat_e7: (pin.lat * 1e7).round() as i32,
+        lon_e7: (pin.lon * 1e7).round() as i32,
+        alt_m: 0,
+        precision_m: 0,
+    })
+    .map_err(text)?;
+    assert_eq!(pinned, Region::public_cell(&location()).map_err(text)?);
+    // The relay's report, which the API reads, names the cell, never a coordinate.
+    let report_json = serde_json::to_string(&report).map_err(text)?;
+    assert!(!report_json.contains("37.41") && !report_json.contains("122.1,"));
+
     assert_eq!(station.state, tally_api_types::StationState::Feeding);
     assert!(station.first_seen_at_ms <= station.last_seen_at_ms);
     assert!(station.last_seen_at_ms <= station.now_ms);
@@ -542,6 +580,23 @@ async fn the_api_serves_aircraft_the_network_and_a_station_from_readsb_and_a_rea
         assert_eq!(status, StatusCode::BAD_REQUEST, "{query}");
         assert_eq!(header(&headers, &ACCESS_CONTROL_ALLOW_ORIGIN), SITE);
     }
+
+    // Its figures, last (the station is not online once the clock moves past its batches): as the
+    // relay computed and signed them once the hour it was fed in passed, and the API read them on
+    // its client link: the four batches' twelve receptions, in the area of its public cell.
+    clock.set(wall_ms());
+    let (_, figures) = until::<FeederStats>(
+        &format!("{api}/v1/stations/{}/stats", key.to_base64url()),
+        |figures| figures.messages == 12,
+    )
+    .await?;
+    let area =
+        tally_wire::rendezvous::area_of_public(Region::public_cell(&location()).map_err(text)?)
+            .map(|area| format!("{:x}", area.as_u64()));
+    assert_eq!(figures.area, area);
+    assert!(!figures.standing && figures.ranks.is_none());
+    let figures_json = serde_json::to_string(&figures).map_err(text)?;
+    assert!(!figures_json.contains("37.41") && !figures_json.contains("-122.1,"));
     Ok(())
 }
 
@@ -610,12 +665,19 @@ async fn a_preflight_allows_what_the_client_core_sends_and_costs_no_token() -> R
 }
 
 /// `/v2`: each path one query of readsb in v2 form, as adsb.lol asks it, answered as readsb
-/// writes it, cached as an aircraft answer is; a malformed value refused before readsb is asked.
+/// writes it less what places its receiver, cached as an aircraft answer is; a malformed value refused before readsb is asked.
 #[tokio::test(flavor = "multi_thread")]
 async fn v2_asks_readsb_as_adsb_lol_does_and_serves_its_answer() -> Result {
     let (readsb_url, asked) = start_readsb().await?;
     let api = start_api(settings("http://127.0.0.1:9", readsb_url)).await?;
-    let readsb_v2: serde_json::Value = serde_json::from_str(READSB_V2).map_err(text)?;
+    // Served as readsb wrote it, less what it says of its receiver (distance, direction, signal).
+    let mut readsb_v2: serde_json::Value = serde_json::from_str(READSB_V2).map_err(text)?;
+    let aircraft = readsb_v2["ac"][0]
+        .as_object_mut()
+        .ok_or("readsb's answer has no aircraft")?;
+    for field in tally_api::v2::RECEIVER_FIELDS {
+        assert!(aircraft.remove(field).is_some(), "{field}");
+    }
     for (path, query) in [
         ("hex/A1B2C3", "find_hex=a1b2c3&jv2"),
         ("icao/a1b2c3,c0ffee", "find_hex=a1b2c3,c0ffee&jv2"),
@@ -988,11 +1050,11 @@ impl Hosting for Held {
 }
 
 impl MlatHost for Held {
-    fn set_areas(&self, _: tally_wire::Regions, descriptions: Vec<ReceiverInfo>) {
+    fn set_areas(&self, _: tally_wire::Regions, descriptions: Vec<SiteRecord>) {
         self.host.set_areas(self.areas.clone(), descriptions);
     }
 
-    fn offer_description(&self, info: &tally_wire::ReceiverInfo, stamp_ms: u64) {
+    fn offer_description(&self, info: &SiteRecord, stamp_ms: u64) {
         self.host.offer_description(info, stamp_ms);
     }
 
@@ -1116,6 +1178,7 @@ async fn feed_simulation(
             .await
             .map_err(text)?;
         let description = Record::ReceiverInfo(feed.info.clone());
+        let site = Record::ReceiverSite(feed.site.clone());
         let mut batches = Vec::new();
         for batch in &feed.batches {
             let wall = batch.content().map_err(text)?.wall_ms;
@@ -1124,7 +1187,7 @@ async fn feed_simulation(
         }
         let clock = Arc::clone(clock);
         tokio::spawn(async move {
-            if session.writer.send(&[description]).await.is_err() {
+            if session.writer.send(&[description, site]).await.is_err() {
                 return;
             }
             for (wall, record) in batches {
@@ -1165,7 +1228,7 @@ async fn the_api_serves_one_merged_mlat_position_per_aircraft_from_two_relays() 
         (mlat_relay(&clock).await?, mlat_relay(&clock).await?);
     let before = (west_hub.listening(), east_hub.listening());
     let (readsb_url, _) = start_readsb().await?;
-    let (_, _, stats_url) = start_relay().await?;
+    let (_, _, stats_url) = start_relay(&stepping::Clock::wall()).await?;
     let mut settings = settings(stats_url, readsb_url);
     settings.mlat.relays = vec![west.clone(), east.clone()];
     // The scenario ran minutes ago.
@@ -1177,7 +1240,7 @@ async fn the_api_serves_one_merged_mlat_position_per_aircraft_from_two_relays() 
         tokio::spawn(tally_merge::link::subscribe(
             relay.clone(),
             Identity::generate().map_err(text)?,
-            tally_merge::link::streams(false),
+            tally_merge::link::streams(),
             inbound.clone(),
         ));
     }
@@ -1196,7 +1259,7 @@ async fn the_api_serves_one_merged_mlat_position_per_aircraft_from_two_relays() 
         WAIT,
     );
 
-    let mut merge = Merge::new(tally_merge::Settings::new(false));
+    let mut merge = Merge::new(tally_merge::Settings::default());
     let last: Arc<Mutex<String>> = Arc::default();
     let url = format!("{api}/v1/aircraft?west=0&south=49&east=10&north=55");
     // The scenario at the wall clock's pace at most, and a hang guard beyond: the clock walks no

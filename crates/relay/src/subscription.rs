@@ -2,9 +2,10 @@
 //! the fan-out is in it, and what an engine may be granted ([`engine_grant`]).
 
 use std::ops::RangeInclusive;
+use std::sync::Arc;
 
 use tally_mlat::area::Band;
-use tally_wire::{PublicKey, Record, Region, Streams};
+use tally_wire::{ClientRecord, PublicKey, Record, Region, Streams};
 
 use crate::directory::Directory;
 use crate::hub::Item;
@@ -35,10 +36,13 @@ impl Default for Subscription {
 }
 
 impl Subscription {
+    /// Whether a relay-role subscriber (an engine) wants `item`: receivers routed by their sites'
+    /// finest cells (`Item::cell`).
     pub fn wants(&self, item: &Item) -> bool {
         match &*item.record {
-            // A receiver's description travels with its raw batches, under the same regions.
-            Record::Batch(_) | Record::ReceiverInfo(_) => {
+            // A receiver's description, and its site, travel with its raw batches, under the same
+            // regions.
+            Record::Batch(_) | Record::ReceiverInfo(_) | Record::ReceiverSite(_) => {
                 self.streams.contains(Streams::RAW) && self.covers(item.cell)
             }
             // Version 1 serves the deduplicated stream for the whole world only: one copy of a
@@ -77,6 +81,24 @@ impl Subscription {
         }
     }
 
+    /// What a client may subscribe to of `self` (`ClientSubscription`, the only way one is
+    /// made): each region no finer than a receiver's public cell (`Region::clamped_to_public`),
+    /// named once. A finer region would let a client test which receivers lie inside it, and so
+    /// place one finer than its public cell.
+    pub fn for_client(self) -> ClientSubscription {
+        let mut regions: Vec<Region> = Vec::with_capacity(self.regions.len());
+        for region in self.regions {
+            let clamped = region.clamped_to_public();
+            if !regions.contains(&clamped) {
+                regions.push(clamped);
+            }
+        }
+        ClientSubscription(Self {
+            streams: self.streams,
+            regions,
+        })
+    }
+
     /// Whether a record placing aircraft at `points` is inside the subscription: any point in a
     /// region. Unplaced (`None`), it is whole-world.
     fn places(&self, points: Option<&[Region]>) -> bool {
@@ -108,6 +130,173 @@ impl Subscription {
             streams: Streams(0),
             regions: Vec::new(),
         }
+    }
+}
+
+/// A client's subscription: its regions no finer than a public cell, made only by
+/// [`Subscription::for_client`]. It routes a [`ClientItem`] and nothing else, so no client's
+/// routing can read what the relay alone holds of a record (`Item::cell`, a receiver's site).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClientSubscription(Subscription);
+
+impl ClientSubscription {
+    pub fn streams(&self) -> Streams {
+        self.0.streams
+    }
+
+    /// Its regions, each no finer than a public cell. Empty is the whole world.
+    pub fn regions(&self) -> &[Region] {
+        &self.0.regions
+    }
+
+    /// As the plain subscription it is, clamped: what the directory's client answer and the
+    /// credit read.
+    pub fn as_subscription(&self) -> &Subscription {
+        &self.0
+    }
+
+    /// The plain subscription it is, clamped: what the credit narrows (`Credit::admit`) and a
+    /// session's updates carry. Clamped again when it is made a client's (`for_client`).
+    pub fn into_subscription(self) -> Subscription {
+        self.0
+    }
+
+    /// Whether the client wants `item`: by its client form's kind and the client's streams, and
+    /// by its client place ([`ClientPlace`]), never by anything finer than a public cell.
+    pub fn serves(&self, item: &ClientItem) -> bool {
+        let streams = self.0.streams;
+        match &*item.record {
+            // A client is sent no raw: its receivers' public descriptions are what it is sent of
+            // the raw stream.
+            ClientRecord::ReceiverInfo(_) => {
+                streams.contains(Streams::RAW) && self.holds(&item.place)
+            }
+            ClientRecord::Positions(_) => {
+                streams.contains(Streams::POSITIONS) && self.holds(&item.place)
+            }
+            ClientRecord::FaultProof(_) => streams.contains(Streams::POSITIONS),
+            ClientRecord::Provisional(_) => {
+                streams.contains(Streams::PROVISIONAL) && self.holds(&item.place)
+            }
+            // The regional product, counters stripped, by the area its origin signed it for.
+            ClientRecord::RegionalBatch(_) => {
+                streams.contains(Streams::REGIONAL) && self.holds(&item.place)
+            }
+            ClientRecord::WorldPositions(_) => streams.contains(Streams::WORLD),
+            ClientRecord::WorldPrecise(_) => streams.contains(Streams::WORLD_PRECISE),
+            // A relay's figures of an area's receivers, by that area.
+            ClientRecord::FeederFigures(_) => {
+                streams.contains(Streams::FEEDER_FIGURES) && self.holds(&item.place)
+            }
+            // A clock model without its offsets, by the area its full model's tile is in.
+            ClientRecord::ClockModel(_) => {
+                streams.contains(Streams::CLOCK_MODELS) && self.holds(&item.place)
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether `place` is inside the subscription. A cell is when it and a region overlap (one
+    /// holds the other): a client of a public cell is sent its area's records, a client of an
+    /// area its public cells'. Aircraft are when any lies in a region. A record of no place a
+    /// client may name goes to whole-world clients alone.
+    fn holds(&self, place: &ClientPlace) -> bool {
+        let regions = &self.0.regions;
+        match place {
+            ClientPlace::World => true,
+            ClientPlace::Unplaced => regions.is_empty(),
+            ClientPlace::Cell(cell) => {
+                regions.is_empty()
+                    || regions
+                        .iter()
+                        .any(|region| region.contains(cell.0) || cell.0.contains(*region))
+            }
+            ClientPlace::Aircraft(points) => {
+                regions.is_empty()
+                    || points
+                        .iter()
+                        .any(|point| regions.iter().any(|region| region.contains(*point)))
+            }
+        }
+    }
+}
+
+/// A cell no finer than a receiver's public cell: the only cell a client is routed by. Made only
+/// by [`Coarse::of`], which clamps.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Coarse(Region);
+
+impl Coarse {
+    pub fn of(region: Region) -> Self {
+        Self(region.clamped_to_public())
+    }
+
+    pub fn region(self) -> Region {
+        self.0
+    }
+
+    pub fn as_region(&self) -> &Region {
+        &self.0
+    }
+}
+
+/// Where a client may be routed a record, read from its client form alone (and, for a clock
+/// model, the area its full model's tile is in): never a receiver's site, never a tile centre.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ClientPlace {
+    /// Of the whole world: every client that takes its stream, whatever its regions.
+    World,
+    /// Of no place a client may name (a receiver whose description names no public cell, figures
+    /// of no area): whole-world clients only.
+    Unplaced,
+    /// In one cell no finer than a public cell: a receiver's public cell, an area.
+    Cell(Coarse),
+    /// The aircraft it places, by their finest cells: where aircraft are, not receivers.
+    Aircraft(Arc<[Region]>),
+}
+
+/// What a client link may be sent of a fan-out item, and where it is routed: its client form and
+/// its client place, made together, once ([`ClientItem::new`]).
+#[derive(Clone, Debug)]
+pub struct ClientItem {
+    pub record: Arc<ClientRecord>,
+    place: ClientPlace,
+}
+
+impl ClientItem {
+    /// `record`'s client item. Its place is read from the record: a description's public cell, a
+    /// regional product's or figures' area, the aircraft of positions (`aircraft`, the points the
+    /// hub placed them by), and, for a client clock model, the area its full model's tile is in
+    /// (`aircraft`'s first point, coarsened to its area here whatever it was).
+    pub fn new(record: Arc<ClientRecord>, aircraft: Option<&Arc<[Region]>>) -> Self {
+        let cell = |cell: Option<Region>| match cell {
+            Some(cell) => ClientPlace::Cell(Coarse::of(cell)),
+            None => ClientPlace::Unplaced,
+        };
+        let place = match &*record {
+            ClientRecord::ReceiverInfo(info) => cell(info.get().public_cell().ok().flatten()),
+            ClientRecord::RegionalBatch(regional) => {
+                cell(regional.content().ok().map(|content| content.cell))
+            }
+            ClientRecord::FeederFigures(figures) => {
+                cell(figures.content().ok().and_then(|content| content.area))
+            }
+            ClientRecord::ClockModel(_) => cell(
+                aircraft
+                    .and_then(|points| points.first())
+                    .and_then(|point| tally_wire::rendezvous::area_of_cell(*point)),
+            ),
+            ClientRecord::Positions(_) | ClientRecord::Provisional(_) => match aircraft {
+                Some(points) => ClientPlace::Aircraft(Arc::clone(points)),
+                None => ClientPlace::World,
+            },
+            _ => ClientPlace::World,
+        };
+        Self { record, place }
+    }
+
+    pub fn place(&self) -> &ClientPlace {
+        &self.place
     }
 }
 
@@ -227,7 +416,9 @@ mod tests {
         SolutionsContent, Streams,
     };
 
-    use super::{Band, Subscription, areas_solved_by, engine_grant};
+    use super::{
+        Band, ClientItem, ClientPlace, Coarse, Subscription, areas_solved_by, engine_grant,
+    };
     use crate::directory::{Directory, Group};
     use crate::egress::{Class, Kind};
     use crate::hub::Item;
@@ -268,6 +459,81 @@ mod tests {
             },
         )
         .map_err(text)
+    }
+
+    /// A client's regions are clamped to public cells: a finer one is its public cell (so it
+    /// cannot ask which receivers lie in a few hundred metres), a coarser one stays, and a region
+    /// named twice once clamped is named once. And a receiver reaches it by its public cell: a
+    /// region holding its site but not its public cell is no way to reach it.
+    #[test]
+    fn a_clients_regions_are_clamped_to_public_cells_and_route_by_them() -> Result<(), String> {
+        use tally_wire::PUBLIC_CELL_RESOLUTION;
+        let site = Location {
+            lat_e7: 337_501_234,
+            lon_e7: -843_887_654,
+            alt_m: 301,
+            precision_m: 0,
+        };
+        let public = Region::public_cell(&site).map_err(text)?;
+        let fine = Region::containing(&site, PUBLIC_CELL_RESOLUTION + 4).map_err(text)?;
+        let finer = Region::point(&site).map_err(text)?;
+        let area = area_at(site.lat_e7, site.lon_e7)?;
+        let asked = Subscription {
+            streams: Streams::RAW,
+            regions: vec![fine, finer, area],
+        }
+        .for_client();
+        assert_eq!(asked.regions(), [public, area]);
+        for region in asked.regions() {
+            assert!(region.resolution() <= PUBLIC_CELL_RESOLUTION);
+        }
+        // Routed by the public cell: served to a client of that cell, never by the site's cell.
+        let receiver = Identity::from_seed([4; 32]);
+        let described = |cell: Option<Region>| -> Result<ClientItem, String> {
+            let info = tally_wire::ReceiverInfo::sign_public(
+                &receiver,
+                &tally_wire::batch::PublicInfoContent {
+                    issued_ms: NOW,
+                    cell,
+                    clock: tally_wire::Clock::Dump1090,
+                    software: String::new(),
+                    relays: Vec::new(),
+                },
+            )
+            .map_err(text)?;
+            let record = Record::ReceiverInfo(info);
+            let client = crate::outbound::client_form(&record).ok_or("no client form")?;
+            Ok(ClientItem::new(client, None))
+        };
+        let only = |region| Subscription {
+            streams: Streams::RAW,
+            regions: vec![region],
+        };
+        let item = described(Some(public))?;
+        assert_eq!(item.place(), &ClientPlace::Cell(Coarse::of(public)));
+        assert!(only(public).for_client().serves(&item));
+        // A neighbouring public cell's client does not get it.
+        let neighbour = Region::public_cell(&Location {
+            lat_e7: site.lat_e7 + 1_000_000,
+            ..site
+        })
+        .map_err(text)?;
+        assert_ne!(neighbour, public);
+        assert!(!only(neighbour).for_client().serves(&item));
+        // A client of the site's finest cell is a client of its public cell: nothing finer.
+        assert!(only(finer).for_client().serves(&item));
+        // With no public cell, a receiver is in the whole world and no region.
+        let unplaced = described(None)?;
+        assert!(!only(public).for_client().serves(&unplaced));
+        assert!(
+            Subscription {
+                streams: Streams::RAW,
+                regions: Vec::new(),
+            }
+            .for_client()
+            .serves(&unplaced)
+        );
+        Ok(())
     }
 
     #[test]
@@ -414,6 +680,7 @@ mod tests {
             points: None,
             decoded: None,
             stamp_ms: 0,
+            client: None,
         };
         let asked = |streams: Streams| {
             Subscription {

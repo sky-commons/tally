@@ -9,7 +9,7 @@
 
 use crate::WireError;
 use crate::batch::{Batch, ReceiverInfo};
-use crate::clock_model::{ClockModel, ClockModelPart};
+use crate::clock_model::{ClientClockModel, ClockModel, ClockModelPart};
 use crate::credit::{EvidenceBundle, FirehoseCredential};
 use crate::cut::MlatCut;
 use crate::delivery::{DeliveryAnswer, DeliveryQuery};
@@ -18,12 +18,13 @@ use crate::fault_proof::FaultProof;
 use crate::key::{KEY_LEN, PublicKey};
 use crate::positions::Positions;
 use crate::probe::{Echo, EchoReply};
-use crate::products::{RegionalBatch, WorldPositions, WorldPrecise};
+use crate::products::{ClientRegionalBatch, RegionalBatch, WorldPositions, WorldPrecise};
 use crate::region::Region;
 use crate::sharing::{
     BundleIndex, HaveSummary, ParityChunk, PieceManifest, StripeAssignment, StripeReceipt,
 };
 use crate::signed::Fields;
+use crate::site::ReceiverSite;
 
 /// The oldest wire version this build speaks: 2 (RFC-0171 §3.3, RFC-0174 §2.10). Version 1 is
 /// retired before any feeder beyond Flightlines' own ran it (adsb.im ships version 2, RFC-0174
@@ -33,8 +34,40 @@ use crate::signed::Fields;
 pub const MIN_VERSION: u16 = 2;
 /// Version 2 (RFC-0174 §2.2, §2.10): the network records (echo, delivery checks, the provider
 /// directory, sharing, credit, the products), compressed batches, the `Probe` role and 16-bit
-/// `Streams`.
-pub const MAX_VERSION: u16 = 2;
+/// `Streams`. Version 3 ([`SITES_VERSION`]): receiver sites are relay-only.
+pub const MAX_VERSION: u16 = 3;
+/// Version 3: "this peer keeps receiver sites off client links" (`crate::site`). A peer that
+/// negotiated it promises to send a site-bearing record ([`Record::carries_site`]: a
+/// `ReceiverSite`, a format 1 `ReceiverInfo`) only on a link [`carries_sites`] admits, and to send
+/// a client only what a [`crate::ClientRecord`] can hold. Its records: `ReceiverSite`, the format
+/// 2 `ReceiverInfo`, tagged `Positions` (formats 5 and 6), `ClientClockModel` and
+/// `ClientRegionalBatch`. A feeder sends its `ReceiverSite` only to a relay that negotiated it,
+/// and a relay forwards a site-bearing record (an old feeder's format 1 description too, byte for
+/// byte) only to relay-role peers that negotiated it. It is also the least a relay-role peer may
+/// agree ([`least_version`]): the relays and their feeders move together, so no relay link of an
+/// older version exists to carry anything.
+pub const SITES_VERSION: u16 = 3;
+const _: () = assert!(MAX_VERSION >= SITES_VERSION);
+
+/// The least version a session of `role` may agree (RFC-0171 §3.3): [`SITES_VERSION`] for a
+/// relay-role peer (a relay, a sharing member, an MLAT engine), which is sent sites; [`MIN_VERSION`]
+/// for everyone else, a client of any version this build speaks. Both ends hold it at the
+/// handshake: an initiator says it as its `Hello`'s least, and a responder refuses a `Hello`
+/// whose role it is not met by with `Goodbye { reason: Version }`.
+pub fn least_version(role: Role) -> u16 {
+    if matches!(role, Role::Relay | Role::Engine) {
+        SITES_VERSION
+    } else {
+        MIN_VERSION
+    }
+}
+
+/// Whether a session of `role` that negotiated `version` may be sent a site-bearing record: a
+/// relay-role peer (another relay, a sharing member, an MLAT engine) that negotiated
+/// [`SITES_VERSION`] or later. Every other link is a client link.
+pub fn carries_sites(version: u16, role: Role) -> bool {
+    version >= SITES_VERSION && matches!(role, Role::Relay | Role::Engine)
+}
 
 /// The bit of a kind byte that says "a reader that does not know this kind must stop".
 pub const CRITICAL: u8 = 0x80;
@@ -86,13 +119,21 @@ pub const KIND_DELIVERY_ANSWER: u8 = 0x23;
 // RFC-0181 §10: a relay's overload cut of its MLAT seats, for the relays holding its areas.
 // Non-critical: a build that predates it skips it and applies no cut.
 pub const KIND_MLAT_CUT: u8 = 0x24;
+// Wire version 3 (`SITES_VERSION`): receiver sites are relay-only. Non-critical: a build that
+// predates them skips them, and is sent none on a client link anyway.
+pub const KIND_RECEIVER_SITE: u8 = 0x25;
+pub const KIND_CLIENT_CLOCK_MODEL: u8 = 0x26;
+pub const KIND_CLIENT_REGIONAL_BATCH: u8 = 0x27;
+// RFC-0174 §2.12 as amended 2026-10-19: a relay's signed figures of its receivers, for clients.
+// Non-critical: a build that predates it skips it.
+pub const KIND_FEEDER_FIGURES: u8 = 0x28;
 
 /// Kinds this build knows were retired: read as `Record::Retired`, never written.
 pub const RETIRED_KINDS: [u8; 2] = [KIND_POSSESSION_QUERY, KIND_POSSESSION_ANSWER];
 
 /// Every kind this build reads and writes, in kind order: what a table over kinds is checked
 /// against, so a kind added here and nowhere else is a failing test.
-pub const KINDS: [u8; 34] = [
+pub const KINDS: [u8; 38] = [
     KIND_HELLO,
     KIND_WELCOME,
     KIND_BATCH,
@@ -127,6 +168,10 @@ pub const KINDS: [u8; 34] = [
     KIND_DELIVERY_QUERY,
     KIND_DELIVERY_ANSWER,
     KIND_MLAT_CUT,
+    KIND_RECEIVER_SITE,
+    KIND_CLIENT_CLOCK_MODEL,
+    KIND_CLIENT_REGIONAL_BATCH,
+    KIND_FEEDER_FIGURES,
 ];
 
 const HEADER_LEN: usize = 3;
@@ -224,6 +269,10 @@ impl Streams {
     /// The precise world product (RFC-0174 §2.11): one fix per aircraft per second from final MLAT
     /// fixes, sealed once they can have come (`WorldPrecise`).
     pub const WORLD_PRECISE: Self = Self(128);
+    /// Relays' feeder figures (RFC-0174 §2.12): each area's receivers' figures as the relay
+    /// that hosts or carries them signs them (`FeederFigures`), by the subscription's regions. Its
+    /// own bit: raw is relay-only, so a client reads figures without asking for it.
+    pub const FEEDER_FIGURES: Self = Self(256);
 
     pub fn contains(self, other: Self) -> bool {
         self.0 & other.0 == other.0
@@ -440,6 +489,13 @@ pub enum Record {
     WorldPrecise(WorldPrecise),
     /// A relay's signed overload cut of its MLAT seats (RFC-0181 §10).
     MlatCut(MlatCut),
+    /// A receiver's signed exact site: relay-only (`crate::site`).
+    ReceiverSite(ReceiverSite),
+    /// An engine's signed clock model as a client receives it: no site, no offset.
+    ClientClockModel(ClientClockModel),
+    /// An area's deduplicated receptions as a client receives them: no counter.
+    ClientRegionalBatch(ClientRegionalBatch),
+    FeederFigures(crate::figures::FeederFigures),
 }
 
 impl Record {
@@ -448,6 +504,17 @@ impl Record {
             min_version: MIN_VERSION,
             max_version: MAX_VERSION,
             role,
+        }
+    }
+
+    /// Whether it carries a receiver's exact site: a `ReceiverSite`, or a `ReceiverInfo` of format
+    /// 1 (or of a format this build cannot show carries none). Such a record travels only on a
+    /// link [`carries_sites`] admits, and no [`crate::ClientRecord`] holds one.
+    pub fn carries_site(&self) -> bool {
+        match self {
+            Self::ReceiverSite(_) => true,
+            Self::ReceiverInfo(info) => info.carries_site(),
+            _ => false,
         }
     }
 
@@ -488,6 +555,10 @@ impl Record {
             Self::BundleIndex(_) => KIND_BUNDLE_INDEX,
             Self::WorldPrecise(_) => KIND_WORLD_PRECISE,
             Self::MlatCut(_) => KIND_MLAT_CUT,
+            Self::ReceiverSite(_) => KIND_RECEIVER_SITE,
+            Self::ClientClockModel(_) => KIND_CLIENT_CLOCK_MODEL,
+            Self::ClientRegionalBatch(_) => KIND_CLIENT_REGIONAL_BATCH,
+            Self::FeederFigures(_) => KIND_FEEDER_FIGURES,
             Self::Retired(kind) => *kind,
         }
     }
@@ -529,6 +600,10 @@ impl Record {
             Self::BundleIndex(signed) => signed.as_bytes().len(),
             Self::WorldPrecise(signed) => signed.as_bytes().len(),
             Self::MlatCut(signed) => signed.as_bytes().len(),
+            Self::ReceiverSite(signed) => signed.as_bytes().len(),
+            Self::ClientClockModel(signed) => signed.as_bytes().len(),
+            Self::ClientRegionalBatch(signed) => signed.as_bytes().len(),
+            Self::FeederFigures(signed) => signed.as_bytes().len(),
             _ => {
                 let mut out = Vec::new();
                 return match self.encode(&mut out) {
@@ -620,6 +695,10 @@ impl Record {
             Self::BundleIndex(signed) => out.extend_from_slice(signed.as_bytes()),
             Self::WorldPrecise(signed) => out.extend_from_slice(signed.as_bytes()),
             Self::MlatCut(signed) => out.extend_from_slice(signed.as_bytes()),
+            Self::ReceiverSite(signed) => out.extend_from_slice(signed.as_bytes()),
+            Self::ClientClockModel(signed) => out.extend_from_slice(signed.as_bytes()),
+            Self::ClientRegionalBatch(signed) => out.extend_from_slice(signed.as_bytes()),
+            Self::FeederFigures(signed) => out.extend_from_slice(signed.as_bytes()),
             Self::Retired(kind) => {
                 out.truncate(start);
                 return Err(WireError::Invalid {
@@ -747,6 +826,16 @@ impl Record {
             KIND_BUNDLE_INDEX => Self::BundleIndex(BundleIndex::from_bytes(body.to_vec())?),
             KIND_WORLD_PRECISE => Self::WorldPrecise(WorldPrecise::from_bytes(body.to_vec())?),
             KIND_MLAT_CUT => Self::MlatCut(MlatCut::from_bytes(body.to_vec())?),
+            KIND_RECEIVER_SITE => Self::ReceiverSite(ReceiverSite::from_bytes(body.to_vec())?),
+            KIND_CLIENT_CLOCK_MODEL => {
+                Self::ClientClockModel(ClientClockModel::from_bytes(body.to_vec())?)
+            }
+            KIND_CLIENT_REGIONAL_BATCH => {
+                Self::ClientRegionalBatch(ClientRegionalBatch::from_bytes(body.to_vec())?)
+            }
+            KIND_FEEDER_FIGURES => {
+                Self::FeederFigures(crate::figures::FeederFigures::from_bytes(body.to_vec())?)
+            }
             KIND_POSSESSION_QUERY | KIND_POSSESSION_ANSWER => Self::Retired(kind),
             _ => return Self::unknown(kind, length),
         };
@@ -880,7 +969,7 @@ impl<'a> Body<'a> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::key::Identity;
 
@@ -1369,6 +1458,120 @@ mod tests {
             assert!(!KINDS.contains(&kind));
         }
         Ok(())
+    }
+
+    /// The version 3 records, once each.
+    pub(crate) fn site_records() -> Result<Vec<Record>, WireError> {
+        use crate::batch::{Clock, Location, PublicInfoContent, ReceiverInfoContent};
+        let feeder = Identity::from_seed([21; 32]);
+        let location = Location {
+            lat_e7: 374_100_000,
+            lon_e7: -1_221_000_000,
+            alt_m: 30,
+            precision_m: 0,
+        };
+        let site = ReceiverSite::sign(
+            &feeder,
+            &crate::site::ReceiverSiteContent {
+                issued_ms: 1,
+                location,
+                clock: Clock::Dump1090,
+            },
+        )?;
+        let public = ReceiverInfo::sign_public(
+            &feeder,
+            &PublicInfoContent {
+                issued_ms: 1,
+                cell: Some(Region::public_cell(&location)?),
+                clock: Clock::Dump1090,
+                software: "tally-feed".to_owned(),
+                relays: Vec::new(),
+            },
+        )?;
+        let old = ReceiverInfo::sign(
+            &feeder,
+            &ReceiverInfoContent {
+                issued_ms: 1,
+                location: Some(location),
+                clock: Clock::Dump1090,
+                software: "tally-feed".to_owned(),
+                relays: Vec::new(),
+            },
+        )?;
+        let model = ClientClockModel::sign(
+            &feeder,
+            &crate::clock_model::ClientClockModelContent {
+                boot_id: 1,
+                sequence: 0,
+                issued_ms: 1,
+                spec_version: 6,
+                model: [1; 32],
+                inputs: [2; 32],
+                window_first: 0,
+                window_last: 1,
+            },
+        )?;
+        let regional = ClientRegionalBatch::sign(
+            &feeder,
+            &crate::products::ClientRegionalBatchContent {
+                cell: crate::directory::tests::cell()?,
+                boot_id: 1,
+                sequence: 0,
+                wall_ms: 1,
+                observations: vec![crate::products::ClientObservation {
+                    format: b'2',
+                    data: vec![0x5d; 7],
+                }],
+            },
+        )?;
+        Ok(vec![
+            Record::ReceiverSite(site),
+            Record::ReceiverInfo(public),
+            Record::ReceiverInfo(old),
+            Record::ClientClockModel(model),
+            Record::ClientRegionalBatch(regional),
+        ])
+    }
+
+    #[test]
+    fn the_site_records_round_trip_and_an_older_build_skips_the_new_kinds() -> Result<(), WireError>
+    {
+        let records = site_records()?;
+        let mut message = Vec::new();
+        for record in &records {
+            record.encode(&mut message)?;
+            let mut one = Vec::new();
+            record.encode(&mut one)?;
+            assert_eq!(record.encoded_len(), one.len());
+            assert_eq!(one[0] & CRITICAL, 0);
+            // A version 2 build, which knows the kinds to the MLAT cut, skips every new kind and
+            // reads a description of either format as a description.
+            let older = Record::decode_knowing(&one, |kind| kind <= KIND_MLAT_CUT)?;
+            match record {
+                Record::ReceiverInfo(_) => assert_eq!(older.0.as_ref(), Some(record)),
+                _ => assert_eq!(older, (None, one.len())),
+            }
+        }
+        let mut back = Vec::new();
+        assert_eq!(Record::decode_message(&message, &mut back)?, 0);
+        assert_eq!(back, records);
+        let carrying: Vec<bool> = records.iter().map(Record::carries_site).collect();
+        assert_eq!(carrying, vec![true, false, true, false, false]);
+        for record in every_record()?.iter().chain(&network_records()?) {
+            assert!(!record.carries_site(), "{record:?}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn sites_travel_only_on_version_3_relay_role_links() {
+        for role in [Role::Relay, Role::Engine] {
+            assert!(carries_sites(SITES_VERSION, role));
+            assert!(!carries_sites(SITES_VERSION - 1, role));
+        }
+        for role in [Role::Feeder, Role::Subscriber, Role::Probe, Role::Other(9)] {
+            assert!(!carries_sites(MAX_VERSION, role), "{role:?}");
+        }
     }
 
     #[test]

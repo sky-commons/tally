@@ -942,6 +942,7 @@ name = "tally-relay"
 version = "0.4.2"
 dependencies = [
  "axum",
+ "h3o",
  "libc",
  "serde",
  "serde_json",
