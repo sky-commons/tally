@@ -170,6 +170,9 @@ fn check(config: &Config) -> Result<(), String> {
             number(tally_relay::budget::headroom_for(budget.memory())),
         ),
         ("limit", number(config.memory_limit)),
+        // The open files its caps need (`Hub::descriptors`), which a start asks the kernel for:
+        // the least LimitNOFILE that serves them.
+        ("descriptors", number(hub.descriptors())),
     ];
     lines.extend(
         fixed
@@ -209,6 +212,12 @@ fn prepare(config: &Config, identity: &Identity) -> Result<(Arc<Hub>, bool), Str
         .accepting_relays(config.accept_relays.iter().copied())
         .vouching_for(config.clients.iter().copied())
         .max_connections(config.max_connections)
+        // Beast-out's clients, planned only where it is served.
+        .serving_beast(if config.beast_out.is_some() {
+            config.max_beast_clients
+        } else {
+            0
+        })
         .max_connections_per_address(config.max_connections_per_address)
         .max_feeder_bytes_per_sec(config.max_feeder_bytes_per_sec)
         .max_member_bytes_per_sec(config.max_member_bytes_per_sec)
@@ -296,17 +305,24 @@ async fn serve(config: Config) -> Result<(), String> {
             budget.mlat_threads()
         );
     }
-    // Both are loopback addresses (`config::parse_loopback`), refused at start, before the relay
-    // starts, rather than as a line in its log; each serve refuses a non-loopback listener again.
+    // Every connection its caps admit has a descriptor before it is served (`listeners`).
+    let needed = hub.descriptors();
+    let open_files = tally_relay::listeners::raise_open_files(needed)?;
+    eprintln!("tally-relay: {open_files} open files allowed; its connection caps need {needed}");
+    // Each listener runs until it starves (`listeners::Starved`), and the first that does ends the
+    // relay, saying why, for its supervisor to start it again. Beast-out and the stats take
+    // loopback addresses (`config::parse_loopback`), refused at start, before the relay starts,
+    // rather than as a line in its log; each serve refuses a non-loopback listener again, which
+    // ends the relay the same way.
+    let mut listening = tokio::task::JoinSet::new();
     if let Some(address) = config.beast_out {
         let listener = TcpListener::bind(address)
             .await
             .map_err(|error| format!("beast-out {address}: {error}"))?;
         let hub = Arc::clone(&hub);
-        tokio::spawn(async move {
-            if let Err(error) = link::serve_beast(listener, hub).await {
-                eprintln!("tally-relay: beast-out: {error}");
-            }
+        listening.spawn(async move {
+            let Err(error) = link::serve_beast(listener, hub).await;
+            error.to_string()
         });
     }
     if let Some(address) = config.stats_listen {
@@ -314,10 +330,9 @@ async fn serve(config: Config) -> Result<(), String> {
             .await
             .map_err(|error| format!("stats-listen {address}: {error}"))?;
         let hub = Arc::clone(&hub);
-        tokio::spawn(async move {
-            if let Err(error) = tally_relay::stats::serve(listener, hub).await {
-                eprintln!("tally-relay: stats: {error}");
-            }
+        listening.spawn(async move {
+            let Err(error) = tally_relay::stats::serve(listener, hub).await;
+            error.to_string()
         });
     }
     for upstream in &config.upstreams {
@@ -330,7 +345,16 @@ async fn serve(config: Config) -> Result<(), String> {
     let listener = TcpListener::bind(&config.listen)
         .await
         .map_err(|error| format!("listen {}: {error}", config.listen))?;
-    tally_relay::serve(listener, identities, hub).await
+    listening.spawn(async move {
+        tally_relay::serve(listener, identities, hub)
+            .await
+            .to_string()
+    });
+    match listening.join_next().await {
+        Some(Ok(why)) => Err(why),
+        Some(Err(error)) => Err(format!("a listener: {error}")),
+        None => Err("no listener".to_owned()),
+    }
 }
 
 /// A random boot id for the hosted MLAT's records, so relays tell this process's from the last.

@@ -26,6 +26,7 @@ pub mod figures;
 pub mod hub;
 pub mod ingest;
 pub mod link;
+pub mod listeners;
 pub mod mlat_host;
 pub mod network;
 pub mod os;
@@ -44,7 +45,6 @@ pub mod stats;
 pub mod subscription;
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use tally_wire::Identity;
 use tokio::net::TcpListener;
@@ -79,34 +79,42 @@ pub fn abort_on_any_panic() {
 /// of their role's own (`hub::Connection::general`): a connection gives its place up once it is a
 /// feeder, a subscriber or a member, each bounded by its own cap and told when that is full, so a
 /// relay full of feeders still answers a member's handshake (`link::inbound`).
-pub async fn serve(listener: TcpListener, identities: Vec<Identity>, hub: Arc<Hub>) -> ! {
+///
+/// Its accepts are a [`listeners::Acceptor`]'s (`listen` on `GET /listeners`): each connection
+/// counted while it is open, and a run of failed accepts waited out; it returns only when its
+/// listener has accepted nothing for `listeners::STARVED_AFTER`, which ends the relay.
+pub async fn serve(
+    listener: TcpListener,
+    identities: Vec<Identity>,
+    hub: Arc<Hub>,
+) -> listeners::Starved {
     if let Some(newest) = identities.first() {
         hub.network().adopt_identity(newest.clone());
     }
     network::start(Arc::clone(&hub), tokio::runtime::Handle::current());
     let identities = Arc::new(identities);
+    // A feeder's kernel buffers until its handshake names its role (`sockets`).
+    let mut acceptor = listeners::Acceptor::new(
+        listener,
+        hub.listeners().gauge("listen"),
+        Arc::clone(hub.egress()),
+        sockets::Role::Feeder,
+    );
     loop {
-        match listener.accept().await {
-            Ok((stream, peer)) => {
-                // A feeder's kernel buffers until its handshake names its role (`sockets`).
-                sockets::configure(&stream, sockets::Role::Feeder);
-                let Some(connection) = hub.connection(peer.ip()) else {
-                    drop(stream);
-                    continue;
-                };
-                let stream = hub.egress().socket(stream, Some(peer.ip()));
-                let identities = Arc::clone(&identities);
-                let hub = Arc::clone(&hub);
-                tokio::spawn(async move {
-                    if let Err(error) = link::inbound(stream, &identities, hub, connection).await {
-                        eprintln!("tally-relay: {peer}: {error}");
-                    }
-                });
+        let (stream, peer) = match acceptor.next().await {
+            Ok(accepted) => accepted,
+            Err(starved) => return starved,
+        };
+        let Some(connection) = hub.connection(peer.ip()) else {
+            acceptor.refuse(stream);
+            continue;
+        };
+        let identities = Arc::clone(&identities);
+        let hub = Arc::clone(&hub);
+        tokio::spawn(async move {
+            if let Err(error) = link::inbound(stream, &identities, hub, connection).await {
+                eprintln!("tally-relay: {peer}: {error}");
             }
-            Err(error) => {
-                eprintln!("tally-relay: accept: {error}");
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-        }
+        });
     }
 }

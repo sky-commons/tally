@@ -45,7 +45,13 @@ RestartSec=5
 DynamicUser=yes
 ConfigurationDirectory=tally
 UMask=0077
-# One descriptor per feeder and subscriber.
+# One descriptor per connection its caps admit: those under --max-connections (2048), the member
+# sessions its areas bring (up to as many), the subscribers (64) and beast-out clients (8), every
+# feeder the budget admits, the stats' 16 and 256 for the process itself (`Hub::descriptors`).
+# `tally-relay check` prints the sum as `descriptors`: 2,931 in this unit's 6G as packaged, 4,594
+# with a base cell taken and beast-out on, about 25,000 at 64G. The relay raises its own soft limit
+# to that at start and refuses to start when this hard limit is below it, so 65536 runs a relay
+# of well over 100G (//crates/relay:check holds this unit to its plan).
 LimitNOFILE=65536
 # A relay under memory pressure is throttled past MemoryHigh and, past MemoryMax, killed by the
 # kernel's OOM killer inside its own cgroup and restarted (Restart=always), rather than taking the
