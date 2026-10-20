@@ -88,11 +88,25 @@ rust_test(
     ],
 )
 
+# `tally-api check` refuses what a start refuses and prints the settings, run against the built
+# binary. A deploy checks its own arguments the same way, by asking the API it runs.
+rust_test(
+    name = "check",
+    size = "small",
+    srcs = ["tests/check.rs"],
+    data = [":tally-api"],
+    edition = "2024",
+    env = {"TALLY_API_BIN": "$(rootpath :tally-api)"},
+    lint_config = ":cargo_lints",
+    deps = ["//crates/wire"],
+)
+
 rustfmt_test(
     name = "rustfmt",
     targets = [
         ":api",
         ":api_test",
+        ":check",
         ":end_to_end",
         ":tally-api",
     ],
