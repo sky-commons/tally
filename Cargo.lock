@@ -843,7 +843,7 @@ checksum = "0bf256ce5efdfa370213c1dabab5935a12e49f2c58d15e9eac2870d3b4f27263"
 
 [[package]]
 name = "tally-api"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "axum",
  "futures-util",
@@ -865,7 +865,7 @@ dependencies = [
 
 [[package]]
 name = "tally-api-types"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -873,7 +873,7 @@ dependencies = [
 
 [[package]]
 name = "tally-feed"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "getrandom 0.2.17",
  "libc",
@@ -883,7 +883,7 @@ dependencies = [
 
 [[package]]
 name = "tally-load"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "libc",
  "serde_json",
@@ -896,7 +896,7 @@ dependencies = [
 
 [[package]]
 name = "tally-merge"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "blake2",
  "libm",
@@ -909,7 +909,7 @@ dependencies = [
 
 [[package]]
 name = "tally-mlat"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "h3o",
  "libm",
@@ -919,7 +919,7 @@ dependencies = [
 
 [[package]]
 name = "tally-mlat-calibrate"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "blake2",
  "tally-mlat",
@@ -929,7 +929,7 @@ dependencies = [
 
 [[package]]
 name = "tally-mlat-solver"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "blake2",
  "libm",
@@ -939,7 +939,7 @@ dependencies = [
 
 [[package]]
 name = "tally-relay"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "axum",
  "h3o",
@@ -955,7 +955,7 @@ dependencies = [
 
 [[package]]
 name = "tally-wire"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "base64",
  "blake2",
