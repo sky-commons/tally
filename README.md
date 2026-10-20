@@ -138,6 +138,11 @@ relay plans memory for every member session its areas let other relays open, whi
 Connections in and out are capped overall (`--max-connections`), and those dialling in per
 address (`--max-connections-per-address`). `tally-relay --help` lists the rest.
 
+`tally-relay check ARGS...` refuses what a start with the same arguments would refuse, without
+starting (it reads no key file and opens no socket), and prints the relay's memory plan, one
+`name value` a line; a deploy's tests run it over the arguments it passes, so an argument the
+binary no longer takes fails there rather than at the next start.
+
 ## What a relay costs
 
 Taking data in costs a relay only its server. What it sends out is billed by most hosts, and a
@@ -259,6 +264,12 @@ Each client is rate limited (`--rate`, `--burst`), and CORS allows `--allow-orig
 answering a preflight for `GET` and `POST` with the `accept`, `content-type` and `traceparent`
 request headers and exposing `Retry-After`; a map whose routes come from this API names its origin
 here. `tally-api --help` lists the rest.
+
+`tally-api check ARGS...` is the same for the API: it reads and checks the arguments as a start
+does (every argument known, `--listen` an IP and port, the upstreams `http://` URLs, header names
+valid, the `--key` file well formed when it can read it, the `--routes` directory readable), opens
+no socket and reads nothing from the network, then prints the settings, one `name value` a line,
+and exits 0; otherwise it exits 1 with the message a start would print.
 
 Behind Cloudflare (or any proxy), every request arrives from the proxy's address, so the rate limit
 would hold every visitor to one bucket. `--client-ip-header CF-Connecting-IP` reads each client's

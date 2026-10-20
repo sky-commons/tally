@@ -220,8 +220,9 @@ impl App {
     }
 }
 
-/// Serves the API on `listener`, and keeps its snapshot fresh, for as long as it runs.
-pub async fn serve(listener: TcpListener, settings: Settings) -> ! {
+/// Serves the API on `listener`, and keeps its snapshot fresh, for as long as it runs: MLAT read
+/// from the relays as `identity` (`config::Prepared`).
+pub async fn serve(listener: TcpListener, settings: Settings, identity: tally_wire::Identity) -> ! {
     let app = Arc::new(App::new(settings));
     tokio::spawn(Arc::clone(&app).refresh());
     if let Some(dir) = &app.settings.routes {
@@ -229,6 +230,7 @@ pub async fn serve(listener: TcpListener, settings: Settings) -> ! {
     }
     if let Err(error) = mlat::start(
         &app.settings.mlat,
+        identity,
         Arc::clone(&app.mlat),
         Arc::clone(&app.feeders),
     ) {
