@@ -814,7 +814,8 @@ impl Plan {
     }
 
     /// The same plan holding `general` sessions under the connection cap (`--max-connections`) and
-    /// `subscribers` subscribers (`--max-subscribers`) beside its member sessions: each with its
+    /// `subscribers` subscribers (`--max-subscribers`, and the beast-out clients, each planned as
+    /// one: `Hub::serving_beast`) beside its member sessions: each with its
     /// Noise buffers (`Plan::connections`), and their records in the cores (`cores::Sessions`). One
     /// count for both, so the sessions whose buffers are planned are the sessions whose records
     /// are. Set after `with_members`, whose sessions it counts. Each role holds its own cap: before,

@@ -21,9 +21,18 @@
 //! - `GET /products`: what the regional and world products have done and let go
 //!   (`products::ProductsReport`), every drop by why.
 //!
-//! What it writes is counted like every other socket's (`egress::Listener`).
+//! - `GET /listeners`: every port the relay listens on (`listeners::ListenerReport`): its
+//!   connections open now, those accepted and refused, and its accepts that failed, skipped and
+//!   in runs, and whether one is under way.
+//!
+//! What it writes is counted like every other socket's, and its connections like every other
+//! listener's (`listeners::Acceptor`): at most [`MAX_CONNECTIONS`] at once, each closed once it
+//! has moved nothing for [`IDLE`].
 
+use std::convert::Infallible;
+use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::Router;
 use axum::extract::{Path, State};
@@ -31,9 +40,19 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use tally_wire::PublicKey;
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::oneshot;
 
+use crate::egress::Socket;
 use crate::hub::Hub;
+use crate::listeners::{Acceptor, Idle, Starved};
+
+/// The most stats connections open at once; one past it is closed as it is accepted. Its readers
+/// are a process or two on the same host, each asking a request at a time.
+pub const MAX_CONNECTIONS: usize = 16;
+
+/// How long a stats connection may move nothing either way before it is closed.
+pub const IDLE: Duration = Duration::from_secs(60);
 
 pub fn router(hub: Arc<Hub>) -> Router {
     Router::new()
@@ -43,15 +62,67 @@ pub fn router(hub: Arc<Hub>) -> Router {
         .route("/mlat", get(mlat))
         .route("/products", get(products))
         .route("/memory", get(memory))
+        .route("/listeners", get(listeners))
         .with_state(hub)
 }
 
 /// Serves `router` on `listener` for as long as the relay runs. A listener not bound to a loopback
-/// address is refused before anything is served.
-pub async fn serve(listener: TcpListener, hub: Arc<Hub>) -> std::io::Result<()> {
+/// address is refused before anything is served; otherwise it returns only when its listener has
+/// starved (`listeners::Starved`), which ends the relay.
+pub async fn serve(listener: TcpListener, hub: Arc<Hub>) -> std::io::Result<Infallible> {
     crate::sockets::loopback_only(&listener, "--stats-listen")?;
-    let listener = crate::egress::Listener::new(listener, Arc::clone(hub.egress()));
-    axum::serve(listener, router(hub)).await
+    let acceptor = Acceptor::new(
+        listener,
+        hub.listeners().gauge("stats"),
+        Arc::clone(hub.egress()),
+        crate::sockets::Role::Feeder,
+    )
+    .capped(MAX_CONNECTIONS);
+    let (starving, starved) = oneshot::channel();
+    let listener = Http {
+        acceptor,
+        starving: Some(starving),
+    };
+    tokio::select! {
+        served = axum::serve(listener, router(hub)) => Err(match served {
+            Ok(()) => std::io::Error::other("stats: stopped serving"),
+            Err(error) => std::io::Error::other(format!("stats: {error}")),
+        }),
+        Ok(starved) = starved => Err(std::io::Error::other(starved.to_string())),
+    }
+}
+
+/// The stats' listener as axum takes one: each connection an [`Acceptor`]'s, held to [`IDLE`].
+/// A starved listener is handed to `serve` (`starving`), which ends with it.
+struct Http {
+    acceptor: Acceptor<TcpListener>,
+    starving: Option<oneshot::Sender<Starved>>,
+}
+
+impl axum::serve::Listener for Http {
+    type Io = Idle<Socket<TcpStream>>;
+    type Addr = SocketAddr;
+
+    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+        match self.acceptor.next().await {
+            Ok((socket, peer)) => (Idle::new(socket, IDLE), peer),
+            Err(starved) => {
+                if let Some(starving) = self.starving.take() {
+                    let _ = starving.send(starved);
+                }
+                std::future::pending().await
+            }
+        }
+    }
+
+    fn local_addr(&self) -> std::io::Result<Self::Addr> {
+        self.acceptor.local_addr()
+    }
+}
+
+/// `GET /listeners`: every listener's connections and accepts (`listeners::Listeners`).
+async fn listeners(State(hub): State<Arc<Hub>>) -> Response {
+    axum::Json(hub.listeners().report()).into_response()
 }
 
 async fn egress(State(hub): State<Arc<Hub>>) -> Response {

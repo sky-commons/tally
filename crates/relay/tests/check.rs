@@ -177,6 +177,16 @@ fn assert_plan_holds(checked: &Checked) -> Result {
         non_feeder > 0 && buffers % non_feeder == 0 && buffers / non_feeder > 0,
         "{plan:?}"
     );
+    // Its open files: every connection planned and every feeder admitted, the stats' and what
+    // the process holds beside them (`Hub::descriptors`).
+    assert_eq!(
+        checked.get("descriptors")?,
+        non_feeder
+            + connections
+            + tally_relay::stats::MAX_CONNECTIONS
+            + tally_relay::listeners::OTHER_DESCRIPTORS,
+        "{plan:?}"
+    );
     // A member session holds nothing of its own beside the members' rate: its records wait in the
     // one ingest pool.
     assert_eq!(pool, rate_pool);
@@ -821,17 +831,55 @@ fn the_packaged_unit_starts_a_relay_that_admits_feeders() -> Result {
     let (limit, cores) = (limit.to_string(), cores.unwrap_or(1).to_string());
     let mut line = vec!["--memory-limit", limit.as_str(), "--cores", cores.as_str()];
     line.extend(args.iter().map(String::as_str));
-    // As packaged, and with a base cell taken (an operator's `--area` in its arguments): every
-    // member session that area brings fits beside the feeders.
-    for area in [None, Some("8001fffffffffff")] {
+    // The open files it gives the relay: what every connection its caps admit needs, or the
+    // relay refuses to start (`listeners::raise_open_files`).
+    let open_files = unit_settings(&text)
+        .into_iter()
+        .rev()
+        .find(|(key, _)| key == "LimitNOFILE")
+        .ok_or_else(|| format!("{}: no LimitNOFILE", path.display()))?
+        .1;
+    let open_files: usize = open_files
+        .parse()
+        .map_err(|_| format!("LimitNOFILE={open_files}: not a number"))?;
+    // As packaged, and with a base cell taken (an operator's `--area` in its arguments) and a
+    // local decoder's beast-out beside it: every member session that area brings fits beside the
+    // feeders, and every connection has a descriptor.
+    let taking = ["--area", "8001fffffffffff"];
+    let decoding = [
+        "--area",
+        "8001fffffffffff",
+        "--beast-out",
+        "127.0.0.1:30105",
+    ];
+    for extra in [&[][..], &taking[..], &decoding[..]] {
         let mut line = line.clone();
-        line.extend(area.iter().flat_map(|area| ["--area", area]));
+        line.extend(extra);
+        let area = extra.contains(&"--area").then_some("8001fffffffffff");
         let checked = check(&line)?;
         assert!(checked.accepted, "{}: {}", path.display(), checked.refusal);
         assert_plan_holds(&checked)?;
         assert_eq!(checked.get("members")? > 0, area.is_some());
+        // Beast-out's clients are planned as subscribers, where it is served (8 by default).
+        assert_eq!(
+            checked.get("subscriber-sessions")?,
+            if extra.contains(&"--beast-out") {
+                64 + 8
+            } else {
+                64
+            },
+            "{:?}",
+            checked.plan
+        );
+        let needed = checked.get("descriptors")?;
+        assert!(
+            needed <= open_files,
+            "{}: LimitNOFILE={open_files} is below the {needed} open files its caps need",
+            path.display()
+        );
         println!(
-            "{}{}: a limit of {limit}, a budget admitting {} feeders beside {} member sessions",
+            "{}{}: a limit of {limit}, a budget admitting {} feeders beside {} member sessions, \
+             {needed} open files",
             path.display(),
             area.map(|area| format!(" taking {area}"))
                 .unwrap_or_default(),
