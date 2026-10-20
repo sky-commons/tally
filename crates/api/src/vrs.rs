@@ -584,7 +584,7 @@ fn csv_files(dir: &FilePath) -> Result<Vec<PathBuf>, String> {
 /// What says the directory's files changed: each file's path, length and modification time.
 pub type Fingerprint = Vec<(PathBuf, u64, Option<SystemTime>)>;
 
-fn fingerprint(dir: &FilePath) -> Result<Fingerprint, String> {
+pub fn fingerprint(dir: &FilePath) -> Result<Fingerprint, String> {
     let mut files = csv_files(&dir.join("routes"))?;
     files.extend(csv_files(&dir.join("airports"))?);
     Ok(files

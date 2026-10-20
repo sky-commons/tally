@@ -236,7 +236,8 @@ async fn feed(
 async fn start_api(settings: Settings) -> Result<String> {
     let listener = TcpListener::bind("127.0.0.1:0").await.map_err(text)?;
     let address = listener.local_addr().map_err(text)?;
-    tokio::spawn(tally_api::serve(listener, settings));
+    let identity = Identity::generate().map_err(text)?;
+    tokio::spawn(tally_api::serve(listener, settings, identity));
     Ok(format!("http://{address}"))
 }
 
