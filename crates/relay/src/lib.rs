@@ -118,3 +118,79 @@ pub async fn serve(
         });
     }
 }
+
+/// The guard every unit-test target of this crate runs beside its own module's tests.
+#[cfg(test)]
+mod targets {
+    use std::collections::BTreeSet;
+
+    /// The module filters of the build's unit-test targets (`crates/relay/BUILD.bazel`,
+    /// `_UNIT_TEST_MODULES`, each `<module>::`), which the build hands the test binary when it
+    /// compiles it. None under Cargo, which runs every test of the binary at once and so selects
+    /// none by filter.
+    const FILTERS: Option<&str> = option_env!("RELAY_TEST_FILTERS");
+
+    /// This guard's name, the filter every target passes beside its own so that it runs too.
+    const GUARD: &str = "every_test_has_one_target";
+
+    /// A target selects its tests by filter, a substring of each test's path, and libtest runs no
+    /// test at all, green, for a filter nothing matches. So every target runs this beside its own:
+    /// every test this binary has, as libtest lists them (the binary asked for its own list), is
+    /// matched by exactly one target's filter, the way libtest matches it, and every filter matches
+    /// a test. A module added without its target, a filter that also matches another module's tests
+    /// (`os::` would match a `pos::`), or a target whose module has gone, fails every target.
+    #[test]
+    fn every_test_has_one_target() -> Result<(), String> {
+        let Some(filters) = FILTERS else {
+            // Under Cargo every test here runs in this one binary: there is no target to miss one.
+            return Ok(());
+        };
+        let filters: BTreeSet<&str> = filters.split_whitespace().collect();
+        let exe = std::env::current_exe().map_err(|error| error.to_string())?;
+        let listed = std::process::Command::new(&exe)
+            .args(["--list", "--format", "terse"])
+            .output()
+            .map_err(|error| error.to_string())?;
+        if !listed.status.success() {
+            return Err(format!("{} --list: {}", exe.display(), listed.status));
+        }
+        let listed = String::from_utf8(listed.stdout).map_err(|error| error.to_string())?;
+        let tests: Vec<&str> = listed
+            .lines()
+            .filter_map(|line| line.strip_suffix(": test"))
+            .collect();
+        let mut wrong = Vec::new();
+        for test in &tests {
+            let matched: Vec<&str> = filters
+                .iter()
+                .copied()
+                .filter(|filter| test.contains(filter))
+                .collect();
+            let guard = *test == format!("targets::{GUARD}");
+            // The guard runs in every target, so it is no target's, and no other test may share
+            // its filter.
+            let want = if guard { 0 } else { 1 };
+            if matched.len() != want || (!guard && test.contains(GUARD)) {
+                wrong.push(format!("{test}: matched by {matched:?}"));
+            }
+        }
+        for filter in &filters {
+            if !tests.iter().any(|test| test.contains(filter)) {
+                wrong.push(format!("{filter}: matches no test"));
+            }
+        }
+        if !wrong.is_empty() {
+            return Err(format!(
+                "every test here is one target's (crates/relay/BUILD.bazel, _UNIT_TEST_MODULES):\n{}",
+                wrong.join("\n")
+            ));
+        }
+        // And the filters this run was asked for are a target's.
+        for arg in std::env::args().skip(1) {
+            if !arg.starts_with('-') && arg != GUARD && !filters.contains(arg.as_str()) {
+                return Err(format!("asked for {arg}, which no target names"));
+            }
+        }
+        Ok(())
+    }
+}

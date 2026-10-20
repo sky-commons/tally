@@ -7,6 +7,8 @@ debug build cannot keep up with the clock it is tested against (`crates/relay/BU
 line's mode.
 """
 
+load("//build:run_test.bzl", "run_test_impl")
+
 def _opt_impl(_settings, _attr):
     return {"//command_line_option:compilation_mode": "opt"}
 
@@ -16,19 +18,8 @@ _opt = transition(
     outputs = ["//command_line_option:compilation_mode"],
 )
 
-def _opt_test_impl(ctx):
-    test = ctx.attr.test[0][DefaultInfo]
-    executable = ctx.actions.declare_file(ctx.label.name)
-    ctx.actions.symlink(
-        output = executable,
-        target_file = test.files_to_run.executable,
-        is_executable = True,
-    )
-    runfiles = ctx.runfiles(files = [executable]).merge(test.default_runfiles)
-    return [DefaultInfo(executable = executable, runfiles = runfiles)]
-
 opt_test = rule(
-    implementation = _opt_test_impl,
+    implementation = run_test_impl,
     doc = "`test`, built optimised (compilation_mode=opt), run as this test.",
     test = True,
     attrs = {
