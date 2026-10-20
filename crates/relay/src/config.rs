@@ -14,6 +14,10 @@ use crate::hub::{
 /// Subscribers served before new ones are turned away, unless `--max-subscribers` says.
 const DEFAULT_MAX_SUBSCRIBERS: usize = 64;
 
+/// Beast-out clients served at once before a new one is closed, unless `--max-beast-clients`
+/// says: a local decoder or two, with room for one reconnecting while its last is let go.
+const DEFAULT_MAX_BEAST_CLIENTS: usize = 8;
+
 const USAGE: &str = "\
 usage: tally-relay --key FILE [--key FILE]... --max-upload RATE [options]
        tally-relay keygen          print a new key file to stdout and its public key to stderr
@@ -61,6 +65,8 @@ usage: tally-relay --key FILE [--key FILE]... --max-upload RATE [options]
                          each frame's message alone (no receiver's counter or signal level).
                          It is unauthenticated, so it takes a loopback address only
                          (127.0.0.1:PORT or [::1]:PORT) and the relay refuses any other
+  --max-beast-clients N  beast-out clients served at once; beyond it a new one is closed as it
+                         connects (default 8). Each is planned as a subscriber
   --stats-listen ADDR    serve each receiver's traffic as JSON here (GET /stations,
                          GET /stations/KEY), and the cap and what it carries (GET /egress),
                          for tally-api. It is unauthenticated and names where each feeder
@@ -174,6 +180,8 @@ pub struct Config {
     /// The clients this relay vouches for (`--client`).
     pub clients: Vec<PublicKey>,
     pub max_subscribers: usize,
+    /// Beast-out clients served at once (`--max-beast-clients`), where `--beast-out` is given.
+    pub max_beast_clients: usize,
     pub max_connections: usize,
     pub max_connections_per_address: usize,
     pub max_feeder_bytes_per_sec: u64,
@@ -310,6 +318,7 @@ impl Config {
             accept_relays: Vec::new(),
             clients: Vec::new(),
             max_subscribers: DEFAULT_MAX_SUBSCRIBERS,
+            max_beast_clients: DEFAULT_MAX_BEAST_CLIENTS,
             max_connections: DEFAULT_MAX_CONNECTIONS,
             max_connections_per_address: DEFAULT_MAX_CONNECTIONS_PER_ADDRESS,
             max_feeder_bytes_per_sec: DEFAULT_MAX_FEEDER_BYTES_PER_SEC,
@@ -380,6 +389,11 @@ impl Config {
                     config.max_subscribers = value()?
                         .parse()
                         .map_err(|_| "--max-subscribers needs a number".to_owned())?;
+                }
+                "--max-beast-clients" => {
+                    config.max_beast_clients = value()?
+                        .parse()
+                        .map_err(|_| "--max-beast-clients needs a number".to_owned())?;
                 }
                 "--area" => config.areas.push(parse_area(&value()?)?),
                 "--network" => {
@@ -612,6 +626,7 @@ mod tests {
         for stated in [
             floor,
             format!("(default {DEFAULT_MAX_SUBSCRIBERS})"),
+            format!("(default {DEFAULT_MAX_BEAST_CLIENTS})"),
             format!("(default {DEFAULT_MAX_CONNECTIONS})"),
             format!(
                 "buffers and waiting replies ({} KiB)",

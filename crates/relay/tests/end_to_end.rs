@@ -288,7 +288,7 @@ async fn a_receivers_frames_reach_both_outputs_signed_and_unchanged() -> Result 
     let sent = frames(500)?;
     let (publishing, ready) = tokio::sync::watch::channel(false);
     let source = readsb(sent.clone(), ready).await?;
-    let relay = relay(Hub::new(8, Deadlines::RELAY)).await?;
+    let relay = relay(Hub::new(8, Deadlines::RELAY).serving_beast(1)).await?;
     let location = Location {
         lat_e7: 374_100_000,
         lon_e7: -1_221_000_000,
