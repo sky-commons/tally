@@ -68,7 +68,7 @@
 #                                    for good
 set -euo pipefail
 
-VERSION="v0.4.2"
+VERSION="v0.5.0"
 # Where this release is published, whose `tally-feed` binaries, unit and seed list this script
 # installs. The source names no publisher: the publisher writes its release's address here when it
 # publishes it, and TALLY_RELEASE overrides it.
