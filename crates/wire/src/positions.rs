@@ -37,6 +37,26 @@
 //! addressed citation is all zero: a provisional names no assignment (the engine solved it under
 //! the newest model holding its receivers), and a reader refuses one that names any.
 //!
+//! Formats 5 and 6 (wire version 3) are what a client receives: formats 3 and 4 with every
+//! reception named by its `ReceptionTag` (`crate::site`) instead of (receiver, epoch, counter), so
+//! no client learns a receiver's counters, from which with the aircraft's own positions its site
+//! follows by reverse MLAT. There is no receiver table:
+//!
+//! ```text
+//! format u8 = 5 (final) or 6 (provisional) | engine key [32] | boot_id u64 | sequence u64
+//! | issued_ms u64 | spec_version u16
+//! | clock count u16 | count x clock model id [32]         strictly ascending, every one used
+//! | solution count u16 | count x solution
+//! | signature [64]
+//!
+//! solution = format 3's, to the addressed count, then
+//!          | tag count u8 (>= 1) | count x tag [16]      strictly ascending
+//! ```
+//!
+//! Format 6 is to 5 as 4 is to 3: provisional, under its own record kind, with no addressed
+//! citation. A relay rematches a tagged solution against its own raw by computing the tags of
+//! what it holds.
+//!
 //! Every integer is big-endian and every f32 is IEEE 754 big-endian. A solution's observations
 //! are in the canonical order of `ObservationSet`, by (receiver key, epoch, counter); since the
 //! receiver table is ascending by key, that is ascending by (receiver index, epoch, counter) on the
@@ -51,8 +71,9 @@ use crate::WireError;
 use crate::batch::{Hash, domain, split_signature, u64_at};
 use crate::fault_proof::FAULT_PROOF_OVERHEAD;
 use crate::key::{Identity, KEY_LEN, PublicKey, SIGNATURE_LEN};
-use crate::observation_set::{ObservationSet, Reception};
+use crate::observation_set::{ObservationSet, Reception, TaggedSet};
 use crate::record::{Body, MAX_BODY};
+use crate::site::{ReceptionTag, TAG_LEN};
 
 /// The native engine's format: solutions naming their observation set, tile clock model, the
 /// aircraft's addressed receptions and the spec.
@@ -60,6 +81,10 @@ pub const POSITIONS_FORMAT_3: u8 = 3;
 /// The native engine's provisional format: format 3's layout, solved under a carried model, with
 /// no addressed citation.
 pub const POSITIONS_FORMAT_PROVISIONAL: u8 = 4;
+/// Format 3 with each reception a tag: what a client receives (module docs).
+pub const POSITIONS_FORMAT_TAGGED: u8 = 5;
+/// Format 4 with each reception a tag.
+pub const POSITIONS_FORMAT_TAGGED_PROVISIONAL: u8 = 6;
 const POSITIONS_DOMAIN: &[u8] = b"tally positions";
 /// Format, engine key, boot id, sequence: fixed across every format version.
 const PREFIX_LEN: usize = 1 + KEY_LEN + 8 + 8;
@@ -152,10 +177,40 @@ impl EnuCovariance {
     }
 }
 
-/// One solution, format 3: where one transmission was sent from, and exactly what it was solved
-/// from.
+/// What a solution names as the observations it used: the raw set (formats 3 and 4, relay-only)
+/// or the tagged set a client sees (formats 5 and 6).
+pub trait Observed: Clone + std::fmt::Debug + PartialEq {
+    /// The transmission's bytes.
+    fn message(&self) -> &[u8];
+    /// The set's own hash (`ObservationSet::hash`, `TaggedSet::hash`).
+    fn set_hash(&self) -> Hash;
+}
+
+impl Observed for ObservationSet {
+    fn message(&self) -> &[u8] {
+        ObservationSet::message(self)
+    }
+
+    fn set_hash(&self) -> Hash {
+        self.hash()
+    }
+}
+
+impl Observed for TaggedSet {
+    fn message(&self) -> &[u8] {
+        TaggedSet::message(self)
+    }
+
+    fn set_hash(&self) -> Hash {
+        self.hash()
+    }
+}
+
+/// One solution: where one transmission was sent from, and exactly what it was solved from. Of
+/// format 3 or 4 with its raw `ObservationSet`; of format 5 or 6 (`TaggedSolution`) with its
+/// `TaggedSet`.
 #[derive(Clone, Debug, PartialEq)]
-pub struct Solution {
+pub struct Solution<O = ObservationSet> {
     /// The aircraft's 24-bit ICAO address.
     pub address: u32,
     pub transmitted: TransmitTime,
@@ -170,10 +225,35 @@ pub struct Solution {
     /// cites them: a verifier holding the same raw recomputes the tile from them.
     pub addressed: AddressedCitation,
     /// The transmission's message and the receptions of it the solution used.
-    pub observations: ObservationSet,
+    pub observations: O,
 }
 
+/// A solution as a client receives it (formats 5 and 6).
+pub type TaggedSolution = Solution<TaggedSet>;
+/// A tagged record's content.
+pub type TaggedSolutionsContent = SolutionsContent<TaggedSet>;
+
 impl Solution {
+    /// The solution as a client sees it: its raw set tagged (`ObservationSet::tagged`).
+    pub fn tagged(
+        &self,
+        key_of: impl Fn(&PublicKey) -> Option<crate::site::ReceptionKey>,
+    ) -> Result<TaggedSolution, WireError> {
+        Ok(Solution {
+            address: self.address,
+            transmitted: self.transmitted,
+            lat_e7: self.lat_e7,
+            lon_e7: self.lon_e7,
+            alt_hae_mm: self.alt_hae_mm,
+            covariance: self.covariance,
+            clock_model: self.clock_model,
+            addressed: self.addressed,
+            observations: self.observations.tagged(key_of)?,
+        })
+    }
+}
+
+impl<O> Solution<O> {
     /// What signing and reading a solution both hold it to: a valid transmit time, a position on
     /// the globe, a finite covariance with no negative variance, and no altitude spelled as the
     /// "none" marker.
@@ -198,9 +278,9 @@ pub struct AddressedCitation {
     pub count: u32,
 }
 
-/// What a format 3 record says.
+/// What a format 3 (or, with `TaggedSet`, a format 5) record says.
 #[derive(Clone, Debug, PartialEq)]
-pub struct SolutionsContent {
+pub struct SolutionsContent<O = ObservationSet> {
     /// Random per engine process start. With `sequence`, names this record uniquely for its
     /// engine, so a restarted engine starts a new stream instead of being refused as a replay.
     pub boot_id: u64,
@@ -209,7 +289,7 @@ pub struct SolutionsContent {
     pub issued_ms: u64,
     /// The version of the solver specification every solution here was computed under.
     pub spec_version: u16,
-    pub solutions: Vec<Solution>,
+    pub solutions: Vec<Solution<O>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -243,7 +323,7 @@ impl Positions {
     ) -> Result<Self, WireError> {
         for solution in &content.solutions {
             solution.check()?;
-            provisional_citation(format, &solution.addressed)?;
+            provisional_citation(format == POSITIONS_FORMAT_PROVISIONAL, &solution.addressed)?;
         }
         let receivers: Vec<PublicKey> = content
             .solutions
@@ -354,7 +434,18 @@ impl Positions {
     /// Whether the record is provisional: superseded by the final positions that follow it, and
     /// carried under a record kind of its own.
     pub fn is_provisional(&self) -> bool {
-        self.format() == POSITIONS_FORMAT_PROVISIONAL
+        matches!(
+            self.format(),
+            POSITIONS_FORMAT_PROVISIONAL | POSITIONS_FORMAT_TAGGED_PROVISIONAL
+        )
+    }
+
+    /// Whether its receptions are tags (formats 5 and 6): the only positions a client is sent.
+    pub fn is_tagged(&self) -> bool {
+        matches!(
+            self.format(),
+            POSITIONS_FORMAT_TAGGED | POSITIONS_FORMAT_TAGGED_PROVISIONAL
+        )
     }
 
     pub fn engine(&self) -> Result<PublicKey, WireError> {
@@ -388,6 +479,7 @@ impl Positions {
         if self.format() != POSITIONS_FORMAT_PROVISIONAL {
             self.expect_format(POSITIONS_FORMAT_3)?;
         }
+        let provisional = self.is_provisional();
         let (signed, _) = split_signature(&self.bytes)?;
         let mut reader = Body::new(&signed[1 + KEY_LEN..]);
         let boot_id = reader.u64()?;
@@ -423,7 +515,7 @@ impl Positions {
                 hash: reader.array::<32>()?,
                 count: reader.u32()?,
             };
-            provisional_citation(self.format(), &addressed)?;
+            provisional_citation(provisional, &addressed)?;
             let observed = usize::from(reader.u8()?);
             let mut wire_order = Vec::with_capacity(observed);
             let mut receptions = Vec::with_capacity(observed);
@@ -469,6 +561,163 @@ impl Positions {
         })
     }
 
+    /// Signs a format 5 record: what a client is sent in place of format 3. Refused as
+    /// `sign_solutions` refuses.
+    pub fn sign_tagged(
+        identity: &Identity,
+        content: &TaggedSolutionsContent,
+    ) -> Result<Self, WireError> {
+        Self::sign_tagged_format(identity, content, POSITIONS_FORMAT_TAGGED)
+    }
+
+    /// Signs a format 6 record: provisional, tagged; refused when a solution names an addressed
+    /// citation.
+    pub fn sign_tagged_provisional(
+        identity: &Identity,
+        content: &TaggedSolutionsContent,
+    ) -> Result<Self, WireError> {
+        Self::sign_tagged_format(identity, content, POSITIONS_FORMAT_TAGGED_PROVISIONAL)
+    }
+
+    fn sign_tagged_format(
+        identity: &Identity,
+        content: &TaggedSolutionsContent,
+        format: u8,
+    ) -> Result<Self, WireError> {
+        for solution in &content.solutions {
+            solution.check()?;
+            provisional_citation(
+                format == POSITIONS_FORMAT_TAGGED_PROVISIONAL,
+                &solution.addressed,
+            )?;
+        }
+        let clocks: Vec<Hash> = content
+            .solutions
+            .iter()
+            .map(|solution| solution.clock_model)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let mut bytes = prefix(format, identity, content.boot_id, content.sequence);
+        bytes.extend_from_slice(&content.issued_ms.to_be_bytes());
+        bytes.extend_from_slice(&content.spec_version.to_be_bytes());
+        bytes.extend_from_slice(&count_u16(clocks.len())?.to_be_bytes());
+        for clock in &clocks {
+            bytes.extend_from_slice(clock);
+        }
+        bytes.extend_from_slice(&count_u16(content.solutions.len())?.to_be_bytes());
+        for solution in &content.solutions {
+            put_tagged(
+                &mut bytes,
+                solution,
+                index_of(&clocks, &solution.clock_model)?,
+            );
+        }
+        if bytes.len() + SIGNATURE_LEN > MAX_POSITIONS_LEN {
+            return Err(WireError::Oversize(bytes.len() + SIGNATURE_LEN));
+        }
+        Ok(Self::signed(identity, bytes))
+    }
+
+    /// As `fitting`, for a tagged record: the longest prefix of `solutions` one format 5 or 6
+    /// record holds.
+    pub fn fitting_tagged(solutions: &[TaggedSolution]) -> usize {
+        // Format to sequence, issued, specification version, and the two tables' counts.
+        let mut len = PREFIX_LEN + 8 + 2 + 2 + 2 + SIGNATURE_LEN;
+        let mut clocks: BTreeSet<Hash> = BTreeSet::new();
+        let mut scratch = Vec::new();
+        for (at, solution) in solutions.iter().enumerate() {
+            scratch.clear();
+            put_tagged(&mut scratch, solution, 0);
+            len += scratch.len();
+            if clocks.insert(solution.clock_model) {
+                len += solution.clock_model.len();
+            }
+            if len > MAX_POSITIONS_LEN
+                || clocks.len() > usize::from(u16::MAX)
+                || at >= usize::from(u16::MAX)
+            {
+                return at;
+            }
+        }
+        solutions.len()
+    }
+
+    /// The content of a format 5 or 6 record, refusing one not in its canonical form (the clock
+    /// table ascending, without repeats and all used; tags ascending; no addressed citation in a
+    /// provisional), so a solution read back re-signs to the same bytes.
+    pub fn tagged_solutions(&self) -> Result<TaggedSolutionsContent, WireError> {
+        if !self.is_tagged() {
+            return Err(WireError::Invalid {
+                field: "positions format",
+                value: u64::from(self.format()),
+            });
+        }
+        let provisional = self.is_provisional();
+        let (signed, _) = split_signature(&self.bytes)?;
+        let mut reader = Body::new(&signed[1 + KEY_LEN..]);
+        let boot_id = reader.u64()?;
+        let sequence = reader.u64()?;
+        let issued_ms = reader.u64()?;
+        let spec_version = reader.u16()?;
+        let clocks = (0..reader.u16()?)
+            .map(|_| reader.array::<32>())
+            .collect::<Result<Vec<Hash>, _>>()?;
+        ascending(&clocks, "clock model table order")?;
+        let mut clocks_used = vec![false; clocks.len()];
+        let count = reader.u16()?;
+        let mut solutions = Vec::with_capacity(usize::from(count));
+        for _ in 0..count {
+            let address = reader.u32()?;
+            let length = usize::from(reader.u8()?);
+            let message = reader.bytes(length)?.to_vec();
+            let transmitted = TransmitTime::new(reader.u64()?, reader.u32()?)?;
+            let lat_e7 = reader.i32()?;
+            let lon_e7 = reader.i32()?;
+            let alt_hae_mm = Some(reader.i32()?).filter(|alt| *alt != NO_ALTITUDE);
+            let mut terms = [0.0; 6];
+            for term in &mut terms {
+                *term = reader.f32()?;
+            }
+            let clock_model = *lookup(&clocks, &mut clocks_used, reader.u16()?, "clock index")?;
+            let addressed = AddressedCitation {
+                hash: reader.array::<32>()?,
+                count: reader.u32()?,
+            };
+            provisional_citation(provisional, &addressed)?;
+            let tags = (0..reader.u8()?)
+                .map(|_| reader.array::<TAG_LEN>().map(ReceptionTag))
+                .collect::<Result<Vec<_>, _>>()?;
+            ascending(&tags, "tag order")?;
+            let solution = Solution {
+                address,
+                transmitted,
+                lat_e7,
+                lon_e7,
+                alt_hae_mm,
+                covariance: EnuCovariance::from_terms(terms),
+                clock_model,
+                addressed,
+                observations: TaggedSet::new(message, tags)?,
+            };
+            solution.check()?;
+            solutions.push(solution);
+        }
+        if clocks_used.contains(&false) {
+            return Err(WireError::Invalid {
+                field: "unused table entry",
+                value: 0,
+            });
+        }
+        Ok(SolutionsContent {
+            boot_id,
+            sequence,
+            issued_ms,
+            spec_version,
+            solutions,
+        })
+    }
+
     fn expect_format(&self, format: u8) -> Result<(), WireError> {
         if self.format() != format {
             return Err(WireError::Invalid {
@@ -481,8 +730,8 @@ impl Positions {
 }
 
 /// A provisional solution names no addressed citation.
-fn provisional_citation(format: u8, addressed: &AddressedCitation) -> Result<(), WireError> {
-    if format == POSITIONS_FORMAT_PROVISIONAL && *addressed != AddressedCitation::default() {
+fn provisional_citation(provisional: bool, addressed: &AddressedCitation) -> Result<(), WireError> {
+    if provisional && *addressed != AddressedCitation::default() {
         return Err(WireError::Invalid {
             field: "provisional addressed citation",
             value: u64::from(addressed.count),
@@ -500,6 +749,30 @@ fn put_solution(
     clock: u16,
     receiver: impl Fn(&PublicKey) -> Result<u16, WireError>,
 ) -> Result<(), WireError> {
+    put_common(bytes, solution, clock);
+    let receptions = solution.observations.receptions();
+    bytes.push(receptions.len() as u8);
+    for reception in receptions {
+        bytes.extend_from_slice(&receiver(&reception.receiver)?.to_be_bytes());
+        bytes.extend_from_slice(&reception.epoch.to_be_bytes());
+        bytes.extend_from_slice(&reception.counter.to_be_bytes()[2..]);
+    }
+    Ok(())
+}
+
+/// A tagged solution as a format 5 or 6 record lays it out.
+fn put_tagged(bytes: &mut Vec<u8>, solution: &TaggedSolution, clock: u16) {
+    put_common(bytes, solution, clock);
+    let tags = solution.observations.tags();
+    // A `TaggedSet` bounds its tags to a byte.
+    bytes.push(tags.len() as u8);
+    for tag in tags {
+        bytes.extend_from_slice(&tag.0);
+    }
+}
+
+/// Every field of a solution before its observations, in every format.
+fn put_common<O: Observed>(bytes: &mut Vec<u8>, solution: &Solution<O>, clock: u16) {
     bytes.extend_from_slice(&solution.address.to_be_bytes());
     let message = solution.observations.message();
     // An `ObservationSet` bounds its message and its receptions to a byte each.
@@ -516,14 +789,6 @@ fn put_solution(
     bytes.extend_from_slice(&clock.to_be_bytes());
     bytes.extend_from_slice(&solution.addressed.hash);
     bytes.extend_from_slice(&solution.addressed.count.to_be_bytes());
-    let receptions = solution.observations.receptions();
-    bytes.push(receptions.len() as u8);
-    for reception in receptions {
-        bytes.extend_from_slice(&receiver(&reception.receiver)?.to_be_bytes());
-        bytes.extend_from_slice(&reception.epoch.to_be_bytes());
-        bytes.extend_from_slice(&reception.counter.to_be_bytes()[2..]);
-    }
-    Ok(())
 }
 
 fn prefix(format: u8, identity: &Identity, boot_id: u64, sequence: u64) -> Vec<u8> {
@@ -692,6 +957,97 @@ pub(crate) mod tests {
         // A provisional names no assignment.
         assert!(Positions::sign_provisional(&engine, &self::content()?).is_err());
         Ok(())
+    }
+
+    fn raw_content() -> Result<SolutionsContent, WireError> {
+        content()
+    }
+
+    fn key_of(receiver: &PublicKey) -> Option<crate::site::ReceptionKey> {
+        Some(crate::site::ReceptionKey::of_signed(receiver.as_bytes()))
+    }
+
+    fn tagged_content() -> Result<TaggedSolutionsContent, WireError> {
+        let raw = content()?;
+        Ok(SolutionsContent {
+            boot_id: raw.boot_id,
+            sequence: raw.sequence,
+            issued_ms: raw.issued_ms,
+            spec_version: raw.spec_version,
+            solutions: raw
+                .solutions
+                .iter()
+                .map(|solution| solution.tagged(key_of))
+                .collect::<Result<_, _>>()?,
+        })
+    }
+
+    #[test]
+    fn a_tagged_record_round_trips_and_names_no_receiver() -> Result<(), WireError> {
+        let engine = Identity::generate()?;
+        let content = tagged_content()?;
+        let signed = Positions::sign_tagged(&engine, &content)?;
+        let back = Positions::from_bytes(signed.as_bytes().to_vec())?;
+        back.verify()?;
+        assert!(back.is_tagged() && !back.is_provisional());
+        assert_eq!(back.format(), POSITIONS_FORMAT_TAGGED);
+        assert_eq!(back.tagged_solutions()?, content);
+        assert!(back.solutions().is_err());
+        assert_eq!(
+            Positions::sign_tagged(&engine, &back.tagged_solutions()?)?,
+            signed
+        );
+        // No receiver key appears anywhere in its bytes.
+        for solution in &raw_content()?.solutions {
+            for reception in solution.observations.receptions() {
+                let key = reception.receiver.as_bytes();
+                assert!(!signed.as_bytes().windows(key.len()).any(|at| at == key));
+            }
+        }
+        // Raw records are not tagged.
+        assert!(!Positions::sign_solutions(&engine, &raw_content()?)?.is_tagged());
+        // Provisional: its own kind, no addressed citation.
+        let mut provisional = content.clone();
+        for solution in &mut provisional.solutions {
+            solution.addressed = AddressedCitation::default();
+        }
+        let signed = Positions::sign_tagged_provisional(&engine, &provisional)?;
+        assert!(signed.is_tagged() && signed.is_provisional());
+        assert_eq!(signed.tagged_solutions()?, provisional);
+        let mut bytes = Vec::new();
+        crate::Record::Provisional(signed.clone()).encode(&mut bytes)?;
+        assert_eq!(
+            crate::Record::decode(&bytes)?.0,
+            Some(crate::Record::Provisional(signed))
+        );
+        assert!(Positions::sign_tagged_provisional(&engine, &content).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn fitting_tagged_is_the_longest_prefix_a_tagged_record_holds() -> Result<(), WireError> {
+        let engine = Identity::generate()?;
+        let one = solution([1; 32], &[1, 2, 3, 4, 5, 6], 0)?.tagged(key_of)?;
+        let all = vec![one; 2_000];
+        let fits = Positions::fitting_tagged(&all);
+        assert!(fits > 0 && fits < all.len());
+        let signed = Positions::sign_tagged(&engine, &solutions_of(all[..fits].to_vec()))?;
+        assert!(signed.as_bytes().len() <= MAX_POSITIONS_LEN);
+        assert!(matches!(
+            Positions::sign_tagged(&engine, &solutions_of(all[..=fits].to_vec())),
+            Err(WireError::Oversize(_))
+        ));
+        Ok(())
+    }
+
+    fn solutions_of(solutions: Vec<TaggedSolution>) -> TaggedSolutionsContent {
+        SolutionsContent {
+            boot_id: 1,
+            sequence: 0,
+            issued_ms: 0,
+            spec_version: 1,
+            solutions,
+        }
     }
 
     #[test]

@@ -1,7 +1,8 @@
 //! The owner's `--precision` (RFC-0171 §8.3): the antenna's position snapped to a grid of the
 //! stated size before the feeder signs or sends anything, so the exact position never leaves the
-//! host. The relay directory snaps the location it is given (`relays::Directory::new`), and every
-//! signed receiver info and every area choice reads the snapped one.
+//! host. The relay directory snaps the location it is given (`relays::Directory::new`): the signed
+//! site relays are sent (`ReceiverSite`) is the snapped one, and the public cell every description
+//! names and every area choice reads are the snapped one's.
 //!
 //! The grid, for a precision of P metres (0 publishes the position exactly):
 //!

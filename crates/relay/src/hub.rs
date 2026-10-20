@@ -8,7 +8,7 @@
 //! routed to the message exchange (the one deduplication, `exchange`) and offered to the fan-out
 //! from there, so its subscribers read it in admitted order.
 
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, Ipv6Addr};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -16,9 +16,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tally_wire::batch::Hash;
 use tally_wire::{
-    Batch, ClockModel, ClockModelPart, Decoded, FaultProof, Location, Positions, PublicKey,
-    ReceiverInfo, Record, Region, RelayAddress,
+    Batch, ClientClockModel, ClientRecord, ClockModel, ClockModelPart, Decoded, FaultProof,
+    Location, Positions, PublicKey, ReceiverInfo, ReceiverSite, Record, Region, RelayAddress,
 };
+
+use tally_mlat::intake::SiteRecord;
 
 use crate::bounded::Bounded;
 use crate::budget::{Budget, Plan, Store};
@@ -30,7 +32,7 @@ use crate::network::{Asker, Network};
 use crate::parts::Parts;
 use crate::shed;
 use crate::stations::{STATIONS_REMEMBERED, StationReport, Stations, StationsReport};
-use crate::subscription::{Described, Subscription};
+use crate::subscription::{ClientItem, ClientSubscription, Described, Subscription};
 
 /// The memory a hub is budgeted until it is told its own (`Hub::memory`, which a relay always
 /// does from `--memory`): a fixed figure, never the host's, so a hub a test builds behaves the
@@ -175,13 +177,14 @@ pub const RELAY_ITSELF: u64 = 0;
 pub struct Item {
     pub source: u64,
     pub record: Arc<Record>,
-    /// For a receiver's batch or description: the finest cell (`Region::point`) of where that
-    /// receiver last declared itself, if it has, computed once when its description was kept.
-    /// Regions route by this and by nothing else.
+    /// For a receiver's batch, description or site: the finest cell (`Region::point`) of its site
+    /// in force, if the relay holds one, computed once when it was kept. Relay-only: a relay link
+    /// and an engine route by it, a client never (a client is routed by `client`'s place alone).
+    /// For a regional or bundle record, the cell it was signed for.
     pub cell: Option<Region>,
-    /// For positions and clock models: the finest cells of the aircraft they place (a clock
-    /// model's, its tile's centre), computed once when published, so a client's regions route
-    /// them as they route raw. `None` is unrouted: whole-world.
+    /// For positions and clock models: the finest cells of the aircraft they place (a full clock
+    /// model's, its tile's centre; a client clock model's, the area its full model's tile is in),
+    /// computed once when published. `None` is unrouted: whole-world.
     pub points: Option<Arc<[Region]>>,
     /// For a receiver's batch of a format this build reads: its one decode (`ingest`), so no
     /// reader of the fan-out (the BEAST output) inflates or parses it again.
@@ -189,6 +192,12 @@ pub struct Item {
     /// The ingest clock when it was taken: a subscriber queue's age is read from this
     /// (`fanout::BEHIND_MS`).
     pub stamp_ms: u64,
+    /// What a client may be sent of it, and where a client is routed it (`ClientItem`): made once
+    /// by the fan-out when anyone it routes to is a client (`fanout::Router::publish`), `None` for
+    /// a relay-only record. A client link sends this and nothing else (`outbound`), and a client
+    /// is routed by its place and nothing else (`ClientSubscription::serves`).
+    /// Shared, so an item stays as small in every queue slot as before it had a client place.
+    pub client: Option<Arc<ClientItem>>,
 }
 
 /// Two generations of hashes: a hash is remembered for one to two windows, or until `most` newer
@@ -320,15 +329,8 @@ fn cited_models(record: &Record) -> Vec<Hash> {
     let (Record::Positions(positions) | Record::Provisional(positions)) = record else {
         return Vec::new();
     };
-    let mut cited: Vec<Hash> = positions
-        .solutions()
-        .map(|content| {
-            content
-                .solutions
-                .iter()
-                .map(|solution| solution.clock_model)
-                .collect()
-        })
+    let mut cited: Vec<Hash> = crate::network::solved(positions)
+        .map(|solved| solved.into_iter().map(|one| one.clock_model).collect())
         .unwrap_or_default();
     cited.sort_unstable();
     cited.dedup();
@@ -432,28 +434,76 @@ impl<A: std::hash::Hash + Eq + Clone> Forwarded<A> {
     }
 }
 
-/// A receiver's newest description, ready to send, and the finest cell of the location it
-/// declared in it.
+/// A receiver's site (`ReceiverSite`, wire version 3) held beside its format 2 description:
+/// relay-only, sent only where `carries_sites` holds (`outbound`).
+#[derive(Clone)]
+struct HeldSite {
+    issued_ms: u64,
+    record: Arc<Record>,
+    location: Location,
+}
+
+impl HeldSite {
+    fn of(site: ReceiverSite) -> Option<Self> {
+        let content = site.content().ok()?;
+        Some(Self {
+            issued_ms: content.issued_ms,
+            location: content.location,
+            record: Arc::new(Record::ReceiverSite(site)),
+        })
+    }
+
+    fn bytes(&self) -> usize {
+        self.record.encoded_len()
+    }
+}
+
+/// Sites held for receivers not yet described in a form they pair with (a site that came before
+/// its description), at most: each is adopted by its receiver's next description, or forgotten.
+const SITES_WAITING: usize = 4_096;
+
+/// A receiver's newest description, ready to send, its site in force (a format 1 description's
+/// own, or the `ReceiverSite` paired with a format 2 one), the finest cell of that site and the
+/// public cell its description says.
 struct Known {
     issued_ms: u64,
     record: Arc<Record>,
+    /// The `ReceiverSite` paired with a format 2 description, when held: its public cell is the
+    /// site's, checked when the pair formed (`PublicInfoContent::holds`).
+    site: Option<HeldSite>,
     cell: Option<Region>,
+    public: Option<Region>,
     bytes: usize,
-    /// What it declares, read once when kept, for the station reports.
+    /// Its site in force, read once when kept: relay-only (the hosted MLAT, the regional area).
     place: Option<Location>,
     software: Option<String>,
 }
 
 impl Known {
-    fn item(&self) -> Item {
-        Item {
+    fn held_site(&self) -> Option<ReceiverSite> {
+        match self.site.as_ref().map(|site| &*site.record) {
+            Some(Record::ReceiverSite(site)) => Some(site.clone()),
+            _ => None,
+        }
+    }
+
+    /// Its description, and its site when `sites` (a relay's answer; never a client's).
+    fn items(&self, sites: bool) -> impl Iterator<Item = Item> + '_ {
+        let item = |record: &Arc<Record>| Item {
             source: RELAY_ITSELF,
-            record: Arc::clone(&self.record),
+            record: Arc::clone(record),
             cell: self.cell,
             points: None,
             decoded: None,
             stamp_ms: 0,
-        }
+            client: None,
+        };
+        std::iter::once(item(&self.record)).chain(
+            self.site
+                .as_ref()
+                .filter(|_| sites)
+                .map(|site| item(&site.record)),
+        )
     }
 }
 
@@ -481,13 +531,25 @@ impl RawShard {
     }
 }
 
+/// The site-bearing record an engine places `info`'s receiver by (`SiteRecord`): the site paired
+/// with it, else the description itself when it carries one (format 1). A format 2 description
+/// with no site paired places nobody.
+fn site_record(info: &ReceiverInfo, site: Option<ReceiverSite>) -> Option<SiteRecord> {
+    site.map(SiteRecord::Site)
+        .or_else(|| SiteRecord::info(info.clone()))
+}
+
 /// A feeder's own description, as its link last took it: given to the hub again when the hub has
 /// forgotten it and the feeder is publishing (see `RECEIVERS_REMEMBERED`).
 #[derive(Clone, Debug)]
 pub struct OwnDescription {
     pub info: ReceiverInfo,
     pub issued_ms: u64,
+    /// A format 1 description's site (an old feeder's); `None` for a format 2 one, whose site is
+    /// `site`.
     pub place: Option<Location>,
+    /// Its own `ReceiverSite`, as its link last took it (wire version 3).
+    pub site: Option<ReceiverSite>,
 }
 
 /// Where a batch came from, for what follows its admission.
@@ -640,9 +702,18 @@ pub struct Description {
 /// by every batch; and the shard's key is one no feeder knows, so filling a shard takes as many
 /// keys as filling the relay.
 struct ReceiverShard {
-    held: Bounded<PublicKey, Option<Region>>,
+    held: Bounded<PublicKey, Cells>,
     bytes: usize,
     max_bytes: usize,
+}
+
+/// A described receiver's two cells, as the batch path reads them: its site's finest cell, which
+/// relay-role links route by (`Item::cell`), and its public cell, which clients and the feeder
+/// figures read (`Item::public`, `figures`). Either `None` while unknown.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Cells {
+    pub point: Option<Region>,
+    pub public: Option<Region>,
 }
 
 /// The receivers described, sharded by receiver: what the batch path reads (a cell to route by)
@@ -689,9 +760,32 @@ struct Directory {
     known: HashMap<PublicKey, Known>,
     /// The located receivers by their finest cell's number, so the receivers inside a region are
     /// one range read (`Region::span`): a subscription's answer costs its matches and a lookup a
-    /// region, never a test of every receiver.
-    by_point: BTreeMap<u64, Vec<PublicKey>>,
+    /// region, never a test of every receiver. A cell's keys are a set, so taking one out costs
+    /// its log however many share the cell (every receiver in a dense city shares a public cell).
+    by_point: BTreeMap<u64, BTreeSet<PublicKey>>,
+    /// The described receivers by their public cell, keyed by its first finest descendant's number
+    /// (`Region::span`): a client's regions (no finer than a public cell, `Region::clamped_to_public`)
+    /// are answered by these and never by `by_point`, so no answer tells a client more than the
+    /// public cell.
+    by_public: BTreeMap<u64, BTreeSet<PublicKey>>,
+    /// Sites that came before a description they pair with (`SITES_WAITING`).
+    waiting_sites: Bounded<PublicKey, HeldSite>,
     bytes: usize,
+}
+
+/// Removes `receiver` from the keys an index holds under `at`.
+fn unindex(index: &mut BTreeMap<u64, BTreeSet<PublicKey>>, at: u64, receiver: &PublicKey) {
+    if let Some(keys) = index.get_mut(&at) {
+        keys.remove(receiver);
+        if keys.is_empty() {
+            index.remove(&at);
+        }
+    }
+}
+
+/// Where a public cell is keyed in `Directory::by_public`.
+fn public_key_of(public: Region) -> u64 {
+    *public.span().start()
 }
 
 /// The descriptions a subscription covers, and how many index entries were read to find them.
@@ -708,21 +802,30 @@ impl Directory {
         Self {
             known: HashMap::new(),
             by_point: BTreeMap::new(),
+            by_public: BTreeMap::new(),
+            waiting_sites: Bounded::new(SITES_WAITING),
             bytes: 0,
         }
     }
 
     fn insert(&mut self, receiver: PublicKey, known: Known) {
+        // The old entry's index entries out first: a description that keeps its cell is indexed
+        // again below, once.
+        self.remove(&receiver);
         self.bytes += known.bytes;
         if let Some(cell) = known.cell {
             self.by_point
                 .entry(cell.as_u64())
                 .or_default()
-                .push(receiver);
+                .insert(receiver);
         }
-        if let Some(old) = self.known.insert(receiver, known) {
-            self.forget(&receiver, &old);
+        if let Some(public) = known.public {
+            self.by_public
+                .entry(public_key_of(public))
+                .or_default()
+                .insert(receiver);
         }
+        self.known.insert(receiver, known);
     }
 
     fn remove(&mut self, receiver: &PublicKey) {
@@ -734,43 +837,66 @@ impl Directory {
     /// Takes back what `old`, no longer held for `receiver`, added.
     fn forget(&mut self, receiver: &PublicKey, old: &Known) {
         self.bytes -= old.bytes;
-        let Some(cell) = old.cell else {
-            return;
-        };
-        if let Some(keys) = self.by_point.get_mut(&cell.as_u64()) {
-            // Only the old entry's: a description that kept its cell was indexed again already.
-            if let Some(at) = keys.iter().position(|key| key == receiver) {
-                keys.swap_remove(at);
-            }
-            if keys.is_empty() {
-                self.by_point.remove(&cell.as_u64());
-            }
+        if let Some(cell) = old.cell {
+            unindex(&mut self.by_point, cell.as_u64(), receiver);
+        }
+        if let Some(public) = old.public {
+            unindex(&mut self.by_public, public_key_of(public), receiver);
         }
     }
 
-    fn all(&self) -> Vec<Item> {
-        self.known.values().map(Known::item).collect()
+    /// Takes `receiver`'s entry out, its index entries and bytes with it, to be changed and put
+    /// back (`insert`).
+    fn take(&mut self, receiver: &PublicKey) -> Option<Known> {
+        let old = self.known.remove(receiver)?;
+        self.forget(receiver, &old);
+        Some(old)
     }
 
+    /// Every description, and every site when `sites`.
+    fn all(&self, sites: bool) -> Vec<Item> {
+        self.known
+            .values()
+            .flat_map(|known| known.items(sites))
+            .collect()
+    }
+
+    /// What an engine's `subscription` covers: its receivers by their sites' finest cells,
+    /// descriptions and sites.
     fn answer(&self, subscription: &Subscription) -> Answer {
+        self.answer_by(subscription, &self.by_point, true)
+    }
+
+    /// What a client's `subscription` covers: its receivers by their public cells, descriptions
+    /// only. Never by `by_point`, so no answer tells a client more than the public cell.
+    fn client_answer(&self, subscription: &ClientSubscription) -> Answer {
+        self.answer_by(subscription.as_subscription(), &self.by_public, false)
+    }
+
+    fn answer_by(
+        &self,
+        subscription: &Subscription,
+        index: &BTreeMap<u64, BTreeSet<PublicKey>>,
+        sites: bool,
+    ) -> Answer {
         match subscription.described() {
             Described::None => Answer {
                 items: Vec::new(),
                 visited: 0,
             },
             Described::All => {
-                let items = self.all();
-                let visited = items.len();
+                let items = self.all(sites);
+                let visited = self.known.len();
                 Answer { items, visited }
             }
             Described::Within(spans) => {
                 let mut items = Vec::new();
                 let mut visited = 0;
                 for span in spans {
-                    for key in self.by_point.range(span).flat_map(|(_, keys)| keys) {
+                    for key in index.range(span).flat_map(|(_, keys)| keys) {
                         visited += 1;
                         if let Some(known) = self.known.get(key) {
-                            items.push(known.item());
+                            items.extend(known.items(sites));
                         }
                     }
                 }
@@ -1432,6 +1558,41 @@ impl Hub {
             Record::ClockModelPart(part) => {
                 self.publish_clock_model_part(source, part);
             }
+            Record::ClientClockModel(model) => {
+                self.publish_client_clock_model(source, model);
+            }
+            // This relay's feeder figures (or a peer's, forwarded): placed by their area, for the
+            // clients that read it (`Subscription::serves`).
+            Record::FeederFigures(figures) => {
+                if !self.first_time(figures.hash()) {
+                    return;
+                }
+                let area = figures.content().ok().and_then(|content| content.area);
+                self.fanout.publish(Item {
+                    source,
+                    record: Arc::new(Record::FeederFigures(figures)),
+                    cell: area,
+                    points: None,
+                    decoded: None,
+                    stamp_ms: self.now_ms(),
+                    client: None,
+                });
+            }
+            Record::ClientRegionalBatch(regional) => {
+                if !self.first_time(regional.hash()) {
+                    return;
+                }
+                let cell = regional.content().ok().map(|content| content.cell);
+                self.fanout.publish(Item {
+                    source,
+                    record: Arc::new(Record::ClientRegionalBatch(regional)),
+                    cell,
+                    points: None,
+                    decoded: None,
+                    stamp_ms: self.now_ms(),
+                    client: None,
+                });
+            }
             Record::BundleIndex(index) => {
                 if !self.first_time(index.hash()) {
                     return;
@@ -1444,6 +1605,7 @@ impl Hub {
                     points: None,
                     decoded: None,
                     stamp_ms: self.now_ms(),
+                    client: None,
                 });
             }
             Record::RegionalBatch(regional) => {
@@ -1458,6 +1620,7 @@ impl Hub {
                     points: None,
                     decoded: None,
                     stamp_ms: self.now_ms(),
+                    client: None,
                 });
             }
             other => {
@@ -1468,6 +1631,7 @@ impl Hub {
                     points: None,
                     decoded: None,
                     stamp_ms: self.now_ms(),
+                    client: None,
                 });
             }
         }
@@ -1522,6 +1686,12 @@ impl Hub {
         self.max_connections = max_connections;
         // The connections' buffers are planned in the budget: resized with the cap.
         self.replanned()
+    }
+
+    /// Signs the feeder figures every `every_ms` instead of `figures::PUBLISH_EVERY_MS`.
+    pub fn figures_every(self, every_ms: u64) -> Self {
+        self.network.figures.publish_every(every_ms);
+        self
     }
 
     /// Connections from one source (`source_of`) served at once before a new one from it is
@@ -1873,7 +2043,13 @@ impl Hub {
         {
             // On the worker that owns the receiver, stamped with its batch: offered to the hosted
             // MLAT here, before the batch, as a description of a receiver is offered.
-            if self.keep_info(
+            // Its own site (wire version 3) is offered with it, to pair as it did before.
+            if let Some(site) = own.site.clone().and_then(HeldSite::of)
+                && let Ok(mut directory) = self.directory.lock()
+            {
+                directory.waiting_sites.insert(receiver, site);
+            }
+            if let Some(site) = self.keep_info(
                 source,
                 own.info.clone(),
                 receiver,
@@ -1881,17 +2057,20 @@ impl Hub {
                 own.place,
                 true,
             ) && let Some(mlat) = self.network.mlat()
+                && let Some(record) = site_record(&own.info, site)
             {
-                mlat.offer_description(&own.info, stamp.stamp_ms);
+                mlat.offer_description(&record, stamp.stamp_ms);
             }
             described = self.publishing(&receiver);
         }
-        let cell = described.flatten();
+        let cells = described.unwrap_or_default();
+        let cell = cells.point;
         if let Some(decoded) = &decoded {
             let area = self.network.products.area_for(&receiver);
             self.stages.message().route(producer, decoded, area);
         }
-        self.network.on_batch(decoded.as_ref(), stamp.stamp_ms);
+        self.network
+            .on_batch(decoded.as_ref(), cells.public, stamp.stamp_ms);
         let record = Record::Batch(batch);
         self.share(&origin, &record, stamp.stamp_ms);
         self.fanout.publish(Item {
@@ -1901,6 +2080,7 @@ impl Hub {
             points: None,
             decoded,
             stamp_ms: stamp.stamp_ms,
+            client: None,
         });
         true
     }
@@ -1935,7 +2115,9 @@ impl Hub {
     /// batch.
     pub fn opened(&self, receiver: &PublicKey, source: u64, address: Option<IpAddr>) {
         if let Ok(mut shard) = self.raw[usize::from(raw_shard(receiver).0)].lock() {
-            shard.stations.opened(*receiver, source, now_ms(), address);
+            shard
+                .stations
+                .opened(*receiver, source, self.now_ms(), address);
         }
     }
 
@@ -1956,7 +2138,8 @@ impl Hub {
 
     /// Every receiver's report (`stations`), with what its newest description declares.
     pub fn stations(&self) -> StationsReport {
-        let now_ms = now_ms();
+        // By the ingest clock, which stamps every batch a report counts.
+        let now_ms = self.now_ms();
         let mut reports: Vec<(PublicKey, StationReport)> = self
             .raw
             .iter()
@@ -1985,7 +2168,7 @@ impl Hub {
             .lock()
             .ok()?
             .stations
-            .report(receiver, now_ms())?;
+            .report(receiver, self.now_ms())?;
         let directory = self.directory.lock().ok()?;
         Some(described(report, directory.known.get(receiver)))
     }
@@ -1997,9 +2180,11 @@ impl Hub {
         directory.known.get(receiver).and_then(|known| known.cell)
     }
 
-    /// Every receiver description the relay holds: what a duty that starts late (the hosted MLAT,
-    /// when its areas change) is handed instead of keeping a copy of its own.
-    pub fn descriptions(&self) -> Vec<ReceiverInfo> {
+    /// Every receiver's site-bearing record the relay holds (`site_record`: a format 2
+    /// description's paired `ReceiverSite`, or a format 1 description, which carries its own): what
+    /// a duty that starts late (the hosted MLAT, when its areas change) is handed instead of
+    /// keeping a copy of its own.
+    pub fn site_records(&self) -> Vec<SiteRecord> {
         let Ok(directory) = self.directory.lock() else {
             return Vec::new();
         };
@@ -2007,19 +2192,33 @@ impl Hub {
             .known
             .values()
             .filter_map(|known| match &*known.record {
-                Record::ReceiverInfo(info) => Some(info.clone()),
+                Record::ReceiverInfo(info) => site_record(info, known.held_site()),
                 _ => None,
             })
             .collect()
     }
 
-    /// The newest description of `receiver` the relay holds, and when it was issued.
-    pub fn description_of(&self, receiver: &PublicKey) -> Option<(Arc<Record>, u64)> {
+    /// What the relay holds of `receiver` for a relay to read before its batches: its newest
+    /// description and the site paired with it, and the newest time either was issued. Relay-only:
+    /// a link's type keeps the site off any link that does not carry sites (`outbound`).
+    pub fn description_of(&self, receiver: &PublicKey) -> Option<(Vec<Arc<Record>>, u64)> {
         let directory = self.directory.lock().ok()?;
-        directory
-            .known
-            .get(receiver)
-            .map(|known| (Arc::clone(&known.record), known.issued_ms))
+        directory.known.get(receiver).map(|known| {
+            let mut records = vec![Arc::clone(&known.record)];
+            let mut issued_ms = known.issued_ms;
+            if let Some(site) = &known.site {
+                records.push(Arc::clone(&site.record));
+                issued_ms = issued_ms.max(site.issued_ms);
+            }
+            (records, issued_ms)
+        })
+    }
+
+    /// `receiver`'s public cell, as its newest description says: the finest place anything this
+    /// relay publishes or a client reads places it (the station reports, `stats`).
+    pub fn public_cell_of(&self, receiver: &PublicKey) -> Option<Region> {
+        let directory = self.directory.lock().ok()?;
+        directory.known.get(receiver).and_then(|known| known.public)
     }
 
     /// Whether the relay holds a description of `receiver`.
@@ -2032,7 +2231,7 @@ impl Hub {
 
     /// `receiver` is publishing: marked so in its shard, and its cell, `None` when it is not
     /// described.
-    fn publishing(&self, receiver: &PublicKey) -> Option<Option<Region>> {
+    fn publishing(&self, receiver: &PublicKey) -> Option<Cells> {
         let mut shard = self.receivers.shard(receiver).lock().ok()?;
         shard.held.touch(receiver);
         shard.held.get(receiver).copied()
@@ -2064,6 +2263,16 @@ impl Hub {
         });
     }
 
+    /// Takes a verified `ReceiverSite` (`keep_site`), charged from `Store::Ingest`: the relay's
+    /// own, a test's. Whether it was paired.
+    pub fn publish_site(&self, source: u64, site: ReceiverSite) -> bool {
+        let Ok(receiver) = site.receiver() else {
+            return false;
+        };
+        let in_flight = self.in_flight_of(site.as_bytes().len());
+        self.keep_site(source, site, receiver, None, in_flight)
+    }
+
     /// Keeps a verified receiver description if it is the newest for its key and forwards it;
     /// kept, it is offered to the hosted MLAT through the ingest stage: on the worker that owns
     /// its receiver's raw shard, after the batches of that receiver handed in before it, stamped
@@ -2082,9 +2291,24 @@ impl Hub {
             in_flight,
         } = description;
         let offered = info.clone();
-        if !self.keep_info(source, info, receiver, issued_ms, place, publishing) {
+        let Some(site) = self.keep_info(source, info, receiver, issued_ms, place, publishing)
+        else {
             return;
-        }
+        };
+        self.offer_to_mlat(receiver, offered, site, stamp, in_flight);
+    }
+
+    /// Offers the hosted MLAT a receiver as now described: its description and the site paired
+    /// with it (a format 1 description carries its own), on the ingest worker that owns its raw
+    /// shard, stamped there as its batches are.
+    fn offer_to_mlat(
+        &self,
+        receiver: PublicKey,
+        offered: ReceiverInfo,
+        site: Option<ReceiverSite>,
+        stamp: Option<Stamp>,
+        in_flight: InFlight,
+    ) {
         let Some(mlat) = self.network.mlat().cloned() else {
             return;
         };
@@ -2095,14 +2319,23 @@ impl Hub {
             in_flight,
             stamp,
             Box::new(move |stamp, in_flight| {
-                mlat.offer_description(&offered, stamp.stamp_ms);
+                if let Some(record) = site_record(&offered, site) {
+                    mlat.offer_description(&record, stamp.stamp_ms);
+                }
                 drop(in_flight);
             }),
         );
     }
 
-    /// Keeps a verified receiver description if it is the newest for its key, and forwards it.
-    /// Whether it was kept.
+    /// Keeps a verified receiver description if it is the newest for its key, and forwards it
+    /// (then the site it pairs with, if it adopted one). Whether it was kept.
+    ///
+    /// The site in force with it is a format 1 description's own (`place`, as the caller read
+    /// it), or for a format 2 one the newest `ReceiverSite` held or waiting for it, when the pair
+    /// holds (`PublicInfoContent::holds`: the site's public cell is the description's). A pair
+    /// that does not hold is never kept: the older of the two is let go, and a description older
+    /// than a site it contradicts is refused (its feeder reissues both together, so the newer
+    /// description follows).
     fn keep_info(
         &self,
         source: u64,
@@ -2111,25 +2344,68 @@ impl Hub {
         issued_ms: u64,
         place: Option<Location>,
         publishing: bool,
-    ) -> bool {
+    ) -> Option<Option<ReceiverSite>> {
         let Ok(mut directory) = self.directory.lock() else {
-            return false;
+            return None;
         };
         let newer = directory
             .known
             .get(&receiver)
             .is_none_or(|known| issued_ms > known.issued_ms);
         if !newer {
-            return false;
+            return None;
+        }
+        let public = info.public_cell().ok().flatten();
+        let (site, place) = if info.carries_site() {
+            (None, place)
+        } else {
+            let held = directory
+                .known
+                .get(&receiver)
+                .and_then(|known| known.site.clone());
+            let waiting = directory.waiting_sites.get(&receiver).cloned();
+            let candidate = [held, waiting]
+                .into_iter()
+                .flatten()
+                .max_by_key(|site| site.issued_ms);
+            let holds = |site: &HeldSite| {
+                info.public()
+                    .is_ok_and(|content| content.holds(&site.location))
+            };
+            match candidate {
+                Some(site) if holds(&site) => {
+                    let location = site.location;
+                    (Some(site), Some(location))
+                }
+                Some(site) if site.issued_ms >= issued_ms => return None,
+                _ => (None, None),
+            }
+        };
+        if site.is_some() {
+            directory.waiting_sites.remove(&receiver);
         }
         let Ok(mut shard) = self.receivers.shard(&receiver).lock() else {
-            return false;
+            return None;
         };
         // Projected once, here; every region test after is integer work.
         let cell = place.and_then(|place| Region::point(&place).ok());
-        let bytes = info.as_bytes().len();
-        let software = info.content().ok().map(|content| content.software);
-        self.network.on_info(&info, now_ms());
+        let bytes = info.as_bytes().len() + site.as_ref().map_or(0, HeldSite::bytes);
+        let software = match info.description() {
+            Ok(tally_wire::Description::Site(content)) => Some(content.software),
+            Ok(tally_wire::Description::Public(content)) => Some(content.software),
+            Err(_) => None,
+        };
+        let site_record = site.as_ref().map(|site| Arc::clone(&site.record));
+        let paired = site.as_ref().and_then(|site| match &*site.record {
+            Record::ReceiverSite(site) => Some(site.clone()),
+            _ => None,
+        });
+        self.network.on_info(
+            &info,
+            self::site_record(&info, paired.clone()).as_ref(),
+            place,
+            now_ms(),
+        );
         let record = Arc::new(Record::ReceiverInfo(info));
         let replaced = directory
             .known
@@ -2141,16 +2417,22 @@ impl Hub {
             Known {
                 issued_ms,
                 record: Arc::clone(&record),
+                site,
                 cell,
+                public,
                 bytes,
                 place,
                 software,
             },
         );
+        let cells = Cells {
+            point: cell,
+            public,
+        };
         let forgotten = if publishing {
-            shard.held.insert_active(receiver, cell)
+            shard.held.insert_active(receiver, cells)
         } else {
-            shard.held.insert(receiver, cell)
+            shard.held.insert(receiver, cells)
         };
         // What the shard forgets, the directory forgets with it, and its bytes.
         let mut forget = |shard: &mut ReceiverShard, forgotten: &PublicKey| {
@@ -2176,6 +2458,109 @@ impl Hub {
         // A link joining reads its descriptions first and takes its place in the fan-out only once
         // it has sent them (see `subscribe`), so one changed in between reaches it at its
         // receiver's next description.
+        for record in std::iter::once(record).chain(site_record) {
+            self.fanout.publish(Item {
+                source,
+                record,
+                cell,
+                points: None,
+                decoded: None,
+                stamp_ms: self.now_ms(),
+                client: None,
+            });
+        }
+        Some(paired)
+    }
+
+    /// Takes a verified `ReceiverSite` (wire version 3) of `receiver` from connection `source`:
+    /// paired with its held format 2 description when the pair holds and it is the newest, and
+    /// forwarded (relay-only: no client link can carry it, `outbound`); held waiting when no
+    /// description it may pair with is held yet; refused when it contradicts a description at
+    /// least as new. Kept, it is offered to the hosted MLAT as its receiver's site, through the
+    /// ingest stage as a description is (`describe`): stamped `stamp` when a trace gives one, else by
+    /// the ingest clock, so the step it takes effect at is the trace's. Whether it was paired.
+    pub fn keep_site(
+        &self,
+        source: u64,
+        site: ReceiverSite,
+        receiver: PublicKey,
+        stamp: Option<Stamp>,
+        in_flight: InFlight,
+    ) -> bool {
+        let Some(held) = HeldSite::of(site) else {
+            return false;
+        };
+        let Ok(mut directory) = self.directory.lock() else {
+            return false;
+        };
+        let wait = |directory: &mut Directory, held: HeldSite| {
+            let newer = directory
+                .waiting_sites
+                .get(&receiver)
+                .is_none_or(|waiting| waiting.issued_ms < held.issued_ms);
+            if newer {
+                directory.waiting_sites.insert(receiver, held);
+            }
+            false
+        };
+        let Some(known) = directory.known.get(&receiver) else {
+            return wait(&mut directory, held);
+        };
+        let info = match &*known.record {
+            Record::ReceiverInfo(info) if !info.carries_site() => info.clone(),
+            // A format 1 description carries its own site: one of the new form waits for the
+            // format 2 description its feeder sends with it.
+            _ => return wait(&mut directory, held),
+        };
+        if known
+            .site
+            .as_ref()
+            .is_some_and(|site| site.issued_ms >= held.issued_ms)
+        {
+            return false;
+        }
+        let holds = info
+            .public()
+            .is_ok_and(|content| content.holds(&held.location));
+        if !holds {
+            // A site newer than the description it contradicts waits for the description its
+            // feeder reissued with it; one no newer is refused.
+            return if held.issued_ms > known.issued_ms {
+                wait(&mut directory, held)
+            } else {
+                false
+            };
+        }
+        let Some(mut known) = directory.take(&receiver) else {
+            return false;
+        };
+        let Ok(mut shard) = self.receivers.shard(&receiver).lock() else {
+            directory.insert(receiver, known);
+            return false;
+        };
+        let before = known.bytes;
+        known.bytes = info.as_bytes().len() + held.bytes();
+        known.place = Some(held.location);
+        known.cell = Region::point(&held.location).ok();
+        let record = Arc::clone(&held.record);
+        let (cell, public, place) = (known.cell, known.public, known.place);
+        known.site = Some(held);
+        shard.bytes = shard.bytes.saturating_sub(before) + known.bytes;
+        if let Some(entry) = shard.held.get_mut(&receiver) {
+            *entry = Cells {
+                point: cell,
+                public,
+            };
+        }
+        directory.insert(receiver, known);
+        directory.waiting_sites.remove(&receiver);
+        drop(shard);
+        drop(directory);
+        self.network
+            .on_info(&info, SiteRecord::of(&record).as_ref(), place, now_ms());
+        if let Record::ReceiverSite(site) = &*record {
+            self.offer_to_mlat(receiver, info, Some(site.clone()), stamp, in_flight);
+        }
         self.fanout.publish(Item {
             source,
             record,
@@ -2183,6 +2568,7 @@ impl Hub {
             points: None,
             decoded: None,
             stamp_ms: self.now_ms(),
+            client: None,
         });
         true
     }
@@ -2212,12 +2598,16 @@ impl Hub {
     /// rebuilt from parity, by a repair or over a link that died between them, may come first);
     /// held meanwhile, for `AWAITING_MS` at most, after which they go anyway (the relay forwards;
     /// it is the reader that cannot check them).
+    ///
+    /// A client's form (tagged) waits too while the relay cannot yet check it (`consistency`):
+    /// its raw twin, its model or a site its model names not held.
     fn forward_positions(&self, source: u64, record: Record) {
         let cited = cited_models(&record);
         let ready = self
             .clock_models
             .lock()
-            .is_ok_and(|forwarded| cited.iter().all(|id| forwarded.seen.contains(id)));
+            .is_ok_and(|forwarded| cited.iter().all(|id| forwarded.seen.contains(id)))
+            && self.checkable(&record);
         if ready {
             self.send_positions(source, record);
         } else if let Ok(mut awaiting) = self.awaiting.lock() {
@@ -2247,7 +2637,8 @@ impl Hub {
             let (ready, held): (VecDeque<Awaiting>, VecDeque<Awaiting>) =
                 awaiting.drain(..).partition(|one| {
                     one.since.elapsed() >= AWAITING_MS
-                        || one.cited.iter().all(|id| forwarded.seen.contains(id))
+                        || (one.cited.iter().all(|id| forwarded.seen.contains(id))
+                            && self.checkable(&one.record))
                 });
             *awaiting = held;
             ready.into_iter().collect()
@@ -2257,8 +2648,44 @@ impl Hub {
         }
     }
 
+    /// Whether the relay can check `record` for a client now: a raw record needs no check.
+    fn checkable(&self, record: &Record) -> bool {
+        match record {
+            Record::Positions(positions) | Record::Provisional(positions)
+                if positions.is_tagged() =>
+            {
+                self.network.consistency.check(positions) != crate::consistency::Verdict::Unknown
+            }
+            _ => true,
+        }
+    }
+
+    /// Into the fan-out. A client's form is checked first (`consistency`): one that passes is
+    /// what a client is sent; one that fails is sent to no one; one that could not be checked is
+    /// passed on to relays, who check it for their own clients, and to no client. The only place
+    /// a client's positions are made (`outbound::client_form` makes none).
     fn send_positions(&self, source: u64, record: Record) {
         let points = crate::network::points_of(&record);
+        let client = match &record {
+            Record::Positions(positions) | Record::Provisional(positions)
+                if positions.is_tagged() =>
+            {
+                match self.network.consistency.check(positions) {
+                    crate::consistency::Verdict::Passes => ClientRecord::try_from(record.clone())
+                        .ok()
+                        .map(|client| Arc::new(ClientItem::new(Arc::new(client), points.as_ref()))),
+                    crate::consistency::Verdict::Fails => {
+                        self.network.consistency.refuse();
+                        return;
+                    }
+                    crate::consistency::Verdict::Unknown => {
+                        self.network.consistency.refuse();
+                        None
+                    }
+                }
+            }
+            _ => None,
+        };
         self.fanout.publish(Item {
             source,
             record: Arc::new(record),
@@ -2266,6 +2693,7 @@ impl Hub {
             points,
             decoded: None,
             stamp_ms: self.now_ms(),
+            client,
         });
     }
 
@@ -2329,6 +2757,7 @@ impl Hub {
                     points: None,
                     decoded: None,
                     stamp_ms: self.now_ms(),
+                    client: None,
                 });
             }
             let record = Record::ClockModel(model);
@@ -2341,11 +2770,39 @@ impl Hub {
                 points,
                 decoded: None,
                 stamp_ms: self.now_ms(),
+                client: None,
             });
             // Positions held for this model go out after it.
             self.release_awaiting();
         }
         new
+    }
+
+    /// Forwards a verified client clock model (a full model's summary for clients: no site, no
+    /// offset) if it is new, placed by the area its full model's tile is in
+    /// (`Network::client_model_area`), never the tile's centre. Its
+    /// boot and sequence are its full model's, so it is told apart by its hash alone. True when it
+    /// was new.
+    pub fn publish_client_clock_model(&self, source: u64, model: ClientClockModel) -> bool {
+        if !self.first_time(model.hash()) {
+            return false;
+        }
+        let points = self
+            .network
+            .client_model_area(&model)
+            .map(|area| Arc::from([area].as_slice()));
+        self.fanout.publish(Item {
+            source,
+            record: Arc::new(Record::ClientClockModel(model)),
+            cell: None,
+            points,
+            decoded: None,
+            stamp_ms: self.now_ms(),
+            client: None,
+        });
+        // Tagged positions citing its model may now go.
+        self.release_awaiting();
+        true
     }
 
     /// Takes a clock model part: held until its manifest, forwarded now if its manifest went out
@@ -2368,6 +2825,7 @@ impl Hub {
             points: None,
             decoded: None,
             stamp_ms: self.now_ms(),
+            client: None,
         });
         true
     }
@@ -2397,6 +2855,7 @@ impl Hub {
                 points: None,
                 decoded: None,
                 stamp_ms: self.now_ms(),
+                client: None,
             });
         }
         new
@@ -2410,9 +2869,9 @@ impl Hub {
     /// between this read and that join is not in either; it reaches the subscriber when its
     /// receiver next describes itself, which a feeder does every ten minutes
     /// (`INFO_EVERY` in `tally_feed`'s relays).
-    pub fn subscribe(&self, subscription: &Subscription) -> Option<(Vec<Item>, Slot)> {
+    pub fn subscribe(&self, subscription: &ClientSubscription) -> Option<(Vec<Item>, Slot)> {
         let slot = Slot::take(&self.subscribers, self.max_subscribers)?;
-        Some((self.infos_for(subscription), slot))
+        Some((self.client_infos(subscription), slot))
     }
 
     /// As `subscribe`, without a place among the subscribers: for an engine, which is another
@@ -2420,7 +2879,7 @@ impl Hub {
     /// subscriber cap was never meant to turn away. What it may take is bounded by its grant (the
     /// border band of the areas it solves), never by the cap.
     pub fn engine(&self, subscription: &Subscription) -> Vec<Item> {
-        self.infos_for(subscription)
+        self.answer(subscription).items
     }
 
     /// One of the engines' places, which gives an engine its socket buffers
@@ -2437,7 +2896,7 @@ impl Hub {
     pub fn peer(&self) -> Vec<Item> {
         self.directory
             .lock()
-            .map(|directory| directory.all())
+            .map(|directory| directory.all(true))
             .unwrap_or_default()
     }
 
@@ -2473,12 +2932,45 @@ impl Hub {
         }
     }
 
-    /// Every known receiver description a subscription covers: what a subscriber is sent when it
-    /// changes what it wants, so receivers it newly covers are described before their batches.
-    pub fn infos_for(&self, subscription: &Subscription) -> Vec<Item> {
-        self.answer(subscription).items
+    /// Every known receiver description a client's subscription covers, by their public cells,
+    /// descriptions alone: what a client is sent when it joins or changes what it wants, so
+    /// receivers it newly covers are described before anything placed by them. With them, this
+    /// relay's latest feeder figures the subscription covers, so one joining reads them at once
+    /// rather than at the next signing (`figures`). Each with its client item made here
+    /// (`outbound::client_item`), and only what a client may be sent.
+    pub fn client_infos(&self, subscription: &ClientSubscription) -> Vec<Item> {
+        let mut items = self
+            .directory
+            .lock()
+            .map(|directory| directory.client_answer(subscription).items)
+            .unwrap_or_default();
+        let stamp_ms = self.now_ms();
+        items.extend(self.network.figures.latest().iter().map(|figures| {
+            let area = figures.content().ok().and_then(|content| content.area);
+            Item {
+                source: u64::MAX,
+                record: Arc::new(Record::FeederFigures(figures.clone())),
+                cell: area,
+                points: None,
+                decoded: None,
+                stamp_ms,
+                client: None,
+            }
+        }));
+        items
+            .into_iter()
+            .filter_map(|mut item| {
+                item.client = crate::outbound::client_item(&item);
+                let served = item
+                    .client
+                    .as_ref()
+                    .is_some_and(|client| subscription.serves(client));
+                served.then_some(item)
+            })
+            .collect()
     }
 
+    /// What an engine's subscription covers of the directory, by its receivers' sites.
     fn answer(&self, subscription: &Subscription) -> Answer {
         self.directory
             .lock()
@@ -2533,8 +3025,9 @@ fn now_ms() -> u64 {
 /// no batch of it forwarded, is placed nowhere: a connection alone publishes no location.
 fn described(mut report: StationReport, known: Option<&Known>) -> StationReport {
     if let Some(known) = known {
+        // Its public cell, never its site: the stats endpoint is a client's (`stats`).
         if report.batches > 0 {
-            report.location = known.place.map(Into::into);
+            report.cell = known.public.map(crate::stations::cell_name);
         }
         report.software = known.software.clone();
     }
@@ -3713,7 +4206,7 @@ mod tests {
     /// must agree with.
     fn brute_force(hub: &Hub, subscription: &Subscription) -> Result<Vec<usize>, String> {
         let directory = hub.directory.lock().map_err(|e| e.to_string())?;
-        let all = directory.all();
+        let all = directory.all(true);
         Ok(identities(
             &all.into_iter()
                 .filter(|item| subscription.wants(item))
@@ -3762,7 +4255,7 @@ mod tests {
         assert_eq!(held(&hub)?, (RECEIVERS, RECEIVERS));
         {
             let directory = hub.directory.lock().map_err(|e| e.to_string())?;
-            let indexed: usize = directory.by_point.values().map(Vec::len).sum();
+            let indexed: usize = directory.by_point.values().map(BTreeSet::len).sum();
             let located = directory
                 .known
                 .values()

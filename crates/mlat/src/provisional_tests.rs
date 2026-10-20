@@ -32,9 +32,13 @@ fn provisionals(
 ) -> Result<Vec<(u64, u64, tally_wire::Solution)>, String> {
     let mut out = Vec::new();
     for (at, record) in published {
+        // The raw form (a relay's); the tagged one is the same solutions for clients.
         let Record::Provisional(positions) = record else {
             continue;
         };
+        if positions.is_tagged() {
+            continue;
+        }
         for solution in positions.solutions().map_err(|e| e.to_string())?.solutions {
             let first = solution.observations.receptions()[0];
             let id = ObservationId {
@@ -73,6 +77,21 @@ fn a_provisional_position_is_published_within_two_seconds_of_its_transmission() 
     let mut engine = engine(2);
     let published = replay(&mut engine, &delivered, 100, until)?;
     let solved = provisionals(&published, &truth, &simulation)?;
+    // Every provisional is published tagged too (format 6), for clients: no counter, no receiver.
+    let mut tagged = 0;
+    for (_, record) in &published {
+        if let Record::Provisional(positions) = record
+            && positions.is_tagged()
+        {
+            assert!(positions.is_provisional());
+            tagged += positions
+                .tagged_solutions()
+                .map_err(|e| e.to_string())?
+                .solutions
+                .len();
+        }
+    }
+    assert_eq!(tagged, solved.len());
     let bytes = |provisional: bool| -> usize {
         published
             .iter()

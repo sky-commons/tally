@@ -4,7 +4,10 @@
 //! the model it was computed from.
 
 use blake2::{Blake2s256, Digest};
-use tally_wire::{Clock, EnuCovariance, Location, ObservationSet, PublicKey, TransmitTime};
+use tally_wire::{
+    Clock, EnuCovariance, Location, ObservationSet, PublicKey, ReceptionKey, ReceptionTag, SiteId,
+    TransmitTime,
+};
 
 use crate::clock::{Bias, BiasKind, ClockKey, ClockModel, ClockPiece, Jump, Timebase};
 use crate::geo::{self, Geodetic};
@@ -43,25 +46,38 @@ fn key(out: &mut Vec<u8>, key: &ClockKey) {
     out.extend_from_slice(&key.piece.to_be_bytes());
 }
 
+/// A scope entry as the encoding writes it: the site in full (relay-only, crate docs § Publishing).
 fn site(out: &mut Vec<u8>, site: &Site) {
     out.extend_from_slice(site.receiver.as_bytes());
     out.push(site.clock.byte());
+    out.extend_from_slice(&site.id.0);
     out.extend_from_slice(&site.location.lat_e7.to_be_bytes());
     out.extend_from_slice(&site.location.lon_e7.to_be_bytes());
     out.extend_from_slice(&site.location.alt_m.to_be_bytes());
     out.extend_from_slice(&site.location.precision_m.to_be_bytes());
 }
 
-/// The part of the encoding that says what the model is a function of: tile, window, members
-/// and input citation.
-fn inputs_bytes(model: &ClockModel) -> Vec<u8> {
+/// A scope entry as the inputs id hashes it: receiver, clock, site id and stated precision. The
+/// site id covers the site-bearing record's signature, which no client is sent, so the inputs id a
+/// client is given cannot be tested against guessed sites (as a hash over the site itself could,
+/// one guess at a time over the public cell).
+fn scope_entry(out: &mut Vec<u8>, site: &Site) {
+    out.extend_from_slice(site.receiver.as_bytes());
+    out.push(site.clock.byte());
+    out.extend_from_slice(&site.id.0);
+    out.extend_from_slice(&site.location.precision_m.to_be_bytes());
+}
+
+/// Tile, window, scope (each entry written by `entry`) and input citation: what the model is a
+/// function of.
+fn leading(model: &ClockModel, entry: fn(&mut Vec<u8>, &Site)) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(&model.tile.bytes());
     out.extend_from_slice(&model.window.first.to_be_bytes());
     out.extend_from_slice(&model.window.last.to_be_bytes());
     out.extend_from_slice(&(model.scope.len() as u16).to_be_bytes());
-    for entry in &model.scope {
-        site(&mut out, entry);
+    for site in &model.scope {
+        entry(&mut out, site);
     }
     out.extend_from_slice(&model.input.hash);
     out.extend_from_slice(&model.input.count.to_be_bytes());
@@ -69,22 +85,49 @@ fn inputs_bytes(model: &ClockModel) -> Vec<u8> {
 }
 
 /// What the model is a function of, as one hash the manifest carries: BLAKE2s-256 over
-/// `"tally clock model inputs id" 0x00`, the specification version (two bytes), and the
-/// encoding's inputs part. Two honest engines that agree on it publish the same model bytes.
+/// `"tally clock model inputs id" 0x00`, the specification version (two bytes), and tile, window,
+/// scope and input citation, each scope entry as receiver key, clock, site id and stated
+/// precision (never the site: the id is published to clients, `tally_wire::ClientClockModel`,
+/// and must name nothing a client could test a guess against).
+/// Two honest engines that agree on it publish the same model bytes.
 pub fn inputs_id(model: &ClockModel) -> [u8; 32] {
     let mut hasher = Blake2s256::new();
     hasher.update(INPUTS_DOMAIN);
     hasher.update([0]);
     hasher.update(model.spec.to_be_bytes());
-    hasher.update(inputs_bytes(model));
+    hasher.update(leading(model, scope_entry));
     hasher.finalize().into()
+}
+
+/// What a client is sent of `model` (`tally_wire::ClientClockModel`, crate docs § Publishing):
+/// the id solutions cite, the manifest's inputs and the window. Nothing of its scope: no site, no
+/// `site_mm`, no offset (with the aircraft's published positions they give every receiver's
+/// site), and no member at all, since a tile's members are chosen by their exact sites and the
+/// tiles a receiver is in, over time, narrow its site. `boot_id` and `sequence` are the full
+/// model's, so the summary is numbered with the model it summarises.
+pub fn client_model(
+    model: &ClockModel,
+    id: [u8; 32],
+    inputs: [u8; 32],
+    (boot_id, sequence, issued_ms): (u64, u64, u64),
+) -> tally_wire::ClientClockModelContent {
+    tally_wire::ClientClockModelContent {
+        boot_id,
+        sequence,
+        issued_ms,
+        spec_version: model.spec,
+        model: id,
+        inputs,
+        window_first: model.window.first,
+        window_last: model.window.last,
+    }
 }
 
 /// The one encoding (crate docs, § Publishing). Refused when a count exceeds its two bytes.
 pub fn encode(model: &ClockModel) -> Result<Vec<u8>, PublishError> {
     let count = |len: usize| u16::try_from(len).map_err(|_| PublishError::Range("count"));
     count(model.scope.len())?;
-    let mut out = inputs_bytes(model);
+    let mut out = leading(model, site);
     key(&mut out, &model.gauge);
     out.extend_from_slice(&model.origin_unix_ns.to_be_bytes());
     out.extend_from_slice(&model.gauge_rate.to_be_bytes());
@@ -172,6 +215,7 @@ pub fn decode(bytes: &[u8], spec: u16) -> Result<ClockModel, PublishError> {
         let entry = Site {
             receiver: reader.public_key()?,
             clock: Clock::from_byte(reader.u8()?),
+            id: SiteId(reader.array()?),
             location: Location {
                 lat_e7: reader.i32()?,
                 lon_e7: reader.i32()?,
@@ -360,6 +404,48 @@ pub fn to_wire(
         addressed: addressed.to_wire(),
         observations: ObservationSet::new(message.to_vec(), receptions)
             .map_err(|error| PublishError::Wire(error.to_string()))?,
+    })
+}
+
+/// The raw solution a tagged one stands for (`tally_wire::TaggedSolution`, what a client is sent),
+/// rematched by a relay against the raw it holds: each of `held` (receptions of the solution's
+/// message that the relay holds) tagged under its receiver's reception key as `key_of` gives it
+/// (the key of the receiver's site-bearing record current when it was heard), and the solution
+/// rebuilt from the receptions whose tags it names. `None` unless every tag it names is matched
+/// by exactly one reception held, so a tag the relay cannot account for is never taken on trust.
+pub fn rematch(
+    tagged: &tally_wire::TaggedSolution,
+    held: impl IntoIterator<Item = tally_wire::Reception>,
+    key_of: impl Fn(&PublicKey) -> Option<ReceptionKey>,
+) -> Option<tally_wire::Solution> {
+    let message = tagged.observations.message();
+    let wanted = tagged.observations.tags();
+    let mut found: Vec<Option<tally_wire::Reception>> = vec![None; wanted.len()];
+    for reception in held {
+        let Some(key) = key_of(&reception.receiver) else {
+            continue;
+        };
+        let Ok(tag) = ReceptionTag::of(&key, reception.epoch, reception.counter, message) else {
+            continue;
+        };
+        if let Ok(at) = wanted.binary_search(&tag) {
+            match found[at] {
+                Some(held) if held != reception => return None,
+                _ => found[at] = Some(reception),
+            }
+        }
+    }
+    let receptions = found.into_iter().collect::<Option<Vec<_>>>()?;
+    Some(tally_wire::Solution {
+        address: tagged.address,
+        transmitted: tagged.transmitted,
+        lat_e7: tagged.lat_e7,
+        lon_e7: tagged.lon_e7,
+        alt_hae_mm: tagged.alt_hae_mm,
+        covariance: tagged.covariance,
+        clock_model: tagged.clock_model,
+        addressed: tagged.addressed,
+        observations: ObservationSet::new(message.to_vec(), receptions).ok()?,
     })
 }
 

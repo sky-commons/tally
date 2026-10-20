@@ -103,6 +103,10 @@ pub struct Network {
     identity: OnceLock<Identity>,
     pub admission: Admission,
     pub delivery: Delivery,
+    /// The feeder figures of the receivers it hosts or carries (`figures`).
+    pub figures: crate::figures::Figures,
+    /// The checks a client's positions pass before a client is sent them (`consistency`).
+    pub consistency: crate::consistency::Consistency,
     pub directory: Directory,
     pub selection: Selection,
     pub sharing: Sharing,
@@ -141,6 +145,8 @@ impl Network {
             identity: OnceLock::new(),
             admission: Admission::new(),
             delivery: Delivery::new(),
+            figures: crate::figures::Figures::new(),
+            consistency: crate::consistency::Consistency::new(),
             directory: Directory::new(),
             selection: Selection::new(),
             sharing: Sharing::new(deadlines),
@@ -172,6 +178,7 @@ impl Network {
         self.sharing.charge_to(budget.gauge(Store::Batches));
         self.sharing.assemble_in(budget.parity_assembly());
         self.delivery.charge_to(budget.gauge(Store::Delivery));
+        self.figures.charge_to(budget.gauge(Store::Figures));
         self.products.charge_to(budget);
     }
 
@@ -253,7 +260,9 @@ impl Network {
                 .into_iter()
                 .collect(),
             Record::DeliveryQuery(query) => {
-                let point = hub.point_of(&query.receiver);
+                // By its public cell, as its batches are tagged (`point_for`): a feeder is a
+                // client, and its answer must not turn on which area its site lies in.
+                let point = hub.public_cell_of(&query.receiver);
                 // A relay's own answer is its own word, never credit evidence (`credit`). By the
                 // ingest clock, the clock delivery held each batch by (`on_batch`).
                 self.delivery
@@ -332,6 +341,27 @@ impl Network {
                 let record = Record::RegionalBatch(regional.clone());
                 self.from_peer(hub, asker, &record, now_ms);
                 self.products.regional_from(asker, regional, hub.now_ms());
+                Vec::new()
+            }
+            // The regional product as a client is sent it: shared in its group with its twin, and
+            // forwarded to this relay's clients while fresh (verified first: a relay's own word).
+            Record::ClientRegionalBatch(regional) => {
+                let fresh = regional.content().is_ok_and(|content| {
+                    let stamp_ms = hub.now_ms();
+                    content
+                        .wall_ms
+                        .saturating_add(crate::products::REGIONAL_MAX_AGE_MS)
+                        >= stamp_ms
+                        && content.wall_ms
+                            <= stamp_ms.saturating_add(crate::products::REGIONAL_MAX_AHEAD_MS)
+                });
+                if regional.verify().is_ok() {
+                    let record = Record::ClientRegionalBatch(regional);
+                    self.from_peer(hub, asker, &record, now_ms);
+                    if fresh {
+                        hub.publish_as(asker.source, record);
+                    }
+                }
                 Vec::new()
             }
             Record::Parity(chunk) => {
@@ -455,12 +485,29 @@ impl Network {
         }
     }
 
-    /// A receiver's description the hub kept (newer than what it held, verified). The hosted
-    /// MLAT is offered it by the hub, through the ingest stage, stamped there as the receiver's
-    /// batches are (`Hub::describe`).
-    pub fn on_info(&self, info: &ReceiverInfo, now_ms: u64) {
+    /// A receiver's description the hub kept (newer than what it held, verified), in either
+    /// format, or a site it paired with one, with `site`, the site record in force with it (a
+    /// format 1 description, or the `ReceiverSite` paired with a format 2 one; `None` while none
+    /// is), and `place`, that site's location. Every site the relay adopts comes here, whichever
+    /// order it came in, so what checks a client's positions (`consistency`) holds every site the
+    /// hosted MLAT is offered. The hosted MLAT is offered it by the hub, through the ingest stage,
+    /// stamped there as the receiver's batches are (`Hub::describe`).
+    pub fn on_info(
+        &self,
+        info: &ReceiverInfo,
+        site: Option<&tally_mlat::intake::SiteRecord>,
+        place: Option<tally_wire::Location>,
+        now_ms: u64,
+    ) {
+        if let Ok(receiver) = info.receiver() {
+            self.figures
+                .described(&receiver, info.public_cell().ok().flatten());
+        }
+        if let Some(site) = site {
+            self.consistency.site(site);
+        }
         self.credit.described(info.clone(), now_ms);
-        self.products.described(info);
+        self.products.described(info, place);
     }
 
     /// The one decode of a receiver's batch the hub forwarded (new, verified), when this build
@@ -468,10 +515,13 @@ impl Network {
     /// else (and standing reads MLAT's sealed bins). The regional product reads it through the
     /// message exchange (`exchange`), not here, and delivery tags the batch where its receiver's
     /// place is read, as it is shared (`originate`, `from_peer`), so the batch is not passed here.
-    pub fn on_batch(&self, decoded: Option<&Arc<Decoded>>, stamp_ms: u64) {
+    pub fn on_batch(&self, decoded: Option<&Arc<Decoded>>, public: Option<Region>, stamp_ms: u64) {
         let Some(decoded) = decoded else {
             return;
         };
+        // The feeder figures, on the ingest worker that owns the receiver's shard: by the
+        // ingest clock's stamp, which a batch's own clock is judged against.
+        self.figures.batch(decoded, public, stamp_ms);
         if let Some(mlat) = self.mlat() {
             mlat.offer_batch(decoded, stamp_ms);
         }
@@ -482,6 +532,13 @@ impl Network {
     /// at `now_ms` by the ingest clock (the products take them in by it, and charge them to that
     /// session, `products::From`).
     pub fn on_positions(&self, positions: &Positions, source: u64, now_ms: u64) {
+        // A tagged record (a client's form) is its raw twin's solutions again: the products and
+        // standing weigh the raw one.
+        if positions.is_tagged() {
+            return;
+        }
+        self.consistency.raw(positions);
+        self.figures.positions(positions, now_ms);
         self.products.positions(positions, source, now_ms);
         self.standing.positions(positions, now_ms);
     }
@@ -492,6 +549,7 @@ impl Network {
         if let Record::ClockModel(model) = record {
             self.products.clock_model(model, source, now_ms);
         }
+        self.consistency.model(record);
         self.standing.model(record, now_ms);
     }
 
@@ -548,12 +606,18 @@ impl Network {
     }
 
     /// Where a record's group is reckoned from, when the record does not say: a batch's
-    /// receiver's place, as described; a clock model's tile centre, from its inline bytes or its
-    /// first part (`hold_part`).
+    /// receiver's public cell, as described (never its site: the area a batch is grouped, tagged
+    /// and answered for is its public cell's, `rendezvous::area_of_public`, as a feeder picks its
+    /// relays by); a clock model's tile centre, from its inline bytes or its first part
+    /// (`hold_part`).
     fn point_for(&self, hub: &Hub, record: &Record) -> Option<Region> {
         match record {
-            Record::Batch(batch) => batch.receiver().ok().and_then(|key| hub.point_of(&key)),
+            Record::Batch(batch) => batch
+                .receiver()
+                .ok()
+                .and_then(|key| hub.public_cell_of(&key)),
             Record::ClockModel(model) => self.model_point_of(model),
+            Record::ClientClockModel(model) => self.client_model_area(model),
             Record::FaultProof(proof) => proof
                 .models_of()
                 .ok()
@@ -638,6 +702,23 @@ impl Network {
         Some(records)
     }
 
+    /// The area a client clock model is routed and grouped by: the area its full model's tile
+    /// centre lies in (`ClientClockModelContent::model`), when that is held (an engine publishes the
+    /// full model first, so it is). An area, never the centre: a client is routed nothing finer
+    /// than a public cell, and a client model is for the area's clients.
+    pub fn client_model_area(&self, model: &tally_wire::ClientClockModel) -> Option<Region> {
+        let id = model.content().ok()?.model;
+        let manifest = self
+            .models
+            .lock()
+            .ok()?
+            .iter()
+            .find(|held| held.id == id)?
+            .manifest
+            .clone()?;
+        tally_wire::rendezvous::area_of_cell(self.model_point_of(&manifest)?)
+    }
+
     /// A model's tile centre: from its inline bytes, or its first part's when it has parts.
     fn model_point_of(&self, model: &ClockModel) -> Option<Region> {
         let manifest = model.manifest().ok()?;
@@ -680,6 +761,21 @@ impl Network {
         // what they signed.
         out.extend(self.products.tick(identity));
         self.standing.tick(self.products.watermark_ms());
+        // The feeder figures, signed as this relay's own claim, for its clients: by the ingest
+        // clock they were counted by (`Hub::clocked`), so their hours are the batches' hours.
+        let figures_ms = hub.now_ms();
+        if let Some(identity) = identity
+            && self.figures.due(figures_ms)
+        {
+            let standing: std::collections::HashSet<PublicKey> =
+                self.standing.agreeing(now_ms).into_iter().collect();
+            out.extend(
+                self.figures
+                    .sign(identity, figures_ms, |key| standing.contains(key))
+                    .into_iter()
+                    .map(Record::FeederFigures),
+            );
+        }
         let last = self.corroborated_ms.load(Ordering::Relaxed);
         if now_ms.saturating_sub(last) >= CORROBORATE_EVERY_MS {
             self.corroborated_ms.store(now_ms, Ordering::Relaxed);
@@ -707,7 +803,7 @@ impl Network {
             if changed {
                 // Standing holds raw for the areas the hosted MLAT does, and for no other.
                 self.standing.set_areas(&areas);
-                mlat.set_areas(areas, hub.descriptions());
+                mlat.set_areas(areas, hub.site_records());
             }
             self.publish_cuts(mlat.take_cuts(), now_ms);
             let published = mlat.take_published(self.products.watermark_ms());
@@ -728,7 +824,10 @@ impl Network {
         // Its own regional batches, likewise (every other record the duties publish is a
         // product for clients, or the directory's).
         for record in &out {
-            if matches!(record, Record::RegionalBatch(_)) {
+            if matches!(
+                record,
+                Record::RegionalBatch(_) | Record::ClientRegionalBatch(_)
+            ) {
                 self.originate(hub, record, now_ms);
             }
         }
@@ -834,9 +933,8 @@ fn pass(hub: &Arc<Hub>, raw_ms: &mut u64) {
 pub fn points_of(record: &Record) -> Option<Arc<[Region]>> {
     let points: Vec<Region> = match record {
         Record::Positions(positions) | Record::Provisional(positions) => {
-            let content = positions.solutions().ok()?;
-            let mut points: Vec<Region> = content
-                .solutions
+            let solved = solved(positions)?;
+            let mut points: Vec<Region> = solved
                 .iter()
                 .filter_map(|solution| {
                     Region::point(&tally_wire::Location {
@@ -856,6 +954,46 @@ pub fn points_of(record: &Record) -> Option<Arc<[Region]>> {
         _ => return None,
     };
     Some(points.into())
+}
+
+/// Where one solution of a positions record placed its aircraft, and the model it cites: what
+/// routing and sharing read of a record, raw (format 3, 4) or tagged (format 5, 6) alike.
+#[derive(Clone, Copy, Debug)]
+pub struct Solved {
+    pub lat_e7: i32,
+    pub lon_e7: i32,
+    pub clock_model: [u8; 32],
+}
+
+/// The solutions of a positions record of either form, as routing reads them (`Solved`).
+pub fn solved(positions: &Positions) -> Option<Vec<Solved>> {
+    if positions.is_tagged() {
+        let content = positions.tagged_solutions().ok()?;
+        Some(
+            content
+                .solutions
+                .iter()
+                .map(|solution| Solved {
+                    lat_e7: solution.lat_e7,
+                    lon_e7: solution.lon_e7,
+                    clock_model: solution.clock_model,
+                })
+                .collect(),
+        )
+    } else {
+        let content = positions.solutions().ok()?;
+        Some(
+            content
+                .solutions
+                .iter()
+                .map(|solution| Solved {
+                    lat_e7: solution.lat_e7,
+                    lon_e7: solution.lon_e7,
+                    clock_model: solution.clock_model,
+                })
+                .collect(),
+        )
+    }
 }
 
 /// The finest cell of a clock model's tile centre, when the model's bytes are in its manifest.
@@ -898,9 +1036,9 @@ mod tests {
     const HANG: Duration = Duration::from_secs(120);
 
     impl MlatHost for Slow {
-        fn set_areas(&self, _: Regions, _: Vec<tally_wire::ReceiverInfo>) {}
+        fn set_areas(&self, _: Regions, _: Vec<tally_mlat::intake::SiteRecord>) {}
 
-        fn offer_description(&self, _: &tally_wire::ReceiverInfo, _: u64) {}
+        fn offer_description(&self, _: &tally_mlat::intake::SiteRecord, _: u64) {}
 
         fn offer_batch(&self, _: &Arc<tally_wire::Decoded>, _: u64) {}
 
@@ -1009,9 +1147,9 @@ mod tests {
     }
 
     impl MlatHost for Recording {
-        fn set_areas(&self, _: Regions, _: Vec<tally_wire::ReceiverInfo>) {}
+        fn set_areas(&self, _: Regions, _: Vec<tally_mlat::intake::SiteRecord>) {}
 
-        fn offer_description(&self, _: &tally_wire::ReceiverInfo, _: u64) {}
+        fn offer_description(&self, _: &tally_mlat::intake::SiteRecord, _: u64) {}
 
         fn offer_batch(&self, _: &Arc<tally_wire::Decoded>, _: u64) {}
 

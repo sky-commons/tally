@@ -37,8 +37,10 @@ Raspberry Pi OS Bullseye and anything newer).
     terminal, or, with no terminal, the install stops naming `TALLY_ALT`, having installed
     nothing. A position found nowhere is handled the same way.
   - **Who sees the location:** it asks nothing and passes no flag for it. The feed carries the
-    exact location to the relays, as MLAT needs, and the relays show only a spot within about
-    5 km on any public page; the installer says so in one line.
+    exact location only to Tally relays, as MLAT needs, in a record relays never pass to a client.
+    Nothing a data user reads (the API, the streams, the stats) contains it: the receiver's public
+    description names only its public cell, about 5 km across, which is all a public map shows.
+    The installer says so in one line.
   - **Relays:** from a seed list, the release's `seeds` or the file `TALLY_SEEDS` names, one
     `HOST:PORT=KEY OPERATOR` a line. It stops before installing anything if the list names no
     relay or an entry names no operator (`install.sh --check-seeds FILE` reads a list the same
@@ -130,9 +132,10 @@ That is all of it: no key to make or paste, and no relay to name.
 - **Decoder:** `BEASTHOST`, and `BEASTPORT` (default 30005), name readsb's BEAST output, here
   ultrafeeder's on the compose network, so port 30005 need not be published on the host.
 - **Location:** `LAT` and `LONG` (or `READSB_LAT` and `READSB_LON`) in degrees, and `ALT` (or
-  `READSB_ALT`) as ultrafeeder takes it, `15m` or `45ft` (a bare number is metres). Relays get the
-  position exactly, as MLAT needs; public surfaces (the map, station pages, the API) show it
-  blurred by the relay software. An empty variable counts as unset, so a missing
+  `READSB_ALT`) as ultrafeeder takes it, `15m` or `45ft` (a bare number is metres). Only Tally
+  relays get the position exactly, as MLAT needs; nothing a data user reads contains it, and public
+  surfaces (the map, station pages, the API) show only its public cell, about 5 km across. An
+  empty variable counts as unset, so a missing
   `${FEEDER_ALT_M}` leaves `ALT=m`, which the feeder refuses by name rather than guessing 0 m.
 - **Identity:** on the first run the feeder makes its key in the volume
   (`/var/lib/tally-feed/key`), and every start logs the receiver's public key and its station page,

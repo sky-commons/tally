@@ -209,14 +209,13 @@ use tally_mlat::engine::{
     Capacity, Dropped, Engine, Ingested, MODELS_RIPEN_MS, Settings, kept_by_stamps,
 };
 use tally_mlat::intake::{
-    Description, Intake, ORPHAN_MS, Orphans, Seats, signed_order, taking_effect,
+    Description, Intake, ORPHAN_MS, Orphans, Seats, SiteRecord, Sited, signed_order, taking_effect,
 };
 use tally_mlat::provisional::{self as provisional_, Due, Note, Order, Taken};
 use tally_mlat::{area, provisional, window};
-use tally_mlat_solver::Site;
 use tally_mlat_solver::gate::{self, Gate};
 use tally_mlat_solver::held::{Bin, Closing, Fragment, Limits, Resealed, SealedBins};
-use tally_wire::{Decoded, Identity, PublicKey, ReceiverInfo, Record, Region, Regions};
+use tally_wire::{Decoded, Identity, PublicKey, Record, Region, Regions};
 
 use crate::budget::{Budget, Charge, Gauge, Store};
 use crate::config::Config;
@@ -226,14 +225,16 @@ use crate::exchange::{SHARDS, raw_shard};
 pub trait MlatHost: Send + Sync {
     /// The areas to solve (plus their border band), as `selection` holds them (the fewest cells
     /// that cover them, never expanded): the receivers it holds are theirs. `descriptions` are
-    /// every receiver description the relay holds (`Hub::descriptions`), for a host that has not
-    /// been offered them. The relay calls this when the areas change.
-    fn set_areas(&self, areas: Regions, descriptions: Vec<ReceiverInfo>);
-    /// A receiver's description the relay kept, stamped `stamp_ms` by the relay's stamp watermark
-    /// when it kept it (`Products::watermark_ms`): it takes effect at the step after its stamp
-    /// (module docs, Descriptions). A batch reaches the host only as the relay's one decode of it
+    /// every receiver's site-bearing record the relay holds (`Hub::site_records`), for a host that
+    /// has not been offered them. The relay calls this when the areas change.
+    fn set_areas(&self, areas: Regions, descriptions: Vec<SiteRecord>);
+    /// A receiver's site-bearing record the relay kept (its `ReceiverSite` paired with its
+    /// description, or an old feeder's format 1 description: `SiteRecord`; a format 2 description
+    /// alone places nobody), stamped `stamp_ms` by the relay's stamp watermark when it kept it
+    /// (`Products::watermark_ms`): it takes effect at the step after its stamp (module docs,
+    /// Descriptions). A batch reaches the host only as the relay's one decode of it
     /// (`offer_batch`): there is no second way in, so none decodes it again.
-    fn offer_description(&self, info: &ReceiverInfo, stamp_ms: u64);
+    fn offer_description(&self, record: &SiteRecord, stamp_ms: u64);
     /// A receiver's batch the relay forwarded, verified and decoded once by its ingest, on the
     /// ingest worker that owns the receiver's raw shard, stamped `now_ms` (its `stamp_ms`): taken
     /// into that shard, never verified or decoded again.
@@ -847,7 +848,7 @@ enum Command {
 struct Closed {
     step_ms: u64,
     settled: i64,
-    sites: Vec<Site>,
+    sites: Vec<Sited>,
 }
 
 /// What the engine's thread does to the sealed bins, in the order it was decided, one seal at a
@@ -870,7 +871,7 @@ enum Sealing {
 struct WindowStep {
     step_ms: u64,
     settled: i64,
-    sites: Vec<Site>,
+    sites: Vec<Sited>,
     due_ms: u64,
     first_bin: i64,
     /// Put off once already for want of the `Engine` store (counted once).
@@ -1302,7 +1303,7 @@ impl Cuts {
 /// A description waiting for its step, with its stamp and its charge.
 struct Pending {
     stamp_ms: u64,
-    info: ReceiverInfo,
+    info: SiteRecord,
     charge: Waiting,
 }
 
@@ -1565,7 +1566,7 @@ impl WaitingRoom {
         step_ms: u64,
         receiver: PublicKey,
         stamp_ms: u64,
-        info: &ReceiverInfo,
+        info: &SiteRecord,
     ) -> u64 {
         let held = self
             .pending
@@ -1620,7 +1621,7 @@ impl WaitingRoom {
 
     /// The descriptions taking effect at or before step `step_ms`, taken, step by step in the order
     /// they are applied (`intake::taking_effect`).
-    fn take_descriptions(&mut self, step_ms: u64) -> Vec<(u64, ReceiverInfo)> {
+    fn take_descriptions(&mut self, step_ms: u64) -> Vec<(u64, SiteRecord)> {
         let later = self.pending.split_off(&(step_ms.saturating_add(1)));
         let due = std::mem::replace(&mut self.pending, later);
         let mut taken = Vec::new();
@@ -1644,7 +1645,7 @@ impl WaitingRoom {
     }
 
     /// Every description pending, taken, in the order they take effect at each step.
-    fn take_all_descriptions(&mut self) -> Vec<ReceiverInfo> {
+    fn take_all_descriptions(&mut self) -> Vec<SiteRecord> {
         self.take_descriptions(u64::MAX - 1)
             .into_iter()
             .map(|(_, info)| info)
@@ -1884,7 +1885,7 @@ impl Shared {
     #[allow(clippy::type_complexity)]
     fn describe(
         &self,
-        info: &ReceiverInfo,
+        info: &SiteRecord,
         at_ms: Option<u64>,
         kept: Option<i64>,
     ) -> (Vec<Told>, Vec<(u64, PublicKey)>, Vec<PublicKey>) {
@@ -2390,7 +2391,7 @@ impl HostedMlat {
     /// areas changed): its receiver's waiting batches taken as stamped, a receiver of another shard
     /// whose seat it changed settled in its own shard after, and a receiver that stopped taking
     /// part forgotten in the sealed bins.
-    fn describe_now(&self, info: &ReceiverInfo) {
+    fn describe_now(&self, info: &SiteRecord) {
         let (told, mut left, moved) = self.shared.describe(info, None, None);
         for told in told {
             self.shared.tell(told);
@@ -2415,7 +2416,7 @@ impl Drop for HostedMlat {
 }
 
 impl MlatHost for HostedMlat {
-    fn set_areas(&self, areas: Regions, descriptions: Vec<ReceiverInfo>) {
+    fn set_areas(&self, areas: Regions, descriptions: Vec<SiteRecord>) {
         for info in &descriptions {
             self.describe_now(info);
         }
@@ -2492,7 +2493,7 @@ impl MlatHost for HostedMlat {
         }
     }
 
-    fn offer_description(&self, info: &ReceiverInfo, stamp_ms: u64) {
+    fn offer_description(&self, info: &SiteRecord, stamp_ms: u64) {
         let descriptions = self.shared.descriptions();
         if descriptions.applied_ms.is_none() {
             // No step yet: applied as it comes, under the lock the first step takes.
@@ -2764,7 +2765,7 @@ impl Host {
     /// waited for this. What a receiver that stops taking part held is left in the bins earlier
     /// steps take (`Intake::describe_after`). The sites taking part and the receivers that stopped,
     /// for the step's seal and its window step, if one falls due at it.
-    fn apply(&mut self, step_ms: u64) -> (Vec<Site>, Vec<PublicKey>) {
+    fn apply(&mut self, step_ms: u64) -> (Vec<Sited>, Vec<PublicKey>) {
         let generation = self.generation;
         let kept = self
             .engine
@@ -2834,7 +2835,7 @@ impl Host {
         for told in told {
             shared.tell(told);
         }
-        sites.sort_unstable_by_key(|site| site.receiver);
+        sites.sort_unstable_by_key(|sited| sited.site.receiver);
         let left = left
             .into_iter()
             .filter(|(of, _)| *of == generation)
@@ -3660,7 +3661,7 @@ impl Host {
     /// Takes every bin complete by step `step_ms` out of every shard and seals them off this
     /// thread in their turn (`seals`); `sites` are the receivers taking part as the step's
     /// descriptions left them, for a window that falls due at it.
-    fn close(&mut self, step_ms: u64, sites: Vec<Site>) {
+    fn close(&mut self, step_ms: u64, sites: Vec<Sited>) {
         let Some(engine) = self.engine.as_ref() else {
             return;
         };
@@ -4167,8 +4168,11 @@ mod tests {
                     host.offer_batch(&decoded, at_ms);
                 }
             }
-            Record::ReceiverInfo(info) => host.offer_description(info, at_ms),
-            _ => {}
+            record => {
+                if let Some(site) = SiteRecord::of(record) {
+                    host.offer_description(&site, at_ms);
+                }
+            }
         }
     }
 
@@ -4368,7 +4372,7 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         assert_eq!(host.ingested(), 0);
-        host.offer_description(&feed.info, now);
+        host.offer_description(&SiteRecord::Site(feed.site.clone()), now);
         while host.in_flight() > 0 {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
@@ -4401,12 +4405,9 @@ mod tests {
         assert_eq!(host.ingested(), taken);
         // Taken again: the same raw, from the start, under a new boot id, the engine starting
         // from the descriptions the relay holds (`Hub::descriptions`).
-        let held: Vec<ReceiverInfo> = delivered
+        let held: Vec<SiteRecord> = delivered
             .iter()
-            .filter_map(|(_, record)| match record {
-                Record::ReceiverInfo(info) => Some(info.clone()),
-                _ => None,
-            })
+            .filter_map(|(_, record)| SiteRecord::of(record))
             .collect();
         host.set_areas(areas()?, held);
         let again = drive(&host, &delivered, first, last + 60_000);
@@ -5068,7 +5069,8 @@ mod tests {
             .iter()
             .find(|(at, record)| {
                 *at > first
-                    && matches!(record, Record::ReceiverInfo(info) if info.receiver().ok() == Some(moved))
+                    && SiteRecord::of(record)
+                        .is_some_and(|site| site.receiver().ok() == Some(moved))
             })
             .map(|(at, _)| step_of(*at))
             .ok_or("no leaving")?;
@@ -5448,15 +5450,16 @@ mod tests {
         let step = step_of(now);
         host.take_published(step);
         handled(&host);
-        let content = feed.info.content().map_err(text)?;
-        let signed = |issued_ms: u64| -> Result<ReceiverInfo, String> {
-            ReceiverInfo::sign(
+        let content = feed.site.content().map_err(text)?;
+        let signed = |issued_ms: u64| -> Result<SiteRecord, String> {
+            tally_wire::ReceiverSite::sign(
                 &feed.identity,
-                &tally_wire::batch::ReceiverInfoContent {
+                &tally_wire::ReceiverSiteContent {
                     issued_ms,
-                    ..content.clone()
+                    ..content
                 },
             )
+            .map(SiteRecord::Site)
             .map_err(text)
         };
         let base = content.issued_ms;
@@ -6153,15 +6156,16 @@ mod tests {
             .next()
             .ok_or("no feed")?;
         let key = feed.identity.public();
-        let content = feed.info.content().map_err(text)?;
-        let signed = |issued_ms: u64| -> Result<ReceiverInfo, String> {
-            ReceiverInfo::sign(
+        let content = feed.site.content().map_err(text)?;
+        let signed = |issued_ms: u64| -> Result<SiteRecord, String> {
+            tally_wire::ReceiverSite::sign(
                 &feed.identity,
-                &tally_wire::batch::ReceiverInfoContent {
+                &tally_wire::ReceiverSiteContent {
                     issued_ms,
-                    ..content.clone()
+                    ..content
                 },
             )
+            .map(SiteRecord::Site)
             .map_err(text)
         };
         let older = signed(content.issued_ms + 1)?;

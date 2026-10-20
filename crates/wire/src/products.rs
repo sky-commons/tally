@@ -18,6 +18,7 @@ use crate::WireError;
 use crate::batch::{Hash, Observation, check_coordinates};
 use crate::decoded::ObsView;
 use crate::key::{Identity, KEY_LEN, PublicKey};
+#[cfg(test)]
 use crate::observation_set::ObservationSet;
 use crate::positions::{EnuCovariance, TransmitTime};
 use crate::record::{Body, MAX_BODY};
@@ -397,12 +398,16 @@ const ADSB_INPUT_SET_DOMAIN: &[u8] = b"tally world adsb input set";
 
 /// The full input set's identity of an MLAT solution (RFC-0171 §3.8.1): BLAKE2s-256 over
 /// `"tally merge input set" 0x00`, the observation set's hash and the cited model's inputs hash.
-/// The one definition, for the merge rule and the world product alike.
-pub fn input_set(observations: &ObservationSet, model_inputs: &Hash) -> Hash {
+/// The one definition, for the merge rule and the world product alike. Of a tagged solution, over
+/// its `TaggedSet`'s hash, and so what the world product states. A client cannot recompute it from
+/// anything it can check: a tag hides which receiver and reception it stands for, and the model's
+/// inputs hash is over site ids a client is never sent. To a client the stated input set is the
+/// signer's word; the relay that serves it checks it (`consistency`, RFC-0171 §3.8.2).
+pub fn input_set<O: crate::positions::Observed>(observations: &O, model_inputs: &Hash) -> Hash {
     let mut hasher = Blake2s256::new();
     hasher.update(INPUT_SET_DOMAIN);
     hasher.update([0]);
-    hasher.update(observations.hash());
+    hasher.update(observations.set_hash());
     hasher.update(model_inputs);
     hasher.finalize().into()
 }
@@ -548,6 +553,180 @@ signed_record!(
     MAX_BODY
 );
 
+/// One deduplicated reception as a client receives it: the message alone, with no receiver
+/// counter and no signal level. A counter, grouped by the clock line it lies on and set against
+/// the aircraft's MLAT positions, ranges the receiver that heard it; a signal level, set against
+/// the aircraft's public positions, estimates the distance to it, which in an area of one receiver
+/// places that receiver. So both are relay-only.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClientObservation {
+    /// As `Observation::format`.
+    pub format: u8,
+    pub data: Vec<u8>,
+}
+
+/// One area's deduplicated receptions as a client receives them (wire version 3): a
+/// `RegionalBatchContent` with every counter stripped and the batch's wall clock kept.
+///
+/// ```text
+/// format u8 = 1 | origin key [32] | cell u64 | boot_id u64 | sequence u64 | wall_ms u64
+/// | count u16 | count x (format u8 | length u16 | data)
+/// | signature [64]
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClientRegionalBatchContent {
+    /// The area: no finer than a receiver's public cell, so the area tells no more of a receiver.
+    pub cell: Region,
+    pub boot_id: u64,
+    pub sequence: u64,
+    pub wall_ms: u64,
+    pub observations: Vec<ClientObservation>,
+}
+
+impl RegionalBatchContent {
+    /// What a client is sent of it: the same receptions, counters stripped.
+    pub fn for_clients(&self) -> ClientRegionalBatchContent {
+        ClientRegionalBatchContent {
+            cell: self.cell,
+            boot_id: self.boot_id,
+            sequence: self.sequence,
+            wall_ms: self.wall_ms,
+            observations: self
+                .observations
+                .iter()
+                .map(|observation| ClientObservation {
+                    format: observation.format,
+                    data: observation.data.clone(),
+                })
+                .collect(),
+        }
+    }
+}
+
+impl Check for ClientRegionalBatchContent {
+    /// At most `MAX_REGIONAL_OBSERVATIONS` observations, each of at most `u16::MAX` bytes, of an
+    /// area no finer than the public cell.
+    fn check(&self) -> Result<(), WireError> {
+        if self.observations.len() > MAX_REGIONAL_OBSERVATIONS {
+            return Err(WireError::Invalid {
+                field: "regional observations",
+                value: self.observations.len() as u64,
+            });
+        }
+        if self.cell.resolution() > crate::site::PUBLIC_CELL_RESOLUTION {
+            return Err(WireError::Invalid {
+                field: "client regional cell resolution",
+                value: u64::from(self.cell.resolution()),
+            });
+        }
+        if let Some(long) = self
+            .observations
+            .iter()
+            .find(|observation| u16::try_from(observation.data.len()).is_err())
+        {
+            return Err(WireError::Oversize(long.data.len()));
+        }
+        Ok(())
+    }
+}
+
+/// The one layout of a client regional batch's body, owned or borrowed.
+fn write_client_regional<'a>(
+    out: &mut Vec<u8>,
+    (cell, boot_id, sequence, wall_ms): (Region, u64, u64, u64),
+    observations: impl ExactSizeIterator<Item = (u8, &'a [u8])>,
+) -> Result<(), WireError> {
+    out.extend_from_slice(&cell.as_u64().to_be_bytes());
+    out.extend_from_slice(&boot_id.to_be_bytes());
+    out.extend_from_slice(&sequence.to_be_bytes());
+    out.extend_from_slice(&wall_ms.to_be_bytes());
+    count_u16(out, observations.len(), MAX_REGIONAL_OBSERVATIONS)?;
+    for (format, data) in observations {
+        out.push(format);
+        let length = u16::try_from(data.len()).map_err(|_| WireError::Oversize(data.len()))?;
+        out.extend_from_slice(&length.to_be_bytes());
+        out.extend_from_slice(data);
+    }
+    Ok(())
+}
+
+impl Fields for ClientRegionalBatchContent {
+    fn write(regional: Checked<'_, Self>, out: &mut Vec<u8>) -> Result<(), WireError> {
+        write_client_regional(
+            out,
+            (
+                regional.cell,
+                regional.boot_id,
+                regional.sequence,
+                regional.wall_ms,
+            ),
+            regional
+                .observations
+                .iter()
+                .map(|observation| (observation.format, &observation.data[..])),
+        )
+    }
+
+    fn read(reader: &mut Body<'_>) -> Result<Unchecked<Self>, WireError> {
+        let cell = Region::from_u64(reader.u64()?)?;
+        let boot_id = reader.u64()?;
+        let sequence = reader.u64()?;
+        let wall_ms = reader.u64()?;
+        let count = read_count(reader, MAX_REGIONAL_OBSERVATIONS)?;
+        let observations = (0..count)
+            .map(|_| {
+                let format = reader.u8()?;
+                let length = usize::from(reader.u16()?);
+                Ok(ClientObservation {
+                    format,
+                    data: reader.bytes(length)?.to_vec(),
+                })
+            })
+            .collect::<Result<_, WireError>>()?;
+        Ok(Unchecked::new(Self {
+            cell,
+            boot_id,
+            sequence,
+            wall_ms,
+            observations,
+        }))
+    }
+}
+
+signed_record!(
+    /// The origin relay's signed `ClientRegionalBatchContent`: the regional product a client is
+    /// sent. Its own domain, so it never verifies as a `RegionalBatch` or back.
+    ClientRegionalBatch,
+    ClientRegionalBatchContent,
+    b"tally client regional batch",
+    1,
+    MAX_BODY
+);
+
+impl ClientRegionalBatch {
+    /// As `sign`, from a draft's borrowed receptions, their counters dropped: the bytes `sign`
+    /// makes of `RegionalBatchContent::for_clients` of their owned copies, with no copy made.
+    pub fn sign_draft(identity: &Identity, draft: &RegionalDraft<'_>) -> Result<Self, WireError> {
+        if draft.cell.resolution() > crate::site::PUBLIC_CELL_RESOLUTION {
+            return Err(WireError::Invalid {
+                field: "client regional cell resolution",
+                value: u64::from(draft.cell.resolution()),
+            });
+        }
+        let mut body = Vec::new();
+        write_client_regional(
+            &mut body,
+            (draft.cell, draft.boot_id, draft.sequence, draft.wall_ms),
+            draft
+                .observations
+                .iter()
+                .map(|observation| (observation.format, observation.data)),
+        )?;
+        crate::signed::Signed::sign(Self::DOMAIN, Self::FORMAT, identity, &body, Self::MAX_LEN)
+            .map(Self)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -596,6 +775,77 @@ mod tests {
             ..draft
         };
         assert!(!RegionalBatch::fits_draft(&draft));
+        Ok(())
+    }
+
+    #[test]
+    fn a_client_regional_batch_carries_no_counter() -> Result<(), WireError> {
+        let relay = Identity::from_seed([9; 32]);
+        let observations: Vec<Observation> = (0..20u8)
+            .map(|n| Observation {
+                format: b'3',
+                timestamp: 0x0a0b_0c0d_0e00 + u64::from(n),
+                signal: n,
+                data: vec![n; 14],
+            })
+            .collect();
+        let content = RegionalBatchContent {
+            cell: cell()?,
+            boot_id: 3,
+            sequence: 7,
+            wall_ms: 1_791_244_800_000,
+            observations: observations.clone(),
+        };
+        let client = content.for_clients();
+        let signed = ClientRegionalBatch::sign(&relay, &client)?;
+        signed.verify()?;
+        assert_eq!(signed.content()?, client);
+        assert_eq!(client.observations.len(), 20);
+        // The draft signs the same bytes, and no counter's bytes are in them.
+        let draft = RegionalDraft {
+            cell: content.cell,
+            boot_id: 3,
+            sequence: 7,
+            wall_ms: content.wall_ms,
+            observations: observations.iter().map(ObsView::from).collect(),
+        };
+        assert_eq!(ClientRegionalBatch::sign_draft(&relay, &draft)?, signed);
+        let counter = &0x0a0b_0c0d_0e00u64.to_be_bytes()[2..6];
+        assert!(!signed.as_bytes().windows(4).any(|at| at == counter));
+        // Nor any signal level: the same receptions heard louder or softer are the same bytes.
+        let louder = RegionalBatchContent {
+            observations: observations
+                .iter()
+                .map(|observation| Observation {
+                    signal: observation.signal.wrapping_add(100),
+                    ..observation.clone()
+                })
+                .collect(),
+            ..content.clone()
+        };
+        assert_eq!(
+            ClientRegionalBatch::sign(&relay, &louder.for_clients())?,
+            signed
+        );
+        // Never a regional batch's signature, and never an area finer than a public cell.
+        assert!(
+            RegionalBatch::from_bytes(signed.as_bytes().to_vec())?
+                .verify()
+                .is_err()
+        );
+        let fine = ClientRegionalBatchContent {
+            cell: Region::containing(
+                &crate::batch::Location {
+                    lat_e7: 0,
+                    lon_e7: 0,
+                    alt_m: 0,
+                    precision_m: 0,
+                },
+                7,
+            )?,
+            ..client
+        };
+        assert!(ClientRegionalBatch::sign(&relay, &fine).is_err());
         Ok(())
     }
 

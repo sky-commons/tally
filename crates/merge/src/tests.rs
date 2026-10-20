@@ -1,7 +1,8 @@
-//! The merge rules over what real engines publish: the simulator's receivers, two engines whose
-//! regions overlap (so the aircraft they share are solved from different receivers, under
-//! different models), and records re-signed or cut down where a rule needs a case engines do not
-//! produce on their own.
+//! The merge rules over what real engines publish for clients: the simulator's receivers, two
+//! engines whose regions overlap (so the aircraft they share are solved from different receivers,
+//! under different models), and records re-signed or cut down where a rule needs a case engines do
+//! not produce on their own. A case is built from an engine's raw solution, as only a relay holds
+//! it, and tagged with the receivers' reception keys, as the engine tags what it publishes.
 
 use std::collections::BTreeMap;
 use std::sync::OnceLock;
@@ -9,23 +10,24 @@ use std::sync::OnceLock;
 use super::*;
 use tally_mlat::engine::{Engine, Settings as EngineSettings};
 use tally_mlat_solver::SPEC_VERSION;
-use tally_mlat_solver::scope::{GRID_MS, Window};
+use tally_mlat_solver::scope::{GRID_MS, Window, bin_of};
 use tally_mlat_solver::sim::{self, Scenario};
-use tally_wire::{Identity, SolutionsContent};
+use tally_wire::{
+    FaultProof, Identity, ObservationSet, ReceptionKey, Record, SolutionsContent,
+    TaggedSolutionsContent,
+};
 
 fn text(error: impl std::fmt::Display) -> String {
     error.to_string()
 }
 
-/// What the receivers published, and what two engines with overlapping regions published from it.
+/// What two engines with overlapping regions published from the receivers' raw.
 struct World {
-    raw: Vec<Record>,
     west: Vec<Record>,
     east: Vec<Record>,
-    /// What an engine holding all of the raw published.
-    full: Vec<Record>,
     west_key: Identity,
-    east_key: Identity,
+    /// Every receiver's reception key, as a relay holding its site has it.
+    keys: BTreeMap<PublicKey, ReceptionKey>,
     now: u64,
 }
 
@@ -42,7 +44,12 @@ fn build() -> Result<World, String> {
     let feeds = simulation.feeds().map_err(text)?;
     let mut raw: Vec<Record> = feeds
         .iter()
-        .map(|feed| Record::ReceiverInfo(feed.info.clone()))
+        .flat_map(|feed| {
+            [
+                Record::ReceiverInfo(feed.info.clone()),
+                Record::ReceiverSite(feed.site.clone()),
+            ]
+        })
         .collect();
     // Every receiver's host clock reads `HOST_CLOCK_LATE_MS` late, as an unsynchronised one may:
     // its batches carry that wall clock. A GNSS gauge's origin takes only the day from it; a
@@ -67,12 +74,12 @@ fn build() -> Result<World, String> {
     let now = (Window::canonical(last).last + 1) as u64 * GRID_MS + SETTLE_MS;
     let west_key = Identity::from_seed([41; 32]);
     // Two whole-world engines that hold different raw: the west the batches of the first seven
-    // receivers, the east of the last seven (every description reaches both). Their tiles'
-    // members differ where their raw does, so the aircraft they share are solved under models of
+    // receivers, the east of the last seven (every site reaches both). Their tiles' members
+    // differ where their raw does, so the aircraft they share are solved under models of
     // different inputs, from different receptions.
     let run =
         |identity: Identity, receivers: std::ops::Range<usize>| -> Result<Vec<Record>, String> {
-            let keys: BTreeSet<tally_wire::PublicKey> = simulation.receivers[receivers]
+            let keys: BTreeSet<PublicKey> = simulation.receivers[receivers]
                 .iter()
                 .map(|receiver| receiver.key)
                 .collect();
@@ -98,16 +105,17 @@ fn build() -> Result<World, String> {
             Ok(engine.step(now, now).0)
         };
     let west = run(west_key.clone(), 0..7)?;
-    let east_key = Identity::from_seed([42; 32]);
-    let east = run(east_key.clone(), 3..10)?;
-    let full = run(Identity::from_seed([45; 32]), 0..simulation.receivers.len())?;
+    let east = run(Identity::from_seed([42; 32]), 3..10)?;
+    let keys = simulation
+        .receivers
+        .iter()
+        .map(|receiver| (receiver.key, receiver.record.reception_key()))
+        .collect();
     Ok(World {
-        raw,
         west,
         east,
-        full,
         west_key,
-        east_key,
+        keys,
         now,
     })
 }
@@ -117,15 +125,23 @@ fn world() -> Result<&'static World, String> {
     WORLD.get_or_init(build).as_ref().map_err(Clone::clone)
 }
 
-fn feed(merge: &mut Merge, records: &[Record], now: u64) -> Result<(), String> {
+/// What a client is sent of `records`: every client form, every relay-only one refused.
+fn client(records: &[Record]) -> Vec<ClientRecord> {
+    records
+        .iter()
+        .filter_map(|record| ClientRecord::try_from(record.clone()).ok())
+        .collect()
+}
+
+fn feed(merge: &mut Merge, records: &[ClientRecord], now: u64) -> Result<(), String> {
     for record in records {
         merge.ingest(record, now)?;
     }
     Ok(())
 }
 
-/// Every transmission held as (address, current input set, check, alternatives' input sets).
-type Summary = Vec<(u32, Hash, Check, Vec<Hash>)>;
+/// Every transmission held as (address, current input set, alternatives' input sets).
+type Summary = Vec<(u32, Hash, Vec<Hash>)>;
 
 fn summary(merge: &Merge) -> Summary {
     merge
@@ -137,7 +153,6 @@ fn summary(merge: &Merge) -> Summary {
             (
                 current.address,
                 current.input_set,
-                current.check,
                 transmission
                     .alternatives()
                     .iter()
@@ -165,42 +180,20 @@ fn fixes(merge: &Merge) -> Vec<&Fix> {
         .collect()
 }
 
-/// `records` as another engine would have published the same content: every model re-signed by
-/// `identity`, and every solution citing its new id.
-fn resign(records: &[Record], identity: &Identity) -> Result<Vec<Record>, String> {
-    resign_as(records, identity, None)
-}
-
-/// As `resign`, every record naming specification version `spec` when given.
-fn resign_as(
-    records: &[Record],
-    identity: &Identity,
-    spec: Option<u16>,
-) -> Result<Vec<Record>, String> {
-    let mut ids: BTreeMap<Hash, Hash> = BTreeMap::new();
+/// `records`' client forms as another engine would sign the same content: every model summary
+/// and every tagged record re-signed by `identity`.
+fn resign(records: &[Record], identity: &Identity) -> Result<Vec<ClientRecord>, String> {
     let mut out = Vec::new();
-    for record in records {
+    for record in client(records) {
         match record {
-            Record::ClockModel(manifest) => {
-                let mut content = manifest.content(&[]).map_err(text)?;
-                if let Some(spec) = spec {
-                    // Its inputs' hash names the version, as another version's engine's would.
-                    content.spec_version = spec;
-                    let decoded = publish::decode(&content.model, spec).map_err(text)?;
-                    content.inputs = publish::inputs_id(&decoded);
-                }
-                let signed = ClockModel::sign(identity, &content).map_err(text)?;
-                ids.insert(manifest.id(), signed.manifest.id());
-                out.extend(signed.records());
+            ClientRecord::ClockModel(model) => {
+                let content = model.content().map_err(text)?;
+                let signed = ClientClockModel::sign(identity, &content).map_err(text)?;
+                out.push(ClientRecord::ClockModel(signed));
             }
-            Record::Positions(positions) => {
-                let mut content = positions.solutions().map_err(text)?;
-                content.spec_version = spec.unwrap_or(content.spec_version);
-                for solution in &mut content.solutions {
-                    solution.clock_model = *ids.get(&solution.clock_model).ok_or("uncited")?;
-                }
-                let signed = Positions::sign_solutions(identity, &content).map_err(text)?;
-                out.push(Record::Positions(signed));
+            ClientRecord::Positions(positions) => {
+                let content = positions.get().tagged_solutions().map_err(text)?;
+                out.push(tagged_record(identity, &content, false)?);
             }
             _ => {}
         }
@@ -208,41 +201,144 @@ fn resign_as(
     Ok(out)
 }
 
+fn tagged_record(
+    identity: &Identity,
+    content: &TaggedSolutionsContent,
+    provisional: bool,
+) -> Result<ClientRecord, String> {
+    if provisional {
+        let signed = Positions::sign_tagged_provisional(identity, content).map_err(text)?;
+        Ok(ClientRecord::Provisional(
+            tally_wire::TaggedPositions::new(signed).map_err(|_| "untagged")?,
+        ))
+    } else {
+        let signed = Positions::sign_tagged(identity, content).map_err(text)?;
+        Ok(ClientRecord::Positions(
+            tally_wire::TaggedPositions::new(signed).map_err(|_| "untagged")?,
+        ))
+    }
+}
+
+/// The raw final solutions `records` publish, as a relay holds them.
 fn solutions(records: &[Record]) -> Result<Vec<tally_wire::Solution>, String> {
     let mut out = Vec::new();
     for record in records {
-        if let Record::Positions(positions) = record {
+        if let Record::Positions(positions) = record
+            && !positions.is_tagged()
+        {
             out.extend(positions.solutions().map_err(text)?.solutions);
         }
     }
     Ok(out)
 }
 
-fn models(records: &[Record]) -> Vec<Record> {
-    records
-        .iter()
-        .filter(|record| matches!(record, Record::ClockModel(_) | Record::ClockModelPart(_)))
-        .cloned()
+/// The model summaries `records` publish for clients.
+fn models(records: &[Record]) -> Vec<ClientRecord> {
+    client(records)
+        .into_iter()
+        .filter(|record| matches!(record, ClientRecord::ClockModel(_)))
         .collect()
+}
+
+/// `solution` tagged as its engine would publish it.
+fn tag(world: &World, solution: &tally_wire::Solution) -> Result<TaggedSolution, String> {
+    solution
+        .tagged(|key| world.keys.get(key).copied())
+        .map_err(text)
+}
+
+/// `solution` tagged and signed by `identity` as one final record.
+fn signed(
+    world: &World,
+    identity: &Identity,
+    sequence: u64,
+    solution: &tally_wire::Solution,
+) -> Result<ClientRecord, String> {
+    tagged_record(
+        identity,
+        &SolutionsContent {
+            boot_id: 0xb007,
+            sequence: 2_000 + sequence,
+            issued_ms: 0,
+            spec_version: SPEC_VERSION,
+            solutions: vec![tag(world, solution)?],
+        },
+        false,
+    )
+}
+
+/// `solution` tagged and signed by `identity` as one provisional record: no addressed citation,
+/// as a provisional names none.
+fn early(
+    world: &World,
+    identity: &Identity,
+    sequence: u64,
+    solution: &tally_wire::Solution,
+) -> Result<ClientRecord, String> {
+    let mut solution = tag(world, solution)?;
+    solution.addressed = tally_wire::AddressedCitation::default();
+    tagged_record(
+        identity,
+        &SolutionsContent {
+            boot_id: 0xb007,
+            sequence,
+            issued_ms: 0,
+            spec_version: SPEC_VERSION,
+            solutions: vec![solution],
+        },
+        true,
+    )
+}
+
+/// A client is sent tagged solutions and model summaries only; a relay-only form is not a
+/// `ClientRecord` at all, and every solution's tags rematch, at a relay, to the raw one.
+#[test]
+fn a_client_is_sent_only_tagged_forms_and_their_tags_rematch_at_a_relay() -> Result<(), String> {
+    let world = world()?;
+    let sent = client(&world.west);
+    assert!(sent.len() < world.west.len());
+    for record in &world.west {
+        let refused = ClientRecord::try_from(record.clone()).is_err();
+        let relay_only = matches!(record, Record::ClockModel(_) | Record::ClockModelPart(_))
+            || matches!(record, Record::Positions(positions) if !positions.is_tagged());
+        assert_eq!(refused, relay_only, "{record:?}");
+    }
+    let raw = solutions(&world.west)?;
+    let mut tagged = Vec::new();
+    for record in &sent {
+        if let ClientRecord::Positions(positions) = record {
+            tagged.extend(positions.get().tagged_solutions().map_err(text)?.solutions);
+        }
+    }
+    assert_eq!(tagged.len(), raw.len());
+    for (one, wire) in tagged.iter().zip(&raw) {
+        let back = tally_mlat_solver::publish::rematch(
+            one,
+            wire.observations.receptions().iter().copied(),
+            |key| world.keys.get(key).copied(),
+        );
+        assert_eq!(back.as_ref(), Some(wire));
+    }
+    Ok(())
 }
 
 #[test]
 fn the_same_input_set_is_a_duplicate_whoever_signed_it_and_whatever_the_order() -> Result<(), String>
 {
     let world = world()?;
-    let mut once = Merge::new(Settings::new(false));
-    feed(&mut once, &world.west, world.now)?;
+    let west = client(&world.west);
+    let mut once = Merge::new(Settings::default());
+    feed(&mut once, &west, world.now)?;
     assert!(once.tracks().len() >= 5, "{} tracks", once.tracks().len());
     // Twice (two relays), backwards (positions before their models), and re-signed by a second
     // engine holding the same raw: the same tracks, with both engines behind every fix.
-    let mut many = Merge::new(Settings::new(false));
-    let mut backwards = world.west.clone();
+    let mut many = Merge::new(Settings::default());
+    let mut backwards = west.clone();
     backwards.reverse();
     feed(&mut many, &backwards, world.now)?;
-    feed(&mut many, &world.west, world.now)?;
+    feed(&mut many, &west, world.now)?;
     let other = Identity::from_seed([43; 32]);
-    let resigned = resign(&world.west, &other)?;
-    for record in &resigned {
+    for record in &resign(&world.west, &other)? {
         let ingested = many.ingest(record, world.now)?;
         if let Ingested::Solutions { accepted, .. } = ingested {
             assert_eq!(accepted, 0, "a duplicate changed a track");
@@ -252,9 +348,39 @@ fn the_same_input_set_is_a_duplicate_whoever_signed_it_and_whatever_the_order() 
     for fix in fixes(&many) {
         assert!(fix.engines.contains(&other.public()));
         assert!(fix.engines.contains(&world.west_key.public()));
-        assert_eq!(fix.check, Check::Signature);
         assert!(fix.horizontal_sigma_m > 0.0);
     }
+    Ok(())
+}
+
+/// A solution counts only under a model summary its own engine signed: another key's summary
+/// naming the same model id holds nothing up, and the solution waits.
+#[test]
+fn a_solution_counts_only_under_its_own_engines_model_summary() -> Result<(), String> {
+    let world = world()?;
+    let other = Identity::from_seed([48; 32]);
+    let mut merge = Merge::new(Settings::default());
+    let summaries: Vec<ClientRecord> = resign(&world.west, &other)?
+        .into_iter()
+        .filter(|record| matches!(record, ClientRecord::ClockModel(_)))
+        .collect();
+    feed(&mut merge, &summaries, world.now)?;
+    let solution = solutions(&world.west)?
+        .into_iter()
+        .next()
+        .ok_or("no solution")?;
+    let ingested = merge.ingest(&signed(world, &world.west_key, 0, &solution)?, world.now)?;
+    assert_eq!(
+        ingested,
+        Ingested::Solutions {
+            accepted: 0,
+            duplicate: 0,
+            dropped: 0,
+            pending: 1
+        }
+    );
+    feed(&mut merge, &models(&world.west), world.now)?;
+    assert!(merge.holds(&tag(world, &solution)?));
     Ok(())
 }
 
@@ -276,30 +402,20 @@ fn a_superset_of_the_same_models_inputs_wins_in_either_order() -> Result<(), Str
         receptions[..receptions.len() - 1].to_vec(),
     )
     .map_err(text)?;
-    let sign = |solution: &tally_wire::Solution, sequence: u64| -> Result<Record, String> {
-        Positions::sign_solutions(
-            &world.west_key,
-            &SolutionsContent {
-                boot_id: 0xb007,
-                sequence: 1_000 + sequence,
-                issued_ms: world.now,
-                spec_version: SPEC_VERSION,
-                solutions: vec![solution.clone()],
-            },
-        )
-        .map(Record::Positions)
-        .map_err(text)
-    };
-    let (full_record, cut_record) = (sign(&full, 0)?, sign(&cut, 1)?);
+    let (full_record, cut_record) = (
+        signed(world, &world.west_key, 0, &full)?,
+        signed(world, &world.west_key, 1, &cut)?,
+    );
+    let tagged = tag(world, &full)?;
     for order in [[&cut_record, &full_record], [&full_record, &cut_record]] {
-        let mut merge = Merge::new(Settings::new(false));
+        let mut merge = Merge::new(Settings::default());
         feed(&mut merge, &models(&world.west), world.now)?;
         for record in order {
             merge.ingest(record, world.now)?;
         }
         let track = merge.track(full.address).ok_or("no track")?;
         let transmission = track.latest().ok_or("no final transmission")?;
-        assert_eq!(transmission.current().observations, full.observations);
+        assert_eq!(transmission.current().observations, tagged.observations);
         assert!(
             transmission.alternatives().is_empty(),
             "a subset is not an alternative"
@@ -309,15 +425,15 @@ fn a_superset_of_the_same_models_inputs_wins_in_either_order() -> Result<(), Str
 }
 
 #[test]
-fn incomparable_sets_without_raw_keep_the_first_by_the_tie_rule_and_record_the_other()
--> Result<(), String> {
+fn incomparable_sets_keep_the_first_by_the_tie_rule_and_record_the_other() -> Result<(), String> {
     let world = world()?;
-    let mut first = Merge::new(Settings::new(false));
-    feed(&mut first, &world.west, world.now)?;
-    feed(&mut first, &world.east, world.now)?;
-    let mut second = Merge::new(Settings::new(false));
-    feed(&mut second, &world.east, world.now)?;
-    feed(&mut second, &world.west, world.now)?;
+    let (west, east) = (client(&world.west), client(&world.east));
+    let mut first = Merge::new(Settings::default());
+    feed(&mut first, &west, world.now)?;
+    feed(&mut first, &east, world.now)?;
+    let mut second = Merge::new(Settings::default());
+    feed(&mut second, &east, world.now)?;
+    feed(&mut second, &west, world.now)?;
     // What is served, every aircraft's current fix, is the same in either order.
     let current = |merge: &Merge| -> Vec<(u32, Hash)> {
         merge
@@ -334,7 +450,6 @@ fn incomparable_sets_without_raw_keep_the_first_by_the_tie_rule_and_record_the_o
     assert!(!contested.is_empty(), "no transmission both engines solved");
     for transmission in contested {
         let current = transmission.current();
-        assert_eq!(current.check, Check::Signature);
         for alternative in transmission.alternatives() {
             assert_eq!(
                 current.observations.message(),
@@ -360,26 +475,23 @@ fn the_tie_rule_is_weight_then_the_lowest_input_set_hash() -> Result<(), String>
         .into_iter()
         .next()
         .ok_or("no solution")?;
+    let tagged = tag(world, &solution)?;
     let fix = |weight: u64, hash: u8| Fix {
         kind: Kind::Final,
-        address: solution.address,
-        transmitted: solution.transmitted,
+        address: tagged.address,
+        transmitted: tagged.transmitted,
         lat_e7: 0,
         lon_e7: 0,
         alt_hae_mm: None,
         altitude_ft: None,
         horizontal_sigma_m: 1.0,
-        covariance: solution.covariance,
-        observations: solution.observations.clone(),
+        covariance: tagged.covariance,
+        observations: tagged.observations.clone(),
         model: [hash; 32],
         model_inputs: [hash; 32],
         input_set: [hash; 32],
         weight,
-        check: Check::Signature,
         engines: BTreeSet::new(),
-        standing: 0,
-        confidence: Confidence::Unconfirmed,
-        consistent: true,
     };
     let mut fixes = [fix(10, 1), fix(12, 9), fix(12, 3), fix(11, 0)];
     fixes.sort_by(order);
@@ -388,102 +500,31 @@ fn the_tie_rule_is_weight_then_the_lowest_input_set_hash() -> Result<(), String>
         .map(|fix| (fix.weight, fix.input_set[0]))
         .collect();
     assert_eq!(ranked, vec![(12, 3), (12, 9), (11, 0), (10, 1)]);
-    let mut resolved = fix(1, 200);
-    resolved.check = Check::Resolved;
-    assert_eq!(order(&resolved, &fix(12, 3)), std::cmp::Ordering::Less);
     Ok(())
 }
 
-/// A client holding all the raw: the models of an engine that held the same raw are verified by
-/// the model verifier and their solutions by the solution verifier and the assignment check; the
-/// models of engines that held only part of it are not the client's to verify (their members
-/// and citations differ from what its raw gives), so they count on their signatures alone; and
-/// where two of those are incomparable, the client solves the transmission itself.
-/// A client holding the raw verifies only what its verifier implements: an engine on another
-/// specification version derives other models from the same raw, so its models are neither
-/// verified nor failed, and their solutions count on their signatures, not dropped.
-#[test]
-fn a_model_of_another_specification_version_counts_by_signature_and_is_not_failed()
--> Result<(), String> {
-    let world = world()?;
-    let older = resign_as(
-        &world.full,
-        &Identity::from_seed([46; 32]),
-        Some(SPEC_VERSION - 1),
-    )?;
-    let mut merge = Merge::new(Settings::new(true));
-    feed(&mut merge, &world.raw, world.now)?;
-    feed(&mut merge, &older, world.now)?;
-    assert!(!fixes(&merge).is_empty());
-    for fix in fixes(&merge) {
-        assert_eq!(fix.check, Check::Signature, "{:06x}", fix.address);
-    }
-    Ok(())
-}
-
-#[test]
-fn holding_the_raw_verifies_every_model_and_solves_the_union_of_incomparable_sets()
--> Result<(), String> {
-    let world = world()?;
-    let mut alone = Merge::new(Settings::new(true));
-    feed(&mut alone, &world.raw, world.now)?;
-    assert!(alone.held() > 0);
-    feed(&mut alone, &world.full, world.now)?;
-    assert!(!alone.tracks().is_empty());
-    for fix in fixes(&alone) {
-        assert_eq!(fix.check, Check::Model, "{:06x}", fix.address);
-    }
-    let mut merge = Merge::new(Settings::new(true));
-    feed(&mut merge, &world.raw, world.now)?;
-    feed(&mut merge, &world.west, world.now)?;
-    feed(&mut merge, &world.east, world.now)?;
-    assert!(!merge.tracks().is_empty());
-    let resolved: Vec<&Transmission> = transmissions(&merge)
-        .into_iter()
-        .filter(|transmission| transmission.current().check == Check::Resolved)
-        .collect();
-    assert!(!resolved.is_empty(), "{:?}", summary(&merge));
-    for transmission in resolved {
-        let current = transmission.current();
-        assert!(current.engines.is_empty());
-        for alternative in transmission.alternatives() {
-            assert_eq!(
-                current.observations.message(),
-                alternative.observations.message()
-            );
-            // The union holds at least as many observations as either side.
-            assert!(
-                current.observations.receptions().len()
-                    >= alternative.observations.receptions().len(),
-                "{:06x}",
-                current.address
-            );
-        }
-    }
-    Ok(())
-}
-
+/// A tagged fault proof, as a client is sent it, convicts: two tagged solutions of one tag set
+/// under one model, both signed by the west engine, that disagree by far more than the
+/// specification allows.
 #[test]
 fn a_fault_proof_convicts_its_engine_and_drops_what_stood_on_its_word_alone() -> Result<(), String>
 {
     let world = world()?;
     let witness = Identity::from_seed([44; 32]);
-    let mut merge = Merge::new(Settings::new(false));
-    feed(&mut merge, &world.west, world.now)?;
-    feed(&mut merge, &world.east, world.now)?;
+    let mut merge = Merge::new(Settings::default());
+    feed(&mut merge, &client(&world.west), world.now)?;
+    feed(&mut merge, &client(&world.east), world.now)?;
     // Some of the west engine's fixes (its even addresses') are also signed by a witness.
     let mut witnessed = Vec::new();
     for record in resign(&world.west, &witness)? {
         match record {
-            Record::Positions(positions) => {
-                let mut content = positions.solutions().map_err(text)?;
+            ClientRecord::Positions(positions) => {
+                let mut content = positions.get().tagged_solutions().map_err(text)?;
                 content
                     .solutions
                     .retain(|solution| solution.address % 2 == 0);
                 if !content.solutions.is_empty() {
-                    witnessed.push(Record::Positions(
-                        Positions::sign_solutions(&witness, &content).map_err(text)?,
-                    ));
+                    witnessed.push(tagged_record(&witness, &content, false)?);
                 }
             }
             record => witnessed.push(record),
@@ -492,26 +533,22 @@ fn a_fault_proof_convicts_its_engine_and_drops_what_stood_on_its_word_alone() ->
     feed(&mut merge, &witnessed, world.now)?;
     let west = world.west_key.public();
     assert!(fixes(&merge).iter().any(|fix| fix.engines == [west].into()));
-    // Two solutions of one observation set under one model, both signed by the west engine,
-    // that disagree by far more than the specification allows. (Two different models of one
-    // inputs are no fault from specification version 3: optimality, not bytes, is the rule.)
     let honest = solutions(&world.west)?
         .into_iter()
         .next()
         .ok_or("no solution")?;
     let mut moved = honest.clone();
     moved.lat_e7 += 10_000;
-    let first = match signed(&world.west_key, 50, honest)? {
-        Record::Positions(positions) => positions,
-        _ => return Err("not positions".to_owned()),
+    let positions = |record: ClientRecord| match record {
+        ClientRecord::Positions(positions) => Ok(positions.get().clone()),
+        _ => Err("not positions".to_owned()),
     };
-    let second = match signed(&world.west_key, 51, moved)? {
-        Record::Positions(positions) => positions,
-        _ => return Err("not positions".to_owned()),
-    };
+    let first = positions(signed(world, &world.west_key, 50, &honest)?)?;
+    let second = positions(signed(world, &world.west_key, 51, &moved)?)?;
     let proof = FaultProof::new(&first, 0, &second, 0).map_err(text)?;
+    let proof = ClientFaultProof::new(proof).map_err(|_| "a tagged proof refused")?;
     assert_eq!(
-        merge.ingest(&Record::FaultProof(proof), world.now)?,
+        merge.ingest(&ClientRecord::FaultProof(proof), world.now)?,
         Ingested::Fault
     );
     assert!(merge.is_faulted(&west));
@@ -526,7 +563,7 @@ fn a_fault_proof_convicts_its_engine_and_drops_what_stood_on_its_word_alone() ->
     );
     // Nothing the convicted engine signs counts any more.
     let left = summary(&merge);
-    feed(&mut merge, &world.west, world.now)?;
+    feed(&mut merge, &client(&world.west), world.now)?;
     assert_eq!(summary(&merge), left);
     Ok(())
 }
@@ -538,112 +575,25 @@ fn every_table_is_bounded() -> Result<(), String> {
         max_aircraft: 3,
         max_models: 4,
         max_pending: 2,
-        max_held: 1_000,
-        max_resolved: 1,
-        ..Settings::new(true)
+        ..Settings::default()
     };
     let mut merge = Merge::new(settings);
-    let mut backwards = world.west.clone();
+    let mut backwards = client(&world.west);
     backwards.reverse();
-    feed(&mut merge, &world.raw, world.now)?;
     feed(&mut merge, &backwards, world.now)?;
-    feed(&mut merge, &world.east, world.now)?;
+    feed(&mut merge, &client(&world.east), world.now)?;
     assert!(merge.tracks().len() <= 3);
     assert!(merge.models() <= 4);
-    assert!(merge.held() <= 1_000);
     assert!(merge.pending.len() <= 2);
-    assert!(merge.resolved.len() <= 1);
-    // Raw is forgotten by bin as the clock moves on.
-    merge.ingest(&world.raw[world.raw.len() - 1], world.now + 3_600_000)?;
-    assert!(merge.held() <= 1);
     Ok(())
-}
-
-/// The decoded model `records` publish under `id`.
-fn decoded(records: &[Record], id: &Hash) -> Result<tally_mlat_solver::ClockModel, String> {
-    for record in records {
-        if let Record::ClockModel(manifest) = record
-            && manifest.id() == *id
-        {
-            let content = manifest.content(&[]).map_err(text)?;
-            return publish::decode(&content.model, content.spec_version).map_err(text);
-        }
-    }
-    Err("no such model".to_owned())
-}
-
-fn signed(
-    identity: &Identity,
-    sequence: u64,
-    solution: tally_wire::Solution,
-) -> Result<Record, String> {
-    Positions::sign_solutions(
-        identity,
-        &SolutionsContent {
-            boot_id: 0xb007,
-            sequence: 2_000 + sequence,
-            issued_ms: 0,
-            spec_version: SPEC_VERSION,
-            solutions: vec![solution],
-        },
-    )
-    .map(Record::Positions)
-    .map_err(text)
-}
-
-/// One DF11 transmission both engines solved (they share a reception), and the east engine's
-/// receptions of it from receivers the west engine's solution does not cite.
-struct Shared {
-    west: tally_wire::Solution,
-    east: tally_wire::Solution,
-    others: Vec<tally_wire::Reception>,
 }
 
 fn is_df11(solution: &tally_wire::Solution) -> bool {
     solution.observations.message()[0] >> 3 == 11
 }
 
-fn shared(world: &World) -> Result<Shared, String> {
-    let east_all = solutions(&world.east)?;
-    for west in solutions(&world.west)?.into_iter().filter(is_df11) {
-        let cited: BTreeSet<PublicKey> = west
-            .observations
-            .receptions()
-            .iter()
-            .map(|reception| reception.receiver)
-            .collect();
-        for east in &east_all {
-            if east.address != west.address
-                || east.observations.message() != west.observations.message()
-                || east
-                    .observations
-                    .receptions()
-                    .iter()
-                    .all(|reception| !west.observations.receptions().contains(reception))
-            {
-                continue;
-            }
-            let others: Vec<tally_wire::Reception> = east
-                .observations
-                .receptions()
-                .iter()
-                .filter(|reception| !cited.contains(&reception.receiver))
-                .copied()
-                .collect();
-            if !others.is_empty() {
-                return Ok(Shared {
-                    west,
-                    east: east.clone(),
-                    others,
-                });
-            }
-        }
-    }
-    Err("no DF11 transmission both engines solved with receivers to spare".to_owned())
-}
-
-/// The transmission of a fix in `merge` whose observations are `set`.
-fn holding(merge: &Merge, address: u32, set: &ObservationSet) -> Option<usize> {
+/// The transmission of a fix in `merge` whose tags are `set`'s.
+fn holding(merge: &Merge, address: u32, set: &TaggedSet) -> Option<usize> {
     merge
         .track(address)?
         .transmissions
@@ -656,46 +606,33 @@ fn holding(merge: &Merge, address: u32, set: &ObservationSet) -> Option<usize> {
         })
 }
 
-/// A Mode S reply repeats its bytes exactly, milliseconds apart, to another interrogator. One
-/// engine's DF11 solution cut in two by receivers: the second half moved 50 ms later (counters
-/// and transmit time) is a second transmission with the same bytes, no reception in common and
-/// a transmit time well within what a rule by times would join, and is never joined; unmoved it
-/// is the same transmission, tied through the model, and joined.
+/// A Mode S reply repeats its bytes exactly, milliseconds apart, to another interrogator, so the
+/// bytes and transmit times never join two solutions: only a tag in common does. One engine's
+/// DF11 solution cut in two by receivers, the second half moved 50 ms later (counters and
+/// transmit time) or not: halves that share no tag are never joined (a client cannot tie them
+/// through a model, which needs the receivers' sites), and one tag in common joins them.
 #[test]
-fn identical_df11_replies_50_ms_apart_are_never_joined_and_a_tie_joins_the_same_one()
--> Result<(), String> {
+fn identical_df11_replies_are_joined_only_by_a_tag_in_common() -> Result<(), String> {
     let world = world()?;
     let whole = solutions(&world.west)?
         .into_iter()
         .filter(is_df11)
-        .find(|solution| {
-            let model = decoded(&world.west, &solution.clock_model);
-            solution.observations.receptions().len() >= 4
-                && model.is_ok_and(|model| {
-                    solution.observations.receptions().iter().all(|reception| {
-                        model.scope.iter().any(|site| {
-                            site.receiver == reception.receiver
-                                && tally_mlat_solver::Timebase::of(site.clock)
-                                    == Some(tally_mlat_solver::Timebase::Mhz12)
-                        })
-                    })
-                })
-        })
-        .ok_or("no DF11 solution of four 12 MHz receptions")?;
+        .find(|solution| solution.observations.receptions().len() >= 4)
+        .ok_or("no DF11 solution of four receptions")?;
     let receptions = whole.observations.receptions();
     let half = receptions.len() / 2;
     let message = whole.observations.message().to_vec();
     let mut first = whole.clone();
     first.observations =
         ObservationSet::new(message.clone(), receptions[..half].to_vec()).map_err(text)?;
-    for (shift_ms, joined) in [(50u64, false), (0, true)] {
+    for (shift_ms, shared, joined) in [(50u64, false, false), (0, false, false), (0, true, true)] {
         let mut later = whole.clone();
         later.transmitted = TransmitTime::new(
             later.transmitted.unix_ms + shift_ms,
             later.transmitted.sub_ms_ps,
         )
         .map_err(text)?;
-        let moved = receptions[half..]
+        let mut moved: Vec<tally_wire::Reception> = receptions[half..]
             .iter()
             .map(|reception| tally_wire::Reception {
                 // 12 MHz: 12 000 counts a millisecond.
@@ -703,90 +640,20 @@ fn identical_df11_replies_50_ms_apart_are_never_joined_and_a_tie_joins_the_same_
                 ..*reception
             })
             .collect();
+        if shared {
+            moved.push(receptions[0]);
+        }
         later.observations = ObservationSet::new(message.clone(), moved).map_err(text)?;
-        let mut merge = Merge::new(Settings::new(false));
+        let mut merge = Merge::new(Settings::default());
         feed(&mut merge, &models(&world.west), world.now)?;
-        merge.ingest(&signed(&world.west_key, 0, first.clone())?, world.now)?;
-        merge.ingest(&signed(&world.west_key, 1, later.clone())?, world.now)?;
-        let a = holding(&merge, whole.address, &first.observations);
-        let b = holding(&merge, whole.address, &later.observations);
+        merge.ingest(&signed(world, &world.west_key, 0, &first)?, world.now)?;
+        merge.ingest(&signed(world, &world.west_key, 1, &later)?, world.now)?;
+        let a = holding(&merge, whole.address, &tag(world, &first)?.observations);
+        let b = holding(&merge, whole.address, &tag(world, &later)?.observations);
         assert!(a.is_some() && b.is_some(), "{a:?} {b:?}");
-        assert_eq!(a == b, joined, "shifted {shift_ms} ms");
+        assert_eq!(a == b, joined, "shifted {shift_ms} ms, shared {shared}");
     }
     Ok(())
-}
-
-/// Two engines whose gauges' time origins are far apart (the west's GNSS, the east's a receiver's
-/// wall clock, which reads `HOST_CLOCK_LATE_MS` late) solve one transmission; with every shared reception taken out of the east's, they
-/// are still matched, through the tie the west's receptions make in the east's model. The same
-/// receptions moved 50 ms later are not.
-#[test]
-fn gauges_far_apart_are_matched_by_a_tie_with_no_reception_in_common() -> Result<(), String> {
-    let world = world()?;
-    let shared = shared(world)?;
-    let gap_ms = shared
-        .west
-        .transmitted
-        .unix_ps()
-        .abs_diff(shared.east.transmitted.unix_ps())
-        / 1_000_000_000;
-    // Far beyond the tie's microseconds, and beyond what any rule by transmit times could
-    // accept as one transmission (the replies of the other test are 50 ms apart).
-    assert!(gap_ms >= 50, "the origins are only {gap_ms} ms apart");
-    for (shift_ms, joined) in [(0u64, true), (50, false)] {
-        let mut east = shared.east.clone();
-        east.transmitted = TransmitTime::new(
-            east.transmitted.unix_ms + shift_ms,
-            east.transmitted.sub_ms_ps,
-        )
-        .map_err(text)?;
-        let moved = shared
-            .others
-            .iter()
-            .map(|reception| tally_wire::Reception {
-                counter: reception.counter + shift_ms * 12_000,
-                ..*reception
-            })
-            .collect();
-        east.observations =
-            ObservationSet::new(east.observations.message().to_vec(), moved).map_err(text)?;
-        let mut merge = Merge::new(Settings::new(false));
-        feed(&mut merge, &models(&world.west), world.now)?;
-        feed(&mut merge, &models(&world.east), world.now)?;
-        merge.ingest(&signed(&world.west_key, 0, shared.west.clone())?, world.now)?;
-        merge.ingest(&signed(&world.east_key, 0, east.clone())?, world.now)?;
-        let a = holding(&merge, shared.west.address, &shared.west.observations);
-        let b = holding(&merge, shared.west.address, &east.observations);
-        assert!(a.is_some() && b.is_some(), "{a:?} {b:?}");
-        assert_eq!(
-            a == b,
-            joined,
-            "shifted {shift_ms} ms, origins {gap_ms} ms apart"
-        );
-    }
-    Ok(())
-}
-
-/// `solution` as a provisional record by `identity`: no addressed citation, as a provisional
-/// names none.
-fn early(
-    identity: &Identity,
-    sequence: u64,
-    mut solution: tally_wire::Solution,
-) -> Result<Record, String> {
-    solution.addressed = tally_wire::AddressedCitation::default();
-    Positions::sign_provisional(
-        identity,
-        &SolutionsContent {
-            boot_id: 0xb007,
-            sequence,
-            issued_ms: 0,
-            spec_version: SPEC_VERSION,
-            solutions: vec![solution],
-        },
-    )
-    .map(Record::Provisional)
-    .map_err(text)
 }
 
 #[test]
@@ -798,10 +665,10 @@ fn a_provisional_fix_is_served_while_it_is_later_and_superseded_by_a_final_of_it
         .next()
         .ok_or("no solution")?;
     let address = final_one.address;
-    let mut merge = Merge::new(Settings::new(false));
+    let mut merge = Merge::new(Settings::default());
     feed(&mut merge, &models(&world.west), world.now)?;
     // The same transmission, solved a second after it was heard: held and served.
-    let ingested = merge.ingest(&early(&world.west_key, 0, final_one.clone())?, world.now)?;
+    let ingested = merge.ingest(&early(world, &world.west_key, 0, &final_one)?, world.now)?;
     assert_eq!(
         ingested,
         Ingested::Provisional {
@@ -814,16 +681,15 @@ fn a_provisional_fix_is_served_while_it_is_later_and_superseded_by_a_final_of_it
         .and_then(Track::served)
         .ok_or("nothing served")?;
     assert_eq!(served.kind, Kind::Provisional);
-    assert_eq!(served.check, Check::Signature);
     // The final one of the same transmission arrives: it supersedes the provisional, which is
     // served no more.
-    merge.ingest(&signed(&world.west_key, 0, final_one.clone())?, world.now)?;
+    merge.ingest(&signed(world, &world.west_key, 0, &final_one)?, world.now)?;
     let track = merge.track(address).ok_or("no track")?;
     assert!(track.provisional.is_empty());
     assert_eq!(track.served().map(|fix| fix.kind), Some(Kind::Final));
     assert_eq!(merge.provisional_counts().superseded, 1);
     // A provisional arriving after the final of its transmission is not held.
-    let late = merge.ingest(&early(&world.west_key, 1, final_one)?, world.now)?;
+    let late = merge.ingest(&early(world, &world.west_key, 1, &final_one)?, world.now)?;
     assert_eq!(
         late,
         Ingested::Provisional {
@@ -852,10 +718,10 @@ fn a_later_provisional_is_served_over_a_final_and_an_unconfirmed_one_is_retracte
     stray.transmitted =
         TransmitTime::new(final_one.transmitted.unix_ms + 30_000, 0).map_err(text)?;
     stray.lat_e7 += 1_000_000;
-    let mut merge = Merge::new(Settings::new(false));
+    let mut merge = Merge::new(Settings::default());
     feed(&mut merge, &models(&world.west), world.now)?;
-    merge.ingest(&signed(&world.west_key, 0, final_one)?, world.now)?;
-    merge.ingest(&early(&world.west_key, 0, stray)?, world.now)?;
+    merge.ingest(&signed(world, &world.west_key, 0, &final_one)?, world.now)?;
+    merge.ingest(&early(world, &world.west_key, 0, &stray)?, world.now)?;
     let served = merge
         .track(address)
         .and_then(Track::served)
@@ -863,7 +729,10 @@ fn a_later_provisional_is_served_over_a_final_and_an_unconfirmed_one_is_retracte
     assert_eq!(served.kind, Kind::Provisional, "the later is served");
     // Its deadline passes, by the client's clock, with nothing to confirm it: retracted, and
     // counted against its engine.
-    merge.ingest(&Record::Heartbeat, world.now + PROVISIONAL_DEADLINE_MS + 1)?;
+    merge.ingest(
+        &ClientRecord::Heartbeat,
+        world.now + PROVISIONAL_DEADLINE_MS + 1,
+    )?;
     let track = merge.track(address).ok_or("the final track went with it")?;
     assert!(track.provisional.is_empty());
     assert_eq!(track.served().map(|fix| fix.kind), Some(Kind::Final));
@@ -885,14 +754,15 @@ fn a_signer_is_held_to_two_provisionals_an_aircraft_a_second() -> Result<(), Str
         .collect();
     assert_eq!(theirs.len(), 3, "too few transmissions of one aircraft");
     let second = theirs[0].transmitted.unix_ms / 1000 * 1000;
-    let mut merge = Merge::new(Settings::new(false));
+    let mut merge = Merge::new(Settings::default());
     feed(&mut merge, &models(&world.west), world.now)?;
     let mut accepted = 0;
     for (at, mut solution) in theirs.into_iter().enumerate() {
         solution.transmitted = TransmitTime::new(second + at as u64 * 100, 0).map_err(text)?;
-        if let Ingested::Provisional { accepted: one, .. } =
-            merge.ingest(&early(&world.west_key, at as u64, solution)?, world.now)?
-        {
+        if let Ingested::Provisional { accepted: one, .. } = merge.ingest(
+            &early(world, &world.west_key, at as u64, &solution)?,
+            world.now,
+        )? {
             accepted += one;
         }
     }
@@ -918,11 +788,14 @@ fn a_live_engines_provisionals_are_superseded_or_confirmed_by_its_finals() -> Re
         },
     );
     let published = tally_mlat::replay::replay(&mut engine, &delivered, 100, until)?;
-    let mut merge = Merge::new(Settings::new(false));
+    let mut merge = Merge::new(Settings::default());
     let mut served_provisional = 0;
-    for (at, record) in &published {
-        merge.ingest(record, *at)?;
-        if matches!(record, Record::Provisional(_)) {
+    for (at, record) in published {
+        let Ok(record) = ClientRecord::try_from(record) else {
+            continue;
+        };
+        merge.ingest(&record, at)?;
+        if matches!(record, ClientRecord::Provisional(_)) {
             served_provisional += merge
                 .tracks()
                 .iter()
@@ -935,7 +808,7 @@ fn a_live_engines_provisionals_are_superseded_or_confirmed_by_its_finals() -> Re
         }
     }
     let end = until + PROVISIONAL_DEADLINE_MS + 1;
-    merge.ingest(&Record::Heartbeat, end)?;
+    merge.ingest(&ClientRecord::Heartbeat, end)?;
     let counts = merge.provisional_counts();
     eprintln!("{counts:?}");
     assert!(counts.accepted >= 200, "{counts:?}");

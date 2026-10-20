@@ -16,6 +16,7 @@ use blake2::{Blake2s256, Digest};
 use crate::WireError;
 use crate::batch::{Hash, domain};
 use crate::key::PublicKey;
+use crate::site::{ReceptionKey, ReceptionTag, TAG_LEN};
 
 /// What an observation set's hash is computed under, so it can never equal any other hash.
 const SET_DOMAIN: &[u8] = b"tally observation set";
@@ -135,33 +136,7 @@ impl ObservationSet {
         if self.message != other.message {
             return Relation::Incomparable;
         }
-        let (mine, theirs) = (&self.receptions, &other.receptions);
-        let (mut i, mut j) = (0, 0);
-        let (mut only_mine, mut only_theirs) = (false, false);
-        while i < mine.len() && j < theirs.len() {
-            match mine[i].cmp(&theirs[j]) {
-                Ordering::Equal => {
-                    i += 1;
-                    j += 1;
-                }
-                Ordering::Less => {
-                    only_mine = true;
-                    i += 1;
-                }
-                Ordering::Greater => {
-                    only_theirs = true;
-                    j += 1;
-                }
-            }
-        }
-        only_mine |= i < mine.len();
-        only_theirs |= j < theirs.len();
-        match (only_mine, only_theirs) {
-            (false, false) => Relation::Equal,
-            (false, true) => Relation::Subset,
-            (true, false) => Relation::Superset,
-            (true, true) => Relation::Incomparable,
-        }
+        sorted_relation(&self.receptions, &other.receptions)
     }
 
     pub fn is_subset_of(&self, other: &Self) -> bool {
@@ -179,6 +154,145 @@ impl ObservationSet {
             let mut receptions = self.receptions.clone();
             receptions.extend_from_slice(&other.receptions);
             Self::new(self.message.clone(), receptions)
+        })
+    }
+
+    /// The set as a client sees it: each reception replaced by its tag, made under the reception
+    /// key `key_of` gives for its receiver (from the receiver's site-bearing record current when it
+    /// was heard). Refused: a receiver `key_of` has no key for.
+    pub fn tagged(
+        &self,
+        key_of: impl Fn(&PublicKey) -> Option<ReceptionKey>,
+    ) -> Result<TaggedSet, WireError> {
+        let tags = self
+            .receptions
+            .iter()
+            .map(|reception| {
+                let key = key_of(&reception.receiver).ok_or(WireError::Invalid {
+                    field: "a reception with no site-bearing record",
+                    value: 0,
+                })?;
+                ReceptionTag::of(&key, reception.epoch, reception.counter, &self.message)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        TaggedSet::new(self.message.clone(), tags)
+    }
+}
+
+/// How two strictly ascending lists stand to each other, by one merge pass.
+fn sorted_relation<T: Ord>(mine: &[T], theirs: &[T]) -> Relation {
+    let (mut i, mut j) = (0, 0);
+    let (mut only_mine, mut only_theirs) = (false, false);
+    while i < mine.len() && j < theirs.len() {
+        match mine[i].cmp(&theirs[j]) {
+            Ordering::Equal => {
+                i += 1;
+                j += 1;
+            }
+            Ordering::Less => {
+                only_mine = true;
+                i += 1;
+            }
+            Ordering::Greater => {
+                only_theirs = true;
+                j += 1;
+            }
+        }
+    }
+    only_mine |= i < mine.len();
+    only_theirs |= j < theirs.len();
+    match (only_mine, only_theirs) {
+        (false, false) => Relation::Equal,
+        (false, true) => Relation::Subset,
+        (true, false) => Relation::Superset,
+        (true, true) => Relation::Incomparable,
+    }
+}
+
+/// What a tagged set's hash is computed under: never an `ObservationSet`'s.
+const TAGGED_SET_DOMAIN: &[u8] = b"tally tagged observation set";
+
+/// The observations one solution used, as a client sees them (wire version 3): the message, and
+/// each reception as its `ReceptionTag` in place of (receiver, epoch, counter), so no client learns
+/// a receiver's counters (`crate::site`). Kept sorted by tag and without repeats, so the same
+/// receptions are the same bytes from every engine, and sets merge exactly as `ObservationSet`s
+/// do: the same set is a duplicate, a superset wins, incomparable sets are never fused.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct TaggedSet {
+    message: Vec<u8>,
+    tags: Vec<ReceptionTag>,
+}
+
+impl TaggedSet {
+    /// Sorts the tags and drops repeats. Refuses an empty set and a message or set too long for
+    /// its one-byte length.
+    pub fn new(message: Vec<u8>, mut tags: Vec<ReceptionTag>) -> Result<Self, WireError> {
+        if message.len() > MAX_MESSAGE_LEN {
+            return Err(WireError::Oversize(message.len()));
+        }
+        tags.sort_unstable();
+        tags.dedup();
+        if tags.is_empty() {
+            return Err(WireError::Invalid {
+                field: "observation set size",
+                value: 0,
+            });
+        }
+        if tags.len() > MAX_OBSERVATIONS {
+            return Err(WireError::Oversize(tags.len()));
+        }
+        Ok(Self { message, tags })
+    }
+
+    pub fn message(&self) -> &[u8] {
+        &self.message
+    }
+
+    /// Ascending.
+    pub fn tags(&self) -> &[ReceptionTag] {
+        &self.tags
+    }
+
+    /// Message length (one byte), message, count (one byte), each tag (16) ascending.
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(2 + self.message.len() + self.tags.len() * TAG_LEN);
+        // Both lengths were bounded to a byte when the set was built.
+        out.push(self.message.len() as u8);
+        out.extend_from_slice(&self.message);
+        out.push(self.tags.len() as u8);
+        for tag in &self.tags {
+            out.extend_from_slice(&tag.0);
+        }
+        out
+    }
+
+    /// BLAKE2s-256 over `"tally tagged observation set" 0x00` and the canonical encoding.
+    pub fn hash(&self) -> Hash {
+        Blake2s256::digest(domain(TAGGED_SET_DOMAIN, &self.canonical_bytes())).into()
+    }
+
+    /// As `ObservationSet::relation`, by tags.
+    pub fn relation(&self, other: &Self) -> Relation {
+        if self.message != other.message {
+            return Relation::Incomparable;
+        }
+        sorted_relation(&self.tags, &other.tags)
+    }
+
+    pub fn is_subset_of(&self, other: &Self) -> bool {
+        matches!(self.relation(other), Relation::Equal | Relation::Subset)
+    }
+
+    pub fn is_superset_of(&self, other: &Self) -> bool {
+        other.is_subset_of(self)
+    }
+
+    /// As `ObservationSet::union`.
+    pub fn union(&self, other: &Self) -> Option<Result<Self, WireError>> {
+        (self.message == other.message).then(|| {
+            let mut tags = self.tags.clone();
+            tags.extend_from_slice(&other.tags);
+            Self::new(self.message.clone(), tags)
         })
     }
 }
@@ -350,6 +464,32 @@ pub(crate) mod tests {
             Citations::of(&[two, one, two])?
         );
         assert_ne!(Citations::of(&[one])?, Citations::of(&[two])?);
+        Ok(())
+    }
+
+    #[test]
+    fn a_tagged_set_relates_as_its_raw_set_does() -> Result<(), WireError> {
+        let keys = |seed: u8| Some(ReceptionKey::of_signed(&[seed]));
+        let key_of = |receiver: &PublicKey| {
+            (1..=3u8)
+                .find(|seed| key(*seed) == *receiver)
+                .and_then(keys)
+        };
+        let (a, b, c) = (reception(1, 0, 1), reception(2, 0, 2), reception(3, 0, 3));
+        let ab = set(&[a, b])?.tagged(key_of)?;
+        let abc = set(&[c, b, a])?.tagged(key_of)?;
+        let bc = set(&[b, c])?.tagged(key_of)?;
+        assert_eq!(ab, set(&[b, a])?.tagged(key_of)?);
+        assert_eq!(ab.relation(&abc), Relation::Subset);
+        assert_eq!(abc.relation(&ab), Relation::Superset);
+        assert_eq!(ab.relation(&bc), Relation::Incomparable);
+        assert_eq!(ab.union(&bc).transpose()?, Some(abc.clone()));
+        assert_ne!(ab.hash(), set(&[a, b])?.hash());
+        assert_eq!(ab.tags().len(), 2);
+        assert!(ab.tags().windows(2).all(|pair| pair[0] < pair[1]));
+        // No key for a receiver: refused, never tagged by anything else.
+        assert!(set(&[reception(9, 0, 1)])?.tagged(key_of).is_err());
+        assert!(TaggedSet::new(vec![1], Vec::new()).is_err());
         Ok(())
     }
 

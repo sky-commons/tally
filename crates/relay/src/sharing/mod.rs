@@ -971,28 +971,35 @@ impl Sharing {
 /// The group a record belongs to (RFC-0174 §2.5): one rule, the same for its origin and every
 /// member, so a record is shared in exactly one group.
 ///
-/// - A receiver's batch: the area (`rendezvous::AREA_RESOLUTION`) of the receiver's signed
-///   location (`point`, as the hub projects it), product `RAW`. No located description, no group.
+/// - A receiver's batch: the area of the receiver's public cell (`point`, its description's;
+///   `rendezvous::area_of_public`, the cell's parent at `AREA_RESOLUTION`), product `RAW`. Never
+///   the area its site lies in, which can differ and so says more than the public cell. No
+///   public cell, no group.
 /// - Final or provisional positions: the area of the record's first solution, product
 ///   `POSITIONS` or `PROVISIONAL` (an engine packs a record's solutions in tile order, so a record
 ///   is nearly always one area's).
 /// - A clock model manifest: the area of its tile's centre (`point`, from its inline bytes or its
 ///   first part), product `CLOCK_MODELS`. Its parts are in no group: every member link carries a
 ///   model's parts just before its manifest (`link`'s `Told`).
-/// - A regional batch: its cell's area, product `REGIONAL`.
+/// - A regional batch: its cell's area, product `REGIONAL`; its client form (counters stripped)
+///   likewise, beside it. A client clock model goes with its full model, positions tagged for
+///   clients with their raw twins (each placed by its own first solution, which is the same).
 /// - A fault proof: the group of the first solutions record it holds, or of its models.
 pub fn group_of(record: &Record, point: Option<Region>) -> Option<(Region, Streams)> {
     let area_at = tally_wire::rendezvous::area_of_cell;
     match record {
-        Record::Batch(_) => Some((area_at(point?)?, Streams::RAW)),
+        Record::Batch(_) => Some((
+            tally_wire::rendezvous::area_of_public(point?)?,
+            Streams::RAW,
+        )),
         Record::Positions(_) | Record::Provisional(_) => {
-            let content = match record {
+            let solved = match record {
                 Record::Positions(positions) | Record::Provisional(positions) => {
-                    positions.solutions().ok()?
+                    crate::network::solved(positions)?
                 }
                 _ => return None,
             };
-            let first = content.solutions.first()?;
+            let first = solved.first()?;
             let point = Region::point(&tally_wire::Location {
                 lat_e7: first.lat_e7,
                 lon_e7: first.lon_e7,
@@ -1007,8 +1014,14 @@ pub fn group_of(record: &Record, point: Option<Region>) -> Option<(Region, Strea
             };
             Some((area_at(point)?, product))
         }
-        Record::ClockModel(_) => Some((area_at(point?)?, Streams::CLOCK_MODELS)),
+        // A client clock model with its full model: placed by the full model's tile (`point`).
+        Record::ClockModel(_) | Record::ClientClockModel(_) => {
+            Some((area_at(point?)?, Streams::CLOCK_MODELS))
+        }
         Record::RegionalBatch(regional) => {
+            Some((area_at(regional.content().ok()?.cell)?, Streams::REGIONAL))
+        }
+        Record::ClientRegionalBatch(regional) => {
             Some((area_at(regional.content().ok()?.cell)?, Streams::REGIONAL))
         }
         // A fault proof travels with what it is about: the first of its two solutions' records,

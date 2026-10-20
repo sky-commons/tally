@@ -358,6 +358,8 @@ pub fn record_hash(record: &Record) -> Option<Hash> {
         Record::ClockModel(model) => Some(model.id()),
         Record::ClockModelPart(part) => Some(part.hash()),
         Record::RegionalBatch(regional) => Some(regional.hash()),
+        Record::ClientRegionalBatch(regional) => Some(regional.hash()),
+        Record::ClientClockModel(model) => Some(model.hash()),
         Record::WorldPositions(world) => Some(world.hash()),
         _ => None,
     }

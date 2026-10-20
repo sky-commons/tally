@@ -126,6 +126,36 @@ impl ObsRef {
     }
 }
 
+/// One reception as a client may be given it (wire version 3, `crate::client`): its message and
+/// nothing of the receiver that heard it. A reception's counter is the receiver's clock, which
+/// reverse multilateration against the aircraft positions anyone reads turns into the site, and its
+/// signal level ranges the receiver against those positions; both are relay-only, so this form has
+/// no room for either. It is what the relay's BEAST output (`--beast-out`) writes, the feed every
+/// public map and API over a relay decodes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ClientObsView<'a> {
+    pub format: u8,
+    pub data: &'a [u8],
+}
+
+impl<'a> From<ObsView<'a>> for ClientObsView<'a> {
+    fn from(view: ObsView<'a>) -> Self {
+        Self {
+            format: view.format,
+            data: view.data,
+        }
+    }
+}
+
+impl ClientObsView<'_> {
+    /// The BEAST frame, for a format BEAST carries: its counter and signal level zero, as a
+    /// decoder reads a frame from a source that stamps neither.
+    pub fn to_beast(&self) -> Option<Frame> {
+        let kind = FrameKind::from_type_byte(self.format)?;
+        Frame::new(kind, 0, 0, self.data).ok()
+    }
+}
+
 /// One reception borrowed: from a decoded batch or from an owned `Observation`, so a reader of
 /// receptions takes either without a copy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -632,6 +662,34 @@ mod tests {
                     .collect(),
             })
             .collect()
+    }
+
+    /// A client's frame of a reception is its message alone: the same message heard at another
+    /// counter, or louder, is the same frame, with counter and signal zero; a format BEAST does
+    /// not carry has none.
+    #[test]
+    fn a_clients_frame_has_no_counter_and_no_signal() -> Result<(), WireError> {
+        for observation in observations() {
+            let view = ObsView::from(&observation);
+            let client = ClientObsView::from(view).to_beast();
+            if observation.format == format::UAT_UPLINK {
+                assert_eq!(client, None);
+                continue;
+            }
+            let frame = client.ok_or(WireError::Invalid {
+                field: "frame",
+                value: 0,
+            })?;
+            assert_eq!((frame.timestamp(), frame.signal()), (0, 0));
+            assert_eq!(frame.message(), observation.data.as_slice());
+            let elsewhere = ObsView {
+                timestamp: observation.timestamp + 12_345,
+                signal: observation.signal.wrapping_add(80),
+                ..view
+            };
+            assert_eq!(ClientObsView::from(elsewhere).to_beast(), Some(frame));
+        }
+        Ok(())
     }
 
     #[test]
