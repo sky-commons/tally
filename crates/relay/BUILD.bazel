@@ -2,6 +2,7 @@ load("@rules_rust//cargo:defs.bzl", "extract_cargo_lints")
 load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test", "rustfmt_test")
 load("//build:opt.bzl", "opt_test")
 load("//build:resources.bzl", "test_size")
+load("//build:run_test.bzl", "run_test")
 load("//build:version.bzl", "VERSION")
 
 package(default_visibility = ["//:__subpackages__"])
@@ -51,14 +52,84 @@ rust_binary(
     ],
 )
 
-# Medium: 12 s on 32 loaded cores here, past small's 60 s on one remote core (2026-10-07).
+# The crate's unit tests, one target per module of the crate (its tests are `<module>::...`), each
+# as tight as it runs: a target is the unit of caching and of a rerun, so one slow module no
+# longer holds the rest to its size, nor reruns them. Measured on two test threads (CI's two
+# cores) with the debug build, on a loaded 32-core box (load 72), 2026-10-20: past 20 s is medium,
+# the rest small. A module's tests are those whose path holds `<module>::` (libtest's filter is a
+# substring); the binary's own guard (`targets::every_test_has_one_target`, in src/lib.rs), which
+# every target runs beside its module, fails every target unless each test is matched by exactly
+# one module here and each module matches a test: a module added without a line here, or a name
+# another module's paths contain (`os::` in a `pos::`), cannot pass, green.
+_UNIT_TEST_MODULES = {
+    "admission": "small",  # under 0.1 s
+    "bounded": "small",  # under 0.1 s
+    "budget": "small",  # 1.1 s
+    "ceiling": "small",  # under 0.1 s
+    "config": "small",  # under 0.1 s
+    "consistency": "small",  # 7.8 s
+    "cores": "small",  # under 0.1 s
+    "credit": "small",  # 1.8 s
+    "delivery": "medium",  # 27.3 s
+    "directory": "medium",  # 23.9 s
+    "egress": "small",  # 0.1 s
+    "exchange": "small",  # under 0.1 s
+    "fanout": "small",  # under 0.1 s
+    "figures": "small",  # under 0.1 s
+    "hub": "small",  # 6.1 s
+    "ingest": "small",  # 0.5 s
+    "link": "small",  # 12.0 s
+    "listeners": "small",  # 1.0 s
+    "mlat_host": "medium",  # 29.0 s
+    "network": "small",  # 0.1 s
+    "os": "small",  # under 0.1 s
+    "outbound": "small",  # under 0.1 s
+    "parts": "small",  # under 0.1 s
+    "peers": "small",  # under 0.1 s
+    "products": "medium",  # 21.8 s
+    "seal": "small",  # under 0.1 s
+    "selection": "small",  # 0.8 s
+    "sharing": "medium",  # 27.4 s
+    "shed": "small",  # 4.6 s
+    "sockets": "small",  # under 0.1 s
+    "standing": "small",  # 0.2 s
+    "stations": "small",  # under 0.1 s
+    "stats": "small",  # under 0.1 s
+    "subscription": "small",  # 0.5 s
+}
+
+# The test binary the targets below run, built once; never on its own (it would run every module
+# at once, past any one size).
 rust_test(
-    name = "relay_test",
-    size = "medium",
+    name = "relay_test_binary",
     crate = ":relay",
     edition = "2024",
     lint_config = ":cargo_lints",
+    # The filters of the targets below, which the guard holds the binary's tests to.
+    rustc_env = {
+        "RELAY_TEST_FILTERS": " ".join([module + "::" for module in _UNIT_TEST_MODULES]),
+    },
+    tags = ["manual"],
     deps = ["@tally_crates//:serde_json"],
+)
+
+[
+    run_test(
+        name = "relay_test_" + module,
+        size = size,
+        # Its module's tests, and the guard that every test here is one target's.
+        args = [
+            module + "::",
+            "every_test_has_one_target",
+        ],
+        test = ":relay_test_binary",
+    )
+    for module, size in _UNIT_TEST_MODULES.items()
+]
+
+test_suite(
+    name = "relay_test",
+    tests = ["relay_test_" + module for module in _UNIT_TEST_MODULES],
 )
 
 # A stand-in readsb, a real feeder, this relay and its subscribers, over loopback sockets.
@@ -304,7 +375,7 @@ rustfmt_test(
         ":mlat_host_binary",
         ":panic",
         ":relay",
-        ":relay_test",
+        ":relay_test_binary",
         ":staged",
         ":staged_mlat",
         ":tally-relay",
