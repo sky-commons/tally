@@ -46,9 +46,6 @@ pub struct Settings {
     /// The relays to subscribe to; none serves no MLAT.
     pub relays: Vec<RelayAddress>,
     pub max_age: Duration,
-    /// This client's key file (`--key`): what the relays know it by. Without one a fresh key each
-    /// run, which no relay vouches for.
-    pub key_file: Option<String>,
     /// The relay that vouches for this client's key (`--linked-relay`, one of `relays`): the
     /// firehose credential it signs is presented to every relay read.
     pub linked: Option<RelayAddress>,
@@ -59,21 +56,8 @@ impl Default for Settings {
         Self {
             relays: Vec::new(),
             max_age: DEFAULT_MAX_AGE,
-            key_file: None,
             linked: None,
         }
-    }
-}
-
-/// This client's identity: the key file's when one is named, else a fresh key.
-pub fn identity(settings: &Settings) -> Result<Identity, String> {
-    match &settings.key_file {
-        Some(path) => {
-            let text =
-                std::fs::read_to_string(path).map_err(|error| format!("--key {path}: {error}"))?;
-            Identity::from_base64(text.trim()).map_err(|error| format!("--key {path}: {error}"))
-        }
-        None => Identity::generate().map_err(|error| error.to_string()),
     }
 }
 
@@ -321,13 +305,13 @@ impl Positions {
 /// the API runs.
 pub fn start(
     settings: &Settings,
+    identity: Identity,
     positions: Arc<Positions>,
     feeders: Arc<Mutex<Ledger>>,
 ) -> Result<(), String> {
     if settings.relays.is_empty() {
         return Ok(());
     }
-    let identity = identity(settings)?;
     // One vouching shared by every session: what the linked relay signs is presented to all.
     let vouching = match &settings.linked {
         Some(linked) => tally_merge::link::Vouching::linked_to(linked.key),
@@ -481,33 +465,6 @@ mod tests {
             gs_kt: None,
             track_deg: None,
         }
-    }
-
-    /// The key the operator names is the client's; with none, a fresh one.
-    #[test]
-    fn the_identity_is_the_key_files_and_fresh_without_one() -> Result<(), String> {
-        let named = Identity::from_seed([9; 32]);
-        let path = std::env::temp_dir().join(format!(
-            "tally-api-key-{}-{}",
-            std::process::id(),
-            named.public().to_base64url()
-        ));
-        std::fs::write(&path, format!("{}\n", named.to_base64())).map_err(|e| e.to_string())?;
-        let settings = Settings {
-            key_file: Some(path.display().to_string()),
-            ..Settings::default()
-        };
-        let read = identity(&settings);
-        let _ = std::fs::remove_file(&path);
-        assert_eq!(read?.public(), named.public());
-        let fresh = identity(&Settings::default())?;
-        assert_ne!(fresh.public(), named.public());
-        let missing = Settings {
-            key_file: Some("/nonexistent/tally-api.key".to_owned()),
-            ..Settings::default()
-        };
-        assert!(identity(&missing).is_err());
-        Ok(())
     }
 
     #[test]

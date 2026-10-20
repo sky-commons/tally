@@ -390,11 +390,11 @@ mod tests {
                 > Allowance::FREE.bytes_per_sec
         })
         .await?;
-        let lifted = credit.allowance(&client.public(), now_ms());
-        assert_eq!(
-            lifted.bytes_per_sec,
-            credit.earned(&linked.public(), now_ms())
-        );
+        // One instant for both: what a relay has earned moves with the clock, so two readings a
+        // millisecond apart can differ by a byte a second.
+        let at = now_ms();
+        let lifted = credit.allowance(&client.public(), at);
+        assert_eq!(lifted.bytes_per_sec, credit.earned(&linked.public(), at));
         assert!(lifted.world && lifted.regions > Allowance::FREE.regions);
         // A client with no linked relay, and one linked to a relay other than the one that signs
         // for it, read the free tier.
