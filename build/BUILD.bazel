@@ -2,5 +2,6 @@
 exports_files([
     "opt.bzl",
     "resources.bzl",
+    "run_test.bzl",
     "version.bzl",
 ])
