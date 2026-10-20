@@ -21,7 +21,7 @@ use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 use tally_api::Settings;
 use tally_api_types::{
-    Aircraft, AircraftResponse, AircraftUpdate, Feed, MeResponse, MlatCheck, Network, Position,
+    Aircraft, AircraftResponse, AircraftUpdate, Feed, MeResponse, MlatCheck, Network,
     PositionSource, SourceCounts, Station, fixtures,
 };
 use tally_merge::Merge;
@@ -416,13 +416,14 @@ async fn the_api_serves_aircraft_the_network_and_a_station_from_readsb_and_a_rea
         ),
         (key.to_base64().as_str(), true, 1, Some("tally-feed test"))
     );
-    assert_eq!(
-        station.location,
-        Some(Position {
-            lat: 37.41,
-            lon: -122.1
-        })
+    // Served at its public pin, about 5 km from where it says it is, never the place itself.
+    let pin = station.location.ok_or("no pin")?;
+    assert!(pin.lat != 37.41 && pin.lon != -122.1, "{pin:?}");
+    assert!(
+        (pin.lat - 37.41).abs() < 0.05 && (pin.lon - -122.1).abs() < 0.07,
+        "{pin:?}"
     );
+    assert_eq!(station.state, tally_api_types::StationState::Feeding);
     assert!(station.first_seen_at_ms <= station.last_seen_at_ms);
     assert!(station.last_seen_at_ms <= station.now_ms);
     assert_eq!(header(&headers, &ACCESS_CONTROL_ALLOW_ORIGIN), SITE);

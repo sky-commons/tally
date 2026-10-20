@@ -4,6 +4,9 @@
 
 pub mod config;
 pub mod delivery_check;
+pub mod health;
+pub mod precision;
+pub mod privilege;
 pub mod probe;
 pub mod relays;
 pub mod selection;
@@ -17,11 +20,20 @@ use tokio::sync::broadcast;
 
 use crate::config::{Config, Key};
 use crate::delivery_check::DeliveryChecker;
+use crate::health::Health;
 use crate::relays::{Directory, Publishing};
 use crate::source::Batcher;
 
 /// Batches held for relay sessions that are momentarily slow: about a minute.
 const BATCH_BACKLOG: usize = 64;
+
+/// A station's page on the Tally site, by its key as a URL carries it (base64url, no padding).
+pub const STATION_PAGE: &str = "https://tally.flightlines.ai/en/station/";
+
+/// Where `public`'s numbers are shown: its station page.
+pub fn station_link(public: &tally_wire::PublicKey) -> String {
+    format!("{STATION_PAGE}{}/", public.to_base64url())
+}
 
 pub fn init(path: &std::path::Path) -> Result<(), String> {
     if path.exists() {
@@ -71,12 +83,33 @@ fn load(path: &std::path::Path) -> Result<Identity, String> {
     Identity::from_base64(&text).map_err(|error| format!("{}: {error}", path.display()))
 }
 
-/// The receiver's identity, from its key file or its environment variable.
+/// The receiver's identity, from its key file or its environment variable; a kept key file is
+/// made first if it is missing.
 fn load_key(key: &Key) -> Result<Identity, String> {
     match key {
         Key::File(path) => load(path),
         Key::Env(name) => from_env(name, std::env::var_os(name)),
+        Key::Kept(path) => kept(path),
     }
+}
+
+/// The kept key at `path`, made now if there is none (`Key::Kept`).
+fn kept(path: &std::path::Path) -> Result<Identity, String> {
+    if path.exists() {
+        return load(path);
+    }
+    let identity = Identity::generate().map_err(|error| error.to_string())?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("{}: {error}", parent.display()))?;
+    }
+    write_private(path, &format!("{}\n", identity.to_base64()))?;
+    eprintln!(
+        "tally-feed: made this receiver's key, {}; keep it (back it up with the rest of the \
+         receiver's configuration): it is the antenna's name for good",
+        path.display()
+    );
+    Ok(identity)
 }
 
 /// An identity from the value of the environment variable `name`, which holds what a key file
@@ -102,9 +135,26 @@ fn from_env(name: &str, value: Option<std::ffi::OsString>) -> Result<Identity, S
 
 pub async fn run(config: Config) -> Result<(), String> {
     let identity = load_key(&config.key)?;
-    eprintln!("tally-feed: receiver {}", identity.public());
-    let (inputs, batching) = start(identity, &config)?;
-    tokio::spawn(source::read_beast(config.source, inputs.clone()));
+    let public = identity.public();
+    eprintln!(
+        "tally-feed: receiver {public}; its station page is {}",
+        station_link(&public)
+    );
+    if let Some(location) = config.location
+        && location.precision_m > 0
+    {
+        let published = precision::snap(location);
+        eprintln!(
+            "tally-feed: publishing the position rounded to {} m: {:.7}, {:.7}",
+            location.precision_m,
+            f64::from(published.lat_e7) / 1e7,
+            f64::from(published.lon_e7) / 1e7
+        );
+    }
+    let health = Arc::new(Health::default());
+    tokio::spawn(health::watch(Arc::clone(&health), config.state_dir.clone()));
+    let (inputs, batching) = publish(identity, &config, Arc::clone(&health))?;
+    tokio::spawn(source::read_beast(config.source, inputs.clone(), health));
     if let Some(uat) = config.uat {
         tokio::spawn(source::read_uat(uat, inputs.clone()));
     }
@@ -123,6 +173,15 @@ pub async fn run(config: Config) -> Result<(), String> {
 pub fn start(
     identity: Identity,
     config: &Config,
+) -> Result<(source::Inputs, impl Future<Output = ()> + Send + 'static), String> {
+    publish(identity, config, Arc::default())
+}
+
+/// `start`, telling `health` how many relay sessions are up.
+fn publish(
+    identity: Identity,
+    config: &Config,
+    health: Arc<Health>,
 ) -> Result<(source::Inputs, impl Future<Output = ()> + Send + 'static), String> {
     let (batches, _) = broadcast::channel(BATCH_BACKLOG);
     let directory = Directory::new(
@@ -147,6 +206,7 @@ pub fn start(
         checking: delivery_check::Checking::default(),
         prober: probe::measure,
         source_address: config.source_address,
+        health,
     }));
     let (inputs, intake) = source::channel();
     let batching = source::batch(
@@ -170,6 +230,37 @@ mod tests {
         let loaded = from_env("TALLY_KEY", Some(format!("{secret}\n").into()))?;
         assert_eq!(loaded.public(), public);
         assert_eq!(loaded.to_base64(), secret);
+        Ok(())
+    }
+
+    #[test]
+    fn a_kept_key_is_made_once_and_then_kept() -> Result<(), String> {
+        let base = std::env::var_os("TEST_TMPDIR")
+            .map_or_else(std::env::temp_dir, std::path::PathBuf::from);
+        let dir = base.join(format!("tally-kept-{}", std::process::id()));
+        let path = dir.join("key");
+        let made = kept(&path)?;
+        let again = kept(&path)?;
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(made.public(), again.public());
+        Ok(())
+    }
+
+    #[test]
+    fn the_station_link_carries_the_key_as_a_url_does() -> Result<(), String> {
+        let public = Identity::generate()
+            .map_err(|error| error.to_string())?
+            .public();
+        let link = station_link(&public);
+        let key = link
+            .strip_prefix(STATION_PAGE)
+            .and_then(|rest| rest.strip_suffix('/'))
+            .ok_or(link.clone())?;
+        assert!(!key.contains(['+', '/', '=']), "{link}");
+        assert_eq!(
+            tally_wire::PublicKey::from_base64url(key).map_err(|error| error.to_string())?,
+            public
+        );
         Ok(())
     }
 

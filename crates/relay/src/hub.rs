@@ -1930,6 +1930,15 @@ impl Hub {
         }
     }
 
+    /// Connection `source`, its handshake proving it `receiver`'s feeder, was admitted from
+    /// `address`: it is reported connected until it leaves (`left`), whether or not it sends a
+    /// batch.
+    pub fn opened(&self, receiver: &PublicKey, source: u64, address: Option<IpAddr>) {
+        if let Ok(mut shard) = self.raw[usize::from(raw_shard(receiver).0)].lock() {
+            shard.stations.opened(*receiver, source, now_ms(), address);
+        }
+    }
+
     /// Connection `source`, a feeder publishing as `receiver` from `address`, had a new batch
     /// forwarded.
     pub fn fed_by(&self, receiver: &PublicKey, source: u64, address: Option<IpAddr>) {
@@ -2520,10 +2529,13 @@ fn now_ms() -> u64 {
         })
 }
 
-/// A station's report with what its description, if held, declares.
+/// A station's report with what its description, if held, declares. A receiver only connected,
+/// no batch of it forwarded, is placed nowhere: a connection alone publishes no location.
 fn described(mut report: StationReport, known: Option<&Known>) -> StationReport {
     if let Some(known) = known {
-        report.location = known.place.map(Into::into);
+        if report.batches > 0 {
+            report.location = known.place.map(Into::into);
+        }
         report.software = known.software.clone();
     }
     report

@@ -10,6 +10,10 @@
 //!   gives it (RFC-0184), never by its own clock read as the API's;
 //! - a SPAN is `*_for_ms`, a count of milliseconds.
 //!
+//! No answer carries a receiver's exact place: a station's `location` is its declared place
+//! blurred to about 5 km, the same on every read, and every figure that places a feeder (its area,
+//! its range) is computed from that pin (`tally-api`'s `privacy`).
+//!
 //! A client may ignore a field it does not read; a field a type states is always present (an
 //! optional one as `null`).
 //!
@@ -211,16 +215,28 @@ pub struct Station {
     pub key: String,
     /// The relay forwarded a batch of it recently.
     pub online: bool,
-    /// When the relay first forwarded a batch of it: Unix milliseconds on the API's clock.
+    /// What it is doing now: feeding, connected with nothing to send, or neither.
+    pub state: StationState,
+    /// When its feeder connection to the relay opened (the oldest, if more than one is open):
+    /// Unix milliseconds on the API's clock; `null` when it is not connected to the relay itself
+    /// (a station that feeds through another relay is `feeding` with this `null`).
+    pub connected_since_at_ms: Option<u64>,
+    /// When the relay first forwarded a batch of it: Unix milliseconds on the API's clock. For a
+    /// station the relay has forwarded no batch of (`batches` 0), when it connected.
     pub first_seen_at_ms: u64,
-    /// When the relay last forwarded a batch of it: Unix milliseconds on the API's clock.
+    /// When the relay last forwarded a batch of it: Unix milliseconds on the API's clock. For a
+    /// station the relay has forwarded no batch of (`batches` 0), when it connected.
     pub last_seen_at_ms: u64,
     pub messages_per_sec: f64,
     /// Signed batches the relay accepted from it.
     pub batches: u64,
     /// Batches of its sequence that never arrived.
     pub gaps: u64,
-    /// Where it says it is; `null` when it does not say.
+    /// About where it says it is: its declared place blurred to about 5 km, never the place itself
+    /// (a pin inside the 0.05 degree cell that holds it, at an offset its key fixes, the same on
+    /// every read). `null` when it does not say, and for a station
+    /// the relay has forwarded no batch of (a connection alone publishes no place). The exact
+    /// place travels only in its signed description, which MLAT reads.
     pub location: Option<Position>,
     /// What it runs, as it says; `null` when it says nothing.
     pub software: Option<String>,
@@ -249,6 +265,21 @@ pub struct MeStation {
     pub last_seen_at_ms: u64,
 }
 
+/// What a station is doing now, as the relay the API reads sees it. A key the relay knows
+/// nothing of (never connected, or forgotten) is no station: `404 no such station`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StationState {
+    /// A batch of it was forwarded recently (`online`): its receptions reach the network.
+    Feeding,
+    /// Connected to the relay, its key proved by the handshake, but no batch of it was forwarded
+    /// recently: tally-feed is running and reaches the relay, and its decoder (readsb's BEAST
+    /// output) is giving it nothing to send. `batches` 0 says it never has.
+    Silent,
+    /// Neither: not connected to the relay, and no batch of it forwarded recently.
+    Offline,
+}
+
 /// `GET /v1/stations/{key}/stats`, the key as base64url without padding: what one feeder gave the
 /// network over the window, as the API computes it (RFC-0174 §2.12) from public signed data alone
 /// (the feeder's signed batches, the signed positions that cite its receptions, and its standing),
@@ -270,8 +301,9 @@ pub struct FeederStats {
     pub messages_per_sec: f64,
     /// Distinct aircraft whose checked address it heard over the window.
     pub aircraft: u32,
-    /// The farthest positioned aircraft it heard, metres from where it says it is; `null` when it
-    /// states no place or heard no positioned aircraft.
+    /// The farthest positioned aircraft it heard, metres from its public pin (its place blurred to
+    /// about 5 km, as `Station::location`), so it is never a measure from the exact place; `null`
+    /// when it states no place or heard no positioned aircraft.
     pub range_m: Option<f64>,
     /// The sky it heard positioned aircraft in, square kilometres of coverage cells.
     pub coverage_km2: f64,
@@ -279,8 +311,8 @@ pub struct FeederStats {
     pub unique_coverage_km2: f64,
     /// Distinct published MLAT positions that cite one of its receptions.
     pub mlat_positions: u64,
-    /// Its area: the H3 cell (resolution 3, as hex) that holds where it says it is; `null` when it
-    /// states no place.
+    /// Its area: the H3 cell (resolution 3, as hex) that holds its public pin (`Station::location`);
+    /// `null` when it states no place.
     pub area: Option<String>,
     /// Its receptions have earned standing (RFC-0174 §2.12): only a feeder with standing is ranked.
     pub standing: bool,
@@ -451,6 +483,11 @@ pub mod fixtures {
     pub const STATION: &str = include_str!("../testdata/station.json");
     /// `GET /v1/stations/{key}`: a station that states neither place nor software.
     pub const STATION_BARE: &str = include_str!("../testdata/station_bare.json");
+    /// `GET /v1/stations/{key}`: a station connected whose decoder has sent nothing, so the relay
+    /// has forwarded no batch of it (`silent`, `batches` 0, placed nowhere).
+    pub const STATION_SILENT: &str = include_str!("../testdata/station_silent.json");
+    /// `GET /v1/stations/{key}`: a station that fed and is no longer connected (`offline`).
+    pub const STATION_OFFLINE: &str = include_str!("../testdata/station_offline.json");
     /// The key the station fixtures name, as base64url without padding (the path's form).
     pub const STATION_KEY_URL: &str = "6kpsY-KcUgq-9VB7Ey7F-ZVHdq6-vnuSQh7qaRRG0iw";
     /// `GET /v1/me`: the one station of the asking client's address.
@@ -498,6 +535,8 @@ mod tests {
         whole::<Network>(fixtures::NETWORK)?;
         whole::<Station>(fixtures::STATION)?;
         whole::<Station>(fixtures::STATION_BARE)?;
+        whole::<Station>(fixtures::STATION_SILENT)?;
+        whole::<Station>(fixtures::STATION_OFFLINE)?;
         whole::<FeederStats>(fixtures::FEEDER_STATS)?;
         whole::<FeederStats>(fixtures::FEEDER_STATS_UNRANKED)?;
         whole::<Leaderboards>(fixtures::LEADERBOARDS)?;

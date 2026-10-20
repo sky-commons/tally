@@ -1,9 +1,14 @@
 # The Tally feeder (RFC-0171 §3.5): reads this receiver's own decoders and publishes what they heard
 # to a few Tally relays. It only connects out: it listens on no port and takes no orders from the
-# network. Its arguments (location, the UAT source, a home relay) are the owner's, in
-# /etc/default/tally-feed as TALLY_FEED_ARGS; `tally-feed --help` lists them.
+# network. Its arguments are in /etc/default/tally-feed: TALLY_FEED_ARGS, the block install.sh
+# rewrites on every run (the relays, the location and how exactly it is published, the UAT
+# source), then TALLY_FEED_EXTRA, the owner's own flags, which install.sh keeps; a flag given once
+# (--lat, --precision) is the last one's, so the owner's wins. `tally-feed --help` lists them.
 #
-# Needs systemd 248 or later (LoadCredential and the %d specifier).
+# Needs systemd 247 or later (LoadCredential= and $CREDENTIALS_DIRECTORY, both new in 247; the %d
+# specifier for the same directory is 248's, so it is not used). SocketBindDeny= is 249's: an
+# older systemd logs that it does not know it and runs the unit without it, the feeder still
+# opening no listening socket of its own.
 
 [Unit]
 Description=Tally feeder: publishes this receiver's receptions to Tally relays
@@ -15,9 +20,10 @@ Wants=network-online.target
 Type=simple
 EnvironmentFile=/etc/default/tally-feed
 # The key stays root's, mode 600. systemd reads it and hands the service a private copy in its
-# credentials directory (%d), so the dynamic user never needs access to /etc/tally.
+# credentials directory ($CREDENTIALS_DIRECTORY), so the dynamic user never needs access to
+# /etc/tally. ${NAME} is one word and $NAME splits on whitespace, an unset one giving none.
 LoadCredential=key:/etc/tally/key
-ExecStart=/usr/local/bin/tally-feed --key %d/key --state /var/lib/tally-feed $TALLY_FEED_ARGS
+ExecStart=/usr/local/bin/tally-feed --key ${CREDENTIALS_DIRECTORY}/key --state /var/lib/tally-feed $TALLY_FEED_ARGS $TALLY_FEED_EXTRA
 Restart=always
 RestartSec=10
 

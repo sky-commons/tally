@@ -32,6 +32,7 @@ use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task::JoinSet;
 
 use crate::delivery_check::{self, Checking, DeliveryChecker, SAMPLED, Sent, Verdict};
+use crate::health::Health;
 use crate::probe::{self, MOST_PER_ROUND, Measured, Probed, Prober, RANDOM_PER_ROUND, ROUND_EVERY};
 use crate::selection::{BandRendezvous, Choice, RelaySelection, failover_jitter};
 use crate::source::{Stating, TokenBucket, WantedCeilings, wall_ms};
@@ -258,7 +259,8 @@ pub struct Directory {
 
 impl Directory {
     /// `configured` are the owner's (`--relay`), `seeds` the binary's: both candidates, never
-    /// pinned.
+    /// pinned. `location` is the antenna's as the owner gave it; the directory holds, signs and
+    /// chooses by it snapped to its precision (`precision::snap`), and never keeps the exact one.
     pub fn new(
         state_dir: PathBuf,
         configured: Vec<RelayAddress>,
@@ -267,6 +269,7 @@ impl Directory {
         location: Option<Location>,
         clock: Clock,
     ) -> Result<Arc<Self>, String> {
+        let location = location.map(crate::precision::snap);
         let mut relays = Relays {
             known: Vec::new(),
             held: Vec::new(),
@@ -1011,6 +1014,8 @@ pub struct Publishing {
     /// choice, as a feeder always runs). A load harness gives each simulated feeder its own, so a
     /// relay sees the many networks real feeders come from.
     pub source_address: Option<IpAddr>,
+    /// Told how many relay sessions are up whenever that changes (`health`).
+    pub health: Arc<Health>,
 }
 
 /// One session the publisher keeps.
@@ -1032,6 +1037,7 @@ struct Publisher {
     checking: Checking,
     prober: Prober,
     source_address: Option<IpAddr>,
+    health: Arc<Health>,
     area: Option<Region>,
     ledger: Arc<Ledger>,
     selection: BandRendezvous,
@@ -1060,6 +1066,7 @@ pub async fn run(publishing: Publishing) {
         checking: publishing.checking,
         prober: publishing.prober,
         source_address: publishing.source_address,
+        health: publishing.health,
         area,
         ledger: Arc::new(Ledger::default()),
         selection: BandRendezvous::new(),
@@ -1342,7 +1349,7 @@ impl Publisher {
                 if let Some(running) = self.sessions.get(&relay)
                     && running.generation == generation
                 {
-                    self.ledger.live(relay, true);
+                    self.live(relay, true);
                 }
             }
             Event::Ended {
@@ -1388,7 +1395,7 @@ impl Publisher {
         else {
             return;
         };
-        self.ledger.live(relay, false);
+        self.live(relay, false);
         // Whatever ended it, an audit of it in progress says nothing.
         self.checker.session_ended(relay);
         let healthy = up_for.is_some_and(|up| up >= HEALTHY_SESSION);
@@ -1425,6 +1432,12 @@ impl Publisher {
         self.apply(&choice, true);
     }
 
+    /// Whether `relay`'s session is up, for the delivery checks' ledger and the feeder's health.
+    fn live(&self, relay: PublicKey, up: bool) {
+        self.ledger.live(relay, up);
+        self.health.relays_up(self.ledger.live_relays().len());
+    }
+
     /// Dials `running`'s relay again after its backoff's wait.
     fn redial(&mut self, mut running: Running) {
         let wait = running
@@ -1448,7 +1461,7 @@ impl Publisher {
         for key in gone {
             if let Some(running) = self.sessions.remove(&key) {
                 running.task.abort();
-                self.ledger.live(key, false);
+                self.live(key, false);
             }
         }
         for relay in choice.relays() {
@@ -1900,6 +1913,32 @@ mod tests {
     fn scratch() -> PathBuf {
         let base = std::env::var_os("TEST_TMPDIR").map_or_else(std::env::temp_dir, PathBuf::from);
         base.join(format!("tally-feed-{:016x}", random_below(usize::MAX)))
+    }
+
+    #[test]
+    fn the_signed_location_is_the_snapped_one() -> Result<(), String> {
+        let exact = Location {
+            lat_e7: 339_425_361,
+            lon_e7: -1_184_080_749,
+            alt_m: 34,
+            precision_m: 1_000,
+        };
+        let directory = Directory::new(
+            scratch(),
+            Vec::new(),
+            Vec::new(),
+            Identity::generate().map_err(|error| error.to_string())?,
+            Some(exact),
+            Clock::Dump1090,
+        )?;
+        let info = directory.info().borrow().clone();
+        let Record::ReceiverInfo(info) = info.as_ref() else {
+            return Err("not a receiver info".to_owned());
+        };
+        let signed = info.content().map_err(|error| error.to_string())?.location;
+        assert_eq!(signed, Some(crate::precision::snap(exact)));
+        assert_ne!(signed, Some(exact));
+        Ok(())
     }
 
     fn directory_at(
@@ -2534,6 +2573,7 @@ mod tests {
                 })
             },
             source_address: None,
+            health: Arc::default(),
         }));
         let sending = tokio::spawn(async move {
             for sequence in 0.. {
@@ -2931,6 +2971,7 @@ mod tests {
                 })
             },
             source_address: None,
+            health: Arc::default(),
         }));
         let sending = tokio::spawn(async move {
             for sequence in 0.. {
@@ -3012,6 +3053,7 @@ mod tests {
                 })
             },
             source_address: None,
+            health: Arc::default(),
         }));
         let sending = tokio::spawn(async move {
             for sequence in 0.. {

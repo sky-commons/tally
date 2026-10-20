@@ -41,22 +41,28 @@ installer does all of it: it downloads `tally-feed` for the machine, checks its 
 decoders and the location, makes the key, and starts the service.
 
 ```sh
-curl -fsSL https://github.com/sky-commons/tally/releases/latest/download/install.sh | sudo bash
+curl -fsSL https://github.com/sky-commons/tally/releases/latest/download/install.sh -o /tmp/tally-install.sh
+sudo bash /tmp/tally-install.sh
 ```
+
+It ends by printing your station's page, which says whether it is feeding. Run it again to upgrade
+or to change the location; `--uninstall` removes it and keeps the key (`--uninstall --purge` deletes
+the key too).
 
 As a container (`ghcr.io/sky-commons/tally-feed`, signed like the binaries), see
 [packaging/README.md](packaging/README.md). By hand:
 
 ```sh
 tally-feed init --key /etc/tally/key            # once: creates the key, prints its public half
-tally-feed --key /etc/tally/key \
-  --relay relay.example.org:10900=<relay key> \
-  --lat 37.41 --lon -122.10 --alt 12
+tally-feed --key /etc/tally/key --lat 37.41 --lon -122.10 --alt 12   # the release's relays are built in
 ```
 
-Your receiver's location is published as you enter it, because multilateration (locating aircraft
-that do not broadcast a position) needs it exact. Pass `--precision <metres>` to say you rounded it;
-you then contribute less to multilateration.
+Your receiver's exact location goes to relays, because multilateration (locating aircraft that do
+not broadcast a position) needs it exact. Public pages and the API show only a spot within about
+5 km (the rule for every relay: [docs/relay-operators.md](docs/relay-operators.md)). Today the
+network's raw products still let a determined reader work it out; the next release keeps it off
+everything clients read. `--precision <metres>` rounds it on the receiver, for experts: above 30 m
+the receiver takes no part in multilateration.
 
 If the receiver also runs dump978-fa for 978 MHz UAT, `--uat 127.0.0.1:30978` publishes its raw
 output too, in the same signed batches.
@@ -82,9 +88,12 @@ unauthenticated: bind it to loopback.
 `--stats-listen 127.0.0.1:10901` serves what the relay knows of each receiver's traffic as JSON
 (`GET /stations`, `GET /stations/KEY` with the key as base64url): sessions, first and last seen,
 batches, sequence gaps, observations, messages a second, the location and software its
-description declares, and the `address` its connected session came from. It is unauthenticated too,
-and names where each feeder feeds from, so it binds loopback only: the relay refuses to start on
-any other address (`0.0.0.0`, a public one, or a name).
+description declares, exactly, and the `address` its connected session came from. It is
+unauthenticated too, and names where each feeder feeds from, so it binds loopback only: the relay
+refuses to start on any other address (`0.0.0.0`, a public one, or a name). Anything a relay
+publishes (`tally-api`, a website, a map) shows receiver locations blurred to about 5 km, never
+exact: the network's rules for relay operators, and the condition for a release's seed list, are in
+[docs/relay-operators.md](docs/relay-operators.md).
 
 `--area CELL` names an area the relay takes (an H3 cell, hex or decimal; repeatable). It shares
 what it takes with every relay that takes the same area, and offers it, signed, to the network.
