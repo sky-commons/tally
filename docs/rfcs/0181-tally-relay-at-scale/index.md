@@ -443,7 +443,9 @@ Measured on main (tally-load, commit b3e3571809 on branch tally-load):
    cannot keep up is let go, so one slow reader never slows ingest for every feeder. When an item
    would pass the fan-out's budget, the subscriber holding most is let go the same way, and the next,
    until it fits. A relay's directory link is the one exception: what it is sent is held whole
-   elsewhere, so it is sent that again (a resync) instead.
+   elsewhere, so it is sent that again (a resync) instead. Since 2026-10-19 a client's subscription
+   cells are clamped to resolution 6 and matched against each receiver's public cell, and a client's
+   queue holds only what a client may be sent (RFC-0171 §3.6, "What a client may be sent").
 9. **Capacity is admission, never a silent drop inside a store.** (The per-feeder worst-case
    reservation described first below is superseded by "Admission": a connection reserves its floor,
    the rate-driven stores are sized for one relay-wide rate, MLAT's seats are a pool of their own.)
@@ -1056,32 +1058,35 @@ relay's caps; output of the test, not prose):
 
 | Line                              | Without MLAT | Hosting MLAT |
 | --------------------------------- | ------------ | ------------ |
-| floor (a connection)              | 590,779      | 590,779      |
-| per-connection (floor + mean rate)| 1,667,720    | 1,909,208    |
+| floor (a connection)              | 754,619      | 754,619      |
+| per-connection (floor + mean rate)| 1,866,376    | 2,107,864    |
 | per-seat                          | 0            | 3,256,264    |
-| before-feeders                    | 2,346,783,808 | 2,788,139,072 |
-| connection-limit                  | 17,324       | 9,416        |
-| connections-by-memory / by-cores  | 17,545 / 17,324 | 11,321 / 9,416 |
-| connection-limit-bound            | cores        | cores        |
-| max-receptions-per-sec (`R_max`)  | 10,394,482   | 5,650,933    |
-| max-bytes-per-sec                 | 1,195,296,133 | 649,819,622 |
-| max-records-per-sec               | 34,648       | 18,836       |
-| rate-by-memory / by-cores         | 10,600,489 / 10,394,482 | 5,650,933 / 5,767,688 |
-| rate-bound                        | cores        | memory       |
-| feeders-at-mean / at-ceiling      | 17,324 / 3,464 | 9,418 / 1,883 |
-| mlat-seats (bound)                | 0            | 3,329 (memory) |
+| before-feeders                    | 2,372,211,776 | 2,813,567,040 |
+| connection-limit                  | 15,664       | 9,416        |
+| connections-by-memory / by-cores  | 15,664 / 17,324 | 10,245 / 9,416 |
+| connection-limit-bound            | memory       | cores        |
+| max-receptions-per-sec (`R_max`)  | 9,399,020    | 5,650,532    |
+| max-bytes-per-sec                 | 1,080,824,639 | 649,773,509 |
+| max-records-per-sec               | 31,330       | 18,835       |
+| rate-by-memory / by-cores         | 9,399,020 / 10,618,256 | 5,650,532 / 6,159,686 |
+| rate-bound                        | memory       | memory       |
+| feeders-at-mean / at-ceiling      | 15,665 / 3,133 | 9,417 / 1,883 |
+| mlat-seats (bound)                | 0            | 2,747 (memory) |
 | ingest / message / seal threads   | 5 / 5 / 4    | 4 / 3 / 4 (and 5 MLAT) |
 | handshakes-in-flight / per-sec    | 4,000 / 40,000 | 4,000 / 40,000 |
 | allocator (the share kept)        | 2,684,354,560 | 2,684,354,560 |
 
 (Hosting MLAT, the connections are planned from three quarters of the memory and the cores, the
 rest being MLAT's share, so they are fewer, bound by cores here; `R_max` and the seats are bound by
-the memory, the seats being what the connections leave, 3,329 of 9,416. `max-bytes-per-sec` is in
+the memory, the seats being what the connections leave, 2,747 of 9,416. `max-bytes-per-sec` is in
 the unit the stores charge, `ingest::rate_cost`, "Memory is charged once".)
 
-The 32 GB relay without MLAT is bound by its 16 cores at 17,324 connections, just under its memory
-(17,545). The 20,000 feeders the RFC sizes for need 19 cores at these figures (`check --cores 19`
-carries 20,626) and 36 GB (`check --memory-limit 36G --cores 19` admits 20,121, bound by memory),
+The 32 GB relay without MLAT is bound by its memory at 15,664 connections, under what its 16 cores
+carry (17,324): since 2026-10-19 every connection's floor holds its feeder figures row
+(`figures::PER_RECEIVER_BYTES`, 160 KiB, what a full row was measured to allocate, RFC-0174
+§2.12). The 20,000 feeders the RFC sizes for need
+19 cores at these figures (`check --cores 19` carries 20,626) and 42 GB (`check --memory-limit 42G
+--cores 19` admits 20,626, bound by the cores; 40 GB admits 20,267, bound by memory),
 or the stages' costs measured lower; "feeders at the ceiling" is `R_max` over what one source is held to
 (`ingest::SOURCE_RECEPTIONS_PER_SEC`), what the relay carries if every feeder sends at its pace.
 Ten cores and 24 GB with the harness's two areas are `tests/cores-10.txt`, held equal to what the

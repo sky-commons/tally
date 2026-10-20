@@ -15,9 +15,14 @@
 //!    and verified as any checker would (`publish::solve_published`, every one); one that fails is
 //!    dropped and counted.
 //! 4. In order: each tile model with a solution is signed, its parts (none when it fits its
-//!    manifest, the normal case) then its manifest published; then the solutions, in as few
-//!    `Positions` records as fit, so every record a solution cites arrives before it.
+//!    manifest, the normal case) then its manifest published, then its summary for clients
+//!    (`ClientClockModel`: no site, no offset); then the solutions, in as few `Positions` records as
+//!    fit, so every record a solution cites arrives before it: raw (format 3) for relays, then the
+//!    same solutions tagged (format 5) for clients, each reception its `ReceptionTag` under its
+//!    receiver's reception key (`intake::Sited`). The raw forms and the full models are relay-only
+//!    (`tally_wire::ClientRecord` refuses them); a client gets the summaries and the tagged forms.
 
+use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use tally_mlat_solver::scope::{Sites, Window, WindowIndex};
@@ -27,9 +32,14 @@ use tally_mlat_solver::{
 };
 use tally_wire::batch::Hash;
 use tally_wire::{
-    ClockModel, ClockModelContent, Identity, Location, Positions, Record, Regions,
-    SolutionsContent, WireError,
+    ClientClockModel, ClockModel, ClockModelContent, Identity, Location, Positions, PublicKey,
+    ReceptionKey, Record, Regions, SiteId, SolutionsContent, TaggedSolution, WireError,
 };
+
+use crate::intake::Sited;
+
+/// The reception keys of a model's scope, by receiver: what its solutions are tagged under.
+pub type Keys = BTreeMap<PublicKey, ReceptionKey>;
 
 /// A step's work, owned.
 pub struct Job {
@@ -43,8 +53,8 @@ pub struct Job {
     pub owned: Regions,
     /// The windows to solve, ascending.
     pub windows: Vec<Window>,
-    /// Every receiver taking part.
-    pub sites: Vec<Site>,
+    /// Every receiver taking part, each with its reception key.
+    pub sites: Vec<Sited>,
     /// Every sealed bin any of the windows spans.
     pub bins: Vec<std::sync::Arc<tally_mlat_solver::held::Bin>>,
     pub positions_sequence: u64,
@@ -81,8 +91,15 @@ pub struct Report {
     /// Parts of the clock models too large for their manifests.
     pub clock_model_parts: usize,
     pub clock_model_bytes: usize,
+    /// Raw positions records (relay-only) and their bytes.
     pub positions: usize,
     pub positions_bytes: usize,
+    /// Tagged positions records (what a client is sent) and their bytes; the models' summaries
+    /// for clients are one a model (`clock_models`).
+    pub tagged_positions: usize,
+    pub tagged_positions_bytes: usize,
+    /// Solutions published raw that could not be tagged (a scope receiver with no reception key).
+    pub untagged: usize,
     /// Time spent fitting, over every thread.
     pub fit_time: Duration,
     /// Time spent solving, over every thread.
@@ -194,6 +211,16 @@ struct Fitted {
     calibrated: Calibrated,
 }
 
+/// The reception keys of `model`'s scope, each the key of the record its site id names: every
+/// scope receiver's, or `None` when one is missing (its solutions cannot be tagged).
+fn keys_of(model: &Model, keys: &BTreeMap<SiteId, ReceptionKey>) -> Option<Keys> {
+    model
+        .scope
+        .iter()
+        .map(|site| keys.get(&site.id).map(|key| (site.receiver, *key)))
+        .collect()
+}
+
 /// One window's solutions, citing no model yet: by the tile that solved them.
 type Solved = Vec<(Tile, tally_wire::Solution)>;
 
@@ -288,7 +315,13 @@ pub fn parallel<T: Sync, R: Send, P: Part>(
 impl Job {
     pub fn run(self) -> Outcome {
         let started = Instant::now();
-        let sites = Sites::new(&self.sites);
+        let plain: Vec<Site> = self.sites.iter().map(|sited| sited.site).collect();
+        let sites = Sites::new(&plain);
+        let keys: BTreeMap<SiteId, ReceptionKey> = self
+            .sites
+            .iter()
+            .map(|sited| (sited.site.id, sited.key))
+            .collect();
         let mut report = Report {
             windows: self.windows.len(),
             ..Report::default()
@@ -302,6 +335,7 @@ impl Job {
             report: Report::default(),
         };
         let mut solutions: Vec<tally_wire::Solution> = Vec::new();
+        let mut tagged: Vec<TaggedSolution> = Vec::new();
         for window in &self.windows {
             report.bins += window.solved().count();
             let index = WindowIndex::new(*window, &self.bins, &sites);
@@ -369,44 +403,82 @@ impl Job {
                     continue;
                 };
                 let id = signed.manifest.id();
-                let records = signed.records();
+                // What a client is sent of it, numbered with it: a model whose summary cannot be
+                // signed is not published, so no client is sent a solution citing a model it
+                // cannot hold.
+                let Ok(summary) = ClientClockModel::sign(
+                    &self.identity,
+                    &publish::client_model(
+                        &found.model,
+                        id,
+                        found.inputs,
+                        (self.boot_id, outcome.models_sequence, self.issued_ms),
+                    ),
+                ) else {
+                    report.unsolved += list.len();
+                    continue;
+                };
+                let mut records = signed.records();
+                records.push(Record::ClientClockModel(summary));
                 report.clock_models += 1;
                 report.clock_model_parts += signed.parts.len();
                 report.clock_model_bytes += records.iter().map(encoded_len).sum::<usize>();
                 outcome.records.extend(records);
                 outcome.models_sequence += 1;
+                let scope_keys = keys_of(&found.model, &keys);
+                for mut solution in list {
+                    solution.clock_model = id;
+                    let tag = scope_keys.as_ref().and_then(|scope_keys| {
+                        solution
+                            .tagged(|receiver| scope_keys.get(receiver).copied())
+                            .ok()
+                    });
+                    match tag {
+                        Some(one) => tagged.push(one),
+                        None => report.untagged += 1,
+                    }
+                    solutions.push(solution);
+                }
                 outcome.carried.push(crate::provisional::Carried {
                     tile,
                     window: *window,
                     id,
+                    keys: scope_keys.unwrap_or_default(),
                     model: found.model,
                     calibrated: found.calibrated,
                 });
-                solutions.extend(list.into_iter().map(|mut solution| {
-                    solution.clock_model = id;
-                    solution
-                }));
             }
         }
-        let positions = pack(
-            &self.identity,
-            self.boot_id,
-            self.issued_ms,
+        let content = |sequence: u64| (self.boot_id, sequence, self.issued_ms);
+        let positions = pack_with(
             outcome.positions_sequence,
             solutions,
+            Positions::fitting,
+            |sequence, run: &[tally_wire::Solution]| {
+                Positions::sign_solutions(
+                    &self.identity,
+                    &solutions_content(content(sequence), run),
+                )
+            },
         );
         report.positions = positions.len();
-        report.positions_bytes = positions
-            .iter()
-            .map(|record| {
-                tally_mlat_solver::gate::checkpoint();
-                encoded_len(&Record::Positions(record.clone()))
-            })
-            .sum();
+        report.positions_bytes = bytes_of(&positions);
         outcome.positions_sequence += positions.len() as u64;
+        // The same solutions tagged, numbered after the raw records in the one positions sequence.
+        let tagged = pack_with(
+            outcome.positions_sequence,
+            tagged,
+            Positions::fitting_tagged,
+            |sequence, run: &[TaggedSolution]| {
+                Positions::sign_tagged(&self.identity, &solutions_content(content(sequence), run))
+            },
+        );
+        report.tagged_positions = tagged.len();
+        report.tagged_positions_bytes = bytes_of(&tagged);
+        outcome.positions_sequence += tagged.len() as u64;
         outcome
             .records
-            .extend(positions.into_iter().map(Record::Positions));
+            .extend(positions.into_iter().chain(tagged).map(Record::Positions));
         report.elapsed = started.elapsed();
         outcome.report = report;
         outcome
@@ -419,49 +491,52 @@ fn encoded_len(record: &Record) -> usize {
     record.encode(&mut bytes).map_or(0, |()| bytes.len())
 }
 
-/// Signs `solutions` into as few `Positions` records as hold them, in order: each record takes the
-/// longest run that signs within the wire's size limit.
-fn pack(
-    identity: &Identity,
-    boot_id: u64,
-    issued_ms: u64,
-    sequence: u64,
-    solutions: Vec<tally_wire::Solution>,
-) -> Vec<Positions> {
-    pack_with(
+/// The content of one positions record of `run`, numbered `(boot_id, sequence, issued_ms)`, under
+/// this specification.
+pub fn solutions_content<O: Clone>(
+    (boot_id, sequence, issued_ms): (u64, u64, u64),
+    run: &[tally_wire::Solution<O>],
+) -> SolutionsContent<O> {
+    SolutionsContent {
+        boot_id,
         sequence,
-        solutions,
-        |sequence, run: &[tally_wire::Solution]| {
-            Positions::sign_solutions(
-                identity,
-                &SolutionsContent {
-                    boot_id,
-                    sequence,
-                    issued_ms,
-                    spec_version: SPEC_VERSION,
-                    solutions: run.to_vec(),
-                },
-            )
-        },
-    )
+        issued_ms,
+        spec_version: SPEC_VERSION,
+        solutions: run.to_vec(),
+    }
 }
 
-/// As `pack`, each record signed by `sign` (final or provisional), numbered from `sequence`.
-pub fn pack_with(
+/// The records' bytes on the wire, headers included.
+fn bytes_of(records: &[Positions]) -> usize {
+    records
+        .iter()
+        .map(|record| {
+            tally_mlat_solver::gate::checkpoint();
+            encoded_len(&Record::Positions(record.clone()))
+        })
+        .sum()
+}
+
+/// Signs `solutions` (raw or tagged) into as few `Positions` records as hold them, in order,
+/// numbered from `sequence`, each signed by `sign` (final or provisional): each record takes the
+/// longest run that signs within the wire's size limit, measured by `fitting`
+/// (`Positions::fitting` or `Positions::fitting_tagged`).
+pub fn pack_with<S>(
     mut sequence: u64,
-    solutions: Vec<tally_wire::Solution>,
-    sign: impl Fn(u64, &[tally_wire::Solution]) -> Result<Positions, WireError>,
+    solutions: Vec<S>,
+    fitting: impl Fn(&[S]) -> usize,
+    sign: impl Fn(u64, &[S]) -> Result<Positions, WireError>,
 ) -> Vec<Positions> {
     let mut records = Vec::new();
     let mut rest = solutions.as_slice();
     while !rest.is_empty() {
-        // The longest prefix one record holds, measured (`Positions::fitting`), signed once. Only
+        // The longest prefix one record holds, measured (`fitting`), signed once. Only
         // when that prefix is refused for a solution's content is it searched below, between none
         // and the length refused. Before, every record was found by signing ever shorter prefixes
         // of all that was left, from the whole: a window step of 80,000 solutions spent two
         // minutes of one thread here, and its provisional steps were shed for want of its models
         //.
-        let mut take = Positions::fitting(rest);
+        let mut take = fitting(rest);
         let (mut fits, mut fails) = (0, take + 1);
         let mut signed = None;
         while fits + 1 < fails {

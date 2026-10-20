@@ -9,8 +9,9 @@
 //!   jitter.
 //! - **The engine as it runs** (`replay`): at every multiple of `tick_ms` of the virtual clock (a
 //!   step), what arrived before it is ingested, provisional work is solved and published, and a due
-//!   window is stepped. A receiver's description takes effect at the step after it arrived, as a
-//!   relay's does (`tally_relay::mlat_host`, descriptions stamped and applied at their step): the
+//!   window is stepped. A receiver's site (`intake::SiteRecord`) takes effect at the step after it
+//!   arrived, as a relay's does (`tally_relay::mlat_host`, sites stamped and applied at their
+//!   step); its format 2 description, which carries no site, places nothing: the
 //!   batches that arrived before that step are taken as the receiver stood before it (those of a
 //!   receiver not yet described wait for it, `intake::Intake::hold_orphan`), and the batches that
 //!   waited are let go once they have waited `intake::ORPHAN_MS` of steps. Each record published is returned with its step. These are the hosted
@@ -23,6 +24,7 @@ use tally_mlat_solver::sim::{self, Rng, Simulation};
 use tally_wire::Record;
 
 use crate::engine::Engine;
+use crate::intake::SiteRecord;
 
 /// When a record a receiver sent reaches an engine at the soonest, by the engine's clock: a batch
 /// when its receiver sealed it (its own wall clock), a description at once. For a test that hands
@@ -37,7 +39,7 @@ pub fn sent_ms(record: &Record) -> u64 {
 }
 
 /// What `simulation`'s receivers publish, each record with when it reaches the engine: every
-/// description at the start, then each batch at its seal time plus its path's delay. Sorted by
+/// description and site at the start, then each batch at its seal time plus its path's delay. Sorted by
 /// arrival. The simulation's receptions are rewritten in place to the wall clocks of the batches
 /// they now travel in.
 pub fn arrivals(simulation: &mut Simulation, seed: u64) -> Result<Vec<(u64, Record)>, String> {
@@ -76,6 +78,7 @@ pub fn arrivals(simulation: &mut Simulation, seed: u64) -> Result<Vec<(u64, Reco
     let mut out = Vec::new();
     for (index, feed) in feeds.iter().enumerate() {
         out.push((start_ms, Record::ReceiverInfo(feed.info.clone())));
+        out.push((start_ms, Record::ReceiverSite(feed.site.clone())));
         for batch in &feed.batches {
             let wall = batch.content().map_err(|error| error.to_string())?.wall_ms;
             let jitter = (rng.uniform() * 30.0) as u64;
@@ -86,12 +89,11 @@ pub fn arrivals(simulation: &mut Simulation, seed: u64) -> Result<Vec<(u64, Reco
     Ok(out)
 }
 
-/// `delivered` (`arrivals` of `simulation`) with two receivers' descriptions moved midway, for a
-/// test that descriptions take effect where their stamps say: the first receiver described again
-/// out of every area (its location moved 20 degrees north) a third of the way in and back ten
-/// seconds later, so it stops taking part and takes part again; and the second described first
-/// halfway in, so its batches before wait for it and those that waited too long are let go. In
-/// arrival order.
+/// `delivered` (`arrivals` of `simulation`) with two receivers' sites moved midway, for a test
+/// that sites take effect where their stamps say: the first receiver's site signed again out of
+/// every area (moved 20 degrees north) a third of the way in and back ten seconds later, so it
+/// stops taking part and takes part again; and the second's site first sent halfway in, so its
+/// batches before wait for it and those that waited too long are let go. In arrival order.
 pub fn described_midway(
     simulation: &Simulation,
     delivered: &[(u64, Record)],
@@ -108,29 +110,29 @@ pub fn described_midway(
     let mut changed: Vec<(u64, Record)> = delivered
         .iter()
         .filter(|(_, record)| {
-            !matches!(record, Record::ReceiverInfo(info) if info.receiver().ok() == Some(late_key))
+            !matches!(record, Record::ReceiverSite(site) if site.receiver().ok() == Some(late_key))
         })
         .cloned()
         .collect();
-    let content = moved.info.content().map_err(|error| error.to_string())?;
-    let away = tally_wire::batch::ReceiverInfoContent {
+    let content = moved.site.content().map_err(|error| error.to_string())?;
+    let away = tally_wire::ReceiverSiteContent {
         issued_ms: content.issued_ms + 1,
-        location: content.location.map(|location| tally_wire::Location {
-            lat_e7: location.lat_e7.saturating_add(200_000_000),
-            ..location
-        }),
-        ..content.clone()
+        location: tally_wire::Location {
+            lat_e7: content.location.lat_e7.saturating_add(200_000_000),
+            ..content.location
+        },
+        ..content
     };
-    let back = tally_wire::batch::ReceiverInfoContent {
+    let back = tally_wire::ReceiverSiteContent {
         issued_ms: content.issued_ms + 2,
         ..content
     };
     for (at, content) in [(third, away), (third + 10_000, back)] {
-        let info = tally_wire::ReceiverInfo::sign(&moved.identity, &content)
+        let site = tally_wire::ReceiverSite::sign(&moved.identity, &content)
             .map_err(|error| error.to_string())?;
-        changed.push((at, Record::ReceiverInfo(info)));
+        changed.push((at, Record::ReceiverSite(site)));
     }
-    changed.push((half, Record::ReceiverInfo(late.info.clone())));
+    changed.push((half, Record::ReceiverSite(late.site.clone())));
     changed.sort_by_key(|(at, _)| *at);
     Ok(changed)
 }
@@ -158,19 +160,22 @@ pub fn replay(
     let mut next = 0;
     let mut published = Vec::new();
     let mut now = (first / tick_ms + 1) * tick_ms;
-    let mut descriptions: Vec<(u64, tally_wire::ReceiverInfo)> = Vec::new();
+    let mut descriptions: Vec<(u64, SiteRecord)> = Vec::new();
     while now <= until_ms {
         while let Some((at, record)) = arrivals.get(next).filter(|(at, _)| *at < now) {
-            if let Record::ReceiverInfo(info) = record {
-                descriptions.push((*at, info.clone()));
-            } else {
-                engine.ingest(record, *at)?;
+            match SiteRecord::of(record) {
+                Some(site) => descriptions.push((*at, site)),
+                // A format 2 description carries no site: nothing to take effect.
+                None if matches!(record, Record::ReceiverInfo(_)) => {}
+                None => {
+                    engine.ingest(record, *at)?;
+                }
             }
             next += 1;
         }
         engine.expire_orphans(now);
-        for (at, info) in crate::intake::taking_effect(descriptions.drain(..)) {
-            engine.ingest(&Record::ReceiverInfo(info), at)?;
+        for (at, site) in crate::intake::taking_effect(descriptions.drain(..)) {
+            engine.ingest(&site.record(), at)?;
         }
         for record in engine.provisional_step(now, now) {
             published.push((now, record));

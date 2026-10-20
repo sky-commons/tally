@@ -1,6 +1,8 @@
 //! The relay's station reports over HTTP (`--stats-listen`): read-only JSON, unauthenticated, for
 //! a process on the same host such as `tally-api`. It binds loopback only: the relay refuses any
-//! other address (`config::parse_stats_listen`).
+//! other address (`config::parse_loopback`), and `serve` refuses a listener bound anywhere
+//! else, so no other host reads it. What it serves is a client's (RFC-0171 §3.5): a receiver's
+//! public cell, never its site (`stations::StationReport::cell`).
 //!
 //! - `GET /stations`: every station held (`StationsReport`).
 //! - `GET /stations/{key}`: one (`StationReport`), the key as base64url without padding; 400 when
@@ -44,8 +46,10 @@ pub fn router(hub: Arc<Hub>) -> Router {
         .with_state(hub)
 }
 
-/// Serves `router` on `listener` for as long as the relay runs.
+/// Serves `router` on `listener` for as long as the relay runs. A listener not bound to a loopback
+/// address is refused before anything is served.
 pub async fn serve(listener: TcpListener, hub: Arc<Hub>) -> std::io::Result<()> {
+    crate::sockets::loopback_only(&listener, "--stats-listen")?;
     let listener = crate::egress::Listener::new(listener, Arc::clone(hub.egress()));
     axum::serve(listener, router(hub)).await
 }
@@ -211,7 +215,17 @@ mod tests {
             ),
             (key.to_base64(), true, true, 1, 3, 1, 3)
         );
-        assert_eq!(one.location, Some(location.into()));
+        // Its public cell, and nothing of its site: no coordinate, no altitude, in any form.
+        assert_eq!(
+            one.cell,
+            Some(crate::stations::cell_name(
+                tally_wire::Region::public_cell(&location).map_err(text)?
+            ))
+        );
+        for canary in ["51.5", "515000000", "-0.1", "-1000000"] {
+            assert!(!body.contains(canary), "{canary} in {body}");
+        }
+        assert!(!body.contains("alt"), "{body}");
         assert_eq!(one.software.as_deref(), Some("tally-feed 0.1.0"));
         assert_eq!(one.address.as_deref(), Some("198.51.100.4"));
 
@@ -246,7 +260,7 @@ mod tests {
         assert_eq!(status, 200, "{body}");
         let one: StationReport = serde_json::from_str(&body).map_err(text)?;
         assert_eq!(
-            (one.online, one.connected, one.batches, one.location),
+            (one.online, one.connected, one.batches, one.cell),
             (false, true, 0, None)
         );
         assert!(one.connected_since_ms.is_some());
@@ -256,13 +270,29 @@ mod tests {
         assert!(
             all.stations
                 .iter()
-                .all(|station| station.key != quiet.to_base64() || station.location.is_none())
+                .all(|station| station.key != quiet.to_base64() || station.cell.is_none())
         );
         hub.left(&quiet, 10);
         let (status, _) = get(address, &format!("/stations/{}", quiet.to_base64url())).await?;
         assert_eq!(status, 404);
         let (status, _) = get(address, "/stations/not-a-key").await?;
         assert_eq!(status, 400);
+        Ok(())
+    }
+
+    /// The stats endpoint refuses a listener bound anywhere but loopback: its reports are served to
+    /// no other host.
+    #[tokio::test]
+    async fn a_listener_off_loopback_is_refused() -> Result<(), String> {
+        let hub = Arc::new(Hub::new(8, crate::sharing::Deadlines::RELAY));
+        let listener = TcpListener::bind("0.0.0.0:0").await.map_err(text)?;
+        let refused = serve(listener, hub).await;
+        assert!(
+            refused
+                .as_ref()
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::InvalidInput),
+            "{refused:?}"
+        );
         Ok(())
     }
 

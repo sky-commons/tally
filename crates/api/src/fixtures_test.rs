@@ -4,8 +4,8 @@
 //! read the old shape.
 
 use tally_api_types::fixtures;
-use tally_relay::stations::{StationLocation, StationReport, StationsReport};
-use tally_wire::Identity;
+use tally_relay::stations::{StationReport, StationsReport, cell_name};
+use tally_wire::{Identity, Location, Region};
 
 use tally_api_types::{Aircraft, SourceCounts};
 
@@ -49,15 +49,24 @@ const READSB_LATER: &str = r#"{
     ]
 }"#;
 
-fn report(location: Option<StationLocation>, software: Option<&str>) -> StationReport {
-    report_of(location, software, 120_000)
+/// The public cell a station at `lat`, `lon` states, as the relay names it: all the relay tells
+/// a client of where a station is.
+fn cell_at(lat: f64, lon: f64) -> Option<String> {
+    Region::public_cell(&Location {
+        lat_e7: (lat * 1e7).round() as i32,
+        lon_e7: (lon * 1e7).round() as i32,
+        alt_m: 10,
+        precision_m: 0,
+    })
+    .ok()
+    .map(cell_name)
 }
 
-fn report_of(
-    location: Option<StationLocation>,
-    software: Option<&str>,
-    observations: u64,
-) -> StationReport {
+fn report(cell: Option<String>, software: Option<&str>) -> StationReport {
+    report_of(cell, software, 120_000)
+}
+
+fn report_of(cell: Option<String>, software: Option<&str>, observations: u64) -> StationReport {
     StationReport {
         key: station_key().to_base64(),
         online: true,
@@ -69,7 +78,7 @@ fn report_of(
         batches: 9_001,
         gaps: 3,
         observations,
-        location,
+        cell,
         software: software.map(str::to_owned),
         address: Some("203.0.113.7".to_owned()),
     }
@@ -224,11 +233,11 @@ fn the_streams_update_is_the_fixture() -> Result<(), String> {
 
 /// The report four seconds before `report`'s, 169 observations fewer: a rate of 42.25 a second,
 /// as the API derives it.
-fn earlier(location: Option<StationLocation>, software: Option<&str>) -> Stations {
+fn earlier(cell: Option<String>, software: Option<&str>) -> Stations {
     Stations::from_report(
         StationsReport {
             now_ms: NOW_MS - 4_000,
-            stations: vec![report_of(location, software, 120_000 - 169)],
+            stations: vec![report_of(cell, software, 120_000 - 169)],
         },
         None,
     )
@@ -236,18 +245,13 @@ fn earlier(location: Option<StationLocation>, software: Option<&str>) -> Station
 
 #[test]
 fn the_network_and_station_answers_are_the_fixtures() -> Result<(), String> {
-    let place = Some(StationLocation {
-        lat: 37.5,
-        lon: -122.25,
-        alt_m: 10,
-        precision_m: 0,
-    });
+    let place = cell_at(37.5, -122.25);
     let located = Stations::from_report(
         StationsReport {
             now_ms: NOW_MS,
-            stations: vec![report(place, Some("tally-feed 0.3.1"))],
+            stations: vec![report(place.clone(), Some("tally-feed 0.3.1"))],
         },
-        Some(&earlier(place, Some("tally-feed 0.3.1"))),
+        Some(&earlier(place.clone(), Some("tally-feed 0.3.1"))),
     );
     let counts = SourceCounts {
         adsb: 290,
@@ -288,7 +292,7 @@ fn the_network_and_station_answers_are_the_fixtures() -> Result<(), String> {
                 batches: 0,
                 gaps: 0,
                 observations: 0,
-                location: None,
+                cell: None,
                 software: Some("tally-feed 0.3.0".to_owned()),
                 address: None,
             }],
@@ -341,24 +345,16 @@ fn numbers(value: &serde_json::Value, into: &mut Vec<f64>) {
     }
 }
 
-/// No public answer that names a station carries its exact place: the station answer and the
-/// network's, as the API writes them, hold neither coordinate the receiver declared, and the
-/// API holds no exact place once it has read the relay's report.
+/// No public answer that names a station carries its exact place: the relay tells the API its
+/// public cell and nothing finer, and the station answer and the network's, as the API writes
+/// them, hold neither coordinate the receiver is at.
 #[test]
 fn no_public_answer_carries_a_receivers_exact_place() -> Result<(), String> {
     let (lat, lon) = (37.512_345_6, -122.251_234_5);
     let stations = Stations::from_report(
         StationsReport {
             now_ms: NOW_MS,
-            stations: vec![report(
-                Some(StationLocation {
-                    lat,
-                    lon,
-                    alt_m: 10,
-                    precision_m: 0,
-                }),
-                Some("tally-feed 0.3.1"),
-            )],
+            stations: vec![report(cell_at(lat, lon), Some("tally-feed 0.3.1"))],
         },
         None,
     );
@@ -377,12 +373,8 @@ fn no_public_answer_carries_a_receivers_exact_place() -> Result<(), String> {
     for exact in [lat, lon] {
         assert!(!written.contains(&exact), "{exact} served");
     }
-    // Near it: inside its 0.05 degree cell.
-    assert!(
-        (pin.lat - lat).abs() < 0.05 && (pin.lon - lon).abs() < 0.07,
-        "{pin:?}"
-    );
-    assert!(stations.by_key.values().all(|held| held.location.is_none()));
+    // Near it: inside its public cell.
+    assert_eq!(cell_at(pin.lat, pin.lon), cell_at(lat, lon), "{pin:?}");
     // The fixtures say the same of theirs: the place they were made from is not in them.
     for fixture in [fixtures::STATION, fixtures::STATION_OFFLINE] {
         let mut served = Vec::new();
@@ -395,11 +387,11 @@ fn no_public_answer_carries_a_receivers_exact_place() -> Result<(), String> {
     Ok(())
 }
 
-/// The feeder figures and boards the fixtures are: the feeders module's own records (two located
-/// feeders with standing and one that states no place), computed a minute after the first.
+/// The feeder figures and boards the fixtures are: the feeders module's own records (one relay's
+/// figures of two placed feeders with standing and one that names no cell), read as issued.
 fn board() -> crate::feeders::Board {
-    use crate::feeders::tests::{T, ledger, records, standing};
-    ledger(&records()).board(T + 60_000, standing)
+    use crate::feeders::tests::{H, T, ledger, records};
+    ledger(&records()).board(T + H)
 }
 
 #[test]
@@ -424,8 +416,8 @@ fn the_feeder_and_leaderboard_answers_are_the_fixtures() -> Result<(), String> {
         fixtures::LEADERBOARD,
     )?;
     // The same records while no feeder has standing: the area is answered, nobody is ranked.
-    use crate::feeders::tests::{T, ledger, records};
-    let unranked = ledger(&records()).board(T + 60_000, |_| false);
+    use crate::feeders::tests::{H, T, ledger, records_standing};
+    let unranked = ledger(&records_standing(false, false)).board(T + H);
     same(
         &unranked.leaderboard(&area).ok_or("no board")?,
         fixtures::LEADERBOARD_UNRANKED,

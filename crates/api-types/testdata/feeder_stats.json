@@ -1,10 +1,10 @@
 {
-  "now_ms": 1791220060000,
+  "now_ms": 1791223200000,
   "key": "6kpsY+KcUgq+9VB7Ey7F+ZVHdq6+vnuSQh7qaRRG0iw=",
-  "window_for_ms": 60000,
+  "window_for_ms": 3600000,
   "uptime": 1.0,
   "messages": 4,
-  "messages_per_sec": 0.06666666666666667,
+  "messages_per_sec": 0.0011111111111111111,
   "aircraft": 2,
   "range_m": 164133.0,
   "coverage_km2": 789.5,

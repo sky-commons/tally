@@ -1,6 +1,6 @@
 {
-  "now_ms": 1791220060000,
-  "window_for_ms": 60000,
+  "now_ms": 1791223200000,
+  "window_for_ms": 3600000,
   "area": "832834fffffffff",
   "center": {
     "lat": 37.097866,

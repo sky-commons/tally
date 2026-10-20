@@ -1,20 +1,24 @@
 //! MLAT positions (RFC-0171 §3.8.1): the API subscribes to the positions and clock model streams
-//! of every relay its operator names (and their raw, with `--mlat-raw`), merges them by the one
-//! client merge rule (`tally_merge`), and serves the merged position of an aircraft readsb holds no
-//! ADS-B position for. The merge runs on a thread of its own; what requests read is the snapshot it
-//! publishes, every aircraft's current fix.
+//! of every relay its operator names, as any client does, merges them by the one client merge rule
+//! (`tally_merge`), and serves the merged position of an aircraft readsb holds no ADS-B position
+//! for. The merge runs on a thread of its own; what requests read is the snapshot it publishes,
+//! every aircraft's current fix. The same subscription carries the relays' signed feeder figures
+//! (`crate::feeders`).
+//!
+//! A client holds no raw (wire version 3): a fix's check is its engine's signature, and its
+//! confidence is unconfirmed, since standing is a relay's ledger, not a client's.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use tally_api_types::{Aircraft, Mlat, MlatCheck, MlatConfidence, MlatKind, PositionSource};
-use tally_merge::{Check, Confidence, Kind, Merge};
-use tally_wire::{Identity, PublicKey, Record, RelayAddress};
+use tally_merge::{Kind, Merge};
+use tally_wire::{ClientRecord, Identity, PublicKey, RelayAddress};
 use tokio::sync::mpsc;
 
 use crate::area::Area;
-use crate::feeders::{LatLon, Ledger, Verdict};
+use crate::feeders::{LatLon, Ledger};
 
 /// How old an MLAT position may be and still be served, by default: readsb's own horizon for an
 /// aircraft it has stopped hearing.
@@ -41,10 +45,6 @@ pub const PRECISE_SKEW_MS: u64 = 10_000;
 pub struct Settings {
     /// The relays to subscribe to; none serves no MLAT.
     pub relays: Vec<RelayAddress>,
-    /// Merge from raw too, so models are verified by the model verifier, incomparable solutions
-    /// are solved over their union, and receivers earn standing (without which no feeder is
-    /// ranked). Raw is subscribed either way: the feeder figures read it.
-    pub raw: bool,
     pub max_age: Duration,
     /// This client's key file (`--key`): what the relays know it by. Without one a fresh key each
     /// run, which no relay vouches for.
@@ -58,7 +58,6 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             relays: Vec::new(),
-            raw: false,
             max_age: DEFAULT_MAX_AGE,
             key_file: None,
             linked: None,
@@ -155,19 +154,15 @@ pub fn served(merge: &Merge) -> Vec<Served> {
                 lon: f64::from(fix.lon_e7) / 1e7,
                 altitude_ft: fix.altitude_ft,
                 horizontal_sigma_m: fix.horizontal_sigma_m,
-                check: match fix.check {
-                    Check::Model => MlatCheck::Model,
-                    Check::Signature => MlatCheck::Signature,
-                    Check::Resolved => MlatCheck::Resolved,
-                },
+                // A client verifies a fix by its engine's signature: the model and resolved
+                // checks need raw, which is relay-only.
+                check: MlatCheck::Signature,
                 kind: match fix.kind {
                     Kind::Final => MlatKind::Final,
                     Kind::Provisional => MlatKind::Provisional,
                 },
-                confidence: match fix.confidence {
-                    Confidence::Standing => MlatConfidence::Standing,
-                    Confidence::Unconfirmed => MlatConfidence::Unconfirmed,
-                },
+                // Standing is a relay's ledger, kept from raw a client never holds.
+                confidence: MlatConfidence::Unconfirmed,
                 contested,
                 source: PositionSource::Mlat,
                 transmitted_ms: fix.transmitted.unix_ms,
@@ -180,14 +175,11 @@ pub fn served(merge: &Merge) -> Vec<Served> {
 
 /// The ground speed (knots) and track (degrees true) of an aircraft that moved from `before` to
 /// `after`, two fixes of it: along the great circle between them, the speed its length over their
-/// time apart and the track its initial bearing. `None` unless both are MLAT fixes whose receivers
-/// have standing and they are `VELOCITY_MIN_SPAN_MS` to `VELOCITY_MAX_SPAN_MS` apart; no track
-/// when they are at one place.
+/// time apart and the track its initial bearing. `None` unless both are MLAT fixes and they are
+/// `VELOCITY_MIN_SPAN_MS` to `VELOCITY_MAX_SPAN_MS` apart; no track when they are at one place.
 pub fn velocity(before: &Served, after: &Served) -> Option<(f64, Option<f64>)> {
-    let standing = |one: &Served| {
-        one.source == PositionSource::Mlat && one.confidence == MlatConfidence::Standing
-    };
-    if !standing(before) || !standing(after) || before.address != after.address {
+    let mlat = |one: &Served| one.source == PositionSource::Mlat;
+    if !mlat(before) || !mlat(after) || before.address != after.address {
         return None;
     }
     let span_ms = after.transmitted_ms.checked_sub(before.transmitted_ms)?;
@@ -325,46 +317,12 @@ impl Positions {
     }
 }
 
-/// The receivers with standing at `now_ms` by the merge's ledger (RFC-0174 §2.12, the rule's
-/// `has_standing`). The ledger settles against the raw the merge holds, so without `--mlat-raw`
-/// no receiver has standing and no feeder is ranked.
-pub fn with_standing(merge: &Merge, now_ms: u64) -> BTreeSet<PublicKey> {
-    let period = tally_mlat_solver::standing::period_of(now_ms);
-    merge
-        .standing()
-        .book()
-        .receivers()
-        .iter()
-        .filter(|(_, standing)| standing.has_standing(period))
-        .map(|(key, _)| *key)
-        .collect()
-}
-
-/// The merge's verdict is what the feeder figures credit by (`crate::feeders`): a final position
-/// counts only when the merge holds it, and a reception it cites only when the receiver's own
-/// signed raw the merge holds has it.
-impl Verdict for Merge {
-    fn accepted(&self, solution: &tally_wire::Solution) -> bool {
-        self.holds(solution)
-    }
-
-    fn heard(
-        &self,
-        reception: &tally_wire::Reception,
-        message: &[u8],
-        transmitted_ms: u64,
-    ) -> bool {
-        Merge::heard(self, reception, message, transmitted_ms)
-    }
-}
-
-/// Subscribes to every relay and keeps `positions`, the feeder ledger and `standing` current, for
-/// as long as the API runs.
+/// Subscribes to every relay and keeps `positions` and the feeder figures current, for as long as
+/// the API runs.
 pub fn start(
     settings: &Settings,
     positions: Arc<Positions>,
     feeders: Arc<Mutex<Ledger>>,
-    standing_now: Arc<RwLock<Arc<BTreeSet<PublicKey>>>>,
 ) -> Result<(), String> {
     if settings.relays.is_empty() {
         return Ok(());
@@ -375,10 +333,10 @@ pub fn start(
         Some(linked) => tally_merge::link::Vouching::linked_to(linked.key),
         None => tally_merge::link::Vouching::none(),
     };
-    let (inbound, mut records) = mpsc::channel::<Record>(INBOUND);
-    // Raw always: the feeder figures are computed from receivers' signed batches. And the
-    // precise world product, for the precise feed.
-    let streams = tally_merge::link::streams(true).with(tally_wire::Streams::WORLD_PRECISE);
+    let (inbound, mut records) = mpsc::channel::<ClientRecord>(INBOUND);
+    // What the merge reads, the relays' feeder figures among it; and the precise world product,
+    // for the precise feed. No raw: it is relay-only.
+    let streams = tally_merge::link::streams().with(tally_wire::Streams::WORLD_PRECISE);
     for relay in &settings.relays {
         tokio::spawn(tally_merge::link::subscribe_vouched(
             relay.clone(),
@@ -388,33 +346,32 @@ pub fn start(
             vouching.clone(),
         ));
     }
-    let raw = settings.raw;
     // The merge's checks and fits are computation, not I/O: a thread of their own.
     tokio::task::spawn_blocking(move || {
-        let mut merge = Merge::new(tally_merge::Settings::new(raw));
+        let mut merge = Merge::new(tally_merge::Settings::default());
         let mut published = std::time::Instant::now();
         let mut dirty = false;
         let mut precise = PreciseWorld::default();
         while let Some(record) = records.blocking_recv() {
             let now_ms = wall_ms();
-            if let Record::WorldPrecise(world) = &record {
-                if precise.take(world, now_ms) {
-                    positions.set_precise(precise.second, precise.served());
+            match &record {
+                ClientRecord::WorldPrecise(world) => {
+                    if precise.take(world, now_ms) {
+                        positions.set_precise(precise.second, precise.served());
+                    }
                 }
-                continue;
-            }
-            match merge.ingest(&record, now_ms) {
-                Ok(_) => dirty = true,
-                Err(error) => eprintln!("tally-api: mlat: {error}"),
-            }
-            if let Ok(mut ledger) = feeders.lock() {
-                ledger.ingest(&record, now_ms, &merge);
+                ClientRecord::FeederFigures(figures) => {
+                    if let Ok(mut ledger) = feeders.lock() {
+                        ledger.ingest(figures, now_ms);
+                    }
+                }
+                _ => match merge.ingest(&record, now_ms) {
+                    Ok(_) => dirty = true,
+                    Err(error) => eprintln!("tally-api: mlat: {error}"),
+                },
             }
             if dirty && (records.is_empty() || published.elapsed() >= PUBLISH_EVERY) {
                 positions.set(served(&merge));
-                if let Ok(mut held) = standing_now.write() {
-                    *held = Arc::new(with_standing(&merge, now_ms));
-                }
                 published = std::time::Instant::now();
                 dirty = false;
             }
@@ -517,7 +474,7 @@ mod tests {
             horizontal_sigma_m: 30.0,
             check: MlatCheck::Signature,
             kind: MlatKind::Final,
-            confidence: MlatConfidence::Standing,
+            confidence: MlatConfidence::Unconfirmed,
             contested: false,
             source: PositionSource::Mlat,
             transmitted_ms,
@@ -723,13 +680,19 @@ mod tests {
         Ok(())
     }
 
-    /// Fixes closer than a second or further than a minute apart, or either without standing,
-    /// give no velocity; nor do two at one place give a track.
+    /// Fixes closer than a second or further than a minute apart, or either not MLAT, give no
+    /// velocity; nor do two at one place give a track. Standing is not asked: a client holds
+    /// none, and every fix it serves is unconfirmed.
     #[test]
-    fn a_velocity_needs_two_standing_fixes_a_second_to_a_minute_apart() {
+    fn a_velocity_needs_two_mlat_fixes_a_second_to_a_minute_apart() {
         let at = |lat, transmitted_ms| one(1, lat, transmitted_ms);
         let unconfirmed = Served {
             confidence: MlatConfidence::Unconfirmed,
+            ..at(52.01, 110_000)
+        };
+        assert!(velocity(&at(52.0, 100_000), &unconfirmed).is_some());
+        let adsb = Served {
+            source: PositionSource::Adsb,
             ..at(52.01, 110_000)
         };
         assert!(velocity(&at(52.0, 100_000), &at(52.01, 101_000)).is_some());
@@ -738,8 +701,8 @@ mod tests {
             (at(52.0, 100_000), at(52.01, 100_999)),
             (at(52.0, 100_000), at(52.01, 160_001)),
             (at(52.01, 110_000), at(52.0, 100_000)),
-            (at(52.0, 100_000), unconfirmed.clone()),
-            (unconfirmed, at(52.0, 120_000)),
+            (at(52.0, 100_000), adsb.clone()),
+            (adsb, at(52.0, 120_000)),
             (one(2, 52.0, 100_000), at(52.01, 110_000)),
         ] {
             assert_eq!(velocity(&before, &after), None, "{before:?} {after:?}");

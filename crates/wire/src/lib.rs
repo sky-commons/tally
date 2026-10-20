@@ -5,6 +5,7 @@
 pub mod backoff;
 pub mod batch;
 pub mod beast;
+pub mod client;
 pub mod clock_model;
 pub mod credit;
 pub mod cut;
@@ -12,6 +13,7 @@ pub mod decoded;
 pub mod delivery;
 pub mod directory;
 pub mod fault_proof;
+pub mod figures;
 pub mod key;
 pub mod modes;
 pub mod noise;
@@ -24,47 +26,68 @@ pub mod region;
 pub mod rendezvous;
 pub mod sharing;
 mod signed;
+pub mod site;
 
 pub use batch::{
-    Batch, BatchContent, BatchDraft, Clock, Codec, Location, Observation, ReceiverInfo,
+    Batch, BatchContent, BatchDraft, Clock, Codec, Description, Location, Observation,
+    PublicInfoContent, ReceiverInfo,
 };
 pub use beast::{Frame, FrameKind};
 /// The shared byte buffer batches are held in, so a crate reading them needs no dependency of its own.
 pub use bytes::Bytes;
+pub use client::{
+    ClientEvidence, ClientFaultProof, ClientRecord, PublicReceiverInfo, TaggedPositions,
+};
 pub use clock_model::{
-    Assembler, ClockModel, ClockModelContent, ClockModelPart, Manifest, SignedClockModel,
+    Assembler, CLIENT_MODEL_LEN, ClientClockModel, ClientClockModelContent, ClockModel,
+    ClockModelContent, ClockModelPart, Manifest, SignedClockModel,
 };
 pub use credit::{
-    EvidenceBundle, EvidenceBundleContent, FirehoseCredential, FirehoseCredentialContent,
+    EVIDENCE_FORMAT_REFERENCED, Evidence, EvidenceBundle, EvidenceBundleContent, FeederReference,
+    FirehoseCredential, FirehoseCredentialContent, ReferencedEvidenceContent,
 };
 pub use cut::{
     CUT_REFRESH_STEPS, CUT_TTL_STEPS, MAX_CUT_AREAS, MAX_CUT_FROM_MS, MlatCut, MlatCutContent,
 };
-pub use decoded::{Decoded, FingerprintKey, ObsRef, ObsView, Undecodable};
+pub use decoded::{ClientObsView, Decoded, FingerprintKey, ObsRef, ObsView, Undecodable};
 pub use delivery::{
     DeliveryAnswer, DeliveryAnswerContent, DeliveryQuery, Possession, SequenceRange, Tag, TagKey,
     TagKeys, TagKeysContent, delivery_tag,
 };
 pub use directory::{ProviderOffer, ProviderOfferContent, ProviderQuery};
 pub use fault_proof::{Fault, FaultProof, ModelFault, SolutionFault, Tolerance};
+pub use figures::{
+    FIGURES_BUCKET_MS, FIGURES_WINDOW_MS, FeederFigure, FeederFigures, FeederFiguresContent,
+    MAX_FEEDER_FIGURES,
+};
 pub use key::{Identity, PublicKey};
-pub use noise::{Accepted, Reader, Session, Writer};
-pub use observation_set::{Citations, ObservationIdentity, ObservationSet, Reception, Relation};
+pub use noise::{Accepted, Outgoing, Reader, Session, Writer};
+pub use observation_set::{
+    Citations, ObservationIdentity, ObservationSet, Reception, Relation, TaggedSet,
+};
 pub use positions::{
-    AddressedCitation, EnuCovariance, Positions, Solution, SolutionsContent, TransmitTime,
+    AddressedCitation, EnuCovariance, Observed, Positions, Solution, SolutionsContent,
+    TaggedSolution, TaggedSolutionsContent, TransmitTime,
 };
 pub use probe::{Echo, EchoReply, EchoReplyContent, Headroom};
 pub use products::{
-    RegionalBatch, RegionalBatchContent, RegionalDraft, WorldCandidate, WorldFix, WorldPositions,
+    ClientObservation, ClientRegionalBatch, ClientRegionalBatchContent, RegionalBatch,
+    RegionalBatchContent, RegionalDraft, WorldCandidate, WorldFix, WorldPositions,
     WorldPositionsContent, WorldPrecise,
 };
-pub use record::{Reason, Record, RelayAddress, Role, Streams};
+pub use record::{
+    Reason, Record, RelayAddress, Role, SITES_VERSION, Streams, carries_sites, least_version,
+};
 pub use region::{Region, Regions};
 pub use sharing::{
     BundleIndex, BundleIndexContent, HaveSummary, ParityChunk, PieceManifest, PieceManifestContent,
     StripeAssignment, StripeReceipt, StripeReceiptContent,
 };
 pub use signed::Check;
+pub use site::{
+    PUBLIC_CELL_RESOLUTION, ReceiverSite, ReceiverSiteContent, ReceptionKey, ReceptionTag,
+    SHARING_AREA_RESOLUTION, SiteId,
+};
 
 /// Everything that can go wrong on the wire. Any of these ends the connection.
 #[derive(Debug, thiserror::Error)]

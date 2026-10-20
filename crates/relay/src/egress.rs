@@ -282,6 +282,10 @@ impl Class {
             KIND_STRIPE_RECEIPT, KIND_SUBSCRIBE, KIND_WELCOME, KIND_WORLD_POSITIONS,
             KIND_WORLD_PRECISE,
         };
+        use tally_wire::record::{
+            KIND_CLIENT_CLOCK_MODEL, KIND_CLIENT_REGIONAL_BATCH, KIND_FEEDER_FIGURES,
+            KIND_RECEIVER_SITE,
+        };
         let forwards = kind.forwards();
         match record {
             KIND_HELLO
@@ -304,14 +308,25 @@ impl Class {
             | KIND_FIREHOSE_CREDENTIAL => Self::Control,
             KIND_PROVIDER_OFFER | KIND_EVIDENCE_BUNDLE if !forwards => Self::Control,
             _ if !forwards => Self::Taker,
-            KIND_POSITIONS | KIND_CLOCK_MODEL | KIND_CLOCK_MODEL_PART | KIND_FAULT_PROOF => {
-                Self::Positions
-            }
-            KIND_BATCH | KIND_RECEIVER_INFO => Self::Raw,
+            KIND_POSITIONS
+            | KIND_CLOCK_MODEL
+            | KIND_CLOCK_MODEL_PART
+            | KIND_FAULT_PROOF
+            | KIND_CLIENT_CLOCK_MODEL => Self::Positions,
+            // A receiver's site travels with its description and raw, relay to relay only.
+            KIND_BATCH | KIND_RECEIVER_INFO | KIND_RECEIVER_SITE => Self::Raw,
             KIND_PROVISIONAL => Self::Provisional,
-            KIND_RELAY_BATCH | KIND_PROVIDER_OFFER | KIND_EVIDENCE_BUNDLE | KIND_PIECE_MANIFEST
-            | KIND_PARITY | KIND_REGIONAL_BATCH | KIND_BUNDLE_INDEX | KIND_WORLD_POSITIONS
-            | KIND_WORLD_PRECISE => Self::Forwarded,
+            KIND_RELAY_BATCH
+            | KIND_PROVIDER_OFFER
+            | KIND_EVIDENCE_BUNDLE
+            | KIND_PIECE_MANIFEST
+            | KIND_PARITY
+            | KIND_REGIONAL_BATCH
+            | KIND_BUNDLE_INDEX
+            | KIND_WORLD_POSITIONS
+            | KIND_WORLD_PRECISE
+            | KIND_CLIENT_REGIONAL_BATCH
+            | KIND_FEEDER_FIGURES => Self::Forwarded,
             // A kind this build does not know is never sent; were it, it would wait with the
             // rest of what is shared.
             _ => Self::Forwarded,
@@ -1263,7 +1278,7 @@ mod tests {
         use Class::{Control as C, Forwarded as F, Positions as P, Provisional as V, Raw as R};
         use tally_wire::record::KINDS;
         const T: Class = Class::Taker;
-        let table: [(u8, &str, Class, Class); 34] = [
+        let table: [(u8, &str, Class, Class); 38] = [
             (0x01, "Hello", C, C),
             (0x02, "Welcome", C, C),
             (0x03, "Batch", R, T),
@@ -1300,6 +1315,12 @@ mod tests {
             (0x23, "DeliveryAnswer", C, C),
             // A few bytes a relay sends the relays holding its areas, which apply it at a step.
             (0x24, "MlatCut", C, C),
+            // Wire version 3 (site privacy).
+            (0x25, "ReceiverSite", R, T),
+            (0x26, "ClientClockModel", P, T),
+            (0x27, "ClientRegionalBatch", F, T),
+            // A relay's feeder figures (RFC-0174 §2.12), a product on client links.
+            (0x28, "FeederFigures", F, T),
         ];
         let kinds: Vec<u8> = table.iter().map(|(kind, ..)| *kind).collect();
         assert_eq!(

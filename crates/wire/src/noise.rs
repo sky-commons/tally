@@ -21,7 +21,6 @@
 //! every byte any holder wrote before the pool keeps it, so no session's plaintext outlives its
 //! message in memory, and a holder reads zeros wherever it has not written.
 
-use std::borrow::Borrow;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -31,7 +30,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, Wr
 
 use crate::WireError;
 use crate::key::{Identity, KEY_HINT_LEN, KEY_LEN, PublicKey, hint_of};
-use crate::record::{MAX_VERSION, MIN_VERSION, Reason, Record, Role};
+use crate::record::{MAX_VERSION, MIN_VERSION, Reason, Record, Role, least_version};
 
 pub const PATTERN: &str = "Noise_IK_25519_ChaChaPoly_BLAKE2s";
 
@@ -285,7 +284,7 @@ where
             local,
             remote,
             (role, first),
-            (MIN_VERSION, MAX_VERSION),
+            (least_version(role), MAX_VERSION),
             &POOL,
         ),
     )
@@ -337,7 +336,11 @@ where
     // Only the answer's first record is read: whatever else its message holds is never decoded.
     let answer = reader.recv_message().await?.next()?;
     match answer {
-        Some(Record::Welcome { version }) if (MIN_VERSION..=MAX_VERSION).contains(&version) => {
+        // A welcome below what this side said it needs (`least_version` for its role) is no
+        // welcome: a responder that ignored the least gets no session.
+        Some(Record::Welcome { version })
+            if (min_version.max(MIN_VERSION)..=MAX_VERSION).contains(&version) =>
+        {
             Ok(Session {
                 reader,
                 writer,
@@ -469,7 +472,9 @@ where
         });
     };
     let version = max_version.min(MAX_VERSION);
-    if version < min_version.max(MIN_VERSION) {
+    // The least this role may agree (`least_version`): a relay or an engine older than version 3
+    // is refused here, as an initiator of no version this build speaks is.
+    if version < min_version.max(least_version(role)) {
         writer
             .send(&[Record::Goodbye {
                 reason: Reason::Version,
@@ -670,6 +675,68 @@ impl Message {
     }
 }
 
+/// What a [`Writer`] sends: a record it measures and writes as its own encoding says. A relay's
+/// links send [`Record`]s; its client links send only [`crate::ClientRecord`]s, so a client link
+/// is typed against what a client may be sent, and a signed record's bytes are written where they
+/// are, never copied into another type first. Anything that lends one (an `Arc` shared by many
+/// links, a reference) sends as it.
+pub trait Outgoing {
+    /// The bytes `encode` writes.
+    fn encoded_len(&self) -> usize;
+    /// Appends the record to `out`.
+    fn encode(&self, out: &mut Vec<u8>) -> Result<(), WireError>;
+}
+
+impl Outgoing for Record {
+    fn encoded_len(&self) -> usize {
+        Record::encoded_len(self)
+    }
+
+    fn encode(&self, out: &mut Vec<u8>) -> Result<(), WireError> {
+        Record::encode(self, out)
+    }
+}
+
+impl Outgoing for crate::client::ClientRecord {
+    fn encoded_len(&self) -> usize {
+        crate::client::ClientRecord::encoded_len(self)
+    }
+
+    fn encode(&self, out: &mut Vec<u8>) -> Result<(), WireError> {
+        crate::client::ClientRecord::encode(self, out)
+    }
+}
+
+impl<T: Outgoing + ?Sized> Outgoing for &T {
+    fn encoded_len(&self) -> usize {
+        (**self).encoded_len()
+    }
+
+    fn encode(&self, out: &mut Vec<u8>) -> Result<(), WireError> {
+        (**self).encode(out)
+    }
+}
+
+impl<T: Outgoing + ?Sized> Outgoing for Arc<T> {
+    fn encoded_len(&self) -> usize {
+        (**self).encoded_len()
+    }
+
+    fn encode(&self, out: &mut Vec<u8>) -> Result<(), WireError> {
+        (**self).encode(out)
+    }
+}
+
+impl<T: Outgoing + ?Sized> Outgoing for Box<T> {
+    fn encoded_len(&self) -> usize {
+        (**self).encoded_len()
+    }
+
+    fn encode(&self, out: &mut Vec<u8>) -> Result<(), WireError> {
+        (**self).encode(out)
+    }
+}
+
 /// The sending half of a session. Records are packed into as few messages as fit, in buffers
 /// taken from the pool for the send and given back after it: it holds none between sends, and at
 /// most [`WRITER_BUFFERS`] during one.
@@ -695,13 +762,14 @@ impl<S: AsyncWrite> Writer<S> {
     }
 
     /// Sends the records, in order, in one or more messages, and flushes.
-    /// `R` is `Record` or anything that lends one (an `Arc<Record>` shared by many subscribers).
+    /// `R` is anything [`Outgoing`]: a `Record`, a `ClientRecord`, or an `Arc` of either shared by
+    /// many links.
     ///
     /// Fails with `Timeout` after `WRITE_TIMEOUT`; the writer is then mid-frame and the session must
     /// end.
     pub async fn send<R>(&mut self, records: &[R]) -> Result<(), WireError>
     where
-        R: Borrow<Record> + Sync,
+        R: Outgoing + Sync,
     {
         tokio::time::timeout(WRITE_TIMEOUT, self.send_now(records))
             .await
@@ -719,13 +787,12 @@ impl<S: AsyncWrite> Writer<S> {
 
     async fn send_now<R>(&mut self, records: &[R]) -> Result<(), WireError>
     where
-        R: Borrow<Record> + Sync,
+        R: Outgoing + Sync,
     {
         let mut plaintext = Buffer::take_from(self.pool);
         let mut ciphertext = Buffer::take_from(self.pool);
         plaintext.truncate(0);
         for record in records {
-            let record = record.borrow();
             // Measured before it is written, and the message sealed first when it would not fit
             // after what is there: a message's plaintext never passes `MAX_PLAINTEXT`, so the
             // buffer never grows past a message and nothing is moved.
@@ -909,6 +976,47 @@ mod tests {
         let accepted = accept(far, &[relay]).await?;
         assert_eq!((accepted.session.version, accepted.role), (2, Role::Probe));
         assert_eq!(join(dial.await)??.version, 2);
+        Ok(())
+    }
+
+    /// A relay-role peer older than version 3 is refused at the handshake (`least_version`), and
+    /// a client of version 2 is still welcomed: only relays and engines move to 3.
+    #[tokio::test]
+    async fn a_relay_or_an_engine_older_than_version_3_is_refused_and_a_client_is_not()
+    -> Result<(), WireError> {
+        for role in [Role::Relay, Role::Engine] {
+            let relay = Identity::generate()?;
+            let older = Identity::generate()?;
+            let (near, far) = tokio::io::duplex(1 << 16);
+            let relay_key = relay.public();
+            let dial = tokio::spawn(async move {
+                initiate(near, &older, &relay_key, (role, &[]), (2, 2), &POOL).await
+            });
+            assert!(accept(far, &[relay]).await.is_err());
+            assert!(matches!(
+                join(dial.await)?,
+                Err(WireError::Refused {
+                    reason: Reason::Version,
+                    ..
+                })
+            ));
+        }
+        for role in [Role::Feeder, Role::Subscriber, Role::Probe] {
+            let relay = Identity::generate()?;
+            let client = Identity::generate()?;
+            let (near, far) = tokio::io::duplex(1 << 16);
+            let relay_key = relay.public();
+            let dial = tokio::spawn(async move {
+                initiate(near, &client, &relay_key, (role, &[]), (2, 2), &POOL).await
+            });
+            let accepted = accept(far, &[relay]).await?;
+            assert_eq!((accepted.session.version, accepted.role), (2, role));
+            assert_eq!(join(dial.await)??.version, 2);
+        }
+        // A relay dialling says 3 as its least, so a responder of version 2 alone cannot welcome it.
+        assert_eq!(least_version(Role::Relay), crate::SITES_VERSION);
+        assert_eq!(least_version(Role::Engine), crate::SITES_VERSION);
+        assert_eq!(least_version(Role::Feeder), MIN_VERSION);
         Ok(())
     }
 

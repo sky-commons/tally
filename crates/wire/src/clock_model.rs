@@ -358,6 +358,100 @@ impl ClockModel {
     }
 }
 
+/// A clock model as a client receives it (wire version 3): the full model (`ClockModel`, its
+/// sites, `site_mm` and offsets) is relay-only, since sites and offsets with the aircraft's
+/// positions give every receiver's site; a client is sent this summary instead, signed by the same
+/// engine under a domain of its own. It names the full model by the id solutions cite, so a client
+/// joins a solution to its model's summary, and says nothing of which receivers the model is of:
+/// no receiver key, no site reference, no entry per receiver. A tile's members are chosen by
+/// their exact sites (a sphere test about the tile's centre, and the farthest-point choice of
+/// members), so the tiles a receiver is a member of, over time, narrow its site to a fraction of
+/// its public cell; membership is relay-only like the site itself.
+///
+/// ```text
+/// format u8 = 1 | engine key [32] | boot_id u64 | sequence u64 | issued_ms u64
+/// | spec_version u16 | model id [32] | inputs [32] | window first i64 | window last i64
+/// | signature [64]
+/// ```
+///
+/// Its boot id and sequence are the full model's, so a summary is numbered with the model it
+/// summarises. `inputs` is the full model's inputs hash: equal for two models of the same inputs,
+/// and a function of the members' site ids, which a client is never sent, so it names no member.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClientClockModelContent {
+    pub boot_id: u64,
+    pub sequence: u64,
+    pub issued_ms: u64,
+    pub spec_version: u16,
+    /// The full model's `ClockModel::id`: what a solution's `clock_model` names.
+    pub model: Hash,
+    /// The full model's `Manifest::inputs`.
+    pub inputs: Hash,
+    /// The window the model is of, as the solver specification numbers windows.
+    pub window_first: i64,
+    pub window_last: i64,
+}
+
+/// A client model's bytes, signature included: it is of one size.
+pub const CLIENT_MODEL_LEN: usize = 1 + KEY_LEN + 8 + 8 + 8 + 2 + 32 + 32 + 8 + 8 + SIGNATURE_LEN;
+
+impl crate::signed::Check for ClientClockModelContent {
+    /// A window that does not end before it begins.
+    fn check(&self) -> Result<(), WireError> {
+        if self.window_first > self.window_last {
+            return Err(WireError::Invalid {
+                field: "client clock model window",
+                value: 0,
+            });
+        }
+        Ok(())
+    }
+}
+
+impl crate::signed::Fields for ClientClockModelContent {
+    fn write(model: crate::signed::Checked<'_, Self>, out: &mut Vec<u8>) -> Result<(), WireError> {
+        out.extend_from_slice(&model.boot_id.to_be_bytes());
+        out.extend_from_slice(&model.sequence.to_be_bytes());
+        out.extend_from_slice(&model.issued_ms.to_be_bytes());
+        out.extend_from_slice(&model.spec_version.to_be_bytes());
+        out.extend_from_slice(&model.model);
+        out.extend_from_slice(&model.inputs);
+        out.extend_from_slice(&model.window_first.to_be_bytes());
+        out.extend_from_slice(&model.window_last.to_be_bytes());
+        Ok(())
+    }
+
+    fn read(reader: &mut Body<'_>) -> Result<crate::signed::Unchecked<Self>, WireError> {
+        let boot_id = reader.u64()?;
+        let sequence = reader.u64()?;
+        let issued_ms = reader.u64()?;
+        let spec_version = reader.u16()?;
+        let model = reader.array()?;
+        let inputs = reader.array()?;
+        let window_first = reader.u64()? as i64;
+        let window_last = reader.u64()? as i64;
+        Ok(crate::signed::Unchecked::new(Self {
+            boot_id,
+            sequence,
+            issued_ms,
+            spec_version,
+            model,
+            inputs,
+            window_first,
+            window_last,
+        }))
+    }
+}
+
+crate::signed::signed_record!(
+    /// An engine's signed `ClientClockModelContent`: the clock model a client is sent.
+    ClientClockModel,
+    ClientClockModelContent,
+    b"tally client clock model",
+    1,
+    MAX_BODY
+);
+
 fn id_of(signed: &[u8]) -> Hash {
     Blake2s256::digest(domain(CLOCK_MODEL_ID_DOMAIN, signed)).into()
 }
@@ -702,6 +796,51 @@ mod tests {
         small.part(signed.parts[1].clone());
         assert!(small.bytes <= PART_LEN + 1000);
         assert_eq!(small.parts.len(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn a_client_model_round_trips_and_names_no_receiver() -> Result<(), WireError> {
+        let engine = Identity::generate()?;
+        let content = ClientClockModelContent {
+            boot_id: 1,
+            sequence: 2,
+            issued_ms: 3,
+            spec_version: 6,
+            model: [4; 32],
+            inputs: [5; 32],
+            window_first: -7,
+            window_last: 8,
+        };
+        let signed = ClientClockModel::sign(&engine, &content)?;
+        let back = ClientClockModel::from_bytes(signed.as_bytes().to_vec())?;
+        back.verify()?;
+        assert_eq!(back.content()?, content);
+        // One size: no room for a member of any kind.
+        assert_eq!(back.as_bytes().len(), CLIENT_MODEL_LEN);
+        // Its signature is no full model's.
+        assert!(
+            ClockModel::from_bytes(signed.as_bytes().to_vec())?
+                .verify()
+                .is_err()
+        );
+        // Bytes appended to what was signed (a scope smuggled in) do not verify.
+        let mut longer = signed.as_bytes().to_vec();
+        longer.splice(
+            longer.len() - SIGNATURE_LEN..longer.len() - SIGNATURE_LEN,
+            [0u8; 2],
+        );
+        assert!(
+            ClientClockModel::from_bytes(longer)
+                .and_then(|model| model.verify())
+                .is_err()
+        );
+        // A window ending before it begins: refused.
+        let inverted = ClientClockModelContent {
+            window_first: 9,
+            ..content
+        };
+        assert!(ClientClockModel::sign(&engine, &inverted).is_err());
         Ok(())
     }
 

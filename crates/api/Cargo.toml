@@ -27,7 +27,6 @@ serde.workspace = true
 serde_json.workspace = true
 tally-api-types.workspace = true
 tally-merge.workspace = true
-tally-mlat-solver.workspace = true
 tally-relay.workspace = true
 tally-wire.workspace = true
 tokio.workspace = true
@@ -39,3 +38,4 @@ workspace = true
 [dev-dependencies]
 # The end-to-end test runs real engines on the simulator's receivers.
 tally-mlat.workspace = true
+tally-mlat-solver.workspace = true

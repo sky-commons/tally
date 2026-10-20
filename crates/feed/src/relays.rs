@@ -12,6 +12,13 @@
 //! minutes a delivery check (`delivery_check`) asks the area's sharing group whether a relay's
 //! batches arrived, and a relay found swallowing them is left for days.
 //!
+//! The receiver's site is relay-only (RFC-0171 §8.3). The feeder publishes only to a relay that
+//! negotiated `tally_wire::SITES_VERSION`, and so keeps sites off client links: an older relay is
+//! sent nothing at all and left (`OLD_RELAY_WAIT`). A relay is sent the receiver's site
+//! (`ReceiverSite`) and its public description (a format 2 `ReceiverInfo`: its public cell, never
+//! its site). The area the feeder chooses relays by, and so the relays its description names, is
+//! the public cell's (`Directory::area`), so nothing it publishes says more than the public cell.
+//!
 //! A session ends when the relay stops reading (a send waits at most `noise::WRITE_TIMEOUT`) and
 //! when the reader fails (closed, or silent for `READ_TIMEOUT`), even while a send is pending.
 
@@ -25,7 +32,8 @@ use tally_wire::backoff::Backoff;
 use tally_wire::noise;
 use tally_wire::{
     Batch, Clock, DeliveryAnswer, DeliveryQuery, Identity, Location, ProviderOffer, ProviderQuery,
-    PublicKey, Reason, ReceiverInfo, Record, Region, RelayAddress, Role, Streams,
+    PublicInfoContent, PublicKey, Reason, ReceiverInfo, ReceiverSite, ReceiverSiteContent, Record,
+    Region, RelayAddress, Role, Streams, carries_sites,
 };
 use tokio::net::TcpStream;
 use tokio::sync::{broadcast, mpsc, watch};
@@ -58,6 +66,9 @@ const REPORT_EVERY: Duration = Duration::from_secs(600);
 /// (a restart, memory pressure) has it back within this long, not at the next change of relays.
 /// The session asks for its area's offers as often.
 const INFO_EVERY: Duration = Duration::from_secs(600);
+/// How long a relay that negotiated a wire version older than `tally_wire::SITES_VERSION` is left
+/// before it is dialled again: it may have been upgraded by then.
+const OLD_RELAY_WAIT: Duration = Duration::from_secs(3_600);
 /// The least burst a relay's rate limit is given: the largest record one message carries, so a
 /// batch always fits, however small a burst the relay asked for.
 const BURST_FLOOR: u32 = noise::MAX_PLAINTEXT as u32;
@@ -247,6 +258,28 @@ fn random_below(n: usize) -> usize {
     usize::try_from(u64::from_be_bytes(bytes) % n).unwrap_or(0)
 }
 
+/// What the feeder says about itself, signed together under one `issued_ms`: its public
+/// description and its site. Only a relay that keeps sites off client links is sent either
+/// (`refuse_old_relay`).
+#[derive(Debug)]
+pub struct Announcement {
+    /// A format 2 `ReceiverInfo`: the public cell, the clock, the software and the relays held.
+    info: Arc<Record>,
+    /// A `ReceiverSite`: the snapped location. None without a location.
+    site: Option<Arc<Record>>,
+}
+
+impl Announcement {
+    /// The records a relay session sends: the site, if any, ahead of the description, so the
+    /// relay can pair them as the description arrives.
+    pub fn records(&self) -> Vec<Arc<Record>> {
+        let mut out = Vec::with_capacity(2);
+        out.extend(self.site.clone());
+        out.push(Arc::clone(&self.info));
+        out
+    }
+}
+
 /// What the feeder knows of relays, which it is using, and what it says about itself.
 pub struct Directory {
     state_dir: PathBuf,
@@ -254,13 +287,15 @@ pub struct Directory {
     identity: Identity,
     location: Option<Location>,
     clock: Clock,
-    info: watch::Sender<Arc<Record>>,
+    info: watch::Sender<Arc<Announcement>>,
+    /// The relays already said (in the log) to be too old to publish to, so each is said once.
+    too_old: Mutex<HashSet<PublicKey>>,
 }
 
 impl Directory {
     /// `configured` are the owner's (`--relay`), `seeds` the binary's: both candidates, never
-    /// pinned. `location` is the antenna's as the owner gave it; the directory holds, signs and
-    /// chooses by it snapped to its precision (`precision::snap`), and never keeps the exact one.
+    /// pinned. `location` is the antenna's as the owner gave it; the directory holds and signs it
+    /// snapped to its precision (`precision::snap`), and never keeps the exact one.
     pub fn new(
         state_dir: PathBuf,
         configured: Vec<RelayAddress>,
@@ -290,26 +325,58 @@ impl Directory {
             }
         }
         relays.changed = false;
-        let info = sign_info(&identity, location, clock, &[])?;
+        let info = sign_announcement(&identity, location, clock, &[])?;
         Ok(Arc::new(Self {
             state_dir,
             relays: Mutex::new(relays),
             identity,
             location,
             clock,
-            info: watch::channel(Arc::new(Record::ReceiverInfo(info))).0,
+            info: watch::channel(Arc::new(info)).0,
+            too_old: Mutex::new(HashSet::new()),
         }))
     }
 
-    pub fn info(&self) -> watch::Receiver<Arc<Record>> {
+    pub fn info(&self) -> watch::Receiver<Arc<Announcement>> {
         self.info.subscribe()
     }
 
-    /// The feeder's area (`rendezvous::area_of` its signed location); none without one.
-    pub fn area(&self) -> Option<Region> {
+    /// The feeder's public cell (`Region::public_cell` of its signed location), what its public
+    /// description names; none without a location.
+    pub fn public_cell(&self) -> Option<Region> {
         self.location
             .as_ref()
-            .and_then(|location| tally_wire::rendezvous::area_of(location).ok())
+            .and_then(|location| Region::public_cell(location).ok())
+    }
+
+    /// The feeder's area: the area its public cell lies in (`rendezvous::area_of_public`), as every
+    /// relay reckons it from the description. The relays it chooses by it, which its description
+    /// names, so tell nothing finer than the public cell. None without a location.
+    pub fn area(&self) -> Option<Region> {
+        self.public_cell()
+            .and_then(tally_wire::rendezvous::area_of_public)
+    }
+
+    /// `None` when a relay that negotiated `version` may be published to: it keeps sites off client
+    /// links (`carries_sites`). An older relay is sent nothing and left for `OLD_RELAY_WAIT`, which
+    /// is said once per relay for as long as the feeder runs.
+    fn refuse_old_relay(&self, relay: &RelayAddress, version: u16) -> Option<Outcome> {
+        if carries_sites(version, Role::Relay) {
+            return None;
+        }
+        let first = self
+            .too_old
+            .lock()
+            .is_ok_and(|mut told| told.insert(relay.key));
+        if first {
+            eprintln!(
+                "tally-feed: relay {} speaks wire version {version}, older than {}, which keeps \
+                 receiver sites off client links: nothing is sent to it, and it is left",
+                relay.address,
+                tally_wire::SITES_VERSION
+            );
+        }
+        Some(Outcome::Leave(OLD_RELAY_WAIT))
     }
 
     /// Adds relays that relay `from` offered. They are hints: they only widen what is probed, and
@@ -526,20 +593,21 @@ impl Directory {
             .map_or(Duration::ZERO, |until| until.saturating_duration_since(now))
     }
 
-    /// The receiver's description signed afresh, with a new `issued_ms` and the relays held now.
-    /// It is kept as the latest without waking the sessions, each of which re-sends on its own
-    /// schedule.
-    pub fn resign(&self) -> Option<Arc<Record>> {
+    /// The receiver's description and site signed afresh, with a new `issued_ms` and the relays
+    /// held now. They are kept as the latest without waking the sessions, each of which re-sends on
+    /// its own schedule.
+    pub fn resign(&self) -> Option<Arc<Announcement>> {
         let relays = self.relays.lock().ok()?;
         self.announce(&relays, false)
     }
 
-    /// Signs the receiver's description for the relays held now and makes it the latest. It runs
-    /// under the relays lock, so the latest is always the newest signed and names what is held.
-    fn announce(&self, relays: &Relays, wake: bool) -> Option<Arc<Record>> {
-        match sign_info(&self.identity, self.location, self.clock, &relays.held) {
+    /// Signs the receiver's description and site for the relays held now and makes them the
+    /// latest. It runs under the relays lock, so the latest is always the newest signed and names
+    /// what is held.
+    fn announce(&self, relays: &Relays, wake: bool) -> Option<Arc<Announcement>> {
+        match sign_announcement(&self.identity, self.location, self.clock, &relays.held) {
             Ok(info) => {
-                let record = Arc::new(Record::ReceiverInfo(info));
+                let record = Arc::new(info);
                 let latest = Arc::clone(&record);
                 self.info.send_if_modified(move |info| {
                     *info = latest;
@@ -614,23 +682,50 @@ fn read_relay(line: &str) -> Option<(RelayAddress, Source, Option<u64>)> {
     }
 }
 
-fn sign_info(
+/// The public description (format 2: the location's public cell, never the location) and the
+/// site (`ReceiverSite`: the location as given, already snapped), under one `issued_ms` so a relay
+/// pairs them.
+fn sign_announcement(
     identity: &Identity,
     location: Option<Location>,
     clock: Clock,
     relays: &[PublicKey],
-) -> Result<ReceiverInfo, String> {
-    ReceiverInfo::sign(
+) -> Result<Announcement, String> {
+    let error = |error: tally_wire::WireError| error.to_string();
+    let issued_ms = wall_ms();
+    let cell = location
+        .as_ref()
+        .map(Region::public_cell)
+        .transpose()
+        .map_err(error)?;
+    let info = ReceiverInfo::sign_public(
         identity,
-        &tally_wire::batch::ReceiverInfoContent {
-            issued_ms: wall_ms(),
-            location,
+        &PublicInfoContent {
+            issued_ms,
+            cell,
             clock,
             software: concat!("tally-feed ", env!("CARGO_PKG_VERSION")).to_owned(),
             relays: relays.to_vec(),
         },
     )
-    .map_err(|error| error.to_string())
+    .map_err(error)?;
+    let site = location
+        .map(|location| {
+            ReceiverSite::sign(
+                identity,
+                &ReceiverSiteContent {
+                    issued_ms,
+                    location,
+                    clock,
+                },
+            )
+        })
+        .transpose()
+        .map_err(error)?;
+    Ok(Announcement {
+        info: Arc::new(Record::ReceiverInfo(info)),
+        site: site.map(|site| Arc::new(Record::ReceiverSite(site))),
+    })
 }
 
 /// An audit: the batches of sequences `first..=last` go to `relay` alone (`delivery_check`).
@@ -1584,6 +1679,10 @@ async fn session(
         }) => return (Ok(goodbye(reason, retry_after_secs)), None),
         Err(error) => return (Err(error.to_string()), None),
     };
+    // Refused before it counts as up: an older relay is no session.
+    if let Some(outcome) = context.directory.refuse_old_relay(relay, session.version) {
+        return (Ok(outcome), None);
+    }
     let began = tokio::time::Instant::now();
     up();
     eprintln!(
@@ -1607,7 +1706,7 @@ async fn session(
             }
         }
     });
-    let ended = publish(context, &mut writer, &mut records, batches).await;
+    let ended = publish(context, session.version, &mut writer, &mut records, batches).await;
     reading.abort();
     (ended, Some(began.elapsed()))
 }
@@ -1675,7 +1774,7 @@ impl<S: tokio::io::AsyncWrite> Link<'_, S> {
     /// Sends the records; `Some` if the relay ended the session before the send was done.
     async fn send<R>(&mut self, out: &[R]) -> Result<Option<Outcome>, String>
     where
-        R: std::borrow::Borrow<Record> + Sync,
+        R: tally_wire::Outgoing + Sync,
     {
         let sent = {
             let sending = self.writer.send(out);
@@ -1774,14 +1873,20 @@ fn ask_offers(context: &Context) -> Option<Record> {
     }))
 }
 
+/// The session's sending loop. `version` is what the relay negotiated: a relay older than
+/// `SITES_VERSION` is sent nothing (`Directory::refuse_old_relay`).
 async fn publish<S: tokio::io::AsyncWrite>(
     context: &Context,
+    version: u16,
     writer: &mut noise::Writer<S>,
     records: &mut Inbound,
     mut batches: broadcast::Receiver<Arc<Record>>,
 ) -> Result<Outcome, String> {
     let relay = &context.relay;
     let directory = &context.directory;
+    if let Some(outcome) = directory.refuse_old_relay(relay, version) {
+        return Ok(outcome);
+    }
     let mut link = Link {
         context,
         writer,
@@ -1790,7 +1895,7 @@ async fn publish<S: tokio::io::AsyncWrite>(
     };
     let mut info = directory.info();
     let mut owed = context.ledger.owed_changes();
-    let mut first = vec![Arc::clone(&info.borrow_and_update())];
+    let mut first = info.borrow_and_update().records();
     first.extend(ask_offers(context).map(Arc::new));
     if let Some(outcome) = link.send(&first).await? {
         return Ok(outcome);
@@ -1831,7 +1936,7 @@ async fn publish<S: tokio::io::AsyncWrite>(
             changed = info.changed() => {
                 if changed.is_ok() {
                     let latest = Arc::clone(&info.borrow_and_update());
-                    link.send(&[latest]).await?
+                    link.send(&latest.records()).await?
                 } else {
                     None
                 }
@@ -1841,7 +1946,10 @@ async fn publish<S: tokio::io::AsyncWrite>(
             }
             _ = heartbeat.tick() => link.send(&[Record::Heartbeat]).await?,
             _ = refresh.tick() => {
-                let mut out: Vec<Arc<Record>> = directory.resign().into_iter().collect();
+                let mut out: Vec<Arc<Record>> = directory
+                    .resign()
+                    .map(|latest| latest.records())
+                    .unwrap_or_default();
                 out.extend(ask_offers(context).map(Arc::new));
                 if out.is_empty() { None } else { link.send(&out).await? }
             }
@@ -1931,13 +2039,197 @@ mod tests {
             Some(exact),
             Clock::Dump1090,
         )?;
-        let info = directory.info().borrow().clone();
-        let Record::ReceiverInfo(info) = info.as_ref() else {
+        let announced = directory.info().borrow().clone();
+        let Some(site) = announced.site.as_deref() else {
+            return Err("no site".to_owned());
+        };
+        let Record::ReceiverSite(site) = site else {
+            return Err("not a receiver site".to_owned());
+        };
+        let signed = site.content().map_err(|error| error.to_string())?.location;
+        assert_eq!(signed, crate::precision::snap(exact));
+        assert_ne!(signed, exact);
+        Ok(())
+    }
+
+    fn at_location(location: Option<Location>) -> Result<Arc<Directory>, String> {
+        Directory::new(
+            scratch(),
+            Vec::new(),
+            Vec::new(),
+            Identity::generate().map_err(|error| error.to_string())?,
+            location,
+            Clock::Dump1090,
+        )
+    }
+
+    const SITE: Location = Location {
+        lat_e7: 339_425_361,
+        lon_e7: -1_184_080_749,
+        alt_m: 34,
+        precision_m: 0,
+    };
+
+    /// The public description is format 2: no site in it, in any form, only the site's public
+    /// cell, which holds the site. The site is its own record, signed at the same moment.
+    #[test]
+    fn the_public_description_never_carries_the_site() -> Result<(), String> {
+        let error = |error: tally_wire::WireError| error.to_string();
+        for precision_m in [0, 20] {
+            let given = Location {
+                precision_m,
+                ..SITE
+            };
+            let directory = at_location(Some(given))?;
+            let announced = directory.info().borrow().clone();
+            let Record::ReceiverInfo(info) = announced.info.as_ref() else {
+                return Err("not a receiver info".to_owned());
+            };
+            info.verify().map_err(error)?;
+            assert_eq!(
+                info.format(),
+                tally_wire::batch::RECEIVER_INFO_FORMAT_PUBLIC
+            );
+            assert!(!info.carries_site());
+            assert!(!announced.info.carries_site());
+            let snapped = crate::precision::snap(given);
+            let public = info.public().map_err(error)?;
+            assert_eq!(
+                public.cell,
+                Some(Region::public_cell(&snapped).map_err(error)?)
+            );
+            assert!(public.holds(&snapped));
+            // Not a coordinate of the site, the given one or the snapped one, is in its bytes.
+            let bytes = info.as_bytes();
+            for location in [given, snapped] {
+                for field in [location.lat_e7, location.lon_e7] {
+                    let needle = field.to_be_bytes();
+                    assert!(
+                        !bytes.windows(needle.len()).any(|window| window == needle),
+                        "{field} in the public description"
+                    );
+                }
+            }
+            let Some(Record::ReceiverSite(site)) = announced.site.as_deref() else {
+                return Err("no receiver site".to_owned());
+            };
+            site.verify().map_err(error)?;
+            let content = site.content().map_err(error)?;
+            assert_eq!(content.location, snapped);
+            assert_eq!(content.issued_ms, public.issued_ms);
+            assert_eq!(
+                site.receiver().map_err(error)?,
+                info.receiver().map_err(error)?
+            );
+            // The area the feeder chooses by is its public cell's, as every relay reckons it.
+            assert_eq!(
+                directory.area(),
+                public.cell.and_then(tally_wire::rendezvous::area_of_public)
+            );
+        }
+        // No location: a description with no cell, and no site at all.
+        let directory = at_location(None)?;
+        let announced = directory.info().borrow().clone();
+        let Record::ReceiverInfo(info) = announced.info.as_ref() else {
             return Err("not a receiver info".to_owned());
         };
-        let signed = info.content().map_err(|error| error.to_string())?.location;
-        assert_eq!(signed, Some(crate::precision::snap(exact)));
-        assert_ne!(signed, Some(exact));
+        assert_eq!(info.public().map_err(error)?.cell, None);
+        assert!(announced.site.is_none());
+        assert_eq!(directory.area(), None);
+        Ok(())
+    }
+
+    /// What a session sends of the receiver's description and site, over its first three
+    /// re-sends, at the version the relay negotiated.
+    async fn announced_at(
+        location: Option<Location>,
+        version: Option<u16>,
+    ) -> Result<Vec<Record>, String> {
+        let error = |error: tally_wire::WireError| error.to_string();
+        let (running, mut reader, _out, _records_in) =
+            publishing_as(at_location(location)?, version).await?;
+        let mut sent = Vec::new();
+        let infos = |sent: &[Record]| {
+            sent.iter()
+                .filter(|record| matches!(record, Record::ReceiverInfo(_)))
+                .count()
+        };
+        while infos(&sent) < 3 {
+            let mut got = Vec::new();
+            tokio::time::timeout(Duration::from_secs(700), reader.recv(&mut got))
+                .await
+                .map_err(|_| format!("only {} receiver infos arrived", infos(&sent)))?
+                .map_err(error)?;
+            sent.extend(got.into_iter().filter(|record| {
+                matches!(record, Record::ReceiverInfo(_) | Record::ReceiverSite(_))
+            }));
+        }
+        running.abort();
+        Ok(sent)
+    }
+
+    /// A relay that negotiated version 3 keeps sites off client links, so it is sent the site,
+    /// ahead of each description and signed with it.
+    #[tokio::test(start_paused = true)]
+    async fn a_version_3_relay_is_sent_the_site_with_each_description() -> Result<(), String> {
+        let error = |error: tally_wire::WireError| error.to_string();
+        let sent = announced_at(Some(SITE), Some(tally_wire::SITES_VERSION)).await?;
+        assert_eq!(sent.len(), 6, "{sent:?}");
+        for pair in sent.chunks(2) {
+            let [Record::ReceiverSite(site), Record::ReceiverInfo(info)] = pair else {
+                return Err(format!("not a site then a description: {pair:?}"));
+            };
+            site.verify().map_err(error)?;
+            info.verify().map_err(error)?;
+            assert!(!info.carries_site());
+            let site = site.content().map_err(error)?;
+            assert_eq!(site.location, SITE);
+            assert_eq!(site.issued_ms, info.issued_ms().map_err(error)?);
+            assert!(info.public().map_err(error)?.holds(&site.location));
+        }
+        // The default session (this build's newest) is a version 3 one.
+        let sent = announced_at(Some(SITE), None).await?;
+        assert!(
+            sent.iter()
+                .any(|record| matches!(record, Record::ReceiverSite(_)))
+        );
+        Ok(())
+    }
+
+    /// A relay older than version 3 may pass what it is sent to clients, so it is sent nothing at
+    /// all, not even the public description, and the session ends with the relay left.
+    #[tokio::test]
+    async fn a_version_2_relay_is_sent_nothing_and_left() -> Result<(), String> {
+        for location in [Some(SITE), None] {
+            let (running, mut reader, out, _records_in) =
+                publishing_as(at_location(location)?, Some(2)).await?;
+            let feeder = Identity::generate().map_err(|error| error.to_string())?;
+            let _ = out.send(Arc::new(Record::Batch(batch(&feeder, 0)?)));
+            let ended = tokio::time::timeout(HANG, running)
+                .await
+                .map_err(|_| "the session did not end".to_owned())?
+                .map_err(|error| error.to_string())?;
+            assert!(
+                matches!(ended, Ok(Outcome::Leave(wait)) if wait == OLD_RELAY_WAIT),
+                "{ended:?}"
+            );
+            // The feeder's end is gone, and nothing came before it.
+            let mut got = Vec::new();
+            let read = tokio::time::timeout(HANG, reader.recv(&mut got))
+                .await
+                .map_err(|_| "the pipe stayed open".to_owned())?;
+            assert!(read.is_err() && got.is_empty(), "{read:?} {got:?}");
+        }
+        // Every version from SITES_VERSION up is published to.
+        let directory = at_location(Some(SITE))?;
+        let relay = relay("relay.example:10900")?;
+        assert!(directory.refuse_old_relay(&relay, 2).is_some());
+        assert!(directory.refuse_old_relay(&relay, 2).is_some());
+        assert!(
+            directory
+                .refuse_old_relay(&relay, tally_wire::SITES_VERSION)
+                .is_none()
+        );
         Ok(())
     }
 
@@ -2492,7 +2784,6 @@ mod tests {
             alt_m: 30,
             precision_m: 0,
         };
-        let area = tally_wire::rendezvous::area_of(&location).map_err(error)?;
         let group: Group = Arc::default();
         let (taken, mut arrivals) = mpsc::unbounded_channel();
         // Each on its own /24 and network, so the networks are known distinct.
@@ -2522,6 +2813,7 @@ mod tests {
             Some(location),
             Clock::Dump1090,
         )?;
+        let area = directory.area().ok_or("no area")?;
         // Two members of the area's sharing group, which take no feeder.
         for (ip, network) in [("127.0.11.1", 11), ("127.0.12.1", 12)] {
             let identity = Identity::generate().map_err(error)?;
@@ -2665,15 +2957,32 @@ mod tests {
         ),
         String,
     > {
+        publishing_as(directory, None).await
+    }
+
+    /// `publishing`, with the session run as though the relay had negotiated `version` (the
+    /// handshake itself always agrees this build's newest), so an older relay can be stood for.
+    async fn publishing_as(
+        directory: Arc<Directory>,
+        version: Option<u16>,
+    ) -> Result<
+        (
+            tokio::task::JoinHandle<Result<Outcome, String>>,
+            noise::Reader<Pipe>,
+            broadcast::Sender<Arc<Record>>,
+            mpsc::Sender<Result<Vec<Record>, String>>,
+        ),
+        String,
+    > {
         let (session, relay_end, relay_key) = pipe(1 << 20).await?;
         let (out, batches) = broadcast::channel(64);
         let (records_in, mut records) = mpsc::channel(16);
         let context = context(directory, relay_key, "relay.example:10900");
+        let version = version.unwrap_or(session.version);
         let mut writer = session.writer;
-        let running =
-            tokio::spawn(
-                async move { publish(&context, &mut writer, &mut records, batches).await },
-            );
+        let running = tokio::spawn(async move {
+            publish(&context, version, &mut writer, &mut records, batches).await
+        });
         Ok((running, relay_end.reader, out, records_in))
     }
 
@@ -2694,14 +3003,14 @@ mod tests {
             for record in got {
                 if let Record::ReceiverInfo(info) = record {
                     info.verify().map_err(error)?;
-                    infos.push((began.elapsed(), info.content().map_err(error)?));
+                    infos.push((began.elapsed(), info.issued_ms().map_err(error)?));
                 }
             }
         }
         running.abort();
         let at: Vec<u64> = infos.iter().map(|(at, _)| at.as_secs()).collect();
         assert_eq!(at, vec![0, 600, 1_200]);
-        let issued: Vec<u64> = infos.iter().map(|(_, content)| content.issued_ms).collect();
+        let issued: Vec<u64> = infos.iter().map(|(_, issued_ms)| *issued_ms).collect();
         assert!(
             issued.windows(2).all(|pair| pair[0] <= pair[1]),
             "{issued:?}"
@@ -2770,11 +3079,11 @@ mod tests {
         let (out, batches) = broadcast::channel(64);
         let (_records_in, mut records) = mpsc::channel(16);
         let context = context(directory, relay_key, "relay.example:10900");
+        let version = session.version;
         let mut writer = session.writer;
-        let publishing =
-            tokio::spawn(
-                async move { publish(&context, &mut writer, &mut records, batches).await },
-            );
+        let publishing = tokio::spawn(async move {
+            publish(&context, version, &mut writer, &mut records, batches).await
+        });
         // Batches as big as the batcher seals them, each a large part of the second's ceiling even
         // compressed: each message is noise (splitmix64 of its counter), which DEFLATE barely
         // shrinks.
@@ -2837,8 +3146,9 @@ mod tests {
         let (_out, batches) = broadcast::channel(64);
         let (_records_in, mut records) = records.unwrap_or_else(|| mpsc::channel(16));
         let context = context(directory, relay_key, "stalled.example:10900");
+        let version = session.version;
         let mut writer = session.writer;
-        publish(&context, &mut writer, &mut records, batches).await
+        publish(&context, version, &mut writer, &mut records, batches).await
     }
 
     #[tokio::test(start_paused = true)]
@@ -2880,8 +3190,9 @@ mod tests {
                 .await;
         });
         let context = context(directory, relay_key, "redirecting.example:10900");
+        let version = session.version;
         let mut writer = session.writer;
-        let ended = publish(&context, &mut writer, &mut records, batches).await;
+        let ended = publish(&context, version, &mut writer, &mut records, batches).await;
         reader.abort();
         assert!(
             matches!(ended, Ok(Outcome::Leave(wait)) if wait == Duration::from_secs(600)),

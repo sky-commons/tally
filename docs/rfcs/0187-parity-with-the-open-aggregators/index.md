@@ -41,6 +41,11 @@ commit, and nginx. It is one more thing a relay operator runs, not a Flightlines
 - nginx serves tar1090 on `:8080`, with readsb's JSON at `/data/` and history at `/globe_history/`.
 - tar1090's config is written at start from the environment: the page's title, and
   `TALLY_MAP_API`, the `tally-api` origin its routes are asked of (§2).
+- It places no receiver (RFC-0171 §3.5, amended 2026-10-19: a receiver's site reaches only
+  relays). `--beast-out` gives each reception's message alone, no receiver's counter or signal
+  level; readsb is given no location, so it names no site and gives no aircraft a distance or
+  direction from one; tar1090 draws no site marker, range rings or range outline. The `/v2`
+  answers (§2) drop readsb's `r_dst`, `r_dir` and `rssi` whatever readsb `--readsb` names.
 - What the map sends is bounded by a ceiling its operator states, `TALLY_MAP_MAX_UPLOAD`, in the
   relay's `--max-upload` units, since a relay host's plan is billed for both (the reference
   deployment is a Lightsail node whose whole plan is 3 TB a month). nginx has no shared budget of
@@ -75,7 +80,9 @@ neither is modified.
   `/v2/hex/{hex}` (`/v2/icao/`), `/v2/callsign/{cs}`, `/v2/registration/{reg}` (`/v2/reg/`),
   `/v2/type/{type}`, `/v2/squawk/{sq}` (`/v2/sqk/`), `/v2/mil`, `/v2/ladd`, `/v2/pia`,
   `/v2/point/{lat}/{lon}/{radius}` (`/v2/lat/{lat}/lon/{lon}/dist/{radius}`, radius at most 250 nm)
-  and `/v2/closest/{lat}/{lon}/{radius}`. Each is one query of readsb's API port.
+  and `/v2/closest/{lat}/{lon}/{radius}`. Each is one query of readsb's API port, served as
+  readsb answers it less what it says of its own receiver (`r_dst`, `r_dir`, `rssi`), which with
+  the aircraft's position would place that receiver.
 - **Routes:** `POST /api/0/routeset` (the shape tar1090's `routeApiUrl` asks) and
   `GET /api/0/route/{callsign}/{lat}/{lon}`, from VRS standing-data (CC0, refreshed daily), each
   judged against where the aircraft is. The judgment keeps adsb.lol's threshold (50 nm or a fifth
@@ -95,7 +102,8 @@ neither is modified.
   stranger. A client whose address is not known (behind the proxy, a missing or unparseable
   client header, never the proxy's own address), or is loopback or unspecified, is answered none.
   The relay's `/stations` names each connected session's address, and its stats port is loopback
-  only by refusal: `--stats-listen` on any other address stops the relay at start.
+  only by refusal: `--stats-listen` on any other address stops the relay at start. It answers
+  keys and traffic, never where a station is.
 
 ## §3 Everything else
 

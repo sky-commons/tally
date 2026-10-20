@@ -79,11 +79,11 @@ usage: tally-feed [--key FILE | --key-env NAME] [options]
   --state DIR            where learned relays and relays found swallowing are kept
                          (default /var/lib/tally-feed)
   --lat DEG --lon DEG --alt ALT
-                         the antenna's position, sent exactly to relays (MLAT needs it exact);
-                         ALT is the height as mlat-client takes it, a bare number or with a
-                         unit: 34, 34m, 112ft (feet are converted to the nearest metre). Public
-                         surfaces (the map, station pages, the API) show it blurred to about
-                         5 km
+                         the antenna's position, sent exactly only to Tally relays (MLAT
+                         needs it exact); ALT is the height as mlat-client takes it, a bare
+                         number or with a unit: 34, 34m, 112ft (feet are converted to the
+                         nearest metre). No client is sent it: public surfaces (the map,
+                         station pages, the API) show only its public cell, about 5 km across
   --precision M          expert only: round the position to a grid of M-metre cells before
                          anything is signed or sent, so not even relay operators see the exact
                          one (latitude to the nearest M metres from the equator, longitude to

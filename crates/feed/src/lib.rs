@@ -145,7 +145,7 @@ pub async fn run(config: Config) -> Result<(), String> {
     {
         let published = precision::snap(location);
         eprintln!(
-            "tally-feed: publishing the position rounded to {} m: {:.7}, {:.7}",
+            "tally-feed: sending relays the position rounded to {} m: {:.7}, {:.7}",
             location.precision_m,
             f64::from(published.lat_e7) / 1e7,
             f64::from(published.lon_e7) / 1e7

@@ -25,7 +25,6 @@ rust_library(
     deps = [
         "//crates/api-types",
         "//crates/merge",
-        "//crates/mlat-solver",
         "//crates/relay",
         "//crates/wire",
         "@tally_crates//:axum",

@@ -66,8 +66,21 @@ pub enum Codec {
     /// thousands of feeders share the cores one reader has.
     DeflateAt(u8),
 }
-/// The receiver-info layout this build writes.
+/// The receiver-info layout an old feeder writes: its exact `Location` in the clear, signed.
+/// Site-bearing ([`ReceiverInfo::carries_site`]): still read, forwarded byte for byte only to
+/// version 3 relay-role peers ([`crate::record::carries_sites`]), never sent to a client.
 pub const RECEIVER_INFO_FORMAT: u8 = 1;
+/// The receiver-info layout this build's feeder writes (wire version 3): the receiver's public
+/// cell (`crate::site::PUBLIC_CELL_RESOLUTION`), computed by the feeder, in place of its site,
+/// which travels relay-only in a `ReceiverSite`. Travels everywhere format 1 did.
+///
+/// ```text
+/// format u8 = 2 | receiver key [32] | issued_ms u64
+/// | cell flag u8 (0 none, 1 present) | [public cell u64, H3 resolution 6]
+/// | clock u8 | software length u8 | software | relay count u8 | count x relay key [32]
+/// | signature [64]
+/// ```
+pub const RECEIVER_INFO_FORMAT_PUBLIC: u8 = 2;
 
 const BATCH_DOMAIN: &[u8] = b"tally batch";
 /// What a relay signs its own deduplicated stream under. A separate domain, so a relay's batch can
@@ -779,6 +792,60 @@ pub struct ReceiverInfoContent {
     pub relays: Vec<PublicKey>,
 }
 
+/// What a format 2 description says: everything format 1 did, the site replaced by the public
+/// cell it lies in.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PublicInfoContent {
+    /// Unix milliseconds. The newest a relay has seen for a key wins, whatever its format.
+    pub issued_ms: u64,
+    /// The H3 cell of resolution `PUBLIC_CELL_RESOLUTION` the antenna is in (`Region::public_cell`),
+    /// `None` for a receiver that declared no location.
+    pub cell: Option<crate::region::Region>,
+    pub clock: Clock,
+    /// The feeder's name and version, for operators.
+    pub software: String,
+    /// The relays this receiver chose to publish to (as format 1's).
+    pub relays: Vec<PublicKey>,
+}
+
+impl crate::signed::Check for PublicInfoContent {
+    /// A cell, if any, of exactly the public resolution: no finer, so it tells no more.
+    fn check(&self) -> Result<(), WireError> {
+        match self.cell {
+            Some(cell) if cell.resolution() != crate::site::PUBLIC_CELL_RESOLUTION => {
+                Err(WireError::Invalid {
+                    field: "public cell resolution",
+                    value: u64::from(cell.resolution()),
+                })
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
+impl PublicInfoContent {
+    /// Whether this description's public cell is the one `location` is in
+    /// ([`Region::public_cell`](crate::region::Region::public_cell)): a relay holding a format 2
+    /// description and a `ReceiverSite` of one key refuses the pair when it is not. Equality, not
+    /// [`Region::covers`](crate::region::Region::covers): H3 cells are not nested, so the cell
+    /// containing a point and the ancestor of its finest cell differ for about one point in
+    /// sixteen, and the feeder names the containing one.
+    pub fn holds(&self, location: &Location) -> bool {
+        self.cell.is_some_and(|cell| {
+            crate::region::Region::public_cell(location).is_ok_and(|named| named == cell)
+        })
+    }
+}
+
+/// What a receiver's description says, of whichever format.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Description {
+    /// Format 1: carries the site. Relay-only.
+    Site(ReceiverInfoContent),
+    /// Format 2: carries the public cell.
+    Public(PublicInfoContent),
+}
+
 /// A receiver's signed description of itself.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReceiverInfo {
@@ -794,6 +861,9 @@ impl crate::signed::Check for ReceiverInfoContent {
 }
 
 impl ReceiverInfo {
+    /// A format 1 description, carrying the site: what an old feeder signs. This build's feeder
+    /// signs `sign_public` and a `ReceiverSite`; this stays for tests and for simulating old
+    /// feeders.
     pub fn sign(identity: &Identity, content: &ReceiverInfoContent) -> Result<Self, WireError> {
         crate::signed::Check::check(content)?;
         let mut bytes = Vec::new();
@@ -810,18 +880,40 @@ impl ReceiverInfo {
                 bytes.extend_from_slice(&location.precision_m.to_be_bytes());
             }
         }
-        bytes.push(content.clock.byte());
-        let software = content.software.as_bytes();
-        let length =
-            u8::try_from(software.len()).map_err(|_| WireError::Oversize(software.len()))?;
-        bytes.push(length);
-        bytes.extend_from_slice(software);
-        let count = u8::try_from(content.relays.len())
-            .map_err(|_| WireError::Oversize(content.relays.len()))?;
-        bytes.push(count);
-        for relay in &content.relays {
-            bytes.extend_from_slice(relay.as_bytes());
+        write_tail(
+            &mut bytes,
+            content.clock,
+            &content.software,
+            &content.relays,
+        )?;
+        let signature = identity.sign(&domain(RECEIVER_INFO_DOMAIN, &bytes));
+        bytes.extend_from_slice(&signature);
+        Ok(Self { bytes })
+    }
+
+    /// A format 2 description: the public cell, no site.
+    pub fn sign_public(
+        identity: &Identity,
+        content: &PublicInfoContent,
+    ) -> Result<Self, WireError> {
+        crate::signed::Check::check(content)?;
+        let mut bytes = Vec::new();
+        bytes.push(RECEIVER_INFO_FORMAT_PUBLIC);
+        bytes.extend_from_slice(identity.public().as_bytes());
+        bytes.extend_from_slice(&content.issued_ms.to_be_bytes());
+        match content.cell {
+            None => bytes.push(0),
+            Some(cell) => {
+                bytes.push(1);
+                bytes.extend_from_slice(&cell.as_u64().to_be_bytes());
+            }
         }
+        write_tail(
+            &mut bytes,
+            content.clock,
+            &content.software,
+            &content.relays,
+        )?;
         let signature = identity.sign(&domain(RECEIVER_INFO_DOMAIN, &bytes));
         bytes.extend_from_slice(&signature);
         Ok(Self { bytes })
@@ -840,6 +932,36 @@ impl ReceiverInfo {
 
     pub fn as_bytes(&self) -> &[u8] {
         &self.bytes
+    }
+
+    pub fn format(&self) -> u8 {
+        self.bytes[0]
+    }
+
+    /// Whether it carries the receiver's site: format 1, and any format this build does not know
+    /// (which it cannot show carries none). Such a description is relay-only.
+    pub fn carries_site(&self) -> bool {
+        self.format() != RECEIVER_INFO_FORMAT_PUBLIC
+    }
+
+    /// The reference clients see in place of a site-bearing description; `None` for one that
+    /// carries no site.
+    pub fn site_id(&self) -> Option<crate::site::SiteId> {
+        self.carries_site()
+            .then(|| crate::site::SiteId::of_signed(&self.bytes))
+    }
+
+    /// What an old feeder's reception tags are keyed by while this format 1 description is
+    /// current; `None` for one that carries no site.
+    pub fn reception_key(&self) -> Option<crate::site::ReceptionKey> {
+        self.carries_site()
+            .then(|| crate::site::ReceptionKey::of_signed(&self.bytes))
+    }
+
+    /// When it was issued, in either format: the newest a relay has seen for a key wins.
+    pub fn issued_ms(&self) -> Result<u64, WireError> {
+        let (signed, _) = split_signature(&self.bytes)?;
+        Body::new(&signed[INFO_PREFIX_LEN..]).u64()
     }
 
     pub fn receiver(&self) -> Result<PublicKey, WireError> {
@@ -871,13 +993,7 @@ impl ReceiverInfo {
                 precision_m: reader.u32()?,
             }),
         };
-        let clock = Clock::from_byte(reader.u8()?);
-        let length = usize::from(reader.u8()?);
-        let software = String::from_utf8_lossy(reader.bytes(length)?).into_owned();
-        let count = reader.u8()?;
-        let relays = (0..count)
-            .map(|_| PublicKey::from_slice(reader.bytes(KEY_LEN)?))
-            .collect::<Result<_, _>>()?;
+        let (clock, software, relays) = read_tail(&mut reader)?;
         let content = ReceiverInfoContent {
             issued_ms,
             location,
@@ -888,6 +1004,84 @@ impl ReceiverInfo {
         crate::signed::Check::check(&content)?;
         Ok(content)
     }
+
+    /// The content of a format 2 description.
+    pub fn public(&self) -> Result<PublicInfoContent, WireError> {
+        if self.bytes[0] != RECEIVER_INFO_FORMAT_PUBLIC {
+            return Err(WireError::Invalid {
+                field: "receiver info format",
+                value: u64::from(self.bytes[0]),
+            });
+        }
+        let (signed, _) = split_signature(&self.bytes)?;
+        let mut reader = Body::new(&signed[INFO_PREFIX_LEN..]);
+        let issued_ms = reader.u64()?;
+        let cell = match reader.u8()? {
+            0 => None,
+            _ => Some(crate::region::Region::from_u64(reader.u64()?)?),
+        };
+        let (clock, software, relays) = read_tail(&mut reader)?;
+        let content = PublicInfoContent {
+            issued_ms,
+            cell,
+            clock,
+            software,
+            relays,
+        };
+        crate::signed::Check::check(&content)?;
+        Ok(content)
+    }
+
+    /// What it says, in whichever format this build reads.
+    pub fn description(&self) -> Result<Description, WireError> {
+        match self.format() {
+            RECEIVER_INFO_FORMAT => self.content().map(Description::Site),
+            _ => self.public().map(Description::Public),
+        }
+    }
+
+    /// The receiver's public cell, in either format: format 2's own, format 1's the cell its
+    /// site lies in. `None` for a receiver that declared no location.
+    pub fn public_cell(&self) -> Result<Option<crate::region::Region>, WireError> {
+        match self.description()? {
+            Description::Public(content) => Ok(content.cell),
+            Description::Site(content) => content
+                .location
+                .map(|location| crate::region::Region::public_cell(&location))
+                .transpose(),
+        }
+    }
+}
+
+/// Clock, software and relays: the fields both description formats end with.
+fn write_tail(
+    bytes: &mut Vec<u8>,
+    clock: Clock,
+    software: &str,
+    relays: &[PublicKey],
+) -> Result<(), WireError> {
+    bytes.push(clock.byte());
+    let software = software.as_bytes();
+    let length = u8::try_from(software.len()).map_err(|_| WireError::Oversize(software.len()))?;
+    bytes.push(length);
+    bytes.extend_from_slice(software);
+    let count = u8::try_from(relays.len()).map_err(|_| WireError::Oversize(relays.len()))?;
+    bytes.push(count);
+    for relay in relays {
+        bytes.extend_from_slice(relay.as_bytes());
+    }
+    Ok(())
+}
+
+fn read_tail(reader: &mut Body<'_>) -> Result<(Clock, String, Vec<PublicKey>), WireError> {
+    let clock = Clock::from_byte(reader.u8()?);
+    let length = usize::from(reader.u8()?);
+    let software = String::from_utf8_lossy(reader.bytes(length)?).into_owned();
+    let count = reader.u8()?;
+    let relays = (0..count)
+        .map(|_| PublicKey::from_slice(reader.bytes(KEY_LEN)?))
+        .collect::<Result<_, _>>()?;
+    Ok((clock, software, relays))
 }
 
 pub(crate) fn domain(label: &[u8], signed: &[u8]) -> Vec<u8> {
@@ -1280,6 +1474,70 @@ mod tests {
             back.verify()?;
             assert_eq!(back.content()?, content);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn a_public_description_round_trips_and_carries_no_site() -> Result<(), WireError> {
+        let identity = Identity::generate()?;
+        let location = Location {
+            lat_e7: 374_100_000,
+            lon_e7: -1_221_000_000,
+            alt_m: 12,
+            precision_m: 0,
+        };
+        for cell in [None, Some(crate::region::Region::public_cell(&location)?)] {
+            let content = PublicInfoContent {
+                issued_ms: 9,
+                cell,
+                clock: Clock::Beast,
+                software: "tally-feed 0.4.0".to_owned(),
+                relays: vec![Identity::generate()?.public()],
+            };
+            let info = ReceiverInfo::sign_public(&identity, &content)?;
+            let back = ReceiverInfo::from_bytes(info.as_bytes().to_vec())?;
+            back.verify()?;
+            assert_eq!(back.format(), RECEIVER_INFO_FORMAT_PUBLIC);
+            assert_eq!(back.public()?, content);
+            assert_eq!(back.description()?, Description::Public(content.clone()));
+            assert_eq!(back.public_cell()?, cell);
+            assert_eq!(back.issued_ms()?, 9);
+            assert!(!back.carries_site());
+            assert_eq!(back.site_id(), None);
+            assert!(back.content().is_err());
+            assert_eq!(content.holds(&location), cell.is_some());
+        }
+        // A cell finer than the public resolution is refused on both sides.
+        let fine = PublicInfoContent {
+            issued_ms: 9,
+            cell: Some(crate::region::Region::point(&location)?),
+            clock: Clock::Beast,
+            software: String::new(),
+            relays: Vec::new(),
+        };
+        assert!(ReceiverInfo::sign_public(&identity, &fine).is_err());
+        // A format 1 description carries the site and is named by an id that is not its hash.
+        let old = ReceiverInfo::sign(
+            &identity,
+            &ReceiverInfoContent {
+                issued_ms: 3,
+                location: Some(location),
+                clock: Clock::Beast,
+                software: String::new(),
+                relays: Vec::new(),
+            },
+        )?;
+        assert!(old.carries_site());
+        assert_eq!(old.issued_ms()?, 3);
+        assert_eq!(
+            old.public_cell()?,
+            Some(crate::region::Region::public_cell(&location)?)
+        );
+        assert_eq!(
+            old.site_id(),
+            Some(crate::site::SiteId::of_signed(old.as_bytes()))
+        );
+        assert!(matches!(old.description()?, Description::Site(_)));
         Ok(())
     }
 

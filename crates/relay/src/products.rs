@@ -110,10 +110,11 @@ use tally_mlat_solver::modes::{self, AltitudeKind};
 use tally_wire::batch::{Hash, format};
 use tally_wire::positions::{EnuCovariance, TransmitTime};
 use tally_wire::products::{MAX_REGIONAL_OBSERVATIONS, MAX_WORLD_FIXES, adsb_input_set, input_set};
-use tally_wire::rendezvous::area_of;
+use tally_wire::rendezvous::area_of_public;
 use tally_wire::{
-    Batch, ClockModel, Identity, Positions, PublicKey, ReceiverInfo, Record, Region, RegionalBatch,
-    RegionalDraft, WireError, WorldFix, WorldPositions, WorldPositionsContent, WorldPrecise,
+    Batch, ClientRegionalBatch, ClockModel, Identity, Location, Positions, PublicKey, ReceiverInfo,
+    Record, Region, RegionalBatch, RegionalDraft, WireError, WorldFix, WorldPositions,
+    WorldPositionsContent, WorldPrecise,
 };
 
 use crate::bounded::Bounded;
@@ -150,8 +151,8 @@ const RELAYS_PER_RECEIVER: usize = 8;
 /// Regional batches remembered by hash, so each is forwarded and decoded once.
 const REGIONAL_REMEMBERED: usize = 200_000;
 /// How old, or how far ahead, a peer's regional batch may be by its signed wall clock.
-const REGIONAL_MAX_AGE_MS: u64 = 60_000;
-const REGIONAL_MAX_AHEAD_MS: u64 = 10_000;
+pub(crate) const REGIONAL_MAX_AGE_MS: u64 = 60_000;
+pub(crate) const REGIONAL_MAX_AHEAD_MS: u64 = 10_000;
 /// Peers' regional batches waiting for the next tick to be forwarded.
 const FORWARD_HELD: usize = 4_096;
 /// Clock models remembered: their id and inputs hash. A world-scale relay publishes some 3,800
@@ -848,19 +849,30 @@ impl Products {
         self.shared.watermark_ms.load(Ordering::Acquire)
     }
 
-    /// A receiver's newest signed description (verified by the hub): where its area is, and
-    /// whether it chose this relay. A receiver that declares no location has no area and is in
-    /// no regional product.
-    pub fn described(&self, info: &ReceiverInfo) {
-        let (Ok(receiver), Ok(content)) = (info.receiver(), info.content()) else {
+    /// A receiver's newest signed description (verified by the hub), with its site as the hub
+    /// holds it (`place`: a format 1 description's own, or the `ReceiverSite` paired with a format
+    /// 2 one): whether it chose this relay, and its area. The area is its public cell's parent at
+    /// `AREA_RESOLUTION` (`area_of_public`), never the area its site lies in: a client reads the
+    /// regional product by area, and the two differ where the public cell straddles an area's
+    /// edge, so the site's would place it finer than its public cell. A receiver with no site
+    /// held has no area and is in no regional product.
+    pub fn described(&self, info: &ReceiverInfo, place: Option<Location>) {
+        let (Ok(receiver), Ok(described)) = (info.receiver(), info.description()) else {
             return;
+        };
+        let relays = match described {
+            tally_wire::batch::Description::Site(content) => content.relays,
+            tally_wire::batch::Description::Public(content) => content.relays,
         };
         let Ok(mut located) = self.located[usize::from(raw_shard(&receiver).0)].lock() else {
             return;
         };
-        match content.location.map(|location| area_of(&location)) {
-            Some(Ok(area)) => {
-                let mut relays = content.relays;
+        let area = place
+            .and_then(|_| info.public_cell().ok().flatten())
+            .and_then(area_of_public);
+        match area {
+            Some(area) => {
+                let mut relays = relays;
                 relays.truncate(RELAYS_PER_RECEIVER);
                 located.insert_active(receiver, Located { area, relays });
             }
@@ -1208,7 +1220,12 @@ impl Sealing {
             let (stream, regional) = self.seal_copies(epoch, stream, regional);
             streamed = !stream.is_empty();
             records.extend(stream.into_iter().map(Record::RelayBatch));
-            records.extend(regional.into_iter().map(Record::RegionalBatch));
+            // Each regional batch, then its client form (counters stripped): the one a client
+            // is sent (`outbound`).
+            for (regional, client) in regional {
+                records.push(Record::RegionalBatch(regional));
+                records.extend(client.map(Record::ClientRegionalBatch));
+            }
         }
         // The epoch's batches, and what they are charged, are let go now: everything it made is
         // signed.
@@ -1302,7 +1319,9 @@ impl Sealing {
     }
 
     /// An epoch's copies signed: its deduplicated stream as this relay's batches, in order, and
-    /// its areas, in cell order, as regional batches. Their time is the epoch's end. Without an
+    /// its areas, in cell order, as regional batches, each with its client form
+    /// (`ClientRegionalBatch::sign_draft`, the same receptions with their counters stripped, as
+    /// the regional product reaches a client). Their time is the epoch's end. Without an
     /// identity the copies are counted and dropped.
     ///
     /// The work is the pool's ([`Pool::map`]), every reception read where its batch holds it:
@@ -1316,7 +1335,10 @@ impl Sealing {
         epoch: Epoch,
         stream: Vec<Kept>,
         areas: BTreeMap<u64, (Region, Vec<Kept>)>,
-    ) -> (Vec<Batch>, Vec<RegionalBatch>) {
+    ) -> (
+        Vec<Batch>,
+        Vec<(RegionalBatch, Option<ClientRegionalBatch>)>,
+    ) {
         let mut sealed = Vec::new();
         let wall_ms = end_of(epoch);
         let Some(identity) = self.identity.clone() else {
@@ -1360,13 +1382,13 @@ impl Sealing {
             }
         }
         let signed = self.pool.map(chunks, move |(cell, sequence, copies)| {
-            match RegionalBatch::sign_draft(
-                &identity,
-                &draft(cell, (boot_id, sequence, wall_ms), &copies),
-            ) {
+            let draft = draft(cell, (boot_id, sequence, wall_ms), &copies);
+            match RegionalBatch::sign_draft(&identity, &draft) {
                 Ok(regional) => {
                     let fixes = regional_fixes(&regional).ok();
-                    Ok((regional, fixes))
+                    // Never larger than the regional batch, so it fits where that did.
+                    let client = ClientRegionalBatch::sign_draft(&identity, &draft).ok();
+                    Ok(((regional, client), fixes))
                 }
                 // `cut` made it fit, so this is never reached; were it, it is counted.
                 Err(_) => Err(copies.len() as u64),
@@ -1374,14 +1396,14 @@ impl Sealing {
         });
         for outcome in signed {
             match outcome {
-                Ok((regional, fixes)) => {
+                Ok(((regional, client), fixes)) => {
                     self.report.regional_signed += 1;
                     self.regional_seen.insert(regional.hash(), ());
                     for fix in fixes.into_iter().flatten() {
                         self.remember(&fix);
                         self.offer_fix(fix, wall_ms);
                     }
-                    sealed.push(regional);
+                    sealed.push((regional, client));
                 }
                 Err(lost) => self.report.regional_oversized += lost,
             }

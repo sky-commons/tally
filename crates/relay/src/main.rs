@@ -296,11 +296,18 @@ async fn serve(config: Config) -> Result<(), String> {
             budget.mlat_threads()
         );
     }
-    if let Some(address) = &config.beast_out {
+    // Both are loopback addresses (`config::parse_loopback`), refused at start, before the relay
+    // starts, rather than as a line in its log; each serve refuses a non-loopback listener again.
+    if let Some(address) = config.beast_out {
         let listener = TcpListener::bind(address)
             .await
             .map_err(|error| format!("beast-out {address}: {error}"))?;
-        tokio::spawn(link::serve_beast(listener, Arc::clone(&hub)));
+        let hub = Arc::clone(&hub);
+        tokio::spawn(async move {
+            if let Err(error) = link::serve_beast(listener, hub).await {
+                eprintln!("tally-relay: beast-out: {error}");
+            }
+        });
     }
     if let Some(address) = config.stats_listen {
         let listener = TcpListener::bind(address)

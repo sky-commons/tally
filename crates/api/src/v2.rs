@@ -2,9 +2,13 @@
 //! adsb.lol's `api_v2.py` serves (github.com/adsblol/api, BSD-3-Clause, Copyright (c) 2023 Katia
 //! Esposito; the queries below are ported from it). Each path is one query of readsb's API port,
 //! asked for ADS-B Exchange's v2 form (`&jv2`), and readsb's answer is served as it is: `ac` (each
-//! aircraft as readsb's JSON gives it), `msg`, `now` (milliseconds), `total`, `ctime` and `ptime`.
-//! readsb decides which aircraft match (github.com/wiedehopf/readsb, README-json.md); this only
-//! refuses what is not a well-formed query (`400`) before readsb is asked.
+//! aircraft as readsb's JSON gives it), `msg`, `now` (milliseconds), `total`, `ctime` and `ptime`,
+//! less what readsb says of the receiver it decodes for (`RECEIVER_FIELDS`: the aircraft's
+//! distance and direction from that receiver, and the signal level it was heard at), which with the
+//! aircraft's own position places the receiver; no client may read or derive a receiver's site
+//! (docs/relay-operators.md). readsb decides which aircraft match (github.com/wiedehopf/readsb,
+//! README-json.md); this only refuses what is not a well-formed query (`400`) before readsb is
+//! asked.
 //!
 //! - `/v2/hex/{hex}` (`/v2/icao/{hex}`): `find_hex`, a 24-bit address as six hex digits.
 //! - `/v2/callsign/{callsign}`: `find_callsign`.
@@ -25,7 +29,6 @@ use axum::extract::{Path, State};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
-use serde::Deserialize;
 
 use crate::App;
 use crate::routes::refuse;
@@ -168,15 +171,29 @@ fn list<'a>(value: &'a str, why: &str, valid: impl Fn(&str) -> bool) -> Result<&
     Ok(value)
 }
 
-/// What readsb's v2 answer must be to be served: an object with its aircraft. Everything else in
-/// it is served as readsb wrote it.
-#[derive(Deserialize)]
-struct Answer {
-    #[expect(
-        dead_code,
-        reason = "read only to check the answer is readsb's v2 form"
-    )]
-    ac: Vec<serde::de::IgnoredAny>,
+/// What readsb says of each aircraft relative to the receiver it decodes for, never served:
+/// `r_dst` and `r_dir`, its distance and direction from readsb's receiver location (written when
+/// readsb is given one, `--lat`/`--lon`), and `rssi`, the signal level it was heard at, which
+/// against the aircraft's position ranges the receiver. A readsb over the relay's `--beast-out` has
+/// no location and is sent no signal level, but `--readsb` may name any readsb, so the answer is
+/// held to it here.
+pub const RECEIVER_FIELDS: [&str; 3] = ["r_dst", "r_dir", "rssi"];
+
+/// readsb's v2 answer as a client may be served it: an object with its aircraft, each aircraft
+/// without `RECEIVER_FIELDS`, everything else as readsb wrote it. `None` when it is not readsb's
+/// v2 form.
+pub fn for_clients(body: &[u8]) -> Option<Vec<u8>> {
+    let mut answer: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_slice(body).ok()?;
+    let aircraft = answer.get_mut("ac")?.as_array_mut()?;
+    for one in aircraft {
+        if let Some(one) = one.as_object_mut() {
+            for field in RECEIVER_FIELDS {
+                one.remove(field);
+            }
+        }
+    }
+    serde_json::to_vec(&answer).ok()
 }
 
 /// Asks readsb `query` and serves its answer, or why not: the query's own mistake (`400`), or
@@ -187,17 +204,16 @@ async fn ask(app: &App, query: Result<Query, String>) -> Response {
         Err(why) => return refuse(StatusCode::BAD_REQUEST, &why),
     };
     let url = query.url(&app.settings.readsb);
-    let body = match app.upstream.get(&url).await.and_then(|body| {
-        serde_json::from_slice::<Answer>(&body)
-            .map(|_| body)
-            .map_err(|error| format!("{url}: {error}"))
-    }) {
-        Ok(body) => body,
-        Err(error) => {
-            eprintln!("tally-api: {error}");
-            return refuse(StatusCode::BAD_GATEWAY, "readsb did not answer");
-        }
-    };
+    let body =
+        match app.upstream.get(&url).await.and_then(|body| {
+            for_clients(&body).ok_or_else(|| format!("{url}: not readsb's v2 answer"))
+        }) {
+            Ok(body) => body,
+            Err(error) => {
+                eprintln!("tally-api: {error}");
+                return refuse(StatusCode::BAD_GATEWAY, "readsb did not answer");
+            }
+        };
     (
         [(
             header::CONTENT_TYPE,
@@ -288,6 +304,31 @@ mod tests {
             ),
         ] {
             assert_eq!(query.url(READSB), format!("{base}{expected}"));
+        }
+        Ok(())
+    }
+
+    /// Nothing readsb says of its receiver is served: each aircraft keeps everything else, and
+    /// what is not readsb's v2 form is not served at all.
+    #[test]
+    fn the_receivers_fields_are_never_served() -> Result<(), String> {
+        let readsb = br#"{"now":1700000000000,"total":1,"ctime":1,"ptime":2,"msg":"No error",
+            "ac":[{"hex":"a1b2c3","lat":37.5,"lon":-122.25,"alt_baro":3000,"rssi":-12.3,
+            "r_dst":12.345,"r_dir":271.4,"dst":1.5,"dir":10.0,"seen":0.2}]}"#;
+        let served: serde_json::Value =
+            serde_json::from_slice(&for_clients(readsb).ok_or("not served")?)
+                .map_err(|error| error.to_string())?;
+        let one = served["ac"][0].as_object().ok_or("no aircraft")?;
+        for field in RECEIVER_FIELDS {
+            assert!(!one.contains_key(field), "{field} served");
+        }
+        // The query point's distance and direction, and the rest, are served as readsb wrote them.
+        assert_eq!(one["dst"], 1.5);
+        assert_eq!(one["lat"], 37.5);
+        assert_eq!(served["total"], 1);
+        assert_eq!(served["msg"], "No error");
+        for refused in [&b"[]"[..], b"{}", b"{\"ac\":3}", b"not json"] {
+            assert_eq!(for_clients(refused), None);
         }
         Ok(())
     }

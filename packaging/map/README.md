@@ -9,6 +9,15 @@ What it gives: search, filters, aircraft details (registration, type, military a
 flags from the database below), trails, the table, layers, any aircraft's track by date, replay
 and the heatmap, all from the relay's own data.
 
+What it never shows is a receiver (docs/relay-operators.md: a receiver's site reaches only
+relays). It is a relay-side tool, on the relay's host, but everything it reads is what a client
+may hold: the relay's `--beast-out` gives each reception's message alone, with no receiver's
+counter or signal level, which against the aircraft positions anyone reads would place the
+receiver. Its readsb is given no location, so `receiver.json` names none, no range outline is
+written and no aircraft carries a distance or direction from one; tar1090 is set to draw no site
+marker, range rings or range outline. Do not give readsb a location, or feed it from anything
+else.
+
 ## Run it
 
 The relay's `--beast-out` is plain, unauthenticated BEAST bound to loopback, so the map shares the
@@ -54,7 +63,7 @@ volumes:
 tally-relay --key /etc/tally/relay.key --max-upload 6Mbit/s \
   --listen 0.0.0.0:10900 --beast-out 127.0.0.1:30105 --stats-listen 127.0.0.1:10901
 tally-api --relay-stats http://127.0.0.1:10901 --readsb http://127.0.0.1:30152 \
-  --relay 127.0.0.1:10900=<relay key> --mlat-raw --listen 127.0.0.1:10902
+  --relay 127.0.0.1:10900=<relay key> --listen 127.0.0.1:10902
 ```
 
 The image is signed by the release workflow on its tag, like the binaries; check it before pinning

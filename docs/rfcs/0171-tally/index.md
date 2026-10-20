@@ -12,6 +12,13 @@
 - Extends RFC-0119 (the feeder and the firehose): the boxes, the master, the consumer readsb and
   the JVM-never-sees-BEAST rule are kept whole. What changes is where the consumer readsb drinks
   from. Composes with RFC-0031 (surveillance) and RFC-0087 (observation storage), untouched.
+- **Amended 2026-10-19 (founder): a receiver's exact site is relay-only.** Aircraft receptions stay
+  open; a receiver's exact site (latitude, longitude, altitude, and anything a site can be derived
+  from) goes only to relays, which need it for MLAT, and never into anything a client reads. Anyone
+  may run a relay, so the promise is "never published, never readable by a client", not "secret
+  from someone who runs a relay". It changes §3.1, §3.3 (wire version 3, in one release), §3.4, §3.5, §3.6, §3.8, §3.8.1, §3.8.2, §6, §7 and §8.3, and RFC-0174 §2.1, §2.5,
+  §2.8, §2.10, §2.11 and §2.12; each place says so. It was pressure-tested by critics who found ten
+  ways a client could read or derive a site from v0.3.0 (§9, item 6).
 
 ## §0 The answer, in one line
 
@@ -88,8 +95,9 @@ restarted, so counters from before and after never meet), its wall clock, the co
 its own rate ceiling dropped, the hash of its previous batch, the receptions, and an Ed25519
 signature. Relays forward batches byte for byte. Consequences, each the reason for one field:
 
-- Anyone downstream can prove a receiver published exactly what arrived; a relay can drop a batch
-  but cannot alter or invent one.
+- Any relay downstream can prove a receiver published exactly what arrived; a relay can drop a batch
+  but cannot alter or invent one. (Raw batches go only to relays since 2026-10-19, §3.6: their
+  counters, with the published aircraft positions, would give a client the receiver's site.)
 - A sequence gap is data some hop did not deliver, and `dropped` separates the feeder's own choice
   from a relay's.
 - The hash chain means a receiver cannot sign two histories for two relays.
@@ -127,6 +135,36 @@ is 1 with `Goodbye{Version}`, and no code path keeps version 1 working (a feeder
 batch that compression shrinks, and probes expect a signed echo reply from every relay). Version 2
 also widens `Streams` to two bytes, so products after the eighth have bits.
 
+**Wire version 3 means "this peer keeps receiver sites off client links"** (decided 2026-10-19,
+founder; `tally_wire::record::SITES_VERSION`, `carries_sites`). A site-bearing record (§3.4: a
+`ReceiverSite`, or a `ReceiverInfo` of format 1) is sent only on a link that negotiated version 3
+or later with the role relay or engine. Every other link is a client link and is never sent one: a
+subscriber's, a feeder's, a probe's. A relay or engine link at version 2 is refused outright, since
+a version 2 relay does not know it must keep sites from its own subscribers. A feeder sends its
+`ReceiverSite`, and publishes at all, only to a relay that welcomed version 3. Version 3 adds
+only non-critical records (§3.4), so a version 2 build skips them.
+
+**There is no migration window.** When version 3 was decided the network was Flightlines' own
+relay and feeders, so it moves at once, in one release:
+
+- **A relay or engine link is accepted only at version 3 or above** (feeders, subscribers and
+  probes keep the minimum of 2, under the forever rule above). The least is per role
+  (`tally_wire::least_version`) and held at the handshake by both ends: a relay or engine says 3
+  as its `Hello`'s least, and a responder answers a relay or engine `Hello` below 3 with
+  `Goodbye{Version}`. The relay's egress has no column for an older relay link (`Column::of`
+  refuses it), so no relay that might pass a site to a client is ever sent one, and a version 2
+  peer that is not a relay is a client.
+- **A feeder publishes only to relays that welcome version 3.** It sends a format 2 description,
+  with its public cell, and a `ReceiverSite` (§3.5); a relay that welcomes only version 2 is not
+  one it publishes to.
+- **Relays** read both description formats, hold sites, refuse a site and a description of one key
+  whose public cell does not hold the site (§3.6), send clients only what cannot carry a site
+  (§3.6, "What a client may be sent"), and forward an older feeder's format 1 description byte for
+  byte only to relay and engine peers.
+- **The MLAT specification moves to version 6** with it: client clock models that name no
+  receiver, tagged positions, and a model's inputs hash over site ids rather than sites (§3.8.1,
+  "What a client is sent of MLAT").
+
 **The roles** a `Hello` names: feeder, subscriber, relay, engine (another relay's MLAT taking raw
 one hop, RFC-0174 §2.3; it publishes nothing), and **probe**. A probe is a
 measurement session (RFC-0174 §2.2's round-trip probing and delivery check): it may send only
@@ -146,13 +184,13 @@ record is a kind byte, a two-byte length, a body; a Noise message carries whole 
 | 0x01 | `Hello`        | the versions the initiator speaks, and its role (feeder, subscriber, relay, engine, probe) |
 | 0x02 | `Welcome`      | the version both speak from here on                                             |
 | 0x03 | `Batch`        | a receiver's signed receptions (§3.1)                                           |
-| 0x04 | `ReceiverInfo` | a receiver's signed self-description: location, clock class, software, relays  |
+| 0x04 | `ReceiverInfo` | a receiver's signed self-description: format 2 (2026-10-19) its public cell (H3 resolution 6), clock class, software, relays, and no site; format 1, from older feeders, its exact location, and relay-only (§3.5) |
 | 0x05 | `Heartbeat`    | liveness                                                                        |
 | 0x06 | `Redirect`     | "leave me", with relays as hints the feeder may ignore (§3.7)                   |
 | 0x07 | `RelayList`    | relays this relay knows of, as hints                                            |
 | 0x08 | `RateLimit`    | the most a relay wants; a feeder may go lower, never above its owner's ceiling |
 | 0x09 | `Goodbye`      | the relay is closing, and how long to wait                                      |
-| 0x0a | `Subscribe`    | the streams a subscriber wants, and its regions by receiver location (§3.6)     |
+| 0x0a | `Subscribe`    | the streams a subscriber wants, and its regions by receiver location; a client's matched by public cell, clamped to resolution 6 (§3.6) |
 | 0x0b | `RelayBatch`   | a relay's own deduplicated stream, signed under its own domain (§3.6)           |
 | 0x0c | `Positions`    | a relay's signed solutions, each naming its observation set (§3.8.1)          |
 | 0x0d | `ClockModel`   | a relay's signed, content-addressed clock model manifest for one tile and window (§3.8.1) |
@@ -160,6 +198,14 @@ record is a kind byte, a two-byte length, a body; a Noise message carries whole 
 | 0x0f | `ClockModelPart` | one part of a clock model too large for its manifest, checked against it (§3.8.1) |
 | 0x10 | `Provisional`  | a relay's signed provisional solutions (`Positions` format 4), superseded by final ones; only to subscribers that asked (`PROVISIONAL`, §3.8.1) |
 | 0x11 to 0x23 | RFC-0174's records | echo, delivery check, provider directory, sharing groups, credit, the regional and the two world products, parity and bundle index (RFC-0174 §2.10); transport version 2, the minimum. 0x13 and 0x14 are retired (the first delivery check), read as retired and never written; the delivery check is 0x22 and 0x23 (RFC-0181 §7) |
+| 0x25 | `ReceiverSite` | a receiver's signed exact site (issued time, location with altitude, clock class), under its own signing domain `"tally receiver site"`; relay-only, sent only on version 3 relay and engine links (§3.3, §3.5) |
+| 0x26 | `ClientClockModel` | a relay's signed clock model as a client may hold it, of one fixed size: signer, boot, sequence, issued time, spec version, the full model's id and inputs hash, and the window; no member, no site, no offsets (§3.8.1) |
+| 0x27 | `ClientRegionalBatch` | a relay's signed deduplicated receptions for one area as a client may hold them: each reception's format and bytes, the batch's wall clock, and no counters or signal levels (a signal set against public positions ranges a lone receiver; §3.6) |
+
+Kinds 0x25 to 0x27 came with wire version 3 (2026-10-19) and are non-critical, so a version 2 build
+skips them. Two formats came with them: `ReceiverInfo` format 2 (above) and `Positions` formats 5
+and 6, final and provisional, which name each reception by a 16-byte tag in place of its receiver,
+epoch and counter (§3.8.1).
 
 The extension rules, which are what a frozen feeder relies on:
 
@@ -230,7 +276,26 @@ Version 1 carries, and freezes:
   sent fewer batches, alone;
 - a hard upload ceiling (a token bucket that drops, never a buffer), counted in each batch;
 - the owner's location exactly as entered, with a precision field the owner may set to round it
-  (§8.3), a periodic wall-clock sample and its clock class.
+  (§8.3), a periodic wall-clock sample and its clock class. Since 2026-10-19 the exact location
+  goes only to relays (below).
+
+**The site goes only to relays** (amended 2026-10-19, founder). Up to tally-feed 0.3.0 the exact
+location was a field of the one description (`ReceiverInfo` format 1), and that description went
+everywhere: to every raw subscriber, into evidence bundles, onto the stats endpoint and the API. A
+feeder now signs two records, together, with one issued time:
+
+- a **`ReceiverInfo` of format 2**: issued time, the **public cell** (the H3 resolution 6 cell
+  holding the site, about 36 km², which the feeder computes; a finer cell is refused on signing
+  and on reading), clock class, software and relays. No location and no altitude. It travels
+  everywhere a description travels, clients included;
+- a **`ReceiverSite`**: issued time, the exact location with altitude, and the clock class, under
+  its own signing domain, so it can never verify as a description. It is sent only on a session
+  whose relay welcomed wire version 3 (§3.3).
+
+A relay that welcomes only version 2 is not published to at all (§3.3). When the location
+changes, it reissues both with one issued time. A description from an older feeder (format 1, the site inside) is still read: relays
+forward it byte for byte only to version 3 relay and engine peers, and a client is sent no
+description for that receiver.
 
 It must never carry: a remote kill switch, remote configuration or command push, self-update (it
 updates through the owner's package manager, if ever), a single built-in seed or signer, any check
@@ -242,21 +307,66 @@ cards and replays stale data), or a listening port.
 `tally-relay` accepts feeders, subscribers and other relays on one port. It checks each batch's
 signature, drops duplicates by hash, and forwards. It decodes no frame. It serves three streams:
 
-1. **Regional raw:** batches routed by the receiver's declared cell, for relays' MLAT and research.
-   Routing is by where the receiver is, never by decoded aircraft position.
+1. **Regional raw:** batches routed by the receiver's declared cell, for relays' MLAT. Routing is
+   by where the receiver is, never by decoded aircraft position. Relay-only since 2026-10-19 (below):
+   it was also for research, but a receiver's counters and the aircraft positions everyone can read
+   give its site to metres.
 2. **Deduplicated:** one copy of each Mode-S message (byte-identical within a short window), for
    most clients, signed by the relay as its own claim. It is about 30 Mbps for the whole world at
-   20,000 receivers, against roughly 1 to 2 Gbps of raw receptions.
-3. **MLAT results:** positions published by relays' MLAT (§3.8), signed by the relay.
+   20,000 receivers, against roughly 1 to 2 Gbps of raw receptions. A client gets it with no
+   counters (`ClientRegionalBatch`, below).
+3. **MLAT results:** positions published by relays' MLAT (§3.8), signed by the relay; a client gets
+   them tagged (§3.8.1).
 
 A subscriber chooses with `Subscribe { streams, regions }`, which it may send at any time and which
-replaces the last one; before any, it gets raw batches for the whole world. Regions are H3 cells of
-any resolution (`wire::region`, the one place that says whether a receiver is inside one), matched
-against the location in the receiver's newest signed `ReceiverInfo`; a receiver with no location
+replaces the last one; before any, a relay link gets raw batches for the whole world (a client is
+never sent raw, below). Regions are H3 cells of any resolution (`wire::region`, the one place that
+says whether a receiver is inside one), matched on a relay link against the receiver's newest
+signed site and on a client link against its public cell (below); a receiver with no location
 reaches only whole-world subscriptions. In wire version 1 the deduplicated stream is whole-world
 only: it mixes every receiver, so it is not cut by region. A relay derives its own deduplicated
 stream and never forwards another relay's; positions travel between relays like batches, verified
 and forwarded once by hash.
+
+**What a client may be sent is a type** (amended 2026-10-19, founder). A client is every peer that
+is not a relay or engine on a version 3 link (§3.3): free-tier, credited, vouched and linked
+subscribers, feeders, probes, and everything built on them (the HTTP API, the stats endpoint, any
+product). The client column of the egress table carries `tally_wire::ClientRecord`, never `Record`,
+and `ClientRecord` has no variant for a relay-only record; where one wire type has both forms, the
+variant holds a wrapper whose only constructor refuses the relay-only form. Conversion is one
+`TryFrom`, which names every relay-only record and hands back what it refuses, so egress counts it
+and a new record kind does not compile until someone classifies it. It is never a filter in a
+subscription's `wants`.
+
+| Relay-only                                   | Why                                                    | A client gets                       |
+| -------------------------------------------- | ------------------------------------------------------ | ----------------------------------- |
+| `ReceiverSite`, `ReceiverInfo` format 1      | the exact site                                         | `ReceiverInfo` format 2             |
+| `Batch`, `RelayBatch`, `RegionalBatch`       | counters: reverse MLAT, ranging by clock line          | `ClientRegionalBatch` (no counters) |
+| `Positions`, `Provisional` formats 3 and 4   | receiver, epoch and counter of every reception         | formats 5 and 6 (tags, §3.8.1)      |
+| `ClockModel`, `ClockModelPart`               | every member's site, and the clock offsets             | `ClientClockModel`                  |
+| a `FaultProof` of raw-form records or models | it carries the records above                           | a format 1 proof of tagged records  |
+| an `EvidenceBundle` holding a site           | it carries the site                                    | a bundle by reference (RFC-0174 §2.1) |
+
+What follows from it:
+
+- **The relay holds the site and the description apart, and checks the pair.** Per receiver it
+  keeps the newest `ReceiverSite` and the newest description, and refuses a pair whose public cell
+  does not hold the site, so the cell a client sees is the cell the site is in.
+- **Routing.** The hub keeps each receiver's exact point for relay links, and matches a client's
+  regions against the receiver's public cell. A client region finer than resolution 6 is clamped
+  to its resolution 6 ancestor, so 64 regions can no longer descend to about a square metre and
+  learn a site from which receivers' traffic arrives. A receiver's area is the resolution 3
+  parent of its public cell (`tally_wire::site::SHARING_AREA_RESOLUTION`,
+  `rendezvous::area_of_cell`): the feeder picks its relays by it and relays group and route its
+  data by it, so nothing a feeder's choices reveal is finer than its public cell.
+- **`--beast-out` serves each reception's message alone.** Its plain BEAST frames carry no
+  counter and no signal level (`tally_wire::ClientObsView`), so it is a client's form of the
+  receptions: a public map or API decoded from it (RFC-0187's `tally-map`, `tally-api`) can
+  place no receiver. It is unauthenticated and uncapped, so it refuses to bind anything but
+  loopback.
+- **The stats endpoint** (`--stats-listen`) shows each receiver's public cell, never its site or
+  altitude, and refuses to bind anything but loopback.
+- **Altitude** is in no client form: the site is the only record that carries it.
 
 How relays divide the work is RFC-0174's shape, which replaces the regional and top relay tree
 first described here: one kind of relay; each feeder sending to the two nearest healthy relays on
@@ -351,8 +461,8 @@ What a relay holds is bounded, and what it trusts is narrow, because keys cost n
   hash is forgotten is still refused. Positions follow the same rule per MLAT boot. The table of
   streams is capped and forgets the least recently active (a stream's activity is a forwarded
   batch), so a flood of new streams pushes out its own oldest first.
-- Receiver descriptions are capped and forget the receiver least recently active; a subscription names at
-  most 64 regions; a `Subscribe` sent with `Hello` decides the first byte a subscriber receives.
+- Receiver descriptions and sites are capped and forget the receiver least recently active; a subscription names at
+  most 64 regions, a client's each clamped to resolution 6 (above); a `Subscribe` sent with `Hello` decides the first byte a subscriber receives.
 - A relay signs its deduplicated stream under its own signature domain, so a relay's batch can
   never verify as a receiver's.
 
@@ -386,7 +496,8 @@ identities used.
 - Relays cover overlapping regions (at least one reception radius, about 400 km), and a receiver
   belongs to every relay whose region covers it.
 - An observation's identity is receiver key, counter epoch, raw counter and message hash, the same
-  whichever relay delivered it, and relays deduplicate on it before solving.
+  whichever relay delivered it, and relays deduplicate on it before solving. A client never sees
+  it: it sees a reception tag in its place (§3.8.1).
 - Relays never exchange calibrated times, pairwise time differences or pre-solved positions as
   solver inputs. Pairwise differences share their reference receiver's noise and overstate
   certainty; calibrated times from two relays make one reception look like two.
@@ -416,7 +527,8 @@ this:
   set. Clients merge solutions of one transmission by their full input set (the observation set
   and the model's input set together): the same set is a duplicate; a superset wins; incomparable
   sets are never averaged or fused, and any relay holding both publishes the solution over their
-  union (raw is public, so the union is always computable).
+  union (every relay of the area holds the raw, so the union is always computable there; a client,
+  which holds no raw since 2026-10-19, compares tag sets, below).
 - **Completeness is local by construction.** Relay regions overlap their neighbours by at least
   one reception radius, so a relay whose region holds an aircraft receives every receiver that
   could have heard it; border solutions from two relays therefore start from the same inputs, and
@@ -427,8 +539,8 @@ this:
   are at most 48 of the receivers inside it, chosen by farthest point from the cube's centre so
   they spread. An aircraft is assigned the tile containing the lower median of its hearers'
   sites, at the level whose members hold the most of its hearers, ties to the smaller level.
-  Every choice is integer arithmetic over signed descriptions and raw, so the assignment is
-  canonical: any relay or verifier computes the same tile from the same raw, and a model names
+  Every choice is integer arithmetic over signed sites and raw, so the assignment is
+  canonical: any relay computes the same tile from the same raw, and a model names
   its tile. A window is decided by the raw's own signed wall clocks, never by when anything
   arrived. Clock sync within the tile is a least-squares fit of each member's offset as a
   continuous piecewise-linear function on 5 s knots aligned to the tile's reference clock (the
@@ -462,7 +574,11 @@ this:
   never assumed. The published covariance is the fit's, inflated by 1.1 and floored at 5 m a
   side, for what the simulator cannot show (unmodelled multipath, site survey error, clock
   behaviour beyond its mix); a fix wider than 1.5 km is not published.
-- **Anyone can check a relay, and the rule is optimality, not bytes.** Verifying a model is
+- **Any relay verifies; anyone checks signatures and fault proofs; the rule is optimality, not
+  bytes.** (Amended 2026-10-19, founder: this read "anyone can check a relay", which needed raw and
+  sites in every client's hands. Verifying against raw needs the sites and the counters, so only a
+  relay, which holds both, does it; a client checks signatures, content addresses and format 1
+  fault proofs, which need neither.) Verifying a model is
   rebuilding its tile's members and input set from raw and checking the citation exactly, then
   forming its normal equations once at its estimate: the Gauss-Newton step there must be within
   tolerance of zero under the robust weights the estimate itself gives, its noise within
@@ -475,7 +591,7 @@ this:
   add, and an engine publishes a solution only after running the verifier on it as published,
   every one (as built 2026-10-07: checking every solution costs 20% more solving time, measured on
   the 4,000-receiver world benchmark, about half a percent of a stride's compute). A fault is a signed model or solution that fails verification on
-  its own cited raw: anyone holding that raw shows it, and a client drops the relay on its own
+  its own cited raw: any relay holding that raw shows it, and a client drops the relay on its own
   authority. The one fault provable with no raw at all is two signed solutions of one
   observation set, model and spec version that disagree beyond tolerance (the fault proof's
   format 1), final or provisional alike: a provisional solution is verified the same way with
@@ -486,6 +602,43 @@ this:
   assignment, grouping receptions into a transmission, thinning, outlier gating) are integer
   arithmetic on raw counters, signed wall clocks and fixed-point models, so independent
   implementations agree on them exactly.
+
+**What a client is sent of MLAT** (amended 2026-10-19, founder). A raw-form solution names each
+reception by receiver, epoch and counter, and a full clock model carries every member's site and
+its clock offsets; with the aircraft positions anyone reads, an hour of either gives a receiver's
+site to metres by reverse MLAT. So both stay on relay links, and a client gets these instead:
+
+- **A site id, relay-side.** `SiteId` is BLAKE2s-256 over `"tally site id" 0x00` and the
+  site-bearing record's signed bytes, signature included. It names a receiver's site for as long
+  as that record stands; a full model's scope and inputs hash use it in place of the site. A
+  client is never sent one.
+- **A reception key, never sent.** `ReceptionKey` is BLAKE2s-256 over `"tally reception key"
+  0x00` and the same signed bytes: a second derivation that no wire ever carries, so a relay holding
+  the site record derives it and a client cannot.
+- **Tagged positions** (`Positions` formats 5 and 6, final and provisional; format 6 travels as
+  `Provisional` like format 4). Format 3's and 4's layout with no receiver table, each reception a
+  `ReceptionTag`: the first 16 bytes of BLAKE2s-256 over `"tally reception tag" 0x00`, the reception
+  key current when the reception was heard, the counter epoch, the 48-bit counter, the message's
+  length and the message. Why a key no client can compute, and not the site id first proposed:
+  the site id was then to be published in client clock models, and a tag keyed by a public value
+  over a 48-bit counter is a search of 2^48 (hours on one GPU) from the counter itself. A key that
+  no wire carries holds whatever else a client learns. A relay rematches tags against its own raw. A
+  client merges by tag sets exactly as by observation sets: the same set is a duplicate, a superset
+  wins, anything else is incomparable.
+- **Client clock models** (`ClientClockModel`, kind 0x26), one fixed size: the signer, the full
+  model's boot and sequence, issued time, specification version, the full model's id (what
+  solutions cite), its inputs hash (what clients match models by) and the window. It names no
+  receiver: no key, no site id, no entry per member, no site, no `site_mm`, no offsets. Why not
+  even the members: a tile's members are chosen by their exact sites (a sphere about the tile's
+  centre, then farthest point), so the tiles a receiver belongs to, over time, narrow its site to a
+  fraction of its public cell. Membership is relay-only, like the site. The inputs hash covers site
+  ids, not sites (specification version 6, §3.3), and a client compares it, never recomputes it.
+- **Fault proofs** of format 1 over two tagged records, which a client checks with nothing else, as
+  before. A format 2 proof carries two full models and stays between relays; a tagged record and a
+  raw-form one of the same transmission are never a fault.
+
+The merge's raw mode is gone (`tally-merge`, and `tally-api --mlat-raw`): no client holds raw to
+resolve or verify with.
 
 The mlat-server bridge (`tally-mlat` as first built) could not take part: mlat-server's clock sync
 is private and stateful, so its outputs could be neither deduplicated nor verified. It is replaced
@@ -498,7 +651,8 @@ over it. As built:
 - A relay's MLAT subscribes to its regions' raw stream on every relay its operator names, and holds
   each signed observation once, by identity (of copies, the earliest signed wall clock), so relays
   that overlap add nothing but availability. It holds only receivers whose newest signed
-  description places them in its regions with a clock and location precision the specification
+  site (a `ReceiverSite`, or an older feeder's format 1 description; never a format 2 one, which
+  has none) places them in its regions with a clock and location precision the specification
   accepts, and only Mode S receptions.
 - It holds raw compactly and bounded by bytes (48 GiB by default; a held reception is a 24 byte
   record over an interned message), and refuses at ingest what no rule could use: anything but
@@ -716,7 +870,9 @@ over it. As built:
     111,955, 174 m).
 - The client merge rule is implemented once, `tally/crates/merge` (`tally-merge`), for every
   client; `tally-api` is the first. It reads positions, clock models (reassembled part by part
-  against their manifests), fault proofs and, optionally, raw from any number of relays, and holds
+  against their manifests), fault proofs and, until 2026-10-19, optionally raw, from any number of
+  relays (a client now reads tagged positions, client clock models and tagged fault proofs only;
+  what that changes is said in each item below), and holds
   per aircraft its latest transmissions (eight), each with the fix kept and up to four
   alternatives:
   - *One transmission, only on evidence*: two solutions are of one transmission when they name
@@ -732,13 +888,17 @@ over it. As built:
     joins false ones, which no chi-square sees since each side fits itself. What is lost: two
     relays whose solutions share no reception and no receiver of either's model are never
     merged; the aircraft's track holds both as separate transmissions and serves the latest.
+    Since 2026-10-19 a client joins two solutions only on a shared tag: the tie through a clock
+    model needs a reception's counter and the model's offsets, and a client holds neither.
   - *The full input set* is the observation set and the cited model's inputs hash; its identity is
     BLAKE2s-256 over `"tally merge input set" 0x00`, the set's hash and the inputs hash. The same
     set is a duplicate (dropped; its signer joins the fix's relays). Under the same model inputs a
     superset of observations wins and a subset is dropped. Anything else is incomparable.
   - *Incomparable, holding the raw* of every cited observation: the client finds the
     aircraft's canonical tile from its raw, fits that tile's model, solves the transmission and
-    verifies it as a relay would; that fix stands above the ones it was solved from.
+    verifies it as a relay would; that fix stands above the ones it was solved from. Since
+    2026-10-19 only a relay holds raw, so a client always takes the tie rule below; a relay that
+    holds both solves their union and publishes it.
   - *Incomparable, without the raw, the tie rule*: the fix with the greater weight (observations
     cited plus the model citation's input count, so a superset under one model always ranks
     first), then the lowest input set hash, is kept; the other is recorded as an alternative.
@@ -752,7 +912,8 @@ over it. As built:
     citation exactly, and the canonical assignment puts the aircraft in the cited tile, the model
     is verified by the model verifier once and every solution under it by the solution verifier;
     a failure is dropped. A client whose raw does not reproduce a citation does not hold that
-    model's raw and falls back to the signature check. Models are matched by the hash of their
+    model's raw and falls back to the signature check. Since 2026-10-19 no client holds raw, so
+    every client's check is the signature check, and the check against raw is a relay's. Models are matched by the hash of their
     inputs, never by their bytes, so two honest relays' models of one inputs that differ in the
     last bits are the same evidence.
   - *Fault proofs*: a checked proof marks the relays it names faulted; what stood on their word
@@ -776,11 +937,11 @@ over it. As built:
     provisional fixes and raw are each capped, least recently active forgotten first (the relay's
     table), raw also by bin as the client's clock moves on.
 
-  `tally-api` subscribes with `--relay` (and `--mlat-raw` for the raw) to final and provisional
-  positions, and serves an aircraft's merged MLAT position when readsb holds no ADS-B position for
+  `tally-api` subscribes with `--relay` to final and provisional positions (`--mlat-raw`, which
+  read raw, is gone since 2026-10-19), and serves an aircraft's merged MLAT position when readsb holds no ADS-B position for
   it, stating `position_source` (`adsb` or `mlat`) and, for MLAT, the horizontal sigma, the check
-  it passed (`model`, `signature` or `resolved`) and its `kind` (`final`, or `provisional` while
-  later than every final fix).
+  it passed (`model`, `signature` or `resolved`; with no raw, `signature`, §3.8.2) and its `kind`
+  (`final`, or `provisional` while later than every final fix).
 
 #### §3.8.2 Who checks a position
 
@@ -793,17 +954,20 @@ needs anyone to; each fix is checked by whoever is placed to, and says which che
 - **The other relays holding the area.** Every relay that covers an area's tiles holds the same raw
   (§3.8.1) and computes the same positions to the same bytes. Two signatures over the same inputs
   that disagree are a fault proof (`FaultProof`), which anyone checks with the two signed records
-  alone, no raw needed, and which travels to every reader of positions.
-- **A client holding raw** (the API with `--mlat-raw`) checks a fix itself: the model by the model
-  verifier and the solution by the solution verifier.
-- **A client holding no raw** relies on the signatures and content addresses: the solution and the
+  alone, no raw needed, and which travels to every reader of positions (to a client, of two tagged
+  records, §3.8.1).
+- **A client holding raw** (the API with `--mlat-raw`) checked a fix itself: the model by the model
+  verifier and the solution by the solution verifier. Since 2026-10-19 no client holds raw (§3.6),
+  so this check is a relay's alone.
+- **A client** relies on the signatures and content addresses: the solution and the
   model it cites are signed, whole, and agree with each other. The API reports which of these each
   fix passed (`MlatCheck`: `model`, `signature`, or `resolved` when it solved the fix itself from
-  two engines' raw).
+  two engines' raw). Both `model` and `resolved` need raw, so since 2026-10-19 a client's fixes
+  pass `signature`, and the cross-check below is what tells a client more.
 
 **The weak spot.** An area that one relay holds, or that only one operator's relays hold, has no
 independent check: nobody else computes its positions, so no disagreement can be signed, and a
-client without raw has only that operator's word. Several keys prove nothing here, since one
+client has only that operator's word. Several keys prove nothing here, since one
 operator can run any number.
 
 **The rule (decided 2026-10-08).** A fix counts as cross-checked only when at least two relays of
@@ -893,8 +1057,26 @@ roughly $200 to $700 a month on budget hosting; today it is one server.
   either. China seized receivers in 2021. Tally recruits only through adsb.im (§8.4).
 - LADD binds FAA data-feed subscribers by contract, not relays of radio receptions. Filtering is a
   client option, not a network duty.
-- An exact receiver location is personal data under GDPR. It is published exactly by default, with
-  that said plainly at install, and the owner may round it (§8.3).
+- An exact receiver location is personal data under GDPR. It was published exactly by default, with
+  that said plainly at install, and the owner may round it (§8.3). **Amended 2026-10-19 (founder):
+  it is no longer published.** The exact site goes only to relays, which need it for MLAT (§3.3,
+  §3.5), and is never in anything a client reads (§3.6); public surfaces show the receiver's public
+  cell, an H3 resolution 6 cell of about 36 km². Every relay operator that receives a site is a
+  controller of that exact site under the GDPR, for MLAT, bound by the network's rules for relay
+  operators (`docs/relay-operators.md`: never republish it, show only the public cell, keep an
+  objection process). Anyone may run a relay, so the honest promise is "never published and never
+  readable by a client", not "secret from whoever runs a relay".
+- **What was exposed before 2026-10-19.** Up to tally-feed and tally-relay 0.3.0 the exact site was
+  in the one signed description, sent to every raw subscriber and carried in evidence bundles; the
+  v0.3.0 API served exact coordinates; and raw counters, full clock models and raw-form positions
+  let a determined client derive a site. Descriptions already sent to subscribers cannot be called
+  back. Owners are told so (`docs/relay-operators.md`, "What was exposed before").
+- **What still narrows a site, by design.** A client's deduplicated stream for an area
+  (`ClientRegionalBatch`) carries every message the area's receivers heard, without counters or
+  receivers. In an area with a single receiver, every message in it is that receiver's, so the
+  stream shows that receiver's reception pattern: which aircraft it heard, when, and how strongly.
+  That bounds the site only to about its public cell, the precision the public cell already
+  states, so it is accepted; an owner in a lone area should know it.
 - Sweden's IMY reprimanded Flightradar24 (2025) for demanding proof of ownership before honouring
   removal requests; publication itself was a legitimate interest. A Tally relay that runs MLAT or
   archives is a GDPR controller and keeps a simple objection process.
@@ -924,6 +1106,14 @@ roughly $200 to $700 a month on budget hosting; today it is one server.
   unverifiable (§3.8.1).
 - **A broker in the middle (MQTT, NATS, Kafka).** Durable buffers with worse semantics than drop
   the slow client, and a dependency a stranger must run.
+- **Sites, raw counters and full clock models to clients** (2026-10-19). Any one of them gives a
+  receiver's home to a client (§3.6, §3.8.1).
+- **Keeping sites from clients with a filter.** A rule in a subscription's `wants` is one forgotten
+  branch from a leak; a client's egress is a type that cannot hold a site (§3.6).
+- **Keying reception tags by the site id.** As first designed the site id was public in client
+  clock models, so its tags would fall to a 2^48 search; the key is one no wire carries (§3.8.1).
+- **Naming a model's members to clients.** Tile membership is chosen by exact site, so it narrows
+  a site below its public cell over time (§3.8.1).
 
 ## §8 Founder rulings (2026-10-05)
 
@@ -934,6 +1124,15 @@ roughly $200 to $700 a month on budget hosting; today it is one server.
 3. **Receiver location is exact by default.** Any relay's MLAT needs it, and rounding for some and
    not others would need a trusted party. The installer says the location is public; the owner may
    round it and contribute less to MLAT.
+   **Reversed in part 2026-10-19 (founder): relays are now the trusted party for exact sites.** The
+   location stays exact by default, because MLAT needs it, but it is no longer public: it goes to
+   relays and to nothing a client reads (§3.5, §3.6). This ruling had refused a trusted party; it
+   now names one, every relay, because the alternative left every receiver's home readable by any
+   client, and a client is anyone. Relays are not a closed set (anyone may run one), so what the
+   trust buys is that a site is never published and never sent to a client, and what binds an
+   operator is the rules for relay operators. The installer says that the exact location goes to
+   relays only and public pages show its public cell; the owner may still round it and contribute
+   less to MLAT.
 4. **Recruitment is through adsb.im only.** Outside that, no recruiting.
 
 ## §9 Provenance: what each critic changed
@@ -954,6 +1153,14 @@ roughly $200 to $700 a month on budget hosting; today it is one server.
 5. **Legal and privacy research:** §6, with sources: 18 USC 2511 and 47 USC 605; UK Wireless
    Telegraphy Act s.48; German TDDDG §5 and §27; faa.gov/pilots/ladd; IMY decision DI-2021-3397;
    adsb.lol's privacy and licence pages; the ODbL 1.0 text.
+6. **Site privacy (2026-10-19):** critics found ten ways a client of v0.3.0 could read or derive a
+   receiver's site: the description, full clock models, routing by a point cell at any resolution,
+   counters in positions, counters in the regional product, raw batches, exact altitude, the API's
+   pin grid crossing the protocol's cells, the merge's raw mode, and a stats endpoint that bound
+   anywhere. The design critic's shape was adopted (format 2 descriptions and a separate site
+   record, wire version 3, a client egress typed so it cannot hold a site, tags, client clock
+   models, the public cell as the one cell clients see); the reception key in place of the site
+   id as the tags' key was the wire writer's, accepted the same day.
 
 ## §10 Build steps
 
@@ -996,3 +1203,7 @@ roughly $200 to $700 a month on budget hosting; today it is one server.
    0.895 with every crowdsourced receiver. Owed: a run with our own real receivers, surveyed,
    and the same calibration over them.
    Then **the Bridge as a receiver** (its own RFC).
+8. **Sites relay-only** (2026-10-19), in one release with no migration window (§3.3): the wire
+   records and the typed client egress, relay and engine links at version 3 only (the minimum
+   for those roles is 3 from this release; relays and feeders move together), feeders that
+   publish only to version 3 relays, and the MLAT specification's version 6.

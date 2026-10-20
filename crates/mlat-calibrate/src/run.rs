@@ -7,8 +7,11 @@ use std::io::Write;
 
 use tally_mlat::engine::{Engine, Settings as EngineSettings};
 use tally_mlat_solver::publish;
-use tally_wire::batch::{ReceiverInfoContent, format};
-use tally_wire::{Batch, BatchContent, Identity, Observation, PublicKey, ReceiverInfo, Record};
+use tally_wire::batch::format;
+use tally_wire::{
+    Batch, BatchContent, Identity, Observation, PublicKey, ReceiverSite, ReceiverSiteContent,
+    Record,
+};
 
 use crate::locards::{self, Row, Subset};
 use crate::mapping::{self, ClockClass, Receiver, Reply, Survey};
@@ -498,21 +501,20 @@ struct Replay {
 }
 
 impl Replay {
-    /// Every feeder describes itself at the start.
+    /// Every feeder signs its site at the start, as a new feeder does (relay-only: the engine is
+    /// hosted by a relay).
     fn describe(&mut self, start_ms: u64) -> Result<(), String> {
         for feed in self.feeds.values() {
-            let info = ReceiverInfo::sign(
+            let site = ReceiverSite::sign(
                 &feed.receiver.identity,
-                &ReceiverInfoContent {
+                &ReceiverSiteContent {
                     issued_ms: start_ms,
-                    location: Some(feed.receiver.location),
+                    location: feed.receiver.location,
                     clock: feed.receiver.clock,
-                    software: "tally-mlat-calibrate locards".to_owned(),
-                    relays: Vec::new(),
                 },
             )
             .map_err(|e| e.to_string())?;
-            self.engine.ingest(&Record::ReceiverInfo(info), start_ms)?;
+            self.engine.ingest(&Record::ReceiverSite(site), start_ms)?;
         }
         Ok(())
     }
@@ -650,7 +652,10 @@ impl Replay {
                     self.levels.insert(model, tile.level);
                 }
             }
-            Record::Positions(positions) | Record::Provisional(positions) => {
+            // The tagged form is the same solutions for clients: scored once, raw.
+            Record::Positions(positions) | Record::Provisional(positions)
+                if !positions.is_tagged() =>
+            {
                 let provisional = matches!(record, Record::Provisional(_));
                 let content = positions.solutions().map_err(|e| e.to_string())?;
                 for solution in &content.solutions {
