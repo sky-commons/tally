@@ -1360,7 +1360,7 @@ impl State {
                 let group = groups_of(child).into_iter().next()?;
                 (!own_groups.contains(&group)).then_some(Unit::Network(group.as_u64()))
             };
-            let feeder = |_: &PublicKey| false;
+            let feeder = |_: &credit::ShownFeeder| false;
             credit::worth(
                 shown,
                 key,

@@ -2,7 +2,7 @@
 //! them.
 
 use blake2::{Blake2s256, Digest};
-use tally_wire::{Clock, Location, Observation, PublicKey};
+use tally_wire::{Clock, Location, Observation, PublicKey, SiteId};
 
 /// An observation's identity (RFC-0171 §3.8): receiver key, counter epoch, raw counter and the
 /// Blake2s-256 of the message bytes. The same whichever relay delivered it; ordered by those four
@@ -42,12 +42,17 @@ impl Reception {
     }
 }
 
-/// A receiver as its signed `ReceiverInfo` describes it.
+/// A receiver as its site-bearing record (a `ReceiverSite`, or an old feeder's format 1
+/// `ReceiverInfo`) places it: relay-only, since its location is the receiver's exact site. A
+/// client sees nothing of it: `id` enters only the model's inputs hash.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Site {
     pub receiver: PublicKey,
     pub clock: Clock,
     pub location: Location,
+    /// The site-bearing record's reference (`tally_wire::SiteId`): what a model's inputs id
+    /// hashes in place of the location, and what a client's view of the model names.
+    pub id: SiteId,
 }
 
 /// The largest declared location precision a receiver may have and still take part, metres.

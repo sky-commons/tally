@@ -1,7 +1,7 @@
 //! What a relay reports about each receiver it forwards for (RFC-0173 §2.5): how often it has fed
 //! this relay directly, when it was first and last heard, how many batches and observations were
 //! forwarded for it, and how many of its sequences never arrived. These are counts of the relay's
-//! own traffic, not about aircraft; a receiver's location and software come from its own signed
+//! own traffic, not about aircraft; a receiver's public cell and software come from its own signed
 //! description, which the hub holds (`Hub::stations`).
 //!
 //! No figure about a feeder is computed here (RFC-0174 §2.12: no relay computes, stores or vouches
@@ -23,7 +23,7 @@ use std::collections::HashMap;
 use std::net::IpAddr;
 
 use serde::{Deserialize, Serialize};
-use tally_wire::{Location, PublicKey};
+use tally_wire::{PublicKey, Region};
 
 use crate::bounded::Bounded;
 use crate::hub::RECEIVERS_REMEMBERED;
@@ -66,38 +66,26 @@ pub struct StationReport {
     /// Sequences of its current and earlier boots that were skipped and have not arrived late.
     pub gaps: u64,
     pub observations: u64,
-    /// Where its newest description says it is, if the relay holds one that says and a batch of
-    /// it was forwarded: a receiver only connected is placed nowhere.
-    pub location: Option<StationLocation>,
+    /// The public cell (H3 resolution 6, `Region::public_cell`, as its H3 index in hex) its newest
+    /// description says it is in, if the relay holds one that says and a batch of it was
+    /// forwarded: a receiver only connected is placed nowhere. Never its site: what this report
+    /// serves is a client's (RFC-0171 §3.5), so nothing finer than the public cell, and no
+    /// altitude, is in it.
+    pub cell: Option<String>,
     /// The feeder software its newest description names.
     pub software: Option<String>,
     /// The address (no port) its connected session came from, as the socket saw it; `null` while
     /// no session of it is connected. An address is a session's, never the receiver's: once the
     /// session ends the address may be anyone's (a dynamic IP reassigned), so it goes with it.
     /// Who feeds from where is the operator's to know, never the public's: this report is served
-    /// on loopback only (`config::parse_stats_listen`), and `tally-api` answers a client only the
+    /// on loopback only (`config::parse_loopback`), and `tally-api` answers a client only the
     /// connected stations of the client's own address (`GET /v1/me`).
     pub address: Option<String>,
 }
 
-/// A receiver's declared location, in degrees and metres.
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
-pub struct StationLocation {
-    pub lat: f64,
-    pub lon: f64,
-    pub alt_m: i32,
-    pub precision_m: u32,
-}
-
-impl From<Location> for StationLocation {
-    fn from(location: Location) -> Self {
-        Self {
-            lat: f64::from(location.lat_e7) / 1e7,
-            lon: f64::from(location.lon_e7) / 1e7,
-            alt_m: location.alt_m,
-            precision_m: location.precision_m,
-        }
-    }
+/// How a station report names a cell: its H3 index in lowercase hex, as H3's own tools print it.
+pub fn cell_name(cell: Region) -> String {
+    format!("{:x}", cell.as_u64())
 }
 
 /// One receiver's running counts.
@@ -170,7 +158,7 @@ impl Tally {
             batches: self.batches,
             gaps: self.gaps,
             observations: self.observations,
-            location: None,
+            cell: None,
             software: None,
             address,
         }
@@ -190,7 +178,7 @@ fn connected_only(key: &PublicKey, since_ms: u64, address: Option<String>) -> St
         batches: 0,
         gaps: 0,
         observations: 0,
-        location: None,
+        cell: None,
         software: None,
         address,
     }
@@ -308,7 +296,7 @@ impl Stations {
         }
     }
 
-    /// `receiver`'s report, without the location and software its description carries: its row,
+    /// `receiver`'s report, without the public cell and software its description carries: its row,
     /// or, connected with no batch forwarded, what its connection alone says.
     pub fn report(&self, receiver: &PublicKey, now_ms: u64) -> Option<StationReport> {
         let since = self.connected_since(receiver);
@@ -513,7 +501,7 @@ mod tests {
                 report.sessions,
                 report.first_seen_ms,
                 report.last_seen_ms,
-                report.location
+                report.cell
             ),
             (false, true, Some(1_000), 0, 0, 1_000, 1_000, None)
         );

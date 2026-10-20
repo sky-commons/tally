@@ -465,8 +465,8 @@
 //!
 //! ```text
 //! tile level u8 | tile cube x, y, z i64 | window first i64 | window last i64
-//! | scope count u16 | count x (key [32], clock u8, lat_e7 i32, lon_e7 i32, alt_m i32,
-//!                              precision_m u32)                        strictly ascending by key
+//! | scope count u16 | count x (key [32], clock u8, site id [32], lat_e7 i32, lon_e7 i32,
+//!                              alt_m i32, precision_m u32)             strictly ascending by key
 //! | input citation hash [32] | count u32
 //! | gauge clock | origin unix ns u64 | gauge rate i64 (parts per 10^15)
 //! | piece count u16 | count x piece                                    strictly ascending by clock
@@ -488,9 +488,23 @@
 //! fits its manifest.
 //! The model's inputs id ([`publish::inputs_id`], carried by the manifest) is BLAKE2s-256 over
 //! `"tally clock model inputs id" 0x00`, the specification version (two bytes) and the encoding's
-//! first part (tile to input citation). Consumers merge by it, never by model bytes; the
+//! first part (tile to input citation) with each scope entry as key, clock, site id and
+//! precision only: no site. Consumers merge by it, never by model bytes; the
 //! reference engine publishes the same bytes for one inputs id, but two models of one inputs id
 //! that differ are no fault (§ What verification means).
+//!
+//! **A model is relay-only; a client is sent its summary** (wire version 3). A scope entry's site,
+//! a piece's `site_mm` and its offsets, with the aircraft's published positions, give every
+//! receiver's site, and a receiver's exact site is never readable by a client. The site id
+//! (`tally_wire::SiteId`) names the site-bearing record the engine placed the receiver by (its
+//! `ReceiverSite`, or an old feeder's format 1 `ReceiverInfo`) without revealing it, and enters
+//! only the inputs id. Beside each model the engine signs a `tally_wire::ClientClockModel`
+//! ([`publish::client_model`]): the model's id, its inputs id and its window, and nothing of its
+//! scope, since a tile's members are chosen by their exact sites (the tile's sphere and the
+//! farthest-point choice) and the tiles a receiver is in, over time, narrow its site. A client is sent
+//! that and tagged solutions (`tally_wire::TaggedSolution`, each reception its `ReceptionTag` under
+//! the receiver's relay-only `ReceptionKey`); a relay keeps the model and the raw solutions, and
+//! rematches a tagged solution against the raw it holds ([`publish::rematch`]).
 //!
 //! A solution on the wire ([`publish::to_wire`]) carries its transmit time as the origin plus its
 //! model time, in Unix picoseconds; latitude and longitude rounded to 10^-7 degree; height above

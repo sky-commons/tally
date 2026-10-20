@@ -25,12 +25,9 @@ usage: tally-api --relay-stats URL --readsb URL [options]
   --max-requests N       requests handled at once; beyond it one is answered 503 (default 256)
   --max-connections N    connections held at once; beyond it a new one is closed (default 4096)
   --refresh-secs N       how often the relay's stations and readsb's count are read (default 5)
-  --relay HOST:PORT=KEY  a relay to read MLAT positions, clock models and raw from; repeatable,
-                         and relays may overlap (none serves no MLAT and no feeder figures)
-  --mlat-raw             merge from the raw too: verify every clock model from it, solve two
-                         relays' incomparable solutions over their union (MLAT is a relay's
-                         duty), and give receivers standing (without it no feeder is ranked on a
-                         leaderboard)
+  --relay HOST:PORT=KEY  a relay to read MLAT positions, clock models and its signed feeder
+                         figures from; repeatable, and relays may overlap (none serves no MLAT
+                         and no feeder figures)
   --key FILE             this client's key (base64, as a relay's --key); without it a fresh key
                          each run, which no relay can vouch for
   --linked-relay HOST:PORT=KEY
@@ -87,7 +84,6 @@ impl Config {
                     settings.refresh = Duration::from_secs(count(&flag, &value()?)? as u64);
                 }
                 "--relay" => settings.mlat.relays.push(RelayAddress::parse(&value()?)?),
-                "--mlat-raw" => settings.mlat.raw = true,
                 "--key" => key_file = Some(value()?),
                 "--linked-relay" => {
                     if linked_relay.is_some() {
@@ -220,12 +216,12 @@ mod tests {
     }
 
     #[test]
-    fn mlat_relays_repeat_and_raw_and_age_are_the_operators() -> Result<(), String> {
+    fn mlat_relays_repeat_and_age_are_the_operators() -> Result<(), String> {
         let key = tally_wire::Identity::from_seed([3; 32])
             .public()
             .to_base64();
         let bare = parse(&["--relay-stats", "r", "--readsb", "s"])?;
-        assert!(bare.settings.mlat.relays.is_empty() && !bare.settings.mlat.raw);
+        assert!(bare.settings.mlat.relays.is_empty());
         let one = format!("10.0.0.1:10900={key}");
         let two = format!("10.0.0.2:10900={key}");
         let config = parse(&[
@@ -237,16 +233,16 @@ mod tests {
             &one,
             "--relay",
             &two,
-            "--mlat-raw",
             "--mlat-max-age-secs",
             "30",
         ])?;
         let mlat = &config.settings.mlat;
         assert_eq!(mlat.relays.len(), 2);
         assert_eq!(mlat.relays[1].address, "10.0.0.2:10900");
-        assert!(mlat.raw);
         assert_eq!(mlat.max_age, Duration::from_secs(30));
         assert!(parse(&["--relay-stats", "r", "--readsb", "s", "--relay", "nokey"]).is_err());
+        // Raw is relay-only (wire version 3): a client has none to merge from.
+        assert!(parse(&["--relay-stats", "r", "--readsb", "s", "--mlat-raw"]).is_err());
         Ok(())
     }
 

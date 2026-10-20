@@ -57,12 +57,17 @@ tally-feed init --key /etc/tally/key            # once: creates the key, prints 
 tally-feed --key /etc/tally/key --lat 37.41 --lon -122.10 --alt 12   # the release's relays are built in
 ```
 
-Your receiver's exact location goes to relays, because multilateration (locating aircraft that do
-not broadcast a position) needs it exact. Public pages and the API show only a spot within about
-5 km (the rule for every relay: [docs/relay-operators.md](docs/relay-operators.md)). Today the
-network's raw products still let a determined reader work it out; the next release keeps it off
-everything clients read. `--precision <metres>` rounds it on the receiver, for experts: above 30 m
-the receiver takes no part in multilateration.
+Your receiver's exact location (with its altitude) goes only to relays, because multilateration
+(locating aircraft that do not broadcast a position) needs it exact. It is never in anything a
+client reads: maps, the API, station pages and every other client see only its public cell, the
+H3 cell of about 36 km² (about 6 km across) that holds it, which the feeder works out itself.
+Anyone may run a relay, so the operators of the relays your receiver reaches do hold the exact
+location; the network's rules forbid them to republish it
+([docs/relay-operators.md](docs/relay-operators.md)). Before this release it was not kept from
+clients: tally-feed 0.3.0 and earlier put it in a description sent to raw subscribers, and the
+v0.3.0 API served exact coordinates, so treat it as already known to anyone who read the feed
+then (the same page, "What was exposed before this change"). `--precision <metres>` rounds it on
+the receiver, for experts: above 30 m the receiver takes no part in multilateration.
 
 If the receiver also runs dump978-fa for 978 MHz UAT, `--uat 127.0.0.1:30978` publishes its raw
 output too, in the same signed batches.
@@ -82,18 +87,23 @@ tally-relay --key /etc/tally/relay.key --max-upload 6Mbit/s \
 costs" below). It needs no state and no calendar: a restart cannot reset it, and it never runs
 out.
 
-`--beast-out` serves every reception as plain BEAST for a local decoder such as readsb. It is
-unauthenticated: bind it to loopback.
+`--beast-out` serves every reception as plain BEAST for a local decoder such as readsb, the one a
+public map and `tally-api` read (below). Each frame is the reception's message alone: its counter
+and signal level are zero, since a receiver's counters and signal levels against the aircraft
+positions anyone reads place it, and those are relay-only. It is unauthenticated and never
+counted against the cap, so it binds loopback only: the relay refuses to start on any other
+address.
 
 `--stats-listen 127.0.0.1:10901` serves what the relay knows of each receiver's traffic as JSON
 (`GET /stations`, `GET /stations/KEY` with the key as base64url): sessions, first and last seen,
-batches, sequence gaps, observations, messages a second, the location and software its
-description declares, exactly, and the `address` its connected session came from. It is
-unauthenticated too, and names where each feeder feeds from, so it binds loopback only: the relay
-refuses to start on any other address (`0.0.0.0`, a public one, or a name). Anything a relay
-publishes (`tally-api`, a website, a map) shows receiver locations blurred to about 5 km, never
-exact: the network's rules for relay operators, and the condition for a release's seed list, are in
-[docs/relay-operators.md](docs/relay-operators.md).
+batches, sequence gaps, observations, messages a second, the public cell and software its
+description declares (never the exact location or altitude), and the `address` its connected
+session came from. It is unauthenticated too, and names where each feeder feeds from, so it binds
+loopback only: the relay refuses to start on any other address (`0.0.0.0`, a public one, or a
+name). Anything a relay publishes (`tally-api`, a website, a map) shows a receiver's public cell
+and nothing finer, and the exact locations a relay holds for multilateration are never
+republished: the network's rules for relay operators, and the condition for a release's seed list,
+are in [docs/relay-operators.md](docs/relay-operators.md).
 
 `--area CELL` names an area the relay takes (an H3 cell, hex or decimal; repeatable). It shares
 what it takes with every relay that takes the same area, and offers it, signed, to the network.
@@ -183,7 +193,7 @@ Exchange-compatible `/v2` and routes (RFC-0187 §2).
 
 ```sh
 tally-api --relay-stats http://127.0.0.1:10901 --readsb http://127.0.0.1:30152 \
-  --relay 127.0.0.1:10900=<relay key> --mlat-raw --routes /var/lib/tally/standing-data \
+  --relay 127.0.0.1:10900=<relay key> --routes /var/lib/tally/standing-data \
   --listen 127.0.0.1:10902 --client-ip-header CF-Connecting-IP
 ```
 
@@ -193,14 +203,14 @@ tally-api --relay-stats http://127.0.0.1:10901 --readsb http://127.0.0.1:30152 \
 once with `git clone --depth 1 --filter=blob:none --sparse https://github.com/vradarserver/standing-data DIR && git -C DIR sparse-checkout set routes airports`.
 Without it the routes answer `404`.
 
-`--relay` (repeatable) is where the API reads the network's MLAT positions and its world products.
-Feeder figures and leaderboards need both it and `--mlat-raw`: a receiver ranks only with standing,
-and standing is settled against the raw messages the API reads with `--mlat-raw`. Without them those
-endpoints answer `503`, and the aircraft carry readsb's positions alone. Without `--mlat-raw` no
-receiver is credited with MLAT help either: a final position credits a receiver only when the
-merge accepted it and the receiver's own signed raw holds the reception it cites. The feeder
-figures (uptime, message rate, aircraft, range, coverage, MLAT help) are the API's, computed from
-public signed records; no relay computes them.
+`--relay` (repeatable) is where the API reads the network's MLAT positions, its world products
+and the relays' feeder figures. Without it the aircraft carry readsb's positions alone, and no
+feeder has figures. The API is a client of the relay like any other: it is sent tagged positions
+(each checked by the relay that sent it) and clock models with no receiver sites, and no raw
+(`--mlat-raw`, which read raw, is gone). Each relay computes the figures of the receivers it
+hosts or carries, standing and MLAT help among them, and signs them (`FeederFigures`, RFC-0174
+§2.12); the API serves the newest its `--relay`s signed, and ranks only receivers their relay
+says have standing.
 
 - `GET /v1/aircraft?west=&south=&east=&north=` (degrees, at most 60 each way); add `&feed=precise`
   for the precise world product, about a minute and a half behind, with every MLAT position final

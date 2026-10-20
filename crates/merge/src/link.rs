@@ -1,6 +1,8 @@
 //! A consumer's sessions with Tally relays: it dials each as a `Subscriber`, asks in the same
-//! message as its Hello for the whole world's positions and clock models (and raw, when it merges
-//! from raw), and hands every record it is sent that the merge reads to `inbound`. The relays are
+//! message as its Hello for the whole world's positions and clock models, and hands every record
+//! it is sent that the merge reads to `inbound`, as a [`ClientRecord`]: a record only a relay may
+//! hold (a receiver's site, raw counters, a full model) is never handed on, whoever sent it. The
+//! relays are
 //! the operator's to name and may overlap: the merge holds a record once however many deliver it.
 //! A relay that says "leave me" is only left for as long as it asks.
 //!
@@ -16,8 +18,8 @@ use std::time::Duration;
 use tally_wire::backoff::Backoff;
 use tally_wire::noise;
 use tally_wire::{
-    EvidenceBundle, FirehoseCredential, Identity, PublicKey, Record, RelayAddress, Role, Streams,
-    WireError,
+    ClientRecord, EvidenceBundle, FirehoseCredential, Identity, PublicKey, Record, RelayAddress,
+    Role, Streams, WireError,
 };
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, watch};
@@ -30,33 +32,33 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const HEALTHY_SESSION: Duration = Duration::from_secs(60);
 
 /// The streams a consumer merging MLAT asks for: final and provisional positions (a provisional
-/// is served only while it is later than every final one, `Track::served`), and clock models.
-pub fn streams(raw: bool) -> Streams {
-    let streams = Streams::POSITIONS
+/// is served only while it is later than every final one, `Track::served`), clock models (a
+/// client is sent their summaries), and the relays' signed feeder figures, which a client serving
+/// feeders reads beside them (the merge itself ignores them).
+pub fn streams() -> Streams {
+    Streams::POSITIONS
         .with(Streams::PROVISIONAL)
-        .with(Streams::CLOCK_MODELS);
-    if raw {
-        streams.with(Streams::RAW)
-    } else {
-        streams
-    }
+        .with(Streams::CLOCK_MODELS)
+        .with(Streams::FEEDER_FIGURES)
 }
 
-/// Whether the merge reads `record`.
-pub fn wanted(record: &Record) -> bool {
+/// The record as the merge's consumer reads it, if it does: what a client may hold
+/// (`ClientRecord::try_from`, which refuses every relay-only form) of the kinds it reads.
+pub fn wanted(record: Record) -> Option<ClientRecord> {
+    let record = ClientRecord::try_from(record).ok()?;
     matches!(
         record,
-        Record::Positions(_)
-            | Record::Provisional(_)
-            | Record::ClockModel(_)
-            | Record::ClockModelPart(_)
-            | Record::FaultProof(_)
-            | Record::Batch(_)
-            // Raw mode places receivers by their signed descriptions (the merge's sites).
-            | Record::ReceiverInfo(_)
-            | Record::WorldPositions(_)
-            | Record::WorldPrecise(_)
+        ClientRecord::Positions(_)
+            | ClientRecord::Provisional(_)
+            | ClientRecord::ClockModel(_)
+            | ClientRecord::FaultProof(_)
+            | ClientRecord::WorldPositions(_)
+            | ClientRecord::WorldPrecise(_)
+            // A relay's signed feeder figures, for a consumer that asks for them (the merge
+            // ignores them).
+            | ClientRecord::FeederFigures(_)
     )
+    .then_some(record)
 }
 
 /// A credential a linked relay signed this consumer, with that relay's evidence.
@@ -140,7 +142,7 @@ pub async fn subscribe(
     relay: RelayAddress,
     identity: Identity,
     streams: Streams,
-    inbound: mpsc::Sender<Record>,
+    inbound: mpsc::Sender<ClientRecord>,
 ) {
     subscribe_vouched(relay, identity, streams, inbound, Vouching::none()).await;
 }
@@ -151,7 +153,7 @@ pub async fn subscribe_vouched(
     relay: RelayAddress,
     identity: Identity,
     streams: Streams,
-    inbound: mpsc::Sender<Record>,
+    inbound: mpsc::Sender<ClientRecord>,
     vouching: Vouching,
 ) {
     let mut backoff = Backoff::new();
@@ -177,7 +179,7 @@ async fn session(
     relay: &RelayAddress,
     identity: &Identity,
     streams: Streams,
-    inbound: &mpsc::Sender<Record>,
+    inbound: &mpsc::Sender<ClientRecord>,
     vouching: &Vouching,
 ) -> Result<Duration, String> {
     let stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(&relay.address))
@@ -231,13 +233,15 @@ async fn session(
                             held.offered(&from, &client, signed, evidence);
                         }
                     }
-                    record if wanted(&record) => {
+                    record => {
+                        let Some(record) = wanted(record) else {
+                            continue;
+                        };
                         if inbound.send(record).await.is_err() {
                             leave = Some(Err("the consumer ended".to_owned()));
                             break;
                         }
                     }
-                    _ => {}
                 }
             }
             if let Some(outcome) = leave {
@@ -277,7 +281,7 @@ mod tests {
     use tally_relay::credit::Allowance;
     use tally_relay::egress::Cap;
     use tally_relay::hub::Hub;
-    use tally_wire::batch::{Clock, ReceiverInfoContent};
+    use tally_wire::batch::{Clock, PublicInfoContent};
     use tally_wire::{Identity, ReceiverInfo, RelayAddress, Streams};
     use tokio::net::TcpListener;
     use tokio::sync::mpsc;
@@ -343,17 +347,20 @@ mod tests {
         for _ in 0..10 {
             let feeder = Identity::generate().map_err(text)?;
             let now = now_ms();
-            let info = ReceiverInfo::sign(
+            let info = ReceiverInfo::sign_public(
                 &feeder,
-                &ReceiverInfoContent {
+                &PublicInfoContent {
                     issued_ms: now,
-                    location: None,
+                    cell: None,
                     clock: Clock::Beast,
                     software: "tally-feed".to_owned(),
                     relays: vec![linked.public()],
                 },
             )
             .map_err(text)?;
+            // Evidence cites feeders by reference: the serving relay credits one only when its own
+            // copy of the description (gossiped to it in the network) resolves it.
+            serving_hub.network().credit.described(info.clone(), now);
             linked_hub.network().credit.described(info, now);
             serving_hub
                 .network()

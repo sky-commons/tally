@@ -27,9 +27,10 @@
 # The altitude is never assumed: when no source holds one, it is asked for on the terminal, and
 # with no terminal the install stops naming TALLY_ALT.
 #
-# The exact location goes to the Tally relays, inside the feed, for multilateration (MLAT); the
-# relays show only a spot within about 5 km on any public page (they do the blurring). It asks
-# nothing about it and passes no flag for it.
+# The exact location goes only to Tally relays, inside the feed, for multilateration (MLAT). The
+# feed signs it in a record relays keep to themselves; what any data user reads (the API, the
+# streams, the stats) names only the antenna's public cell, about 5 km across, which is all a
+# public map shows. It asks nothing about it and passes no flag for it.
 #
 # Where nothing answers on 127.0.0.1:30005 but an ultrafeeder container runs, the decoder's output
 # is inside docker and a host install would feed nothing: it installs nothing and prints the
@@ -72,8 +73,8 @@ VERSION="v0.4.2"
 # installs. The source names no publisher: the publisher writes its release's address here when it
 # publishes it, and TALLY_RELEASE overrides it.
 PUBLISHED_RELEASE=""
-# What any public page shows of the exact location: the relays blur it.
-PUBLIC_BLUR="about 5 km"
+# What any public map shows of the location: the feeder's public cell (H3 resolution 6).
+PUBLIC_AREA="~5 km"
 BIN=/usr/local/bin/tally-feed
 KEY=/etc/tally/key
 DEFAULTS=/etc/default/tally-feed
@@ -420,9 +421,9 @@ discover_location() {
 }
 
 # The one line that says who sees the location. Nothing is asked: the feed always carries it
-# exactly, which multilateration needs, and the relays blur it on every public page.
+# exactly to relays, which multilateration needs, and no client is ever sent it.
 privacy_line() {
-  printf 'Your exact location goes to Tally relays for MLAT. Relays show only a spot within %s on any public page.' "$PUBLIC_BLUR"
+  printf 'Your exact location goes only to Tally relays, for MLAT. Nothing a data user reads contains it; public maps show only the %s area.' "$PUBLIC_AREA"
 }
 
 # This machine's build of tally-feed, by its userland (a 32-bit Raspberry Pi OS on a 64-bit kernel

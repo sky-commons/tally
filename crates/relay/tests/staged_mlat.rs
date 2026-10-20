@@ -23,6 +23,63 @@ use tally_relay::mlat_host::{
 };
 use tally_wire::{Identity, Location, PublicKey, ReceiverInfo, Record, Region, Regions};
 
+/// `delivered` with each site that moves its receiver out of the public cell its description
+/// names followed, at its stamp, by the description its feeder reissues with it (format 2, the new
+/// cell): a relay pairs a site only with a description whose public cell holds it
+/// (`Hub::keep_site`), as a moved feeder signs both. A reference engine places receivers by their
+/// sites alone, so the descriptions change nothing it does.
+fn reissued(
+    simulation: &tally_mlat_solver::sim::Simulation,
+    delivered: &[(u64, Record)],
+) -> Result<Vec<(u64, Record)>> {
+    let feeds = simulation.feeds().map_err(text)?;
+    let mut named: std::collections::HashMap<PublicKey, tally_wire::PublicInfoContent> =
+        std::collections::HashMap::new();
+    let mut out = Vec::with_capacity(delivered.len());
+    for (at, record) in delivered {
+        out.push((*at, record.clone()));
+        match record {
+            Record::ReceiverInfo(info) => {
+                named.insert(info.receiver().map_err(text)?, info.public().map_err(text)?);
+            }
+            Record::ReceiverSite(site) => {
+                let receiver = site.receiver().map_err(text)?;
+                let content = site.content().map_err(text)?;
+                let Some(held) = named.get(&receiver) else {
+                    continue;
+                };
+                if held.holds(&content.location) {
+                    continue;
+                }
+                let identity = &feeds
+                    .iter()
+                    .find(|feed| feed.identity.public() == receiver)
+                    .ok_or("a site of no feed")?
+                    .identity;
+                let renamed = tally_wire::PublicInfoContent {
+                    issued_ms: content.issued_ms,
+                    cell: Some(Region::public_cell(&content.location).map_err(text)?),
+                    ..held.clone()
+                };
+                let info = ReceiverInfo::sign_public(identity, &renamed).map_err(text)?;
+                named.insert(receiver, renamed);
+                out.push((*at, Record::ReceiverInfo(info)));
+            }
+            _ => {}
+        }
+    }
+    Ok(out)
+}
+
+/// What a description declares: when it was issued and, a format 1 one, its site (a format 2
+/// one's site comes apart, as a `ReceiverSite`).
+fn declared(info: &ReceiverInfo) -> Result<(u64, Option<Location>)> {
+    Ok(match info.description().map_err(text)? {
+        tally_wire::Description::Public(content) => (content.issued_ms, None),
+        tally_wire::Description::Site(content) => (content.issued_ms, content.location),
+    })
+}
+
 type Result<T = ()> = std::result::Result<T, String>;
 
 fn text(error: impl std::fmt::Display) -> String {
@@ -71,27 +128,34 @@ enum Describing {
     Racing { seed: u64 },
 }
 
-/// Hands every description of `arrivals` that comes before the first batch to `hub` as
-/// `describing` says (the rest come at their stamps, `mlat_run_with`).
+/// Hands every description and site of `arrivals` that comes before the first batch to `hub` as
+/// `describing` says (the rest come at their stamps, `mlat_run_with`): a site and its description
+/// pair in whichever order they come.
 fn describe_all(hub: &Arc<Hub>, arrivals: &[(u64, Record)], describing: Describing) -> Result {
-    let mut infos: Vec<ReceiverInfo> = arrivals
+    let mut infos: Vec<Record> = arrivals
         .iter()
         .take_while(|(_, record)| !matches!(record, Record::Batch(_)))
-        .filter_map(|(_, record)| match record {
-            Record::ReceiverInfo(info) => Some(info.clone()),
-            _ => None,
-        })
+        .filter(|(_, record)| matches!(record, Record::ReceiverInfo(_) | Record::ReceiverSite(_)))
+        .map(|(_, record)| record.clone())
         .collect();
-    let publish = |hub: &Hub, info: &ReceiverInfo| -> Result {
-        let content = info.content().map_err(text)?;
-        hub.publish_info(
-            1,
-            info.clone(),
-            info.receiver().map_err(text)?,
-            content.issued_ms,
-            content.location,
-            true,
-        );
+    let publish = |hub: &Hub, record: &Record| -> Result {
+        match record {
+            Record::ReceiverInfo(info) => {
+                let (issued_ms, place) = declared(info)?;
+                hub.publish_info(
+                    1,
+                    info.clone(),
+                    info.receiver().map_err(text)?,
+                    issued_ms,
+                    place,
+                    true,
+                );
+            }
+            Record::ReceiverSite(site) => {
+                hub.publish_site(1, site.clone());
+            }
+            _ => {}
+        }
         Ok(())
     };
     match describing {
@@ -410,13 +474,13 @@ fn mlat_run_cuts(
                     if let Delays::Seeded(seed) = delays {
                         std::thread::sleep(pause(seed, next as u64, 200));
                     }
-                    let content = info.content().map_err(text)?;
+                    let (issued_ms, place) = declared(info)?;
                     hub.describe(Description {
                         source: 2,
                         info: info.clone(),
                         receiver: info.receiver().map_err(text)?,
-                        issued_ms: content.issued_ms,
-                        place: content.location,
+                        issued_ms,
+                        place,
                         publishing: false,
                         stamp: Some(Stamp {
                             stamp_ms: *at,
@@ -424,6 +488,27 @@ fn mlat_run_cuts(
                         }),
                         in_flight: hub.in_flight_of(info.as_bytes().len()),
                     });
+                }
+                // A site after the first batch, likewise: it takes effect at its step.
+                if let Record::ReceiverSite(site) = record
+                    && next > 0
+                    && arrivals[..next]
+                        .iter()
+                        .any(|(_, record)| matches!(record, Record::Batch(_)))
+                {
+                    if let Delays::Seeded(seed) = delays {
+                        std::thread::sleep(pause(seed, next as u64, 200));
+                    }
+                    hub.keep_site(
+                        2,
+                        site.clone(),
+                        site.receiver().map_err(text)?,
+                        Some(Stamp {
+                            stamp_ms: *at,
+                            ingest_seq: next as u64,
+                        }),
+                        hub.in_flight_of(site.as_bytes().len()),
+                    );
                 }
                 if let Record::Batch(batch) = record {
                     if let Delays::Seeded(seed) = delays {
@@ -731,7 +816,7 @@ fn descriptions_midway_make_the_same_bytes_with_any_delays_and_the_reference_eng
     use tally_mlat::replay::{arrivals, described_midway, replay, scenario};
     let mut simulation = tally_mlat_solver::sim::run(&scenario(17, 60.0));
     let plain = arrivals(&mut simulation, 3)?;
-    let delivered = described_midway(&simulation, &plain)?;
+    let delivered = reissued(&simulation, &described_midway(&simulation, &plain)?)?;
     let areas = mlat_areas()?;
     let run = |delivered: &[(u64, Record)], ingest: usize, delays: Delays| -> Result<Signed> {
         let (signed, report, _) = mlat_run_with(

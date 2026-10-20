@@ -18,6 +18,10 @@
   extension rules (§3.4), the upload speed cap and its priorities (§3.6), and the deterministic, verifiable MLAT and
   merge rule (§3.8.1) are kept whole. What changes is who runs what, where a feeder sends, and how
   data reaches whoever wants it. RFC-0173 (Tally on the web) is a client of the result.
+- **Amended 2026-10-19 (founder): a receiver's exact site is relay-only** (RFC-0171, its status and
+  §3.3, §3.6, §3.8.1). Here that changes what credit buys and what evidence carries (§2.1), what a
+  member hears first (§2.5), the costs table (§2.8), two records (§2.10), the regional product
+  (§2.11) and who can compute standing (§2.12); each place says so.
 
 **Three words** (founder, 2026-10-06). This RFC, RFC-0171 and the site use exactly three words for
 the network's roles. A **feeder** is a receiver that sends what it hears: a radio receiver at
@@ -102,11 +106,12 @@ seeding their data to the area's sharing groups.
 **Firehose access is earned by a linked relay, on signed, portable evidence (founder,
 2026-10-06).** A client never shares. Its access is either the free small tier (positions for an
 area, with nothing but a connection) or the credit of the relay it is linked to: a client that
-wants firehose-scale streams (raw, or positions beyond a small area) presents a credential signed
+wants firehose-scale streams (positions, clock models and the regional product beyond a small area;
+raw too, until 2026-10-19, below) presents a credential signed
 by a relay's key, "this client belongs to relay R", with an expiry, beside R's evidence. The
-evidence is signed records anyone can check without a history of their own: the feeders' own signed
-descriptions naming R as one of their relays, signed receipts from the members of R's sharing
-trees for the stripe slices R delivered to them (§2.5). R's answers to delivery checks are not
+evidence is signed records a relay can check without a history of its own: the feeders' own signed
+descriptions naming R as one of their relays (by reference since 2026-10-19, below), signed receipts
+from the members of R's sharing trees for the stripe slices R delivered to them (§2.5). R's answers to delivery checks are not
 evidence: they are R's word about itself, checkable only by a holder of the same batch, so a relay
 with no feeders and no children earns nothing however many it gives. Any relay a client reaches checks the bundle and serves it in proportion to what the
 evidence shows, so the credit travels with the client and no peer has to have watched R itself, and
@@ -126,6 +131,22 @@ can vouch for several clients.
   minutes, with its newest bundle. The client (`tally-api --key FILE --linked-relay
   HOST:PORT=KEY`) presents both before its `Subscribe` to every relay it reads, and accepts a pair
   only from its linked relay.
+- **Credit buys scale, never sites or raw** (amended 2026-10-19, founder). A credited, vouched or
+  linked client is a client like any other (RFC-0171 §3.6): its link is typed so it cannot hold a
+  site. It gets no raw feeder batches, no sites, no full clock models and no raw-form positions;
+  it gets format 2 descriptions (each receiver's public cell), the regional product without
+  counters, tagged positions, client clock models and the world products, over wider areas and at
+  higher rates than the free tier. Raw and sites are a relay's, and a business that wants them runs
+  a relay, as the firehose rule above already asks of it.
+- **Evidence by reference** (amended 2026-10-19, founder). A bundle carrying feeders' descriptions
+  carried, for a feeder of 0.3.0 or earlier, its exact site, to every relay and client the bundle
+  reached. A bundle now (`EvidenceBundle` format 2) names each feeder description by reference: the
+  feeder's key, the description's issued time and the BLAKE2s of its signed bytes, signature
+  included. The relay that weighs the bundle
+  resolves each reference against its own copy of that description and weighs the description it
+  holds exactly as before; a reference it cannot resolve, or whose hash its copy does not match,
+  counts nothing, as a record that does not verify counts nothing. The stripe receipts are
+  unchanged. A client passes a bundle on without reading a site, since none is in it.
 
 ### §2.2 A feeder sends to two relays: the nearest healthy pair, on different networks
 
@@ -143,7 +164,9 @@ can vouch for several clients.
   the healthy relays inside the band: the closest measured time plus half again, or plus 10 ms,
   whichever is larger.
 - **Inside the band, one shared pick per area.** The feeder ranks the band's relays by weighted
-  rendezvous hashing over its area (the H3 cell of its signed location at the area resolution) and
+  rendezvous hashing over its area (the H3 cell of its signed location at the area resolution;
+  since 2026-10-19 the resolution 3 parent of its public cell, by which relays also group and route
+  its data, so its choice of relays reveals nothing finer than the public cell, RFC-0171 §3.6) and
   each relay's key, weighted by the spare feeder capacity the relay declares in its signed
   description. Every feeder of an area that sees the same band computes the same ranking, so an
   area's feeders land on the same few relays without coordinating, which is what MLAT needs (§2.3),
@@ -222,7 +245,8 @@ only when it holds its whole footprint, which reaches half the tile cube's diago
 definition, `tally_mlat::area::border_band`, serves both the raw a relay asks for and the
 receivers its MLAT lets take part); every other relay holding feeders of the area
 passes their raw to the chosen ones, one hop, over the region-cut raw subscription
-(`Subscribe { streams: RAW, regions }`, matched against the receiver's signed location). When a
+(`Subscribe { streams: RAW, regions }`, matched against the receiver's signed location; since
+2026-10-19 its site, which only a version 3 engine or relay link is sent, RFC-0171 §3.3). When a
 chosen relay fails or withdraws its offer, the next in the ranking takes the area.
 
 An `Engine` session is another relay's MLAT taking an area's raw one hop. It is accepted only from
@@ -356,7 +380,8 @@ positions; clock models): the relays that take that area.
 - **A member hears what a record depends on first** (as built). Records reach a member by
   address, striped over several trees, so nothing orders them the way one session does. Each
   member link therefore carries, before a record, what it depends on that the link has not yet
-  carried: a batch's receiver's newest description, a clock model's parts just before its manifest
+  carried: a batch's receiver's newest description (and, on a version 3 link, its newest site,
+  RFC-0171 §3.3), a clock model's parts just before its manifest
   (parts are in no group of their own), and every model a positions record cites. A relay that
   cannot place a receiver can neither solve its receptions nor pass its batches on, a manifest
   without its parts is no model, and a solution whose model has not come cannot be checked.
@@ -424,7 +449,7 @@ feeder rate is measured (§1); everything else below is an estimate from it.
 | User (estimates)            | Traffic a month        | Cost a month                                     |
 | --------------------------- | ---------------------- | ------------------------------------------------ |
 | Georgia positions           | well inside 3 TB       | about $12 (one Lightsail plan)                   |
-| A region's raw client     | about 2 TB in, 2 TB out | about $100 on AWS (1 TB over), or flat-rate      |
+| A region's raw (a relay taking it; no client is sent raw since 2026-10-19) | about 2 TB in, 2 TB out | about $100 on AWS (1 TB over), or flat-rate      |
 | World positions             | about 4 TB in, 4 TB out | about $370 metered on AWS, about $45 flat-rate   |
 
 Lightsail's 3 TB allowance counts traffic in both directions, though only outbound overage is
@@ -455,13 +480,14 @@ kinds skips it:
 | 0x13, 0x14 | retired | The first delivery check, a proof of possession over the feeder's nonce. Read as retired and never written; a relay answers an old query with `Goodbye{Retired}` (RFC-0181 §7). |
 | 0x15, 0x16 | `ProviderOffer`, `ProviderQuery` | The directory (§2.6): cells, stripes, MLAT cores, address and network, signed. |
 | 0x17 to 0x1a | `StripeAssignment`, `PieceManifest`, `HaveSummary`, `StripeReceipt` | Sharing groups (§2.5). |
-| 0x1b, 0x1c | `FirehoseCredential`, `EvidenceBundle` | Credit (§2.1): the credential, and feeders' descriptions and children's receipts. |
+| 0x1b, 0x1c | `FirehoseCredential`, `EvidenceBundle` | Credit (§2.1): the credential, and feeders' descriptions (by reference since 2026-10-19) and children's receipts. |
 | 0x1d | `WorldPositions` | The live world product (§2.11), the `WORLD` bit (64). |
-| 0x1e | `RegionalBatch` | The regional product's deduplicated receptions, the `REGIONAL` bit (32). |
+| 0x1e | `RegionalBatch` | The regional product's deduplicated receptions, the `REGIONAL` bit (32). Relay-only since 2026-10-19: a client gets `ClientRegionalBatch` (0x27, no counters, RFC-0171 §3.4). |
 | 0x1f | `Parity` | A stripe's XOR parity slice, chunked under the body limit (§2.5), unsigned. |
 | 0x20 | `BundleIndex` | A parent cell's bundle for one second: its children's digests, signed (§2.6). |
 | 0x21 | `WorldPrecise` | The precise world product (§2.11), the `WORLD_PRECISE` bit (128). |
 | 0x22, 0x23 | `DeliveryQuery`, `DeliveryAnswer` | The feeder's signed grant of tag keys to the member asked, and, in an audit, a nonce and a few batches named by boot and sequence; per batch, the member's tag made on arrival and its key's id, or "not seen", signed, answer format 2 (§2.2, RFC-0181 §7). Kinds of their own, not 0x13 and 0x14 read differently, so no build reads one form as the other. |
+| 0x28 | `FeederFigures` | A relay's signed figures of one area's receivers (§2.12), the `FEEDER_FIGURES` bit (256), on client links. Since 2026-10-19. |
 
 A batch may be compressed (format 2, raw DEFLATE, inflating at most 1 MiB and at most 8 times its
 compressed stream, RFC-0171 §3.4); a feeder compresses whenever it shrinks the batch within that
@@ -471,7 +497,12 @@ rule, since every version 2 reader inflates it.
 
 - **Regional:** everything for one area, raw included (raw, positions, provisional positions and
   clock models), read from the area's sharing group. For researchers, local apps and the relays
-  that cover the area.
+  that cover the area. **Amended 2026-10-19 (founder):** that whole product is the relays'. A
+  client, researchers and local apps included, gets the area's client forms: its receivers' format
+  2 descriptions, its deduplicated receptions without counters (`ClientRegionalBatch`, signed from
+  the same draft as the relay's `RegionalBatch`, wall clock kept), tagged final and provisional
+  positions and client clock models (RFC-0171 §3.6, §3.8.1). A researcher who needs raw runs a
+  relay that takes the area.
 - **World:** one position per aircraft per second, everywhere, thinned by one deterministic rule
   (`tally_wire::products::world_choice`) and offered at the top of the area tree (§2.6) by any
   relay that has gathered every area's positions (by taking every area: its groups bring it each
@@ -498,33 +529,59 @@ rule, since every version 2 reader inflates it.
 
 ### §2.12 Receiver standing, and a bigger answer wins only if it agrees
 
-- **Receiver standing.** Every client and relay can compute, from public signed data alone, how
+- **Receiver standing.** Every relay can compute, from the signed data it holds, how
   well each receiver's receptions agree with the solutions that cite it (its residuals against
   verified fixes, by tile and over time). A receiver whose receptions keep agreeing gains weight;
   one that keeps disagreeing loses it. Standing ranks answers (below); it never decides what a
   solver includes. A solver leaves out only a reception that does not fit, by the specification's
   outlier rule, which the verifier applies the same way (it refuses a solution that omits a
   reception that fits), so a fake receiver either fits and changes nothing or does not and is left
-  out. Standing is a function of the public record, read when a transmission's solutions are
+  out. Standing is a function of the signed record, read when a transmission's solutions are
   decided (never fixed when a solution arrives), and a transmission is settled
   `FINAL_FIX_ARRIVED_MS` after its transmit time; so every party that reads the same record
-  computes the same standing and the same ranking, and a new key starts with none.
+  computes the same standing and the same ranking, and a new key starts with none. **Amended
+  2026-10-19 (founder):** this read "every client and relay ... from public signed data alone".
+  Residuals need each receiver's site and counters, which only relays hold now (RFC-0171 §3.6), so
+  standing is a relay's computation, over the raw it holds (RFC-0181 §5 already scopes it so).
 - **A bigger answer wins only if it agrees.** RFC-0171 §3.8.1's merge rule prefers the solution
   over the larger input set, and that preference holds only when the larger solution agrees with
   the smaller within the smaller's uncertainty (a chi-square test of the difference). A superset
   that disagrees is not a better answer but a sign that something in the added inputs is wrong: the
   smaller fix stands, both are kept as evidence, and the added receptions' standing pays for it. So
   a relay cannot override an honest fix by padding it with bad receptions.
-- **Feeder figures and leaderboards are a client's, never the network's.** No relay computes,
-  stores or vouches for a feeder's uptime, message rate, planes heard, range, unique coverage or
-  MLAT help, and nothing in the protocol ranks feeders. tally.flightlines.ai, one client run by
-  Flightlines, offers station pages and per-area leaderboards (`tally-api`, `GET
-  /v1/stations/{key}/stats` and `/v1/leaderboards`), computed from the public signed records any
-  client reads (receivers' batches and descriptions, and the final positions that cite their
-  receptions), ranking by unique coverage and MLAT help, never raw message counts, and ranking
-  only receivers with standing. MLAT help is credited only for fixes the API's merge accepted and
-  receptions in the receiver's own signed raw, and a station's row comes only from its batches. Anyone reading the same records computes the same figures, and
-  anyone may run boards of their own (founder, 2026-10-07).
+- **A client's positions are checked by the relay that sends them** (amended 2026-10-19). The rule
+  above lets only a solution consistent with its own receptions under its own model refuse a
+  superset, and a client, sent tagged positions and client clock models, cannot tell which are. So
+  a relay sends a client a tagged positions record only after rematching each solution's tags to
+  the receptions of its raw twin (each receiver's tag keyed by the site-bearing record the model's
+  scope names, by site id, so a site re-signed mid-window still rematches) and finding every one
+  under its model and consistent; one that fails is sent to no one, and one it cannot check is
+  passed on to relays, who check it for their own clients, and to no client
+  (`tally_relay::consistency`).
+- **Feeder figures are each relay's own signed claim, and any client serves them** (founder,
+  2026-10-19; this replaced "feeder figures and leaderboards are a client's, never the network's",
+  2026-10-07). Only relays hold what the figures are computed from: receivers' raw batches, the
+  raw positions that cite their receptions, and standing. So each relay computes, over the last
+  day, the figures of the receivers it hosts or carries (uptime, messages, aircraft heard, range,
+  coverage and unique coverage at H3 resolution 5, MLAT help, and standing from its own ledger)
+  and publishes them as a record it signs (`FeederFigures`, its own stream bit
+  `Streams::FEEDER_FIGURES`), one per area (the receivers' public cells' parent at the area
+  resolution, the one area rule), on its client links like any other product. Figures are of
+  whole hours: published once an hour, issued at the hour's start over the 24 whole hours before
+  it (`FIGURES_BUCKET_MS`, which the wire holds every record to), so the finest series a client
+  can difference out of two records is an hour's, never a minute's. A figure
+  carries no site and no counter: the receiver's public cell, counts, square kilometres of
+  coverage cells, and a range measured from the public cell's centre, never the site; a receiver
+  that names no cell is figured in a record of no area. Unique coverage is unique among that
+  relay's receivers. Any client reads the records (verifying the signature, and trusting the
+  relays it chose), and the API is no different: tally.flightlines.ai, one client run by
+  Flightlines, serves station pages and per-area leaderboards (`tally-api`, `GET
+  /v1/stations/{key}/stats` and `/v1/leaderboards`) from the newest figures its operator's relays
+  signed, ranking by unique coverage and MLAT help, never raw message counts, and ranking only
+  receivers their relay says have standing. A relay's figures are its word about its receivers,
+  as a relay's delivery answers are its word about itself (§2.1): nothing in the protocol ranks
+  feeders or grants anything on them, and anyone may run boards of their own over the relays they
+  trust.
 
 ## §3 What is killed, and why
 

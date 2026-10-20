@@ -14,10 +14,11 @@
 //!   by where each position came from.
 //! - `GET /v1/stations/{key}`: one receiver, the key as base64url without padding.
 //! - `GET /v1/stations/{key}/stats`: what one feeder gave the network over the last day (`feeders`),
-//!   computed by this API as a client from public signed records, never by a relay.
+//!   as the relay that hosts or carries it computed and signed it (only relays hold what the
+//!   figures are computed from), read here as any client reads it.
 //! - `GET /v1/leaderboards` and `GET /v1/leaderboards/{area}`: every area with a feeder, ranked or
 //!   not, and one area's two leaderboards (by unique coverage and by MLAT help; only feeders with
-//!   standing) and its feeders without standing.
+//!   standing, as their relay says) and its feeders without standing.
 //! - `GET /v1/me`: the stations connected now from the asking client's host, as the relay's
 //!   loopback stats name it (RFC-0187 §2, `Stations::mine`); never any other, and never cached.
 //! - `GET /v2/...`: the ADS-B Exchange-compatible API adsb.lol serves, each path one query of
@@ -47,9 +48,8 @@ pub mod vrs;
 #[cfg(test)]
 mod fixtures_test;
 
-use std::collections::BTreeSet;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use axum::http::HeaderName;
@@ -133,10 +133,8 @@ pub struct App {
     pub requests: Arc<Semaphore>,
     pub snapshot: Snapshot,
     pub mlat: Arc<mlat::Positions>,
-    /// What the feeder figures are computed from, fed by the MLAT subscription's records.
+    /// The relays' signed feeder figures, fed by the MLAT subscription's records.
     pub feeders: Arc<Mutex<feeders::Ledger>>,
-    /// The receivers with standing, as the merge's ledger says (`mlat::with_standing`).
-    pub standing: Arc<RwLock<Arc<BTreeSet<tally_wire::PublicKey>>>>,
     /// readsb's aircraft as every open stream reads them, one read shared.
     pub live: stream::Live,
     /// The streams each client holds open.
@@ -153,8 +151,9 @@ impl App {
             requests: Arc::new(Semaphore::new(settings.max_requests)),
             snapshot: Snapshot::default(),
             mlat: Arc::default(),
-            feeders: Arc::default(),
-            standing: Arc::default(),
+            feeders: Arc::new(Mutex::new(feeders::Ledger::trusting(
+                settings.mlat.relays.iter().map(|relay| relay.key),
+            ))),
             live: stream::Live::default(),
             streams: stream::Open::default(),
             routes: Arc::default(),
@@ -209,41 +208,13 @@ impl App {
 }
 
 impl App {
-    /// Computes the feeder figures and leaderboards now, over where the API may say each receiver
-    /// is (its public pin, `privacy::public_location`, from its own signed description) and the
-    /// merge's standing: a figure that places a feeder (its area, its range) is computed from the
-    /// pin anyone may read, never the exact place.
+    /// The feeder figures and leaderboards now, from the newest figures the operator's relays
+    /// signed.
     pub fn compute_board(&self) {
-        // `None` while the stations are not known: the places held stay. Known, they replace them,
-        // so a receiver that stops declaring a place loses it.
-        let locations: Option<Vec<(tally_wire::PublicKey, feeders::LatLon)>> =
-            self.snapshot.stations(Instant::now()).map(|stations| {
-                stations
-                    .places
-                    .iter()
-                    .map(|(key, pin)| {
-                        (
-                            *key,
-                            feeders::LatLon {
-                                lat: pin.lat,
-                                lon: pin.lon,
-                            },
-                        )
-                    })
-                    .collect()
-            });
-        let standing = self
-            .standing
-            .read()
-            .map(|held| Arc::clone(&held))
-            .unwrap_or_default();
         let Ok(mut ledger) = self.feeders.lock() else {
             return;
         };
-        if let Some(locations) = locations {
-            ledger.locate(locations);
-        }
-        let board = ledger.board(routes::wall_ms(), |key| standing.contains(key));
+        let board = ledger.board(routes::wall_ms());
         drop(ledger);
         self.snapshot.set_board(board, Instant::now());
     }
@@ -260,7 +231,6 @@ pub async fn serve(listener: TcpListener, settings: Settings) -> ! {
         &app.settings.mlat,
         Arc::clone(&app.mlat),
         Arc::clone(&app.feeders),
-        Arc::clone(&app.standing),
     ) {
         eprintln!("tally-api: mlat: {error}");
     }

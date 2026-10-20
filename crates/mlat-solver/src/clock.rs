@@ -13,8 +13,13 @@ use crate::scope::{Citation, Window};
 /// fits a GNSS-disciplined clock as it behaves (no prior ties it to the gauge's stamps) and drops a
 /// clock nothing places; version 5 dates a free-running gauge's origin by the least bound every
 /// cited reception of its clock gives (not its anchor batch's wall clock alone), rejects a sync
-/// message any receiver heard more than once in the window, and starts the fit robustly.
-pub const SPEC_VERSION: u16 = 5;
+/// message any receiver heard more than once in the window, and starts the fit robustly; version 6
+/// names each scope entry's site-bearing record by its site id (`tally_wire::SiteId`) in the
+/// encoding and hashes the id and the stated precision, never the site, into the inputs id, so the
+/// id a client is sent with the model (`tally_wire::ClientClockModel`) tells nothing of where a
+/// receiver is. The mathematics is version 5's: the same raw fits the same clocks and solves to the
+/// same positions.
+pub const SPEC_VERSION: u16 = 6;
 
 // Relays judge fault proofs by the tolerance the wire sets per version: a version the wire does
 // not know would make every proof of it unjudgeable (as bumping to 4 once did in `tally-merge`).

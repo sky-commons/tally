@@ -45,7 +45,7 @@ use crate::WireError;
 use crate::batch::Hash;
 use crate::clock_model::{CLOCK_MODEL_FORMAT, ClockModel};
 use crate::key::PublicKey;
-use crate::positions::{POSITIONS_FORMAT_3, Positions, Solution};
+use crate::positions::{Observed, POSITIONS_FORMAT_3, Positions, Solution, SolutionsContent};
 use crate::record::{Body, MAX_BODY};
 
 pub const FAULT_PROOF_FORMAT: u8 = 1;
@@ -82,8 +82,9 @@ impl Tolerance {
         match spec_version {
             // About 1 m of latitude, 1 m of altitude, 3 m of light travel, 0.1% of a variance.
             // Version 5 changed what is derived (a gauge's origin, the sync messages kept), not
-            // how far two implementations' floating point may differ.
-            1..=5 => Some(Self {
+            // how far two implementations' floating point may differ; version 6 only how a model
+            // names its scope's sites (by site id), not any number solved.
+            1..=6 => Some(Self {
                 position_e7: 10,
                 alt_mm: 1_000,
                 transmit_ns: 10,
@@ -94,7 +95,7 @@ impl Tolerance {
     }
 
     /// True when the two solutions differ by more than this tolerance anywhere.
-    pub fn disagree(&self, a: &Solution, b: &Solution) -> bool {
+    pub fn disagree<O: Observed>(&self, a: &Solution<O>, b: &Solution<O>) -> bool {
         let beyond = |difference: u64, limit: u32| difference > u64::from(limit);
         let lat = a.lat_e7.abs_diff(b.lat_e7);
         let lon = {
@@ -282,12 +283,16 @@ impl FaultProof {
             return Ok(first.manifest()?.spec_version);
         }
         let [(first, _), _] = self.parts()?;
+        if first.is_tagged() {
+            return Ok(first.tagged_solutions()?.spec_version);
+        }
         Ok(first.solutions()?.spec_version)
     }
 
-    /// Checks the proof: both records are format 3 or provisional (format 4) and verify, the pairs are in canonical order,
-    /// both name one spec version, both solutions exist and name the same observation set and the
-    /// same clock model, and they disagree beyond `tolerance`. What it proves, or why it does not.
+    /// Checks the proof: both records are format 3, a tagged format (5) or provisional (formats 4
+    /// and 6) and verify, both tagged or both raw, the pairs are in canonical order, both name one
+    /// spec version, both solutions exist and name the same observation set and the same clock
+    /// model, and they disagree beyond `tolerance`. What it proves, or why it does not.
     pub fn check(&self, tolerance: &Tolerance) -> Result<Fault, WireError> {
         if self.format() == MODEL_FAULT_PROOF_FORMAT {
             return self.check_models().map(Fault::Models);
@@ -297,36 +302,33 @@ impl FaultProof {
             return Err(WireError::NotAFault("not in canonical order"));
         }
         for record in [&first, &second] {
-            if record.format() != POSITIONS_FORMAT_3 && !record.is_provisional() {
-                return Err(WireError::NotAFault("not a format 3 or provisional record"));
+            let known = record.format() == POSITIONS_FORMAT_3
+                || record.is_provisional()
+                || record.is_tagged();
+            if !known {
+                return Err(WireError::NotAFault(
+                    "not a format 3, tagged or provisional record",
+                ));
             }
             record.verify()?;
         }
-        let (a, b) = (first.solutions()?, second.solutions()?);
-        if a.spec_version != b.spec_version {
-            return Err(WireError::NotAFault("different spec versions"));
+        let engines = [first.engine()?, second.engine()?];
+        // Tagged against tagged, raw against raw: a raw and a tagged set are never one set.
+        match (first.is_tagged(), second.is_tagged()) {
+            (true, true) => solution_fault(
+                (&first.tagged_solutions()?, i),
+                (&second.tagged_solutions()?, j),
+                tolerance,
+                engines,
+            ),
+            (false, false) => solution_fault(
+                (&first.solutions()?, i),
+                (&second.solutions()?, j),
+                tolerance,
+                engines,
+            ),
+            _ => Err(WireError::NotAFault("different observation sets")),
         }
-        let (Some(x), Some(y)) = (
-            a.solutions.get(usize::from(i)),
-            b.solutions.get(usize::from(j)),
-        ) else {
-            return Err(WireError::NotAFault("no such solution"));
-        };
-        if x.observations != y.observations {
-            return Err(WireError::NotAFault("different observation sets"));
-        }
-        if x.clock_model != y.clock_model {
-            return Err(WireError::NotAFault("different clock models"));
-        }
-        if !tolerance.disagree(x, y) {
-            return Err(WireError::NotAFault("the solutions agree within tolerance"));
-        }
-        Ok(Fault::Solutions(SolutionFault {
-            engines: [first.engine()?, second.engine()?],
-            observations: x.observations.hash(),
-            clock_model: x.clock_model,
-            spec_version: a.spec_version,
-        }))
     }
 
     /// Checks a format 2 proof: both manifests verify and are in canonical order, both name one
@@ -369,6 +371,39 @@ impl FaultProof {
             spec_version: a.spec_version,
         })
     }
+}
+
+/// Whether solution `i` of `a` and `j` of `b`, of one kind of observation set, prove a fault.
+fn solution_fault<O: Observed>(
+    (a, i): (&SolutionsContent<O>, u16),
+    (b, j): (&SolutionsContent<O>, u16),
+    tolerance: &Tolerance,
+    engines: [PublicKey; 2],
+) -> Result<Fault, WireError> {
+    if a.spec_version != b.spec_version {
+        return Err(WireError::NotAFault("different spec versions"));
+    }
+    let (Some(x), Some(y)) = (
+        a.solutions.get(usize::from(i)),
+        b.solutions.get(usize::from(j)),
+    ) else {
+        return Err(WireError::NotAFault("no such solution"));
+    };
+    if x.observations != y.observations {
+        return Err(WireError::NotAFault("different observation sets"));
+    }
+    if x.clock_model != y.clock_model {
+        return Err(WireError::NotAFault("different clock models"));
+    }
+    if !tolerance.disagree(x, y) {
+        return Err(WireError::NotAFault("the solutions agree within tolerance"));
+    }
+    Ok(Fault::Solutions(SolutionFault {
+        engines,
+        observations: x.observations.set_hash(),
+        clock_model: x.clock_model,
+        spec_version: a.spec_version,
+    }))
 }
 
 #[cfg(test)]
@@ -535,6 +570,47 @@ mod tests {
         let close = provisional(&liar, 1, 374_100_003, &[1, 2, 3, 4])?;
         assert!(
             FaultProof::new(&a, 0, &close, 0)?
+                .check(&tolerance()?)
+                .is_err()
+        );
+        Ok(())
+    }
+
+    /// Two tagged records of one tagged set, as clients receive them, prove a fault as raw ones
+    /// do; a tagged and a raw record of the same receptions are never one set.
+    #[test]
+    fn tagged_positions_prove_a_fault_as_raw_ones_do() -> Result<(), WireError> {
+        let (honest, liar) = (Identity::generate()?, Identity::generate()?);
+        let key_of =
+            |receiver: &PublicKey| Some(crate::site::ReceptionKey::of_signed(receiver.as_bytes()));
+        let tagged = |engine: &Identity, lat_e7: i32| -> Result<Positions, WireError> {
+            let one = solution([1; 32], &[1, 2, 3, 4], lat_e7)?.tagged(key_of)?;
+            Positions::sign_tagged(
+                engine,
+                &SolutionsContent {
+                    boot_id: 1,
+                    sequence: 0,
+                    issued_ms: 0,
+                    spec_version: 1,
+                    solutions: vec![one],
+                },
+            )
+        };
+        let a = tagged(&honest, 374_100_000)?;
+        let b = tagged(&liar, 374_200_000)?;
+        let proof = FaultProof::new(&a, 0, &b, 0)?;
+        let fault = solutions_fault(proof.check(&tolerance()?)?)?;
+        assert!(fault.engines.contains(&liar.public()));
+        assert_eq!(proof.spec_version()?, 1);
+        let close = tagged(&liar, 374_100_003)?;
+        assert!(
+            FaultProof::new(&a, 0, &close, 0)?
+                .check(&tolerance()?)
+                .is_err()
+        );
+        let raw = signed(&liar, 0, 374_200_000, 1, &[1, 2, 3, 4])?;
+        assert!(
+            FaultProof::new(&a, 0, &raw, 1)?
                 .check(&tolerance()?)
                 .is_err()
         );

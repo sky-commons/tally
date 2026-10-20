@@ -278,3 +278,16 @@ mod tests {
         Ok(())
     }
 }
+
+/// Refuses a listener bound anywhere but loopback, naming `flag`: what serves relay-only data or
+/// the operator's own reports (the BEAST output, the stats endpoint) is served to no other host.
+pub fn loopback_only(listener: &tokio::net::TcpListener, flag: &str) -> std::io::Result<()> {
+    let bound = listener.local_addr()?;
+    if bound.ip().to_canonical().is_loopback() {
+        return Ok(());
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        format!("{flag} {bound}: it serves loopback only"),
+    ))
+}

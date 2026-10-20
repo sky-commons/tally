@@ -2,10 +2,11 @@
 //! feeders would publish them, with the truth kept beside them. It is part of the library so the
 //! engine built over this crate can test against it too. Deterministic: a seed fixes everything.
 
-use tally_wire::batch::ReceiverInfoContent;
+use tally_wire::batch::PublicInfoContent;
 use tally_wire::batch::format;
 use tally_wire::{
-    Batch, BatchContent, Clock, Identity, Location, Observation, PublicKey, ReceiverInfo, WireError,
+    Batch, BatchContent, Clock, Identity, Location, Observation, PublicKey, ReceiverInfo,
+    ReceiverSite, ReceiverSiteContent, Region, WireError,
 };
 
 use crate::clock::Timebase;
@@ -123,6 +124,8 @@ impl ClockTruth {
 pub struct SimReceiver {
     pub key: PublicKey,
     pub site: Site,
+    /// What it signs of its site (relay-only), issued at the scenario's start: `site.id` is its.
+    pub record: ReceiverSite,
     pub ecef: Vec3,
     pub truth: ClockTruth,
 }
@@ -215,6 +218,11 @@ pub struct Scenario {
 }
 
 impl Scenario {
+    /// Unix milliseconds at the scenario's start: when its receivers describe themselves.
+    pub fn start_ms(&self) -> u64 {
+        self.midnight_unix_ms + (self.start_tod_s * 1000.0) as u64
+    }
+
     /// The wall clock of the batch carrying a reception heard at `t` seconds into the scenario:
     /// receivers seal a batch at every whole second of a correct clock, so its end.
     pub fn wall_ms(&self, t: f64) -> u64 {
@@ -288,7 +296,7 @@ impl Simulation {
         self.receivers.iter().find(|receiver| receiver.key == *key)
     }
 
-    /// What each receiver would publish (RFC-0171 §3.1): its signed description, then its
+    /// What each receiver would publish (RFC-0171 §3.1): its signed description and site, then its
     /// receptions in the order it heard them, one signed batch per wall clock second (each
     /// reception's `wall_ms`), at most `MAX_BATCH` observations a batch. Counter epoch 1, as `run`
     /// gives the receptions.
@@ -298,11 +306,11 @@ impl Simulation {
         let mut feeds = Vec::with_capacity(self.receivers.len());
         for (index, receiver) in self.receivers.iter().enumerate() {
             let identity = receiver_identity(self.scenario.seed, index);
-            let info = ReceiverInfo::sign(
+            let info = ReceiverInfo::sign_public(
                 &identity,
-                &ReceiverInfoContent {
+                &PublicInfoContent {
                     issued_ms: start_ms,
-                    location: Some(receiver.site.location),
+                    cell: Some(Region::public_cell(&receiver.site.location)?),
                     clock: receiver.site.clock,
                     software: "tally-mlat-solver sim".to_owned(),
                     relays: Vec::new(),
@@ -348,6 +356,7 @@ impl Simulation {
             feeds.push(Feed {
                 identity,
                 info,
+                site: receiver.record.clone(),
                 batches,
             });
         }
@@ -359,7 +368,10 @@ impl Simulation {
 #[derive(Clone, Debug)]
 pub struct Feed {
     pub identity: Identity,
+    /// Its description as a new feeder signs it: format 2, its public cell and no site.
     pub info: ReceiverInfo,
+    /// Its site (relay-only): what an engine places it by.
+    pub site: ReceiverSite,
     pub batches: Vec<Batch>,
 }
 
@@ -775,9 +787,10 @@ pub fn run_into_in_time_order(
 fn make(scenario: &Scenario) -> (World, Rng, Vec<SimAircraft>) {
     let mut rng = Rng::new(scenario.seed);
     let receivers: Vec<SimReceiver> = (0..scenario.receivers.min(usize::from(u16::MAX) - 1))
-        .map(|index| {
+        .filter_map(|index| {
             let (lat, lon, alt) = site_of(scenario, index);
-            let key = receiver_identity(scenario.seed, index).public();
+            let identity = receiver_identity(scenario.seed, index);
+            let key = identity.public();
             let gps = scenario.gps.contains(&index);
             let mut truth = clock_truth(&mut rng, gps, scenario.duration_s, scenario.rate_ppm);
             if !gps {
@@ -823,16 +836,28 @@ fn make(scenario: &Scenario) -> (World, Rng, Vec<SimAircraft>) {
                 lon_deg: f64::from(location.lon_e7) * 1e-7,
                 height_m: f64::from(location.alt_m),
             });
-            SimReceiver {
+            // A site on the globe always signs; one that did not would be no receiver.
+            let record = ReceiverSite::sign(
+                &identity,
+                &ReceiverSiteContent {
+                    issued_ms: scenario.start_ms(),
+                    location,
+                    clock,
+                },
+            )
+            .ok()?;
+            Some(SimReceiver {
                 key,
                 site: Site {
                     receiver: key,
                     clock,
                     location,
+                    id: record.site_id(),
                 },
+                record,
                 ecef,
                 truth,
-            }
+            })
         })
         .collect();
     let mut aircraft = Vec::new();

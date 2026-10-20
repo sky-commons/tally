@@ -10,9 +10,11 @@
 //!   gives it (RFC-0184), never by its own clock read as the API's;
 //! - a SPAN is `*_for_ms`, a count of milliseconds.
 //!
-//! No answer carries a receiver's exact place: a station's `location` is its declared place
-//! blurred to about 5 km, the same on every read, and every figure that places a feeder (its area,
-//! its range) is computed from that pin (`tally-api`'s `privacy`).
+//! No answer carries a receiver's exact place, and the API never holds one: a receiver's site is
+//! relay-only (wire version 3). A station's `location` is a pin inside its public cell (the H3
+//! cell of resolution 6, about 36 km², its owner signed into its description), the same on every
+//! read, and a feeder's figures (its area, its range) are measured from that cell, never the site
+//! (`tally-api`'s `privacy`, `tally_relay::figures`).
 //!
 //! A client may ignore a field it does not read; a field a type states is always present (an
 //! optional one as `null`).
@@ -147,7 +149,8 @@ pub struct Mlat {
     /// Final, or provisional until a final position replaces it.
     pub kind: MlatKind,
     /// Whether the receivers it was solved from have standing (RFC-0174 §2.12): `unconfirmed` is
-    /// drawn, and labelled so.
+    /// drawn, and labelled so. Standing is a relay's ledger, kept from raw a client never holds, so
+    /// the API serves `unconfirmed`.
     pub confidence: MlatConfidence,
     /// Whether a solution over more receptions of the same transmission disagreed with it: the
     /// position stands, and the disagreement is kept as evidence against the added receptions.
@@ -160,7 +163,7 @@ pub struct Mlat {
 pub enum MlatConfidence {
     /// At least the solver's minimum of its receivers have standing.
     Standing,
-    /// Fewer, or the API has not weighed them (a precise world fix, read as its relay signed it).
+    /// Fewer, or not weighed: what a client, which holds no standing, serves.
     Unconfirmed,
 }
 
@@ -178,17 +181,19 @@ pub enum MlatKind {
     Provisional,
 }
 
-/// How the API checked an MLAT position before serving it.
+/// How the API checked an MLAT position before serving it. Raw is relay-only (wire version 3), so
+/// the API, a client, checks by `signature`; `model` and `resolved` remain the names of checks a
+/// holder of raw makes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum MlatCheck {
-    /// The API holds the raw it was solved from: the clock model was verified by the model
+    /// The checker holds the raw it was solved from: the clock model was verified by the model
     /// verifier and the solution by the solution verifier.
     Model,
     /// Signatures and content addresses only: the engine's solution and the model it cites are
     /// signed and whole, and agree with each other, but the API holds none of their raw.
     Signature,
-    /// The API solved it itself, from the union of two engines' raw it holds.
+    /// The checker solved it itself, from the union of two engines' raw it holds.
     Resolved,
 }
 
@@ -232,11 +237,11 @@ pub struct Station {
     pub batches: u64,
     /// Batches of its sequence that never arrived.
     pub gaps: u64,
-    /// About where it says it is: its declared place blurred to about 5 km, never the place itself
-    /// (a pin inside the 0.05 degree cell that holds it, at an offset its key fixes, the same on
-    /// every read). `null` when it does not say, and for a station
-    /// the relay has forwarded no batch of (a connection alone publishes no place). The exact
-    /// place travels only in its signed description, which MLAT reads.
+    /// About where it says it is: a pin inside its public cell (H3 resolution 6, about 36 km²), at
+    /// an offset its key fixes, the same on every read; never the place itself. `null` when it
+    /// names no cell, and for a station the relay has forwarded no batch of (a connection alone
+    /// publishes no place). The exact place travels only between relays, in its signed site,
+    /// which MLAT reads.
     pub location: Option<Position>,
     /// What it runs, as it says; `null` when it says nothing.
     pub software: Option<String>,
@@ -281,17 +286,18 @@ pub enum StationState {
 }
 
 /// `GET /v1/stations/{key}/stats`, the key as base64url without padding: what one feeder gave the
-/// network over the window, as the API computes it (RFC-0174 §2.12) from public signed data alone
-/// (the feeder's signed batches, the signed positions that cite its receptions, and its standing),
-/// so anyone who reads the same records computes the same figures. The site that shows them is one
-/// client of the network; no relay computes or vouches for any of them.
+/// network over the window, as the relay that hosts or carries it computed and signed it
+/// (RFC-0174 §2.12, amended 2026-10-19: only relays hold the raw the figures are computed from).
+/// The API reads the signed figures as any client may and serves the newest; the site that shows
+/// them is one client of the network, and the figures are their relay's claim.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct FeederStats {
     /// When the figures were computed: Unix milliseconds on the API's clock.
     pub now_ms: u64,
     /// The receiver's public key as tally prints it (standard base64).
     pub key: String,
-    /// The span the figures cover: the last day, or less while the API has been reading for less.
+    /// The span the figures cover: the last day, or less while the relay has been counting for
+    /// less.
     pub window_for_ms: u64,
     /// The share of the window's minutes in which a signed batch of it was published, 0 to 1.
     pub uptime: f64,
@@ -301,20 +307,21 @@ pub struct FeederStats {
     pub messages_per_sec: f64,
     /// Distinct aircraft whose checked address it heard over the window.
     pub aircraft: u32,
-    /// The farthest positioned aircraft it heard, metres from its public pin (its place blurred to
-    /// about 5 km, as `Station::location`), so it is never a measure from the exact place; `null`
-    /// when it states no place or heard no positioned aircraft.
+    /// The farthest positioned aircraft it heard, metres from its public cell's centre, so it is
+    /// never a measure from the exact place; `null` when it names no cell or heard no positioned
+    /// aircraft.
     pub range_m: Option<f64>,
     /// The sky it heard positioned aircraft in, square kilometres of coverage cells.
     pub coverage_km2: f64,
-    /// The part of `coverage_km2` no other feeder heard over the window.
+    /// The part of `coverage_km2` no other feeder of its relay heard over the window.
     pub unique_coverage_km2: f64,
     /// Distinct published MLAT positions that cite one of its receptions.
     pub mlat_positions: u64,
-    /// Its area: the H3 cell (resolution 3, as hex) that holds its public pin (`Station::location`);
-    /// `null` when it states no place.
+    /// Its area: its public cell's H3 parent at resolution 3, as hex (the one area rule relays
+    /// group, route and publish by); `null` when it names no cell.
     pub area: Option<String>,
-    /// Its receptions have earned standing (RFC-0174 §2.12): only a feeder with standing is ranked.
+    /// Its receptions have earned standing by its relay's ledger (RFC-0174 §2.12): only a feeder
+    /// with standing is ranked.
     pub standing: bool,
     /// Its places on its area's leaderboards; `null` when it is not ranked (no standing, or no
     /// area).

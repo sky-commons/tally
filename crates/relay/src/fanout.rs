@@ -46,7 +46,7 @@ use tokio::sync::Notify;
 use crate::budget::{Charge, Gauge, Store};
 
 use crate::hub::Item;
-use crate::subscription::{Subscription, directory_wants};
+use crate::subscription::{ClientPlace, ClientSubscription, Subscription, directory_wants};
 
 /// How far behind its inbound a subscriber may fall before it is let go.
 pub const BEHIND_MS: u64 = 2_000;
@@ -148,8 +148,11 @@ impl<T> Queue<T> {
 pub enum Filter {
     /// Another relay: the directory only (`directory_wants`).
     Directory,
-    /// A subscriber or engine: its subscription.
+    /// An engine: its subscription, by its receivers' sites (`Subscription::wants`).
     Subscription(Subscription),
+    /// A client: its subscription, routing an item's client form by its client place and nothing
+    /// else (`ClientSubscription::serves`, `Item::client`).
+    Client(ClientSubscription),
     /// The loopback BEAST output: every receiver's batch this build reads.
     Beast,
     /// Every record: what a test of the hub reads.
@@ -162,6 +165,10 @@ impl Filter {
         match self {
             Self::Directory => directory_wants(item),
             Self::Subscription(subscription) => subscription.wants(item),
+            Self::Client(subscription) => item
+                .client
+                .as_ref()
+                .is_some_and(|client| subscription.serves(client)),
             Self::Beast => item.decoded.is_some(),
             #[cfg(test)]
             Self::Everything => true,
@@ -173,6 +180,7 @@ impl Filter {
     fn regions(&self) -> &[Region] {
         match self {
             Self::Subscription(subscription) => &subscription.regions,
+            Self::Client(subscription) => subscription.regions(),
             Self::Directory | Self::Beast => &[],
             #[cfg(test)]
             Self::Everything => &[],
@@ -223,9 +231,17 @@ pub fn item_charge(item: &Item, takers: usize) -> usize {
         Record::Batch(batch) if batch.is_owned() => 0,
         record => record.encoded_len(),
     };
+    // A client form is a copy of the record's bytes of its own.
+    let client = item.client.as_ref().map_or(0, |client| {
+        client.record.encoded_len()
+            + std::mem::size_of::<tally_wire::ClientRecord>()
+            + std::mem::size_of::<crate::subscription::ClientItem>()
+            + 2 * tally_wire::decoded::ARC_HEADER
+    });
     ITEM_BYTES
         .saturating_add(takers.saturating_mul(SLOT_BYTES))
         .saturating_add(record)
+        .saturating_add(client)
 }
 
 /// An item as a queue holds it: with the one charge every queue holding it shares.
@@ -424,19 +440,97 @@ struct Entry {
     filter: Filter,
 }
 
-/// The subscribers by how they are routed to: whole-world ones, and the rest by their regions'
-/// cells.
+/// One set of subscribers by how they are routed to: whole-world ones, and the rest by their
+/// regions' cells.
 #[derive(Default)]
-struct Index {
-    entries: Vec<Entry>,
+struct Routes {
     /// Entries that take records from anywhere: no regions.
     everywhere: Vec<usize>,
     /// Entries with regions, by each region's cell number.
     by_cell: HashMap<u64, Vec<usize>>,
+    /// Entries with regions, by each of their regions' ancestors' cell numbers: what a coarser
+    /// cell overlaps (a client of a public cell is offered its area's records).
+    by_ancestor: HashMap<u64, Vec<usize>>,
     /// Entries with regions, all of them: offered what is routed by no place.
     regional: Vec<usize>,
     /// The resolutions any region is at, ascending.
     resolutions: Vec<u8>,
+}
+
+impl Routes {
+    fn add(&mut self, at: usize, regions: &[Region]) {
+        if regions.is_empty() {
+            self.everywhere.push(at);
+            return;
+        }
+        self.regional.push(at);
+        for region in regions {
+            let keyed = self.by_cell.entry(region.as_u64()).or_default();
+            if keyed.last() != Some(&at) {
+                keyed.push(at);
+            }
+            for resolution in 0..region.resolution() {
+                if let Some(ancestor) = region.ancestor(resolution) {
+                    let keyed = self.by_ancestor.entry(ancestor.as_u64()).or_default();
+                    if keyed.last() != Some(&at) {
+                        keyed.push(at);
+                    }
+                }
+            }
+            self.resolutions.push(region.resolution());
+        }
+    }
+
+    fn sort(&mut self) {
+        self.resolutions.sort_unstable();
+        self.resolutions.dedup();
+    }
+
+    /// The entries with regions that hold one of `cells` or lie inside one, each once, ascending.
+    fn holding(&self, cells: &[Region], into: &mut Vec<usize>) {
+        for cell in cells {
+            for resolution in &self.resolutions {
+                if let Some(ancestor) = cell.ancestor(*resolution)
+                    && let Some(keyed) = self.by_cell.get(&ancestor.as_u64())
+                {
+                    into.extend_from_slice(keyed);
+                }
+            }
+            if let Some(keyed) = self.by_ancestor.get(&cell.as_u64()) {
+                into.extend_from_slice(keyed);
+            }
+        }
+        into.sort_unstable();
+        into.dedup();
+    }
+
+    /// The entries offered a record placed at `place`: every whole-world one, and those with
+    /// regions by the place.
+    fn offered(&self, place: Place<'_>, into: &mut Vec<usize>) {
+        into.extend_from_slice(&self.everywhere);
+        if self.regional.is_empty() {
+            return;
+        }
+        match place {
+            Place::Nowhere => into.extend_from_slice(&self.regional),
+            Place::Cells(cells) if !cells.is_empty() => {
+                let mut held = Vec::new();
+                self.holding(cells, &mut held);
+                into.extend(held);
+            }
+            Place::Cells(_) => {}
+        }
+    }
+}
+
+/// The subscribers, routed apart: relay-role ones (engines, directory links, the BEAST output) by
+/// what the relay holds of an item (`place`), and clients by its client place alone
+/// (`ClientItem`), so no client is ever offered a record by a receiver's site.
+#[derive(Default)]
+struct Index {
+    entries: Vec<Entry>,
+    relays: Routes,
+    clients: Routes,
 }
 
 impl Index {
@@ -447,64 +541,65 @@ impl Index {
         };
         for (at, entry) in index.entries.iter().enumerate() {
             let regions = entry.filter.regions();
-            if regions.is_empty() {
-                index.everywhere.push(at);
-                continue;
-            }
-            index.regional.push(at);
-            for region in regions {
-                let keyed = index.by_cell.entry(region.as_u64()).or_default();
-                if keyed.last() != Some(&at) {
-                    keyed.push(at);
-                }
-                index.resolutions.push(region.resolution());
+            if matches!(entry.filter, Filter::Client(_)) {
+                index.clients.add(at, regions);
+            } else {
+                index.relays.add(at, regions);
             }
         }
-        index.resolutions.sort_unstable();
-        index.resolutions.dedup();
+        index.relays.sort();
+        index.clients.sort();
         index
     }
 
-    /// The entries with regions that hold one of `cells`, each once, ascending.
-    fn holding(&self, cells: &[Region], into: &mut Vec<usize>) {
-        for cell in cells {
-            for resolution in &self.resolutions {
-                if let Some(ancestor) = cell.ancestor(*resolution)
-                    && let Some(keyed) = self.by_cell.get(&ancestor.as_u64())
-                {
-                    into.extend_from_slice(keyed);
-                }
-            }
-        }
-        into.sort_unstable();
-        into.dedup();
+    /// Whether any entry is a client's (`Filter::Client`): an item is given its client form only
+    /// then.
+    fn has_clients(&self) -> bool {
+        !self.clients.everywhere.is_empty() || !self.clients.regional.is_empty()
     }
 }
 
-/// Where a record is placed for routing: its receiver's or area's cell, the aircraft it places, or
-/// nowhere (offered to every subscriber, each deciding by its streams alone).
+/// Where a record is placed for routing: the cells it is placed at, or nowhere (offered to every
+/// subscriber, each deciding by its streams alone).
+#[derive(Clone, Copy)]
 enum Place<'a> {
     Cells(&'a [Region]),
     Nowhere,
 }
 
+/// Where a relay-role subscriber is offered `item`: its receiver's site's finest cell or its
+/// area's cell (`Item::cell`), the aircraft it places (`Item::points`), or nowhere.
 fn place(item: &Item) -> Place<'_> {
     match &*item.record {
         Record::Batch(_)
         | Record::ReceiverInfo(_)
+        | Record::ReceiverSite(_)
         | Record::RegionalBatch(_)
+        | Record::ClientRegionalBatch(_)
+        | Record::FeederFigures(_)
         | Record::BundleIndex(_) => match &item.cell {
             Some(cell) => Place::Cells(std::slice::from_ref(cell)),
             // Unplaced: whole-world subscribers only (`Subscription::covers`).
             None => Place::Cells(&[]),
         },
-        Record::Positions(_) | Record::Provisional(_) | Record::ClockModel(_) => {
-            match &item.points {
-                Some(points) => Place::Cells(points),
-                None => Place::Nowhere,
-            }
-        }
+        Record::Positions(_)
+        | Record::Provisional(_)
+        | Record::ClockModel(_)
+        | Record::ClientClockModel(_) => match &item.points {
+            Some(points) => Place::Cells(points),
+            None => Place::Nowhere,
+        },
         _ => Place::Nowhere,
+    }
+}
+
+/// Where a client is offered an item: by its client place, and nothing else.
+fn client_place(place: &ClientPlace) -> Place<'_> {
+    match place {
+        ClientPlace::World => Place::Nowhere,
+        ClientPlace::Unplaced => Place::Cells(&[]),
+        ClientPlace::Cell(cell) => Place::Cells(std::slice::from_ref(cell.as_region())),
+        ClientPlace::Aircraft(points) => Place::Cells(points),
     }
 }
 
@@ -562,39 +657,33 @@ impl Router {
 
     /// Offers `item` to every subscriber that takes it. Never waits on a subscriber: one whose
     /// queue is past its bounds is let go.
-    pub fn publish(&self, item: Item) {
+    pub fn publish(&self, mut item: Item) {
         let Ok(index) = self.index.read() else {
             return;
         };
         if index.entries.is_empty() {
             return;
         }
-        // Who takes it: every whole-world subscriber, and those whose regions hold its place.
-        let mut takers = Vec::new();
-        let mut take = |at: usize| {
-            let entry = &index.entries[at];
-            if entry.subscriber.source != item.source && entry.filter.wants(&item) {
-                takers.push(at);
-            }
-        };
-        for at in &index.everywhere {
-            take(*at);
+        // Its client item, made once for every client that may take it: what a client link
+        // sends, and all it can, with where it is routed (`outbound`, `ClientItem`).
+        if index.has_clients() && item.client.is_none() {
+            item.client = crate::outbound::client_item(&item);
         }
-        match place(&item) {
-            Place::Nowhere => {
-                for at in &index.regional {
-                    take(*at);
-                }
-            }
-            Place::Cells(cells) if !cells.is_empty() && !index.regional.is_empty() => {
-                let mut held = Vec::new();
-                index.holding(cells, &mut held);
-                for at in held {
-                    take(at);
-                }
-            }
-            Place::Cells(_) => {}
+        // Who takes it: relay-role subscribers by its place, clients by its client place.
+        let mut offered = Vec::new();
+        index.relays.offered(place(&item), &mut offered);
+        if let Some(client) = &item.client {
+            index
+                .clients
+                .offered(client_place(client.place()), &mut offered);
         }
+        let takers: Vec<usize> = offered
+            .into_iter()
+            .filter(|at| {
+                let entry = &index.entries[*at];
+                entry.subscriber.source != item.source && entry.filter.wants(&item)
+            })
+            .collect();
         if takers.is_empty() {
             return;
         }
@@ -830,6 +919,7 @@ mod tests {
             points: None,
             decoded: None,
             stamp_ms,
+            client: None,
         }
     }
 
@@ -901,6 +991,92 @@ mod tests {
         Ok(())
     }
 
+    /// A client is routed by its client place alone, never by what the relay holds of a record:
+    /// a receiver whose site's cell (`Item::cell`) lies in one area and whose public cell lies in
+    /// another reaches the clients of its public cell's area and none of its site's, while an
+    /// engine is routed by its site. A client clock model is routed by its area, so a client of a
+    /// public cell inside that area is sent it and one of the next area is not.
+    #[test]
+    fn a_client_is_routed_by_its_client_place_and_never_by_a_site() -> Result<(), String> {
+        use crate::subscription::{ClientItem, ClientPlace, Coarse};
+        let text = |error: tally_wire::WireError| error.to_string();
+        let router = Arc::new(Router::new(Bounds {
+            max_bytes: 1 << 20,
+            max_age_ms: BEHIND_MS,
+        }));
+        let atlanta = cell(33.749, -84.388, 6)?;
+        let paris_site = cell(48.857, 2.352, 15)?;
+        let atlanta_area = atlanta.ancestor(3).ok_or("no ancestor")?;
+        let paris_area = paris_site.ancestor(3).ok_or("no ancestor")?;
+        let client =
+            |streams, regions| Filter::Client(Subscription { streams, regions }.for_client());
+        let near = router.listen(10, client(Streams::RAW, vec![atlanta_area]));
+        let at_site = router.listen(11, client(Streams::RAW, vec![paris_area]));
+        let engine = router.listen(
+            12,
+            Filter::Subscription(Subscription {
+                streams: Streams::RAW,
+                regions: vec![paris_area],
+            }),
+        );
+        let info = tally_wire::ReceiverInfo::sign_public(
+            &tally_wire::Identity::from_seed([6; 32]),
+            &tally_wire::batch::PublicInfoContent {
+                issued_ms: 1,
+                cell: Some(atlanta),
+                clock: tally_wire::Clock::Dump1090,
+                software: String::new(),
+                relays: Vec::new(),
+            },
+        )
+        .map_err(text)?;
+        router.publish(Item {
+            record: Arc::new(Record::ReceiverInfo(info)),
+            ..item(1, Some(paris_site), 0)
+        });
+        let mut out = Vec::new();
+        assert_eq!(near.try_recv_many(&mut out, 10), Ok(1));
+        assert_eq!(
+            out[0].client.as_deref().map(ClientItem::place),
+            Some(&ClientPlace::Cell(Coarse::of(atlanta)))
+        );
+        out.clear();
+        assert_eq!(at_site.try_recv_many(&mut out, 10), Ok(0));
+        assert_eq!(engine.try_recv_many(&mut out, 10), Ok(1));
+        out.clear();
+        // A client clock model: placed by its area, however fine the point it was published at.
+        let model = tally_wire::ClientClockModel::sign(
+            &tally_wire::Identity::from_seed([7; 32]),
+            &tally_wire::ClientClockModelContent {
+                boot_id: 1,
+                sequence: 0,
+                issued_ms: 1,
+                spec_version: 6,
+                model: [1; 32],
+                inputs: [2; 32],
+                window_first: 0,
+                window_last: 0,
+            },
+        )
+        .map_err(text)?;
+        let models = |regions| client(Streams::CLOCK_MODELS, regions);
+        let inside = router.listen(20, models(vec![atlanta]));
+        let next = router.listen(21, models(vec![paris_area]));
+        let fine = cell(33.749, -84.388, 15)?;
+        router.publish(Item {
+            record: Arc::new(Record::ClientClockModel(model)),
+            points: Some(Arc::from([fine].as_slice())),
+            ..item(1, None, 0)
+        });
+        assert_eq!(inside.try_recv_many(&mut out, 10), Ok(1));
+        assert_eq!(
+            out[0].client.as_deref().map(ClientItem::place),
+            Some(&ClientPlace::Cell(Coarse::of(atlanta_area)))
+        );
+        assert_eq!(next.try_recv_many(&mut out, 10), Ok(0));
+        Ok(())
+    }
+
     /// RFC-0181, "Memory is charged once, for its life": the fan-out is charged what it allocates
     /// for an item, the item once and a slot in each queue that takes it, and a record's bytes
     /// only where no allocation of their own carries their charge: a batch kept at ingest, whose
@@ -934,6 +1110,7 @@ mod tests {
             points: None,
             decoded: None,
             stamp_ms: 0,
+            client: None,
         };
         let plain = item(batch.clone());
         assert_eq!(

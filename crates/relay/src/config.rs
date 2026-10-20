@@ -57,8 +57,10 @@ usage: tally-relay --key FILE [--key FILE]... --max-upload RATE [options]
                          it would have to forward. Loopback peers are neither counted nor
                          capped. 0 (with a unit) sends nothing billed at all
   --listen ADDR          where feeders, subscribers and relays connect (default 0.0.0.0:10900)
-  --beast-out ADDR       serve plain BEAST of every reception here, for a local decoder
-                         (bind it to loopback: it is unauthenticated)
+  --beast-out ADDR       serve plain BEAST of every reception here, for a local decoder,
+                         each frame's message alone (no receiver's counter or signal level).
+                         It is unauthenticated, so it takes a loopback address only
+                         (127.0.0.1:PORT or [::1]:PORT) and the relay refuses any other
   --stats-listen ADDR    serve each receiver's traffic as JSON here (GET /stations,
                          GET /stations/KEY), and the cap and what it carries (GET /egress),
                          for tally-api. It is unauthenticated and names where each feeder
@@ -160,9 +162,11 @@ pub struct Upstream {
 pub struct Config {
     pub key_files: Vec<String>,
     pub listen: String,
-    pub beast_out: Option<String>,
+    /// Where the BEAST output is served (`--beast-out`): a loopback address, always
+    /// (`parse_loopback`).
+    pub beast_out: Option<SocketAddr>,
     /// Where the station reports are served (`--stats-listen`): a loopback address, always, since
-    /// they name every feeder's address (`parse_stats_listen`).
+    /// they name every feeder's address (`parse_loopback`).
     pub stats_listen: Option<SocketAddr>,
     pub upstreams: Vec<Upstream>,
     pub advertise: Vec<RelayAddress>,
@@ -329,8 +333,8 @@ impl Config {
                 "--key" => config.key_files.push(value()?),
                 "--max-upload" => max_upload = Some(Cap::parse(&value()?)?),
                 "--listen" => config.listen = value()?,
-                "--beast-out" => config.beast_out = Some(value()?),
-                "--stats-listen" => config.stats_listen = Some(parse_stats_listen(&value()?)?),
+                "--beast-out" => config.beast_out = Some(parse_loopback(&flag, &value()?)?),
+                "--stats-listen" => config.stats_listen = Some(parse_loopback(&flag, &value()?)?),
                 "--upstream" => config.upstreams.push(parse_upstream(&value()?)?),
                 "--advertise" => {
                     let Upstream { address, key } = parse_upstream(&value()?)?;
@@ -511,19 +515,20 @@ pub fn covers_the_world(areas: &[Region]) -> bool {
     named == tally_wire::Regions::world()
 }
 
-/// `--stats-listen`'s address, which must be loopback: the reports it serves are unauthenticated
-/// and name where each feeder feeds from (`StationReport::address`), so a bind anyone else could
-/// reach is refused rather than trusted to a firewall. A name is refused too, since what it
-/// resolves to is not known here.
-pub fn parse_stats_listen(text: &str) -> Result<SocketAddr, String> {
-    let address: SocketAddr = text.parse().map_err(|_| {
-        format!("--stats-listen {text}: not an address and port, such as 127.0.0.1:10901")
-    })?;
+/// The address of `flag` (`--stats-listen`, `--beast-out`), which must be loopback: what each
+/// serves is unauthenticated (the station reports name where each feeder feeds from,
+/// `StationReport::address`; the BEAST output is every reception, uncapped), so a bind anyone else
+/// could reach is refused at start rather than trusted to a firewall. A name is refused too, since
+/// what it resolves to is not known here. Each listener refuses a non-loopback bind again when it
+/// is served (`sockets::loopback_only`).
+pub fn parse_loopback(flag: &str, text: &str) -> Result<SocketAddr, String> {
+    let address: SocketAddr = text
+        .parse()
+        .map_err(|_| format!("{flag} {text}: not an address and port, such as 127.0.0.1:10901"))?;
     if !address.ip().to_canonical().is_loopback() {
         return Err(format!(
-            "--stats-listen {text}: not a loopback address. The stats listener is \
-             unauthenticated and names every feeder's address, so it is served on loopback only \
-             (127.0.0.1:PORT or [::1]:PORT)"
+            "{flag} {text}: not a loopback address. It is unauthenticated, so it is served on \
+             loopback only (127.0.0.1:PORT or [::1]:PORT)"
         ));
     }
     Ok(address)
@@ -873,14 +878,18 @@ mod tests {
         Ok(())
     }
 
-    /// The stats listener names every feeder's address, so only loopback is ever bound.
+    /// The stats listener names every feeder's address and the BEAST output is unauthenticated,
+    /// so only loopback is ever bound for either.
     #[test]
-    fn the_stats_listener_is_loopback_or_the_relay_refuses_to_start() -> Result<(), String> {
+    fn the_stats_listener_and_beast_out_are_loopback_or_the_relay_refuses_to_start()
+    -> Result<(), String> {
         for loopback in ["127.0.0.1:10901", "127.8.9.10:1", "[::1]:10901"] {
-            assert!(
-                parse_stats_listen(loopback)?.ip().is_loopback(),
-                "{loopback}"
-            );
+            for flag in ["--stats-listen", "--beast-out"] {
+                assert!(
+                    parse_loopback(flag, loopback)?.ip().is_loopback(),
+                    "{flag} {loopback}"
+                );
+            }
         }
         for open in [
             "0.0.0.0:10901",
@@ -890,20 +899,27 @@ mod tests {
             "localhost:10901",
             "127.0.0.1",
         ] {
-            let refused = parse_stats_listen(open).err().unwrap_or_default();
-            assert!(refused.contains("--stats-listen"), "{open}: {refused}");
+            for flag in ["--stats-listen", "--beast-out"] {
+                let refused = parse_loopback(flag, open).err().unwrap_or_default();
+                assert!(refused.contains(flag), "{open}: {refused}");
+            }
         }
-        let refused = config(&[
-            "--key",
-            "k",
-            "--max-upload",
-            "10Mbit/s",
-            "--stats-listen",
-            "0.0.0.0:10901",
-        ])
-        .err()
-        .unwrap_or_default();
-        assert!(refused.contains("not a loopback address"), "{refused}");
+        for flag in ["--stats-listen", "--beast-out"] {
+            let refused = config(&[
+                "--key",
+                "k",
+                "--max-upload",
+                "10Mbit/s",
+                flag,
+                "0.0.0.0:10901",
+            ])
+            .err()
+            .unwrap_or_default();
+            assert!(
+                refused.contains("not a loopback address"),
+                "{flag}: {refused}"
+            );
+        }
         Ok(())
     }
 

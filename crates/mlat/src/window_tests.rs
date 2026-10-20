@@ -27,12 +27,17 @@ fn engine(seed: u8, regions: Vec<Region>, threads: usize) -> Engine {
     )
 }
 
-/// What `simulation`'s receivers publish: descriptions, then batches.
+/// What `simulation`'s receivers publish: descriptions and sites, then batches.
 fn records(simulation: &Simulation) -> Result<(Vec<Record>, Vec<Record>), String> {
     let feeds = simulation.feeds().map_err(text)?;
     let infos = feeds
         .iter()
-        .map(|feed| Record::ReceiverInfo(feed.info.clone()))
+        .flat_map(|feed| {
+            [
+                Record::ReceiverInfo(feed.info.clone()),
+                Record::ReceiverSite(feed.site.clone()),
+            ]
+        })
         .collect();
     let batches = feeds
         .iter()
@@ -82,6 +87,107 @@ fn scenario(seed: u64) -> Scenario {
         modes_aircraft: 16,
         ..Scenario::new(seed)
     }
+}
+
+/// What a step publishes for clients beside each relay-only form: a `ClientClockModel` per full
+/// model (numbered with it, naming it by id, nothing of its members) and every solution tagged, in
+/// records numbered after the raw ones. No client form names a receiver: its key, its site (each
+/// site's latitude and longitude as the wire writes them), its site id and its counters, the
+/// canaries, are in none (its reception key is never written at all); a relay
+/// holding the receivers' sites and the raw rematches every tagged solution to the raw one.
+#[test]
+fn a_step_publishes_client_forms_that_carry_no_site_and_rematch_on_a_relay() -> Result<(), String> {
+    let simulation = sim::run(&scenario(5));
+    let (infos, batches) = records(&simulation)?;
+    let now = after(&simulation);
+    let mut engine = engine(9, Vec::new(), 2);
+    for record in infos.iter().chain(&batches) {
+        engine.ingest(record, crate::replay::sent_ms(record))?;
+    }
+    let (published, report) = engine.step(now, now);
+    assert!(report.solved >= 100, "{report:?}");
+    assert_eq!(report.untagged, 0, "{report:?}");
+    assert!(report.tagged_positions >= 1, "{report:?}");
+    let client: Vec<tally_wire::ClientRecord> = published
+        .iter()
+        .filter_map(|record| tally_wire::ClientRecord::try_from(record.clone()).ok())
+        .collect();
+    let relay_only = published.len() - client.len();
+    assert!(relay_only >= report.clock_models + report.positions);
+    // The canaries: every receiver's site and key, and every raw counter published.
+    let contains = |bytes: &[u8], canary: &[u8]| bytes.windows(canary.len()).any(|at| at == canary);
+    let mut raw: Vec<tally_wire::Solution> = Vec::new();
+    let mut models = Vec::new();
+    for record in &published {
+        match record {
+            Record::Positions(positions) if !positions.is_tagged() => {
+                raw.extend(positions.solutions().map_err(text)?.solutions);
+            }
+            Record::ClockModel(manifest) => models.push(manifest.id()),
+            _ => {}
+        }
+    }
+    let mut tagged: Vec<tally_wire::TaggedSolution> = Vec::new();
+    let mut summaries = Vec::new();
+    for record in &client {
+        let mut bytes = Vec::new();
+        record.encode(&mut bytes).map_err(text)?;
+        // No client form names a receiver: not its key, its site or its site id.
+        for receiver in &simulation.receivers {
+            let canaries: [&[u8]; 4] = [
+                receiver.key.as_bytes(),
+                &receiver.site.location.lat_e7.to_be_bytes(),
+                &receiver.site.location.lon_e7.to_be_bytes(),
+                &receiver.record.site_id().0,
+            ];
+            for canary in canaries {
+                assert!(!contains(&bytes, canary), "{record:?}");
+            }
+        }
+        match record {
+            tally_wire::ClientRecord::Positions(positions) => {
+                let content = positions.get().tagged_solutions().map_err(text)?;
+                for solution in &raw {
+                    for reception in solution.observations.receptions() {
+                        assert!(!contains(&bytes, &reception.counter.to_be_bytes()[2..]));
+                    }
+                }
+                tagged.extend(content.solutions);
+            }
+            tally_wire::ClientRecord::ClockModel(summary) => {
+                summaries.push(summary.content().map_err(text)?)
+            }
+            _ => {}
+        }
+    }
+    // One summary a model, naming it, of one size: nothing of its members.
+    let ids: Vec<_> = summaries.iter().map(|summary| summary.model).collect();
+    assert_eq!(ids, models);
+    for summary in &summaries {
+        assert_eq!(summary.spec_version, SPEC_VERSION);
+    }
+    // Every raw solution, and only those, tagged; a relay rematches each.
+    assert_eq!(tagged.len(), raw.len());
+    let keys: BTreeMap<_, _> = simulation
+        .receivers
+        .iter()
+        .map(|receiver| (receiver.key, receiver.record.reception_key()))
+        .collect();
+    for (one, wire) in tagged.iter().zip(&raw) {
+        let held = wire.observations.receptions().iter().copied();
+        let back = tally_mlat_solver::publish::rematch(one, held, |key| keys.get(key).copied());
+        assert_eq!(back.as_ref(), Some(wire));
+    }
+    // The positions sequence runs on through the tagged records.
+    let sequences: Vec<u64> = published
+        .iter()
+        .filter_map(|record| match record {
+            Record::Positions(positions) => Some(positions.sequence()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(sequences, (0..sequences.len() as u64).collect::<Vec<_>>());
+    Ok(())
 }
 
 /// (b) The same observations, delivered in any order and any number of times, and solved on one
@@ -137,7 +243,7 @@ fn published(records: &[Record]) -> Result<Published, String> {
                     (content.model, Vec::new()),
                 );
             }
-            Record::Positions(positions) => {
+            Record::Positions(positions) if !positions.is_tagged() => {
                 for mut solution in positions.solutions().map_err(text)?.solutions {
                     let key = *models
                         .get(&solution.clock_model)
@@ -347,7 +453,14 @@ fn solutions_are_packed_into_as_few_records_as_hold_them_in_order() -> Result<()
         .take(700)
         .map(solution)
         .collect::<Result<Vec<_>, _>>()?;
-    let records = pack(&identity, 1, 2, 10, all.clone());
+    let records = pack_with(
+        10,
+        all.clone(),
+        Positions::fitting,
+        |sequence, run: &[tally_wire::Solution]| {
+            Positions::sign_solutions(&identity, &solutions_content((1, sequence, 2), run))
+        },
+    );
     assert!(records.len() >= 2, "{} records", records.len());
     let mut back = Vec::new();
     for (at, record) in records.iter().enumerate() {
@@ -391,19 +504,15 @@ fn packing_signs_each_record_once_and_checkpoints_before_every_signing() -> Resu
         .collect::<Result<Vec<_>, _>>()?;
     let signed = std::cell::Cell::new(0u64);
     let before = tally_mlat_solver::gate::checkpoints_here();
-    let records = pack_with(10, all, |sequence, run: &[tally_wire::Solution]| {
-        signed.set(signed.get() + 1);
-        Positions::sign_solutions(
-            &identity,
-            &SolutionsContent {
-                boot_id: 1,
-                sequence,
-                issued_ms: 2,
-                spec_version: SPEC_VERSION,
-                solutions: run.to_vec(),
-            },
-        )
-    });
+    let records = pack_with(
+        10,
+        all,
+        Positions::fitting,
+        |sequence, run: &[tally_wire::Solution]| {
+            signed.set(signed.get() + 1);
+            Positions::sign_solutions(&identity, &solutions_content((1, sequence, 2), run))
+        },
+    );
     let passed = tally_mlat_solver::gate::checkpoints_here() - before;
     assert!(records.len() >= 2);
     assert_eq!(signed.get(), records.len() as u64);

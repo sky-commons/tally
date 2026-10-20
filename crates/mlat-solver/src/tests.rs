@@ -1975,21 +1975,149 @@ fn a_tile_models_bytes_are_the_committed_golden() -> Result {
     });
     let runs = run(&simulation.sites(), &simulation.receptions)?;
     let run = runs.first().ok_or("no model")?;
-    let digest: [u8; 32] = Blake2s256::digest(&run.bytes).into();
-    let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+    let hex = |bytes: &[u8]| -> String {
+        let digest: [u8; 32] = Blake2s256::digest(bytes).into();
+        digest.iter().map(|byte| format!("{byte:02x}")).collect()
+    };
     assert_eq!(
-        hex,
+        hex(&run.bytes),
         GOLDEN,
         "{} bytes of tile {:?}",
         run.bytes.len(),
         run.model.tile
     );
+    // Version 6 changed only how the scope names its sites: without each entry's site id the bytes
+    // are version 5's golden, so every number fitted and solved is the same to the bit.
+    let scope = usize::from(u16::from_be_bytes([run.bytes[41], run.bytes[42]]));
+    let entry = 32 + 1 + 32 + 16;
+    let mut without = run.bytes[..43].to_vec();
+    for at in 0..scope {
+        let start = 43 + at * entry;
+        without.extend_from_slice(&run.bytes[start..start + 33]);
+        without.extend_from_slice(&run.bytes[start + 65..start + entry]);
+    }
+    without.extend_from_slice(&run.bytes[43 + scope * entry..]);
+    assert_eq!(hex(&without), GOLDEN_5);
     Ok(())
 }
 
-/// BLAKE2s-256 of the first tile model of scenario 301 (12 s), made on the x86 host (version 4:
-/// every clock starts at 500 ns, so the GNSS gauge's fit starts elsewhere than version 3's).
-const GOLDEN: &str = "0758416042f68480004ce93fee8ca8699248818e1e35eb51b2a6db8f41dabc3e";
+/// What a client is sent of a model (`publish::client_model`, signed as a `ClientClockModel`) and
+/// of its solutions (tagged) names no receiver and holds no site, no site id, no `site_mm`, no
+/// offset and no counter; a relay holding
+/// the raw rematches every tagged solution to the raw one exactly (`publish::rematch`), and one
+/// whose tags it cannot all account for to nothing.
+#[test]
+fn a_clients_forms_carry_no_site_and_a_relay_rematches_their_tags() -> Result {
+    let simulation = sim::run(&Scenario {
+        duration_s: 12.0,
+        ..Scenario::new(301)
+    });
+    let runs = run(&simulation.sites(), &simulation.receptions)?;
+    let run = runs.first().ok_or("no model")?;
+    let contains = |bytes: &[u8], canary: &[u8]| bytes.windows(canary.len()).any(|at| at == canary);
+    let engine = tally_wire::Identity::from_seed([9; 32]);
+    let inputs = publish::inputs_id(&run.model);
+    let content = publish::client_model(&run.model, [1; 32], inputs, (1, 2, 3));
+    let signed = tally_wire::ClientClockModel::sign(&engine, &content).map_err(text)?;
+    let bytes = signed.as_bytes();
+    // It is of one size, and names no member: no receiver key, no site id, no site.
+    assert_eq!(bytes.len(), tally_wire::CLIENT_MODEL_LEN);
+    for site in &run.model.scope {
+        assert!(!contains(bytes, site.receiver.as_bytes()));
+        assert!(!contains(bytes, &site.id.0));
+        assert!(!contains(bytes, &site.location.lat_e7.to_be_bytes()));
+        assert!(!contains(bytes, &site.location.lon_e7.to_be_bytes()));
+    }
+    for piece in &run.model.pieces {
+        for axis in piece.site_mm {
+            assert!(!contains(bytes, &axis.to_be_bytes()));
+        }
+        for offset in piece.offsets_ps.iter().filter(|offset| **offset != 0) {
+            assert!(!contains(bytes, &offset.to_be_bytes()));
+        }
+    }
+    // The inputs id is the site ids' and precisions', never the sites': moving a site with the
+    // same id leaves it, a new site-bearing record (a new id) changes it.
+    let mut moved = run.model.clone();
+    moved.scope[0].location.lat_e7 += 1;
+    assert_eq!(publish::inputs_id(&moved), inputs);
+    moved.scope[0].id = tally_wire::SiteId([0; 32]);
+    assert_ne!(publish::inputs_id(&moved), inputs);
+
+    let keys: BTreeMap<tally_wire::PublicKey, tally_wire::ReceptionKey> = simulation
+        .receivers
+        .iter()
+        .map(|receiver| (receiver.key, receiver.record.reception_key()))
+        .collect();
+    let key_of = |receiver: &tally_wire::PublicKey| keys.get(receiver).copied();
+    let mut rematched = 0;
+    for solved in &run.solutions {
+        let wire = publish::to_wire(
+            &run.model,
+            &solved.solution,
+            [7; 32],
+            Citation::default(),
+            &solved.transmission.data,
+        )
+        .map_err(text)?;
+        let tagged = wire.tagged(key_of).map_err(text)?;
+        let record = tally_wire::Positions::sign_tagged(
+            &engine,
+            &tally_wire::SolutionsContent {
+                boot_id: 1,
+                sequence: 0,
+                issued_ms: 0,
+                spec_version: SPEC_VERSION,
+                solutions: vec![tagged.clone()],
+            },
+        )
+        .map_err(text)?;
+        for reception in wire.observations.receptions() {
+            assert!(!contains(record.as_bytes(), reception.receiver.as_bytes()));
+            assert!(!contains(
+                record.as_bytes(),
+                &reception.counter.to_be_bytes()[2..]
+            ));
+        }
+        let (receptions, _) = &run.aircraft[&solved.address];
+        let held: Vec<tally_wire::Reception> = receptions
+            .iter()
+            .filter(|reception| reception.observation.data == solved.transmission.data)
+            .map(|reception| tally_wire::Reception {
+                receiver: reception.receiver,
+                epoch: reception.epoch,
+                counter: reception.observation.timestamp,
+            })
+            .collect();
+        assert_eq!(
+            publish::rematch(&tagged, held.iter().copied(), key_of),
+            Some(wire.clone())
+        );
+        // A relay missing one reception, or holding none of the keys, accounts for nothing.
+        let cited = wire.observations.receptions()[0];
+        let missing = held
+            .iter()
+            .filter(|reception| **reception != cited)
+            .copied();
+        assert_eq!(publish::rematch(&tagged, missing, key_of), None);
+        assert_eq!(
+            publish::rematch(&tagged, held.iter().copied(), |_| None),
+            None
+        );
+        rematched += 1;
+    }
+    assert!(rematched > 5, "{rematched} rematched");
+    Ok(())
+}
+
+/// BLAKE2s-256 of the first tile model of scenario 301 (12 s), made on the x86 host (version 6:
+/// each scope entry names its site-bearing record by site id).
+const GOLDEN: &str = "bb825c3e6eb2a26c9b0bf01788a26a80ffc34292b15bbdea1d8e192ace1950a9";
+
+/// The same model's bytes under version 5's encoding (no site ids), made on the x86 host
+/// (version 4: every clock starts at 500 ns, so the GNSS gauge's fit starts elsewhere than
+/// version 3's).
+const GOLDEN_5: &str = "0758416042f68480004ce93fee8ca8699248818e1e35eb51b2a6db8f41dabc3e";
 
 /// Per-stage timers at a region's scale: index, plan, inputs, fit (folded calibration), solve,
 /// and an external verification. Run in release with `--ignored`.

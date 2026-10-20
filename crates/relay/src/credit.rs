@@ -46,11 +46,13 @@ use std::collections::{HashMap, HashSet};
 use std::hash::Hash as StdHash;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
+use tally_wire::batch::Hash;
 use tally_wire::record::MAX_REGIONS;
 use tally_wire::rendezvous::AREA_RESOLUTION;
 use tally_wire::{
-    EvidenceBundle, EvidenceBundleContent, FirehoseCredential, FirehoseCredentialContent, Identity,
-    PublicKey, ReceiverInfo, Region, Streams, StripeReceipt, WireError,
+    Evidence, EvidenceBundle, FeederReference, FirehoseCredential, FirehoseCredentialContent,
+    Identity, PublicKey, ReceiverInfo, ReferencedEvidenceContent, Region, Streams, StripeReceipt,
+    WireError,
 };
 
 use crate::ingest::RecordPace;
@@ -350,8 +352,28 @@ struct Slice {
 pub struct Shown {
     issued_ms: u64,
     /// Feeders naming the relay, by key, with their descriptions' times.
-    feeders: Vec<(PublicKey, u64)>,
+    feeders: Vec<ShownFeeder>,
     slices: Vec<Slice>,
+}
+
+/// A feeder a bundle shows naming its relay ([`check`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ShownFeeder {
+    pub feeder: PublicKey,
+    pub issued_ms: u64,
+    /// For a bundle that names its feeders by reference (format 2, which carries no site): the
+    /// hash of the description it names, which only a judge holding the same description can
+    /// resolve ([`Credit::described`]). `None` for one carried whole, already checked.
+    pub description: Option<Hash>,
+}
+
+/// What a relay holds of a feeder's newest description, whoever it names: what a bundle's
+/// reference to it is resolved against ([`resolves`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct HeldCopy {
+    issued_ms: u64,
+    description: Hash,
+    relays: Vec<PublicKey>,
 }
 
 impl Shown {
@@ -368,6 +390,9 @@ const MAX_RELAYS_SHOWN: usize = 4_096;
 const MAX_LINKED: usize = 8_192;
 const MAX_CORROBORATED_RECEIVERS: usize = 65_536;
 const MAX_CORROBORATED_RELAYS: usize = 8_192;
+/// The most feeders' descriptions held to resolve references by: one each, as many as the
+/// receivers a relay remembers.
+const MAX_COPIES: usize = 65_536;
 
 #[derive(Default)]
 struct State {
@@ -375,8 +400,10 @@ struct State {
     own: Vec<PublicKey>,
     /// The upload cap, once told: before it, nothing is rationed.
     upload_cap: Option<u64>,
-    /// Feeders' descriptions, newest per feeder.
+    /// Feeders' descriptions naming this relay, newest per feeder: its own evidence.
     described: HashMap<PublicKey, (ReceiverInfo, u64)>,
+    /// Every feeder's newest description the relay holds, as a reference resolves against it.
+    copies: HashMap<PublicKey, HeldCopy>,
     /// Children's receipts, newest per (child, cell, product, stripe).
     receipts: HashMap<(PublicKey, u64, u16, u8), (StripeReceipt, u64)>,
     /// The clients this relay vouches for (its operator's).
@@ -541,30 +568,47 @@ impl Credit {
         Some((credential, evidence))
     }
 
-    /// A feeder's signed description: evidence when it names this relay.
+    /// A feeder's signed description the hub kept (verified there), in either format: held as
+    /// what a bundle's reference to it resolves against ([`resolves`]), and evidence when it names
+    /// this relay. Its signature is checked again only when it becomes evidence this relay signs
+    /// over, as before references: every description the relay holds passes here, and a check of
+    /// each would cost a signature per description a second time.
     ///
-    /// Only a description naming one of this relay's keys is kept, and its signature is checked
-    /// only then: the hub hands every description it keeps, and most name other relays. One dated
-    /// further ahead of `now_ms` than any clock skew is refused: it would stand as the newest for
-    /// as long as its date is ahead.
+    /// One dated further ahead of `now_ms` than any clock skew is refused: it would stand as the
+    /// newest for as long as its date is ahead.
     pub fn described(&self, info: ReceiverInfo, now_ms: u64) {
-        let (Ok(feeder), Ok(content)) = (info.receiver(), info.content()) else {
+        let (Ok(feeder), Ok(described)) = (info.receiver(), info.description()) else {
             return;
         };
-        let names_me = {
-            let state = self.state();
-            content.relays.iter().any(|relay| state.own.contains(relay))
-        };
-        if !names_me || ahead(content.issued_ms, now_ms) || info.verify().is_err() {
+        let (issued_ms, relays) = said(&described);
+        if ahead(issued_ms, now_ms) {
             return;
         }
         let mut state = self.state();
         let newer = state
+            .copies
+            .get(&feeder)
+            .is_none_or(|held| held.issued_ms < issued_ms);
+        if newer {
+            state.copies.insert(
+                feeder,
+                HeldCopy {
+                    issued_ms,
+                    description: tally_wire::credit::description_hash(&info),
+                    relays: relays.to_vec(),
+                },
+            );
+            trim(&mut state.copies, MAX_COPIES, |held| held.issued_ms);
+        }
+        if !relays.iter().any(|relay| state.own.contains(relay)) || info.verify().is_err() {
+            return;
+        }
+        let newer = state
             .described
             .get(&feeder)
-            .is_none_or(|(_, issued)| *issued < content.issued_ms);
+            .is_none_or(|(_, issued)| *issued < issued_ms);
         if newer {
-            state.described.insert(feeder, (info, content.issued_ms));
+            state.described.insert(feeder, (info, issued_ms));
             trim(&mut state.described, OWN_EVIDENCE, |(_, issued)| *issued);
         }
     }
@@ -572,6 +616,10 @@ impl Credit {
     /// This relay's evidence, bundled: the newest of each kind that names it, at most
     /// `MAX_EVIDENCE` each, fewer if they would not fit one record. The same evidence always
     /// bundles alike: newest first, ties in the order of the records' bytes.
+    ///
+    /// Feeders are named by reference (`EvidenceBundle::sign_referenced`: key, issued time, hash
+    /// of the description), never carried: a bundle reaches clients, and an old feeder's
+    /// description carries its site. A judging relay resolves each against its own copy.
     pub fn bundle(&self, identity: &Identity, now_ms: u64) -> Result<EvidenceBundle, WireError> {
         let own = identity.public();
         self.adopt_identity(own);
@@ -586,8 +634,8 @@ impl Credit {
                 .filter(|(info, issued)| {
                     fresh(*issued)
                         && info
-                            .content()
-                            .is_ok_and(|content| content.relays.contains(&own))
+                            .description()
+                            .is_ok_and(|described| said(&described).1.contains(&own))
                 })
                 .map(|(info, issued)| (*issued, info.clone()))
                 .collect();
@@ -608,14 +656,17 @@ impl Credit {
         feeders.truncate(most);
         receipts.truncate(most);
         loop {
-            let content = EvidenceBundleContent {
+            let content = ReferencedEvidenceContent {
                 issued_ms: now_ms,
-                feeders: feeders.clone(),
+                feeders: feeders
+                    .iter()
+                    .filter_map(|info| FeederReference::of(info).ok())
+                    .collect(),
                 receipts: receipts.clone(),
                 // A relay's own answers are not evidence (the module's rules): none is carried.
                 answers: Vec::new(),
             };
-            match EvidenceBundle::sign(identity, &content) {
+            match EvidenceBundle::sign_referenced(identity, &content) {
                 Err(WireError::Oversize(_)) if !(feeders.is_empty() && receipts.is_empty()) => {
                     if feeders.len() >= receipts.len() {
                         feeders.truncate(feeders.len() / 2);
@@ -822,6 +873,30 @@ impl Credit {
     }
 }
 
+/// What a description of either format says of the relays it chose, and when it said it.
+fn said(described: &tally_wire::batch::Description) -> (u64, &[PublicKey]) {
+    match described {
+        tally_wire::batch::Description::Site(content) => (content.issued_ms, &content.relays),
+        tally_wire::batch::Description::Public(content) => (content.issued_ms, &content.relays),
+    }
+}
+
+/// Whether a feeder a bundle of `relay` shows counts at a judge holding `copy`, its own copy of
+/// that feeder's newest description: one carried whole was checked already; one named by
+/// reference counts when the judge holds the very description named (same hash) and it names
+/// `relay`, or a newer one that still names it (the feeder signed again since; it still chose
+/// the relay). A reference the judge cannot resolve counts nothing: a relay cannot be credited
+/// for a feeder on its own word.
+fn resolves(copy: Option<&HeldCopy>, shown: &ShownFeeder, relay: &PublicKey) -> bool {
+    let Some(named) = shown.description else {
+        return true;
+    };
+    copy.is_some_and(|copy| {
+        copy.relays.contains(relay)
+            && (copy.description == named || copy.issued_ms > shown.issued_ms)
+    })
+}
+
 /// Whether `issued_ms` is further ahead of `now_ms` than any clock skew.
 fn ahead(issued_ms: u64, now_ms: u64) -> bool {
     issued_ms > now_ms.saturating_add(MAX_SKEW_MS)
@@ -860,32 +935,57 @@ pub fn check(
     };
     bundle.verify().map_err(unreadable)?;
     let relay = bundle.signer().map_err(unreadable)?;
-    let content = bundle.content().map_err(unreadable)?;
-    if ahead(content.issued_ms, now_ms) {
+    let (issued_ms, receipts) = match bundle.evidence().map_err(unreadable)? {
+        Evidence::Carried(content) => {
+            let mut feeders = Vec::with_capacity(content.feeders.len());
+            for info in &content.feeders {
+                spend();
+                let (Ok(()), Ok(feeder), Ok(described)) =
+                    (info.verify(), info.receiver(), info.description())
+                else {
+                    continue;
+                };
+                let (issued_ms, relays) = said(&described);
+                if ahead(issued_ms, now_ms) || feeder == relay || !relays.contains(&relay) {
+                    continue;
+                }
+                feeders.push(ShownFeeder {
+                    feeder,
+                    issued_ms,
+                    description: None,
+                });
+            }
+            (content.issued_ms, (feeders, content.receipts))
+        }
+        // By reference: nothing to verify here; each counts only where the judge's own copy
+        // resolves it (`resolves`).
+        Evidence::Referenced(content) => {
+            let feeders = content
+                .feeders
+                .iter()
+                .filter(|named| !ahead(named.issued_ms, now_ms) && named.feeder != relay)
+                .map(|named| ShownFeeder {
+                    feeder: named.feeder,
+                    issued_ms: named.issued_ms,
+                    description: Some(named.description),
+                })
+                .collect();
+            (content.issued_ms, (feeders, content.receipts))
+        }
+    };
+    let (feeders, receipts) = receipts;
+    if ahead(issued_ms, now_ms) {
         return Err(Refused::Future);
     }
-    if now_ms.saturating_sub(content.issued_ms) > MAX_EVIDENCE_AGE_MS {
+    if now_ms.saturating_sub(issued_ms) > MAX_EVIDENCE_AGE_MS {
         return Err(Refused::Stale);
     }
     let mut shown = Shown {
-        issued_ms: content.issued_ms,
-        ..Shown::default()
+        issued_ms,
+        feeders,
+        slices: Vec::new(),
     };
-    for info in &content.feeders {
-        spend();
-        let (Ok(()), Ok(feeder), Ok(described)) = (info.verify(), info.receiver(), info.content())
-        else {
-            continue;
-        };
-        if ahead(described.issued_ms, now_ms)
-            || feeder == relay
-            || !described.relays.contains(&relay)
-        {
-            continue;
-        }
-        shown.feeders.push((feeder, described.issued_ms));
-    }
-    for receipt in &content.receipts {
+    for receipt in &receipts {
         spend();
         let (Ok(()), Ok(child), Ok(slice)) =
             (receipt.verify(), receipt.signer(), receipt.content())
@@ -908,8 +1008,9 @@ pub fn check(
 
 /// What a weigher accepts of a bundle's items, beyond their signatures ([`worth`]).
 pub struct Corroboration<'a> {
-    /// Whether a feeder's description naming the relay counts.
-    pub feeder: &'a dyn Fn(&PublicKey) -> bool,
+    /// Whether a feeder the bundle shows naming the relay counts (by reference, only where it
+    /// resolves: [`resolves`]).
+    pub feeder: &'a dyn Fn(&ShownFeeder) -> bool,
     /// What a child's receipts count once per (the child itself, or its network), if the child's
     /// receipts count at all.
     pub child: &'a dyn Fn(&PublicKey) -> Option<Unit>,
@@ -942,10 +1043,10 @@ pub fn worth(
     now_ms: u64,
 ) -> u64 {
     let mut hosted: HashMap<PublicKey, u64> = HashMap::new();
-    for (feeder, issued) in &shown.feeders {
-        if (corroboration.feeder)(feeder) {
-            let newest = hosted.entry(*feeder).or_insert(*issued);
-            *newest = (*newest).max(*issued);
+    for shown in &shown.feeders {
+        if (corroboration.feeder)(shown) {
+            let newest = hosted.entry(shown.feeder).or_insert(shown.issued_ms);
+            *newest = (*newest).max(shown.issued_ms);
         }
     }
     let mut children: HashMap<Unit, u64> = HashMap::new();
@@ -978,7 +1079,10 @@ fn earned(state: &State, relay: &PublicKey, now_ms: u64) -> u64 {
     let Some(shown) = state.shown.get(relay) else {
         return 0;
     };
-    let feeder = |key: &PublicKey| corroborated(&state.corroborated_receivers, key, now_ms);
+    let feeder = |shown: &ShownFeeder| {
+        corroborated(&state.corroborated_receivers, &shown.feeder, now_ms)
+            && resolves(state.copies.get(&shown.feeder), shown, relay)
+    };
     let child = |key: &PublicKey| {
         corroborated(&state.corroborated_relays, key, now_ms).then_some(Unit::Child(*key))
     };
@@ -1041,6 +1145,7 @@ mod tests {
 
     use super::*;
     use std::time::Duration;
+    use tally_wire::EvidenceBundleContent;
 
     type Result<T = ()> = std::result::Result<T, String>;
 
@@ -1339,7 +1444,7 @@ mod tests {
         // And its own bundle never carries one.
         let own = Credit::new();
         let bundled = own.bundle(&relay, NOW).map_err(text)?;
-        assert!(bundled.content().map_err(text)?.answers.is_empty());
+        assert!(bundled.referenced().map_err(text)?.answers.is_empty());
         Ok(())
     }
 
@@ -1534,7 +1639,7 @@ mod tests {
             (content.client, credential.signer().map_err(text)?),
             (client.public(), relay.public())
         );
-        assert_eq!(evidence.content().map_err(text)?.feeders.len(), 1);
+        assert_eq!(evidence.referenced().map_err(text)?.feeders.len(), 1);
         // Served here as the credential says: anything, anywhere.
         assert_eq!(
             own.admit(&session, sub(Streams::RAW, Vec::new()), NOW),
@@ -1834,7 +1939,9 @@ mod tests {
         own.record_receipt(receipt(&child, relay.public(), 4_000, NOW)?, NOW);
         own.record_receipt(receipt(&child, identity()?.public(), 4_000, NOW)?, NOW);
         let bundled = own.bundle(&relay, NOW).map_err(text)?;
-        let content = bundled.content().map_err(text)?;
+        // By reference: no description, so no site, rides in it.
+        assert!(!bundled.carries_site());
+        let content = bundled.referenced().map_err(text)?;
         assert_eq!(
             (
                 content.feeders.len(),
@@ -1847,6 +1954,11 @@ mod tests {
         judge.corroborate_receiver(feeder.public(), NOW);
         judge.corroborate_relay(child.public(), NOW);
         judge.weigh(&bundled, NOW, None).map_err(text)?;
+        // A judge holding no copy of the description cannot resolve the reference: the feeder
+        // counts nothing on the relay's word alone.
+        assert_eq!(judge.earned(&relay.public(), NOW), 4_000);
+        // Holding the same description, it resolves.
+        judge.described(info(&feeder, relay.public(), NOW)?, NOW);
         assert_eq!(judge.earned(&relay.public(), NOW), FEEDER_CREDIT + 4_000);
         // A full evidence store still bundles into one record, and alike every time.
         for _ in 0..200 {
@@ -1854,13 +1966,13 @@ mod tests {
         }
         let full = own.bundle(&relay, NOW).map_err(text)?;
         full.verify().map_err(text)?;
-        let content = full.content().map_err(text)?;
+        let content = full.referenced().map_err(text)?;
         assert!(content.feeders.len() <= tally_wire::credit::MAX_EVIDENCE);
         assert!(!content.feeders.is_empty());
         assert_eq!(
             own.bundle(&relay, NOW)
                 .map_err(text)?
-                .content()
+                .referenced()
                 .map_err(text)?,
             content
         );
@@ -1883,18 +1995,73 @@ mod tests {
         let content = own
             .bundle(&relay, NOW)
             .map_err(text)?
-            .content()
+            .referenced()
             .map_err(text)?;
         assert_eq!((content.feeders.len(), content.receipts.len()), (1, 0));
-        assert_eq!(content.feeders[0].content().map_err(text)?.issued_ms, NOW);
+        assert_eq!(content.feeders[0].issued_ms, NOW);
         // Within the skew is a clock's ordinary disagreement, and is kept.
         own.described(info(&early, relay.public(), NOW + MAX_SKEW_MS)?, NOW);
         let content = own
             .bundle(&relay, NOW)
             .map_err(text)?
-            .content()
+            .referenced()
             .map_err(text)?;
         assert_eq!(content.feeders.len(), 2);
+        Ok(())
+    }
+
+    /// A reference resolves against the judge's own copy: the very description named, or a newer
+    /// one still naming the relay; never one that names another relay, nor a hash the judge does
+    /// not hold.
+    #[test]
+    fn a_reference_counts_only_where_the_judges_copy_resolves_it() -> Result {
+        let (relay, feeder) = (identity()?, identity()?);
+        let own = Credit::new();
+        own.adopt_identity(relay.public());
+        own.described(info(&feeder, relay.public(), NOW - 10)?, NOW);
+        let bundled = own.bundle(&relay, NOW).map_err(text)?;
+        let judge_of = |copy: Option<ReceiverInfo>| -> Result<u64> {
+            let judge = Credit::new();
+            judge.corroborate_receiver(feeder.public(), NOW);
+            if let Some(copy) = copy {
+                judge.described(copy, NOW);
+            }
+            judge.weigh(&bundled, NOW, None).map_err(text)?;
+            Ok(judge.earned(&relay.public(), NOW))
+        };
+        assert_eq!(judge_of(None)?, 0);
+        assert_eq!(
+            judge_of(Some(info(&feeder, relay.public(), NOW - 10)?))?,
+            FEEDER_CREDIT
+        );
+        // Re-signed since, still naming the relay: it still chose it.
+        assert!(judge_of(Some(info(&feeder, relay.public(), NOW - 5)?))? > 0);
+        // Re-signed naming another relay: the reference is stale, and counts nothing.
+        assert_eq!(
+            judge_of(Some(info(&feeder, identity()?.public(), NOW - 5)?))?,
+            0
+        );
+        // An older copy than the one named, with another hash: unresolved.
+        assert_eq!(judge_of(Some(info(&feeder, relay.public(), NOW - 20)?))?, 0);
+        Ok(())
+    }
+
+    /// An old relay's bundle, carrying its feeders' format 1 descriptions whole, still counts
+    /// as it did, with no copy needed.
+    #[test]
+    fn a_carried_bundle_of_an_old_relay_still_counts() -> Result {
+        let (relay, feeder) = (identity()?, identity()?);
+        let carried = bundle(
+            &relay,
+            vec![info(&feeder, relay.public(), NOW)?],
+            vec![],
+            vec![],
+        )?;
+        assert!(carried.carries_site());
+        let judge = Credit::new();
+        judge.corroborate_receiver(feeder.public(), NOW);
+        judge.weigh(&carried, NOW, None).map_err(text)?;
+        assert_eq!(judge.earned(&relay.public(), NOW), FEEDER_CREDIT);
         Ok(())
     }
 

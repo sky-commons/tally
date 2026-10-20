@@ -29,6 +29,7 @@ rust_library(
         "//crates/mlat-solver",
         "//crates/wire",
         "@tally_crates//:axum",
+        "@tally_crates//:h3o",
         "@tally_crates//:libc",
         "@tally_crates//:serde",
         "@tally_crates//:tokio",
@@ -70,6 +71,7 @@ rust_test(
     deps = [
         ":relay",
         "//crates/feed",
+        "//crates/mlat",
         "//crates/mlat-solver",
         "//crates/wire",
         "@tally_crates//:tokio",
@@ -130,6 +132,22 @@ rust_test(
     deps = [
         ":relay",
         "@tally_crates//:tokio",
+    ],
+)
+
+# A feeder figures row at every cap allocates no more than the charge it takes
+# (`figures::PER_RECEIVER_BYTES`), measured by a counting allocator: its own binary, so nothing
+# else allocates while it measures.
+rust_test(
+    name = "figures_bytes",
+    size = "small",
+    srcs = ["tests/figures_bytes.rs"],
+    edition = "2024",
+    lint_config = ":cargo_lints",
+    deps = [
+        ":relay",
+        "//crates/mlat-solver",
+        "//crates/wire",
     ],
 )
 
@@ -281,6 +299,7 @@ rustfmt_test(
     targets = [
         ":check",
         ":end_to_end",
+        ":figures_bytes",
         ":flood",
         ":mlat_host_binary",
         ":panic",

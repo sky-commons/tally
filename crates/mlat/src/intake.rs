@@ -7,9 +7,14 @@
 //! receiver's word decides its part whichever intake holds it, so the same raw split any way
 //! seals to the same bins (`held::Bin::seal_from`) and solves to the same bytes.
 //!
-//! - A receiver takes part on its own signed word only: its newest `ReceiverInfo` verifies, places
-//!   it inside the engine's regions, and names a clock the solver specification knows with a
-//!   location no coarser than it allows (`tally_mlat_solver::obs::MAX_SITE_PRECISION_M`).
+//! - A receiver takes part on its own signed word only: its newest site-bearing record
+//!   ([`SiteRecord`]: its `ReceiverSite`, or an old feeder's format 1 `ReceiverInfo`) verifies,
+//!   places it inside the engine's regions, and names a clock the solver specification knows with
+//!   a location no coarser than it allows (`tally_mlat_solver::obs::MAX_SITE_PRECISION_M`). A
+//!   format 2 `ReceiverInfo` carries no site and places nobody: an engine never takes a site
+//!   from anything a client can read. The record also gives the receiver's site id (what a model
+//!   names it by) and reception key (what its receptions are tagged under for clients), carried
+//!   with its site ([`Sited`]).
 //! - A batch is used once: from a receiver that takes part, with a (boot, sequence) not already used
 //!   and not too far behind that boot's newest (§3.1).
 //! - **Room is shared, refusal is whole, and neither depends on order** (RFC-0181 §9). The
@@ -67,7 +72,8 @@ use tally_mlat_solver::held::{Closing, Fragment, Limits, Open};
 use tally_mlat_solver::obs::MAX_SITE_PRECISION_M;
 use tally_mlat_solver::{Site, Timebase};
 use tally_wire::{
-    Clock, Decoded, FingerprintKey, Location, PublicKey, ReceiverInfo, Region, Regions,
+    Clock, Decoded, FingerprintKey, Location, PublicKey, ReceiverInfo, ReceiverSite, ReceptionKey,
+    Record, Region, Regions, SiteId, WireError,
 };
 
 use crate::engine::{Dropped, Ingested};
@@ -115,44 +121,145 @@ pub struct Orphaned {
     pub expired: u64,
 }
 
-/// Receivers' descriptions taking effect at one step, in the order they are applied (a relay's
-/// hosted MLAT and the reference drive alike, `replay`): of each receiver only the newest it
-/// signed (by `issued_ms`, then bytes), which is what it says as of the step, whatever order they
-/// came in and however many came; then by stamp, then by key. So a receiver re-signing within one
-/// step holds one description there, and an older one never applies after a newer one.
-pub fn taking_effect(
-    descriptions: impl IntoIterator<Item = (u64, ReceiverInfo)>,
-) -> Vec<(u64, ReceiverInfo)> {
-    let mut newest: BTreeMap<Vec<u8>, (u64, ReceiverInfo)> = BTreeMap::new();
-    for (stamp_ms, info) in descriptions {
-        let key = info
-            .receiver()
-            .map(|key| key.as_bytes().to_vec())
-            .unwrap_or_else(|_| info.as_bytes().to_vec());
-        let replace = newest
-            .get(&key)
-            .is_none_or(|(_, held)| signed_order(held) < signed_order(&info));
-        if replace {
-            newest.insert(key, (stamp_ms, info));
+/// A receiver's site-bearing record: the one thing an engine places a receiver by (module docs).
+/// Relay-only, both kinds (`Record::carries_site`): a new feeder's `ReceiverSite`, or an old
+/// feeder's format 1 `ReceiverInfo`. A format 2 `ReceiverInfo` is no `SiteRecord` ([`Self::of`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SiteRecord {
+    Site(ReceiverSite),
+    /// A `ReceiverInfo` that carries a site (format 1, or a format this build cannot read, which it
+    /// then ignores).
+    Info(ReceiverInfo),
+}
+
+/// What a site-bearing record says, as an engine reads it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SiteContent {
+    pub issued_ms: u64,
+    /// `None` for an old feeder that declared no location.
+    pub location: Option<Location>,
+    pub clock: Clock,
+}
+
+impl SiteRecord {
+    /// The site-bearing record `record` is, if it is one: a `ReceiverSite`, or a `ReceiverInfo`
+    /// that carries a site. A format 2 description places nobody.
+    pub fn of(record: &Record) -> Option<Self> {
+        match record {
+            Record::ReceiverSite(site) => Some(Self::Site(site.clone())),
+            Record::ReceiverInfo(info) => Self::info(info.clone()),
+            _ => None,
         }
     }
-    let mut due: Vec<(u64, ReceiverInfo)> = newest.into_values().collect();
-    due.sort_by_cached_key(|(stamp_ms, info)| {
+
+    /// `info` as a site-bearing record, if it carries a site.
+    pub fn info(info: ReceiverInfo) -> Option<Self> {
+        info.carries_site().then_some(Self::Info(info))
+    }
+
+    /// The record as the wire carries it (relay-only).
+    pub fn record(&self) -> Record {
+        match self {
+            Self::Site(site) => Record::ReceiverSite(site.clone()),
+            Self::Info(info) => Record::ReceiverInfo(info.clone()),
+        }
+    }
+
+    pub fn receiver(&self) -> Result<PublicKey, WireError> {
+        match self {
+            Self::Site(site) => site.receiver(),
+            Self::Info(info) => info.receiver(),
+        }
+    }
+
+    pub fn verify(&self) -> Result<(), WireError> {
+        match self {
+            Self::Site(site) => site.verify(),
+            Self::Info(info) => info.verify(),
+        }
+    }
+
+    /// Its signed bytes: what its site id and reception key are of.
+    pub fn as_bytes(&self) -> &[u8] {
+        match self {
+            Self::Site(site) => site.as_bytes(),
+            Self::Info(info) => info.as_bytes(),
+        }
+    }
+
+    /// What it says, in a format this build reads.
+    pub fn content(&self) -> Result<SiteContent, WireError> {
+        match self {
+            Self::Site(site) => site.content().map(|content| SiteContent {
+                issued_ms: content.issued_ms,
+                location: Some(content.location),
+                clock: content.clock,
+            }),
+            Self::Info(info) => info.content().map(|content| SiteContent {
+                issued_ms: content.issued_ms,
+                location: content.location,
+                clock: content.clock,
+            }),
+        }
+    }
+
+    /// The reference a model names the receiver by while this record is current.
+    pub fn site_id(&self) -> SiteId {
+        SiteId::of_signed(self.as_bytes())
+    }
+
+    /// What the receiver's receptions are tagged under while this record is current.
+    pub fn reception_key(&self) -> ReceptionKey {
+        ReceptionKey::of_signed(self.as_bytes())
+    }
+}
+
+/// A receiver taking part: its site, and the reception key of the record that placed it (never
+/// on any wire), which its receptions are tagged under in what a client is sent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Sited {
+    pub site: Site,
+    pub key: ReceptionKey,
+}
+
+/// Receivers' site-bearing records taking effect at one step, in the order they are applied (a
+/// relay's hosted MLAT and the reference drive alike, `replay`): of each receiver only the newest
+/// it signed (by `issued_ms`, then bytes), which is what it says as of the step, whatever order
+/// they came in and however many came; then by stamp, then by key. So a receiver re-signing within
+/// one step holds one record there, and an older one never applies after a newer one.
+pub fn taking_effect(
+    descriptions: impl IntoIterator<Item = (u64, SiteRecord)>,
+) -> Vec<(u64, SiteRecord)> {
+    let mut newest: BTreeMap<Vec<u8>, (u64, SiteRecord)> = BTreeMap::new();
+    for (stamp_ms, record) in descriptions {
+        let key = record
+            .receiver()
+            .map(|key| key.as_bytes().to_vec())
+            .unwrap_or_else(|_| record.as_bytes().to_vec());
+        let replace = newest
+            .get(&key)
+            .is_none_or(|(_, held)| signed_order(held) < signed_order(&record));
+        if replace {
+            newest.insert(key, (stamp_ms, record));
+        }
+    }
+    let mut due: Vec<(u64, SiteRecord)> = newest.into_values().collect();
+    due.sort_by_cached_key(|(stamp_ms, record)| {
         (
             *stamp_ms,
-            info.receiver().ok().map(|key| *key.as_bytes()),
-            info.as_bytes().to_vec(),
+            record.receiver().ok().map(|key| *key.as_bytes()),
+            record.as_bytes().to_vec(),
         )
     });
     due
 }
 
-/// Which of two descriptions of one receiver is the newer: what it signed later (`issued_ms`),
-/// then its bytes, so the order is total.
-pub fn signed_order(info: &ReceiverInfo) -> (u64, &[u8]) {
+/// Which of two site-bearing records of one receiver is the newer: what it signed later
+/// (`issued_ms`), then its bytes, so the order is total whichever kinds the two are.
+pub fn signed_order(record: &SiteRecord) -> (u64, &[u8]) {
     (
-        info.content().map_or(0, |content| content.issued_ms),
-        info.as_bytes(),
+        record.content().map_or(0, |content| content.issued_ms),
+        record.as_bytes(),
     )
 }
 
@@ -751,6 +858,9 @@ struct Described {
     /// What it declared, so a change of the engine's regions re-decides whether it takes part.
     location: Option<Location>,
     clock: Clock,
+    /// Its record's site id and reception key.
+    id: SiteId,
+    key: ReceptionKey,
     /// Its site, if its own word places it inside the engine's regions with a usable clock.
     site: Option<Site>,
     /// Whether it holds a seat ([`Seats`]): it takes part when it is seated and has a site.
@@ -932,12 +1042,17 @@ impl Intake {
             .count()
     }
 
-    /// The sites of the receivers taking part, in key order.
-    pub fn sites(&self) -> impl Iterator<Item = Site> + '_ {
+    /// The receivers taking part, in key order: each site with its reception key.
+    pub fn sites(&self) -> impl Iterator<Item = Sited> + '_ {
         self.receivers
             .values()
             .filter(|known| known.seated)
-            .filter_map(|known| known.site)
+            .filter_map(|known| {
+                known.site.map(|site| Sited {
+                    site,
+                    key: known.key,
+                })
+            })
     }
 
     /// What was refused since the last call.
@@ -945,10 +1060,10 @@ impl Intake {
         std::mem::take(&mut self.dropped)
     }
 
-    /// A receiver's description (verified here: it is the receiver's own word). An error is one
-    /// that does not verify.
-    pub fn describe(&mut self, info: &ReceiverInfo) -> Result<Description, String> {
-        self.describe_after(info, None)
+    /// A receiver's site-bearing record (verified here: it is the receiver's own word). An error
+    /// is one that does not verify.
+    pub fn describe(&mut self, record: &SiteRecord) -> Result<Description, String> {
+        self.describe_after(record, None)
     }
 
     /// As `describe`, at a step of a holder whose earlier steps are not all done: what a receiver
@@ -958,7 +1073,7 @@ impl Intake {
     /// step. `None`: everything it held here goes now.
     pub fn describe_after(
         &mut self,
-        info: &ReceiverInfo,
+        record: &SiteRecord,
         kept: Option<i64>,
     ) -> Result<Description, String> {
         let ignored = Description {
@@ -966,34 +1081,40 @@ impl Intake {
             left: Vec::new(),
             moved: Vec::new(),
         };
-        let key = info.receiver().map_err(|error| error.to_string())?;
-        info.verify()
-            .map_err(|error| format!("receiver info of {key}: {error}"))?;
+        let key = record.receiver().map_err(|error| error.to_string())?;
+        record
+            .verify()
+            .map_err(|error| format!("site of {key}: {error}"))?;
         // A format this build cannot read says nothing it can use.
-        let Ok(content) = info.content() else {
+        let Ok(content) = record.content() else {
             return Ok(ignored);
         };
         if let Some(known) = self.receivers.get(&key)
-            && (known.issued_ms, known.bytes.as_slice()) >= (content.issued_ms, info.as_bytes())
+            && (known.issued_ms, known.bytes.as_slice()) >= (content.issued_ms, record.as_bytes())
         {
             return Ok(ignored);
         }
-        let site = self.site(key, content.location, content.clock);
+        let (id, reception_key) = (record.site_id(), record.reception_key());
+        let site = self.site(key, content.location, content.clock, id);
         let fresh = !self.receivers.contains_key(&key);
         let known = self.receivers.entry(key).or_insert_with(|| Described {
             issued_ms: 0,
             bytes: Vec::new(),
             location: None,
             clock: content.clock,
+            id,
+            key: reception_key,
             site: None,
             seated: false,
             boots: VecDeque::new(),
         });
         let was = known.taking_part();
         known.issued_ms = content.issued_ms;
-        known.bytes = info.as_bytes().to_vec();
+        known.bytes = record.as_bytes().to_vec();
         known.location = content.location;
         known.clock = content.clock;
+        known.id = id;
+        known.key = reception_key;
         known.site = site;
         let changed = self
             .seats
@@ -1092,7 +1213,7 @@ impl Intake {
             .map(|(key, known)| {
                 (
                     *key,
-                    self.site(*key, known.location, known.clock),
+                    self.site(*key, known.location, known.clock, known.id),
                     known.taking_part(),
                 )
             })
@@ -1142,8 +1263,15 @@ impl Intake {
         self.orphans.clear();
     }
 
-    /// The site a declared location and clock give, if the receiver takes part.
-    fn site(&self, key: PublicKey, location: Option<Location>, clock: Clock) -> Option<Site> {
+    /// The site a declared location and clock give, if the receiver takes part, named by its
+    /// record's site id.
+    fn site(
+        &self,
+        key: PublicKey,
+        location: Option<Location>,
+        clock: Clock,
+        id: SiteId,
+    ) -> Option<Site> {
         let regions = self.regions.as_ref()?;
         let location = location?;
         let inside = regions.is_empty() || regions.covers(&location);
@@ -1152,6 +1280,7 @@ impl Intake {
             receiver: key,
             clock,
             location,
+            id,
         })
     }
 
@@ -1641,7 +1770,8 @@ mod tests {
     {
         let one = Identity::from_seed([31; 32]);
         let other = Identity::from_seed([32; 32]);
-        let describe = |identity: &Identity, issued_ms: u64, software: &str| {
+        // An old feeder's format 1 description and a new feeder's site are ordered alike.
+        let described = |identity: &Identity, issued_ms: u64, software: &str| {
             ReceiverInfo::sign(
                 identity,
                 &tally_wire::batch::ReceiverInfoContent {
@@ -1652,12 +1782,25 @@ mod tests {
                     relays: Vec::new(),
                 },
             )
+            .map(SiteRecord::Info)
+            .map_err(|error| error.to_string())
+        };
+        let sited = |identity: &Identity, issued_ms: u64| {
+            ReceiverSite::sign(
+                identity,
+                &tally_wire::ReceiverSiteContent {
+                    issued_ms,
+                    location: place_at(374_100_000, -1_221_000_000),
+                    clock: Clock::Dump1090,
+                },
+            )
+            .map(SiteRecord::Site)
             .map_err(|error| error.to_string())
         };
         // The older one is stamped last: by its stamp alone it would apply last, over the newer.
-        let older = describe(&one, 10, "an older and much longer description")?;
-        let newer = describe(&one, 11, "newer")?;
-        let theirs = describe(&other, 5, "x")?;
+        let older = described(&one, 10, "an older and much longer description")?;
+        let newer = sited(&one, 11)?;
+        let theirs = sited(&other, 5)?;
         for order in [[0, 1, 2], [1, 0, 2], [2, 1, 0], [2, 0, 1]] {
             let all = [
                 (1_400, older.clone()),
