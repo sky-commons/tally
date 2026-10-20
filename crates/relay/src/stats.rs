@@ -176,6 +176,7 @@ mod tests {
         )
         .map_err(text)?;
         hub.publish_info(9, info, key, 5, Some(location), false);
+        hub.opened(&key, 9, None);
         for sequence in [0, 1, 3] {
             hub.publish_batch(9, batch(&receiver, sequence)?, key);
         }
@@ -222,6 +223,43 @@ mod tests {
 
         let stranger = Identity::generate().map_err(text)?.public();
         let (status, _) = get(address, &format!("/stations/{}", stranger.to_base64url())).await?;
+        assert_eq!(status, 404);
+
+        // A feeder connected whose decoder sends nothing: listed and served as connected with
+        // nothing forwarded, and placed nowhere though its description declares a place.
+        let silent = Identity::generate().map_err(text)?;
+        let quiet = silent.public();
+        let described = ReceiverInfo::sign(
+            &silent,
+            &ReceiverInfoContent {
+                issued_ms: 5,
+                location: Some(location),
+                clock: Clock::Dump1090,
+                software: "tally-feed 0.3.0".to_owned(),
+                relays: Vec::new(),
+            },
+        )
+        .map_err(text)?;
+        hub.publish_info(10, described, quiet, 5, Some(location), false);
+        hub.opened(&quiet, 10, None);
+        let (status, body) = get(address, &format!("/stations/{}", quiet.to_base64url())).await?;
+        assert_eq!(status, 200, "{body}");
+        let one: StationReport = serde_json::from_str(&body).map_err(text)?;
+        assert_eq!(
+            (one.online, one.connected, one.batches, one.location),
+            (false, true, 0, None)
+        );
+        assert!(one.connected_since_ms.is_some());
+        let (_, body) = get(address, "/stations").await?;
+        let all: StationsReport = serde_json::from_str(&body).map_err(text)?;
+        assert_eq!(all.stations.len(), 2);
+        assert!(
+            all.stations
+                .iter()
+                .all(|station| station.key != quiet.to_base64() || station.location.is_none())
+        );
+        hub.left(&quiet, 10);
+        let (status, _) = get(address, &format!("/stations/{}", quiet.to_base64url())).await?;
         assert_eq!(status, 404);
         let (status, _) = get(address, "/stations/not-a-key").await?;
         assert_eq!(status, 400);

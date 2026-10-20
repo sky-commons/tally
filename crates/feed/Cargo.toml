@@ -18,6 +18,8 @@ path = "src/main.rs"
 
 [dependencies]
 getrandom.workspace = true
+# A container's root becomes its unprivileged user (src/privilege.rs).
+libc.workspace = true
 tally-wire.workspace = true
 tokio.workspace = true
 

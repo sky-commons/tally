@@ -1,0 +1,14 @@
+{
+  "now_ms": 1791220000250,
+  "key": "6kpsY+KcUgq+9VB7Ey7F+ZVHdq6+vnuSQh7qaRRG0iw=",
+  "online": false,
+  "state": "offline",
+  "connected_since_at_ms": null,
+  "first_seen_at_ms": 1791216400250,
+  "last_seen_at_ms": 1791219400250,
+  "messages_per_sec": 0.0,
+  "batches": 9001,
+  "gaps": 3,
+  "location": { "lat": 37.5395, "lon": -122.2836 },
+  "software": "tally-feed 0.3.1"
+}

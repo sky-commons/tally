@@ -4,6 +4,13 @@ load("@rules_rust//rust:defs.bzl", "rust_test", "rustfmt_test")
 # --check-seeds FILE`, which reads a seed list as an install does).
 exports_files(["install.sh"])
 
+# The release's seed list, which the feeder compiles in (`crates/feed`, `config::SEEDS`) and the
+# release publishes beside the binaries for the installer: one list.
+exports_files(
+    ["seeds"],
+    visibility = ["//crates/feed:__pkg__"],
+)
+
 # Until a release pipeline publishes Tally's releases (RFC-0180 phase 1), the installer names no
 # release and no seed list: it stops saying how to pass both (`TALLY_RELEASE`, `TALLY_SEEDS`).
 rust_test(
