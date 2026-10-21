@@ -1,18 +1,19 @@
-# A release (RFC-0180 §4): a tag vX.Y.Z builds the feeder, the relay and the API for x86_64 and
-# aarch64, and the feeder alone for armv7 (32-bit Raspberry Pi OS, the PiAware image), optimised
-# and against the pinned sysroots, tests them, and publishes them on the tag's GitHub
-# release with the systemd units, the seed list and the installer (its PUBLISHED_RELEASE written to
-# this release), each with its .sha256, a cosign keyless signature bundle (.sigstore.json, the
-# identity this workflow on this repository's tag) and the build's provenance attestation. It then
-# pushes the feeder's container image (packaging/container/Dockerfile), for amd64, arm64 and
-# arm/v7, built from those same binaries, to ghcr.io/sky-commons/tally-feed:<tag> and to its major
-# tag (:0 for every 0.x release, :1 for 1.x), signs its digest the same way, attests its
-# provenance in the registry, and names the digest in the release (tally-feed-image.txt and the
-# notes), so a host that pins the image by digest pins what this release built. Both tags name
-# the one digest, so the one signature and attestation cover both; the major tag moves to each
-# new release of its major, which is what a compose file that names it follows. The map
-# bundle (packaging/map/Dockerfile, RFC-0187 §1) is built, pushed to
-# ghcr.io/sky-commons/tally-map:<tag>, signed, attested and named (tally-map-image.txt) the same way.
+# A release (RFC-0180 §4): a tag vX.Y.Z builds the feeder, the relay, the API and the map's ACARS
+# collector for x86_64 and aarch64, and the feeder alone for armv7 (32-bit Raspberry Pi OS, the
+# PiAware image), optimised and against the pinned sysroots, tests them, and publishes them on the
+# tag's GitHub release with the systemd units, the seed list and the installer (its
+# PUBLISHED_RELEASE written to this release), each with its .sha256, a cosign keyless signature
+# bundle (.sigstore.json, the identity this workflow on this repository's tag) and the build's
+# provenance attestation. It then pushes the feeder's container image
+# (packaging/container/Dockerfile), for amd64, arm64 and arm/v7, built from those same binaries, to
+# ghcr.io/sky-commons/tally-feed:<tag> and to its major tag (:0 for every 0.x release, :1 for 1.x),
+# signs its digest the same way, attests its provenance in the registry, and names the digest in the
+# release (tally-feed-image.txt and the notes), so a host that pins the image by digest pins what
+# this release built. Both tags name the one digest, so the one signature and attestation cover
+# both; the major tag moves to each new release of its major, which is what a compose file that
+# names it follows. The map bundle (packaging/map/Dockerfile, RFC-0187 §1) is built, pushed to
+# ghcr.io/sky-commons/tally-map:<tag>, signed, attested and named (tally-map-image.txt) the same
+# way.
 #
 # Check a download:
 #   sha256sum -c tally-feed-aarch64-linux.sha256
@@ -90,9 +91,10 @@ jobs:
         run: |
           set -euo pipefail
           mkdir dist
-          # Every program for the 64-bit platforms; the feeder alone for 32-bit ARM, where only
-          # receivers run.
-          for build in x86_64:tally-feed,tally-relay,tally-api aarch64:tally-feed,tally-relay,tally-api \
+          # Every program for the 64-bit platforms (tally-acars-collect for the map image); the
+          # feeder alone for 32-bit ARM, where only receivers run.
+          for build in x86_64:tally-feed,tally-relay,tally-api,tally-acars-collect \
+            aarch64:tally-feed,tally-relay,tally-api,tally-acars-collect \
             armv7:tally-feed; do
             arch="${build%%:*}"
             IFS=, read -ra bins <<< "${build#*:}"
@@ -184,11 +186,13 @@ jobs:
           subject-digest: ${{ steps.image.outputs.digest }}
           push-to-registry: true
       # v7.4.0, pinned by commit. Its context is packaging/map; every input it fetches is pinned
-      # there by digest, version or sha256.
+      # there by digest, version or sha256, and tally-acars-collect is the binary signed above,
+      # from the build context `dist`.
       - id: map-image
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc
         with:
           context: packaging/map
+          build-contexts: dist=dist
           file: packaging/map/Dockerfile
           platforms: linux/amd64,linux/arm64
           push: true

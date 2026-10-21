@@ -4,7 +4,12 @@
 # linux/arm64 on its tag and pushes it as ghcr.io/sky-commons/tally-map:<tag>, signed like
 # tally-feed's image.
 #
-#   docker buildx build --platform linux/amd64,linux/arm64 -f packaging/map/Dockerfile packaging/map
+#   docker buildx build --platform linux/amd64,linux/arm64 --build-context dist=dist \
+#     -f packaging/map/Dockerfile packaging/map
+#
+# The one program of ours in it, tally-acars-collect (crates/acars-collect), is never built here:
+# it comes from the build context `dist`, a directory holding tally-acars-collect-ARCH-linux. The
+# release passes its own dist/, the signed binaries; packaging/tests/map.sh one Bazel just built.
 #
 # Every input is pinned: the Debian base by digest, Debian's packages by a snapshot of the archive
 # (and of its security updates) at one date and readsb, nginx, its Lua module, lua-cjson and tini
@@ -56,6 +61,18 @@ ARG STATICMAP_SHA256=f4ffc40ee4502b92e91045e0df85a46a2fd68483b4e7e404a6b545fd739
 # every package above stays installable at its version after Debian moves on. A snapshot's
 # Release files are past their Valid-Until, which is expected of a snapshot and nothing else.
 ARG DEBIAN_SNAPSHOT=20261005T000000Z
+
+# Docker names the architecture amd64 or arm64, the release x86_64 or aarch64: a stage each, and
+# `FROM collect-${TARGETARCH}` picks one (packaging/container/Dockerfile says why).
+ARG TARGETARCH
+
+FROM scratch AS collect-amd64
+COPY --from=dist tally-acars-collect-x86_64-linux /tally-acars-collect
+
+FROM scratch AS collect-arm64
+COPY --from=dist tally-acars-collect-aarch64-linux /tally-acars-collect
+
+FROM collect-${TARGETARCH} AS collect
 
 # The web root and the database are the same bytes for every platform, so they are made once,
 # on the build's own platform, with no emulation.
@@ -171,6 +188,7 @@ RUN set -eu; \
   rm -rf /tmp/staticmap /tmp/staticmap.whl; \
   python3 -E -s /usr/local/lib/tally-map/preview.py card /usr/local/share/tally-map/card.jpg
 COPY --chmod=0755 entrypoint.sh /usr/local/bin/tally-map
+COPY --from=collect --chmod=0755 /tally-acars-collect /usr/local/bin/tally-acars-collect
 COPY README.md /usr/local/share/tally-map/README.md
 
 LABEL org.opencontainers.image.source="https://github.com/sky-commons/tally" \

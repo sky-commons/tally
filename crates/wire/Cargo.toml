@@ -16,6 +16,9 @@ ed25519-dalek.workspace = true
 getrandom.workspace = true
 h3o.workspace = true
 miniz_oxide.workspace = true
+# An ACARS-family decoder's line, projected to the one flat schema (src/acars.rs).
+serde.workspace = true
+serde_json.workspace = true
 snow.workspace = true
 thiserror.workspace = true
 tokio.workspace = true

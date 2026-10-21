@@ -311,6 +311,8 @@ async fn a_receivers_frames_reach_both_outputs_signed_and_unchanged() -> Result 
         key: Key::File(key_file),
         source: source.to_string(),
         uat: None,
+        acars: Vec::new(),
+        acars_ceiling: tally_feed::source::DEFAULT_ACARS_CEILING,
         relays: vec![RelayAddress {
             key: relay.key,
             address: relay.address.to_string(),
@@ -412,6 +414,134 @@ async fn a_receivers_frames_reach_both_outputs_signed_and_unchanged() -> Result 
 
     // The feeder's signed description names the relay it publishes to (above, `named`): what a
     // relay's credit counts it by (RFC-0174 §2.1).
+    let _ = std::fs::remove_dir_all(dir);
+    Ok(())
+}
+
+/// A stand-in acars_router serving `lines` on its TCP output, one a line, to whoever connects, again
+/// every 100 ms: a batch sealed before the feeder's session is up is gone (as for [`readsb`]), and
+/// the relay forwards a message it has already forwarded once.
+async fn acars_router(lines: &'static str) -> Result<SocketAddr> {
+    let listener = TcpListener::bind("127.0.0.1:0").await.map_err(text)?;
+    let address = listener.local_addr().map_err(text)?;
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                while stream.write_all(lines.as_bytes()).await.is_ok() {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            });
+        }
+    });
+    Ok(address)
+}
+
+/// acarsdec's, dumpvdl2's and dumphfdl's own lines, as acars_router serves them (shortened from
+/// crates/feed/testdata, which cites each), go from a feeder's `--acars` through the relay to its
+/// `--acars-out` in the one flat schema: the station, its signal, its frequency, its clock past the
+/// second and the decoders' frame trees never leave it, and a frame with no ACARS (a ground
+/// station's XID), a block acarsdec is still reassembling or a block with more to follow is never
+/// published.
+#[tokio::test]
+async fn a_decoders_messages_reach_acars_out_without_the_receivers_fields() -> Result {
+    const LINES: &str = concat!(
+        r#"{"timestamp":1516206744.1849549,"station_id":"XX","channel":2,"freq":130.025,"#,
+        r#""level":-22,"error":0,"mode":"2","label":"H1","block_id":"6","ack":false,"#,
+        r##""tail":".N842UA","flight":"UA1412","msgno":"D04G","text":"#DFB"}"##,
+        "\n",
+        r#"{"timestamp":1516206745.1,"mode":"2","label":"H1","block_id":"8","ack":false,"#,
+        r#""tail":".N842UA","flight":"UA1412","msgno":"D06A","text":"CD","end":true}"#,
+        "\n",
+        r#"{"timestamp":1516206745.5,"mode":"2","label":"H1","block_id":"7","ack":false,"#,
+        r#""tail":".N842UA","flight":"UA1412","msgno":"D05A","text":"AB","assstat":"in progress"}"#,
+        "\n",
+        r#"{"vdl2":{"app":{"name":"dumpvdl2","ver":"2.1.1"},"station":"XX","freq":136975000,"#,
+        r#""sig_level":-20.8,"t":{"sec":1645287903,"usec":757630},"#,
+        r#""avlc":{"src":{"addr":"281658","type":"Ground station"},"xid":{"type":"GSIF"}}}}"#,
+        "\n",
+        r#"{"vdl2":{"app":{"name":"dumpvdl2","ver":"2.5.1"},"station":"XX","sig_level":-16.6,"#,
+        r#""t":{"sec":1769990648,"usec":949234},"avlc":{"src":{"addr":"ABFDAF","type":"Aircraft"},"#,
+        r#""dst":{"addr":"1144AA","type":"Ground station"},"acars":{"crc_ok":true,"more":false,"#,
+        r#""reg":".N8719Q","mode":"2","label":"H1","blk_id":"3","ack":"!","flight":"WN2340","#,
+        r#""msg_num":"D09","msg_num_seq":"A","msg_text":"ABS"}}}}"#,
+        "\n",
+        r#"{"hfdl":{"app":{"name":"dumphfdl","ver":"1.7.0"},"freq":17919000,"#,
+        r#""sig_level":-9.873339,"station":"CS-KABQ-HFDL","t":{"sec":1769991943,"usec":852110},"#,
+        r#""lpdu":{"dst":{"type":"Aircraft","id":223,"ac_info":{"icao":"A9CFF8"}},"#,
+        r#""src":{"type":"Ground station","id":1,"name":"San Francisco, California"},"#,
+        r#""hfnpdu":{"acars":{"more":false,"reg":".N731NK","mode":"2","label":"_d","blk_id":"D","#,
+        r#""ack":"3","msg_text":""}}}}}"#,
+        "\n",
+    );
+    let (_, ready) = tokio::sync::watch::channel(false);
+    let source = readsb(Vec::new(), ready).await?;
+    let router = acars_router(LINES).await?;
+    let relay = relay(Hub::new(8, Deadlines::RELAY).serving_acars(1)).await?;
+    let acars = TcpListener::bind("127.0.0.1:0").await.map_err(text)?;
+    let acars_out = acars.local_addr().map_err(text)?;
+    tokio::spawn(link::serve_acars(acars, Arc::clone(&relay.hub)));
+    let mut out = TcpStream::connect(acars_out).await.map_err(text)?;
+
+    let dir = state_dir()?;
+    let key_file = dir.join("key");
+    tally_feed::init(&key_file)?;
+    tokio::spawn(tally_feed::run(Config {
+        key: Key::File(key_file),
+        source: source.to_string(),
+        uat: None,
+        acars: vec![router.to_string()],
+        acars_ceiling: tally_feed::source::DEFAULT_ACARS_CEILING,
+        relays: vec![RelayAddress {
+            key: relay.key,
+            address: relay.address.to_string(),
+        }],
+        seeds: Vec::new(),
+        state_dir: dir.clone(),
+        location: Some(here()),
+        clock: Clock::Dump1090,
+        ceiling: 1_000_000,
+        source_address: None,
+        deflate_level: None,
+    }));
+
+    let expected = HashSet::from([
+        concat!(
+            r#"{"ack":"!","block":"6","flight":"UA1412","kind":"acars","label":"H1","mode":"2","#,
+            r##""msgnum":"D04G","reg":"N842UA","sublabel":"DF","t":1516206744,"##,
+            r##""text":"#DFB"}"##
+        )
+        .to_owned(),
+        concat!(
+            r#"{"ack":"!","block":"3","flight":"WN2340","gs":"1144AA","icao":"ABFDAF","#,
+            r#""kind":"vdl2","label":"H1","mode":"2","msgnum":"D09A","#,
+            r#""reg":"N8719Q","t":1769990648,"text":"ABS"}"#
+        )
+        .to_owned(),
+        concat!(
+            r#"{"ack":"3","block":"D","gs":"1","kind":"hfdl","label":"_d","#,
+            r#""mode":"2","reg":"N731NK","t":1769991943}"#
+        )
+        .to_owned(),
+    ]);
+    let mut heard = HashSet::new();
+    let mut pending = Vec::new();
+    let mut buffer = vec![0; 64 * 1024];
+    while heard.len() < expected.len() {
+        let length = tokio::time::timeout(Duration::from_secs(60), out.read(&mut buffer))
+            .await
+            .map_err(|_| format!("acars-out sent nothing for 60 s after {heard:?}"))?
+            .map_err(text)?;
+        if length == 0 {
+            return Err(format!("acars-out closed after {heard:?}"));
+        }
+        pending.extend_from_slice(&buffer[..length]);
+        while let Some(end) = pending.iter().position(|byte| *byte == b'\n') {
+            let line: Vec<u8> = pending.drain(..=end).collect();
+            let line = String::from_utf8(line[..end].to_vec()).map_err(text)?;
+            assert!(expected.contains(&line), "acars-out wrote {line}");
+            heard.insert(line);
+        }
+    }
     let _ = std::fs::remove_dir_all(dir);
     Ok(())
 }

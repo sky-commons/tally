@@ -52,6 +52,7 @@ services:
     stop_grace_period: 30s # readsb writes its state on the way down
     environment:
       TALLY_MAP_BEAST: 127.0.0.1:30105 # tally-relay --beast-out 127.0.0.1:30105
+      TALLY_MAP_ACARS: 127.0.0.1:30106 # tally-relay --acars-out 127.0.0.1:30106, for the archives
       TALLY_MAP_API: https://api.example.org # tally-api, for routes
       TALLY_MAP_MAX_UPLOAD: 2Mbit/s # the most the map sends a second, all visitors together
     volumes:
@@ -64,7 +65,8 @@ volumes:
 
 ```sh
 tally-relay --key /etc/tally/relay.key --max-upload 6Mbit/s \
-  --listen 0.0.0.0:10900 --beast-out 127.0.0.1:30105 --stats-listen 127.0.0.1:10901
+  --listen 0.0.0.0:10900 --beast-out 127.0.0.1:30105 --acars-out 127.0.0.1:30106 \
+  --stats-listen 127.0.0.1:10901
 tally-api --relay-stats http://127.0.0.1:10901 --readsb http://127.0.0.1:30152 \
   --relay 127.0.0.1:10900=<relay key> --listen 127.0.0.1:10902
 ```
@@ -84,6 +86,8 @@ gh attestation verify oci://ghcr.io/sky-commons/tally-map:vX.Y.Z --repo sky-comm
 | Variable                       | Default           | What it is                                                                                                                                       |
 | ------------------------------ | ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `TALLY_MAP_BEAST`              | `127.0.0.1:30105` | The relay's `--beast-out`, `HOST:PORT` (or readsb's `HOST,PORT`). readsb dials it and redials every 5 s while it is down.                        |
+| `TALLY_MAP_ACARS`              | unset             | The relay's `--acars-out`, `HOST:PORT`: each ACARS, VDL2 and HFDL message, copies merged, filed into its UTC day's archive (below). Unset, none. |
+| `TALLY_MAP_ACARS_DAY_MAX`      | `268435456`       | The most bytes of ACARS lines kept for one day; past it the rest of the day's are dropped. As it is packed, it takes three times that on disk.   |
 | `TALLY_MAP_TITLE`              | `Tally`           | The page's title, and the site a preview names.                                                                                                  |
 | `TALLY_MAP_API`                | unset             | The `tally-api` origin (`https://host[:port]`, no path). The map asks it for routes at `/api/0/routeset`. Unset, routes are off.                 |
 | `TALLY_MAP_URL`                | unset             | The map's public origin (`https://host[:port]`), which a preview's links name in full. Unset, `https://` and the host asked for.                 |
@@ -246,8 +250,8 @@ requests for the pictures, nginx's Lua module for the tags), 21 MB of the pull.
   volume is created owned by the image's user (`readsb`); a bind-mounted directory must be
   writable by that user's uid (`docker run --rm --entrypoint id ghcr.io/sky-commons/tally-map:vX.Y.Z`).
 
-Its three processes (readsb, nginx and the archiver below) run as `readsb`, not root. If any
-exits, the others are stopped and the container exits with a failure, so the restart policy
+Its processes (readsb, nginx, the archiver and the ACARS collector below) run as `readsb`, not
+root. If any exits, the others are stopped and the container exits with a failure, so the restart policy
 brings them back together.
 
 ## The daily archives
@@ -263,6 +267,47 @@ the relay's host:
   heatmap files inside, each already compressed, so the tar is not), with `ATTRIBUTION` (the data's
   licence, the ODbL, and the aircraft database's, below) and `LICENSE-aircraft-database` added at
   its root. Beside it, `YYYY-MM-DD.tar.sha256`, `sha256sum`'s line for it.
+- With `TALLY_MAP_ACARS` set, the collector (`tally-acars-collect`, crates/acars-collect) reads
+  the relay's `--acars-out`, where every line is one ACARS message in the wire's one flat schema
+  (`tally_wire::acars`: the aircraft's address, registration and flight, the ground station, the
+  message's label, sublabel, block, number, mode and acknowledgement, its text and
+  its time to the second, each spelled as libacars spells it; no decoder's frame tree or libacars
+  decode, which differ by decoder, version and setting). Every receiver's copy of a message is
+  the same line but for its time (RFC-0187 §3 says where it is not: a message reassembled by one
+  receiver and not another), so the collector holds each message 30 s
+  from its first copy's arrival, counts every copy that comes meanwhile, and writes it once, timed
+  at the median of the copies' seconds (with an even count, the floor of the mean of the middle
+  two), so no one receiver's clock shows; the earliest second would always be the slowest
+  clock's. A copy that comes after its message is written is dropped and counted for the next
+  5 minutes. It files each message into the UTC day of its own time, `YYYY/MM/DD/acars.jsonl` (no
+  `acars.*` file is served at `/globe_history/`), dropping one more than 5 minutes from its
+  arrival, and never writes a day from 01:10 UTC the next or once it is packed (its lines are
+  dropped and counted in the log); a line a crash cut short is cut off when the file is next
+  opened. What a day missed goes in its `acars.gaps`, one `FROM TO WHY` a line in Unix seconds,
+  written as a gap opens (`TO` is `-`) and again once it closes: `down` while the relay was not
+  read (from the last time it was, which the collector keeps in `archive/.acars-read` about once a
+  minute, never later than the oldest message it holds, and as it stops, until it connects again; at start, before the archiver runs, over every
+  day still on the volume and not packed), `write` from the first line it could not write to the
+  next it could, `full` while new messages were dropped because 8 MiB of them were already held,
+  `skew` while messages came timed more than 5 minutes from their arrival (a clock is wrong),
+  `cap` once the day reached `TALLY_MAP_ACARS_DAY_MAX`; a gap never closed ran to the day's end.
+  A `down` or `skew` gap is in every day a message arriving in it may be filed in, from 5 minutes
+  before it to 5 minutes after, so a gap just past midnight is the day before's too. The
+  archiver sorts the day by each message's own time, keeping only lines in the schema and a
+  message once in any 5 minutes (its earliest line: a restart can write one twice), and
+  compresses it into that day's tar as `acars.jsonl.gz` (written under a temporary name and
+  renamed before the `.jsonl` is removed, so a day holding both is a pack cut short, and its
+  `.jsonl` is packed again); a day with an `acars.gaps` is packed as partial, the file with it.
+- **What ACARS costs:** the collector holds at most 8 MiB of messages waiting for their copies and
+  65,536 written messages' keys (`tally_acars_collect::COLLECT_MEMORY`, about 12.5 MiB, its
+  bookkeeping measured), and peaked at 14.0 MiB resident with both full. The sort is an external
+  merge, its runs in `archive/.sorting` on the volume (never served), and holds at most 16.7 MiB
+  (`tally_acars_collect::SORT_MEMORY`: a run, three line buffers, its read and write buffers, and
+  the keys of the last 5 minutes' messages, at most 65,536) whatever the day's size (a 120 MB day
+  peaked at 13.5 MiB resident, and 17.5 MiB with 65,536 keys held); so ACARS adds about 32 MiB to
+  the container's memory, both processes included. On disk, a day's file is at most
+  `TALLY_MAP_ACARS_DAY_MAX`, and three times that while it is sorted (the file, the runs, and the
+  run they merge into).
 - A day whose 00:55 UTC the container's readsb did not run through (it started after) may lack
   its last traces, so it is archived as `YYYY-MM-DD.partial.tar` (and `.partial.tar.sha256`)
   instead: still useful, never mistaken for a whole day. A day a stopped container missed is

@@ -5,7 +5,8 @@
 //! Every write has a deadline: a Noise `Writer::send` fails with `WireError::Timeout` after
 //! `noise::WRITE_TIMEOUT`, leaving the writer mid-frame, and like any send error here that ends the
 //! link (a subscriber's, an engine's, a feeder's greeting and heartbeats, an accepted relay's, an
-//! upstream's, which then redials). A beast-out client's writes are held to `BEAST_WRITE_TIMEOUT`.
+//! upstream's, which then redials). A beast-out or acars-out client's writes are held to
+//! `LOCAL_WRITE_TIMEOUT`.
 //! A peer that heartbeats but never reads therefore holds its slot no longer than the deadline.
 //!
 //! Every stream is an `egress::Socket`, so every byte written is counted and held to the upload cap.
@@ -57,9 +58,9 @@ const DUMP_BYTES: usize = 256 * 1024;
 /// last one took effect: however fast a peer resubscribes, the relay answers it at most once a
 /// second, and the latest subscription always wins. The first change after joining is immediate.
 pub const SUBSCRIBE_EVERY: Duration = Duration::from_secs(1);
-/// How long one write to a beast-out client may take before the client is dropped: the same
-/// deadline as a Noise session's.
-const BEAST_WRITE_TIMEOUT: Duration = noise::WRITE_TIMEOUT;
+/// How long one write to a beast-out or acars-out client may take before the client is dropped: the
+/// same deadline as a Noise session's.
+const LOCAL_WRITE_TIMEOUT: Duration = noise::WRITE_TIMEOUT;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long a peer turned away at capacity (the subscriber cap, or the upload cap) is asked to stay
 /// away.
@@ -2843,51 +2844,125 @@ fn fell_behind(kind: Kind) -> Result<(), Closing> {
     })
 }
 
+/// A loopback output of every reception in a local decoder's own format, unauthenticated and
+/// never billed: plain BEAST (`--beast-out`) or ACARS-family JSON lines (`--acars-out`). Each
+/// writes a reception's client form (`tally_wire::ClientObsView`) and nothing of the receiver
+/// that heard it, since what is decoded from here is published.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LocalOutput {
+    /// Each 1090 MHz reception as a BEAST frame, its counter and signal level zero: what a local
+    /// readsb reads, and through it a public map and `tally-api`.
+    Beast,
+    /// Each ACARS, VDL2 or HFDL message as the feeder published it (only the message, nothing of
+    /// its receiver) and a newline, as acars_router's TCP outputs write them (all three kinds on
+    /// one port): what the map image's collector reads. Each is held to the rule first
+    /// (`tally_wire::acars::line`: exactly its own projection), so a feeder's line that is not
+    /// one message as a feeder publishes it is never written.
+    Acars,
+}
+
+impl LocalOutput {
+    fn flag(self) -> &'static str {
+        match self {
+            Self::Beast => "--beast-out",
+            Self::Acars => "--acars-out",
+        }
+    }
+
+    /// Its listener's gauge, on `GET /listeners`.
+    fn gauge(self) -> &'static str {
+        match self {
+            Self::Beast => "beast-out",
+            Self::Acars => "acars-out",
+        }
+    }
+
+    fn clients(self, hub: &Hub) -> usize {
+        match self {
+            Self::Beast => hub.beast_clients(),
+            Self::Acars => hub.acars_clients(),
+        }
+    }
+
+    /// Appends what it writes of one batch's receptions to `bytes`: the receptions of its kind,
+    /// each in its client form; nothing of any other.
+    fn encode(self, decoded: &tally_wire::Decoded, bytes: &mut Vec<u8>) {
+        let views = decoded.views().map(tally_wire::ClientObsView::from);
+        match self {
+            Self::Beast => {
+                for frame in views.filter_map(|view| view.to_beast()) {
+                    frame.encode_beast(bytes);
+                }
+            }
+            Self::Acars => {
+                for line in views.filter_map(|view| view.to_acars_line()) {
+                    bytes.extend_from_slice(line.as_bytes());
+                    bytes.push(b'\n');
+                }
+            }
+        }
+    }
+}
+
 /// Serves plain BEAST of every reception to whoever connects (a local readsb, which a public map
-/// and `tally-api` read), at most `Hub::beast_clients` at once (`--max-beast-clients`): one past
-/// them is closed as it is accepted (`listeners::Acceptor`, `beast-out` on `GET /listeners`). Each
-/// frame is a reception's client form (`tally_wire::ClientObsView`): its message, with the counter
-/// and signal level zero, since a receiver's counters and signal levels against the aircraft
-/// positions anyone reads place it, and what is decoded from here is published. It is
-/// unauthenticated and never billed, so a listener bound anywhere but loopback is refused before
-/// anything is served (`sockets::loopback_only`), as the stats endpoint's is. Otherwise it returns
-/// only when its listener has accepted nothing for `listeners::STARVED_AFTER`, which ends the
-/// relay.
+/// and `tally-api` read), at most `Hub::beast_clients` at once (`--max-beast-clients`), as
+/// [`serve_local`] serves either output.
 pub async fn serve_beast(listener: TcpListener, hub: Arc<Hub>) -> std::io::Result<Infallible> {
-    crate::sockets::loopback_only(&listener, "--beast-out")?;
+    serve_local(listener, hub, LocalOutput::Beast).await
+}
+
+/// Serves every ACARS, VDL2 and HFDL message as a JSON line to whoever connects (the map image's
+/// collector), at most `Hub::acars_clients` at once (`--max-acars-clients`), as
+/// [`serve_local`] serves either output.
+pub async fn serve_acars(listener: TcpListener, hub: Arc<Hub>) -> std::io::Result<Infallible> {
+    serve_local(listener, hub, LocalOutput::Acars).await
+}
+
+/// Serves `output` to whoever connects, at most its clients at once: one past them is closed as it
+/// is accepted (`listeners::Acceptor`, its gauge on `GET /listeners`). It is unauthenticated and
+/// never billed, so a listener bound anywhere but loopback is refused before anything is served
+/// (`sockets::loopback_only`), as the stats endpoint's is. Otherwise it returns only when its
+/// listener has accepted nothing for `listeners::STARVED_AFTER`, which ends the relay.
+pub async fn serve_local(
+    listener: TcpListener,
+    hub: Arc<Hub>,
+    output: LocalOutput,
+) -> std::io::Result<Infallible> {
+    crate::sockets::loopback_only(&listener, output.flag())?;
     let mut acceptor = crate::listeners::Acceptor::new(
         listener,
-        hub.listeners().gauge("beast-out"),
+        hub.listeners().gauge(output.gauge()),
         Arc::clone(hub.egress()),
         crate::sockets::Role::Subscriber,
     )
-    .capped(hub.beast_clients());
+    .capped(output.clients(&hub));
     loop {
         let (stream, peer) = match acceptor.next().await {
             Ok(accepted) => accepted,
             Err(starved) => return Err(std::io::Error::other(starved.to_string())),
         };
-        let out = hub.listen(hub.connection_id(), Filter::Beast);
+        let out = hub.listen(hub.connection_id(), Filter::Local);
         // It takes data and gives none: a plain subscriber, to the cap.
         stream.link().set_kind(Kind::Taker);
         tokio::spawn(async move {
-            if let Err(error) = beast_client(stream, out, BEAST_WRITE_TIMEOUT).await {
-                eprintln!("tally-relay: beast-out {peer}: {error}");
+            if let Err(error) = local_client(stream, out, LOCAL_WRITE_TIMEOUT, output).await {
+                eprintln!("tally-relay: {} {peer}: {error}", output.gauge());
             }
         });
     }
 }
 
-/// Writes every reception to one client, each write held to `deadline` and granted by the upload
-/// cap as a plain subscriber's (a loopback client, the usual one, is never held to it), at most
-/// `SEND_BYTES` (beyond the batch that crosses it) at a time. The client sends nothing, and the
-/// relay only writes to it, so its end is read for (`listeners::send_only`): a client that hangs
-/// up is let go at once, not at the next write, which may not come while nothing is received.
-/// Ended by the client, it is `Ok`.
-async fn beast_client<S: AsyncRead + AsyncWrite + Unpin>(
+/// Writes every reception of `output`'s kind to one client, each write held to `deadline` and
+/// granted by the upload cap as a plain subscriber's (a loopback client, the usual one, is never
+/// held to it), at most `SEND_BYTES` (beyond the batch that crosses it) at a time. The client
+/// sends nothing, and the relay only writes to it, so its end is read for
+/// (`listeners::send_only`): a client that hangs up is let go at once, not at the next write,
+/// which may not come while nothing is received. Ended by the client, it is `Ok`.
+async fn local_client<S: AsyncRead + AsyncWrite + Unpin>(
     stream: Socket<S>,
     out: Listener,
     deadline: Duration,
+    output: LocalOutput,
 ) -> Result<(), String> {
     let link = stream.link();
     let egress = Arc::clone(stream.egress());
@@ -2911,14 +2986,7 @@ async fn beast_client<S: AsyncRead + AsyncWrite + Unpin>(
                     // Each batch's one decode (`hub::Item::decoded`); the router offers only
                     // batches with one.
                     if let Some(decoded) = item.decoded.as_ref() {
-                        // Each reception in its client form: the message, no counter, no signal
-                        // level.
-                        for frame in decoded
-                            .views()
-                            .filter_map(|view| tally_wire::ClientObsView::from(view).to_beast())
-                        {
-                            frame.encode_beast(&mut bytes);
-                        }
+                        output.encode(decoded, &mut bytes);
                     }
                     holds.push(item.hold());
                 }
@@ -3422,8 +3490,13 @@ mod tests {
         let hub = Arc::new(Hub::new(1, crate::sharing::Deadlines::RELAY).max_upload(roomy()));
         let (unread, far) = tokio::io::duplex(1024);
         let far = hub.egress().socket(far, None);
-        let out = hub.listen(hub.connection_id(), Filter::Beast);
-        let client = tokio::spawn(beast_client(far, out, Duration::from_millis(200)));
+        let out = hub.listen(hub.connection_id(), Filter::Local);
+        let client = tokio::spawn(local_client(
+            far,
+            out,
+            Duration::from_millis(200),
+            LocalOutput::Beast,
+        ));
         let receiver = Identity::generate().map_err(text)?;
         hub.publish_batch(999, batch(&receiver, 0, 200)?, receiver.public());
         let ended = timeout(Duration::from_secs(5), client)
@@ -3433,6 +3506,126 @@ mod tests {
         assert_eq!(ended, Err("write timed out".to_owned()));
         drop(unread);
         Ok(())
+    }
+
+    /// A feeder's ACARS-family lines pass through the relay unchanged: its batch reaches every
+    /// taker as it signed it, acars-out writes each line that is its own projection
+    /// (`tally_wire::acars::line`) and a newline, and nothing else (the 1090 MHz frame of its
+    /// next batch; what a hostile feeder shaped to look like one: a newline, two objects, trailing
+    /// text, a line separator, an unclosed object, a receiver's field, a time past the second, a
+    /// decoder's tree, a key twice); beast-out writes the frame and none of the lines.
+    #[tokio::test]
+    async fn acars_lines_pass_through_unchanged_and_acars_out_writes_each_as_a_line()
+    -> Result<(), String> {
+        use tokio::io::AsyncReadExt;
+        let hub = Arc::new(Hub::new(4, crate::sharing::Deadlines::RELAY).max_upload(roomy()));
+        let everything = hub.listen(u64::MAX, Filter::Everything);
+        let mut readers = Vec::new();
+        for output in [LocalOutput::Acars, LocalOutput::Beast] {
+            let (near, far) = tokio::io::duplex(1 << 16);
+            let far = hub.egress().socket(far, None);
+            let out = hub.listen(hub.connection_id(), Filter::Local);
+            tokio::spawn(local_client(far, out, Duration::from_secs(5), output));
+            readers.push(near);
+        }
+        let good = br#"{"icao":"A1B2C3","kind":"vdl2","label":"H1","t":1696500000}"#;
+        let acars = |data: &[u8]| Observation {
+            format: tally_wire::batch::format::ACARS_JSON,
+            timestamp: 5,
+            signal: 0,
+            data: data.to_vec(),
+        };
+        let frame = Frame::new(FrameKind::ModeSLong, 7, 100, &[0x8d; 14]).map_err(text)?;
+        let receiver = Identity::generate().map_err(text)?;
+        let signed = Batch::sign(
+            &receiver,
+            &BatchContent {
+                boot_id: 1,
+                sequence: 0,
+                counter_epoch: 0,
+                wall_ms: 0,
+                dropped: 0,
+                previous: [0; 32],
+                observations: vec![
+                    acars(good),
+                    acars(b"{\"a\":1}\n{\"forged\":2}"),
+                    acars(b"{\"a\":1}{\"forged\":2}"),
+                    acars(b"{\"a\":1} [2]"),
+                    acars("{\"a\":\"\u{2028}{\\\"forged\\\":2}\"}".as_bytes()),
+                    acars(b"{\"unclosed\":1"),
+                    acars(
+                        "{\"kind\":\"acars\",\"label\":\"H1\",\"t\":1,\"text\":\"\u{85}\"}"
+                            .as_bytes(),
+                    ),
+                    // One message, but not as the feeder publishes it: the receiver's level, the
+                    // time past the second, a decoder's tree, a key twice.
+                    acars(br#"{"kind":"acars","label":"H1","level":-20,"t":1}"#),
+                    acars(br#"{"kind":"vdl2","label":"H1","t":1.5}"#),
+                    acars(br#"{"avlc":{"src":{}},"kind":"vdl2","label":"H1","t":1}"#),
+                    acars(br#"{"kind":"acars","label":"H1","t":1,"text":"x","text":"y"}"#),
+                    acars(good),
+                ],
+            },
+        )
+        .map_err(text)?;
+        let frames = Batch::sign(
+            &receiver,
+            &BatchContent {
+                boot_id: 1,
+                sequence: 1,
+                counter_epoch: 0,
+                wall_ms: 0,
+                dropped: 0,
+                previous: signed.hash(),
+                observations: vec![Observation::from_beast(&frame)],
+            },
+        )
+        .map_err(text)?;
+        assert!(hub.publish_batch(999, signed.clone(), receiver.public()));
+        assert!(hub.publish_batch(999, frames, receiver.public()));
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let forwarded = loop {
+            if let Some(item) = everything.try_recv()
+                && let Record::Batch(batch) = &*item.record
+            {
+                break batch.clone();
+            }
+            if Instant::now() > deadline {
+                return Err("the batch never reached a taker".to_owned());
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        assert_eq!(forwarded.as_bytes(), signed.as_bytes());
+
+        let mut expected = Vec::new();
+        for _ in 0..2 {
+            expected.extend_from_slice(good);
+            expected.push(b'\n');
+        }
+        let mut beast = Vec::new();
+        frame_without_receiver(&frame)?.encode_beast(&mut beast);
+        for (reader, expected) in readers.iter_mut().zip([expected, beast]) {
+            let mut read = vec![0; expected.len()];
+            timeout(Duration::from_secs(10), reader.read_exact(&mut read))
+                .await
+                .map_err(|_| "a local output wrote nothing".to_owned())?
+                .map_err(text)?;
+            assert_eq!(read, expected);
+            // And nothing more.
+            let mut more = [0; 1];
+            assert!(
+                timeout(Duration::from_millis(100), reader.read(&mut more))
+                    .await
+                    .is_err()
+            );
+        }
+        Ok(())
+    }
+
+    /// A frame as a local output writes it: its message, no counter, no signal level.
+    fn frame_without_receiver(frame: &Frame) -> Result<Frame, String> {
+        Frame::new(frame.kind(), 0, 0, frame.message()).map_err(text)
     }
 
     /// Waits (a bounded poll) until `holds` of `hub`'s listener `name` is true of its count of

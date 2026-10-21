@@ -454,6 +454,14 @@ impl Sharing {
         self.queue(out.unwrap_or_default());
     }
 
+    /// A group record a member sent that this relay refused (`Member::refuse`).
+    pub fn refused(&self, record: &Record, cell: Region, product: Streams, now_ms: u64) {
+        let Some(hash) = member::record_hash(record) else {
+            return;
+        };
+        self.with_member(|member| member.refuse(GroupKey::new(cell, product), hash, now_ms));
+    }
+
     /// A chunk of a parity a member sent: held until the parity is whole, then taken in as the
     /// member's parity.
     ///

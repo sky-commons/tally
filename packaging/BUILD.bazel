@@ -22,7 +22,30 @@ rust_test(
     env = {"TALLY_INSTALLER": "$(rootpath install.sh)"},
 )
 
+# The map image's archiver packing a day's ACARS lines (packaging/map/entrypoint.sh archive-pass),
+# with the image's tally-acars-collect, from the time the collector stops writing a day. The
+# script runs on the host's bash, coreutils, findutils, tar and gzip, as the image's Debian has
+# them (the test's `TOOLS`, each checked on PATH first).
+rust_test(
+    name = "map_archive_test",
+    size = "small",
+    srcs = ["tests/map_archive.rs"],
+    data = [
+        "map/entrypoint.sh",
+        "//crates/acars-collect:tally-acars-collect",
+    ],
+    edition = "2024",
+    deps = ["//crates/acars-collect"],
+    env = {
+        "TALLY_ACARS_COLLECT": "$(rootpath //crates/acars-collect:tally-acars-collect)",
+        "TALLY_MAP_ENTRYPOINT": "$(rootpath map/entrypoint.sh)",
+    },
+)
+
 rustfmt_test(
     name = "rustfmt",
-    targets = [":install_test"],
+    targets = [
+        ":install_test",
+        ":map_archive_test",
+    ],
 )

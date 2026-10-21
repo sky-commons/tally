@@ -496,6 +496,9 @@ struct Group {
     /// When the trees last changed, newest last.
     changed_ms: Vec<u64>,
     pieces: BTreeMap<Hash, Held>,
+    /// Records this relay refused (`Member::refuse`), with when: never held or pushed on, and
+    /// counted as had, so a manifest that lists one is whole and no repair asks for it.
+    refused: BTreeMap<Hash, u64>,
     /// The bytes it holds, kept as they change: the encoded bytes of `pieces` and the bytes of
     /// `parity` (`Parity::len`), each charged to the member's gauge before it is held.
     bytes: usize,
@@ -534,6 +537,7 @@ impl Group {
             layout: Layout::new(key.cell, key.product, &[me], &[]),
             changed_ms: Vec::new(),
             pieces: BTreeMap::new(),
+            refused: BTreeMap::new(),
             bytes: 0,
             manifests: BTreeMap::new(),
             parity: BTreeMap::new(),
@@ -705,10 +709,15 @@ impl Group {
 
     fn whole(&self, second: u64) -> bool {
         self.manifests.get(&second).is_some_and(|by_hash| {
-            by_hash.values().all(|listed| {
-                listed.whole || listed.hashes.iter().all(|h| self.pieces.contains_key(h))
-            })
+            by_hash
+                .values()
+                .all(|listed| listed.whole || listed.hashes.iter().all(|h| self.has(h)))
         })
+    }
+
+    /// Whether it holds `hash`, or refused it: either way, nothing to ask for.
+    fn has(&self, hash: &Hash) -> bool {
+        self.pieces.contains_key(hash) || self.refused.contains_key(hash)
     }
 
     /// Holds a piece, counting its bytes, which its caller has charged (`Member::charge`).
@@ -1076,6 +1085,14 @@ impl Member {
             .unwrap_or_default()
     }
 
+    /// A record of `group` this relay refused (a batch of a format it reads that does not decode):
+    /// never held or pushed on, and counted as had until the horizon, so no repair asks for it.
+    pub fn refuse(&mut self, group: GroupKey, hash: Hash, now_ms: u64) {
+        if let Some(group) = self.groups.get_mut(&group) {
+            group.refused.insert(hash, now_ms);
+        }
+    }
+
     pub fn holds(&self, group: GroupKey, hash: &Hash) -> bool {
         self.groups
             .get(&group)
@@ -1234,6 +1251,9 @@ impl Member {
         let Some(group) = self.groups.get_mut(&key) else {
             return Vec::new();
         };
+        if group.refused.contains_key(&hash) {
+            return Vec::new();
+        }
         if let Some(held) = group.pieces.get_mut(&hash) {
             if !held.from.iter().any(|(sender, _)| *sender == from) {
                 held.from.push((from, now_ms));
@@ -1728,7 +1748,9 @@ fn rebuild(
             let missing: Vec<Hash> = listed
                 .hashes
                 .iter()
-                .filter(|hash| !group.pieces.contains_key(*hash))
+                .filter(|hash| {
+                    !group.pieces.contains_key(*hash) && !group.refused.contains_key(*hash)
+                })
                 .copied()
                 .collect();
             let Some(first) = missing.first() else {
@@ -2210,6 +2232,7 @@ fn forget(group: &mut Group, now_ms: u64) -> usize {
     group.manifests = group.manifests.split_off(&horizon_second);
     group.own = group.own.split_off(&horizon_second);
     group.seen.retain(|_, at| *at >= horizon_ms);
+    group.refused.retain(|_, at| *at >= horizon_ms);
     group
         .answered
         .retain(|_, at| *at + ANSWER_INTERVAL_MS > now_ms);

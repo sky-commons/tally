@@ -18,6 +18,9 @@ const DEFAULT_MAX_SUBSCRIBERS: usize = 64;
 /// says: a local decoder or two, with room for one reconnecting while its last is let go.
 const DEFAULT_MAX_BEAST_CLIENTS: usize = 8;
 
+/// Acars-out clients served at once unless `--max-acars-clients` says, as beast-out's.
+const DEFAULT_MAX_ACARS_CLIENTS: usize = 8;
+
 const USAGE: &str = "\
 usage: tally-relay --key FILE [--key FILE]... --max-upload RATE [options]
        tally-relay keygen          print a new key file to stdout and its public key to stderr
@@ -67,6 +70,10 @@ usage: tally-relay --key FILE [--key FILE]... --max-upload RATE [options]
                          (127.0.0.1:PORT or [::1]:PORT) and the relay refuses any other
   --max-beast-clients N  beast-out clients served at once; beyond it a new one is closed as it
                          connects (default 8). Each is planned as a subscriber
+  --acars-out ADDR       serve every ACARS, VDL2 and HFDL message here, one JSON line each as
+                         acars_router's TCP outputs are (all three kinds on one port), for the
+                         map image's daily release. Loopback only, as --beast-out
+  --max-acars-clients N  acars-out clients served at once, as --max-beast-clients (default 8)
   --stats-listen ADDR    serve each receiver's traffic as JSON here (GET /stations,
                          GET /stations/KEY), and the cap and what it carries (GET /egress),
                          for tally-api. It is unauthenticated and names where each feeder
@@ -171,6 +178,8 @@ pub struct Config {
     /// Where the BEAST output is served (`--beast-out`): a loopback address, always
     /// (`parse_loopback`).
     pub beast_out: Option<SocketAddr>,
+    /// Where the ACARS-family lines are served (`--acars-out`): a loopback address, always.
+    pub acars_out: Option<SocketAddr>,
     /// Where the station reports are served (`--stats-listen`): a loopback address, always, since
     /// they name every feeder's address (`parse_loopback`).
     pub stats_listen: Option<SocketAddr>,
@@ -182,6 +191,8 @@ pub struct Config {
     pub max_subscribers: usize,
     /// Beast-out clients served at once (`--max-beast-clients`), where `--beast-out` is given.
     pub max_beast_clients: usize,
+    /// Acars-out clients served at once (`--max-acars-clients`), where `--acars-out` is given.
+    pub max_acars_clients: usize,
     pub max_connections: usize,
     pub max_connections_per_address: usize,
     pub max_feeder_bytes_per_sec: u64,
@@ -312,6 +323,7 @@ impl Config {
             key_files: Vec::new(),
             listen: "0.0.0.0:10900".to_owned(),
             beast_out: None,
+            acars_out: None,
             stats_listen: None,
             upstreams: Vec::new(),
             advertise: Vec::new(),
@@ -319,6 +331,7 @@ impl Config {
             clients: Vec::new(),
             max_subscribers: DEFAULT_MAX_SUBSCRIBERS,
             max_beast_clients: DEFAULT_MAX_BEAST_CLIENTS,
+            max_acars_clients: DEFAULT_MAX_ACARS_CLIENTS,
             max_connections: DEFAULT_MAX_CONNECTIONS,
             max_connections_per_address: DEFAULT_MAX_CONNECTIONS_PER_ADDRESS,
             max_feeder_bytes_per_sec: DEFAULT_MAX_FEEDER_BYTES_PER_SEC,
@@ -343,6 +356,7 @@ impl Config {
                 "--max-upload" => max_upload = Some(Cap::parse(&value()?)?),
                 "--listen" => config.listen = value()?,
                 "--beast-out" => config.beast_out = Some(parse_loopback(&flag, &value()?)?),
+                "--acars-out" => config.acars_out = Some(parse_loopback(&flag, &value()?)?),
                 "--stats-listen" => config.stats_listen = Some(parse_loopback(&flag, &value()?)?),
                 "--upstream" => config.upstreams.push(parse_upstream(&value()?)?),
                 "--advertise" => {
@@ -394,6 +408,11 @@ impl Config {
                     config.max_beast_clients = value()?
                         .parse()
                         .map_err(|_| "--max-beast-clients needs a number".to_owned())?;
+                }
+                "--max-acars-clients" => {
+                    config.max_acars_clients = value()?
+                        .parse()
+                        .map_err(|_| "--max-acars-clients needs a number".to_owned())?;
                 }
                 "--area" => config.areas.push(parse_area(&value()?)?),
                 "--network" => {
@@ -529,12 +548,12 @@ pub fn covers_the_world(areas: &[Region]) -> bool {
     named == tally_wire::Regions::world()
 }
 
-/// The address of `flag` (`--stats-listen`, `--beast-out`), which must be loopback: what each
-/// serves is unauthenticated (the station reports name where each feeder feeds from,
-/// `StationReport::address`; the BEAST output is every reception, uncapped), so a bind anyone else
-/// could reach is refused at start rather than trusted to a firewall. A name is refused too, since
-/// what it resolves to is not known here. Each listener refuses a non-loopback bind again when it
-/// is served (`sockets::loopback_only`).
+/// The address of `flag` (`--stats-listen`, `--beast-out`, `--acars-out`), which must be loopback:
+/// what each serves is unauthenticated (the station reports name where each feeder feeds from,
+/// `StationReport::address`; the BEAST and ACARS outputs are every reception, uncapped), so a bind
+/// anyone else could reach is refused at start rather than trusted to a firewall. A name is
+/// refused too, since what it resolves to is not known here. Each listener refuses a non-loopback
+/// bind again when it is served (`sockets::loopback_only`).
 pub fn parse_loopback(flag: &str, text: &str) -> Result<SocketAddr, String> {
     let address: SocketAddr = text
         .parse()
@@ -896,10 +915,10 @@ mod tests {
     /// The stats listener names every feeder's address and the BEAST output is unauthenticated,
     /// so only loopback is ever bound for either.
     #[test]
-    fn the_stats_listener_and_beast_out_are_loopback_or_the_relay_refuses_to_start()
+    fn the_stats_listener_beast_out_and_acars_out_are_loopback_or_the_relay_refuses_to_start()
     -> Result<(), String> {
         for loopback in ["127.0.0.1:10901", "127.8.9.10:1", "[::1]:10901"] {
-            for flag in ["--stats-listen", "--beast-out"] {
+            for flag in ["--stats-listen", "--beast-out", "--acars-out"] {
                 assert!(
                     parse_loopback(flag, loopback)?.ip().is_loopback(),
                     "{flag} {loopback}"
@@ -914,12 +933,12 @@ mod tests {
             "localhost:10901",
             "127.0.0.1",
         ] {
-            for flag in ["--stats-listen", "--beast-out"] {
+            for flag in ["--stats-listen", "--beast-out", "--acars-out"] {
                 let refused = parse_loopback(flag, open).err().unwrap_or_default();
                 assert!(refused.contains(flag), "{open}: {refused}");
             }
         }
-        for flag in ["--stats-listen", "--beast-out"] {
+        for flag in ["--stats-listen", "--beast-out", "--acars-out"] {
             let refused = config(&[
                 "--key",
                 "k",

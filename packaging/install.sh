@@ -108,6 +108,9 @@ MARK_END="# END install.sh"
 # owner's, and moves to TALLY_FEED_EXTRA.
 OWNED_FLAGS=(--relay --lat --lon --alt --uat)
 UAT=127.0.0.1:30978
+# acars_router's TCP outputs, one a kind (AR_SERVE_TCP_ACARS, _VDLM2, _HFDL). Never added: message
+# text is the owner's to publish (README.md, "--acars"), so a run says the flag to add instead.
+ACARS=(127.0.0.1:15550 127.0.0.1:15555 127.0.0.1:15556)
 
 say() { printf 'tally: %s\n' "$*"; }
 stop() {
@@ -741,6 +744,11 @@ main() {
     say "found dump978 (978 MHz UAT) on $UAT"
     args+=(--uat "$UAT")
   fi
+  for acars in "${ACARS[@]}"; do
+    if listening 127.0.0.1 "${acars##*:}"; then
+      say "found acars_router (ACARS, VDL2 or HFDL) on $acars; to publish its messages, which can carry personal data, add --acars $acars to TALLY_FEED_EXTRA in $DEFAULTS"
+    fi
+  done
   args+=(--lat "$lat" --lon "$lon" --alt "$alt")
 
   install -m 0755 "$work/tally-feed-$ARCH-linux" "$BIN"

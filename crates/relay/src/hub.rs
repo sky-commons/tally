@@ -597,6 +597,9 @@ pub struct MemoryReport {
     /// every holder keeps a decode no longer than its deadline, the store being planned for the rate
     /// over the longest of them (`budget::decoded_window_ms`).
     pub decoded_refused: u64,
+    /// Batches a peer forwarded of a format this build reads that did not decode (a relay that
+    /// predates a format forwards it raw): dropped, never forwarded on.
+    pub malformed_batches: u64,
     /// What the ingest rate cut, per source and reason (`shed`): every cut a feeder's batch met,
     /// all at ingest, before it was signed or shared.
     pub shed: crate::shed::ShedReport,
@@ -974,6 +977,8 @@ pub struct Hub {
     over_ceiling_batches: AtomicU64,
     /// Batches let go before their decode for want of room in `Store::Decoded`.
     decoded_refused: AtomicU64,
+    /// A peer's batches of a format this build reads that did not decode (`MemoryReport`).
+    malformed_batches: AtomicU64,
     over_ceiling_receptions: AtomicU64,
     /// The relay-wide ingest rate (`shed`): unbounded until the plan names `R_max`
     /// (`Hub::admitted_rate`).
@@ -1008,6 +1013,9 @@ pub struct Hub {
     /// The beast-out clients served at once (`--max-beast-clients`), none where the relay serves
     /// no beast-out (`Hub::serving_beast`): planned as subscribers are.
     beast_clients: usize,
+    /// The acars-out clients served at once (`--max-acars-clients`), as `beast_clients`
+    /// (`Hub::serving_acars`).
+    acars_clients: usize,
     /// Every listener's connections and accepts (`listeners`, `GET /listeners`).
     listeners: crate::listeners::Listeners,
 }
@@ -1191,6 +1199,7 @@ impl Hub {
             burst_grants: crate::ingest::BurstGrants::default(),
             over_ceiling_batches: AtomicU64::new(0),
             decoded_refused: AtomicU64::new(0),
+            malformed_batches: AtomicU64::new(0),
             over_ceiling_receptions: AtomicU64::new(0),
             shedder: crate::shed::Shedder::unbounded(),
             admitted_rate: None,
@@ -1214,6 +1223,7 @@ impl Hub {
             network,
             members_refused: AtomicU64::new(0),
             beast_clients: 0,
+            acars_clients: 0,
             listeners: crate::listeners::Listeners::default(),
         }
         .replanned()
@@ -1339,11 +1349,13 @@ impl Hub {
         Plan::planned(self.holds_raw)
             .with_feeder_ceiling(self.max_feeder_bytes_per_sec)
             .with_members(members, self.max_member_bytes_per_sec)
-            // A beast-out client takes from the fan-out, holds a subscriber's kernel buffers and
-            // writes from a buffer of its own: a subscriber's session to the plan.
+            // A beast-out or acars-out client takes from the fan-out, holds a subscriber's kernel
+            // buffers and writes from a buffer of its own: a subscriber's session to the plan.
             .with_sessions(
                 self.max_connections,
-                self.max_subscribers.saturating_add(self.beast_clients),
+                self.max_subscribers
+                    .saturating_add(self.beast_clients)
+                    .saturating_add(self.acars_clients),
             )
             .with_cores(self.cores)
     }
@@ -1470,6 +1482,7 @@ impl Hub {
             ingest_queued: self.stages.queued(),
             ingest_refused: self.stages.refused(),
             decoded_refused: self.decoded_refused.load(Ordering::Relaxed),
+            malformed_batches: self.malformed_batches.load(Ordering::Relaxed),
             shed: self.shedder.report(),
             handshakes: self.handshake_report(),
         }
@@ -1719,6 +1732,19 @@ impl Hub {
         self.beast_clients
     }
 
+    /// Serves at most `clients` acars-out clients at once (`--max-acars-clients`, where
+    /// `--acars-out` is given; none otherwise), as `serving_beast` serves beast-out's
+    /// (`link::serve_acars`).
+    pub fn serving_acars(mut self, clients: usize) -> Self {
+        self.acars_clients = clients;
+        self.replanned()
+    }
+
+    /// The acars-out clients served at once (`Hub::serving_acars`).
+    pub fn acars_clients(&self) -> usize {
+        self.acars_clients
+    }
+
     /// Every listener's gauge (`listeners`).
     pub fn listeners(&self) -> &crate::listeners::Listeners {
         &self.listeners
@@ -1726,9 +1752,9 @@ impl Hub {
 
     /// The descriptors the relay may hold at once, by its caps: every connection the plan counts
     /// (those under the connection cap, the dials among them; the member sessions; the
-    /// subscribers and the beast-out clients), every feeder admitted, the stats' connections, and
-    /// what the process holds beside them (`listeners::OTHER_DESCRIPTORS`). What the relay asks
-    /// the kernel for before it serves (`listeners::raise_open_files`).
+    /// subscribers and the beast-out and acars-out clients), every feeder admitted, the stats'
+    /// connections, and what the process holds beside them (`listeners::OTHER_DESCRIPTORS`). What
+    /// the relay asks the kernel for before it serves (`listeners::raise_open_files`).
     pub fn descriptors(&self) -> usize {
         self.budget
             .plan()
@@ -2021,6 +2047,33 @@ impl Hub {
         drop(in_flight);
         let (batch, decoded) = match decoded {
             Ok(decoded) => (decoded.batch().clone(), Some(decoded)),
+            // A format this build reads that does not decode is malformed (an ACARS message in a
+            // format 1 or 2 batch among them, which a relay that predates format 3 would read):
+            // never forwarded raw. Straight from its feeder, the feeder's link ends, as for a
+            // batch that does not verify; from a peer (a relay that predates the format forwards
+            // it raw), it is dropped, counted, and its group counts it as had, so no repair asks
+            // for it again.
+            Err(tally_wire::decoded::NotDecoded::Undecodable(undecodable))
+                if tally_wire::batch::BATCH_FORMATS.contains(&undecodable.batch.format()) =>
+            {
+                match &origin {
+                    Origin::Feeder(..) => {
+                        if let Some(refusal) = refusal {
+                            refusal.refuse(undecodable.error.to_string());
+                        }
+                    }
+                    Origin::Peer(_) => {
+                        self.malformed_batches.fetch_add(1, Ordering::Relaxed);
+                        let record = Record::Batch(undecodable.batch);
+                        self.network
+                            .refused_from_peer(self, &record, stamp.stamp_ms);
+                    }
+                    Origin::Elsewhere => {
+                        self.malformed_batches.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                return false;
+            }
             Err(tally_wire::decoded::NotDecoded::Undecodable(undecodable)) => {
                 (undecodable.batch, None)
             }
@@ -2062,9 +2115,14 @@ impl Hub {
             self.share(&origin, &Record::Batch(batch), stamp.stamp_ms);
             return false;
         }
-        let observations = decoded
-            .as_ref()
-            .map_or(0, |decoded| decoded.observations().len() as u64);
+        // The receptions of the products: an ACARS-family message is none of them.
+        let observations = decoded.as_ref().map_or(0, |decoded| {
+            decoded
+                .observations()
+                .iter()
+                .filter(|observation| tally_wire::batch::format::in_products(observation.format))
+                .count() as u64
+        });
         if let Ok(mut shard) = shard.lock() {
             shard.stations.forwarded(
                 receiver,
@@ -3118,6 +3176,77 @@ mod tests {
             passed += 1;
         }
         assert_eq!(passed, 1);
+        Ok(())
+    }
+
+    /// A batch of a format this build reads that does not decode is malformed (an ACARS message
+    /// relabelled into format 2, which a relay that predates format 3 would put into its
+    /// products), and is never forwarded raw. Signed and checked as a link takes it: straight from
+    /// its feeder, the link is refused; from a peer (a relay that predates the format forwards it
+    /// raw), it is dropped and counted and the link kept. One of a format this build does not read
+    /// is a later build's, and forwarded raw.
+    #[test]
+    fn a_malformed_batch_ends_its_feeders_link_and_a_peers_copy_is_dropped() -> Result<(), String> {
+        let hub = Arc::new(Hub::new(4, crate::sharing::Deadlines::RELAY));
+        let feeder = Identity::generate().map_err(|error| error.to_string())?;
+        let relabelled = |sequence: u64, format: u8| -> Result<Batch, String> {
+            let signed = Batch::sign(
+                &feeder,
+                &BatchContent {
+                    boot_id: 1,
+                    sequence,
+                    counter_epoch: 0,
+                    wall_ms: 0,
+                    dropped: 0,
+                    previous: [0; 32],
+                    observations: vec![Observation {
+                        format: tally_wire::batch::format::ACARS_JSON,
+                        timestamp: 5,
+                        signal: 0,
+                        data: br#"{"kind":"acars","label":"H1","t":1}"#.to_vec(),
+                    }],
+                },
+            )
+            .map_err(|error| error.to_string())?;
+            let bytes = signed.as_bytes();
+            let mut unsigned = bytes[..bytes.len() - tally_wire::key::SIGNATURE_LEN].to_vec();
+            unsigned[0] = format;
+            // What the receiver signs: the batch domain, a zero, the bytes (`batch::domain`).
+            let signature = feeder.sign(&[&b"tally batch\0"[..], &unsigned].concat());
+            unsigned.extend_from_slice(&signature);
+            Batch::from_bytes(unsigned).map_err(|error| error.to_string())
+        };
+        let ingest = |batch: Batch, origin: Origin| {
+            let refusal = Arc::new(crate::ingest::Refusal::default());
+            let kept = hub.ingest(Inbound {
+                source: 1,
+                batch,
+                origin,
+                verify: true,
+                stamp: None,
+                in_flight: InFlight::free(),
+                refusal: Some(Arc::clone(&refusal)),
+            });
+            (kept, refusal.now())
+        };
+        let peer = Origin::Peer(crate::network::Asker {
+            role: crate::network::AskerRole::Relay,
+            key: Identity::generate()
+                .map_err(|error| error.to_string())?
+                .public(),
+            source: 2,
+            loopback: true,
+            address: None,
+        });
+        let deflate = tally_wire::batch::BATCH_FORMAT_DEFLATE;
+        let (kept, refused) = ingest(relabelled(0, deflate)?, Origin::Feeder(None, None, None));
+        assert!(!kept && refused.is_some(), "{refused:?}");
+        let (kept, refused) = ingest(relabelled(1, deflate)?, peer.clone());
+        assert!(!kept && refused.is_none(), "{refused:?}");
+        assert_eq!(hub.memory_report().malformed_batches, 1);
+        // Signed as it is, it is a batch; and one of a later format is forwarded.
+        let (kept, refused) = ingest(relabelled(2, 9)?, peer);
+        assert!(kept && refused.is_none(), "{refused:?}");
         Ok(())
     }
 
