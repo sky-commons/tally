@@ -14,10 +14,10 @@
 //! optional (dump978 omits one that is zero) and their order is not relied on, so a later dump978
 //! adding a field changes nothing here.
 
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use tally_wire::Observation;
 use tally_wire::batch::format;
+
+use crate::lines::{Line, TIMESTAMP_MODULUS};
 
 /// The longest line dump978 writes is an uplink: 865 characters of payload and its fields. A line
 /// past this is not dump978's and is skipped whole.
@@ -26,17 +26,6 @@ pub const MAX_LINE: usize = 2048;
 const DOWNLINK_SHORT: usize = 18;
 const DOWNLINK_LONG: usize = 34;
 const UPLINK: usize = 432;
-const TIMESTAMP_MODULUS: u64 = 1 << 48;
-
-/// What one line of dump978's raw output was.
-#[derive(Debug, PartialEq, Eq)]
-pub enum Line {
-    Reception(Observation),
-    /// Decoder metadata or an empty line: not a reception, and not an error.
-    Ignored,
-    /// Not a reception this feeder can publish faithfully.
-    Bad,
-}
 
 /// One line, without its newline. `now_us` is the feeder's wall clock, used when the line has no
 /// usable `t=`.
@@ -74,15 +63,6 @@ pub fn parse_line(line: &str, now_us: u64) -> Line {
         signal,
         data,
     })
-}
-
-/// The feeder's wall clock in microseconds, for a line that carries none.
-pub fn now_us() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |since| {
-            u64::try_from(since.as_micros()).unwrap_or(u64::MAX)
-        })
 }
 
 fn hex(text: &str) -> Option<Vec<u8>> {
@@ -131,47 +111,6 @@ fn signal_from_dbfs(dbfs: f64) -> u8 {
         return 0;
     }
     amplitude.round().clamp(0.0, 255.0) as u8
-}
-
-/// Splits a byte stream into lines, never holding more than `MAX_LINE` bytes of one: a stream
-/// that is not line shaped is skipped and counted rather than buffered.
-#[derive(Default)]
-pub struct Lines {
-    pending: Vec<u8>,
-    overlong: bool,
-}
-
-impl Lines {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Calls `line` with each complete line in `bytes` (without its newline), and returns how many
-    /// were skipped for being too long or not text.
-    pub fn push(&mut self, bytes: &[u8], mut line: impl FnMut(&str)) -> u64 {
-        let mut skipped = 0;
-        for &byte in bytes {
-            if byte != b'\n' {
-                if self.pending.len() < MAX_LINE {
-                    self.pending.push(byte);
-                } else {
-                    self.overlong = true;
-                }
-                continue;
-            }
-            if self.overlong {
-                skipped += 1;
-            } else {
-                match std::str::from_utf8(&self.pending) {
-                    Ok(text) => line(text),
-                    Err(_) => skipped += 1,
-                }
-            }
-            self.pending.clear();
-            self.overlong = false;
-        }
-        skipped
-    }
 }
 
 #[cfg(test)]
@@ -258,23 +197,5 @@ mod tests {
     fn metadata_and_blank_lines_are_not_receptions() {
         assert_eq!(parse_line("!version=9.0;", 7), Line::Ignored);
         assert_eq!(parse_line("", 7), Line::Ignored);
-    }
-
-    #[test]
-    fn lines_split_across_reads_and_overlong_lines_are_skipped() {
-        let mut lines = Lines::new();
-        let mut seen = Vec::new();
-        let skipped = lines.push(b"-ab;t=1", |line| seen.push(line.to_owned()));
-        assert_eq!((skipped, seen.len()), (0, 0));
-        let skipped = lines.push(b".0;\n!x=1;\n", |line| seen.push(line.to_owned()));
-        assert_eq!(skipped, 0);
-        assert_eq!(seen, ["-ab;t=1.0;", "!x=1;"]);
-        let long = vec![b'a'; MAX_LINE + 10];
-        assert_eq!(lines.push(&long, |_| {}), 0);
-        assert_eq!(
-            lines.push(b"\n\xff\n+ok\n", |line| seen.push(line.to_owned())),
-            2
-        );
-        assert_eq!(seen.last().map(String::as_str), Some("+ok"));
     }
 }

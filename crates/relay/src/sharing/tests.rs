@@ -96,6 +96,9 @@ struct Sim {
     receipts: Vec<(usize, usize, tally_wire::StripeReceipt)>,
     receiver: Identity,
     sequence: u64,
+    /// (member, origin): the member's hub drops every record of that origin it is handed, and
+    /// tells its member so (`Member::refuse`) when the flag says.
+    refusing: Option<(usize, usize, bool)>,
 }
 
 impl Sim {
@@ -136,6 +139,7 @@ impl Sim {
             receipts: Vec::new(),
             receiver: identity(10_000),
             sequence: 0,
+            refusing: None,
         };
         let mut sends = Vec::new();
         for (i, member) in members.iter_mut().enumerate() {
@@ -268,6 +272,19 @@ impl Sim {
                     continue;
                 };
                 if self.down.contains(&event.to) {
+                    continue;
+                }
+                if let (Some((member, origin, tell)), Message::Piece { group, hash, .. }) =
+                    (self.refusing, &event.message)
+                    && member == event.to
+                    && self
+                        .originated
+                        .get(hash)
+                        .is_some_and(|(_, by)| *by == origin)
+                {
+                    if tell {
+                        self.members[member].refuse(*group, *hash, self.now);
+                    }
                     continue;
                 }
                 let from = self.keys[event.from];
@@ -574,6 +591,36 @@ fn seeds_rotate_by_a_rule_anyone_can_check() -> Outcome {
     }
     if !rotated {
         return Err("the seeds never rotated".into());
+    }
+    Ok(())
+}
+
+/// A record this relay's hub refused (a batch of a format it reads that does not decode, from a
+/// relay that forwards it raw) is counted as had: no repair asks for it again, where one only
+/// dropped is asked for every repair interval.
+#[test]
+fn a_refused_record_is_never_asked_for_again() -> Outcome {
+    let mut asked = Vec::new();
+    for tell in [false, true] {
+        let mut sim = Sim::new(8, 20)?;
+        let member = 5;
+        sim.refusing = Some((member, 0, tell));
+        sim.feed(&[0, 1], 3, 4)?;
+        let end = sim.now + 30_000;
+        sim.run_until(end);
+        let lacking = sim
+            .originated
+            .iter()
+            .filter(|(_, (_, origin))| *origin == 0)
+            .filter(|(hash, _)| !sim.members[member].holds(sim.group, hash))
+            .count();
+        if lacking == 0 {
+            return Err("the member holds what its hub refused".into());
+        }
+        asked.push(sim.members[member].stats().repairs_asked);
+    }
+    if !(asked[0] > 0 && asked[1] == 0) {
+        return Err(format!("repairs asked, dropped then refused: {asked:?}"));
     }
     Ok(())
 }

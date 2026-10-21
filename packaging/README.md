@@ -21,10 +21,13 @@ Raspberry Pi OS Bullseye and anything newer).
     Each download is checked against the `.sha256` published beside it, which guards a broken
     download, not a compromised release.
   - **Decoders:** readsb's BEAST output on `127.0.0.1:30005`, and dump978-fa's raw output on
-    `127.0.0.1:30978` (added as `--uat`). Where nothing answers on 30005 but an ultrafeeder
-    container runs, the decoder's output is inside docker and a host install would feed nothing,
-    so it installs nothing and prints the compose service to add instead ("Run it as a container",
-    below), filled in with the container's name and location.
+    `127.0.0.1:30978` (added as `--uat`). acars_router's ACARS, VDL2 and HFDL outputs on
+    `127.0.0.1:15550`, `15555` and `15556` are never added: message text can carry personal data,
+    so publishing it is the owner's choice, and the run prints the `--acars` to put in
+    `TALLY_FEED_EXTRA` for each it finds. Where nothing answers on
+    30005 but an ultrafeeder container runs, the decoder's output is inside docker and a host
+    install would feed nothing, so it installs nothing and prints the compose service to add
+    instead ("Run it as a container", below), filled in with the container's name and location.
   - **Location**, the first found, each printed with where it came from: `TALLY_LAT`, `TALLY_LON`
     and `TALLY_ALT` (metres, or `15m` or `45ft`); adsb.im's `/opt/adsb/config/.env`
     (`FEEDER_LAT`, `FEEDER_LONG`, `FEEDER_ALT_M`); readsb's `--lat` and `--lon`
@@ -155,7 +158,8 @@ That is all of it: no key to make or paste, and no relay to name.
   A named volume works the same. A compose `user:` skips the handover (then the directory must be
   writable by that user).
 - **Flags:** a `command:` list is `tally-feed`'s own flags and wins over the environment, for
-  example `[--uat, dump978:30978]` for a 978 MHz UAT decoder, or `--relay HOST:PORT=KEY` to add a
+  example `[--uat, dump978:30978]` for a 978 MHz UAT decoder, `[--acars, acars_router:15555]` for
+  acars_router's VDL2 output, or `--relay HOST:PORT=KEY` to add a
   relay. `TALLY_STATE` moves the state directory (`--state`); the health check reads it too.
 - **Rounding, experts only:** `--precision M` (a flag, never an environment variable) rounds the
   position to an M-metre grid before anything is signed or sent, so not even relay operators see

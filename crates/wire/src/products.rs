@@ -584,7 +584,8 @@ pub struct ClientRegionalBatchContent {
 }
 
 impl RegionalBatchContent {
-    /// What a client is sent of it: the same receptions, counters stripped.
+    /// What a client is sent of it: the same receptions, counters stripped, and none that is not
+    /// a product's (`format::in_products`), whatever relay signed it.
     pub fn for_clients(&self) -> ClientRegionalBatchContent {
         ClientRegionalBatchContent {
             cell: self.cell,
@@ -594,6 +595,7 @@ impl RegionalBatchContent {
             observations: self
                 .observations
                 .iter()
+                .filter(|observation| crate::batch::format::in_products(observation.format))
                 .map(|observation| ClientObservation {
                     format: observation.format,
                     data: observation.data.clone(),
@@ -713,14 +715,17 @@ impl ClientRegionalBatch {
                 value: u64::from(draft.cell.resolution()),
             });
         }
+        let observations: Vec<(u8, &[u8])> = draft
+            .observations
+            .iter()
+            .filter(|observation| crate::batch::format::in_products(observation.format))
+            .map(|observation| (observation.format, observation.data))
+            .collect();
         let mut body = Vec::new();
         write_client_regional(
             &mut body,
             (draft.cell, draft.boot_id, draft.sequence, draft.wall_ms),
-            draft
-                .observations
-                .iter()
-                .map(|observation| (observation.format, observation.data)),
+            observations.into_iter(),
         )?;
         crate::signed::Signed::sign(Self::DOMAIN, Self::FORMAT, identity, &body, Self::MAX_LEN)
             .map(Self)
@@ -775,6 +780,49 @@ mod tests {
             ..draft
         };
         assert!(!RegionalBatch::fits_draft(&draft));
+        Ok(())
+    }
+
+    /// An ACARS-family message is never in a client's regional batch, whoever signed the regional
+    /// batch it was in, signed from owned copies or from a draft alike.
+    #[test]
+    fn a_client_regional_batch_carries_no_acars() -> Result<(), WireError> {
+        let relay = Identity::from_seed([9; 32]);
+        let acars = br#"{"kind":"acars","label":"H1","t":1}"#;
+        let observations = vec![
+            Observation {
+                format: b'3',
+                timestamp: 1,
+                signal: 0,
+                data: vec![7; 14],
+            },
+            Observation {
+                format: crate::batch::format::ACARS_JSON,
+                timestamp: 2,
+                signal: 0,
+                data: acars.to_vec(),
+            },
+        ];
+        let content = RegionalBatchContent {
+            cell: cell()?,
+            boot_id: 3,
+            sequence: 7,
+            wall_ms: 1_791_244_800_000,
+            observations: observations.clone(),
+        };
+        let client = content.for_clients();
+        assert_eq!(client.observations.len(), 1);
+        assert_eq!(client.observations[0].format, b'3');
+        let draft = RegionalDraft {
+            cell: content.cell,
+            boot_id: 3,
+            sequence: 7,
+            wall_ms: content.wall_ms,
+            observations: observations.iter().map(ObsView::from).collect(),
+        };
+        let signed = ClientRegionalBatch::sign_draft(&relay, &draft)?;
+        assert_eq!(signed, ClientRegionalBatch::sign(&relay, &client)?);
+        assert!(!signed.as_bytes().windows(acars.len()).any(|at| at == acars));
         Ok(())
     }
 

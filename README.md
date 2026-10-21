@@ -72,6 +72,30 @@ the receiver, for experts: above 30 m the receiver takes no part in multilaterat
 If the receiver also runs dump978-fa for 978 MHz UAT, `--uat 127.0.0.1:30978` publishes its raw
 output too, in the same signed batches.
 
+`--acars HOST:PORT` publishes ACARS, VDL2 and HFDL messages the same way, from acars_router's TCP
+outputs (`--acars 127.0.0.1:15550` for ACARS, `15555` for VDL2, `15556` for HFDL; repeat the flag
+for each): acarsdec, dumpvdl2 and dumphfdl only send their JSON over UDP or ZeroMQ, and acars_router
+takes it and serves it one line a message. Only the ACARS message is published, in one flat schema
+whatever the decoder (`tally_wire::acars`): the aircraft's address, registration and flight, the
+ground station, the label, sublabel, block, message number, mode, acknowledgement, the text, and the
+time to the whole second (a receiver's clock readings finer than that help place it, as a BEAST
+counter does), each spelled as libacars spells it whichever decoder wrote it (HFDL without the
+aircraft's address, which dumphfdl takes from its own logon cache). Nothing of a decoder's own frame
+trees or libacars' decodes is published: they differ by decoder, version and setting, so copies
+would not merge. Everything of the receiver (its station, signal, frequency and decoder counters) is
+dropped. A frame that carries no ACARS message (a VDL2 XID, an HFDL logon or ground station's SPDU),
+a message its decoder says is damaged, and a block with more of its message to follow or still being
+reassembled are counted and not published; a message with no time of its own is skipped. The
+messages travel in batches of their own format, which a relay older than this forwards without
+reading. A message two receivers hear is published by both, and the archive keeps it once: the map's
+collector merges the copies, which are the same line but for their times, timed at the median of
+their seconds. Message text can carry personal data, and some jurisdictions restrict disclosing
+intercepted content (in the UK, the Wireless Telegraphy Act 2006 s48), so nothing is published
+unless the owner names `--acars`. The messages take at most `--acars-ceiling` bytes a second (8000
+by default) of `--ceiling`, so ADS-B always keeps the rest; a decoder's line over 64 KiB is skipped,
+and so is a message over 16 KiB once published. They join the relay's daily open data release
+(packaging/map/README.md).
+
 `--ceiling` caps what the feeder sends each relay per second (64 KB by default). Over the cap,
 receptions are dropped and counted, never buffered.
 
@@ -93,6 +117,14 @@ and signal level are zero, since a receiver's counters and signal levels against
 positions anyone reads place it, and those are relay-only. It is unauthenticated and never
 counted against the cap, so it binds loopback only: the relay refuses to start on any other
 address.
+
+`--acars-out 127.0.0.1:30106` serves every ACARS, VDL2 and HFDL message its feeders publish as one
+JSON line each, as acars_router's TCP outputs are (all three kinds on one port), for the map
+image's daily archives. A line that is not exactly what a feeder publishes (`tally_wire::acars`) is
+never written. Copies from receivers that heard one message are each served; the map's
+collector merges them. ACARS is in no product: no subscriber's stream, regional product or
+receiver's figures carry it.
+Loopback only, as `--beast-out`.
 
 `--stats-listen 127.0.0.1:10901` serves what the relay knows of each receiver's traffic as JSON
 (`GET /stations`, `GET /stations/KEY` with the key as base64url): sessions, first and last seen,

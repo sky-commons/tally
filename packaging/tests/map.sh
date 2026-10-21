@@ -7,6 +7,9 @@
 #   packaging/tests/map.sh            build the image from packaging/map, then test it
 #   packaging/tests/map.sh IMAGE      test an image already built
 #
+# The image's one program of ours, tally-acars-collect, comes from the build context `dist`, as the
+# release's signed binary does (release.yml): here Bazel builds it for this machine first.
+#
 # It fetches nothing from outside: the pictures' tiles come from map_tiles.py, a stand-in tile
 # server in the container (TALLY_MAP_TILES), and one check reads that the image's default is
 # OpenStreetMap's own.
@@ -16,7 +19,20 @@ here="$(cd "$(dirname "$0")" && pwd)"
 image="${1:-}"
 if [[ -z "$image" ]]; then
 	image=tally-map-test:local
-	docker build -q -t "$image" "$here/../map" >/dev/null
+	dist="$(mktemp -d)"
+	case "$(uname -m)" in
+	x86_64) arch=x86_64 docker_arch=amd64 ;;
+	aarch64 | arm64) arch=aarch64 docker_arch=arm64 ;;
+	*) echo "map.sh: no map image for $(uname -m)" >&2 && exit 1 ;;
+	esac
+	# From the workspace, wherever this runs from: cquery names the binary relative to it.
+	root="$(cd "$here/../.." && pwd)"
+	(cd "$root" && bazel build -c opt --lockfile_mode=error //crates/acars-collect:tally-acars-collect)
+	install -m 0755 "$root/$(cd "$root" && bazel cquery -c opt --output=files \
+		//crates/acars-collect:tally-acars-collect 2>/dev/null)" "$dist/tally-acars-collect-$arch-linux"
+	docker build -q --platform "linux/$docker_arch" --build-context "dist=$dist" -t "$image" \
+		"$here/../map" >/dev/null
+	rm -rf "$dist"
 fi
 
 name="tally-map-test-$$"
@@ -133,6 +149,21 @@ page="$(get /nope.x)"
 expect "the not-found page" "$page" '<h1>Nothing here</h1>'
 expect "the not-found page, back to the site" "$page" 'https://tally.skycommons.org/'
 
+# A day's ACARS files and the sort's runs are in the archive alone: no path of /globe_history/ or
+# /archive/ serves them, while the day's other files are served.
+docker exec "$name" sh -c 'd=/var/globe_history/2026/10/20 && mkdir -p "$d" /var/globe_history/archive/.sorting &&
+	for f in acars.jsonl acars.jsonl.gz acars.gaps acars.jsonl.sorting probe.txt; do echo x >"$d/$f"; done &&
+	echo x >/var/globe_history/archive/.sorting/run-1'
+expect "a day's other files" "$(status /globe_history/2026/10/20/probe.txt)" '200'
+for file in acars.jsonl acars.jsonl.gz acars.gaps acars.jsonl.sorting; do
+	expect "no $file at /globe_history/" "$(status "/globe_history/2026/10/20/$file")" '404'
+done
+expect "no sort run at /archive/" "$(status /archive/.sorting/run-1)" '404'
+expect "no sort run at /globe_history/" "$(status /globe_history/archive/.sorting/run-1)" '404'
+refuse "the listing names no sort run" "$(get /archive/)" '.sorting'
+docker exec "$name" sh -c 'echo 1 >/var/globe_history/archive/.acars-read'
+expect "no ACARS read time at /archive/" "$(status /archive/.acars-read)" '404'
+
 # readsb taking connections and never answering: the page, its tags without an aircraft; and
 # one visitor's previews waiting on it hold no more than its share of the page's slots, so
 # another's page files are still served.
@@ -157,10 +188,27 @@ expect "a visitor's previews past its share" "$(cat "$scratch"/many.*)" '503'
 
 # Unset, the tiles are OpenStreetMap's own.
 default="tally-map-test-default-$$"
-docker run -d --name "$default" -e TALLY_MAP_MAX_UPLOAD=8Mbit/s -e TALLY_MAP_IPV6=off "$image" >/dev/null
-sleep 2
+# With TALLY_MAP_ACARS naming a relay that is not there, the collector marks today as missed from
+# its start, before the archiver runs, and as it stops keeps when it last read the relay.
+docker run -d --name "$default" -e TALLY_MAP_MAX_UPLOAD=8Mbit/s -e TALLY_MAP_IPV6=off \
+	-e TALLY_MAP_ACARS=127.0.0.1:9 "$image" >/dev/null
+for _ in $(seq 100); do
+	docker exec "$default" test -e /run/tally-map/acars.ready 2>/dev/null && break
+	sleep 0.1
+done
 expect "the default tile server is OpenStreetMap's" "$(docker exec "$default" cat /run/tally-map/tiles.conf)" \
 	'tile_origin "https://tile.openstreetmap.org";'
+expect "the collector is ready" "$(docker exec "$default" ls /run/tally-map)" 'acars.ready'
+# Today as the container's clock has it, which is what the collector files by.
+today="$(docker exec "$default" date -u +%Y/%m/%d)"
+midnight="$(docker exec "$default" sh -c 'echo $(($(date -u +%s) / 86400 * 86400))')"
+expect "today is missed from its start" "$(docker exec "$default" cat "/var/globe_history/$today/acars.gaps")" \
+	"$midnight - down"
+docker stop -t 20 "$default" >/dev/null
+refuse "the collector was not killed" "$(docker inspect -f '{{.State.ExitCode}}' "$default")" '137'
+docker cp "$default:/var/globe_history/archive/.acars-read" "$scratch/acars-read"
+# It never reached the relay, so it last read it, for all it knows, at the start of today.
+expect "the last read time is kept" "$(cat "$scratch/acars-read")" "$midnight"
 docker rm -f "$default" >/dev/null
 
 if ((failures > 0)); then

@@ -629,11 +629,15 @@ impl Note {
 /// airborne position it carries (once: every reception of a batch has its wall clock, so a second
 /// says nothing more), and each reply MLAT solves, by index. A function of the batch alone, so the
 /// thread that holds the batch reads it (a relay's raw shard, RFC-0181 §5) and the address shards
-/// only weigh what it says (`Shard::read`).
+/// only weigh what it says (`Shard::read`). A reception in no product (an ACARS-family message)
+/// says nothing.
 pub fn notes_of(batch: &Decoded) -> Vec<Note> {
     let mut notes = Vec::new();
     let mut positions: Vec<u32> = Vec::new();
     for (index, observation) in batch.views().enumerate() {
+        if !tally_wire::batch::format::in_products(observation.format) {
+            continue;
+        }
         let data = observation.data;
         let Some(address) = modes::address(data) else {
             continue;

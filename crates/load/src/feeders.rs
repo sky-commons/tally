@@ -98,6 +98,8 @@ pub fn spawn(run: Run, counts: Arc<Counts>, start: tokio::time::Instant) {
             key: Key::File(state_dir.join("unused")),
             source: String::new(),
             uat: None,
+            acars: Vec::new(),
+            acars_ceiling: tally_feed::source::DEFAULT_ACARS_CEILING,
             relays: vec![relay],
             seeds: Vec::new(),
             state_dir: state_dir.join("feeders").join(index.to_string()),

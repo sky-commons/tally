@@ -1,10 +1,10 @@
 //! Reading the receiver's own decoders and turning what they heard into signed batches (RFC-0171
-//! §3.1, §3.5). Each decoder's port is read as one more client; nothing about readsb or dump978 is
-//! changed. Each source has its own reader, and every reader feeds the one batcher that owns the
-//! chain.
+//! §3.1, §3.5). Each decoder's port is read as one more client; nothing about readsb, dump978 or
+//! the ACARS-family decoders is changed. Each source has its own reader, and every reader feeds
+//! the one batcher that owns the chain.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tally_wire::backoff::Backoff;
@@ -17,7 +17,8 @@ use tokio::net::TcpStream;
 use tokio::sync::{broadcast, mpsc};
 
 use crate::health::Health;
-use crate::uat::{self, Lines};
+use crate::lines::{self, Line, Lines};
+use crate::{acars, uat};
 
 /// How often a batch is sealed, at most.
 const SEAL_EVERY: Duration = Duration::from_secs(1);
@@ -37,6 +38,85 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Receptions waiting for the batcher. It only falls this far behind if the box is starved, and
 /// then what does not fit is dropped and counted like anything over the ceiling.
 const INPUT_BACKLOG: usize = 4096;
+
+/// The most ACARS-family messages take of the upload ceiling a second unless `--acars-ceiling`
+/// says otherwise: a busy VDL2 station near a hub, about ten messages a second of a few hundred
+/// bytes each, fits, and ADS-B keeps the rest of the default ceiling (64000).
+pub const DEFAULT_ACARS_CEILING: u32 = 8_000;
+
+/// The most ACARS-family messages waiting for the batcher at once, of the queue's
+/// `INPUT_BACKLOG`: however small they are, they never take more of the places BEAST's frames
+/// wait in.
+const ACARS_BACKLOG: u32 = 256;
+
+/// What a reception costs of the upload ceiling: its bytes in a batch (format, counter, signal,
+/// length, data).
+fn reception_cost(observation: &Observation) -> usize {
+    RECEPTION_OVERHEAD + observation.data.len()
+}
+
+const RECEPTION_OVERHEAD: usize = 1 + 6 + 1 + 2;
+
+/// What the longest ACARS-family message costs of the upload ceiling (`reception_cost`): a
+/// `--ceiling` below it could never send one (`config`).
+pub const LONGEST_ACARS: usize = RECEPTION_OVERHEAD + tally_wire::acars::MAX_LINE;
+
+/// The owner's upload ceiling (`--ceiling`) and the ACARS-family share of it (`--acars-ceiling`),
+/// one of each for the feeder: the batcher takes every reception's bytes from the ceiling, and
+/// each ACARS reader takes a message's from the share before it queues it
+/// ([`Inputs::offer_acars`]), so however many `--acars` ports there are and however busy, they
+/// take no more than the share between them, and never a place in the queue BEAST's frames wait
+/// in beyond it.
+pub struct Ceilings {
+    ceiling: u32,
+    upload: Mutex<TokenBucket>,
+    acars: Mutex<TokenBucket>,
+}
+
+impl Ceilings {
+    /// The share holds a second of itself at once, never more: a burst of messages takes no
+    /// more of the ceiling's second than the share does.
+    pub fn new(ceiling: u32, acars: u32) -> Arc<Self> {
+        Arc::new(Self {
+            ceiling,
+            upload: Mutex::new(TokenBucket::new(ceiling)),
+            acars: Mutex::new(TokenBucket::new(acars)),
+        })
+    }
+
+    /// Whether `cost` bytes fit the upload ceiling at `now`, and takes them.
+    fn take_upload(&self, cost: usize, now: Instant) -> bool {
+        self.upload
+            .lock()
+            .is_ok_and(|mut bucket| bucket.take_at(cost, now))
+    }
+
+    /// Whether an ACARS-family message of `cost` bytes may be queued at `now`, and if so takes
+    /// its bytes from the upload ceiling and the share at once, under both locks, so nothing
+    /// takes the ceiling's room between the two (the batcher then takes nothing more for it:
+    /// `Batcher::push_admitted_at`). A message the ceiling has no room for never spends the share.
+    /// A message longer than the share goes once the share is full, and the share owes it
+    /// (`take_owing_at`), so the share holds on average and a long message is still sent.
+    pub fn admit_acars(&self, cost: usize, now: Instant) -> bool {
+        let (Ok(mut upload), Ok(mut acars)) = (self.upload.lock(), self.acars.lock()) else {
+            return false;
+        };
+        if !upload.fits_at(cost, now) || !acars.take_owing_at(cost, now) {
+            return false;
+        }
+        upload.take_at(cost, now)
+    }
+
+    /// Gives back what [`Self::admit_acars`] took for a message that was then not queued, so a
+    /// message dropped never spends the share or the ceiling.
+    fn refund_acars(&self, cost: usize) {
+        for bucket in [&self.upload, &self.acars] {
+            if let Ok(mut bucket) = bucket.lock() {
+                bucket.give_back(cost);
+            }
+        }
+    }
+}
 
 /// A token bucket that drops what is over budget and never buffers (§3.5). It starts full.
 pub struct TokenBucket {
@@ -69,15 +149,34 @@ impl TokenBucket {
 
     /// As `take`, at `now` (which never runs backwards for one bucket).
     pub fn take_at(&mut self, cost: usize, now: Instant) -> bool {
+        if !self.fits_at(cost, now) {
+            return false;
+        }
+        self.tokens -= cost as f64;
+        true
+    }
+
+    /// As `take_at`, but a `cost` past the burst is taken once the bucket is full, leaving it
+    /// owing: what it lets through still averages its rate.
+    pub fn take_owing_at(&mut self, cost: usize, now: Instant) -> bool {
+        if !self.fits_at((cost as f64).min(self.burst) as usize, now) {
+            return false;
+        }
+        self.tokens -= cost as f64;
+        true
+    }
+
+    /// Returns `cost` bytes taken for what was not sent, never past the burst.
+    fn give_back(&mut self, cost: usize) {
+        self.tokens = (self.tokens + cost as f64).min(self.burst);
+    }
+
+    /// Whether `cost` bytes fit at `now`, taking nothing.
+    pub fn fits_at(&mut self, cost: usize, now: Instant) -> bool {
         let elapsed = now.saturating_duration_since(self.filled).as_secs_f64();
         self.filled = self.filled.max(now);
         self.tokens = (self.tokens + elapsed * self.rate).min(self.burst);
-        let cost = cost as f64;
-        if cost > self.tokens {
-            return false;
-        }
-        self.tokens -= cost;
-        true
+        cost as f64 <= self.tokens
     }
 }
 
@@ -156,9 +255,14 @@ pub struct Batcher {
     previous: Hash,
     observations: Vec<Observation>,
     bytes: usize,
+    /// ACARS-family messages, gathered apart: they travel in a batch of their own format
+    /// (`tally_wire::batch::BATCH_FORMAT_ACARS`), which no relay that predates them reads.
+    acars: Vec<Observation>,
+    acars_bytes: usize,
     dropped: u32,
     last_counter: Option<u64>,
-    bucket: TokenBucket,
+    /// The upload ceiling, shared with the ACARS readers (`Ceilings`).
+    ceilings: Arc<Ceilings>,
     /// The relays' wanted ceilings this batcher sheds to, and its bucket at the one it last read.
     wanted: Arc<WantedCeilings>,
     wanted_bucket: Option<(u32, TokenBucket)>,
@@ -183,13 +287,27 @@ impl Batcher {
             previous: [0; 32],
             observations: Vec::new(),
             bytes: 0,
+            acars: Vec::new(),
+            acars_bytes: 0,
             dropped: 0,
             last_counter: None,
-            bucket: TokenBucket::new(ceiling),
+            ceilings: Ceilings::new(ceiling, DEFAULT_ACARS_CEILING),
             wanted: Arc::default(),
             wanted_bucket: None,
             codec: Codec::Deflate,
         }
+    }
+
+    /// Holds ACARS-family messages to `bytes_per_sec` of the upload ceiling (`--acars-ceiling`),
+    /// dropped and counted past it like anything over the ceiling. Before `ceilings` is shared.
+    pub fn holding_acars_to(mut self, bytes_per_sec: u32) -> Self {
+        self.ceilings = Ceilings::new(self.ceilings.ceiling, bytes_per_sec);
+        self
+    }
+
+    /// The ceilings, for the channel its readers offer to (`channel`).
+    pub fn ceilings(&self) -> Arc<Ceilings> {
+        Arc::clone(&self.ceilings)
     }
 
     /// Compresses at DEFLATE level `level` instead of the wire's own (`Codec::DeflateAt`).
@@ -289,22 +407,48 @@ impl Batcher {
         observation: Observation,
         now: Instant,
     ) -> Result<Option<Batch>, String> {
-        let cost = 1 + 6 + 1 + 2 + observation.data.len();
+        self.push_paying(observation, now, true)
+    }
+
+    /// An ACARS-family message `Ceilings::admit_acars` admitted, its bytes already taken from
+    /// the ceiling.
+    pub fn push_admitted_at(
+        &mut self,
+        observation: Observation,
+        now: Instant,
+    ) -> Result<Option<Batch>, String> {
+        self.push_paying(observation, now, false)
+    }
+
+    fn push_paying(
+        &mut self,
+        observation: Observation,
+        now: Instant,
+        pay: bool,
+    ) -> Result<Option<Batch>, String> {
+        let cost = reception_cost(&observation);
         // A wanted reception past the relays' ceiling is shed here, before it is signed: the
         // relay would drop the batch it took past it.
         let shed = tally_wire::modes::wanted_reception(observation.format, &observation.data)
             && !self.wanted_fits(now);
-        if shed || cost > MAX_OBSERVATION_BYTES || !self.bucket.take_at(cost, now) {
+        if shed || cost > MAX_OBSERVATION_BYTES || (pay && !self.ceilings.take_upload(cost, now)) {
             self.dropped = self.dropped.saturating_add(1);
             return Ok(None);
         }
-        let sealed = if self.bytes + cost > MAX_OBSERVATION_BYTES {
-            self.seal()?
+        let acars = observation.format == tally_wire::batch::format::ACARS_JSON;
+        let held = if acars { self.acars_bytes } else { self.bytes };
+        let sealed = if held + cost > MAX_OBSERVATION_BYTES {
+            self.seal_of(acars)?
         } else {
             None
         };
-        self.bytes += cost;
-        self.observations.push(observation);
+        if acars {
+            self.acars_bytes += cost;
+            self.acars.push(observation);
+        } else {
+            self.bytes += cost;
+            self.observations.push(observation);
+        }
         Ok(sealed)
     }
 
@@ -316,7 +460,7 @@ impl Batcher {
     /// The BEAST source went away or its counter jumped: counters after this are a new epoch.
     /// What gathered under the old epoch is sealed first and returned.
     pub fn counter_restarted(&mut self) -> Result<Option<Batch>, String> {
-        let sealed = self.seal()?;
+        let sealed = self.seal_of(false)?;
         self.counter_epoch = self.counter_epoch.wrapping_add(1);
         self.last_counter = None;
         Ok(sealed)
@@ -326,27 +470,47 @@ impl Batcher {
         self.bytes >= MAX_BATCH_BYTES
     }
 
-    /// Signs what has gathered, if anything has.
+    /// Signs what has gathered, if anything has: the receptions (and what was dropped) first, the
+    /// ACARS-family messages in a batch of their own once none are left. Called until it signs
+    /// nothing, it signs everything.
     pub fn seal(&mut self) -> Result<Option<Batch>, String> {
-        if self.observations.is_empty() && self.dropped == 0 {
+        let acars = self.observations.is_empty() && !self.acars.is_empty();
+        self.seal_of(acars)
+    }
+
+    /// Signs the ACARS-family messages gathered, or the receptions and what was dropped.
+    fn seal_of(&mut self, acars: bool) -> Result<Option<Batch>, String> {
+        let observations = if acars {
+            self.acars_bytes = 0;
+            std::mem::take(&mut self.acars)
+        } else {
+            self.bytes = 0;
+            std::mem::take(&mut self.observations)
+        };
+        if observations.is_empty() && (acars || self.dropped == 0) {
             return Ok(None);
         }
+        // The count dropped rides a batch of receptions alone: a relay that predates the ACARS
+        // format reads none of its batches, so would never count it.
+        let dropped = if acars {
+            0
+        } else {
+            std::mem::take(&mut self.dropped)
+        };
         let content = BatchContent {
             boot_id: self.boot_id,
             sequence: self.sequence,
             counter_epoch: self.counter_epoch,
             wall_ms: wall_ms(),
-            dropped: self.dropped,
+            dropped,
             previous: self.previous,
-            observations: std::mem::take(&mut self.observations),
+            observations,
         };
         // Compressed: every relay reads it (wire version 2 is the minimum).
         let batch = Batch::sign_with(&self.identity, &content, self.codec)
             .map_err(|error| error.to_string())?;
         self.sequence += 1;
         self.previous = batch.hash();
-        self.bytes = 0;
-        self.dropped = 0;
         Ok(Some(batch))
     }
 }
@@ -373,7 +537,8 @@ pub fn wall_ms() -> u64 {
 pub enum Input {
     /// A 1090 MHz frame from the BEAST source.
     Frame(Frame),
-    /// A reception from a source with no receiver counter (978 MHz UAT, wall-clock timestamped).
+    /// A reception from a source with no receiver counter (978 MHz UAT, an ACARS-family message;
+    /// wall-clock timestamped).
     Observation(Observation),
     /// The BEAST source went away, so its counter may restart: later counters are a new epoch.
     CounterRestarted,
@@ -383,6 +548,8 @@ pub enum Input {
 /// message for all of them, not one each).
 enum Message {
     One(Input),
+    /// An ACARS-family message (`Inputs::offer_acars`), counted apart (`ACARS_BACKLOG`).
+    Acars(Observation),
     Frames(Vec<Frame>),
 }
 
@@ -394,6 +561,10 @@ pub struct Inputs {
     /// Receptions sent and not yet taken: the backlog is counted in receptions, whether they
     /// crossed one at a time or a read's worth at once.
     queued: Arc<AtomicU32>,
+    /// The batcher's ceilings, which an ACARS message is held to before it is queued.
+    ceilings: Arc<Ceilings>,
+    /// ACARS-family messages queued and not yet taken (`ACARS_BACKLOG`).
+    acars_queued: Arc<AtomicU32>,
 }
 
 /// The batcher's end.
@@ -401,22 +572,28 @@ pub struct Intake {
     receiver: mpsc::Receiver<Message>,
     overflow: Arc<AtomicU32>,
     queued: Arc<AtomicU32>,
+    acars_queued: Arc<AtomicU32>,
 }
 
-pub fn channel() -> (Inputs, Intake) {
+/// The channel to the batcher that holds `ceilings` (`Batcher::ceilings`).
+pub fn channel(ceilings: Arc<Ceilings>) -> (Inputs, Intake) {
     let (sender, receiver) = mpsc::channel(INPUT_BACKLOG);
     let overflow = Arc::new(AtomicU32::new(0));
     let queued = Arc::new(AtomicU32::new(0));
+    let acars_queued = Arc::new(AtomicU32::new(0));
     (
         Inputs {
             sender,
             overflow: Arc::clone(&overflow),
             queued: Arc::clone(&queued),
+            ceilings,
+            acars_queued: Arc::clone(&acars_queued),
         },
         Intake {
             receiver,
             overflow,
             queued,
+            acars_queued,
         },
     )
 }
@@ -430,16 +607,37 @@ impl Inputs {
         self.send(Message::One(input), 1);
     }
 
+    /// An ACARS-family message, held here, before it is queued, to `ACARS_BACKLOG` places in
+    /// the queue and to its share of the ceiling (`Ceilings::admit_acars`): past either, it is
+    /// dropped and counted as the ceiling's own drops, and a message refused a place spends none
+    /// of the share.
+    pub fn offer_acars(&self, observation: Observation) {
+        let cost = reception_cost(&observation);
+        if self.acars_queued.fetch_add(1, Ordering::Relaxed) >= ACARS_BACKLOG
+            || !self.ceilings.admit_acars(cost, Instant::now())
+        {
+            self.acars_queued.fetch_sub(1, Ordering::Relaxed);
+            self.overflow.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        if !self.send(Message::Acars(observation), 1) {
+            self.acars_queued.fetch_sub(1, Ordering::Relaxed);
+            self.ceilings.refund_acars(cost);
+        }
+    }
+
     /// Sends `message` of `count` receptions unless that would put more than `INPUT_BACKLOG`
-    /// receptions in the channel: then it is dropped, counted.
-    fn send(&self, message: Message, count: u32) {
+    /// receptions in the channel: then it is dropped, counted, and this is false.
+    fn send(&self, message: Message, count: u32) -> bool {
         let before = self.queued.fetch_add(count, Ordering::Relaxed);
         if before.saturating_add(count) > INPUT_BACKLOG as u32
             || self.sender.try_send(message).is_err()
         {
             self.queued.fetch_sub(count, Ordering::Relaxed);
             self.overflow.fetch_add(count, Ordering::Relaxed);
+            return false;
         }
+        true
     }
 
     /// The frames one read decoded, as `offer` takes one: if the batcher is behind, all of them
@@ -473,15 +671,23 @@ pub async fn batch(mut batcher: Batcher, mut intake: Intake, out: broadcast::Sen
                 };
                 let taken = match &input {
                     Message::One(_) => 1,
+                    Message::Acars(_) => {
+                        intake.acars_queued.fetch_sub(1, Ordering::Relaxed);
+                        1
+                    }
                     Message::Frames(frames) => u32::try_from(frames.len()).unwrap_or(u32::MAX),
                 };
                 intake.queued.fetch_sub(taken, Ordering::Relaxed);
-                match input {
-                    Message::One(input) => match batcher.take(input) {
-                        Ok(Some(batch)) => publish(&out, batch),
-                        Ok(None) => {}
-                        Err(error) => eprintln!("tally-feed: signing a batch: {error}"),
-                    },
+                let one = match input {
+                    Message::One(input) => Some(input),
+                    Message::Acars(observation) => {
+                        match batcher.push_admitted_at(observation, Instant::now()) {
+                            Ok(Some(batch)) => publish(&out, batch),
+                            Ok(None) => {}
+                            Err(error) => eprintln!("tally-feed: signing a batch: {error}"),
+                        }
+                        None
+                    }
                     Message::Frames(frames) => {
                         let mut sealed = Vec::new();
                         if let Err(error) = batcher.take_frames(&frames, &mut sealed) {
@@ -490,6 +696,14 @@ pub async fn batch(mut batcher: Batcher, mut intake: Intake, out: broadcast::Sen
                         for batch in sealed {
                             publish(&out, batch);
                         }
+                        None
+                    }
+                };
+                if let Some(input) = one {
+                    match batcher.take(input) {
+                        Ok(Some(batch)) => publish(&out, batch),
+                        Ok(None) => {}
+                        Err(error) => eprintln!("tally-feed: signing a batch: {error}"),
                     }
                 }
                 if batcher.is_full() {
@@ -523,9 +737,8 @@ async fn read_beast_once(
     refusing: &mut bool,
 ) -> Result<(), String> {
     let stream = connect(address).await?;
-    backoff.reset();
     eprintln!("tally-feed: reading {address}");
-    let result = read_beast_stream(stream, address, inputs, health, refusing).await;
+    let result = read_beast_stream(stream, address, inputs, health, backoff, refusing).await;
     // The counter may restart with the next connection (readsb restarted, or a different one).
     inputs.counter_restarted().await;
     result
@@ -536,6 +749,7 @@ async fn read_beast_stream(
     address: &str,
     inputs: &Inputs,
     health: &Health,
+    backoff: &mut Backoff,
     refusing: &mut bool,
 ) -> Result<(), String> {
     let mut decoder = Decoder::new();
@@ -548,6 +762,9 @@ async fn read_beast_stream(
         if length == 0 {
             return Err("closed".to_owned());
         }
+        // Only a source that sends anything is a source that works: one that accepts and closes
+        // keeps backing off.
+        backoff.reset();
         health.source_heard();
         let mut frames = Vec::new();
         decoder.push(&buffer[..length], |frame| {
@@ -566,28 +783,69 @@ async fn read_beast_stream(
     }
 }
 
-/// Reads dump978-fa's raw output for as long as the feeder runs. Its timestamps are wall clock,
-/// so a reconnect starts no new counter epoch.
-pub async fn read_uat(address: String, inputs: Inputs) {
+/// A decoder that writes one reception a line of text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LineSource {
+    /// dump978-fa's raw output (`--uat`, `uat`).
+    Uat,
+    /// An ACARS-family decoder's JSON (`--acars`, `acars`).
+    Acars,
+}
+
+impl LineSource {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Uat => "uat",
+            Self::Acars => "acars",
+        }
+    }
+
+    /// What its lines carry, as a log line names it.
+    fn carries(self) -> &'static str {
+        match self {
+            Self::Uat => "UAT reception",
+            Self::Acars => "ACARS, VDL2 or HFDL message",
+        }
+    }
+
+    fn max_line(self) -> usize {
+        match self {
+            Self::Uat => uat::MAX_LINE,
+            Self::Acars => acars::MAX_LINE,
+        }
+    }
+
+    fn parse(self, line: &str, now_us: u64) -> Line {
+        match self {
+            Self::Uat => uat::parse_line(line, now_us),
+            Self::Acars => acars::parse_line(line),
+        }
+    }
+}
+
+/// Reads a line-shaped decoder's output for as long as the feeder runs. Its timestamps are wall
+/// clock, so a reconnect starts no new counter epoch.
+pub async fn read_lines(address: String, inputs: Inputs, source: LineSource) {
     let mut backoff = Backoff::new();
     loop {
-        if let Err(error) = read_uat_once(&address, &inputs, &mut backoff).await {
-            eprintln!("tally-feed: uat source {address}: {error}");
+        if let Err(error) = read_lines_once(&address, &inputs, source, &mut backoff).await {
+            eprintln!("tally-feed: {} source {address}: {error}", source.name());
         }
         tokio::time::sleep(backoff.wait()).await;
     }
 }
 
-async fn read_uat_once(
+async fn read_lines_once(
     address: &str,
     inputs: &Inputs,
+    source: LineSource,
     backoff: &mut Backoff,
 ) -> Result<(), String> {
     let mut stream = connect(address).await?;
-    backoff.reset();
     eprintln!("tally-feed: reading {address}");
-    let mut lines = Lines::new();
+    let mut lines = Lines::new(source.max_line());
     let mut skipped = 0u64;
+    let mut not_published = 0u64;
     let mut buffer = vec![0; 16 * 1024];
     loop {
         let length = stream
@@ -595,39 +853,94 @@ async fn read_uat_once(
             .await
             .map_err(|error| error.to_string())?;
         if length == 0 {
-            return Err(format!("closed ({skipped} unreadable lines skipped)"));
+            return Err(format!(
+                "closed ({skipped} unreadable lines skipped, {not_published} frames with no \
+                 whole, undamaged message not published)"
+            ));
         }
-        let mut bad = 0;
+        // As `read_beast_stream`: only a source that sends anything resets the backoff.
+        backoff.reset();
+        let (mut bad, mut quiet) = (0, 0);
         let unreadable = lines.push(&buffer[..length], |line| {
-            match uat::parse_line(line, uat::now_us()) {
-                uat::Line::Reception(observation) => inputs.offer(Input::Observation(observation)),
-                uat::Line::Ignored => {}
-                uat::Line::Bad => bad += 1,
+            match source.parse(line, lines::now_us()) {
+                Line::Reception(observation) if source == LineSource::Acars => {
+                    inputs.offer_acars(observation);
+                }
+                Line::Reception(observation) => inputs.offer(Input::Observation(observation)),
+                Line::Ignored => {}
+                Line::Bad => bad += 1,
+                Line::NotPublished => quiet += 1,
             }
         });
+        if not_published == 0 && quiet > 0 {
+            eprintln!(
+                "tally-feed: {address} sent a frame that carries no whole, undamaged {}; such \
+                 frames are counted and not published",
+                source.carries()
+            );
+        }
+        not_published += quiet;
         if skipped == 0 && bad + unreadable > 0 {
             eprintln!(
-                "tally-feed: {address} sent a line that is not a UAT reception; such lines are \
-                 skipped"
+                "tally-feed: {address} sent a line that is not a {}; such lines are skipped",
+                source.carries()
             );
         }
         skipped += bad + unreadable;
     }
 }
 
+/// A decoder's port, with TCP keepalive on: a source that goes quiet (no traffic overhead, a
+/// quiet ACARS channel) is told from one whose host went away, which no read would otherwise
+/// notice.
 async fn connect(address: &str) -> Result<TcpStream, String> {
-    tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(address))
+    let stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(address))
         .await
         .map_err(|_| "connect timed out".to_owned())?
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+    keepalive(&stream).map_err(|error| format!("keepalive: {error}"))?;
+    Ok(stream)
+}
+
+/// Probes after a minute idle, every 10 s, 6 times: a peer gone is noticed within two minutes.
+fn keepalive(stream: &TcpStream) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let fd = stream.as_raw_fd();
+    let set = |level, name, value: libc::c_int| {
+        // SAFETY: `fd` is this stream's open socket, and `value` an int that lives for the call.
+        let done = unsafe {
+            libc::setsockopt(
+                fd,
+                level,
+                name,
+                std::ptr::from_ref(&value).cast(),
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        if done == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    };
+    set(libc::SOL_SOCKET, libc::SO_KEEPALIVE, 1)?;
+    #[cfg(target_os = "linux")]
+    {
+        set(libc::IPPROTO_TCP, libc::TCP_KEEPIDLE, 60)?;
+        set(libc::IPPROTO_TCP, libc::TCP_KEEPINTVL, 10)?;
+        set(libc::IPPROTO_TCP, libc::TCP_KEEPCNT, 6)?;
+    }
+    Ok(())
 }
 
 fn flush(batcher: &mut Batcher, overflow: &AtomicU32, out: &broadcast::Sender<Arc<Record>>) {
     batcher.add_dropped(overflow.swap(0, Ordering::Relaxed));
-    match batcher.seal() {
-        Ok(Some(batch)) => publish(out, batch),
-        Ok(None) => {}
-        Err(error) => eprintln!("tally-feed: signing a batch: {error}"),
+    loop {
+        match batcher.seal() {
+            Ok(Some(batch)) => publish(out, batch),
+            Ok(None) => return,
+            Err(error) => return eprintln!("tally-feed: signing a batch: {error}"),
+        }
     }
 }
 
@@ -737,7 +1050,7 @@ mod tests {
         for pair in sealed.windows(2) {
             assert_eq!(content(&pair[1])?.previous, pair[0].hash());
         }
-        let (inputs, mut intake) = channel();
+        let (inputs, mut intake) = channel(Ceilings::new(u32::MAX, DEFAULT_ACARS_CEILING));
         inputs.offer_frames(frames[..3_000].to_vec());
         inputs.offer_frames(frames[..3_000].to_vec());
         // 3,000 and 3,000 receptions against a backlog of 4,096: the second is dropped, counted.
@@ -783,6 +1096,171 @@ mod tests {
             .map_err(|error| error.to_string())?;
         assert_eq!((before.counter_epoch, before.observations.len()), (0, 2));
         assert_eq!((after.counter_epoch, after.observations.len()), (1, 1));
+        Ok(())
+    }
+
+    /// ACARS-family messages gathered among receptions are signed in a batch of their own
+    /// format, after the receptions' and in one chain with them, so no relay that predates the
+    /// format reads one; what was dropped is counted in a batch of receptions alone.
+    #[test]
+    fn acars_messages_are_signed_apart_from_receptions() -> Result<(), String> {
+        let mut batcher = batcher(u32::MAX)?;
+        let message = Observation {
+            format: tally_wire::batch::format::ACARS_JSON,
+            timestamp: 1,
+            signal: 0,
+            data: br#"{"kind":"acars","label":"H1","t":1}"#.to_vec(),
+        };
+        for at in 1..=3 {
+            batcher.push(message.clone())?;
+            batcher.observe(&frame(at * 1_000)?)?;
+        }
+        let receptions = batcher.seal()?.ok_or("no batch")?;
+        let acars = batcher.seal()?.ok_or("no ACARS batch")?;
+        assert!(batcher.seal()?.is_none());
+        assert_ne!(receptions.format(), tally_wire::batch::BATCH_FORMAT_ACARS);
+        assert_eq!(acars.format(), tally_wire::batch::BATCH_FORMAT_ACARS);
+        let (receptions, acars) = (content(&receptions)?, content(&acars)?);
+        assert!(
+            receptions
+                .observations
+                .iter()
+                .all(|o| o.format != message.format)
+        );
+        assert_eq!(acars.observations, vec![message.clone(); 3]);
+        assert_eq!((receptions.sequence, acars.sequence), (0, 1));
+        // What was dropped rides a batch of receptions, never the ACARS batch: one is signed for
+        // it alone if it must be.
+        batcher.add_dropped(2);
+        batcher.push(message)?;
+        let acars = content(&batcher.seal()?.ok_or("no ACARS batch")?)?;
+        let receptions = content(&batcher.seal()?.ok_or("no batch for the dropped")?)?;
+        assert!(batcher.seal()?.is_none());
+        assert_eq!((acars.dropped, acars.observations.len()), (0, 1));
+        assert_eq!((receptions.dropped, receptions.observations.len()), (2, 0));
+        Ok(())
+    }
+
+    /// ACARS-family messages past their share are dropped and counted before they are queued,
+    /// however many readers offer them, so the queue keeps its room for BEAST's frames; and a
+    /// message the upload ceiling has no room for never spends the share.
+    #[test]
+    fn a_chatty_acars_decoder_never_takes_adsbs_share() -> Result<(), String> {
+        let ceilings = Ceilings::new(64_000, 2_000);
+        let (inputs, mut intake) = channel(Arc::clone(&ceilings));
+        let line = format!(r#"{{"timestamp":1.5,"text":"{}"}}"#, "x".repeat(470));
+        let message = Observation {
+            format: tally_wire::batch::format::ACARS_JSON,
+            timestamp: 1,
+            signal: 0,
+            data: line.into_bytes(),
+        };
+        let cost = reception_cost(&message);
+        // Two readers, one share.
+        let other = inputs.clone();
+        for at in 0..200 {
+            if at % 2 == 0 {
+                inputs.offer_acars(message.clone());
+            } else {
+                other.offer_acars(message.clone());
+            }
+        }
+        // The share holds a second of itself, so at most that many bytes of messages at once.
+        let fit = 2_000 / cost;
+        assert!(fit > 0);
+        assert_eq!(intake.queued.load(Ordering::Relaxed) as usize, fit);
+        assert_eq!(intake.overflow.load(Ordering::Relaxed) as usize, 200 - fit);
+        // The rest of the queue is BEAST's.
+        let frames = (1..=(INPUT_BACKLOG - fit) as u64)
+            .map(frame)
+            .collect::<Result<Vec<_>, _>>()?;
+        inputs.offer_frames(frames);
+        assert_eq!(intake.overflow.load(Ordering::Relaxed) as usize, 200 - fit);
+        while intake.receiver.try_recv().is_ok() {}
+
+        // An upload ceiling with no room: refused, and the share untouched.
+        let tight = Ceilings::new(100, 2_000);
+        let now = Instant::now();
+        let before = tight
+            .acars
+            .lock()
+            .map_err(|error| error.to_string())?
+            .tokens;
+        assert!(!tight.admit_acars(cost, now));
+        let after = tight
+            .acars
+            .lock()
+            .map_err(|error| error.to_string())?
+            .tokens;
+        assert_eq!(before, after);
+        // With room, admitted, its bytes taken from the ceiling then and there.
+        let roomy = Ceilings::new(64_000, 2_000);
+        assert!(roomy.admit_acars(cost, now));
+        assert!(roomy.take_upload(64_000 - cost, now));
+        assert!(!roomy.take_upload(cost, now));
+
+        // The longest message, eight times the share: sent once the share is full, which then
+        // owes it, so nothing more goes until it is paid.
+        let owing = Ceilings::new(64_000, 2_000);
+        assert!(owing.admit_acars(LONGEST_ACARS, now));
+        assert!(!owing.admit_acars(cost, now));
+        Ok(())
+    }
+
+    /// However small and however many, ACARS-family messages never hold more than
+    /// `ACARS_BACKLOG` places in the queue: the rest are BEAST's.
+    #[test]
+    fn acars_messages_hold_a_bounded_part_of_the_queue() -> Result<(), String> {
+        let ceilings = Ceilings::new(u32::MAX, u32::MAX / 2);
+        let (inputs, intake) = channel(ceilings);
+        let message = Observation {
+            format: tally_wire::batch::format::ACARS_JSON,
+            timestamp: 1,
+            signal: 0,
+            data: br#"{"kind":"acars","label":"H1","t":1}"#.to_vec(),
+        };
+        for _ in 0..1_000 {
+            inputs.offer_acars(message.clone());
+        }
+        assert_eq!(intake.queued.load(Ordering::Relaxed), ACARS_BACKLOG);
+        assert_eq!(
+            intake.overflow.load(Ordering::Relaxed),
+            1_000 - ACARS_BACKLOG
+        );
+        let frames = (1..=(INPUT_BACKLOG as u32 - ACARS_BACKLOG) as u64)
+            .map(frame)
+            .collect::<Result<Vec<_>, _>>()?;
+        inputs.offer_frames(frames);
+        assert_eq!(
+            intake.overflow.load(Ordering::Relaxed),
+            1_000 - ACARS_BACKLOG
+        );
+        drop(inputs);
+        Ok(())
+    }
+
+    /// A message admitted but then dropped (the queue full of frames) gives its bytes back: it
+    /// spends neither the share nor the ceiling.
+    #[test]
+    fn an_acars_message_not_queued_spends_no_share() -> Result<(), String> {
+        let message = Observation {
+            format: tally_wire::batch::format::ACARS_JSON,
+            timestamp: 1,
+            signal: 0,
+            data: br#"{"kind":"acars","label":"H1","t":1}"#.to_vec(),
+        };
+        let cost = reception_cost(&message);
+        let ceilings = Ceilings::new(u32::MAX, cost as u32);
+        let (inputs, intake) = channel(Arc::clone(&ceilings));
+        let frames = (1..=INPUT_BACKLOG as u64)
+            .map(frame)
+            .collect::<Result<Vec<_>, _>>()?;
+        inputs.offer_frames(frames);
+        inputs.offer_acars(message);
+        assert_eq!(intake.overflow.load(Ordering::Relaxed), 1);
+        assert_eq!(intake.acars_queued.load(Ordering::Relaxed), 0);
+        assert!(ceilings.admit_acars(cost, Instant::now()));
+        drop(inputs);
         Ok(())
     }
 
