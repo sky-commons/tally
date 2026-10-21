@@ -2,14 +2,19 @@
 # The map image's entrypoint (RFC-0187 §1; packaging/map/README.md): readsb, net-only, decoding the
 # relay's --beast-out; nginx serving tar1090 over readsb's output on :8080; and the archiver, which
 # packs each finished UTC day of the globe history into one tar for the open data releases
-# (RFC-0187 §3). All three run as this image's user; if any exits, the others are stopped and the
-# container exits with a failure, so the host's restart policy brings them back together.
+# (RFC-0187 §3); and preview.py, which draws a link's picture (RFC-0187 §3). All four run as this
+# image's user; if any exits, the others are stopped and the container exits with a failure, so the
+# host's restart policy brings them back together.
 #
 # Environment:
 #   TALLY_MAP_BEAST       the relay's --beast-out, HOST:PORT or HOST,PORT (default 127.0.0.1:30105)
-#   TALLY_MAP_TITLE       the page's title (default Tally)
+#   TALLY_MAP_TITLE       the page's title, and the site a preview names (default Tally)
 #   TALLY_MAP_API         the tally-api origin routes are asked of, https://host[:port]; unset,
 #                         routes are off
+#   TALLY_MAP_TILES       the tile server previews' pictures are drawn from, https://host[:port]
+#                         (default https://tile.openstreetmap.org, OpenStreetMap's own)
+#   TALLY_MAP_URL         the map's public origin, https://host[:port], which a link's preview
+#                         names its page and picture by; unset, https:// and the host asked for
 #   TALLY_MAP_READSB_API  where readsb's query API listens, ADDRESS:PORT (default 127.0.0.1:30152)
 #   TALLY_MAP_JSON_EVERY  seconds between readsb's JSON writes and API updates (default 1)
 #   TALLY_MAP_HISTORY_DAYS  days of globe history kept, once each is archived (default 8)
@@ -145,6 +150,54 @@ api_port="${readsb_api##*:}"
 api_address="${api_address#[}"
 api_address="${api_address%]}"
 
+# Where nginx asks readsb's query API for a link's preview (preview.lua): the address it listens
+# on, or loopback when it listens on every address.
+case "$api_address" in
+0.0.0.0) api_reach="127.0.0.1" ;;
+:: | 0:0:0:0:0:0:0:0) api_reach="[::1]" ;;
+*:*) api_reach="[$api_address]" ;;
+*) api_reach="$api_address" ;;
+esac
+[[ "$api_reach" =~ ^[][0-9A-Za-z.:-]+$ ]] ||
+	fail "TALLY_MAP_READSB_API is '$readsb_api'; it is ADDRESS:PORT"
+echo "upstream readsb_api { server $api_reach:$api_port; }" >/run/tally-map/readsb.conf
+
+public_url="${TALLY_MAP_URL:-}"
+public_url="${public_url%/}"
+[[ -z "$public_url" || "$public_url" =~ ^https?://[][A-Za-z0-9.:-]+$ ]] ||
+	fail "TALLY_MAP_URL is '$public_url'; it is the map's public origin, such as https://map.example.org"
+export TALLY_MAP_URL="$public_url"
+
+# The tile server nginx fetches the pictures' tiles from (nginx.conf): OpenStreetMap's, tar1090's
+# default layer, unless the operator names another serving the same tiles at /{z}/{x}/{y}.png.
+tiles="${TALLY_MAP_TILES:-https://tile.openstreetmap.org}"
+tiles="${tiles%/}"
+[[ "$tiles" =~ ^https?://([][A-Za-z0-9.:-]+)$ ]] ||
+	fail "TALLY_MAP_TILES is '$tiles'; it is a tile server's origin, such as https://tile.openstreetmap.org"
+cat >/run/tally-map/tiles.conf <<EOF
+set \$tile_origin "$tiles";
+set \$tile_host "${BASH_REMATCH[1]}";
+EOF
+
+# The nameservers nginx looks up the tile server's name with, at each fetch (nginx.conf): the
+# container's own. With none, no tile is fetched and every picture is the site's card.
+resolvers=""
+while read -r keyword address _; do
+	[[ "$keyword" == nameserver ]] || continue
+	address="${address%%%*}"
+	if [[ "$address" =~ ^[0-9.]+$ ]]; then
+		resolvers+=" $address"
+	elif [[ "$address" =~ ^[0-9A-Fa-f:]+$ ]]; then
+		resolvers+=" [$address]"
+	fi
+done </etc/resolv.conf
+if [[ -n "$resolvers" ]]; then
+	echo "resolver$resolvers valid=300s;" >/run/tally-map/resolver.conf
+else
+	echo "tally-map: /etc/resolv.conf names no nameserver; previews will have no map" >&2
+	: >/run/tally-map/resolver.conf
+fi
+
 json_every="${TALLY_MAP_JSON_EVERY:-1}"
 [[ "$json_every" =~ ^[0-9]+(\.[0-9]+)?$ ]] ||
 	fail "TALLY_MAP_JSON_EVERY is '$json_every'; it is a number of seconds"
@@ -207,11 +260,13 @@ rate_bytes() {
 #   history  /globe_history/        4/16   4      ceiling/16     2
 #   archive  /archive/              4/16   2      ceiling/8      1
 #
-# The page (tar1090's own files) has no per-client limit, since a browser asks for its files all at
-# once and one refused breaks the page; its files are fixed, cacheable for two weeks, and share the
-# live class's slots. Every client is also held to 20 requests a second over /data/,
-# /globe_history/ and /archive/, with 40 more queued (nginx.conf's client_req): what one map page
-# asks, not a figure of bytes, so it does not move with the ceiling.
+# The page's files (tar1090's own) have no per-client limit, since a browser asks for them all at
+# once and one refused breaks the page; they are fixed, cacheable for two weeks, and share the live
+# class's slots. The page itself (/ and index.html, which may ask readsb for a link's preview) and
+# the previews' pictures are held to a client's 4 of them, as /data/ is. Every client is also held
+# to 20 requests a second over /data/, /globe_history/, /archive/, the page itself and the
+# pictures, with 40 more queued (nginx.conf's client_req): what one map page asks, not a figure of
+# bytes, so it does not move with the ceiling.
 max_upload="${TALLY_MAP_MAX_UPLOAD:-}"
 [[ -n "$max_upload" ]] ||
 	fail "TALLY_MAP_MAX_UPLOAD is unset; it is the most the map sends a second, as tally-relay's --max-upload takes it (README.md)"
@@ -397,12 +452,21 @@ readsb \
 names[$!]=readsb
 
 if [[ -z "$stopping" ]]; then
+	rm -f /run/tally-map/tiles.sock
 	nginx -e stderr -c /etc/tally-map/nginx.conf -g 'daemon off;' &
 	names[$!]=nginx
 fi
 if [[ -z "$stopping" ]]; then
 	archiver &
 	names[$!]=archiver
+fi
+# A socket left by a container stopped short would refuse the new one. preview.py imports
+# staticmap from its own directory, the image's.
+if [[ -z "$stopping" ]]; then
+	rm -f /run/tally-map/preview.sock
+	python3 -E -s /usr/local/lib/tally-map/preview.py serve /run/tally-map/preview.sock \
+		/run/tally-map/tiles.sock "$api_reach:$api_port" &
+	names[$!]=preview
 fi
 if [[ -n "$stopping" ]]; then
 	stop

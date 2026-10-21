@@ -7,8 +7,9 @@
 #   docker buildx build --platform linux/amd64,linux/arm64 -f packaging/map/Dockerfile packaging/map
 #
 # Every input is pinned: the Debian base by digest, Debian's packages by a snapshot of the archive
-# (and of its security updates) at one date and readsb, nginx and tini by version in it, tar1090 by
-# commit and the tarball's sha256, and the aircraft database's sources by commit and sha256.
+# (and of its security updates) at one date and readsb, nginx, its Lua module, lua-cjson and tini
+# by version in it, tar1090 by commit and the tarball's sha256, and the aircraft database's sources
+# by commit and sha256.
 
 # Debian 13 (trixie), slim, pinned by the digest of its multi-arch index
 # (`docker buildx imagetools inspect debian:trixie-slim`, 2026-10-05); the tag says which image the
@@ -37,6 +38,19 @@ ARG OURAIRPORTS_SHA256=0499dbd88de2fc735ac5c09f59796ccc3af544e17ffda807f793c0c6f
 ARG READSB_VERSION=3.14.1630+git20240609.adc080d-1
 ARG NGINX_VERSION=1.26.3-3+deb13u9
 ARG TINI_VERSION=0.19.0-3+b8
+# nginx's Lua module and Lua's JSON, Debian 13's packages, for the link previews (preview.lua).
+ARG NGINX_LUA_VERSION=1:0.10.28-2
+ARG LUA_CJSON_VERSION=2.1.0+dfsg-2.2+b2
+# Their pictures (preview.py): Pillow and requests, which staticmap draws with, Debian 13's, and
+# the certificates nginx checks OpenStreetMap's tile server by.
+ARG PYTHON_PIL_VERSION=11.1.0-5+deb13u4
+ARG PYTHON_REQUESTS_VERSION=2.32.3+dfsg-5+deb13u1
+ARG CA_CERTIFICATES_VERSION=20250419
+
+# komoot's staticmap (Apache-2.0), github.com/komoot/staticmap, the wheel PyPI publishes of 0.5.7,
+# unmodified.
+ARG STATICMAP_VERSION=0.5.7
+ARG STATICMAP_SHA256=f4ffc40ee4502b92e91045e0df85a46a2fd68483b4e7e404a6b545fd7396ea01
 
 # Debian's archive and its security updates as snapshot.debian.org kept them at this instant, so
 # every package above stays installable at its version after Debian moves on. A snapshot's
@@ -114,6 +128,13 @@ ARG DEBIAN_SNAPSHOT
 ARG READSB_VERSION
 ARG NGINX_VERSION
 ARG TINI_VERSION
+ARG NGINX_LUA_VERSION
+ARG LUA_CJSON_VERSION
+ARG PYTHON_PIL_VERSION
+ARG PYTHON_REQUESTS_VERSION
+ARG CA_CERTIFICATES_VERSION
+ARG STATICMAP_VERSION
+ARG STATICMAP_SHA256
 ARG TAR1090_COMMIT
 ARG MICTRONICS_COMMIT
 ARG OURAIRPORTS_COMMIT
@@ -125,12 +146,30 @@ RUN debian-snapshot "$DEBIAN_SNAPSHOT" \
   && apt-get update \
   && apt-get install -y --no-install-recommends \
     "readsb=${READSB_VERSION}" "nginx=${NGINX_VERSION}" "tini=${TINI_VERSION}" \
+    "libnginx-mod-http-lua=${NGINX_LUA_VERSION}" "lua-cjson=${LUA_CJSON_VERSION}" \
+    "python3-pil=${PYTHON_PIL_VERSION}" "python3-requests=${PYTHON_REQUESTS_VERSION}" \
+    "ca-certificates=${CA_CERTIFICATES_VERSION}" \
   && rm -rf /var/lib/apt/lists/* /etc/nginx/sites-enabled/* /usr/local/bin/debian-snapshot \
-  && install -d -o readsb /run/readsb /run/tally-map /var/globe_history /var/globe_history/archive
+  && install -d -o readsb /run/readsb /run/tally-map /var/globe_history /var/globe_history/archive \
+    /var/cache/tally-map
 
 COPY --from=web /usr/local/share/tar1090 /usr/local/share/tar1090
 COPY --from=web /out/aircraft.csv.gz /out/LICENSE-aircraft-database /out/ATTRIBUTION /usr/local/share/tally-map/
 COPY nginx.conf /etc/tally-map/nginx.conf
+COPY preview.lua 404.html /usr/local/share/tally-map/
+COPY preview.py /usr/local/lib/tally-map/preview.py
+
+# staticmap beside preview.py, which imports it, and its licence beside it; then the site's card,
+# drawn by preview.py once, here.
+ADD --checksum=sha256:${STATICMAP_SHA256} \
+  https://files.pythonhosted.org/packages/39/69/6f6c04591cced82a807b4b1e71e892ca7dc40c96d337ec6bd00f7be7035d/staticmap-${STATICMAP_VERSION}-py3-none-any.whl /tmp/staticmap.whl
+RUN set -eu; \
+  python3 -I -m zipfile -e /tmp/staticmap.whl /tmp/staticmap; \
+  cp -r /tmp/staticmap/staticmap /usr/local/lib/tally-map/staticmap; \
+  rm -f /usr/local/lib/tally-map/staticmap/tests.py; \
+  cp "/tmp/staticmap/staticmap-${STATICMAP_VERSION}.dist-info/LICENSE.txt" /usr/local/lib/tally-map/LICENSE-staticmap; \
+  rm -rf /tmp/staticmap /tmp/staticmap.whl; \
+  python3 -E -s /usr/local/lib/tally-map/preview.py card /usr/local/share/tally-map/card.jpg
 COPY --chmod=0755 entrypoint.sh /usr/local/bin/tally-map
 COPY README.md /usr/local/share/tally-map/README.md
 
@@ -140,6 +179,7 @@ LABEL org.opencontainers.image.source="https://github.com/sky-commons/tally" \
   org.skycommons.tally.tar1090="https://github.com/wiedehopf/tar1090/tree/${TAR1090_COMMIT}" \
   org.skycommons.tally.readsb="https://snapshot.debian.org/package/readsb/${READSB_VERSION}/" \
   org.skycommons.tally.aircraft-database="https://github.com/Mictronics/aircraft-database/tree/${MICTRONICS_COMMIT} (ODC-By-1.0)" \
+  org.skycommons.tally.staticmap="https://pypi.org/project/staticmap/${STATICMAP_VERSION}/ (Apache-2.0)" \
   org.skycommons.tally.airports="https://github.com/davidmegginson/ourairports-data/tree/${OURAIRPORTS_COMMIT} (Unlicense)"
 
 # The globe history, the heatmap and the daily archives, kept across restarts and upgrades;

@@ -9,6 +9,9 @@ What it gives: search, filters, aircraft details (registration, type, military a
 flags from the database below), trails, the table, layers, any aircraft's track by date, replay
 and the heatmap, all from the relay's own data.
 
+It also answers adsb.lol's short links and gives a link to an aircraft a preview card, its name and
+a picture of the map where it is (below, "Short links and previews").
+
 What it never shows is a receiver (docs/relay-operators.md: a receiver's site reaches only
 relays). It is a relay-side tool, on the relay's host, but everything it reads is what a client
 may hold: the relay's `--beast-out` gives each reception's message alone, with no receiver's
@@ -81,8 +84,10 @@ gh attestation verify oci://ghcr.io/sky-commons/tally-map:vX.Y.Z --repo sky-comm
 | Variable                       | Default           | What it is                                                                                                                                       |
 | ------------------------------ | ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `TALLY_MAP_BEAST`              | `127.0.0.1:30105` | The relay's `--beast-out`, `HOST:PORT` (or readsb's `HOST,PORT`). readsb dials it and redials every 5 s while it is down.                        |
-| `TALLY_MAP_TITLE`              | `Tally`           | The page's title.                                                                                                                                |
+| `TALLY_MAP_TITLE`              | `Tally`           | The page's title, and the site a preview names.                                                                                                  |
 | `TALLY_MAP_API`                | unset             | The `tally-api` origin (`https://host[:port]`, no path). The map asks it for routes at `/api/0/routeset`. Unset, routes are off.                 |
+| `TALLY_MAP_URL`                | unset             | The map's public origin (`https://host[:port]`), which a preview's links name in full. Unset, `https://` and the host asked for.                 |
+| `TALLY_MAP_TILES`              | OpenStreetMap     | The tile server the previews' pictures are drawn from (`https://host[:port]`, tiles at `/{z}/{x}/{y}.png`). Unset, `https://tile.openstreetmap.org`.|
 | `TALLY_MAP_READSB_API`         | `127.0.0.1:30152` | Where readsb's query API listens, which `tally-api --readsb http://127.0.0.1:30152` reads. Keep it on loopback: it is unauthenticated.           |
 | `TALLY_MAP_JSON_EVERY`         | `1`               | Seconds between readsb's writes of its JSON and its API's updates. `tally-api`'s streams want `0.2` (the top-level README, "Run the API").       |
 | `TALLY_MAP_HISTORY_DAYS`       | `8`               | Days of globe history kept (below). A day older is deleted once it is archived, never before; the map's history and heatmap reach back this far. |
@@ -119,15 +124,17 @@ The slots times the rates add up to the ceiling, so all of them together cannot 
 archive at 31,250; at `8Mbit/s`, four times that. The cost of a hard ceiling is that a response
 keeps to its slot's rate even when the other slots are idle.
 
-A request that finds its class's slots taken, or its visitor's share of them, is answered `503`;
-a visitor asking more than 20 requests a second over `/data/`, `/globe_history/` and `/archive/`
-(with 40 more queued) is answered `429`, a figure of what one map page asks, not of bytes, so it
-does not move with the ceiling. Each says when to come back in `Retry-After` (1 s for the page and
-`/data/`, 5 s for the history, 60 s for an archive). The page's own files have no per-visitor
-limit, since a browser asks for them all at once and one refused breaks the page; they are fixed,
-and a caching proxy keeps them two weeks (`Cache-Control`), so few reach the map. A request refused
-before it is served (a limit's answer, a closed archive's 404) is an error page of a couple of
-hundred bytes, no larger than the request.
+A request that finds its class's slots taken, or its visitor's share of them, is answered `503`; a
+visitor asking more than 20 requests a second over `/data/`, `/globe_history/`, `/archive/`, the
+page itself (`/` and `index.html`, which may ask readsb for a link's preview, below) and the
+previews' pictures, with 40 more queued, is answered `429`, a figure of what one map page asks, not
+of bytes, so it does not move with the ceiling. Each says when to come back in `Retry-After` (1 s
+for the page and `/data/`, 5 s for the history, 60 s for an archive). The page itself and the
+pictures are held to a visitor's share of the live slots too, 4, as `/data/` is. The page's other
+files have no per-visitor limit, since a browser asks for them all at once and one refused breaks
+the page; they are fixed, and a caching proxy keeps them two weeks (`Cache-Control`), so few reach
+the map. A request refused before it is served (a limit's answer, a closed archive's 404) is an
+error page of a couple of hundred bytes, no larger than the request.
 
 **Who a visitor is.** Behind a proxy every request comes from the proxy's address, so every
 visitor would share one visitor's limits. `TALLY_MAP_CLIENT_IP_HEADER` names the header the proxy
@@ -158,12 +165,79 @@ curl -sO -H "Authorization: Bearer $(cat archive-token)" https://map.example.org
 nginx compares the token as a regular expression does, not in constant time; a token of 64 random
 characters leaves its timing nothing worth telling.
 
+## Short links and previews
+
+The map answers adsb.lol's short links, each a redirect to tar1090's own query, with or without a
+trailing slash, and with the link's own query carried on after it (`/a1b2c3?zoom=9` goes to
+`/?icao=a1b2c3&zoom=9`):
+
+| Link                    | Goes to                     |
+| ----------------------- | --------------------------- |
+| `/<hex>`                | `/?icao=<hex>`              |
+| `/<registration>`       | `/?reg=<registration>`      |
+| `/<lat>,<lon>[,<zoom>]` | `/?lat=..&lon=..[&zoom=..]` |
+
+A hex is six hex digits, or tar1090's `~` and six for an address that is not ICAO's; a
+registration 3 to 8 letters, digits and one hyphen, with a letter; a place a latitude to 90, a
+longitude to 180 and a zoom to 20. Any other path that is not one of the page's own files is the
+map's not-found page, which links back to the site. The site's short links
+(`tally.skycommons.org/<hex>`) hand off to these, so the rules are the map's alone.
+
+A chat app or a social site reads a link's Open Graph tags to draw its card, and does not run the
+page's JavaScript. So when the page is asked for one aircraft (`?icao=`, or `?reg=`, which every
+aircraft short link goes to), nginx asks readsb's query API for it (`preview.lua`, nginx's Lua
+module) and puts its tags in the page's head:
+
+- the title, its callsign, registration and type, each it has (`RYR4AB · EI-EFZ · BOEING 737-800`);
+- the description, its altitude and speed (`36,000 ft · 452 kt`), or `Not heard right now`;
+- the picture (`summary_large_image`, 1200 by 630): the map around where readsb hears it now, with
+  one marker on it, at `/preview/<hex>/<lat>,<lon>.jpg`, the position rounded to 0.01 degrees; or,
+  for an aircraft readsb does not place, the site's card (`/card.jpg`);
+- `og:url`, the link itself, from `TALLY_MAP_URL`.
+
+The card shows the aircraft's position, which the map shows anyone. It shows nothing of a
+receiver: readsb here has none, and none of the fields readsb writes of its own (`r_dst`, `r_dir`,
+`rssi`) is read.
+
+The picture is drawn by `preview.py` with komoot's [staticmap](https://github.com/komoot/staticmap)
+over OpenStreetMap's standard tiles (`tile.openstreetmap.org`, or the server `TALLY_MAP_TILES`
+names, which serves the same tiles), the layer tar1090 draws by default, credited in the picture ("©
+OpenStreetMap contributors") as [OpenStreetMap's tile
+policy](https://operations.osmfoundation.org/policies/tiles/) asks. The policy asks a client to name
+itself, to cache, and to keep its use light: nginx fetches every tile for it, naming the image in
+its User-Agent, keeps each as long as OpenStreetMap's headers say and at least a week, fetches one
+tile once however many ask (`proxy_cache_lock`), and asks no more than 10 tiles a second. A picture
+draws only near where readsb hears the aircraft now (within a degree), so nobody can have the map
+draw anywhere else; anything it cannot draw is answered the site's card.
+
+What a preview costs:
+
+- **The page asked for an aircraft:** one question of readsb on loopback, answered within 250 ms to
+  connect and 250 ms to answer, or the page is served with its tags but no aircraft. While it waits
+  it holds one of the live class's 8 slots, and a visitor holds at most 4 of them at once and asks
+  at most 20 pages a second (40 more queued); so the worst a visitor can do is hold half the live
+  slots for half a second at a time.
+- **A picture:** drawn at most once a minute for one aircraft at one rounded position (nginx's
+  cache), one at a time with two waiting; one that waits past 10 s, or is refused, is the site's
+  card. A drawing takes about a second and about 75 MB of memory at its peak, and `preview.py` may
+  take no more than 768 MiB of address space. About twenty tiles a drawing, each fetched once a
+  week at most. A picture is about 75 KB, the card 25 KB, both sent in the page's class.
+- **Disk:** the cached pictures at most 32 MB and the tiles at most 128 MB, in the container's own
+  `/var/cache/tally-map` (gone with the container, and filled again as they are asked for).
+
+The image is 253 MB unpacked (69 MB to pull); the previews are 86 MB of it (Python, Pillow and
+requests for the pictures, nginx's Lua module for the tags), 21 MB of the pull.
+
 ## Ports and storage
 
-- `8080`: the map. `/` is tar1090, `/data/` readsb's JSON (`aircraft.json`, `receiver.json`, the
-  globe tiles and traces, open to any origin), `/globe_history/` the history, `/archive/` the daily
-  archives (below).
-- `127.0.0.1:30152` (`TALLY_MAP_READSB_API`): readsb's query API, for `tally-api`.
+- `8080`: the map. `/` is tar1090 (with the short links, the previews' pictures at `/preview/` and
+  the site's card at `/card.jpg`, above), `/data/` readsb's JSON (`aircraft.json`, `receiver.json`,
+  the globe tiles and traces, open to any origin), `/globe_history/` the history, `/archive/` the
+  daily archives (below).
+- `127.0.0.1:30152` (`TALLY_MAP_READSB_API`): readsb's query API, for `tally-api` and the
+  previews.
+- `/var/cache/tally-map`, the container's own: the previews' pictures and OpenStreetMap's tiles
+  (above, "Short links and previews"), at most 160 MB.
 - `/var/globe_history`, a volume: each day's traces, the heatmap, the daily archives (in
   `archive`), and readsb's state (traces across a restart, in `internal_state`, never served). The
   archiver deletes each date's history (`YYYY/MM/DD`) once it is older than
@@ -227,10 +301,19 @@ All of it unmodified, each from a pinned source (`Dockerfile` names every pin):
   GPL-2.0-or-later or GPL-3.0-or-later (`/usr/share/doc/readsb/copyright` in the image). Its
   source, the exact source package this binary was built from, kept for good by Debian's snapshot
   archive: [snapshot.debian.org/package/readsb/3.14.1630+git20240609.adc080d-1](https://snapshot.debian.org/package/readsb/3.14.1630%2Bgit20240609.adc080d-1/).
-- **nginx** `1.26.3-3+deb13u9` and **tini** `0.19.0-3+b8`, Debian 13's packages (BSD-2-Clause;
+- **nginx** `1.26.3-3+deb13u9`, its Lua module `libnginx-mod-http-lua` `1:0.10.28-2` (with LuaJIT,
+  lua-resty-core, lua-resty-lrucache and the NDK), **lua-cjson** `2.1.0+dfsg-2.2+b2` and **tini**
+  `0.19.0-3+b8`, Debian 13's packages (BSD-2-Clause; BSD-2-Clause, MIT and BSD-3-Clause; MIT;
   MIT). Every Debian package comes from snapshot.debian.org as it was at `20261005T000000Z`
   (`DEBIAN_SNAPSHOT` in the `Dockerfile`, with its security updates), so each stays installable at
   its version.
+- **Python 3**, **Pillow** `11.1.0-5+deb13u4`, **requests** `2.32.3+dfsg-5+deb13u1` and
+  **ca-certificates** `20250419`, Debian 13's packages (PSF-2.0; MIT-CMU; Apache-2.0; MPL-2.0), and
+  **staticmap** 0.5.7, [komoot/staticmap](https://github.com/komoot/staticmap), Apache-2.0, the
+  wheel PyPI publishes, checked by its sha256, unmodified (its licence in
+  `/usr/local/lib/tally-map/LICENSE-staticmap`).
+- **The previews' maps**: OpenStreetMap's standard tiles, fetched as they are asked for, not
+  shipped; map data © OpenStreetMap contributors, under the ODbL, credited in every picture.
 - **The aircraft database**: [Mictronics' aircraft database](https://github.com/Mictronics/aircraft-database)
   at commit `e7ff3f1474334b3f00d50a6661ef1c16754721a5` (2026-10-18), under the
   [Open Data Commons Attribution License](https://opendatacommons.org/licenses/by/1-0/) (ODC-By
