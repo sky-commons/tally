@@ -91,7 +91,8 @@ gh attestation verify oci://ghcr.io/sky-commons/tally-map:vX.Y.Z --repo sky-comm
 | `TALLY_MAP_TITLE`              | `Tally`           | The page's title, and the site a preview names.                                                                                                  |
 | `TALLY_MAP_API`                | unset             | The `tally-api` origin (`https://host[:port]`, no path). The map asks it for routes at `/api/0/routeset`. Unset, routes are off.                 |
 | `TALLY_MAP_URL`                | unset             | The map's public origin (`https://host[:port]`), which a preview's links name in full. Unset, `https://` and the host asked for.                 |
-| `TALLY_MAP_TILES`              | OpenStreetMap     | The tile server the previews' pictures are drawn from (`https://host[:port]`, tiles at `/{z}/{x}/{y}.png`). Unset, `https://tile.openstreetmap.org`.|
+| `TALLY_MAP_PREVIEWS`           | `on`              | `on` or `off`: a link's preview carries a picture of the map. Off, `preview.py` does not run and every preview's picture is the site's card (below).|
+| `TALLY_MAP_TILES`              | OpenStreetMap     | The tile server the previews' pictures are drawn from (`https://host[:port]`, tiles at `/{z}/{x}/{y}.png`). Unset, `https://tile.openstreetmap.org`. Ignored when `TALLY_MAP_PREVIEWS` is off.|
 | `TALLY_MAP_READSB_API`         | `127.0.0.1:30152` | Where readsb's query API listens, which `tally-api --readsb http://127.0.0.1:30152` reads. Keep it on loopback: it is unauthenticated.           |
 | `TALLY_MAP_JSON_EVERY`         | `1`               | Seconds between readsb's writes of its JSON and its API's updates. `tally-api`'s streams want `0.2` (the top-level README, "Run the API").       |
 | `TALLY_MAP_HISTORY_DAYS`       | `8`               | Days of globe history kept (below). A day older is deleted once it is archived, never before; the map's history and heatmap reach back this far. |
@@ -228,6 +229,14 @@ What a preview costs:
   week at most. A picture is about 75 KB, the card 25 KB, both sent in the page's class.
 - **Disk:** the cached pictures at most 32 MB and the tiles at most 128 MB, in the container's own
   `/var/cache/tally-map` (gone with the container, and filled again as they are asked for).
+
+On a small server, `TALLY_MAP_PREVIEWS=off` turns the pictures off and keeps the rest: the short
+links work, and a link's preview still carries its title, description and `og:url`, with the
+site's card (`/card.jpg`, a fixed file in the image) as its picture. `preview.py` does not run,
+which saves its renderer's memory (measured on x86_64: about 38 MiB resident idle, 73 MiB at its
+peak drawing), `/preview/` is the map's not-found page, and no tile is fetched or cached, so
+`TALLY_MAP_TILES` is not read. nginx's Lua module and the caches' shared memory and manager stay,
+a few MiB.
 
 The image is 253 MB unpacked (69 MB to pull); the previews are 86 MB of it (Python, Pillow and
 requests for the pictures, nginx's Lua module for the tags), 21 MB of the pull.
