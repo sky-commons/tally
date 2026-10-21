@@ -2141,8 +2141,9 @@ async fn taking(
 /// group's data is taken and the other is turned away with `Reason::Full`. The relay turned away
 /// takes that as "this provider is full": it routes what it would have sent the full relay to the
 /// next members of the area's trees, so the feeder's batches on the third relay reach the second
-/// relay and its subscriber all the same, and it does not dial the full relay again for the wait
-/// it was given (so the full relay turns each relay away once, never in a loop). The feed runs
+/// relay all the same: every one admitted there, by its own count of the receiver's batches
+/// (`Hub::station`), and read by its subscriber. It does not dial the full relay again for the wait it
+/// was given (so the full relay turns each relay away once, never in a loop). The feed runs
 /// past several receipt windows and their judgment, and routing around is no fault on either side
 /// (§2.6, "it is not demoted for it"), judged relay by relay: the full relay
 /// itself, which still takes the group's data over the session it admitted, and the second relay
@@ -2221,22 +2222,35 @@ async fn a_relay_whose_members_are_full_is_routed_around_and_the_data_still_arri
     // Twelve seconds of batches: at least one whole receipt window, its receipts and its judgment
     // (`sharing::member::RECEIPT_WINDOW_SECONDS`, and `PATIENT`'s grace and judgment) fall
     // inside the run, and the full relay's 60 s wait outlasts it.
-    let sent = 120;
+    let sent: u64 = 120;
     let author = feeder.public();
-    let heard = tokio::spawn(async move {
+    // The reader keeps up, as a subscriber the fan-out serves must: it reads on a thread of its
+    // own, polling every few milliseconds, never on the runtime the three relays' tasks crowd. A
+    // reader those tasks starve past `fanout::BEHIND_MS` on a loaded runner is let go as fallen
+    // behind, rightly, as a subscriber that slow is, which says nothing of what reached the relay.
+    // Bounded by `HANG`, and its fall, if it falls, is the test's error.
+    let heard = std::thread::spawn(move || -> std::result::Result<u64, String> {
+        let until = std::time::Instant::now() + HANG;
         let mut sequences = std::collections::BTreeSet::new();
-        let _ = relay_until(&subscriber, "the third relay's batches", |record| {
-            if let Record::Batch(batch) = record
-                && batch.receiver().ok() == Some(author)
-            {
-                sequences.insert(batch.sequence());
+        let mut taken = Vec::new();
+        while (sequences.len() as u64) < sent && std::time::Instant::now() < until {
+            let read = subscriber
+                .try_recv_many(&mut taken, 256)
+                .map_err(|fell| format!("the second relay's subscriber fell: {fell:?}"))?;
+            for one in taken.drain(..) {
+                if let Record::Batch(batch) = &*one.into_item().record
+                    && batch.receiver().ok() == Some(author)
+                {
+                    sequences.insert(batch.sequence());
+                }
             }
-            sequences.len() == sent
-        })
-        .await;
-        sequences.len()
+            if read == 0 {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        Ok(sequences.len() as u64)
     });
-    for sequence in 0..sent as u64 {
+    for sequence in 0..sent {
         let now = tally_relay::network::wall_ms();
         feed.writer
             .send(&[Record::Batch(fresh_batch(&feeder, sequence, now)?)])
@@ -2245,11 +2259,36 @@ async fn a_relay_whose_members_are_full_is_routed_around_and_the_data_still_arri
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     let fed_until = tally_relay::network::wall_ms();
-    let got = tokio::time::timeout(HANG, heard)
+    // Every batch reached the second relay: it kept each, as its own count of the receiver's new
+    // batches says (`Hub::station`). Read from the relay, not from a reader of its fan-out: a
+    // reader in this process shares the machine with the three relays, and one not polled for
+    // `fanout::BEHIND_MS` on a loaded runner is let go as fallen behind (rightly, as a subscriber
+    // that slow is), which says nothing of what reached the relay.
+    let kept = || {
+        next_hub
+            .station(&author)
+            .map_or((0, 0), |station| (station.batches, station.gaps))
+    };
+    tokio::time::timeout(HANG, async {
+        while kept().0 < sent {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .map_err(|_| {
+        let (batches, _) = kept();
+        format!("the second relay kept {batches} of the third relay's {sent} batches")
+    })?;
+    assert_eq!(kept(), (sent, 0), "the second relay's batches and gaps");
+    // And every one reached its subscriber.
+    let got = tokio::task::spawn_blocking(move || heard.join())
         .await
-        .map_err(|_| "the third relay's batches never all reached the second".to_owned())?
-        .map_err(text)?;
-    assert_eq!(got, sent);
+        .map_err(text)?
+        .map_err(|_| "the subscriber's reader panicked".to_owned())??;
+    assert_eq!(
+        got, sent,
+        "the second relay's subscriber read {got} of {sent}"
+    );
     // Past the judgment of the last window the feed reached.
     let window_ms = RECEIPT_WINDOW_SECONDS * 1000;
     let judged_at = fed_until - fed_until % window_ms

@@ -22,6 +22,7 @@ use crate::fanout::Filter;
 use crate::hub::{Hub, Item};
 use crate::ingest::Stamp;
 use crate::network::{Asker, AskerRole};
+use crate::sharing::groups::GroupKey;
 use crate::subscription::Subscription;
 
 /// The watermark passes `now`, with `relay` (when given) the products' key: what they signed.
@@ -78,6 +79,12 @@ const BASE_MS: u64 = 1_791_244_800_000;
 const PEER: u64 = 7;
 
 type Result<T> = std::result::Result<T, String>;
+
+/// A regional batch checked, as its intake checks it before the products take it in.
+fn verified(batch: RegionalBatch) -> Result<crate::products::Verified> {
+    crate::products::Verified::of(batch)
+        .ok_or_else(|| "a regional batch that does not verify".into())
+}
 
 fn err(error: impl std::fmt::Display) -> String {
     error.to_string()
@@ -371,7 +378,7 @@ fn gather(inputs: &Inputs, second: u64, reversed: bool) -> Result<(Identity, Vec
     for record in shown {
         match record {
             Record::RegionalBatch(batch) => {
-                products.regional_from(&relay_asker(peer), batch, now);
+                products.regional_from(&relay_asker(peer), verified(batch)?, now);
             }
             Record::Positions(positions) => products.positions(&positions, PEER, now),
             _ => {}
@@ -534,13 +541,13 @@ fn no_aircraft_has_two_fixes_in_one_second_and_a_late_fix_is_dropped() -> Result
             let at = now / 1_000;
             products.regional_from(
                 &relay_asker(peer),
-                regional(
+                verified(regional(
                     &origin,
                     cell,
                     sequence,
                     now,
                     adsb_second(&addresses, at, false),
-                )?,
+                )?)?,
                 now,
             );
             sequence += 1;
@@ -819,19 +826,20 @@ fn a_peer_regional_batch_is_forwarded_once_unchanged_within_the_areas_taken() ->
     let last = forged_bytes.len() - 1;
     forged_bytes[last] ^= 1;
     let forged = RegionalBatch::from_bytes(forged_bytes).map_err(err)?;
+    // A forged one never reaches the products: only a checked one can (`products::Verified`).
+    assert!(crate::products::Verified::of(forged).is_none());
     let client = Asker {
         role: AskerRole::Client,
         ..relay_asker(peer)
     };
     for (asker, batch) in [
         (client, taken.clone()),
-        (relay_asker(peer), forged),
         (relay_asker(peer), taken.clone()),
         (relay_asker(peer), taken.clone()),
         (relay_asker(peer), not_taken),
         (relay_asker(peer), stale),
     ] {
-        products.regional_from(&asker, batch, now);
+        products.regional_from(&asker, verified(batch)?, now);
     }
     // The sealer takes them in once the watermark passes their stamp.
     products.advance(now + 1);
@@ -841,7 +849,7 @@ fn a_peer_regional_batch_is_forwarded_once_unchanged_within_the_areas_taken() ->
     assert_eq!(products.report().regional_forwarded, 1);
     assert_eq!(products.report().regional_stale, 1);
     // Heard back from another peer: already forwarded.
-    products.regional_from(&relay_asker(peer), taken, now + 50);
+    products.regional_from(&relay_asker(peer), verified(taken)?, now + 50);
     products.advance(now + 51);
     assert!(products.take_forward().is_empty());
     Ok(())
@@ -1047,7 +1055,7 @@ fn what_a_busy_area_and_the_world_cost_a_second() -> Result<()> {
             for chunk in adsb.chunks(1_000) {
                 let batch = regional(&origin, cell, sequence, now, adsb_second(chunk, at, false))?;
                 sequence += 1;
-                gatherer.regional_from(&relay_asker(peer), batch, now);
+                gatherer.regional_from(&relay_asker(peer), verified(batch)?, now);
             }
             for (n, chunk) in targets.chunks(100).enumerate() {
                 let n = n as u64;
@@ -1126,7 +1134,7 @@ fn the_precise_world_waits_for_finals_and_takes_no_provisional() -> Result<()> {
     let now = second * 1_000 + 1_500;
     products.clock_model(&inputs.mlat.model, PEER, now);
     for batch in &inputs.regional {
-        products.regional_from(&relay_asker(peer), batch.clone(), now);
+        products.regional_from(&relay_asker(peer), verified(batch.clone())?, now);
     }
     for positions in &inputs.positions {
         products.positions(positions, PEER, now);
@@ -1234,7 +1242,7 @@ fn every_drop_is_counted_by_why() -> Result<()> {
     let now = stamped + WAITING_MS + 2;
     for sequence in 0..=FORWARD_HELD as u64 {
         let batch = regional(&origin, atlanta, sequence, now - 100, Vec::new())?;
-        products.regional_from(&relay_asker(peer), batch, now);
+        products.regional_from(&relay_asker(peer), verified(batch)?, now);
     }
     products.advance(now + 1);
     assert_eq!(products.report().regional_forward_full, 1);
@@ -1561,6 +1569,227 @@ fn a_receivers_area_is_its_public_cells_parent_never_its_sites() -> Result<()> {
     assert_eq!(
         crate::sharing::group_of(&record, Some(public)),
         Some((parent, Streams::RAW))
+    );
+    Ok(())
+}
+
+/// What a regional test hub needs to tell a rebuilt record from this relay's own: a hub taking
+/// `area` with its key, its sharing member made by a tick, and a control showing a record this
+/// relay originates is held in its group (so a record that is not held was not seeded).
+fn seeding_hub(relay: &Identity, origin: &Identity, area: Region) -> Result<(Arc<Hub>, usize)> {
+    let hub = Arc::new(Hub::new(4, crate::sharing::Deadlines::RELAY).taking(vec![area]));
+    hub.network().adopt_identity(relay.clone());
+    let now = crate::network::wall_ms();
+    let _ = hub.network().tick(&hub, now);
+    let control = regional(origin, area, 99, now, adsb_second(&[9], 0, false))?;
+    hub.network()
+        .originate(&hub, &Record::RegionalBatch(control), now);
+    let seeded = hub.network().sharing.held().0;
+    if seeded == 0 {
+        return Err("a regional batch this relay originated was not held in its group".into());
+    }
+    Ok((hub, seeded))
+}
+
+/// The regional group of `area`: where these tests' regional batches are shared, and rebuilt.
+fn regional_group(area: Region) -> GroupKey {
+    GroupKey::new(area, tally_wire::Streams::REGIONAL)
+}
+
+/// `record` rebuilt from parity in `hub`'s `group` (its relay `relay` a member, with two others),
+/// and the handle the member's tick hands out with it, as the duties take it.
+fn rebuilt_in(
+    hub: &Arc<Hub>,
+    relay: &Identity,
+    group: GroupKey,
+    record: &Record,
+) -> Result<crate::sharing::Rebuilt> {
+    let signer = Identity::generate().map_err(err)?;
+    let parity_from = Identity::generate().map_err(err)?.public();
+    let members = [relay.public(), signer.public(), parity_from];
+    let now = crate::network::wall_ms();
+    let sharing = &hub.network().sharing;
+    sharing.fill_for_rebuild(
+        group,
+        &members,
+        (&signer, parity_from),
+        std::slice::from_ref(record),
+        now / 1000 - 2,
+        now,
+    )?;
+    sharing
+        .tick_member_for_test(now)
+        .into_iter()
+        .find(|(_, rebuilt)| rebuilt == record)
+        .map(|(handle, _)| handle)
+        .ok_or_else(|| "the record was not rebuilt".into())
+}
+
+/// Where `group` has `handle`'s record: (held, originated as this relay's own, refused).
+fn group_state(hub: &Hub, handle: crate::sharing::Rebuilt) -> (bool, bool, bool) {
+    let (group, hash) = (handle.group(), handle.hash());
+    hub.network()
+        .sharing
+        .member_for_test(|member| {
+            (
+                member.holds(group, &hash),
+                member.originated(group, &hash),
+                member.has_refused(group, &hash),
+            )
+        })
+        .unwrap_or_default()
+}
+
+/// A regional batch the sharing group rebuilt from parity is taken in as a member's is
+/// (`Hub::take_rebuilt`, `Network::take_regional`): to the products, which forward it once,
+/// unchanged, as from this relay's rebuilding (`RELAY_ITSELF`), held in the group that rebuilt it
+/// and never seeded into it as this relay's own. Before, the duties published it straight into the
+/// fan-out and seeded it as their own (`Network::tick`'s originate of its own regional batches), so
+/// the relay claimed another's record as its origin, and the products never saw it.
+#[test]
+fn a_regional_batch_rebuilt_from_parity_is_forwarded_once_and_never_seeded_as_this_relays()
+-> Result<()> {
+    let relay = Identity::generate().map_err(err)?;
+    let origin = Identity::generate().map_err(err)?;
+    let atlanta = area_of(&place(33.7, -84.4)).map_err(err)?;
+    let (hub, _) = seeding_hub(&relay, &origin, atlanta)?;
+    let listener = hub.listen(u64::MAX, Filter::Everything);
+    let now = crate::network::wall_ms();
+    let rebuilt = regional(&origin, atlanta, 0, now, adsb_second(&[1, 2], 0, false))?;
+    let record = Record::RegionalBatch(rebuilt.clone());
+    let handle = rebuilt_in(&hub, &relay, regional_group(atlanta), &record)?;
+    hub.take_rebuilt(handle, record.clone());
+    assert_eq!(
+        group_state(&hub, handle),
+        (true, false, false),
+        "a rebuilt regional batch: (held, seeded as this relay's own, refused)"
+    );
+    assert!(
+        listener.try_recv().is_none(),
+        "published before the products took it in"
+    );
+    hub.network().products.advance(hub.now_ms() + 1);
+    let forwarded = hub.network().products.take_forward();
+    assert_eq!(forwarded, vec![(crate::hub::RELAY_ITSELF, rebuilt.clone())]);
+    for (source, regional) in forwarded {
+        hub.publish_as(source, Record::RegionalBatch(regional));
+    }
+    // Taken in again (a member's copy after): not forwarded again.
+    hub.take_rebuilt(handle, record.clone());
+    hub.network().products.advance(hub.now_ms() + 1);
+    assert!(hub.network().products.take_forward().is_empty());
+    let mut reached = 0;
+    while let Some(item) = listener.try_recv() {
+        if *item.record == record {
+            reached += 1;
+        }
+    }
+    assert_eq!(reached, 1, "the fan-out had it {reached} times");
+    assert_eq!(hub.memory_report().rebuilt_refused, 0);
+    Ok(())
+}
+
+/// The client form of a regional batch, rebuilt from parity, is taken in as a member's is: checked,
+/// and forwarded to this relay's clients once while fresh, held in the group that rebuilt it and
+/// never seeded into it as this relay's own (before, the duties seeded it as theirs). One that does
+/// not verify is refused in its group, counted, and reaches no one.
+#[test]
+fn a_client_regional_batch_rebuilt_from_parity_reaches_clients_once_and_is_never_seeded()
+-> Result<()> {
+    let relay = Identity::generate().map_err(err)?;
+    let origin = Identity::generate().map_err(err)?;
+    let atlanta = area_of(&place(33.7, -84.4)).map_err(err)?;
+    let (hub, _) = seeding_hub(&relay, &origin, atlanta)?;
+    let listener = hub.listen(u64::MAX, Filter::Everything);
+    let now = crate::network::wall_ms();
+    let content = regional(&origin, atlanta, 0, now, adsb_second(&[1, 2], 0, false))?
+        .content()
+        .map_err(err)?
+        .for_clients();
+    let client = tally_wire::ClientRegionalBatch::sign(&origin, &content).map_err(err)?;
+    let mut forged_bytes = client.as_bytes().to_vec();
+    let last = forged_bytes.len() - 1;
+    forged_bytes[last] ^= 1;
+    let forged = Record::ClientRegionalBatch(
+        tally_wire::ClientRegionalBatch::from_bytes(forged_bytes).map_err(err)?,
+    );
+    let client = Record::ClientRegionalBatch(client);
+    let forged_handle = rebuilt_in(&hub, &relay, regional_group(atlanta), &forged)?;
+    hub.take_rebuilt(forged_handle, forged);
+    let handle = rebuilt_in(&hub, &relay, regional_group(atlanta), &client)?;
+    hub.take_rebuilt(handle, client.clone());
+    hub.take_rebuilt(handle, client.clone());
+    assert_eq!(
+        group_state(&hub, handle),
+        (true, false, false),
+        "a rebuilt client regional batch: (held, seeded as this relay's own, refused)"
+    );
+    assert_eq!(
+        group_state(&hub, forged_handle),
+        (false, false, true),
+        "a forged rebuilt client regional batch: (held, seeded as this relay's own, refused)"
+    );
+    let mut reached = 0;
+    while let Some(item) = listener.try_recv() {
+        if matches!(&*item.record, Record::ClientRegionalBatch(_)) {
+            assert_eq!(*item.record, client);
+            reached += 1;
+        }
+    }
+    assert_eq!(reached, 1, "the fan-out had it {reached} times");
+    assert_eq!(hub.memory_report().rebuilt_refused, 1);
+    Ok(())
+}
+
+/// A regional batch a member sent that does not verify is refused in its group, as any piece its
+/// relay refuses is: counted as had, so no repair asks for it again and it is never pushed on.
+/// Before, it was dropped and nothing told the group, which went on lacking it. A relay that is no
+/// member of the group adds nothing to it, not even a refusal (as `Network::from_peer` takes no
+/// piece from one): before, its forgeries each left an entry in the group, uncharged.
+#[test]
+fn a_members_regional_batch_that_does_not_verify_is_refused_in_its_group() -> Result<()> {
+    let relay = Identity::generate().map_err(err)?;
+    let origin = Identity::generate().map_err(err)?;
+    let atlanta = area_of(&place(33.7, -84.4)).map_err(err)?;
+    let (hub, _) = seeding_hub(&relay, &origin, atlanta)?;
+    let group = regional_group(atlanta);
+    let member = Identity::generate().map_err(err)?.public();
+    let stranger = Identity::generate().map_err(err)?.public();
+    hub.network()
+        .sharing
+        .groups
+        .set_offers(group, &std::collections::BTreeMap::from([(member, false)]));
+    let now = crate::network::wall_ms();
+    let refused = |sequence: u64, from: PublicKey| -> Result<bool> {
+        let taken = regional(
+            &origin,
+            atlanta,
+            sequence,
+            now,
+            adsb_second(&[1, 2], 0, false),
+        )?;
+        let mut forged_bytes = taken.as_bytes().to_vec();
+        let last = forged_bytes.len() - 1;
+        forged_bytes[last] ^= 1;
+        let forged = Record::RegionalBatch(RegionalBatch::from_bytes(forged_bytes).map_err(err)?);
+        let hash = crate::sharing::member::Piece::of(&forged)
+            .and_then(|piece| piece.hash())
+            .ok_or("no hash")?;
+        let _ = hub
+            .network()
+            .handle(&hub, &relay_asker(from), forged, now, None);
+        hub.network()
+            .sharing
+            .member_for_test(|member| member.has_refused(group, &hash))
+            .ok_or_else(|| "no member".into())
+    };
+    assert!(
+        refused(1, member)?,
+        "a member's forged regional batch was not refused in its group"
+    );
+    assert!(
+        !refused(2, stranger)?,
+        "a stranger's forged regional batch left a refusal in the group"
     );
     Ok(())
 }

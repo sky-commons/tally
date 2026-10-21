@@ -38,7 +38,7 @@ use crate::mlat_host::MlatHost;
 use crate::peers::Peers;
 use crate::products::Products;
 use crate::selection::Selection;
-use crate::sharing::Sharing;
+use crate::sharing::{Rebuilt, Sharing};
 use crate::standing::Standing;
 
 /// How often the timed duties run: often enough for provisional positions, which a hosted MLAT
@@ -337,30 +337,16 @@ impl Network {
                 self.products.precise_from(asker, world, hub.now_ms());
                 Vec::new()
             }
-            Record::RegionalBatch(regional) => {
-                let record = Record::RegionalBatch(regional.clone());
-                self.from_peer(hub, asker, &record, now_ms);
-                self.products.regional_from(asker, regional, hub.now_ms());
-                Vec::new()
-            }
-            // The regional product as a client is sent it: shared in its group with its twin, and
-            // forwarded to this relay's clients while fresh (verified first: a relay's own word).
-            Record::ClientRegionalBatch(regional) => {
-                let fresh = regional.content().is_ok_and(|content| {
-                    let stamp_ms = hub.now_ms();
-                    content
-                        .wall_ms
-                        .saturating_add(crate::products::REGIONAL_MAX_AGE_MS)
-                        >= stamp_ms
-                        && content.wall_ms
-                            <= stamp_ms.saturating_add(crate::products::REGIONAL_MAX_AHEAD_MS)
+            // The regional product, and its client form: the one intake each has
+            // (`take_regional`), received into its group from the member that sent it.
+            // One that fails its check is refused in its group, so no repair asks for it again.
+            record @ (Record::RegionalBatch(_) | Record::ClientRegionalBatch(_)) => {
+                let refused = record.clone();
+                let taken = self.take_regional(hub, asker, record, |record| {
+                    self.from_peer(hub, asker, record, now_ms);
                 });
-                if regional.verify().is_ok() {
-                    let record = Record::ClientRegionalBatch(regional);
-                    self.from_peer(hub, asker, &record, now_ms);
-                    if fresh {
-                        hub.publish_as(asker.source, record);
-                    }
+                if !taken {
+                    self.refused_from_peer(hub, asker, &refused, now_ms);
                 }
                 Vec::new()
             }
@@ -751,21 +737,96 @@ impl Network {
         }
     }
 
-    /// A record a peer sent that this relay refused: its group's member counts it as had and
-    /// never pushes it on (`sharing::Sharing::refused`).
-    pub fn refused_from_peer(&self, hub: &Hub, record: &Record, now_ms: u64) {
+    /// A group record this relay rebuilt from its group's parity (`sharing::member`'s rebuild,
+    /// `Hub::take_rebuilt`), judged and taken in as a member's would be: tagged for delivery as
+    /// one is (`tag`), and held and pushed on down its stripe in the group that rebuilt it now that
+    /// it passed (`Sharing::passed_on`), but not received into its group again, and no member
+    /// corroborated by it, since none sent it.
+    pub fn rebuilt(&self, hub: &Hub, rebuilt: Rebuilt, record: &Record, now_ms: u64) {
         let point = self.point_for(hub, record);
-        if let Some((cell, product)) = crate::sharing::group_of(record, point) {
+        self.tag(record, point, now_ms);
+        self.sharing.passed_on(rebuilt, record, now_ms);
+    }
+
+    /// A regional batch, or its client form, that `asker` sent or this relay rebuilt from its
+    /// group's parity (`Hub::take_rebuilt`): the one intake each has. Its signature is checked
+    /// first, and only one that passes is taken into its group by `share`, as where it came from
+    /// says, so one that fails travels no further. A regional batch then goes to the products,
+    /// which forward it unchanged when its cell is in an area this relay takes
+    /// (`Products::take_forward`); its client form is forwarded to this relay's clients while
+    /// fresh (a relay's own word). Whether it passed.
+    pub fn take_regional(
+        &self,
+        hub: &Hub,
+        asker: &Asker,
+        record: Record,
+        share: impl FnOnce(&Record),
+    ) -> bool {
+        match record {
+            Record::RegionalBatch(regional) => {
+                let Some(regional) = crate::products::Verified::of(regional) else {
+                    return false;
+                };
+                share(&Record::RegionalBatch(regional.batch().clone()));
+                self.products.regional_from(asker, regional, hub.now_ms());
+                true
+            }
+            Record::ClientRegionalBatch(regional) => {
+                if regional.verify().is_err() {
+                    return false;
+                }
+                let fresh = regional.content().is_ok_and(|content| {
+                    let stamp_ms = hub.now_ms();
+                    content
+                        .wall_ms
+                        .saturating_add(crate::products::REGIONAL_MAX_AGE_MS)
+                        >= stamp_ms
+                        && content.wall_ms
+                            <= stamp_ms.saturating_add(crate::products::REGIONAL_MAX_AHEAD_MS)
+                });
+                let record = Record::ClientRegionalBatch(regional);
+                share(&record);
+                if fresh {
+                    hub.publish_as(asker.source, record);
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// A record `asker` sent that this relay refused: its group's member counts it as had and
+    /// never pushes it on (`sharing::Sharing::refused`). Only a member of the group's refusal is
+    /// noted, as only a member's piece is received (`from_peer`): a stranger adds nothing to a
+    /// group, not even an entry saying what it lacks.
+    pub fn refused_from_peer(&self, hub: &Hub, asker: &Asker, record: &Record, now_ms: u64) {
+        let point = self.point_for(hub, record);
+        let Some((cell, product)) = crate::sharing::group_of(record, point) else {
+            return;
+        };
+        if self
+            .sharing
+            .groups
+            .members(cell, product)
+            .contains(&asker.key)
+        {
             self.sharing.refused(record, cell, product, now_ms);
         }
     }
 
-    /// What the timed duties publish now, each into the hub's fan-out.
-    pub fn tick(&self, hub: &Hub, now_ms: u64) -> Vec<Record> {
+    /// What the timed duties hand on now: what they publish, each into the hub's fan-out as the
+    /// relay's own, and the records the sharing groups rebuilt from parity, each taken in as a
+    /// member's piece is (`Hub::take_rebuilt`).
+    pub fn tick(&self, hub: &Hub, now_ms: u64) -> crate::sharing::Ticked {
         let identity = self.identity();
         let mut out = Vec::new();
         out.extend(self.directory.tick(hub, identity, now_ms));
-        out.extend(self.sharing.tick(hub, identity, now_ms));
+        let crate::sharing::Ticked {
+            rebuilt,
+            unreadable,
+            published,
+        } = self.sharing.tick(hub, identity, now_ms);
+        out.extend(published);
         // The products seal by the watermark as epochs close (`products::Sealer`); this takes
         // what they signed.
         out.extend(self.products.tick(identity));
@@ -840,7 +901,11 @@ impl Network {
                 self.originate(hub, record, now_ms);
             }
         }
-        out
+        crate::sharing::Ticked {
+            rebuilt,
+            unreadable,
+            published: out,
+        }
     }
 
     /// What the duties address to other relays now, each down a session to that relay (`peers`):
@@ -918,11 +983,18 @@ pub fn start(hub: Arc<Hub>, runtime: tokio::runtime::Handle) {
 }
 
 /// One pass of the timed duties (`start`).
-fn pass(hub: &Arc<Hub>, raw_ms: &mut u64) {
+pub(crate) fn pass(hub: &Arc<Hub>, raw_ms: &mut u64) {
     hub.idle();
     let now_ms = wall_ms();
-    for record in hub.network().tick(hub, now_ms) {
+    let ticked = hub.network().tick(hub, now_ms);
+    for record in ticked.published {
         hub.publish_own(record);
+    }
+    for (rebuilt, record) in ticked.rebuilt {
+        hub.take_rebuilt(rebuilt, record);
+    }
+    for rebuilt in ticked.unreadable {
+        hub.refuse_rebuilt(rebuilt);
     }
     // Positions held for their models past the wait go out even with nothing new coming.
     hub.release_awaiting();
