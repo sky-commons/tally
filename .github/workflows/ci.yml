@@ -49,3 +49,15 @@ jobs:
           bazel build --lockfile_mode=error --platforms=//platforms:linux_aarch64 \
             //crates/feed:tally-feed //crates/relay:tally-relay //crates/api:tally-api
           bazel build --lockfile_mode=error --platforms=//platforms:linux_armv7 //crates/feed:tally-feed
+
+  # The map image (packaging/map), built and run under Docker, which Bazel's tests do not have: its
+  # pages, short links and link previews over HTTP (packaging/tests/map.sh).
+  map:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      # v4.2.2, pinned by commit.
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - run: bash packaging/tests/map.sh
