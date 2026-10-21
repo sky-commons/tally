@@ -30,6 +30,7 @@ use crate::fanout::{BEHIND_MS, Bounds, Filter, Listener, Router};
 use crate::ingest::{Clock, InFlight, Pause, Refusal, Stage, Stages, Stamp, Threads};
 use crate::network::{Asker, Network};
 use crate::parts::Parts;
+use crate::sharing::Rebuilt;
 use crate::shed;
 use crate::stations::{STATIONS_REMEMBERED, StationReport, Stations, StationsReport};
 use crate::subscription::{ClientItem, ClientSubscription, Described, Subscription};
@@ -566,6 +567,10 @@ pub enum Origin {
     ),
     /// A sharing member or a relay link: a piece of a group.
     Peer(Asker),
+    /// A piece of a group this relay rebuilt from the group's parity (`sharing::member`'s
+    /// rebuild), handed in by the relay itself (`RELAY_ITSELF`, `Hub::take_rebuilt`) with the
+    /// group that rebuilt it: taken as a member's piece is, its verdict given back to that group.
+    Rebuilt(Rebuilt),
     /// Anywhere else (a subscriber, a test): forwarded, nothing more.
     Elsewhere,
 }
@@ -597,9 +602,22 @@ pub struct MemoryReport {
     /// every holder keeps a decode no longer than its deadline, the store being planned for the rate
     /// over the longest of them (`budget::decoded_window_ms`).
     pub decoded_refused: u64,
-    /// Batches a peer forwarded of a format this build reads that did not decode (a relay that
-    /// predates a format forwards it raw): dropped, never forwarded on.
+    /// Batches of a format this build reads that did not decode, from a peer (a relay that
+    /// predates a format forwards it raw) or any other source but a feeder (whose link ends
+    /// instead) and this relay's own rebuilding (counted in `rebuilt_refused`): dropped, never
+    /// forwarded on.
     pub malformed_batches: u64,
+    /// Records the sharing groups rebuilt from parity that this relay judged and refused, each
+    /// counted here alone (`Hub::refuse_rebuilt`): a batch or a piece whose signature or check
+    /// failed, a batch with no receiver to read or of a format this build reads that does not
+    /// decode, bytes that are no record (`sharing::Ticked::unreadable`). Let go from their group,
+    /// never passed on.
+    pub rebuilt_refused: u64,
+    /// Records rebuilt from parity let go for want of room (`Hub::take_rebuilt`, which never waits
+    /// on the timed duties' thread): `Store::Ingest` full, the ingest workers' queues full, or no
+    /// room in `Store::Decoded` for its decode. Each is let go from its group, which asks for it
+    /// again or rebuilds it again, so this counts attempts: a record let go twice counts twice.
+    pub rebuilt_no_room: u64,
     /// What the ingest rate cut, per source and reason (`shed`): every cut a feeder's batch met,
     /// all at ingest, before it was signed or shared.
     pub shed: crate::shed::ShedReport,
@@ -979,6 +997,10 @@ pub struct Hub {
     decoded_refused: AtomicU64,
     /// A peer's batches of a format this build reads that did not decode (`MemoryReport`).
     malformed_batches: AtomicU64,
+    /// Records rebuilt from parity this relay judged and refused (`MemoryReport`).
+    rebuilt_refused: AtomicU64,
+    /// Records rebuilt from parity let go for want of room in `Store::Ingest` (`MemoryReport`).
+    rebuilt_no_room: AtomicU64,
     over_ceiling_receptions: AtomicU64,
     /// The relay-wide ingest rate (`shed`): unbounded until the plan names `R_max`
     /// (`Hub::admitted_rate`).
@@ -1200,6 +1222,8 @@ impl Hub {
             over_ceiling_batches: AtomicU64::new(0),
             decoded_refused: AtomicU64::new(0),
             malformed_batches: AtomicU64::new(0),
+            rebuilt_refused: AtomicU64::new(0),
+            rebuilt_no_room: AtomicU64::new(0),
             over_ceiling_receptions: AtomicU64::new(0),
             shedder: crate::shed::Shedder::unbounded(),
             admitted_rate: None,
@@ -1483,6 +1507,8 @@ impl Hub {
             ingest_refused: self.stages.refused(),
             decoded_refused: self.decoded_refused.load(Ordering::Relaxed),
             malformed_batches: self.malformed_batches.load(Ordering::Relaxed),
+            rebuilt_refused: self.rebuilt_refused.load(Ordering::Relaxed),
+            rebuilt_no_room: self.rebuilt_no_room.load(Ordering::Relaxed),
             shed: self.shedder.report(),
             handshakes: self.handshake_report(),
         }
@@ -1950,6 +1976,171 @@ impl Hub {
         )
     }
 
+    /// A record this relay rebuilt from its sharing group's parity (`sharing::Ticked::rebuilt`):
+    /// taken in through the one intake its kind has, as a member's piece of the group is (a batch
+    /// admitted by the ingest stage, `take_piece`, `Network::take_regional`), handed in by the
+    /// relay itself (`RELAY_ITSELF`, the session the products charge its rebuilding to), and not
+    /// received into its group again, which holds it already (`Origin::Rebuilt`). Never published
+    /// straight into the fan-out: a batch rebuilt so was never admitted, so it was not remembered
+    /// as kept (a copy arriving after was published again), not counted for its station, not
+    /// decoded for the hosted MLAT or the message exchange, and placed for no regional subscriber.
+    ///
+    /// Every rebuilt record ends in one verdict, given back to the group that rebuilt it by its
+    /// handle (`rebuilt`, never reckoned again from the record): passed on (`Network::rebuilt`),
+    /// refused (`refuse_rebuilt`, counted in `rebuilt_refused`), or let go for want of room
+    /// (`let_go_rebuilt`, counted in `rebuilt_no_room`), so none stays held unjudged.
+    pub fn take_rebuilt(self: &Arc<Self>, rebuilt: Rebuilt, record: Record) {
+        match record {
+            Record::Batch(batch) => {
+                // One with no receiver to read is no batch any intake takes.
+                if batch.receiver().is_err() {
+                    self.refuse_rebuilt(rebuilt);
+                    return;
+                }
+                // Charged as the relay's own, but never waited for: the timed duties' thread
+                // hands it in, and sharing's sends and receipts must not queue behind ingest.
+                // Without room it is let go from its group, counted, and asked for again.
+                let Some(in_flight) = InFlight::try_trusted(
+                    &self.budget.gauge(Store::Ingest),
+                    crate::ingest::floored(crate::ingest::charge_of(&batch)),
+                ) else {
+                    self.let_go_rebuilt(rebuilt);
+                    return;
+                };
+                let handed = self.ingest(Inbound {
+                    source: RELAY_ITSELF,
+                    batch,
+                    origin: Origin::Rebuilt(rebuilt),
+                    verify: true,
+                    stamp: None,
+                    in_flight,
+                    refusal: None,
+                });
+                // Inline, `ingest` is the admission's own answer, which gave its verdict; across
+                // the workers it is false only when their queues were full and the batch was let
+                // go unadmitted (`Stages::run_charged`), which is no room.
+                if !handed && !self.stages.is_inline() {
+                    self.let_go_rebuilt(rebuilt);
+                }
+            }
+            record @ (Record::RegionalBatch(_) | Record::ClientRegionalBatch(_)) => {
+                // A relay with no identity yet is in no group, and has no word to forward as.
+                let Some(key) = self.network.identity().map(tally_wire::Identity::public) else {
+                    self.refuse_rebuilt(rebuilt);
+                    return;
+                };
+                let asker = Asker {
+                    role: crate::network::AskerRole::Relay,
+                    key,
+                    source: RELAY_ITSELF,
+                    loopback: true,
+                    address: None,
+                };
+                let taken = self.network.take_regional(self, &asker, record, |record| {
+                    self.network.rebuilt(self, rebuilt, record, self.now_ms());
+                });
+                if !taken {
+                    self.refuse_rebuilt(rebuilt);
+                }
+            }
+            // Anything else its kind's intake judges; one it does not pass on (refused, or a fault
+            // proof this relay cannot judge, which it forwards to no one) is refused in its group.
+            record => {
+                let passed = std::cell::Cell::new(false);
+                let taken = self.take_piece(RELAY_ITSELF, record, |record| {
+                    passed.set(true);
+                    self.network.rebuilt(self, rebuilt, record, self.now_ms());
+                });
+                if taken.is_err() || !passed.get() {
+                    self.refuse_rebuilt(rebuilt);
+                }
+            }
+        }
+    }
+
+    /// A record rebuilt from parity that this relay judged and refused: counted, and refused in
+    /// the group that rebuilt it, which lets it go and never passes it on (`Member::refuse`).
+    pub fn refuse_rebuilt(&self, rebuilt: Rebuilt) {
+        self.rebuilt_refused.fetch_add(1, Ordering::Relaxed);
+        self.network.sharing.refused_rebuilt(rebuilt, self.now_ms());
+    }
+
+    /// A record rebuilt from parity that this relay had no room to take in: counted, and let go
+    /// from the group that rebuilt it, which asks for it again (`Member::let_go`).
+    fn let_go_rebuilt(&self, rebuilt: Rebuilt) {
+        self.rebuilt_no_room.fetch_add(1, Ordering::Relaxed);
+        self.network.sharing.let_go(rebuilt);
+    }
+
+    /// A piece of a group's data other than a batch or a regional batch (positions, provisional
+    /// positions, a clock model, its client form, a fault proof), from session `source`: the one
+    /// intake each kind has, whether a member's link brought it (`link`) or this relay rebuilt it
+    /// from parity (`take_rebuilt`). Its signature is checked, `share` takes it into its group as
+    /// where it came from says, and it is published. A fault proof is checked before it is
+    /// forwarded: one this relay cannot judge (a proof format or a solver spec version it does not
+    /// know) is dropped and not held against the sender; one that proves nothing is an error (a
+    /// false accusation, which ends a link's session). Any other record is not a piece, and is an
+    /// error.
+    pub fn take_piece(
+        &self,
+        source: u64,
+        record: Record,
+        share: impl FnOnce(&Record),
+    ) -> Result<(), String> {
+        use tally_wire::fault_proof::{FAULT_PROOF_FORMAT, MODEL_FAULT_PROOF_FORMAT};
+        match record {
+            Record::Positions(positions) => {
+                let engine = positions.engine().map_err(|error| error.to_string())?;
+                positions.verify().map_err(|error| error.to_string())?;
+                share(&Record::Positions(positions.clone()));
+                self.publish_positions(source, positions, engine);
+            }
+            Record::Provisional(positions) => {
+                let engine = positions.engine().map_err(|error| error.to_string())?;
+                positions.verify().map_err(|error| error.to_string())?;
+                share(&Record::Provisional(positions.clone()));
+                self.publish_provisional(source, positions, engine);
+            }
+            Record::ClockModel(model) => {
+                let engine = model.engine().map_err(|error| error.to_string())?;
+                model.verify().map_err(|error| error.to_string())?;
+                self.network.hold_model(&model);
+                share(&Record::ClockModel(model.clone()));
+                self.publish_clock_model(source, model, engine);
+            }
+            // A clock model as a client reads it (no sites, no offsets), published beside its
+            // full model by the engine that signed both.
+            Record::ClientClockModel(model) => {
+                model.verify().map_err(|error| error.to_string())?;
+                share(&Record::ClientClockModel(model.clone()));
+                self.publish_client_clock_model(source, model);
+            }
+            Record::FaultProof(proof) => {
+                if proof.format() != FAULT_PROOF_FORMAT
+                    && proof.format() != MODEL_FAULT_PROOF_FORMAT
+                {
+                    return Ok(());
+                }
+                let spec = proof.spec_version().map_err(|error| error.to_string())?;
+                let Some(tolerance) = tally_wire::Tolerance::for_spec(spec) else {
+                    return Ok(());
+                };
+                proof
+                    .check(&tolerance)
+                    .map_err(|error| format!("sent a fault proof that proves nothing: {error}"))?;
+                share(&Record::FaultProof(proof.clone()));
+                self.publish_fault_proof(source, proof);
+            }
+            other => {
+                return Err(format!(
+                    "a record of kind {} is not a piece of a group",
+                    other.kind()
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// A receiver's batch, verified elsewhere, from `source`: as `ingest` with nothing to follow.
     /// What a test, a replay and the relay's own links publish by.
     pub fn publish_batch(self: &Arc<Self>, source: u64, batch: Batch, receiver: PublicKey) -> bool {
@@ -1974,12 +2165,18 @@ impl Hub {
             refusal,
         } = inbound;
         let Ok(receiver) = batch.receiver() else {
+            if let Origin::Rebuilt(rebuilt) = origin {
+                self.refuse_rebuilt(rebuilt);
+            }
             return false;
         };
         // A receiver's signature only: a relay's deduplicated batch never passes as one.
         if verify && let Err(error) = batch.verify() {
             if let Some(refusal) = refusal {
                 refusal.refuse(error.to_string());
+            }
+            if let Origin::Rebuilt(rebuilt) = origin {
+                self.refuse_rebuilt(rebuilt);
             }
             return false;
         }
@@ -2062,12 +2259,14 @@ impl Hub {
                             refusal.refuse(undecodable.error.to_string());
                         }
                     }
-                    Origin::Peer(_) => {
+                    Origin::Peer(asker) => {
                         self.malformed_batches.fetch_add(1, Ordering::Relaxed);
                         let record = Record::Batch(undecodable.batch);
                         self.network
-                            .refused_from_peer(self, &record, stamp.stamp_ms);
+                            .refused_from_peer(self, asker, &record, stamp.stamp_ms);
                     }
+                    // Counted once, as a rebuilt record refused (`rebuilt_refused`).
+                    Origin::Rebuilt(rebuilt) => self.refuse_rebuilt(*rebuilt),
                     Origin::Elsewhere => {
                         self.malformed_batches.fetch_add(1, Ordering::Relaxed);
                     }
@@ -2079,6 +2278,9 @@ impl Hub {
             }
             Err(tally_wire::decoded::NotDecoded::NoRoom(_)) => {
                 self.decoded_refused.fetch_add(1, Ordering::Relaxed);
+                if let Origin::Rebuilt(rebuilt) = origin {
+                    self.let_go_rebuilt(rebuilt);
+                }
                 return false;
             }
         };
@@ -2208,6 +2410,7 @@ impl Hub {
         match origin {
             Origin::Feeder(..) => self.network.originate(self, record, stamp_ms),
             Origin::Peer(asker) => self.network.from_peer(self, asker, record, stamp_ms),
+            Origin::Rebuilt(rebuilt) => self.network.rebuilt(self, *rebuilt, record, stamp_ms),
             Origin::Elsewhere => {}
         }
     }
@@ -3376,6 +3579,56 @@ mod tests {
             },
         )
         .map_err(|error| error.to_string())
+    }
+
+    /// A batch the sharing groups rebuilt from parity is taken in as a member's is, through the
+    /// ingest stage (`take_rebuilt`): its station counts it, and it is remembered as kept, so the
+    /// copy a member sends after is not published again. Before, a rebuilt batch went straight
+    /// into the fan-out as the relay's own: its station never counted it (a relay routing around a
+    /// full member reported one batch fewer than it had), nothing decoded it for the hosted MLAT,
+    /// and the copy that came after was new to the batch path and reached every subscriber twice.
+    #[test]
+    fn a_batch_rebuilt_from_parity_is_admitted_as_a_members_is() -> Result<(), String> {
+        let hub = Arc::new(Hub::new(8, crate::sharing::Deadlines::RELAY));
+        let out = hub.listen(u64::MAX, Filter::Everything);
+        let (receiver, receiver_key) = key()?;
+        let batch = signed_batch(&receiver, 0, Vec::new())?;
+        // A handle to no group this relay holds: the admission alone is under test here (the
+        // group's side is `sharing::tests::a_rebuilt_records_verdict_reaches_the_group_that_rebuilt_it`).
+        let rebuilt = Rebuilt::of(
+            crate::sharing::groups::GroupKey::new(
+                tally_wire::Region::containing(
+                    &tally_wire::Location {
+                        lat_e7: 0,
+                        lon_e7: 0,
+                        alt_m: 0,
+                        precision_m: 0,
+                    },
+                    3,
+                )
+                .map_err(|error| error.to_string())?,
+                tally_wire::Streams::RAW,
+            ),
+            batch.hash(),
+        );
+        hub.take_rebuilt(rebuilt, Record::Batch(batch.clone()));
+        // The member's own copy, arriving after the rebuild.
+        hub.publish_batch(7, batch, receiver_key);
+        let mut published = 0;
+        while let Some(item) = out.try_recv() {
+            if matches!(&*item.record, Record::Batch(_)) {
+                published += 1;
+            }
+        }
+        assert_eq!(
+            published, 1,
+            "the batch reached the fan-out {published} times"
+        );
+        assert_eq!(
+            hub.station(&receiver_key).map(|station| station.batches),
+            Some(1)
+        );
+        Ok(())
     }
 
     fn key() -> Result<(Identity, PublicKey), String> {

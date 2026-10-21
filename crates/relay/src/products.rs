@@ -643,6 +643,22 @@ enum Sealer {
     },
 }
 
+/// A regional batch whose signature was checked: made only by [`Verified::of`], so what takes
+/// one ([`Products::regional_from`]) never checks it again, and nothing reaches it unchecked.
+#[derive(Clone, Debug)]
+pub struct Verified(RegionalBatch);
+
+impl Verified {
+    /// `regional`, if its signature verifies.
+    pub fn of(regional: RegionalBatch) -> Option<Self> {
+        regional.verify().ok().map(|()| Self(regional))
+    }
+
+    pub fn batch(&self) -> &RegionalBatch {
+        &self.0
+    }
+}
+
 /// The products: the receivers' areas (read per batch by the ingest worker that owns the
 /// receiver's shard), and the sealer. Whoever holds them sees the sealer where it runs: moving it
 /// onto its thread (`on_thread`) needs no exclusive hold, so it can never be left behind inline.
@@ -998,13 +1014,15 @@ impl Products {
         }
     }
 
-    /// A regional batch a peer sent: once, its ADS-B positions become world candidates, and when
-    /// its cell is inside an area this relay takes it is forwarded unchanged
+    /// A regional batch a peer sent, its signature checked once by its intake
+    /// (`Network::take_regional`, [`Verified`]): once, its ADS-B positions become world
+    /// candidates, and when its cell is inside an area this relay takes it is forwarded unchanged
     /// ([`Products::take_forward`], never down the connection it came in on). Nothing is sent back.
-    pub fn regional_from(&self, asker: &Asker, regional: RegionalBatch, stamp_ms: u64) {
-        if asker.role != AskerRole::Relay || regional.verify().is_err() {
+    pub fn regional_from(&self, asker: &Asker, regional: Verified, stamp_ms: u64) {
+        if asker.role != AskerRole::Relay {
             return;
         }
+        let Verified(regional) = regional;
         let bytes = regional.as_bytes().len();
         self.record(
             From::Peer(asker.source),

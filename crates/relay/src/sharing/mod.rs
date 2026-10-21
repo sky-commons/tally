@@ -86,6 +86,54 @@ use self::withdrawal::Withdrawal;
 pub use self::member::Deadlines;
 pub use self::seeds::{SEED_COPIES, seeded_bytes};
 
+/// A record a sharing group rebuilt from parity and holds apart until this relay judges it: the
+/// exact group and hash it was rebuilt under, as the member holds it. Made only here, by the tick
+/// that rebuilt it ([`Sharing::tick`]), and handed back with the verdict ([`Sharing::passed_on`],
+/// [`Sharing::refused_rebuilt`], [`Sharing::let_go`]), so the verdict reaches the group that holds
+/// the record and is never reckoned again from the record (a clock model's tile, a receiver's
+/// described cell), which can say no group, or another.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Rebuilt {
+    group: GroupKey,
+    hash: tally_wire::batch::Hash,
+}
+
+impl Rebuilt {
+    /// A handle for a record a test's group holds rebuilt (`Member::tick`'s `Arrival::Rebuilt`).
+    #[cfg(test)]
+    pub(crate) fn of(group: GroupKey, hash: tally_wire::batch::Hash) -> Self {
+        Self { group, hash }
+    }
+
+    /// The group that rebuilt it, for a test.
+    #[cfg(test)]
+    pub(crate) fn group(&self) -> GroupKey {
+        self.group
+    }
+
+    /// Its hash, for a test.
+    #[cfg(test)]
+    pub(crate) fn hash(&self) -> tally_wire::batch::Hash {
+        self.hash
+    }
+}
+
+/// What a sharing tick hands on ([`Sharing::tick`]).
+#[derive(Debug, Default)]
+pub struct Ticked {
+    /// Records rebuilt from parity, new to this relay, each with the group that holds it: each is
+    /// taken in through the intake its kind has (`Hub::take_rebuilt`), as a member's piece of the
+    /// group is, never published straight into the fan-out, which would skip a batch's admission
+    /// (its dedup, its station, its decode for the hosted MLAT, its cell for regional
+    /// subscribers).
+    pub rebuilt: Vec<(Rebuilt, Record)>,
+    /// Records rebuilt from parity whose bytes are no record: no intake can judge one, so its
+    /// relay refuses it in its group, counted (`Hub::refuse_rebuilt`).
+    pub unreadable: Vec<Rebuilt>,
+    /// Records this relay signed of its own (bundle indexes), published as its own.
+    pub published: Vec<Record>,
+}
+
 /// The products an area's group shares (§2.5: raw, positions, provisional positions, clock
 /// models, and the regional product's deduplicated batches): every record of data one relay passes
 /// another travels in one of these groups.
@@ -454,6 +502,30 @@ impl Sharing {
         self.queue(out.unwrap_or_default());
     }
 
+    /// A record its group rebuilt from parity, which this relay judged and took in
+    /// (`Hub::take_rebuilt`) as `record`: held as taken in, as a member's piece is (an admitted
+    /// batch charged only its place), and pushed on down its stripe now (`Member::pass_on`).
+    pub fn passed_on(&self, rebuilt: Rebuilt, record: &Record, now_ms: u64) {
+        let Some(piece) = Piece::of(record) else {
+            return self.let_go(rebuilt);
+        };
+        let out =
+            self.with_member(|member| member.pass_on(rebuilt.group, rebuilt.hash, piece, now_ms));
+        self.queue(out.unwrap_or_default());
+    }
+
+    /// A record its group rebuilt from parity that this relay could not take in (no room): let
+    /// go, so the group asks for it again (`Member::let_go`).
+    pub fn let_go(&self, rebuilt: Rebuilt) {
+        self.with_member(|member| member.let_go(rebuilt.group, rebuilt.hash));
+    }
+
+    /// A record its group rebuilt from parity that this relay judged and refused: let go and
+    /// counted as had, never passed on (`Member::refuse`).
+    pub fn refused_rebuilt(&self, rebuilt: Rebuilt, now_ms: u64) {
+        self.with_member(|member| member.refuse(rebuilt.group, rebuilt.hash, now_ms));
+    }
+
     /// A group record a member sent that this relay refused (`Member::refuse`).
     pub fn refused(&self, record: &Record, cell: Region, product: Streams, now_ms: u64) {
         let Some(hash) = member::record_hash(record) else {
@@ -687,11 +759,11 @@ impl Sharing {
         lock(&self.withdrawal).covers(cell)
     }
 
-    /// What to publish now: records rebuilt from parity (new to this relay). Manifests,
-    /// receipts, assignments and repairs are addressed, and wait in the outbox. Membership is
-    /// refreshed first, from the areas this relay takes and the live offers for them, and the
-    /// regions it forwards in from what its egress has shed.
-    pub fn tick(&self, hub: &Hub, identity: Option<&Identity>, now_ms: u64) -> Vec<Record> {
+    /// What the tick hands on now: records rebuilt from parity (new to this relay), and the bundle
+    /// indexes due ([`Ticked`]). Manifests, receipts, assignments and repairs are addressed, and
+    /// wait in the outbox. Membership is refreshed first, from the areas this relay takes and the
+    /// live offers for them, and the regions it forwards in from what its egress has shed.
+    pub fn tick(&self, hub: &Hub, identity: Option<&Identity>, now_ms: u64) -> Ticked {
         let shed = forwarders_shed(&hub.egress().report());
         self.tick_shed(hub, identity, shed, now_ms)
     }
@@ -708,9 +780,9 @@ impl Sharing {
         identity: Option<&Identity>,
         shed: u64,
         now_ms: u64,
-    ) -> Vec<Record> {
+    ) -> Ticked {
         let Some(identity) = identity else {
-            return Vec::new();
+            return Ticked::default();
         };
         let me = identity.public();
         let network = hub.network();
@@ -849,17 +921,14 @@ impl Sharing {
             }
         }
         let indexes = self.bundle_indexes(member, identity, now_ms);
-        let rebuilt: Vec<Record> = member
-            .take_delivered()
-            .into_iter()
-            .filter(|delivered| delivered.arrival == Arrival::Rebuilt)
-            .filter_map(|delivered| delivered.piece.record())
-            .collect();
+        let (rebuilt, unreadable) = rebuilt_of(member);
         drop(guard);
         self.queue(out);
-        let mut published = rebuilt;
-        published.extend(indexes.into_iter().map(Record::BundleIndex));
-        published
+        Ticked {
+            rebuilt,
+            unreadable,
+            published: indexes.into_iter().map(Record::BundleIndex).collect(),
+        }
     }
 
     /// The bundle indexes due (§2.6): once a second, `BUNDLE_INDEX_AFTER_SECONDS` after it ends,
@@ -949,6 +1018,83 @@ impl Sharing {
 
     fn with_member<T>(&self, act: impl FnOnce(&mut Member) -> T) -> Option<T> {
         lock(&self.member).as_mut().map(act)
+    }
+
+    /// A test's hand on this relay's member (made by a tick, `tick_shed`).
+    #[cfg(test)]
+    pub(crate) fn member_for_test<T>(&self, act: impl FnOnce(&mut Member) -> T) -> Option<T> {
+        self.with_member(act)
+    }
+
+    /// A test's group set up to rebuild `records[0]`'s data stripe: `members` (this relay among
+    /// them), a manifest of every record signed and sent by `signer` (a member), every record
+    /// outside that stripe sent by `signer`, and the parity of them all sent by `parity_from`, all
+    /// of `second`. The stripe it lacks, rebuilt by the member's next tick past `second`'s
+    /// rebuild wait.
+    #[cfg(test)]
+    pub(crate) fn fill_for_rebuild(
+        &self,
+        group: GroupKey,
+        members: &[PublicKey],
+        (signer, parity_from): (&Identity, PublicKey),
+        records: &[Record],
+        second: u64,
+        now_ms: u64,
+    ) -> Result<u8, String> {
+        let pieces: Vec<(tally_wire::batch::Hash, Piece)> = records
+            .iter()
+            .map(|record| encoded(record).ok_or("no piece"))
+            .collect::<Result<_, _>>()?;
+        let lost = stripes::data_stripe(&pieces.first().ok_or("no records")?.0);
+        let mut hashes: Vec<_> = pieces.iter().map(|(hash, _)| *hash).collect();
+        hashes.sort();
+        let manifest = PieceManifest::sign(
+            signer,
+            &tally_wire::PieceManifestContent {
+                cell: group.cell,
+                product: group.product,
+                second,
+                hashes,
+            },
+        )
+        .map_err(|error| error.to_string())?;
+        let views: Vec<_> = pieces.iter().map(|(hash, piece)| (*hash, piece)).collect();
+        let parity =
+            parity::Parity::build(manifest.hash(), group.cell, group.product, second, &views);
+        let from = signer.public();
+        self.with_member(|member| {
+            let _ = member.set_members(group, members, &[], now_ms);
+            let _ = member.receive(from, Message::Manifest(manifest), now_ms);
+            for (hash, piece) in &pieces {
+                if stripes::data_stripe(hash) != lost {
+                    let message = Message::Piece {
+                        group,
+                        hash: *hash,
+                        piece: piece.clone(),
+                    };
+                    let _ = member.receive(from, message, now_ms);
+                }
+            }
+            let _ = member.receive(parity_from, Message::Parity(Arc::new(parity)), now_ms);
+        })
+        .ok_or("no member")?;
+        Ok(lost)
+    }
+
+    /// A test's tick of the member alone, its membership as the test set it (the whole tick
+    /// lays the groups out again from the directory): what it addresses is queued, and what it
+    /// rebuilt is handed on as the tick hands it ([`Ticked::rebuilt`]).
+    #[cfg(test)]
+    pub(crate) fn tick_member_for_test(&self, now_ms: u64) -> Vec<(Rebuilt, Record)> {
+        let mut guard = lock(&self.member);
+        let Some(member) = guard.as_mut() else {
+            return Vec::new();
+        };
+        let out = member.tick(now_ms);
+        let (rebuilt, _) = rebuilt_of(member);
+        drop(guard);
+        self.queue(out);
+        rebuilt
     }
 
     fn queue(&self, out: Vec<Outgoing>) {
@@ -1067,4 +1213,25 @@ fn to_records(message: Message) -> Vec<Record> {
         .map(|chunks| chunks.into_iter().map(Record::Parity).collect())
         .unwrap_or_default(),
     }
+}
+
+/// What `member` rebuilt from parity since it was last asked, each with the group that holds it
+/// ([`Rebuilt`]), for its relay to judge ([`Ticked::rebuilt`]); apart, those whose bytes are no
+/// record, which no intake can judge and its relay refuses ([`Ticked::unreadable`]).
+fn rebuilt_of(member: &mut Member) -> (Vec<(Rebuilt, Record)>, Vec<Rebuilt>) {
+    let (mut rebuilt, mut unreadable) = (Vec::new(), Vec::new());
+    for delivered in member.take_delivered() {
+        if delivered.arrival != Arrival::Rebuilt {
+            continue;
+        }
+        let handle = Rebuilt {
+            group: delivered.group,
+            hash: delivered.hash,
+        };
+        match delivered.piece.record() {
+            Some(record) => rebuilt.push((handle, record)),
+            None => unreadable.push(handle),
+        }
+    }
+    (rebuilt, unreadable)
 }

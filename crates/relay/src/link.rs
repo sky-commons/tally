@@ -20,9 +20,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tally_wire::backoff::Backoff;
-use tally_wire::fault_proof::{FAULT_PROOF_FORMAT, MODEL_FAULT_PROOF_FORMAT};
 use tally_wire::noise::{self, Accepted, Reader, Writer};
-use tally_wire::{ClientRecord, Identity, PublicKey, Reason, Record, Role, Tolerance};
+use tally_wire::{ClientRecord, Identity, PublicKey, Reason, Record, Role};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, watch};
@@ -2037,53 +2036,18 @@ fn ingest(
             };
             hub.keep_site(source, site, receiver, None, in_flight);
         }
-        Record::Positions(positions) => {
-            let engine = positions.engine().map_err(|error| error.to_string())?;
-            positions.verify().map_err(|error| error.to_string())?;
-            share(hub, peer, asker, &Record::Positions(positions.clone()));
-            hub.publish_positions(source, positions, engine);
-        }
-        Record::Provisional(positions) => {
-            let engine = positions.engine().map_err(|error| error.to_string())?;
-            positions.verify().map_err(|error| error.to_string())?;
-            share(hub, peer, asker, &Record::Provisional(positions.clone()));
-            hub.publish_provisional(source, positions, engine);
-        }
-        Record::ClockModel(model) => {
-            let engine = model.engine().map_err(|error| error.to_string())?;
-            model.verify().map_err(|error| error.to_string())?;
-            hub.network().hold_model(&model);
-            share(hub, peer, asker, &Record::ClockModel(model.clone()));
-            hub.publish_clock_model(source, model, engine);
+        // A piece of a group's data: taken in by the one intake each kind has (`Hub::take_piece`,
+        // which a piece this relay rebuilt from parity takes too), shared as its sender's role says.
+        record @ (Record::Positions(_)
+        | Record::Provisional(_)
+        | Record::ClockModel(_)
+        | Record::ClientClockModel(_)
+        | Record::FaultProof(_)) => {
+            hub.take_piece(source, record, |record| share(hub, peer, asker, record))?;
         }
         Record::ClockModelPart(part) => {
             hub.network().hold_part(&part);
             hub.publish_clock_model_part(source, part);
-        }
-        // A clock model as a client reads it (no sites, no offsets), published beside its full
-        // model by the engine that signed both.
-        Record::ClientClockModel(model) => {
-            model.verify().map_err(|error| error.to_string())?;
-            share(hub, peer, asker, &Record::ClientClockModel(model.clone()));
-            hub.publish_client_clock_model(source, model);
-        }
-        // Anyone may prove a fault, and every proof is checked before it is forwarded. One this
-        // relay cannot judge (a proof format or a solver spec version it does not know) is not
-        // forwarded and not held against the sender; one that proves nothing is a false
-        // accusation and ends the session.
-        Record::FaultProof(proof) => {
-            if proof.format() != FAULT_PROOF_FORMAT && proof.format() != MODEL_FAULT_PROOF_FORMAT {
-                return Ok(());
-            }
-            let spec = proof.spec_version().map_err(|error| error.to_string())?;
-            let Some(tolerance) = Tolerance::for_spec(spec) else {
-                return Ok(());
-            };
-            proof
-                .check(&tolerance)
-                .map_err(|error| format!("sent a fault proof that proves nothing: {error}"))?;
-            share(hub, peer, asker, &Record::FaultProof(proof.clone()));
-            hub.publish_fault_proof(source, proof);
         }
         Record::Subscribe { streams, regions } => {
             if regions.len() > MAX_REGIONS {

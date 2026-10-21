@@ -1028,6 +1028,16 @@ impl InFlight {
         }
     }
 
+    /// `bytes` charged to `gauge` (the relay's `Store::Ingest`) now, or `None` when it has no room:
+    /// for a record the relay itself hands in from a thread that must not wait (the timed duties
+    /// taking in a record rebuilt from parity, `Hub::take_rebuilt`), which counts the refusal.
+    pub fn try_trusted(gauge: &Arc<Gauge>, bytes: usize) -> Option<Self> {
+        Some(Self {
+            charge: gauge.try_charge(bytes)?,
+            _credit: None,
+        })
+    }
+
     /// Nothing charged: for a test that hands a stage its parts by hand.
     #[cfg(test)]
     pub fn free() -> Self {
