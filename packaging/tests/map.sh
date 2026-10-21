@@ -38,7 +38,7 @@ fi
 name="tally-map-test-$$"
 scratch="$(mktemp -d)"
 cleanup() {
-	docker rm -f "$name" >/dev/null 2>&1 || true
+	docker rm -f "$name" "tally-map-test-default-$$" "tally-map-test-off-$$" >/dev/null 2>&1 || true
 	rm -rf "$scratch"
 }
 trap cleanup EXIT
@@ -210,6 +210,49 @@ docker cp "$default:/var/globe_history/archive/.acars-read" "$scratch/acars-read
 # It never reached the relay, so it last read it, for all it knows, at the start of today.
 expect "the last read time is kept" "$(cat "$scratch/acars-read")" "$midnight"
 docker rm -f "$default" >/dev/null
+
+# With the pictures off: no preview.py, no /preview/, no tiles, and the site's card as a preview's
+# picture; TALLY_MAP_TILES, here not an origin at all, is not read.
+off="tally-map-test-off-$$"
+docker run -d --name "$off" -p 127.0.0.1::8080 -e TALLY_MAP_MAX_UPLOAD=8Mbit/s -e TALLY_MAP_IPV6=off \
+	-e TALLY_MAP_URL=https://map.example.org -e TALLY_MAP_PREVIEWS=off -e TALLY_MAP_TILES=nonsense \
+	"$image" >/dev/null
+docker cp "$here/map_feed.py" "$off:/tmp/map_feed.py"
+docker exec -d "$off" python3 -I /tmp/map_feed.py
+map="http://$(docker port "$off" 8080/tcp | head -1)"
+for _ in $(seq 60); do
+	page="$(get '/?icao=a32806' || true)"
+	[[ "$page" == *'og:title" content="TALLY1 · N302PA · PIPER PA-44 Seminole"'* &&
+		"$page" == *'og:description" content="3,000 ft"'* ]] && break
+	sleep 1
+done
+expect "no pictures, the title" "$page" '<meta property="og:title" content="TALLY1 · N302PA · PIPER PA-44 Seminole">'
+expect "no pictures, the description" "$page" '<meta property="og:description" content="3,000 ft">'
+expect "no pictures, the url" "$page" '<meta property="og:url" content="https://map.example.org/?icao=a32806">'
+expect "no pictures, the card" "$page" '<meta property="og:image" content="https://map.example.org/card.jpg">'
+refuse "no pictures, no picture's path" "$page" '/preview/'
+expect "no pictures, the card is served" "$(status /card.jpg)" '200'
+expect "no pictures, the short link" "$(status /a32806)" '302 /?icao=a32806'
+expect "no pictures, /preview/ is the map's 404" "$(status '/preview/a32806/37.62,-122.38.jpg')" '404'
+expect "no pictures, the not-found page" "$(get '/preview/a32806/37.62,-122.38.jpg')" '<h1>Nothing here</h1>'
+refuse "no pictures, no preview.py" "$(docker exec "$off" sh -c 'cat /proc/[0-9]*/cmdline | tr "\0" " "')" 'preview.py'
+refuse "no pictures, no preview socket" "$(docker exec "$off" ls /run/tally-map)" 'preview.sock'
+tile="$(docker exec "$off" python3 -I -c 'import http.client, socket
+c = http.client.HTTPConnection("localhost")
+c.sock = socket.socket(socket.AF_UNIX)
+c.sock.connect("/run/tally-map/tiles.sock")
+c.request("GET", "/7/20/49.png")
+print(c.getresponse().status)')"
+expect "no pictures, the tile server fetches nothing" "$tile" '404'
+expect "no pictures, still running" "$(docker inspect -f '{{.State.Running}}' "$off")" 'true'
+docker rm -f "$off" >/dev/null
+
+# Anything but on or off is refused, as the other switches are.
+bad=0
+docker run --rm -e TALLY_MAP_MAX_UPLOAD=8Mbit/s -e TALLY_MAP_IPV6=off -e TALLY_MAP_PREVIEWS=yes \
+	"$image" >/dev/null 2>"$scratch/bad" || bad=$?
+if ((bad == 64)); then pass "TALLY_MAP_PREVIEWS=yes exits 64"; else fail "TALLY_MAP_PREVIEWS=yes exits $bad"; fi
+expect "TALLY_MAP_PREVIEWS=yes, why" "$(cat "$scratch/bad")" "TALLY_MAP_PREVIEWS is 'yes'; it is on or off"
 
 if ((failures > 0)); then
 	echo "$failures failed" >&2

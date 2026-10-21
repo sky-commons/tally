@@ -218,7 +218,8 @@ neither is modified.
   and caches every tile, names the image in its User-Agent and asks at most 10 tiles a second. A
   picture is cached a minute for an aircraft at a position rounded to 0.01 degrees, drawn one at a
   time, and only near where readsb hears the aircraft; anything else is the site's card, a fixed
-  picture in the image.
+  picture in the image. An operator on a small host turns the pictures off with
+  `TALLY_MAP_PREVIEWS=off`: the renderer does not run, and every preview's picture is the card.
 - A status page and a hardware guide on the site.
 
 ## Rollout

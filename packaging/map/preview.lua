@@ -7,9 +7,9 @@
 --
 -- The tags name the aircraft from readsb's answer for it, and their picture is the map at its
 -- position (preview.py), which anyone reads on the map; the site's card when readsb hears it
--- nowhere. Nothing of a receiver: none of the fields readsb writes of its own (r_dst, r_dir,
--- rssi), which with the aircraft's position would place one (crates/api/src/privacy.rs; this
--- readsb has no receiver).
+-- nowhere, or always when TALLY_MAP_PREVIEWS is off (nginx's $previews). Nothing of a receiver:
+-- none of the fields readsb writes of its own (r_dst, r_dir, rssi), which with the aircraft's
+-- position would place one (crates/api/src/privacy.rs; this readsb has no receiver).
 local cjson = require "cjson.safe"
 
 -- The first of a parameter's comma-separated values (tar1090 takes a list), or nil.
@@ -71,9 +71,9 @@ if not origin or origin == "" then
 end
 
 -- The picture: the map at the aircraft's position, rounded to 0.01 degrees (about a kilometre),
--- which keys preview.py's cache; or the site's card.
+-- which keys preview.py's cache; or the site's card, which is all there is with the pictures off.
 local image, drawn = origin .. "/card.jpg", false
-if aircraft and type(aircraft.lat) == "number" and type(aircraft.lon) == "number"
+if ngx.var.previews ~= "off" and aircraft and type(aircraft.lat) == "number" and type(aircraft.lon) == "number"
     and type(aircraft.hex) == "string" and aircraft.hex:match("^~?%x%x%x%x%x%x$") then
     image = string.format("%s/preview/%s/%.2f,%.2f.jpg", origin, aircraft.hex:lower(), aircraft.lat, aircraft.lon)
     drawn = true
