@@ -15,7 +15,7 @@ use tally_wire::{
 
 use super::bundles::{BundleIndex, Bundles, Omission, children};
 use super::groups::{GroupKey, Groups};
-use super::member::{Deadlines, Member, Message, Outgoing, Piece};
+use super::member::{Arrival, Deadlines, Member, Message, Outgoing, Piece};
 use super::parity::Parity;
 use super::seeds::{
     SEED_COPIES, SEED_ROTATION_SECONDS, SEEDS, epoch_of, is_seed, seed_members, seeded_bytes,
@@ -214,11 +214,23 @@ impl Sim {
         }
     }
 
+    /// What member `i` newly holds, handed to its relay; one it rebuilt from parity is judged
+    /// there and passed on (`Hub::take_rebuilt`): every one here passes.
     fn collect(&mut self, i: usize) {
+        let mut out = Vec::new();
         for delivered in self.members[i].take_delivered() {
             *self.handed.entry((i, delivered.hash)).or_default() += 1;
             self.held_at.entry((i, delivered.hash)).or_insert(self.now);
+            if delivered.arrival == Arrival::Rebuilt {
+                out.extend(self.members[i].pass_on(
+                    delivered.group,
+                    delivered.hash,
+                    delivered.piece.clone(),
+                    self.now,
+                ));
+            }
         }
+        self.send(i, out);
     }
 
     /// Originates `count` new records at member `origin`, now.
@@ -1614,7 +1626,9 @@ fn a_false_parity_is_dropped_and_a_true_one_after_it_rebuilds() -> Outcome {
         .iter()
         .filter(|hash| data_stripe(hash) == lost)
         .count() as u64;
-    if member.stats().rebuilt != missing || !hashes.iter().all(|hash| member.holds(group, hash)) {
+    // Each held, or rebuilt and awaiting its relay's judgment.
+    let had = |hash: &Hash| member.holds(group, hash) || member.judging(group, hash);
+    if member.stats().rebuilt != missing || !hashes.iter().all(had) {
         return Err(format!(
             "rebuilt {} of {missing} after the true parity came",
             member.stats().rebuilt
@@ -1666,8 +1680,9 @@ fn a_true_parity_rebuilds_the_rest_of_a_stripe_partly_held_and_is_kept() -> Outc
     let parity = Parity::build(signed.hash(), group.cell, group.product, second, &views);
     let _ = member.receive(members[2], Message::Parity(Arc::new(parity)), START_MS);
     let _ = member.tick((second + 1) * 1000 + super::member::REBUILD_AFTER_MS);
-    if member.stats().rebuilt != in_lost - 1 || !hashes.iter().all(|hash| member.holds(group, hash))
-    {
+    // Each held, or rebuilt and awaiting its relay's judgment.
+    let had = |hash: &Hash| member.holds(group, hash) || member.judging(group, hash);
+    if member.stats().rebuilt != in_lost - 1 || !hashes.iter().all(had) {
         return Err(format!(
             "rebuilt {} of the {} the stripe lacked",
             member.stats().rebuilt,
@@ -1676,6 +1691,264 @@ fn a_true_parity_rebuilds_the_rest_of_a_stripe_partly_held_and_is_kept() -> Outc
     }
     if !member.holds_parity(group, &signed.hash()) {
         return Err("a true parity was let go for a stripe held in part".into());
+    }
+    Ok(())
+}
+
+/// A record rebuilt from parity is held and handed to the relay, and pushed on down its stripe only
+/// once the relay judged it and passed it on (`Member::pass_on`), as a piece a member sent is
+/// pushed on only once its relay took it in. One the relay refuses is let go and never travels:
+/// before, `rebuild` pushed it to the stripe's children at once, so a record its relay would
+/// refuse (a false fault proof, positions that do not verify) went on to every member below.
+#[test]
+fn a_rebuilt_record_is_pushed_on_only_once_its_relay_passed_it() -> Outcome {
+    let group = GroupKey::new(area()?, Streams::RAW);
+    let members = keys(24);
+    let receiver = identity(10_000);
+    let mut pieces = Vec::new();
+    for sequence in 0..24 {
+        pieces.push(record(&receiver, sequence, START_MS)?);
+    }
+    let second = START_MS / 1000;
+    let hashes: Vec<Hash> = pieces.iter().map(|(hash, _)| *hash).collect();
+    let lost = data_stripe(&hashes[0]);
+    // The member that rebuilds is interior in the stripe lost, so it has children to push to; the
+    // manifest's and the parity's senders are two others.
+    let layout = Layout::new(group.cell, group.product, &members, &[]);
+    let me = *layout
+        .interior(lost)
+        .first()
+        .ok_or("the stripe lost has no interior")?;
+    let index = members
+        .iter()
+        .position(|key| *key == me)
+        .ok_or("not a member")?;
+    let others: Vec<usize> = (0..members.len()).filter(|other| *other != index).collect();
+    let mut member = unlimited(identity(index));
+    let _ = member.set_members(group, &members, &[], START_MS);
+    let signed = manifest(&identity(others[0]), group, second, &hashes)?;
+    let _ = member.receive(
+        members[others[0]],
+        Message::Manifest(signed.clone()),
+        START_MS,
+    );
+    for (hash, bytes) in &pieces {
+        if data_stripe(hash) != lost {
+            let message = Message::Piece {
+                group,
+                hash: *hash,
+                piece: bytes.clone(),
+            };
+            let _ = member.receive(members[others[0]], message, START_MS);
+        }
+    }
+    let views: Vec<(Hash, &Piece)> = pieces.iter().map(|(h, b)| (*h, b)).collect();
+    let parity = Parity::build(signed.hash(), group.cell, group.product, second, &views);
+    let _ = member.receive(
+        members[others[1]],
+        Message::Parity(Arc::new(parity)),
+        START_MS,
+    );
+    let now = (second + 1) * 1000 + super::member::REBUILD_AFTER_MS;
+    let ticked = member.tick(now);
+    let rebuilt: Vec<Hash> = member
+        .take_delivered()
+        .into_iter()
+        .filter(|delivered| delivered.arrival == Arrival::Rebuilt)
+        .map(|delivered| delivered.hash)
+        .collect();
+    if rebuilt.len() < 2 {
+        return Err(format!(
+            "rebuilt {} records of the stripe lost",
+            rebuilt.len()
+        ));
+    }
+    let pieces_of = |out: &[Outgoing], hash: &Hash| {
+        out.iter()
+            .filter(
+                |sent| matches!(&sent.message, Message::Piece { hash: sent, .. } if sent == hash),
+            )
+            .count()
+    };
+    if rebuilt.iter().any(|hash| pieces_of(&ticked, hash) > 0) {
+        return Err("a rebuilt record was pushed on before its relay judged it".into());
+    }
+    // Held apart until judged: not among the records it holds, so none is answered to a repair.
+    if rebuilt
+        .iter()
+        .any(|hash| member.holds(group, hash) || !member.judging(group, hash))
+    {
+        return Err("a rebuilt record was held as judged before its relay judged it".into());
+    }
+    // Its relay refuses the first: let go, and never passed on.
+    let (refused, passed) = (rebuilt[0], rebuilt[1]);
+    member.refuse(group, refused, now);
+    if member.holds(group, &refused) {
+        return Err("a rebuilt record its relay refused is still held".into());
+    }
+    let piece_of = |hash: &Hash| {
+        pieces
+            .iter()
+            .find(|(held, _)| held == hash)
+            .map(|(_, piece)| piece.clone())
+            .ok_or("not a record of the manifest")
+    };
+    if pieces_of(
+        &member.pass_on(group, refused, piece_of(&refused)?, now),
+        &refused,
+    ) > 0
+    {
+        return Err("a rebuilt record its relay refused was pushed on".into());
+    }
+    // The second passed: pushed on to the stripe's children.
+    if pieces_of(
+        &member.pass_on(group, passed, piece_of(&passed)?, now),
+        &passed,
+    ) == 0
+    {
+        return Err("a rebuilt record its relay passed was not pushed on".into());
+    }
+    if !member.holds(group, &passed) || member.judging(group, &passed) {
+        return Err("a rebuilt record its relay passed is not held".into());
+    }
+    Ok(())
+}
+
+/// The hub gives each rebuilt record's verdict back to the group that rebuilt it, by the handle the
+/// tick handed out with it (`Rebuilt`), never by reckoning the group again from the record: a
+/// batch whose receiver this relay never saw described has no cell to reckon from, so before,
+/// the verdict reached no group. A batch that passes is held and pushed down its stripe; a forged
+/// one is refused, let go and never rebuilt again; one with no room in ingest is let go,
+/// counted, and rebuilt again by the next tick.
+#[test]
+fn a_rebuilt_records_verdict_reaches_the_group_that_rebuilt_it() -> Outcome {
+    use crate::hub::Hub;
+    let group = GroupKey::new(area()?, Streams::RAW);
+    let members = keys(24);
+    let receiver = identity(10_000);
+    let now = crate::network::wall_ms();
+    let second = now / 1000;
+    let mut records: Vec<Record> = Vec::new();
+    for sequence in 0..40 {
+        let (_, piece) = record(&receiver, sequence, now)?;
+        records.push(piece.record().ok_or("no record")?);
+    }
+    // The first is forged: its signature no longer verifies, though its bytes are a batch.
+    if let Some(Record::Batch(batch)) = records.first_mut() {
+        let mut bytes = batch.as_bytes().to_vec();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 1;
+        *batch = Batch::from_bytes(bytes).map_err(text)?;
+    }
+    let pieces: Vec<(Hash, Piece)> = records
+        .iter()
+        .map(|record| {
+            let piece = Piece::of(record).ok_or("no piece")?;
+            Ok((piece.hash().ok_or("no hash")?, piece))
+        })
+        .collect::<Result<_, String>>()?;
+    let lost = data_stripe(&pieces[0].0);
+    let in_lost: Vec<usize> = (0..pieces.len())
+        .filter(|at| data_stripe(&pieces[*at].0) == lost)
+        .collect();
+    if in_lost.len() < 3 {
+        return Err(format!("{} records in the stripe lost", in_lost.len()));
+    }
+    // This relay is interior in the stripe lost, so a record it passes has children to go to.
+    let layout = Layout::new(group.cell, group.product, &members, &[]);
+    let me = *layout.interior(lost).first().ok_or("no interior")?;
+    let index = members
+        .iter()
+        .position(|key| *key == me)
+        .ok_or("not a member")?;
+    let others: Vec<usize> = (0..members.len()).filter(|other| *other != index).collect();
+    let hub = Arc::new(Hub::new(8, Deadlines::RELAY).taking(vec![group.cell]));
+    hub.network().adopt_identity(identity(index));
+    let _ = hub.network().tick(&hub, now);
+    let sharing = &hub.network().sharing;
+    let hashes: Vec<Hash> = pieces.iter().map(|(hash, _)| *hash).collect();
+    let signed = manifest(&identity(others[0]), group, second, &hashes)?;
+    let views: Vec<(Hash, &Piece)> = pieces.iter().map(|(h, p)| (*h, p)).collect();
+    let parity = Parity::build(signed.hash(), group.cell, group.product, second, &views);
+    sharing
+        .member_for_test(|member| {
+            let _ = member.set_members(group, &members, &[], now);
+            let _ = member.receive(members[others[0]], Message::Manifest(signed.clone()), now);
+            for (hash, piece) in &pieces {
+                if data_stripe(hash) != lost {
+                    let message = Message::Piece {
+                        group,
+                        hash: *hash,
+                        piece: piece.clone(),
+                    };
+                    let _ = member.receive(members[others[0]], message, now);
+                }
+            }
+            let _ = member.receive(members[others[1]], Message::Parity(Arc::new(parity)), now);
+        })
+        .ok_or("no member")?;
+    let rebuild_at = (second + 1) * 1000 + super::member::REBUILD_AFTER_MS;
+    let rebuilt = sharing.tick_member_for_test(rebuild_at);
+    drop(sharing.take_outbox());
+    let handle = |at: usize| {
+        rebuilt
+            .iter()
+            .find(|(rebuilt, _)| rebuilt.hash == pieces[at].0)
+            .map(|(rebuilt, record)| (*rebuilt, record.clone()))
+            .ok_or(format!("record {at} was not rebuilt"))
+    };
+    let (forged, passed, no_room) = (
+        handle(in_lost[0])?,
+        handle(in_lost[1])?,
+        handle(in_lost[2])?,
+    );
+    let state = |hash: &Hash| {
+        sharing
+            .member_for_test(|member| (member.holds(group, hash), member.judging(group, hash)))
+            .unwrap_or_default()
+    };
+    // No room in ingest: let go, counted, and not held.
+    let ingest = hub.budget().gauge(Store::Ingest);
+    let full = ingest
+        .try_charge(ingest.limit() - 1)
+        .ok_or("ingest's room was not free")?;
+    hub.take_rebuilt(no_room.0, no_room.1);
+    drop(full);
+    if hub.memory_report().rebuilt_no_room != 1 || state(&no_room.0.hash) != (false, false) {
+        return Err("a rebuilt record with no room was not let go from its group".into());
+    }
+    // Forged: refused, counted, and not held.
+    hub.take_rebuilt(forged.0, forged.1);
+    hub.flush();
+    if hub.memory_report().rebuilt_refused != 1 || state(&forged.0.hash) != (false, false) {
+        return Err("a forged rebuilt record is still held in its group".into());
+    }
+    // Passed: held, and pushed down its stripe to its children.
+    let record = passed.1.clone();
+    hub.take_rebuilt(passed.0, passed.1);
+    hub.flush();
+    if state(&passed.0.hash) != (true, false) {
+        return Err("a rebuilt record that passed is not held in its group".into());
+    }
+    let sent = sharing
+        .take_outbox()
+        .into_iter()
+        .filter(|addressed| addressed.record == record)
+        .count();
+    if sent == 0 {
+        return Err("a rebuilt record that passed was not pushed down its stripe".into());
+    }
+    // The next rebuild: only the one let go for want of room is rebuilt again.
+    let again: Vec<Hash> = sharing
+        .tick_member_for_test(rebuild_at + 250)
+        .into_iter()
+        .map(|(rebuilt, _)| rebuilt.hash)
+        .collect();
+    if again != vec![no_room.0.hash] {
+        return Err(format!(
+            "rebuilt again {} records, not the one let go alone",
+            again.len()
+        ));
     }
     Ok(())
 }
@@ -2311,6 +2584,125 @@ fn a_repair_page_waits_charged_in_the_outbox_addressed_to_the_asker() -> Outcome
     drop(page);
     if gauge.held() != before {
         return Err("the page's charge outlived it".into());
+    }
+    Ok(())
+}
+
+/// One pass of the timed duties (`network::pass`) gives every record its group rebuilt a verdict:
+/// the tick's rebuilt records are each taken in (`Hub::take_rebuilt`), so a true batch is held
+/// in its group as the relay admitted it, its place charged and not its bytes again (the admitted
+/// batch's bytes carry their own charge, `Batch::owned_by`), and a forged one is refused, counted.
+/// A pass that let the tick's rebuilt records go would leave each held apart, unjudged, until the
+/// horizon.
+#[test]
+fn a_duties_pass_gives_every_record_its_group_rebuilt_a_verdict() -> Outcome {
+    use crate::hub::Hub;
+    let group = GroupKey::new(area()?, Streams::RAW);
+    let members = keys(4);
+    let hub = Arc::new(Hub::new(8, Deadlines::RELAY).taking(vec![group.cell]));
+    hub.network().adopt_identity(identity(0));
+    let now = crate::network::wall_ms();
+    let _ = hub.network().tick(&hub, now);
+    // A second whose rebuild wait is past by the pass's own clock.
+    let second = now / 1000 - 2;
+    let receiver = identity(10_000);
+    // Batches with receptions, so a batch's bytes are more than its place (`PIECE_ENTRY_BYTES`).
+    let mut records: Vec<Record> = Vec::new();
+    for sequence in 0..24u8 {
+        let observations = (0..4u8)
+            .map(|n| tally_wire::Observation {
+                format: b'3',
+                timestamp: u64::from(sequence) * 10 + u64::from(n),
+                signal: 0,
+                data: vec![n; 14],
+            })
+            .collect();
+        let batch = Batch::sign(
+            &receiver,
+            &BatchContent {
+                boot_id: 1,
+                sequence: u64::from(sequence),
+                counter_epoch: 0,
+                wall_ms: second * 1000,
+                dropped: 0,
+                previous: [0; 32],
+                observations,
+            },
+        )
+        .map_err(text)?;
+        records.push(Record::Batch(batch));
+    }
+    // The first, whose stripe is lost, is forged.
+    if let Some(Record::Batch(batch)) = records.first_mut() {
+        let mut bytes = batch.as_bytes().to_vec();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 1;
+        *batch = Batch::from_bytes(bytes).map_err(text)?;
+    }
+    let sharing = &hub.network().sharing;
+    let lost = sharing.fill_for_rebuild(
+        group,
+        &members,
+        (&identity(1), members[2]),
+        &records,
+        second,
+        now,
+    )?;
+    let in_lost: Vec<Hash> = records
+        .iter()
+        .filter_map(|record| Piece::of(record).and_then(|piece| piece.hash()))
+        .filter(|hash| data_stripe(hash) == lost)
+        .collect();
+    if in_lost.len() < 2 {
+        return Err(format!("{} records in the stripe lost", in_lost.len()));
+    }
+    let mut raw_ms = 0;
+    crate::network::pass(&hub, &mut raw_ms);
+    hub.flush();
+    let state = |hash: &Hash| {
+        sharing
+            .member_for_test(|member| {
+                (
+                    member.judging(group, hash),
+                    member.has_refused(group, hash),
+                    member.held_len_of(group, hash),
+                )
+            })
+            .unwrap_or((false, false, None))
+    };
+    if hub.network().sharing.stats().0.rebuilt != in_lost.len() as u64 {
+        return Err("the pass rebuilt nothing".into());
+    }
+    let (forged, true_ones) = (in_lost[0], &in_lost[1..]);
+    if state(&forged) != (false, true, None) {
+        return Err(format!("the forged rebuilt batch: {:?}", state(&forged)));
+    }
+    for hash in true_ones {
+        if state(hash) != (false, false, Some(super::member::PIECE_ENTRY_BYTES)) {
+            return Err(format!(
+                "a true rebuilt batch was not held as admitted: {:?}",
+                state(hash)
+            ));
+        }
+    }
+    if hub.memory_report().rebuilt_refused != 1 {
+        return Err("the forged rebuilt batch was not counted refused".into());
+    }
+    // What the member is charged is what its groups hold, counted afresh: each rebuilt copy's
+    // whole charge let go as it was judged, none of it left behind.
+    let (charged, counted, kept) = sharing
+        .member_for_test(|member| {
+            (
+                member.held_bytes(),
+                member.counted_bytes(),
+                member.group_bytes(),
+            )
+        })
+        .ok_or("no member")?;
+    if charged != counted || kept != counted {
+        return Err(format!(
+            "charged {charged} bytes, the groups count {kept}, and hold {counted}"
+        ));
     }
     Ok(())
 }

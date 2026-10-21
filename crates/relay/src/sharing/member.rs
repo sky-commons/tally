@@ -14,8 +14,10 @@
 //!   (`PieceManifest`) and floods it over every tree edge, with the parity of those records down
 //!   the parity stripe. A record no manifest lists is held and forwarded but never credited.
 //! - **Rebuild.** A member missing records of one data stripe of a manifest rebuilds them from the
-//!   others and the parity, and forwards them on as if they had arrived, so losing a parent costs
-//!   one stripe only until the parity comes.
+//!   others and the parity, and hands them to its relay, which judges each as it judges a piece a
+//!   member sent and only then has it forwarded on as if it had arrived (`Member::pass_on`), so
+//!   losing a parent costs one stripe only until the parity comes, and a record that fails its
+//!   relay's judgment travels no further.
 //! - **Repair (lazy).** A member still missing records asks a rotating member with its
 //!   `HaveSummary` (which seconds it holds whole); the answer is the manifests and records of the
 //!   seconds it lacks, paged. Repaired records are pushed on too (Plumtree's graft).
@@ -388,7 +390,9 @@ pub struct Delivered {
 /// What a member has done, for tests and the relay's report.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Stats {
-    /// Records rebuilt from parity.
+    /// Rebuilds from parity: each record rebuilt and handed to its relay for judgment. A record
+    /// its relay let go for want of room (`Member::let_go`) and rebuilt again is counted again, so
+    /// this counts rebuilds, not distinct records.
     pub rebuilt: u64,
     /// Asks for repair sent.
     pub repairs_asked: u64,
@@ -413,6 +417,15 @@ struct Held {
     at_ms: u64,
     /// Who sent it, and when, in order; empty for one this relay originated or rebuilt.
     from: Vec<(PublicKey, u64)>,
+}
+
+/// A record rebuilt from parity awaiting its relay's judgment (`Group::judging`), with the bytes
+/// it was charged when rebuilt: whichever verdict lets it go releases exactly that charge, and
+/// what it is held as once passed (`Member::pass_on`, the record as its relay took it in) is
+/// charged afresh.
+struct Judging {
+    held: Held,
+    charged: usize,
 }
 
 struct Listed {
@@ -496,10 +509,16 @@ struct Group {
     /// When the trees last changed, newest last.
     changed_ms: Vec<u64>,
     pieces: BTreeMap<Hash, Held>,
+    /// Records rebuilt from parity that this relay has not yet judged (`rebuild`): held apart
+    /// from `pieces`, charged and counted in `bytes`, so none is answered to a repair, used to
+    /// rebuild another, or pushed on before its relay takes it in (`Member::pass_on`), refuses it
+    /// (`Member::refuse`) or lets it go (`Member::let_go`). Counted as had, so no repair asks for
+    /// one while it waits.
+    judging: BTreeMap<Hash, Judging>,
     /// Records this relay refused (`Member::refuse`), with when: never held or pushed on, and
     /// counted as had, so a manifest that lists one is whole and no repair asks for it.
     refused: BTreeMap<Hash, u64>,
-    /// The bytes it holds, kept as they change: the encoded bytes of `pieces` and the bytes of
+    /// The bytes it holds, kept as they change: the encoded bytes of `pieces` and `judging`, and the bytes of
     /// `parity` (`Parity::len`), each charged to the member's gauge before it is held.
     bytes: usize,
     /// By second, then by the manifest's hash.
@@ -537,6 +556,7 @@ impl Group {
             layout: Layout::new(key.cell, key.product, &[me], &[]),
             changed_ms: Vec::new(),
             pieces: BTreeMap::new(),
+            judging: BTreeMap::new(),
             refused: BTreeMap::new(),
             bytes: 0,
             manifests: BTreeMap::new(),
@@ -715,9 +735,22 @@ impl Group {
         })
     }
 
-    /// Whether it holds `hash`, or refused it: either way, nothing to ask for.
+    /// Whether it holds `hash`, has it rebuilt and awaiting judgment, or refused it: either way,
+    /// nothing to ask for.
     fn has(&self, hash: &Hash) -> bool {
-        self.pieces.contains_key(hash) || self.refused.contains_key(hash)
+        self.pieces.contains_key(hash)
+            || self.judging.contains_key(hash)
+            || self.refused.contains_key(hash)
+    }
+
+    /// Lets go of a rebuilt record awaiting judgment, if it is one. The bytes it let go.
+    fn drop_judging(&mut self, hash: &Hash) -> usize {
+        let freed = self
+            .judging
+            .remove(hash)
+            .map_or(0, |judging| judging.charged);
+        self.bytes -= freed;
+        freed
     }
 
     /// Holds a piece, counting its bytes, which its caller has charged (`Member::charge`).
@@ -743,6 +776,7 @@ impl Group {
     /// (manifests, rebuilds, receipts, judgment, repair, forgetting).
     fn busy(&self) -> bool {
         !(self.pieces.is_empty()
+            && self.judging.is_empty()
             && self.manifests.is_empty()
             && self.parity.is_empty()
             && self.own.is_empty()
@@ -1007,6 +1041,11 @@ impl Member {
                     .map(|held| held.piece.held_len())
                     .sum::<usize>()
                     + group
+                        .judging
+                        .values()
+                        .map(|judging| judging.charged)
+                        .sum::<usize>()
+                    + group
                         .parity
                         .values()
                         .map(|held| held.parity.len())
@@ -1090,7 +1129,109 @@ impl Member {
     pub fn refuse(&mut self, group: GroupKey, hash: Hash, now_ms: u64) {
         if let Some(group) = self.groups.get_mut(&group) {
             group.refused.insert(hash, now_ms);
+            // One rebuilt from parity awaits its relay's judgment apart (`rebuild`): refused, it
+            // is let go, never answered to a repair nor passed on.
+            release(&mut self.held, group.drop_judging(&hash));
         }
+    }
+
+    /// A record rebuilt from parity (`rebuild`) that its relay could not take in for want of room
+    /// (`Hub::take_rebuilt`): let go, not refused, so the group lacks it again and repair asks a
+    /// member for it, or the parity rebuilds it again.
+    pub fn let_go(&mut self, group: GroupKey, hash: Hash) {
+        if let Some(group) = self.groups.get_mut(&group) {
+            release(&mut self.held, group.drop_judging(&hash));
+        }
+    }
+
+    /// A record rebuilt from parity (`rebuild`) that its relay judged and took in, as a member's
+    /// piece is judged before it is received (`Hub::take_rebuilt`): pushed on down its stripe now.
+    /// A piece is pushed on only once its relay took it in, however it came: a rebuilt one is
+    /// never passed on before, so a record its relay refuses (a false fault proof, positions that
+    /// do not verify) travels no further than the relay that rebuilt it (`refuse`).
+    /// One a member sent meanwhile was held and pushed on as it came (`piece`), so this one is let
+    /// go and nothing is pushed twice.
+    ///
+    /// What is held is `taken`, the record as its relay took it in, as a member's piece is held
+    /// (`Sharing::received`): a batch the relay admitted carries its own charge
+    /// (`Batch::owned_by`, `budget::Store::Decoded`), so the group charges it only its place
+    /// (`Piece::held_len`, [`PIECE_ENTRY_BYTES`]), not its bytes a second time. The rebuilt copy
+    /// and its whole charge are let go. One whose hash is not the rebuilt record's is no copy of
+    /// it, and the rebuilt copy is held instead.
+    pub fn pass_on(
+        &mut self,
+        key: GroupKey,
+        hash: Hash,
+        taken: Piece,
+        now_ms: u64,
+    ) -> Vec<Outgoing> {
+        let me = self.me;
+        let Some(group) = self.groups.get_mut(&key) else {
+            return Vec::new();
+        };
+        let Some(Judging {
+            held: rebuilt,
+            charged: freed,
+        }) = group.judging.remove(&hash)
+        else {
+            return Vec::new();
+        };
+        group.bytes -= freed;
+        release(&mut self.held, freed);
+        if group.pieces.contains_key(&hash) || group.refused.contains_key(&hash) {
+            return Vec::new();
+        }
+        let piece = if taken.hash() == Some(hash) {
+            taken
+        } else {
+            rebuilt.piece
+        };
+        // At most what the rebuilt copy held, just released, so it fits unless the store shrank.
+        if !charge(&mut self.held, &mut self.stats, piece.held_len()) {
+            return Vec::new();
+        }
+        group.hold(hash, piece.clone(), rebuilt.at_ms, rebuilt.from);
+        let out = push(group, &me, &me, data_stripe(&hash), now_ms, || {
+            Message::Piece {
+                group: key,
+                hash,
+                piece: piece.clone(),
+            }
+        });
+        self.route(out, None, now_ms)
+    }
+
+    /// What `group` charges for holding `hash` (`Piece::held_len`), if it holds it.
+    #[cfg(test)]
+    pub fn held_len_of(&self, group: GroupKey, hash: &Hash) -> Option<usize> {
+        self.groups
+            .get(&group)
+            .and_then(|group| group.pieces.get(hash))
+            .map(|held| held.piece.held_len())
+    }
+
+    /// Whether this relay originated `hash` in `group` (`Member::originate`): seeded as its own.
+    #[cfg(test)]
+    pub fn originated(&self, group: GroupKey, hash: &Hash) -> bool {
+        self.groups
+            .get(&group)
+            .is_some_and(|group| group.own.values().any(|own| own.contains(hash)))
+    }
+
+    /// Whether `group` counts `hash` refused (`Member::refuse`).
+    #[cfg(test)]
+    pub fn has_refused(&self, group: GroupKey, hash: &Hash) -> bool {
+        self.groups
+            .get(&group)
+            .is_some_and(|group| group.refused.contains_key(hash))
+    }
+
+    /// Whether `group` holds `hash` rebuilt from parity and awaiting its relay's judgment.
+    #[cfg(test)]
+    pub fn judging(&self, group: GroupKey, hash: &Hash) -> bool {
+        self.groups
+            .get(&group)
+            .is_some_and(|group| group.judging.contains_key(hash))
     }
 
     pub fn holds(&self, group: GroupKey, hash: &Hash) -> bool {
@@ -1267,6 +1408,9 @@ impl Member {
         let Some(group) = self.groups.get_mut(&key) else {
             return Vec::new();
         };
+        // A member's copy of one rebuilt and awaiting judgment: the member's, judged by its relay
+        // before it came here, is held and pushed on; the rebuilt one is let go (`pass_on`).
+        release(&mut self.held, group.drop_judging(&hash));
         let parent = group
             .layout
             .place(data_stripe(&hash), epoch_of(now_ms / 1000), &me)
@@ -1485,14 +1629,13 @@ impl Member {
                 now_ms,
                 (&mut self.held, &mut self.stats),
             ));
-            out.extend(rebuild(
+            rebuild(
                 group,
-                &me,
                 now_ms,
                 &mut self.held,
                 &mut self.delivered,
                 &mut self.stats,
-            ));
+            );
             out.extend(receipts(
                 group,
                 &self.identity,
@@ -1721,20 +1864,22 @@ fn originate_manifests(
     out
 }
 
-/// Rebuilds, from parity, a manifest's records when all it lacks are in one data stripe, and
-/// pushes them on down that stripe. Parity is unsigned, so it is checked here against the
+/// Rebuilds, from parity, a manifest's records when all it lacks are in one data stripe, and holds
+/// them apart (`Group::judging`), handed to the relay (`Arrival::Rebuilt`), which judges each as a
+/// member's piece is and only then has it held and pushed on down its stripe (`Member::pass_on`),
+/// refuses it (`Member::refuse`) or lets it go (`Member::let_go`).
+/// Parity is unsigned, so it is checked here against the
 /// manifest's own hashes: with every other stripe held, a true parity rebuilds exactly the records
 /// missing, so one that rebuilds anything else (or nothing) is false and is dropped, and the next
 /// parity for the manifest that arrives is taken in its place. What it rebuilt that matches the
 /// manifest is kept either way: a record is checked by its own hash.
 fn rebuild(
     group: &mut Group,
-    me: &PublicKey,
     now_ms: u64,
     held: &mut Charge,
     delivered: &mut Vec<Delivered>,
     stats: &mut Stats,
-) -> Vec<Outgoing> {
+) {
     let mut found: Vec<(Hash, Piece)> = Vec::new();
     let mut false_parity: Vec<Hash> = Vec::new();
     for (second, by_hash) in &mut group.manifests {
@@ -1749,7 +1894,9 @@ fn rebuild(
                 .hashes
                 .iter()
                 .filter(|hash| {
-                    !group.pieces.contains_key(*hash) && !group.refused.contains_key(*hash)
+                    !group.pieces.contains_key(*hash)
+                        && !group.judging.contains_key(*hash)
+                        && !group.refused.contains_key(*hash)
                 })
                 .copied()
                 .collect();
@@ -1806,32 +1953,34 @@ fn rebuild(
     for id in false_parity {
         release(held, group.drop_parity(&id));
     }
-    let mut out = Vec::new();
     for (hash, piece) in found {
-        if group.pieces.contains_key(&hash) {
+        if group.has(&hash) {
             continue;
         }
-        if !charge(held, stats, piece.held_len()) {
+        let charged = piece.held_len();
+        if !charge(held, stats, charged) {
             continue;
         }
-        group.hold(hash, piece.clone(), now_ms, Vec::new());
+        group.bytes += charged;
+        group.judging.insert(
+            hash,
+            Judging {
+                held: Held {
+                    piece: piece.clone(),
+                    at_ms: now_ms,
+                    from: Vec::new(),
+                },
+                charged,
+            },
+        );
         stats.rebuilt += 1;
         delivered.push(Delivered {
             group: group.key,
             hash,
-            piece: piece.clone(),
+            piece,
             arrival: Arrival::Rebuilt,
         });
-        let key = group.key;
-        out.extend(push(group, me, me, data_stripe(&hash), now_ms, || {
-            Message::Piece {
-                group: key,
-                hash,
-                piece: piece.clone(),
-            }
-        }));
     }
-    out
 }
 
 /// After each window and its grace: a receipt per stripe for each deliverer that owed this
@@ -2218,6 +2367,13 @@ fn forget(group: &mut Group, now_ms: u64) -> usize {
         let keep = held.at_ms >= horizon_ms;
         if !keep {
             freed += held.piece.held_len();
+        }
+        keep
+    });
+    group.judging.retain(|_, judging| {
+        let keep = judging.held.at_ms >= horizon_ms;
+        if !keep {
+            freed += judging.charged;
         }
         keep
     });
