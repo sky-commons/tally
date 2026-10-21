@@ -1,0 +1,56 @@
+load("@rules_rust//cargo:defs.bzl", "extract_cargo_lints")
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test", "rustfmt_test")
+load("//build:version.bzl", "VERSION")
+
+package(default_visibility = ["//:__subpackages__"])
+
+exports_files(["Cargo.toml"])
+
+extract_cargo_lints(
+    name = "cargo_lints",
+    manifest = "Cargo.toml",
+    workspace = "//:Cargo.toml",
+)
+
+rust_library(
+    name = "acars-collect",
+    srcs = glob(
+        ["src/**/*.rs"],
+        exclude = ["src/main.rs"],
+    ),
+    crate_name = "tally_acars_collect",
+    edition = "2024",
+    lint_config = ":cargo_lints",
+    version = VERSION,
+    deps = [
+        "//crates/wire",
+        "@tally_crates//:libc",
+    ],
+)
+
+# The map image runs it (packaging/map/entrypoint.sh); the release builds it beside the relay.
+rust_binary(
+    name = "tally-acars-collect",
+    srcs = ["src/main.rs"],
+    edition = "2024",
+    lint_config = ":cargo_lints",
+    version = VERSION,
+    deps = [":acars-collect"],
+)
+
+rust_test(
+    name = "acars-collect_test",
+    size = "small",
+    crate = ":acars-collect",
+    edition = "2024",
+    lint_config = ":cargo_lints",
+)
+
+rustfmt_test(
+    name = "rustfmt",
+    targets = [
+        ":acars-collect",
+        ":acars-collect_test",
+        ":tally-acars-collect",
+    ],
+)

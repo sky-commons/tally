@@ -2,6 +2,7 @@
 //! emits, the signed batches that carry them, the records that move between feeders, relays and
 //! subscribers, and the Noise transport every hop runs over. Every binary goes through this crate.
 
+pub mod acars;
 pub mod backoff;
 pub mod batch;
 pub mod beast;

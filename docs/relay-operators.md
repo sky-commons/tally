@@ -67,6 +67,13 @@ public.
   counter or signal level: those, against the aircraft positions anyone reads, solve a site, so
   they stay relay-only. It is what a local readsb decodes for the map (`tally-map`) and
   `tally-api`. It is unauthenticated, so it refuses to bind anything but loopback.
+- `tally-feed --acars` signs an ACARS, VDL2 or HFDL message only in one flat schema
+  (`tally_wire::acars`: the aircraft, the ground station, the message's own fields and text) and
+  its time to the whole second; the station, its signal, frequency, decoder counters, clock past
+  the second and the decoders' frame trees are dropped. `tally-relay --acars-out` serves each line
+  as signed only when it is exactly that, loopback only, as `--beast-out`, and no other product
+  carries it. They travel in batches of their own format, which an older relay forwards without
+  reading, so none reaches its products.
 - `tally-map` gives its readsb no location and draws no site marker, range rings or range
   outline, and `tally-api`'s `/v2` drops what readsb says of its own receiver (distance,
   direction, signal level), whatever readsb it reads. Do not give a public map's readsb a

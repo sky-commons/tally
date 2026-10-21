@@ -1,6 +1,10 @@
 This archive is one UTC day of a Tally relay's globe history: what readsb, decoding the relay's
-ADS-B, wrote for that day (each aircraft's trace and the heatmap), as the tally-map image packs it
-(github.com/sky-commons/tally, packaging/map).
+ADS-B, wrote for that day (each aircraft's trace and the heatmap), and where the relay serves them,
+the ACARS, VDL2 and HFDL messages its feeders published that day (acars.jsonl.gz: one JSON object a
+line in one flat schema, sorted by message time, holding only each ACARS message's aircraft,
+ground station, own fields, text and time to the second; a message more than one receiver heard
+is there once, timed at the median of its copies' seconds), as
+the tally-map image packs it (github.com/sky-commons/tally, packaging/map).
 
 The data in it is made available under the Open Database License (ODbL) 1.0:
 https://opendatacommons.org/licenses/odbl/1-0/

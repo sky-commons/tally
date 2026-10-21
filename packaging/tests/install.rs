@@ -622,6 +622,45 @@ fn an_install_waits_for_publishing_and_prints_the_station_page() -> Result {
 }
 
 #[test]
+fn an_install_names_each_acars_router_output_it_finds_and_adds_none() -> Result {
+    let sandbox = Sandbox::new("acars")?;
+    sandbox.release()?;
+    sandbox.file(
+        "journal",
+        "tally-feed: receiver x\ntally-feed: publishing to relay.example:10900 (version 1)\n",
+    )?;
+    let env = install_env(
+        &sandbox,
+        &[
+            ("TALLY_LAT", "51.5"),
+            ("TALLY_LON", "-0.1"),
+            ("TALLY_ALT", "20"),
+        ],
+    );
+    let out = sandbox.ok(
+        &format!("listening() {{ [[ $2 == 30005 || $2 == 15555 || $2 == 15556 ]]; }}\n{INSTALL}"),
+        &borrowed(&env),
+    )?;
+    // Publishing message text is the owner's choice: the run says the flag, and writes none.
+    for port in [15555, 15556] {
+        assert!(
+            out.contains(&format!("add --acars 127.0.0.1:{port} to TALLY_FEED_EXTRA")),
+            "{out}"
+        );
+    }
+    assert!(!out.contains("15550"), "{out}");
+    let written = sandbox.read("root/etc/default/tally-feed")?;
+    assert!(
+        written.contains(&format!(
+            "TALLY_FEED_ARGS=\"--relay relay.example:10900={RELAY_KEY} --lat 51.5 --lon -0.1 --alt 20\""
+        )),
+        "{written}"
+    );
+    assert!(!written.contains("--acars"), "{written}");
+    Ok(())
+}
+
+#[test]
 fn a_feeder_that_never_publishes_is_not_called_installed() -> Result {
     let sandbox = Sandbox::new("silent")?;
     sandbox.release()?;

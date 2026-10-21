@@ -76,6 +76,26 @@ fn batch(who: &Identity, sequence: u64, wall_ms: u64, messages: &[Vec<u8>]) -> A
     Decoded::from_verified(batch, wall_ms, sequence).unwrap_or_else(|error| panic!("{error:?}"))
 }
 
+/// An ACARS-family message's batch, which no figure counts.
+fn acars(who: &Identity, sequence: u64, wall_ms: u64) -> Arc<Decoded> {
+    let content = BatchContent {
+        boot_id: 1,
+        sequence,
+        counter_epoch: 0,
+        wall_ms,
+        dropped: 0,
+        previous: [0; 32],
+        observations: vec![Observation {
+            format: tally_wire::batch::format::ACARS_JSON,
+            timestamp: 5,
+            signal: 0,
+            data: br#"{"kind":"acars","label":"H1","t":1}"#.to_vec(),
+        }],
+    };
+    let batch = Batch::sign(who, &content).unwrap_or_else(|error| panic!("{error}"));
+    Decoded::from_verified(batch, wall_ms, sequence).unwrap_or_else(|error| panic!("{error:?}"))
+}
+
 /// A final position of `address` at `place`, at `at_ms`, citing one reception of each receiver.
 fn position(
     engine: &Identity,
@@ -174,7 +194,8 @@ fn public(site: LatLon) -> Region {
     .unwrap_or_else(|error| panic!("{error}"))
 }
 
-/// A and B feed; C is cited by MLAT but never fed here; two engines publish Z.
+/// A and B feed, B an ACARS message too; C is cited by MLAT but never fed here; two engines
+/// publish Z.
 fn fed() -> Figures {
     let (a, b, c) = (identity(7), identity(8), identity(9));
     let figures = Figures::new();
@@ -200,6 +221,7 @@ fn fed() -> Figures {
         Some(public(B_SITE)),
         now,
     );
+    figures.batch(&acars(&b, 1, T + 600), Some(public(B_SITE)), now);
     for engine in [identity(20), identity(21)] {
         figures.positions(
             &position(&engine, 0, Z.0, Z.1, T + 1_000, &[&a, &b, &c]),
@@ -242,6 +264,7 @@ fn each_figure_counts_what_it_says() {
     assert!(a.coverage_dkm2 >= km2(X.1) + km2(Y.1));
     assert!(a.unique_coverage_dkm2 >= km2(Y.1));
     let b = figure_of(&figures, 8);
+    // Not its ACARS message: none of the products.
     assert_eq!(b.messages, 2);
     assert_eq!(b.aircraft, 2);
     assert_eq!(b.mlat_positions, 1);
