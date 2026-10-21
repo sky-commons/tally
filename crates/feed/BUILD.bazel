@@ -47,9 +47,12 @@ rust_binary(
 rust_test(
     name = "feed_test",
     size = "small",
+    # Real decoders' lines, which src/acars.rs's tests read (`include_str!`).
+    compile_data = glob(["testdata/**"]),
     crate = ":feed",
     edition = "2024",
     lint_config = ":cargo_lints",
+    deps = ["@tally_crates//:serde_json"],
 )
 
 rustfmt_test(

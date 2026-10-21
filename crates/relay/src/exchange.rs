@@ -278,10 +278,16 @@ pub enum Envelope {
 }
 
 /// Splits a batch into one slice per thread its receptions' message shards run on, threads
-/// ascending, each slice's ranges ascending.
+/// ascending, each slice's ranges ascending. A reception that is no product's
+/// (`tally_wire::batch::format::in_products`: an ACARS-family message) is in no slice, so neither
+/// the deduplicated stream nor the regional product, nor any client form of them, carries one: it
+/// leaves the relay by `--acars-out` alone.
 pub fn split(decoded: &Arc<Decoded>, threads: usize, area: Option<Region>) -> Vec<(usize, Slice)> {
     let mut runs: Vec<Vec<Range<u32>>> = vec![Vec::new(); threads.max(1)];
     for (index, obs) in decoded.observations().iter().enumerate() {
+        if !tally_wire::batch::format::in_products(obs.format) {
+            continue;
+        }
         let index = index as u32;
         let ranges = &mut runs[thread_of(message_shard(obs.fp), threads)];
         match ranges.last_mut() {

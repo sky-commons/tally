@@ -2,9 +2,11 @@
 //! publishes it to the two nearest healthy relays on different networks (RFC-0174 §2.2). It listens on no port, takes no orders from the network, and
 //! changes nothing about the receiver's other feeds.
 
+pub mod acars;
 pub mod config;
 pub mod delivery_check;
 pub mod health;
+pub mod lines;
 pub mod precision;
 pub mod privilege;
 pub mod probe;
@@ -156,7 +158,18 @@ pub async fn run(config: Config) -> Result<(), String> {
     let (inputs, batching) = publish(identity, &config, Arc::clone(&health))?;
     tokio::spawn(source::read_beast(config.source, inputs.clone(), health));
     if let Some(uat) = config.uat {
-        tokio::spawn(source::read_uat(uat, inputs.clone()));
+        tokio::spawn(source::read_lines(
+            uat,
+            inputs.clone(),
+            source::LineSource::Uat,
+        ));
+    }
+    for acars in config.acars {
+        tokio::spawn(source::read_lines(
+            acars,
+            inputs.clone(),
+            source::LineSource::Acars,
+        ));
     }
     drop(inputs);
     batching.await;
@@ -165,7 +178,7 @@ pub async fn run(config: Config) -> Result<(), String> {
 
 /// Everything a feeder runs but its sources: the relay directory and its saving, the publisher
 /// (probing, choosing, the sessions, the delivery checks) and the batcher that owns the chain.
-/// Reads every field of `config` but `key`, `source` and `uat`, which are the caller's.
+/// Reads every field of `config` but `key`, `source`, `uat` and `acars`, which are the caller's.
 /// Returns the batcher's input, which the sources offer their receptions to, and the batcher
 /// itself, which runs until every clone of the input is dropped. `run` feeds it from the
 /// receiver's decoders; the load harness (`tally-load`) from the MLAT simulator, so each of its
@@ -175,6 +188,15 @@ pub fn start(
     config: &Config,
 ) -> Result<(source::Inputs, impl Future<Output = ()> + Send + 'static), String> {
     publish(identity, config, Arc::default())
+}
+
+/// The batcher `config` names: its ceiling, the ACARS share of it, the relays' wanted ceilings to
+/// shed to, and its compression.
+fn batcher(identity: Identity, config: &Config, wanted: Arc<source::WantedCeilings>) -> Batcher {
+    Batcher::new(identity, config.ceiling, config.clock)
+        .holding_acars_to(config.acars_ceiling)
+        .shedding_to(wanted)
+        .compressing_at(config.deflate_level)
 }
 
 /// `start`, telling `health` how many relay sessions are up.
@@ -208,20 +230,96 @@ fn publish(
         source_address: config.source_address,
         health,
     }));
-    let (inputs, intake) = source::channel();
-    let batching = source::batch(
-        Batcher::new(identity, config.ceiling, config.clock)
-            .shedding_to(wanted)
-            .compressing_at(config.deflate_level),
-        intake,
-        batches,
-    );
+    let batcher = batcher(identity, config, wanted);
+    let (inputs, intake) = source::channel(batcher.ceilings());
+    let batching = source::batch(batcher, intake, batches);
     Ok((inputs, batching))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The ceilings a run is configured with hold through the batcher it builds (`batcher`) and
+    /// what that publishes: offered an ACARS flood and more BEAST than the ceiling at once, the
+    /// messages take their configured share of the ceiling and ADS-B the rest of it.
+    #[tokio::test]
+    async fn adsb_keeps_the_ceiling_but_the_configured_acars_share() -> Result<(), String> {
+        use tally_wire::batch::format;
+        use tally_wire::{Frame, FrameKind, Observation, Record};
+        let args = [
+            "--key",
+            "k",
+            "--acars",
+            "127.0.0.1:15555",
+            "--ceiling",
+            "64000",
+            "--acars-ceiling",
+            "20000",
+        ];
+        let config::Command::Run(config) = config::parse(args.iter().map(|arg| (*arg).to_owned()))?
+        else {
+            return Err("not a run".to_owned());
+        };
+        let started = std::time::Instant::now();
+        let identity = Identity::generate().map_err(|error| error.to_string())?;
+        let batcher = batcher(identity, &config, Arc::default());
+        let (inputs, intake) = source::channel(batcher.ceilings());
+        let (out, mut published) = broadcast::channel(1024);
+        let batching = tokio::spawn(source::batch(batcher, intake, out));
+        let line = format!(r#"{{"text":"{}","timestamp":1}}"#, "x".repeat(990));
+        let line_cost = 10.0 + line.len() as f64;
+        for _ in 0..200 {
+            inputs.offer_acars(Observation {
+                format: format::ACARS_JSON,
+                timestamp: 1_000_000,
+                signal: 0,
+                data: line.clone().into_bytes(),
+            });
+        }
+        // 72000 bytes of frames, past the 64000 a second.
+        let frames = (1..=3_000u64)
+            .map(|n| Frame::new(FrameKind::ModeSLong, n, 9, &[0x8d; 14]))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        for chunk in frames.chunks(500) {
+            inputs.offer_frames(chunk.to_vec());
+        }
+        drop(inputs);
+        batching.await.map_err(|error| error.to_string())?;
+        let elapsed = started.elapsed().as_secs_f64();
+
+        let (mut acars, mut adsb) = (0.0, 0.0);
+        while let Ok(record) = published.try_recv() {
+            let Record::Batch(batch) = &*record else {
+                continue;
+            };
+            for observation in batch
+                .content()
+                .map_err(|error| error.to_string())?
+                .observations
+            {
+                let cost = 10.0 + observation.data.len() as f64;
+                if observation.format == format::ACARS_JSON {
+                    acars += cost;
+                } else {
+                    adsb += cost;
+                }
+            }
+        }
+        // What either bucket refilled while the test ran, and one reception's rounding.
+        let (share, ceiling) = (20_000.0, 64_000.0);
+        let slack = elapsed * ceiling + 24.0;
+        assert!(
+            acars >= share - line_cost && acars <= share + elapsed * share + line_cost,
+            "ACARS took {acars} of a {share} share"
+        );
+        assert!(
+            adsb >= ceiling - acars - 24.0 && adsb <= ceiling - acars + slack,
+            "ADS-B took {adsb} of {ceiling} beside ACARS's {acars}"
+        );
+        Ok(())
+    }
 
     #[test]
     fn a_new_key_loads_from_the_environment_as_the_printed_public_key() -> Result<(), String> {

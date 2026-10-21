@@ -122,7 +122,80 @@ neither is modified.
   to a request without the bearer token in `TALLY_MAP_ARCHIVE_TOKEN_FILE`, so an operator can keep
   them off its public name while its release job still fetches them.
 - **ACARS, VDL2 and HFDL:** `tally-feed --acars HOST:PORT` publishes a local decoder's JSON lines in
-  its signed batches, as `--uat` does, and they join the daily release.
+  its signed batches, as `--uat` does, and they join the daily release. The decoders' JSON goes
+  out over UDP or ZeroMQ (acarsdec only UDP), so the way in is acars_router, which takes it and
+  serves one JSON object a line over TCP (`AR_SERVE_TCP_ACARS` 15550, `_VDLM2` 15555, `_HFDL`
+  15556); `--acars` is repeatable. Message text can carry personal data, and some jurisdictions
+  restrict disclosing intercepted content (in the UK, the Wireless Telegraphy Act 2006 s48), so it
+  is opt-in: the installer prints the flag and never adds it.
+
+  **What is published.** The privacy rule: no published field is finer than a receiver's public cell
+  or names a receiver, and nothing carries reception timing below a second, or signal. So the
+  station, signal, frequency, channel and error counts are dropped and the time is cut to the whole
+  second, as every client form drops a receiver's signal and BEAST counter. What a decoder, its
+  version and settings leave different in a receiver's copies is not a privacy defect: grouping one
+  receiver's lines by those differences reveals at most its VHF or HF coverage, the ground stations
+  and aircraft in its radio range, which is coarser than the public cell already published. Merging
+  every receiver's copies into one message is data quality. What a line is has one rule,
+  `tally_wire::acars::project`: one fixed, flat schema for all three decoders (`t`, `kind`, `icao`,
+  `reg`, `flight`, `gs`, `label`, `sublabel`, `block`, `msgnum`, `mode`, `ack`, `text`, each only if
+  the decoder gave it, mapped from each decoder's own fields), every field spelled as libacars
+  spells it (a registration without dots or dashes, an ACK `^` and a NAK `!`, the sublabel and MFI
+  left in the text and the sublabel read from it by libacars' one rule, a message number and flight
+  on a downlink block alone, no broadcast address `FFFFFF`), written canonically (keys sorted, no
+  spacing, strings escaped one way); no key twice; at most 16 KiB. vdlm2dec's lines are VDL2, its
+  ground station's address `gs`. HFDL carries no aircraft address: dumphfdl takes it from its own
+  cache of logons, not from the message, so two receivers' copies would differ by it. The decoders'
+  own trees (dumpvdl2's AVLC, dumphfdl's LPDU and SPDU, libacars' decodes) are not published: they
+  differ by decoder, version and configuration, so copies would not merge. A frame that carries no
+  ACARS message (an XID, X.25 or CPDLC without ACARS, an HFDL logon or performance report, an SPDU),
+  and one its decoder says is damaged or partial (libacars' `err` or `crc_ok` false, a block with
+  more to follow by libacars' `more` or acarsdec's and vdlm2dec's `end`, an acarsdec `assstat` other
+  than `complete` or `skipped`), is dropped, counted. The feeder publishes a decoder's line as its
+  projection, and the relay's `--acars-out` and the collector take only a line the schema writes
+  byte for byte (`tally_wire::acars::line`).
+
+  **How it travels.** The feeder holds the messages, in the reader before they queue beside BEAST,
+  to `--acars-ceiling` (8000 bytes a second) of `--ceiling` and to 256 of the queue's places, one
+  share for every `--acars`, so ADS-B keeps the rest. Each message is an observation of a new
+  format (`'J'`), signed in a batch of its own format (`BATCH_FORMAT_ACARS`, 3: format 2's layout,
+  `'J'` and nothing else, and `'J'` in no other), in one chain with the receiver's other batches.
+  A relay that predates format 3 forwards such a batch raw, as it forwards any batch format it
+  does not read, and never reads one into its products, so the wire's version does not move. A
+  relay refuses a batch of a format it reads that does not decode (`'J'` relabelled as format 2
+  among them) rather than forward it raw. A relay that reads it forwards it raw as signed, but
+  `'J'` is in none of its products (`format::in_products`): not the deduplicated stream, not the
+  regional product, not a receiver's figures, and so no client's stream; it leaves a relay only
+  by `--acars-out` (loopback, beside `--beast-out`), every receiver's copy as its line.
+
+  **The archive.** The map image's `tally-acars-collect` (`TALLY_MAP_ACARS`) merges the copies,
+  which are the same line but for `t`: each message is held 30 s from its first copy and written
+  once, timed at the median of its copies' seconds (with an even count the floor of the mean of the
+  middle two; one clock off cannot move it, where the earliest would always be the slowest clock's),
+  and a copy after that is dropped for 5 minutes. It files each message by the UTC day of its own
+  time (within 5 minutes of its arrival) into `YYYY/MM/DD/acars.jsonl`, never into a day from 01:10
+  the next or once packed, and writes what a day missed to `acars.gaps`, including the time it was
+  stopped (it keeps its last read time on the volume, never later than the oldest message it still
+  holds, so a crash's gap covers what it held), messages dropped while its room to hold them was
+  full, and messages timed more than 5 minutes from their arrival; a gap of arrivals is in every day
+  a message arriving in it may be filed in, 5 minutes either side. At pack time the day is sorted by
+  message time in bounded memory (an external merge, under 17 MiB whatever the day's size), so no
+  receiver's batch stays together, each message kept once in any 5 minutes (its earliest line: a
+  restart can write one twice), and goes into that day's tar as `acars.jsonl.gz`; a day with gaps
+  packs as partial.
+
+  **What the merge cannot do.** A message of several blocks is one message only where every receiver
+  reassembled it alike. No block with more to follow is published, nor one acarsdec is still
+  reassembling, so a receiver whose decoder reassembles publishes the message once, whole, on its
+  last block. One whose decoder does not reassemble (vdlm2dec, or acarsdec, dumpvdl2 or dumphfdl run
+  without it), or whose reassembly missed a block or timed out, publishes the last block's own text
+  alone, which libacars cannot tell from a whole message: that copy is another line, and the blocks
+  before it are lost. Two messages that are the same line but for `t` are one copy key: squitters
+  (`SQ`) and empty acknowledgements (`_d`) that repeat with nothing that differs are merged into one
+  within 30 s, and a repeat within 5 minutes after it is written is dropped as a late copy. A feeder
+  signs whatever lines it likes: the archive says what was published, never that an aircraft sent
+  it, and a fabricated message is attributable at a relay to the receiver that signed it, not in the
+  archive, which names no receiver.
 - **Short links and previews.** The map's nginx answers adsb.lol's short links (`/<hex>`,
   `/<registration>`, `/<lat>,<lon>[,<zoom>]`) as redirects to tar1090's own query, and the site's
   short links hand off to them, so the rules are the map's alone; a path that is none is the map's

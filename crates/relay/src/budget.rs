@@ -814,14 +814,14 @@ impl Plan {
     }
 
     /// The same plan holding `general` sessions under the connection cap (`--max-connections`) and
-    /// `subscribers` subscribers (`--max-subscribers`, and the beast-out clients, each planned as
-    /// one: `Hub::serving_beast`) beside its member sessions: each with its
-    /// Noise buffers (`Plan::connections`), and their records in the cores (`cores::Sessions`). One
-    /// count for both, so the sessions whose buffers are planned are the sessions whose records
-    /// are. Set after `with_members`, whose sessions it counts. Each role holds its own cap: before,
-    /// the three shared the one, so the plan counted some 128 members, 25 feeders and 64
-    /// subscribers in 128 connections, and a member past the connections the others held was
-    /// closed on before its handshake, with no word to route around it by.
+    /// `subscribers` subscribers (`--max-subscribers`, and the beast-out and acars-out clients,
+    /// each planned as one: `Hub::serving_beast`, `Hub::serving_acars`) beside its member sessions:
+    /// each with its Noise buffers (`Plan::connections`), and their records in the cores
+    /// (`cores::Sessions`). One count for both, so the sessions whose buffers are planned are the
+    /// sessions whose records are. Set after `with_members`, whose sessions it counts. Each role
+    /// holds its own cap: before, the three shared the one, so the plan counted some 128 members,
+    /// 25 feeders and 64 subscribers in 128 connections, and a member past the connections the
+    /// others held was closed on before its handshake, with no word to route around it by.
     #[must_use]
     pub fn with_sessions(self, general: usize, subscribers: usize) -> Self {
         Self {

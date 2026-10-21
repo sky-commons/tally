@@ -1,0 +1,25 @@
+[package]
+name = "tally-acars-collect"
+description = "Files a relay's --acars-out into the map image's daily archives (RFC-0187 §3)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lib]
+name = "tally_acars_collect"
+path = "src/lib.rs"
+
+[[bin]]
+name = "tally-acars-collect"
+path = "src/main.rs"
+
+[dependencies]
+# TCP keepalive on its one connection (src/lib.rs).
+libc.workspace = true
+tally-wire.workspace = true
+
+[lints]
+workspace = true

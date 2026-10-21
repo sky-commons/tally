@@ -751,6 +751,15 @@ impl Network {
         }
     }
 
+    /// A record a peer sent that this relay refused: its group's member counts it as had and
+    /// never pushes it on (`sharing::Sharing::refused`).
+    pub fn refused_from_peer(&self, hub: &Hub, record: &Record, now_ms: u64) {
+        let point = self.point_for(hub, record);
+        if let Some((cell, product)) = crate::sharing::group_of(record, point) {
+            self.sharing.refused(record, cell, product, now_ms);
+        }
+    }
+
     /// What the timed duties publish now, each into the hub's fan-out.
     pub fn tick(&self, hub: &Hub, now_ms: u64) -> Vec<Record> {
         let identity = self.identity();

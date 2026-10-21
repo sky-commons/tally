@@ -1,13 +1,16 @@
 #!/bin/bash
 # The map image's entrypoint (RFC-0187 §1; packaging/map/README.md): readsb, net-only, decoding the
-# relay's --beast-out; nginx serving tar1090 over readsb's output on :8080; and the archiver, which
+# relay's --beast-out; nginx serving tar1090 over readsb's output on :8080; the archiver, which
 # packs each finished UTC day of the globe history into one tar for the open data releases
-# (RFC-0187 §3); and preview.py, which draws a link's picture (RFC-0187 §3). All four run as this
-# image's user; if any exits, the others are stopped and the container exits with a failure, so the
-# host's restart policy brings them back together.
+# (RFC-0187 §3); preview.py, which draws a link's picture (RFC-0187 §3); and, where TALLY_MAP_ACARS
+# is set, the ACARS collector, which files the relay's --acars-out lines into the same days. All
+# run as this image's user; if any exits, the others are stopped and the container exits with a
+# failure, so the host's restart policy brings them back together.
 #
 # Environment:
 #   TALLY_MAP_BEAST       the relay's --beast-out, HOST:PORT or HOST,PORT (default 127.0.0.1:30105)
+#   TALLY_MAP_ACARS       the relay's --acars-out, HOST:PORT; unset, no ACARS is collected
+#   TALLY_MAP_ACARS_DAY_MAX  the most bytes of ACARS lines kept for one day (default 268435456)
 #   TALLY_MAP_TITLE       the page's title, and the site a preview names (default Tally)
 #   TALLY_MAP_API         the tally-api origin routes are asked of, https://host[:port]; unset,
 #                         routes are off
@@ -47,6 +50,16 @@ fail() {
 # nobody takes it for a whole day. Every day on the volume not yet packed is packed when its time
 # has come, so a day a stopped container missed is packed when it next runs, and partial.
 #
+# A day's ACARS lines (the collector, below) are its acars.jsonl, sorted by each message's own time
+# (in bounded memory, its runs in archive/.sorting, which nothing serves; a pass first removes any
+# a stopped one left) and compressed to acars.jsonl.gz as the day is packed: nothing writes to it
+# then, since the collector files each message by the UTC day of its own time, held to five
+# minutes of its arrival, and writes no day from 01:10 UTC the next. A day the collector missed any
+# of (its acars.gaps says when and why) is packed as partial too, its acars.gaps with it. The .gz is
+# written under a temporary name (a pass first removes any a stopped one left) and renamed, and only
+# then is the .jsonl removed, so a day holding both is a pack cut short: the .jsonl is the day's,
+# and it is packed again.
+#
 # The .sha256 is written first and the tar after, each under a temporary name and renamed; then
 # the day is recorded as packed (archive/.packed/YYYY-MM-DD), and only that record makes it
 # complete. The newest ARCHIVE_KEEP archives are kept, and a day's history is deleted once it is
@@ -66,8 +79,20 @@ archive_day() {
 	local day="$1" whole="$2" dir name tmp sum
 	dir="$GLOBE_HISTORY/${day//-//}"
 	name="$day.tar"
-	((whole)) || name="$day.partial.tar"
+	((whole)) && [[ ! -e "$dir/acars.gaps" ]] || name="$day.partial.tar"
 	tmp="$ARCHIVE/$name.tmp"
+	if [[ -e "$dir/acars.jsonl" ]]; then
+		# A pack stopped between the .gz's rename and the .jsonl's removal left both: the .jsonl
+		# is whole, so it is packed again.
+		rm -f "$dir/acars.jsonl.gz"
+		# The .gz is on the disk, and its name in the directory, before the .jsonl goes.
+		tally-acars-collect sort "$dir/acars.jsonl" --scratch "$ARCHIVE/.sorting" &&
+			gzip -n -c "$dir/acars.jsonl" >"$dir/acars.jsonl.gz.tmp" &&
+			sync "$dir/acars.jsonl.gz.tmp" &&
+			mv "$dir/acars.jsonl.gz.tmp" "$dir/acars.jsonl.gz" &&
+			sync "$dir" &&
+			rm "$dir/acars.jsonl" || return
+	fi
 	tar -cf "$tmp" -C "$dir" . -C /usr/local/share/tally-map ./ATTRIBUTION ./LICENSE-aircraft-database &&
 		sum="$(sha256sum <"$tmp" | cut -d' ' -f1)" &&
 		printf '%s  %s\n' "$sum" "$name" >"$ARCHIVE/$name.sha256.tmp" &&
@@ -84,7 +109,9 @@ archive_pass() {
 	local now="$1" started="$2" history_days="$3"
 	local dir day start next oldest i archives
 	mkdir -p "$PACKED"
-	rm -f "$ARCHIVE"/*.tmp
+	rm -f "$ARCHIVE"/*.tmp \
+		"$GLOBE_HISTORY"/[0-9][0-9][0-9][0-9]/[0-9][0-9]/[0-9][0-9]/acars.jsonl.gz.tmp
+	rm -rf "$ARCHIVE/.sorting"
 	oldest=$(($(day_start "$(date -u -d "@$now" +%F)") - history_days * 86400))
 	while IFS= read -r dir; do
 		day="${dir#"$GLOBE_HISTORY"/}"
@@ -92,7 +119,8 @@ archive_pass() {
 		start="$(day_start "$day")" || continue
 		next=$((start + 86400))
 		if [[ ! -e "$PACKED/$day" ]] && ((now >= next + 4500)); then
-			# 4500 s is 01:15, 3300 s 00:55.
+			# 4500 s is 01:15 (tally_acars_collect::PACKED_FROM, which packaging/tests/map_archive.rs
+			# holds this to), 3300 s 00:55.
 			archive_day "$day" "$((started < next + 3300))" ||
 				echo "tally-map: could not archive $day" >&2
 		fi
@@ -141,6 +169,15 @@ beast_host="${beast_host#[}"
 beast_host="${beast_host%]}"
 [[ -n "$beast_host" && "$beast_port" =~ ^[0-9]+$ ]] ||
 	fail "TALLY_MAP_BEAST is '$beast'; it names the relay's --beast-out as HOST:PORT"
+
+# The relay's --acars-out, HOST:PORT or [IPV6]:PORT; unset, no collector runs.
+acars="${TALLY_MAP_ACARS:-}"
+[[ -z "$acars" || "$acars" =~ ^(\[[0-9A-Fa-f:.]+\]|[^]:[]+):[0-9]+$ ]] ||
+	fail "TALLY_MAP_ACARS is '$acars'; it names the relay's --acars-out as HOST:PORT"
+acars_day_max="${TALLY_MAP_ACARS_DAY_MAX:-268435456}"
+[[ "$acars_day_max" =~ ^0*[1-9][0-9]{0,14}$ ]] ||
+	fail "TALLY_MAP_ACARS_DAY_MAX is '$acars_day_max'; it is a whole number of bytes, at least 1"
+acars_day_max=$((10#$acars_day_max))
 
 readsb_api="${TALLY_MAP_READSB_API:-127.0.0.1:30152}"
 api_address="${readsb_api%:*}"
@@ -455,6 +492,22 @@ if [[ -z "$stopping" ]]; then
 	rm -f /run/tally-map/tiles.sock
 	nginx -e stderr -c /etc/tally-map/nginx.conf -g 'daemon off;' &
 	names[$!]=nginx
+fi
+if [[ -z "$stopping" && -n "$acars" ]]; then
+	# tally-acars-collect (crates/acars-collect): merges the copies of each message on the relay's
+	# --acars-out and files it into the UTC day of its own time,
+	# /var/globe_history/YYYY/MM/DD/acars.jsonl, at most TALLY_MAP_ACARS_DAY_MAX bytes a day, writing
+	# what each day missed to its acars.gaps. Before the archiver, which waits until it has marked
+	# what it missed while stopped, so no day is packed without its gap.
+	rm -f /run/tally-map/acars.ready
+	tally-acars-collect collect --from "$acars" --history "$GLOBE_HISTORY" \
+		--day-max "$acars_day_max" --ready /run/tally-map/acars.ready &
+	names[$!]=acars
+	acars_pid=$!
+	while [[ -z "$stopping" && ! -e /run/tally-map/acars.ready ]] &&
+		kill -0 "$acars_pid" 2>/dev/null; do
+		sleep 0.1
+	done
 fi
 if [[ -z "$stopping" ]]; then
 	archiver &

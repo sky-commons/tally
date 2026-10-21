@@ -738,6 +738,63 @@ fn the_regional_product_holds_one_copy_of_each_message_per_area_signed_as_origin
     Ok(())
 }
 
+/// An ACARS-family message a feeder publishes is in none of the products: not the deduplicated
+/// stream, not the regional product, and so no client form of any record a client is sent. It
+/// leaves the relay by `--acars-out` alone (`link::LocalOutput::Acars`). A relay that predates it
+/// put every reception of a batch it read into its products; it reads only batch formats 1 and 2,
+/// and the message travels in neither.
+#[test]
+fn no_product_and_no_client_carries_an_acars_message() -> Result<()> {
+    let relay = Identity::generate().map_err(err)?;
+    let staged = Staged::new(&relay);
+    let feeder = Identity::generate().map_err(err)?;
+    let atlanta = place(33.7, -84.4);
+    staged.products.described(
+        &described(&feeder, atlanta, vec![relay.public()])?,
+        Some(atlanta),
+    );
+    let acars = br#"{"kind":"acars","label":"H1","t":1791244800,"text":"HELLO"}"#;
+    let message = Observation {
+        format: format::ACARS_JSON,
+        timestamp: 5,
+        signal: 0,
+        data: acars.to_vec(),
+    };
+    let lines = feeder_batch(&feeder, 1, vec![message], (BASE_MS + 100, 1))?;
+    let older = [
+        tally_wire::batch::BATCH_FORMAT,
+        tally_wire::batch::BATCH_FORMAT_DEFLATE,
+    ];
+    assert!(!older.contains(&lines.batch().format()));
+    let adsb = adsb_second(&[0x00a0_0001], 0, false);
+    staged.feed(&feeder_batch(&feeder, 0, adsb, (BASE_MS + 100, 0))?);
+    staged.feed(&lines);
+    let out = staged.tick(BASE_MS + 1_000);
+    let kinds: Vec<u8> = out.iter().map(Record::kind).collect();
+    assert!(
+        out.iter()
+            .any(|record| matches!(record, Record::ClientRegionalBatch(_))),
+        "{kinds:?}"
+    );
+    for record in &out {
+        let mut bytes = Vec::new();
+        record.encode(&mut bytes).map_err(err)?;
+        assert!(
+            !bytes.windows(acars.len()).any(|at| at == acars),
+            "kind {} carries the message",
+            record.kind()
+        );
+        if let Some(client) = crate::outbound::client_form(record) {
+            let mut bytes = Vec::new();
+            Record::from((*client).clone())
+                .encode(&mut bytes)
+                .map_err(err)?;
+            assert!(!bytes.windows(acars.len()).any(|at| at == acars));
+        }
+    }
+    Ok(())
+}
+
 #[test]
 fn a_peer_regional_batch_is_forwarded_once_unchanged_within_the_areas_taken() -> Result<()> {
     let origin = Identity::generate().map_err(err)?;

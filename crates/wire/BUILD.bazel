@@ -27,6 +27,8 @@ rust_library(
         "@tally_crates//:getrandom",
         "@tally_crates//:h3o",
         "@tally_crates//:miniz_oxide",
+        "@tally_crates//:serde",
+        "@tally_crates//:serde_json",
         "@tally_crates//:snow",
         "@tally_crates//:thiserror",
         "@tally_crates//:tokio",

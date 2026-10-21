@@ -393,10 +393,18 @@ impl Figures {
     }
 
     /// A batch the hub forwarded, decoded once, of a receiver whose public cell is `public`, at
-    /// `now_ms` by the relay's clock.
+    /// `now_ms` by the relay's clock. Only the receptions of the products count: an ACARS-family
+    /// message is none of them, and leaves the relay by `--acars-out` alone, so a batch of them is
+    /// no activity, no message and no aircraft.
     pub fn batch(&self, decoded: &Decoded, public: Option<Region>, now_ms: u64) {
         let at = decoded.wall_ms();
-        if at.abs_diff(now_ms) > FRESH_WITHIN_MS {
+        let products = || {
+            decoded
+                .observations()
+                .iter()
+                .filter(|observation| tally_wire::batch::format::in_products(observation.format))
+        };
+        if at.abs_diff(now_ms) > FRESH_WITHIN_MS || products().next().is_none() {
             return;
         }
         let receiver = decoded.receiver();
@@ -432,8 +440,8 @@ impl Figures {
             };
             feeder.public = public.or(feeder.public);
             feeder.minutes.insert(at / MINUTE_MS);
-            feeder.hour(at).messages += decoded.observations().len() as u64;
-            for observation in decoded.observations() {
+            feeder.hour(at).messages += products().count() as u64;
+            for observation in products() {
                 let data = decoded.data(observation);
                 let Some(address) = checked_address(data) else {
                     continue;

@@ -153,8 +153,9 @@ pub enum Filter {
     /// A client: its subscription, routing an item's client form by its client place and nothing
     /// else (`ClientSubscription::serves`, `Item::client`).
     Client(ClientSubscription),
-    /// The loopback BEAST output: every receiver's batch this build reads.
-    Beast,
+    /// A loopback output (`--beast-out`, `--acars-out`, `link::LocalOutput`): every receiver's
+    /// batch this build reads.
+    Local,
     /// Every record: what a test of the hub reads.
     #[cfg(test)]
     Everything,
@@ -169,7 +170,7 @@ impl Filter {
                 .client
                 .as_ref()
                 .is_some_and(|client| subscription.serves(client)),
-            Self::Beast => item.decoded.is_some(),
+            Self::Local => item.decoded.is_some(),
             #[cfg(test)]
             Self::Everything => true,
         }
@@ -181,7 +182,7 @@ impl Filter {
         match self {
             Self::Subscription(subscription) => &subscription.regions,
             Self::Client(subscription) => subscription.regions(),
-            Self::Directory | Self::Beast => &[],
+            Self::Directory | Self::Local => &[],
             #[cfg(test)]
             Self::Everything => &[],
         }

@@ -24,6 +24,17 @@ pub const BATCH_FORMAT: u8 = 1;
 /// deduplicates it without inflating it, and a reader inflates at most `MAX_PLAIN_LEN` and at most
 /// `MAX_INFLATION` times its compressed stream ([`inflation_allowed`]).
 pub const BATCH_FORMAT_DEFLATE: u8 = 2;
+/// A batch of ACARS-family messages ([`format::ACARS_JSON`]) and nothing else: format 2's layout,
+/// always compressed (stored, DEFLATE's level 0, where the wire's inflation rule would refuse it
+/// compressed). A message of that format travels in this layout alone ([`composed`]), so a reader
+/// that predates it reads none: it forwards the batch raw, as any batch of a format it does not
+/// read, and no relay that knows only formats 1 and 2 puts a message into its products or a
+/// client's record. The wire's version is not raised for it: who reads it is decided by the
+/// layout, as a reception format a reader does not know is forwarded untouched.
+pub const BATCH_FORMAT_ACARS: u8 = 3;
+/// Every batch format this build reads: one of them that does not decode is malformed, not a
+/// format of a later build.
+pub const BATCH_FORMATS: [u8; 3] = [BATCH_FORMAT, BATCH_FORMAT_DEFLATE, BATCH_FORMAT_ACARS];
 /// The most a compressed batch's observations may inflate to: far beyond any record's body, so
 /// no honest batch is refused, and bounded, so no batch is a decompression bomb.
 pub const MAX_PLAIN_LEN: usize = 1 << 20;
@@ -51,7 +62,24 @@ pub fn inflation_allowed(plain: usize, compressed: usize) -> bool {
 /// DEFLATE's level 6: zlib's default, where its ratio levels off.
 const DEFLATE_LEVEL: u8 = 6;
 
-/// How a batch's observations are written.
+/// The wire's one rule for what a batch of `batch` format may carry, held by every writer and
+/// every reader: a reception of [`format::ACARS_JSON`] in a [`BATCH_FORMAT_ACARS`] batch alone,
+/// and nothing else there. A relay that reads a batch's format reads every reception in it into
+/// its products, whatever its reception format, so a new kind of reception that an older relay
+/// must not serve needs a batch format of its own, held here as this one is.
+pub fn composed(batch: u8, reception: u8) -> Result<(), WireError> {
+    if (batch == BATCH_FORMAT_ACARS) == (reception == format::ACARS_JSON) {
+        Ok(())
+    } else {
+        Err(WireError::Invalid {
+            field: "reception format for its batch format",
+            value: u64::from(reception),
+        })
+    }
+}
+
+/// How a batch's observations are written. A batch of ACARS-family messages is
+/// [`BATCH_FORMAT_ACARS`] whatever its codec says: its level, if one is given, is used.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Codec {
     /// Format 1: as they are.
@@ -111,6 +139,21 @@ pub mod format {
     pub const UAT_DOWNLINK: u8 = b'D';
     /// A 978 MHz UAT ground uplink (FIS-B weather, TIS-B), 432 bytes, timestamped as a downlink.
     pub const UAT_UPLINK: u8 = b'U';
+    /// One message an ACARS-family decoder wrote as a line of its JSON output (acarsdec or
+    /// vdlm2dec for VHF ACARS, dumpvdl2 for VDL Mode 2, dumphfdl for HFDL), in the one schema
+    /// `crate::acars` projects it to. Timestamped as a UAT downlink; its signal byte is 0, and the
+    /// line carries nothing of the receiver. It travels in a feeder's batch of its own
+    /// ([`super::BATCH_FORMAT_ACARS`]) and a relay's raw forward of it, and leaves a relay only by
+    /// its `--acars-out` (`in_products`).
+    pub const ACARS_JSON: u8 = b'J';
+
+    /// Whether a reception of `format` goes into a relay's products (the deduplicated stream, the
+    /// regional product and every client form of it). An ACARS-family message does not: its copies
+    /// are merged and archived by the map's collector alone, and a client's regional batch would
+    /// time each copy to the second and name the receiver's area beside it.
+    pub const fn in_products(format: u8) -> bool {
+        format != ACARS_JSON
+    }
 }
 
 /// What a receiver's decoder emitted for one reception, unchanged.
@@ -347,10 +390,36 @@ impl Batch {
         let count = u32::try_from(observations.len())
             .map_err(|_| WireError::Oversize(observations.len()))?;
         plain.extend_from_slice(&count.to_be_bytes());
+        let mut acars = None;
         for observation in observations {
+            let batch = *acars.get_or_insert(observation.format == format::ACARS_JSON);
+            composed(
+                if batch {
+                    BATCH_FORMAT_ACARS
+                } else {
+                    BATCH_FORMAT
+                },
+                observation.format,
+            )?;
             observation.encode(&mut plain)?;
         }
+        let acars = acars.unwrap_or(false);
         let deflated = match codec {
+            _ if acars => {
+                if plain.len() > MAX_PLAIN_LEN {
+                    return Err(WireError::Oversize(plain.len()));
+                }
+                let level = match codec {
+                    Codec::DeflateAt(level) => level.clamp(1, 9),
+                    _ => DEFLATE_LEVEL,
+                };
+                let deflated = miniz_oxide::deflate::compress_to_vec(&plain, level);
+                Some(if inflation_allowed(plain.len(), deflated.len()) {
+                    deflated
+                } else {
+                    miniz_oxide::deflate::compress_to_vec(&plain, 0)
+                })
+            }
             Codec::Plain => None,
             Codec::Deflate | Codec::DeflateAt(_) => {
                 if plain.len() > MAX_PLAIN_LEN {
@@ -368,10 +437,10 @@ impl Batch {
             }
         };
         let mut bytes = Vec::new();
-        bytes.push(if deflated.is_some() {
-            BATCH_FORMAT_DEFLATE
-        } else {
-            BATCH_FORMAT
+        bytes.push(match (acars, deflated.is_some()) {
+            (true, _) => BATCH_FORMAT_ACARS,
+            (false, true) => BATCH_FORMAT_DEFLATE,
+            (false, false) => BATCH_FORMAT,
         });
         bytes.extend_from_slice(identity.public().as_bytes());
         bytes.extend_from_slice(&header.boot_id.to_be_bytes());
@@ -513,8 +582,12 @@ impl Batch {
         let mut plain = Body::new(&plain);
         let count = plain.u32()?;
         let observations = (0..count)
-            .map(|_| Observation::decode(&mut plain))
-            .collect::<Result<_, _>>()?;
+            .map(|_| {
+                let observation = Observation::decode(&mut plain)?;
+                composed(self.format(), observation.format)?;
+                Ok(observation)
+            })
+            .collect::<Result<_, WireError>>()?;
         Ok(BatchContent {
             boot_id: header.boot_id,
             sequence: header.sequence,
@@ -592,7 +665,7 @@ impl Batch {
     /// compressed batch's stated length already held to the wire's rule (`inflation_allowed`).
     fn layout(&self) -> Result<(Header, Layout), WireError> {
         let format = self.format();
-        if format != BATCH_FORMAT && format != BATCH_FORMAT_DEFLATE {
+        if !BATCH_FORMATS.contains(&format) {
             return Err(WireError::Invalid {
                 field: "batch format",
                 value: u64::from(format),
@@ -628,7 +701,7 @@ impl Batch {
 
     /// The fixed fields, and the observations' plain bytes (`count u32 | observations`), for a
     /// format this build reads: a slice of the signed bytes for format 1 (shared, not copied), and
-    /// for format 2 inflated once, to its stated length and never past it, so at most
+    /// for formats 2 and 3 inflated once, to its stated length and never past it, so at most
     /// `MAX_INFLATION` times its stream and `MAX_PLAIN_LEN`.
     pub(crate) fn header_and_plain(&self) -> Result<(Header, Bytes), WireError> {
         let (header, layout) = self.layout()?;
@@ -663,7 +736,7 @@ impl Batch {
 enum Layout {
     /// Format 1: these bytes, as they are.
     Plain(std::ops::Range<usize>),
-    /// Format 2: a DEFLATE stream in these bytes, stated to inflate to `stated`.
+    /// Formats 2 and 3: a DEFLATE stream in these bytes, stated to inflate to `stated`.
     Deflate {
         stated: usize,
         stream: std::ops::Range<usize>,
@@ -1115,6 +1188,90 @@ pub(crate) fn u64_at(bytes: &[u8], at: usize) -> u64 {
 mod tests {
     use super::*;
     use crate::beast::FrameKind;
+
+    /// ACARS-family lines ride a batch of their own format, whatever the codec, and read back
+    /// byte for byte; a client's view of one is the line. A batch of formats 1 and 2, the only
+    /// ones a reader that predates them reads, never carries one, and a format 3 batch nothing
+    /// else, written or read.
+    #[test]
+    fn an_acars_line_rides_a_batch_of_its_own_format() -> Result<(), WireError> {
+        let feeder = Identity::generate()?;
+        let line = br#"{"icao":"A1B2C3","kind":"vdl2","label":"H1","t":1696500000}"#;
+        let acars = Observation {
+            format: format::ACARS_JSON,
+            timestamp: 1_696_500_000_000_000 % (1 << 48),
+            signal: 0,
+            data: line.to_vec(),
+        };
+        let mode_s = Observation {
+            format: format::MODE_S_LONG,
+            timestamp: 12_000,
+            signal: 80,
+            data: vec![0x8d; 14],
+        };
+        let content = |observations: Vec<Observation>| BatchContent {
+            boot_id: 1,
+            sequence: 0,
+            counter_epoch: 0,
+            wall_ms: 4,
+            dropped: 0,
+            previous: [0; 32],
+            observations,
+        };
+        let lines = content(vec![acars.clone(), acars.clone()]);
+        for codec in [Codec::Plain, Codec::Deflate, Codec::DeflateAt(1)] {
+            let batch = Batch::sign_with(&feeder, &lines, codec)?;
+            batch.verify()?;
+            assert_eq!(batch.format(), BATCH_FORMAT_ACARS);
+            let read = Batch::from_bytes(batch.as_bytes().to_vec())?.content()?;
+            assert_eq!(read, lines);
+            let view = crate::decoded::ClientObsView::from(ObsView::from(&read.observations[1]));
+            assert_eq!(view.to_acars_line().map(str::as_bytes), Some(&line[..]));
+            let decoded = crate::decoded::Decoded::from_verified(batch, 0, 0)
+                .map_err(|undecodable| undecodable.error)?;
+            assert_eq!(decoded.receptions(), 2);
+        }
+        // Written beside anything else, refused.
+        assert!(
+            Batch::sign_with(
+                &feeder,
+                &content(vec![mode_s.clone(), acars.clone()]),
+                Codec::Deflate
+            )
+            .is_err()
+        );
+        assert!(Batch::sign(&feeder, &content(vec![acars, mode_s.clone()])).is_err());
+        // Read under the other format's byte, refused, by the content and by the decode.
+        let relabelled = |batch: &Batch, format: u8| -> Result<Batch, WireError> {
+            let mut bytes = batch.as_bytes()[..batch.as_bytes().len() - SIGNATURE_LEN].to_vec();
+            bytes[0] = format;
+            let signature = feeder.sign(&domain(BATCH_DOMAIN, &bytes));
+            bytes.extend_from_slice(&signature);
+            Batch::from_bytes(bytes)
+        };
+        // Receptions that compress within the wire's inflation rule.
+        let varied = (0..20u64)
+            .map(|at| Observation {
+                timestamp: at * 7_919,
+                data: (0..14).map(|k| (at * 31 + k * 97) as u8 ^ 0x5a).collect(),
+                ..mode_s.clone()
+            })
+            .collect();
+        let deflated = Batch::sign_with(&feeder, &content(varied), Codec::Deflate)?;
+        assert_eq!(deflated.format(), BATCH_FORMAT_DEFLATE);
+        for forged in [
+            relabelled(
+                &Batch::sign_with(&feeder, &lines, Codec::Deflate)?,
+                BATCH_FORMAT_DEFLATE,
+            )?,
+            relabelled(&deflated, BATCH_FORMAT_ACARS)?,
+        ] {
+            forged.verify()?;
+            assert!(forged.content().is_err());
+            assert!(crate::decoded::Decoded::from_verified(forged, 0, 0).is_err());
+        }
+        Ok(())
+    }
 
     #[test]
     fn a_compressed_batch_reads_back_as_its_plain_twin_and_a_bomb_is_refused()

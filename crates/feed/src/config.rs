@@ -73,6 +73,12 @@ usage: tally-feed [--key FILE | --key-env NAME] [options]
   --source HOST:PORT     readsb's BEAST output (default 127.0.0.1:30005)
   --uat HOST:PORT        dump978-fa's raw output, for 978 MHz UAT (none by default; it is
                          usually 127.0.0.1:30978)
+  --acars HOST:PORT      acars_router's JSON output over TCP, which takes the ACARS, VDL2 and
+                         HFDL decoders' (15550 ACARS, 15555 VDL2, 15556 HFDL); repeatable, none
+                         by default. Only each message's aircraft, content and time are published
+  --acars-ceiling BYTES  the most of --ceiling these messages take a second (default 8000),
+                         so ADS-B always keeps the rest; less than --ceiling, which is
+                         then at least 16394 bytes (the longest message)
   --relay HOST:PORT=KEY  a relay to consider; repeatable. Measured and ranked like every relay the
                          feeder knows: the feeder sends to the two nearest healthy relays on
                          different networks, chosen with every feeder of its area (RFC-0174)
@@ -128,6 +134,10 @@ pub struct Config {
     pub key: Key,
     pub source: String,
     pub uat: Option<String>,
+    /// The ACARS-family decoders' JSON outputs (`--acars`, `crate::acars`).
+    pub acars: Vec<String>,
+    /// The most of `ceiling` their messages take a second (`--acars-ceiling`).
+    pub acars_ceiling: u32,
     /// The relays the owner named with `--relay`: candidates, never pinned (RFC-0174 §2.2).
     pub relays: Vec<RelayAddress>,
     /// The relays shipped in the binary (`SEEDS`).
@@ -190,6 +200,8 @@ pub fn parse_with(
         key: Key::File(PathBuf::new()),
         source: "127.0.0.1:30005".to_owned(),
         uat: None,
+        acars: Vec::new(),
+        acars_ceiling: crate::source::DEFAULT_ACARS_CEILING,
         relays: Vec::new(),
         seeds: Vec::new(),
         state_dir: PathBuf::from(DEFAULT_STATE),
@@ -211,6 +223,8 @@ pub fn parse_with(
                 source = true;
             }
             "--uat" => config.uat = Some(value()?),
+            "--acars" => config.acars.push(value()?),
+            "--acars-ceiling" => config.acars_ceiling = number(&flag, &value()?)?,
             "--relay" => config.relays.push(parse_relay(&value()?)?),
             // Retired with the home, anchor and random slots (RFC-0174 §2.2), and refused, so no
             // command line goes on saying what the feeder no longer does.
@@ -235,6 +249,26 @@ pub fn parse_with(
             }
             other => return Err(format!("unknown argument {other}\n{USAGE}")),
         }
+    }
+    if config.acars_ceiling == 0 {
+        return Err(
+            "--acars-ceiling 0 would publish no message; leave out --acars to publish none"
+                .to_owned(),
+        );
+    }
+    if !config.acars.is_empty() && (config.ceiling as usize) < crate::source::LONGEST_ACARS {
+        return Err(format!(
+            "--ceiling {} is less than the longest ACARS message ({} bytes), which it could never \
+             send: raise it, or leave out --acars",
+            config.ceiling,
+            crate::source::LONGEST_ACARS
+        ));
+    }
+    if !config.acars.is_empty() && config.acars_ceiling >= config.ceiling {
+        return Err(format!(
+            "--acars-ceiling {} leaves ADS-B nothing of --ceiling {}: give it less",
+            config.acars_ceiling, config.ceiling
+        ));
     }
     if init {
         // `init` makes a key file; a key held in the environment is made with `new-key`.
@@ -653,6 +687,44 @@ mod tests {
         assert_eq!(run(&["--key", "k"])?.uat, None);
         let config = run(&["--key", "k", "--uat", "127.0.0.1:30978"])?;
         assert_eq!(config.uat.as_deref(), Some("127.0.0.1:30978"));
+        Ok(())
+    }
+
+    #[test]
+    fn acars_is_off_unless_named_and_keeps_adsb_its_share() -> Result<(), String> {
+        let config = run(&["--key", "k"])?;
+        assert!(config.acars.is_empty());
+        assert_eq!(config.acars_ceiling, crate::source::DEFAULT_ACARS_CEILING);
+        let config = run(&[
+            "--key",
+            "k",
+            "--acars",
+            "127.0.0.1:15550",
+            "--acars",
+            "127.0.0.1:15555",
+            "--acars-ceiling",
+            "2000",
+        ])?;
+        assert_eq!(config.acars, ["127.0.0.1:15550", "127.0.0.1:15555"]);
+        assert_eq!(config.acars_ceiling, 2000);
+        let starving = [
+            "--key",
+            "k",
+            "--acars",
+            "a:1",
+            "--ceiling",
+            "20000",
+            "--acars-ceiling",
+            "20000",
+        ];
+        assert!(run(&starving).is_err_and(|why| why.contains("--acars-ceiling")));
+        let short = ["--key", "k", "--acars", "a:1", "--ceiling", "16000"];
+        assert!(run(&short).is_err_and(|why| why.contains("longest ACARS message")));
+        assert!(USAGE.contains(&format!("at least {} bytes", crate::source::LONGEST_ACARS)));
+        let off = ["--key", "k", "--acars", "a:1", "--acars-ceiling", "0"];
+        assert!(run(&off).is_err_and(|why| why.contains("--acars-ceiling 0")));
+        // With no ACARS source, a low --ceiling is no conflict.
+        assert_eq!(run(&["--key", "k", "--ceiling", "4000"])?.ceiling, 4000);
         Ok(())
     }
 }

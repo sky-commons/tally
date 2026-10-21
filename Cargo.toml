@@ -44,7 +44,8 @@ hyper-util = { version = "0.1", default-features = false, features = ["client-le
 # complete level is its fastest) 1.23 times; zstd proper needs C. A feeder pays its bytes monthly.
 miniz_oxide = { version = "0.8", default-features = false, features = ["with-alloc"] }
 serde = { version = "1", features = ["derive"] }
-# The relay's stats and the API are JSON.
+# The relay's stats and the API are JSON, and so are the ACARS-family decoders' lines (tally-wire's
+# src/acars.rs).
 serde_json = "1"
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "time", "macros", "sync"] }

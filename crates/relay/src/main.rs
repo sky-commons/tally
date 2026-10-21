@@ -212,9 +212,14 @@ fn prepare(config: &Config, identity: &Identity) -> Result<(Arc<Hub>, bool), Str
         .accepting_relays(config.accept_relays.iter().copied())
         .vouching_for(config.clients.iter().copied())
         .max_connections(config.max_connections)
-        // Beast-out's clients, planned only where it is served.
+        // Beast-out's and acars-out's clients, each planned only where it is served.
         .serving_beast(if config.beast_out.is_some() {
             config.max_beast_clients
+        } else {
+            0
+        })
+        .serving_acars(if config.acars_out.is_some() {
+            config.max_acars_clients
         } else {
             0
         })
@@ -310,10 +315,10 @@ async fn serve(config: Config) -> Result<(), String> {
     let open_files = tally_relay::listeners::raise_open_files(needed)?;
     eprintln!("tally-relay: {open_files} open files allowed; its connection caps need {needed}");
     // Each listener runs until it starves (`listeners::Starved`), and the first that does ends the
-    // relay, saying why, for its supervisor to start it again. Beast-out and the stats take
-    // loopback addresses (`config::parse_loopback`), refused at start, before the relay starts,
-    // rather than as a line in its log; each serve refuses a non-loopback listener again, which
-    // ends the relay the same way.
+    // relay, saying why, for its supervisor to start it again. Beast-out, acars-out and the stats
+    // take loopback addresses (`config::parse_loopback`), refused at start, before the relay
+    // starts, rather than as a line in its log; each serve refuses a non-loopback listener again,
+    // which ends the relay the same way.
     let mut listening = tokio::task::JoinSet::new();
     if let Some(address) = config.beast_out {
         let listener = TcpListener::bind(address)
@@ -322,6 +327,16 @@ async fn serve(config: Config) -> Result<(), String> {
         let hub = Arc::clone(&hub);
         listening.spawn(async move {
             let Err(error) = link::serve_beast(listener, hub).await;
+            error.to_string()
+        });
+    }
+    if let Some(address) = config.acars_out {
+        let listener = TcpListener::bind(address)
+            .await
+            .map_err(|error| format!("acars-out {address}: {error}"))?;
+        let hub = Arc::clone(&hub);
+        listening.spawn(async move {
+            let Err(error) = link::serve_acars(listener, hub).await;
             error.to_string()
         });
     }

@@ -156,6 +156,17 @@ impl ClientObsView<'_> {
     }
 }
 
+impl<'a> ClientObsView<'a> {
+    /// The line, for an ACARS-family reception that is one (`acars::line`, parsed, never taken on
+    /// the feeder's word): what a relay's `--acars-out` writes, a newline after each.
+    pub fn to_acars_line(&self) -> Option<&'a str> {
+        if self.format != crate::batch::format::ACARS_JSON {
+            return None;
+        }
+        crate::acars::line(self.data)
+    }
+}
+
 /// One reception borrowed: from a decoded batch or from an owned `Observation`, so a reader of
 /// receptions takes either without a copy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -447,6 +458,7 @@ impl Decoded {
         for _ in 0..count {
             let fixed = read(&plain, at, OBSERVATION_FIXED)?;
             let format = fixed[0];
+            crate::batch::composed(batch.format(), format)?;
             let mut counter = [0; 8];
             counter[2..].copy_from_slice(&fixed[1..7]);
             let signal = fixed[7];
