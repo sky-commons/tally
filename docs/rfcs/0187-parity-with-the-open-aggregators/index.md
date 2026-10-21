@@ -123,8 +123,30 @@ neither is modified.
   them off its public name while its release job still fetches them.
 - **ACARS, VDL2 and HFDL:** `tally-feed --acars HOST:PORT` publishes a local decoder's JSON lines in
   its signed batches, as `--uat` does, and they join the daily release.
-- **Previews and short URLs** (`/<hex>`, `/<registration>`), a status page and a hardware guide on
-  the site.
+- **Short links and previews.** The map's nginx answers adsb.lol's short links (`/<hex>`,
+  `/<registration>`, `/<lat>,<lon>[,<zoom>]`) as redirects to tar1090's own query, and the site's
+  short links hand off to them, so the rules are the map's alone; a path that is none is the map's
+  not-found page, back to the site. A page asked for one aircraft (`?icao=`, `?reg=`) carries Open
+  Graph tags from readsb's answer for it, as adsb.lol's `inject_meta.lua` writes them, with
+  Debian's nginx Lua module: its callsign, registration and type, its altitude and speed, and a
+  picture of the map at its position with one marker on it. The aircraft's position is public (the
+  map shows it to anyone), so it may be in the card; nothing of a receiver is, neither a site nor
+  readsb's receiver fields (`r_dst`, `r_dir`, `rssi`). GitHub Pages serves one `404.html` for every
+  path the site has not prerendered, so a crawler reading `tally.skycommons.org/<hex>` learns
+  nothing of the aircraft: the link that previews is the map's (`tally-map.skycommons.org/<hex>`,
+  or any `?icao=` link tar1090 copies).
+- **The picture is a static map render, not a screenshot.** adsb.lol screenshots tar1090 with
+  Playwright over a headless Chromium. In the map image that is Debian's `chromium-headless-shell`,
+  528 MB installed against the image's 167 MB, a browser of 100 MB or more for each render on a
+  relay's host, and a driver of our own to wait for the map's tiles (Chromium's own `--screenshot`
+  left them half drawn). Instead the image draws the picture with komoot's staticmap over Pillow
+  (Python, 86 MB with the tags' Lua module), over OpenStreetMap's standard tiles, the layer tar1090
+  draws by default, credited in the picture. It keeps OpenStreetMap's tile policy: nginx fetches
+  and caches every tile, names the image in its User-Agent and asks at most 10 tiles a second. A
+  picture is cached a minute for an aircraft at a position rounded to 0.01 degrees, drawn one at a
+  time, and only near where readsb hears the aircraft; anything else is the site's card, a fixed
+  picture in the image.
+- A status page and a hardware guide on the site.
 
 ## Rollout
 
