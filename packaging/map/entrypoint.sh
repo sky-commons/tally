@@ -2,10 +2,11 @@
 # The map image's entrypoint (RFC-0187 §1; packaging/map/README.md): readsb, net-only, decoding the
 # relay's --beast-out; nginx serving tar1090 over readsb's output on :8080; the archiver, which
 # packs each finished UTC day of the globe history into one tar for the open data releases
-# (RFC-0187 §3); preview.py, which draws a link's picture (RFC-0187 §3); and, where TALLY_MAP_ACARS
-# is set, the ACARS collector, which files the relay's --acars-out lines into the same days. All
-# run as this image's user; if any exits, the others are stopped and the container exits with a
-# failure, so the host's restart policy brings them back together.
+# (RFC-0187 §3); preview.py, which draws a link's picture (RFC-0187 §3), unless TALLY_MAP_PREVIEWS
+# is off; and, where TALLY_MAP_ACARS is set, the ACARS collector, which files the relay's
+# --acars-out lines into the same days. All run as this image's user; if any exits, the others are
+# stopped and the container exits with a failure, so the host's restart policy brings them back
+# together.
 #
 # Environment:
 #   TALLY_MAP_BEAST       the relay's --beast-out, HOST:PORT or HOST,PORT (default 127.0.0.1:30105)
@@ -14,8 +15,12 @@
 #   TALLY_MAP_TITLE       the page's title, and the site a preview names (default Tally)
 #   TALLY_MAP_API         the tally-api origin routes are asked of, https://host[:port]; unset,
 #                         routes are off
+#   TALLY_MAP_PREVIEWS    on or off: a link's preview carries a picture of the map, which
+#                         preview.py draws (default on); off, preview.py does not run, /preview/
+#                         is not served, and every preview's picture is the site's card
 #   TALLY_MAP_TILES       the tile server previews' pictures are drawn from, https://host[:port]
-#                         (default https://tile.openstreetmap.org, OpenStreetMap's own)
+#                         (default https://tile.openstreetmap.org, OpenStreetMap's own); ignored
+#                         when TALLY_MAP_PREVIEWS is off
 #   TALLY_MAP_URL         the map's public origin, https://host[:port], which a link's preview
 #                         names its page and picture by; unset, https:// and the host asked for
 #   TALLY_MAP_READSB_API  where readsb's query API listens, ADDRESS:PORT (default 127.0.0.1:30152)
@@ -205,15 +210,29 @@ public_url="${public_url%/}"
 	fail "TALLY_MAP_URL is '$public_url'; it is the map's public origin, such as https://map.example.org"
 export TALLY_MAP_URL="$public_url"
 
+# The previews' pictures, nginx's $previews (nginx.conf, preview.lua): on, preview.py draws them
+# and nginx serves them at /preview/; off, preview.py does not run, /preview/ and the tile server
+# answer 404, and every preview's picture is the site's card.
+previews="${TALLY_MAP_PREVIEWS:-on}"
+case "$previews" in
+on | off) echo "map \$host \$previews { default $previews; }" >/run/tally-map/previews.conf ;;
+*) fail "TALLY_MAP_PREVIEWS is '$previews'; it is on or off" ;;
+esac
+
 # The tile server nginx fetches the pictures' tiles from (nginx.conf): OpenStreetMap's, tar1090's
 # default layer, unless the operator names another serving the same tiles at /{z}/{x}/{y}.png.
-tiles="${TALLY_MAP_TILES:-https://tile.openstreetmap.org}"
-tiles="${tiles%/}"
-[[ "$tiles" =~ ^https?://([][A-Za-z0-9.:-]+)$ ]] ||
-	fail "TALLY_MAP_TILES is '$tiles'; it is a tile server's origin, such as https://tile.openstreetmap.org"
+# With no pictures it is not read, and nginx's tile server fetches nothing.
+tiles="" tile_host=""
+if [[ "$previews" == on ]]; then
+	tiles="${TALLY_MAP_TILES:-https://tile.openstreetmap.org}"
+	tiles="${tiles%/}"
+	[[ "$tiles" =~ ^https?://([][A-Za-z0-9.:-]+)$ ]] ||
+		fail "TALLY_MAP_TILES is '$tiles'; it is a tile server's origin, such as https://tile.openstreetmap.org"
+	tile_host="${BASH_REMATCH[1]}"
+fi
 cat >/run/tally-map/tiles.conf <<EOF
 set \$tile_origin "$tiles";
-set \$tile_host "${BASH_REMATCH[1]}";
+set \$tile_host "$tile_host";
 EOF
 
 # The nameservers nginx looks up the tile server's name with, at each fetch (nginx.conf): the
@@ -231,7 +250,8 @@ done </etc/resolv.conf
 if [[ -n "$resolvers" ]]; then
 	echo "resolver$resolvers valid=300s;" >/run/tally-map/resolver.conf
 else
-	echo "tally-map: /etc/resolv.conf names no nameserver; previews will have no map" >&2
+	[[ "$previews" == off ]] ||
+		echo "tally-map: /etc/resolv.conf names no nameserver; previews will have no map" >&2
 	: >/run/tally-map/resolver.conf
 fi
 
@@ -514,8 +534,9 @@ if [[ -z "$stopping" ]]; then
 	names[$!]=archiver
 fi
 # A socket left by a container stopped short would refuse the new one. preview.py imports
-# staticmap from its own directory, the image's.
-if [[ -z "$stopping" ]]; then
+# staticmap from its own directory, the image's. With TALLY_MAP_PREVIEWS off it does not run, and
+# nginx asks nothing of its socket.
+if [[ -z "$stopping" && "$previews" == on ]]; then
 	rm -f /run/tally-map/preview.sock
 	python3 -E -s /usr/local/lib/tally-map/preview.py serve /run/tally-map/preview.sock \
 		/run/tally-map/tiles.sock "$api_reach:$api_port" &
