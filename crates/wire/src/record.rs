@@ -127,13 +127,16 @@ pub const KIND_CLIENT_REGIONAL_BATCH: u8 = 0x27;
 // RFC-0174 §2.12 as amended 2026-10-19: a relay's signed figures of its receivers, for clients.
 // Non-critical: a build that predates it skips it.
 pub const KIND_FEEDER_FIGURES: u8 = 0x28;
+// RFC-0171 §3.6: a relay's signed freshness anchor, to its feeder sessions. Non-critical: a
+// feeder that predates it skips it. (0x29 was a retired kind of a draft never released.)
+pub const KIND_ANCHOR: u8 = 0x2a;
 
 /// Kinds this build knows were retired: read as `Record::Retired`, never written.
 pub const RETIRED_KINDS: [u8; 2] = [KIND_POSSESSION_QUERY, KIND_POSSESSION_ANSWER];
 
 /// Every kind this build reads and writes, in kind order: what a table over kinds is checked
 /// against, so a kind added here and nowhere else is a failing test.
-pub const KINDS: [u8; 38] = [
+pub const KINDS: [u8; 39] = [
     KIND_HELLO,
     KIND_WELCOME,
     KIND_BATCH,
@@ -172,6 +175,7 @@ pub const KINDS: [u8; 38] = [
     KIND_CLIENT_CLOCK_MODEL,
     KIND_CLIENT_REGIONAL_BATCH,
     KIND_FEEDER_FIGURES,
+    KIND_ANCHOR,
 ];
 
 const HEADER_LEN: usize = 3;
@@ -221,15 +225,18 @@ impl Role {
     }
 
     /// Whether a session of this role may send `record` after its `Hello`. Only a `Probe` is held
-    /// to a list here (`Echo` and `DeliveryQuery`); what every other role may publish is the
-    /// responder's to decide, by the keys that signed it.
+    /// to a list here (`Echo`, `DeliveryQuery`, and a `TimedHeartbeat` asking the relay's clock);
+    /// what every other role may publish is the responder's to decide, by the keys that signed it.
     pub fn may_send(self, record: &Record) -> bool {
         match self {
             // A retired delivery query too: an old feeder's probe is answered with a refusal
             // (`Record::refusal`), not ended as a breach of the protocol.
             Self::Probe => matches!(
                 record,
-                Record::Echo(_) | Record::DeliveryQuery(_) | Record::Retired(KIND_POSSESSION_QUERY)
+                Record::Echo(_)
+                    | Record::DeliveryQuery(_)
+                    | Record::TimedHeartbeat(_)
+                    | Record::Retired(KIND_POSSESSION_QUERY)
             ),
             _ => true,
         }
@@ -327,6 +334,13 @@ pub enum Reason {
     /// exempted such a parent from every shortfall. A reader that predates it reads `Other(8)`,
     /// which no reader takes as full.
     OverCeiling,
+    /// A feeder's batch was signed by a wall clock further ahead of the relay's than the relay
+    /// allows (`budget::F`), or by none it can read: every relay would judge
+    /// its batches outside its window of time (RFC-0171 §3.6). A batch only too old is dropped,
+    /// never refused. The feeder signs by the relay's stated clock from then on (`RateLimit`'s
+    /// `clock_ms`) and may come back at the wait given; one that predates the stated clock should
+    /// set its own (NTP). A reader that predates it reads `Other(9)`, which a feeder retries.
+    Clock,
     Other(u8),
 }
 
@@ -341,6 +355,7 @@ impl Reason {
             Self::FellBehind => 6,
             Self::Retired => 7,
             Self::OverCeiling => 8,
+            Self::Clock => 9,
             Self::Other(byte) => byte,
         }
     }
@@ -355,6 +370,7 @@ impl Reason {
             6 => Self::FellBehind,
             7 => Self::Retired,
             8 => Self::OverCeiling,
+            9 => Self::Clock,
             other => Self::Other(other),
         }
     }
@@ -383,6 +399,70 @@ impl RelayAddress {
     }
 }
 
+/// The timestamps a [`Record::TimedHeartbeat`] carries, Unix milliseconds by each side's clock:
+/// NTP's on-wire exchange (RFC 5905 §8). The asker sends `sent_ms` (its `T1`); the answer carries
+/// `T1` echoed and the time its sender took it (`T2`) as `echo`, its own send time (`T3`) as
+/// `sent_ms`, and its clock's error bound, and its reader notes when it took it (`T4`). Then the
+/// answerer's clock is `((T2 - T1) + (T3 - T4)) / 2` from the asker's, within half the round
+/// trip `(T4 - T1) - (T3 - T2)`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HeartbeatTimes {
+    /// The sender's clock as it wrote this.
+    pub sent_ms: u64,
+    /// An answer's echo: the asker's `sent_ms`, and the sender's clock when it took it.
+    pub echo: Option<(u64, u64)>,
+    /// The sender's stated error bound of its clock (as `Record::RateLimit`'s `error_ms`),
+    /// `u64::MAX` unsynced. Sent only with `echo`.
+    pub error_ms: Option<u64>,
+}
+
+impl HeartbeatTimes {
+    /// An asker's: its send time alone.
+    pub const fn asking(sent_ms: u64) -> Self {
+        Self {
+            sent_ms,
+            echo: None,
+            error_ms: None,
+        }
+    }
+
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), WireError> {
+        out.extend_from_slice(&self.sent_ms.to_be_bytes());
+        match (self.echo, self.error_ms) {
+            (Some((asked, took)), error) => {
+                out.extend_from_slice(&asked.to_be_bytes());
+                out.extend_from_slice(&took.to_be_bytes());
+                if let Some(error) = error {
+                    out.extend_from_slice(&error.to_be_bytes());
+                }
+                Ok(())
+            }
+            (None, None) => Ok(()),
+            (None, Some(_)) => Err(WireError::Invalid {
+                field: "heartbeat error without its echo",
+                value: 0,
+            }),
+        }
+    }
+
+    fn read(reader: &mut Body<'_>) -> Result<Self, WireError> {
+        let sent_ms = reader.u64()?;
+        let echo = if reader.remaining() >= 16 {
+            Some((reader.u64()?, reader.u64()?))
+        } else {
+            None
+        };
+        let error_ms = (echo.is_some() && reader.remaining() >= 8)
+            .then(|| reader.u64())
+            .transpose()?;
+        Ok(Self {
+            sent_ms,
+            echo,
+            error_ms,
+        })
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Record {
     /// The initiator's first record: the versions it speaks and what it is.
@@ -400,6 +480,12 @@ pub enum Record {
     /// A receiver's signed description of itself. Sent at start and whenever it changes.
     ReceiverInfo(ReceiverInfo),
     Heartbeat,
+    /// A heartbeat carrying the NTP timestamps (RFC 5905 §8) that let its reader measure the
+    /// sender's clock: kind 0x05 with a body, which a reader that predates it reads as a plain
+    /// [`Record::Heartbeat`] (its body ignored, §3.4). A feeder sends its own send time; a relay
+    /// answers with it echoed, when it took it, its own send time and its error bound, so the
+    /// feeder has the four timestamps of one exchange and the relay's word on its own clock.
+    TimedHeartbeat(HeartbeatTimes),
     /// "Leave me", from a relay. The relays named are hints; the feeder still chooses by its
     /// own rules, so a redirect can never steer a feeder somewhere it would not go.
     Redirect {
@@ -420,6 +506,22 @@ pub enum Record {
         /// (§3.4): `None` from a relay that states none, and a feeder that predates it reads the
         /// two fields before it and ignores it.
         wanted_per_sec: Option<u32>,
+        /// The relay's wall clock as it wrote this, Unix milliseconds: the clock it judges a
+        /// feeder's signed `wall_ms` by (`budget::Window::FEEDER`). Stated in the greeting, and
+        /// again whenever a feeder that signed in step with it drifts past half of `budget::F`. A
+        /// feeder signs its batches at the low end of what its configured relays' clocks select
+        /// (RFC 5905 §11.2.1, `tally_feed`'s `RelayClocks`), so no one relay off on its own moves
+        /// it; a relay it was not configured with only says, on its health, how far apart they
+        /// are. Appended after `wanted_per_sec`, and sent only with it: `None` from a relay that states none, and a feeder that predates it
+        /// reads the fields before it and ignores it.
+        clock_ms: Option<u64>,
+        /// How far the relay's clock may be from true time as it wrote this, in milliseconds
+        /// (`ε_r`, the host's NTP daemon's bound, `adjtimex`'s `maxerror`), `u64::MAX` while the
+        /// host reports its clock unsynced: what a feeder weighs this relay's clock by when it
+        /// selects (RFC 5905 §11.2.1). Appended after `clock_ms`, and sent only with it: `None`
+        /// from a relay that states none, which a feeder takes at the bound the protocol promises
+        /// (`budget::E`); a reader that predates it ignores it.
+        error_ms: Option<u64>,
     },
     /// The relay is closing the session.
     Goodbye {
@@ -496,6 +598,9 @@ pub enum Record {
     /// An area's deduplicated receptions as a client receives them: no counter.
     ClientRegionalBatch(ClientRegionalBatch),
     FeederFigures(crate::figures::FeederFigures),
+    /// A relay's signed freshness anchor (RFC-0171 §3.6, [`crate::anchor`]), to a feeder session:
+    /// what the feeder's next batches carry.
+    Anchor(crate::anchor::Anchor),
 }
 
 impl Record {
@@ -525,7 +630,7 @@ impl Record {
             Self::Welcome { .. } => KIND_WELCOME,
             Self::Batch(_) => KIND_BATCH,
             Self::ReceiverInfo(_) => KIND_RECEIVER_INFO,
-            Self::Heartbeat => KIND_HEARTBEAT,
+            Self::Heartbeat | Self::TimedHeartbeat(_) => KIND_HEARTBEAT,
             Self::Redirect { .. } => KIND_REDIRECT,
             Self::RelayList(_) => KIND_RELAY_LIST,
             Self::RateLimit { .. } => KIND_RATE_LIMIT,
@@ -559,6 +664,7 @@ impl Record {
             Self::ClientClockModel(_) => KIND_CLIENT_CLOCK_MODEL,
             Self::ClientRegionalBatch(_) => KIND_CLIENT_REGIONAL_BATCH,
             Self::FeederFigures(_) => KIND_FEEDER_FIGURES,
+            Self::Anchor(_) => KIND_ANCHOR,
             Self::Retired(kind) => *kind,
         }
     }
@@ -574,6 +680,65 @@ impl Record {
                 retry_after_secs: 86_400,
             }),
             _ => None,
+        }
+    }
+
+    /// What it allocates of its own beside its place, as a queue or a store holding it is charged
+    /// for it (`footprint`): each signed record its bytes' capacity, a batch its shared bytes
+    /// unless they carry their own charge ([`Batch::allocated`]), and any other its lists' and
+    /// strings' capacities. Never its encoded length, which a record's allocations may pass.
+    pub fn allocated(&self) -> usize {
+        use crate::footprint::vec;
+        match self {
+            Self::Hello { .. }
+            | Self::Welcome { .. }
+            | Self::Heartbeat
+            | Self::TimedHeartbeat(_)
+            | Self::RateLimit { .. }
+            | Self::Goodbye { .. }
+            | Self::Echo(_)
+            | Self::Retired(_)
+            | Self::ProviderQuery(_)
+            | Self::StripeAssignment(_)
+            | Self::Anchor(_) => 0,
+            Self::Batch(batch) | Self::RelayBatch(batch) => batch.allocated(),
+            Self::ReceiverInfo(info) => info.allocated(),
+            Self::Redirect { hints, .. } | Self::RelayList(hints) => {
+                vec::<RelayAddress>(hints.capacity())
+                    + hints
+                        .iter()
+                        .map(|hint| hint.address.capacity())
+                        .sum::<usize>()
+            }
+            Self::Subscribe { regions, .. } => vec::<Region>(regions.capacity()),
+            Self::Positions(positions) | Self::Provisional(positions) => positions.allocated(),
+            Self::ClockModel(model) => model.allocated(),
+            Self::ClockModelPart(part) => part.allocated(),
+            Self::FaultProof(proof) => proof.allocated(),
+            Self::EchoReply(signed) => signed.allocated(),
+            Self::DeliveryQuery(query) => {
+                vec::<crate::delivery::SequenceRange>(query.ranges.capacity())
+                    + query.keys.as_ref().map_or(0, |keys| keys.allocated())
+            }
+            Self::DeliveryAnswer(signed) => signed.allocated(),
+            Self::ProviderOffer(signed) => signed.allocated(),
+            Self::PieceManifest(signed) => signed.allocated(),
+            Self::HaveSummary(have) => vec::<u8>(have.seconds.capacity()),
+            Self::StripeReceipt(signed) => signed.allocated(),
+            Self::FirehoseCredential(signed) => signed.allocated(),
+            Self::EvidenceBundle(signed) => signed.allocated(),
+            Self::WorldPositions(signed) => signed.allocated(),
+            Self::RegionalBatch(signed) => signed.allocated(),
+            Self::Parity(chunk) => {
+                vec::<u32>(chunk.lens.capacity()) + vec::<u8>(chunk.bytes.capacity())
+            }
+            Self::BundleIndex(signed) => signed.allocated(),
+            Self::WorldPrecise(signed) => signed.allocated(),
+            Self::MlatCut(signed) => signed.allocated(),
+            Self::ReceiverSite(signed) => signed.allocated(),
+            Self::ClientClockModel(signed) => signed.allocated(),
+            Self::ClientRegionalBatch(signed) => signed.allocated(),
+            Self::FeederFigures(signed) => signed.allocated(),
         }
     }
 
@@ -635,6 +800,7 @@ impl Record {
             Self::Batch(batch) => out.extend_from_slice(batch.as_bytes()),
             Self::ReceiverInfo(info) => out.extend_from_slice(info.as_bytes()),
             Self::Heartbeat => {}
+            Self::TimedHeartbeat(times) => times.write(out)?,
             Self::Redirect {
                 retry_after_secs,
                 hints,
@@ -647,11 +813,36 @@ impl Record {
                 bytes_per_sec,
                 burst,
                 wanted_per_sec,
+                clock_ms,
+                error_ms,
             } => {
                 out.extend_from_slice(&bytes_per_sec.to_be_bytes());
                 out.extend_from_slice(&burst.to_be_bytes());
-                if let Some(wanted) = wanted_per_sec {
-                    out.extend_from_slice(&wanted.to_be_bytes());
+                if clock_ms.is_none() && error_ms.is_some() {
+                    // Appended after it: an error with no clock before it would be read as one.
+                    return Err(WireError::Invalid {
+                        field: "rate limit error without its clock",
+                        value: 0,
+                    });
+                }
+                match (wanted_per_sec, clock_ms) {
+                    (Some(wanted), clock) => {
+                        out.extend_from_slice(&wanted.to_be_bytes());
+                        if let Some(clock) = clock {
+                            out.extend_from_slice(&clock.to_be_bytes());
+                            if let Some(error) = error_ms {
+                                out.extend_from_slice(&error.to_be_bytes());
+                            }
+                        }
+                    }
+                    (None, None) => {}
+                    // Appended after it: a clock with no ceiling before it would be read as one.
+                    (None, Some(_)) => {
+                        return Err(WireError::Invalid {
+                            field: "rate limit clock without its wanted ceiling",
+                            value: 0,
+                        });
+                    }
                 }
             }
             Self::Goodbye {
@@ -699,6 +890,7 @@ impl Record {
             Self::ClientClockModel(signed) => out.extend_from_slice(signed.as_bytes()),
             Self::ClientRegionalBatch(signed) => out.extend_from_slice(signed.as_bytes()),
             Self::FeederFigures(signed) => out.extend_from_slice(signed.as_bytes()),
+            Self::Anchor(anchor) => anchor.write(out),
             Self::Retired(kind) => {
                 out.truncate(start);
                 return Err(WireError::Invalid {
@@ -766,7 +958,8 @@ impl Record {
             },
             KIND_BATCH => Self::Batch(Batch::from_bytes(body.to_vec())?),
             KIND_RECEIVER_INFO => Self::ReceiverInfo(ReceiverInfo::from_bytes(body.to_vec())?),
-            KIND_HEARTBEAT => Self::Heartbeat,
+            KIND_HEARTBEAT if body.is_empty() => Self::Heartbeat,
+            KIND_HEARTBEAT => Self::TimedHeartbeat(HeartbeatTimes::read(&mut reader)?),
             KIND_REDIRECT => Self::Redirect {
                 retry_after_secs: reader.u32()?,
                 hints: decode_relays(&mut reader)?,
@@ -778,6 +971,12 @@ impl Record {
                 // Appended: read when its bytes are there, as a relay that states it sends it.
                 wanted_per_sec: (reader.remaining() >= 4)
                     .then(|| reader.u32())
+                    .transpose()?,
+                clock_ms: (reader.remaining() >= 8)
+                    .then(|| reader.u64())
+                    .transpose()?,
+                error_ms: (reader.remaining() >= 8)
+                    .then(|| reader.u64())
                     .transpose()?,
             },
             KIND_GOODBYE => Self::Goodbye {
@@ -836,6 +1035,7 @@ impl Record {
             KIND_FEEDER_FIGURES => {
                 Self::FeederFigures(crate::figures::FeederFigures::from_bytes(body.to_vec())?)
             }
+            KIND_ANCHOR => Self::Anchor(crate::anchor::Anchor::from_body(body)?),
             KIND_POSSESSION_QUERY | KIND_POSSESSION_ANSWER => Self::Retired(kind),
             _ => return Self::unknown(kind, length),
         };
@@ -1000,12 +1200,36 @@ pub(crate) mod tests {
                 bytes_per_sec: 64_000,
                 burst: 128_000,
                 wanted_per_sec: None,
+                clock_ms: None,
+                error_ms: None,
             },
             Record::RateLimit {
                 bytes_per_sec: 64_000,
                 burst: 128_000,
                 wanted_per_sec: Some(1_800),
+                clock_ms: None,
+                error_ms: None,
             },
+            Record::RateLimit {
+                bytes_per_sec: 64_000,
+                burst: 128_000,
+                wanted_per_sec: Some(1_800),
+                clock_ms: Some(1_791_244_800_000),
+                error_ms: None,
+            },
+            Record::RateLimit {
+                bytes_per_sec: 64_000,
+                burst: 128_000,
+                wanted_per_sec: Some(1_800),
+                clock_ms: Some(1_791_244_800_000),
+                error_ms: Some(12),
+            },
+            Record::TimedHeartbeat(HeartbeatTimes::asking(1_791_244_800_000)),
+            Record::TimedHeartbeat(HeartbeatTimes {
+                sent_ms: 1_791_244_800_010,
+                echo: Some((1_791_244_800_000, 1_791_244_800_004)),
+                error_ms: Some(u64::MAX),
+            }),
             Record::Goodbye {
                 reason: Reason::Full,
                 retry_after_secs: 600,
@@ -1302,7 +1526,8 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_probe_may_send_only_echoes_and_delivery_queries() -> Result<(), WireError> {
+    fn a_probe_may_send_only_echoes_timed_heartbeats_and_delivery_queries() -> Result<(), WireError>
+    {
         let relay = Identity::generate()?;
         let query = Record::DeliveryQuery(DeliveryQuery {
             nonce: [1; 32],
@@ -1313,7 +1538,12 @@ pub(crate) mod tests {
         });
         assert!(Role::Probe.may_send(&Record::Echo(Echo { nonce: 1 })));
         assert!(Role::Probe.may_send(&query));
+        // A probe asks a relay's clock with a timed heartbeat (RFC-0171 §3.6).
         for other in every_record()? {
+            if matches!(other, Record::TimedHeartbeat(_)) {
+                assert!(Role::Probe.may_send(&other));
+                continue;
+            }
             assert!(!Role::Probe.may_send(&other), "{other:?}");
             assert!(Role::Feeder.may_send(&other));
         }
@@ -1615,11 +1845,15 @@ pub(crate) mod tests {
             bytes_per_sec: 64_000,
             burst: 128_000,
             wanted_per_sec: Some(1_800),
+            clock_ms: None,
+            error_ms: None,
         };
         let unstated = Record::RateLimit {
             bytes_per_sec: 64_000,
             burst: 128_000,
             wanted_per_sec: None,
+            clock_ms: None,
+            error_ms: None,
         };
         let (mut new, mut old) = (Vec::new(), Vec::new());
         stated.encode(&mut new)?;
@@ -1637,6 +1871,121 @@ pub(crate) mod tests {
         let mut later = Vec::new();
         Record::decode_message(&new, &mut later)?;
         assert_eq!(later, vec![stated]);
+        Ok(())
+    }
+
+    /// A relay states its clock after the wanted ceiling (RFC-0171 §3.6): a feeder that predates
+    /// it reads the record as one stating the ceiling alone, byte for byte, and a clock is never
+    /// written without the ceiling it is appended after.
+    #[test]
+    fn a_rate_limits_clock_is_appended_after_its_wanted_ceiling() -> Result<(), WireError> {
+        let clocked = Record::RateLimit {
+            bytes_per_sec: 64_000,
+            burst: 128_000,
+            wanted_per_sec: Some(1_800),
+            clock_ms: Some(1_791_244_800_123),
+            error_ms: None,
+        };
+        let unclocked = Record::RateLimit {
+            bytes_per_sec: 64_000,
+            burst: 128_000,
+            wanted_per_sec: Some(1_800),
+            clock_ms: None,
+            error_ms: None,
+        };
+        let (mut new, mut old) = (Vec::new(), Vec::new());
+        clocked.encode(&mut new)?;
+        unclocked.encode(&mut old)?;
+        assert_eq!(new.len(), old.len() + 8);
+        assert_eq!(new[3..old.len()], old[3..]);
+        assert_eq!(new[old.len()..], 1_791_244_800_123u64.to_be_bytes());
+        let mut back = Vec::new();
+        Record::decode_message(&new, &mut back)?;
+        assert_eq!(back, vec![clocked]);
+        let alone = Record::RateLimit {
+            bytes_per_sec: 64_000,
+            burst: 128_000,
+            wanted_per_sec: None,
+            clock_ms: Some(1),
+            error_ms: None,
+        };
+        assert!(alone.encode(&mut Vec::new()).is_err());
+        Ok(())
+    }
+
+    /// A relay states its clock's error bound after its clock (RFC-0171 §3.6): a feeder that
+    /// predates it reads the record as one stating the clock alone, byte for byte, and an error
+    /// is never written without the clock it is appended after.
+    #[test]
+    fn a_rate_limits_error_is_appended_after_its_clock() -> Result<(), WireError> {
+        let bounded = Record::RateLimit {
+            bytes_per_sec: 64_000,
+            burst: 128_000,
+            wanted_per_sec: Some(1_800),
+            clock_ms: Some(1_791_244_800_123),
+            error_ms: Some(40),
+        };
+        let unbounded = Record::RateLimit {
+            bytes_per_sec: 64_000,
+            burst: 128_000,
+            wanted_per_sec: Some(1_800),
+            clock_ms: Some(1_791_244_800_123),
+            error_ms: None,
+        };
+        let (mut new, mut old) = (Vec::new(), Vec::new());
+        bounded.encode(&mut new)?;
+        unbounded.encode(&mut old)?;
+        assert_eq!(new.len(), old.len() + 8);
+        assert_eq!(new[3..old.len()], old[3..]);
+        assert_eq!(new[old.len()..], 40u64.to_be_bytes());
+        let mut back = Vec::new();
+        Record::decode_message(&new, &mut back)?;
+        assert_eq!(back, vec![bounded]);
+        let alone = Record::RateLimit {
+            bytes_per_sec: 64_000,
+            burst: 128_000,
+            wanted_per_sec: Some(1_800),
+            clock_ms: None,
+            error_ms: Some(1),
+        };
+        assert!(alone.encode(&mut Vec::new()).is_err());
+        Ok(())
+    }
+
+    /// A timed heartbeat is a heartbeat with a body (RFC 5905 §8's timestamps): its kind is the
+    /// heartbeat's, so a reader that predates it, which reads a heartbeat's kind and ignores what
+    /// follows, reads a plain heartbeat; an empty body is still the plain one; an answer's error
+    /// is never written without its echo.
+    #[test]
+    fn a_timed_heartbeat_is_a_heartbeat_with_its_timestamps_appended() -> Result<(), WireError> {
+        let plain = {
+            let mut out = Vec::new();
+            Record::Heartbeat.encode(&mut out)?;
+            out
+        };
+        let answer = Record::TimedHeartbeat(HeartbeatTimes {
+            sent_ms: 30,
+            echo: Some((10, 20)),
+            error_ms: Some(7),
+        });
+        let mut timed = Vec::new();
+        answer.encode(&mut timed)?;
+        assert_eq!(timed[0], plain[0]);
+        assert_eq!(timed.len(), plain.len() + 32);
+        let mut back = Vec::new();
+        Record::decode_message(&timed, &mut back)?;
+        Record::decode_message(&plain, &mut back)?;
+        assert_eq!(back, vec![answer, Record::Heartbeat]);
+        // An asker's: its send time alone.
+        let mut asking = Vec::new();
+        Record::TimedHeartbeat(HeartbeatTimes::asking(5)).encode(&mut asking)?;
+        assert_eq!(asking.len(), plain.len() + 8);
+        let unechoed = Record::TimedHeartbeat(HeartbeatTimes {
+            sent_ms: 1,
+            echo: None,
+            error_ms: Some(1),
+        });
+        assert!(unechoed.encode(&mut Vec::new()).is_err());
         Ok(())
     }
 

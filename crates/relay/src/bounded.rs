@@ -27,6 +27,19 @@ pub struct Bounded<K, V> {
     tick: u64,
 }
 
+impl<K, V> Bounded<K, V> {
+    /// What a map of `capacity` keys allocates at most, at every instant, whatever it holds: its
+    /// order's tree at one past its capacity (a write adds its key before it forgets one), and its
+    /// entries' table as a table churned at that many (`footprint::table_churned`: a map that
+    /// forgets as many keys as it is written grows its table past twice its keys, and holds the
+    /// old table and the new one as it does).
+    pub const fn planned_bytes(capacity: usize) -> usize {
+        let held = if capacity == 0 { 1 } else { capacity } + 1;
+        tally_wire::footprint::table_churned::<K, (Rank, V)>(held)
+            + tally_wire::footprint::btree_planned::<Rank, K>(held)
+    }
+}
+
 impl<K: Hash + Eq + Clone, V> Bounded<K, V> {
     /// At least one key is always held.
     pub fn new(capacity: usize) -> Self {

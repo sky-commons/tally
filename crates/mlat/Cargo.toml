@@ -19,5 +19,9 @@ libm.workspace = true
 tally-mlat-solver.workspace = true
 tally-wire.workspace = true
 
+[dev-dependencies]
+# The tests' counting allocator: test support, outside every production build.
+tally-counting = { path = "../counting" }
+
 [lints]
 workspace = true

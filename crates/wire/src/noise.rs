@@ -29,7 +29,9 @@ use snow::StatelessTransportState;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf};
 
 use crate::WireError;
-use crate::key::{Identity, KEY_HINT_LEN, KEY_LEN, PublicKey, hint_of};
+use crate::key::{
+    Handshakes, Identity, KEY_HINT_LEN, KEY_LEN, PublicKey, handshake_key_of, hint_of,
+};
 use crate::record::{MAX_VERSION, MIN_VERSION, Reason, Record, Role, least_version};
 
 pub const PATTERN: &str = "Noise_IK_25519_ChaChaPoly_BLAKE2s";
@@ -254,7 +256,7 @@ pub struct Accepted<S, First = Vec<Record>> {
 /// Dials a responder whose key is known, says who we are and what we speak.
 pub async fn connect<S>(
     stream: S,
-    local: &Identity,
+    local: &impl Handshakes,
     remote: &PublicKey,
     role: Role,
 ) -> Result<Session<S>, WireError>
@@ -269,7 +271,7 @@ where
 /// for.
 pub async fn connect_with<S>(
     stream: S,
-    local: &Identity,
+    local: &impl Handshakes,
     remote: &PublicKey,
     role: Role,
     first: &[Record],
@@ -281,7 +283,7 @@ where
         HANDSHAKE_TIMEOUT,
         initiate(
             stream,
-            local,
+            handshake_key_of(local),
             remote,
             (role, first),
             (least_version(role), MAX_VERSION),
@@ -365,7 +367,7 @@ where
 /// key). Returns who it is and what it is; whether to serve that key is the caller's decision.
 /// What came with its `Hello` is decoded whole: for a peer that is trusted to send little with it
 /// (a test's stand-in relay). A relay, which answers strangers, reads it with [`accept_message`].
-pub async fn accept<S>(stream: S, identities: &[Identity]) -> Result<Accepted<S>, WireError>
+pub async fn accept<S>(stream: S, identities: &[impl Handshakes]) -> Result<Accepted<S>, WireError>
 where
     S: AsyncRead + AsyncWrite + Send,
 {
@@ -392,7 +394,7 @@ where
 /// three-byte records makes the responder hold one decoded record at a time, never them all.
 pub async fn accept_message<S>(
     stream: S,
-    identities: &[Identity],
+    identities: &[impl Handshakes],
 ) -> Result<Accepted<S, Message>, WireError>
 where
     S: AsyncRead + AsyncWrite + Send,
@@ -404,7 +406,7 @@ where
 
 async fn respond<S>(
     stream: S,
-    identities: &[Identity],
+    identities: &[impl Handshakes],
     pool: &'static Pool,
 ) -> Result<Accepted<S, Message>, WireError>
 where
@@ -422,6 +424,7 @@ where
     let hint = &prologue[8..];
     let local = identities
         .iter()
+        .map(handshake_key_of)
         .find(|identity| {
             identity
                 .public()
@@ -860,12 +863,12 @@ mod tests {
     async fn a_session_names_the_initiator_and_carries_records_both_ways() -> Result<(), WireError>
     {
         let relay = Identity::generate()?;
-        let feeder = Identity::generate()?;
+        let feeder = std::sync::Arc::new(Identity::generate()?);
         let (near, far) = tokio::io::duplex(1 << 16);
         let relay_key = relay.public();
         let dial = tokio::spawn({
-            let feeder = feeder.clone();
-            async move { connect(near, &feeder, &relay_key, Role::Feeder).await }
+            let feeder = std::sync::Arc::clone(&feeder);
+            async move { connect(near, feeder.as_ref(), &relay_key, Role::Feeder).await }
         });
         let accepted = accept(far, &[relay]).await?;
         let mut theirs = join(dial.await)??;
@@ -879,7 +882,7 @@ mod tests {
         let batches: Vec<Record> = (0..200)
             .map(|sequence| {
                 Batch::sign(
-                    &feeder,
+                    feeder.as_ref(),
                     &BatchContent {
                         boot_id: 1,
                         sequence,
@@ -1164,17 +1167,17 @@ mod tests {
         assert!(halves < 1024, "{halves} bytes");
         let pool = own_pool(16);
         let relay = Identity::generate()?;
-        let feeder = Identity::generate()?;
+        let feeder = std::sync::Arc::new(Identity::generate()?);
         let mut sessions = Vec::new();
         for _ in 0..8 {
             let (near, far) = tokio::io::duplex(1 << 17);
             let relay_key = relay.public();
             let dial = tokio::spawn({
-                let feeder = feeder.clone();
+                let feeder = std::sync::Arc::clone(&feeder);
                 async move {
                     initiate(
                         near,
-                        &feeder,
+                        feeder.as_ref(),
                         &relay_key,
                         (Role::Feeder, &[]),
                         (MIN_VERSION, MAX_VERSION),
@@ -1339,63 +1342,23 @@ mod tests {
         Ok(())
     }
 
-    /// Counts the bytes each thread has live on the heap and the most it had since it last asked
-    /// ([`counting::start`]): what one test measures on its own thread, whatever the others do.
+    /// The bytes each thread has live on the heap and the most it had since it last asked
+    /// (`tally_counting`, the test binary's allocator): what one test measures on its own thread,
+    /// whatever the others do.
     mod counting {
-        use std::alloc::{GlobalAlloc, Layout, System};
-        use std::cell::Cell;
-
-        thread_local! {
-            static LIVE: Cell<isize> = const { Cell::new(0) };
-            static PEAK: Cell<isize> = const { Cell::new(0) };
-        }
-
-        fn add(bytes: isize) {
-            // A thread's own counters, skipped while its storage is being torn down.
-            let _ = LIVE.try_with(|live| {
-                let now = live.get() + bytes;
-                live.set(now);
-                let _ = PEAK.try_with(|peak| peak.set(peak.get().max(now)));
-            });
-        }
-
-        struct Counting;
-
-        // SAFETY: every call is the system allocator's, with the same arguments; the counters are
-        // the calling thread's own cells, touched by nothing else.
-        unsafe impl GlobalAlloc for Counting {
-            unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-                add(layout.size() as isize);
-                // SAFETY: the caller's contract is the system allocator's.
-                unsafe { System.alloc(layout) }
-            }
-
-            unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-                add(-(layout.size() as isize));
-                // SAFETY: the caller's contract is the system allocator's.
-                unsafe { System.dealloc(ptr, layout) }
-            }
-
-            unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-                add(new_size as isize - layout.size() as isize);
-                // SAFETY: the caller's contract is the system allocator's.
-                unsafe { System.realloc(ptr, layout, new_size) }
-            }
-        }
+        use tally_counting::Counting;
 
         #[global_allocator]
         static GLOBAL: Counting = Counting;
 
         /// Starts a measure on this thread: the bytes live now.
         pub fn start() -> isize {
-            let live = LIVE.with(Cell::get);
-            PEAK.with(|peak| peak.set(live));
-            live
+            Counting::peak_base()
         }
 
         /// The most this thread had live since `start`, above what it had then.
         pub fn peak_since(start: isize) -> isize {
-            PEAK.with(Cell::get) - start
+            Counting::peak_since(start)
         }
     }
 

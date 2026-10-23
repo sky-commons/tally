@@ -24,6 +24,11 @@ pub const MAX_CREDENTIAL_LIFETIME_MS: u64 = 60 * 60 * 1000;
 /// The most records of each kind one bundle carries: a sample of the evidence, not all of it.
 pub const MAX_EVIDENCE: usize = 64;
 
+/// The most relays a description may name and still be held as a feeder's (`tally_relay::credit`):
+/// a feeder names the relays it publishes to, two at most (`tally_feed`'s `selection::Choice`,
+/// held to this at compile time), so one naming more is no feeder's.
+pub const MAX_DESCRIBED_RELAYS: usize = 8;
+
 /// "This client belongs to me", signed by the relay.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FirehoseCredentialContent {
@@ -285,7 +290,7 @@ impl EvidenceBundle {
     /// Signs a format 2 bundle: its feeders by reference, so it carries no description, and no
     /// site, whatever format its feeders signed in.
     pub fn sign_referenced(
-        identity: &crate::key::Identity,
+        identity: &impl crate::key::Signs,
         content: &ReferencedEvidenceContent,
     ) -> Result<Self, WireError> {
         let mut body = Vec::new();

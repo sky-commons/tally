@@ -4,9 +4,17 @@
 //! The feeders split over processes and hosts by shard (`config::Shard`): every shard simulates the
 //! same world and runs its own slice of it.
 
+// It holds every simulated feeder's key: no `unsafe` code outside its one libc module (`os`).
+// Denied, not forbidden, since `os` needs its allow, and a forbid refuses that too: the build
+// refuses `unsafe` in every other module, and that `os` reaches no key is review's to hold.
+#![deny(unsafe_code)]
+
 pub mod config;
 pub mod feeders;
 pub mod histogram;
+/// The one module that calls libc, and so the one allowed `unsafe`: it reaches no key.
+#[allow(unsafe_code)]
+mod os;
 pub mod relay;
 pub mod subscriber;
 pub mod traffic;
@@ -34,11 +42,7 @@ const FEEDERS_NICE: libc::c_int = 5;
 /// behind starves the feeders it feeds), while a feeder that waits only delays its own batch.
 /// Run on each of the feeders' runtime threads as it starts. Failing, it leaves the thread as it is.
 pub fn lower_priority() {
-    let tid = tally_relay::os::thread_id();
-    // SAFETY: `setpriority` takes and touches no memory of ours.
-    unsafe {
-        let _ = libc::setpriority(libc::PRIO_PROCESS, tid, FEEDERS_NICE);
-    }
+    os::set_thread_nice(tally_relay::os::thread_id(), FEEDERS_NICE);
 }
 
 /// How often a progress line is printed.

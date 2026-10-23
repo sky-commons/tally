@@ -39,7 +39,8 @@ use std::sync::Arc;
 
 use tally_mlat_solver::held::{Bin, Fragment, Limits, RAW_SPARE_BINS, Rates, SealedBins};
 use tally_mlat_solver::scope::{AFTER, BEFORE, STRIDE, Window, bin_of};
-use tally_wire::{Batch, Decoded, Identity, PublicKey, Record, Regions};
+use tally_wire::clocks::{Judged, Moment, Mono, Span};
+use tally_wire::{Batch, Decoded, PublicKey, Record, Regions, Signer};
 
 use crate::intake::{Intake, Orphaned, Seats, SiteRecord, Sited};
 use crate::provisional::{self, Provisional};
@@ -67,9 +68,26 @@ pub const WAITING_PER_RECEIVER: usize =
 /// window step's run on the threads its host plans (measured on a relay's planned threads, RFC-0181
 /// "MLAT in the cores", 9 to 11 s at 2,000 feeders; it was 5 s, and every window step past it made
 /// the provisional bytes depend on thread timing), and at least the window steps a host may fall
-/// behind. A model is carried for 90 s past its window (`tally_mlat_solver::MAX_CARRY_PS`) and a
-/// tile's is refitted every stride (40 s), so fifteen seconds of it are not missed.
+/// behind. Its delay is part of how far a model is carried (`tally_mlat_solver::MAX_CARRY_PS`,
+/// held to it below).
 pub const MODELS_RIPEN_MS: u64 = 15_000;
+
+// How far a provisional carries a model past its last knot, at most: a tile's model is refitted
+// every stride, so the newest one's window ended up to `STRIDE + AFTER` bins before the bin a
+// reception falls in, and that bin's own length on; the window was solved once settled
+// (`MLAT_SETTLE`), its model ripens `MODELS_RIPEN_MS` later, and a reception may be stamped up to
+// `MLAT_AHEAD` past the judging clock that sealed it, plus one bin of rounding. 84 s, inside the
+// spec's 90 s.
+const _: () = {
+    use tally_mlat_solver::scope::GRID_MS;
+    use tally_wire::budget::{MLAT_AHEAD, MLAT_SETTLE};
+    let carried_ms = (STRIDE + AFTER) as u64 * GRID_MS
+        + MLAT_SETTLE.span::<Judged>().ms()
+        + MODELS_RIPEN_MS
+        + MLAT_AHEAD.span::<Judged>().ms()
+        + GRID_MS;
+    assert!(tally_mlat_solver::MAX_CARRY_PS >= carried_ms as i128 * 1_000_000_000);
+};
 
 /// How much an engine holds, derived from what its host admits (RFC-0181 §9).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -118,9 +136,9 @@ impl Default for Capacity {
 pub struct Settings {
     /// The H3 cells whose receivers take part; empty is every receiver with a location.
     pub regions: Regions,
-    /// How long after a bin's canonical window ends (by the engine's clock) it is solved, so the
-    /// raw of the window's last bin is in.
-    pub settle_ms: u64,
+    /// How long after a bin's canonical window ends (by the engine's judging clock) it is solved,
+    /// so the raw of the window's last bin is in.
+    pub settle: Span<Judged>,
     /// The threads one step's work, and a bin's sealing, are spread over. Any number gives the
     /// same bytes.
     pub threads: usize,
@@ -131,7 +149,11 @@ pub struct Settings {
 impl Settings {
     /// The raw it may hold.
     pub fn limits(&self) -> Limits {
-        Limits::for_receivers(self.capacity.receivers, self.capacity.rates, self.settle_ms)
+        Limits::for_receivers(
+            self.capacity.receivers,
+            self.capacity.rates,
+            self.settle.ms(),
+        )
     }
 }
 
@@ -150,6 +172,24 @@ pub enum Ingested {
     Refused,
 }
 
+/// A window passed over unsolved (`Engine::pass_sealed`), by the judging times between which the
+/// engine solving in line carries its model in provisional solving: from when it would ripen
+/// (`MODELS_RIPEN_MS` after its window fell due) to when it is spent (`MAX_CARRY_PS` past its
+/// window). A provisional step judged in between would have carried it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Passed {
+    pub ripe_ms: u64,
+    pub spent_ms: u64,
+}
+
+impl Passed {
+    /// Whether a provisional step judged at `judged` would have carried it.
+    pub fn carried_at(&self, judged: Judged) -> bool {
+        tally_wire::budget::reached(self.ripe_ms, judged)
+            && !tally_wire::budget::passed(self.spent_ms, judged)
+    }
+}
+
 /// What was refused since the last step, every refusal whole.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Dropped {
@@ -166,7 +206,9 @@ pub struct Dropped {
 }
 
 pub struct Engine {
-    identity: Identity,
+    /// The relay's key as everything the engine signs reaches it: only while its clock is
+    /// judging (`tally_wire::Signer`), so a step that finishes after it lost sync signs nothing.
+    signer: Signer,
     boot_id: u64,
     settings: Settings,
     /// The areas whose tiles it fits (`set_scope`): a tile is fitted only if its centre is in one.
@@ -185,26 +227,21 @@ pub struct Engine {
     provisional: Provisional,
     /// Batches waiting for a description let go, since it started.
     orphaned: Orphaned,
-    /// The models window steps published, each with the step from which provisional solving
-    /// takes it up (`MODELS_RIPEN_MS` after its window's due step).
+    /// The models window steps published, each with the judging time on the bin grid from which
+    /// provisional solving takes it up (`MODELS_RIPEN_MS` after its window's due step).
     ripening: Vec<(u64, provisional::Carried)>,
 }
 
 impl Engine {
     /// `boot_id` is this process's: relays number an engine's records per (engine, boot), so a
     /// restart starts its sequences again at 0 without colliding with what the last boot sent.
-    pub fn new(identity: Identity, boot_id: u64, settings: Settings) -> Self {
-        Self::sharing(identity, boot_id, settings, SealedBins::new())
+    pub fn new(signer: Signer, boot_id: u64, settings: Settings) -> Self {
+        Self::sharing(signer, boot_id, settings, SealedBins::new())
     }
 
     /// As `new`, sealing into `sealed`: the handle its host's other readers of the raw keep (a
     /// relay's standing), so the raw is held once.
-    pub fn sharing(
-        identity: Identity,
-        boot_id: u64,
-        settings: Settings,
-        sealed: SealedBins,
-    ) -> Self {
+    pub fn sharing(signer: Signer, boot_id: u64, settings: Settings, sealed: SealedBins) -> Self {
         let intake = Intake::new(
             Seats::new(settings.capacity.receivers),
             Limits {
@@ -213,7 +250,7 @@ impl Engine {
             },
             Some(settings.regions.clone()),
         );
-        let mut engine = Self::hosted(identity, boot_id, settings, sealed);
+        let mut engine = Self::hosted(signer, boot_id, settings, sealed);
         engine.intake = Some(intake);
         engine.provisional = Provisional::new(engine.settings.capacity.waiting());
         engine
@@ -223,14 +260,9 @@ impl Engine {
     /// receiver) and seals it into `sealed`: its host weighs what each batch says to provisional
     /// solving (`provisional::Shard::read`) and hands it the sites and the sealed bins at each
     /// step (`prepare_sealed`), and it solves them as `new`'s engine solves the same raw.
-    pub fn hosted(
-        identity: Identity,
-        boot_id: u64,
-        settings: Settings,
-        sealed: SealedBins,
-    ) -> Self {
+    pub fn hosted(signer: Signer, boot_id: u64, settings: Settings, sealed: SealedBins) -> Self {
         Self {
-            identity,
+            signer,
             boot_id,
             settings,
             owned: Regions::default(),
@@ -280,11 +312,12 @@ impl Engine {
         self.intake.as_ref().map_or(0, Intake::taking_part)
     }
 
-    /// Takes a record a relay delivered, at `now_ms` by the engine's clock (which decides only
-    /// when a reception is solved provisionally, never what anything solves to). An error is a
+    /// Takes a record a relay delivered, at `at` by the engine's clocks (which decide only when a
+    /// reception is solved provisionally and how far ahead raw may open, never what anything
+    /// solves to). An error is a
     /// record that claimed to be signed and is not. A hosted engine takes nothing this way: its
     /// host's intakes do.
-    pub fn ingest(&mut self, record: &Record, now_ms: u64) -> Result<Ingested, String> {
+    pub fn ingest(&mut self, record: &Record, at: Moment) -> Result<Ingested, String> {
         match record {
             Record::ReceiverSite(_) | Record::ReceiverInfo(_) => {
                 // A format 2 description carries no site: it places nobody.
@@ -296,14 +329,14 @@ impl Engine {
                 let described = intake.describe(&site)?;
                 let key = site.receiver().map_err(|error| error.to_string())?;
                 // The batches that waited for it, taken now as they would have been then.
-                for (batch, stamp_ms) in intake.take_orphans(&key) {
+                for batch in intake.take_orphans(&key) {
                     let (_, notes) = intake.ingest_verified(&batch);
-                    self.provisional.hear_notes(&batch, notes, stamp_ms);
+                    self.provisional.hear_notes(&batch, notes);
                 }
                 self.forget_receivers(&described.left);
                 Ok(described.ingested)
             }
-            Record::Batch(batch) => self.receive(batch, now_ms),
+            Record::Batch(batch) => self.receive(batch, at),
             // A relay's deduplicated stream is the relay's word, not a receiver's: it carries no
             // receiver's counter and is never multilaterated.
             _ => Ok(Ingested::Ignored),
@@ -341,7 +374,7 @@ impl Engine {
         }
     }
 
-    fn receive(&mut self, batch: &Batch, now_ms: u64) -> Result<Ingested, String> {
+    fn receive(&mut self, batch: &Batch, at: Moment) -> Result<Ingested, String> {
         let key = batch.receiver().map_err(|error| error.to_string())?;
         // Described and taking no part: nothing of it is held. Not described: it waits for the
         // description (`intake::Intake::hold_orphan`), verified first.
@@ -351,8 +384,8 @@ impl Engine {
         batch
             .verify()
             .map_err(|error| format!("batch of {key}: {error}"))?;
-        match Decoded::from_verified(batch.clone(), now_ms, 0) {
-            Ok(decoded) => Ok(self.ingest_verified(&decoded, now_ms)),
+        match Decoded::from_verified(batch.clone(), at, 0) {
+            Ok(decoded) => Ok(self.ingest_verified(&decoded)),
             // A format this build cannot read uses its sequence and holds nothing.
             Err(_) => Ok(self.intake.as_mut().map_or(Ingested::Ignored, |intake| {
                 intake.use_sequence(&key, batch.boot_id(), batch.sequence())
@@ -361,27 +394,28 @@ impl Engine {
     }
 
     /// Takes a batch whose signature the caller already verified and which it decoded once
-    /// (`tally_wire::Decoded`), at `now_ms` by the engine's clock: a relay hosting this engine
+    /// (`tally_wire::Decoded`), at its own stamp: a relay hosting this engine
     /// hands it what its own ingest checked, so nothing is verified or decoded twice. As `ingest`
     /// otherwise: used once per (boot, sequence), held only from a receiver that takes part.
-    pub fn ingest_verified(&mut self, batch: &Arc<Decoded>, now_ms: u64) -> Ingested {
+    pub fn ingest_verified(&mut self, batch: &Arc<Decoded>) -> Ingested {
         let Some(intake) = self.intake.as_mut() else {
             return Ingested::Ignored;
         };
         let (ingested, notes) = intake.ingest_verified(batch);
         if ingested == Ingested::Ignored && intake.described(&batch.receiver()).is_none() {
-            let orphaned = intake.hold_orphan(batch, now_ms);
+            let orphaned = intake.hold_orphan(batch);
             self.orphaned.dropped += orphaned.dropped;
         }
-        self.provisional.hear_notes(batch, notes, now_ms);
+        self.provisional.hear_notes(batch, notes);
         ingested
     }
 
     /// Lets go the batches that waited `intake::ORPHAN_MS` for a description by the step at
-    /// `now_ms`. What batches waiting for a description were let go since it started.
-    pub fn expire_orphans(&mut self, now_ms: u64) -> Orphaned {
+    /// `now` on the monotonic clock. What batches waiting for a description were let go since it
+    /// started.
+    pub fn expire_orphans(&mut self, now: Mono) -> Orphaned {
         if let Some(intake) = self.intake.as_mut() {
-            self.orphaned.expired += intake.expire_orphans(now_ms).expired;
+            self.orphaned.expired += intake.expire_orphans(now).expired;
         }
         self.orphaned
     }
@@ -394,19 +428,21 @@ impl Engine {
         self.dropped.ahead += dropped.ahead;
     }
 
-    /// The latest bin complete by `now_ms`: it ended, and the settling time after it passed.
-    pub fn settled(&self, now_ms: u64) -> i64 {
-        bin_of(now_ms.saturating_sub(self.settings.settle_ms)) - 1
+    /// The latest bin complete by the judging clock reading `judged`: it ended, and the settling
+    /// time after it passed. The bins are the feeders' signed times, so the judging clock, never
+    /// the monotonic one (a type: `tally_wire::clocks`).
+    pub fn settled(&self, judged: Judged) -> i64 {
+        bin_of(judged.earlier(self.settings.settle).ms()) - 1
     }
 
     /// Seals every bin that is complete, hands out the work of every window whose bins are all
     /// sealed and that is not solved yet (owned: the sealed bins are shared, not copied), so it
     /// runs off the thread that keeps ingesting; and forgets the bins no window still to be solved
-    /// needs. `None` when there is nothing to solve. `now_ms` is the engine's wall clock;
-    /// `issued_ms` the wall clock the records it signs carry. A hosted engine's host seals instead
-    /// and calls `prepare_sealed`.
-    pub fn prepare(&mut self, now_ms: u64, issued_ms: u64) -> Option<Job> {
-        let settled = self.settled(now_ms);
+    /// needs. `None` when there is nothing to solve. `at` is the step: its judging clock settles
+    /// the bins and is what the records it signs carry. A hosted engine's host seals instead and
+    /// calls `prepare_sealed`.
+    pub fn prepare(&mut self, at: Moment) -> Option<Job> {
+        let settled = self.settled(at.judged());
         let threads = self.settings.threads.max(1);
         let intake = self.intake.as_mut()?;
         let fragments = intake.take_through(settled);
@@ -418,7 +454,7 @@ impl Engine {
         for bin in bins {
             self.sealed.insert(bin);
         }
-        self.prepare_sealed(now_ms, issued_ms, settled, sites)
+        self.prepare_sealed(at.judged(), settled, sites)
     }
 
     /// The bytes of raw the sealed bins may still grow by: `Settings::limits` less what is sealed.
@@ -430,12 +466,11 @@ impl Engine {
     }
 
     /// As `prepare`, for an engine whose host sealed every bin through `settled` (the latest bin
-    /// complete by `now_ms`, `settled`) and holds the receivers taking part, `sites`, in key order
+    /// complete at its step) and holds the receivers taking part, `sites`, in key order
     /// (`intake::Intake::sites`: each with its reception key).
     pub fn prepare_sealed(
         &mut self,
-        now_ms: u64,
-        issued_ms: u64,
+        issued: Judged,
         settled: i64,
         sites: Vec<Sited>,
     ) -> Option<Job> {
@@ -450,9 +485,9 @@ impl Engine {
             .collect();
         let job = match (windows.first(), windows.last()) {
             (Some(first), Some(last)) => Some(Job {
-                identity: self.identity.clone(),
+                signer: self.signer.clone(),
                 boot_id: self.boot_id,
-                issued_ms,
+                issued_ms: issued.ms(),
                 threads: self.settings.threads.max(1),
                 regions: self.settings.regions.clone(),
                 owned: self.owned.clone(),
@@ -464,19 +499,19 @@ impl Engine {
             }),
             _ => None,
         };
-        self.forget_by(now_ms, settled, i64::MAX);
+        self.forget_by(settled, i64::MAX);
         job
     }
 
-    /// Forgets what no window still to be solved needs as of the step `now_ms`, whose bins are
-    /// sealed through `settled`, and nothing from bin `floor` on: what `prepare_sealed` forgets
+    /// Forgets what no window still to be solved needs as of the step whose bins are sealed
+    /// through `settled`, and nothing from bin `floor` on: what `prepare_sealed` forgets
     /// once it has handed its windows out. A host that seals at every step and prepares windows
     /// only at the steps where one falls due (`falls_due`; a relay's, `tally_relay::mlat_host`)
     /// forgets so at every step, its `floor` the first bin of a window it has not solved yet, so
     /// what the sealed bins hold, and the room the next seal has, is the stamps' alone, as in line,
     /// and a window that waits is never solved without the bins it began with.
-    pub fn forget_by(&mut self, now_ms: u64, settled: i64, floor: i64) {
-        let keep = kept_by_stamps(now_ms, settled).min(floor);
+    pub fn forget_by(&mut self, settled: i64, floor: i64) {
+        let keep = kept_by_stamps(settled).min(floor);
         self.sealed.forget_before(keep);
         if let Some(intake) = self.intake.as_mut() {
             intake.forget_before(keep);
@@ -498,71 +533,109 @@ impl Engine {
             .min()
     }
 
-    /// The step a window falls due at: the first at which its last bin is complete (`settled`).
-    /// A model it published ripens `MODELS_RIPEN_MS` after it, whenever the window was solved.
-    fn due_ms(&self, window: &Window) -> u64 {
+    /// The judging time a window falls due at, on the bin grid: the first at which its last bin is complete
+    /// (`settled`). A model it published ripens `MODELS_RIPEN_MS` after it, whenever the window
+    /// was solved. On the bin grid, so the judging clock's.
+    fn due(&self, window: &Window) -> u64 {
         (window.last.max(-1) + 1) as u64 * tally_mlat_solver::scope::GRID_MS
-            + self.settings.settle_ms
+            + self.settings.settle.ms()
     }
 
     /// Takes a finished job's outcome: what it solved is not solved again, and its records are
     /// the next in this boot's sequences. The records to publish, in order, and what the step did.
+    /// Its models ripen for provisional solving (`MODELS_RIPEN_MS`), so its caller publishes every
+    /// model record among them: a provisional fix cites only a model its readers received. A
+    /// caller that refuses the records is [`Engine::apply_unpublished`]'s.
     pub fn apply(&mut self, outcome: Outcome) -> (Vec<Record>, Report, Dropped) {
+        self.apply_as(outcome, true)
+    }
+
+    /// As [`Engine::apply`], for an outcome whose records were refused before any reader received
+    /// them (a host's queue of records not yet taken was full): what it solved is still not solved
+    /// again and its sequences still advance, but none of its models ripens, so no provisional fix
+    /// ever cites a model nobody received. What the step did.
+    pub fn apply_unpublished(&mut self, outcome: Outcome) -> (Report, Dropped) {
+        let (_, report, dropped) = self.apply_as(outcome, false);
+        (report, dropped)
+    }
+
+    fn apply_as(&mut self, outcome: Outcome, published: bool) -> (Vec<Record>, Report, Dropped) {
         self.processed
             .extend(outcome.windows.iter().map(|window| window.last));
         self.positions_sequence = outcome.positions_sequence;
         self.models_sequence = outcome.models_sequence;
         // Each model ripens by its own window's due step, however late the step that solved it ran
         // (a host's window step that waited, or took up a window shed or put off before it).
-        let ripening: Vec<(u64, provisional::Carried)> = outcome
-            .carried
-            .into_iter()
-            .map(|carried| {
-                let ripe_ms = self.due_ms(&carried.window).saturating_add(MODELS_RIPEN_MS);
-                (ripe_ms, carried)
-            })
-            .collect();
-        self.ripening.extend(ripening);
+        if published {
+            let ripening: Vec<(u64, provisional::Carried)> = outcome
+                .carried
+                .into_iter()
+                .map(|carried| {
+                    let ripe = self.due(&carried.window).saturating_add(MODELS_RIPEN_MS);
+                    (ripe, carried)
+                })
+                .collect();
+            self.ripening.extend(ripening);
+        }
         let dropped = std::mem::take(&mut self.dropped);
         (outcome.records, outcome.report, dropped)
     }
 
-    /// What a provisional step at `now_ms` needs of the engine (`crate::provisional::Plan`), for a
+    /// Passes over the windows of the sealed bins that fall due at the step whose bins are sealed
+    /// through `settled`, unsolved: those `prepare_sealed` would hand out at that step, for a host
+    /// whose step is already too late for any reader to take its final fixes. They are not solved
+    /// again, and what they held is forgotten as `prepare_sealed` forgets it. None of them publishes
+    /// a model, so the provisional steps that would have carried one ([`Passed`]) carry what the
+    /// engine solving in line would not: the host sheds them. What was passed over, window by
+    /// window.
+    pub fn pass_sealed(&mut self, settled: i64) -> Vec<Passed> {
+        let windows: BTreeSet<Window> = self
+            .sealed
+            .numbers()
+            .into_iter()
+            .map(Window::canonical)
+            .filter(|window| window.last <= settled && !self.processed.contains(&window.last))
+            .collect();
+        let passed = windows
+            .iter()
+            .map(|window| Passed {
+                ripe_ms: self.due(window).saturating_add(MODELS_RIPEN_MS),
+                spent_ms: provisional::spent_ms(window),
+            })
+            .collect();
+        self.processed
+            .extend(windows.iter().map(|window| window.last));
+        self.forget_by(settled, i64::MAX);
+        passed
+    }
+
+    /// What a provisional step at `at` needs of the engine (`crate::provisional::Plan`), for a
     /// host that holds the address shards: the models carried, spent ones forgotten first, and the
     /// next sequence. At most one step at a time; its outcome is `apply_provisional`'s.
-    pub fn provisional_plan(&mut self, now_ms: u64, issued_ms: u64) -> provisional::Plan {
-        self.ripen(now_ms);
-        self.provisional.plan(
-            now_ms,
-            &self.identity,
-            self.boot_id,
-            issued_ms,
-            self.settings.threads,
-        )
+    pub fn provisional_plan(&mut self, at: Moment) -> provisional::Plan {
+        self.ripen(at.judged());
+        self.provisional
+            .plan(at, &self.signer, self.boot_id, self.settings.threads)
     }
 
-    /// The provisional work due by `now_ms` (`crate::provisional`), owned, to run off the
-    /// ingesting thread; `None` when nothing is due.
-    pub fn provisional(&mut self, now_ms: u64, issued_ms: u64) -> Option<provisional::Job> {
-        self.ripen(now_ms);
-        self.provisional.due(
-            now_ms,
-            &self.identity,
-            self.boot_id,
-            issued_ms,
-            self.settings.threads,
-        )
+    /// The provisional work due at `at` (`crate::provisional`), owned, to run off the ingesting
+    /// thread; `None` when nothing is due.
+    pub fn provisional(&mut self, at: Moment) -> Option<provisional::Job> {
+        self.ripen(at.judged());
+        self.provisional
+            .due(at, &self.signer, self.boot_id, self.settings.threads)
     }
 
-    /// Provisional solving takes up the models published `MODELS_RIPEN_MS` or more before `now_ms`,
-    /// in the order they were published.
-    fn ripen(&mut self, now_ms: u64) {
+    /// Provisional solving takes up the models published `MODELS_RIPEN_MS` or more before the
+    /// judging clock reads `judged`, in the order they were published: a model ripens on the bin
+    /// grid its window fell due on, so by the judging clock, never the monotonic one.
+    fn ripen(&mut self, judged: Judged) {
         let ripening = std::mem::take(&mut self.ripening);
-        for (ripe_ms, carried) in ripening {
-            if ripe_ms <= now_ms {
+        for (ripe, carried) in ripening {
+            if tally_wire::budget::reached(ripe, judged) {
                 self.provisional.adopt(carried);
             } else {
-                self.ripening.push((ripe_ms, carried));
+                self.ripening.push((ripe, carried));
             }
         }
     }
@@ -575,8 +648,8 @@ impl Engine {
     }
 
     /// `provisional`, run and `apply_provisional` in one, on this thread.
-    pub fn provisional_step(&mut self, now_ms: u64, issued_ms: u64) -> Vec<Record> {
-        match self.provisional(now_ms, issued_ms) {
+    pub fn provisional_step(&mut self, at: Moment) -> Vec<Record> {
+        match self.provisional(at) {
             Some(job) => {
                 let outcome = job.run();
                 self.apply_provisional(outcome)
@@ -596,8 +669,8 @@ impl Engine {
     }
 
     /// `prepare`, run and `apply` in one, on this thread.
-    pub fn step(&mut self, now_ms: u64, issued_ms: u64) -> (Vec<Record>, Report) {
-        match self.prepare(now_ms, issued_ms) {
+    pub fn step(&mut self, at: Moment) -> (Vec<Record>, Report) {
+        match self.prepare(at) {
             Some(job) => {
                 let (records, report, _) = self.apply(job.run());
                 (records, report)
@@ -632,32 +705,37 @@ pub fn seal(fragments: Vec<Fragment>, threads: usize, room: usize) -> (Vec<Bin>,
     (bins, refused)
 }
 
-/// The first bin the stamps alone keep at the step `now_ms` whose bins are sealed through
-/// `settled` (`Engine::forget_by` keeps no less, and from a waiting window's `floor` on as well): a
-/// window still to be solved solves bins after `settled - STRIDE`, so nothing before its history is
+/// The first bin the stamps alone keep at the step whose bins are sealed through `settled`
+/// (`Engine::forget_by` keeps no less, and from a waiting window's `floor` on as well): a window
+/// still to be solved solves bins after `settled - STRIDE`, so nothing before its history is
 /// needed by the engine; and its raw is its host's one store, so it keeps what standing settles
-/// against too: a window and its stride behind the clock, and the spare bins
-/// (`held::RAW_SPARE_BINS`). A host that charges the bins a waiting window holds beyond these to
-/// that window reads the line here.
-pub fn kept_by_stamps(now_ms: u64, settled: i64) -> i64 {
+/// against too: a window and its stride behind the last bin settled, and the spare bins
+/// (`held::RAW_SPARE_BINS`), within the sealed bins a holder plans (`held::SEALED_BINS_HELD`). A
+/// host that charges the bins a waiting window holds beyond these to that window reads the line
+/// here. Reckoned from `settled`, never from the clock: the bins are the feeders' signed times,
+/// so a settling that grows (`tally_wire::budget::MLAT_SETTLE`) or a judging clock stepped moves
+/// what is kept with what is sealed. Before, it was reckoned from the step's clock, so a longer
+/// settling forgot a window's first bins before its models ripened.
+pub fn kept_by_stamps(settled: i64) -> i64 {
     Window::canonical(settled + 1)
         .first
-        .min(settled + 1 - BEFORE - STRIDE)
-        .min(bin_of(now_ms) - BEFORE - AFTER - STRIDE - RAW_SPARE_BINS)
+        .min(settled + 1 - BEFORE - AFTER - STRIDE - RAW_SPARE_BINS)
 }
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::disallowed_methods, reason = "a test's scripted readings")]
     use super::*;
     use tally_mlat_solver::obs::MAX_SITE_PRECISION_M;
-    use tally_wire::ReceiverInfo;
     use tally_wire::batch::{ReceiverInfoContent, format};
+    use tally_wire::clocks::recorded::aligned;
     use tally_wire::{BatchContent, Clock, Location, Observation, Region};
+    use tally_wire::{Identity, ReceiverInfo};
 
     fn settings() -> Settings {
         Settings {
             regions: Regions::default(),
-            settle_ms: 1_000,
+            settle: tally_wire::budget::policy::<_, 1_000>(),
             threads: 1,
             capacity: Capacity::default(),
         }
@@ -665,7 +743,10 @@ mod tests {
 
     fn engine() -> Result<Engine, String> {
         Ok(Engine::new(
-            Identity::generate().map_err(|e| e.to_string())?,
+            tally_wire::Signer::new(
+                Identity::generate().map_err(|e| e.to_string())?,
+                std::sync::Arc::new(|| true),
+            ),
             7,
             settings(),
         ))
@@ -740,18 +821,18 @@ mod tests {
             Identity::generate().map_err(text)?,
         );
         assert_eq!(
-            engine.ingest(&public_info(&public, 1, location())?, 0)?,
+            engine.ingest(&public_info(&public, 1, location())?, aligned(0))?,
             Ingested::Ignored
         );
         assert_eq!(engine.described(&public.public()), None);
         assert_eq!(
-            engine.ingest(&public_info(&new, 1, location())?, 0)?,
+            engine.ingest(&public_info(&new, 1, location())?, aligned(0))?,
             Ingested::Ignored
         );
         let site = info(&new, 1, location(), Clock::Dump1090);
-        assert_eq!(engine.ingest(&site, 0)?, Ingested::Described);
+        assert_eq!(engine.ingest(&site, aligned(0))?, Ingested::Described);
         let described = old_info(&old, 1, location(), Clock::Dump1090);
-        assert_eq!(engine.ingest(&described, 0)?, Ingested::Described);
+        assert_eq!(engine.ingest(&described, aligned(0))?, Ingested::Described);
         assert_eq!(engine.taking_part(), 2);
         let intake = engine.intake.as_ref().ok_or("no intake")?;
         let sites: Vec<Sited> = intake.sites().collect();
@@ -767,7 +848,7 @@ mod tests {
         }
         // Reissued: the newer record's id and key.
         let reissued = info(&new, 2, location(), Clock::Dump1090);
-        engine.ingest(&reissued, 0)?;
+        engine.ingest(&reissued, aligned(0))?;
         let intake = engine.intake.as_ref().ok_or("no intake")?;
         let held = intake
             .sites()
@@ -821,7 +902,7 @@ mod tests {
         use tally_mlat_solver::scope::GRID_MS;
         let mut engine = engine()?;
         let receiver = Identity::generate().map_err(text)?;
-        engine.ingest(&info(&receiver, 1, location(), Clock::Dump1090), 0)?;
+        engine.ingest(&info(&receiver, 1, location(), Clock::Dump1090), aligned(0))?;
         let base = 1_000 * GRID_MS;
         let first = vec![observation(1_000, format::MODE_S_SHORT)];
         // The same observation in a second batch (a different sequence): one identity.
@@ -830,15 +911,23 @@ mod tests {
             observation(2_000, format::MODE_S_SHORT),
         ];
         assert_eq!(
-            engine.ingest(&batch(&receiver, 1, 1, base + 900, second)?, base + 900)?,
+            engine.ingest(
+                &batch(&receiver, 1, 1, base + 900, second)?,
+                aligned(base + 900)
+            )?,
             Ingested::Batch {
                 new: 2,
                 filtered: 0
             }
         );
-        engine.ingest(&batch(&receiver, 1, 0, base + 500, first)?, base + 500)?;
+        engine.ingest(
+            &batch(&receiver, 1, 0, base + 500, first)?,
+            aligned(base + 500),
+        )?;
         // Sealed (its bin complete), the copy is gone and the earliest wall clock kept.
-        let _ = engine.prepare(base + GRID_MS + 1_000, 0);
+        let _ = engine.prepare(tally_wire::clocks::recorded::aligned(
+            base + GRID_MS + 1_000,
+        ));
         assert_eq!(engine.held(), 2);
         Ok(())
     }
@@ -847,7 +936,7 @@ mod tests {
     fn a_batch_two_relays_deliver_or_one_replays_is_used_once() -> Result<(), String> {
         let mut engine = engine()?;
         let receiver = Identity::generate().map_err(text)?;
-        engine.ingest(&info(&receiver, 1, location(), Clock::Beast), 0)?;
+        engine.ingest(&info(&receiver, 1, location(), Clock::Beast), aligned(0))?;
         let record = batch(
             &receiver,
             3,
@@ -856,10 +945,10 @@ mod tests {
             vec![observation(5, format::MODE_S_SHORT)],
         )?;
         assert!(matches!(
-            engine.ingest(&record, 0)?,
+            engine.ingest(&record, aligned(0))?,
             Ingested::Batch { new: 1, .. }
         ));
-        assert_eq!(engine.ingest(&record, 0)?, Ingested::Replayed);
+        assert_eq!(engine.ingest(&record, aligned(0))?, Ingested::Replayed);
         // Far behind the boot's newest: a replay, though never seen.
         let old = batch(
             &receiver,
@@ -868,7 +957,7 @@ mod tests {
             0,
             vec![observation(6, format::MODE_S_SHORT)],
         )?;
-        assert_eq!(engine.ingest(&old, 0)?, Ingested::Replayed);
+        assert_eq!(engine.ingest(&old, aligned(0))?, Ingested::Replayed);
         // A new boot starts its own sequence.
         let restarted = batch(
             &receiver,
@@ -878,7 +967,7 @@ mod tests {
             vec![observation(7, format::MODE_S_SHORT)],
         )?;
         assert!(matches!(
-            engine.ingest(&restarted, 0)?,
+            engine.ingest(&restarted, aligned(0))?,
             Ingested::Batch { new: 1, .. }
         ));
         Ok(())
@@ -891,11 +980,14 @@ mod tests {
         let stranger = Identity::generate().map_err(text)?;
         let unknown_clock = Identity::generate().map_err(text)?;
         let coarse = Identity::generate().map_err(text)?;
-        engine.ingest(&info(&receiver, 1, location(), Clock::Dump1090), 0)?;
-        engine.ingest(&info(&unknown_clock, 1, location(), Clock::Unknown), 0)?;
+        engine.ingest(&info(&receiver, 1, location(), Clock::Dump1090), aligned(0))?;
+        engine.ingest(
+            &info(&unknown_clock, 1, location(), Clock::Unknown),
+            aligned(0),
+        )?;
         let mut rounded = location();
         rounded.precision_m = MAX_SITE_PRECISION_M + 1;
-        engine.ingest(&info(&coarse, 1, rounded, Clock::Dump1090), 0)?;
+        engine.ingest(&info(&coarse, 1, rounded, Clock::Dump1090), aligned(0))?;
         let mixed = vec![
             observation(1, format::MODE_AC),
             observation(2, format::MODE_S_SHORT),
@@ -903,12 +995,12 @@ mod tests {
             observation(4, format::MODE_S_LONG),
         ];
         assert!(matches!(
-            engine.ingest(&batch(&receiver, 1, 0, 0, mixed)?, 0)?,
+            engine.ingest(&batch(&receiver, 1, 0, 0, mixed)?, aligned(0))?,
             Ingested::Batch { new: 2, .. }
         ));
         for other in [&stranger, &unknown_clock, &coarse] {
             let record = batch(other, 1, 0, 0, vec![observation(9, format::MODE_S_SHORT)])?;
-            assert_eq!(engine.ingest(&record, 0)?, Ingested::Ignored);
+            assert_eq!(engine.ingest(&record, aligned(0))?, Ingested::Ignored);
         }
         assert_eq!(engine.held(), 2);
         assert_eq!(engine.taking_part(), 1);
@@ -919,7 +1011,7 @@ mod tests {
     fn a_forged_batch_is_an_error_and_holds_nothing() -> Result<(), String> {
         let mut engine = engine()?;
         let receiver = Identity::generate().map_err(text)?;
-        engine.ingest(&info(&receiver, 1, location(), Clock::Dump1090), 0)?;
+        engine.ingest(&info(&receiver, 1, location(), Clock::Dump1090), aligned(0))?;
         let Record::Batch(signed) = batch(
             &receiver,
             1,
@@ -934,7 +1026,7 @@ mod tests {
         let last = bytes.len() - 1;
         bytes[last] ^= 1;
         let forged = Batch::from_bytes(bytes).map_err(text)?;
-        assert!(engine.ingest(&Record::Batch(forged), 0).is_err());
+        assert!(engine.ingest(&Record::Batch(forged), aligned(0)).is_err());
         assert_eq!(engine.held(), 0);
         Ok(())
     }
@@ -952,7 +1044,10 @@ mod tests {
         let newer = info(&receiver, 2, elsewhere, Clock::Dump1090);
         for order in [[&older, &newer], [&newer, &older]] {
             let mut engine = Engine::new(
-                Identity::generate().map_err(text)?,
+                tally_wire::Signer::new(
+                    Identity::generate().map_err(text)?,
+                    std::sync::Arc::new(|| true),
+                ),
                 1,
                 Settings {
                     regions: Regions::new([region]),
@@ -960,19 +1055,22 @@ mod tests {
                 },
             );
             for record in order {
-                engine.ingest(record, 0)?;
+                engine.ingest(record, aligned(0))?;
             }
             assert_eq!(engine.taking_part(), 0, "the newer description is outside");
         }
         let mut engine = Engine::new(
-            Identity::generate().map_err(text)?,
+            tally_wire::Signer::new(
+                Identity::generate().map_err(text)?,
+                std::sync::Arc::new(|| true),
+            ),
             1,
             Settings {
                 regions: Regions::new([region]),
                 ..settings()
             },
         );
-        engine.ingest(&older, 0)?;
+        engine.ingest(&older, aligned(0))?;
         engine.ingest(
             &batch(
                 &receiver,
@@ -981,10 +1079,10 @@ mod tests {
                 0,
                 vec![observation(1, format::MODE_S_SHORT)],
             )?,
-            0,
+            aligned(0),
         )?;
         assert_eq!(engine.held(), 1);
-        engine.ingest(&newer, 0)?;
+        engine.ingest(&newer, aligned(0))?;
         assert_eq!(engine.held(), 0);
         Ok(())
     }
@@ -996,7 +1094,7 @@ mod tests {
         use tally_mlat_solver::scope::{GRID_MS, Window};
         let mut engine = engine()?;
         let receiver = Identity::generate().map_err(text)?;
-        engine.ingest(&info(&receiver, 1, location(), Clock::Dump1090), 0)?;
+        engine.ingest(&info(&receiver, 1, location(), Clock::Dump1090), aligned(0))?;
         let base = 1_000 * GRID_MS;
         engine.ingest(
             &batch(
@@ -1006,7 +1104,7 @@ mod tests {
                 base,
                 vec![observation(1, format::MODE_S_SHORT)],
             )?,
-            base,
+            aligned(base),
         )?;
         // A second, far enough on that windows long after the first's still need it.
         let later = 1_000 + BEFORE + 3 * STRIDE;
@@ -1018,21 +1116,29 @@ mod tests {
                 later as u64 * GRID_MS,
                 vec![observation(2, format::MODE_S_SHORT)],
             )?,
-            later as u64 * GRID_MS,
+            aligned(later as u64 * GRID_MS),
         )?;
         assert_eq!(engine.held(), 2);
         // A window is due once its last bin has ended and the settling time passed.
         let due = |window: Window| (window.last + 1) as u64 * GRID_MS + 1_000;
         let first = Window::canonical(1_000);
-        assert!(engine.prepare(due(first) - 1, 0).is_none());
-        assert!(engine.prepare(due(first), 0).is_some());
+        assert!(
+            engine
+                .prepare(tally_wire::clocks::recorded::aligned(due(first) - 1))
+                .is_none()
+        );
+        assert!(
+            engine
+                .prepare(tally_wire::clocks::recorded::aligned(due(first)))
+                .is_some()
+        );
         assert_eq!(engine.held(), 2);
         // Once every window spanning bin 1000 is solved, it goes; then the later one.
         // Standing reads the same store, so the spare bins it settles in are kept too.
         let gone = |bin: i64| Window::canonical(bin + BEFORE + STRIDE + RAW_SPARE_BINS);
-        let _ = engine.prepare(due(gone(1_000)), 0);
+        let _ = engine.prepare(tally_wire::clocks::recorded::aligned(due(gone(1_000))));
         assert_eq!(engine.held(), 1);
-        let _ = engine.prepare(due(gone(later)), 0);
+        let _ = engine.prepare(tally_wire::clocks::recorded::aligned(due(gone(later))));
         assert_eq!(engine.held(), 0);
         Ok(())
     }

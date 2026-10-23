@@ -108,6 +108,7 @@ mod tests {
             last_seen_ms: 0,
             batches: 1,
             gaps: 0,
+            late_batches: 0,
             observations: 1,
             cell: Some(cell_name(cell)),
             software: None,

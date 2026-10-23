@@ -20,7 +20,11 @@
 //!   relay's judgment travels no further.
 //! - **Repair (lazy).** A member still missing records asks a rotating member with its
 //!   `HaveSummary` (which seconds it holds whole); the answer is the manifests and records of the
-//!   seconds it lacks, paged. Repaired records are pushed on too (Plumtree's graft).
+//!   seconds it lacks, paged. Repaired records are pushed on too (Plumtree's graft). It never asks
+//!   a member that cannot answer it: one it routes around as full (the ask would go nowhere), or
+//!   one it turned away as full while that one may still route around it, its wait and slack
+//!   (which sends it nothing, its answer included). Before, it asked them in turn with the rest,
+//!   and a full member repaired at half the pace its one admitted link could carry.
 //! - **Receipts.** After each window a child signs, for each stripe, a `StripeReceipt` for what
 //!   its parent (or, for a seed, each origin) delivered of what the manifests list, and sends it to
 //!   the deliverer: the evidence of the deliverer's credit. One short of what was owed is also a
@@ -64,16 +68,18 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
+use tally_wire::Signs;
 use tally_wire::batch::Hash;
+use tally_wire::clocks::{Judged, Mono, Span};
 use tally_wire::record::{KIND_BATCH, KIND_RELAY_BATCH};
 use tally_wire::sharing::{MAX_HAVE_SECONDS, MAX_PIECES, receipt_digest};
 use tally_wire::{
-    Batch, Bytes, Check, HaveSummary, Identity, ParityChunk, PieceManifest, PieceManifestContent,
-    PublicKey, Record, StripeAssignment, StripeReceipt, StripeReceiptContent,
+    Batch, Bytes, Check, HaveSummary, ParityChunk, PieceManifest, PieceManifestContent, PublicKey,
+    Record, StripeAssignment, StripeReceipt, StripeReceiptContent,
 };
 
 use crate::budget::{Charge, Gauge};
-use crate::directory::CLOCK_SKEW_MS;
+use crate::footprint::{self, Tree};
 
 use super::full::Wait;
 use super::groups::{DEMOTION_MS, GroupKey};
@@ -107,44 +113,54 @@ pub struct Deadlines {
     /// lacks of it, and what reached it before then from above its parent in the stripe's tree (or
     /// from the record's origin) was pushed past the parent, which was being routed around, and not
     /// a repair (`routed_past`).
-    pub repair_after_ms: u64,
+    pub repair_after: Span<Judged>,
     /// After a window ends, how long a child waits (for rebuilds and repairs to arrive from its
     /// parent) before signing its receipts. What its deliverer delivered later is not on them.
-    pub receipt_grace_ms: u64,
+    pub receipt_grace: Span<Judged>,
     /// After the receipts of a window, how long before the group judges it. A report (a
     /// shortfall, or a deliverer's own starvation, which excuses it) that arrives later is not
     /// weighed.
-    pub judge_after_ms: u64,
+    pub judge_after: Span<Judged>,
     /// How long past a refusal's wait the relay refused may still be routing around this one: its
     /// wait starts when the `Goodbye` reaches it, a link's latency after this relay sent it.
-    pub route_slack_ms: u64,
+    pub route_slack: Span<Judged>,
 }
 
 impl Deadlines {
     /// A relay's.
     pub const RELAY: Self = Self {
-        repair_after_ms: 1_500,
-        receipt_grace_ms: 4_000,
-        judge_after_ms: 2_000,
-        route_slack_ms: 1_000,
+        repair_after: tally_wire::budget::policy::<_, 1_500>(),
+        receipt_grace: tally_wire::budget::policy::<_, 4_000>(),
+        judge_after: tally_wire::budget::policy::<_, 2_000>(),
+        route_slack: tally_wire::budget::policy::<_, 1_000>(),
     };
 
     /// How far back a member holds records and manifests: as long as its own duties need them, and
     /// no longer. A record of a window's first second is owed in that window's receipts, signed
-    /// `receipt_grace_ms` after the window ends, judged `judge_after_ms` after that, and a member
-    /// short of it asks for repair from `repair_after_ms` on; so the horizon is the window, the
+    /// `receipt_grace` after the window ends, judged `judge_after` after that, and a member
+    /// short of it asks for repair from `repair_after` on; so the horizon is the window, the
     /// grace, the judgment and the repair delay (a relay's, 12.5 s). A relay's is the one batch
     /// byte store's window (RFC-0181 §6): what it holds of a batch's bytes after it is passed on.
     pub const fn horizon_ms(self) -> u64 {
         RECEIPT_WINDOW_SECONDS * 1000
-            + self.receipt_grace_ms
-            + self.judge_after_ms
-            + self.repair_after_ms
+            + self.receipt_grace.ms()
+            + self.judge_after.ms()
+            + self.repair_after.ms()
     }
 
     /// The horizon rounded up to whole seconds: what is held is kept by its second.
     pub const fn horizon_seconds(self) -> u64 {
         self.horizon_ms().div_ceil(1000)
+    }
+
+    /// [`Deadlines::horizon_seconds`] as a span of the judging clock: what the sharing windows
+    /// hold a signed second for (`tally_wire::budget::Window::sharing`).
+    pub const fn horizon(self) -> Span<Judged> {
+        tally_wire::budget::policy::<_, { RECEIPT_WINDOW_SECONDS * 1000 }>()
+            .plus(self.receipt_grace)
+            .plus(self.judge_after)
+            .plus(self.repair_after)
+            .whole_seconds()
     }
 }
 
@@ -159,11 +175,6 @@ pub const ANSWER_INTERVAL_MS: u64 = REPAIR_INTERVAL_MS / 2;
 /// each, so 14,400 records a second from one origin in one area, far past any feeder count. The
 /// cap is per origin, so a member flooding manifests fills only its own share, never another's.
 pub const MAX_MANIFESTS_PER_ORIGIN_SECOND: usize = 8;
-/// How far past this relay's clock a signed second may be (a manifest's, a parity's, a receipt's
-/// window): the directory's allowance for clocks that differ. Anything later is refused, so what
-/// is held is bounded by the horizon behind and this ahead, and `forget` bounds memory.
-pub const SKEW_SECONDS: u64 = CLOCK_SKEW_MS / 1000;
-
 const REPAIR: &[u8] = b"tally sharing repair";
 
 /// Something to send.
@@ -188,11 +199,41 @@ pub enum Piece {
 /// A record's header: kind, then its body's length.
 const HEADER_LEN: usize = 3;
 
-/// What a group holds for one record beside its signed bytes: its entry by hash and the shared
-/// batch it names ([`Piece::held_len`]).
-pub const PIECE_ENTRY_BYTES: usize = std::mem::size_of::<(Hash, Held)>()
-    + tally_wire::decoded::ARC_HEADER
-    + std::mem::size_of::<Batch>();
+/// The senders a record or parity is planned to be noted from: its parent in its stripe's tree,
+/// and one more, the member a route-around repair brings it from. Noting more is
+/// charged what it allocates as ever (`note_growth`), so a record with more is refused room
+/// sooner, never held past its charge.
+pub const PLANNED_SENDERS: usize = 2;
+
+/// What a list of [`PLANNED_SENDERS`] allocates, grown as [`note`] grows it.
+const PLANNED_SENDERS_BYTES: usize = footprint::vec::<Sender>(grown(grown(0)));
+
+/// What a group is planned at for one record beside its signed bytes, held or credited, whichever
+/// allocates more (a record is one or the other: a credit's place is let go when the record is
+/// held, `Member::piece`): held, its entry in the group's tree of records at the most a tree costs
+/// an entry (`footprint::btree_planned`), the shared batch it names ([`Piece::held_len`]) and its
+/// senders; credited, its entry in the tree of credits and its senders.
+pub const PIECE_ENTRY_BYTES: usize = {
+    let held =
+        Tree::<Hash, Held>::bytes_per_entry() + footprint::arc::<Batch>() + PLANNED_SENDERS_BYTES;
+    let credited = Tree::<Hash, Credited>::bytes_per_entry() + PLANNED_SENDERS_BYTES;
+    if held > credited { held } else { credited }
+};
+
+/// What a group is planned at for one parity beside its XOR: its entry in the group's tree of
+/// parities, the parity's own allocation and its senders.
+pub const PARITY_ENTRY_BYTES: usize = Tree::<Hash, HeldParity>::bytes_per_entry()
+    + footprint::arc::<Parity>()
+    + PLANNED_SENDERS_BYTES;
+
+const _: () = assert!(grown(grown(0)) >= PLANNED_SENDERS);
+
+/// What a group's trees of records, rebuilt records, credited records and parities cost before any
+/// entry, at the most (`footprint::btree_planned` of none): what a plan takes for each group.
+pub const GROUP_TREES_BYTES: usize = Tree::<Hash, Held>::bytes_planned(0)
+    + Tree::<Hash, Judging>::bytes_planned(0)
+    + Tree::<Hash, Credited>::bytes_planned(0)
+    + Tree::<Hash, HeldParity>::bytes_planned(0);
 
 impl Piece {
     /// The piece of a record, without copying a batch's bytes. `None` for a record that does not
@@ -204,25 +245,27 @@ impl Piece {
             other => {
                 let mut bytes = Vec::new();
                 other.encode(&mut bytes).ok()?;
-                Some(Self::Encoded(Bytes::from(bytes)))
+                Some(Self::Encoded(Bytes::from(footprint::exact(bytes))))
             }
         }
     }
 
-    /// The piece of one encoded record (what parity rebuilds), a batch's body kept in place.
-    /// `None` for bytes that are not one record.
+    /// The piece of one encoded record (what parity rebuilds), a batch's body kept in place: a
+    /// slice of the record's allocation, which the batch is charged for whole (its header too,
+    /// `Batch::from_shared`). `None` for bytes that are not one record.
     pub fn from_encoded(bytes: Vec<u8>) -> Option<Self> {
         let (_, used) = Record::decode(&bytes).ok()?;
         if used != bytes.len() || bytes.len() < HEADER_LEN {
             return None;
         }
         let kind = bytes[0];
-        let bytes = Bytes::from(bytes);
+        let bytes = Bytes::from(footprint::exact(bytes));
+        let backing = bytes.len();
         match kind {
-            KIND_BATCH => Batch::from_bytes(bytes.slice(HEADER_LEN..))
+            KIND_BATCH => Batch::from_shared(bytes.slice(HEADER_LEN..), backing)
                 .ok()
                 .map(|batch| Self::Batch(Arc::new(batch))),
-            KIND_RELAY_BATCH => Batch::from_bytes(bytes.slice(HEADER_LEN..))
+            KIND_RELAY_BATCH => Batch::from_shared(bytes.slice(HEADER_LEN..), backing)
                 .ok()
                 .map(|batch| Self::RelayBatch(Arc::new(batch))),
             _ => Some(Self::Encoded(bytes)),
@@ -246,15 +289,19 @@ impl Piece {
         }
     }
 
-    /// What holding it allocates, as the groups are charged for it (`budget::Store::Batches`):
-    /// a batch kept at ingest, whose signed bytes carry their own charge for their life
-    /// (`Batch::owned_by`, `budget::Store::Decoded`), only its place ([`PIECE_ENTRY_BYTES`]); any
-    /// other piece its encoded bytes, which are its own. Before, every batch was charged its bytes
+    /// What holding it allocates, beside its entry in its group's tree, as the groups are charged
+    /// for it (`budget::Store::Batches`, `footprint`): a batch kept at ingest, whose signed bytes
+    /// carry their own charge for their life (`Batch::owned_by`, `budget::Store::Decoded`), only
+    /// its shared batch; any other batch that, its bytes and its kept key (`Batch::allocated`);
+    /// any other piece its encoded bytes,
+    /// which are its own (made exact, [`Piece::of`]). Before, every batch was charged its bytes
     /// here and again in its decode, in the epochs and in each subscriber's queue.
     pub fn held_len(&self) -> usize {
         match self {
-            Self::Batch(batch) | Self::RelayBatch(batch) if batch.is_owned() => PIECE_ENTRY_BYTES,
-            _ => self.len(),
+            Self::Batch(batch) | Self::RelayBatch(batch) => {
+                footprint::arc::<Batch>() + batch.allocated()
+            }
+            Self::Encoded(bytes) => footprint::shared_bytes(bytes.len()),
         }
     }
 
@@ -293,7 +340,9 @@ impl Piece {
 /// What members send each other.
 #[derive(Clone, Debug)]
 pub enum Message {
-    /// A record of a group's product, by its hash.
+    /// A record of a group's product, by its hash: held, pushed on, receipted and credited by
+    /// every member whatever its signed time, since possession never reads a clock; whether a
+    /// member's relay uses it is that relay's own judgment (`strikes`).
     Piece {
         group: GroupKey,
         hash: Hash,
@@ -410,22 +459,161 @@ pub struct Stats {
     /// rotation or change of the members about them), the only windows whose shortfalls can
     /// demote. What says "no member was demoted" is a verdict and not a judge that never sat.
     pub judged: u64,
+    /// Refusals of a relay as full not noted for want of the store's room
+    /// (`Member::turned_away`): a shortfall of it is judged as any other's.
+    pub turned_away_unheld: u64,
+}
+
+/// The relay's two clocks at one moment (`clock::RelayClock::read`, an `ingest::Stamp`):
+/// `judged` (`J`) for every signed second and everything compared with one (windows, epochs,
+/// receipts, when a sender delivered), `mono` (`M`) for how long anything is kept and when the
+/// tick next visits a group, and whether `J` judged as they were read. A step of `J` moves no
+/// retention: what a group holds is let go on `M`, so a relay whose clock stepped back holds no
+/// more than its plan (RFC-0171 §3.6).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Now {
+    judged: Judged,
+    mono: Mono,
+    judging: bool,
+}
+
+/// A moment on the relay's monotonic clock (`M`) by which something the relay keeps lapses: an
+/// ask's membership, a demotion, a full member's route-around, an idle link. Made only from a
+/// [`Now`]'s monotonic side ([`Now::after`]), so no deadline can be put on the judging clock and
+/// a step of `J` either way moves none of them (RFC-0171 §3.6).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct MonoDeadline(u64);
+
+impl MonoDeadline {
+    /// A deadline that never passes.
+    pub const NEVER: Self = Self(u64::MAX);
+
+    /// Whether it has passed at `now`.
+    pub const fn passed(self, now: Now) -> bool {
+        now.mono.ms() >= self.0
+    }
+
+    /// How long from `now` until it passes (none, once it has).
+    pub const fn left_ms(self, now: Now) -> u64 {
+        self.0.saturating_sub(now.mono.ms())
+    }
+
+    /// The deadline as a reading of `M`, for a wake computed on `M`.
+    pub const fn mono_ms(self) -> u64 {
+        self.0
+    }
+}
+
+impl Now {
+    /// `ms` from now by `M`: the one way a [`MonoDeadline`] is made.
+    pub const fn after(self, ms: u64) -> MonoDeadline {
+        MonoDeadline(self.mono.ms().saturating_add(ms))
+    }
+
+    /// The judging reading.
+    pub const fn judged(self) -> Judged {
+        self.judged
+    }
+
+    /// The monotonic reading.
+    pub const fn mono(self) -> Mono {
+        self.mono
+    }
+
+    /// The monotonic reading's milliseconds.
+    pub const fn mono_ms(self) -> u64 {
+        self.mono.ms()
+    }
+
+    /// Whether `J` judged as the two were read: nothing is judged or signed by a moment that did
+    /// not (RFC-0171 §3.6).
+    pub const fn judging(self) -> bool {
+        self.judging
+    }
+
+    /// When `M` reaches the moment `J` reads `judge_ms`, as the two read now: a deadline in
+    /// signed time put on the clock the tick runs on (now, for one already past).
+    const fn mono_at(self, judge_ms: u64) -> u64 {
+        self.mono
+            .ms()
+            .saturating_add(judge_ms.saturating_sub(self.judged.ms()))
+    }
+}
+
+impl From<crate::ingest::Stamp> for Now {
+    fn from(stamp: crate::ingest::Stamp) -> Self {
+        Self {
+            judged: stamp.judged(),
+            mono: stamp.mono(),
+            judging: stamp.judging(),
+        }
+    }
+}
+
+/// A test's moment, its two clocks alike and judging. Only a test may name one clock for both:
+/// the relay's own code hands its stamp (`ingest::Stamp`) or both clocks read together.
+#[cfg(test)]
+#[allow(clippy::disallowed_methods, reason = "a test's scripted readings")]
+impl From<u64> for Now {
+    fn from(ms: u64) -> Self {
+        crate::ingest::Stamp::at(ms, 0).into()
+    }
 }
 
 struct Held {
     piece: Piece,
+    /// When it was taken in, by `M` (`Now::mono_ms`): what it is let go by.
     at_ms: u64,
     /// Who sent it, and when, in order; empty for one this relay originated or rebuilt.
-    from: Vec<(PublicKey, u64)>,
+    from: Vec<Sender>,
 }
 
-/// A record rebuilt from parity awaiting its relay's judgment (`Group::judging`), with the bytes
-/// it was charged when rebuilt: whichever verdict lets it go releases exactly that charge, and
-/// what it is held as once passed (`Member::pass_on`, the record as its relay took it in) is
-/// charged afresh.
+/// A relay that delivered a record or a parity, and when.
+type Sender = (PublicKey, u64);
+
+/// What a list of senders allocates.
+fn senders_bytes(from: &[Sender], capacity: usize) -> usize {
+    debug_assert!(capacity >= from.len());
+    footprint::vec::<Sender>(capacity)
+}
+
+/// What noting `who` among `from` allocates more: nothing if it is there or there is room, else
+/// the list doubled (from one).
+fn note_growth(from: &Vec<Sender>, who: &PublicKey) -> usize {
+    if from.len() < from.capacity() || from.iter().any(|(sender, _)| sender == who) {
+        return 0;
+    }
+    footprint::vec::<Sender>(grown(from.capacity())) - footprint::vec::<Sender>(from.capacity())
+}
+
+/// The capacity a full list of senders of `capacity` grows to: doubled, from one.
+const fn grown(capacity: usize) -> usize {
+    if capacity == 0 { 1 } else { capacity * 2 }
+}
+
+/// Notes `sender` among `from` once, grown as [`note_growth`] reckons.
+fn note(from: &mut Vec<Sender>, sender: Sender) {
+    if from.iter().any(|(who, _)| *who == sender.0) {
+        return;
+    }
+    if from.len() == from.capacity() {
+        from.reserve_exact(grown(from.capacity()) - from.len());
+    }
+    from.push(sender);
+}
+
+impl Held {
+    /// What it allocates beside its entry in its tree.
+    fn bytes(&self) -> usize {
+        self.piece.held_len() + senders_bytes(&self.from, self.from.capacity())
+    }
+}
+
+/// A record rebuilt from parity awaiting its relay's judgment (`Group::judging`): whichever
+/// verdict lets it go releases what it allocated, and what it is held as once passed
+/// (`Member::pass_on`, the record as its relay took it in) is charged afresh.
 struct Judging {
     held: Held,
-    charged: usize,
 }
 
 struct Listed {
@@ -455,7 +643,7 @@ struct TurnedAway {
 
 impl TurnedAway {
     /// It routed around this relay from `start_ms` to `end_ms`: put in its place by start, and
-    /// merged with every span it touches, counting the slack (`Deadlines::route_slack_ms`), which
+    /// merged with every span it touches, counting the slack (`Deadlines::route_slack`), which
     /// covers the same moments. A refusal comes after the last as a rule, so this is a merge into
     /// the last span or a push.
     fn add(&mut self, start_ms: u64, end_ms: u64, slack_ms: u64) {
@@ -487,46 +675,75 @@ impl TurnedAway {
     }
 }
 
+/// The relays a member holds as turned away at most (`Member::turned_away`): as many as the
+/// directory holds offers (`directory::OFFERS_HELD`), every relay that can share a group with this
+/// one and so be owed a window by it.
+pub const TURNED_AWAY_HELD: usize = crate::directory::OFFERS_HELD;
+
 /// The longest record a group carries, encoded: what one record adds to a parity slice at most.
 const MAX_PIECE_LEN: usize = HEADER_LEN + tally_wire::record::MAX_BODY;
 
+/// A record its deliverers sent that this relay had no room to take in (`Member::credit`): its
+/// senders, for the receipts (`Group::senders`), and when it was first credited. Not held, not
+/// counted as had and never pushed on: the group still lacks it and repair asks for it.
+struct Credited {
+    /// When it was first credited, by `M`.
+    at_ms: u64,
+    from: Vec<Sender>,
+}
+
 struct HeldParity {
     parity: Arc<Parity>,
+    /// When it was taken in, by `M`.
     at_ms: u64,
-    from: Vec<(PublicKey, u64)>,
+    from: Vec<Sender>,
+}
+
+impl HeldParity {
+    /// What it allocates beside its entry in its tree: the parity and its XOR, and its senders.
+    fn bytes(&self) -> usize {
+        footprint::arc::<Parity>()
+            + footprint::vec::<u8>(self.parity.xor.capacity())
+            + senders_bytes(&self.from, self.from.capacity())
+    }
 }
 
 struct Group {
     key: GroupKey,
     /// The member's deadlines (`Member::new`): every timed verdict of the group reads them.
     deadlines: Deadlines,
-    /// When the tick next visits it (`Member::settle`), if ever.
+    /// When the tick next visits it (`Member::settle`), by `M`, if ever.
     due_ms: Option<u64>,
     members: Vec<PublicKey>,
     leaves_only: Vec<PublicKey>,
-    demoted: BTreeMap<PublicKey, u64>,
+    demoted: BTreeMap<PublicKey, MonoDeadline>,
     layout: Layout,
     /// When the trees last changed, newest last.
     changed_ms: Vec<u64>,
-    pieces: BTreeMap<Hash, Held>,
+    pieces: Tree<Hash, Held>,
     /// Records rebuilt from parity that this relay has not yet judged (`rebuild`): held apart
     /// from `pieces`, charged and counted in `bytes`, so none is answered to a repair, used to
     /// rebuild another, or pushed on before its relay takes it in (`Member::pass_on`), refuses it
     /// (`Member::refuse`) or lets it go (`Member::let_go`). Counted as had, so no repair asks for
     /// one while it waits.
-    judging: BTreeMap<Hash, Judging>,
-    /// Records this relay refused (`Member::refuse`), with when: never held or pushed on, and
+    judging: Tree<Hash, Judging>,
+    /// Records this relay refused (`Member::refuse`), with when by `M`: never held or pushed on, and
     /// counted as had, so a manifest that lists one is whole and no repair asks for it.
     refused: BTreeMap<Hash, u64>,
-    /// The bytes it holds, kept as they change: the encoded bytes of `pieces` and `judging`, and the bytes of
-    /// `parity` (`Parity::len`), each charged to the member's gauge before it is held.
-    bytes: usize,
+    /// Records its members sent that this relay had no room to take in (`Member::credit`): their
+    /// senders credited for the receipts, nothing held, nothing counted as had.
+    credited: Tree<Hash, Credited>,
+    /// What the entries of `pieces`, `judging`, `credited` and `parity` allocate beside their
+    /// places in the trees (`Held::bytes`, `HeldParity::bytes`, their senders), kept as they
+    /// change. With the trees' own ([`Group::bytes`]), what the member's gauge is charged for the
+    /// group, each change charged before it is made.
+    entries_bytes: usize,
     /// By second, then by the manifest's hash.
     manifests: BTreeMap<u64, BTreeMap<Hash, Listed>>,
-    parity: BTreeMap<Hash, HeldParity>,
+    parity: Tree<Hash, HeldParity>,
     /// What this relay originated, by second, not yet in a manifest.
     own: BTreeMap<u64, BTreeSet<Hash>>,
-    /// Manifests and receipts already taken in, by hash, with when.
+    /// Manifests and receipts already taken in, by hash, with when by `M`.
     seen: BTreeMap<Hash, u64>,
     receipted: BTreeSet<u64>,
     judged: BTreeSet<u64>,
@@ -537,7 +754,7 @@ struct Group {
     repair_at_ms: u64,
     repair_attempt: u64,
     anti_entropy_at_ms: u64,
-    /// When each member's `HaveSummary` was last answered.
+    /// When each member's `HaveSummary` was last answered, by `M`.
     answered: BTreeMap<PublicKey, u64>,
     /// The stripes asked of each parent, as last sent.
     assigned: BTreeMap<PublicKey, u32>,
@@ -555,12 +772,13 @@ impl Group {
             demoted: BTreeMap::new(),
             layout: Layout::new(key.cell, key.product, &[me], &[]),
             changed_ms: Vec::new(),
-            pieces: BTreeMap::new(),
-            judging: BTreeMap::new(),
+            pieces: Tree::new(),
+            judging: Tree::new(),
             refused: BTreeMap::new(),
-            bytes: 0,
+            credited: Tree::new(),
+            entries_bytes: 0,
             manifests: BTreeMap::new(),
-            parity: BTreeMap::new(),
+            parity: Tree::new(),
             own: BTreeMap::new(),
             seen: BTreeMap::new(),
             receipted: BTreeSet::new(),
@@ -649,7 +867,7 @@ impl Group {
             return false;
         }
         let from = (first * 1000).saturating_sub(1000);
-        let to = end * 1000 + self.deadlines.receipt_grace_ms;
+        let to = end * 1000 + self.deadlines.receipt_grace.ms();
         !self
             .changed_ms
             .iter()
@@ -710,12 +928,18 @@ impl Group {
         above
     }
 
-    /// Who delivered `hash` (a record or a parity id), in order.
-    fn senders(&self, hash: &Hash) -> &[(PublicKey, u64)] {
+    /// Who delivered `hash` (a record or a parity id), in order: whether this relay holds it or
+    /// only credited its senders for want of room (`credited`).
+    fn senders(&self, hash: &Hash) -> &[Sender] {
         self.pieces
             .get(hash)
             .map(|held| held.from.as_slice())
             .or_else(|| self.parity.get(hash).map(|held| held.from.as_slice()))
+            .or_else(|| {
+                self.credited
+                    .get(hash)
+                    .map(|credited| credited.from.as_slice())
+            })
             .unwrap_or(&[])
     }
 
@@ -743,33 +967,95 @@ impl Group {
             || self.refused.contains_key(hash)
     }
 
+    /// What it allocates for what it holds, as its member's gauge is charged for it: its trees of
+    /// records, rebuilt records, credited records and parities (`footprint::Tree`, at most) and
+    /// their entries' own.
+    fn bytes(&self) -> usize {
+        self.pieces.bytes()
+            + self.judging.bytes()
+            + self.credited.bytes()
+            + self.parity.bytes()
+            + self.entries_bytes
+    }
+
     /// Lets go of a rebuilt record awaiting judgment, if it is one. The bytes it let go.
     fn drop_judging(&mut self, hash: &Hash) -> usize {
-        let freed = self
-            .judging
-            .remove(hash)
-            .map_or(0, |judging| judging.charged);
-        self.bytes -= freed;
-        freed
+        let before = self.bytes();
+        if let Some(judging) = self.judging.remove(hash) {
+            self.entries_bytes -= judging.held.bytes();
+        }
+        before - self.bytes()
     }
 
-    /// Holds a piece, counting its bytes, which its caller has charged (`Member::charge`).
-    fn hold(&mut self, hash: Hash, piece: Piece, at_ms: u64, from: Vec<(PublicKey, u64)>) {
-        self.bytes += piece.held_len();
-        self.pieces.insert(hash, Held { piece, at_ms, from });
+    /// What holding a record with `piece` and senders of `capacity` allocates more.
+    fn hold_growth(&self, piece: &Piece, capacity: usize) -> usize {
+        self.pieces.growth() + piece.held_len() + footprint::vec::<Sender>(capacity)
     }
 
-    /// Holds a parity, counting its bytes, which its caller has charged.
+    /// Holds a piece, counting what it allocates, which its caller has charged
+    /// ([`Group::hold_growth`]).
+    fn hold(&mut self, hash: Hash, piece: Piece, at_ms: u64, from: Vec<Sender>) {
+        let held = Held { piece, at_ms, from };
+        self.entries_bytes += held.bytes();
+        self.pieces.insert(hash, held);
+    }
+
+    /// What holding `held` allocates more.
+    fn parity_growth(&self, held: &HeldParity) -> usize {
+        self.parity.growth() + held.bytes()
+    }
+
+    /// Holds a parity, counting what it allocates, which its caller has charged
+    /// ([`Group::parity_growth`]).
     fn hold_parity(&mut self, held: HeldParity) {
-        self.bytes += held.parity.len();
+        self.entries_bytes += held.bytes();
         self.parity.insert(held.parity.id(), held);
     }
 
     /// Lets a parity go. The bytes it let go.
     fn drop_parity(&mut self, id: &Hash) -> usize {
-        let freed = self.parity.remove(id).map_or(0, |held| held.parity.len());
-        self.bytes -= freed;
-        freed
+        let before = self.bytes();
+        if let Some(held) = self.parity.remove(id) {
+            self.entries_bytes -= held.bytes();
+        }
+        before - self.bytes()
+    }
+
+    /// What noting `from` as a sender of the record or parity `hash` it holds or credits
+    /// allocates more, and then notes it.
+    fn note_growth(&self, hash: &Hash, from: &PublicKey) -> usize {
+        if let Some(held) = self.pieces.get(hash) {
+            note_growth(&held.from, from)
+        } else if let Some(held) = self.parity.get(hash) {
+            note_growth(&held.from, from)
+        } else if let Some(credited) = self.credited.get(hash) {
+            note_growth(&credited.from, from)
+        } else {
+            self.credited.growth() + footprint::vec::<Sender>(1)
+        }
+    }
+
+    /// Notes `sender` as a sender of the record or parity `hash`, crediting it if it holds
+    /// neither, at `kept_ms` by `M`; charged first by [`Group::note_growth`].
+    fn note(&mut self, hash: Hash, sender: Sender, kept_ms: u64) {
+        let from = if let Some(held) = self.pieces.get_mut(&hash) {
+            &mut held.from
+        } else if let Some(held) = self.parity.get_mut(&hash) {
+            &mut held.from
+        } else {
+            &mut self
+                .credited
+                .entry(hash)
+                .or_insert(Credited {
+                    at_ms: kept_ms,
+                    from: Vec::new(),
+                })
+                .from
+        };
+        let before = from.capacity();
+        note(from, sender);
+        self.entries_bytes +=
+            footprint::vec::<Sender>(from.capacity()) - footprint::vec::<Sender>(before);
     }
 
     /// Whether it holds anything within the horizon: then every tick has duties for it
@@ -801,36 +1087,40 @@ impl Group {
 
     /// When the tick must next visit it: at once while it holds anything; else at the soonest of
     /// its timed duties (the next seed rotation and anti-entropy ask while it has another member,
-    /// a demotion's end, forgetting what it remembers of the trees); never when it has none.
-    fn wake_ms(&self, me: &PublicKey, now_ms: u64) -> Option<u64> {
+    /// a demotion's end, forgetting what it remembers of the trees); never when it has none. By
+    /// `M`, the clock the tick runs on: a duty set by a signed second (a seed rotation, a
+    /// demotion's end, a change of the trees) is put on it as the two clocks read now
+    /// (`Now::mono_at`), so a step of `J` never stalls a group's tick, and with it the forgetting.
+    fn wake_ms(&self, me: &PublicKey, now: Now) -> Option<u64> {
         if self.busy() {
-            return Some(now_ms);
+            return Some(now.mono_ms());
         }
         let mut wake = u64::MAX;
         let others = self.layout.members().iter().any(|member| member != me);
         if others || !self.assigned.is_empty() {
-            let epoch = epoch_of(now_ms / 1000);
-            wake = wake.min((epoch + 1) * SEED_ROTATION_SECONDS * 1000);
+            let epoch = epoch_of(now.judged().ms() / 1000);
+            wake = wake.min(now.mono_at((epoch + 1) * SEED_ROTATION_SECONDS * 1000));
         }
         if others {
             wake = wake.min(self.repair_at_ms.max(self.anti_entropy_at_ms));
         }
         if let Some(until) = self.demoted.values().min() {
-            wake = wake.min(*until);
+            wake = wake.min(until.mono_ms());
         }
         if let Some(changed) = self.changed_ms.iter().min() {
-            wake = wake.min(changed + 2 * self.deadlines.horizon_seconds() * 1000 + 1);
+            wake = wake.min(now.mono_at(changed + 2 * self.deadlines.horizon_seconds() * 1000 + 1));
         }
         if let Some(at) = self.answered.values().min() {
             wake = wake.min(at + ANSWER_INTERVAL_MS);
         }
-        (wake != u64::MAX).then_some(wake.max(now_ms))
+        (wake != u64::MAX).then_some(wake.max(now.mono_ms()))
     }
 }
 
 /// This relay's part in all of its groups.
 pub struct Member {
-    identity: Identity,
+    /// Its key, signing only while the relay's clock is synced (`signer::Signer`).
+    signer: crate::signer::Signer,
     me: PublicKey,
     /// What it judges its deliverers by (`Deadlines`), as it was built: each group it holds keeps
     /// a copy.
@@ -848,31 +1138,36 @@ pub struct Member {
     /// it sends is routed around them (`route`).
     full: BTreeSet<PublicKey>,
     /// The relays this one turned away as full, and when each was routing around it
-    /// (`turned_away`): no shortfall is filed against one for those windows.
-    turned_away: BTreeMap<PublicKey, TurnedAway>,
+    /// (`turned_away`): no shortfall is filed against one for those windows. At most
+    /// [`TURNED_AWAY_HELD`], charged what they allocate (`turned_away_charge`).
+    turned_away: Tree<PublicKey, TurnedAway>,
+    /// What `turned_away` allocates, charged to the same store as the groups (`gauge`) before it
+    /// grows.
+    turned_away_charge: Charge,
     /// Groups the tick has visited since start: the work it did, which follows what the groups
     /// hold and never how many areas the relay takes.
     visits: u64,
     delivered: Vec<Delivered>,
-    demotions: Vec<(GroupKey, PublicKey, u64)>,
+    demotions: Vec<(GroupKey, PublicKey, MonoDeadline)>,
     stats: Stats,
 }
 
 impl Member {
     /// A member whose groups hold what `gauge` (the budget's `Store::Batches`) takes, judging its
     /// deliverers by `deadlines` (a relay's `Deadlines::RELAY`).
-    pub fn new(identity: Identity, gauge: Arc<Gauge>, deadlines: Deadlines) -> Self {
-        let me = identity.public();
+    pub fn new(signer: crate::signer::Signer, gauge: Arc<Gauge>, deadlines: Deadlines) -> Self {
+        let me = signer.public();
         Self {
-            identity,
+            signer,
             me,
             deadlines,
             groups: BTreeMap::new(),
             due: BTreeSet::new(),
             held: gauge.empty(),
+            turned_away_charge: gauge.empty(),
             gauge,
             full: BTreeSet::new(),
-            turned_away: BTreeMap::new(),
+            turned_away: Tree::new(),
             visits: 0,
             delivered: Vec::new(),
             demotions: Vec::new(),
@@ -891,7 +1186,12 @@ impl Member {
             self.groups.clear();
             self.due.clear();
         }
+        let mut turned_away = gauge.empty();
+        if !turned_away.try_grow(self.turned_away_charge.bytes()) {
+            self.turned_away.clear();
+        }
         self.held = moved;
+        self.turned_away_charge = turned_away;
         self.gauge = gauge;
     }
 
@@ -905,11 +1205,67 @@ impl Member {
     /// `asked` (`link`, `Reason::Full`). It takes that as "this provider is full" and routes its
     /// slice past this relay for the wait the one rule gives (`full::Wait`, which `peers` applies
     /// to the same refusal), so for every window that wait covers it owes this relay nothing.
+    ///
+    /// At most [`TURNED_AWAY_HELD`] relays are held: one more lets go the one whose last span
+    /// ended first. What they allocate is charged before it is held; past the store's room the
+    /// refusal is not noted, counted (`Stats::turned_away_unheld`), and a shortfall of that relay
+    /// is judged as any other's.
     pub fn turned_away(&mut self, key: PublicKey, asked: std::time::Duration, now_ms: u64) {
+        if self.turned_away.get(&key).is_none() && self.turned_away.len() >= TURNED_AWAY_HELD {
+            let oldest = self
+                .turned_away
+                .iter()
+                .min_by_key(|(_, held)| held.spans.last().map_or(0, |(_, end)| *end))
+                .map(|(key, _)| *key);
+            if let Some(oldest) = oldest {
+                self.turned_away.remove(&oldest);
+            }
+        }
+        let before = self.turned_away.get(&key).cloned();
         let held = self.turned_away.entry(key).or_default();
         let wait = Wait::after(held.last, asked, now_ms);
         held.last = Some(wait);
-        held.add(now_ms, wait.until_ms, self.deadlines.route_slack_ms);
+        held.add(now_ms, wait.until_ms, self.deadlines.route_slack.ms());
+        if !self.settle_turned_away() {
+            match before {
+                Some(before) => {
+                    self.turned_away.insert(key, before);
+                }
+                None => {
+                    self.turned_away.remove(&key);
+                }
+            }
+            self.settle_turned_away();
+            self.stats.turned_away_unheld += 1;
+        }
+    }
+
+    /// What the relays turned away allocate: their tree and each one's spans.
+    fn turned_away_bytes(&self) -> usize {
+        self.turned_away.bytes()
+            + self
+                .turned_away
+                .values()
+                .map(|held| footprint::vec::<(u64, u64)>(held.spans.capacity()))
+                .sum::<usize>()
+    }
+
+    /// Brings their charge to what they allocate: false when it would grow past the store's room.
+    fn settle_turned_away(&mut self) -> bool {
+        let bytes = self.turned_away_bytes();
+        let charged = self.turned_away_charge.bytes();
+        if bytes > charged {
+            self.turned_away_charge.try_grow(bytes - charged)
+        } else {
+            self.turned_away_charge.shrink_to(bytes);
+            true
+        }
+    }
+
+    /// The relays it holds as turned away, and what they are charged.
+    #[cfg(test)]
+    pub fn turned_away_held(&self) -> (usize, usize) {
+        (self.turned_away.len(), self.turned_away_charge.bytes())
     }
 
     /// The spans this relay holds of `key` routing around it (`turned_away`).
@@ -921,7 +1277,7 @@ impl Member {
     /// Whether this relay turned `key` away and it was routing around this relay at any time from
     /// `from_ms` to `to_ms`.
     pub fn routed_around_by(&self, key: &PublicKey, from_ms: u64, to_ms: u64) -> bool {
-        let slack_ms = self.deadlines.route_slack_ms;
+        let slack_ms = self.deadlines.route_slack.ms();
         self.turned_away
             .get(key)
             .is_some_and(|held| held.during(from_ms, to_ms, slack_ms))
@@ -931,12 +1287,14 @@ impl Member {
     /// longer double the next.
     fn forget_turned_away(&mut self, now_ms: u64) {
         let horizon_ms = now_ms.saturating_sub(2 * self.deadlines.horizon_ms());
-        let slack_ms = self.deadlines.route_slack_ms;
+        let slack_ms = self.deadlines.route_slack.ms();
         self.turned_away.retain(|_, held| {
             held.spans
                 .retain(|(_, end)| end.saturating_add(slack_ms) >= horizon_ms);
+            held.spans.shrink_to_fit();
             !held.spans.is_empty() || held.last.is_some_and(|wait| wait.remembered(now_ms))
         });
+        self.settle_turned_away();
     }
 
     /// Whether a parity chunk `from` sent may start reassembling here, and the most bytes its
@@ -1022,34 +1380,35 @@ impl Member {
         self.held.bytes()
     }
 
-    /// The bytes its groups hold, by each group's own count (kept apart from the charge, as
+    /// What its groups allocate, by each group's own count (kept apart from the charge, as
     /// records and parities come and go): what its gauge reads.
     pub fn group_bytes(&self) -> usize {
-        self.groups.values().map(|group| group.bytes).sum()
+        self.groups.values().map(Group::bytes).sum()
     }
 
-    /// The bytes its groups hold, counted afresh from every record and parity in them: what its
+    /// What its groups allocate, counted afresh from every tree and every entry in them: what its
     /// gauge must read.
     #[cfg(test)]
     pub fn counted_bytes(&self) -> usize {
         self.groups
             .values()
             .map(|group| {
-                group
-                    .pieces
-                    .values()
-                    .map(|held| held.piece.held_len())
-                    .sum::<usize>()
+                Tree::<Hash, Held>::bytes_at(group.pieces.len())
+                    + Tree::<Hash, Judging>::bytes_at(group.judging.len())
+                    + Tree::<Hash, Credited>::bytes_at(group.credited.len())
+                    + Tree::<Hash, HeldParity>::bytes_at(group.parity.len())
+                    + group.pieces.values().map(Held::bytes).sum::<usize>()
                     + group
                         .judging
                         .values()
-                        .map(|judging| judging.charged)
+                        .map(|judging| judging.held.bytes())
                         .sum::<usize>()
                     + group
-                        .parity
+                        .credited
                         .values()
-                        .map(|held| held.parity.len())
+                        .map(|credited| senders_bytes(&credited.from, credited.from.capacity()))
                         .sum::<usize>()
+                    + group.parity.values().map(HeldParity::bytes).sum::<usize>()
             })
             .sum()
     }
@@ -1126,13 +1485,53 @@ impl Member {
 
     /// A record of `group` this relay refused (a batch of a format it reads that does not decode):
     /// never held or pushed on, and counted as had until the horizon, so no repair asks for it.
-    pub fn refuse(&mut self, group: GroupKey, hash: Hash, now_ms: u64) {
+    pub fn refuse(&mut self, group: GroupKey, hash: Hash, now: impl Into<Now>) {
+        let now = now.into();
         if let Some(group) = self.groups.get_mut(&group) {
-            group.refused.insert(hash, now_ms);
+            group.refused.insert(hash, now.mono_ms());
             // One rebuilt from parity awaits its relay's judgment apart (`rebuild`): refused, it
             // is let go, never answered to a repair nor passed on.
             release(&mut self.held, group.drop_judging(&hash));
         }
+    }
+
+    /// A record of `group` that `from` delivered and this relay had no room to take in
+    /// (`strikes::Verdict::Full`): `from` is credited as its deliverer, as any copy's is, so a
+    /// receipt never reports an honest member short for this relay's want of room (RFC-0174 §2.5).
+    /// Unlike a copy held it is not counted as had or pushed on: this relay never took it, so
+    /// its group still lacks it and asks for it again. Each record credited is charged what its
+    /// entry allocates until the horizon (its place in the tree of credits and its senders), and
+    /// one there is no room to credit is not.
+    pub fn credit(&mut self, from: PublicKey, group: GroupKey, hash: Hash, now: impl Into<Now>) {
+        let now = now.into();
+        let Some(held) = self.groups.get_mut(&group) else {
+            return;
+        };
+        if held.refused.contains_key(&hash) {
+            return;
+        }
+        let growth = held.note_growth(&hash, &from);
+        if !charge(&mut self.held, &mut self.stats, growth) {
+            return;
+        }
+        let before = held.bytes();
+        held.note(hash, (from, now.judged().ms()), now.mono_ms());
+        settle(&mut self.held, before + growth, held.bytes());
+    }
+
+    /// Whether `group` holds `hash` or counts it as had.
+    #[cfg(test)]
+    pub fn counts_had(&self, group: GroupKey, hash: &Hash) -> bool {
+        self.groups.get(&group).is_some_and(|group| group.has(hash))
+    }
+
+    /// Whether `group` noted `from` as a deliverer of `hash`: the evidence its receipts credit
+    /// `from` by (`delivered_by`).
+    #[cfg(test)]
+    pub fn delivered(&self, group: GroupKey, hash: &Hash, from: &PublicKey) -> bool {
+        self.groups
+            .get(&group)
+            .is_some_and(|group| group.senders(hash).iter().any(|(sender, _)| sender == from))
     }
 
     /// A record rebuilt from parity (`rebuild`) that its relay could not take in for want of room
@@ -1169,15 +1568,12 @@ impl Member {
         let Some(group) = self.groups.get_mut(&key) else {
             return Vec::new();
         };
-        let Some(Judging {
-            held: rebuilt,
-            charged: freed,
-        }) = group.judging.remove(&hash)
-        else {
+        let before = group.bytes();
+        let Some(Judging { held: rebuilt }) = group.judging.remove(&hash) else {
             return Vec::new();
         };
-        group.bytes -= freed;
-        release(&mut self.held, freed);
+        group.entries_bytes -= rebuilt.bytes();
+        release(&mut self.held, before - group.bytes());
         if group.pieces.contains_key(&hash) || group.refused.contains_key(&hash) {
             return Vec::new();
         }
@@ -1186,11 +1582,32 @@ impl Member {
         } else {
             rebuilt.piece
         };
-        // At most what the rebuilt copy held, just released, so it fits unless the store shrank.
-        if !charge(&mut self.held, &mut self.stats, piece.held_len()) {
+        // Its senders: those credited while there was no room to take it (`credit`), who
+        // delivered it before parity rebuilt it, as a member's piece takes them (`piece`). Their
+        // list moves from the credit to the record, which lets the credit's place go; the rebuilt
+        // copy itself noted none (a member's copy arriving while it was judged takes its place).
+        debug_assert!(rebuilt.from.is_empty(), "a rebuilt copy noted a sender");
+        let senders_growth = if group.credited.contains_key(&hash) {
+            0
+        } else {
+            footprint::vec::<Sender>(rebuilt.from.capacity())
+        };
+        let growth = group.pieces.growth() + piece.held_len() + senders_growth;
+        if !charge(&mut self.held, &mut self.stats, growth) {
+            // No room to hold it: let go, as any record refused for room; whoever delivered it
+            // before stays credited.
             return Vec::new();
         }
-        group.hold(hash, piece.clone(), rebuilt.at_ms, rebuilt.from);
+        let before = group.bytes();
+        let senders = match group.credited.remove(&hash) {
+            Some(credited) => {
+                group.entries_bytes -= senders_bytes(&credited.from, credited.from.capacity());
+                credited.from
+            }
+            None => rebuilt.from,
+        };
+        group.hold(hash, piece.clone(), rebuilt.at_ms, senders);
+        settle(&mut self.held, before + growth, group.bytes());
         let out = push(group, &me, &me, data_stripe(&hash), now_ms, || {
             Message::Piece {
                 group: key,
@@ -1261,7 +1678,7 @@ impl Member {
     }
 
     /// The members this one demoted since the last call: (group, member, until).
-    pub fn take_demotions(&mut self) -> Vec<(GroupKey, PublicKey, u64)> {
+    pub fn take_demotions(&mut self) -> Vec<(GroupKey, PublicKey, MonoDeadline)> {
         std::mem::take(&mut self.demotions)
     }
 
@@ -1271,8 +1688,10 @@ impl Member {
         key: GroupKey,
         members: &[PublicKey],
         leaves_only: &[PublicKey],
-        now_ms: u64,
+        now: impl Into<Now>,
     ) -> Vec<Outgoing> {
+        let now = now.into();
+        let now_ms = now.judged().ms();
         let (me, deadlines) = (self.me, self.deadlines);
         let group = self
             .groups
@@ -1286,14 +1705,14 @@ impl Member {
         group.leaves_only = leaves_only.to_vec();
         group.relayout(now_ms);
         let out = assign(group, &me, now_ms);
-        self.settle(key, now_ms);
+        self.settle(key, now);
         self.route(out, None, now_ms)
     }
 
     /// Leaves a group (the relay no longer takes its cell).
     pub fn leave(&mut self, key: GroupKey) {
         if let Some(group) = self.groups.remove(&key) {
-            release(&mut self.held, group.bytes);
+            release(&mut self.held, group.bytes());
             if let Some(at) = group.due_ms {
                 self.due.remove(&(at, key));
             }
@@ -1302,7 +1721,7 @@ impl Member {
 
     /// Schedules `key` for when the tick next has something to do for it, or lets it go when it
     /// is this relay alone with nothing.
-    fn settle(&mut self, key: GroupKey, now_ms: u64) {
+    fn settle(&mut self, key: GroupKey, now: Now) {
         let me = self.me;
         let Some(group) = self.groups.get_mut(&key) else {
             return;
@@ -1314,7 +1733,7 @@ impl Member {
             self.leave(key);
             return;
         }
-        if let Some(at) = group.wake_ms(&me, now_ms) {
+        if let Some(at) = group.wake_ms(&me, now) {
             group.due_ms = Some(at);
             self.due.insert((at, key));
         }
@@ -1326,14 +1745,23 @@ impl Member {
         key: GroupKey,
         hash: Hash,
         piece: Piece,
-        now_ms: u64,
+        now: impl Into<Now>,
     ) -> Vec<Outgoing> {
+        self.seed(key, hash, piece, now.into())
+    }
+
+    fn seed(&mut self, key: GroupKey, hash: Hash, piece: Piece, now: Now) -> Vec<Outgoing> {
+        let now_ms = now.judged().ms();
         let (me, deadlines) = (self.me, self.deadlines);
         let held = self
             .groups
             .get(&key)
             .is_some_and(|group| group.pieces.contains_key(&hash));
-        if !held && !self.charge(piece.held_len()) {
+        let growth = self.groups.get(&key).map_or_else(
+            || Tree::<Hash, Held>::bytes_at(1) + piece.held_len(),
+            |group| group.hold_growth(&piece, 0),
+        );
+        if !held && !self.charge(growth) {
             return Vec::new();
         }
         let group = self
@@ -1342,10 +1770,12 @@ impl Member {
             .or_insert_with(|| Group::new(key, me, deadlines));
         group.own.entry(now_ms / 1000).or_default().insert(hash);
         if held {
-            self.settle(key, now_ms);
+            self.settle(key, now);
             return Vec::new();
         }
-        group.hold(hash, piece.clone(), now_ms, Vec::new());
+        let before = group.bytes();
+        group.hold(hash, piece.clone(), now.mono_ms(), Vec::new());
+        settle(&mut self.held, before + growth, group.bytes());
         self.delivered.push(Delivered {
             group: key,
             hash,
@@ -1359,25 +1789,31 @@ impl Member {
             piece,
         };
         let out = inject(group, &me, stripe, message, now_ms);
-        self.settle(key, now_ms);
+        self.settle(key, now);
         self.route(out, None, now_ms)
     }
 
     /// A message from another relay.
-    pub fn receive(&mut self, from: PublicKey, message: Message, now_ms: u64) -> Vec<Outgoing> {
+    pub fn receive(
+        &mut self,
+        from: PublicKey,
+        message: Message,
+        now: impl Into<Now>,
+    ) -> Vec<Outgoing> {
+        let now = now.into();
         let key = message.group();
         let out = match message {
-            Message::Piece { group, hash, piece } => self.piece(from, group, hash, piece, now_ms),
-            Message::Manifest(manifest) => self.manifest(from, manifest, now_ms),
-            Message::Parity(parity) => self.parity(from, parity, now_ms),
-            Message::Receipt(receipt) => self.receipt(from, receipt, now_ms),
-            Message::Have(have) => self.have(from, &have, now_ms),
+            Message::Piece { group, hash, piece } => self.piece(from, group, hash, piece, now),
+            Message::Manifest(manifest) => self.manifest(from, manifest, now),
+            Message::Parity(parity) => self.parity(from, parity, now),
+            Message::Receipt(receipt) => self.receipt(from, receipt, now),
+            Message::Have(have) => self.have(from, &have, now),
             Message::Assign(_) => Vec::new(),
         };
         if let Some(key) = key {
-            self.settle(key, now_ms);
+            self.settle(key, now);
         }
-        self.route(out, Some(&from), now_ms)
+        self.route(out, Some(&from), now.judged().ms())
     }
 
     fn piece(
@@ -1386,8 +1822,9 @@ impl Member {
         key: GroupKey,
         hash: Hash,
         piece: Piece,
-        now_ms: u64,
+        now: Now,
     ) -> Vec<Outgoing> {
+        let now_ms = now.judged().ms();
         let me = self.me;
         let Some(group) = self.groups.get_mut(&key) else {
             return Vec::new();
@@ -1395,22 +1832,48 @@ impl Member {
         if group.refused.contains_key(&hash) {
             return Vec::new();
         }
-        if let Some(held) = group.pieces.get_mut(&hash) {
-            if !held.from.iter().any(|(sender, _)| *sender == from) {
-                held.from.push((from, now_ms));
+        if group.pieces.contains_key(&hash) {
+            // Its sender noted, if there is room to note it.
+            let growth = group.note_growth(&hash, &from);
+            if charge(&mut self.held, &mut self.stats, growth) {
+                let before = group.bytes();
+                group.note(hash, (from, now_ms), now.mono_ms());
+                settle(&mut self.held, before + growth, group.bytes());
             }
             self.stats.duplicates += 1;
             return Vec::new();
         }
-        if piece.hash() != Some(hash) || !self.charge(piece.held_len()) {
+        if piece.hash() != Some(hash) {
             return Vec::new();
         }
-        let Some(group) = self.groups.get_mut(&key) else {
+        // What holding it allocates more: its place and piece, and its senders, those credited
+        // while there was no room to take it (`credit`), who delivered it first, with `from`. Their
+        // list moves from the credit to the record, which lets the credit's place go.
+        let credited = group.credited.get(&hash);
+        let senders_growth = credited.map_or(footprint::vec::<Sender>(1), |credited| {
+            note_growth(&credited.from, &from)
+        });
+        let growth = group.pieces.growth() + piece.held_len() + senders_growth;
+        if !charge(&mut self.held, &mut self.stats, growth) {
+            // No room to hold it: `from` delivered it all the same, and is credited as a link
+            // refused for want of room credits it (`credit`), so its receipt counts it had and
+            // the parent that sent it is never reported short.
+            self.credit(from, key, hash, now);
             return Vec::new();
-        };
+        }
         // A member's copy of one rebuilt and awaiting judgment: the member's, judged by its relay
         // before it came here, is held and pushed on; the rebuilt one is let go (`pass_on`).
         release(&mut self.held, group.drop_judging(&hash));
+        let before = group.bytes();
+        let mut senders = group
+            .credited
+            .remove(&hash)
+            .map_or_else(Vec::new, |credited| {
+                group.entries_bytes -= senders_bytes(&credited.from, credited.from.capacity());
+                credited.from
+            });
+        let charged = before + growth;
+        note(&mut senders, (from, now_ms));
         let parent = group
             .layout
             .place(data_stripe(&hash), epoch_of(now_ms / 1000), &me)
@@ -1418,7 +1881,8 @@ impl Member {
         if parent.is_some_and(|parent| parent != from) {
             self.stats.repaired += 1;
         }
-        group.hold(hash, piece.clone(), now_ms, vec![(from, now_ms)]);
+        group.hold(hash, piece.clone(), now.mono_ms(), senders);
+        settle(&mut self.held, charged, group.bytes());
         self.delivered.push(Delivered {
             group: key,
             hash,
@@ -1434,7 +1898,8 @@ impl Member {
         })
     }
 
-    fn manifest(&mut self, from: PublicKey, manifest: PieceManifest, now_ms: u64) -> Vec<Outgoing> {
+    fn manifest(&mut self, from: PublicKey, manifest: PieceManifest, now: Now) -> Vec<Outgoing> {
+        let now_ms = now.judged().ms();
         let me = self.me;
         let hash = manifest.hash();
         let Ok(content) = manifest.content() else {
@@ -1450,7 +1915,7 @@ impl Member {
         // Only a member originates into the group (a demoted one too: it is out of the trees, not
         // the group, and still holds its feeders); each origin has its own share of a second.
         if group.seen.contains_key(&hash)
-            || !in_window(content.second, now_ms, group.deadlines)
+            || !in_window(content.second, now.judged(), group.deadlines)
             || !(group.members.contains(&origin) || group.demoted.contains_key(&origin))
             || group.manifests.get(&content.second).is_some_and(|by_hash| {
                 by_hash
@@ -1463,7 +1928,7 @@ impl Member {
         {
             return Vec::new();
         }
-        group.seen.insert(hash, now_ms);
+        group.seen.insert(hash, now.mono_ms());
         group.manifests.entry(content.second).or_default().insert(
             hash,
             Listed {
@@ -1476,16 +1941,20 @@ impl Member {
         flood(group, &me, Some(&from), now_ms, Message::Manifest(manifest))
     }
 
-    fn parity(&mut self, from: PublicKey, parity: Arc<Parity>, now_ms: u64) -> Vec<Outgoing> {
+    fn parity(&mut self, from: PublicKey, parity: Arc<Parity>, now: Now) -> Vec<Outgoing> {
+        let now_ms = now.judged().ms();
         let me = self.me;
         let key = GroupKey::new(parity.cell, parity.product);
         let Some(group) = self.groups.get_mut(&key) else {
             return Vec::new();
         };
         let id = parity.id();
-        if let Some(held) = group.parity.get_mut(&id) {
-            if !held.from.iter().any(|(sender, _)| *sender == from) {
-                held.from.push((from, now_ms));
+        if group.parity.contains_key(&id) {
+            let growth = group.note_growth(&id, &from);
+            if charge(&mut self.held, &mut self.stats, growth) {
+                let before = group.bytes();
+                group.note(id, (from, now_ms), now.mono_ms());
+                settle(&mut self.held, before + growth, group.bytes());
             }
             return Vec::new();
         }
@@ -1497,23 +1966,31 @@ impl Member {
             .manifests
             .get(&parity.second)
             .is_some_and(|by_hash| by_hash.contains_key(&parity.manifest));
-        if !listed
-            || !in_window(parity.second, now_ms, group.deadlines)
-            || !charge(&mut self.held, &mut self.stats, parity.len())
-        {
+        let held = HeldParity {
+            parity: Arc::clone(&parity),
+            at_ms: now.mono_ms(),
+            from: vec![(from, now_ms)],
+        };
+        let growth = group.parity_growth(&held);
+        if !listed || !in_window(parity.second, now.judged(), group.deadlines) {
             return Vec::new();
         }
-        group.hold_parity(HeldParity {
-            parity: Arc::clone(&parity),
-            at_ms: now_ms,
-            from: vec![(from, now_ms)],
-        });
+        if !charge(&mut self.held, &mut self.stats, growth) {
+            // No room to hold it: `from` delivered it all the same, and is credited as a record
+            // refused for room credits its sender (`piece`).
+            self.credit(from, key, id, now);
+            return Vec::new();
+        }
+        let before = group.bytes();
+        group.hold_parity(held);
+        settle(&mut self.held, before + growth, group.bytes());
         push(group, &me, &from, PARITY_STRIPE, now_ms, || {
             Message::Parity(Arc::clone(&parity))
         })
     }
 
-    fn receipt(&mut self, from: PublicKey, receipt: StripeReceipt, now_ms: u64) -> Vec<Outgoing> {
+    fn receipt(&mut self, from: PublicKey, receipt: StripeReceipt, now: Now) -> Vec<Outgoing> {
+        let now_ms = now.judged().ms();
         let me = self.me;
         let hash = receipt.hash();
         let Ok(content) = receipt.content() else {
@@ -1524,7 +2001,7 @@ impl Member {
             return Vec::new();
         };
         if group.seen.contains_key(&hash)
-            || !in_window(content.first_second, now_ms, group.deadlines)
+            || !in_window(content.first_second, now.judged(), group.deadlines)
             || receipt.verify().is_err()
         {
             return Vec::new();
@@ -1532,7 +2009,7 @@ impl Member {
         let Ok(child) = receipt.signer() else {
             return Vec::new();
         };
-        group.seen.insert(hash, now_ms);
+        group.seen.insert(hash, now.mono_ms());
         if note_shortfall(group, &child, &content) {
             flood(group, &me, Some(&from), now_ms, Message::Receipt(receipt))
         } else {
@@ -1545,7 +2022,7 @@ impl Member {
     /// member of the group's trees that is not demoted is answered: a page is up to
     /// `REPAIR_PAGE_BYTES` of this relay's upload, and an asker the group does not hold is owed
     /// none of it.
-    fn have(&mut self, from: PublicKey, have: &HaveSummary, now_ms: u64) -> Vec<Outgoing> {
+    fn have(&mut self, from: PublicKey, have: &HaveSummary, now: Now) -> Vec<Outgoing> {
         let key = GroupKey::new(have.cell, have.product);
         let Some(group) = self.groups.get_mut(&key) else {
             return Vec::new();
@@ -1557,11 +2034,11 @@ impl Member {
             || group
                 .answered
                 .get(&from)
-                .is_some_and(|at| at + ANSWER_INTERVAL_MS > now_ms)
+                .is_some_and(|at| at + ANSWER_INTERVAL_MS > now.mono_ms())
         {
             return Vec::new();
         }
-        group.answered.insert(from, now_ms);
+        group.answered.insert(from, now.mono_ms());
         let group = &*group;
         let mut out = Vec::new();
         let mut budget = REPAIR_PAGE_BYTES;
@@ -1608,48 +2085,80 @@ impl Member {
     ///
     /// Only the groups with something due are visited (`settle`), in key order, and each is
     /// scheduled again after: a group with nothing due at `now_ms` would have done nothing.
-    pub fn tick(&mut self, now_ms: u64) -> Vec<Outgoing> {
+    pub fn tick(&mut self, now: impl Into<Now>) -> Vec<Outgoing> {
+        let now = now.into();
+        let now_ms = now.judged().ms();
         let me = self.me;
         let mut out = Vec::new();
+        // Who would not answer an ask: the members this relay routes around as full, and those
+        // it turned away while they may still route around it (their wait, and its slack:
+        // `Deadlines::route_slack`).
+        let silent: BTreeSet<PublicKey> = self
+            .full
+            .iter()
+            .copied()
+            .chain(
+                self.turned_away
+                    .iter()
+                    .filter(|(_, held)| {
+                        held.last.is_some_and(|wait| {
+                            now_ms
+                                < wait
+                                    .until_ms
+                                    .saturating_add(self.deadlines.route_slack.ms())
+                        })
+                    })
+                    .map(|(key, _)| *key),
+            )
+            .collect();
         let mut keys: Vec<GroupKey> = self
             .due
             .iter()
-            .take_while(|(at, _)| *at <= now_ms)
+            .take_while(|(at, _)| *at <= now.mono_ms())
             .map(|(_, key)| *key)
             .collect();
         keys.sort();
-        for key in keys {
-            let Some(group) = self.groups.get_mut(&key) else {
-                continue;
-            };
-            self.visits += 1;
-            out.extend(originate_manifests(
-                group,
-                &self.identity,
-                now_ms,
-                (&mut self.held, &mut self.stats),
-            ));
-            rebuild(
-                group,
-                now_ms,
-                &mut self.held,
-                &mut self.delivered,
-                &mut self.stats,
-            );
-            out.extend(receipts(
-                group,
-                &self.identity,
-                &self.turned_away,
-                now_ms,
-                &mut self.stats,
-            ));
-            judge(group, now_ms, &mut self.demotions, &mut self.stats);
-            expire_demotions(group, now_ms);
-            out.extend(assign(group, &me, now_ms));
-            out.extend(repair(group, &me, now_ms, &mut self.stats));
-            release(&mut self.held, forget(group, now_ms));
-            self.settle(key, now_ms);
-        }
+        // Manifests and receipts are signed only while the relay's clock is synced
+        // (`signer::Signer::with`): until then they wait, and are made at the first tick after.
+        let signer = self.signer.clone();
+        crate::signer::with(&signer, now, |signing| {
+            for key in keys {
+                let Some(group) = self.groups.get_mut(&key) else {
+                    continue;
+                };
+                self.visits += 1;
+                if let Some(identity) = signing {
+                    out.extend(originate_manifests(
+                        group,
+                        identity,
+                        now,
+                        (&mut self.held, &mut self.stats),
+                    ));
+                }
+                rebuild(
+                    group,
+                    now,
+                    &mut self.held,
+                    &mut self.delivered,
+                    &mut self.stats,
+                );
+                if let Some(identity) = signing {
+                    out.extend(receipts(
+                        group,
+                        identity,
+                        &self.turned_away,
+                        now,
+                        &mut self.stats,
+                    ));
+                }
+                judge(group, now, &mut self.demotions, &mut self.stats);
+                expire_demotions(group, now);
+                out.extend(assign(group, &me, now_ms));
+                out.extend(repair(group, (&me, &silent), now, &mut self.stats));
+                release(&mut self.held, forget(group, now));
+                self.settle(key, now);
+            }
+        });
         self.forget_turned_away(now_ms);
         self.route(out, None, now_ms)
     }
@@ -1775,10 +2284,11 @@ fn owed_by(
 /// send its parity down the parity stripe.
 fn originate_manifests(
     group: &mut Group,
-    identity: &Identity,
-    now_ms: u64,
+    identity: &impl Signs,
+    now: Now,
     (held, stats): (&mut Charge, &mut Stats),
 ) -> Vec<Outgoing> {
+    let now_ms = now.judged().ms();
     let me = identity.public();
     let due: Vec<u64> = group
         .own
@@ -1803,7 +2313,7 @@ fn originate_manifests(
                 continue;
             };
             let hash = manifest.hash();
-            group.seen.insert(hash, now_ms);
+            group.seen.insert(hash, now.mono_ms());
             let pieces: Option<Vec<(Hash, &Piece)>> = chunk
                 .iter()
                 .map(|hash| group.pieces.get(hash).map(|held| (*hash, &held.piece)))
@@ -1838,12 +2348,16 @@ fn originate_manifests(
             if let Some(parity) = parity {
                 // Held for repair only if the store has room; sent down the parity stripe either
                 // way, as what this relay sends is never the store's.
-                if charge(held, stats, parity.len()) {
-                    group.hold_parity(HeldParity {
-                        parity: Arc::clone(&parity),
-                        at_ms: now_ms,
-                        from: Vec::new(),
-                    });
+                let kept = HeldParity {
+                    parity: Arc::clone(&parity),
+                    at_ms: now.mono_ms(),
+                    from: Vec::new(),
+                };
+                let growth = group.parity_growth(&kept);
+                if charge(held, stats, growth) {
+                    let before = group.bytes();
+                    group.hold_parity(kept);
+                    settle(held, before + growth, group.bytes());
                 }
                 let sends = inject(group, &me, PARITY_STRIPE, Message::Parity(parity), now_ms);
                 // A member takes a parity only for a manifest it holds (`Member::parity`), so the
@@ -1875,11 +2389,12 @@ fn originate_manifests(
 /// manifest is kept either way: a record is checked by its own hash.
 fn rebuild(
     group: &mut Group,
-    now_ms: u64,
+    now: Now,
     held: &mut Charge,
     delivered: &mut Vec<Delivered>,
     stats: &mut Stats,
 ) {
+    let now_ms = now.judged().ms();
     let mut found: Vec<(Hash, Piece)> = Vec::new();
     let mut false_parity: Vec<Hash> = Vec::new();
     for (second, by_hash) in &mut group.manifests {
@@ -1957,22 +2472,21 @@ fn rebuild(
         if group.has(&hash) {
             continue;
         }
-        let charged = piece.held_len();
-        if !charge(held, stats, charged) {
+        let judging = Judging {
+            held: Held {
+                piece: piece.clone(),
+                at_ms: now.mono_ms(),
+                from: Vec::new(),
+            },
+        };
+        let growth = group.judging.growth() + judging.held.bytes();
+        if !charge(held, stats, growth) {
             continue;
         }
-        group.bytes += charged;
-        group.judging.insert(
-            hash,
-            Judging {
-                held: Held {
-                    piece: piece.clone(),
-                    at_ms: now_ms,
-                    from: Vec::new(),
-                },
-                charged,
-            },
-        );
+        let before = group.bytes();
+        group.entries_bytes += judging.held.bytes();
+        group.judging.insert(hash, judging);
+        settle(held, before + growth, group.bytes());
         stats.rebuilt += 1;
         delivered.push(Delivered {
             group: group.key,
@@ -1996,11 +2510,12 @@ fn rebuild(
 /// the parent, which is signed its receipt only if it delivered the rest itself.
 fn receipts(
     group: &mut Group,
-    identity: &Identity,
-    turned_away: &BTreeMap<PublicKey, TurnedAway>,
-    now_ms: u64,
+    identity: &impl Signs,
+    turned_away: &Tree<PublicKey, TurnedAway>,
+    now: Now,
     stats: &mut Stats,
 ) -> Vec<Outgoing> {
+    let now_ms = now.judged().ms();
     let me = identity.public();
     let deadlines = group.deadlines;
     let windows: BTreeSet<u64> = group
@@ -2008,7 +2523,7 @@ fn receipts(
         .keys()
         .map(|second| second / RECEIPT_WINDOW_SECONDS)
         .filter(|window| {
-            (window + 1) * RECEIPT_WINDOW_SECONDS * 1000 + deadlines.receipt_grace_ms <= now_ms
+            (window + 1) * RECEIPT_WINDOW_SECONDS * 1000 + deadlines.receipt_grace.ms() <= now_ms
                 && !group.receipted.contains(window)
         })
         .collect();
@@ -2035,8 +2550,8 @@ fn receipts(
                 if turned_away.get(&deliverer).is_some_and(|held| {
                     held.during(
                         first * 1000,
-                        end * 1000 + deadlines.receipt_grace_ms,
-                        deadlines.route_slack_ms,
+                        end * 1000 + deadlines.receipt_grace.ms(),
+                        deadlines.route_slack.ms(),
                     )
                 }) {
                     continue;
@@ -2054,7 +2569,7 @@ fn receipts(
                 let routed_around = !past.is_empty();
                 for (router, got) in past {
                     let Some((receipt, _)) =
-                        sign_receipt(group, identity, (router, stripe, first), &got, now_ms)
+                        sign_receipt(group, identity, (router, stripe, first), &got, now)
                     else {
                         continue;
                     };
@@ -2070,7 +2585,7 @@ fn receipts(
                     continue;
                 }
                 let Some((receipt, content)) =
-                    sign_receipt(group, identity, (deliverer, stripe, first), &got, now_ms)
+                    sign_receipt(group, identity, (deliverer, stripe, first), &got, now)
                 else {
                     continue;
                 };
@@ -2113,7 +2628,7 @@ fn delivered_by(group: &Group, owed: &[Hash], deliverer: &PublicKey) -> Vec<Hash
 
 /// What `parent` owed this relay in a window's stripe that reached it past the parent first, by
 /// who delivered it, each in the order it came: from a member above the parent in the stripe's
-/// tree, or from the record's origin, before its second settled (`Deadlines::repair_after_ms`
+/// tree, or from the record's origin, before its second settled (`Deadlines::repair_after`
 /// after it ended: no repair is asked for a second before then, so what came sooner was pushed
 /// down the tree, past a parent that was full to the one that pushed it), and before the parent's
 /// own copy if it sent one.
@@ -2136,7 +2651,8 @@ fn routed_past(
             .iter()
             .find(|(sender, _)| sender == parent)
             .map_or(u64::MAX, |(_, at)| *at);
-        let before_ms = parent_at.min((listed.second + 1) * 1000 + group.deadlines.repair_after_ms);
+        let before_ms =
+            parent_at.min((listed.second + 1) * 1000 + group.deadlines.repair_after.ms());
         if let Some((router, at)) = senders.iter().find(|(sender, at)| {
             sender != me
                 && sender != parent
@@ -2158,10 +2674,10 @@ fn routed_past(
 /// stripe, and what it says.
 fn sign_receipt(
     group: &mut Group,
-    identity: &Identity,
+    identity: &impl Signs,
     (deliverer, stripe, first): (PublicKey, u8, u64),
     hashes: &[Hash],
-    now_ms: u64,
+    now: Now,
 ) -> Option<(StripeReceipt, StripeReceiptContent)> {
     let content = StripeReceiptContent {
         parent: deliverer,
@@ -2174,10 +2690,10 @@ fn sign_receipt(
         records: u32::try_from(hashes.len()).unwrap_or(u32::MAX),
         bytes: hashes.iter().map(|hash| group.bytes_of(hash)).sum(),
         digest: receipt_digest(hashes),
-        issued_ms: now_ms,
+        issued_ms: now.judged().ms(),
     };
     let receipt = StripeReceipt::sign(identity, &content).ok()?;
-    group.seen.insert(receipt.hash(), now_ms);
+    group.seen.insert(receipt.hash(), now.mono_ms());
     Some((receipt, content))
 }
 
@@ -2185,10 +2701,11 @@ fn sign_receipt(
 /// itself starved in.
 fn judge(
     group: &mut Group,
-    now_ms: u64,
-    demotions: &mut Vec<(GroupKey, PublicKey, u64)>,
+    now: Now,
+    demotions: &mut Vec<(GroupKey, PublicKey, MonoDeadline)>,
     stats: &mut Stats,
 ) {
+    let now_ms = now.judged().ms();
     let deadlines = group.deadlines;
     let due: Vec<u64> = group
         .receipted
@@ -2196,8 +2713,8 @@ fn judge(
         .copied()
         .filter(|window| {
             (window + 1) * RECEIPT_WINDOW_SECONDS * 1000
-                + deadlines.receipt_grace_ms
-                + deadlines.judge_after_ms
+                + deadlines.receipt_grace.ms()
+                + deadlines.judge_after.ms()
                 <= now_ms
                 && !group.judged.contains(window)
         })
@@ -2232,7 +2749,8 @@ fn judge(
             if place.children.is_empty() || reporting * 2 <= place.children.len() {
                 continue;
             }
-            let until = now_ms + DEMOTION_MS;
+            // Out of the trees for `DEMOTION_MS` by `M`: a step of `J` stretches no demotion.
+            let until = now.after(DEMOTION_MS);
             group.demoted.insert(deliverer, until);
             demotions.push((group.key, deliverer, until));
         }
@@ -2240,11 +2758,11 @@ fn judge(
     }
 }
 
-fn expire_demotions(group: &mut Group, now_ms: u64) {
+fn expire_demotions(group: &mut Group, now: Now) {
     let before = group.demoted.len();
-    group.demoted.retain(|_, until| *until > now_ms);
+    group.demoted.retain(|_, until| !until.passed(now));
     if group.demoted.len() != before {
-        group.relayout(now_ms);
+        group.relayout(now.judged().ms());
     }
 }
 
@@ -2292,9 +2810,16 @@ fn assign(group: &mut Group, me: &PublicKey, now_ms: u64) -> Vec<Outgoing> {
 }
 
 /// Asks a rotating member for the seconds this one lacks (or, now and then, for none in
-/// particular, so a lost manifest is found).
-fn repair(group: &mut Group, me: &PublicKey, now_ms: u64, stats: &mut Stats) -> Vec<Outgoing> {
-    if now_ms < group.repair_at_ms {
+/// particular, so a lost manifest is found), never one of the `silent`, which would not answer.
+fn repair(
+    group: &mut Group,
+    (me, silent): (&PublicKey, &BTreeSet<PublicKey>),
+    now: Now,
+    stats: &mut Stats,
+) -> Vec<Outgoing> {
+    let now_ms = now.judged().ms();
+    // Its pace is a duration's, by `M`; the seconds it asks of, by `J`.
+    if now.mono_ms() < group.repair_at_ms {
         return Vec::new();
     }
     let now_second = now_ms / 1000;
@@ -2303,9 +2828,9 @@ fn repair(group: &mut Group, me: &PublicKey, now_ms: u64, stats: &mut Stats) -> 
     let lacking = group
         .manifests
         .range(first..)
-        .take_while(|(second, _)| (*second + 1) * 1000 + deadlines.repair_after_ms <= now_ms)
+        .take_while(|(second, _)| (*second + 1) * 1000 + deadlines.repair_after.ms() <= now_ms)
         .any(|(second, _)| !group.whole(*second));
-    let anti_entropy = now_ms >= group.anti_entropy_at_ms;
+    let anti_entropy = now.mono_ms() >= group.anti_entropy_at_ms;
     if !lacking && !anti_entropy {
         return Vec::new();
     }
@@ -2314,7 +2839,7 @@ fn repair(group: &mut Group, me: &PublicKey, now_ms: u64, stats: &mut Stats) -> 
         .layout
         .members()
         .into_iter()
-        .filter(|key| key != me)
+        .filter(|key| key != me && !silent.contains(key))
         .max_by_key(|key| {
             score(
                 REPAIR,
@@ -2329,15 +2854,15 @@ fn repair(group: &mut Group, me: &PublicKey, now_ms: u64, stats: &mut Stats) -> 
         return Vec::new();
     };
     group.repair_attempt += 1;
-    group.repair_at_ms = now_ms + REPAIR_INTERVAL_MS;
-    group.anti_entropy_at_ms = now_ms + ANTI_ENTROPY_MS;
+    group.repair_at_ms = now.mono_ms() + REPAIR_INTERVAL_MS;
+    group.anti_entropy_at_ms = now.mono_ms() + ANTI_ENTROPY_MS;
     let span = (now_second + 1 - first).min(MAX_HAVE_SECONDS as u64);
     let mut seconds = vec![0u8; usize::try_from(span.div_ceil(8)).unwrap_or(0)];
     for offset in 0..span {
         let second = first + offset;
         // A second still arriving is not asked for; one with no manifest is, so a manifest that
         // never came is found.
-        let settled = (second + 1) * 1000 + deadlines.repair_after_ms <= now_ms;
+        let settled = (second + 1) * 1000 + deadlines.repair_after.ms() <= now_ms;
         if (!settled || group.whole(second))
             && let Some(byte) = seconds.get_mut(usize::try_from(offset / 8).unwrap_or(0))
         {
@@ -2356,42 +2881,61 @@ fn repair(group: &mut Group, me: &PublicKey, now_ms: u64, stats: &mut Stats) -> 
     }]
 }
 
-/// Forgets what is past the horizon. The bytes it let go (records and parities).
-fn forget(group: &mut Group, now_ms: u64) -> usize {
+/// Forgets what is past the horizon. The bytes it let go (records, parities and credits).
+///
+/// What the group holds (records, records awaiting judgment, parities, credits) and the hashes it
+/// took in or refused are let go by `M`, a horizon after they came: how long the relay keeps a
+/// possessed thing is a duration, and its store is planned on it (`budget::Store::Batches`), so
+/// a step of `J` either way keeps nothing past its plan. What is indexed by signed second (the
+/// manifests, the relay's own records not yet in one, the windows receipted and judged, the
+/// shortfalls) is let go by `J`: no copy enters it outside the seconds `J` admits
+/// (`in_window`), so a step holds at most one horizon's seconds beside the new.
+fn forget(group: &mut Group, now: Now) -> usize {
+    let now_ms = now.judged().ms();
     let horizon_seconds = group.deadlines.horizon_seconds();
     let horizon_ms = now_ms.saturating_sub(horizon_seconds * 1000);
+    let kept_from_ms = now.mono_ms().saturating_sub(horizon_seconds * 1000);
     let horizon_second = horizon_ms / 1000;
     let horizon_window = horizon_second / RECEIPT_WINDOW_SECONDS;
+    let before = group.bytes();
     let mut freed = 0;
     group.pieces.retain(|_, held| {
-        let keep = held.at_ms >= horizon_ms;
+        let keep = held.at_ms >= kept_from_ms;
         if !keep {
-            freed += held.piece.held_len();
+            freed += held.bytes();
         }
         keep
     });
     group.judging.retain(|_, judging| {
-        let keep = judging.held.at_ms >= horizon_ms;
+        let keep = judging.held.at_ms >= kept_from_ms;
         if !keep {
-            freed += judging.charged;
+            freed += judging.held.bytes();
         }
         keep
     });
     group.parity.retain(|_, held| {
-        let keep = held.at_ms >= horizon_ms;
+        let keep = held.at_ms >= kept_from_ms;
         if !keep {
-            freed += held.parity.len();
+            freed += held.bytes();
         }
         keep
     });
-    group.bytes -= freed;
+    group.credited.retain(|_, credited| {
+        let keep = credited.at_ms >= kept_from_ms;
+        if !keep {
+            freed += senders_bytes(&credited.from, credited.from.capacity());
+        }
+        keep
+    });
+    group.entries_bytes -= freed;
+    let freed = before - group.bytes();
     group.manifests = group.manifests.split_off(&horizon_second);
     group.own = group.own.split_off(&horizon_second);
-    group.seen.retain(|_, at| *at >= horizon_ms);
-    group.refused.retain(|_, at| *at >= horizon_ms);
+    group.seen.retain(|_, at| *at >= kept_from_ms);
+    group.refused.retain(|_, at| *at >= kept_from_ms);
     group
         .answered
-        .retain(|_, at| *at + ANSWER_INTERVAL_MS > now_ms);
+        .retain(|_, at| *at + ANSWER_INTERVAL_MS > now.mono_ms());
     group.receipted = group.receipted.split_off(&horizon_window);
     group.judged = group.judged.split_off(&horizon_window);
     group
@@ -2421,10 +2965,17 @@ fn release(held: &mut Charge, freed: usize) {
     held.shrink_to(left);
 }
 
+/// A change charged `charged` (what the group allocated before it and its growth) that leaves the
+/// group allocating `now`: what it did not grow by given back, so the charge is what the groups
+/// allocate. A change never grows by more than its growth reckons.
+fn settle(held: &mut Charge, charged: usize, now: usize) {
+    debug_assert!(now <= charged, "a group grew past what it was charged");
+    release(held, charged.saturating_sub(now));
+}
+
 /// Whether a signed `second` is one this relay holds things for: within the horizon behind its
-/// clock, and no further ahead than `SKEW_SECONDS`. Overflow-free for any `second`.
-fn in_window(second: u64, now_ms: u64, deadlines: Deadlines) -> bool {
-    let now = now_ms / 1000;
-    second.saturating_add(deadlines.horizon_seconds()) >= now
-        && second <= now.saturating_add(SKEW_SECONDS)
+/// judging clock, and no further ahead than two relays' clocks may differ
+/// (`tally_wire::budget::Window::sharing`), so what is held is bounded and `forget` bounds memory.
+fn in_window(second: u64, now: Judged, deadlines: Deadlines) -> bool {
+    tally_wire::budget::Window::sharing(deadlines.horizon()).holds_second(second, now)
 }

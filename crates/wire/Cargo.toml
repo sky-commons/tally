@@ -15,6 +15,8 @@ bytes.workspace = true
 ed25519-dalek.workspace = true
 getrandom.workspace = true
 h3o.workspace = true
+# The one read of the host's clock (src/kernel_clock.rs).
+libc.workspace = true
 miniz_oxide.workspace = true
 # An ACARS-family decoder's line, projected to the one flat schema (src/acars.rs).
 serde.workspace = true
@@ -24,6 +26,8 @@ thiserror.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
+# The tests' counting allocator: test support, outside every production build.
+tally-counting = { path = "../counting" }
 # `test-util` pauses time, so a timeout test waits no real seconds.
 tokio = { workspace = true, features = ["test-util"] }
 

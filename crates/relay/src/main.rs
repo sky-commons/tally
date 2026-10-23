@@ -1,5 +1,9 @@
 //! `tally-relay`: the relay's command line (RFC-0171 §3.6).
 
+// No `unsafe` here, forbidden, so no module of the binary can allow it: what calls libc is the
+// library's, in its one module that allows it.
+#![forbid(unsafe_code)]
+
 use std::io::Write as _;
 use std::sync::Arc;
 
@@ -7,7 +11,8 @@ use tally_relay::config::{Command, Config};
 use tally_relay::egress;
 use tally_relay::hub::Hub;
 use tally_relay::link;
-use tally_wire::Identity;
+use tally_relay::signer::Signer;
+use tally_wire::{Identity, NoiseKey};
 use tokio::net::TcpListener;
 
 fn main() {
@@ -15,6 +20,10 @@ fn main() {
     tally_relay::budget::bound_the_allocator();
     // Every panic ends the relay (`tally_relay::abort_on_any_panic`), set before any thread runs.
     tally_relay::abort_on_any_panic();
+    // SIGTERM and SIGINT are taken by one thread alone (`serve`), so blocked before any runs.
+    if !tally_relay::os::block_termination() {
+        eprintln!("tally-relay: could not block SIGTERM to take it gracefully");
+    }
     serve_main();
 }
 
@@ -48,7 +57,14 @@ async fn run() -> Result<(), String> {
 /// The keys are an operator's secrets, not its configuration: a throwaway key stands in for them.
 fn check(config: &Config) -> Result<(), String> {
     let identity = Identity::generate().map_err(|error| error.to_string())?;
-    let (hub, _) = prepare(config, &identity)?;
+    // A relay whose sandbox refuses it the clock's error bound would refuse to start: so does
+    // its check, naming why.
+    tally_relay::clock::kernel_answers()?;
+    // A state directory this relay could not make or write is refused as a start refuses it;
+    // nothing in it is read, no key is made and no lock taken, so a check beside the live relay
+    // that holds the directory neither waits on it nor touches its state.
+    config.check_state_dir(std::env::var("STATE_DIRECTORY").ok().as_deref())?;
+    let (hub, _, _) = prepare(config, identity, tally_relay::durable::Durable::Off)?;
     let budget = hub.budget();
     let threads = budget.threads();
     let plan = budget.plan();
@@ -112,6 +128,15 @@ fn check(config: &Config) -> Result<(), String> {
                 format!("window-{name}"),
                 number(
                     plan.per_rate
+                        .of(store)
+                        .div_ceil(tally_relay::budget::PLANNED_RECEPTIONS_PER_SEC),
+                ),
+            ));
+            // The members' rate's own, where it differs (what is taken, `strikes`).
+            gauges.push((
+                format!("members-window-{name}"),
+                number(
+                    plan.member_unit()
                         .of(store)
                         .div_ceil(tally_relay::budget::PLANNED_RECEPTIONS_PER_SEC),
                 ),
@@ -200,8 +225,13 @@ fn check(config: &Config) -> Result<(), String> {
 /// The relay as its configuration builds it, before any socket: its hub, staged, with its budget
 /// checked and its RFC-0174 duties configured, and whether it hosts MLAT. Every refusal a start
 /// makes after reading its arguments (but for reading its keys and binding its sockets) is made
-/// here, so `check` refuses exactly what a start refuses.
-fn prepare(config: &Config, identity: &Identity) -> Result<(Arc<Hub>, bool), String> {
+/// here, so `check` refuses exactly what a start refuses. `identity`, the newest key, is moved
+/// into the relay's one signer on the hub's clock, which the MLAT host and `serve_as` share.
+fn prepare(
+    config: &Config,
+    identity: Identity,
+    durable: tally_relay::durable::Durable,
+) -> Result<(Arc<Hub>, bool, Signer), String> {
     let hosts_mlat = config.relay_duties && config.mlat;
     let hub = Arc::new(
         Hub::new(
@@ -233,6 +263,9 @@ fn prepare(config: &Config, identity: &Identity) -> Result<(Arc<Hub>, bool), Str
         // Its cores, which bound the connections, the rate and the MLAT seats it admits
         // (`budget::Plan::admit`).
         .cores(config.cores)
+        // What it keeps across a restart (`durable`): each table started from it, so a restarted
+        // relay uses nothing it used before.
+        .durable(durable)?
         // Each stage on the threads the load it admits needs (`cores::threads_for`), and
         // MLAT's steps on what the cores leave them (`cores::mlat_threads_for`). A stage
         // short of a thread would close no epoch: the relay fails to start instead.
@@ -241,6 +274,8 @@ fn prepare(config: &Config, identity: &Identity) -> Result<(Arc<Hub>, bool), Str
     // A relay whose memory cannot hold its members' pool and a feeder beside it would refuse every
     // Hello, or its members: it refuses to start instead.
     hub.budget().check()?;
+    // Nor does one whose anchor cache or station rows, held whole, their stores cannot hold.
+    hub.fixed_charged()?;
     // RFC-0174's duties, configured once here.
     let network = hub.network();
     network.products.set_world(config.world);
@@ -249,26 +284,50 @@ fn prepare(config: &Config, identity: &Identity) -> Result<(Arc<Hub>, bool), Str
         .admission
         .configure(config.network, config.relay_duties);
     network.credit.set_upload_cap(config.max_upload.rate());
+    // The engine is handed the relay's key only as its signer on the relay's judging clock: it
+    // signs nothing while that clock is not synced.
+    let signer = tally_relay::signer::on(identity, hub.clock().clone());
     let hosted =
-        match tally_relay::mlat_host::host_for(config, identity.clone(), boot_id()?, hub.budget())?
-        {
+        match tally_relay::mlat_host::host_for(config, signer.clone(), boot_id()?, hub.budget())? {
             Some(host) => {
                 network.host_mlat(Arc::new(host));
                 true
             }
             None => false,
         };
-    Ok((hub, hosted))
+    Ok((hub, hosted, signer))
 }
 
 async fn serve(config: Config) -> Result<(), String> {
-    let identities = config.identities()?;
+    // A relay that cannot read its clock's error judges no time: refused at once, naming why.
+    tally_relay::clock::kernel_answers()?;
+    // The newest key signs (moved into the relay's one signer); the older ones only answer
+    // handshakes while feeders move to the newest.
+    let mut identities = config.identities()?.into_iter();
+    let newest = identities
+        .next()
+        .ok_or_else(|| "no key: --key names none".to_owned())?;
+    let older: Vec<NoiseKey> = identities.map(NoiseKey::of).collect();
     eprintln!(
         "tally-relay: upload capped at {}/s to billed peers, at most {} in 31 days",
         egress::decimal(config.max_upload.rate()),
         egress::decimal(config.max_upload.most_a_month())
     );
-    let (hub, hosted) = prepare(&config, &identities[0])?;
+    let durable = config.durable(std::env::var("STATE_DIRECTORY").ok().as_deref())?;
+    match &durable {
+        tally_relay::durable::Durable::Dir(dir) => {
+            eprintln!("tally-relay: state kept in {}", dir.path().display());
+        }
+        _ => eprintln!(
+            "tally-relay: no state directory: every table starts {} s ahead of the clock, using \
+             nothing new until then",
+            tally_wire::budget::FALLBACK_FLOOR
+                .span::<tally_wire::clocks::Judged>()
+                .ms()
+                / 1000
+        ),
+    }
+    let (hub, hosted, signer) = prepare(&config, newest, durable)?;
     // What the arenas keep free below their tops is returned on a thread of its own, off every
     // stage (`budget::spawn_allocator_trimmer`).
     tally_relay::budget::spawn_allocator_trimmer(tally_relay::budget::TRIM_PERIOD)
@@ -300,7 +359,7 @@ async fn serve(config: Config) -> Result<(), String> {
     );
     eprintln!(
         "tally-relay: key {} listening on {}",
-        identities[0].public(),
+        signer.public(),
         config.listen
     );
     if hosted {
@@ -353,22 +412,54 @@ async fn serve(config: Config) -> Result<(), String> {
     for upstream in &config.upstreams {
         tokio::spawn(link::upstream(
             upstream.clone(),
-            identities[0].clone(),
+            signer.handshake(),
             Arc::clone(&hub),
         ));
     }
     let listener = TcpListener::bind(&config.listen)
         .await
         .map_err(|error| format!("listen {}: {error}", config.listen))?;
-    listening.spawn(async move {
-        tally_relay::serve(listener, identities, hub)
-            .await
-            .to_string()
-    });
-    match listening.join_next().await {
-        Some(Ok(why)) => Err(why),
-        Some(Err(error)) => Err(format!("a listener: {error}")),
-        None => Err("no listener".to_owned()),
+    {
+        let hub = Arc::clone(&hub);
+        listening.spawn(async move {
+            match tally_relay::serve_as(listener, signer, older, hub).await {
+                // Stopping: the signal's path below ends the relay.
+                tally_relay::Ended::Stopped => std::future::pending().await,
+                ended => ended.to_string(),
+            }
+        });
+    }
+    // SIGTERM or SIGINT: every session told goodbye and the state written (`Hub::stop`), then the
+    // relay waits for its sessions to close, as long as a farewell takes at most, and exits 0.
+    let (stopped, stopping) = tokio::sync::oneshot::channel();
+    {
+        let hub = Arc::clone(&hub);
+        std::thread::Builder::new()
+            .name("tally-relay-signals".to_owned())
+            .spawn(move || {
+                if let Some(signal) = tally_relay::os::wait_termination() {
+                    eprintln!("tally-relay: signal {signal}: stopping");
+                    if let Err(error) = hub.stop() {
+                        eprintln!("tally-relay: its state was not written: {error}");
+                    }
+                    let _ = stopped.send(());
+                }
+            })
+            .map_err(|error| format!("the signal thread: {error}"))?;
+    }
+    tokio::select! {
+        ended = listening.join_next() => match ended {
+            Some(Ok(why)) => Err(why),
+            Some(Err(error)) => Err(format!("a listener: {error}")),
+            None => Err("no listener".to_owned()),
+        },
+        Ok(()) = stopping => {
+            let deadline = tokio::time::Instant::now() + tally_relay::link::FAREWELL_MOST;
+            while hub.connections_open() > 0 && tokio::time::Instant::now() < deadline {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            std::process::exit(0)
+        }
     }
 }
 

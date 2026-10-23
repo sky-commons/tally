@@ -24,9 +24,20 @@
 //!   centre into the area tree.
 //! - `replay`: the engine driven over the simulator on a virtual clock, as a relay drives it.
 
+// No `unsafe` at all, forbidden, so no module can allow it: the engine signs through a `Signer`
+// (`tally_wire::Signs`), and nothing here can forge its way past wire's seal with a `transmute`.
+#![forbid(unsafe_code)]
+
 pub mod area;
 pub mod engine;
 pub mod intake;
 pub mod provisional;
 pub mod replay;
 pub mod window;
+
+/// The unit tests hold what the engine's tables are charged to what they really allocate, each
+/// test on its own thread's count (`tally_counting::Counting`, test support outside every
+/// production build).
+#[cfg(test)]
+#[global_allocator]
+static COUNTING: tally_counting::Counting = tally_counting::Counting;

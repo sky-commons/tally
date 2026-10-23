@@ -49,6 +49,20 @@ It ends by printing your station's page, which says whether it is feeding. Run i
 or to change the location; `--uninstall` removes it and keeps the key (`--uninstall --purge` deletes
 the key too).
 
+**The host keeps time with chrony or ntpd.** The feeder trusts its host's clock only by the
+kernel's error bound on it (`maxerror`), which chrony and ntpd keep true. systemd-timesyncd does
+not: it sets the bound to 0 at every sync and the kernel grows it 500 µs a second from there, so
+under timesyncd the bound understates the clock's error and neither the kernel nor the feeder can
+tell (RFC-0171 §3.6). That is a known gap, closed only by the requirement. The installer installs
+chrony when the host has neither (Debian's chrony package replaces timesyncd) and starts one that
+is installed and stopped, and the unit is ordered after `chrony-wait.service` and
+`time-sync.target`. By hand or in a container, run chrony or ntpd on the host.
+
+**Upgrade required.** A feeder signs a relay's freshness anchor into every batch (RFC-0171 §3.6), and
+a relay uses no batch without one: a feeder from before anchors is still received and passed on, but
+none of its data reaches the map, MLAT or subscribers. Upgrade relays first (they read both formats),
+then feeders.
+
 As a container (`ghcr.io/sky-commons/tally-feed`, signed like the binaries), see
 [packaging/README.md](packaging/README.md). By hand:
 
@@ -97,7 +111,9 @@ and so is a message over 16 KiB once published. They join the relay's daily open
 (packaging/map/README.md).
 
 `--ceiling` caps what the feeder sends each relay per second (64 KB by default). Over the cap,
-receptions are dropped and counted, never buffered.
+receptions are dropped and counted, never buffered. Batches held while no relay's anchor is heard
+go out at the cap too once one is, the oldest within its 64 s hold; batches a relay session was
+too slow for are counted in the feeder's health (`lagged`).
 
 ## Run a relay
 
@@ -151,8 +167,8 @@ MLAT that falls behind sheds rather than delaying raw; `--no-mlat` runs none), a
 three off, for a relay that only shares the areas it takes (a host behind NAT, or one with no
 cores to spare). `--world` gathers the live world product from every area's positions it receives
 (one fix per aircraft per second, sealed about 4 seconds after the second, MLAT by its provisional
-fix), and `--world-precise` the precise one (the same rule sealed about 90 seconds after the
-second, once final MLAT fixes can arrive, MLAT by its final fix only). A relay receives an area's
+fix), and `--world-precise` the precise one (the same rule sealed 108.5 seconds after the
+second, once final MLAT fixes have surely arrived, MLAT by its final fix only). A relay receives an area's
 positions by taking it, so a world relay takes every area: with either flag the `--area` cells
 must cover the globe (the 122 resolution 0 cells do), and a relay told otherwise refuses to start
 rather than sign part of the world as the whole. A client subscribes to each product separately.
@@ -170,8 +186,43 @@ relay plans memory for every member session its areas let other relays open, whi
 Connections in and out are capped overall (`--max-connections`), and those dialling in per
 address (`--max-connections-per-address`). `tally-relay --help` lists the rest.
 
+`--state-dir DIR` is where the relay keeps what a restart must know (RFC-0171 §3.6): each strike
+table's lease on the newest signed time it may have used, synced ahead of use, and on a graceful
+stop (SIGTERM) the fingerprints it holds. With it, a restarted relay forwards nothing it forwarded
+before, and a deploy is not deaf for a window. The systemd unit's `StateDirectory=tally-relay` sets
+it (`$STATE_DIRECTORY`); on Kubernetes, mount a small persistent volume (a few megabytes, one
+writer) and pass its path, and give the deployment the `Recreate` strategy: the relay holds an
+exclusive lock on the directory for its whole life and refuses to start while another process
+holds it, so a rolling update's second pod would never start. Never restore it from a backup: an old lease lets old records count as
+new. With no state directory, every table starts 40 s ahead of the clock (`J + S + K`) and uses
+nothing new for that long; possession still flows, so nobody is blamed. The relay judges by the
+host's clock as its time daemon keeps it, so run chrony or ntpd, not systemd-timesyncd: the
+relay judges by the kernel's error bound (`maxerror`), which chrony and ntpd set to their root
+distance and timesyncd sets to 0 at every adjustment, so under it the bound leaves out the
+server's own error and a relay could judge by a clock seconds off; nothing can tell that bound
+from chrony's, so this is a stated requirement and a known gap. The packaged unit is ordered after
+`chrony-wait.service`, which chrony's package provides, and `time-sync.target`, which holds the
+start back only while a wait service is enabled (under ntpd, `ntpsec-wait.service` or
+`systemd-time-wait-sync.service`). What holds either way is the kernel's word, read at every
+judgement, below.
+Until the host first reports its clock synced, and whenever the kernel's error bound on it
+(which grows from its last sync) is past 7.5 s, the relay holds what it is sent and uses none of
+it, and signs nothing. No relay refuses, drops or ends a link over a clock, synced or not: a
+batch signed too far off to use is held and passed on, and each relay judges its copy by its own
+clock; a kernel that will not say (a seccomp filter,
+`ProtectClock=`) stops the relay at start, naming why. Every state file in the directory (each
+lease, dump, table checkpoint and log) is sealed under the directory's key, `strike.key`: one
+torn, edited or of another key or build's layout is not trusted, and its table starts as if there
+were no state. Two files are not sealed: `strike.key` is the key itself, and a key file that is
+cut or changed is replaced by a fresh key, so every table starts as if there were no state; and
+`lock` holds nothing, only the lock the running relay takes on it.
+
 `tally-relay check ARGS...` refuses what a start with the same arguments would refuse, without
-starting (it reads no key file and opens no socket), and prints the relay's memory plan, one
+starting: a kernel that will not say how far off the clock is, and every argument (it reads no key
+file and opens no socket; of a state directory it only checks that it can be made and written, by
+an unnamed file that leaves nothing behind however the check ends, taking no lock and making no
+key, so it runs beside the live relay), and
+prints the relay's memory plan, one
 `name value` a line; a deploy's tests run it over the arguments it passes, so an argument the
 binary no longer takes fails there rather than at the next start.
 

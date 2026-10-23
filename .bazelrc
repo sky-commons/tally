@@ -4,3 +4,9 @@
 build:lint --aspects=@rules_rust//rust:defs.bzl%rust_clippy_aspect
 build:lint --output_groups=+clippy_checks
 build:lint --@rules_rust//rust/settings:clippy_flag=-Dwarnings
+# A unit-test binary run only through its per-module targets is tagged `manual` (it would run every
+# module at once), and `//...` skips manual targets, so without this its code (every crate's
+# `#[cfg(test)]` modules) is never linted. Bazel's stock flag builds them, never runs them.
+build:lint --build_manual_tests
+# The workspace's clippy.toml (its disallowed methods), as Cargo's clippy reads it.
+build:lint --@rules_rust//rust/settings:clippy.toml=//:clippy.toml

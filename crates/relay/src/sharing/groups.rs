@@ -13,10 +13,12 @@ use std::sync::RwLock;
 use tally_wire::{PublicKey, Region, Streams};
 
 use super::locks::{read, write};
+use super::member::{MonoDeadline, Now};
 
-/// How long a demoted member stays out of the trees.
+/// How long a demoted member stays out of the trees, by the relay's monotonic clock.
 pub const DEMOTION_MS: u64 = 10 * 60 * 1000;
-/// How long an ask (`StripeAssignment`) keeps its sender a member without an offer.
+/// How long an ask (`StripeAssignment`) keeps its sender a member without an offer, by the
+/// relay's monotonic clock.
 pub const ASK_LIFETIME_MS: u64 = 5 * 60 * 1000;
 
 /// One group: an area cell and one product.
@@ -50,8 +52,8 @@ impl PartialOrd for GroupKey {
 
 #[derive(Clone, Copy, Debug, Default)]
 struct Entry {
-    /// A member by asking until then (0: never asked, or lapsed).
-    asked_until_ms: u64,
+    /// A member by asking until then, by `M` (`None`: never asked, or lapsed).
+    asked_until: Option<MonoDeadline>,
     /// A leaf, as its ask said (a newcomer's only).
     asked_leaf: bool,
     /// A member by its verified offers, held now: `Some(leaf)`, a leaf when any of them forwards
@@ -65,15 +67,15 @@ impl Entry {
         self.offered.unwrap_or(self.asked_leaf)
     }
 
-    fn lapsed(&self, now_ms: u64) -> bool {
-        self.offered.is_none() && self.asked_until_ms <= now_ms
+    fn lapsed(&self, now: Now) -> bool {
+        self.offered.is_none() && self.asked_until.is_none_or(|until| until.passed(now))
     }
 }
 
 #[derive(Default)]
 struct Book {
     members: BTreeMap<PublicKey, Entry>,
-    demoted: BTreeMap<PublicKey, u64>,
+    demoted: BTreeMap<PublicKey, MonoDeadline>,
 }
 
 impl Book {
@@ -84,12 +86,22 @@ impl Book {
 
 /// The books of the groups some other relay is in. This relay is in every group of the areas it
 /// takes without an entry here (`Sharing` adds it to each tree it lays out): a group no other relay
-/// is in has no book, so holding the whole world costs nothing per area.
-#[derive(Default)]
+/// is in has no book, so holding the whole world costs nothing per area. Every ask and demotion
+/// lapses by the relay's monotonic clock ([`MonoDeadline`]): a step of its judging clock neither
+/// lapses a membership early nor stretches a demotion (RFC-0171 §3.6).
 pub struct Groups {
     books: RwLock<BTreeMap<GroupKey, Book>>,
     /// The soonest an ask lapses or a demotion ends: `expire` does nothing before it.
-    next_expiry_ms: RwLock<u64>,
+    next_expiry: RwLock<MonoDeadline>,
+}
+
+impl Default for Groups {
+    fn default() -> Self {
+        Self {
+            books: RwLock::default(),
+            next_expiry: RwLock::new(MonoDeadline::NEVER),
+        }
+    }
 }
 
 impl Groups {
@@ -97,12 +109,12 @@ impl Groups {
         Self::default()
     }
 
-    /// `member` asked for stripes: in the group until `until_ms` (or later, if it already was).
+    /// `member` asked for stripes: in the group until `until` (or later, if it already was).
     /// A member only by asking may send the group's records here and is sent its stripes'
     /// records, but it is in no tree ([`Groups::tree`]): a relay that has not verified its offer
     /// may not lay it out where every other relay does. `leaf_only` holds only for a newcomer;
     /// an ask never changes what a member's offers said.
-    pub fn admit(&self, group: GroupKey, member: PublicKey, until_ms: u64, leaf_only: bool) {
+    pub fn admit(&self, group: GroupKey, member: PublicKey, until: MonoDeadline, leaf_only: bool) {
         let mut books = write(&self.books);
         let entry = books
             .entry(group)
@@ -113,8 +125,8 @@ impl Groups {
                 asked_leaf: leaf_only,
                 ..Entry::default()
             });
-        entry.asked_until_ms = entry.asked_until_ms.max(until_ms);
-        self.expires_at(until_ms);
+        entry.asked_until = Some(entry.asked_until.map_or(until, |asked| asked.max(until)));
+        self.expires_at(until);
     }
 
     /// The members whose verified offers cover the group now, each a leaf when any of its offers
@@ -134,19 +146,19 @@ impl Groups {
             book.members.entry(*member).or_default().offered = Some(*leaf);
         }
         book.members
-            .retain(|_, entry| entry.offered.is_some() || entry.asked_until_ms > 0);
+            .retain(|_, entry| entry.offered.is_some() || entry.asked_until.is_some());
         if book.is_empty() {
             books.remove(&group);
         }
     }
 
-    /// Out of the group's trees until `until_ms`.
-    pub fn demote(&self, group: GroupKey, member: PublicKey, until_ms: u64) {
+    /// Out of the group's trees until `until`.
+    pub fn demote(&self, group: GroupKey, member: PublicKey, until: MonoDeadline) {
         let mut books = write(&self.books);
         let demoted = books.entry(group).or_default().demoted.entry(member);
-        let until = demoted.or_insert(until_ms);
-        *until = (*until).max(until_ms);
-        self.expires_at(until_ms);
+        let held = demoted.or_insert(until);
+        *held = (*held).max(until);
+        self.expires_at(until);
     }
 
     pub fn is_demoted(&self, group: GroupKey, member: &PublicKey) -> bool {
@@ -157,24 +169,25 @@ impl Groups {
 
     /// Forgets asks and demotions whose time is up, and groups left empty: nothing to do, and no
     /// scan, before the soonest is due. The groups whose trees changed (a demotion ended).
-    pub fn expire(&self, now_ms: u64) -> Vec<GroupKey> {
-        if *read(&self.next_expiry_ms) > now_ms {
+    pub fn expire(&self, now: impl Into<Now>) -> Vec<GroupKey> {
+        let now = now.into();
+        if !read(&self.next_expiry).passed(now) {
             return Vec::new();
         }
         let mut books = write(&self.books);
         let mut changed = Vec::new();
-        let mut next = u64::MAX;
+        let mut next = MonoDeadline::NEVER;
         for (key, book) in books.iter_mut() {
             for entry in book.members.values_mut() {
-                if entry.asked_until_ms <= now_ms {
-                    entry.asked_until_ms = 0;
-                } else {
-                    next = next.min(entry.asked_until_ms);
+                match entry.asked_until {
+                    Some(until) if until.passed(now) => entry.asked_until = None,
+                    Some(until) => next = next.min(until),
+                    None => {}
                 }
             }
-            book.members.retain(|_, entry| !entry.lapsed(now_ms));
+            book.members.retain(|_, entry| !entry.lapsed(now));
             let before = book.demoted.len();
-            book.demoted.retain(|_, until| *until > now_ms);
+            book.demoted.retain(|_, until| !until.passed(now));
             if book.demoted.len() != before {
                 changed.push(*key);
             }
@@ -184,13 +197,13 @@ impl Groups {
                 .fold(next, |next, until| next.min(*until));
         }
         books.retain(|_, book| !book.is_empty());
-        *write(&self.next_expiry_ms) = next;
+        *write(&self.next_expiry) = next;
         changed
     }
 
-    fn expires_at(&self, until_ms: u64) {
-        let mut next = write(&self.next_expiry_ms);
-        *next = (*next).min(until_ms);
+    fn expires_at(&self, until: MonoDeadline) {
+        let mut next = write(&self.next_expiry);
+        *next = (*next).min(until);
     }
 
     /// The members of a cell's product group, sorted by key, demoted members left out: who may

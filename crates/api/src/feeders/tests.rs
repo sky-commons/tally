@@ -1,7 +1,10 @@
 //! The API serves what the operator's relays signed, the newest of each receiver, and ranks it:
 //! nothing else counts, and the same records in any order give the same board.
 
+#![allow(clippy::disallowed_methods, reason = "a test's scripted readings")]
+
 use super::*;
+use tally_wire::clocks::recorded::judged;
 use tally_wire::{FeederFiguresContent, Identity, Location};
 
 /// An hour's start: figures are issued at one (`tally_wire::FIGURES_BUCKET_MS`).
@@ -98,7 +101,7 @@ pub(crate) fn records() -> Vec<FeederFigures> {
 pub(crate) fn ledger(records: &[FeederFigures]) -> Ledger {
     let mut ledger = Ledger::trusting([relay().public()]);
     for record in records {
-        ledger.ingest(record, T + H);
+        ledger.ingest(record, crate::mlat::Now::at(T + H, true));
     }
     ledger
 }
@@ -111,7 +114,7 @@ fn stats(board: &Board, seed: u8) -> FeederStats {
 
 #[test]
 fn each_figure_is_what_the_relay_signed() {
-    let board = ledger(&records()).board(T + H);
+    let board = ledger(&records()).board(judged(T + H));
     let a = stats(&board, 7);
     assert_eq!(
         (a.messages, a.aircraft, a.range_m, a.mlat_positions),
@@ -132,15 +135,15 @@ fn the_same_records_in_another_order_give_the_same_board() {
     let mut reversed = records();
     reversed.reverse();
     assert_eq!(
-        ledger(&records()).board(T + H),
-        ledger(&reversed).board(T + H)
+        ledger(&records()).board(judged(T + H)),
+        ledger(&reversed).board(judged(T + H))
     );
 }
 
 /// Only receivers the relay says have standing are ranked, by what only they add.
 #[test]
 fn only_feeders_with_standing_are_ranked() -> Result<(), String> {
-    let board = ledger(&records()).board(T + H);
+    let board = ledger(&records()).board(judged(T + H));
     let ranks = stats(&board, 7).ranks.ok_or("a unranked")?;
     assert_eq!((ranks.unique_coverage, ranks.mlat, ranks.of), (1, 1, 2));
     assert_eq!(
@@ -174,7 +177,7 @@ pub(crate) fn records_standing(a: bool, b: bool) -> Vec<FeederFigures> {
 /// of them unranked. C names no cell, so no area holds it.
 #[test]
 fn an_area_with_feeders_but_none_ranked_is_listed_with_its_receivers() -> Result<(), String> {
-    let board = ledger(&records_standing(false, false)).board(T + H);
+    let board = ledger(&records_standing(false, false)).board(judged(T + H));
     let named = stats(&board, 7).area.ok_or("no area")?;
     let listed = board.leaderboards();
     assert_eq!(listed.areas.len(), 1);
@@ -197,7 +200,7 @@ fn an_area_with_feeders_but_none_ranked_is_listed_with_its_receivers() -> Result
 /// `unranked` is exactly the area's feeders without standing: a ranked feeder is never in it.
 #[test]
 fn unranked_lists_exactly_the_feeders_without_standing() -> Result<(), String> {
-    let board = ledger(&records_standing(true, false)).board(T + H);
+    let board = ledger(&records_standing(true, false)).board(judged(T + H));
     let (a, b) = (stats(&board, 7), stats(&board, 8));
     let area = parse_area(a.area.as_deref().ok_or("no area")?).ok_or("not an area")?;
     let boards = board.leaderboard(&area).ok_or("no board")?;
@@ -208,7 +211,7 @@ fn unranked_lists_exactly_the_feeders_without_standing() -> Result<(), String> {
     }
     assert_eq!(boards.by_unique_coverage[0].key, a.key);
     // With standing for both, nobody is unranked.
-    let both = ledger(&records()).board(T + H);
+    let both = ledger(&records()).board(judged(T + H));
     let boards = both.leaderboard(&area).ok_or("no board")?;
     assert_eq!((boards.ranked, boards.receivers), (2, 2));
     assert!(boards.unranked.is_empty());
@@ -238,7 +241,7 @@ fn areas_are_listed_by_ranked_then_receivers() -> Result<(), String> {
     // Nobody ranked: A's and B's area holds two receivers, D's one.
     let mut unranked = records_standing(false, false);
     unranked.push(far(false));
-    let board = ledger(&unranked).board(T + H);
+    let board = ledger(&unranked).board(judged(T + H));
     let listed: Vec<(u32, u32)> = board
         .leaderboards()
         .areas
@@ -249,7 +252,7 @@ fn areas_are_listed_by_ranked_then_receivers() -> Result<(), String> {
     // D ranked: its area of one comes first.
     let mut d_ranked = records_standing(false, false);
     d_ranked.push(far(true));
-    let board = ledger(&d_ranked).board(T + H);
+    let board = ledger(&d_ranked).board(judged(T + H));
     let listed = board.leaderboards();
     assert_eq!(
         Some(listed.areas[0].area.clone()),
@@ -265,21 +268,59 @@ fn areas_are_listed_by_ranked_then_receivers() -> Result<(), String> {
 fn only_the_operators_relays_fresh_signed_figures_count() {
     let mut ledger = Ledger::trusting([relay().public()]);
     let stranger = signed(&identity(21), T, vec![figure(7, None)]);
-    ledger.ingest(&stranger, T);
+    ledger.ingest(&stranger, crate::mlat::Now::at(T, true));
     let ahead = signed(&relay(), T + H, vec![figure(7, None)]);
-    const { assert!(H > FRESH_WITHIN_MS) };
-    ledger.ingest(&ahead, T);
+    const {
+        assert!(
+            H > tally_wire::budget::K
+                .span::<tally_wire::clocks::Judged>()
+                .ms()
+        )
+    };
+    ledger.ingest(&ahead, crate::mlat::Now::at(T, true));
     let old = signed(&relay(), T - 2 * STALE_MS - H, vec![figure(7, None)]);
-    ledger.ingest(&old, T);
+    ledger.ingest(&old, crate::mlat::Now::at(T, true));
     let mut bytes = signed(&relay(), T, vec![figure(7, None)])
         .as_bytes()
         .to_vec();
     let last = bytes.len() - 1;
     bytes[last] ^= 1;
     if let Ok(forged) = FeederFigures::from_bytes(bytes) {
-        ledger.ingest(&forged, T);
+        ledger.ingest(&forged, crate::mlat::Now::at(T, true));
     }
-    assert_eq!(ledger.board(T).feeder(&identity(7).public()), None);
+    assert_eq!(ledger.board(judged(T)).feeder(&identity(7).public()), None);
+}
+
+/// A figure is judged ahead by the error budget's one tolerance between two judging clocks
+/// (`tally_wire::budget::K`): one issued `K` ahead of the API's clock is taken, one a
+/// millisecond further is not. Before, a bound of the API's own (120 s) took records a relay's
+/// clock could never have issued.
+#[test]
+fn a_figure_is_judged_ahead_by_the_budget() {
+    let k = tally_wire::budget::K
+        .span::<tally_wire::clocks::Judged>()
+        .ms();
+    let mut ledger = Ledger::trusting([relay().public()]);
+    // Issued as of an hour's start (`H`), read by an API clock just before it.
+    let issued = T + H;
+    ledger.ingest(
+        &signed(&relay(), issued, vec![figure(7, None)]),
+        crate::mlat::Now::at(issued - k - 1, true),
+    );
+    assert_eq!(
+        ledger.board(judged(issued)).feeder(&identity(7).public()),
+        None
+    );
+    ledger.ingest(
+        &signed(&relay(), issued, vec![figure(7, None)]),
+        crate::mlat::Now::at(issued - k, true),
+    );
+    assert!(
+        ledger
+            .board(judged(issued))
+            .feeder(&identity(7).public())
+            .is_some()
+    );
 }
 
 /// The newest record of a receiver stands, from whichever of the operator's relays signed it; at
@@ -292,20 +333,35 @@ fn a_receivers_newest_figure_stands() {
         messages,
         ..figure(7, None)
     };
-    ledger.ingest(&signed(&one, T + H, vec![with(5)]), T + H);
-    ledger.ingest(&signed(&two, T, vec![with(9)]), T + H);
-    assert_eq!(stats(&ledger.board(T + H), 7).messages, 5);
-    ledger.ingest(&signed(&two, T + 2 * H, vec![with(9)]), T + 2 * H);
-    assert_eq!(stats(&ledger.board(T + 2 * H), 7).messages, 9);
+    ledger.ingest(
+        &signed(&one, T + H, vec![with(5)]),
+        crate::mlat::Now::at(T + H, true),
+    );
+    ledger.ingest(
+        &signed(&two, T, vec![with(9)]),
+        crate::mlat::Now::at(T + H, true),
+    );
+    assert_eq!(stats(&ledger.board(judged(T + H)), 7).messages, 5);
+    ledger.ingest(
+        &signed(&two, T + 2 * H, vec![with(9)]),
+        crate::mlat::Now::at(T + 2 * H, true),
+    );
+    assert_eq!(stats(&ledger.board(judged(T + 2 * H)), 7).messages, 9);
     let lesser = if one.public().as_bytes() < two.public().as_bytes() {
         &one
     } else {
         &two
     };
     let expect = if std::ptr::eq(lesser, &one) { 3 } else { 4 };
-    ledger.ingest(&signed(&one, T + 3 * H, vec![with(3)]), T + 3 * H);
-    ledger.ingest(&signed(&two, T + 3 * H, vec![with(4)]), T + 3 * H);
-    assert_eq!(stats(&ledger.board(T + 3 * H), 7).messages, expect);
+    ledger.ingest(
+        &signed(&one, T + 3 * H, vec![with(3)]),
+        crate::mlat::Now::at(T + 3 * H, true),
+    );
+    ledger.ingest(
+        &signed(&two, T + 3 * H, vec![with(4)]),
+        crate::mlat::Now::at(T + 3 * H, true),
+    );
+    assert_eq!(stats(&ledger.board(judged(T + 3 * H)), 7).messages, expect);
 }
 
 #[test]
@@ -313,13 +369,13 @@ fn a_figure_not_reissued_is_forgotten() {
     let mut ledger = ledger(&records());
     assert!(
         ledger
-            .board(T + H + STALE_MS)
+            .board(judged(T + H + STALE_MS))
             .feeder(&identity(7).public())
             .is_some()
     );
     assert_eq!(
         ledger
-            .board(T + H + 1 + STALE_MS)
+            .board(judged(T + H + 1 + STALE_MS))
             .feeder(&identity(7).public()),
         None
     );

@@ -36,25 +36,29 @@
 //! - **Credit is a rate, earned 1:1.** A relay earns back what its evidence shows it gives the
 //!   network: [`FEEDER_CREDIT`] per feeder it hosts, and each receipt's delivered bytes a second.
 //!   Each item decays with the age of its own signature (halving every [`HALF_LIFE_MS`], nothing
-//!   past [`MAX_EVIDENCE_AGE_MS`]).
+//!   past `tally_wire::budget::EVIDENCE_AGE`).
 //! - **Credit is split** across every session linked to the relay here: a hundred clients, or one
 //!   credential shared by a hundred processes, divide it a hundred ways.
 //! - **A relay's own clients** (a credential signed by this relay's own key) are served as they
 //!   ask, within the credential's products: the operator spends its own cap.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::hash::Hash as StdHash;
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
+use tally_wire::Signs;
 use tally_wire::batch::Hash;
+use tally_wire::budget::RECEIPT_AHEAD;
+use tally_wire::clocks::Judged;
 use tally_wire::record::MAX_REGIONS;
 use tally_wire::rendezvous::AREA_RESOLUTION;
 use tally_wire::{
     Evidence, EvidenceBundle, FeederReference, FirehoseCredential, FirehoseCredentialContent,
-    Identity, PublicKey, ReceiverInfo, ReferencedEvidenceContent, Region, Streams, StripeReceipt,
-    WireError,
+    PublicKey, ReceiverInfo, ReferencedEvidenceContent, Region, Streams, StripeReceipt, WireError,
 };
 
+use crate::budget::{Charge, Gauge, Store};
+use crate::footprint;
 use crate::ingest::RecordPace;
 use crate::network::{Asker, AskerRole};
 use crate::sharing::seeded_bytes;
@@ -63,14 +67,8 @@ use crate::subscription::Subscription;
 /// How long a credential this relay signs lives: a client re-asks every quarter hour, so a leaked
 /// credential is worth a quarter hour at most.
 pub const CREDENTIAL_LIFETIME_MS: u64 = 15 * 60 * 1000;
-/// How far ahead of this relay's clock a signed time may be: clocks disagree a little, never by
-/// more than a minute on a host that keeps time.
-pub const MAX_SKEW_MS: u64 = 60 * 1000;
 /// How fast evidence fades: a relay that stops contributing loses half its credit each half hour.
 pub const HALF_LIFE_MS: u64 = 30 * 60 * 1000;
-/// Evidence older than this counts nothing: a feeder re-signs its description every ten minutes,
-/// so six hours is many missed renewals.
-pub const MAX_EVIDENCE_AGE_MS: u64 = 6 * 60 * 60 * 1000;
 /// How long a first-hand corroboration (a receiver whose receptions agreed, a relay this one dealt
 /// with) stands without being renewed.
 pub const CORROBORATION_LIFETIME_MS: u64 = 24 * 60 * 60 * 1000;
@@ -274,12 +272,14 @@ pub fn narrow(asked: &Subscription, allowance: &Allowance) -> Subscription {
     Subscription { streams, regions }
 }
 
-/// `value` as it stands `age_ms` after it was signed: halved each [`HALF_LIFE_MS`] (straight
-/// between halvings), nothing past [`MAX_EVIDENCE_AGE_MS`].
-pub fn decayed(value: u64, age_ms: u64) -> u64 {
-    if age_ms > MAX_EVIDENCE_AGE_MS {
+/// `value` signed at `signed_ms` as it stands by the judging clock `now`: halved each
+/// [`HALF_LIFE_MS`] of its age (straight between halvings), nothing once older than the budget's
+/// `EVIDENCE_AGE`.
+pub fn decayed(value: u64, signed_ms: u64, now: Judged) -> u64 {
+    if tally_wire::budget::EVIDENCE_AGE.older(signed_ms, now) {
         return 0;
     }
+    let age_ms = now.ms().saturating_sub(signed_ms);
     let halvings = age_ms / HALF_LIFE_MS;
     let into = age_ms % HALF_LIFE_MS;
     let whole = value
@@ -393,74 +393,276 @@ const MAX_CORROBORATED_RELAYS: usize = 8_192;
 /// The most feeders' descriptions held to resolve references by: one each, as many as the
 /// receivers a relay remembers.
 const MAX_COPIES: usize = 65_536;
+/// The most clients this relay vouches for (its operator's list, `--vouch`): past it the rest are
+/// not taken.
+const MAX_VOUCHED: usize = 1_024;
+/// What client sessions asked for, at most, and the most served on the free tier: one per client
+/// session, which ends with it (`Credit::left`), as many as may be linked.
+const ASKED_REMEMBERED: usize = MAX_LINKED;
+/// The most a held description's signed bytes take: its fixed fields, its signature and key, a
+/// software name of 255 bytes and the most relays a held description names
+/// (`tally_wire::credit::MAX_DESCRIBED_RELAYS`); a test holds the largest one to it.
+const DESCRIPTION_MOST: usize = 1_024;
+/// The most a receipt's signed bytes take; a test holds one to it.
+const RECEIPT_MOST: usize = 256;
 
-#[derive(Default)]
+/// What every table here allocates at most at its caps ([`Credit`], charged to the budget's
+/// `Store::Credit`, a part of what the relay holds before any feeder): each table at its cap and
+/// one more (a table is trimmed once past its cap, `Gauged::trim`), never shrunk, so its buckets
+/// are those [`footprint::table_planned`] plans; and what each entry holds beside its table, at
+/// the most it may hold (a description, a receipt, a copy's relays, a bundle's feeders and slices,
+/// a session's two subscriptions).
+pub const PLANNED_BYTES: usize = {
+    use tally_wire::footprint::{table_planned, vec};
+    let described = table_planned::<PublicKey, (ReceiverInfo, u64)>(OWN_EVIDENCE + 1)
+        + (OWN_EVIDENCE + 1) * DESCRIPTION_MOST;
+    let copies = table_planned::<PublicKey, HeldCopy>(MAX_COPIES + 1)
+        + (MAX_COPIES + 1) * vec::<PublicKey>(tally_wire::credit::MAX_DESCRIBED_RELAYS);
+    let receipts =
+        table_planned::<(PublicKey, u64, u16, u8), (StripeReceipt, u64)>(OWN_EVIDENCE + 1)
+            + (OWN_EVIDENCE + 1) * RECEIPT_MOST;
+    let vouched = table_planned::<PublicKey, ()>(MAX_VOUCHED);
+    let shown = table_planned::<PublicKey, Shown>(MAX_RELAYS_SHOWN + 1)
+        + (MAX_RELAYS_SHOWN + 1)
+            * (vec::<ShownFeeder>(tally_wire::credit::MAX_EVIDENCE)
+                + vec::<Slice>(tally_wire::credit::MAX_EVIDENCE));
+    let corroborated = table_planned::<PublicKey, u64>(MAX_CORROBORATED_RECEIVERS + 1)
+        + table_planned::<PublicKey, u64>(MAX_CORROBORATED_RELAYS + 1);
+    let sessions = table_planned::<u64, Linked>(MAX_LINKED)
+        + table_planned::<u64, ()>(ASKED_REMEMBERED)
+        + table_planned::<u64, (Subscription, Subscription)>(ASKED_REMEMBERED + 1)
+        + (ASKED_REMEMBERED + 1) * 2 * vec::<Region>(MAX_REGIONS);
+    described + copies + receipts + vouched + shown + corroborated + sessions
+};
+
+/// A table of the credit's, charged as it allocates ([`PLANNED_BYTES`]): its buckets, followed
+/// as it grows (`footprint::Table`), and what its entries hold beside them (`heap`, each entry's
+/// by `heap_of`). An entry goes in only once what it adds is charged, so a table past what its
+/// store has room for takes nothing more.
+struct Gauged<K, V> {
+    map: HashMap<K, V>,
+    table: footprint::Table,
+    heap: usize,
+    heap_of: fn(&V) -> usize,
+}
+
+impl<K, V> std::ops::Deref for Gauged<K, V> {
+    type Target = HashMap<K, V>;
+
+    fn deref(&self) -> &HashMap<K, V> {
+        &self.map
+    }
+}
+
+impl<K: Copy + Eq + StdHash, V> Gauged<K, V> {
+    fn new(heap_of: fn(&V) -> usize) -> Self {
+        Self {
+            map: HashMap::new(),
+            table: footprint::Table::default(),
+            heap: 0,
+            heap_of,
+        }
+    }
+
+    /// What it allocates.
+    fn bytes(&self) -> usize {
+        self.table.bytes::<K, V>() + self.heap
+    }
+
+    /// `value` in at `key`, once what it adds (a table it grows into, what it holds more than the
+    /// one it replaces) is charged to `charge`: false, and nothing changed, when it is not.
+    fn insert(&mut self, charge: &mut Charge, key: K, value: V) -> bool {
+        let old = self.map.get(&key).map_or(0, self.heap_of);
+        let new = (self.heap_of)(&value);
+        let growth = if self.map.contains_key(&key) {
+            0
+        } else {
+            self.table
+                .growth::<K, V>(self.map.len(), self.map.capacity())
+        };
+        let more = (growth + new).saturating_sub(old);
+        if more > 0 && !charge.try_grow(more) {
+            return false;
+        }
+        self.map.insert(key, value);
+        self.table.inserted(self.map.capacity());
+        self.heap = self.heap + new - old;
+        true
+    }
+
+    fn remove(&mut self, key: &K) -> Option<V> {
+        let removed = self.map.remove(key);
+        if let Some(value) = &removed {
+            self.heap -= (self.heap_of)(value);
+        }
+        removed
+    }
+
+    fn retain(&mut self, mut keep: impl FnMut(&K, &V) -> bool) {
+        let heap_of = self.heap_of;
+        let mut freed = 0;
+        self.map.retain(|key, value| {
+            let kept = keep(key, value);
+            if !kept {
+                freed += heap_of(value);
+            }
+            kept
+        });
+        self.heap -= freed;
+    }
+
+    /// Kept at most `cap` long: past it, the oldest quarter by `time` goes (amortised, so a flood
+    /// costs a sort per quarter of the cap, not per insert).
+    fn trim(&mut self, cap: usize, time: impl Fn(&V) -> u64) {
+        if self.map.len() <= cap {
+            return;
+        }
+        let mut ages: Vec<(u64, K)> = self
+            .map
+            .iter()
+            .map(|(key, value)| (time(value), *key))
+            .collect();
+        ages.sort_unstable_by_key(|(time, _)| *time);
+        let excess = self.map.len() - cap * 3 / 4;
+        for (_, key) in ages.into_iter().take(excess) {
+            self.remove(&key);
+        }
+    }
+}
+
+fn nothing<V>(_: &V) -> usize {
+    0
+}
+
 struct State {
     /// The keys this relay signs with (it may hold several during a rotation).
     own: Vec<PublicKey>,
     /// The upload cap, once told: before it, nothing is rationed.
     upload_cap: Option<u64>,
     /// Feeders' descriptions naming this relay, newest per feeder: its own evidence.
-    described: HashMap<PublicKey, (ReceiverInfo, u64)>,
+    described: Gauged<PublicKey, (ReceiverInfo, u64)>,
     /// Every feeder's newest description the relay holds, as a reference resolves against it.
-    copies: HashMap<PublicKey, HeldCopy>,
+    copies: Gauged<PublicKey, HeldCopy>,
     /// Children's receipts, newest per (child, cell, product, stripe).
-    receipts: HashMap<(PublicKey, u64, u16, u8), (StripeReceipt, u64)>,
+    receipts: Gauged<(PublicKey, u64, u16, u8), (StripeReceipt, u64)>,
     /// The clients this relay vouches for (its operator's).
-    vouched: HashSet<PublicKey>,
+    vouched: Gauged<PublicKey, ()>,
     /// What each relay's evidence shows.
-    shown: HashMap<PublicKey, Shown>,
-    corroborated_receivers: HashMap<PublicKey, u64>,
-    corroborated_relays: HashMap<PublicKey, u64>,
+    shown: Gauged<PublicKey, Shown>,
+    corroborated_receivers: Gauged<PublicKey, Judged>,
+    corroborated_relays: Gauged<PublicKey, Judged>,
     /// Sessions linked by a credential, by the hub's connection id.
-    linked: HashMap<u64, Linked>,
+    linked: Gauged<u64, Linked>,
     /// Sessions served on the free tier now.
-    free: HashSet<u64>,
+    free: Gauged<u64, ()>,
     /// What each client session last asked for, so it is admitted again as its credit changes.
-    asked: HashMap<u64, (Subscription, Subscription)>,
+    asked: Gauged<u64, (Subscription, Subscription)>,
+    /// What every table allocates, charged to the budget's `Store::Credit` (`Credit::charge_to`).
+    charge: Charge,
+    /// What was let go because the store had no room for it.
+    full: u64,
 }
 
-/// What client sessions asked for, at most: one per linked or free session, and then some.
-const ASKED_REMEMBERED: usize = 65_536;
-
-fn trim_asked(asked: &mut HashMap<u64, (Subscription, Subscription)>) {
-    if asked.len() > ASKED_REMEMBERED {
-        // Connection ids grow: the oldest sessions are the lowest.
-        let mut sources: Vec<u64> = asked.keys().copied().collect();
-        sources.sort_unstable();
-        for source in sources.into_iter().take(ASKED_REMEMBERED / 4) {
-            asked.remove(&source);
+impl State {
+    fn new(gauge: &Arc<Gauge>) -> Self {
+        Self {
+            own: Vec::new(),
+            upload_cap: None,
+            described: Gauged::new(|(info, _)| info.allocated()),
+            copies: Gauged::new(|copy| footprint::vec::<PublicKey>(copy.relays.capacity())),
+            receipts: Gauged::new(|(receipt, _)| receipt.allocated()),
+            vouched: Gauged::new(nothing),
+            shown: Gauged::new(|shown| {
+                footprint::vec::<ShownFeeder>(shown.feeders.capacity())
+                    + footprint::vec::<Slice>(shown.slices.capacity())
+            }),
+            corroborated_receivers: Gauged::new(nothing),
+            corroborated_relays: Gauged::new(nothing),
+            linked: Gauged::new(nothing),
+            free: Gauged::new(nothing),
+            asked: Gauged::new(|(asked, served)| {
+                footprint::vec::<Region>(asked.regions.capacity())
+                    + footprint::vec::<Region>(served.regions.capacity())
+            }),
+            charge: gauge.empty(),
+            full: 0,
         }
     }
-}
 
-/// Keeps a map at most `cap` long: past it, the oldest quarter by `time` goes (amortised, so a
-/// flood costs a sort per quarter of the cap, not per insert).
-fn trim<K: Copy + Eq + StdHash, V>(map: &mut HashMap<K, V>, cap: usize, time: impl Fn(&V) -> u64) {
-    if map.len() <= cap {
-        return;
+    /// What every table allocates now.
+    fn bytes(&self) -> usize {
+        self.described.bytes()
+            + self.copies.bytes()
+            + self.receipts.bytes()
+            + self.vouched.bytes()
+            + self.shown.bytes()
+            + self.corroborated_receivers.bytes()
+            + self.corroborated_relays.bytes()
+            + self.linked.bytes()
+            + self.free.bytes()
+            + self.asked.bytes()
     }
-    let mut ages: Vec<(u64, K)> = map.iter().map(|(key, value)| (time(value), *key)).collect();
-    ages.sort_unstable_by_key(|(time, _)| *time);
-    let excess = map.len() - cap * 3 / 4;
-    for (_, key) in ages.into_iter().take(excess) {
-        map.remove(&key);
+
+    /// The charge brought down to what the tables allocate, after entries went or growth charged
+    /// for was less than charged.
+    fn settle(&mut self) {
+        let bytes = self.bytes();
+        self.charge.shrink_to(bytes);
+    }
+
+    /// Counts what was let go, the store full: false always, for the caller to return.
+    fn let_go(&mut self) -> bool {
+        self.full += 1;
+        false
     }
 }
 
-fn corroborated(map: &HashMap<PublicKey, u64>, key: &PublicKey, now_ms: u64) -> bool {
-    map.get(key)
-        .is_some_and(|seen| now_ms.saturating_sub(*seen) <= CORROBORATION_LIFETIME_MS)
+fn corroborated(map: &HashMap<PublicKey, Judged>, key: &PublicKey, now: Judged) -> bool {
+    map.get(key).is_some_and(|seen| {
+        now.since(*seen) <= tally_wire::budget::policy::<_, CORROBORATION_LIFETIME_MS>()
+    })
 }
 
-#[derive(Default)]
+/// The credit's state, its tables charged to a store of their own ([`PLANNED_BYTES`]).
 pub struct Credit {
     state: Mutex<State>,
 }
 
+impl Default for Credit {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Credit {
+    /// Its tables charged to a store of no bound until the relay's is given (`charge_to`).
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            state: Mutex::new(State::new(&Gauge::unlimited(Store::Credit))),
+        }
+    }
+
+    /// Its tables are charged to `gauge` (the budget's `Store::Credit`) from now on, what they
+    /// hold now moved to it: past its limit, what would grow them is let go, counted
+    /// ([`Credit::full`]).
+    pub fn charge_to(&self, gauge: &Arc<Gauge>) {
+        let mut state = self.state();
+        let bytes = state.bytes();
+        // What it was charged before given back first, so a budget charged again holds it once.
+        state.charge = gauge.empty();
+        let mut charge = gauge.empty();
+        let _ = charge.try_grow(bytes);
+        state.charge = charge;
+    }
+
+    /// What it let go because its store had no room: an entry not taken into a table.
+    pub fn full(&self) -> u64 {
+        self.state().full
+    }
+
+    /// What its tables allocate now, as charged.
+    pub fn charged(&self) -> usize {
+        self.state().charge.bytes()
     }
 
     fn state(&self) -> MutexGuard<'_, State> {
@@ -488,43 +690,54 @@ impl Credit {
 
     /// A receiver this relay corroborated first-hand (its receptions agreed with verified fixes
     /// that cite it): only such a receiver earns any relay credit here.
-    pub fn corroborate_receiver(&self, receiver: PublicKey, now_ms: u64) {
+    pub fn corroborate_receiver(&self, receiver: PublicKey, now: Judged) {
         let mut state = self.state();
-        state.corroborated_receivers.insert(receiver, now_ms);
-        trim(
-            &mut state.corroborated_receivers,
-            MAX_CORROBORATED_RECEIVERS,
-            |seen| *seen,
-        );
+        let state = &mut *state;
+        if !state
+            .corroborated_receivers
+            .insert(&mut state.charge, receiver, now)
+        {
+            state.let_go();
+        }
+        state
+            .corroborated_receivers
+            .trim(MAX_CORROBORATED_RECEIVERS, |seen| seen.ms());
+        state.settle();
     }
 
     /// Whether `receiver` stands corroborated here at `now_ms` (`corroborate_receiver`, not yet
     /// lapsed): the receivers the ingest rate (`shed`) gives a share of their own, where every
     /// other is held to its network group's.
-    pub fn corroborated_receiver(&self, receiver: &PublicKey, now_ms: u64) -> bool {
-        corroborated(&self.state().corroborated_receivers, receiver, now_ms)
+    pub fn corroborated_receiver(&self, receiver: &PublicKey, now: Judged) -> bool {
+        corroborated(&self.state().corroborated_receivers, receiver, now)
     }
 
     /// A relay this relay corroborated first-hand (a sharing peer it dealt with): only such a
     /// relay's receipts earn the relay it signed them for any credit here.
-    pub fn corroborate_relay(&self, relay: PublicKey, now_ms: u64) {
+    pub fn corroborate_relay(&self, relay: PublicKey, now: Judged) {
         let mut state = self.state();
-        state.corroborated_relays.insert(relay, now_ms);
-        trim(
-            &mut state.corroborated_relays,
-            MAX_CORROBORATED_RELAYS,
-            |seen| *seen,
-        );
+        let state = &mut *state;
+        if !state
+            .corroborated_relays
+            .insert(&mut state.charge, relay, now)
+        {
+            state.let_go();
+        }
+        state
+            .corroborated_relays
+            .trim(MAX_CORROBORATED_RELAYS, |seen| seen.ms());
+        state.settle();
     }
 
     /// Signs a credential for `client`.
     pub fn issue(
         &self,
-        identity: &Identity,
+        identity: &impl Signs,
         client: PublicKey,
         products: Streams,
-        now_ms: u64,
+        now: Judged,
     ) -> Result<FirehoseCredential, WireError> {
+        let now_ms = now.ms();
         self.adopt_identity(identity.public());
         FirehoseCredential::sign(
             identity,
@@ -532,20 +745,32 @@ impl Credit {
                 client,
                 products,
                 issued_ms: now_ms,
-                expires_ms: now_ms + CREDENTIAL_LIFETIME_MS,
+                expires_ms: now
+                    .later(tally_wire::budget::policy::<_, CREDENTIAL_LIFETIME_MS>())
+                    .ms(),
             },
         )
     }
 
     /// The clients this relay vouches for (its operator's): each is signed a credential on its
     /// sessions here ([`Credit::vouch`]), and served here as the credential says.
+    /// At most [`MAX_VOUCHED`] of them.
     pub fn vouch_for(&self, clients: impl IntoIterator<Item = PublicKey>) {
-        self.state().vouched.extend(clients);
+        let mut state = self.state();
+        let state = &mut *state;
+        for client in clients {
+            if state.vouched.len() >= MAX_VOUCHED
+                || !state.vouched.insert(&mut state.charge, client, ())
+            {
+                state.let_go();
+            }
+        }
+        state.settle();
     }
 
     /// Whether this relay vouches for `client`.
     pub fn vouches_for(&self, client: &PublicKey) -> bool {
-        self.state().vouched.contains(client)
+        self.state().vouched.contains_key(client)
     }
 
     /// For a session of a client this relay vouches for: a fresh credential bound to the key its
@@ -553,18 +778,16 @@ impl Credit {
     /// linked here by it. `None` for any other session, or when nothing could be signed.
     pub fn vouch(
         &self,
-        identity: &Identity,
+        identity: &impl Signs,
         asker: &Asker,
-        now_ms: u64,
+        now: Judged,
     ) -> Option<(FirehoseCredential, EvidenceBundle)> {
         if asker.role != AskerRole::Client || !self.vouches_for(&asker.key) {
             return None;
         }
-        let credential = self
-            .issue(identity, asker.key, KNOWN_PRODUCTS, now_ms)
-            .ok()?;
-        let evidence = self.bundle(identity, now_ms).ok()?;
-        self.link(asker, &credential, now_ms).ok()?;
+        let credential = self.issue(identity, asker.key, KNOWN_PRODUCTS, now).ok()?;
+        let evidence = self.bundle(identity, now).ok()?;
+        self.link(asker, &credential, now).ok()?;
         Some((credential, evidence))
     }
 
@@ -574,43 +797,59 @@ impl Credit {
     /// over, as before references: every description the relay holds passes here, and a check of
     /// each would cost a signature per description a second time.
     ///
-    /// One dated further ahead of `now_ms` than any clock skew is refused: it would stand as the
-    /// newest for as long as its date is ahead.
-    pub fn described(&self, info: ReceiverInfo, now_ms: u64) {
+    /// One dated further ahead of `now` than any clock skew is refused: it would stand as the
+    /// newest for as long as its date is ahead. While the clock does not judge (`strikes::Now`),
+    /// none is held: whether its date is ahead cannot be told, and its feeder signs it again.
+    pub fn described(&self, info: ReceiverInfo, now: crate::strikes::Now) {
+        if !now.judges() {
+            return;
+        }
+        let now = now.judged();
         let (Ok(feeder), Ok(described)) = (info.receiver(), info.description()) else {
             return;
         };
         let (issued_ms, relays) = said(&described);
-        if ahead(issued_ms, now_ms) {
+        // No feeder names more relays than it may publish to: one that does is no feeder's.
+        if RECEIPT_AHEAD.ahead(issued_ms, now)
+            || relays.len() > tally_wire::credit::MAX_DESCRIBED_RELAYS
+        {
             return;
         }
         let mut state = self.state();
+        let state = &mut *state;
         let newer = state
             .copies
             .get(&feeder)
             .is_none_or(|held| held.issued_ms < issued_ms);
         if newer {
-            state.copies.insert(
-                feeder,
-                HeldCopy {
-                    issued_ms,
-                    description: tally_wire::credit::description_hash(&info),
-                    relays: relays.to_vec(),
-                },
-            );
-            trim(&mut state.copies, MAX_COPIES, |held| held.issued_ms);
+            let copy = HeldCopy {
+                issued_ms,
+                description: tally_wire::credit::description_hash(&info),
+                relays: relays.to_vec(),
+            };
+            if !state.copies.insert(&mut state.charge, feeder, copy) {
+                state.let_go();
+            }
+            state.copies.trim(MAX_COPIES, |held| held.issued_ms);
         }
-        if !relays.iter().any(|relay| state.own.contains(relay)) || info.verify().is_err() {
-            return;
+        if relays.iter().any(|relay| state.own.contains(relay)) && info.verify().is_ok() {
+            let newer = state
+                .described
+                .get(&feeder)
+                .is_none_or(|(_, issued)| *issued < issued_ms);
+            if newer && info.as_bytes().len() <= DESCRIPTION_MOST {
+                // Held exact (a clone allocates its bytes and no more), so it is charged what it
+                // holds.
+                if !state
+                    .described
+                    .insert(&mut state.charge, feeder, (info.clone(), issued_ms))
+                {
+                    state.let_go();
+                }
+                state.described.trim(OWN_EVIDENCE, |(_, issued)| *issued);
+            }
         }
-        let newer = state
-            .described
-            .get(&feeder)
-            .is_none_or(|(_, issued)| *issued < issued_ms);
-        if newer {
-            state.described.insert(feeder, (info, issued_ms));
-            trim(&mut state.described, OWN_EVIDENCE, |(_, issued)| *issued);
-        }
+        state.settle();
     }
 
     /// This relay's evidence, bundled: the newest of each kind that names it, at most
@@ -620,11 +859,13 @@ impl Credit {
     /// Feeders are named by reference (`EvidenceBundle::sign_referenced`: key, issued time, hash
     /// of the description), never carried: a bundle reaches clients, and an old feeder's
     /// description carries its site. A judging relay resolves each against its own copy.
-    pub fn bundle(&self, identity: &Identity, now_ms: u64) -> Result<EvidenceBundle, WireError> {
+    pub fn bundle(&self, identity: &impl Signs, now: Judged) -> Result<EvidenceBundle, WireError> {
+        let now_ms = now.ms();
         let own = identity.public();
         self.adopt_identity(own);
         let fresh = |issued: u64| {
-            !ahead(issued, now_ms) && now_ms.saturating_sub(issued) <= MAX_EVIDENCE_AGE_MS
+            !RECEIPT_AHEAD.ahead(issued, now)
+                && !tally_wire::budget::EVIDENCE_AGE.older(issued, now)
         };
         let (mut feeders, mut receipts) = {
             let state = self.state();
@@ -681,15 +922,21 @@ impl Credit {
 
     /// A child's receipt for a slice this relay delivered: evidence. Only a receipt naming this
     /// relay as the one that delivered is kept; members' reports of shortfalls by others are
-    /// sharing's, never this relay's evidence. One dated further ahead of `now_ms` than any clock
-    /// skew is refused.
-    pub fn record_receipt(&self, receipt: StripeReceipt, now_ms: u64) {
+    /// sharing's, never this relay's evidence. One dated further ahead of `now` than any clock
+    /// skew is refused, and none is kept while the clock does not judge (`strikes::Now`).
+    pub fn record_receipt(&self, receipt: StripeReceipt, now: crate::strikes::Now) {
+        if !now.judges() {
+            return;
+        }
+        let now = now.judged();
         let (Ok(()), Ok(child), Ok(content)) =
             (receipt.verify(), receipt.signer(), receipt.content())
         else {
             return;
         };
-        if !self.state().own.contains(&content.parent) || ahead(content.issued_ms, now_ms) {
+        if !self.state().own.contains(&content.parent)
+            || RECEIPT_AHEAD.ahead(content.issued_ms, now)
+        {
             return;
         }
         let key = (
@@ -699,19 +946,27 @@ impl Credit {
             content.stripe,
         );
         let mut state = self.state();
+        let state = &mut *state;
         let newer = state
             .receipts
             .get(&key)
             .is_none_or(|(_, issued)| *issued < content.issued_ms);
-        if newer {
-            state.receipts.insert(key, (receipt, content.issued_ms));
-            trim(&mut state.receipts, OWN_EVIDENCE, |(_, issued)| *issued);
+        if newer && receipt.as_bytes().len() <= RECEIPT_MOST {
+            // Held exact, as a description is.
+            if !state
+                .receipts
+                .insert(&mut state.charge, key, (receipt.clone(), content.issued_ms))
+            {
+                state.let_go();
+            }
+            state.receipts.trim(OWN_EVIDENCE, |(_, issued)| *issued);
         }
+        state.settle();
     }
 
     /// A credential a client presented on its session.
-    pub fn presented(&self, asker: &Asker, credential: FirehoseCredential, now_ms: u64) {
-        let _ = self.link(asker, &credential, now_ms);
+    pub fn presented(&self, asker: &Asker, credential: FirehoseCredential, now: Judged) {
+        let _ = self.link(asker, &credential, now);
     }
 
     /// Checks a credential and, if it holds, links the session to the relay that signed it.
@@ -719,7 +974,7 @@ impl Credit {
         &self,
         asker: &Asker,
         credential: &FirehoseCredential,
-        now_ms: u64,
+        now: Judged,
     ) -> Result<(), Refused> {
         if asker.role != AskerRole::Client {
             return Err(Refused::NotAClient);
@@ -731,29 +986,37 @@ impl Credit {
         if content.client != asker.key {
             return Err(Refused::OtherKey);
         }
-        if now_ms >= content.expires_ms {
+        if tally_wire::budget::expired(content.expires_ms, now) {
             return Err(Refused::Expired);
         }
-        if ahead(content.issued_ms, now_ms) {
+        if RECEIPT_AHEAD.ahead(content.issued_ms, now) {
             return Err(Refused::Future);
         }
         let mut state = self.state();
+        let state = &mut *state;
         if !state.linked.contains_key(&asker.source) && state.linked.len() >= MAX_LINKED {
-            state.linked.retain(|_, link| link.expires_ms > now_ms);
+            state
+                .linked
+                .retain(|_, link| !tally_wire::budget::expired(link.expires_ms, now));
+            state.settle();
             if state.linked.len() >= MAX_LINKED {
                 return Err(Refused::Full);
             }
         }
-        state.linked.insert(
-            asker.source,
-            Linked {
-                client: content.client,
-                relay,
-                products: content.products,
-                expires_ms: content.expires_ms,
-            },
-        );
-        Ok(())
+        let linked = Linked {
+            client: content.client,
+            relay,
+            products: content.products,
+            expires_ms: content.expires_ms,
+        };
+        let taken = state.linked.insert(&mut state.charge, asker.source, linked);
+        state.settle();
+        if taken {
+            Ok(())
+        } else {
+            state.let_go();
+            Err(Refused::Full)
+        }
     }
 
     /// The evidence behind a credential a client presented.
@@ -762,10 +1025,10 @@ impl Credit {
         &self,
         asker: &Asker,
         bundle: EvidenceBundle,
-        now_ms: u64,
+        now: Judged,
         pace: Option<&RecordPace>,
     ) {
-        let _ = (asker, self.weigh(&bundle, now_ms, pace));
+        let _ = (asker, self.weigh(&bundle, now, pace));
     }
 
     /// Checks a bundle and keeps what its good records show of its relay, if it is newer than what
@@ -774,34 +1037,38 @@ impl Credit {
     pub fn weigh(
         &self,
         bundle: &EvidenceBundle,
-        now_ms: u64,
+        now: Judged,
         pace: Option<&RecordPace>,
     ) -> Result<(), Refused> {
-        let shown = check(bundle, now_ms, pace)?;
+        let shown = check(bundle, now, pace)?;
         let relay = bundle.signer().map_err(unreadable)?;
         let mut state = self.state();
+        let state = &mut *state;
         let newer = state
             .shown
             .get(&relay)
             .is_none_or(|held| held.issued_ms < shown.issued_ms);
         if newer {
-            state.shown.insert(relay, shown);
-            trim(&mut state.shown, MAX_RELAYS_SHOWN, |held| held.issued_ms);
+            if !state.shown.insert(&mut state.charge, relay, shown) {
+                state.let_go();
+            }
+            state.shown.trim(MAX_RELAYS_SHOWN, |held| held.issued_ms);
         }
+        state.settle();
         Ok(())
     }
 
     /// What `relay`'s evidence earns it here now, in bytes a second, before it is split.
-    pub fn earned(&self, relay: &PublicKey, now_ms: u64) -> u64 {
+    pub fn earned(&self, relay: &PublicKey, now: Judged) -> u64 {
         let state = self.state();
-        earned(&state, relay, now_ms)
+        earned(&state, relay, now)
     }
 
     /// The subscription a client is served, given what it asked for: held to its allowance
     /// (`allowance`). Any other role is granted nothing here: what it may receive is the link's
     /// to decide (`link`'s `Peer::grant`), so no role reaches a stream by being mistaken for a
     /// client's peer.
-    pub fn admit(&self, asker: &Asker, asked: Subscription, now_ms: u64) -> Subscription {
+    pub fn admit(&self, asker: &Asker, asked: Subscription, now: Judged) -> Subscription {
         if asker.role != AskerRole::Client {
             return Subscription {
                 streams: Streams(0),
@@ -812,43 +1079,70 @@ impl Credit {
         if asker.loopback {
             return asked;
         }
-        let served = self.admit_client(asker, &asked, now_ms);
-        let mut state = self.state();
-        state.asked.insert(asker.source, (asked, served.clone()));
-        trim_asked(&mut state.asked);
+        let served = self.admit_client(asker, &asked, now);
+        self.remember(asker.source, asked, served.clone());
         served
     }
 
     /// A client session admitted again with what it last asked for: the new subscription when it
     /// changed (a credential expired, credit grew or shrank), else `None`.
-    pub fn readmit(&self, asker: &Asker, now_ms: u64) -> Option<Subscription> {
+    pub fn readmit(&self, asker: &Asker, now: Judged) -> Option<Subscription> {
         let (asked, before) = self.state().asked.get(&asker.source).cloned()?;
-        let served = self.admit_client(asker, &asked, now_ms);
+        let served = self.admit_client(asker, &asked, now);
         if served == before {
             return None;
         }
-        if let Some(held) = self.state().asked.get_mut(&asker.source) {
-            held.1 = served.clone();
+        if self.state().asked.contains_key(&asker.source) {
+            self.remember(asker.source, asked, served.clone());
         }
         Some(served)
     }
 
-    fn admit_client(&self, asker: &Asker, asked: &Subscription, now_ms: u64) -> Subscription {
+    /// What `source` asked for and is served, remembered (exact, so it is charged what it holds)
+    /// until the session leaves: the oldest sessions' go first past [`ASKED_REMEMBERED`]
+    /// (connection ids grow). One the store has no room for is not remembered, counted.
+    fn remember(&self, source: u64, mut asked: Subscription, mut served: Subscription) {
+        asked.regions.shrink_to_fit();
+        served.regions.shrink_to_fit();
+        let mut state = self.state();
+        let state = &mut *state;
+        if !state
+            .asked
+            .insert(&mut state.charge, source, (asked, served))
+        {
+            state.let_go();
+        }
+        if state.asked.len() > ASKED_REMEMBERED {
+            let mut sources: Vec<u64> = state.asked.keys().copied().collect();
+            sources.sort_unstable();
+            for source in sources.into_iter().take(ASKED_REMEMBERED / 4) {
+                state.asked.remove(&source);
+            }
+        }
+        state.settle();
+    }
+
+    fn admit_client(&self, asker: &Asker, asked: &Subscription, now: Judged) -> Subscription {
         let asked = asked.clone();
         let mut state = self.state();
+        let state = &mut *state;
         let Some(cap) = state.upload_cap else {
             return asked;
         };
-        let (allowance, free) = allowance_of(&state, |source, _| source == asker.source, now_ms);
+        let (allowance, free) = allowance_of(state, |source, _| source == asker.source, now);
         let served = narrow(&asked, &allowance);
         if !free || served.streams.0 == 0 {
             state.free.remove(&asker.source);
+            state.settle();
             return served;
         }
         let room = cap / FREE_SHARE_OF_CAP.1 * FREE_SHARE_OF_CAP.0 / Allowance::FREE.bytes_per_sec;
-        let room = usize::try_from(room).unwrap_or(usize::MAX);
-        if state.free.contains(&asker.source) || state.free.len() < room {
-            state.free.insert(asker.source);
+        let room = usize::try_from(room)
+            .unwrap_or(usize::MAX)
+            .min(ASKED_REMEMBERED);
+        if state.free.contains_key(&asker.source)
+            || (state.free.len() < room && state.free.insert(&mut state.charge, asker.source, ()))
+        {
             served
         } else {
             Subscription {
@@ -864,12 +1158,13 @@ impl Credit {
         state.linked.remove(&source);
         state.free.remove(&source);
         state.asked.remove(&source);
+        state.settle();
     }
 
     /// What `client` may read now: the best of its sessions' links, or the free tier.
-    pub fn allowance(&self, client: &PublicKey, now_ms: u64) -> Allowance {
+    pub fn allowance(&self, client: &PublicKey, now: Judged) -> Allowance {
         let state = self.state();
-        allowance_of(&state, |_, link| link.client == *client, now_ms).0
+        allowance_of(&state, |_, link| link.client == *client, now).0
     }
 }
 
@@ -897,11 +1192,6 @@ fn resolves(copy: Option<&HeldCopy>, shown: &ShownFeeder, relay: &PublicKey) -> 
     })
 }
 
-/// Whether `issued_ms` is further ahead of `now_ms` than any clock skew.
-fn ahead(issued_ms: u64, now_ms: u64) -> bool {
-    issued_ms > now_ms.saturating_add(MAX_SKEW_MS)
-}
-
 /// `dated` records, newest first, ties in the order of their bytes: one order however they were
 /// held.
 fn newest_first<T>(mut dated: Vec<(u64, T)>, bytes: impl Fn(&T) -> &[u8]) -> Vec<T> {
@@ -925,7 +1215,7 @@ fn newest_first<T>(mut dated: Vec<(u64, T)>, bytes: impl Fn(&T) -> &[u8]) -> Vec
 /// for a bundle no session brought (the relay's own).
 pub fn check(
     bundle: &EvidenceBundle,
-    now_ms: u64,
+    now: Judged,
     pace: Option<&RecordPace>,
 ) -> Result<Shown, Refused> {
     let spend = || {
@@ -946,7 +1236,10 @@ pub fn check(
                     continue;
                 };
                 let (issued_ms, relays) = said(&described);
-                if ahead(issued_ms, now_ms) || feeder == relay || !relays.contains(&relay) {
+                if RECEIPT_AHEAD.ahead(issued_ms, now)
+                    || feeder == relay
+                    || !relays.contains(&relay)
+                {
                     continue;
                 }
                 feeders.push(ShownFeeder {
@@ -963,7 +1256,7 @@ pub fn check(
             let feeders = content
                 .feeders
                 .iter()
-                .filter(|named| !ahead(named.issued_ms, now_ms) && named.feeder != relay)
+                .filter(|named| !RECEIPT_AHEAD.ahead(named.issued_ms, now) && named.feeder != relay)
                 .map(|named| ShownFeeder {
                     feeder: named.feeder,
                     issued_ms: named.issued_ms,
@@ -974,16 +1267,16 @@ pub fn check(
         }
     };
     let (feeders, receipts) = receipts;
-    if ahead(issued_ms, now_ms) {
+    if RECEIPT_AHEAD.ahead(issued_ms, now) {
         return Err(Refused::Future);
     }
-    if now_ms.saturating_sub(issued_ms) > MAX_EVIDENCE_AGE_MS {
+    if tally_wire::budget::EVIDENCE_AGE.older(issued_ms, now) {
         return Err(Refused::Stale);
     }
     let mut shown = Shown {
         issued_ms,
         feeders,
-        slices: Vec::new(),
+        slices: Vec::with_capacity(receipts.len()),
     };
     for receipt in &receipts {
         spend();
@@ -992,7 +1285,7 @@ pub fn check(
         else {
             continue;
         };
-        if ahead(slice.issued_ms, now_ms) || child == relay || slice.parent != relay {
+        if RECEIPT_AHEAD.ahead(slice.issued_ms, now) || child == relay || slice.parent != relay {
             continue;
         }
         // No stripe of one area carries more than the area's whole raw. `seconds` is at least 1.
@@ -1003,6 +1296,9 @@ pub fn check(
             issued_ms: slice.issued_ms,
         });
     }
+    // Exact, so a table holding it is charged what it holds (`PLANNED_BYTES`).
+    shown.feeders.shrink_to_fit();
+    shown.slices.shrink_to_fit();
     Ok(shown)
 }
 
@@ -1015,7 +1311,7 @@ pub struct Corroboration<'a> {
     /// receipts count at all.
     pub child: &'a dyn Fn(&PublicKey) -> Option<Unit>,
     /// When set, what every unit of children counted is worth, whatever its receipts say it
-    /// delivered (and undecayed, while its newest receipt is younger than `MAX_EVIDENCE_AGE_MS`):
+    /// delivered (and undecayed, while its newest receipt is younger than `tally_wire::budget::EVIDENCE_AGE`):
     /// for a weigher that must not take the parties' own figures, since a child signs whatever
     /// rate its parent asks of it, and counts witnesses instead.
     pub flat: Option<u64>,
@@ -1040,7 +1336,7 @@ pub fn worth(
     shown: &Shown,
     relay: &PublicKey,
     corroboration: &Corroboration<'_>,
-    now_ms: u64,
+    now: Judged,
 ) -> u64 {
     let mut hosted: HashMap<PublicKey, u64> = HashMap::new();
     for shown in &shown.feeders {
@@ -1055,36 +1351,34 @@ pub fn worth(
             continue;
         }
         if let Some(unit) = (corroboration.child)(&slice.child) {
-            let age = now_ms.saturating_sub(slice.issued_ms);
             let value = match corroboration.flat {
-                Some(_) if age > MAX_EVIDENCE_AGE_MS => 0,
+                Some(_) if tally_wire::budget::EVIDENCE_AGE.older(slice.issued_ms, now) => 0,
                 Some(flat) => flat,
-                None => decayed(slice.rate, age),
+                None => decayed(slice.rate, slice.issued_ms, now),
             };
             let best = children.entry(unit).or_insert(0);
             *best = (*best).max(value);
         }
     }
-    let age = |issued: &u64| now_ms.saturating_sub(*issued);
     hosted
         .values()
-        .map(|issued| decayed(FEEDER_CREDIT, age(issued)))
+        .map(|issued| decayed(FEEDER_CREDIT, *issued, now))
         .chain(children.into_values())
         .fold(0, u64::saturating_add)
 }
 
 /// What `relay`'s evidence earns it at this relay now: [`worth`], counting only the receivers and
 /// relays this relay corroborated first-hand, one witness per child.
-fn earned(state: &State, relay: &PublicKey, now_ms: u64) -> u64 {
+fn earned(state: &State, relay: &PublicKey, now: Judged) -> u64 {
     let Some(shown) = state.shown.get(relay) else {
         return 0;
     };
     let feeder = |shown: &ShownFeeder| {
-        corroborated(&state.corroborated_receivers, &shown.feeder, now_ms)
+        corroborated(&state.corroborated_receivers, &shown.feeder, now)
             && resolves(state.copies.get(&shown.feeder), shown, relay)
     };
     let child = |key: &PublicKey| {
-        corroborated(&state.corroborated_relays, key, now_ms).then_some(Unit::Child(*key))
+        corroborated(&state.corroborated_relays, key, now).then_some(Unit::Child(*key))
     };
     worth(
         shown,
@@ -1094,7 +1388,7 @@ fn earned(state: &State, relay: &PublicKey, now_ms: u64) -> u64 {
             child: &child,
             flat: None,
         },
-        now_ms,
+        now,
     )
 }
 
@@ -1104,11 +1398,11 @@ fn earned(state: &State, relay: &PublicKey, now_ms: u64) -> u64 {
 fn allowance_of(
     state: &State,
     matches: impl Fn(u64, &Linked) -> bool,
-    now_ms: u64,
+    now: Judged,
 ) -> (Allowance, bool) {
     let mut best: Option<Allowance> = None;
-    for (source, link) in &state.linked {
-        if link.expires_ms <= now_ms || !matches(*source, link) {
+    for (source, link) in state.linked.iter() {
+        if tally_wire::budget::expired(link.expires_ms, now) || !matches(*source, link) {
             continue;
         }
         let allowance = if state.own.contains(&link.relay) {
@@ -1117,10 +1411,12 @@ fn allowance_of(
             let sessions = state
                 .linked
                 .values()
-                .filter(|other| other.relay == link.relay && other.expires_ms > now_ms)
+                .filter(|other| {
+                    other.relay == link.relay && !tally_wire::budget::expired(other.expires_ms, now)
+                })
                 .count()
                 .max(1);
-            let share = earned(state, &link.relay, now_ms) / sessions as u64;
+            let share = earned(state, &link.relay, now) / sessions as u64;
             if share <= Allowance::FREE.bytes_per_sec {
                 continue;
             }
@@ -1138,7 +1434,10 @@ fn allowance_of(
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::disallowed_methods, reason = "a test's scripted readings")]
+    use tally_wire::Identity;
     use tally_wire::batch::{Clock, ReceiverInfoContent};
+    use tally_wire::clocks::recorded::judged;
     use tally_wire::{
         DeliveryAnswer, DeliveryAnswerContent, Location, Possession, StripeReceiptContent,
     };
@@ -1276,7 +1575,7 @@ mod tests {
         (0..count)
             .map(|_| {
                 let feeder = identity()?;
-                judge.corroborate_receiver(feeder.public(), NOW);
+                judge.corroborate_receiver(feeder.public(), judged(NOW));
                 info(&feeder, relay.public(), NOW)
             })
             .collect()
@@ -1296,26 +1595,219 @@ mod tests {
         sub(Streams(0), Vec::new())
     }
 
+    /// Every table is charged what it allocates (`Store::Credit`): after descriptions, receipts,
+    /// bundles, corroborations, links, subscriptions and the operator's clients come and some go,
+    /// what its tables hold allocated on this thread is what it is charged, to the byte. Before,
+    /// the tables sat under no gauge at all, bounded only by their caps.
+    #[test]
+    fn the_credit_is_charged_what_its_tables_allocate() -> Result {
+        let relay = identity()?;
+        let credit = rationing();
+        credit.adopt_identity(relay.public());
+        let base = tally_counting::Counting::live();
+        for n in 0..120u64 {
+            let feeder = identity()?;
+            credit.corroborate_receiver(feeder.public(), judged(NOW + n));
+            credit.described(
+                info(&feeder, relay.public(), NOW + n)?,
+                crate::strikes::Now::judging(NOW + n),
+            );
+            if n % 3 == 0 {
+                credit.corroborate_relay(feeder.public(), judged(NOW + n));
+                credit.record_receipt(
+                    receipt(&feeder, relay.public(), 1_000, NOW)?,
+                    crate::strikes::Now::judging(NOW + n),
+                );
+            }
+        }
+        // Another relay's descriptions, held only to resolve references by.
+        let other = identity()?;
+        for _ in 0..40 {
+            let feeder = identity()?;
+            credit.described(
+                info(&feeder, other.public(), NOW)?,
+                crate::strikes::Now::judging(NOW),
+            );
+        }
+        for _ in 0..4 {
+            let shown = identity()?;
+            let feeders = hosted(&credit, &shown, 8)?;
+            credit
+                .weigh(
+                    &bundle(&shown, feeders, Vec::new(), Vec::new())?,
+                    judged(NOW),
+                    None,
+                )
+                .map_err(text)?;
+        }
+        let clients: Vec<Identity> = (0..12).map(|_| identity()).collect::<Result<_>>()?;
+        credit.vouch_for(clients.iter().map(Identity::public));
+        for (source, client) in clients.iter().enumerate() {
+            let session = asker(AskerRole::Client, client.public(), source as u64);
+            let credential = credit
+                .issue(&relay, client.public(), Streams::RAW, judged(NOW))
+                .map_err(text)?;
+            credit
+                .link(&session, &credential, judged(NOW))
+                .map_err(|e| format!("{e:?}"))?;
+            let _ = credit.admit(&session, sub(Streams::POSITIONS, areas(3)?), judged(NOW));
+        }
+        for source in 0..4 {
+            credit.left(source);
+        }
+        drop((clients, other));
+        let measured = tally_counting::Counting::live() - base;
+        assert_eq!(
+            credit.charged() as isize,
+            measured,
+            "charged {}, allocated {measured}",
+            credit.charged()
+        );
+        assert!(credit.charged() <= PLANNED_BYTES);
+        assert_eq!(credit.full(), 0);
+        Ok(())
+    }
+
+    /// A description and a receipt are charged what their bytes allocate (`allocated`, their
+    /// capacity), not their length: held with room to spare, the room is charged too. Before,
+    /// the length was, exact only while every one held was a clone.
+    #[test]
+    fn a_held_description_and_receipt_are_charged_their_capacity() -> Result {
+        let relay = identity()?;
+        let feeder = identity()?;
+        let roomy = |bytes: &[u8]| {
+            let mut held = Vec::with_capacity(bytes.len() + 4_096);
+            held.extend_from_slice(bytes);
+            held
+        };
+        let mut state = State::new(&Gauge::new(Store::Credit, usize::MAX));
+        let base = tally_counting::Counting::live();
+        let described = {
+            let signed = info(&feeder, relay.public(), NOW)?;
+            ReceiverInfo::from_bytes(roomy(signed.as_bytes())).map_err(text)?
+        };
+        let held = {
+            let signed = receipt(&feeder, relay.public(), 1_000, NOW)?;
+            StripeReceipt::from_bytes(roomy(signed.as_bytes())).map_err(text)?
+        };
+        let State {
+            described: table,
+            receipts,
+            charge,
+            ..
+        } = &mut state;
+        assert!(table.insert(charge, feeder.public(), (described, NOW)));
+        assert!(receipts.insert(charge, (feeder.public(), 0, 0, 0), (held, NOW)));
+        state.settle();
+        // All the two tables allocate, the entries' spare room with them, to the byte.
+        let measured = tally_counting::Counting::live() - base;
+        let charged = state.bytes();
+        assert_eq!(
+            charged as isize, measured,
+            "charged {charged}, allocated {measured}"
+        );
+        assert!(charged > 2 * 4_096, "{charged}");
+        Ok(())
+    }
+
+    /// A store with no room lets what would grow a table go, counted, and holds within its
+    /// limit: what was taken first stays.
+    #[test]
+    fn a_full_credit_store_lets_entries_go() -> Result {
+        let credit = Credit::new();
+        let limit = 16 << 10;
+        credit.charge_to(&Gauge::new(Store::Credit, limit));
+        let first = identity()?.public();
+        credit.corroborate_receiver(first, judged(NOW));
+        for _ in 0..2_000 {
+            credit.corroborate_receiver(identity()?.public(), judged(NOW));
+        }
+        assert!(credit.full() > 0, "nothing was let go");
+        assert!(credit.charged() <= limit);
+        assert!(credit.corroborated_receiver(&first, judged(NOW)));
+        Ok(())
+    }
+
+    /// The most a held description and a receipt take are within what the plan holds for each
+    /// (`DESCRIPTION_MOST`, `RECEIPT_MOST`): a description with a site, a software name of 255
+    /// bytes and the most relays one may name; and a description naming more relays than any
+    /// feeder does is not held at all, neither as a copy nor as evidence.
+    #[test]
+    fn what_the_credit_holds_is_within_its_plan() -> Result {
+        let feeder = identity()?;
+        let relays: Vec<PublicKey> = (0..tally_wire::credit::MAX_DESCRIBED_RELAYS)
+            .map(|_| identity().map(|relay| relay.public()))
+            .collect::<Result<_>>()?;
+        let largest = |relays: Vec<PublicKey>| {
+            ReceiverInfo::sign(
+                &feeder,
+                &ReceiverInfoContent {
+                    issued_ms: NOW,
+                    location: Some(Location {
+                        lat_e7: -899_999_999,
+                        lon_e7: -1_799_999_999,
+                        alt_m: -400,
+                        precision_m: u32::MAX,
+                    }),
+                    clock: Clock::Beast,
+                    software: "x".repeat(255),
+                    relays,
+                },
+            )
+            .map_err(text)
+        };
+        let most = largest(relays.clone())?;
+        assert!(
+            most.as_bytes().len() <= DESCRIPTION_MOST,
+            "{}",
+            most.as_bytes().len()
+        );
+        let child = identity()?;
+        let held = receipt(&child, relays[0], u64::MAX / 60, NOW)?;
+        assert!(
+            held.as_bytes().len() <= RECEIPT_MOST,
+            "{}",
+            held.as_bytes().len()
+        );
+        // One relay more than a description may name: neither copy nor evidence.
+        let credit = Credit::new();
+        credit.adopt_identity(relays[0]);
+        let mut more = relays.clone();
+        more.push(identity()?.public());
+        credit.described(largest(more)?, crate::strikes::Now::judging(NOW));
+        let held = |credit: &Credit| {
+            let state = credit.state();
+            (state.copies.len(), state.described.len())
+        };
+        assert_eq!(held(&credit), (0, 0));
+        credit.described(most, crate::strikes::Now::judging(NOW));
+        assert_eq!(held(&credit), (1, 1));
+        Ok(())
+    }
+
     #[test]
     fn a_credential_bound_to_another_key_is_refused() -> Result {
         let (relay, client, thief) = (identity()?, identity()?, identity()?);
         let issuer = Credit::new();
         let credential = issuer
-            .issue(&relay, client.public(), Streams::RAW, NOW)
+            .issue(&relay, client.public(), Streams::RAW, judged(NOW))
             .map_err(text)?;
         let judge = Credit::new();
         let copied = asker(AskerRole::Client, thief.public(), 1);
         assert_eq!(
-            judge.link(&copied, &credential, NOW),
+            judge.link(&copied, &credential, judged(NOW)),
             Err(Refused::OtherKey)
         );
-        assert_eq!(judge.allowance(&thief.public(), NOW), Allowance::FREE);
+        assert_eq!(
+            judge.allowance(&thief.public(), judged(NOW)),
+            Allowance::FREE
+        );
         // Presented by its own key it links; by a relay's session it does not.
         let own = asker(AskerRole::Client, client.public(), 2);
-        assert_eq!(judge.link(&own, &credential, NOW), Ok(()));
+        assert_eq!(judge.link(&own, &credential, judged(NOW)), Ok(()));
         let relay_session = asker(AskerRole::Relay, client.public(), 3);
         assert_eq!(
-            judge.link(&relay_session, &credential, NOW),
+            judge.link(&relay_session, &credential, judged(NOW)),
             Err(Refused::NotAClient)
         );
         // A tampered credential does not verify.
@@ -1324,7 +1816,7 @@ mod tests {
         bytes[last] ^= 1;
         let forged = FirehoseCredential::from_bytes(bytes).map_err(text)?;
         assert!(matches!(
-            judge.link(&own, &forged, NOW),
+            judge.link(&own, &forged, judged(NOW)),
             Err(Refused::Unreadable(_))
         ));
         Ok(())
@@ -1335,11 +1827,11 @@ mod tests {
         let (relay, client) = (identity()?, identity()?);
         let judge = rationing();
         let credential = Credit::new()
-            .issue(&relay, client.public(), Streams::POSITIONS, NOW)
+            .issue(&relay, client.public(), Streams::POSITIONS, judged(NOW))
             .map_err(text)?;
         let session = asker(AskerRole::Client, client.public(), 1);
         assert_eq!(
-            judge.link(&session, &credential, NOW + CREDENTIAL_LIFETIME_MS),
+            judge.link(&session, &credential, judged(NOW + CREDENTIAL_LIFETIME_MS)),
             Err(Refused::Expired)
         );
         let early = Credit::new()
@@ -1347,24 +1839,34 @@ mod tests {
                 &relay,
                 client.public(),
                 Streams::POSITIONS,
-                NOW + 2 * MAX_SKEW_MS,
+                judged(
+                    NOW + 2 * tally_wire::budget::RECEIPT_AHEAD
+                        .span::<tally_wire::clocks::Judged>()
+                        .ms(),
+                ),
             )
             .map_err(text)?;
-        assert_eq!(judge.link(&session, &early, NOW), Err(Refused::Future));
+        assert_eq!(
+            judge.link(&session, &early, judged(NOW)),
+            Err(Refused::Future)
+        );
         // Linked while valid, with credit enough to lift it; once expired, the free tier.
         judge
             .weigh(
                 &bundle(&relay, hosted(&judge, &relay, 8)?, vec![], vec![])?,
-                NOW,
+                judged(NOW),
                 None,
             )
             .map_err(text)?;
-        judge.link(&session, &credential, NOW).map_err(text)?;
+        judge
+            .link(&session, &credential, judged(NOW))
+            .map_err(text)?;
         assert!(
-            judge.allowance(&client.public(), NOW).bytes_per_sec > Allowance::FREE.bytes_per_sec
+            judge.allowance(&client.public(), judged(NOW)).bytes_per_sec
+                > Allowance::FREE.bytes_per_sec
         );
         assert_eq!(
-            judge.allowance(&client.public(), NOW + CREDENTIAL_LIFETIME_MS),
+            judge.allowance(&client.public(), judged(NOW + CREDENTIAL_LIFETIME_MS)),
             Allowance::FREE
         );
         Ok(())
@@ -1384,21 +1886,37 @@ mod tests {
         let other = identity()?;
         feeders.extend(hosted(&judge, &other, 1)?);
         let early = identity()?;
-        judge.corroborate_receiver(early.public(), NOW);
-        feeders.push(info(&early, relay.public(), NOW + 2 * MAX_SKEW_MS)?);
+        judge.corroborate_receiver(early.public(), judged(NOW));
+        feeders.push(info(
+            &early,
+            relay.public(),
+            NOW + 2 * tally_wire::budget::RECEIPT_AHEAD
+                .span::<tally_wire::clocks::Judged>()
+                .ms(),
+        )?);
         let child = identity()?;
-        judge.corroborate_relay(child.public(), NOW);
+        judge.corroborate_relay(child.public(), judged(NOW));
         let mixed = bundle(
             &relay,
             feeders,
             vec![
                 receipt(&child, other.public(), 1_000, NOW)?,
-                receipt(&child, relay.public(), 3_000, NOW + 2 * MAX_SKEW_MS)?,
+                receipt(
+                    &child,
+                    relay.public(),
+                    3_000,
+                    NOW + 2 * tally_wire::budget::RECEIPT_AHEAD
+                        .span::<tally_wire::clocks::Judged>()
+                        .ms(),
+                )?,
             ],
             vec![],
         )?;
-        judge.weigh(&mixed, NOW, None).map_err(text)?;
-        assert_eq!(judge.earned(&relay.public(), NOW), 4 * FEEDER_CREDIT);
+        judge.weigh(&mixed, judged(NOW), None).map_err(text)?;
+        assert_eq!(
+            judge.earned(&relay.public(), judged(NOW)),
+            4 * FEEDER_CREDIT
+        );
         // The bundle's own signature and time are not skipped: a forged or future bundle is
         // refused whole.
         let mut bytes = mixed.as_bytes().to_vec();
@@ -1406,20 +1924,26 @@ mod tests {
         bytes[last] ^= 1;
         let forged = EvidenceBundle::from_bytes(bytes).map_err(text)?;
         assert!(matches!(
-            judge.weigh(&forged, NOW, None),
+            judge.weigh(&forged, judged(NOW), None),
             Err(Refused::Unreadable(_))
         ));
         let future = EvidenceBundle::sign(
             &relay,
             &EvidenceBundleContent {
-                issued_ms: NOW + 2 * MAX_SKEW_MS,
+                issued_ms: NOW
+                    + 2 * tally_wire::budget::RECEIPT_AHEAD
+                        .span::<tally_wire::clocks::Judged>()
+                        .ms(),
                 feeders: vec![],
                 receipts: vec![],
                 answers: vec![],
             },
         )
         .map_err(text)?;
-        assert_eq!(judge.weigh(&future, NOW, None), Err(Refused::Future));
+        assert_eq!(
+            judge.weigh(&future, judged(NOW), None),
+            Err(Refused::Future)
+        );
         Ok(())
     }
 
@@ -1433,17 +1957,17 @@ mod tests {
         let answers = receivers
             .iter()
             .map(|receiver| {
-                judge.corroborate_receiver(receiver.public(), NOW);
+                judge.corroborate_receiver(receiver.public(), judged(NOW));
                 answer(&relay, receiver.public(), NOW)
             })
             .collect::<Result<Vec<_>>>()?;
         judge
-            .weigh(&bundle(&relay, vec![], vec![], answers)?, NOW, None)
+            .weigh(&bundle(&relay, vec![], vec![], answers)?, judged(NOW), None)
             .map_err(text)?;
-        assert_eq!(judge.earned(&relay.public(), NOW), 0);
+        assert_eq!(judge.earned(&relay.public(), judged(NOW)), 0);
         // And its own bundle never carries one.
         let own = Credit::new();
-        let bundled = own.bundle(&relay, NOW).map_err(text)?;
+        let bundled = own.bundle(&relay, judged(NOW)).map_err(text)?;
         assert!(bundled.referenced().map_err(text)?.answers.is_empty());
         Ok(())
     }
@@ -1452,7 +1976,7 @@ mod tests {
     fn a_zero_span_receipt_counts_its_one_second() -> Result {
         let (relay, child) = (identity()?, identity()?);
         let judge = Credit::new();
-        judge.corroborate_relay(child.public(), NOW);
+        judge.corroborate_relay(child.public(), judged(NOW));
         let instant = StripeReceipt::sign(
             &child,
             &StripeReceiptContent {
@@ -1471,9 +1995,13 @@ mod tests {
         )
         .map_err(text)?;
         judge
-            .weigh(&bundle(&relay, vec![], vec![instant], vec![])?, NOW, None)
+            .weigh(
+                &bundle(&relay, vec![], vec![instant], vec![])?,
+                judged(NOW),
+                None,
+            )
             .map_err(text)?;
-        assert_eq!(judge.earned(&relay.public(), NOW), 5_000);
+        assert_eq!(judge.earned(&relay.public(), judged(NOW)), 5_000);
         Ok(())
     }
 
@@ -1483,22 +2011,25 @@ mod tests {
         let client = identity()?;
         let session = asker(AskerRole::Client, client.public(), 1);
         let cells = areas(2)?;
-        assert_eq!(judge.allowance(&client.public(), NOW), Allowance::FREE);
+        assert_eq!(
+            judge.allowance(&client.public(), judged(NOW)),
+            Allowance::FREE
+        );
         // Raw and the world are not free: only positions, for one area.
         let everything = Streams(0x7f);
         assert_eq!(
-            judge.admit(&session, sub(everything, cells.clone()), NOW),
+            judge.admit(&session, sub(everything, cells.clone()), judged(NOW)),
             sub(
                 Streams::POSITIONS.with(Streams::PROVISIONAL),
                 vec![cells[0]]
             )
         );
         assert_eq!(
-            judge.admit(&session, sub(Streams::POSITIONS, Vec::new()), NOW),
+            judge.admit(&session, sub(Streams::POSITIONS, Vec::new()), judged(NOW)),
             nothing()
         );
         assert_eq!(
-            judge.admit(&session, sub(Streams::RAW, vec![cells[0]]), NOW),
+            judge.admit(&session, sub(Streams::RAW, vec![cells[0]]), judged(NOW)),
             nothing()
         );
         // A region coarser than an area is refused, and refusing every region never widens to
@@ -1513,7 +2044,7 @@ mod tests {
             Region::containing(&location, 1).map_err(text)?
         };
         assert_eq!(
-            judge.admit(&session, sub(Streams::POSITIONS, vec![coarse]), NOW),
+            judge.admit(&session, sub(Streams::POSITIONS, vec![coarse]), judged(NOW)),
             nothing()
         );
         Ok(())
@@ -1531,16 +2062,16 @@ mod tests {
         let mut served = Vec::new();
         for source in 0..4 {
             let session = asker(AskerRole::Client, identity()?.public(), source);
-            served.push(judge.admit(&session, ask(), NOW));
+            served.push(judge.admit(&session, ask(), judged(NOW)));
         }
         assert_eq!(served[..3], [ask(), ask(), ask()]);
         assert_eq!(served[3], nothing());
         // A client already served keeps its place on a new Subscribe; one leaving makes room.
         let again = asker(AskerRole::Client, identity()?.public(), 0);
-        assert_eq!(judge.admit(&again, ask(), NOW), ask());
+        assert_eq!(judge.admit(&again, ask(), judged(NOW)), ask());
         judge.left(1);
         let fourth = asker(AskerRole::Client, identity()?.public(), 3);
-        assert_eq!(judge.admit(&fourth, ask(), NOW), ask());
+        assert_eq!(judge.admit(&fourth, ask(), judged(NOW)), ask());
         Ok(())
     }
 
@@ -1551,25 +2082,33 @@ mod tests {
         judge
             .weigh(
                 &bundle(&relay, hosted(&judge, &relay, 24)?, vec![], vec![])?,
-                NOW,
+                judged(NOW),
                 None,
             )
             .map_err(text)?;
-        assert_eq!(judge.earned(&relay.public(), NOW), 24 * FEEDER_CREDIT);
+        assert_eq!(
+            judge.earned(&relay.public(), judged(NOW)),
+            24 * FEEDER_CREDIT
+        );
         let session = asker(AskerRole::Client, client.public(), 1);
         let positions = Streams::POSITIONS.with(Streams::PROVISIONAL);
         let three = areas(3)?;
         // Free, one area; linked, all three.
         assert_eq!(
-            judge.admit(&session, sub(positions, three.clone()), NOW),
+            judge.admit(&session, sub(positions, three.clone()), judged(NOW)),
             sub(positions, vec![three[0]])
         );
         let credential = Credit::new()
-            .issue(&relay, client.public(), positions.with(Streams::RAW), NOW)
+            .issue(
+                &relay,
+                client.public(),
+                positions.with(Streams::RAW),
+                judged(NOW),
+            )
             .map_err(text)?;
-        judge.presented(&session, credential, NOW);
+        judge.presented(&session, credential, judged(NOW));
         assert_eq!(
-            judge.admit(&session, sub(positions, three.clone()), NOW),
+            judge.admit(&session, sub(positions, three.clone()), judged(NOW)),
             sub(positions, three.clone())
         );
         // Still in proportion: an area's raw costs more than 24 feeders earn.
@@ -1577,7 +2116,7 @@ mod tests {
             judge.admit(
                 &session,
                 sub(positions.with(Streams::RAW), three.clone()),
-                NOW
+                judged(NOW)
             ),
             sub(positions, three)
         );
@@ -1585,10 +2124,13 @@ mod tests {
         let (idle, other) = (identity()?, identity()?);
         let idle_session = asker(AskerRole::Client, other.public(), 2);
         let idle_credential = Credit::new()
-            .issue(&idle, other.public(), positions, NOW)
+            .issue(&idle, other.public(), positions, judged(NOW))
             .map_err(text)?;
-        judge.presented(&idle_session, idle_credential, NOW);
-        assert_eq!(judge.allowance(&other.public(), NOW), Allowance::FREE);
+        judge.presented(&idle_session, idle_credential, judged(NOW));
+        assert_eq!(
+            judge.allowance(&other.public(), judged(NOW)),
+            Allowance::FREE
+        );
         Ok(())
     }
 
@@ -1607,20 +2149,23 @@ mod tests {
         {
             let peer = asker(role, identity()?.public(), source as u64);
             assert_eq!(
-                judge.admit(&peer, asked.clone(), NOW),
+                judge.admit(&peer, asked.clone(), judged(NOW)),
                 nothing(),
                 "{role:?}"
             );
             let mut loopback = peer;
             loopback.loopback = true;
-            assert_eq!(judge.admit(&loopback, asked.clone(), NOW), nothing());
+            assert_eq!(
+                judge.admit(&loopback, asked.clone(), judged(NOW)),
+                nothing()
+            );
         }
         // A relay told no cap sends nothing billed, and serves its clients as they ask.
         let uncapped = Credit::new();
         let client = asker(AskerRole::Client, identity()?.public(), 9);
-        assert_eq!(uncapped.admit(&client, asked.clone(), NOW), asked);
+        assert_eq!(uncapped.admit(&client, asked.clone(), judged(NOW)), asked);
         uncapped.set_upload_cap(0);
-        assert_eq!(uncapped.admit(&client, asked.clone(), NOW), asked);
+        assert_eq!(uncapped.admit(&client, asked.clone(), judged(NOW)), asked);
         Ok(())
     }
 
@@ -1631,9 +2176,14 @@ mod tests {
         let own = rationing();
         own.adopt_identity(relay.public());
         own.vouch_for([client.public()]);
-        own.described(info(&feeder, relay.public(), NOW)?, NOW);
+        own.described(
+            info(&feeder, relay.public(), NOW)?,
+            crate::strikes::Now::judging(NOW),
+        );
         let session = asker(AskerRole::Client, client.public(), 1);
-        let (credential, evidence) = own.vouch(&relay, &session, NOW).ok_or("not vouched")?;
+        let (credential, evidence) = own
+            .vouch(&relay, &session, judged(NOW))
+            .ok_or("not vouched")?;
         let content = credential.content().map_err(text)?;
         assert_eq!(
             (content.client, credential.signer().map_err(text)?),
@@ -1642,17 +2192,25 @@ mod tests {
         assert_eq!(evidence.referenced().map_err(text)?.feeders.len(), 1);
         // Served here as the credential says: anything, anywhere.
         assert_eq!(
-            own.admit(&session, sub(Streams::RAW, Vec::new()), NOW),
+            own.admit(&session, sub(Streams::RAW, Vec::new()), judged(NOW)),
             sub(Streams::RAW, Vec::new())
         );
         // A stranger, or the client's key on a relay's session, is vouched for by nobody.
         assert!(
-            own.vouch(&relay, &asker(AskerRole::Client, stranger.public(), 2), NOW)
-                .is_none()
+            own.vouch(
+                &relay,
+                &asker(AskerRole::Client, stranger.public(), 2),
+                judged(NOW)
+            )
+            .is_none()
         );
         assert!(
-            own.vouch(&relay, &asker(AskerRole::Relay, client.public(), 3), NOW)
-                .is_none()
+            own.vouch(
+                &relay,
+                &asker(AskerRole::Relay, client.public(), 3),
+                judged(NOW)
+            )
+            .is_none()
         );
         Ok(())
     }
@@ -1666,13 +2224,13 @@ mod tests {
                 &relay,
                 client.public(),
                 Streams::RAW.with(Streams::POSITIONS),
-                NOW,
+                judged(NOW),
             )
             .map_err(text)?;
         let session = asker(AskerRole::Client, client.public(), 1);
-        judge.presented(&session, credential, NOW);
+        judge.presented(&session, credential, judged(NOW));
         assert_eq!(
-            judge.admit(&session, sub(Streams(0x7f), Vec::new()), NOW),
+            judge.admit(&session, sub(Streams(0x7f), Vec::new()), judged(NOW)),
             sub(Streams::RAW.with(Streams::POSITIONS), Vec::new())
         );
         Ok(())
@@ -1697,7 +2255,7 @@ mod tests {
         // The record itself, taken as the read loop takes it.
         pace.take().await;
         let started = tokio::time::Instant::now();
-        check(&evidence, NOW, Some(&pace)).map_err(|refused| format!("{refused:?}"))?;
+        check(&evidence, judged(NOW), Some(&pace)).map_err(|refused| format!("{refused:?}"))?;
         pace.take().await;
         let waited = started.elapsed();
         assert!(
@@ -1706,7 +2264,7 @@ mod tests {
         );
         // A bundle no session brought owes nothing.
         let started = tokio::time::Instant::now();
-        check(&evidence, NOW, None).map_err(|refused| format!("{refused:?}"))?;
+        check(&evidence, judged(NOW), None).map_err(|refused| format!("{refused:?}"))?;
         pace.take().await;
         assert!(started.elapsed() <= Duration::from_secs(1));
         Ok(())
@@ -1725,16 +2283,19 @@ mod tests {
             .collect::<Result<Vec<_>>>()?;
         // Every record is genuinely signed, so the bundle is accepted, and earns nothing.
         judge
-            .weigh(&bundle(&relay, feeders, vec![], vec![])?, NOW, None)
+            .weigh(&bundle(&relay, feeders, vec![], vec![])?, judged(NOW), None)
             .map_err(text)?;
-        assert_eq!(judge.earned(&relay.public(), NOW), 0);
+        assert_eq!(judge.earned(&relay.public(), judged(NOW)), 0);
         // Two of them turn out real: those two count.
-        judge.corroborate_receiver(fakes[0].public(), NOW);
-        judge.corroborate_receiver(fakes[1].public(), NOW);
-        assert_eq!(judge.earned(&relay.public(), NOW), 2 * FEEDER_CREDIT);
+        judge.corroborate_receiver(fakes[0].public(), judged(NOW));
+        judge.corroborate_receiver(fakes[1].public(), judged(NOW));
+        assert_eq!(
+            judge.earned(&relay.public(), judged(NOW)),
+            2 * FEEDER_CREDIT
+        );
         // Corroboration lapses.
         assert_eq!(
-            judge.earned(&relay.public(), NOW + CORROBORATION_LIFETIME_MS + 1),
+            judge.earned(&relay.public(), judged(NOW + CORROBORATION_LIFETIME_MS + 1)),
             0
         );
         Ok(())
@@ -1747,26 +2308,26 @@ mod tests {
         judge
             .weigh(
                 &bundle(&relay, hosted(&judge, &relay, 50)?, vec![], vec![])?,
-                NOW,
+                judged(NOW),
                 None,
             )
             .map_err(text)?;
-        let earned = judge.earned(&relay.public(), NOW);
+        let earned = judge.earned(&relay.public(), judged(NOW));
         assert_eq!(earned, 50 * FEEDER_CREDIT);
         let issuer = Credit::new();
         let mut clients = Vec::new();
         for source in 0..100 {
             let client = identity()?;
             let credential = issuer
-                .issue(&relay, client.public(), Streams::POSITIONS, NOW)
+                .issue(&relay, client.public(), Streams::POSITIONS, judged(NOW))
                 .map_err(text)?;
             judge.presented(
                 &asker(AskerRole::Client, client.public(), source),
                 credential,
-                NOW,
+                judged(NOW),
             );
             clients.push(client.public());
-            let each = judge.allowance(&clients[0], NOW);
+            let each = judge.allowance(&clients[0], judged(NOW));
             let share = earned / (source + 1);
             if share > Allowance::FREE.bytes_per_sec {
                 assert_eq!(each.bytes_per_sec, share);
@@ -1776,7 +2337,7 @@ mod tests {
         }
         // A hundred ways, each below the free tier: no client is better off for the link.
         for client in &clients {
-            assert_eq!(judge.allowance(client, NOW), Allowance::FREE);
+            assert_eq!(judge.allowance(client, judged(NOW)), Allowance::FREE);
         }
         // One credential shared by two sessions halves it too.
         let lone_relay = identity()?;
@@ -1788,35 +2349,40 @@ mod tests {
                     vec![],
                     vec![],
                 )?,
-                NOW,
+                judged(NOW),
                 None,
             )
             .map_err(text)?;
         let shared = identity()?;
         let credential = issuer
-            .issue(&lone_relay, shared.public(), Streams::POSITIONS, NOW)
+            .issue(
+                &lone_relay,
+                shared.public(),
+                Streams::POSITIONS,
+                judged(NOW),
+            )
             .map_err(text)?;
         judge.presented(
             &asker(AskerRole::Client, shared.public(), 200),
             credential.clone(),
-            NOW,
+            judged(NOW),
         );
         assert_eq!(
-            judge.allowance(&shared.public(), NOW).bytes_per_sec,
+            judge.allowance(&shared.public(), judged(NOW)).bytes_per_sec,
             20 * FEEDER_CREDIT
         );
         judge.presented(
             &asker(AskerRole::Client, shared.public(), 201),
             credential,
-            NOW,
+            judged(NOW),
         );
         assert_eq!(
-            judge.allowance(&shared.public(), NOW).bytes_per_sec,
+            judge.allowance(&shared.public(), judged(NOW)).bytes_per_sec,
             10 * FEEDER_CREDIT
         );
         judge.left(201);
         assert_eq!(
-            judge.allowance(&shared.public(), NOW).bytes_per_sec,
+            judge.allowance(&shared.public(), judged(NOW)).bytes_per_sec,
             20 * FEEDER_CREDIT
         );
         Ok(())
@@ -1833,8 +2399,8 @@ mod tests {
         let shown = bundle(&relay, vec![], receipts.clone(), vec![])?;
         // An honest relay that never dealt with the colluders: nothing.
         let honest = Credit::new();
-        honest.weigh(&shown, NOW, None).map_err(text)?;
-        assert_eq!(honest.earned(&relay.public(), NOW), 0);
+        honest.weigh(&shown, judged(NOW), None).map_err(text)?;
+        assert_eq!(honest.earned(&relay.public(), judged(NOW)), 0);
         // The colluders vouching for each other the same way earn nothing either.
         for (index, colluder) in colluders.iter().enumerate() {
             let next = &colluders[(index + 1) % colluders.len()];
@@ -1844,13 +2410,13 @@ mod tests {
                 vec![receipt(next, colluder.public(), 100_000, NOW)?],
                 vec![],
             )?;
-            honest.weigh(&mutual, NOW, None).map_err(text)?;
-            assert_eq!(honest.earned(&colluder.public(), NOW), 0);
+            honest.weigh(&mutual, judged(NOW), None).map_err(text)?;
+            assert_eq!(honest.earned(&colluder.public(), judged(NOW)), 0);
         }
         // A real child this relay knows counts, once, however many receipts it signs, and no
         // more than an area's raw a second.
         let known = identity()?;
-        honest.corroborate_relay(known.public(), NOW);
+        honest.corroborate_relay(known.public(), judged(NOW));
         let mut with_known = receipts;
         with_known.push(receipt(&known, relay.public(), 1_000, NOW)?);
         with_known.push(receipt(&known, relay.public(), 2_000, NOW)?);
@@ -1864,18 +2430,21 @@ mod tests {
             },
         )
         .map_err(text)?;
-        honest.weigh(&later, NOW + 1, None).map_err(text)?;
-        assert_eq!(honest.earned(&relay.public(), NOW + 1), decayed(2_000, 1));
+        honest.weigh(&later, judged(NOW + 1), None).map_err(text)?;
+        assert_eq!(
+            honest.earned(&relay.public(), judged(NOW + 1)),
+            decayed(2_000, NOW, judged(NOW + 1))
+        );
         let flood = bundle(
             &known,
             vec![],
             vec![receipt(&relay, known.public(), u64::MAX / 120, NOW)?],
             vec![],
         )?;
-        honest.corroborate_relay(relay.public(), NOW);
-        honest.weigh(&flood, NOW, None).map_err(text)?;
+        honest.corroborate_relay(relay.public(), judged(NOW));
+        honest.weigh(&flood, judged(NOW), None).map_err(text)?;
         assert_eq!(
-            honest.earned(&known.public(), NOW),
+            honest.earned(&known.public(), judged(NOW)),
             AREA_FEEDERS * FEEDER_BYTES_PER_SEC
         );
         Ok(())
@@ -1883,32 +2452,37 @@ mod tests {
 
     #[test]
     fn credit_decays_with_the_age_of_its_evidence() -> Result {
-        assert_eq!(decayed(1_000, 0), 1_000);
-        assert_eq!(decayed(1_000, HALF_LIFE_MS / 2), 750);
-        assert_eq!(decayed(1_000, HALF_LIFE_MS), 500);
-        assert_eq!(decayed(1_000, 2 * HALF_LIFE_MS), 250);
-        assert_eq!(decayed(1_000, MAX_EVIDENCE_AGE_MS + 1), 0);
+        let aged = |age_ms: u64| decayed(1_000, NOW, judged(NOW + age_ms));
+        let past = |at: u64| {
+            tally_wire::budget::EVIDENCE_AGE
+                .after(judged(at))
+                .later(tally_wire::budget::policy::<_, 1>())
+        };
+        assert_eq!(aged(0), 1_000);
+        assert_eq!(aged(HALF_LIFE_MS / 2), 750);
+        assert_eq!(aged(HALF_LIFE_MS), 500);
+        assert_eq!(aged(2 * HALF_LIFE_MS), 250);
+        assert_eq!(decayed(1_000, NOW, past(NOW)), 0);
         let relay = identity()?;
         let judge = Credit::new();
         judge
             .weigh(
                 &bundle(&relay, hosted(&judge, &relay, 4)?, vec![], vec![])?,
-                NOW,
+                judged(NOW),
                 None,
             )
             .map_err(text)?;
-        assert_eq!(judge.earned(&relay.public(), NOW), 4 * FEEDER_CREDIT);
         assert_eq!(
-            judge.earned(&relay.public(), NOW + HALF_LIFE_MS),
+            judge.earned(&relay.public(), judged(NOW)),
+            4 * FEEDER_CREDIT
+        );
+        assert_eq!(
+            judge.earned(&relay.public(), judged(NOW + HALF_LIFE_MS)),
             2 * FEEDER_CREDIT
         );
         assert!(
             judge
-                .weigh(
-                    &bundle(&relay, vec![], vec![], vec![])?,
-                    NOW + MAX_EVIDENCE_AGE_MS + 1,
-                    None
-                )
+                .weigh(&bundle(&relay, vec![], vec![], vec![])?, past(NOW), None)
                 .is_err()
         );
         // An older bundle never replaces a newer one.
@@ -1922,8 +2496,11 @@ mod tests {
             },
         )
         .map_err(text)?;
-        judge.weigh(&stale, NOW, None).map_err(text)?;
-        assert_eq!(judge.earned(&relay.public(), NOW), 4 * FEEDER_CREDIT);
+        judge.weigh(&stale, judged(NOW), None).map_err(text)?;
+        assert_eq!(
+            judge.earned(&relay.public(), judged(NOW)),
+            4 * FEEDER_CREDIT
+        );
         Ok(())
     }
 
@@ -1933,12 +2510,24 @@ mod tests {
         let own = Credit::new();
         // Receipts are kept only for this relay's own keys, adopted when it serves.
         own.adopt_identity(relay.public());
-        own.described(info(&feeder, relay.public(), NOW)?, NOW);
+        own.described(
+            info(&feeder, relay.public(), NOW)?,
+            crate::strikes::Now::judging(NOW),
+        );
         // A description naming someone else, and a receipt for another parent, stay out.
-        own.described(info(&identity()?, identity()?.public(), NOW)?, NOW);
-        own.record_receipt(receipt(&child, relay.public(), 4_000, NOW)?, NOW);
-        own.record_receipt(receipt(&child, identity()?.public(), 4_000, NOW)?, NOW);
-        let bundled = own.bundle(&relay, NOW).map_err(text)?;
+        own.described(
+            info(&identity()?, identity()?.public(), NOW)?,
+            crate::strikes::Now::judging(NOW),
+        );
+        own.record_receipt(
+            receipt(&child, relay.public(), 4_000, NOW)?,
+            crate::strikes::Now::judging(NOW),
+        );
+        own.record_receipt(
+            receipt(&child, identity()?.public(), 4_000, NOW)?,
+            crate::strikes::Now::judging(NOW),
+        );
+        let bundled = own.bundle(&relay, judged(NOW)).map_err(text)?;
         // By reference: no description, so no site, rides in it.
         assert!(!bundled.carries_site());
         let content = bundled.referenced().map_err(text)?;
@@ -1951,26 +2540,35 @@ mod tests {
             (1, 1, 0)
         );
         let judge = Credit::new();
-        judge.corroborate_receiver(feeder.public(), NOW);
-        judge.corroborate_relay(child.public(), NOW);
-        judge.weigh(&bundled, NOW, None).map_err(text)?;
+        judge.corroborate_receiver(feeder.public(), judged(NOW));
+        judge.corroborate_relay(child.public(), judged(NOW));
+        judge.weigh(&bundled, judged(NOW), None).map_err(text)?;
         // A judge holding no copy of the description cannot resolve the reference: the feeder
         // counts nothing on the relay's word alone.
-        assert_eq!(judge.earned(&relay.public(), NOW), 4_000);
+        assert_eq!(judge.earned(&relay.public(), judged(NOW)), 4_000);
         // Holding the same description, it resolves.
-        judge.described(info(&feeder, relay.public(), NOW)?, NOW);
-        assert_eq!(judge.earned(&relay.public(), NOW), FEEDER_CREDIT + 4_000);
+        judge.described(
+            info(&feeder, relay.public(), NOW)?,
+            crate::strikes::Now::judging(NOW),
+        );
+        assert_eq!(
+            judge.earned(&relay.public(), judged(NOW)),
+            FEEDER_CREDIT + 4_000
+        );
         // A full evidence store still bundles into one record, and alike every time.
         for _ in 0..200 {
-            own.described(info(&identity()?, relay.public(), NOW)?, NOW);
+            own.described(
+                info(&identity()?, relay.public(), NOW)?,
+                crate::strikes::Now::judging(NOW),
+            );
         }
-        let full = own.bundle(&relay, NOW).map_err(text)?;
+        let full = own.bundle(&relay, judged(NOW)).map_err(text)?;
         full.verify().map_err(text)?;
         let content = full.referenced().map_err(text)?;
         assert!(content.feeders.len() <= tally_wire::credit::MAX_EVIDENCE);
         assert!(!content.feeders.is_empty());
         assert_eq!(
-            own.bundle(&relay, NOW)
+            own.bundle(&relay, judged(NOW))
                 .map_err(text)?
                 .referenced()
                 .map_err(text)?,
@@ -1984,25 +2582,62 @@ mod tests {
         let (relay, child, feeder, early) = (identity()?, identity()?, identity()?, identity()?);
         let own = Credit::new();
         own.adopt_identity(relay.public());
-        own.described(info(&feeder, relay.public(), NOW)?, NOW);
+        own.described(
+            info(&feeder, relay.public(), NOW)?,
+            crate::strikes::Now::judging(NOW),
+        );
         // Dated past the skew: refused, so it can never stand as the newest description.
-        own.described(info(&feeder, relay.public(), NOW + 2 * MAX_SKEW_MS)?, NOW);
-        own.described(info(&early, relay.public(), NOW + 2 * MAX_SKEW_MS)?, NOW);
+        own.described(
+            info(
+                &feeder,
+                relay.public(),
+                NOW + 2 * tally_wire::budget::RECEIPT_AHEAD
+                    .span::<tally_wire::clocks::Judged>()
+                    .ms(),
+            )?,
+            crate::strikes::Now::judging(NOW),
+        );
+        own.described(
+            info(
+                &early,
+                relay.public(),
+                NOW + 2 * tally_wire::budget::RECEIPT_AHEAD
+                    .span::<tally_wire::clocks::Judged>()
+                    .ms(),
+            )?,
+            crate::strikes::Now::judging(NOW),
+        );
         own.record_receipt(
-            receipt(&child, relay.public(), 4_000, NOW + 2 * MAX_SKEW_MS)?,
-            NOW,
+            receipt(
+                &child,
+                relay.public(),
+                4_000,
+                NOW + 2 * tally_wire::budget::RECEIPT_AHEAD
+                    .span::<tally_wire::clocks::Judged>()
+                    .ms(),
+            )?,
+            crate::strikes::Now::judging(NOW),
         );
         let content = own
-            .bundle(&relay, NOW)
+            .bundle(&relay, judged(NOW))
             .map_err(text)?
             .referenced()
             .map_err(text)?;
         assert_eq!((content.feeders.len(), content.receipts.len()), (1, 0));
         assert_eq!(content.feeders[0].issued_ms, NOW);
         // Within the skew is a clock's ordinary disagreement, and is kept.
-        own.described(info(&early, relay.public(), NOW + MAX_SKEW_MS)?, NOW);
+        own.described(
+            info(
+                &early,
+                relay.public(),
+                NOW + tally_wire::budget::RECEIPT_AHEAD
+                    .span::<tally_wire::clocks::Judged>()
+                    .ms(),
+            )?,
+            crate::strikes::Now::judging(NOW),
+        );
         let content = own
-            .bundle(&relay, NOW)
+            .bundle(&relay, judged(NOW))
             .map_err(text)?
             .referenced()
             .map_err(text)?;
@@ -2018,16 +2653,19 @@ mod tests {
         let (relay, feeder) = (identity()?, identity()?);
         let own = Credit::new();
         own.adopt_identity(relay.public());
-        own.described(info(&feeder, relay.public(), NOW - 10)?, NOW);
-        let bundled = own.bundle(&relay, NOW).map_err(text)?;
+        own.described(
+            info(&feeder, relay.public(), NOW - 10)?,
+            crate::strikes::Now::judging(NOW),
+        );
+        let bundled = own.bundle(&relay, judged(NOW)).map_err(text)?;
         let judge_of = |copy: Option<ReceiverInfo>| -> Result<u64> {
             let judge = Credit::new();
-            judge.corroborate_receiver(feeder.public(), NOW);
+            judge.corroborate_receiver(feeder.public(), judged(NOW));
             if let Some(copy) = copy {
-                judge.described(copy, NOW);
+                judge.described(copy, crate::strikes::Now::judging(NOW));
             }
-            judge.weigh(&bundled, NOW, None).map_err(text)?;
-            Ok(judge.earned(&relay.public(), NOW))
+            judge.weigh(&bundled, judged(NOW), None).map_err(text)?;
+            Ok(judge.earned(&relay.public(), judged(NOW)))
         };
         assert_eq!(judge_of(None)?, 0);
         assert_eq!(
@@ -2059,9 +2697,9 @@ mod tests {
         )?;
         assert!(carried.carries_site());
         let judge = Credit::new();
-        judge.corroborate_receiver(feeder.public(), NOW);
-        judge.weigh(&carried, NOW, None).map_err(text)?;
-        assert_eq!(judge.earned(&relay.public(), NOW), FEEDER_CREDIT);
+        judge.corroborate_receiver(feeder.public(), judged(NOW));
+        judge.weigh(&carried, judged(NOW), None).map_err(text)?;
+        assert_eq!(judge.earned(&relay.public(), judged(NOW)), FEEDER_CREDIT);
         Ok(())
     }
 

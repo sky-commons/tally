@@ -32,8 +32,8 @@ use tally_mlat_solver::{
 };
 use tally_wire::batch::Hash;
 use tally_wire::{
-    ClientClockModel, ClockModel, ClockModelContent, Identity, Location, Positions, PublicKey,
-    ReceptionKey, Record, Regions, SiteId, SolutionsContent, TaggedSolution, WireError,
+    ClientClockModel, ClockModel, ClockModelContent, Location, Positions, PublicKey, ReceptionKey,
+    Record, Regions, Signer, SiteId, SolutionsContent, TaggedSolution, WireError,
 };
 
 use crate::intake::Sited;
@@ -43,7 +43,7 @@ pub type Keys = BTreeMap<PublicKey, ReceptionKey>;
 
 /// A step's work, owned.
 pub struct Job {
-    pub identity: Identity,
+    pub signer: Signer,
     pub boot_id: u64,
     pub issued_ms: u64,
     pub threads: usize,
@@ -313,6 +313,13 @@ pub fn parallel<T: Sync, R: Send, P: Part>(
 }
 
 impl Job {
+    /// The step's work, signed by the engine's signer: a job exists only for a step the host
+    /// took by a watermark read while the relay's clock judged (`tally_relay::mlat_host`'s
+    /// `take_published`), and the signer lends its key only while the clock judges still.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "stepped only by a judging watermark (`MlatHost::take_published`)"
+    )]
     pub fn run(self) -> Outcome {
         let started = Instant::now();
         let plain: Vec<Site> = self.sites.iter().map(|sited| sited.site).collect();
@@ -388,17 +395,19 @@ impl Job {
                 let Some(found) = fitted.remove(&tile) else {
                     continue;
                 };
-                let Ok(signed) = ClockModel::sign(
-                    &self.identity,
-                    &ClockModelContent {
-                        boot_id: self.boot_id,
-                        sequence: outcome.models_sequence,
-                        issued_ms: self.issued_ms,
-                        spec_version: SPEC_VERSION,
-                        inputs: found.inputs,
-                        model: found.bytes.clone(),
-                    },
-                ) else {
+                let Ok(signed) = self.signer.sign_with(|identity| {
+                    ClockModel::sign(
+                        identity,
+                        &ClockModelContent {
+                            boot_id: self.boot_id,
+                            sequence: outcome.models_sequence,
+                            issued_ms: self.issued_ms,
+                            spec_version: SPEC_VERSION,
+                            inputs: found.inputs,
+                            model: found.bytes.clone(),
+                        },
+                    )
+                }) else {
                     report.unsolved += list.len();
                     continue;
                 };
@@ -406,15 +415,17 @@ impl Job {
                 // What a client is sent of it, numbered with it: a model whose summary cannot be
                 // signed is not published, so no client is sent a solution citing a model it
                 // cannot hold.
-                let Ok(summary) = ClientClockModel::sign(
-                    &self.identity,
-                    &publish::client_model(
-                        &found.model,
-                        id,
-                        found.inputs,
-                        (self.boot_id, outcome.models_sequence, self.issued_ms),
-                    ),
-                ) else {
+                let Ok(summary) = self.signer.sign_with(|identity| {
+                    ClientClockModel::sign(
+                        identity,
+                        &publish::client_model(
+                            &found.model,
+                            id,
+                            found.inputs,
+                            (self.boot_id, outcome.models_sequence, self.issued_ms),
+                        ),
+                    )
+                }) else {
                     report.unsolved += list.len();
                     continue;
                 };
@@ -455,10 +466,9 @@ impl Job {
             solutions,
             Positions::fitting,
             |sequence, run: &[tally_wire::Solution]| {
-                Positions::sign_solutions(
-                    &self.identity,
-                    &solutions_content(content(sequence), run),
-                )
+                self.signer.sign_with(|identity| {
+                    Positions::sign_solutions(identity, &solutions_content(content(sequence), run))
+                })
             },
         );
         report.positions = positions.len();
@@ -470,7 +480,9 @@ impl Job {
             tagged,
             Positions::fitting_tagged,
             |sequence, run: &[TaggedSolution]| {
-                Positions::sign_tagged(&self.identity, &solutions_content(content(sequence), run))
+                self.signer.sign_with(|identity| {
+                    Positions::sign_tagged(identity, &solutions_content(content(sequence), run))
+                })
             },
         );
         report.tagged_positions = tagged.len();
@@ -549,6 +561,8 @@ pub fn pack_with<S>(
                     signed = Some(record);
                 }
                 Err(WireError::Oversize(_)) => fails = take,
+                // Its signer's clock is not judging: nothing more is signed.
+                Err(WireError::Unsynced) => return records,
                 // A solution the wire refuses outright: leave it out.
                 Err(_) if take == 1 => break,
                 Err(_) => fails = take,

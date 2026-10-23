@@ -99,7 +99,10 @@ impl Fields for StripeAssignment {
 pub struct PieceManifestContent {
     pub cell: Region,
     pub product: Streams,
-    /// Unix seconds, by the records' own signed wall clocks.
+    /// Unix seconds, by the origin relay's clock: the second it took the records in and seeded
+    /// them into the group, whatever their own signed times. It says when members owe the records
+    /// (the repair horizon runs from it), never whether a copy is new: each relay decides that by
+    /// the record's own signed time and the hashes it took in (RFC-0171 §3.6).
     pub second: u64,
     /// The records' hashes, ascending, without repeats.
     pub hashes: Vec<Hash>,

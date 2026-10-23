@@ -32,7 +32,7 @@
 //! aircraft and message that shares a reception with another is of the same transmission. A solution
 //! is consistent when every reception it cites, mapped through the model it cites, puts its
 //! transmit time within [`AGREE_Z`] of where the solution says ([`reception_z`]); one that is not
-//! is evidence against what it cites and nothing more. [`SETTLE_MS`] after the transmission (its
+//! is evidence against what it cites and nothing more. [`SETTLE`] after the transmission (its
 //! transmit time, signed in every solution of it, by the keeper's clock), once every final fix of
 //! it has surely arrived, it is settled ([`Book::settle`]) against its final fix, the first
 //! consistent one of its final solutions by [`decide`], each ranked by its receivers' standing as
@@ -85,6 +85,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use tally_wire::batch::Hash;
+use tally_wire::clocks::Judged;
 use tally_wire::{EnuCovariance, ObservationSet, PublicKey, Relation, TaggedSet, TransmitTime};
 
 use crate::clock::{ClockModel, Reach};
@@ -127,13 +128,21 @@ pub const GATED_BELOW: i64 = 10 * DISAGREE_COST;
 pub const HALF_LIFE_PERIODS: u64 = 144;
 /// Periods older than this (eight half-lives) are worth under a 256th and forgotten.
 pub const HORIZON_PERIODS: u64 = 8 * HALF_LIFE_PERIODS;
-/// How long after a transmission (its signed transmit time, by the keeper's clock) it is settled:
-/// once every final fix of it has surely arrived, `tally_wire::products::FINAL_FIX_ARRIVED_MS`
-/// (90 s: the latest a final fix leaves its engine, about 82 s, plus relay hops and clock skew;
-/// derived there). That is inside the 120 s a keeper holds raw behind its clock (24 bins of 5 s:
-/// a window's 11 before and 1 after, a stride of 8 and 4 spare), so the raw a settlement asks
-/// [`heard_in`] for is still held.
-pub const SETTLE_MS: u64 = tally_wire::products::FINAL_FIX_ARRIVED_MS;
+/// How long after a transmission (its signed transmit time, by the keeper's judging clock) it is
+/// settled: once every final fix of it has surely arrived, the error budget's
+/// `tally_wire::budget::FINAL_FIX_ARRIVED` (108.5 s: the latest a final fix leaves its engine,
+/// `FINAL_FIX_LEAVES`, 91.5 s, then `K`, how far the keeper's clock may be from that engine's
+/// relay's, and a repair's transit; derived there). That is inside what a keeper holds raw behind
+/// its clock (`held::SEALED_BINS_HELD` bins, less the one being sealed: a window's 11 before, its
+/// own and 1 after, a stride of 8 and 4 spare, 24 bins, 120 s), so the raw a settlement asks
+/// [`heard_in`] for is still held: the assert below holds it, so a settling or a holding changed
+/// without the other stops compiling.
+pub const SETTLE: tally_wire::budget::Tolerance = tally_wire::budget::FINAL_FIX_ARRIVED;
+
+const _: () = assert!(
+    SETTLE.span::<Judged>().ms()
+        <= (crate::held::SEALED_BINS_HELD - 1) as u64 * crate::scope::GRID_MS
+);
 /// Periods of settled receptions remembered, so a reception is settled once.
 pub const SETTLED_PERIODS: u64 = 3;
 /// Weights are thousandths.
@@ -648,10 +657,10 @@ impl Candidate for Weighed<'_> {
     }
 }
 
-/// A transmission's solutions, waiting to be settled at `due_ms` (its earliest transmit time plus
-/// `SETTLE_MS`).
+/// A transmission's solutions, waiting to be settled [`SETTLE`] after `earliest_ms`, its
+/// earliest transmit time.
 struct Pending {
-    due_ms: u64,
+    earliest_ms: u64,
     solutions: Vec<Solved>,
 }
 
@@ -671,7 +680,8 @@ pub struct Book {
     pending: BTreeMap<u64, Pending>,
     /// Every reception a pending transmission holds, and which.
     index: BTreeMap<ObservationId, u64>,
-    /// Pending transmissions by (due, number): what `settle` walks.
+    /// Pending transmissions by (earliest transmit time, number): what `settle` walks, earliest
+    /// due first.
     deadlines: BTreeSet<(u64, u64)>,
     next: u64,
     /// Receptions settled, by period, the last `SETTLED_PERIODS`.
@@ -756,10 +766,10 @@ impl Book {
     }
 
     /// A solution the keeper took ([`Solved::new`]): held with every other solution of its
-    /// transmission until it is settled, `SETTLE_MS` after the transmission. When it arrived
+    /// transmission until it is settled, [`SETTLE`] after the transmission. When it arrived
     /// decides nothing.
     pub fn add(&mut self, solved: Solved) {
-        let due_ms = solved.claimed.transmitted.unix_ms.saturating_add(SETTLE_MS);
+        let earliest_ms = solved.claimed.transmitted.unix_ms;
         let ids = solved.ids();
         let address = modes::address(solved.observations.message());
         let joined: BTreeSet<u64> = ids
@@ -779,17 +789,17 @@ impl Book {
                 // Joining two held transmissions makes them one.
                 for other in joined.iter().skip(1) {
                     if let Some(gone) = self.pending.remove(other) {
-                        self.deadlines.remove(&(gone.due_ms, *other));
+                        self.deadlines.remove(&(gone.earliest_ms, *other));
                         for moved in &gone.solutions {
                             for id in moved.ids() {
                                 self.index.insert(id, first);
                             }
                         }
                         if let Some(kept) = self.pending.get_mut(&first) {
-                            let before = kept.due_ms;
-                            kept.due_ms = kept.due_ms.min(gone.due_ms);
+                            let before = kept.earliest_ms;
+                            kept.earliest_ms = kept.earliest_ms.min(gone.earliest_ms);
                             kept.solutions.extend(gone.solutions);
-                            let after = kept.due_ms;
+                            let after = kept.earliest_ms;
                             self.deadlines.remove(&(before, first));
                             self.deadlines.insert((after, first));
                         }
@@ -803,11 +813,11 @@ impl Book {
                 self.pending.insert(
                     number,
                     Pending {
-                        due_ms,
+                        earliest_ms,
                         solutions: Vec::new(),
                     },
                 );
-                self.deadlines.insert((due_ms, number));
+                self.deadlines.insert((earliest_ms, number));
                 number
             }
         };
@@ -815,10 +825,10 @@ impl Book {
             self.index.insert(id, number);
         }
         if let Some(pending) = self.pending.get_mut(&number) {
-            if due_ms < pending.due_ms {
-                self.deadlines.remove(&(pending.due_ms, number));
-                pending.due_ms = due_ms;
-                self.deadlines.insert((due_ms, number));
+            if earliest_ms < pending.earliest_ms {
+                self.deadlines.remove(&(pending.earliest_ms, number));
+                pending.earliest_ms = earliest_ms;
+                self.deadlines.insert((earliest_ms, number));
             }
             match pending.solutions.iter_mut().find(|held| {
                 held.identity == solved.identity && held.provisional == solved.provisional
@@ -845,39 +855,40 @@ impl Book {
         }
     }
 
-    /// Settles every transmission `SETTLE_MS` or more before `now_ms` (its transmit time).
+    /// Settles every transmission [`SETTLE`] or more before the keeper's judging clock `now` (by
+    /// its transmit time).
     /// `heard` is the signed wall clock of the batch that carried a reception (given with its
     /// transmission's transmit time, Unix milliseconds), when the keeper holds it in its
     /// receiver's own signed raw (the earliest of copies). The receivers whose standing changed,
     /// so a keeper that ranks by it ranks again.
     pub fn settle(
         &mut self,
-        now_ms: u64,
+        now: Judged,
         heard: impl Fn(&ObservationId, u64) -> Option<u64>,
     ) -> BTreeSet<PublicKey> {
-        self.settle_up_to(now_ms, heard, usize::MAX).0
+        self.settle_up_to(now, heard, usize::MAX).0
     }
 
     /// As `settle`, `most` transmissions at most, earliest due first, and whether any due by
-    /// `now_ms` is left: a keeper that settles in pieces holds what it shares for one piece at a
+    /// `now` is left: a keeper that settles in pieces holds what it shares for one piece at a
     /// time, and settles the same transmissions in the same order as at once.
     pub fn settle_up_to(
         &mut self,
-        now_ms: u64,
+        now: Judged,
         heard: impl Fn(&ObservationId, u64) -> Option<u64>,
         most: usize,
     ) -> (BTreeSet<PublicKey>, bool) {
         let mut changed = BTreeSet::new();
         let mut settled = 0;
-        while let Some(&(due_ms, number)) = self.deadlines.first() {
-            if due_ms > now_ms {
+        while let Some(&(earliest_ms, number)) = self.deadlines.first() {
+            if !SETTLE.settled(earliest_ms, now) {
                 break;
             }
             if settled == most {
                 return (changed, true);
             }
             settled += 1;
-            self.deadlines.remove(&(due_ms, number));
+            self.deadlines.remove(&(earliest_ms, number));
             let Some(pending) = self.pending.remove(&number) else {
                 continue;
             };

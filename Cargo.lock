@@ -880,6 +880,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "tally-counting"
+version = "0.6.1"
+
+[[package]]
 name = "tally-feed"
 version = "0.6.1"
 dependencies = [
@@ -922,6 +926,7 @@ version = "0.6.1"
 dependencies = [
  "h3o",
  "libm",
+ "tally-counting",
  "tally-mlat-solver",
  "tally-wire",
 ]
@@ -942,6 +947,7 @@ version = "0.6.1"
 dependencies = [
  "blake2",
  "libm",
+ "tally-counting",
  "tally-wire",
  "thiserror",
 ]
@@ -955,6 +961,7 @@ dependencies = [
  "libc",
  "serde",
  "serde_json",
+ "tally-counting",
  "tally-feed",
  "tally-mlat",
  "tally-mlat-solver",
@@ -972,10 +979,12 @@ dependencies = [
  "ed25519-dalek",
  "getrandom 0.2.17",
  "h3o",
+ "libc",
  "miniz_oxide",
  "serde",
  "serde_json",
  "snow",
+ "tally-counting",
  "thiserror",
  "tokio",
 ]

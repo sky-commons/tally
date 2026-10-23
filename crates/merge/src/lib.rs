@@ -67,6 +67,10 @@
 //! - **Memory is bounded**, every table least-recently-active first (the relay's `Bounded`):
 //!   tracks, models, solutions waiting for their model and faulted keys by count.
 
+// It reaches keys (`tally_wire::Identity`): no `unsafe` code at all, forbidden, so no module
+// can allow it.
+#![forbid(unsafe_code)]
+
 pub mod contest;
 pub mod link;
 

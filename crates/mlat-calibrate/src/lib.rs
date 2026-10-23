@@ -48,7 +48,7 @@
 //! - **Feeding.** Each sensor seals a batch once a second at a phase of its own and its batch
 //!   reaches the engine 40 to 250 ms later, as `tally_mlat::replay` does for the simulator; a
 //!   reception's arrival at the feeder is the row's `timeAtServer`. The engine is
-//!   `tally_mlat::engine::Engine` with the relay's settings (settle 2 s), stepped and asked for
+//!   `tally_mlat::engine::Engine` with the relay's settings (settle `MLAT_SETTLE`, 11.5 s), stepped and asked for
 //!   provisional work every 100 ms of a virtual clock: every model and solution it publishes went
 //!   through `publish::solve_published` and the verifier, as on a relay.
 //!
@@ -94,6 +94,9 @@
 //! 65 s. `--samples` writes every scored solution for analysis; `--unverified-precision` has the
 //! sensors LocaRDS did not verify declare their sites to that precision.
 
+// It reaches keys (`tally_wire::Identity`): no `unsafe` code at all, forbidden, so no module
+// can allow it.
+#![forbid(unsafe_code)]
 // Matrix code reads as the algebra it implements: index loops over rows and columns.
 #![allow(clippy::needless_range_loop)]
 

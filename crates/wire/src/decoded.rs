@@ -26,6 +26,7 @@ use bytes::Bytes;
 use crate::WireError;
 use crate::batch::{Batch, Hash, Observation};
 use crate::beast::{Frame, FrameKind};
+use crate::clocks::{Judged, Moment, Mono};
 use crate::key::PublicKey;
 
 /// The fixed part of one encoded observation: format, 48-bit counter, signal, length.
@@ -47,10 +48,16 @@ impl std::fmt::Debug for FingerprintKey {
 impl FingerprintKey {
     /// Fresh keys from the operating system's randomness.
     pub fn random() -> Self {
+        Self::from_bytes(Self::fresh_seed())
+    }
+
+    /// Fresh key bytes from the operating system's randomness (the `getrandom` crate, no `unsafe`
+    /// of ours), what [`FingerprintKey::random`] keys from and what a relay keeps as its
+    /// directory's key. With no OS randomness, the standard library's per-process random hasher
+    /// keys, which are seeded from it too when it works at all: still unknown outside the process.
+    pub fn fresh_seed() -> [u8; 32] {
         let mut seed = [0u8; 32];
         if getrandom::getrandom(&mut seed).is_err() {
-            // No OS randomness: the standard library's per-process random hasher keys, which
-            // are seeded from it too when it works at all. Still unknown outside the process.
             use std::hash::{BuildHasher, Hasher};
             let state = std::collections::hash_map::RandomState::new();
             for (index, chunk) in seed.chunks_mut(8).enumerate() {
@@ -59,7 +66,7 @@ impl FingerprintKey {
                 chunk.copy_from_slice(&hasher.finish().to_le_bytes());
             }
         }
-        Self::from_bytes(seed)
+        seed
     }
 
     /// Keys from 32 bytes: for tests that need the same fingerprints twice.
@@ -98,6 +105,20 @@ pub mod keyed {
     pub const ADDRESS_SHARD: u8 = 0xf1;
     /// A receiver's raw shard (`tally_relay::exchange::raw_shard`).
     pub const RAW_SHARD: u8 = 0xf2;
+    /// A record's fingerprint in a relay's strike register (`tally_relay::strikes`), over its
+    /// hash.
+    pub const STRIKE: u8 = 0xf3;
+    /// A relay's state file's code (`tally_relay::durable`), over the file before it, under the
+    /// state directory's key.
+    pub const STATE: u8 = 0xf4;
+    /// A relay's state directory's key named, a keyed hash of a constant (`tally_relay::durable`):
+    /// a file written under another key is known at once.
+    pub const STATE_KEY_ID: u8 = 0xf5;
+    /// One record of a relay's table log (`tally_relay::durable::Log`).
+    pub const STATE_LOG: u8 = 0xf6;
+    /// A freshness anchor's slot in a relay's cache of verified anchors
+    /// (`tally_relay::anchors`), over its bytes.
+    pub const ANCHOR_SLOT: u8 = 0xf7;
 }
 
 /// One reception of a decoded batch: its fixed fields, where its message is in the batch's plain
@@ -219,8 +240,8 @@ impl<'a> From<&'a Observation> for ObsView<'a> {
     }
 }
 
-/// A batch whose decoding failed: the batch, so it is still forwarded raw (a format this build
-/// cannot read), and why.
+/// A batch whose decoding failed: the batch, and why (a format this build cannot read, or one it
+/// reads that is malformed).
 #[derive(Debug)]
 pub struct Undecodable {
     pub batch: Batch,
@@ -233,7 +254,7 @@ pub struct Undecodable {
 pub type Owner = Box<dyn std::any::Any + Send + Sync>;
 
 /// Why a verified batch was not made a decode: it does not decode (a format this build cannot
-/// read: still forwarded raw), or its owner had no room for it (`Decoded::from_verified_owned`).
+/// read, or a malformed one), or its owner had no room for it (`Decoded::from_verified_owned`).
 #[derive(Debug)]
 pub enum NotDecoded {
     Undecodable(Box<Undecodable>),
@@ -252,7 +273,8 @@ pub struct Decoded {
     wall_ms: u64,
     dropped: u32,
     previous: Hash,
-    stamp_ms: u64,
+    at: Moment,
+    judging: bool,
     ingest_seq: u64,
     plain: Bytes,
     obs: Box<[ObsRef]>,
@@ -345,27 +367,39 @@ impl Decoded {
     }
 
     /// Decodes `batch`, whose signature the caller has already verified (this does not verify it),
-    /// under the process's fingerprint key. `stamp_ms` is the ingest clock's reading when it was
-    /// taken and `ingest_seq` its place in the ingest order: what every later decision reads, never
-    /// a clock of its own. Inflates once and makes two allocations whatever the batch holds (the
-    /// observations' references, and for a compressed batch its inflated bytes); a message is a
-    /// slice of those bytes.
+    /// under the process's fingerprint key. `at` is the instant its stamp read the ingest's clocks
+    /// (`M` and `J` together) and `ingest_seq` its place in the ingest order: what every later
+    /// decision reads, never a clock of its own. Inflates once and makes two allocations whatever
+    /// the batch holds (the observations' references, and for a compressed batch its inflated
+    /// bytes); a message is a slice of those bytes. Taken while its clock judged: for a holder
+    /// whose clock always does (a reference engine, a replay, a test).
     pub fn from_verified(
         batch: Batch,
-        stamp_ms: u64,
+        at: Moment,
         ingest_seq: u64,
     ) -> Result<Arc<Self>, Box<Undecodable>> {
-        Self::from_verified_keyed(batch, FingerprintKey::process(), stamp_ms, ingest_seq)
+        Self::from_verified_keyed(batch, FingerprintKey::process(), at, ingest_seq)
+    }
+
+    /// As `from_verified`, taken at `at` while its clock judged or not (`judging`, read in the
+    /// same instant, [`Decoded::judging`]): a relay's, whose clock may not judge.
+    pub fn from_verified_stamped(
+        batch: Batch,
+        (at, judging): (Moment, bool),
+        ingest_seq: u64,
+    ) -> Result<Arc<Self>, Box<Undecodable>> {
+        Self::decode_unshared(batch, FingerprintKey::process(), at, judging, ingest_seq)
+            .map(|decoded| Self::shared(decoded, |_| {}))
     }
 
     /// As `from_verified`, the fingerprints under `key`.
     pub fn from_verified_keyed(
         batch: Batch,
         key: &FingerprintKey,
-        stamp_ms: u64,
+        at: Moment,
         ingest_seq: u64,
     ) -> Result<Arc<Self>, Box<Undecodable>> {
-        Self::decode_unshared(batch, key, stamp_ms, ingest_seq)
+        Self::decode_unshared(batch, key, at, true, ingest_seq)
             .map(|decoded| Self::shared(decoded, |_| {}))
     }
 
@@ -378,18 +412,25 @@ impl Decoded {
     /// decode alive that nothing has charged, not even for an instant. So a decode is charged
     /// exactly once, by whoever made it, however many stages share it, and none is alive that its
     /// own charge does not hold.
+    /// `judging` is whether the clock judged when the stamp was read ([`Decoded::judging`]), read
+    /// in the same instant as `at`.
     pub fn from_verified_owned(
         batch: Batch,
-        stamp_ms: u64,
+        (at, judging): (Moment, bool),
         ingest_seq: u64,
         owner: impl FnOnce(&Self) -> Option<Owner>,
         held: impl FnOnce(&Arc<Self>),
     ) -> Result<Arc<Self>, NotDecoded> {
-        let mut decoded =
-            match Self::decode_unshared(batch, FingerprintKey::process(), stamp_ms, ingest_seq) {
-                Ok(decoded) => decoded,
-                Err(undecodable) => return Err(NotDecoded::Undecodable(undecodable)),
-            };
+        let mut decoded = match Self::decode_unshared(
+            batch,
+            FingerprintKey::process(),
+            at,
+            judging,
+            ingest_seq,
+        ) {
+            Ok(decoded) => decoded,
+            Err(undecodable) => return Err(NotDecoded::Undecodable(undecodable)),
+        };
         match owner(&decoded) {
             Some(charge) => decoded.owner = Some(Held(charge)),
             None => return Err(NotDecoded::NoRoom(decoded.batch.clone())),
@@ -401,7 +442,8 @@ impl Decoded {
     fn decode_unshared(
         batch: Batch,
         key: &FingerprintKey,
-        stamp_ms: u64,
+        at: Moment,
+        judging: bool,
         ingest_seq: u64,
     ) -> Result<Self, Box<Undecodable>> {
         match Self::decode(&batch, key) {
@@ -414,7 +456,8 @@ impl Decoded {
                 wall_ms: header.wall_ms,
                 dropped: header.dropped,
                 previous: header.previous,
-                stamp_ms,
+                at,
+                judging,
                 ingest_seq,
                 plain,
                 obs,
@@ -514,9 +557,33 @@ impl Decoded {
         &self.previous
     }
 
-    /// The ingest clock when the batch was taken: the only time a later stage decides by.
+    /// The ingest's monotonic clock when the batch was taken, in milliseconds: the only time a
+    /// later stage orders and ages by.
     pub fn stamp_ms(&self) -> u64 {
-        self.stamp_ms
+        self.at.mono().ms()
+    }
+
+    /// The ingest's monotonic clock when the batch was taken.
+    pub fn mono(&self) -> Mono {
+        self.at.mono()
+    }
+
+    /// The judging clock when the batch was taken: what its signed time is compared against
+    /// (`crate::budget`), as the stamp is the monotonic clock every later stage orders by. The two
+    /// part when the host's clock is stepped; a holder whose one clock is both has them equal.
+    pub fn judged(&self) -> Judged {
+        self.at.judged()
+    }
+
+    /// The instant its stamp read both clocks.
+    pub fn at(&self) -> Moment {
+        self.at
+    }
+
+    /// Whether the clock judged when the batch was stamped: one taken while it did not is never
+    /// blamed, and nothing is signed from it (RFC-0171 §3.6).
+    pub fn judging(&self) -> bool {
+        self.judging
     }
 
     /// The batch's place in the ingest order.
@@ -632,6 +699,7 @@ fn round(v: &mut [u64; 4]) {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::disallowed_methods, reason = "a test's scripted readings")]
     use super::*;
     use crate::batch::{BatchContent, Codec, format};
     use crate::key::Identity;
@@ -711,8 +779,13 @@ mod tests {
         for codec in [Codec::Plain, Codec::Deflate] {
             let content = content(observations());
             let batch = Batch::sign_with(&identity, &content, codec)?;
-            let decoded = Decoded::from_verified_keyed(batch.clone(), &key, 11, 12)
-                .map_err(|undecodable| undecodable.error)?;
+            let decoded = Decoded::from_verified_keyed(
+                batch.clone(),
+                &key,
+                crate::clocks::recorded::aligned(11),
+                12,
+            )
+            .map_err(|undecodable| undecodable.error)?;
             assert_eq!(decoded.batch(), &batch);
             let format = match codec {
                 Codec::Plain => crate::batch::BATCH_FORMAT,
@@ -769,9 +842,10 @@ mod tests {
         let count_at = 1 + 32 + 8 + 8 + 4 + 8 + 4 + 32;
         bytes[count_at..count_at + 4].copy_from_slice(&u32::MAX.to_be_bytes());
         let forged = Batch::from_bytes(bytes)?;
-        let undecodable = Decoded::from_verified(forged.clone(), 0, 0)
-            .err()
-            .ok_or(WireError::Timeout)?;
+        let undecodable =
+            Decoded::from_verified(forged.clone(), crate::clocks::recorded::aligned(0), 0)
+                .err()
+                .ok_or(WireError::Timeout)?;
         assert_eq!(undecodable.batch, forged);
         assert!(forged.content().is_err());
         Ok(())

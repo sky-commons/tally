@@ -1,5 +1,7 @@
+#![allow(clippy::disallowed_methods, reason = "a test's scripted readings")]
 use super::*;
 use crate::sim::{self, Rng, Scenario};
+use tally_wire::clocks::recorded::{aligned, moment};
 use tally_wire::{Identity, Observation};
 
 /// A DF11 all-call reply of `address`, which MLAT uses.
@@ -57,14 +59,14 @@ fn what_mlat_uses_is_held_once_in_24_bytes_and_the_rest_is_never_held() {
                 (b'1', vec![1, 2], 12),
             ],
         ),
-        9_000,
+        aligned(9_000),
     );
     assert_eq!((added.new, added.filtered), (1, 2));
     // The same reception again, in an earlier batch: held once, with the earlier wall clock.
     held.add(
         key,
         &content(6_000, &[(format::MODE_S_SHORT, reply.clone(), 10)]),
-        6_000,
+        aligned(6_000),
     );
     held.seal_through(1);
     let bins = held.bins(0, 10);
@@ -76,7 +78,7 @@ fn what_mlat_uses_is_held_once_in_24_bytes_and_the_rest_is_never_held() {
     let late = held.add(
         key,
         &content(7_000, &[(format::MODE_S_SHORT, reply, 99)]),
-        7_000,
+        aligned(7_000),
     );
     assert_eq!((late.late, late.new), (1, 0));
     held.forget_before(2);
@@ -91,13 +93,13 @@ fn beyond_its_bytes_a_receivers_raw_of_the_bin_is_refused_whole() {
     let first = Identity::from_seed([1; 32]).public();
     let second = Identity::from_seed([2; 32]).public();
     let mut held = Held::new(4_000);
-    let taken = held.add(first, &content(1, &replies(10, 0)), 1);
+    let taken = held.add(first, &content(1, &replies(10, 0)), aligned(1));
     assert_eq!(taken.new, 10);
-    let refused = held.add(second, &content(1, &replies(400, 100)), 1);
+    let refused = held.add(second, &content(1, &replies(400, 100)), aligned(1));
     assert_eq!((refused.new, refused.refused), (0, 400));
     assert!(held.bytes() <= 4_000, "{}", held.bytes());
     // Refused for the bin: a later batch of it there is refused too, and counted.
-    let again = held.add(second, &content(2, &replies(1, 900)), 2);
+    let again = held.add(second, &content(2, &replies(1, 900)), aligned(2));
     assert_eq!(again.refused, 1);
     held.seal_through(0);
     let bins = held.bins(0, 0);
@@ -123,10 +125,12 @@ fn over_its_count_a_receivers_bin_is_refused_whole_in_any_order() {
     let mut sealed = Vec::new();
     for order in [[0, 1, 2], [2, 1, 0], [1, 2, 0]] {
         let mut held = Held::with(limits, 1, SealedBins::new());
-        held.add(quiet, &content(1_500, &replies(2, 50)), 1_500);
+        held.add(quiet, &content(1_500, &replies(2, 50)), aligned(1_500));
         let mut refused = 0;
         for at in order {
-            refused += held.add(busy, &batches[at], batches[at].wall_ms).refused;
+            refused += held
+                .add(busy, &batches[at], aligned(batches[at].wall_ms))
+                .refused;
         }
         assert_eq!(refused, 8, "{order:?}");
         held.seal_through(1);
@@ -176,7 +180,7 @@ fn fill(receptions: &[Reception], opens: &mut [Open], owner: impl Fn(&PublicKey)
                 previous: [0; 32],
                 observations: vec![reception.observation.clone()],
             },
-            reception.wall_ms,
+            aligned(reception.wall_ms),
         );
     }
 }
@@ -189,7 +193,7 @@ fn sealing_any_split_by_receiver_gives_the_whole_holders_bin() {
         let receptions = sky(seed);
         let mut whole = Held::new(usize::MAX);
         for reception in &receptions {
-            whole.add_one(reception, reception.wall_ms);
+            whole.add_one(reception, aligned(reception.wall_ms));
         }
         whole.seal_through(i64::MAX - 1);
         let expected = whole.bins(i64::MIN, i64::MAX - 1);
@@ -240,7 +244,7 @@ fn a_receiver_forgotten_is_gone_from_every_bin() {
     let gone = receptions[0].receiver;
     let mut held = Held::new(usize::MAX);
     for reception in &receptions {
-        held.add_one(reception, reception.wall_ms);
+        held.add_one(reception, aligned(reception.wall_ms));
     }
     held.seal_through(bin_of(receptions[0].wall_ms));
     held.forget_receiver(&gone);
@@ -270,7 +274,7 @@ fn receivers_forgotten_together_are_forgotten_as_one_by_one() {
         let sealed = SealedBins::new();
         let mut held = Held::with(Limits::UNBOUNDED, 2, sealed.clone());
         for reception in &receptions {
-            held.add_one(reception, reception.wall_ms);
+            held.add_one(reception, aligned(reception.wall_ms));
         }
         held.seal_through(i64::MAX - 1);
         (held, sealed)
@@ -317,7 +321,7 @@ fn receivers_are_forgotten_one_bin_at_a_time_each_charged_before_it_is_built() {
         let sealed = SealedBins::new();
         let mut held = Held::with(Limits::UNBOUNDED, 2, sealed.clone());
         for reception in &receptions {
-            held.add_one(reception, reception.wall_ms);
+            held.add_one(reception, aligned(reception.wall_ms));
         }
         held.seal_through(i64::MAX - 1);
         (held, sealed)
@@ -407,7 +411,7 @@ fn a_reader_of_the_sealed_bins_sees_what_the_holder_seals_and_forgets() {
     let sealed = SealedBins::new();
     let mut held = Held::with(Limits::UNBOUNDED, 2, sealed.clone());
     for reception in &receptions {
-        held.add_one(reception, reception.wall_ms);
+        held.add_one(reception, aligned(reception.wall_ms));
     }
     assert!(sealed.is_empty());
     let first = bin_of(receptions.iter().map(|r| r.wall_ms).min().unwrap_or(0));
@@ -436,7 +440,7 @@ fn a_sealed_bin_costs_what_admission_reserves() {
     };
     let mut held = Held::new(usize::MAX);
     sim::run_into(&scenario, &mut |reception, _| {
-        held.add_one(&reception, reception.wall_ms);
+        held.add_one(&reception, aligned(reception.wall_ms));
     });
     held.seal_through(i64::MAX - 1);
     let bins = held.bins(i64::MIN, i64::MAX - 1);
@@ -466,7 +470,7 @@ fn open_raw_costs_what_admission_reserves() {
                     batch * 1_000,
                     &replies(per_receiver / 5, n as u64 * 10_000 + batch * 1_000),
                 ),
-                batch * 1_000,
+                aligned(batch * 1_000),
             );
         }
     }
@@ -483,12 +487,16 @@ fn open_raw_costs_what_admission_reserves() {
 #[test]
 fn a_receivers_cost_follows_its_rates() {
     let cost = Rates::MEASURED.cost(2_000);
-    // A bin, its settling and the second it may open ahead of its stamp (`AHEAD_MS`) of wanted
-    // raw at the ceiling, 28 bytes each, and three open bins' allowance.
-    assert_eq!(AHEAD_MS, 1_000);
+    // A bin, its settling and how far ahead of its judging time it may open (`AHEAD_MS`, the
+    // budget's `MLAT_AHEAD`) of wanted raw at the ceiling, 28 bytes each, and four open bins'
+    // allowance.
+    assert_eq!(
+        tally_wire::budget::MLAT_AHEAD.after(tally_wire::clocks::recorded::judged(0)),
+        tally_wire::clocks::recorded::judged(AHEAD_MS)
+    );
     assert_eq!(
         cost.open,
-        1_800 * 8 * OPEN_BYTES_PER_RECEPTION + 3 * OPEN_BYTES_PER_RECEIVER_BIN
+        1_800 * 145 / 10 * OPEN_BYTES_PER_RECEPTION + 4 * OPEN_BYTES_PER_RECEIVER_BIN
     );
     // Sealed raw at the kept ceiling every receiver is held to, never at the mean.
     assert_eq!(KEPT_PER_RECEIVER_BIN, 300 * 5);
@@ -514,7 +522,7 @@ fn a_bin_sealed_within_its_room_refuses_the_busiest_receivers_whole_whatever_the
     let whole = |order: &[usize], owners: usize| -> Vec<Fragment> {
         let mut opens: Vec<Open> = (0..owners).map(|_| Open::new(Limits::UNBOUNDED)).collect();
         for n in order {
-            opens[n % owners].add(keys[*n], &batch(*n), 1_000 + *n as u64);
+            opens[n % owners].add(keys[*n], &batch(*n), aligned(1_000 + *n as u64));
         }
         opens
             .iter_mut()
@@ -576,7 +584,11 @@ fn a_holder_sized_for_its_receivers_never_refuses_a_busy_one_whole() -> Result<(
     let mut open = Open::new(Limits::UNBOUNDED);
     for (n, key) in keys.iter().enumerate() {
         let heard = if n == 0 { busy } else { over };
-        open.add(*key, &content(1_000, &replies(heard as u64, 0)), 1_000);
+        open.add(
+            *key,
+            &content(1_000, &replies(heard as u64, 0)),
+            aligned(1_000),
+        );
     }
     let fragments = open.take_through(0);
     // One bin's share of what a holder of these receivers reserves for its sealed raw.
@@ -672,7 +684,7 @@ fn stamped(
 ) -> Result<Arc<Decoded>, String> {
     let signed = tally_wire::Batch::sign(receiver, &BatchContent { sequence, ..batch })
         .map_err(|error| error.to_string())?;
-    Decoded::from_verified(signed, stamp_ms, sequence)
+    Decoded::from_verified(signed, aligned(stamp_ms), sequence)
         .map_err(|undecodable| undecodable.error.to_string())
 }
 
@@ -749,7 +761,10 @@ fn a_bin_far_ahead_of_its_batchs_stamp_is_refused_and_counted() -> Result<(), St
     let empty = open.bytes();
     // Bins from one to an hour ahead, each a batch: none opened, every observation counted.
     let mut ahead = 0;
-    for (n, lead) in [6_000u64, 60_000, 3_600_000].into_iter().enumerate() {
+    for (n, lead) in [AHEAD_MS + GRID_MS, 60_000, 3_600_000]
+        .into_iter()
+        .enumerate()
+    {
         let batch = stamped(
             &liar,
             n as u64,
@@ -775,7 +790,12 @@ fn a_bin_far_ahead_of_its_batchs_stamp_is_refused_and_counted() -> Result<(), St
     // A batch is judged by its own stamp on every way in, however late it is taken (one that
     // waited for its receiver's description too): there is no way in that takes a
     // later stamp in its place.
-    let early = stamped(&honest, 1, content(stamp + 6_000, &replies(3, 10)), stamp)?;
+    let early = stamped(
+        &honest,
+        1,
+        content(stamp + AHEAD_MS + GRID_MS, &replies(3, 10)),
+        stamp,
+    )?;
     assert_eq!(open.add_decoded_taking(&early, &mut |_| true).ahead, 3);
     // A holder that decides lateness by what it took (one engine holding its own raw, the
     // reference drive) refuses the same raw ahead of its stamp: whether a bin too far ahead opens
@@ -785,17 +805,25 @@ fn a_bin_far_ahead_of_its_batchs_stamp_is_refused_and_counted() -> Result<(), St
     let mut in_line = Open::new(Limits::UNBOUNDED);
     assert_eq!(in_line.add_decoded(&far).ahead, 4);
     let mut in_line = Open::new(Limits::UNBOUNDED);
-    assert_eq!(in_line.add(liar.public(), &far_content, stamp).ahead, 4);
+    assert_eq!(
+        in_line
+            .add(liar.public(), &far_content, aligned(stamp))
+            .ahead,
+        4
+    );
     let mut held = Held::new(usize::MAX);
     assert_eq!(held.add_decoded(&far).ahead, 4);
-    assert_eq!(held.add(liar.public(), &far_content, stamp).ahead, 4);
+    assert_eq!(
+        held.add(liar.public(), &far_content, aligned(stamp)).ahead,
+        4
+    );
     let one = Reception {
         receiver: liar.public(),
         epoch: far_content.counter_epoch,
         observation: far_content.observations[0].clone(),
         wall_ms: far_content.wall_ms,
     };
-    assert_eq!(held.add_one(&one, stamp).ahead, 1);
+    assert_eq!(held.add_one(&one, aligned(stamp)).ahead, 1);
     assert!(held.is_empty());
     Ok(())
 }
@@ -905,7 +933,7 @@ fn a_reseal_and_a_seals_sorts_checkpoint_between_their_items() {
     let mut open = Open::new(Limits::UNBOUNDED);
     for seed in 1..=100u8 {
         let key = Identity::from_seed([seed; 32]).public();
-        open.add(key, &content(1_000, &replies(100, 0)), 1_000);
+        open.add(key, &content(1_000, &replies(100, 0)), aligned(1_000));
     }
     let sealed = Bin::seal_from(0, open.take_through(0), 1);
     let records = sealed.records.len();
@@ -950,7 +978,7 @@ fn forgetting_many_receivers_at_once_costs_a_lookup_a_record() {
         .collect();
     let mut open = Open::new(Limits::UNBOUNDED);
     for key in &keys {
-        open.add(*key, &content(1_000, &replies(100, 0)), 1_000);
+        open.add(*key, &content(1_000, &replies(100, 0)), aligned(1_000));
     }
     let fragments = open.take_through(0);
     let bin = Bin::seal_from(0, fragments, 1);
@@ -980,4 +1008,86 @@ fn forgetting_many_receivers_at_once_costs_a_lookup_a_record() {
         "without {} receivers {half} checkpoints, without one {one}: a pass over the records either way",
         leaving.len()
     );
+}
+
+/// A batch taken at `stamp_ms` on its holder's monotonic clock and `judge_ms` on its judging
+/// clock.
+fn taken_at(
+    receiver: &Identity,
+    sequence: u64,
+    batch: BatchContent,
+    (stamp_ms, judge_ms): (u64, u64),
+) -> Result<Arc<Decoded>, String> {
+    let signed = tally_wire::Batch::sign(receiver, &BatchContent { sequence, ..batch })
+        .map_err(|error| error.to_string())?;
+    Decoded::from_verified(signed, moment(stamp_ms, judge_ms), sequence)
+        .map_err(|undecodable| undecodable.error.to_string())
+}
+
+/// An honest receiver signs up to `tally_wire::budget::MLAT_AHEAD` ahead of a relay's judging
+/// clock (its feeder's reference, E above true time, against a relay E below): its raw of the bin
+/// that holds its signed time that far ahead is held, and only raw of a later bin is refused as
+/// ahead. Before `AHEAD_MS` was derived from the budget, it was a second, and that honest raw was
+/// refused.
+#[test]
+fn raw_signed_as_far_ahead_as_an_honest_receiver_signs_is_held() -> Result<(), String> {
+    let receiver = Identity::from_seed([11; 32]);
+    let judge: u64 = 61_500;
+    let ahead = tally_wire::budget::MLAT_AHEAD
+        .after(tally_wire::clocks::recorded::judged(judge))
+        .ms();
+    let mut open = Open::new(Limits::UNBOUNDED);
+    let held = taken_at(&receiver, 0, content(ahead, &replies(4, 0)), (judge, judge))?;
+    let added = open.add_decoded(&held);
+    assert_eq!((added.new, added.ahead, added.late), (4, 0, 0), "{ahead}");
+    let next_bin = (bin_of(ahead) + 1) as u64 * GRID_MS;
+    let past = taken_at(
+        &receiver,
+        1,
+        content(next_bin, &replies(4, 0)),
+        (judge, judge),
+    )?;
+    let added = open.add_decoded(&past);
+    assert_eq!((added.new, added.ahead), (0, 4), "{next_bin}");
+    Ok(())
+}
+
+/// A holder that steps on its monotonic clock judges a bin by the judging clock the batch was
+/// taken at (`tally_wire::budget`: a signed time is compared against a judging clock), so a step
+/// of its host's judging clock after start offsets nothing: an honest receiver's raw, signed by
+/// the judging clock 30 s from the monotonic one either way, is held, neither ahead nor late.
+/// Before, the bins were compared with the monotonic clock aligned to the judging one once at
+/// start, so after a forward step the raw was refused as ahead, and after a backward one as late.
+#[test]
+fn a_host_clock_step_after_start_does_not_offset_the_bins() -> Result<(), String> {
+    let closing = Closing {
+        step_ms: 1_000,
+        settle_ms: 2_000,
+    };
+    let receiver = Identity::from_seed([10; 32]);
+    let stamp: u64 = 61_500;
+    for (sequence, apart) in [(0_u64, 30_000_i64), (1, -30_000)] {
+        let judge = stamp.saturating_add_signed(apart);
+        let mut open = Open::new(Limits::UNBOUNDED).closing(closing);
+        let batch = taken_at(
+            &receiver,
+            sequence,
+            content(judge - 500, &replies(4, 0)),
+            (stamp, judge),
+        )?;
+        let added = open.add_decoded(&batch);
+        assert_eq!(
+            (added.new, added.ahead, added.late),
+            (4, 0, 0),
+            "judging clock {apart} ms from the monotonic one"
+        );
+        // Its bin taken at the first step whose judging time is its end and its settling.
+        let bin = bin_of(judge - 500);
+        let due = (bin + 1) * GRID_MS as i64 + 2_000 - apart;
+        assert_eq!(
+            closing.close_at_judged(bin, moment(stamp, judge)),
+            u64::try_from(due).unwrap_or(0).div_ceil(1_000) * 1_000
+        );
+    }
+    Ok(())
 }

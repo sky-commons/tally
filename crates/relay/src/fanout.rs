@@ -36,7 +36,7 @@
 //! ancestors at the resolutions anyone subscribed at, a few hash lookups whatever the number of
 //! subscribers; every offer is then the subscription's own rule (`Subscription::wants`).
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -44,6 +44,7 @@ use tally_wire::{Record, Region};
 use tokio::sync::Notify;
 
 use crate::budget::{Charge, Gauge, Store};
+use crate::footprint::Deque;
 
 use crate::hub::Item;
 use crate::subscription::{ClientPlace, ClientSubscription, Subscription, directory_wants};
@@ -67,11 +68,13 @@ pub enum FellBehind {
     Age,
 }
 
-/// One subscriber's queue of `T`, each with its size in bytes and its ingest stamp.
+/// One subscriber's queue of `T`, each with its size in bytes and its ingest stamp: a [`Deque`],
+/// so what it allocates is bounded by what it holds ([`Queue::allocated`]) and given back as it
+/// empties.
 #[derive(Debug)]
 pub struct Queue<T> {
     bounds: Bounds,
-    items: VecDeque<(T, usize, u64)>,
+    items: Deque<(T, usize, u64)>,
     bytes: usize,
 }
 
@@ -79,7 +82,7 @@ impl<T> Queue<T> {
     pub fn new(bounds: Bounds) -> Self {
         Self {
             bounds,
-            items: VecDeque::new(),
+            items: Deque::new(),
             bytes: 0,
         }
     }
@@ -128,6 +131,16 @@ impl<T> Queue<T> {
     pub fn clear(&mut self) {
         self.items.clear();
         self.bytes = 0;
+    }
+
+    /// What its slots allocate now (not what the items keep alive, [`Queue::bytes`]).
+    pub fn allocated(&self) -> usize {
+        self.items.bytes()
+    }
+
+    /// What one more item's slot allocates more ([`Deque::growth`]).
+    pub fn growth(&self) -> usize {
+        self.items.growth()
     }
 
     pub fn bytes(&self) -> usize {
@@ -211,42 +224,66 @@ pub fn item_bytes(item: &Item) -> usize {
     }
 }
 
-/// What one item allocates once, whatever takes it: its record's `Arc` and the `Arc` of the one
-/// charge every queue holding it shares.
-pub const ITEM_BYTES: usize = 2 * tally_wire::decoded::ARC_HEADER
-    + std::mem::size_of::<Record>()
-    + std::mem::size_of::<Charge>();
+/// What one item allocates once, whatever takes it: itself in the one `Arc` every queue holding it
+/// shares, its record's `Arc`, and the `Arc` of the one charge they share.
+pub const ITEM_BYTES: usize = crate::footprint::arc::<Item>()
+    + crate::footprint::arc::<Record>()
+    + crate::footprint::arc::<Charge>();
 
-/// What one queue's slot for an item takes: the item's clone, its claim on the charge, its bytes
-/// and its stamp ([`Queued`]).
-pub const SLOT_BYTES: usize = std::mem::size_of::<(Queued, usize, u64)>();
+/// One queue's slot for an item: its claim on the item and on the charge, its bytes and its stamp.
+type Slot = (Queued, usize, u64);
 
-/// What the fan-out charges for an item `takers` queues take (`budget::Store::Fanout`): what it
-/// allocates itself, the item once ([`ITEM_BYTES`]) and a slot in each queue ([`SLOT_BYTES`]), and
-/// a record's bytes where no allocation of their own carries their charge (any record but a batch
-/// kept at ingest, whose signed bytes and decode are charged once for their life, whoever holds
-/// them, `budget::Store::Decoded`). Before, every item was charged its decode's footprint here as
-/// well as in the epochs, the notes and the orphans, and no queue's slots were charged at all.
-pub fn item_charge(item: &Item, takers: usize) -> usize {
-    let record = match &*item.record {
-        Record::Batch(batch) if batch.is_owned() => 0,
-        record => record.encoded_len(),
-    };
-    // A client form is a copy of the record's bytes of its own.
+/// The charges a link holds in hand, by its hold, in the order it took them ([`InHand`]).
+type Held = Deque<(u64, Arc<Charge>, usize)>;
+
+/// What a subscriber's queue and its link's hand allocate for each item they hold, at most, as
+/// planned: its slot in a queue, or its place among the charges in hand, each in a deque that
+/// keeps a quarter again what it holds ([`Deque`]), whichever is more, since an item is in one or
+/// the other and the two are held to one bound together (`Bounds`).
+pub const SLOT_BYTES: usize = max(
+    crate::footprint::vec::<Slot>(1) * 5 / 4,
+    crate::footprint::vec::<(u64, Arc<Charge>, usize)>(1) * 5 / 4,
+);
+
+const fn max(a: usize, b: usize) -> usize {
+    if a > b { a } else { b }
+}
+
+/// What a subscriber's queue and its link's hand allocate at most whatever they hold, as planned:
+/// the slots a queue and its hand may each keep beyond a quarter again what they hold
+/// (`Deque::LEAST`).
+pub const LISTENER_BYTES: usize = Deque::<Slot>::bytes_at_most(0) + Held::bytes_at_most(0);
+
+/// What the fan-out charges for an item, once, however many queues take it
+/// (`budget::Store::Fanout`): what it allocates itself ([`ITEM_BYTES`]), and a record's bytes where
+/// no allocation of their own carries their charge (any record but a batch kept at ingest, whose
+/// signed bytes and decode are charged once for their life, whoever holds them,
+/// `budget::Store::Decoded`). Each queue's slots are charged by the queue, as they are allocated
+/// ([`Queue::allocated`], `State::settle`). Before, every item was charged its decode's footprint
+/// here as well as in the epochs, the notes and the orphans; then a slot of an assumed size in each
+/// queue, which a queue's spare capacity passed and never gave back.
+pub fn item_charge(item: &Item) -> usize {
+    // What the record allocates of its own (`Record::allocated`: nothing for a batch kept at
+    // ingest), the aircraft's cells it is routed by, and a client form: its own record and item,
+    // each in an `Arc` (its place's cells are the item's, shared).
+    let record = item.record.allocated();
+    let points = item.points.as_ref().map_or(0, |points| {
+        tally_wire::decoded::ARC_HEADER + std::mem::size_of_val(&**points)
+    });
     let client = item.client.as_ref().map_or(0, |client| {
-        client.record.encoded_len()
-            + std::mem::size_of::<tally_wire::ClientRecord>()
-            + std::mem::size_of::<crate::subscription::ClientItem>()
-            + 2 * tally_wire::decoded::ARC_HEADER
+        client.record.allocated()
+            + crate::footprint::arc::<tally_wire::ClientRecord>()
+            + crate::footprint::arc::<crate::subscription::ClientItem>()
     });
     ITEM_BYTES
-        .saturating_add(takers.saturating_mul(SLOT_BYTES))
         .saturating_add(record)
+        .saturating_add(points)
         .saturating_add(client)
 }
 
 /// An item as a queue holds it: with the one charge every queue holding it shares.
-type Queued = (Item, Arc<Charge>);
+/// A queue's claim on an item, shared by every queue that holds it, and on its charge.
+type Queued = (Arc<Item>, Arc<Charge>);
 
 /// An item a link took from its queue, with the charge every holder of it shares and its place
 /// among what its subscriber holds in hand: held for as long as the link holds the item
@@ -260,7 +297,7 @@ type Queued = (Item, Arc<Charge>);
 /// charged by itself, whoever holds it.
 #[derive(Debug)]
 pub struct Taken {
-    item: Item,
+    item: Arc<Item>,
     charge: Arc<Charge>,
     hold: Hold,
 }
@@ -278,18 +315,14 @@ pub struct Hold {
 impl Drop for Hold {
     fn drop(&mut self) {
         // Taken out under the lock, dropped after it: a charge released wakes its gauge's waiters.
-        let released = self
-            .subscriber
-            .queue
-            .lock()
-            .ok()
-            .and_then(|mut state| state.in_hand.release(self.id));
+        let released = self.subscriber.queue.lock().ok().and_then(|mut state| {
+            let released = state.in_hand.release(self.id);
+            state.settle();
+            released
+        });
         drop(released);
     }
 }
-
-/// Charges held in hand, by hold, each with its bytes.
-type Held = HashMap<u64, (Arc<Charge>, usize)>;
 
 /// What one subscriber's link holds in hand: each item's charge it took, by its hold, and their
 /// bytes together.
@@ -301,16 +334,26 @@ struct InHand {
 }
 
 impl InHand {
+    /// What it allocates now.
+    fn allocated(&self) -> usize {
+        self.held.bytes()
+    }
+
     fn take(&mut self, charge: Arc<Charge>, bytes: usize) -> u64 {
         let id = self.next;
         self.next += 1;
-        self.held.insert(id, (charge, bytes));
+        // Taken in order, so the hand is ordered by hold.
+        self.held.push_back((id, charge, bytes));
         self.bytes += bytes;
         id
     }
 
     fn release(&mut self, id: u64) -> Option<Arc<Charge>> {
-        let (charge, bytes) = self.held.remove(&id)?;
+        let at = self
+            .held
+            .binary_search_by_key(&id, |(held, _, _)| *held)
+            .ok()?;
+        let (_, charge, bytes) = self.held.remove(at)?;
         self.bytes -= bytes;
         Some(charge)
     }
@@ -338,7 +381,7 @@ impl Taken {
 
     /// The item, its charge let go: for a test that reads what it was sent.
     pub fn into_item(self) -> Item {
-        self.item
+        Arc::unwrap_or_clone(self.item)
     }
 }
 
@@ -366,23 +409,53 @@ struct State {
     fell: Option<Fell>,
     /// What its link took and has not yet sent ([`Hold`]).
     in_hand: InHand,
+    /// What its queue's slots and its hand allocate, charged to the fan-out's store
+    /// (`budget::Store::Fanout`) before they grow, and brought down to it as they shrink.
+    slots: Charge,
 }
 
 impl State {
+    /// What its queue's slots and its hand allocate now.
+    fn allocated(&self) -> usize {
+        self.queue.allocated() + self.in_hand.allocated()
+    }
+
+    /// Its charge brought down to what it allocates now.
+    fn settle(&mut self) {
+        let allocated = self.allocated();
+        self.slots.shrink_to(allocated);
+        debug_assert_eq!(self.slots.bytes(), allocated);
+    }
+
     /// Fallen (behind, or to be resynchronised): what it holds, queued and in hand, is no use to
     /// it now, and is let go at once, returned to be dropped outside the lock.
     fn fall(&mut self, fell: Fell) -> (Queue<Queued>, Held) {
         self.fell = Some(fell);
         let bounds = self.queue.bounds;
-        (
+        let fallen = (
             std::mem::replace(&mut self.queue, Queue::new(bounds)),
             self.in_hand.release_all(),
-        )
+        );
+        self.settle();
+        fallen
     }
 }
 
 impl Subscriber {
-    fn offer(&self, item: &Item, charge: &Arc<Charge>, bytes: usize) {
+    /// How it falls for `why`: a directory link is resynchronised, never let go; any other is
+    /// let go. The one place that says so, so no path lets a directory link go.
+    fn fell(&self, why: FellBehind) -> Fell {
+        if self.resyncs {
+            Fell::Resync
+        } else {
+            Fell::Behind(why)
+        }
+    }
+
+    /// Offers `item`, its slot's growth paid from `reserved` (what `Router::publish` charged for
+    /// it with the item, so no publisher meanwhile takes the room it found), any shortfall
+    /// charged now and any surplus given back.
+    fn offer(&self, item: &Arc<Item>, charge: &Arc<Charge>, bytes: usize, mut reserved: Charge) {
         let Ok(mut state) = self.queue.lock() else {
             return;
         };
@@ -391,22 +464,48 @@ impl Subscriber {
         }
         let in_hand = state.in_hand.bytes;
         let mut fallen = None;
-        if let Err(why) = state.queue.push_beside(
-            (item.clone(), Arc::clone(charge)),
-            bytes,
-            item.stamp_ms,
-            in_hand,
-        ) {
+        // Its slot is charged before the queue grows for it: the store full, it falls behind as
+        // a queue past its bounds does.
+        let growth = state.queue.growth();
+        let paid = if reserved.bytes() == 0 {
+            state.slots.try_grow(growth)
+        } else {
+            let short = growth.saturating_sub(reserved.bytes());
+            (short == 0 || reserved.try_grow(short)) && state.slots.absorb(reserved).is_ok()
+        };
+        let pushed = if paid {
+            state.queue.push_beside(
+                (Arc::clone(item), Arc::clone(charge)),
+                bytes,
+                item.stamp_ms,
+                in_hand,
+            )
+        } else {
+            Err(FellBehind::Bytes)
+        };
+        state.settle();
+        if let Err(why) = pushed {
             // What it holds is no use to it now: let it go at once, not when it is read.
-            fallen = Some(state.fall(if self.resyncs {
-                Fell::Resync
-            } else {
-                Fell::Behind(why)
-            }));
+            fallen = Some(state.fall(self.fell(why)));
         }
         drop(state);
         drop(fallen);
         self.notify.notify_one();
+    }
+
+    /// What its queue's slots and its hand allocate now, and what they are charged: for a test.
+    #[cfg(test)]
+    fn charged(&self) -> (usize, usize) {
+        self.queue
+            .lock()
+            .map_or((0, 0), |state| (state.allocated(), state.slots.bytes()))
+    }
+
+    /// What its queue's slots must grow by to take one more item, while it still takes them:
+    /// `None` once it fell behind.
+    fn growth(&self) -> Option<usize> {
+        let state = self.queue.lock().ok()?;
+        (!matches!(state.fell, Some(Fell::Behind(_)))).then(|| state.queue.growth())
     }
 
     /// Bytes it holds now, queued and in hand, while it may still be let go: `None` once it was
@@ -423,13 +522,11 @@ impl Subscriber {
     /// it held, queued and in its link's hand, let go now, so the room is free before this
     /// returns.
     fn let_go(&self) {
-        let fallen = self.queue.lock().ok().map(|mut state| {
-            state.fall(if self.resyncs {
-                Fell::Resync
-            } else {
-                Fell::Behind(FellBehind::Bytes)
-            })
-        });
+        let fallen = self
+            .queue
+            .lock()
+            .ok()
+            .map(|mut state| state.fall(self.fell(FellBehind::Bytes)));
         drop(fallen);
         self.notify.notify_one();
     }
@@ -689,17 +786,33 @@ impl Router {
             return;
         }
         let bytes = item_bytes(&item);
-        let charged = item_charge(&item, takers.len());
+        let charged = item_charge(&item);
         // Room in the budget, made by letting go whoever holds most, as many as it takes. Charged
         // once whatever holds it, before any queue holds it; released when the last queue lets it
         // go.
+        // The room is the item's charge and every taker's slot for it together: a queue whose
+        // slots must grow to hold it charges that growth when it is offered (`Subscriber::offer`),
+        // and room made for the item alone left an honest taker to fall behind on its slot while
+        // the laggard kept what it held.
+        // Both are charged here together, the slots' growth handed to each taker with the item,
+        // so the room found is the room used: before, only the item was charged, and a publisher
+        // meanwhile took the slots' room, so an honest taker fell behind on its slot.
+        let growths: Vec<usize> = takers
+            .iter()
+            .map(|at| index.entries[*at].subscriber.growth().unwrap_or(0))
+            .collect();
+        let need = charged.saturating_add(growths.iter().sum());
         let mut charge = None;
         for _ in 0..=index.entries.len() {
-            if self.gauge.fits(charged) || self.gauge.held() == 0 {
+            if self.gauge.fits(need) {
+                charge = self.gauge.try_charge(need);
+            } else if self.gauge.held() == 0 {
+                // An item whose takers' slots do not fit an empty store: the item alone, each
+                // slot charged as it is offered (and its taker let go if it does not fit).
                 charge = self.gauge.try_charge(charged);
-                if charge.is_some() {
-                    break;
-                }
+            }
+            if charge.is_some() {
+                break;
             }
             let Some((_, laggard)) = index
                 .entries
@@ -714,15 +827,19 @@ impl Router {
         }
         // No room even with every queue let go (another publisher took it meanwhile): the item is
         // held by none, and those it was for fall behind, as a full queue does.
-        let Some(charge) = charge else {
+        let Some(mut reserved) = charge else {
             for at in takers {
                 index.entries[at].subscriber.let_go();
             }
             return;
         };
-        let charge = Arc::new(charge);
-        for at in takers {
-            index.entries[at].subscriber.offer(&item, &charge, bytes);
+        let charge = reserved.split(charged);
+        let (item, charge) = (Arc::new(item), Arc::new(charge));
+        for (at, growth) in takers.into_iter().zip(growths) {
+            let slot = reserved.split(growth);
+            index.entries[at]
+                .subscriber
+                .offer(&item, &charge, bytes, slot);
         }
     }
 
@@ -735,6 +852,7 @@ impl Router {
                 queue: Queue::new(self.bounds),
                 fell: None,
                 in_hand: InHand::default(),
+                slots: self.gauge.empty(),
             }),
             notify: Notify::new(),
             resyncs: matches!(filter, Filter::Directory),
@@ -813,7 +931,48 @@ impl Listener {
             None => {}
         }
         let mut moved = 0;
-        while moved < most {
+        while moved < most && !state.queue.is_empty() {
+            // Its place in hand is charged before it is taken: the store full, what was taken goes
+            // out, and a link that can take nothing falls behind.
+            let growth = state.in_hand.held.growth();
+            if !state.slots.try_grow(growth) {
+                // No room for its place in hand: room is made as it is for an item, by letting go
+                // whoever holds most (another subscriber, or this one if it holds most), outside
+                // this lock, since letting go reads every subscriber's. Then it tries once more.
+                drop(state);
+                self.router.let_go_largest();
+                state = match self.subscriber.queue.lock() {
+                    Ok(state) => state,
+                    Err(_) => return Err(Fell::Behind(FellBehind::Bytes)),
+                };
+                match state.fell {
+                    Some(Fell::Behind(why)) => return Err(Fell::Behind(why)),
+                    // Let go to make the room itself, a directory link: what it held is gone, so
+                    // it is told to resynchronise now, as it would be on its next take.
+                    Some(Fell::Resync) => {
+                        state.fell = None;
+                        return Err(Fell::Resync);
+                    }
+                    None => {}
+                }
+                let growth = state.in_hand.held.growth();
+                if state.slots.try_grow(growth) {
+                    // Charged now: taken below.
+                } else if moved == 0 {
+                    // No room for even one: it falls as a full store makes it fall, a directory
+                    // link resynchronised, never let go.
+                    let fell = self.subscriber.fell(FellBehind::Bytes);
+                    let fallen = state.fall(fell);
+                    if fell == Fell::Resync {
+                        state.fell = None;
+                    }
+                    drop(state);
+                    drop(fallen);
+                    return Err(fell);
+                } else {
+                    break;
+                }
+            }
             let Some(((item, charge), bytes)) = state.queue.pop_sized() else {
                 break;
             };
@@ -830,6 +989,7 @@ impl Listener {
             });
             moved += 1;
         }
+        state.settle();
         Ok(moved)
     }
 
@@ -1084,9 +1244,9 @@ mod tests {
     /// signed bytes are owned and charged for their life, costs its queues their slots and no
     /// more, however large it is.
     #[test]
-    fn an_item_is_charged_its_slots_and_never_an_owned_batchs_bytes() -> Result<(), String> {
+    fn an_item_is_charged_once_and_never_an_owned_batchs_bytes() -> Result<(), String> {
         let identity = tally_wire::Identity::from_seed([3; 32]);
-        let batch = tally_wire::Batch::sign(
+        let batch = crate::anchors::anchored(
             &identity,
             &tally_wire::BatchContent {
                 boot_id: 1,
@@ -1114,17 +1274,80 @@ mod tests {
             client: None,
         };
         let plain = item(batch.clone());
-        assert_eq!(
-            item_charge(&plain, 3),
-            ITEM_BYTES + 3 * SLOT_BYTES + plain.record.encoded_len()
-        );
+        assert_eq!(item_charge(&plain), ITEM_BYTES + plain.record.allocated());
         let owned = batch
             .owned_by(|_| Some(Box::new(()) as tally_wire::decoded::Owner))
             .map_err(|_| "owned".to_owned())?;
         let owned = item(owned);
-        assert_eq!(item_charge(&owned, 3), ITEM_BYTES + 3 * SLOT_BYTES);
+        assert_eq!(item_charge(&owned), ITEM_BYTES);
         // What it keeps alive, by which its subscriber is bounded, is still its bytes.
         assert_eq!(item_bytes(&owned), owned.record.encoded_len());
+        Ok(())
+    }
+
+    /// An item published to many queues is allocated once, shared by every queue that takes it,
+    /// and charged what it allocates: itself, its charge and each queue's slot. Before, each queue
+    /// held a clone of the item, its fields copied into every slot.
+    #[test]
+    fn an_item_is_allocated_once_however_many_queues_take_it() -> Result<(), String> {
+        use tally_counting::Counting;
+        let gauge = Gauge::new(Store::Fanout, 1 << 20);
+        let router = Arc::new(Router::charged(
+            Bounds {
+                max_bytes: 1 << 20,
+                max_age_ms: BEHIND_MS,
+            },
+            Arc::clone(&gauge),
+        ));
+        let listeners: Vec<Listener> = (10..14)
+            .map(|source| {
+                router.listen(
+                    source,
+                    Filter::Subscription(Subscription {
+                        streams: Streams::RAW,
+                        regions: Vec::new(),
+                    }),
+                )
+            })
+            .collect();
+        let item = info_item(None, 0)?;
+        // Made before what is counted: its record's `Arc` and what the record allocates.
+        let made = crate::footprint::arc::<Record>() + item.record.allocated();
+        let charged = item_charge(&item);
+        let held = gauge.held();
+        let base = Counting::live();
+        router.publish(item);
+        let allocated = Counting::since(base);
+        assert_eq!(allocated + made as isize, (gauge.held() - held) as isize);
+        // Each queue holds a slot of its own beside the one item.
+        let slots: usize = listeners
+            .iter()
+            .map(|listener| listener.subscriber.charged().1)
+            .sum();
+        assert_eq!(gauge.held() - held - slots, charged);
+        Ok(())
+    }
+
+    /// An item's cells it is routed by are charged what their `Arc` allocates, its counts with
+    /// them. Before, only the cells were, and the counts went uncharged on every item.
+    #[test]
+    fn an_items_cells_are_charged_what_they_allocate() -> Result<(), String> {
+        use tally_counting::Counting;
+        let cells = (0..5)
+            .map(|at| cell(33.0 + f64::from(at), -84.0, 15))
+            .collect::<Result<Vec<_>, String>>()?;
+        let plain = item(1, None, 0);
+        let base = Counting::live();
+        let points: Arc<[Region]> = Arc::from(cells.as_slice());
+        let allocated = Counting::since(base);
+        let routed = Item {
+            points: Some(points),
+            ..item(1, None, 0)
+        };
+        assert_eq!(
+            (item_charge(&routed) - item_charge(&plain)) as isize,
+            allocated
+        );
         Ok(())
     }
 
@@ -1149,17 +1372,19 @@ mod tests {
         );
         let item = info_item(None, 0)?;
         let kept = item_bytes(&item);
+        // The items' charges: the store less what the queue's slots and the hand are charged.
+        let items = || gauge.held() - world.subscriber.charged().1;
         router.publish(item);
-        let held = gauge.held();
+        let held = items();
         assert!(held > 0);
         let mut out = Vec::new();
         assert_eq!(world.try_recv_many(&mut out, 10), Ok(1));
-        assert_eq!((world.queued_bytes(), gauge.held()), (0, held));
+        assert_eq!((world.queued_bytes(), items()), (0, held));
         // What a link keeps of it while it sends keeps its charge, and counts in its hand.
         let sending = out.pop().map(Taken::hold).ok_or("nothing taken")?;
-        assert_eq!((gauge.held(), world.in_hand()), (held, kept));
+        assert_eq!((items(), world.in_hand()), (held, kept));
         drop(sending);
-        assert_eq!((gauge.held(), world.in_hand()), (0, 0));
+        assert_eq!((items(), world.in_hand()), (0, 0));
         Ok(())
     }
 
@@ -1172,8 +1397,8 @@ mod tests {
     async fn a_link_holding_items_in_hand_is_let_go_before_an_honest_queue() -> Result<(), String> {
         // What a subscriber holds, and what the fan-out is charged for an item one queue takes.
         let unit = item_bytes(&info_item(None, 0)?);
-        let charged = item_charge(&info_item(None, 0)?, 1);
-        let gauge = Gauge::new(Store::Fanout, 8 * charged);
+        let charged = item_charge(&info_item(None, 0)?);
+        let gauge = Gauge::new(Store::Fanout, 1 << 20);
         let router = Arc::new(Router::charged(
             Bounds {
                 max_bytes: 1 << 20,
@@ -1205,7 +1430,25 @@ mod tests {
         for _ in 0..2 {
             router.publish(info_item(Some(paris), 0)?);
         }
-        assert_eq!(gauge.held(), 8 * charged);
+        // The items' charges: the store less what the queues' slots and the hands are charged,
+        // and less what fills it.
+        let slots = || stalled.subscriber.charged().1 + honest.subscriber.charged().1;
+        assert_eq!(gauge.held() - slots(), 8 * charged);
+        // The store filled to one item short of room for the next, with the honest queue's slot
+        // for it already allocated.
+        assert_eq!(
+            honest
+                .subscriber
+                .queue
+                .lock()
+                .map_err(|_| "poisoned")?
+                .queue
+                .growth(),
+            0
+        );
+        let fill = gauge.limit() - gauge.held() - (charged - 1);
+        let filled = gauge.try_charge(fill).ok_or("no room to fill")?;
+        let items = || gauge.held() - fill - slots();
         // One more for the honest subscriber does not fit: the stalled one holds the most, and
         // letting it go frees what it holds in hand at once, while its link still has the claims:
         // the honest one keeps all three. Before, only the stalled one's (empty) queue was
@@ -1213,9 +1456,9 @@ mod tests {
         // still holds whole stays charged until it is dropped, never a moment past it: its
         // `Taken` holds a claim of its own.
         router.publish(info_item(Some(paris), 0)?);
-        assert_eq!((gauge.held(), stalled.in_hand()), (4 * charged, 0));
+        assert_eq!((items(), stalled.in_hand()), (4 * charged, 0));
         drop(whole);
-        assert_eq!(gauge.held(), 3 * charged);
+        assert_eq!(items(), 3 * charged);
         let mut out = Vec::new();
         assert_eq!(honest.try_recv_many(&mut out, 10), Ok(3));
         assert_eq!(
@@ -1234,7 +1477,210 @@ mod tests {
         assert!(!told(&honest));
         // Its link letting go of the items later releases nothing twice.
         drop(in_hand);
-        assert_eq!((stalled.in_hand(), gauge.held()), (0, 3 * charged));
+        assert_eq!((stalled.in_hand(), items()), (0, 3 * charged));
+        drop(filled);
+        Ok(())
+    }
+
+    /// RFC-0181 §8: the room publishing makes for an item is the item's charge and its takers'
+    /// slots together. An honest subscriber whose queue must grow its slots for the item, the
+    /// store holding room for the item's charge alone, keeps the item and the laggard is let go.
+    /// Before, room was made for the charge only, the honest queue's slot growth was refused, and
+    /// the honest subscriber fell behind while the laggard kept everything it held.
+    #[tokio::test]
+    async fn an_honest_queue_whose_slots_must_grow_is_kept_before_a_laggard() -> Result<(), String>
+    {
+        let charged = item_charge(&info_item(None, 0)?);
+        let gauge = Gauge::new(Store::Fanout, 1 << 20);
+        let router = Arc::new(Router::charged(
+            Bounds {
+                max_bytes: 1 << 20,
+                max_age_ms: BEHIND_MS,
+            },
+            Arc::clone(&gauge),
+        ));
+        let atlanta = cell(33.749, -84.388, 15)?;
+        let paris = cell(48.857, 2.352, 15)?;
+        let raw = |region: Region| {
+            Filter::Subscription(Subscription {
+                streams: Streams::RAW,
+                regions: vec![region],
+            })
+        };
+        let stalled = router.listen(10, raw(atlanta));
+        let honest = router.listen(11, raw(paris));
+        for _ in 0..6 {
+            router.publish(info_item(Some(atlanta), 0)?);
+        }
+        // The honest queue is empty, so its slots must grow for the next item.
+        assert!(honest.subscriber.growth().ok_or("fell")? > 0);
+        // Room for exactly one item's charge, and none for its slot.
+        let fill = gauge.limit() - gauge.held() - charged;
+        let filled = gauge.try_charge(fill).ok_or("no room to fill")?;
+        router.publish(info_item(Some(paris), 0)?);
+        let mut out = Vec::new();
+        assert_eq!(honest.try_recv_many(&mut out, 10), Ok(1));
+        assert_eq!(
+            stalled.try_recv_many(&mut out, 10),
+            Err(Fell::Behind(FellBehind::Bytes))
+        );
+        drop((out, filled));
+        Ok(())
+    }
+
+    /// The room `publish` finds for an item and its takers' slots is charged then, together, and
+    /// each slot's share handed to its taker with the item: two publishers at once, the store
+    /// holding a laggard's items and room for both items but one slot, each finds room, and the
+    /// second to charge lets the laggard go, so neither honest taker falls. Before, only the item
+    /// was charged, both found room, and the second honest taker fell behind on its slot while the
+    /// laggard kept what it held. Two threads released together, many times, so the interleaving
+    /// that loses comes.
+    #[test]
+    fn two_publishers_at_once_never_lose_an_honest_taker_to_the_others_slot() -> Result<(), String>
+    {
+        let charged = item_charge(&info_item(None, 0)?);
+        let atlanta = cell(33.749, -84.388, 15)?;
+        let paris = cell(48.857, 2.352, 15)?;
+        let tokyo = cell(35.676, 139.650, 15)?;
+        let raw = |region: Region| {
+            Filter::Subscription(Subscription {
+                streams: Streams::RAW,
+                regions: vec![region],
+            })
+        };
+        for _ in 0..2_000 {
+            let gauge = Gauge::new(Store::Fanout, 1 << 20);
+            let router = Arc::new(Router::charged(
+                Bounds {
+                    max_bytes: 1 << 20,
+                    max_age_ms: BEHIND_MS,
+                },
+                Arc::clone(&gauge),
+            ));
+            let stalled = router.listen(10, raw(atlanta));
+            let first = router.listen(11, raw(paris));
+            let second = router.listen(12, raw(tokyo));
+            for _ in 0..8 {
+                router.publish(info_item(Some(atlanta), 0)?);
+            }
+            let slot = first.subscriber.growth().ok_or("fell")?;
+            assert_eq!(second.subscriber.growth(), Some(slot));
+            // Room for both items and one slot: each publisher alone finds room.
+            let fill = gauge.limit() - gauge.held() - (2 * charged + slot);
+            let filled = gauge.try_charge(fill).ok_or("no room to fill")?;
+            let start = std::sync::Barrier::new(2);
+            let items = (info_item(Some(paris), 0)?, info_item(Some(tokyo), 0)?);
+            std::thread::scope(|scope| {
+                for item in [items.0, items.1] {
+                    let (router, start) = (&router, &start);
+                    scope.spawn(move || {
+                        start.wait();
+                        router.publish(item);
+                    });
+                }
+            });
+            let mut out = Vec::new();
+            assert_eq!(first.try_recv_many(&mut out, 10), Ok(1));
+            assert_eq!(second.try_recv_many(&mut out, 10), Ok(1));
+            assert_eq!(
+                stalled.try_recv_many(&mut out, 10),
+                Err(Fell::Behind(FellBehind::Bytes))
+            );
+            drop((out, filled));
+        }
+        Ok(())
+    }
+
+    /// A directory link is resynchronised, never let go: also when the store has no room for its
+    /// place in hand as it takes (`Listener::try_recv_many`), where it is let go to make the room
+    /// and no other holds any. It is told to resynchronise, and takes what comes after. Before,
+    /// it fell behind there and its link was dropped.
+    #[tokio::test]
+    async fn a_directory_link_with_no_room_to_take_is_resynchronised_never_let_go()
+    -> Result<(), String> {
+        let gauge = Gauge::new(Store::Fanout, 1 << 20);
+        let router = Arc::new(Router::charged(
+            Bounds {
+                max_bytes: 1 << 20,
+                max_age_ms: BEHIND_MS,
+            },
+            Arc::clone(&gauge),
+        ));
+        let directory = router.listen(11, Filter::Directory);
+        let relay = tally_wire::Identity::from_seed([9; 32]);
+        let offer = |issued_ms: u64| -> Result<Item, String> {
+            let offer = tally_wire::ProviderOffer::sign(
+                &relay,
+                &tally_wire::ProviderOfferContent {
+                    address: "relay.example:10900".to_owned(),
+                    cell: cell(48.857, 2.352, 4)?,
+                    products: Streams::RAW,
+                    stripes_of: 1,
+                    stripes: 1,
+                    mlat_cores: 1,
+                    feeder_slots: 10,
+                    network: 64_512,
+                    issued_ms,
+                    expires_ms: issued_ms + 600_000,
+                },
+            )
+            .map_err(|error| error.to_string())?;
+            Ok(Item {
+                record: Arc::new(Record::ProviderOffer(offer)),
+                ..item(1, None, 0)
+            })
+        };
+        router.publish(offer(1)?);
+        assert!(directory.queued_bytes() > 0);
+        // The store full to the byte: its hand's first slot does not fit.
+        let fill = gauge.limit() - gauge.held();
+        let filled = gauge.try_charge(fill).ok_or("no room to fill")?;
+        let mut out = Vec::new();
+        assert_eq!(directory.try_recv_many(&mut out, 10), Err(Fell::Resync));
+        drop(filled);
+        router.publish(offer(2)?);
+        assert_eq!(directory.try_recv_many(&mut out, 10), Ok(1));
+        Ok(())
+    }
+
+    /// RFC-0181 §8: a subscriber's place in hand is charged before it takes an item, and when the
+    /// store has no room for it, room is made as it is for an item, by letting go whoever holds
+    /// most. An honest subscriber taking its queue, the store full of a laggard's items, takes
+    /// them and the laggard is let go; before, the honest one fell behind.
+    #[tokio::test]
+    async fn an_honest_take_whose_hand_must_grow_is_kept_before_a_laggard() -> Result<(), String> {
+        let gauge = Gauge::new(Store::Fanout, 1 << 20);
+        let router = Arc::new(Router::charged(
+            Bounds {
+                max_bytes: 1 << 20,
+                max_age_ms: BEHIND_MS,
+            },
+            Arc::clone(&gauge),
+        ));
+        let atlanta = cell(33.749, -84.388, 15)?;
+        let paris = cell(48.857, 2.352, 15)?;
+        let raw = |region: Region| {
+            Filter::Subscription(Subscription {
+                streams: Streams::RAW,
+                regions: vec![region],
+            })
+        };
+        let stalled = router.listen(10, raw(atlanta));
+        let honest = router.listen(11, raw(paris));
+        for _ in 0..6 {
+            router.publish(info_item(Some(atlanta), 0)?);
+        }
+        router.publish(info_item(Some(paris), 0)?);
+        // The store full to the byte: the honest hand's first slot does not fit.
+        let fill = gauge.limit() - gauge.held();
+        let filled = gauge.try_charge(fill).ok_or("no room to fill")?;
+        let mut out = Vec::new();
+        assert_eq!(honest.try_recv_many(&mut out, 10), Ok(1));
+        assert_eq!(
+            stalled.try_recv_many(&mut out, 10),
+            Err(Fell::Behind(FellBehind::Bytes))
+        );
+        drop((out, filled));
         Ok(())
     }
 
@@ -1294,6 +1740,132 @@ mod tests {
         router.publish(info_item(None, BEHIND_MS + 2)?);
         assert_eq!(slow.queued_bytes(), 0);
         assert_eq!(directory.try_recv_many(&mut out, 10), Ok(0));
+        Ok(())
+    }
+
+    /// A subscriber's queue and its link's hand are charged what they allocate, read from an
+    /// allocator that counts this thread's every byte, as items come, are taken in bursts and are
+    /// let go out of order; the queue gives its spare slots back as it empties, so a subscriber
+    /// that once held many holds little once caught up; and at a store too small for the slots, it
+    /// falls behind rather than holding slots uncharged. Before, each item was charged a slot of an
+    /// assumed size in every queue, and a queue kept the capacity of its longest backlog, uncharged,
+    /// for the rest of its session.
+    #[test]
+    fn a_subscribers_slots_are_charged_what_they_allocate_as_items_churn() -> Result<(), String> {
+        use tally_counting::Counting;
+        let gauge = Gauge::new(Store::Fanout, 64 << 20);
+        let router = Arc::new(Router::charged(
+            Bounds {
+                max_bytes: 64 << 20,
+                max_age_ms: u64::MAX,
+            },
+            Arc::clone(&gauge),
+        ));
+        let world = router.listen(
+            10,
+            Filter::Subscription(Subscription {
+                streams: Streams::RAW,
+                regions: Vec::new(),
+            }),
+        );
+        // Made before anything is measured: what they allocate is theirs, not the queue's.
+        let items: Vec<Arc<Item>> = (0..64).map(|at| Arc::new(item(1, None, at))).collect();
+        let none = Arc::new(Charge::none());
+        let mut out = Vec::with_capacity(64);
+        let mut sending: Vec<Hold> = Vec::with_capacity(1 << 16);
+        let mut mix = 0x5eed_u64;
+        let mut roll = |n: u64| {
+            mix = mix
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (mix >> 33) % n
+        };
+        let base = Counting::live();
+        let charged_base = world.subscriber.charged().1;
+        let mut most = 0;
+        for step in 0..4_000_u64 {
+            for _ in 0..roll(if step % 500 < 50 { 40 } else { 4 }) {
+                world
+                    .subscriber
+                    .offer(&items[roll(64) as usize], &none, 1, Charge::none());
+            }
+            if roll(3) == 0 {
+                world
+                    .try_recv_many(&mut out, roll(64) as usize)
+                    .map_err(|fell| format!("{fell:?}"))?;
+                sending.extend(out.drain(..).map(Taken::hold));
+            }
+            while !sending.is_empty() && roll(2) == 0 {
+                let at = roll(sending.len() as u64) as usize;
+                drop(sending.swap_remove(at));
+            }
+            let (allocated, charged) = world.subscriber.charged();
+            assert_eq!(charged, allocated, "step {step}");
+            let live = Counting::since(base);
+            // The queue's slots and the hand's, exactly.
+            assert_eq!(
+                live,
+                (charged - charged_base) as isize,
+                "step {step}: {live} allocated, {charged} charged"
+            );
+            let queued = world
+                .subscriber
+                .queue
+                .lock()
+                .map_err(|_| "poisoned")?
+                .queue
+                .len();
+            most = most.max(queued);
+            assert!(
+                charged
+                    <= Deque::<Slot>::bytes_at_most(queued) + Held::bytes_at_most(sending.len()),
+                "step {step}: {charged} for {queued} queued and {} in hand",
+                sending.len()
+            );
+        }
+        // Caught up: what it once held is given back.
+        sending.clear();
+        while world
+            .try_recv_many(&mut out, 64)
+            .map_err(|fell| format!("{fell:?}"))?
+            > 0
+        {
+            out.clear();
+        }
+        assert!(most > 100, "the queue never grew: {most}");
+        let kept = Deque::<Slot>::bytes_at_most(0) + Held::bytes_at_most(0);
+        assert!(world.subscriber.charged().1 <= kept);
+        assert!(Counting::since(base) as usize <= kept);
+        drop(world);
+        assert_eq!(gauge.held(), 0);
+
+        // A store with room for a few slots only: past them the subscriber falls behind, and
+        // nothing it allocates is uncharged.
+        let small = Gauge::new(Store::Fanout, crate::footprint::vec::<Slot>(8));
+        let router = Arc::new(Router::charged(
+            Bounds {
+                max_bytes: 64 << 20,
+                max_age_ms: u64::MAX,
+            },
+            Arc::clone(&small),
+        ));
+        let tight = router.listen(
+            10,
+            Filter::Subscription(Subscription {
+                streams: Streams::RAW,
+                regions: Vec::new(),
+            }),
+        );
+        for one in &items[..32] {
+            tight.subscriber.offer(one, &none, 1, Charge::none());
+            let (allocated, charged) = tight.subscriber.charged();
+            assert_eq!(charged, allocated);
+            assert!(small.held() <= small.limit());
+        }
+        assert_eq!(
+            tight.try_recv_many(&mut out, 1),
+            Err(Fell::Behind(FellBehind::Bytes))
+        );
         Ok(())
     }
 }

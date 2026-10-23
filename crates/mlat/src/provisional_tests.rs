@@ -2,7 +2,9 @@
 //! each is published, that each is what its model and receptions solve to, and that only targets
 //! are solved, at most one an aircraft a second.
 
+#![allow(clippy::disallowed_methods, reason = "a test's scripted readings")]
 use std::collections::BTreeMap;
+use tally_wire::clocks::recorded::aligned;
 
 use tally_mlat_solver::ObservationId;
 use tally_mlat_solver::sim;
@@ -13,11 +15,11 @@ use crate::replay::{arrivals, replay, scenario, transmitted_ms};
 
 fn engine(threads: usize) -> Engine {
     Engine::new(
-        Identity::from_seed([4; 32]),
+        tally_wire::Signer::new(Identity::from_seed([4; 32]), std::sync::Arc::new(|| true)),
         0xb007,
         Settings {
             regions: tally_wire::Regions::default(),
-            settle_ms: 1_000,
+            settle: tally_wire::budget::policy::<_, 1_000>(),
             threads,
             capacity: crate::engine::Capacity::default(),
         },
@@ -162,5 +164,78 @@ fn a_provisional_position_is_published_within_two_seconds_of_its_transmission() 
         "{sampled} of {} provisionals are of ADS-B aircraft",
         solved.len()
     );
+    Ok(())
+}
+
+/// RFC-0181 "Memory is charged once": an address shard says what it allocates, and what reading
+/// and keeping a batch may allocate more before it does, so a relay charging it that ahead of
+/// each change (`tally_relay::mlat_host`) is never short: read from an allocator counting this
+/// thread's bytes over a trace whose aircraft come and go, and nothing once each list is let go.
+/// Before, a reception was charged an assumed size and the ADS-B and solved trees nothing.
+#[test]
+fn a_shard_says_what_it_allocates_and_what_it_grows_by_before_it_grows() -> Result<(), String> {
+    use std::sync::Arc;
+    use tally_counting::Counting;
+
+    use super::{Book, Order, SHARDS, Shard, by_shard, notes_of};
+
+    let mut simulation = sim::run(&scenario(31, 40.0));
+    let delivered = arrivals(&mut simulation, 7)?;
+    // Every batch decoded and its notes ordered by shard before the count starts.
+    let mut batches = Vec::new();
+    for (sequence, (at, record)) in delivered.iter().enumerate() {
+        if let Record::Batch(batch) = record {
+            let decoded = Arc::new(
+                tally_wire::Decoded::from_verified(batch.clone(), aligned(*at), sequence as u64)
+                    .map_err(|undecodable| undecodable.error.to_string())?,
+            );
+            let mut notes = notes_of(&decoded);
+            let runs = by_shard(&mut notes);
+            batches.push((*at, decoded, notes, runs));
+        }
+    }
+    assert!(batches.len() > 100, "{} batches", batches.len());
+    let book = Book::default();
+    let mut shards: Vec<Shard> = (0..SHARDS).map(|_| Shard::default()).collect();
+    let base = Counting::live();
+    let held = |shards: &[Shard]| shards.iter().map(Shard::bytes).sum::<usize>();
+    let mut most = 0;
+    let mut next_due = batches[0].0 + 100;
+    for (at, batch, notes, runs) in &batches {
+        while *at >= next_due {
+            for shard in &mut shards {
+                drop(shard.due(tally_wire::clocks::recorded::aligned(next_due), &book));
+            }
+            next_due += 100;
+            let live = Counting::since(base);
+            assert!(
+                live >= 0 && live as usize <= held(&shards),
+                "{live} after due"
+            );
+        }
+        for (index, range) in runs {
+            let shard = &mut shards[*index];
+            let before = shard.bytes();
+            let reading = shard.reading_growth(&notes[range.clone()]);
+            let taken = shard.read(batch, &notes[range.clone()], Order::of(batch));
+            assert!(shard.bytes() <= before + reading, "read past its growth");
+            let before = shard.bytes();
+            let keeping = shard.keeping_growth([&taken]);
+            shard.keep(taken);
+            assert!(shard.bytes() <= before + keeping, "kept past its growth");
+        }
+        let live = Counting::since(base);
+        let bytes = held(&shards);
+        most = most.max(bytes);
+        assert!(
+            live >= 0 && live as usize <= bytes,
+            "{live} allocated, {bytes} said"
+        );
+    }
+    assert!(most > 0);
+    for shard in &mut shards {
+        *shard = Shard::default();
+    }
+    assert_eq!(Counting::since(base), 0);
     Ok(())
 }

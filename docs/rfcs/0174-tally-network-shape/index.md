@@ -64,9 +64,13 @@ which forwarding one's slice is the duty of taking the area, under each relay's 
   can carry what they commit the relay to forward. No bill can exceed the cap times the seconds in a
   month, and a relay never goes dark. It replaced the monthly egress budget built earlier the same
   day.
-- **Final MLAT positions arrive 7 to 47 s late, 32 s on average.** A window solves eight bins at
-  once and is solved once it has ended and settled (RFC-0171 §3.8.1: one bin after the last it
-  solves, 2 s settling, then the fits); the stride is what lets one relay carry the world (§2.3).
+- **A final MLAT position leaves its engine within 91.5 s of its transmission, and has surely
+  arrived anywhere within 108.5 s** (`tally_wire::budget::FINAL_FIX_LEAVES`, `FINAL_FIX_ARRIVED`).
+  A window step solves eight 5 s bins at once and falls due one bin after the last it solves,
+  once that bin has settled (11.5 s: its batches' way in, the relay's error and two
+  measurements', `MLAT_SETTLE`), then its fits run, some 35 s at world scale (RFC-0171 §3.8.1); a
+  step whose fixes would leave later is refused, counted. The stride is what lets one relay carry
+  the world (§2.3).
   **Provisional ones arrive a median 1.34 s after the transmission** (95th percentile 1.65 s,
   in the simulator), built (§2.4).
 - **A feeder uploads about 8 KB/s** (box-01, near KLAX, 7.9 KB/s measured 2026-10-06), about 21 GB
@@ -123,7 +127,8 @@ bundled process, so a relay can sit near its feeders while its clients run elsew
 can vouch for several clients.
 
 - **Weighing.** A bundle is weighed record by record: a record that does not verify, is dated more
-  than a minute ahead of the weigher's clock, or does not name R is skipped and the rest counts;
+  than `K` (15 s, `budget::RECEIPT_AHEAD`: two judging relays' clocks apart at most) ahead of the
+  weigher's clock, or does not name R is skipped and the rest counts;
   the bundle's own signature and date are refused whole. A hosted feeder earns what seeding it
   costs (one copy plus parity, §2.5).
 - **Vouching.** R's operator names the clients it vouches for (`tally-relay --client KEY`). On each
@@ -266,11 +271,13 @@ the border band of the areas it is an MLAT relay for, and is held to a feeder's 
   and Europe's are, about 320 wanted receptions a second each and about 5,400 targets a window,
   takes 41 cores to keep up (3,800 tile fits a 40 s stride, 0.35 s each, and the solves, on 32
   threads) and holds 8.7 GB of raw for a window (30 bytes an observation, index included), about
-  12 GB with the open bins and the bins standing settles in. What a relay reserves for it is a bound,
-  not that mean: `held::Rates::cost` reserves about 1.1 MB a receiver (open raw at five times the
-  mean rate, and 25 sealed bins of thinned raw), 22.5 GB at 20,000 (RFC-0181 §5). One 32-core relay no longer carries the whole world; a 32-core relay carries about
-  three quarters of it, and a 16-core relay about a third. (The 27 cores and 1.6 GB first
-  measured were at an eighth of the real rate.)
+  12 GB with the open bins and the bins standing settles in. What a relay reserves for it is a
+  bound, not that mean: `held::Rates::cost` reserves open raw at five times the mean rate, and 25
+  sealed bins (`held::SEALED_BINS_HELD`) of thinned raw at the ceiling every receiver is kept to
+  (`KEPT_CEILING_PER_S`), never its mean; with the rest a hosted receiver holds, a seat is about
+  4.1 MB (`per-seat` in `tally/crates/relay/tests/world-relay.txt`), so a 32 GB, 16-core relay
+  seats 2,023 receivers, bound by memory (RFC-0181 §5, §9). No one relay carries the whole world.
+  (The 27 cores and 1.6 GB first measured were at an eighth of the real rate.)
 - Raw travels at most a hop, never worldwide. Only positions travel far.
 - Why here: clock sync needs every receiver that heard an aircraft in one place, and the raw is
   already at the relay its feeders chose. Moving the computation to the data is cheaper than any
@@ -298,8 +305,8 @@ it.
   receptions, so it is checkable against raw like any solution, and the same fault proof holds it.
   The merge rule ranks it below every final fix: superseded by a final fix of the same
   transmission, confirmed by a final fix of the aircraft near it in time, and retracted by a
-  deadline rule (90 s, the client's clock, `tally_wire::products::FINAL_FIX_ARRIVED_MS`) when neither came; a client needs no message to learn
-  it.
+  deadline rule (108.5 s by the client's clock, `tally_wire::products::FINAL_FIX_ARRIVED_MS`)
+  when neither came; a client needs no message to learn it.
 - Why: cockpit traffic awareness. At 150 kt an aircraft covers two and a half miles in 32 s; a
   target drawn where it was half a minute ago is drawn in the wrong place.
 
@@ -337,7 +344,7 @@ positions; clock models): the relays that take that area.
   is answered only to a tree member that is not demoted, and its data is sent only over a member
   link, through the upload cap; a directory link is sent only the directory. A manifest is taken
   only from a member of the group, at most 8 per origin per second, and none for a second more
-  than 60 s ahead of the reader's clock. A parity is checked against its manifest when used; a
+  than `K` (15 s, `budget::Window::sharing`) ahead of the reader's clock. A parity is checked against its manifest when used; a
   false one is dropped and a later one taken.
 - **A relay's members are bounded** (as built, 2026-10-08). A relay holds at most the member
   sessions (sessions that bring another relay's data in: a member's link sending it what its
@@ -354,7 +361,25 @@ positions; clock models): the relays that take that area.
   too, to its children); a manifest, to those beneath it in every stripe; what was for it alone (a
   receipt, a have-summary, an ask) nowhere. The trees are not changed, so every relay still lays
   out the same ones and the area's data still reaches every member but the full one, which repairs
-  what it lacks once it has room. A relay hosting MLAT takes a raw link's place in its own pool
+  what it lacks over the links it admitted, and the rest once it has room. It asks only a member
+  that can answer it (as built, 2026-10-21): never one it routes around as full, nor one it turned
+  away while that one may still route around it (its wait and the `route_slack_ms` after), which
+  sends it nothing. A repaired copy is judged by its hash and its author's signed time, never by
+  its place in a stream (RFC-0171 §3.6, the strike register): new once while it is inside its
+  kind's window of time (RFC-0171 §3.6, `strikes::Window`): a repaired batch is a peer's copy,
+  usable 76 s behind and 25 s ahead (a feeder's 10 s, its 64 s backlog and the 17 s its trusted
+  reference's low end may lag true time, less the 15 s two relays' clocks may be apart; that 15 s
+  and the feeder's 10 s ahead; RFC-0171 §3.6's error budget); a relay-signed record
+  (a regional batch, an engine's record) 43 s behind and 15 s ahead; a fault proof 122 s behind
+  (the 14 s horizon, a repaired copy's 2 s in transit, the 15 s apart, and a feeder's 91 s) and
+  25 s ahead; feeder figures, the relay-signed window stretched by their hour; a
+  duplicate after that while its hash is remembered (not forwarded, but counted had and its
+  deliverer credited), and too late outside the window: never forwarded, remembered or given to
+  the products, but delivered into its group as a duplicate is (held, counted had, its deliverer
+  credited), so what a member receipts never depends on a relay's clock and no relay is reported
+  short for a copy a window refused, its own or an older relay's. Whatever a member still asks for
+  is taken however far the stream has moved on. A member's
+  manifest never makes a copy new. A relay hosting MLAT takes a raw link's place in its own pool
   before it dials it, so it never dials a link it would turn away itself.
 - **Routing around a full member files no shortfall, on either side** (as built, 2026-10-09). The
   wait is one rule, read by both ends of the refusal (`sharing::full::Wait`): the relay turned
@@ -403,8 +428,8 @@ trust: a bundle is checked record by record exactly as its cells would be.
 
 - A relay announces a `ProviderOffer`: its key, its address, the cell, the stream kinds, and an
   expiry, signed by its key. It re-signs every minute while it serves, and an offer lives at most
-  three minutes from its signing whatever it claims (one re-signing, a minute of clock skew and a
-  minute to spread), so a dead relay leaves every relay's ranking within three minutes, for all
+  three minutes from its signing whatever it claims (one re-signing, the clock skew with room to
+  spare, a minute, and a minute to spread), so a dead relay leaves every relay's ranking within three minutes, for all
   alike. With relay duties off, a relay's offers do not include raw.
 - Relays gossip offers the way they gossip `RelayList`, keep each until it expires, and hold at most
   32 offers per cell, at most 4 from one network. Within a cell, offers are held and answered by
@@ -512,8 +537,9 @@ rule, since every version 2 reader inflates it.
   shared, priced and served as separate products:
   - **World live** (`WorldPositions`, `WORLD`): sealed about 4 s after its second, an MLAT
     aircraft by its provisional fix until the final one arrives.
-  - **World precise** (`WorldPrecise`, `WORLD_PRECISE`): the same rule sealed about 90 s after its
-    second, once final fixes can arrive, an MLAT aircraft by its final fix only; ADS-B unchanged.
+  - **World precise** (`WorldPrecise`, `WORLD_PRECISE`): the same rule sealed 108.5 s after its
+    second (`products::WORLD_PRECISE_SETTLE_MS`, `FINAL_FIX_ARRIVED`), once final fixes have surely
+    arrived, an MLAT aircraft by its final fix only; ADS-B unchanged.
   - Each fix carries its pressure altitude and its MLAT flag, and names its origin by an index into
     a per-record origin table (each entry the origin record's hash and the key that signed it, so
     the choice rule's last ties, by source key and then record hash, are decided from the record

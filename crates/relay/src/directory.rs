@@ -69,10 +69,13 @@ use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use tally_wire::Signs;
+use tally_wire::budget::policy;
+use tally_wire::clocks::Judged;
 use tally_wire::rendezvous::{self, Weighted};
 use tally_wire::{
-    EvidenceBundle, Identity, ProviderOffer, ProviderOfferContent, ProviderQuery, PublicKey,
-    Record, Region, Streams, WireError, noise,
+    EvidenceBundle, ProviderOffer, ProviderOfferContent, ProviderQuery, PublicKey, Record, Region,
+    Streams, WireError, noise,
 };
 use tokio::net::TcpStream;
 
@@ -111,8 +114,6 @@ pub const OFFERS_PER_GROUP_IN_CELL: usize = 4;
 pub const OFFERS_PER_GROUP: usize = 256;
 /// Offers held in all, at most.
 pub const OFFERS_HELD: usize = 16_384;
-/// How far in the future an offer may say it was issued, for clocks that differ.
-pub const CLOCK_SKEW_MS: u64 = 60 * 1000;
 /// Offers waiting for their handshake, at most, and at most per asker.
 pub const PENDING: usize = 256;
 pub const PENDING_PER_ASKER: usize = 16;
@@ -130,6 +131,10 @@ pub const SEEN_REMEMBERED: usize = 65_536;
 /// evidence's half-life (`credit::HALF_LIFE_MS`), so its tier, a factor of two wide, follows what it
 /// does within minutes and the bundles cost the directory links little.
 pub const OWN_EVIDENCE_EVERY_MS: u64 = credit::HALF_LIFE_MS / 10;
+// What another relay's evidence is held for while its offer has not come: two of its bundles.
+const _: () = assert!(
+    tally_wire::budget::EVIDENCE_AWAITED.span::<Judged>().ms() == 2 * OWN_EVIDENCE_EVERY_MS
+);
 /// Relays' evidence held, at most: one a key, as many as offers may be held.
 pub const EVIDENCE_HELD: usize = OFFERS_HELD;
 /// How often a relay re-signs its own offers while it serves: once a minute.
@@ -140,8 +145,8 @@ pub const OWN_RESIGN_EVERY_MS: u64 = 60 * 1000;
 /// when anyone heard it, alike on every relay. The figure is the directory's own timing:
 ///
 /// - one re-signing (60 s), the wait for the next offer;
-/// - the clock skew a reader allows (`CLOCK_SKEW_MS`, 60 s): to a reader whose clock is a minute
-///   ahead, every offer is a minute older than its signer meant;
+/// - the clock skew a reader allows (`tally_wire::budget::K`, 15 s) and 45 s to spare, 60 s in all: to a
+///   reader whose clock is that far ahead, every offer is that much older than its signer meant;
 /// - and a re-signing again (60 s) for the offer to spread: a re-signed offer from a key already
 ///   verified at its address is held at once and gossiped at the next tick (`network::TICK`,
 ///   100 ms) on every directory link, so a hop costs a tick and a round trip, and tens of hops
@@ -237,10 +242,12 @@ impl Group {
     }
 }
 
-#[derive(Default)]
 pub struct Directory {
     /// Shared with the handshakes in flight, which write their outcome back.
     state: Arc<Mutex<State>>,
+    /// The relay's one clock (`clock::RelayClock`): what a handshake's outcome and an address
+    /// asked for are judged by, as everything the duties hand in is.
+    clock: crate::clock::RelayClock,
 }
 
 struct State {
@@ -266,9 +273,9 @@ struct State {
     dialling: HashSet<String>,
     verifying: usize,
     /// (key, address) that answered, and until when it is trusted there.
-    verified: Bounded<(PublicKey, String), u64>,
+    verified: Bounded<(PublicKey, String), Judged>,
     /// Addresses that did not answer, until when they are not dialled again.
-    unanswered: Bounded<String, u64>,
+    unanswered: Bounded<String, Judged>,
     /// Offer hashes acted on.
     seen: Bounded<[u8; 32], ()>,
     /// Newly verified offers, gossiped once at the next tick.
@@ -279,7 +286,7 @@ struct State {
     /// New evidence held, gossiped once at the next tick.
     evidence_gossip: Vec<EvidenceBundle>,
     /// When the relay's own evidence was last bundled.
-    own_evidence_ms: Option<u64>,
+    own_evidence_at: Option<Judged>,
     /// The network group of the address the relay's own offers as last signed name
     /// (`Group::of_address`), as every peer that dials it finds it: what its own offers are held
     /// under. `None` while it signs none.
@@ -299,7 +306,7 @@ struct State {
     key_groups: HashMap<PublicKey, BTreeMap<Group, usize>>,
     /// Each key's tier, weighed at `tiers_at`; cleared whenever what they are weighed from changes.
     tiers: HashMap<PublicKey, u32>,
-    tiers_at: u64,
+    tiers_at: Option<Judged>,
     /// Bumped whenever what the held offers answer may have changed: an offer held or let go, one
     /// that says something new, evidence that moves the tiers (`Directory::version`).
     version: u64,
@@ -335,7 +342,7 @@ impl Default for State {
             gossip: Vec::new(),
             evidence: HashMap::new(),
             evidence_gossip: Vec::new(),
-            own_evidence_ms: None,
+            own_evidence_at: None,
             own_group: None,
             own_offers: Vec::new(),
             own_resolved: None,
@@ -343,7 +350,7 @@ impl Default for State {
             hosts: HashMap::new(),
             key_groups: HashMap::new(),
             tiers: HashMap::new(),
-            tiers_at: 0,
+            tiers_at: None,
             version: 0,
             changed: HashSet::new(),
             rolled_at: 0,
@@ -579,11 +586,11 @@ fn same_offer(held: &ProviderOfferContent, new: &ProviderOfferContent) -> bool {
 
 /// An offer whose signature verifies and whose lifetime holds at `now_ms`, checked: the one place
 /// an offer is verified.
-fn checked(offer: &ProviderOffer, now_ms: u64) -> Option<Checked> {
+fn checked(offer: &ProviderOffer, now: Judged) -> Option<Checked> {
     offer.verify().ok()?;
     let content = offer.content().ok()?;
     let signer = offer.signer().ok()?;
-    live(&content, now_ms).then(|| {
+    live(&content, now).then(|| {
         Checked(Arc::new(CheckedOffer {
             offer: offer.clone(),
             signer,
@@ -594,8 +601,9 @@ fn checked(offer: &ProviderOffer, now_ms: u64) -> Option<Checked> {
 
 /// Whether an offer's lifetime holds at `now_ms`: not expired, and not issued in the future past
 /// the allowed skew.
-fn live(content: &ProviderOfferContent, now_ms: u64) -> bool {
-    expiry(content) > now_ms && content.issued_ms <= now_ms + CLOCK_SKEW_MS
+fn live(content: &ProviderOfferContent, now: Judged) -> bool {
+    !tally_wire::budget::expired(expiry(content), now)
+        && !tally_wire::budget::K.ahead(content.issued_ms, now)
 }
 
 /// What the held offers answer, named (`Directory::version`).
@@ -644,7 +652,25 @@ impl State {
     }
 }
 
+/// A test's: on a clock of its own, as a relay started now reads it.
+#[cfg(test)]
+impl Default for Directory {
+    fn default() -> Self {
+        Self::on(crate::clock::RelayClock::system())
+    }
+}
+
 impl Directory {
+    /// A directory judging by `clock`, the relay's one clock (`network::Network::new`).
+    pub fn on(clock: crate::clock::RelayClock) -> Self {
+        Self {
+            state: Arc::default(),
+            clock,
+        }
+    }
+
+    /// A test's: on a clock of its own, as a relay started now reads it.
+    #[cfg(test)]
     pub fn new() -> Self {
         Self::default()
     }
@@ -668,21 +694,21 @@ impl Directory {
 
     /// An offer a peer sent or gossiped: checked, then held at once if its key already answered
     /// at its address, else queued for the handshake (`tick` dials). Acted on once by its hash.
-    pub fn offered(&self, asker: &Asker, offer: ProviderOffer, now_ms: u64) {
-        lock(&self.state).offered(asker, offer, now_ms);
+    pub fn offered(&self, asker: &Asker, offer: ProviderOffer, now: Judged) {
+        lock(&self.state).offered(asker, offer, now);
     }
 
     /// The offers held for `query.cell` and its ancestors, live at `now_ms`, of the products
     /// asked (any, when none is named): the finest cell first, in rank order within a cell; at
     /// most `QUERY_ANSWER_MAX`.
-    pub fn query(&self, query: &ProviderQuery, now_ms: u64) -> Vec<ProviderOffer> {
+    pub fn query(&self, query: &ProviderQuery, now: Judged) -> Vec<ProviderOffer> {
         let Ok(path) = rendezvous::ancestors(query.cell) else {
             return Vec::new();
         };
         let mut state = lock(&self.state);
         let mut answer = Vec::new();
         for cell in path {
-            let offers = state.ranked_offers(cell, now_ms, |held| {
+            let offers = state.ranked_offers(cell, now, |held| {
                 query.products.0 == 0 || held.products().0 & query.products.0 != 0
             });
             answer.extend(offers.into_iter().map(|offer| offer.offer().clone()));
@@ -698,23 +724,23 @@ impl Directory {
     /// offer for a parent provides every cell under it), each cell's in rank order and at most
     /// `OFFERS_PER_CELL`. For the MLAT choice and the sharing trees, so unpaged: the same offers
     /// held give the same answer on every relay.
-    pub fn offers_for(&self, cell: Region, now_ms: u64) -> Vec<Checked> {
+    pub fn offers_for(&self, cell: Region, now: Judged) -> Vec<Checked> {
         let Ok(path) = rendezvous::ancestors(cell) else {
             return Vec::new();
         };
         let mut state = lock(&self.state);
         path.iter()
-            .flat_map(|cell| state.ranked_offers(*cell, now_ms, |_| true))
+            .flat_map(|cell| state.ranked_offers(*cell, now, |_| true))
             .collect()
     }
 
     /// The cells `key`'s live offers held name (its own, for this relay's key), each once,
     /// sorted.
-    pub fn cells_of(&self, key: &PublicKey, now_ms: u64) -> Vec<Region> {
+    pub fn cells_of(&self, key: &PublicKey, now: Judged) -> Vec<Region> {
         let state = lock(&self.state);
         let mut cells: Vec<Region> = state
             .held_of(key)
-            .filter(|held| held.expires_ms > now_ms)
+            .filter(|held| !tally_wire::budget::expired(held.expires_ms, now))
             .map(|held| held.offer.content().cell)
             .collect();
         cells.sort_by_key(|cell| cell.as_u64());
@@ -727,9 +753,10 @@ impl Directory {
     /// version moves. It moves when an offer is held, let go or says something new, when a tier
     /// moves (by new evidence, or weighed again in a new minute), and when a held offer's expiry
     /// passes.
-    pub fn version(&self, now_ms: u64) -> Version {
+    pub fn version(&self, now: Judged) -> Version {
+        let now_ms = now.ms();
         let mut state = lock(&self.state);
-        state.roll_tiers(now_ms);
+        state.roll_tiers(now);
         Version {
             held: state.version,
             expired: state
@@ -743,10 +770,10 @@ impl Directory {
     /// The cells whose held offers answer differently since the last call, sorted: offers that
     /// expired by `now_ms` let go first, and every crowded cell when the tiers are weighed again.
     /// For sharing, which lays out the trees of only the areas under these.
-    pub fn take_changed_cells(&self, now_ms: u64) -> Vec<Region> {
+    pub fn take_changed_cells(&self, now: Judged) -> Vec<Region> {
         let mut state = lock(&self.state);
-        state.expire_offers(now_ms);
-        state.roll_tiers(now_ms);
+        state.expire_offers(now);
+        state.roll_tiers(now);
         let mut cells: Vec<Region> = state
             .changed
             .drain()
@@ -780,7 +807,7 @@ impl Directory {
     /// The live offers of every cell no finer than an area, each cell's as `offers_for` takes
     /// them (in rank order, at most `OFFERS_PER_CELL`): what covers the areas, read once for a
     /// whole region rather than area by area (`selection`).
-    pub fn coverage(&self, now_ms: u64) -> Coverage {
+    pub fn coverage(&self, now: Judged) -> Coverage {
         let mut state = lock(&self.state);
         let cells: Vec<u64> = state.cells.keys().copied().collect();
         let mut coverage = Coverage::default();
@@ -791,7 +818,7 @@ impl Directory {
             if region.resolution() > rendezvous::AREA_RESOLUTION {
                 continue;
             }
-            let offers = state.ranked_offers(region, now_ms, |_| true);
+            let offers = state.ranked_offers(region, now, |_| true);
             if offers.is_empty() {
                 continue;
             }
@@ -816,32 +843,32 @@ impl Directory {
 
     /// Where a relay whose live offer is held answers: the address its handshake was proved at.
     pub fn address_of(&self, key: &PublicKey) -> Option<String> {
-        let now_ms = crate::network::wall_ms();
+        let now = self.clock.judged();
         let state = lock(&self.state);
         if state.own == Some(*key) {
             return None;
         }
         state
             .held_of(key)
-            .filter(|held| held.expires_ms > now_ms)
+            .filter(|held| !tally_wire::budget::expired(held.expires_ms, now))
             .min_by_key(|held| held.offer.content().cell.as_u64())
             .map(|held| held.offer.content().address.clone())
     }
 
     /// Every live offer held, and this relay's own as last signed (held here or not: a peer
     /// holds them by its own caps), each once: what a new directory link is sent first.
-    pub fn live_offers(&self, now_ms: u64) -> Vec<ProviderOffer> {
+    pub fn live_offers(&self, now: Judged) -> Vec<ProviderOffer> {
         let state = lock(&self.state);
         let mut seen = HashSet::new();
         let own = state
             .own_offers
             .iter()
-            .filter(|offer| live(offer.content(), now_ms));
+            .filter(|offer| live(offer.content(), now));
         state
             .cells
             .values()
             .flat_map(HashMap::values)
-            .filter(|held| held.expires_ms > now_ms)
+            .filter(|held| !tally_wire::budget::expired(held.expires_ms, now))
             .map(|held| &held.offer)
             .chain(own)
             .filter(|offer| seen.insert(offer.offer().hash()))
@@ -856,10 +883,10 @@ impl Directory {
     pub fn evidence(
         &self,
         bundle: &EvidenceBundle,
-        now_ms: u64,
+        now: Judged,
         pace: Option<&crate::ingest::RecordPace>,
     ) -> bool {
-        lock(&self.state).evidence(bundle, now_ms, pace)
+        lock(&self.state).evidence(bundle, now, pace)
     }
 
     /// Every evidence bundle held: what a new directory link is sent beside the offers.
@@ -875,8 +902,8 @@ impl Directory {
     }
 
     /// `key`'s contribution tier now (`tier`): what its offers are ranked by first.
-    pub fn tier_of(&self, key: &PublicKey, now_ms: u64) -> u32 {
-        lock(&self.state).tier(key, now_ms)
+    pub fn tier_of(&self, key: &PublicKey, now: Judged) -> u32 {
+        lock(&self.state).tier(key, now)
     }
 
     /// Offers held now.
@@ -890,23 +917,32 @@ impl Directory {
 
     /// What to publish now: the relay's own offers when due for re-signing, and the offers newly
     /// verified, each once. Also forgets what expired and starts the handshakes waiting.
-    pub fn tick(&self, hub: &Hub, identity: Option<&Identity>, now_ms: u64) -> Vec<Record> {
-        let Some(identity) = identity else {
+    ///
+    /// Its own offers and evidence are signed only while the relay's clock is synced
+    /// (`signer::Signer::with`); the rest (expiry, gossip, verification) goes on regardless.
+    pub fn tick(
+        &self,
+        hub: &Hub,
+        signer: Option<&crate::signer::Signer>,
+        at: crate::strikes::Now,
+    ) -> Vec<Record> {
+        let Some(signer) = signer else {
             return Vec::new();
         };
-        let basis = own_basis(hub, identity);
+        let now = at.judged();
+        let basis = own_basis(hub, &signer.public());
         let offering = basis.is_some();
         let mut out = Vec::new();
         let mut evidence = Vec::new();
         let mut resolve = None;
         let evidence_due = {
             let mut state = lock(&self.state);
-            state.own = Some(identity.public());
+            state.own = Some(signer.public());
             // The offers name the advertised address by number: a host name as it last resolved,
             // and nothing is signed (or withdrawn) before it first resolves.
             let mut unresolved = false;
             let basis = basis.and_then(|mut basis| {
-                let (address, due) = state.own_address_of(&basis.address, now_ms);
+                let (address, due) = state.own_address_of(&basis.address, now);
                 if due {
                     resolve = Some(basis.address.clone());
                 }
@@ -917,23 +953,31 @@ impl Directory {
                 basis.address = address.to_string();
                 Some(basis)
             });
-            state.expire(now_ms);
-            if !unresolved && let Some(offers) = state.resign(identity, basis, now_ms) {
+            state.expire(now);
+            if !unresolved
+                && let Some(offers) = crate::signer::with(signer, at, |signing| {
+                    signing.and_then(|identity| state.resign(identity, basis, now))
+                })
+            {
                 out.extend(offers);
             }
             out.append(&mut state.gossip);
             evidence.append(&mut state.evidence_gossip);
             offering
                 && state
-                    .own_evidence_ms
-                    .is_none_or(|at| now_ms.saturating_sub(at) >= OWN_EVIDENCE_EVERY_MS)
+                    .own_evidence_at
+                    .is_none_or(|at| now.since(at) >= policy::<_, OWN_EVIDENCE_EVERY_MS>())
         };
         // The relay's own evidence goes with its offers, so every relay ranks them by the same
         // evidence (`State::tier`).
-        if evidence_due && let Ok(bundle) = hub.network().credit.bundle(identity, now_ms) {
+        if evidence_due
+            && let Some(Ok(bundle)) = crate::signer::with(signer, at, |signing| {
+                signing.map(|identity| hub.network().credit.bundle(identity, now))
+            })
+        {
             let mut state = lock(&self.state);
-            state.own_evidence_ms = Some(now_ms);
-            if state.evidence(&bundle, now_ms, None) {
+            state.own_evidence_at = Some(now);
+            if state.evidence(&bundle, now, None) {
                 evidence.push(bundle);
             }
         }
@@ -950,12 +994,14 @@ impl Directory {
                         None => resolved_address(&address).await,
                     };
                     // By the clock of the tick that asked.
-                    lock(&state).resolved(&address, resolved, now_ms);
+                    lock(&state).resolved(&address, resolved, now);
                 });
             }
             while let Some(pending) = self.next_to_verify() {
                 let state = Arc::clone(&self.state);
-                let identity = identity.clone();
+                // The handshake's key, which signs no record.
+                let identity = signer.handshake();
+                let clock = self.clock.clone();
                 runtime.spawn(async move {
                     let answered = answers_as(
                         &pending.offer.content().address,
@@ -963,7 +1009,7 @@ impl Directory {
                         &pending.offer.signer(),
                     )
                     .await;
-                    lock(&state).verified(pending, answered, crate::network::wall_ms());
+                    lock(&state).verified(pending, answered, clock.judged());
                 });
             }
         }
@@ -976,7 +1022,7 @@ impl Directory {
     /// Dials every offer waiting, one after another, and records each outcome at `now_ms`: the
     /// handshakes `tick` runs concurrently, run in line (for tests, and a caller with its own
     /// task).
-    pub async fn verify_pending(&self, identity: &Identity, now_ms: u64) {
+    pub async fn verify_pending(&self, identity: &impl tally_wire::Handshakes, now: Judged) {
         while let Some(pending) = self.next_to_verify() {
             let answered = answers_as(
                 &pending.offer.content().address,
@@ -984,7 +1030,7 @@ impl Directory {
                 &pending.offer.signer(),
             )
             .await;
-            lock(&self.state).verified(pending, answered, now_ms);
+            lock(&self.state).verified(pending, answered, now);
         }
     }
 
@@ -1014,10 +1060,10 @@ impl Directory {
         &self,
         offer: ProviderOffer,
         group: Group,
-        now_ms: u64,
+        now: Judged,
     ) -> Result<bool, String> {
-        let offer = checked(&offer, now_ms).ok_or("not a live, signed offer")?;
-        Ok(lock(&self.state).hold(offer, group, now_ms))
+        let offer = checked(&offer, now).ok_or("not a live, signed offer")?;
+        Ok(lock(&self.state).hold(offer, group, now))
     }
 }
 
@@ -1033,14 +1079,14 @@ impl Directory {
         signer: PublicKey,
         content: ProviderOfferContent,
         group: Group,
-        now_ms: u64,
+        now: Judged,
     ) -> bool {
         let offer = Checked(Arc::new(CheckedOffer {
             offer: stand_in.clone(),
             signer,
             content,
         }));
-        lock(&self.state).hold(offer, group, now_ms)
+        lock(&self.state).hold(offer, group, now)
     }
 }
 
@@ -1057,7 +1103,11 @@ async fn resolved_address(address: &str) -> Option<std::net::SocketAddr> {
 /// Dials `address` (an offer's, an IP and port: `Group::of_address`) and runs the handshake to
 /// `key`: true if it answered as `key`. A refusal after the handshake (a full relay's `Goodbye`)
 /// still proves the key, since only its holder completes the handshake. Never resolves a name.
-async fn answers_as(address: &str, identity: &Identity, key: &PublicKey) -> bool {
+async fn answers_as(
+    address: &str,
+    identity: &impl tally_wire::Handshakes,
+    key: &PublicKey,
+) -> bool {
     let Ok(address) = address.parse::<std::net::SocketAddr>() else {
         return false;
     };
@@ -1078,9 +1128,9 @@ async fn answers_as(address: &str, identity: &Identity, key: &PublicKey) -> bool
 
 /// What the relay's own offers should declare now, or `None` if it has nothing to offer (no
 /// region taken, or no address advertised under its key, which no one could verify).
-fn own_basis(hub: &Hub, identity: &Identity) -> Option<Basis> {
+fn own_basis(hub: &Hub, own: &PublicKey) -> Option<Basis> {
     let network = hub.network();
-    let own = identity.public();
+    let own = *own;
     let address = hub
         .hints()
         .iter()
@@ -1149,17 +1199,17 @@ impl State {
     fn ranked_offers(
         &mut self,
         cell: Region,
-        now_ms: u64,
+        now: Judged,
         keep: impl Fn(&Held) -> bool,
     ) -> Vec<Checked> {
-        let order = self.ranking(cell.as_u64(), now_ms).to_vec();
+        let order = self.ranking(cell.as_u64(), now).to_vec();
         let Some(offers) = self.cells.get(&cell.as_u64()) else {
             return Vec::new();
         };
         order
             .iter()
             .filter_map(|key| offers.get(key))
-            .filter(|held| held.expires_ms > now_ms && keep(held))
+            .filter(|held| !tally_wire::budget::expired(held.expires_ms, now) && keep(held))
             .take(OFFERS_PER_CELL)
             .map(|held| held.offer.clone())
             .collect()
@@ -1167,8 +1217,8 @@ impl State {
 
     /// Every offer held for `cell`, ranked (`ranked`): kept until the cell's offers or the tiers
     /// change.
-    fn ranking(&mut self, cell: u64, now_ms: u64) -> &[PublicKey] {
-        self.weigh_at(now_ms);
+    fn ranking(&mut self, cell: u64, now: Judged) -> &[PublicKey] {
+        self.weigh_at(now);
         if !self.ranks.contains_key(&cell) {
             let keys: Vec<PublicKey> = self
                 .cells
@@ -1177,7 +1227,7 @@ impl State {
                 .unwrap_or_default();
             let tiered: Vec<(PublicKey, u32)> = keys
                 .into_iter()
-                .map(|key| (key, self.tier(&key, now_ms)))
+                .map(|key| (key, self.tier(&key, now)))
                 .collect();
             let order = Region::from_u64(cell)
                 .map(|region| ranked(region, tiered))
@@ -1189,12 +1239,13 @@ impl State {
 
     /// The tiers are weighed by the minute: a new minute forgets them, and the rankings made from
     /// them.
-    fn weigh_at(&mut self, now_ms: u64) {
-        let at = now_ms - now_ms % WEIGHED_EVERY_MS;
-        if at != self.tiers_at {
-            self.tiers_at = at;
+    fn weigh_at(&mut self, now: Judged) -> Judged {
+        let at = now.floor(policy::<_, WEIGHED_EVERY_MS>());
+        if Some(at) != self.tiers_at {
+            self.tiers_at = Some(at);
             self.clear_tiers();
         }
+        at
     }
 
     /// The tiers are weighed again: forget them, and every ranking made from them.
@@ -1229,18 +1280,18 @@ impl State {
         &mut self,
         (cell, key): (u64, PublicKey),
         with: Option<(u64, PublicKey)>,
-        now_ms: u64,
+        now: Judged,
     ) -> Standing {
-        let tier = self.tier(&key, now_ms);
+        let tier = self.tier(&key, now);
         let depth = match with {
             Some((with_cell, with_key)) if with_cell == cell => {
-                let mut keys: Vec<PublicKey> = self.ranking(cell, now_ms).to_vec();
+                let mut keys: Vec<PublicKey> = self.ranking(cell, now).to_vec();
                 if !keys.contains(&with_key) {
                     keys.push(with_key);
                 }
                 let tiered: Vec<(PublicKey, u32)> = keys
                     .into_iter()
-                    .map(|one| (one, self.tier(&one, now_ms)))
+                    .map(|one| (one, self.tier(&one, now)))
                     .collect();
                 Region::from_u64(cell)
                     .map(|region| ranked(region, tiered))
@@ -1248,10 +1299,7 @@ impl State {
                     .iter()
                     .position(|one| *one == key)
             }
-            _ => self
-                .ranking(cell, now_ms)
-                .iter()
-                .position(|one| *one == key),
+            _ => self.ranking(cell, now).iter().position(|one| *one == key),
         }
         .unwrap_or(usize::MAX);
         Standing {
@@ -1337,9 +1385,8 @@ impl State {
     /// So the tier is the bit length of the count of networks that witnessed the relay deliver: a
     /// key that showed no evidence is tier 0, below every relay with a witness, and to outrank a
     /// relay with `n` witnesses a party needs relays answering on more than `n` networks.
-    fn tier(&mut self, key: &PublicKey, now_ms: u64) -> u32 {
-        self.weigh_at(now_ms);
-        let at = self.tiers_at;
+    fn tier(&mut self, key: &PublicKey, now: Judged) -> u32 {
+        let at = self.weigh_at(now);
         if let Some(tier) = self.tiers.get(key) {
             return *tier;
         }
@@ -1381,13 +1428,13 @@ impl State {
     fn evidence(
         &mut self,
         bundle: &EvidenceBundle,
-        now_ms: u64,
+        now: Judged,
         pace: Option<&crate::ingest::RecordPace>,
     ) -> bool {
         let Ok(signer) = bundle.signer() else {
             return false;
         };
-        let Ok(shown) = credit::check(bundle, now_ms, pace) else {
+        let Ok(shown) = credit::check(bundle, now, pace) else {
             return false;
         };
         // Held whether or not the signer's offer is yet (it may be waiting for its handshake), so
@@ -1416,11 +1463,11 @@ impl State {
         if !newer {
             return false;
         }
-        let before = self.tier(&signer, now_ms);
+        let before = self.tier(&signer, now);
         self.evidence.insert(signer, (shown, bundle.clone()));
         self.retier([signer]);
         // A key's evidence weighs in its own tier and no other's.
-        if self.tier(&signer, now_ms) != before {
+        if self.tier(&signer, now) != before {
             self.tiers_moved();
         }
         if Some(signer) != self.own {
@@ -1429,13 +1476,13 @@ impl State {
         true
     }
 
-    fn offered(&mut self, asker: &Asker, offer: ProviderOffer, now_ms: u64) {
+    fn offered(&mut self, asker: &Asker, offer: ProviderOffer, now: Judged) {
         let hash = offer.hash();
         if self.seen.get(&hash).is_some() {
             return;
         }
         self.seen.insert(hash, ());
-        let Some(offer) = checked(&offer, now_ms) else {
+        let Some(offer) = checked(&offer, now) else {
             return;
         };
         let (signer, content) = (offer.signer(), offer.content());
@@ -1462,9 +1509,9 @@ impl State {
         let trusted = self
             .verified
             .get(&(signer, content.address.clone()))
-            .is_some_and(|until| *until > now_ms);
+            .is_some_and(|until| !now.reached(*until));
         if trusted {
-            if self.hold(offer.clone(), group, now_ms) {
+            if self.hold(offer.clone(), group, now) {
                 self.gossip.push(offer.offer().clone());
             }
             return;
@@ -1472,7 +1519,7 @@ impl State {
         if self
             .unanswered
             .get(&content.address)
-            .is_some_and(|until| *until > now_ms)
+            .is_some_and(|until| !now.reached(*until))
         {
             return;
         }
@@ -1503,23 +1550,27 @@ impl State {
     }
 
     /// A handshake's outcome.
-    fn verified(&mut self, pending: Pending, answered: bool, now_ms: u64) {
+    fn verified(&mut self, pending: Pending, answered: bool, now: Judged) {
         let (signer, content) = (pending.offer.signer(), pending.offer.content());
         self.dialling.remove(&content.address);
         self.verifying = self.verifying.saturating_sub(1);
         // Only an offer in a group is queued (`offered`).
         match Group::of_address(&content.address).filter(|_| answered) {
             Some(group) => {
-                self.verified
-                    .insert((signer, content.address.clone()), now_ms + VERIFIED_FOR_MS);
+                self.verified.insert(
+                    (signer, content.address.clone()),
+                    now.later(policy::<_, VERIFIED_FOR_MS>()),
+                );
                 // Checked when it came; only its lifetime may have run out since.
-                if live(content, now_ms) && self.hold(pending.offer.clone(), group, now_ms) {
+                if live(content, now) && self.hold(pending.offer.clone(), group, now) {
                     self.gossip.push(pending.offer.offer().clone());
                 }
             }
             None => {
-                self.unanswered
-                    .insert(content.address.clone(), now_ms + UNANSWERED_FOR_MS);
+                self.unanswered.insert(
+                    content.address.clone(),
+                    now.later(policy::<_, UNANSWERED_FOR_MS>()),
+                );
             }
         }
     }
@@ -1527,7 +1578,8 @@ impl State {
     /// Holds a verified offer if the caps allow it, by rank (see the module). True when held
     /// (new, or newer for its key and cell); false when refused, or when it is a change that must
     /// wait its turn (`CHANGED_AT_MOST_EVERY_MS`), which is then held when due.
-    fn hold(&mut self, offer: Checked, group: Group, now_ms: u64) -> bool {
+    fn hold(&mut self, offer: Checked, group: Group, now: Judged) -> bool {
+        let now_ms = now.ms();
         let (signer, content) = (offer.signer(), offer.content().clone());
         let cell_key = content.cell.as_u64();
         let replacing = self
@@ -1562,7 +1614,7 @@ impl State {
             }
             // The relay's own changes are held to `OWN_RESIGN_AT_MOST_EVERY_MS` where it signs.
             let due = held_changed_ms.saturating_add(CHANGED_AT_MOST_EVERY_MS);
-            if Some(signer) != self.own && now_ms < due {
+            if Some(signer) != self.own && !tally_wire::budget::reached(due, now) {
                 if let Some(held) = self
                     .cells
                     .get_mut(&cell_key)
@@ -1599,7 +1651,7 @@ impl State {
                         .collect();
                     let lowest = contest
                         .into_iter()
-                        .map(|held| self.standing(held, Some((cell_key, signer)), now_ms))
+                        .map(|held| self.standing(held, Some((cell_key, signer)), now))
                         .min();
                     match lowest {
                         Some(lowest) if (lowest.cell, lowest.key) != (cell_key, signer) => {
@@ -1619,9 +1671,9 @@ impl State {
 
     /// The changes whose turn has come (`CHANGED_AT_MOST_EVERY_MS`), held now; each held is
     /// gossiped, as an offer newly held is.
-    fn apply_deferred(&mut self, now_ms: u64) {
+    fn apply_deferred(&mut self, now: Judged) {
         while let Some((due, cell, key)) = self.deferred.first().copied() {
-            if due > now_ms {
+            if !tally_wire::budget::reached(due, now) {
                 break;
             }
             self.deferred.pop_first();
@@ -1631,8 +1683,8 @@ impl State {
                 .and_then(|offers| offers.get_mut(&key))
                 .and_then(|held| held.deferred.take());
             if let Some((offer, group)) = waiting
-                && live(offer.content(), now_ms)
-                && self.hold(offer.clone(), group, now_ms)
+                && live(offer.content(), now)
+                && self.hold(offer.clone(), group, now)
             {
                 self.gossip.push(offer.offer().clone());
             }
@@ -1782,7 +1834,8 @@ impl State {
 
     /// Weighs the tiers of the minute `now_ms` falls in, once a minute, for readers that follow the
     /// version: a tier that moved since the last minute moves it; tiers that stood still do not.
-    fn roll_tiers(&mut self, now_ms: u64) {
+    fn roll_tiers(&mut self, now: Judged) {
+        let now_ms = now.ms();
         let at = now_ms - now_ms % WEIGHED_EVERY_MS;
         if at == self.rolled_at {
             return;
@@ -1791,7 +1844,7 @@ impl State {
         let keys: Vec<PublicKey> = self.evidence.keys().copied().collect();
         let mut tiers: Vec<(PublicKey, u32)> = keys
             .into_iter()
-            .map(|key| (key, self.tier(&key, now_ms)))
+            .map(|key| (key, self.tier(&key, now)))
             .filter(|(_, tier)| *tier > 0)
             .collect();
         tiers.sort();
@@ -1803,11 +1856,11 @@ impl State {
 
     /// Forgets every offer expired at `now_ms`: nothing to do, and no scan, until the soonest
     /// expiry held is due.
-    fn expire_offers(&mut self, now_ms: u64) {
+    fn expire_offers(&mut self, now: Judged) {
         if self
             .expiries
             .first_key_value()
-            .is_none_or(|(at, _)| *at > now_ms)
+            .is_none_or(|(at, _)| !tally_wire::budget::expired(*at, now))
         {
             return;
         }
@@ -1817,7 +1870,7 @@ impl State {
             .flat_map(|(cell, offers)| {
                 offers
                     .iter()
-                    .filter(|(_, held)| held.expires_ms <= now_ms)
+                    .filter(|(_, held)| tally_wire::budget::expired(held.expires_ms, now))
                     .map(move |(key, _)| (*cell, *key))
             })
             .collect();
@@ -1827,9 +1880,9 @@ impl State {
     }
 
     /// Forgets every offer expired at `now_ms`, and the addresses no longer trusted or shunned.
-    fn expire(&mut self, now_ms: u64) {
-        self.apply_deferred(now_ms);
-        self.expire_offers(now_ms);
+    fn expire(&mut self, now: Judged) {
+        self.apply_deferred(now);
+        self.expire_offers(now);
         // Evidence is held for the relays whose offers are held, and for one whose offer has not
         // come for a while (its handshake under way) until its offer would have.
         let own = self.own;
@@ -1838,7 +1891,7 @@ impl State {
         self.evidence.retain(|key, (shown, _)| {
             let kept = Some(*key) == own
                 || per_key.contains_key(key)
-                || now_ms.saturating_sub(shown.issued_ms()) <= 2 * OWN_EVIDENCE_EVERY_MS;
+                || !tally_wire::budget::EVIDENCE_AWAITED.older(shown.issued_ms(), now);
             if !kept {
                 dropped.push(*key);
             }
@@ -1848,14 +1901,14 @@ impl State {
         while self
             .verified
             .first()
-            .is_some_and(|(_, until)| *until <= now_ms)
+            .is_some_and(|(_, until)| now.reached(*until))
         {
             self.verified.pop_first();
         }
         while self
             .unanswered
             .first()
-            .is_some_and(|(_, until)| *until <= now_ms)
+            .is_some_and(|(_, until)| now.reached(*until))
         {
             self.unanswered.pop_first();
         }
@@ -1866,10 +1919,11 @@ impl State {
     /// cells no longer taken are withdrawn. `Some` with what to gossip when re-signed.
     fn resign(
         &mut self,
-        identity: &Identity,
+        identity: &impl Signs,
         basis: Option<Basis>,
-        now_ms: u64,
+        now: Judged,
     ) -> Option<Vec<ProviderOffer>> {
+        let now_ms = now.ms();
         let own = identity.public();
         let changed = match (&basis, &self.own_basis) {
             (Some(new), Some(old)) => !new.same(old),
@@ -1899,7 +1953,7 @@ impl State {
         self.own_basis.clone_from(&basis);
         self.own_offers.clear();
         let Some(basis) = basis else {
-            self.set_own_group(None, now_ms);
+            self.set_own_group(None, now);
             return None;
         };
         let group = Group::of_address(&basis.address);
@@ -1921,7 +1975,7 @@ impl State {
                 continue;
             };
             self.seen.insert(offer.hash(), ());
-            let Some(checked) = checked(&offer, now_ms) else {
+            let Some(checked) = checked(&offer, now) else {
                 continue;
             };
             self.own_offers.push(checked);
@@ -1930,7 +1984,7 @@ impl State {
             signed.push(offer);
         }
         // Held under the group of the address they name, as every peer holds them.
-        self.set_own_group(group, now_ms);
+        self.set_own_group(group, now);
         Some(signed)
     }
 
@@ -1938,7 +1992,8 @@ impl State {
     /// is itself; a host name the address it last resolved to. `true` when it is to be resolved
     /// now (never resolved, or resolved over `VERIFIED_FOR_MS` ago), and no resolution of it is
     /// under way.
-    fn own_address_of(&self, address: &str, now_ms: u64) -> (Option<std::net::SocketAddr>, bool) {
+    fn own_address_of(&self, address: &str, now: Judged) -> (Option<std::net::SocketAddr>, bool) {
+        let now_ms = now.ms();
         if let Ok(address) = address.parse::<std::net::SocketAddr>() {
             return (Some(address), false);
         }
@@ -1960,7 +2015,8 @@ impl State {
     /// `address` resolved to `resolved` (none: it did not resolve, and is tried again
     /// `RESOLVE_AGAIN_MS` on, the address it last resolved to still named): the relay's own
     /// offers name it from their next signing, by the tick's clock (`own_address_of`).
-    fn resolved(&mut self, address: &str, resolved: Option<std::net::SocketAddr>, now_ms: u64) {
+    fn resolved(&mut self, address: &str, resolved: Option<std::net::SocketAddr>, now: Judged) {
+        let now_ms = now.ms();
         let Some(resolved) = resolved else {
             self.own_resolving = Some((address.to_owned(), now_ms + RESOLVE_AGAIN_MS));
             return;
@@ -1979,9 +2035,9 @@ impl State {
     /// they leave the one they were held under and are held under this one by its caps. The
     /// relay's own network is also one no witness of its own may come from (`State::tier`), which
     /// its offers' group says.
-    fn set_own_group(&mut self, group: Option<Group>, now_ms: u64) {
+    fn set_own_group(&mut self, group: Option<Group>, now: Judged) {
         if self.own_group == group {
-            self.hold_own(now_ms);
+            self.hold_own(now);
             return;
         }
         self.own_group = group;
@@ -1999,13 +2055,13 @@ impl State {
         }
         self.networks_moved();
         self.tiers_moved();
-        self.hold_own(now_ms);
+        self.hold_own(now);
     }
 
     /// Holds the relay's own offers as last signed under its own group, by every cap, as a peer
     /// that verified them there holds them: one held already is left as it is. None while the
     /// group is not known.
-    fn hold_own(&mut self, now_ms: u64) {
+    fn hold_own(&mut self, now: Judged) {
         let (Some(own), Some(group)) = (self.own, self.own_group) else {
             return;
         };
@@ -2013,7 +2069,7 @@ impl State {
             let content = offer.content();
             let cell = content.cell.as_u64();
             let held = self.cells.get(&cell).and_then(|offers| offers.get(&own));
-            if !live(content, now_ms)
+            if !live(content, now)
                 || held
                     .is_some_and(|held| held.group == group && held.issued_ms >= content.issued_ms)
             {
@@ -2022,7 +2078,7 @@ impl State {
             if held.is_some_and(|held| held.group != group) {
                 self.remove(cell, &own);
             }
-            self.hold(offer, group, now_ms);
+            self.hold(offer, group, now);
         }
     }
 }
@@ -2056,9 +2112,12 @@ fn given_up_under(
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::disallowed_methods, reason = "a test's scripted readings")]
     use super::*;
     use std::net::Ipv4Addr;
+    use tally_wire::Identity;
     use tally_wire::Location;
+    use tally_wire::clocks::recorded::judged;
     use tally_wire::rendezvous::area_of;
     use tokio::net::TcpListener;
 
@@ -2118,6 +2177,10 @@ mod tests {
 
     /// A Noise responder on loopback answering as `identities`, for as long as the test runs.
     async fn answering(identities: Vec<Identity>) -> std::result::Result<String, String> {
+        let identities: Vec<tally_wire::NoiseKey> = identities
+            .into_iter()
+            .map(tally_wire::NoiseKey::of)
+            .collect();
         let listener = TcpListener::bind("127.0.0.1:0").await.map_err(text)?;
         let address = listener.local_addr().map_err(text)?.to_string();
         tokio::spawn(async move {
@@ -2140,32 +2203,39 @@ mod tests {
         let local = Identity::generate().map_err(text)?;
         let honest = Identity::generate().map_err(text)?;
         let impostor = Identity::generate().map_err(text)?;
-        let honest_at = answering(vec![honest.clone()]).await?;
+        let honest_at = answering(vec![crate::signer::twin(&honest)]).await?;
         // The impostor's address answers, but as another key.
         let impostor_at = answering(vec![Identity::generate().map_err(text)?]).await?;
         let directory = Directory::new();
         let cell = area()?;
         let good = sign(&honest, &content(&honest_at, cell, NOW))?;
         let lying = sign(&impostor, &content(&impostor_at, cell, NOW))?;
-        directory.offered(&relay_asker(honest.public()), good.clone(), NOW);
-        directory.offered(&relay_asker(honest.public()), lying.clone(), NOW);
+        directory.offered(&relay_asker(honest.public()), good.clone(), judged(NOW));
+        directory.offered(&relay_asker(honest.public()), lying.clone(), judged(NOW));
         assert!(directory.is_empty(), "nothing held before the handshake");
-        directory.verify_pending(&local, NOW).await;
-        assert_eq!(directory.offers_for(cell, NOW), vec![good.clone()]);
+        directory.verify_pending(&local, judged(NOW)).await;
+        assert_eq!(directory.offers_for(cell, judged(NOW)), vec![good.clone()]);
         // Gossiped once, at the next tick; a second offer of the same bytes is not acted on.
         let gossip = directory.state.lock().map_err(text)?.gossip.clone();
         assert_eq!(gossip, vec![good.clone()]);
         directory.state.lock().map_err(text)?.gossip.clear();
-        directory.offered(&relay_asker(honest.public()), good, NOW);
+        directory.offered(&relay_asker(honest.public()), good, judged(NOW));
         assert!(directory.state.lock().map_err(text)?.gossip.is_empty());
         // The impostor's address is not dialled again for a while, even for a new offer.
         let again = sign(&impostor, &content(&impostor_at, cell, NOW + 1))?;
-        directory.offered(&relay_asker(honest.public()), again, NOW + 1);
+        directory.offered(&relay_asker(honest.public()), again, judged(NOW + 1));
         assert!(directory.state.lock().map_err(text)?.pending.is_empty());
         // A re-signed offer from a key already verified there is held without a dial.
         let renewed = sign(&honest, &content(&honest_at, cell, NOW + 60_000))?;
-        directory.offered(&relay_asker(honest.public()), renewed.clone(), NOW + 60_000);
-        assert_eq!(directory.offers_for(cell, NOW + 60_000), vec![renewed]);
+        directory.offered(
+            &relay_asker(honest.public()),
+            renewed.clone(),
+            judged(NOW + 60_000),
+        );
+        assert_eq!(
+            directory.offers_for(cell, judged(NOW + 60_000)),
+            vec![renewed]
+        );
         Ok(())
     }
 
@@ -2173,7 +2243,7 @@ mod tests {
     async fn a_forged_an_expired_and_an_unanswering_offer_are_not_held() -> Result {
         let local = Identity::generate().map_err(text)?;
         let relay = Identity::generate().map_err(text)?;
-        let at = answering(vec![relay.clone()]).await?;
+        let at = answering(vec![crate::signer::twin(&relay)]).await?;
         let directory = Directory::new();
         let cell = area()?;
         let asker = relay_asker(relay.public());
@@ -2183,12 +2253,21 @@ mod tests {
         let at_byte = bytes.len() - 70;
         bytes[at_byte] ^= 1;
         let forged = ProviderOffer::from_bytes(bytes).map_err(text)?;
-        directory.offered(&asker, forged, NOW);
+        directory.offered(&asker, forged, judged(NOW));
         // Expired by this relay's clock, and issued too far in the future.
         let old = sign(&relay, &content(&at, cell, NOW - 20 * 60 * 1000))?;
-        directory.offered(&asker, old, NOW);
-        let future = sign(&relay, &content(&at, cell, NOW + 2 * CLOCK_SKEW_MS))?;
-        directory.offered(&asker, future, NOW);
+        directory.offered(&asker, old, judged(NOW));
+        let future = sign(
+            &relay,
+            &content(
+                &at,
+                cell,
+                NOW + 2 * tally_wire::budget::K
+                    .span::<tally_wire::clocks::Judged>()
+                    .ms(),
+            ),
+        )?;
+        directory.offered(&asker, future, judged(NOW));
         assert!(directory.state.lock().map_err(text)?.pending.is_empty());
         // Nobody listening at the address.
         let closed = TcpListener::bind("127.0.0.1:0").await.map_err(text)?;
@@ -2198,19 +2277,19 @@ mod tests {
         directory.offered(
             &relay_asker(silent.public()),
             sign(&silent, &content(&nowhere, cell, NOW))?,
-            NOW,
+            judged(NOW),
         );
-        directory.verify_pending(&local, NOW).await;
+        directory.verify_pending(&local, judged(NOW)).await;
         assert!(directory.is_empty());
         // An offer expires while held.
-        directory.offered(&asker, good, NOW);
-        directory.verify_pending(&local, NOW).await;
+        directory.offered(&asker, good, judged(NOW));
+        directory.verify_pending(&local, judged(NOW)).await;
         assert_eq!(directory.len(), 1);
         directory
             .state
             .lock()
             .map_err(text)?
-            .expire(NOW + 10 * 60 * 1000);
+            .expire(judged(NOW + 10 * 60 * 1000));
         assert!(directory.is_empty());
         Ok(())
     }
@@ -2257,7 +2336,7 @@ mod tests {
     }
 
     /// One arrival at a directory, in a test that holds the same arrivals in different orders.
-    type Step = Box<dyn Fn(&Directory) -> Result>;
+    type Step<'a> = Box<dyn Fn(&Directory) -> Result + 'a>;
 
     /// RFC-0174 §2.6, a cell's held offers ranked by contribution first: honest relays whose
     /// children (relays verified on networks of their own) signed receipts for what they
@@ -2300,54 +2379,56 @@ mod tests {
 
         let held_set = |reversed: bool| -> std::result::Result<Vec<PublicKey>, String> {
             let directory = Directory::new();
-            let mut steps: Vec<Step> = Vec::new();
+            let mut steps: Vec<Step<'_>> = Vec::new();
             for (at, (child_set, relay)) in children.iter().zip(&honest).enumerate() {
                 for (index, child) in child_set.iter().enumerate() {
-                    let child = child.clone();
                     steps.push(Box::new(move |directory: &Directory| {
-                        let offer = sign(&child, &content("child.example:1", elsewhere, NOW))?;
-                        directory.hold_verified(offer, v4(20 + at as u8, index as u8), NOW)?;
+                        let offer = sign(child, &content("child.example:1", elsewhere, NOW))?;
+                        directory.hold_verified(
+                            offer,
+                            v4(20 + at as u8, index as u8),
+                            judged(NOW),
+                        )?;
                         Ok(())
                     }));
                 }
-                let relay = relay.clone();
-                let child_set = child_set.clone();
                 steps.push(Box::new(move |directory: &Directory| {
-                    let offer = sign(&relay, &content("honest.example:1", cell, NOW))?;
-                    directory.hold_verified(offer, v4(10, at as u8), NOW)?;
-                    directory.evidence(&evidence_of(&relay, &child_set, 10_000)?, NOW, None);
+                    let offer = sign(relay, &content("honest.example:1", cell, NOW))?;
+                    directory.hold_verified(offer, v4(10, at as u8), judged(NOW))?;
+                    directory.evidence(&evidence_of(relay, child_set, 10_000)?, judged(NOW), None);
                     Ok(())
                 }));
             }
             for (index, child) in one_network.iter().enumerate() {
-                let child = child.clone();
                 steps.push(Box::new(move |directory: &Directory| {
-                    let offer = sign(&child, &content("one.example:1", elsewhere, NOW))?;
+                    let offer = sign(child, &content("one.example:1", elsewhere, NOW))?;
                     // Every one of them on one network.
-                    directory.hold_verified(offer, v4(30, 0), NOW + index as u64)?;
+                    directory.hold_verified(offer, v4(30, 0), judged(NOW + index as u64))?;
                     Ok(())
                 }));
             }
             for (index, key) in ground.iter().enumerate() {
-                let key = key.clone();
-                let free = free.clone();
-                let one_network = one_network.clone();
+                let (free, one_network) = (&free, &one_network);
                 steps.push(Box::new(move |directory: &Directory| {
-                    let offer = sign(&key, &content("ground.example:1", cell, NOW))?;
+                    let offer = sign(key, &content("ground.example:1", cell, NOW))?;
                     directory.hold_verified(
                         offer,
                         v4(100 + (index / 200) as u8, index as u8),
-                        NOW,
+                        judged(NOW),
                     )?;
                     match index % 3 {
                         0 => {}
                         1 => {
-                            directory.evidence(&evidence_of(&key, &free, 1_000_000)?, NOW, None);
+                            directory.evidence(
+                                &evidence_of(key, free, 1_000_000)?,
+                                judged(NOW),
+                                None,
+                            );
                         }
                         _ => {
                             directory.evidence(
-                                &evidence_of(&key, &one_network, 1_000_000)?,
-                                NOW,
+                                &evidence_of(key, one_network, 1_000_000)?,
+                                judged(NOW),
                                 None,
                             );
                         }
@@ -2381,10 +2462,10 @@ mod tests {
             }
             for (key, address, group) in resigned {
                 let offer = sign(key, &content(address, cell, NOW + 1))?;
-                directory.hold_verified(offer, group, NOW + 1)?;
+                directory.hold_verified(offer, group, judged(NOW + 1))?;
             }
             Ok(directory
-                .offers_for(cell, NOW + 2)
+                .offers_for(cell, judged(NOW + 2))
                 .iter()
                 .map(Checked::signer)
                 .collect())
@@ -2405,16 +2486,20 @@ mod tests {
         let one = Directory::new();
         for (index, child) in one_network.iter().enumerate() {
             let offer = sign(child, &content("one.example:1", elsewhere, NOW))?;
-            one.hold_verified(offer, v4(30, 0), NOW + index as u64)?;
+            one.hold_verified(offer, v4(30, 0), judged(NOW + index as u64))?;
         }
         let witness = &ground[2];
         one.hold_verified(
             sign(witness, &content("ground.example:1", cell, NOW))?,
             v4(99, 0),
-            NOW,
+            judged(NOW),
         )?;
-        one.evidence(&evidence_of(witness, &one_network, 1_000_000)?, NOW, None);
-        assert_eq!(one.tier_of(&witness.public(), NOW), tier(1));
+        one.evidence(
+            &evidence_of(witness, &one_network, 1_000_000)?,
+            judged(NOW),
+            None,
+        );
+        assert_eq!(one.tier_of(&witness.public(), judged(NOW)), tier(1));
         assert_eq!(tier(1), 1);
         // The same evidence, held in the opposite order: the same set, in the same order.
         assert_eq!(held_set(true)?, forwards);
@@ -2447,15 +2532,15 @@ mod tests {
             let directory = Directory::new();
             for (index, child) in children.iter().enumerate() {
                 let offer = sign(child, &content("child.example:1", elsewhere, NOW))?;
-                directory.hold_verified(offer, v4(20, index as u8), NOW)?;
+                directory.hold_verified(offer, v4(20, index as u8), judged(NOW))?;
             }
             for (at, relay) in honest.iter().enumerate() {
                 // One core each: the least a relay offering MLAT can name.
                 let mut offered = content("honest.example:1", cell, NOW);
                 offered.mlat_cores = 1;
-                directory.hold_verified(sign(relay, &offered)?, v4(10, at as u8), NOW)?;
+                directory.hold_verified(sign(relay, &offered)?, v4(10, at as u8), judged(NOW))?;
                 if evidenced {
-                    directory.evidence(&evidence_of(relay, &children, 10_000)?, NOW, None);
+                    directory.evidence(&evidence_of(relay, &children, 10_000)?, judged(NOW), None);
                 }
             }
             for (index, key) in ground.iter().enumerate() {
@@ -2464,10 +2549,10 @@ mod tests {
                 directory.hold_verified(
                     sign(key, &lure)?,
                     v4(100 + (index / 200) as u8, index as u8),
-                    NOW,
+                    judged(NOW),
                 )?;
             }
-            Ok(crate::selection::mlat_relays(cell, &directory, NOW))
+            Ok(crate::selection::mlat_relays(cell, &directory, judged(NOW)))
         };
         let honest_keys: HashSet<PublicKey> = honest.iter().map(Identity::public).collect();
         let chosen = build(true)?;
@@ -2494,8 +2579,8 @@ mod tests {
         let directory = Directory::new();
         // It claims ten minutes.
         let offer = sign(&relay, &content("relay.example:1", cell, NOW))?;
-        directory.hold_verified(offer, v4(1, 1), NOW)?;
-        let held = |at: u64| !directory.offers_for(cell, at).is_empty();
+        directory.hold_verified(offer, v4(1, 1), judged(NOW))?;
+        let held = |at: u64| !directory.offers_for(cell, judged(at)).is_empty();
         assert!(held(NOW + OFFER_LIFETIME_MS - 1));
         assert!(!held(NOW + OFFER_LIFETIME_MS));
         assert_eq!(OFFER_LIFETIME_MS, 3 * OWN_RESIGN_EVERY_MS);
@@ -2517,11 +2602,11 @@ mod tests {
             loopback: false,
             address: None,
         };
-        directory.offered(&client, offer.clone(), NOW);
+        directory.offered(&client, offer.clone(), judged(NOW));
         assert!(directory.state.lock().map_err(text)?.pending.is_empty());
         // The relay's own offer, come back round a gossip loop.
         let mine = sign(&own, &content("192.0.2.8:7450", cell, NOW))?;
-        directory.offered(&relay_asker(other.public()), mine, NOW);
+        directory.offered(&relay_asker(other.public()), mine, judged(NOW));
         assert!(directory.state.lock().map_err(text)?.pending.is_empty());
         // A client announcing its own offer is queued.
         let announcing = Asker {
@@ -2529,7 +2614,7 @@ mod tests {
             ..client
         };
         let fresh = sign(&other, &content("192.0.2.7:7450", cell, NOW + 1))?;
-        directory.offered(&announcing, fresh, NOW + 1);
+        directory.offered(&announcing, fresh, judged(NOW + 1));
         assert_eq!(directory.state.lock().map_err(text)?.pending.len(), 1);
         Ok(())
     }
@@ -2544,7 +2629,7 @@ mod tests {
             bytes[..4].copy_from_slice(&seed.to_be_bytes());
             let key = Identity::from_seed(bytes);
             let offer = sign(&key, &content("flood.example:1", cell, NOW))?;
-            directory.hold_verified(offer, v4(10, 0), NOW)?;
+            directory.hold_verified(offer, v4(10, 0), judged(NOW))?;
         }
         assert_eq!(directory.len(), OFFERS_PER_GROUP_IN_CELL);
         // From many groups: the cell holds at most its cap.
@@ -2553,9 +2638,12 @@ mod tests {
             bytes[..4].copy_from_slice(&seed.to_be_bytes());
             let key = Identity::from_seed(bytes);
             let offer = sign(&key, &content("flood.example:1", cell, NOW))?;
-            directory.hold_verified(offer, v4(11, seed as u8), NOW)?;
+            directory.hold_verified(offer, v4(11, seed as u8), judged(NOW))?;
         }
-        assert_eq!(directory.offers_for(cell, NOW).len(), OFFERS_PER_CELL);
+        assert_eq!(
+            directory.offers_for(cell, judged(NOW)).len(),
+            OFFERS_PER_CELL
+        );
         // One key over many cells: at most its cap.
         let busy = Identity::generate().map_err(text)?;
         let state = Region::containing(
@@ -2574,7 +2662,11 @@ mod tests {
         let mut held = 0;
         for (index, cell) in cells.iter().cycle().take(400).enumerate() {
             let content = content("busy.example:1", *cell, NOW + index as u64);
-            if directory.hold_verified(sign(&busy, &content)?, v4(12, (index % 200) as u8), NOW)? {
+            if directory.hold_verified(
+                sign(&busy, &content)?,
+                v4(12, (index % 200) as u8),
+                judged(NOW),
+            )? {
                 held += 1;
             }
         }
@@ -2595,7 +2687,7 @@ mod tests {
             .collect();
         for (relay, index) in honest.iter().zip(0_u8..) {
             let offer = sign(relay, &content("honest.example:1", cell, NOW))?;
-            assert!(directory.hold_verified(offer, v4(1, index), NOW)?);
+            assert!(directory.hold_verified(offer, v4(1, index), judged(NOW))?);
         }
         // An attacker with 1,000 keys from two networks, each offer with every MLAT core it can
         // name.
@@ -2605,9 +2697,13 @@ mod tests {
             let attacker = Identity::from_seed(bytes);
             let mut lure = content("attacker.example:1", cell, NOW);
             lure.mlat_cores = u16::MAX;
-            directory.hold_verified(sign(&attacker, &lure)?, v4(200, (seed % 2) as u8), NOW)?;
+            directory.hold_verified(
+                sign(&attacker, &lure)?,
+                v4(200, (seed % 2) as u8),
+                judged(NOW),
+            )?;
         }
-        let held = directory.offers_for(cell, NOW);
+        let held = directory.offers_for(cell, judged(NOW));
         assert_eq!(held.len(), honest.len() + 2 * OFFERS_PER_GROUP_IN_CELL);
         for relay in &honest {
             assert!(
@@ -2617,7 +2713,7 @@ mod tests {
         }
         // The MLAT choice still ranks every relay held, each counted for at most
         // `MLAT_CORES_COUNTED` cores whatever it names.
-        let chosen = crate::selection::mlat_relays(cell, &directory, NOW);
+        let chosen = crate::selection::mlat_relays(cell, &directory, judged(NOW));
         assert_eq!(chosen.len(), rendezvous::MLAT_RELAYS_PER_AREA);
         Ok(())
     }
@@ -2656,7 +2752,7 @@ mod tests {
         let directory = Directory::new();
         for index in order {
             let (key, content, group) = &offers[index];
-            directory.hold_unsigned(&stand_in, *key, content.clone(), *group, NOW);
+            directory.hold_unsigned(&stand_in, *key, content.clone(), *group, judged(NOW));
         }
         let state = directory.state.lock().map_err(text)?;
         let mut held: Vec<(u64, PublicKey)> = state
@@ -2763,9 +2859,9 @@ mod tests {
         let cell = area()?;
         let directory = Directory::new();
         let first = sign(&relay, &content("r.example:1", cell, NOW))?;
-        assert!(directory.hold_verified(first, v4(1, 1), NOW)?);
-        assert_eq!(directory.take_changed_cells(NOW), vec![cell]);
-        let version = directory.version(NOW);
+        assert!(directory.hold_verified(first, v4(1, 1), judged(NOW))?);
+        assert_eq!(directory.take_changed_cells(judged(NOW)), vec![cell]);
+        let version = directory.version(judged(NOW));
         let mut newest = None;
         for step in 1..=200_u64 {
             let mut changed = content("r.example:1", cell, NOW + step);
@@ -2773,17 +2869,20 @@ mod tests {
             changed.mlat_cores = (step % 60) as u16 + 9;
             let offer = sign(&relay, &changed)?;
             // Every 10 ms: deferred, and no reader is told.
-            assert!(!directory.hold_verified(offer.clone(), v4(1, 1), NOW + step * 10)?);
+            assert!(!directory.hold_verified(offer.clone(), v4(1, 1), judged(NOW + step * 10))?);
             newest = Some(offer);
         }
-        assert_eq!(directory.version(NOW + 2_000), version);
-        assert!(directory.take_changed_cells(NOW + 2_000).is_empty());
+        assert_eq!(directory.version(judged(NOW + 2_000)), version);
+        assert!(directory.take_changed_cells(judged(NOW + 2_000)).is_empty());
         // Its turn: the newest change is held, told once, and gossiped once.
         let due = NOW + CHANGED_AT_MOST_EVERY_MS;
-        directory.state.lock().map_err(text)?.expire(due);
+        directory.state.lock().map_err(text)?.expire(judged(due));
         let newest = newest.ok_or("no change")?;
-        assert_eq!(directory.offers_for(cell, due), vec![newest.clone()]);
-        assert_eq!(directory.take_changed_cells(due), vec![cell]);
+        assert_eq!(
+            directory.offers_for(cell, judged(due)),
+            vec![newest.clone()]
+        );
+        assert_eq!(directory.take_changed_cells(judged(due)), vec![cell]);
         assert_eq!(
             directory.state.lock().map_err(text)?.gossip,
             vec![newest.clone()]
@@ -2793,14 +2892,14 @@ mod tests {
         let mut same = newest.content().map_err(text)?;
         same.issued_ms += RESIGNED_AT_MOST_EVERY_MS;
         let quiet = sign(&relay, &same)?;
-        assert!(directory.hold_verified(quiet.clone(), v4(1, 1), due + 1)?);
-        assert_eq!(directory.offers_for(cell, due + 1), vec![quiet]);
-        assert!(directory.take_changed_cells(due + 1).is_empty());
+        assert!(directory.hold_verified(quiet.clone(), v4(1, 1), judged(due + 1))?);
+        assert_eq!(directory.offers_for(cell, judged(due + 1)), vec![quiet]);
+        assert!(directory.take_changed_cells(judged(due + 1)).is_empty());
         // And the next change waits its turn from the last.
         let mut later = same.clone();
         later.issued_ms += 1;
         later.mlat_cores = 99;
-        assert!(!directory.hold_verified(sign(&relay, &later)?, v4(1, 1), due + 2)?);
+        assert!(!directory.hold_verified(sign(&relay, &later)?, v4(1, 1), judged(due + 2))?);
         Ok(())
     }
 
@@ -2824,10 +2923,10 @@ mod tests {
             let directory = Directory::new();
             for index in order {
                 let (offer, group) = &offers[*index];
-                directory.hold_verified(offer.clone(), *group, NOW)?;
+                directory.hold_verified(offer.clone(), *group, judged(NOW))?;
             }
             let mut keys: Vec<PublicKey> = directory
-                .offers_for(cell, NOW)
+                .offers_for(cell, judged(NOW))
                 .iter()
                 .map(Checked::signer)
                 .collect();
@@ -2873,8 +2972,18 @@ mod tests {
         let sharing = &hub.network().sharing;
         assert_ne!(forwarded_stripes(sharing, cell, &identity.public()), 0);
         // The egress sheds a forwarding peer: the relay withdraws its one region.
-        let _ = sharing.tick_shed(&hub, Some(&identity), 0, NOW);
-        let _ = sharing.tick_shed(&hub, Some(&identity), 1, NOW + 1_000);
+        let _ = sharing.tick_shed(
+            &hub,
+            Some(&crate::signer::synced(crate::signer::twin(&identity))),
+            0,
+            NOW,
+        );
+        let _ = sharing.tick_shed(
+            &hub,
+            Some(&crate::signer::synced(crate::signer::twin(&identity))),
+            1,
+            NOW + 1_000,
+        );
         assert!(sharing.withdrawn(cell));
         assert_eq!(forwarded_stripes(sharing, cell, &identity.public()), 0);
         Ok(())
@@ -2903,25 +3012,25 @@ mod tests {
             sign(&relays[2], &content("c.example:1", finer, NOW))?,
         ];
         for (offer, index) in offers.iter().zip(0_u8..) {
-            directory.hold_verified(offer.clone(), v4(2, index), NOW)?;
+            directory.hold_verified(offer.clone(), v4(2, index), judged(NOW))?;
         }
         let answer = directory.query(
             &ProviderQuery {
                 cell,
                 products: Streams(0),
             },
-            NOW,
+            judged(NOW),
         );
         // The cell's own and its parent's, finest first; not the finer cell's.
         assert_eq!(answer, vec![offers[0].clone(), offers[1].clone()]);
-        assert_eq!(directory.offers_for(cell, NOW), answer);
+        assert_eq!(directory.offers_for(cell, judged(NOW)), answer);
         // Products filter.
         let none = directory.query(
             &ProviderQuery {
                 cell,
                 products: Streams::WORLD,
             },
-            NOW,
+            judged(NOW),
         );
         assert!(none.is_empty());
         // Expired ones are not answered.
@@ -2932,9 +3041,47 @@ mod tests {
                         cell,
                         products: Streams(0),
                     },
-                    NOW + 11 * 60 * 1000,
+                    judged(NOW + 11 * 60 * 1000),
                 )
                 .is_empty()
+        );
+        Ok(())
+    }
+
+    /// RFC-0171 §3.6: the relay signs no offer and no evidence while its clock is unsynced
+    /// (`signer::Signer::with`); its offer goes out at the first tick after it is synced.
+    /// Before, the directory held the key itself and signed by whatever the clock read.
+    #[test]
+    fn the_relay_offers_nothing_while_its_clock_is_unsynced() -> Result {
+        let identity = Identity::generate().map_err(text)?;
+        let hub = Hub::new(8, crate::sharing::Deadlines::RELAY).advertising(vec![
+            tally_wire::RelayAddress {
+                key: identity.public(),
+                address: "198.51.100.7:7450".to_owned(),
+            },
+        ]);
+        hub.network().selection.set_taken(vec![area()?]);
+        hub.network().admission.configure(64_496, true);
+        let directory = Directory::new();
+        let clock = crate::clock::RelayClock::scripted(Arc::new(|| NOW));
+        let signer = crate::signer::on(identity, clock.clone());
+        clock.set_error(None);
+        assert!(
+            directory
+                .tick(&hub, Some(&signer), crate::strikes::Now::judging(NOW))
+                .is_empty()
+        );
+        clock.set_error(Some(5));
+        let published = directory.tick(
+            &hub,
+            Some(&signer),
+            crate::strikes::Now::judging(NOW + 1_000),
+        );
+        assert!(
+            published
+                .iter()
+                .any(|record| matches!(record, Record::ProviderOffer(_))),
+            "{published:?}"
         );
         Ok(())
     }
@@ -2952,7 +3099,11 @@ mod tests {
         hub.network().selection.set_taken(vec![cell]);
         hub.network().admission.configure(64_496, true);
         let directory = Directory::new();
-        let published = directory.tick(&hub, Some(&identity), NOW);
+        let published = directory.tick(
+            &hub,
+            Some(&crate::signer::synced(crate::signer::twin(&identity))),
+            crate::strikes::Now::judging(NOW),
+        );
         // Its offer, and its evidence beside it, by which every relay ranks the offer.
         let [
             Record::ProviderOffer(offer),
@@ -2971,19 +3122,36 @@ mod tests {
         assert_eq!(declared.expires_ms, NOW + OFFER_LIFETIME_MS);
         assert!(declared.products.contains(Streams::RAW));
         assert_eq!(directory.own_key(), Some(identity.public()));
-        assert_eq!(directory.offers_for(cell, NOW), vec![offer.clone()]);
+        assert_eq!(directory.offers_for(cell, judged(NOW)), vec![offer.clone()]);
         // Nothing new a moment later; re-signed a minute on, its evidence not yet again.
         assert!(
             directory
-                .tick(&hub, Some(&identity), NOW + 1_000)
+                .tick(
+                    &hub,
+                    Some(&crate::signer::synced(crate::signer::twin(&identity))),
+                    crate::strikes::Now::judging(NOW + 1_000)
+                )
                 .is_empty()
         );
         let half = NOW + OWN_RESIGN_EVERY_MS;
-        assert_eq!(directory.tick(&hub, Some(&identity), half).len(), 1);
+        assert_eq!(
+            directory
+                .tick(
+                    &hub,
+                    Some(&crate::signer::synced(crate::signer::twin(&identity))),
+                    crate::strikes::Now::judging(half)
+                )
+                .len(),
+            1
+        );
         // Its relay duties turned off, it hosts no feeders: its offers no longer say raw, so no
         // MLAT relay dials it for raw it does not have.
         hub.network().admission.configure(64_496, false);
-        let resigned = directory.tick(&hub, Some(&identity), half + OWN_RESIGN_AT_MOST_EVERY_MS);
+        let resigned = directory.tick(
+            &hub,
+            Some(&crate::signer::synced(crate::signer::twin(&identity))),
+            crate::strikes::Now::judging(half + OWN_RESIGN_AT_MOST_EVERY_MS),
+        );
         let [Record::ProviderOffer(without)] = &resigned[..] else {
             return Err(format!("published {resigned:?}"));
         };
@@ -2995,7 +3163,11 @@ mod tests {
         hub.network().selection.set_taken(Vec::new());
         assert!(
             directory
-                .tick(&hub, Some(&identity), half + OWN_RESIGN_AT_MOST_EVERY_MS)
+                .tick(
+                    &hub,
+                    Some(&crate::signer::synced(crate::signer::twin(&identity))),
+                    crate::strikes::Now::judging(half + OWN_RESIGN_AT_MOST_EVERY_MS)
+                )
                 .is_empty()
         );
         assert!(directory.is_empty());
@@ -3016,9 +3188,10 @@ mod tests {
     }
 
     /// The signers held for `cell`, sorted.
-    fn held_keys(directory: &Directory, cell: Region, now_ms: u64) -> Vec<PublicKey> {
+    fn held_keys(directory: &Directory, cell: Region, now: Judged) -> Vec<PublicKey> {
+        let now_ms = now.ms();
         let mut keys: Vec<PublicKey> = directory
-            .offers_for(cell, now_ms)
+            .offers_for(cell, judged(now_ms))
             .iter()
             .map(Checked::signer)
             .collect();
@@ -3036,26 +3209,41 @@ mod tests {
         let identity = Identity::from_seed([71; 32]);
         let hub = own_relay(&identity, "198.51.100.7:7450", cell);
         let mine = Directory::new();
-        let published = mine.tick(&hub, Some(&identity), NOW);
+        let published = mine.tick(
+            &hub,
+            Some(&crate::signer::synced(crate::signer::twin(&identity))),
+            crate::strikes::Now::judging(NOW),
+        );
         let Some(Record::ProviderOffer(own)) = published.first() else {
             return Err(format!("published {published:?}"));
         };
         let group = Group::of(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7)));
         let peer = Directory::new();
-        peer.hold_verified(own.clone(), group, NOW)?;
+        peer.hold_verified(own.clone(), group, judged(NOW))?;
         for seed in 0..OFFERS_PER_GROUP_IN_CELL {
             let neighbour = Identity::from_seed([72 + seed as u8; 32]);
             let offer = sign(&neighbour, &content("198.51.7.1:7450", cell, NOW))?;
-            mine.offered(&relay_asker(neighbour.public()), offer.clone(), NOW);
-            lock(&mine.state).hold(checked(&offer, NOW).ok_or("unchecked")?, group, NOW);
-            peer.hold_verified(offer, group, NOW)?;
+            mine.offered(&relay_asker(neighbour.public()), offer.clone(), judged(NOW));
+            lock(&mine.state).hold(
+                checked(&offer, judged(NOW)).ok_or("unchecked")?,
+                group,
+                judged(NOW),
+            );
+            peer.hold_verified(offer, group, judged(NOW))?;
         }
-        let held = held_keys(&mine, cell, NOW);
+        let held = held_keys(&mine, cell, judged(NOW));
         assert_eq!(held.len(), OFFERS_PER_GROUP_IN_CELL);
-        assert_eq!(held, held_keys(&peer, cell, NOW));
+        assert_eq!(held, held_keys(&peer, cell, judged(NOW)));
         // Re-signed a minute on, it competes again, and both still hold the same.
-        mine.tick(&hub, Some(&identity), NOW + OWN_RESIGN_EVERY_MS);
-        assert_eq!(held_keys(&mine, cell, NOW + OWN_RESIGN_EVERY_MS), held);
+        mine.tick(
+            &hub,
+            Some(&crate::signer::synced(crate::signer::twin(&identity))),
+            crate::strikes::Now::judging(NOW + OWN_RESIGN_EVERY_MS),
+        );
+        assert_eq!(
+            held_keys(&mine, cell, judged(NOW + OWN_RESIGN_EVERY_MS)),
+            held
+        );
         Ok(())
     }
 
@@ -3072,7 +3260,7 @@ mod tests {
         let port = v4.local_addr().map_err(text)?.port();
         let v6 = TcpListener::bind(("::1", port)).await.ok();
         for listener in std::iter::once(v4).chain(v6) {
-            let identities = vec![identity.clone()];
+            let identities = vec![tally_wire::NoiseKey::of(crate::signer::twin(&identity))];
             tokio::spawn(async move {
                 while let Ok((stream, _)) = listener.accept().await {
                     let identities = identities.clone();
@@ -3088,17 +3276,25 @@ mod tests {
         // listener above answers.
         mine.pin_host("localhost", std::net::Ipv4Addr::LOCALHOST.into());
         let mut now = NOW;
-        let mut gossiped = mine.tick(&hub, Some(&identity), now);
+        let mut gossiped = mine.tick(
+            &hub,
+            Some(&crate::signer::synced(crate::signer::twin(&identity))),
+            crate::strikes::Now::judging(now),
+        );
         // Until its own offer is held (the host name resolved, then signed): waited for as long as
         // that takes, failing only on a hang, never on how many ticks fit a span of the clock.
         let started = std::time::Instant::now();
-        while mine.offers_for(cell, now).is_empty() {
+        while mine.offers_for(cell, judged(now)).is_empty() {
             if started.elapsed() > Duration::from_secs(120) {
                 return Err("its own offer was never held".into());
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
             now += 100;
-            gossiped.extend(mine.tick(&hub, Some(&identity), now));
+            gossiped.extend(mine.tick(
+                &hub,
+                Some(&crate::signer::synced(crate::signer::twin(&identity))),
+                crate::strikes::Now::judging(now),
+            ));
         }
         let offer = gossiped
             .into_iter()
@@ -3121,8 +3317,8 @@ mod tests {
         }
         // A peer, given the gossiped offer, dials the address it names and holds it there.
         let peer = Directory::new();
-        peer.offered(&relay_asker(identity.public()), offer, now);
-        peer.verify_pending(&Identity::generate().map_err(text)?, now)
+        peer.offered(&relay_asker(identity.public()), offer, judged(now));
+        peer.verify_pending(&Identity::generate().map_err(text)?, judged(now))
             .await;
         let state = lock(&peer.state);
         let held = state
@@ -3142,10 +3338,10 @@ mod tests {
         let relay = Identity::generate().map_err(text)?;
         let cell = area()?;
         let named = sign(&relay, &content("relay.example:7450", cell, NOW))?;
-        directory.offered(&relay_asker(relay.public()), named, NOW);
+        directory.offered(&relay_asker(relay.public()), named, judged(NOW));
         assert!(directory.state.lock().map_err(text)?.pending.is_empty());
         let numbered = sign(&relay, &content("192.0.2.7:7450", cell, NOW + 1))?;
-        directory.offered(&relay_asker(relay.public()), numbered, NOW + 1);
+        directory.offered(&relay_asker(relay.public()), numbered, judged(NOW + 1));
         assert_eq!(directory.state.lock().map_err(text)?.pending.len(), 1);
         Ok(())
     }
@@ -3159,20 +3355,20 @@ mod tests {
         let cell = area()?;
         let directory = Directory::new();
         let first = sign(&relay, &content("203.0.113.9:1", cell, NOW))?;
-        assert!(directory.hold_verified(first.clone(), v4(203, 0), NOW)?);
-        let ranked = directory.offers_for(cell, NOW);
-        let version = directory.version(NOW);
-        let _ = directory.take_changed_cells(NOW);
+        assert!(directory.hold_verified(first.clone(), v4(203, 0), judged(NOW))?);
+        let ranked = directory.offers_for(cell, judged(NOW));
+        let version = directory.version(judged(NOW));
+        let _ = directory.take_changed_cells(judged(NOW));
         // Re-signed a millisecond apart, a thousand times: none taken.
         for step in 1..=1_000 {
             let again = sign(&relay, &content("203.0.113.9:1", cell, NOW + step))?;
-            assert!(!directory.hold_verified(again, v4(203, 0), NOW + step)?);
+            assert!(!directory.hold_verified(again, v4(203, 0), judged(NOW + step))?);
         }
-        assert_eq!(directory.offers_for(cell, NOW + 1_000), vec![first]);
+        assert_eq!(directory.offers_for(cell, judged(NOW + 1_000)), vec![first]);
         // Its turn come: taken, in place.
         let at = NOW + RESIGNED_AT_MOST_EVERY_MS;
         let renewed = sign(&relay, &content("203.0.113.9:1", cell, at))?;
-        assert!(directory.hold_verified(renewed.clone(), v4(203, 0), at)?);
+        assert!(directory.hold_verified(renewed.clone(), v4(203, 0), judged(at))?);
         {
             let state = lock(&directory.state);
             assert!(
@@ -3180,9 +3376,9 @@ mod tests {
                 "the cell's ranking was dropped: not renewed in place"
             );
         }
-        assert_eq!(directory.version(at).held, version.held);
-        assert!(directory.take_changed_cells(at).is_empty());
-        assert_eq!(directory.offers_for(cell, at), vec![renewed]);
+        assert_eq!(directory.version(judged(at)).held, version.held);
+        assert!(directory.take_changed_cells(judged(at)).is_empty());
+        assert_eq!(directory.offers_for(cell, judged(at)), vec![renewed]);
         assert_eq!(ranked.len(), 1);
         Ok(())
     }

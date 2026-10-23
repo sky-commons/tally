@@ -17,7 +17,7 @@ use blake2::{Blake2s256, Digest};
 use crate::WireError;
 use crate::batch::{Hash, Observation, check_coordinates};
 use crate::decoded::ObsView;
-use crate::key::{Identity, KEY_LEN, PublicKey};
+use crate::key::{KEY_LEN, PublicKey, Signs};
 #[cfg(test)]
 use crate::observation_set::ObservationSet;
 use crate::positions::{EnuCovariance, TransmitTime};
@@ -37,19 +37,11 @@ const NO_ALTITUDE: i32 = i32::MIN;
 /// retraction of an unconfirmed provisional fix, the precise world product's seal, a receiver's
 /// standing settling a transmission).
 ///
-/// Derived from how the reference engine publishes (RFC-0171 §3.8.1, RFC-0174 §2.3): a window of
-/// eight 5 s bins (the stride, 40 s) is solved once it has ended, one bin after its last (5 s)
-/// and 2 s of settling later, and at world scale its fits take some 35 s, so the latest final fix
-/// leaves its engine about 40 + 5 + 2 + 35 = 82 s after the transmission. A relay hop or two and
-/// the skew between the engine's clock and a reader's are seconds, so 90 s covers them. Each
-/// party measures from what it sees (a transmit time, or when a fix arrived, which is later), so
-/// waiting this long from either is enough.
-pub const FINAL_FIX_ARRIVED_MS: u64 = FINAL_FIX_LATEST_MS + FINAL_FIX_MARGIN_MS;
-/// The latest a final fix leaves its engine after its transmission: the stride (8 bins of 5 s),
-/// the bin after the window, the settling time and a world-scale step of fits.
-const FINAL_FIX_LATEST_MS: u64 = 8 * 5_000 + 5_000 + 2_000 + 35_000;
-/// Relay hops and the skew between an engine's clock and a reader's.
-const FINAL_FIX_MARGIN_MS: u64 = 8_000;
+/// Derived in the clocks' error budget (`crate::budget::FINAL_FIX_ARRIVED`, 108.5 s): the
+/// engine's settling and solving, the skew between its relay's clock and a reader's (`K`), and a
+/// relay hop or two. Before, the skew was a literal 8 s of this module's own, less than two
+/// judging clocks may be apart.
+pub const FINAL_FIX_ARRIVED_MS: u64 = crate::budget::FINAL_FIX_ARRIVED_MS;
 
 /// One aircraft's fix for one second of the world product.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -299,7 +291,7 @@ signed_record!(
 
 signed_record!(
     /// The precise world product: the same content and the same choice rule over final MLAT fixes
-    /// only (ADS-B as in the live product), each second sealed once its finals can have come. Its
+    /// only (ADS-B as in the live product), each second sealed once its finals have surely come. Its
     /// own domain, so a precise record never verifies as a live one or back.
     WorldPrecise,
     WorldPositionsContent,
@@ -496,8 +488,14 @@ impl RegionalDraft<'_> {
 }
 
 impl RegionalBatch {
+    /// Its signed `wall_ms` (`RegionalBatchContent::wall_ms`), read without its receptions: what a
+    /// relay's time window judges it by. After the cell, the boot id and the sequence.
+    pub fn wall_ms(&self) -> Result<u64, WireError> {
+        crate::batch::u64_from(self.as_bytes(), 1 + crate::key::KEY_LEN + 24)
+    }
+
     /// As `sign`, from receptions borrowed: the bytes `sign` makes of their owned copies.
-    pub fn sign_draft(identity: &Identity, draft: &RegionalDraft<'_>) -> Result<Self, WireError> {
+    pub fn sign_draft(identity: &impl Signs, draft: &RegionalDraft<'_>) -> Result<Self, WireError> {
         let body = draft.body()?;
         crate::signed::Signed::sign(Self::DOMAIN, Self::FORMAT, identity, &body, Self::MAX_LEN)
             .map(Self)
@@ -706,9 +704,14 @@ signed_record!(
 );
 
 impl ClientRegionalBatch {
+    /// Its signed `wall_ms`, as `RegionalBatch::wall_ms`.
+    pub fn wall_ms(&self) -> Result<u64, WireError> {
+        crate::batch::u64_from(self.as_bytes(), 1 + crate::key::KEY_LEN + 24)
+    }
+
     /// As `sign`, from a draft's borrowed receptions, their counters dropped: the bytes `sign`
     /// makes of `RegionalBatchContent::for_clients` of their owned copies, with no copy made.
-    pub fn sign_draft(identity: &Identity, draft: &RegionalDraft<'_>) -> Result<Self, WireError> {
+    pub fn sign_draft(identity: &impl Signs, draft: &RegionalDraft<'_>) -> Result<Self, WireError> {
         if draft.cell.resolution() > crate::site::PUBLIC_CELL_RESOLUTION {
             return Err(WireError::Invalid {
                 field: "client regional cell resolution",
@@ -736,6 +739,7 @@ impl ClientRegionalBatch {
 mod tests {
     use super::*;
     use crate::directory::tests::cell;
+    use crate::key::Identity;
 
     /// A regional batch signed from borrowed receptions is the one signed from their owned
     /// copies, byte for byte, and fits exactly when it does.

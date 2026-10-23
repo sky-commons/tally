@@ -280,8 +280,7 @@ mod tests {
     fn each_column_carries_only_what_it_may() -> Result<(), WireError> {
         use tally_wire::batch::{PublicInfoContent, ReceiverInfoContent};
         use tally_wire::{
-            Batch, BatchContent, Clock, Identity, ReceiverInfo, ReceiverSite, ReceiverSiteContent,
-            Region,
+            BatchContent, Clock, Identity, ReceiverInfo, ReceiverSite, ReceiverSiteContent, Region,
         };
         let receiver = Identity::from_seed([5; 32]);
         let format_one = Record::ReceiverInfo(ReceiverInfo::sign(
@@ -312,7 +311,7 @@ mod tests {
                 clock: Clock::Dump1090,
             },
         )?);
-        let raw = Record::Batch(Batch::sign(
+        let raw = Record::Batch(crate::anchors::anchored(
             &receiver,
             &BatchContent {
                 boot_id: 1,

@@ -282,6 +282,10 @@ async fn leaderboard(State(app): State<Arc<App>>, Path(area): Path<String>) -> R
     }
 }
 
+#[allow(
+    clippy::disallowed_methods,
+    reason = "the API host's clock, which ages what it serves"
+)]
 pub(crate) fn wall_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

@@ -55,11 +55,24 @@ rust_test(
     deps = ["@tally_crates//:serde_json"],
 )
 
+# The packaged unit's seccomp filter, held to the system calls the host clock's read makes.
+rust_test(
+    name = "unit",
+    size = "small",
+    srcs = ["tests/unit.rs"],
+    data = ["//packaging/systemd:tally-feed.service"],
+    edition = "2024",
+    env = {"TALLY_FEED_UNIT": "$(rootpath //packaging/systemd:tally-feed.service)"},
+    lint_config = ":cargo_lints",
+    deps = ["//crates/wire"],
+)
+
 rustfmt_test(
     name = "rustfmt",
     targets = [
         ":feed",
         ":feed_test",
         ":tally-feed",
+        ":unit",
     ],
 )

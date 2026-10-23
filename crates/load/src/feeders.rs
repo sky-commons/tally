@@ -67,6 +67,10 @@ pub fn spawn(run: Run, counts: Arc<Counts>, start: tokio::time::Instant) {
     let state_dir = state_dir.as_path();
     let local = (traffic.receivers.len().max(1) * replay.max(1)) as u32;
     // The wall clock of `start`, which a GNSS-disciplined receiver's counter reads (`frames`).
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the load tool's start, which its stand-in receivers' counters read"
+    )]
     let start_unix_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |since| since.as_millis() as u64)
@@ -110,7 +114,7 @@ pub fn spawn(run: Run, counts: Arc<Counts>, start: tokio::time::Instant) {
             deflate_level: deflate,
         };
         let identity = if round == 0 {
-            receiver.identity.clone()
+            receiver.identity()
         } else {
             tally_mlat_solver::sim::receiver_identity(
                 seed.wrapping_add((round as u64).wrapping_mul(1_000_003)),

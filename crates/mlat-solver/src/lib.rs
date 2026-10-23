@@ -528,9 +528,10 @@
 //!    `MAX_CARRY_PS = 90 s` of nominal time, takes the piece's last interval `k = L - 1`, and
 //!    model time is that interval's line extended: `t = e + o_k + floor((o_L - o_k) u / 5 s)` with
 //!    `u = e - 5 s k` past 5 s, then the gauge's rate as always. Inside the knots it is `time`
-//!    exactly. 90 s is the longest a final model is behind the newest raw at `s = 8` on a
-//!    world-scale engine: the stride (40 s), the window's last bin (5 s), its settling time and a
-//!    step (some 35 s at world scale).
+//!    exactly. 90 s covers the longest a tile's newest model is behind a reception it maps: the
+//!    stride and the window's last bins (45 s at `s = 8`), the settling before the window is
+//!    solved (11.5 s), the ripening before its model is used (15 s), how far a reception may run
+//!    ahead (7.5 s) and a bin of rounding (5 s), 84 s in all (asserted in `tally_mlat::engine`).
 //! 2. **Covariance**: the clock covariance of two receptions is the model's (the last interval's
 //!    two knots' weights, now `1 - f` and `f` with `f > 1`, so the line's slope error grows with
 //!    the carry) plus the curvature prior's integrated random walk past the last knot. With `n`
@@ -559,6 +560,9 @@
 //! 45 s and 0.975 from 45 to 90 s (0.956 of 5,076 overall; 0.982 published), for median
 //! horizontal errors of 124, 237 and 468 m. The carry costs precision, not honesty.
 
+// It reaches keys (`tally_wire::Identity`): no `unsafe` code at all, forbidden, so no module
+// can allow it.
+#![forbid(unsafe_code)]
 // Matrix code reads as the algebra it implements: index loops over rows and columns.
 #![allow(clippy::needless_range_loop)]
 

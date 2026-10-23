@@ -1,5 +1,5 @@
 load("@rules_rust//cargo:defs.bzl", "extract_cargo_lints")
-load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test", "rustfmt_test")
+load("@rules_rust//rust:defs.bzl", "rust_doc_test", "rust_library", "rust_test", "rustfmt_test")
 load("//build:version.bzl", "VERSION")
 
 package(default_visibility = ["//:__subpackages__"])
@@ -26,6 +26,7 @@ rust_library(
         "@tally_crates//:ed25519-dalek",
         "@tally_crates//:getrandom",
         "@tally_crates//:h3o",
+        "@tally_crates//:libc",
         "@tally_crates//:miniz_oxide",
         "@tally_crates//:serde",
         "@tally_crates//:serde_json",
@@ -41,11 +42,35 @@ rust_test(
     crate = ":wire",
     edition = "2024",
     lint_config = ":cargo_lints",
+    deps = ["//crates/counting"],
+)
+
+# What `footprint` says each collection allocates is what it allocates, measured by an allocator
+# that counts every byte, the only test in its binary so nothing else allocates while it measures.
+rust_test(
+    name = "footprint_bytes",
+    size = "small",
+    srcs = ["tests/footprint_bytes.rs"],
+    edition = "2024",
+    lint_config = ":cargo_lints",
+    deps = [
+        ":wire",
+        "//crates/counting",
+    ],
+)
+
+# The doc examples, which are the compile-fail checks of what the types refuse: an `Identity`
+# cannot be cloned, a `Signing` cannot be kept past its call, and a handshake's key cannot sign.
+rust_doc_test(
+    name = "wire_doc_test",
+    size = "small",
+    crate = ":wire",
 )
 
 rustfmt_test(
     name = "rustfmt",
     targets = [
+        ":footprint_bytes",
         ":wire",
         ":wire_test",
     ],

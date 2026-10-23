@@ -45,7 +45,7 @@
 //!   the step that takes its bin is late whenever it arrives, so a batch that raced ahead of that
 //!   step is late exactly as one that came after it, and what is sealed never depends on which won.
 //! - **Never ahead of the stamp** ([`AHEAD_MS`]): no holder opens a bin that begins more than
-//!   `AHEAD_MS` past the batch's stamp, however it was built: every way in takes the stamp (a
+//!   `AHEAD_MS` past the batch's judging time, however it was built: every way in takes it (a
 //!   decoded batch carries its own, a batch's content is handed in with its holder's), so a
 //!   reference engine and a hosted one refuse the same raw. A bin comes from the feeder's own signed wall clock,
 //!   which nothing else bounds, and a bin the steps never reach is never taken: a receiver stamping
@@ -60,6 +60,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 
 use tally_wire::batch::{BatchContent, format};
+use tally_wire::budget::MLAT_AHEAD;
+use tally_wire::clocks::Moment;
 use tally_wire::{Decoded, ObsView, PublicKey};
 
 use crate::modes;
@@ -83,8 +85,8 @@ pub struct Added {
     /// Wanted observations refused with their receiver's whole raw of the bin (`Limits`): this
     /// batch's, and what the receiver had held in the bin until it was refused.
     pub refused: usize,
-    /// Wanted observations of a bin that begins more than [`AHEAD_MS`] past the batch's stamp, for
-    /// a holder that closes by the stamp ([`Closing`]): refused, never opening that bin.
+    /// Wanted observations of a bin that begins more than [`AHEAD_MS`] past the batch's judging
+    /// time: refused, never opening that bin.
     pub ahead: usize,
 }
 
@@ -740,11 +742,11 @@ impl Cost {
     }
 }
 
-/// How far past a batch's stamp a bin may begin and still be opened, for a holder that closes by the
-/// stamp (module docs, Never ahead): a receiver's wall clock ahead of the relay's ingest clock by a
-/// second is a clock that disagrees, and one further ahead is refused. A receiver's open raw is
-/// reserved over it too ([`Rates::cost`]).
-pub const AHEAD_MS: u64 = 1_000;
+/// How far past a batch's judging time a bin may begin and still be opened (module docs, Never
+/// ahead): the error budget's `tally_wire::budget::MLAT_AHEAD`, as far as an honest feeder's
+/// signed time may be ahead of a relay's judging clock; one further ahead is refused. A
+/// receiver's open raw is reserved over it too ([`Rates::cost`]).
+pub const AHEAD_MS: u64 = MLAT_AHEAD.span::<tally_wire::clocks::Judged>().ms();
 
 /// When a holder that steps on a fixed clock takes each bin for sealing (module docs, late by
 /// the stamp): at every multiple of `step_ms` of its step clock, every bin that ended `settle_ms`
@@ -757,14 +759,31 @@ pub struct Closing {
 
 impl Closing {
     /// The step that takes `bin`: the first multiple of `step_ms` at or after the bin's end plus
-    /// `settle_ms`. Raw of the bin stamped at or after it is late.
+    /// `settle_ms`. Raw of the bin stamped at or after it is late. For a holder whose steps and
+    /// bins are on one clock.
     pub fn close_at(&self, bin: i64) -> u64 {
-        let ended = u64::try_from(bin.saturating_add(1).max(0))
-            .unwrap_or(0)
-            .saturating_mul(GRID_MS);
+        self.close_offset(bin, 0)
+    }
+
+    /// As `close_at`, for a holder that steps on its monotonic clock and takes each bin by its
+    /// judging clock (a relay's, `tally_relay`'s `mlat_host`), the two as `at` read them together:
+    /// the first step whose judging time is at or after the bin's end plus `settle_ms`. So a step
+    /// of the host's judging clock moves the bins with it.
+    pub fn close_at_judged(&self, bin: i64, at: Moment) -> u64 {
+        self.close_offset(bin, at.offset_ms())
+    }
+
+    /// The step that takes `bin` on a step clock the judging clock reads `judged_ahead` ms ahead
+    /// of.
+    fn close_offset(&self, bin: i64, judged_ahead: i64) -> u64 {
+        let ended = bin.saturating_add(1).max(0).saturating_mul(GRID_MS as i64);
+        let due = ended
+            .saturating_add(i64::try_from(self.settle_ms).unwrap_or(i64::MAX))
+            .saturating_sub(judged_ahead)
+            .max(0);
         let step = self.step_ms.max(1);
-        ended
-            .saturating_add(self.settle_ms)
+        u64::try_from(due)
+            .unwrap_or(0)
             .div_ceil(step)
             .saturating_mul(step)
     }
@@ -825,9 +844,9 @@ impl Open {
         self.through
     }
 
-    /// Takes the wanted Mode S receptions of one verified batch of `receiver`, taken in at
-    /// `stamp_ms` (its ingest stamp, module docs, Never ahead).
-    pub fn add(&mut self, receiver: PublicKey, content: &BatchContent, stamp_ms: u64) -> Added {
+    /// Takes the wanted Mode S receptions of one verified batch of `receiver`, taken in at `at`
+    /// (its ingest stamp, module docs, Never ahead).
+    pub fn add(&mut self, receiver: PublicKey, content: &BatchContent, at: Moment) -> Added {
         let room = self.limits.bytes;
         self.add_observations(
             receiver,
@@ -835,7 +854,7 @@ impl Open {
             content.wall_ms,
             content.observations.iter().map(ObsView::from),
             room,
-            stamp_ms,
+            at,
             &mut |_| true,
         )
     }
@@ -856,7 +875,7 @@ impl Open {
             decoded.wall_ms(),
             decoded.views(),
             room,
-            decoded.stamp_ms(),
+            decoded.at(),
             &mut |_| true,
         )
     }
@@ -876,15 +895,18 @@ impl Open {
             decoded.wall_ms(),
             decoded.views(),
             room,
-            decoded.stamp_ms(),
+            decoded.at(),
             take,
         )
     }
 
-    /// `room`: the bytes these open bins may grow to. `stamp_ms`: the batch's ingest stamp, which
-    /// every way in passes (module docs, Never ahead): it bounds how far ahead a bin may open for
-    /// every holder alike, however it was built, and decides lateness when the holder closes by
-    /// one ([`Closing`]). `take`: asked for every byte before it is allocated.
+    /// `room`: the bytes these open bins may grow to. `at`: the batch's ingest stamp, read on the
+    /// monotonic and the judging clock together, which every way in passes (module docs, Never
+    /// ahead): the judging time bounds how far ahead a bin may open for every holder alike, however it
+    /// was built, as a signed time is judged against a judging clock (`tally_wire::budget`); the
+    /// stamp decides lateness when the holder closes by one ([`Closing`]), the bin's end moved
+    /// onto the stamp's clock by the two clocks' difference when the batch was taken. `take`:
+    /// asked for every byte before it is allocated.
     #[allow(clippy::too_many_arguments)]
     fn add_observations<'a>(
         &mut self,
@@ -893,7 +915,7 @@ impl Open {
         wall_ms: u64,
         observations: impl Iterator<Item = ObsView<'a>>,
         room: usize,
-        stamp_ms: u64,
+        at: Moment,
         take: &mut dyn FnMut(usize) -> bool,
     ) -> Added {
         let mut added = Added::default();
@@ -906,13 +928,14 @@ impl Open {
                 keep
             })
             .collect();
-        // Never ahead, for every holder: the stamp is every way in's, so whether a bin too far
-        // ahead opens never depends on how the holder was built (a reference engine and a hosted
-        // one refuse the same raw).
-        let ahead = bin > bin_of(stamp_ms.saturating_add(AHEAD_MS));
+        // Never ahead, for every holder: the judging time is every way in's, so whether a bin
+        // too far ahead opens never depends on how the holder was built (a reference engine and
+        // a hosted one refuse the same raw).
+        let begins_ms = u64::try_from(bin).unwrap_or(0).saturating_mul(GRID_MS);
+        let ahead = MLAT_AHEAD.ahead(begins_ms, at.judged());
         let late_by_stamp = self
             .closing
-            .is_some_and(|closing| stamp_ms >= closing.close_at(bin));
+            .is_some_and(|closing| at.mono().ms() >= closing.close_at_judged(bin, at));
         if ahead {
             added.ahead = wanted.len();
             return added;
@@ -1850,9 +1873,9 @@ impl Held {
         self.limits.bytes.saturating_sub(self.sealed.bytes())
     }
 
-    /// Takes the wanted Mode S receptions of one verified batch of `receiver`, taken in at
-    /// `stamp_ms` (its holder's clock when it took it, module docs, Never ahead).
-    pub fn add(&mut self, receiver: PublicKey, content: &BatchContent, stamp_ms: u64) -> Added {
+    /// Takes the wanted Mode S receptions of one verified batch of `receiver`, taken in at `at`
+    /// (its holder's clocks when it took it, module docs, Never ahead).
+    pub fn add(&mut self, receiver: PublicKey, content: &BatchContent, at: Moment) -> Added {
         let room = self.room();
         self.open.add_observations(
             receiver,
@@ -1860,7 +1883,7 @@ impl Held {
             content.wall_ms,
             content.observations.iter().map(ObsView::from),
             room,
-            stamp_ms,
+            at,
             &mut |_| true,
         )
     }
@@ -1874,14 +1897,14 @@ impl Held {
             decoded.wall_ms(),
             decoded.views(),
             room,
-            decoded.stamp_ms(),
+            decoded.at(),
             &mut |_| true,
         )
     }
 
-    /// Takes one reception, as `add` would within a batch of it taken in at `stamp_ms`: what a
+    /// Takes one reception, as `add` would within a batch of it taken in at `at`: what a
     /// simulator at world scale feeds without building batches.
-    pub fn add_one(&mut self, reception: &Reception, stamp_ms: u64) -> Added {
+    pub fn add_one(&mut self, reception: &Reception, at: Moment) -> Added {
         let room = self.room();
         self.open.add_observations(
             reception.receiver,
@@ -1889,7 +1912,7 @@ impl Held {
             reception.wall_ms,
             std::iter::once(ObsView::from(&reception.observation)),
             room,
-            stamp_ms,
+            at,
             &mut |_| true,
         )
     }
@@ -1951,6 +1974,9 @@ pub fn bins_of(receptions: &[Reception]) -> BTreeMap<i64, Arc<Bin>> {
             .push(reception.observation.clone());
     }
     for ((receiver, epoch, wall_ms), observations) in batches {
+        // Replayed: each batch taken at its own signed time, by a clock that never stepped.
+        #[allow(clippy::disallowed_methods, reason = "a replay's instants")]
+        let at = tally_wire::clocks::recorded::aligned(wall_ms);
         held.add(
             receiver,
             &BatchContent {
@@ -1962,7 +1988,7 @@ pub fn bins_of(receptions: &[Reception]) -> BTreeMap<i64, Arc<Bin>> {
                 previous: [0; 32],
                 observations,
             },
-            wall_ms,
+            at,
         );
     }
     held.seal_through(i64::MAX - 1);

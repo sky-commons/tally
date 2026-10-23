@@ -41,6 +41,8 @@
 //!   says nothing of who sent what together. The sort is an external merge in bounded memory
 //!   ([`SORT_MEMORY`]), its runs on the volume under `archive/.sorting`, which nothing serves.
 
+#![deny(unsafe_code)]
+
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, VecDeque};
 use std::fs::{File, OpenOptions};
@@ -48,11 +50,14 @@ use std::hash::{BuildHasher, RandomState};
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tally_wire::acars;
 use tally_wire::backoff::Backoff;
+
+// The one module allowed `unsafe`: its calls into libc.
+#[allow(unsafe_code)]
+mod os;
 
 /// A day's ACARS file in its history directory.
 pub const DAY_FILE: &str = "acars.jsonl";
@@ -70,7 +75,7 @@ pub const DEFAULT_DAY_MAX: u64 = 256 * 1024 * 1024;
 /// batch every second and a relay forwards it at once, so every copy is in within seconds.
 pub const MERGE_WINDOW: u64 = 30;
 /// The most a message's own time may be from its arrival, in seconds.
-pub const MAX_SKEW: u64 = 300;
+pub const MAX_SKEW: u64 = tally_wire::budget::ACARS_MESSAGE_SKEW.duration().as_secs();
 /// The most the held messages take (their lines, keys, copies' seconds and bookkeeping): past it
 /// a new message is dropped, and its day's `full` gap opened.
 pub const PENDING_BYTES: usize = 8 * 1024 * 1024;
@@ -132,6 +137,10 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const READ_TICK: Duration = Duration::from_secs(1);
 
 /// The Unix seconds now.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "the collector's own host clock, which names its files' days"
+)]
 pub fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -296,7 +305,7 @@ impl Collector {
         ) else {
             return Filed::Invalid;
         };
-        if second.abs_diff(now) > MAX_SKEW {
+        if tally_wire::budget::acars_skewed(second, now) {
             if self.skewed == 0 {
                 eprintln!(
                     "tally-acars-collect: a message timed {second} came at {now}, more than \
@@ -909,33 +918,15 @@ impl<R: BufRead> BoundedLines<R> {
     }
 }
 
-static STOPPING: AtomicBool = AtomicBool::new(false);
-
-extern "C" fn on_stop(_: libc::c_int) {
-    STOPPING.store(true, Ordering::SeqCst);
-}
-
+/// Whether SIGTERM or SIGINT came (`os::catch_stop`).
 fn stopping() -> bool {
-    STOPPING.load(Ordering::SeqCst)
+    os::stopping()
 }
 
-/// SIGTERM and SIGINT set `STOPPING`, without `SA_RESTART`, so a read waiting on the relay
-/// returns at once.
+/// SIGTERM and SIGINT mark the collector stopping, without `SA_RESTART`, so a read waiting on
+/// the relay returns at once.
 fn catch_stop() -> io::Result<()> {
-    for signal in [libc::SIGTERM, libc::SIGINT] {
-        // SAFETY: a zeroed `sigaction` is a valid one with no flags, its mask emptied before use,
-        // and `on_stop` only stores to an atomic, which a signal handler may.
-        let done = unsafe {
-            let mut action: libc::sigaction = std::mem::zeroed();
-            action.sa_sigaction = on_stop as extern "C" fn(libc::c_int) as libc::sighandler_t;
-            libc::sigemptyset(&mut action.sa_mask);
-            libc::sigaction(signal, &action, std::ptr::null_mut())
-        };
-        if done != 0 {
-            return Err(io::Error::last_os_error());
-        }
-    }
-    Ok(())
+    os::catch_stop()
 }
 
 /// Reads `from` (the relay's `--acars-out`) into `collector` until SIGTERM, redialling while it is
@@ -1051,31 +1042,12 @@ fn connect(from: &str) -> io::Result<TcpStream> {
 /// Probes after a minute idle, every 10 s, 6 times: a relay gone is noticed within two minutes,
 /// though a quiet one sends nothing for hours.
 fn keepalive(stream: &TcpStream) -> io::Result<()> {
-    use std::os::fd::AsRawFd;
-    let fd = stream.as_raw_fd();
-    let set = |level, name, value: libc::c_int| {
-        // SAFETY: `fd` is this stream's open socket, and `value` an int that lives for the call.
-        let done = unsafe {
-            libc::setsockopt(
-                fd,
-                level,
-                name,
-                std::ptr::from_ref(&value).cast(),
-                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-            )
-        };
-        if done == 0 {
-            Ok(())
-        } else {
-            Err(io::Error::last_os_error())
-        }
-    };
-    set(libc::SOL_SOCKET, libc::SO_KEEPALIVE, 1)?;
+    os::set_int(stream, libc::SOL_SOCKET, libc::SO_KEEPALIVE, 1)?;
     #[cfg(target_os = "linux")]
     {
-        set(libc::IPPROTO_TCP, libc::TCP_KEEPIDLE, 60)?;
-        set(libc::IPPROTO_TCP, libc::TCP_KEEPINTVL, 10)?;
-        set(libc::IPPROTO_TCP, libc::TCP_KEEPCNT, 6)?;
+        os::set_int(stream, libc::IPPROTO_TCP, libc::TCP_KEEPIDLE, 60)?;
+        os::set_int(stream, libc::IPPROTO_TCP, libc::TCP_KEEPINTVL, 10)?;
+        os::set_int(stream, libc::IPPROTO_TCP, libc::TCP_KEEPCNT, 6)?;
     }
     Ok(())
 }

@@ -43,7 +43,7 @@ use crate::delivery_check::{self, Checking, DeliveryChecker, SAMPLED, Sent, Verd
 use crate::health::Health;
 use crate::probe::{self, MOST_PER_ROUND, Measured, Probed, Prober, RANDOM_PER_ROUND, ROUND_EVERY};
 use crate::selection::{BandRendezvous, Choice, RelaySelection, failover_jitter};
-use crate::source::{Stating, TokenBucket, WantedCeilings, wall_ms};
+use crate::source::{RelayClocks, Stating, Telling, TokenBucket, WantedCeilings};
 
 const HEARTBEAT: Duration = Duration::from_secs(30);
 const READ_TIMEOUT: Duration = Duration::from_secs(120);
@@ -51,6 +51,67 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long a session must stay up to count as having worked: one that fails sooner is a failed
 /// relay, and its place goes to the next; one that worked is dialled again.
 const HEALTHY_SESSION: Duration = Duration::from_secs(60);
+/// How soon a configured relay with no live clock sample is probed for its clock when the clocks
+/// ask for it (`RelayClocks::probing`), at first: each poll it does not answer doubles it, up to
+/// `ROUND_EVERY` (`ClockPolls`), as NTP's poll interval grows for a server that does not answer.
+const CLOCK_POLL_FIRST: Duration = Duration::from_secs(30);
+
+const _: () = assert!(CLOCK_POLL_FIRST.as_secs() < ROUND_EVERY.as_secs());
+
+/// Each configured relay's clock poll while it has no live clock sample (RFC 5905 §7.3, the poll
+/// interval): when it is next probed for its clock, and how long until the one after. A poll probes
+/// only the configured relays due one, never discovery's round: before, a clock that asked for
+/// probes brought the whole round forward to every 30 s, so one seed that never answered had every
+/// feeder probe sixteen relays twice a minute for ever.
+#[derive(Default)]
+struct ClockPolls {
+    polls: HashMap<PublicKey, (tokio::time::Instant, Duration)>,
+}
+
+impl ClockPolls {
+    /// Of `unheard` (each configured relay's addresses with no live sample,
+    /// `Directory::clock_set`), those due a poll at `now`: each due is due again its interval
+    /// later, and that interval doubles, up to `ROUND_EVERY`. A relay no longer unheard is
+    /// forgotten, so if it falls silent again it is polled from `CLOCK_POLL_FIRST`.
+    fn due(&mut self, unheard: Vec<RelayAddress>, now: tokio::time::Instant) -> Vec<RelayAddress> {
+        self.polls
+            .retain(|key, _| unheard.iter().any(|relay| relay.key == *key));
+        let mut due: Vec<PublicKey> = Vec::new();
+        for relay in &unheard {
+            let (at, _) = *self
+                .polls
+                .entry(relay.key)
+                .or_insert((now, CLOCK_POLL_FIRST));
+            if at <= now && !due.contains(&relay.key) {
+                due.push(relay.key);
+            }
+        }
+        for key in &due {
+            if let Some((at, every)) = self.polls.get_mut(key) {
+                *at = now + *every;
+                *every = (*every * 2).min(ROUND_EVERY);
+            }
+        }
+        unheard
+            .into_iter()
+            .filter(|relay| due.contains(&relay.key))
+            .collect()
+    }
+
+    /// Relays that answered a probe (`probed`, a round's or a clock poll's): each is polled from
+    /// `CLOCK_POLL_FIRST` again if it is unheard later, its interval no longer grown by the polls
+    /// it missed before it answered (as NTP resets a server's poll on a reply).
+    fn answered(&mut self, probed: &[Probed]) {
+        for each in probed {
+            self.polls.remove(&each.measured.relay.key);
+        }
+    }
+
+    /// When the next poll is due, if any relay is polled.
+    fn next(&self) -> Option<tokio::time::Instant> {
+        self.polls.values().map(|(at, _)| *at).min()
+    }
+}
 /// The most relays kept from any one source's hints. A relay's own list weighs no more than this,
 /// however long it is.
 const HINTS_PER_SOURCE: usize = 32;
@@ -204,6 +265,31 @@ impl Relays {
         }
     }
 
+    /// Every configured relay (the owner's, then the seeds) with no live clock sample (not in
+    /// `heard`) and not avoided at `now`, each of its addresses: the clock's sources unheard.
+    fn clock_part(&self, heard: &[PublicKey], now: tokio::time::Instant) -> Vec<RelayAddress> {
+        let mut out: Vec<RelayAddress> = Vec::new();
+        let configured = self
+            .known
+            .iter()
+            .filter(|known| matches!(known.source, Source::Configured))
+            .chain(
+                self.known
+                    .iter()
+                    .filter(|known| matches!(known.source, Source::Seed)),
+            )
+            .flat_map(Known::addresses);
+        for relay in configured {
+            if !heard.contains(&relay.key)
+                && !self.is_avoided(&relay.key, now)
+                && !out.contains(&relay)
+            {
+                out.push(relay);
+            }
+        }
+        out
+    }
+
     fn is_avoided(&self, key: &PublicKey, now: tokio::time::Instant) -> bool {
         self.avoided.get(key).is_some_and(|until| *until > now)
     }
@@ -284,9 +370,12 @@ impl Announcement {
 pub struct Directory {
     state_dir: PathBuf,
     relays: Mutex<Relays>,
-    identity: Identity,
+    identity: Arc<Identity>,
     location: Option<Location>,
     clock: Clock,
+    /// The clock the feeder signs by (`RelayClocks::now_ms`): what its description and site are
+    /// issued at and what an offer's expiry is judged against, as a relay judges them.
+    signing: Arc<RelayClocks>,
     info: watch::Sender<Arc<Announcement>>,
     /// The relays already said (in the log) to be too old to publish to, so each is said once.
     too_old: Mutex<HashSet<PublicKey>>,
@@ -295,15 +384,17 @@ pub struct Directory {
 impl Directory {
     /// `configured` are the owner's (`--relay`), `seeds` the binary's: both candidates, never
     /// pinned. `location` is the antenna's as the owner gave it; the directory holds and signs it
-    /// snapped to its precision (`precision::snap`), and never keeps the exact one.
+    /// snapped to its precision (`precision::snap`), and never keeps the exact one. `signing` is
+    /// the clock the feeder signs by, its batches' (`RelayClocks::now_ms`).
     pub fn new(
         state_dir: PathBuf,
         configured: Vec<RelayAddress>,
         seeds: Vec<RelayAddress>,
-        identity: Identity,
+        identity: impl Into<Arc<Identity>>,
         location: Option<Location>,
-        clock: Clock,
+        (clock, signing): (Clock, Arc<RelayClocks>),
     ) -> Result<Arc<Self>, String> {
+        let identity = identity.into();
         let location = location.map(crate::precision::snap);
         let mut relays = Relays {
             known: Vec::new(),
@@ -325,13 +416,14 @@ impl Directory {
             }
         }
         relays.changed = false;
-        let info = sign_announcement(&identity, location, clock, &[])?;
+        let info = sign_announcement(&identity, location, clock, &[], signing.now_ms())?;
         Ok(Arc::new(Self {
             state_dir,
             relays: Mutex::new(relays),
             identity,
             location,
             clock,
+            signing,
             info: watch::channel(Arc::new(info)).0,
             too_old: Mutex::new(HashSet::new()),
         }))
@@ -411,7 +503,7 @@ impl Directory {
         let Ok(content) = offer.content() else {
             return;
         };
-        if content.expires_ms <= wall_ms() {
+        if content.expires_ms <= self.signing.now_ms() {
             return;
         }
         if let Ok(mut relays) = self.relays.lock() {
@@ -447,7 +539,7 @@ impl Directory {
 
     /// The offers of the feeder's area held now.
     pub fn offers(&self) -> Vec<ProviderOffer> {
-        let now = wall_ms();
+        let now = self.signing.now_ms();
         self.relays.lock().map_or_else(
             |_| Vec::new(),
             |relays| {
@@ -465,13 +557,18 @@ impl Directory {
         )
     }
 
-    /// The relays to probe this round, at most `MOST_PER_ROUND`: those held, those that offer the
-    /// feeder's area (the one use of where a relay says it is: whom to probe first), the owner's,
-    /// the seeds, and last round's band, in that order, at most `MOST_PER_ROUND - RANDOM_PER_ROUND`
-    /// of them; then the rest of the round at random among the others known, so a relay whose
-    /// offer lies about where it is still gets measured. Relays that
-    /// asked to be left are not probed until their wait has passed.
-    pub fn probe_set(&self, last_band: &[PublicKey]) -> Vec<RelayAddress> {
+    /// The relays to probe this round. First, apart from discovery, every configured relay (the
+    /// owner's and the seeds) with no live clock sample (not in `heard`, `RelayClocks::heard`):
+    /// they are the feeder's clock sources, as NTP's configured servers are, so they are polled
+    /// whatever the round holds and no number of offers or hints can crowd them out. Then
+    /// discovery's round, at most `MOST_PER_ROUND`: those held, those that offer the feeder's area
+    /// (the one use of where a relay says it is: whom to probe first), the owner's, the seeds, and
+    /// last round's band, in that order, at most `MOST_PER_ROUND - RANDOM_PER_ROUND` of them; then
+    /// the rest of it at random among the others known, so a relay whose offer lies about where it
+    /// is still gets measured. Relays that asked to be left are not probed until their wait has
+    /// passed. Before, the configured relays were in discovery's cut, after every relay held or
+    /// offering, so minted offers left them unprobed and the clock unselected.
+    pub fn probe_set(&self, last_band: &[PublicKey], heard: &[PublicKey]) -> Vec<RelayAddress> {
         let Ok(relays) = self.relays.lock() else {
             return Vec::new();
         };
@@ -489,34 +586,41 @@ impl Directory {
                 .flat_map(Known::addresses)
                 .collect::<Vec<_>>()
         };
-        let mut first: Vec<RelayAddress> = Vec::new();
         let push = |relay: RelayAddress, into: &mut Vec<RelayAddress>| {
             if !relays.is_avoided(&relay.key, now) && !into.contains(&relay) {
                 into.push(relay);
             }
+        };
+        let configured = || {
+            relays
+                .known
+                .iter()
+                .filter(|known| matches!(known.source, Source::Configured))
+                .chain(
+                    relays
+                        .known
+                        .iter()
+                        .filter(|known| matches!(known.source, Source::Seed)),
+                )
+                .flat_map(Known::addresses)
+        };
+        // The clock's sources unheard, outside discovery's cut.
+        let mut clock = relays.clock_part(heard, now);
+        let probed = |relay: &RelayAddress, first: &[RelayAddress]| {
+            first.iter().chain(&clock).any(|each| each.key == relay.key)
         };
         let ordered = relays
             .held
             .iter()
             .chain(&offering)
             .flat_map(find)
-            .chain(
-                relays
-                    .known
-                    .iter()
-                    .filter(|known| matches!(known.source, Source::Configured))
-                    .flat_map(Known::addresses),
-            )
-            .chain(
-                relays
-                    .known
-                    .iter()
-                    .filter(|known| matches!(known.source, Source::Seed))
-                    .flat_map(Known::addresses),
-            )
+            .chain(configured())
             .chain(last_band.iter().flat_map(find));
+        let mut first: Vec<RelayAddress> = Vec::new();
         for relay in ordered {
-            push(relay, &mut first);
+            if !probed(&relay, &[]) {
+                push(relay, &mut first);
+            }
         }
         first.truncate(MOST_PER_ROUND - RANDOM_PER_ROUND);
         // The rest of the round, at least `RANDOM_PER_ROUND`, at random among the others known.
@@ -524,14 +628,24 @@ impl Directory {
             .known
             .iter()
             .flat_map(Known::addresses)
-            .filter(|relay| !first.iter().any(|each| each.key == relay.key))
+            .filter(|relay| !probed(relay, &first))
             .filter(|relay| !relays.is_avoided(&relay.key, now))
             .collect();
         while first.len() < MOST_PER_ROUND && !rest.is_empty() {
             let picked = rest.swap_remove(random_below(rest.len()));
             first.push(picked);
         }
-        first
+        clock.extend(first);
+        clock
+    }
+
+    /// The configured relays with no live clock sample (not in `heard`), not avoided: what a
+    /// clock poll probes between rounds (`ClockPolls`), and nothing of discovery's.
+    pub fn clock_set(&self, heard: &[PublicKey]) -> Vec<RelayAddress> {
+        self.relays
+            .lock()
+            .map(|relays| relays.clock_part(heard, tokio::time::Instant::now()))
+            .unwrap_or_default()
     }
 
     /// Writes the learned relays if they changed since the last write.
@@ -605,7 +719,14 @@ impl Directory {
     /// latest. It runs under the relays lock, so the latest is always the newest signed and names
     /// what is held.
     fn announce(&self, relays: &Relays, wake: bool) -> Option<Arc<Announcement>> {
-        match sign_announcement(&self.identity, self.location, self.clock, &relays.held) {
+        let issued_ms = self.signing.now_ms();
+        match sign_announcement(
+            &self.identity,
+            self.location,
+            self.clock,
+            &relays.held,
+            issued_ms,
+        ) {
             Ok(info) => {
                 let record = Arc::new(info);
                 let latest = Arc::clone(&record);
@@ -683,16 +804,16 @@ fn read_relay(line: &str) -> Option<(RelayAddress, Source, Option<u64>)> {
 }
 
 /// The public description (format 2: the location's public cell, never the location) and the
-/// site (`ReceiverSite`: the location as given, already snapped), under one `issued_ms` so a relay
-/// pairs them.
+/// site (`ReceiverSite`: the location as given, already snapped), under one `issued_ms`, read off
+/// the clock the feeder signs by, so a relay pairs them and judges them as it judges its batches.
 fn sign_announcement(
     identity: &Identity,
     location: Option<Location>,
     clock: Clock,
     relays: &[PublicKey],
+    issued_ms: u64,
 ) -> Result<Announcement, String> {
     let error = |error: tally_wire::WireError| error.to_string();
-    let issued_ms = wall_ms();
     let cell = location
         .as_ref()
         .map(Region::public_cell)
@@ -829,8 +950,9 @@ impl Ledger {
         !held_back
     }
 
-    /// The session to `relay` wrote `batch`.
-    pub fn record(&self, relay: PublicKey, batch: &Batch) {
+    /// The session to `relay` wrote `batch` at `sent_ms`, by the clock the feeder signs by
+    /// (`RelayClocks::now_ms`), which the delivery check's windows and tag keys are judged on.
+    pub fn record(&self, relay: PublicKey, batch: &Batch, sent_ms: u64) {
         let Ok(mut state) = self.state.lock() else {
             return;
         };
@@ -857,7 +979,7 @@ impl Ledger {
                     boot_id,
                     sequence,
                     first_at: now,
-                    sent_ms: wall_ms(),
+                    sent_ms,
                     relays: bit,
                 });
                 if state.sent.len() > SENT_KEPT {
@@ -922,11 +1044,7 @@ impl Ledger {
                     continue;
                 }
                 for relay in kept.from {
-                    state
-                        .owed
-                        .entry(relay)
-                        .or_default()
-                        .push(kept.batch.clone());
+                    state.owe(relay, vec![kept.batch.clone()], false);
                     owed += 1;
                 }
             }
@@ -944,13 +1062,51 @@ impl Ledger {
         self.owed.subscribe()
     }
 
-    /// The batches owed to `relay`'s session, oldest first; they are its to send now.
+    /// The batches owed to `relay`'s session, oldest first; they are its to send now. What it
+    /// does not send it gives back (`owe_again`).
     pub fn take_owed(&self, relay: &PublicKey) -> Vec<Batch> {
         self.state
             .lock()
             .ok()
             .and_then(|mut state| state.owed.remove(relay))
             .unwrap_or_default()
+    }
+
+    /// `rest`, taken from what was owed to `relay` (`take_owed`) and not sent (its session ended
+    /// first), is owed to it again, ahead of anything owed to it since: its next session sends it,
+    /// or the relay that takes its place does (`hand_owed`).
+    pub fn owe_again(&self, relay: PublicKey, rest: Vec<Batch>) {
+        if let Ok(mut state) = self.state.lock() {
+            state.owe(relay, rest, true);
+        }
+    }
+
+    /// `relay` was replaced (its session ended and it is not chosen again): what was owed to it
+    /// is owed to each of `successors` instead, so no batch an audit held back is dropped with the
+    /// relay it was owed to. A relay that already holds one takes it as a duplicate. With no
+    /// successor it stays owed to `relay`, within its bound (`OWED_KEPT`).
+    pub fn hand_owed(&self, relay: &PublicKey, successors: &[PublicKey]) {
+        let handed = {
+            let Ok(mut state) = self.state.lock() else {
+                return;
+            };
+            let Some(owed) = state.owed.remove(relay) else {
+                return;
+            };
+            let mut handed = false;
+            for successor in successors.iter().filter(|successor| *successor != relay) {
+                state.owe(*successor, owed.clone(), false);
+                handed = true;
+            }
+            if !handed {
+                state.owe(*relay, owed, true);
+            }
+            handed
+        };
+        if handed {
+            self.owed
+                .send_modify(|count| *count = count.wrapping_add(1));
+        }
     }
 
     fn live(&self, relay: PublicKey, up: bool) {
@@ -1026,7 +1182,30 @@ impl Ledger {
     }
 }
 
+/// The most batches owed to any one relay: four audits' worth. Past it the oldest go first (the
+/// network has had the longest to carry them some other way), so what a relay that keeps failing
+/// is owed, or what it hands on, never grows without bound.
+const OWED_KEPT: usize = 4 * SAMPLED;
+
 impl LedgerState {
+    /// `batches` owed to `relay`: ahead of what it is owed already when `first` (given back,
+    /// oldest), else after; then the oldest past [`OWED_KEPT`] let go. Every owed list is made
+    /// here, so none passes its bound.
+    fn owe(&mut self, relay: PublicKey, mut batches: Vec<Batch>, first: bool) {
+        if batches.is_empty() {
+            return;
+        }
+        let owed = self.owed.entry(relay).or_default();
+        if first {
+            batches.append(owed);
+            *owed = batches;
+        } else {
+            owed.append(&mut batches);
+        }
+        let over = owed.len().saturating_sub(OWED_KEPT);
+        owed.drain(..over);
+    }
+
     fn slot(&self, relay: &PublicKey) -> Option<usize> {
         self.slots.iter().position(|slot| slot == relay)
     }
@@ -1062,7 +1241,7 @@ impl LedgerState {
 }
 
 /// How a session ended.
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum Outcome {
     /// Try the same relay again, after at least this long.
     Retry(Duration),
@@ -1071,9 +1250,193 @@ pub enum Outcome {
     Leave(Duration),
 }
 
+/// What the publisher does at once when a session ends ([`after`]).
+#[derive(Debug, PartialEq, Eq)]
+enum Next {
+    /// The same relay again, waiting at least `wait`.
+    Redial { wait: Duration },
+    /// The relay asked to be left: avoided for `avoid`, another in its place if one can take it.
+    Leave { avoid: Duration },
+}
+
+/// The least a feeder waits before dialling again a relay of an older version that refused it for
+/// its clock: the protocol's (`tally_wire::batch::CLOCK_RETRY_SECS`), never less, so a relay that
+/// says to come back at once (`retry_after_secs` 0) is not redialled about once a second for ever.
+pub const CLOCK_RETRY: Duration = Duration::from_secs(tally_wire::batch::CLOCK_RETRY_SECS as u64);
+
+/// How long after a session ends the publisher waits to see whether the feeder's other sessions
+/// stayed up before it holds the end against its relay: a heartbeat and a dial's timeout, about how
+/// far apart a flap of the feeder's own network ends every session it holds (each notices at its
+/// next heartbeat or read).
+const ENDED_TOGETHER: Duration =
+    Duration::from_secs(HEARTBEAT.as_secs() + CONNECT_TIMEOUT.as_secs());
+/// How long the publisher waits on a relay's ends: the protocol's waits
+/// (`Pacing::default()`), and a test's shorter ones over loopback relays.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Pacing {
+    /// The least wait before a relay that ended a session for its clock is dialled again
+    /// ([`CLOCK_RETRY`]).
+    pub clock_retry: Duration,
+    /// How long an end waits to be judged against its relay ([`ENDED_TOGETHER`], [`Ends`]).
+    pub ended_together: Duration,
+}
+
+impl Default for Pacing {
+    fn default() -> Self {
+        Self {
+            clock_retry: CLOCK_RETRY,
+            ended_together: ENDED_TOGETHER,
+        }
+    }
+}
+
+/// Sessions in a row held against a relay ([`Ends`]) that replace it.
+const SHORT_IN_A_ROW: u32 = 2;
+// An end is judged before a healthy session after it can end, so "in a row" is in order.
+const _: () = assert!(ENDED_TOGETHER.as_secs() < HEALTHY_SESSION.as_secs());
+
+/// How far a session got: whether it reached its relay (a connection was made; a dial that
+/// failed or timed out did not), and how long it was up (none if it never was).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Span {
+    reached: bool,
+    up_for: Option<Duration>,
+}
+
+impl Span {
+    /// A session that reached its relay and ended before it was up `HEALTHY_SESSION`: a refused
+    /// handshake, a goodbye, a cut, whatever the reason.
+    fn short(self) -> bool {
+        self.reached && self.up_for.is_none_or(|up| up < HEALTHY_SESSION)
+    }
+}
+
+/// Whether a session up for `up_for` counts as healthy (its backoff reset, and the relay's run of
+/// ends held against it cleared): up long enough to have had its batches taken
+/// (`HEALTHY_SESSION`), and its relay neither found swallowing them nor ending it while it was
+/// audited (`failed`), however long it stayed.
+fn healthy(up_for: Option<Duration>, failed: bool) -> bool {
+    !failed && up_for.is_some_and(|up| up >= HEALTHY_SESSION)
+}
+
+/// What follows a session's end at once: a relay that asked to be left is avoided and replaced;
+/// any other end is dialled again, after at least what it asked. Whether an end counts against
+/// its relay is judged later, by [`Ends`], once the feeder's other sessions show whether it was
+/// the relay's or the feeder's own network.
+fn after(ended: &Result<Outcome, String>) -> Next {
+    match ended {
+        Ok(Outcome::Leave(wait)) => Next::Leave { avoid: *wait },
+        Ok(Outcome::Retry(wait)) => Next::Redial { wait: *wait },
+        Err(_) => Next::Redial {
+            wait: Duration::ZERO,
+        },
+    }
+}
+
+/// The ends the publisher holds against relays (RFC-0171 §3.6). A session that reached its relay
+/// and ended short ([`Span::short`]), or ended while its relay was audited (it dodged the audit),
+/// waits `ENDED_TOGETHER`, then counts against its relay only if a session to another relay that
+/// was up when it ended is up still, the same session: then the feeder's network was fine and the
+/// end was the relay's. When every live session ends together (the feeder's own network flapped),
+/// or the feeder held no other, nobody is blamed. `SHORT_IN_A_ROW` held in a row replace the
+/// relay; a healthy session clears its run. A dial that never reached the relay (an honest relay
+/// restarting refuses connections) counts against nobody: a relay that stops answering is
+/// replaced by the rounds, which count it silent (`selection::FAILED_ROUNDS`). As the rounds'
+/// "a round that heard nothing blames no one", one network's failure is never a relay's.
+#[derive(Debug)]
+struct Ends {
+    in_a_row: HashMap<PublicKey, u32>,
+    pending: Vec<Pending>,
+    /// How long an end waits to be judged (`Pacing::ended_together`).
+    together: Duration,
+}
+
+impl Default for Ends {
+    fn default() -> Self {
+        Self::new(ENDED_TOGETHER)
+    }
+}
+
+/// An end waiting to be judged: its relay, when it ended, and the sessions (relay, generation) up
+/// to other relays then.
+#[derive(Debug)]
+struct Pending {
+    relay: PublicKey,
+    at: tokio::time::Instant,
+    others: Vec<(PublicKey, u64)>,
+}
+
+impl Ends {
+    fn new(together: Duration) -> Self {
+        Self {
+            in_a_row: HashMap::new(),
+            pending: Vec::new(),
+            together,
+        }
+    }
+
+    /// `relay`'s session ended at `at`: `held` when it is an end to judge (short, or dodging an
+    /// audit), `healthy` when it clears the relay's run; `others` the sessions up then to other
+    /// relays.
+    fn ended(
+        &mut self,
+        relay: PublicKey,
+        at: tokio::time::Instant,
+        (held, healthy): (bool, bool),
+        others: Vec<(PublicKey, u64)>,
+    ) {
+        if healthy {
+            self.in_a_row.remove(&relay);
+        }
+        if held {
+            self.pending.push(Pending { relay, at, others });
+        }
+    }
+
+    /// When the next end is due to be judged.
+    fn next_due(&self) -> Option<tokio::time::Instant> {
+        self.pending
+            .iter()
+            .map(|pending| pending.at + self.together)
+            .min()
+    }
+
+    /// Judges the ends due by `now`, oldest first, given which sessions are up now (`up`, by
+    /// relay and generation): the relays whose run reached `SHORT_IN_A_ROW`, to replace.
+    fn judge(
+        &mut self,
+        now: tokio::time::Instant,
+        up: impl Fn(&(PublicKey, u64)) -> bool,
+    ) -> Vec<PublicKey> {
+        self.pending.sort_by_key(|pending| pending.at);
+        let due = self
+            .pending
+            .iter()
+            .take_while(|pending| pending.at + self.together <= now)
+            .count();
+        let mut replace = Vec::new();
+        for pending in self.pending.drain(..due) {
+            // Nobody stayed up: the feeder's own network, which blames no one.
+            if !pending.others.iter().any(&up) {
+                continue;
+            }
+            let run = self.in_a_row.entry(pending.relay).or_insert(0);
+            *run += 1;
+            if *run >= SHORT_IN_A_ROW {
+                self.in_a_row.remove(&pending.relay);
+                replace.push(pending.relay);
+            }
+        }
+        replace
+    }
+}
+
 /// What a running session and the background work tell the publisher.
 enum Event {
     Probed(Vec<Probed>),
+    /// A clock poll's answers (`Publisher::clock_poll`): clock samples, and the relays they
+    /// name, but no round's measure to choose by.
+    ClockPolled(Vec<Probed>),
     Up {
         relay: PublicKey,
         generation: u64,
@@ -1082,7 +1445,7 @@ enum Event {
         relay: PublicKey,
         generation: u64,
         ended: Result<Outcome, String>,
-        up_for: Option<Duration>,
+        span: Span,
     },
     Answers {
         query: DeliveryQuery,
@@ -1093,13 +1456,16 @@ enum Event {
 /// Everything the publisher works from.
 pub struct Publishing {
     pub directory: Arc<Directory>,
-    pub identity: Identity,
+    pub identity: Arc<Identity>,
     pub batches: broadcast::Sender<Arc<Record>>,
     /// The owner's ceiling, bytes a second.
     pub ceiling: u32,
     /// The wanted receptions a second the relays state, which the batcher sheds to: each session
     /// states its relay's (`source::WantedCeilings`).
     pub wanted: Arc<WantedCeilings>,
+    /// The clocks the relays state, which the batcher signs by: each session states its relay's
+    /// (`source::RelayClocks`).
+    pub clocks: Arc<RelayClocks>,
     pub checker: DeliveryChecker,
     /// When the delivery checks run: `Checking::default()`.
     pub checking: Checking,
@@ -1111,6 +1477,8 @@ pub struct Publishing {
     pub source_address: Option<IpAddr>,
     /// Told how many relay sessions are up whenever that changes (`health`).
     pub health: Arc<Health>,
+    /// How long it waits on a relay's ends: `Pacing::default()`.
+    pub pacing: Pacing,
 }
 
 /// One session the publisher keeps.
@@ -1124,10 +1492,11 @@ struct Running {
 /// The publisher's state between events.
 struct Publisher {
     directory: Arc<Directory>,
-    identity: Identity,
+    identity: Arc<Identity>,
     batches: broadcast::Sender<Arc<Record>>,
     ceiling: u32,
     wanted: Arc<WantedCeilings>,
+    clocks: Arc<RelayClocks>,
     checker: DeliveryChecker,
     checking: Checking,
     prober: Prober,
@@ -1142,6 +1511,9 @@ struct Publisher {
     observed: HashMap<PublicKey, IpAddr>,
     last_band: Vec<PublicKey>,
     generation: u64,
+    /// The ends held against relays, waiting to be judged ([`Ends`]).
+    ends: Ends,
+    pacing: Pacing,
     events: mpsc::Sender<Event>,
     tasks: JoinSet<()>,
 }
@@ -1157,6 +1529,7 @@ pub async fn run(publishing: Publishing) {
         batches: publishing.batches,
         ceiling: publishing.ceiling,
         wanted: publishing.wanted,
+        clocks: publishing.clocks,
         checker: publishing.checker,
         checking: publishing.checking,
         prober: publishing.prober,
@@ -1169,6 +1542,8 @@ pub async fn run(publishing: Publishing) {
         observed: HashMap::new(),
         last_band: Vec::new(),
         generation: 0,
+        ends: Ends::new(publishing.pacing.ended_together),
+        pacing: publishing.pacing,
         events,
         tasks: JoinSet::new(),
     };
@@ -1180,6 +1555,12 @@ pub async fn run(publishing: Publishing) {
     let mut round_began = next_round;
     let mut unplaced = Backoff::new();
     let mut probing = false;
+    // The clocks asked for a probe of their unheard configured relays (`RelayClocks::probing`),
+    // and none is out: a clock poll runs once one is due (`ClockPolls`).
+    let mut clock_wanted = false;
+    let mut clock_polling = false;
+    let mut polls = ClockPolls::default();
+    let clocks = Arc::clone(&publisher.clocks);
     let every = publisher.checking.every;
     let mut check = tokio::time::interval_at(tokio::time::Instant::now() + jittered(every), every);
     check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -1195,6 +1576,23 @@ pub async fn run(publishing: Publishing) {
                 probing = true;
                 round_began = tokio::time::Instant::now();
                 publisher.probe_round();
+            }
+            // The clocks make no majority while a configured relay is unheard: that relay is
+            // polled for its clock on its own interval, and nothing of discovery's round is.
+            () = clocks.probing() => clock_wanted = true,
+            _ = sleep_until(polls.next().or(Some(tokio::time::Instant::now()))),
+                if clock_wanted && !clock_polling => {
+                let heard = publisher.clocks.heard();
+                let unheard = publisher.directory.clock_set(&heard);
+                if unheard.is_empty() {
+                    clock_wanted = false;
+                }
+                let due = polls.due(unheard, tokio::time::Instant::now());
+                if !due.is_empty() {
+                    clock_wanted = false;
+                    clock_polling = true;
+                    publisher.clock_poll(due);
+                }
             }
             _ = grant.tick(), if publisher.area.is_some() => publisher.grant_keys(),
             // One check at a time: the next begins once the last is judged or dropped.
@@ -1219,7 +1617,13 @@ pub async fn run(publishing: Publishing) {
                 };
             }
             Some(event) = inbox.recv() => {
+                if let Event::Probed(answered) | Event::ClockPolled(answered) = &event {
+                    polls.answered(answered);
+                }
                 let probed = matches!(event, Event::Probed(_));
+                if matches!(event, Event::ClockPolled(_)) {
+                    clock_polling = false;
+                }
                 publisher.handle(event);
                 if probed {
                     probing = false;
@@ -1230,6 +1634,11 @@ pub async fn run(publishing: Publishing) {
                         round_began + ROUND_EVERY
                     };
                 }
+            }
+            // An end held against a relay is judged once the feeder's other sessions have had
+            // time to show whether the feeder's own network failed (`Ends`).
+            _ = sleep_until(publisher.ends.next_due()), if publisher.ends.next_due().is_some() => {
+                publisher.judge_ends();
             }
             Some(_) = publisher.tasks.join_next(), if !publisher.tasks.is_empty() => {}
         }
@@ -1254,7 +1663,9 @@ async fn sleep_until(due: Option<tokio::time::Instant>) {
 impl Publisher {
     /// Probes this round's candidates at once, and reports what came back.
     fn probe_round(&mut self) {
-        let candidates = self.directory.probe_set(&self.last_band);
+        let candidates = self
+            .directory
+            .probe_set(&self.last_band, &self.clocks.heard());
         let identity = self.identity.clone();
         let events = self.events.clone();
         let prober = self.prober;
@@ -1273,13 +1684,52 @@ impl Publisher {
         });
     }
 
+    /// Probes `due` (configured relays with no live clock sample, `ClockPolls::due`) for their
+    /// clocks alone, and reports what came back: no round of discovery's, and no choice made by
+    /// what so few answered.
+    fn clock_poll(&mut self, due: Vec<RelayAddress>) {
+        let identity = self.identity.clone();
+        let events = self.events.clone();
+        let prober = self.prober;
+        self.tasks.spawn(async move {
+            let mut probes = JoinSet::new();
+            for relay in due {
+                probes.spawn(prober(relay, identity.clone()));
+            }
+            let mut probed = Vec::new();
+            while let Some(done) = probes.join_next().await {
+                if let Ok(Ok(result)) = done {
+                    probed.push(result);
+                }
+            }
+            let _ = events.send(Event::ClockPolled(probed)).await;
+        });
+    }
+
+    /// Each probe answer's clock told to the clocks (a configured relay's is a source,
+    /// `RelayClocks::probed`), and the relays it named learned.
+    fn heard_probes(&mut self, probed: &[Probed]) {
+        for each in probed {
+            self.directory.learn(each.measured.relay.key, &each.hints);
+            if let Some(clock) = &each.clock {
+                let asked = self.clocks.anchored_before(clock.asked.elapsed());
+                self.clocks.probed(
+                    each.measured.relay.key,
+                    (asked, clock.took_ms, clock.sent_ms),
+                    clock.error_ms,
+                    clock.heard.elapsed(),
+                );
+            }
+        }
+    }
+
     /// The members of the feeder's area to ask about batches sent to `checked`: those given the
     /// key in force now.
     fn members(&self, checked: &[PublicKey]) -> Vec<delivery_check::Member> {
         let Some(area) = self.area else {
             return Vec::new();
         };
-        let now = wall_ms();
+        let now = self.clocks.now_ms();
         delivery_check::members(
             &self.directory.offers(),
             area,
@@ -1298,7 +1748,7 @@ impl Publisher {
         let Some(area) = self.area else {
             return;
         };
-        let now = wall_ms();
+        let now = self.clocks.now_ms();
         let candidates =
             delivery_check::keyable(&self.directory.offers(), area, &self.observed, now);
         let members = self.checker.draw(candidates, now);
@@ -1340,7 +1790,7 @@ impl Publisher {
         let Some(area) = self.area else {
             return false;
         };
-        let now = wall_ms();
+        let now = self.clocks.now_ms();
         let observed = &self.observed;
         let keyring = &self.checker.keyring;
         let askable: Vec<PublicKey> = held
@@ -1371,7 +1821,7 @@ impl Publisher {
     /// Asks the area's members about the audited batches, once they have settled.
     fn ask_members(&mut self) {
         let recent = self.ledger.audited(self.checking.settle);
-        let Some(query) = self.checker.sample(&recent) else {
+        let Some(query) = self.checker.sample_at(&recent, self.clocks.now_ms()) else {
             self.checker.abandon();
             return;
         };
@@ -1381,7 +1831,7 @@ impl Publisher {
             return;
         }
         // Each member's query carries its keys again: an ask looks like a grant.
-        let now = wall_ms();
+        let now = self.clocks.now_ms();
         let asks: Vec<(delivery_check::Member, DeliveryQuery)> = members
             .into_iter()
             .map(|member| {
@@ -1420,10 +1870,11 @@ impl Publisher {
 
     fn handle(&mut self, event: Event) {
         match event {
+            Event::ClockPolled(probed) => self.heard_probes(&probed),
             Event::Probed(probed) => {
+                self.heard_probes(&probed);
                 let mut measured: Vec<Measured> = Vec::new();
                 for each in probed {
-                    self.directory.learn(each.measured.relay.key, &each.hints);
                     measured.push(each.measured);
                 }
                 let measured = fastest_per_relay(measured);
@@ -1438,7 +1889,7 @@ impl Publisher {
                     .collect();
                 let avoid = self.avoid();
                 let choice = self.selection.choose(self.area, &measured, &avoid);
-                self.apply(&choice, false);
+                self.apply(&choice, false, None);
             }
             Event::Up { relay, generation } => {
                 if let Some(running) = self.sessions.get(&relay)
@@ -1451,10 +1902,13 @@ impl Publisher {
                 relay,
                 generation,
                 ended,
-                up_for,
-            } => self.ended(relay, generation, ended, up_for),
+                span,
+            } => self.ended(relay, generation, ended, span),
             Event::Answers { query, answers } => {
-                if let Verdict::Swallowed(swallowers) = self.checker.judge(&query, &answers) {
+                if let Verdict::Swallowed(swallowers) =
+                    self.checker
+                        .judge_at(&query, &answers, self.clocks.now_ms())
+                {
                     for swallower in swallowers {
                         eprintln!(
                             "tally-feed: relay {swallower} did not deliver this feeder's batches \
@@ -1462,7 +1916,7 @@ impl Publisher {
                             delivery_check::AVOID_FOR.as_secs() / 86_400
                         );
                         let choice = self.selection.left(&swallower);
-                        self.apply(&choice, true);
+                        self.apply(&choice, true, None);
                     }
                 }
             }
@@ -1471,7 +1925,7 @@ impl Publisher {
 
     /// Relays not to choose: those remembered as swallowing, and those that asked to be left.
     fn avoid(&self) -> Vec<PublicKey> {
-        let mut avoid = self.checker.avoided();
+        let mut avoid = self.checker.avoided_at(self.clocks.now_ms());
         avoid.extend(self.directory.avoided());
         avoid
     }
@@ -1481,7 +1935,7 @@ impl Publisher {
         relay: PublicKey,
         generation: u64,
         ended: Result<Outcome, String>,
-        up_for: Option<Duration>,
+        span: Span,
     ) {
         let Some(mut running) = self
             .sessions
@@ -1491,40 +1945,90 @@ impl Publisher {
             return;
         };
         self.live(relay, false);
-        // Whatever ended it, an audit of it in progress says nothing.
-        self.checker.session_ended(relay);
-        let healthy = up_for.is_some_and(|up| up >= HEALTHY_SESSION);
+        // An audit of the relay in progress says nothing of it now, and the end dodged it.
+        let dodged = self.checker.session_ended(relay);
+        let healthy = healthy(
+            span.up_for,
+            dodged
+                || self
+                    .checker
+                    .avoided_at(self.clocks.now_ms())
+                    .contains(&relay),
+        );
+        let others = self
+            .ledger
+            .live_relays()
+            .into_iter()
+            .filter(|other| *other != relay)
+            .filter_map(|other| {
+                self.sessions
+                    .get(&other)
+                    .map(|running| (other, running.generation))
+            })
+            .collect();
+        self.ends.ended(
+            relay,
+            tokio::time::Instant::now(),
+            (span.short() || dodged, healthy),
+            others,
+        );
         if healthy {
             running.backoff.reset();
         }
-        let choice = match ended {
-            Ok(Outcome::Leave(wait)) => {
-                self.directory.avoid(&relay, wait);
-                self.selection.failed(&relay)
-            }
-            Ok(Outcome::Retry(wait)) if healthy => {
+        if let Err(error) = &ended {
+            eprintln!("tally-feed: relay {}: {error}", running.relay.address);
+        }
+        let choice = match after(&ended) {
+            Next::Redial { wait } => {
                 running.backoff.at_least(wait);
                 self.redial(running);
                 return;
             }
-            Ok(Outcome::Retry(wait)) => {
-                running.backoff.at_least(wait);
-                self.selection.failed(&relay)
-            }
-            Err(error) => {
-                eprintln!("tally-feed: relay {}: {error}", running.relay.address);
-                if healthy {
-                    self.redial(running);
-                    return;
-                }
+            Next::Leave { avoid } => {
+                self.directory.avoid(&relay, avoid);
                 self.selection.failed(&relay)
             }
         };
-        if choice.keys().contains(&relay) {
-            // No other relay can take its place: the same one again, at the backoff's pace.
-            self.redial(running);
+        self.replaced(relay, Some(running), &choice);
+    }
+
+    /// Judges the ends due ([`Ends::judge`]): a relay whose run of ends held against it is long
+    /// enough is replaced, if another can take its place.
+    fn judge_ends(&mut self) {
+        let live = self.ledger.live_relays();
+        let sessions = &self.sessions;
+        let replace = self
+            .ends
+            .judge(tokio::time::Instant::now(), |(relay, generation)| {
+                live.contains(relay)
+                    && sessions
+                        .get(relay)
+                        .is_some_and(|running| running.generation == *generation)
+            });
+        for relay in replace {
+            eprintln!(
+                "tally-feed: relay {relay} ended {SHORT_IN_A_ROW} sessions in a row short while \
+                 others stayed up; replacing it"
+            );
+            let choice = self.selection.failed(&relay);
+            self.replaced(relay, None, &choice);
         }
-        self.apply(&choice, true);
+    }
+
+    /// Follows `choice` after `relay` was replaced: its place to another and what it was owed with
+    /// it, or, with no other to take it, the same relay again (`running`, if its session ended, at
+    /// the backoff's pace).
+    fn replaced(&mut self, relay: PublicKey, running: Option<Running>, choice: &Choice) {
+        if choice.keys().contains(&relay) {
+            // No other relay can take its place: the same one again, at the backoff's pace (its
+            // session, if one is running, goes on).
+            if let Some(running) = running {
+                self.redial(running);
+            }
+            self.apply(choice, true, None);
+        } else {
+            self.apply(choice, true, Some(relay));
+        }
     }
 
     /// Whether `relay`'s session is up, for the delivery checks' ledger and the feeder's health.
@@ -1544,21 +2048,26 @@ impl Publisher {
     }
 
     /// Makes the sessions follow `choice`: those no longer chosen end, those newly chosen start
-    /// (after a jitter when they take a failed relay's place).
-    fn apply(&mut self, choice: &Choice, failover: bool) {
+    /// (after a jitter when they take a failed relay's place). What was owed to a relay whose
+    /// session ends here, or to `replaced` (one whose session already ended and is not chosen
+    /// again), goes to the relays started in their place, or, if none is, to every relay chosen
+    /// (`Ledger::hand_owed`): no batch an audit owed is dropped with the relay it was owed to.
+    fn apply(&mut self, choice: &Choice, failover: bool, replaced: Option<PublicKey>) {
         let wanted = choice.keys();
-        let gone: Vec<PublicKey> = self
+        let mut gone: Vec<PublicKey> = self
             .sessions
             .keys()
             .filter(|key| !wanted.contains(key))
             .copied()
             .collect();
-        for key in gone {
-            if let Some(running) = self.sessions.remove(&key) {
+        for key in &gone {
+            if let Some(running) = self.sessions.remove(key) {
                 running.task.abort();
-                self.live(key, false);
+                self.live(*key, false);
             }
         }
+        gone.extend(replaced.filter(|relay| !wanted.contains(relay)));
+        let mut started = Vec::new();
         for relay in choice.relays() {
             if self.sessions.contains_key(&relay.key) {
                 continue;
@@ -1569,7 +2078,16 @@ impl Publisher {
                 Duration::ZERO
             };
             let wait = jitter.max(self.directory.avoided_for(&relay.key));
+            started.push(relay.key);
             self.start(relay, wait, Backoff::new());
+        }
+        let successors = if started.is_empty() {
+            &wanted
+        } else {
+            &started
+        };
+        for relay in gone {
+            self.ledger.hand_owed(&relay, successors);
         }
         self.directory.hold(&wanted);
     }
@@ -1584,7 +2102,10 @@ impl Publisher {
             ceiling: self.ceiling,
             area: self.area,
             wanted: Arc::clone(&self.wanted),
+            clocks: Arc::clone(&self.clocks),
             source_address: self.source_address,
+            clock_retry: self.pacing.clock_retry,
+            health: Arc::clone(&self.health),
         };
         let identity = self.identity.clone();
         let batches = self.batches.subscribe();
@@ -1592,7 +2113,7 @@ impl Publisher {
         let task = self.tasks.spawn(async move {
             tokio::time::sleep(wait).await;
             let key = context.relay.key;
-            let (ended, up_for) = session(&context, &identity, batches, || {
+            let (ended, span) = session(&context, &identity, batches, || {
                 let _ = events.try_send(Event::Up {
                     relay: key,
                     generation,
@@ -1604,7 +2125,7 @@ impl Publisher {
                     relay: key,
                     generation,
                     ended,
-                    up_for,
+                    span,
                 })
                 .await;
         });
@@ -1629,8 +2150,14 @@ struct Context {
     area: Option<Region>,
     /// The relays' wanted ceilings the batcher sheds to: this session's statement is one.
     wanted: Arc<WantedCeilings>,
+    /// The relays' clocks the batcher signs by: this session's statement is one.
+    clocks: Arc<RelayClocks>,
     /// The local address to connect from (`Publishing::source_address`).
     source_address: Option<IpAddr>,
+    /// The least wait after a clock goodbye (`Pacing::clock_retry`).
+    clock_retry: Duration,
+    /// Told of the batches this session was too slow for (`Health::lagged`).
+    health: Arc<Health>,
 }
 
 /// Connects to `address` from `from` when one is chosen, else as the system chooses.
@@ -1653,13 +2180,13 @@ async fn dial(address: &str, from: Option<IpAddr>) -> std::io::Result<TcpStream>
     Err(last.unwrap_or_else(|| std::io::Error::other("no address")))
 }
 
-/// One session with a relay: how it ended, and how long it was up (none if it never was).
+/// One session with a relay: how it ended, and how far it got ([`Span`]).
 async fn session(
     context: &Context,
     identity: &Identity,
     batches: broadcast::Receiver<Arc<Record>>,
     up: impl FnOnce(),
-) -> (Result<Outcome, String>, Option<Duration>) {
+) -> (Result<Outcome, String>, Span) {
     let relay = &context.relay;
     let stream = match tokio::time::timeout(
         CONNECT_TIMEOUT,
@@ -1668,20 +2195,33 @@ async fn session(
     .await
     {
         Ok(Ok(stream)) => stream,
-        Ok(Err(error)) => return (Err(error.to_string()), None),
-        Err(_) => return (Err("connect timed out".to_owned()), None),
+        Ok(Err(error)) => return (Err(error.to_string()), Span::default()),
+        Err(_) => return (Err("connect timed out".to_owned()), Span::default()),
     };
+    // Connected: whatever ends the session from here reached the relay.
+    let reached = Span {
+        reached: true,
+        up_for: None,
+    };
+    // The relay states its clock in its greeting, once the handshake is done: how long that took
+    // from the Hello is the uncertainty of the statement (`Telling::stated`).
+    let hello = tokio::time::Instant::now();
     let session = match noise::connect(stream, identity, &relay.key, Role::Feeder).await {
         Ok(session) => session,
         Err(tally_wire::WireError::Refused {
             reason,
             retry_after_secs,
-        }) => return (Ok(goodbye(reason, retry_after_secs)), None),
-        Err(error) => return (Err(error.to_string()), None),
+        }) => {
+            return (
+                Ok(goodbye(reason, retry_after_secs, context.clock_retry)),
+                reached,
+            );
+        }
+        Err(error) => return (Err(error.to_string()), reached),
     };
     // Refused before it counts as up: an older relay is no session.
     if let Some(outcome) = context.directory.refuse_old_relay(relay, session.version) {
-        return (Ok(outcome), None);
+        return (Ok(outcome), reached);
     }
     let began = tokio::time::Instant::now();
     up();
@@ -1706,54 +2246,141 @@ async fn session(
             }
         }
     });
-    let ended = publish(context, session.version, &mut writer, &mut records, batches).await;
+    let ended = publish(
+        context,
+        session.version,
+        hello,
+        &mut writer,
+        &mut records,
+        batches,
+    )
+    .await;
     reading.abort();
-    (ended, Some(began.elapsed()))
+    (
+        ended,
+        Span {
+            reached: true,
+            up_for: Some(began.elapsed()),
+        },
+    )
 }
 
-/// How much one relay session sends of what the batcher sealed. The owner's ceiling is kept once,
-/// by the batcher, so a relay that asked nothing gets every batch. A relay that asked for less than
-/// the ceiling gets a bucket at its rate, deep enough that a whole batch always fits; the batches
-/// over it are skipped for that relay alone, and their sequence numbers say so.
+/// How fast one relay session sends what the batcher sealed: every batch, in order, never one
+/// skipped, each waiting for its bytes' turn. The pace is the owner's ceiling, as the batcher
+/// signs at it (`source::signed_most`: its receptions and each batch's own bytes), so a backlog an
+/// anchor's return releases at once goes out at the ceiling, never over it, and a session sends at
+/// least as fast as the batcher signs, so the backlog drains within its budget
+/// (`tally_wire::budget::BACKLOG_DRAIN`). A relay that asked for less gets a pace at its rate,
+/// deep enough that a whole batch always fits: its batches wait longer, and what it cannot keep up
+/// with lags behind in the sessions' channel (`RecvError::Lagged`, counted and reported).
 ///
 /// The wanted receptions a second the relay states with it are the batcher's to keep to
 /// (`source::WantedCeilings`): a batch is signed once for every relay, so what is past them is shed
 /// before it is signed, never skipped here. What this session stated goes when it ends.
-struct Pace {
+pub(crate) struct Pace {
     ceiling: u32,
-    bucket: Option<TokenBucket>,
-    skipped: u64,
+    bucket: TokenBucket,
+    /// The rate and burst the relay last stated, which `bucket` holds to.
+    told: Option<(u32, u32)>,
     wanted: Stating,
+    /// The relay's clock as this session measures it (`source::Telling`): a source the batcher
+    /// signs by when the relay is configured, and what the health reports this feeder's clock
+    /// against. Never what decides a send, and never what decides the relay's fate.
+    clock: Option<Telling>,
+    /// When the session sent its Hello, which a statement's uncertainty runs from.
+    hello: tokio::time::Instant,
+    /// The relay restated its clock (`Telling::stated`): the session asks it for an echo at once,
+    /// which measures it by its own round trip.
+    asking: bool,
+}
+
+/// The pace of a session whose relay asks no less than the owner's `ceiling`: what the batcher
+/// signs a second at it (`source::signed_most`), a second of it at once, and never less than a
+/// whole batch.
+fn at_ceiling(ceiling: u32) -> TokenBucket {
+    let rate = crate::source::signed_most(ceiling);
+    TokenBucket::with_burst(rate, rate.max(BURST_FLOOR))
 }
 
 impl Pace {
-    fn new(ceiling: u32, wanted: Stating) -> Self {
+    pub(crate) fn new(ceiling: u32, wanted: Stating) -> Self {
         Self {
             ceiling,
-            bucket: None,
-            skipped: 0,
+            bucket: at_ceiling(ceiling),
+            told: None,
             wanted,
+            clock: None,
+            hello: tokio::time::Instant::now(),
+            asking: false,
         }
     }
 
-    /// A relay's `RateLimit`. One at or over the owner's ceiling asks for nothing the batcher
-    /// does not already keep to.
+    /// The same pace, its relay's clock measured into `clock`, the session's Hello sent at
+    /// `hello`.
+    fn telling(self, clock: Telling, hello: tokio::time::Instant) -> Self {
+        Self {
+            clock: Some(clock),
+            hello,
+            ..self
+        }
+    }
+
+    /// A relay's `RateLimit`. One at or over what the batcher signs a second at the owner's
+    /// ceiling asks for nothing the ceiling's pace does not already keep to. One stating the rate
+    /// it already holds (a relay states it again with its clock, `clock`) keeps the bucket as it
+    /// is, its tokens spent. A rate of 0 is taken as the least there is, so a batch still goes.
     fn limit(&mut self, bytes_per_sec: u32, burst: u32, wanted_per_sec: Option<u32>) {
-        self.bucket = (bytes_per_sec < self.ceiling)
-            .then(|| TokenBucket::with_burst(bytes_per_sec, burst.max(BURST_FLOOR)));
+        if self.told != Some((bytes_per_sec, burst)) {
+            self.told = Some((bytes_per_sec, burst));
+            self.bucket = if bytes_per_sec < crate::source::signed_most(self.ceiling) {
+                TokenBucket::with_burst(bytes_per_sec.max(1), burst.max(BURST_FLOOR))
+            } else {
+                at_ceiling(self.ceiling)
+            };
+        }
         self.wanted.state(wanted_per_sec);
     }
 
-    /// True if a batch of `bytes` goes to this relay now; counted as skipped if not.
-    fn admit(&mut self, bytes: usize, now: Instant) -> bool {
-        let admitted = self
-            .bucket
-            .as_mut()
-            .is_none_or(|bucket| bucket.take_at(bytes, now));
-        if !admitted {
-            self.skipped += 1;
+    /// A relay's stated clock and its error (`RateLimit`'s `clock_ms` and `error_ms`), heard now.
+    /// A restatement (any after the first) is no sample of its own, its one-way time unbounded:
+    /// the session asks for an echo at once (`asking`).
+    fn clock(&mut self, clock_ms: Option<u64>, error_ms: Option<u64>) {
+        if let Some(telling) = &self.clock
+            && telling.stated(clock_ms, error_ms, self.hello.elapsed())
+        {
+            self.asking = true;
         }
-        admitted
+    }
+
+    /// A relay's freshness anchor (RFC-0171 §3.6): this session's newest, for the batcher to sign
+    /// into its batches (`source::Telling::anchored`).
+    fn anchored(&self, anchor: tally_wire::Anchor) {
+        if let Some(telling) = &self.clock {
+            telling.anchored(anchor);
+        }
+    }
+
+    /// A relay's answer to a timed heartbeat (`times`): measured, when it echoes one.
+    fn echoed(&self, times: tally_wire::HeartbeatTimes) {
+        if let (Some(telling), Some((asked, took))) = (&self.clock, times.echo) {
+            telling.echoed(asked, took, times.sent_ms, times.error_ms);
+        }
+    }
+
+    /// The timed heartbeat this session sends now: its own clock for the relay to echo.
+    fn heartbeat(&self) -> Record {
+        match &self.clock {
+            Some(telling) => {
+                Record::TimedHeartbeat(tally_wire::HeartbeatTimes::asking(telling.asking_ms()))
+            }
+            None => Record::Heartbeat,
+        }
+    }
+
+    /// How long a batch of `bytes` waits from `now` before it goes to this relay: none when it
+    /// may go now, its bytes then taken from the pace. Asked again once the wait is over.
+    pub(crate) fn wait(&mut self, bytes: usize, now: Instant) -> Duration {
+        self.bucket.wait_at(bytes, now)
     }
 }
 
@@ -1797,16 +2424,46 @@ impl<S: tokio::io::AsyncWrite> Link<'_, S> {
         }
     }
 
+    /// Waits for a batch of `bytes` to have its turn at the session's pace (`Pace::wait`), hearing
+    /// the relay meanwhile; `Some` if the relay ended the session while it waited.
+    async fn paced(&mut self, bytes: usize) -> Result<Option<Outcome>, String> {
+        loop {
+            let wait = self.pace.wait(bytes, Instant::now());
+            if wait.is_zero() {
+                return Ok(None);
+            }
+            tokio::select! {
+                () = tokio::time::sleep(wait) => {}
+                got = self.records.recv() => {
+                    if let Some(outcome) = heard(self.context, &mut self.pace, got)? {
+                        return Ok(Some(outcome));
+                    }
+                }
+            }
+        }
+    }
+
     /// Sends what an ended audit owes this relay (`Ledger::end_audit`): batches the audited relay
     /// did not carry, which this session held back. Few, so they go whatever the relay's pace.
+    /// Held back for the audit's length on top of any wait, and sent all the same: the relay
+    /// judges whether it can still use each, and holds it either way. If the session ends before
+    /// they are all sent, the rest, the one cut short among them, are owed to the relay still
+    /// (`Ledger::owe_again`): its next session sends them, or the relay that takes its place does.
     async fn send_owed(&mut self) -> Result<Option<Outcome>, String> {
         let relay = self.context.relay.key;
-        for batch in self.context.ledger.take_owed(&relay) {
+        let mut owed = self.context.ledger.take_owed(&relay).into_iter();
+        while let Some(batch) = owed.next() {
             let record = Arc::new(Record::Batch(batch.clone()));
-            if let Some(outcome) = self.send(&[record]).await? {
-                return Ok(Some(outcome));
+            let sent = self.send(&[record]).await;
+            if !matches!(sent, Ok(None)) {
+                self.context
+                    .ledger
+                    .owe_again(relay, std::iter::once(batch).chain(owed).collect());
+                return sent;
             }
-            self.context.ledger.record(relay, &batch);
+            self.context
+                .ledger
+                .record(relay, &batch, self.context.clocks.now_ms());
         }
         Ok(None)
     }
@@ -1844,7 +2501,14 @@ fn heard(
                 bytes_per_sec,
                 burst,
                 wanted_per_sec,
-            } => pace.limit(bytes_per_sec, burst, wanted_per_sec),
+                clock_ms,
+                error_ms,
+            } => {
+                pace.limit(bytes_per_sec, burst, wanted_per_sec);
+                pace.clock(clock_ms, error_ms);
+            }
+            Record::TimedHeartbeat(times) => pace.echoed(times),
+            Record::Anchor(anchor) => pace.anchored(anchor),
             Record::Redirect {
                 retry_after_secs,
                 hints,
@@ -1857,7 +2521,7 @@ fn heard(
             Record::Goodbye {
                 reason,
                 retry_after_secs,
-            } => return Ok(Some(goodbye(reason, retry_after_secs))),
+            } => return Ok(Some(goodbye(reason, retry_after_secs, context.clock_retry))),
             _ => {}
         }
     }
@@ -1878,6 +2542,7 @@ fn ask_offers(context: &Context) -> Option<Record> {
 async fn publish<S: tokio::io::AsyncWrite>(
     context: &Context,
     version: u16,
+    hello: tokio::time::Instant,
     writer: &mut noise::Writer<S>,
     records: &mut Inbound,
     mut batches: broadcast::Receiver<Arc<Record>>,
@@ -1891,7 +2556,8 @@ async fn publish<S: tokio::io::AsyncWrite>(
         context,
         writer,
         records,
-        pace: Pace::new(context.ceiling, context.wanted.session()),
+        pace: Pace::new(context.ceiling, context.wanted.session())
+            .telling(context.clocks.session(relay.key), hello),
     };
     let mut info = directory.info();
     let mut owed = context.ledger.owed_changes();
@@ -1899,6 +2565,19 @@ async fn publish<S: tokio::io::AsyncWrite>(
     first.extend(ask_offers(context).map(Arc::new));
     if let Some(outcome) = link.send(&first).await? {
         return Ok(outcome);
+    }
+    // A relay speaks first to a feeder: the rate it takes and the clock it judges a batch by
+    // (`RateLimit`), perhaps heard already while the first records went. No batch goes before
+    // that is heard, so the first goes at the rate the relay takes, and is signed by the clock it
+    // stated if the relay is a configured source. A timed heartbeat then asks for the
+    // relay's clock by echo, so it is measured at once rather than a heartbeat later.
+    if let Some(outcome) = link.send(&[link.pace.heartbeat()]).await? {
+        return Ok(outcome);
+    }
+    while link.pace.told.is_none() {
+        if let Some(outcome) = heard(context, &mut link.pace, link.records.recv().await)? {
+            return Ok(outcome);
+        }
     }
     if let Some(outcome) = link.send_owed().await? {
         return Ok(outcome);
@@ -1914,21 +2593,25 @@ async fn publish<S: tokio::io::AsyncWrite>(
             batch = batches.recv() => match batch {
                 Ok(batch) => {
                     let Record::Batch(signed) = &*batch else { continue };
+                    // Not this relay's to take: not sent. Whatever its clock, one that is goes,
+                    // at its turn.
                     if !context.ledger.routes(&relay.key, signed) {
                         None
-                    } else if link.pace.admit(signed.as_bytes().len(), Instant::now()) {
+                    } else if let Some(outcome) = link.paced(signed.as_bytes().len()).await? {
+                        Some(outcome)
+                    } else {
                         let ended = link.send(&[Arc::clone(&batch)]).await?;
                         if ended.is_none() {
-                            context.ledger.record(relay.key, signed);
+                            context.ledger.record(relay.key, signed, context.clocks.now_ms());
                         }
                         ended
-                    } else {
-                        None
                     }
                 }
-                // Batches this session could not keep up with are gone; gaps say so.
+                // Batches this session could not keep up with are gone; gaps say so, and the
+                // health counts them.
                 Err(broadcast::error::RecvError::Lagged(count)) => {
                     lagged += count;
+                    context.health.lagged(count);
                     None
                 }
                 Err(broadcast::error::RecvError::Closed) => return Err("source ended".to_owned()),
@@ -1944,7 +2627,10 @@ async fn publish<S: tokio::io::AsyncWrite>(
             changed = owed.changed() => {
                 if changed.is_ok() { link.send_owed().await? } else { None }
             }
-            _ = heartbeat.tick() => link.send(&[Record::Heartbeat]).await?,
+            _ = heartbeat.tick() => {
+                let beat = link.pace.heartbeat();
+                link.send(&[beat]).await?
+            }
             _ = refresh.tick() => {
                 let mut out: Vec<Arc<Record>> = directory
                     .resign()
@@ -1954,14 +2640,16 @@ async fn publish<S: tokio::io::AsyncWrite>(
                 if out.is_empty() { None } else { link.send(&out).await? }
             }
             _ = report.tick() => {
-                if link.pace.skipped > 0 || lagged > 0 {
+                if lagged > 0 {
                     eprintln!(
-                        "tally-feed: relay {}: {} batches over its rate limit and {lagged} it was \
-                         too slow for were not sent to it",
-                        relay.address, link.pace.skipped
+                        "tally-feed: relay {}: {lagged} batches it was too slow for were not sent \
+                         to it",
+                        relay.address
                     );
-                    link.pace.skipped = 0;
                     lagged = 0;
+                }
+                if let Some(off) = link.pace.clock.as_ref().and_then(Telling::disagreement_ms) {
+                    eprintln!("tally-feed: {}", disagreeing(&relay.address, off));
                 }
                 None
             }
@@ -1970,7 +2658,46 @@ async fn publish<S: tokio::io::AsyncWrite>(
         if let Some(outcome) = ended {
             return Ok(outcome);
         }
+        // A restated clock is measured by an echo of its own round trip, asked at once.
+        if std::mem::take(&mut link.pace.asking) {
+            let beat = link.pace.heartbeat();
+            if let Some(outcome) = link.send(&[beat]).await? {
+                return Ok(outcome);
+            }
+        }
     }
+}
+
+/// What the feeder says when its clock is `off_ms` outside the clock of the relay at `relay`
+/// (`Telling::disagreement_ms`): positive ahead of it.
+pub fn disagreeing(relay: &str, off_ms: i64) -> String {
+    let secs = off_ms.unsigned_abs().div_ceil(1_000);
+    let way = if off_ms > 0 { "ahead of" } else { "behind" };
+    format!(
+        "your clock disagrees with relay {relay} by {secs} s ({way} it); every batch is still \
+         sent, and the relay judges whether it can use it"
+    )
+}
+
+/// What the health says of a relay `relay` whose freshness anchor was `off_ms` outside the
+/// feeder's trusted reference as it heard it (positive below it, negative above it), more than an
+/// honest relay's can be (RFC-0171 §3.6, `tally_wire::budget::anchor_outside`).
+pub fn anchor_disagreeing(relay: &str, off_ms: i64) -> String {
+    let secs = off_ms.unsigned_abs().div_ceil(1_000);
+    let way = if off_ms > 0 { "behind" } else { "ahead of" };
+    format!(
+        "relay {relay}'s anchor disagrees with your reference (your configured relays, or this \
+         host synced) by {secs} s ({way} it); its anchors are left out of your batches"
+    )
+}
+
+/// What the health says while the feeder has carried no anchor for `secs` seconds and has signed
+/// `unanchored` batches with none since it started: no relay can use them (RFC-0171 §3.6).
+pub fn anchorless(secs: u64, unanchored: u64) -> String {
+    format!(
+        "carrying no anchor for {secs}s, data unusable at every relay ({unanchored} batches \
+         signed unanchored); a relay states one while its clock is synced"
+    )
 }
 
 /// `wait` with the backoff's jitter, so feeders started together do not check together.
@@ -1981,11 +2708,16 @@ fn jittered(wait: Duration) -> Duration {
 }
 
 /// A relay closing a session or refusing one. Full, leaving or refusing is "leave me": the relay
-/// declared it will not carry this feeder now. Anything else is retried.
-fn goodbye(reason: Reason, retry_after_secs: u32) -> Outcome {
+/// declared it will not carry this feeder now. Anything else is retried, an older relay's clock
+/// refusal among it.
+fn goodbye(reason: Reason, retry_after_secs: u32, clock_retry: Duration) -> Outcome {
     let wait = Duration::from_secs(retry_after_secs.into());
     match reason {
         Reason::Full | Reason::Leaving | Reason::Refused => Outcome::Leave(wait),
+        // No relay of this version sends it (RFC-0171 §3.6): an older one's, or one minted to
+        // say it, is retried like any other end, after at least the protocol's minute; a short
+        // session ended so is held against its relay like any short session (`Ends`).
+        Reason::Clock => Outcome::Retry(wait.max(clock_retry)),
         _ => Outcome::Retry(wait),
     }
 }
@@ -1993,7 +2725,7 @@ fn goodbye(reason: Reason, retry_after_secs: u32) -> Outcome {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::source::Batcher;
+    use crate::source::{Batcher, wall_ms};
 
     /// How long a test waits for the event it asserts before calling it a hang: a guard on a
     /// feeder that never gets there, never a verdict on how fast the machine running the test is.
@@ -2037,7 +2769,7 @@ mod tests {
             Vec::new(),
             Identity::generate().map_err(|error| error.to_string())?,
             Some(exact),
-            Clock::Dump1090,
+            (Clock::Dump1090, Arc::default()),
         )?;
         let announced = directory.info().borrow().clone();
         let Some(site) = announced.site.as_deref() else {
@@ -2059,7 +2791,7 @@ mod tests {
             Vec::new(),
             Identity::generate().map_err(|error| error.to_string())?,
             location,
-            Clock::Dump1090,
+            (Clock::Dump1090, Arc::default()),
         )
     }
 
@@ -2244,7 +2976,7 @@ mod tests {
             Vec::new(),
             identity,
             None,
-            Clock::Dump1090,
+            (Clock::Dump1090, Arc::default()),
         )
     }
 
@@ -2342,6 +3074,76 @@ mod tests {
         .map_err(|error| error.to_string())
     }
 
+    /// Everything the feeder signs or judges against a relay's clock but its batches goes by the
+    /// clock its batches are signed by (`RelayClocks::now_ms`): a host an hour ahead whose one
+    /// seed is heard at true time issues its description and site at true time, so no relay's
+    /// credit refuses them as an hour ahead, and judges an offer's expiry by true time, so it
+    /// keeps one alive for ten minutes more. Before, both read the host's own clock: the
+    /// description was issued an hour ahead and the offer taken for expired.
+    #[test]
+    fn a_host_an_hour_ahead_signs_and_judges_by_the_selected_clock() -> Result<(), String> {
+        const HOUR: u64 = 3_600_000;
+        let error = |error: tally_wire::WireError| error.to_string();
+        let real = wall_ms();
+        let wall = Arc::new(std::sync::atomic::AtomicU64::new(real + HOUR));
+        let monotonic = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let seed = Identity::from_seed([61; 32]).public();
+        let clocks = Arc::new(
+            RelayClocks::on(crate::source::HostClock::set_by(&wall, &monotonic)).configured([seed]),
+        );
+        let directory = Directory::new(
+            scratch(),
+            Vec::new(),
+            Vec::new(),
+            Identity::generate().map_err(|error| error.to_string())?,
+            Some(SITE),
+            (Clock::Dump1090, Arc::clone(&clocks)),
+        )?;
+        let issued = |announcement: &Announcement| -> Result<u64, String> {
+            let Record::ReceiverInfo(info) = &*announcement.info else {
+                return Err("no description".into());
+            };
+            info.issued_ms().map_err(error)
+        };
+        // Nothing heard: the host's clock as read is all there is.
+        assert_eq!(issued(&directory.info().borrow())?, real + HOUR);
+        let heard = clocks.session(seed);
+        let asked = heard.asking_ms();
+        heard.echoed(asked, real, real, Some(0));
+        let latest = directory.resign().ok_or("not signed")?;
+        let at = issued(&latest)?;
+        assert!(
+            at <= real && at + 1_000 >= real,
+            "issued at {at}, true time {real}"
+        );
+        let Some(Record::ReceiverSite(site)) = latest.site.as_deref() else {
+            return Err("no site".into());
+        };
+        assert_eq!(site.content().map_err(error)?.issued_ms, at);
+        // An offer alive for ten minutes by true time, expired by the host's clock: kept.
+        let provider = Identity::from_seed([62; 32]);
+        let offer = ProviderOffer::sign(
+            &provider,
+            &tally_wire::directory::ProviderOfferContent {
+                address: "provider.example:10900".to_owned(),
+                cell: Region::containing(&SITE, 0).map_err(error)?,
+                products: Streams::RAW,
+                stripes_of: 1,
+                stripes: 1,
+                mlat_cores: 0,
+                feeder_slots: 1,
+                network: 0,
+                issued_ms: real,
+                expires_ms: real + 600_000,
+            },
+        )
+        .map_err(error)?;
+        directory.offered(seed, offer);
+        assert_eq!(directory.offers().len(), 1);
+        drop(heard);
+        Ok(())
+    }
+
     fn address_of(directory: &Directory, key: &PublicKey) -> Option<String> {
         directory
             .known()
@@ -2387,7 +3189,7 @@ mod tests {
         );
         // Both the new address and the owner's are probed; the new first.
         let probed: Vec<String> = directory
-            .probe_set(&[])
+            .probe_set(&[], &[])
             .into_iter()
             .filter(|relay| relay.key == owner.key)
             .map(|relay| relay.address)
@@ -2412,7 +3214,7 @@ mod tests {
         // A newer offer naming the owner's address again moves it back, with no fallback left.
         directory.offered(passer, own_offer(&moving, &owner.address, now + 2)?);
         let probed: Vec<RelayAddress> = directory
-            .probe_set(&[])
+            .probe_set(&[], &[])
             .into_iter()
             .filter(|relay| relay.key == owner.key)
             .collect();
@@ -2447,7 +3249,7 @@ mod tests {
         );
         assert_eq!(from(&again, Source::Learned(seed.public())), vec![learned]);
         let probed: Vec<String> = again
-            .probe_set(&[])
+            .probe_set(&[], &[])
             .into_iter()
             .filter(|relay| relay.key == owner.key)
             .map(|relay| relay.address)
@@ -2498,16 +3300,72 @@ mod tests {
         let owner = relays("owner", 2)?;
         let directory = directory_at(scratch(), owner.clone())?;
         directory.learn(key()?, &relays("learned", 30)?);
-        let set = directory.probe_set(&[]);
+        // Unheard, the owner's relays are the clock's sources, probed beside discovery's round.
+        let set = directory.probe_set(&[], &[]);
+        assert_eq!(set.len(), 2 + MOST_PER_ROUND);
+        assert_eq!(set[..2], owner[..]);
+        // Heard, they take discovery's first places, within its round.
+        let heard: Vec<PublicKey> = owner.iter().map(|relay| relay.key).collect();
+        let set = directory.probe_set(&[], &heard);
         assert_eq!(set.len(), MOST_PER_ROUND);
         assert_eq!(set[..2], owner[..]);
         // Asked to leave, the owner's relay is not probed until its wait has passed.
         directory.avoid(&owner[0].key, Duration::from_secs(600));
         assert!(
             !directory
-                .probe_set(&[])
+                .probe_set(&[], &[])
                 .iter()
                 .any(|relay| relay.key == owner[0].key)
+        );
+        Ok(())
+    }
+
+    /// The round 13 sweep's probe, over the number of offers: every configured relay unheard (the
+    /// owner's) is probed in every round however many relays offer the feeder's area, each a key
+    /// minted for it. They are the clock's sources, probed outside discovery's cut. Before, they
+    /// came after every relay held or offering in that cut, and twenty minted offers left them out
+    /// of most rounds.
+    #[test]
+    fn no_number_of_offers_lowers_how_often_configured_relays_are_probed() -> Result<(), String> {
+        let owner = relays("owner", 2)?;
+        let mut rates = Vec::new();
+        for offers in [0usize, 1, 5, 13, 20, 40, 100] {
+            let directory = Directory::new(
+                scratch(),
+                owner.clone(),
+                Vec::new(),
+                Identity::generate().map_err(|error| error.to_string())?,
+                Some(Location {
+                    lat_e7: 0,
+                    lon_e7: 0,
+                    alt_m: 0,
+                    precision_m: 1_000,
+                }),
+                (Clock::Dump1090, Arc::default()),
+            )?;
+            let hinter = key()?;
+            let now = wall_ms();
+            for at in 0..offers {
+                let minted = Identity::generate().map_err(|error| error.to_string())?;
+                directory.offered(
+                    hinter,
+                    own_offer(&minted, &format!("minted-{at}.example:10900"), now)?,
+                );
+            }
+            let rounds = 100;
+            let probed = (0..rounds)
+                .filter(|_| {
+                    let set = directory.probe_set(&[], &[]);
+                    owner
+                        .iter()
+                        .all(|configured| set.iter().any(|relay| relay.key == configured.key))
+                })
+                .count();
+            rates.push((offers, probed));
+        }
+        assert!(
+            rates.iter().all(|(_, probed)| *probed == 100),
+            "rounds probing every configured relay, by offers: {rates:?}"
         );
         Ok(())
     }
@@ -2516,7 +3374,10 @@ mod tests {
     fn a_relay_hiding_behind_a_lying_location_is_still_probed() -> Result<(), String> {
         // Many relays outrank it for the first places (the owner's, last round's band), and it
         // offers no cell near the feeder: the random places still find it within a few rounds.
-        let directory = directory_at(scratch(), relays("owner", 3)?)?;
+        let owner = relays("owner", 3)?;
+        // The owner's relays heard, so every place is discovery's.
+        let heard: Vec<PublicKey> = owner.iter().map(|relay| relay.key).collect();
+        let directory = directory_at(scratch(), owner)?;
         let band: Vec<RelayAddress> = relays("band", 20)?;
         directory.learn(key()?, &band[..10]);
         directory.learn(key()?, &band[10..]);
@@ -2532,7 +3393,7 @@ mod tests {
         const ROUNDS: usize = 3_000;
         let mut found = 0;
         for _ in 0..ROUNDS {
-            let set = directory.probe_set(&band_keys);
+            let set = directory.probe_set(&band_keys, &heard);
             assert_eq!(set.len(), MOST_PER_ROUND);
             assert!(
                 set[..first].iter().all(|relay| relay.key != hidden.key),
@@ -2555,14 +3416,49 @@ mod tests {
         Pace::new(ceiling, Arc::new(WantedCeilings::default()).session())
     }
 
+    /// The seconds from `start` at which `pace` lets each of `count` batches of `bytes` go, each
+    /// waiting its turn after the one before, as a session sends them.
+    fn turns(pace: &mut Pace, count: usize, bytes: usize, start: Instant) -> Vec<f64> {
+        let mut at = start;
+        (0..count)
+            .map(|_| {
+                loop {
+                    let wait = pace.wait(bytes, at);
+                    if wait.is_zero() {
+                        break;
+                    }
+                    at += wait;
+                }
+                at.duration_since(start).as_secs_f64()
+            })
+            .collect()
+    }
+
+    /// A relay that asks nothing, or as much as the batcher signs at the owner's ceiling or more,
+    /// is paced at the ceiling as the batcher signs at it (`source::signed_most`): a burst of batches goes out at that rate, a
+    /// second of it at once, never all at once. Before, it was not paced at all, and a backlog an
+    /// anchor's return released went out over the ceiling in one go.
     #[test]
-    fn a_relay_that_asked_nothing_is_not_paced() {
-        let mut pace = pace(64_000);
-        let now = Instant::now();
-        assert!((0..100).all(|_| pace.admit(noise::MAX_PLAINTEXT, now)));
-        // A relay asking for the ceiling or more asks for nothing.
-        pace.limit(64_000, 0, None);
-        assert!((0..100).all(|_| pace.admit(noise::MAX_PLAINTEXT, now)));
+    fn a_relay_that_asked_nothing_is_paced_at_the_ceiling() {
+        const CEILING: u32 = 64_000;
+        let signed = crate::source::signed_most(CEILING);
+        let most = f64::from(signed);
+        for asked in [None, Some(signed), Some(u32::MAX)] {
+            let mut pace = pace(CEILING);
+            if let Some(rate) = asked {
+                pace.limit(rate, 0, None);
+            }
+            let start = Instant::now();
+            let bytes = noise::MAX_PLAINTEXT;
+            let sent = turns(&mut pace, 100, bytes, start);
+            let last = sent.last().copied().unwrap_or_default();
+            // A hundred whole batches at the rate, the first second's at once.
+            let expected = (100.0 * bytes as f64 - most.max(bytes as f64)) / most;
+            assert!(
+                (last - expected).abs() < 0.1,
+                "{asked:?}: the last went at {last} s, not {expected} s"
+            );
+        }
     }
 
     /// What a relay states of its wanted receptions a second is the batcher's to
@@ -2585,33 +3481,77 @@ mod tests {
         drop(second);
     }
 
+    /// A relay's stated clock (`RateLimit`'s `clock_ms` and `error_ms`) is its session's source
+    /// for the batcher's clocks (`source::RelayClocks`), uncertain by the time since the
+    /// session's Hello; a relay that states none is no source. Before, the statement was an
+    /// offset with no uncertainty and no error.
     #[test]
-    fn a_relay_that_asked_for_less_gets_fewer_batches_never_none() {
+    fn a_sessions_relay_clock_is_told_to_the_batcher() {
+        let wall = Arc::new(std::sync::atomic::AtomicU64::new(1_000_000));
+        let monotonic = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        // A relay the owner configured (`--relay`): a configured clock source.
+        let relay = Identity::from_seed([3; 32]).public();
+        let clocks = Arc::new(
+            RelayClocks::on(crate::source::HostClock::set_by(&wall, &monotonic))
+                .configured([relay]),
+        );
+        let hello = tokio::time::Instant::now();
+        let mut pace = Pace::new(64_000, Arc::new(WantedCeilings::default()).session())
+            .telling(clocks.session(relay), hello);
+        // The relay and this host (unsynced, within `E`) meet: the batches are signed at the low
+        // end of where they do, the relay's statement less the handshake and its error.
+        pace.clock(Some(1_005_000), Some(100));
+        let handshake = u64::try_from(hello.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let signed = clocks.now_ms();
+        assert!(signed < 1_005_000 - 100, "{signed}");
+        assert!(signed + 100 + handshake + 1 >= 1_005_000, "{signed}");
+        drop(pace);
+        // Gone with its session: this host alone, unsynced, is held over by the clock last taken.
+        assert_eq!(clocks.now_ms(), signed);
+        let mut quiet = Pace::new(64_000, Arc::new(WantedCeilings::default()).session())
+            .telling(clocks.session(relay), hello);
+        quiet.clock(None, None);
+        assert_eq!(clocks.now_ms(), signed);
+    }
+
+    /// A relay that asked for less than the ceiling gets every batch, each waiting its turn at
+    /// the rate it asked for, none skipped. Before, a batch over its rate was skipped and counted,
+    /// and a backlog an anchor's return released was skipped but for one burst.
+    #[test]
+    fn a_relay_that_asked_for_less_gets_every_batch_at_its_rate() {
         let mut pace = pace(64_000);
         pace.limit(16_000, 1_000, None);
         let start = Instant::now();
         let batch = 48 * 1024 + 4_000;
-        let mut sent = Vec::new();
-        for second in 0..600 {
-            if pace.admit(batch, start + Duration::from_secs(second)) {
-                sent.push(second);
-            }
-        }
-        // About a third of a batch a second, and never a long silence.
-        assert!((150..=250).contains(&sent.len()), "{} sent", sent.len());
-        assert_eq!(pace.skipped, 600 - sent.len() as u64);
-        assert!(sent.windows(2).all(|pair| pair[1] - pair[0] <= 5));
-        assert_eq!(sent.first(), Some(&0));
+        let sent = turns(&mut pace, 60, batch, start);
+        assert_eq!(sent.len(), 60);
+        assert_eq!(sent.first().copied(), Some(0.0));
+        // Past the burst (a whole batch at least), one batch a little over three seconds, each
+        // after the one before, never sooner.
+        let each = batch as f64 / 16_000.0;
+        assert!(sent[1] < each, "{sent:?}");
+        assert!(
+            sent[1..]
+                .windows(2)
+                .all(|pair| (pair[1] - pair[0] - each).abs() < 0.01),
+            "{sent:?}"
+        );
     }
 
+    /// A batch signed now, as a live feeder signs one: the publisher sends it before it outlives
+    /// the backlog a relay takes (`outlived`).
     fn batch(feeder: &Identity, sequence: u64) -> Result<Batch, String> {
+        batch_at(feeder, sequence, wall_ms())
+    }
+
+    fn batch_at(feeder: &Identity, sequence: u64, wall_ms: u64) -> Result<Batch, String> {
         Batch::sign(
             feeder,
             &tally_wire::BatchContent {
                 boot_id: 1,
                 sequence,
                 counter_epoch: 0,
-                wall_ms: 1,
+                wall_ms,
                 dropped: 0,
                 previous: [0; 32],
                 observations: Vec::new(),
@@ -2632,7 +3572,7 @@ mod tests {
             let batch = batch(&feeder, sequence)?;
             for relay in [audited, other] {
                 assert!(ledger.routes(&relay, &batch));
-                ledger.record(relay, &batch);
+                ledger.record(relay, &batch, wall_ms());
             }
         }
         ledger.audit(audited);
@@ -2641,7 +3581,7 @@ mod tests {
             let batch = batch(&feeder, sequence)?;
             for relay in [audited, other] {
                 if ledger.routes(&relay, &batch) {
-                    ledger.record(relay, &batch);
+                    ledger.record(relay, &batch, wall_ms());
                 }
             }
             if !ledger.routes(&other, &batch) {
@@ -2693,7 +3633,7 @@ mod tests {
             let batch = large(sequence)?;
             for relay in [audited, other] {
                 if ledger.routes(&relay, &batch) {
-                    ledger.record(relay, &batch);
+                    ledger.record(relay, &batch, wall_ms());
                 }
             }
             let _ = ledger.take_owed(&other);
@@ -2730,7 +3670,7 @@ mod tests {
             let batch = batch(&feeder, sequence)?;
             assert!(!ledger.routes(&other, &batch));
             if ledger.routes(&audited, &batch) && sequence != 2 {
-                ledger.record(audited, &batch);
+                ledger.record(audited, &batch, wall_ms());
             }
         }
         assert!(!changes.has_changed().map_err(|error| error.to_string())?);
@@ -2753,7 +3693,7 @@ mod tests {
             let batch = batch(&feeder, sequence)?;
             assert!(!ledger.routes(&other, &batch));
             if ledger.routes(&audited, &batch) {
-                ledger.record(audited, &batch);
+                ledger.record(audited, &batch, wall_ms());
             }
         }
         ledger.live(audited, false);
@@ -2764,6 +3704,200 @@ mod tests {
             .map(Batch::sequence)
             .collect();
         assert_eq!(owed, vec![8, 9, 10, 11]);
+        Ok(())
+    }
+
+    /// A configured relay's clock poll is reset by any probe answer it gives (a round's or a
+    /// poll's): unheard again later, it is polled from `CLOCK_POLL_FIRST`, not at the interval
+    /// the polls it missed before had grown to. Before, an answer reset nothing, so a seed that
+    /// was down an hour and came back was polled every five minutes from then on.
+    #[test]
+    fn any_probe_answer_resets_a_seeds_poll() -> Result<(), String> {
+        let seed = relay("seed.example:10900")?;
+        let mut polls = ClockPolls::default();
+        let mut at = tokio::time::Instant::now();
+        for _ in 0..6 {
+            let due = polls.due(vec![seed.clone()], at);
+            assert_eq!(due.len(), 1);
+            at = polls.next().ok_or("no poll next")?;
+        }
+        assert_eq!(polls.polls[&seed.key].1, ROUND_EVERY);
+        polls.answered(&[Probed {
+            measured: crate::probe::tests::measured(seed.key, 20, 4, 1),
+            hints: Vec::new(),
+            clock: None,
+        }]);
+        // Unheard again: due at once, and again `CLOCK_POLL_FIRST` after.
+        assert_eq!(polls.due(vec![seed.clone()], at).len(), 1);
+        assert_eq!(polls.next(), Some(at + CLOCK_POLL_FIRST));
+        Ok(())
+    }
+
+    /// What an ended audit owes a relay is never dropped with a session or a relay: a session
+    /// that ends before it has sent them all owes the rest to its relay again, the one cut short
+    /// among them, oldest first and ahead of anything owed since (`Ledger::owe_again`); and a
+    /// relay replaced hands what it was owed to the relays in its place (`Ledger::hand_owed`).
+    /// Before, `take_owed` took them all and a session that ended early dropped the rest, and a
+    /// replaced relay's were never sent.
+    #[test]
+    fn owed_batches_outlive_their_session_and_their_relay() -> Result<(), String> {
+        let feeder = Identity::generate().map_err(|error| error.to_string())?;
+        let (audited, other, successor, another) = (key()?, key()?, key()?, key()?);
+        let ledger = Ledger::default();
+        ledger.live(audited, true);
+        ledger.live(other, true);
+        assert!(ledger.routes(&other, &batch(&feeder, 0)?));
+        ledger.audit(audited);
+        for sequence in 2..6 {
+            let batch = batch(&feeder, sequence)?;
+            assert!(!ledger.routes(&other, &batch));
+        }
+        assert_eq!(ledger.end_audit(), 4);
+        let sequences =
+            |batches: Vec<Batch>| -> Vec<u64> { batches.iter().map(Batch::sequence).collect() };
+        // A session took them and sent one before it ended; the rest are owed again, before one
+        // owed since.
+        let mut taken = ledger.take_owed(&other);
+        assert!(ledger.take_owed(&other).is_empty());
+        let rest = taken.split_off(1);
+        ledger.audit(audited);
+        assert!(!ledger.routes(&other, &batch(&feeder, 9)?));
+        ledger.live(audited, false);
+        assert_eq!(ledger.end_audit(), 1);
+        ledger.owe_again(other, rest);
+        assert_eq!(sequences(ledger.take_owed(&other)), vec![3, 4, 5, 9]);
+        // Replaced: what it was owed goes to each relay in its place, and only to them.
+        ledger.owe_again(other, vec![batch(&feeder, 10)?]);
+        let changes = ledger.owed_changes();
+        ledger.hand_owed(&other, &[successor, another]);
+        assert!(changes.has_changed().map_err(|error| error.to_string())?);
+        assert!(ledger.take_owed(&other).is_empty());
+        assert_eq!(sequences(ledger.take_owed(&successor)), vec![10]);
+        assert_eq!(sequences(ledger.take_owed(&another)), vec![10]);
+        Ok(())
+    }
+
+    /// RFC-0171 §3.6: what a relay that keeps failing is owed stays bounded. The feeder audits
+    /// another relay through it again and again, and each session of it ends: what it is owed
+    /// stays within `OWED_KEPT` however many audits end, whether it is replaced with no successor
+    /// (the list is kept, bounded) or hands the list on (the publisher's replacement of it is
+    /// `a_relay_saying_goodbye_for_its_clock_every_session_is_replaced`). Before, its owed list grew
+    /// by every audit.
+    #[test]
+    fn what_a_relay_that_keeps_failing_is_owed_stays_bounded() -> Result<(), String> {
+        let feeder = Identity::generate().map_err(|error| error.to_string())?;
+        let (audited, minted, successor) = (key()?, key()?, key()?);
+        let ledger = Ledger::default();
+        ledger.live(audited, true);
+        ledger.live(minted, true);
+        let mut sequence = 0;
+        for round in 0..200 {
+            ledger.audit(audited);
+            // The audit holds back the `SAMPLED` sequences from the newest seen plus two.
+            let held_last = if round == 0 { 0 } else { sequence + 1 } + SAMPLED as u64 - 1;
+            for _ in 0..SAMPLED + 2 {
+                let _ = ledger.routes(&minted, &batch(&feeder, sequence)?);
+                sequence += 1;
+            }
+            ledger.live(audited, false);
+            assert!(ledger.end_audit() <= SAMPLED);
+            ledger.live(audited, true);
+            if round % 2 == 0 {
+                // Replaced with no relay to take its place: still owed, within the bound.
+                ledger.hand_owed(&minted, &[]);
+            } else {
+                let taken = ledger.take_owed(&minted);
+                ledger.owe_again(minted, taken);
+            }
+            let owed = ledger.take_owed(&minted);
+            assert!(
+                !owed.is_empty() && owed.len() <= OWED_KEPT,
+                "{}",
+                owed.len()
+            );
+            // The newest are kept: the oldest go first.
+            assert_eq!(owed.last().map(Batch::sequence), Some(held_last));
+            ledger.owe_again(minted, owed);
+        }
+        ledger.hand_owed(&minted, &[successor]);
+        assert!(ledger.take_owed(&minted).is_empty());
+        let handed = ledger.take_owed(&successor);
+        assert_eq!(handed.len(), OWED_KEPT);
+        Ok(())
+    }
+
+    /// A session that ends while it sends what it was owed (its relay says goodbye under a send
+    /// it is not reading) gives back every batch it did not finish sending, so its next session,
+    /// or its successor, sends them. Before, they were dropped.
+    #[tokio::test]
+    async fn a_session_ended_while_sending_its_owed_batches_owes_them_still() -> Result<(), String>
+    {
+        let directory = directory_at(scratch(), Vec::new())?;
+        // A pipe narrower than one batch: a send the relay does not read waits.
+        let (session, mut relay_end, relay_key) = pipe(64).await?;
+        let context = context(directory, relay_key, "relay.example:10900");
+        let ledger = Arc::clone(&context.ledger);
+        let (feeder, audited) = (Identity::generate().map_err(|e| e.to_string())?, key()?);
+        ledger.live(audited, true);
+        ledger.live(relay_key, true);
+        ledger.audit(audited);
+        for sequence in 0..3 {
+            assert!(!ledger.routes(&relay_key, &batch(&feeder, sequence)?));
+        }
+        assert_eq!(ledger.end_audit(), 3);
+        let (_out, batches) = broadcast::channel(64);
+        let (records_in, mut records) = mpsc::channel(16);
+        let version = session.version;
+        let mut writer = session.writer;
+        let running = tokio::spawn(async move {
+            publish(
+                &context,
+                version,
+                tokio::time::Instant::now(),
+                &mut writer,
+                &mut records,
+                batches,
+            )
+            .await
+        });
+        // Read what goes before the greeting is asked for, then read no more.
+        loop {
+            let mut got = Vec::new();
+            tokio::time::timeout(HANG, relay_end.reader.recv(&mut got))
+                .await
+                .map_err(|_| "no heartbeat came".to_owned())?
+                .map_err(|error| error.to_string())?;
+            if got
+                .iter()
+                .any(|record| matches!(record, Record::TimedHeartbeat(_) | Record::Heartbeat))
+            {
+                break;
+            }
+        }
+        let _ = records_in.try_send(Ok(vec![greeting()]));
+        // It took what it is owed to send, and waits under the first.
+        tokio::time::timeout(HANG, async {
+            while ledger.held().1 > 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .map_err(|_| "the session never took what it was owed".to_owned())?;
+        let _ = records_in.try_send(Ok(vec![Record::Goodbye {
+            reason: Reason::Full,
+            retry_after_secs: 60,
+        }]));
+        let ended = tokio::time::timeout(HANG, running)
+            .await
+            .map_err(|_| "the session did not end".to_owned())?
+            .map_err(|error| error.to_string())?;
+        assert!(matches!(ended, Ok(Outcome::Leave(_))), "{ended:?}");
+        let owed: Vec<u64> = ledger
+            .take_owed(&relay_key)
+            .iter()
+            .map(Batch::sequence)
+            .collect();
+        assert_eq!(owed, vec![0, 1, 2]);
         Ok(())
     }
 
@@ -2803,7 +3937,7 @@ mod tests {
         let swallower = echo_relay(relay("127.0.1.1", 1, 1_000_000, false)?).await?;
         let honest = echo_relay(relay("127.0.2.1", 2, 1_000_000, true)?).await?;
         let reserve = echo_relay(relay("127.0.3.1", 3, 1, true)?).await?;
-        let feeder = Identity::generate().map_err(error)?;
+        let feeder = Arc::new(Identity::generate().map_err(error)?);
         let dir = scratch();
         let directory = Directory::new(
             dir.clone(),
@@ -2811,12 +3945,12 @@ mod tests {
             Vec::new(),
             feeder.clone(),
             Some(location),
-            Clock::Dump1090,
+            (Clock::Dump1090, Arc::default()),
         )?;
         let area = directory.area().ok_or("no area")?;
         // Two members of the area's sharing group, which take no feeder.
         for (ip, network) in [("127.0.11.1", 11), ("127.0.12.1", 12)] {
-            let identity = Identity::generate().map_err(error)?;
+            let identity = Arc::new(Identity::generate().map_err(error)?);
             let member = echo_relay(Fake {
                 ip,
                 answers_from: Some(Arc::clone(&group)),
@@ -2850,6 +3984,7 @@ mod tests {
             batches: batches.clone(),
             ceiling: 64_000,
             wanted: Arc::default(),
+            clocks: Arc::default(),
             checker: DeliveryChecker::load(&dir),
             checking: Checking {
                 every: Duration::from_secs(1),
@@ -2866,6 +4001,7 @@ mod tests {
             },
             source_address: None,
             health: Arc::default(),
+            pacing: Pacing::default(),
         }));
         let sending = tokio::spawn(async move {
             for sequence in 0.. {
@@ -2914,7 +4050,7 @@ mod tests {
         buffer: usize,
     ) -> Result<(noise::Session<Pipe>, noise::Session<Pipe>, PublicKey), String> {
         let error = |error: tally_wire::WireError| error.to_string();
-        let feeder = Identity::generate().map_err(error)?;
+        let feeder = Arc::new(Identity::generate().map_err(error)?);
         let relay_identity = Identity::generate().map_err(error)?;
         let relay_key = relay_identity.public();
         let (near, far) = tokio::io::duplex(buffer);
@@ -2930,6 +4066,18 @@ mod tests {
         Ok((session, accepted.session, relay_key))
     }
 
+    /// What a relay first says to a feeder (`publish` sends no batch before it): a rate at no
+    /// ceiling, and no clock.
+    fn greeting() -> Record {
+        Record::RateLimit {
+            bytes_per_sec: u32::MAX,
+            burst: u32::MAX,
+            wanted_per_sec: None,
+            clock_ms: None,
+            error_ms: None,
+        }
+    }
+
     fn context(directory: Arc<Directory>, key: PublicKey, address: &str) -> Context {
         Context {
             relay: RelayAddress {
@@ -2941,7 +4089,10 @@ mod tests {
             ceiling: 64_000,
             area: None,
             wanted: Arc::default(),
+            clocks: Arc::default(),
             source_address: None,
+            clock_retry: CLOCK_RETRY,
+            health: Arc::default(),
         }
     }
 
@@ -2977,11 +4128,20 @@ mod tests {
         let (session, relay_end, relay_key) = pipe(1 << 20).await?;
         let (out, batches) = broadcast::channel(64);
         let (records_in, mut records) = mpsc::channel(16);
+        let _ = records_in.try_send(Ok(vec![greeting()]));
         let context = context(directory, relay_key, "relay.example:10900");
         let version = version.unwrap_or(session.version);
         let mut writer = session.writer;
         let running = tokio::spawn(async move {
-            publish(&context, version, &mut writer, &mut records, batches).await
+            publish(
+                &context,
+                version,
+                tokio::time::Instant::now(),
+                &mut writer,
+                &mut records,
+                batches,
+            )
+            .await
         });
         Ok((running, relay_end.reader, out, records_in))
     }
@@ -3023,8 +4183,8 @@ mod tests {
         let error = |error: tally_wire::WireError| error.to_string();
         let directory = directory_at(scratch(), Vec::new())?;
         let (running, mut reader, out, _records_in) = publishing(directory).await?;
-        let feeder = Identity::generate().map_err(error)?;
-        let mut batcher = Batcher::new(feeder, u32::MAX, Clock::Dump1090);
+        let feeder = Arc::new(Identity::generate().map_err(error)?);
+        let mut batcher = Batcher::new(feeder, u32::MAX, Clock::Dump1090).always_anchored();
         for counter in 1..200u64 {
             let frame = tally_wire::Frame::new(
                 tally_wire::FrameKind::ModeSLong,
@@ -3049,7 +4209,10 @@ mod tests {
             {
                 running.abort();
                 assert_eq!(arrived, sealed);
-                assert_eq!(arrived.format(), tally_wire::batch::BATCH_FORMAT_DEFLATE);
+                assert_eq!(
+                    arrived.format(),
+                    tally_wire::batch::BATCH_FORMAT_ANCHORED_DEFLATE
+                );
                 arrived.verify().map_err(error)?;
                 assert_eq!(arrived.content().map_err(error)?.observations.len(), 199);
                 return Ok(());
@@ -3061,7 +4224,7 @@ mod tests {
     async fn a_feeder_at_its_ceiling_delivers_every_batch_to_a_relay_that_asked_nothing()
     -> Result<(), String> {
         let error = |error: tally_wire::WireError| error.to_string();
-        let feeder = Identity::generate().map_err(error)?;
+        let feeder = Arc::new(Identity::generate().map_err(error)?);
         let relay_identity = Identity::generate().map_err(error)?;
         let relay_key = relay_identity.public();
         let (near, far) = tokio::io::duplex(1 << 20);
@@ -3077,17 +4240,26 @@ mod tests {
             .map_err(error)?;
         let directory = directory_at(scratch(), Vec::new())?;
         let (out, batches) = broadcast::channel(64);
-        let (_records_in, mut records) = mpsc::channel(16);
+        let (records_in, mut records) = mpsc::channel(16);
+        let _ = records_in.try_send(Ok(vec![greeting()]));
         let context = context(directory, relay_key, "relay.example:10900");
         let version = session.version;
         let mut writer = session.writer;
         let publishing = tokio::spawn(async move {
-            publish(&context, version, &mut writer, &mut records, batches).await
+            publish(
+                &context,
+                version,
+                tokio::time::Instant::now(),
+                &mut writer,
+                &mut records,
+                batches,
+            )
+            .await
         });
         // Batches as big as the batcher seals them, each a large part of the second's ceiling even
         // compressed: each message is noise (splitmix64 of its counter), which DEFLATE barely
         // shrinks.
-        let mut batcher = Batcher::new(feeder, u32::MAX, Clock::Dump1090);
+        let mut batcher = Batcher::new(feeder, u32::MAX, Clock::Dump1090).always_anchored();
         let frame = |counter: u64| {
             let mix = |x: u64| {
                 let x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
@@ -3135,6 +4307,448 @@ mod tests {
         Ok(())
     }
 
+    /// RFC-0171 §3.6: possession never depends on a clock. A batch the session held longer than
+    /// its relay uses one, one signed far ahead of every clock, and the ones between all go: the
+    /// relay alone judges whether it can use each, and holds what it cannot use. Before, a
+    /// session withheld what it judged too old or too far ahead, so a feeder with a wrong clock
+    /// delivered nothing.
+    #[tokio::test]
+    async fn every_batch_goes_whatever_its_clock() -> Result<(), String> {
+        let directory = directory_at(scratch(), Vec::new())?;
+        let (running, mut reader, out, _records_in) = publishing(directory).await?;
+        let feeder = Identity::generate().map_err(|error| error.to_string())?;
+        let now = wall_ms();
+        let hour = 3_600_000;
+        let signed = [
+            now - hour,
+            now - tally_wire::budget::B
+                .span::<tally_wire::clocks::Judged>()
+                .ms()
+                - 3_000,
+            now,
+            now + tally_wire::budget::F
+                .span::<tally_wire::clocks::Judged>()
+                .ms()
+                + 1,
+            now + hour,
+        ];
+        for (sequence, at) in signed.into_iter().enumerate() {
+            let _ = out.send(Arc::new(Record::Batch(batch_at(
+                &feeder,
+                sequence as u64,
+                at,
+            )?)));
+        }
+        let mut sequences = Vec::new();
+        let deadline = tokio::time::Instant::now() + HANG;
+        while sequences.len() < signed.len() {
+            let mut got = Vec::new();
+            tokio::time::timeout_at(deadline, reader.recv(&mut got))
+                .await
+                .map_err(|_| format!("only {sequences:?} arrived"))?
+                .map_err(|error| error.to_string())?;
+            for record in got {
+                if let Record::Batch(batch) = record {
+                    sequences.push(batch.sequence());
+                }
+            }
+        }
+        running.abort();
+        assert_eq!(sequences, vec![0, 1, 2, 3, 4]);
+        Ok(())
+    }
+
+    /// The first `Record::Batch` the relay's end reads, with every timed heartbeat the feeder
+    /// sent before it.
+    async fn first_batch(
+        reader: &mut noise::Reader<Pipe>,
+        mut beat: impl FnMut(tally_wire::HeartbeatTimes),
+    ) -> Result<Batch, String> {
+        // One deadline for the whole wait: heartbeats keep coming, so a wait per read would never
+        // end on a batch that never comes.
+        let deadline = tokio::time::Instant::now() + HANG;
+        loop {
+            let mut got = Vec::new();
+            tokio::time::timeout_at(deadline, reader.recv(&mut got))
+                .await
+                .map_err(|_| "no batch arrived".to_owned())?
+                .map_err(|error| error.to_string())?;
+            for record in got {
+                match record {
+                    Record::Batch(batch) => return Ok(batch),
+                    Record::TimedHeartbeat(times) => beat(times),
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    /// RFC-0171 §3.6: an unsynced relay (one stating its error unbounded) still receives every
+    /// batch, whatever its stated clock: here it states a clock 200 s ahead, and a batch signed
+    /// now and one signed by its clock both go, and the session goes on. Its sample is ignored
+    /// (its error is past `E`). Before, a session judged each batch by the relay's stated clock
+    /// and withheld the one signed now.
+    #[tokio::test]
+    async fn an_unsynced_relay_still_receives_every_batch() -> Result<(), String> {
+        let directory = directory_at(scratch(), Vec::new())?;
+        let (session, mut relay_end, relay_key) = pipe(1 << 20).await?;
+        let context = context(directory, relay_key, "relay.example:10900");
+        let ahead_by = 200_000;
+        let stated = Record::RateLimit {
+            bytes_per_sec: u32::MAX,
+            burst: u32::MAX,
+            wanted_per_sec: None,
+            clock_ms: Some(wall_ms() + ahead_by),
+            error_ms: Some(u64::MAX),
+        };
+        let (out, batches) = broadcast::channel(64);
+        let (records_in, mut records) = mpsc::channel(16);
+        let _ = records_in.try_send(Ok(vec![stated]));
+        let feeder = Identity::generate().map_err(|error| error.to_string())?;
+        let now = wall_ms();
+        let _ = out.send(Arc::new(Record::Batch(batch_at(&feeder, 0, now)?)));
+        let _ = out.send(Arc::new(Record::Batch(batch_at(
+            &feeder,
+            1,
+            now + ahead_by,
+        )?)));
+        let version = session.version;
+        let mut writer = session.writer;
+        let running = tokio::spawn(async move {
+            publish(
+                &context,
+                version,
+                tokio::time::Instant::now(),
+                &mut writer,
+                &mut records,
+                batches,
+            )
+            .await
+        });
+        let first = first_batch(&mut relay_end.reader, |_| {}).await?;
+        let second = first_batch(&mut relay_end.reader, |_| {}).await?;
+        assert_eq!((first.sequence(), second.sequence()), (0, 1));
+        assert!(!running.is_finished(), "the session ended over a clock");
+        running.abort();
+        drop(records_in);
+        Ok(())
+    }
+
+    /// RFC-0171 §3.6: a synced relay stating a clock an hour off this feeder's (a relay whose
+    /// host was set wrong, or this feeder's own clock wrong): the feeder withholds nothing from it
+    /// (a batch signed by its own clock and one signed by the relay's both go), the session goes
+    /// on, and its health reports the disagreement. Nothing it says of its clock replaces it.
+    /// An older relay's clock goodbye is a retry like any other: a long session is dialled
+    /// again, and a short one is held against it as any short session is (`Ends`). The relay holds
+    /// every batch as possession and passes it on to its peers, which judge it by their own
+    /// clocks (the relay's own tests). Before, a relay that refused a batch the session's
+    /// measure said it promised to take was replaced after three.
+    #[tokio::test]
+    async fn a_relay_stating_a_clock_an_hour_off_is_sent_everything_and_never_replaced()
+    -> Result<(), String> {
+        const HOUR: u64 = 3_600_000;
+        let directory = directory_at(scratch(), Vec::new())?;
+        let (session, mut relay_end, relay_key) = pipe(1 << 20).await?;
+        let clocks: Arc<RelayClocks> = Arc::default();
+        let context = Context {
+            clocks: Arc::clone(&clocks),
+            ..context(directory, relay_key, "relay.example:10900")
+        };
+        let stated = Record::RateLimit {
+            bytes_per_sec: u32::MAX,
+            burst: u32::MAX,
+            wanted_per_sec: None,
+            clock_ms: Some(wall_ms() + HOUR),
+            error_ms: Some(0),
+        };
+        let (out, batches) = broadcast::channel(64);
+        let (records_in, mut records) = mpsc::channel(16);
+        let _ = records_in.try_send(Ok(vec![stated]));
+        let feeder = Identity::generate().map_err(|error| error.to_string())?;
+        let now = wall_ms();
+        for (sequence, at) in [now, now + HOUR, now - HOUR].into_iter().enumerate() {
+            let _ = out.send(Arc::new(Record::Batch(batch_at(
+                &feeder,
+                sequence as u64,
+                at,
+            )?)));
+        }
+        let version = session.version;
+        let mut writer = session.writer;
+        let running = tokio::spawn(async move {
+            publish(
+                &context,
+                version,
+                tokio::time::Instant::now(),
+                &mut writer,
+                &mut records,
+                batches,
+            )
+            .await
+        });
+        let mut sequences = Vec::new();
+        for _ in 0..3 {
+            sequences.push(first_batch(&mut relay_end.reader, |_| {}).await?.sequence());
+        }
+        assert_eq!(sequences, vec![0, 1, 2]);
+        assert!(!running.is_finished(), "the session ended over a clock");
+        // The health's word: this feeder's clock is an hour behind the relay's.
+        let disagree = clocks.disagreements();
+        assert_eq!(disagree.len(), 1, "{disagree:?}");
+        assert_eq!(disagree[0].0, relay_key);
+        assert!(disagree[0].1 < -3_500_000, "{disagree:?}");
+        // An older relay's clock goodbye: a retry like any other, the same relay again after at
+        // least the protocol's minute; whether it counts against the relay is the run of ends
+        // (`Ends`), as for any other reason.
+        let _ = records_in.try_send(Ok(vec![Record::Goodbye {
+            reason: Reason::Clock,
+            retry_after_secs: 60,
+        }]));
+        let ended = tokio::time::timeout(HANG, running)
+            .await
+            .map_err(|_| "the session did not end".to_owned())?
+            .map_err(|error| error.to_string())?;
+        assert!(
+            matches!(ended, Ok(Outcome::Retry(wait)) if wait == CLOCK_RETRY),
+            "{ended:?}"
+        );
+        assert_eq!(after(&ended), Next::Redial { wait: CLOCK_RETRY });
+        Ok(())
+    }
+
+    /// RFC-0171 §3.6: a Pi whose clock is an hour behind, unsynced, with one seed: before the seed
+    /// is heard it signs by its own clock, an hour old, and every batch still goes; the relay
+    /// holds them as possession, unused. Once the seed states its clock the selection flips to
+    /// it mid-session, and that blames no one: the session goes on, sending every batch, and the
+    /// relay's fate is no clock's. Before, the session withheld every batch an hour old, and the
+    /// Pi delivered nothing; then a relay that refused after the flip was counted a broken
+    /// promise.
+    #[tokio::test]
+    async fn a_pi_an_hour_behind_with_one_seed_still_sends_every_batch() -> Result<(), String> {
+        const HOUR: u64 = 3_600_000;
+        let directory = directory_at(scratch(), Vec::new())?;
+        let (session, mut relay_end, relay_key) = pipe(1 << 20).await?;
+        let real = wall_ms();
+        let wall = Arc::new(std::sync::atomic::AtomicU64::new(real - HOUR));
+        let monotonic = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let clocks = Arc::new(
+            RelayClocks::on(crate::source::HostClock::set_by(&wall, &monotonic))
+                .configured([relay_key]),
+        );
+        let context = Context {
+            clocks: Arc::clone(&clocks),
+            ..context(directory, relay_key, "relay.example:10900")
+        };
+        let (out, batches) = broadcast::channel(64);
+        let (records_in, mut records) = mpsc::channel(16);
+        let _ = records_in.try_send(Ok(vec![greeting()]));
+        let feeder = Identity::generate().map_err(|error| error.to_string())?;
+        // Signed by the Pi's own clock, the seed not yet heard: an hour old.
+        assert_eq!(clocks.now_ms(), real - HOUR);
+        for sequence in 0..3 {
+            let _ = out.send(Arc::new(Record::Batch(batch_at(
+                &feeder,
+                sequence,
+                clocks.now_ms(),
+            )?)));
+        }
+        let version = session.version;
+        let mut writer = session.writer;
+        let running = tokio::spawn(async move {
+            publish(
+                &context,
+                version,
+                tokio::time::Instant::now(),
+                &mut writer,
+                &mut records,
+                batches,
+            )
+            .await
+        });
+        let mut sequences = Vec::new();
+        for _ in 0..3 {
+            sequences.push(first_batch(&mut relay_end.reader, |_| {}).await?.sequence());
+        }
+        assert_eq!(sequences, vec![0, 1, 2]);
+        // The seed answers the session's timed heartbeat with its clock, the real time: the Pi
+        // signs by it from now on (the seed is its one source; an unsynced host never votes), and
+        // a batch so signed is one the seed promised to take.
+        let asked = u64::try_from(clocks.anchored_ms()).unwrap_or(0);
+        let _ = records_in.try_send(Ok(vec![Record::TimedHeartbeat(
+            tally_wire::HeartbeatTimes {
+                sent_ms: wall_ms(),
+                echo: Some((asked, wall_ms())),
+                error_ms: Some(0),
+            },
+        )]));
+        let stated = tokio::time::Instant::now();
+        while clocks.now_ms() < real - HOUR / 2 {
+            tokio::time::timeout_at(stated + HANG, tokio::task::yield_now())
+                .await
+                .map_err(|_| "the seed's clock was never selected".to_owned())?;
+        }
+        let _ = out.send(Arc::new(Record::Batch(batch_at(
+            &feeder,
+            3,
+            clocks.now_ms(),
+        )?)));
+        assert_eq!(
+            first_batch(&mut relay_end.reader, |_| {}).await?.sequence(),
+            3
+        );
+        // And one signed by the Pi's old clock after the flip, still on its way: it goes too.
+        let _ = out.send(Arc::new(Record::Batch(batch_at(&feeder, 4, real - HOUR)?)));
+        assert_eq!(
+            first_batch(&mut relay_end.reader, |_| {}).await?.sequence(),
+            4
+        );
+        assert!(!running.is_finished(), "the flip ended the session");
+        running.abort();
+        drop(records_in);
+        Ok(())
+    }
+
+    /// A session sends no batch before its relay's greeting states the rate it takes and the
+    /// clock it judges by (`RateLimit`), and asks that clock by a timed heartbeat at once. Then
+    /// every batch goes, in order, whatever the stated clock: here it is 100 s behind, and the
+    /// batch signed by this host's clock 30 s ago still goes first.
+    #[tokio::test]
+    async fn no_batch_goes_before_the_relays_greeting() -> Result<(), String> {
+        let directory = directory_at(scratch(), Vec::new())?;
+        let (session, mut relay_end, relay_key) = pipe(1 << 20).await?;
+        let context = context(directory, relay_key, "relay.example:10900");
+        let (out, batches) = broadcast::channel(64);
+        let (records_in, mut records) = mpsc::channel(16);
+        let feeder = Identity::generate().map_err(|error| error.to_string())?;
+        let now = wall_ms();
+        let behind_by = 100_000;
+        let _ = out.send(Arc::new(Record::Batch(batch_at(&feeder, 0, now - 30_000)?)));
+        let version = session.version;
+        let mut writer = session.writer;
+        let running = tokio::spawn(async move {
+            publish(
+                &context,
+                version,
+                tokio::time::Instant::now(),
+                &mut writer,
+                &mut records,
+                batches,
+            )
+            .await
+        });
+        // The timed heartbeat goes before the greeting is heard.
+        let mut asked = false;
+        loop {
+            let mut got = Vec::new();
+            tokio::time::timeout(HANG, relay_end.reader.recv(&mut got))
+                .await
+                .map_err(|_| "no timed heartbeat arrived".to_owned())?
+                .map_err(|error| error.to_string())?;
+            for record in got {
+                match record {
+                    Record::TimedHeartbeat(times) if times.echo.is_none() => asked = true,
+                    Record::Batch(batch) => {
+                        running.abort();
+                        return Err(format!("batch {} went first", batch.sequence()));
+                    }
+                    _ => {}
+                }
+            }
+            if asked {
+                break;
+            }
+        }
+        let stated = Record::RateLimit {
+            bytes_per_sec: u32::MAX,
+            burst: u32::MAX,
+            wanted_per_sec: None,
+            clock_ms: Some(wall_ms() - behind_by),
+            error_ms: Some(0),
+        };
+        let _ = records_in.try_send(Ok(vec![stated]));
+        let _ = out.send(Arc::new(Record::Batch(batch_at(
+            &feeder,
+            1,
+            now - behind_by,
+        )?)));
+        let first = first_batch(&mut relay_end.reader, |_| {}).await?;
+        let second = first_batch(&mut relay_end.reader, |_| {}).await?;
+        running.abort();
+        assert_eq!((first.sequence(), second.sequence()), (0, 1));
+        Ok(())
+    }
+
+    /// RFC-0171 §3.6: every batch an ended audit owes a relay (`Ledger::end_audit`) goes, held
+    /// past what the relay uses or signed ahead of its clock alike: the relay judges each, and
+    /// holds what it cannot use. Before, the session withheld the two it judged by a clock.
+    #[tokio::test]
+    async fn every_owed_batch_goes_whatever_its_clock() -> Result<(), String> {
+        let directory = directory_at(scratch(), Vec::new())?;
+        let (session, mut relay_end, relay_key) = pipe(1 << 20).await?;
+        let context = context(directory, relay_key, "relay.example:10900");
+        let ledger = Arc::clone(&context.ledger);
+        let (feeder, audited) = (Identity::generate().map_err(|e| e.to_string())?, key()?);
+        ledger.live(audited, true);
+        ledger.live(relay_key, true);
+        ledger.audit(audited);
+        let now = wall_ms();
+        let held = batch_at(
+            &feeder,
+            0,
+            now - tally_wire::budget::B
+                .span::<tally_wire::clocks::Judged>()
+                .ms()
+                - 3_000,
+        )?;
+        let ahead = batch_at(
+            &feeder,
+            2,
+            now + tally_wire::budget::F
+                .span::<tally_wire::clocks::Judged>()
+                .ms(),
+        )?;
+        let within = batch_at(&feeder, 1, now)?;
+        for batch in [&held, &ahead, &within] {
+            assert!(!ledger.routes(&relay_key, batch), "not held back");
+            assert!(ledger.routes(&audited, batch));
+        }
+        assert_eq!(ledger.end_audit(), 3);
+        let (_out, batches) = broadcast::channel(64);
+        let (records_in, mut records) = mpsc::channel(16);
+        let _ = records_in.try_send(Ok(vec![greeting()]));
+        let version = session.version;
+        let mut writer = session.writer;
+        let running = tokio::spawn(async move {
+            publish(
+                &context,
+                version,
+                tokio::time::Instant::now(),
+                &mut writer,
+                &mut records,
+                batches,
+            )
+            .await
+        });
+        let mut sequences = Vec::new();
+        let deadline = tokio::time::Instant::now() + HANG;
+        while sequences.len() < 3 {
+            let mut got = Vec::new();
+            tokio::time::timeout_at(deadline, relay_end.reader.recv(&mut got))
+                .await
+                .map_err(|_| format!("only {sequences:?} arrived"))?
+                .map_err(|error| error.to_string())?;
+            for record in got {
+                if let Record::Batch(batch) = record {
+                    sequences.push(batch.sequence());
+                }
+            }
+        }
+        running.abort();
+        sequences.sort_unstable();
+        assert_eq!(sequences, vec![0, 1, 2]);
+        Ok(())
+    }
+
     /// A publishing session to a relay that completed the handshake and then stopped reading, over
     /// a pipe too small for even the first receiver info. The relay's end and the reader's sender
     /// are held for as long as the session runs.
@@ -3148,7 +4762,15 @@ mod tests {
         let context = context(directory, relay_key, "stalled.example:10900");
         let version = session.version;
         let mut writer = session.writer;
-        publish(&context, version, &mut writer, &mut records, batches).await
+        publish(
+            &context,
+            version,
+            tokio::time::Instant::now(),
+            &mut writer,
+            &mut records,
+            batches,
+        )
+        .await
     }
 
     #[tokio::test(start_paused = true)]
@@ -3192,7 +4814,15 @@ mod tests {
         let context = context(directory, relay_key, "redirecting.example:10900");
         let version = session.version;
         let mut writer = session.writer;
-        let ended = publish(&context, version, &mut writer, &mut records, batches).await;
+        let ended = publish(
+            &context,
+            version,
+            tokio::time::Instant::now(),
+            &mut writer,
+            &mut records,
+            batches,
+        )
+        .await;
         reader.abort();
         assert!(
             matches!(ended, Ok(Outcome::Leave(wait)) if wait == Duration::from_secs(600)),
@@ -3251,7 +4881,7 @@ mod tests {
             };
             fakes.push(echo_relay(fake).await?);
         }
-        let feeder = Identity::generate().map_err(error)?;
+        let feeder = Arc::new(Identity::generate().map_err(error)?);
         let directory = Directory::new(
             scratch(),
             fakes.clone(),
@@ -3263,7 +4893,7 @@ mod tests {
                 alt_m: 30,
                 precision_m: 0,
             }),
-            Clock::Dump1090,
+            (Clock::Dump1090, Arc::default()),
         )?;
         let (batches, _) = broadcast::channel(64);
         let publisher = tokio::spawn(run(Publishing {
@@ -3272,6 +4902,7 @@ mod tests {
             batches: batches.clone(),
             ceiling: 64_000,
             wanted: Arc::default(),
+            clocks: Arc::default(),
             checker: DeliveryChecker::default(),
             checking: Checking::default(),
             prober: |relay, me| {
@@ -3283,6 +4914,7 @@ mod tests {
             },
             source_address: None,
             health: Arc::default(),
+            pacing: Pacing::default(),
         }));
         let sending = tokio::spawn(async move {
             for sequence in 0.. {
@@ -3318,6 +4950,109 @@ mod tests {
         Ok(())
     }
 
+    /// RFC-0171 §3.6, the whole publisher over loopback relays: a minted relay, ranked first,
+    /// says `Goodbye{Clock}` at the first batch of every session (no relay of this version
+    /// does). Each session reached it and ended short while the session to the other relay held
+    /// stayed up, so the second in a row replaces it: the third relay takes its place and both
+    /// serving relays take batches, and the minted relay was dialled for exactly two sessions
+    /// before it was replaced, not one. Its waits are shortened (`Pacing`: the clock goodbye's
+    /// retry, and the wait to judge an end), as a loopback test's must be; the rule is the
+    /// protocol's. Before, a clock goodbye redialled the same relay for ever.
+    #[tokio::test]
+    async fn a_relay_saying_goodbye_for_its_clock_every_session_is_replaced() -> Result<(), String>
+    {
+        use crate::probe::tests::{Fake, Mode, echo_relay};
+        const LOOPBACK: Duration = Duration::from_millis(1);
+        let error = |error: tally_wire::WireError| error.to_string();
+        let (taken, mut arrivals) = mpsc::unbounded_channel();
+        let (roles, mut minted_roles) = mpsc::unbounded_channel();
+        let mut fakes = Vec::new();
+        for (ip, network, slots, mode) in [
+            ("127.0.0.1", 1, 1, Mode::Serve),
+            ("127.0.0.2", 2, 1_000_000, Mode::ClockGoodbyeOnBatch),
+            ("127.0.0.3", 3, 1, Mode::Serve),
+        ] {
+            let fake = Fake {
+                ip,
+                batches: Some(taken.clone()),
+                roles: (mode == Mode::ClockGoodbyeOnBatch).then(|| roles.clone()),
+                ..Fake::new(Identity::generate().map_err(error)?, network, slots, mode)
+            };
+            fakes.push(echo_relay(fake).await?);
+        }
+        let feeder = Arc::new(Identity::generate().map_err(error)?);
+        let directory = Directory::new(
+            scratch(),
+            fakes.clone(),
+            Vec::new(),
+            feeder.clone(),
+            Some(Location {
+                lat_e7: 339_400_000,
+                lon_e7: -1_184_000_000,
+                alt_m: 30,
+                precision_m: 0,
+            }),
+            (Clock::Dump1090, Arc::default()),
+        )?;
+        let (batches, _) = broadcast::channel(64);
+        let publisher = tokio::spawn(run(Publishing {
+            directory: Arc::clone(&directory),
+            identity: feeder.clone(),
+            batches: batches.clone(),
+            ceiling: 64_000,
+            wanted: Arc::default(),
+            clocks: Arc::default(),
+            checker: DeliveryChecker::default(),
+            checking: Checking::default(),
+            prober: |relay, me| {
+                Box::pin(async move {
+                    let mut probed = probe::probe(&relay, &me).await?;
+                    probed.measured.rtt = LOOPBACK;
+                    Ok(probed)
+                })
+            },
+            source_address: None,
+            health: Arc::default(),
+            pacing: Pacing {
+                clock_retry: Duration::from_millis(500),
+                ended_together: Duration::from_secs(1),
+            },
+        }));
+        let sending = tokio::spawn(async move {
+            for sequence in 0.. {
+                if let Ok(batch) = batch(&feeder, sequence) {
+                    let _ = batches.send(Arc::new(Record::Batch(batch)));
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        });
+        let mut heard: HashSet<PublicKey> = HashSet::new();
+        let serving: HashSet<PublicKey> = [fakes[0].key, fakes[2].key].into_iter().collect();
+        let waited = tokio::time::timeout(HANG, async {
+            while heard != serving {
+                match arrivals.recv().await {
+                    Some((relay, _)) => {
+                        heard.insert(relay);
+                    }
+                    None => return,
+                }
+            }
+        })
+        .await;
+        sending.abort();
+        publisher.abort();
+        waited.map_err(|_| format!("{} of the two serving relays took batches", heard.len()))?;
+        let mut sessions = 0;
+        while let Ok(role) = minted_roles.try_recv() {
+            if role == Role::Feeder {
+                sessions += 1;
+            }
+        }
+        // Two short sessions in a row, not one: the second replaced it.
+        assert_eq!(sessions, 2, "sessions of the minted relay");
+        Ok(())
+    }
+
     #[tokio::test]
     async fn a_feeder_that_started_before_its_relay_publishes_once_the_relay_is_up()
     -> Result<(), String> {
@@ -3334,14 +5069,14 @@ mod tests {
             ..Fake::new(Identity::generate().map_err(error)?, 1, 1, Mode::Serve)
         };
         let relay = echo_relay(fake).await?;
-        let feeder = Identity::generate().map_err(error)?;
+        let feeder = Arc::new(Identity::generate().map_err(error)?);
         let directory = Directory::new(
             scratch(),
             vec![relay.clone()],
             Vec::new(),
             feeder.clone(),
             None,
-            Clock::Dump1090,
+            (Clock::Dump1090, Arc::default()),
         )?;
         let (batches, _) = broadcast::channel(64);
         let publisher = tokio::spawn(run(Publishing {
@@ -3350,6 +5085,7 @@ mod tests {
             batches: batches.clone(),
             ceiling: 64_000,
             wanted: Arc::default(),
+            clocks: Arc::default(),
             checker: DeliveryChecker::default(),
             checking: Checking::default(),
             prober: |relay, me| {
@@ -3365,6 +5101,7 @@ mod tests {
             },
             source_address: None,
             health: Arc::default(),
+            pacing: Pacing::default(),
         }));
         let sending = tokio::spawn(async move {
             for sequence in 0.. {
@@ -3389,13 +5126,260 @@ mod tests {
         }
     }
 
+    /// One configured relay that never answers is polled for its clock on its own interval,
+    /// doubling from `CLOCK_POLL_FIRST` to `ROUND_EVERY` (NTP's poll interval), and a clock that
+    /// asks for probes never brings discovery's round forward. Over an hour the dead seed is
+    /// probed a bounded number of times, fewer in the last stretch than the first, and a relay a
+    /// hint named only by the rounds. Before, every round came 30 s after the last while the seed
+    /// was unheard, so it and the whole round were probed twice a minute for ever, on every
+    /// feeder.
+    #[tokio::test(start_paused = true)]
+    async fn a_dead_seed_is_polled_less_and_less_and_never_hastens_a_round() -> Result<(), String> {
+        static PROBES: std::sync::Mutex<Vec<(PublicKey, tokio::time::Instant)>> =
+            std::sync::Mutex::new(Vec::new());
+        let error = |error: tally_wire::WireError| error.to_string();
+        let seed = relay("127.0.0.1:9")?;
+        let hinted = relay("127.0.0.1:10")?;
+        let feeder = Arc::new(Identity::generate().map_err(error)?);
+        let directory = Directory::new(
+            scratch(),
+            vec![seed.clone()],
+            Vec::new(),
+            feeder.clone(),
+            None,
+            (Clock::Dump1090, Arc::default()),
+        )?;
+        directory.learn(seed.key, std::slice::from_ref(&hinted));
+        let wall = Arc::new(std::sync::atomic::AtomicU64::new(wall_ms()));
+        let monotonic = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let clocks = Arc::new(
+            RelayClocks::on(crate::source::HostClock::set_by(&wall, &monotonic))
+                .configured([seed.key]),
+        );
+        let (batches, _) = broadcast::channel(64);
+        let started = tokio::time::Instant::now();
+        let publisher = tokio::spawn(run(Publishing {
+            directory,
+            identity: feeder,
+            batches,
+            ceiling: 64_000,
+            wanted: Arc::default(),
+            clocks: Arc::clone(&clocks),
+            checker: DeliveryChecker::default(),
+            checking: Checking::default(),
+            prober: |relay, _| {
+                Box::pin(async move {
+                    if let Ok(mut probes) = PROBES.lock() {
+                        probes.push((relay.key, tokio::time::Instant::now()));
+                    }
+                    Err("connection refused".to_owned())
+                })
+            },
+            source_address: None,
+            health: Arc::default(),
+            pacing: Pacing::default(),
+        }));
+        // The batcher reads the clock as it signs, each second: each read with the seed unheard
+        // asks for a probe of it.
+        let hour = Duration::from_secs(3_600);
+        while started.elapsed() < hour {
+            let _ = clocks.now_ms();
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        publisher.abort();
+        let probes = PROBES.lock().map_err(|error| error.to_string())?.clone();
+        let count = |key: PublicKey, from: u64, to: u64| {
+            probes
+                .iter()
+                .filter(|(each, at)| {
+                    *each == key && (from..to).contains(&at.duration_since(started).as_secs())
+                })
+                .count()
+        };
+        let (first, last) = (count(seed.key, 0, 600), count(seed.key, 3_000, 3_600));
+        assert!(last < first, "it did not decay: {first} then {last}");
+        // Past its first polls: a round and a poll each `ROUND_EVERY` at most, with the jitter's
+        // slack, for the seed; the rounds alone for the relay a hint named.
+        let rounds = (1_800 / ROUND_EVERY.as_secs()) as usize;
+        let seed_late = count(seed.key, 1_800, 3_600);
+        assert!(
+            seed_late <= 2 * rounds + 3,
+            "{seed_late} probes of the seed"
+        );
+        let hinted_late = count(hinted.key, 1_800, 3_600);
+        assert!(hinted_late <= rounds + 2, "{hinted_late} rounds hastened");
+        let all = count(seed.key, 0, 3_600);
+        assert!(all <= 45, "{all} probes of the seed in an hour");
+        Ok(())
+    }
+
     #[test]
     fn full_leaving_and_refused_are_leave_me_and_the_rest_retry() {
         for reason in [Reason::Full, Reason::Leaving, Reason::Refused] {
-            assert!(matches!(goodbye(reason, 60), Outcome::Leave(_)));
+            assert!(matches!(
+                goodbye(reason, 60, CLOCK_RETRY),
+                Outcome::Leave(_)
+            ));
         }
         for reason in [Reason::Protocol, Reason::Version, Reason::Other(9)] {
-            assert!(matches!(goodbye(reason, 60), Outcome::Retry(_)));
+            assert!(matches!(
+                goodbye(reason, 60, CLOCK_RETRY),
+                Outcome::Retry(_)
+            ));
         }
+    }
+
+    /// A clock goodbye that says to come back at once (`retry_after_secs` 0) still waits the
+    /// protocol's minute (`CLOCK_RETRY`): before, it was redialled about once a second for ever.
+    #[test]
+    fn a_clock_goodbye_waits_at_least_the_clock_retry() {
+        assert_eq!(
+            goodbye(Reason::Clock, 0, CLOCK_RETRY),
+            Outcome::Retry(CLOCK_RETRY)
+        );
+        assert_eq!(
+            goodbye(Reason::Clock, 90, CLOCK_RETRY),
+            Outcome::Retry(Duration::from_secs(90))
+        );
+        assert_eq!(CLOCK_RETRY, Duration::from_secs(60));
+    }
+
+    /// The moment a test's ends are judged from: any instant, the judging is relative.
+    fn ends_at() -> tokio::time::Instant {
+        tokio::time::Instant::now()
+    }
+
+    /// RFC-0171 §3.6: whatever reason a relay gives, a session that reached it and ended short
+    /// counts against it, but only two in a row replace it, and only while another session stayed
+    /// up through each. One short session replaces nobody; a healthy one between clears the run.
+    /// Before, the first short session replaced its relay, so an honest relay's one bad moment
+    /// cost it every feeder.
+    #[test]
+    fn a_relay_is_replaced_after_two_short_sessions_in_a_row_while_another_stayed_up()
+    -> Result<(), String> {
+        let (relay, other) = (key()?, key()?);
+        let t0 = ends_at();
+        let stayed = |held: &(PublicKey, u64)| *held == (other, 1);
+        let mut ends = Ends::default();
+        for reason in [Reason::Clock, Reason::Protocol, Reason::Other(9)] {
+            assert_eq!(
+                after(&Ok(goodbye(reason, 90, CLOCK_RETRY))),
+                Next::Redial {
+                    wait: Duration::from_secs(90)
+                },
+                "{reason:?}"
+            );
+        }
+        let short = Span {
+            reached: true,
+            up_for: Some(HEALTHY_SESSION / 2),
+        };
+        assert!(short.short());
+        ends.ended(relay, t0, (short.short(), false), vec![(other, 1)]);
+        assert_eq!(ends.next_due(), Some(t0 + ENDED_TOGETHER));
+        assert!(
+            ends.judge(t0 + ENDED_TOGETHER - Duration::from_millis(1), stayed)
+                .is_empty()
+        );
+        assert!(
+            ends.judge(t0 + ENDED_TOGETHER, stayed).is_empty(),
+            "one short session"
+        );
+        // A healthy session clears the run: one more is again only one.
+        ends.ended(relay, t0 + HEALTHY_SESSION, (false, true), vec![(other, 1)]);
+        let t1 = t0 + HEALTHY_SESSION * 2;
+        ends.ended(relay, t1, (true, false), vec![(other, 1)]);
+        assert!(ends.judge(t1 + ENDED_TOGETHER, stayed).is_empty());
+        // The second in a row replaces it.
+        let t2 = t1 + Duration::from_secs(1);
+        ends.ended(relay, t2, (true, false), vec![(other, 1)]);
+        assert_eq!(ends.judge(t2 + ENDED_TOGETHER, stayed), vec![relay]);
+        assert_eq!(ends.next_due(), None);
+        Ok(())
+    }
+
+    /// RFC-0171 §3.6: an honest relay restarting is replaced by no feeder. Its long session ends
+    /// (healthy), and the feeder's dials while it is down never reach it (refused, timed out): none
+    /// of them counts against it, however many. Before, the first refused redial replaced it.
+    #[test]
+    fn an_honest_relay_restarting_is_replaced_by_no_one() -> Result<(), String> {
+        let (relay, other) = (key()?, key()?);
+        let t0 = ends_at();
+        let mut ends = Ends::default();
+        let long = Span {
+            reached: true,
+            up_for: Some(HEALTHY_SESSION * 60),
+        };
+        let unreached = Span::default();
+        assert!(!long.short() && !unreached.short());
+        ends.ended(
+            relay,
+            t0,
+            (long.short(), healthy(long.up_for, false)),
+            vec![(other, 1)],
+        );
+        for dial in 0..10 {
+            ends.ended(
+                relay,
+                t0 + Duration::from_secs(dial),
+                (unreached.short(), healthy(unreached.up_for, false)),
+                vec![(other, 1)],
+            );
+        }
+        assert_eq!(ends.next_due(), None);
+        assert!(ends.judge(t0 + ENDED_TOGETHER * 10, |_| true).is_empty());
+        Ok(())
+    }
+
+    /// RFC-0171 §3.6: a flap of the feeder's own network ends every session it holds together,
+    /// and blames no one, however often it happens: each end waits `ENDED_TOGETHER`, and no session
+    /// that was up when it ended stayed up. An end while an audit was in progress (dodging it)
+    /// counts only if another session stayed up; with the other relay's session up throughout, two
+    /// dodged audits replace the relay. Before, a flap during an audit replaced the audited relay
+    /// however long its session had been up.
+    #[test]
+    fn a_feeder_network_flap_replaces_no_one_and_a_dodged_audit_counts_only_beside_a_live_session()
+    -> Result<(), String> {
+        let (relay, other) = (key()?, key()?);
+        let mut ends = Ends::default();
+        let mut checker = DeliveryChecker::default();
+        let short = Span {
+            reached: true,
+            up_for: Some(Duration::from_secs(5)),
+        };
+        let mut at = ends_at();
+        for flap in 0..20 {
+            assert_eq!(checker.audit(&[relay], |_| true), Some(relay));
+            let dodged = checker.session_ended(relay);
+            assert!(dodged);
+            ends.ended(
+                relay,
+                at,
+                (short.short() || dodged, false),
+                vec![(other, flap)],
+            );
+            ends.ended(other, at, (short.short(), false), vec![(relay, flap)]);
+            // Neither session is up now: the generations that were up have ended.
+            let up_now = |held: &(PublicKey, u64)| held.1 == flap + 1;
+            assert!(ends.judge(at + ENDED_TOGETHER, up_now).is_empty(), "{flap}");
+            at += ENDED_TOGETHER * 2;
+        }
+        // Dodged audits while the other relay's session stays up: held, and two replace it.
+        let long = Some(HEALTHY_SESSION * 10);
+        for round in 0..2 {
+            assert_eq!(checker.audit(&[relay], |_| true), Some(relay));
+            let dodged = checker.session_ended(relay);
+            assert!(!healthy(long, dodged));
+            ends.ended(
+                relay,
+                at,
+                (dodged, healthy(long, dodged)),
+                vec![(other, 99)],
+            );
+            let replaced = ends.judge(at + ENDED_TOGETHER, |held| *held == (other, 99));
+            assert_eq!(replaced, if round == 1 { vec![relay] } else { Vec::new() });
+            at += ENDED_TOGETHER * 2;
+        }
+        Ok(())
     }
 }

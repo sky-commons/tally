@@ -3,51 +3,19 @@
 //! by an allocator that counts every byte asked of it, the only test in this binary so nothing
 //! else allocates while it measures.
 
-use std::alloc::{GlobalAlloc, Layout, System};
-use std::sync::atomic::{AtomicIsize, Ordering};
-
+#![allow(clippy::disallowed_methods, reason = "a test's scripted readings")]
 use tally_mlat_solver::held::{Held, Limits, SealedBins};
 use tally_mlat_solver::sim::{self, Scenario};
+use tally_wire::clocks::recorded::aligned;
 
 /// The system's allocator, counting the bytes live and the allocations.
-struct Counting;
-
-static LIVE: AtomicIsize = AtomicIsize::new(0);
-static ALLOCATIONS: AtomicIsize = AtomicIsize::new(0);
-
-// SAFETY: every call is the system allocator's, with the same arguments; the counters are atomics.
-unsafe impl GlobalAlloc for Counting {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        LIVE.fetch_add(layout.size() as isize, Ordering::Relaxed);
-        ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
-        // SAFETY: the caller's contract is the system allocator's.
-        unsafe { System.alloc(layout) }
-    }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        LIVE.fetch_sub(layout.size() as isize, Ordering::Relaxed);
-        ALLOCATIONS.fetch_sub(1, Ordering::Relaxed);
-        // SAFETY: the caller's contract is the system allocator's.
-        unsafe { System.dealloc(ptr, layout) }
-    }
-
-    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        LIVE.fetch_add(
-            new_size as isize - layout.size() as isize,
-            Ordering::Relaxed,
-        );
-        // SAFETY: the caller's contract is the system allocator's.
-        unsafe { System.realloc(ptr, layout, new_size) }
-    }
-}
-
 #[global_allocator]
-static GLOBAL: Counting = Counting;
+static GLOBAL: tally_counting::CountingAll = tally_counting::CountingAll;
 
 fn live() -> (isize, isize) {
     (
-        LIVE.load(Ordering::Relaxed),
-        ALLOCATIONS.load(Ordering::Relaxed),
+        tally_counting::CountingAll::live(),
+        tally_counting::CountingAll::allocations(),
     )
 }
 
@@ -83,7 +51,7 @@ fn a_holders_bytes_are_what_it_allocated() {
     let (before, allocations_before) = live();
     let mut held = Held::with(Limits::UNBOUNDED, 4, SealedBins::new());
     for reception in &simulation.receptions {
-        held.add_one(reception, reception.wall_ms);
+        held.add_one(reception, aligned(reception.wall_ms));
     }
     let (open, allocations) = live();
     covers(

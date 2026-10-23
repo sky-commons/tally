@@ -24,9 +24,11 @@
 //! has not caught up with; what it asserts it asserts in stamps (how fast a provisional position
 //! comes on the wall clock is `tally-load`'s to measure, a bed, `--provisional-latency`).
 
+#![allow(clippy::disallowed_methods, reason = "a test's scripted readings")]
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
+use tally_wire::clocks::recorded::judged;
 
 use tally_mlat::engine::Settings;
 use tally_mlat_solver::scope::{GRID_MS, STRIDE, Sites, WindowIndex, bin_of};
@@ -60,6 +62,12 @@ const RELAY_THREADS: tally_relay::ingest::Threads = tally_relay::ingest::Threads
 };
 
 type Result<T = ()> = std::result::Result<T, String>;
+
+/// The same key again, from its file form, for a test that hands a key over and still signs or
+/// dials as it: `Identity` is not `Clone`.
+fn twin(identity: &Identity) -> Result<Identity> {
+    Identity::from_base64(&identity.to_base64()).map_err(|error| error.to_string())
+}
 
 fn text(error: impl std::fmt::Display) -> String {
     error.to_string()
@@ -118,8 +126,8 @@ impl MlatHost for Pinned {
         self.host.sealed_bins()
     }
 
-    fn take_published(&self, now_ms: u64) -> Vec<Record> {
-        self.host.take_published(now_ms)
+    fn take_published(&self, watermark: tally_relay::products::Watermark) -> Vec<Record> {
+        self.host.take_published(watermark)
     }
 
     fn cores(&self) -> u16 {
@@ -206,10 +214,9 @@ fn areas() -> Result<Vec<Region>> {
     Ok(areas)
 }
 
+/// The wall clock now (a relay's clock started now reads it).
 fn wall_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_millis() as u64)
+    tally_relay::clock::RelayClock::system().judged().ms()
 }
 
 /// A scenario whose first 30 seconds fill the solved bins of the newest window already due by the
@@ -252,6 +259,7 @@ async fn relay(
     // Every feeder here comes from loopback: more than one host's share of connections.
     let hub = Arc::new(
         Hub::clocked(8, clock.clock(), tally_relay::sharing::Deadlines::RELAY)
+            .accepting_relays([tally_mlat_solver::sim::anchoring_relay().public()])
             .accepting_relays(relays.iter().copied())
             .max_connections_per_address(64)
             .staged(RELAY_THREADS)?,
@@ -276,11 +284,11 @@ async fn relay(
 fn pinned(identity: &Identity) -> Result<Arc<Pinned>> {
     let areas = areas()?;
     let host = HostedMlat::new(
-        identity.clone(),
+        tally_wire::Signer::new(twin(identity)?, std::sync::Arc::new(|| true)),
         7,
         Settings {
             regions: Regions::default(),
-            settle_ms: SETTLE_MS,
+            settle: tally_wire::budget::policy::<_, SETTLE_MS>(),
             threads: 4,
             capacity: tally_mlat::engine::Capacity::default(),
         },
@@ -714,7 +722,7 @@ async fn settled<T>(heard: Result<T>, stepper: tokio::task::JoinHandle<Result>) 
 async fn feeders_of_a_relay_hosting_mlat_give_its_clients_verifiable_positions_and_provisionals()
 -> Result {
     // A window has just come due, so the one `recent` fills is as young as it can be and its
-    // finals reach the precise world well inside its 90 s.
+    // finals reach the precise world well inside its 108.5 s.
     timeout(WAIT, async {
         while (bin_of(wall_ms().saturating_sub(SETTLE_MS)) - 2).rem_euclid(STRIDE) != 0 {
             tokio::time::sleep(Duration::from_millis(200)).await;
@@ -790,7 +798,7 @@ async fn raw_from_a_relay_that_solves_nothing_reaches_the_relay_that_solves_its_
     let clock = Clock::at(start_of(&simulation)?);
     let mlat = pinned(&solving)?;
     let (feeders, feeders_hub) = offering(
-        holding.clone(),
+        twin(&holding)?,
         &areas,
         64_521,
         None,
@@ -799,7 +807,7 @@ async fn raw_from_a_relay_that_solves_nothing_reaches_the_relay_that_solves_its_
     )
     .await?;
     let (solver, solver_hub) = offering(
-        solving.clone(),
+        twin(&solving)?,
         &areas,
         64_522,
         Some(Arc::clone(&mlat)),
@@ -812,14 +820,15 @@ async fn raw_from_a_relay_that_solves_nothing_reaches_the_relay_that_solves_its_
             address: feeders.address.clone(),
             key: feeders.key,
         },
-        solving.clone(),
+        tally_wire::NoiseKey::of(twin(&solving)?),
         Arc::clone(&solver_hub),
     ));
     // The feeders' relay holds the solver's verified offer, and the solver keeps its one-hop raw
     // link to it.
     timeout(WAIT, async {
         loop {
-            let now = tally_relay::network::wall_ms();
+            // By the relays' one clock, which their offers are signed and judged by.
+            let now = solver_hub.now();
             let network = solver_hub.network();
             if feeders_hub.network().directory.knows(&solver.key)
                 && !network
@@ -866,6 +875,7 @@ async fn offering(
     };
     let hub = Arc::new(
         Hub::clocked(64, clock.clock(), tally_relay::sharing::Deadlines::RELAY)
+            .accepting_relays([tally_mlat_solver::sim::anchoring_relay().public()])
             .advertising(vec![address.clone()])
             .accepting_relays(relays.iter().copied())
             .max_connections_per_address(256)
@@ -914,8 +924,8 @@ impl MlatHost for Gated {
         self.host.sealed_bins()
     }
 
-    fn take_published(&self, now_ms: u64) -> Vec<Record> {
-        self.host.take_published(now_ms)
+    fn take_published(&self, watermark: tally_relay::products::Watermark) -> Vec<Record> {
+        self.host.take_published(watermark)
     }
 
     fn cores(&self) -> u16 {
@@ -955,6 +965,7 @@ async fn member(
     // border band) and their directory checks.
     let hub = Arc::new(
         Hub::clocked(64, clock.clock(), tally_relay::sharing::Deadlines::RELAY)
+            .accepting_relays([tally_mlat_solver::sim::anchoring_relay().public()])
             .advertising(vec![address.clone()])
             .accepting_relays(relays.iter().copied())
             .max_connections_per_address(256)
@@ -968,11 +979,11 @@ async fn member(
     network.admission.configure(asn, true);
     let mlat = Arc::new(Gated {
         host: HostedMlat::new(
-            identity.clone(),
+            tally_wire::Signer::new(twin(&identity)?, std::sync::Arc::new(|| true)),
             u64::from(asn),
             Settings {
                 regions: Regions::default(),
-                settle_ms: SETTLE_MS,
+                settle: tally_wire::budget::policy::<_, SETTLE_MS>(),
                 threads: 2,
                 capacity: tally_mlat::engine::Capacity::default(),
             },
@@ -1092,8 +1103,8 @@ fn confirm_model(model: Model, raw: &Raw) -> Result<Option<Checked>> {
 ///
 /// The first 30 s of the scenario are past, fed at once and solved together once every relay
 /// holds them, as the first test holds its one relay; the rest is fed as it happens, solved
-/// provisionally under the models carried. The precise world seals a second 90 s after it, so
-/// this takes about two minutes.
+/// provisionally under the models carried. The precise world seals a second 108.5 s after it,
+/// so this takes about two minutes.
 ///
 /// It runs three relays in real time, so it states what it needs: an optimised build (Cargo's
 /// `--release`; Bazel builds it so, `crates/relay/BUILD.bazel`) and the cores the target declares.
@@ -1112,14 +1123,16 @@ async fn three_relays_share_solve_and_serve_verifiable_positions_and_both_world_
         Identity::generate().map_err(text)?,
     ];
     let joining: Vec<PublicKey> = identities[1..].iter().map(Identity::public).collect();
-    // Set to the scenario's start once it is built, then stepped (`stepping`).
-    let clock = Clock::at(0);
+    // The relays' one clock: a minute behind the wall clock while they find one another (their
+    // offers signed and judged by it), set to the scenario's start once it is built, which is
+    // ahead of that and inside the offers' lifetime, then stepped (`stepping`).
+    let clock = Clock::at(wall_ms() - 60_000);
     let mut members = Vec::new();
     for (identity, asn) in identities.iter().zip([64_501, 64_502, 64_503]) {
         let accepted = if asn == 64_501 { &joining[..] } else { &[] };
         members.push(
             member(
-                identity.clone(),
+                twin(identity)?,
                 &areas,
                 asn,
                 asn == 64_501,
@@ -1135,7 +1148,7 @@ async fn three_relays_share_solve_and_serve_verifiable_positions_and_both_world_
                 address: members[0].address.address.clone(),
                 key: members[0].address.key,
             },
-            identity.clone(),
+            tally_wire::NoiseKey::of(twin(identity)?),
             Arc::clone(&joiner.hub),
         ));
     }
@@ -1147,7 +1160,8 @@ async fn three_relays_share_solve_and_serve_verifiable_positions_and_both_world_
         loop {
             let ready = members.iter().all(|m| {
                 let network = m.hub.network();
-                let now = tally_relay::network::wall_ms();
+                // By the relay's one clock, which its offers are signed and judged by.
+                let now = m.hub.now();
                 network.selection.mlat_areas(&network.directory, now) == Regions::new(areas.clone())
                     && network.selection.raw_sources(&network.directory, now).len() >= 2
                     && network.peers.counts().1 >= 2
@@ -1166,7 +1180,7 @@ async fn three_relays_share_solve_and_serve_verifiable_positions_and_both_world_
     .map_err(|_| "the relays never found one another".to_owned())?;
 
     // The feeding starts the moment a window comes due, so the one `recent` fills is as young as
-    // it can be and its finals reach the precise world well inside its 90 s. The scenario is
+    // it can be and its finals reach the precise world well inside its 108.5 s. The scenario is
     // built, and its feeds signed, before that moment comes: a minute ahead.
     let mut at = wall_ms() + 60_000;
     while (bin_of(at.saturating_sub(SETTLE_MS)) - 2).rem_euclid(STRIDE) != 0 {
@@ -1290,7 +1304,14 @@ async fn three_relays_share_solve_and_serve_verifiable_positions_and_both_world_
     // past as fast as the relays keep up: every relay's engine is offered every receiver's batches,
     // by its own feeders, its sharing members and its one-hop raw links, before it moves past them.
     tokio::time::sleep(Duration::from_millis(at.saturating_sub(wall_ms()))).await;
-    clock.set(start_of(&simulation)?);
+    let start = start_of(&simulation)?;
+    if start < clock.now() {
+        return Err(format!(
+            "the scenario starts at {start}, before the relays' clock ({})",
+            clock.now()
+        ));
+    }
+    clock.set(start);
     let stepper = stepping(
         Arc::clone(&clock),
         members
@@ -1521,11 +1542,11 @@ async fn three_relays_share_solve_and_serve_verifiable_positions_and_both_world_
 
 /// Every relay's MLAT choice for each area, as it computes it: (relay, areas it solves).
 fn choices(members: &[Member]) -> Vec<(PublicKey, Regions)> {
-    let now = tally_relay::network::wall_ms();
     members
         .iter()
         .map(|m| {
             let network = m.hub.network();
+            let now = m.hub.now();
             (
                 m.address.key,
                 network.selection.mlat_areas(&network.directory, now),
@@ -1577,7 +1598,7 @@ impl Killable {
             };
             let made = runtime.block_on(async {
                 let made = member(
-                    identity.clone(),
+                    twin(&identity)?,
                     &areas,
                     asn,
                     false,
@@ -1591,7 +1612,7 @@ impl Killable {
                             address: upstream.address,
                             key: upstream.key,
                         },
-                        identity,
+                        tally_wire::NoiseKey::of(identity),
                         Arc::clone(&made.hub),
                     ));
                 }
@@ -1643,7 +1664,7 @@ async fn of_four_relays_three_solve_an_area_and_a_dead_one_is_replaced_by_the_ne
         let accepted = if at == 0 { joining.clone() } else { Vec::new() };
         let upstream = relays.first().map(|first| first.member.address.clone());
         relays.push(Killable::start(
-            identity.clone(),
+            twin(identity)?,
             areas.clone(),
             asn,
             accepted,
@@ -1712,7 +1733,7 @@ async fn of_four_relays_three_solve_an_area_and_a_dead_one_is_replaced_by_the_ne
             .hub
             .network()
             .selection
-            .mlat_areas(&unchosen.hub.network().directory, wall_ms())
+            .mlat_areas(&unchosen.hub.network().directory, judged(wall_ms()))
             .contains(area)
     );
 

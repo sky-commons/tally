@@ -64,7 +64,6 @@
 //!   the raw stamped at or after the step that takes its bin, so a batch that raced ahead of that
 //!   step is late exactly as one that came after it.
 
-use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
@@ -78,6 +77,8 @@ use tally_wire::{
 
 use crate::engine::{Dropped, Ingested};
 use crate::provisional::{Note, notes_of};
+use tally_wire::clocks::Mono;
+use tally_wire::footprint::{Deque, Tree};
 
 /// How far behind a boot's newest sequence a batch may still arrive (two relays, or one relay's
 /// reordering) and be used; anything older is a replay or too late to matter.
@@ -95,21 +96,32 @@ pub const ORPHAN_RECEIVERS: usize = 4_096;
 /// settling and a step). A description later than that is not coming by the same way.
 pub const ORPHAN_MS: u64 = 3_000;
 
-/// A batch waiting for its receiver's description, stamped when it came, with what its holder
-/// charged for holding it (dropped when the batch is let go).
+/// A batch waiting for its receiver's description, stamped when it came.
 struct Orphan {
     batch: Arc<Decoded>,
-    stamp_ms: u64,
-    /// What it costs its holder ([`ORPHAN_BYTES`]), within the intake's bytes a receiver.
-    bytes: usize,
-    _hold: Box<dyn Any + Send>,
 }
 
-/// What holding one batch for its description costs: its place in the queue, with its charge. Not
-/// the decode it keeps alive, which a relay charges once for its life, however many hold it
-/// (`tally_relay::budget::Store::Decoded`); the intake's room bounds how many it holds, and
+/// A receiver's batches waiting, oldest first.
+type Waiting = Deque<Orphan>;
+
+/// A receiver's place in what is held, as planned ([`Tree::bytes_per_entry`]).
+const ORPHAN_PLACE_BYTES: usize = Tree::<PublicKey, Waiting>::bytes_per_entry();
+
+/// What a receiver holding `batches` waiting for its description is held to at most within its
+/// bytes ([`Orphans::new`]): their deque, which keeps a quarter again what it holds, and its place.
+/// Not the decodes they keep alive, which a relay charges once for their life, however many hold
+/// them (`tally_relay::budget::Store::Decoded`); the room bounds how many it holds, and
 /// `ORPHAN_MS` how long.
-pub const ORPHAN_BYTES: usize = std::mem::size_of::<Orphan>() + 2 * std::mem::size_of::<usize>();
+pub const fn orphans_planned(batches: usize) -> usize {
+    Waiting::bytes_at_most(batches) + ORPHAN_PLACE_BYTES
+}
+
+/// What one more batch waiting adds to [`orphans_planned`], at most: its slot, a quarter again.
+pub const ORPHAN_PLANNED_BYTES: usize = tally_wire::footprint::vec::<Orphan>(1) * 5 / 4;
+
+/// What holding batches for their descriptions allocates whatever it holds, as planned: the root
+/// of its tree.
+pub const ORPHANS_ROOT_BYTES: usize = Tree::<PublicKey, Waiting>::bytes_planned(0);
 
 /// What holding, expiring or taking batches waiting for a description let go.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -274,43 +286,50 @@ pub struct Orphans {
     seats: Arc<Seats>,
     receivers: usize,
     bytes_per_receiver: usize,
-    held: BTreeMap<PublicKey, VecDeque<Orphan>>,
+    held: Tree<PublicKey, Waiting>,
+    /// What the receivers' deques allocate together.
+    lists: usize,
 }
 
 impl Orphans {
+    /// At most `receivers` receivers, each held to `bytes_per_receiver` ([`orphans_planned`]).
     pub fn new(seats: Arc<Seats>, receivers: usize, bytes_per_receiver: usize) -> Self {
         Self {
             seats,
             receivers,
             bytes_per_receiver,
-            held: BTreeMap::new(),
+            held: Tree::new(),
+            lists: 0,
         }
     }
 
-    /// Its room is now `bytes` in all, split evenly over its receivers: a holder whose room is
-    /// resized (a relay's `Orphans` store) says so before each hold. What it holds past a smaller
-    /// room is let go as the next batches of each receiver come.
+    /// Its room is now `bytes` in all: its tree's root, and the rest split evenly over its
+    /// receivers. A holder whose room is resized (a relay's `Orphans` store) says so before each
+    /// hold. What it holds past a smaller room is let go as the next batches of each receiver come.
     pub fn set_room(&mut self, bytes: usize) {
-        self.bytes_per_receiver = bytes / self.receivers.max(1);
+        self.bytes_per_receiver = bytes.saturating_sub(ORPHANS_ROOT_BYTES) / self.receivers.max(1);
     }
 
-    /// Holds `batch`, stamped `stamp_ms`, until its receiver's description comes or `ORPHAN_MS` of
-    /// steps pass; `hold` is asked, once room for it is made, for what its holder charges for it
-    /// (let go with it; `None` drops it, counted). The receiver's oldest go first beyond
+    /// What it allocates now: its tree and its receivers' deques. Not the decodes the batches keep
+    /// alive. Within its room ([`Orphans::set_room`]) whatever it holds, so a holder charging it
+    /// this, grown before each hold ([`Orphans::hold`]), charges what it allocates.
+    pub fn bytes(&self) -> usize {
+        self.held.bytes() + self.lists
+    }
+
+    /// Holds `batch`, by its own stamp, until its receiver's description comes or `ORPHAN_MS` of
+    /// steps pass on the monotonic clock; `grow` is asked, once room for it is made, whether its holder can charge what
+    /// it then allocates in all ([`Orphans::bytes`] once held, what was let go for it gone): false
+    /// drops it, counted. The receiver's oldest go first beyond
     /// `ORPHANS_PER_RECEIVER` or its bytes; beyond the receivers the worst drawn is let go whole
     /// for a better drawn one, and a worse drawn one is not held: each batch counted. So the
     /// receivers held are the best drawn of those that came, whatever their order, and nothing is
     /// charged past its room.
-    pub fn hold(
-        &mut self,
-        batch: &Arc<Decoded>,
-        stamp_ms: u64,
-        hold: impl FnOnce(usize) -> Option<Box<dyn Any + Send>>,
-    ) -> Orphaned {
+    pub fn hold(&mut self, batch: &Arc<Decoded>, grow: impl FnOnce(usize) -> bool) -> Orphaned {
         let mut orphaned = Orphaned::default();
         let key = batch.receiver();
-        let bytes = ORPHAN_BYTES;
-        if bytes > self.bytes_per_receiver || self.receivers == 0 {
+        let most = self.bytes_per_receiver;
+        if Waiting::new().growth() + ORPHAN_PLACE_BYTES > most || self.receivers == 0 {
             orphaned.dropped += 1;
             return orphaned;
         }
@@ -322,8 +341,10 @@ impl Orphans {
                 .max();
             match worst {
                 Some(worst) if (self.seats.draw_of(&key), key) < worst => {
-                    let gone = self.held.remove(&worst.1).map_or(0, |gone| gone.len());
-                    orphaned.dropped += gone as u64;
+                    if let Some(gone) = self.held.remove(&worst.1) {
+                        self.lists -= gone.bytes();
+                        orphaned.dropped += gone.len() as u64;
+                    }
                 }
                 _ => {
                     orphaned.dropped += 1;
@@ -331,54 +352,75 @@ impl Orphans {
                 }
             }
         }
-        let most = self.bytes_per_receiver;
-        let waiting = self.held.entry(key).or_default();
-        let mut held: usize = waiting.iter().map(|orphan| orphan.bytes).sum();
-        while waiting.len() >= ORPHANS_PER_RECEIVER || held.saturating_add(bytes) > most {
-            let Some(oldest) = waiting.pop_front() else {
+        let mut waiting = self.held.remove(&key).unwrap_or_default();
+        self.lists -= waiting.bytes();
+        // Its oldest go first, for its newest: within its count, and within its bytes with the
+        // newest's slot.
+        while waiting.len() >= ORPHANS_PER_RECEIVER
+            || waiting.bytes() + waiting.growth() + ORPHAN_PLACE_BYTES > most
+        {
+            if waiting.pop_front().is_none() {
                 break;
-            };
-            held -= oldest.bytes;
+            }
             orphaned.dropped += 1;
         }
-        match hold(bytes) {
-            Some(hold) => waiting.push_back(Orphan {
+        // What it allocates in all once it holds it, charged by the holder first: what is held
+        // now (after what was let go for it), its slot, and its receiver's place.
+        let total = Tree::<PublicKey, Waiting>::bytes_at(self.held.len() + 1)
+            + self.lists
+            + waiting.bytes()
+            + waiting.growth();
+        if grow(total) {
+            waiting.push_back(Orphan {
                 batch: Arc::clone(batch),
-                stamp_ms,
-                bytes,
-                _hold: hold,
-            }),
-            None => {
-                orphaned.dropped += 1;
-                if waiting.is_empty() {
-                    self.held.remove(&key);
-                }
-            }
+            });
+        } else {
+            orphaned.dropped += 1;
+        }
+        if !waiting.is_empty() {
+            self.lists += waiting.bytes();
+            self.held.insert(key, waiting);
         }
         orphaned
     }
 
-    /// Lets go every batch that has waited `ORPHAN_MS` by the step at `now_ms`.
-    pub fn expire(&mut self, now_ms: u64) -> Orphaned {
+    /// Lets go every batch that has waited `ORPHAN_MS` by the step at `now` on the monotonic
+    /// clock its stamps are of.
+    pub fn expire(&mut self, now: Mono) -> Orphaned {
         let mut orphaned = Orphaned::default();
+        let mut lists = 0;
         self.held.retain(|_, waiting| {
             let before = waiting.len();
-            waiting.retain(|orphan| orphan.stamp_ms.saturating_add(ORPHAN_MS) > now_ms);
+            waiting.retain(|orphan| {
+                orphan
+                    .batch
+                    .mono()
+                    .later(tally_wire::budget::policy::<_, ORPHAN_MS>())
+                    > now
+            });
             orphaned.expired += (before - waiting.len()) as u64;
-            !waiting.is_empty()
+            if waiting.is_empty() {
+                false
+            } else {
+                lists += waiting.bytes();
+                true
+            }
         });
+        self.lists = lists;
         orphaned
     }
 
-    /// The batches that waited for `receiver`'s description, oldest first, each with its stamp:
-    /// for their holder to take now that it is described (their holds let go).
-    pub fn take(&mut self, receiver: &PublicKey) -> Vec<(Arc<Decoded>, u64)> {
+    /// The batches that waited for `receiver`'s description, oldest first, each with its own
+    /// stamp: for their holder to take now that it is described (their holds let go).
+    pub fn take(&mut self, receiver: &PublicKey) -> Vec<Arc<Decoded>> {
         self.held
             .remove(receiver)
-            .map(|waiting| {
+            .map(|mut waiting| {
+                self.lists -= waiting.bytes();
                 waiting
+                    .take()
                     .into_iter()
-                    .map(|orphan| (orphan.batch, orphan.stamp_ms))
+                    .map(|orphan| orphan.batch)
                     .collect()
             })
             .unwrap_or_default()
@@ -386,7 +428,7 @@ impl Orphans {
 
     /// Batches held.
     pub fn len(&self) -> usize {
-        self.held.values().map(VecDeque::len).sum()
+        self.held.values().map(|waiting| waiting.len()).sum()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -396,6 +438,7 @@ impl Orphans {
     /// Lets every batch go (the engine they waited for went).
     pub fn clear(&mut self) {
         self.held.clear();
+        self.lists = 0;
     }
 }
 
@@ -978,25 +1021,25 @@ impl Intake {
         }
     }
 
-    /// Holds `batch`, stamped `stamp_ms`, of a receiver not described here, until its description
+    /// Holds `batch`, by its own stamp, of a receiver not described here, until its description
     /// comes or `ORPHAN_MS` of steps pass ([`Orphans::hold`]): for an engine holding its own raw.
     /// A holder that splits its receivers over many intakes keeps one [`Orphans`] for all of them
     /// instead, so room among them is decided by rank across all.
-    pub fn hold_orphan(&mut self, batch: &Arc<Decoded>, stamp_ms: u64) -> Orphaned {
+    pub fn hold_orphan(&mut self, batch: &Arc<Decoded>) -> Orphaned {
         if self.receivers.contains_key(&batch.receiver()) {
             return Orphaned::default();
         }
-        self.orphans.hold(batch, stamp_ms, |_| Some(Box::new(())))
+        self.orphans.hold(batch, |_| true)
     }
 
-    /// Lets go every batch that has waited `ORPHAN_MS` by the step at `now_ms`.
-    pub fn expire_orphans(&mut self, now_ms: u64) -> Orphaned {
-        self.orphans.expire(now_ms)
+    /// Lets go every batch that has waited `ORPHAN_MS` by the step at `now` on the monotonic clock.
+    pub fn expire_orphans(&mut self, now: Mono) -> Orphaned {
+        self.orphans.expire(now)
     }
 
     /// The batches that waited for `receiver`'s description, oldest first, each with its stamp:
     /// for its holder to take now that it is described.
-    pub fn take_orphans(&mut self, receiver: &PublicKey) -> Vec<(Arc<Decoded>, u64)> {
+    pub fn take_orphans(&mut self, receiver: &PublicKey) -> Vec<Arc<Decoded>> {
         self.orphans.take(receiver)
     }
 
@@ -1361,8 +1404,10 @@ impl Drop for Intake {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::disallowed_methods, reason = "a test's scripted readings")]
     use super::*;
     use tally_wire::Identity;
+    use tally_wire::clocks::recorded::aligned;
 
     /// `draw` of `Identity::from_seed([7; 32])`'s key.
     const KNOWN_DRAW: u128 = 0xa152b57161dad4a033a9d8cbfd33dbb0;
@@ -1667,10 +1712,12 @@ mod tests {
     /// Who waits for a description, for room, is decided by rank and never by
     /// arrival. Past the intake's receivers the worst drawn is let go for a better drawn one, and
     /// past its bytes a receiver's oldest go first, so the same batches in any order leave the
-    /// same batches held, every one let go counted, and the holder is asked for each batch's
-    /// bytes only once room is made (what it charges never passes the room it gave).
+    /// same batches held, every one let go counted, and the holder is asked for what each batch
+    /// allocates only once room is made: what it charges never passes the room it gave, and is
+    /// what the batches waiting allocate, read from an allocator counting this thread's bytes.
     #[test]
     fn who_waits_for_a_description_depends_on_who_came_never_on_the_order() -> Result<(), String> {
+        const EACH: u64 = 6;
         let senders: Vec<Identity> = (20..26u8)
             .map(|seed| Identity::from_seed([seed; 32]))
             .collect();
@@ -1688,36 +1735,45 @@ mod tests {
                 },
             )
             .map_err(|error| error.to_string())?;
-            Decoded::from_verified(signed, 1_000 + sequence, sequence)
+            Decoded::from_verified(signed, aligned(1_000 + sequence), sequence)
                 .map_err(|undecodable| undecodable.error.to_string())
         };
         let mut batches = Vec::new();
         for sender in 0..senders.len() {
-            for sequence in 0..3 {
+            for sequence in 0..EACH {
                 batches.push(batch(sender, sequence)?);
             }
         }
-        let one = ORPHAN_BYTES;
         let held = |order: &[usize]| -> (Vec<(PublicKey, u64)>, u64) {
             let seats = Seats::keyed(8, secret(4));
-            // Three receivers, two batches each.
-            let mut orphans = Orphans::new(seats, 3, 2 * one);
-            let room = 3 * 2 * one;
-            let charged = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            // Three receivers, four batches each: a full deque of four and its place.
+            let room = ORPHANS_ROOT_BYTES
+                + 3 * (tally_wire::footprint::vec::<Orphan>(4) + ORPHAN_PLACE_BYTES);
+            let mut orphans = Orphans::new(seats, 3, 0);
+            orphans.set_room(room);
+            let base = tally_counting::Counting::live();
+            let mut asked = 0;
             let mut dropped = 0;
             for at in order {
-                let charging = Arc::clone(&charged);
                 dropped += orphans
-                    .hold(&batches[*at], batches[*at].stamp_ms(), |bytes| {
-                        let now = charging.fetch_add(bytes, std::sync::atomic::Ordering::SeqCst);
-                        assert!(now + bytes <= room, "charged past the room");
-                        Some(Box::new(Release(charging, bytes)))
+                    .hold(&batches[*at], |total| {
+                        asked = asked.max(total);
+                        total <= room
                     })
                     .dropped;
+                assert!(asked <= room, "asked past the room");
+                // What a holder charges once it settles after each hold.
+                let charged = orphans.bytes();
+                assert!(charged <= room, "charged past the room");
+                let live = tally_counting::Counting::since(base);
+                assert!(
+                    live >= 0 && live as usize <= charged,
+                    "{live} allocated, {charged} charged"
+                );
             }
             let mut kept = Vec::new();
             for sender in &senders {
-                for (batch, _) in orphans.take(&sender.public()) {
+                for batch in orphans.take(&sender.public()) {
                     kept.push((batch.receiver(), batch.sequence()));
                 }
             }
@@ -1729,10 +1785,10 @@ mod tests {
             .map(|sender| (draw_under(&secret(4), &sender.public()), sender.public()))
             .collect();
         drawn.sort_unstable();
-        // The three best drawn, each its two newest.
+        // The three best drawn, each its four newest.
         let mut expected: Vec<(PublicKey, u64)> = drawn[..3]
             .iter()
-            .flat_map(|(_, key)| [(*key, 1), (*key, 2)])
+            .flat_map(|(_, key)| (EACH - 4..EACH).map(|sequence| (*key, sequence)))
             .collect();
         expected.sort_unstable();
         let mut order: Vec<usize> = (0..batches.len()).collect();
@@ -1746,8 +1802,8 @@ mod tests {
             let mut by_sender: Vec<usize> = Vec::new();
             let mut next = vec![0usize; senders.len()];
             for at in &order {
-                let sender = at / 3;
-                by_sender.push(sender * 3 + next[sender]);
+                let sender = at / EACH as usize;
+                by_sender.push(sender * EACH as usize + next[sender]);
                 next[sender] += 1;
             }
             let (kept, dropped) = held(&by_sender);
@@ -1812,15 +1868,5 @@ mod tests {
             assert_eq!(bytes, [newer.as_bytes(), theirs.as_bytes()], "{order:?}");
         }
         Ok(())
-    }
-
-    /// What a test's holder charged for a batch waiting, given back when the batch goes.
-    struct Release(Arc<std::sync::atomic::AtomicUsize>, usize);
-
-    impl Drop for Release {
-        fn drop(&mut self) {
-            self.0
-                .fetch_sub(self.1, std::sync::atomic::Ordering::SeqCst);
-        }
     }
 }

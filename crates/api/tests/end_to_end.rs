@@ -41,6 +41,12 @@ use tokio::net::{TcpListener, TcpStream};
 
 type Result<T = ()> = std::result::Result<T, String>;
 
+/// The same key again, from its file form, for a test that hands a key over and still signs or
+/// dials as it: `Identity` is not `Clone`.
+fn twin(identity: &Identity) -> Result<Identity> {
+    Identity::from_base64(&identity.to_base64()).map_err(|error| error.to_string())
+}
+
 /// How long a test waits for the event it asserts before calling it a hang: a guard on a server
 /// that never gets there, never a verdict on how fast the machine running the test is.
 const WAIT: Duration = Duration::from_secs(120);
@@ -144,7 +150,9 @@ async fn start_relay(
     let identity = Identity::generate().map_err(text)?;
     let key = identity.public();
     let hub = Arc::new(
-        Hub::clocked(8, clock.clock(), tally_relay::sharing::Deadlines::RELAY).figures_every(200),
+        Hub::clocked(8, clock.clock(), tally_relay::sharing::Deadlines::RELAY)
+            .accepting_relays([tally_mlat_solver::sim::anchoring_relay().public()])
+            .figures_every(200),
     );
     let listener = TcpListener::bind("127.0.0.1:0").await.map_err(text)?;
     let address = listener.local_addr().map_err(text)?;
@@ -173,7 +181,7 @@ fn batch(receiver: &Identity, sequence: u64, wall_ms: u64) -> Result<Batch> {
             data: vec![0x5d, 0xab, 0xcd, n, sequence as u8, 0, 0],
         })
         .collect();
-    Batch::sign(
+    anchored_batch(
         receiver,
         &BatchContent {
             boot_id: 7,
@@ -1012,6 +1020,10 @@ async fn a_stream_pushes_every_aircraft_then_what_changed_and_holds_an_address_t
     Ok(())
 }
 
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a test's stand-in feeder signs by its own host clock"
+)]
 fn wall_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1067,8 +1079,8 @@ impl MlatHost for Held {
         self.host.sealed_bins()
     }
 
-    fn take_published(&self, now_ms: u64) -> Vec<Record> {
-        self.host.take_published(now_ms)
+    fn take_published(&self, watermark: tally_relay::products::Watermark) -> Vec<Record> {
+        self.host.take_published(watermark)
     }
 
     fn cores(&self) -> u16 {
@@ -1112,15 +1124,16 @@ async fn mlat_relay(clock: &Arc<stepping::Clock>) -> Result<(RelayAddress, Arc<H
     // Every feeder here comes from loopback: more than one host's share of connections.
     let hub = Arc::new(
         Hub::clocked(8, clock.clock(), tally_relay::sharing::Deadlines::RELAY)
+            .accepting_relays([tally_mlat_solver::sim::anchoring_relay().public()])
             .max_connections_per_address(64),
     );
     let areas = tally_wire::Regions::new(areas()?);
     let host = HostedMlat::new(
-        identity.clone(),
+        tally_wire::Signer::new(twin(&identity)?, std::sync::Arc::new(|| true)),
         1,
         tally_mlat::engine::Settings {
             regions: tally_wire::Regions::default(),
-            settle_ms: SETTLE_MS,
+            settle: tally_wire::budget::policy::<_, SETTLE_MS>(),
             threads: 4,
             capacity: tally_mlat::engine::Capacity::default(),
         },
@@ -1240,7 +1253,7 @@ async fn the_api_serves_one_merged_mlat_position_per_aircraft_from_two_relays() 
     for relay in [&west, &east] {
         tokio::spawn(tally_merge::link::subscribe(
             relay.clone(),
-            Identity::generate().map_err(text)?,
+            tally_wire::NoiseKey::of(Identity::generate().map_err(text)?),
             tally_merge::link::streams(),
             inbound.clone(),
         ));
@@ -1335,4 +1348,26 @@ async fn the_api_serves_one_merged_mlat_position_per_aircraft_from_two_relays() 
         assert_eq!(mlat.check, MlatCheck::Signature);
     }
     Ok(())
+}
+
+/// `content` signed by `identity` as a feeder of this build signs it (RFC-0171 §3.6): anchored by
+/// the relay its session is to as that relay's clock read its signed time, here the simulation's
+/// anchoring relay (`tally_mlat_solver::sim::anchoring_relay`), which every relay these tests
+/// start accepts.
+fn anchored_batch(
+    identity: &Identity,
+    content: &BatchContent,
+) -> std::result::Result<Batch, tally_wire::WireError> {
+    anchored_batch_with(identity, content, tally_wire::Codec::Plain)
+}
+
+/// As `anchored_batch`, its receptions written by `codec`.
+fn anchored_batch_with(
+    identity: &Identity,
+    content: &BatchContent,
+    codec: tally_wire::Codec,
+) -> std::result::Result<Batch, tally_wire::WireError> {
+    let anchor =
+        tally_wire::Anchor::sign(&tally_mlat_solver::sim::anchoring_relay(), content.wall_ms);
+    Batch::sign_anchored(identity, content, codec, &[anchor])
 }

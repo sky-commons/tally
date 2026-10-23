@@ -3,6 +3,7 @@
 //! fabricated where an attacker would. The attack is built as only a relay could (from the raw
 //! solution and the full model), then tagged and signed as a client is sent it.
 
+#![allow(clippy::disallowed_methods, reason = "a test's scripted readings")]
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::OnceLock;
 
@@ -64,19 +65,22 @@ fn build() -> Result<World, String> {
     let now = (Window::canonical(last).last + 1) as u64 * GRID_MS + SETTLE_MS;
     let engine = Identity::from_seed([61; 32]);
     let mut running = Engine::new(
-        engine.clone(),
+        tally_wire::Signer::new(Identity::from_seed([61; 32]), std::sync::Arc::new(|| true)),
         0xb007,
         EngineSettings {
             regions: tally_wire::Regions::default(),
-            settle_ms: SETTLE_MS,
+            settle: tally_wire::budget::policy::<_, SETTLE_MS>(),
             threads: 4,
             capacity: Default::default(),
         },
     );
     for record in &raw {
-        running.ingest(record, tally_mlat::replay::sent_ms(record))?;
+        running.ingest(
+            record,
+            tally_wire::clocks::recorded::aligned(tally_mlat::replay::sent_ms(record)),
+        )?;
     }
-    let published = running.step(now, now).0;
+    let published = running.step(tally_wire::clocks::recorded::aligned(now)).0;
     let keys = simulation
         .receivers
         .iter()
@@ -300,11 +304,11 @@ fn honest_fixes_are_consistent_with_their_own_receptions() -> Result<(), String>
     let delivered = tally_mlat::replay::arrivals(&mut simulation, 7)?;
     let until = delivered.last().map_or(0, |(at, _)| *at) + 60_000;
     let mut engine = Engine::new(
-        Identity::from_seed([62; 32]),
+        tally_wire::Signer::new(Identity::from_seed([62; 32]), std::sync::Arc::new(|| true)),
         0xb007,
         EngineSettings {
             regions: tally_wire::Regions::default(),
-            settle_ms: SETTLE_MS,
+            settle: tally_wire::budget::policy::<_, SETTLE_MS>(),
             threads: 2,
             capacity: Default::default(),
         },

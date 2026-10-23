@@ -4,6 +4,7 @@
 //! not produce on their own. A case is built from an engine's raw solution, as only a relay holds
 //! it, and tagged with the receivers' reception keys, as the engine tags what it publishes.
 
+#![allow(clippy::disallowed_methods, reason = "a test's scripted readings")]
 use std::collections::BTreeMap;
 use std::sync::OnceLock;
 
@@ -84,11 +85,11 @@ fn build() -> Result<World, String> {
                 .map(|receiver| receiver.key)
                 .collect();
             let mut engine = Engine::new(
-                identity,
+                tally_wire::Signer::new(identity, std::sync::Arc::new(|| true)),
                 0xb007,
                 EngineSettings {
                     regions: tally_wire::Regions::default(),
-                    settle_ms: SETTLE_MS,
+                    settle: tally_wire::budget::policy::<_, SETTLE_MS>(),
                     threads: 4,
                     capacity: Default::default(),
                 },
@@ -99,12 +100,15 @@ fn build() -> Result<World, String> {
                     _ => true,
                 };
                 if wanted {
-                    engine.ingest(record, tally_mlat::replay::sent_ms(record))?;
+                    engine.ingest(
+                        record,
+                        tally_wire::clocks::recorded::aligned(tally_mlat::replay::sent_ms(record)),
+                    )?;
                 }
             }
-            Ok(engine.step(now, now).0)
+            Ok(engine.step(tally_wire::clocks::recorded::aligned(now)).0)
         };
-    let west = run(west_key.clone(), 0..7)?;
+    let west = run(Identity::from_seed([41; 32]), 0..7)?;
     let east = run(Identity::from_seed([42; 32]), 3..10)?;
     let keys = simulation
         .receivers
@@ -778,11 +782,11 @@ fn a_live_engines_provisionals_are_superseded_or_confirmed_by_its_finals() -> Re
     let until = delivered.last().map_or(0, |(at, _)| *at) + 60_000;
     let identity = Identity::from_seed([47; 32]);
     let mut engine = Engine::new(
-        identity.clone(),
+        tally_wire::Signer::new(Identity::from_seed([47; 32]), std::sync::Arc::new(|| true)),
         0xb007,
         EngineSettings {
             regions: tally_wire::Regions::default(),
-            settle_ms: SETTLE_MS,
+            settle: tally_wire::budget::policy::<_, SETTLE_MS>(),
             threads: 2,
             capacity: Default::default(),
         },

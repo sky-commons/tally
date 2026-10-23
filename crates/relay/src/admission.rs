@@ -8,7 +8,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
-use tally_wire::{Echo, EchoReply, EchoReplyContent, Headroom, Identity};
+use tally_wire::{Echo, EchoReply, EchoReplyContent, Headroom, Signing};
 
 use crate::egress::{Admitted, Egress};
 use crate::hub::Hub;
@@ -85,7 +85,7 @@ impl Admission {
     pub fn echo(
         &self,
         hub: &Hub,
-        identity: Option<&Identity>,
+        identity: Option<&Signing<'_>>,
         echo: Echo,
         now_ms: u64,
     ) -> Option<EchoReply> {
@@ -109,6 +109,7 @@ fn feeder_slots(egress: &Arc<Egress>) -> u32 {
 mod tests {
     use super::*;
     use crate::egress::Cap;
+    use tally_wire::Identity;
 
     #[test]
     fn with_duties_off_nothing_is_declared_and_no_feeder_is_taken() -> Result<(), String> {
@@ -118,7 +119,7 @@ mod tests {
         admission.configure(64_512, false);
         let identity = Identity::generate().map_err(|error| error.to_string())?;
         let reply = admission
-            .echo(&hub, Some(&identity), Echo { nonce: 3 }, 9)
+            .echo(&hub, Some(&identity.signing()), Echo { nonce: 3 }, 9)
             .ok_or("no reply")?;
         reply.verify().map_err(|error| error.to_string())?;
         let content = reply.content().map_err(|error| error.to_string())?;

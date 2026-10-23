@@ -116,6 +116,7 @@ pub enum ClientRecord {
         version: u16,
     },
     Heartbeat,
+    TimedHeartbeat(crate::record::HeartbeatTimes),
     Redirect {
         retry_after_secs: u32,
         hints: Vec<RelayAddress>,
@@ -125,6 +126,8 @@ pub enum ClientRecord {
         bytes_per_sec: u32,
         burst: u32,
         wanted_per_sec: Option<u32>,
+        clock_ms: Option<u64>,
+        error_ms: Option<u64>,
     },
     Goodbye {
         reason: Reason,
@@ -144,6 +147,9 @@ pub enum ClientRecord {
     FirehoseCredential(FirehoseCredential),
     EvidenceBundle(ClientEvidence),
     FeederFigures(crate::figures::FeederFigures),
+    /// A relay's freshness anchor, to its feeder (RFC-0171 §3.6): what the feeder puts in each
+    /// batch it signs.
+    Anchor(crate::anchor::Anchor),
 }
 
 impl TryFrom<Record> for ClientRecord {
@@ -154,6 +160,7 @@ impl TryFrom<Record> for ClientRecord {
         Ok(match record {
             Record::Welcome { version } => Self::Welcome { version },
             Record::Heartbeat => Self::Heartbeat,
+            Record::TimedHeartbeat(times) => Self::TimedHeartbeat(times),
             Record::Redirect {
                 retry_after_secs,
                 hints,
@@ -166,10 +173,14 @@ impl TryFrom<Record> for ClientRecord {
                 bytes_per_sec,
                 burst,
                 wanted_per_sec,
+                clock_ms,
+                error_ms,
             } => Self::RateLimit {
                 bytes_per_sec,
                 burst,
                 wanted_per_sec,
+                clock_ms,
+                error_ms,
             },
             Record::Goodbye {
                 reason,
@@ -202,6 +213,7 @@ impl TryFrom<Record> for ClientRecord {
             Record::DeliveryAnswer(answer) => Self::DeliveryAnswer(answer),
             Record::ProviderOffer(offer) => Self::ProviderOffer(offer),
             Record::FirehoseCredential(credential) => Self::FirehoseCredential(credential),
+            Record::Anchor(anchor) => Self::Anchor(anchor),
             // Relay-only, or never sent to a client at all. Listed, not a wildcard, so a new
             // record kind is a compile error here until someone decides which it is.
             other @ (Record::Hello { .. }
@@ -232,6 +244,7 @@ impl From<ClientRecord> for Record {
         match record {
             ClientRecord::Welcome { version } => Self::Welcome { version },
             ClientRecord::Heartbeat => Self::Heartbeat,
+            ClientRecord::TimedHeartbeat(times) => Self::TimedHeartbeat(times),
             ClientRecord::Redirect {
                 retry_after_secs,
                 hints,
@@ -244,10 +257,14 @@ impl From<ClientRecord> for Record {
                 bytes_per_sec,
                 burst,
                 wanted_per_sec,
+                clock_ms,
+                error_ms,
             } => Self::RateLimit {
                 bytes_per_sec,
                 burst,
                 wanted_per_sec,
+                clock_ms,
+                error_ms,
             },
             ClientRecord::Goodbye {
                 reason,
@@ -270,6 +287,7 @@ impl From<ClientRecord> for Record {
             ClientRecord::ProviderOffer(offer) => Self::ProviderOffer(offer),
             ClientRecord::FirehoseCredential(credential) => Self::FirehoseCredential(credential),
             ClientRecord::EvidenceBundle(bundle) => Self::EvidenceBundle(bundle.0),
+            ClientRecord::Anchor(anchor) => Self::Anchor(anchor),
         }
     }
 }
@@ -297,10 +315,12 @@ impl ClientRecord {
             Self::FeederFigures(figures) => (KIND_FEEDER_FIGURES, figures.as_bytes()),
             Self::Welcome { .. }
             | Self::Heartbeat
+            | Self::TimedHeartbeat(_)
             | Self::Redirect { .. }
             | Self::RelayList(_)
             | Self::RateLimit { .. }
-            | Self::Goodbye { .. } => return None,
+            | Self::Goodbye { .. }
+            | Self::Anchor(_) => return None,
         })
     }
 
@@ -318,6 +338,40 @@ impl ClientRecord {
             }
             // A few bytes each: built as a `Record` to be written.
             None => Record::from(self.clone()).encode(out),
+        }
+    }
+
+    /// What it allocates of its own beside its place, as `Record::allocated` says of a record: a
+    /// signed record its bytes' capacity, any other its lists' and strings'.
+    pub fn allocated(&self) -> usize {
+        use crate::footprint::vec;
+        match self {
+            Self::Welcome { .. }
+            | Self::Heartbeat
+            | Self::TimedHeartbeat(_)
+            | Self::RateLimit { .. }
+            | Self::Goodbye { .. }
+            | Self::Anchor(_) => 0,
+            Self::Redirect { hints, .. } | Self::RelayList(hints) => {
+                vec::<RelayAddress>(hints.capacity())
+                    + hints
+                        .iter()
+                        .map(|hint| hint.address.capacity())
+                        .sum::<usize>()
+            }
+            Self::ReceiverInfo(info) => info.0.allocated(),
+            Self::Positions(positions) | Self::Provisional(positions) => positions.0.allocated(),
+            Self::ClockModel(model) => model.allocated(),
+            Self::FaultProof(proof) => proof.0.allocated(),
+            Self::RegionalBatch(batch) => batch.allocated(),
+            Self::WorldPositions(world) => world.allocated(),
+            Self::WorldPrecise(world) => world.allocated(),
+            Self::EchoReply(reply) => reply.allocated(),
+            Self::DeliveryAnswer(answer) => answer.allocated(),
+            Self::ProviderOffer(offer) => offer.allocated(),
+            Self::FirehoseCredential(credential) => credential.allocated(),
+            Self::EvidenceBundle(bundle) => bundle.0.allocated(),
+            Self::FeederFigures(figures) => figures.allocated(),
         }
     }
 
@@ -444,8 +498,12 @@ mod tests {
                 "{relay_only:?}"
             );
         }
-        // Control converts.
+        // Control converts, a relay's anchor to its feeder among it.
         for control in [
+            Record::Anchor(crate::anchor::Anchor::sign(
+                &Identity::from_seed([5; 32]),
+                1_800_000_000_000,
+            )),
             Record::Heartbeat,
             Record::Welcome { version: 3 },
             Record::Goodbye {

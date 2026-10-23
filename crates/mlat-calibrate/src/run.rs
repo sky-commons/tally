@@ -8,6 +8,7 @@ use std::io::Write;
 use tally_mlat::engine::{Engine, Settings as EngineSettings};
 use tally_mlat_solver::publish;
 use tally_wire::batch::format;
+use tally_wire::clocks::recorded::aligned;
 use tally_wire::{
     Batch, BatchContent, Identity, Observation, PublicKey, ReceiverSite, ReceiverSiteContent,
     Record,
@@ -18,8 +19,11 @@ use crate::mapping::{self, ClockClass, Receiver, Reply, Survey};
 use crate::reference::Reference;
 use crate::score::{self, Count, Planar, Slice, Truth};
 
-/// What the relay's hosted MLAT waits after a window's last bin (`tally_relay::mlat_host`).
-pub const SETTLE_MS: u64 = 2_000;
+/// What the relay's hosted MLAT waits after a window's last bin (`tally_relay::mlat_host::SETTLE`):
+/// the error budget's `MLAT_SETTLE`, so the engine here settles as a relay's does.
+pub const SETTLE_MS: u64 = tally_wire::budget::MLAT_SETTLE
+    .span::<tally_wire::clocks::Judged>()
+    .ms();
 /// How often the virtual clock ticks: what has arrived is ingested, provisional work solved and a
 /// due window stepped.
 pub const TICK_MS: u64 = 100;
@@ -343,11 +347,14 @@ pub fn run(
         reference: Vec::new(),
         reference_chi2: Vec::new(),
         engine: Engine::new(
-            Identity::from_seed([0x17; 32]),
+            tally_wire::Signer::new(
+                Identity::from_seed([0x17; 32]),
+                std::sync::Arc::new(|| true),
+            ),
             1,
             EngineSettings {
                 regions: tally_wire::Regions::default(),
-                settle_ms: SETTLE_MS,
+                settle: tally_wire::budget::policy::<_, SETTLE_MS>(),
                 threads: settings.threads.max(1),
                 capacity: tally_mlat::engine::Capacity::default(),
             },
@@ -502,7 +509,8 @@ struct Replay {
 
 impl Replay {
     /// Every feeder signs its site at the start, as a new feeder does (relay-only: the engine is
-    /// hosted by a relay).
+    /// hosted by a relay). The virtual clock never steps, so an instant reads alike on both.
+    #[allow(clippy::disallowed_methods, reason = "a replay's instants")]
     fn describe(&mut self, start_ms: u64) -> Result<(), String> {
         for feed in self.feeds.values() {
             let site = ReceiverSite::sign(
@@ -514,7 +522,8 @@ impl Replay {
                 },
             )
             .map_err(|e| e.to_string())?;
-            self.engine.ingest(&Record::ReceiverSite(site), start_ms)?;
+            self.engine
+                .ingest(&Record::ReceiverSite(site), aligned(start_ms))?;
         }
         Ok(())
     }
@@ -603,7 +612,9 @@ impl Replay {
     }
 
     /// One tick of the virtual clock at `now`: batches due are sealed, what has arrived is
-    /// ingested, and the engine's provisional and window work is run and scored.
+    /// ingested, and the engine's provisional and window work is run and scored. The virtual clock
+    /// never steps, so an instant reads alike on both.
+    #[allow(clippy::disallowed_methods, reason = "a replay's instants")]
     fn tick(&mut self, now: u64) -> Result<(), String> {
         let mut sealed = Vec::new();
         for feed in self.feeds.values_mut() {
@@ -620,11 +631,11 @@ impl Replay {
             }
             self.arrivals.pop();
             if let Some(batch) = self.in_flight.remove(&id) {
-                self.engine.ingest(&Record::Batch(batch), at)?;
+                self.engine.ingest(&Record::Batch(batch), aligned(at))?;
             }
         }
-        let mut published = self.engine.provisional_step(now, now);
-        let (records, report) = self.engine.step(now, now);
+        let mut published = self.engine.provisional_step(aligned(now));
+        let (records, report) = self.engine.step(aligned(now));
         published.extend(records);
         add_report(&mut self.out.window, &report);
         let provisional = self.engine.provisional_report();

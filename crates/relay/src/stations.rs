@@ -17,20 +17,54 @@
 //! has no row, yet it is connected, and a report says so (`connected`, with no batch forwarded).
 //! These are bounded by the feeder connections the relay admits, and each goes with its
 //! connection, so no stranger grows them by inventing keys and none of them pushes a row out.
-
-use std::collections::HashMap;
+//! Each is charged with its connection's own state ([`CONNECTION_BYTES`], `ingest::
+//! OWN_BYTES_PER_CONNECTION`, the paces' store), and what they allocate goes as they go
+//! (`footprint::Tree`, each receiver's list exactly as long as its connections).
 
 use std::net::IpAddr;
 
 use serde::{Deserialize, Serialize};
+use tally_wire::budget::policy;
+use tally_wire::clocks::{Moment, Mono};
 use tally_wire::{PublicKey, Region};
 
 use crate::bounded::Bounded;
+use crate::footprint::Tree;
 use crate::hub::RECEIVERS_REMEMBERED;
 
-/// How many receivers' stats are held: as many as their descriptions (`RECEIVERS_REMEMBERED`). At
-/// under 300 bytes a row, about 15 MB.
+/// One open feeder connection, in its receiver's list: its id, when it opened, and the address it
+/// came from.
+type Connection = (u64, Mono, Option<IpAddr>);
+
+/// What one open feeder connection allocates in the station connections at most: its share of the
+/// tree of receivers (a tree of `n` entries is planned at no more than `n` times one's,
+/// `footprint::btree_planned`) and its place in its receiver's list, which is kept exactly as long
+/// as its connections. Charged with the connection's own state for its session
+/// (`ingest::OWN_BYTES_PER_CONNECTION`). Before, the map grew with every receiver that ever
+/// connected and was charged nowhere.
+pub const CONNECTION_BYTES: usize =
+    Tree::<PublicKey, Vec<Connection>>::bytes_planned(1) + std::mem::size_of::<Connection>();
+
+/// How many receivers' stats are held: as many as their descriptions (`RECEIVERS_REMEMBERED`),
+/// spread over the raw shards (`exchange::SHARDS`), each holding its share.
 pub const STATIONS_REMEMBERED: usize = RECEIVERS_REMEMBERED;
+
+/// What the station rows of every raw shard allocate at their cap (`Bounded::planned_bytes`), a
+/// fixed store charged whole at start (`budget::Store::Stations`), whatever the relay carries.
+/// The rows' feeder connections are each a connection's, and bounded by the connections admitted.
+pub const PLANNED_BYTES: usize = crate::exchange::SHARDS
+    * Stations::planned_bytes(STATIONS_REMEMBERED.div_ceil(crate::exchange::SHARDS));
+
+/// The station rows charged whole to `gauge` (`budget::Store::Stations`): what a hub holds for
+/// them for its life. A store whose limit is below them is charged nothing, and a start refuses it
+/// (`Hub::fixed_charged`).
+pub fn charge(gauge: &std::sync::Arc<crate::budget::Gauge>) -> crate::budget::Charge {
+    let mut charge = gauge.empty();
+    if gauge.limit() >= PLANNED_BYTES {
+        let _ = charge.try_grow(PLANNED_BYTES);
+    }
+    charge
+}
 
 /// A receiver is online while a batch of it was forwarded this recently. A feeder seals once a
 /// second, so this is many missed seals, never one slow one.
@@ -39,6 +73,8 @@ pub const ONLINE_WITHIN_MS: u64 = 30_000;
 /// Every station's report, as `GET /stations` serves it.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct StationsReport {
+    /// Unix milliseconds by the relay's judging clock as the report was made: the time every
+    /// instant in it is on.
     pub now_ms: u64,
     pub stations: Vec<StationReport>,
 }
@@ -53,7 +89,9 @@ pub struct StationReport {
     /// A feeder connection of it to this relay is open now, whether or not it sends batches.
     pub connected: bool,
     /// Unix milliseconds when the oldest of its open feeder connections to this relay opened;
-    /// `None` when none is open. Absent from a relay older than this field, read as `None`.
+    /// `None` when none is open. Every instant of a report is timed on the relay's monotonic clock
+    /// and stated on its judging clock as the report is made ([`Stations::report`]), so a step of
+    /// the host's clock between moves none of them off the report's `now_ms`. Absent from a relay older than this field, read as `None`.
     #[serde(default)]
     pub connected_since_ms: Option<u64>,
     /// How many times it has fed this relay directly: a connection that forwarded a new batch.
@@ -65,6 +103,12 @@ pub struct StationReport {
     pub batches: u64,
     /// Sequences of its current and earlier boots that were skipped and have not arrived late.
     pub gaps: u64,
+    /// Batches its feeder sent signed longer ago than this relay takes (`strikes::feeder_clock`'s
+    /// `TooOld`: a clock behind, or a batch held past the feeder's backlog), each dropped unseen:
+    /// its owner's sign that its clock is behind, since its feeder is never told. Absent from a
+    /// relay older than this field, read as 0.
+    #[serde(default)]
+    pub late_batches: u64,
     pub observations: u64,
     /// The public cell (H3 resolution 6, `Region::public_cell`, as its H3 index in hex) its newest
     /// description says it is in, if the relay holds one that says and a batch of it was
@@ -96,32 +140,44 @@ struct Tally {
     session: Option<u64>,
     /// The address `session` connected from, held only while `session` is.
     address: Option<IpAddr>,
-    first_seen_ms: u64,
-    last_seen_ms: u64,
+    first_seen: Mono,
+    last_seen: Mono,
     batches: u64,
     gaps: u64,
+    late_batches: u64,
     observations: u64,
     /// Its newest boot and the highest sequence forwarded in it.
     stream: Option<(u64, u64)>,
+    /// The last boot judged here from its feeder (not the newest: a batch of any other boot
+    /// replaces it) and the highest sequence of that boot first judged, usable or not: a batch of
+    /// that boot at or below it is a repeat (a resend, an audit's owed batch) and is never blamed
+    /// again (`first_judged`).
+    judged: Option<(u64, u64)>,
 }
 
 impl Tally {
-    fn new(now_ms: u64) -> Self {
+    fn new(now: Mono) -> Self {
         Self {
             sessions: 0,
             session: None,
             address: None,
-            first_seen_ms: now_ms,
-            last_seen_ms: now_ms,
+            first_seen: now,
+            last_seen: now,
             batches: 0,
             gaps: 0,
+            late_batches: 0,
             observations: 0,
             stream: None,
+            judged: None,
         }
     }
 
-    fn forwarded(&mut self, boot: u64, sequence: u64, observations: u64, now_ms: u64) {
-        self.last_seen_ms = self.last_seen_ms.max(now_ms);
+    fn forwarded(&mut self, boot: u64, sequence: u64, observations: u64, now: Mono) {
+        // A row made by late batches alone (`Stations::too_old`) starts at its first forwarded.
+        if self.batches == 0 {
+            self.first_seen = now;
+        }
+        self.last_seen = self.last_seen.latest(now);
         self.batches += 1;
         self.observations += observations;
         self.stream = Some(match self.stream {
@@ -143,20 +199,27 @@ impl Tally {
     fn report(
         &self,
         key: &PublicKey,
-        connected_since_ms: Option<u64>,
+        connected_since: Option<Mono>,
         address: Option<String>,
-        now_ms: u64,
+        now: Moment,
     ) -> StationReport {
+        // A row with no batch forwarded (only late ones dropped) reads as its connection does.
+        let (first_seen, last_seen) = match connected_since {
+            Some(since) if self.batches == 0 => (since, since),
+            _ => (self.first_seen, self.last_seen),
+        };
         StationReport {
             key: key.to_base64(),
-            online: now_ms.saturating_sub(self.last_seen_ms) <= ONLINE_WITHIN_MS,
-            connected: connected_since_ms.is_some(),
-            connected_since_ms,
+            online: self.batches > 0
+                && now.mono().since(self.last_seen) <= policy::<_, ONLINE_WITHIN_MS>(),
+            connected: connected_since.is_some(),
+            connected_since_ms: connected_since.map(|since| stated(since, now)),
             sessions: self.sessions,
-            first_seen_ms: self.first_seen_ms,
-            last_seen_ms: self.last_seen_ms,
+            first_seen_ms: stated(first_seen, now),
+            last_seen_ms: stated(last_seen, now),
             batches: self.batches,
             gaps: self.gaps,
+            late_batches: self.late_batches,
             observations: self.observations,
             cell: None,
             software: None,
@@ -166,7 +229,20 @@ impl Tally {
 }
 
 /// A receiver connected that has had no batch forwarded: what its report says.
-fn connected_only(key: &PublicKey, since_ms: u64, address: Option<String>) -> StationReport {
+/// An instant `at` timed on the monotonic clock, stated on the judging clock by the report's
+/// instant `now` (`Moment::at`): Unix milliseconds, as a report serves them, whatever the host's
+/// clock did since `at` was timed.
+fn stated(at: Mono, now: Moment) -> u64 {
+    now.at(at).judged().ms()
+}
+
+fn connected_only(
+    key: &PublicKey,
+    since: Mono,
+    address: Option<String>,
+    now: Moment,
+) -> StationReport {
+    let since_ms = stated(since, now);
     StationReport {
         key: key.to_base64(),
         online: false,
@@ -177,6 +253,7 @@ fn connected_only(key: &PublicKey, since_ms: u64, address: Option<String>) -> St
         last_seen_ms: since_ms,
         batches: 0,
         gaps: 0,
+        late_batches: 0,
         observations: 0,
         cell: None,
         software: None,
@@ -187,24 +264,29 @@ fn connected_only(key: &PublicKey, since_ms: u64, address: Option<String>) -> St
 pub struct Stations {
     table: Bounded<PublicKey, Tally>,
     /// The feeder connections open now, by receiver: each one's id, when it opened, and the
-    /// address it came from.
-    connections: HashMap<PublicKey, Vec<(u64, u64, Option<IpAddr>)>>,
+    /// address it came from ([`CONNECTION_BYTES`] each at most).
+    connections: Tree<PublicKey, Vec<Connection>>,
 }
 
 impl Stations {
+    /// What one shard's rows allocate at most at `capacity` rows (`Bounded::planned_bytes`).
+    pub const fn planned_bytes(capacity: usize) -> usize {
+        Bounded::<PublicKey, Tally>::planned_bytes(capacity)
+    }
+
     pub fn new(capacity: usize) -> Self {
         Self {
             table: Bounded::new(capacity),
-            connections: HashMap::new(),
+            connections: Tree::new(),
         }
     }
 
     /// When the oldest open feeder connection of `receiver` opened, if one is open.
-    fn connected_since(&self, receiver: &PublicKey) -> Option<u64> {
+    fn connected_since(&self, receiver: &PublicKey) -> Option<Mono> {
         self.connections
             .get(receiver)?
             .iter()
-            .map(|(_, opened_ms, _)| *opened_ms)
+            .map(|(_, opened, _)| *opened)
             .min()
     }
 
@@ -214,7 +296,7 @@ impl Stations {
         self.connections
             .get(receiver)?
             .iter()
-            .max_by_key(|(id, opened_ms, _)| (*opened_ms, *id))
+            .max_by_key(|(id, opened, _)| (*opened, *id))
             .and_then(|(_, _, address)| *address)
     }
 
@@ -227,22 +309,14 @@ impl Stations {
     }
 
     /// Connection `source`, its Noise handshake proving it is `receiver`'s feeder, was admitted
-    /// at `now_ms` from `address`: the receiver is connected from now until it leaves, whether or
+    /// at `now` from `address`: the receiver is connected from now until it leaves, whether or
     /// not it sends. An IPv4 client of a dual-stack socket is named as IPv4.
-    pub fn opened(
-        &mut self,
-        receiver: PublicKey,
-        source: u64,
-        now_ms: u64,
-        address: Option<IpAddr>,
-    ) {
+    pub fn opened(&mut self, receiver: PublicKey, source: u64, now: Mono, address: Option<IpAddr>) {
         let open = self.connections.entry(receiver).or_default();
         if !open.iter().any(|(id, _, _)| *id == source) {
-            open.push((
-                source,
-                now_ms,
-                address.map(|address| address.to_canonical()),
-            ));
+            // Exactly as long as its connections (`CONNECTION_BYTES`).
+            open.reserve_exact(1);
+            open.push((source, now, address.map(|address| address.to_canonical())));
         }
     }
 
@@ -253,14 +327,87 @@ impl Stations {
         boot: u64,
         sequence: u64,
         observations: u64,
-        now_ms: u64,
+        now: Mono,
     ) {
         if let Some(tally) = self.table.get_mut(&receiver) {
-            tally.forwarded(boot, sequence, observations, now_ms);
+            tally.forwarded(boot, sequence, observations, now);
             self.table.touch(&receiver);
         } else {
-            let mut tally = Tally::new(now_ms);
-            tally.forwarded(boot, sequence, observations, now_ms);
+            let mut tally = Tally::new(now);
+            tally.forwarded(boot, sequence, observations, now);
+            self.table.insert_active(receiver, tally);
+        }
+    }
+
+    /// Whether batch `(boot, sequence)` of `receiver` is judged here for the first time from its
+    /// feeder: of another boot than the last boot judged, or above the highest sequence of that
+    /// boot judged before. Its boot is then the last boot judged and its sequence the highest. A
+    /// feeder sends its batches in order, so a repeat (a resend after a stall, a batch an audit
+    /// held back) is at or below it and is blamed at most once, when it first came; a batch first
+    /// seen out of order is not blamed at all, which only undercounts. Its row made at `now` if
+    /// it has none, as `too_old` makes one.
+    ///
+    /// One boot is held, the last judged: a batch of another boot replaces it. So where a
+    /// receiver's batches of two boots interleave (a repeat of its earlier boot's batch after its
+    /// later boot's was judged), the repeat is judged anew and may be blamed again: the one case
+    /// it overcounts, bounded by the batches of the earlier boot that come again after the later
+    /// one began. Its row holds no more, so a churn of boots grows nothing.
+    pub fn first_judged(
+        &mut self,
+        receiver: PublicKey,
+        boot: u64,
+        sequence: u64,
+        now: Mono,
+    ) -> bool {
+        let Some(tally) = self.table.get_mut(&receiver) else {
+            let mut tally = Tally::new(now);
+            tally.judged = Some((boot, sequence));
+            self.table.insert_active(receiver, tally);
+            return true;
+        };
+        match tally.judged {
+            Some((held_boot, held)) if held_boot == boot && sequence <= held => false,
+            _ => {
+                tally.judged = Some((boot, sequence));
+                true
+            }
+        }
+    }
+
+    /// A batch of `receiver` its feeder signed longer ago than this relay takes was dropped at
+    /// `now` (`strikes::FeederClock::TooOld`), and blamed on it by the one rule that blames
+    /// (`blame`, `strikes::blame`, taken by value so one blame counts once): counted against it, so
+    /// its owner reads it (`late_batches`), its row made if it has none. Nothing counts a batch
+    /// against its receiver without a blame, which nothing but that rule makes:
+    ///
+    /// ```compile_fail,E0061
+    /// # fn count(stations: &mut tally_relay::stations::Stations, key: tally_wire::PublicKey, now: tally_wire::clocks::Mono) {
+    /// stations.too_old(key, now);
+    /// # }
+    /// ```
+    ///
+    /// ```compile_fail,E0603
+    /// # fn count(stations: &mut tally_relay::stations::Stations, key: tally_wire::PublicKey, now: tally_wire::clocks::Mono) {
+    /// stations.too_old(tally_relay::strikes::Blame(()), key, now);
+    /// # }
+    /// ```
+    ///
+    /// ```compile_fail,E0382
+    /// # fn count(stations: &mut tally_relay::stations::Stations, key: tally_wire::PublicKey, now: tally_wire::clocks::Mono) {
+    /// # use tally_relay::strikes::{OwnAnchor, blame};
+    /// // One blame counts once.
+    /// if let Some(blame) = blame(true, true, OwnAnchor::Absent) {
+    ///     stations.too_old(blame, key, now);
+    ///     stations.too_old(blame, key, now);
+    /// }
+    /// # }
+    /// ```
+    pub fn too_old(&mut self, _blame: crate::strikes::Blame, receiver: PublicKey, now: Mono) {
+        if let Some(tally) = self.table.get_mut(&receiver) {
+            tally.late_batches += 1;
+        } else {
+            let mut tally = Tally::new(now);
+            tally.late_batches = 1;
             self.table.insert_active(receiver, tally);
         }
     }
@@ -290,6 +437,7 @@ impl Stations {
         }
         if let Some(open) = self.connections.get_mut(receiver) {
             open.retain(|(id, _, _)| *id != source);
+            open.shrink_to_fit();
             if open.is_empty() {
                 self.connections.remove(receiver);
             }
@@ -297,29 +445,28 @@ impl Stations {
     }
 
     /// `receiver`'s report, without the public cell and software its description carries: its row,
-    /// or, connected with no batch forwarded, what its connection alone says.
-    pub fn report(&self, receiver: &PublicKey, now_ms: u64) -> Option<StationReport> {
+    /// or, connected with no batch forwarded, what its connection alone says. Its instants, timed
+    /// on the monotonic clock, are stated on the judging clock by `now`, the relay's clocks read
+    /// together as the report is made.
+    pub fn report(&self, receiver: &PublicKey, now: Moment) -> Option<StationReport> {
         let since = self.connected_since(receiver);
         match self.table.get(receiver) {
-            Some(tally) => Some(tally.report(
-                receiver,
-                since,
-                self.address_of(receiver, Some(tally)),
-                now_ms,
-            )),
-            None => {
-                since.map(|since| connected_only(receiver, since, self.address_of(receiver, None)))
+            Some(tally) => {
+                Some(tally.report(receiver, since, self.address_of(receiver, Some(tally)), now))
             }
+            None => since
+                .map(|since| connected_only(receiver, since, self.address_of(receiver, None), now)),
         }
     }
 
-    /// Every receiver held or connected, with its key, unordered.
-    pub fn reports(&self, now_ms: u64) -> Vec<(PublicKey, StationReport)> {
+    /// Every receiver held or connected, with its key, unordered, stated as [`Stations::report`]
+    /// states one.
+    pub fn reports(&self, now: Moment) -> Vec<(PublicKey, StationReport)> {
         let held = self.table.iter().map(|(key, tally)| {
             let address = self.address_of(key, Some(tally));
             (
                 *key,
-                tally.report(key, self.connected_since(key), address, now_ms),
+                tally.report(key, self.connected_since(key), address, now),
             )
         });
         let connected = self
@@ -328,7 +475,10 @@ impl Stations {
             .filter(|key| self.table.get(key).is_none())
             .filter_map(|key| {
                 let since = self.connected_since(key)?;
-                Some((*key, connected_only(key, since, self.address_of(key, None))))
+                Some((
+                    *key,
+                    connected_only(key, since, self.address_of(key, None), now),
+                ))
             });
         held.chain(connected).collect()
     }
@@ -344,13 +494,74 @@ impl Stations {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::disallowed_methods, reason = "a test's scripted readings")]
     use super::*;
     use tally_wire::Identity;
+    use tally_wire::clocks::recorded::{aligned, mono as m};
 
     fn key() -> Result<PublicKey, String> {
         Ok(Identity::generate()
             .map_err(|error| error.to_string())?
             .public())
+    }
+
+    /// What the open feeder connections allocate is within what their sessions are charged for
+    /// them, [`CONNECTION_BYTES`] each, however many receivers connected and left before (each
+    /// several times, some receivers with several connections at once); and once every
+    /// connection has left, nothing. Before, the map kept its table at the most receivers that
+    /// were ever connected at once, and nothing was charged for it.
+    #[test]
+    fn the_open_connections_allocate_within_their_charge() -> Result<(), String> {
+        use tally_counting::Counting;
+        let keys = (0..64).map(|_| key()).collect::<Result<Vec<_>, String>>()?;
+        let mut stations = Stations::new(8);
+        // The test's own list of what is open, allocated before the count starts.
+        let mut open = Vec::with_capacity(keys.len() + 8);
+        let base = Counting::live();
+        let mut source = 0;
+        for round in 0..4u64 {
+            // Every receiver once, the first eight twice over.
+            for (at, receiver) in keys.iter().chain(&keys[..8]).enumerate() {
+                source += 1;
+                stations.opened(*receiver, source, m(round * 1_000 + at as u64), None);
+                open.push((*receiver, source));
+                let live = Counting::since(base);
+                assert!(
+                    live <= (open.len() * CONNECTION_BYTES) as isize,
+                    "{live} for {} connections",
+                    open.len()
+                );
+            }
+            // Most leave; a few stay, and what they hold is within their charge.
+            for (receiver, source) in open.drain(..open.len() - 3) {
+                stations.left(&receiver, source);
+            }
+            let live = Counting::since(base);
+            assert!(
+                live <= (3 * CONNECTION_BYTES) as isize,
+                "{live} for 3 connections"
+            );
+            for (receiver, source) in open.drain(..) {
+                stations.left(&receiver, source);
+            }
+            assert_eq!(Counting::since(base), 0);
+        }
+        // One receiver with many connections at once, all but one gone: its list is as long as
+        // the one left.
+        for at in 0..64u64 {
+            stations.opened(keys[0], 1_000 + at, m(10_000 + at), None);
+        }
+        for at in 1..64u64 {
+            stations.left(&keys[0], 1_000 + at);
+        }
+        let live = Counting::since(base);
+        assert!(
+            live <= CONNECTION_BYTES as isize,
+            "{live} for one connection"
+        );
+        stations.left(&keys[0], 1_000);
+        assert_eq!(Counting::since(base), 0);
+        Ok(())
     }
 
     /// The relay counts its own traffic and computes no figure from it: a report carries counts
@@ -359,8 +570,10 @@ mod tests {
     fn a_report_carries_counts_and_no_feeder_figure() -> Result<(), String> {
         let receiver = key()?;
         let mut stations = Stations::new(8);
-        stations.forwarded(receiver, 1, 0, 5, 1_000);
-        let report = stations.report(&receiver, 2_000).ok_or("no report")?;
+        stations.forwarded(receiver, 1, 0, 5, m(1_000));
+        let report = stations
+            .report(&receiver, aligned(2_000))
+            .ok_or("no report")?;
         let json = serde_json::to_value(&report).map_err(|error| error.to_string())?;
         let fields: Vec<&str> = json
             .as_object()
@@ -386,9 +599,11 @@ mod tests {
         let mut stations = Stations::new(8);
         // One batch of 50 a second for twelve seconds, from t = 1,000 s.
         for n in 0..12 {
-            stations.forwarded(receiver, 7, n, 50, 1_000_000 + n * 1000);
+            stations.forwarded(receiver, 7, n, 50, m(1_000_000 + n * 1000));
         }
-        let report = stations.report(&receiver, 1_011_500).ok_or("no report")?;
+        let report = stations
+            .report(&receiver, aligned(1_011_500))
+            .ok_or("no report")?;
         assert_eq!(
             (report.batches, report.observations, report.gaps),
             (12, 600, 0)
@@ -400,7 +615,7 @@ mod tests {
         assert!(report.online);
         // Long after, the receiver is offline.
         let later = stations
-            .report(&receiver, 1_011_000 + ONLINE_WITHIN_MS + 1)
+            .report(&receiver, aligned(1_011_000 + ONLINE_WITHIN_MS + 1))
             .ok_or("no report")?;
         assert!(!later.online);
         Ok(())
@@ -411,15 +626,19 @@ mod tests {
     -> Result<(), String> {
         let receiver = key()?;
         let mut stations = Stations::new(8);
-        stations.forwarded(receiver, 1, 10, 1, 0);
-        stations.forwarded(receiver, 1, 14, 1, 0);
-        let gaps = |stations: &Stations| stations.report(&receiver, 0).map(|report| report.gaps);
+        stations.forwarded(receiver, 1, 10, 1, m(0));
+        stations.forwarded(receiver, 1, 14, 1, m(0));
+        let gaps = |stations: &Stations| {
+            stations
+                .report(&receiver, aligned(0))
+                .map(|report| report.gaps)
+        };
         assert_eq!(gaps(&stations), Some(3));
-        stations.forwarded(receiver, 1, 12, 1, 0);
+        stations.forwarded(receiver, 1, 12, 1, m(0));
         assert_eq!(gaps(&stations), Some(2));
         // A reboot starts again at 0, and joining mid-stream is no gap either.
-        stations.forwarded(receiver, 2, 0, 1, 0);
-        stations.forwarded(receiver, 2, 1, 1, 0);
+        stations.forwarded(receiver, 2, 0, 1, m(0));
+        stations.forwarded(receiver, 2, 1, 1, m(0));
         assert_eq!(gaps(&stations), Some(2));
         Ok(())
     }
@@ -429,20 +648,20 @@ mod tests {
         let receiver = key()?;
         let mut stations = Stations::new(8);
         // No row until a batch: a connection alone creates nothing.
-        stations.opened(receiver, 5, 0, None);
+        stations.opened(receiver, 5, m(0), None);
         stations.fed_by(&receiver, 5, None);
         assert!(stations.is_empty());
-        stations.forwarded(receiver, 1, 0, 1, 0);
+        stations.forwarded(receiver, 1, 0, 1, m(0));
         stations.fed_by(&receiver, 5, None);
         stations.fed_by(&receiver, 5, None);
         // The feeder reconnects before its old connection is noticed gone.
-        stations.opened(receiver, 6, 0, None);
+        stations.opened(receiver, 6, m(0), None);
         stations.fed_by(&receiver, 6, None);
         stations.left(&receiver, 5);
-        let report = stations.report(&receiver, 0).ok_or("no report")?;
+        let report = stations.report(&receiver, aligned(0)).ok_or("no report")?;
         assert_eq!((report.sessions, report.connected), (2, true));
         stations.left(&receiver, 6);
-        let report = stations.report(&receiver, 0).ok_or("no report")?;
+        let report = stations.report(&receiver, aligned(0)).ok_or("no report")?;
         assert_eq!((report.sessions, report.connected), (2, false));
         Ok(())
     }
@@ -456,10 +675,10 @@ mod tests {
         let mut stations = Stations::new(8);
         let address = |stations: &Stations| {
             stations
-                .report(&receiver, 0)
+                .report(&receiver, aligned(0))
                 .and_then(|report| report.address)
         };
-        stations.forwarded(receiver, 1, 0, 1, 0);
+        stations.forwarded(receiver, 1, 0, 1, m(0));
         assert_eq!(address(&stations), None);
         let home: IpAddr = "::ffff:203.0.113.7".parse().map_err(|_| "not an address")?;
         stations.fed_by(&receiver, 5, Some(home));
@@ -475,7 +694,7 @@ mod tests {
         // A session that ends takes its address with it.
         stations.left(&receiver, 6);
         assert_eq!(address(&stations), None);
-        let report = stations.report(&receiver, 0).ok_or("no report")?;
+        let report = stations.report(&receiver, aligned(0)).ok_or("no report")?;
         assert!(!report.connected);
         Ok(())
     }
@@ -486,12 +705,14 @@ mod tests {
     fn a_connected_feeder_that_sends_nothing_is_reported_until_it_leaves() -> Result<(), String> {
         let receiver = key()?;
         let mut stations = Stations::new(8);
-        stations.opened(receiver, 5, 1_000, None);
+        stations.opened(receiver, 5, m(1_000), None);
         // A second connection of it, before the first is noticed gone, keeps the older instant.
-        stations.opened(receiver, 6, 4_000, None);
+        stations.opened(receiver, 6, m(4_000), None);
         // No row: the table holds only receivers a batch of which was forwarded.
         assert!(stations.is_empty());
-        let report = stations.report(&receiver, 9_000).ok_or("no report")?;
+        let report = stations
+            .report(&receiver, aligned(9_000))
+            .ok_or("no report")?;
         assert_eq!(
             (
                 report.online,
@@ -505,13 +726,15 @@ mod tests {
             ),
             (false, true, Some(1_000), 0, 0, 1_000, 1_000, None)
         );
-        assert_eq!(stations.reports(9_000).len(), 1);
+        assert_eq!(stations.reports(aligned(9_000)).len(), 1);
         stations.left(&receiver, 5);
-        let report = stations.report(&receiver, 9_000).ok_or("no report")?;
+        let report = stations
+            .report(&receiver, aligned(9_000))
+            .ok_or("no report")?;
         assert_eq!(report.connected_since_ms, Some(4_000));
         stations.left(&receiver, 6);
-        assert_eq!(stations.report(&receiver, 9_000), None);
-        assert!(stations.reports(9_000).is_empty());
+        assert_eq!(stations.report(&receiver, aligned(9_000)), None);
+        assert!(stations.reports(aligned(9_000)).is_empty());
         Ok(())
     }
 
@@ -521,11 +744,11 @@ mod tests {
     fn a_feeder_that_went_quiet_is_connected_and_then_offline() -> Result<(), String> {
         let receiver = key()?;
         let mut stations = Stations::new(8);
-        stations.opened(receiver, 5, 0, None);
-        stations.forwarded(receiver, 1, 0, 10, 1_000);
+        stations.opened(receiver, 5, m(0), None);
+        stations.forwarded(receiver, 1, 0, 10, m(1_000));
         stations.fed_by(&receiver, 5, None);
         let quiet = stations
-            .report(&receiver, 1_000 + ONLINE_WITHIN_MS + 1)
+            .report(&receiver, aligned(1_000 + ONLINE_WITHIN_MS + 1))
             .ok_or("no report")?;
         assert_eq!(
             (
@@ -538,7 +761,7 @@ mod tests {
         );
         stations.left(&receiver, 5);
         let gone = stations
-            .report(&receiver, 1_000 + ONLINE_WITHIN_MS + 1)
+            .report(&receiver, aligned(1_000 + ONLINE_WITHIN_MS + 1))
             .ok_or("no report")?;
         assert_eq!(
             (
@@ -549,7 +772,7 @@ mod tests {
             ),
             (false, false, None, 1_000)
         );
-        assert_eq!(stations.reports(0).len(), 1);
+        assert_eq!(stations.reports(aligned(0)).len(), 1);
         Ok(())
     }
 
@@ -558,11 +781,48 @@ mod tests {
         let honest = key()?;
         let mut stations = Stations::new(4);
         for n in 0..40 {
-            stations.forwarded(honest, 1, n, 1, 0);
-            stations.forwarded(key()?, 1, 0, 1, 0);
+            stations.forwarded(honest, 1, n, 1, m(0));
+            stations.forwarded(key()?, 1, 0, 1, m(0));
             assert!(stations.len() <= 4);
         }
-        assert!(stations.report(&honest, 0).is_some());
+        assert!(stations.report(&honest, aligned(0)).is_some());
+        Ok(())
+    }
+
+    /// Each instant, timed on the monotonic clock, is served on the judging clock as the report
+    /// reads it: three hours apart, every instant is three hours on, and online is measured on
+    /// the monotonic clock alone.
+    #[test]
+    fn a_reports_instants_are_on_the_judging_clock_it_is_made_by() -> Result<(), String> {
+        use tally_wire::clocks::recorded::moment;
+        let hours = 3 * 3_600_000;
+        let receiver = key()?;
+        let mut stations = Stations::new(8);
+        stations.opened(receiver, 5, m(500), None);
+        stations.forwarded(receiver, 1, 0, 10, m(1_000));
+        stations.forwarded(receiver, 1, 1, 10, m(2_000));
+        let report = stations
+            .report(&receiver, moment(3_000, 3_000 + hours))
+            .ok_or("no report")?;
+        assert_eq!(
+            (
+                report.connected_since_ms,
+                report.first_seen_ms,
+                report.last_seen_ms,
+                report.online
+            ),
+            (Some(500 + hours), 1_000 + hours, 2_000 + hours, true)
+        );
+        let (_, listed) = stations
+            .reports(moment(3_000, 3_000 + hours))
+            .pop()
+            .ok_or("no reports")?;
+        assert_eq!(listed, report);
+        // Online by the monotonic clock: the judging one stepped back changes nothing of it.
+        let back = stations
+            .report(&receiver, moment(2_000 + ONLINE_WITHIN_MS, 0))
+            .ok_or("no report")?;
+        assert!(back.online);
         Ok(())
     }
 }

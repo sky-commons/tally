@@ -11,7 +11,7 @@
 //! records do, so the same stamped batches sign the same stream on any number of threads.
 
 use tally_wire::batch::Hash;
-use tally_wire::{Batch, BatchDraft, Identity};
+use tally_wire::{Batch, BatchDraft, Signs};
 
 use crate::seal::Kept;
 
@@ -27,11 +27,23 @@ pub struct Stream {
     previous: Hash,
 }
 
-/// One epoch's stream, signed: its batches in order, and the copies too large for any.
+/// One epoch's stream, signed: its batches in order, the copies too large for any, and the copies
+/// left unsigned because the signer's clock stopped judging while the epoch sealed.
 #[derive(Debug, Default)]
 pub struct Signed {
     pub batches: Vec<Batch>,
     pub oversized: u64,
+    pub unsigned: u64,
+}
+
+impl Signed {
+    /// `copies` copies left unsigned: the signer's clock was not judging.
+    pub fn unsigned(copies: usize) -> Self {
+        Self {
+            unsigned: copies as u64,
+            ..Self::default()
+        }
+    }
 }
 
 impl Stream {
@@ -48,7 +60,7 @@ impl Stream {
     /// small enough for one record, timed `wall_ms`. Each copy is moved, never its reception
     /// copied: into its chunk, and into a half when a chunk is halved. A copy too large for any
     /// record is not deliverable, and is counted.
-    pub fn sign(&mut self, identity: &Identity, mut copies: Vec<Kept>, wall_ms: u64) -> Signed {
+    pub fn sign(&mut self, identity: &impl Signs, mut copies: Vec<Kept>, wall_ms: u64) -> Signed {
         let mut signed = Signed::default();
         let mut todo: Vec<Vec<Kept>> = Vec::new();
         while copies.len() > FIRST_TRY {

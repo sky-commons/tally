@@ -31,6 +31,10 @@
 //! capped, and every request, header read and upstream read has a deadline; a stream instead is
 //! held to a few open at once per client, and lasts as long as its connection.
 
+// It reaches keys (`tally_wire::Identity`): no `unsafe` code at all, forbidden, so no module
+// can allow it.
+#![forbid(unsafe_code)]
+
 pub mod area;
 pub mod config;
 pub mod feeders;
@@ -214,7 +218,7 @@ impl App {
         let Ok(mut ledger) = self.feeders.lock() else {
             return;
         };
-        let board = ledger.board(routes::wall_ms());
+        let board = ledger.board(crate::mlat::Clock::system().now().judged());
         drop(ledger);
         self.snapshot.set_board(board, Instant::now());
     }

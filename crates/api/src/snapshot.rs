@@ -112,6 +112,7 @@ impl Stations {
             messages_per_sec: self.rates.get(key).copied().unwrap_or(0.0),
             batches: report.batches,
             gaps: report.gaps,
+            late_batches: report.late_batches,
             location: self.places.get(key).copied(),
             software: report.software.clone(),
         })
@@ -319,6 +320,7 @@ mod tests {
             last_seen_ms: 2,
             batches: 3,
             gaps: 4,
+            late_batches: 0,
             observations,
             cell: cell(),
             software: Some("tally-feed 0.1.0".to_owned()),
@@ -532,6 +534,7 @@ mod tests {
             last_seen_ms: 7_000,
             batches: 0,
             gaps: 0,
+            late_batches: 0,
             observations: 0,
             cell: None,
             software: Some("tally-feed 0.3.0".to_owned()),

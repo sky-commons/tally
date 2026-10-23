@@ -1,0 +1,33 @@
+# Clippy's configuration for every crate, read by Cargo's clippy from the workspace root and by
+# Bazel's (`.bazelrc`, `build:lint`).
+#
+# A relay judges everything compared across machines by the host's wall clock as its time daemon
+# keeps it, with the kernel's error bound, and times every duration by the monotonic clock
+# (crates/relay/src/clock.rs, `RelayClock`; RFC-0171 §3.6), so it reads the wall clock and the
+# kernel's word on it in that one place. Any other read is refused here, whichever way it is
+# spelt, and one that is right (a feeder's own host clock, a tool's) says why where it is allowed.
+disallowed-methods = [
+    { path = "std::time::SystemTime::now", reason = "in the relay, read its one clock (`clock::RelayClock`); elsewhere, allow it where it is read, saying why that clock is the right one" },
+    { path = "std::time::SystemTime::elapsed", reason = "a read of the wall clock: in the relay, read its one clock (`clock::RelayClock`); elsewhere, allow it where it is read, saying why" },
+    { path = "libc::clock_gettime", reason = "a read of a host clock: in the relay, read its one clock (`clock::RelayClock`); elsewhere, allow it where it is read, saying why" },
+    # The 64-bit-time read of 32-bit targets: no such function on 64-bit ones, so not an error there.
+    { path = "libc::clock_gettime64", allow-invalid = true, reason = "a read of a host clock: in the relay, read its one clock (`clock::RelayClock`); elsewhere, allow it where it is read, saying why" },
+    { path = "libc::gettimeofday", reason = "a read of the wall clock: in the relay, read its one clock (`clock::RelayClock`); elsewhere, allow it where it is read, saying why" },
+    { path = "libc::time", reason = "a read of the wall clock: in the relay, read its one clock (`clock::RelayClock`); elsewhere, allow it where it is read, saying why" },
+    { path = "libc::adjtimex", reason = "the kernel's word on the wall clock: read once, by `tally_wire::kernel_clock::asked`, which both ends' clocks call" },
+    { path = "libc::clock_adjtime", allow-invalid = true, reason = "the kernel's word on the wall clock: read once, by `tally_wire::kernel_clock::asked`, which both ends' clocks call" },
+    # A clock's reading is made by reading the clock (`tally_wire::clocks`): a number becomes one
+    # only as a reading taken before and given back, by a replay or a test, which says so.
+    { path = "tally_wire::clocks::recorded::mono", reason = "read the clock through its reader; a replay or a test that gives back a reading taken before allows it, saying so" },
+    { path = "tally_wire::clocks::recorded::judged", reason = "read the clock through its reader; a replay or a test that gives back a reading taken before allows it, saying so" },
+    { path = "tally_wire::clocks::recorded::raw", reason = "read the clock through its reader; a replay or a test that gives back a reading taken before allows it, saying so" },
+    { path = "tally_wire::clocks::recorded::moment", reason = "read the clock through its reader; a replay or a test that gives back a reading taken before allows it, saying so" },
+    { path = "tally_wire::clocks::recorded::aligned", reason = "read the clock through its reader; a replay or a test that gives back a reading taken before allows it, saying so" },
+    { path = "tally_wire::clocks::Moment::at_ms", reason = "a time on the monotonic clock's own grid is stated in one place (`tally_relay::seal::on_grid`); a test that gives back one taken before allows it, saying so" },
+    { path = "tally_relay::ingest::Stamp::recorded", reason = "a stamp is read from the relay's clock (`RelayClock::stamp`); a test that gives back a stamp taken before allows it, saying so" },
+    { path = "tally_relay::ingest::Stamp::at", reason = "a stamp is read from the relay's clock (`RelayClock::stamp`); a test that gives back a stamp taken before allows it, saying so" },
+    # The relay lends its key by the reading a record states its time by (`tally_relay::signer::with`),
+    # so nothing is signed from a reading taken while its clock did not judge.
+    { path = "tally_wire::key::Signer::with", reason = "in the relay, sign through `tally_relay::signer::with`, by the reading the record states; elsewhere, allow it where the caller is stepped only by a judging reading, saying so" },
+    { path = "tally_wire::key::Signer::sign_with", reason = "in the relay, sign through `tally_relay::signer::sign_with`, by the reading the record states; elsewhere, allow it where the caller is stepped only by a judging reading, saying so" },
+]

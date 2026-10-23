@@ -70,7 +70,7 @@ use blake2::{Blake2s256, Digest};
 use crate::WireError;
 use crate::batch::{Hash, domain, split_signature, u64_at};
 use crate::fault_proof::FAULT_PROOF_OVERHEAD;
-use crate::key::{Identity, KEY_LEN, PublicKey, SIGNATURE_LEN};
+use crate::key::{KEY_LEN, PublicKey, SIGNATURE_LEN, Signs};
 use crate::observation_set::{ObservationSet, Reception, TaggedSet};
 use crate::record::{Body, MAX_BODY};
 use crate::site::{ReceptionTag, TAG_LEN};
@@ -301,7 +301,7 @@ impl Positions {
     /// Signs a format 3 record. Refused when a solution is malformed or the record would be
     /// larger than `MAX_POSITIONS_LEN`.
     pub fn sign_solutions(
-        identity: &Identity,
+        identity: &impl Signs,
         content: &SolutionsContent,
     ) -> Result<Self, WireError> {
         Self::sign_format(identity, content, POSITIONS_FORMAT_3)
@@ -310,14 +310,14 @@ impl Positions {
     /// Signs a provisional (format 4) record: as `sign_solutions`, and refused when a solution
     /// names an addressed citation.
     pub fn sign_provisional(
-        identity: &Identity,
+        identity: &impl Signs,
         content: &SolutionsContent,
     ) -> Result<Self, WireError> {
         Self::sign_format(identity, content, POSITIONS_FORMAT_PROVISIONAL)
     }
 
     fn sign_format(
-        identity: &Identity,
+        identity: &impl Signs,
         content: &SolutionsContent,
         format: u8,
     ) -> Result<Self, WireError> {
@@ -405,7 +405,7 @@ impl Positions {
         solutions.len()
     }
 
-    pub(crate) fn signed(identity: &Identity, mut bytes: Vec<u8>) -> Self {
+    pub(crate) fn signed(identity: &impl Signs, mut bytes: Vec<u8>) -> Self {
         let signature = identity.sign(&domain(POSITIONS_DOMAIN, &bytes));
         bytes.extend_from_slice(&signature);
         Self { bytes }
@@ -421,6 +421,11 @@ impl Positions {
         }
         PublicKey::from_slice(&bytes[1..1 + KEY_LEN])?;
         Ok(Self { bytes })
+    }
+
+    /// What it allocates of its own: its bytes' capacity.
+    pub fn allocated(&self) -> usize {
+        crate::footprint::vec::<u8>(self.bytes.capacity())
     }
 
     pub fn as_bytes(&self) -> &[u8] {
@@ -458,6 +463,12 @@ impl Positions {
 
     pub fn sequence(&self) -> u64 {
         u64_at(&self.bytes, 1 + KEY_LEN + 8)
+    }
+
+    /// Its signed `issued_ms` (`SolutionsContent::issued_ms`), read without decoding a solution: what a
+    /// relay's time window judges it by.
+    pub fn issued_ms(&self) -> Result<u64, WireError> {
+        crate::batch::u64_from(&self.bytes, 1 + KEY_LEN + 16)
     }
 
     /// BLAKE2s over the whole signed record: its identity for deduplication.
@@ -564,7 +575,7 @@ impl Positions {
     /// Signs a format 5 record: what a client is sent in place of format 3. Refused as
     /// `sign_solutions` refuses.
     pub fn sign_tagged(
-        identity: &Identity,
+        identity: &impl Signs,
         content: &TaggedSolutionsContent,
     ) -> Result<Self, WireError> {
         Self::sign_tagged_format(identity, content, POSITIONS_FORMAT_TAGGED)
@@ -573,14 +584,14 @@ impl Positions {
     /// Signs a format 6 record: provisional, tagged; refused when a solution names an addressed
     /// citation.
     pub fn sign_tagged_provisional(
-        identity: &Identity,
+        identity: &impl Signs,
         content: &TaggedSolutionsContent,
     ) -> Result<Self, WireError> {
         Self::sign_tagged_format(identity, content, POSITIONS_FORMAT_TAGGED_PROVISIONAL)
     }
 
     fn sign_tagged_format(
-        identity: &Identity,
+        identity: &impl Signs,
         content: &TaggedSolutionsContent,
         format: u8,
     ) -> Result<Self, WireError> {
@@ -791,7 +802,7 @@ fn put_common<O: Observed>(bytes: &mut Vec<u8>, solution: &Solution<O>, clock: u
     bytes.extend_from_slice(&solution.addressed.count.to_be_bytes());
 }
 
-fn prefix(format: u8, identity: &Identity, boot_id: u64, sequence: u64) -> Vec<u8> {
+fn prefix(format: u8, identity: &impl Signs, boot_id: u64, sequence: u64) -> Vec<u8> {
     let mut bytes = Vec::new();
     bytes.push(format);
     bytes.extend_from_slice(identity.public().as_bytes());
@@ -844,6 +855,7 @@ pub(crate) fn ascending<T: Ord>(items: &[T], field: &'static str) -> Result<(), 
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::key::Identity;
     use crate::observation_set::Reception;
 
     pub(crate) fn receiver(seed: u8) -> PublicKey {

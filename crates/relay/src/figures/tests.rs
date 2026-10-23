@@ -1,10 +1,13 @@
 //! The figures count what their definitions say, from the relay-only records a relay holds, and
 //! sign nothing a site can be read from.
 
+#![allow(clippy::disallowed_methods, reason = "a test's scripted readings")]
 use super::*;
+use tally_wire::Identity;
+use tally_wire::clocks::recorded::{aligned, judged};
 use tally_wire::rendezvous::AREA_RESOLUTION;
 use tally_wire::{
-    AddressedCitation, Batch, BatchContent, EnuCovariance, Location, Observation, ObservationSet,
+    AddressedCitation, BatchContent, EnuCovariance, Location, Observation, ObservationSet,
     Reception, Solution, SolutionsContent, TransmitTime,
 };
 
@@ -72,8 +75,9 @@ fn batch(who: &Identity, sequence: u64, wall_ms: u64, messages: &[Vec<u8>]) -> A
         previous: [0; 32],
         observations,
     };
-    let batch = Batch::sign(who, &content).unwrap_or_else(|error| panic!("{error}"));
-    Decoded::from_verified(batch, wall_ms, sequence).unwrap_or_else(|error| panic!("{error:?}"))
+    let batch = crate::anchors::anchored(who, &content).unwrap_or_else(|error| panic!("{error}"));
+    Decoded::from_verified(batch, aligned(wall_ms), sequence)
+        .unwrap_or_else(|error| panic!("{error:?}"))
 }
 
 /// An ACARS-family message's batch, which no figure counts.
@@ -92,8 +96,9 @@ fn acars(who: &Identity, sequence: u64, wall_ms: u64) -> Arc<Decoded> {
             data: br#"{"kind":"acars","label":"H1","t":1}"#.to_vec(),
         }],
     };
-    let batch = Batch::sign(who, &content).unwrap_or_else(|error| panic!("{error}"));
-    Decoded::from_verified(batch, wall_ms, sequence).unwrap_or_else(|error| panic!("{error:?}"))
+    let batch = crate::anchors::anchored(who, &content).unwrap_or_else(|error| panic!("{error}"));
+    Decoded::from_verified(batch, aligned(wall_ms), sequence)
+        .unwrap_or_else(|error| panic!("{error:?}"))
 }
 
 /// A final position of `address` at `place`, at `at_ms`, citing one reception of each receiver.
@@ -214,25 +219,25 @@ fn fed() -> Figures {
             ],
         ),
         Some(public(A_SITE)),
-        now,
+        judged(now),
     );
     figures.batch(
         &batch(&b, 0, T + 500, &[df11(X.0), df11(Z.0)]),
         Some(public(B_SITE)),
-        now,
+        judged(now),
     );
-    figures.batch(&acars(&b, 1, T + 600), Some(public(B_SITE)), now);
+    figures.batch(&acars(&b, 1, T + 600), Some(public(B_SITE)), judged(now));
     for engine in [identity(20), identity(21)] {
         figures.positions(
             &position(&engine, 0, Z.0, Z.1, T + 1_000, &[&a, &b, &c]),
-            now,
+            judged(now),
         );
     }
     figures
 }
 
 fn figure_of(figures: &Figures, seed: u8) -> FeederFigure {
-    let (_, _, areas) = figures.compute(NEXT_HOUR, |_| true);
+    let (_, _, areas) = figures.compute(judged(NEXT_HOUR), |_| true);
     let key = identity(seed).public();
     areas
         .values()
@@ -296,7 +301,7 @@ fn the_range_is_from_the_public_cell_never_the_site() {
 #[test]
 fn a_citation_never_makes_a_row_nor_credits_an_aircraft_not_heard() {
     let figures = fed();
-    let (_, _, areas) = figures.compute(NEXT_HOUR, |_| true);
+    let (_, _, areas) = figures.compute(judged(NEXT_HOUR), |_| true);
     let c = identity(9).public();
     assert!(
         areas
@@ -307,11 +312,11 @@ fn a_citation_never_makes_a_row_nor_credits_an_aircraft_not_heard() {
     figures.batch(
         &batch(&d, 0, T, &[df11(X.0)]),
         Some(public(B_SITE)),
-        T + 5_000,
+        judged(T + 5_000),
     );
     figures.positions(
         &position(&identity(20), 1, 0x00_beef, Z.1, T + 2_000, &[&d]),
-        T + 5_000,
+        judged(T + 5_000),
     );
     assert_eq!(figure_of(&figures, 10).mlat_positions, 0);
 }
@@ -321,8 +326,8 @@ fn a_citation_never_makes_a_row_nor_credits_an_aircraft_not_heard() {
 fn a_row_past_the_store_is_refused() {
     let figures = Figures::new();
     figures.charge_to(Gauge::new(Store::Figures, PER_RECEIVER_BYTES));
-    figures.batch(&batch(&identity(7), 0, T, &[df11(X.0)]), None, T);
-    figures.batch(&batch(&identity(8), 0, T, &[df11(X.0)]), None, T);
+    figures.batch(&batch(&identity(7), 0, T, &[df11(X.0)]), None, judged(T));
+    figures.batch(&batch(&identity(8), 0, T, &[df11(X.0)]), None, judged(T));
     assert_eq!(figures.rows(), 1);
     assert_eq!(figures.refused(), 1);
 }
@@ -332,7 +337,7 @@ fn a_row_past_the_store_is_refused() {
 fn the_signed_figures_carry_no_site() -> Result<(), String> {
     let figures = fed();
     let relay = identity(30);
-    let signed = figures.sign(&relay, NEXT_HOUR, |_| true);
+    let signed = figures.sign(&relay, judged(NEXT_HOUR), |_| true);
     assert!(!signed.is_empty());
     for record in signed {
         record.verify().map_err(|error| error.to_string())?;
@@ -377,8 +382,12 @@ fn figures_are_whole_hours_published_hourly() -> Result<(), String> {
     let figures = fed();
     let relay = identity(30);
     // Within the hour it was heard in: not yet.
-    assert!(figures.sign(&relay, T + 60_000, |_| true).is_empty());
-    let first = figures.sign(&relay, NEXT_HOUR, |_| true);
+    assert!(
+        figures
+            .sign(&relay, judged(T + 60_000), |_| true)
+            .is_empty()
+    );
+    let first = figures.sign(&relay, judged(NEXT_HOUR), |_| true);
     assert!(!first.is_empty());
     let boundary = NEXT_HOUR / HOUR_MS * HOUR_MS;
     for record in &first {
@@ -390,9 +399,9 @@ fn figures_are_whole_hours_published_hourly() -> Result<(), String> {
     figures.batch(
         &batch(&identity(7), 1, NEXT_HOUR, &[df11(Y.0), df11(X.0)]),
         Some(public(A_SITE)),
-        NEXT_HOUR + 1_000,
+        judged(NEXT_HOUR + 1_000),
     );
-    let again = figures.sign(&relay, NEXT_HOUR + 30 * 60_000, |_| true);
+    let again = figures.sign(&relay, judged(NEXT_HOUR + 30 * 60_000), |_| true);
     let contents = |records: &[FeederFigures]| -> Result<Vec<_>, String> {
         records
             .iter()
@@ -400,14 +409,14 @@ fn figures_are_whole_hours_published_hourly() -> Result<(), String> {
             .collect()
     };
     assert_eq!(contents(&again)?, contents(&first)?);
-    let later = figures.sign(&relay, NEXT_HOUR + HOUR_MS, |_| true);
+    let later = figures.sign(&relay, judged(NEXT_HOUR + HOUR_MS), |_| true);
     assert_ne!(contents(&later)?, contents(&first)?);
     // Due once an hour, at the first tick of each.
     let hourly = Figures::new();
-    assert!(hourly.due(NEXT_HOUR));
-    assert!(!hourly.due(NEXT_HOUR + 59 * 60_000 - 60_000));
-    assert!(hourly.due(NEXT_HOUR + HOUR_MS));
-    assert!(!hourly.due(NEXT_HOUR + HOUR_MS + 60_000));
+    assert!(hourly.due(judged(NEXT_HOUR)));
+    assert!(!hourly.due(judged(NEXT_HOUR + 59 * 60_000 - 60_000)));
+    assert!(hourly.due(judged(NEXT_HOUR + HOUR_MS)));
+    assert!(!hourly.due(judged(NEXT_HOUR + HOUR_MS + 60_000)));
     Ok(())
 }
 
@@ -419,9 +428,9 @@ fn a_day_old_feeder_is_forgotten_and_its_charge_let_go() {
     figures.batch(
         &batch(&identity(7), 0, T, &[df11(X.0)]),
         Some(public(A_SITE)),
-        T,
+        judged(T),
     );
-    let (_, _, areas) = figures.compute(T + (WINDOW_HOURS + 1) * HOUR_MS, |_| true);
+    let (_, _, areas) = figures.compute(judged(T + (WINDOW_HOURS + 1) * HOUR_MS), |_| true);
     assert!(areas.is_empty());
     assert_eq!(figures.rows(), 0);
     figures.batch(
@@ -432,9 +441,37 @@ fn a_day_old_feeder_is_forgotten_and_its_charge_let_go() {
             &[df11(X.0)],
         ),
         None,
-        T + (WINDOW_HOURS + 1) * HOUR_MS,
+        judged(T + (WINDOW_HOURS + 1) * HOUR_MS),
     );
     assert_eq!(figures.rows(), 1);
+    assert_eq!(gauge.held(), figures.counted());
+}
+
+/// The store holds what the rows and their shards' tables allocate, read from each table's
+/// buckets, as receivers come in waves and are forgotten: each row its [`ROW_BYTES`], each table
+/// what it allocates and no more than [`PER_RECEIVER_BYTES`] leaves it for each row, and nothing
+/// once every row is forgotten. Before, each row was charged its fixed bytes and its slot in its
+/// shard's table nothing, which kept every bucket a wave grew it to.
+#[test]
+fn the_rows_tables_are_charged_what_they_allocate_as_receivers_come_and_go() {
+    let figures = Figures::new();
+    let gauge = Gauge::unlimited(Store::Figures);
+    figures.charge_to(Arc::clone(&gauge));
+    let mut now = T;
+    for wave in 0..4u64 {
+        let receivers = [40, 255, 3, 120][wave as usize];
+        for seed in 0..receivers {
+            let who = Identity::from_seed([seed as u8 ^ wave as u8; 32]);
+            figures.batch(&batch(&who, wave, now, &[df11(X.0)]), None, judged(now));
+            assert_eq!(gauge.held(), figures.counted());
+        }
+        assert!(gauge.held() <= figures.rows() * PER_RECEIVER_BYTES);
+        now += (WINDOW_HOURS + 1) * HOUR_MS;
+        let _ = figures.compute(judged(now), |_| true);
+        assert_eq!(figures.rows(), 0);
+        assert_eq!(gauge.held(), 0);
+        assert_eq!(figures.counted(), 0);
+    }
 }
 
 /// A receiver that names no public cell still has its figures, in a record of no area, which
@@ -442,8 +479,12 @@ fn a_day_old_feeder_is_forgotten_and_its_charge_let_go() {
 #[test]
 fn a_receiver_with_no_cell_is_figured_in_a_record_of_no_area() -> Result<(), String> {
     let figures = Figures::new();
-    figures.batch(&batch(&identity(7), 0, T, &[df11(X.0)]), None, T + 1_000);
-    let signed = figures.sign(&identity(30), NEXT_HOUR, |_| false);
+    figures.batch(
+        &batch(&identity(7), 0, T, &[df11(X.0)]),
+        None,
+        judged(T + 1_000),
+    );
+    let signed = figures.sign(&identity(30), judged(NEXT_HOUR), |_| false);
     assert_eq!(signed.len(), 1);
     let content = signed[0].content().map_err(|error| error.to_string())?;
     assert_eq!(content.area, None);
@@ -453,4 +494,81 @@ fn a_receiver_with_no_cell_is_figured_in_a_record_of_no_area() -> Result<(), Str
         (None, 1)
     );
     Ok(())
+}
+
+/// The figures judge a batch's and a final position's own signed time by the error budget's
+/// windows (`tally_wire::budget::Window::FIGURES` and `Window::FIGURES_POSITIONS`), never a
+/// tolerance of their own: a batch as old as its origin may use it is counted, one older or
+/// further ahead than any copy may be used is not; a final position as late as a final fix may
+/// arrive is counted, one later is not. Before, one 120 s either way of the relay's clock counted
+/// both, records no relay could have used.
+#[test]
+fn the_figures_judge_signed_times_by_the_budgets_windows() {
+    use tally_wire::budget::{FEEDER_BEHIND, FINAL_FIX_ARRIVED, PEER_AHEAD};
+    let now = T + 600_000;
+    let figures = Figures::new();
+    let rows = |figures: &Figures| figures.rows();
+    figures.batch(
+        &batch(
+            &identity(7),
+            0,
+            now - FEEDER_BEHIND.span::<tally_wire::clocks::Judged>().ms() - 1,
+            &[df11(X.0)],
+        ),
+        None,
+        judged(now),
+    );
+    figures.batch(
+        &batch(
+            &identity(8),
+            0,
+            now + PEER_AHEAD.span::<tally_wire::clocks::Judged>().ms() + 1,
+            &[df11(X.0)],
+        ),
+        None,
+        judged(now),
+    );
+    assert_eq!(rows(&figures), 0, "a batch outside the window was counted");
+    let fed = identity(9);
+    figures.batch(
+        &batch(
+            &fed,
+            0,
+            now - FEEDER_BEHIND.span::<tally_wire::clocks::Judged>().ms(),
+            &[df11(Z.0), df11(Z.0 + 1)],
+        ),
+        None,
+        judged(now),
+    );
+    assert_eq!(rows(&figures), 1);
+    figures.positions(
+        &position(
+            &identity(20),
+            0,
+            Z.0,
+            Z.1,
+            now - FINAL_FIX_ARRIVED.span::<tally_wire::clocks::Judged>().ms() - 1,
+            &[&fed],
+        ),
+        judged(now),
+    );
+    figures.positions(
+        &position(
+            &identity(20),
+            1,
+            Z.0 + 1,
+            Z.1,
+            now - FINAL_FIX_ARRIVED.span::<tally_wire::clocks::Judged>().ms(),
+            &[&fed],
+        ),
+        judged(now),
+    );
+    let (_, _, areas) = figures.compute(judged(now + HOUR_MS), |_| true);
+    let positions: u64 = areas
+        .values()
+        .flat_map(|(_, figures)| figures.iter())
+        .filter(|figure| figure.receiver == fed.public())
+        .map(|figure| figure.mlat_positions)
+        .sum();
+    assert_eq!(positions, 1);
 }

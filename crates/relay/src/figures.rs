@@ -15,8 +15,8 @@
 //! minute's (`tally_wire::FIGURES_BUCKET_MS`, which the wire holds every record to):
 //!
 //! - **uptime**: the share of the window's minutes in which a batch of it was forwarded here, by
-//!   the batch's own signed wall clock (one further than `FRESH_WITHIN_MS` from the relay's clock
-//!   is not counted, so no history is signed after the fact);
+//!   the batch's own signed wall clock (one outside `tally_wire::budget::Window::FIGURES` by the
+//!   relay's one clock, `Hub::now_ms`, is not counted, so no history is signed after the fact);
 //! - **messages**: receptions in its batches;
 //! - **aircraft**: distinct addresses it heard in a checked format (DF11, DF17, DF18: the CRC
 //!   proves the address);
@@ -43,10 +43,12 @@ use std::sync::{Arc, Mutex};
 
 use h3o::{CellIndex, LatLng, Resolution};
 use tally_mlat_solver::modes;
+use tally_wire::Signs;
 use tally_wire::batch::Hash;
+use tally_wire::clocks::Judged;
 use tally_wire::{
-    Decoded, FeederFigure, FeederFigures, FeederFiguresContent, Identity, MAX_FEEDER_FIGURES,
-    Positions, PublicKey, Region,
+    Decoded, FeederFigure, FeederFigures, FeederFiguresContent, MAX_FEEDER_FIGURES, Positions,
+    PublicKey, Region,
 };
 
 use crate::bounded::Bounded;
@@ -62,8 +64,6 @@ pub const WINDOW_HOURS: u64 = tally_wire::FIGURES_WINDOW_MS / HOUR_MS;
 pub const NEAR_MS: u64 = 2_000;
 /// How close in time an even and an odd airborne position must be to decode globally.
 pub const PAIR_WITHIN_MS: u64 = 10_000;
-/// A batch or a position whose own clock is further than this from the relay's is not counted.
-pub const FRESH_WITHIN_MS: u64 = 120_000;
 /// Beyond this from a receiver's public cell's centre, a position it is credited with is not its
 /// own: past the radio horizon of an aircraft at 45,000 ft and an antenna on a tall mast, plus
 /// the public cell's own reach.
@@ -79,8 +79,15 @@ pub const SHARED_PER_FEEDER: usize = 64;
 /// minutes of the window and the hour after it, its hours, its aircraft, cells and CPR halves at
 /// their caps (each table at the capacity its cap grows it to). Measured, not estimated: the
 /// `figures_bytes` test fills a row to every cap under a counting allocator and holds it within
-/// this (about 145 KiB; it was 96 KiB, under what a full row allocates).
-pub const PER_RECEIVER_BYTES: usize = 160 * 1024;
+/// this (about 145 KiB; it was 96 KiB, under what a full row allocates). What each row is charged.
+pub const ROW_BYTES: usize = 160 * 1024;
+/// What one receiver costs the store at most: its row ([`ROW_BYTES`]) and its slot in its shard's
+/// table of rows, which is charged what it allocates as it grows and is kept within four times
+/// the rows it holds (`footprint::table_per_entry`).
+pub const PER_RECEIVER_BYTES: usize =
+    ROW_BYTES + crate::footprint::table_per_entry::<PublicKey, Feeder>(ROWS_KEPT_WITHIN);
+/// A shard's table of rows is kept within this many times the rows it holds (`Table::kept`).
+const ROWS_KEPT_WITHIN: usize = 4;
 /// How often the figures are signed and published: once an hour, as its bucket closes.
 pub const PUBLISH_EVERY_MS: u64 = HOUR_MS;
 /// The mean Earth radius, metres (IUGG).
@@ -179,6 +186,58 @@ struct Hour {
     mlat: u64,
 }
 
+/// One shard's rows, and what its table allocates, charged to the store as it grows
+/// (`footprint::Table`): read as the map it is; a row is made only by [`Rows::make`].
+#[derive(Default)]
+struct Rows {
+    map: HashMap<PublicKey, Feeder>,
+    table: crate::footprint::Table,
+    charge: Charge,
+}
+
+impl std::ops::Deref for Rows {
+    type Target = HashMap<PublicKey, Feeder>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.map
+    }
+}
+
+impl Rows {
+    fn get_mut(&mut self, receiver: &PublicKey) -> Option<&mut Feeder> {
+        self.map.get_mut(receiver)
+    }
+
+    /// `receiver`'s row, made with `charge` if the store has room for what the table grows by;
+    /// false when it has none.
+    fn make(&mut self, receiver: PublicKey, row: Feeder) -> bool {
+        let growth = self
+            .table
+            .growth::<PublicKey, Feeder>(self.map.len(), self.map.capacity());
+        if !self.charge.try_grow(growth) {
+            return false;
+        }
+        self.map.insert(receiver, row);
+        self.table.inserted(self.map.capacity());
+        self.charge
+            .shrink_to(self.table.bytes::<PublicKey, Feeder>());
+        true
+    }
+
+    /// `emptied`'s rows let go, the table kept within four times the rows left and its charge
+    /// brought down to what it allocates.
+    fn let_go(&mut self, emptied: &[PublicKey]) -> usize {
+        let before = self.map.len();
+        for key in emptied {
+            self.map.remove(key);
+        }
+        self.table.kept(&mut self.map, ROWS_KEPT_WITHIN);
+        self.charge
+            .shrink_to(self.table.bytes::<PublicKey, Feeder>());
+        before - self.map.len()
+    }
+}
+
 /// One receiver's row: made only by a batch of its own, charged for all it may grow to.
 struct Feeder {
     _charge: Charge,
@@ -255,7 +314,8 @@ impl Feeder {
     }
 
     /// Forgets what is older than the window, and pairs too old to complete.
-    fn prune(&mut self, start_ms: u64, now_ms: u64) {
+    fn prune(&mut self, start_ms: u64, now: Judged) {
+        let now_ms = now.ms();
         self.minutes
             .retain(|minute| *minute >= start_ms / MINUTE_MS);
         self.hours.retain(|hour, _| *hour >= start_ms / HOUR_MS);
@@ -303,7 +363,7 @@ struct Row {
 /// Everything the figures are computed from, sharded by receiver as the raw is
 /// (`exchange::raw_shard`): a batch takes only its receiver's shard.
 pub struct Figures {
-    shards: Box<[Mutex<HashMap<PublicKey, Feeder>>]>,
+    shards: Box<[Mutex<Rows>]>,
     shared: Mutex<Shared>,
     /// Rows held, every shard's: what the shared tables are held to (`SHARED_PER_FEEDER` each).
     rows: AtomicUsize,
@@ -329,14 +389,22 @@ impl Default for Figures {
 
 impl Figures {
     pub fn new() -> Self {
+        let gauge = Gauge::unlimited(Store::Figures);
         Self {
-            shards: (0..SHARDS).map(|_| Mutex::new(HashMap::new())).collect(),
+            shards: (0..SHARDS)
+                .map(|_| {
+                    Mutex::new(Rows {
+                        charge: gauge.empty(),
+                        ..Rows::default()
+                    })
+                })
+                .collect(),
             shared: Mutex::new(Shared {
                 placed: Bounded::new(usize::MAX),
                 cited: Bounded::new(usize::MAX),
             }),
             rows: AtomicUsize::new(0),
-            gauge: Mutex::new(Gauge::unlimited(Store::Figures)),
+            gauge: Mutex::new(gauge),
             observed_since_ms: AtomicU64::new(u64::MAX),
             published_ms: AtomicU64::new(0),
             every_ms: AtomicU64::new(PUBLISH_EVERY_MS),
@@ -358,8 +426,17 @@ impl Figures {
             .unwrap_or_else(|_| Arc::from(Vec::new()))
     }
 
-    /// Rows are charged to `gauge` (the budget's `Store::Figures`) from now on.
+    /// Rows are charged to `gauge` (the budget's `Store::Figures`) from now on, and the shards'
+    /// tables moved there (made before any row, so they hold nothing yet).
     pub fn charge_to(&self, gauge: Arc<Gauge>) {
+        for shard in self.shards.iter() {
+            if let Ok(mut rows) = shard.lock() {
+                let mut moved = gauge.empty();
+                if moved.try_grow(rows.charge.bytes()) {
+                    rows.charge = moved;
+                }
+            }
+        }
         if let Ok(mut held) = self.gauge.lock() {
             *held = gauge;
         }
@@ -375,7 +452,23 @@ impl Figures {
         self.rows.load(Ordering::Relaxed)
     }
 
-    fn shard(&self, receiver: &PublicKey) -> &Mutex<HashMap<PublicKey, Feeder>> {
+    /// What the rows and their tables are charged, counted afresh: each row's [`ROW_BYTES`] and
+    /// what each table's buckets allocate, every table within its plan for the rows it holds.
+    #[cfg(test)]
+    fn counted(&self) -> usize {
+        self.shards
+            .iter()
+            .filter_map(|shard| shard.lock().ok())
+            .map(|rows| {
+                let table = rows.table.bytes::<PublicKey, Feeder>();
+                assert!(rows.map.capacity() <= crate::footprint::capacity_of(rows.table.buckets()));
+                assert!(table <= rows.map.len() * (PER_RECEIVER_BYTES - ROW_BYTES));
+                rows.map.len() * ROW_BYTES + table
+            })
+            .sum()
+    }
+
+    fn shard(&self, receiver: &PublicKey) -> &Mutex<Rows> {
         &self.shards[usize::from(raw_shard(receiver).0) % self.shards.len()]
     }
 
@@ -393,10 +486,10 @@ impl Figures {
     }
 
     /// A batch the hub forwarded, decoded once, of a receiver whose public cell is `public`, at
-    /// `now_ms` by the relay's clock. Only the receptions of the products count: an ACARS-family
-    /// message is none of them, and leaves the relay by `--acars-out` alone, so a batch of them is
-    /// no activity, no message and no aircraft.
-    pub fn batch(&self, decoded: &Decoded, public: Option<Region>, now_ms: u64) {
+    /// `now_ms` by the relay's clock. Only the receptions of the products count: an
+    /// ACARS-family message is none of them, and leaves the relay by `--acars-out` alone, so a
+    /// batch of them is no activity, no message and no aircraft.
+    pub fn batch(&self, decoded: &Decoded, public: Option<Region>, now: Judged) {
         let at = decoded.wall_ms();
         let products = || {
             decoded
@@ -404,7 +497,7 @@ impl Figures {
                 .iter()
                 .filter(|observation| tally_wire::batch::format::in_products(observation.format))
         };
-        if at.abs_diff(now_ms) > FRESH_WITHIN_MS || products().next().is_none() {
+        if !tally_wire::budget::Window::FIGURES.holds(at, now) || products().next().is_none() {
             return;
         }
         let receiver = decoded.receiver();
@@ -414,25 +507,30 @@ impl Figures {
             let Ok(mut shard) = self.shard(&receiver).lock() else {
                 return;
             };
-            if let std::collections::hash_map::Entry::Vacant(row) = shard.entry(receiver) {
+            if !shard.contains_key(&receiver) {
                 let gauge = self
                     .gauge
                     .lock()
                     .map(|gauge| Arc::clone(&gauge))
                     .unwrap_or_else(|_| Gauge::unlimited(Store::Figures));
-                let Some(charge) = gauge.try_charge(PER_RECEIVER_BYTES) else {
+                let made = gauge.try_charge(ROW_BYTES).is_some_and(|charge| {
+                    shard.make(
+                        receiver,
+                        Feeder {
+                            _charge: charge,
+                            public,
+                            minutes: BTreeSet::new(),
+                            hours: BTreeMap::new(),
+                            aircraft: HashMap::new(),
+                            cells: HashMap::new(),
+                            cpr: HashMap::new(),
+                        },
+                    )
+                });
+                if !made {
                     self.refused.fetch_add(1, Ordering::Relaxed);
                     return;
-                };
-                row.insert(Feeder {
-                    _charge: charge,
-                    public,
-                    minutes: BTreeSet::new(),
-                    hours: BTreeMap::new(),
-                    aircraft: HashMap::new(),
-                    cells: HashMap::new(),
-                    cpr: HashMap::new(),
-                });
+                }
                 self.rows.fetch_add(1, Ordering::Relaxed);
             }
             let Some(feeder) = shard.get_mut(&receiver) else {
@@ -494,9 +592,10 @@ impl Figures {
         }
     }
 
-    /// Final positions the hub forwarded (new, verified), raw, at `now_ms`: each solution places
-    /// its aircraft, and credits each receiver it cites that heard that aircraft here.
-    pub fn positions(&self, positions: &Positions, now_ms: u64) {
+    /// Final positions the hub forwarded (new, verified), raw, at `now_ms` by the relay's clock:
+    /// each solution places its aircraft, and credits each receiver it cites that heard that
+    /// aircraft here.
+    pub fn positions(&self, positions: &Positions, now: Judged) {
         if positions.is_provisional() || positions.is_tagged() {
             return;
         }
@@ -505,7 +604,7 @@ impl Figures {
         };
         for solution in content.solutions {
             let at = solution.transmitted.unix_ms;
-            if at.abs_diff(now_ms) > FRESH_WITHIN_MS {
+            if !tally_wire::budget::Window::FIGURES_POSITIONS.holds(at, now) {
                 continue;
             }
             self.observed(at);
@@ -559,7 +658,8 @@ impl Figures {
 
     /// Whether the figures are due at `now_ms`: once a bucket of `PUBLISH_EVERY_MS` (or as set)
     /// has begun since they were last signed; taken when they are.
-    pub fn due(&self, now_ms: u64) -> bool {
+    pub fn due(&self, now: Judged) -> bool {
+        let now_ms = now.ms();
         let last = self.published_ms.load(Ordering::Relaxed);
         let every = self.every_ms.load(Ordering::Relaxed).max(1);
         (last == 0 || now_ms / every > last / every)
@@ -577,11 +677,12 @@ impl Figures {
     /// its length, and the areas.
     pub fn compute(
         &self,
-        now_ms: u64,
+        now: Judged,
         has_standing: impl Fn(&PublicKey) -> bool,
     ) -> (u64, u64, Areas) {
+        let now_ms = now.ms();
         let end = now_ms / HOUR_MS * HOUR_MS;
-        let start = window_start_ms(now_ms);
+        let start = window_start_ms(now);
         let observed = self.observed_since_ms.load(Ordering::Relaxed);
         let observed = if observed == u64::MAX { end } else { observed };
         let since = start.max(observed / HOUR_MS * HOUR_MS).min(end);
@@ -599,8 +700,8 @@ impl Figures {
                 continue;
             };
             let mut emptied = Vec::new();
-            for (key, feeder) in shard.iter_mut() {
-                feeder.prune(start, now_ms);
+            for (key, feeder) in shard.map.iter_mut() {
+                feeder.prune(start, now);
                 if feeder.minutes.is_empty() && feeder.hours.is_empty() {
                     emptied.push(*key);
                     continue;
@@ -648,10 +749,8 @@ impl Figures {
                     cells,
                 });
             }
-            for key in emptied {
-                shard.remove(&key);
-                self.rows.fetch_sub(1, Ordering::Relaxed);
-            }
+            let gone = shard.let_go(&emptied);
+            self.rows.fetch_sub(gone, Ordering::Relaxed);
         }
         let mut areas: Areas = BTreeMap::new();
         for Row {
@@ -709,11 +808,11 @@ impl Figures {
     /// than one record does.
     pub fn sign(
         &self,
-        identity: &Identity,
-        now_ms: u64,
+        identity: &impl Signs,
+        now: Judged,
         has_standing: impl Fn(&PublicKey) -> bool,
     ) -> Vec<FeederFigures> {
-        let (issued_ms, window_for_ms, areas) = self.compute(now_ms, has_standing);
+        let (issued_ms, window_for_ms, areas) = self.compute(now, has_standing);
         let mut signed = Vec::new();
         for (_, (area, figures)) in areas {
             for part in figures.chunks(MAX_FEEDER_FIGURES) {
@@ -736,7 +835,8 @@ impl Figures {
 }
 
 /// The start of the window at `now_ms`: the start of the hour `WINDOW_HOURS` before this one.
-fn window_start_ms(now_ms: u64) -> u64 {
+fn window_start_ms(now: Judged) -> u64 {
+    let now_ms = now.ms();
     (now_ms / HOUR_MS).saturating_sub(WINDOW_HOURS) * HOUR_MS
 }
 

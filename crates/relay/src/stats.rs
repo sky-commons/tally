@@ -207,13 +207,13 @@ mod tests {
     }
 
     fn batch(receiver: &Identity, sequence: u64) -> Result<Batch, String> {
-        Batch::sign(
+        crate::anchors::anchored(
             receiver,
             &BatchContent {
                 boot_id: 1,
                 sequence,
                 counter_epoch: 0,
-                wall_ms: 0,
+                wall_ms: crate::clock::RelayClock::system().judged().ms(),
                 dropped: 0,
                 previous: [0; 32],
                 observations: vec![Observation {
@@ -384,11 +384,11 @@ mod tests {
         assert_eq!(status, 404);
 
         let hosted = Arc::new(crate::mlat_host::HostedMlat::new(
-            Identity::from_seed([3; 32]),
+            tally_wire::Signer::new(Identity::from_seed([3; 32]), std::sync::Arc::new(|| true)),
             1,
             tally_mlat::engine::Settings {
                 regions: tally_wire::Regions::default(),
-                settle_ms: crate::mlat_host::SETTLE_MS,
+                settle: crate::mlat_host::SETTLE,
                 threads: 1,
                 capacity: tally_mlat::engine::Capacity::default(),
             },
@@ -410,6 +410,9 @@ mod tests {
             crate::mlat_host::MlatReport {
                 seat_cap: report.seat_limit,
                 seat_limit: report.seat_limit,
+                // How many MLAT runners met the lowest priority follows the nice the test runs
+                // at (`mlat_host`'s own tests hold it), not the report's serving.
+                priority_unset: report.priority_unset,
                 ..crate::mlat_host::MlatReport::default()
             }
         );

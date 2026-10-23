@@ -68,6 +68,7 @@ use tally_wire::{
 };
 use tokio::net::TcpStream;
 
+#[cfg(test)]
 use crate::source::wall_ms;
 
 /// How often a check runs.
@@ -414,24 +415,32 @@ impl DeliveryChecker {
     }
 
     /// `relay`'s session ended (it said "leave me", restarted, or the connection failed): if it is
-    /// the relay audited, the audit says nothing of it.
-    pub fn session_ended(&mut self, relay: PublicKey) {
+    /// the relay audited, the audit says nothing of it. Whether it voided an audit of it: a
+    /// session that ends while its relay is audited dodged the audit: never healthy, and held
+    /// against its relay if another session stayed up (`relays::Ends`).
+    pub fn session_ended(&mut self, relay: PublicKey) -> bool {
         if let Some(audit) = &mut self.audit
             && audit.relay == relay
+            && !audit.void
         {
             audit.void = true;
+            return true;
         }
+        false
     }
 
-    /// A query over a sample of `recent` (the feeder's audited batches, newest last, each with the
-    /// relays it was written to): the newest `SAMPLED` that the audited relay alone was written,
-    /// sent within `ASK_WITHIN_MS`, of the newest boot among them. None with no audit, a void one,
-    /// or none of those. It carries no keys: each member's are added as it is asked.
+    /// As [`Self::sample_at`], at the host's clock as read: a test's.
+    #[cfg(test)]
     pub fn sample(&mut self, recent: &[Sent]) -> Option<DeliveryQuery> {
         self.sample_at(recent, wall_ms())
     }
 
-    fn sample_at(&mut self, recent: &[Sent], now_ms: u64) -> Option<DeliveryQuery> {
+    /// A query over a sample of `recent` (the feeder's audited batches, newest last, each with the
+    /// relays it was written to): the newest `SAMPLED` that the audited relay alone was written,
+    /// sent within `ASK_WITHIN_MS` of `now_ms` (the clock the feeder signs by, which each batch's
+    /// `sent_ms` was read off), of the newest boot among them. None with no audit, a void one, or
+    /// none of those. It carries no keys: each member's are added as it is asked.
+    pub fn sample_at(&mut self, recent: &[Sent], now_ms: u64) -> Option<DeliveryQuery> {
         let audit = self.audit.filter(|audit| !audit.void)?;
         let solo = |sent: &&Sent| {
             sent.relays == [audit.relay] && now_ms.saturating_sub(sent.sent_ms) < ASK_WITHIN_MS
@@ -482,12 +491,15 @@ impl DeliveryChecker {
         relays
     }
 
-    /// The verdict from the members' answers, each with the network its member is on.
+    /// As [`Self::judge_at`], at the host's clock as read: a test's.
+    #[cfg(test)]
     pub fn judge(&mut self, query: &DeliveryQuery, answers: &[(u32, DeliveryAnswer)]) -> Verdict {
         self.judge_at(query, answers, wall_ms())
     }
 
-    fn judge_at(
+    /// The verdict from the members' answers, each with the network its member is on, at `now_ms`
+    /// by the clock the feeder signs by.
+    pub fn judge_at(
         &mut self,
         query: &DeliveryQuery,
         answers: &[(u32, DeliveryAnswer)],
@@ -612,12 +624,14 @@ impl DeliveryChecker {
         }
     }
 
-    /// The relays to avoid now (saved across restarts).
+    /// As [`Self::avoided_at`], at the host's clock as read: a test's.
+    #[cfg(test)]
     pub fn avoided(&self) -> Vec<PublicKey> {
         self.avoided_at(wall_ms())
     }
 
-    fn avoided_at(&self, now_ms: u64) -> Vec<PublicKey> {
+    /// The relays to avoid at `now_ms` by the clock the feeder signs by (saved across restarts).
+    pub fn avoided_at(&self, now_ms: u64) -> Vec<PublicKey> {
         self.swallowers
             .iter()
             .filter(|(_, until)| **until > now_ms)
@@ -1103,11 +1117,13 @@ mod tests {
             .collect::<Result<Vec<_>, String>>()?;
         let mut checker = DeliveryChecker::default();
         checker.audit(&[relay], |_| true);
-        checker.session_ended(relay);
+        // It dodged the audit (`relays::Ends` holds such an end against it), once.
+        assert!(checker.session_ended(relay));
+        assert!(!checker.session_ended(relay));
         assert_eq!(checker.sample(&recent), None);
-        // Another relay's session ending does not void it.
+        // Another relay's session ending does not void it, and dodged nothing.
         checker.audit(&[relay], |_| true);
-        checker.session_ended(identity()?.public());
+        assert!(!checker.session_ended(identity()?.public()));
         assert!(checker.sample(&recent).is_some());
         Ok(())
     }
@@ -1486,7 +1502,11 @@ mod tests {
     }
 
     /// A member on loopback that answers a `DeliveryQuery` sent with Hello, signed by `signer`.
-    async fn member(identity: Identity, signer: Identity) -> Result<RelayAddress, String> {
+    async fn member(
+        identity: impl Into<std::sync::Arc<Identity>>,
+        signer: impl Into<std::sync::Arc<Identity>>,
+    ) -> Result<RelayAddress, String> {
+        let (identity, signer) = (identity.into(), signer.into());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .map_err(|error| error.to_string())?;
@@ -1533,8 +1553,8 @@ mod tests {
     async fn a_member_is_asked_and_only_its_own_signature_counts() -> Result<(), String> {
         let mut setup = audited()?;
         let me = identity()?;
-        let honest = identity()?;
-        let asked = member(honest.clone(), honest).await?;
+        let honest = std::sync::Arc::new(identity()?);
+        let asked = member(std::sync::Arc::clone(&honest), honest).await?;
         let answer = ask(&asked, &me, &setup.query).await.ok_or("no answer")?;
         assert_eq!(answer.signer().map_err(error)?, asked.key);
         // A member answering under another key's signature has given no answer.

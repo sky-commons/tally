@@ -177,6 +177,12 @@ fn assert_plan_holds(checked: &Checked) -> Result {
         non_feeder > 0 && buffers % non_feeder == 0 && buffers / non_feeder > 0,
         "{plan:?}"
     );
+    // And its pace state, at what a connection's pace state allocates at most.
+    assert_eq!(
+        checked.get("connection-paces")?,
+        non_feeder * tally_relay::ingest::PACE_BYTES_PER_CONNECTION,
+        "{plan:?}"
+    );
     // Its open files: every connection planned and every feeder admitted, the stats' and what
     // the process holds beside them (`Hub::descriptors`).
     assert_eq!(
@@ -256,23 +262,41 @@ fn assert_plan_holds(checked: &Checked) -> Result {
         "{plan:?}"
     );
     // Every rate-driven store's limit is its window (bytes held per reception a second) times
-    // R_max and the members' rate; the connections' stores are their floors'.
-    let served = rate + checked.get("members-receptions-per-sec")?;
+    // R_max, and the members' window times the members' rate; the connections' stores are their
+    // floors'.
+    let members_rate = checked.get("members-receptions-per-sec")?;
+    let served = rate + members_rate;
     let mut gauges = 0;
     for store in tally_relay::budget::Store::ALL {
         let limit = checked.get(&format!("limit-{}", store.name()))?;
         gauges += limit;
         if store.driver() == tally_relay::budget::Driver::Rate {
             let window = checked.get(&format!("window-{}", store.name()))?;
-            // The fingerprints' tables' fixed part is held before any feeder, beside the rate's.
-            let limit = if store == tally_relay::budget::Store::Dedup {
-                limit - checked.get("dedup-tables")?
-            } else {
-                limit
+            let members_window = checked.get(&format!("members-window-{}", store.name()))?;
+            // The fingerprints' tables' fixed part, what waits for the sealer whatever it holds,
+            // the tables' of what was taken, the fan-out's queues and the sharing outbox's slots
+            // are held before any feeder, beside the rate's.
+            let limit = match store {
+                tally_relay::budget::Store::Dedup => limit - checked.get("dedup-tables")?,
+                tally_relay::budget::Store::Epochs => limit - checked.get("epochs-fixed")?,
+                tally_relay::budget::Store::FeederStrikes => {
+                    limit - checked.get("feeder-strike-tables")?
+                }
+                tally_relay::budget::Store::PeerStrikes => {
+                    limit - checked.get("peer-strike-tables")?
+                }
+                tally_relay::budget::Store::OwnStrikes => {
+                    limit - checked.get("own-strike-tables")?
+                }
+                tally_relay::budget::Store::Fanout => limit - checked.get("fanout-queues")?,
+                tally_relay::budget::Store::Batches => limit - checked.get("sharing-outbox")?,
+                _ => limit,
             };
+            let expected = window * rate + members_window * members_rate;
             assert!(
-                limit <= window * served && limit + served >= window * served,
-                "{store:?}: {limit} is not {window} x {served}: {plan:?}"
+                limit <= expected && limit + served >= expected,
+                "{store:?}: {limit} is not {window} x {rate} and {members_window} x \
+                 {members_rate}: {plan:?}"
             );
         }
     }
@@ -310,7 +334,7 @@ fn a_configuration_the_relay_takes_is_accepted_with_its_plan() -> Result {
     // A key file that does not exist: check reads no key, which is an operator's secret.
     let checked = check(&[
         "--memory-limit",
-        "800M",
+        "1G",
         "--cores",
         "2",
         "--key",
@@ -318,7 +342,7 @@ fn a_configuration_the_relay_takes_is_accepted_with_its_plan() -> Result {
         "--max-upload",
         "6Mbit/s",
         "--memory",
-        "560M",
+        "720M",
         "--max-connections",
         "32",
         "--max-member-bytes-per-sec",
@@ -327,10 +351,10 @@ fn a_configuration_the_relay_takes_is_accepted_with_its_plan() -> Result {
         "8001fffffffffff",
     ])?;
     assert!(checked.accepted, "{}", checked.refusal);
-    assert_eq!(checked.get("memory")?, 560 << 20);
+    assert_eq!(checked.get("memory")?, 720 << 20);
     // It hosts MLAT by default, on the threads its cores' plan gives it.
     assert!(checked.get("mlat-threads")? >= 1, "{:?}", checked.plan);
-    assert_eq!(checked.get("limit")?, 800 << 20);
+    assert_eq!(checked.get("limit")?, 1 << 30);
     // A base cell's groups reach every relay offering it or a cell under it, far more than 32:
     // the member sessions planned are the cap's worth.
     assert_eq!(checked.get("members")?, 32);
@@ -356,7 +380,7 @@ fn a_configuration_the_relay_takes_is_accepted_with_its_plan() -> Result {
     // finds its cgroup's.
     let whole = check(&[
         "--memory-limit",
-        "2G",
+        "3G",
         "--cores",
         "2",
         "--key",
@@ -369,7 +393,7 @@ fn a_configuration_the_relay_takes_is_accepted_with_its_plan() -> Result {
     assert!(whole.accepted, "{}", whole.refusal);
     // (to the byte the allocator's share rounds to: `budget::budget_within`)
     let kept = whole.get("memory")? + whole.get("headroom")?;
-    assert!(kept <= 2 << 30 && kept + 2 >= 2 << 30, "{:?}", whole.plan);
+    assert!(kept <= 3 << 30 && kept + 2 >= 3 << 30, "{:?}", whole.plan);
     // No area taken: no group shared, no member session planned.
     assert_eq!(whole.get("members")?, 0);
     assert_plan_holds(&whole)
@@ -448,8 +472,7 @@ fn the_stages_follow_the_load_admitted_and_the_cores_bound_it() -> Result {
 /// A relay hosting MLAT plans its steps in the same cores (RFC-0181 §10, "The cores"): the stages
 /// keep the threads their load needs, MLAT is given the cores they leave, and the feeders admitted
 /// are no more than the cores carry with both, so the same cores admit fewer than without MLAT.
-/// The configuration the 2026-10-09 MLAT runs measured (`TEN_CORES`): 10 cores, two areas, memory
-/// to spare.
+/// On `TEN_CORES`: 10 cores, two areas.
 #[test]
 fn hosted_mlat_takes_the_cores_the_stages_leave_and_bounds_admission() -> Result {
     let on = |mlat: bool| -> Result<Checked> {
@@ -481,13 +504,6 @@ fn hosted_mlat_takes_the_cores_the_stages_leave_and_bounds_admission() -> Result
                     .unwrap_or(usize::MAX)
             )
             .min(hosting.get("connection-limit")?)
-    );
-    // The 2,000 feeders measured hosting MLAT fit, each with a seat.
-    assert!(hosting.get("mlat-seats")? >= 2_000, "{:?}", hosting.plan);
-    assert!(
-        hosting.get("connection-limit")? >= 2_000,
-        "{:?}",
-        hosting.plan
     );
     // MLAT takes what the stages leave; the stages' threads are their own plan's.
     assert_eq!(
@@ -572,7 +588,7 @@ fn a_configuration_a_start_refuses_is_refused_and_says_why() -> Result {
             "--area",
             "8001fffffffffff",
         ],
-        "1 cores carry no feeder beside the 16384 feeders",
+        "1 cores carry no feeder beside the 15977 feeders",
     )?;
     // The stages' threads are the plan's: no operator picks them.
     for flag in ["--ingest-threads", "--message-threads"] {
@@ -818,6 +834,45 @@ MemoryMax=4G
     Ok(())
 }
 
+/// The packaged unit's seccomp filter lets through every system call the relay's read of its
+/// clock's error bound may make (`tally_wire::kernel_clock::SYSCALLS`, the one list that read is
+/// made of), or the relay refuses to start (`clock::kernel_answers`); and a call it does refuse
+/// fails with EPERM, so a relay refused its clock says why rather than dying of SIGSYS.
+#[test]
+fn the_packaged_unit_lets_the_relay_read_its_clock() -> Result {
+    let path = packaged_unit();
+    let text =
+        std::fs::read_to_string(&path).map_err(|error| format!("{}: {error}", path.display()))?;
+    let refused = tally_wire::kernel_clock::refused_by(&text);
+    assert!(refused.is_empty(), "{} refuses {refused:?}", path.display());
+    let errno = unit_settings(&text)
+        .into_iter()
+        .rev()
+        .find(|(key, _)| key == "SystemCallErrorNumber")
+        .map(|(_, value)| value);
+    assert_eq!(errno.as_deref(), Some("EPERM"), "{}", path.display());
+    Ok(())
+}
+
+/// The packaged unit starts once the host's time daemon has set the clock, and names the daemons
+/// that keep the bound the relay judges by: after chrony's wait, which it pulls in, and after
+/// `time-sync.target`, which it never pulls in (systemd.special(7);
+/// `tally_wire::kernel_clock::TIME_WAITS`; RFC-0171 §3.6, chrony or ntpd, never
+/// systemd-timesyncd).
+#[test]
+fn the_packaged_unit_waits_for_a_bounded_clock() -> Result {
+    let path = packaged_unit();
+    let text =
+        std::fs::read_to_string(&path).map_err(|error| format!("{}: {error}", path.display()))?;
+    let unwaited = tally_wire::kernel_clock::unwaited(&text);
+    assert!(
+        unwaited.is_empty(),
+        "{} holds its clock waits wrongly: {unwaited:?}",
+        path.display()
+    );
+    Ok(())
+}
+
 #[test]
 fn the_packaged_unit_starts_a_relay_that_admits_feeders() -> Result {
     let path = packaged_unit();
@@ -916,8 +971,13 @@ const CORE_LINES: [&str; 20] = [
     "handshakes-per-sec",
 ];
 
-/// Ten cores, 24 GB and the harness's two areas, the configuration the 2026-10-09 runs measured,
-/// with the connection cap at 2,048 so the memory is to spare. A relay taking a base cell plans a
+/// Ten cores, 24 GB and the harness's two areas, the configuration the 2026-10-09 runs had, with
+/// the connection cap at 2,048. What it measures is how a relay plans ten cores: the stages'
+/// threads, what MLAT is given of what they leave, and the connections both admit
+/// (`tests/cores-10.txt`). It is no seat floor: since the clocks' error budget set the hosted
+/// MLAT's bins (`tally_wire::budget::MLAT_AHEAD` and `MLAT_SETTLE`), a seat's open raw is
+/// reserved over a longer span of its ceiling, and its seats are what its memory leaves. The
+/// floor is the world relay's (`tests/world-relay.txt`). A relay taking a base cell plans a
 /// member session for every connection the cap allows, and each holds its kernel socket buffers,
 /// a link dialled to it and an engine's place (`budget::Plan::connection_sockets`), and every
 /// connection under the cap may listen to the fan-out: at 5,024 they took some 10 GB before any
@@ -991,13 +1051,17 @@ fn the_cores_figures_the_rfc_quotes_are_the_relays_own() -> Result {
 
 /// The world's relay (RFC-0181 §9, "Admission"): 16 cores in a 32 GB container, no MLAT (it does
 /// not fit one box beside the world's feeders), the public relay's caps. The plan it prints is
-/// printed here, whole, so the RFC quotes what the relay says: its connection limit and `R_max`
-/// with what bound each, the feeders carried at the planned mean and at the ceiling a source is
-/// held to, every gauge's limit, the handshakes allowed at once and the totals against the
-/// memory with the allocator's share. And the same relay hosting MLAT, whose seats are its own
-/// pool and whose connections are fewer.
+/// held whole in `tests/world-relay.txt`, never prose, so what quotes it (RFC-0181's table, the
+/// seats RFC-0171 and `tally_wire::budget` weigh the hosted MLAT's settling against) reads what the
+/// relay says: its connection limit and `R_max` with what bound each, the feeders carried at the
+/// planned mean and at the ceiling a source is held to, every gauge's limit, the handshakes
+/// allowed at once and the totals against the memory with the allocator's share. And the same
+/// relay hosting MLAT, whose seats are its own pool and whose connections are fewer. A change to
+/// the plan fails here until the file is written again from what this test prints. Its floors,
+/// asserted here: more than 15,000 connections without MLAT, and 2,000 seats hosting it.
 #[test]
 fn the_world_relay_prints_what_it_admits() -> Result {
+    let printed = std::cell::RefCell::new(String::new());
     let world = |mlat: bool| -> Result<Checked> {
         let mut args = vec![
             "--memory-limit",
@@ -1021,17 +1085,26 @@ fn the_world_relay_prints_what_it_admits() -> Result {
         let checked = check(&args)?;
         assert!(checked.accepted, "{}", checked.refusal);
         assert_plan_holds(&checked)?;
-        println!(
-            "# tally-relay check {}{}",
+        let mut printed = printed.borrow_mut();
+        printed.push_str(&format!(
+            "# tally-relay check {}{}\n",
             args.join(" "),
             if mlat { "" } else { " (without MLAT)" }
-        );
+        ));
         for (name, value) in &checked.plan {
-            println!("{name} {value}");
+            printed.push_str(&format!("{name} {value}\n"));
         }
         Ok(checked)
     };
     let (hosting, without) = (world(true)?, world(false)?);
+    let printed = printed.into_inner();
+    print!("{printed}");
+    assert!(
+        include_str!("world-relay.txt") == printed,
+        "tally/crates/relay/tests/world-relay.txt is not what the relay plans: write this test's \
+         output there (`bazel test //crates/relay:check --test_output=all`) and quote it in \
+         RFC-0181, \"What it admits\":\n{printed}"
+    );
     // The relay's whole plan: the connections, the rate and what bound each.
     assert!(
         without.get("connection-limit")? > 15_000,
@@ -1039,7 +1112,54 @@ fn the_world_relay_prints_what_it_admits() -> Result {
         without.plan
     );
     assert_eq!(without.get("mlat-seats")?, 0);
-    assert!(hosting.get("mlat-seats")? > 0);
+    // The world relay hosting MLAT seats 2,000 receivers at least (RFC-0181's floor).
+    assert!(
+        hosting.get("mlat-seats")? >= 2_000,
+        "{} seats",
+        hosting.get("mlat-seats")?
+    );
     assert!(hosting.get("connection-limit")? < without.get("connection-limit")?);
+    Ok(())
+}
+
+/// `tally-relay check` with a state directory runs beside the live relay that holds it: the test
+/// holds the directory as a relay does (`durable::StateDir::open`, its lock), and a check naming it
+/// is accepted, makes no key there and leaves the lock with its holder. Before, a check opened the
+/// directory as a start does: it took the lock (refused here) and wrote the key.
+#[test]
+fn a_check_beside_the_live_relay_takes_no_lock_and_writes_no_key() -> Result {
+    let base = std::env::var_os("TEST_TMPDIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    let path = base.join(format!("check-state-{}", std::process::id()));
+    let fresh = path.join("fresh");
+    let _ = std::fs::remove_dir_all(&path);
+    let live = tally_relay::durable::StateDir::open(&path).map_err(|error| error.to_string())?;
+    let key = std::fs::read(path.join("strike.key")).map_err(|error| error.to_string())?;
+    let path_text = path.display().to_string();
+    let fresh_text = fresh.display().to_string();
+    for dir in [path_text.as_str(), fresh_text.as_str()] {
+        let checked = check(&[
+            "--memory-limit",
+            "4G",
+            "--cores",
+            "2",
+            "--key",
+            "k",
+            "--max-upload",
+            "10Mbit/s",
+            "--state-dir",
+            dir,
+        ])?;
+        assert!(checked.accepted, "{dir}: {}", checked.refusal);
+    }
+    assert_eq!(
+        std::fs::read(path.join("strike.key")).map_err(|error| error.to_string())?,
+        key
+    );
+    assert!(!fresh.join("strike.key").exists());
+    assert!(!fresh.join("lock").exists());
+    drop(live);
+    let _ = std::fs::remove_dir_all(&path);
     Ok(())
 }

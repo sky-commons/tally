@@ -1,6 +1,13 @@
 # The packaged units. //crates/relay:check holds the relay's to its memory budget, through
-# `tally-relay check` (RFC-0181 §9).
+# `tally-relay check` (RFC-0181 §9), and to the system calls its clock read makes.
 exports_files(
     ["tally-relay.service"],
     visibility = ["//crates/relay:__pkg__"],
+)
+
+# The feeder's: //crates/feed:unit holds its seccomp filter to the system calls its clock read
+# makes (`tally_wire::kernel_clock::SYSCALLS`).
+exports_files(
+    ["tally-feed.service"],
+    visibility = ["//crates/feed:__pkg__"],
 )

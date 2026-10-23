@@ -142,17 +142,7 @@ fn set(fd: RawFd, role: Role) {
     let (receive, send) = role.buffers();
     let option = |level: libc::c_int, name: libc::c_int, bytes: usize| {
         let value = libc::c_int::try_from(bytes).unwrap_or(libc::c_int::MAX);
-        // SAFETY: `setsockopt` reads one `c_int` from a live local for the length given, and
-        // changes only the socket's own options.
-        unsafe {
-            libc::setsockopt(
-                fd,
-                level,
-                name,
-                std::ptr::from_ref(&value).cast(),
-                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-            );
-        }
+        let _ = crate::os::set_socket_int(fd, level, name, value);
     };
     option(libc::SOL_SOCKET, libc::SO_RCVBUF, receive);
     option(libc::SOL_SOCKET, libc::SO_SNDBUF, send);
@@ -223,19 +213,9 @@ mod tests {
 
     /// What a socket was given, read back: the kernel reports the doubled value it charges.
     fn granted(stream: &tokio::net::TcpStream, name: libc::c_int) -> usize {
-        let mut value: libc::c_int = 0;
-        let mut length = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
-        // SAFETY: `getsockopt` writes one `c_int` and its length into live locals.
-        unsafe {
-            libc::getsockopt(
-                stream.as_raw_fd(),
-                libc::SOL_SOCKET,
-                name,
-                std::ptr::from_mut(&mut value).cast(),
-                &mut length,
-            );
-        }
-        usize::try_from(value).unwrap_or(0)
+        crate::os::socket_int(stream.as_raw_fd(), libc::SOL_SOCKET, name)
+            .and_then(|value| usize::try_from(value).ok())
+            .unwrap_or(0)
     }
 
     #[tokio::test]

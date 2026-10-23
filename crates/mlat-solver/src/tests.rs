@@ -1,8 +1,10 @@
 //! End-to-end tests over the simulator: tiles and assignment, the time-banded fit, calibration
 //! (single and joint), solving and verifying, determinism, and the verifiers' refusals.
 
+#![allow(clippy::disallowed_methods, reason = "a test's scripted readings")]
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
+use tally_wire::clocks::recorded::aligned;
 
 use crate::clock::{ClockModel, KNOT_PS, ModelTime};
 use crate::geo;
@@ -2262,7 +2264,7 @@ fn world_cluster(scenario: &Scenario, window: Window, threads: usize) -> Result<
     let simulation = sim::run_into_in_time_order(scenario, &mut |reception, _| {
         measured.made += 1;
         let bin = bin_of(reception.wall_ms);
-        let added = held.add_one(&reception, reception.wall_ms);
+        let added = held.add_one(&reception, aligned(reception.wall_ms));
         measured.wanted += added.new + added.late;
         measured.filtered += added.filtered;
         measured.late += added.late;

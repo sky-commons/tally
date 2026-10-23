@@ -81,6 +81,18 @@ pub enum Store {
     Orphans,
     /// The message exchange's generations of fingerprints (`exchange::DEDUP_GENERATIONS`).
     Dedup,
+    /// What the relay took from its feeders, which decides whether a copy is new (`strikes`,
+    /// RFC-0171 §3.6): each record's fingerprint over the window of time it may arrive in
+    /// (`strikes::Usable::life_seconds`), in the feeders' ring of every table, and each feeder's
+    /// place in the shares. A store of its own (`strikes::Class`), so whatever the feeders hold,
+    /// and however their sets grow, never takes the peers' room or the relay's own.
+    FeederStrikes,
+    /// What the relay took from its peers (members, relays, subscribers' fault proofs), as
+    /// [`Store::FeederStrikes`] holds the feeders'.
+    PeerStrikes,
+    /// What the relay took of its own making (its products, its engine's records, its figures,
+    /// what it rebuilt from parity), as [`Store::FeederStrikes`] holds the feeders'.
+    OwnStrikes,
     /// Subscriber queues: each item's own allocation and its slot in every queue that takes it
     /// (`fanout::item_charge`), over `fanout::BEHIND_MS`. Not a batch's decode or signed bytes.
     Fanout,
@@ -115,6 +127,16 @@ pub enum Store {
     /// use, over the sources a connection can bring (`shed::UNITS_PER_CONNECTION`). Past it the
     /// shedder tracks no more and judges the rest as one (`shed::Unit::Overflow`).
     Shed,
+    /// Every connection's pace state (`ingest`): what it holds of its own
+    /// (`ingest::OWN_BYTES_PER_CONNECTION`: its record pace, and a feeder's entry in the station
+    /// connections, `stations::CONNECTION_BYTES`) and its entries in the pace maps, its receiver's reception bucket
+    /// (`ingest::ReceptionCeilings`), its group's burst grant (`ingest::BurstGrants`) and its
+    /// group's directory share (`ingest::DirectoryPaces`), each table charged what it allocates
+    /// (`ingest::PaceRoom`). The maps take their entries' share alone (`Budget::pace_entries`), so
+    /// the own paces planned are always there; past it each map's newcomers share one entry.
+    /// Every connection is planned at `ingest::PACE_BYTES_PER_CONNECTION`: a feeder in its floor,
+    /// every other the caps allow before any feeder (`Plan::connection_paces`).
+    Paces,
     /// Every batch kept at ingest, as two allocations each charged once for its life: its decode
     /// (`tally_wire::Decoded`, the charge inside its shared allocation, `Decoded::from_verified_owned`)
     /// and its signed bytes (`Batch::owned_by`). However many stages hold them, neither is charged
@@ -123,6 +145,18 @@ pub enum Store {
     /// the signed bytes outlive their decode in the groups (`sharing::Deadlines::horizon_ms`, a
     /// relay's).
     Decoded,
+    /// The firehose credit's tables (`credit::Credit`): the evidence it keeps, the descriptions
+    /// it resolves references by, what relays' bundles show, the corroborations and the client
+    /// sessions it links, each table capped, charged as it allocates, and planned at its caps
+    /// before any feeder (`credit::PLANNED_BYTES`).
+    Credit,
+    /// The cache of freshness anchors verified here (`anchors::Anchors`): its slots, allocated
+    /// once whatever it holds, planned before any feeder (`anchors::PLANNED_BYTES`).
+    Anchors,
+    /// The receivers' station rows (`stations::Stations`, GET /stations): one for each receiver
+    /// described at most (`stations::STATIONS_REMEMBERED`), held at that cap whatever the relay
+    /// carries, planned before any feeder (`stations::PLANNED_BYTES`).
+    Stations,
 }
 
 /// What a store's size follows (`Store::driver`).
@@ -135,10 +169,13 @@ pub enum Driver {
     Rate,
     /// One per hosted MLAT seat, the seats being their own pool.
     Seat,
+    /// Nothing the relay admits: tables held at their caps whatever it carries, planned before
+    /// any feeder.
+    Fixed,
 }
 
 impl Store {
-    pub const ALL: [Self; 17] = [
+    pub const ALL: [Self; 24] = [
         Self::Batches,
         Self::Held,
         Self::Open,
@@ -146,6 +183,9 @@ impl Store {
         Self::Engine,
         Self::Orphans,
         Self::Dedup,
+        Self::FeederStrikes,
+        Self::PeerStrikes,
+        Self::OwnStrikes,
         Self::Fanout,
         Self::Delivery,
         Self::Figures,
@@ -155,7 +195,11 @@ impl Store {
         Self::Products,
         Self::Records,
         Self::Shed,
+        Self::Paces,
         Self::Decoded,
+        Self::Credit,
+        Self::Anchors,
+        Self::Stations,
     ];
 
     const fn index(self) -> usize {
@@ -181,7 +225,14 @@ impl Store {
             Self::Products => "products",
             Self::Records => "records",
             Self::Shed => "shed",
+            Self::Paces => "paces",
             Self::Decoded => "decoded",
+            Self::FeederStrikes => "feeder-strikes",
+            Self::PeerStrikes => "peer-strikes",
+            Self::OwnStrikes => "own-strikes",
+            Self::Credit => "credit",
+            Self::Anchors => "anchors",
+            Self::Stations => "stations",
         }
     }
 
@@ -189,14 +240,19 @@ impl Store {
     /// (RFC-0181 §9, "Admission"). Every store answers, with no default.
     pub const fn driver(self) -> Driver {
         match self {
-            Self::Buffers | Self::Delivery | Self::Figures | Self::Shed => Driver::Connection,
+            Self::Buffers | Self::Delivery | Self::Figures | Self::Shed | Self::Paces => {
+                Driver::Connection
+            }
             Self::Batches
             | Self::Dedup
             | Self::Fanout
             | Self::Ingest
             | Self::Epochs
             | Self::Products
-            | Self::Decoded => Driver::Rate,
+            | Self::Decoded
+            | Self::FeederStrikes
+            | Self::PeerStrikes
+            | Self::OwnStrikes => Driver::Rate,
             // Records are written by the members' sessions and this relay's MLAT, never by a
             // feeder's receptions: the seats, and the members' rate (`Plan::member_unit`).
             Self::Held
@@ -205,6 +261,18 @@ impl Store {
             | Self::Engine
             | Self::Orphans
             | Self::Records => Driver::Seat,
+            Self::Credit | Self::Anchors | Self::Stations => Driver::Fixed,
+        }
+    }
+
+    /// What a fixed store ([`Driver::Fixed`]) is planned at, whatever the relay carries: its
+    /// tables at their caps. Nothing for any other store.
+    pub const fn fixed_bytes(self) -> usize {
+        match self {
+            Self::Credit => crate::credit::PLANNED_BYTES,
+            Self::Anchors => crate::anchors::PLANNED_BYTES,
+            Self::Stations => crate::stations::PLANNED_BYTES,
+            _ => 0,
         }
     }
 
@@ -231,7 +299,27 @@ impl Store {
             | Self::Buffers
             | Self::Products
             | Self::Records
-            | Self::Shed => false,
+            | Self::Shed
+            | Self::Paces
+            | Self::FeederStrikes
+            | Self::PeerStrikes
+            | Self::OwnStrikes
+            | Self::Credit
+            | Self::Anchors
+            | Self::Stations => false,
+        }
+    }
+}
+
+impl Store {
+    /// The class of deliverer whose takes this store holds (`strikes::Class`), if it is one of
+    /// the stores of what is taken.
+    pub const fn strike_class(self) -> Option<crate::strikes::Class> {
+        match self {
+            Self::FeederStrikes => Some(crate::strikes::Class::Feeders),
+            Self::PeerStrikes => Some(crate::strikes::Class::Peers),
+            Self::OwnStrikes => Some(crate::strikes::Class::Own),
+            _ => None,
         }
     }
 }
@@ -255,10 +343,17 @@ pub struct PerFeeder {
     pub products: usize,
     pub records: usize,
     pub shed: usize,
+    pub paces: usize,
+    pub feeder_strikes: usize,
+    pub peer_strikes: usize,
+    pub own_strikes: usize,
     pub decoded: usize,
-    /// A connection's pace state outside any store: its record pace, its reception bucket and its
-    /// share's counters ([`PACE_STATE_BYTES`]). Part of a connection's floor.
-    pub pace: usize,
+    /// Always nothing: the credit's tables are planned before any feeder (`Store::Credit`).
+    pub credit: usize,
+    /// Always nothing: the anchor cache is planned before any feeder (`Store::Anchors`).
+    pub anchors: usize,
+    /// Always nothing: the station rows are planned before any feeder (`Store::Stations`).
+    pub stations: usize,
     /// What the kernel charges a feeder's socket at most, outside any store: its buffers pinned
     /// (`sockets::FEEDER_KERNEL_BYTES`). Part of a connection's floor.
     pub sockets: usize,
@@ -274,7 +369,6 @@ impl PerFeeder {
             }
         }
         if driver == Driver::Connection {
-            kept.pace = self.pace;
             kept.sockets = self.sockets;
         }
         kept
@@ -315,7 +409,14 @@ impl PerFeeder {
             Store::Products => self.products = bytes,
             Store::Records => self.records = bytes,
             Store::Shed => self.shed = bytes,
+            Store::Paces => self.paces = bytes,
+            Store::FeederStrikes => self.feeder_strikes = bytes,
+            Store::PeerStrikes => self.peer_strikes = bytes,
+            Store::OwnStrikes => self.own_strikes = bytes,
             Store::Decoded => self.decoded = bytes,
+            Store::Credit => self.credit = bytes,
+            Store::Anchors => self.anchors = bytes,
+            Store::Stations => self.stations = bytes,
         }
     }
 
@@ -337,17 +438,25 @@ impl PerFeeder {
             Store::Products => self.products,
             Store::Records => self.records,
             Store::Shed => self.shed,
+            Store::Paces => self.paces,
+            Store::FeederStrikes => self.feeder_strikes,
+            Store::PeerStrikes => self.peer_strikes,
+            Store::OwnStrikes => self.own_strikes,
             Store::Decoded => self.decoded,
+            Store::Credit => self.credit,
+            Store::Anchors => self.anchors,
+            Store::Stations => self.stations,
         }
     }
 
     /// What one feeder's worth of the members' shared rate costs each store: a feeder's, but for
     /// the connection's own buffers and sockets, which each member's connection takes from the
-    /// connections' room (`Plan::connection_buffers`, `Plan::connection_sockets`), and its pace.
+    /// connections' room (`Plan::connection_buffers`, `Plan::connection_sockets`,
+    /// `Plan::connection_paces`).
     pub fn as_member(&self) -> Self {
         Self {
             buffers: 0,
-            pace: 0,
+            paces: 0,
             sockets: 0,
             ..*self
         }
@@ -356,7 +465,6 @@ impl PerFeeder {
     /// The sum of two costs, store by store.
     pub fn plus(&self, other: &Self) -> Self {
         let mut sum = Self {
-            pace: self.pace.saturating_add(other.pace),
             sockets: self.sockets.saturating_add(other.sockets),
             ..Self::default()
         };
@@ -368,11 +476,9 @@ impl PerFeeder {
 
     /// Every store's cost together: what admitting one feeder reserves.
     pub fn total(&self) -> usize {
-        Store::ALL
-            .iter()
-            .fold(self.pace.saturating_add(self.sockets), |sum, store| {
-                sum.saturating_add(self.of(*store))
-            })
+        Store::ALL.iter().fold(self.sockets, |sum, store| {
+            sum.saturating_add(self.of(*store))
+        })
     }
 
     /// What one feeder at the planned rate costs each store over that store's window, on a relay
@@ -401,23 +507,27 @@ impl PerFeeder {
         let decoded_ms = decoded_window_ms(holds_raw) as usize;
         Self {
             // What the sharing groups allocate themselves over the repair horizon, on a relay
-            // with sharing members only: a record's entry (its piece, the signed bytes being its
-            // batch's own allocation, `Store::Decoded`), and its parity, which the groups hold as
-            // long. A parity is as long as its manifest's longest stripe slice, at most its
-            // records' signed bytes, which the rate holds to its bytes over
-            // `ingest::CHARGED_PER_SIGNED` (`ingest::rate_cost`); and its
-            // own overhead (`sharing::parity::OVERHEAD`) a second. And the parities addressed to
-            // members waiting in the outbox for the next network tick (`network::TICK`), a second's
-            // to each child of the stripe trees (`stripes::FANOUT`), a tick of it. (Once handed to a
-            // member's link, a send keeps this charge and takes its link's share too,
-            // `Plan::member_links`.) Not rounded up: the horizon is in milliseconds.
+            // with sharing members only (`footprint`): a record's entry (its place in its group's
+            // tree, its piece and its first sender, `sharing::member::PIECE_ENTRY_BYTES`, the
+            // signed bytes being its batch's own allocation, `Store::Decoded`), and its parity,
+            // which the groups hold as long. A parity is as long as its manifest's longest stripe
+            // slice, at most its records' signed bytes, which the rate holds to its bytes over
+            // `ingest::CHARGED_PER_SIGNED` (`ingest::rate_cost`); and its entry
+            // (`sharing::member::PARITY_ENTRY_BYTES`) a second. The trees of the group its records
+            // go to, at most one more for each feeder (`sharing::member::GROUP_TREES_BYTES`). And
+            // the parities addressed to members waiting in the outbox for the next network tick
+            // (`network::TICK`), a second's to each child of the stripe trees
+            // (`stripes::FANOUT`), a tick of it. (Once handed to a member's link, a send keeps this
+            // charge and takes its link's share too, `Plan::member_links`.) Not rounded up: the
+            // horizon is in milliseconds.
             batches: if sharing {
                 (records * crate::sharing::member::PIECE_ENTRY_BYTES
                     + signed
-                    + crate::sharing::parity::OVERHEAD)
+                    + crate::sharing::member::PARITY_ENTRY_BYTES)
                     * horizon_ms
                     / 1_000
-                    + (signed + crate::sharing::parity::OVERHEAD)
+                    + crate::sharing::member::GROUP_TREES_BYTES
+                    + crate::sharing::outbox_parity_bytes(signed)
                         * crate::sharing::stripes::FANOUT
                         * crate::network::TICK.as_millis() as usize
                         / 1_000
@@ -461,9 +571,12 @@ impl PerFeeder {
                 0
             },
             // The engine's own tables (`Engine`): the receptions a seat may have waiting for
-            // provisional solving, and its share of a window step's working set.
+            // provisional solving, as they allocate at most (`provisional::waiting_planned`), and
+            // its share of a window step's working set. The address shards' trees as they are
+            // whatever they hold, and the aircraft they keep, are held before any feeder
+            // (`provisional::TABLES_PLANNED_BYTES`, `Plan::mlat_tables`).
             engine: if holds_raw {
-                tally_mlat::engine::WAITING_PER_RECEIVER * tally_mlat::provisional::WAITING_BYTES
+                tally_mlat::provisional::waiting_planned(tally_mlat::engine::WAITING_PER_RECEIVER)
                     + crate::mlat_host::SOLVE_BYTES_PER_RECEIVER
             } else {
                 0
@@ -474,9 +587,12 @@ impl PerFeeder {
             // (`exchange::DEDUP_BYTES_PER_RECEPTION_PER_SEC`; what they allocate whatever the rate,
             // `exchange::DEDUP_FIXED_BYTES`, is held before any feeder, `Plan::before_feeders`).
             dedup: receptions * crate::exchange::DEDUP_BYTES_PER_RECEPTION_PER_SEC,
-            // A subscriber's queue holds `BEHIND_MS` of inbound: each item's own allocation once,
-            // and its slot in the queue of every session that may take it (`fanout::item_charge`);
-            // nothing where no session listens (an item no queue takes is not charged).
+            // A subscriber's queue holds `BEHIND_MS` of inbound: each item's own allocation once
+            // (`fanout::item_charge`), and its slot in the queue of every session that may take it,
+            // as a queue that keeps a quarter again what it holds allocates it, or its place in
+            // that session's hand (`fanout::SLOT_BYTES`); nothing where no session listens (an item
+            // no queue takes is not charged). What each session's queue keeps whatever it holds is
+            // held before any feeder (`fanout::LISTENER_BYTES`, `Plan::before_feeders`).
             fanout: if listeners == 0 {
                 0
             } else {
@@ -485,8 +601,10 @@ impl PerFeeder {
                     * crate::fanout::BEHIND_MS as usize
                     / 1_000
             },
-            // A delivery tag per batch over the audit window, at the most one receiver may hold
-            // (`delivery::PER_RECEIVER_BYTES`), whatever it sends.
+            // A delivery tag per batch over the audit window, at the most one receiver may hold,
+            // with what its lists, its record and its streams allocate
+            // (`delivery::PER_RECEIVER_BYTES`), whatever it sends; the shards' tables as they are
+            // kept whatever they hold are held before any feeder (`delivery::FIXED_BYTES`).
             delivery: crate::delivery::PER_RECEIVER_BYTES,
             // A receiver's feeder figures row, whatever it sends (`figures::PER_RECEIVER_BYTES`).
             figures: crate::figures::PER_RECEIVER_BYTES,
@@ -525,6 +643,21 @@ impl PerFeeder {
             },
             // The sources the ingest rate tracks (`shed`): the ones a connection brings.
             shed: crate::shed::BYTES_PER_UNIT * crate::shed::UNITS_PER_CONNECTION,
+            // What the relay took in (`strikes`): each record's fingerprint for as long as a copy
+            // of it may arrive, at the most a table holds an entry at, its set growing
+            // (`strikes::PLANNED_ENTRY_BYTES`), whether or not the relay has sharing members (a
+            // feeder's batch comes again on its reconnect, a peer's copy by another path). The
+            // feeders' store: the feeder's records over the longest one of them lives
+            // (`Usable::feeder_life_seconds`), twice, since the feeders together may hold twice
+            // their share (`strikes::Shares`), its place in the shares among them
+            // (`strikes::feeder_place_bytes`). The relay's own store: its own records for its
+            // worth of load over theirs (`own_records_per_feeder`, `Usable::own_life_seconds`)
+            // and the feeder figures held for it.
+            feeder_strikes: feeder_strikes_bytes(records),
+            peer_strikes: 0,
+            own_strikes: own_strikes_bytes(
+                crate::strikes::own_records_per_feeder(holds_raw) as usize
+            ),
             // Every batch kept, its decode and its signed bytes, each charged once for its life,
             // at most what it was charged at ingest: over the longest any holder keeps a decode
             // (`decoded_window_ms`), and where the sharing groups hold its signed bytes, those
@@ -536,10 +669,72 @@ impl PerFeeder {
                 } else {
                     0
                 },
-            pace: PACE_STATE_BYTES,
+            // Its pace state (`paces`): its own pace and its entries in the pace maps.
+            paces: crate::ingest::PACE_BYTES_PER_CONNECTION,
+            // The credit's tables are planned before any feeder (`Store::Credit`).
+            credit: 0,
+            // The anchor cache is planned before any feeder (`Store::Anchors`).
+            anchors: 0,
+            // The station rows are planned before any feeder (`Store::Stations`).
+            stations: 0,
             sockets: crate::sockets::FEEDER_KERNEL_BYTES,
         }
     }
+}
+
+/// What `Store::FeederStrikes` holds for a planned feeder's worth of load: the feeders' share for
+/// it ([`feeder_share_entries`] of its `records` a second, its place among them), twice (the
+/// feeders together may hold twice their share, `strikes::Shares`), each at
+/// `strikes::PLANNED_ENTRY_BYTES`.
+const fn feeder_strikes_bytes(records: usize) -> usize {
+    2 * feeder_share_entries(records as u64) as usize * crate::strikes::PLANNED_ENTRY_BYTES
+}
+
+/// What `Store::OwnStrikes` holds for a planned feeder's worth of load: the relay's `own` records
+/// for it over theirs (`strikes::Usable::own_life_seconds` of the relay-signed kinds), and the
+/// feeder figures held for it (`strikes::FIGURES_HELD_PER_FEEDER`), each at
+/// `strikes::PLANNED_ENTRY_BYTES`.
+const fn own_strikes_bytes(own: usize) -> usize {
+    (own * own_life_seconds() as usize + crate::strikes::FIGURES_HELD_PER_FEEDER as usize)
+        * crate::strikes::PLANNED_ENTRY_BYTES
+}
+
+/// The feeders' share together for each connection admitted (`strikes::Entries::feeders`), in
+/// entries: its `records` a second over the longest a feeder's entry of its batches lives
+/// (`strikes::Usable::feeder_life_seconds` of `Usable::BATCHES`), and its place in the shares
+/// with its counts, as the shares charge it (`strikes::FEEDER_PLACE_ENTRIES`). The store holds
+/// twice it ([`feeder_strikes_bytes`]), as the feeders may hold.
+const fn feeder_share_entries(records: u64) -> u64 {
+    records * crate::strikes::Usable::BATCHES.feeder_life_seconds()
+        + crate::strikes::FEEDER_PLACE_ENTRIES as u64
+}
+
+/// A connection's part of the feeders' share is planned in the store twice, the most the
+/// feeders may hold together (`strikes::Shares::take`), at the rate the relay-wide rate admits
+/// for it (`cores::RECORDS_PER_PLANNED_FEEDER`), its place included.
+const _: () = assert!(
+    feeder_strikes_bytes(crate::cores::RECORDS_PER_PLANNED_FEEDER as usize)
+        >= 2 * (feeder_share_entries(crate::cores::RECORDS_PER_PLANNED_FEEDER) as usize)
+            * crate::strikes::PLANNED_ENTRY_BYTES
+        && feeder_share_entries(crate::cores::RECORDS_PER_PLANNED_FEEDER) as usize
+            * crate::strikes::PLANNED_ENTRY_BYTES
+            >= crate::strikes::feeder_place_bytes(crate::strikes::Usable::BATCHES)
+);
+
+/// The longest a peer's copy's entry lives, of the kinds a peer delivers at a rate (its batches
+/// and the relay-signed kinds; a fault proof is rare, and a flood of them fills the peers' share
+/// and no more): a batch's, the longer (`strikes::Usable::life_seconds`).
+const fn peer_life_seconds() -> u64 {
+    let batches = crate::strikes::Usable::BATCHES.life_seconds();
+    let relay =
+        crate::strikes::Usable::relay_signed(crate::sharing::Deadlines::RELAY).life_seconds();
+    if batches > relay { batches } else { relay }
+}
+
+/// The longest the relay's own record's entry lives (`strikes::Usable::own_life_seconds` of the
+/// relay-signed kinds).
+const fn own_life_seconds() -> u64 {
+    crate::strikes::Usable::relay_signed(crate::sharing::Deadlines::RELAY).own_life_seconds()
 }
 
 /// What a decode is held for at most, by the holder that keeps it longest, each by a deadline its
@@ -578,16 +773,11 @@ pub const fn inflated_of_charged(charged: usize) -> usize {
         / (tally_wire::decoded::OBSERVATION_FIXED + std::mem::size_of::<tally_wire::ObsRef>())
 }
 
-/// What a connection's pace state holds outside any store: its record pace (`ingest::RecordPace`,
-/// a rate, a burst and a locked token count), its entry in the reception ceilings
-/// (`ingest::ReceptionCeilings`, a key and two numbers), each tens of bytes in a map; planned at
-/// a kibibyte. (Its share of the ingest rate is a store, `Store::Shed`.)
-pub const PACE_STATE_BYTES: usize = 1 << 10;
-
 /// The rate the RFC sizes one feeder to: about 600 receptions and 8 KB of signed batches a second
-/// (RFC-0181, "Requirement").
+/// (RFC-0181, "Requirement"), one batch a second, carrying its freshness anchors at the most a
+/// batch carries (`tally_wire::batch::ANCHORS_MAX_LEN`, RFC-0171 §3.6) beside them.
 pub const PLANNED_RECEPTIONS_PER_SEC: usize = 600;
-pub const PLANNED_BYTES_PER_SEC: usize = 8 * 1024;
+pub const PLANNED_BYTES_PER_SEC: usize = 8 * 1024 + tally_wire::batch::ANCHORS_MAX_LEN;
 /// That feeder's batches as the relay charges them (`ingest::charge_of`: signed, inflated, a
 /// reference for each reception they can hold, and the headers of the allocations they make), one
 /// batch a second: the unit `R_max`'s bytes are counted in (`Admission::bytes_per_sec`), the
@@ -658,6 +848,9 @@ pub struct Plan {
     /// `--max-feeder-bytes-per-sec`): each costs the ingest workers a verification whatever its
     /// size, so the cores carry fewer feeders the more each may send (`cores::Source`).
     pub feeder_records_per_sec: u64,
+    /// The bundle indexes the relay signs a second (`sharing::bundles::planned_indexes_per_sec`):
+    /// one for each parent it may offer of the regions it takes and each shared product, at most.
+    pub bundle_indexes_per_sec: u64,
 }
 
 impl Plan {
@@ -681,6 +874,7 @@ impl Plan {
             feeder_records_per_sec: crate::ingest::records_per_sec(
                 crate::hub::DEFAULT_MAX_FEEDER_BYTES_PER_SEC,
             ),
+            bundle_indexes_per_sec: 0,
         }
     }
 
@@ -845,13 +1039,24 @@ impl Plan {
             per_rate: PerFeeder::planned_for(
                 self.holds_raw,
                 self.members > 0,
-                self.sessions
-                    .general
-                    .saturating_add(self.sessions.subscribers),
+                self.fanout_listeners(),
             )
             .rate(),
             ..self
         }
+    }
+
+    /// Every session that joins the fan-out (`Hub::listen`): those under the connection cap (a
+    /// relay or engine link, a dialled parent's directory link, `link::serve`), the subscribers,
+    /// and the member sessions, which hold places of their own outside the cap and each join it as
+    /// a directory link (`Peer::Member`). Before, the member sessions were left out, so a relay
+    /// taking base cells with thousands of them charged queues past what `Store::Fanout` was
+    /// planned for.
+    pub fn fanout_listeners(&self) -> usize {
+        self.sessions
+            .general
+            .saturating_add(self.sessions.subscribers)
+            .saturating_add(self.members)
     }
 
     /// The kernel's socket buffers of every connection but a feeder's (whose are its floor's,
@@ -892,12 +1097,63 @@ impl Plan {
             .saturating_add(seconds.saturating_mul(second))
     }
 
+    /// What the fan-out's queues allocate whatever they hold (`fanout::LISTENER_BYTES` each): every
+    /// session that may take a batch from it (`Plan::fanout_listeners`), charged to `Store::Fanout`
+    /// beside what its items' slots take for each feeder.
+    pub fn fanout_queues(&self) -> usize {
+        self.fanout_listeners()
+            .saturating_mul(crate::fanout::LISTENER_BYTES)
+    }
+
+    /// What the sharing outbox's slots keep beyond what each send takes, on a relay with sharing
+    /// members (`sharing::OUTBOX_FIXED_BYTES`), charged to `Store::Batches`.
+    pub fn sharing_outbox(&self) -> usize {
+        if self.members == 0 {
+            0
+        } else {
+            crate::sharing::OUTBOX_FIXED_BYTES
+        }
+    }
+
+    /// What hosted MLAT's stores allocate whatever they hold, where MLAT is hosted: the notes'
+    /// inboxes and intervals (`Store::Notes`, `mlat_host::NOTES_FIXED_BYTES`), the trees' roots
+    /// of the batches waiting (`Store::Orphans`, `mlat_host::ORPHANS_FIXED_BYTES`), and provisional
+    /// solving's address shards (`Store::Engine`, `provisional::TABLES_PLANNED_BYTES`).
+    pub fn mlat_tables(&self) -> usize {
+        [Store::Notes, Store::Orphans, Store::Engine]
+            .into_iter()
+            .map(|store| self.mlat_tables_of(store))
+            .sum()
+    }
+
+    /// What [`Plan::mlat_tables`] holds of `store`.
+    pub fn mlat_tables_of(&self, store: Store) -> usize {
+        if !self.holds_raw {
+            return 0;
+        }
+        match store {
+            Store::Notes => crate::mlat_host::NOTES_FIXED_BYTES,
+            Store::Orphans => crate::mlat_host::ORPHANS_FIXED_BYTES,
+            Store::Engine => tally_mlat::provisional::TABLES_PLANNED_BYTES,
+            _ => 0,
+        }
+    }
+
     /// The Noise buffers of every connection but a feeder's the caps allow
     /// (`ingest::BUFFERS_PER_CONNECTION` each, reading and writing): those under the connection
     /// cap, the member sessions and the subscribers (`Hub::plan`), from which each carves its own.
     pub fn connection_buffers(&self) -> usize {
         self.connections
             .saturating_mul(crate::ingest::BUFFERS_PER_CONNECTION)
+    }
+
+    /// The pace state of every connection but a feeder's the caps allow
+    /// (`ingest::PACE_BYTES_PER_CONNECTION` each): those under the connection cap, the member
+    /// sessions and the subscribers (`Hub::plan`), charged to `Store::Paces` beside the feeders'
+    /// floors.
+    pub fn connection_paces(&self) -> usize {
+        self.connections
+            .saturating_mul(crate::ingest::PACE_BYTES_PER_CONNECTION)
     }
 
     /// What waits for the member links this relay dials (`peers`), at most: each member session
@@ -924,21 +1180,47 @@ impl Plan {
 
     /// Every part of what the relay holds before any feeder, each under the name `tally-relay
     /// check` prints it by: its base, what the fingerprints' tables allocate whatever the rate
-    /// (charged to `Store::Dedup` beside the rate's), the connections' Noise buffers and kernel
+    /// (charged to `Store::Dedup` beside the rate's), what waits for the sealer whatever it holds
+    /// (`Store::Epochs`), the tables of what was taken
+    /// (`Store::FeederStrikes`, `Store::PeerStrikes`, `Store::OwnStrikes`), the delivery shards' tables as kept whatever they hold
+    /// (`Store::Delivery`, beside its connections' floors), the connections' Noise buffers and kernel
     /// socket buffers,
-    /// the members' pool, what waits for the member links and the parities being reassembled. The
+    /// the members' pool, what waits for the member links, the parities being reassembled, the
+    /// credit's tables, the cache of verified anchors (`Store::Anchors`) and the station rows
+    /// (`Store::Stations`). The
     /// one list [`Plan::before_feeders`] sums and `check` prints, so a part planned is a part
     /// printed: a room added here and nowhere else is in both, and the deploy checks that add the
     /// lines up (`before-feeders`) never sum a list of their own.
-    pub fn before_feeders_parts(&self) -> [(&'static str, usize); 7] {
+    pub fn before_feeders_parts(&self) -> [(&'static str, usize); 19] {
         [
             ("base", self.base),
             ("dedup-tables", crate::exchange::DEDUP_FIXED_BYTES),
+            ("epochs-fixed", crate::exchange::EPOCHS_FIXED_BYTES),
+            (
+                "feeder-strike-tables",
+                self.strike_tables_bytes(crate::strikes::Class::Feeders),
+            ),
+            (
+                "peer-strike-tables",
+                self.strike_tables_bytes(crate::strikes::Class::Peers),
+            ),
+            (
+                "own-strike-tables",
+                self.strike_tables_bytes(crate::strikes::Class::Own),
+            ),
+            ("delivery-tables", crate::delivery::FIXED_BYTES),
+            ("fanout-queues", self.fanout_queues()),
+            ("sharing-outbox", self.sharing_outbox()),
+            ("mlat-tables", self.mlat_tables()),
             ("connection-buffers", self.connection_buffers()),
             ("connection-sockets", self.connection_sockets()),
+            ("connection-paces", self.connection_paces()),
             ("member-pool", self.member_pool()),
             ("member-links", self.member_links()),
             ("parity-assembly", self.parity_assembly()),
+            ("credit-tables", crate::credit::PLANNED_BYTES),
+            ("anchor-cache", crate::anchors::PLANNED_BYTES),
+            ("station-rows", crate::stations::PLANNED_BYTES),
         ]
     }
 
@@ -993,7 +1275,148 @@ impl Plan {
             .plus(&self.per_rate)
             .plus(&self.per_seat);
         unit.records = crate::products::records_per_feeder(PLANNED_RECEPTIONS_PER_SEC);
+        // What the relay takes in of its worth (`strikes`), nothing in the feeders' store: in the
+        // peers', its records as the peers deliver them, at most twice their rate (a peer below
+        // its fair share is taken while another floods the rest, `strikes::Shares`); in the
+        // relay's own, as the relay rebuilds them from parity, each over the longest a peer's copy
+        // lives (`Usable::life_seconds`), and the relay's own records for its worth of load, and
+        // its figures. The members' places in the shares are theirs, before any feeder
+        // (`Plan::strike_tables_bytes`).
+        let member = crate::ingest::MEMBER_RECORDS_PER_FEEDER * peer_life_seconds();
+        unit.feeder_strikes = 0;
+        unit.peer_strikes = (2 * member) as usize * crate::strikes::PLANNED_ENTRY_BYTES;
+        unit.own_strikes = member as usize * crate::strikes::PLANNED_ENTRY_BYTES
+            + own_strikes_bytes(crate::strikes::own_records_per_feeder(self.holds_raw) as usize);
         unit
+    }
+
+    /// The same plan with the bundle indexes its relay signs a second (`bundle_indexes_per_sec`,
+    /// `sharing::bundles::planned_indexes_per_sec` of the regions it takes).
+    #[must_use]
+    pub fn with_bundle_indexes(self, per_sec: u64) -> Self {
+        Self {
+            bundle_indexes_per_sec: per_sec,
+            ..self
+        }
+    }
+
+    /// The records a second the relay signs whatever its feeders: its bundle indexes, and hosting
+    /// MLAT its engine's last record of each form a step (`strikes::ENGINE_RECORDS_FIXED`).
+    fn own_records_fixed(&self) -> u64 {
+        self.bundle_indexes_per_sec
+            + if self.holds_raw {
+                crate::strikes::ENGINE_RECORDS_FIXED
+            } else {
+                0
+            }
+    }
+
+    /// What each class's store of what is taken holds before any feeder (`strikes::Class`): its
+    /// ring of generations in every table it may take in (`strikes::Strikes::fixed_bytes`: the
+    /// feeders' in each ingest shard's alone; the peers' and the relay's own in each ingest
+    /// shard's, positions', provisional positions', clock models', fault proofs', what is passed
+    /// on by hash, and feeder figures'), and its table of places in the shares as it is kept
+    /// whatever it holds (`strikes::PLACES_FIXED_BYTES`). Beside them, in the peers' store, the
+    /// one record a second the peers' share allows a relay whose members' rate plans none and the
+    /// peers' places, twice as the peers may hold; in the relay's own, that record once, the
+    /// records the relay signs whatever its load (`own_records_fixed`) over their life, and the
+    /// relay's place with its counts (`strikes::place_bytes`).
+    pub fn strike_tables_bytes(&self, class: crate::strikes::Class) -> usize {
+        use crate::strikes::{Class, PLACES_FIXED_BYTES, PLANNED_ENTRY_BYTES, Strikes, Usable};
+        let deadlines = crate::sharing::Deadlines::RELAY;
+        let figures = Usable::figures(crate::strikes::relay_signed(deadlines));
+        let batches = crate::exchange::SHARDS * Strikes::fixed_bytes(Usable::BATCHES);
+        // Positions', provisional positions', clock models' and what is passed on by hash;
+        // fault proofs'; feeder figures'.
+        let others = 4 * Strikes::fixed_bytes(Usable::relay_signed(deadlines))
+            + Strikes::fixed_bytes(Usable::proofs(deadlines))
+            + Strikes::fixed_bytes(figures);
+        // The one record a second the peers' share allows a relay whose members' rate plans none
+        // (`ingest::member_records_per_sec`), held as the members' unit holds theirs: twice as the
+        // peers', once as the relay's own.
+        let members = self.member_feeders as u64;
+        let unplanned = crate::ingest::member_records_per_sec(self.member_feeders)
+            .saturating_sub(members * crate::ingest::MEMBER_RECORDS_PER_FEEDER)
+            as usize
+            * peer_life_seconds() as usize
+            * PLANNED_ENTRY_BYTES;
+        match class {
+            Class::Feeders => batches + PLACES_FIXED_BYTES,
+            Class::Peers => {
+                // The peers' places, as their share charges them (`strikes::PEER_PLACE_ENTRIES`
+                // each, a place for each session on a link and one at least), twice as the peers
+                // may hold.
+                let places = 2 * self.peer_places() * crate::strikes::PEER_PLACE_ENTRIES;
+                batches + others + PLACES_FIXED_BYTES + 2 * unplanned + places * PLANNED_ENTRY_BYTES
+            }
+            Class::Own => {
+                let own = self.own_records_fixed() as usize
+                    * own_life_seconds() as usize
+                    * PLANNED_ENTRY_BYTES;
+                let place = crate::strikes::place_bytes(Usable::BATCHES, figures);
+                batches + others + PLACES_FIXED_BYTES + unplanned + own + place
+            }
+        }
+    }
+
+    /// The peers' places the peers' share holds (`strikes::Entries::peers`): one for each session
+    /// that may deliver as a peer (`Origin::Peer`), which is every session on a link
+    /// ([`Plan::fanout_listeners`]: those under the connection cap, the subscribers, each of whom
+    /// may send a fault proof, and the member sessions), and one at least. Before, only the
+    /// member sessions were planned, so on a relay with none a second subscriber's fault proof
+    /// found no room for its place and was let go.
+    fn peer_places(&self) -> usize {
+        self.fanout_listeners().max(1)
+    }
+
+    /// The entries each kind of deliverer may hold (`strikes::Entries`), from what the plan
+    /// carries at `admission`: a feeder's records a second over the longest a feeder's entry
+    /// lives, and the feeders' together what the store holds for each connection admitted, half
+    /// of it as they may hold twice their share, their places among their entries
+    /// ([`feeder_share_entries`]; so feeders churning fresh keys fill the feeders' part of the
+    /// store and no more); the members' records a second over a peer's copy's and the peers'
+    /// places, the peers' share together; and
+    /// the relay's own, its records for every feeder it admits and every feeder the members' rate
+    /// is planned as, and whatever its load over theirs, its figures, and the
+    /// members' records it rebuilds from parity over a peer's copy's. What the stores are planned
+    /// at for each (`PerFeeder::strikes`, `Plan::member_unit`, `Plan::strike_tables_bytes`).
+    pub fn strike_entries(&self, admission: &Admission) -> crate::strikes::Entries {
+        let batches = crate::strikes::Usable::BATCHES;
+        let members = crate::ingest::member_records_per_sec(self.member_feeders);
+        // Its own records follow the feeders it holds, one share each, as the store holds them
+        // (`PerFeeder::strikes` for each connection admitted, `Plan::member_unit` for each of
+        // the members' feeders).
+        let feeders = (admission.connections as u64).saturating_add(self.member_feeders as u64);
+        let own = feeders
+            .saturating_mul(crate::strikes::own_records_per_feeder(self.holds_raw))
+            .saturating_add(self.own_records_fixed());
+        let entries = |count: u64| usize::try_from(count).unwrap_or(usize::MAX);
+        let feeder = self
+            .feeder_records_per_sec
+            .saturating_mul(batches.feeder_life_seconds());
+        crate::strikes::Entries {
+            feeder: entries(feeder),
+            // As the store holds them (`PerFeeder::strikes`): the rate the relay-wide rate admits
+            // for each connection, not each feeder's own ceiling, its place among them.
+            feeders: entries(
+                feeder_share_entries(crate::cores::RECORDS_PER_PLANNED_FEEDER)
+                    .saturating_mul(admission.connections as u64),
+            ),
+            peer: entries(members.saturating_mul(peer_life_seconds())),
+            // The peers' together, their places among their entries.
+            peers: entries(
+                members.saturating_mul(peer_life_seconds()).saturating_add(
+                    (self.peer_places() * crate::strikes::PEER_PLACE_ENTRIES) as u64,
+                ),
+            ),
+            relay: entries(
+                own.saturating_mul(own_life_seconds())
+                    .saturating_add(members.saturating_mul(peer_life_seconds()))
+                    .saturating_add(
+                        feeders.saturating_mul(crate::strikes::FIGURES_HELD_PER_FEEDER),
+                    ),
+            ),
+        }
     }
 
     /// The members' pool: their shared rate's worth.
@@ -1248,24 +1671,14 @@ static TRIM_LAST_US: AtomicU64 = AtomicU64::new(0);
 /// without any trim, glibc's arenas kept up to 1.9 GB beside what was live at 2,000 feeders, which
 /// the 64 MiB headroom was documented to cover and did not. Elsewhere than glibc, nothing.
 pub fn bound_the_allocator() {
-    #[cfg(all(target_os = "linux", target_env = "gnu"))]
-    // SAFETY: `mallopt` only sets a parameter of the allocator; called before any thread starts.
-    unsafe {
-        libc::mallopt(libc::M_ARENA_MAX, MALLOC_ARENAS);
-        libc::mallopt(libc::M_MMAP_THRESHOLD, MMAP_THRESHOLD_BYTES);
-        libc::mallopt(libc::M_TRIM_THRESHOLD, TRIM_THRESHOLD_BYTES);
-    }
+    crate::os::set_allocator(MALLOC_ARENAS, MMAP_THRESHOLD_BYTES, TRIM_THRESHOLD_BYTES);
 }
 
 /// Returns every arena's free pages to the kernel (`malloc_trim(0)`), once, and records how long
 /// it took. Called only by the trimmer thread, never by a stage.
 pub fn trim_the_allocator() -> std::time::Duration {
     let began = std::time::Instant::now();
-    #[cfg(all(target_os = "linux", target_env = "gnu"))]
-    // SAFETY: `malloc_trim` only returns free pages of the allocator's own arenas.
-    unsafe {
-        libc::malloc_trim(0);
-    }
+    crate::os::trim_allocator();
     let took = began.elapsed();
     let micros = u64::try_from(took.as_micros()).unwrap_or(u64::MAX);
     TRIMS.fetch_add(1, Ordering::Relaxed);
@@ -1281,11 +1694,7 @@ pub fn spawn_allocator_trimmer(period: std::time::Duration) -> std::io::Result<(
     std::thread::Builder::new()
         .name("tally-malloc-trim".into())
         .spawn(move || {
-            #[cfg(target_os = "linux")]
-            // SAFETY: `setpriority` on this thread's own id touches no memory of ours.
-            unsafe {
-                libc::setpriority(libc::PRIO_PROCESS, crate::os::thread_id(), 19);
-            }
+            let _ = crate::os::run_at_lowest();
             loop {
                 std::thread::sleep(period);
                 trim_the_allocator();
@@ -2031,6 +2440,8 @@ pub struct Budget {
     member_links: Arc<Gauge>,
     /// The parities being reassembled (`Plan::parity_assembly`).
     parity_assembly: Arc<Gauge>,
+    /// The pace maps' entries' share of `Store::Paces` (`ingest::pace_entries_part`).
+    pace_entries: Arc<Gauge>,
 }
 
 impl Budget {
@@ -2048,6 +2459,7 @@ impl Budget {
             .iter()
             .map(|store| Gauge::new(*store, 0))
             .collect();
+        let pace_entries = gauges[Store::Paces.index()].share(crate::ingest::pace_entries_part);
         let budget = Self {
             memory: total.saturating_add(BASE_BYTES),
             plan: Plan {
@@ -2064,6 +2476,7 @@ impl Budget {
             connection_buffers: Gauge::new(Store::Buffers, 0),
             member_links: Gauge::new(Store::Batches, 0),
             parity_assembly: Gauge::new(Store::Batches, 0),
+            pace_entries,
         };
         budget.limit_gauges();
         budget
@@ -2092,6 +2505,18 @@ impl Budget {
     /// the budget's life, sized to the connection cap.
     pub fn connection_buffers(&self) -> Arc<Gauge> {
         Arc::clone(&self.connection_buffers)
+    }
+
+    /// A pace map's room (`ingest::PaceRoom`): charged to `Store::Paces` and to its entries'
+    /// share, which every map shares, so the maps together leave the connections' own paces their
+    /// room.
+    pub fn pace_room(&self) -> crate::ingest::PaceRoom {
+        crate::ingest::PaceRoom::within(&self.gauge(Store::Paces), &self.pace_entries)
+    }
+
+    /// The pace maps' entries' share of `Store::Paces`.
+    pub fn pace_entries(&self) -> Arc<Gauge> {
+        Arc::clone(&self.pace_entries)
     }
 
     /// The room what waits for the member links comes from, each link's share charged to it too
@@ -2393,11 +2818,25 @@ impl Budget {
             .member_unit()
             .of(store)
             .saturating_mul(self.plan.member_feeders);
-        // The fingerprints' tables allocate this whatever the rate (`Plan::before_feeders`).
-        let fixed = if store == Store::Dedup {
-            crate::exchange::DEDUP_FIXED_BYTES
-        } else {
-            0
+        // The fingerprints' tables, what waits for the sealer, the tables of what was taken, the
+        // delivery shards' orders, the
+        // fan-out's queues and the notes' inboxes allocate this whatever the rate
+        // (`Plan::before_feeders`).
+        let fixed = match store {
+            Store::Dedup => crate::exchange::DEDUP_FIXED_BYTES,
+            Store::Epochs => crate::exchange::EPOCHS_FIXED_BYTES,
+            Store::FeederStrikes => self
+                .plan
+                .strike_tables_bytes(crate::strikes::Class::Feeders),
+            Store::PeerStrikes => self.plan.strike_tables_bytes(crate::strikes::Class::Peers),
+            Store::OwnStrikes => self.plan.strike_tables_bytes(crate::strikes::Class::Own),
+            Store::Delivery => crate::delivery::FIXED_BYTES,
+            Store::Fanout => self.plan.fanout_queues(),
+            Store::Batches => self.plan.sharing_outbox(),
+            Store::Paces => self.plan.connection_paces(),
+            Store::Notes | Store::Orphans | Store::Engine => self.plan.mlat_tables_of(store),
+            Store::Credit | Store::Anchors | Store::Stations => store.fixed_bytes(),
+            _ => 0,
         };
         floors
             .saturating_add(rate)
@@ -2542,7 +2981,7 @@ mod tests {
     /// A signed batch of `receptions` receptions, its own.
     fn signed(receptions: u32) -> Result<tally_wire::Batch, String> {
         let receiver = tally_wire::Identity::generate().map_err(|error| error.to_string())?;
-        tally_wire::Batch::sign_with(
+        crate::anchors::anchored_with(
             &receiver,
             &tally_wire::BatchContent {
                 boot_id: 1,
@@ -2567,12 +3006,16 @@ mod tests {
 
     /// `batch` decoded as the ingest stage decodes it (`ingest::Stages::decode_owned`), its bytes
     /// and its decode charged to `gauge`, entered in `covered`.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "a test's batch, stamped at the clocks' origin"
+    )]
     fn owned(
         batch: tally_wire::Batch,
         gauge: &Arc<Gauge>,
         covered: &'static Covered,
     ) -> Result<Arc<tally_wire::Decoded>, String> {
-        crate::ingest::Stages::decode_owned(batch, crate::ingest::Stamp::default(), gauge, covered)
+        crate::ingest::Stages::decode_owned(batch, crate::ingest::Stamp::at(0, 0), gauge, covered)
             .map_err(|error| format!("{error:?}"))
     }
 
@@ -2697,10 +3140,17 @@ mod tests {
                     | Store::Batches
                     | Store::Buffers
                     | Store::Fanout
+                    // A fixed store: planned once for the relay, never per feeder.
+                    | Store::Credit
+                    | Store::Anchors
+                    | Store::Stations
+                    // What the peers deliver: the members' rate's, never a feeder's.
+                    | Store::PeerStrikes
             ) {
                 assert!(without.of(store) > 0, "{store:?}");
             }
         }
+        assert_eq!(with.of(Store::PeerStrikes), 0);
         // Records are written by MLAT's seats and the members, never a feeder: none without MLAT.
         assert_eq!(without.records, 0);
         assert!(with.records > 0);
@@ -2714,6 +3164,114 @@ mod tests {
         assert!(budget.ceiling() > 1_000);
         assert!(budget.check().is_ok());
         assert!(memory_available() > 0);
+    }
+
+    /// RFC-0181's figures for what a planned feeder's worth holds in the stores of what is taken,
+    /// from the constants: its entries' lives (102 s a feeder's batch, 44 s the relay's own, 117 s
+    /// a peer's copy), its place in entries, and the bytes: the feeders' store's, and the relay's
+    /// own, without and hosting MLAT.
+    #[test]
+    fn rfc_0181_quotes_the_strike_plan() {
+        use crate::strikes::{
+            FEEDER_PLACE_ENTRIES, PLANNED_ENTRY_BYTES, Usable, feeder_place_bytes,
+        };
+        assert_eq!(Usable::BATCHES.feeder_life_seconds(), 102);
+        assert_eq!(own_life_seconds(), 44);
+        assert_eq!(peer_life_seconds(), 117);
+        assert_eq!(PLANNED_ENTRY_BYTES, 32);
+        assert_eq!(
+            (
+                crate::strikes::PLACE_BYTES,
+                feeder_place_bytes(Usable::BATCHES)
+            ),
+            (741, 2_389)
+        );
+        assert_eq!(FEEDER_PLACE_ENTRIES, 75);
+        assert_eq!(feeder_share_entries(2), 279);
+        let records = crate::cores::RECORDS_PER_PLANNED_FEEDER as usize;
+        let own = |hosts_mlat| {
+            own_strikes_bytes(crate::strikes::own_records_per_feeder(hosts_mlat) as usize)
+        };
+        assert_eq!(
+            (feeder_strikes_bytes(records), own(false), own(true)),
+            (17_856, 2_880, 4_288)
+        );
+    }
+
+    /// RFC-0171 §3.6 and RFC-0181 §10: what is taken is planned for every class of deliverer at
+    /// once, each in a store of its own (`strikes::Class`), the relay's own records among them
+    /// (its products and, hosting MLAT, its engine's, for every planned feeder's worth of load and
+    /// whatever its load, its bundle indexes; the members' records it rebuilds): the feeders'
+    /// entries at the rate the relay admits from them together (every connection admitted a
+    /// planned feeder's records over the longest a feeder's entry lives, and its place: the
+    /// relay-wide rate holds the feeders to it together, so one feeder filling its own share,
+    /// `Entries::feeder`, takes from that rate and not past it), the feeders and the peers each
+    /// twice their share together, their places charged among their entries (a holder below its
+    /// fair part is taken while others hold the rest, `Shares::take`), the relay its whole share
+    /// and its place, each class's table of places, and each class's ring in every table it takes
+    /// in. Each at its peak, a set growing (`strikes::PLANNED_ENTRY_BYTES`). So each store holds
+    /// its class's share full, and a flood by any class (feeders churning fresh keys among them)
+    /// never reaches another's store.
+    #[test]
+    fn every_deliverers_share_of_what_is_taken_is_inside_the_store_planned() {
+        use crate::strikes::{Class, PLACES_FIXED_BYTES, PLANNED_ENTRY_BYTES, Strikes, Usable};
+        let deadlines = crate::sharing::Deadlines::RELAY;
+        let figures = Usable::figures(crate::strikes::relay_signed(deadlines));
+        for hosts_mlat in [false, true] {
+            for members in [0, 4] {
+                for bundles in [0, 285] {
+                    let plan = Plan::planned(hosts_mlat)
+                        .with_members(members, 16 * PLANNED_BYTES_PER_SEC as u64)
+                        .with_bundle_indexes(bundles);
+                    let budget = Budget::of_memory(Budget::memory_for(1_000, plan), plan);
+                    let admission = budget.admission();
+                    let entries = plan.strike_entries(&admission);
+                    assert!(entries.relay > 0 && entries.peer > 0 && entries.feeder > 0);
+                    // The feeders' together, places among their entries, are every connection
+                    // admitted at the rate the relay-wide rate admits for it, with its place.
+                    assert_eq!(
+                        entries.feeders,
+                        admission.connections
+                            * (crate::cores::RECORDS_PER_PLANNED_FEEDER as usize
+                                * Usable::BATCHES.feeder_life_seconds() as usize
+                                + crate::strikes::FEEDER_PLACE_ENTRIES)
+                    );
+                    let batches = crate::exchange::SHARDS * Strikes::fixed_bytes(Usable::BATCHES);
+                    let every = batches
+                        + 4 * Strikes::fixed_bytes(Usable::relay_signed(deadlines))
+                        + Strikes::fixed_bytes(Usable::proofs(deadlines))
+                        + Strikes::fixed_bytes(figures);
+                    for (class, held) in [
+                        // The feeders' share twice, their places among their entries
+                        // (`Shares::take`), in the ingest shards' tables alone.
+                        (
+                            Class::Feeders,
+                            2 * entries.feeders * PLANNED_ENTRY_BYTES + batches,
+                        ),
+                        // The peers' twice, in every table.
+                        (
+                            Class::Peers,
+                            2 * entries.peers * PLANNED_ENTRY_BYTES + every,
+                        ),
+                        // The relay's own whole, and its place with its counts.
+                        (
+                            Class::Own,
+                            entries.relay * PLANNED_ENTRY_BYTES
+                                + every
+                                + crate::strikes::place_bytes(Usable::BATCHES, figures),
+                        ),
+                    ] {
+                        let held = held + PLACES_FIXED_BYTES;
+                        let store = budget.store_bytes(class.store());
+                        assert!(
+                            held <= store,
+                            "{class:?}, hosting MLAT {hosts_mlat}, {members} members, {bundles} \
+                             indexes a second: {held} planned in {store}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// The cores bound the connections and the rate as the memory does (`cores`): the limit is
@@ -2824,6 +3382,7 @@ mod tests {
             cores: None,
             holds_raw: false,
             feeder_records_per_sec: 1,
+            bundle_indexes_per_sec: 0,
         }
         .with_members(2, 3 * PLANNED_BYTES_PER_SEC as u64 + 1);
         // Its rate's costs this test's own, not the ones the members would plan.
@@ -2835,9 +3394,13 @@ mod tests {
         // floor's batches and the records the members' sessions write.
         assert_eq!(plan.member_feeders, 4);
         let records = crate::products::records_per_feeder(PLANNED_RECEPTIONS_PER_SEC);
+        // And what is taken of them (`strikes`), planned for the members alone.
+        let unit = plan.member_unit();
+        let strikes = unit.feeder_strikes + unit.peer_strikes + unit.own_strikes;
+        assert!(unit.feeder_strikes == 0 && unit.peer_strikes > 0 && unit.own_strikes > 0);
         assert_eq!(
             (plan.member_rate_pool(), plan.member_pool()),
-            (4 * (10 + records), 4 * (10 + records))
+            (4 * (10 + records + strikes), 4 * (10 + records + strikes))
         );
         // Room for the pool and three feeders.
         let budget = Budget::of_memory(Budget::memory_for(3, plan), plan);
@@ -2854,7 +3417,11 @@ mod tests {
         drop(first);
         assert!(budget.reserve_member().is_some());
         // The gauges are sized for the feeders and the members' rate.
-        assert_eq!(budget.gauge(Store::Batches).limit(), 10 * (3 + 4));
+        // And the outbox's slots kept whatever it holds (`Plan::sharing_outbox`).
+        assert_eq!(
+            budget.gauge(Store::Batches).limit(),
+            10 * (3 + 4) + crate::sharing::OUTBOX_FIXED_BYTES
+        );
         assert_eq!(budget.gauge(Store::Records).limit(), records * 4);
         // A member's one connection takes its buffers from the connections' room, never from the
         // members' rate.
@@ -2865,7 +3432,7 @@ mod tests {
             },
             ..plan
         };
-        assert_eq!(buffered.member_pool(), 4 * (10 + records));
+        assert_eq!(buffered.member_pool(), 4 * (10 + records + strikes));
         let budget = Budget::of_memory(Budget::memory_for(3, buffered), buffered);
         assert_eq!(budget.gauge(Store::Buffers).limit(), 5 * 3);
         // A relay holding no member plans no rate for them.
@@ -3104,17 +3671,7 @@ mod tests {
             .collect();
         barrier.wait();
         let path = std::env::temp_dir().join(format!("malloc-info-{}", std::process::id()));
-        // SAFETY: a file opened for writing, handed to glibc's `malloc_info` and closed.
-        unsafe {
-            let name = std::ffi::CString::new(path.display().to_string())
-                .map_err(|error| error.to_string())?;
-            let file = libc::fopen(name.as_ptr(), c"w".as_ptr());
-            if file.is_null() {
-                return Err("fopen".to_owned());
-            }
-            libc::malloc_info(0, file);
-            libc::fclose(file);
-        }
+        crate::os::write_malloc_info(&path)?;
         done.wait();
         for handle in handles {
             handle.join().map_err(|_| "a thread panicked".to_owned())?;
@@ -3132,18 +3689,20 @@ mod tests {
         let per_feeder = plan.per_rate;
         let mut budget = Budget::of_memory(Budget::memory_for(10, plan), plan);
         let epochs = budget.gauge(Store::Epochs);
-        assert_eq!(epochs.limit(), per_feeder.epochs * 10);
+        // Its rate's, and what waits for the sealer whatever it holds.
+        let fixed = crate::exchange::EPOCHS_FIXED_BYTES;
+        assert_eq!(epochs.limit(), per_feeder.epochs * 10 + fixed);
         // A share a part split the store into follows it too (`mlat_host`'s waiting share).
         let third = epochs.share(|limit| limit / 3);
-        assert_eq!(third.limit(), per_feeder.epochs * 10 / 3);
+        assert_eq!(third.limit(), (per_feeder.epochs * 10 + fixed) / 3);
         let all: usize = Store::ALL
             .iter()
             .map(|store| budget.gauge(*store).limit())
             .sum();
         assert!(all <= budget.memory() - budget.base());
         budget.resize(Budget::memory_for(20, plan), plan);
-        assert_eq!(epochs.limit(), per_feeder.epochs * 20);
-        assert_eq!(third.limit(), per_feeder.epochs * 20 / 3);
+        assert_eq!(epochs.limit(), per_feeder.epochs * 20 + fixed);
+        assert_eq!(third.limit(), (per_feeder.epochs * 20 + fixed) / 3);
     }
 
     #[test]
@@ -3393,7 +3952,6 @@ mod tests {
                     .filter(|store| store.driver() == Driver::Connection)
                     .map(|store| full.of(*store))
                     .sum::<usize>()
-                    + PACE_STATE_BYTES
                     + crate::sockets::FEEDER_KERNEL_BYTES
             );
             let budget = Budget::of_memory(Budget::memory_for(3, plan), plan);
@@ -3401,6 +3959,62 @@ mod tests {
             assert!(one.is_some());
             assert_eq!(budget.reserved(), plan.per_feeder.total());
         }
+    }
+
+    /// Every connection's pace state is planned in `Store::Paces` at
+    /// `ingest::PACE_BYTES_PER_CONNECTION`: a feeder's in its floor, every other connection the
+    /// caps allow before any feeder (`Plan::connection_paces`); and the pace maps' share
+    /// (`Budget::pace_entries`) leaves every one of them its own pace. Before, a connection's pace
+    /// state was planned at a kibibyte outside any store, and nothing was charged for it.
+    #[test]
+    fn the_paces_store_holds_every_connections_pace_and_leaves_their_own_apart() {
+        let plan = Plan::planned(false).with_sessions(100, 10);
+        let budget = Budget::of_memory(Budget::memory_for(3, plan), plan);
+        let feeders = budget.admission().connections;
+        let others = budget.plan().connections;
+        assert!(feeders >= 3 && others >= 110, "{feeders} {others}");
+        let per = crate::ingest::PACE_BYTES_PER_CONNECTION;
+        assert_eq!(budget.plan().per_feeder.of(Store::Paces), per);
+        let store = budget.gauge(Store::Paces);
+        assert_eq!(store.limit(), (feeders + others) * per);
+        assert_eq!(
+            store.limit() - budget.pace_entries().limit(),
+            (feeders + others) * crate::ingest::OWN_BYTES_PER_CONNECTION
+        );
+        assert!(
+            budget
+                .plan()
+                .before_feeders_parts()
+                .contains(&("connection-paces", others * per))
+        );
+    }
+
+    /// RFC-0181 §8: every session that joins the fan-out is planned in it, the member sessions
+    /// with the rest: each its queue's fixed allocation, and each its slot for every item the rate
+    /// brings. Before, the member sessions were left out of both.
+    #[test]
+    fn the_fanout_plans_a_queue_for_every_member_session() {
+        let plan = Plan::planned(false).with_sessions(100, 10);
+        let members = plan
+            .with_members(64, 16 * PLANNED_BYTES_PER_SEC as u64)
+            .with_sessions(100, 10);
+        assert_eq!(members.fanout_listeners(), 174);
+        assert_eq!(
+            members.fanout_queues() - plan.fanout_queues(),
+            64 * crate::fanout::LISTENER_BYTES
+        );
+        let per_item = |plan: &Plan| {
+            PerFeeder::planned_for(plan.holds_raw, plan.members > 0, plan.fanout_listeners())
+                .rate()
+                .of(Store::Fanout)
+        };
+        assert_eq!(members.per_rate.of(Store::Fanout), per_item(&members));
+        assert!(
+            members.per_rate.of(Store::Fanout)
+                > PerFeeder::planned_for(false, true, 110)
+                    .rate()
+                    .of(Store::Fanout)
+        );
     }
 
     /// RFC-0181 §10, "Admission": each rate-driven gauge's limit is its window times the rate the
@@ -3425,14 +4039,43 @@ mod tests {
                         plan.per_rate.of(store) * (rate as usize + members * 600) / 600
                             + crate::exchange::DEDUP_FIXED_BYTES
                     }
+                    // What is taken: the members' worth planned apart, and every table's fixed
+                    // part (`Plan::strike_tables_bytes`).
+                    Driver::Rate if let Some(class) = store.strike_class() => {
+                        plan.per_rate.of(store) * rate as usize / 600
+                            + plan.member_unit().of(store) * members
+                            + plan.strike_tables_bytes(class)
+                    }
+                    // The fan-out's queues as they keep whatever they hold (`Plan::fanout_queues`).
+                    Driver::Rate if store == Store::Fanout => {
+                        plan.per_rate.of(store) * (rate as usize + members * 600) / 600
+                            + plan.fanout_queues()
+                    }
                     Driver::Rate => plan.per_rate.of(store) * (rate as usize + members * 600) / 600,
+                    // The delivery shards' orders' roots beside the connections' floors
+                    // (`delivery::FIXED_BYTES`).
+                    Driver::Connection if store == Store::Delivery => {
+                        plan.per_feeder.of(store) * connections
+                            + plan.member_unit().of(store) * members
+                            + crate::delivery::FIXED_BYTES
+                    }
                     Driver::Connection => {
                         plan.per_feeder.of(store) * connections
                             + plan.member_unit().of(store) * members
                     }
                     // No seats without MLAT; the members' records are theirs.
                     Driver::Seat => plan.member_unit().of(store) * members,
+                    // The credit's tables at their caps, whatever the relay carries.
+                    Driver::Fixed => store.fixed_bytes(),
                 };
+                // The sharing outbox's slots as it keeps whatever it holds (`Plan::sharing_outbox`),
+                // and what waits for the sealer whatever it holds.
+                let expected = expected
+                    + match store {
+                        Store::Batches => plan.sharing_outbox(),
+                        Store::Epochs => crate::exchange::EPOCHS_FIXED_BYTES,
+                        _ => 0,
+                    };
                 assert_eq!(limit, expected, "{store:?} at {connections}");
             }
             let all: usize = Store::ALL
@@ -3545,7 +4188,8 @@ mod tests {
                 assert_eq!(
                     budget.gauge(store).limit(),
                     plan.per_seat.of(store) * seats
-                        + plan.member_unit().of(store) * plan.member_feeders,
+                        + plan.member_unit().of(store) * plan.member_feeders
+                        + plan.mlat_tables_of(store),
                     "{store:?}"
                 );
             }

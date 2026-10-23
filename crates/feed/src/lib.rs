@@ -2,12 +2,21 @@
 //! publishes it to the two nearest healthy relays on different networks (RFC-0174 §2.2). It listens on no port, takes no orders from the network, and
 //! changes nothing about the receiver's other feeds.
 
+// No `unsafe` but in `privilege`, which calls libc. Denied, not forbidden, since `privilege` needs
+// its allow, and a forbid refuses that too. So the build refuses `unsafe` in every module that
+// does not say `#[allow(unsafe_code)]`, and `privilege` is the one that does: what keeps a
+// `transmute` from forging wire's seal (`tally_wire::Signs`) is that `privilege` reaches no key,
+// which review holds, not the compiler. The binary forbids it outright (`main.rs`).
+#![deny(unsafe_code)]
+
 pub mod acars;
 pub mod config;
 pub mod delivery_check;
 pub mod health;
 pub mod lines;
 pub mod precision;
+// The one module that calls libc, and so the one allowed `unsafe`: it reaches no key.
+#[allow(unsafe_code)]
 pub mod privilege;
 pub mod probe;
 pub mod relays;
@@ -25,9 +34,6 @@ use crate::delivery_check::DeliveryChecker;
 use crate::health::Health;
 use crate::relays::{Directory, Publishing};
 use crate::source::Batcher;
-
-/// Batches held for relay sessions that are momentarily slow: about a minute.
-const BATCH_BACKLOG: usize = 64;
 
 /// A station's page on the Tally site, by its key as a URL carries it (base64url, no padding).
 pub const STATION_PAGE: &str = "https://tally.flightlines.ai/en/station/";
@@ -136,6 +142,14 @@ fn from_env(name: &str, value: Option<std::ffi::OsString>) -> Result<Identity, S
 }
 
 pub async fn run(config: Config) -> Result<(), String> {
+    source::raw_clock_answers()?;
+    run_on(config, source::HostClock::system()).await
+}
+
+/// As `run`, this host's clocks read by `host` (the system's in `run`): the clock its batches are
+/// signed by runs on `host`'s monotonic clock once a relay states one (`source::RelayClocks`). A
+/// test steps `host`'s wall clock to show a host's step moves nothing a relay judges.
+pub async fn run_on(config: Config, host: source::HostClock) -> Result<(), String> {
     let identity = load_key(&config.key)?;
     let public = identity.public();
     eprintln!(
@@ -155,7 +169,7 @@ pub async fn run(config: Config) -> Result<(), String> {
     }
     let health = Arc::new(Health::default());
     tokio::spawn(health::watch(Arc::clone(&health), config.state_dir.clone()));
-    let (inputs, batching) = publish(identity, &config, Arc::clone(&health))?;
+    let (inputs, batching) = publish(identity, &config, Arc::clone(&health), host)?;
     tokio::spawn(source::read_beast(config.source, inputs.clone(), health));
     if let Some(uat) = config.uat {
         tokio::spawn(source::read_lines(
@@ -187,16 +201,40 @@ pub fn start(
     identity: Identity,
     config: &Config,
 ) -> Result<(source::Inputs, impl Future<Output = ()> + Send + 'static), String> {
-    publish(identity, config, Arc::default())
+    source::raw_clock_answers()?;
+    publish(
+        identity,
+        config,
+        Arc::default(),
+        source::HostClock::system(),
+    )
 }
 
 /// The batcher `config` names: its ceiling, the ACARS share of it, the relays' wanted ceilings to
 /// shed to, and its compression.
-fn batcher(identity: Identity, config: &Config, wanted: Arc<source::WantedCeilings>) -> Batcher {
+fn batcher(
+    identity: impl Into<Arc<Identity>>,
+    config: &Config,
+    (wanted, clocks): (Arc<source::WantedCeilings>, Arc<source::RelayClocks>),
+) -> Batcher {
     Batcher::new(identity, config.ceiling, config.clock)
         .holding_acars_to(config.acars_ceiling)
         .shedding_to(wanted)
+        .signing_by(clocks)
         .compressing_at(config.deflate_level)
+}
+
+/// The channel the batcher publishes to its relay sessions, for upload ceiling `ceiling`: it holds
+/// every batch the batcher may release at once as an anchor returns (`source::batch_backlog`). A
+/// session sends every batch it held, however old: its relay judges whether it can still use one
+/// (RFC-0171 §3.6), and holds it either way.
+pub(crate) fn batch_channel(
+    ceiling: u32,
+) -> (
+    broadcast::Sender<Arc<tally_wire::Record>>,
+    broadcast::Receiver<Arc<tally_wire::Record>>,
+) {
+    broadcast::channel(source::batch_backlog(ceiling))
 }
 
 /// `start`, telling `health` how many relay sessions are up.
@@ -204,33 +242,68 @@ fn publish(
     identity: Identity,
     config: &Config,
     health: Arc<Health>,
+    host: source::HostClock,
 ) -> Result<(source::Inputs, impl Future<Output = ()> + Send + 'static), String> {
-    let (batches, _) = broadcast::channel(BATCH_BACKLOG);
+    // The feeder's one key, shared by its directory, its sessions and probes, and its batcher.
+    let identity = Arc::new(identity);
+    let (batches, _) = batch_channel(config.ceiling);
+    // What the relays state of the wanted receptions a second they take: each session states its
+    // relay's, and the batcher sheds to the least before it signs.
+    let wanted = Arc::new(source::WantedCeilings::default());
+    // And the clocks they state, which the batcher signs by. Its clock sources are configured,
+    // never discovered, as NTP's servers are: this host, and the owner's and the binary's seeds
+    // (`RelayClocks::configured`), heard through a session or a probe. A relay a hint named is no
+    // source, whatever it says.
+    let clocks = Arc::new(
+        source::RelayClocks::on(host).configured(
+            config
+                .relays
+                .iter()
+                .chain(&config.seeds)
+                .map(|relay| relay.key),
+        ),
+    );
+    // The directory signs what the feeder says of itself by the same clock as its batches.
     let directory = Directory::new(
         config.state_dir.clone(),
         config.relays.clone(),
         config.seeds.clone(),
-        identity.clone(),
+        Arc::clone(&identity),
         config.location,
-        config.clock,
+        (config.clock, Arc::clone(&clocks)),
     )?;
     tokio::spawn(relays::keep_saved(Arc::clone(&directory)));
-    // What the relays state of the wanted receptions a second they take: each session states its
-    // relay's, and the batcher sheds to the least before it signs.
-    let wanted = Arc::new(source::WantedCeilings::default());
+    // The health surface says when the batcher has no clock source but an unsynced host, and
+    // which relays' clocks its own disagrees with.
+    tokio::spawn({
+        let (clocks, health) = (Arc::clone(&clocks), Arc::clone(&health));
+        async move {
+            let mut every = tokio::time::interval(health::STATUS_EVERY);
+            every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                every.tick().await;
+                health.clock_sourced(clocks.sourced());
+                health.clock_disagrees(clocks.disagreements());
+                health.anchor_disagrees(clocks.anchor_disagreements());
+                health.anchored(!clocks.anchors().is_empty(), clocks.unanchored());
+            }
+        }
+    });
     tokio::spawn(relays::run(Publishing {
         directory,
-        identity: identity.clone(),
+        identity: Arc::clone(&identity),
         batches: batches.clone(),
         ceiling: config.ceiling,
         wanted: Arc::clone(&wanted),
+        clocks: Arc::clone(&clocks),
         checker: DeliveryChecker::load(&config.state_dir),
         checking: delivery_check::Checking::default(),
         prober: probe::measure,
         source_address: config.source_address,
         health,
+        pacing: relays::Pacing::default(),
     }));
-    let batcher = batcher(identity, config, wanted);
+    let batcher = batcher(identity, config, (wanted, clocks));
     let (inputs, intake) = source::channel(batcher.ceilings());
     let batching = source::batch(batcher, intake, batches);
     Ok((inputs, batching))
@@ -263,7 +336,7 @@ mod tests {
         };
         let started = std::time::Instant::now();
         let identity = Identity::generate().map_err(|error| error.to_string())?;
-        let batcher = batcher(identity, &config, Arc::default());
+        let batcher = batcher(identity, &config, (Arc::default(), Arc::default()));
         let (inputs, intake) = source::channel(batcher.ceilings());
         let (out, mut published) = broadcast::channel(1024);
         let batching = tokio::spawn(source::batch(batcher, intake, out));

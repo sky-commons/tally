@@ -14,21 +14,34 @@
 # host's plan in /etc/default/tally-relay, for example TALLY_RELAY_MAX_UPLOAD=6Mbit/s on a $12
 # Lightsail plan (at most about 2.01 TB in 31 days, leaving about 1 TB of its 3 TB for what feeders
 # send in, which counts toward it too; 10Mbit/s would be up to about 3.35 TB out alone). The cap keeps
-# no state, so nothing needs to survive a restart.
+# no state.
 #
 # Needs systemd 248 or later (LoadCredential and the %d specifier).
 
 [Unit]
 Description=Tally relay: verifies and forwards Tally receivers' batches
 Documentation=https://github.com/sky-commons/tally
-# A relay stamps what it ingests by its own ingest clock, anchored to the wall clock it starts on
-# and never going back: started on a clock still seconds behind, it would refuse every feeder's
-# raw as ahead of it until it caught up. So it starts once
-# the clock is synchronized, where the host says so: time-sync.target is reached after a wait
-# service (systemd-time-wait-sync.service, chrony-wait.service) when one is enabled, and at once
-# where none is, so a host with no time daemon still starts its relay.
-After=network-online.target time-sync.target
-Wants=network-online.target time-sync.target
+# A relay judges what it compares across machines by the host's wall clock as its time daemon
+# keeps it, with the kernel's error bound, and times every duration by the monotonic clock
+# (RFC-0171 §3.6). A step of the wall clock ends nothing: the relay tells its feeders the new time.
+# Until the host first reports its clock synchronised, and whenever the kernel's error bound on it
+# (which grows from its last sync) is past 7.5 s, the relay states its error as unbounded and
+# refuses no one for clock, so it can start before the clock is set, but it judges best once it is.
+# The host's time daemon must be chrony or ntpd: each sets the kernel's error bound (maxerror) to
+# its root distance, the bound against true time the relay judges by. systemd-timesyncd sets it to
+# 0 at every adjustment (src/timesync/timesyncd-manager.c, manager_adjust_clock), and the kernel
+# grows it 500 us a second from there, so the bound counts only the drift since its last poll,
+# never the server's own distance or the measurement's error, and a relay could judge by a clock
+# seconds off while it reads milliseconds; nothing stock tells that bound from chrony's, so the
+# relay cannot refuse it and the requirement is stated here.
+# The relay starts after chrony-wait.service (chrony's own wait for a synchronised clock, pulled in
+# when chrony is installed), and after time-sync.target, which it never pulls in
+# (systemd.special(7): a unit that needs the time is ordered after it "but not pull it in"). That
+# target holds the start back only while a wait service is enabled (under ntpd, ntpsec-wait.service
+# or systemd-time-wait-sync.service); with none it is reached at once, and what holds is the
+# kernel's word read at each judgement, as above.
+After=network-online.target chrony-wait.service time-sync.target
+Wants=network-online.target chrony-wait.service
 
 [Service]
 Type=simple
@@ -44,6 +57,11 @@ RestartSec=5
 
 DynamicUser=yes
 ConfigurationDirectory=tally
+# What survives a restart (RFC-0171 §3.6): each strike table's lease on the newest time it may have
+# used, and on a graceful stop the fingerprints it holds, so a restarted relay forwards nothing
+# twice and a deploy is not deaf: /var/lib/tally-relay, kept across restarts with DynamicUser and
+# found through $STATE_DIRECTORY, which systemd sets from this line.
+StateDirectory=tally-relay
 UMask=0077
 # One descriptor per connection its caps admit: those under --max-connections (2048), the member
 # sessions its areas bring (up to as many), the subscribers (64) and beast-out clients (8), every
@@ -73,7 +91,9 @@ ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectKernelLogs=yes
 ProtectControlGroups=yes
-ProtectClock=yes
+# No ProtectClock=: it filters adjtimex(2) whole, and the relay reads the clock's error bound with
+# it (a read, no modes set). The clock cannot be set from here all the same: the empty
+# CapabilityBoundingSet below keeps CAP_SYS_TIME out, and the kernel refuses a write without it.
 ProtectHostname=yes
 ProtectProc=invisible
 ProcSubset=pid
@@ -89,9 +109,16 @@ CapabilityBoundingSet=
 AmbientCapabilities=
 SystemCallArchitectures=native
 SystemCallFilter=@system-service
-# @resources stays allowed: the async runtime may set a thread's affinity or priority, and a
-# denied call kills the process.
+# @resources stays allowed: the async runtime may set a thread's affinity or priority.
 SystemCallFilter=~@privileged
+# @privileged holds @clock, and so the read of the clock's error bound: allowed back, every system
+# call that read may be (glibc's adjtimex(3) is clock_adjtime(2), and clock_adjtime64 on a 32-bit
+# time_t; tally_wire::kernel_clock::SYSCALLS, which //crates/relay:check holds this line to). With
+# no capability it can change nothing.
+SystemCallFilter=adjtimex clock_adjtime clock_adjtime64
+# A refused call fails with EPERM rather than killing the process, so a relay the filter still
+# refuses its clock says so and stops (clock::kernel_answers) instead of dying of SIGSYS unsaid.
+SystemCallErrorNumber=EPERM
 
 [Install]
 WantedBy=multi-user.target

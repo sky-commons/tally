@@ -237,6 +237,10 @@ pub struct Station {
     pub batches: u64,
     /// Batches of its sequence that never arrived.
     pub gaps: u64,
+    /// Batches the relay dropped as signed too long ago: its clock is behind (or it held them past
+    /// its backlog), and nothing else tells its owner. Absent from an older API, read as 0.
+    #[serde(default)]
+    pub late_batches: u64,
     /// About where it says it is: a pin inside its public cell (H3 resolution 6, about 36 km²), at
     /// an offset its key fixes, the same on every read; never the place itself. `null` when it
     /// names no cell, and for a station the relay has forwarded no batch of (a connection alone

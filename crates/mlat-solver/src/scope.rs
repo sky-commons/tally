@@ -68,6 +68,16 @@ impl Window {
         }
     }
 
+    /// Whether a canonical window's last bin lies in `(before, settled]`: whether a window may
+    /// fall due at a step that settles bins from past `before` through `settled`.
+    pub fn ends_within(before: i64, settled: i64) -> bool {
+        // Canonical windows end at `k * STRIDE + AFTER`; the first past `before`.
+        let past = i128::from(before) - i128::from(AFTER);
+        let next =
+            (past.div_euclid(i128::from(STRIDE)) + 1) * i128::from(STRIDE) + i128::from(AFTER);
+        next <= i128::from(settled)
+    }
+
     /// The stride the window was made at.
     pub fn stride(&self) -> i64 {
         (self.last - self.first + 1 - BEFORE - AFTER).max(1)
@@ -791,4 +801,29 @@ pub fn chosen(
         );
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `ends_within` says exactly whether some bin's canonical window ends in the span, checked
+    /// against every bin's window across negative and positive bins and spans of every length.
+    #[test]
+    fn a_window_ends_within_a_span_exactly_when_a_canonical_one_does() {
+        for before in -40..40 {
+            for settled in before..before + 20 {
+                let brute = (before - 40..settled + 40)
+                    .map(Window::canonical)
+                    .any(|window| before < window.last && window.last <= settled);
+                assert_eq!(
+                    Window::ends_within(before, settled),
+                    brute,
+                    "({before}, {settled}]"
+                );
+            }
+        }
+        assert!(Window::ends_within(i64::MIN, 0));
+        assert!(!Window::ends_within(i64::MAX - 1, i64::MAX));
+    }
 }

@@ -14,6 +14,10 @@
 //!
 //! The address the session's socket reached is kept (`Measured::observed`): it is what tells two
 //! relays' networks apart beside what each declares (`tally_wire::rendezvous::distinct_networks`).
+//!
+//! Last, the probe asks the relay's clock with a timed heartbeat (NTP's on-wire exchange), after
+//! its echoes so a relay that predates it (and ends a probe that sends one) is measured first.
+//! The answer is one of the sources the batcher selects its clock from (`source::RelayClocks`).
 
 use std::net::IpAddr;
 use std::time::Duration;
@@ -71,6 +75,20 @@ impl Measured {
 pub struct Probed {
     pub measured: Measured,
     pub hints: Vec<RelayAddress>,
+    /// The relay's answer to the timed heartbeat sent last, if it gave one.
+    pub clock: Option<ProbedClock>,
+}
+
+/// A relay's answer to a probe's timed heartbeat: when it was asked and heard on this host's
+/// monotonic clock, and the relay's clock when it took the question and sent the answer, with its
+/// stated error (`source::RelayClocks::probed`).
+#[derive(Clone, Copy, Debug)]
+pub struct ProbedClock {
+    pub asked: Instant,
+    pub heard: Instant,
+    pub took_ms: u64,
+    pub sent_ms: u64,
+    pub error_ms: Option<u64>,
 }
 
 /// Probes to send per relay per round, whose median is its time.
@@ -116,26 +134,32 @@ pub fn median(samples: &mut [Duration]) -> Option<Duration> {
 pub type Prober =
     fn(
         RelayAddress,
-        Identity,
+        std::sync::Arc<Identity>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Probed, String>> + Send>>;
 
 /// The feeder's `Prober`: `probe`.
 pub fn measure(
     relay: RelayAddress,
-    me: Identity,
+    me: std::sync::Arc<Identity>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Probed, String>> + Send>> {
     Box::pin(async move { probe(&relay, &me).await })
 }
 
 /// Probes `relay`: its round-trip time (the median of `PROBES_PER_ROUND` samples), its signed
 /// reply, and whether it is full.
-pub async fn probe(relay: &RelayAddress, me: &Identity) -> Result<Probed, String> {
+pub async fn probe(
+    relay: &RelayAddress,
+    me: &impl tally_wire::Handshakes,
+) -> Result<Probed, String> {
     tokio::time::timeout(PROBE_TIMEOUT, probe_once(relay, me))
         .await
         .map_err(|_| "probe timed out".to_owned())?
 }
 
-async fn probe_once(relay: &RelayAddress, me: &Identity) -> Result<Probed, String> {
+async fn probe_once(
+    relay: &RelayAddress,
+    me: &impl tally_wire::Handshakes,
+) -> Result<Probed, String> {
     let started = Instant::now();
     let stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(&relay.address))
         .await
@@ -169,6 +193,27 @@ async fn probe_once(relay: &RelayAddress, me: &Identity) -> Result<Probed, Strin
             None => break,
         }
     }
+    let clock = if heard.ended {
+        None
+    } else {
+        let asked = Instant::now();
+        let token = nonce();
+        let question = Record::TimedHeartbeat(tally_wire::HeartbeatTimes::asking(token));
+        if writer.send(&[question]).await.is_ok() {
+            heard
+                .clock(&mut reader, token)
+                .await
+                .map(|times| ProbedClock {
+                    asked,
+                    heard: times.0,
+                    took_ms: times.1,
+                    sent_ms: times.2,
+                    error_ms: times.3,
+                })
+        } else {
+            None
+        }
+    };
     let rtt = median(&mut samples).unwrap_or_default();
     Ok(Probed {
         measured: Measured {
@@ -179,6 +224,7 @@ async fn probe_once(relay: &RelayAddress, me: &Identity) -> Result<Probed, Strin
             full: heard.full,
         },
         hints: heard.hints,
+        clock,
     })
 }
 
@@ -237,6 +283,44 @@ impl Heard {
             }
             if answer.is_some() {
                 return answer;
+            }
+        }
+    }
+
+    /// Reads until the answer to the timed heartbeat sent with `token`: when it was heard, the
+    /// relay's clock when it took the question and sent the answer, and its stated error. None if
+    /// the session ends, the wait runs out, or no answer echoes `token`.
+    async fn clock<S: tokio::io::AsyncRead>(
+        &mut self,
+        reader: &mut noise::Reader<S>,
+        token: u64,
+    ) -> Option<(Instant, u64, u64, Option<u64>)> {
+        let deadline = Instant::now() + ECHO_TIMEOUT;
+        loop {
+            if self.ended {
+                return None;
+            }
+            let mut got = Vec::new();
+            match tokio::time::timeout_at(deadline, reader.recv(&mut got)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) | Err(_) => {
+                    self.ended = true;
+                    return None;
+                }
+            }
+            let heard = Instant::now();
+            for record in got {
+                match record {
+                    Record::TimedHeartbeat(times) => {
+                        if let Some((asked, took)) = times.echo
+                            && asked == token
+                        {
+                            return Some((heard, took, times.sent_ms, times.error_ms));
+                        }
+                    }
+                    Record::Redirect { .. } | Record::Goodbye { .. } => self.ended = true,
+                    _ => {}
+                }
             }
         }
     }
@@ -359,13 +443,16 @@ pub(crate) mod tests {
         Full,
         /// Answers echoes, and redirects at the first batch.
         RedirectOnBatch,
+        /// Answers echoes, and at the first batch says goodbye for its clock, to come back at
+        /// once: what no relay of this version sends, as one minted to say it would.
+        ClockGoodbyeOnBatch,
     }
 
     /// A fake relay on loopback.
     pub(crate) struct Fake {
-        pub identity: Identity,
+        pub identity: std::sync::Arc<Identity>,
         /// Who signs its echo replies (another key than `identity` to forge them).
-        pub signer: Identity,
+        pub signer: std::sync::Arc<Identity>,
         /// The loopback address it listens on (`127.0.0.N`).
         pub ip: &'static str,
         pub network: u32,
@@ -389,9 +476,15 @@ pub(crate) mod tests {
     pub(crate) type Group = std::sync::Arc<std::sync::Mutex<Vec<tally_wire::Batch>>>;
 
     impl Fake {
-        pub(crate) fn new(identity: Identity, network: u32, slots: u32, mode: Mode) -> Self {
+        pub(crate) fn new(
+            identity: impl Into<std::sync::Arc<Identity>>,
+            network: u32,
+            slots: u32,
+            mode: Mode,
+        ) -> Self {
+            let identity = identity.into();
             Self {
-                signer: identity.clone(),
+                signer: std::sync::Arc::clone(&identity),
                 identity,
                 ip: "127.0.0.1",
                 network,
@@ -435,6 +528,18 @@ pub(crate) mod tests {
             let _ = roles.send(accepted.role);
         }
         let (mut reader, mut writer) = (accepted.session.reader, accepted.session.writer);
+        // A relay speaks first to a feeder, as a real one does: its rate and its clock.
+        if accepted.role == Role::Feeder {
+            writer
+                .send(&[Record::RateLimit {
+                    bytes_per_sec: u32::MAX,
+                    burst: u32::MAX,
+                    wanted_per_sec: None,
+                    clock_ms: None,
+                    error_ms: None,
+                }])
+                .await?;
+        }
         let key = fake.identity.public();
         let answer = |echo: &Echo| {
             EchoReply::sign(
@@ -464,6 +569,7 @@ pub(crate) mod tests {
                 match record {
                     Record::Echo(echo) => out.push(answer(echo)?),
                     Record::Batch(_) if fake.mode == Mode::RedirectOnBatch => leave = true,
+                    Record::Batch(_) if fake.mode == Mode::ClockGoodbyeOnBatch => leave = true,
                     Record::Batch(batch) => {
                         if let Some(batches) = &fake.batches {
                             let _ = batches.send((key, batch.clone()));
@@ -496,7 +602,12 @@ pub(crate) mod tests {
                 }
             }
             leave |= fake.mode == Mode::Full && !out.is_empty();
-            if leave {
+            if leave && fake.mode == Mode::ClockGoodbyeOnBatch {
+                out.push(Record::Goodbye {
+                    reason: tally_wire::Reason::Clock,
+                    retry_after_secs: 0,
+                });
+            } else if leave {
                 out.push(redirect.clone());
             }
             if !out.is_empty() {
@@ -617,7 +728,7 @@ pub(crate) mod tests {
         let relay_identity = Identity::generate().map_err(|error| error.to_string())?;
         let impostor = Identity::generate().map_err(|error| error.to_string())?;
         let relay = echo_relay(Fake {
-            signer: impostor,
+            signer: impostor.into(),
             ..Fake::new(relay_identity, 64_512, 42, Mode::Serve)
         })
         .await?;

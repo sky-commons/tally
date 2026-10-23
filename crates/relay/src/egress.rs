@@ -271,6 +271,10 @@ impl Class {
     ///   control to it, as the answer to what it asked (a feeder's query, a client's vouching).
     pub fn of_kind(record: u8, kind: Kind) -> Self {
         use tally_wire::record::{
+            KIND_ANCHOR, KIND_CLIENT_CLOCK_MODEL, KIND_CLIENT_REGIONAL_BATCH, KIND_FEEDER_FIGURES,
+            KIND_RECEIVER_SITE,
+        };
+        use tally_wire::record::{
             KIND_BATCH, KIND_BUNDLE_INDEX, KIND_CLOCK_MODEL, KIND_CLOCK_MODEL_PART,
             KIND_DELIVERY_ANSWER, KIND_DELIVERY_QUERY, KIND_ECHO, KIND_ECHO_REPLY,
             KIND_EVIDENCE_BUNDLE, KIND_FAULT_PROOF, KIND_FIREHOSE_CREDENTIAL, KIND_GOODBYE,
@@ -280,10 +284,6 @@ impl Class {
             KIND_REGIONAL_BATCH, KIND_RELAY_BATCH, KIND_RELAY_LIST, KIND_STRIPE_ASSIGNMENT,
             KIND_STRIPE_RECEIPT, KIND_SUBSCRIBE, KIND_WELCOME, KIND_WORLD_POSITIONS,
             KIND_WORLD_PRECISE,
-        };
-        use tally_wire::record::{
-            KIND_CLIENT_CLOCK_MODEL, KIND_CLIENT_REGIONAL_BATCH, KIND_FEEDER_FIGURES,
-            KIND_RECEIVER_SITE,
         };
         let forwards = kind.forwards();
         match record {
@@ -304,6 +304,7 @@ impl Class {
             | KIND_HAVE_SUMMARY
             | KIND_STRIPE_RECEIPT
             | KIND_MLAT_CUT
+            | KIND_ANCHOR
             | KIND_FIREHOSE_CREDENTIAL => Self::Control,
             KIND_PROVIDER_OFFER | KIND_EVIDENCE_BUNDLE if !forwards => Self::Control,
             _ if !forwards => Self::Taker,
@@ -1251,7 +1252,7 @@ mod tests {
         use Class::{Control as C, Forwarded as F, Positions as P, Provisional as V, Raw as R};
         use tally_wire::record::KINDS;
         const T: Class = Class::Taker;
-        let table: [(u8, &str, Class, Class); 38] = [
+        let table: [(u8, &str, Class, Class); 39] = [
             (0x01, "Hello", C, C),
             (0x02, "Welcome", C, C),
             (0x03, "Batch", R, T),
@@ -1294,6 +1295,8 @@ mod tests {
             (0x27, "ClientRegionalBatch", F, T),
             // A relay's feeder figures (RFC-0174 §2.12), a product on client links.
             (0x28, "FeederFigures", F, T),
+            // A relay's freshness anchor to its feeders (RFC-0171 §3.6): as its clock, control.
+            (0x2a, "Anchor", C, C),
         ];
         let kinds: Vec<u8> = table.iter().map(|(kind, ..)| *kind).collect();
         assert_eq!(

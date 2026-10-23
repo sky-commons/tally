@@ -57,16 +57,26 @@ use tally_mlat_solver::{
     Transmission, Unpublished, modes, publish,
 };
 use tally_wire::batch::Hash;
-use tally_wire::{Decoded, Identity, Positions, PublicKey, Record, TaggedSolution};
+use tally_wire::budget::{ADSB_HORIZON, ADSB_REMEMBERED, policy};
+use tally_wire::clocks::{Judged, Moment, Mono};
+use tally_wire::footprint::{Deque, Tree, vec};
+use tally_wire::{Decoded, Positions, PublicKey, Record, Signer, TaggedSolution};
 
 use crate::window::{Keys, Part, pack_with, parallel, solutions_content};
 
 /// How long after the first of a transmission's receptions arrives it is solved.
 pub const SETTLE_MS: u64 = 1_100;
-/// How long after an aircraft's last ADS-B position it is a target again: a window's span.
+/// How long after an aircraft's last ADS-B position it is a target again: a window's span, the
+/// error budget's exemption `tally_wire::budget::ADSB_HORIZON` (it is compared with the judging
+/// clock to forget what an aircraft solved, so it is stated there).
 pub const ADSB_HORIZON_MS: u64 =
     (tally_mlat_solver::scope::BEFORE as u64 + 1 + tally_mlat_solver::scope::AFTER as u64)
         * GRID_MS;
+
+const _: () = assert!(
+    ADSB_HORIZON.span::<Judged>().ms() == ADSB_HORIZON_MS
+        && ADSB_REMEMBERED.span::<Judged>().ms() == 2 * ADSB_HORIZON_MS
+);
 /// How long a waiting reception is kept past its settling time when no model can carry it, or
 /// while too few receivers of its transmission have come to solve it.
 const KEPT_PAST_SETTLE_MS: u64 = 1_000;
@@ -74,10 +84,37 @@ const KEPT_PAST_SETTLE_MS: u64 = 1_000;
 /// What a receiver may have waiting is its wanted receptions over this
 /// (`engine::Capacity::waiting`).
 pub const WAITING_MS: u64 = SETTLE_MS + KEPT_PAST_SETTLE_MS + 1_000;
-/// A waiting reception as allocated, at most: its entry in its aircraft's list (a vector, so up to
-/// twice its size while the list doubles) and its message's own allocation (14 bytes, with the
-/// allocator's header, rounded).
-pub const WAITING_BYTES: usize = 2 * std::mem::size_of::<Waiting>() + 32;
+/// An aircraft's receptions waiting, oldest first: a deque that grows by one at least, since most
+/// aircraft have a few (`tally_wire::footprint::Deque`).
+type Waitings = Deque<Waiting, 1>;
+
+/// What `receptions` waiting for provisional solving allocate, as planned: each its place in its
+/// aircraft's list, which keeps a quarter again what it holds, and its message's own bytes
+/// (`tally_wire::beast::MAX_MESSAGE` at most). What a relay reserves for them (`Capacity::waiting`
+/// of them, `tally_relay::budget::Store::Engine`); each aircraft's own part, its list's one place
+/// more and its place in its shard's tree, is planned with the tables, at [`PLANNED_AIRCRAFT`]
+/// ([`TABLES_PLANNED_BYTES`]). Every part is charged as it allocates, so receptions of more
+/// aircraft than planned are refused by the store, never held uncharged.
+pub const fn waiting_planned(receptions: usize) -> usize {
+    receptions * (vec::<Waiting>(1) * 5 / 4 + tally_wire::beast::MAX_MESSAGE)
+}
+
+/// What one aircraft's receptions waiting allocate beside their places, as planned: its list's
+/// one place more (`Deque::LEAST`) and its place in its shard's tree.
+const WAITING_AIRCRAFT_BYTES: usize =
+    vec::<Waiting>(Waitings::LEAST) + Tree::<u32, Waitings>::bytes_per_entry();
+
+/// The aircraft a relay's provisional solving keeps the newest ADS-B position and the last
+/// second solved of, as planned: about every aircraft in the air at once worldwide. Beyond it a
+/// step's notes the store cannot hold are let go whole (`tally_relay::mlat_host`).
+pub const PLANNED_AIRCRAFT: usize = 20_000;
+
+/// What the address shards allocate whatever they hold, as planned: each one's trees' roots, both
+/// per-aircraft trees ([`Shard`]'s ADS-B positions and seconds solved) and each aircraft's own
+/// part of what waits ([`waiting_planned`]) at [`PLANNED_AIRCRAFT`].
+pub const TABLES_PLANNED_BYTES: usize = SHARDS
+    * (Tree::<u32, Waitings>::bytes_planned(0) + 2 * Tree::<u32, u64>::bytes_planned(0))
+    + PLANNED_AIRCRAFT * (2 * Tree::<u32, u64>::bytes_per_entry() + WAITING_AIRCRAFT_BYTES);
 
 /// A published tile model, carried for provisional solutions.
 pub struct Carried {
@@ -93,15 +130,21 @@ pub struct Carried {
 }
 
 impl Carried {
-    /// The wall clock past which the model can be carried no further.
-    fn spent_ms(&self) -> u64 {
-        (self.window.last.max(0) as u64 + 1) * GRID_MS + (MAX_CARRY_PS / 1_000_000_000) as u64
+    /// The judging time past which the model can be carried no further: on the bin grid.
+    fn spent(&self) -> u64 {
+        spent_ms(&self.window)
     }
+}
+
+/// The judging time past which the model of `window` can be carried no further: on the bin grid.
+pub fn spent_ms(window: &Window) -> u64 {
+    (window.last.max(0) as u64 + 1) * GRID_MS + (MAX_CARRY_PS / 1_000_000_000) as u64
 }
 
 struct Waiting {
     reception: Reception,
-    arrived_ms: u64,
+    /// When its batch arrived, by the monotonic clock (`Order::stamp_ms`).
+    arrived: Mono,
 }
 
 /// What provisional solving did since the last time it was asked.
@@ -160,17 +203,17 @@ pub fn shard_of(address: u32) -> usize {
 /// however they raced.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Order {
-    pub stamp_ms: u64,
+    pub stamp: Mono,
     pub receiver: PublicKey,
     pub boot: u64,
     pub sequence: u64,
 }
 
 impl Order {
-    /// `batch` taken at `stamp_ms` by its holder's clock.
-    pub fn of(batch: &Decoded, stamp_ms: u64) -> Self {
+    /// `batch`, by its own stamp on its holder's monotonic clock.
+    pub fn of(batch: &Decoded) -> Self {
         Self {
-            stamp_ms,
+            stamp: batch.mono(),
             receiver: batch.receiver(),
             boot: batch.boot_id(),
             sequence: batch.sequence(),
@@ -272,12 +315,12 @@ impl Book {
         }
     }
 
-    /// Forgets every model that can be carried no further by `now_ms`.
-    fn forget_spent(&mut self, now_ms: u64) {
+    /// Forgets every model that can be carried no further by the judging clock reading `judged`.
+    fn forget_spent(&mut self, judged: Judged) {
         let spent: Vec<Tile> = self
             .models
             .iter()
-            .filter(|(_, held)| held.spent_ms() < now_ms)
+            .filter(|(_, held)| tally_wire::budget::passed(held.spent(), judged))
             .map(|(tile, _)| *tile)
             .collect();
         for tile in spent {
@@ -322,15 +365,30 @@ impl Book {
 /// batches keeps all [`SHARDS`] ([`Provisional`]), and a relay keeps them apart, each weighed and
 /// stepped on whichever thread takes it (`tally_relay::mlat_host`), and the same notes in the same
 /// order solve to the same bytes either way.
+///
+/// It says what it allocates ([`Shard::bytes`]), and what reading and keeping may allocate more
+/// before they do ([`Shard::reading_growth`], [`Shard::keeping_growth`]), so a holder charges it
+/// what it allocates, growth included.
 #[derive(Default)]
 pub struct Shard {
-    waiting: BTreeMap<u32, Vec<Waiting>>,
+    waiting: Tree<u32, Waitings>,
     count: usize,
+    /// What the aircraft's lists allocate together, with their messages' bytes.
+    lists: usize,
     /// The newest wall clock of each aircraft's ADS-B position.
-    adsb: BTreeMap<u32, u64>,
+    adsb: Tree<u32, u64>,
     /// The last second each aircraft was solved in.
-    solved_second: BTreeMap<u32, u64>,
+    solved_second: Tree<u32, u64>,
     report: Report,
+}
+
+/// What a list of waiting receptions allocates: its slots and each message's bytes.
+fn list_bytes(list: &Waitings) -> usize {
+    list.bytes()
+        + list
+            .iter()
+            .map(|one| one.reception.observation.data.capacity())
+            .sum::<usize>()
 }
 
 /// One address shard's due transmissions, each with its aircraft and model, and what the shard
@@ -349,7 +407,7 @@ impl Shard {
     /// shard ([`admit`]). Read in [`Order`], the batches of one step give the same whatever shard
     /// or thread reads them.
     pub fn read(&mut self, batch: &Decoded, notes: &[Note], order: Order) -> Taken {
-        let now_ms = order.stamp_ms;
+        let arrived = order.stamp;
         let receiver = batch.receiver();
         let wall_ms = batch.wall_ms();
         let observations = batch.observations();
@@ -376,7 +434,7 @@ impl Shard {
                                 observation: batch.view(obs).to_observation(),
                                 wall_ms,
                             },
-                            arrived_ms: now_ms,
+                            arrived,
                         },
                     ));
                 }
@@ -392,8 +450,60 @@ impl Shard {
     pub fn keep(&mut self, taken: Taken) {
         self.count += taken.replies.len();
         for (address, waiting) in taken.replies {
-            self.waiting.entry(address).or_default().push(waiting);
+            let data = waiting.reception.observation.data.capacity();
+            let list = self.waiting.entry(address).or_default();
+            let before = list.bytes();
+            list.push_back(waiting);
+            self.lists = self.lists - before + list.bytes() + data;
         }
+    }
+
+    /// What it allocates now: its trees, and its aircraft's lists with their messages' bytes.
+    pub fn bytes(&self) -> usize {
+        self.waiting.bytes() + self.lists + self.adsb.bytes() + self.solved_second.bytes()
+    }
+
+    /// What reading `notes` may allocate more, at most: an aircraft's place among the ADS-B
+    /// positions for each position among them.
+    pub fn reading_growth<'a>(&self, notes: impl IntoIterator<Item = &'a Note>) -> usize {
+        let positions = notes
+            .into_iter()
+            .filter(|note| matches!(note, Note::Position(_)))
+            .count();
+        let len = self.adsb.len();
+        Tree::<u32, u64>::bytes_at(len + positions) - Tree::<u32, u64>::bytes_at(len)
+    }
+
+    /// What keeping `kept` and then finding what is due may allocate more, at most: each reply's
+    /// slot in its aircraft's list as the lists grow, a new aircraft's place, the messages' bytes,
+    /// and a place among the seconds solved for every aircraft waiting then.
+    pub fn keeping_growth<'a>(&self, kept: impl IntoIterator<Item = &'a Taken>) -> usize {
+        let mut adding: BTreeMap<u32, (usize, usize)> = BTreeMap::new();
+        for taken in kept {
+            for (address, waiting) in &taken.replies {
+                let entry = adding.entry(*address).or_default();
+                entry.0 += 1;
+                entry.1 += waiting.reception.observation.data.capacity();
+            }
+        }
+        let mut growth = 0;
+        let mut new = 0;
+        for (address, (count, data)) in &adding {
+            let list = self.waiting.get(address);
+            if list.is_none() {
+                new += 1;
+            }
+            // What its list grows by to take them, one by one.
+            let grows = list.map_or_else(
+                || Waitings::new().growth_by(*count),
+                |list| list.growth_by(*count),
+            );
+            growth += grows + data;
+        }
+        let len = self.waiting.len();
+        growth += Tree::<u32, Waitings>::bytes_at(len + new) - Tree::<u32, Waitings>::bytes_at(len);
+        let solved = self.solved_second.len();
+        growth + Tree::<u32, u64>::bytes_at(solved + len + new) - Tree::<u32, u64>::bytes_at(solved)
     }
 
     /// Lets go of a batch's replies [`admit`] refused, counted.
@@ -411,36 +521,43 @@ impl Shard {
         let quiet = self
             .adsb
             .get(&address)
-            .is_none_or(|newest| wall_ms.saturating_sub(*newest) > ADSB_HORIZON_MS);
+            .is_none_or(|newest| ADSB_HORIZON.beyond(*newest, wall_ms));
         quiet || sampled(address, bin_of(wall_ms))
     }
 
-    /// Hands out this shard's transmissions due by `now_ms` under `book`'s models, ascending by
+    /// Hands out this shard's transmissions due at `at` under `book`'s models, ascending by
     /// address, and forgets what can no longer be solved; with what it let go since last asked.
-    pub fn due(&mut self, now_ms: u64, book: &Book) -> Due {
+    /// What waits is due by when it arrived, on the monotonic clock; what it remembers of each
+    /// aircraft (its newest ADS-B position, the second it last solved) is of signed times, so it
+    /// is forgotten by the judging clock.
+    pub fn due(&mut self, at: Moment, book: &Book) -> Due {
+        let judged = at.judged();
         self.adsb
-            .retain(|_, newest| now_ms.saturating_sub(*newest) <= 2 * ADSB_HORIZON_MS);
-        let settled = now_ms.saturating_sub(SETTLE_MS);
+            .retain(|_, newest| !ADSB_REMEMBERED.older(*newest, judged));
+        let settled = at.mono().earlier(policy::<_, SETTLE_MS>());
         let mut work = Vec::new();
         let addresses: Vec<u32> = self
             .waiting
             .iter()
-            .filter(|(_, list)| list.iter().any(|one| one.arrived_ms <= settled))
+            .filter(|(_, list)| list.iter().any(|one| one.arrived <= settled))
             .map(|(address, _)| *address)
             .collect();
         for address in addresses {
-            let Some(list) = self.waiting.remove(&address) else {
+            let Some(mut list) = self.waiting.remove(&address) else {
                 continue;
             };
             self.count -= list.len();
-            let kept = self.solve_due(address, list, settled, book, &mut work);
+            self.lists -= list_bytes(&list);
+            let kept = self.solve_due(address, list.take().into(), settled, book, &mut work);
             if !kept.is_empty() {
                 self.count += kept.len();
+                let kept = Waitings::of(kept);
+                self.lists += list_bytes(&kept);
                 self.waiting.insert(address, kept);
             }
         }
         self.solved_second
-            .retain(|_, second| now_ms / 1000 <= *second + ADSB_HORIZON_MS / 1000);
+            .retain(|_, second| !ADSB_HORIZON.older_second(*second, judged));
         Due {
             work,
             report: std::mem::take(&mut self.report),
@@ -458,11 +575,12 @@ impl Shard {
         &mut self,
         address: u32,
         list: Vec<Waiting>,
-        settled: u64,
+        settled: Mono,
         book: &Book,
         work: &mut Vec<(u32, Arc<Carried>, Transmission)>,
     ) -> Vec<Waiting> {
-        let expired = |one: &Waiting| one.arrived_ms + KEPT_PAST_SETTLE_MS <= settled;
+        let expired =
+            |one: &Waiting| one.arrived.later(policy::<_, KEPT_PAST_SETTLE_MS>()) <= settled;
         let Some(carried) = book.model_for(&list) else {
             let before = list.len();
             let kept: Vec<Waiting> = list.into_iter().filter(|one| !expired(one)).collect();
@@ -470,21 +588,21 @@ impl Shard {
             return kept;
         };
         let receptions: Vec<Reception> = list.iter().map(|one| one.reception.clone()).collect();
-        let arrived: BTreeMap<ObservationId, u64> = list
+        let arrived: BTreeMap<ObservationId, Mono> = list
             .iter()
-            .map(|one| (one.reception.id(), one.arrived_ms))
+            .map(|one| (one.reception.id(), one.arrived))
             .collect();
         let grouping = tally_mlat_solver::group_reach(&carried.model, &receptions, Reach::Carried);
         let mut used: BTreeSet<ObservationId> = BTreeSet::new();
         for transmission in grouping.transmissions {
-            let first = transmission
+            let not_due = transmission
                 .receptions
                 .iter()
                 .filter_map(|timed| arrived.get(&timed.id))
                 .min()
                 .copied()
-                .unwrap_or(u64::MAX);
-            if first > settled {
+                .is_none_or(|first| first > settled);
+            if not_due {
                 continue;
             }
             // Fewer receivers than any solve takes: what else heard it is still on its way (from
@@ -528,10 +646,10 @@ impl Shard {
 /// models to carry, so the step (weighing what was heard, finding what is due in every address
 /// shard, solving) runs off the engine's thread.
 pub struct Plan {
-    pub identity: Identity,
+    pub signer: Signer,
     pub boot_id: u64,
-    pub now_ms: u64,
-    pub issued_ms: u64,
+    /// The step: what is due by its monotonic clock, what is signed by its judging one.
+    pub at: Moment,
     pub threads: usize,
     pub sequence: u64,
     pub book: Arc<Book>,
@@ -552,9 +670,9 @@ impl Plan {
         // Stable: an aircraft's transmissions keep the order its shard handed them out in.
         work.sort_by_key(|(address, _, _)| *address);
         Job {
-            identity: self.identity,
+            signer: self.signer,
             boot_id: self.boot_id,
-            issued_ms: self.issued_ms,
+            issued_ms: self.at.judged().ms(),
             threads: self.threads.max(1),
             sequence: self.sequence,
             work: work
@@ -584,7 +702,7 @@ pub struct Provisional {
 
 /// A provisional step's work, owned.
 pub struct Job {
-    pub identity: Identity,
+    pub signer: Signer,
     pub boot_id: u64,
     pub issued_ms: u64,
     pub threads: usize,
@@ -713,20 +831,19 @@ impl Provisional {
         self.book.len()
     }
 
-    /// Takes a batch the engine admitted, arrived at `now_ms`.
-    pub fn hear(&mut self, batch: &Arc<Decoded>, now_ms: u64) {
-        self.hear_notes(batch, notes_of(batch), now_ms);
+    /// Takes a batch the engine admitted, arrived at its own stamp.
+    pub fn hear(&mut self, batch: &Arc<Decoded>) {
+        self.hear_notes(batch, notes_of(batch));
     }
 
-    /// Takes what [`notes_of`] read of a batch the engine admitted, arrived at `now_ms`: the same
+    /// Takes what [`notes_of`] read of a batch the engine admitted, arrived at its own stamp: the same
     /// as `hear`, with the reading done wherever the batch was held. Held until the next step
     /// weighs it, in [`Order`] (module docs). Nothing for a hosted engine.
-    pub fn hear_notes(&mut self, batch: &Arc<Decoded>, notes: Vec<Note>, now_ms: u64) {
+    pub fn hear_notes(&mut self, batch: &Arc<Decoded>, notes: Vec<Note>) {
         if self.shards.is_empty() || notes.is_empty() {
             return;
         }
-        self.told
-            .push((Order::of(batch, now_ms), Arc::clone(batch), notes));
+        self.told.push((Order::of(batch), Arc::clone(batch), notes));
     }
 
     /// Weighs everything told, in [`Order`], as a host holding the shards apart does
@@ -756,43 +873,35 @@ impl Provisional {
         }
     }
 
-    /// What a step at `now_ms` needs, the spent models forgotten first.
-    pub fn plan(
-        &mut self,
-        now_ms: u64,
-        identity: &Identity,
-        boot_id: u64,
-        issued_ms: u64,
-        threads: usize,
-    ) -> Plan {
-        Arc::make_mut(&mut self.book).forget_spent(now_ms);
+    /// What a step at `at` needs, the spent models forgotten first (by its judging clock: a
+    /// model's life is on the bin grid).
+    pub fn plan(&mut self, at: Moment, signer: &Signer, boot_id: u64, threads: usize) -> Plan {
+        Arc::make_mut(&mut self.book).forget_spent(at.judged());
         Plan {
-            identity: identity.clone(),
+            signer: signer.clone(),
             boot_id,
-            now_ms,
-            issued_ms,
+            at,
             threads: threads.max(1),
             sequence: self.sequence,
             book: Arc::clone(&self.book),
         }
     }
 
-    /// Hands out the transmissions due by `now_ms` in every address shard here, and forgets what
-    /// can no longer be solved. `None` when nothing is due.
+    /// Hands out the transmissions due at `at` in every address shard here, and forgets what can
+    /// no longer be solved. `None` when nothing is due.
     pub fn due(
         &mut self,
-        now_ms: u64,
-        identity: &Identity,
+        at: Moment,
+        signer: &Signer,
         boot_id: u64,
-        issued_ms: u64,
         threads: usize,
     ) -> Option<Job> {
         self.weigh();
-        let plan = self.plan(now_ms, identity, boot_id, issued_ms, threads);
+        let plan = self.plan(at, signer, boot_id, threads);
         let parts: Vec<Due> = self
             .shards
             .iter_mut()
-            .map(|shard| shard.due(now_ms, &plan.book))
+            .map(|shard| shard.due(at, &plan.book))
             .collect();
         let mut job = plan.job(parts);
         self.report.add(&std::mem::take(&mut job.report));
@@ -816,6 +925,13 @@ impl Provisional {
 }
 
 impl Job {
+    /// The step's work, signed by the engine's signer: a job exists only for a step the host
+    /// took by a watermark read while the relay's clock judged (`tally_relay::mlat_host`'s
+    /// `take_published`), and the signer lends its key only while the clock judges still.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "stepped only by a judging watermark (`MlatHost::take_published`)"
+    )]
     pub fn run(self) -> Outcome {
         let (solved, mut report) = parallel(self.threads, &self.work, solve_one);
         let mut solutions: Vec<tally_wire::Solution> = Vec::new();
@@ -833,10 +949,12 @@ impl Job {
             solutions,
             Positions::fitting,
             |sequence, run: &[tally_wire::Solution]| {
-                Positions::sign_provisional(
-                    &self.identity,
-                    &solutions_content(content(sequence), run),
-                )
+                self.signer.sign_with(|identity| {
+                    Positions::sign_provisional(
+                        identity,
+                        &solutions_content(content(sequence), run),
+                    )
+                })
             },
         );
         let sequence = self.sequence + records.len() as u64;
@@ -845,10 +963,12 @@ impl Job {
             tagged,
             Positions::fitting_tagged,
             |sequence, run: &[TaggedSolution]| {
-                Positions::sign_tagged_provisional(
-                    &self.identity,
-                    &solutions_content(content(sequence), run),
-                )
+                self.signer.sign_with(|identity| {
+                    Positions::sign_tagged_provisional(
+                        identity,
+                        &solutions_content(content(sequence), run),
+                    )
+                })
             },
         );
         report.records = records.len();

@@ -244,6 +244,11 @@ impl FaultProof {
         Ok(Self { bytes })
     }
 
+    /// What it allocates of its own: its bytes' capacity.
+    pub fn allocated(&self) -> usize {
+        crate::footprint::vec::<u8>(self.bytes.capacity())
+    }
+
     pub fn as_bytes(&self) -> &[u8] {
         &self.bytes
     }

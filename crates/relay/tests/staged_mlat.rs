@@ -11,9 +11,11 @@
 //! makes of it (`tally_mlat::replay`). At capacity the same receivers are refused, whole, whatever
 //! the order the descriptions came in and however they raced.
 
+#![allow(clippy::disallowed_methods, reason = "a test's scripted readings")]
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use tally_wire::clocks::recorded::judged;
 
 use tally_relay::hub::{Description, Hub, Inbound, Origin};
 use tally_relay::ingest::{Stamp, Threads};
@@ -82,6 +84,12 @@ fn declared(info: &ReceiverInfo) -> Result<(u64, Option<Location>)> {
 
 type Result<T = ()> = std::result::Result<T, String>;
 
+/// The same key again, from its file form, for a test that hands a key over and still signs or
+/// dials as it: `Identity` is not `Clone`.
+fn twin(identity: &Identity) -> Result<Identity> {
+    Identity::from_base64(&identity.to_base64()).map_err(|error| error.to_string())
+}
+
 fn text(error: impl std::fmt::Display) -> String {
     error.to_string()
 }
@@ -111,7 +119,7 @@ const MLAT_BOOT: u64 = 0xb007;
 fn mlat_settings(threads: usize) -> tally_mlat::engine::Settings {
     tally_mlat::engine::Settings {
         regions: Regions::default(),
-        settle_ms: tally_relay::mlat_host::SETTLE_MS,
+        settle: tally_relay::mlat_host::SETTLE,
         threads,
         capacity: tally_mlat::engine::Capacity::default(),
     }
@@ -263,8 +271,8 @@ struct Cutting {
 /// Two relays holding every area of the trace, each with the other's verified offer.
 #[derive(Clone, Debug)]
 struct Neighbours {
-    me: Identity,
-    other: Identity,
+    me: Arc<Identity>,
+    other: Arc<Identity>,
     carried: Vec<Record>,
 }
 
@@ -275,7 +283,7 @@ fn neighbouring(hub: &Hub, me: &Identity, other: &Identity, areas: &Regions, now
     use tally_relay::directory::Group;
     use tally_wire::{ProviderOffer, ProviderOfferContent, Streams};
     let network = hub.network();
-    network.adopt_identity(me.clone());
+    network.adopt_identity(twin(me)?);
     network.directory.adopt_own_key(me.public());
     network.selection.set_taken(areas.cells().to_vec());
     for (group, relay) in [me, other].into_iter().enumerate() {
@@ -298,7 +306,7 @@ fn neighbouring(hub: &Hub, me: &Identity, other: &Identity, areas: &Regions, now
             .map_err(text)?;
             network
                 .directory
-                .hold_verified(offer, Group::V4(group as u16), now)?;
+                .hold_verified(offer, Group::V4(group as u16), judged(now))?;
         }
     }
     Ok(())
@@ -333,11 +341,12 @@ fn mlat_run_cuts(
     // source through it. Untaken, the store was planned nothing and held one cut at a time.
     let hub = Arc::new(
         Hub::clocked(8, Arc::new(|| 0), tally_relay::sharing::Deadlines::RELAY)
+            .accepting_relays([tally_mlat_solver::sim::anchoring_relay().public()])
             .taking(areas.cells().to_vec())
             .staged(threads)?,
     );
     let host = Arc::new(HostedMlat::new(
-        Identity::from_seed([5; 32]),
+        tally_wire::Signer::new(Identity::from_seed([5; 32]), std::sync::Arc::new(|| true)),
         MLAT_BOOT,
         settings,
         cutting.window_clock.unwrap_or(WindowClock::KEEPING_UP),
@@ -375,7 +384,7 @@ fn mlat_run_cuts(
     hub.network()
         .host_mlat(Arc::clone(&host) as Arc<dyn MlatHost>);
     host.set_areas(areas.clone(), Vec::new());
-    let now = tally_relay::network::wall_ms();
+    let now = tally_relay::clock::RelayClock::system().judged().ms();
     let mut carried: std::collections::VecDeque<(u64, Record)> = Default::default();
     let mut link = None;
     if let Some(neighbours) = &cutting.network {
@@ -416,8 +425,7 @@ fn mlat_run_cuts(
         let asker = scope.spawn(|| {
             let mut n = 0;
             while !done.load(Ordering::SeqCst) {
-                let watermark = hub.network().products.watermark_ms();
-                let records = host.take_published(watermark);
+                let records = host.take_published(hub.network().products.watermark());
                 if let Ok(mut published) = published.lock() {
                     published.extend(records);
                 }
@@ -482,10 +490,7 @@ fn mlat_run_cuts(
                         issued_ms,
                         place,
                         publishing: false,
-                        stamp: Some(Stamp {
-                            stamp_ms: *at,
-                            ingest_seq: next as u64,
-                        }),
+                        stamp: Some(Stamp::recorded(*at, next as u64, *at, *at, true)),
                         in_flight: hub.in_flight_of(info.as_bytes().len()),
                     });
                 }
@@ -503,10 +508,7 @@ fn mlat_run_cuts(
                         2,
                         site.clone(),
                         site.receiver().map_err(text)?,
-                        Some(Stamp {
-                            stamp_ms: *at,
-                            ingest_seq: next as u64,
-                        }),
+                        Some(Stamp::recorded(*at, next as u64, *at, *at, true)),
                         hub.in_flight_of(site.as_bytes().len()),
                     );
                 }
@@ -520,10 +522,8 @@ fn mlat_run_cuts(
                         batch: batch.clone(),
                         origin: Origin::Elsewhere,
                         verify: true,
-                        stamp: Some(Stamp {
-                            stamp_ms: *at,
-                            ingest_seq: next as u64,
-                        }),
+                        stamp: Some(Stamp::recorded(*at, next as u64, *at, *at, true)),
+                        arrived: None,
                         in_flight,
                         refusal: None,
                     });
@@ -545,7 +545,11 @@ fn mlat_run_cuts(
                 .is_some_and(|(from_ms, _)| *from_ms <= step + lead)
             {
                 if let (Some((_, record)), Some(asker)) = (carried.pop_front(), &link) {
-                    hub.network().handle(&hub, asker, record, now, None);
+                    // One clock in this test: what it judges by is what it keeps by.
+                    let at = tally_relay::sharing::Now::from(tally_relay::ingest::Stamp::recorded(
+                        now, 0, now, now, true,
+                    ));
+                    hub.network().handle(&hub, asker, record, at, None);
                 }
             }
             // Everything stamped before the step is handed in: every worker ticks to it.
@@ -583,7 +587,10 @@ fn mlat_run_cuts(
     let cuts = host.take_cuts();
     let mut sent = Vec::new();
     if cutting.network.is_some() {
-        hub.network().publish_cuts(cuts.clone(), now);
+        hub.network().publish_cuts(
+            cuts.clone(),
+            tally_relay::strikes::Now::from(hub.clock().stamp(0)),
+        );
         sent = hub
             .network()
             .sharing
@@ -697,8 +704,11 @@ fn hosted_mlat_makes_the_same_bytes_on_any_threads_with_any_delays_and_the_refer
     }
     let first = delivered.first().map(|(at, _)| *at).ok_or("no raw")?;
     let until = delivered.last().map_or(0, |(at, _)| *at) + 60_000;
-    let mut engine =
-        tally_mlat::engine::Engine::new(Identity::from_seed([5; 32]), MLAT_BOOT, mlat_settings(2));
+    let mut engine = tally_mlat::engine::Engine::new(
+        tally_wire::Signer::new(Identity::from_seed([5; 32]), std::sync::Arc::new(|| true)),
+        MLAT_BOOT,
+        mlat_settings(2),
+    );
     engine.set_scope(tally_mlat::area::border_band(&areas), areas.clone());
     let reference: Vec<Record> = replay(&mut engine, &delivered, STEP_MS, until)?
         .into_iter()
@@ -861,8 +871,11 @@ fn descriptions_midway_make_the_same_bytes_with_any_delays_and_the_reference_eng
     }
     let first = delivered.first().map(|(at, _)| *at).ok_or("no raw")?;
     let until = delivered.last().map_or(0, |(at, _)| *at) + 60_000;
-    let mut engine =
-        tally_mlat::engine::Engine::new(Identity::from_seed([5; 32]), MLAT_BOOT, mlat_settings(2));
+    let mut engine = tally_mlat::engine::Engine::new(
+        tally_wire::Signer::new(Identity::from_seed([5; 32]), std::sync::Arc::new(|| true)),
+        MLAT_BOOT,
+        mlat_settings(2),
+    );
     engine.set_scope(tally_mlat::area::border_band(&areas), areas.clone());
     let reference: Vec<Record> = replay(&mut engine, &delivered, STEP_MS, until)?
         .into_iter()
@@ -944,8 +957,11 @@ fn a_window_step_that_runs_long_changes_no_provisional_byte() -> Result {
     assert!(!signed.0.is_empty(), "no provisional positions");
     let first = delivered.first().map(|(at, _)| *at).ok_or("no raw")?;
     let until = delivered.last().map_or(0, |(at, _)| *at) + 60_000;
-    let mut engine =
-        tally_mlat::engine::Engine::new(Identity::from_seed([5; 32]), MLAT_BOOT, mlat_settings(2));
+    let mut engine = tally_mlat::engine::Engine::new(
+        tally_wire::Signer::new(Identity::from_seed([5; 32]), std::sync::Arc::new(|| true)),
+        MLAT_BOOT,
+        mlat_settings(2),
+    );
     engine.set_scope(tally_mlat::area::border_band(&areas), areas.clone());
     let reference: Vec<Record> = replay(&mut engine, &delivered, STEP_MS, until)?
         .into_iter()
@@ -1248,8 +1264,8 @@ fn an_overloaded_host_cuts_by_rank_and_a_peer_offered_the_cut_makes_the_same_byt
 fn an_overloaded_relays_cut_reaches_the_relay_holding_its_area_and_both_make_the_same_bytes()
 -> Result {
     let (delivered, areas, receivers, settings) = cut_trace()?;
-    let relay_a = Identity::from_seed([6; 32]);
-    let relay_b = Identity::from_seed([7; 32]);
+    let relay_a = Arc::new(Identity::from_seed([6; 32]));
+    let relay_b = Arc::new(Identity::from_seed([7; 32]));
     let stranger = Identity::from_seed([8; 32]);
     let threads = Threads {
         ingest: 2,

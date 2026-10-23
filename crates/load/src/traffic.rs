@@ -92,12 +92,22 @@ struct Heard {
 pub struct Receiver {
     /// Its index in the whole run.
     pub index: usize,
-    pub identity: Identity,
+    /// Where its key comes from: the simulation's seed and its index in its cluster
+    /// (`sim::receiver_identity`). The key is made where it is used ([`Receiver::identity`]): an
+    /// `Identity` is not `Clone`, and the feeder that replays this receiver owns its own.
+    key: (u64, usize),
     pub location: Location,
     pub clock: Clock,
     /// Its cluster, and its place among this shard's receivers in that cluster.
     cluster: usize,
     slot: usize,
+}
+
+impl Receiver {
+    /// Its key, as the simulation made it.
+    pub fn identity(&self) -> Identity {
+        sim::receiver_identity(self.key.0, self.key.1)
+    }
 }
 
 /// How the rate was met, for the run's whole population (every shard's receivers).
@@ -431,7 +441,7 @@ impl Traffic {
                 let simulated = &sites.receivers[within];
                 receivers.push(Receiver {
                     index,
-                    identity: sim::receiver_identity(scenario.seed, within),
+                    key: (scenario.seed, within),
                     location: simulated.site.location,
                     clock: simulated.site.clock,
                     cluster,
@@ -974,7 +984,7 @@ mod tests {
             shard.wait_for(second);
             for (mine, theirs) in shard.receivers.iter().zip(&whole.receivers[185..215]) {
                 assert_eq!(mine.index, theirs.index);
-                assert_eq!(mine.identity.public(), theirs.identity.public());
+                assert_eq!(mine.identity().public(), theirs.identity().public());
                 let (mut a, mut b) = (Vec::new(), Vec::new());
                 assert!(shard.frames(mine.index - 185, second, 0, &mut a));
                 assert!(whole.frames(theirs.index, second, 0, &mut b));

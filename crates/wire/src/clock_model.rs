@@ -60,7 +60,7 @@ use blake2::{Blake2s256, Digest};
 
 use crate::WireError;
 use crate::batch::{Hash, domain, split_signature, u64_at};
-use crate::key::{Identity, KEY_LEN, PublicKey, SIGNATURE_LEN};
+use crate::key::{KEY_LEN, PublicKey, SIGNATURE_LEN, Signs};
 use crate::record::{Body, MAX_BODY, Record};
 
 pub const CLOCK_MODEL_FORMAT: u8 = 1;
@@ -150,7 +150,7 @@ impl ClockModel {
     /// The manifest and parts of `content`: inline when the model fits the manifest, else cut
     /// into `PART_LEN` parts. Refused beyond `MAX_MODEL_LEN`.
     pub fn sign(
-        identity: &Identity,
+        identity: &impl Signs,
         content: &ClockModelContent,
     ) -> Result<SignedClockModel, WireError> {
         let model = &content.model;
@@ -205,6 +205,11 @@ impl ClockModel {
         Ok(Self { bytes })
     }
 
+    /// What it allocates of its own: its bytes' capacity.
+    pub fn allocated(&self) -> usize {
+        crate::footprint::vec::<u8>(self.bytes.capacity())
+    }
+
     pub fn as_bytes(&self) -> &[u8] {
         &self.bytes
     }
@@ -223,6 +228,12 @@ impl ClockModel {
 
     pub fn sequence(&self) -> u64 {
         u64_at(&self.bytes, 1 + KEY_LEN + 8)
+    }
+
+    /// Its signed `issued_ms` (`Manifest::issued_ms`), read without its model: what a relay's time
+    /// window judges it by.
+    pub fn issued_ms(&self) -> Result<u64, WireError> {
+        crate::batch::u64_from(&self.bytes, 1 + KEY_LEN + 16)
     }
 
     /// The content address `Positions` solutions and parts cite: BLAKE2s-256 over
@@ -481,6 +492,11 @@ impl ClockModelPart {
         Ok(Self { bytes })
     }
 
+    /// What it allocates of its own: its bytes' capacity.
+    pub fn allocated(&self) -> usize {
+        crate::footprint::vec::<u8>(self.bytes.capacity())
+    }
+
     pub fn as_bytes(&self) -> &[u8] {
         &self.bytes
     }
@@ -622,6 +638,7 @@ impl Assembler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::key::Identity;
 
     fn content(model: Vec<u8>) -> ClockModelContent {
         ClockModelContent {

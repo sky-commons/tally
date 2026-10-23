@@ -22,6 +22,7 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
 use std::time::Duration;
+use tally_wire::clocks::Judged;
 
 use tally_mlat::area::Band;
 use tally_mlat_solver::ClockModel as Model;
@@ -85,8 +86,10 @@ enum Handed {
 struct Intake {
     records: VecDeque<(Handed, usize)>,
     bytes: usize,
-    settle_ms: u64,
-    settled_ms: u64,
+    /// On the judging clock: transmissions are settled by their signed transmit time. None before
+    /// any was asked, or any settled.
+    settle: Option<Judged>,
+    settled: Option<Judged>,
     /// Whether the thread holds a record or a piece it has taken and not finished.
     working: bool,
 }
@@ -178,7 +181,7 @@ impl Standing {
     fn work_once(&self, gate: Option<&Arc<Gate>>) {
         let next = {
             let mut intake = self.intake();
-            if intake.records.is_empty() && intake.settled_ms >= intake.settle_ms {
+            if intake.records.is_empty() && intake.settled >= intake.settle {
                 intake = self
                     .handed
                     .wait_timeout(intake, Duration::from_secs(1))
@@ -190,22 +193,24 @@ impl Standing {
                     intake.working = true;
                     Some(Ok(record))
                 }
-                None if intake.settled_ms < intake.settle_ms => {
-                    intake.working = true;
-                    Some(Err(intake.settle_ms))
-                }
-                None => None,
+                None => match intake.settle {
+                    Some(settle) if intake.settled < Some(settle) => {
+                        intake.working = true;
+                        Some(Err(settle))
+                    }
+                    _ => None,
+                },
             }
         };
         let busy = next.is_some();
         let work = || match next {
             Some(Ok(Handed::Model(record))) => self.inner().model(&record),
             Some(Ok(Handed::Positions(positions))) => self.inner().positions(&positions),
-            Some(Err(settle_ms)) => {
-                let more = self.inner().settle_piece(settle_ms);
+            Some(Err(settle)) => {
+                let more = self.inner().settle_piece(settle);
                 if !more {
                     let mut intake = self.intake();
-                    intake.settled_ms = intake.settled_ms.max(settle_ms);
+                    intake.settled = intake.settled.max(Some(settle));
                 }
             }
             None => {}
@@ -227,10 +232,7 @@ impl Standing {
         loop {
             {
                 let intake = self.intake();
-                if intake.records.is_empty()
-                    && !intake.working
-                    && intake.settled_ms >= intake.settle_ms
-                {
+                if intake.records.is_empty() && !intake.working && intake.settled >= intake.settle {
                     return true;
                 }
             }
@@ -272,32 +274,32 @@ impl Standing {
     /// A clock model manifest or part the relay forwarded: held once whole, read under the
     /// specification it names, and only when it is a function of what it says. Taken in by
     /// standing's thread (`Standing::start`), in the order handed.
-    pub fn model(&self, record: &Record, now_ms: u64) {
+    pub fn model(&self, record: &Record, now: Judged) {
         let bytes = match record {
             Record::ClockModel(manifest) => manifest.as_bytes().len(),
             Record::ClockModelPart(part) => part.as_bytes().len(),
             _ => return,
         };
         self.hand(Handed::Model(record.clone()), bytes);
-        self.tick(now_ms);
+        self.tick(now);
     }
 
     /// Final or provisional positions the relay forwarded (verified): each solution under a held
     /// model, consistent with its own receptions, joins its transmission until it is settled.
     /// Taken in by standing's thread (`Standing::start`), in the order handed.
-    pub fn positions(&self, positions: &Positions, now_ms: u64) {
+    pub fn positions(&self, positions: &Positions, now: Judged) {
         self.hand(
             Handed::Positions(positions.clone()),
             positions.as_bytes().len(),
         );
-        self.tick(now_ms);
+        self.tick(now);
     }
 
-    /// Settles what is due by `now_ms`, on standing's thread.
-    pub fn tick(&self, now_ms: u64) {
+    /// Settles what is due by the judging clock `now`, on standing's thread.
+    pub fn tick(&self, now: Judged) {
         let mut intake = self.intake();
-        if now_ms > intake.settle_ms {
-            intake.settle_ms = now_ms;
+        if Some(now) > intake.settle {
+            intake.settle = Some(now);
             drop(intake);
             self.handed.notify_one();
         }
@@ -308,19 +310,21 @@ impl Standing {
     #[cfg(test)]
     pub fn drain(&self) {
         loop {
-            let (next, settle_ms) = {
+            let (next, settle) = {
                 let mut intake = self.intake();
                 let next = intake.records.pop_front().map(|(record, bytes)| {
                     intake.bytes -= bytes;
                     record
                 });
-                (next, intake.settle_ms)
+                (next, intake.settle)
             };
             match next {
                 Some(Handed::Model(record)) => self.inner().model(&record),
                 Some(Handed::Positions(positions)) => self.inner().positions(&positions),
                 None => {
-                    while self.inner().settle_piece(settle_ms) {}
+                    if let Some(settle) = settle {
+                        while self.inner().settle_piece(settle) {}
+                    }
                     return;
                 }
             }
@@ -339,7 +343,8 @@ impl Standing {
 
     /// The receivers with standing now (their receptions kept agreeing with verified fixes):
     /// corroborated first-hand, which is what `credit` counts a feeder's description by.
-    pub fn agreeing(&self, now_ms: u64) -> Vec<PublicKey> {
+    pub fn agreeing(&self, now: Judged) -> Vec<PublicKey> {
+        let now_ms = now.ms();
         let period = tally_mlat_solver::standing::period_of(now_ms);
         self.inner()
             .book
@@ -437,13 +442,13 @@ impl Inner {
     }
 
     /// Settles a piece of what is due by `now_ms` (`SETTLE_PIECE`); true while any is left.
-    fn settle_piece(&mut self, now_ms: u64) -> bool {
+    fn settle_piece(&mut self, now: Judged) -> bool {
         let Some(sealed) = &self.sealed else {
             return false;
         };
         self.book
             .settle_up_to(
-                now_ms,
+                now,
                 |id, transmitted_ms| heard_in(sealed, id, transmitted_ms),
                 SETTLE_PIECE,
             )
@@ -453,8 +458,10 @@ impl Inner {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::disallowed_methods, reason = "a test's scripted readings")]
     use super::*;
     use tally_wire::Identity;
+    use tally_wire::clocks::recorded::judged;
 
     /// What standing is handed returns at once, whatever its thread is doing with the book
     /// (here, the book held for the whole test), and is taken in by that thread; past its intake's
@@ -476,7 +483,7 @@ mod tests {
         .map_err(|error| error.to_string())?;
         let standing = Arc::new(Standing::new());
         // No thread yet (no hosted MLAT): nothing is kept, nothing refused.
-        standing.positions(&positions, 0);
+        standing.positions(&positions, judged(0));
         assert!(standing.intake().records.is_empty());
         Standing::start(&standing, None)?;
         let held = standing.inner();
@@ -485,7 +492,7 @@ mod tests {
             let standing = Arc::clone(&standing);
             let positions = positions.clone();
             std::thread::spawn(move || {
-                standing.positions(&positions, 1);
+                standing.positions(&positions, judged(1));
                 let _ = done.send(());
             });
         }
@@ -504,7 +511,7 @@ mod tests {
         let many = MAX_INTAKE_BYTES / positions.as_bytes().len() + 2;
         let blocked = standing.inner();
         for _ in 0..many {
-            standing.positions(&positions, 2);
+            standing.positions(&positions, judged(2));
         }
         assert!(standing.refused() > 0);
         drop(blocked);
@@ -528,8 +535,8 @@ mod tests {
         assert_eq!(standing.of(&key, atlanta), None);
         standing.read_bins(SealedBins::new());
         assert_eq!(standing.of(&key, atlanta), Some(ReceiverStanding::NEW));
-        standing.model(&Record::Heartbeat, 0);
-        standing.tick(u64::MAX / 2);
+        standing.model(&Record::Heartbeat, judged(0));
+        standing.tick(judged(u64::MAX / 2));
         standing.drain();
         assert_eq!(standing.of(&key, atlanta), Some(ReceiverStanding::NEW));
         // Outside the areas held: unknown.

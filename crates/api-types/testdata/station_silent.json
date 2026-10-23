@@ -9,6 +9,7 @@
   "messages_per_sec": 0.0,
   "batches": 0,
   "gaps": 0,
+  "late_batches": 0,
   "location": null,
   "software": "tally-feed 0.3.0"
 }

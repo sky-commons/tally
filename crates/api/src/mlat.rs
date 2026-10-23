@@ -34,11 +34,13 @@ pub const VELOCITY_MIN_SPAN_MS: u64 = 1_000;
 pub const VELOCITY_MAX_SPAN_MS: u64 = 60_000;
 /// Metres a second in a knot (an international nautical mile, 1852 m, an hour).
 const KNOTS_PER_M_S: f64 = 3_600.0 / 1_852.0;
-/// How far past the API's own clock a precise world second may be and still be taken: the skew
-/// between a relay's clock and the API's. A precise second is sealed about 90 s after it ends, so
-/// an honest one is never ahead of either clock; one further ahead is a relay's lie, which would
-/// otherwise hold the feed at its second and refuse every honest one after it.
-pub const PRECISE_SKEW_MS: u64 = 10_000;
+// How far past the API's own clock a precise world second may be and still be taken is
+// `tally_wire::budget::PRODUCT_AHEAD`: the skew between a relay's clock and the API's, which holds
+// only while the API's own clock is bounded (the kernel's bound, checked before the API relies on
+// it). A precise second is sealed once every final fix of it has surely arrived
+// (`tally_relay::products::WORLD_PRECISE_SETTLE_MS`, 108.5 s after it ends), so an honest one is
+// never ahead of either clock; one further ahead is a relay's lie, which would otherwise hold the
+// feed at its second and refuse every honest one after it.
 
 /// What the operator chose.
 #[derive(Clone, Debug, PartialEq)]
@@ -321,6 +323,8 @@ pub fn start(
     // What the merge reads, the relays' feeder figures among it; and the precise world product,
     // for the precise feed. No raw: it is relay-only.
     let streams = tally_merge::link::streams().with(tally_wire::Streams::WORLD_PRECISE);
+    // The API's key only handshakes: as a subscriber it signs nothing.
+    let identity = tally_wire::NoiseKey::of(identity);
     for relay in &settings.relays {
         tokio::spawn(tally_merge::link::subscribe_vouched(
             relay.clone(),
@@ -336,17 +340,19 @@ pub fn start(
         let mut published = std::time::Instant::now();
         let mut dirty = false;
         let mut precise = PreciseWorld::default();
+        let clock = Clock::system();
         while let Some(record) = records.blocking_recv() {
-            let now_ms = wall_ms();
+            let now = clock.now();
+            let now_ms = now.judged().ms();
             match &record {
                 ClientRecord::WorldPrecise(world) => {
-                    if precise.take(world, now_ms) {
+                    if precise.take(world, now) {
                         positions.set_precise(precise.second, precise.served());
                     }
                 }
                 ClientRecord::FeederFigures(figures) => {
                     if let Ok(mut ledger) = feeders.lock() {
-                        ledger.ingest(figures, now_ms);
+                        ledger.ingest(figures, now);
                     }
                 }
                 _ => match merge.ingest(&record, now_ms) {
@@ -374,15 +380,21 @@ struct PreciseWorld {
 }
 
 impl PreciseWorld {
-    /// Takes a part, if it verifies, is of a second no later than `now_ms` plus
-    /// `PRECISE_SKEW_MS`, and is of the newest second (from the relay that signed the second's
-    /// first part seen): true when what is held changed.
-    fn take(&mut self, world: &tally_wire::WorldPrecise, now_ms: u64) -> bool {
+    /// Takes a part, if it verifies, is of a second no later than `now` plus
+    /// `tally_wire::budget::PRODUCT_AHEAD`, and is of the newest second (from the relay that
+    /// signed the second's first part seen): true when what is held changed. None is taken while
+    /// the API's clock does not judge (`Clock`): `PRODUCT_AHEAD` holds only of a clock within `E`,
+    /// and a lying relay's second far ahead would otherwise hold the feed.
+    fn take(&mut self, world: &tally_wire::WorldPrecise, now: Now) -> bool {
+        if !now.judging() {
+            return false;
+        }
         let (Ok(()), Ok(signer), Ok(content)) = (world.verify(), world.signer(), world.content())
         else {
             return false;
         };
-        if content.second.saturating_mul(1_000) > now_ms.saturating_add(PRECISE_SKEW_MS)
+        if tally_wire::budget::PRODUCT_AHEAD
+            .ahead(content.second.saturating_mul(1_000), now.judged())
             || content.second < self.second
             || (content.second == self.second && self.signer.is_some_and(|held| held != signer))
         {
@@ -425,10 +437,102 @@ impl PreciseWorld {
     }
 }
 
-fn wall_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_millis() as u64)
+/// The API host's clock as it judges signed times: its wall clock, and whether the kernel says it
+/// is synchronised now within `budget::E` (`tally_wire::kernel_clock::bound_ms`, the one reading
+/// of the kernel's word), asked at each reading. What `PRODUCT_AHEAD` and `K` are derived from is
+/// every judging clock within `E` of true time, so the API relies on them only by a reading its
+/// kernel vouched for: a host with no time daemon, or one whose kernel says unsynchronised or a
+/// bound past `E`, judges nothing. The bound is only as good as the daemon's: the host must run
+/// chrony or ntpd (RFC-0171 §3.6); under systemd-timesyncd it understates the error, and nothing
+/// here can tell.
+#[derive(Clone)]
+pub struct Clock {
+    judged: tally_wire::clocks::JudgedReader,
+    judging: std::sync::Arc<dyn Fn() -> bool + Send + Sync>,
+}
+
+impl std::fmt::Debug for Clock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Clock").finish_non_exhaustive()
+    }
+}
+
+/// The host's wall clock read as the API's judging clock: the one place a reading of it is made.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "the API's reader of its host's wall clock: a reading is made where the clock is read"
+)]
+fn wall() -> tally_wire::clocks::Judged {
+    tally_wire::clocks::recorded::judged(crate::routes::wall_ms())
+}
+
+/// A test's script read as the API's judging clock.
+#[cfg(test)]
+#[allow(clippy::disallowed_methods, reason = "a test's scripted readings")]
+fn scripted(ms: u64) -> tally_wire::clocks::Judged {
+    tally_wire::clocks::recorded::judged(ms)
+}
+
+impl Clock {
+    /// The host's: its wall clock, judged by its kernel's word on it.
+    pub fn system() -> Self {
+        Self {
+            judged: tally_wire::clocks::JudgedReader::of(wall),
+            judging: std::sync::Arc::new(|| {
+                tally_wire::kernel_clock::asked()
+                    .is_ok_and(|answer| tally_wire::kernel_clock::bound_ms(answer, false).is_some())
+            }),
+        }
+    }
+
+    /// A test's: its clock reads `read`, and judges as `judging` says.
+    #[cfg(test)]
+    pub fn scripted(
+        read: impl Fn() -> u64 + Send + Sync + 'static,
+        judging: impl Fn() -> bool + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            judged: tally_wire::clocks::JudgedReader::of(move || scripted(read())),
+            judging: std::sync::Arc::new(judging),
+        }
+    }
+
+    /// The clock now, with whether it judges.
+    pub fn now(&self) -> Now {
+        Now {
+            judged: self.judged.read(),
+            judging: (self.judging)(),
+        }
+    }
+}
+
+/// A reading of the API's clock and whether it judged as it was read (`Clock::now`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Now {
+    judged: tally_wire::clocks::Judged,
+    judging: bool,
+}
+
+impl Now {
+    /// The reading.
+    pub const fn judged(self) -> tally_wire::clocks::Judged {
+        self.judged
+    }
+
+    /// Whether the kernel bounded the clock within `E` as it was read.
+    pub const fn judging(self) -> bool {
+        self.judging
+    }
+
+    /// A test's reading `ms`, judging or not.
+    #[cfg(test)]
+    #[allow(clippy::disallowed_methods, reason = "a test's scripted readings")]
+    pub const fn at(ms: u64, judging: bool) -> Self {
+        Self {
+            judged: tally_wire::clocks::recorded::judged(ms),
+            judging,
+        }
+    }
 }
 
 /// The aircraft answer for a viewport: readsb's, each at its ADS-B position, then the MLAT
@@ -539,21 +643,29 @@ mod tests {
     }
 
     /// A precise second further ahead than the skew is a relay's lie: refused, and it does not
-    /// hold the feed against the honest seconds after it.
+    /// hold the feed against the honest seconds after it. While the API's clock does not judge
+    /// (its kernel bounds it past `E`, or not at all), nothing is taken, an honest second neither:
+    /// `PRODUCT_AHEAD` holds only of a clock within `E`.
     #[test]
     fn a_precise_second_from_the_future_is_refused() -> Result<(), String> {
         let now_ms = 1_791_220_000_000;
+        let now = Now::at(now_ms, true);
+        let skew = tally_wire::budget::PRODUCT_AHEAD
+            .span::<tally_wire::clocks::Judged>()
+            .ms();
         let liar = Identity::from_seed([1; 32]);
         let honest = Identity::from_seed([2; 32]);
         let mut held = PreciseWorld::default();
-        let ahead = (now_ms + PRECISE_SKEW_MS) / 1_000 + 1;
-        assert!(!held.take(&precise(&liar, ahead, 0xbad)?, now_ms));
+        let ahead = (now_ms + skew) / 1_000 + 1;
+        assert!(!held.take(&precise(&liar, ahead, 0xbad)?, now));
         assert!(!held.take(
             &precise(&liar, now_ms / 1_000 + 10 * 365 * 86_400, 0xbad)?,
-            now_ms
+            now
         ));
         let second = now_ms / 1_000 - 91;
-        assert!(held.take(&precise(&honest, second, 0xc0ffee)?, now_ms));
+        assert!(!held.take(&precise(&honest, second, 0xc0ffee)?, Now::at(now_ms, false)));
+        assert_eq!(held.second, 0);
+        assert!(held.take(&precise(&honest, second, 0xc0ffee)?, now));
         assert_eq!(held.second, second);
         assert_eq!(
             held.served()
@@ -563,8 +675,11 @@ mod tests {
             [0xc0ffee]
         );
         // Within the skew is taken: the relay's clock may be a little ahead of the API's.
-        let skewed = (now_ms + PRECISE_SKEW_MS) / 1_000;
-        assert!(held.take(&precise(&honest, skewed, 0xabc)?, now_ms));
+        let skewed = (now_ms + skew) / 1_000;
+        assert!(held.take(&precise(&honest, skewed, 0xabc)?, now));
+        // A scripted clock judges as its kernel says.
+        let clock = Clock::scripted(move || now_ms, || false);
+        assert_eq!(clock.now(), Now::at(now_ms, false));
         Ok(())
     }
 

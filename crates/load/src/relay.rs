@@ -4,7 +4,6 @@
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -135,18 +134,9 @@ pub fn spawn(
         std::fs::File::create(&log).map_err(|error| format!("{}: {error}", log.display()))?;
     let errors = output.try_clone().map_err(|error| error.to_string())?;
     let mut command = Command::new(bin);
-    // SAFETY: between fork and exec only `prctl` runs, which is async-signal-safe and touches no
-    // memory of the parent's.
-    unsafe {
-        command.pre_exec(|| {
-            // The relay dies with the harness, however the harness ends (an interrupt included),
-            // so no load test leaves a relay behind.
-            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
+    // The relay dies with the harness, however the harness ends (an interrupt included), so no
+    // load test leaves a relay behind.
+    crate::os::die_with_parent(&mut command);
     let child = command
         .args(&args)
         .stdin(Stdio::null())
@@ -381,23 +371,12 @@ impl Sample {
 /// Raises this process's open file limit to its hard limit (what an unprivileged process may),
 /// and returns the limit now in force. A spawned relay inherits it.
 pub fn raise_open_files() -> Result<u64, String> {
-    let mut limit = libc::rlimit {
-        rlim_cur: 0,
-        rlim_max: 0,
-    };
-    // SAFETY: `limit` is a valid rlimit for the call to fill and to read.
-    unsafe {
-        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) != 0 {
-            return Err(std::io::Error::last_os_error().to_string());
-        }
-        if limit.rlim_cur < limit.rlim_max {
-            limit.rlim_cur = limit.rlim_max;
-            if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) != 0 {
-                return Err(std::io::Error::last_os_error().to_string());
-            }
-        }
+    let text = |error: std::io::Error| error.to_string();
+    let (soft, hard) = tally_relay::os::open_files_limit().map_err(text)?;
+    if soft < hard {
+        tally_relay::os::set_open_files_limit(hard, hard).map_err(text)?;
     }
-    Ok(limit.rlim_cur)
+    Ok(soft.max(hard))
 }
 
 /// The kernel's clock ticks a second (`getconf CLK_TCK`), 100 if it cannot be asked.

@@ -314,12 +314,12 @@ pub fn engine_grant(
     directory: &Directory,
     engine: &PublicKey,
     asked: &Subscription,
-    now_ms: u64,
+    now: tally_wire::clocks::Judged,
 ) -> Subscription {
     if !asked.streams.contains(Streams::RAW) || asked.regions.is_empty() {
         return Subscription::nothing();
     }
-    let band = Band::of(&areas_solved_by(directory, engine, now_ms));
+    let band = Band::of(&areas_solved_by(directory, engine, now));
     let regions: Vec<Region> = asked
         .regions
         .iter()
@@ -400,6 +400,7 @@ pub fn on_directory_link(record: &Record) -> bool {
             | Record::DeliveryAnswer(_)
             | Record::HaveSummary(_)
             | Record::Heartbeat
+            | Record::TimedHeartbeat(_)
             | Record::Goodbye { .. }
             | Record::Redirect { .. }
             | Record::RelayList(_)
@@ -408,7 +409,9 @@ pub fn on_directory_link(record: &Record) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::disallowed_methods, reason = "a test's scripted readings")]
     use std::sync::Arc;
+    use tally_wire::clocks::recorded::judged;
 
     use tally_wire::rendezvous::AREA_RESOLUTION;
     use tally_wire::{
@@ -547,8 +550,8 @@ mod tests {
             Identity::generate().map_err(text)?,
         );
         let directory = Directory::new();
-        directory.hold_verified(offer(&engine, atlanta, 8)?, Group::V4(1), NOW)?;
-        directory.hold_verified(offer(&other, sydney, 8)?, Group::V4(2), NOW)?;
+        directory.hold_verified(offer(&engine, atlanta, 8)?, Group::V4(1), judged(NOW))?;
+        directory.hold_verified(offer(&other, sydney, 8)?, Group::V4(2), judged(NOW))?;
         let band = tally_mlat::area::border_band(&tally_wire::Regions::new([atlanta]));
         let edge = *band.cells().last().ok_or("an empty band")?;
         let asked = Subscription {
@@ -556,7 +559,7 @@ mod tests {
             regions: vec![atlanta, edge, sydney],
         };
         assert_eq!(
-            engine_grant(&directory, &engine.public(), &asked, NOW),
+            engine_grant(&directory, &engine.public(), &asked, judged(NOW)),
             Subscription {
                 streams: Streams::RAW,
                 regions: vec![atlanta, edge],
@@ -569,7 +572,7 @@ mod tests {
             regions: Vec::new(),
         };
         assert_eq!(
-            engine_grant(&directory, &engine.public(), &world, NOW),
+            engine_grant(&directory, &engine.public(), &world, judged(NOW)),
             Subscription::nothing()
         );
         let positions = Subscription {
@@ -577,11 +580,11 @@ mod tests {
             regions: vec![atlanta],
         };
         assert_eq!(
-            engine_grant(&directory, &engine.public(), &positions, NOW),
+            engine_grant(&directory, &engine.public(), &positions, judged(NOW)),
             Subscription::nothing()
         );
         assert_eq!(
-            engine_grant(&directory, &other.public(), &asked, NOW),
+            engine_grant(&directory, &other.public(), &asked, judged(NOW)),
             Subscription {
                 streams: Streams::RAW,
                 regions: vec![sydney],
@@ -589,11 +592,11 @@ mod tests {
         );
         let stranger = Identity::generate().map_err(text)?;
         assert_eq!(
-            engine_grant(&directory, &stranger.public(), &asked, NOW),
+            engine_grant(&directory, &stranger.public(), &asked, judged(NOW)),
             Subscription::nothing()
         );
         assert_eq!(
-            engine_grant(&directory, &engine.public(), &asked, NOW + 600_001),
+            engine_grant(&directory, &engine.public(), &asked, judged(NOW + 600_001)),
             Subscription::nothing()
         );
         Ok(())
@@ -617,7 +620,7 @@ mod tests {
                 )?;
                 if !areas.contains(&area) {
                     areas.push(area);
-                    directory.hold_verified(offer(&engine, area, 8)?, Group::V4(1), NOW)?;
+                    directory.hold_verified(offer(&engine, area, 8)?, Group::V4(1), judged(NOW))?;
                 }
             }
         }
@@ -628,7 +631,7 @@ mod tests {
         );
         // The work is counted, not timed: the band lookups one band of the engine's areas takes.
         let before = tally_mlat::area::band_lookups_here();
-        let _ = Band::of(&areas_solved_by(&directory, &engine.public(), NOW));
+        let _ = Band::of(&areas_solved_by(&directory, &engine.public(), judged(NOW)));
         let one_band = tally_mlat::area::band_lookups_here() - before;
         assert!(one_band > 0);
         let chunks = band.cells().chunks(tally_wire::record::MAX_REGIONS).len() as u64;
@@ -639,7 +642,7 @@ mod tests {
                 regions: chunk.to_vec(),
             };
             assert_eq!(
-                engine_grant(&directory, &engine.public(), &asked, NOW),
+                engine_grant(&directory, &engine.public(), &asked, judged(NOW)),
                 asked
             );
         }

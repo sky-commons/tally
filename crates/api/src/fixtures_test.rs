@@ -3,6 +3,7 @@
 //! writes, so a field renamed, retyped or re-meant here turns this test red before any client can
 //! read the old shape.
 
+#![allow(clippy::disallowed_methods, reason = "a test's scripted readings")]
 use tally_api_types::fixtures;
 use tally_relay::stations::{StationReport, StationsReport, cell_name};
 use tally_wire::{Identity, Location, Region};
@@ -77,6 +78,7 @@ fn report_of(cell: Option<String>, software: Option<&str>, observations: u64) ->
         last_seen_ms: NOW_MS - 1_000,
         batches: 9_001,
         gaps: 3,
+        late_batches: 0,
         observations,
         cell,
         software: software.map(str::to_owned),
@@ -249,7 +251,11 @@ fn the_network_and_station_answers_are_the_fixtures() -> Result<(), String> {
     let located = Stations::from_report(
         StationsReport {
             now_ms: NOW_MS,
-            stations: vec![report(place.clone(), Some("tally-feed 0.3.1"))],
+            // Seven of its batches came too late to take (a clock behind): the station says so.
+            stations: vec![StationReport {
+                late_batches: 7,
+                ..report(place.clone(), Some("tally-feed 0.3.1"))
+            }],
         },
         Some(&earlier(place.clone(), Some("tally-feed 0.3.1"))),
     );
@@ -291,6 +297,7 @@ fn the_network_and_station_answers_are_the_fixtures() -> Result<(), String> {
                 last_seen_ms: connected_ms,
                 batches: 0,
                 gaps: 0,
+                late_batches: 0,
                 observations: 0,
                 cell: None,
                 software: Some("tally-feed 0.3.0".to_owned()),
@@ -391,7 +398,7 @@ fn no_public_answer_carries_a_receivers_exact_place() -> Result<(), String> {
 /// figures of two placed feeders with standing and one that names no cell), read as issued.
 fn board() -> crate::feeders::Board {
     use crate::feeders::tests::{H, T, ledger, records};
-    ledger(&records()).board(T + H)
+    ledger(&records()).board(tally_wire::clocks::recorded::judged(T + H))
 }
 
 #[test]
@@ -417,7 +424,8 @@ fn the_feeder_and_leaderboard_answers_are_the_fixtures() -> Result<(), String> {
     )?;
     // The same records while no feeder has standing: the area is answered, nobody is ranked.
     use crate::feeders::tests::{H, T, ledger, records_standing};
-    let unranked = ledger(&records_standing(false, false)).board(T + H);
+    let unranked =
+        ledger(&records_standing(false, false)).board(tally_wire::clocks::recorded::judged(T + H));
     same(
         &unranked.leaderboard(&area).ok_or("no board")?,
         fixtures::LEADERBOARD_UNRANKED,

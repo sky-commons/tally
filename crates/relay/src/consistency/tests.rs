@@ -18,11 +18,11 @@ fn published() -> Result<(Vec<Record>, Vec<SiteRecord>), String> {
         .collect();
     let until = delivered.last().map_or(0, |(at, _)| *at) + 60_000;
     let mut engine = Engine::new(
-        Identity::from_seed([4; 32]),
+        tally_wire::Signer::new(Identity::from_seed([4; 32]), std::sync::Arc::new(|| true)),
         0xb007,
         Settings {
             regions: tally_wire::Regions::default(),
-            settle_ms: 1_000,
+            settle: tally_wire::budget::policy::<_, 1_000>(),
             threads: 2,
             capacity: Capacity::default(),
         },
@@ -167,7 +167,24 @@ fn the_hub_sends_a_client_only_what_passed() -> Result<(), String> {
     use crate::subscription::Subscription;
     use tally_wire::Streams;
     let (records, sites) = published()?;
-    let hub = Hub::new(8, crate::sharing::Deadlines::RELAY);
+    // By the clock the engine signed them at: a record outside the window of time is not
+    // forwarded (`strikes`).
+    let issued = records
+        .iter()
+        .filter_map(|record| match record {
+            Record::Positions(positions) | Record::Provisional(positions) => {
+                positions.issued_ms().ok()
+            }
+            Record::ClockModel(model) => model.issued_ms().ok(),
+            _ => None,
+        })
+        .max()
+        .ok_or("no records")?;
+    let hub = Hub::clocked(
+        8,
+        std::sync::Arc::new(move || issued),
+        crate::sharing::Deadlines::RELAY,
+    );
     let client = hub.listen(
         1,
         Filter::Client(

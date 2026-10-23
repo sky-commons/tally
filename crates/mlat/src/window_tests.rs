@@ -1,12 +1,16 @@
 //! The step over the simulator: determinism under order, copies and threads; two engines that
 //! cover a footprint publish the same tile; one that does not publishes none; one fit per tile.
 
+#![allow(clippy::disallowed_methods, reason = "a test's scripted readings")]
 use super::*;
 use crate::engine::{Engine, Settings};
 use std::collections::{BTreeMap, BTreeSet};
 use tally_mlat_solver::scope::{AFTER, GRID_MS, STRIDE, bin_of};
 use tally_mlat_solver::sim::{self, Rng, Scenario, Simulation};
-use tally_wire::{EnuCovariance, ObservationSet, Reception as WireReception, Region, TransmitTime};
+use tally_wire::clocks::recorded::aligned;
+use tally_wire::{
+    EnuCovariance, Identity, ObservationSet, Reception as WireReception, Region, TransmitTime,
+};
 
 fn text(error: impl std::fmt::Display) -> String {
     error.to_string()
@@ -16,11 +20,14 @@ const SETTLE_MS: u64 = 1_000;
 
 fn engine(seed: u8, regions: Vec<Region>, threads: usize) -> Engine {
     Engine::new(
-        Identity::from_seed([seed; 32]),
+        tally_wire::Signer::new(
+            Identity::from_seed([seed; 32]),
+            std::sync::Arc::new(|| true),
+        ),
         0xb007,
         Settings {
             regions: regions.into_iter().collect(),
-            settle_ms: SETTLE_MS,
+            settle: tally_wire::budget::policy::<_, SETTLE_MS>(),
             threads,
             capacity: crate::engine::Capacity::default(),
         },
@@ -102,9 +109,9 @@ fn a_step_publishes_client_forms_that_carry_no_site_and_rematch_on_a_relay() -> 
     let now = after(&simulation);
     let mut engine = engine(9, Vec::new(), 2);
     for record in infos.iter().chain(&batches) {
-        engine.ingest(record, crate::replay::sent_ms(record))?;
+        engine.ingest(record, aligned(crate::replay::sent_ms(record)))?;
     }
-    let (published, report) = engine.step(now, now);
+    let (published, report) = engine.step(tally_wire::clocks::recorded::aligned(now));
     assert!(report.solved >= 100, "{report:?}");
     assert_eq!(report.untagged, 0, "{report:?}");
     assert!(report.tagged_positions >= 1, "{report:?}");
@@ -199,9 +206,9 @@ fn the_same_raw_signs_the_same_bytes_whatever_the_order_copies_and_threads() -> 
     let now = after(&simulation);
     let mut first = engine(9, Vec::new(), 1);
     for record in infos.iter().chain(&batches) {
-        first.ingest(record, crate::replay::sent_ms(record))?;
+        first.ingest(record, aligned(crate::replay::sent_ms(record)))?;
     }
-    let (one, report) = first.step(now, now);
+    let (one, report) = first.step(tally_wire::clocks::recorded::aligned(now));
     assert!(report.solved >= 100, "{report:?}");
     assert_eq!(report.rejected, 0, "{report:?}");
     assert!(one.iter().any(|r| matches!(r, Record::ClockModel(_))));
@@ -211,17 +218,59 @@ fn the_same_raw_signs_the_same_bytes_whatever_the_order_copies_and_threads() -> 
         let mut rng = Rng::new(77 + threads as u64);
         let mut second = engine(9, Vec::new(), threads);
         for record in infos.iter().rev() {
-            second.ingest(record, crate::replay::sent_ms(record))?;
+            second.ingest(record, aligned(crate::replay::sent_ms(record)))?;
         }
         for record in delivered(&batches, &mut rng) {
-            second.ingest(record, crate::replay::sent_ms(record))?;
+            second.ingest(record, aligned(crate::replay::sent_ms(record)))?;
         }
-        let (two, _) = second.step(now, now);
+        let (two, _) = second.step(tally_wire::clocks::recorded::aligned(now));
         assert_eq!(encoded(&one)?, encoded(&two)?, "{threads} threads");
     }
     // Each window is solved once: the same clock again publishes nothing.
-    let (none, _) = first.step(now + 1, now + 1);
+    let (none, _) = first.step(tally_wire::clocks::recorded::aligned(now + 1));
     assert!(none.is_empty());
+    Ok(())
+}
+
+/// The engine signs through its signer only (`tally_wire::Signer`): a step whose relay's clock is
+/// not judging when it signs publishes no model, no client model and no positions, though it
+/// solved them. Before, the engine held the relay's key itself and signed whatever the clock.
+#[test]
+fn a_step_signs_nothing_while_its_signers_clock_is_not_judging() -> Result<(), String> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let simulation = sim::run(&scenario(5));
+    let (infos, batches) = records(&simulation)?;
+    let now = after(&simulation);
+    let judging = std::sync::Arc::new(AtomicBool::new(false));
+    let flag = std::sync::Arc::clone(&judging);
+    let mut engine = Engine::new(
+        tally_wire::Signer::new(
+            Identity::from_seed([9; 32]),
+            std::sync::Arc::new(move || flag.load(Ordering::Relaxed)),
+        ),
+        0xb007,
+        Settings {
+            regions: tally_wire::Regions::default(),
+            settle: tally_wire::budget::policy::<_, SETTLE_MS>(),
+            threads: 1,
+            capacity: crate::engine::Capacity::default(),
+        },
+    );
+    for record in infos.iter().chain(&batches) {
+        engine.ingest(record, aligned(crate::replay::sent_ms(record)))?;
+    }
+    let (records, report) = engine.step(tally_wire::clocks::recorded::aligned(now));
+    assert!(report.solved >= 100, "{report:?}");
+    assert!(
+        !records.iter().any(|record| matches!(
+            record,
+            Record::ClockModel(_)
+                | Record::ClientClockModel(_)
+                | Record::Positions(_)
+                | Record::ClockModelPart(_)
+        )),
+        "signed while the clock was not judging"
+    );
     Ok(())
 }
 
@@ -330,22 +379,22 @@ fn engines_covering_a_footprint_publish_the_same_tile_and_one_not_covering_it_no
         .chain(&far_batches)
         .collect();
     for record in &all {
-        both.ingest(record, crate::replay::sent_ms(record))?;
-        tiny.ingest(record, crate::replay::sent_ms(record))?;
+        both.ingest(record, aligned(crate::replay::sent_ms(record)))?;
+        tiny.ingest(record, aligned(crate::replay::sent_ms(record)))?;
     }
     let mut rng = Rng::new(9);
     for record in far_infos.iter().chain(near_infos.iter().rev()) {
-        near_only.ingest(record, crate::replay::sent_ms(record))?;
+        near_only.ingest(record, aligned(crate::replay::sent_ms(record)))?;
     }
     let mut mixed: Vec<Record> = near_batches.clone();
     mixed.extend(far_batches.iter().cloned());
     for record in delivered(&mixed, &mut rng) {
-        near_only.ingest(record, crate::replay::sent_ms(record))?;
+        near_only.ingest(record, aligned(crate::replay::sent_ms(record)))?;
     }
     let now = after(&near).max(after(&far));
-    let (a, report) = both.step(now, now);
-    let (b, near_report) = near_only.step(now, now + 7);
-    let (c, tiny_report) = tiny.step(now, now);
+    let (a, report) = both.step(tally_wire::clocks::recorded::aligned(now));
+    let (b, near_report) = near_only.step(tally_wire::clocks::recorded::moment(now, now + 7));
+    let (c, tiny_report) = tiny.step(tally_wire::clocks::recorded::aligned(now));
     let (a, b) = (published(&a)?, published(&b)?);
     let near_tiles: BTreeSet<(Tile, i64)> = b.keys().copied().collect();
     assert!(
@@ -376,10 +425,10 @@ fn a_window_fits_each_distinct_tile_its_targets_chose_once() -> Result<(), Strin
     let (infos, batches) = records(&simulation)?;
     let mut engine = engine(4, Vec::new(), 4);
     for record in infos.iter().chain(&batches) {
-        engine.ingest(record, crate::replay::sent_ms(record))?;
+        engine.ingest(record, aligned(crate::replay::sent_ms(record)))?;
     }
     let now = after(&simulation);
-    let (records, report) = engine.step(now, now);
+    let (records, report) = engine.step(tally_wire::clocks::recorded::aligned(now));
     assert!(report.windows >= 2 && report.tiles > 0, "{report:?}");
     assert_eq!(report.fits + report.uncovered, report.tiles, "{report:?}");
     assert_eq!(report.uncovered, 0, "{report:?}");
@@ -399,7 +448,7 @@ fn a_window_waits_until_it_has_ended_and_settled() -> Result<(), String> {
     let (infos, batches) = records(&simulation)?;
     let mut engine = engine(3, Vec::new(), 1);
     for record in infos.iter().chain(&batches) {
-        engine.ingest(record, crate::replay::sent_ms(record))?;
+        engine.ingest(record, aligned(crate::replay::sent_ms(record)))?;
     }
     let first = simulation
         .receptions
@@ -409,9 +458,9 @@ fn a_window_waits_until_it_has_ended_and_settled() -> Result<(), String> {
         .ok_or("no raw")?;
     let window = Window::canonical(first);
     let due = (window.last + 1) as u64 * GRID_MS + SETTLE_MS;
-    let (early, report) = engine.step(due - 1, 0);
+    let (early, report) = engine.step(tally_wire::clocks::recorded::aligned(due - 1));
     assert!(early.is_empty() && report.windows == 0, "{report:?}");
-    let (_, report) = engine.step(due, 0);
+    let (_, report) = engine.step(tally_wire::clocks::recorded::aligned(due));
     assert_eq!(report.windows, 1, "{report:?}");
     Ok(())
 }

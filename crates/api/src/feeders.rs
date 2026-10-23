@@ -17,7 +17,8 @@
 //! reception of it) and **standing** (the relay's own ledger).
 //!
 //! A figure counts only when its record verifies, is signed by one of the operator's relays
-//! (`Settings::relays`), and was issued no later than `FRESH_WITHIN_MS` past the API's clock; a
+//! (`Settings::relays`), and was issued no further ahead of the API's clock than two judging clocks
+//! may be apart (`tally_wire::budget::K`); a
 //! receiver's figure is the newest such, by issue time, then by the signer's key. One not
 //! re-issued within `STALE_MS` is no longer served.
 //!
@@ -40,12 +41,17 @@ use tally_relay::bounded::Bounded;
 use tally_wire::rendezvous::AREA_RESOLUTION;
 use tally_wire::{FeederFigure, FeederFigures, PublicKey, Region};
 
-/// A record issued further than this past the API's clock is not taken.
-pub const FRESH_WITHIN_MS: u64 = 120_000;
 /// A receiver's figure not re-issued within this is no longer served: two of a relay's hourly
 /// publishing intervals (`tally_relay::figures::PUBLISH_EVERY_MS`), so one missed publish is
 /// carried and a relay gone is dropped within two hours.
 pub const STALE_MS: u64 = 2 * tally_relay::figures::PUBLISH_EVERY_MS;
+// What the budget declares for it, `FIGURES_SERVED`, through which it is compared with the clock.
+const _: () = assert!(
+    tally_wire::budget::FIGURES_SERVED
+        .span::<tally_wire::clocks::Judged>()
+        .ms()
+        == STALE_MS
+);
 /// Feeders each leaderboard lists, and an area's unranked feeders at most.
 pub const BOARD_LENGTH: usize = 20;
 /// Receivers held.
@@ -122,18 +128,23 @@ impl Ledger {
         }
     }
 
-    /// One relay's figures, read at `now_ms` on the API's clock: each receiver's figure taken
-    /// when the record verifies, its signer is one of the operator's relays, it is not dated
-    /// ahead, and it is newer than the one held.
-    pub fn ingest(&mut self, figures: &FeederFigures, now_ms: u64) {
+    /// One relay's figures, read at `now` on the API's clock: each receiver's figure taken when
+    /// the record verifies, its signer is one of the operator's relays, it is not dated ahead,
+    /// and it is newer than the one held. None is taken while the API's clock is not judging
+    /// (`crate::mlat::Clock`): whether one is ahead cannot be told by it.
+    pub fn ingest(&mut self, figures: &FeederFigures, now: crate::mlat::Now) {
+        if !now.judging() {
+            return;
+        }
+        let now = now.judged();
         let (Ok(()), Ok(signer), Ok(content)) =
             (figures.verify(), figures.signer(), figures.content())
         else {
             return;
         };
         if !self.relays.contains(&signer)
-            || content.issued_ms > now_ms.saturating_add(FRESH_WITHIN_MS)
-            || content.issued_ms.saturating_add(STALE_MS) < now_ms
+            || tally_wire::budget::K.ahead(content.issued_ms, now)
+            || tally_wire::budget::FIGURES_SERVED.older(content.issued_ms, now)
         {
             return;
         }
@@ -160,12 +171,13 @@ impl Ledger {
         }
     }
 
-    /// Forgets what is stale, and computes every figure and board as of `now_ms`.
-    pub fn board(&mut self, now_ms: u64) -> Board {
+    /// Forgets what is stale, and computes every figure and board as of `now`.
+    pub fn board(&mut self, now: tally_wire::clocks::Judged) -> Board {
+        let now_ms = now.ms();
         let stale: Vec<PublicKey> = self
             .feeders
             .iter()
-            .filter(|(_, held)| held.issued_ms.saturating_add(STALE_MS) < now_ms)
+            .filter(|(_, held)| tally_wire::budget::FIGURES_SERVED.older(held.issued_ms, now))
             .map(|(key, _)| *key)
             .collect();
         for key in stale {

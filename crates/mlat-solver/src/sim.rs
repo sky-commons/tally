@@ -337,8 +337,11 @@ impl Simulation {
             }
             let mut batches = Vec::new();
             let mut previous = [0; 32];
+            let relay = anchoring_relay();
             for (sequence, chunk) in by_wall.iter().enumerate() {
-                let batch = Batch::sign(
+                // Anchored as its relay stated its clock when it was signed (RFC-0171 §3.6).
+                let anchor = tally_wire::Anchor::sign(&relay, chunk[0].wall_ms);
+                let batch = Batch::sign_anchored(
                     &identity,
                     &BatchContent {
                         boot_id: 1,
@@ -349,6 +352,8 @@ impl Simulation {
                         previous,
                         observations: chunk.iter().map(|r| r.observation.clone()).collect(),
                     },
+                    tally_wire::Codec::Plain,
+                    &[anchor],
                 )?;
                 previous = batch.hash();
                 batches.push(batch);
@@ -364,8 +369,16 @@ impl Simulation {
     }
 }
 
+/// The relay a simulated receiver publishes to, as its batches' freshness anchors name it
+/// (RFC-0171 §3.6): each batch carries this relay's anchor of the second it was signed in. A relay
+/// a simulation feeds uses its batches only if it knows this key (its own, or one its operator
+/// accepted, `--accept-relay`), as it would the relay a real feeder holds a session with.
+pub fn anchoring_relay() -> Identity {
+    Identity::from_seed([0xa7; 32])
+}
+
 /// One simulated receiver's signed traffic.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct Feed {
     pub identity: Identity,
     /// Its description as a new feeder signs it: format 2, its public cell and no site.

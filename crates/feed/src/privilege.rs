@@ -4,7 +4,9 @@
 //! and becomes that user for good. So a bind-mounted directory Docker created as root
 //! (`/opt/adsb/tally-feed:/var/lib/tally-feed`) works as a named volume does, with no `chown` by
 //! hand, and the feeder never runs as root. A feeder started as any other user (a host's systemd
-//! unit, a compose file's `user:`) changes nothing.
+//! unit, a compose file's `user:`) changes nothing. Its sockets' keepalive is set here too: this
+//! is the feeder's one module of system calls, the one that allows `unsafe`, and it reaches no
+//! key.
 
 use std::path::Path;
 
@@ -63,6 +65,39 @@ pub fn become_user(run_as: Option<&str>, state_dir: &Path) -> Result<(), String>
 
 #[cfg(not(unix))]
 pub fn become_user(_run_as: Option<&str>, _state_dir: &Path) -> Result<(), String> {
+    Ok(())
+}
+
+/// Probes `stream` after a minute idle, every 10 s, 6 times (`SO_KEEPALIVE`, and on Linux its
+/// times): the feeder's one other system call, kept here beside the others so this is the one
+/// module of the feeder that holds `unsafe`, and it reaches no key.
+pub fn keepalive(stream: &tokio::net::TcpStream) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let fd = stream.as_raw_fd();
+    let set = |level, name, value: libc::c_int| {
+        // SAFETY: `fd` is this stream's open socket, and `value` an int that lives for the call.
+        let done = unsafe {
+            libc::setsockopt(
+                fd,
+                level,
+                name,
+                std::ptr::from_ref(&value).cast(),
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        if done == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    };
+    set(libc::SOL_SOCKET, libc::SO_KEEPALIVE, 1)?;
+    #[cfg(target_os = "linux")]
+    {
+        set(libc::IPPROTO_TCP, libc::TCP_KEEPIDLE, 60)?;
+        set(libc::IPPROTO_TCP, libc::TCP_KEEPINTVL, 10)?;
+        set(libc::IPPROTO_TCP, libc::TCP_KEEPCNT, 6)?;
+    }
     Ok(())
 }
 

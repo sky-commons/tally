@@ -1,6 +1,10 @@
 //! `tally-mlat-calibrate <subset dir> [options]`: the native MLAT's calibration over a LocaRDS
 //! subset (the crate documentation says what it does and measures).
 
+// It reaches keys (`tally_wire::Identity`): no `unsafe` code at all, forbidden, so no module
+// can allow it.
+#![forbid(unsafe_code)]
+
 use std::path::PathBuf;
 use std::process::ExitCode;
 

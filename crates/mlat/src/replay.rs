@@ -22,6 +22,7 @@
 
 use tally_mlat_solver::sim::{self, Rng, Simulation};
 use tally_wire::Record;
+use tally_wire::clocks::recorded::aligned;
 
 use crate::engine::Engine;
 use crate::intake::SiteRecord;
@@ -146,7 +147,9 @@ pub fn transmitted_ms(simulation: &Simulation, source: usize) -> u64 {
 
 /// Drives `engine` over `arrivals` on the steps from the first arrival to `until_ms` (module docs):
 /// every multiple of `tick_ms` after the first arrival, each taking what arrived before it. Every
-/// record it published, with its step.
+/// record it published, with its step. A replay's clock never steps, so each instant reads alike
+/// on both clocks (`tally_wire::clocks::recorded::aligned`).
+#[allow(clippy::disallowed_methods, reason = "a replay's instants")]
 pub fn replay(
     engine: &mut Engine,
     arrivals: &[(u64, Record)],
@@ -168,19 +171,19 @@ pub fn replay(
                 // A format 2 description carries no site: nothing to take effect.
                 None if matches!(record, Record::ReceiverInfo(_)) => {}
                 None => {
-                    engine.ingest(record, *at)?;
+                    engine.ingest(record, aligned(*at))?;
                 }
             }
             next += 1;
         }
-        engine.expire_orphans(now);
+        engine.expire_orphans(aligned(now).mono());
         for (at, site) in crate::intake::taking_effect(descriptions.drain(..)) {
-            engine.ingest(&site.record(), at)?;
+            engine.ingest(&site.record(), aligned(at))?;
         }
-        for record in engine.provisional_step(now, now) {
+        for record in engine.provisional_step(aligned(now)) {
             published.push((now, record));
         }
-        let (records, _) = engine.step(now, now);
+        let (records, _) = engine.step(aligned(now));
         published.extend(records.into_iter().map(|record| (now, record)));
         now += tick_ms;
     }

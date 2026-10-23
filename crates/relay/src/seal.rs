@@ -36,7 +36,7 @@ pub const EPOCHS_HELD: u64 = 3;
 
 /// The epoch a stamp falls in.
 pub fn epoch_of(stamp: Stamp) -> Epoch {
-    epoch_of_ms(stamp.stamp_ms)
+    epoch_of_ms(stamp.mono_ms())
 }
 
 /// The epoch a stamp's milliseconds fall in.
@@ -50,10 +50,10 @@ pub fn epoch_of_ms(stamp_ms: u64) -> Epoch {
 /// workers are ordered the same however the workers raced, so which copy of a message is kept (and
 /// so the stream's and the regional product's bytes) follows the stamps and the batches alone.
 ///
-/// The hash is what makes the order total. Admission keeps receiver, boot and sequence unique only
-/// while it remembers the boot (`hub::BOOTS_PER_AUTHOR`); once it forgets an old one, a second, different
-/// batch under the same three can be admitted in the same millisecond, and only the hash (which
-/// admission already holds, `Batch::hash` computed once) orders the two without the insertion order.
+/// The hash is what makes the order total. Admission keeps batches unique by their hash alone
+/// (`strikes`), never by receiver, boot and sequence: two different batches under the same three can
+/// be admitted in the same millisecond, and only the hash (which admission already holds,
+/// `Batch::hash` computed once) orders the two without the insertion order.
 /// It is the key's last field, so it orders only batches whose other fields are equal: any two
 /// batches it did not tie before keep the order they had.
 pub fn canonical(decoded: &Decoded) -> (u64, PublicKey, u64, u64, Hash) {
@@ -71,6 +71,18 @@ pub fn end_of(epoch: Epoch) -> u64 {
     (epoch + 1) * EPOCH_MS
 }
 
+/// The instant `mono_ms` on the monotonic clock's own grid (an epoch's end, [`end_of`]; a hosted
+/// MLAT step), its judging clock by `moment`'s offset: a time the pipeline states on `M` from its
+/// own grid, never a reading of another clock. The relay's one statement of one
+/// (`tally_wire::clocks::Moment::at_ms`, which Clippy refuses elsewhere).
+#[allow(
+    clippy::disallowed_methods,
+    reason = "the pipeline's one statement of a time on its own monotonic grid"
+)]
+pub fn on_grid(moment: tally_wire::clocks::Moment, mono_ms: u64) -> tally_wire::clocks::Moment {
+    moment.at_ms(mono_ms)
+}
+
 /// Which epochs a shard has closed: each closes once, in order, when the watermark has passed it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Closer {
@@ -85,10 +97,10 @@ impl Closer {
     /// shard holds anything of: a shard starts with nothing before either.
     pub fn advance(
         &mut self,
-        watermark: Stamp,
+        watermark: tally_wire::clocks::Mono,
         oldest_open: Option<Epoch>,
     ) -> std::ops::Range<Epoch> {
-        let current = epoch_of(watermark);
+        let current = epoch_of_ms(watermark.ms());
         if !self.started {
             self.started = true;
             self.open_from = oldest_open.map_or(current, |oldest| oldest.min(current));
@@ -134,6 +146,25 @@ pub struct Merged {
     pub regional: BTreeMap<u64, (Region, Vec<Kept>)>,
     /// What its batches are charged, released when the epoch is let go.
     pub charges: Vec<Charge>,
+    /// The newest tick of its parts (`exchange::Frozen::judged`): what it is signed by.
+    pub judged: Option<Stamp>,
+}
+
+impl Merged {
+    /// The judging clock at this epoch's end (`end_of`), by its newest tick's two readings: the
+    /// time its products are signed at. None when that tick was stamped while the relay's clock
+    /// did not judge: nothing is signed from a stamp taken then (RFC-0171 §3.6).
+    pub fn signed_ms(&self) -> Option<u64> {
+        self.signed_at().map(|at| at.judged().ms())
+    }
+
+    /// As [`Merged::signed_ms`], the stamp at the epoch's end: its products' fixes are offered to
+    /// the world by it.
+    pub fn signed_at(&self) -> Option<Stamp> {
+        self.judged
+            .filter(|judged| judged.judging())
+            .map(|judged| judged.at_mono_ms(end_of(self.epoch)))
+    }
 }
 
 impl Merged {
@@ -185,8 +216,13 @@ pub struct Ready {
     /// Receptions a thread let go since its last word, their epoch closed before they came
     /// (`exchange::Frozen::late`).
     pub late: u64,
+    /// Receptions a thread let go since its last word, their epoch past the window
+    /// (`exchange::Frozen::past`).
+    pub past: u64,
     /// Every epoch before this is closed on every thread.
     pub watermark: Option<Epoch>,
+    /// The thread's newest tick (`exchange::Frozen::judged`): what the watermark is signed by.
+    pub judged: Option<Stamp>,
 }
 
 impl Coordinator {
@@ -203,7 +239,7 @@ impl Coordinator {
     /// One thread's word: the epochs it completes, merged or refused, oldest first, and the
     /// watermark every thread has closed to (every epoch before it is done).
     pub fn take(&mut self, frozen: Frozen) -> Ready {
-        let frozen_late = frozen.late;
+        let (frozen_late, frozen_past, judged) = (frozen.late, frozen.past, frozen.judged);
         let thread = frozen.thread.min(self.closed.len() - 1);
         let mut parts_lost = 0;
         if frozen.seq > self.expected[thread] {
@@ -236,7 +272,9 @@ impl Coordinator {
             merged,
             parts_lost,
             late: frozen_late,
+            past: frozen_past,
             watermark,
+            judged,
         }
     }
 
@@ -286,6 +324,7 @@ pub fn merge(epoch: Epoch, parts: Vec<Frozen>) -> Merged {
         ..Merged::default()
     };
     for mut part in parts {
+        merged.judged = merged.judged.max(part.judged);
         merged.charges.push(std::mem::take(&mut part.charge));
         let copy = |at: u32, index: u32| Kept {
             decoded: Arc::clone(&part.batches[at as usize]),
@@ -312,13 +351,11 @@ pub fn merge(epoch: Epoch, parts: Vec<Frozen>) -> Merged {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::disallowed_methods, reason = "a test's scripted readings")]
     use super::*;
 
-    fn at(stamp_ms: u64) -> Stamp {
-        Stamp {
-            stamp_ms,
-            ingest_seq: 0,
-        }
+    fn at(stamp_ms: u64) -> tally_wire::clocks::Mono {
+        tally_wire::clocks::recorded::mono(stamp_ms)
     }
 
     #[test]
@@ -410,8 +447,9 @@ mod tests {
                 data: vec![0x5d, 1, 2, 3, 4, 5, 6],
             }],
         };
-        let batch = tally_wire::Batch::sign(receiver, &content).map_err(|e| e.to_string())?;
-        Decoded::from_verified(batch, stamp_ms, 0).map_err(|e| e.error.to_string())
+        let batch = crate::anchors::anchored(receiver, &content).map_err(|e| e.to_string())?;
+        Decoded::from_verified(batch, tally_wire::clocks::recorded::aligned(stamp_ms), 0)
+            .map_err(|e| e.error.to_string())
     }
 
     /// One thread's part of epoch 0 holding `batches`, each one reception kept.

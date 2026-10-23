@@ -288,9 +288,13 @@ pub struct ClockModel {
 }
 
 /// How far past a clock's last knot a provisional solution may carry a model (crate docs,
-/// § Provisional solutions): 90 s, the longest a final model can be behind the newest raw at
-/// stride 8 (a stride of 40 s, the window's last bin, its settling time and a world-scale step of
-/// some 35 s). Beyond it the model says nothing.
+/// § Provisional solutions): 90 s, a spec constant. It covers the longest a tile's newest model
+/// can be behind a reception it is used for: the stride and the window's last bins
+/// (`(STRIDE + AFTER) * GRID`), the settling before the window is solved
+/// (`tally_wire::budget::MLAT_SETTLE`), the ripening before its model is used
+/// (`tally_mlat::engine::MODELS_RIPEN_MS`), how far a reception may run ahead
+/// (`tally_wire::budget::MLAT_AHEAD`) and a bin of rounding, 84 s in all, which `tally_mlat`
+/// asserts at compile time. Beyond it the model says nothing.
 pub const MAX_CARRY_PS: i128 = 90 * PS;
 
 /// What a model maps: only the counts between its clocks' knots (a final solution), or also up

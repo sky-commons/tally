@@ -58,7 +58,11 @@ rust_test(
     edition = "2024",
     lint_config = ":cargo_lints",
     rustc_flags = SOLVER_RUSTC_FLAGS,
-    deps = [":mlat-solver"],
+    deps = [
+        ":mlat-solver",
+        "//crates/counting",
+        "//crates/wire",
+    ],
 )
 
 rustfmt_test(
