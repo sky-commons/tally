@@ -682,7 +682,7 @@ mod tests {
             cell: None,
             points: None,
             decoded: None,
-            stamp_ms: 0,
+            stamp: tally_wire::clocks::recorded::mono(0),
             client: None,
         };
         let asked = |streams: Streams| {

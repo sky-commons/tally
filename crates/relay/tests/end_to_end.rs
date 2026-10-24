@@ -11,6 +11,7 @@
 //! deadline is what fails one that never comes. That something did *not* happen is shown by order,
 //! not by waiting a while: the relay's fan-out is in order, so a sentinel published after the
 //! event is heard after anything the event let through.
+#![allow(clippy::disallowed_methods, reason = "a test's scripted readings")]
 
 use std::collections::HashSet;
 use std::net::SocketAddr;
@@ -1146,10 +1147,45 @@ fn positions(engine: &Identity, sequence: u64) -> Result<Positions> {
 #[derive(Default)]
 struct Scripted {
     ready: std::sync::Mutex<Vec<Record>>,
+    /// The models among them, decoded, as an engine hands its own to the relay
+    /// (`MlatHost::take_own_models`).
+    own: std::sync::Mutex<Vec<tally_relay::mlat_host::OwnModel>>,
 }
 
 impl Scripted {
     fn publish(&self, records: Vec<Record>) {
+        let parts: Vec<tally_wire::ClockModelPart> = records
+            .iter()
+            .filter_map(|record| match record {
+                Record::ClockModelPart(part) => Some(part.clone()),
+                _ => None,
+            })
+            .collect();
+        let own: Vec<tally_relay::mlat_host::OwnModel> = records
+            .iter()
+            .filter_map(|record| {
+                let Record::ClockModel(manifest) = record else {
+                    return None;
+                };
+                let listed: Vec<tally_wire::ClockModelPart> = parts
+                    .iter()
+                    .filter(|part| part.model().ok() == Some(manifest.id()))
+                    .cloned()
+                    .collect();
+                let content = manifest.content(&listed).ok()?;
+                let model =
+                    tally_mlat_solver::publish::decode(&content.model, content.spec_version)
+                        .ok()?;
+                Some(tally_relay::mlat_host::OwnModel {
+                    id: manifest.id(),
+                    engine: manifest.engine().ok()?,
+                    model: Arc::new(model),
+                })
+            })
+            .collect();
+        if let Ok(mut held) = self.own.lock() {
+            held.extend(own);
+        }
         if let Ok(mut ready) = self.ready.lock() {
             ready.extend(records);
         }
@@ -1180,6 +1216,13 @@ impl MlatHost for Scripted {
 
     fn report(&self) -> MlatReport {
         MlatReport::default()
+    }
+
+    fn take_own_models(&self) -> Vec<tally_relay::mlat_host::OwnModel> {
+        self.own
+            .lock()
+            .map(|mut own| std::mem::take(&mut *own))
+            .unwrap_or_default()
     }
 }
 
@@ -1227,13 +1270,19 @@ async fn relay_hosting(
         Arc::new(move || base + u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)),
         Deadlines::RELAY,
     )
-    .accepting_relays([tally_mlat_solver::sim::anchoring_relay().public()]);
-    hub.network().host_mlat(mlat);
+    .accepting_relays([tally_mlat_solver::sim::anchoring_relay().public()])
+    // Its raw planned, as `tally-relay` plans a relay hosting MLAT.
+    .memory(tally_relay::hub::DEFAULT_MEMORY, true);
+    hub.host_mlat(mlat)?;
     relay_as(hub, identity).await
 }
 
 /// What a reference engine signing as `identity` publishes over a short simulation, and the site
 /// records it placed its receivers by.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a reference engine's signer, on a clock that always judges"
+)]
 fn engine_output(
     identity: &Identity,
 ) -> Result<(Vec<Record>, Vec<tally_mlat::intake::SiteRecord>)> {

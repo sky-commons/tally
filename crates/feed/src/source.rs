@@ -11,7 +11,9 @@ use tally_wire::backoff::Backoff;
 use tally_wire::batch::Hash;
 use tally_wire::beast::Decoder;
 use tally_wire::noise;
-use tally_wire::{Batch, BatchContent, Clock, Codec, Frame, Identity, Observation, Record};
+use tally_wire::{
+    Batch, BatchContent, Clock, Codec, EncodedBatch, Frame, Identity, Observation, Record,
+};
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
 use tokio::sync::{broadcast, mpsc};
@@ -71,10 +73,74 @@ pub const fn batches_held(ceiling: u32) -> usize {
         .ms();
     let seal_ms = SEAL_EVERY.as_millis() as u64;
     let seals = held_ms.div_ceil(seal_ms) + 1;
-    let gathered = (ceiling as u64).saturating_mul(held_ms + 2 * 1_000) / 1_000;
-    let filled = gathered.div_ceil(FILLED_AT_LEAST as u64);
+    let filled = held_gathered(ceiling).div_ceil(FILLED_AT_LEAST as u64);
     (seals * SEAL_KINDS as u64 + filled) as usize
 }
+
+/// The most receptions' bytes a batcher with upload ceiling `ceiling` gathers into the batches it
+/// holds for an anchor at once: what its ceiling lets through over `B`
+/// (`tally_wire::budget::Tolerance::gathered`), the longest it holds any (`ANCHOR_WAIT`), the seal
+/// that releases them and its bucket's second more.
+const fn held_gathered(ceiling: u32) -> u64 {
+    tally_wire::budget::B.gathered(ceiling as u64)
+}
+
+/// What one batch held for an anchor allocates beside its receptions' bytes (`Pending`, its
+/// receptions encoded as the wire carries them, `tally_wire::EncodedBatch`): its place in the
+/// queue, twice over since a `VecDeque` grows by doubling, the encoding's count and DEFLATE length
+/// fields, and the allocator's own header and rounding (16 bytes each, as
+/// `tally_counting::Counting` measures against).
+const HELD_BATCH_BYTES: u64 = 2 * std::mem::size_of::<Pending>() as u64 + 4 + 4 + 16;
+
+/// What one batch in the channel to the sessions allocates at most (`batch_backlog`): a signed
+/// batch's bytes, at most one Noise message (`MAX_OBSERVATION_BYTES` and `BATCH_OVERHEAD`), its
+/// kept key and hash, and the record that carries it, each with the allocator's own 16 bytes.
+const CHANNEL_BATCH_BYTES: u64 = (noise::MAX_PLAINTEXT
+    + tally_wire::batch::KEPT_BYTES
+    + tally_wire::footprint::arc::<Record>()
+    + 3 * 16) as u64;
+
+/// The most memory a batcher with upload ceiling `ceiling` and the channel to its sessions keep at
+/// once, in bytes: the batches it holds for an anchor, each as its receptions' wire bytes
+/// (compressed where that is smaller, never larger: `held_gathered` of them) and its own
+/// (`HELD_BATCH_BYTES`, `batches_held` of them); and every batch the channel holds
+/// (`batch_backlog`) at the most one signed batch allocates, since a session that reads nothing
+/// keeps it full while the hold fills. An anchor's return moves the hold into the channel batch
+/// by batch, each signed from its compact form and that form freed, so the drain never holds the
+/// backlog twice.
+pub const fn held_bytes(ceiling: u32) -> u64 {
+    held_gathered(ceiling)
+        + batches_held(ceiling) as u64 * HELD_BATCH_BYTES
+        + batch_backlog(ceiling) as u64 * CHANNEL_BATCH_BYTES
+}
+
+/// The memory the packaged unit runs the feeder in (`packaging/systemd/tally-feed.service`'s
+/// `MemoryMax=64M`; `tests/unit.rs` reads it there), past which the kernel kills it and the
+/// backlog it held is lost.
+pub const MEMORY_MAX: u64 = 64 << 20;
+
+/// What the feeder needs of `MEMORY_MAX` beside what it holds for an anchor (`held_bytes`): the
+/// binary's pages, the runtime's threads and their stacks, its sessions' Noise buffers, the
+/// batch it is gathering of each kind as owned receptions, the readers' queue (`INPUT_BACKLOG`),
+/// and the delivery check's audited batches. An allowance: an idle feeder publishing to a relay
+/// was measured at 10.3 MB resident (33 threads, on a 32-core host).
+pub const RUNTIME_BYTES: u64 = 24 << 20;
+
+/// The highest `--ceiling` whose hold for an anchor (`held_bytes`) and runtime (`RUNTIME_BYTES`)
+/// fit `MEMORY_MAX`: `config` refuses a higher one, which the kernel would kill as its backlog
+/// grew.
+pub const CEILING_MOST: u32 = {
+    let (mut fits, mut over) = (0u32, u32::MAX);
+    while over - fits > 1 {
+        let mid = fits + (over - fits) / 2;
+        if held_bytes(mid) + RUNTIME_BYTES <= MEMORY_MAX {
+            fits = mid;
+        } else {
+            over = mid;
+        }
+    }
+    fits
+};
 
 /// The most bytes a second a batcher with upload ceiling `ceiling` signs, as its sessions send
 /// them: the ceiling's receptions, and each batch's own bytes (`BATCH_OVERHEAD`, and a stored
@@ -335,8 +401,9 @@ impl WantedCeilings {
 
 /// This host's clocks: its wall clock (milliseconds since the epoch, which NTP or its owner may
 /// step either way), a monotonic one (time since some instant of its own, which never steps), and
-/// what the kernel says of the wall clock (`synced`: its error bound in milliseconds while its NTP
-/// daemon reports it synced, none while unsynced). The system's, or a test's.
+/// what the host's ClockBound says of the wall clock (`synced`: its error bound in milliseconds
+/// while it reports it synchronised within `E`, none otherwise or without ClockBound). The
+/// system's, or a test's.
 #[derive(Clone)]
 pub struct HostClock {
     pub wall: Arc<dyn Fn() -> u64 + Send + Sync>,
@@ -346,13 +413,19 @@ pub struct HostClock {
 
 impl HostClock {
     /// The system's: `SystemTime`, the raw monotonic clock (`CLOCK_MONOTONIC_RAW`,
-    /// `tally_wire::kernel_clock::raw_monotonic_ms`) and the kernel's word on its clock
-    /// (`adjtimex`). The monotonic clock is the raw one, the oscillator's own rate, because it ages
-    /// every sample's uncertainty at `tally_wire::budget::DRIFT_PPM` and anchors every sample's
-    /// offset: `Instant` (`CLOCK_MONOTONIC`) is slewed with the wall clock, by chrony at up to
-    /// 83,333 ppm, so a sample 30 s old could be off by 2.5 s while its interval widened by 15 ms.
-    /// A start asks [`raw_clock_answers`] first.
+    /// `tally_wire::kernel_clock::raw_monotonic_ms`) and the host's ClockBound
+    /// (`tally_wire::clock_bound::Reader::host`). The monotonic clock is the raw one, the
+    /// oscillator's own rate, because it ages every sample's uncertainty at
+    /// `tally_wire::budget::DRIFT_PPM` and anchors every sample's offset: `Instant`
+    /// (`CLOCK_MONOTONIC`) is slewed with the wall clock, by chrony at up to 83,333 ppm, so a
+    /// sample 30 s old could be off by 2.5 s while its interval widened by 15 ms. A start asks
+    /// [`raw_clock_answers`] first.
     pub fn system() -> Self {
+        Self::bounded_by(tally_wire::clock_bound::Reader::host())
+    }
+
+    /// As [`HostClock::system`], its wall clock bounded by the ClockBound segment `bound` reads.
+    pub fn bounded_by(bound: &'static tally_wire::clock_bound::Reader) -> Self {
         let started = tally_wire::kernel_clock::raw_monotonic_ms();
         Self {
             wall: Arc::new(wall_ms),
@@ -361,7 +434,7 @@ impl HostClock {
                     tally_wire::kernel_clock::raw_monotonic_ms().saturating_sub(started),
                 )
             }),
-            synced: Arc::new(host_error_ms),
+            synced: Arc::new(move || host_error_ms(bound)),
         }
     }
 }
@@ -383,7 +456,7 @@ pub fn raw_clock_answers() -> Result<(), String> {
 
 impl HostClock {
     /// A host whose wall clock reads `wall` and monotonic clock `monotonic` (milliseconds), each
-    /// as a test sets them, and whose kernel reports its clock unsynced.
+    /// as a test sets them, and which has no ClockBound to bound it.
     pub fn set_by(
         wall: &Arc<std::sync::atomic::AtomicU64>,
         monotonic: &Arc<std::sync::atomic::AtomicU64>,
@@ -403,23 +476,13 @@ impl Default for HostClock {
     }
 }
 
-/// The wall clock's error bound in milliseconds while the kernel says it is synchronised within
-/// `E`, from its read-only `adjtimex` (the one read every end makes, and the one reading of its
-/// answer, `tally_wire::kernel_clock::bound_ms`, synchronised now); none while it is unsynced
-/// (`STA_UNSYNC`), past `E`, or cannot be asked. The bound is the time daemon's: the host must run
-/// chrony or ntpd, which set it from their sources' root distance (the packaged unit and the
-/// installer see to it, RFC-0171 §3.6). Under systemd-timesyncd the kernel's bound leaves out the
-/// server's own error and understates the clock's, and nothing here can tell: the requirement is
-/// stated, not detected.
-pub fn host_error_ms() -> Option<u64> {
-    host_bound_of(tally_wire::kernel_clock::asked())
-}
-
-/// [`host_error_ms`] of what the kernel answered.
-fn host_bound_of(asked: std::io::Result<(bool, u64)>) -> Option<u64> {
-    asked
-        .ok()
-        .and_then(|answer| tally_wire::kernel_clock::bound_ms(answer, false))
+/// The wall clock's error bound in milliseconds while the host's ClockBound, as `bound` reads it,
+/// says it is synchronised within `E` (`tally_wire::clock_bound`, the one reader and the one
+/// judgement of its word every end shares); none while it is missing, unreadable, not
+/// synchronised or too wide. A feeder never needs ClockBound: without it the host is no reference,
+/// and the feeder signs by its configured relays.
+pub fn host_error_ms(bound: &tally_wire::clock_bound::Reader) -> Option<u64> {
+    bound.read().ok()
 }
 
 /// `E` in milliseconds: the error a relay that states none is taken to have, as a relay that
@@ -545,7 +608,7 @@ impl Sample {
 /// The sources are configured, never discovered, as NTP's are only the servers it was configured
 /// with: the relays its owner configured or its binary seeds (`--relay`, the seeds:
 /// [`RelayClocks::configured`]), measured by a session to one or a probe of one, and this host's
-/// own clock while its kernel reports it synced within `E`. Nothing else is a source: not a probe
+/// own clock while its ClockBound reports it synchronised within `E`. Nothing else is a source: not a probe
 /// answer from a relay a hint named, and not a session to one either, so no number of hinted
 /// relays changes what is selected. One relay is one source however it was heard, and a session
 /// that ends takes its sample with it. An unsynced host is no source, as NTP never votes its
@@ -560,9 +623,10 @@ impl Sample {
 /// sources a majority is still selected, and it asks for probes of its configured relays not yet
 /// heard (`RelayClocks::probing`). Without a selection (as in NTP, no system peer: the clock is
 /// not steered by a minority) it asks for them too, and meanwhile signs at the low end of this
-/// host's clock's bound while its kernel reports it synced (its own trusted reference, so again
+/// host's clock's bound while its ClockBound reports it synchronised (its own trusted reference, so again
 /// never ahead of true time), else by the offset a selection of its configured relays last made
-/// (NTP's holdover), else by this host's clock as read. What it selects is an interval holding
+/// (NTP's holdover, widened by the raw clock's drift as it ages and dropped once wider than
+/// `tally_wire::budget::SELECTION_LAG`), else by this host's clock as read. What it selects is an interval holding
 /// true time (`RelayClocks::reference`), at most `tally_wire::budget::SELECTION_LAG` wide, so a
 /// batch's signed time lags true time by at most that: the lag every window of time allows for.
 ///
@@ -572,17 +636,21 @@ impl Sample {
 /// clock says only how far this feeder's clock is from that relay's, which its health reports
 /// ([`RelayClocks::disagreements`]): never whether a batch goes, and never the relay's fate.
 pub struct RelayClocks {
-    samples: std::sync::Mutex<std::collections::HashMap<Source, (tally_wire::PublicKey, Sample)>>,
-    /// The relays whose probe answers are sources: the owner's and the binary's seeds.
+    /// Every sample kept, by where it was heard (`change`, the one place that decides which are
+    /// kept and which are sources).
+    samples: std::sync::Mutex<std::collections::HashMap<Source, Kept>>,
+    /// The relays that are sources: the owner's and the binary's seeds.
     configured: std::collections::HashSet<tally_wire::PublicKey>,
     sessions: std::sync::atomic::AtomicU64,
     host: HostClock,
     /// This host's wall clock when its monotonic clock read zero, as near as it was read: the
     /// anchor the monotonic clock is read in milliseconds since the epoch from.
     anchor_ms: i128,
-    /// The offset last selected, held when every source is gone, so a feeder keeps signing by
-    /// the corrected clock across its reconnects.
-    held_ms: std::sync::Mutex<Option<i64>>,
+    /// The interval last selected (offsets from the anchored clock) and when (the anchored
+    /// clock), held when every source is gone, so a feeder keeps signing by the corrected clock
+    /// across its reconnects: widened by the raw clock's drift as it ages, and dropped once wider
+    /// than any reference a feeder signs by (`tally_wire::budget::held_over`).
+    held_ms: std::sync::Mutex<Option<((i64, i64), i128)>>,
     /// Told when the sources make no majority: the publisher probes until they do.
     probing: tokio::sync::Notify,
     /// Each live session's freshness anchor from its relay heard last (RFC-0171 §3.6): what the
@@ -622,7 +690,9 @@ pub struct Telling {
 
 impl Telling {
     /// The session's relay stated its clock `clock_ms` with its error `error_ms` (either none) in
-    /// a `RateLimit`, heard now, `since_hello` after the session's Hello. Its greeting, the first
+    /// a `RateLimit`, heard now, the session's Hello sent at `hello_ms` (the anchored clock,
+    /// [`RelayClocks::stamp_ms`]: the raw monotonic clock, never `Instant`, which a daemon slews
+    /// with the wall clock by up to 83,333 ppm). Its greeting, the first
     /// statement, answers the Hello, so its one-way time is within that round trip: a sample
     /// whose uncertainty is the whole of it (the session's handshake time). A restatement, any
     /// after it, comes on the relay's own account (its clock stepped, or this feeder's batches
@@ -631,22 +701,17 @@ impl Telling {
     /// returned so the session asks for an echo at once, which measures the relay by its own
     /// round trip (`Telling::echoed`). Before, a restatement was a sample within the handshake's
     /// time, however long it had queued.
-    pub fn stated(
-        &self,
-        clock_ms: Option<u64>,
-        error_ms: Option<u64>,
-        since_hello: Duration,
-    ) -> bool {
+    pub fn stated(&self, clock_ms: Option<u64>, error_ms: Option<u64>, hello_ms: u64) -> bool {
         if self.handshake_ms.load(Ordering::Relaxed) != 0 {
             self.clocks
                 .change(Source::Session(self.session), self.relay, None);
             return true;
         }
-        let handshake = u64::try_from(since_hello.as_millis())
-            .unwrap_or(u64::MAX)
+        let now = self.clocks.anchored_ms();
+        let handshake = u64::try_from(now - i128::from(hello_ms))
+            .unwrap_or(0)
             .max(1);
         self.handshake_ms.store(handshake, Ordering::Relaxed);
-        let now = self.clocks.anchored_ms();
         let sample = clock_ms.map(|clock| Sample {
             offset_ms: saturated(i128::from(clock) - now),
             half_rtt_ms: handshake,
@@ -661,6 +726,14 @@ impl Telling {
     /// The relay answered a timed heartbeat (NTP's on-wire exchange): `asked_ms` (`T1`, the
     /// anchored clock this session sent it by, `Telling::asking_ms`), `took_ms` and `sent_ms`
     /// (`T2`, `T3`, the relay's clock), heard now (`T4`), with its error bound.
+    ///
+    /// `T1` is taken as the relay echoes it, with no nonce as a probe's echo carries: the session
+    /// is the relay's own, authenticated end to end by Noise, so only the relay measured can answer,
+    /// and every number in the answer but `T4` is already its word. An echoed `T1` later than the
+    /// one sent only narrows that relay's own interval, by at most the true round trip, while its
+    /// `T2` and `T3` place the interval anywhere: what makes one relay's lie harmless is the
+    /// selection, a majority of sources outvoting it (`selected`), never the width it claims. One
+    /// later than now (`T4`), or a round trip below none, is no sample (`echo_sample`).
     pub fn echoed(&self, asked_ms: u64, took_ms: u64, sent_ms: u64, error_ms: Option<u64>) {
         let now = self.clocks.anchored_ms();
         if let Some(sample) = echo_sample(asked_ms, took_ms, sent_ms, now, error_ms) {
@@ -693,7 +766,7 @@ impl Telling {
 
     /// The time a timed heartbeat this session sends now carries (`T1`): the anchored clock.
     pub fn asking_ms(&self) -> u64 {
-        u64::try_from(self.clocks.anchored_ms().max(0)).unwrap_or(u64::MAX)
+        self.clocks.stamp_ms()
     }
 
     /// This session's sample of its relay's clock, when it is one to judge by now: measured
@@ -707,7 +780,7 @@ impl Telling {
             .and_then(|samples| {
                 samples
                     .get(&Source::Session(self.session))
-                    .map(|(_, sample)| *sample)
+                    .map(|kept| kept.sample)
             })
             .filter(|sample| sample.interval(now).is_some())
     }
@@ -775,6 +848,17 @@ impl Drop for Telling {
         self.clocks
             .change(Source::Session(self.session), self.relay, None);
     }
+}
+
+/// A sample as [`RelayClocks::change`] keeps it: its relay, and whether that relay is a clock
+/// source (configured, [`RelayClocks::configured`]), decided once as it is kept. A session's sample
+/// of a relay a hint named is kept for its health (`Telling::disagreement_ms`,
+/// [`RelayClocks::disagreements`]) and is no source; a probe's of one is not kept at all.
+#[derive(Clone, Copy, Debug)]
+struct Kept {
+    relay: tally_wire::PublicKey,
+    sample: Sample,
+    source: bool,
 }
 
 /// An `i128` of milliseconds held to an `i64`.
@@ -895,8 +979,8 @@ impl RelayClocks {
     /// The trusted reference now, when there is one its operator trusts, as the interval of
     /// wall-clock milliseconds it holds true time in: where its configured relays' selection
     /// meets (`Selection::Majority` or `Selection::Few`), or this host's clock within its
-    /// kernel's bound while it reports it synced within `E` (its NTP daemon's configured
-    /// servers). Batches are signed at its low end (`now_ms`). None otherwise: the host's clock as
+    /// ClockBound's bound while it reports it synchronised within `E` (its NTP daemon's
+    /// configured servers). Batches are signed at its low end (`now_ms`). None otherwise: the host's clock as
     /// read, or held over, is no reference to judge a relay's anchor by.
     fn reference(&self) -> Option<(i128, i128)> {
         let now = self.anchored_ms();
@@ -1017,37 +1101,50 @@ impl RelayClocks {
     }
 
     /// A relay this feeder probed (`probe`) answered a timed heartbeat: `asked_ms` and `took_ms`,
-    /// `sent_ms` as `Telling::echoed` takes them, its answer heard `ago` before now. A source only
-    /// when the relay is configured ([`RelayClocks::configured`]): a relay a hint named is probed
-    /// for its rate and its room, never for the time.
+    /// `sent_ms` as `Telling::echoed` takes them, its answer heard at `heard_ms`, both stamps on
+    /// the anchored clock ([`RelayClocks::stamp_ms`]). It is kept only when the relay is configured
+    /// ([`RelayClocks::configured`]), which the store alone decides (`change`): a relay a hint
+    /// named is probed for its rate and its room, never for the time, and its answer is not kept.
     pub fn probed(
         &self,
         relay: tally_wire::PublicKey,
         (asked_ms, took_ms, sent_ms): (u64, u64, u64),
         error_ms: Option<u64>,
-        ago: Duration,
+        heard_ms: u64,
     ) {
-        if !self.configured.contains(&relay) {
-            return;
-        }
-        let heard = self.anchored_ms() - ago.as_millis().cast_signed();
+        let heard = i128::from(heard_ms);
         if let Some(sample) = echo_sample(asked_ms, took_ms, sent_ms, heard, error_ms) {
             self.change(Source::Probed(relay), relay, Some(sample));
         }
     }
 
-    /// The anchored clock `ago` before now, as a probe stamps its timed heartbeat (`T1`).
-    pub fn anchored_before(&self, ago: Duration) -> u64 {
-        u64::try_from((self.anchored_ms() - ago.as_millis().cast_signed()).max(0))
-            .unwrap_or(u64::MAX)
+    /// The anchored clock now, in whole milliseconds: what a timed heartbeat's question (`T1`)
+    /// and its answer (`T4`) and a session's Hello are stamped by, a probe's as a session's. It
+    /// runs on the raw monotonic clock ([`HostClock::system`]), so a daemon's slew of the wall
+    /// clock, which `Instant` follows, moves no stamp.
+    pub fn stamp_ms(&self) -> u64 {
+        u64::try_from(self.anchored_ms().max(0)).unwrap_or(u64::MAX)
     }
 
+    /// Keeps `sample` as `source`'s, or forgets `source`'s (none). The one owner of which relays
+    /// are clock sources: a configured relay's sample is one, however it was heard; a session's
+    /// sample of any other is kept for its health and is none; a probe of any other is kept not
+    /// at all, since nothing reads it (a probe's sample is a source's or nothing).
     fn change(&self, source: Source, relay: tally_wire::PublicKey, sample: Option<Sample>) {
+        let configured = self.configured.contains(&relay);
         if let Ok(mut samples) = self.samples.lock() {
             match sample {
-                Some(sample) => {
-                    samples.insert(source, (relay, sample));
+                Some(sample) if configured || matches!(source, Source::Session(_)) => {
+                    samples.insert(
+                        source,
+                        Kept {
+                            relay,
+                            sample,
+                            source: configured,
+                        },
+                    );
                 }
+                Some(_) => {}
                 None => {
                     samples.remove(&source);
                 }
@@ -1065,13 +1162,8 @@ impl RelayClocks {
         let mut by_relay: std::collections::HashMap<tally_wire::PublicKey, (i64, i64)> =
             std::collections::HashMap::new();
         if let Ok(samples) = self.samples.lock() {
-            // Only a configured relay is a source, however it was heard: a session to a relay a
-            // hint named keeps its sample for its health (`Telling::disagreement_ms`) and nothing
-            // else.
-            for (relay, sample) in samples
-                .values()
-                .filter(|(relay, _)| self.configured.contains(relay))
-            {
+            // Only a source's sample, as the store kept it (`change`).
+            for Kept { relay, sample, .. } in samples.values().filter(|kept| kept.source) {
                 let Some(interval) = sample.interval(now) else {
                     continue;
                 };
@@ -1092,7 +1184,7 @@ impl RelayClocks {
             .any(|relay| !by_relay.contains_key(relay));
         let mut intervals: Vec<(i64, i64)> = by_relay.into_values().collect();
         let relays = intervals.len();
-        // This host's own clock is a source only while its kernel reports it synced within `E`,
+        // This host's own clock is a source only while its ClockBound reports it synced within `E`,
         // within that bound: an undisciplined clock never votes, as NTP never votes its local
         // clock (it is read as it is only when nothing is selected, `now_ms`). Before, an
         // unsynced host was a source within `E`, so a Pi an hour off beside one seed made two
@@ -1126,7 +1218,7 @@ impl RelayClocks {
         };
         let mut by_relay: std::collections::HashMap<tally_wire::PublicKey, i64> =
             std::collections::HashMap::new();
-        for (source, (relay, sample)) in samples.iter() {
+        for (source, Kept { relay, sample, .. }) in samples.iter() {
             if !matches!(source, Source::Session(_)) {
                 continue;
             }
@@ -1157,8 +1249,8 @@ impl RelayClocks {
         };
         let heard: std::collections::HashSet<tally_wire::PublicKey> = samples
             .values()
-            .filter(|(_, sample)| sample.interval(now).is_some())
-            .map(|(relay, _)| *relay)
+            .filter(|kept| kept.sample.interval(now).is_some())
+            .map(|kept| kept.relay)
             .collect();
         heard.into_iter().collect()
     }
@@ -1169,45 +1261,51 @@ impl RelayClocks {
         self.host_synced() || self.offset_now().1 > 0
     }
 
-    /// This host's kernel reports its clock synced within `E`.
+    /// This host's ClockBound reports its clock synchronised within `E`.
     fn host_synced(&self) -> bool {
         self.host_bound().is_some()
     }
 
-    /// The bound this host's kernel reports its clock synced within, while it is within `E`.
+    /// The bound this host's ClockBound reports its clock synchronised within, while within `E`.
     fn host_bound(&self) -> Option<u64> {
         (self.host.synced)().filter(|error| tally_wire::budget::E.covers(*error))
     }
 
     /// The clock batches are signed by now (see the type): the low end of its trusted reference
     /// (`reference`), the anchored clock moved by the low end of what its configured sources
-    /// selected, or this host's clock less its kernel's bound while it reports it synced, so a
+    /// selected, or this host's clock less its ClockBound's bound while it reports it synced, so a
     /// batch is never signed ahead of true time. With no selection (RFC 5905: nothing selected),
-    /// the publisher is asked to probe (`probing`); with no reference either, it is the offset its
-    /// configured relays last selected (NTP's holdover), else this host's clock as read. So a Pi
+    /// the publisher is asked to probe (`probing`); with no reference either, it is the low end of
+    /// what its configured relays last selected (NTP's holdover), widened by the raw clock's drift
+    /// since and dropped once wider than `tally_wire::budget::SELECTION_LAG`
+    /// (`tally_wire::budget::held_over`), so a held offset is never ahead of true time nor further
+    /// behind than a live selection may be; else this host's clock as read. So a Pi
     /// an hour off between sessions signs by the time its configured relays last agreed, not its
     /// own, and nothing a hinted relay said is ever held.
     pub fn now_ms(&self) -> u64 {
-        let held = || self.held_ms.lock().ok().and_then(|held| *held);
-        let (selection, relays, unheard) = self.offset_now();
+        let held = || {
+            let ((lo, hi), at) = self.held_ms.lock().ok().and_then(|held| *held)?;
+            let age = u64::try_from(self.anchored_ms() - at).unwrap_or(0);
+            tally_wire::budget::held_over(lo, hi, age).map(|(lo, _)| lo)
+        };
+        let (selection, _, unheard) = self.offset_now();
         // Probes help only while a configured relay is unheard: no other relay's answer is a
         // source. Before, every round under three sources was hastened, forever.
         if unheard && !matches!(selection, Selection::Majority(_)) {
             self.probing.notify_one();
         }
         let chosen = match selection {
-            Selection::Majority((lo, _)) | Selection::Few((lo, _)) => Some(lo),
+            Selection::Majority(interval) | Selection::Few(interval) => Some(interval),
             Selection::NoMajority => None,
         };
-        // Every selection holds a configured relay (`offset_now`), so only such a one is held.
+        // Every selection holds a heard relay (`offset_now` selects nothing without one), so only
+        // such a one is held.
         let offset = match chosen {
-            Some(offset) => {
-                if relays > 0
-                    && let Ok(mut held) = self.held_ms.lock()
-                {
-                    *held = Some(offset);
+            Some((lo, hi)) => {
+                if let Ok(mut held) = self.held_ms.lock() {
+                    *held = Some(((lo, hi), self.anchored_ms()));
                 }
-                Some(offset)
+                Some(lo)
             }
             None => {
                 if let Some(error) = self.host_bound() {
@@ -1278,11 +1376,13 @@ pub struct Batcher {
     pending: std::collections::VecDeque<Pending>,
 }
 
-/// A batch gathered and not yet signed ([`Batcher::pending`]): its content but its chain link,
-/// which is taken as it is signed, and when it was gathered (the anchored clock).
+/// A batch gathered and not yet signed ([`Batcher::pending`]): its receptions encoded as the wire
+/// carries them, compressed (`tally_wire::EncodedBatch`), so the hold costs about its wire bytes
+/// and not the owned receptions' several times that; its chain link, which is taken as it is
+/// signed; and when it was gathered (the anchored clock).
 #[derive(Debug)]
 struct Pending {
-    content: BatchContent,
+    batch: EncodedBatch,
     gathered_ms: i128,
 }
 
@@ -1551,22 +1651,26 @@ impl Batcher {
     /// counted), never dropped, so what an anchor's return releases at once is what the sessions'
     /// channel holds (`batch_backlog`).
     fn signed_or_held(&mut self, content: BatchContent) -> Result<Option<Batch>, String> {
+        // Encoded once, as it is gathered: what it is held as, and what it is signed from.
+        let batch =
+            EncodedBatch::encode(&content, self.codec).map_err(|error| error.to_string())?;
+        drop(content);
         let anchors = self.clocks.anchors();
         if self.pending.is_empty() && !anchors.is_empty() {
-            return self.sign(content, &anchors).map(Some);
+            return self.sign(&batch, &anchors).map(Some);
         }
         let full = self.pending.len() >= batches_held(self.ceilings.ceiling);
         let oldest = if full { self.pending.pop_front() } else { None };
         self.pending.push_back(Pending {
-            content,
+            batch,
             gathered_ms: self.clocks.anchored_ms(),
         });
         match oldest {
-            Some(Pending { content, .. }) => {
+            Some(Pending { batch, .. }) => {
                 if anchors.is_empty() {
                     self.clocks.signed_unanchored();
                 }
-                self.sign(content, &anchors).map(Some)
+                self.sign(&batch, &anchors).map(Some)
             }
             None => self.release(),
         }
@@ -1575,12 +1679,12 @@ impl Batcher {
     /// The oldest batch waiting for an anchor, signed now whatever it has: what its source's end
     /// leaves (`batch`), so nothing gathered is dropped. None once none waits.
     pub fn finish(&mut self) -> Option<Result<Batch, String>> {
-        let Pending { content, .. } = self.pending.pop_front()?;
+        let Pending { batch, .. } = self.pending.pop_front()?;
         let anchors = self.clocks.anchors();
         if anchors.is_empty() {
             self.clocks.signed_unanchored();
         }
-        Some(self.sign(content, &anchors))
+        Some(self.sign(&batch, &anchors))
     }
 
     /// The oldest batch waiting for an anchor, signed: with the sessions' anchors once they have
@@ -1595,23 +1699,22 @@ impl Batcher {
         if anchors.is_empty() && tally_wire::budget::ANCHOR_WAIT.covers(waited) {
             return Ok(None);
         }
-        let Some(Pending { content, .. }) = self.pending.pop_front() else {
+        let Some(Pending { batch, .. }) = self.pending.pop_front() else {
             return Ok(None);
         };
         if anchors.is_empty() {
             self.clocks.signed_unanchored();
         }
-        self.sign(content, &anchors).map(Some)
+        self.sign(&batch, &anchors).map(Some)
     }
 
-    /// `content`, its chain linked to the batch signed before it, signed with `anchors`.
+    /// `batch`, its chain linked to the batch signed before it, signed with `anchors`.
     fn sign(
         &mut self,
-        mut content: BatchContent,
+        batch: &EncodedBatch,
         anchors: &[tally_wire::Anchor],
     ) -> Result<Batch, String> {
-        content.previous = self.previous;
-        let batch = Batch::sign_anchored(&self.identity, &content, self.codec, anchors)
+        let batch = Batch::sign_encoded(&self.identity, batch, self.previous, anchors)
             .map_err(|error| error.to_string())?;
         self.previous = batch.hash();
         Ok(batch)
@@ -2080,20 +2183,80 @@ mod tests {
     use super::*;
     use tally_wire::FrameKind;
 
-    /// A feeder's host is a source by the kernel's word as every end reads it
-    /// (`tally_wire::kernel_clock::bound_ms`): synchronised now, within `E`, its bound rounded up
-    /// to the millisecond; a bound of 0 is 0 ms, never a mark of one daemon. Before, a bound of
-    /// exactly 0 was taken for systemd-timesyncd's and no source, which it is for under a second
-    /// after each of its syncs; and a bound past `E` read as one here and was cut only later.
+    /// A segment written as ClockBound's daemon writes one at `dir`, its sample taken now, its
+    /// bound `bound_ns` and its status `status`, with no VMClock to read beside it.
+    fn clock_bound_segment(
+        dir: &std::path::Path,
+        bound_ns: i64,
+        status: clock_bound_shm::ClockStatus,
+    ) -> String {
+        use clock_bound_shm::{ClockErrorBound, ShmWrite, ShmWriter};
+        let path = dir.join("shm0");
+        let now =
+            clock_bound_shm::common::clock_gettime_safe(clock_bound_shm::common::CLOCK_MONOTONIC)
+                .unwrap_or_else(|error| panic!("{error:?}"));
+        let later = now + nix::sys::time::TimeSpec::new(1_000, 0);
+        let ceb = ClockErrorBound::new(now, later, bound_ns, 0, 50_000, status, false);
+        ShmWriter::new(&path)
+            .unwrap_or_else(|error| panic!("{}: {error}", path.display()))
+            .write(&ceb);
+        path.to_string_lossy().into_owned()
+    }
+
+    /// A host is a reference only by its ClockBound: synchronised within `E`, it is a source
+    /// within its bound and batches are signed at the low end of it; without ClockBound, or with
+    /// it free running or too wide, the host is no reference, and with no relay heard the feeder
+    /// signs by its own clock as read. Before, the host was a reference by the kernel's
+    /// `maxerror`, which no daemon vouches for.
     #[test]
-    fn a_host_is_a_source_by_the_kernels_word_synced_now_within_e() {
-        let e_us = tally_wire::budget::E.duration().as_micros() as u64;
-        assert_eq!(host_bound_of(Ok((true, 0))), Some(0));
-        assert_eq!(host_bound_of(Ok((true, 1))), Some(1));
-        assert_eq!(host_bound_of(Ok((true, 2_500))), Some(3));
-        assert_eq!(host_bound_of(Ok((true, e_us + 1))), None);
-        assert_eq!(host_bound_of(Ok((false, 2_500))), None);
-        assert_eq!(host_bound_of(Err(std::io::Error::other("no"))), None);
+    fn a_host_is_a_reference_only_by_its_clockbound() {
+        let dir = std::env::var_os("TEST_TMPDIR")
+            .map_or_else(std::env::temp_dir, std::path::PathBuf::from)
+            .join(format!("feed_clock_bound_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let vmclock = dir.join("vmclock0").to_string_lossy().into_owned();
+        let host = |shm: &str| {
+            let reader: &'static tally_wire::clock_bound::Reader =
+                Box::leak(Box::new(tally_wire::clock_bound::Reader::at(shm, &vmclock)));
+            HostClock::bounded_by(reader)
+        };
+        let synced = clock_bound_segment(
+            &dir.join("synced"),
+            4_000_000,
+            clock_bound_shm::ClockStatus::Synchronized,
+        );
+        let free = clock_bound_segment(
+            &dir.join("free"),
+            4_000_000,
+            clock_bound_shm::ClockStatus::FreeRunning,
+        );
+        let e_ns = i64::try_from(tally_wire::budget::E_MS * 1_000_000).unwrap_or(i64::MAX);
+        let wide = clock_bound_segment(
+            &dir.join("wide"),
+            e_ns + 1,
+            clock_bound_shm::ClockStatus::Synchronized,
+        );
+        let missing = dir.join("none").to_string_lossy().into_owned();
+
+        let bounded = host(&synced);
+        let bound = (bounded.synced)();
+        assert!(matches!(bound, Some(4..=5)), "{bound:?}");
+        let clocks = RelayClocks::on(bounded.clone());
+        assert!(clocks.reference().is_some(), "a synced host is a reference");
+        let before = (bounded.wall)();
+        let signed = clocks.now_ms();
+        let after = (bounded.wall)();
+        assert!(
+            signed + 4 <= after && signed + 6 >= before,
+            "signed at {signed}, the wall clock read {before} and {after}"
+        );
+        for (name, shm) in [("missing", &missing), ("free", &free), ("wide", &wide)] {
+            let unbounded = host(shm);
+            assert_eq!((unbounded.synced)(), None, "{name}");
+            let clocks = RelayClocks::on(unbounded);
+            assert!(clocks.reference().is_none(), "{name} is no reference");
+            assert!(!clocks.host_synced(), "{name}");
+        }
     }
 
     /// A frame of `counter` whose bytes are a hash of it: what no DEFLATE stream shrinks, so a
@@ -2154,13 +2317,14 @@ mod tests {
         let clocks =
             Arc::new(RelayClocks::on(HostClock::set_by(&wall, &monotonic)).configured([relay]));
         let session = clocks.session(relay);
-        let handshake = Duration::from_millis(40);
-        assert!(!session.stated(Some(LOCAL + 1_000), Some(0), handshake));
+        // Its Hello went 40 ms ago by the anchored clock.
+        let hello = clocks.stamp_ms() - 40;
+        assert!(!session.stated(Some(LOCAL + 1_000), Some(0), hello));
         assert_eq!(session.sample(0).map(|sample| sample.half_rtt_ms), Some(40));
         assert_eq!(clocks.now_ms(), LOCAL + 1_000 - 40);
         // The relay steps a second later and restates: no sample, an echo asked.
         monotonic.store(1_000, Ordering::Relaxed);
-        assert!(session.stated(Some(LOCAL + 61_000), Some(0), handshake));
+        assert!(session.stated(Some(LOCAL + 61_000), Some(0), hello));
         assert_eq!(session.sample(1_000), None);
         // The echo measures it.
         let asked = session.asking_ms();
@@ -2194,9 +2358,30 @@ mod tests {
         let session = clocks.session(liar);
         let asked = session.asking_ms();
         session.echoed(asked, lie, lie, Some(0));
-        clocks.probed(liar, (asked, lie, lie), Some(0), Duration::ZERO);
+        clocks.probed(liar, (asked, lie, lie), Some(0), clocks.stamp_ms());
         // Signed at the low end of its host's bound.
         assert_eq!(clocks.now_ms(), LOCAL - 5, "the liar was followed");
+        drop(session);
+    }
+
+    /// A relay heard two ways (a session and a probe) is one source at the tighter of its two
+    /// intervals, whichever was heard first: here the probe's, narrow and a second ahead of the
+    /// session's wide one, so the batches are signed at its low end.
+    #[test]
+    fn a_relay_heard_two_ways_is_its_tightest_interval() {
+        const LOCAL: u64 = 1_800_000_000_000;
+        let wall = Arc::new(std::sync::atomic::AtomicU64::new(LOCAL));
+        let monotonic = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let seed = fresh_relay();
+        let clocks =
+            Arc::new(RelayClocks::on(HostClock::set_by(&wall, &monotonic)).configured([seed]));
+        let session = clocks.session(seed);
+        let asked = session.asking_ms();
+        session.echoed(asked, LOCAL, LOCAL, Some(4_000));
+        let ahead = LOCAL + 1_000;
+        clocks.probed(seed, (asked, ahead, ahead), Some(100), clocks.stamp_ms());
+        assert_eq!(clocks.offset_now().1, 1, "one relay, one source");
+        assert_eq!(clocks.now_ms(), ahead - 100, "the wider interval was taken");
         drop(session);
     }
 
@@ -2231,8 +2416,8 @@ mod tests {
     /// its clock; a relay off on its own is outvoted; with fewer than three sources a majority is
     /// still selected, and it asks for probes of its unheard configured relays; with no majority
     /// nothing is selected (RFC 5905) and it asks for them too, signing meanwhile by this
-    /// host's clock when its kernel reports it synced, else by the offset a majority last
-    /// selected; this host's clock is a source only while its kernel reports it synced; with
+    /// host's clock when its ClockBound reports it synced, else by the offset a majority last
+    /// selected; this host's clock is a source only while its ClockBound reports it synced; with
     /// every source gone, the offset last taken holds; and with none ever, it signs by its own
     /// clock. Before, no majority signed at the lowest end any source allowed, so one relay far
     /// behind dragged every batch back with it.
@@ -2328,7 +2513,7 @@ mod tests {
             "no probe was asked for without a majority"
         );
         drop(pair);
-        // This host's clock, synced, is a source within its kernel's bound.
+        // This host's clock, synced, is a source within its ClockBound's bound.
         let [k1, k2, k3, kx, ky] = seeds();
         let synced = Arc::new(
             RelayClocks::on(HostClock {
@@ -2421,17 +2606,28 @@ mod tests {
                 fresh_relay(),
                 (LOCAL, ahead, ahead),
                 Some(0),
-                Duration::ZERO,
+                clocks.stamp_ms(),
             );
         }
         assert_eq!(clocks.now_ms(), LOCAL - 5, "a hinted key moved the clock");
+        // Nor are they kept: nothing reads a hinted relay's probe answer, so it would only grow.
+        assert_eq!(
+            clocks.samples.lock().map(|samples| samples.len()).ok(),
+            Some(0),
+            "a hinted key's probe answer was kept"
+        );
         // Two sources at most while the seed is unheard: a probe is asked for, to hear it.
         let probing = clocks.probing();
         tokio::pin!(probing);
         let _ = clocks.now_ms();
         assert!(futures_ready(probing.as_mut()), "the seed was never asked");
         // A configured relay's answer is a source: it and this host meet.
-        clocks.probed(seed, (LOCAL, LOCAL + 2, LOCAL + 2), Some(0), Duration::ZERO);
+        clocks.probed(
+            seed,
+            (LOCAL, LOCAL + 2, LOCAL + 2),
+            Some(0),
+            clocks.stamp_ms(),
+        );
         assert_eq!(clocks.now_ms(), LOCAL + 2, "a configured relay is a source");
         // Every configured relay heard: no probe can add a source, so none is hastened, however
         // few the sources. Before, a round came every 30 s forever under three.
@@ -2489,6 +2685,84 @@ mod tests {
         let heard = measured_as(&clocks, seed, REAL, Some(0));
         assert_eq!(clocks.now_ms(), REAL, "the seed was not followed");
         drop(heard);
+    }
+
+    /// While no session has an anchor, what the batcher holds for one costs about its batches'
+    /// wire bytes (`tally_wire::EncodedBatch`), within `held_bytes`, and an anchor's return moves
+    /// the hold into the channel to the sessions without holding it twice, even with a session
+    /// that reads nothing keeping every batch there. Before, a held batch was its owned
+    /// receptions, some 3.4 times its wire bytes, so at 256 kB/s a minute's hold took the feeder
+    /// 46 MB past its start, past the unit's `MemoryMax`, and the kernel killed it.
+    #[test]
+    fn a_hold_for_an_anchor_costs_its_wire_bytes() -> Result<(), String> {
+        const CEILING: u32 = 64_000;
+        const AT: u64 = 1_800_000_000_000;
+        let error = |error: tally_wire::WireError| error.to_string();
+        let wall = Arc::new(std::sync::atomic::AtomicU64::new(AT));
+        let monotonic = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let clocks = Arc::new(RelayClocks::on(HostClock::set_by(&wall, &monotonic)));
+        let mut batcher = Batcher::new(
+            Identity::generate().map_err(error)?,
+            CEILING,
+            Clock::Dump1090,
+        )
+        .signing_by(Arc::clone(&clocks));
+        // A session that reads nothing: the channel keeps every batch it is sent.
+        let (out, _unread) = crate::batch_channel(CEILING);
+        let overflow = AtomicU32::new(0);
+        let start = Instant::now();
+        let cost = reception_cost(&Observation::from_beast(&frame(1)?));
+        // The ceiling's second in tenths, every reception unlike the last, so nothing compresses.
+        let per_tick = CEILING as usize / cost / 10;
+        let relay = Identity::from_seed([33; 32]);
+        let heard = clocks.session(relay.public());
+        let base = tally_counting::Counting::peak_base();
+        let mut counter = 1;
+        let mut held_most = 0;
+        for tick in 0..66 * 10u64 {
+            let ms = tick * 100;
+            wall.store(AT + ms, Ordering::Relaxed);
+            monotonic.store(ms, Ordering::Relaxed);
+            // The anchor comes back at the end of the longest hold.
+            if ms == 62_000 {
+                held_most = tally_counting::Counting::since(base);
+                assert!(batcher.held_for_anchor() > 60, "nothing was held");
+                assert!(heard.anchored(tally_wire::Anchor::sign(&relay, AT + ms)));
+            }
+            let now = start + Duration::from_millis(ms);
+            for _ in 0..per_tick {
+                counter += 1;
+                if let Some(batch) = batcher.observe_at(&noisy_frame(counter)?, now)? {
+                    publish(&out, batch);
+                }
+                if batcher.is_full() {
+                    flush(&mut batcher, &overflow, &out);
+                }
+            }
+            if ms % 1_000 == 0 {
+                flush(&mut batcher, &overflow, &out);
+            }
+            if ms == 62_000 {
+                assert_eq!(batcher.held_for_anchor(), 0, "the anchor released the hold");
+            }
+        }
+        let peak = tally_counting::Counting::peak_since(base);
+        assert_eq!(batcher.unanchored(), 0, "a batch was signed with no anchor");
+        // 62 s of the ceiling's receptions held, as their wire bytes and a little more.
+        let wire = |seconds: isize| seconds * CEILING as isize;
+        assert!(
+            held_most >= wire(62) / 2 && held_most <= wire(62) * 5 / 4,
+            "held {held_most} bytes for {} of wire bytes",
+            wire(62)
+        );
+        // The drain moved the hold into the channel: what it holds at the end is all 66 s, once.
+        assert!(
+            peak <= wire(66) * 5 / 4,
+            "held at most {peak} bytes for {} of wire bytes",
+            wire(66)
+        );
+        assert!(peak as u64 <= held_bytes(CEILING), "{peak} past held_bytes");
+        Ok(())
     }
 
     /// A batcher on its own clocks, set by `wall` and `monotonic`, with no anchor yet.
@@ -3013,7 +3287,7 @@ mod tests {
 
     /// RFC-0171 §3.6: a session to a relay a hint named is no clock source. An attacker holding
     /// both of a feeder's session slots (two /24s, two keys of its own, both an hour ahead) beside
-    /// a synced host moves nothing: the feeder signs by its host, at the low end of its kernel's
+    /// a synced host moves nothing: the feeder signs by its host, at the low end of its ClockBound's
     /// bound. Before, the two outvoted
     /// the host, two of three.
     #[test]
@@ -3241,11 +3515,13 @@ mod tests {
         let relay = measured_as(&clocks, configured, NOW - 4_000, Some(3));
         // A relay a hint named, 100 s behind, and two it cannot measure.
         let behind = clocks.session(fresh_relay());
-        behind.stated(Some(NOW - 100_000), Some(0), Duration::from_millis(40));
+        // Their Hellos went 40 ms and 2 s before now by the anchored clock.
+        let (soon, late) = (clocks.stamp_ms() - 40, clocks.stamp_ms() - 2_000);
+        behind.stated(Some(NOW - 100_000), Some(0), soon);
         let slow = clocks.session(fresh_relay());
-        slow.stated(Some(NOW), None, Duration::from_millis(2_000));
+        slow.stated(Some(NOW), None, late);
         let unsynced = clocks.session(fresh_relay());
-        unsynced.stated(Some(NOW), Some(u64::MAX), Duration::from_millis(40));
+        unsynced.stated(Some(NOW), Some(u64::MAX), soon);
         assert_eq!(
             (slow.disagreement_ms(), unsynced.disagreement_ms()),
             (None, None)
@@ -3806,13 +4082,13 @@ mod tests {
         let clocks = Arc::new(
             RelayClocks::on(HostClock::set_by(&wall, &monotonic)).configured([configured.public()]),
         );
-        let asked = clocks.anchored_before(Duration::from_millis(2));
+        let asked = clocks.stamp_ms() - 2;
         let reading = truth - 7_000;
         clocks.probed(
             configured.public(),
             (asked, reading, reading),
             Some(7_400),
-            Duration::ZERO,
+            clocks.stamp_ms(),
         );
         let sessions: Vec<_> = hinted
             .iter()
@@ -3828,5 +4104,82 @@ mod tests {
         );
         assert_eq!(clocks.anchors().len(), 2);
         assert!(clocks.anchor_disagreements().is_empty());
+    }
+
+    /// The reference an anchor is judged by is the one it held as the anchor was heard: its
+    /// interval now, moved back by the anchor's age. A synced host (bound 1 s) hears two anchors,
+    /// and 2 s later judges them: one exactly `ANCHOR_BELOW_REFERENCE` below the low end as heard
+    /// is kept, and one a millisecond past `ANCHOR_ABOVE_REFERENCE` above the high end as heard is
+    /// left out. Judged against the reference now, unmoved, the first was 2 s past the low edge
+    /// and left out, and the second 2 s inside the high edge and kept.
+    #[test]
+    fn an_anchor_is_judged_by_the_reference_as_it_was_heard() {
+        const HEARD: u64 = 1_800_000_000_000;
+        let ms = |tolerance: tally_wire::budget::Tolerance| {
+            u64::try_from(tolerance.duration().as_millis()).unwrap_or(u64::MAX)
+        };
+        let wall = Arc::new(AtomicU64::new(HEARD));
+        let monotonic = Arc::new(AtomicU64::new(0));
+        let clocks = Arc::new(RelayClocks::on(HostClock {
+            synced: Arc::new(|| Some(1_000)),
+            ..HostClock::set_by(&wall, &monotonic)
+        }));
+        let (low, high) = (Identity::from_seed([4; 32]), Identity::from_seed([5; 32]));
+        let sessions = [clocks.session(low.public()), clocks.session(high.public())];
+        let at_low_edge = tally_wire::Anchor::sign(
+            &low,
+            HEARD - 1_000 - ms(tally_wire::budget::ANCHOR_BELOW_REFERENCE),
+        );
+        let past_high_edge = tally_wire::Anchor::sign(
+            &high,
+            HEARD + 1_000 + ms(tally_wire::budget::ANCHOR_ABOVE_REFERENCE) + 1,
+        );
+        assert!(sessions[0].anchored(at_low_edge));
+        assert!(sessions[1].anchored(past_high_edge));
+        let held = ms(tally_wire::budget::ANCHOR_HELD);
+        monotonic.store(held, Ordering::Relaxed);
+        wall.store(HEARD + held, Ordering::Relaxed);
+        assert_eq!(clocks.anchors(), [at_low_edge]);
+        assert_eq!(clocks.anchor_disagreements(), [(high.public(), -1)]);
+        drop(sessions);
+    }
+
+    /// A held selection widens by the raw clock's drift as it ages, so it signs further below
+    /// where it was selected the longer it is held, and is dropped once wider than
+    /// `SELECTION_LAG`: then this host's clock is read as it is. Before, the offset was held as
+    /// selected for ever, ahead of true time once the raw clock had drifted under it.
+    #[test]
+    fn a_held_selection_widens_with_age_and_is_dropped_past_the_selection_lag() {
+        const LOCAL: u64 = 1_800_000_000_000;
+        let wall = Arc::new(AtomicU64::new(LOCAL));
+        let monotonic = Arc::new(AtomicU64::new(0));
+        let [seed] = seeds();
+        let clocks =
+            Arc::new(RelayClocks::on(HostClock::set_by(&wall, &monotonic)).configured([seed]));
+        let relay = measured_as(&clocks, seed, LOCAL + 600_000, Some(0));
+        assert_eq!(clocks.now_ms(), LOCAL + 600_000);
+        drop(relay);
+        let at = |raw: u64| {
+            monotonic.store(raw, Ordering::Relaxed);
+            wall.store(LOCAL + raw, Ordering::Relaxed);
+            clocks.now_ms()
+        };
+        // 10,000 s on: 5 s of drift at 500 ppm, below where it was selected.
+        assert_eq!(at(10_000_000), LOCAL + 600_000 + 10_000_000 - 5_000);
+        // 17,000 s on, 8.5 s either side: 17 s wide, still held. A millisecond on, dropped.
+        assert_eq!(at(17_000_000), LOCAL + 600_000 + 17_000_000 - 8_500);
+        assert_eq!(at(17_000_001), LOCAL + 17_000_001);
+    }
+
+    /// A relay whose clock steps back between taking a question and sending its answer (`T3`
+    /// before `T2`) is taken to have held it no time: the round trip is the asker's whole wait,
+    /// never more. Without the guard, the step back counted as a second of round trip.
+    #[test]
+    fn a_relay_clock_stepping_back_mid_answer_holds_the_question_no_time() {
+        let sample = echo_sample(1_000, 5_000, 4_000, 1_100, Some(0));
+        assert_eq!(
+            sample.map(|sample| (sample.offset_ms, sample.half_rtt_ms)),
+            Some((3_450, 50))
+        );
     }
 }

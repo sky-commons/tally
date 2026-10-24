@@ -94,7 +94,15 @@ pub const PER_RECEIVER_BYTES: usize = receiver_bytes(ENTRIES_PER_RECEIVER, BOOTS
 pub const PER_FEEDER_BYTES: usize = receiver_bytes((TAG_WINDOW_MS / 1000) as usize + 1, 1);
 /// What the store allocates whatever it holds, once a shard holds anything: the roots of each
 /// shard's orders ([`orders_bytes`]). Held before any feeder (`budget::Plan`).
-pub const FIXED_BYTES: usize = SHARDS * 2 * Tree::<(u64, StreamKey), ()>::bytes_planned(0);
+pub const FIXED_BYTES: usize =
+    SHARDS * 2 * Tree::<(u64, StreamKey), ()>::bytes_planned(0) + STRANGERS_BYTES;
+/// What the strangers' allowances allocate at most ([`Strangers`]): their map churned at its cap
+/// ([`STRANGER_GROUPS`], one forgotten for each new one) and their order of the same, charged
+/// whole when the store is (`Delivery::charge_to`), as a table held at its cap whatever the relay
+/// carries is. Before, they were charged to nothing.
+pub const STRANGERS_BYTES: usize =
+    footprint::table_churned::<Option<Group>, Allowance>(STRANGER_GROUPS)
+        + footprint::btree_planned::<(u64, Option<Group>), ()>(STRANGER_GROUPS);
 /// What a receiver holding `entries` over `streams` streams allocates at most, its share of its
 /// shard's tables included: the entries' lists, which hold at most a quarter again their entries
 /// and [`ENTRIES_LEAST`] more each (`grown`, `age`); its boots; its record's buckets and each
@@ -192,6 +200,9 @@ struct Strangers {
     by_whole: BTreeSet<(u64, Option<Group>)>,
     /// What every stranger together may ask (`STRANGER_BURST`): spent after the group's own.
     relay: RelayWide,
+    /// [`STRANGERS_BYTES`], charged to the store (`Delivery::charge_to`); `None` while it could
+    /// not be, when no stranger is answered, as a store with no room refuses.
+    charge: Option<Charge>,
 }
 
 /// The relay-wide allowance of all strangers: a bucket of `STRANGER_BURST` earning one query each
@@ -240,10 +251,18 @@ impl RelayWide {
 }
 
 impl Strangers {
+    /// Allowances charged whole to `gauge` ([`STRANGERS_BYTES`]).
+    fn charged_to(gauge: &std::sync::Arc<Gauge>) -> Self {
+        Self {
+            charge: gauge.try_charge(STRANGERS_BYTES),
+            ..Self::default()
+        }
+    }
+
     /// Spends one query of `group`'s strangers and one of the relay-wide allowance at `now_ms`, if
     /// both have one left: a refusal by the relay-wide cap spends nothing of the group's.
     fn spend(&mut self, group: Option<Group>, now_ms: u64) -> bool {
-        if !self.relay.has_one(now_ms) {
+        if self.charge.is_none() || !self.relay.has_one(now_ms) {
             return false;
         }
         let spent = self.spend_in_group(group, now_ms);
@@ -449,12 +468,12 @@ impl Delivery {
             shards: (0..SHARDS)
                 .map(|_| Mutex::new(Shard::new(&gauge)))
                 .collect(),
+            strangers: Mutex::new(Strangers::charged_to(&gauge)),
             gauge: Mutex::new(gauge),
             placement: RandomState::new(),
             refused: AtomicU64::new(0),
             refused_keys: AtomicU64::new(0),
             unanswered: AtomicU64::new(0),
-            strangers: Mutex::default(),
         }
     }
 
@@ -494,6 +513,11 @@ impl Delivery {
                 return;
             }
             *held = std::sync::Arc::clone(&gauge);
+        }
+        if let Ok(mut strangers) = self.strangers.lock() {
+            // Released from the old store first, so a store sized for it takes it.
+            strangers.charge = None;
+            strangers.charge = gauge.try_charge(STRANGERS_BYTES);
         }
         for shard in self.shards.iter() {
             if let Ok(mut shard) = shard.lock() {
@@ -606,13 +630,23 @@ impl Delivery {
 
     /// What the store is charged now: what its shards allocate.
     pub fn held_bytes(&self) -> usize {
-        self.each(|shard| shard.held.bytes())
+        self.each(|shard| shard.held.bytes()) + self.strangers_bytes()
     }
 
-    /// What every shard allocates, counted afresh: what the gauge must read.
+    /// What the strangers' allowances are charged: [`STRANGERS_BYTES`] once charged.
+    fn strangers_bytes(&self) -> usize {
+        self.strangers
+            .lock()
+            .ok()
+            .and_then(|strangers| strangers.charge.as_ref().map(Charge::bytes))
+            .unwrap_or(0)
+    }
+
+    /// What every shard allocates, counted afresh, and the strangers' charge: what the gauge must
+    /// read.
     #[cfg(test)]
     fn counted_bytes(&self) -> usize {
-        self.each(Shard::counted)
+        self.each(Shard::counted) + self.strangers_bytes()
     }
 
     /// Streams remembered now.
@@ -1170,6 +1204,7 @@ fn age(stream: &mut Stream, now_ms: u64) -> usize {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::disallowed_methods, reason = "a test's scripted readings")]
     use super::*;
     use tally_wire::Identity;
     use tally_wire::delivery::{TAG_KEY_LEN, key_period, tag_keys_for};
@@ -1664,7 +1699,7 @@ mod tests {
     /// bound shared one allowance, the botnet spent it and every newcomer was refused.
     #[test]
     fn a_flood_of_groups_never_refuses_a_newcomer() {
-        let mut strangers = Strangers::default();
+        let mut strangers = Strangers::charged_to(&Gauge::unlimited(Store::Delivery));
         let group = |n: usize| Some(Group::V6(u32::try_from(n).unwrap_or(u32::MAX)));
         let queries = PROBER_QUERIES as usize;
         // The botnet floods first, from every one of its networks.
@@ -1709,13 +1744,49 @@ mod tests {
         assert!(strangers.spend_in_group(group(botnet - 1), later));
     }
 
+    /// The strangers' allowances are charged to the store, whole, before any is answered, and
+    /// what they allocate under a flood of groups churning at the cap stays within it. A store
+    /// with no room for them answers no stranger. Before, they were charged to nothing.
+    #[test]
+    fn the_strangers_allowances_are_charged_and_stay_within_it() {
+        let gauge = Gauge::new(Store::Delivery, usize::MAX / 2);
+        let delivery = Delivery::new();
+        delivery.charge_to(std::sync::Arc::clone(&gauge));
+        assert_eq!(delivery.strangers_bytes(), STRANGERS_BYTES);
+        assert_eq!(gauge.held(), delivery.held_bytes());
+        let group = |n: usize| Some(Group::V6(u32::try_from(n).unwrap_or(u32::MAX)));
+        let Ok(mut strangers) = delivery.strangers.lock() else {
+            panic!("poisoned");
+        };
+        for n in 0..4 * STRANGER_GROUPS {
+            let _ = strangers.spend_in_group(group(n), T0 + n as u64);
+            let capacity = strangers.groups.capacity();
+            let buckets = if capacity < 8 {
+                capacity + 1
+            } else {
+                (capacity * 8 / 7).next_power_of_two()
+            };
+            let allocated = footprint::table::<Option<Group>, Allowance>(buckets)
+                + footprint::btree::<(u64, Option<Group>), ()>(strangers.by_whole.len());
+            assert!(
+                allocated <= STRANGERS_BYTES,
+                "{n}: {allocated} > {STRANGERS_BYTES}"
+            );
+        }
+        drop(strangers);
+        let full = Gauge::new(Store::Delivery, 1);
+        let _taken = full.try_charge(1);
+        delivery.charge_to(full);
+        assert!(!delivery.allowed(Identity::from_seed([3; 32]).public(), group(1), T0));
+    }
+
     /// All strangers together are answered at most `STRANGER_BURST` queries at
     /// once and `1000 / STRANGER_EVERY_MS` a second after, however many network groups they ask
     /// from (each group alone is allowed `PROBER_QUERIES`, so a botnet of 4,096 groups had 16,384
     /// at once); a query the relay-wide cap refuses spends nothing of its group's.
     #[test]
     fn strangers_together_are_answered_a_relay_wide_rate() {
-        let mut strangers = Strangers::default();
+        let mut strangers = Strangers::charged_to(&Gauge::unlimited(Store::Delivery));
         let group = |n: usize| Some(Group::V6(u32::try_from(n).unwrap_or(u32::MAX)));
         let mut answered = 0;
         for n in 0..STRANGER_GROUPS {
@@ -1978,7 +2049,7 @@ mod tests {
     fn past_the_relays_bound_a_batch_is_refused_whole_counted_and_never_denied() -> Result {
         let relay = Relay::new()?;
         // Room for a receiver's share in each shard, and no more.
-        let limit = SHARDS * ENTRIES_PER_RECEIVER * TAG_BYTES;
+        let limit = SHARDS * ENTRIES_PER_RECEIVER * TAG_BYTES + STRANGERS_BYTES;
         let gauge = Gauge::new(Store::Delivery, limit);
         relay.delivery.charge_to(std::sync::Arc::clone(&gauge));
         let feeders: Vec<Identity> = (0..4 * SHARDS as u64)

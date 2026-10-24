@@ -455,7 +455,11 @@ impl Job {
                     window: *window,
                     id,
                     keys: scope_keys.unwrap_or_default(),
-                    model: found.model,
+                    model: {
+                        let mut model = found.model;
+                        model.shrink_to_fit();
+                        std::sync::Arc::new(model)
+                    },
                     calibrated: found.calibrated,
                 });
             }

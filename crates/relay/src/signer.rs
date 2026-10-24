@@ -2,15 +2,19 @@
 //! relay's judging clock.
 //!
 //! Every record a relay signs carries its judging clock's time, or is judged by it where it is
-//! read (a manifest, a receipt, a bundle index, an offer, an echo, a product, its figures, the
-//! MLAT engine's models and positions). So nothing is signed while that clock is not synced
+//! read (a manifest, a receipt, a bundle index, an offer, a product, its figures, the MLAT
+//! engine's models and positions). So nothing is signed while that clock is not synced
 //! (`clock::RelayClock::judging`): a [`Signer`] lends the key to sign with only while it is, for
 //! one call (`Signer::sign_with`, `Signer::with`), as a `tally_wire::Signing` that cannot be kept.
 //! `Identity` is not `Clone`: `main` moves the relay's newest key into its one `Signer`, which
 //! every part that signs is handed (the network's duties, the MLAT host), so no part holds a key
 //! of its own and a signer added later cannot reach it without asking. The one other use of the
 //! key, a transport handshake (Noise), states no time and is named apart (`Signer::handshake`), by
-//! a `tally_wire::NoiseKey`, which cannot sign.
+//! a `tally_wire::NoiseKey`, which cannot sign. The one record signed whatever the clock is the
+//! answer to a probe (`tally_wire::EchoReply::answer`, `admission::Admission::echo`), which
+//! decides the time it states itself, a judging reading's while this signer's clock judges and 0
+//! while it does not, never a number its caller passes: a feeder chooses only a relay whose answer
+//! verifies, and a relay that cannot judge must still be chosen and fed (RFC-0171 §3.6).
 
 pub use tally_wire::Signer;
 
@@ -50,13 +54,21 @@ pub fn sign_with<T>(
     })
 }
 
-/// `identity`, signing while `clock` is synced.
+/// `identity`, signing while `clock` is synced: the relay's one signer, on its own judging clock.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "the relay's one signer, made on its own judging clock"
+)]
 pub fn on(identity: tally_wire::Identity, clock: RelayClock) -> Signer {
     Signer::new(identity, std::sync::Arc::new(move || clock.judging()))
 }
 
 /// A test's signer, on a clock that is always synced.
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a test's signer, on a scripted clock"
+)]
 pub fn synced(identity: tally_wire::Identity) -> Signer {
     on(
         identity,

@@ -10,15 +10,7 @@
 #
 # It downloads tally-feed for this machine and checks its sha256, finds the receiver's decoders and
 # location, makes the receiver's key if there is none, starts tally-feed.service, waits until it
-# publishes, and prints the station's page. It changes no readsb or dump978 setting and no other feed.
-# It installs one package of the system's, chrony, when the host keeps time with neither chrony
-# nor ntpd (`need_time_daemon`, asked of systemd first), and starts one installed and stopped:
-# the feeder trusts its host's clock only by the kernel's error bound, and that bound is true only
-# under chrony or ntpd, which keep it. systemd-timesyncd keeps none: it zeroes the bound at a sync
-# and the kernel then grows it 500 us a second, which can stand below the clock's real error, and
-# neither the kernel nor the feeder can tell (RFC-0171 §3.6). So chrony or ntpd is required, and
-# the feeder detects no daemon at run time. Debian's chrony package replaces timesyncd. It installs
-# no updater and no timer:
+# publishes, and prints the station's page. It changes no readsb or dump978 setting and no other feed. It installs no updater and no timer:
 # tally-feed never updates itself. A newer version is this script again, run by the owner; a rerun
 # upgrades the binary and keeps the key.
 #
@@ -100,11 +92,6 @@ ISSUES=https://github.com/sky-commons/tally/issues
 IMAGE=ghcr.io/sky-commons/tally-feed
 # How long a started feeder has to say it is publishing before the install calls it failed.
 WAIT_SECONDS=20
-# How often `apt-get update` is tried while another apt holds the package lists, and how long apart:
-# it ignores DPkg::Lock::Timeout for the lists' lock and fails at once (apt 2.8), so two minutes
-# of waiting is these tries.
-LOCK_TRIES=24
-LOCK_RETRY_SECONDS=5
 
 # Where receivers keep their location, read in this order (none is ever sourced: each is someone
 # else's code).
@@ -442,100 +429,6 @@ privacy_line() {
   printf 'Your exact location goes only to Tally relays, for MLAT. Nothing a data user reads contains it; public maps show only the %s area.' "$PUBLIC_AREA"
 }
 
-# How this host keeps time (RFC-0171 §3.6), printed: `kept` when chrony or ntpd keeps it, each of
-# which keeps the kernel's error bound, the one word on the host's clock the feeder trusts;
-# `openntpd` when OpenNTPD does, which slews the clock and keeps no such bound, and which Debian's
-# chrony package would remove; `stopped:UNIT` when chrony or ntpd is installed (Debian's package
-# database, `dpkg-query`, the way apt itself asks) and not running, UNIT being the one to start;
-# nothing when neither is installed (systemd-timesyncd keeps no true bound either). Asked of
-# systemd first, by every name the distributions give the units (`systemctl is-active`, true when
-# any of them is active). A host with no systemd, asked only of its packages, counts one installed
-# as kept, since nothing here could start it.
-time_keeper() {
-  local package status
-  if command -v systemctl >/dev/null; then
-    if systemctl is-active --quiet chrony chronyd ntp ntpd ntpsec 2>/dev/null; then
-      echo kept
-      return 0
-    fi
-    if systemctl is-active --quiet openntpd 2>/dev/null; then
-      echo openntpd
-      return 0
-    fi
-  fi
-  command -v dpkg-query >/dev/null || return 0
-  for package in chrony ntpsec ntp openntpd; do
-    status="$(dpkg-query -W -f='${Status}' "$package" 2>/dev/null || true)"
-    if [[ $status == *"install ok installed"* ]]; then
-      if [[ $package == openntpd ]]; then
-        echo openntpd
-      elif command -v systemctl >/dev/null; then
-        echo "stopped:$package"
-      else
-        echo kept
-      fi
-      return 0
-    fi
-  done
-}
-
-# The time daemon the feeder needs (`time_keeper`): true when this host does not keep time with
-# chrony or ntpd now, setting time_daemon to what to do: `chrony` to install it, or `start:UNIT`
-# for one installed and stopped (Debian names each package's unit after it). Installing needs
-# apt-get, which is asked here, before anything is installed, and a host keeping time with
-# OpenNTPD is stopped, since installing chrony would remove the owner's daemon.
-need_time_daemon() {
-  local keeper
-  keeper="$(time_keeper)"
-  time_daemon=""
-  case "$keeper" in
-    kept) return 1 ;;
-    stopped:*)
-      time_daemon="start:${keeper#stopped:}"
-      return 0
-      ;;
-    openntpd) stop "this host keeps time with OpenNTPD, which keeps no error bound in the kernel, the one word on the host's clock tally-feed trusts, and installing chrony would remove it. Replace it with chrony (which replaces systemd-timesyncd too) and run this again. Nothing was installed." ;;
-  esac
-  command -v apt-get >/dev/null || stop "this host keeps time with neither chrony nor ntpd, and tally-feed needs one of them (systemd-timesyncd does not bound its clock's error). Install chrony (it replaces systemd-timesyncd) and run this again. Nothing was installed."
-  time_daemon=chrony
-  return 0
-}
-
-# Starts the time daemon installed and stopped, UNIT, and keeps it enabled at boot: the feeder's
-# unit waits on it (chrony-wait.service, time-sync.target).
-start_time_daemon() {
-  say "starting $1, the time daemon tally-feed needs (it is installed and was not running)"
-  systemctl enable --now "$1" >/dev/null ||
-    stop "could not start $1 (systemctl enable --now $1 failed). Start it and run this again."
-}
-
-# Brings the package lists up to date, trying again while another apt holds their lock (an
-# unattended upgrade, a first boot's), LOCK_TRIES times LOCK_RETRY_SECONDS apart; any other
-# failure fails at once.
-update_package_lists() {
-  local tries=0 failure
-  while :; do
-    failure="$(DEBIAN_FRONTEND=noninteractive apt-get update 2>&1 >/dev/null)" && return 0
-    [[ $failure == *"Could not get lock"* ]] || return 1
-    tries=$((tries + 1))
-    ((tries < LOCK_TRIES)) || return 1
-    sleep "$LOCK_RETRY_SECONDS"
-  done
-}
-
-# Installs chrony from the system's own packages, the package lists brought up to date first:
-# its Debian package replaces systemd-timesyncd, and its chrony-wait.service is what
-# tally-feed.service starts after. Each waits up to two minutes for another apt holding its lock
-# (an unattended upgrade, a first boot's), rather than failing at once: the update by its tries,
-# the install by DPkg::Lock::Timeout, which it honours.
-install_chrony() {
-  say "installing chrony, the time daemon tally-feed needs (it replaces systemd-timesyncd)"
-  update_package_lists ||
-    stop "could not update the package lists (apt-get update failed). Install chrony and run this again."
-  DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=120 install -y chrony >/dev/null ||
-    stop "could not install chrony (apt-get install chrony failed). Install it and run this again."
-}
-
 # This machine's build of tally-feed, by its userland (a 32-bit Raspberry Pi OS on a 64-bit kernel
 # reports aarch64 from uname -m, but runs only 32-bit programs). Sets ARCH.
 detect_arch() {
@@ -615,16 +508,6 @@ container_route() {
     printf 'No altitude was found: fill in ALT=, the antenna'\''s, as 15m or 45ft (MLAT needs a real one).\n'
   fi
   printf '%s\n' "$(privacy_line)"
-  # The container's clock is the host's: tally-feed trusts it by the kernel's error bound there
-  # too, which this script installs nothing to keep on this route.
-  local keeper
-  keeper="$(time_keeper)"
-  case "$keeper" in
-    kept) ;;
-    openntpd) printf 'This host keeps time with OpenNTPD, which keeps no error bound in the kernel: tally-feed trusts the host'\''s clock by that bound, in a container too. Replace it with chrony on the host (it replaces systemd-timesyncd too).\n' ;;
-    stopped:*) printf 'This host has %s installed and not running: tally-feed trusts the host'\''s clock by the kernel'\''s error bound, in a container too, which it keeps only while it runs. Start it on the host (systemctl enable --now %s).\n' "${keeper#stopped:}" "${keeper#stopped:}" ;;
-    *) printf 'This host keeps time with neither chrony nor ntpd: tally-feed trusts the host'\''s clock by the kernel'\''s error bound, in a container too, and systemd-timesyncd keeps none. Install chrony on the host (it replaces systemd-timesyncd).\n' ;;
-  esac
   printf 'The feeder makes its key in that volume (keep it: it is the station'\''s name for good), and\n'
   printf 'docker logs tally-feed shows its public key and station page. More, in "Run it as a container":\n'
   printf '  https://github.com/sky-commons/tally/blob/main/packaging/README.md#run-it-as-a-container\n'
@@ -838,8 +721,6 @@ main() {
   fi
 
   # Every question is asked, and every refusal made, before anything is installed.
-  local time_daemon=""
-  need_time_daemon || true
   discover_location ask
   say "location $lat, $lon from $lat_from"
   say "altitude $alt m from $alt_from"
@@ -870,10 +751,6 @@ main() {
   done
   args+=(--lat "$lat" --lon "$lon" --alt "$alt")
 
-  case "$time_daemon" in
-    chrony) install_chrony ;;
-    start:*) start_time_daemon "${time_daemon#start:}" ;;
-  esac
   install -m 0755 "$work/tally-feed-$ARCH-linux" "$BIN"
   install -d -m 0755 "${KEY%/*}"
   if [[ ! -f $KEY ]]; then

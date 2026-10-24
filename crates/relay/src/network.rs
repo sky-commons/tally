@@ -48,16 +48,82 @@ use crate::standing::Standing;
 pub const TICK: Duration = Duration::from_millis(100);
 /// How often receivers with standing are counted as corroborated for credit.
 const CORROBORATE_EVERY_MS: u64 = 10_000;
+/// An `M` reading no pace has started from yet.
+const NEVER_MS: u64 = u64::MAX;
 /// Clock models held for member links, at most: a member link carries a model (its parts, then
 /// its manifest) before the first record citing it (`link`'s `Told`), and a model's first part
 /// names its tile, its group.
 const MODELS_HELD: usize = 4_096;
 
-/// One clock model as held: its manifest once seen, and its parts.
+/// One clock model as held: its manifest once seen, and its parts, at most
+/// `clock_model::MAX_PARTS` (a part's index is below it), each once.
 struct HeldModel {
     id: [u8; 32],
     manifest: Option<ClockModel>,
     parts: Vec<ClockModelPart>,
+}
+
+impl HeldModel {
+    /// What it allocates beside its slot: its manifest, its parts and their list.
+    fn bytes(&self) -> usize {
+        self.manifest.as_ref().map_or(0, ClockModel::allocated)
+            + crate::footprint::vec::<ClockModelPart>(self.parts.capacity())
+            + self
+                .parts
+                .iter()
+                .map(ClockModelPart::allocated)
+                .sum::<usize>()
+    }
+}
+
+/// The clock models held for member links, charged to the one batch byte store
+/// (`budget::Store::Batches`, what is held for members) as they allocate: a model's parts are
+/// a peer's word, so what they take is charged before it is held, and past the store's room the
+/// oldest models are let go to make it, or the part is not held, counted (`Models::unheld`).
+/// Before, the parts were held uncharged and with no bound per model.
+struct Models {
+    held: std::collections::VecDeque<HeldModel>,
+    /// What `held` allocates: its slots and each model's own.
+    bytes: usize,
+    charge: crate::budget::Charge,
+    unheld: u64,
+}
+
+impl Models {
+    fn new(gauge: &Arc<crate::budget::Gauge>) -> Self {
+        Self {
+            held: std::collections::VecDeque::new(),
+            bytes: 0,
+            charge: gauge.empty(),
+            unheld: 0,
+        }
+    }
+
+    fn count(&self) -> usize {
+        crate::footprint::vec::<HeldModel>(self.held.capacity())
+            + self.held.iter().map(HeldModel::bytes).sum::<usize>()
+    }
+
+    /// The charge brought to what is held, the oldest models let go while it cannot grow to it:
+    /// false when even alone the change has no room (`keep`, the model being changed, kept to the
+    /// last).
+    fn settle(&mut self, keep: &[u8; 32]) -> bool {
+        loop {
+            self.bytes = self.count();
+            let charged = self.charge.bytes();
+            if self.bytes <= charged {
+                self.charge.shrink_to(self.bytes);
+                return true;
+            }
+            if self.charge.try_grow(self.bytes - charged) {
+                return true;
+            }
+            let Some(oldest) = self.held.iter().position(|model| model.id != *keep) else {
+                return false;
+            };
+            self.held.remove(oldest);
+        }
+    }
 }
 
 /// Who sent a record a duty is handed.
@@ -140,6 +206,10 @@ pub struct Network {
     pub figures: crate::figures::Figures,
     /// The checks a client's positions pass before a client is sent them (`consistency`).
     pub consistency: crate::consistency::Consistency,
+    /// The relay's decoded clock models, one store that standing and the checks both cite
+    /// (`models`): fed once, as the hub assembles a model ([`Network::admit_model`]) or its own
+    /// engine publishes one.
+    pub clock_models: Arc<crate::models::Models>,
     pub directory: Directory,
     pub selection: Selection,
     pub sharing: Sharing,
@@ -152,13 +222,19 @@ pub struct Network {
     mlat: OnceLock<Arc<dyn MlatHost>>,
     /// The areas last handed the hosted MLAT, and the generation of the choice they came from.
     mlat_areas: Mutex<(u64, Regions)>,
+    /// When receivers were last corroborated, by `M` (`NEVER_MS` before the first time).
     corroborated_ms: AtomicU64,
     /// Recent clock models, oldest first.
-    models: Mutex<std::collections::VecDeque<HeldModel>>,
+    models: Mutex<Models>,
     /// Group records members sent this relay, and records of data a directory link sent it (not
     /// taken: a relay link carries only the directory).
     shared_in: AtomicU64,
     data_on_directory_links: AtomicU64,
+    /// Offers and evidence bundles not taken because the clock did not judge as they came
+    /// (`unjudged_directory`): their signers gossip them again, but a clock that stays unsynced
+    /// shows here.
+    unjudged_offers: AtomicU64,
+    unjudged_evidence: AtomicU64,
     /// Overload cuts (`mlat_host::Cut`) this relay sent a relay holding its areas (one count a
     /// relay it addressed), took from one, and refused (not signed by the relay that sent it, or
     /// from one holding none of this relay's areas).
@@ -176,27 +252,33 @@ impl Network {
     /// Every duty of a relay, its sharing judging deliverers by `deadlines` (a relay's
     /// `sharing::Deadlines::RELAY`), its directory by the relay's one clock (`clock`).
     pub fn new(deadlines: crate::sharing::Deadlines, clock: crate::clock::RelayClock) -> Self {
+        let clock_models = Arc::new(crate::models::Models::new());
         Self {
             signer: OnceLock::new(),
             clock: clock.clone(),
             admission: Admission::new(),
             delivery: Delivery::new(),
             figures: crate::figures::Figures::new(),
-            consistency: crate::consistency::Consistency::new(),
+            consistency: crate::consistency::Consistency::new(Arc::clone(&clock_models)),
+            clock_models: Arc::clone(&clock_models),
             directory: Directory::on(clock),
             selection: Selection::new(),
             sharing: Sharing::new(deadlines),
             credit: Credit::new(),
             anchors: crate::anchors::Anchors::new(),
             products: Arc::new(Products::new()),
-            standing: Arc::new(Standing::new()),
+            standing: Arc::new(Standing::with_models(clock_models)),
             peers: Peers::new(),
             mlat: OnceLock::new(),
             mlat_areas: Mutex::new((0, Regions::default())),
-            corroborated_ms: AtomicU64::new(0),
-            models: Mutex::new(std::collections::VecDeque::new()),
+            corroborated_ms: AtomicU64::new(NEVER_MS),
+            models: Mutex::new(Models::new(&crate::budget::Gauge::unlimited(
+                crate::budget::Store::Batches,
+            ))),
             shared_in: AtomicU64::new(0),
             data_on_directory_links: AtomicU64::new(0),
+            unjudged_offers: AtomicU64::new(0),
+            unjudged_evidence: AtomicU64::new(0),
             cuts_sent: AtomicU64::new(0),
             cuts_received: AtomicU64::new(0),
             cuts_refused: AtomicU64::new(0),
@@ -213,18 +295,49 @@ impl Network {
     pub fn charge_to(&self, budget: &crate::budget::Budget) {
         use crate::budget::Store;
         self.sharing.charge_to(budget.gauge(Store::Batches));
+        if let Ok(mut models) = self.models.lock() {
+            models.charge = budget.gauge(Store::Batches).empty();
+            let bytes = models.bytes;
+            if !models.charge.try_grow(bytes) {
+                models.held = std::collections::VecDeque::new();
+                models.bytes = 0;
+            }
+        }
         self.sharing.assemble_in(budget.parity_assembly());
         self.delivery.charge_to(budget.gauge(Store::Delivery));
         self.figures.charge_to(budget.gauge(Store::Figures));
         self.products.charge_to(budget);
+        self.credit.set_receivers(budget.receivers());
         self.credit.charge_to(&budget.gauge(Store::Credit));
         self.anchors.charge_to(&budget.gauge(Store::Anchors));
+        self.directory.charge_to(&budget.gauge(Store::Directory));
+        // The decoded models, each charged as it is held, each source in a room sized by what
+        // drives it: the seats and the members' pace (`models::Rooms::of`).
+        self.clock_models
+            .size_for(budget.models_sizing(), budget.gauge(Store::Models));
+        // Standing's and the positions checks' tables, sized from the seats and the receiver
+        // figure and charged whole (`standing::Caps::of`, `consistency::Caps::of`).
+        self.standing
+            .size_for(budget.mlat_seats(), &budget.gauge(Store::Standing));
+        self.consistency.size_for(
+            budget.consistency_sizing(),
+            &budget.gauge(Store::Consistency),
+            &budget.gauge(Store::Twins),
+        );
     }
 
-    /// Whether the stores allocated whole at start (the anchor cache) are charged in full: a relay
-    /// whose budget cannot hold them refuses to start.
+    /// Whether the stores allocated whole at start (the anchor cache, the directory's tables, the
+    /// products' remembered tables, standing's and the positions checks') are
+    /// charged in full: a relay whose budget cannot hold them refuses to start.
     pub fn fixed_charged(&self) -> Result<(), String> {
-        self.anchors.charged_in_full()
+        self.anchors.charged_in_full()?;
+        self.products.located_charged()?;
+        self.products.remembered_charged()?;
+        if !self.standing.charged_in_full() {
+            return Err("the relay's standing tables are not charged in full".to_owned());
+        }
+        self.consistency.charged_in_full()?;
+        self.directory.charged_in_full()
     }
 
     /// Group records members have sent this relay.
@@ -249,6 +362,15 @@ impl Network {
     /// Records of data directory links have sent this relay, none of them taken.
     pub fn data_on_directory_links(&self) -> u64 {
         self.data_on_directory_links.load(Ordering::Relaxed)
+    }
+
+    /// The offers and the evidence bundles not taken because the clock did not judge as they came,
+    /// since start.
+    pub fn unjudged_directory(&self) -> (u64, u64) {
+        (
+            self.unjudged_offers.load(Ordering::Relaxed),
+            self.unjudged_evidence.load(Ordering::Relaxed),
+        )
     }
 
     /// A record of data came on a directory link, and was not taken.
@@ -290,8 +412,9 @@ impl Network {
         }
     }
 
-    /// The MLAT this relay runs (one program); none when its MLAT duty is off.
-    pub fn host_mlat(&self, host: Arc<dyn MlatHost>) {
+    /// The MLAT this relay runs (one program); none when its MLAT duty is off. Only through
+    /// `Hub::host_mlat`, which refuses a hub that plans no raw.
+    pub(crate) fn host_mlat(&self, host: Arc<dyn MlatHost>) {
         // Standing reads the engine's raw: one store of raw per relay (RFC-0181 §5), and runs on
         // its threads (`Standing::start`).
         if let Some(sealed) = host.sealed_bins() {
@@ -320,12 +443,12 @@ impl Network {
         pace: Option<&crate::ingest::RecordPace>,
     ) -> Vec<Record> {
         let now = now.into();
-        let now_ms = now.judged().ms();
         match record {
+            // Answered whatever the clock (`Admission::echo`): a feeder chooses only a relay whose
+            // answer verifies, and possession never depends on a clock.
             Record::Echo(echo) => self
-                .with_signing(now, |identity| {
-                    self.admission.echo(hub, identity, echo, now_ms)
-                })
+                .admission
+                .echo(hub, self.signer(), echo, now)
                 .map(Record::EchoReply)
                 .into_iter()
                 .collect(),
@@ -361,6 +484,8 @@ impl Network {
             Record::ProviderOffer(offer) => {
                 if now.judging() {
                     self.directory.offered(asker, offer, now.judged());
+                } else {
+                    self.unjudged_offers.fetch_add(1, Ordering::Relaxed);
                 }
                 Vec::new()
             }
@@ -400,6 +525,7 @@ impl Network {
             // Its age is judged by the clock, so none is taken while it does not judge.
             Record::EvidenceBundle(bundle) => {
                 if !now.judging() {
+                    self.unjudged_evidence.fetch_add(1, Ordering::Relaxed);
                     return Vec::new();
                 }
                 if asker.role == AskerRole::Relay {
@@ -616,15 +742,15 @@ impl Network {
     /// The products take them in by the monotonic clock their records are stamped and sealed by;
     /// the figures and standing judge their signed times by the judging clock (`ingest::Stamp`).
     pub fn on_positions(&self, positions: &Positions, source: u64, now: crate::ingest::Stamp) {
-        // A tagged record (a client's form) is its raw twin's solutions again: the products and
-        // standing weigh the raw one.
+        // A tagged record (a client's form) is its raw twin's solutions again: the products weigh
+        // the raw one. Standing takes the raw one as the hub sends it (`Hub::send_positions`).
+        // Its raw is held for the checks by the hub, which knows who may be sent it
+        // (`Hub::hold_twins`).
         if positions.is_tagged() {
             return;
         }
-        self.consistency.raw(positions);
         self.figures.positions(positions, now.judged());
         self.products.positions(positions, source, now);
-        self.standing.positions(positions, now.judged());
     }
 
     /// A clock model manifest or part the hub forwarded (new, verified or checked), handed in by
@@ -633,8 +759,65 @@ impl Network {
         if let Record::ClockModel(model) = record {
             self.products.clock_model(model, source, now);
         }
-        self.consistency.model(record);
-        self.standing.model(record, now.judged());
+    }
+
+    /// A clock model whole as the hub forwards it: its manifest (new, verified) with the parts it
+    /// lists that went out ahead of it (`parts::Parts::manifest`), held in the relay's one store of
+    /// decoded models (`models::Models::admit`) when it is of a tile of the relay's areas and
+    /// signed by one of that area's rendezvous MLAT relays (`selection::mlat_relays`, by the
+    /// directory as it stands at the judging clock `now`); else refused there and counted. A
+    /// model whose parts are not all there is refused as unreadable: an engine sends a model's
+    /// parts right before its manifest, and the relay's own are held already.
+    pub fn admit_model(
+        &self,
+        manifest: &ClockModel,
+        parts: &[ClockModelPart],
+        now: Judged,
+    ) -> Option<crate::models::Model> {
+        if let Some(held) = self.clock_models.get(&manifest.id()) {
+            return Some(held);
+        }
+        let Ok(content) = manifest.content(parts) else {
+            return None;
+        };
+        self.clock_models
+            .admit(
+                manifest,
+                &content,
+                |area, engine| {
+                    crate::selection::mlat_relays(area, &self.directory, now).contains(engine)
+                },
+                now,
+            )
+            .ok()
+    }
+
+    /// Model `id` held whole in the store of decoded models from what this relay holds of it for
+    /// its member links (`hold_model`, `hold_part`), once its manifest and every part it lists are
+    /// held: what a part that went out after its manifest completes (`Hub::publish_clock_model_part`),
+    /// as `admit_model` holds one whose parts came first. `None` while a part is still to come,
+    /// or when the store refused it (counted there).
+    pub fn admit_held(&self, id: &[u8; 32], now: Judged) -> Option<crate::models::Model> {
+        if let Some(held) = self.clock_models.get(id) {
+            return Some(held);
+        }
+        let mut records = self.model_records(id)?;
+        let Some(Record::ClockModel(manifest)) = records.pop() else {
+            return None;
+        };
+        let parts: Vec<ClockModelPart> = records
+            .into_iter()
+            .filter_map(|record| match record {
+                Record::ClockModelPart(part) => Some(part),
+                _ => None,
+            })
+            .collect();
+        // Joined only once every part it lists is held.
+        let listed = manifest.manifest().ok()?.parts;
+        if listed.is_empty() || parts.len() < listed.len() {
+            return None;
+        }
+        self.admit_model(&manifest, &parts, now)
     }
 
     /// A session opened, as `asker`. Called once for every session, as it starts. It is given
@@ -713,45 +896,88 @@ impl Network {
         }
     }
 
-    /// The held entry of model `id`, made when new (the oldest forgotten past `MODELS_HELD`).
-    fn with_model<T>(&self, id: [u8; 32], act: impl FnOnce(&mut HeldModel) -> T) -> Option<T> {
-        let mut held = self.models.lock().ok()?;
-        if let Some(model) = held.iter_mut().find(|model| model.id == id) {
-            return Some(act(model));
+    /// The held entry of model `id`, made when new (the oldest forgotten past `MODELS_HELD`),
+    /// changed by `act` and charged (`Models::settle`): a change with no room even alone is
+    /// undone, counted.
+    fn with_model(&self, id: [u8; 32], act: impl FnOnce(&mut HeldModel) -> bool) {
+        let Ok(mut models) = self.models.lock() else {
+            return;
+        };
+        let at = match models.held.iter().position(|model| model.id == id) {
+            Some(at) => at,
+            None => {
+                if models.held.len() >= MODELS_HELD {
+                    models.held.pop_front();
+                }
+                models.held.push_back(HeldModel {
+                    id,
+                    manifest: None,
+                    parts: Vec::new(),
+                });
+                models.held.len() - 1
+            }
+        };
+        let Some(model) = models.held.get_mut(at) else {
+            return;
+        };
+        let before = (model.manifest.clone(), model.parts.len());
+        if !act(model) {
+            return;
         }
-        if held.len() >= MODELS_HELD {
-            held.pop_front();
+        if !models.settle(&id) {
+            if let Some(model) = models.held.iter_mut().find(|model| model.id == id) {
+                model.manifest = before.0;
+                model.parts.truncate(before.1);
+                model.parts.shrink_to_fit();
+            }
+            models
+                .held
+                .retain(|model| model.manifest.is_some() || !model.parts.is_empty());
+            models.unheld += 1;
+            let _ = models.settle(&id);
         }
-        held.push_back(HeldModel {
-            id,
-            manifest: None,
-            parts: Vec::new(),
-        });
-        held.back_mut().map(act)
     }
 
     /// Holds a clock model's part (one too large for its manifest has them), for member links and
-    /// for the model's group (its first part names its tile).
+    /// for the model's group (its first part names its tile): each index once, and only an index
+    /// a model can have (`clock_model::MAX_PARTS`).
     pub fn hold_part(&self, part: &ClockModelPart) {
-        let Ok(id) = part.model() else {
+        let (Ok(id), Ok(index)) = (part.model(), part.index()) else {
             return;
         };
+        if usize::from(index) >= tally_wire::clock_model::MAX_PARTS {
+            return;
+        }
         self.with_model(id, |model| {
-            if !model
+            if model
                 .parts
                 .iter()
-                .any(|known| known.index().ok() == part.index().ok())
+                .any(|known| known.index().ok() == Some(index))
             {
-                model.parts.push(part.clone());
+                return false;
             }
+            model.parts.push(part.clone());
+            true
         });
     }
 
     /// Holds a clock model's manifest, for the member links that carry a record citing it.
     pub fn hold_model(&self, manifest: &ClockModel) {
         self.with_model(manifest.id(), |model| {
-            model.manifest.get_or_insert_with(|| manifest.clone());
+            if model.manifest.is_some() {
+                return false;
+            }
+            model.manifest = Some(manifest.clone());
+            true
         });
+    }
+
+    /// Clock-model parts and manifests not held for want of the store's room, since start, and
+    /// what the models held are charged.
+    pub fn models_unheld(&self) -> (u64, usize) {
+        self.models
+            .lock()
+            .map_or((0, 0), |models| (models.unheld, models.charge.bytes()))
     }
 
     /// The parts held of model `id`, in index order.
@@ -760,8 +986,10 @@ impl Network {
             .models
             .lock()
             .ok()
-            .and_then(|held| {
-                held.iter()
+            .and_then(|models| {
+                models
+                    .held
+                    .iter()
                     .find(|model| model.id == *id)
                     .map(|model| model.parts.clone())
             })
@@ -776,6 +1004,7 @@ impl Network {
             .models
             .lock()
             .ok()?
+            .held
             .iter()
             .find(|model| model.id == *id)?
             .manifest
@@ -799,6 +1028,7 @@ impl Network {
             .models
             .lock()
             .ok()?
+            .held
             .iter()
             .find(|held| held.id == id)?
             .manifest
@@ -833,7 +1063,7 @@ impl Network {
             .contains(&asker.key)
         {
             self.shared_in.fetch_add(1, Ordering::Relaxed);
-            self.credit.corroborate_relay(asker.key, now.judged());
+            self.credit.corroborate_relay(asker.key, now);
             self.sharing
                 .received(&asker.key, record, cell, product, now);
         }
@@ -937,7 +1167,8 @@ impl Network {
     }
 
     /// A record `asker` sent that this relay refused: its group's member counts it as had and
-    /// never pushes it on (`sharing::Sharing::refused`). Only a member of the group's refusal is
+    /// owed by nobody, notes `asker` as its deliverer, and pushes it on unheld when a manifest it
+    /// holds lists it (`sharing::Sharing::refused`, `Member::refused`). Only a member of the group's refusal is
     /// noted, as only a member's piece is received (`from_peer`): a stranger adds nothing to a
     /// group, not even an entry saying what it lacks.
     pub fn refused_from_peer(
@@ -957,7 +1188,7 @@ impl Network {
             .members(cell, product)
             .contains(&asker.key)
         {
-            self.sharing.refused(record, cell, product, now);
+            self.sharing.refused(asker.key, record, cell, product, now);
         }
     }
 
@@ -986,7 +1217,6 @@ impl Network {
     /// member's piece is (`Hub::take_rebuilt`).
     pub fn tick(&self, hub: &Hub, now: impl Into<Now>) -> crate::sharing::Ticked {
         let now = now.into();
-        let now_ms = now.judged().ms();
         let signer = self.signer();
         // What the tables of what was taken have passed is let go, used or not; and every table
         // begun, once the clock is synced (`Hub::begin_strikes`).
@@ -998,10 +1228,7 @@ impl Network {
         let mut out = Vec::new();
         // The directory's lifetimes and ranks are judged by the clock: not while it does not judge.
         if synced {
-            out.extend(
-                self.directory
-                    .tick(hub, signer, crate::strikes::Now::from(now)),
-            );
+            out.extend(self.directory.tick(hub, signer, now));
         }
         let crate::sharing::Ticked {
             rebuilt,
@@ -1018,6 +1245,8 @@ impl Network {
         let watermark = self.products.watermark();
         if let Some(at) = watermark.judging_at() {
             self.standing.tick(at.judged());
+            // The models no record still to come can cite are let go by the same clock.
+            self.clock_models.tick(at.judged());
         }
         // The feeder figures, signed as this relay's own claim, for its clients: by the judging
         // clock as `now` read it, and never by one read while it did not judge.
@@ -1035,14 +1264,18 @@ impl Network {
                 }
             });
         }
-        // Credit counts corroboration by the judging clock: not while it does not judge.
+        // Credit counts corroboration by the judging clock: not while it does not judge. How often
+        // it is renewed is this relay's own pace, by `M`, so a step of `J` back stalls no renewal.
         let last = self.corroborated_ms.load(Ordering::Relaxed);
-        if synced && now_ms.saturating_sub(last) >= CORROBORATE_EVERY_MS {
-            self.corroborated_ms.store(now_ms, Ordering::Relaxed);
+        if synced
+            && (last == NEVER_MS || now.mono_ms().saturating_sub(last) >= CORROBORATE_EVERY_MS)
+        {
+            self.corroborated_ms.store(now.mono_ms(), Ordering::Relaxed);
             for receiver in self.standing.agreeing(now.judged()) {
-                self.credit.corroborate_receiver(receiver, now.judged());
+                self.credit.corroborate_receiver(receiver, now);
             }
         }
+        self.credit.expire(now);
         if let Some(mlat) = self.mlat() {
             // The choice is recomputed only when what it follows moved (`Selection::solved`), and
             // handed on only when it came out different.
@@ -1069,6 +1302,13 @@ impl Network {
             // Asked every tick: the host steps nothing and signs nothing by a watermark that is
             // not judging, and collapses the steps it passed meanwhile once it judges again.
             let published = mlat.take_published(self.products.watermark());
+            // Its own models are its own `Arc`s, held before their manifests go out, so the hub's
+            // assembly finds them held and decodes nothing (`Models::insert_own`).
+            for own in mlat.take_own_models() {
+                let _ = self
+                    .clock_models
+                    .insert_own(own.id, own.model, own.engine, now.judged());
+            }
             // A model's parts come before its manifest; held first, they place it.
             for record in &published {
                 match record {
@@ -1115,6 +1355,7 @@ impl Network {
         }
         for (member, records) in by_member {
             let Some(address) = self.directory.address_of(&member) else {
+                self.sharing.unaddressed(records, now);
                 continue;
             };
             let relay = RelayAddress {
@@ -1289,6 +1530,7 @@ fn tile_point(prefix: &[u8]) -> Option<Region> {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::disallowed_methods, reason = "a test's scripted readings")]
     use super::*;
     use tally_mlat_solver::geo::{self, Geodetic};
     use tally_wire::Identity;
@@ -1339,6 +1581,11 @@ mod tests {
             crate::mlat_host::MlatReport::default()
         }
 
+        // It publishes no model.
+        fn take_own_models(&self) -> Vec<crate::mlat_host::OwnModel> {
+            Vec::new()
+        }
+
         fn sealed_bins(&self) -> Option<tally_mlat_solver::held::SealedBins> {
             None
         }
@@ -1356,14 +1603,15 @@ mod tests {
             .enable_all()
             .build()
             .map_err(|error| error.to_string())?;
-        let hub = Arc::new(Hub::new(8, crate::sharing::Deadlines::RELAY));
+        let hub = Arc::new(
+            Hub::new(8, crate::sharing::Deadlines::RELAY).memory(crate::hub::DEFAULT_MEMORY, true),
+        );
         let slow = Arc::new(Slow {
             beats: AtomicU64::new(0),
             beat_seen: std::sync::atomic::AtomicBool::new(false),
             asked: AtomicU64::new(0),
         });
-        hub.network()
-            .host_mlat(Arc::clone(&slow) as Arc<dyn MlatHost>);
+        hub.host_mlat(Arc::clone(&slow) as Arc<dyn MlatHost>)?;
         runtime.block_on(async {
             start(Arc::clone(&hub), tokio::runtime::Handle::current());
             let started = std::time::Instant::now();
@@ -1437,6 +1685,11 @@ mod tests {
             crate::mlat_host::MlatReport::default()
         }
 
+        // It publishes no model.
+        fn take_own_models(&self) -> Vec<crate::mlat_host::OwnModel> {
+            Vec::new()
+        }
+
         fn sealed_bins(&self) -> Option<tally_mlat_solver::held::SealedBins> {
             None
         }
@@ -1461,13 +1714,14 @@ mod tests {
         let text = |error: &dyn std::fmt::Display| error.to_string();
         let here = tally_wire::rendezvous::area_at(51.5, -0.1).map_err(|e| text(&e))?;
         let elsewhere = tally_wire::rendezvous::area_at(48.8, 2.3).map_err(|e| text(&e))?;
-        let hub = Hub::new(8, crate::sharing::Deadlines::RELAY);
+        let hub =
+            Hub::new(8, crate::sharing::Deadlines::RELAY).memory(crate::hub::DEFAULT_MEMORY, true);
         let network = hub.network();
         let me = Identity::from_seed([60; 32]);
         network.adopt_identity(crate::signer::twin(&me));
         network.directory.adopt_own_key(me.public());
         let recording = Arc::new(Recording::default());
-        network.host_mlat(Arc::clone(&recording) as Arc<dyn MlatHost>);
+        hub.host_mlat(Arc::clone(&recording) as Arc<dyn MlatHost>)?;
         let now = hub.now();
         let strong: Vec<Identity> = (0..5u8)
             .map(|n| Identity::from_seed([70 + n; 32]))
@@ -1587,6 +1841,193 @@ mod tests {
         assert_eq!(cuts[1].origin, legit.public());
         assert_eq!(cuts[1].areas, vec![here], "an area it does not solve");
         assert_eq!(network.cuts(), (0, 2, 3));
+        Ok(())
+    }
+
+    /// A clock model's parts are a peer's word: each is charged to the batch store before it is
+    /// held, an index no model can have is not held, nor one held already, and past the store's
+    /// room the oldest models go to make it, or the part is not held, counted. Before, a peer could
+    /// grow one model's parts and the list of models without bound, charged to nothing.
+    #[test]
+    fn clock_model_parts_are_charged_capped_and_bounded_by_the_store() {
+        let hub = Hub::new(8, crate::sharing::Deadlines::RELAY);
+        let network = hub.network();
+        let gauge = crate::budget::Gauge::new(crate::budget::Store::Batches, 64 * 1024);
+        if let Ok(mut models) = network.models.lock() {
+            models.charge = gauge.empty();
+        }
+        let data = vec![7u8; 1024];
+        let past = u16::try_from(tally_wire::clock_model::MAX_PARTS).unwrap_or(u16::MAX);
+        network.hold_part(&ClockModelPart::new([1; 32], past, &data));
+        network.hold_part(&ClockModelPart::new([1; 32], 0, &data));
+        network.hold_part(&ClockModelPart::new([1; 32], 0, &data));
+        let parts = |id: [u8; 32]| {
+            network.models.lock().map_or(0, |models| {
+                models
+                    .held
+                    .iter()
+                    .find(|model| model.id == id)
+                    .map_or(0, |model| model.parts.len())
+            })
+        };
+        assert_eq!(
+            parts([1; 32]),
+            1,
+            "a part past MAX_PARTS or held twice was held"
+        );
+        let charged = |network: &Network| network.models_unheld().1;
+        assert!(charged(network) >= 1024, "a held part is charged");
+        assert_eq!(gauge.held(), charged(network), "the store holds the charge");
+        for id in 2..200u8 {
+            network.hold_part(&ClockModelPart::new([id; 32], 0, &data));
+        }
+        assert!(gauge.held() <= gauge.limit(), "the store's room holds");
+        assert_eq!(parts([1; 32]), 0, "the oldest model went to make room");
+        assert_eq!(parts([199; 32]), 1, "the newest part is held");
+        let whole = vec![7u8; 128 * 1024];
+        network.hold_part(&ClockModelPart::new([250; 32], 0, &whole));
+        assert_eq!(
+            parts([250; 32]),
+            0,
+            "a part larger than the store is not held"
+        );
+        assert_eq!(network.models_unheld().0, 1, "and is counted");
+        assert_eq!(gauge.held(), charged(network));
+    }
+
+    /// A clock not synced and an hour ahead reads every offer expired, so before, the sends
+    /// drained for the members it held went nowhere (`carry`). Now an offer's expiry is judged
+    /// only while the clock judges, and a send for a member with no offer held is queued again
+    /// while it does not, then let go once it does, each counted.
+    #[test]
+    fn sends_drained_while_the_clock_is_unsynced_and_ahead_are_carried_or_kept()
+    -> Result<(), String> {
+        const BASE_MS: u64 = 1_791_244_800_000;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| error.to_string())?;
+        let _entered = runtime.enter();
+        let wall = Arc::new(AtomicU64::new(BASE_MS));
+        let monotonic = Arc::new(AtomicU64::new(BASE_MS));
+        let (judging, mono) = (Arc::clone(&wall), Arc::clone(&monotonic));
+        let hub = Arc::new(Hub::on(
+            8,
+            crate::clock::RelayClock::scripted_apart(
+                Arc::new(move || judging.load(Ordering::Relaxed)),
+                Arc::new(move || mono.load(Ordering::Relaxed)),
+            ),
+            crate::sharing::Deadlines::RELAY,
+        ));
+        let network = hub.network();
+        let me = Identity::from_seed([91; 32]);
+        let (member, stranger) = (Identity::from_seed([92; 32]), Identity::from_seed([93; 32]));
+        network.adopt_identity(crate::signer::twin(&me));
+        // The hub plans no room for sharing: its sends get a store of their own.
+        network.sharing.charge_to(crate::budget::Gauge::unlimited(
+            crate::budget::Store::Batches,
+        ));
+        let offer = tally_wire::ProviderOffer::sign(
+            &member,
+            &tally_wire::ProviderOfferContent {
+                address: "203.0.113.7:10900".to_owned(),
+                cell: Region::containing(
+                    &tally_wire::Location {
+                        lat_e7: 340_000_000,
+                        lon_e7: -1_180_000_000,
+                        alt_m: 0,
+                        precision_m: 0,
+                    },
+                    tally_wire::rendezvous::AREA_RESOLUTION,
+                )
+                .map_err(|error| error.to_string())?,
+                products: tally_wire::Streams::RAW,
+                stripes_of: 1,
+                stripes: 1,
+                mlat_cores: 0,
+                feeder_slots: 10,
+                network: 1,
+                issued_ms: BASE_MS,
+                expires_ms: BASE_MS + 600_000,
+            },
+        )
+        .map_err(|error| error.to_string())?;
+        let cell = offer.content().map_err(|error| error.to_string())?.cell;
+        let stale = offer.clone();
+        network
+            .directory
+            .hold_verified(offer, crate::directory::Group::V4(1), hub.now())
+            .map_err(|error| error.to_string())?;
+        let record = || -> Result<Record, String> {
+            tally_wire::PieceManifest::sign(
+                &me,
+                &tally_wire::PieceManifestContent {
+                    cell,
+                    product: tally_wire::Streams::RAW,
+                    second: BASE_MS / 1000,
+                    hashes: vec![[1; 32]],
+                },
+            )
+            .map(Record::PieceManifest)
+            .map_err(|error| error.to_string())
+        };
+        // Unsynced, and an hour ahead.
+        hub.clock().set_error(None);
+        wall.store(BASE_MS + 3_600_000, Ordering::Relaxed);
+        assert!(
+            network.directory.address_of(&member.public()).is_some(),
+            "an unsynced clock read the member's offer expired"
+        );
+        assert!(network.sharing.address(stranger.public(), record()?));
+        network.carry(&hub, Now::from(hub.stamp_now()), false);
+        assert_eq!(
+            network.sharing.unaddressed_counts(),
+            (1, 0),
+            "not queued again"
+        );
+        let queued = network.sharing.take_outbox();
+        assert_eq!(queued.len(), 1, "the send went nowhere");
+        // The clock judging: let go.
+        network
+            .sharing
+            .unaddressed(queued, Now::from(BASE_MS + 3_600_000));
+        assert_eq!(
+            network.sharing.unaddressed_counts(),
+            (1, 1),
+            "not counted let go"
+        );
+        assert!(network.sharing.take_outbox().is_empty());
+        // An offer or evidence that comes meanwhile is not taken, and counted.
+        let evidence = tally_wire::EvidenceBundle::sign(
+            &member,
+            &tally_wire::EvidenceBundleContent {
+                issued_ms: BASE_MS,
+                feeders: Vec::new(),
+                receipts: Vec::new(),
+                answers: Vec::new(),
+            },
+        )
+        .map_err(|error| error.to_string())?;
+        let asker = Asker {
+            role: AskerRole::Relay,
+            key: member.public(),
+            source: 1,
+            loopback: false,
+            address: None,
+        };
+        let unsynced = Now::from(hub.stamp_now());
+        let _ = network.handle(&hub, &asker, Record::ProviderOffer(stale), unsynced, None);
+        let _ = network.handle(
+            &hub,
+            &asker,
+            Record::EvidenceBundle(evidence),
+            unsynced,
+            None,
+        );
+        assert_eq!(network.unjudged_directory(), (1, 1), "not counted");
+        // Synced again, the hour ahead is judged: the offer has expired.
+        hub.clock().set_error(Some(10));
+        assert!(network.directory.address_of(&member.public()).is_none());
         Ok(())
     }
 }

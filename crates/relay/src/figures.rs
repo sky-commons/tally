@@ -370,6 +370,7 @@ pub struct Figures {
     gauge: Mutex<Arc<Gauge>>,
     /// When the first counted record was stamped: the window never reaches before it.
     observed_since_ms: AtomicU64,
+    /// When the figures were last signed (`Figures::sign`): none yet at zero.
     published_ms: AtomicU64,
     /// How often they are signed (`PUBLISH_EVERY_MS` unless set, `publish_every`).
     every_ms: AtomicU64,
@@ -657,16 +658,15 @@ impl Figures {
     }
 
     /// Whether the figures are due at `now_ms`: once a bucket of `PUBLISH_EVERY_MS` (or as set)
-    /// has begun since they were last signed; taken when they are.
+    /// has begun since they were last signed. Only signing them takes the bucket
+    /// ([`Figures::sign`]), so figures due while no key could sign them (the clock stopped
+    /// judging between the two) are signed at the next tick that can. Before, asking took it, and
+    /// a bucket whose signing found no key was lost, uncounted.
     pub fn due(&self, now: Judged) -> bool {
         let now_ms = now.ms();
         let last = self.published_ms.load(Ordering::Relaxed);
         let every = self.every_ms.load(Ordering::Relaxed).max(1);
-        (last == 0 || now_ms / every > last / every)
-            && self
-                .published_ms
-                .compare_exchange(last, now_ms, Ordering::Relaxed, Ordering::Relaxed)
-                .is_ok()
+        last == 0 || now_ms / every > last / every
     }
 
     /// Every receiver's figures as of the start of the hour holding `now_ms` (`end`), over the
@@ -830,6 +830,8 @@ impl Figures {
         if let Ok(mut latest) = self.latest.lock() {
             *latest = Arc::from(signed.clone());
         }
+        // Their bucket taken: they are due again at the next.
+        self.published_ms.fetch_max(now.ms(), Ordering::Relaxed);
         signed
     }
 }

@@ -8,9 +8,20 @@
 //! for a feeder's uptime, message rate, planes heard, range, coverage or MLAT help). A rate is a
 //! client's to derive: `tally-api` takes the change in `observations` between two reports.
 //!
-//! The table is bounded like the relay's others (`Bounded`): a receiver is active whenever a batch
+//! The table is bounded like the relay's others (`Bounded`), at the receiver figure
+//! (`budget::Plan::receivers`: the receivers the records a second the relay admits may be within
+//! the longest an honest receiver goes between batches): a receiver is active whenever a batch
 //! of it is forwarded, so a churn of throwaway keys forgets itself oldest first and a receiver that
-//! keeps publishing keeps its place. Only a forwarded batch, which its key signed, creates a row.
+//! keeps publishing keeps its place. It is one table in one order of activity for the whole relay,
+//! never a share of the figure in each raw shard: receivers land in shards by a keyed hash, so a
+//! shard's receivers are a random draw, and a shard held to an even share of the figure is over
+//! full on every batch while another has room, forgetting a receiver that publishes within the
+//! gap (at 64 receivers, one row a shard, a sixth of them). One order forgets only past the
+//! figure, and the figure counts every receiver that published within the gap. Only a batch its
+//! key signed creates a row: one forwarded, one judged here for the first time from its feeder
+//! (`Stations::first_judged`, usable or not), or one blamed on it (`Stations::too_old`). A row
+//! pushed out loses what it held, its last judged batch with it, so a repeat that comes after is
+//! judged anew (RFC-0171 §3.6).
 //!
 //! Beside the table, the feeder connections open now, by the receiver key each one's Noise
 //! handshake proved (RFC-0171 §3.2): a feeder whose decoder sends nothing seals no batch, so it
@@ -30,7 +41,6 @@ use tally_wire::{PublicKey, Region};
 
 use crate::bounded::Bounded;
 use crate::footprint::Tree;
-use crate::hub::RECEIVERS_REMEMBERED;
 
 /// One open feeder connection, in its receiver's list: its id, when it opened, and the address it
 /// came from.
@@ -45,23 +55,34 @@ type Connection = (u64, Mono, Option<IpAddr>);
 pub const CONNECTION_BYTES: usize =
     Tree::<PublicKey, Vec<Connection>>::bytes_planned(1) + std::mem::size_of::<Connection>();
 
-/// How many receivers' stats are held: as many as their descriptions (`RECEIVERS_REMEMBERED`),
-/// spread over the raw shards (`exchange::SHARDS`), each holding its share.
-pub const STATIONS_REMEMBERED: usize = RECEIVERS_REMEMBERED;
+/// What the station rows allocate at most for `receivers` receivers (`Bounded::planned_bytes` of
+/// one table at the figure), charged whole to `budget::Store::Stations` at the figure the budget
+/// holds. The rows' feeder connections are each a connection's, and bounded by the connections
+/// admitted.
+pub const fn planned_bytes(receivers: usize) -> usize {
+    Stations::planned_bytes(receivers)
+}
 
-/// What the station rows of every raw shard allocate at their cap (`Bounded::planned_bytes`), a
-/// fixed store charged whole at start (`budget::Store::Stations`), whatever the relay carries.
-/// The rows' feeder connections are each a connection's, and bounded by the connections admitted.
-pub const PLANNED_BYTES: usize = crate::exchange::SHARDS
-    * Stations::planned_bytes(STATIONS_REMEMBERED.div_ceil(crate::exchange::SHARDS));
+/// What [`planned_bytes`] takes for each receiver at most (`Bounded::bytes_per_key`): the store's
+/// share of a receiver (`budget::Store::Stations`).
+pub const BYTES_PER_RECEIVER: usize = Bounded::<PublicKey, Tally>::bytes_per_key();
 
-/// The station rows charged whole to `gauge` (`budget::Store::Stations`): what a hub holds for
-/// them for its life. A store whose limit is below them is charged nothing, and a start refuses it
-/// (`Hub::fixed_charged`).
-pub fn charge(gauge: &std::sync::Arc<crate::budget::Gauge>) -> crate::budget::Charge {
+/// What [`planned_bytes`] takes beside [`BYTES_PER_RECEIVER`] for each: the table's fixed part
+/// (`Bounded::fixed_bytes`) and the one row a figure of none is held at. So [`planned_bytes`] of
+/// any figure is at most this and the figure's receivers' (a test holds it).
+pub const FIXED_BYTES: usize = Bounded::<PublicKey, Tally>::fixed_bytes() + BYTES_PER_RECEIVER;
+
+/// The station rows of `receivers` receivers charged whole to `gauge` (`budget::Store::Stations`):
+/// what a hub holds for them while the budget stands. A store whose limit is below them is charged
+/// nothing, and a start refuses it (`Hub::fixed_charged`).
+pub fn charge(
+    gauge: &std::sync::Arc<crate::budget::Gauge>,
+    receivers: usize,
+) -> crate::budget::Charge {
     let mut charge = gauge.empty();
-    if gauge.limit() >= PLANNED_BYTES {
-        let _ = charge.try_grow(PLANNED_BYTES);
+    let planned = planned_bytes(receivers);
+    if gauge.limit() >= planned {
+        let _ = charge.try_grow(planned);
     }
     charge
 }
@@ -104,9 +125,11 @@ pub struct StationReport {
     /// Sequences of its current and earlier boots that were skipped and have not arrived late.
     pub gaps: u64,
     /// Batches its feeder sent signed longer ago than this relay takes (`strikes::feeder_clock`'s
-    /// `TooOld`: a clock behind, or a batch held past the feeder's backlog), each dropped unseen:
-    /// its owner's sign that its clock is behind, since its feeder is never told. Absent from a
-    /// relay older than this field, read as 0.
+    /// `TooOld`: a clock behind, or a batch held past the feeder's backlog) and carrying this
+    /// relay's own anchor older than an honest batch's can be (`strikes::blame`), each held
+    /// unused: its owner's sign that its clock is behind or its batches held too long. Its feeder
+    /// is told this relay's clock again at its next heartbeat (`ingest::Refusal::drifted`), never
+    /// that a batch was late. Absent from a relay older than this field, read as 0.
     #[serde(default)]
     pub late_batches: u64,
     pub observations: u64,
@@ -279,6 +302,17 @@ impl Stations {
             table: Bounded::new(capacity),
             connections: Tree::new(),
         }
+    }
+
+    /// The rows it holds at most.
+    pub fn capacity(&self) -> usize {
+        self.table.capacity()
+    }
+
+    /// Holds at most `capacity` rows from now, the least recently active forgotten past it
+    /// (`Bounded::set_capacity`): what a budget resized to another receiver figure tells it.
+    pub fn set_capacity(&mut self, capacity: usize) {
+        self.table.set_capacity(capacity);
     }
 
     /// When the oldest open feeder connection of `receiver` opened, if one is open.
@@ -462,25 +496,32 @@ impl Stations {
     /// Every receiver held or connected, with its key, unordered, stated as [`Stations::report`]
     /// states one.
     pub fn reports(&self, now: Moment) -> Vec<(PublicKey, StationReport)> {
-        let held = self.table.iter().map(|(key, tally)| {
-            let address = self.address_of(key, Some(tally));
-            (
-                *key,
-                tally.report(key, self.connected_since(key), address, now),
-            )
+        self.rows().reports(now)
+    }
+
+    /// Every receiver held or connected, copied as it stands, to be stated after its lock is let
+    /// go ([`Rows::reports`]): the table is one for the relay and every batch marks it, so a
+    /// report holds its lock for a copy of each row, never for the words a report spells.
+    pub fn rows(&self) -> Rows {
+        let held = self.table.iter().map(|(key, tally)| Row {
+            key: *key,
+            tally: Some(tally.clone()),
+            since: self.connected_since(key),
+            address: tally.address.or_else(|| self.connected_address(key)),
         });
         let connected = self
             .connections
             .keys()
             .filter(|key| self.table.get(key).is_none())
             .filter_map(|key| {
-                let since = self.connected_since(key)?;
-                Some((
-                    *key,
-                    connected_only(key, since, self.address_of(key, None), now),
-                ))
+                Some(Row {
+                    key: *key,
+                    tally: None,
+                    since: Some(self.connected_since(key)?),
+                    address: self.connected_address(key),
+                })
             });
-        held.chain(connected).collect()
+        Rows(held.chain(connected).collect())
     }
 
     pub fn len(&self) -> usize {
@@ -489,6 +530,35 @@ impl Stations {
 
     pub fn is_empty(&self) -> bool {
         self.table.is_empty()
+    }
+}
+
+/// One receiver held or connected as [`Stations::rows`] copied it: its row, if it has one, when
+/// its oldest open connection opened, and the address a report names.
+struct Row {
+    key: PublicKey,
+    tally: Option<Tally>,
+    since: Option<Mono>,
+    address: Option<IpAddr>,
+}
+
+/// Every receiver held or connected, copied out of the table ([`Stations::rows`]).
+pub struct Rows(Vec<Row>);
+
+impl Rows {
+    /// Each stated as [`Stations::report`] states one, with its key, unordered.
+    pub fn reports(self, now: Moment) -> Vec<(PublicKey, StationReport)> {
+        self.0
+            .into_iter()
+            .filter_map(|row| {
+                let address = row.address.map(|address| address.to_string());
+                let report = match &row.tally {
+                    Some(tally) => tally.report(&row.key, row.since, address, now),
+                    None => connected_only(&row.key, row.since?, address, now),
+                };
+                Some((row.key, report))
+            })
+            .collect()
     }
 }
 

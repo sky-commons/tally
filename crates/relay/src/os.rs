@@ -44,23 +44,6 @@ pub fn allocator_holdings() -> [u64; 4] {
     }
 }
 
-/// The kernel's word on the host's clock, as its NTP daemon keeps it (`adjtimex(2)` with no
-/// modes: a read, which needs no capability): whether it says the clock is synchronised (not
-/// `STA_UNSYNC`, nor the call's `TIME_ERROR`), and its error bound `maxerror` in microseconds,
-/// which the kernel grows by 500 ppm a second while nothing disciplines the clock. `None` when
-/// the kernel cannot be asked (a sandbox that filters the call: systemd's `ProtectClock=` does,
-/// so the relay's unit leaves it off, and a start refuses to run without it).
-pub fn clock_error_us() -> Option<(bool, u64)> {
-    asked_clock().ok()
-}
-
-/// As [`clock_error_us`], the kernel's refusal when it will not answer (the errno a seccomp
-/// filter or `ProtectClock=` returns): what a start reports before it refuses to run. The read
-/// is the one both ends make (`tally_wire::kernel_clock`).
-pub fn asked_clock() -> std::io::Result<(bool, u64)> {
-    tally_wire::kernel_clock::asked()
-}
-
 /// Sets an `int` option `name` at `level` on the socket `fd`, as `setsockopt` takes one; false
 /// when the kernel refused it.
 #[cfg(unix)]

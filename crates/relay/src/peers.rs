@@ -181,7 +181,7 @@ impl Peers {
             return;
         };
         let last = full.get(&key).copied();
-        full.insert(key, Wait::after(last, asked, now.mono_ms()));
+        full.insert(key, Wait::after(last, asked, now));
     }
 
     /// The members full now: routed around until their wait ends. A member's record is forgotten
@@ -191,9 +191,9 @@ impl Peers {
         let Ok(mut full) = self.full.lock() else {
             return BTreeSet::new();
         };
-        full.retain(|_, held| held.remembered(now.mono_ms()));
+        full.retain(|_, held| held.remembered(now));
         full.iter()
-            .filter(|(_, held)| held.holds(now.mono_ms()))
+            .filter(|(_, held)| held.holds(now))
             .map(|(key, _)| *key)
             .collect()
     }
@@ -203,8 +203,8 @@ impl Peers {
         let now = now.into();
         let full = self.full.lock().ok()?;
         let held = full.get(key)?;
-        held.holds(now.mono_ms())
-            .then(|| Duration::from_millis(held.until_ms - now.mono_ms()))
+        held.holds(now)
+            .then(|| Duration::from_millis(held.until.left_ms(now)))
     }
 
     /// Sends what sharing addressed the member `relay.key` (`sends`, each charged to its store) to
@@ -442,6 +442,7 @@ mod tests {
                     to: member,
                     record,
                     charge,
+                    unaddressed_until: None,
                 })
             })
             .collect()

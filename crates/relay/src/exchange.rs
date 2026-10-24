@@ -253,7 +253,7 @@ impl Slice {
     }
 
     fn epoch(&self) -> Epoch {
-        crate::seal::epoch_of_ms(self.decoded.stamp_ms())
+        Epoch::of(self.decoded.at().mono())
     }
 
     /// The stamp its batch was taken at (`ingest::Stamp`): the decode's two clocks, its place in
@@ -283,17 +283,43 @@ impl Slice {
     }
 }
 
-/// What the epochs allocate for one reception at most ([`Slice::bytes`]): a slice's place in its
-/// epoch's list and a run of its own (a batch cut into as many slices as it has receptions), its
-/// batch's place in the word, and its place in the decisions. A list of `n` slices allocates at
-/// most `n` places, a quarter again and one more (`footprint::Deque::capacity_at_most`): the place
-/// and a quarter are a reception's, the one more its epoch's ([`EPOCHS_FIXED_BYTES`]). What
-/// `Store::Epochs` is planned at a reception (`budget::PerFeeder::planned`).
-pub const EPOCH_BYTES_PER_RECEPTION: usize = std::mem::size_of::<Slice>()
-    + Slices::SPARE_PER_ENTRY
-    + std::mem::size_of::<Range<u32>>()
-    + std::mem::size_of::<Arc<Decoded>>()
-    + DECISION_BYTES_PER_RECEPTION;
+/// What the epochs allocate for one reception at most ([`Slice::bytes`]) beside its slice's own
+/// ([`EPOCH_BYTES_PER_SLICE`]): a run of its own (a batch whose receptions alternate between
+/// threads is cut into a run a reception) and its place in the decisions. What `Store::Epochs`
+/// is planned at a reception (`budget::PerFeeder::planned_for`).
+pub const EPOCH_BYTES_PER_RECEPTION: usize =
+    std::mem::size_of::<Range<u32>>() + DECISION_BYTES_PER_RECEPTION;
+
+/// What the epochs allocate for one slice at most ([`Slice::bytes`]): its place in its epoch's
+/// list (a list of `n` slices allocates at most `n` places, a quarter again and one more,
+/// `footprint::Deque::capacity_at_most`: the place and a quarter are a slice's, the one more its
+/// epoch's, [`EPOCHS_FIXED_BYTES`]) and its batch's place in the word. A batch is cut into one
+/// slice for each message thread that holds a reception of it ([`split`]), so slices come at
+/// most a batch's rate times the threads ([`slices_per_sec`]), however many receptions they hold.
+pub const EPOCH_BYTES_PER_SLICE: usize =
+    std::mem::size_of::<Slice>() + Slices::SPARE_PER_ENTRY + std::mem::size_of::<Arc<Decoded>>();
+
+/// The message threads a batch may be cut across on `cores` cores: no more than the cores
+/// (`cores::threads_for`) and the shards (a thread past [`SHARDS`] owns none), and the shards
+/// where the cores are not known.
+pub const fn slicing_threads(cores: Option<usize>) -> usize {
+    match cores {
+        Some(cores) if cores < SHARDS => {
+            if cores == 0 {
+                1
+            } else {
+                cores
+            }
+        }
+        _ => SHARDS,
+    }
+}
+
+/// The slices a second `batches` batches a second are cut into at most, across `threads` message
+/// threads: one a thread for each ([`split`]).
+pub const fn slices_per_sec(batches: usize, threads: usize) -> usize {
+    batches.saturating_mul(threads)
+}
 
 /// What travels down a thread's queue.
 #[derive(Debug)]
@@ -682,8 +708,8 @@ pub struct Frozen {
     /// The epoch was refused whole here (its bytes would have passed the budget): it carries
     /// nothing, and the sealer refuses the epoch.
     pub refused: bool,
-    /// Every epoch before this is closed on this thread.
-    pub closed_before: Epoch,
+    /// Every epoch before this is closed on this thread; none before it closed any.
+    pub closed_before: Option<Epoch>,
     /// Receptions that arrived for an epoch this thread had already closed, since its last word:
     /// let go, never decided (`products::ProductsReport::receptions_late`).
     pub late: u64,
@@ -926,7 +952,7 @@ pub const EPOCHS_FIXED_BYTES: usize =
 
 /// How far one thread has closed, not yet told the sealer: told once the words queued before it
 /// (`after`) are.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug)]
 struct Mark {
     after: u64,
     seq: u64,
@@ -1021,7 +1047,7 @@ impl Window {
             return Admit::Open;
         };
         let (from, to) = (oldest.min(epoch), newest.max(epoch));
-        if to - from < EPOCHS_OPEN {
+        if to.after(from) < EPOCHS_OPEN {
             self.held = Some((from, to));
             Admit::Open
         } else if epoch > newest {
@@ -1038,9 +1064,9 @@ impl Window {
         let at = self.let_go.partition_point(|run| run.end < epoch);
         match self.let_go.get_mut(at) {
             Some(run) if run.contains(&epoch) => return,
-            Some(run) if run.end == epoch => run.end += 1,
-            Some(run) if run.start == epoch + 1 => run.start = epoch,
-            _ => self.let_go.insert(at, epoch..epoch + 1),
+            Some(run) if run.end == epoch => run.end = epoch.next(),
+            Some(run) if run.start == epoch.next() => run.start = epoch,
+            _ => self.let_go.insert(at, epoch..epoch.next()),
         }
         // The run changed at `at` joins a neighbour it now touches, in place, so the runs keep the
         // room reserved for them.
@@ -1063,7 +1089,7 @@ impl Window {
                         self.let_go[*at - 1].end > newest || self.let_go[*at].start <= oldest
                     })
                 })
-                .min_by_key(|at| self.let_go[*at].start - self.let_go[*at - 1].end);
+                .min_by_key(|at| self.let_go[*at].start.after(self.let_go[*at - 1].end));
             if let Some(nearest) = nearest {
                 let run = self.let_go.remove(nearest);
                 self.let_go[nearest - 1].end = run.end;
@@ -1383,7 +1409,7 @@ impl Ledger {
             return Some(Frozen {
                 thread,
                 seq: mark.seq,
-                closed_before: mark.closed_before,
+                closed_before: Some(mark.closed_before),
                 late: mark.late,
                 past: mark.past,
                 judged: mark.judged,
@@ -1416,7 +1442,7 @@ fn settle(epoch: Epoch, settling: Settling, ledger: &mut Ledger, may_admit: bool
         thread: 0,
         seq: ledger.parts,
         epoch: Some(epoch),
-        closed_before: epoch + 1,
+        closed_before: Some(epoch.next()),
         ..Frozen::default()
     };
     ledger.parts += 1;
@@ -1677,7 +1703,7 @@ impl MessageThread {
         // The generations follow the epochs by number, not by which held anything: the
         // `DEDUP_GENERATIONS - 1` epochs before this one are remembered, older ones are not.
         if let Some(last) = self.decided {
-            self.messages.rotate(epoch.saturating_sub(last));
+            self.messages.rotate(epoch.after(last));
         }
         self.decided = Some(epoch);
         // Room for every reception of the epoch to be new, before any is decided: the generation
@@ -1717,7 +1743,7 @@ impl MessageThread {
         let mut frozen = Frozen {
             thread: self.thread,
             epoch: Some(epoch),
-            closed_before: epoch + 1,
+            closed_before: Some(epoch.next()),
             judged: self.judged,
             batches: Vec::with_capacity(slices.len()),
             stream: Vec::with_capacity(receptions),
@@ -1939,6 +1965,11 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
     use tally_wire::clocks::recorded::aligned;
+
+    /// Epoch number `number`.
+    fn e(number: u64) -> Epoch {
+        Epoch::of(tally_wire::clocks::recorded::mono(number * EPOCH_MS))
+    }
     use tally_wire::{BatchContent, Identity, Observation};
 
     fn decoded(count: u8, stamp_ms: u64, ingest_seq: u64) -> Result<Arc<Decoded>, String> {
@@ -2311,14 +2342,11 @@ mod tests {
 
     /// The word the sealer was told for `epoch`: whether it was refused, and the first byte of
     /// each message it kept for the stream.
-    fn word_of(
-        words: &Mutex<Vec<Frozen>>,
-        epoch: Epoch,
-    ) -> Result<Option<(bool, Vec<u8>)>, String> {
+    fn word_of(words: &Mutex<Vec<Frozen>>, epoch: u64) -> Result<Option<(bool, Vec<u8>)>, String> {
         let words = words.lock().map_err(|error| error.to_string())?;
         Ok(words
             .iter()
-            .find(|word| word.epoch == Some(epoch))
+            .find(|word| word.epoch == Some(e(epoch)))
             .map(|word| {
                 let kept = word
                     .stream
@@ -2402,7 +2430,7 @@ mod tests {
             .lock()
             .map_err(|error| error.to_string())?
             .iter()
-            .find(|word| word.epoch == Some(0))
+            .find(|word| word.epoch == Some(e(0)))
             .map(|word| word.judged)
             .ok_or("the first epoch was not closed")?;
         assert_eq!(
@@ -2467,23 +2495,23 @@ mod tests {
         };
         let room = window.let_go.capacity();
         // Epoch 101 taken, with a run let go on either side of it, one epoch apart: the nearest gap.
-        assert_eq!(window.admit(101), Admit::Open);
+        assert_eq!(window.admit(e(101)), Admit::Open);
         for epoch in [99, 100, 102, 103] {
-            window.let_go(epoch);
+            window.let_go(e(epoch));
         }
-        assert_eq!(window.let_go, vec![99..101, 102..104]);
+        assert_eq!(window.let_go, vec![e(99)..e(101), e(102)..e(104)]);
         // Fifteen more runs, each two epochs from the last: seventeen in all.
         for run in 0..15 {
-            window.let_go(106 + 3 * run);
+            window.let_go(e(106 + 3 * run));
         }
         assert!(window.let_go.len() <= LET_GO_RUNS, "{:?}", window.let_go);
         assert!(
-            !window.is_let_go(101),
+            !window.is_let_go(e(101)),
             "the taken epoch was let go: {:?}",
             window.let_go
         );
         assert_eq!(
-            window.admit(101),
+            window.admit(e(101)),
             Admit::Open,
             "a later thread is refused it"
         );
@@ -2527,10 +2555,10 @@ mod tests {
         one.resume();
         // Settled to 5: epoch 9 is taken, and the window is [9, 17).
         zero.take(0, Envelope::Slice(copy_of(3, at(9))?));
-        assert!(zero.open.contains_key(&9));
+        assert!(zero.open.contains_key(&e(9)));
         // Epoch 17 is past it: let go, a second run beside epoch 8's.
         zero.take(1, Envelope::Slice(copy_of(4, at(17))?));
-        assert!(!zero.open.contains_key(&17));
+        assert!(!zero.open.contains_key(&e(17)));
         // Epoch 11, inside the window and between the two runs, never let go by anyone.
         one.take(0, Envelope::Slice(copy_of(5, at(11))?));
         zero.take(0, Envelope::Slice(copy_of(6, at(11))?));
@@ -2546,11 +2574,15 @@ mod tests {
         assert!(
             words
                 .iter()
-                .find(|w| w.epoch == Some(9))
+                .find(|w| w.epoch == Some(e(9)))
                 .is_some_and(|w| !w.refused),
             "epoch 9, in the window, refused"
         );
-        let kept = |epoch| words.iter().any(|w| w.epoch == Some(epoch) && !w.refused);
+        let kept = |epoch: u64| {
+            words
+                .iter()
+                .any(|w| w.epoch == Some(e(epoch)) && !w.refused)
+        };
         assert!(kept(11), "epoch 11, in the window, refused");
         assert!(!kept(8), "epoch 8, let go, was kept");
         Ok(())
@@ -2580,17 +2612,17 @@ mod tests {
             .ok_or("no room for the part")?;
         let part = Frozen {
             thread: 0,
-            epoch: Some(0),
-            closed_before: 1,
+            epoch: Some(e(0)),
+            closed_before: Some(e(1)),
             charge,
             ..Frozen::default()
         };
-        admission.post(0, 0, Some(part));
-        admission.progress(0, 1, None);
-        let verdict = admission.verdict(0, 0);
+        admission.post(0, e(0), Some(part));
+        admission.progress(0, e(1), None);
+        let verdict = admission.verdict(0, e(0));
         let words = words.lock().map_err(|e| e.to_string())?;
         assert!(
-            verdict == Some(false) || words.iter().any(|w| w.epoch == Some(0)),
+            verdict == Some(false) || words.iter().any(|w| w.epoch == Some(e(0))),
             "told admitted, never sent"
         );
         Ok(())
@@ -2627,7 +2659,7 @@ mod tests {
         let words = words.lock().map_err(|e| e.to_string())?;
         let late: u64 = words.iter().map(|w| w.late + w.past).sum();
         assert!(
-            words.iter().any(|w| w.epoch == Some(4)),
+            words.iter().any(|w| w.epoch == Some(e(4))),
             "epoch 4 lost at start"
         );
         assert_eq!(late, 0);
@@ -2740,7 +2772,7 @@ mod tests {
         one.take(0, tick(at(2) - 500));
         zero.resume();
         one.take(0, Envelope::Slice(slice(9)?));
-        assert!(!one.open.contains_key(&9));
+        assert!(!one.open.contains_key(&e(9)));
         for thread in [&mut zero, &mut one] {
             thread.take(0, tick(at(30)));
         }
@@ -2748,7 +2780,7 @@ mod tests {
         one.resume();
         zero.resume();
         let words = words.lock().map_err(|error| error.to_string())?;
-        let word = |epoch| words.iter().find(|word| word.epoch == Some(epoch));
+        let word = |epoch: u64| words.iter().find(|word| word.epoch == Some(e(epoch)));
         assert!(word(9).is_none_or(|word| word.refused), "epoch 9 was kept");
         for epoch in 0..EPOCHS_OPEN {
             assert!(
@@ -2780,7 +2812,7 @@ mod tests {
         thread.take(0, Envelope::Slice(first));
         let epochs = Arc::clone(&thread.gauges.epochs);
         let listed =
-            |thread: &MessageThread| thread.open.get(&0).map_or(0, |open| open.slices.bytes());
+            |thread: &MessageThread| thread.open.get(&e(0)).map_or(0, |open| open.slices.bytes());
         let (base, at_base) = (Counting::live(), listed(&thread));
         for slice in slices {
             runs += slice.bytes();
@@ -2816,9 +2848,9 @@ mod tests {
         // One epoch settled first, so the ledger's tables are as they stay.
         let mut epoch = 0;
         let settle = |admission: &Admission, epoch: &mut u64| {
-            admission.post(0, *epoch, None);
-            admission.progress(0, *epoch + 1, None);
-            admission.progress(1, *epoch + 1, None);
+            admission.post(0, e(*epoch), None);
+            admission.progress(0, e(*epoch + 1), None);
+            admission.progress(1, e(*epoch + 1), None);
             *epoch += 1;
         };
         settle(&admission, &mut epoch);
@@ -3044,7 +3076,7 @@ mod tests {
         let words = words.lock().map_err(|error| error.to_string())?;
         let word = words
             .iter()
-            .find(|word| word.epoch == Some(0))
+            .find(|word| word.epoch == Some(e(0)))
             .ok_or("no word for epoch 0")?;
         assert_eq!(word.stream.len(), 5);
         // Its own bytes (and what the sealer's queue holds for a word), never its decodes'.
@@ -3085,13 +3117,13 @@ mod tests {
         let admission = Admission::new(2, sink, Gauge::unlimited(Store::Epochs));
         for epoch in 0..3 {
             let part = Frozen {
-                epoch: Some(epoch),
-                closed_before: epoch + 1,
+                epoch: Some(e(epoch)),
+                closed_before: Some(e(epoch + 1)),
                 ..Frozen::default()
             };
-            admission.post(0, epoch, Some(part));
-            admission.progress(0, epoch + 1, None);
-            admission.progress(1, epoch + 1, None);
+            admission.post(0, e(epoch), Some(part));
+            admission.progress(0, e(epoch + 1), None);
+            admission.progress(1, e(epoch + 1), None);
         }
         taking.store(true, Ordering::Relaxed);
         admission.flush();
@@ -3102,9 +3134,9 @@ mod tests {
             .ok_or("no mark of thread 1")?;
         let second_epoch = words
             .iter()
-            .position(|(_, epoch, _)| *epoch == Some(1))
+            .position(|(_, epoch, _)| *epoch == Some(e(1)))
             .ok_or("no word for epoch 1")?;
-        assert_eq!(words[first_mark].2, 1, "{words:?}");
+        assert_eq!(words[first_mark].2, Some(e(1)), "{words:?}");
         assert!(first_mark < second_epoch, "{words:?}");
         Ok(())
     }
@@ -3141,9 +3173,9 @@ mod tests {
         let admission = Admission::new(2, sink, Arc::clone(&epochs));
         const EPOCHS: u64 = 1_000;
         for epoch in 0..EPOCHS {
-            admission.post(0, epoch, None);
-            admission.progress(0, epoch + 1, None);
-            admission.progress(1, epoch + 1, None);
+            admission.post(0, e(epoch), None);
+            admission.progress(0, e(epoch + 1), None);
+            admission.progress(1, e(epoch + 1), None);
         }
         let waiting = admission
             .ledger
@@ -3188,9 +3220,12 @@ mod tests {
         thread.take(0, tick(4_000));
         let words = words.lock().map_err(|error| error.to_string())?;
         assert_eq!(words.iter().map(|word| word.late).sum::<u64>(), 1);
-        let decided: Vec<(Epoch, bool, usize)> = words
+        let decided: Vec<(u64, bool, usize)> = words
             .iter()
-            .filter_map(|word| word.epoch.map(|e| (e, word.refused, word.stream.len())))
+            .filter_map(|word| {
+                word.epoch
+                    .map(|epoch| (epoch.number(), word.refused, word.stream.len()))
+            })
             .collect();
         assert_eq!(decided, vec![(0, false, 1), (2, false, 1)]);
         Ok(())

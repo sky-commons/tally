@@ -39,6 +39,7 @@ pub mod ingest;
 pub mod link;
 pub mod listeners;
 pub mod mlat_host;
+pub mod models;
 pub mod network;
 // The one module that calls libc, and so the one allowed `unsafe`: it reaches no key (no
 // `Signer`, `Signing` or `Identity`), so nothing here can forge wire's seal.

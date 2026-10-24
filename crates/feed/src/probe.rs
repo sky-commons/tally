@@ -30,6 +30,8 @@ use tally_wire::{
 use tokio::net::TcpStream;
 use tokio::time::Instant;
 
+use crate::source::RelayClocks;
+
 /// One relay as measured.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Measured {
@@ -79,13 +81,14 @@ pub struct Probed {
     pub clock: Option<ProbedClock>,
 }
 
-/// A relay's answer to a probe's timed heartbeat: when it was asked and heard on this host's
-/// monotonic clock, and the relay's clock when it took the question and sent the answer, with its
-/// stated error (`source::RelayClocks::probed`).
+/// A relay's answer to a probe's timed heartbeat: when it was asked (`T1`) and heard (`T4`) on
+/// the feeder's anchored clock (`source::RelayClocks::stamp_ms`, the raw monotonic clock, never
+/// `Instant`, which a daemon slews with the wall clock), and the relay's clock when it took the
+/// question and sent the answer, with its stated error (`source::RelayClocks::probed`).
 #[derive(Clone, Copy, Debug)]
 pub struct ProbedClock {
-    pub asked: Instant,
-    pub heard: Instant,
+    pub asked_ms: u64,
+    pub heard_ms: u64,
     pub took_ms: u64,
     pub sent_ms: u64,
     pub error_ms: Option<u64>,
@@ -135,23 +138,26 @@ pub type Prober =
     fn(
         RelayAddress,
         std::sync::Arc<Identity>,
+        std::sync::Arc<RelayClocks>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Probed, String>> + Send>>;
 
 /// The feeder's `Prober`: `probe`.
 pub fn measure(
     relay: RelayAddress,
     me: std::sync::Arc<Identity>,
+    clocks: std::sync::Arc<RelayClocks>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Probed, String>> + Send>> {
-    Box::pin(async move { probe(&relay, &me).await })
+    Box::pin(async move { probe(&relay, &me, &clocks).await })
 }
 
 /// Probes `relay`: its round-trip time (the median of `PROBES_PER_ROUND` samples), its signed
-/// reply, and whether it is full.
+/// reply, and whether it is full; and its clock, its timed heartbeat stamped by `clocks`.
 pub async fn probe(
     relay: &RelayAddress,
     me: &impl tally_wire::Handshakes,
+    clocks: &RelayClocks,
 ) -> Result<Probed, String> {
-    tokio::time::timeout(PROBE_TIMEOUT, probe_once(relay, me))
+    tokio::time::timeout(PROBE_TIMEOUT, probe_once(relay, me, clocks))
         .await
         .map_err(|_| "probe timed out".to_owned())?
 }
@@ -159,6 +165,7 @@ pub async fn probe(
 async fn probe_once(
     relay: &RelayAddress,
     me: &impl tally_wire::Handshakes,
+    clocks: &RelayClocks,
 ) -> Result<Probed, String> {
     let started = Instant::now();
     let stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(&relay.address))
@@ -196,16 +203,16 @@ async fn probe_once(
     let clock = if heard.ended {
         None
     } else {
-        let asked = Instant::now();
+        let asked_ms = clocks.stamp_ms();
         let token = nonce();
         let question = Record::TimedHeartbeat(tally_wire::HeartbeatTimes::asking(token));
         if writer.send(&[question]).await.is_ok() {
             heard
-                .clock(&mut reader, token)
+                .clock(&mut reader, token, clocks)
                 .await
                 .map(|times| ProbedClock {
-                    asked,
-                    heard: times.0,
+                    asked_ms,
+                    heard_ms: times.0,
                     took_ms: times.1,
                     sent_ms: times.2,
                     error_ms: times.3,
@@ -287,14 +294,16 @@ impl Heard {
         }
     }
 
-    /// Reads until the answer to the timed heartbeat sent with `token`: when it was heard, the
+    /// Reads until the answer to the timed heartbeat sent with `token`: when it was heard (by
+    /// `clocks`' stamp), the
     /// relay's clock when it took the question and sent the answer, and its stated error. None if
     /// the session ends, the wait runs out, or no answer echoes `token`.
     async fn clock<S: tokio::io::AsyncRead>(
         &mut self,
         reader: &mut noise::Reader<S>,
         token: u64,
-    ) -> Option<(Instant, u64, u64, Option<u64>)> {
+        clocks: &RelayClocks,
+    ) -> Option<(u64, u64, u64, Option<u64>)> {
         let deadline = Instant::now() + ECHO_TIMEOUT;
         loop {
             if self.ended {
@@ -308,7 +317,7 @@ impl Heard {
                     return None;
                 }
             }
-            let heard = Instant::now();
+            let heard = clocks.stamp_ms();
             for record in got {
                 match record {
                     Record::TimedHeartbeat(times) => {
@@ -470,6 +479,9 @@ pub(crate) mod tests {
         pub answers_from: Option<Group>,
         /// The tag key in force each feeder gave it, from the keys its queries carried.
         pub keys: std::sync::Mutex<std::collections::HashMap<PublicKey, tally_wire::TagKey>>,
+        /// Answers a timed heartbeat with this clock as it took and sent it, error 0, after this
+        /// wait; none answers none.
+        pub clock: Option<(u64, Duration)>,
     }
 
     /// What an area's sharing group holds, in a test.
@@ -495,6 +507,7 @@ pub(crate) mod tests {
                 forwards_to: None,
                 answers_from: None,
                 keys: std::sync::Mutex::default(),
+                clock: None,
             }
         }
     }
@@ -568,6 +581,16 @@ pub(crate) mod tests {
             for record in &pending {
                 match record {
                     Record::Echo(echo) => out.push(answer(echo)?),
+                    Record::TimedHeartbeat(times) if times.echo.is_none() => {
+                        if let Some((clock_ms, wait)) = fake.clock {
+                            tokio::time::sleep(wait).await;
+                            out.push(Record::TimedHeartbeat(tally_wire::HeartbeatTimes {
+                                sent_ms: clock_ms,
+                                echo: Some((times.sent_ms, clock_ms)),
+                                error_ms: Some(0),
+                            }));
+                        }
+                    }
                     Record::Batch(_) if fake.mode == Mode::RedirectOnBatch => leave = true,
                     Record::Batch(_) if fake.mode == Mode::ClockGoodbyeOnBatch => leave = true,
                     Record::Batch(batch) => {
@@ -689,7 +712,7 @@ pub(crate) mod tests {
         })
         .await?;
         let me = Identity::generate().map_err(|error| error.to_string())?;
-        probe(&relay, &me).await?;
+        probe(&relay, &me, &RelayClocks::default()).await?;
         assert_eq!(dialled.recv().await, Some(Role::Probe));
         Ok(())
     }
@@ -700,7 +723,7 @@ pub(crate) mod tests {
         let relay_identity = Identity::generate().map_err(|error| error.to_string())?;
         let relay = echo_relay(Fake::new(relay_identity, 64_512, 42, Mode::Serve)).await?;
         let me = Identity::generate().map_err(|error| error.to_string())?;
-        let probed = probe(&relay, &me).await?;
+        let probed = probe(&relay, &me, &RelayClocks::default()).await?;
         // Where the connection reached is observed, beside what the relay declares.
         assert_eq!(probed.measured.observed, "127.0.0.1".parse().ok());
         assert_eq!(probed.measured.weight(), 42);
@@ -716,10 +739,43 @@ pub(crate) mod tests {
         let relay_identity = Identity::generate().map_err(|error| error.to_string())?;
         let relay = echo_relay(Fake::new(relay_identity, 64_512, 500, Mode::Full)).await?;
         let me = Identity::generate().map_err(|error| error.to_string())?;
-        let probed = probe(&relay, &me).await?;
+        let probed = probe(&relay, &me, &RelayClocks::default()).await?;
         assert!(probed.measured.full);
         assert_eq!(probed.measured.weight(), 0);
         assert!(band(&[probed.measured]).is_empty());
+        Ok(())
+    }
+
+    /// A probe stamps its timed heartbeat's question and answer on the feeder's anchored clock
+    /// (the raw monotonic one), never `Instant`, which a daemon slews with the wall clock. The
+    /// test's raw clock stands still while the relay takes 200 ms to answer, as a slew that stops
+    /// the slewed clock against it would look from the other side: the round trip is the raw
+    /// clock's, nothing, and the configured relay's clock is taken exactly. Before, `T1` and `T4`
+    /// were `Instant`s, so the sample's round trip was the slewed clock's 200 ms.
+    #[tokio::test]
+    async fn a_probes_timed_heartbeat_is_stamped_by_the_raw_clock() -> Result<(), String> {
+        const LOCAL: u64 = 1_800_000_000_000;
+        let relay_identity = Identity::generate().map_err(|error| error.to_string())?;
+        let relay = echo_relay(Fake {
+            clock: Some((LOCAL + 5_000, Duration::from_millis(200))),
+            ..Fake::new(relay_identity, 64_512, 42, Mode::Serve)
+        })
+        .await?;
+        let wall = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(LOCAL));
+        let raw = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let clocks =
+            RelayClocks::on(crate::source::HostClock::set_by(&wall, &raw)).configured([relay.key]);
+        let me = Identity::generate().map_err(|error| error.to_string())?;
+        let probed = probe(&relay, &me, &clocks).await?;
+        let clock = probed.clock.ok_or("the relay's clock was not measured")?;
+        assert_eq!((clock.asked_ms, clock.heard_ms), (LOCAL, LOCAL));
+        clocks.probed(
+            relay.key,
+            (clock.asked_ms, clock.took_ms, clock.sent_ms),
+            clock.error_ms,
+            clock.heard_ms,
+        );
+        assert_eq!(clocks.now_ms(), LOCAL + 5_000);
         Ok(())
     }
 
@@ -733,7 +789,7 @@ pub(crate) mod tests {
         })
         .await?;
         let me = Identity::generate().map_err(|error| error.to_string())?;
-        assert!(probe(&relay, &me).await.is_err());
+        assert!(probe(&relay, &me, &RelayClocks::default()).await.is_err());
         Ok(())
     }
 }

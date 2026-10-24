@@ -77,7 +77,7 @@ use tally_wire::{
 
 use crate::engine::{Dropped, Ingested};
 use crate::provisional::{Note, notes_of};
-use tally_wire::clocks::Mono;
+use tally_wire::clocks::{Moment, Mono};
 use tally_wire::footprint::{Deque, Tree};
 
 /// How far behind a boot's newest sequence a batch may still arrive (two relays, or one relay's
@@ -1332,16 +1332,19 @@ impl Intake {
     /// (`Limits::per_receiver_bin`; the holder's whole bound is checked when it seals). What it
     /// did, and what it says to provisional solving (nothing unless it was taken).
     pub fn ingest_verified(&mut self, batch: &Decoded) -> (Ingested, Vec<Note>) {
-        self.ingest_verified_taking(batch, &mut |_| true)
+        self.ingest_verified_taking(batch, None, &mut |_| true)
     }
 
     /// As `ingest_verified`, every byte of open raw asked of `take` before it is allocated
     /// (`held::Open::add_decoded_taking`): for a holder charged for its open raw as it grows. A
     /// byte refused refuses the batch's raw of its bin, counted with the receiver's raw refused
-    /// for its share; what it says to provisional solving is told all the same.
+    /// for its share; what it says to provisional solving is told all the same. `step`: for a
+    /// holder that closes by the stamp, the step whose interval its stamp is in, whose two clocks
+    /// judge it late (`held::Open::add_decoded_taking`).
     pub fn ingest_verified_taking(
         &mut self,
         batch: &Decoded,
+        step: Option<Moment>,
         take: &mut dyn FnMut(usize) -> bool,
     ) -> (Ingested, Vec<Note>) {
         let key = batch.receiver();
@@ -1356,8 +1359,9 @@ impl Intake {
         }
         let notes = notes_of(batch);
         // Judged ahead or late by its own stamp, however late it is taken (a batch that waited for
-        // its receiver's description too): every holder judges the same raw the same way.
-        let added = self.open.add_decoded_taking(batch, take);
+        // its receiver's description too), late by the clocks of the step its stamp is in: every
+        // holder judges the same raw the same way.
+        let added = self.open.add_decoded_taking(batch, step, take);
         self.dropped.late += added.late as u64;
         self.dropped.refused += added.refused as u64;
         self.dropped.ahead += added.ahead as u64;

@@ -766,11 +766,15 @@ impl Closing {
     }
 
     /// As `close_at`, for a holder that steps on its monotonic clock and takes each bin by its
-    /// judging clock (a relay's, `tally_relay`'s `mlat_host`), the two as `at` read them together:
-    /// the first step whose judging time is at or after the bin's end plus `settle_ms`. So a step
-    /// of the host's judging clock moves the bins with it.
-    pub fn close_at_judged(&self, bin: i64, at: Moment) -> u64 {
-        self.close_offset(bin, at.offset_ms())
+    /// judging clock (a relay's, `tally_relay`'s `mlat_host`), the two as `step` read them
+    /// together: the first step whose judging time is at or after the bin's end plus `settle_ms`,
+    /// the two clocks as far apart as at `step`, the step whose interval the batch's stamp is in
+    /// (the last whose seal may have taken its bin). So a step of the host's judging clock moves
+    /// the bins with it, and a batch is judged by the step that seals, never by its own stamp's
+    /// offset: a step of the judging clock between the two would otherwise judge it by a clock
+    /// the seal did not read.
+    pub fn close_at_judged(&self, bin: i64, step: Moment) -> u64 {
+        self.close_offset(bin, step.offset_ms())
     }
 
     /// The step that takes `bin` on a step clock the judging clock reads `judged_ahead` ms ahead
@@ -854,7 +858,7 @@ impl Open {
             content.wall_ms,
             content.observations.iter().map(ObsView::from),
             room,
-            at,
+            (at, None),
             &mut |_| true,
         )
     }
@@ -875,17 +879,21 @@ impl Open {
             decoded.wall_ms(),
             decoded.views(),
             room,
-            decoded.at(),
+            (decoded.at(), None),
             &mut |_| true,
         )
     }
 
     /// As `add_decoded`, every byte asked of `take` before it is allocated (module docs, Bounded):
     /// for an owner charged for its open raw as it grows. What `take` granted and this did not
-    /// allocate is the owner's to give back: afterwards these bins hold [`Open::bytes`].
+    /// allocate is the owner's to give back: afterwards these bins hold [`Open::bytes`]. `step`:
+    /// for a holder that closes by the stamp ([`Closing`]), the step whose interval its stamp is
+    /// in, whose two clocks judge it late ([`Closing::close_at_judged`]); none judges it by its
+    /// own stamp's.
     pub fn add_decoded_taking(
         &mut self,
         decoded: &Decoded,
+        step: Option<Moment>,
         take: &mut dyn FnMut(usize) -> bool,
     ) -> Added {
         let room = self.limits.bytes;
@@ -895,18 +903,19 @@ impl Open {
             decoded.wall_ms(),
             decoded.views(),
             room,
-            decoded.at(),
+            (decoded.at(), step),
             take,
         )
     }
 
     /// `room`: the bytes these open bins may grow to. `at`: the batch's ingest stamp, read on the
     /// monotonic and the judging clock together, which every way in passes (module docs, Never
-    /// ahead): the judging time bounds how far ahead a bin may open for every holder alike, however it
-    /// was built, as a signed time is judged against a judging clock (`tally_wire::budget`); the
-    /// stamp decides lateness when the holder closes by one ([`Closing`]), the bin's end moved
-    /// onto the stamp's clock by the two clocks' difference when the batch was taken. `take`:
-    /// asked for every byte before it is allocated.
+    /// ahead), and the step whose interval it is in, when known: the judging time bounds how far
+    /// ahead a bin may open for every holder alike, however it was built, as a signed time is
+    /// judged against a judging clock (`tally_wire::budget`); the stamp decides lateness when the
+    /// holder closes by one ([`Closing`]), the bin's end moved onto the stamp's clock by the two
+    /// clocks' difference at that step (the stamp's own, when none is given). `take`: asked for
+    /// every byte before it is allocated.
     #[allow(clippy::too_many_arguments)]
     fn add_observations<'a>(
         &mut self,
@@ -915,7 +924,7 @@ impl Open {
         wall_ms: u64,
         observations: impl Iterator<Item = ObsView<'a>>,
         room: usize,
-        at: Moment,
+        (at, step): (Moment, Option<Moment>),
         take: &mut dyn FnMut(usize) -> bool,
     ) -> Added {
         let mut added = Added::default();
@@ -933,9 +942,9 @@ impl Open {
         // a hosted one refuse the same raw).
         let begins_ms = u64::try_from(bin).unwrap_or(0).saturating_mul(GRID_MS);
         let ahead = MLAT_AHEAD.ahead(begins_ms, at.judged());
-        let late_by_stamp = self
-            .closing
-            .is_some_and(|closing| at.mono().ms() >= closing.close_at_judged(bin, at));
+        let late_by_stamp = self.closing.is_some_and(|closing| {
+            at.mono().ms() >= closing.close_at_judged(bin, step.unwrap_or(at))
+        });
         if ahead {
             added.ahead = wanted.len();
             return added;
@@ -1883,7 +1892,7 @@ impl Held {
             content.wall_ms,
             content.observations.iter().map(ObsView::from),
             room,
-            at,
+            (at, None),
             &mut |_| true,
         )
     }
@@ -1897,7 +1906,7 @@ impl Held {
             decoded.wall_ms(),
             decoded.views(),
             room,
-            decoded.at(),
+            (decoded.at(), None),
             &mut |_| true,
         )
     }
@@ -1912,7 +1921,7 @@ impl Held {
             reception.wall_ms,
             std::iter::once(ObsView::from(&reception.observation)),
             room,
-            at,
+            (at, None),
             &mut |_| true,
         )
     }

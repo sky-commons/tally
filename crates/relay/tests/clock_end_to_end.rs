@@ -7,6 +7,7 @@
 //!
 //! A test waits for what it is looking for with a bounded poll of the relay's own record of the
 //! receiver (`Hub::station`) or of its counters, and [`HANG`] fails one that never comes.
+#![allow(clippy::disallowed_methods, reason = "a test's scripted readings")]
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -322,5 +323,45 @@ async fn a_relay_whose_clock_steps_ends_nothing_and_refuses_no_one() -> Result {
         assert_eq!(running.hub.clock().steps(), 2, "{step_ms}");
         assert_eq!(one_session(&running)?, 1, "{step_ms}");
     }
+    Ok(())
+}
+
+/// A relay that cannot judge time (no ClockBound on its host: its error unbounded, as on any host
+/// without it) still answers its feeder's probes, admits it, holds its session and takes in every
+/// batch it sends as possession: possession never depends on a clock, and no link is refused over
+/// one (RFC-0171 §3.6). Each batch is counted unjudged (`unjudged_records`), used by nothing and
+/// blamed on nobody (no late batch), and the one session is never ended. Before, the relay
+/// signed its answer to a probe only while its clock judged, so a feeder heard no signed answer,
+/// chose no relay, and was never held.
+#[tokio::test]
+async fn a_relay_that_cannot_judge_time_holds_its_feeder_and_takes_its_batches() -> Result {
+    let clock = tally_relay::clock::RelayClock::host_stated();
+    clock.set_error(None);
+    let running = running_on(
+        Hub::on(8, clock, Deadlines::RELAY),
+        host(&Arc::new(AtomicI64::new(0))),
+    )
+    .await?;
+    tokio::time::timeout(HANG, async {
+        while running.hub.memory_report().unjudged_records < 5 {
+            tokio::time::sleep(POLL).await;
+        }
+    })
+    .await
+    .map_err(|_| {
+        format!(
+            "its batches never taken in: {} unjudged, {} feeders held, {:?}",
+            running.hub.memory_report().unjudged_records,
+            running.hub.egress().report().feeders,
+            running.hub.station(&running.feeder)
+        )
+    })?;
+    assert!(!running.hub.clock().judging());
+    assert_eq!(running.hub.egress().report().feeders, 1, "its feeder held");
+    let station = running.hub.station(&running.feeder).ok_or("no station")?;
+    assert!(station.connected, "{station:?}");
+    // Blamed on nobody, and used by nothing: no clock judged them.
+    assert_eq!(station.late_batches, 0);
+    assert_eq!(station.batches, 0);
     Ok(())
 }

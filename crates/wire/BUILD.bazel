@@ -23,6 +23,7 @@ rust_library(
         "@tally_crates//:base64",
         "@tally_crates//:blake2",
         "@tally_crates//:bytes",
+        "@tally_crates//:clock-bound-client",
         "@tally_crates//:ed25519-dalek",
         "@tally_crates//:getrandom",
         "@tally_crates//:h3o",
@@ -42,7 +43,11 @@ rust_test(
     crate = ":wire",
     edition = "2024",
     lint_config = ":cargo_lints",
-    deps = ["//crates/counting"],
+    deps = [
+        "//crates/counting",
+        "@tally_crates//:clock-bound-shm",
+        "@tally_crates//:nix",
+    ],
 )
 
 # What `footprint` says each collection allocates is what it allocates, measured by an allocator

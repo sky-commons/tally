@@ -159,7 +159,7 @@ usage: tally-relay --key FILE [--key FILE]... --max-upload RATE [options]
                          shedding what it falls behind on rather than delaying raw; hosting it
                          costs each feeder memory and cores, so the same relay admits fewer
   --world                gather the live world product: one fix per aircraft per second from
-                         every area's positions this relay receives, each second sealed 4 s
+                         every area's positions this relay receives, each second sealed 32.5 s
                          after it ends, MLAT aircraft by their provisional fixes (RFC-0174 §2.11).
                          The world is every area: the --area cells must cover the globe (the 122
                          resolution 0 cells do), or the relay refuses to start rather than sign a
@@ -170,6 +170,9 @@ usage: tally-relay --key FILE [--key FILE]... --max-upload RATE [options]
                          the same --area rule as --world
   --no-relay-duties      take no feeders, run no MLAT and seed nothing: only share the areas
                          taken (RFC-0174 §2.1: the duties are on by default, sharing is required)
+  --clock-bound PATH     the ClockBound segment the judging clock is bounded by (default
+                         /var/run/clockbound/shm0, the daemon's own): a relay judges no time
+                         while this segment does not say its clock is synchronised within E
 ";
 
 #[derive(Clone, Debug)]
@@ -230,6 +233,9 @@ pub struct Config {
     pub world_precise: bool,
     /// Accepting feeders, running MLAT and seeding: on unless turned off.
     pub relay_duties: bool,
+    /// The ClockBound segment its judging clock is bounded by (`--clock-bound`): ClockBound's own
+    /// (`tally_wire::clock_bound::SHM`) unless named, as a test or a load run names one it writes.
+    pub clock_bound: String,
 }
 
 /// Why `--max-upload` is required, and a safe value to start from.
@@ -391,6 +397,7 @@ impl Config {
             world: false,
             world_precise: false,
             relay_duties: true,
+            clock_bound: tally_wire::clock_bound::SHM.to_owned(),
         };
         let mut max_upload = None;
         let mut args = args;
@@ -470,6 +477,7 @@ impl Config {
                 "--no-relay-duties" => config.relay_duties = false,
                 "--world" => config.world = true,
                 "--world-precise" => config.world_precise = true,
+                "--clock-bound" => config.clock_bound = value()?,
                 "-h" | "--help" => {
                     print!("{USAGE}");
                     return Ok(None);
@@ -688,8 +696,24 @@ mod tests {
     fn the_help_states_the_defaults_and_the_rules_the_code_uses() {
         let floor = format!("{} KiB", crate::ceiling::MIN_BURST / 1024);
         let ten = egress::decimal(Cap::bytes_per_sec(1_250_000).most_a_month());
+        let seconds = |ms: u64| match ms % 1_000 {
+            0 => format!("{} s", ms / 1_000),
+            part => format!(
+                "{}.{} s",
+                ms / 1_000,
+                format!("{part:03}").trim_end_matches('0')
+            ),
+        };
         for stated in [
             floor,
+            format!(
+                "sealed {}\n                         after it ends",
+                seconds(crate::products::WORLD_SETTLE_MS)
+            ),
+            format!(
+                "sealed {} after it ends",
+                seconds(crate::products::WORLD_PRECISE_SETTLE_MS)
+            ),
             format!("(default {DEFAULT_MAX_SUBSCRIBERS})"),
             format!("(default {DEFAULT_MAX_BEAST_CLIENTS})"),
             format!("(default {DEFAULT_MAX_CONNECTIONS})"),
@@ -1073,6 +1097,26 @@ mod tests {
                 "{gone} was accepted"
             );
         }
+        Ok(())
+    }
+
+    /// The judging clock is bounded by ClockBound's own segment unless `--clock-bound` names
+    /// another (a load run's, which it writes), and the flag needs its path.
+    #[test]
+    fn the_clock_bound_is_clockbounds_unless_named() -> Result<(), String> {
+        let bare = config(&["--key", "k", "--max-upload", "1MB/s"])?;
+        assert_eq!(bare.clock_bound, tally_wire::clock_bound::SHM);
+        let named = config(&[
+            "--key",
+            "k",
+            "--max-upload",
+            "1MB/s",
+            "--clock-bound",
+            "/run/load/shm0",
+        ])?;
+        assert_eq!(named.clock_bound, "/run/load/shm0");
+        assert!(config(&["--key", "k", "--max-upload", "1MB/s", "--clock-bound"]).is_err());
+        assert!(USAGE.contains("--clock-bound PATH"));
         Ok(())
     }
 }

@@ -796,7 +796,10 @@ fn a_bin_far_ahead_of_its_batchs_stamp_is_refused_and_counted() -> Result<(), St
         content(stamp + AHEAD_MS + GRID_MS, &replies(3, 10)),
         stamp,
     )?;
-    assert_eq!(open.add_decoded_taking(&early, &mut |_| true).ahead, 3);
+    assert_eq!(
+        open.add_decoded_taking(&early, None, &mut |_| true).ahead,
+        3
+    );
     // A holder that decides lateness by what it took (one engine holding its own raw, the
     // reference drive) refuses the same raw ahead of its stamp: whether a bin too far ahead opens
     // never depends on how the holder was built. Every way in takes a stamp.
@@ -872,7 +875,7 @@ fn open_raw_asks_for_every_byte_before_it_holds_it() -> Result<(), String> {
                 wall_ms,
             )?;
             sequence += 1;
-            let added = open.add_decoded_taking(&batch, &mut |bytes| {
+            let added = open.add_decoded_taking(&batch, None, &mut |bytes| {
                 granted += bytes;
                 true
             });
@@ -897,7 +900,7 @@ fn open_raw_asks_for_every_byte_before_it_holds_it() -> Result<(), String> {
         content(30_000, &replies(50, 0)),
         30_000,
     )?;
-    let added = open.add_decoded_taking(&batch, &mut |_| false);
+    let added = open.add_decoded_taking(&batch, None, &mut |_| false);
     assert_eq!((added.new, added.refused), (0, 50));
     assert_eq!(open.bytes(), before);
     // Refused part way through a receiver's bin: its raw of the bin is refused whole.
@@ -908,7 +911,7 @@ fn open_raw_asks_for_every_byte_before_it_holds_it() -> Result<(), String> {
         content(31_000, &replies(400, 0)),
         31_000,
     )?;
-    let added = open.add_decoded_taking(&big, &mut |_| {
+    let added = open.add_decoded_taking(&big, None, &mut |_| {
         grants -= 1;
         grants >= 0
     });
@@ -919,7 +922,10 @@ fn open_raw_asks_for_every_byte_before_it_holds_it() -> Result<(), String> {
         content(31_500, &replies(1, 900)),
         31_500,
     )?;
-    assert_eq!(open.add_decoded_taking(&after, &mut |_| true).refused, 1);
+    assert_eq!(
+        open.add_decoded_taking(&after, None, &mut |_| true).refused,
+        1
+    );
     Ok(())
 }
 
@@ -1089,5 +1095,40 @@ fn a_host_clock_step_after_start_does_not_offset_the_bins() -> Result<(), String
             u64::try_from(due).unwrap_or(0).div_ceil(1_000) * 1_000
         );
     }
+    Ok(())
+}
+
+/// A holder that closes by the stamp judges a batch late by the two clocks of the step whose
+/// interval its stamp is in (the step whose seal takes its bin), never by its own stamp's: the
+/// judging clock stepped 5 s forward between the batch's stamp and that step, whose seal took the
+/// bin by the new reading, so the batch is late, as the engine in line, stepping after it, judges
+/// it. Before, it was judged by its own stamp's offset and held in a bin already taken.
+#[test]
+fn a_batch_is_judged_late_by_the_clocks_of_the_step_that_seals_its_bin() -> Result<(), String> {
+    let closing = Closing {
+        step_ms: 1_000,
+        settle_ms: 2_000,
+    };
+    let receiver = Identity::from_seed([11; 32]);
+    // Bin 12 ends at 65 s and settles at 67 s by the judging clock; stamped at 63 s, both clocks
+    // agreeing, its own stamp says it is on time.
+    let stamp: u64 = 63_000;
+    let wall = 12 * GRID_MS + 1_000;
+    let batch = |sequence| {
+        taken_at(
+            &receiver,
+            sequence,
+            content(wall, &replies(4, 0)),
+            (stamp, stamp),
+        )
+    };
+    let mut own = Open::new(Limits::UNBOUNDED).closing(closing);
+    let added = own.add_decoded_taking(&*batch(0)?, None, &mut |_| true);
+    assert_eq!((added.new, added.late), (4, 0));
+    // Its step read the judging clock 5 s ahead: that step's seal took bin 12 (65 + 2 <= 68).
+    let stepped = moment(stamp, stamp + 5_000);
+    let mut judged = Open::new(Limits::UNBOUNDED).closing(closing);
+    let added = judged.add_decoded_taking(&*batch(1)?, Some(stepped), &mut |_| true);
+    assert_eq!((added.new, added.late), (0, 4));
     Ok(())
 }

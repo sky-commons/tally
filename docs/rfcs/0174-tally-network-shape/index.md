@@ -274,9 +274,10 @@ the border band of the areas it is an MLAT relay for, and is held to a feeder's 
   12 GB with the open bins and the bins standing settles in. What a relay reserves for it is a
   bound, not that mean: `held::Rates::cost` reserves open raw at five times the mean rate, and 25
   sealed bins (`held::SEALED_BINS_HELD`) of thinned raw at the ceiling every receiver is kept to
-  (`KEPT_CEILING_PER_S`), never its mean; with the rest a hosted receiver holds, a seat is about
-  4.1 MB (`per-seat` in `tally/crates/relay/tests/world-relay.txt`), so a 32 GB, 16-core relay
-  seats 2,023 receivers, bound by memory (RFC-0181 §5, §9). No one relay carries the whole world.
+  (`KEPT_CEILING_PER_S`), never its mean; with the rest a hosted receiver holds, a seat's bytes
+  and the receivers a 32 GB, 16-core relay seats are what `tally-relay check` prints
+  (`per-seat` and `mlat-seats` in `tally/crates/relay/tests/world-relay.txt`, held equal to it;
+  RFC-0181 §5, §9), never a copy here. No one relay carries the whole world.
   (The 27 cores and 1.6 GB first measured were at an eighth of the real rate.)
 - Raw travels at most a hop, never worldwide. Only positions travel far.
 - Why here: clock sync needs every receiver that heard an aircraft in one place, and the raw is
@@ -332,6 +333,24 @@ positions; clock models): the relays that take that area.
   shared ordering assigned it.
 - **Receipts are evidence.** A child signs a receipt for each stripe slice it received, which is
   what a relay's firehose credit is made of (§2.1).
+- **A window falls due on the relay's own clock** (as built, 2026-10-23). A receipt window is a
+  span of signed time, so whether it has ended is read on the judging clock `J`, and only while
+  `J` judges; from the moment `J` first passes its end, its receipts' deadline (`receipt_grace`)
+  and its judgment (`judge_after`) are spans of the relay's monotonic clock `M`
+  (`member::Due`), and everything a relay schedules for itself (when it forgets a window's
+  senders and credit, retries an ask, re-signs an offer, times out a dial, ends a route-around
+  wait, drops a corroboration) is a deadline on `M` (`MonoDeadline`), which never steps. A step
+  of `J` forward so lets no window fall due before its grace, and one back holds none past it.
+  A window's senders and credit are let go when its judgment is made, never on a clock of their
+  own, so no step makes a relay forget who delivered before it judges. What a member is owed is
+  only what it could have sent: a record refused as undecodable notes its deliverer like any
+  copy and leaves what is owed, so an origin's malformed record never demotes its honest
+  forwarder; a copy this relay had no room for still notes its deliverer, from a floor reserved
+  for those notes, so this relay's want of room is never another's shortfall; and a relay that
+  restarted files no shortfall for a window that began before it did. The groups' books
+  (manifests, the ledger of deliveries, refusals, shortfalls) are charged to the batches' store
+  with the records they reckon, and so is each ask a peer's word puts in a group (`ASK_BYTES`):
+  one past the store's room is not held, counted.
 - **The cap stays the ceiling.** A relay whose upload cap is full serves its priority classes in
   order (RFC-0171 §3.6) and, if it cannot carry its slice, says so by withdrawing from the stripe;
   the ordering's next member takes it. The cap bounds every bill, whatever the group asks. It
@@ -386,7 +405,8 @@ positions; clock models): the relays that take that area.
   away keeps it for the member that refused it, and the full member keeps the same wait, from the
   same refusal and the same asked time, for the relay it turned away (every `Goodbye` `Full` it
   says to a relay that dialled it: a member's link, a directory link that is one, or another
-  relay's raw link). So the full member knows exactly when that relay was sending its slice past
+  relay's raw link). Both keep it on their monotonic clocks, so a step of either's `J` neither
+  ends it early nor stretches it. So the full member knows exactly when that relay was sending its slice past
   it, and files no shortfall against it for any receipt window the wait covers, however much of a
   stripe it was owed through that relay; the relay turned away files none against the full member,
   which it was not sending to. Before, the full member counted every routed-around window as that
@@ -446,6 +466,29 @@ trust: a bundle is checked record by record exactly as its cells would be.
   could sign itself any rate. Keys are free too, so a ground key with no evidence ranks below every
   relay with evidence. Relays gossip their evidence bundles beside their offers. A relay asks any relay with `ProviderQuery { cell, streams }`
   and gets the offers it holds for that cell and its ancestors.
+- **What the directory holds is planned and charged** (as built, 2026-10-23). An offer's and a
+  bundle's expiry are signed times, read on `J` and only while `J` judges: an offer or bundle
+  that comes while it does not is not taken, counted, and its signer gossips it again.
+  What the relay schedules for itself is on `M`: re-signing its own offers and bundling its own
+  evidence, how long a key that answered at an address is trusted and one that did not is not
+  dialled, the ten seconds a held offer waits between changes. The tables (16,384 offers, the
+  hashes acted on, the addresses remembered, the offers waiting) are planned at their caps before
+  any feeder, in the directory's own store (`budget::Store::Directory`, `directory::PLANNED_BYTES`).
+  An offer's bytes are held once, shared by the offer held, its change waiting and its gossip.
+  The hashes acted on are a ring of four generations of keyed eight-byte fingerprints
+  (`directory::Seen`, 14,336 a generation, each a table made once and never grown), each
+  generation taking hashes for a third of an offer's lifetime and the skew a reader allows, so the
+  three kept beside the newest cover an offer's life: forgetting one early only costs a check
+  again, since an expired offer and one not newer than the one held for its key and cell are
+  refused by their signed times whatever is remembered. The evidence held beside them, read once
+  and its bundle held once (shared with its gossip), which a bundle as large as a record makes
+  unbounded by count alone, has a room of its own in it (`EVIDENCE_ROOM_BYTES`, 32 MiB), held by
+  rank, never by arrival (`directory::evidence_rank`): the relay's own first, then a signer with
+  an offer held here, then the rest, within each the cheaper first, then by key, and the room
+  keeps the longest run in that order that fits it and `EVIDENCE_HELD`. A bundle past the run is
+  refused, counted, and takes nobody's place. So two relays given the same bundles in any order
+  hold the same evidence and rank offers alike, and a flood of keys costs the directory its room,
+  never the relay's feeders.
 - An offer is a hint, never a promise. A reader tries several providers, keeps those that deliver
   valid, fresh, complete data for the cell (the same accounting as §2.5), and drops the rest on its
   own authority. A provider is ranked by what it delivered to this reader, never by what it
@@ -535,8 +578,9 @@ rule, since every version 2 reader inflates it.
   start unless its areas cover the globe). As built (founder, 2026-10-07), in two feeds, each
   opt-in on the relay (`--world`, `--world-precise`), each its own record stream and `Streams` bit,
   shared, priced and served as separate products:
-  - **World live** (`WorldPositions`, `WORLD`): sealed about 4 s after its second, an MLAT
-    aircraft by its provisional fix until the final one arrives.
+  - **World live** (`WorldPositions`, `WORLD`): sealed 32.5 s after its second
+    (`products::WORLD_SETTLE_MS`, `LIVE_FIX_ARRIVED`), an MLAT aircraft by its provisional fix
+    until the final one arrives.
   - **World precise** (`WorldPrecise`, `WORLD_PRECISE`): the same rule sealed 108.5 s after its
     second (`products::WORLD_PRECISE_SETTLE_MS`, `FINAL_FIX_ARRIVED`), once final fixes have surely
     arrived, an MLAT aircraft by its final fix only; ADS-B unchanged.

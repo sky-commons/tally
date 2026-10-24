@@ -80,7 +80,7 @@ The load:
                          separated (default raw,dedup). provisional measures how long a
                          provisional MLAT position takes from its transmission to the subscriber
                          (the relay must host MLAT: RFC-0174 §2.4's fast MLAT, which must reach
-                         the live world before its second is sealed, 4 s after it ends)
+                         the live world before its second is sealed, 32.5 s after it ends)
   --no-verify            the subscriber does not check signatures
   --decode-threads N     threads the subscriber decodes batches on (default 4)
   --simulate-only        simulate the run's first seconds, print what they came to, and exit
@@ -397,6 +397,25 @@ fn number<T: std::str::FromStr>(flag: &str, text: &str) -> Result<T, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_help_states_the_live_worlds_settle_the_relay_uses() {
+        let ms = tally_relay::products::WORLD_SETTLE_MS;
+        let stated = match ms % 1_000 {
+            0 => format!("{} s", ms / 1_000),
+            part => format!(
+                "{}.{} s",
+                ms / 1_000,
+                format!("{part:03}").trim_end_matches('0')
+            ),
+        };
+        assert!(
+            USAGE.contains(&format!(
+                "before its second is sealed, {stated} after it ends"
+            )),
+            "the help does not say {stated}"
+        );
+    }
 
     #[test]
     fn shards_cover_every_feeder_once_in_order() {

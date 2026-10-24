@@ -2,11 +2,8 @@
 //! Two it judges and steps by, and a third it ages its own anchors by.
 //!
 //! - **The judging clock, `J`** ([`RelayClock::now_ms`]): `CLOCK_REALTIME` as the host's NTP
-//!   daemon (chrony or ntpd, required and not detected: under systemd-timesyncd the kernel's bound
-//!   leaves out the server's error, and nothing here can tell) keeps it, and its error bound as the
-//!   kernel reports it
-//!   (read-only `adjtimex(2)`, `tally_wire::kernel_clock`: `STA_UNSYNC` and `maxerror`,
-//!   [`RelayClock::error_ms`]). It judges
+//!   daemon (chrony) keeps it, and its error bound as the host's ClockBound daemon publishes it
+//!   (`tally_wire::clock_bound`, read at every judgement: [`RelayClock::error_ms`]). It judges
 //!   everything compared across machines: a record's signed time against the windows of
 //!   `strikes`, a feeder's clock, the directory's offers, the groups' manifests and receipts; and
 //!   it is what the relay signs and states. The relay moves it in no way: the daemon slews it
@@ -29,28 +26,28 @@
 //! nothing: it is stated again to every feeder session at its next heartbeat (`link`), and the
 //! strike tables keep their own safety whatever the clock does (`strikes`).
 //!
-//! **Unsynced.** The relay judges by the clock only once the kernel has said it is synchronised
-//! since the relay started, and only while the kernel's error bound (`maxerror`) is within
-//! `tally_wire::budget::E` (`E`). A clock that loses its sources after that is
-//! judged on by its bound, which the kernel grows by 500 ppm a second while nothing disciplines it
-//! (`E` is reached hours later, not at once), as NTP's own error budget does (RFC 5905 §11.3);
-//! past `E`, or before the first sync, the relay states its error as unbounded, judges and uses
-//! nothing (`strikes::feeder_clock`, `strikes::Now`) and signs nothing (`signer::Signer`). Synced
-//! or not, it refuses no one for a clock: a clock decides usability alone (RFC-0171 §3.6). A kernel that cannot be asked (a seccomp filter or systemd's
-//! `ProtectClock=` refusing `adjtimex`) gives no bound, so nothing is judged, and a start refuses
-//! to run, naming the cause ([`kernel_answers`]).
+//! **Unsynced.** The relay judges by the clock only while ClockBound says it is `Synchronized`
+//! and the half-width of its interval is within `tally_wire::budget::E` (`E`), read at every
+//! judgement (a memory read of its shared segment). Anything else (no ClockBound on the host, a
+//! segment its client cannot read, `Unknown`, `FreeRunning`, `Disrupted`, or a bound past `E`)
+//! states the relay's error as unbounded: it judges and uses nothing (`strikes::feeder_clock`,
+//! `strikes::Now`) and signs nothing (`signer::Signer`), each such read counted by why and the
+//! last stated (`hub::MemoryReport::clock_bound`). Synced or not, it refuses no one for a clock: a
+//! clock decides usability alone (RFC-0171 §3.6). A host without ClockBound runs a relay that
+//! never judges; what ClockBound says when chronyd dies, and the gaps that stay, are
+//! `tally_wire::clock_bound`'s.
 //!
-//! The host's wall clock is read in this module alone, and the kernel's word on it in one place
-//! both ends share (`tally_wire::kernel_clock`): Clippy's `disallowed-methods` refuses
-//! `SystemTime::now`, `SystemTime::elapsed`, `UNIX_EPOCH.elapsed`, `clock_gettime`,
-//! `gettimeofday`, `time`, `adjtimex` and `clock_adjtime` anywhere else (`clippy.toml`), so
+//! The host's wall clock is read in this module alone, and its bound in one place every end
+//! shares (`tally_wire::clock_bound`): Clippy's `disallowed-methods` refuses `SystemTime::now`,
+//! `SystemTime::elapsed`, `UNIX_EPOCH.elapsed`, `clock_gettime`, `gettimeofday` and `time`
+//! anywhere else, and `adjtimex` and `clock_adjtime` everywhere (`clippy.toml`), so
 //! nothing in the relay can judge or sign by another clock. `M` is read here for what is stamped
 //! and ticked by it; a duration timed elsewhere (a deadline, a timeout, a measure of how long
 //! something took) reads std's `Instant`, the same `CLOCK_MONOTONIC`, where it is timed: it is
 //! never compared across machines and never signed, so it needs no single owner.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::time::Instant;
 
 use tally_wire::clocks::{Judged, JudgedReader, Moment, Mono, MonoReader, Raw, RawReader};
@@ -67,10 +64,6 @@ pub type Script = Arc<dyn Fn() -> u64 + Send + Sync>;
 /// millisecond is read again).
 pub const STEP_SEEN_MS: i64 = 5;
 
-/// How long a reading of the kernel's error bound is kept before it is asked again: a tenth of a
-/// second, so a busy relay asks it ten times a second at most.
-const ERROR_KEPT_MS: u64 = 100;
-
 /// What [`RelayClock::error_ms`] holds for an error past bounds.
 const UNBOUNDED: u64 = u64::MAX;
 
@@ -86,10 +79,8 @@ enum Reading {
         /// `J` at start: where `M` reads from.
         start_ms: u64,
         offset: Offset,
-        /// The kernel's error bound as last asked, and `M` when it was.
-        error: (AtomicU64, AtomicU64),
-        /// The kernel has said the clock is synchronised since the relay started.
-        synced_once: AtomicBool,
+        /// The host's ClockBound, read at every judgement.
+        bound: &'static tally_wire::clock_bound::Reader,
     },
     /// Exactly what scripts read: a test's or a replay's times of its own choosing, and the
     /// error it says.
@@ -146,30 +137,10 @@ fn host_ms() -> u64 {
         })
 }
 
-/// The host clock's error bound in milliseconds ([`RelayClock::error_ms`]) from the kernel's word
-/// `kernel` (`os::clock_error_us`: whether it says synchronised, and `maxerror` in microseconds),
-/// and whether it has said synchronised since the relay started, `synced_once`, which a synced
-/// word sets: the one reading of that word (`tally_wire::kernel_clock::bound_ms`), synchronised
-/// now or once since the start, so a clock that lost its sources is judged on by the bound the
-/// kernel grows until it passes `E`; unbounded when the kernel cannot be asked, so a clock whose
-/// error nobody can read judges nothing (a start refuses to run then: [`kernel_answers`]).
-fn error_of(kernel: Option<(bool, u64)>, synced_once: &AtomicBool) -> u64 {
-    let Some(answer) = kernel else {
-        return UNBOUNDED;
-    };
-    if answer.0 {
-        synced_once.store(true, Ordering::Release);
-    }
-    tally_wire::kernel_clock::bound_ms(answer, synced_once.load(Ordering::Acquire))
-        .unwrap_or(UNBOUNDED)
-}
-
-/// Whether the kernel answers the read of its clock's error (`adjtimex(2)` with no modes): a
-/// relay that cannot read it can judge no time, so a start refuses to run, naming the cause.
+/// Whether the kernel reads the raw monotonic clock the relay ages its own anchors by: a relay
+/// that cannot read it refuses to start, naming the cause. (The judging clock's bound is
+/// ClockBound's, and a host without it starts a relay that judges nothing.)
 pub fn kernel_answers() -> Result<(), String> {
-    crate::os::asked_clock()
-        .map(drop)
-        .map_err(|error| unanswered(&error))?;
     tally_wire::kernel_clock::raw_monotonic()
         .map(drop)
         .map_err(|error| {
@@ -181,59 +152,71 @@ pub fn kernel_answers() -> Result<(), String> {
         })
 }
 
-/// What a start says when the kernel will not answer `adjtimex`.
-fn unanswered(error: &std::io::Error) -> String {
-    format!(
-        "the kernel will not say how far off the host's clock is (adjtimex: {error}): a seccomp \
-         filter or systemd's ProtectClock= blocks the read-only call, and the relay judges no \
-         time without it; allow adjtimex (the packaged unit does: it leaves ProtectClock off and \
-         CAP_SYS_TIME out)"
-    )
-}
-
 impl RelayClock {
-    /// A relay's: the host's clocks.
+    /// A relay's: the host's clocks, its judging clock bounded by the host's ClockBound.
     pub fn system() -> Self {
+        Self::bounded_by(tally_wire::clock_bound::Reader::host())
+    }
+
+    /// The host's clocks, the judging clock bounded by the ClockBound segment `bound` reads: a
+    /// relay's `--clock-bound`.
+    pub fn bounded_by(bound: &'static tally_wire::clock_bound::Reader) -> Self {
         let started = Instant::now();
         let start_ms = host_ms();
         Self(Arc::new(Reading::Host {
             started,
             start_ms,
             offset: Offset::new(0),
-            error: (AtomicU64::new(UNBOUNDED), AtomicU64::new(0)),
-            synced_once: AtomicBool::new(false),
+            bound,
         }))
-        .asked_error()
     }
 
-    /// The kernel asked at once, so a start does not wait [`ERROR_KEPT_MS`] to judge.
-    fn asked_error(self) -> Self {
-        if let Reading::Host {
-            error, synced_once, ..
-        } = &*self.0
-        {
-            error.0.store(
-                error_of(crate::os::clock_error_us(), synced_once),
-                Ordering::Release,
-            );
-        }
-        self
+    /// A test's: the host's three clocks as they read, as a script ([`RelayClock::scripted_raw`]),
+    /// its error stated at 0 ms ([`RelayClock::set_error`] changes it), since no test host runs
+    /// ClockBound: what a test that wants real time and a judging clock builds (`Hub::new`). A
+    /// relay's is [`RelayClock::system`]. Clippy refuses it outside a test (`clippy.toml`).
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "a test's clock, made on the scripted clocks it is"
+    )]
+    pub fn host_stated() -> Self {
+        let started = Instant::now();
+        let start_ms = host_ms();
+        Self::scripted_raw(
+            Arc::new(host_ms),
+            Arc::new(move || {
+                start_ms.saturating_add(
+                    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                )
+            }),
+            Arc::new(tally_wire::kernel_clock::raw_monotonic_ms),
+        )
     }
 
     /// Exactly the times `clock` reads, for both clocks, its error none: a test's or a replay's,
-    /// which chooses its times itself.
+    /// which chooses its times itself. Clippy refuses it outside a test (`clippy.toml`).
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "a test's clock, made on the scripted clocks it is"
+    )]
     pub fn scripted(clock: Script) -> Self {
         Self::scripted_apart(Arc::clone(&clock), clock)
     }
 
     /// `judging` and `monotonic` as a test's stand-ins for the host's two clocks: a step of the
-    /// one is a step only when the other does not move with it.
+    /// one is a step only when the other does not move with it. Clippy refuses it outside a test
+    /// (`clippy.toml`).
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "a test's clock, made on the scripted clocks it is"
+    )]
     pub fn scripted_apart(judging: Script, monotonic: Script) -> Self {
         Self::scripted_raw(judging, Arc::clone(&monotonic), monotonic)
     }
 
     /// As [`RelayClock::scripted_apart`], with `raw` the stand-in for the host's raw monotonic
     /// clock ([`RelayClock::raw`]): a test's true time, while the other two slew and step.
+    /// Clippy refuses it outside a test (`clippy.toml`).
     pub fn scripted_raw(judging: Script, monotonic: Script, raw: Script) -> Self {
         let offset = i64_of(judging()) - i64_of(monotonic());
         Self(Arc::new(Reading::Scripted {
@@ -245,8 +228,8 @@ impl RelayClock {
         }))
     }
 
-    /// A scripted clock's error set (`None`: unbounded, unsynced): a test's. A host's is the
-    /// kernel's alone.
+    /// A scripted clock's error set (`None`: unbounded, unsynced): a test's. A host's is
+    /// ClockBound's alone. Clippy refuses it outside a test (`clippy.toml`).
     pub fn set_error(&self, error_ms: Option<u64>) {
         if let Reading::Scripted { error, .. } = &*self.0 {
             error.store(error_ms.unwrap_or(UNBOUNDED), Ordering::Release);
@@ -321,28 +304,26 @@ impl RelayClock {
         }
     }
 
-    /// The judging clock's error bound now, in milliseconds: `None` while it is unbounded (the
-    /// host unsynchronised, or its error past `E`), when the relay judges nothing by it.
+    /// The judging clock's error bound now, in milliseconds: ClockBound's, read now
+    /// (`tally_wire::clock_bound::Reader::read`); `None` while it is unbounded (ClockBound absent,
+    /// unreadable or not `Synchronized`, or its bound past `E`), when the relay judges nothing by
+    /// it.
     pub fn error_ms(&self) -> Option<u64> {
-        let error = match &*self.0 {
-            Reading::Host {
-                started,
-                error,
-                synced_once,
-                ..
-            } => {
-                let now = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-                let asked = error.1.load(Ordering::Acquire);
-                if now >= asked.saturating_add(ERROR_KEPT_MS) {
-                    let judged = error_of(crate::os::clock_error_us(), synced_once);
-                    error.0.store(judged, Ordering::Release);
-                    error.1.store(now, Ordering::Release);
-                }
-                error.0.load(Ordering::Acquire)
+        match &*self.0 {
+            Reading::Host { bound, .. } => bound.read().ok(),
+            Reading::Scripted { error, .. } => {
+                Some(error.load(Ordering::Acquire)).filter(|error| *error != UNBOUNDED)
             }
-            Reading::Scripted { error, .. } => error.load(Ordering::Acquire),
-        };
-        (error != UNBOUNDED).then_some(error)
+        }
+    }
+
+    /// What the reads of the judging clock's bound said: the last verdict and the refusals by
+    /// why (`tally_wire::clock_bound::Health`). A scripted clock's reads none.
+    pub fn bound_health(&self) -> tally_wire::clock_bound::Health {
+        match &*self.0 {
+            Reading::Host { bound, .. } => bound.health(),
+            Reading::Scripted { .. } => tally_wire::clock_bound::Health::default(),
+        }
     }
 
     /// Whether the judging clock is bounded now: what lets the relay judge a record usable.
@@ -466,37 +447,6 @@ mod tests {
         assert_eq!(clock.steps(), 0);
     }
 
-    /// RFC 5905 §11.3: a relay judges only once the kernel has said the clock is synchronised
-    /// since it started, and then on the kernel's error bound, which grows while nothing
-    /// disciplines the clock: one that loses its sources is judged on until its bound passes `E`,
-    /// not cut off at once. A kernel that cannot be asked gives no bound, and a start says why it
-    /// refuses. Before, it was taken at `E`, judging by a clock whose error nobody read.
-    #[test]
-    fn the_clock_is_judged_on_the_kernels_bound_once_it_has_been_synced() {
-        let cap = tally_wire::budget::E
-            .span::<tally_wire::clocks::Judged>()
-            .ms();
-        let once = AtomicBool::new(false);
-        // Never synced: unbounded, however small the bound.
-        assert_eq!(error_of(Some((false, 500)), &once), UNBOUNDED);
-        assert_eq!(error_of(Some((true, 2_000)), &once), 2);
-        // Lost its sources: judged on its bound while it is within `E`.
-        assert_eq!(error_of(Some((false, 3_000_000)), &once), 3_000);
-        assert_eq!(error_of(Some((false, (cap + 1) * 1_000)), &once), UNBOUNDED);
-        assert_eq!(error_of(Some((true, (cap + 1) * 1_000)), &once), UNBOUNDED);
-        // A bound of 0 is the kernel's word like any other: 0 ms.
-        assert_eq!(error_of(Some((true, 0)), &once), 0);
-        // A kernel that cannot be asked: no bound, so nothing is judged.
-        assert_eq!(error_of(None, &AtomicBool::new(false)), UNBOUNDED);
-        assert_eq!(error_of(None, &once), UNBOUNDED);
-        // And a start says why it refuses.
-        let why = unanswered(&std::io::Error::from_raw_os_error(libc::EPERM));
-        assert!(
-            why.contains("seccomp") && why.contains("ProtectClock"),
-            "{why}"
-        );
-    }
-
     /// A pair of reads too far apart is read again, and once the tries run out it is used but
     /// never watched for a step: the gap between its reads is no step of the clock. Before, the
     /// last try's pair was watched like any, so a preempted read counted a step and restated the
@@ -559,6 +509,28 @@ mod tests {
         judging.fetch_add(7_200_000, Ordering::Relaxed);
         let _ = clock.read();
         assert_eq!(clock.steps(), 2);
+    }
+
+    /// A host's judging clock is bounded by its ClockBound alone, read at each judgement: with
+    /// none on the host, it judges nothing, and says why. Before, it was bounded by the kernel's
+    /// `maxerror`, which no daemon vouches for.
+    #[test]
+    fn a_host_without_clockbound_judges_nothing_and_says_why() {
+        let missing = std::env::temp_dir().join(format!("no_clockbound_{}", std::process::id()));
+        let bound: &'static tally_wire::clock_bound::Reader =
+            Box::leak(Box::new(tally_wire::clock_bound::Reader::at(
+                &missing.join("shm0").to_string_lossy(),
+                &missing.join("vmclock0").to_string_lossy(),
+            )));
+        let clock = RelayClock::bounded_by(bound);
+        assert_eq!((clock.error_ms(), clock.judging()), (None, false));
+        let health = clock.bound_health();
+        assert_eq!(
+            health.refusing,
+            Some(tally_wire::clock_bound::Refusal::Missing)
+        );
+        assert!(health.missing >= 2, "{health:?}");
+        assert_eq!(health.bound_ms, None);
     }
 
     /// A clock's error: unbounded is no judging clock.

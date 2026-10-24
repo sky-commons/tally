@@ -125,7 +125,10 @@ pub struct Carried {
     /// Its scope's reception keys: what a provisional under it is tagged with for clients. Empty
     /// when one was missing; its provisionals are then published raw only.
     pub keys: Keys,
-    pub model: Model,
+    /// The model, shared with the relay's store of models (`tally-relay`'s `models::Models`),
+    /// which holds the engine's own models as this `Arc`, never decoded again. Every list at its
+    /// length (`ClockModel::shrink_to_fit`), as a decoded one is.
+    pub model: Arc<Model>,
     pub calibrated: Calibrated,
 }
 
@@ -143,7 +146,7 @@ pub fn spent_ms(window: &Window) -> u64 {
 
 struct Waiting {
     reception: Reception,
-    /// When its batch arrived, by the monotonic clock (`Order::stamp_ms`).
+    /// When its batch arrived: its stamp on the holder's monotonic clock (`Order::stamp`).
     arrived: Mono,
 }
 

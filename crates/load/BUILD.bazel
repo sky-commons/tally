@@ -27,7 +27,9 @@ rust_library(
         "//crates/mlat-solver",
         "//crates/relay",
         "//crates/wire",
+        "@tally_crates//:clock-bound-shm",
         "@tally_crates//:libc",
+        "@tally_crates//:nix",
         "@tally_crates//:serde_json",
         "@tally_crates//:tokio",
     ],
@@ -59,11 +61,44 @@ rust_test(
     lint_config = ":cargo_lints",
 )
 
+# The public relay's plan against what it is resident at 0, 8, 32 and 128 feeders, at its deployed
+# arguments (`public_relay`) and again gathering the world products (`public_relay_world`), each
+# its own target so each run of four loads fits a large test's time (RFC-0181, "Sizing"): a
+# measurement of this host, minutes long, so `manual` and never in the verdict.
+# `bazel test -c opt //crates/load:public_relay //crates/load:public_relay_world --test_output=all`.
+[
+    rust_test(
+        name = name,
+        size = "large",
+        srcs = ["tests/public_relay.rs"],
+        args = [test],
+        data = ["//crates/relay:tally-relay"],
+        edition = "2024",
+        env = {"TALLY_RELAY": "$(rootpath //crates/relay:tally-relay)"},
+        lint_config = ":cargo_lints",
+        tags = ["manual"],
+        deps = [
+            ":load",
+            "//crates/wire",
+            "@tally_crates//:tokio",
+        ],
+    )
+    for name, test in [
+        ("public_relay", "the_public_relay_is_resident_within_its_plan_at_each_load"),
+        (
+            "public_relay_world",
+            "the_public_relay_gathering_the_world_is_resident_within_its_plan_at_each_load",
+        ),
+    ]
+]
+
 rustfmt_test(
     name = "rustfmt",
     targets = [
         ":load",
         ":load_test",
+        ":public_relay",
+        ":public_relay_world",
         ":tally-load",
     ],
 )

@@ -6,6 +6,7 @@
 #![allow(clippy::disallowed_methods, reason = "a test's scripted readings")]
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::OnceLock;
+use tally_wire::clocks::recorded::mono;
 
 use tally_mlat::engine::{Engine, Settings as EngineSettings};
 use tally_mlat_solver::scope::{GRID_MS, Window, bin_of};
@@ -160,7 +161,7 @@ fn signed(
 
 fn feed(merge: &mut Merge, records: &[ClientRecord], now: u64) -> Result<(), String> {
     for record in records {
-        merge.ingest(record, now)?;
+        merge.ingest(record, mono(now))?;
     }
     Ok(())
 }
@@ -376,7 +377,7 @@ fn ten_fabricated_receivers_do_not_move_the_served_position_and_are_contested() 
         let mut merge = Merge::new(Settings::default());
         feed(&mut merge, &summaries, world.now)?;
         for record in order {
-            merge.ingest(record, world.now)?;
+            merge.ingest(record, mono(world.now))?;
         }
         let track = merge.track(attack.honest.address).ok_or("no track")?;
         let served = track.served().ok_or("nothing served")?;
@@ -409,8 +410,11 @@ fn ten_fabricated_receivers_do_not_move_the_served_position_and_are_contested() 
     agreeing.lon_e7 = attack.honest.lon_e7;
     let mut merge = Merge::new(Settings::default());
     feed(&mut merge, &summaries, world.now)?;
-    merge.ingest(&honest, world.now)?;
-    merge.ingest(&signed(world, &attacker, world.now, &agreeing)?, world.now)?;
+    merge.ingest(&honest, mono(world.now))?;
+    merge.ingest(
+        &signed(world, &attacker, world.now, &agreeing)?,
+        mono(world.now),
+    )?;
     let track = merge.track(attack.honest.address).ok_or("no track")?;
     assert_eq!(
         track.served().map(|fix| &fix.observations),

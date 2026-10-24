@@ -18,13 +18,16 @@
 //! another's belongs either. No reading has a default. A reading is moved only by a span on its
 //! own clock ([`Mono::later`], [`Judged::earlier`], ...), and a span is made only by the clocks'
 //! budget (`crate::budget`: its terms, and the constants a module states through
-//! `crate::budget::policy`) or by measuring between two readings of one clock ([`Mono::since`]):
-//! never from a number, so no reading's milliseconds become a span or a reading of another
-//! clock. A reading is read out as milliseconds to be stated (signed into a record, binned on the
-//! grid), but a number is never made into a reading again but by [`recorded`]: a reading a reader
-//! took before, given back by a trace or a test's script. Clippy refuses those constructors
-//! outside the code that replays (`clippy.toml`), so a relay's own code reads its clocks and
-//! nothing else.
+//! `crate::budget::policy`) or by measuring between two readings of one clock ([`Mono::since`]),
+//! and scaled only by a constant ([`Span::times`], whose count is a const parameter): never from
+//! a number, so no reading's milliseconds become a span or a reading of another clock. A time on
+//! a clock's own grid (an epoch's end, an MLAT step) is a reading too: a reading floored to the
+//! grid ([`Mono::floor`]) and stepped by a span of the grid's step, never a number made into one.
+//! A reading is read out as milliseconds to be stated (signed into a record, binned on the grid),
+//! but a number is never made into a reading again but by [`recorded`]: a reading a reader took
+//! before, given back by a trace or a test's script. Clippy refuses those constructors outside
+//! the code that replays (`clippy.toml`), so a relay's own code reads its clocks and nothing
+//! else.
 //!
 //! What mixing them would look like, refused by the compiler:
 //!
@@ -68,6 +71,24 @@
 //! # use tally_wire::clocks::{Judged, Moment, Mono};
 //! // An instant is read, both clocks together, never paired by hand.
 //! fn moment_mix(m: Mono, j: Judged) -> Moment { Moment::of(m, j) }
+//! ```
+//!
+//! ```compile_fail,E0435
+//! # use tally_wire::clocks::{Judged, Mono, Span};
+//! // A span is scaled by a constant, never by a number read at run time.
+//! fn scaled(span: Span<Judged>, m: Mono) -> Span<Judged> { span.times::<{ m.ms() }>() }
+//! ```
+//!
+//! ```compile_fail,E0308
+//! # use tally_wire::clocks::Moment;
+//! // An instant is carried to a reading of `M`, never to a number on its grid.
+//! fn on_grid(moment: Moment, mono_ms: u64) -> Moment { moment.at(mono_ms) }
+//! ```
+//!
+//! ```compile_fail,E0599
+//! # use tally_wire::clocks::Moment;
+//! // Nor is there another way to state one.
+//! fn on_grid(moment: Moment, mono_ms: u64) -> Moment { moment.at_ms(mono_ms) }
 //! ```
 //!
 //! A time a record states (its signed time, a bin's start on the grid) is a number, not a
@@ -116,10 +137,11 @@ impl<C> Span<C> {
         Self::of(self.0.div_ceil(1000).saturating_mul(1000))
     }
 
-    /// This span `n` times over.
+    /// This span `N` times over. The count is a const parameter, so only a constant scales a
+    /// span: a number read at run time (a reading's milliseconds, a count of steps) never can.
     #[must_use]
-    pub const fn times(self, n: u64) -> Self {
-        Self::of(self.0.saturating_mul(n))
+    pub const fn times<const N: u64>(self) -> Self {
+        Self::of(self.0.saturating_mul(N))
     }
 }
 
@@ -409,13 +431,6 @@ impl Moment {
             Judged(u64::try_from(judged.max(0)).unwrap_or(u64::MAX)),
         )
     }
-
-    /// As [`Moment::at`], at `mono_ms` on the monotonic clock's own grid (an epoch's end, a step):
-    /// a time the pipeline states on `M`, never a reading of any other clock. Clippy refuses it
-    /// but where the pipeline steps by its grid (`clippy.toml`), which says so.
-    pub fn at_ms(self, mono_ms: u64) -> Self {
-        self.at(Mono(mono_ms))
-    }
 }
 
 #[cfg(test)]
@@ -440,7 +455,6 @@ mod tests {
             behind.at(recorded::mono(1_000)).judged(),
             recorded::judged(0)
         );
-        assert_eq!(ahead.at_ms(11_000), ahead.at(recorded::mono(11_000)));
         assert_eq!(
             recorded::aligned(5).at(recorded::mono(9)),
             recorded::aligned(9)
@@ -455,15 +469,15 @@ mod tests {
         let eight = recorded::judged(50).since(now);
         assert_eq!(eight.ms(), 8);
         assert_eq!(now.later(eight).since(now), eight);
-        assert_eq!(now.earlier(eight.times(100)).ms(), 0);
+        assert_eq!(now.earlier(eight.times::<100>()).ms(), 0);
         assert_eq!(now.since(now.later(eight)), Span::ZERO);
         assert!(now.reached(recorded::judged(42)) && !now.reached(recorded::judged(43)));
         assert!(now.passed(recorded::judged(41)) && !now.passed(recorded::judged(42)));
         assert_eq!(eight.plus(eight).minus(eight), eight);
-        assert_eq!(eight.minus(eight.times(2)), Span::ZERO);
+        assert_eq!(eight.minus(eight.times::<2>()), Span::ZERO);
         assert_eq!(recorded::judged(50).floor(eight), recorded::judged(48));
         assert_eq!(eight.whole_seconds().ms(), 1_000);
-        assert_eq!(eight.times(125).whole_seconds().ms(), 1_000);
+        assert_eq!(eight.times::<125>().whole_seconds().ms(), 1_000);
         assert_eq!(Span::<Judged>::ZERO.whole_seconds(), Span::ZERO);
         assert_eq!(now.floor(Span::ZERO), now);
     }

@@ -21,27 +21,22 @@
 [Unit]
 Description=Tally relay: verifies and forwards Tally receivers' batches
 Documentation=https://github.com/sky-commons/tally
-# A relay judges what it compares across machines by the host's wall clock as its time daemon
-# keeps it, with the kernel's error bound, and times every duration by the monotonic clock
-# (RFC-0171 §3.6). A step of the wall clock ends nothing: the relay tells its feeders the new time.
-# Until the host first reports its clock synchronised, and whenever the kernel's error bound on it
-# (which grows from its last sync) is past 7.5 s, the relay states its error as unbounded and
-# refuses no one for clock, so it can start before the clock is set, but it judges best once it is.
-# The host's time daemon must be chrony or ntpd: each sets the kernel's error bound (maxerror) to
-# its root distance, the bound against true time the relay judges by. systemd-timesyncd sets it to
-# 0 at every adjustment (src/timesync/timesyncd-manager.c, manager_adjust_clock), and the kernel
-# grows it 500 us a second from there, so the bound counts only the drift since its last poll,
-# never the server's own distance or the measurement's error, and a relay could judge by a clock
-# seconds off while it reads milliseconds; nothing stock tells that bound from chrony's, so the
-# relay cannot refuse it and the requirement is stated here.
-# The relay starts after chrony-wait.service (chrony's own wait for a synchronised clock, pulled in
-# when chrony is installed), and after time-sync.target, which it never pulls in
-# (systemd.special(7): a unit that needs the time is ordered after it "but not pull it in"). That
-# target holds the start back only while a wait service is enabled (under ntpd, ntpsec-wait.service
-# or systemd-time-wait-sync.service); with none it is reached at once, and what holds is the
-# kernel's word read at each judgement, as above.
-After=network-online.target chrony-wait.service time-sync.target
-Wants=network-online.target chrony-wait.service
+# A relay judges what it compares across machines by the host's wall clock as chrony keeps it,
+# with the error bound the host's ClockBound daemon publishes (/var/run/clockbound/shm0), read at
+# every judgement, and times every duration by the monotonic clock (RFC-0171 §3.6). A step of the
+# wall clock ends nothing: the relay tells its feeders the new time. While ClockBound is missing or
+# does not say Synchronized within 7.5 s less 418 ms (what its word may leave unsaid), the relay
+# states its error as unbounded, judges nothing and refuses no one for clock, so it starts
+# whatever the clock's state, but it judges only on a
+# host that has: chrony with `maxclockerror 50` and `rtcsync`, and ClockBound 2.x run with
+# `--max-drift-rate 50`, and VMClock where the hypervisor offers one, readable by all as
+# ClockBound's own unit makes it (chmod a+r /dev/vmclock0; else ClockBound runs with
+# `--disable-clock-disruption-support`). The kernel's own bound (adjtimex's maxerror) is not read: it cannot say which daemon
+# wrote it, and a daemon that died mid-slew leaves it understating the error.
+# The relay starts after ClockBound and never pulls it in: a host without it runs a relay that
+# judges nothing, and says so (`/memory`, clock_bound).
+After=network-online.target clockbound.service
+Wants=network-online.target
 
 [Service]
 Type=simple
@@ -85,15 +80,23 @@ NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
-PrivateDevices=yes
+# No PrivateDevices=, which would hide /dev/vmclock0: ClockBound's client reads it beside the
+# segment where the hypervisor offers one (systemd.exec(5): "When access to some but not all
+# devices must be possible, the DeviceAllow= setting might be used instead"). Every other device
+# stays closed.
+DevicePolicy=closed
+DeviceAllow=/dev/vmclock0 r
+# PrivateDevices= gave the process a /dev/shm of its own; without it the host's is shared, so it
+# is made private here (systemd.exec(5), TemporaryFileSystem=), as PrivateDevices= mounted it.
+TemporaryFileSystem=/dev/shm:mode=1777,nosuid,nodev,noexec
 PrivateUsers=yes
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectKernelLogs=yes
 ProtectControlGroups=yes
-# No ProtectClock=: it filters adjtimex(2) whole, and the relay reads the clock's error bound with
-# it (a read, no modes set). The clock cannot be set from here all the same: the empty
-# CapabilityBoundingSet below keeps CAP_SYS_TIME out, and the kernel refuses a write without it.
+# Nothing here reads or sets the clock's discipline: the bound is ClockBound's, read from shared
+# memory, so every call that could set the clock is filtered too.
+ProtectClock=yes
 ProtectHostname=yes
 ProtectProc=invisible
 ProcSubset=pid
@@ -111,13 +114,7 @@ SystemCallArchitectures=native
 SystemCallFilter=@system-service
 # @resources stays allowed: the async runtime may set a thread's affinity or priority.
 SystemCallFilter=~@privileged
-# @privileged holds @clock, and so the read of the clock's error bound: allowed back, every system
-# call that read may be (glibc's adjtimex(3) is clock_adjtime(2), and clock_adjtime64 on a 32-bit
-# time_t; tally_wire::kernel_clock::SYSCALLS, which //crates/relay:check holds this line to). With
-# no capability it can change nothing.
-SystemCallFilter=adjtimex clock_adjtime clock_adjtime64
-# A refused call fails with EPERM rather than killing the process, so a relay the filter still
-# refuses its clock says so and stops (clock::kernel_answers) instead of dying of SIGSYS unsaid.
+# A refused call fails with EPERM rather than killing the process with SIGSYS unsaid.
 SystemCallErrorNumber=EPERM
 
 [Install]

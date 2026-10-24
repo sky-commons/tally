@@ -210,8 +210,9 @@ pub fn decode(bytes: &[u8], spec: u16) -> Result<ClockModel, PublishError> {
     if window.first > window.last {
         return Err(PublishError::Malformed("window"));
     }
-    let mut scope: Vec<Site> = Vec::new();
-    for _ in 0..reader.u16()? {
+    let count = reader.u16()?;
+    let mut scope: Vec<Site> = reader.list(count, SITE_WIRE_BYTES);
+    for _ in 0..count {
         let entry = Site {
             receiver: reader.public_key()?,
             clock: Clock::from_byte(reader.u8()?),
@@ -238,8 +239,9 @@ pub fn decode(bytes: &[u8], spec: u16) -> Result<ClockModel, PublishError> {
     let gauge = reader.clock_key()?;
     let origin_unix_ns = reader.u64()?;
     let gauge_rate = reader.i64()?;
-    let mut pieces: Vec<ClockPiece> = Vec::new();
-    for _ in 0..reader.u16()? {
+    let count = reader.u16()?;
+    let mut pieces: Vec<ClockPiece> = reader.list(count, PIECE_WIRE_BYTES);
+    for _ in 0..count {
         let key = reader.clock_key()?;
         if pieces.last().is_some_and(|last| last.key >= key) {
             return Err(PublishError::Malformed("piece order"));
@@ -260,9 +262,10 @@ pub fn decode(bytes: &[u8], spec: u16) -> Result<ClockModel, PublishError> {
         if knots < 2 {
             return Err(PublishError::Malformed("fewer than two knots"));
         }
-        let offsets_ps = (0..knots)
-            .map(|_| reader.i64())
-            .collect::<Result<Vec<_>, _>>()?;
+        let mut offsets_ps: Vec<i64> = reader.list(knots, 8);
+        for _ in 0..knots {
+            offsets_ps.push(reader.i64()?);
+        }
         let Some(entry) = scope.iter().find(|entry| entry.receiver == key.receiver) else {
             return Err(PublishError::Malformed("a clock outside the scope"));
         };
@@ -289,8 +292,9 @@ pub fn decode(bytes: &[u8], spec: u16) -> Result<ClockModel, PublishError> {
     if !gauge_zero {
         return Err(PublishError::Malformed("gauge"));
     }
-    let mut biases: Vec<Bias> = Vec::new();
-    for _ in 0..reader.u16()? {
+    let count = reader.u16()?;
+    let mut biases: Vec<Bias> = reader.list(count, BIAS_WIRE_BYTES);
+    for _ in 0..count {
         let address = reader.u32()?;
         let kind = BiasKind::from_byte(reader.u8()?).ok_or(PublishError::Malformed("bias kind"))?;
         let bias = Bias {
@@ -306,8 +310,9 @@ pub fn decode(bytes: &[u8], spec: u16) -> Result<ClockModel, PublishError> {
         }
         biases.push(bias);
     }
-    let mut jumps: Vec<Jump> = Vec::new();
-    for _ in 0..reader.u16()? {
+    let count = reader.u16()?;
+    let mut jumps: Vec<Jump> = reader.list(count, JUMP_WIRE_BYTES);
+    for _ in 0..count {
         let jump = Jump {
             receiver: reader.public_key()?,
             epoch: reader.u32()?,
@@ -319,8 +324,9 @@ pub fn decode(bytes: &[u8], spec: u16) -> Result<ClockModel, PublishError> {
         }
         jumps.push(jump);
     }
-    let mut dropped: Vec<(PublicKey, u32)> = Vec::new();
-    for _ in 0..reader.u16()? {
+    let count = reader.u16()?;
+    let mut dropped: Vec<(PublicKey, u32)> = reader.list(count, DROPPED_WIRE_BYTES);
+    for _ in 0..count {
         let clock = (reader.public_key()?, reader.u32()?);
         if dropped.last().is_some_and(|last| *last >= clock) {
             return Err(PublishError::Malformed("dropped order"));
@@ -556,7 +562,25 @@ struct Reader<'a> {
     at: usize,
 }
 
+/// The least each listed entry takes on the wire: a site (its key, clock and location, its id
+/// besides), a clock's piece (its key, timebase, times, site, noise, base, first knot and at least
+/// two knots), a bias, a jump and a dropped clock. What [`Reader::list`] reserves for a count by.
+const SITE_WIRE_BYTES: usize = 32 + 1 + 16;
+const PIECE_WIRE_BYTES: usize = 38 + 1 + 8 * 8 + 4 + 2 + 2 * 8;
+const BIAS_WIRE_BYTES: usize = 4 + 1 + 8;
+const JUMP_WIRE_BYTES: usize = 32 + 4 + 8 + 8;
+const DROPPED_WIRE_BYTES: usize = 32 + 4;
+
 impl Reader<'_> {
+    /// A list for `count` entries of at least `each` bytes on the wire: exactly `count` when the
+    /// bytes left can hold them, so a model decoded holds every list at its length
+    /// (`standing::model_bytes_most`), and never more than the bytes left could fill, so a count
+    /// that lies reserves nothing it cannot read.
+    fn list<T>(&self, count: u16, each: usize) -> Vec<T> {
+        let left = self.bytes.len().saturating_sub(self.at) / each;
+        Vec::with_capacity(usize::from(count).min(left))
+    }
+
     fn array<const N: usize>(&mut self) -> Result<[u8; N], PublishError> {
         let end = self.at.checked_add(N).ok_or(PublishError::Truncated)?;
         let slice = self

@@ -411,12 +411,21 @@ fn figures_are_whole_hours_published_hourly() -> Result<(), String> {
     assert_eq!(contents(&again)?, contents(&first)?);
     let later = figures.sign(&relay, judged(NEXT_HOUR + HOUR_MS), |_| true);
     assert_ne!(contents(&later)?, contents(&first)?);
-    // Due once an hour, at the first tick of each.
+    // Due once an hour, at the first tick of each that signs them: a tick that could not sign
+    // them (no key, the clock stopped judging) leaves them due. Before, asking took the hour, and
+    // an hour whose signing found no key was lost.
     let hourly = Figures::new();
     assert!(hourly.due(judged(NEXT_HOUR)));
+    assert!(
+        hourly.due(judged(NEXT_HOUR + 1_000)),
+        "asking took the hour"
+    );
+    let _ = hourly.sign(&relay, judged(NEXT_HOUR + 1_000), |_| true);
     assert!(!hourly.due(judged(NEXT_HOUR + 59 * 60_000 - 60_000)));
     assert!(hourly.due(judged(NEXT_HOUR + HOUR_MS)));
-    assert!(!hourly.due(judged(NEXT_HOUR + HOUR_MS + 60_000)));
+    assert!(hourly.due(judged(NEXT_HOUR + HOUR_MS + 60_000)));
+    let _ = hourly.sign(&relay, judged(NEXT_HOUR + HOUR_MS + 60_000), |_| true);
+    assert!(!hourly.due(judged(NEXT_HOUR + HOUR_MS + 120_000)));
     Ok(())
 }
 

@@ -195,6 +195,11 @@ pub const fn member_records_per_sec(member_feeders: usize) -> u64 {
 /// share of each (the rate over the sessions waiting now, [`FairPace`]) and then for the shared
 /// total, so one member sending large batches cannot take the rate from the rest, and the members
 /// together never pass it.
+///
+/// Their MLAT records (positions of either form, clock models and their parts, client clock
+/// models) spend the same bytes, their signed bytes each (`Admitted::in_flight`), so what the
+/// stores that hold them (the checks' twins, the ingest pool) are planned from, the members'
+/// rate, bounds what they are sent (`budget::Plan::member_paced_bytes_per_sec`).
 pub struct MemberPace {
     bytes: Arc<FairPace>,
     receptions: Arc<FairPace>,
@@ -1310,15 +1315,15 @@ impl Stamp {
         }
     }
 
-    /// The stamp moved to `mono_ms` on its monotonic clock's own grid (an epoch's end): its
-    /// judging reading moved with it by the pair's offset (`seal::on_grid`), its judging bit its
-    /// own. Its raw reading is the one taken: the raw clock is no daemon's and runs apart from
-    /// `M`, so a span of `M` never moves it. What the products sign an epoch at, by its newest
-    /// tick.
+    /// The stamp moved to `mono`, a reading of its monotonic clock on that clock's own grid (an
+    /// epoch's end, `seal::Epoch::end`): its judging reading moved with it by the pair's offset
+    /// (`Moment::at`), its judging bit its own. Its raw reading is the one taken: the raw clock is
+    /// no daemon's and runs apart from `M`, so a span of `M` never moves it. What the products
+    /// sign an epoch at, by its newest tick.
     #[must_use]
-    pub(crate) fn at_mono_ms(self, mono_ms: u64) -> Self {
+    pub(crate) fn at_mono(self, mono: Mono) -> Self {
         Self {
-            moment: crate::seal::on_grid(self.moment, mono_ms),
+            moment: self.moment.at(mono),
             ..self
         }
     }
@@ -2952,7 +2957,7 @@ mod tests {
     fn a_stamp_moved_on_the_monotonic_clock_keeps_its_raw_reading() {
         // `J` an hour ahead of `M`, the raw clock on an origin of its own.
         let stamp = Stamp::recorded(10_000, 7, 3_610_000, 500, true);
-        let moved = stamp.at_mono_ms(12_000);
+        let moved = stamp.at_mono(recorded::mono(12_000));
         assert_eq!(
             (moved.mono_ms(), moved.judged().ms(), moved.raw().ms()),
             (12_000, 3_612_000, 500)

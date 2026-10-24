@@ -435,6 +435,14 @@ impl Engine {
         bin_of(judged.earlier(self.settings.settle).ms()) - 1
     }
 
+    /// The last bin through which every window's model has ripened by the judging clock reading
+    /// `judged` (`MODELS_RIPEN_MS` after the window fell due, [`Engine::ripen`]'s rule): a
+    /// provisional step judged at `judged` carries the model of every window whose last bin is at
+    /// or before it, so a host starts one only once every such window is solved or passed over.
+    pub fn ripe_through(&self, judged: Judged) -> i64 {
+        self.settled(judged.earlier(tally_wire::budget::policy::<_, MODELS_RIPEN_MS>()))
+    }
+
     /// Seals every bin that is complete, hands out the work of every window whose bins are all
     /// sealed and that is not solved yet (owned: the sealed bins are shared, not copied), so it
     /// runs off the thread that keeps ingesting; and forgets the bins no window still to be solved
@@ -553,10 +561,27 @@ impl Engine {
     /// As [`Engine::apply`], for an outcome whose records were refused before any reader received
     /// them (a host's queue of records not yet taken was full): what it solved is still not solved
     /// again and its sequences still advance, but none of its models ripens, so no provisional fix
-    /// ever cites a model nobody received. What the step did.
-    pub fn apply_unpublished(&mut self, outcome: Outcome) -> (Report, Dropped) {
+    /// ever cites a model nobody received. What the step did, and each model's window as
+    /// [`Engine::pass_sealed`] gives a window passed over ([`Passed`]): the provisional steps the
+    /// engine solving in line would have carried it in carry what that engine would not, and the
+    /// host sheds them. Before, it returned none, and those steps ran with fewer models than the
+    /// engine in line.
+    pub fn apply_unpublished(&mut self, outcome: Outcome) -> (Report, Dropped, Vec<Passed>) {
+        let passed = outcome
+            .carried
+            .iter()
+            .map(|carried| self.passed(&carried.window))
+            .collect();
         let (_, report, dropped) = self.apply_as(outcome, false);
-        (report, dropped)
+        (report, dropped, passed)
+    }
+
+    /// When `window`'s model would ripen and when it is spent, by the judging clock.
+    fn passed(&self, window: &Window) -> Passed {
+        Passed {
+            ripe_ms: self.due(window).saturating_add(MODELS_RIPEN_MS),
+            spent_ms: provisional::spent_ms(window),
+        }
     }
 
     fn apply_as(&mut self, outcome: Outcome, published: bool) -> (Vec<Record>, Report, Dropped) {
@@ -570,10 +595,7 @@ impl Engine {
             let ripening: Vec<(u64, provisional::Carried)> = outcome
                 .carried
                 .into_iter()
-                .map(|carried| {
-                    let ripe = self.due(&carried.window).saturating_add(MODELS_RIPEN_MS);
-                    (ripe, carried)
-                })
+                .map(|carried| (self.passed(&carried.window).ripe_ms, carried))
                 .collect();
             self.ripening.extend(ripening);
         }
@@ -596,13 +618,7 @@ impl Engine {
             .map(Window::canonical)
             .filter(|window| window.last <= settled && !self.processed.contains(&window.last))
             .collect();
-        let passed = windows
-            .iter()
-            .map(|window| Passed {
-                ripe_ms: self.due(window).saturating_add(MODELS_RIPEN_MS),
-                spent_ms: provisional::spent_ms(window),
-            })
-            .collect();
+        let passed = windows.iter().map(|window| self.passed(window)).collect();
         self.processed
             .extend(windows.iter().map(|window| window.last));
         self.forget_by(settled, i64::MAX);
@@ -1141,5 +1157,66 @@ mod tests {
         let _ = engine.prepare(tally_wire::clocks::recorded::aligned(due(gone(later))));
         assert_eq!(engine.held(), 0);
         Ok(())
+    }
+
+    /// A window step whose records were refused unpublished gives each of its models' windows as
+    /// passed over (`Passed`, as `pass_sealed` gives one), ripening at its due step and spent with
+    /// its window, so the host sheds the provisional steps that would have carried them; and none
+    /// of them ripens here. Before, it gave none, and those steps ran with fewer models than the
+    /// engine solving in line.
+    #[test]
+    fn a_window_step_refused_unpublished_gives_its_models_as_passed() -> Result<(), String> {
+        use crate::replay::{arrivals, scenario};
+        let mut simulation = tally_mlat_solver::sim::run(&scenario(23, 40.0));
+        let delivered = arrivals(&mut simulation, 5)?;
+        let first = delivered.first().map_or(0, |(at, _)| *at);
+        let until = delivered.last().map_or(0, |(at, _)| *at) + 60_000;
+        let mut engine = engine()?;
+        let mut next = 0;
+        let mut now = (first / 100 + 1) * 100;
+        let mut descriptions = Vec::new();
+        while now <= until {
+            while let Some((at, record)) = delivered.get(next).filter(|(at, _)| *at < now) {
+                match SiteRecord::of(record) {
+                    Some(site) => descriptions.push((*at, site)),
+                    None if matches!(record, Record::ReceiverInfo(_)) => {}
+                    None => {
+                        engine.ingest(record, aligned(*at))?;
+                    }
+                }
+                next += 1;
+            }
+            for (at, site) in crate::intake::taking_effect(descriptions.drain(..)) {
+                engine.ingest(&site.record(), aligned(at))?;
+            }
+            if let Some(job) = engine.prepare(aligned(now)) {
+                let outcome = job.run();
+                if !outcome.carried.is_empty() {
+                    let windows: Vec<Window> = outcome
+                        .carried
+                        .iter()
+                        .map(|carried| carried.window)
+                        .collect();
+                    let (_, _, passed) = engine.apply_unpublished(outcome);
+                    assert_eq!(passed.len(), windows.len());
+                    for (passed, window) in passed.iter().zip(&windows) {
+                        assert_eq!(passed.ripe_ms, engine.due(window) + MODELS_RIPEN_MS);
+                        assert_eq!(passed.spent_ms, provisional::spent_ms(window));
+                        assert!(passed.carried_at(aligned(passed.ripe_ms).judged()));
+                    }
+                    let ripe = passed
+                        .iter()
+                        .map(|passed| passed.ripe_ms)
+                        .max()
+                        .unwrap_or(0);
+                    let _ = engine.provisional_plan(aligned(ripe));
+                    assert_eq!(engine.carried_models(), 0, "a model refused ripened");
+                    return Ok(());
+                }
+                let _ = engine.apply(outcome);
+            }
+            now += 100;
+        }
+        Err("no window step published a model".into())
     }
 }

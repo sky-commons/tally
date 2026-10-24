@@ -8,12 +8,22 @@
 
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
-use std::sync::RwLock;
+use std::sync::{Arc, Mutex, RwLock};
 
 use tally_wire::{PublicKey, Region, Streams};
 
-use super::locks::{read, write};
+use super::locks::{lock, read, write};
 use super::member::{MonoDeadline, Now};
+use crate::budget::{Charge, Gauge, Store};
+use crate::footprint::btree_planned;
+
+/// What one ask held allocates at most, as a plan counts a map's entry
+/// (`footprint::btree_planned`): its place among its group's members, and its group's place among
+/// the books, which one ask may be the first of.
+pub const ASK_BYTES: usize = (btree_planned::<PublicKey, Entry>(1)
+    - btree_planned::<PublicKey, Entry>(0))
+    + (btree_planned::<GroupKey, Book>(1) - btree_planned::<GroupKey, Book>(0))
+    + btree_planned::<PublicKey, Entry>(0);
 
 /// How long a demoted member stays out of the trees, by the relay's monotonic clock.
 pub const DEMOTION_MS: u64 = 10 * 60 * 1000;
@@ -89,10 +99,19 @@ impl Book {
 /// is in has no book, so holding the whole world costs nothing per area. Every ask and demotion
 /// lapses by the relay's monotonic clock ([`MonoDeadline`]): a step of its judging clock neither
 /// lapses a membership early nor stretches a demotion (RFC-0171 §3.6).
+///
+/// An ask is the asker's own word, so what it holds is charged ([`ASK_BYTES`] each, to the one
+/// batch byte store, `budget::Store::Batches`, `Groups::charge_to`) while it is held, and an ask
+/// past the store's room is not held, counted (`Groups::unheld`). An offer is the directory's,
+/// bounded there (`directory::OFFERS_HELD`).
 pub struct Groups {
     books: RwLock<BTreeMap<GroupKey, Book>>,
     /// The soonest an ask lapses or a demotion ends: `expire` does nothing before it.
     next_expiry: RwLock<MonoDeadline>,
+    /// The asks held, [`ASK_BYTES`] each.
+    asks: Mutex<Charge>,
+    /// Asks not held for want of the store's room, since start.
+    unheld: std::sync::atomic::AtomicU64,
 }
 
 impl Default for Groups {
@@ -100,6 +119,8 @@ impl Default for Groups {
         Self {
             books: RwLock::default(),
             next_expiry: RwLock::new(MonoDeadline::NEVER),
+            asks: Mutex::new(Gauge::unlimited(Store::Batches).empty()),
+            unheld: std::sync::atomic::AtomicU64::new(0),
         }
     }
 }
@@ -113,9 +134,25 @@ impl Groups {
     /// A member only by asking may send the group's records here and is sent its stripes'
     /// records, but it is in no tree ([`Groups::tree`]): a relay that has not verified its offer
     /// may not lay it out where every other relay does. `leaf_only` holds only for a newcomer;
-    /// an ask never changes what a member's offers said.
-    pub fn admit(&self, group: GroupKey, member: PublicKey, until: MonoDeadline, leaf_only: bool) {
+    /// an ask never changes what a member's offers said. A new ask is charged [`ASK_BYTES`]
+    /// first: false, nothing held and counted, when the store has no room.
+    pub fn admit(
+        &self,
+        group: GroupKey,
+        member: PublicKey,
+        until: MonoDeadline,
+        leaf_only: bool,
+    ) -> bool {
         let mut books = write(&self.books);
+        let asked = books
+            .get(&group)
+            .and_then(|book| book.members.get(&member))
+            .is_some_and(|entry| entry.asked_until.is_some());
+        if !asked && !lock(&self.asks).try_grow(ASK_BYTES) {
+            self.unheld
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return false;
+        }
         let entry = books
             .entry(group)
             .or_default()
@@ -127,6 +164,32 @@ impl Groups {
             });
         entry.asked_until = Some(entry.asked_until.map_or(until, |asked| asked.max(until)));
         self.expires_at(until);
+        true
+    }
+
+    /// The asks held are charged to `gauge` from now on: moved there, or let go if it has no
+    /// room for them.
+    pub fn charge_to(&self, gauge: &Arc<Gauge>) {
+        let mut books = write(&self.books);
+        let mut asks = lock(&self.asks);
+        let mut moved = gauge.empty();
+        if !moved.try_grow(asks.bytes()) {
+            moved = gauge.empty();
+            for book in books.values_mut() {
+                for entry in book.members.values_mut() {
+                    entry.asked_until = None;
+                }
+                book.members.retain(|_, entry| entry.offered.is_some());
+            }
+            books.retain(|_, book| !book.is_empty());
+        }
+        *asks = moved;
+    }
+
+    /// The asks held, and those not held for want of room since start.
+    pub fn asks(&self) -> (usize, u64) {
+        let held = lock(&self.asks).bytes() / ASK_BYTES;
+        (held, self.unheld.load(std::sync::atomic::Ordering::Relaxed))
     }
 
     /// The members whose verified offers cover the group now, each a leaf when any of its offers
@@ -177,10 +240,14 @@ impl Groups {
         let mut books = write(&self.books);
         let mut changed = Vec::new();
         let mut next = MonoDeadline::NEVER;
+        let mut lapsed = 0;
         for (key, book) in books.iter_mut() {
             for entry in book.members.values_mut() {
                 match entry.asked_until {
-                    Some(until) if until.passed(now) => entry.asked_until = None,
+                    Some(until) if until.passed(now) => {
+                        entry.asked_until = None;
+                        lapsed += 1;
+                    }
                     Some(until) => next = next.min(until),
                     None => {}
                 }
@@ -197,6 +264,9 @@ impl Groups {
                 .fold(next, |next, until| next.min(*until));
         }
         books.retain(|_, book| !book.is_empty());
+        let mut asks = lock(&self.asks);
+        let left = asks.bytes().saturating_sub(lapsed * ASK_BYTES);
+        asks.shrink_to(left);
         *write(&self.next_expiry) = next;
         changed
     }

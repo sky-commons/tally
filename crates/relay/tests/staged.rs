@@ -198,7 +198,11 @@ fn trace() -> Result<Trace> {
         relay,
         feeders,
         batches,
-        end_ms: BASE_MS + (SECONDS + 7) * 1_000,
+        // Past the live world's settle after the last second, on the epochs' grid, so every
+        // second of it is sealed.
+        end_ms: BASE_MS
+            + (SECONDS + 3) * 1_000
+            + tally_relay::products::WORLD_SETTLE_MS.div_ceil(1_000) * 1_000,
     })
 }
 
@@ -225,11 +229,10 @@ fn stream_of(hub: &Hub) -> Result<(Vec<Observation>, u64)> {
     Ok((stream, products.report().stream_refused))
 }
 
-/// The relay's key, the trace's world switched on and its feeders described: as the trace's
-/// relay starts.
+/// The relay's key and its feeders described: as the trace's relay starts (its world switched on
+/// where it is built, `Hub::gathering_world`).
 fn start(hub: &Hub, trace: &Trace) -> Result {
     hub.network().adopt_identity(twin(&trace.relay)?);
-    hub.network().products.set_world(true);
     for (identity, info, location) in &trace.feeders {
         hub.publish_info(
             1,
@@ -293,6 +296,8 @@ fn run(trace: &Trace, threads: Threads, delay: impl Fn(usize) -> Duration) -> Re
     let hub = Arc::new(
         Hub::clocked(8, Arc::new(|| 0), tally_relay::sharing::Deadlines::RELAY)
             .accepting_relays([tally_mlat_solver::sim::anchoring_relay().public()])
+            // The trace's world switched on, as `--world` does, its fixes' store planned.
+            .gathering_world(true, false)
             .product_boots(42)
             .staged(threads)?,
     );
@@ -320,6 +325,8 @@ fn run_clocked(trace: &Trace, threads: Threads, pause: Option<Pause>) -> Result<
             tally_relay::sharing::Deadlines::RELAY,
         )
         .accepting_relays([tally_mlat_solver::sim::anchoring_relay().public()])
+        // The trace's world switched on, as `--world` does, its fixes' store planned.
+        .gathering_world(true, false)
         .product_boots(42)
         .staged_pausing(threads, pause)?,
     );

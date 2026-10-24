@@ -8,7 +8,7 @@
 //! routed to the message exchange (the one deduplication, `exchange`) and offered to the fan-out
 //! from there, so its subscribers read it in admitted order.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, Ipv6Addr};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -36,7 +36,7 @@ use crate::parts::Parts;
 use crate::sharing::Now;
 use crate::sharing::Rebuilt;
 use crate::shed;
-use crate::stations::{STATIONS_REMEMBERED, StationReport, Stations, StationsReport};
+use crate::stations::{StationReport, Stations, StationsReport};
 use crate::strikes::{
     Begun, Deliverer, Shares, Start, StrikeStores, Strikes, Usable, Verdict, Window,
 };
@@ -60,20 +60,96 @@ pub enum RelayTrust {
     Directory,
 }
 
-/// How many receivers' descriptions the relay holds. When full, the one least recently active is
-/// forgotten: a receiver is active when it is first described and whenever a batch of it is
-/// forwarded, never by a description alone (`Bounded`). So descriptions from throwaway keys forget
-/// each other oldest first, a receiver publishing at least once per table's worth of new keys keeps
-/// its place, and a new receiver is described from its first description, however full the table
-/// of receivers that publish. A forgotten receiver's batches still flow, to whole-world subscribers
-/// only, until it describes itself again (a feeder's link does so at its next batch, see `link`;
-/// one known only through a relay link, at its feeder's next periodic description).
-pub const RECEIVERS_REMEMBERED: usize = 50_000;
+/// How many receivers' descriptions the relay holds: the receiver figure (`budget::Plan::receivers`,
+/// the receivers the records a second it admits may be within the longest an honest receiver goes
+/// between batches), in one table and one order of activity (`Receivers`), never an even share of
+/// it in each raw shard: receivers land in shards by a keyed hash, so a shard's are a random draw
+/// and an even share is over full on every batch while another shard has room. When full, the one
+/// least recently active is forgotten: a receiver is active when it is first described and
+/// whenever a batch of it is forwarded, never by a description alone (`Bounded`). So descriptions
+/// from throwaway keys forget each other oldest first, a receiver publishing at least once per
+/// table's worth of new keys keeps its place, and a new receiver is described from its first
+/// description, however full the table of receivers that publish. A forgotten receiver's batches
+/// still flow, to whole-world subscribers only, until it describes itself again (a feeder's link
+/// does so at its next batch, see `link`; one known only through a relay link, at its feeder's next
+/// periodic description).
+///
+/// The descriptions are held to bytes as well as to their count: a description is at most one
+/// message, so the count alone would let throwaway keys hold a message each. Each receiver is
+/// given the most an honest description and its site hold ([`DESCRIPTION_BYTES_PER_RECEIVER`]),
+/// so the receivers the figure holds are never forgotten for bytes while they describe themselves
+/// honestly.
+pub const DESCRIPTION_BYTES_PER_RECEIVER: usize =
+    crate::credit::DESCRIPTION_MOST + 255 + ReceiverSite::MAX_LEN;
 
-/// The most bytes of receiver descriptions held. A description is at most one message, so the count
-/// alone would let 50,000 throwaway keys hold 3 GB; this holds an honest description (a few hundred
-/// bytes) for every receiver remembered many times over.
-pub const DESCRIPTION_BYTES_HELD: usize = 64 * 1024 * 1024;
+/// What one entry of each of the descriptions' tables allocates beside its description's counted
+/// bytes ([`Known::bytes`]): the cells (`Bounded::bytes_per_key`), what the member links told of
+/// it ([`TOLD_PER_RECEIVER`] entries), the directory's entry,
+/// its two cell indexes' entries (`footprint::Tree`), the site waiting for it and that site's
+/// record, and the two records' shared headers.
+const DESCRIPTION_TABLES_PER_RECEIVER: usize = Bounded::<PublicKey, Cells>::bytes_per_key()
+    + TOLD_PER_RECEIVER * Bounded::<(u64, PublicKey), Told>::bytes_per_key()
+    + Bounded::<PublicKey, Known>::bytes_per_key()
+    + 2 * crate::footprint::Tree::<(u64, Edge), ()>::bytes_per_entry()
+    + Bounded::<PublicKey, HeldSite>::bytes_per_key()
+    + ReceiverSite::MAX_LEN
+    + 3 * (crate::footprint::arc::<Record>() + crate::footprint::shared_bytes(0));
+
+/// What the descriptions' store (`budget::Store::Descriptions`) takes for each receiver the
+/// figure holds: its tables' entries and its description's bytes.
+pub const DESCRIPTIONS_BYTES_PER_RECEIVER: usize =
+    DESCRIPTION_TABLES_PER_RECEIVER + DESCRIPTION_BYTES_PER_RECEIVER;
+
+/// What the descriptions' tables take beside [`DESCRIPTIONS_BYTES_PER_RECEIVER`] for each
+/// receiver: the cells' fixed part, the directory's, the indexes' and the waiting sites' fixed
+/// parts, and the receiver theirs are one past the cells' by and a figure of none is held at.
+pub const DESCRIPTIONS_FIXED_BYTES: usize = Bounded::<PublicKey, Cells>::fixed_bytes()
+    + Bounded::<(u64, PublicKey), Told>::fixed_bytes()
+    + Bounded::<PublicKey, Known>::fixed_bytes()
+    + Bounded::<PublicKey, HeldSite>::fixed_bytes()
+    + 2 * crate::footprint::Tree::<(u64, Edge), ()>::bytes_planned(0)
+    + 2 * DESCRIPTIONS_BYTES_PER_RECEIVER;
+
+/// The descriptions the cells hold for `receivers` receivers: the figure, one at least.
+const fn described_count(receivers: usize) -> usize {
+    if receivers == 0 { 1 } else { receivers }
+}
+
+/// What a member link has told its peer of one receiver (`Hub::to_describe`): the newest time its
+/// description was issued as the link last sent it, and when, by `M`, the link last sent a batch
+/// of it.
+#[derive(Clone, Copy, Debug)]
+pub struct Told {
+    issued_ms: u64,
+    batch: Mono,
+}
+
+/// The member links a receiver's batches go down within the gap, as planned: a record goes down
+/// its stripe's tree to each child (`sharing::stripes::FANOUT`). A link and receiver forgotten past
+/// it (a stripe whose fan-out was raised, repairs) only describe the receiver again on that link.
+pub const TOLD_PER_RECEIVER: usize = crate::sharing::stripes::FANOUT;
+
+/// What the descriptions' tables allocate at most for `receivers` receivers: the cells at the
+/// figure, what the member links told at [`TOLD_PER_RECEIVER`] for each, the directory and the
+/// waiting sites at one more, the two indexes at that many, and
+/// every description's bytes at the most the cells hold. Never more than
+/// [`DESCRIPTIONS_FIXED_BYTES`] and [`DESCRIPTIONS_BYTES_PER_RECEIVER`] for each (a test holds
+/// it).
+pub const fn descriptions_planned_bytes(receivers: usize) -> usize {
+    let count = described_count(receivers);
+    let held = count + 1;
+    Bounded::<PublicKey, Cells>::planned_bytes(count)
+        + Bounded::<(u64, PublicKey), Told>::planned_bytes(TOLD_PER_RECEIVER * count)
+        + Bounded::<PublicKey, Known>::planned_bytes(held)
+        + Bounded::<PublicKey, HeldSite>::planned_bytes(held)
+        + held
+            * (ReceiverSite::MAX_LEN
+                + crate::footprint::arc::<Record>()
+                + crate::footprint::shared_bytes(0))
+        + 2 * crate::footprint::Tree::<(u64, Edge), ()>::bytes_planned(held)
+        + held * 2 * (crate::footprint::arc::<Record>() + crate::footprint::shared_bytes(0))
+        + count * DESCRIPTION_BYTES_PER_RECEIVER
+}
 
 /// The default ceilings an operator may change (`config`).
 ///
@@ -82,15 +158,14 @@ pub const DESCRIPTION_BYTES_HELD: usize = 64 * 1024 * 1024;
 /// grows with what feeders send (subscriber queues, deduplication, the epochs between ingest and
 /// the sealer, the products, MLAT's raw, the batch store) is charged to its gauge and held to its
 /// share at the feeder ceiling, and a Hello past the ceiling is refused; a relay whose memory
-/// admits no feeder refuses to start. What every relay holds whatever its feeders (`BASE_BYTES`)
-/// covers the tables below, which are bounded by count and so need no feeder's reservation:
-///
-/// | what                                                         | at most    |
-/// | ------------------------------------------------------------ | ---------- |
-/// | descriptions (`DESCRIPTION_BYTES_HELD`) and their index      | 80 MiB     |
-/// | streams, three tables x 100,000 authors x ~250 B             | 75 MiB     |
-/// | hashes, four tables x two generations x 100,000              | 36 MiB     |
-/// | clock model parts awaiting manifests, and manifests' lists    | 96 MiB     |
+/// admits no feeder refuses to start. No table that grows with what arrives is left to the base
+/// (`BASE_BYTES`, the process measured idle): each is a store of its own, sized from what the
+/// relay admits. The receivers' descriptions are `budget::Store::Descriptions`, at the receiver
+/// figure (`budget::Plan::receivers`); the clock model parts waiting for their manifests are
+/// `budget::Store::Parts`, at what the members' rate and the relay's MLAT bring while one waits
+/// (`budget::Plan::parts_room`); the streams' tables are the delivery tags'
+/// (`budget::Store::Delivery`); and what was taken, by hash, is the strike stores'
+/// (`budget::Store::FeederStrikes`, `PeerStrikes`, `OwnStrikes`).
 ///
 /// A connection's Noise buffers come from one pool (`tally_wire::noise`), and each connection
 /// carves what it may hold of them, reading and writing (`ingest::BUFFERS_PER_CONNECTION`), for
@@ -150,9 +225,10 @@ pub struct Item {
     /// For a receiver's batch of a format this build reads: its one decode (`ingest`), so no
     /// reader of the fan-out (the BEAST output) inflates or parses it again.
     pub decoded: Option<Arc<Decoded>>,
-    /// The ingest clock when it was taken: a subscriber queue's age is read from this
-    /// (`fanout::BEHIND_MS`).
-    pub stamp_ms: u64,
+    /// The monotonic clock when it was taken: a subscriber queue's age is read from this
+    /// (`fanout::BEHIND_MS`), so a step of the judging clock ages no queue. A `Mono`, so no
+    /// judging reading can be stored here.
+    pub stamp: Mono,
     /// What a client may be sent of it, and where a client is routed it (`ClientItem`): made once
     /// by the fan-out when anyone it routes to is a client (`fanout::Router::publish`), `None` for
     /// a relay-only record. A client link sends this and nothing else (`outbound`), and a client
@@ -170,8 +246,12 @@ struct Intake<S, L> {
 }
 
 /// Positions held until the models they cite have gone out, at most, and for at most how long.
+/// Each is charged to the records' store while it waits (`budget::Store::Records`, which the
+/// members' rate and the relay's MLAT seats are planned in, as they bring every positions record),
+/// what it allocates and its slot in the queue; one the store has no room for goes out at once,
+/// as it would once it waited its time (the relay forwards; it is the reader that cannot check it).
 const AWAITING_MAX: usize = 4_096;
-const AWAITING_MS: Duration = Duration::from_secs(10);
+pub const AWAITING_MS: Duration = Duration::from_secs(10);
 
 /// Positions held for their models (`Hub::forward_positions`).
 struct Awaiting {
@@ -181,6 +261,18 @@ struct Awaiting {
     /// (`Hub::release_awaiting`), so none is looked for in the table again.
     missing: Vec<Hash>,
     since: Instant,
+    /// What it holds, charged to `budget::Store::Records` while it waits.
+    _charge: crate::budget::Charge,
+}
+
+impl Awaiting {
+    /// What one held allocates: its record's own allocation, the models it waits for, and its
+    /// slot in the queue, twice as a full queue grows beside the one it replaces.
+    fn bytes_of(record: &Record, missing: &[Hash]) -> usize {
+        record.allocated()
+            + crate::footprint::vec::<Hash>(missing.len())
+            + 2 * std::mem::size_of::<Self>()
+    }
 }
 
 /// The clock models a positions record cites, each once.
@@ -220,9 +312,18 @@ impl HeldSite {
     }
 }
 
-/// Sites held for receivers not yet described in a form they pair with (a site that came before
-/// its description), at most: each is adopted by its receiver's next description, or forgotten.
-const SITES_WAITING: usize = 4_096;
+/// Where a receiver stands in a cell index (`Directory::by_point`, `by_public`): its key, between
+/// the two ends every cell's range is read from (`Low` before every key, `High` after), so one
+/// ordered set of (cell, receiver) answers a span of cells as one range read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Edge {
+    Low,
+    Key(PublicKey),
+    High,
+}
+
+/// One cell index: each receiver once, under its cell's number.
+type CellIndex = crate::footprint::Tree<(u64, Edge), ()>;
 
 /// A receiver's newest description, ready to send, its site in force (a format 1 description's
 /// own, or the `ReceiverSite` paired with a format 2 one), the finest cell of that site and the
@@ -242,6 +343,16 @@ struct Known {
 }
 
 impl Known {
+    /// What a description of `info` holds of its own, counted against the receivers' bytes
+    /// (`Receivers::max_bytes`): its signed bytes, its software's name read out of them, and
+    /// its paired site's signed bytes. What its records' headers and its tables' entries take is
+    /// planned for each receiver beside it (`DESCRIPTIONS_BYTES_PER_RECEIVER`).
+    fn bytes_of(info: &ReceiverInfo, software: Option<&String>, site: Option<&HeldSite>) -> usize {
+        info.as_bytes().len()
+            + software.map_or(0, String::capacity)
+            + site.map_or(0, HeldSite::bytes)
+    }
+
     fn held_site(&self) -> Option<ReceiverSite> {
         match self.site.as_ref().map(|site| &*site.record) {
             Some(Record::ReceiverSite(site)) => Some(site.clone()),
@@ -249,15 +360,16 @@ impl Known {
         }
     }
 
-    /// Its description, and its site when `sites` (a relay's answer; never a client's).
-    fn items(&self, sites: bool) -> impl Iterator<Item = Item> + '_ {
-        let item = |record: &Arc<Record>| Item {
+    /// Its description, and its site when `sites` (a relay's answer; never a client's), stamped
+    /// `stamp` (`Item::stamp`).
+    fn items(&self, sites: bool, stamp: Mono) -> impl Iterator<Item = Item> + '_ {
+        let item = move |record: &Arc<Record>| Item {
             source: RELAY_ITSELF,
             record: Arc::clone(record),
             cell: self.cell,
             points: None,
             decoded: None,
-            stamp_ms: 0,
+            stamp,
             client: None,
         };
         std::iter::once(item(&self.record)).chain(
@@ -270,23 +382,18 @@ impl Known {
 }
 
 /// One raw shard's state (`exchange::raw_shard`): the batches its receivers' feeders and peers
-/// delivered that it took in (`strikes`), and their station counters (which count each stream's
-/// gaps, never what is new). Owned by the ingest worker of the shard, which alone takes it on the
-/// batch path; the lock is for the reports and a feeder's arrival and departure.
+/// delivered that it took in (`strikes`). Owned by the ingest worker of the shard, which alone
+/// takes it on the batch path. Its receivers' station counters are the relay's one table
+/// (`Hub::stations`), not the shard's: a shard's receivers are a random draw of the relay's.
 struct RawShard {
     batches: Strikes,
-    stations: Stations,
     /// Its receivers' wanted receptions against their ceiling, by their batches' stamps.
     ceilings: crate::ingest::ReceptionCeilings,
 }
 
 impl RawShard {
     fn new(batches: Strikes, ceilings: crate::ingest::ReceptionCeilings) -> Self {
-        Self {
-            batches,
-            stations: Stations::new(STATIONS_REMEMBERED.div_ceil(SHARDS)),
-            ceilings,
-        }
+        Self { batches, ceilings }
     }
 }
 
@@ -299,7 +406,7 @@ fn site_record(info: &ReceiverInfo, site: Option<ReceiverSite>) -> Option<SiteRe
 }
 
 /// A feeder's own description, as its link last took it: given to the hub again when the hub has
-/// forgotten it and the feeder is publishing (see `RECEIVERS_REMEMBERED`).
+/// forgotten it and the feeder is publishing (see `DESCRIPTION_BYTES_PER_RECEIVER`).
 #[derive(Clone, Debug)]
 pub struct OwnDescription {
     pub info: ReceiverInfo,
@@ -408,6 +515,10 @@ pub struct MemoryReport {
     /// The steps of the judging clock seen (`clock::RelayClock::steps`): each restated to every
     /// feeder session, and nothing ended.
     pub clock_steps: u64,
+    /// What the reads of the judging clock's bound said (`clock::RelayClock::bound_health`): the
+    /// last read's bound or why it judged nothing (ClockBound missing, unreadable, unknown, free
+    /// running, disrupted, or too wide), and every refusal counted by why.
+    pub clock_bound: tally_wire::clock_bound::Health,
     /// New records let go for want of room (`strikes::Verdict::Full`): their deliverer's share of
     /// what is taken full, or its class's store (`strikes::StrikeStores`). Not forwarded and not counted had, so
     /// their group asks for them again.
@@ -430,6 +541,9 @@ pub struct MemoryReport {
     /// room in `Store::Decoded` for its decode. Each is let go from its group, which asks for it
     /// again or rebuilds it again, so this counts attempts: a record let go twice counts twice.
     pub rebuilt_no_room: u64,
+    /// Positions sent on at once, not held for the models they cite, for want of the records'
+    /// store's room (`budget::Store::Records`).
+    pub awaiting_unheld: u64,
     /// What the ingest rate cut, per source and reason (`shed`): every cut a feeder's batch met,
     /// all at ingest, before it was signed or shared.
     pub shed: crate::shed::ShedReport,
@@ -484,11 +598,12 @@ pub struct Inbound {
     pub verify: bool,
     /// Its stamp, when a trace gives one; else the ingest clock's when it is worked on.
     pub stamp: Option<Stamp>,
-    /// The raw monotonic clock as its message came off its link (`link`, read right after the
-    /// message is received, before the link paces or charges its records): what this relay's own
-    /// anchor in it is aged by (`Hub::own_anchor_age`), so neither the relay's own pacing of a
-    /// backlog nor a queue on the way ages it. None for a batch the relay hands in itself, read
-    /// as it is handed in (`Hub::ingest`).
+    /// The raw monotonic clock as its message's bytes reached this relay (`link::Drained`: as it
+    /// was read, or, its bytes already waiting in the socket as the link read it, the last moment
+    /// the link found its socket empty): what this relay's own anchor in it is aged by
+    /// (`Hub::own_anchor_age`), so neither the relay's own pacing of a backlog, nor the time its
+    /// bytes waited unread on it, nor a queue on the way ages it. None for a batch the relay
+    /// hands in itself, read as it is handed in (`Hub::ingest`).
     pub arrived: Option<Raw>,
     /// Its charge in the ingest stage (`ingest::charge_of`), from its connection's allowance or,
     /// handed in by the relay itself, from `Store::Ingest` (`Hub::in_flight_for`): no batch reaches
@@ -536,12 +651,15 @@ pub struct Description {
     pub in_flight: InFlight,
 }
 
-/// One raw shard's receivers described (`exchange::raw_shard`), each with its cell, in the order
-/// they are forgotten, and the bytes of their descriptions: held to a count and to bytes, each a
-/// `SHARDS`th of the relay's. The batch path takes only its receiver's shard, so no lock is shared
-/// by every batch; and the shard's key is one no feeder knows, so filling a shard takes as many
-/// keys as filling the relay.
-struct ReceiverShard {
+/// The receivers described, each with its cell, in the order they are forgotten, and the bytes of
+/// their descriptions: held to a count and to bytes, the relay's, in one order of activity. Not
+/// split into a share for each raw shard: receivers land in shards by a keyed hash, so a shard's
+/// receivers are a random draw, and a shard held to an even share of the figure forgets a receiver
+/// that publishes whenever its draw is above the share, which at a small figure is every batch.
+/// One order forgets only past the figure, which counts every receiver that published within the
+/// gap. The batch path holds its lock for a mark and a copy of two cells, and nothing that checks
+/// a signature or tells another stage holds it (`Hub::keep_info`).
+struct Receivers {
     held: Bounded<PublicKey, Cells>,
     bytes: usize,
     max_bytes: usize,
@@ -556,40 +674,14 @@ pub struct Cells {
     pub public: Option<Region>,
 }
 
-/// The receivers described, sharded by receiver: what the batch path reads (a cell to route by)
-/// and marks (the receiver is publishing), O(1) each under one shard's lock.
-struct Receivers {
-    shards: Box<[Mutex<ReceiverShard>]>,
-}
-
 impl Receivers {
-    /// `shards` shards (`SHARDS` in a relay; a test may hold one), each of `count` receivers and
-    /// `bytes` of descriptions at most.
-    fn new(shards: usize, count: usize, bytes: usize) -> Self {
+    /// Of `count` receivers and `bytes` of descriptions at most.
+    fn new(count: usize, bytes: usize) -> Self {
         Self {
-            shards: (0..shards.max(1))
-                .map(|_| {
-                    Mutex::new(ReceiverShard {
-                        held: Bounded::new(count),
-                        bytes: 0,
-                        max_bytes: bytes,
-                    })
-                })
-                .collect(),
+            held: Bounded::new(count),
+            bytes: 0,
+            max_bytes: bytes,
         }
-    }
-
-    fn shard(&self, receiver: &PublicKey) -> &Mutex<ReceiverShard> {
-        &self.shards[usize::from(raw_shard(receiver).0) % self.shards.len()]
-    }
-
-    /// Receivers held.
-    #[cfg(test)]
-    fn len(&self) -> usize {
-        self.shards
-            .iter()
-            .filter_map(|shard| shard.lock().ok().map(|shard| shard.held.len()))
-            .sum()
     }
 }
 
@@ -597,30 +689,37 @@ impl Receivers {
 /// Which receivers are held, and which is forgotten first, is `Hub::receivers`; this follows it
 /// key for key.
 struct Directory {
-    known: HashMap<PublicKey, Known>,
+    /// Every description held, as many as the receivers hold and one more (they forget as they
+    /// take one past the figure, `Hub::keep_info`): never forgetting of its own.
+    known: Bounded<PublicKey, Known>,
     /// The located receivers by their finest cell's number, so the receivers inside a region are
     /// one range read (`Region::span`): a subscription's answer costs its matches and a lookup a
-    /// region, never a test of every receiver. A cell's keys are a set, so taking one out costs
-    /// its log however many share the cell (every receiver in a dense city shares a public cell).
-    by_point: BTreeMap<u64, BTreeSet<PublicKey>>,
+    /// region, never a test of every receiver. One ordered set of (cell, receiver), so taking one
+    /// out costs its log however many share the cell (every receiver in a dense city shares a
+    /// public cell), and a receiver costs one entry, never a set of its own.
+    by_point: CellIndex,
     /// The described receivers by their public cell, keyed by its first finest descendant's number
     /// (`Region::span`): a client's regions (no finer than a public cell, `Region::clamped_to_public`)
     /// are answered by these and never by `by_point`, so no answer tells a client more than the
     /// public cell.
-    by_public: BTreeMap<u64, BTreeSet<PublicKey>>,
-    /// Sites that came before a description they pair with (`SITES_WAITING`).
+    by_public: CellIndex,
+    /// Sites that came before a description they pair with, as many as the directory holds: each
+    /// is adopted by its receiver's next description, or forgotten.
     waiting_sites: Bounded<PublicKey, HeldSite>,
     bytes: usize,
 }
 
+/// A table sized whole from the budget (`Hub::size_tables`): its store, what it allocates at most
+/// at the figure it was sized to, and what its store charged it for that.
+struct SizedTable {
+    store: Store,
+    planned: usize,
+    charge: crate::budget::Charge,
+}
+
 /// Removes `receiver` from the keys an index holds under `at`.
-fn unindex(index: &mut BTreeMap<u64, BTreeSet<PublicKey>>, at: u64, receiver: &PublicKey) {
-    if let Some(keys) = index.get_mut(&at) {
-        keys.remove(receiver);
-        if keys.is_empty() {
-            index.remove(&at);
-        }
-    }
+fn unindex(index: &mut CellIndex, at: u64, receiver: &PublicKey) {
+    index.remove(&(at, Edge::Key(*receiver)));
 }
 
 /// Where a public cell is keyed in `Directory::by_public`.
@@ -638,14 +737,25 @@ struct Answer {
 }
 
 impl Directory {
-    fn new() -> Self {
+    /// A directory of as many as `held` descriptions and waiting sites.
+    fn new(held: usize) -> Self {
         Self {
-            known: HashMap::new(),
-            by_point: BTreeMap::new(),
-            by_public: BTreeMap::new(),
-            waiting_sites: Bounded::new(SITES_WAITING),
+            known: Bounded::new(held),
+            by_point: CellIndex::new(),
+            by_public: CellIndex::new(),
+            waiting_sites: Bounded::new(held),
             bytes: 0,
         }
+    }
+
+    /// Holds as many as `held` from now (`Hub::size_descriptions`): what the receivers hold and
+    /// one more. The receivers forget past the figure first, so nothing held by them is forgotten
+    /// here.
+    fn set_capacity(&mut self, held: usize) {
+        for (receiver, old) in self.known.set_capacity(held) {
+            self.forget(&receiver, &old);
+        }
+        self.waiting_sites.set_capacity(held);
     }
 
     fn insert(&mut self, receiver: PublicKey, known: Known) {
@@ -655,15 +765,11 @@ impl Directory {
         self.bytes += known.bytes;
         if let Some(cell) = known.cell {
             self.by_point
-                .entry(cell.as_u64())
-                .or_default()
-                .insert(receiver);
+                .insert((cell.as_u64(), Edge::Key(receiver)), ());
         }
         if let Some(public) = known.public {
             self.by_public
-                .entry(public_key_of(public))
-                .or_default()
-                .insert(receiver);
+                .insert((public_key_of(public), Edge::Key(receiver)), ());
         }
         self.known.insert(receiver, known);
     }
@@ -693,31 +799,37 @@ impl Directory {
         Some(old)
     }
 
-    /// Every description, and every site when `sites`.
-    fn all(&self, sites: bool) -> Vec<Item> {
+    /// Every description, and every site when `sites`, stamped `stamp`.
+    fn all(&self, sites: bool, stamp: Mono) -> Vec<Item> {
         self.known
             .values()
-            .flat_map(|known| known.items(sites))
+            .flat_map(|known| known.items(sites, stamp))
             .collect()
     }
 
     /// What an engine's `subscription` covers: its receivers by their sites' finest cells,
     /// descriptions and sites.
-    fn answer(&self, subscription: &Subscription) -> Answer {
-        self.answer_by(subscription, &self.by_point, true)
+    fn answer(&self, subscription: &Subscription, stamp: Mono) -> Answer {
+        self.answer_by(subscription, &self.by_point, true, stamp)
     }
 
     /// What a client's `subscription` covers: its receivers by their public cells, descriptions
     /// only. Never by `by_point`, so no answer tells a client more than the public cell.
-    fn client_answer(&self, subscription: &ClientSubscription) -> Answer {
-        self.answer_by(subscription.as_subscription(), &self.by_public, false)
+    fn client_answer(&self, subscription: &ClientSubscription, stamp: Mono) -> Answer {
+        self.answer_by(
+            subscription.as_subscription(),
+            &self.by_public,
+            false,
+            stamp,
+        )
     }
 
     fn answer_by(
         &self,
         subscription: &Subscription,
-        index: &BTreeMap<u64, BTreeSet<PublicKey>>,
+        index: &CellIndex,
         sites: bool,
+        stamp: Mono,
     ) -> Answer {
         match subscription.described() {
             Described::None => Answer {
@@ -725,7 +837,7 @@ impl Directory {
                 visited: 0,
             },
             Described::All => {
-                let items = self.all(sites);
+                let items = self.all(sites, stamp);
                 let visited = self.known.len();
                 Answer { items, visited }
             }
@@ -733,10 +845,14 @@ impl Directory {
                 let mut items = Vec::new();
                 let mut visited = 0;
                 for span in spans {
-                    for key in index.range(span).flat_map(|(_, keys)| keys) {
+                    let range = (*span.start(), Edge::Low)..=(*span.end(), Edge::High);
+                    for key in index.range(range).filter_map(|((_, edge), ())| match edge {
+                        Edge::Key(key) => Some(key),
+                        Edge::Low | Edge::High => None,
+                    }) {
                         visited += 1;
                         if let Some(known) = self.known.get(key) {
-                            items.extend(known.items(sites));
+                            items.extend(known.items(sites, stamp));
                         }
                     }
                 }
@@ -753,8 +869,11 @@ pub struct Hub {
     queue_bytes: Option<usize>,
     /// The ingest workers and the message exchange (`ingest`, `exchange`).
     stages: Stages,
-    /// Each raw shard's batches taken in and stations, `SHARDS` of them.
+    /// Each raw shard's batches taken in, `SHARDS` of them.
     raw: Box<[Mutex<RawShard>]>,
+    /// Every receiver's station counters, one table at the receiver figure in one order of
+    /// activity (`stations`), taken after a raw shard's lock when both are held, never before.
+    stations: Mutex<Stations>,
     /// The window of time a relay-signed record's signed time must be in to be used
     /// (`strikes::Window::relay_signed`), from the deadlines its groups keep: what a record judged
     /// by no table of its own is held to (`Hub::in_window`).
@@ -768,9 +887,10 @@ pub struct Hub {
     /// (`budget::Plan::strike_entries`).
     shares: Arc<Shares>,
     budget: Budget,
-    /// The raw shards' station rows charged whole, for the hub's life (`stations::charge`,
-    /// `budget::Store::Stations`).
-    stations_charge: Mutex<crate::budget::Charge>,
+    /// The tables sized whole from the budget as it stands (`Hub::size_tables`): the station rows
+    /// and the descriptions at the receiver figure, and the clock model parts at their room, each
+    /// with what its store charged it.
+    sized: Mutex<Vec<SizedTable>>,
     /// Engines' positions taken in, by hash, each judged by its signed `issued_ms`.
     positions: Mutex<Strikes>,
     /// Engines' provisional positions taken in, apart from their final positions.
@@ -796,11 +916,15 @@ pub struct Hub {
     /// on, read back) went round for ever, thousands a second, and every link behind the fan-out
     /// fell behind it.
     passed_on: Mutex<Strikes>,
-    /// The receivers described, each with its cell, in the order they are forgotten, sharded by
-    /// receiver: what the batch path reads (a cell to route by) and marks (the receiver is
-    /// publishing), under its receiver's shard's lock alone.
-    receivers: Receivers,
-    /// Their descriptions. Taken by `publish_info` (then a receiver's shard, in that order) and by
+    /// The receivers described, each with its cell, in the order they are forgotten: what the
+    /// batch path reads (a cell to route by) and marks (the receiver is publishing), O(1) under
+    /// its lock (`Receivers`).
+    receivers: Mutex<Receivers>,
+    /// What each member link told its peer of each receiver it carried a batch of, by the link's
+    /// connection and the receiver, in the order of their last batch: [`TOLD_PER_RECEIVER`] for
+    /// each receiver of the figure (`Hub::to_describe`), charged with the descriptions.
+    told: Mutex<Bounded<(u64, PublicKey), Told>>,
+    /// Their descriptions. Taken by `publish_info` (then the receivers, in that order) and by
     /// a joining subscriber, never by the batch path, so no scan ever stalls a batch.
     directory: Mutex<Directory>,
     next_connection: AtomicU64,
@@ -859,6 +983,9 @@ pub struct Hub {
     between: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// Records rebuilt from parity let go for want of room in `Store::Ingest` (`MemoryReport`).
     rebuilt_no_room: AtomicU64,
+    /// Positions sent on at once, not held for the models they cite, for want of the records'
+    /// room (`AWAITING_MAX`).
+    awaiting_unheld: AtomicU64,
     over_ceiling_receptions: AtomicU64,
     /// The relay-wide ingest rate (`shed`): unbounded until the plan names `R_max`
     /// (`Hub::admitted_rate`).
@@ -880,6 +1007,9 @@ pub struct Hub {
     /// its stages' threads follow the load admitted (`cores`). None for a test's hub, whose
     /// feeders only its memory bounds and whose stages' threads it names.
     cores: Option<usize>,
+    /// Whether it gathers the live and the precise world products (`Hub::gathering_world`): their
+    /// fixes' store is planned only then (`Plan::with_world`).
+    world: (bool, bool),
     /// The time the ingest ceilings read.
     ceiling_clock: crate::ceiling::Clock,
     /// The relay's two clocks (`clock::RelayClock`): the judging clock everything compared across
@@ -1032,16 +1162,26 @@ pub fn source_of(address: IpAddr) -> IpAddr {
 }
 
 impl Hub {
-    /// A hub whose stages run on the caller (`ingest::Stages::inline`), by the system clock, its
-    /// budget `DEFAULT_MEMORY`: what a test builds. A relay is then `staged` onto its threads. Its
-    /// sharing judges deliverers by `deadlines` (a relay's `sharing::Deadlines::RELAY`; a test
-    /// asserting a verdict over real links declares its own, `sharing::member::Deadlines`).
+    /// A hub whose stages run on the caller (`ingest::Stages::inline`), by the host's clocks with
+    /// their bound stated (`RelayClock::host_stated`: no test host runs ClockBound), its budget
+    /// `DEFAULT_MEMORY`: what a test builds. A relay is built `on` the host's own clock
+    /// (`RelayClock::system`) and then `staged` onto its threads. Its sharing judges deliverers by
+    /// `deadlines` (a relay's `sharing::Deadlines::RELAY`; a test asserting a verdict over real
+    /// links declares its own, `sharing::member::Deadlines`).
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "a test's hub: no test host runs ClockBound"
+    )]
     pub fn new(max_subscribers: usize, deadlines: crate::sharing::Deadlines) -> Self {
-        Self::on(max_subscribers, RelayClock::system(), deadlines)
+        Self::on(max_subscribers, RelayClock::host_stated(), deadlines)
     }
 
     /// As `new`, on a clock that reads exactly what `clock` reads (`clock::RelayClock::scripted`):
     /// a test's or a replay's times of its own choosing.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "a test's hub: no test host runs ClockBound"
+    )]
     pub fn clocked(
         max_subscribers: usize,
         clock: crate::clock::Script,
@@ -1065,7 +1205,6 @@ impl Hub {
                 .with_sessions(DEFAULT_MAX_CONNECTIONS, max_subscribers),
         );
         network.charge_to(&budget);
-        let stations_charge = Mutex::new(crate::stations::charge(&budget.gauge(Store::Stations)));
         let window = crate::strikes::relay_signed(deadlines);
         let store = StrikeStores::of(&budget);
         let shares = Shares::new(&store, budget.plan().strike_entries(&budget.admission()));
@@ -1090,10 +1229,12 @@ impl Hub {
                     ))
                 })
                 .collect(),
+            // Sized to the budget's receiver figure as it is planned (`Hub::size_tables`).
+            stations: Mutex::new(Stations::new(1)),
             positions: Mutex::new(table(relay_signed)),
             provisional: Mutex::new(table(relay_signed)),
             clock_models: Mutex::new(table(relay_signed)),
-            parts: Mutex::new(Parts::default()),
+            parts: Mutex::new(Parts::sized(crate::parts::ONE_MODEL_BYTES)),
             awaiting: Mutex::new(VecDeque::new()),
             fault_proofs: Mutex::new(table(Usable::proofs(deadlines))),
             figures: Mutex::new(table(Usable::figures(window))),
@@ -1103,13 +1244,11 @@ impl Hub {
             durable: Durable::Off,
             shares,
             budget,
-            stations_charge,
-            receivers: Receivers::new(
-                SHARDS,
-                RECEIVERS_REMEMBERED.div_ceil(SHARDS),
-                DESCRIPTION_BYTES_HELD.div_ceil(SHARDS),
-            ),
-            directory: Mutex::new(Directory::new()),
+            sized: Mutex::new(Vec::new()),
+            // Sized to the budget's receiver figure as it is planned (`Hub::size_tables`).
+            receivers: Mutex::new(Receivers::new(1, DESCRIPTION_BYTES_PER_RECEIVER)),
+            told: Mutex::new(Bounded::new(TOLD_PER_RECEIVER)),
+            directory: Mutex::new(Directory::new(2)),
             next_connection: AtomicU64::new(RELAY_ITSELF + 1),
             subscribers: Arc::new(AtomicUsize::new(0)),
             max_subscribers,
@@ -1146,6 +1285,7 @@ impl Hub {
             #[cfg(test)]
             between: Mutex::new(None),
             rebuilt_no_room: AtomicU64::new(0),
+            awaiting_unheld: AtomicU64::new(0),
             over_ceiling_receptions: AtomicU64::new(0),
             shedder: crate::shed::Shedder::unbounded(),
             admitted_rate: None,
@@ -1160,6 +1300,7 @@ impl Hub {
             areas: Vec::new(),
             holds_raw: false,
             cores: None,
+            world: (false, false),
             ceiling_clock: crate::ceiling::system_clock(),
             clock,
             leaving: tokio::sync::watch::Sender::new(false),
@@ -1237,8 +1378,11 @@ impl Hub {
             boot_id.wrapping_add(1),
             1,
         ));
+        // The world products it gathers (`Hub::gathering_world`), whichever was built first.
+        self.network.products.set_world(self.world.0);
+        self.network.products.set_world_precise(self.world.1);
         self.network.charge_to(&self.budget);
-        self.charge_stations();
+        self.size_tables();
         self.stages = Stages::inline(clock, self.network.products.sink(), gauges);
         self
     }
@@ -1269,38 +1413,128 @@ impl Hub {
             .set(self.budget.plan().strike_entries(&self.budget.admission()));
         self.fanout = Arc::new(router(&self.budget, self.queue_bytes));
         self.network.charge_to(&self.budget);
-        self.charge_stations();
+        self.size_tables();
         self.inline_restaged().shedder_built()
     }
 
-    /// The station rows charged again to the budget as it now stands, what they were charged
-    /// before given back first, so a budget resized holds them once.
-    fn charge_stations(&self) {
-        let mut held = self
-            .stations_charge
+    /// The tables sized whole from the budget made again for it as it now stands, what they were
+    /// charged before given back first, so a budget resized holds them once: the station rows and
+    /// the descriptions at its receiver figure (`Budget::receivers`), each one table and each
+    /// forgetting the least recently active past it, and the clock model parts at their room
+    /// (`Plan::parts_room`). Each is charged whole what it allocates at most at its figure; a store
+    /// whose limit is below it is charged nothing, and a start refuses it (`Hub::fixed_charged`).
+    fn size_tables(&self) {
+        let mut sized = self
+            .sized
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *held = crate::budget::Charge::none();
-        *held = crate::stations::charge(&self.budget.gauge(Store::Stations));
+        sized.clear();
+        let receivers = self.budget.receivers();
+        self.size_receivers(receivers);
+        let room = self.budget.plan().parts_room();
+        if let Ok(mut parts) = self.parts.lock() {
+            parts.resize(room);
+        }
+        for (store, planned) in [
+            (Store::Stations, crate::stations::planned_bytes(receivers)),
+            (Store::Descriptions, descriptions_planned_bytes(receivers)),
+            (Store::Parts, crate::parts::planned_bytes(room)),
+        ] {
+            let gauge = self.budget.gauge(store);
+            let mut charge = gauge.empty();
+            if gauge.limit() >= planned {
+                let _ = charge.try_grow(planned);
+            }
+            sized.push(SizedTable {
+                store,
+                planned,
+                charge,
+            });
+        }
     }
 
-    /// Whether the stores held whole from the start (the anchor cache, the station rows) are
-    /// charged in full: a relay whose budget cannot hold them refuses to start.
+    /// The station rows and the descriptions held to `receivers`, the receiver figure: each one
+    /// table, forgetting the least recently active past it.
+    pub(crate) fn size_receivers(&self, receivers: usize) {
+        if let Ok(mut stations) = self.stations.lock() {
+            stations.set_capacity(receivers);
+        }
+        let count = described_count(receivers);
+        self.size_descriptions(count, count * DESCRIPTION_BYTES_PER_RECEIVER, count + 1);
+        if let Ok(mut told) = self.told.lock() {
+            told.set_capacity(TOLD_PER_RECEIVER * count);
+        }
+    }
+
+    /// The receivers hold at most `count` descriptions and `bytes` of them, and the directory and
+    /// the waiting sites `held`, each forgetting the least recently active past it, the directory
+    /// what the receivers forget.
+    fn size_descriptions(&self, count: usize, bytes: usize, held: usize) {
+        let Ok(mut directory) = self.directory.lock() else {
+            return;
+        };
+        let Ok(mut receivers) = self.receivers.lock() else {
+            return;
+        };
+        receivers.max_bytes = bytes;
+        let mut forgotten: Vec<PublicKey> = receivers
+            .held
+            .set_capacity(count)
+            .into_iter()
+            .map(|(receiver, _)| receiver)
+            .collect();
+        let mut held_bytes = receivers.bytes;
+        for receiver in &forgotten {
+            held_bytes -= directory.known.get(receiver).map_or(0, |known| known.bytes);
+        }
+        while held_bytes > bytes {
+            let Some(receiver) = receivers.held.forget_first() else {
+                break;
+            };
+            held_bytes -= directory
+                .known
+                .get(&receiver)
+                .map_or(0, |known| known.bytes);
+            forgotten.push(receiver);
+        }
+        receivers.bytes = held_bytes;
+        drop(receivers);
+        for receiver in &forgotten {
+            directory.remove(receiver);
+        }
+        directory.set_capacity(held);
+    }
+
+    /// A test's descriptions: `count` descriptions and `bytes` of them.
+    #[cfg(test)]
+    pub(crate) fn described_as(&mut self, count: usize, bytes: usize) {
+        self.receivers = Mutex::new(Receivers::new(count, bytes));
+        if let Ok(mut directory) = self.directory.lock() {
+            *directory = Directory::new(count + 1);
+        }
+    }
+
+    /// Whether the stores held whole from the start (the anchor cache, the station rows, the
+    /// descriptions, the receivers' areas, the clock model parts) are charged in full: a relay
+    /// whose budget cannot hold them refuses to start.
     pub fn fixed_charged(&self) -> Result<(), String> {
         self.network.fixed_charged()?;
-        let charged = self
-            .stations_charge
+        let sized = self
+            .sized
             .lock()
-            .map_or(0, |charge| charge.bytes());
-        if charged == crate::stations::PLANNED_BYTES {
-            Ok(())
-        } else {
-            Err(format!(
-                "the station rows need {} bytes and their store gave them {charged}: give the \
-                 relay more memory",
-                crate::stations::PLANNED_BYTES
-            ))
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for table in sized.iter() {
+            let charged = table.charge.bytes();
+            if charged != table.planned {
+                return Err(format!(
+                    "the {} need {} bytes and their store gave them {charged}: give the relay \
+                     more memory",
+                    table.store.name(),
+                    table.planned
+                ));
+            }
         }
+        Ok(())
     }
 
     /// Stages run by the caller made again for the budget as it now stands: their fingerprints'
@@ -1350,6 +1584,16 @@ impl Hub {
                     .saturating_add(self.acars_clients),
             )
             .with_cores(self.cores)
+            .with_world(self.world.0, self.world.1)
+    }
+
+    /// Gathers the live (`live`) and the precise (`precise`) world products (`--world`,
+    /// `--world-precise`): the products are told, and the plan holds their fixes' store.
+    pub fn gathering_world(mut self, live: bool, precise: bool) -> Self {
+        self.network.products.set_world(live);
+        self.network.products.set_world_precise(precise);
+        self.world = (live, precise);
+        self.replanned()
     }
 
     /// Runs on `cores` cores (`cores::cores_available`, or what `check` is told): the feeders it
@@ -1445,6 +1689,10 @@ impl Hub {
     pub fn taking(mut self, areas: Vec<Region>) -> Self {
         self.network.selection.set_taken(areas.clone());
         self.network.products.set_taken(areas.clone());
+        // Clock models are held for the tiles of the areas it takes, and no other (`models`).
+        self.network
+            .clock_models
+            .set_areas(&tally_wire::Regions::new(areas.clone()));
         self.areas = areas;
         self.replanned()
     }
@@ -1484,10 +1732,12 @@ impl Hub {
             dumps_resumed: self.dumps_resumed.load(Ordering::Relaxed),
             unreadable_times: self.unreadable_times.load(Ordering::Relaxed),
             clock_steps: self.clock.steps(),
+            clock_bound: self.clock.bound_health(),
             strikes_full: self.strikes_full.load(Ordering::Relaxed),
             ahead_records: self.ahead_records.load(Ordering::Relaxed),
             unanchored_records: self.unanchored_records.load(Ordering::Relaxed),
             rebuilt_no_room: self.rebuilt_no_room.load(Ordering::Relaxed),
+            awaiting_unheld: self.awaiting_unheld.load(Ordering::Relaxed),
             shed: self.shedder.report(),
             handshakes: self.handshake_report(),
         }
@@ -1552,6 +1802,21 @@ impl Hub {
         self.shares.held_by(who)
     }
 
+    /// Hosts `host`, the MLAT this relay runs, on a hub that plans its raw (`Hub::memory(..,
+    /// true)`): its seats, and the room the positions checks hold its own engine's twins in, are
+    /// planned from that, so a hub that plans none would hold none of its own engine's twins and
+    /// send its clients nothing its engine solved. Refused there, the only way to host MLAT.
+    pub fn host_mlat(&self, host: Arc<dyn crate::mlat_host::MlatHost>) -> Result<(), String> {
+        if !self.holds_raw {
+            return Err(
+                "a relay hosting MLAT plans its raw: build its hub with `Hub::memory(.., true)`"
+                    .to_owned(),
+            );
+        }
+        self.network.host_mlat(host);
+        Ok(())
+    }
+
     /// RFC-0174's duties.
     pub fn network(&self) -> &Network {
         &self.network
@@ -1561,19 +1826,37 @@ impl Hub {
     /// fan-out as the relay's own, routed by kind exactly as a peer's would be. Positions, clock
     /// models and their parts go through their own forwarding rules, so a duplicate is still
     /// forwarded once.
+    ///
+    /// The relay's own store of what is taken is never evicted to make room (`strikes`): a record
+    /// of its own making past its room is refused there and counted (`strikes_full`), and goes out
+    /// all the same, unremembered. A copy of it that comes back is then new to it once more, and
+    /// passed on once more: what a full store costs, never a record the relay signed and kept to
+    /// itself, which no member could ever repair, since only it holds it.
     pub fn publish_own(&self, record: Record) {
-        self.publish_as(RELAY_ITSELF, Deliverer::Relay, record);
+        self.publish_from(RELAY_ITSELF, Deliverer::Relay, record, true);
     }
 
-    /// Whether a record passed on by hash (`passed_on`) is new, taken in if so: by its signed time
-    /// `signed_ms` (one whose time cannot be read is outside any window), charged to `who`
-    /// delivered it, so the relay's own share holds only what it made or rebuilt.
-    fn first_time(&self, hash: Hash, signed_ms: Option<u64>, who: Deliverer) -> bool {
-        self.take_passed_on(hash, signed_ms, who, self.judged_now()) == Verdict::New
+    /// Whether a record passed on by hash is to go out: new to `passed_on` (`take_passed_on`), or,
+    /// for a record of the relay's own making (`originated`), refused there for want of room
+    /// (`Verdict::Full`, counted), since a record the relay made is sent whether or not it can be
+    /// remembered (`publish_own`).
+    fn goes_out(
+        &self,
+        hash: Hash,
+        signed_ms: Option<u64>,
+        who: Deliverer,
+        originated: bool,
+    ) -> bool {
+        match self.take_passed_on(hash, signed_ms, who, self.judged_now()) {
+            Verdict::New => true,
+            Verdict::Full => originated,
+            _ => false,
+        }
     }
 
     /// What a record passed on by hash is to `passed_on`, taken in if new and counted
-    /// (`first_time`): what a peer's regional batch is judged by before the products use it
+    /// (`goes_out`): by its signed time `signed_ms`, charged to `who` delivered it, so the relay's
+    /// own share holds only what it made or rebuilt. What a peer's regional batch is judged by before the products use it
     /// (`Network::take_regional`), so the lease covers it before it is used. One whose time cannot
     /// be read is late.
     pub(crate) fn take_passed_on(
@@ -1607,7 +1890,7 @@ impl Hub {
             cell,
             points: None,
             decoded: None,
-            stamp_ms: self.clock.mono().ms(),
+            stamp: self.clock.mono(),
             client: None,
         });
     }
@@ -1640,6 +1923,11 @@ impl Hub {
     /// never sent back down that connection, and what is taken of it charged to `who`'s share
     /// (`strikes::Shares`).
     pub fn publish_as(&self, source: u64, who: Deliverer, record: Record) {
+        self.publish_from(source, who, record, false);
+    }
+
+    /// As `publish_as`, of the relay's own making when `originated` (`publish_own`).
+    fn publish_from(&self, source: u64, who: Deliverer, record: Record, originated: bool) {
         match record {
             Record::Positions(positions) => {
                 if positions.engine().is_ok() {
@@ -1679,8 +1967,10 @@ impl Hub {
                 let verdict = self.figures.lock().map_or(Verdict::Full, |mut taken| {
                     taken.take(&figures.hash(), issued_ms, now, who)
                 });
-                if self.counted(verdict) != Verdict::New {
-                    return;
+                match self.counted(verdict) {
+                    Verdict::New => {}
+                    Verdict::Full if originated => {}
+                    _ => return,
                 }
                 let area = content.and_then(|content| content.area);
                 self.fanout.publish(Item {
@@ -1689,12 +1979,12 @@ impl Hub {
                     cell: area,
                     points: None,
                     decoded: None,
-                    stamp_ms: self.clock.mono().ms(),
+                    stamp: self.clock.mono(),
                     client: None,
                 });
             }
             Record::ClientRegionalBatch(regional) => {
-                if !self.first_time(regional.hash(), regional.wall_ms().ok(), who) {
+                if !self.goes_out(regional.hash(), regional.wall_ms().ok(), who, originated) {
                     return;
                 }
                 let cell = regional.content().ok().map(|content| content.cell);
@@ -1704,7 +1994,7 @@ impl Hub {
                     cell,
                     points: None,
                     decoded: None,
-                    stamp_ms: self.clock.mono().ms(),
+                    stamp: self.clock.mono(),
                     client: None,
                 });
             }
@@ -1713,7 +2003,7 @@ impl Hub {
                 let signed_ms = content
                     .as_ref()
                     .map(|content| content.second.saturating_mul(1000));
-                if !self.first_time(index.hash(), signed_ms, who) {
+                if !self.goes_out(index.hash(), signed_ms, who, originated) {
                     return;
                 }
                 let cell = content.map(|content| content.parent);
@@ -1723,12 +2013,12 @@ impl Hub {
                     cell,
                     points: None,
                     decoded: None,
-                    stamp_ms: self.clock.mono().ms(),
+                    stamp: self.clock.mono(),
                     client: None,
                 });
             }
             Record::RegionalBatch(regional) => {
-                if !self.first_time(regional.hash(), regional.wall_ms().ok(), who) {
+                if !self.goes_out(regional.hash(), regional.wall_ms().ok(), who, originated) {
                     return;
                 }
                 let cell = regional.content().ok().map(|content| content.cell);
@@ -1738,7 +2028,7 @@ impl Hub {
                     cell,
                     points: None,
                     decoded: None,
-                    stamp_ms: self.clock.mono().ms(),
+                    stamp: self.clock.mono(),
                     client: None,
                 });
             }
@@ -1749,7 +2039,7 @@ impl Hub {
                     cell: None,
                     points: None,
                     decoded: None,
-                    stamp_ms: self.clock.mono().ms(),
+                    stamp: self.clock.mono(),
                     client: None,
                 });
             }
@@ -1998,7 +2288,7 @@ impl Hub {
         let Ok(receiver) = inbound.batch.receiver() else {
             return false;
         };
-        // Its raw monotonic clock as it came off its link (`Inbound::arrived`), or as it is handed
+        // Its raw monotonic clock as it reached this relay (`Inbound::arrived`), or as it is handed
         // in here, before any queue: what this relay's own anchor in it is aged by
         // (`own_anchor_age`), so waiting for a worker never ages it.
         let arrived = inbound.arrived.unwrap_or_else(|| self.clock.raw());
@@ -2172,14 +2462,13 @@ impl Hub {
         &self,
         blame: crate::strikes::Blame,
         origin: &Origin,
-        shard: &Mutex<RawShard>,
         receiver: PublicKey,
         stamp: Mono,
     ) {
         if matches!(origin, Origin::Feeder(..))
-            && let Ok(mut shard) = shard.lock()
+            && let Ok(mut stations) = self.stations.lock()
         {
-            shard.stations.too_old(blame, receiver, stamp);
+            stations.too_old(blame, receiver, stamp);
         }
     }
 
@@ -2204,23 +2493,21 @@ impl Hub {
         )
     }
 
-    /// How long before it arrived (`arrived`, its raw monotonic reading as it was read off its
-    /// link, before any pacing or queueing on the way here ages it), by its raw monotonic
-    /// clock, this relay issued its own anchor in a feeder's batch, when the batch carries one that verifies and this relay still remembers issuing it
-    /// (`anchors::Anchors::issued_by`, which never overstates it): what blame is reckoned by where the batch is published
-    /// (`strikes::blame`). This relay signed it and timed it on a clock no daemon slews
-    /// or steps, so the age is the batch's own, whatever its judging clock did meanwhile. The
-    /// youngest, should it carry two. Unknowable while this relay has not run long enough to
-    /// remember every own anchor an honest batch may carry (a restart: `Anchors::remembers`).
+    /// How long before it arrived (`arrived`, its raw monotonic reading as it reached this relay's
+    /// process: `link::Drained`, never later than its bytes came off the socket, before any pacing
+    /// or queueing on the way here ages it), by its raw monotonic clock, this relay issued its own
+    /// anchor in a feeder's batch, when the batch carries one that verifies
+    /// (`anchors::Anchors::issued_by`, which never overstates it, an anchor the ring let go or an
+    /// earlier run's included): what blame is reckoned by where the batch is published
+    /// (`strikes::blame`). This relay signed it and timed it on a clock no daemon slews or steps,
+    /// so the age is the batch's own, whatever its judging clock did meanwhile. The youngest,
+    /// should it carry two. Absent, and so never blamed, when it carries none, or this relay has
+    /// no key (it issues no anchor, in this run or any) or has issued none this run.
     fn own_anchor_age(&self, batch: &Batch, arrived: Raw) -> crate::strikes::OwnAnchor {
         use crate::strikes::OwnAnchor;
-        // A relay with no key issues no anchor, in this run or any.
         let Some(own) = self.network.signer().map(crate::signer::Signer::public) else {
             return OwnAnchor::Absent;
         };
-        if !self.network.anchors.remembers(arrived) {
-            return OwnAnchor::Unknowable;
-        }
         batch
             .anchors()
             .ok()
@@ -2276,23 +2563,24 @@ impl Hub {
     /// A new record let go for want of room ([`Verdict::Full`]): counted (`strikes_full`), and
     /// never taken in (forwarded, remembered) nor held in its group, which so does not count it as
     /// had and asks for it again; but a member that delivered it is credited for it, as for a late
-    /// copy (`no_room`). One rebuilt from parity is let go from its group, not refused.
-    fn not_taken(&self, origin: &Origin, record: &Record) {
+    /// copy (`no_room`), by the clocks it arrived at (`now`). One rebuilt from parity is let go
+    /// from its group, not refused.
+    fn not_taken(&self, origin: &Origin, record: &Record, now: Now) {
         self.counted(Verdict::Full);
         match origin {
             Origin::Rebuilt(rebuilt) => self.network.sharing.let_go(*rebuilt),
-            Origin::Peer(asker) => self.no_room(Deliverer::Peer(asker.key), record),
+            Origin::Peer(asker) => self.no_room(Deliverer::Peer(asker.key), record, now),
             Origin::Feeder(..) | Origin::Elsewhere => {}
         }
     }
 
     /// A record `who` delivered that this relay had no room to take in: a peer is credited for it
     /// in its group (`Network::no_room_from_peer`), so this relay's want of room never reports an
-    /// honest member short (RFC-0174 §2.5). Nothing else delivers into a group.
-    fn no_room(&self, who: Deliverer, record: &Record) {
+    /// honest member short (RFC-0174 §2.5). Nothing else delivers into a group. By the clocks
+    /// it arrived at (`now`, its stamp's): the group's schedule runs on `M` as its stamps do.
+    fn no_room(&self, who: Deliverer, record: &Record, now: Now) {
         if let Deliverer::Peer(key) = who {
-            self.network
-                .no_room_from_peer(self, key, record, self.stamp_now());
+            self.network.no_room_from_peer(self, key, record, now);
         }
     }
 
@@ -2538,14 +2826,12 @@ impl Hub {
                 shard
                     .batches
                     .judge_batch(&hash, signed_ms, crate::strikes::Now::from(stamp), who);
+            // The station rows' lock after the shard's, as everywhere both are held.
             let first = feeder
                 && judged != Verdict::Duplicate
-                && shard.stations.first_judged(
-                    receiver,
-                    batch.boot_id(),
-                    batch.sequence(),
-                    stamp.mono(),
-                );
+                && self.stations.lock().is_ok_and(|mut stations| {
+                    stations.first_judged(receiver, batch.boot_id(), batch.sequence(), stamp.mono())
+                });
             (judged, first)
         });
         if judged == Verdict::Duplicate {
@@ -2598,21 +2884,29 @@ impl Hub {
         let stale = anchoring == crate::anchors::Anchoring::Stale;
         let unjudged = unjudged || ahead || judged == Verdict::Unjudged;
         let late = too_old || stale || unjudged || unanchored || judged == Verdict::Late;
-        if late {
-            // Its receiver's ceiling holds a feeder's batch it may not use as it holds one it
-            // may: never decoded, so charged every reception it carries, the most it can want.
-            if feeder
-                && !self.within_ceiling(
-                    shard,
-                    receiver,
-                    cost.receptions,
-                    stamp.mono_ms(),
-                    unit,
-                    cost,
-                )
-            {
+        if !late && judged == Verdict::Full {
+            self.not_taken(&origin, &Record::Batch(batch), Now::from(stamp));
+            return false;
+        }
+        // A feeder's batch that would take its receiver past its wanted receptions a second is
+        // dropped here, counted, never waited for on its read loop: the feeder was told the
+        // ceiling and sheds to it before it signs, so only one that predates it, or one that
+        // ignores it, meets this. Its wanted receptions read from its signed bytes, with no
+        // decode (`Batch::wanted_receptions`), so a batch it may not use (too old, unjudged,
+        // unanchored, late) is charged exactly as one it may: whether a batch is kept never
+        // depends on this relay's clock. One whose bytes do not hold the receptions they state is
+        // charged every reception it states, the most it can want. By the batch's stamp, on the
+        // worker that owns the receiver's shard, so the same stamped batches are kept alike on
+        // any threads.
+        if feeder {
+            let wanted = batch
+                .wanted_receptions()
+                .map_or(cost.receptions, |wanted| wanted as u64);
+            if !self.within_ceiling(shard, receiver, wanted, stamp.mono_ms(), unit, cost) {
                 return false;
             }
+        }
+        if late {
             if ahead {
                 self.ahead_records.fetch_add(1, Ordering::Relaxed);
             }
@@ -2622,14 +2916,10 @@ impl Hub {
                 self.unjudged(&origin, &Record::Batch(batch), Now::from(stamp));
             } else {
                 if let Some(blame) = blamed {
-                    self.late_from_feeder(blame, &origin, shard, receiver, stamp.mono());
+                    self.late_from_feeder(blame, &origin, receiver, stamp.mono());
                 }
                 self.late(&origin, &Record::Batch(batch), Now::from(stamp));
             }
-            return false;
-        }
-        if judged == Verdict::Full {
-            self.not_taken(&origin, &Record::Batch(batch));
             return false;
         }
         #[cfg(test)]
@@ -2691,20 +2981,6 @@ impl Hub {
                 return false;
             }
         };
-        // A feeder's batch that would take its receiver past its wanted receptions a second is
-        // dropped here, counted, never waited for on its read loop: the feeder
-        // was told the ceiling and sheds to it before it signs, so only one that predates it, or
-        // one that ignores it, meets this. By the batch's stamp, on the worker that owns the
-        // receiver's shard, so the same stamped batches are kept alike on any threads.
-        if let (Origin::Feeder(..), Some(decoded)) = (&origin, &decoded) {
-            let wanted = decoded
-                .views()
-                .filter(|view| tally_wire::modes::wanted_reception(view.format, view.data))
-                .count();
-            if !self.within_ceiling(shard, receiver, wanted as u64, stamp.mono_ms(), unit, cost) {
-                return false;
-            }
-        }
         // Kept: remembered now, in the same step as the receiver's pace was taken from, charged
         // to whoever delivered it. Judged again as it is remembered, and that verdict followed:
         // another copy may have been taken since it was first asked, or the clock moved on.
@@ -2739,7 +3015,7 @@ impl Hub {
                 return false;
             }
             Verdict::Full => {
-                self.not_taken(&origin, &Record::Batch(batch));
+                self.not_taken(&origin, &Record::Batch(batch), Now::from(stamp));
                 return false;
             }
         }
@@ -2751,8 +3027,8 @@ impl Hub {
                 .filter(|observation| tally_wire::batch::format::in_products(observation.format))
                 .count() as u64
         });
-        if let Ok(mut shard) = shard.lock() {
-            shard.stations.forwarded(
+        if let Ok(mut stations) = self.stations.lock() {
+            stations.forwarded(
                 receiver,
                 batch.boot_id(),
                 batch.sequence(),
@@ -2760,11 +3036,11 @@ impl Hub {
                 stamp.mono(),
             );
             if let Origin::Feeder(_, _, address) = &origin {
-                shard.stations.fed_by(&receiver, source, *address);
+                stations.fed_by(&receiver, source, *address);
             }
         }
         // The receiver is publishing, so its description is the last to be forgotten: one lock,
-        // its shard's, for the mark and the cell to route by.
+        // the receivers', for the mark and the cell to route by.
         let mut described = self.publishing(&receiver);
         // A feeder's description pushed out while it was not yet publishing comes back now that
         // it is, as one that is, before the batch: a subscriber is told who a receiver is first.
@@ -2810,7 +3086,7 @@ impl Hub {
             cell,
             points: None,
             decoded,
-            stamp_ms: stamp.mono_ms(),
+            stamp: stamp.mono(),
             client: None,
         });
         true
@@ -2851,7 +3127,7 @@ impl Hub {
             && self
                 .network
                 .credit
-                .corroborated_receiver(receiver, self.now())
+                .corroborated_receiver(receiver, self.stamp_now())
         {
             shed::Unit::Corroborated(*receiver)
         } else {
@@ -2876,25 +3152,23 @@ impl Hub {
     /// `address`: it is reported connected until it leaves (`left`), whether or not it sends a
     /// batch.
     pub fn opened(&self, receiver: &PublicKey, source: u64, address: Option<IpAddr>) {
-        if let Ok(mut shard) = self.raw[usize::from(raw_shard(receiver).0)].lock() {
-            shard
-                .stations
-                .opened(*receiver, source, self.clock.mono(), address);
+        if let Ok(mut stations) = self.stations.lock() {
+            stations.opened(*receiver, source, self.clock.mono(), address);
         }
     }
 
     /// Connection `source`, a feeder publishing as `receiver` from `address`, had a new batch
     /// forwarded.
     pub fn fed_by(&self, receiver: &PublicKey, source: u64, address: Option<IpAddr>) {
-        if let Ok(mut shard) = self.raw[usize::from(raw_shard(receiver).0)].lock() {
-            shard.stations.fed_by(receiver, source, address);
+        if let Ok(mut stations) = self.stations.lock() {
+            stations.fed_by(receiver, source, address);
         }
     }
 
     /// Connection `source` of a feeder publishing as `receiver` ended.
     pub fn left(&self, receiver: &PublicKey, source: u64) {
-        if let Ok(mut shard) = self.raw[usize::from(raw_shard(receiver).0)].lock() {
-            shard.stations.left(receiver, source);
+        if let Ok(mut stations) = self.stations.lock() {
+            stations.left(receiver, source);
         }
     }
 
@@ -2903,12 +3177,10 @@ impl Hub {
     /// on the judging clock read with it (`Stations::report`), the Unix time the report serves.
     pub fn stations(&self) -> StationsReport {
         let now = self.clock.read();
-        let mut reports: Vec<(PublicKey, StationReport)> = self
-            .raw
-            .iter()
-            .filter_map(|shard| shard.lock().ok().map(|shard| shard.stations.reports(now)))
-            .flatten()
-            .collect();
+        // Copied under the rows' lock, which every batch takes, and stated after it is let go.
+        let rows = self.stations.lock().ok().map(|stations| stations.rows());
+        let mut reports: Vec<(PublicKey, StationReport)> =
+            rows.map(|rows| rows.reports(now)).unwrap_or_default();
         reports.sort_by_key(|(key, _)| *key);
         let stations = match self.directory.lock() {
             Ok(directory) => reports
@@ -2925,10 +3197,10 @@ impl Hub {
 
     /// One receiver's report, or `None` when the relay holds none for it.
     pub fn station(&self, receiver: &PublicKey) -> Option<StationReport> {
-        let report = self.raw[usize::from(raw_shard(receiver).0)]
+        let report = self
+            .stations
             .lock()
             .ok()?
-            .stations
             .report(receiver, self.clock.read())?;
         let directory = self.directory.lock().ok()?;
         Some(described(report, directory.known.get(receiver)))
@@ -2959,6 +3231,39 @@ impl Hub {
             .collect()
     }
 
+    /// Whether member link `source` describes `receiver` (as issued at `issued_ms`, the newest
+    /// this relay holds) before the batch of it it sends now, and the batch noted as sent. Yes
+    /// when the link never told it, when it told an older description, and when its last batch
+    /// of it on this link is older than the gap (`budget::RECEIVER_GAP`): the peer holds a
+    /// receiver's description only while a batch of it came within the gap (its receiver figure,
+    /// `Receivers`), so one this link last carried longer ago may be forgotten there, and its
+    /// batches would reach the peer's whole-world subscribers alone, routed to no region, until
+    /// its feeder's next description (ten minutes). Its batches since have kept it there, so
+    /// within the gap it is not described again.
+    pub fn to_describe(&self, source: u64, receiver: PublicKey, issued_ms: u64) -> bool {
+        let now = self.clock.mono();
+        let Ok(mut told) = self.told.lock() else {
+            return true;
+        };
+        let key = (source, receiver);
+        let held = told.get(&key).copied();
+        let describe = held.is_none_or(|held| {
+            held.issued_ms < issued_ms || now.passed(crate::budget::RECEIVER_GAP.after(held.batch))
+        });
+        let issued_ms = match held {
+            Some(held) if !describe => held.issued_ms,
+            _ => issued_ms,
+        };
+        told.insert_active(
+            key,
+            Told {
+                issued_ms,
+                batch: now,
+            },
+        );
+        describe
+    }
+
     /// What the relay holds of `receiver` for a relay to read before its batches: its newest
     /// description and the site paired with it, and the newest time either was issued. Relay-only:
     /// a link's type keeps the site off any link that does not carry sites (`outbound`).
@@ -2985,17 +3290,16 @@ impl Hub {
     /// Whether the relay holds a description of `receiver`.
     pub fn describes(&self, receiver: &PublicKey) -> bool {
         self.receivers
-            .shard(receiver)
             .lock()
-            .is_ok_and(|shard| shard.held.get(receiver).is_some())
+            .is_ok_and(|receivers| receivers.held.get(receiver).is_some())
     }
 
-    /// `receiver` is publishing: marked so in its shard, and its cell, `None` when it is not
+    /// `receiver` is publishing: marked so in the receivers, and its cell, `None` when it is not
     /// described.
     fn publishing(&self, receiver: &PublicKey) -> Option<Cells> {
-        let mut shard = self.receivers.shard(receiver).lock().ok()?;
-        shard.held.touch(receiver);
-        shard.held.get(receiver).copied()
+        let mut receivers = self.receivers.lock().ok()?;
+        receivers.held.touch(receiver);
+        receivers.held.get(receiver).copied()
     }
 
     /// Keeps a verified receiver description if it is the newest for its key, and forwards it,
@@ -3145,17 +3449,14 @@ impl Hub {
         if site.is_some() {
             directory.waiting_sites.remove(&receiver);
         }
-        let Ok(mut shard) = self.receivers.shard(&receiver).lock() else {
-            return None;
-        };
         // Projected once, here; every region test after is integer work.
         let cell = place.and_then(|place| Region::point(&place).ok());
-        let bytes = info.as_bytes().len() + site.as_ref().map_or(0, HeldSite::bytes);
         let software = match info.description() {
             Ok(tally_wire::Description::Site(content)) => Some(content.software),
             Ok(tally_wire::Description::Public(content)) => Some(content.software),
             Err(_) => None,
         };
+        let bytes = Known::bytes_of(&info, software.as_ref(), site.as_ref());
         let site_record = site.as_ref().map(|site| Arc::clone(&site.record));
         let paired = site.as_ref().and_then(|site| match &*site.record {
             Record::ReceiverSite(site) => Some(site.clone()),
@@ -3168,6 +3469,12 @@ impl Hub {
             self.judged_now(),
         );
         let record = Arc::new(Record::ReceiverInfo(info));
+        // The receivers' lock, which every batch takes, only now: what was told above checks
+        // signatures, and none of it is the receivers'. The directory's lock, held since the
+        // start, keeps every other description of the receiver out meanwhile.
+        let Ok(mut shard) = self.receivers.lock() else {
+            return None;
+        };
         let replaced = directory
             .known
             .get(&receiver)
@@ -3196,7 +3503,7 @@ impl Hub {
             shard.held.insert(receiver, cells)
         };
         // What the shard forgets, the directory forgets with it, and its bytes.
-        let mut forget = |shard: &mut ReceiverShard, forgotten: &PublicKey| {
+        let mut forget = |shard: &mut Receivers, forgotten: &PublicKey| {
             let bytes = directory
                 .known
                 .get(forgotten)
@@ -3226,7 +3533,7 @@ impl Hub {
                 cell,
                 points: None,
                 decoded: None,
-                stamp_ms: self.clock.mono().ms(),
+                stamp: self.clock.mono(),
                 client: None,
             });
         }
@@ -3295,12 +3602,12 @@ impl Hub {
         let Some(mut known) = directory.take(&receiver) else {
             return false;
         };
-        let Ok(mut shard) = self.receivers.shard(&receiver).lock() else {
+        let Ok(mut shard) = self.receivers.lock() else {
             directory.insert(receiver, known);
             return false;
         };
         let before = known.bytes;
-        known.bytes = info.as_bytes().len() + held.bytes();
+        known.bytes = Known::bytes_of(&info, known.software.as_ref(), Some(&held));
         known.place = Some(held.location);
         known.cell = Region::point(&held.location).ok();
         let record = Arc::clone(&held.record);
@@ -3332,7 +3639,7 @@ impl Hub {
             cell,
             points: None,
             decoded: None,
-            stamp_ms: self.clock.mono().ms(),
+            stamp: self.clock.mono(),
             client: None,
         });
         true
@@ -3402,7 +3709,7 @@ impl Hub {
         // (`no_room`).
         match (self.counted(verdict), intake) {
             (Verdict::Full, Some(intake)) => {
-                self.no_room(who, record);
+                self.no_room(who, record, Now::from(self.stamp_now()));
                 (intake.let_go)();
             }
             (
@@ -3449,17 +3756,28 @@ impl Hub {
             };
             if missing.is_empty() && self.checkable(&record) {
                 Some(record)
-            } else {
+            } else if let Some(charge) = self
+                .budget
+                .gauge(Store::Records)
+                .try_charge(Awaiting::bytes_of(&record, &missing))
+            {
                 if awaiting.len() >= AWAITING_MAX {
                     evicted = awaiting.pop_front();
                 }
+                let mut missing = missing;
+                missing.shrink_to_fit();
                 awaiting.push_back(Awaiting {
                     source,
                     record,
                     missing,
                     since: Instant::now(),
+                    _charge: charge,
                 });
                 None
+            } else {
+                // No room to wait: out now, as it would go once it waited its time.
+                self.awaiting_unheld.fetch_add(1, Ordering::Relaxed);
+                Some(record)
             }
         };
         if let Some(oldest) = evicted {
@@ -3475,25 +3793,38 @@ impl Hub {
     /// `forwarded`, a model that just went out, struck off every one that cites it first. Each
     /// held one is a few comparisons, never a look in the table.
     pub fn release_awaiting(&self, forwarded: Option<Hash>) {
-        let ready: Vec<Awaiting> = {
-            let Ok(mut awaiting) = self.awaiting.lock() else {
-                return;
-            };
-            if let Some(id) = forwarded {
-                for one in awaiting.iter_mut() {
-                    one.missing.retain(|missing| *missing != id);
+        let mut forwarded = forwarded;
+        loop {
+            let ready: Vec<Awaiting> = {
+                let Ok(mut awaiting) = self.awaiting.lock() else {
+                    return;
+                };
+                if let Some(id) = forwarded.take() {
+                    for one in awaiting.iter_mut() {
+                        one.missing.retain(|missing| *missing != id);
+                    }
                 }
+                let (ready, held): (VecDeque<Awaiting>, VecDeque<Awaiting>) =
+                    awaiting.drain(..).partition(|one| {
+                        one.since.elapsed() >= AWAITING_MS
+                            || (one.missing.is_empty() && self.checkable(&one.record))
+                    });
+                *awaiting = held;
+                ready.into_iter().collect()
+            };
+            // A raw record sent holds its twins (`hold_twins`): a client's form held beside it
+            // may be checkable now, so the rest are looked at again.
+            let raw = ready.iter().any(|one| {
+                matches!(&one.record,
+                    Record::Positions(positions) | Record::Provisional(positions)
+                        if !positions.is_tagged())
+            });
+            for one in ready {
+                self.send_positions(one.source, one.record);
             }
-            let (ready, held): (VecDeque<Awaiting>, VecDeque<Awaiting>) =
-                awaiting.drain(..).partition(|one| {
-                    one.since.elapsed() >= AWAITING_MS
-                        || (one.missing.is_empty() && self.checkable(&one.record))
-                });
-            *awaiting = held;
-            ready.into_iter().collect()
-        };
-        for one in ready {
-            self.send_positions(one.source, one.record);
+            if !raw {
+                return;
+            }
         }
     }
 
@@ -3513,8 +3844,20 @@ impl Hub {
     /// what a client is sent; one that fails is sent to no one; one that could not be checked is
     /// passed on to relays, who check it for their own clients, and to no client. The only place
     /// a client's positions are made (`outbound::client_form` makes none).
+    ///
+    /// Standing takes raw positions here, as they go out: by now every model they cite that came
+    /// went out before them and is held (`Network::admit_model`), or they waited their longest and
+    /// go without it (`Standing::positions` counts them unmodelled).
     fn send_positions(&self, source: u64, record: Record) {
         let points = crate::network::points_of(&record);
+        if let Record::Positions(positions) | Record::Provisional(positions) = &record
+            && !positions.is_tagged()
+        {
+            self.network
+                .standing
+                .positions(positions, self.judged_now().judged());
+            self.hold_twins(positions, source);
+        }
         let client = match &record {
             Record::Positions(positions) | Record::Provisional(positions)
                 if positions.is_tagged() =>
@@ -3541,9 +3884,34 @@ impl Hub {
             cell: None,
             points,
             decoded: None,
-            stamp_ms: self.clock.mono().ms(),
+            stamp: self.clock.mono(),
             client,
         });
+    }
+
+    /// A raw positions record going out, from session `source`: each solution the checks may need
+    /// for a client held for its tagged twin (`consistency`), as it goes out after the models it
+    /// cites: one whose place some client's subscription covers (`fanout::Router::clients_at`), of
+    /// the relay's own engine's room when its own key signed it, else the members'.
+    fn hold_twins(&self, positions: &Positions, source: u64) {
+        let own = self.network.signer().map(tally_wire::Signer::public);
+        let class = if own.is_some() && positions.engine().ok() == own {
+            crate::consistency::Class::Own
+        } else {
+            crate::consistency::Class::Members
+        };
+        let fanout = &self.fanout;
+        self.network
+            .consistency
+            .raw(positions, (source, class), self.clock.mono(), |solution| {
+                Region::point(&tally_wire::Location {
+                    lat_e7: solution.lat_e7,
+                    lon_e7: solution.lon_e7,
+                    alt_m: 0,
+                    precision_m: 0,
+                })
+                .is_ok_and(|point| fanout.clients_at(&[point]))
+            });
     }
 
     /// Forwards verified provisional positions if they are new, as `publish_positions` does final
@@ -3614,6 +3982,20 @@ impl Hub {
                 .lock()
                 .map(|mut parts| parts.manifest(model.id(), hashes, Instant::now()))
                 .unwrap_or_default();
+            // Its listed parts, checked by it now, held with it for the member links that carry
+            // it (`Network::hold_part`), whichever path brought them.
+            self.network.hold_model(&model);
+            for (_, part) in &ready {
+                self.network.hold_part(part);
+            }
+            // Whole here, its listed parts with it: held once in the relay's store of decoded
+            // models (`models`), before anything citing it is released. One whose parts are still
+            // to come is held when its last one goes out (`publish_clock_model_part`).
+            let listed: Vec<ClockModelPart> = ready.iter().map(|(_, part)| part.clone()).collect();
+            let _ = self
+                .network
+                .admit_model(&model, &listed, self.judged_now().judged());
+            drop(listed);
             for (from, part) in ready {
                 self.fanout.publish(Item {
                     source: from,
@@ -3621,7 +4003,7 @@ impl Hub {
                     cell: None,
                     points: None,
                     decoded: None,
-                    stamp_ms: self.clock.mono().ms(),
+                    stamp: self.clock.mono(),
                     client: None,
                 });
             }
@@ -3635,7 +4017,7 @@ impl Hub {
                 cell: None,
                 points,
                 decoded: None,
-                stamp_ms: self.clock.mono().ms(),
+                stamp: self.clock.mono(),
                 client: None,
             });
             // Positions held for this model go out after it.
@@ -3688,7 +4070,7 @@ impl Hub {
             cell: None,
             points,
             decoded: None,
-            stamp_ms: self.clock.mono().ms(),
+            stamp: self.clock.mono(),
             client: None,
         });
         // Tagged positions citing its model may now go.
@@ -3707,20 +4089,28 @@ impl Hub {
         let Some(part) = forward else {
             return false;
         };
-        self.network.on_clock_model(
-            &Record::ClockModelPart(part.clone()),
-            source,
-            self.stamp_now(),
-        );
+        // Checked by its manifest now: held with it, and the model held whole in the store of
+        // decoded models once this was the last part it lacked (`Network::admit_held`); what
+        // waits to be checked against it may go then.
+        self.network.hold_part(&part);
+        let id = part.model().ok();
         self.fanout.publish(Item {
             source,
             record: Arc::new(Record::ClockModelPart(part)),
             cell: None,
             points: None,
             decoded: None,
-            stamp_ms: self.clock.mono().ms(),
+            stamp: self.clock.mono(),
             client: None,
         });
+        if let Some(id) = id
+            && self
+                .network
+                .admit_held(&id, self.judged_now().judged())
+                .is_some()
+        {
+            self.release_awaiting(None);
+        }
         true
     }
 
@@ -3759,7 +4149,7 @@ impl Hub {
                 cell: None,
                 points: None,
                 decoded: None,
-                stamp_ms: self.clock.mono().ms(),
+                stamp: self.clock.mono(),
                 client: None,
             });
         }
@@ -3801,7 +4191,7 @@ impl Hub {
     pub fn peer(&self) -> Vec<Item> {
         self.directory
             .lock()
-            .map(|directory| directory.all(true))
+            .map(|directory| directory.all(true, self.clock.mono()))
             .unwrap_or_default()
     }
 
@@ -4170,10 +4560,14 @@ impl Hub {
         let mut items = self
             .directory
             .lock()
-            .map(|directory| directory.client_answer(subscription).items)
+            .map(|directory| {
+                directory
+                    .client_answer(subscription, self.clock.mono())
+                    .items
+            })
             .unwrap_or_default();
-        // Aged on the fan-out by the monotonic clock, as every item is (`Item::stamp_ms`).
-        let stamp_ms = self.clock.mono().ms();
+        // Aged on the fan-out by the monotonic clock, as every item is (`Item::stamp`).
+        let stamp = self.clock.mono();
         items.extend(self.network.figures.latest().iter().map(|figures| {
             let area = figures.content().ok().and_then(|content| content.area);
             Item {
@@ -4182,7 +4576,7 @@ impl Hub {
                 cell: area,
                 points: None,
                 decoded: None,
-                stamp_ms,
+                stamp,
                 client: None,
             }
         }));
@@ -4203,7 +4597,7 @@ impl Hub {
     fn answer(&self, subscription: &Subscription) -> Answer {
         self.directory
             .lock()
-            .map(|directory| directory.answer(subscription))
+            .map(|directory| directory.answer(subscription, self.clock.mono()))
             .unwrap_or(Answer {
                 items: Vec::new(),
                 visited: 0,
@@ -4263,6 +4657,11 @@ mod tests {
     use tally_wire::clocks::recorded::judged;
     use tally_wire::{BatchContent, Clock, Identity, Observation};
 
+    /// A test's descriptions held: one shard of 50,000, the most a relay's figure held once.
+    const RECEIVERS_REMEMBERED: usize = 50_000;
+    /// A test's descriptions' bytes: an honest description many times over for each of them.
+    const DESCRIPTION_BYTES_HELD: usize = 64 * 1024 * 1024;
+
     /// A bundle index a peer sent is passed on once, however often it comes back: three relays
     /// once passed one round a loop of their one-hop raw links for ever, thousands a second.
     #[test]
@@ -4297,6 +4696,82 @@ mod tests {
             passed += 1;
         }
         assert_eq!(passed, 1);
+        Ok(())
+    }
+
+    /// The relay's own store of what is taken is never evicted: a bundle index of the relay's own
+    /// signing past its room is refused there and counted (`strikes_full`), and goes out all the
+    /// same, since only this relay holds it and no member could repair it. A peer's past its
+    /// share is let go, counted, and not passed on. Before, an own index refused at Full was
+    /// dropped unsent.
+    #[test]
+    fn an_own_bundle_index_past_its_room_is_counted_and_still_sent() -> Result<(), String> {
+        let hub = stamped_hub(8, crate::sharing::Deadlines::RELAY);
+        hub.shares.set(crate::strikes::Entries {
+            feeder: 2,
+            feeders: 2,
+            peer: 2,
+            peers: 2 + 2 * crate::strikes::PEER_PLACE_ENTRIES,
+            relay: 2,
+        });
+        let out = hub.listen(u64::MAX, Filter::Everything);
+        let parent = Region::containing(
+            &tally_wire::Location {
+                lat_e7: 337_490_000,
+                lon_e7: -843_880_000,
+                alt_m: 0,
+                precision_m: 0,
+            },
+            1,
+        )
+        .map_err(|error| error.to_string())?;
+        let signer = Identity::generate().map_err(|error| error.to_string())?;
+        let index = |second: u64| -> Result<tally_wire::BundleIndex, String> {
+            tally_wire::BundleIndex::sign(
+                &signer,
+                &tally_wire::BundleIndexContent {
+                    parent,
+                    product: tally_wire::Streams::RAW,
+                    second,
+                    children: Vec::new(),
+                },
+            )
+            .map_err(|error| error.to_string())
+        };
+        let second = now_ms() / 1000;
+        let own = (0..5)
+            .map(|n| index(second - n))
+            .collect::<Result<Vec<_>, _>>()?;
+        for index in &own {
+            hub.publish_own(Record::BundleIndex(index.clone()));
+        }
+        let mut sent = Vec::new();
+        while let Some(item) = out.try_recv() {
+            sent.push((*item.record).clone());
+        }
+        assert_eq!(
+            sent,
+            own.iter()
+                .cloned()
+                .map(Record::BundleIndex)
+                .collect::<Vec<_>>(),
+            "an own index refused for room was not sent"
+        );
+        assert_eq!(hub.memory_report().strikes_full, 3);
+        // A peer's past its share is let go, counted, and never passed on.
+        let peer = Identity::from_seed([73; 32]).public();
+        let peers = (10..15)
+            .map(|n| index(second - n))
+            .collect::<Result<Vec<_>, _>>()?;
+        for index in &peers {
+            hub.publish_as(9, Deliverer::Peer(peer), Record::BundleIndex(index.clone()));
+        }
+        let mut passed = 0;
+        while out.try_recv().is_some() {
+            passed += 1;
+        }
+        assert_eq!(passed, 2);
+        assert_eq!(hub.memory_report().strikes_full, 6);
         Ok(())
     }
 
@@ -4568,7 +5043,7 @@ mod tests {
     fn a_flood_of_descriptions_never_forgets_a_receiver_that_is_publishing() -> Result<(), String> {
         const CAP: usize = 200;
         let mut hub = stamped_hub(8, crate::sharing::Deadlines::RELAY);
-        hub.receivers = Receivers::new(1, CAP, DESCRIPTION_BYTES_HELD);
+        hub.described_as(CAP, DESCRIPTION_BYTES_HELD);
         let hub = Arc::new(hub);
         let (honest, honest_key) = key()?;
         hub.publish_info(1, signed_info(&honest)?, honest_key, 1, None, false);
@@ -4599,9 +5074,53 @@ mod tests {
         Ok(())
     }
 
+    /// The relay at a receiver figure of `receivers` (its station rows and descriptions held to
+    /// it, as a budget sizes them, `Hub::size_receivers`) with exactly that many honest receivers,
+    /// each described and publishing a batch a round, every one of the 256 raw shards in use:
+    /// none is ever forgotten. Receivers land in raw shards by a keyed hash, so a shard's are a
+    /// random draw; before, each shard held an even share of the figure (64 receivers, one row a
+    /// shard), every shard drawn above its share forgot a receiver on each of its batches, and its
+    /// row (its judged batches with it), its description and its regional routing went with it.
+    #[test]
+    fn no_receiver_publishing_within_the_figure_is_forgotten_whatever_its_raw_shard()
+    -> Result<(), String> {
+        for figure in [64, 1_024] {
+            let hub = Arc::new(stamped_hub(8, crate::sharing::Deadlines::RELAY));
+            hub.size_receivers(figure);
+            let honest = (0..figure)
+                .map(|_| key())
+                .collect::<Result<Vec<_>, String>>()?;
+            // Drawn into many raw shards, some holding more than an even share of the figure.
+            let mut shards = HashMap::<u16, usize>::new();
+            for (_, receiver) in &honest {
+                *shards.entry(raw_shard(receiver).0).or_default() += 1;
+            }
+            assert!(shards.values().any(|&held| held > figure.div_ceil(SHARDS)));
+            const ROUNDS: u64 = 3;
+            for round in 0..ROUNDS {
+                for (identity, receiver) in &honest {
+                    if round == 0 {
+                        hub.publish_info(1, signed_info(identity)?, *receiver, 1, None, true);
+                    }
+                    let batch = signed_batch_at(identity, round, Vec::new(), now_ms())?;
+                    assert!(hub.publish_batch(1, batch, *receiver), "{figure}: refused");
+                }
+            }
+            for (_, receiver) in &honest {
+                assert!(hub.describes(receiver), "{figure}: a description forgotten");
+                let row = hub
+                    .station(receiver)
+                    .ok_or_else(|| format!("{figure}: a station row forgotten"))?;
+                assert_eq!(row.batches, ROUNDS, "{figure}: a station row started again");
+            }
+            assert_eq!(held(&hub)?, (figure, figure));
+        }
+        Ok(())
+    }
+
     /// How many receivers the batch path knows, and how many descriptions the directory holds.
     fn held(hub: &Hub) -> Result<(usize, usize), String> {
-        let receivers = hub.receivers.len();
+        let receivers = hub.receivers.lock().map_err(|e| e.to_string())?.held.len();
         let directory = hub.directory.lock().map_err(|e| e.to_string())?.known.len();
         Ok((receivers, directory))
     }
@@ -4609,7 +5128,7 @@ mod tests {
     #[test]
     fn when_full_the_receiver_least_recently_active_is_forgotten() -> Result<(), String> {
         let mut hub = stamped_hub(8, crate::sharing::Deadlines::RELAY);
-        hub.receivers = Receivers::new(1, 2, DESCRIPTION_BYTES_HELD);
+        hub.described_as(2, DESCRIPTION_BYTES_HELD);
         let (stranger, _) = key()?;
         let info = signed_info(&stranger)?;
         let (_, first) = key()?;
@@ -5606,6 +6125,12 @@ mod tests {
             let window = BASE_MS / 1000 / crate::sharing::member::RECEIPT_WINDOW_SECONDS;
             let due = (window + 1) * crate::sharing::member::RECEIPT_WINDOW_SECONDS * 1000
                 + crate::sharing::Deadlines::RELAY.receipt_grace.ms();
+            // The window falls due when the judging clock first passes its end, and its receipts
+            // a grace on by the monotonic one (`member::Due`).
+            let _ = hub
+                .network()
+                .sharing
+                .tick_member_for_test(due - crate::sharing::Deadlines::RELAY.receipt_grace.ms());
             let _ = hub.network().sharing.tick_member_for_test(due);
             let sent: Vec<_> = hub
                 .network()
@@ -5929,6 +6454,12 @@ mod tests {
         let window = BASE_MS / 1000 / crate::sharing::member::RECEIPT_WINDOW_SECONDS;
         let due = (window + 1) * crate::sharing::member::RECEIPT_WINDOW_SECONDS * 1000
             + crate::sharing::Deadlines::RELAY.receipt_grace.ms();
+        // The window falls due when the judging clock first passes its end, and its receipts a
+        // grace on by the monotonic one (`member::Due`).
+        let _ = hub
+            .network()
+            .sharing
+            .tick_member_for_test(due - crate::sharing::Deadlines::RELAY.receipt_grace.ms());
         let _ = hub.network().sharing.tick_member_for_test(due);
         let stripe = crate::sharing::stripes::data_stripe(&batch.hash());
         let records: Vec<u32> = hub
@@ -6964,7 +7495,9 @@ mod tests {
     /// pins no table's memory or floor), and its feeder is told the relay's clock again; one more
     /// than `tally_wire::budget::FEEDER_BEHIND` behind it is only too old (a
     /// backlog a feeder held over a backoff or a stall, which a clock behind looks the same as):
-    /// held and counted late against its receiver (`late_batches`). The session goes on, and the
+    /// held and counted late (`late_records`), and never against its receiver (`late_batches`),
+    /// since it carries none of this relay's own anchors (`strikes::blame`). The session goes on,
+    /// and the
     /// batches after it on it are taken. Before, a batch more than the tolerance ahead was refused
     /// and its feeder sent away for a minute.
     #[test]
@@ -7045,10 +7578,10 @@ mod tests {
         // What it took is in its table, and nothing of the batches ahead, however far ahead they
         // were signed: possession pins no table.
         assert_eq!(hub.held_by_for_test(Deliverer::Feeder(receiver_key)), 5);
-        // Each one too old is counted against its receiver, where its owner reads it; the ones
-        // ahead against nobody.
+        // None is counted against its receiver: the ones too old carry none of this relay's own
+        // anchors (it has no signer), and the ones ahead are counted against nobody.
         let station = hub.station(&receiver_key).ok_or("no station")?;
-        assert_eq!((station.late_batches, station.batches), (66, 5));
+        assert_eq!((station.late_batches, station.batches), (0, 5));
         Ok(())
     }
 
@@ -7274,16 +7807,53 @@ mod tests {
         Ok(())
     }
 
-    /// The station rows are charged their whole plan from the start (`stations::PLANNED_BYTES`,
-    /// `Store::Stations`), and once however often the budget is resized.
+    /// The tables sized from the budget (the station rows and the descriptions at its receiver
+    /// figure, the clock model parts at their room) are charged their whole plan from the start
+    /// (`stations::planned_bytes`, `descriptions_planned_bytes`, `parts::planned_bytes`), and once
+    /// however often the budget is resized: each at the figure the budget holds then, its tables
+    /// held to it.
     #[test]
-    fn a_relay_charges_its_station_rows_once_from_the_start() -> Result<(), String> {
+    fn a_relay_charges_its_sized_tables_once_from_the_start() -> Result<(), String> {
         let hub = stamped_hub(8, crate::sharing::Deadlines::RELAY);
-        let held = |hub: &Hub| hub.budget().gauge(Store::Stations).held();
-        assert_eq!(held(&hub), crate::stations::PLANNED_BYTES);
+        let held = |hub: &Hub, store: Store| hub.budget().gauge(store).held();
+        let planned = |hub: &Hub| {
+            let receivers = hub.budget().receivers();
+            (
+                crate::stations::planned_bytes(receivers),
+                descriptions_planned_bytes(receivers),
+                crate::parts::planned_bytes(hub.budget().plan().parts_room()),
+            )
+        };
+        let charged = |hub: &Hub| {
+            (
+                held(hub, Store::Stations),
+                held(hub, Store::Descriptions),
+                held(hub, Store::Parts),
+            )
+        };
+        assert_eq!(charged(&hub), planned(&hub));
         hub.fixed_charged()?;
+        let small = hub.budget().receivers();
         let hub = hub.memory(4 << 30, false).memory(2 << 30, true);
-        assert_eq!(held(&hub), crate::stations::PLANNED_BYTES);
+        assert_eq!(charged(&hub), planned(&hub));
+        assert_ne!(
+            hub.budget().receivers(),
+            small,
+            "the figure did not follow the budget"
+        );
+        let figure = hub.budget().receivers();
+        assert_eq!(
+            hub.stations.lock().map_err(|e| e.to_string())?.capacity(),
+            figure
+        );
+        assert_eq!(
+            hub.receivers
+                .lock()
+                .map_err(|e| e.to_string())?
+                .held
+                .capacity(),
+            figure
+        );
         hub.fixed_charged()
     }
 
@@ -7704,7 +8274,7 @@ mod tests {
                         telling.stated(
                             Some(*reading),
                             Some(5),
-                            std::time::Duration::from_millis(1),
+                            feeder.clocks.stamp_ms().saturating_sub(1),
                         );
                     }
                     telling.anchored(tally_wire::Anchor::sign(*relay, *reading));
@@ -7760,23 +8330,16 @@ mod tests {
     /// same boot first seen after a later one. Before, each copy counted again.
     #[test]
     fn a_late_batch_is_blamed_once_however_often_it_comes() -> Result<(), String> {
-        let hub = Arc::new(stamped_hub(8, crate::sharing::Deadlines::RELAY));
+        let now = BASE_MS + 600_000;
+        let (hub, own) = aged_own_anchor(96, now)?;
         let (receiver, receiver_key) = key()?;
         let feeder = Origin::Feeder(None, None, None);
-        let now = BASE_MS + 600_000;
         let old = now
             - tally_wire::budget::FEEDER_BEHIND
                 .span::<tally_wire::clocks::Judged>()
                 .ms()
             - 1;
-        let batch = |sequence: u64| {
-            signed_with_anchors(
-                &receiver,
-                sequence,
-                old,
-                &[tally_wire::Anchor::sign(&crate::anchors::test_relay(), old)],
-            )
-        };
+        let batch = |sequence: u64| signed_with_anchors(&receiver, sequence, old, &[own]);
         let late = || {
             hub.station(&receiver_key)
                 .map_or(0, |station| station.late_batches)
@@ -7809,7 +8372,7 @@ mod tests {
                 observations: Vec::new(),
             },
             tally_wire::batch::Codec::Plain,
-            &[tally_wire::Anchor::sign(&crate::anchors::test_relay(), old)],
+            &[own],
         )
         .map_err(|error| error.to_string())?;
         assert!(!feed(&hub, 1, rebooted.clone(), feeder.clone(), now));
@@ -7829,26 +8392,27 @@ mod tests {
     #[test]
     fn a_batch_stamped_before_the_clock_judged_is_never_blamed_though_it_judges_at_admit()
     -> Result<(), String> {
-        let truth = Arc::new(AtomicU64::new(BASE_MS + 600_000));
+        let now = BASE_MS + 600_000;
+        let oldest = tally_wire::budget::OWN_ANCHOR_OLDEST
+            .span::<tally_wire::clocks::Judged>()
+            .ms();
+        let truth = Arc::new(AtomicU64::new(now - oldest - 1_000));
         let reading = Arc::clone(&truth);
         let clock = RelayClock::scripted(Arc::new(move || reading.load(Ordering::Relaxed)));
         let hub = Arc::new(Hub::on(8, clock.clone(), crate::sharing::Deadlines::RELAY));
+        hub.network()
+            .adopt_identity(crate::signer::twin(&Identity::from_seed([97; 32])));
         hub.begin_strikes();
+        // Its own anchor, older than an honest batch's by the time the batches come.
+        let own = hub.anchor().ok_or("no anchor issued")?;
+        truth.store(now, Ordering::Relaxed);
         let (receiver, receiver_key) = key()?;
-        let now = BASE_MS + 600_000;
         let old = now
             - tally_wire::budget::FEEDER_BEHIND
                 .span::<tally_wire::clocks::Judged>()
                 .ms()
             - 1;
-        let batch = |sequence: u64| {
-            signed_with_anchors(
-                &receiver,
-                sequence,
-                old,
-                &[tally_wire::Anchor::sign(&crate::anchors::test_relay(), old)],
-            )
-        };
+        let batch = |sequence: u64| signed_with_anchors(&receiver, sequence, old, &[own]);
         let late = || {
             hub.station(&receiver_key)
                 .map_or(0, |station| station.late_batches)
@@ -7886,6 +8450,20 @@ mod tests {
         Ok(())
     }
 
+    /// A hub of signing key `seed` whose clocks read `now`, and the anchor it issued a second past
+    /// `OWN_ANCHOR_OLDEST` before: the own anchor of a batch too old by it, so a batch too old by
+    /// its signed time that carries it is blamed (`strikes::blame`).
+    fn aged_own_anchor(seed: u8, now: u64) -> Result<(Arc<Hub>, tally_wire::Anchor), String> {
+        let oldest = tally_wire::budget::OWN_ANCHOR_OLDEST
+            .span::<tally_wire::clocks::Judged>()
+            .ms();
+        let truth = Arc::new(AtomicU64::new(now - oldest - 1_000));
+        let hub = issuing_hub(seed, &truth);
+        let own = hub.anchor().ok_or("no anchor issued")?;
+        truth.store(now, Ordering::Relaxed);
+        Ok((hub, own))
+    }
+
     /// A hub whose clocks are all `truth`'s, its own signing key of seed `seed`: one that issues
     /// its own anchors ([`Hub::anchor`]) at the times a test sets, and so remembers them.
     fn issuing_hub(seed: u8, truth: &Arc<AtomicU64>) -> Arc<Hub> {
@@ -7907,8 +8485,11 @@ mod tests {
     /// relay timed its own anchor's issue and it was a minute after `t`. A batch sent at once and
     /// as late is blamed as ever. Another relay's anchor moves nothing either way: a newer one
     /// beside an old own one does not excuse it, and an older one beside a new own one does not
-    /// blame it; nor does one alone, without this relay's. Nor does an anchor in this relay's
-    /// name it never issued (another run's, or one it has forgotten): blame is then by `t` alone.
+    /// blame it; one alone, without this relay's, is never blamed, since an honest backlog
+    /// anchored by another relay is such a batch. An anchor in this relay's name it does not
+    /// remember issuing (an earlier run's, or one its ring let go) is aged from this run's first
+    /// issue, or the newest one the ring let go, which it was issued no later than
+    /// (`anchors::Anchors::issued_by`): so it is aged, never overstated, and blamed by that age.
     #[test]
     fn a_batch_held_for_its_anchor_is_not_blamed_for_the_hold() -> Result<(), String> {
         let t = BASE_MS + 600_000;
@@ -7952,12 +8533,12 @@ mod tests {
             "another relay's anchor blamed it"
         );
         assert!(
-            blamed(4, &[new_other])?,
-            "another relay's anchor alone excused it"
+            !blamed(4, &[new_other])?,
+            "blamed with no anchor of this relay's"
         );
         assert!(
             blamed(5, &[never_issued])?,
-            "an anchor this relay never issued excused it"
+            "an own anchor this relay does not remember issuing excused it"
         );
         Ok(())
     }
@@ -8382,12 +8963,11 @@ mod tests {
             let station = hub.station(&receiver_key).ok_or("no station")?;
             assert_eq!(station.batches, 70, "{step}");
             if step > 0 {
-                // Stepped ahead, the relay finds real time too old: held and counted late.
-                assert!(
-                    station.late_batches >= 50,
-                    "{step}: {}",
-                    station.late_batches
-                );
+                // Stepped ahead, the relay finds real time too old: held and counted late, and
+                // never blamed on the feeder, whose batches carry none of this relay's anchors
+                // (it has no signer): the step is the relay's.
+                assert!(report.late_records >= 50, "{step}: {report:?}");
+                assert_eq!(station.late_batches, 0, "{step}");
             } else {
                 // Stepped back, real time is ahead of the relay: held unused, counted against
                 // nobody.
@@ -8677,6 +9257,81 @@ mod tests {
         Ok(())
     }
 
+    /// A receiver's ceiling charges a batch its wanted receptions whether this relay can use it or
+    /// not (`Batch::wanted_receptions`, read with no decode): a feeder that has spent its ceiling
+    /// keeps every batch of only unwanted receptions (Mode A/C here), usable or too old by its
+    /// signed time, and none is over the ceiling. Before, a batch the relay could not use was
+    /// charged every reception it carried and one it could only its wanted ones, so whether a
+    /// batch was kept turned on this relay's clock.
+    #[test]
+    fn a_feeder_at_its_ceiling_keeps_its_unwanted_receptions_usable_or_late() -> Result<(), String>
+    {
+        let hub = Arc::new(stamped_hub(8, crate::sharing::Deadlines::RELAY));
+        let receiver = Identity::from_seed([7; 32]);
+        let feeder = || Origin::Feeder(None, Some(crate::ingest::Group::V4(1)), None);
+        let burst =
+            crate::ingest::FEEDER_RECEPTIONS_PER_SEC * crate::ingest::FEEDER_RECEPTIONS_BURST_SECS;
+        let mut spent = 0;
+        let mut sequence = 0;
+        while spent < burst {
+            let per = (burst - spent).min(500);
+            assert!(feed(
+                &hub,
+                1,
+                wanted_batch(&receiver, sequence, per as usize)?,
+                feeder(),
+                BASE_MS
+            ));
+            spent += per;
+            sequence += 1;
+        }
+        assert_eq!(hub.over_reception_ceiling().batches, 0);
+        let mode_ac = |n: usize| -> Vec<Observation> {
+            (0..n)
+                .map(|n| Observation {
+                    format: tally_wire::batch::format::MODE_AC,
+                    timestamp: n as u64,
+                    signal: 0,
+                    data: vec![(n >> 8) as u8, n as u8],
+                })
+                .collect()
+        };
+        let old = BASE_MS
+            - tally_wire::budget::FEEDER_BEHIND
+                .span::<tally_wire::clocks::Judged>()
+                .ms()
+            - 1;
+        let unwanted = burst as usize + 1;
+        assert!(
+            feed(
+                &hub,
+                1,
+                signed_batch(&receiver, sequence, mode_ac(unwanted))?,
+                feeder(),
+                BASE_MS
+            ),
+            "a usable batch of unwanted receptions was not kept"
+        );
+        assert!(!feed(
+            &hub,
+            1,
+            signed_batch_at(&receiver, sequence + 1, mode_ac(unwanted), old)?,
+            feeder(),
+            BASE_MS
+        ));
+        assert_eq!(
+            hub.memory_report().late_records,
+            1,
+            "the late one not held late"
+        );
+        assert_eq!(
+            hub.over_reception_ceiling().batches,
+            0,
+            "a batch of unwanted receptions charged to the ceiling"
+        );
+        Ok(())
+    }
+
     /// A copy of a batch this relay already kept is neither judged nor charged: a feeder that
     /// reconnects and resends its backlog spends its group's share once, and the next group's
     /// batch is not cut for the tokens the copies would have taken.
@@ -8736,7 +9391,7 @@ mod tests {
         let proven = Identity::from_seed([9; 32]);
         hub.network()
             .credit
-            .corroborate_receiver(proven.public(), judged(now_ms()));
+            .corroborate_receiver(proven.public(), crate::sharing::Now::from(now_ms()));
         let hostile: Vec<Identity> = (0..50u8)
             .map(|n| Identity::from_seed([n + 100; 32]))
             .collect();
@@ -8807,8 +9462,12 @@ mod tests {
         let mut hub = stamped_hub(8, crate::sharing::Deadlines::RELAY);
         let (stranger, _) = key()?;
         let info = signed_info(&stranger)?;
-        let size = info.as_bytes().len();
-        hub.receivers = Receivers::new(1, RECEIVERS_REMEMBERED, 3 * size);
+        // What one description is charged, read from a relay holding just it.
+        let one = stamped_hub(8, crate::sharing::Deadlines::RELAY);
+        one.publish_info(2, info.clone(), stranger.public(), 1, None, false);
+        let size = one.directory.lock().map_err(|e| e.to_string())?.bytes;
+        assert!(size > info.as_bytes().len());
+        hub.described_as(RECEIVERS_REMEMBERED, 3 * size);
         let keys = (0..5)
             .map(|_| key().map(|(_, public)| public))
             .collect::<Result<Vec<_>, _>>()?;
@@ -8827,6 +9486,59 @@ mod tests {
             hub.directory.lock().map_err(|e| e.to_string())?.bytes,
             3 * size
         );
+        Ok(())
+    }
+
+    /// The descriptions' tables sized to a receiver figure, churned past it by more receivers
+    /// than it holds, each described with a site, allocate no more than they are charged
+    /// (`descriptions_planned_bytes`, and the receivers' areas the products keep beside them,
+    /// `products::located_planned_bytes`). Measured by the allocator, on this thread.
+    #[test]
+    fn the_descriptions_tables_stay_within_their_plan_at_a_figure() -> Result<(), String> {
+        use tally_counting::Counting;
+        const RECEIVERS: usize = 512;
+        let hub = stamped_hub(8, crate::sharing::Deadlines::RELAY);
+        hub.size_descriptions(
+            RECEIVERS,
+            RECEIVERS * DESCRIPTION_BYTES_PER_RECEIVER,
+            RECEIVERS + 1,
+        );
+        let located = crate::budget::Gauge::new(Store::Located, usize::MAX);
+        hub.network().products.size_located(RECEIVERS, &located);
+        let described: Vec<(ReceiverInfo, PublicKey, Location)> = (0..2 * (RECEIVERS + 1) as u64)
+            .map(|n| {
+                let mut seed = [0u8; 32];
+                seed[..8].copy_from_slice(&n.to_be_bytes());
+                let receiver = Identity::from_seed(seed);
+                let place = Location {
+                    lat_e7: 515_000_000 + (n as i32 % 100) * 1_000_000,
+                    lon_e7: -1_000_000 + (n as i32 / 100) * 1_000_000,
+                    alt_m: 0,
+                    precision_m: 0,
+                };
+                let info = ReceiverInfo::sign(
+                    &receiver,
+                    &ReceiverInfoContent {
+                        issued_ms: 1,
+                        location: Some(place),
+                        clock: Clock::Dump1090,
+                        software: "test".repeat(16),
+                        relays: Vec::new(),
+                    },
+                )
+                .map_err(|error| error.to_string())?;
+                Ok((info, receiver.public(), place))
+            })
+            .collect::<Result<_, String>>()?;
+        let base = Counting::peak_base();
+        for (info, receiver, place) in described {
+            hub.publish_info(2, info, receiver, 1, Some(place), true);
+        }
+        let peak = usize::try_from(Counting::peak_since(base)).unwrap_or(0);
+        let planned = descriptions_planned_bytes(RECEIVERS)
+            + crate::products::located_planned_bytes(RECEIVERS);
+        assert!(hub.receivers.lock().map_err(|e| e.to_string())?.held.len() <= RECEIVERS);
+        assert!(peak <= planned, "{peak} at the peak, {planned} planned");
         Ok(())
     }
 
@@ -8945,6 +9657,11 @@ mod tests {
     fn a_large_models_parts_go_out_ahead_of_its_manifest_and_forged_ones_never()
     -> Result<(), String> {
         let hub = stamped_hub(8, crate::sharing::Deadlines::RELAY);
+        // Room for the model's three parts, as a relay with members' rate sizes it.
+        hub.parts
+            .lock()
+            .map_err(|e| e.to_string())?
+            .resize(4 * crate::parts::ONE_PART_BYTES);
         let out = hub.listen(u64::MAX, Filter::Everything);
         let (engine, _) = key()?;
         let model: Vec<u8> = (0..3 * tally_wire::clock_model::PART_LEN as u64)
@@ -8992,6 +9709,114 @@ mod tests {
             ]
         );
         assert_eq!(hub.parts_held_bytes(), 0);
+        Ok(())
+    }
+
+    /// A large model reaches the relay's store of decoded models whole whichever came first, its
+    /// manifest or its parts (a part rebuilt from parity, or carried by another path, may come
+    /// after): one whose parts came first is taken whole as its manifest goes out, one whose
+    /// manifest came first as its last part does. Before, the second never reached the store, so
+    /// nothing citing it was ever checked for a client. Each taking is counted by the store (this
+    /// model is no model it holds: its bytes are not a fit's, and its engine is no area's).
+    #[test]
+    fn a_large_model_reaches_the_store_whole_whichever_came_first() -> Result<(), String> {
+        // An area taken: the members it brings carry the models whole (`Network::hold_part`).
+        let (receiver, _) = key()?;
+        let (_, _, group) = located(&receiver)?;
+        for manifest_first in [false, true] {
+            let hub = stamped_hub(8, crate::sharing::Deadlines::RELAY).taking(vec![group.cell]);
+            hub.parts
+                .lock()
+                .map_err(|e| e.to_string())?
+                .resize(4 * crate::parts::ONE_PART_BYTES);
+            let (engine, _) = key()?;
+            let model: Vec<u8> = (0..3 * tally_wire::clock_model::PART_LEN as u64)
+                .map(|at| (at.wrapping_mul(2_654_435_761) >> 11) as u8)
+                .collect();
+            let signed = tally_wire::ClockModel::sign(
+                &engine,
+                &tally_wire::ClockModelContent {
+                    boot_id: 1,
+                    sequence: 0,
+                    issued_ms: now_ms(),
+                    spec_version: 1,
+                    inputs: [0; 32],
+                    model,
+                },
+            )
+            .map_err(|error| error.to_string())?;
+            let taken = || {
+                let report = hub.network().clock_models.report();
+                report.admitted
+                    + report.unreadable
+                    + report.outside
+                    + report.not_an_engine
+                    + report.stale
+                    + report.slot_taken
+                    + report.room
+            };
+            if manifest_first {
+                assert!(hub.publish_clock_model(6, signed.manifest.clone()));
+                for part in &signed.parts {
+                    assert_eq!(taken(), 0, "taken before it was whole");
+                    assert!(hub.publish_clock_model_part(7, part.clone()));
+                }
+            } else {
+                for part in &signed.parts {
+                    assert!(!hub.publish_clock_model_part(5, part.clone()));
+                }
+                assert_eq!(taken(), 0);
+                assert!(hub.publish_clock_model(6, signed.manifest.clone()));
+            }
+            assert_eq!(
+                taken(),
+                1,
+                "never taken whole, its {} first",
+                if manifest_first { "manifest" } else { "parts" }
+            );
+            // And the member links carry it whole either way.
+            assert_eq!(
+                hub.network()
+                    .model_records(&signed.manifest.id())
+                    .map(|r| r.len()),
+                Some(signed.parts.len() + 1),
+                "its {} first",
+                if manifest_first { "manifest" } else { "parts" }
+            );
+        }
+        Ok(())
+    }
+
+    /// A relay hosting MLAT holds its own engine's twins: its raw is planned (seats, and the
+    /// checks' room for its own engine's raw), and a hub that plans none is refused the engine.
+    /// Before, a hub built without its raw hosted the engine anyway, its own room was empty, every
+    /// twin of its own was refused for room, and its clients were sent nothing its engine solved.
+    #[test]
+    fn only_a_hub_that_plans_its_raw_hosts_mlat_and_holds_its_own_twins() -> Result<(), String> {
+        let hosted = || -> Result<Arc<dyn crate::mlat_host::MlatHost>, String> {
+            Ok(Arc::new(
+                crate::mlat_host::HostedMlat::new(
+                    tally_wire::Signer::new(Identity::from_seed([3; 32]), Arc::new(|| true)),
+                    1,
+                    tally_mlat::engine::Settings {
+                        regions: tally_wire::Regions::default(),
+                        settle: crate::mlat_host::SETTLE,
+                        threads: 1,
+                        capacity: tally_mlat::engine::Capacity::default(),
+                    },
+                    crate::mlat_host::WindowClock::KEEPING_UP,
+                )
+                .map_err(|error| error.to_string())?,
+            ))
+        };
+        let unplanned = stamped_hub(8, crate::sharing::Deadlines::RELAY);
+        assert!(unplanned.host_mlat(hosted()?).is_err());
+        assert!(unplanned.network().mlat().is_none());
+        let planned = stamped_hub(8, crate::sharing::Deadlines::RELAY).memory(DEFAULT_MEMORY, true);
+        let own = planned.network().consistency.caps().own;
+        assert!(own.bytes > 0 && own.twins > 0, "{own:?}");
+        planned.host_mlat(hosted()?)?;
+        assert!(planned.network().mlat().is_some());
         Ok(())
     }
 
@@ -9258,7 +10083,7 @@ mod tests {
     /// must agree with.
     fn brute_force(hub: &Hub, subscription: &Subscription) -> Result<Vec<usize>, String> {
         let directory = hub.directory.lock().map_err(|e| e.to_string())?;
-        let all = directory.all(true);
+        let all = directory.all(true, hub.clock().mono());
         Ok(identities(
             &all.into_iter()
                 .filter(|item| subscription.wants(item))
@@ -9272,9 +10097,9 @@ mod tests {
         use std::sync::mpsc;
         use tally_wire::Streams;
         const RECEIVERS: usize = RECEIVERS_REMEMBERED;
-        // One shard of them all, so every one is held.
+        // A table of them all, so every one is held.
         let mut hub = stamped_hub(8, crate::sharing::Deadlines::RELAY);
-        hub.receivers = Receivers::new(1, RECEIVERS, DESCRIPTION_BYTES_HELD);
+        hub.described_as(RECEIVERS, DESCRIPTION_BYTES_HELD);
         let hub = Arc::new(hub);
         let (stranger, _) = key()?;
         let info = signed_info(&stranger)?;
@@ -9307,7 +10132,7 @@ mod tests {
         assert_eq!(held(&hub)?, (RECEIVERS, RECEIVERS));
         {
             let directory = hub.directory.lock().map_err(|e| e.to_string())?;
-            let indexed: usize = directory.by_point.values().map(BTreeSet::len).sum();
+            let indexed: usize = directory.by_point.len();
             let located = directory
                 .known
                 .values()
@@ -9333,7 +10158,7 @@ mod tests {
         let expected = brute_force(&hub, &subscription)?;
         assert!(!expected.is_empty() && expected.len() < RECEIVERS);
         // The batch path's lock held throughout: the answer is read without it, or never.
-        let batch_lock = hub.receivers.shards[0].lock().map_err(|e| e.to_string())?;
+        let batch_lock = hub.receivers.lock().map_err(|e| e.to_string())?;
         let (answered, answer) = mpsc::channel();
         let asking = Arc::clone(&hub);
         let asked = subscription.clone();
@@ -9362,9 +10187,9 @@ mod tests {
     #[test]
     fn a_new_receiver_is_described_in_a_table_full_of_receivers_that_publish() -> Result<(), String>
     {
-        // One shard of them all: the order of forgetting, apart from the sharding.
+        // A table of them all: the order of forgetting.
         let mut hub = stamped_hub(8, crate::sharing::Deadlines::RELAY);
-        hub.receivers = Receivers::new(1, RECEIVERS_REMEMBERED, DESCRIPTION_BYTES_HELD);
+        hub.described_as(RECEIVERS_REMEMBERED, DESCRIPTION_BYTES_HELD);
         let hub = Arc::new(hub);
         let (stranger, _) = key()?;
         let info = signed_info(&stranger)?;
@@ -9375,7 +10200,6 @@ mod tests {
         for receiver in publishing {
             hub.publish_info(2, info.clone(), *receiver, 1, None, false);
             hub.receivers
-                .shard(receiver)
                 .lock()
                 .map_err(|e| e.to_string())?
                 .held
@@ -9538,6 +10362,7 @@ mod honest_end_to_end {
         ];
         let truth = Arc::new(AtomicU64::new(first_slot as u64));
         // The hops, and the hops a member releases to later, which have never seen the batch.
+        #[allow(clippy::disallowed_methods, reason = "a test's scripted readings")]
         let hub_of = |hop: usize| {
             let (judging, monotonic, raw) =
                 (Arc::clone(&truth), Arc::clone(&truth), Arc::clone(&truth));
@@ -9742,14 +10567,10 @@ mod honest_end_to_end {
             };
             if kind == 3 {
                 let (took, at) = round_trip(&mut draw);
-                let asked = clocks.anchored_before(std::time::Duration::from_millis(took as u64));
+                let heard = clocks.stamp_ms();
+                let asked = heard.saturating_sub(took as u64);
                 let clock = relay_clock(b, now - took + at);
-                clocks.probed(
-                    keys[b],
-                    (asked, clock, clock),
-                    Some(e as u64),
-                    std::time::Duration::ZERO,
-                );
+                clocks.probed(keys[b], (asked, clock, clock), Some(e as u64), heard);
             }
             for (place, hop) in [a, b].into_iter().enumerate() {
                 if place == 1 && with_liar {

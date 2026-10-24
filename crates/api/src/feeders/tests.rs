@@ -323,6 +323,28 @@ fn a_figure_is_judged_ahead_by_the_budget() {
     );
 }
 
+/// No figure is taken while the API's clock does not judge (its kernel bounds it past `E`, or
+/// not at all): whether one is dated ahead cannot be told by it. The same record, read once the
+/// clock judges again, is taken.
+#[test]
+fn no_figure_is_taken_while_the_clock_does_not_judge() {
+    let mut ledger = Ledger::trusting([relay().public()]);
+    let issued = T + H;
+    let record = signed(&relay(), issued, vec![figure(8, None)]);
+    ledger.ingest(&record, crate::mlat::Now::at(issued, false));
+    assert_eq!(
+        ledger.board(judged(issued)).feeder(&identity(8).public()),
+        None
+    );
+    ledger.ingest(&record, crate::mlat::Now::at(issued, true));
+    assert!(
+        ledger
+            .board(judged(issued))
+            .feeder(&identity(8).public())
+            .is_some()
+    );
+}
+
 /// The newest record of a receiver stands, from whichever of the operator's relays signed it; at
 /// one instant, the lesser key's.
 #[test]

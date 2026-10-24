@@ -137,6 +137,10 @@ impl MlatHost for Pinned {
     fn report(&self) -> MlatReport {
         self.host.report()
     }
+
+    fn take_own_models(&self) -> Vec<tally_relay::mlat_host::OwnModel> {
+        self.host.take_own_models()
+    }
 }
 
 /// The tests of this binary, as the build runs them: one target each (`crates/relay/BUILD.bazel`,
@@ -262,10 +266,12 @@ async fn relay(
             .accepting_relays([tally_mlat_solver::sim::anchoring_relay().public()])
             .accepting_relays(relays.iter().copied())
             .max_connections_per_address(64)
+            // Its raw planned where it hosts MLAT, as `tally-relay` plans it.
+            .memory(tally_relay::hub::DEFAULT_MEMORY, mlat.is_some())
             .staged(RELAY_THREADS)?,
     );
     if let Some(mlat) = mlat {
-        hub.network().host_mlat(mlat);
+        hub.host_mlat(mlat)?;
     }
     tokio::spawn(tally_relay::serve(
         listener,
@@ -881,12 +887,14 @@ async fn offering(
             .max_connections_per_address(256)
             // Its areas, which its member sessions are planned from, as `tally-relay` plans them.
             .taking(areas.to_vec())
+            // Its raw planned where it hosts MLAT, as `tally-relay` plans it.
+            .memory(tally_relay::hub::DEFAULT_MEMORY, mlat.is_some())
             .staged(RELAY_THREADS)?,
     );
     let network = hub.network();
     network.admission.configure(asn, true);
     if let Some(mlat) = mlat {
-        network.host_mlat(mlat);
+        hub.host_mlat(mlat)?;
     }
     tokio::spawn(tally_relay::serve(
         listener,
@@ -935,6 +943,10 @@ impl MlatHost for Gated {
     fn report(&self) -> MlatReport {
         self.host.report()
     }
+
+    fn take_own_models(&self) -> Vec<tally_relay::mlat_host::OwnModel> {
+        self.host.take_own_models()
+    }
 }
 
 /// One relay of the three-relay network: its address, hub and hosted MLAT.
@@ -971,11 +983,14 @@ async fn member(
             .max_connections_per_address(256)
             // Its areas, which its member sessions are planned from, as `tally-relay` plans them.
             .taking(areas.to_vec())
+            // Both world products when `world`, their fixes' store planned, as `--world` and
+            // `--world-precise` do.
+            .gathering_world(world, world)
+            // Its raw planned, as `tally-relay` plans a relay hosting MLAT.
+            .memory(tally_relay::hub::DEFAULT_MEMORY, true)
             .staged(RELAY_THREADS)?,
     );
     let network = hub.network();
-    network.products.set_world(world);
-    network.products.set_world_precise(world);
     network.admission.configure(asn, true);
     let mlat = Arc::new(Gated {
         host: HostedMlat::new(
@@ -990,7 +1005,7 @@ async fn member(
             WindowClock::KEEPING_UP,
         )?,
     });
-    network.host_mlat(Arc::clone(&mlat) as Arc<dyn MlatHost>);
+    hub.host_mlat(Arc::clone(&mlat) as Arc<dyn MlatHost>)?;
     tokio::spawn(tally_relay::serve(
         listener,
         vec![identity],
@@ -1494,7 +1509,9 @@ async fn three_relays_share_solve_and_serve_verifiable_positions_and_both_world_
         assert_eq!(network.data_on_directory_links(), 0);
     }
     // Fast MLAT is fast (RFC-0174 §2.4), in stamps: a provisional record is published (by the step
-    // that signs it) within the live world's seal of its newest transmission (`WORLD_SETTLE_MS`);
+    // that signs it) within the live world's feeder path of its newest transmission
+    // (`tally_wire::budget::LIVE_FIX_LEAVES`, the part of the world's settle that is the
+    // provisional's own way out);
     // every solution the client's relay published before its second's seal is in the live world
     // for that second; and nearly all are published before it (a transmission whose receptions
     // straggle waits for them, `provisional::SETTLE_MS` and the time kept past it). Every second the
@@ -1502,7 +1519,10 @@ async fn three_relays_share_solve_and_serve_verifiable_positions_and_both_world_
     // `tally-load`'s to measure (`--provisional-latency`).
     assert!(heard.provisional > 0, "{heard:?}");
     assert!(
-        heard.provisional_lag_ms <= tally_relay::products::WORLD_SETTLE_MS,
+        heard.provisional_lag_ms
+            <= tally_wire::budget::LIVE_FIX_LEAVES
+                .span::<tally_wire::clocks::Judged>()
+                .ms(),
         "a provisional was published {} ms after its transmission",
         heard.provisional_lag_ms
     );

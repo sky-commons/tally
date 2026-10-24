@@ -7,6 +7,7 @@
 #![allow(clippy::disallowed_methods, reason = "a test's scripted readings")]
 use std::collections::BTreeMap;
 use std::sync::OnceLock;
+use tally_wire::clocks::recorded::mono;
 
 use super::*;
 use tally_mlat::engine::{Engine, Settings as EngineSettings};
@@ -139,7 +140,7 @@ fn client(records: &[Record]) -> Vec<ClientRecord> {
 
 fn feed(merge: &mut Merge, records: &[ClientRecord], now: u64) -> Result<(), String> {
     for record in records {
-        merge.ingest(record, now)?;
+        merge.ingest(record, mono(now))?;
     }
     Ok(())
 }
@@ -343,7 +344,7 @@ fn the_same_input_set_is_a_duplicate_whoever_signed_it_and_whatever_the_order() 
     feed(&mut many, &west, world.now)?;
     let other = Identity::from_seed([43; 32]);
     for record in &resign(&world.west, &other)? {
-        let ingested = many.ingest(record, world.now)?;
+        let ingested = many.ingest(record, mono(world.now))?;
         if let Ingested::Solutions { accepted, .. } = ingested {
             assert_eq!(accepted, 0, "a duplicate changed a track");
         }
@@ -373,7 +374,10 @@ fn a_solution_counts_only_under_its_own_engines_model_summary() -> Result<(), St
         .into_iter()
         .next()
         .ok_or("no solution")?;
-    let ingested = merge.ingest(&signed(world, &world.west_key, 0, &solution)?, world.now)?;
+    let ingested = merge.ingest(
+        &signed(world, &world.west_key, 0, &solution)?,
+        mono(world.now),
+    )?;
     assert_eq!(
         ingested,
         Ingested::Solutions {
@@ -415,7 +419,7 @@ fn a_superset_of_the_same_models_inputs_wins_in_either_order() -> Result<(), Str
         let mut merge = Merge::new(Settings::default());
         feed(&mut merge, &models(&world.west), world.now)?;
         for record in order {
-            merge.ingest(record, world.now)?;
+            merge.ingest(record, mono(world.now))?;
         }
         let track = merge.track(full.address).ok_or("no track")?;
         let transmission = track.latest().ok_or("no final transmission")?;
@@ -552,7 +556,7 @@ fn a_fault_proof_convicts_its_engine_and_drops_what_stood_on_its_word_alone() ->
     let proof = FaultProof::new(&first, 0, &second, 0).map_err(text)?;
     let proof = ClientFaultProof::new(proof).map_err(|_| "a tagged proof refused")?;
     assert_eq!(
-        merge.ingest(&ClientRecord::FaultProof(proof), world.now)?,
+        merge.ingest(&ClientRecord::FaultProof(proof), mono(world.now))?,
         Ingested::Fault
     );
     assert!(merge.is_faulted(&west));
@@ -650,8 +654,8 @@ fn identical_df11_replies_are_joined_only_by_a_tag_in_common() -> Result<(), Str
         later.observations = ObservationSet::new(message.clone(), moved).map_err(text)?;
         let mut merge = Merge::new(Settings::default());
         feed(&mut merge, &models(&world.west), world.now)?;
-        merge.ingest(&signed(world, &world.west_key, 0, &first)?, world.now)?;
-        merge.ingest(&signed(world, &world.west_key, 1, &later)?, world.now)?;
+        merge.ingest(&signed(world, &world.west_key, 0, &first)?, mono(world.now))?;
+        merge.ingest(&signed(world, &world.west_key, 1, &later)?, mono(world.now))?;
         let a = holding(&merge, whole.address, &tag(world, &first)?.observations);
         let b = holding(&merge, whole.address, &tag(world, &later)?.observations);
         assert!(a.is_some() && b.is_some(), "{a:?} {b:?}");
@@ -672,7 +676,10 @@ fn a_provisional_fix_is_served_while_it_is_later_and_superseded_by_a_final_of_it
     let mut merge = Merge::new(Settings::default());
     feed(&mut merge, &models(&world.west), world.now)?;
     // The same transmission, solved a second after it was heard: held and served.
-    let ingested = merge.ingest(&early(world, &world.west_key, 0, &final_one)?, world.now)?;
+    let ingested = merge.ingest(
+        &early(world, &world.west_key, 0, &final_one)?,
+        mono(world.now),
+    )?;
     assert_eq!(
         ingested,
         Ingested::Provisional {
@@ -687,13 +694,19 @@ fn a_provisional_fix_is_served_while_it_is_later_and_superseded_by_a_final_of_it
     assert_eq!(served.kind, Kind::Provisional);
     // The final one of the same transmission arrives: it supersedes the provisional, which is
     // served no more.
-    merge.ingest(&signed(world, &world.west_key, 0, &final_one)?, world.now)?;
+    merge.ingest(
+        &signed(world, &world.west_key, 0, &final_one)?,
+        mono(world.now),
+    )?;
     let track = merge.track(address).ok_or("no track")?;
     assert!(track.provisional.is_empty());
     assert_eq!(track.served().map(|fix| fix.kind), Some(Kind::Final));
     assert_eq!(merge.provisional_counts().superseded, 1);
     // A provisional arriving after the final of its transmission is not held.
-    let late = merge.ingest(&early(world, &world.west_key, 1, &final_one)?, world.now)?;
+    let late = merge.ingest(
+        &early(world, &world.west_key, 1, &final_one)?,
+        mono(world.now),
+    )?;
     assert_eq!(
         late,
         Ingested::Provisional {
@@ -724,8 +737,11 @@ fn a_later_provisional_is_served_over_a_final_and_an_unconfirmed_one_is_retracte
     stray.lat_e7 += 1_000_000;
     let mut merge = Merge::new(Settings::default());
     feed(&mut merge, &models(&world.west), world.now)?;
-    merge.ingest(&signed(world, &world.west_key, 0, &final_one)?, world.now)?;
-    merge.ingest(&early(world, &world.west_key, 0, &stray)?, world.now)?;
+    merge.ingest(
+        &signed(world, &world.west_key, 0, &final_one)?,
+        mono(world.now),
+    )?;
+    merge.ingest(&early(world, &world.west_key, 0, &stray)?, mono(world.now))?;
     let served = merge
         .track(address)
         .and_then(Track::served)
@@ -735,13 +751,52 @@ fn a_later_provisional_is_served_over_a_final_and_an_unconfirmed_one_is_retracte
     // counted against its engine.
     merge.ingest(
         &ClientRecord::Heartbeat,
-        world.now + PROVISIONAL_DEADLINE_MS + 1,
+        mono(world.now + PROVISIONAL_DEADLINE.ms() + 1),
     )?;
     let track = merge.track(address).ok_or("the final track went with it")?;
     assert!(track.provisional.is_empty());
     assert_eq!(track.served().map(|fix| fix.kind), Some(Kind::Final));
     assert_eq!(merge.provisional_counts().retracted, 1);
     assert_eq!(merge.retractions(&world.west_key.public()), 1);
+    Ok(())
+}
+
+/// A provisional fix's deadline is a span of the client's monotonic clock, `FINAL_FIX_ARRIVED`
+/// from its arrival (`tally_wire::budget`): held to its last millisecond and retracted after,
+/// whatever the client's judging clock did meanwhile, which the merge never reads (an API host's
+/// wall clock stepped an hour forward moves no deadline). Before, the deadline was measured on the
+/// judging clock, so a step of it forward retracted honest provisional fixes before their finals
+/// could arrive.
+#[test]
+fn a_provisional_is_held_its_whole_deadline_on_the_monotonic_clock() -> Result<(), String> {
+    let world = world()?;
+    let all = solutions(&world.west)?;
+    let final_one = all.first().ok_or("no solution")?.clone();
+    let address = final_one.address;
+    let mut stray = all
+        .iter()
+        .find(|other| other.address == address && other.observations != final_one.observations)
+        .ok_or("one transmission only")?
+        .clone();
+    stray.transmitted =
+        TransmitTime::new(final_one.transmitted.unix_ms + 30_000, 0).map_err(text)?;
+    stray.lat_e7 += 1_000_000;
+    let mut merge = Merge::new(Settings::default());
+    feed(&mut merge, &models(&world.west), world.now)?;
+    merge.ingest(&early(world, &world.west_key, 0, &stray)?, mono(world.now))?;
+    let deadline = world.now
+        + tally_wire::budget::FINAL_FIX_ARRIVED
+            .span::<tally_wire::clocks::Mono>()
+            .ms();
+    merge.ingest(&ClientRecord::Heartbeat, mono(deadline - 1))?;
+    assert_eq!(merge.provisional_counts().retracted, 0);
+    assert!(
+        merge
+            .track(address)
+            .is_some_and(|track| !track.provisional.is_empty())
+    );
+    merge.ingest(&ClientRecord::Heartbeat, mono(deadline))?;
+    assert_eq!(merge.provisional_counts().retracted, 1);
     Ok(())
 }
 
@@ -765,7 +820,7 @@ fn a_signer_is_held_to_two_provisionals_an_aircraft_a_second() -> Result<(), Str
         solution.transmitted = TransmitTime::new(second + at as u64 * 100, 0).map_err(text)?;
         if let Ingested::Provisional { accepted: one, .. } = merge.ingest(
             &early(world, &world.west_key, at as u64, &solution)?,
-            world.now,
+            mono(world.now),
         )? {
             accepted += one;
         }
@@ -798,7 +853,7 @@ fn a_live_engines_provisionals_are_superseded_or_confirmed_by_its_finals() -> Re
         let Ok(record) = ClientRecord::try_from(record) else {
             continue;
         };
-        merge.ingest(&record, at)?;
+        merge.ingest(&record, mono(at))?;
         if matches!(record, ClientRecord::Provisional(_)) {
             served_provisional += merge
                 .tracks()
@@ -811,8 +866,8 @@ fn a_live_engines_provisionals_are_superseded_or_confirmed_by_its_finals() -> Re
                 .count();
         }
     }
-    let end = until + PROVISIONAL_DEADLINE_MS + 1;
-    merge.ingest(&ClientRecord::Heartbeat, end)?;
+    let end = until + PROVISIONAL_DEADLINE.ms() + 1;
+    merge.ingest(&ClientRecord::Heartbeat, mono(end))?;
     let counts = merge.provisional_counts();
     eprintln!("{counts:?}");
     assert!(counts.accepted >= 200, "{counts:?}");

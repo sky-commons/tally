@@ -32,6 +32,8 @@ fn packaged_unit() -> PathBuf {
 
 /// What `check` said: its exit, its stdout's plan (`name value` a line) and its stderr.
 struct Checked {
+    /// The arguments it was checked with.
+    args: Vec<String>,
     accepted: bool,
     plan: Vec<(String, String)>,
     refusal: String,
@@ -93,6 +95,7 @@ fn check(args: &[&str]) -> Result<Checked> {
         })
         .collect::<Result<Vec<(String, String)>>>()?;
     Ok(Checked {
+        args: args.iter().map(|arg| (*arg).to_owned()).collect(),
         accepted: output.status.success(),
         plan,
         refusal: String::from_utf8_lossy(&output.stderr).into_owned(),
@@ -274,8 +277,8 @@ fn assert_plan_holds(checked: &Checked) -> Result {
             let window = checked.get(&format!("window-{}", store.name()))?;
             let members_window = checked.get(&format!("members-window-{}", store.name()))?;
             // The fingerprints' tables' fixed part, what waits for the sealer whatever it holds,
-            // the tables' of what was taken, the fan-out's queues and the sharing outbox's slots
-            // are held before any feeder, beside the rate's.
+            // the tables' of what was taken, the fan-out's queues, the sharing outbox's slots and
+            // the receivers' tables' fixed parts are held before any feeder, beside the rate's.
             let limit = match store {
                 tally_relay::budget::Store::Dedup => limit - checked.get("dedup-tables")?,
                 tally_relay::budget::Store::Epochs => limit - checked.get("epochs-fixed")?,
@@ -290,6 +293,16 @@ fn assert_plan_holds(checked: &Checked) -> Result {
                 }
                 tally_relay::budget::Store::Fanout => limit - checked.get("fanout-queues")?,
                 tally_relay::budget::Store::Batches => limit - checked.get("sharing-outbox")?,
+                // The tables of one entry per receiver: what they hold whatever the rate.
+                tally_relay::budget::Store::Credit => limit - checked.get("credit-tables")?,
+                tally_relay::budget::Store::Stations => limit - checked.get("station-tables")?,
+                tally_relay::budget::Store::Descriptions => {
+                    limit - checked.get("description-tables")?
+                }
+                tally_relay::budget::Store::Located => limit - checked.get("located-tables")?,
+                tally_relay::budget::Store::Consistency => {
+                    limit - checked.get("consistency-tables")?
+                }
                 _ => limit,
             };
             let expected = window * rate + members_window * members_rate;
@@ -311,6 +324,17 @@ fn assert_plan_holds(checked: &Checked) -> Result {
     let hosted = checked.text("mlat-seats-bound")? != "not-hosted";
     assert_eq!(checked.get("mlat-seats")? > 0, hosted, "{plan:?}");
     assert!(checked.get("mlat-seats")? <= connections, "{plan:?}");
+    // The tables that grow with what the relay is sent are each held before any feeder: the
+    // products' remembered tables always, standing's where MLAT is hosted (among MLAT's tables),
+    // the world's fixes only where they are gathered (`--world`, `--world-precise`).
+    assert!(checked.get("remembered-tables")? > 0, "{plan:?}");
+    assert_eq!(checked.get("mlat-tables")? > 0, hosted, "{plan:?}");
+    assert!(checked.get("consistency-tables")? > 0, "{plan:?}");
+    assert_eq!(
+        checked.get("world-fixes")? > 0,
+        checked.args.iter().any(|arg| arg.starts_with("--world")),
+        "{plan:?}"
+    );
     // The handshakes allowed at once are a core's worth of them.
     assert!(
         checked.get("handshakes-in-flight")? >= checked.get("cores")?,
@@ -332,9 +356,12 @@ fn assert_plan_holds(checked: &Checked) -> Result {
 #[test]
 fn a_configuration_the_relay_takes_is_accepted_with_its_plan() -> Result {
     // A key file that does not exist: check reads no key, which is an operator's secret.
+    // Its memory the least round figure that holds what it plans before any feeder (its members'
+    // rate's models over their hold among it, `models::BYTES_PER_MEMBER_FEEDER`) and a
+    // connection with its seat.
     let checked = check(&[
         "--memory-limit",
-        "1G",
+        "1536M",
         "--cores",
         "2",
         "--key",
@@ -342,7 +369,7 @@ fn a_configuration_the_relay_takes_is_accepted_with_its_plan() -> Result {
         "--max-upload",
         "6Mbit/s",
         "--memory",
-        "720M",
+        "1152M",
         "--max-connections",
         "32",
         "--max-member-bytes-per-sec",
@@ -351,10 +378,10 @@ fn a_configuration_the_relay_takes_is_accepted_with_its_plan() -> Result {
         "8001fffffffffff",
     ])?;
     assert!(checked.accepted, "{}", checked.refusal);
-    assert_eq!(checked.get("memory")?, 720 << 20);
+    assert_eq!(checked.get("memory")?, 1152 << 20);
     // It hosts MLAT by default, on the threads its cores' plan gives it.
     assert!(checked.get("mlat-threads")? >= 1, "{:?}", checked.plan);
-    assert_eq!(checked.get("limit")?, 1 << 30);
+    assert_eq!(checked.get("limit")?, 1536 << 20);
     // A base cell's groups reach every relay offering it or a cell under it, far more than 32:
     // the member sessions planned are the cap's worth.
     assert_eq!(checked.get("members")?, 32);
@@ -834,40 +861,35 @@ MemoryMax=4G
     Ok(())
 }
 
-/// The packaged unit's seccomp filter lets through every system call the relay's read of its
-/// clock's error bound may make (`tally_wire::kernel_clock::SYSCALLS`, the one list that read is
-/// made of), or the relay refuses to start (`clock::kernel_answers`); and a call it does refuse
-/// fails with EPERM, so a relay refused its clock says why rather than dying of SIGSYS.
+/// The packaged unit reads the judging clock's bound as ClockBound publishes it: ordered after
+/// `clockbound.service` and never pulling it in (a host without it runs a relay that judges
+/// nothing), and letting its client read VMClock (`tally_wire::clock_bound::unit_faults`); it
+/// filters every call that would set the clock (`ProtectClock=yes`), since nothing in the relay
+/// reads `adjtimex` any more; and a call it refuses fails with EPERM rather than SIGSYS.
 #[test]
-fn the_packaged_unit_lets_the_relay_read_its_clock() -> Result {
+fn the_packaged_unit_reads_clockbound_and_cannot_set_the_clock() -> Result {
     let path = packaged_unit();
     let text =
         std::fs::read_to_string(&path).map_err(|error| format!("{}: {error}", path.display()))?;
-    let refused = tally_wire::kernel_clock::refused_by(&text);
-    assert!(refused.is_empty(), "{} refuses {refused:?}", path.display());
-    let errno = unit_settings(&text)
-        .into_iter()
-        .rev()
-        .find(|(key, _)| key == "SystemCallErrorNumber")
-        .map(|(_, value)| value);
-    assert_eq!(errno.as_deref(), Some("EPERM"), "{}", path.display());
-    Ok(())
-}
-
-/// The packaged unit starts once the host's time daemon has set the clock, and names the daemons
-/// that keep the bound the relay judges by: after chrony's wait, which it pulls in, and after
-/// `time-sync.target`, which it never pulls in (systemd.special(7);
-/// `tally_wire::kernel_clock::TIME_WAITS`; RFC-0171 §3.6, chrony or ntpd, never
-/// systemd-timesyncd).
-#[test]
-fn the_packaged_unit_waits_for_a_bounded_clock() -> Result {
-    let path = packaged_unit();
-    let text =
-        std::fs::read_to_string(&path).map_err(|error| format!("{}: {error}", path.display()))?;
-    let unwaited = tally_wire::kernel_clock::unwaited(&text);
-    assert!(
-        unwaited.is_empty(),
-        "{} holds its clock waits wrongly: {unwaited:?}",
+    let faults = tally_wire::clock_bound::unit_faults(&text);
+    assert!(faults.is_empty(), "{}: {faults:?}", path.display());
+    let last = |name: &str| {
+        unit_settings(&text)
+            .into_iter()
+            .rev()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value)
+    };
+    assert_eq!(
+        last("ProtectClock").as_deref(),
+        Some("yes"),
+        "{}",
+        path.display()
+    );
+    assert_eq!(
+        last("SystemCallErrorNumber").as_deref(),
+        Some("EPERM"),
+        "{}",
         path.display()
     );
     Ok(())

@@ -508,6 +508,14 @@ pub const fn table<K, V>(buckets: usize) -> usize {
     round_up(buckets * size_of::<(K, V)>(), align) + buckets + GROUP_WIDTH
 }
 
+/// What a `HashMap<K, V>` made by `HashMap::with_capacity(entries)` allocates: the fewest buckets
+/// whose capacity takes them ([`buckets_for`]). A map that never takes an entry past its capacity
+/// (its owner makes it anew before it would, as `Bounded` in a relay does) allocates this and no
+/// more, whatever it is told, since only a full table grows.
+pub const fn table_made<K, V>(entries: usize) -> usize {
+    table::<K, V>(buckets_for(entries, size_of::<(K, V)>()))
+}
+
 /// What a `HashMap<K, V>` holding at most `held` entries, as many removed as are inserted (a
 /// bounded cache churned at its cap), allocates at most at any instant. Removing leaves deleted
 /// slots, and once no slot is free hashbrown rehashes in place only while its entries fill no more
@@ -526,6 +534,20 @@ pub const fn table_planned<K, V>(entries: usize) -> usize {
     let buckets = 16 + (entries * 16).div_ceil(7);
     let align = max(align_of::<(K, V)>(), GROUP_WIDTH);
     buckets * size_of::<(K, V)>() + (align - 1) + buckets + GROUP_WIDTH
+}
+
+/// What [`table_planned`] takes for each entry at most, linear: `table_planned(n)` is never more
+/// than `table_planned(0)`, one bucket more, and `n` times this (sixteen sevenths of a bucket, its
+/// entry and its control byte, rounded up). What a plan that sizes a table by a figure of entries
+/// takes for each.
+pub const fn table_planned_per_entry<K, V>() -> usize {
+    (16 * (size_of::<(K, V)>() + 1)).div_ceil(7)
+}
+
+/// What [`table_planned`] takes beside [`table_planned_per_entry`] for each entry: the table of
+/// none, and the one bucket the entries' share is rounded up by.
+pub const fn table_planned_fixed<K, V>() -> usize {
+    table_planned::<K, V>(0) + size_of::<(K, V)>() + 1
 }
 
 /// The most a `HashMap<K, V>` holding at least one entry allocates for each, while its capacity is
@@ -672,6 +694,24 @@ mod tests {
 
     use super::*;
     use std::collections::HashMap;
+
+    /// A table planned for a figure of entries is never planned at more than its linear figures
+    /// say, on each side of every rounding.
+    #[test]
+    fn a_planned_table_is_within_its_linear_figures() {
+        fn check<K, V>() {
+            for n in 0..10_000usize {
+                assert!(
+                    table_planned::<K, V>(n)
+                        <= table_planned_fixed::<K, V>() + n * table_planned_per_entry::<K, V>(),
+                    "{n}"
+                );
+            }
+        }
+        check::<[u8; 32], u64>();
+        check::<u8, ()>();
+        check::<[u8; 32], [u8; 40]>();
+    }
 
     /// A table followed through growth, churn and shrinking names the buckets `hashbrown` gives it,
     /// read where they can be read (its capacity right after it is made anew), and growth is

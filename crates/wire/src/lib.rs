@@ -1,11 +1,12 @@
 //! The only code that speaks Tally's wire (RFC-0171 §3): the BEAST frames a receiver's decoder
 //! emits, the signed batches that carry them, the records that move between feeders, relays and
 //! subscribers, and the Noise transport every hop runs over. Every binary goes through this crate.
-// The crate that holds every key: no `unsafe` code outside the one read of the host's clock
-// (`kernel_clock`). Denied, not forbidden, since `kernel_clock` needs its allow, and a forbid
-// refuses that too: the build refuses `unsafe` in every other module, and that `kernel_clock`
-// touches no key, so nothing can forge what the types refuse (`key`'s seal), is review's to hold. A test's
-// counting allocator is the test-support crate's (`tally_counting`), never this one's.
+// The crate that holds every key: no `unsafe` code outside the one read of the host's raw clock
+// (`kernel_clock`; the clock's bound, `clock_bound`, is read through ClockBound's own client).
+// Denied, not forbidden, since `kernel_clock` needs its allow, and a forbid refuses that too: the
+// build refuses `unsafe` in every other module, and that `kernel_clock` touches no key, so nothing
+// can forge what the types refuse (`key`'s seal), is review's to hold. A test's counting allocator
+// is the test-support crate's (`tally_counting`), never this one's.
 #![deny(unsafe_code)]
 
 pub mod acars;
@@ -15,6 +16,7 @@ pub mod batch;
 pub mod beast;
 pub mod budget;
 pub mod client;
+pub mod clock_bound;
 pub mod clock_model;
 pub mod clocks;
 pub mod credit;
@@ -44,8 +46,8 @@ pub mod site;
 
 pub use anchor::Anchor;
 pub use batch::{
-    Batch, BatchContent, BatchDraft, Clock, Codec, Description, Location, Observation,
-    PublicInfoContent, ReceiverInfo,
+    Batch, BatchContent, BatchDraft, Clock, Codec, Description, EncodedBatch, Location,
+    Observation, PublicInfoContent, ReceiverInfo,
 };
 pub use beast::{Frame, FrameKind};
 /// The shared byte buffer batches are held in, so a crate reading them needs no dependency of its own.

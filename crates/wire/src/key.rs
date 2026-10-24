@@ -395,7 +395,10 @@ impl std::fmt::Debug for NoiseKey {
 /// keeps it), so a step that finishes after the clock lost sync signs nothing, and a signer added
 /// later cannot reach the key without asking. The one other use of the key, a transport
 /// handshake (Noise), states no time and is named apart ([`Signer::handshake`]), by a key that
-/// cannot sign ([`NoiseKey`]).
+/// cannot sign ([`NoiseKey`]). The one record signed whatever the clock is a relay's answer to a
+/// probe (`EchoReply::answer`), through a lending this crate keeps to itself: the answer decides
+/// the time it states, a judging reading (never a number) while this signer's clock judges and 0
+/// while it does not, so no code holding a `Signer` gets a time signed through it.
 ///
 /// What a signing looks like, and what the compile-fail examples beside it change by one line:
 ///
@@ -464,6 +467,20 @@ impl Signer {
             }))
         } else {
             then(None)
+        }
+    }
+
+    /// The key for a record that states no unjudged time, whatever the clock: wire's own, for the
+    /// one record a relay must sign while its clock does not judge, its answer to a probe
+    /// (`probe::EchoReply::answer`), which decides its time itself: a judging reading's while this
+    /// signer's clock judges, 0 while it does not, never a number its caller passes. A
+    /// relay that cannot judge must still be reached and chosen (RFC-0171 §3.6: no clock decides
+    /// what a feeder sends, and an unsynced relay still receives everything), and a feeder
+    /// chooses only a relay whose answer verifies. Crate-private, so no part of a relay can sign
+    /// a time by it.
+    pub(crate) fn untimed(&self) -> Signing<'_> {
+        Signing {
+            identity: handshake_key_of(&self.identity),
         }
     }
 

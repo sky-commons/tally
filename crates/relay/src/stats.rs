@@ -17,7 +17,8 @@
 //!   and its step reports; 404 when the relay hosts no MLAT.
 //! - `GET /memory`: the memory budget, every store's gauge and the decoded batches alive
 //!   (`hub::MemoryReport`), and the feeders' batches dropped past their receiver's wanted
-//!   receptions a second (`over_reception_ceiling`).
+//!   receptions a second (`over_reception_ceiling`), and what the relay's standing holds and has
+//!   taken in (`standing`, `standing::StandingReport`).
 //! - `GET /products`: what the regional and world products have done and let go
 //!   (`products::ProductsReport`), every drop by why.
 //!
@@ -147,18 +148,21 @@ async fn products(State(hub): State<Arc<Hub>>) -> Response {
 /// The budget and every store's gauge, with what the stores that count their own bytes hold
 /// (the batch byte store, the delivery tags) and the decoded batches alive in all.
 /// `GET /memory`: the memory report, and beside it the feeders' batches dropped for taking their
-/// receiver past its wanted receptions a second (`Hub::over_reception_ceiling`).
+/// receiver past its wanted receptions a second (`Hub::over_reception_ceiling`), and what standing
+/// holds and has taken in (`Standing::report`).
 #[derive(serde::Serialize)]
 struct Memory {
     #[serde(flatten)]
     report: crate::hub::MemoryReport,
     over_reception_ceiling: crate::hub::OverCeiling,
+    standing: crate::standing::StandingReport,
 }
 
 async fn memory(State(hub): State<Arc<Hub>>) -> Response {
     axum::Json(Memory {
         report: hub.memory_report(),
         over_reception_ceiling: hub.over_reception_ceiling(),
+        standing: hub.network().standing.report(),
     })
     .into_response()
 }
@@ -179,6 +183,7 @@ async fn station(State(hub): State<Arc<Hub>>, Path(key): Path<String>) -> Respon
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::disallowed_methods, reason = "a test's scripted readings")]
     use super::*;
     use crate::stations::{StationReport, StationsReport};
     use tally_wire::batch::ReceiverInfoContent;
@@ -370,6 +375,10 @@ mod tests {
     /// The products' and the hosted MLAT's counters are served, every drop by why; a relay that
     /// hosts no MLAT says so.
     #[tokio::test]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "a test's signer, on a clock that always judges"
+    )]
     async fn the_products_and_mlat_counters_are_served() -> Result<(), String> {
         let hub = Arc::new(Hub::new(8, crate::sharing::Deadlines::RELAY));
         let listener = TcpListener::bind("127.0.0.1:0").await.map_err(text)?;
@@ -394,8 +403,10 @@ mod tests {
             },
             crate::mlat_host::WindowClock::KEEPING_UP,
         )?);
-        let hub = Arc::new(Hub::new(8, crate::sharing::Deadlines::RELAY));
-        hub.network().host_mlat(hosted);
+        let hub = Arc::new(
+            Hub::new(8, crate::sharing::Deadlines::RELAY).memory(crate::hub::DEFAULT_MEMORY, true),
+        );
+        hub.host_mlat(hosted)?;
         let listener = TcpListener::bind("127.0.0.1:0").await.map_err(text)?;
         let address = listener.local_addr().map_err(text)?;
         tokio::spawn(serve(listener, Arc::clone(&hub)));
@@ -425,6 +436,17 @@ mod tests {
         ] {
             assert!(body.contains(counter), "{counter} not served: {body}");
         }
+        // `/memory` serves standing beside what it served before (an addition: no field renamed).
+        let (status, body) = get(address, "/memory").await?;
+        assert_eq!(status, 200, "{body}");
+        let memory: serde_json::Value = serde_json::from_str(&body).map_err(text)?;
+        assert!(memory.get("over_reception_ceiling").is_some(), "{body}");
+        assert!(memory.get("budget").is_some(), "{body}");
+        assert_eq!(
+            memory.get("standing"),
+            Some(&serde_json::to_value(hub.network().standing.report()).map_err(text)?),
+            "{body}"
+        );
         Ok(())
     }
 }

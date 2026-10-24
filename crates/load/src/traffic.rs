@@ -133,6 +133,10 @@ pub struct Made {
     pub contents: u64,
     /// What the relay's deduplicated stream carries when it loses nothing ([`Dedup`]).
     pub deduplicated: u64,
+    /// Distinct transmissions heard by enough receivers to be multilaterated
+    /// (`tally_mlat_solver::solve::MIN_RECEIVERS`), so a run without one cannot ask MLAT for a
+    /// position.
+    pub multilaterable: u64,
 }
 
 impl Made {
@@ -141,6 +145,7 @@ impl Made {
         self.transmissions += other.transmissions;
         self.contents += other.contents;
         self.deduplicated += other.deduplicated;
+        self.multilaterable += other.multilaterable;
     }
 
     /// A count a second.
@@ -200,8 +205,8 @@ struct Second {
 /// A second being made, until the simulation has passed it.
 struct Making {
     second: Second,
-    /// The last transmission noted, and its index in `second.messages`.
-    last: Option<(usize, u32)>,
+    /// The last transmission noted, its index in `second.messages`, and how many heard it.
+    last: Option<(usize, u32, usize)>,
     /// What everyone heard, by the bytes' hash.
     contents: HashSet<u64>,
     made: Made,
@@ -701,14 +706,20 @@ impl Maker<'_> {
             return;
         };
         now.made.receptions += 1;
-        let message = match now.last {
-            Some((last, at)) if last == source => at,
+        let message = match &mut now.last {
+            Some((last, at, hearers)) if *last == source => {
+                *hearers += 1;
+                if *hearers == tally_mlat_solver::solve::MIN_RECEIVERS {
+                    now.made.multilaterable += 1;
+                }
+                *at
+            }
             _ => {
                 now.made.transmissions += 1;
                 now.contents.insert(content_hash(data));
                 let at = now.second.messages.len() as u32;
                 now.second.messages.push(data.to_vec());
-                now.last = Some((source, at));
+                now.last = Some((source, at, 1));
                 at
             }
         };
@@ -977,6 +988,10 @@ mod tests {
         assert!((per_sec - 20.0).abs() < 5.0, "{made:?}");
         assert!(made.receptions > made.transmissions, "{made:?}");
         assert!(made.deduplicated <= made.contents, "{made:?}");
+        // Some transmissions are heard by enough receivers to multilaterate, and none twice.
+        assert!(made.multilaterable > 0, "{made:?}");
+        assert!(made.multilaterable * 4 <= made.receptions, "{made:?}");
+        assert!(made.multilaterable < made.transmissions, "{made:?}");
         // A shard holds exactly the whole run's receivers in its slice, hearing the same.
         let shard = Traffic::build(&spec, 185..215, Pace::Free)?;
         assert_eq!(shard.receivers.len(), 30);

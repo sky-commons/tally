@@ -4,6 +4,7 @@
 //! three endpoints from them over loopback HTTP, with CORS, caching and the rate limit on each, and
 //! pushes a viewport's aircraft as a stream; it answers a client its own stations, the ADS-B
 //! Exchange-compatible `/v2` from readsb, and routes from a standing-data directory.
+#![allow(clippy::disallowed_methods, reason = "a test's scripted readings")]
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -54,10 +55,12 @@ const WAIT: Duration = Duration::from_secs(120);
 /// allows no origin of its own accord.
 const SITE: &str = "https://site.example";
 
-/// The API's settings over `relay_stats` and `readsb`, the test's site allowed.
+/// The API's settings over `relay_stats` and `readsb`, the test's site allowed, on the host's
+/// clocks with their bound stated (no test host runs ClockBound).
 fn settings(relay_stats: impl Into<String>, readsb: impl Into<String>) -> Settings {
     let mut settings = Settings::new(relay_stats, readsb);
     settings.allow_origins = vec![SITE.to_owned()];
+    settings.clock = tally_api::mlat::Clock::host_stated();
     settings
 }
 
@@ -1090,6 +1093,10 @@ impl MlatHost for Held {
     fn report(&self) -> MlatReport {
         self.host.report()
     }
+
+    fn take_own_models(&self) -> Vec<tally_relay::mlat_host::OwnModel> {
+        self.host.take_own_models()
+    }
 }
 
 /// The areas within about 150 km of the simulator's centre.
@@ -1116,6 +1123,10 @@ fn areas() -> Result<Vec<Region>> {
 
 /// A relay hosting MLAT for the simulator's areas, on `clock`: its address as a client names it,
 /// its hub and its hosted MLAT.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "the hosted MLAT's signer, on a clock that always judges"
+)]
 async fn mlat_relay(clock: &Arc<stepping::Clock>) -> Result<(RelayAddress, Arc<Hub>, Arc<Held>)> {
     let identity = Identity::generate().map_err(text)?;
     let key = identity.public();
@@ -1125,7 +1136,9 @@ async fn mlat_relay(clock: &Arc<stepping::Clock>) -> Result<(RelayAddress, Arc<H
     let hub = Arc::new(
         Hub::clocked(8, clock.clock(), tally_relay::sharing::Deadlines::RELAY)
             .accepting_relays([tally_mlat_solver::sim::anchoring_relay().public()])
-            .max_connections_per_address(64),
+            .max_connections_per_address(64)
+            // Its raw planned, as `tally-relay` plans a relay hosting MLAT.
+            .memory(tally_relay::hub::DEFAULT_MEMORY, true),
     );
     let areas = tally_wire::Regions::new(areas()?);
     let host = HostedMlat::new(
@@ -1142,8 +1155,7 @@ async fn mlat_relay(clock: &Arc<stepping::Clock>) -> Result<(RelayAddress, Arc<H
     )?;
     host.set_areas(areas.clone(), Vec::new());
     let held = Arc::new(Held { host, areas });
-    hub.network()
-        .host_mlat(Arc::clone(&held) as Arc<dyn MlatHost>);
+    hub.host_mlat(Arc::clone(&held) as Arc<dyn MlatHost>)?;
     tokio::spawn(tally_relay::serve(
         listener,
         vec![identity],
@@ -1274,6 +1286,12 @@ async fn the_api_serves_one_merged_mlat_position_per_aircraft_from_two_relays() 
     );
 
     let mut merge = Merge::new(tally_merge::Settings::default());
+    // One reading for every record: this merge never waits out a provisional's deadline.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "a test's merge, read at one scripted instant"
+    )]
+    let at = tally_wire::clocks::recorded::mono(0);
     let last: Arc<Mutex<String>> = Arc::default();
     let url = format!("{api}/v1/aircraft?west=0&south=49&east=10&north=55");
     // The scenario at the wall clock's pace at most, and a hang guard beyond: the clock walks no
@@ -1282,7 +1300,7 @@ async fn the_api_serves_one_merged_mlat_position_per_aircraft_from_two_relays() 
     let outcome = tokio::time::timeout(Duration::from_secs(180) + WAIT, async {
         loop {
             while let Ok(record) = records.try_recv() {
-                merge.ingest(&record, 0).map_err(text)?;
+                merge.ingest(&record, at).map_err(text)?;
             }
             let expected: Vec<(String, f64, f64, Option<i32>)> = tally_api::mlat::served(&merge)
                 .into_iter()

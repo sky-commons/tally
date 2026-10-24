@@ -15,6 +15,13 @@ pub const LEVELS: u8 = 4;
 pub const RADIUS_MM: [i64; LEVELS as usize] = [50_000_000, 100_000_000, 200_000_000, 400_000_000];
 /// The most members a tile has (`M`).
 pub const MEMBERS_MAX: usize = 48;
+/// The most tiles, over every level, that may hold a receiver's site in their footprint and be
+/// fitted: a tile is fitted only where it holds the lower median of some aircraft's hearers
+/// (`assign`), which lies within a hearer's spread of the ground, so every such tile's cube meets
+/// the shell from 25 km under the ellipsoid to 10 km over it, and its centre is within the
+/// level's footprint of the site. Counted by enumerating the cubes about sites at every latitude
+/// (the test `no_site_is_in_more_tiles_than_planned` holds it): 90, 72, 64 and 58 by level.
+pub const SITE_TILES_MOST: usize = 90 + 72 + 64 + 58;
 
 /// One tile: a level and the integer ECEF cube (edge half the level's radius) its centre is in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]

@@ -8,6 +8,7 @@
 //! | term | value | what it absorbs |
 //! | --- | --- | --- |
 //! | [`E`] | 7.5 s | a judging relay's (or a synced host's) clock against true time |
+//! | [`CLOCK_BOUND_MARGIN`] | 418 ms | what ClockBound's word may leave unsaid of `E`: `J`'s whole milliseconds and its documented gaps |
 //! | [`U_M`] | 1 s | a feeder's measurement of one relay's clock |
 //! | [`TRANSIT`] (`δ`) | 1 s | one way, feeder to relay or relay to feeder |
 //! | [`ANCHOR_PERIOD`] (`P`) | 1 s | how often a relay signs a new anchor |
@@ -24,11 +25,14 @@
 //! | [`ANCHOR_AGE`] | 4 s | an honest anchor's age as a batch is signed by it: `P + δ + 2P` |
 //! | [`MLAT_BATCHING`] | 2 s | a receiver's last raw of a bin, gathered and on its way |
 //! | [`MLAT_SOLVE`] | 80 s | a final MLAT fix's way out of its engine, its window's last bin settled |
+//! | [`PROVISIONAL_SOLVE`] | 4 s | a provisional MLAT fix's way out of its engine, its first reception in |
 //!
 //! What follows from them is each derived below with the error each term absorbs: the feeder's,
 //! peers' and anchors' windows, [`OWN_ANCHOR_OLDEST`] (blame, measured on the origin's raw
 //! monotonic clock), the hosted MLAT's [`MLAT_AHEAD`] and [`MLAT_SETTLE`], when a final fix has
-//! left its engine ([`FINAL_FIX_LEAVES`]) and surely arrived ([`FINAL_FIX_ARRIVED`]), the feeder
+//! left its engine ([`FINAL_FIX_LEAVES`]) and surely arrived ([`FINAL_FIX_ARRIVED`]), when a live
+//! world fix has been offered where it was heard ([`LIVE_FIX_LEAVES`]) and surely arrived wherever
+//! the world is gathered ([`LIVE_FIX_ARRIVED`], the live world's settle), the feeder
 //! figures' [`Window::FIGURES`] and [`Window::FIGURES_POSITIONS`], when a relay restates its clock
 //! to a feeder ([`RESTATE_BEYOND`]), and the strike tables' [`FALLBACK_FLOOR`]. A signed time
 //! compared against a clock is compared through [`Tolerance`]'s methods or a [`Window`], never by
@@ -196,10 +200,18 @@ impl Tolerance {
         now.ms() / 1000 > second.saturating_add(self.0 / 1000)
     }
 
-    /// Whether an error a clock's keeper states, `ms` (a kernel's bound, a measurement's
+    /// Whether an error a clock's keeper states, `ms` (ClockBound's bound, a measurement's
     /// uncertainty: a number it reports, not a span measured here), is within this.
     pub const fn covers(self, ms: u64) -> bool {
         ms <= self.0
+    }
+
+    /// The most bytes a source held to `bytes_per_sec` gathers over this span, rounded up. Of
+    /// [`B`], what a feeder at its upload ceiling gathers into the batches it holds for an anchor
+    /// at once ([`ANCHOR_WAIT`], the seal that releases them and its ceiling's burst:
+    /// `tally_feed`'s `batches_held` and `held_bytes`), which sizes that hold's memory.
+    pub const fn gathered(self, bytes_per_sec: u64) -> u64 {
+        bytes_per_sec.saturating_mul(self.0).div_ceil(1_000)
     }
 }
 
@@ -236,9 +248,9 @@ use crate::clocks::{Judged, Reading, Span};
 // The sources: each measured, configured or allowed once.
 
 /// `E`, 7.5 s: the most a judging relay's clock may be from true time, the cap past which it
-/// counts itself unsynced and signs nothing (its host's NTP daemon keeps it within, its kernel's
-/// `maxerror` says by how much); and the most a synced host's bound may be for a feeder to trust
-/// it.
+/// counts itself unsynced and signs nothing (its host's NTP daemon keeps it within, its host's
+/// ClockBound says by how much, `crate::clock_bound`); and the most a synced host's bound may be
+/// for a feeder to trust it.
 pub const E: Tolerance = Tolerance(7_500);
 
 /// `U_m`, 1 s: the most a feeder's measurement of one relay's clock may be off (half the round
@@ -309,6 +321,15 @@ pub const MLAT_BATCHING: Tolerance = Tolerance(2_000);
 /// after that, once that bin has settled, and at world scale its fits take some 35 s. The engine's
 /// design, not a clock's error.
 pub const MLAT_SOLVE: Tolerance = Tolerance(8 * 5_000 + 5_000 + 35_000);
+
+/// 4 s: the engine's share of a provisional MLAT fix's way out (RFC-0171 §3.8.1), counted from
+/// its transmission's first reception reaching the engine's relay (its stamp) to the fix's
+/// records taken for the network: the transmission due a second and a tenth after, kept a second
+/// more while too few receivers have come, weighed by the first step after that, and published
+/// within that step's own deadline. The hosted MLAT asserts its steps fit it (`tally_relay`'s
+/// `mlat_host`, `PROVISIONAL_PUBLISH_MS`) and refuses a step's records past it, counted. The
+/// engine's design, not a clock's error.
+pub const PROVISIONAL_SOLVE: Tolerance = Tolerance(4_000);
 
 /// `ρ`, 500 ppm: how fast a clock may drift between measurements, the kernel's most frequency
 /// correction (`MAXFREQ`). A rate, not a span: it ages a measurement's uncertainty.
@@ -384,6 +405,46 @@ pub const fn passed(stated_ms: u64, now: Judged) -> bool {
 /// compared with a clock only through the tolerance.
 pub const FINAL_FIX_ARRIVED_MS: u64 = FINAL_FIX_ARRIVED.0;
 
+/// chrony's fastest slew (`maxslewrate`), parts per million: the most the tick may be biased by
+/// a chronyd that died mid-slew.
+const CHRONY_SLEW_PPM: u64 = 83_333;
+
+/// ClockBound's grace (`CHRONY_RESTART_GRACE_PERIOD`): how long after its last sample a stopped
+/// ClockBound's segment still reads `Synchronized` to a client.
+const CLOCKBOUND_GRACE_MS: u64 = 5_000;
+
+/// How long ClockBound's poll of a hung chronyd waits (its 1 s query timeout) after its 100 ms
+/// poll period before it writes `FreeRunning`.
+const CHRONY_HUNG_MS: u64 = 1_100;
+
+/// The most the tick runs off, unbounded, over `ms` at chrony's fastest slew, rounded up.
+const fn slewed(ms: u64) -> u64 {
+    (ms * CHRONY_SLEW_PPM).div_ceil(1_000_000)
+}
+
+/// What ClockBound's word on the clock may leave unsaid, 418 ms (`crate::clock_bound`'s residual
+/// gaps): a judging reading of `J` is whole milliseconds truncated (1 ms), and its bound may
+/// understate the error by the slew of a chronyd that died mid-slew for as long as the status
+/// still says `Synchronized`: up to about 92 ms while ClockBound polls a hung chronyd (1.1 s), and
+/// up to about 417 ms when ClockBound stops with chronyd (its segment read `Synchronized` for 5 s
+/// after its last sample). The two do not add: a ClockBound that polls writes `FreeRunning` once
+/// its poll fails, and one that stopped stops polling, so the slew runs unsaid at most the longer
+/// of the two. So a bound judges only within `E` less this ([`judging_bound`]), and a judging
+/// clock is within `E` of true time even across those gaps.
+pub const CLOCK_BOUND_MARGIN: Tolerance = Tolerance(
+    1 + if slewed(CLOCKBOUND_GRACE_MS) > slewed(CHRONY_HUNG_MS) {
+        slewed(CLOCKBOUND_GRACE_MS)
+    } else {
+        slewed(CHRONY_HUNG_MS)
+    },
+);
+
+/// Whether ClockBound's stated bound, `ms`, leaves the clock within [`E`] even past what it may
+/// leave unsaid ([`CLOCK_BOUND_MARGIN`]): the one test of a bound's width.
+pub const fn judging_bound(ms: u64) -> bool {
+    E.minus(CLOCK_BOUND_MARGIN).covers(ms)
+}
+
 /// [`E`] in milliseconds, as a protocol constant: the error a relay that states none is taken to
 /// have (`tally_feed`'s relay clocks), since a relay that judges states at most this.
 pub const E_MS: u64 = E.0;
@@ -399,9 +460,10 @@ pub const K: Tolerance = E.times(2);
 /// judged by this one's, each within `E` of true time, so at most `K` apart.
 pub const RECEIPT_AHEAD: Tolerance = K;
 
-/// `K`, 15 s: how far ahead of the API's clock a precise MLAT second may be and still be served
-/// (`tally_api`'s `mlat`): the second is signed by its relay's judging clock and judged by the
-/// API's, each within `E` of true time either way, so they are at most `K` apart.
+/// `K`, 15 s: how far ahead of the API's clock a precise MLAT second's seal may be and still be
+/// served (`tally_api`'s `mlat`): second `s` is sealed no earlier than `(s + 1) * 1000 +
+/// FINAL_FIX_ARRIVED` by its relay's judging clock, and judged by the API's, each within `E` of
+/// true time either way, so they are at most `K` apart.
 pub const PRODUCT_AHEAD: Tolerance = K;
 
 /// `2(E + U_m)`, 17 s: the widest trusted reference a feeder signs by, so how far below true time
@@ -480,10 +542,9 @@ pub const ANCHOR_AHEAD: Tolerance = SELECTION_LAG.plus(ANCHOR_ABOVE_REFERENCE).p
 /// by), counted in. A batch the origin finds older than this by its own anchor, and too old by
 /// its signed time, is blamed on its receiver (`strikes::blame`). The origin keeps a ring of its
 /// recent issues: an anchor the ring has let go is aged from the newest issue it let go, which
-/// it was issued no later than, so its age is never overstated; a batch carrying none of its
-/// anchors is blamed by its signed time. For this span after its first issue of a run (a
-/// restart), the origin cannot tell an earlier run's anchor from none, so it blames nothing
-/// (`strikes::OwnAnchor::Unknowable`).
+/// it was issued no later than, and an earlier run's from this run's first issue, so its age is
+/// never overstated; a batch carrying none of its anchors is never blamed
+/// (`strikes::OwnAnchor::Absent`).
 pub const OWN_ANCHOR_OLDEST: Tolerance = ANCHOR_AGE.plus(B).plus(TRANSIT).drifted();
 
 /// `E`, 7.5 s: how far past a batch's judging time a bin of the hosted MLAT may begin and its raw
@@ -524,6 +585,24 @@ pub const FINAL_FIX_LEAVES: Tolerance = MLAT_SETTLE.plus(MLAT_SOLVE);
 /// or when a fix arrived, which is later), so waiting this long from either is enough.
 pub const FINAL_FIX_ARRIVED: Tolerance = MLAT_SOLVE.plus(MLAT_SETTLE).plus(K).plus(REPAIR_TRANSIT);
 
+/// `MLAT_SETTLE + PROVISIONAL_SOLVE`, 15.5 s: how long after a transmission its live world fix
+/// has been offered by the relay that heard it, by that relay's judging clock: the feeder path.
+/// Its receptions are signed at most `E + 2U_m` below that clock and their batch is on its way
+/// within [`MLAT_BATCHING`] ([`MLAT_SETTLE`], 11.5 s, as for the hosted MLAT's raw), and its fix
+/// leaves within [`PROVISIONAL_SOLVE`]: a provisional's engine, or an ADS-B position's regional
+/// batch, signed at its epoch's end, a second at most. A fix whose receptions a feeder signed
+/// lower than that (its reference leaving its relay out, [`MLAT_SETTLE`] says why) may miss its
+/// second, counted late.
+pub const LIVE_FIX_LEAVES: Tolerance = MLAT_SETTLE.plus(PROVISIONAL_SOLVE);
+
+/// `LIVE_FIX_LEAVES + K + REPAIR_TRANSIT`, 32.5 s: how long after a second ends the live world
+/// seals it, so every honest fix of it has arrived, wherever the world is gathered
+/// (`tally_relay`'s `products::WORLD_SETTLE_MS`): the peer path. A fix leaves where it was heard
+/// within [`LIVE_FIX_LEAVES`] by that relay's clock, the gathering relay's is at most `K` from
+/// that one, and the fix's way through a relay or two is [`REPAIR_TRANSIT`], as a final fix's
+/// ([`FINAL_FIX_ARRIVED`]). It covers the feeder path, a fix heard where it is gathered, too.
+pub const LIVE_FIX_ARRIVED: Tolerance = LIVE_FIX_LEAVES.plus(K).plus(REPAIR_TRANSIT);
+
 /// `F / 2`, 5 s: how far a feeder's signed time may be from its relay's clock, either way, before
 /// the relay states its clock to it again at its next heartbeat (`tally_relay`'s `hub`,
 /// `ingest::Refusal::drifted`): half of what the relay allows ahead, so a feeder drifting is told
@@ -541,6 +620,16 @@ pub const LEASE: Tolerance = Tolerance(2_000);
 /// run takes records up to `S` ahead of its clock, and its bound is [`LEASE`] past the newest it
 /// took. A bound further ahead was left by a run whose clock ran ahead (`durable::Lease::begin`).
 pub const LEASE_REACH: Tolerance = PEER_AHEAD.plus(LEASE);
+
+/// How long a sender held to `bytes_per_sec` takes to send `bytes`, rounded down (none at no
+/// rate): the least time after it began it can have sent them, so a moment put that long after its
+/// start is never later than they were sent (`tally_relay`'s `ceiling::Ceiling::sending`).
+pub const fn sending<C>(bytes: u64, bytes_per_sec: u64) -> Span<C> {
+    match bytes_per_sec {
+        0 => Span::ZERO,
+        rate => Span::of(bytes.saturating_mul(1_000) / rate),
+    }
+}
 
 /// The bound a lease writes to cover a record signed at `signed_ms`: [`LEASE`] past it.
 pub const fn lease_bound(signed_ms: u64) -> u64 {
@@ -560,6 +649,13 @@ pub const fn lease_renews(signed_ms: u64, held_ms: u64) -> bool {
 pub const FALLBACK_FLOOR: Tolerance = PEER_AHEAD.plus(K);
 
 const _: () = assert!(F.ms() >= E.ms() + U_M.ms() + TRANSIT.ms());
+// ClockBound's gaps leave a judging clock within `E`: the larger gap, and `J`'s truncation.
+const _: () = assert!(
+    CLOCK_BOUND_MARGIN.ms() == 418
+        && slewed(CHRONY_HUNG_MS) == 92
+        && slewed(CLOCKBOUND_GRACE_MS) == 417
+        && CLOCK_BOUND_MARGIN.ms() < E.ms()
+);
 // A batch held the longest for an anchor, then sent through the backlog it was released into,
 // is sent within `B`, so it is within `FEEDER_BEHIND` where it publishes.
 const _: () = assert!(
@@ -592,6 +688,12 @@ const _: () = assert!(
     FINAL_FIX_ARRIVED.ms() == FINAL_FIX_LEAVES.ms() + K.ms() + REPAIR_TRANSIT.ms()
         && FINAL_FIX_LEAVES.ms() == 91_500
 );
+// The live world's settle covers a fix heard where it is gathered, and one heard `K` away.
+const _: () = assert!(
+    LIVE_FIX_LEAVES.ms() == MLAT_SETTLE.ms() + PROVISIONAL_SOLVE.ms()
+        && LIVE_FIX_ARRIVED.ms() == LIVE_FIX_LEAVES.ms() + K.ms() + REPAIR_TRANSIT.ms()
+        && LIVE_FIX_ARRIVED.ms() >= LIVE_FIX_LEAVES.ms()
+);
 // The figures RFC-0171 quotes.
 const _: () = assert!(
     E.ms() == 7_500
@@ -607,10 +709,27 @@ const _: () = assert!(
         && MLAT_AHEAD.ms() == 7_500
         && MLAT_SETTLE.ms() == 11_500
         && FINAL_FIX_ARRIVED.ms() == 108_500
+        && LIVE_FIX_LEAVES.ms() == 15_500
+        && LIVE_FIX_ARRIVED.ms() == 32_500
         && RESTATE_BEYOND.ms() == 5_000
         && FALLBACK_FLOOR.ms() == 40_000
         && ANCHOR_WAIT.ms() == 62_000
 );
+
+/// What a feeder's selection `[lo_ms, hi_ms]` (offsets from its raw monotonic clock) holds true
+/// time in `age_ms` later on that clock, held over once its sources are gone (NTP's holdover):
+/// widened either side by the raw clock's drift over the age at [`DRIFT_PPM`], rounded up, so its
+/// low end, which the feeder signs at, is never ahead of true time. None once it is wider than
+/// [`SELECTION_LAG`], the widest reference a feeder signs by, so a held offset never lags true
+/// time more than a live selection may, which every window allows for.
+pub fn held_over(lo_ms: i64, hi_ms: i64, age_ms: u64) -> Option<(i64, i64)> {
+    let drift = (u128::from(age_ms) * u128::from(DRIFT_PPM)).div_ceil(1_000_000);
+    let drift = i64::try_from(drift).unwrap_or(i64::MAX);
+    let (lo, hi) = (lo_ms.saturating_sub(drift), hi_ms.saturating_add(drift));
+    u64::try_from(hi.saturating_sub(lo))
+        .is_ok_and(|width| SELECTION_LAG.covers(width))
+        .then_some((lo, hi))
+}
 
 /// Whether an anchor reading `j_ms` agrees with a trusted reference that held `[lo_ms, hi_ms]`
 /// as it was heard: at most [`ANCHOR_BELOW_REFERENCE`] below its low end and
@@ -765,6 +884,17 @@ mod tests {
     #![allow(clippy::disallowed_methods, reason = "a test's scripted readings")]
     use super::*;
 
+    /// What a source gathers over a span is its rate for that span, rounded up, and saturates
+    /// rather than overflows: `B` at a feeder's default ceiling is 64 s of it.
+    #[test]
+    fn a_span_gathers_its_rate_for_its_length() {
+        assert_eq!(B.gathered(64_000), 64 * 64_000);
+        assert_eq!(SEAL_PERIOD.gathered(1), 1);
+        assert_eq!(Tolerance(1).gathered(1), 1);
+        assert_eq!(B.gathered(0), 0);
+        assert_eq!(B.gathered(u64::MAX), u64::MAX.div_ceil(1_000));
+    }
+
     /// A sharing window holds a second from its horizon's whole seconds behind the clock's second
     /// to `K`'s ahead, and neither one second further, nor overflows at the ends.
     #[test]
@@ -817,6 +947,21 @@ mod tests {
         // 7 s ahead of it. Against the low end alone, it was 21.4 s ahead and left out.
         let truth = 1_014_400_u64;
         assert_eq!(anchor_outside(lo, hi, truth + 7_000), None);
+    }
+
+    /// A held selection widens by the raw clock's drift either side as it ages, rounded up, and
+    /// is dropped the millisecond it is wider than `SELECTION_LAG`. Before, the offset was held
+    /// as selected for ever, ahead of true time once the raw clock had drifted under it.
+    #[test]
+    fn a_held_selection_widens_by_drift_and_is_dropped_past_the_selection_lag() {
+        assert_eq!(held_over(-1_000, 1_000, 0), Some((-1_000, 1_000)));
+        assert_eq!(held_over(-1_000, 1_000, 2_000_000), Some((-2_000, 2_000)));
+        assert_eq!(held_over(-1_000, 1_000, 1), Some((-1_001, 1_001)));
+        // 2 s wide, it reaches 17 s once 7.5 s has drifted either side: 15,000 s at 500 ppm.
+        assert_eq!(held_over(-1_000, 1_000, 15_000_000), Some((-8_500, 8_500)));
+        assert_eq!(held_over(-1_000, 1_000, 15_000_001), None);
+        assert_eq!(held_over(0, 17_000, 0), Some((0, 17_000)));
+        assert_eq!(held_over(0, 17_001, 0), None);
     }
 
     /// Each comparison is strict at its edge: a time exactly the tolerance ahead, past or apart is

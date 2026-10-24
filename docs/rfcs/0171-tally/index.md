@@ -456,52 +456,79 @@ What a relay holds is bounded, and what it trusts is narrow, because keys cost n
   an engine included (it publishes nothing), to a feeder's (`--max-feeder-bytes-per-sec`, 256 KiB/s
   by default). Feeders are told theirs as a `RateLimit`. Connections are capped
   (`--max-connections`).
-- A relay reads two clocks, as TrueTime does on stock Linux. The wall clock is read in one place
-  (`clock::RelayClock`), and the kernel's word on it in one place both ends share
-  (`tally_wire::kernel_clock`); Clippy's `disallowed-methods` refuses `SystemTime::now`,
-  `SystemTime::elapsed`, `UNIX_EPOCH.elapsed`, `libc::clock_gettime`, `libc::gettimeofday`,
-  `libc::time`, `libc::adjtimex` and `libc::clock_adjtime` anywhere else (`clippy.toml`). The
-  monotonic clock is std's `Instant`, read wherever a duration is timed: it is never compared
-  across machines, and no reading of it can be wrong in a way another site's could not. `J` judges everything compared
-  across machines: the usability windows, a feeder's clock, directory offers, manifests and
-  receipts. It is the host's wall clock as its time daemon (chrony or ntpd, below) keeps it, with
-  the kernel's error bound read by `adjtimex(2)` with no modes set (`STA_UNSYNC`, `maxerror`). `M`,
-  the monotonic clock, drives epochs, ticks, the hosted MLAT's steps, paces and every duration. A
-  stamp carries both. The relay never disciplines a clock of its own: the time daemon does. A step
-  of `J` is seen exactly, as a change of `J - M` (which only a step moves), and ends nothing: it is
-  counted (`clock_steps`) and the relay states its new clock to every feeder session. Until the
-  kernel first reports the clock synchronised, and whenever its error bound (`maxerror`, which the
-  kernel grows by 500 ppm a second from the last sync, so a clock that loses sync is judged on it
-  and not on `STA_UNSYNC`) is past `E` = 7.5 s (`tally_wire::budget::E`), the relay states its
-  error as unbounded and judges nothing by its clock. A kernel that will not answer the read (a
-  seccomp filter, `ProtectClock=`) gives no bound at all, and the relay refuses to start, as
-  `tally-relay check` does. The systemd units leave `ProtectClock=` off (it filters `adjtimex`
-  whole), allow every system call the read may be after `~@privileged` (`adjtimex`,
-  `clock_adjtime`, `clock_adjtime64`: `tally_wire::kernel_clock::SYSCALLS`, to which a test holds
-  each unit) and fail a refused call with `EPERM` rather than killing the process; the empty
-  `CapabilityBoundingSet` keeps `CAP_SYS_TIME` out, so the clock still cannot be set from them, and
-  the relay orders itself after `chrony-wait.service` and `time-sync.target`. That target holds a
-  start back only while a wait service is enabled (under ntpd, `ntpsec-wait.service` or
-  `systemd-time-wait-sync.service`; neither is by default), so the ordering is no guarantee: what
-  holds is the kernel's word, read at every judgement, as above.
-  **The time daemon must be chrony or ntpd.** `E` is judged against `maxerror`, so `maxerror` must
-  bound the clock against true time. chrony and ntpd set it to their root distance (the server's
-  own distance from its reference plus half the round trip). systemd-timesyncd sets it to 0 at
-  every adjustment (`src/timesync/timesyncd-manager.c`, `manager_adjust_clock`: `ADJ_MAXERROR` in
-  the modes, the field left 0), so the bound it leaves counts only the kernel's 500 ppm a second
-  since its last poll, never the server's error or the measurement's: a relay under it could judge
-  by a clock seconds off while it reads milliseconds. Nothing stock tells that bound from a good
-  chrony's (both are small with `STA_UNSYNC` clear), so neither end refuses it at run time and
-  neither detects the daemon: one function, `tally_wire::kernel_clock::bound_ms`, is the only
-  reader of the kernel's answer for the relay, the feeder and the API, and it takes the bound as
-  the kernel states it (synced, or synced once, and within `E`). **Known gap:** under timesyncd
-  that bound understates the clock's error and Tally cannot tell. The requirement is stated in
-  the packaged units, the README and here, as the stock answer is. It is the feeder's too, for the
-  same reason: a feeder trusts its host's clock only by the same bound (`tally_feed`'s
-  `host_error_ms`), so the feeder's unit is ordered after the same two waits, the installer
-  installs chrony from the system's packages when the host has neither chrony nor ntpd (Debian's
-  package replaces timesyncd) and starts one installed and stopped, and the README's feeder
-  section says so.
+- A relay reads two clocks, as TrueTime does: the host's wall clock, and a bound on its error
+  that a per-host daemon publishes, which is what Google's TrueTime and AWS ClockBound both do.
+  The wall clock is read in one place (`clock::RelayClock`), and its bound in one place every end
+  shares (`tally_wire::clock_bound`: the one reader of the bound and the one judgement of it, for
+  the relay, the feeder and the API); Clippy's `disallowed-methods` refuses `SystemTime::now`,
+  `SystemTime::elapsed`, `UNIX_EPOCH.elapsed`, `libc::clock_gettime`, `libc::gettimeofday` and
+  `libc::time` anywhere else, and `libc::adjtimex` and `libc::clock_adjtime` everywhere
+  (`clippy.toml`). The monotonic clock is std's `Instant`, read wherever a duration is timed: it
+  is never compared across machines, and no reading of it can be wrong in a way another site's
+  could not. `J` judges everything compared across machines: the usability windows, a feeder's
+  clock, directory offers, manifests and receipts. It is the host's wall clock as chrony keeps
+  it, with the bound **AWS ClockBound 2.x** publishes in shared memory (`/var/run/clockbound/shm0`),
+  read through its own Rust client (`clock-bound-client` 2.0.3) at every judgement: a memory read,
+  the bound grown by ClockBound's drift rate since its sample. `M`, the monotonic clock, drives
+  epochs, ticks, the hosted MLAT's steps, paces and every duration. A stamp carries both. The relay
+  never disciplines a clock of its own: the time daemon does. A step of `J` is seen exactly, as a
+  change of `J - M` (which only a step moves), and ends nothing: it is counted (`clock_steps`) and
+  the relay states its new clock to every feeder session. The relay judges only while ClockBound
+  says `Synchronized` and the half-width of its interval is within `E` = 7.5 s less what
+  ClockBound's word may leave unsaid, 418 ms (`tally_wire::budget::CLOCK_BOUND_MARGIN`: `J`'s
+  truncation to the millisecond and the worst residual gap below), so 7,082 ms, and a judging
+  clock is within `E` of true time even across those gaps. The segment missing or unreadable, or `Unknown`, `FreeRunning`,
+  `Disrupted`, or a bound past `E`, states the relay's error as unbounded and judges nothing by its
+  clock; each such read is counted by why and the last stated (`/memory`, `clock_bound`). A relay
+  starts whatever ClockBound says, and its unit is ordered after `clockbound.service` and never
+  pulls it in.
+  **The kernel's bound is not read.** `adjtimex`'s `maxerror` is not a bound by itself: the kernel
+  cannot tell which daemon wrote it (systemd-timesyncd sets it to 0 at every adjustment,
+  `src/timesync/timesyncd-manager.c`, `manager_adjust_clock`); a chronyd killed mid-slew leaves the
+  tick biased by up to 83,333 ppm while the kernel grows `maxerror` at 500 ppm; and a suspend or a
+  VM's restore is not aged at all. So the units filter every clock call (`ProtectClock=yes`), allow
+  only VMClock among devices (`DevicePolicy=closed`, `DeviceAllow=/dev/vmclock0 r`, no
+  `PrivateDevices=`, which would hide it), give the process a private `/dev/shm`
+  (`TemporaryFileSystem=/dev/shm`, which `PrivateDevices=` gave it), and a test holds each to that
+  (`tally_wire::clock_bound::unit_faults`).
+  **What a relay host runs** (ClockBound's README): chrony with `maxclockerror 50` (chrony's own 1
+  ppm is an estimate, not a bound) and `rtcsync`; ClockBound 2.x with `--max-drift-rate 50`, which
+  must match; and VMClock where the hypervisor offers it, readable by all as ClockBound's own
+  unit makes it (`chmod a+r /dev/vmclock0`), else ClockBound with
+  `--disable-clock-disruption-support`.
+  **What ClockBound says when chronyd dies** (its source, `clock-bound-d` and `clock-bound-shm`
+  2.0.3): it polls chronyd every 100 ms with a 1 s timeout; a poll that fails writes
+  `FreeRunning` while its last synchronised sample is under 5 s old and `Unknown` after
+  (`CHRONY_RESTART_GRACE_PERIOD`), keeping that sample's bound, which the client grows by
+  `--max-drift-rate` from the sample's time. So the status leaves `Synchronized` within about 0.1 s
+  of chronyd exiting, or about 1.1 s if it hangs. A chronyd that runs on with its sources lost
+  still says synchronised, and ClockBound writes `FreeRunning` once chrony's last clock update is
+  older than eight of its polling intervals; until then the bound is chrony's root dispersion,
+  which grows by `maxclockerror`. ClockBound itself stopped leaves its segment `Synchronized` to a
+  client for 5 s after its last sample, then `FreeRunning`, then `Unknown` after 1,000 s.
+  **Residual gaps**, stated as the stock answer is: the bound is only as honest as chrony's root
+  distance and ClockBound's drift rate; between chronyd dying mid-slew and ClockBound's next poll
+  the status still says `Synchronized` while the tick runs at up to 83,333 ppm against a bound
+  growing at 50 (about 8 ms unaccounted when chronyd exits, up to about 92 ms while it hangs, and
+  up to about 417 ms when ClockBound stops with it, its segment read `Synchronized` for 5 s after
+  its last sample; the margin above covers the worst, so these cost judging time and not truth); a
+  leap smear (a smearing server, or `leapsecmode slew`) moves the clock off UTC by up to half a
+  second with no bound that says so; a suspend or a VM's restore without VMClock is seen only at
+  chronyd's next measurement; and a host without ClockBound never judges as a relay or the API.
+  **A known upstream defect:** ClockBound's daemon, restarted, wipes its segment in place
+  (`clock-bound-shm` 2.0.3, `ShmWriter::wipe`, `File::create` truncating the file a reader has
+  mapped), so a reader that reads between the truncation and the rewrite takes `SIGBUS`. The
+  process dies and its unit's `Restart=always` brings it back, judging nothing until ClockBound
+  says `Synchronized` again; the fix proposed upstream is to write the new segment to a file
+  beside it and rename it over the old, so a mapping never loses its pages. The vendor's reader
+  also prints a line to stderr at each open of a segment of a version it does not support, so a
+  reader opens such a segment again only once its file changes
+  (`tally_wire::clock_bound::Reader`).
+  The feeder reads the same bound (`tally_feed`'s `host_error_ms`) and never needs it: its host's
+  clock is a source and a reference only while ClockBound says `Synchronized` within `E`, and
+  without it the feeder signs by its configured relays (its unit is ordered after
+  `clockbound.service` and pulls nothing in). So the installer manages no time daemon: it
+  installs no ClockBound and no chrony, and the README's feeder section says so.
 - Two predicates decide what a relay does with a record, each a pure function of its signed bytes
   and the relay's `J`; no verdict travels with a copy. **Possession** (held, sent down the stripe,
   receipted, its deliverer credited, its audit tags) never consults a clock: **nobody refuses a
@@ -522,7 +549,9 @@ What a relay holds is bounded, and what it trusts is narrow, because keys cost n
     clock stepped back), it is held unused at this hop and counted against nobody
     (`ahead_records`, and `unjudged_records`), as is every batch while `J` is not judging; its
     peers judge their copies by their own clocks. Older than that, it is held unused and counted
-    against its receiver (`late_batches`, the stations report and `GET /v1/stations/{key}`). Either
+    late, and counted against its receiver (`late_batches`, the stations report and
+    `GET /v1/stations/{key}`) only when this relay's own anchor in it is older than an honest
+    batch's can be too (below). Either
     way off, its feeder is told the relay's clock again at its next heartbeat (`RateLimit`'s
     `clock_ms`), and its session goes on. A batch held unused is never taken into a strike table,
     so it pins no table's memory or floor;
@@ -566,10 +595,13 @@ What a relay holds is bounded, and what it trusts is narrow, because keys cost n
   | `MLAT_SETTLE` = `MLAT_BATCHING + E + 2U_m` | 11.5 s | how long after a bin ends the hosted MLAT takes it |
   | `MLAT_SOLVE` | 80 s | a final fix's way out of its engine after its window settles (the engine's design) |
   | `FINAL_FIX_ARRIVED` = `MLAT_SOLVE + MLAT_SETTLE + K + REPAIR_TRANSIT` | 108.5 s | when a final fix has surely arrived, wherever it is read |
+  | `PROVISIONAL_SOLVE` | 4 s | a provisional MLAT fix's way out of its engine, its first reception in (the engine's design) |
+  | `LIVE_FIX_LEAVES` = `MLAT_SETTLE + PROVISIONAL_SOLVE` | 15.5 s | when a live world fix has been offered where it was heard: the feeder path |
+  | `LIVE_FIX_ARRIVED` = `LIVE_FIX_LEAVES + K + REPAIR_TRANSIT` | 32.5 s | when a live world fix has surely arrived wherever the world is gathered: the peer path, the live world's settle |
   | `RESTATE_BEYOND` = `F / 2` | 5 s | how far a feeder's signed time may be from its relay's clock before the relay restates its clock |
   | `FALLBACK_FLOOR` = `S + K` | 40 s | a strike table's floor with no state |
   | `RECEIPT_AHEAD` = `K` | 15 s | a credit receipt's issued time ahead of a relay (issued by another judging relay's clock, so at most `K` apart) |
-  | `PRODUCT_AHEAD` = `K` | 15 s | a precise MLAT second ahead of the API's clock |
+  | `PRODUCT_AHEAD` = `K` | 15 s | a precise MLAT second's seal (`(s + 1) * 1000 + FINAL_FIX_ARRIVED`) ahead of the API's clock |
   | `ACARS_MESSAGE_SKEW` | 300 s | exempt: an ACARS message's own time is an aircraft's or a ground station's, set by no clock of ours |
 
   Every comparison of a signed time against a clock goes through the module: a `Tolerance`'s
@@ -628,7 +660,7 @@ What a relay holds is bounded, and what it trusts is narrow, because keys cost n
     against its raw clock (anchors matter exactly when that clock is wrong, and a filter by it
     would keep the lie that matches it and drop the honest anchor) (`source::RelayClocks::anchors`):
     - With a reference its operator trusts (a selection of its configured relays, NTP's rule, or
-      its host while the kernel reports it synced to its own configured servers), it carries only
+      its host while its ClockBound reports it synchronised within `E`), it carries only
       anchors that **agree with that reference** as an honest relay's must, judged against the
       reference's whole interval `[lo, hi]` as the anchor was heard, never a point of it (the
       reference holds true time somewhere inside it, and the feeder signs at its low end): at most
@@ -641,14 +673,26 @@ What a relay holds is bounded, and what it trusts is narrow, because keys cost n
     - With no trusted reference (no configured majority, and its host unsynced), it carries
       every session's newest anchor unfiltered, and the hop takes the oldest it knows. Safety
       wins: a lying relay can then make that feeder's batches unusable (a loss of liveness,
-      counted against nobody and shown on its health), never make stale ones look fresh.
+      counted against nobody and shown on its health), and makes a stale one look fresh only at
+      a hop that can check no honest anchor the batch carries (while it can check one, the
+      oldest decides).
     - When there are more anchors than slots, the oldest reading always takes one and the last
       heard the rest. A feeder holds two sessions, and its sessions are at most
-      `batch::MAX_ANCHORS` (asserted at compile time, `selection::DESTINATIONS`), so each relay it
-      publishes to finds its own anchor in the batch unless the trusted reference left it out.
+      `batch::MAX_ANCHORS` (asserted at compile time, `selection::DESTINATIONS`), so a batch has
+      room for the anchor of each relay it is published to. It need not carry it: a reconnect's
+      backlog signed while its session had heard only another relay's anchor, a batch sent to a
+      relay other than the ones it was anchored by, the trusted reference leaving that relay's
+      anchor out, or a relay with no signer, which issues none. So a relay never blames a batch
+      for carrying none of its own anchors (below).
 
     Before its first anchor it holds its batches in order within its backlog and drops none; one
-    that waited `ANCHOR_WAIT` (62 s) is signed with none, and counted (`unanchored`). When an
+    that waited `ANCHOR_WAIT` (62 s) is signed with none, and counted (`unanchored`). It holds
+    each as its receptions' wire bytes, encoded and compressed as it will sign them
+    (`tally_wire::EncodedBatch`), never as their decoded receptions, so a hold costs about what
+    the ceiling gathers over `B`; and it refuses a `--ceiling` whose hold, with the channel to its
+    sessions full and its runtime beside it, would not fit the 64 MB its unit runs it in
+    (`tally_feed::source::CEILING_MOST`), which the kernel would otherwise kill, losing the
+    backlog. When an
     anchor comes, the backlog is released at the next seal and each session sends it at the
     ceiling, its pace waiting for tokens and never skipping a batch; a session at least as fast as
     the ceiling sends the oldest released batch within `BACKLOG_DRAIN`, so it leaves within `B` and
@@ -682,7 +726,11 @@ What a relay holds is bounded, and what it trusts is narrow, because keys cost n
     resend, an audit's owed batch) is at or below it and is judged as ever and counted
     relay-wide, but blamed on nobody (a batch first seen out of order is not blamed, which only
     undercounts; one boot is held, so a repeat of an earlier boot's batch after a later boot's
-    was judged is judged anew, and may be blamed again, the one case it overcounts). Nor is a feeder blamed for the time it held a batch waiting for its first
+    was judged is judged anew, and may be blamed again, the one case it overcounts). What it
+    keeps is its receiver's row of the stations table, which is bounded (`Bounded`, oldest
+    active first): a row a churn of other receivers pushed out loses its last judged with it, so
+    a repeat that comes after is judged anew and may be blamed again, the other case it
+    overcounts; a receiver that keeps publishing keeps its row. Nor is a feeder blamed for the time it held a batch waiting for its first
     anchor, nor for its origin's clock: a batch too old by `t` is blamed only when **this relay's
     own anchor** in it is older than `OWN_ANCHOR_OLDEST` too (`strikes::blame`). The
     origin issued that anchor and remembers when, by its **raw monotonic clock**
@@ -696,12 +744,20 @@ What a relay holds is bounded, and what it trusts is narrow, because keys cost n
     its own anchor's truth (it signed and timed it), so no other relay's anchor moves the blame,
     and a batch is blamed the same whatever else it carries. A held batch carries the origin's
     anchor newer than its `t`, so its hold is not counted; one sent at once is blamed as by `t`, or
-    later; one without the origin's anchor is blamed by `t` alone. One whose anchor has left the
-    ring is aged from the newest issue the ring let go, which it was issued no later than, so its
-    age is never overstated. And for `OWN_ANCHOR_OLDEST` after a run's first issue (a restart),
-    the origin cannot tell an earlier run's anchor from none, so it blames nothing
-    (`strikes::OwnAnchor::Unknowable`). A batch below a strike table's floor is late
-    by this relay's clock, not its feeder's, and blamed on nobody.
+    later. One without the origin's anchor is never blamed, however old its `t`
+    (`strikes::OwnAnchor::Absent`): an honest feeder sends such batches (a reconnect's backlog
+    anchored by another relay alone, its batches anchored elsewhere while this relay's `J`
+    stepped ahead, an origin with no signer), so `t` alone proves nothing against it. One whose
+    anchor has left the ring is aged from the newest issue the ring let go, which it was issued no
+    later than, and one of the origin's earlier run from this run's first issue, before which it
+    was issued, so its age is never overstated (within `OWN_ANCHOR_OLDEST` of a restart no age can
+    blame anyone). The age runs to when the batch reached the origin's process, never to when the
+    origin got to it: a link reads its socket only between records, so while one is paced or
+    waits for its admission what the feeder sends waits in the kernel's buffers, and a message
+    read with its bytes already waiting is dated to the last moment the link found its socket
+    empty, after which every byte of it came (`link::Drained`; TCP keeps the order). The origin's
+    own pacing, admission or queueing never ages a batch, however long. A batch below a strike
+    table's floor is late by this relay's clock, not its feeder's, and blamed on nobody.
   - `W_a` = `FEEDER_BEHIND + E + P + δ + 2P` = 102.5 s (`budget::ANCHOR_BEHIND`, asserted at
     compile time): `J - A.j_ms = (J - t) + (t - A.j_ms)`. The first is at most `FEEDER_BEHIND`
     wherever `t` is usable. The second, for a feeder with a trusted reference: it signs at the
@@ -723,7 +779,8 @@ What a relay holds is bounded, and what it trusts is narrow, because keys cost n
 
     **What that staleness costs the products.** Neither the live map nor MLAT takes old data for
     new. The live world product gathers fixes by their own transmit second and seals each second
-    `WORLD_SETTLE_MS` after it ends: a fix of a second already sealed is late (`world_late`) and
+    `LIVE_FIX_ARRIVED` after it ends (`WORLD_SETTLE_MS`, once every honest live fix of it has surely
+    arrived, whatever relay heard it): a fix of a second already sealed is late (`world_late`) and
     dropped, counted, never drawn as current, and a fix older than the history before the first
     seal is out of its window. The hosted MLAT bins raw by its signed time and takes each bin
     `MLAT_SETTLE` after it ends by the relay's judging clock: raw of a bin already taken is late
@@ -848,7 +905,7 @@ What a relay holds is bounded, and what it trusts is narrow, because keys cost n
 - Nothing is derived from the wall clock until it is synced (`clock::RelayClock::judging`).
   Until then no table has a floor and none judges anything: every record a feeder or a peer sends
   is held, possession only (its group holds it, its receipts and credit flow), counted unjudged
-  (`unjudged_records`), never used and never blamed on anyone; and the relay signs nothing (products, feeder figures, engine records). Once it is synced every
+  (`unjudged_records`), never used and never blamed on anyone; and the relay signs nothing (products, feeder figures, engine records) but its answer to a probe, which states no time (`EchoReply::answer`, its `issued_ms` 0: the answer decides it, a judging reading's while the signer's clock judges and 0 while it does not, and takes no number, so no code holding the key gets a time signed through it): a feeder chooses only a relay whose answer verifies, so a relay that cannot judge is still chosen, admitted and fed. Once it is synced every
   table begins at its lease's bound when the lease is there and trusted (the bound covers every
   record the run before used, so it is the floor even below the fallback), and at the fallback
   floor from the synced clock when it is not. A run takes records up to `S` ahead of its clock and
@@ -858,14 +915,16 @@ What a relay holds is bounded, and what it trusts is narrow, because keys cost n
   uses a record again, with no exception. The cost is a relay that uses nothing new until the clock passes the
   bound, bounded by how far ahead the bad time source was; it says so loudly at start, with how
   long until it clears, and counts it (`leases_ahead`, `lease_ahead_until_ms`). A clock that loses sync after the start is
-  judged on the kernel's error bound, which grows from the last sync: the relay keeps judging and
-  signing while that bound is within `E`, and stops (holds, signs nothing, refuses no one for
-  clock) once it passes it, until the clock is synced again. Every relay signature goes through
+  judged on ClockBound's word, read at every judgement: the relay keeps judging and signing while
+  it says `Synchronized` within `E`, and stops (holds, signs nothing, refuses no one for clock)
+  once it says anything else, until it says so again. Every relay signature goes through
   one seam (`signer::Signer`), which lends the key for one call only while the clock is judging,
   so a new signer cannot skip the gate. The types hold it, not a convention: the key (`Identity`)
   is not `Clone`, the relay moves its newest into its one `Signer`, and what a signing is lent
-  (`Signing`) cannot be kept past the call; the transport handshake, which states no time, is the
-  one use apart, by a key that cannot sign (`NoiseKey`). The wire crate's doc tests hold each
+  (`Signing`) cannot be kept past the call. Two uses are apart from the clock: the transport
+  handshake, which states no time, by a key that cannot sign (`NoiseKey`), and the answer to a
+  probe, signed by a lending the wire crate keeps to itself (`Signer::untimed`), which states 0
+  for its time whenever the signer's clock does not judge. The wire crate's doc tests hold each
   refusal as a compile-fail check. The state directory is the unit's `StateDirectory=tally-relay` or `--state-dir` (on
   Kubernetes, a small persistent volume with one writer), and must never be restored from a
   backup: an old lease is a floor too low.
@@ -895,13 +954,23 @@ What a relay holds is bounded, and what it trusts is narrow, because keys cost n
   generation instead. Entries leave a share only once every table has dropped them (the relay's
   sweep of every table, then the shares'), never as one table passes them. A share or a store full lets the record go unused (counted, `strikes_full`): it is
   still possessed, so its deliverer is credited and no honest member is reported short for
-  another's flood.
+  another's flood. The one exception is a record of the relay's own making (a bundle index, a
+  regional batch it signed, its feeder figures): its own store is never evicted, so one past it is
+  refused there and counted, and goes out all the same, unremembered (`Hub::publish_own`), since
+  only this relay holds it and no member could repair it.
 - How long a relay keeps what it possesses is kept on `M`, never on `J`: a sharing group's pieces
   and parity, what it forgets and refuses, its answered repairs, its ticks, repairs and
   anti-entropy (`sharing::Now`: a group is driven by both clocks, and production code cannot hand
   it one alone), the delivery tags a feeder's audit is answered from, and every deadline on what
-  it remembers of other relays: an ask's membership, a demotion, a full member's route-around and
-  an idle member link. Each of those is a `sharing::MonoDeadline`, which only `Now::after` makes
+  it remembers of other relays: an ask's membership, a demotion, a full member's route-around
+  (at both ends of the refusal) and an idle member link. A receipt window's end is a signed time,
+  read on `J` while it judges; from when `J` first passes it, its receipts and its judgment fall
+  due on `M` (RFC-0174 §2.5), and its senders and credit are let go with that judgment, never on
+  a clock of their own. The same holds outside the groups: the directory's own re-signing and
+  evidence bundling, its dial timeouts and change waits, a credit corroboration (taken only while
+  `J` judges), a withdrawal's quiet period and a fan-out item's age are on `M`; an offer's or a
+  bundle's expiry, a signed time, is judged on `J` and not at all while it does not judge (the
+  record is counted and its signer's next one taken). Each of those is a `sharing::MonoDeadline`, which only `Now::after` makes
   from the monotonic side, so no deadline can be put on `J`. `J` is used only to
   compare signed seconds (a manifest's, a receipt's, a shortfall's, a sender's). So a step of `J`
   either way keeps nothing past its plan: a store planned on the window never overfills, every
@@ -922,7 +991,7 @@ What a relay holds is bounded, and what it trusts is narrow, because keys cost n
   Marzullo, with the differences below; `source::RelayClocks`), and as
   in NTP its clock sources are only the ones it was configured with: the configured relays (the
   ones its owner named with `--relay` and the release's seeds), heard through a session with one
-  or a probe of it, and the host while its kernel reports it synced within `E` (within that
+  or a probe of it, and the host while its ClockBound reports it synchronised within `E` (within that
   bound). An unsynced host is no source, as NTP never votes an undisciplined local clock: it is
   read as it is only when nothing is selected. Nothing else is a source: a relay a hint named is
   never one, whether the feeder holds a session with it or probed it, so no number of relays found
@@ -950,10 +1019,12 @@ What a relay holds is bounded, and what it trusts is narrow, because keys cost n
   for its clock alone, never with discovery's round, every 30 s at first, doubling each poll it
   does not answer up to the round's five minutes (`relays::ClockPolls`, NTP's poll interval).
   With no configured majority, as in NTP (no system peer; a minority never steers the clock), it
-  signs at the low end of its host's interval (its clock less the kernel's bound, never ahead of
-  true time) while its kernel reports it synced, else by the offset the last
-  selection of configured sources made (NTP's holdover, never kept from anything else), else by
-  the host's clock as read; and the feeder's health says "no configured clock source reachable,
+  signs at the low end of its host's interval (its clock less ClockBound's bound, never ahead of
+  true time) while its ClockBound reports it synchronised, else by the offset the last
+  selection of configured sources made (NTP's holdover, never kept from anything else: the
+  selected interval widened by the raw clock's drift at 500 ppm as it ages and dropped once wider
+  than `SELECTION_LAG`, `budget::held_over`, so it is never ahead of true time nor further behind
+  than a live selection), else by the host's clock as read; and the feeder's health says "no configured clock source reachable,
   host unsynced" while that lasts past a relay's grace (`health`). Every time the feeder signs or
   judges by (its batches, its `ReceiverInfo`, the directory offers and announcements it signs,
   its delivery checks, its ledger) is read from this one selected clock, never the host's clock

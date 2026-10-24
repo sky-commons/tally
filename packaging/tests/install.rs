@@ -121,7 +121,6 @@ PIAWARE_ENV="$R/var/cache/piaware/location.env"
 DUMP1090_DEFAULTS="$R/etc/default/dump1090-fa"
 FEED_CLIENT_DEFAULTS=("$R/etc/default/adsbexchange" "$R/etc/default/adsbfi")
 WAIT_SECONDS=1
-LOCK_RETRY_SECONDS=0
 mkdir -p "$R/usr/local/bin" "$R/etc/default" "$R/etc/systemd/system" "$T/work"
 work="$T/work"
 require_root() { :; }
@@ -151,23 +150,9 @@ const STUBS: &[(&str, &str)] = &[
         "#!/bin/sh\ncat \"$TEST_DIR/getconf\" 2>/dev/null || echo 64\n",
     ),
     ("chown", "#!/bin/sh\nexit 0\n"),
-    // Debian's package database: what `$TEST_DIR/packages` names is installed, nothing else.
-    (
-        "dpkg-query",
-        "#!/bin/sh\nfor last; do :; done\ngrep -qx \"$last\" \"$TEST_DIR/packages\" 2>/dev/null && echo 'install ok installed'\nexit 0\n",
-    ),
-    // apt-get, logged; failing when `$TEST_DIR/apt-fails` is there, an install failing when
-    // `$TEST_DIR/install-fails` is, and an update failing as apt 2.8 does on the lists' lock
-    // another apt holds as many times as `$TEST_DIR/lists-locked` says.
-    (
-        "apt-get",
-        "#!/bin/sh\necho \"$*\" >> \"$TEST_DIR/apt.log\"\n[ ! -f \"$TEST_DIR/apt-fails\" ] || exit 100\ncase \"$*\" in\n  *install*) [ ! -f \"$TEST_DIR/install-fails\" ] || exit 100 ;;\n  update)\n    locked=\"$(cat \"$TEST_DIR/lists-locked\" 2>/dev/null || echo 0)\"\n    if [ \"$locked\" -gt 0 ]; then\n      echo $((locked - 1)) > \"$TEST_DIR/lists-locked\"\n      echo 'E: Could not get lock /var/lib/apt/lists/lock. It is held by process 4242 (apt-get)' >&2\n      exit 100\n    fi ;;\nesac\n",
-    ),
-    // systemd: the feeder's unit active unless `$TEST_DIR/inactive` is there, and of every
-    // other unit only those `$TEST_DIR/active` names (`is-active` is true when any asked is).
     (
         "systemctl",
-        "#!/bin/sh\necho \"$*\" >> \"$TEST_DIR/systemctl.log\"\ncase \"$1\" in\n  --version) echo 'systemd 247 (247.3-7+deb11u4)' ;;\n  show) echo 0123456789abcdef ;;\n  is-active)\n    shift\n    [ \"$1\" = --quiet ] && shift\n    for unit; do\n      case \"$unit\" in\n        tally-feed*) [ ! -f \"$TEST_DIR/inactive\" ] && exit 0 ;;\n        *) grep -qx \"$unit\" \"$TEST_DIR/active\" 2>/dev/null && exit 0 ;;\n      esac\n    done\n    exit 1 ;;\nesac\n",
+        "#!/bin/sh\necho \"$*\" >> \"$TEST_DIR/systemctl.log\"\ncase \"$1\" in\n  --version) echo 'systemd 247 (247.3-7+deb11u4)' ;;\n  show) echo 0123456789abcdef ;;\n  is-active) [ ! -f \"$TEST_DIR/inactive\" ] ;;\nesac\n",
     ),
     (
         "journalctl",
@@ -633,201 +618,6 @@ fn an_install_waits_for_publishing_and_prints_the_station_page() -> Result {
         "{written}"
     );
     assert!(sandbox.exists("root/usr/local/bin/tally-feed"));
-    // A host keeping time with neither chrony nor ntpd gets chrony: the package lists updated
-    // first, the install waiting for another's lock rather than failing at once (the update
-    // ignores that option and is tried again instead).
-    let apt = sandbox.read("apt.log")?;
-    let lines: Vec<&str> = apt.lines().collect();
-    assert_eq!(
-        lines,
-        ["update", "-o DPkg::Lock::Timeout=120 install -y chrony"],
-        "{apt}"
-    );
-    assert!(out.contains("installing chrony"), "{out}");
-    assert!(out.contains("it replaces systemd-timesyncd"), "{out}");
-    Ok(())
-}
-
-/// The environment of an install with its location given, so it asks nothing.
-fn located_env(sandbox: &Sandbox) -> Vec<(&'static str, String)> {
-    install_env(
-        sandbox,
-        &[
-            ("TALLY_LAT", "51.5"),
-            ("TALLY_LON", "-0.1"),
-            ("TALLY_ALT", "20"),
-        ],
-    )
-}
-
-/// A body that runs on a host with neither `dpkg-query` nor `apt-get` (Fedora, Arch, Alpine with
-/// systemd): `command -v` finds neither, as on such a host.
-const NOT_DEBIAN: &str = r#"
-command() {
-  if [[ $1 == -v && ( $2 == dpkg-query || $2 == apt-get ) ]]; then return 1; fi
-  builtin command "$@"
-}
-dpkg-query() { echo "asked dpkg-query" >&2; exit 97; }
-apt-get() { echo "asked apt-get" >&2; exit 97; }
-"#;
-
-/// RFC-0171 §3.6: the feeder trusts its host's clock by the kernel's error bound, which is true
-/// only under chrony or ntpd (systemd-timesyncd keeps none), so an install leaves the host running
-/// one of the two. One whose systemd runs chrony or ntpd under any of the distributions' names is
-/// left as it is; one (on Debian) with chrony or ntpd (`ntp`, or `ntpsec`) installed and stopped
-/// has it started and enabled; one with neither gets chrony from apt; one keeping time with
-/// OpenNTPD, which chrony's package would remove, is stopped before anything is installed; and
-/// when apt cannot install chrony, the install stops before the feeder is installed.
-#[test]
-fn an_install_leaves_the_host_keeping_time_with_chrony_or_ntpd() -> Result {
-    for (packages, active, installs, starts) in [
-        ("chrony", "", false, Some("chrony")),
-        ("ntp", "", false, Some("ntp")),
-        ("ntpsec", "", false, Some("ntpsec")),
-        ("chrony", "chrony", false, None),
-        ("", "chrony", false, None),
-        ("", "chronyd", false, None),
-        ("", "ntpd", false, None),
-        ("", "ntpsec", false, None),
-        ("", "systemd-timesyncd", true, None),
-        ("", "", true, None),
-    ] {
-        let sandbox = Sandbox::new("time")?;
-        sandbox.release()?;
-        sandbox.file("packages", &format!("{packages}\n"))?;
-        sandbox.file("active", &format!("{active}\n"))?;
-        sandbox.file(
-            "journal",
-            "tally-feed: publishing to relay.example:10900 (version 1)\n",
-        )?;
-        let env = located_env(&sandbox);
-        let out = sandbox.ok(INSTALL, &borrowed(&env))?;
-        let apt = sandbox.read("apt.log").unwrap_or_default();
-        assert_eq!(
-            apt.contains("install -y chrony"),
-            installs,
-            "{packages:?} {active:?}: {apt}"
-        );
-        let calls = sandbox.read("systemctl.log")?;
-        let started: Vec<&str> = calls
-            .lines()
-            .filter_map(|line| line.strip_prefix("enable --now "))
-            .collect();
-        assert_eq!(
-            started,
-            starts.into_iter().collect::<Vec<_>>(),
-            "{packages:?} {active:?}: {calls}"
-        );
-        if let Some(unit) = starts {
-            assert!(out.contains(&format!("starting {unit}")), "{out}");
-        }
-    }
-    for (packages, active) in [("openntpd", ""), ("", "openntpd")] {
-        let sandbox = Sandbox::new("time-openntpd")?;
-        sandbox.release()?;
-        sandbox.file("packages", &format!("{packages}\n"))?;
-        sandbox.file("active", &format!("{active}\n"))?;
-        let env = located_env(&sandbox);
-        let refusal = sandbox.stopped(INSTALL, &borrowed(&env))?;
-        assert!(refusal.contains("OpenNTPD"), "{refusal}");
-        assert!(refusal.contains("replaces systemd-timesyncd"), "{refusal}");
-        assert!(!sandbox.exists("apt.log"));
-        assert!(!sandbox.exists("root/usr/local/bin/tally-feed"));
-    }
-    let sandbox = Sandbox::new("time-fails")?;
-    sandbox.release()?;
-    sandbox.file("apt-fails", "")?;
-    let env = located_env(&sandbox);
-    let refusal = sandbox.stopped(INSTALL, &borrowed(&env))?;
-    assert!(
-        refusal.contains("could not update the package lists"),
-        "{refusal}"
-    );
-    assert!(!sandbox.exists("root/usr/local/bin/tally-feed"));
-    // A failure that is not the lists' lock is not tried again.
-    assert_eq!(sandbox.read("apt.log")?.lines().count(), 1);
-    let sandbox = Sandbox::new("time-install-fails")?;
-    sandbox.release()?;
-    sandbox.file("install-fails", "")?;
-    let env = located_env(&sandbox);
-    let refusal = sandbox.stopped(INSTALL, &borrowed(&env))?;
-    assert!(refusal.contains("could not install chrony"), "{refusal}");
-    assert!(!sandbox.exists("root/usr/local/bin/tally-feed"));
-    Ok(())
-}
-
-/// `apt-get update` fails at once on the package lists' lock another apt holds, whatever
-/// DPkg::Lock::Timeout says (apt 2.8), so the install tries it again while that is the failure,
-/// LOCK_TRIES times, then stops before anything is installed.
-#[test]
-fn an_update_waits_out_another_apt_holding_the_package_lists() -> Result {
-    let sandbox = Sandbox::new("time-locked")?;
-    sandbox.release()?;
-    sandbox.file("lists-locked", "3\n")?;
-    sandbox.file(
-        "journal",
-        "tally-feed: publishing to relay.example:10900 (version 1)\n",
-    )?;
-    let env = located_env(&sandbox);
-    let out = sandbox.ok(INSTALL, &borrowed(&env))?;
-    assert!(out.contains("installed and publishing"), "{out}");
-    let apt = sandbox.read("apt.log")?;
-    let lines: Vec<&str> = apt.lines().collect();
-    assert_eq!(
-        lines,
-        [
-            "update",
-            "update",
-            "update",
-            "update",
-            "-o DPkg::Lock::Timeout=120 install -y chrony"
-        ],
-        "{apt}"
-    );
-    let sandbox = Sandbox::new("time-locked-for-good")?;
-    sandbox.release()?;
-    sandbox.file("lists-locked", "1000\n")?;
-    let env = located_env(&sandbox);
-    let refusal = sandbox.stopped(INSTALL, &borrowed(&env))?;
-    assert!(
-        refusal.contains("could not update the package lists"),
-        "{refusal}"
-    );
-    assert_eq!(sandbox.read("apt.log")?.lines().count(), 24);
-    assert!(!sandbox.exists("root/usr/local/bin/tally-feed"));
-    Ok(())
-}
-
-/// A host with no Debian package database (no `dpkg-query`, no `apt-get`) is asked of systemd:
-/// one running chronyd or ntpd is installed on, asking neither tool, and one running neither
-/// is stopped before anything is installed, told to install chrony. Before, the install asked
-/// only `dpkg-query`, and refused every host that is not Debian's, whatever kept its time.
-#[test]
-fn a_host_with_no_package_database_is_asked_of_systemd() -> Result {
-    for active in ["chronyd", "ntpd"] {
-        let sandbox = Sandbox::new("time-systemd")?;
-        sandbox.release()?;
-        sandbox.file("active", &format!("{active}\n"))?;
-        sandbox.file(
-            "journal",
-            "tally-feed: publishing to relay.example:10900 (version 1)\n",
-        )?;
-        let env = located_env(&sandbox);
-        let out = sandbox.ok(&format!("{NOT_DEBIAN}\n{INSTALL}"), &borrowed(&env))?;
-        assert!(out.contains("installed and publishing"), "{active}: {out}");
-        assert!(sandbox.exists("root/usr/local/bin/tally-feed"));
-    }
-    let sandbox = Sandbox::new("time-none")?;
-    sandbox.release()?;
-    let env = located_env(&sandbox);
-    let refusal = sandbox.stopped(&format!("{NOT_DEBIAN}\n{INSTALL}"), &borrowed(&env))?;
-    assert!(refusal.contains("neither chrony nor ntpd"), "{refusal}");
-    assert!(
-        refusal.contains("it replaces systemd-timesyncd"),
-        "{refusal}"
-    );
-    assert!(!refusal.contains("asked"), "{refusal}");
-    assert!(!sandbox.exists("root/usr/local/bin/tally-feed"));
     Ok(())
 }
 
@@ -929,19 +719,6 @@ fn an_ultrafeeder_container_with_no_host_beast_gets_the_compose_route() -> Resul
     }
     assert!(!sandbox.exists("root/usr/local/bin/tally-feed"));
     assert!(!sandbox.exists("root/etc/default/tally-feed"));
-    // The container trusts the host's clock: a host keeping time with neither chrony nor ntpd
-    // is told to install chrony; one that keeps it is told nothing of it.
-    assert!(out.contains("Install chrony on the host"), "{out}");
-    sandbox.file("packages", "chrony\n")?;
-    let stopped = sandbox.ok(INSTALL, &borrowed(&env))?;
-    assert!(
-        stopped.contains("chrony installed and not running")
-            && stopped.contains("systemctl enable --now chrony"),
-        "{stopped}"
-    );
-    sandbox.file("active", "chrony\n")?;
-    let kept = sandbox.ok(INSTALL, &borrowed(&env))?;
-    assert!(!kept.contains("chrony"), "{kept}");
     Ok(())
 }
 

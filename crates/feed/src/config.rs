@@ -99,7 +99,9 @@ usage: tally-feed [--key FILE | --key-env NAME] [options]
                          but contributes nothing to MLAT
   --clock NAME           the receiver's clock: dump1090 (RTL-SDR, the default), beast,
                          radarcape_12mhz, radarcape_gps
-  --ceiling BYTES        the most this feeder sends each relay per second (default 64000)
+  --ceiling BYTES        the most this feeder sends each relay per second (default 64000,
+                         at most 216842: what it holds while it waits for a relay's anchor
+                         must fit the 64 MB its unit runs it in)
 
 The environment configures what no flag does, as an sdr-enthusiasts container is configured:
 BEASTHOST and BEASTPORT (default 30005) for --source, LAT (or READSB_LAT), LONG (or READSB_LON)
@@ -262,6 +264,17 @@ pub fn parse_with(
              send: raise it, or leave out --acars",
             config.ceiling,
             crate::source::LONGEST_ACARS
+        ));
+    }
+    if config.ceiling > crate::source::CEILING_MOST {
+        return Err(format!(
+            "--ceiling {} would have the feeder hold up to {} MB while it waits for a relay's \
+             anchor, more than its unit's MemoryMax ({} MB) leaves, and the kernel would kill it \
+             and lose the backlog: give it at most {}",
+            config.ceiling,
+            crate::source::held_bytes(config.ceiling) >> 20,
+            crate::source::MEMORY_MAX >> 20,
+            crate::source::CEILING_MOST
         ));
     }
     if !config.acars.is_empty() && config.acars_ceiling >= config.ceiling {
@@ -725,6 +738,31 @@ mod tests {
         assert!(run(&off).is_err_and(|why| why.contains("--acars-ceiling 0")));
         // With no ACARS source, a low --ceiling is no conflict.
         assert_eq!(run(&["--key", "k", "--ceiling", "4000"])?.ceiling, 4000);
+        Ok(())
+    }
+
+    /// A `--ceiling` whose hold for an anchor would not fit the packaged unit's memory is refused,
+    /// naming the most that fits, which is taken; the default fits with room. Before, any ceiling
+    /// was taken, and at 256 kB/s a minute's wait for an anchor took the feeder past its
+    /// MemoryMax, so the kernel killed it and the backlog was lost.
+    #[test]
+    fn a_ceiling_whose_hold_does_not_fit_the_unit_is_refused() -> Result<(), String> {
+        let most = crate::source::CEILING_MOST;
+        let held = |ceiling: u32| crate::source::held_bytes(ceiling) + crate::source::RUNTIME_BYTES;
+        assert!(held(most) <= crate::source::MEMORY_MAX);
+        assert!(held(most + 1) > crate::source::MEMORY_MAX);
+        assert!(held(run(&["--key", "k"])?.ceiling) <= crate::source::MEMORY_MAX);
+        assert!(
+            USAGE.contains(&format!("at most {most}")),
+            "the usage says {most}"
+        );
+        let over = (most + 1).to_string();
+        let refused = run(&["--key", "k", "--ceiling", &over]);
+        assert!(
+            refused.is_err_and(|why| why.contains("MemoryMax") && why.contains(&most.to_string()))
+        );
+        let fits = most.to_string();
+        assert_eq!(run(&["--key", "k", "--ceiling", &fits])?.ceiling, most);
         Ok(())
     }
 }

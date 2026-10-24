@@ -389,7 +389,7 @@ mod tests {
             serving_hub
                 .network()
                 .credit
-                .corroborate_receiver(feeder.public(), serving_hub.now());
+                .corroborate_receiver(feeder.public(), serving_hub.stamp_now());
         }
         let linked_at = relay(linked, Arc::clone(&linked_hub)).await?;
         let serving_at = relay(serving, Arc::clone(&serving_hub)).await?;

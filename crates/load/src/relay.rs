@@ -10,12 +10,102 @@ use std::time::{Duration, Instant};
 
 use tally_wire::{Identity, RelayAddress};
 
-/// A relay this harness started, killed when dropped.
+/// A relay this harness started, killed when dropped, with the ClockBound segment its judging
+/// clock is bounded by (`--clock-bound`), kept fresh while it runs.
 pub struct Spawned {
     child: Child,
     pub address: RelayAddress,
     pub stats: String,
     pub log: PathBuf,
+    /// Kept fresh until the relay is dropped.
+    _clock: ClockSegment,
+}
+
+/// The bound the run's segment states: a synchronised clock within a millisecond, as ClockBound
+/// says of a host whose chrony tracks its reference closely.
+pub const SEGMENT_BOUND_NS: i64 = 1_000_000;
+/// How often the segment is written again, and how long each writing holds: ClockBound's daemon
+/// writes its segment every second, each sample void some seconds on, so a writer that stops is a
+/// clock that stops judging, never one that judges on.
+const SEGMENT_EVERY: Duration = Duration::from_millis(500);
+const SEGMENT_VOID_AFTER_S: i64 = 10;
+
+/// A ClockBound segment the harness writes for its relay, as ClockBound's daemon writes one
+/// (`clock_bound_shm::ShmWriter`): synchronised within [`SEGMENT_BOUND_NS`], sampled now, written
+/// again every [`SEGMENT_EVERY`] until dropped. Without it a load host with no ClockBound starts a
+/// relay that judges no time, signs nothing and holds every batch as possession: what a run
+/// measured then was a relay that did none of its work.
+pub struct ClockSegment {
+    pub path: PathBuf,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl ClockSegment {
+    /// The segment at `path`, written now and kept fresh on a thread of its own (the writer maps
+    /// the segment and is not `Send`, so that thread makes it, and this waits for its first
+    /// writing).
+    pub fn start(path: &Path) -> Result<Self, String> {
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stopped = std::sync::Arc::clone(&stop);
+        let (ready, written) = std::sync::mpsc::channel();
+        let at = path.to_owned();
+        std::thread::Builder::new()
+            .name("tally-load-clockbound".to_owned())
+            .spawn(move || {
+                let first = clock_bound_shm::ShmWriter::new(&at)
+                    .map_err(|error| format!("{}: {error}", at.display()))
+                    .and_then(|mut writer| write_segment(&mut writer).map(|()| writer));
+                let mut writer = match first {
+                    Ok(writer) => {
+                        let _ = ready.send(Ok(()));
+                        writer
+                    }
+                    Err(error) => {
+                        let _ = ready.send(Err(error));
+                        return;
+                    }
+                };
+                while !stopped.load(std::sync::atomic::Ordering::Relaxed) {
+                    std::thread::sleep(SEGMENT_EVERY);
+                    if let Err(error) = write_segment(&mut writer) {
+                        eprintln!("tally-load: the ClockBound segment: {error}");
+                    }
+                }
+            })
+            .map_err(|error| error.to_string())?;
+        written
+            .recv()
+            .map_err(|_| "the ClockBound segment's writer ended".to_owned())??;
+        Ok(Self {
+            path: path.to_owned(),
+            stop,
+        })
+    }
+}
+
+impl Drop for ClockSegment {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// One writing of the segment: synchronised within [`SEGMENT_BOUND_NS`], sampled now on the
+/// clock ClockBound's client reads, void [`SEGMENT_VOID_AFTER_S`] on.
+fn write_segment(writer: &mut clock_bound_shm::ShmWriter) -> Result<(), String> {
+    use clock_bound_shm::ShmWrite as _;
+    let now = clock_bound_shm::common::clock_gettime_safe(clock_bound_shm::common::CLOCK_MONOTONIC)
+        .map_err(|error| format!("{error:?}"))?;
+    let bound = clock_bound_shm::ClockErrorBound::new(
+        now,
+        now + nix::sys::time::TimeSpec::new(SEGMENT_VOID_AFTER_S, 0),
+        SEGMENT_BOUND_NS,
+        0,
+        50_000,
+        clock_bound_shm::ClockStatus::Synchronized,
+        false,
+    );
+    writer.write(&bound);
+    Ok(())
 }
 
 impl Spawned {
@@ -83,6 +173,8 @@ pub fn spawn(
     };
     let listen = format!("{host}:{port}");
     let stats = format!("127.0.0.1:{}", free_port("127.0.0.1")?);
+    // Its judging clock is bounded by the run's own ClockBound segment, kept fresh while it runs.
+    let clock = ClockSegment::start(&state_dir.join("clockbound-shm0"))?;
     // A feeder holds its session and, while it probes, a probe's; probes are brief, so a fifth
     // more than the feeders holds them (20,000 feeders: 20,000 held and none refused at 24,000,
     // RFC-0181 "The world baseline"). The relay plans Noise buffers for every connection the cap
@@ -101,6 +193,8 @@ pub fn spawn(
         connections.clone(),
         "--max-connections-per-address".into(),
         connections,
+        "--clock-bound".into(),
+        clock.path.display().to_string(),
     ];
     if !mlat {
         args.push("--no-mlat".into());
@@ -123,10 +217,12 @@ pub fn spawn(
     }
     args.extend(extra.iter().cloned());
     if fit {
-        let memory = fitted_memory(bin, &args, feeders)?;
-        eprintln!(
-            "tally-load: the relay's --memory is {memory} bytes, what {feeders} feeders need"
-        );
+        // A relay refuses memory that admits no feeder (`Budget::check`), so a run of none is
+        // fitted to the least a relay starts with, one: its base is what is measured. Before, a
+        // run of none was fitted to none and the relay refused to start.
+        let fitted = feeders.max(1);
+        let memory = fitted_memory(bin, &args, fitted)?;
+        eprintln!("tally-load: the relay's --memory is {memory} bytes, what {fitted} feeders need");
         args.extend(["--memory".into(), memory.to_string()]);
     }
     let log = state_dir.join("relay.log");
@@ -157,6 +253,7 @@ pub fn spawn(
         },
         stats,
         log,
+        _clock: clock,
     };
     let reach: SocketAddr = reach
         .parse()
@@ -251,12 +348,31 @@ impl Fit {
 pub struct Charged {
     pub base: u64,
     pub held: u64,
+    /// What the allocator serves now, in its arenas and mapped apart (`allocator.in_use`,
+    /// `allocator.mapped`).
+    pub in_use: u64,
+    pub mapped: u64,
 }
 
 impl Charged {
     /// What its base and stores are charged together.
     pub fn total(&self) -> u64 {
         self.base + self.held
+    }
+
+    /// What the allocator serves beyond every store's charge: what the relay's base holds, which
+    /// the measured base and its margin must cover (`within_base`).
+    pub fn unplanned(&self) -> i64 {
+        (self.in_use + self.mapped) as i64 - self.held as i64
+    }
+
+    /// Whether what no store charges is within what the base plans for it: the measured idle
+    /// relay and its margin (`budget::MEASURED_IDLE_BYTES`, `budget::BASE_MARGIN_BYTES`). Past
+    /// them a table grows that no store charges, and the base plans for none.
+    pub fn within_base(&self) -> bool {
+        self.unplanned()
+            <= (tally_relay::budget::MEASURED_IDLE_BYTES + tally_relay::budget::BASE_MARGIN_BYTES)
+                as i64
     }
 }
 
@@ -288,12 +404,135 @@ pub fn charged(stats: &str) -> Result<Charged, String> {
         .iter()
         .map(|room| held(budget.get(room)))
         .sum();
+    let allocator = |name: &str| {
+        budget
+            .get("allocator")
+            .and_then(|allocator| allocator.get(name))
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+    };
     Ok(Charged {
         base: budget
             .get("base")
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(0),
         held: stores + rooms,
+        in_use: allocator("in_use"),
+        mapped: allocator("mapped"),
+    })
+}
+
+/// What the relay did of its work over a run (`GET /memory`, `/products`, `/mlat`): what a run's
+/// figures are worth only beside. A relay whose clock never judged holds every record as
+/// possession and uses none, so its products and strike tables hold nothing and its memory is
+/// not a working relay's (before 2026-10-23, every run on a host without ClockBound).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Worked {
+    /// Records held while the relay could judge nothing.
+    pub unjudged_records: u64,
+    pub regional_signed: u64,
+    /// What the relay's own strike tables hold (`Store::OwnStrikes`).
+    pub own_strikes_held: u64,
+    /// Where MLAT is hosted: its window steps, the positions they published, and the records
+    /// standing took in and forgot for room.
+    pub mlat: Option<MlatWorked>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MlatWorked {
+    pub steps: u64,
+    pub positions: u64,
+    pub standing_taken: u64,
+    pub standing_forgotten: u64,
+}
+
+impl Worked {
+    /// What the run did not do of its work, with feeders sending and, where hosted, MLAT: each
+    /// a reason its figures are not a working relay's. None for a run of no feeder but that its
+    /// clock judged. MLAT is asked for positions, and standing for records, only where the
+    /// simulation made `multilaterable` transmissions (heard by enough receivers to solve): a
+    /// few feeders spread over two continents hear nothing in common.
+    pub fn shortfalls(&self, feeders: usize, multilaterable: u64) -> Vec<String> {
+        let mut short = Vec::new();
+        if self.unjudged_records > 0 {
+            short.push(format!(
+                "{} records were held unjudged: the relay's clock did not judge",
+                self.unjudged_records
+            ));
+        }
+        if feeders == 0 {
+            return short;
+        }
+        if self.regional_signed == 0 {
+            short.push("no regional product was signed".to_owned());
+        }
+        if self.own_strikes_held == 0 {
+            short.push("the relay's own strike tables held nothing".to_owned());
+        }
+        if let Some(mlat) = self.mlat {
+            if mlat.steps == 0 || (multilaterable > 0 && mlat.positions == 0) {
+                short.push(format!(
+                    "MLAT stepped {} windows and published {} positions of {multilaterable} \
+                     transmissions heard by enough receivers to solve",
+                    mlat.steps, mlat.positions
+                ));
+            }
+            if multilaterable > 0 && mlat.standing_taken == 0 {
+                short.push("standing took nothing in".to_owned());
+            }
+            if mlat.standing_forgotten > 0 {
+                short.push(format!(
+                    "standing forgot {} for room: its plan (`standing::Caps::of`) is short of \
+                     what the seats bring",
+                    mlat.standing_forgotten
+                ));
+            }
+        }
+        short
+    }
+}
+
+/// What the relay at `stats` did (`Worked`): MLAT's part where it serves `/mlat` (it hosts MLAT).
+pub fn worked(stats: &str) -> Result<Worked, String> {
+    let json = |path: &str| -> Result<serde_json::Value, String> {
+        serde_json::from_str(&get(stats, path)?).map_err(|error| format!("{path}: {error}"))
+    };
+    let number =
+        |value: Option<&serde_json::Value>| value.and_then(serde_json::Value::as_u64).unwrap_or(0);
+    let memory = json("/memory")?;
+    let products = json("/products")?;
+    let own_strikes_held = memory
+        .get("budget")
+        .and_then(|budget| budget.get("stores"))
+        .and_then(serde_json::Value::as_array)
+        .and_then(|stores| {
+            stores.iter().find(|store| {
+                store.get("store").and_then(serde_json::Value::as_str) == Some("own_strikes")
+            })
+        })
+        .and_then(|store| store.get("held"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let mlat = if let Ok(report) = json("/mlat") {
+        let standing = memory.get("standing");
+        Some(MlatWorked {
+            steps: number(report.get("steps")),
+            positions: number(
+                report
+                    .get("steps_total")
+                    .and_then(|total| total.get("positions")),
+            ),
+            standing_taken: number(standing.and_then(|standing| standing.get("taken"))),
+            standing_forgotten: number(standing.and_then(|standing| standing.get("forgotten"))),
+        })
+    } else {
+        None
+    };
+    Ok(Worked {
+        unjudged_records: number(memory.get("unjudged_records")),
+        regional_signed: number(products.get("regional_signed")),
+        own_strikes_held,
+        mlat,
     })
 }
 
@@ -564,6 +803,128 @@ mod tests {
         assert!(fit(1_100).within());
         assert_eq!(fit(1_100).over_budget(), 100);
         assert!(!fit(1_101).within());
+    }
+
+    /// A run that did not do its work says what it did not: its clock judged nothing, it signed
+    /// no product, its strike tables held nothing, MLAT stepped nothing, standing took nothing in
+    /// or forgot for room. A run of no feeder is held only to its clock.
+    #[test]
+    fn a_run_that_did_not_work_says_what_it_did_not_do() {
+        let working = Worked {
+            unjudged_records: 0,
+            regional_signed: 3,
+            own_strikes_held: 4_096,
+            mlat: Some(MlatWorked {
+                steps: 2,
+                positions: 9,
+                standing_taken: 40,
+                standing_forgotten: 0,
+            }),
+        };
+        assert!(working.shortfalls(8, 100).is_empty());
+        assert!(Worked::default().shortfalls(0, 0).is_empty());
+        let broken = [
+            Worked {
+                unjudged_records: 1,
+                ..working
+            },
+            Worked {
+                regional_signed: 0,
+                ..working
+            },
+            Worked {
+                own_strikes_held: 0,
+                ..working
+            },
+            Worked {
+                mlat: Some(MlatWorked {
+                    steps: 0,
+                    ..working.mlat.unwrap_or_default()
+                }),
+                ..working
+            },
+            Worked {
+                mlat: Some(MlatWorked {
+                    positions: 0,
+                    ..working.mlat.unwrap_or_default()
+                }),
+                ..working
+            },
+            Worked {
+                mlat: Some(MlatWorked {
+                    standing_taken: 0,
+                    ..working.mlat.unwrap_or_default()
+                }),
+                ..working
+            },
+            Worked {
+                mlat: Some(MlatWorked {
+                    standing_forgotten: 1,
+                    ..working.mlat.unwrap_or_default()
+                }),
+                ..working
+            },
+        ];
+        for worked in broken {
+            assert_eq!(worked.shortfalls(8, 100).len(), 1, "{worked:?}");
+        }
+        // With nothing heard by enough receivers to solve, MLAT is asked only to step.
+        let unsolvable = Worked {
+            mlat: Some(MlatWorked {
+                positions: 0,
+                standing_taken: 0,
+                ..working.mlat.unwrap_or_default()
+            }),
+            ..working
+        };
+        assert!(unsolvable.shortfalls(8, 0).is_empty());
+        assert_eq!(unsolvable.shortfalls(8, 1).len(), 2);
+        assert_eq!(
+            Worked {
+                unjudged_records: 1,
+                ..Worked::default()
+            }
+            .shortfalls(0, 0)
+            .len(),
+            1
+        );
+    }
+
+    /// What the allocator serves beyond every store's charge is held to the measured base and
+    /// its margin.
+    #[test]
+    fn what_no_store_charges_is_held_to_the_measured_base() {
+        let base = (tally_relay::budget::MEASURED_IDLE_BYTES
+            + tally_relay::budget::BASE_MARGIN_BYTES) as u64;
+        let charged = |in_use| Charged {
+            base: 0,
+            held: 100 << 20,
+            in_use,
+            mapped: 10 << 20,
+        };
+        assert!(charged((90 << 20) + base).within_base());
+        assert!(!charged((90 << 20) + base + 1).within_base());
+        assert_eq!(charged(0).unplanned(), -(90 << 20));
+    }
+
+    /// The segment the harness writes reads, through the reader the relay's `--clock-bound`
+    /// opens, as a synchronised clock within its bound: the run's relay judges.
+    #[test]
+    fn the_clock_segment_reads_as_a_synchronised_clock() -> Result<(), String> {
+        let dir = std::env::var_os("TEST_TMPDIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir)
+            .join("clock-segment");
+        std::fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
+        let segment = ClockSegment::start(&dir.join("shm0"))?;
+        let path = segment.path.display().to_string();
+        let vmclock = dir.join("vmclock0").display().to_string();
+        let reader = tally_wire::clock_bound::Reader::at(&path, &vmclock);
+        let bound_ms = reader
+            .read()
+            .map_err(|why| format!("the segment judged nothing: {why:?}"))?;
+        assert!(bound_ms <= 2, "a bound of {bound_ms} ms");
+        Ok(())
     }
 
     /// What the relay may hold follows the most it was charged.

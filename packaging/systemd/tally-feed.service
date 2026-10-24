@@ -10,24 +10,18 @@
 # older systemd logs that it does not know it and runs the unit without it, the feeder still
 # opening no listening socket of its own.
 
-# The host's time daemon must be chrony or ntpd (install.sh installs chrony when it has neither,
-# and starts one installed and stopped): the feeder trusts its host's clock only by the kernel's
-# error bound (maxerror), which each of them keeps true. systemd-timesyncd keeps none: it sets the
-# bound to zero at a sync and the kernel grows it 500 us a second from there, which can stand below
-# the clock's real error, so under timesyncd the bound understates it and neither the kernel nor
-# the feeder can tell (RFC-0171 §3.6). Nothing here tells one daemon from another, so the
-# requirement is stated. The feeder starts after chrony-wait.service (chrony's own wait for a
-# synchronised clock, which it pulls in) and after time-sync.target, which it never pulls in
-# (systemd.special(7): a unit that needs the time is ordered after it "but not pull it in"). That
-# target holds the start back only while a wait service is enabled (under ntpd, ntpsec-wait.service
-# or systemd-time-wait-sync.service); with none it is reached at once. What holds either way is the
-# kernel's word, read at each judgement: until it says synchronised, the host is no clock source.
+# The feeder trusts its host's clock as a reference only while the host's ClockBound daemon
+# (/var/run/clockbound/shm0) says it is Synchronized within 7.5 s (RFC-0171 §3.6). It never needs
+# ClockBound, and install.sh installs none: without it, or while it says anything else, the host
+# is simply no reference, and the feeder signs by its configured relays' clocks. So the unit is
+# ordered after clockbound.service, where a host has it, and never pulls it in. The kernel's own
+# bound (adjtimex's maxerror) is not read: it cannot say which daemon wrote it.
 
 [Unit]
 Description=Tally feeder: publishes this receiver's receptions to Tally relays
 Documentation=https://github.com/sky-commons/tally
-After=network-online.target chrony-wait.service time-sync.target
-Wants=network-online.target chrony-wait.service
+After=network-online.target clockbound.service
+Wants=network-online.target
 
 [Service]
 Type=simple
@@ -51,16 +45,24 @@ NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
-PrivateDevices=yes
+# No PrivateDevices=, which would hide /dev/vmclock0: ClockBound's client reads it beside the
+# segment where the hypervisor offers one (systemd.exec(5): "When access to some but not all
+# devices must be possible, the DeviceAllow= setting might be used instead"). Every other device
+# stays closed. On a host with no VM clock systemd logs that it cannot stat /dev/vmclock0 as the
+# unit starts: harmless, the rule then allows nothing and the unit runs.
+DevicePolicy=closed
+DeviceAllow=/dev/vmclock0 r
+# PrivateDevices= gave the process a /dev/shm of its own; without it the host's is shared, so it
+# is made private here (systemd.exec(5), TemporaryFileSystem=), as PrivateDevices= mounted it.
+TemporaryFileSystem=/dev/shm:mode=1777,nosuid,nodev,noexec
 PrivateUsers=yes
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectKernelLogs=yes
 ProtectControlGroups=yes
-# No ProtectClock=: it filters adjtimex(2) whole, and the feeder reads the host clock's error
-# bound with it (a read, no modes set), which is how it knows whether its own clock is a source it
-# may trust (RFC-0171 §3.6). The clock cannot be set from here all the same: the empty
-# CapabilityBoundingSet below keeps CAP_SYS_TIME out, and the kernel refuses a write without it.
+# Nothing here reads or sets the clock's discipline: the bound is ClockBound's, read from shared
+# memory, so every call that could set the clock is filtered too.
+ProtectClock=yes
 ProtectHostname=yes
 ProtectProc=invisible
 ProcSubset=pid
@@ -77,14 +79,7 @@ SystemCallArchitectures=native
 SystemCallFilter=@system-service
 # @resources stays allowed: the async runtime may set a thread's affinity or priority.
 SystemCallFilter=~@privileged
-# @privileged holds @clock, and so the read of the clock's error bound: allowed back, every system
-# call that read may be (glibc's adjtimex(3) is clock_adjtime(2), and clock_adjtime64 on a 32-bit
-# time_t; tally_wire::kernel_clock::SYSCALLS, which //crates/feed:unit holds this line to).
-SystemCallFilter=adjtimex clock_adjtime clock_adjtime64
-# A refused call fails with EPERM rather than killing the process: a feeder refused its clock's
-# bound treats the host as unsynced, which is no clock source at all (as NTP never votes an
-# undisciplined local clock): it signs by its configured relays, or by the host's clock as read
-# while none is selected.
+# A refused call fails with EPERM rather than killing the process with SIGSYS unsaid.
 SystemCallErrorNumber=EPERM
 # It never listens: binding any socket is refused outright.
 SocketBindDeny=any

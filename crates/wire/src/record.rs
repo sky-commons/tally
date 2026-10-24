@@ -516,8 +516,8 @@ pub enum Record {
         /// reads the fields before it and ignores it.
         clock_ms: Option<u64>,
         /// How far the relay's clock may be from true time as it wrote this, in milliseconds
-        /// (`ε_r`, the host's NTP daemon's bound, `adjtimex`'s `maxerror`), `u64::MAX` while the
-        /// host reports its clock unsynced: what a feeder weighs this relay's clock by when it
+        /// (`ε_r`, the bound the host's ClockBound publishes, `clock_bound`), `u64::MAX` while it
+        /// does not judge: what a feeder weighs this relay's clock by when it
         /// selects (RFC 5905 §11.2.1). Appended after `clock_ms`, and sent only with it: `None`
         /// from a relay that states none, which a feeder takes at the bound the protocol promises
         /// (`budget::E`); a reader that predates it ignores it.

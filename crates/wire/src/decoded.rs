@@ -119,6 +119,9 @@ pub mod keyed {
     /// A freshness anchor's slot in a relay's cache of verified anchors
     /// (`tally_relay::anchors`), over its bytes.
     pub const ANCHOR_SLOT: u8 = 0xf7;
+    /// A provider offer's hash remembered as acted on, in a relay's directory
+    /// (`tally_relay::directory`), under the directory's own key.
+    pub const OFFER_SEEN: u8 = 0xf8;
 }
 
 /// One reception of a decoded batch: its fixed fields, where its message is in the batch's plain

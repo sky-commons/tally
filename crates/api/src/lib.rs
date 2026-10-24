@@ -108,6 +108,9 @@ pub struct Settings {
     /// A checkout of VRS standing data (its `routes/` and `airports/`), which the routes answer
     /// from; none answers them `404`.
     pub routes: Option<PathBuf>,
+    /// The clock signed times are judged by: the host's, bounded by its ClockBound
+    /// (`mlat::Clock::system`); a test's states its bound (`mlat::Clock::host_stated`).
+    pub clock: mlat::Clock,
 }
 
 impl Settings {
@@ -125,6 +128,7 @@ impl Settings {
             stream_heartbeat: stream::HEARTBEAT,
             mlat: mlat::Settings::default(),
             routes: None,
+            clock: mlat::Clock::system(),
         }
     }
 }
@@ -218,7 +222,7 @@ impl App {
         let Ok(mut ledger) = self.feeders.lock() else {
             return;
         };
-        let board = ledger.board(crate::mlat::Clock::system().now().judged());
+        let board = ledger.board(self.settings.clock.now().judged());
         drop(ledger);
         self.snapshot.set_board(board, Instant::now());
     }
@@ -234,6 +238,7 @@ pub async fn serve(listener: TcpListener, settings: Settings, identity: tally_wi
     }
     if let Err(error) = mlat::start(
         &app.settings.mlat,
+        app.settings.clock.clone(),
         identity,
         Arc::clone(&app.mlat),
         Arc::clone(&app.feeders),

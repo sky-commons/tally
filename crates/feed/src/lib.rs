@@ -35,6 +35,13 @@ use crate::health::Health;
 use crate::relays::{Directory, Publishing};
 use crate::source::Batcher;
 
+/// The unit tests hold what the batcher keeps for an anchor to what it really allocates, each test
+/// on its own thread's count (`tally_counting::Counting`, test support outside every production
+/// build).
+#[cfg(test)]
+#[global_allocator]
+static COUNTING: tally_counting::Counting = tally_counting::Counting;
+
 /// A station's page on the Tally site, by its key as a URL carries it (base64url, no padding).
 pub const STATION_PAGE: &str = "https://tally.flightlines.ai/en/station/";
 

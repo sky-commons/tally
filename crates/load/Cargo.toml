@@ -17,7 +17,11 @@ name = "tally-load"
 path = "src/main.rs"
 
 [dependencies]
+# The run's own ClockBound segment, written as the daemon writes one, which the spawned relay's
+# judging clock is bounded by (`--clock-bound`): a relay that judges no time signs nothing.
+clock-bound-shm = { workspace = true, features = ["writer"] }
 libc.workspace = true
+nix = { workspace = true, features = ["time"] }
 serde_json.workspace = true
 # Each simulated feeder is the feeder itself (`tally_feed::start`), not a copy of it.
 tally-feed = { path = "../feed" }

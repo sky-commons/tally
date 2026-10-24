@@ -285,37 +285,38 @@ pub enum FeederClock {
 
 /// Whether a feeder's batch too old by its signed time where it publishes
 /// ([`FeederClock::TooOld`]) is older than an honest batch can be by this relay's own anchor in
-/// it: either it carries none of this relay's own anchors that this relay remembers issuing, or
-/// the youngest of them, issued [`OwnAnchor::Aged`] before it arrived by this relay's raw
-/// monotonic clock (`Hub::own_anchor_age`), is older than an honest batch's can be
-/// (`tally_wire::budget::OWN_ANCHOR_OLDEST`: the anchor's age as it is signed by, `B` and `δ`).
-/// The signed time's half of the rule is [`feeder_clock`]'s alone ([`blame`]'s `too_old`).
-/// The origin signed that anchor and timed it on a clock no daemon slews or steps, so the age is
-/// exact whatever its judging clock did meanwhile, and whatever the feeder's clock says. No other
-/// relay's anchor moves it, so the blame is the same whatever else the batch carries. A batch a
-/// feeder held waiting for its first anchor, or signed by a clock behind true time, carries this
-/// relay's anchor younger than that, so neither the hold nor the clock is blamed; without it, it
-/// is blamed by its signed time.
+/// it: the youngest of this relay's own anchors it carries was issued [`OwnAnchor::Aged`] before
+/// it arrived by this relay's raw monotonic clock (`Hub::own_anchor_age`), longer than an honest
+/// batch's can be (`tally_wire::budget::OWN_ANCHOR_OLDEST`: the anchor's age as it is signed by,
+/// `B` and `δ`). The signed time's half of the rule is [`feeder_clock`]'s alone ([`blame`]'s
+/// `too_old`). The origin signed that anchor and timed it on a clock no daemon slews or steps, so
+/// the age is exact whatever its judging clock did meanwhile, and whatever the feeder's clock
+/// says. No other relay's anchor moves it, so the blame is the same whatever else the batch
+/// carries. A batch a feeder held waiting for its first anchor, or signed by a clock behind true
+/// time, carries this relay's anchor younger than that, so neither the hold nor the clock is
+/// blamed. A batch that carries none of this relay's anchors ([`OwnAnchor::Absent`]) is never
+/// blamed: an honest feeder sends such batches (a reconnect's backlog anchored by another relay
+/// alone, its batches anchored by another relay while this relay's judging clock stepped ahead, a
+/// relay with no signer, which issues none), so its signed time alone proves nothing against it.
 fn own_anchor_too_old(own: OwnAnchor) -> bool {
     match own {
         OwnAnchor::Aged(age) => age > tally_wire::budget::OWN_ANCHOR_OLDEST,
-        OwnAnchor::Absent => true,
-        OwnAnchor::Unknowable => false,
+        OwnAnchor::Absent => false,
     }
 }
 
 /// This relay's own freshness anchor in a feeder's batch, as blame reads it ([`blame`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OwnAnchor {
-    /// The youngest it carries was issued this long before the batch arrived, by this relay's raw
-    /// monotonic clock (`Hub::own_anchor_age`).
+    /// The youngest it carries was issued no later than this long before the batch arrived, by
+    /// this relay's raw monotonic clock (`Hub::own_anchor_age`): never overstated, whether the
+    /// relay remembers that issue or only one it was issued no later than
+    /// (`anchors::Anchors::issued_by`), or the batch came in its link's backlog
+    /// (`link::Drained`).
     Aged(Span<Raw>),
-    /// It carries none this relay remembers issuing, and the relay remembers every one an
-    /// honest batch may carry (`anchors::Anchors::remembers`).
+    /// It carries none of this relay's that verifies, or this relay has issued none this run
+    /// (none it can age): never blamed.
     Absent,
-    /// The relay started too recently to remember every own anchor an honest batch may carry
-    /// (`anchors::Anchors::remembers`): one of its earlier run may be in it, so nothing is blamed.
-    Unknowable,
 }
 
 /// A feeder's batch's lateness blamed on its receiver (`stations::StationReport`'s
@@ -326,9 +327,10 @@ pub struct Blame(());
 /// The one rule a feeder's batch is blamed by: too old by its own signed time where its feeder
 /// published it (`too_old`, `feeder_clock`), judged there for the first time (`first`, so a
 /// resend or an audit's owed copy is never blamed again), and older than an honest batch can be
-/// by this relay's own anchor in it ([`own_anchor_too_old`]). Late for any other reason (its table's
-/// floor raised past it before it was kept, a stale anchor, a clock not judging) is counted late,
-/// never blamed.
+/// by this relay's own anchor in it ([`own_anchor_too_old`]), so only a batch that carries this
+/// relay's own anchor is ever blamed. Late for any other reason (its table's floor raised past it
+/// before it was kept, a stale anchor, a clock not judging, none of this relay's anchors) is
+/// counted late, never blamed.
 pub fn blame(too_old: bool, first: bool, own: OwnAnchor) -> Option<Blame> {
     (too_old && first && own_anchor_too_old(own)).then_some(Blame(()))
 }
@@ -2410,9 +2412,11 @@ mod tests {
     /// reference 14.4 s below true time, held its whole backlog for an anchor that never came and
     /// sent unanchored, reaches an origin 7 s ahead usable and unblamed; one signed by a clock an
     /// hour behind, carrying the origin's own anchor, is not blamed while that anchor's age since
-    /// its issue is within an honest batch's (`OWN_ANCHOR_OLDEST`), and is past it. Before, the
-    /// first was too old (a 74 s window with no room for the lag) and the second blamed (an
-    /// allowance that subtracted the wrong term).
+    /// its issue is within an honest batch's (`OWN_ANCHOR_OLDEST`), and is past it; one carrying
+    /// none of the origin's own anchors is never blamed, however old. Before, the first was too
+    /// old (a 74 s window with no room for the lag), the second blamed (an allowance that
+    /// subtracted the wrong term), and the third blamed by its signed time alone, though an honest
+    /// reconnect's backlog anchored by another relay is such a batch.
     #[test]
     fn an_honest_feeder_is_blamed_neither_for_its_references_lag_nor_its_backlog() {
         use tally_wire::budget::{ANCHOR_AGE, B, OWN_ANCHOR_OLDEST, TRANSIT};
@@ -2460,16 +2464,19 @@ mod tests {
             Some(OWN_ANCHOR_OLDEST.span::<tally_wire::clocks::Judged>().ms() + 1),
             now
         ));
-        // Its own anchor forgotten (a boot before this one's): blamed by its signed time.
-        assert!(blamed(behind, None, now));
+        // None of this relay's anchors in it (another relay's alone, a relay with no signer):
+        // never blamed, however old its signed time. An own anchor the ring has let go, or one of
+        // an earlier run, is no such batch: it is aged from the newest issue let go, or this
+        // run's first (`anchors::Anchors::issued_by`), and blamed by that age.
+        assert!(!blamed(behind, None, now));
         // Usable by its signed time: never blamed, whatever its anchor's age.
         assert!(!blamed(now - 1_000, Some(u64::MAX), now));
         assert!(!blamed(now - 1_000, None, now));
         // Judged before (a resend, an audit's owed copy): never blamed again.
-        assert!(blame(true, false, OwnAnchor::Absent).is_none());
-        // A relay that restarted too recently to remember every own anchor an honest batch may
-        // carry blames nothing, whatever the batch's signed time.
-        assert!(blame(true, true, OwnAnchor::Unknowable).is_none());
+        let raw = tally_wire::clocks::recorded::raw;
+        let aged = OwnAnchor::Aged(raw(u64::MAX).since(raw(0)));
+        assert!(blame(true, true, aged).is_some());
+        assert!(blame(true, false, aged).is_none());
     }
 
     /// A table begun by a synced clock judges nothing while the clock is not judging (its error

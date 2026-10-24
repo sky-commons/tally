@@ -65,6 +65,18 @@ struct Event {
     message: Message,
 }
 
+/// What a member's hub tells its member of a record it refused (`Sim::refusing`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Telling {
+    /// Nothing: the record is only dropped.
+    Nothing,
+    /// That its deliverer sent it (`Member::refused`): noted, and pushed on unheld.
+    Delivered,
+    /// That it refused it, naming no deliverer (`Member::refuse`), as for a record rebuilt from
+    /// parity that it judged bad: never pushed on.
+    Refused,
+}
+
 struct Sim {
     group: GroupKey,
     members: Vec<Member>,
@@ -99,20 +111,45 @@ struct Sim {
     receiver: Identity,
     sequence: u64,
     /// (member, origin): the member's hub drops every record of that origin it is handed, and
-    /// tells its member so (`Member::refuse`) when the flag says.
-    refusing: Option<(usize, usize, bool)>,
+    /// tells its member so as the [`Telling`] says.
+    refusing: Option<(usize, usize, Telling)>,
     /// How far every member's judging clock reads from the simulation's (its monotonic clock):
     /// zero but in a test of a step.
     judge_step_ms: i64,
+    /// Each record's encoded length.
+    lens: BTreeMap<Hash, usize>,
+    /// The observations each record originated carries: none but in a test of records' size.
+    observations: usize,
+    /// How far each member's judging clock reads from the rest's, beside the step: none but in a
+    /// test of clocks apart.
+    skew_ms: BTreeMap<usize, i64>,
+    /// Members whose judging clock does not judge yet, as at a boot before it syncs: how far it
+    /// reads from the simulation's, and the simulation's moment it judges from (reading true).
+    booting: BTreeMap<usize, (i64, u64)>,
 }
 
 impl Sim {
-    /// The members' two clocks now: the simulation's, and its judging clock moved by the step.
-    fn at(&self) -> super::Now {
+    /// Member `i`'s two clocks now: the simulation's, and its judging clock moved by the step and
+    /// by its own skew.
+    fn at(&self, i: usize) -> super::Now {
+        if let Some(&(off_ms, judges_from)) = self.booting.get(&i)
+            && self.now < judges_from
+        {
+            return super::Now::from(crate::ingest::Stamp::recorded(
+                self.now,
+                0,
+                self.now.saturating_add_signed(off_ms),
+                self.now,
+                false,
+            ));
+        }
+        let skew = self.skew_ms.get(&i).copied().unwrap_or(0);
         super::Now::from(crate::ingest::Stamp::recorded(
             self.now,
             0,
-            self.now.saturating_add_signed(self.judge_step_ms),
+            self.now
+                .saturating_add_signed(self.judge_step_ms)
+                .saturating_add_signed(skew),
             self.now,
             true,
         ))
@@ -163,6 +200,10 @@ impl Sim {
             sequence: 0,
             refusing: None,
             judge_step_ms: 0,
+            skew_ms: BTreeMap::new(),
+            booting: BTreeMap::new(),
+            lens: BTreeMap::new(),
+            observations: 0,
         };
         let mut sends = Vec::new();
         for (i, member) in members.iter_mut().enumerate() {
@@ -270,7 +311,24 @@ impl Sim {
                     wall_ms: self.now,
                     dropped: 0,
                     previous: [0; 32],
-                    observations: Vec::new(),
+                    observations: (0..self.observations)
+                        .map(|n| {
+                            let mut state = self.sequence * 1_000_003 + n as u64;
+                            tally_wire::Observation {
+                                format: b'3',
+                                timestamp: n as u64,
+                                signal: 0,
+                                data: (0..14)
+                                    .map(|_| {
+                                        state = state
+                                            .wrapping_mul(6_364_136_223_846_793_005)
+                                            .wrapping_add(1);
+                                        (state >> 56) as u8
+                                    })
+                                    .collect(),
+                            }
+                        })
+                        .collect(),
                 },
             )
             .map_err(text)?;
@@ -278,11 +336,13 @@ impl Sim {
             let piece = Piece::of(&record).ok_or("no piece")?;
             let hash = piece.hash().ok_or("no hash")?;
             self.originated.insert(hash, (self.now, origin));
+            self.lens.insert(hash, piece.len());
             hashes.push(hash);
             if self.down.contains(&origin) {
                 continue;
             }
-            let out = self.members[origin].originate(self.group, hash, piece, self.now);
+            let at = self.at(origin);
+            let out = self.members[origin].originate(self.group, hash, piece, at);
             self.collect(origin);
             self.send(origin, out);
         }
@@ -309,7 +369,7 @@ impl Sim {
                 if self.down.contains(&event.to) {
                     continue;
                 }
-                if let (Some((member, origin, tell)), Message::Piece { group, hash, .. }) =
+                if let (Some((member, origin, tell)), Message::Piece { group, hash, piece }) =
                     (self.refusing, &event.message)
                     && member == event.to
                     && self
@@ -317,14 +377,25 @@ impl Sim {
                         .get(hash)
                         .is_some_and(|(_, by)| *by == origin)
                 {
-                    if tell {
-                        let at = self.at();
-                        self.members[member].refuse(*group, *hash, at);
+                    let at = self.at(member);
+                    match tell {
+                        Telling::Nothing => {}
+                        Telling::Delivered => {
+                            let from = self.keys[event.from];
+                            let out = self.members[member].refused(
+                                from,
+                                *group,
+                                (*hash, piece.clone()),
+                                at,
+                            );
+                            self.send(member, out);
+                        }
+                        Telling::Refused => self.members[member].refuse(*group, *hash, at),
                     }
                     continue;
                 }
                 let from = self.keys[event.from];
-                let at = self.at();
+                let at = self.at(event.to);
                 let out = self.members[event.to].receive(from, event.message, at);
                 self.collect(event.to);
                 self.send(event.to, out);
@@ -338,7 +409,7 @@ impl Sim {
                     if self.down.contains(&i) {
                         continue;
                     }
-                    let at = self.at();
+                    let at = self.at(i);
                     let out = self.members[i].tick(at);
                     self.collect(i);
                     self.send(i, out);
@@ -639,7 +710,7 @@ fn seeds_rotate_by_a_rule_anyone_can_check() -> Outcome {
 #[test]
 fn a_refused_record_is_never_asked_for_again() -> Outcome {
     let mut asked = Vec::new();
-    for tell in [false, true] {
+    for tell in [Telling::Nothing, Telling::Delivered] {
         let mut sim = Sim::new(8, 20)?;
         let member = 5;
         sim.refusing = Some((member, 0, tell));
@@ -888,6 +959,413 @@ fn receipts_verify_and_name_what_was_delivered() -> Outcome {
     let shortfalls: u64 = sim.members.iter().map(|m| m.stats().shortfalls).sum();
     if shortfalls != 0 {
         return Err(format!("{shortfalls} shortfalls in a healthy group"));
+    }
+    Ok(())
+}
+
+fn shortfalls(sim: &Sim) -> u64 {
+    sim.members.iter().map(|m| m.stats().shortfalls).sum()
+}
+
+fn demoted_any(sim: &Sim) -> Option<(usize, usize)> {
+    sim.live().into_iter().find_map(|i| {
+        sim.live()
+            .into_iter()
+            .find(|j| sim.members[i].is_demoted(sim.group, &sim.keys[*j]))
+            .map(|j| (i, j))
+    })
+}
+
+/// RFC-0171 §3.6: who delivered what is kept to its window's judgment, on `M`, however late the
+/// judging clock reaches the window's end. Origins whose clocks read 7 s ahead of the rest have
+/// their records' windows end, by this relay's clock, after a horizon on `M` from when the records
+/// came; and origins 10 s ahead, with every clock then stepped 5 s back, later still. Every window
+/// still signed is receipted whole: nobody is reported short and nobody demoted. Before, the
+/// senders were let go a horizon after they came, by `M`, while the receipt was signed by `J` at
+/// the window's end and its grace, so it found none and reported its honest parent short.
+#[test]
+fn origins_clocks_ahead_and_a_step_back_report_nobody_short() -> Outcome {
+    for (skew_ms, step_ms) in [(7_000i64, 0i64), (10_000, -5_000)] {
+        let mut sim = Sim::new(16, 20)?;
+        let origins = [0, 1, 2, 3];
+        for origin in origins {
+            sim.skew_ms.insert(origin, skew_ms);
+        }
+        sim.feed(&origins, 3, 6)?;
+        sim.judge_step_ms = step_ms;
+        sim.feed(&origins, 3, 6)?;
+        let end = sim.now + 30_000;
+        sim.run_until(end);
+        if shortfalls(&sim) != 0 {
+            return Err(format!(
+                "{} shortfalls with origins {skew_ms} ms ahead and a {step_ms} ms step",
+                shortfalls(&sim)
+            ));
+        }
+        if let Some((i, j)) = demoted_any(&sim) {
+            return Err(format!(
+                "member {i} demoted {j} with origins {skew_ms} ms ahead"
+            ));
+        }
+        // Not a quiet pass: the windows were receipted, by every member but the origins.
+        if skew_ms == 7_000
+            && sim
+                .receipts
+                .iter()
+                .all(|(from, _, _)| origins.contains(from))
+        {
+            return Err("no member but an origin signed a receipt".into());
+        }
+    }
+    Ok(())
+}
+
+/// RFC-0171 §3.6: a member that restarts within a receipt window signs no receipt for that window
+/// (it never saw what was delivered before the restart), and does sign one for each window after,
+/// which it saw whole. When it began is its first judging reading: its clock at boot reads a
+/// minute behind, then a minute ahead, without judging, for its first second. Nobody is reported
+/// short, and the restarted member signs receipts for the windows after. Before, its first
+/// reading of any kind was when it began: a clock behind put that before the window the restart
+/// cut, whose receipt then reported its parent short; one ahead skipped every window it saw whole.
+#[test]
+fn a_restart_within_a_window_is_dated_by_its_first_judging_reading() -> Outcome {
+    let origins = [0, 1, 2, 3];
+    let restarted = 9;
+    for off_ms in [-60_000i64, 60_000] {
+        let mut sim = Sim::new(16, 20)?;
+        sim.feed(&origins, 3, 6)?;
+        // Into a window, two seconds past its start.
+        while (sim.now / 1000) % super::member::RECEIPT_WINDOW_SECONDS != 2 {
+            sim.feed(&origins, 3, 1)?;
+        }
+        let booted = sim.now;
+        sim.booting.insert(restarted, (off_ms, booted + 1_000));
+        sim.members[restarted] = Member::new(
+            crate::signer::synced(identity(restarted)),
+            Gauge::unlimited(Store::Batches),
+            Deadlines::RELAY,
+        );
+        let at = sim.at(restarted);
+        let keys = sim.keys.clone();
+        let out = sim.members[restarted].set_members(sim.group, &keys, &[], at);
+        sim.send(restarted, out);
+        sim.feed(&origins, 3, 15)?;
+        let end = sim.now + 15_000;
+        sim.run_until(end);
+        if shortfalls(&sim) != 0 {
+            return Err(format!(
+                "{} shortfalls after a restart booting {off_ms} ms off",
+                shortfalls(&sim)
+            ));
+        }
+        if !sim.receipts.iter().any(|(from, _, receipt)| {
+            *from == restarted
+                && receipt
+                    .content()
+                    .is_ok_and(|content| content.first_second * 1000 > booted)
+        }) {
+            return Err(format!(
+                "the member restarted {off_ms} ms off signed no receipt for a window after"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// RFC-0171 §3.6: a window's receipts fall due on `M`, a grace after the judging clock was first
+/// read past its end, so a step of that clock forward brings no window due before what was
+/// still arriving for it came. Records travel 400 ms a hop; just after a window ends, every
+/// member's judging clock steps 4 s forward, past the window and its grace. Nobody is reported
+/// short. Before, the receipts were due by `J` at the window's end and its grace, so the step made
+/// them due at once, before the last second's records reached the leaves.
+#[test]
+fn a_step_forward_of_the_judging_clock_brings_no_window_due_at_once() -> Outcome {
+    let mut sim = Sim::new(16, 400)?;
+    let origins = [0, 1, 2, 3];
+    sim.feed(&origins, 3, 6)?;
+    while (sim.now / 1000 + 1) % super::member::RECEIPT_WINDOW_SECONDS != 0 {
+        sim.feed(&origins, 3, 1)?;
+    }
+    let ended = (sim.now / 1000 + 1) * 1000;
+    sim.run_until(ended + 100);
+    sim.judge_step_ms = 4_000;
+    let end = sim.now + 20_000;
+    sim.run_until(end);
+    if shortfalls(&sim) != 0 {
+        return Err(format!(
+            "{} shortfalls after a step forward of the judging clock",
+            shortfalls(&sim)
+        ));
+    }
+    if sim.receipts.is_empty() {
+        return Err("no receipts".into());
+    }
+    Ok(())
+}
+
+/// RFC-0174 §2.5: an origin's record that a member's relay refuses (it reads its format, and it
+/// does not decode) is no fault of the honest members that carry it. The member notes who
+/// delivered it, holds it owed by nobody, and pushes it on unheld, so neither its parent nor the
+/// member itself is reported short, and nobody is demoted. Before, it noted no sender and pushed it
+/// no further, so its own receipt reported its parent short of it and its children reported it.
+#[test]
+fn an_origins_refused_record_demotes_no_honest_forwarder() -> Outcome {
+    let origins = [0, 1, 2, 3];
+    // The same run without the refusal first: the stripes origin 0's records travel (the run is
+    // deterministic), and a member that forwards in one of them.
+    let mut dry = Sim::new(16, 20)?;
+    dry.feed(&origins, 3, 10)?;
+    let stripes: BTreeSet<u8> = dry
+        .originated
+        .iter()
+        .filter(|(_, (_, origin))| *origin == 0)
+        .map(|(hash, _)| data_stripe(hash))
+        .collect();
+    let layout = dry.layout();
+    let epoch = epoch_of(dry.now / 1000);
+    let refuser = (0..dry.members.len())
+        .filter(|i| !origins.contains(i))
+        .find(|i| {
+            stripes.iter().any(|stripe| {
+                layout
+                    .place(*stripe, epoch, &dry.keys[*i])
+                    .is_some_and(|place| !place.children.is_empty() && place.parent.is_some())
+            })
+        })
+        .ok_or("no member forwards origin 0's records")?;
+    let mut sim = Sim::new(16, 20)?;
+    sim.refusing = Some((refuser, 0, Telling::Delivered));
+    sim.feed(&origins, 3, 10)?;
+    let near = sim.now + 1_000;
+    sim.run_until(near);
+    let refused = sim
+        .originated
+        .iter()
+        .filter(|(hash, (_, origin))| {
+            *origin == 0 && sim.members[refuser].has_refused(sim.group, hash)
+        })
+        .count();
+    if refused == 0 {
+        return Err("the member refused nothing".into());
+    }
+    let end = sim.now + 15_000;
+    sim.run_until(end);
+    if shortfalls(&sim) != 0 {
+        return Err(format!(
+            "{} shortfalls for an origin's refused records",
+            shortfalls(&sim)
+        ));
+    }
+    if let Some((i, j)) = demoted_any(&sim) {
+        return Err(format!(
+            "member {i} demoted {j} for an origin's refused record"
+        ));
+    }
+    Ok(())
+}
+
+/// RFC-0174 §2.5: a refused record is pushed on only once a manifest lists it, since only then is
+/// a child owed it. A member's parent hands it a record no manifest lists, which its relay refuses
+/// (its signature fails): it goes no further, is held charged meanwhile, and is let go a horizon
+/// later. Before, every refused record was pushed down the tree at once, so a member could flood
+/// the whole group with records nobody vouched for.
+#[test]
+fn a_refused_record_no_manifest_lists_goes_no_further() -> Outcome {
+    let mut sim = Sim::new(16, 20)?;
+    sim.feed(&[0, 1], 3, 2)?;
+    let record = Record::Batch(
+        crate::anchors::anchored(
+            &identity(10_001),
+            &BatchContent {
+                boot_id: 9,
+                sequence: 1,
+                counter_epoch: 0,
+                wall_ms: sim.now,
+                dropped: 0,
+                previous: [0; 32],
+                observations: Vec::new(),
+            },
+        )
+        .map_err(text)?,
+    );
+    let piece = Piece::of(&record).ok_or("no piece")?;
+    let hash = piece.hash().ok_or("no hash")?;
+    let layout = sim.layout();
+    let epoch = epoch_of(sim.now / 1000);
+    let (member, parent) = (0..sim.members.len())
+        .find_map(|i| {
+            let place = layout.place(data_stripe(&hash), epoch, &sim.keys[i])?;
+            (!place.children.is_empty())
+                .then_some(place.parent)
+                .flatten()
+                .map(|parent| (i, parent))
+        })
+        .ok_or("no member forwards in the record's stripe")?;
+    let at = sim.at(member);
+    let before = sim.members[member].held_bytes();
+    let out = sim.members[member].refused(parent, sim.group, (hash, piece), at);
+    if !out.is_empty() {
+        return Err(format!(
+            "pushed on to {} members, listed by no manifest",
+            out.len()
+        ));
+    }
+    if !sim.members[member].has_refused(sim.group, &hash) {
+        return Err("not counted refused".into());
+    }
+    let member_ref = &sim.members[member];
+    if member_ref.held_bytes() <= before || member_ref.held_bytes() != member_ref.counted_bytes() {
+        return Err(format!(
+            "held {} (before {before}), counted {}",
+            member_ref.held_bytes(),
+            member_ref.counted_bytes()
+        ));
+    }
+    let end = sim.now + Deadlines::RELAY.horizon_ms() + 10_000;
+    sim.run_until(end);
+    if sim.handed.keys().any(|(_, handed)| *handed == hash) {
+        return Err("the record reached another member".into());
+    }
+    let member_ref = &sim.members[member];
+    if member_ref.held_bytes() != member_ref.counted_bytes() {
+        return Err(format!(
+            "held {}, counted {} past the horizon",
+            member_ref.held_bytes(),
+            member_ref.counted_bytes()
+        ));
+    }
+    Ok(())
+}
+
+/// RFC-0174 §2.5: a record a member refused is owed by nobody in its reckoning, so it reports
+/// nobody short of it, whoever did or did not deliver it. A leaf of every stripe an origin's
+/// records travel refuses each of them naming no deliverer (`Member::refuse`, as for a record
+/// rebuilt from parity and judged bad), so none is noted delivered and none goes further: its
+/// receipts report nobody short. Were a refused record owed, every receipt to its parent would
+/// report that parent short of the origin's records.
+#[test]
+fn a_record_refused_with_no_deliverer_is_owed_by_nobody() -> Outcome {
+    let origins = [0, 1, 2, 3];
+    // The same run without the refusal first: the stripes origin 0's records travel and the
+    // epochs they span (the run is deterministic), and a member that is a leaf in all of them.
+    let mut dry = Sim::new(16, 20)?;
+    dry.feed(&origins, 3, 10)?;
+    let travelled: BTreeSet<(u8, u64)> = dry
+        .originated
+        .iter()
+        .filter(|(_, (_, origin))| *origin == 0)
+        .map(|(hash, (at, _))| (data_stripe(hash), epoch_of(at / 1000)))
+        .collect();
+    let layout = dry.layout();
+    let refuser = (0..dry.members.len())
+        .filter(|i| !origins.contains(i))
+        .find(|i| {
+            travelled.iter().all(|(stripe, epoch)| {
+                layout
+                    .place(*stripe, *epoch, &dry.keys[*i])
+                    .is_some_and(|place| place.children.is_empty() && place.parent.is_some())
+            })
+        })
+        .ok_or("no member is a leaf of every stripe origin 0's records travel")?;
+    let mut sim = Sim::new(16, 20)?;
+    sim.refusing = Some((refuser, 0, Telling::Refused));
+    sim.feed(&origins, 3, 10)?;
+    let near = sim.now + 1_000;
+    sim.run_until(near);
+    let refused = sim
+        .originated
+        .iter()
+        .filter(|(hash, (_, origin))| {
+            *origin == 0 && sim.members[refuser].has_refused(sim.group, hash)
+        })
+        .count();
+    if refused == 0 {
+        return Err("the member refused nothing".into());
+    }
+    let end = sim.now + 15_000;
+    sim.run_until(end);
+    if shortfalls(&sim) != 0 {
+        return Err(format!(
+            "{} shortfalls for records refused with no deliverer",
+            shortfalls(&sim)
+        ));
+    }
+    // Not a quiet pass: the refuser receipted its parents.
+    if !sim.receipts.iter().any(|(from, _, _)| *from == refuser) {
+        return Err("the refuser signed no receipt".into());
+    }
+    Ok(())
+}
+
+/// RFC-0174 §2.5: a member with no room to hold what it is delivered still reckons it: who
+/// delivered it, and how long it is, from the store's floor for what the groups reckon by
+/// (`member::reckoning_floor`), which records never take. Every member's store holds a fraction of
+/// the group's records; nobody is reported short, and each receipt counts the bytes of every
+/// record it names. Before, a member noted a sender only when the store had room to hold the
+/// record, and counted a record it did not hold as no bytes.
+#[test]
+fn a_full_store_still_credits_what_it_could_not_hold() -> Outcome {
+    let origins = [0, 1, 2, 3];
+    // What the group holds and reckons at most with room for all of it.
+    // Records of a size the plan is made for, beside which a record's reckoning is small.
+    const OBSERVATIONS: usize = 200;
+    let mut open = Sim::new(16, 20)?;
+    open.observations = OBSERVATIONS;
+    open.feed(&origins, 3, 10)?;
+    let end = open.now + 15_000;
+    let (mut held, mut reckoned) = (0, 0);
+    while open.now < end {
+        let next = open.now + 250;
+        open.run_until(next);
+        for member in &open.members {
+            held = held.max(member.held_bytes());
+            reckoned = reckoned.max(member.reckoning_bytes().0);
+        }
+    }
+    // A store whose floor holds twice that reckoning, with room beside it for less than what is
+    // held.
+    let mut limit = held / 8;
+    while super::member::reckoning_floor(limit) < 2 * reckoned {
+        limit += held / 8;
+    }
+    let free = limit - super::member::reckoning_floor(limit);
+    if free >= held {
+        return Err(format!(
+            "a store of {limit} with its floor of {} holds all {held} bytes",
+            super::member::reckoning_floor(limit)
+        ));
+    }
+    let mut sim = Sim::new(16, 20)?;
+    sim.observations = OBSERVATIONS;
+    for member in &mut sim.members {
+        member.charge_to(Gauge::new(Store::Batches, limit));
+    }
+    sim.feed(&origins, 3, 10)?;
+    let end = sim.now + 15_000;
+    sim.run_until(end);
+    let refused: u64 = sim.members.iter().map(|m| m.stats().refused).sum();
+    if refused == 0 {
+        return Err("no store was full".into());
+    }
+    if shortfalls(&sim) != 0 {
+        return Err(format!("{} shortfalls of full stores", shortfalls(&sim)));
+    }
+    let lens: BTreeSet<usize> = sim.lens.values().copied().collect();
+    let [len] = lens.into_iter().collect::<Vec<_>>()[..] else {
+        return Err("records of different lengths".into());
+    };
+    for (_, _, receipt) in &sim.receipts {
+        let content = receipt.content().map_err(text)?;
+        if content.stripe != super::stripes::PARITY_STRIPE
+            && content.bytes != u64::from(content.records) * len as u64
+        {
+            return Err(format!(
+                "a receipt for {} records counts {} bytes, not {}",
+                content.records,
+                content.bytes,
+                u64::from(content.records) * len as u64
+            ));
+        }
     }
     Ok(())
 }
@@ -1163,6 +1641,7 @@ fn asks_and_demotions_lapse_by_the_monotonic_clock() -> Outcome {
     use super::groups::{ASK_LIFETIME_MS, DEMOTION_MS};
     let sharing = super::Sharing::new(Deadlines::RELAY);
     let cell = area()?;
+    sharing.take_areas_for_test(vec![cell]);
     let assignment = tally_wire::StripeAssignment {
         cell,
         product: Streams::RAW,
@@ -1225,6 +1704,7 @@ fn asks_and_demotions_lapse_by_the_monotonic_clock() -> Outcome {
 fn the_seam_admits_relays_that_ask_and_ignores_clients() -> Outcome {
     let sharing = super::Sharing::new(Deadlines::RELAY);
     let cell = area()?;
+    sharing.take_areas_for_test(vec![cell]);
     let assignment = tally_wire::StripeAssignment {
         cell,
         product: Streams::RAW,
@@ -1254,6 +1734,66 @@ fn the_seam_admits_relays_that_ask_and_ignores_clients() -> Outcome {
     sharing.originate(&Record::Heartbeat, cell, Streams::RAW, 1_000);
     if !sharing.take_outbox().is_empty() {
         return Err("an outbox before serving".into());
+    }
+    Ok(())
+}
+
+/// An ask books its asker only in a group this relay holds (an area it takes, a product it
+/// shares), charged to the store while it is held, and not past the store's room: a relay naming
+/// cells this relay does not take, or asking past the room, holds nothing here. Before, every
+/// cell named was booked, uncharged.
+#[test]
+fn an_ask_is_booked_only_for_a_group_held_and_charged() -> Outcome {
+    use super::groups::{ASK_BYTES, ASK_LIFETIME_MS};
+    let sharing = super::Sharing::new(Deadlines::RELAY);
+    let cell = area()?;
+    let elsewhere = children(cell.ancestor(2).ok_or("no parent")?)
+        .into_iter()
+        .find(|other| *other != cell)
+        .ok_or("one child")?;
+    sharing.take_areas_for_test(vec![cell]);
+    let gauge = Gauge::new(Store::Batches, 1 << 20);
+    sharing.charge_to(Arc::clone(&gauge));
+    let ask = |cell: Region, product: Streams| tally_wire::StripeAssignment {
+        cell,
+        product,
+        stripes_of: STRIPES,
+        stripes: 1,
+    };
+    let asker = |index: usize| Asker {
+        role: AskerRole::Relay,
+        key: identity(index).public(),
+        source: index as u64,
+        loopback: false,
+        address: None,
+    };
+    sharing.assigned(&asker(1), ask(elsewhere, Streams::RAW), START_MS);
+    sharing.assigned(&asker(1), ask(cell, Streams(0x8000)), START_MS);
+    if !sharing.groups.keys().is_empty() || sharing.groups.asks().0 != 0 {
+        return Err("an ask for a group not held was booked".into());
+    }
+    let before = gauge.held();
+    sharing.assigned(&asker(1), ask(cell, Streams::RAW), START_MS);
+    sharing.assigned(&asker(1), ask(cell, Streams::RAW), START_MS + 1);
+    if sharing.groups.members(cell, Streams::RAW) != vec![asker(1).key]
+        || gauge.held() - before != ASK_BYTES
+    {
+        return Err(format!(
+            "one ask held charged {}, not {ASK_BYTES}",
+            gauge.held() - before
+        ));
+    }
+    // Past the store's room, no more asks are held.
+    let full = Gauge::new(Store::Batches, ASK_BYTES * 3 / 2);
+    sharing.charge_to(Arc::clone(&full));
+    sharing.assigned(&asker(2), ask(cell, Streams::RAW), START_MS);
+    if sharing.groups.members(cell, Streams::RAW).len() != 1 || sharing.groups.asks().1 != 1 {
+        return Err("an ask past the store's room was held".into());
+    }
+    // Lapsed, its charge is let go.
+    let _ = sharing.groups.expire(START_MS + ASK_LIFETIME_MS + 10);
+    if full.held() != 0 || !sharing.groups.keys().is_empty() {
+        return Err(format!("{} bytes held by lapsed asks", full.held()));
     }
     Ok(())
 }
@@ -2059,7 +2599,7 @@ fn a_rebuilt_record_keeps_the_credit_of_its_earlier_sender() -> Outcome {
     for (hash, bytes) in &pieces {
         if data_stripe(hash) == lost {
             // Delivered while there was no room: credited, not held.
-            member.credit(earlier, group, *hash, START_MS);
+            member.credit(earlier, group, (*hash, 100), START_MS);
         } else {
             let message = Message::Piece {
                 group,
@@ -2287,6 +2827,15 @@ fn a_relay_that_only_asked_is_in_no_tree() -> Outcome {
     let offered = identity(1);
     hold_offer(&hub, &offered, cell, 0b1111, START_MS)?;
     let asker = relay(identity(2).public());
+    // An ask is held only in the store's room: this hub plans none for sharing.
+    sharing.charge_to(Gauge::unlimited(Store::Batches));
+    // An ask is booked only for an area the relay takes, as its tick reads the selection.
+    let _ = sharing.tick_shed(
+        &hub,
+        Some(&crate::signer::synced(crate::signer::twin(&identity(0)))),
+        0,
+        START_MS,
+    );
     sharing.assigned(
         &asker,
         tally_wire::StripeAssignment {
@@ -2318,6 +2867,48 @@ fn a_relay_that_only_asked_is_in_no_tree() -> Outcome {
     Ok(())
 }
 
+/// Withdrawal paces itself on `M`: the judging clock stepping back an hour between two
+/// withdrawals neither holds the second back for that hour nor lets it come before its pace.
+#[test]
+fn a_judging_clock_step_back_does_not_hold_the_next_withdrawal_for_an_hour() -> Outcome {
+    use super::withdrawal::{WITHDRAW_EVERY_MS, Withdrawal, order};
+    let me = identity(0).public();
+    let regions: Vec<Region> = children(area()?.ancestor(2).ok_or("no parent")?);
+    let ordered = order(&regions, &me);
+    let at = |judged: u64, mono: u64| {
+        super::Now::from(crate::ingest::Stamp::recorded(
+            mono, 0, judged, judged, true,
+        ))
+    };
+    let hour = 3_600_000;
+    let mut withdrawal = Withdrawal::default();
+    withdrawal.observe(1, &regions, &me, at(START_MS + hour, 1_000));
+    withdrawal.observe(2, &regions, &me, at(START_MS + hour, 1_100));
+    if withdrawal.withdrawn() != &ordered[..1] {
+        return Err(format!("withdrew {:?}", withdrawal.withdrawn()));
+    }
+    // `J` steps back an hour; just short of the pace on `M`, nothing more.
+    withdrawal.observe(
+        3,
+        &regions,
+        &me,
+        at(START_MS, 1_100 + WITHDRAW_EVERY_MS - 1),
+    );
+    if withdrawal.withdrawn().len() != 1 {
+        return Err("withdrew again before its pace on M".into());
+    }
+    withdrawal.observe(
+        4,
+        &regions,
+        &me,
+        at(START_MS + 1, 1_100 + WITHDRAW_EVERY_MS),
+    );
+    if withdrawal.withdrawn() != &ordered[..2] {
+        return Err("the step back of J held the next withdrawal".into());
+    }
+    Ok(())
+}
+
 #[test]
 fn a_full_cap_withdraws_regions_one_at_a_time_in_a_fixed_order_and_takes_them_back() -> Outcome {
     use super::withdrawal::{RESTORE_AFTER_MS, WITHDRAW_EVERY_MS, Withdrawal, order};
@@ -2332,24 +2923,24 @@ fn a_full_cap_withdraws_regions_one_at_a_time_in_a_fixed_order_and_takes_them_ba
     }
     let mut withdrawal = Withdrawal::default();
     let mut now = START_MS;
-    withdrawal.observe(5, &regions, &me, now);
+    withdrawal.observe(5, &regions, &me, super::Now::from(now));
     if !withdrawal.withdrawn().is_empty() {
         return Err("withdrew with nothing newly shed".into());
     }
     now += 100;
-    withdrawal.observe(6, &regions, &me, now);
+    withdrawal.observe(6, &regions, &me, super::Now::from(now));
     now += 100;
-    withdrawal.observe(7, &regions, &me, now);
+    withdrawal.observe(7, &regions, &me, super::Now::from(now));
     if withdrawal.withdrawn() != &ordered[..1] {
         return Err(format!("withdrew {:?}", withdrawal.withdrawn()));
     }
     now += WITHDRAW_EVERY_MS;
-    withdrawal.observe(8, &regions, &me, now);
+    withdrawal.observe(8, &regions, &me, super::Now::from(now));
     if withdrawal.withdrawn() != &ordered[..2] || !withdrawal.covers(ordered[1]) {
         return Err("the second region is not the order's next".into());
     }
     now += RESTORE_AFTER_MS;
-    withdrawal.observe(8, &regions, &me, now);
+    withdrawal.observe(8, &regions, &me, super::Now::from(now));
     if withdrawal.withdrawn() != &ordered[..1] {
         return Err("the last withdrawn was not taken back first".into());
     }
@@ -2445,7 +3036,10 @@ fn a_member_holds_records_for_its_repair_horizon_shared_and_its_gauge_is_what_it
     // Charged what holding it allocates (`footprint`): its place in the group's tree of records,
     // the shared batch and its bytes, counted afresh the same.
     let first = member.held_bytes();
-    if first != member.counted_bytes() || gauge.held() != first || first <= piece.held_len() {
+    if first != member.counted_bytes()
+        || gauge.held() != member.charged_bytes()
+        || first <= piece.held_len()
+    {
         return Err(format!(
             "{first} bytes held of {len}, {} counted, the gauge charged {}",
             member.counted_bytes(),
@@ -2477,7 +3071,8 @@ fn a_member_holds_records_for_its_repair_horizon_shared_and_its_gauge_is_what_it
         ));
     }
     if taken < 2
-        || gauge.held() != member.counted_bytes()
+        || gauge.held() != member.charged_bytes()
+        || member.held_bytes() != member.counted_bytes()
         || member.group_bytes() != member.counted_bytes()
     {
         return Err(format!(
@@ -2489,7 +3084,10 @@ fn a_member_holds_records_for_its_repair_horizon_shared_and_its_gauge_is_what_it
     // A tick a second on signs the manifest and builds the parity of what it originated: the
     // parity is held only if the gauge takes it, and the gauge is still what the groups hold.
     let _ = member.tick(START_MS + 1_000 + super::member::MANIFEST_DELAY_MS);
-    if gauge.held() != member.counted_bytes() || gauge.held() > limit {
+    if gauge.held() != member.charged_bytes()
+        || member.held_bytes() != member.counted_bytes()
+        || gauge.held() > limit
+    {
         return Err(format!(
             "{} charged with the parity, {} counted",
             gauge.held(),
@@ -2502,7 +3100,15 @@ fn a_member_holds_records_for_its_repair_horizon_shared_and_its_gauge_is_what_it
         return Err("let go within the horizon".into());
     }
     let _ = member.tick(START_MS + horizon_seconds * 1000 + 1_001);
-    if member.holds(group, &hash) || member.held_bytes() != 0 || gauge.held() != 0 {
+    if member.holds(group, &hash) {
+        return Err("held past the horizon".into());
+    }
+    // What its books remember of the trees' change (`Group::steady`) is let go two horizons on.
+    let _ = member.tick(START_MS + 2 * horizon_seconds * 1000 + 1_001);
+    if member.held_bytes() != 0
+        || member.reckoning_bytes().0 != 0
+        || gauge.held() != member.charged_bytes()
+    {
         return Err(format!(
             "held past the horizon: {} bytes, {} charged",
             member.held_bytes(),
@@ -2567,7 +3173,9 @@ fn a_step_of_the_judging_clock_leaves_a_full_store_no_fuller() -> Outcome {
         return Err(format!("{unseeded} unseeded with no bound"));
     }
     let (_, piece) = record(&identity(10_000), 0, START_MS)?;
-    let limit = in_step + 2 * piece.len();
+    // The room the groups held in step, and the ledgers' floor of such a store beside it (no
+    // ledger entry is made here: the member originates every record).
+    let limit = in_step + 2 * piece.len() + super::member::reckoning_floor(2 * in_step);
     for step_ms in [-60_000, 60_000] {
         let (most, unseeded) = originate_through_a_step(step_ms, 120, limit)?;
         if unseeded != 0 || most > limit {
@@ -3070,6 +3678,9 @@ fn a_repair_page_waits_charged_in_the_outbox_addressed_to_the_asker() -> Outcome
     // What the member sent the group so far is taken, as the links would.
     drop(sharing.take_outbox());
     let before = gauge.held();
+    let member_before = sharing
+        .member_for_test(|member| member.charged_bytes())
+        .ok_or("no member")?;
     let have = tally_wire::HaveSummary {
         cell,
         product: Streams::RAW,
@@ -3100,6 +3711,12 @@ fn a_repair_page_waits_charged_in_the_outbox_addressed_to_the_asker() -> Outcome
         }
     }
     let charged: usize = page.iter().map(|sent| sent.charge.bytes()).sum();
+    // Answering notes when the asker was answered, in the group's books, charged with them.
+    let booked = sharing
+        .member_for_test(|member| member.charged_bytes())
+        .ok_or("no member")?
+        - member_before;
+    let before = before + booked;
     if gauge.held() != before + charged {
         return Err(format!(
             "the store holds {} with the page waiting, {before} before and {charged} for it",
@@ -3251,7 +3868,8 @@ fn a_members_charge_is_what_its_groups_allocate_as_they_churn() -> Outcome {
     let receiver = identity(10_000);
     let same = |member: &Member, step: &str| -> Outcome {
         if member.held_bytes() != member.counted_bytes()
-            || gauge.held() != member.held_bytes()
+            || gauge.held() != member.charged_bytes()
+            || member.reckoning_bytes().0 != member.counted_reckoning_bytes()
             || member.group_bytes() != member.held_bytes()
         {
             return Err(format!(
@@ -3293,7 +3911,7 @@ fn a_members_charge_is_what_its_groups_allocate_as_they_churn() -> Outcome {
                 // Credited for want of room by many members, then some of them received.
                 _ => {
                     for from in &members[1..12] {
-                        member.credit(*from, group, hash, now);
+                        member.credit(*from, group, (hash, 100), now);
                     }
                     if sequence % 8 == 3 {
                         let _ = member.receive(
@@ -3340,7 +3958,7 @@ fn a_record_refused_for_room_is_credited_to_its_sender() -> Outcome {
     let receiver = identity(10_000);
     // One record credited first, so the credits' tree has a place for the next.
     let (first, _) = record(&receiver, 1, START_MS)?;
-    member.credit(members[2], group, first, START_MS);
+    member.credit(members[2], group, (first, 100), START_MS);
     let (hash, piece) = record(&receiver, 2, START_MS)?;
     // Room for less than the record itself.
     let fill = gauge.limit() - gauge.held() - piece.held_len();
@@ -3383,7 +4001,7 @@ fn a_parity_refused_for_room_is_credited_to_its_sender() -> Outcome {
     let parity = Parity::build(signed.hash(), group.cell, group.product, second, &views);
     let id = parity.id();
     // One record credited first, so the credits' tree has a place for the next.
-    member.credit(members[3], group, hashes[0], START_MS);
+    member.credit(members[3], group, (hashes[0], 100), START_MS);
     // Room for less than the parity's own bytes.
     let fill = gauge.limit() - gauge.held() - parity.xor.len();
     let filled = gauge.try_charge(fill).ok_or("no room to fill")?;
@@ -3420,7 +4038,7 @@ fn a_groups_plan_covers_its_records_held_or_credited_by_their_planned_senders() 
             let (hash, piece) = record(&receiver, sequence, START_MS)?;
             for from in &members[1..] {
                 if credited {
-                    member.credit(*from, group, hash, START_MS);
+                    member.credit(*from, group, (hash, 100), START_MS);
                 } else {
                     let _ = member.receive(
                         *from,
@@ -3454,6 +4072,71 @@ fn mixed(state: &mut u64, below: u64) -> u64 {
         .wrapping_mul(6_364_136_223_846_793_005)
         .wrapping_add(1_442_695_040_888_963_407);
     (*state >> 33) % below.max(1)
+}
+
+/// A send for a member no address is held for, while the clock does not judge, is queued again
+/// for at most the group's horizon on `M` from when it first was (`Deadlines::horizon_ms`), counted
+/// once however often it is, and let go past it, counted. Before, it was queued again for as long
+/// as the clock did not judge, and counted at every carry.
+#[test]
+fn a_send_with_no_address_waits_a_horizon_at_most() -> Outcome {
+    use tally_wire::StripeAssignment;
+    let to = identity(1).public();
+    let gauge = Gauge::unlimited(Store::Batches);
+    let sharing = super::Sharing::new(Deadlines::RELAY);
+    sharing.charge_to(Arc::clone(&gauge));
+    let record = Record::StripeAssignment(StripeAssignment {
+        cell: area()?,
+        product: Streams::RAW,
+        stripes_of: 4,
+        stripes: 0b1010,
+    });
+    // Unsynced: the judging clock an hour ahead of `M`, not judging.
+    let unjudged = |mono_ms: u64| {
+        super::Now::from(crate::ingest::Stamp::recorded(
+            mono_ms,
+            0,
+            mono_ms + 3_600_000,
+            mono_ms,
+            false,
+        ))
+    };
+    if !sharing.address(to, record) {
+        return Err("not queued".into());
+    }
+    let horizon = Deadlines::RELAY.horizon_ms();
+    // Carried every tick up to the horizon: waiting still, counted once.
+    let mut at = START_MS;
+    while at < START_MS + horizon {
+        let sent = sharing.take_outbox();
+        if sent.len() != 1 {
+            return Err(format!("{} sends waiting at {at}", sent.len()));
+        }
+        sharing.unaddressed(sent, unjudged(at));
+        at += TICK_MS;
+    }
+    if sharing.unaddressed_counts() != (1, 0) {
+        return Err(format!(
+            "(queued again, let go) {:?} within the horizon",
+            sharing.unaddressed_counts()
+        ));
+    }
+    // Past it: let go, counted, and its charge given back.
+    let sent = sharing.take_outbox();
+    sharing.unaddressed(sent, unjudged(START_MS + horizon));
+    if !sharing.take_outbox().is_empty() {
+        return Err("a send waited past the horizon".into());
+    }
+    if sharing.unaddressed_counts() != (1, 1) {
+        return Err(format!(
+            "(queued again, let go) {:?} past the horizon",
+            sharing.unaddressed_counts()
+        ));
+    }
+    if gauge.held() != 0 {
+        return Err(format!("{} bytes held after it went", gauge.held()));
+    }
+    Ok(())
 }
 
 /// RFC-0181 "Memory is charged once": the outbox is charged what it allocates, each send's

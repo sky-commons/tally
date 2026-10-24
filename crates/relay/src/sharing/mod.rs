@@ -205,6 +205,12 @@ pub struct Sharing {
     /// counted (`outbox_refused`), never one already queued dropped.
     outbox: Mutex<Outbox>,
     outbox_refused: AtomicU64,
+    /// Sends drained for a member with no address held: queued again while the clock does not
+    /// judge (the member's offer may be live), each counted once however often it is queued again;
+    /// let go once it judges, or once a send has waited a horizon on `M`, each counted
+    /// ([`Sharing::unaddressed`]).
+    requeued: AtomicU64,
+    unaddressed: AtomicU64,
     /// Parity chunks by sender, then manifest, until the parity is whole, each allocation charged
     /// to the room before it is made ([`Assembly`]); what one sender holds is read from its own
     /// charges and held to its part of the room ([`Sender`]).
@@ -262,6 +268,10 @@ pub struct Addressed {
     pub to: PublicKey,
     pub record: Record,
     pub charge: Charge,
+    /// Once it was first queued again for want of its member's address (`Sharing::unaddressed`),
+    /// when it is let go, by `M`: a horizon after, past which its member keeps nothing of what it
+    /// carries. None while it was never queued again.
+    pub unaddressed_until: Option<MonoDeadline>,
 }
 
 /// What a parity of `len` bytes costs the outbox at most while its chunks wait there
@@ -310,7 +320,12 @@ impl Outbox {
             self.settle();
             return false;
         };
-        self.queued.push_back(Addressed { to, record, charge });
+        self.queued.push_back(Addressed {
+            to,
+            record,
+            charge,
+            unaddressed_until: None,
+        });
         self.settle();
         true
     }
@@ -325,6 +340,24 @@ impl Outbox {
                 refused += 1;
             }
         }
+        refused
+    }
+
+    /// Sends taken and not carried, queued again with the charges they hold, each slot charged as
+    /// a push's is: the number refused for want of a slot.
+    fn requeue(&mut self, gauge: &Arc<Gauge>, sent: Vec<Addressed>) -> u64 {
+        let mut refused = 0;
+        for addressed in sent {
+            if self.queued.is_empty() && self.slots.bytes() == 0 {
+                self.slots = gauge.empty();
+            }
+            if self.slots.try_grow(self.queued.growth()) {
+                self.queued.push_back(addressed);
+            } else {
+                refused += 1;
+            }
+        }
+        self.settle();
         refused
     }
 
@@ -629,6 +662,8 @@ impl Sharing {
             member: Mutex::default(),
             outbox: Mutex::default(),
             outbox_refused: AtomicU64::new(0),
+            requeued: AtomicU64::new(0),
+            unaddressed: AtomicU64::new(0),
             assembling: Mutex::default(),
             room: Mutex::new(Gauge::unlimited(Store::Batches)),
             indexed_through: Mutex::default(),
@@ -641,15 +676,25 @@ impl Sharing {
     }
 
     /// A member asking this relay for stripes: it is a member of the group for a while, as its
-    /// offer would make it.
+    /// offer would make it. Only for a group this relay holds (an area it takes, one of the
+    /// products it shares), and only while the store has room for the ask (`Groups::admit`):
+    /// before, any cell an asker named was booked, uncharged.
     pub fn assigned(&self, asker: &Asker, assignment: StripeAssignment, now: impl Into<Now>) {
-        if asker.role != AskerRole::Relay {
+        if asker.role != AskerRole::Relay
+            || assignment.cell.resolution() != AREA_RESOLUTION
+            || !SHARED_PRODUCTS.contains(&assignment.product)
+            || !self.takes_area(assignment.cell)
+        {
             return;
         }
         let now = now.into();
         let group = GroupKey::new(assignment.cell, assignment.product);
-        self.groups
-            .admit(group, asker.key, now.after(ASK_LIFETIME_MS), false);
+        if !self
+            .groups
+            .admit(group, asker.key, now.after(ASK_LIFETIME_MS), false)
+        {
+            return;
+        }
         self.drive(asker, Message::Assign(assignment), now)
     }
 
@@ -748,13 +793,24 @@ impl Sharing {
         self.with_member(|member| member.refuse(rebuilt.group, rebuilt.hash, now));
     }
 
-    /// A group record a member sent that this relay refused (`Member::refuse`).
-    pub fn refused(&self, record: &Record, cell: Region, product: Streams, now: impl Into<Now>) {
+    /// A group record member `from` sent that this relay refused: counted refused, `from` noted
+    /// as its deliverer, and pushed on down its stripe unheld (`Member::refused`), so neither
+    /// `from` nor this relay is reported short for an origin's malformed record.
+    pub fn refused(
+        &self,
+        from: PublicKey,
+        record: &Record,
+        cell: Region,
+        product: Streams,
+        now: impl Into<Now>,
+    ) {
         let now = now.into();
-        let Some(hash) = member::record_hash(record) else {
+        let Some((hash, piece)) = encoded(record) else {
             return;
         };
-        self.with_member(|member| member.refuse(GroupKey::new(cell, product), hash, now));
+        let group = GroupKey::new(cell, product);
+        let out = self.with_member(|member| member.refused(from, group, (hash, piece), now));
+        self.queue(out.unwrap_or_default());
     }
 
     /// A record of `cell`'s `product` group that member `from` delivered and this relay had no
@@ -769,10 +825,12 @@ impl Sharing {
         now: impl Into<Now>,
     ) {
         let now = now.into();
-        let Some(hash) = member::record_hash(record) else {
+        let Some((hash, piece)) = encoded(record) else {
             return;
         };
-        self.with_member(|member| member.credit(from, GroupKey::new(cell, product), hash, now));
+        self.with_member(|member| {
+            member.credit(from, GroupKey::new(cell, product), (hash, piece.len()), now);
+        });
     }
 
     /// A chunk of a parity a member sent: held until the parity is whole, then taken in as the
@@ -847,12 +905,13 @@ impl Sharing {
         self.drive(asker, Message::Parity(Arc::new(parity)), now)
     }
 
-    /// This relay turned `key`'s member link away as full at `now_ms`, asking it to stay away
+    /// This relay turned `key`'s member link away as full at `now` (its wait kept on `M`), asking it to stay away
     /// `asked` (`link`, every `Goodbye` of reason `Full` it sends a relay): that relay routes its
     /// slice past this one for the wait the one rule gives (`full::Wait`), so no shortfall is filed
     /// against it for those windows (`Member::turned_away`).
-    pub fn turned_away(&self, key: PublicKey, asked: std::time::Duration, now_ms: u64) {
-        self.with_member(|member| member.turned_away(key, asked, now_ms));
+    pub fn turned_away(&self, key: PublicKey, asked: std::time::Duration, now: impl Into<Now>) {
+        let now = now.into();
+        self.with_member(|member| member.turned_away(key, asked, now));
     }
 
     /// What the member has done since start (records rebuilt, repairs, receipts and shortfalls),
@@ -871,6 +930,7 @@ impl Sharing {
     /// and counted (`member::Stats::refused`, and the gauge's own count).
     pub fn charge_to(&self, gauge: Arc<Gauge>) {
         *lock(&self.gauge) = Arc::clone(&gauge);
+        self.groups.charge_to(&gauge);
         if let Some(member) = lock(&self.member).as_mut() {
             member.charge_to(gauge);
         }
@@ -910,6 +970,48 @@ impl Sharing {
     /// holds until it is written ([`Addressed`]).
     pub fn take_outbox(&self) -> Vec<Addressed> {
         lock(&self.outbox).take()
+    }
+
+    /// Sends taken from the outbox for a member no address is held for (`network::Network::carry`):
+    /// while the clock does not judge (`now` not judging), queued again with the charges they
+    /// hold, to be carried once its offer can be read, each for at most the group's horizon on `M`
+    /// from when it was first queued again (`Deadlines::horizon_ms`: past it, its member keeps
+    /// nothing of what it carries); once the clock judges, or past that, let go. Each counted once
+    /// as queued again however often it is, and once let go; one the outbox's slots have no room
+    /// for is refused as any send is.
+    pub fn unaddressed(&self, sent: Vec<Addressed>, now: Now) {
+        let mut waiting = Vec::with_capacity(sent.len());
+        let (mut first, mut let_go) = (0, 0);
+        for mut addressed in sent {
+            match addressed.unaddressed_until {
+                _ if now.judging() => let_go += 1,
+                Some(until) if until.passed(now) => let_go += 1,
+                Some(_) => waiting.push(addressed),
+                None => {
+                    addressed.unaddressed_until = Some(now.after(self.deadlines.horizon_ms()));
+                    first += 1;
+                    waiting.push(addressed);
+                }
+            }
+        }
+        self.unaddressed.fetch_add(let_go, Ordering::Relaxed);
+        self.requeued.fetch_add(first, Ordering::Relaxed);
+        if waiting.is_empty() {
+            return;
+        }
+        let gauge = Arc::clone(&lock(&self.gauge));
+        let refused = lock(&self.outbox).requeue(&gauge, waiting);
+        self.outbox_refused.fetch_add(refused, Ordering::Relaxed);
+    }
+
+    /// The sends queued again for want of an address while the clock did not judge (each once),
+    /// and those let go for it (the clock judging, or a horizon waited), since start
+    /// ([`Sharing::unaddressed`]).
+    pub fn unaddressed_counts(&self) -> (u64, u64) {
+        (
+            self.requeued.load(Ordering::Relaxed),
+            self.unaddressed.load(Ordering::Relaxed),
+        )
     }
 
     /// The cells this relay may offer as bundles now (§2.6).
@@ -1021,7 +1123,7 @@ impl Sharing {
         let taken = network.selection.taken_index();
         let withdrawal = {
             let mut withdrawal = lock(&self.withdrawal);
-            withdrawal.observe(shed, taken.regions(), &me, now_ms);
+            withdrawal.observe(shed, taken.regions(), &me, now);
             withdrawal.clone()
         };
         let (taken_moved, withdrawn_moved) = {
@@ -1049,7 +1151,12 @@ impl Sharing {
         member.set_full(network.peers.full(now));
         // The areas whose trees may have changed.
         let directory = &network.directory;
-        let changed = directory.take_changed_cells(now.judged());
+        // More cells changed than the directory remembers between two looks: every one is taken
+        // as changed, as when what the relay takes moves.
+        let (changed, all_changed) = match directory.take_changed(now.judged()) {
+            crate::directory::Changed::Cells(cells) => (cells, false),
+            crate::directory::Changed::All => (Vec::new(), true),
+        };
         let mut areas: BTreeSet<u64> = std::mem::take(&mut *lock(&self.relayout));
         for key in self.groups.expire(now) {
             areas.insert(key.cell.as_u64());
@@ -1062,10 +1169,10 @@ impl Sharing {
                     .map(Region::as_u64),
             );
         };
-        if taken_moved || withdrawn_moved {
+        if taken_moved || withdrawn_moved || all_changed {
             known(&mut areas, member, None);
         }
-        let cells = if taken_moved {
+        let cells = if taken_moved || all_changed {
             directory.cells_held_by_others(&me)
         } else {
             changed
@@ -1251,6 +1358,12 @@ impl Sharing {
 
     fn with_member<T>(&self, act: impl FnOnce(&mut Member) -> T) -> Option<T> {
         lock(&self.member).as_mut().map(act)
+    }
+
+    /// A test's areas taken, as a tick would read them from the selection (`tick_shed`).
+    #[cfg(test)]
+    pub(crate) fn take_areas_for_test(&self, areas: Vec<Region>) {
+        lock(&self.view).taken = Arc::new(Taken::of(areas));
     }
 
     /// A test's hand on this relay's member (made by a tick, `tick_shed`).

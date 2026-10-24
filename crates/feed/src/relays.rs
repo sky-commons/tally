@@ -98,13 +98,14 @@ impl ClockPolls {
             .collect()
     }
 
-    /// Relays that answered a probe (`probed`, a round's or a clock poll's): each is polled from
-    /// `CLOCK_POLL_FIRST` again if it is unheard later, its interval no longer grown by the polls
-    /// it missed before it answered (as NTP resets a server's poll on a reply).
-    fn answered(&mut self, probed: &[Probed]) {
-        for each in probed {
-            self.polls.remove(&each.measured.relay.key);
-        }
+    /// Relays a probe's answer made live samples of (`heard`, `RelayClocks::heard` once the answer
+    /// is handled): each is polled from `CLOCK_POLL_FIRST` again if it is unheard later, its
+    /// interval no longer grown by the polls it missed before (as NTP resets a server's poll on a
+    /// reply it can use). An answer that made no live sample (no clock, or one too uncertain to
+    /// use: a seed whose ClockBound is down) resets nothing, so its poll keeps doubling; before,
+    /// any answer reset it, and such a seed was probed some 3,600 times an hour by every feeder.
+    fn answered(&mut self, heard: &[PublicKey]) {
+        self.polls.retain(|key, _| !heard.contains(key));
     }
 
     /// When the next poll is due, if any relay is polled.
@@ -1617,14 +1618,15 @@ pub async fn run(publishing: Publishing) {
                 };
             }
             Some(event) = inbox.recv() => {
-                if let Event::Probed(answered) | Event::ClockPolled(answered) = &event {
-                    polls.answered(answered);
-                }
+                let answered = matches!(event, Event::Probed(_) | Event::ClockPolled(_));
                 let probed = matches!(event, Event::Probed(_));
                 if matches!(event, Event::ClockPolled(_)) {
                     clock_polling = false;
                 }
                 publisher.handle(event);
+                if answered {
+                    polls.answered(&publisher.clocks.heard());
+                }
                 if probed {
                     probing = false;
                     next_round = if publisher.sessions.is_empty() {
@@ -1667,12 +1669,13 @@ impl Publisher {
             .directory
             .probe_set(&self.last_band, &self.clocks.heard());
         let identity = self.identity.clone();
+        let clocks = Arc::clone(&self.clocks);
         let events = self.events.clone();
         let prober = self.prober;
         self.tasks.spawn(async move {
             let mut probes = JoinSet::new();
             for relay in candidates {
-                probes.spawn(prober(relay, identity.clone()));
+                probes.spawn(prober(relay, identity.clone(), Arc::clone(&clocks)));
             }
             let mut probed = Vec::new();
             while let Some(done) = probes.join_next().await {
@@ -1689,12 +1692,13 @@ impl Publisher {
     /// what so few answered.
     fn clock_poll(&mut self, due: Vec<RelayAddress>) {
         let identity = self.identity.clone();
+        let clocks = Arc::clone(&self.clocks);
         let events = self.events.clone();
         let prober = self.prober;
         self.tasks.spawn(async move {
             let mut probes = JoinSet::new();
             for relay in due {
-                probes.spawn(prober(relay, identity.clone()));
+                probes.spawn(prober(relay, identity.clone(), Arc::clone(&clocks)));
             }
             let mut probed = Vec::new();
             while let Some(done) = probes.join_next().await {
@@ -1712,12 +1716,11 @@ impl Publisher {
         for each in probed {
             self.directory.learn(each.measured.relay.key, &each.hints);
             if let Some(clock) = &each.clock {
-                let asked = self.clocks.anchored_before(clock.asked.elapsed());
                 self.clocks.probed(
                     each.measured.relay.key,
-                    (asked, clock.took_ms, clock.sent_ms),
+                    (clock.asked_ms, clock.took_ms, clock.sent_ms),
                     clock.error_ms,
-                    clock.heard.elapsed(),
+                    clock.heard_ms,
                 );
             }
         }
@@ -2204,8 +2207,9 @@ async fn session(
         up_for: None,
     };
     // The relay states its clock in its greeting, once the handshake is done: how long that took
-    // from the Hello is the uncertainty of the statement (`Telling::stated`).
-    let hello = tokio::time::Instant::now();
+    // from the Hello is the uncertainty of the statement (`Telling::stated`), stamped on the
+    // anchored clock (the raw monotonic one), never `Instant`, which a daemon slews.
+    let hello = context.clocks.stamp_ms();
     let session = match noise::connect(stream, identity, &relay.key, Role::Feeder).await {
         Ok(session) => session,
         Err(tally_wire::WireError::Refused {
@@ -2287,8 +2291,9 @@ pub(crate) struct Pace {
     /// signs by when the relay is configured, and what the health reports this feeder's clock
     /// against. Never what decides a send, and never what decides the relay's fate.
     clock: Option<Telling>,
-    /// When the session sent its Hello, which a statement's uncertainty runs from.
-    hello: tokio::time::Instant,
+    /// When the session sent its Hello, which a statement's uncertainty runs from: the anchored
+    /// clock (`RelayClocks::stamp_ms`).
+    hello: u64,
     /// The relay restated its clock (`Telling::stated`): the session asks it for an echo at once,
     /// which measures it by its own round trip.
     asking: bool,
@@ -2310,14 +2315,14 @@ impl Pace {
             told: None,
             wanted,
             clock: None,
-            hello: tokio::time::Instant::now(),
+            hello: 0,
             asking: false,
         }
     }
 
     /// The same pace, its relay's clock measured into `clock`, the session's Hello sent at
     /// `hello`.
-    fn telling(self, clock: Telling, hello: tokio::time::Instant) -> Self {
+    fn telling(self, clock: Telling, hello: u64) -> Self {
         Self {
             clock: Some(clock),
             hello,
@@ -2346,7 +2351,7 @@ impl Pace {
     /// the session asks for an echo at once (`asking`).
     fn clock(&mut self, clock_ms: Option<u64>, error_ms: Option<u64>) {
         if let Some(telling) = &self.clock
-            && telling.stated(clock_ms, error_ms, self.hello.elapsed())
+            && telling.stated(clock_ms, error_ms, self.hello)
         {
             self.asking = true;
         }
@@ -2542,7 +2547,7 @@ fn ask_offers(context: &Context) -> Option<Record> {
 async fn publish<S: tokio::io::AsyncWrite>(
     context: &Context,
     version: u16,
-    hello: tokio::time::Instant,
+    hello: u64,
     writer: &mut noise::Writer<S>,
     records: &mut Inbound,
     mut batches: broadcast::Receiver<Arc<Record>>,
@@ -3483,10 +3488,13 @@ mod tests {
 
     /// A relay's stated clock (`RateLimit`'s `clock_ms` and `error_ms`) is its session's source
     /// for the batcher's clocks (`source::RelayClocks`), uncertain by the time since the
-    /// session's Hello; a relay that states none is no source. Before, the statement was an
-    /// offset with no uncertainty and no error.
-    #[test]
-    fn a_sessions_relay_clock_is_told_to_the_batcher() {
+    /// session's Hello on the anchored (raw monotonic) clock; a relay that states none is no
+    /// source. The test's scripted slew: 300 ms pass on the raw clock while the slewed one
+    /// (`Instant`, tokio's paused clock here) runs 2 s, and the statement is uncertain by the raw
+    /// clock's 300 ms. Before, the Hello was an `Instant`, so a daemon's slew moved the
+    /// uncertainty; and before that, the statement was an offset with no uncertainty and no error.
+    #[tokio::test(start_paused = true)]
+    async fn a_sessions_relay_clock_is_told_to_the_batcher() {
         let wall = Arc::new(std::sync::atomic::AtomicU64::new(1_000_000));
         let monotonic = Arc::new(std::sync::atomic::AtomicU64::new(0));
         // A relay the owner configured (`--relay`): a configured clock source.
@@ -3495,16 +3503,16 @@ mod tests {
             RelayClocks::on(crate::source::HostClock::set_by(&wall, &monotonic))
                 .configured([relay]),
         );
-        let hello = tokio::time::Instant::now();
+        let hello = clocks.stamp_ms();
         let mut pace = Pace::new(64_000, Arc::new(WantedCeilings::default()).session())
             .telling(clocks.session(relay), hello);
-        // The relay and this host (unsynced, within `E`) meet: the batches are signed at the low
-        // end of where they do, the relay's statement less the handshake and its error.
+        monotonic.store(300, std::sync::atomic::Ordering::Relaxed);
+        tokio::time::advance(Duration::from_secs(2)).await;
+        // The relay alone is a source (this host, unsynced, is none): the batches are signed at
+        // the low end of its interval, its statement less the handshake and its error.
         pace.clock(Some(1_005_000), Some(100));
-        let handshake = u64::try_from(hello.elapsed().as_millis()).unwrap_or(u64::MAX);
         let signed = clocks.now_ms();
-        assert!(signed < 1_005_000 - 100, "{signed}");
-        assert!(signed + 100 + handshake + 1 >= 1_005_000, "{signed}");
+        assert_eq!(signed, 1_005_000 - 100 - 300);
         drop(pace);
         // Gone with its session: this host alone, unsynced, is held over by the clock last taken.
         assert_eq!(clocks.now_ms(), signed);
@@ -3707,12 +3715,13 @@ mod tests {
         Ok(())
     }
 
-    /// A configured relay's clock poll is reset by any probe answer it gives (a round's or a
-    /// poll's): unheard again later, it is polled from `CLOCK_POLL_FIRST`, not at the interval
-    /// the polls it missed before had grown to. Before, an answer reset nothing, so a seed that
-    /// was down an hour and came back was polled every five minutes from then on.
+    /// A configured relay's clock poll is reset once a probe's answer made it a live sample (a
+    /// round's or a poll's): unheard again later, it is polled from `CLOCK_POLL_FIRST`, not at the
+    /// interval the polls it missed before had grown to. An answer with no live sample keeps it
+    /// doubling. Before, any answer reset it, so a seed answering with no usable clock was polled
+    /// every few seconds for ever.
     #[test]
-    fn any_probe_answer_resets_a_seeds_poll() -> Result<(), String> {
+    fn an_answer_with_no_live_sample_keeps_doubling() -> Result<(), String> {
         let seed = relay("seed.example:10900")?;
         let mut polls = ClockPolls::default();
         let mut at = tokio::time::Instant::now();
@@ -3722,12 +3731,14 @@ mod tests {
             at = polls.next().ok_or("no poll next")?;
         }
         assert_eq!(polls.polls[&seed.key].1, ROUND_EVERY);
-        polls.answered(&[Probed {
-            measured: crate::probe::tests::measured(seed.key, 20, 4, 1),
-            hints: Vec::new(),
-            clock: None,
-        }]);
-        // Unheard again: due at once, and again `CLOCK_POLL_FIRST` after.
+        // It answered, and is still no live sample: its poll is as it was.
+        polls.answered(&[]);
+        assert_eq!(polls.polls[&seed.key].1, ROUND_EVERY);
+        assert_eq!(polls.due(vec![seed.clone()], at).len(), 1);
+        assert_eq!(polls.next(), Some(at + ROUND_EVERY));
+        // Its answer made a live sample: unheard again, it is due at once, and again
+        // `CLOCK_POLL_FIRST` after.
+        polls.answered(&[seed.key]);
         assert_eq!(polls.due(vec![seed.clone()], at).len(), 1);
         assert_eq!(polls.next(), Some(at + CLOCK_POLL_FIRST));
         Ok(())
@@ -3853,7 +3864,7 @@ mod tests {
             publish(
                 &context,
                 version,
-                tokio::time::Instant::now(),
+                context.clocks.stamp_ms(),
                 &mut writer,
                 &mut records,
                 batches,
@@ -3992,9 +4003,9 @@ mod tests {
                 settle: Duration::from_millis(500),
                 grant_every: Duration::from_millis(200),
             },
-            prober: |relay, me| {
+            prober: |relay, me, clocks| {
                 Box::pin(async move {
-                    let mut probed = probe::probe(&relay, &me).await?;
+                    let mut probed = probe::probe(&relay, &me, &clocks).await?;
                     probed.measured.rtt = LOOPBACK;
                     Ok(probed)
                 })
@@ -4136,7 +4147,7 @@ mod tests {
             publish(
                 &context,
                 version,
-                tokio::time::Instant::now(),
+                context.clocks.stamp_ms(),
                 &mut writer,
                 &mut records,
                 batches,
@@ -4249,7 +4260,7 @@ mod tests {
             publish(
                 &context,
                 version,
-                tokio::time::Instant::now(),
+                context.clocks.stamp_ms(),
                 &mut writer,
                 &mut records,
                 batches,
@@ -4418,7 +4429,7 @@ mod tests {
             publish(
                 &context,
                 version,
-                tokio::time::Instant::now(),
+                context.clocks.stamp_ms(),
                 &mut writer,
                 &mut records,
                 batches,
@@ -4479,7 +4490,7 @@ mod tests {
             publish(
                 &context,
                 version,
-                tokio::time::Instant::now(),
+                context.clocks.stamp_ms(),
                 &mut writer,
                 &mut records,
                 batches,
@@ -4558,7 +4569,7 @@ mod tests {
             publish(
                 &context,
                 version,
-                tokio::time::Instant::now(),
+                context.clocks.stamp_ms(),
                 &mut writer,
                 &mut records,
                 batches,
@@ -4629,7 +4640,7 @@ mod tests {
             publish(
                 &context,
                 version,
-                tokio::time::Instant::now(),
+                context.clocks.stamp_ms(),
                 &mut writer,
                 &mut records,
                 batches,
@@ -4722,7 +4733,7 @@ mod tests {
             publish(
                 &context,
                 version,
-                tokio::time::Instant::now(),
+                context.clocks.stamp_ms(),
                 &mut writer,
                 &mut records,
                 batches,
@@ -4765,7 +4776,7 @@ mod tests {
         publish(
             &context,
             version,
-            tokio::time::Instant::now(),
+            context.clocks.stamp_ms(),
             &mut writer,
             &mut records,
             batches,
@@ -4817,7 +4828,7 @@ mod tests {
         let ended = publish(
             &context,
             version,
-            tokio::time::Instant::now(),
+            context.clocks.stamp_ms(),
             &mut writer,
             &mut records,
             batches,
@@ -4905,9 +4916,9 @@ mod tests {
             clocks: Arc::default(),
             checker: DeliveryChecker::default(),
             checking: Checking::default(),
-            prober: |relay, me| {
+            prober: |relay, me, clocks| {
                 Box::pin(async move {
-                    let mut probed = probe::probe(&relay, &me).await?;
+                    let mut probed = probe::probe(&relay, &me, &clocks).await?;
                     probed.measured.rtt = LOOPBACK;
                     Ok(probed)
                 })
@@ -5004,9 +5015,9 @@ mod tests {
             clocks: Arc::default(),
             checker: DeliveryChecker::default(),
             checking: Checking::default(),
-            prober: |relay, me| {
+            prober: |relay, me, clocks| {
                 Box::pin(async move {
-                    let mut probed = probe::probe(&relay, &me).await?;
+                    let mut probed = probe::probe(&relay, &me, &clocks).await?;
                     probed.measured.rtt = LOOPBACK;
                     Ok(probed)
                 })
@@ -5088,7 +5099,7 @@ mod tests {
             clocks: Arc::default(),
             checker: DeliveryChecker::default(),
             checking: Checking::default(),
-            prober: |relay, me| {
+            prober: |relay, me, clocks| {
                 Box::pin(async move {
                     let unanswered = NOT_YET
                         .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
@@ -5096,7 +5107,7 @@ mod tests {
                     if unanswered {
                         return Err("connection refused".to_owned());
                     }
-                    probe::probe(&relay, &me).await
+                    probe::probe(&relay, &me, &clocks).await
                 })
             },
             source_address: None,
@@ -5167,7 +5178,7 @@ mod tests {
             clocks: Arc::clone(&clocks),
             checker: DeliveryChecker::default(),
             checking: Checking::default(),
-            prober: |relay, _| {
+            prober: |relay, _, _| {
                 Box::pin(async move {
                     if let Ok(mut probes) = PROBES.lock() {
                         probes.push((relay.key, tokio::time::Instant::now()));
@@ -5209,6 +5220,81 @@ mod tests {
         let hinted_late = count(hinted.key, 1_800, 3_600);
         assert!(hinted_late <= rounds + 2, "{hinted_late} rounds hastened");
         let all = count(seed.key, 0, 3_600);
+        assert!(all <= 45, "{all} probes of the seed in an hour");
+        Ok(())
+    }
+
+    /// A seed that answers every probe with no usable clock (its ClockBound down: an error it
+    /// cannot bound) is polled as a dead one is, less and less, at most 45 times an hour: its
+    /// answer makes no live sample, so it resets nothing (`ClockPolls::answered`). Before, any
+    /// answer reset its poll, and the default feeder (one seed, no ClockBound of its own) probed
+    /// it 3,641 times an hour.
+    #[tokio::test(start_paused = true)]
+    async fn a_seed_answering_with_no_usable_clock_is_polled_less_and_less() -> Result<(), String> {
+        static PROBES: std::sync::Mutex<Vec<(PublicKey, tokio::time::Instant)>> =
+            std::sync::Mutex::new(Vec::new());
+        let error = |error: tally_wire::WireError| error.to_string();
+        let seed = relay("127.0.0.1:9")?;
+        let feeder = Arc::new(Identity::generate().map_err(error)?);
+        let directory = Directory::new(
+            scratch(),
+            vec![seed.clone()],
+            Vec::new(),
+            feeder.clone(),
+            None,
+            (Clock::Dump1090, Arc::default()),
+        )?;
+        let wall = Arc::new(std::sync::atomic::AtomicU64::new(wall_ms()));
+        let monotonic = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let clocks = Arc::new(
+            RelayClocks::on(crate::source::HostClock::set_by(&wall, &monotonic))
+                .configured([seed.key]),
+        );
+        let (batches, _) = broadcast::channel(64);
+        let started = tokio::time::Instant::now();
+        let publisher = tokio::spawn(run(Publishing {
+            directory,
+            identity: feeder,
+            batches,
+            ceiling: 64_000,
+            wanted: Arc::default(),
+            clocks: Arc::clone(&clocks),
+            checker: DeliveryChecker::default(),
+            checking: Checking::default(),
+            prober: |relay, _, clocks| {
+                Box::pin(async move {
+                    if let Ok(mut probes) = PROBES.lock() {
+                        probes.push((relay.key, tokio::time::Instant::now()));
+                    }
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    let at = clocks.stamp_ms();
+                    Ok(Probed {
+                        measured: crate::probe::tests::measured(relay.key, 20, 4, 1),
+                        hints: Vec::new(),
+                        clock: Some(crate::probe::ProbedClock {
+                            asked_ms: at,
+                            heard_ms: at,
+                            took_ms: wall_ms(),
+                            sent_ms: wall_ms(),
+                            error_ms: Some(u64::MAX),
+                        }),
+                    })
+                })
+            },
+            source_address: None,
+            health: Arc::default(),
+            pacing: Pacing::default(),
+        }));
+        // The batcher reads the clock as it signs, each second: each read with the seed unheard
+        // asks for a probe of it.
+        let hour = Duration::from_secs(3_600);
+        while started.elapsed() < hour {
+            let _ = clocks.now_ms();
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        publisher.abort();
+        let probes = PROBES.lock().map_err(|error| error.to_string())?.clone();
+        let all = probes.iter().filter(|(key, _)| *key == seed.key).count();
         assert!(all <= 45, "{all} probes of the seed in an hour");
         Ok(())
     }

@@ -343,6 +343,8 @@ fn mlat_run_cuts(
         Hub::clocked(8, Arc::new(|| 0), tally_relay::sharing::Deadlines::RELAY)
             .accepting_relays([tally_mlat_solver::sim::anchoring_relay().public()])
             .taking(areas.cells().to_vec())
+            // Its raw planned, as `tally-relay` plans a relay hosting MLAT.
+            .memory(tally_relay::hub::DEFAULT_MEMORY, true)
             .staged(threads)?,
     );
     let host = Arc::new(HostedMlat::new(
@@ -381,8 +383,7 @@ fn mlat_run_cuts(
     let mut offered: Vec<Cut> = cutting.offered.clone();
     offered.sort_by_key(|cut| cut.from_ms);
     let mut offered = std::collections::VecDeque::from(offered);
-    hub.network()
-        .host_mlat(Arc::clone(&host) as Arc<dyn MlatHost>);
+    hub.host_mlat(Arc::clone(&host) as Arc<dyn MlatHost>)?;
     host.set_areas(areas.clone(), Vec::new());
     let now = tally_relay::clock::RelayClock::system().judged().ms();
     let mut carried: std::collections::VecDeque<(u64, Record)> = Default::default();

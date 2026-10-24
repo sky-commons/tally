@@ -454,30 +454,53 @@ impl Subscriber {
 
     /// Offers `item`, its slot's growth paid from `reserved` (what `Router::publish` charged for
     /// it with the item, so no publisher meanwhile takes the room it found), any shortfall
-    /// charged now and any surplus given back.
-    fn offer(&self, item: &Arc<Item>, charge: &Arc<Charge>, bytes: usize, mut reserved: Charge) {
+    /// charged now and any surplus given back; the store full, it falls behind. A test's: the
+    /// publisher offers through `try_offer`, which hands a shortfall back (`Router::deliver`).
+    #[cfg(test)]
+    fn offer(&self, item: &Arc<Item>, charge: &Arc<Charge>, bytes: usize, reserved: Charge) {
+        let _ = self.try_offer(item, charge, bytes, reserved, true);
+    }
+
+    /// As `offer`, but when the store has no room for what its slot must grow by (the queue's
+    /// growth read here, under its lock, where no other publisher can move it) and `fall` is
+    /// false: nothing is queued, and the shortfall is handed back with `reserved`, for the
+    /// publisher to make room for and offer again (`Router::publish`). Before, the growth was
+    /// read outside the lock, and a publisher between that read and the push left an honest
+    /// taker short of its slot, let go while the laggard kept what it held.
+    fn try_offer(
+        &self,
+        item: &Arc<Item>,
+        charge: &Arc<Charge>,
+        bytes: usize,
+        mut reserved: Charge,
+        fall: bool,
+    ) -> Option<(usize, Charge)> {
         let Ok(mut state) = self.queue.lock() else {
-            return;
+            return None;
         };
         if matches!(state.fell, Some(Fell::Behind(_))) {
-            return;
+            return None;
         }
         let in_hand = state.in_hand.bytes;
         let mut fallen = None;
         // Its slot is charged before the queue grows for it: the store full, it falls behind as
         // a queue past its bounds does.
         let growth = state.queue.growth();
+        let short = growth.saturating_sub(reserved.bytes());
+        if short > 0 && !fall && !reserved.try_grow(short) {
+            return Some((short, reserved));
+        }
         let paid = if reserved.bytes() == 0 {
             state.slots.try_grow(growth)
         } else {
-            let short = growth.saturating_sub(reserved.bytes());
-            (short == 0 || reserved.try_grow(short)) && state.slots.absorb(reserved).is_ok()
+            (short == 0 || reserved.bytes() >= growth || reserved.try_grow(short))
+                && state.slots.absorb(reserved).is_ok()
         };
         let pushed = if paid {
             state.queue.push_beside(
                 (Arc::clone(item), Arc::clone(charge)),
                 bytes,
-                item.stamp_ms,
+                item.stamp.ms(),
                 in_hand,
             )
         } else {
@@ -491,6 +514,7 @@ impl Subscriber {
         drop(state);
         drop(fallen);
         self.notify.notify_one();
+        None
     }
 
     /// What its queue's slots and its hand allocate now, and what they are charged: for a test.
@@ -835,11 +859,56 @@ impl Router {
         };
         let charge = reserved.split(charged);
         let (item, charge) = (Arc::new(item), Arc::new(charge));
-        for (at, growth) in takers.into_iter().zip(growths) {
-            let slot = reserved.split(growth);
-            index.entries[at]
-                .subscriber
-                .offer(&item, &charge, bytes, slot);
+        let offering: Vec<(usize, Charge)> = takers
+            .into_iter()
+            .zip(growths)
+            .map(|(at, growth)| (at, reserved.split(growth)))
+            .collect();
+        Self::deliver(&index, &item, &charge, bytes, offering);
+    }
+
+    /// Queues `item` to each taker (`offering`: its index, and the charge read for its slot).
+    fn deliver(
+        index: &Index,
+        item: &Arc<Item>,
+        charge: &Arc<Charge>,
+        bytes: usize,
+        mut offering: Vec<(usize, Charge)>,
+    ) {
+        // A taker whose slot must grow by more than was read for it (another publisher pushed
+        // meanwhile) is handed back its shortfall: room is made for it as for the item, by letting
+        // go whoever holds most, and it is offered again. The last round falls behind as a full
+        // store does.
+        for round in 0..=index.entries.len() {
+            let fall = round == index.entries.len();
+            let mut short = Vec::new();
+            for (at, slot) in offering {
+                if let Some((missing, slot)) = index.entries[at]
+                    .subscriber
+                    .try_offer(item, charge, bytes, slot, fall)
+                {
+                    short.push((at, missing, slot));
+                }
+            }
+            if short.is_empty() {
+                break;
+            }
+            offering = Vec::with_capacity(short.len());
+            for (at, missing, mut slot) in short {
+                while !slot.try_grow(missing) {
+                    let Some((_, laggard)) = index
+                        .entries
+                        .iter()
+                        .filter_map(|entry| Some((entry.subscriber.holding()?, &entry.subscriber)))
+                        .filter(|(held, _)| *held > 0)
+                        .max_by_key(|(held, _)| *held)
+                    else {
+                        break;
+                    };
+                    laggard.let_go();
+                }
+                offering.push((at, slot));
+            }
         }
     }
 
@@ -869,6 +938,21 @@ impl Router {
             subscriber,
             router: Arc::clone(self),
         }
+    }
+
+    /// Whether some client's subscription covers one of `cells` (a subscription of no regions
+    /// covers every cell): what a client may be sent of a record placed there. What the positions
+    /// checks hold a raw solution for (`Hub::hold_twins`).
+    pub fn clients_at(&self, cells: &[Region]) -> bool {
+        let Ok(index) = self.index.read() else {
+            return true;
+        };
+        if !index.clients.everywhere.is_empty() {
+            return true;
+        }
+        let mut holding = Vec::new();
+        index.clients.holding(cells, &mut holding);
+        !holding.is_empty()
     }
 
     /// How many listen now.
@@ -1053,6 +1137,7 @@ impl Drop for Listener {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::disallowed_methods, reason = "a test's scripted readings")]
     use super::*;
     use tally_wire::{Location, Streams};
 
@@ -1079,7 +1164,7 @@ mod tests {
             cell,
             points: None,
             decoded: None,
-            stamp_ms,
+            stamp: tally_wire::clocks::recorded::mono(stamp_ms),
             client: None,
         }
     }
@@ -1270,7 +1355,7 @@ mod tests {
             cell: None,
             points: None,
             decoded: None,
-            stamp_ms: 0,
+            stamp: tally_wire::clocks::recorded::mono(0),
             client: None,
         };
         let plain = item(batch.clone());
@@ -1866,6 +1951,74 @@ mod tests {
             tight.try_recv_many(&mut out, 1),
             Err(Fell::Behind(FellBehind::Bytes))
         );
+        Ok(())
+    }
+
+    /// Two publishers read one subscriber's slot growth as nothing while its queue is one slot
+    /// from full: the first fills it, and the second's slot must grow by more than it reserved,
+    /// the store full but for what a laggard holds. The honest subscriber is made room for (the
+    /// laggard let go) and takes the item; before, the growth was read outside its lock and it
+    /// fell behind on the slot while the laggard kept what it held.
+    #[test]
+    fn a_slot_a_publisher_meanwhile_outgrew_is_made_room_for_not_fallen_behind()
+    -> Result<(), String> {
+        let gauge = Gauge::new(Store::Fanout, 1 << 20);
+        let router = Arc::new(Router::charged(
+            Bounds {
+                max_bytes: 64 << 20,
+                max_age_ms: u64::MAX,
+            },
+            Arc::clone(&gauge),
+        ));
+        let wants = || {
+            Filter::Subscription(Subscription {
+                streams: Streams::RAW,
+                regions: Vec::new(),
+            })
+        };
+        let honest = router.listen(10, wants());
+        let laggard = router.listen(11, wants());
+        let none = Arc::new(Charge::none());
+        let one = Arc::new(info_item(None, 0)?);
+        // One slot from full: the next push fills the queue, the one after grows it.
+        honest.subscriber.offer(&one, &none, 1, gauge.empty());
+        while honest.subscriber.growth() != Some(0) {
+            honest.subscriber.offer(&one, &none, 1, gauge.empty());
+        }
+        loop {
+            honest.subscriber.offer(&one, &none, 1, gauge.empty());
+            if honest.subscriber.growth().is_some_and(|growth| growth > 0) {
+                break;
+            }
+        }
+        // The laggard holds room; the rest of the store is taken.
+        for _ in 0..64 {
+            laggard.subscriber.offer(&one, &none, 1, gauge.empty());
+        }
+        let _rest = gauge
+            .try_charge(gauge.limit() - gauge.held())
+            .ok_or("no room to take")?;
+        let queued = honest.queued_bytes();
+        let index = router.index.read().map_err(|_| "poisoned")?;
+        let at = index
+            .entries
+            .iter()
+            .position(|entry| Arc::ptr_eq(&entry.subscriber, &honest.subscriber))
+            .ok_or("not listed")?;
+        // The second publisher's slot, read as nothing.
+        Router::deliver(&index, &one, &none, 1, vec![(at, gauge.empty())]);
+        drop(index);
+        assert!(
+            honest.subscriber.growth().is_some(),
+            "the honest subscriber fell behind"
+        );
+        assert_eq!(honest.queued_bytes(), queued + 1, "the item was not queued");
+        assert!(
+            laggard.subscriber.growth().is_none(),
+            "the laggard was kept"
+        );
+        let (allocated, charged) = honest.subscriber.charged();
+        assert_eq!(allocated, charged);
         Ok(())
     }
 }

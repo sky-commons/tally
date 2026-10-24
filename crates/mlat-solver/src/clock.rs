@@ -332,6 +332,20 @@ impl ModelTime {
 }
 
 impl ClockModel {
+    /// Every list at exactly its length, as `publish::decode` makes a model it reads: what a
+    /// fitted model is shrunk to before it is shared, so the relay's store of models holds the
+    /// engine's own at what it plans a model to take (`standing::model_bytes_most`).
+    pub fn shrink_to_fit(&mut self) {
+        self.scope.shrink_to_fit();
+        self.pieces.shrink_to_fit();
+        for piece in &mut self.pieces {
+            piece.offsets_ps.shrink_to_fit();
+        }
+        self.biases.shrink_to_fit();
+        self.jumps.shrink_to_fit();
+        self.dropped.shrink_to_fit();
+    }
+
     /// The pieces of one receiver's epoch, as an index range.
     pub fn pieces_of(&self, receiver: &PublicKey, epoch: u32) -> std::ops::Range<usize> {
         let start = self

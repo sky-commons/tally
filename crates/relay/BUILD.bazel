@@ -81,13 +81,13 @@ _UNIT_TEST_MODULES = {
     "config": "small",  # under 0.1 s
     "consistency": "small",  # 7.8 s
     "cores": "small",  # under 0.1 s
-    "credit": "small",  # 1.8 s
-    "delivery": "medium",  # 27.3 s
-    "directory": "medium",  # 23.9 s
+    "credit": "small",  # 12.9 s
+    "delivery": "medium",  # 36.1 s
+    "directory": "medium",  # 56.9 s
     "durable": "small",  # 0.1 s
     "egress": "small",  # 0.1 s
     "exchange": "small",  # under 0.1 s
-    "fanout": "small",  # under 0.1 s
+    "fanout": "small",  # 3.0 s
     "figures": "small",  # under 0.1 s
     # hub.rs's tests but its error budget end to end, and that test alone
     # (`hub::honest_end_to_end`).
@@ -97,6 +97,7 @@ _UNIT_TEST_MODULES = {
     "link": "small",  # 12.0 s
     "listeners": "small",  # 1.0 s
     "mlat_host": "medium",  # 29.0 s
+    "models": "small",
     "network": "small",  # 0.1 s
     "os": "small",  # under 0.1 s
     "outbound": "small",  # under 0.1 s
@@ -263,9 +264,9 @@ rust_test(
     ],
 )
 
-# A shard's station rows at their cap allocate no more than they are charged
-# (`stations::PLANNED_BYTES`), measured by a counting allocator: its own binary, so nothing else
-# allocates while it measures.
+# A shard's station rows at its share of the receiver figure allocate no more than they are
+# charged (`stations::planned_bytes`), measured by a counting allocator: its own binary, so nothing
+# else allocates while it measures.
 rust_test(
     name = "stations_bytes",
     size = "small",
@@ -275,6 +276,42 @@ rust_test(
     deps = [
         ":relay",
         "//crates/counting",
+        "//crates/wire",
+    ],
+)
+
+# The tables that grow with what the relay is sent (the products' remembered tables, the world
+# gatherers' fixes, standing's and the positions checks') allocate no more than they are charged,
+# measured by a counting allocator: its own binary, so nothing else allocates while it measures.
+rust_test(
+    name = "tables_bytes",
+    size = "small",
+    srcs = ["tests/tables_bytes.rs"],
+    edition = "2024",
+    lint_config = ":cargo_lints",
+    deps = [
+        ":relay",
+        "//crates/counting",
+        "//crates/mlat",
+        "//crates/mlat-solver",
+        "//crates/wire",
+    ],
+)
+
+# The positions checks' twins (RFC-0181, "The positions checks") allocate no more than their
+# store is charged, filled past their rooms by the smallest solutions the wire carries, measured by
+# a counting allocator: its own binary, so nothing else allocates while it measures.
+rust_test(
+    name = "twins_bytes",
+    size = "small",
+    srcs = ["tests/twins_bytes.rs"],
+    edition = "2024",
+    lint_config = ":cargo_lints",
+    deps = [
+        ":relay",
+        "//crates/counting",
+        "//crates/mlat",
+        "//crates/mlat-solver",
         "//crates/wire",
     ],
 )
@@ -423,8 +460,7 @@ rust_test(
     },
     lint_config = ":cargo_lints",
     # A member link's share (`peers::WAITING_PER_LINK_BYTES`), which the plan's line is made of,
-    # and the system calls the clock read makes (`tally_wire::kernel_clock`), which the unit's
-    # filter is held to.
+    # and how the unit reads the clock's bound (`tally_wire::clock_bound::unit_faults`).
     deps = [
         ":relay",
         "//crates/wire",

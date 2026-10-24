@@ -276,6 +276,10 @@ fn velocity(track: &[(f64, f64, f64)], t: f64) -> [f64; 2] {
 }
 
 /// Runs the calibration over `subset`, reporting progress to `progress`.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a replay's engine signs by the recording's instants, whose clock always judges"
+)]
 pub fn run(
     subset: &Subset,
     settings: &Settings,

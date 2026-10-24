@@ -94,11 +94,12 @@ fn check_host(
 /// What the simulation made, a line of the summary.
 fn made_line(made: &traffic::Made, feeders: usize) -> String {
     format!(
-        "{:.0} receptions/s a receiver; {:.0} distinct transmissions/s, each heard by {:.1}; {:.0} \
-         distinct messages/s by their bytes",
+        "{:.0} receptions/s a receiver; {:.0} distinct transmissions/s, each heard by {:.1}, {:.0}/s \
+         by enough to multilaterate; {:.0} distinct messages/s by their bytes",
         made.per_sec(made.receptions) / feeders.max(1) as f64,
         made.per_sec(made.transmissions),
         made.receptions as f64 / made.transmissions.max(1) as f64,
+        made.per_sec(made.multilaterable),
         made.per_sec(made.contents)
     )
 }
@@ -341,6 +342,9 @@ pub async fn run(config: Config) -> Result<String, String> {
     // that and the headroom for it at any sample: (beyond, resident, peak charged).
     let mut peak_charged = 0u64;
     let mut beyond: Option<(i64, u64, u64)> = None;
+    // The sample at which the allocator served the most beyond every store's charge: what the
+    // base holds, held to what was measured idle and its margin (`Charged::within_base`).
+    let mut base_worst: Option<relay::Charged> = None;
     loop {
         let elapsed = begin.elapsed();
         let next = if window.is_none() {
@@ -358,6 +362,11 @@ pub async fn run(config: Config) -> Result<String, String> {
             ));
         }
         let now = watch.moment();
+        if let Some(charged) = now.charged
+            && base_worst.is_none_or(|worst| charged.unplanned() > worst.unplanned())
+        {
+            base_worst = Some(charged);
+        }
         if let (Some(sample), Some(charged)) = (&now.sample, now.charged) {
             peak_charged = peak_charged.max(charged.total());
             let rss = sample.rss_kib * 1024;
@@ -413,6 +422,10 @@ pub async fn run(config: Config) -> Result<String, String> {
         }),
         _ => None,
     };
+    let worked = match watch.stats.as_deref() {
+        Some(stats) => Some(relay::worked(stats)?),
+        None => None,
+    };
     let table = summary(&Summary {
         config: &config,
         local,
@@ -428,6 +441,8 @@ pub async fn run(config: Config) -> Result<String, String> {
         relay_peak_cores,
         fit,
         beyond,
+        base_worst,
+        worked,
     });
     let _ = std::fs::remove_dir_all(config.state_dir.join("feeders"));
     drop(spawned);
@@ -437,6 +452,33 @@ pub async fn run(config: Config) -> Result<String, String> {
     // The relay's peak resident memory is held to its budget and the headroom it
     // keeps below the memory it runs in, whatever the allocator keeps; past them a relay sized
     // for its load is throttled or killed.
+    // The figures are a working relay's only if it did its work: its clock judged, it signed
+    // products, its strike tables filled and, hosting MLAT, it stepped, published and kept
+    // standing within its plan.
+    let multilaterable = traffic.as_deref().map_or(0, |traffic| {
+        traffic.made(0..run_second(begin.elapsed())).multilaterable
+    });
+    if let Some(short) = worked
+        .map(|worked| worked.shortfalls(config.spec.feeders, multilaterable))
+        .filter(|short| !short.is_empty())
+    {
+        return Err(format!(
+            "{table}\nthe relay did not do its work: {}",
+            short.join("; ")
+        ));
+    }
+    // What no store charges stays within the base the plan holds for it.
+    if let Some(worst) = base_worst
+        && !worst.within_base()
+    {
+        return Err(format!(
+            "{table}\nthe allocator served {} MiB beyond every store's charge, past the \
+             measured base and its margin ({} MiB): a table grows that no store charges",
+            worst.unplanned() >> 20,
+            (tally_relay::budget::MEASURED_IDLE_BYTES + tally_relay::budget::BASE_MARGIN_BYTES)
+                >> 20
+        ));
+    }
     if let Some((over, _, _)) = beyond
         && over > 0
     {
@@ -531,6 +573,8 @@ struct Summary<'a> {
     /// The relay's peak resident memory beside its budget and headroom, where it can be read.
     fit: Option<relay::Fit>,
     beyond: Option<(i64, u64, u64)>,
+    base_worst: Option<relay::Charged>,
+    worked: Option<relay::Worked>,
 }
 
 fn summary(summary: &Summary) -> String {
@@ -549,6 +593,8 @@ fn summary(summary: &Summary) -> String {
         relay_peak_cores,
         fit,
         beyond,
+        base_worst,
+        worked,
     } = summary;
     let seconds = seconds.max(1e-3);
     let rate = |count: u64| count as f64 / seconds;
@@ -670,6 +716,40 @@ fn summary(summary: &Summary) -> String {
                 peak >> 20,
                 relay::resident_allowed(*peak) >> 20,
                 if *over <= 0 { "within" } else { "OVER" }
+            ),
+        );
+    }
+    if let Some(worst) = base_worst {
+        row(
+            "relay: base",
+            format!(
+                "at its worst sample the allocator served {} MiB in use and {} MiB mapped, {} MiB \
+                 beyond every store's charge, against {} MiB measured idle and its margin: {}",
+                worst.in_use >> 20,
+                worst.mapped >> 20,
+                worst.unplanned() >> 20,
+                (tally_relay::budget::MEASURED_IDLE_BYTES + tally_relay::budget::BASE_MARGIN_BYTES)
+                    >> 20,
+                if worst.within_base() {
+                    "within"
+                } else {
+                    "OVER"
+                }
+            ),
+        );
+    }
+    if let Some(worked) = worked {
+        row(
+            "relay: worked",
+            format!(
+                "{} unjudged, {} regional signed, own strikes {} KiB{}",
+                worked.unjudged_records,
+                worked.regional_signed,
+                worked.own_strikes_held >> 10,
+                worked.mlat.map_or(String::new(), |mlat| format!(
+                    "; MLAT {} steps, {} positions; standing took {}, forgot {}",
+                    mlat.steps, mlat.positions, mlat.standing_taken, mlat.standing_forgotten
+                ))
             ),
         );
     }

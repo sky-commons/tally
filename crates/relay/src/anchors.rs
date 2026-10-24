@@ -145,10 +145,10 @@ pub struct Anchors {
     /// (paced, queued) is aged from at most this and never more than its anchor's own age
     /// ([`Anchors::issued_by`]).
     forgotten: Mutex<Option<Raw>>,
-    /// The raw monotonic clock at its first issue since it started: the ring remembers every own
-    /// anchor an honest batch may carry only once `OWN_ANCHOR_OLDEST` has passed since, and before
-    /// that one of the relay's earlier run may be in a batch, whose issue nothing here remembers
-    /// ([`Anchors::remembers`]).
+    /// The raw monotonic clock at its first issue since it started: an own anchor of the relay's
+    /// earlier run, whose issue nothing here remembers, was issued before it, so a batch carrying
+    /// one is aged from at most this ([`Anchors::issued_by`]), and within `OWN_ANCHOR_OLDEST` of a
+    /// restart no age can blame anyone.
     first: Mutex<Option<Raw>>,
     charge: Mutex<Charge>,
 }
@@ -285,17 +285,6 @@ impl Anchors {
         remembered
             .or_else(|| *lock(&self.forgotten))
             .or_else(|| *lock(&self.first))
-    }
-
-    /// Whether every own anchor an honest batch arriving at `arrived` (the raw monotonic clock)
-    /// may carry is one this relay remembers issuing: `OWN_ANCHOR_OLDEST` has passed since its
-    /// first issue of this run. Before, the relay restarted within that span and a batch may
-    /// carry the anchor of its earlier run, whose issue this one never saw, so no age measured
-    /// from its anchors can blame anyone (`strikes::OwnAnchor::Unknowable`). Not persisted: the
-    /// raw clock starts again with the host, so an earlier run's issues could not be aged by it.
-    pub fn remembers(&self, arrived: Raw) -> bool {
-        lock(&self.first)
-            .is_some_and(|first| tally_wire::budget::OWN_ANCHOR_OLDEST.past(first, arrived))
     }
 }
 
@@ -570,27 +559,5 @@ mod tests {
                 "forgotten at {ppm} ppm"
             );
         }
-    }
-
-    /// A relay that started (or restarted) remembers every own anchor an honest batch may carry
-    /// only once `OWN_ANCHOR_OLDEST` has passed by its raw clock since its first issue of this run:
-    /// before, a batch may carry its earlier run's anchor, which nothing here remembers. Its
-    /// first issue starts the span, not a later one, and an issue refused (the clock not judging)
-    /// starts nothing.
-    #[test]
-    fn a_restarted_relay_remembers_nothing_until_its_ring_covers_the_oldest_anchor() {
-        let anchors = Anchors::new();
-        let relay = Identity::from_seed([1; 32]);
-        let sign = |j: tally_wire::clocks::Judged| Some(Anchor::sign(&relay, j.ms()));
-        let oldest = tally_wire::budget::OWN_ANCHOR_OLDEST
-            .span::<tally_wire::clocks::Judged>()
-            .ms();
-        assert!(!anchors.remembers(raw(u64::MAX)));
-        assert_eq!(anchors.issue(judged(NOW), raw(500), |_| None), None);
-        assert!(!anchors.remembers(raw(u64::MAX)));
-        anchors.issue(judged(NOW), raw(1_000), sign);
-        anchors.issue(judged(NOW + 5_000), raw(6_000), sign);
-        assert!(!anchors.remembers(raw(1_000 + oldest)));
-        assert!(anchors.remembers(raw(1_001 + oldest)));
     }
 }

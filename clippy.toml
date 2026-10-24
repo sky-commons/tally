@@ -2,9 +2,9 @@
 # Bazel's (`.bazelrc`, `build:lint`).
 #
 # A relay judges everything compared across machines by the host's wall clock as its time daemon
-# keeps it, with the kernel's error bound, and times every duration by the monotonic clock
-# (crates/relay/src/clock.rs, `RelayClock`; RFC-0171 §3.6), so it reads the wall clock and the
-# kernel's word on it in that one place. Any other read is refused here, whichever way it is
+# keeps it, with ClockBound's error bound (`tally_wire::clock_bound`), and times every duration by
+# the monotonic clock (crates/relay/src/clock.rs, `RelayClock`; RFC-0171 §3.6), so it reads the
+# wall clock in that one place. Any other read is refused here, whichever way it is
 # spelt, and one that is right (a feeder's own host clock, a tool's) says why where it is allowed.
 disallowed-methods = [
     { path = "std::time::SystemTime::now", reason = "in the relay, read its one clock (`clock::RelayClock`); elsewhere, allow it where it is read, saying why that clock is the right one" },
@@ -14,8 +14,11 @@ disallowed-methods = [
     { path = "libc::clock_gettime64", allow-invalid = true, reason = "a read of a host clock: in the relay, read its one clock (`clock::RelayClock`); elsewhere, allow it where it is read, saying why" },
     { path = "libc::gettimeofday", reason = "a read of the wall clock: in the relay, read its one clock (`clock::RelayClock`); elsewhere, allow it where it is read, saying why" },
     { path = "libc::time", reason = "a read of the wall clock: in the relay, read its one clock (`clock::RelayClock`); elsewhere, allow it where it is read, saying why" },
-    { path = "libc::adjtimex", reason = "the kernel's word on the wall clock: read once, by `tally_wire::kernel_clock::asked`, which both ends' clocks call" },
-    { path = "libc::clock_adjtime", allow-invalid = true, reason = "the kernel's word on the wall clock: read once, by `tally_wire::kernel_clock::asked`, which both ends' clocks call" },
+    # The kernel's own bound (`maxerror`) is no bound: it cannot say which daemon wrote it, and a
+    # daemon killed mid-slew leaves it understating the error. The clock's bound is ClockBound's,
+    # read by `tally_wire::clock_bound` alone.
+    { path = "libc::adjtimex", reason = "the kernel's maxerror is no bound on the clock: read ClockBound's (`tally_wire::clock_bound::Reader`)" },
+    { path = "libc::clock_adjtime", allow-invalid = true, reason = "the kernel's maxerror is no bound on the clock: read ClockBound's (`tally_wire::clock_bound::Reader`)" },
     # A clock's reading is made by reading the clock (`tally_wire::clocks`): a number becomes one
     # only as a reading taken before and given back, by a replay or a test, which says so.
     { path = "tally_wire::clocks::recorded::mono", reason = "read the clock through its reader; a replay or a test that gives back a reading taken before allows it, saying so" },
@@ -23,11 +26,26 @@ disallowed-methods = [
     { path = "tally_wire::clocks::recorded::raw", reason = "read the clock through its reader; a replay or a test that gives back a reading taken before allows it, saying so" },
     { path = "tally_wire::clocks::recorded::moment", reason = "read the clock through its reader; a replay or a test that gives back a reading taken before allows it, saying so" },
     { path = "tally_wire::clocks::recorded::aligned", reason = "read the clock through its reader; a replay or a test that gives back a reading taken before allows it, saying so" },
-    { path = "tally_wire::clocks::Moment::at_ms", reason = "a time on the monotonic clock's own grid is stated in one place (`tally_relay::seal::on_grid`); a test that gives back one taken before allows it, saying so" },
     { path = "tally_relay::ingest::Stamp::recorded", reason = "a stamp is read from the relay's clock (`RelayClock::stamp`); a test that gives back a stamp taken before allows it, saying so" },
     { path = "tally_relay::ingest::Stamp::at", reason = "a stamp is read from the relay's clock (`RelayClock::stamp`); a test that gives back a stamp taken before allows it, saying so" },
     # The relay lends its key by the reading a record states its time by (`tally_relay::signer::with`),
     # so nothing is signed from a reading taken while its clock did not judge.
     { path = "tally_wire::key::Signer::with", reason = "in the relay, sign through `tally_relay::signer::with`, by the reading the record states; elsewhere, allow it where the caller is stepped only by a judging reading, saying so" },
+    # A signer judges by the clock it is handed, so the relay makes its one from its own judging
+    # clock (`tally_relay::signer::on`); a test or a tool whose clock always judges says so.
+    { path = "tally_wire::key::Signer::new", reason = "in the relay, make its signer on its judging clock (`tally_relay::signer::on`); elsewhere, allow it where the clock it is handed is the right one, saying so" },
     { path = "tally_wire::key::Signer::sign_with", reason = "in the relay, sign through `tally_relay::signer::sign_with`, by the reading the record states; elsewhere, allow it where the caller is stepped only by a judging reading, saying so" },
+    # A clock that always judges is a test's, never a relay's or an API's: a relay judges by
+    # ClockBound's word on its host clock (`RelayClock::system`), an API by its host's
+    # (`mlat::Clock::system`). Each of these judges whatever ClockBound says, or by a script, so
+    # production code reaching one would judge and sign by a clock nobody bounds; a test, which
+    # has no ClockBound, allows it and says so.
+    { path = "tally_relay::clock::RelayClock::host_stated", reason = "a test's clock, judging whatever ClockBound says: a relay's is `RelayClock::system`; a test allows it, saying so" },
+    { path = "tally_relay::clock::RelayClock::scripted", reason = "a test's or a replay's scripted clock, always judging: a relay's is `RelayClock::system`; a test allows it, saying so" },
+    { path = "tally_relay::clock::RelayClock::scripted_apart", reason = "a test's scripted clocks, always judging: a relay's is `RelayClock::system`; a test allows it, saying so" },
+    { path = "tally_relay::clock::RelayClock::scripted_raw", reason = "a test's scripted clocks, always judging: a relay's is `RelayClock::system`; a test allows it, saying so" },
+    { path = "tally_relay::clock::RelayClock::set_error", reason = "a test's scripted error: a relay's error is ClockBound's alone; a test allows it, saying so" },
+    { path = "tally_relay::hub::Hub::new", reason = "a test's hub, on a clock that judges whatever ClockBound says: a relay's is `Hub::on` with `RelayClock::system`; a test allows it, saying so" },
+    { path = "tally_relay::hub::Hub::clocked", reason = "a test's hub, on a scripted clock that always judges: a relay's is `Hub::on` with `RelayClock::system`; a test allows it, saying so" },
+    { path = "tally_api::mlat::Clock::host_stated", reason = "a test's clock, judging whatever ClockBound says: an API's is `mlat::Clock::system`; a test allows it, saying so" },
 ]

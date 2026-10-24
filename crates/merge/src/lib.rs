@@ -61,7 +61,8 @@
 //!   within `CONFIRM_WITHIN_MS` that puts it inside `CONFIRM_GATE` (both horizontal covariances and
 //!   `CONFIRM_SPEED_M_PER_S` of motion) confirms it. A client learns of a retraction by the
 //!   deadline rule, needing no message: one neither superseded nor confirmed
-//!   `PROVISIONAL_DEADLINE_MS` after it arrived, by the client's clock, is retracted, forgotten and
+//!   `tally_wire::budget::FINAL_FIX_ARRIVED` after it arrived, measured on the client's monotonic
+//!   clock (a span, which a step of its wall clock never shortens), is retracted, forgotten and
 //!   counted against its signers ([`Merge::retractions`]). Each fix held ends superseded,
 //!   confirmed, retracted or forgotten ([`ProvisionalCounts`]).
 //! - **Memory is bounded**, every table least-recently-active first (the relay's `Bounded`):
@@ -82,6 +83,7 @@ use tally_mlat_solver::modes;
 use tally_mlat_solver::standing::{Candidate, Claimed, decide};
 use tally_relay::bounded::Bounded;
 use tally_wire::batch::Hash;
+use tally_wire::clocks::{Mono, Span};
 use tally_wire::{
     ClientClockModel, ClientFaultProof, ClientRecord, Positions, PublicKey, TaggedSet,
     TaggedSolution, Tolerance, TransmitTime,
@@ -96,11 +98,13 @@ pub const TRANSMISSIONS: usize = 8;
 pub const ALTERNATIVES: usize = 4;
 /// Solutions held per model while it has not arrived.
 pub const PENDING_PER_MODEL: usize = 4_096;
-/// How long after a provisional fix arrives (by the client's clock) a final one must have
-/// superseded or confirmed it, else it is retracted: once a final fix has surely arrived
-/// (`tally_wire::products::FINAL_FIX_ARRIVED_MS`, derived there). A provisional arrives after its
-/// transmission, so waiting this long from its arrival is enough.
-pub const PROVISIONAL_DEADLINE_MS: u64 = tally_wire::products::FINAL_FIX_ARRIVED_MS;
+/// How long after a provisional fix arrives a final one must have superseded or confirmed it,
+/// else it is retracted: once a final fix has surely arrived (`tally_wire::budget::FINAL_FIX_ARRIVED`,
+/// derived there), measured on the client's monotonic clock: a span between two of its readings,
+/// which a step of its wall clock never shortens. A provisional arrives after its transmission, so
+/// waiting this long from its arrival is enough. Before, it was measured on the judging clock,
+/// so a step of it forward retracted honest provisional fixes before their finals could arrive.
+const PROVISIONAL_DEADLINE: Span<Mono> = tally_wire::budget::FINAL_FIX_ARRIVED.span::<Mono>();
 /// Provisional fixes taken per signer per aircraft per second of transmit time, at most: an engine
 /// solves one an aircraft a second, and a second's boundary on two models' time origins may fall
 /// between two.
@@ -332,8 +336,8 @@ pub enum Standing {
 pub struct Provisional {
     pub fix: Fix,
     pub standing: Standing,
-    /// The client's clock past which, still waiting, it is retracted.
-    pub deadline_ms: u64,
+    /// The client's monotonic reading past which, still waiting, it is retracted.
+    pub deadline: Mono,
 }
 
 /// An aircraft's most recent final transmissions, oldest first by their current fix's transmit
@@ -455,7 +459,7 @@ pub struct Merge {
     pending: Bounded<ModelKey, Waiting>,
     faulted: Bounded<PublicKey, ()>,
     /// Every provisional fix held, by (deadline, aircraft, input set): what `expire` walks.
-    deadlines: BTreeSet<(u64, u32, Hash)>,
+    deadlines: BTreeSet<(Mono, u32, Hash)>,
     /// Provisional fixes each signer had retracted.
     retracted: Bounded<PublicKey, u64>,
     counts: ProvisionalCounts,
@@ -499,10 +503,10 @@ impl Merge {
         self.counts
     }
 
-    /// Lets the caller's clock move to `now_ms` with no record: provisional fixes past their
-    /// deadline are retracted.
-    pub fn tick(&mut self, now_ms: u64) {
-        self.expire(now_ms);
+    /// Lets the caller's monotonic clock move to `now` with no record: provisional fixes past
+    /// their deadline are retracted.
+    pub fn tick(&mut self, now: Mono) {
+        self.expire(now);
     }
 
     /// Supersets refused for disagreeing with a smaller fix of their transmission, since the merge
@@ -556,16 +560,16 @@ impl Merge {
         self.models.len()
     }
 
-    /// Takes one record a relay delivered. `now_ms` is the client's wall clock, which decides
+    /// Takes one record a relay delivered. `now` is the client's monotonic clock, which decides
     /// only when a provisional fix's deadline has passed. An error is a record that claimed to be
     /// signed and is not.
-    pub fn ingest(&mut self, record: &ClientRecord, now_ms: u64) -> Result<Ingested, String> {
-        self.tick(now_ms);
+    pub fn ingest(&mut self, record: &ClientRecord, now: Mono) -> Result<Ingested, String> {
+        self.tick(now);
         match record {
             ClientRecord::ClockModel(model) => self.model(model),
             ClientRecord::Positions(positions) => self.positions(positions.get()),
             ClientRecord::Provisional(positions) => {
-                self.provisional_positions(positions.get(), now_ms)
+                self.provisional_positions(positions.get(), now)
             }
             ClientRecord::FaultProof(proof) => Ok(self.fault_proof(proof)),
             _ => Ok(Ingested::Ignored),
@@ -669,7 +673,7 @@ impl Merge {
     fn provisional_positions(
         &mut self,
         positions: &Positions,
-        now_ms: u64,
+        now: Mono,
     ) -> Result<Ingested, String> {
         let engine = positions.engine().map_err(|error| error.to_string())?;
         positions
@@ -684,7 +688,7 @@ impl Merge {
         let (mut accepted, mut dropped) = (0, 0);
         for solution in content.solutions {
             let checked = self.check(engine, content.spec_version, &solution, Kind::Provisional);
-            let held = checked.is_some_and(|fix| self.hold_provisional(fix, engine, now_ms));
+            let held = checked.is_some_and(|fix| self.hold_provisional(fix, engine, now));
             if held {
                 accepted += 1;
             } else {
@@ -695,7 +699,7 @@ impl Merge {
     }
 
     /// Holds a checked provisional fix (crate docs, § Provisional fixes). True when it is held.
-    fn hold_provisional(&mut self, fix: Fix, engine: PublicKey, now_ms: u64) -> bool {
+    fn hold_provisional(&mut self, fix: Fix, engine: PublicKey, now: Mono) -> bool {
         if self.deadlines.len() >= self.settings.max_provisional {
             return false;
         }
@@ -742,7 +746,7 @@ impl Merge {
             }
             return false;
         }
-        let deadline_ms = now_ms.saturating_add(PROVISIONAL_DEADLINE_MS);
+        let deadline = now.later(PROVISIONAL_DEADLINE);
         let input_set = fix.input_set;
         track.provisional.push(Provisional {
             fix,
@@ -751,7 +755,7 @@ impl Merge {
             } else {
                 Standing::Waiting
             },
-            deadline_ms,
+            deadline,
         });
         track
             .provisional
@@ -765,12 +769,12 @@ impl Merge {
         let kept = forgotten.iter().all(|gone| gone.fix.input_set != input_set);
         for gone in forgotten {
             self.deadlines
-                .remove(&(gone.deadline_ms, address, gone.fix.input_set));
+                .remove(&(gone.deadline, address, gone.fix.input_set));
             self.counts.forgotten += 1;
         }
         self.tracks.touch(&address);
         if kept {
-            self.deadlines.insert((deadline_ms, address, input_set));
+            self.deadlines.insert((deadline, address, input_set));
         }
         kept
     }
@@ -793,17 +797,17 @@ impl Merge {
         for at in superseded.into_iter().rev() {
             let gone = track.provisional.remove(at);
             self.deadlines
-                .remove(&(gone.deadline_ms, address, gone.fix.input_set));
+                .remove(&(gone.deadline, address, gone.fix.input_set));
             self.counts.superseded += 1;
         }
     }
 
-    /// Provisional fixes whose deadline has passed by `now_ms`: one still waiting is retracted,
+    /// Provisional fixes whose deadline has passed by `now`: one still waiting is retracted,
     /// and counted against its signers; one confirmed is let go.
-    fn expire(&mut self, now_ms: u64) {
+    fn expire(&mut self, now: Mono) {
         while let Some(first) = self.deadlines.first().copied() {
-            let (deadline_ms, address, input_set) = first;
-            if deadline_ms > now_ms {
+            let (deadline, address, input_set) = first;
+            if deadline > now {
                 return;
             }
             self.deadlines.remove(&first);
@@ -1006,7 +1010,7 @@ impl Merge {
                 held.fix.engines.remove(&engine);
                 let stands = !held.fix.engines.is_empty();
                 if !stands {
-                    deadlines.remove(&(held.deadline_ms, address, held.fix.input_set));
+                    deadlines.remove(&(held.deadline, address, held.fix.input_set));
                 }
                 stands
             });

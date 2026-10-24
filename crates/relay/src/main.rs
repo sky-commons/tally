@@ -234,8 +234,16 @@ fn prepare(
 ) -> Result<(Arc<Hub>, bool, Signer), String> {
     let hosts_mlat = config.relay_duties && config.mlat;
     let hub = Arc::new(
-        Hub::new(
+        Hub::on(
             config.max_subscribers,
+            // Bounded by the ClockBound segment named (`--clock-bound`), ClockBound's own unless
+            // named: the reader lives as long as the process, as the host's does.
+            tally_relay::clock::RelayClock::bounded_by(Box::leak(Box::new(
+                tally_wire::clock_bound::Reader::at(
+                    &config.clock_bound,
+                    tally_wire::clock_bound::VMCLOCK,
+                ),
+            ))),
             tally_relay::sharing::Deadlines::RELAY,
         )
         .advertising(config.hints())
@@ -260,6 +268,8 @@ fn prepare(
         .memory(config.memory, hosts_mlat)
         // Its areas, which the member sessions are planned from (`budget::members_for`).
         .taking(config.areas.clone())
+        // The world products it gathers, whose fixes the plan holds (`Plan::with_world`).
+        .gathering_world(config.world, config.world_precise)
         // Its cores, which bound the connections, the rate and the MLAT seats it admits
         // (`budget::Plan::admit`).
         .cores(config.cores)
@@ -278,8 +288,6 @@ fn prepare(
     hub.fixed_charged()?;
     // RFC-0174's duties, configured once here.
     let network = hub.network();
-    network.products.set_world(config.world);
-    network.products.set_world_precise(config.world_precise);
     network
         .admission
         .configure(config.network, config.relay_duties);
@@ -290,7 +298,7 @@ fn prepare(
     let hosted =
         match tally_relay::mlat_host::host_for(config, signer.clone(), boot_id()?, hub.budget())? {
             Some(host) => {
-                network.host_mlat(Arc::new(host));
+                hub.host_mlat(Arc::new(host))?;
                 true
             }
             None => false,

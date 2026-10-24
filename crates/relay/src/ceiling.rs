@@ -162,6 +162,19 @@ impl Ceiling {
         self.within_at(now)
     }
 
+    /// The least time after the connection began that a sender keeping to this ceiling took to
+    /// send every byte read from it so far: the bytes past its burst and a second of its rate (the
+    /// slack for the sender's clock and for its bucket starting after this one), at its rate. A
+    /// sender keeping to it has sent at most its burst and its rate since; so the last byte read
+    /// reached this relay no sooner than this after the connection began (`link::Drained`).
+    pub fn sending<C>(&self) -> tally_wire::clocks::Span<C> {
+        let read = self.read.load(Ordering::Relaxed);
+        tally_wire::budget::sending(
+            read.saturating_sub(self.burst.saturating_add(self.rate)),
+            self.rate,
+        )
+    }
+
     fn within_at(&mut self, now: Instant) -> bool {
         let elapsed = now.saturating_duration_since(self.refilled).as_secs_f64();
         self.refilled = now;

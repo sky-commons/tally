@@ -2628,3 +2628,54 @@ fn an_inputs_pass_on_a_contended_gate_finishes() -> Result {
     drop(sites);
     Ok(())
 }
+
+/// No receiver's site is in the footprint of more tiles that may be fitted than
+/// `tile::SITE_TILES_MOST` plans: at sites over every latitude, each level's cubes whose centre's
+/// footprint holds the site and whose cube meets the shell where hearers' medians lie (25 km under
+/// the ellipsoid to 10 km over it) are counted, and the most at any site is the plan's, level by
+/// level.
+#[test]
+fn no_site_is_in_more_tiles_than_planned() {
+    let planned = [90usize, 72, 64, 58];
+    let mut most = [0usize; crate::tile::LEVELS as usize];
+    for lat_deg in [0.0, 15.0, 30.0, 45.0, 60.0, 75.0, 89.9] {
+        for lon_deg in [0.0, 17.0, 45.0] {
+            let site = geo::to_mm(geo::to_ecef(geo::Geodetic {
+                lat_deg,
+                lon_deg,
+                height_m: 0.0,
+            }));
+            for level in 0..crate::tile::LEVELS {
+                let edge = crate::tile::edge_mm(level);
+                let reach = crate::tile::footprint_mm(level) + edge;
+                let half_diagonal_m = (3.0f64).sqrt() * edge as f64 / 2_000.0;
+                let low = site.map(|axis| (axis - reach).div_euclid(edge));
+                let high = site.map(|axis| (axis + reach).div_euclid(edge));
+                let mut count = 0;
+                for x in low[0]..=high[0] {
+                    for y in low[1]..=high[1] {
+                        for z in low[2]..=high[2] {
+                            let tile = Tile {
+                                level,
+                                cube: [x, y, z],
+                            };
+                            if !tile.holds(site) {
+                                continue;
+                            }
+                            let height = geo::from_ecef(geo::from_mm(tile.centre_mm())).height_m;
+                            if height >= -(half_diagonal_m + 25_000.0)
+                                && height <= half_diagonal_m + 10_000.0
+                            {
+                                count += 1;
+                            }
+                        }
+                    }
+                }
+                let at = usize::from(level);
+                most[at] = most[at].max(count);
+            }
+        }
+    }
+    assert_eq!(most, planned);
+    assert_eq!(planned.iter().sum::<usize>(), crate::tile::SITE_TILES_MOST);
+}

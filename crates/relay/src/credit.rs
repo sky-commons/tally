@@ -50,6 +50,8 @@ use tally_wire::Signs;
 use tally_wire::batch::Hash;
 use tally_wire::budget::RECEIPT_AHEAD;
 use tally_wire::clocks::Judged;
+
+use crate::sharing::{MonoDeadline, Now};
 use tally_wire::record::MAX_REGIONS;
 use tally_wire::rendezvous::AREA_RESOLUTION;
 use tally_wire::{
@@ -381,18 +383,27 @@ impl Shown {
     pub fn issued_ms(&self) -> u64 {
         self.issued_ms
     }
+
+    /// What it allocates beside itself: its feeders' and slices' lists.
+    pub fn allocated(&self) -> usize {
+        footprint::vec::<ShownFeeder>(self.feeders.capacity())
+            + footprint::vec::<Slice>(self.slices.capacity())
+    }
 }
+
+/// The receivers a credit not yet told its figure holds (`Credit::set_receivers`): a test's that
+/// builds one alone. A relay's is told its figure before it starts.
+const UNSIZED_RECEIVERS: usize = 65_536;
 
 /// The most of each kind this relay keeps of its own evidence: a few bundles' worth.
 const OWN_EVIDENCE: usize = 16 * tally_wire::credit::MAX_EVIDENCE;
 /// The most relays whose evidence it holds, sessions it links, and corroborations it keeps.
 const MAX_RELAYS_SHOWN: usize = 4_096;
 const MAX_LINKED: usize = 8_192;
-const MAX_CORROBORATED_RECEIVERS: usize = 65_536;
 const MAX_CORROBORATED_RELAYS: usize = 8_192;
-/// The most feeders' descriptions held to resolve references by: one each, as many as the
-/// receivers a relay remembers.
-const MAX_COPIES: usize = 65_536;
+// The receivers corroborated, and the feeders' descriptions held to resolve references by (one
+// each), are as many as the receiver figure (`budget::Plan::receivers`, `Credit::set_receivers`):
+// the receivers the records a second the relay admits may be.
 /// The most clients this relay vouches for (its operator's list, `--vouch`): past it the rest are
 /// not taken.
 const MAX_VOUCHED: usize = 1_024;
@@ -402,9 +413,12 @@ const ASKED_REMEMBERED: usize = MAX_LINKED;
 /// The most a held description's signed bytes take: its fixed fields, its signature and key, a
 /// software name of 255 bytes and the most relays a held description names
 /// (`tally_wire::credit::MAX_DESCRIBED_RELAYS`); a test holds the largest one to it.
-const DESCRIPTION_MOST: usize = 1_024;
+pub(crate) const DESCRIPTION_MOST: usize = 1_024;
 /// The most a receipt's signed bytes take; a test holds one to it.
 const RECEIPT_MOST: usize = 256;
+/// The most receipts held from one signer: a bundle's worth. A signer is anyone with a key, so one
+/// signer's receipts (a fresh key's, dated ahead) take no more of the evidence than this.
+const RECEIPTS_PER_SIGNER: usize = tally_wire::credit::MAX_EVIDENCE;
 
 /// What every table here allocates at most at its caps ([`Credit`], charged to the budget's
 /// `Store::Credit`, a part of what the relay holds before any feeder): each table at its cap and
@@ -412,12 +426,41 @@ const RECEIPT_MOST: usize = 256;
 /// are those [`footprint::table_planned`] plans; and what each entry holds beside its table, at
 /// the most it may hold (a description, a receipt, a copy's relays, a bundle's feeders and slices,
 /// a session's two subscriptions).
-pub const PLANNED_BYTES: usize = {
+pub const fn planned_bytes(receivers: usize) -> usize {
+    use tally_wire::footprint::{table_planned, vec};
+    let copies = table_planned::<PublicKey, HeldCopy>(receivers + 1)
+        + (receivers + 1) * vec::<PublicKey>(tally_wire::credit::MAX_DESCRIBED_RELAYS);
+    let corroborated = table_planned::<PublicKey, MonoDeadline>(receivers + 1);
+    FIXED_TABLES_BYTES + copies + corroborated
+}
+
+/// What [`planned_bytes`] takes for each receiver at most, linear with [`FIXED_BYTES`]: a copy's
+/// share of its table (`footprint::table_planned_per_entry`) and the relays it names, and a
+/// corroboration's share of its.
+pub const BYTES_PER_RECEIVER: usize = {
+    use tally_wire::footprint::{table_planned_per_entry, vec};
+    table_planned_per_entry::<PublicKey, HeldCopy>()
+        + vec::<PublicKey>(tally_wire::credit::MAX_DESCRIBED_RELAYS)
+        + table_planned_per_entry::<PublicKey, MonoDeadline>()
+};
+
+/// What [`planned_bytes`] takes beside [`BYTES_PER_RECEIVER`] for each receiver: every table held
+/// at its own caps ([`FIXED_TABLES_BYTES`]), and the receivers' two tables' fixed parts and the one
+/// entry each holds past its figure.
+pub const FIXED_BYTES: usize = {
+    use tally_wire::footprint::{table_planned_fixed, vec};
+    FIXED_TABLES_BYTES
+        + table_planned_fixed::<PublicKey, HeldCopy>()
+        + table_planned_fixed::<PublicKey, MonoDeadline>()
+        + BYTES_PER_RECEIVER
+        + vec::<PublicKey>(tally_wire::credit::MAX_DESCRIBED_RELAYS)
+};
+
+/// What every table but the receivers' allocates at most at its caps.
+const FIXED_TABLES_BYTES: usize = {
     use tally_wire::footprint::{table_planned, vec};
     let described = table_planned::<PublicKey, (ReceiverInfo, u64)>(OWN_EVIDENCE + 1)
         + (OWN_EVIDENCE + 1) * DESCRIPTION_MOST;
-    let copies = table_planned::<PublicKey, HeldCopy>(MAX_COPIES + 1)
-        + (MAX_COPIES + 1) * vec::<PublicKey>(tally_wire::credit::MAX_DESCRIBED_RELAYS);
     let receipts =
         table_planned::<(PublicKey, u64, u16, u8), (StripeReceipt, u64)>(OWN_EVIDENCE + 1)
             + (OWN_EVIDENCE + 1) * RECEIPT_MOST;
@@ -426,16 +469,15 @@ pub const PLANNED_BYTES: usize = {
         + (MAX_RELAYS_SHOWN + 1)
             * (vec::<ShownFeeder>(tally_wire::credit::MAX_EVIDENCE)
                 + vec::<Slice>(tally_wire::credit::MAX_EVIDENCE));
-    let corroborated = table_planned::<PublicKey, u64>(MAX_CORROBORATED_RECEIVERS + 1)
-        + table_planned::<PublicKey, u64>(MAX_CORROBORATED_RELAYS + 1);
+    let corroborated = table_planned::<PublicKey, MonoDeadline>(MAX_CORROBORATED_RELAYS + 1);
     let sessions = table_planned::<u64, Linked>(MAX_LINKED)
         + table_planned::<u64, ()>(ASKED_REMEMBERED)
         + table_planned::<u64, (Subscription, Subscription)>(ASKED_REMEMBERED + 1)
         + (ASKED_REMEMBERED + 1) * 2 * vec::<Region>(MAX_REGIONS);
-    described + copies + receipts + vouched + shown + corroborated + sessions
+    described + receipts + vouched + shown + corroborated + sessions
 };
 
-/// A table of the credit's, charged as it allocates ([`PLANNED_BYTES`]): its buckets, followed
+/// A table of the credit's, charged as it allocates ([`planned_bytes`]): its buckets, followed
 /// as it grows (`footprint::Table`), and what its entries hold beside them (`heap`, each entry's
 /// by `heap_of`). An entry goes in only once what it adds is charged, so a table past what its
 /// store has room for takes nothing more.
@@ -490,6 +532,16 @@ impl<K: Copy + Eq + StdHash, V> Gauged<K, V> {
         true
     }
 
+    /// Its table made anew no larger than `entries` take, if it is larger: what a lower figure
+    /// leaves it planned at (`footprint::Table::shrunk`).
+    fn shrink_within(&mut self, entries: usize) {
+        if self.map.capacity() > entries {
+            let len = self.map.len();
+            self.map.shrink_to(entries.max(len));
+            self.table.shrunk::<K, V>(len, entries.max(len));
+        }
+    }
+
     fn remove(&mut self, key: &K) -> Option<V> {
         let removed = self.map.remove(key);
         if let Some(value) = &removed {
@@ -514,17 +566,22 @@ impl<K: Copy + Eq + StdHash, V> Gauged<K, V> {
     /// Kept at most `cap` long: past it, the oldest quarter by `time` goes (amortised, so a flood
     /// costs a sort per quarter of the cap, not per insert).
     fn trim(&mut self, cap: usize, time: impl Fn(&V) -> u64) {
+        self.trim_ranked(cap, |_, value| time(value));
+    }
+
+    /// Kept at most `cap` long: past it, the lowest quarter by `rank` goes, as [`Gauged::trim`].
+    fn trim_ranked<R: Ord>(&mut self, cap: usize, rank: impl Fn(&K, &V) -> R) {
         if self.map.len() <= cap {
             return;
         }
-        let mut ages: Vec<(u64, K)> = self
+        let mut ranks: Vec<(R, K)> = self
             .map
             .iter()
-            .map(|(key, value)| (time(value), *key))
+            .map(|(key, value)| (rank(key, value), *key))
             .collect();
-        ages.sort_unstable_by_key(|(time, _)| *time);
+        ranks.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
         let excess = self.map.len() - cap * 3 / 4;
-        for (_, key) in ages.into_iter().take(excess) {
+        for (_, key) in ranks.into_iter().take(excess) {
             self.remove(&key);
         }
     }
@@ -549,8 +606,16 @@ struct State {
     vouched: Gauged<PublicKey, ()>,
     /// What each relay's evidence shows.
     shown: Gauged<PublicKey, Shown>,
-    corroborated_receivers: Gauged<PublicKey, Judged>,
-    corroborated_relays: Gauged<PublicKey, Judged>,
+    /// The receivers and relays corroborated first-hand, each until its corroboration lapses by
+    /// `M` ([`CORROBORATION_LIFETIME_MS`] after it was last renewed): how long this relay keeps
+    /// what it saw itself is its own schedule, so a step of its judging clock neither lapses a
+    /// corroboration early nor stretches one (RFC-0171 §3.6).
+    corroborated_receivers: Gauged<PublicKey, MonoDeadline>,
+    corroborated_relays: Gauged<PublicKey, MonoDeadline>,
+    /// When the corroborations are next swept for those lapsed (`Credit::expire`), by `M`.
+    sweep_at: MonoDeadline,
+    /// Corroborations not made because the clock did not judge, since start.
+    unjudged: u64,
     /// Sessions linked by a credential, by the hub's connection id.
     linked: Gauged<u64, Linked>,
     /// Sessions served on the free tier now.
@@ -559,6 +624,9 @@ struct State {
     asked: Gauged<u64, (Subscription, Subscription)>,
     /// What every table allocates, charged to the budget's `Store::Credit` (`Credit::charge_to`).
     charge: Charge,
+    /// The receiver figure the copies and the receivers' corroborations are held to
+    /// (`Credit::set_receivers`).
+    receivers: usize,
     /// What was let go because the store had no room for it.
     full: u64,
 }
@@ -578,6 +646,8 @@ impl State {
             }),
             corroborated_receivers: Gauged::new(nothing),
             corroborated_relays: Gauged::new(nothing),
+            sweep_at: MonoDeadline::NEVER,
+            unjudged: 0,
             linked: Gauged::new(nothing),
             free: Gauged::new(nothing),
             asked: Gauged::new(|(asked, served)| {
@@ -586,6 +656,7 @@ impl State {
             }),
             charge: gauge.empty(),
             full: 0,
+            receivers: UNSIZED_RECEIVERS,
         }
     }
 
@@ -617,13 +688,17 @@ impl State {
     }
 }
 
-fn corroborated(map: &HashMap<PublicKey, Judged>, key: &PublicKey, now: Judged) -> bool {
-    map.get(key).is_some_and(|seen| {
-        now.since(*seen) <= tally_wire::budget::policy::<_, CORROBORATION_LIFETIME_MS>()
-    })
+/// Whether `key` stands corroborated: held, and (at `now`, when the caller has it) not lapsed. An
+/// entry lapsed and not yet swept (`Credit::expire`) is past its lifetime by at most a sweep.
+fn corroborated(map: &HashMap<PublicKey, MonoDeadline>, key: &PublicKey, now: Option<Now>) -> bool {
+    map.get(key)
+        .is_some_and(|until| now.is_none_or(|now| !until.passed(now)))
 }
 
-/// The credit's state, its tables charged to a store of their own ([`PLANNED_BYTES`]).
+/// How often the corroborations are swept for those lapsed, by `M`.
+const SWEEP_EVERY_MS: u64 = 60 * 1000;
+
+/// The credit's state, its tables charged to a store of their own ([`planned_bytes`]).
 pub struct Credit {
     state: Mutex<State>,
 }
@@ -653,6 +728,24 @@ impl Credit {
         let mut charge = gauge.empty();
         let _ = charge.try_grow(bytes);
         state.charge = charge;
+    }
+
+    /// The copies and the receivers' corroborations held to `receivers` from now (the receiver
+    /// figure, `budget::Budget::receivers`), the oldest let go past it and their tables made no
+    /// larger than it needs, so they allocate what [`planned_bytes`] of it plans.
+    pub fn set_receivers(&self, receivers: usize) {
+        let mut state = self.state();
+        let state = &mut *state;
+        state.receivers = receivers.max(1);
+        let cap = state.receivers;
+        state.copies.trim(cap, |held| held.issued_ms);
+        state.copies.shrink_within(cap + 1);
+        state
+            .corroborated_receivers
+            .trim(cap, |until| until.mono_ms());
+        state.corroborated_receivers.shrink_within(cap + 1);
+        let bytes = state.bytes();
+        state.charge.shrink_to(bytes);
     }
 
     /// What it let go because its store had no room: an entry not taken into a table.
@@ -689,44 +782,93 @@ impl Credit {
     }
 
     /// A receiver this relay corroborated first-hand (its receptions agreed with verified fixes
-    /// that cite it): only such a receiver earns any relay credit here.
-    pub fn corroborate_receiver(&self, receiver: PublicKey, now: Judged) {
+    /// that cite it): only such a receiver earns any relay credit here. Made only while the
+    /// relay's clock judges (`Now::judging`), as what it agreed with was judged by that clock;
+    /// kept [`CORROBORATION_LIFETIME_MS`] by `M`.
+    pub fn corroborate_receiver(&self, receiver: PublicKey, now: impl Into<Now>) {
+        let now = now.into();
         let mut state = self.state();
         let state = &mut *state;
-        if !state
-            .corroborated_receivers
-            .insert(&mut state.charge, receiver, now)
-        {
+        if !now.judging() {
+            state.unjudged += 1;
+            return;
+        }
+        if !state.corroborated_receivers.insert(
+            &mut state.charge,
+            receiver,
+            now.after(CORROBORATION_LIFETIME_MS),
+        ) {
             state.let_go();
         }
         state
             .corroborated_receivers
-            .trim(MAX_CORROBORATED_RECEIVERS, |seen| seen.ms());
+            .trim(state.receivers, |until| until.mono_ms());
+        state.sweep_at = state.sweep_at.min(now.after(SWEEP_EVERY_MS));
         state.settle();
     }
 
-    /// Whether `receiver` stands corroborated here at `now_ms` (`corroborate_receiver`, not yet
-    /// lapsed): the receivers the ingest rate (`shed`) gives a share of their own, where every
-    /// other is held to its network group's.
-    pub fn corroborated_receiver(&self, receiver: &PublicKey, now: Judged) -> bool {
-        corroborated(&self.state().corroborated_receivers, receiver, now)
+    /// Whether `receiver` stands corroborated here at `now` (`corroborate_receiver`, not yet
+    /// lapsed by `M`): the receivers the ingest rate (`shed`) gives a share of their own, where
+    /// every other is held to its network group's.
+    pub fn corroborated_receiver(&self, receiver: &PublicKey, now: impl Into<Now>) -> bool {
+        corroborated(
+            &self.state().corroborated_receivers,
+            receiver,
+            Some(now.into()),
+        )
     }
 
     /// A relay this relay corroborated first-hand (a sharing peer it dealt with): only such a
-    /// relay's receipts earn the relay it signed them for any credit here.
-    pub fn corroborate_relay(&self, relay: PublicKey, now: Judged) {
+    /// relay's receipts earn the relay it signed them for any credit here. Made only while the
+    /// relay's clock judges, kept [`CORROBORATION_LIFETIME_MS`] by `M`, as a receiver's is.
+    pub fn corroborate_relay(&self, relay: PublicKey, now: impl Into<Now>) {
+        let now = now.into();
         let mut state = self.state();
         let state = &mut *state;
-        if !state
-            .corroborated_relays
-            .insert(&mut state.charge, relay, now)
-        {
+        if !now.judging() {
+            state.unjudged += 1;
+            return;
+        }
+        if !state.corroborated_relays.insert(
+            &mut state.charge,
+            relay,
+            now.after(CORROBORATION_LIFETIME_MS),
+        ) {
             state.let_go();
         }
         state
             .corroborated_relays
-            .trim(MAX_CORROBORATED_RELAYS, |seen| seen.ms());
+            .trim(MAX_CORROBORATED_RELAYS, |until| until.mono_ms());
+        state.sweep_at = state.sweep_at.min(now.after(SWEEP_EVERY_MS));
         state.settle();
+    }
+
+    /// Lets go of the corroborations lapsed by `M`, at most once a [`SWEEP_EVERY_MS`]: the
+    /// network's tick calls it every tick.
+    pub fn expire(&self, now: impl Into<Now>) {
+        let now = now.into();
+        let mut state = self.state();
+        if !state.sweep_at.passed(now) {
+            return;
+        }
+        state
+            .corroborated_receivers
+            .retain(|_, until| !until.passed(now));
+        state
+            .corroborated_relays
+            .retain(|_, until| !until.passed(now));
+        state.sweep_at =
+            if state.corroborated_receivers.is_empty() && state.corroborated_relays.is_empty() {
+                MonoDeadline::NEVER
+            } else {
+                now.after(SWEEP_EVERY_MS)
+            };
+        state.settle();
+    }
+
+    /// Corroborations not made because the clock did not judge, since start.
+    pub fn unjudged(&self) -> u64 {
+        self.state().unjudged
     }
 
     /// Signs a credential for `client`.
@@ -830,7 +972,8 @@ impl Credit {
             if !state.copies.insert(&mut state.charge, feeder, copy) {
                 state.let_go();
             }
-            state.copies.trim(MAX_COPIES, |held| held.issued_ms);
+            let receivers = state.receivers;
+            state.copies.trim(receivers, |held| held.issued_ms);
         }
         if relays.iter().any(|relay| state.own.contains(relay)) && info.verify().is_ok() {
             let newer = state
@@ -952,6 +1095,27 @@ impl Credit {
             .get(&key)
             .is_none_or(|(_, issued)| *issued < content.issued_ms);
         if newer && receipt.as_bytes().len() <= RECEIPT_MOST {
+            // A signer holds at most its share: a new one past it takes the place of its own
+            // oldest, if it is newer, never another signer's.
+            if !state.receipts.contains_key(&key) {
+                let own = state
+                    .receipts
+                    .iter()
+                    .filter(|(held, _)| held.0 == child)
+                    .map(|(held, (_, issued))| (*issued, *held));
+                let count = own.clone().count();
+                if count >= RECEIPTS_PER_SIGNER {
+                    match own.min() {
+                        Some((oldest, held)) if oldest < content.issued_ms => {
+                            state.receipts.remove(&held);
+                        }
+                        _ => {
+                            state.settle();
+                            return;
+                        }
+                    }
+                }
+            }
             // Held exact, as a description is.
             if !state
                 .receipts
@@ -959,7 +1123,15 @@ impl Credit {
             {
                 state.let_go();
             }
-            state.receipts.trim(OWN_EVIDENCE, |(_, issued)| *issued);
+            // Past the cap, a signer this relay never dealt with goes first, whatever the date it
+            // put on its receipt: a key made for the purpose, dated as far ahead as is taken,
+            // never evicts a known signer's.
+            let known = &state.corroborated_relays;
+            state
+                .receipts
+                .trim_ranked(OWN_EVIDENCE, |(signer, ..), (_, issued)| {
+                    (known.contains_key(signer), *issued)
+                });
         }
         state.settle();
     }
@@ -1296,7 +1468,7 @@ pub fn check(
             issued_ms: slice.issued_ms,
         });
     }
-    // Exact, so a table holding it is charged what it holds (`PLANNED_BYTES`).
+    // Exact, so a table holding it is charged what it holds (`planned_bytes`).
     shown.feeders.shrink_to_fit();
     shown.slices.shrink_to_fit();
     Ok(shown)
@@ -1374,11 +1546,11 @@ fn earned(state: &State, relay: &PublicKey, now: Judged) -> u64 {
         return 0;
     };
     let feeder = |shown: &ShownFeeder| {
-        corroborated(&state.corroborated_receivers, &shown.feeder, now)
+        corroborated(&state.corroborated_receivers, &shown.feeder, None)
             && resolves(state.copies.get(&shown.feeder), shown, relay)
     };
     let child = |key: &PublicKey| {
-        corroborated(&state.corroborated_relays, key, now).then_some(Unit::Child(*key))
+        corroborated(&state.corroborated_relays, key, None).then_some(Unit::Child(*key))
     };
     worth(
         shown,
@@ -1531,6 +1703,109 @@ mod tests {
         .map_err(text)
     }
 
+    /// A receipt from `child` to `parent` for `stripe`, issued at `issued_ms`.
+    fn receipt_of(
+        child: &Identity,
+        parent: PublicKey,
+        degree: i32,
+        issued_ms: u64,
+    ) -> Result<StripeReceipt> {
+        StripeReceipt::sign(
+            child,
+            &StripeReceiptContent {
+                parent,
+                cell: area(-1_180_000_000 + degree * 5_000_000)?,
+                product: Streams::RAW,
+                stripe: 0,
+                stripes_of: 4,
+                first_second: 100,
+                last_second: 159,
+                records: 900,
+                bytes: 60_000,
+                digest: [7; 32],
+                issued_ms,
+            },
+        )
+        .map_err(text)
+    }
+
+    /// The receipts a relay holds as its evidence are bounded per signer, and a signer it never
+    /// dealt with goes first: keys made for the purpose, each signing a receipt dated as far ahead
+    /// as is taken, evict none of a known child's, and one key holds no more than its share.
+    /// Before, the newest by date were kept, so such receipts pushed every genuine one out.
+    #[test]
+    fn receipts_from_fresh_keys_dated_ahead_evict_no_known_childs() -> Result {
+        let relay = identity()?;
+        let credit = rationing();
+        credit.adopt_identity(relay.public());
+        let now = crate::strikes::Now::judging(NOW);
+        let children: Vec<Identity> = (0..16).map(|_| identity()).collect::<Result<_>>()?;
+        for child in &children {
+            credit.corroborate_relay(child.public(), crate::sharing::Now::from(NOW));
+            for degree in 0..8 {
+                credit.record_receipt(receipt_of(child, relay.public(), degree, NOW)?, now);
+            }
+        }
+        for _ in 0..2 * OWN_EVIDENCE {
+            let fresh = identity()?;
+            credit.record_receipt(receipt_of(&fresh, relay.public(), 0, NOW + 10_000)?, now);
+        }
+        let known: std::collections::HashSet<PublicKey> =
+            children.iter().map(Identity::public).collect();
+        let held = credit
+            .state()
+            .receipts
+            .keys()
+            .filter(|(signer, ..)| known.contains(signer))
+            .count();
+        let cells: std::collections::HashSet<u64> = (0..8)
+            .map(|degree| area(-1_180_000_000 + degree * 5_000_000).map(|cell| cell.as_u64()))
+            .collect::<Result<_>>()?;
+        assert_eq!(held, 16 * cells.len(), "known children's receipts evicted");
+        // One key, as many receipts as it can sign: its share at most.
+        let greedy = identity()?;
+        for degree in 0..250 {
+            credit.record_receipt(receipt_of(&greedy, relay.public(), degree, NOW)?, now);
+        }
+        let own = credit
+            .state()
+            .receipts
+            .keys()
+            .filter(|(signer, ..)| *signer == greedy.public())
+            .count();
+        assert!(own <= RECEIPTS_PER_SIGNER, "one signer holds {own}");
+        Ok(())
+    }
+
+    /// A corroboration is made only while the clock judges, and lapses by `M`: a step of the
+    /// judging clock an hour back or a day on neither keeps one past its lifetime nor lets it go
+    /// before.
+    #[test]
+    fn corroborations_need_a_judging_clock_and_lapse_by_the_monotonic_one() -> Result {
+        let credit = Credit::new();
+        let at = |judged: u64, mono: u64, judging: bool| {
+            crate::sharing::Now::from(crate::ingest::Stamp::recorded(
+                mono, 0, judged, judged, judging,
+            ))
+        };
+        let unsynced = identity()?.public();
+        credit.corroborate_receiver(unsynced, at(NOW, 1_000, false));
+        credit.corroborate_relay(unsynced, at(NOW, 1_000, false));
+        assert!(!credit.corroborated_receiver(&unsynced, at(NOW, 1_000, true)));
+        assert_eq!(credit.unjudged(), 2);
+        let seen = identity()?.public();
+        credit.corroborate_receiver(seen, at(NOW, 1_000, true));
+        let day = 24 * 60 * 60 * 1000;
+        // `J` a day on, `M` a second: still corroborated.
+        assert!(credit.corroborated_receiver(&seen, at(NOW + 2 * day, 2_000, true)));
+        // `J` an hour back, `M` past the lifetime: lapsed, and swept.
+        let lapsed = at(NOW - 3_600_000, 1_000 + CORROBORATION_LIFETIME_MS, true);
+        assert!(!credit.corroborated_receiver(&seen, lapsed));
+        credit.expire(lapsed);
+        assert!(credit.state().corroborated_receivers.is_empty());
+        Ok(())
+    }
+
     fn answer(relay: &Identity, receiver: PublicKey, issued_ms: u64) -> Result<DeliveryAnswer> {
         DeliveryAnswer::sign(
             relay,
@@ -1575,7 +1850,7 @@ mod tests {
         (0..count)
             .map(|_| {
                 let feeder = identity()?;
-                judge.corroborate_receiver(feeder.public(), judged(NOW));
+                judge.corroborate_receiver(feeder.public(), crate::sharing::Now::from(NOW));
                 info(&feeder, relay.public(), NOW)
             })
             .collect()
@@ -1607,13 +1882,13 @@ mod tests {
         let base = tally_counting::Counting::live();
         for n in 0..120u64 {
             let feeder = identity()?;
-            credit.corroborate_receiver(feeder.public(), judged(NOW + n));
+            credit.corroborate_receiver(feeder.public(), crate::sharing::Now::from(NOW + n));
             credit.described(
                 info(&feeder, relay.public(), NOW + n)?,
                 crate::strikes::Now::judging(NOW + n),
             );
             if n % 3 == 0 {
-                credit.corroborate_relay(feeder.public(), judged(NOW + n));
+                credit.corroborate_relay(feeder.public(), crate::sharing::Now::from(NOW + n));
                 credit.record_receipt(
                     receipt(&feeder, relay.public(), 1_000, NOW)?,
                     crate::strikes::Now::judging(NOW + n),
@@ -1663,8 +1938,45 @@ mod tests {
             "charged {}, allocated {measured}",
             credit.charged()
         );
-        assert!(credit.charged() <= PLANNED_BYTES);
+        assert!(credit.charged() <= planned_bytes(UNSIZED_RECEIVERS));
         assert_eq!(credit.full(), 0);
+        Ok(())
+    }
+
+    /// The copies and the receivers' corroborations held to a receiver figure, churned past it
+    /// by three times its receivers, allocate no more than [`planned_bytes`] of the figure plans,
+    /// whatever else the credit holds within its own caps. Measured by the allocator, on this
+    /// thread.
+    #[test]
+    fn the_receivers_tables_stay_within_their_plan_at_a_figure() -> Result {
+        const RECEIVERS: usize = 200;
+        let relay = identity()?;
+        let credit = rationing();
+        credit.adopt_identity(relay.public());
+        credit.set_receivers(RECEIVERS);
+        let feeders: Vec<Identity> = (0..3 * RECEIVERS)
+            .map(|_| identity())
+            .collect::<Result<_>>()?;
+        let other = identity()?;
+        let infos: Vec<ReceiverInfo> = feeders
+            .iter()
+            .enumerate()
+            .map(|(n, feeder)| info(feeder, other.public(), NOW + n as u64))
+            .collect::<Result<_>>()?;
+        let base = tally_counting::Counting::peak_base();
+        for (n, (feeder, described)) in feeders.iter().zip(infos).enumerate() {
+            let at = NOW + n as u64;
+            credit.corroborate_receiver(feeder.public(), crate::sharing::Now::from(at));
+            credit.described(described, crate::strikes::Now::judging(at));
+        }
+        let peak = usize::try_from(tally_counting::Counting::peak_since(base)).unwrap_or(0);
+        let state = credit.state();
+        assert!(state.copies.len() <= RECEIVERS + 1);
+        assert!(state.corroborated_receivers.len() <= RECEIVERS + 1);
+        drop(state);
+        // The receivers' tables' share of the plan: the other tables are untouched here.
+        let planned = planned_bytes(RECEIVERS) - FIXED_TABLES_BYTES;
+        assert!(peak <= planned, "{peak} at the peak, {planned} planned");
         Ok(())
     }
 
@@ -1718,13 +2030,13 @@ mod tests {
         let limit = 16 << 10;
         credit.charge_to(&Gauge::new(Store::Credit, limit));
         let first = identity()?.public();
-        credit.corroborate_receiver(first, judged(NOW));
+        credit.corroborate_receiver(first, crate::sharing::Now::from(NOW));
         for _ in 0..2_000 {
-            credit.corroborate_receiver(identity()?.public(), judged(NOW));
+            credit.corroborate_receiver(identity()?.public(), crate::sharing::Now::from(NOW));
         }
         assert!(credit.full() > 0, "nothing was let go");
         assert!(credit.charged() <= limit);
-        assert!(credit.corroborated_receiver(&first, judged(NOW)));
+        assert!(credit.corroborated_receiver(&first, crate::sharing::Now::from(NOW)));
         Ok(())
     }
 
@@ -1886,7 +2198,7 @@ mod tests {
         let other = identity()?;
         feeders.extend(hosted(&judge, &other, 1)?);
         let early = identity()?;
-        judge.corroborate_receiver(early.public(), judged(NOW));
+        judge.corroborate_receiver(early.public(), crate::sharing::Now::from(NOW));
         feeders.push(info(
             &early,
             relay.public(),
@@ -1895,7 +2207,7 @@ mod tests {
                 .ms(),
         )?);
         let child = identity()?;
-        judge.corroborate_relay(child.public(), judged(NOW));
+        judge.corroborate_relay(child.public(), crate::sharing::Now::from(NOW));
         let mixed = bundle(
             &relay,
             feeders,
@@ -1957,7 +2269,7 @@ mod tests {
         let answers = receivers
             .iter()
             .map(|receiver| {
-                judge.corroborate_receiver(receiver.public(), judged(NOW));
+                judge.corroborate_receiver(receiver.public(), crate::sharing::Now::from(NOW));
                 answer(&relay, receiver.public(), NOW)
             })
             .collect::<Result<Vec<_>>>()?;
@@ -1976,7 +2288,7 @@ mod tests {
     fn a_zero_span_receipt_counts_its_one_second() -> Result {
         let (relay, child) = (identity()?, identity()?);
         let judge = Credit::new();
-        judge.corroborate_relay(child.public(), judged(NOW));
+        judge.corroborate_relay(child.public(), crate::sharing::Now::from(NOW));
         let instant = StripeReceipt::sign(
             &child,
             &StripeReceiptContent {
@@ -2287,8 +2599,8 @@ mod tests {
             .map_err(text)?;
         assert_eq!(judge.earned(&relay.public(), judged(NOW)), 0);
         // Two of them turn out real: those two count.
-        judge.corroborate_receiver(fakes[0].public(), judged(NOW));
-        judge.corroborate_receiver(fakes[1].public(), judged(NOW));
+        judge.corroborate_receiver(fakes[0].public(), crate::sharing::Now::from(NOW));
+        judge.corroborate_receiver(fakes[1].public(), crate::sharing::Now::from(NOW));
         assert_eq!(
             judge.earned(&relay.public(), judged(NOW)),
             2 * FEEDER_CREDIT
@@ -2416,7 +2728,7 @@ mod tests {
         // A real child this relay knows counts, once, however many receipts it signs, and no
         // more than an area's raw a second.
         let known = identity()?;
-        honest.corroborate_relay(known.public(), judged(NOW));
+        honest.corroborate_relay(known.public(), crate::sharing::Now::from(NOW));
         let mut with_known = receipts;
         with_known.push(receipt(&known, relay.public(), 1_000, NOW)?);
         with_known.push(receipt(&known, relay.public(), 2_000, NOW)?);
@@ -2441,7 +2753,7 @@ mod tests {
             vec![receipt(&relay, known.public(), u64::MAX / 120, NOW)?],
             vec![],
         )?;
-        honest.corroborate_relay(relay.public(), judged(NOW));
+        honest.corroborate_relay(relay.public(), crate::sharing::Now::from(NOW));
         honest.weigh(&flood, judged(NOW), None).map_err(text)?;
         assert_eq!(
             honest.earned(&known.public(), judged(NOW)),
@@ -2540,8 +2852,8 @@ mod tests {
             (1, 1, 0)
         );
         let judge = Credit::new();
-        judge.corroborate_receiver(feeder.public(), judged(NOW));
-        judge.corroborate_relay(child.public(), judged(NOW));
+        judge.corroborate_receiver(feeder.public(), crate::sharing::Now::from(NOW));
+        judge.corroborate_relay(child.public(), crate::sharing::Now::from(NOW));
         judge.weigh(&bundled, judged(NOW), None).map_err(text)?;
         // A judge holding no copy of the description cannot resolve the reference: the feeder
         // counts nothing on the relay's word alone.
@@ -2660,7 +2972,7 @@ mod tests {
         let bundled = own.bundle(&relay, judged(NOW)).map_err(text)?;
         let judge_of = |copy: Option<ReceiverInfo>| -> Result<u64> {
             let judge = Credit::new();
-            judge.corroborate_receiver(feeder.public(), judged(NOW));
+            judge.corroborate_receiver(feeder.public(), crate::sharing::Now::from(NOW));
             if let Some(copy) = copy {
                 judge.described(copy, crate::strikes::Now::judging(NOW));
             }
@@ -2697,7 +3009,7 @@ mod tests {
         )?;
         assert!(carried.carries_site());
         let judge = Credit::new();
-        judge.corroborate_receiver(feeder.public(), judged(NOW));
+        judge.corroborate_receiver(feeder.public(), crate::sharing::Now::from(NOW));
         judge.weigh(&carried, judged(NOW), None).map_err(text)?;
         assert_eq!(judge.earned(&relay.public(), judged(NOW)), FEEDER_CREDIT);
         Ok(())
