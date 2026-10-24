@@ -507,6 +507,12 @@ pub trait Candidate {
     fn preferred(&self) -> bool {
         false
     }
+    /// Whether a holder of its raw verified it: `Some(true)` passed, `Some(false)` failed, `None`
+    /// not judged (no raw held, or not yet). A disagreeing superset supersedes a consistent subset
+    /// only when verified and of more standing (phase 1's rule).
+    fn verified(&self) -> Option<bool> {
+        None
+    }
 }
 
 /// A superset refused: it disagreed with a smaller solution of the same transmission.

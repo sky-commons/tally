@@ -566,6 +566,7 @@
 // Matrix code reads as the algebra it implements: index loops over rows and columns.
 #![allow(clippy::needless_range_loop)]
 
+pub mod arrived;
 pub mod banded;
 pub mod clock;
 pub mod gate;
@@ -581,20 +582,25 @@ pub mod sim;
 pub mod solve;
 pub mod standing;
 pub mod sync;
+pub mod threshold;
 pub mod tile;
 pub mod verify;
 
+pub use arrived::{Admitted, Arrived, BatchId, Considered, HELD_MS, TransmissionKey};
 pub use clock::{ClockKey, ClockModel, MAX_CARRY_PS, Reach, SPEC_VERSION, Timebase};
 pub use group::{Grouping, Transmission, group, group_reach};
 pub use obs::{ObservationId, Reception, Site};
-pub use publish::{PublishError, Unpublished, solve_published};
-pub use scope::{Assignment, Citation, Inputs, Sites, Window, WindowIndex};
+pub use publish::{PublishError, Unpublished, solve_fix, solve_published};
+pub use scope::{
+    Assignment, Citation, Frontier, Inputs, Sites, Trailing, TrailingInputs, Window, WindowIndex,
+};
 pub use solve::{Solution, SolveError};
-pub use sync::{Assessment, Calibrated, FitError, calibrate, fit, fit_calibrated};
+pub use sync::{Assessment, Calibrated, FitError, calibrate, fit, fit_calibrated, fit_trailing};
+pub use threshold::{KEPT_KEEP, PAIR_KEEP, REFERENCE_KEEP, SYNC_KEEP, Threshold, sync_key};
 pub use tile::Tile;
 pub use verify::{
-    Failure, ModelFailure, ModelVerdict, Verdict, judges, verify, verify_assignment, verify_model,
-    verify_reach,
+    Failure, ModelFailure, ModelVerdict, Verdict, judges, verify, verify_assignment, verify_fix,
+    verify_model, verify_reach, verify_trailing_model,
 };
 
 #[cfg(test)]

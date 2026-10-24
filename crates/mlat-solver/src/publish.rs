@@ -490,6 +490,19 @@ pub fn solve_published(
     Ok((solution, wire))
 }
 
+/// Solves the transmission of `considered` under `calibrated` and writes it to the wire, citing
+/// `model_hash`, naming every considered reception and the subset used: published only when the
+/// verifier passes the claim read back from those very bytes. Phase 1 replaces `solve_published`
+/// with it.
+pub fn solve_fix(
+    calibrated: &crate::sync::Calibrated,
+    considered: &crate::arrived::Considered,
+    model_hash: [u8; 32],
+) -> Result<(Solution, tally_wire::Solution), Unpublished> {
+    let _ = (calibrated, considered, model_hash);
+    todo!("phase 1")
+}
+
 /// The claim a verifier checks for a wire solution under `model`: its position and transmit
 /// time read back, its covariance rotated back to ECEF, its observations' identities. The wire
 /// carries no chi-square (the verifier computes it; it is 0 here) and no degrees of freedom,

@@ -59,6 +59,8 @@ pub enum Failure {
     Addressed,
     /// The model it cites is not of the tile the assignment rule gives the aircraft.
     Tile,
+    /// A used observation is not among the solution's considered set.
+    NotConsidered { id: ObservationId },
 }
 
 /// The verifier's answer: pass when there is no failure.
@@ -310,6 +312,12 @@ pub enum ModelFailure {
     },
     /// A clock's residuals step by more than the jump threshold where no jump is declared.
     Jump { score: f64 },
+    /// The verifier lacks batches at or below a cited frontier: neither passed nor failed.
+    Unjudged {
+        missing: Vec<crate::arrived::BatchId>,
+    },
+    /// Its frontiers are not one contiguous run a member's boot, or name no member.
+    Frontier,
 }
 
 /// The model verifier's answer: pass when there is no failure.
@@ -324,9 +332,13 @@ impl ModelVerdict {
     }
 
     /// False when the model names a specification version this verifier does not implement
-    /// (`judges`): neither passed nor failed, and nothing else was checked.
+    /// (`judges`), or cites batches it lacks (`ModelFailure::Unjudged`): neither passed nor
+    /// failed, and nothing else was checked.
     pub fn judged(&self) -> bool {
-        !matches!(self.failures.as_slice(), [ModelFailure::Spec(_)])
+        !matches!(
+            self.failures.as_slice(),
+            [ModelFailure::Spec(_) | ModelFailure::Unjudged { .. }]
+        )
     }
 }
 
@@ -412,4 +424,29 @@ pub fn verify_assignment(
         }
         _ => Err(Failure::Tile),
     }
+}
+
+/// Verifies a solution against `considered`, the receptions of its transmission the verifier
+/// holds, under `model` (crate docs, § Verifying a solution): the omission check runs over the
+/// considered set less the used set alone, so a reception outside the considered set is never
+/// judged. Phase 1 replaces `verify` and `verify_reach` with it.
+pub fn verify_fix(
+    sites: &crate::scope::Sites,
+    model: &crate::ClockModel,
+    solution: &tally_wire::Solution,
+    considered: &[Reception],
+) -> Result<(), Vec<Failure>> {
+    let _ = (sites, model, solution, considered);
+    todo!("phase 1")
+}
+
+/// Verifies a published trailing model against the raw it cites, rebuilt from what has arrived
+/// (`Arrived::rebuild`): `ModelFailure::Unjudged` when a cited batch has not. Phase 1 replaces
+/// `verify_model` with it.
+pub fn verify_trailing_model(
+    model: &crate::ClockModel,
+    arrived: &crate::arrived::Arrived,
+) -> Result<(), ModelFailure> {
+    let _ = (model, arrived);
+    todo!("phase 1")
 }

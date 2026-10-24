@@ -34,8 +34,9 @@ use crate::site::ReceiverSite;
 pub const MIN_VERSION: u16 = 2;
 /// Version 2 (RFC-0174 §2.2, §2.10): the network records (echo, delivery checks, the provider
 /// directory, sharing, credit, the products), compressed batches, the `Probe` role and 16-bit
-/// `Streams`. Version 3 ([`SITES_VERSION`]): receiver sites are relay-only.
-pub const MAX_VERSION: u16 = 3;
+/// `Streams`. Version 3 ([`SITES_VERSION`]): receiver sites are relay-only. Version 4
+/// ([`FIXES_VERSION`]): one MLAT fix class.
+pub const MAX_VERSION: u16 = 4;
 /// Version 3: "this peer keeps receiver sites off client links" (`crate::site`). A peer that
 /// negotiated it promises to send a site-bearing record ([`Record::carries_site`]: a
 /// `ReceiverSite`, a format 1 `ReceiverInfo`) only on a link [`carries_sites`] admits, and to send
@@ -48,6 +49,13 @@ pub const MAX_VERSION: u16 = 3;
 /// older version exists to carry anything.
 pub const SITES_VERSION: u16 = 3;
 const _: () = assert!(MAX_VERSION >= SITES_VERSION);
+/// Version 4: "MLAT in seconds" (RFC-0171 §3.8.1 as amended 2026-10-24). There is one kind of
+/// MLAT fix, positions formats 7 and 8 under the positions kind, so the provisional kind
+/// ([`KIND_PROVISIONAL`]) and the precise world product ([`KIND_WORLD_PRECISE`]) are retired, with
+/// their stream bits ([`Streams::RETIRED_FROM_FIXES`]): a session that negotiated it refuses them
+/// ([`Record::decode_at`]), and one below it reads them as before.
+pub const FIXES_VERSION: u16 = 4;
+const _: () = assert!(MAX_VERSION >= FIXES_VERSION && FIXES_VERSION > SITES_VERSION);
 
 /// The least version a session of `role` may agree (RFC-0171 §3.3): [`SITES_VERSION`] for a
 /// relay-role peer (a relay, a sharing member, an MLAT engine), which is sent sites; [`MIN_VERSION`]
@@ -133,6 +141,17 @@ pub const KIND_ANCHOR: u8 = 0x2a;
 
 /// Kinds this build knows were retired: read as `Record::Retired`, never written.
 pub const RETIRED_KINDS: [u8; 2] = [KIND_POSSESSION_QUERY, KIND_POSSESSION_ANSWER];
+
+/// Kinds retired from [`FIXES_VERSION`]: refused on a session that negotiated it or later, read
+/// as before below it. Their bytes are never reused.
+pub const RETIRED_FROM_FIXES: [u8; 2] = [KIND_PROVISIONAL, KIND_WORLD_PRECISE];
+
+/// Whether `kind` is retired on a session that negotiated `version`: a kind every version retired
+/// ([`RETIRED_KINDS`]), or one retired from [`FIXES_VERSION`] on a session of it or later.
+pub fn retired_at(version: u16, kind: u8) -> bool {
+    RETIRED_KINDS.contains(&kind)
+        || (version >= FIXES_VERSION && RETIRED_FROM_FIXES.contains(&kind))
+}
 
 /// Every kind this build reads and writes, in kind order: what a table over kinds is checked
 /// against, so a kind added here and nowhere else is a failing test.
@@ -280,6 +299,15 @@ impl Streams {
     /// that hosts or carries them signs them (`FeederFigures`), by the subscription's regions. Its
     /// own bit: raw is relay-only, so a client reads figures without asking for it.
     pub const FEEDER_FIGURES: Self = Self(256);
+    /// The bits retired from [`FIXES_VERSION`] ([`Streams::PROVISIONAL`] and
+    /// [`Streams::WORLD_PRECISE`]): reserved, never reused, and refused on a session of it.
+    pub const RETIRED_FROM_FIXES: Self = Self(Self::PROVISIONAL.0 | Self::WORLD_PRECISE.0);
+
+    /// Whether a session that negotiated `version` refuses these streams: it is of
+    /// [`FIXES_VERSION`] or later and they name a bit retired from it.
+    pub fn refused_at(self, version: u16) -> bool {
+        version >= FIXES_VERSION && self.0 & Self::RETIRED_FROM_FIXES.0 != 0
+    }
 
     pub fn contains(self, other: Self) -> bool {
         self.0 & other.0 == other.0
@@ -926,6 +954,32 @@ impl Record {
         Self::decode_knowing(bytes, Self::knows)
     }
 
+    /// As `decode`, on a session that negotiated `version`: from [`FIXES_VERSION`], a kind retired
+    /// from it ([`RETIRED_FROM_FIXES`]) and a `Subscribe` naming a stream retired from it
+    /// ([`Streams::refused_at`]) are refused, as a breach of the protocol; below it, exactly
+    /// `decode`.
+    pub fn decode_at(bytes: &[u8], version: u16) -> Result<(Option<Record>, usize), WireError> {
+        if let Some(&kind) = bytes.first()
+            && version >= FIXES_VERSION
+            && RETIRED_FROM_FIXES.contains(&kind)
+        {
+            return Err(WireError::Invalid {
+                field: "a kind retired at this wire version",
+                value: u64::from(kind),
+            });
+        }
+        let (record, used) = Self::decode(bytes)?;
+        if let Some(Record::Subscribe { streams, .. }) = &record
+            && streams.refused_at(version)
+        {
+            return Err(WireError::Invalid {
+                field: "a stream retired at this wire version",
+                value: u64::from(streams.0),
+            });
+        }
+        Ok((record, used))
+    }
+
     /// Whether this build reads `kind`: every kind it writes (`KINDS`), and the ones it knows
     /// were retired (`RETIRED_KINDS`).
     pub fn knows(kind: u8) -> bool {
@@ -1172,6 +1226,7 @@ impl<'a> Body<'a> {
 pub(crate) mod tests {
     use super::*;
     use crate::key::Identity;
+    use std::collections::BTreeSet;
 
     fn relay(port: u16) -> Result<RelayAddress, WireError> {
         Ok(RelayAddress {
@@ -1790,6 +1845,101 @@ pub(crate) mod tests {
         for record in every_record()?.iter().chain(&network_records()?) {
             assert!(!record.carries_site(), "{record:?}");
         }
+        Ok(())
+    }
+
+    /// A provisional record, which no list above holds: what a version 3 peer may still send.
+    fn provisional() -> Result<Record, WireError> {
+        let mut one = crate::positions::tests::solution([1; 32], &[1, 2, 3], 0)?;
+        one.addressed = Default::default();
+        let content = crate::positions::tests::solutions(0, vec![one]);
+        Ok(Record::Provisional(Positions::sign_provisional(
+            &Identity::from_seed([7; 32]),
+            &content,
+        )?))
+    }
+
+    #[test]
+    fn version_4_refuses_the_retired_kinds_and_version_3_reads_them_as_before()
+    -> Result<(), WireError> {
+        let mut records = every_record()?;
+        records.extend(network_records()?);
+        records.extend(site_records()?);
+        records.push(provisional()?);
+        let mut retired = BTreeSet::new();
+        for record in &records {
+            let mut bytes = Vec::new();
+            record.encode(&mut bytes)?;
+            let decoded = Record::decode(&bytes)?;
+            for version in MIN_VERSION..FIXES_VERSION {
+                assert_eq!(Record::decode_at(&bytes, version)?, decoded, "{record:?}");
+                assert!(!retired_at(version, record.kind()));
+            }
+            if RETIRED_FROM_FIXES.contains(&record.kind()) {
+                retired.insert(record.kind());
+                assert!(retired_at(FIXES_VERSION, record.kind()));
+                assert!(matches!(
+                    Record::decode_at(&bytes, FIXES_VERSION),
+                    Err(WireError::Invalid {
+                        field: "a kind retired at this wire version",
+                        ..
+                    })
+                ));
+            } else if !matches!(record, Record::Subscribe { streams, .. } if streams.refused_at(FIXES_VERSION))
+            {
+                assert_eq!(Record::decode_at(&bytes, FIXES_VERSION)?, decoded);
+            }
+        }
+        // Both retired kinds were tried; the possession check's stay retired at every version.
+        assert_eq!(retired.into_iter().collect::<Vec<_>>(), RETIRED_FROM_FIXES);
+        for kind in RETIRED_KINDS {
+            assert!(retired_at(MIN_VERSION, kind) && retired_at(FIXES_VERSION, kind));
+        }
+        assert!(RETIRED_FROM_FIXES.iter().all(|kind| KINDS.contains(kind)));
+        Ok(())
+    }
+
+    #[test]
+    fn version_4_refuses_a_subscription_to_a_retired_stream() -> Result<(), WireError> {
+        for (streams, refused) in [
+            (Streams::PROVISIONAL, true),
+            (Streams::WORLD_PRECISE, true),
+            (Streams::POSITIONS.with(Streams::PROVISIONAL), true),
+            (
+                Streams::RAW.with(Streams::POSITIONS).with(Streams::WORLD),
+                false,
+            ),
+            (Streams::CLOCK_MODELS.with(Streams::FEEDER_FIGURES), false),
+        ] {
+            assert_eq!(streams.refused_at(FIXES_VERSION), refused, "{streams:?}");
+            assert!(!streams.refused_at(FIXES_VERSION - 1), "{streams:?}");
+            let record = Record::Subscribe {
+                streams,
+                regions: Vec::new(),
+            };
+            let mut bytes = Vec::new();
+            record.encode(&mut bytes)?;
+            assert_eq!(
+                Record::decode_at(&bytes, FIXES_VERSION - 1)?.0,
+                Some(record.clone())
+            );
+            let at_4 = Record::decode_at(&bytes, FIXES_VERSION);
+            if refused {
+                assert!(matches!(
+                    at_4,
+                    Err(WireError::Invalid {
+                        field: "a stream retired at this wire version",
+                        ..
+                    })
+                ));
+            } else {
+                assert_eq!(at_4?.0, Some(record));
+            }
+        }
+        assert_eq!(
+            Streams::RETIRED_FROM_FIXES,
+            Streams::PROVISIONAL.with(Streams::WORLD_PRECISE)
+        );
         Ok(())
     }
 

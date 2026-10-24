@@ -1950,6 +1950,17 @@ pub fn fit(inputs: &Inputs) -> Result<ClockModel, FitError> {
     fit_with_gauge(inputs, None)
 }
 
+/// Fits the clock model of `inputs` at its trailing edge (crate docs, § The clock model), warm
+/// started from `warm` (the tile's previous model, shifted to the new edge) when given. Phase 1
+/// replaces `fit`, `fit_calibrated` and `fit_with_gauge` with it.
+pub fn fit_trailing(
+    inputs: &crate::scope::TrailingInputs,
+    warm: Option<&ClockModel>,
+) -> Result<ClockModel, FitError> {
+    let _ = (inputs, warm);
+    todo!("phase 1")
+}
+
 /// Fits the clock model of `inputs` and calibrates it in one: the fit's own read of the inputs,
 /// and one factorisation at the published (rounded) estimate, kept with its selected inverse.
 /// What `calibrate` of the published model would give, without reading the inputs again; an

@@ -83,8 +83,9 @@ impl Tolerance {
             // About 1 m of latitude, 1 m of altitude, 3 m of light travel, 0.1% of a variance.
             // Version 5 changed what is derived (a gauge's origin, the sync messages kept), not
             // how far two implementations' floating point may differ; version 6 only how a model
-            // names its scope's sites (by site id), not any number solved.
-            1..=6 => Some(Self {
+            // names its scope's sites (by site id), not any number solved; version 7 the
+            // trailing window a model is fitted over and the frontier it cites, not how precisely.
+            1..=7 => Some(Self {
                 position_e7: 10,
                 alt_mm: 1_000,
                 transmit_ns: 10,

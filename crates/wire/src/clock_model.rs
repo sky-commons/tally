@@ -463,6 +463,106 @@ crate::signed::signed_record!(
     MAX_BODY
 );
 
+/// The client model's format of a trailing-window model (RFC-0171 §3.8.1 as amended 2026-10-24):
+/// format 1's fields with the window as the model's trailing edge and span in place of its bins.
+pub const CLIENT_TRAILING_MODEL_FORMAT: u8 = 2;
+
+/// What a format 2 client model says: format 1's fields (`ClientClockModelContent`), the window a
+/// trailing one, fitted over the sync raw signed in `[edge_ms - span_ms, edge_ms]`. Still nothing
+/// of the scope: the model's per-member frontier (which batches of each member it fitted) is in
+/// the relay-only full model, as its sites are.
+///
+/// ```text
+/// format u8 = 2 | engine key [32] | boot_id u64 | sequence u64 | issued_ms u64
+/// | spec_version u16 | model id [32] | inputs [32] | edge_ms u64 | span_ms u32
+/// | signature [64]
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClientTrailingModelContent {
+    pub boot_id: u64,
+    pub sequence: u64,
+    pub issued_ms: u64,
+    pub spec_version: u16,
+    /// The full model's `ClockModel::id`: what a fix's `model` names.
+    pub model: Hash,
+    /// The full model's `Manifest::inputs`.
+    pub inputs: Hash,
+    /// The window's trailing edge, Unix milliseconds by the signed wall clocks of its sync raw.
+    pub edge_ms: u64,
+    /// How far before the edge the window begins (`budget::TRAILING_WINDOW_MS`).
+    pub span_ms: u32,
+}
+
+/// A format 2 client model's bytes, signature included: it is of one size.
+pub const CLIENT_TRAILING_MODEL_LEN: usize =
+    1 + KEY_LEN + 8 + 8 + 8 + 2 + 32 + 32 + 8 + 4 + SIGNATURE_LEN;
+
+impl crate::signed::Check for ClientTrailingModelContent {
+    /// A window of some span that begins no earlier than the epoch.
+    fn check(&self) -> Result<(), WireError> {
+        if self.span_ms == 0 || u64::from(self.span_ms) > self.edge_ms {
+            return Err(WireError::Invalid {
+                field: "client clock model trailing window",
+                value: u64::from(self.span_ms),
+            });
+        }
+        Ok(())
+    }
+}
+
+impl crate::signed::Fields for ClientTrailingModelContent {
+    fn write(model: crate::signed::Checked<'_, Self>, out: &mut Vec<u8>) -> Result<(), WireError> {
+        out.extend_from_slice(&model.boot_id.to_be_bytes());
+        out.extend_from_slice(&model.sequence.to_be_bytes());
+        out.extend_from_slice(&model.issued_ms.to_be_bytes());
+        out.extend_from_slice(&model.spec_version.to_be_bytes());
+        out.extend_from_slice(&model.model);
+        out.extend_from_slice(&model.inputs);
+        out.extend_from_slice(&model.edge_ms.to_be_bytes());
+        out.extend_from_slice(&model.span_ms.to_be_bytes());
+        Ok(())
+    }
+
+    fn read(reader: &mut Body<'_>) -> Result<crate::signed::Unchecked<Self>, WireError> {
+        Ok(crate::signed::Unchecked::new(Self {
+            boot_id: reader.u64()?,
+            sequence: reader.u64()?,
+            issued_ms: reader.u64()?,
+            spec_version: reader.u16()?,
+            model: reader.array()?,
+            inputs: reader.array()?,
+            edge_ms: reader.u64()?,
+            span_ms: reader.u32()?,
+        }))
+    }
+}
+
+impl ClientClockModel {
+    /// Signs a format 2 client model, under the same domain and record kind as format 1: a
+    /// reader tells them apart by the format byte.
+    pub fn sign_trailing(
+        identity: &impl Signs,
+        content: &ClientTrailingModelContent,
+    ) -> Result<Self, WireError> {
+        let mut body = Vec::new();
+        crate::signed::Fields::encode(content, &mut body)?;
+        crate::signed::Signed::sign(
+            Self::DOMAIN,
+            CLIENT_TRAILING_MODEL_FORMAT,
+            identity,
+            &body,
+            Self::MAX_LEN,
+        )
+        .map(Self)
+    }
+
+    /// The content of a format 2 client model (`content` reads format 1).
+    pub fn trailing_content(&self) -> Result<ClientTrailingModelContent, WireError> {
+        let mut body = self.0.body(CLIENT_TRAILING_MODEL_FORMAT)?;
+        <ClientTrailingModelContent as crate::signed::Fields>::decode(&mut body)
+    }
+}
+
 fn id_of(signed: &[u8]) -> Hash {
     Blake2s256::digest(domain(CLOCK_MODEL_ID_DOMAIN, signed)).into()
 }
@@ -858,6 +958,60 @@ mod tests {
             ..content
         };
         assert!(ClientClockModel::sign(&engine, &inverted).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn a_trailing_client_model_round_trips_beside_format_1() -> Result<(), WireError> {
+        let engine = Identity::generate()?;
+        let content = ClientTrailingModelContent {
+            boot_id: 1,
+            sequence: 2,
+            issued_ms: 3,
+            spec_version: 7,
+            model: [4; 32],
+            inputs: [5; 32],
+            edge_ms: 1_791_220_000_000,
+            span_ms: 20_000,
+        };
+        let signed = ClientClockModel::sign_trailing(&engine, &content)?;
+        let back = ClientClockModel::from_bytes(signed.as_bytes().to_vec())?;
+        back.verify()?;
+        assert_eq!(back.format(), CLIENT_TRAILING_MODEL_FORMAT);
+        assert_eq!(back.trailing_content()?, content);
+        assert_eq!(back.as_bytes().len(), CLIENT_TRAILING_MODEL_LEN);
+        // Each format reads only itself.
+        assert!(back.content().is_err());
+        let first = ClientClockModel::sign(
+            &engine,
+            &ClientClockModelContent {
+                boot_id: 1,
+                sequence: 2,
+                issued_ms: 3,
+                spec_version: 6,
+                model: [4; 32],
+                inputs: [5; 32],
+                window_first: 0,
+                window_last: 1,
+            },
+        )?;
+        assert!(first.trailing_content().is_err());
+        // Under the client model's kind, as format 1.
+        let mut bytes = Vec::new();
+        Record::ClientClockModel(signed.clone()).encode(&mut bytes)?;
+        assert_eq!(
+            Record::decode(&bytes)?.0,
+            Some(Record::ClientClockModel(signed))
+        );
+        // A window of no span, or one beginning before the epoch: refused.
+        for (edge_ms, span_ms) in [(5, 0), (5, 6)] {
+            let bad = ClientTrailingModelContent {
+                edge_ms,
+                span_ms,
+                ..content.clone()
+            };
+            assert!(ClientClockModel::sign_trailing(&engine, &bad).is_err());
+        }
         Ok(())
     }
 

@@ -173,6 +173,72 @@ impl Inputs {
     }
 }
 
+/// The trailing window a model is fitted over, milliseconds of signed wall clock (`W`).
+// phase 0: from tally_wire::budget::TRAILING_WINDOW_MS (placeholder until the sweep picks `W`).
+pub(crate) const TRAILING_WINDOW_MS: u64 = 20_000;
+
+/// The span of signed wall clock a tile's model is fitted over: `[edge - span, edge]`, both ends
+/// included, solved at its trailing edge (the newest wall clock it covers).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Trailing {
+    pub edge_ms: u64,
+    pub span_ms: u32,
+}
+
+impl Trailing {
+    /// The specification's trailing window ending at `edge_ms`.
+    pub fn at(edge_ms: u64) -> Self {
+        Self {
+            edge_ms,
+            span_ms: u32::try_from(TRAILING_WINDOW_MS).unwrap_or(u32::MAX),
+        }
+    }
+
+    /// The oldest wall clock the window holds.
+    pub fn first_ms(&self) -> u64 {
+        self.edge_ms.saturating_sub(u64::from(self.span_ms))
+    }
+
+    /// Whether `wall_ms` lies in `[first_ms, edge_ms]`.
+    pub fn holds(&self, wall_ms: u64) -> bool {
+        wall_ms >= self.first_ms() && wall_ms <= self.edge_ms
+    }
+}
+
+/// How far one member's raw a model cites reaches: every batch of the member's boot `boot_id`
+/// with a sequence at or below `through_sequence` (a contiguous run, as the engine cites only
+/// one). A verifier missing a batch at or below it cannot judge the model, and says so.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Frontier {
+    pub receiver: PublicKey,
+    pub boot_id: u64,
+    pub through_sequence: u64,
+}
+
+/// What one tile's clock model at one trailing edge is a function of: the threshold-selected sync
+/// receptions of its members with a wall clock in the window, from the batches at or below each
+/// member's frontier, which is what had arrived when it was fitted.
+// phase 0: renamed to `Inputs` in phase 1, when the windowed `Inputs` above is deleted.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TrailingInputs {
+    pub tile: Tile,
+    pub trailing: Trailing,
+    /// The tile's members, by their signed site records alone, sorted by key.
+    pub scope: Vec<Site>,
+    /// Each member's frontier, sorted by key.
+    pub frontier: Vec<Frontier>,
+    /// The sync material, sorted by identity.
+    pub sync: Vec<Reception>,
+    pub citation: Citation,
+}
+
+impl TrailingInputs {
+    /// The members' keys, sorted.
+    pub fn keys(&self) -> Vec<PublicKey> {
+        self.scope.iter().map(|site| site.receiver).collect()
+    }
+}
+
 /// The receivers that may take part, each with its millimetre site: one per receiver, usable
 /// (a receiver described twice, or unusable, takes no part).
 #[derive(Clone, Debug, Default)]

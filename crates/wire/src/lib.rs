@@ -56,8 +56,9 @@ pub use client::{
     ClientEvidence, ClientFaultProof, ClientRecord, PublicReceiverInfo, TaggedPositions,
 };
 pub use clock_model::{
-    Assembler, CLIENT_MODEL_LEN, ClientClockModel, ClientClockModelContent, ClockModel,
-    ClockModelContent, ClockModelPart, Manifest, SignedClockModel,
+    Assembler, CLIENT_MODEL_LEN, CLIENT_TRAILING_MODEL_LEN, ClientClockModel,
+    ClientClockModelContent, ClientTrailingModelContent, ClockModel, ClockModelContent,
+    ClockModelPart, Manifest, SignedClockModel,
 };
 pub use credit::{
     EVIDENCE_FORMAT_REFERENCED, Evidence, EvidenceBundle, EvidenceBundleContent, FeederReference,
@@ -83,8 +84,9 @@ pub use observation_set::{
     Citations, ObservationIdentity, ObservationSet, Reception, Relation, TaggedSet,
 };
 pub use positions::{
-    AddressedCitation, EnuCovariance, Observed, Positions, Solution, SolutionsContent,
-    TaggedSolution, TaggedSolutionsContent, TransmitTime,
+    AddressedCitation, EnuCovariance, Fix, FixSets, FixesContent, Members, Observed, Positions,
+    Solution, SolutionsContent, TaggedFix, TaggedFixesContent, TaggedSolution,
+    TaggedSolutionsContent, TransmitTime,
 };
 pub use probe::{Echo, EchoReply, EchoReplyContent, Headroom};
 pub use products::{
