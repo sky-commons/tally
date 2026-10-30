@@ -17,31 +17,71 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use tally_wire::batch::Hash;
+use tally_wire::budget::policy;
+use tally_wire::clocks::{Mono, Span};
 use tally_wire::{Decoded, ObsRef, PublicKey, Region};
 
 use crate::budget::Charge;
 use crate::exchange::{Frozen, Parts};
 use crate::ingest::Stamp;
 
-/// An epoch: one `EPOCH_MS` of the ingest clock.
-pub type Epoch = u64;
-
 /// How long an epoch is: the regional product's once a second.
 pub const EPOCH_MS: u64 = crate::products::REGIONAL_EVERY_MS;
+
+/// [`EPOCH_MS`] on the monotonic clock, what an epoch's start is stepped by to its end.
+const EPOCH: Span<Mono> = policy::<Mono, EPOCH_MS>();
 
 /// Epochs whose decoded batches the relay holds between ingest and the products, at most: the one
 /// open, the one closing (open until the slowest producer's tick passes it), and the one the sealer
 /// is working on. Past what they are budgeted (`budget::Store::Epochs`) an epoch is refused whole.
 pub const EPOCHS_HELD: u64 = 3;
 
-/// The epoch a stamp falls in.
-pub fn epoch_of(stamp: Stamp) -> Epoch {
-    epoch_of_ms(stamp.stamp_ms)
+/// An epoch: one [`EPOCH_MS`] cell of the monotonic clock's own grid, named by the reading at its
+/// start. Made only from a reading ([`Epoch::of`]: a stamp's, a watermark's, floored to the grid)
+/// and stepped by a span of [`EPOCH_MS`] ([`Epoch::next`]), so its start and end are readings of
+/// `M` and never a number made into one: what an epoch is signed at is the judging clock carried
+/// to its end (`Moment::at`). Counted from one to another ([`Epoch::after`]) and stated
+/// ([`Epoch::number`]) as numbers, which never become one again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Epoch(Mono);
+
+impl Epoch {
+    /// The epoch the reading `at` falls in.
+    pub fn of(at: Mono) -> Self {
+        Self(at.floor(EPOCH))
+    }
+
+    /// Its start on the monotonic clock.
+    pub const fn start(self) -> Mono {
+        self.0
+    }
+
+    /// Its end on the monotonic clock, the first reading after it: the watermark at which it is
+    /// closed.
+    pub fn end(self) -> Mono {
+        self.0.later(EPOCH)
+    }
+
+    /// The epoch after it.
+    #[must_use]
+    pub fn next(self) -> Self {
+        Self(self.end())
+    }
+
+    /// How many epochs it is after `earlier`: none when it is not later.
+    pub fn after(self, earlier: Self) -> u64 {
+        self.0.since(earlier.0).ms() / EPOCH_MS
+    }
+
+    /// Its number on the grid (its start over [`EPOCH_MS`]), to be stated.
+    pub const fn number(self) -> u64 {
+        self.0.ms() / EPOCH_MS
+    }
 }
 
-/// The epoch a stamp's milliseconds fall in.
-pub fn epoch_of_ms(stamp_ms: u64) -> Epoch {
-    stamp_ms / EPOCH_MS
+/// The epoch a stamp falls in.
+pub fn epoch_of(stamp: Stamp) -> Epoch {
+    Epoch::of(stamp.mono())
 }
 
 /// The canonical order of batches: by stamp, then by the batch itself (its receiver, boot and
@@ -50,10 +90,10 @@ pub fn epoch_of_ms(stamp_ms: u64) -> Epoch {
 /// workers are ordered the same however the workers raced, so which copy of a message is kept (and
 /// so the stream's and the regional product's bytes) follows the stamps and the batches alone.
 ///
-/// The hash is what makes the order total. Admission keeps receiver, boot and sequence unique only
-/// while it remembers the boot (`hub::BOOTS_PER_AUTHOR`); once it forgets an old one, a second, different
-/// batch under the same three can be admitted in the same millisecond, and only the hash (which
-/// admission already holds, `Batch::hash` computed once) orders the two without the insertion order.
+/// The hash is what makes the order total. Admission keeps batches unique by their hash alone
+/// (`strikes`), never by receiver, boot and sequence: two different batches under the same three can
+/// be admitted in the same millisecond, and only the hash (which admission already holds,
+/// `Batch::hash` computed once) orders the two without the insertion order.
 /// It is the key's last field, so it orders only batches whose other fields are equal: any two
 /// batches it did not tie before keep the order they had.
 pub fn canonical(decoded: &Decoded) -> (u64, PublicKey, u64, u64, Hash) {
@@ -66,17 +106,11 @@ pub fn canonical(decoded: &Decoded) -> (u64, PublicKey, u64, u64, Hash) {
     )
 }
 
-/// The first stamp after epoch `epoch`: the watermark at which it is closed.
-pub fn end_of(epoch: Epoch) -> u64 {
-    (epoch + 1) * EPOCH_MS
-}
-
 /// Which epochs a shard has closed: each closes once, in order, when the watermark has passed it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Closer {
-    /// Epochs before this are closed.
-    open_from: Epoch,
-    started: bool,
+    /// Epochs before this are closed; none before the first watermark.
+    open_from: Option<Epoch>,
 }
 
 impl Closer {
@@ -85,22 +119,21 @@ impl Closer {
     /// shard holds anything of: a shard starts with nothing before either.
     pub fn advance(
         &mut self,
-        watermark: Stamp,
+        watermark: Mono,
         oldest_open: Option<Epoch>,
     ) -> std::ops::Range<Epoch> {
-        let current = epoch_of(watermark);
-        if !self.started {
-            self.started = true;
-            self.open_from = oldest_open.map_or(current, |oldest| oldest.min(current));
-        }
-        let closing = self.open_from..current.max(self.open_from);
-        self.open_from = closing.end;
+        let current = Epoch::of(watermark);
+        let open_from = self
+            .open_from
+            .unwrap_or_else(|| oldest_open.map_or(current, |oldest| oldest.min(current)));
+        let closing = open_from..current.max(open_from);
+        self.open_from = Some(closing.end);
         closing
     }
 
     /// Whether `epoch` has closed: a slice for it now is late.
     pub fn closed(&self, epoch: Epoch) -> bool {
-        self.started && epoch < self.open_from
+        self.open_from.is_some_and(|open_from| epoch < open_from)
     }
 }
 
@@ -123,7 +156,7 @@ impl Kept {
 }
 
 /// One epoch merged across every message thread.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Merged {
     pub epoch: Epoch,
     /// No copy of it is kept: a part was lost (a sealer behind), so all of it is refused.
@@ -134,6 +167,37 @@ pub struct Merged {
     pub regional: BTreeMap<u64, (Region, Vec<Kept>)>,
     /// What its batches are charged, released when the epoch is let go.
     pub charges: Vec<Charge>,
+    /// The newest tick of its parts (`exchange::Frozen::judged`): what it is signed by.
+    pub judged: Option<Stamp>,
+}
+
+impl Merged {
+    /// Epoch `epoch` with nothing merged yet.
+    pub fn of(epoch: Epoch) -> Self {
+        Self {
+            epoch,
+            refused: false,
+            stream: Vec::new(),
+            regional: BTreeMap::new(),
+            charges: Vec::new(),
+            judged: None,
+        }
+    }
+
+    /// The judging clock at this epoch's end ([`Epoch::end`]), by its newest tick's two readings: the
+    /// time its products are signed at. None when that tick was stamped while the relay's clock
+    /// did not judge: nothing is signed from a stamp taken then (RFC-0171 §3.6).
+    pub fn signed_ms(&self) -> Option<u64> {
+        self.signed_at().map(|at| at.judged().ms())
+    }
+
+    /// As [`Merged::signed_ms`], the stamp at the epoch's end: its products' fixes are offered to
+    /// the world by it.
+    pub fn signed_at(&self) -> Option<Stamp> {
+        self.judged
+            .filter(|judged| judged.judging())
+            .map(|judged| judged.at_mono(self.epoch.end()))
+    }
 }
 
 impl Merged {
@@ -163,8 +227,8 @@ pub struct Coordinator {
     expected: Vec<u64>,
     /// Per thread, the epochs a part of it that was lost may have been for.
     lost: Vec<(usize, std::ops::Range<Epoch>)>,
-    /// Every epoch before this has been handed on.
-    next: Epoch,
+    /// Every epoch before this has been handed on; none before the first is.
+    next: Option<Epoch>,
 }
 
 /// One epoch's parts as they come: let go whole (`exchange::Parts`), every part's batches before
@@ -185,8 +249,13 @@ pub struct Ready {
     /// Receptions a thread let go since its last word, their epoch closed before they came
     /// (`exchange::Frozen::late`).
     pub late: u64,
+    /// Receptions a thread let go since its last word, their epoch past the window
+    /// (`exchange::Frozen::past`).
+    pub past: u64,
     /// Every epoch before this is closed on every thread.
     pub watermark: Option<Epoch>,
+    /// The thread's newest tick (`exchange::Frozen::judged`): what the watermark is signed by.
+    pub judged: Option<Stamp>,
 }
 
 impl Coordinator {
@@ -196,26 +265,28 @@ impl Coordinator {
             closed: vec![None; threads.max(1)],
             expected: vec![0; threads.max(1)],
             lost: Vec::new(),
-            next: 0,
+            next: None,
         }
     }
 
     /// One thread's word: the epochs it completes, merged or refused, oldest first, and the
     /// watermark every thread has closed to (every epoch before it is done).
     pub fn take(&mut self, frozen: Frozen) -> Ready {
-        let frozen_late = frozen.late;
+        let (frozen_late, frozen_past, judged) = (frozen.late, frozen.past, frozen.judged);
         let thread = frozen.thread.min(self.closed.len() - 1);
         let mut parts_lost = 0;
         if frozen.seq > self.expected[thread] {
             parts_lost = frozen.seq - self.expected[thread];
             // Lost on the way: each was for an epoch from the thread's last word to this one
             // (from its first, the oldest epoch anyone has a part of).
-            let until = frozen.epoch.unwrap_or(frozen.closed_before);
+            let until = frozen.epoch.or(frozen.closed_before);
             let since = self.closed[thread]
                 .or_else(|| self.pending.keys().next().copied())
-                .unwrap_or(until)
+                .or(until)
                 .max(self.next);
-            if since < until {
+            if let (Some(since), Some(until)) = (since, until)
+                && since < until
+            {
                 self.lost.push((thread, since..until));
             }
         }
@@ -223,9 +294,9 @@ impl Coordinator {
         if frozen.epoch.is_some() {
             self.expected[thread] = frozen.seq + 1;
         }
-        self.closed[thread] = Some(frozen.closed_before.max(self.closed[thread].unwrap_or(0)));
+        self.closed[thread] = self.closed[thread].max(frozen.closed_before);
         if let Some(epoch) = frozen.epoch
-            && epoch >= self.next
+            && self.next.is_none_or(|next| epoch >= next)
         {
             let gathering = self.pending.entry(epoch).or_default();
             gathering.refused |= frozen.refused;
@@ -236,7 +307,9 @@ impl Coordinator {
             merged,
             parts_lost,
             late: frozen_late,
+            past: frozen_past,
             watermark,
+            judged,
         }
     }
 
@@ -264,16 +337,15 @@ impl Coordinator {
             if gathering.refused || lost {
                 // Its parts, and what they are charged, are let go here.
                 out.push(Merged {
-                    epoch,
                     refused: true,
-                    ..Merged::default()
+                    ..Merged::of(epoch)
                 });
             } else {
                 out.push(merge(epoch, gathering.parts.into_vec()));
             }
         }
-        self.next = self.next.max(watermark);
-        let next = self.next;
+        let next = self.next.map_or(watermark, |next| next.max(watermark));
+        self.next = Some(next);
         self.lost.retain(|(_, lost)| lost.end > next);
         (out, Some(watermark))
     }
@@ -281,11 +353,9 @@ impl Coordinator {
 
 /// Every thread's part of one epoch as one: each list in canonical order.
 pub fn merge(epoch: Epoch, parts: Vec<Frozen>) -> Merged {
-    let mut merged = Merged {
-        epoch,
-        ..Merged::default()
-    };
+    let mut merged = Merged::of(epoch);
     for mut part in parts {
+        merged.judged = merged.judged.max(part.judged);
         merged.charges.push(std::mem::take(&mut part.charge));
         let copy = |at: u32, index: u32| Kept {
             decoded: Arc::clone(&part.batches[at as usize]),
@@ -312,48 +382,70 @@ pub fn merge(epoch: Epoch, parts: Vec<Frozen>) -> Merged {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::disallowed_methods, reason = "a test's scripted readings")]
     use super::*;
 
-    fn at(stamp_ms: u64) -> Stamp {
-        Stamp {
-            stamp_ms,
-            ingest_seq: 0,
-        }
+    fn at(stamp_ms: u64) -> Mono {
+        tally_wire::clocks::recorded::mono(stamp_ms)
+    }
+
+    /// Epoch number `number`.
+    pub(crate) fn epoch(number: u64) -> Epoch {
+        Epoch::of(at(number * EPOCH_MS))
     }
 
     #[test]
     fn each_epoch_closes_once_in_order_when_the_watermark_passes_it() {
         let mut closer = Closer::default();
-        assert_eq!(closer.advance(at(5_500), None), 5..5);
-        assert_eq!(closer.advance(at(5_999), None), 5..5);
-        assert_eq!(closer.advance(at(6_000), None), 5..6);
-        assert_eq!(closer.advance(at(9_100), None), 6..9);
-        assert_eq!(closer.advance(at(8_000), None), 9..9);
+        assert_eq!(closer.advance(at(5_500), None), epoch(5)..epoch(5));
+        assert_eq!(closer.advance(at(5_999), None), epoch(5)..epoch(5));
+        assert_eq!(closer.advance(at(6_000), None), epoch(5)..epoch(6));
+        assert_eq!(closer.advance(at(9_100), None), epoch(6)..epoch(9));
+        assert_eq!(closer.advance(at(8_000), None), epoch(9)..epoch(9));
         // A shard that holds an older epoch than its first watermark starts there.
         let mut closer = Closer::default();
-        assert_eq!(closer.advance(at(7_200), Some(4)), 4..7);
+        assert_eq!(
+            closer.advance(at(7_200), Some(epoch(4))),
+            epoch(4)..epoch(7)
+        );
     }
 
-    fn part(epoch: Epoch, thread: usize, seq: u64) -> Frozen {
+    /// An epoch is a cell of the monotonic grid: its start the reading floored, its end and the
+    /// next one step later, counted between and stated by number.
+    #[test]
+    fn an_epoch_is_a_reading_floored_to_the_grid_and_stepped_by_its_span() {
+        let five = Epoch::of(at(5_999));
+        assert_eq!(five.start(), at(5_000));
+        assert_eq!(five.end(), at(6_000));
+        assert_eq!(five.next(), Epoch::of(at(6_000)));
+        assert_eq!(five.number(), 5);
+        assert_eq!(epoch(9).after(five), 4);
+        assert_eq!(five.after(epoch(9)), 0);
+    }
+
+    fn part(number: u64, thread: usize, seq: u64) -> Frozen {
         Frozen {
             thread,
             seq,
-            epoch: Some(epoch),
-            closed_before: epoch + 1,
+            epoch: Some(epoch(number)),
+            closed_before: Some(epoch(number + 1)),
             ..Frozen::default()
         }
     }
 
-    fn epochs(done: Ready) -> Vec<(Epoch, bool)> {
-        done.merged.iter().map(|m| (m.epoch, m.refused)).collect()
+    fn epochs(done: Ready) -> Vec<(u64, bool)> {
+        done.merged
+            .iter()
+            .map(|m| (m.epoch.number(), m.refused))
+            .collect()
     }
 
-    fn marker(thread: usize, seq: u64, closed_before: Epoch) -> Frozen {
+    fn marker(thread: usize, seq: u64, closed_before: u64) -> Frozen {
         Frozen {
             thread,
             seq,
             epoch: None,
-            closed_before,
+            closed_before: Some(epoch(closed_before)),
             ..Frozen::default()
         }
     }
@@ -373,7 +465,7 @@ mod tests {
         assert!(epochs(coordinator.take(part(9, 0, 3))).is_empty());
         let ready = coordinator.take(marker(1, 3, 1_000_000_000));
         assert_eq!(ready.parts_lost, 0);
-        assert_eq!(ready.watermark, Some(10));
+        assert_eq!(ready.watermark, Some(epoch(10)));
         assert_eq!(epochs(ready), vec![(9, false)]);
     }
 
@@ -410,16 +502,17 @@ mod tests {
                 data: vec![0x5d, 1, 2, 3, 4, 5, 6],
             }],
         };
-        let batch = tally_wire::Batch::sign(receiver, &content).map_err(|e| e.to_string())?;
-        Decoded::from_verified(batch, stamp_ms, 0).map_err(|e| e.error.to_string())
+        let batch = crate::anchors::anchored(receiver, &content).map_err(|e| e.to_string())?;
+        Decoded::from_verified(batch, tally_wire::clocks::recorded::aligned(stamp_ms), 0)
+            .map_err(|e| e.error.to_string())
     }
 
     /// One thread's part of epoch 0 holding `batches`, each one reception kept.
     fn holding(thread: usize, batches: Vec<Arc<Decoded>>) -> Frozen {
         Frozen {
             thread,
-            epoch: Some(0),
-            closed_before: 1,
+            epoch: Some(epoch(0)),
+            closed_before: Some(epoch(1)),
             stream: (0..batches.len() as u32).map(|at| (at, 0)).collect(),
             batches,
             ..Frozen::default()
@@ -445,14 +538,14 @@ mod tests {
         let b = decoded(&receiver, 500, 4, 2)?;
         assert_ne!(a.batch().hash(), b.batch().hash());
         let one = merge(
-            0,
+            epoch(0),
             vec![
                 holding(0, vec![Arc::clone(&a)]),
                 holding(1, vec![Arc::clone(&b)]),
             ],
         );
         let other = merge(
-            0,
+            epoch(0),
             vec![
                 holding(1, vec![Arc::clone(&b)]),
                 holding(0, vec![Arc::clone(&a)]),
@@ -482,7 +575,7 @@ mod tests {
                 vec![holding(0, vec![Arc::clone(&first), Arc::clone(&second)])],
                 vec![holding(0, vec![Arc::clone(&second), Arc::clone(&first)])],
             ] {
-                assert_eq!(order(&merge(0, parts)), expected);
+                assert_eq!(order(&merge(epoch(0), parts)), expected);
             }
         }
         Ok(())

@@ -1,5 +1,9 @@
 //! `tally-feed`: the feeder's command line (RFC-0171 §3.5).
 
+// No `unsafe` here, forbidden, so no module of the binary can allow it: what calls libc is the
+// library's, in its one module that allows it.
+#![forbid(unsafe_code)]
+
 use tally_feed::config::{self, Command};
 use tally_feed::{health, privilege};
 

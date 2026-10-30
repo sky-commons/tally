@@ -511,35 +511,19 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Idle<S> {
 /// descriptors before its caps turned anyone away, and stop accepting on every port.
 pub fn raise_open_files(needed: usize) -> Result<u64, String> {
     let needed = u64::try_from(needed).unwrap_or(u64::MAX);
-    let mut limit = libc::rlimit {
-        rlim_cur: 0,
-        rlim_max: 0,
-    };
-    // SAFETY: `limit` is a valid rlimit for the call to fill.
-    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+    let (soft, hard) =
+        crate::os::open_files_limit().map_err(|error| format!("the open-file limit: {error}"))?;
+    if soft >= needed {
+        return Ok(soft);
+    }
+    if hard < needed {
         return Err(format!(
-            "the open-file limit: {}",
-            io::Error::last_os_error()
+            "its connection caps need {needed} open files and its hard limit is {hard} (raise \
+             LimitNOFILE, or lower --max-connections, --max-subscribers or --memory)"
         ));
     }
-    if limit.rlim_cur >= needed {
-        return Ok(limit.rlim_cur);
-    }
-    if limit.rlim_max < needed {
-        return Err(format!(
-            "its connection caps need {needed} open files and its hard limit is {} (raise \
-             LimitNOFILE, or lower --max-connections, --max-subscribers or --memory)",
-            limit.rlim_max
-        ));
-    }
-    limit.rlim_cur = needed;
-    // SAFETY: `limit` is a valid rlimit, its soft limit within its hard one.
-    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) } != 0 {
-        return Err(format!(
-            "raising the open-file limit to {needed}: {}",
-            io::Error::last_os_error()
-        ));
-    }
+    crate::os::set_open_files_limit(needed, hard)
+        .map_err(|error| format!("raising the open-file limit to {needed}: {error}"))?;
     Ok(needed)
 }
 

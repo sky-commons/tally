@@ -137,6 +137,15 @@ impl Bundles {
     }
 }
 
+/// The bundle indexes a second a relay taking `regions` signs at the most
+/// (`Sharing::bundle_indexes`): one for each parent it may offer of them (complete of the regions
+/// alone, held bundles aside) and each shared product, each second. A parent with nothing
+/// originated under it that second has none, so this is the most, never the usual.
+pub fn planned_indexes_per_sec(regions: &[Region]) -> u64 {
+    let offerable = offerable(&Taken::of(regions.to_vec()), &BTreeSet::new());
+    (offerable.len() * super::SHARED_PRODUCTS.len()) as u64
+}
+
 /// Every cell coarser than an area, above an area gathered, that is complete: the regions taken
 /// coarser than an area, their ancestors and their descendants down to just above the areas, and
 /// the ancestors of the rest, each checked. Computed from the regions, never from their areas.

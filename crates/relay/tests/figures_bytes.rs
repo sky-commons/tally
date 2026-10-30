@@ -3,43 +3,14 @@
 //! must cover what a row at every cap really allocates. Measured by an allocator that counts every
 //! byte asked of it, the only test in this binary so nothing else allocates while it measures.
 
-use std::alloc::{GlobalAlloc, Layout, System};
-use std::sync::atomic::{AtomicIsize, Ordering};
-
+#![allow(clippy::disallowed_methods, reason = "a test's scripted readings")]
 use tally_mlat_solver::modes;
 use tally_relay::figures::{Figures, MAX_PER_FEEDER, PER_RECEIVER_BYTES, WINDOW_HOURS};
+use tally_wire::clocks::recorded::{aligned, judged};
 use tally_wire::{Batch, BatchContent, Decoded, Identity, Location, Observation, Region};
 
-struct Counting;
-
-static LIVE: AtomicIsize = AtomicIsize::new(0);
-
-// SAFETY: every call is the system allocator's, with the same arguments; the counter is atomic.
-unsafe impl GlobalAlloc for Counting {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        LIVE.fetch_add(layout.size() as isize, Ordering::Relaxed);
-        // SAFETY: the caller's contract is the system allocator's.
-        unsafe { System.alloc(layout) }
-    }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        LIVE.fetch_sub(layout.size() as isize, Ordering::Relaxed);
-        // SAFETY: the caller's contract is the system allocator's.
-        unsafe { System.dealloc(ptr, layout) }
-    }
-
-    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        LIVE.fetch_add(
-            new_size as isize - layout.size() as isize,
-            Ordering::Relaxed,
-        );
-        // SAFETY: the caller's contract is the system allocator's.
-        unsafe { System.realloc(ptr, layout, new_size) }
-    }
-}
-
 #[global_allocator]
-static GLOBAL: Counting = Counting;
+static GLOBAL: tally_counting::CountingAll = tally_counting::CountingAll;
 
 const HOUR_MS: u64 = tally_wire::FIGURES_BUCKET_MS;
 const T: u64 = 497_561 * HOUR_MS;
@@ -90,7 +61,8 @@ fn batch(
         observations,
     };
     let batch = Batch::sign(who, &content).unwrap_or_else(|error| panic!("{error}"));
-    Decoded::from_verified(batch, wall_ms, sequence).unwrap_or_else(|error| panic!("{error:?}"))
+    Decoded::from_verified(batch, aligned(wall_ms), sequence)
+        .unwrap_or_else(|error| panic!("{error:?}"))
 }
 
 /// One receiver's row at every cap: a batch every minute of the window and the hour after it (the
@@ -130,11 +102,11 @@ fn a_full_row_costs_no_more_than_its_charge() {
         let at = T + minute * 60_000 + 30_000;
         batches.push(batch(&feeder, u64::from(aircraft) + minute, at, Vec::new()));
     }
-    let before = LIVE.load(Ordering::Relaxed);
+    let before = tally_counting::CountingAll::live();
     for decoded in &batches {
-        figures.batch(decoded, Some(public), decoded.wall_ms());
+        figures.batch(decoded, Some(public), judged(decoded.wall_ms()));
     }
-    let row = LIVE.load(Ordering::Relaxed) - before;
+    let row = tally_counting::CountingAll::live() - before;
     assert_eq!(figures.rows(), 1);
     eprintln!("a full row: {row} bytes of {PER_RECEIVER_BYTES} charged");
     assert!(

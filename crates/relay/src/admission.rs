@@ -8,10 +8,11 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
-use tally_wire::{Echo, EchoReply, EchoReplyContent, Headroom, Identity};
+use tally_wire::{Echo, EchoReply, Headroom, Signer};
 
 use crate::egress::{Admitted, Egress};
 use crate::hub::Hub;
+use crate::strikes::Now;
 
 pub struct Admission {
     network: AtomicU32,
@@ -81,21 +82,28 @@ impl Admission {
         self.network.load(Ordering::Relaxed)
     }
 
-    /// The signed answer to a probe: at once, before anything else the link does.
+    /// The signed answer to a probe: at once, before anything else the link does, and whatever
+    /// the clock (`EchoReply::answer`): a feeder chooses only a relay whose answer verifies, and
+    /// a relay that cannot judge time must still be chosen and fed (RFC-0171 §3.6). It hands
+    /// the answer `now`'s judging reading only while that reading judged, and the answer states
+    /// it only while the signer's clock judges too. `None` only before the relay has a key to
+    /// answer with.
     pub fn echo(
         &self,
         hub: &Hub,
-        identity: Option<&Identity>,
+        signer: Option<&Signer>,
         echo: Echo,
-        now_ms: u64,
+        now: impl Into<Now>,
     ) -> Option<EchoReply> {
-        let content = EchoReplyContent {
-            nonce: echo.nonce,
-            issued_ms: now_ms,
-            network: self.network(),
-            headroom: self.headroom(hub),
-        };
-        EchoReply::sign(identity?, &content).ok()
+        let now = now.into();
+        EchoReply::answer(
+            signer?,
+            echo,
+            now.judges().then(|| now.judged()),
+            self.network(),
+            self.headroom(hub),
+        )
+        .ok()
     }
 }
 
@@ -109,16 +117,22 @@ fn feeder_slots(egress: &Arc<Egress>) -> u32 {
 mod tests {
     use super::*;
     use crate::egress::Cap;
+    use tally_wire::Identity;
 
     #[test]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "a test's hub, on a clock that judges"
+    )]
     fn with_duties_off_nothing_is_declared_and_no_feeder_is_taken() -> Result<(), String> {
         let hub =
             Hub::new(8, crate::sharing::Deadlines::RELAY).max_upload(Cap::bytes_per_sec(1_000_000));
         let admission = &hub.network().admission;
         admission.configure(64_512, false);
-        let identity = Identity::generate().map_err(|error| error.to_string())?;
+        let signer =
+            crate::signer::synced(Identity::generate().map_err(|error| error.to_string())?);
         let reply = admission
-            .echo(&hub, Some(&identity), Echo { nonce: 3 }, 9)
+            .echo(&hub, Some(&signer), Echo { nonce: 3 }, Now::judging(9))
             .ok_or("no reply")?;
         reply.verify().map_err(|error| error.to_string())?;
         let content = reply.content().map_err(|error| error.to_string())?;
@@ -130,6 +144,37 @@ mod tests {
         // Duties on: the egress decides, and with nothing committed it takes the feeder.
         admission.configure(64_512, true);
         assert!(admission.admit(&hub).is_some());
+        Ok(())
+    }
+
+    /// A relay whose clock does not judge (no ClockBound) still answers a probe, signed, so a
+    /// feeder can choose it (RFC-0171 §3.6), and states no time it could not judge. Before, the
+    /// answer was signed only while the clock judged, and such a relay was never fed.
+    #[test]
+    #[allow(clippy::disallowed_methods, reason = "a test's scripted readings")]
+    fn a_relay_that_cannot_judge_time_answers_a_probe_stating_no_time() -> Result<(), String> {
+        let hub =
+            Hub::new(8, crate::sharing::Deadlines::RELAY).max_upload(Cap::bytes_per_sec(1_000_000));
+        let admission = &hub.network().admission;
+        admission.configure(64_512, true);
+        let clock = crate::clock::RelayClock::host_stated();
+        clock.set_error(None);
+        let signer = crate::signer::on(
+            Identity::generate().map_err(|error| error.to_string())?,
+            clock,
+        );
+        assert!(!signer.signs());
+        let unjudged = Now::new(
+            tally_wire::clocks::recorded::judged(1_791_244_800_000),
+            false,
+        );
+        let reply = admission
+            .echo(&hub, Some(&signer), Echo { nonce: 5 }, unjudged)
+            .ok_or("no reply")?;
+        reply.verify().map_err(|error| error.to_string())?;
+        let content = reply.content().map_err(|error| error.to_string())?;
+        assert_eq!((content.nonce, content.issued_ms), (5, 0));
+        assert!(content.headroom.feeder_slots > 0);
         Ok(())
     }
 }

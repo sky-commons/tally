@@ -19,9 +19,11 @@
 //! the one before it held is gone (`alone`): before, a test could start while the last test's
 //! dropped relay was still letting its decodes go, and read them as its own uncharged.
 
+#![allow(clippy::disallowed_methods, reason = "a test's scripted readings")]
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
+use tally_wire::clocks::recorded::aligned;
 
 use tally_relay::budget::{Covered, Lapses, Store};
 use tally_relay::fanout::{Fell, Filter};
@@ -79,14 +81,20 @@ const RECEPTIONS: u32 = 100;
 /// Bytes of each reception's message.
 const MESSAGE_BYTES: usize = 190;
 
-fn busy_batch(receiver: &Identity, sequence: u64) -> Result<Batch> {
-    Batch::sign(
+/// The wall clock now, as a feeder signs its batches by (a relay's clock started now reads it).
+fn wall_ms() -> u64 {
+    tally_relay::clock::RelayClock::system().judged().ms()
+}
+
+/// A busy batch of `receiver`'s, signed at `wall_ms` by its feeder's clock.
+fn busy_batch(receiver: &Identity, sequence: u64, wall_ms: u64) -> Result<Batch> {
+    anchored_batch(
         receiver,
         &BatchContent {
             boot_id: 7,
             sequence,
             counter_epoch: 0,
-            wall_ms: 0,
+            wall_ms,
             dropped: 0,
             previous: [0; 32],
             observations: (0..RECEPTIONS)
@@ -239,7 +247,7 @@ impl Watch {
 async fn assert_watch_sees_one_leaked_batch(hub: &Hub) -> Result {
     let receiver = Identity::generate().map_err(text)?;
     let decode = |sequence| -> Result<Arc<tally_wire::Decoded>> {
-        tally_wire::Decoded::from_verified(busy_batch(&receiver, sequence)?, 0, 0)
+        tally_wire::Decoded::from_verified(busy_batch(&receiver, sequence, 0)?, aligned(0), 0)
             .map_err(|error| error.error.to_string())
     };
     let kept = decode(0)?;
@@ -295,6 +303,7 @@ async fn memory_stays_bounded_under_a_flood_of_many_feeders() -> Result {
     };
     let hub = Arc::new(
         Hub::new(8, tally_relay::sharing::Deadlines::RELAY)
+            .accepting_relays([tally_mlat_solver::sim::anchoring_relay().public()])
             .max_connections(4 * OFFERED)
             // Every feeder here is on loopback, one address.
             .max_connections_per_address(4 * OFFERED)
@@ -361,7 +370,7 @@ async fn memory_stays_bounded_under_a_flood_of_many_feeders() -> Result {
             let mut sequence = 0u64;
             let mut drain = Vec::new();
             while !stop.load(Ordering::Relaxed) {
-                let Ok(batch) = busy_batch(&feeder, sequence) else {
+                let Ok(batch) = busy_batch(&feeder, sequence, wall_ms()) else {
                     break;
                 };
                 let bytes = batch.as_bytes().len() as u64;
@@ -463,6 +472,7 @@ async fn a_stalled_stage_never_grows_past_the_budget() -> Result {
     let _alone = alone().await?;
     let hub = Arc::new(
         Hub::clocked(8, Arc::new(|| 0), tally_relay::sharing::Deadlines::RELAY)
+            .accepting_relays([tally_mlat_solver::sim::anchoring_relay().public()])
             .memory_for_feeders(4, false)
             .staged(Threads {
                 ingest: 2,
@@ -478,6 +488,8 @@ async fn a_stalled_stage_never_grows_past_the_budget() -> Result {
         }),
     );
     let epochs = hub.budget().gauge(Store::Epochs);
+    // What waits for the sealer whatever it holds, charged when the exchange was made.
+    let fixed = epochs.held();
     let decoded = hub.budget().gauge(Store::Decoded);
     let receivers: Vec<Identity> = (0..8u8)
         .map(|n| Identity::from_seed([n + 40; 32]))
@@ -487,7 +499,7 @@ async fn a_stalled_stage_never_grows_past_the_budget() -> Result {
     let mut sequence = 0u64;
     while ingested < 10 * decoded.limit() {
         for receiver in &receivers {
-            let batch = busy_batch(receiver, sequence)?;
+            let batch = busy_batch(receiver, sequence, BASE_MS + 500)?;
             ingested += batch.as_bytes().len();
             let in_flight = hub.in_flight_for(&batch);
             hub.ingest(Inbound {
@@ -495,10 +507,14 @@ async fn a_stalled_stage_never_grows_past_the_budget() -> Result {
                 batch,
                 origin: Origin::Elsewhere,
                 verify: true,
-                stamp: Some(Stamp {
-                    stamp_ms: BASE_MS + 500,
-                    ingest_seq: ingested as u64,
-                }),
+                stamp: Some(Stamp::recorded(
+                    BASE_MS + 500,
+                    ingested as u64,
+                    BASE_MS + 500,
+                    BASE_MS + 500,
+                    true,
+                )),
+                arrived: None,
                 in_flight,
                 refusal: None,
             });
@@ -548,7 +564,7 @@ async fn a_stalled_stage_never_grows_past_the_budget() -> Result {
     }
     let products = &hub.network().products;
     let mut stream = 0usize;
-    for record in products.tick(None) {
+    for record in products.tick() {
         if let Record::RelayBatch(batch) = record {
             stream += batch.content().map_err(text)?.observations.len();
         }
@@ -559,7 +575,7 @@ async fn a_stalled_stage_never_grows_past_the_budget() -> Result {
         stream > 0 || products.report().epochs_refused >= 1,
         "the stalled epoch was neither published nor refused"
     );
-    assert_eq!(epochs.held(), 0);
+    assert_eq!(epochs.held(), fixed);
     let settled = Instant::now();
     while decoded.held() > 0 {
         if settled.elapsed() > Duration::from_secs(10) {
@@ -582,7 +598,9 @@ async fn a_stalled_stage_never_grows_past_the_budget() -> Result {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_ingest_pool_is_shared_by_network_not_by_connection() -> Result {
     let hub = Arc::new(
-        Hub::new(8, tally_relay::sharing::Deadlines::RELAY).memory_for_feeders(CEILING, false),
+        Hub::new(8, tally_relay::sharing::Deadlines::RELAY)
+            .accepting_relays([tally_mlat_solver::sim::anchoring_relay().public()])
+            .memory_for_feeders(CEILING, false),
     );
     let batch = hub.budget().gauge(Store::Ingest).limit() / 3;
     let source = |address: &str, connection: u64| -> Result<u64> {
@@ -647,4 +665,26 @@ async fn the_ingest_pool_is_shared_by_network_not_by_connection() -> Result {
          of the room, where first come first served gives it a seventh"
     );
     Ok(())
+}
+
+/// `content` signed by `identity` as a feeder of this build signs it (RFC-0171 §3.6): anchored by
+/// the relay its session is to as that relay's clock read its signed time, here the simulation's
+/// anchoring relay (`tally_mlat_solver::sim::anchoring_relay`), which every relay these tests
+/// start accepts.
+fn anchored_batch(
+    identity: &Identity,
+    content: &BatchContent,
+) -> std::result::Result<Batch, tally_wire::WireError> {
+    anchored_batch_with(identity, content, tally_wire::Codec::Plain)
+}
+
+/// As `anchored_batch`, its receptions written by `codec`.
+fn anchored_batch_with(
+    identity: &Identity,
+    content: &BatchContent,
+    codec: tally_wire::Codec,
+) -> std::result::Result<Batch, tally_wire::WireError> {
+    let anchor =
+        tally_wire::Anchor::sign(&tally_mlat_solver::sim::anchoring_relay(), content.wall_ms);
+    Batch::sign_anchored(identity, content, codec, &[anchor])
 }

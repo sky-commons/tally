@@ -23,10 +23,11 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
+use tally_wire::clocks::Judged;
 
 use tally_wire::{
     Batch, ClockModel, ClockModelPart, Decoded, Identity, Positions, PublicKey, ReceiverInfo,
-    Record, Region, Regions, RelayAddress,
+    Record, Region, Regions, RelayAddress, Signing,
 };
 
 use crate::admission::Admission;
@@ -38,24 +39,120 @@ use crate::mlat_host::MlatHost;
 use crate::peers::Peers;
 use crate::products::Products;
 use crate::selection::Selection;
-use crate::sharing::{Rebuilt, Sharing};
+use crate::sharing::{Now, Rebuilt, Sharing};
+use crate::signer::Signer;
 use crate::standing::Standing;
 
-/// How often the timed duties run: often enough for provisional positions, which a hosted MLAT
-/// publishes about a second after a transmission (RFC-0171 §3.8.1).
+/// How often the timed duties run: often enough for MLAT positions, which a hosted MLAT publishes
+/// about a second after a transmission (RFC-0171 §3.8.1, as amended 2026-10-24).
 pub const TICK: Duration = Duration::from_millis(100);
 /// How often receivers with standing are counted as corroborated for credit.
 const CORROBORATE_EVERY_MS: u64 = 10_000;
+/// An `M` reading no pace has started from yet.
+const NEVER_MS: u64 = u64::MAX;
 /// Clock models held for member links, at most: a member link carries a model (its parts, then
 /// its manifest) before the first record citing it (`link`'s `Told`), and a model's first part
-/// names its tile, its group.
+/// names its area, its group.
 const MODELS_HELD: usize = 4_096;
 
-/// One clock model as held: its manifest once seen, and its parts.
+/// One clock model as held: its manifest once seen, and its parts, at most
+/// `clock_model::MAX_PARTS` (a part's index is below it), each once.
 struct HeldModel {
     id: [u8; 32],
     manifest: Option<ClockModel>,
     parts: Vec<ClockModelPart>,
+    /// Whether its manifest and every part it lists are held, its encoding joined.
+    whole: bool,
+    /// Its pair model id (`publish::pair_model_id`, what fixes cite) and its area, once it is
+    /// whole and its encoding names an area.
+    pair: Option<([u8; 32], Region)>,
+}
+
+impl HeldModel {
+    /// Reads its pair model id and area once it is whole: its manifest and every part it lists.
+    fn complete(&mut self) {
+        if self.whole {
+            return;
+        }
+        let Some(manifest) = &self.manifest else {
+            return;
+        };
+        let mut parts = self.parts.clone();
+        parts.sort_by_key(|part| part.index().unwrap_or(u16::MAX));
+        let Ok(content) = manifest.content(&parts) else {
+            return;
+        };
+        self.whole = true;
+        if let Ok(area) = tally_mlat_solver::publish::area_of(&content.model) {
+            self.pair = Some((
+                tally_mlat_solver::publish::pair_model_id(&content.model),
+                area,
+            ));
+        }
+    }
+}
+
+impl HeldModel {
+    /// What it allocates beside its slot: its manifest, its parts and their list.
+    fn bytes(&self) -> usize {
+        self.manifest.as_ref().map_or(0, ClockModel::allocated)
+            + crate::footprint::vec::<ClockModelPart>(self.parts.capacity())
+            + self
+                .parts
+                .iter()
+                .map(ClockModelPart::allocated)
+                .sum::<usize>()
+    }
+}
+
+/// The clock models held for member links, charged to the one batch byte store
+/// (`budget::Store::Batches`, what is held for members) as they allocate: a model's parts are
+/// a peer's word, so what they take is charged before it is held, and past the store's room the
+/// oldest models are let go to make it, or the part is not held, counted (`Models::unheld`).
+/// Before, the parts were held uncharged and with no bound per model.
+struct Models {
+    held: std::collections::VecDeque<HeldModel>,
+    /// What `held` allocates: its slots and each model's own.
+    bytes: usize,
+    charge: crate::budget::Charge,
+    unheld: u64,
+}
+
+impl Models {
+    fn new(gauge: &Arc<crate::budget::Gauge>) -> Self {
+        Self {
+            held: std::collections::VecDeque::new(),
+            bytes: 0,
+            charge: gauge.empty(),
+            unheld: 0,
+        }
+    }
+
+    fn count(&self) -> usize {
+        crate::footprint::vec::<HeldModel>(self.held.capacity())
+            + self.held.iter().map(HeldModel::bytes).sum::<usize>()
+    }
+
+    /// The charge brought to what is held, the oldest models let go while it cannot grow to it:
+    /// false when even alone the change has no room (`keep`, the model being changed, kept to the
+    /// last).
+    fn settle(&mut self, keep: &[u8; 32]) -> bool {
+        loop {
+            self.bytes = self.count();
+            let charged = self.charge.bytes();
+            if self.bytes <= charged {
+                self.charge.shrink_to(self.bytes);
+                return true;
+            }
+            if self.charge.try_grow(self.bytes - charged) {
+                return true;
+            }
+            let Some(oldest) = self.held.iter().position(|model| model.id != *keep) else {
+                return false;
+            };
+            self.held.remove(oldest);
+        }
+    }
 }
 
 /// Who sent a record a duty is handed.
@@ -75,6 +172,18 @@ pub struct Asker {
     pub address: Option<std::net::IpAddr>,
 }
 
+impl Asker {
+    /// Whose share what it delivers is charged to (`strikes::Deliverer`): the relay's own when it
+    /// is the relay itself handing in what it rebuilt (`hub::RELAY_ITSELF`), else the peer's key.
+    pub fn deliverer(&self) -> crate::strikes::Deliverer {
+        if self.source == crate::hub::RELAY_ITSELF {
+            crate::strikes::Deliverer::Relay
+        } else {
+            crate::strikes::Deliverer::Peer(self.key)
+        }
+    }
+}
+
 /// What the asker's handshake established it is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AskerRole {
@@ -86,7 +195,7 @@ pub enum AskerRole {
     /// Another relay's hosted MLAT taking an area's raw one hop (`peers`): the one session that
     /// handshakes as `Role::Engine`. There is no engine program apart from a relay.
     Engine,
-    /// A measurement session (`Role::Probe`): echoes and delivery queries only.
+    /// A measurement session (`Role::Probe`): echoes, delivery queries and a timed heartbeat only.
     Probe,
 }
 
@@ -98,32 +207,63 @@ pub struct Membership {
     _reservation: crate::budget::Reservation,
 }
 
+/// What a regional batch's intake made of it (`Network::take_regional`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Regional {
+    /// Its signature checked and its signed time inside the window: taken into its group.
+    Passed,
+    /// Signed outside this relay's window of time: held in its group all the same, as every copy
+    /// is (possession never reads a clock), but never used by the products.
+    Late,
+    /// Its signature or form failed, or its signed time cannot be read: refused.
+    Refused,
+    /// New, and no room to take it in: let go, never held in its group as had, so the group asks
+    /// for it again; a member that delivered it is credited for it (`Network::no_room_from_peer`).
+    Full,
+}
+
 /// Every RFC-0174 duty of one relay.
 pub struct Network {
-    identity: OnceLock<Identity>,
+    /// The relay's key, once it serves, as everything it signs reaches it (`signer`): the one
+    /// copy the duties hold.
+    signer: OnceLock<Signer>,
+    /// The relay's one clock: what its signer signs while synced.
+    clock: crate::clock::RelayClock,
     pub admission: Admission,
     pub delivery: Delivery,
     /// The feeder figures of the receivers it hosts or carries (`figures`).
     pub figures: crate::figures::Figures,
     /// The checks a client's positions pass before a client is sent them (`consistency`).
     pub consistency: crate::consistency::Consistency,
+    /// The relay's decoded clock models, one store that standing and the checks both cite
+    /// (`models`): fed once, as the hub assembles a model ([`Network::admit_model`]) or its own
+    /// engine publishes one.
+    pub clock_models: Arc<crate::models::Models>,
     pub directory: Directory,
     pub selection: Selection,
     pub sharing: Sharing,
     pub credit: Credit,
+    /// The freshness anchors this relay verified and the one it issues (`anchors`).
+    pub anchors: crate::anchors::Anchors,
     pub products: Arc<Products>,
     pub standing: Arc<Standing>,
     pub peers: Peers,
     mlat: OnceLock<Arc<dyn MlatHost>>,
     /// The areas last handed the hosted MLAT, and the generation of the choice they came from.
     mlat_areas: Mutex<(u64, Regions)>,
+    /// When receivers were last corroborated, by `M` (`NEVER_MS` before the first time).
     corroborated_ms: AtomicU64,
     /// Recent clock models, oldest first.
-    models: Mutex<std::collections::VecDeque<HeldModel>>,
+    models: Mutex<Models>,
     /// Group records members sent this relay, and records of data a directory link sent it (not
     /// taken: a relay link carries only the directory).
     shared_in: AtomicU64,
     data_on_directory_links: AtomicU64,
+    /// Offers and evidence bundles not taken because the clock did not judge as they came
+    /// (`unjudged_directory`): their signers gossip them again, but a clock that stays unsynced
+    /// shows here.
+    unjudged_offers: AtomicU64,
+    unjudged_evidence: AtomicU64,
     /// Overload cuts (`mlat_host::Cut`) this relay sent a relay holding its areas (one count a
     /// relay it addressed), took from one, and refused (not signed by the relay that sent it, or
     /// from one holding none of this relay's areas).
@@ -139,27 +279,35 @@ pub struct Network {
 
 impl Network {
     /// Every duty of a relay, its sharing judging deliverers by `deadlines` (a relay's
-    /// `sharing::Deadlines::RELAY`).
-    pub fn new(deadlines: crate::sharing::Deadlines) -> Self {
+    /// `sharing::Deadlines::RELAY`), its directory by the relay's one clock (`clock`).
+    pub fn new(deadlines: crate::sharing::Deadlines, clock: crate::clock::RelayClock) -> Self {
+        let clock_models = Arc::new(crate::models::Models::new());
         Self {
-            identity: OnceLock::new(),
+            signer: OnceLock::new(),
+            clock: clock.clone(),
             admission: Admission::new(),
             delivery: Delivery::new(),
             figures: crate::figures::Figures::new(),
-            consistency: crate::consistency::Consistency::new(),
-            directory: Directory::new(),
+            consistency: crate::consistency::Consistency::new(Arc::clone(&clock_models)),
+            clock_models: Arc::clone(&clock_models),
+            directory: Directory::on(clock),
             selection: Selection::new(),
             sharing: Sharing::new(deadlines),
             credit: Credit::new(),
+            anchors: crate::anchors::Anchors::new(),
             products: Arc::new(Products::new()),
-            standing: Arc::new(Standing::new()),
+            standing: Arc::new(Standing::with_models(clock_models)),
             peers: Peers::new(),
             mlat: OnceLock::new(),
             mlat_areas: Mutex::new((0, Regions::default())),
-            corroborated_ms: AtomicU64::new(0),
-            models: Mutex::new(std::collections::VecDeque::new()),
+            corroborated_ms: AtomicU64::new(NEVER_MS),
+            models: Mutex::new(Models::new(&crate::budget::Gauge::unlimited(
+                crate::budget::Store::Batches,
+            ))),
             shared_in: AtomicU64::new(0),
             data_on_directory_links: AtomicU64::new(0),
+            unjudged_offers: AtomicU64::new(0),
+            unjudged_evidence: AtomicU64::new(0),
             cuts_sent: AtomicU64::new(0),
             cuts_received: AtomicU64::new(0),
             cuts_refused: AtomicU64::new(0),
@@ -176,10 +324,49 @@ impl Network {
     pub fn charge_to(&self, budget: &crate::budget::Budget) {
         use crate::budget::Store;
         self.sharing.charge_to(budget.gauge(Store::Batches));
+        if let Ok(mut models) = self.models.lock() {
+            models.charge = budget.gauge(Store::Batches).empty();
+            let bytes = models.bytes;
+            if !models.charge.try_grow(bytes) {
+                models.held = std::collections::VecDeque::new();
+                models.bytes = 0;
+            }
+        }
         self.sharing.assemble_in(budget.parity_assembly());
         self.delivery.charge_to(budget.gauge(Store::Delivery));
         self.figures.charge_to(budget.gauge(Store::Figures));
         self.products.charge_to(budget);
+        self.credit.set_receivers(budget.receivers());
+        self.credit.charge_to(&budget.gauge(Store::Credit));
+        self.anchors.charge_to(&budget.gauge(Store::Anchors));
+        self.directory.charge_to(&budget.gauge(Store::Directory));
+        // The decoded models, each charged as it is held, each source in a room sized by what
+        // drives it: the seats and the members' pace (`models::Rooms::of`).
+        self.clock_models
+            .size_for(budget.models_sizing(), budget.gauge(Store::Models));
+        // Standing's and the positions checks' tables, sized from the seats and the receiver
+        // figure and charged whole (`standing::Caps::of`, `consistency::Caps::of`).
+        self.standing
+            .size_for(budget.mlat_seats(), &budget.gauge(Store::Standing));
+        self.consistency.size_for(
+            budget.consistency_sizing(),
+            &budget.gauge(Store::Consistency),
+            &budget.gauge(Store::Twins),
+        );
+    }
+
+    /// Whether the stores allocated whole at start (the anchor cache, the directory's tables, the
+    /// products' remembered tables, standing's and the positions checks') are
+    /// charged in full: a relay whose budget cannot hold them refuses to start.
+    pub fn fixed_charged(&self) -> Result<(), String> {
+        self.anchors.charged_in_full()?;
+        self.products.located_charged()?;
+        self.products.remembered_charged()?;
+        if !self.standing.charged_in_full() {
+            return Err("the relay's standing tables are not charged in full".to_owned());
+        }
+        self.consistency.charged_in_full()?;
+        self.directory.charged_in_full()
     }
 
     /// Group records members have sent this relay.
@@ -206,28 +393,61 @@ impl Network {
         self.data_on_directory_links.load(Ordering::Relaxed)
     }
 
+    /// The offers and the evidence bundles not taken because the clock did not judge as they came,
+    /// since start.
+    pub fn unjudged_directory(&self) -> (u64, u64) {
+        (
+            self.unjudged_offers.load(Ordering::Relaxed),
+            self.unjudged_evidence.load(Ordering::Relaxed),
+        )
+    }
+
     /// A record of data came on a directory link, and was not taken.
     pub fn refused_on_directory_link(&self) {
         self.data_on_directory_links.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// The key the relay signs its network records with (its newest), once it serves.
+    /// The relay's signer, the key it signs its network records with (its newest), once it
+    /// serves (`serve_as`): no duty holds the key but through it.
+    pub fn adopt_signer(&self, signer: Signer) {
+        self.credit.adopt_identity(signer.public());
+        self.products.adopt_signer(&signer);
+        let _ = self.signer.set(signer);
+    }
+
+    /// As [`Network::adopt_signer`], `identity` moved into a signer on the relay's clock (a
+    /// test's relay, which has no MLAT host to share it with).
     pub fn adopt_identity(&self, identity: Identity) {
-        self.credit.adopt_identity(identity.public());
-        self.products.adopt_identity(&identity);
-        let _ = self.identity.set(identity);
+        self.adopt_signer(crate::signer::on(identity, self.clock.clone()));
     }
 
-    pub fn identity(&self) -> Option<&Identity> {
-        self.identity.get()
+    /// The relay's signer, once it serves: its key while its clock is synced
+    /// (`Signer::with`), and its public key always.
+    pub fn signer(&self) -> Option<&Signer> {
+        self.signer.get()
     }
 
-    /// The MLAT this relay runs (one program); none when its MLAT duty is off.
-    pub fn host_mlat(&self, host: Arc<dyn MlatHost>) {
+    /// `then` given the key to sign with for this one call: none before the relay serves, or
+    /// when `at`, the reading the record states its time by, was taken while its clock did not
+    /// judge, or while its clock does not judge now (`signer::with`).
+    pub fn with_signing<T>(
+        &self,
+        at: impl Into<crate::strikes::Now>,
+        then: impl FnOnce(Option<&Signing<'_>>) -> T,
+    ) -> T {
+        match self.signer() {
+            Some(signer) => crate::signer::with(signer, at, then),
+            None => then(None),
+        }
+    }
+
+    /// The MLAT this relay runs (one program); none when its MLAT duty is off. Only through
+    /// `Hub::host_mlat`, which refuses a hub that plans no raw.
+    pub(crate) fn host_mlat(&self, host: Arc<dyn MlatHost>) {
         // Standing reads the engine's raw: one store of raw per relay (RFC-0181 §5), and runs on
         // its threads (`Standing::start`).
-        if let Some(sealed) = host.sealed_bins() {
-            self.standing.read_bins(sealed);
+        if let Some(raw) = host.raw() {
+            self.standing.read_raw(raw);
             if let Err(error) = Standing::start(&self.standing, host.gate()) {
                 eprintln!("tally-relay: {error}");
             }
@@ -248,14 +468,16 @@ impl Network {
         hub: &Hub,
         asker: &Asker,
         record: Record,
-        now_ms: u64,
+        now: impl Into<Now>,
         pace: Option<&crate::ingest::RecordPace>,
     ) -> Vec<Record> {
-        let identity = self.identity();
+        let now = now.into();
         match record {
+            // Answered whatever the clock (`Admission::echo`): a feeder chooses only a relay whose
+            // answer verifies, and possession never depends on a clock.
             Record::Echo(echo) => self
                 .admission
-                .echo(hub, identity, echo, now_ms)
+                .echo(hub, self.signer(), echo, now)
                 .map(Record::EchoReply)
                 .into_iter()
                 .collect(),
@@ -263,10 +485,11 @@ impl Network {
                 // By its public cell, as its batches are tagged (`point_for`): a feeder is a
                 // client, and its answer must not turn on which area its site lies in.
                 let point = hub.public_cell_of(&query.receiver);
-                // A relay's own answer is its own word, never credit evidence (`credit`). By the
-                // ingest clock, the clock delivery held each batch by (`on_batch`).
-                self.delivery
-                    .answer_at(
+                // A relay's own answer is its own word, never credit evidence (`credit`). Its
+                // tags are read by `M`, the clock delivery held each batch by (`tag`), and it is
+                // issued by `J`.
+                self.with_signing(now, |identity| {
+                    self.delivery.answer_at(
                         &self.selection,
                         identity,
                         &query,
@@ -277,64 +500,75 @@ impl Network {
                             asker.key,
                             asker.address.map(crate::directory::Group::of),
                         ),
-                        hub.now_ms(),
+                        Now::from(hub.stamp_now()),
                     )
-                    .map(Record::DeliveryAnswer)
-                    .into_iter()
-                    .collect()
+                })
+                .map(Record::DeliveryAnswer)
+                .into_iter()
+                .collect()
             }
             Record::DeliveryAnswer(_) => Vec::new(),
+            // An offer's lifetime and its date are judged by the clock, so none is taken while it
+            // does not judge: its signer gossips it again.
             Record::ProviderOffer(offer) => {
-                self.directory.offered(asker, offer, now_ms);
+                if now.judging() {
+                    self.directory.offered(asker, offer, now.judged());
+                } else {
+                    self.unjudged_offers.fetch_add(1, Ordering::Relaxed);
+                }
                 Vec::new()
             }
             Record::ProviderQuery(query) => self
                 .directory
-                .query(&query, now_ms)
+                .query(&query, now.judged())
                 .into_iter()
                 .map(Record::ProviderOffer)
                 .collect(),
             // Sharing answers nothing down the link a message came in on: what it sends, a repair
             // page to the asker too, goes over this relay's own member links (`sharing`).
             Record::StripeAssignment(assignment) => {
-                self.sharing.assigned(asker, assignment, now_ms);
+                self.sharing.assigned(asker, assignment, now);
                 Vec::new()
             }
             Record::PieceManifest(manifest) => {
-                self.sharing.manifest(asker, manifest, now_ms);
+                self.sharing.manifest(asker, manifest, now);
                 Vec::new()
             }
             Record::HaveSummary(have) => {
-                self.sharing.have(asker, have, now_ms);
+                self.sharing.have(asker, have, now);
                 Vec::new()
             }
             Record::StripeReceipt(receipt) => {
-                self.credit.record_receipt(receipt.clone(), now_ms);
-                self.sharing.receipt(asker, receipt, now_ms);
+                self.credit
+                    .record_receipt(receipt.clone(), crate::strikes::Now::from(now));
+                self.sharing.receipt(asker, receipt, now);
                 Vec::new()
             }
             Record::FirehoseCredential(credential) => {
-                self.credit.presented(asker, credential, now_ms);
+                self.credit.presented(asker, credential, now.judged());
                 Vec::new()
             }
             // A client presents its relay's evidence for its own credit; a relay gossips every
             // relay's for the directory's ranking (`directory::State::tier`), which its clients'
             // credit may use too.
+            // Its age is judged by the clock, so none is taken while it does not judge.
             Record::EvidenceBundle(bundle) => {
-                if asker.role == AskerRole::Relay {
-                    self.directory.evidence(&bundle, now_ms, pace);
+                if !now.judging() {
+                    self.unjudged_evidence.fetch_add(1, Ordering::Relaxed);
+                    return Vec::new();
                 }
-                self.credit.evidence(asker, bundle, now_ms, pace);
+                if asker.role == AskerRole::Relay {
+                    self.directory.evidence(&bundle, now.judged(), pace);
+                }
+                self.credit.evidence(asker, bundle, now.judged(), pace);
                 Vec::new()
             }
-            // The products take a record in by its stamp against their watermark, so it is
-            // stamped by the ingest clock their watermark comes from (`products::Records`).
+            // The products take every input by one stamp, both clocks read together
+            // (`Hub::stamp_now`): its monotonic reading orders it against their watermark
+            // (`products::Records`), its judging one judges its fixes, as for positions and every
+            // other input (`on_positions`).
             Record::WorldPositions(world) => {
-                self.products.world_from(asker, world, hub.now_ms());
-                Vec::new()
-            }
-            Record::WorldPrecise(world) => {
-                self.products.precise_from(asker, world, hub.now_ms());
+                self.products.world_from(asker, world, hub.stamp_now());
                 Vec::new()
             }
             // The regional product, and its client form: the one intake each has
@@ -343,26 +577,29 @@ impl Network {
             record @ (Record::RegionalBatch(_) | Record::ClientRegionalBatch(_)) => {
                 let refused = record.clone();
                 let taken = self.take_regional(hub, asker, record, |record| {
-                    self.from_peer(hub, asker, record, now_ms);
+                    self.from_peer(hub, asker, record, now);
                 });
-                if !taken {
-                    self.refused_from_peer(hub, asker, &refused, now_ms);
+                // One outside the window of time was held in its group, as every copy is.
+                match taken {
+                    Regional::Refused => self.refused_from_peer(hub, asker, &refused, now),
+                    Regional::Full => self.no_room_from_peer(hub, asker.key, &refused, now),
+                    Regional::Passed | Regional::Late => {}
                 }
                 Vec::new()
             }
             Record::Parity(chunk) => {
-                self.sharing.parity_chunk(asker, chunk, now_ms);
+                self.sharing.parity_chunk(asker, chunk, now);
                 Vec::new()
             }
             // A bundler's index: checked, and passed on to whoever reads the parent cell.
             Record::BundleIndex(index) => {
                 if asker.role == AskerRole::Relay && index.verify().is_ok() {
-                    hub.publish_as(asker.source, Record::BundleIndex(index));
+                    hub.publish_as(asker.source, asker.deliverer(), Record::BundleIndex(index));
                 }
                 Vec::new()
             }
             Record::MlatCut(cut) => {
-                self.take_cut(asker, &cut, now_ms);
+                self.take_cut(asker, &cut, now.judged());
                 Vec::new()
             }
             Record::EchoReply(_) => Vec::new(),
@@ -378,21 +615,24 @@ impl Network {
     /// was down, or started late, learns it at the next, and a cut not announced again expires
     /// (`mlat_host::CUT_TTL_MS`). One that reaches a relay after its step is that relay's
     /// `cuts_late`, counted and never silent.
-    pub fn publish_cuts(&self, cuts: Vec<crate::mlat_host::Cut>, now_ms: u64) {
+    pub fn publish_cuts(&self, cuts: Vec<crate::mlat_host::Cut>, at: crate::strikes::Now) {
         if cuts.is_empty() {
             return;
         }
-        let Some(identity) = self.identity() else {
+        let Some(signer) = self.signer().filter(|signer| at.judges() && signer.signs()) else {
             return;
         };
-        let sources = self.selection.raw_sources(&self.directory, now_ms);
+        let now = at.judged();
+        let sources = self.selection.raw_sources(&self.directory, now);
         for cut in cuts {
             let content = tally_wire::MlatCutContent {
                 from_ms: cut.from_ms,
                 below: cut.below,
                 areas: cut.areas,
             };
-            let Ok(signed) = tally_wire::MlatCut::sign(identity, &content) else {
+            let Ok(signed) = crate::signer::sign_with(signer, at, |identity| {
+                tally_wire::MlatCut::sign(identity, &content)
+            }) else {
                 continue;
             };
             let mut reached = HashSet::new();
@@ -411,9 +651,9 @@ impl Network {
     /// The areas `relay` solves by its verified offers (`selection::areas_solved_by`), as the
     /// directory holds them now: remembered per relay for as long as the directory's offers stay
     /// as they were.
-    fn solved_by(&self, relay: &PublicKey, now_ms: u64) -> Regions {
+    fn solved_by(&self, relay: &PublicKey, now: Judged) -> Regions {
         const REMEMBERED: usize = 128;
-        let version = self.directory.version(now_ms);
+        let version = self.directory.version(now);
         if let Some(regions) = self.cut_signers.lock().ok().and_then(|held| {
             held.get(relay)
                 .filter(|(held, _)| *held == version)
@@ -421,7 +661,7 @@ impl Network {
         }) {
             return regions;
         }
-        let regions = crate::selection::areas_solved_by(&self.directory, relay, now_ms);
+        let regions = crate::selection::areas_solved_by(&self.directory, relay, now);
         if let Ok(mut held) = self.cut_signers.lock() {
             if held.len() >= REMEMBERED {
                 held.clear();
@@ -437,7 +677,7 @@ impl Network {
     /// and counted. A cut is keyed by area and only the relays that solve an area may cut it: a
     /// relay that merely offers raw, or holds nothing of the area, cannot cut its solving, and one
     /// of the area's relays cannot cut an area it does not solve.
-    fn take_cut(&self, asker: &Asker, cut: &tally_wire::MlatCut, now_ms: u64) {
+    fn take_cut(&self, asker: &Asker, cut: &tally_wire::MlatCut, now: Judged) {
         let Some(mlat) = self.mlat() else {
             return;
         };
@@ -446,7 +686,7 @@ impl Network {
             && cut.signer().is_ok_and(|signer| signer == asker.key);
         let content = cut.content().ok().filter(|_| heard);
         let taken = content.and_then(|content| {
-            let held = self.solved_by(&asker.key, now_ms);
+            let held = self.solved_by(&asker.key, now);
             let areas: Vec<Region> = content
                 .areas
                 .iter()
@@ -483,7 +723,7 @@ impl Network {
         info: &ReceiverInfo,
         site: Option<&tally_mlat::intake::SiteRecord>,
         place: Option<tally_wire::Location>,
-        now_ms: u64,
+        now: crate::strikes::Now,
     ) {
         if let Ok(receiver) = info.receiver() {
             self.figures
@@ -492,7 +732,7 @@ impl Network {
         if let Some(site) = site {
             self.consistency.site(site);
         }
-        self.credit.described(info.clone(), now_ms);
+        self.credit.described(info.clone(), now);
         self.products.described(info, place);
     }
 
@@ -501,42 +741,161 @@ impl Network {
     /// else (and standing reads MLAT's sealed bins). The regional product reads it through the
     /// message exchange (`exchange`), not here, and delivery tags the batch where its receiver's
     /// place is read, as it is shared (`originate`, `from_peer`), so the batch is not passed here.
-    pub fn on_batch(&self, decoded: Option<&Arc<Decoded>>, public: Option<Region>, stamp_ms: u64) {
+    /// Its freshness is judged by its stamp's judging clock, the clock every signed time is
+    /// compared with (`Hub::now_ms`); MLAT steps by its monotonic one (`ingest::Stamp`).
+    pub fn on_batch(
+        &self,
+        decoded: Option<&Arc<Decoded>>,
+        public: Option<Region>,
+        stamp: crate::ingest::Stamp,
+    ) {
         let Some(decoded) = decoded else {
             return;
         };
-        // The feeder figures, on the ingest worker that owns the receiver's shard: by the
-        // ingest clock's stamp, which a batch's own clock is judged against.
-        self.figures.batch(decoded, public, stamp_ms);
+        // The feeder figures, on the ingest worker that owns the receiver's shard: a batch's own
+        // clock judged against the relay's.
+        self.figures.batch(decoded, public, stamp.judged());
         if let Some(mlat) = self.mlat() {
-            mlat.offer_batch(decoded, stamp_ms);
+            mlat.offer_batch(decoded, stamp.mono_ms());
         }
     }
 
-    /// Final or provisional positions the hub forwarded (new, verified), handed in by the
+    /// Positions the hub forwarded (new, verified), handed in by the
     /// session `source` (the hub's id of its connection, `hub::RELAY_ITSELF` for the relay's own),
-    /// at `now_ms` by the ingest clock (the products take them in by it, and charge them to that
-    /// session, `products::From`).
-    pub fn on_positions(&self, positions: &Positions, source: u64, now_ms: u64) {
-        // A tagged record (a client's form) is its raw twin's solutions again: the products and
-        // standing weigh the raw one.
+    /// at `now_ms` by the relay's clock (the products take them in by it, and charge them to that
+    /// session, `products::From`; the figures judge their freshness by it).
+    /// The products take them in by the monotonic clock their records are stamped and sealed by;
+    /// the figures and standing judge their signed times by the judging clock (`ingest::Stamp`).
+    pub fn on_positions(&self, positions: &Positions, source: u64, now: crate::ingest::Stamp) {
+        // A tagged record (a client's form) is its raw twin's fixes again: the products weigh
+        // the raw one. Standing takes the raw one as the hub sends it, and the checks hold it as
+        // its link's twin there (`Hub::send_positions`).
         if positions.is_tagged() {
             return;
         }
-        self.consistency.raw(positions);
-        self.figures.positions(positions, now_ms);
-        self.products.positions(positions, source, now_ms);
-        self.standing.positions(positions, now_ms);
+        self.figures.positions(positions, now.judged());
+        self.products.positions(positions, source, now);
     }
 
-    /// A clock model manifest or part the hub forwarded (new, verified or checked), handed in by
-    /// the session `source`.
-    pub fn on_clock_model(&self, record: &Record, source: u64, now_ms: u64) {
-        if let Record::ClockModel(model) = record {
-            self.products.clock_model(model, source, now_ms);
+    /// A clock model manifest the hub forwarded (new, verified), handed in by the session
+    /// `source`, once its pair model id is known (it is whole here, `pair_of`).
+    pub fn on_clock_model(&self, record: &Record, source: u64, now: crate::ingest::Stamp) {
+        if let Record::ClockModel(model) = record
+            && let Some((pair, _)) = self.pair_of(&model.id())
+        {
+            self.products.clock_model(model, pair, source, now);
         }
-        self.consistency.model(record);
-        self.standing.model(record, now_ms);
+    }
+
+    /// Whether the model whose manifest is `id` is held here whole: its manifest and every part it
+    /// lists, its encoding joined (whether or not it names an area).
+    pub fn is_whole(&self, id: &[u8; 32]) -> bool {
+        self.models.lock().is_ok_and(|models| {
+            models
+                .held
+                .iter()
+                .any(|model| model.id == *id && model.whole)
+        })
+    }
+
+    /// The pair model id and area of model `id` (by its manifest id), once it is held whole and
+    /// its encoding names an area.
+    pub fn pair_of(&self, id: &[u8; 32]) -> Option<([u8; 32], Region)> {
+        self.models
+            .lock()
+            .ok()?
+            .held
+            .iter()
+            .find(|model| model.id == *id)?
+            .pair
+    }
+
+    /// Whether a model fixes cite as `pair` (a pair model id) is held here whole: what a fix
+    /// citing it waits for before it goes out (`Hub::forward_positions`).
+    pub fn holds_pair(&self, pair: &[u8; 32]) -> bool {
+        self.clock_models.get(pair).is_some()
+            || self.models.lock().is_ok_and(|models| {
+                models
+                    .held
+                    .iter()
+                    .any(|model| model.pair.is_some_and(|(id, _)| id == *pair))
+            })
+    }
+
+    /// The manifest ids of the models held whole whose pair model id is `pair`: what a member link
+    /// carries before a record citing it (each engine of an area signs its own manifest).
+    pub fn manifests_of(&self, pair: &[u8; 32]) -> Vec<[u8; 32]> {
+        self.models.lock().map_or_else(
+            |_| Vec::new(),
+            |models| {
+                models
+                    .held
+                    .iter()
+                    .filter(|model| model.pair.is_some_and(|(id, _)| id == *pair))
+                    .map(|model| model.id)
+                    .collect()
+            },
+        )
+    }
+
+    /// A clock model whole as the hub forwards it: its manifest (new, verified) with the parts it
+    /// lists that went out ahead of it (`parts::Parts::manifest`), held in the relay's one store of
+    /// decoded models (`models::Models::admit`) when it is of an area of the relay's areas or
+    /// their band and signed by one of that area's rendezvous MLAT relays
+    /// (`selection::mlat_relays`, by the directory as it stands at the judging clock `now`); else
+    /// refused there and counted. A model whose parts are not all there is refused as unreadable:
+    /// an engine sends a model's parts right before its manifest, and the relay's own are held
+    /// already. One held is offered to the hosted MLAT, which holds a neighbouring area's model
+    /// for its own fixes once it is verified or corroborated (`MlatHost::offer_model`).
+    pub fn admit_model(
+        &self,
+        manifest: &ClockModel,
+        parts: &[ClockModelPart],
+        now: Judged,
+    ) -> Option<crate::models::Model> {
+        let Ok(content) = manifest.content(parts) else {
+            return None;
+        };
+        let held = self
+            .clock_models
+            .admit(
+                manifest,
+                &content,
+                |area, engine| {
+                    crate::selection::mlat_relays(area, &self.directory, now).contains(engine)
+                },
+                now,
+            )
+            .ok()?;
+        if let Some(mlat) = self.mlat() {
+            mlat.offer_model(held.clone());
+        }
+        Some(held)
+    }
+
+    /// Model `id` held whole in the store of decoded models from what this relay holds of it for
+    /// its member links (`hold_model`, `hold_part`), once its manifest and every part it lists are
+    /// held: what a part that went out after its manifest completes (`Hub::publish_clock_model_part`),
+    /// as `admit_model` holds one whose parts came first. `None` while a part is still to come,
+    /// or when the store refused it (counted there).
+    pub fn admit_held(&self, id: &[u8; 32], now: Judged) -> Option<crate::models::Model> {
+        let mut records = self.model_records(id)?;
+        let Some(Record::ClockModel(manifest)) = records.pop() else {
+            return None;
+        };
+        let parts: Vec<ClockModelPart> = records
+            .into_iter()
+            .filter_map(|record| match record {
+                Record::ClockModelPart(part) => Some(part),
+                _ => None,
+            })
+            .collect();
+        // Joined only once every part it lists is held.
+        let listed = manifest.manifest().ok()?.parts;
+        if listed.is_empty() || parts.len() < listed.len() {
+            return None;
+        }
+        self.admit_model(&manifest, &parts, now)
     }
 
     /// A session opened, as `asker`. Called once for every session, as it starts. It is given
@@ -560,42 +919,46 @@ impl Network {
     }
 
     /// The session `source` closed: whatever it was given ends with it (a client's credit, its
-    /// free-tier place). A member's part of the products' records ends with its [`Membership`].
+    /// free-tier place, the raw record its link held for a twin). A member's part of the products' records ends with its [`Membership`].
     /// Called once for every session, as it ends, whichever side dialled.
     pub fn left(&self, source: u64) {
         self.credit.left(source);
+        // The raw record its link held for a tagged twin (`Consistency::forget`).
+        self.consistency.forget(source);
     }
 
     /// A record this relay is the first relay to hold (its own feeder's batch, an engine's or its
     /// own MLAT's positions and models, its own regional batches, a fault proof brought to it):
     /// it is the origin, and seeds it into the record's sharing group.
-    pub fn originate(&self, hub: &Hub, record: &Record, now_ms: u64) {
+    pub fn originate(&self, hub: &Hub, record: &Record, now: impl Into<Now>) {
+        let now = now.into();
         let point = self.point_for(hub, record);
-        self.tag(record, point, now_ms);
+        self.tag(record, point, now);
         if let Some((cell, product)) = crate::sharing::group_of(record, point) {
-            self.sharing.originate(record, cell, product, now_ms);
+            self.sharing.originate(record, cell, product, now);
         }
     }
 
     /// A batch this relay's own feeder published.
-    pub fn from_feeder(&self, hub: &Hub, batch: &Batch, now_ms: u64) {
-        self.originate(hub, &Record::Batch(batch.clone()), now_ms);
+    pub fn from_feeder(&self, hub: &Hub, batch: &Batch, now: impl Into<Now>) {
+        self.originate(hub, &Record::Batch(batch.clone()), now);
     }
 
     /// A batch from a feeder or a peer, its receiver's place `point` (as its group is reckoned
-    /// from it), at `now_ms` by the ingest clock: delivery tags it if its receiver is of the
-    /// areas this relay takes (`delivery`).
-    fn tag(&self, record: &Record, point: Option<Region>, now_ms: u64) {
+    /// from it), at `now`: delivery tags it if its receiver is of the areas this relay takes
+    /// (`delivery`). Its tags are kept by `M` (`Now::mono_ms`), as everything the relay holds is,
+    /// so a step of `J` keeps none past its window.
+    fn tag(&self, record: &Record, point: Option<Region>, now: Now) {
         if let Record::Batch(batch) = record {
-            self.delivery.hold(&self.selection, batch, point, now_ms);
+            self.delivery
+                .hold(&self.selection, batch, point, now.mono_ms());
         }
     }
 
     /// Where a record's group is reckoned from, when the record does not say: a batch's
     /// receiver's public cell, as described (never its site: the area a batch is grouped, tagged
     /// and answered for is its public cell's, `rendezvous::area_of_public`, as a feeder picks its
-    /// relays by); a clock model's tile centre, from its inline bytes or its first part
-    /// (`hold_part`).
+    /// relays by); a clock model's area, from its inline bytes or its first part (`hold_part`).
     fn point_for(&self, hub: &Hub, record: &Record) -> Option<Region> {
         match record {
             Record::Batch(batch) => batch
@@ -612,45 +975,91 @@ impl Network {
         }
     }
 
-    /// The held entry of model `id`, made when new (the oldest forgotten past `MODELS_HELD`).
-    fn with_model<T>(&self, id: [u8; 32], act: impl FnOnce(&mut HeldModel) -> T) -> Option<T> {
-        let mut held = self.models.lock().ok()?;
-        if let Some(model) = held.iter_mut().find(|model| model.id == id) {
-            return Some(act(model));
+    /// The held entry of model `id`, made when new (the oldest forgotten past `MODELS_HELD`),
+    /// changed by `act` and charged (`Models::settle`): a change with no room even alone is
+    /// undone, counted.
+    fn with_model(&self, id: [u8; 32], act: impl FnOnce(&mut HeldModel) -> bool) {
+        let Ok(mut models) = self.models.lock() else {
+            return;
+        };
+        let at = match models.held.iter().position(|model| model.id == id) {
+            Some(at) => at,
+            None => {
+                if models.held.len() >= MODELS_HELD {
+                    models.held.pop_front();
+                }
+                models.held.push_back(HeldModel {
+                    id,
+                    manifest: None,
+                    parts: Vec::new(),
+                    whole: false,
+                    pair: None,
+                });
+                models.held.len() - 1
+            }
+        };
+        let Some(model) = models.held.get_mut(at) else {
+            return;
+        };
+        let before = (model.manifest.clone(), model.parts.len());
+        if !act(model) {
+            return;
         }
-        if held.len() >= MODELS_HELD {
-            held.pop_front();
+        model.complete();
+        if !models.settle(&id) {
+            if let Some(model) = models.held.iter_mut().find(|model| model.id == id) {
+                model.manifest = before.0;
+                model.parts.truncate(before.1);
+                model.parts.shrink_to_fit();
+            }
+            models
+                .held
+                .retain(|model| model.manifest.is_some() || !model.parts.is_empty());
+            models.unheld += 1;
+            let _ = models.settle(&id);
         }
-        held.push_back(HeldModel {
-            id,
-            manifest: None,
-            parts: Vec::new(),
-        });
-        held.back_mut().map(act)
     }
 
     /// Holds a clock model's part (one too large for its manifest has them), for member links and
-    /// for the model's group (its first part names its tile).
+    /// for the model's group (its first part names its area): each index once, and only an index
+    /// a model can have (`clock_model::MAX_PARTS`).
     pub fn hold_part(&self, part: &ClockModelPart) {
-        let Ok(id) = part.model() else {
+        let (Ok(id), Ok(index)) = (part.model(), part.index()) else {
             return;
         };
+        if usize::from(index) >= tally_wire::clock_model::MAX_PARTS {
+            return;
+        }
         self.with_model(id, |model| {
-            if !model
+            if model
                 .parts
                 .iter()
-                .any(|known| known.index().ok() == part.index().ok())
+                .any(|known| known.index().ok() == Some(index))
             {
-                model.parts.push(part.clone());
+                return false;
             }
+            model.parts.push(part.clone());
+            true
         });
     }
 
     /// Holds a clock model's manifest, for the member links that carry a record citing it.
     pub fn hold_model(&self, manifest: &ClockModel) {
         self.with_model(manifest.id(), |model| {
-            model.manifest.get_or_insert_with(|| manifest.clone());
+            if model.manifest.is_some() {
+                return false;
+            }
+            model.manifest = Some(manifest.clone());
+            true
         });
+    }
+
+    /// Clock-model parts and manifests not held for want of the store's room, since start, and
+    /// what the models held are charged.
+    pub fn models_unheld(&self) -> (u64, usize) {
+        self.models
+            .lock()
+            .map_or((0, 0), |models| (models.unheld, models.charge.bytes()))
     }
 
     /// The parts held of model `id`, in index order.
@@ -659,8 +1068,10 @@ impl Network {
             .models
             .lock()
             .ok()
-            .and_then(|held| {
-                held.iter()
+            .and_then(|models| {
+                models
+                    .held
+                    .iter()
                     .find(|model| model.id == *id)
                     .map(|model| model.parts.clone())
             })
@@ -675,6 +1086,7 @@ impl Network {
             .models
             .lock()
             .ok()?
+            .held
             .iter()
             .find(|model| model.id == *id)?
             .manifest
@@ -688,39 +1100,53 @@ impl Network {
         Some(records)
     }
 
-    /// The area a client clock model is routed and grouped by: the area its full model's tile
-    /// centre lies in (`ClientClockModelContent::model`), when that is held (an engine publishes the
-    /// full model first, so it is). An area, never the centre: a client is routed nothing finer
-    /// than a public cell, and a client model is for the area's clients.
+    /// The area a client clock model is grouped by: its full model's area
+    /// (`ClientClockModelContent::model`, its pair model id), when that is held (an engine
+    /// publishes the full model first, so it is). An area: a client is routed nothing finer than a
+    /// public cell.
     pub fn client_model_area(&self, model: &tally_wire::ClientClockModel) -> Option<Region> {
-        let id = model.content().ok()?.model;
-        let manifest = self
-            .models
+        let pair = model.content().ok()?.model;
+        if let Some(held) = self.clock_models.get(&pair) {
+            return Some(held.area());
+        }
+        self.models
             .lock()
             .ok()?
+            .held
             .iter()
-            .find(|held| held.id == id)?
-            .manifest
-            .clone()?;
-        tally_wire::rendezvous::area_of_cell(self.model_point_of(&manifest)?)
+            .find_map(|held| held.pair.filter(|(id, _)| *id == pair))
+            .map(|(_, area)| area)
     }
 
-    /// A model's tile centre: from its inline bytes, or its first part's when it has parts.
-    fn model_point_of(&self, model: &ClockModel) -> Option<Region> {
+    /// Where a client clock model is routed: its area and every area whose border band holds it
+    /// (`tally_mlat::area::Band`), the areas whose fixes may cite it beside their own, so a client
+    /// of one area is sent the models of its neighbours its fixes cite.
+    pub fn client_model_places(&self, model: &tally_wire::ClientClockModel) -> Option<Vec<Region>> {
+        let area = self.client_model_area(model)?;
+        Some(
+            tally_mlat::area::border_band(&Regions::new([area]))
+                .iter()
+                .collect(),
+        )
+    }
+
+    /// A model's area: from its inline bytes, or its first part's when it has parts.
+    pub fn model_point_of(&self, model: &ClockModel) -> Option<Region> {
         let manifest = model.manifest().ok()?;
         if manifest.parts.is_empty() {
-            return tile_point(&manifest.inline);
+            return model_area(&manifest.inline);
         }
         let first = self.parts_of(&model.id()).into_iter().next()?;
         (first.index().ok()? == 0).then_some(())?;
-        tile_point(first.data())
+        model_area(first.data())
     }
 
     /// A group record a member sent this one: a piece of its group, pushed on down this relay's
     /// stripes, and the sender corroborated first-hand.
-    pub fn from_peer(&self, hub: &Hub, asker: &Asker, record: &Record, now_ms: u64) {
+    pub fn from_peer(&self, hub: &Hub, asker: &Asker, record: &Record, now: impl Into<Now>) {
+        let now = now.into();
         let point = self.point_for(hub, record);
-        self.tag(record, point, now_ms);
+        self.tag(record, point, now);
         let Some((cell, product)) = crate::sharing::group_of(record, point) else {
             return;
         };
@@ -731,9 +1157,9 @@ impl Network {
             .contains(&asker.key)
         {
             self.shared_in.fetch_add(1, Ordering::Relaxed);
-            self.credit.corroborate_relay(asker.key, now_ms);
+            self.credit.corroborate_relay(asker.key, now);
             self.sharing
-                .received(&asker.key, record, cell, product, now_ms);
+                .received(&asker.key, record, cell, product, now);
         }
     }
 
@@ -742,64 +1168,110 @@ impl Network {
     /// one is (`tag`), and held and pushed on down its stripe in the group that rebuilt it now that
     /// it passed (`Sharing::passed_on`), but not received into its group again, and no member
     /// corroborated by it, since none sent it.
-    pub fn rebuilt(&self, hub: &Hub, rebuilt: Rebuilt, record: &Record, now_ms: u64) {
+    pub fn rebuilt(&self, hub: &Hub, rebuilt: Rebuilt, record: &Record, now: impl Into<Now>) {
+        let now = now.into();
         let point = self.point_for(hub, record);
-        self.tag(record, point, now_ms);
-        self.sharing.passed_on(rebuilt, record, now_ms);
+        self.tag(record, point, now);
+        self.sharing.passed_on(rebuilt, record, now.judged().ms());
     }
 
     /// A regional batch, or its client form, that `asker` sent or this relay rebuilt from its
     /// group's parity (`Hub::take_rebuilt`): the one intake each has. Its signature is checked
     /// first, and only one that passes is taken into its group by `share`, as where it came from
-    /// says, so one that fails travels no further. A regional batch then goes to the products,
-    /// which forward it unchanged when its cell is in an area this relay takes
-    /// (`Products::take_forward`); its client form is forwarded to this relay's clients while
-    /// fresh (a relay's own word). Whether it passed.
+    /// says, so one that fails travels no further; one signed outside this relay's window of time
+    /// (`Hub::in_window`, RFC-0171 §3.6) is unusable here: held in its group as every copy is, so
+    /// no receipt turns on this relay's clock, and used no further; one whose
+    /// signed time cannot be read is refused. A regional batch in the window then goes to
+    /// the products, which forward it unchanged when its cell is in an area this relay takes
+    /// (`Products::take_forward`), once (`Hub::publish_as`); its client form is forwarded to this
+    /// relay's clients while fresh (a relay's own word).
     pub fn take_regional(
         &self,
         hub: &Hub,
         asker: &Asker,
         record: Record,
         share: impl FnOnce(&Record),
-    ) -> bool {
+    ) -> Regional {
+        // One reading of both clocks, and whether the judging one judged, for every judgement of
+        // this intake: its window, what is passed on, and the products' stamp.
+        let stamp = hub.stamp_now();
+        let now = crate::strikes::Now::from(stamp);
         match record {
             Record::RegionalBatch(regional) => {
                 let Some(regional) = crate::products::Verified::of(regional) else {
-                    return false;
+                    return Regional::Refused;
                 };
-                share(&Record::RegionalBatch(regional.batch().clone()));
-                self.products.regional_from(asker, regional, hub.now_ms());
-                true
+                let window = hub.in_window(regional.batch().wall_ms().ok(), now);
+                if window == crate::hub::InWindow::Unreadable {
+                    return Regional::Refused;
+                }
+                if window == crate::hub::InWindow::Late {
+                    share(&Record::RegionalBatch(regional.batch().clone()));
+                    return Regional::Late;
+                }
+                // Judged by what is passed on by hash before it is held in its group or used, so
+                // its lease covers it (`Hub::take_passed_on`): a restart, graceful or not, never
+                // merges it into the world again, where the products' own memory of it
+                // (`regional_seen`) is gone. Only a new one is used; the products forward it once
+                // from here (`Hub::forward_taken`). One there was no room for is let go, never
+                // held as had, so its group asks for it again.
+                let batch = regional.batch().clone();
+                let verdict =
+                    hub.take_passed_on(batch.hash(), batch.wall_ms().ok(), asker.deliverer(), now);
+                match verdict {
+                    crate::strikes::Verdict::Full => Regional::Full,
+                    crate::strikes::Verdict::New => {
+                        share(&Record::RegionalBatch(batch));
+                        self.products.regional_from(asker, regional, stamp);
+                        Regional::Passed
+                    }
+                    crate::strikes::Verdict::Duplicate => {
+                        share(&Record::RegionalBatch(batch));
+                        Regional::Passed
+                    }
+                    crate::strikes::Verdict::Late
+                    | crate::strikes::Verdict::Unjudged
+                    | crate::strikes::Verdict::Ahead
+                    | crate::strikes::Verdict::Unanchored => {
+                        share(&Record::RegionalBatch(batch));
+                        Regional::Late
+                    }
+                }
             }
             Record::ClientRegionalBatch(regional) => {
                 if regional.verify().is_err() {
-                    return false;
+                    return Regional::Refused;
                 }
-                let fresh = regional.content().is_ok_and(|content| {
-                    let stamp_ms = hub.now_ms();
-                    content
-                        .wall_ms
-                        .saturating_add(crate::products::REGIONAL_MAX_AGE_MS)
-                        >= stamp_ms
-                        && content.wall_ms
-                            <= stamp_ms.saturating_add(crate::products::REGIONAL_MAX_AHEAD_MS)
-                });
+                let window = hub.in_window(regional.wall_ms().ok(), now);
+                if window == crate::hub::InWindow::Unreadable {
+                    return Regional::Refused;
+                }
+                if window == crate::hub::InWindow::Late {
+                    share(&Record::ClientRegionalBatch(regional));
+                    return Regional::Late;
+                }
+                // Inside the relay's one window for what relays sign: fresh to its clients.
                 let record = Record::ClientRegionalBatch(regional);
                 share(&record);
-                if fresh {
-                    hub.publish_as(asker.source, record);
-                }
-                true
+                hub.publish_as(asker.source, asker.deliverer(), record);
+                Regional::Passed
             }
-            _ => false,
+            _ => Regional::Refused,
         }
     }
 
     /// A record `asker` sent that this relay refused: its group's member counts it as had and
-    /// never pushes it on (`sharing::Sharing::refused`). Only a member of the group's refusal is
+    /// owed by nobody, notes `asker` as its deliverer, and pushes it on unheld when a manifest it
+    /// holds lists it (`sharing::Sharing::refused`, `Member::refused`). Only a member of the group's refusal is
     /// noted, as only a member's piece is received (`from_peer`): a stranger adds nothing to a
     /// group, not even an entry saying what it lacks.
-    pub fn refused_from_peer(&self, hub: &Hub, asker: &Asker, record: &Record, now_ms: u64) {
+    pub fn refused_from_peer(
+        &self,
+        hub: &Hub,
+        asker: &Asker,
+        record: &Record,
+        now: impl Into<Now>,
+    ) {
         let point = self.point_for(hub, record);
         let Some((cell, product)) = crate::sharing::group_of(record, point) else {
             return;
@@ -810,53 +1282,98 @@ impl Network {
             .members(cell, product)
             .contains(&asker.key)
         {
-            self.sharing.refused(record, cell, product, now_ms);
+            self.sharing.refused(asker.key, record, cell, product, now);
+        }
+    }
+
+    /// A record peer `from` delivered that this relay had no room to take in
+    /// (`strikes::Verdict::Full`): when `from` is a member of its group, credited there as its
+    /// deliverer, so its receipt is not short for this relay's want of room
+    /// (`sharing::Sharing::credit`).
+    pub fn no_room_from_peer(
+        &self,
+        hub: &Hub,
+        from: PublicKey,
+        record: &Record,
+        now: impl Into<Now>,
+    ) {
+        let point = self.point_for(hub, record);
+        let Some((cell, product)) = crate::sharing::group_of(record, point) else {
+            return;
+        };
+        if self.sharing.groups.members(cell, product).contains(&from) {
+            self.sharing.credit(from, record, cell, product, now);
         }
     }
 
     /// What the timed duties hand on now: what they publish, each into the hub's fan-out as the
     /// relay's own, and the records the sharing groups rebuilt from parity, each taken in as a
     /// member's piece is (`Hub::take_rebuilt`).
-    pub fn tick(&self, hub: &Hub, now_ms: u64) -> crate::sharing::Ticked {
-        let identity = self.identity();
+    pub fn tick(&self, hub: &Hub, now: impl Into<Now>) -> crate::sharing::Ticked {
+        let now = now.into();
+        let signer = self.signer();
+        // What the tables of what was taken have passed is let go, used or not; and every table
+        // begun, once the clock is synced (`Hub::begin_strikes`).
+        hub.sweep_strikes();
+        // Nothing this relay signs is signed by a clock not synced (RFC-0171 §3.6): every duty
+        // signs through its signer (`signer::Signer`), and the engine is not stepped meanwhile.
+        // Whether the clock judged is `now`'s, read with it, never the clock read again later.
+        let synced = now.judging();
         let mut out = Vec::new();
-        out.extend(self.directory.tick(hub, identity, now_ms));
+        // The directory's lifetimes and ranks are judged by the clock: not while it does not judge.
+        if synced {
+            out.extend(self.directory.tick(hub, signer, now));
+        }
         let crate::sharing::Ticked {
             rebuilt,
             unreadable,
             published,
-        } = self.sharing.tick(hub, identity, now_ms);
+        } = self.sharing.tick(hub, signer, now);
         out.extend(published);
         // The products seal by the watermark as epochs close (`products::Sealer`); this takes
         // what they signed.
-        out.extend(self.products.tick(identity));
-        self.standing.tick(self.products.watermark_ms());
-        // The feeder figures, signed as this relay's own claim, for its clients: by the ingest
-        // clock they were counted by (`Hub::clocked`), so their hours are the batches' hours.
-        let figures_ms = hub.now_ms();
-        if let Some(identity) = identity
-            && self.figures.due(figures_ms)
-        {
-            let standing: std::collections::HashSet<PublicKey> =
-                self.standing.agreeing(now_ms).into_iter().collect();
-            out.extend(
-                self.figures
-                    .sign(identity, figures_ms, |key| standing.contains(key))
-                    .into_iter()
-                    .map(Record::FeederFigures),
-            );
+        out.extend(self.products.tick());
+        // Standing settles transmissions by their signed transmit times, so by the judging clock
+        // at the products' watermark (the time the forwarded fixes were taken in by), and not at
+        // all by one read while the clock did not judge.
+        let watermark = self.products.watermark();
+        if let Some(at) = watermark.judging_at() {
+            self.standing.tick(at.judged());
+            // The models no record still to come can cite are let go by the same clock.
+            self.clock_models.tick(at.judged());
         }
+        // The feeder figures, signed as this relay's own claim, for its clients: by the judging
+        // clock as `now` read it, and never by one read while it did not judge.
+        if synced && self.figures.due(now.judged()) {
+            self.with_signing(now, |identity| {
+                if let Some(identity) = identity {
+                    let standing: std::collections::HashSet<PublicKey> =
+                        self.standing.agreeing(now.judged()).into_iter().collect();
+                    out.extend(
+                        self.figures
+                            .sign(identity, now.judged(), |key| standing.contains(key))
+                            .into_iter()
+                            .map(Record::FeederFigures),
+                    );
+                }
+            });
+        }
+        // Credit counts corroboration by the judging clock: not while it does not judge. How often
+        // it is renewed is this relay's own pace, by `M`, so a step of `J` back stalls no renewal.
         let last = self.corroborated_ms.load(Ordering::Relaxed);
-        if now_ms.saturating_sub(last) >= CORROBORATE_EVERY_MS {
-            self.corroborated_ms.store(now_ms, Ordering::Relaxed);
-            for receiver in self.standing.agreeing(now_ms) {
-                self.credit.corroborate_receiver(receiver, now_ms);
+        if synced
+            && (last == NEVER_MS || now.mono_ms().saturating_sub(last) >= CORROBORATE_EVERY_MS)
+        {
+            self.corroborated_ms.store(now.mono_ms(), Ordering::Relaxed);
+            for receiver in self.standing.agreeing(now.judged()) {
+                self.credit.corroborate_receiver(receiver, now);
             }
         }
+        self.credit.expire(now);
         if let Some(mlat) = self.mlat() {
             // The choice is recomputed only when what it follows moved (`Selection::solved`), and
             // handed on only when it came out different.
-            let (generation, areas) = self.selection.solved(&self.directory, now_ms);
+            let (generation, areas) = self.selection.solved(&self.directory, now.judged());
             let changed = self
                 .mlat_areas
                 .lock()
@@ -875,8 +1392,17 @@ impl Network {
                 self.standing.set_areas(&areas);
                 mlat.set_areas(areas, hub.site_records());
             }
-            self.publish_cuts(mlat.take_cuts(), now_ms);
-            let published = mlat.take_published(self.products.watermark_ms());
+            self.publish_cuts(mlat.take_cuts(), crate::strikes::Now::from(now));
+            // Asked every tick: the host steps nothing and signs nothing by a watermark that is
+            // not judging, and collapses the steps it passed meanwhile once it judges again.
+            let published = mlat.take_published(self.products.watermark());
+            // Its own models are its own `Arc`s, held before their manifests go out, so the hub's
+            // assembly finds them held and decodes nothing (`Models::insert_own`).
+            for own in mlat.take_own_models() {
+                let _ = self
+                    .clock_models
+                    .insert_own(own.model, own.engine, now.judged());
+            }
             // A model's parts come before its manifest; held first, they place it.
             for record in &published {
                 match record {
@@ -887,7 +1413,7 @@ impl Network {
             }
             for record in published {
                 // This relay originated it: seeded into the sharing group of its area.
-                self.originate(hub, &record, now_ms);
+                self.originate(hub, &record, now);
                 out.push(record);
             }
         }
@@ -898,7 +1424,7 @@ impl Network {
                 record,
                 Record::RegionalBatch(_) | Record::ClientRegionalBatch(_)
             ) {
-                self.originate(hub, record, now_ms);
+                self.originate(hub, record, now);
             }
         }
         crate::sharing::Ticked {
@@ -910,8 +1436,9 @@ impl Network {
 
     /// What the duties address to other relays now, each down a session to that relay (`peers`):
     /// sharing's sends to its members, and the one-hop raw links of this relay's MLAT areas.
-    fn carry(&self, hub: &Arc<Hub>, now_ms: u64, raw_due: bool) {
-        let Some(identity) = self.identity() else {
+    fn carry(&self, hub: &Arc<Hub>, now: Now, raw_due: bool) {
+        // The key for the links' handshakes, which sign no record.
+        let Some(identity) = self.signer().map(Signer::handshake) else {
             return;
         };
         // Each send carries its charge (`sharing::Addressed`) to the link, which holds it until
@@ -922,22 +1449,23 @@ impl Network {
         }
         for (member, records) in by_member {
             let Some(address) = self.directory.address_of(&member) else {
+                self.sharing.unaddressed(records, now);
                 continue;
             };
             let relay = RelayAddress {
                 key: member,
                 address,
             };
-            self.peers.send(hub, identity, relay, records, now_ms);
+            self.peers.send(hub, &identity, relay, records, now);
         }
-        self.peers.expire(now_ms);
+        self.peers.expire(now);
         if raw_due {
             let sources = if self.mlat().is_some() {
-                self.selection.raw_sources(&self.directory, now_ms)
+                self.selection.raw_sources(&self.directory, now.judged())
             } else {
                 Vec::new()
             };
-            self.peers.keep_raw(hub, identity, sources, now_ms);
+            self.peers.keep_raw(hub, &identity, sources, now);
         }
     }
 }
@@ -948,7 +1476,7 @@ impl Network {
 /// they open is spawned on that runtime, `runtime`).
 ///
 /// Never on the async runtime's workers. A pass is synchronous work whose size follows what the
-/// relay holds and was handed (a window step's positions and models published at once, the
+/// relay holds and was handed (an MLAT step's fixes and models published at once, the
 /// sharing groups' manifests and parity, the directory), and a runtime worker held by it holds
 /// every task woken from it there with it: a pass that took ten seconds on a runtime worker held
 /// the subscribers' writers and feeders' readers it woke for those ten seconds, and raw's p99 went
@@ -967,13 +1495,13 @@ pub fn start(hub: Arc<Hub>, runtime: tokio::runtime::Handle) {
         .name("tally-duties".to_owned())
         .spawn(move || {
             let _runtime = runtime.enter();
-            let mut raw_ms = 0;
+            let mut raw_at = None;
             loop {
                 match alive.recv_timeout(TICK) {
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                     Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
                 }
-                pass(&hub, &mut raw_ms);
+                pass(&hub, &mut raw_at);
             }
         });
     if let Err(error) = spawned {
@@ -982,11 +1510,14 @@ pub fn start(hub: Arc<Hub>, runtime: tokio::runtime::Handle) {
     }
 }
 
-/// One pass of the timed duties (`start`).
-pub(crate) fn pass(hub: &Arc<Hub>, raw_ms: &mut u64) {
+/// One pass of the timed duties (`start`). The one-hop raw links are refreshed every `peers::RAW_EVERY_MS` of the monotonic clock since
+/// `raw_at`: a cadence, which judges nothing, so a relay's clock standing still (a test's script
+/// between its steps) never stops it.
+pub(crate) fn pass(hub: &Arc<Hub>, raw_at: &mut Option<std::time::Instant>) {
     hub.idle();
-    let now_ms = wall_ms();
-    let ticked = hub.network().tick(hub, now_ms);
+    // The relay's one clock, which this read also watches for a real step (`serve`).
+    let now = hub.stamp_now();
+    let ticked = hub.network().tick(hub, now);
     for record in ticked.published {
         hub.publish_own(record);
     }
@@ -997,30 +1528,32 @@ pub(crate) fn pass(hub: &Arc<Hub>, raw_ms: &mut u64) {
         hub.refuse_rebuilt(rebuilt);
     }
     // Positions held for their models past the wait go out even with nothing new coming.
-    hub.release_awaiting();
-    for (source, regional) in hub.network().products.take_forward() {
-        hub.publish_as(source, Record::RegionalBatch(regional));
+    hub.release_awaiting(None);
+    for (source, _, regional) in hub.network().products.take_forward() {
+        hub.forward_taken(source, Record::RegionalBatch(regional));
     }
-    let raw_due = now_ms.saturating_sub(*raw_ms) >= crate::peers::RAW_EVERY_MS;
+    let raw_due = raw_at.is_none_or(|at| {
+        at.elapsed() >= std::time::Duration::from_millis(crate::peers::RAW_EVERY_MS)
+    });
     if raw_due {
-        *raw_ms = now_ms;
+        *raw_at = Some(std::time::Instant::now());
     }
-    hub.network().carry(hub, now_ms, raw_due);
+    hub.network().carry(hub, now.into(), raw_due);
 }
 
-/// The finest cells a positions record or a clock model places aircraft at, for routing by
-/// region: each solution's position; a model's tile centre. `None` for anything else, or a model
-/// whose bytes are not all in its manifest (its parts carry the rest), which goes whole-world.
+/// The cells a positions record or a clock model is routed at, by region: each fix's position, its
+/// finest cell; a model's area. `None` for anything else, or a model whose bytes are not all in
+/// its manifest (its parts carry the rest), which goes whole-world.
 pub fn points_of(record: &Record) -> Option<Arc<[Region]>> {
     let points: Vec<Region> = match record {
-        Record::Positions(positions) | Record::Provisional(positions) => {
+        Record::Positions(positions) => {
             let solved = solved(positions)?;
             let mut points: Vec<Region> = solved
                 .iter()
-                .filter_map(|solution| {
+                .filter_map(|fix| {
                     Region::point(&tally_wire::Location {
-                        lat_e7: solution.lat_e7,
-                        lon_e7: solution.lon_e7,
+                        lat_e7: fix.lat_e7,
+                        lon_e7: fix.lon_e7,
                         alt_m: 0,
                         precision_m: 0,
                     })
@@ -1037,74 +1570,54 @@ pub fn points_of(record: &Record) -> Option<Arc<[Region]>> {
     Some(points.into())
 }
 
-/// Where one solution of a positions record placed its aircraft, and the model it cites: what
-/// routing and sharing read of a record, raw (format 3, 4) or tagged (format 5, 6) alike.
-#[derive(Clone, Copy, Debug)]
+/// Where one fix of a positions record placed its aircraft, and the models it was solved under:
+/// what routing and sharing read of a record, raw (format 7) or tagged (format 8) alike.
+#[derive(Clone, Debug)]
 pub struct Solved {
     pub lat_e7: i32,
     pub lon_e7: i32,
-    pub clock_model: [u8; 32],
+    /// Their pair model ids, ascending (`tally_wire::Fix::models`).
+    pub clock_models: Vec<[u8; 32]>,
 }
 
-/// The solutions of a positions record of either form, as routing reads them (`Solved`).
+/// The fixes of a positions record of either form, as routing reads them (`Solved`).
 pub fn solved(positions: &Positions) -> Option<Vec<Solved>> {
+    fn of<O>(fixes: &[tally_wire::Fix<O>]) -> Vec<Solved> {
+        fixes
+            .iter()
+            .map(|fix| Solved {
+                lat_e7: fix.lat_e7,
+                lon_e7: fix.lon_e7,
+                clock_models: fix.models.clone(),
+            })
+            .collect()
+    }
     if positions.is_tagged() {
-        let content = positions.tagged_solutions().ok()?;
-        Some(
-            content
-                .solutions
-                .iter()
-                .map(|solution| Solved {
-                    lat_e7: solution.lat_e7,
-                    lon_e7: solution.lon_e7,
-                    clock_model: solution.clock_model,
-                })
-                .collect(),
-        )
+        Some(of(&positions.tagged_fixes().ok()?.fixes))
     } else {
-        let content = positions.solutions().ok()?;
-        Some(
-            content
-                .solutions
-                .iter()
-                .map(|solution| Solved {
-                    lat_e7: solution.lat_e7,
-                    lon_e7: solution.lon_e7,
-                    clock_model: solution.clock_model,
-                })
-                .collect(),
-        )
+        Some(of(&positions.fixes().ok()?.fixes))
     }
 }
 
-/// The finest cell of a clock model's tile centre, when the model's bytes are in its manifest.
+/// A clock model's area, when the model's bytes are in its manifest.
 pub fn model_point(model: &tally_wire::ClockModel) -> Option<Region> {
-    tile_point(&model.manifest().ok()?.inline)
+    model_area(&model.manifest().ok()?.inline)
 }
 
-/// The finest cell of the centre of the tile a model's encoding leads with
-/// (`tally_mlat::area::centre`, the one projection, which also decides who fits it).
-fn tile_point(prefix: &[u8]) -> Option<Region> {
-    let tile = tally_mlat_solver::publish::tile_of(prefix).ok()?;
-    Region::point(&tally_mlat::area::centre(tile)).ok()
-}
-
-pub fn wall_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |elapsed| {
-            u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
-        })
+/// The area a model's encoding leads with (`publish::area_of`), which also decides who fits it.
+fn model_area(prefix: &[u8]) -> Option<Region> {
+    tally_mlat_solver::publish::area_of(prefix).ok()
 }
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::disallowed_methods, reason = "a test's scripted readings")]
     use super::*;
-    use tally_mlat_solver::geo::{self, Geodetic};
+    use tally_wire::Identity;
 
     /// A hosted MLAT whose every ask lasts until the runtime's task has beaten while it lasted
     /// (`beats` moved past where it stood when the ask began): a pass of the duties as long as
-    /// one that publishes a window step's solutions, held for as long as it takes to see whether
+    /// one that publishes a large MLAT step, held for as long as it takes to see whether
     /// the runtime's tasks go on meanwhile. Seen, it says so in `beat_seen`; a pass that holds the
     /// runtime's only thread can never see one, and gives up at `HANG`.
     struct Slow {
@@ -1119,11 +1632,15 @@ mod tests {
     impl MlatHost for Slow {
         fn set_areas(&self, _: Regions, _: Vec<tally_mlat::intake::SiteRecord>) {}
 
+        fn raw(&self) -> Option<Arc<dyn crate::standing::Raw>> {
+            None
+        }
+
         fn offer_description(&self, _: &tally_mlat::intake::SiteRecord, _: u64) {}
 
         fn offer_batch(&self, _: &Arc<tally_wire::Decoded>, _: u64) {}
 
-        fn take_published(&self, _: u64) -> Vec<Record> {
+        fn take_published(&self, _: crate::products::Watermark) -> Vec<Record> {
             self.asked.fetch_add(1, Ordering::SeqCst);
             if self.beat_seen.load(Ordering::SeqCst) {
                 return Vec::new();
@@ -1148,8 +1665,9 @@ mod tests {
             crate::mlat_host::MlatReport::default()
         }
 
-        fn sealed_bins(&self) -> Option<tally_mlat_solver::held::SealedBins> {
-            None
+        // It publishes no model.
+        fn take_own_models(&self) -> Vec<crate::mlat_host::OwnModel> {
+            Vec::new()
         }
     }
 
@@ -1165,14 +1683,15 @@ mod tests {
             .enable_all()
             .build()
             .map_err(|error| error.to_string())?;
-        let hub = Arc::new(Hub::new(8, crate::sharing::Deadlines::RELAY));
+        let hub = Arc::new(
+            Hub::new(8, crate::sharing::Deadlines::RELAY).memory(crate::hub::DEFAULT_MEMORY, true),
+        );
         let slow = Arc::new(Slow {
             beats: AtomicU64::new(0),
             beat_seen: std::sync::atomic::AtomicBool::new(false),
             asked: AtomicU64::new(0),
         });
-        hub.network()
-            .host_mlat(Arc::clone(&slow) as Arc<dyn MlatHost>);
+        hub.host_mlat(Arc::clone(&slow) as Arc<dyn MlatHost>)?;
         runtime.block_on(async {
             start(Arc::clone(&hub), tokio::runtime::Handle::current());
             let started = std::time::Instant::now();
@@ -1188,36 +1707,22 @@ mod tests {
         );
         Ok(())
     }
-    use tally_mlat_solver::tile::{LEVELS, Tile};
-    use tally_wire::rendezvous::area_of_cell;
-
-    /// A model is routed by the area that fits its tile: the region `model_point` places it at is
-    /// in the one area whose MLAT relays own the tile (`tally_mlat::window::owns`), wherever the
-    /// tile is and at every level, because both read the one projection.
+    /// A model is routed by its area: the one its encoding leads with, inline or in its first
+    /// part, wherever the area is.
     #[test]
-    fn a_model_is_routed_to_the_area_whose_relays_fit_its_tile() -> Result<(), String> {
+    fn a_model_is_routed_by_its_area() -> Result<(), String> {
         let mut checked = 0;
         for lat in (-80..=80).step_by(7) {
             for lon in (-179..=179).step_by(11) {
-                let point = geo::to_ecef(Geodetic {
-                    lat_deg: f64::from(lat) + 0.37,
-                    lon_deg: f64::from(lon) + 0.61,
-                    height_m: 10_000.0,
-                });
-                let mm = point.map(|axis| (axis * 1000.0).round() as i64);
-                for level in 0..LEVELS {
-                    let tile = Tile::containing(level, mm);
-                    let routed = tile_point(&tile.bytes()).ok_or("no point")?;
-                    let area = area_of_cell(routed).ok_or("no area")?;
-                    assert!(
-                        tally_mlat::window::owns(&Regions::new([area]), tile),
-                        "{tile:?} routed to {area:?}, which does not fit it"
-                    );
-                    checked += 1;
-                }
+                let area = tally_wire::rendezvous::area_at(f64::from(lat) + 0.37, f64::from(lon))
+                    .map_err(|error| error.to_string())?;
+                let mut prefix = tally_mlat_solver::SPEC_VERSION.to_be_bytes().to_vec();
+                prefix.extend_from_slice(&area.as_u64().to_be_bytes());
+                assert_eq!(model_area(&prefix), Some(area));
+                checked += 1;
             }
         }
-        assert!(checked > 1_000);
+        assert!(checked > 300);
         Ok(())
     }
 
@@ -1230,11 +1735,15 @@ mod tests {
     impl MlatHost for Recording {
         fn set_areas(&self, _: Regions, _: Vec<tally_mlat::intake::SiteRecord>) {}
 
+        fn raw(&self) -> Option<Arc<dyn crate::standing::Raw>> {
+            None
+        }
+
         fn offer_description(&self, _: &tally_mlat::intake::SiteRecord, _: u64) {}
 
         fn offer_batch(&self, _: &Arc<tally_wire::Decoded>, _: u64) {}
 
-        fn take_published(&self, _: u64) -> Vec<Record> {
+        fn take_published(&self, _: crate::products::Watermark) -> Vec<Record> {
             Vec::new()
         }
 
@@ -1246,8 +1755,9 @@ mod tests {
             crate::mlat_host::MlatReport::default()
         }
 
-        fn sealed_bins(&self) -> Option<tally_mlat_solver::held::SealedBins> {
-            None
+        // It publishes no model.
+        fn take_own_models(&self) -> Vec<crate::mlat_host::OwnModel> {
+            Vec::new()
         }
 
         fn offer_cut(&self, cut: crate::mlat_host::Cut) {
@@ -1270,14 +1780,15 @@ mod tests {
         let text = |error: &dyn std::fmt::Display| error.to_string();
         let here = tally_wire::rendezvous::area_at(51.5, -0.1).map_err(|e| text(&e))?;
         let elsewhere = tally_wire::rendezvous::area_at(48.8, 2.3).map_err(|e| text(&e))?;
-        let hub = Hub::new(8, crate::sharing::Deadlines::RELAY);
+        let hub =
+            Hub::new(8, crate::sharing::Deadlines::RELAY).memory(crate::hub::DEFAULT_MEMORY, true);
         let network = hub.network();
         let me = Identity::from_seed([60; 32]);
-        network.adopt_identity(me.clone());
+        network.adopt_identity(crate::signer::twin(&me));
         network.directory.adopt_own_key(me.public());
         let recording = Arc::new(Recording::default());
-        network.host_mlat(Arc::clone(&recording) as Arc<dyn MlatHost>);
-        let now = wall_ms();
+        hub.host_mlat(Arc::clone(&recording) as Arc<dyn MlatHost>)?;
+        let now = hub.now();
         let strong: Vec<Identity> = (0..5u8)
             .map(|n| Identity::from_seed([70 + n; 32]))
             .collect();
@@ -1294,8 +1805,8 @@ mod tests {
                     mlat_cores: cores,
                     feeder_slots: 10,
                     network: group,
-                    issued_ms: now,
-                    expires_ms: now + 600_000,
+                    issued_ms: now.ms(),
+                    expires_ms: now.later(tally_wire::budget::policy::<_, 600_000>()).ms(),
                 },
             )
             .map_err(|e| text(&e))
@@ -1362,7 +1873,13 @@ mod tests {
                     },
                 )
                 .map_err(|e| text(&e))?;
-                network.handle(&hub, &asker(sender), Record::MlatCut(signed), now, None);
+                network.handle(
+                    &hub,
+                    &asker(sender),
+                    Record::MlatCut(signed),
+                    hub.stamp_now(),
+                    None,
+                );
                 Ok(())
             };
         let taken = || {
@@ -1390,6 +1907,193 @@ mod tests {
         assert_eq!(cuts[1].origin, legit.public());
         assert_eq!(cuts[1].areas, vec![here], "an area it does not solve");
         assert_eq!(network.cuts(), (0, 2, 3));
+        Ok(())
+    }
+
+    /// A clock model's parts are a peer's word: each is charged to the batch store before it is
+    /// held, an index no model can have is not held, nor one held already, and past the store's
+    /// room the oldest models go to make it, or the part is not held, counted. Before, a peer could
+    /// grow one model's parts and the list of models without bound, charged to nothing.
+    #[test]
+    fn clock_model_parts_are_charged_capped_and_bounded_by_the_store() {
+        let hub = Hub::new(8, crate::sharing::Deadlines::RELAY);
+        let network = hub.network();
+        let gauge = crate::budget::Gauge::new(crate::budget::Store::Batches, 64 * 1024);
+        if let Ok(mut models) = network.models.lock() {
+            models.charge = gauge.empty();
+        }
+        let data = vec![7u8; 1024];
+        let past = u16::try_from(tally_wire::clock_model::MAX_PARTS).unwrap_or(u16::MAX);
+        network.hold_part(&ClockModelPart::new([1; 32], past, &data));
+        network.hold_part(&ClockModelPart::new([1; 32], 0, &data));
+        network.hold_part(&ClockModelPart::new([1; 32], 0, &data));
+        let parts = |id: [u8; 32]| {
+            network.models.lock().map_or(0, |models| {
+                models
+                    .held
+                    .iter()
+                    .find(|model| model.id == id)
+                    .map_or(0, |model| model.parts.len())
+            })
+        };
+        assert_eq!(
+            parts([1; 32]),
+            1,
+            "a part past MAX_PARTS or held twice was held"
+        );
+        let charged = |network: &Network| network.models_unheld().1;
+        assert!(charged(network) >= 1024, "a held part is charged");
+        assert_eq!(gauge.held(), charged(network), "the store holds the charge");
+        for id in 2..200u8 {
+            network.hold_part(&ClockModelPart::new([id; 32], 0, &data));
+        }
+        assert!(gauge.held() <= gauge.limit(), "the store's room holds");
+        assert_eq!(parts([1; 32]), 0, "the oldest model went to make room");
+        assert_eq!(parts([199; 32]), 1, "the newest part is held");
+        let whole = vec![7u8; 128 * 1024];
+        network.hold_part(&ClockModelPart::new([250; 32], 0, &whole));
+        assert_eq!(
+            parts([250; 32]),
+            0,
+            "a part larger than the store is not held"
+        );
+        assert_eq!(network.models_unheld().0, 1, "and is counted");
+        assert_eq!(gauge.held(), charged(network));
+    }
+
+    /// A clock not synced and an hour ahead reads every offer expired, so before, the sends
+    /// drained for the members it held went nowhere (`carry`). Now an offer's expiry is judged
+    /// only while the clock judges, and a send for a member with no offer held is queued again
+    /// while it does not, then let go once it does, each counted.
+    #[test]
+    fn sends_drained_while_the_clock_is_unsynced_and_ahead_are_carried_or_kept()
+    -> Result<(), String> {
+        const BASE_MS: u64 = 1_791_244_800_000;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| error.to_string())?;
+        let _entered = runtime.enter();
+        let wall = Arc::new(AtomicU64::new(BASE_MS));
+        let monotonic = Arc::new(AtomicU64::new(BASE_MS));
+        let (judging, mono) = (Arc::clone(&wall), Arc::clone(&monotonic));
+        let hub = Arc::new(Hub::on(
+            8,
+            crate::clock::RelayClock::scripted_apart(
+                Arc::new(move || judging.load(Ordering::Relaxed)),
+                Arc::new(move || mono.load(Ordering::Relaxed)),
+            ),
+            crate::sharing::Deadlines::RELAY,
+        ));
+        let network = hub.network();
+        let me = Identity::from_seed([91; 32]);
+        let (member, stranger) = (Identity::from_seed([92; 32]), Identity::from_seed([93; 32]));
+        network.adopt_identity(crate::signer::twin(&me));
+        // The hub plans no room for sharing: its sends get a store of their own.
+        network.sharing.charge_to(crate::budget::Gauge::unlimited(
+            crate::budget::Store::Batches,
+        ));
+        let offer = tally_wire::ProviderOffer::sign(
+            &member,
+            &tally_wire::ProviderOfferContent {
+                address: "203.0.113.7:10900".to_owned(),
+                cell: Region::containing(
+                    &tally_wire::Location {
+                        lat_e7: 340_000_000,
+                        lon_e7: -1_180_000_000,
+                        alt_m: 0,
+                        precision_m: 0,
+                    },
+                    tally_wire::rendezvous::AREA_RESOLUTION,
+                )
+                .map_err(|error| error.to_string())?,
+                products: tally_wire::Streams::RAW,
+                stripes_of: 1,
+                stripes: 1,
+                mlat_cores: 0,
+                feeder_slots: 10,
+                network: 1,
+                issued_ms: BASE_MS,
+                expires_ms: BASE_MS + 600_000,
+            },
+        )
+        .map_err(|error| error.to_string())?;
+        let cell = offer.content().map_err(|error| error.to_string())?.cell;
+        let stale = offer.clone();
+        network
+            .directory
+            .hold_verified(offer, crate::directory::Group::V4(1), hub.now())
+            .map_err(|error| error.to_string())?;
+        let record = || -> Result<Record, String> {
+            tally_wire::PieceManifest::sign(
+                &me,
+                &tally_wire::PieceManifestContent {
+                    cell,
+                    product: tally_wire::Streams::RAW,
+                    second: BASE_MS / 1000,
+                    hashes: vec![[1; 32]],
+                },
+            )
+            .map(Record::PieceManifest)
+            .map_err(|error| error.to_string())
+        };
+        // Unsynced, and an hour ahead.
+        hub.clock().set_error(None);
+        wall.store(BASE_MS + 3_600_000, Ordering::Relaxed);
+        assert!(
+            network.directory.address_of(&member.public()).is_some(),
+            "an unsynced clock read the member's offer expired"
+        );
+        assert!(network.sharing.address(stranger.public(), record()?));
+        network.carry(&hub, Now::from(hub.stamp_now()), false);
+        assert_eq!(
+            network.sharing.unaddressed_counts(),
+            (1, 0),
+            "not queued again"
+        );
+        let queued = network.sharing.take_outbox();
+        assert_eq!(queued.len(), 1, "the send went nowhere");
+        // The clock judging: let go.
+        network
+            .sharing
+            .unaddressed(queued, Now::from(BASE_MS + 3_600_000));
+        assert_eq!(
+            network.sharing.unaddressed_counts(),
+            (1, 1),
+            "not counted let go"
+        );
+        assert!(network.sharing.take_outbox().is_empty());
+        // An offer or evidence that comes meanwhile is not taken, and counted.
+        let evidence = tally_wire::EvidenceBundle::sign(
+            &member,
+            &tally_wire::EvidenceBundleContent {
+                issued_ms: BASE_MS,
+                feeders: Vec::new(),
+                receipts: Vec::new(),
+                answers: Vec::new(),
+            },
+        )
+        .map_err(|error| error.to_string())?;
+        let asker = Asker {
+            role: AskerRole::Relay,
+            key: member.public(),
+            source: 1,
+            loopback: false,
+            address: None,
+        };
+        let unsynced = Now::from(hub.stamp_now());
+        let _ = network.handle(&hub, &asker, Record::ProviderOffer(stale), unsynced, None);
+        let _ = network.handle(
+            &hub,
+            &asker,
+            Record::EvidenceBundle(evidence),
+            unsynced,
+            None,
+        );
+        assert_eq!(network.unjudged_directory(), (1, 1), "not counted");
+        // Synced again, the hour ahead is judged: the offer has expired.
+        hub.clock().set_error(Some(10));
+        assert!(network.directory.address_of(&member.public()).is_none());
         Ok(())
     }
 }

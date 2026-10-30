@@ -67,11 +67,24 @@ pub fn nl(lat_deg: f64) -> u32 {
     if lat >= 87.0 {
         return if lat > 87.0 { 1 } else { 2 };
     }
+    let transitions = &*NL_TRANSITIONS;
     (2..=59)
         .rev()
-        .find(|zones| lat <= nl_transition(*zones))
+        .find(|zones| lat <= transitions[*zones as usize])
         .unwrap_or(1)
 }
+
+/// `nl_transition(n)` at index `n`, for 2 to 59, computed once by that formula, so `nl` reads
+/// the same latitudes bit for bit. Before (2026-10-27), each `nl` computed up to 58 cosines and
+/// arccosines: a quarter of the relay's figures and of the pairs' read of a window, profiled at
+/// 2,000 feeders.
+static NL_TRANSITIONS: std::sync::LazyLock<[f64; 60]> = std::sync::LazyLock::new(|| {
+    let mut transitions = [0.0; 60];
+    for zones in 2..=59u32 {
+        transitions[zones as usize] = nl_transition(zones);
+    }
+    transitions
+});
 
 fn modulo(x: f64, y: f64) -> f64 {
     x - y * (x / y).floor()
@@ -231,6 +244,12 @@ mod tests {
         assert_eq!(nl(-87.5), 1);
         assert!((nl_transition(59) - 10.470_471_30).abs() < 1e-7);
         assert!((nl_transition(58) - 14.828_174_37).abs() < 1e-7);
+        for zones in 2..=59u32 {
+            assert_eq!(
+                NL_TRANSITIONS[zones as usize].to_bits(),
+                nl_transition(zones).to_bits()
+            );
+        }
     }
 
     #[test]

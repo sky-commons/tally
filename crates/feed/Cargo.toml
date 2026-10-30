@@ -24,8 +24,13 @@ tally-wire.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
+# A fake ClockBound segment, written as its daemon writes one (src/source.rs's tests).
+clock-bound-shm = { workspace = true, features = ["writer"] }
+nix = { workspace = true, features = ["time"] }
 # A published ACARS-family line read back (src/acars.rs's tests).
 serde_json.workspace = true
+# The unit tests' counting allocator (src/lib.rs): test support, outside every production build.
+tally-counting = { path = "../counting" }
 # `test-util` pauses time, so a test of a ten-minute wait waits no real seconds.
 tokio = { workspace = true, features = ["test-util"] }
 

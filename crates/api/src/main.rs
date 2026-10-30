@@ -1,5 +1,9 @@
 //! `tally-api`: the Tally API's command line (RFC-0173 §2.5).
 
+// It reaches keys (`tally_wire::Identity`): no `unsafe` code at all, forbidden, so no module
+// can allow it.
+#![forbid(unsafe_code)]
+
 use tally_api::config::{Command, Keys, Prepared};
 use tokio::net::TcpListener;
 

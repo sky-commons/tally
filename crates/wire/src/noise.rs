@@ -29,8 +29,10 @@ use snow::StatelessTransportState;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf};
 
 use crate::WireError;
-use crate::key::{Identity, KEY_HINT_LEN, KEY_LEN, PublicKey, hint_of};
-use crate::record::{MAX_VERSION, MIN_VERSION, Reason, Record, Role, least_version};
+use crate::key::{
+    Handshakes, Identity, KEY_HINT_LEN, KEY_LEN, PublicKey, handshake_key_of, hint_of,
+};
+use crate::record::{MAX_VERSION, MIN_VERSION, Reason, Record, Role, framed_len, least_version};
 
 pub const PATTERN: &str = "Noise_IK_25519_ChaChaPoly_BLAKE2s";
 
@@ -254,7 +256,7 @@ pub struct Accepted<S, First = Vec<Record>> {
 /// Dials a responder whose key is known, says who we are and what we speak.
 pub async fn connect<S>(
     stream: S,
-    local: &Identity,
+    local: &impl Handshakes,
     remote: &PublicKey,
     role: Role,
 ) -> Result<Session<S>, WireError>
@@ -269,7 +271,7 @@ where
 /// for.
 pub async fn connect_with<S>(
     stream: S,
-    local: &Identity,
+    local: &impl Handshakes,
     remote: &PublicKey,
     role: Role,
     first: &[Record],
@@ -281,7 +283,7 @@ where
         HANDSHAKE_TIMEOUT,
         initiate(
             stream,
-            local,
+            handshake_key_of(local),
             remote,
             (role, first),
             (least_version(role), MAX_VERSION),
@@ -341,6 +343,7 @@ where
         Some(Record::Welcome { version })
             if (min_version.max(MIN_VERSION)..=MAX_VERSION).contains(&version) =>
         {
+            reader.version = version;
             Ok(Session {
                 reader,
                 writer,
@@ -365,7 +368,7 @@ where
 /// key). Returns who it is and what it is; whether to serve that key is the caller's decision.
 /// What came with its `Hello` is decoded whole: for a peer that is trusted to send little with it
 /// (a test's stand-in relay). A relay, which answers strangers, reads it with [`accept_message`].
-pub async fn accept<S>(stream: S, identities: &[Identity]) -> Result<Accepted<S>, WireError>
+pub async fn accept<S>(stream: S, identities: &[impl Handshakes]) -> Result<Accepted<S>, WireError>
 where
     S: AsyncRead + AsyncWrite + Send,
 {
@@ -392,7 +395,7 @@ where
 /// three-byte records makes the responder hold one decoded record at a time, never them all.
 pub async fn accept_message<S>(
     stream: S,
-    identities: &[Identity],
+    identities: &[impl Handshakes],
 ) -> Result<Accepted<S, Message>, WireError>
 where
     S: AsyncRead + AsyncWrite + Send,
@@ -404,7 +407,7 @@ where
 
 async fn respond<S>(
     stream: S,
-    identities: &[Identity],
+    identities: &[impl Handshakes],
     pool: &'static Pool,
 ) -> Result<Accepted<S, Message>, WireError>
 where
@@ -422,6 +425,7 @@ where
     let hint = &prologue[8..];
     let local = identities
         .iter()
+        .map(handshake_key_of)
         .find(|identity| {
             identity
                 .public()
@@ -487,6 +491,9 @@ where
         });
     }
     writer.send(&[Record::Welcome { version }]).await?;
+    // What came with the `Hello`, and everything after, is read at the version agreed.
+    reader.version = version;
+    first.version = version;
     Ok(Accepted {
         session: Session {
             reader,
@@ -508,6 +515,10 @@ pub struct Reader<S> {
     transport: Arc<StatelessTransportState>,
     nonce: u64,
     pool: &'static Pool,
+    /// The version the session agreed, which its records are read by (`Record::decode`): the
+    /// least this build speaks until the handshake agrees one, since a `Hello` and a `Welcome`
+    /// read alike at every version.
+    version: u16,
 }
 
 impl<S: AsyncRead> Reader<S> {
@@ -521,7 +532,13 @@ impl<S: AsyncRead> Reader<S> {
             transport,
             nonce: 0,
             pool,
+            version: MIN_VERSION,
         }
+    }
+
+    /// The version its records are read by: the session's, once agreed.
+    pub fn version(&self) -> u16 {
+        self.version
     }
 
     /// Reads one message and appends the records this build knows to `out`. An end of stream is
@@ -558,7 +575,7 @@ impl<S: AsyncRead> Reader<S> {
         self.pool
             .decoding
             .fetch_max(self.pool.out.load(Ordering::Relaxed), Ordering::Relaxed);
-        Ok(Message::of(plaintext, length))
+        Ok(Message::of(plaintext, length, self.version))
     }
 
     /// The plaintext of the frame `message` holds (its first `length` bytes), and its length. The
@@ -595,6 +612,8 @@ impl<S: AsyncRead> Reader<S> {
 pub struct Message {
     plaintext: Option<Buffer>,
     length: usize,
+    /// The session's version, which its records are read by.
+    version: u16,
     /// Where the next record starts.
     at: usize,
     /// A record decoded and not taken ([`Message::next_if`]): the next one [`Message::next`] gives.
@@ -602,10 +621,11 @@ pub struct Message {
 }
 
 impl Message {
-    fn of(plaintext: Buffer, length: usize) -> Self {
+    fn of(plaintext: Buffer, length: usize, version: u16) -> Self {
         let mut message = Self {
             plaintext: Some(plaintext),
             length,
+            version,
             at: 0,
             held: None,
         };
@@ -613,9 +633,11 @@ impl Message {
         message
     }
 
-    /// The next record this build knows, skipping the kinds it may skip (`Record::decode`), or
-    /// `None` once the message is read. A record that does not decode fails it, and the records
-    /// after it are not read.
+    /// The next record this build knows, read at the session's version and skipping the kinds it
+    /// may skip (`Record::decode`), or `None` once the message is read. A record that does not
+    /// decode fails it, and the records after it are not read; but one of a form an older peer
+    /// may still send and this version retired (`WireError::Retired`) fails only itself, so a
+    /// caller that drops it reads on.
     #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> Result<Option<Record>, WireError> {
         if let Some(record) = self.held.take() {
@@ -623,8 +645,14 @@ impl Message {
         }
         while let Some(plaintext) = &self.plaintext {
             let rest = plaintext.written(self.length).get(self.at..).unwrap_or(&[]);
-            let (record, used) = match Record::decode(rest) {
+            let (record, used) = match Record::decode(rest, self.version) {
                 Ok(decoded) => decoded,
+                // Only after its header and body were read, so its length is known.
+                Err(error @ WireError::Retired { .. }) => {
+                    self.at += framed_len(rest).unwrap_or(rest.len());
+                    self.release_if_read();
+                    return Err(error);
+                }
                 Err(error) => {
                     self.plaintext = None;
                     self.at = self.length;
@@ -860,12 +888,12 @@ mod tests {
     async fn a_session_names_the_initiator_and_carries_records_both_ways() -> Result<(), WireError>
     {
         let relay = Identity::generate()?;
-        let feeder = Identity::generate()?;
+        let feeder = std::sync::Arc::new(Identity::generate()?);
         let (near, far) = tokio::io::duplex(1 << 16);
         let relay_key = relay.public();
         let dial = tokio::spawn({
-            let feeder = feeder.clone();
-            async move { connect(near, &feeder, &relay_key, Role::Feeder).await }
+            let feeder = std::sync::Arc::clone(&feeder);
+            async move { connect(near, feeder.as_ref(), &relay_key, Role::Feeder).await }
         });
         let accepted = accept(far, &[relay]).await?;
         let mut theirs = join(dial.await)??;
@@ -879,7 +907,7 @@ mod tests {
         let batches: Vec<Record> = (0..200)
             .map(|sequence| {
                 Batch::sign(
-                    &feeder,
+                    feeder.as_ref(),
                     &BatchContent {
                         boot_id: 1,
                         sequence,
@@ -1164,17 +1192,17 @@ mod tests {
         assert!(halves < 1024, "{halves} bytes");
         let pool = own_pool(16);
         let relay = Identity::generate()?;
-        let feeder = Identity::generate()?;
+        let feeder = std::sync::Arc::new(Identity::generate()?);
         let mut sessions = Vec::new();
         for _ in 0..8 {
             let (near, far) = tokio::io::duplex(1 << 17);
             let relay_key = relay.public();
             let dial = tokio::spawn({
-                let feeder = feeder.clone();
+                let feeder = std::sync::Arc::clone(&feeder);
                 async move {
                     initiate(
                         near,
-                        &feeder,
+                        feeder.as_ref(),
                         &relay_key,
                         (Role::Feeder, &[]),
                         (MIN_VERSION, MAX_VERSION),
@@ -1339,63 +1367,23 @@ mod tests {
         Ok(())
     }
 
-    /// Counts the bytes each thread has live on the heap and the most it had since it last asked
-    /// ([`counting::start`]): what one test measures on its own thread, whatever the others do.
+    /// The bytes each thread has live on the heap and the most it had since it last asked
+    /// (`tally_counting`, the test binary's allocator): what one test measures on its own thread,
+    /// whatever the others do.
     mod counting {
-        use std::alloc::{GlobalAlloc, Layout, System};
-        use std::cell::Cell;
-
-        thread_local! {
-            static LIVE: Cell<isize> = const { Cell::new(0) };
-            static PEAK: Cell<isize> = const { Cell::new(0) };
-        }
-
-        fn add(bytes: isize) {
-            // A thread's own counters, skipped while its storage is being torn down.
-            let _ = LIVE.try_with(|live| {
-                let now = live.get() + bytes;
-                live.set(now);
-                let _ = PEAK.try_with(|peak| peak.set(peak.get().max(now)));
-            });
-        }
-
-        struct Counting;
-
-        // SAFETY: every call is the system allocator's, with the same arguments; the counters are
-        // the calling thread's own cells, touched by nothing else.
-        unsafe impl GlobalAlloc for Counting {
-            unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-                add(layout.size() as isize);
-                // SAFETY: the caller's contract is the system allocator's.
-                unsafe { System.alloc(layout) }
-            }
-
-            unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-                add(-(layout.size() as isize));
-                // SAFETY: the caller's contract is the system allocator's.
-                unsafe { System.dealloc(ptr, layout) }
-            }
-
-            unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-                add(new_size as isize - layout.size() as isize);
-                // SAFETY: the caller's contract is the system allocator's.
-                unsafe { System.realloc(ptr, layout, new_size) }
-            }
-        }
+        use tally_counting::Counting;
 
         #[global_allocator]
         static GLOBAL: Counting = Counting;
 
         /// Starts a measure on this thread: the bytes live now.
         pub fn start() -> isize {
-            let live = LIVE.with(Cell::get);
-            PEAK.with(|peak| peak.set(live));
-            live
+            Counting::peak_base()
         }
 
         /// The most this thread had live since `start`, above what it had then.
         pub fn peak_since(start: isize) -> isize {
-            PEAK.with(Cell::get) - start
+            Counting::peak_since(start)
         }
     }
 
@@ -1419,7 +1407,7 @@ mod tests {
         // Decoded whole: every record at once.
         let start = counting::start();
         let mut whole = Vec::new();
-        Record::decode_message(plaintext.written(length), &mut whole)?;
+        Record::decode_message(plaintext.written(length), MAX_VERSION, &mut whole)?;
         let held_whole = counting::peak_since(start);
         assert_eq!(whole.len(), count);
         drop(whole);
@@ -1428,7 +1416,7 @@ mod tests {
             "decoded whole, it held only {held_whole} bytes"
         );
         // A record at a time: never more than a record's worth beside the plaintext.
-        let mut message = Message::of(plaintext, length);
+        let mut message = Message::of(plaintext, length, MAX_VERSION);
         let start = counting::start();
         let mut read = 0;
         while let Some(record) = message.next()? {
@@ -1438,6 +1426,40 @@ mod tests {
         let held = counting::peak_since(start);
         assert_eq!((read, message.remaining()), (count, 0));
         assert!(held < 4_096, "a record at a time held {held} bytes");
+        Ok(())
+    }
+
+    /// A version 3 peer's retired record fails only itself: the records after it are still read,
+    /// so the relay drops it and reads on. From a version 4 peer it is a breach, and the message
+    /// ends there.
+    #[test]
+    fn a_retired_record_fails_only_itself_below_version_4() -> Result<(), WireError> {
+        let message = |version| -> Result<Message, WireError> {
+            let mut plaintext = Buffer::take_from(own_pool(2));
+            plaintext.truncate(0);
+            for retired in [
+                crate::record::KIND_PROVISIONAL,
+                crate::record::KIND_WORLD_PRECISE,
+            ] {
+                plaintext.append(|out| {
+                    out.extend_from_slice(&[retired, 0, 3, 1, 2, 3]);
+                    Ok::<(), WireError>(())
+                })?;
+                plaintext.append(|out| Record::Heartbeat.encode(out))?;
+            }
+            let length = plaintext.packed().len();
+            Ok(Message::of(plaintext, length, version))
+        };
+        let mut old = message(crate::record::FIXES_VERSION - 1)?;
+        for _ in 0..2 {
+            assert!(matches!(old.next(), Err(WireError::Retired { .. })));
+            assert_eq!(old.next()?, Some(Record::Heartbeat));
+        }
+        assert_eq!(old.next()?, None);
+        assert!(old.is_read());
+        let mut new = message(crate::record::FIXES_VERSION)?;
+        assert!(matches!(new.next(), Err(WireError::Invalid { .. })));
+        assert_eq!(new.next()?, None);
         Ok(())
     }
 }

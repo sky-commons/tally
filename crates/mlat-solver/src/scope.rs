@@ -1,162 +1,228 @@
-//! Windows, tiles and assignment (crate docs, § Windows, § Tiles, § Assignment): which raw a
-//! tile's shared clock model is a function of, and which tile each aircraft is solved under.
-//! Decided by the content alone, never by when anything arrived, so two engines holding the same
-//! raw build the same inputs. A window is assembled from the sealed bins it spans
-//! (`held::Bin`), each indexed once when it was sealed; nothing here copies the raw, except the
-//! few receptions a tile's fit or an aircraft's solve takes.
+//! Trailing windows and members (crate docs, § The trailing window, § Areas): which raw an area's
+//! pair model at one trailing edge is a function of. An area's members follow its receivers'
+//! signed site records alone, never which receivers' raw arrived; its inputs are the sync raw of
+//! those members that had arrived when it was fitted, cited by each member's frontier
+//! (`arrived::Arrived::area_inputs`), so a holder of more raw builds a superset of what a holder of
+//! less builds, and a verifier holding the cited batches rebuilds it exactly.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use blake2::{Blake2s256, Digest};
-use tally_wire::PublicKey;
+use tally_wire::budget::{FIT_LAG_MS, REFIT_EVERY_MS, TRAILING_WINDOW_MS};
+use tally_wire::{PublicKey, Region};
 
-use crate::held::Bin;
 use crate::obs::{ObservationId, Reception, Site};
-use crate::tile::{self, Tile};
+use crate::pair::Network;
 
-/// The wall clock grid, milliseconds: an observation's bin is its batch wall clock over this.
-pub const GRID_MS: u64 = 5_000;
-/// Bins of the canonical window before the bin its transmissions are solved in.
-pub const BEFORE: i64 = 11;
-/// Bins of the canonical window after it (`L`).
-pub const AFTER: i64 = 1;
 /// What the input citation is hashed under.
 const CITATION_DOMAIN: &[u8] = b"tally clock model inputs";
-/// What a sync aircraft's rank in a tile's window is hashed under.
-const RANK_DOMAIN: &[u8] = b"tally sync aircraft rank";
-/// Sync events a receiver keeps per grid bin (`K`).
-pub const EVENTS_PER_RECEIVER: usize = 10;
-/// Sync events a pair of receivers keeps per grid bin, when they hear one together (`P`).
-pub const EVENTS_PER_PAIR: usize = 1;
-/// Distinct sync aircraft a tile's window takes its events from (`A_max`), by rank.
-pub const SYNC_AIRCRAFT_MAX: usize = 16;
-/// Bins solved under one window (`s`): a tile is fitted once per this many bins.
-pub const STRIDE: i64 = 8;
-/// Transmissions solved per aircraft per bin, at most (about one a second), by rank.
-pub const TRANSMISSIONS_PER_BIN: usize = 5;
-/// What a transmission's rank is hashed under.
-const TRANSMISSION_DOMAIN: &[u8] = b"tally transmission rank";
+/// What a cited part's digest is hashed under.
+const PART_DOMAIN: &[u8] = b"tally sync part";
 
-/// The grid bin of a wall clock.
-pub fn bin_of(wall_ms: u64) -> i64 {
-    (wall_ms / GRID_MS) as i64
-}
-
-/// A span of grid bins, both ends included.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Window {
-    pub first: i64,
-    pub last: i64,
-}
-
-impl Window {
-    /// The window a transmission in `bin` is solved under, at the specification's stride.
-    pub fn canonical(bin: i64) -> Self {
-        Self::strided(bin, STRIDE)
-    }
-
-    /// The window that solves `bin` at stride `s`: with `ks` the least multiple of `s` at or above
-    /// `bin`, `[ks - BEFORE - (s - 1), ks + AFTER]`, which solves bins `ks - (s - 1)` to `ks`, each
-    /// with at least `BEFORE` bins before it and `AFTER` after.
-    pub fn strided(bin: i64, stride: i64) -> Self {
-        let stride = stride.max(1);
-        let top = (bin + stride - 1).div_euclid(stride) * stride;
-        Self {
-            first: top - BEFORE - (stride - 1),
-            last: top + AFTER,
-        }
-    }
-
-    /// The stride the window was made at.
-    pub fn stride(&self) -> i64 {
-        (self.last - self.first + 1 - BEFORE - AFTER).max(1)
-    }
-
-    /// The last bin the window solves.
-    pub fn bin(&self) -> i64 {
-        self.last - AFTER
-    }
-
-    /// The bins the window solves.
-    pub fn solved(&self) -> std::ops::RangeInclusive<i64> {
-        self.bin() - (self.stride() - 1)..=self.bin()
-    }
-
-    pub fn holds(&self, wall_ms: u64) -> bool {
-        let bin = bin_of(wall_ms);
-        bin >= self.first && bin <= self.last
-    }
-}
-
-/// The bin a transmission belongs to: its receptions' wall clocks' lower median's.
-pub fn bin_of_transmission(walls: &mut [u64]) -> Option<i64> {
-    walls.sort_unstable();
-    let middle = walls.len().checked_sub(1)? / 2;
-    Some(bin_of(walls[middle]))
-}
-
-/// A set of observations cited by hash and count.
+/// A set of observations cited by hash and count: the count of the inputs' sync receptions, and a
+/// hash of the held batches they are a function of (crate docs, § Thinning, the citation).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Citation {
-    /// BLAKE2s-256 over `"tally clock model inputs" 0x00`, then each distinct (identity, wall
-    /// clock) in order as receiver key (32), epoch (4), counter (6), message hash (32), wall
-    /// clock (8), all big-endian.
+    /// BLAKE2s-256 over `"tally clock model inputs" 0x00`, then each cited part (a batch's kept
+    /// sync and status receptions of one slice, [`Part`]) in order as receiver key (32), boot (8),
+    /// sequence (8), slice (8) and its digest (32), all big-endian.
     pub hash: [u8; 32],
     pub count: u32,
 }
 
-impl Citation {
-    pub fn of<'a>(receptions: impl IntoIterator<Item = &'a Reception>) -> Self {
-        Self::of_identities(
-            receptions
-                .into_iter()
-                .map(|reception| (reception.id(), reception.wall_ms)),
-        )
-    }
+/// One part a citation cites: a batch's kept sync and status receptions of one slice of signed
+/// wall clock, by its receiver, boot, sequence and slice, and its digest ([`Part::digest`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Part {
+    pub receiver: PublicKey,
+    pub boot_id: u64,
+    pub sequence: u64,
+    pub slice: u64,
+    pub digest: [u8; 32],
+}
 
-    pub fn of_identities(entries: impl IntoIterator<Item = (ObservationId, u64)>) -> Self {
-        let entries: BTreeSet<(ObservationId, u64)> = entries.into_iter().collect();
+impl Part {
+    /// A part's digest: BLAKE2s-256 over `"tally sync part" 0x00`, then each of its receptions as
+    /// epoch (4), counter (the low six bytes of eight), message hash (32) and milliseconds into the
+    /// slice (2), all big-endian, ascending by those bytes: a function of the receptions as a set
+    /// (with their repeats), so of a batch's in whatever order it carries them.
+    pub fn digest(entries: impl IntoIterator<Item = (u32, u64, [u8; 32], u16)>) -> [u8; 32] {
+        let mut encoded: Vec<[u8; 44]> = entries
+            .into_iter()
+            .map(|(epoch, counter, message, into_ms)| {
+                let mut entry = [0u8; 44];
+                entry[..4].copy_from_slice(&epoch.to_be_bytes());
+                entry[4..10].copy_from_slice(&counter.to_be_bytes()[2..]);
+                entry[10..42].copy_from_slice(&message);
+                entry[42..].copy_from_slice(&into_ms.to_be_bytes());
+                entry
+            })
+            .collect();
+        encoded.sort_unstable();
+        let mut hasher = Blake2s256::new();
+        hasher.update(PART_DOMAIN);
+        hasher.update([0]);
+        for entry in &encoded {
+            hasher.update(entry);
+        }
+        hasher.finalize().into()
+    }
+}
+
+impl Citation {
+    /// The citation of `count` receptions, a function of `parts`, in their order: each member's
+    /// in the frontier's order, and a member's by sequence, then slice.
+    pub fn of_parts<'a>(parts: impl IntoIterator<Item = &'a Part>, count: usize) -> Self {
         let mut hasher = Blake2s256::new();
         hasher.update(CITATION_DOMAIN);
         hasher.update([0]);
-        for (id, wall) in &entries {
-            hasher.update(id.receiver.as_bytes());
-            hasher.update(id.epoch.to_be_bytes());
-            hasher.update(&id.timestamp.to_be_bytes()[2..]);
-            hasher.update(id.message);
-            hasher.update(wall.to_be_bytes());
+        for part in parts {
+            let mut entry = [0u8; 88];
+            entry[..32].copy_from_slice(part.receiver.as_bytes());
+            entry[32..40].copy_from_slice(&part.boot_id.to_be_bytes());
+            entry[40..48].copy_from_slice(&part.sequence.to_be_bytes());
+            entry[48..56].copy_from_slice(&part.slice.to_be_bytes());
+            entry[56..].copy_from_slice(&part.digest);
+            hasher.update(entry);
         }
         Self {
             hash: hasher.finalize().into(),
-            count: u32::try_from(entries.len()).unwrap_or(u32::MAX),
-        }
-    }
-
-    /// As the wire carries it in a solution.
-    pub fn to_wire(self) -> tally_wire::AddressedCitation {
-        tally_wire::AddressedCitation {
-            hash: self.hash,
-            count: self.count,
+            count: u32::try_from(count).unwrap_or(u32::MAX),
         }
     }
 }
 
-/// What one tile's clock model in one window is a function of.
+/// The span of signed wall clock an area's model is fitted over: `[edge - span, edge)`, its first
+/// millisecond in and its edge out, so its seconds tile it (crate docs, § The pairwise path,
+/// blocks), solved at its trailing edge. Its span is `tally_wire::budget::TRAILING_WINDOW_MS`
+/// (`W`), which every party states the same. Its inputs reach `pair::READ_BACK_MS` further back
+/// ([`Trailing::read_from_ms`]): what its first blocks read before the window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Trailing {
+    pub edge_ms: u64,
+    pub span_ms: u32,
+}
+
+const _: () = assert!(TRAILING_WINDOW_MS <= u32::MAX as u64);
+const _: () =
+    assert!(TRAILING_WINDOW_MS.is_multiple_of(1000) && REFIT_EVERY_MS.is_multiple_of(1000));
+
+impl Trailing {
+    /// The specification's trailing window ending at `edge_ms`.
+    pub fn at(edge_ms: u64) -> Self {
+        Self {
+            edge_ms,
+            span_ms: TRAILING_WINDOW_MS as u32,
+        }
+    }
+
+    /// The specification's trailing window of a refit run at `judged_ms` (the engine's clock):
+    /// its edge the newest multiple of `tally_wire::budget::REFIT_EVERY` at least
+    /// `tally_wire::budget::FIT_LAG` below, where every honest receiver's raw has arrived, so the
+    /// inputs are a function of the edge and of the raw, never of when a batch arrived
+    /// (`arrived::Arrived::area_inputs`). On one grid for every relay, whatever the phase its
+    /// steps run at, so the models of neighbouring areas, fitted by other relays, share the edges a
+    /// fix citing several of them needs (crate docs, § Areas).
+    pub fn fitted_at(judged_ms: u64) -> Self {
+        let lagged = judged_ms.saturating_sub(FIT_LAG_MS);
+        Self::at(lagged - lagged % REFIT_EVERY_MS)
+    }
+
+    /// The oldest wall clock the window holds.
+    pub fn first_ms(&self) -> u64 {
+        self.edge_ms.saturating_sub(u64::from(self.span_ms))
+    }
+
+    /// The oldest wall clock its inputs hold: `pair::READ_BACK_MS` before its first.
+    pub fn read_from_ms(&self) -> u64 {
+        self.first_ms().saturating_sub(crate::pair::READ_BACK_MS)
+    }
+
+    /// Whether `wall_ms` lies in `[first_ms, edge_ms)`.
+    pub fn holds(&self, wall_ms: u64) -> bool {
+        wall_ms >= self.first_ms() && wall_ms < self.edge_ms
+    }
+
+    /// Whether its inputs hold `wall_ms`: `[read_from_ms, edge_ms)`.
+    pub fn reads(&self, wall_ms: u64) -> bool {
+        wall_ms >= self.read_from_ms() && wall_ms < self.edge_ms
+    }
+}
+
+/// How far one member's raw a model cites reaches: every batch of the member's boot `boot_id`
+/// with a sequence at or below `through_sequence` (a contiguous run, as the engine cites only
+/// one). A verifier missing a batch at or below it cannot judge the model, and says so.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Frontier {
+    pub receiver: PublicKey,
+    pub boot_id: u64,
+    pub through_sequence: u64,
+}
+
+/// What one area's pair model at one trailing edge is a function of: the sync receptions of its
+/// members with a wall clock its inputs hold (`Trailing::reads`), from the batches at or below each member's frontier at
+/// the edge (`arrived::Arrived::area_inputs`).
 #[derive(Clone, Debug, PartialEq)]
 pub struct Inputs {
-    pub tile: Tile,
-    pub window: Window,
-    /// The tile's members, sorted by key.
+    pub area: Region,
+    pub trailing: Trailing,
+    /// The area's members (`Sites::members`), by their signed site records alone, sorted by key.
     pub scope: Vec<Site>,
-    /// The sync material: the members' receptions of the sync events kept (§ Thinning), and of
-    /// each distinct operational status of a kept event's aircraft its lowest-identity member
-    /// reception. Sorted by identity.
-    pub sync: Vec<Reception>,
+    /// The frontier of each member whose raw arrived whole over the window, sorted by key: one
+    /// with none, or whose first batch held arrived inside the window (what came before it may be
+    /// in the window too), cites nothing and has no frontier.
+    pub frontier: Vec<Frontier>,
+    /// The sync material: the members' receptions of the sync events kept (§ Thinning), and
+    /// their receptions of each operational status of a kept event's aircraft. Sorted by
+    /// identity ([`Inputs::id`]), each identity once.
+    pub sync: Vec<SyncReception>,
+    /// The messages the sync material carries, each once, in the order the sync material first
+    /// carries them.
+    pub messages: Vec<SyncMessage>,
     pub citation: Citation,
 }
 
+/// One reception of an area's sync material ([`Inputs::sync`]): its message by its place in
+/// [`Inputs::messages`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SyncReception {
+    pub receiver: PublicKey,
+    pub epoch: u32,
+    pub timestamp: u64,
+    pub wall_ms: u64,
+    pub message: u32,
+}
+
+/// A message of an area's sync material: its bytes and their hash (`obs::message_hash`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SyncMessage {
+    pub hash: [u8; 32],
+    pub data: Box<[u8]>,
+}
+
 impl Inputs {
+    /// A reception's identity.
+    pub fn id(&self, reception: &SyncReception) -> ObservationId {
+        ObservationId {
+            receiver: reception.receiver,
+            epoch: reception.epoch,
+            timestamp: reception.timestamp,
+            message: self.messages[reception.message as usize].hash,
+        }
+    }
+
+    /// A reception as the wire carries it: `None` for bytes no Mode S message holds.
+    pub fn reception(&self, reception: &SyncReception) -> Option<Reception> {
+        Reception::mode_s(
+            reception.receiver,
+            reception.epoch,
+            reception.timestamp,
+            reception.wall_ms,
+            &self.messages[reception.message as usize].data,
+        )
+    }
+
     /// The members' keys, sorted.
     pub fn keys(&self) -> Vec<PublicKey> {
         self.scope.iter().map(|site| site.receiver).collect()
@@ -164,10 +230,43 @@ impl Inputs {
 }
 
 /// The receivers that may take part, each with its millimetre site: one per receiver, usable
-/// (a receiver described twice, or unusable, takes no part).
-#[derive(Clone, Debug, Default)]
+/// (a receiver described twice, or unusable, takes no part). Indexed by area, with every
+/// receiver's kept pairs (`pair::Network`, found once) and each area's members once found
+/// ([`Sites::members`]): a function of the sites alone, asked for every refit's inputs, every
+/// model's verification and every fix's cited models.
+#[derive(Debug, Default)]
 pub struct Sites {
     by_key: BTreeMap<PublicKey, (Site, [i64; 3])>,
+    area_of: BTreeMap<PublicKey, Region>,
+    by_area: BTreeMap<Region, Vec<PublicKey>>,
+    network: OnceLock<Network>,
+    members: std::sync::RwLock<BTreeMap<Region, Arc<[Site]>>>,
+}
+
+impl Clone for Sites {
+    fn clone(&self) -> Self {
+        Self {
+            by_key: self.by_key.clone(),
+            area_of: self.area_of.clone(),
+            by_area: self.by_area.clone(),
+            network: self.network.clone(),
+            members: std::sync::RwLock::new(read(&self.members).clone()),
+        }
+    }
+}
+
+impl PartialEq for Sites {
+    /// The same sites: what they remember is theirs alike.
+    fn eq(&self, other: &Self) -> bool {
+        self.by_key == other.by_key
+    }
+}
+
+/// A read of a lock whose writers only insert a finished value: a panic in one leaves nothing
+/// half-written, so a poisoned lock is read as it is.
+fn read<T>(lock: &std::sync::RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
+    lock.read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 impl Sites {
@@ -176,12 +275,25 @@ impl Sites {
         for site in sites {
             *count.entry(site.receiver).or_default() += 1;
         }
+        let by_key: BTreeMap<PublicKey, (Site, [i64; 3])> = sites
+            .iter()
+            .filter(|site| count.get(&site.receiver) == Some(&1) && site.usable())
+            .map(|site| (site.receiver, (*site, site.mm())))
+            .collect();
+        let mut area_of = BTreeMap::new();
+        let mut by_area: BTreeMap<Region, Vec<PublicKey>> = BTreeMap::new();
+        for (key, (site, _)) in &by_key {
+            if let Some(area) = crate::area::of(site) {
+                area_of.insert(*key, area);
+                by_area.entry(area).or_default().push(*key);
+            }
+        }
         Self {
-            by_key: sites
-                .iter()
-                .filter(|site| count.get(&site.receiver) == Some(&1) && site.usable())
-                .map(|site| (site.receiver, (*site, site.mm())))
-                .collect(),
+            by_key,
+            area_of,
+            by_area,
+            network: OnceLock::new(),
+            members: std::sync::RwLock::default(),
         }
     }
 
@@ -189,8 +301,45 @@ impl Sites {
         self.by_key.get(key)
     }
 
+    /// The area a receiver is in (`area::of`), when it is a usable receiver.
+    pub fn area(&self, key: &PublicKey) -> Option<Region> {
+        self.area_of.get(key).copied()
+    }
+
+    /// Every area with a receiver in it, ascending, with its receivers' keys, ascending.
+    pub fn areas(&self) -> impl Iterator<Item = (&Region, &[PublicKey])> {
+        self.by_area
+            .iter()
+            .map(|(area, keys)| (area, keys.as_slice()))
+    }
+
     pub fn len(&self) -> usize {
         self.by_key.len()
+    }
+
+    /// Bytes it holds, as allocated: its index of sites and areas, the network and the members it
+    /// remembers.
+    pub fn bytes(&self) -> usize {
+        use tally_wire::footprint::{btree, vec};
+        let members = read(&self.members);
+        let kept = self.network.get().map_or(0, |network| {
+            network.len() * 2 * std::mem::size_of::<PublicKey>()
+                + btree::<PublicKey, Vec<PublicKey>>(self.by_key.len()) * 2
+        });
+        btree::<PublicKey, (Site, [i64; 3])>(self.by_key.len())
+            + btree::<PublicKey, Region>(self.area_of.len())
+            + btree::<Region, Vec<PublicKey>>(self.by_area.len())
+            + self
+                .by_area
+                .values()
+                .map(|keys| vec::<PublicKey>(keys.capacity()))
+                .sum::<usize>()
+            + kept
+            + btree::<Region, Arc<[Site]>>(members.len())
+            + members
+                .values()
+                .map(|sites| tally_wire::decoded::ARC_HEADER + vec::<Site>(sites.len()))
+                .sum::<usize>()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -200,595 +349,49 @@ impl Sites {
     pub fn iter(&self) -> impl Iterator<Item = (&PublicKey, &(Site, [i64; 3]))> {
         self.by_key.iter()
     }
-}
 
-/// Which tile an aircraft is solved under, and which of its hearers are its scope there.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Assignment {
-    pub tile: Tile,
-    /// Its hearers among the tile's members, sorted.
-    pub scope: Vec<PublicKey>,
-}
-
-/// One target's hearers (with their sites) and its tile at each level.
-type Candidates = (u32, Vec<(PublicKey, [i64; 3])>, Vec<Tile>);
-
-/// A bin's work: every aircraft heard in it with its tile, and every tile's members.
-#[derive(Clone, Debug, Default)]
-pub struct Plan {
-    pub assignments: BTreeMap<u32, Assignment>,
-    /// Every tile looked at, chosen or not.
-    pub members: BTreeMap<Tile, Vec<PublicKey>>,
-}
-
-impl Plan {
-    /// The distinct tiles the bin's aircraft chose, in order: the bin's fits.
-    pub fn tiles(&self) -> Vec<Tile> {
-        let chosen: BTreeSet<Tile> = self
-            .assignments
-            .values()
-            .map(|assignment| assignment.tile)
-            .collect();
-        chosen.into_iter().collect()
-    }
-}
-
-/// One window, assembled from the sealed bins it spans.
-pub struct WindowIndex<'a> {
-    pub window: Window,
-    bins: Vec<Arc<Bin>>,
-    sites: &'a Sites,
-    /// The window's sync-active usable receivers, with their sites, by key.
-    active: Vec<(PublicKey, [i64; 3])>,
-    /// The same, by the level-3 cube their site is in: what a footprint looks through.
-    grid: BTreeMap<[i64; 3], Vec<usize>>,
-    /// Per bin, per receiver index, its usable site (looked up once).
-    usable: Vec<Vec<Option<[i64; 3]>>>,
-    sync_aircraft_max: Option<usize>,
-    /// The sync candidates' messages some receiver heard more than once in the window
-    /// (`repeated`), by hash, ascending: found as the index is made, on the thread making it.
-    /// Never lazily, inside a pass: the first of a pass's workers to ask would find them while the
-    /// others waited on it holding their gate permits, and its own checkpoints could give its
-    /// permit to a provisional step and wait for one the waiting workers held, for ever (a relay's window steps stopped for good that way).
-    repeated: Vec<[u8; 32]>,
-}
-
-/// The hashes of the sync candidates of `bins` (ascending by bin) that one receiver heard more
-/// than once anywhere among them, ascending: within one bin (two records of it by one receiver)
-/// or across bins (one record in each). Such bytes are two transmissions, or more: an aircraft
-/// repeating a position message byte for byte (a stationary one does), or a recording replayed.
-/// Which reception is of which cannot be told from the bytes, so an event of them would mix
-/// receptions seconds apart; the window rejects the message whole. Judged over every
-/// receiver's records before any tile thins, so every tile and every engine rejects the same.
-/// Each bin's candidates ascend by hash, so the bins are merged in one pass with nothing held but
-/// one message's receivers at a time.
-fn repeated(bins: &[Arc<Bin>]) -> Vec<[u8; 32]> {
-    let mut at = vec![0usize; bins.len()];
-    let mut out = Vec::new();
-    let mut keys: Vec<PublicKey> = Vec::new();
-    loop {
-        crate::gate::checkpoint();
-        let hash_of = |bin: &Bin, index: usize| {
-            bin.candidates
-                .get(index)
-                .map(|candidate| bin.messages[candidate.message as usize].hash)
-        };
-        let Some(lowest) = bins
-            .iter()
-            .zip(&at)
-            .filter_map(|(bin, index)| hash_of(bin, *index))
-            .min()
-        else {
-            return out;
-        };
-        keys.clear();
-        for (bin, index) in bins.iter().zip(at.iter_mut()) {
-            if hash_of(bin, *index) == Some(lowest) {
-                let candidate = &bin.candidates[*index];
-                keys.extend(
-                    candidate.records.iter().map(|record| {
-                        bin.receivers[bin.records[*record as usize].receiver as usize]
-                    }),
-                );
-                *index += 1;
-            }
-        }
-        let heard = keys.len();
-        keys.sort_unstable();
-        keys.dedup();
-        if keys.len() < heard {
-            out.push(lowest);
-        }
-    }
-}
-
-impl<'a> WindowIndex<'a> {
-    /// `bins`: any, in any order; only those in the window are kept.
-    pub fn new(window: Window, bins: &[Arc<Bin>], sites: &'a Sites) -> Self {
-        Self::with_sync_aircraft(window, bins, sites, Some(SYNC_AIRCRAFT_MAX))
-    }
-
-    /// As `new`, with `A_max` other than the specification's (for measuring it).
-    pub fn with_sync_aircraft(
-        window: Window,
-        bins: &[Arc<Bin>],
-        sites: &'a Sites,
-        sync_aircraft_max: Option<usize>,
-    ) -> Self {
-        let mut bins: Vec<Arc<Bin>> = bins
-            .iter()
-            .filter(|bin| bin.bin >= window.first && bin.bin <= window.last)
-            .cloned()
-            .collect();
-        bins.sort_by_key(|bin| bin.bin);
-        bins.dedup_by_key(|bin| bin.bin);
-        let usable: Vec<Vec<Option<[i64; 3]>>> = bins
-            .iter()
-            .map(|bin| {
-                bin.receivers
-                    .iter()
-                    .map(|key| sites.get(key).map(|(_, mm)| *mm))
-                    .collect()
-            })
-            .collect();
-        let mut active: BTreeMap<PublicKey, [i64; 3]> = BTreeMap::new();
-        for (bin, usable) in bins.iter().zip(&usable) {
-            crate::gate::checkpoint();
-            for (index, key) in bin.receivers.iter().enumerate() {
-                if bin.sync_active[index]
-                    && let Some(mm) = usable[index]
-                {
-                    active.insert(*key, mm);
-                }
-            }
-        }
-        let active: Vec<(PublicKey, [i64; 3])> = active.into_iter().collect();
-        let mut grid: BTreeMap<[i64; 3], Vec<usize>> = BTreeMap::new();
-        for (at, (_, mm)) in active.iter().enumerate() {
-            grid.entry(Tile::containing(tile::LEVELS - 1, *mm).cube)
-                .or_default()
-                .push(at);
-        }
-        let repeated = repeated(&bins);
-        Self {
-            window,
-            bins,
-            sites,
-            active,
-            grid,
-            usable,
-            sync_aircraft_max,
-            repeated,
-        }
-    }
-
-    /// The sync messages some receiver heard more than once in the window (`repeated`), by hash,
-    /// ascending: no tile's inputs take them.
-    pub fn repeated(&self) -> &[[u8; 32]] {
-        &self.repeated
-    }
-
-    pub fn bins(&self) -> &[Arc<Bin>] {
-        &self.bins
-    }
-
-    /// The window's MLAT targets, in order (§ Targets): the aircraft heard in a bin it solves
-    /// with no ADS-B position anywhere in the window, and those of the calibration sample.
-    pub fn addresses(&self) -> Vec<u32> {
-        let adsb: BTreeSet<u32> = self
-            .bins
-            .iter()
-            .flat_map(|bin| bin.adsb.iter().copied())
-            .collect();
-        let solved = self.window.solved();
-        let mut out: BTreeSet<u32> = BTreeSet::new();
-        for (bin, usable) in self.bins.iter().zip(&self.usable) {
-            crate::gate::checkpoint();
-            if !solved.contains(&bin.bin) {
-                continue;
-            }
-            for (address, records) in &bin.by_address {
-                let heard = records.iter().any(|record| {
-                    let record = &bin.records[*record as usize];
-                    usable[record.receiver as usize].is_some()
-                        && !bin.messages[record.message as usize].sync
-                });
-                let target = !adsb.contains(address) || crate::held::sampled(*address, bin.bin);
-                if heard && target {
-                    out.insert(*address);
-                }
-            }
-        }
-        out.into_iter().collect()
-    }
-
-    /// The members of `tile` in this window (§ Tiles): its footprint's sync-active receivers, at
-    /// most `tile::MEMBERS_MAX` by farthest point. Sorted.
-    pub fn members(&self, tile: Tile) -> Vec<PublicKey> {
-        // Every level-3 cube the footprint can reach: its centre's, and those within the reach
-        // (the footprint radius over the level-3 edge, rounded up, and one more).
-        let centre = Tile::containing(tile::LEVELS - 1, tile.centre_mm()).cube;
-        let reach = tile::footprint_mm(tile.level) / tile::edge_mm(tile::LEVELS - 1) + 1;
-        let mut inside: Vec<(PublicKey, [i64; 3])> = Vec::new();
-        for x in -reach..=reach {
-            for y in -reach..=reach {
-                for z in -reach..=reach {
-                    let cube = [centre[0] + x, centre[1] + y, centre[2] + z];
-                    for at in self.grid.get(&cube).map_or(&[][..], Vec::as_slice) {
-                        let (key, mm) = self.active[*at];
-                        if tile.holds(mm) {
-                            inside.push((key, mm));
-                        }
-                    }
-                }
-            }
-        }
-        tile::members(&inside)
-    }
-
-    /// The usable receivers that heard `address` in the window, with their sites, by key.
-    pub fn hearers(&self, address: u32) -> Vec<(PublicKey, [i64; 3])> {
-        let mut out: Vec<(PublicKey, [i64; 3])> = Vec::new();
-        for (bin, usable) in self.bins.iter().zip(&self.usable) {
-            let mut last = u32::MAX;
-            for record in bin.by_address.get(&address).map_or(&[][..], Vec::as_slice) {
-                let receiver = bin.records[*record as usize].receiver;
-                if receiver == last {
-                    continue;
-                }
-                last = receiver;
-                if let Some(mm) = usable[receiver as usize] {
-                    out.push((bin.receivers[receiver as usize], mm));
-                }
-            }
-        }
-        out.sort_unstable_by_key(|(key, _)| *key);
-        out.dedup_by_key(|(key, _)| *key);
-        out
-    }
-
-    /// Every target of the window assigned (§ Assignment), in address order.
-    pub fn plan(&self) -> Plan {
-        self.plan_on(1)
-    }
-
-    /// As `plan`, on `threads` threads: each target's hearers and candidate tiles, then each
-    /// distinct candidate's members, then the choice. The same whatever the threads.
-    pub fn plan_on(&self, threads: usize) -> Plan
-    where
-        Self: Sync,
-    {
-        let addresses = self.addresses();
-        // Each target's hearers and its tile at every level, in pieces pulled by the threads.
-        let candidates: Vec<Candidates> = crate::gate::on_threads(
-            threads,
-            addresses
-                .chunks(crate::gate::piece(addresses.len(), threads))
-                .collect(),
-            |chunk: &[u32]| {
-                chunk
-                    .iter()
-                    .filter_map(|address| {
-                        crate::gate::checkpoint();
-                        let hearers = self.hearers(*address);
-                        let points: Vec<[i64; 3]> = hearers.iter().map(|(_, mm)| *mm).collect();
-                        let median = tile::lower_median(&points)?;
-                        let tiles = (0..tile::LEVELS)
-                            .map(|level| Tile::containing(level, median))
-                            .collect();
-                        Some((*address, hearers, tiles))
-                    })
-                    .collect::<Vec<_>>()
-            },
-        )
-        .into_iter()
-        .flatten()
-        .collect();
-        // Every distinct candidate's members.
-        let tiles: Vec<Tile> = candidates
-            .iter()
-            .flat_map(|(_, _, tiles)| tiles.iter().copied())
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect();
-        let members: BTreeMap<Tile, Vec<PublicKey>> = crate::gate::on_threads(
-            threads,
-            tiles
-                .chunks(crate::gate::piece(tiles.len(), threads))
-                .collect(),
-            |chunk: &[Tile]| {
-                chunk
-                    .iter()
-                    .map(|tile| {
-                        crate::gate::checkpoint();
-                        (*tile, self.members(*tile))
-                    })
-                    .collect::<Vec<_>>()
-            },
-        )
-        .into_iter()
-        .flatten()
-        .collect();
-        // The choice, by the rule.
-        let mut plan = Plan {
-            assignments: BTreeMap::new(),
-            members,
-        };
-        for (address, hearers, _) in &candidates {
-            crate::gate::checkpoint();
-            if let Some((tile, scope)) = tile::assign(hearers, |tile| {
-                plan.members.get(&tile).cloned().unwrap_or_default()
-            }) {
-                plan.assignments
-                    .insert(*address, Assignment { tile, scope });
-            }
-        }
-        plan
-    }
-
-    /// The tile `address` is solved under (§ Assignment), with `members` remembering what each
-    /// tile's members are.
-    pub fn assign(
-        &self,
-        address: u32,
-        members: &mut BTreeMap<Tile, Vec<PublicKey>>,
-    ) -> Option<Assignment> {
-        let hearers = self.hearers(address);
-        let (tile, scope) = tile::assign(&hearers, |tile| {
-            members
-                .entry(tile)
-                .or_insert_with(|| self.members(tile))
-                .clone()
-        })?;
-        Some(Assignment { tile, scope })
-    }
-
-    /// Every usable receiver's receptions of `address` in the window: what chose its tile, as the
-    /// solution cites it.
-    pub fn addressed_citation(&self, address: u32) -> Citation {
-        let mut entries = Vec::new();
-        for bin in &self.bins {
-            for record in bin.by_address.get(&address).map_or(&[][..], Vec::as_slice) {
-                let id = bin.id(*record);
-                if self.sites.get(&id.receiver).is_some() {
-                    entries.push((id, bin.wall_ms(&bin.records[*record as usize])));
-                }
-            }
-        }
-        Citation::of_identities(entries)
-    }
-
-    /// The receptions of `address` in the window by `scope` receivers: what its transmissions are
-    /// grouped and solved from (never its ADS-B positions, which sync the clocks). Sorted by
-    /// identity.
-    pub fn receptions(&self, address: u32, scope: &[PublicKey]) -> Vec<Reception> {
-        let wanted: BTreeSet<&PublicKey> = scope.iter().collect();
-        let mut out = Vec::new();
-        for bin in &self.bins {
-            for record in bin.by_address.get(&address).map_or(&[][..], Vec::as_slice) {
-                let held = &bin.records[*record as usize];
-                let key = &bin.receivers[held.receiver as usize];
-                if wanted.contains(key) && !bin.messages[held.message as usize].sync {
-                    out.push(bin.reception(*record));
-                }
-            }
-        }
-        out.sort_by_cached_key(Reception::id);
-        out
-    }
-
-    /// A sync aircraft's rank in this window: BLAKE2s-256 over `"tally sync aircraft rank" 0x00`,
-    /// the address and the window's first and last bins, big-endian.
-    pub fn rank(&self, address: u32) -> [u8; 32] {
-        let mut hasher = Blake2s256::new();
-        hasher.update(RANK_DOMAIN);
-        hasher.update([0]);
-        hasher.update(address.to_be_bytes());
-        hasher.update(self.window.first.to_be_bytes());
-        hasher.update(self.window.last.to_be_bytes());
-        hasher.finalize().into()
-    }
-
-    /// Everything `tile`'s model in this window is a function of (§ Thinning), or `None` when it
-    /// has fewer than two members.
-    pub fn inputs(&self, tile: Tile, members: &[PublicKey]) -> Option<Inputs> {
-        if members.len() < 2 {
-            return None;
-        }
-        let scope: Vec<Site> = members
-            .iter()
-            .filter_map(|key| self.sites.get(key).map(|(site, _)| *site))
-            .collect();
-        // Per bin, the candidates the members heard, each with the members' records of it.
-        struct Event<'b> {
-            bin: &'b Bin,
-            records: Vec<u32>,
-            places: Vec<usize>,
-            address: u32,
-            hash: [u8; 32],
-        }
-        let mut events: Vec<Event<'_>> = Vec::new();
-        let repeated = self.repeated();
-        for bin in &self.bins {
-            let locals: Vec<(usize, u32)> = members
-                .iter()
-                .enumerate()
-                .filter_map(|(place, key)| bin.receiver(key).map(|local| (place, local)))
-                .collect();
-            let mut heard: Vec<u32> = locals
-                .iter()
-                .flat_map(|(_, local)| bin.heard[*local as usize].iter().copied())
-                .collect();
-            heard.sort_unstable();
-            heard.dedup();
-            let place_of: BTreeMap<u32, usize> = locals
-                .iter()
-                .map(|(place, local)| (*local, *place))
-                .collect();
-            for candidate in heard {
-                let candidate = &bin.candidates[candidate as usize];
-                let message = &bin.messages[candidate.message as usize];
-                let Some(address) = message.address else {
-                    continue;
-                };
-                // Bytes some receiver heard twice in the window are more than one transmission:
-                // never an event (`repeated`).
-                if repeated.binary_search(&message.hash).is_ok() {
-                    continue;
-                }
-                let mut records = Vec::new();
-                let mut places = Vec::new();
-                for record in &candidate.records {
-                    let local = bin.records[*record as usize].receiver;
-                    if let Some(place) = place_of.get(&local) {
-                        records.push(*record);
-                        places.push(*place);
-                    }
-                }
-                if places.len() >= 2 {
-                    events.push(Event {
-                        bin,
-                        records,
-                        places,
-                        address,
-                        hash: message.hash,
-                    });
-                }
-            }
-        }
-        // The sync aircraft, by rank: at most `A_max`.
-        let mut aircraft: Vec<u32> = events.iter().map(|event| event.address).collect();
-        aircraft.sort_unstable();
-        aircraft.dedup();
-        aircraft.sort_by_cached_key(|address| self.rank(*address));
-        if let Some(cap) = self.sync_aircraft_max {
-            aircraft.truncate(cap);
-        }
-        let kept_aircraft: BTreeSet<u32> = aircraft.into_iter().collect();
-        events.retain(|event| kept_aircraft.contains(&event.address));
-        // Thinning: per bin, in rank order (the message hash), an event is kept when one of its
-        // members has kept fewer than `K` there, or one pair of them fewer than `P` together.
-        events.sort_by(|a, b| a.bin.bin.cmp(&b.bin.bin).then(a.hash.cmp(&b.hash)));
-        let n = members.len();
-        let bins = usize::try_from(self.window.last - self.window.first + 1).unwrap_or(0);
-        let mut per_receiver = vec![0usize; n * bins];
-        let mut per_pair = vec![0usize; n * n * bins];
-        let mut sync: Vec<Reception> = Vec::new();
-        for event in &events {
-            let Some(slot) = usize::try_from(event.bin.bin - self.window.first)
-                .ok()
-                .filter(|slot| *slot < bins)
-            else {
-                continue;
-            };
-            let wanted = event
-                .places
-                .iter()
-                .any(|r| per_receiver[r * bins + slot] < EVENTS_PER_RECEIVER)
-                || event.places.iter().enumerate().any(|(i, a)| {
-                    event.places[i + 1..].iter().any(|b| {
-                        let (low, high) = if a < b { (a, b) } else { (b, a) };
-                        per_pair[(low * n + high) * bins + slot] < EVENTS_PER_PAIR
-                    })
-                });
-            if !wanted {
-                continue;
-            }
-            for (i, a) in event.places.iter().enumerate() {
-                per_receiver[a * bins + slot] += 1;
-                for b in &event.places[i + 1..] {
-                    let (low, high) = if a < b { (a, b) } else { (b, a) };
-                    per_pair[(low * n + high) * bins + slot] += 1;
-                }
-            }
-            sync.extend(
-                event
-                    .records
-                    .iter()
-                    .map(|record| event.bin.reception(*record)),
-            );
-        }
-        // The operational status of the kept events' aircraft: of each distinct message, its
-        // lowest-identity member reception in the window.
-        let used: BTreeSet<u32> = sync
-            .iter()
-            .filter_map(|reception| crate::modes::address(&reception.observation.data))
-            .collect();
-        let wanted: BTreeSet<&PublicKey> = members.iter().collect();
-        let mut status: BTreeMap<[u8; 32], Reception> = BTreeMap::new();
-        for bin in &self.bins {
-            for address in &used {
-                for (message, records) in bin.status.get(address).map_or(&[][..], Vec::as_slice) {
-                    // The lowest-identity member record of the message in this bin.
-                    let first = records
-                        .iter()
-                        .find(|record| {
-                            let local = bin.records[**record as usize].receiver;
-                            wanted.contains(&bin.receivers[local as usize])
-                        })
-                        .map(|record| bin.reception(*record));
-                    if let Some(first) = first {
-                        let hash = bin.messages[*message as usize].hash;
-                        let keep = status.get(&hash).is_none_or(|held| first.id() < held.id());
-                        if keep {
-                            status.insert(hash, first);
-                        }
-                    }
-                }
-            }
-        }
-        sync.extend(status.into_values());
-        sync.sort_by_cached_key(Reception::id);
-        sync.dedup_by(|later, earlier| later.id() == earlier.id());
-        let citation = Citation::of(&sync);
-        Some(Inputs {
-            tile,
-            window: self.window,
-            scope,
-            sync,
-            citation,
+    /// Every receiver's kept pairs (`pair::Network::of` over every site), found once.
+    pub fn network(&self) -> &Network {
+        self.network.get_or_init(|| {
+            let sites: Vec<Site> = self.by_key.values().map(|(site, _)| *site).collect();
+            Network::of(&sites)
         })
     }
-}
 
-/// The transmissions of `grouping` the window solves (§ Targets): those of a bin it solves, at
-/// most `TRANSMISSIONS_PER_BIN` a bin, the lowest-ranked first. A transmission's rank is
-/// BLAKE2s-256 over `"tally transmission rank" 0x00` and its lowest-identity reception's identity
-/// (receiver key, epoch, counter (8), message hash).
-pub fn chosen(
-    window: &Window,
-    transmissions: Vec<crate::group::Transmission>,
-) -> Vec<crate::group::Transmission> {
-    let rank = |transmission: &crate::group::Transmission| -> [u8; 32] {
-        let mut hasher = Blake2s256::new();
-        hasher.update(TRANSMISSION_DOMAIN);
-        hasher.update([0]);
-        if let Some(first) = transmission.receptions.iter().map(|timed| timed.id).min() {
-            hasher.update(first.receiver.as_bytes());
-            hasher.update(first.epoch.to_be_bytes());
-            hasher.update(first.timestamp.to_be_bytes());
-            hasher.update(first.message);
+    /// The members of `area` (crate docs, § Areas): its receivers and every receiver one of them
+    /// keeps, by their signed sites, sorted by key. Never a function of whose raw arrived, so
+    /// every holder of the same site records names the same members. Found once an area and
+    /// remembered.
+    pub fn members(&self, area: Region) -> Arc<[Site]> {
+        if let Some(members) = read(&self.members).get(&area) {
+            return Arc::clone(members);
         }
-        hasher.finalize().into()
-    };
-    let solved = window.solved();
-    let mut by_bin: BTreeMap<i64, Vec<([u8; 32], crate::group::Transmission)>> = BTreeMap::new();
-    for transmission in transmissions {
-        if let Some(bin) = transmission.bin().filter(|bin| solved.contains(bin)) {
-            by_bin
-                .entry(bin)
-                .or_default()
-                .push((rank(&transmission), transmission));
+        let network = self.network();
+        let mut keys: BTreeSet<PublicKey> = BTreeSet::new();
+        for key in self.by_area.get(&area).map_or(&[][..], Vec::as_slice) {
+            keys.insert(*key);
+            keys.extend(network.kept(key).iter().copied());
         }
+        let members: Arc<[Site]> = keys
+            .iter()
+            .filter_map(|key| self.by_key.get(key).map(|(site, _)| *site))
+            .collect();
+        self.members
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(area)
+            .or_insert_with(|| Arc::clone(&members));
+        members
     }
-    let mut out = Vec::new();
-    for mut list in by_bin.into_values() {
-        list.sort_by_key(|entry| entry.0);
-        out.extend(
-            list.into_iter()
-                .take(TRANSMISSIONS_PER_BIN)
-                .map(|(_, transmission)| transmission),
-        );
+
+    /// The areas `receivers` are in, ascending and without repeats, each a usable receiver here:
+    /// the areas whose models a considered set of their receptions is grouped and solved by
+    /// (crate docs, § Areas, the models a fix cites).
+    pub fn areas_of(&self, receivers: impl IntoIterator<Item = PublicKey>) -> Vec<Region> {
+        let areas: std::collections::BTreeSet<Region> = receivers
+            .into_iter()
+            .filter_map(|key| self.area(&key))
+            .collect();
+        areas.into_iter().collect()
     }
-    out
 }

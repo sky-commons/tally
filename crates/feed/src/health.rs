@@ -4,7 +4,12 @@
 //! status file in its state directory every `STATUS_EVERY`, which `tally-feed health` reads and
 //! judges (a container's `HEALTHCHECK`, packaging/container/Dockerfile): healthy when the file is
 //! fresh, a relay session was up within `RELAY_WITHIN` and the decoder sent bytes within
-//! `SOURCE_WITHIN`. readsb and dump1090-fa send a heartbeat on their BEAST output every 60 s
+//! `SOURCE_WITHIN`, and that it has had a clock to sign by: a configured relay heard (`--relay`
+//! or a seed) or this host's clock synced, within `RELAY_WITHIN` (`source::RelayClocks`'s
+//! sources; without either it signs by an unsynced host clock no relay vouches for). It also says,
+//! without calling the feeder unhealthy, when its clock disagrees with a relay it publishes to
+//! (`source::RelayClocks::disagreements`): every batch is still sent, and that relay judges whether
+//! it can use it, so the owner sees a wrong clock rather than missing batches. readsb and dump1090-fa send a heartbeat on their BEAST output every 60 s
 //! when no aircraft is heard (readsb's `--net-heartbeat`), so a decoder silent for five minutes
 //! is a decoder that is gone or wedged, not a quiet sky.
 
@@ -36,6 +41,25 @@ pub struct Health {
     state: Mutex<State>,
     /// Wall-clock seconds the decoder last sent bytes; 0 if it never did.
     source_heard: AtomicU64,
+    /// Since when (wall-clock seconds) no configured clock source has been reachable while this
+    /// host's clock is unsynced (`source::RelayClocks::sourced`); 0 while one is.
+    unsourced_since: AtomicU64,
+    /// The relays a session measures whose clock this feeder's is outside, and by how far in
+    /// milliseconds (positive ahead of it): `source::RelayClocks::disagreements`.
+    disagreeing: Mutex<Vec<(tally_wire::PublicKey, i64)>>,
+    /// The relays whose anchors this feeder's trusted reference disagrees with more than an
+    /// honest relay's can, and by how far in milliseconds:
+    /// `source::RelayClocks::anchor_disagreements`.
+    anchors_disagreeing: Mutex<Vec<(tally_wire::PublicKey, i64)>>,
+    /// Since when (wall-clock seconds) the batcher has carried no anchor
+    /// (`source::RelayClocks::anchors`); 0 while it carries one.
+    anchorless_since: AtomicU64,
+    /// The batches signed with no anchor since the feeder started
+    /// (`source::RelayClocks::unanchored`).
+    unanchored: AtomicU64,
+    /// The batches relay sessions were too slow for since the feeder started: each lost to that
+    /// session as the sessions' channel moved past it (`RecvError::Lagged`).
+    lagged: AtomicU64,
 }
 
 struct State {
@@ -70,6 +94,12 @@ impl Default for Health {
                 recovered: None,
             }),
             source_heard: AtomicU64::new(0),
+            unsourced_since: AtomicU64::new(0),
+            disagreeing: Mutex::new(Vec::new()),
+            anchors_disagreeing: Mutex::new(Vec::new()),
+            anchorless_since: AtomicU64::new(0),
+            unanchored: AtomicU64::new(0),
+            lagged: AtomicU64::new(0),
         }
     }
 }
@@ -95,6 +125,58 @@ impl Health {
             }
             state.relays_up = count;
         }
+    }
+
+    /// Whether the batcher has a clock source now: a configured relay heard, or this host's
+    /// clock synced (`source::RelayClocks::sourced`).
+    pub fn clock_sourced(&self, sourced: bool) {
+        if sourced {
+            self.unsourced_since.store(0, Ordering::Relaxed);
+        } else {
+            let _ = self.unsourced_since.compare_exchange(
+                0,
+                wall_secs().max(1),
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            );
+        }
+    }
+
+    /// The relays whose clock this feeder's disagrees with now, by how far
+    /// (`source::RelayClocks::disagreements`).
+    pub fn clock_disagrees(&self, disagreeing: Vec<(tally_wire::PublicKey, i64)>) {
+        if let Ok(mut held) = self.disagreeing.lock() {
+            *held = disagreeing;
+        }
+    }
+
+    /// The relays whose anchors disagree with this feeder's clock now, and by how far
+    /// (`source::RelayClocks::anchor_disagreements`): said, and their anchors left out of batches.
+    pub fn anchor_disagrees(&self, disagreeing: Vec<(tally_wire::PublicKey, i64)>) {
+        if let Ok(mut held) = self.anchors_disagreeing.lock() {
+            *held = disagreeing;
+        }
+    }
+
+    /// Whether the batcher carries an anchor now, and how many batches it has signed with none:
+    /// none carried, its data is unusable at every relay (RFC-0171 §3.6).
+    pub fn anchored(&self, carrying: bool, unanchored: u64) {
+        self.unanchored.store(unanchored, Ordering::Relaxed);
+        if carrying {
+            self.anchorless_since.store(0, Ordering::Relaxed);
+        } else {
+            let _ = self.anchorless_since.compare_exchange(
+                0,
+                wall_secs().max(1),
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            );
+        }
+    }
+
+    /// A relay session was too slow for `count` more batches, which it will never send.
+    pub fn lagged(&self, count: u64) {
+        self.lagged.fetch_add(count, Ordering::Relaxed);
     }
 
     /// The decoder sent bytes.
@@ -133,10 +215,38 @@ impl Health {
             })
             .unwrap_or(0);
         let source = self.source_heard.load(Ordering::Relaxed);
+        let unsourced = self.unsourced_since.load(Ordering::Relaxed);
+        let anchorless = self.anchorless_since.load(Ordering::Relaxed);
+        let unanchored = self.unanchored.load(Ordering::Relaxed);
+        let lagged = self.lagged.load(Ordering::Relaxed);
+        let disagreeing: String = self
+            .disagreeing
+            .lock()
+            .map(|held| {
+                held.iter()
+                    .map(|(relay, off)| format!("clock-disagrees {} {off}\n", relay.to_base64url()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let anchors: String = self
+            .anchors_disagreeing
+            .lock()
+            .map(|held| {
+                held.iter()
+                    .map(|(relay, off)| {
+                        format!("anchor-disagrees {} {off}\n", relay.to_base64url())
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         format!(
             "# tally-feed's status, rewritten every {}s while it runs and read by `tally-feed \
-             health`: wall-clock seconds, 0 for never.\nwritten {now}\nrelay {relay}\nsource \
-             {source}\n",
+             health`: wall-clock seconds, 0 for never; each clock-disagrees line a relay and how \
+             far this feeder's clock is outside its, and each anchor-disagrees line a relay and how \
+             far its anchor is outside this feeder's reference, in milliseconds; lagged the \
+             batches relay sessions were too slow for since it started.\nwritten \
+             {now}\nrelay {relay}\nsource {source}\nclock-unsourced {unsourced}\nanchorless \
+             {anchorless}\nunanchored {unanchored}\nlagged {lagged}\n{disagreeing}{anchors}",
             STATUS_EVERY.as_secs()
         )
     }
@@ -228,16 +338,66 @@ fn judge(text: &str, now: u64) -> Result<String, String> {
             ago(source)
         ));
     }
+    // A status written before the line existed has none: nothing to judge.
+    if let Ok(since) = field("clock-unsourced")
+        && since > 0
+        && ago(since) > RELAY_WITHIN
+    {
+        wrong.push(format!(
+            "no configured clock source reachable, host unsynced, for {}s",
+            ago(since)
+        ));
+    }
+    // A status written before the lines existed has none: nothing to judge.
+    if let Ok(since) = field("anchorless")
+        && since > 0
+        && ago(since) > RELAY_WITHIN
+    {
+        wrong.push(crate::relays::anchorless(
+            ago(since),
+            field("unanchored").unwrap_or(0),
+        ));
+    }
+    // Said, never judged: a session too slow for some batches still sends the rest.
+    let lagged = match field("lagged") {
+        Ok(count) if count > 0 => {
+            format!("; {count} batches relay sessions were too slow for since it started")
+        }
+        _ => String::new(),
+    };
+    // Said, never judged: every batch still goes, and the relay judges it.
+    let notes: String = text
+        .lines()
+        .filter_map(|line| {
+            let (said, rest): (fn(&str, i64) -> String, &str) =
+                if let Some(rest) = line.strip_prefix("clock-disagrees ") {
+                    (crate::relays::disagreeing, rest)
+                } else {
+                    (
+                        crate::relays::anchor_disagreeing,
+                        line.strip_prefix("anchor-disagrees ")?,
+                    )
+                };
+            let (relay, off) = rest.split_once(' ')?;
+            let off: i64 = off.trim().parse().ok()?;
+            Some(format!("; {}", said(&format!("key {relay}"), off)))
+        })
+        .collect();
+    let notes = format!("{lagged}{notes}");
     if wrong.is_empty() {
         Ok(format!(
-            "healthy: publishing to a relay, decoder last heard {}s ago",
+            "healthy: publishing to a relay, decoder last heard {}s ago{notes}",
             ago(source)
         ))
     } else {
-        Err(format!("unhealthy: {}", wrong.join("; ")))
+        Err(format!("unhealthy: {}{notes}", wrong.join("; ")))
     }
 }
 
+#[allow(
+    clippy::disallowed_methods,
+    reason = "the feeder's own host clock, which its health ages by"
+)]
 fn wall_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -314,6 +474,102 @@ mod tests {
                 .is_err_and(|why| why.contains("nothing read from the decoder for"))
         );
         assert!(judge("written 1\n", 1).is_err_and(|why| why.contains("no relay")));
+    }
+
+    /// No configured relay heard and this host's clock unsynced, for longer than a failover: the
+    /// verdict says so (the batcher signs by a clock nothing vouches for). A short gap, or a
+    /// source back, says nothing.
+    #[tokio::test(start_paused = true)]
+    async fn no_clock_source_is_reported() {
+        let health = Health::default();
+        health.relays_up(1);
+        health.source_heard();
+        let now = wall_secs();
+        health.clock_sourced(false);
+        assert!(judge(&health.status(now), now).is_ok(), "a short gap");
+        let later = now + RELAY_WITHIN + 1;
+        health.source_heard.store(later, Ordering::Relaxed);
+        assert!(
+            judge(&health.status(later), later).is_err_and(
+                |why| why.contains("no configured clock source reachable, host unsynced")
+            )
+        );
+        health.clock_sourced(true);
+        assert!(judge(&health.status(later), later).is_ok());
+    }
+
+    /// A feeder that carries no anchor for longer than a failover is unhealthy, and says its data
+    /// is unusable and how many batches it signed with none: no relay can use them. A short gap,
+    /// or an anchor back, says nothing.
+    #[tokio::test(start_paused = true)]
+    async fn carrying_no_anchor_is_reported_with_the_unanchored_count() {
+        let health = Health::default();
+        health.relays_up(1);
+        health.source_heard();
+        let now = wall_secs();
+        health.anchored(false, 3);
+        assert!(judge(&health.status(now), now).is_ok(), "a short gap");
+        let later = now + RELAY_WITHIN + 1;
+        health.source_heard.store(later, Ordering::Relaxed);
+        assert!(judge(&health.status(later), later).is_err_and(|why| {
+            why.contains("carrying no anchor for")
+                && why.contains("data unusable")
+                && why.contains("(3 batches signed unanchored)")
+        }));
+        health.anchored(true, 3);
+        assert!(judge(&health.status(later), later).is_ok());
+    }
+
+    /// The batches relay sessions were too slow for are counted on the health surface, all told
+    /// since the feeder started, and said, never judged. Before, they were only logged.
+    #[tokio::test(start_paused = true)]
+    async fn batches_a_session_was_too_slow_for_are_counted_never_judged() {
+        let health = Health::default();
+        health.relays_up(1);
+        health.source_heard();
+        let now = wall_secs();
+        let quiet = judge(&health.status(now), now);
+        assert!(quiet.is_ok_and(|said| !said.contains("too slow")));
+        health.lagged(3);
+        health.lagged(4);
+        assert!(health.status(now).contains("\nlagged 7\n"));
+        let said = judge(&health.status(now), now);
+        assert!(
+            said.as_ref()
+                .is_ok_and(|said| said.contains("; 7 batches relay sessions were too slow for")),
+            "{said:?}"
+        );
+    }
+
+    /// A clock that disagrees with a relay is said on the health surface, with by how far and
+    /// which way, and is no verdict: the feeder still sends every batch, and the relay judges it.
+    #[tokio::test(start_paused = true)]
+    async fn a_clock_that_disagrees_with_a_relay_is_reported_never_judged() -> Result<(), String> {
+        let health = Health::default();
+        health.relays_up(1);
+        health.source_heard();
+        let relay = tally_wire::Identity::from_seed([3; 32]).public();
+        health.clock_disagrees(vec![(relay, -3_600_000)]);
+        let now = wall_secs();
+        let said = judge(&health.status(now), now)?;
+        assert!(
+            said.contains("your clock disagrees with relay")
+                && said.contains(&relay.to_base64url())
+                && said.contains("by 3600 s (behind it)"),
+            "{said}"
+        );
+        health.clock_disagrees(Vec::new());
+        assert!(!judge(&health.status(now), now)?.contains("disagrees"));
+        // A relay's anchor that disagrees: said, with by how far, and left out of batches.
+        health.anchor_disagrees(vec![(relay, 94_000)]);
+        let said = judge(&health.status(now), now)?;
+        assert!(
+            said.contains("anchor disagrees with your reference")
+                && said.contains(&relay.to_base64url())
+                && said.contains("by 94 s"),
+            "{said}"
+        );
+        Ok(())
     }
 
     #[test]

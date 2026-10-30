@@ -59,6 +59,7 @@ use std::sync::{Arc, Mutex};
 use tally_wire::PublicKey;
 
 use crate::budget::{Charge, Gauge};
+use crate::footprint::{self, Table};
 use crate::ingest::Group;
 
 /// A rate in receptions and bytes a second: `R_max`, or a source's ceiling.
@@ -207,9 +208,13 @@ pub const RESERVE: f64 = 0.1;
 /// Units whose usage is tracked, at most, where no store limits them. Past it (or past the room
 /// the store holds) every further unit shares [`Unit::Overflow`], one share between them.
 pub const UNITS_TRACKED: usize = 1 << 17;
-/// Bytes of the shed store one tracked unit holds: its key in the table, its two decayed sums and
-/// the table's room to grow.
-pub const BYTES_PER_UNIT: usize = 256;
+/// Bytes of the shed store one tracked unit holds at most: its slot in its table and its share of
+/// the table's room, the table being kept within four times what it holds
+/// (`footprint::table_per_entry`). Each table is charged what it allocates, growth before it
+/// grows, so this is what a unit is planned at, never what it is charged.
+pub const BYTES_PER_UNIT: usize = footprint::table_per_entry::<Unit, Use>(KEPT_WITHIN);
+/// A table of units is kept within this many times what it holds (`Table::kept`).
+const KEPT_WITHIN: usize = 4;
 /// The units one connection can bring into the table: its network group's and, once this relay
 /// has corroborated it, its own, and the room for one of another's while that is not yet let go.
 pub const UNITS_PER_CONNECTION: usize = 2;
@@ -243,8 +248,54 @@ struct Use {
     at_ms: u64,
     /// Nothing of it has been judged yet.
     fresh: bool,
-    /// The room this entry holds in the shed store, let go with it.
-    _room: Charge,
+}
+
+/// One table of tracked units, and what it allocates ([`Table`]), charged to the shed store.
+#[derive(Default)]
+struct Tracked {
+    units: HashMap<Unit, Use>,
+    table: Table,
+    charge: Charge,
+}
+
+impl Tracked {
+    /// Kept within [`KEPT_WITHIN`] times what it holds, and its charge brought down to what it
+    /// allocates.
+    fn settle(&mut self) {
+        self.table.kept(&mut self.units, KEPT_WITHIN);
+        self.charge.shrink_to(self.table.bytes::<Unit, Use>());
+    }
+}
+
+/// A unit's entry, held under its lock: in its table, or the overflow's, which every unit past
+/// the store's room shares and which is held apart from the tables, so it costs the store
+/// nothing and is always there.
+enum Entry<'a> {
+    Tracked(std::sync::MutexGuard<'a, Tracked>, Unit),
+    Overflow(std::sync::MutexGuard<'a, Use>),
+}
+
+impl Entry<'_> {
+    fn unit(&self) -> Unit {
+        match self {
+            Self::Tracked(_, unit) => *unit,
+            Self::Overflow(_) => Unit::Overflow,
+        }
+    }
+
+    fn get(&self) -> Option<&Use> {
+        match self {
+            Self::Tracked(tracked, unit) => tracked.units.get(unit),
+            Self::Overflow(used) => Some(used),
+        }
+    }
+
+    fn get_mut(&mut self) -> Option<&mut Use> {
+        match self {
+            Self::Tracked(tracked, unit) => tracked.units.get_mut(unit),
+            Self::Overflow(used) => Some(used),
+        }
+    }
 }
 
 /// The token buckets, which every judgement takes from in the order stamps come.
@@ -335,9 +386,11 @@ pub struct Shedder {
     flow: Mutex<Flow>,
     bounded: bool,
     /// Units tracked, by table (a hash of the unit picks its table).
-    tables: Vec<Mutex<HashMap<Unit, Use>>>,
+    tables: Vec<Mutex<Tracked>>,
+    /// Every unit past the store's room, together.
+    overflow: Mutex<Use>,
     tracked: AtomicUsize,
-    /// What a tracked unit holds ([`BYTES_PER_UNIT`]) is charged here when there is a store.
+    /// What each table allocates is charged here when there is a store.
     room: Option<Arc<Gauge>>,
     scan: Mutex<Scan>,
     /// Tables the scans have visited, all told.
@@ -400,10 +453,18 @@ impl Shedder {
         Self::bounded_by(rate, ceiling)
     }
 
-    /// The units tracked are held in `room` (the shed store, [`BYTES_PER_UNIT`] each): a unit the
-    /// store has no room for shares [`Unit::Overflow`] with every other.
+    /// The units tracked are held in `room` (the shed store, each table charged what it
+    /// allocates, at most [`BYTES_PER_UNIT`] a unit): a unit the store has no room for shares
+    /// [`Unit::Overflow`] with every other. Given before any unit is tracked.
     #[must_use]
     pub fn within(mut self, room: Arc<Gauge>) -> Self {
+        for table in &self.tables {
+            let mut table = table
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            debug_assert!(table.units.is_empty());
+            table.charge = room.empty();
+        }
         self.room = Some(room);
         self
     }
@@ -434,8 +495,9 @@ impl Shedder {
             }),
             bounded,
             tables: (0..if bounded { TABLES } else { 0 })
-                .map(|_| Mutex::new(HashMap::new()))
+                .map(|_| Mutex::new(Tracked::default()))
                 .collect(),
+            overflow: Mutex::new(Use::new(0)),
             tracked: AtomicUsize::new(0),
             room: None,
             scan: Mutex::new(Scan {
@@ -504,37 +566,47 @@ impl Shedder {
         verdict
     }
 
-    /// The table `unit` is tracked in, or the overflow's: a unit already tracked keeps its entry,
-    /// one not yet tracked is given an entry while the store has room for it.
-    fn entry<'a>(
-        &'a self,
-        unit: Unit,
-        now: u64,
-    ) -> (Unit, std::sync::MutexGuard<'a, HashMap<Unit, Use>>) {
-        let lock = |unit: Unit| {
-            self.tables[table_of(unit)]
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
+    /// The entry `unit` is tracked in, or the overflow's: a unit already tracked keeps its entry,
+    /// one not yet tracked is given an entry while the store has room for what its table grows by
+    /// (charged before it grows), or without a store while fewer than [`UNITS_TRACKED`] are.
+    fn entry(&self, unit: Unit, now: u64) -> Entry<'_> {
+        let overflow = || {
+            Entry::Overflow(
+                self.overflow
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            )
         };
-        let mut table = lock(unit);
-        if table.contains_key(&unit) || unit == Unit::Overflow {
-            return (unit, table);
+        if unit == Unit::Overflow || self.tables.is_empty() {
+            return overflow();
+        }
+        let mut tracked = self.tables[table_of(unit)]
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if tracked.units.contains_key(&unit) {
+            return Entry::Tracked(tracked, unit);
         }
         let room = match &self.room {
-            Some(gauge) => gauge.try_charge(BYTES_PER_UNIT),
-            None => (self.tracked.load(Ordering::Relaxed) < UNITS_TRACKED).then(Charge::none),
+            Some(_) => {
+                let growth = tracked
+                    .table
+                    .growth::<Unit, Use>(tracked.units.len(), tracked.units.capacity());
+                tracked.charge.try_grow(growth)
+            }
+            None => self.tracked.load(Ordering::Relaxed) < UNITS_TRACKED,
         };
-        if let Some(room) = room {
-            self.tracked.fetch_add(1, Ordering::Relaxed);
-            table.insert(unit, Use::new(now, room));
-            return (unit, table);
+        if !room {
+            drop(tracked);
+            return overflow();
         }
-        drop(table);
-        let mut table = lock(Unit::Overflow);
-        table
-            .entry(Unit::Overflow)
-            .or_insert_with(|| Use::new(now, Charge::none()));
-        (Unit::Overflow, table)
+        self.tracked.fetch_add(1, Ordering::Relaxed);
+        tracked.units.insert(unit, Use::new(now));
+        let capacity = tracked.units.capacity();
+        tracked.table.inserted(capacity);
+        if self.room.is_some() {
+            tracked.settle();
+        }
+        Entry::Tracked(tracked, unit)
     }
 
     fn judged(&self, flow: &mut Flow, unit: Unit, cost: Cost, now: u64) -> Result<(), Cause> {
@@ -545,9 +617,10 @@ impl Shedder {
             bucket.tokens = (bucket.tokens + elapsed as f64 * bucket.rate_per_ms).min(bucket.burst);
         }
         let attempted = cost.dims();
-        let (resolved, mut table) = self.entry(unit, now);
-        let fresh = table.get(&resolved).is_some_and(|used| used.fresh);
-        let Some(used) = table.get_mut(&resolved) else {
+        let mut entry = self.entry(unit, now);
+        let resolved = entry.unit();
+        let fresh = entry.get().is_some_and(|used| used.fresh);
+        let Some(used) = entry.get_mut() else {
             return Err(Cause::OverShare);
         };
         used.fresh = false;
@@ -633,8 +706,8 @@ impl Shedder {
             for (bucket, cost) in flow.buckets.iter_mut().zip(cost.dims()) {
                 bucket.tokens = (bucket.tokens + cost).min(bucket.burst);
             }
-            let (resolved, mut table) = self.entry(unit, flow.at_ms);
-            if let Some(used) = table.get_mut(&resolved) {
+            let mut entry = self.entry(unit, flow.at_ms);
+            if let Some(used) = entry.get_mut() {
                 for (sum, cost) in used.attempted.iter_mut().zip(cost.dims()) {
                     *sum = (*sum - cost).max(0.0);
                 }
@@ -682,22 +755,35 @@ impl Shedder {
         for _ in 0..TABLES_PER_JUDGEMENT.min(scan.remaining) {
             let at_ms = scan.at_ms;
             let index = scan.next;
-            let mut table = self.tables[index]
+            if index == 0 {
+                // The overflow's want, once a scan beside the tables', once any unit has shared it.
+                let overflow = self
+                    .overflow
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if !overflow.fresh {
+                    for (dim, want) in overflow.rates(at_ms).into_iter().enumerate() {
+                        scan.wants[dim].add(want);
+                    }
+                }
+            }
+            let mut tracked = self.tables[index]
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let before = table.len();
-            table.retain(|unit, used| {
-                *unit == Unit::Overflow || at_ms.saturating_sub(used.at_ms) <= RETAIN_MS
-            });
+            let before = tracked.units.len();
+            tracked
+                .units
+                .retain(|_, used| at_ms.saturating_sub(used.at_ms) <= RETAIN_MS);
             self.tracked
-                .fetch_sub(before - table.len(), Ordering::Relaxed);
-            for used in table.values() {
+                .fetch_sub(before - tracked.units.len(), Ordering::Relaxed);
+            tracked.settle();
+            for used in tracked.units.values() {
                 let wants = used.rates(at_ms);
                 for (dim, want) in wants.into_iter().enumerate() {
                     scan.wants[dim].add(want);
                 }
             }
-            drop(table);
+            drop(tracked);
             scan.next += 1;
             scan.remaining -= 1;
             self.visits.fetch_add(1, Ordering::Relaxed);
@@ -800,14 +886,31 @@ impl Shedder {
     }
 }
 
+impl Shedder {
+    /// What the tables allocate, counted afresh from their buckets: what the store must hold.
+    #[cfg(test)]
+    fn counted(&self) -> usize {
+        self.tables
+            .iter()
+            .map(|table| {
+                let table = table
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                assert!(table.units.capacity() <= footprint::capacity_of(table.table.buckets()));
+                assert!(table.table.bytes::<Unit, Use>() <= table.units.len() * BYTES_PER_UNIT);
+                table.table.bytes::<Unit, Use>()
+            })
+            .sum()
+    }
+}
+
 impl Use {
-    fn new(at_ms: u64, room: Charge) -> Self {
+    fn new(at_ms: u64) -> Self {
         Self {
             attempted: [0.0; DIMS],
             credit: [0.0; DIMS],
             at_ms,
             fresh: true,
-            _room: room,
         }
     }
 
@@ -1349,9 +1452,14 @@ mod tests {
         let shedder = Shedder::new(RATE, CEILING).within(Arc::clone(&room));
         for n in 0..1_000u64 {
             let _ = shedder.judge(group(n as u16), cost(10), n);
+            assert_eq!(room.held(), shedder.counted());
         }
         assert!(room.held() <= BYTES_PER_UNIT * 100, "{}", room.held());
-        assert_eq!(shedder.report().active_sources, 100);
+        // As many as the room holds at what each table allocates: at least the units planned,
+        // and never past the room.
+        let tracked = shedder.report().active_sources;
+        assert!((100..1_000).contains(&tracked), "{tracked}");
+        assert!(room.held() <= tracked * BYTES_PER_UNIT);
         // A newcomer past the room is judged with the others past it, as a unit within its share.
         let unit = group(60_000);
         assert!(shedder.judge(unit, cost(10), 1_001).is_ok());
@@ -1360,7 +1468,38 @@ mod tests {
             let _ = shedder.judge(group(0), cost(1), 20_000 + tick * 100);
         }
         assert!(room.held() <= BYTES_PER_UNIT * 2, "{}", room.held());
+        assert_eq!(room.held(), shedder.counted());
         assert!(shedder.report().active_sources <= 2);
+    }
+
+    /// Each table of tracked units is charged what it allocates, read from its buckets, as units
+    /// come, sit idle past their retention and go, in waves: never more than the store's room nor
+    /// [`BYTES_PER_UNIT`] for each unit it tracks, and nothing once every unit has gone. Before, a
+    /// unit was charged 256 bytes whatever its table allocated, and a table grown by a flood kept
+    /// its buckets uncharged once the flood's units went.
+    #[test]
+    fn the_tables_of_units_are_charged_what_they_allocate_as_units_churn() {
+        let room = Gauge::new(Store::Shed, BYTES_PER_UNIT * 5_000);
+        let shedder = Shedder::new(RATE, CEILING).within(Arc::clone(&room));
+        let mut now = 0;
+        for wave in 0..6u64 {
+            let units = [200, 9_000, 50, 3_000, 1, 600][wave as usize];
+            for n in 0..units {
+                now += 1;
+                let _ = shedder.judge(group((wave * 10_000 + n) as u16), cost(1), now);
+                assert_eq!(room.held(), shedder.counted());
+            }
+            assert!(room.held() <= room.limit());
+            assert!(room.held() <= shedder.report().active_sources.max(1) * BYTES_PER_UNIT);
+            // Idle past the retention: the scans let them go, a few tables at a time.
+            for tick in 0..400u64 {
+                now += RETAIN_MS / 100;
+                let _ = shedder.judge(group(65_000), cost(1), now + tick);
+                assert_eq!(room.held(), shedder.counted());
+            }
+            assert!(shedder.report().active_sources <= 1);
+            assert!(room.held() <= BYTES_PER_UNIT, "{}", room.held());
+        }
     }
 
     /// The water level is found a few tables at a time with the batches judged, never all at once

@@ -101,7 +101,7 @@ pub fn counter(class: ClockClass, ns: f64) -> Option<u64> {
 }
 
 /// A sensor that takes part, as its feeder describes itself.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct Receiver {
     pub serial: u32,
     pub identity: Identity,

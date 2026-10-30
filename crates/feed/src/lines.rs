@@ -10,6 +10,10 @@ use tally_wire::Observation;
 pub const TIMESTAMP_MODULUS: u64 = 1 << 48;
 
 /// The feeder's wall clock in microseconds, for a line that carries none.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "the feeder's own host clock, for a line that carries none"
+)]
 pub fn now_us() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

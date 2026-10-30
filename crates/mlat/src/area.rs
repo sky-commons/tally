@@ -1,42 +1,81 @@
 //! What an MLAT relay holds for the areas it solves (RFC-0174 §2.3): each area's border band, the
-//! cells whose receivers' raw it must hold so that every tile it fits has its whole footprint in
-//! hand. One definition, so the raw a relay asks its neighbours for (the region-cut raw
-//! subscription, `tally_relay::selection`) and the receivers its engine lets take part
-//! (`tally_relay::mlat_host`) are the same cells.
+//! cells whose receivers' sites and raw it must hold so that every area it fits has its whole
+//! model's members in hand; and which area's relays take a transmission up ([`owner`]). One
+//! definition, so the raw a relay asks its neighbours for (the region-cut raw subscription,
+//! `tally_relay::selection`), the models it asks for (`tally_relay::network`) and the receivers its
+//! engine lets take part (`tally_relay::mlat_host`) are the same cells.
 //!
-//! The band's width is not a chosen number: it follows from the tiles. A relay fits the tiles
-//! whose centre is in one of its areas (`crate::window::owns`), and publishes one only if it holds
-//! every receiver of its footprint (`crate::window::covers`), which reaches
-//! `tally_mlat_solver::tile::footprint_mm` of the top level (about 573 km) from the centre. So the
-//! band is every cell that could hold a point within that reach of any point of the area. RFC-0174's
-//! first "one reception radius (about 400 km)" was the reach of a tile's radius alone; the footprint
-//! adds half its cube's diagonal, and a band of 400 km would leave every top-level tile unpublished.
+//! The band's width is not a chosen number: it follows from the pairs. An area's pair model
+//! (`tally_mlat_solver` crate docs, § Areas) has for members its receivers and every receiver one
+//! of them keeps as a pair's other end: its `PAIR_NEIGHBOURS` nearest within `PAIR_BASELINE_MM`
+//! (600 km) by exact distance between millimetre sites (`pair::Network`). Knowing which those are
+//! takes every site within that baseline of each of the area's receivers, and fitting the pairs
+//! takes their raw; so the band is every cell that could hold a point within the baseline of any
+//! point of the area ([`reach_km`]). The tiles' band before it reached a top-level tile's footprint
+//! (about 573 km) from a tile centre in the area; RFC-0174's first "one reception radius (about
+//! 400 km)" would leave a boundary receiver's farther pairs out of its area's model, and two relays
+//! holding different bands would fit different members, so different bytes.
+//!
+//! A transmission's other hearers are in the band too (a relay holds only the raw of receivers that
+//! take part, and those are the band's), and their areas' models are the ones a fix may cite beside
+//! its owner's: the models a relay asks its neighbours for are the band's areas'.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use h3o::{CellIndex, LatLng};
-use tally_mlat_solver::geo;
-use tally_mlat_solver::tile::{LEVELS, Tile, footprint_mm};
+use tally_mlat_solver::Sites;
+use tally_mlat_solver::pair::PAIR_BASELINE_MM;
 use tally_wire::rendezvous::AREA_RESOLUTION;
-use tally_wire::{Location, Region, Regions};
+use tally_wire::{PublicKey, Region, Regions};
 
-/// A tile's centre on the ground, as a location: the one projection of a tile into the area tree,
-/// which decides both which area's MLAT relays fit it (`crate::window::owns`) and which region a
-/// clock model of it is routed by (`tally_relay::network::model_point`).
-pub fn centre(tile: Tile) -> Location {
-    let centre = geo::from_ecef(geo::from_mm(tile.centre_mm()));
-    Location {
-        lat_e7: (centre.lat_deg * 1e7).round() as i32,
-        lon_e7: (centre.lon_deg * 1e7).round() as i32,
-        alt_m: 0,
-        precision_m: 0,
+/// The area whose relays take up a transmission heard by `hearers` (`fix` module docs, By whom):
+/// the area most of them are in (`Sites::area`), ties to the lowest. `None` when none is in any.
+/// A function of the hearers' signed sites alone, so twin relays take up the same transmissions.
+pub fn owner(sites: &Sites, hearers: impl IntoIterator<Item = PublicKey>) -> Option<Region> {
+    let mut counts: BTreeMap<Region, usize> = BTreeMap::new();
+    for hearer in hearers {
+        if let Some(area) = sites.area(&hearer) {
+            *counts.entry(area).or_default() += 1;
+        }
     }
+    let most = counts.values().copied().max()?;
+    counts
+        .into_iter()
+        .find(|(_, count)| *count == most)
+        .map(|(area, _)| area)
 }
 
-/// The farthest from a tile's centre a receiver of its footprint can be, kilometres.
-fn reach_km() -> f64 {
-    footprint_mm(LEVELS - 1) as f64 / 1e6
+/// The steps an area's refits come in turns of: one each `REFIT_EVERY` (two steps of
+/// `ARRIVED_SLICE`), so each area is refit at one of them, its turn ([`refit_turn`]).
+pub const REFIT_TURNS: u64 = tally_wire::budget::REFIT_EVERY_MS
+    / tally_wire::budget::ARRIVED_SLICE
+        .span::<tally_wire::clocks::Judged>()
+        .ms();
+
+/// The step of the refit grid at which `area` is refit (`tally_mlat::engine`, One step a second):
+/// that many steps after the step its edge moves on, so an engine's areas are refit half at each
+/// step and no step carries them all. A function of the cell alone, so every relay holding the
+/// area refits it at the same step, from the same raw. Its edge is still the grid's
+/// (`Trailing::fitted_at`): the turn moves when the model is fitted, never what it is fitted at.
+/// Before (2026-10-26), every area was refit at the step its edge moved on, and that step carried
+/// every refit: at 500 seats a quarter of its second.
+pub fn refit_turn(area: Region) -> u64 {
+    // SplitMix64's finaliser over the cell index: H3 cells of one resolution differ in a few
+    // bits, so the index's own low bits would put neighbours on one turn.
+    let mut z = area.as_u64().wrapping_add(0x9e37_79b9_7f4a_7c15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    (z ^ (z >> 31)) % REFIT_TURNS
+}
+
+/// How far from its area a cell of the band may be, kilometres: the pair baseline, by ECEF chord
+/// between millimetre sites, as the great-circle distance on H3's sphere that the band is walked
+/// by, with a margin of a hundredth for both (the chord is shorter than its arc, by under a twentieth
+/// of a percent at 600 km, and the sphere's radius is within a third of a percent of
+/// the ellipsoid's at any latitude).
+pub fn reach_km() -> f64 {
+    PAIR_BASELINE_MM as f64 / 1e6 * 1.01
 }
 
 /// The farthest a cell's boundary is from its centre, kilometres.
@@ -284,9 +323,7 @@ mod tests {
     fn near(area: CellIndex, cell: CellIndex) -> bool {
         near_to(LatLng::from(area), circumradius_km(area), cell)
     }
-    use crate::window::{covers, owns};
     use tally_mlat_solver::geo;
-    use tally_mlat_solver::tile::Tile;
     use tally_wire::Location;
 
     fn at(lat: f64, lon: f64) -> Location {
@@ -302,9 +339,27 @@ mod tests {
         Region::containing(&at(lat, lon), AREA_RESOLUTION).map_err(|error| error.to_string())
     }
 
-    /// The tiles of every level whose cube holds a point of the area (its centre and its
-    /// boundary's vertices, a little inside).
-    fn tiles_of(area: Region) -> Result<Vec<Tile>, String> {
+    /// An engine's areas are refit half at each step of the grid (`refit_turn`): over the 91 areas
+    /// within five of one, each turn takes at least a third, whatever their H3 indices share.
+    #[test]
+    fn neighbouring_areas_are_refit_on_both_turns() -> Result<(), String> {
+        let centre = CellIndex::try_from(area(51.5, -0.1)?.as_u64()).map_err(|e| e.to_string())?;
+        let mut turns = [0usize; REFIT_TURNS as usize];
+        let disk: Vec<CellIndex> = centre.grid_disk_safe(5).collect();
+        for cell in &disk {
+            let region = Region::from_u64(u64::from(*cell)).map_err(|e| e.to_string())?;
+            turns[usize::try_from(refit_turn(region)).map_err(|e| e.to_string())?] += 1;
+        }
+        assert_eq!(disk.len(), 91);
+        assert!(
+            turns.iter().all(|count| *count * 3 >= disk.len()),
+            "{turns:?}"
+        );
+        Ok(())
+    }
+
+    /// Points of the area: its centre and its boundary's vertices, a little inside.
+    fn points_of(area: Region) -> Result<Vec<LatLng>, String> {
         let cell = CellIndex::try_from(area.as_u64()).map_err(|error| error.to_string())?;
         let centre = LatLng::from(cell);
         let mut points = vec![centre];
@@ -313,25 +368,34 @@ mod tests {
             let lng = centre.lng() + (vertex.lng() - centre.lng()) * 0.95;
             points.push(LatLng::new(lat, lng).map_err(|error| error.to_string())?);
         }
-        let mut tiles = Vec::new();
-        for point in points {
-            let ecef = geo::to_ecef(geo::Geodetic {
-                lat_deg: point.lat(),
-                lon_deg: point.lng(),
-                height_m: 0.0,
-            });
-            let mm = ecef.map(|axis| (axis * 1000.0) as i64);
-            for level in 0..LEVELS {
-                tiles.push(Tile::containing(level, mm));
-            }
-        }
-        Ok(tiles)
+        Ok(points)
     }
 
-    /// Every tile an area owns, at every level, has its whole footprint inside the area's band: an
-    /// MLAT relay holding the band can publish every tile it is chosen to fit.
+    /// The point `km` along the sphere from `from` on `bearing` (radians from north).
+    fn towards(from: LatLng, bearing: f64, km: f64) -> Result<LatLng, String> {
+        let angle = km / 6_371.008_8;
+        let (lat, lng) = (from.lat_radians(), from.lng_radians());
+        let to_lat = (lat.sin() * angle.cos() + lat.cos() * angle.sin() * bearing.cos()).asin();
+        let to_lng = lng
+            + (bearing.sin() * angle.sin() * lat.cos())
+                .atan2(angle.cos() - lat.sin() * to_lat.sin());
+        LatLng::from_radians(to_lat, to_lng).map_err(|error| error.to_string())
+    }
+
+    fn ecef(point: LatLng) -> [f64; 3] {
+        geo::to_ecef(geo::Geodetic {
+            lat_deg: point.lat(),
+            lon_deg: point.lng(),
+            height_m: 0.0,
+        })
+    }
+
+    /// Every place a receiver of an area may keep as a pair's other end (within the pair baseline
+    /// of it, by ECEF chord, as `pair::Network` measures) is inside the area's band: an MLAT relay
+    /// holding the band holds every member of every model it fits.
     #[test]
-    fn the_band_covers_the_footprint_of_every_tile_its_area_owns() -> Result<(), String> {
+    fn the_band_holds_every_place_within_the_pair_baseline_of_its_area() -> Result<(), String> {
+        let baseline_m = PAIR_BASELINE_MM as f64 / 1000.0;
         for (lat, lon) in [
             (52.1, 5.1),
             (40.4, -3.7),
@@ -341,23 +405,69 @@ mod tests {
         ] {
             let area = area(lat, lon)?;
             let band = border_band(&regions([area]));
-            for tile in tiles_of(area)? {
-                if owns(&regions([area]), tile) {
-                    assert!(covers(&band, tile), "{tile:?} at ({lat}, {lon})");
+            let mut checked = 0;
+            for point in points_of(area)? {
+                for step in 0..24 {
+                    let bearing = f64::from(step) * std::f64::consts::TAU / 24.0;
+                    for km in [100.0, 400.0, 590.0, 600.0, 605.0] {
+                        let place = towards(point, bearing, km)?;
+                        let apart = tally_mlat_solver::linalg::norm(
+                            tally_mlat_solver::linalg::sub(ecef(place), ecef(point)),
+                        );
+                        if apart > baseline_m {
+                            continue;
+                        }
+                        let location = at(place.lat(), place.lng());
+                        assert!(
+                            band.iter().any(|cell| cell.covers(&location)),
+                            "{place:?}, {km} km from ({lat}, {lon})"
+                        );
+                        checked += 1;
+                    }
                 }
             }
+            assert!(checked > 500);
         }
         Ok(())
     }
 
+    /// The owner of a set of hearers is the area most of them are in, ties to the lowest.
     #[test]
-    fn the_band_holds_its_area_and_reaches_a_footprint_beyond_it_and_no_further()
+    fn a_transmission_is_owned_by_the_area_most_of_its_hearers_are_in() -> Result<(), String> {
+        let text = |error: tally_wire::WireError| error.to_string();
+        let key = |n: u8| tally_wire::Identity::from_seed([n; 32]).public();
+        let site = |n: u8, lat: f64, lon: f64| tally_mlat_solver::Site {
+            receiver: key(n),
+            id: tally_wire::SiteId([n; 32]),
+            location: at(lat, lon),
+            clock: tally_wire::Clock::Dump1090,
+        };
+        let sites = [
+            site(1, 52.1, 5.1),
+            site(2, 52.11, 5.12),
+            site(3, 48.8, 2.3),
+            site(4, 48.81, 2.31),
+            site(5, 40.4, -3.7),
+        ];
+        let indexed = Sites::new(&sites);
+        let keys = |of: &[u8]| -> Vec<PublicKey> { of.iter().map(|n| key(*n)).collect() };
+        let amsterdam = Region::containing(&at(52.1, 5.1), AREA_RESOLUTION).map_err(text)?;
+        let paris = Region::containing(&at(48.8, 2.3), AREA_RESOLUTION).map_err(text)?;
+        assert_eq!(owner(&indexed, keys(&[1, 2, 3])), Some(amsterdam));
+        assert_eq!(owner(&indexed, keys(&[3, 4, 5, 1])), Some(paris));
+        assert_eq!(owner(&indexed, keys(&[1, 3])), Some(amsterdam.min(paris)));
+        assert_eq!(owner(&indexed, keys(&[9])), None);
+        Ok(())
+    }
+
+    #[test]
+    fn the_band_holds_its_area_and_reaches_the_baseline_beyond_it_and_no_further()
     -> Result<(), String> {
         let area = area(52.1, 5.1)?;
         let band = border_band(&regions([area]));
         let inside = |location: &Location| band.iter().any(|cell| cell.covers(location));
         assert!(inside(&at(52.1, 5.1)));
-        // 560 km east is within the top tile's reach; 1,000 km is not.
+        // 560 km east is within the pair baseline; 1,000 km is not.
         assert!(inside(&at(
             52.1,
             5.1 + 560.0 / (111.32 * 52.1_f64.to_radians().cos())

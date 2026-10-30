@@ -4,6 +4,7 @@
 //! three endpoints from them over loopback HTTP, with CORS, caching and the rate limit on each, and
 //! pushes a viewport's aircraft as a stream; it answers a client its own stations, the ADS-B
 //! Exchange-compatible `/v2` from readsb, and routes from a standing-data directory.
+#![allow(clippy::disallowed_methods, reason = "a test's scripted readings")]
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -21,7 +22,7 @@ use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 use tally_api::Settings;
 use tally_api_types::{
-    Aircraft, AircraftResponse, AircraftUpdate, Feed, FeederStats, MeResponse, MlatCheck, Network,
+    Aircraft, AircraftResponse, AircraftUpdate, FeederStats, MeResponse, MlatCheck, Network,
     PositionSource, SourceCounts, Station, fixtures,
 };
 use tally_merge::Merge;
@@ -29,7 +30,7 @@ use tally_mlat::intake::SiteRecord;
 use tally_mlat_solver::sim::{self, Scenario, Simulation};
 use tally_relay::hub::Hub;
 use tally_relay::mlat_host::stepping::{self, Hosting};
-use tally_relay::mlat_host::{HostedMlat, MlatHost, MlatReport, SETTLE_MS, WindowClock};
+use tally_relay::mlat_host::{HostedMlat, MlatHost, MlatReport, StepClock};
 use tally_relay::stations::StationReport;
 use tally_wire::batch::PublicInfoContent;
 use tally_wire::noise;
@@ -41,6 +42,12 @@ use tokio::net::{TcpListener, TcpStream};
 
 type Result<T = ()> = std::result::Result<T, String>;
 
+/// The same key again, from its file form, for a test that hands a key over and still signs or
+/// dials as it: `Identity` is not `Clone`.
+fn twin(identity: &Identity) -> Result<Identity> {
+    Identity::from_base64(&identity.to_base64()).map_err(|error| error.to_string())
+}
+
 /// How long a test waits for the event it asserts before calling it a hang: a guard on a server
 /// that never gets there, never a verdict on how fast the machine running the test is.
 const WAIT: Duration = Duration::from_secs(120);
@@ -48,10 +55,12 @@ const WAIT: Duration = Duration::from_secs(120);
 /// allows no origin of its own accord.
 const SITE: &str = "https://site.example";
 
-/// The API's settings over `relay_stats` and `readsb`, the test's site allowed.
+/// The API's settings over `relay_stats` and `readsb`, the test's site allowed, on the host's
+/// clocks with their bound stated (no test host runs ClockBound).
 fn settings(relay_stats: impl Into<String>, readsb: impl Into<String>) -> Settings {
     let mut settings = Settings::new(relay_stats, readsb);
     settings.allow_origins = vec![SITE.to_owned()];
+    settings.clock = tally_api::mlat::Clock::host_stated();
     settings
 }
 
@@ -144,7 +153,9 @@ async fn start_relay(
     let identity = Identity::generate().map_err(text)?;
     let key = identity.public();
     let hub = Arc::new(
-        Hub::clocked(8, clock.clock(), tally_relay::sharing::Deadlines::RELAY).figures_every(200),
+        Hub::clocked(8, clock.clock(), tally_relay::sharing::Deadlines::RELAY)
+            .accepting_relays([tally_mlat_solver::sim::anchoring_relay().public()])
+            .figures_every(200),
     );
     let listener = TcpListener::bind("127.0.0.1:0").await.map_err(text)?;
     let address = listener.local_addr().map_err(text)?;
@@ -173,7 +184,7 @@ fn batch(receiver: &Identity, sequence: u64, wall_ms: u64) -> Result<Batch> {
             data: vec![0x5d, 0xab, 0xcd, n, sequence as u8, 0, 0],
         })
         .collect();
-    Batch::sign(
+    anchored_batch(
         receiver,
         &BatchContent {
             boot_id: 7,
@@ -562,19 +573,6 @@ async fn the_api_serves_aircraft_the_network_and_a_station_from_readsb_and_a_rea
         assert!(queries.contains(&part.to_owned()), "{queries:?}");
     }
 
-    // The precise feed with no precise product held: unavailable, never an empty sky, and not
-    // cached.
-    let (status, headers, body) = get(&format!(
-        "{api}/v1/aircraft?west=-123&south=37&east=-121&north=38&feed=precise"
-    ))
-    .await?;
-    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(header(&headers, &CACHE_CONTROL), "no-store");
-    assert_eq!(
-        json::<serde_json::Value>(&body)?,
-        serde_json::json!({ "error": "precise_unavailable" })
-    );
-
     // Too large a viewport, and one not given.
     for query in ["west=-130&south=0&east=-60&north=10", "west=-123&south=37"] {
         let (status, headers, _) = get(&format!("{api}/v1/aircraft?{query}")).await?;
@@ -918,16 +916,10 @@ async fn a_stream_pushes_every_aircraft_then_what_changed_and_holds_an_address_t
     let url = format!("{api}/v1/aircraft/stream?west=-123&south=37&east=-121&north=38");
 
     // Refused as `/v1/aircraft` refuses, and never cached.
-    for (query, refused) in [
-        (
-            "west=-130&south=0&east=-60&north=10",
-            StatusCode::BAD_REQUEST,
-        ),
-        (
-            "west=-123&south=37&east=-121&north=38&feed=precise",
-            StatusCode::SERVICE_UNAVAILABLE,
-        ),
-    ] {
+    for (query, refused) in [(
+        "west=-130&south=0&east=-60&north=10",
+        StatusCode::BAD_REQUEST,
+    )] {
         let (status, headers, _) = get(&format!("{api}/v1/aircraft/stream?{query}")).await?;
         assert_eq!(status, refused, "{query}");
         assert_eq!(header(&headers, &CACHE_CONTROL), "no-store");
@@ -941,8 +933,8 @@ async fn a_stream_pushes_every_aircraft_then_what_changed_and_holds_an_address_t
     assert_eq!(header(&headers, &ACCESS_CONTROL_ALLOW_ORIGIN), SITE);
     let first = events.update().await?;
     assert_eq!(
-        (first.full, first.feed, first.now_ms, first.gone.len()),
-        (true, Feed::Live, 1_791_220_000_250, 0)
+        (first.full, first.now_ms, first.gone.len()),
+        (true, 1_791_220_000_250, 0)
     );
     assert_eq!(first.aircraft, expected());
     assert!(first.sent_at_ms > 0);
@@ -1012,19 +1004,25 @@ async fn a_stream_pushes_every_aircraft_then_what_changed_and_holds_an_address_t
     Ok(())
 }
 
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a test's stand-in feeder signs by its own host clock"
+)]
 fn wall_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_millis() as u64)
 }
 
-/// How long before now the scenario starts: its window bins are past by the time the relays'
-/// clock, walking it from its start (`stepping`), reaches the wall clock (a 30 s scenario, a window
-/// after it and its settling).
-const SCENARIO_AGO_MS: u64 = 150_000;
+/// How long the scenario runs.
+const SCENARIO_S: f64 = 30.0;
+/// How long before now the scenario starts: every fix of it has surely arrived
+/// (`tally_wire::budget::FIX_ARRIVED`) by the time the relays' clock, walking it from its start
+/// (`stepping`), reaches the wall clock.
+const SCENARIO_AGO_MS: u64 = SCENARIO_S as u64 * 1_000 + tally_wire::budget::FIX_ARRIVED_MS;
 
-/// A scenario that began `SCENARIO_AGO_MS` ago, so every window bin of it is past by the time the
-/// relays' clock reaches the wall clock.
+/// A scenario that began `SCENARIO_AGO_MS` ago, so every fix of it has surely arrived by the time
+/// the relays' clock reaches the wall clock.
 fn minutes_ago(scenario: Scenario) -> Scenario {
     let start_ms = wall_ms() - SCENARIO_AGO_MS;
     Scenario {
@@ -1055,6 +1053,10 @@ impl MlatHost for Held {
         self.host.set_areas(self.areas.clone(), descriptions);
     }
 
+    fn raw(&self) -> Option<Arc<dyn tally_relay::standing::Raw>> {
+        self.host.raw()
+    }
+
     fn offer_description(&self, info: &SiteRecord, stamp_ms: u64) {
         self.host.offer_description(info, stamp_ms);
     }
@@ -1063,12 +1065,8 @@ impl MlatHost for Held {
         self.host.offer_batch(batch, now_ms);
     }
 
-    fn sealed_bins(&self) -> Option<tally_mlat_solver::held::SealedBins> {
-        self.host.sealed_bins()
-    }
-
-    fn take_published(&self, now_ms: u64) -> Vec<Record> {
-        self.host.take_published(now_ms)
+    fn take_published(&self, watermark: tally_relay::products::Watermark) -> Vec<Record> {
+        self.host.take_published(watermark)
     }
 
     fn cores(&self) -> u16 {
@@ -1077,6 +1075,10 @@ impl MlatHost for Held {
 
     fn report(&self) -> MlatReport {
         self.host.report()
+    }
+
+    fn take_own_models(&self) -> Vec<tally_relay::mlat_host::OwnModel> {
+        self.host.take_own_models()
     }
 }
 
@@ -1104,6 +1106,10 @@ fn areas() -> Result<Vec<Region>> {
 
 /// A relay hosting MLAT for the simulator's areas, on `clock`: its address as a client names it,
 /// its hub and its hosted MLAT.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "the hosted MLAT's signer, on a clock that always judges"
+)]
 async fn mlat_relay(clock: &Arc<stepping::Clock>) -> Result<(RelayAddress, Arc<Hub>, Arc<Held>)> {
     let identity = Identity::generate().map_err(text)?;
     let key = identity.public();
@@ -1112,25 +1118,26 @@ async fn mlat_relay(clock: &Arc<stepping::Clock>) -> Result<(RelayAddress, Arc<H
     // Every feeder here comes from loopback: more than one host's share of connections.
     let hub = Arc::new(
         Hub::clocked(8, clock.clock(), tally_relay::sharing::Deadlines::RELAY)
-            .max_connections_per_address(64),
+            .accepting_relays([tally_mlat_solver::sim::anchoring_relay().public()])
+            .max_connections_per_address(64)
+            // Its raw planned, as `tally-relay` plans a relay hosting MLAT.
+            .memory(tally_relay::hub::DEFAULT_MEMORY, true),
     );
     let areas = tally_wire::Regions::new(areas()?);
     let host = HostedMlat::new(
-        identity.clone(),
+        tally_wire::Signer::new(twin(&identity)?, std::sync::Arc::new(|| true)),
         1,
         tally_mlat::engine::Settings {
             regions: tally_wire::Regions::default(),
-            settle_ms: SETTLE_MS,
             threads: 4,
             capacity: tally_mlat::engine::Capacity::default(),
         },
         // Its clock walks no faster than it keeps up (`stepping`): it is never overloaded.
-        WindowClock::KEEPING_UP,
+        StepClock::KEEPING_UP,
     )?;
     host.set_areas(areas.clone(), Vec::new());
     let held = Arc::new(Held { host, areas });
-    hub.network()
-        .host_mlat(Arc::clone(&held) as Arc<dyn MlatHost>);
+    hub.host_mlat(Arc::clone(&held) as Arc<dyn MlatHost>)?;
     tokio::spawn(tally_relay::serve(
         listener,
         vec![identity],
@@ -1211,7 +1218,7 @@ async fn feed_simulation(
 #[tokio::test(flavor = "multi_thread")]
 async fn the_api_serves_one_merged_mlat_position_per_aircraft_from_two_relays() -> Result {
     let simulation = sim::run(&minutes_ago(Scenario {
-        duration_s: 30.0,
+        duration_s: SCENARIO_S,
         modes_aircraft: 16,
         ..Scenario::new(31)
     }));
@@ -1240,7 +1247,7 @@ async fn the_api_serves_one_merged_mlat_position_per_aircraft_from_two_relays() 
     for relay in [&west, &east] {
         tokio::spawn(tally_merge::link::subscribe(
             relay.clone(),
-            Identity::generate().map_err(text)?,
+            tally_wire::NoiseKey::of(Identity::generate().map_err(text)?),
             tally_merge::link::streams(),
             inbound.clone(),
         ));
@@ -1269,7 +1276,7 @@ async fn the_api_serves_one_merged_mlat_position_per_aircraft_from_two_relays() 
     let outcome = tokio::time::timeout(Duration::from_secs(180) + WAIT, async {
         loop {
             while let Ok(record) = records.try_recv() {
-                merge.ingest(&record, 0).map_err(text)?;
+                merge.ingest(&record).map_err(text)?;
             }
             let expected: Vec<(String, f64, f64, Option<i32>)> = tally_api::mlat::served(&merge)
                 .into_iter()
@@ -1335,4 +1342,26 @@ async fn the_api_serves_one_merged_mlat_position_per_aircraft_from_two_relays() 
         assert_eq!(mlat.check, MlatCheck::Signature);
     }
     Ok(())
+}
+
+/// `content` signed by `identity` as a feeder of this build signs it (RFC-0171 §3.6): anchored by
+/// the relay its session is to as that relay's clock read its signed time, here the simulation's
+/// anchoring relay (`tally_mlat_solver::sim::anchoring_relay`), which every relay these tests
+/// start accepts.
+fn anchored_batch(
+    identity: &Identity,
+    content: &BatchContent,
+) -> std::result::Result<Batch, tally_wire::WireError> {
+    anchored_batch_with(identity, content, tally_wire::Codec::Plain)
+}
+
+/// As `anchored_batch`, its receptions written by `codec`.
+fn anchored_batch_with(
+    identity: &Identity,
+    content: &BatchContent,
+    codec: tally_wire::Codec,
+) -> std::result::Result<Batch, tally_wire::WireError> {
+    let anchor =
+        tally_wire::Anchor::sign(&tally_mlat_solver::sim::anchoring_relay(), content.wall_ms);
+    Batch::sign_anchored(identity, content, codec, &[anchor])
 }

@@ -48,12 +48,20 @@ pub const FAILOVER_JITTER: Duration = Duration::from_secs(10);
 /// How many relays a feeder publishes to.
 pub const DESTINATIONS: usize = 2;
 
+// A batch carries one anchor from each relay it is published to, so each relay finds its own in
+// it, and judges its feeder's blame by it (RFC-0171 §3.6): no more sessions than anchor slots.
+const _: () = assert!(DESTINATIONS <= tally_wire::batch::MAX_ANCHORS);
+
 /// The feeder's two destinations.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Choice {
     pub first: Option<RelayAddress>,
     pub second: Option<RelayAddress>,
 }
+
+// A feeder's description names the relays it chose, which a relay holds only up to the wire's
+// bound: the two a choice holds are within it.
+const _: () = assert!(2 <= tally_wire::credit::MAX_DESCRIBED_RELAYS);
 
 impl Choice {
     /// The relays chosen, first first.

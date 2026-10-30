@@ -1,5 +1,7 @@
 //! `tally-acars-collect`: the map image's ACARS collector (packaging/map/entrypoint.sh).
 
+#![deny(unsafe_code)]
+
 use std::path::Path;
 
 use tally_acars_collect::{Collector, DEFAULT_DAY_MAX, check_address, run, sort_day};

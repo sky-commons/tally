@@ -1,7 +1,6 @@
 //! The two products (RFC-0174 §2.11).
 //!
-//! - **World:** one fix per aircraft per second, everywhere: the merged final and provisional
-//!   fixes of every area, thinned to one an aircraft a second by a rule anyone can rerun
+//! - **World:** one fix per aircraft per second, everywhere: the merged fixes of every area, thinned to one an aircraft a second by a rule anyone can rerun
 //!   ([`world_choice`]), each citing its input set hash and the origin `Positions` record it came
 //!   from, so a reader checks a world record exactly as it would its areas'. Signed by the relay
 //!   that gathered it (`WorldPositions`).
@@ -17,7 +16,7 @@ use blake2::{Blake2s256, Digest};
 use crate::WireError;
 use crate::batch::{Hash, Observation, check_coordinates};
 use crate::decoded::ObsView;
-use crate::key::{Identity, KEY_LEN, PublicKey};
+use crate::key::{KEY_LEN, PublicKey, Signs};
 #[cfg(test)]
 use crate::observation_set::ObservationSet;
 use crate::positions::{EnuCovariance, TransmitTime};
@@ -32,25 +31,6 @@ pub const MAX_REGIONAL_OBSERVATIONS: usize = 2_000;
 /// The altitude field when a fix states none.
 const NO_ALTITUDE: i32 = i32::MIN;
 
-/// How long after a transmission its final MLAT fix has surely arrived, wherever it is read: the
-/// one bound every party waits on before treating a final fix as never coming (the merge rule's
-/// retraction of an unconfirmed provisional fix, the precise world product's seal, a receiver's
-/// standing settling a transmission).
-///
-/// Derived from how the reference engine publishes (RFC-0171 §3.8.1, RFC-0174 §2.3): a window of
-/// eight 5 s bins (the stride, 40 s) is solved once it has ended, one bin after its last (5 s)
-/// and 2 s of settling later, and at world scale its fits take some 35 s, so the latest final fix
-/// leaves its engine about 40 + 5 + 2 + 35 = 82 s after the transmission. A relay hop or two and
-/// the skew between the engine's clock and a reader's are seconds, so 90 s covers them. Each
-/// party measures from what it sees (a transmit time, or when a fix arrived, which is later), so
-/// waiting this long from either is enough.
-pub const FINAL_FIX_ARRIVED_MS: u64 = FINAL_FIX_LATEST_MS + FINAL_FIX_MARGIN_MS;
-/// The latest a final fix leaves its engine after its transmission: the stride (8 bins of 5 s),
-/// the bin after the window, the settling time and a world-scale step of fits.
-const FINAL_FIX_LATEST_MS: u64 = 8 * 5_000 + 5_000 + 2_000 + 35_000;
-/// Relay hops and the skew between an engine's clock and a reader's.
-const FINAL_FIX_MARGIN_MS: u64 = 8_000;
-
 /// One aircraft's fix for one second of the world product.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct WorldFix {
@@ -63,18 +43,20 @@ pub struct WorldFix {
     /// aircraft's level by (a fix's height above the ellipsoid is not a flight level).
     pub pressure_altitude_ft: Option<i32>,
     pub covariance: EnuCovariance,
-    /// A provisional fix (superseded later by a final one).
-    pub provisional: bool,
-    /// Solved by multilateration (its origin is a `Positions` or `Provisional` record), not
-    /// decoded from the aircraft's own broadcast.
+    /// Solved by multilateration (its origin is a `Positions` record), not decoded from the
+    /// aircraft's own broadcast.
     pub mlat: bool,
     /// The merge rule's full input set hash of the fix (RFC-0171 §3.8.1).
     pub input_set: Hash,
-    /// Who signed the origin record: the engine of a `Positions` or `Provisional` record, the
-    /// origin relay of a `RegionalBatch`. [`world_rank`] breaks a tie by it.
+    /// The receptions it was decided from: an MLAT fix's considered set, an ADS-B position's two
+    /// messages. Of two fixes of one transmission, the one that considered more ([`world_rank`]):
+    /// a subset published fast never displaces the bigger set, as in the merge rule.
+    pub considered: u16,
+    /// Who signed the origin record: the engine of a `Positions` record, the origin relay of a
+    /// `RegionalBatch`. [`world_rank`] breaks a tie by it.
     pub source: PublicKey,
-    /// The origin record's hash (`Positions`, `Provisional` or `RegionalBatch`), and the fix's
-    /// index in it (a solution's, or an observation's).
+    /// The origin record's hash (`Positions` or `RegionalBatch`), and the fix's index in it (a
+    /// fix's, or an observation's).
     pub origin: Hash,
     pub origin_index: u16,
 }
@@ -153,7 +135,7 @@ impl Check for WorldPositionsContent {
 /// Each fix's transmit time as milliseconds into the record's second (0 to 999) and the
 /// picoseconds past them; each fix's origin as an index into the record's table of origins (each
 /// a record hash and the key that signed it, ascending by hash, each once), which most fixes of a
-/// second share: about 85 bytes a fix, against 151 with each time and origin whole.
+/// second share: about 89 bytes a fix, against 153 with each time and origin whole.
 impl Fields for WorldPositionsContent {
     fn write(world: Checked<'_, Self>, out: &mut Vec<u8>) -> Result<(), WireError> {
         let origins: BTreeMap<Hash, PublicKey> = world
@@ -194,8 +176,10 @@ impl Fields for WorldPositionsContent {
             for term in fix.covariance.terms() {
                 out.extend_from_slice(&term.to_bits().to_be_bytes());
             }
-            // One byte of flags: bit 0 provisional, bit 1 MLAT.
-            out.push(u8::from(fix.provisional) | u8::from(fix.mlat) << 1);
+            // One byte of flags: bit 1 MLAT. Bit 0 (once "provisional", retired at wire version 4)
+            // is written zero and ignored on read.
+            out.push(u8::from(fix.mlat) << 1);
+            out.extend_from_slice(&fix.considered.to_be_bytes());
             out.extend_from_slice(&fix.input_set);
             out.extend_from_slice(&(slot as u16).to_be_bytes());
             out.extend_from_slice(&fix.origin_index.to_be_bytes());
@@ -247,6 +231,7 @@ impl Fields for WorldPositionsContent {
                 }
                 let flags = reader.u8()?;
                 let [xx, xy, xz, yy, yz, zz] = terms;
+                let considered = reader.u16()?;
                 let input_set = reader.array()?;
                 let (origin, source) =
                     *origins
@@ -270,9 +255,9 @@ impl Fields for WorldPositionsContent {
                         yz,
                         zz,
                     },
-                    provisional: flags & 1 != 0,
                     mlat: flags & 2 != 0,
                     input_set,
+                    considered,
                     source,
                     origin,
                     origin_index: reader.u16()?,
@@ -289,21 +274,10 @@ impl Fields for WorldPositionsContent {
 
 signed_record!(
     /// The gathering relay's signed `WorldPositionsContent`: the live world product, each second
-    /// sealed a few seconds after it ends, an MLAT aircraft by its provisional fix.
+    /// sealed a few seconds after it ends, an MLAT aircraft by its fix.
     WorldPositions,
     WorldPositionsContent,
     b"tally world positions",
-    1,
-    MAX_BODY
-);
-
-signed_record!(
-    /// The precise world product: the same content and the same choice rule over final MLAT fixes
-    /// only (ADS-B as in the live product), each second sealed once its finals can have come. Its
-    /// own domain, so a precise record never verifies as a live one or back.
-    WorldPrecise,
-    WorldPositionsContent,
-    b"tally world precise positions",
     1,
     MAX_BODY
 );
@@ -312,7 +286,7 @@ signed_record!(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WorldCandidate {
     pub transmitted: TransmitTime,
-    pub provisional: bool,
+    pub considered: u16,
     pub input_set: Hash,
     /// Who signed the origin record.
     pub source: PublicKey,
@@ -326,13 +300,14 @@ pub struct WorldCandidate {
 /// §2.11: the newest fix of each aircraft each second). The index chosen, or `None` for no
 /// candidates.
 ///
-/// The rule is the merge rule's serving order (RFC-0171 §3.8.1, *Provisional fixes*: the latest
-/// final fix is served unless a provisional one is later by transmit time) applied inside one
-/// second, and its tie rule:
+/// The rule is the merge rule's serving order (RFC-0171 §3.8.1: the latest fix by transmit time)
+/// applied inside one second, its preference for the bigger set of one transmission, and its tie
+/// rule; there is one class of fix, so nothing ranks by kind:
 ///
 /// 1. the latest transmit time;
-/// 2. at the same transmit time, a final fix (an MLAT final or a decoded ADS-B position) over a
-///    provisional one;
+/// 2. then the most receptions considered: of one transmission's fixes, a subset an engine
+///    published fast never displaces the bigger set (the merge rule's superset preference, which a
+///    gatherer holding no raw applies by count: it verifies neither);
 /// 3. then the lowest input set hash;
 /// 4. then the lowest source key, by its bytes (two relays that solved the same set each sign
 ///    their own record);
@@ -360,12 +335,12 @@ pub fn world_choice(candidates: &[WorldCandidate]) -> Result<Option<usize>, Wire
 }
 
 /// How `a` stands to `b` under [`world_choice`]'s rule: `Greater` when `a` is chosen over `b`.
-/// A total order on (transmit time, final before provisional, input set hash, source key, origin
+/// A total order on (transmit time, receptions considered, input set hash, source key, origin
 /// hash, origin index): `Equal` only for one fix named twice.
 pub fn world_rank(a: &WorldCandidate, b: &WorldCandidate) -> Ordering {
     a.transmitted
         .cmp(&b.transmitted)
-        .then_with(|| (!a.provisional).cmp(&!b.provisional))
+        .then_with(|| a.considered.cmp(&b.considered))
         .then_with(|| b.input_set.cmp(&a.input_set))
         .then_with(|| b.source.as_bytes().cmp(a.source.as_bytes()))
         .then_with(|| b.origin.cmp(&a.origin))
@@ -377,7 +352,7 @@ impl WorldFix {
     pub fn candidate(&self) -> WorldCandidate {
         WorldCandidate {
             transmitted: self.transmitted,
-            provisional: self.provisional,
+            considered: self.considered,
             input_set: self.input_set,
             source: self.source,
             origin: self.origin,
@@ -396,9 +371,9 @@ const INPUT_SET_DOMAIN: &[u8] = b"tally merge input set";
 /// What an ADS-B world fix's input set hash is computed under.
 const ADSB_INPUT_SET_DOMAIN: &[u8] = b"tally world adsb input set";
 
-/// The full input set's identity of an MLAT solution (RFC-0171 §3.8.1): BLAKE2s-256 over
-/// `"tally merge input set" 0x00`, the observation set's hash and the cited model's inputs hash.
-/// The one definition, for the merge rule and the world product alike. Of a tagged solution, over
+/// The full input set's identity of an MLAT fix (RFC-0171 §3.8.1): BLAKE2s-256 over
+/// `"tally merge input set" 0x00`, the hash of the set it used and the cited model's inputs hash.
+/// The one definition, for the merge rule and the world product alike. Of a tagged fix, over
 /// its `TaggedSet`'s hash, and so what the world product states. A client cannot recompute it from
 /// anything it can check: a tag hides which receiver and reception it stands for, and the model's
 /// inputs hash is over site ids a client is never sent. To a client the stated input set is the
@@ -496,8 +471,14 @@ impl RegionalDraft<'_> {
 }
 
 impl RegionalBatch {
+    /// Its signed `wall_ms` (`RegionalBatchContent::wall_ms`), read without its receptions: what a
+    /// relay's time window judges it by. After the cell, the boot id and the sequence.
+    pub fn wall_ms(&self) -> Result<u64, WireError> {
+        crate::batch::u64_from(self.as_bytes(), 1 + crate::key::KEY_LEN + 24)
+    }
+
     /// As `sign`, from receptions borrowed: the bytes `sign` makes of their owned copies.
-    pub fn sign_draft(identity: &Identity, draft: &RegionalDraft<'_>) -> Result<Self, WireError> {
+    pub fn sign_draft(identity: &impl Signs, draft: &RegionalDraft<'_>) -> Result<Self, WireError> {
         let body = draft.body()?;
         crate::signed::Signed::sign(Self::DOMAIN, Self::FORMAT, identity, &body, Self::MAX_LEN)
             .map(Self)
@@ -706,9 +687,14 @@ signed_record!(
 );
 
 impl ClientRegionalBatch {
+    /// Its signed `wall_ms`, as `RegionalBatch::wall_ms`.
+    pub fn wall_ms(&self) -> Result<u64, WireError> {
+        crate::batch::u64_from(self.as_bytes(), 1 + crate::key::KEY_LEN + 24)
+    }
+
     /// As `sign`, from a draft's borrowed receptions, their counters dropped: the bytes `sign`
     /// makes of `RegionalBatchContent::for_clients` of their owned copies, with no copy made.
-    pub fn sign_draft(identity: &Identity, draft: &RegionalDraft<'_>) -> Result<Self, WireError> {
+    pub fn sign_draft(identity: &impl Signs, draft: &RegionalDraft<'_>) -> Result<Self, WireError> {
         if draft.cell.resolution() > crate::site::PUBLIC_CELL_RESOLUTION {
             return Err(WireError::Invalid {
                 field: "client regional cell resolution",
@@ -736,6 +722,7 @@ impl ClientRegionalBatch {
 mod tests {
     use super::*;
     use crate::directory::tests::cell;
+    use crate::key::Identity;
 
     /// A regional batch signed from borrowed receptions is the one signed from their owned
     /// copies, byte for byte, and fits exactly when it does.
@@ -915,9 +902,9 @@ mod tests {
                 yz: 0.0,
                 zz: 900.0,
             },
-            provisional: true,
             mlat: true,
             input_set: [3; 32],
+            considered: 6,
             source: relay.public(),
             origin: [4; 32],
             origin_index: 2,
@@ -966,13 +953,13 @@ mod tests {
         Ok(())
     }
 
-    fn candidate(ms: u64, ps: u32, provisional: bool, hash: u8) -> WorldCandidate {
+    fn candidate(ms: u64, ps: u32, hash: u8) -> WorldCandidate {
         WorldCandidate {
             transmitted: TransmitTime {
                 unix_ms: ms,
                 sub_ms_ps: ps,
             },
-            provisional,
+            considered: 4,
             input_set: [hash; 32],
             source: Identity::from_seed([7; 32]).public(),
             origin: [hash; 32],
@@ -999,18 +986,17 @@ mod tests {
     }
 
     #[test]
-    fn world_choice_is_the_newest_then_final_then_lowest_hash_in_any_order() -> Result<(), WireError>
-    {
+    fn world_choice_is_the_newest_then_biggest_then_lowest_hash_in_any_order()
+    -> Result<(), WireError> {
         let candidates = [
-            candidate(1_000, 0, false, 9),
-            // Newest, but two of them: the final one at the same time wins.
-            candidate(1_900, 7, true, 1),
-            candidate(1_900, 7, false, 8),
-            // As new and final too, with a lower input set: the tie is broken by the hash.
-            candidate(1_900, 7, false, 5),
-            candidate(1_899, 999_999_999, false, 0),
+            candidate(1_000, 0, 9),
+            // Newest, but three of them: the tie is broken by the lowest input set hash.
+            candidate(1_900, 7, 8),
+            candidate(1_900, 7, 1),
+            candidate(1_900, 7, 5),
+            candidate(1_899, 999_999_999, 0),
         ];
-        let expected = candidates[3];
+        let expected = candidates[2];
         for order in permutations(&candidates) {
             let chosen = world_choice(&order)?.map(|index| order[index]);
             assert_eq!(chosen, Some(expected));
@@ -1025,17 +1011,35 @@ mod tests {
             assert_eq!(folded, Some(expected));
         }
         assert_eq!(world_choice(&[])?, None);
-        // A provisional fix later by transmit time is served over an older final one.
-        let later = [candidate(1_000, 0, false, 0), candidate(1_000, 1, true, 9)];
+        // A fix later by transmit time is served over an older one, whatever its hash.
+        let later = [candidate(1_000, 0, 0), candidate(1_000, 1, 9)];
         assert_eq!(world_choice(&later)?, Some(1));
+        // Of one transmission, the fix that considered more is served over a subset published
+        // fast, whatever their hashes; then a later fix over both, whatever it considered.
+        let bigger = WorldCandidate {
+            considered: 6,
+            ..candidate(1_900, 7, 9)
+        };
+        let sets = [candidate(1_900, 7, 1), bigger];
+        for order in permutations(&sets) {
+            assert_eq!(
+                world_choice(&order)?.map(|index| order[index]),
+                Some(bigger)
+            );
+        }
+        let newer = WorldCandidate {
+            considered: 2,
+            ..candidate(1_901, 0, 9)
+        };
+        assert_eq!(world_choice(&[bigger, newer])?, Some(1));
         Ok(())
     }
 
     #[test]
     fn one_fix_from_two_origins_is_chosen_by_source_key_then_record_in_any_order()
     -> Result<(), WireError> {
-        // The same solution signed by two engines, and one of them twice: equal in time, kind
-        // and input set, apart only by who signed it, which record and where in it.
+        // The same fix signed by two engines, and one of them twice: equal in time and input
+        // set, apart only by who signed it, which record and where in it.
         let low = Identity::from_seed([1; 32]).public();
         let high = Identity::from_seed([2; 32]).public();
         let (low, high) = if low.as_bytes() < high.as_bytes() {
@@ -1047,7 +1051,7 @@ mod tests {
             source,
             origin: [origin; 32],
             origin_index,
-            ..candidate(5_000, 9, false, 4)
+            ..candidate(5_000, 9, 4)
         };
         let candidates = [
             same(high, 1, 0),
@@ -1101,9 +1105,9 @@ mod tests {
                 yz: 0.0,
                 zz: 1.0,
             },
-            provisional: false,
             mlat: false,
             input_set: [0; 32],
+            considered: 2,
             source,
             origin: [1; 32],
             origin_index: 0,
@@ -1155,7 +1159,7 @@ mod tests {
 
     #[test]
     fn world_choice_refuses_a_transmit_time_out_of_range() {
-        let bad = [candidate(1, PS_PER_MS_FOR_TEST, false, 0)];
+        let bad = [candidate(1, PS_PER_MS_FOR_TEST, 0)];
         assert!(world_choice(&bad).is_err());
     }
 

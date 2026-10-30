@@ -314,7 +314,10 @@ mod tests {
         assert!(!record.carries_site());
         let mut bytes = Vec::new();
         record.encode(&mut bytes)?;
-        assert_eq!(Record::decode(&bytes)?, (Some(record.clone()), bytes.len()));
+        assert_eq!(
+            Record::decode(&bytes, crate::record::MAX_VERSION)?,
+            (Some(record.clone()), bytes.len())
+        );
         let client = crate::ClientRecord::try_from(record).map_err(|_| WireError::Invalid {
             field: "a client form",
             value: 0,

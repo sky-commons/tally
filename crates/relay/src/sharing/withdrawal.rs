@@ -16,6 +16,7 @@
 
 use tally_wire::{PublicKey, Region, Streams};
 
+use super::member::Now;
 use super::stripes::score;
 
 /// The least time between two regions withdrawn.
@@ -31,36 +32,40 @@ pub struct Withdrawal {
     shed: Option<u64>,
     /// The regions withdrawn, in the order they were.
     withdrawn: Vec<Region>,
-    /// When a region was last withdrawn or taken back, and when a forwarder was last shed.
-    changed_ms: u64,
-    pressed_ms: u64,
+    /// When a region was last withdrawn or taken back, and when a forwarder was last shed, by `M`
+    /// (`Now::mono_ms`), if ever: both pace this relay's own steps, so a step of its judging clock
+    /// neither withdraws nor takes back a region early, nor holds one withdrawn past its pace.
+    changed_ms: Option<u64>,
+    pressed_ms: Option<u64>,
 }
 
 impl Withdrawal {
-    /// One look: `shed` is the egress's running count of forwarding peers shed, `regions` the
-    /// regions this relay takes now. Withdraws or takes back at most one region.
-    pub fn observe(&mut self, shed: u64, regions: &[Region], me: &PublicKey, now_ms: u64) {
+    /// One look at `now`: `shed` is the egress's running count of forwarding peers shed,
+    /// `regions` the regions this relay takes now. Withdraws or takes back at most one region.
+    pub fn observe(&mut self, shed: u64, regions: &[Region], me: &PublicKey, now: Now) {
+        let now_ms = now.mono_ms();
+        let since = |at: Option<u64>| at.map_or(u64::MAX, |at| now_ms.saturating_sub(at));
         self.withdrawn.retain(|region| regions.contains(region));
         let pressed = self.shed.is_some_and(|seen| shed > seen);
         self.shed = Some(shed);
         if pressed {
-            self.pressed_ms = now_ms;
-            if now_ms.saturating_sub(self.changed_ms) >= WITHDRAW_EVERY_MS
+            self.pressed_ms = Some(now_ms);
+            if since(self.changed_ms) >= WITHDRAW_EVERY_MS
                 && let Some(next) = order(regions, me)
                     .into_iter()
                     .find(|region| !self.withdrawn.contains(region))
             {
                 self.withdrawn.push(next);
-                self.changed_ms = now_ms;
+                self.changed_ms = Some(now_ms);
             }
             return;
         }
         if !self.withdrawn.is_empty()
-            && now_ms.saturating_sub(self.pressed_ms) >= RESTORE_AFTER_MS
-            && now_ms.saturating_sub(self.changed_ms) >= RESTORE_AFTER_MS
+            && since(self.pressed_ms) >= RESTORE_AFTER_MS
+            && since(self.changed_ms) >= RESTORE_AFTER_MS
         {
             self.withdrawn.pop();
-            self.changed_ms = now_ms;
+            self.changed_ms = Some(now_ms);
         }
     }
 

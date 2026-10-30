@@ -30,8 +30,8 @@ usage: tally-relay --key FILE [--key FILE]... --max-upload RATE [options]
                                    (but for the key files, which it does not read, and the
                                    sockets, which it does not open), then print the plan
                                    (memory; what it holds before any feeder, each part: base,
-                                   connection-buffers, connection-sockets, member-pool,
-                                   member-links, parity-assembly, and their sum,
+                                   connection-buffers, connection-sockets, connection-paces,
+                                   member-pool, member-links, parity-assembly, and their sum,
                                    before-feeders;
                                    connections, the floor and per-connection costs,
                                    connection-limit and R_max (max-receptions-per-sec) with what
@@ -79,6 +79,12 @@ usage: tally-relay --key FILE [--key FILE]... --max-upload RATE [options]
                          for tally-api. It is unauthenticated and names where each feeder
                          feeds from, so it takes a loopback address only (127.0.0.1:PORT or
                          [::1]:PORT) and the relay refuses any other
+  --state-dir DIR        where the relay keeps what a restart must know (its tables' leases
+                         of signed time, a stop's dump, their key), so a restarted relay
+                         forwards nothing it forwarded before (default $STATE_DIRECTORY, as
+                         systemd's StateDirectory= sets it; with neither, nothing is kept
+                         and every table starts at its fallback floor). Never restore it
+                         from a backup: an old lease is a floor too low
   --upstream HOST:PORT=KEY
                          a relay to link with for the directory (offers and queries, never
                          data: that travels the sharing groups); repeatable
@@ -121,9 +127,8 @@ usage: tally-relay --key FILE [--key FILE]... --max-upload RATE [options]
                          its turn past it, and the most one alone may, with a burst of the
                          larger of N and 192 KiB (default 1048576). Planned once, apart from
                          the feeders', as the feeders it is worth (N over 8 KiB/s) in every
-                         store, so a whole-world relay sharing its clock models and final and
-                         provisional positions (about 4.2 MB/s) raises it, with the memory to
-                         match. The member sessions are not chosen: they are as many as the
+                         store, so a whole-world relay sharing its clock models and MLAT
+                         positions (about 4.2 MB/s) raises it, with the memory to match. The member sessions are not chosen: they are as many as the
                          areas taken let other relays open (each area's cell, its ancestors and
                          the cells under it, 32 relays a cell, and with MLAT their raw links),
                          at most --max-connections, each carving its own ingest allowance; the
@@ -153,16 +158,16 @@ usage: tally-relay --key FILE [--key FILE]... --max-upload RATE [options]
                          shedding what it falls behind on rather than delaying raw; hosting it
                          costs each feeder memory and cores, so the same relay admits fewer
   --world                gather the live world product: one fix per aircraft per second from
-                         every area's positions this relay receives, each second sealed 4 s
-                         after it ends, MLAT aircraft by their provisional fixes (RFC-0174 §2.11).
+                         every area's positions this relay receives, each second sealed 32.5 s
+                         after it ends, once its MLAT fixes have surely come (RFC-0174 §2.11).
                          The world is every area: the --area cells must cover the globe (the 122
                          resolution 0 cells do), or the relay refuses to start rather than sign a
                          part of the world as the whole
-  --world-precise        gather the precise world product: the same rule over final MLAT fixes,
-                         each second sealed 90 s after it ends, once its finals can have come;
-                         the same --area rule as --world
   --no-relay-duties      take no feeders, run no MLAT and seed nothing: only share the areas
                          taken (RFC-0174 §2.1: the duties are on by default, sharing is required)
+  --clock-bound PATH     the ClockBound segment the judging clock is bounded by (default
+                         /var/run/clockbound/shm0, the daemon's own): a relay judges no time
+                         while this segment does not say its clock is synchronised within E
 ";
 
 #[derive(Clone, Debug)]
@@ -183,6 +188,9 @@ pub struct Config {
     /// Where the station reports are served (`--stats-listen`): a loopback address, always, since
     /// they name every feeder's address (`parse_loopback`).
     pub stats_listen: Option<SocketAddr>,
+    /// Where it keeps what a restart must know (`--state-dir`, `durable`): none named here, the
+    /// environment's (`Config::state_dir`).
+    pub state_dir: Option<String>,
     pub upstreams: Vec<Upstream>,
     pub advertise: Vec<RelayAddress>,
     pub accept_relays: Vec<PublicKey>,
@@ -215,11 +223,13 @@ pub struct Config {
     /// Hosts MLAT for the areas it is chosen to solve: on unless `--no-mlat`. Its threads are the
     /// plan's (`Budget::mlat_threads`), never an operator's.
     pub mlat: bool,
-    /// Gathers the live world product, and the precise one.
+    /// Gathers the world product.
     pub world: bool,
-    pub world_precise: bool,
     /// Accepting feeders, running MLAT and seeding: on unless turned off.
     pub relay_duties: bool,
+    /// The ClockBound segment its judging clock is bounded by (`--clock-bound`): ClockBound's own
+    /// (`tally_wire::clock_bound::SHM`) unless named, as a test or a load run names one it writes.
+    pub clock_bound: String,
 }
 
 /// Why `--max-upload` is required, and a safe value to start from.
@@ -299,6 +309,40 @@ impl Host {
 }
 
 impl Config {
+    /// What the relay keeps across a restart (`durable`): the directory `--state-dir` names, else
+    /// the first of `$STATE_DIRECTORY` (`environment`, which systemd sets from the unit's
+    /// `StateDirectory=` as a colon-separated list), else no state at all (`Durable::Fresh`).
+    pub fn durable(&self, environment: Option<&str>) -> Result<crate::durable::Durable, String> {
+        match self.state_path(environment) {
+            Some(path) => crate::durable::StateDir::open(std::path::Path::new(path))
+                .map(crate::durable::Durable::Dir)
+                .map_err(|error| format!("state directory {path}: {error}")),
+            None => Ok(crate::durable::Durable::Fresh),
+        }
+    }
+
+    /// The state directory named: `--state-dir`, else the first of systemd's `$STATE_DIRECTORY`
+    /// (`environment`).
+    fn state_path<'a>(&'a self, environment: Option<&'a str>) -> Option<&'a str> {
+        self.state_dir.as_deref().or_else(|| {
+            environment
+                .and_then(|list| list.split(':').next())
+                .filter(|path| !path.is_empty())
+        })
+    }
+
+    /// What `tally-relay check` asks of the state directory named (`state_path`): only that it
+    /// can be made and written (`durable::StateDir::probe`). It takes no lock, reads or writes no
+    /// key and starts no renewer, so a check run beside the live relay neither waits on its lock
+    /// nor touches its state.
+    pub fn check_state_dir(&self, environment: Option<&str>) -> Result<(), String> {
+        match self.state_path(environment) {
+            Some(path) => crate::durable::StateDir::probe(std::path::Path::new(path))
+                .map_err(|error| format!("state directory {path}: {error}")),
+            None => Ok(()),
+        }
+    }
+
     /// `None` when the command was fully handled (usage, keygen). The relay's memory limit and
     /// cores are what this host gives it ([`Host::this`]).
     pub fn from_args(args: impl Iterator<Item = String>) -> Result<Option<Self>, String> {
@@ -325,6 +369,7 @@ impl Config {
             beast_out: None,
             acars_out: None,
             stats_listen: None,
+            state_dir: None,
             upstreams: Vec::new(),
             advertise: Vec::new(),
             accept_relays: Vec::new(),
@@ -344,8 +389,8 @@ impl Config {
             network: 0,
             mlat: true,
             world: false,
-            world_precise: false,
             relay_duties: true,
+            clock_bound: tally_wire::clock_bound::SHM.to_owned(),
         };
         let mut max_upload = None;
         let mut args = args;
@@ -358,6 +403,7 @@ impl Config {
                 "--beast-out" => config.beast_out = Some(parse_loopback(&flag, &value()?)?),
                 "--acars-out" => config.acars_out = Some(parse_loopback(&flag, &value()?)?),
                 "--stats-listen" => config.stats_listen = Some(parse_loopback(&flag, &value()?)?),
+                "--state-dir" => config.state_dir = Some(value()?),
                 "--upstream" => config.upstreams.push(parse_upstream(&value()?)?),
                 "--advertise" => {
                     let Upstream { address, key } = parse_upstream(&value()?)?;
@@ -423,7 +469,7 @@ impl Config {
                 "--no-mlat" => config.mlat = false,
                 "--no-relay-duties" => config.relay_duties = false,
                 "--world" => config.world = true,
-                "--world-precise" => config.world_precise = true,
+                "--clock-bound" => config.clock_bound = value()?,
                 "-h" | "--help" => {
                     print!("{USAGE}");
                     return Ok(None);
@@ -453,7 +499,7 @@ impl Config {
                 crate::budget::ALLOCATOR_CAP_BYTES,
             ));
         }
-        if (config.world || config.world_precise) && !covers_the_world(&config.areas) {
+        if config.world && !covers_the_world(&config.areas) {
             return Err(WORLD_NEEDS_EVERY_AREA.to_owned());
         }
         // Every region taken is offered, or the relay does not start.
@@ -492,13 +538,13 @@ impl Config {
     }
 }
 
-/// Why `--world` and `--world-precise` need every area taken.
+/// Why `--world` needs every area taken.
 const WORLD_NEEDS_EVERY_AREA: &str = "\
---world and --world-precise sign one fix per aircraft for the whole world (RFC-0174 §2.11), and a
-relay gathers every area's positions by taking every area: its sharing groups bring it each one.
-The --area cells named do not cover the globe, so the product would be a part of the world signed
-as the whole. Take every area (the 122 resolution 0 cells cover it), or leave the world products
-to a relay that does.";
+--world signs one fix per aircraft for the whole world (RFC-0174 §2.11), and a relay gathers every
+area's positions by taking every area: its sharing groups bring it each one. The --area cells
+named do not cover the globe, so the product would be a part of the world signed as the whole.
+Take every area (the 122 resolution 0 cells cover it), or leave the world product to a relay that
+does.";
 
 /// Bytes, as a number or with a binary K, M, G or T after it.
 pub fn parse_bytes(text: &str) -> Result<usize, String> {
@@ -642,8 +688,20 @@ mod tests {
     fn the_help_states_the_defaults_and_the_rules_the_code_uses() {
         let floor = format!("{} KiB", crate::ceiling::MIN_BURST / 1024);
         let ten = egress::decimal(Cap::bytes_per_sec(1_250_000).most_a_month());
+        let seconds = |ms: u64| match ms % 1_000 {
+            0 => format!("{} s", ms / 1_000),
+            part => format!(
+                "{}.{} s",
+                ms / 1_000,
+                format!("{part:03}").trim_end_matches('0')
+            ),
+        };
         for stated in [
             floor,
+            format!(
+                "sealed {}\n                         after it ends",
+                seconds(crate::products::WORLD_SETTLE_MS)
+            ),
             format!("(default {DEFAULT_MAX_SUBSCRIBERS})"),
             format!("(default {DEFAULT_MAX_BEAST_CLIENTS})"),
             format!("(default {DEFAULT_MAX_CONNECTIONS})"),
@@ -768,7 +826,8 @@ mod tests {
         for base in &bases {
             every.extend(["--area", base]);
         }
-        for flag in ["--world", "--world-precise"] {
+        {
+            let flag = "--world";
             let mut args = every.clone();
             args.push(flag);
             assert!(config(&args).is_ok(), "{flag} with every area");
@@ -898,6 +957,40 @@ mod tests {
         Ok(())
     }
 
+    /// The state directory is the flag's, else the first of systemd's `$STATE_DIRECTORY`, else
+    /// none, and then nothing is kept.
+    #[test]
+    fn the_state_directory_is_the_flags_then_systemds_then_none() -> Result<(), String> {
+        let base = std::env::var("TEST_TMPDIR")
+            .unwrap_or_else(|_| std::env::temp_dir().display().to_string());
+        let flagged = format!("{base}/flagged-state");
+        let unit = format!("{base}/unit-state");
+        let named = config(&[
+            "--key",
+            "k",
+            "--max-upload",
+            "10Mbit/s",
+            "--state-dir",
+            &flagged,
+        ])?;
+        let crate::durable::Durable::Dir(dir) = named.durable(Some(&unit))? else {
+            return Err("the flag's directory was not used".into());
+        };
+        assert_eq!(dir.path(), std::path::Path::new(&flagged));
+        let bare = config(&["--key", "k", "--max-upload", "10Mbit/s"])?;
+        let crate::durable::Durable::Dir(dir) =
+            bare.durable(Some(&format!("{unit}:/elsewhere")))?
+        else {
+            return Err("systemd's directory was not used".into());
+        };
+        assert_eq!(dir.path(), std::path::Path::new(&unit));
+        assert!(matches!(
+            bare.durable(None)?,
+            crate::durable::Durable::Fresh
+        ));
+        Ok(())
+    }
+
     #[test]
     fn the_stats_listener_is_named_by_flag() -> Result<(), String> {
         let config = config(&[
@@ -993,6 +1086,26 @@ mod tests {
                 "{gone} was accepted"
             );
         }
+        Ok(())
+    }
+
+    /// The judging clock is bounded by ClockBound's own segment unless `--clock-bound` names
+    /// another (a load run's, which it writes), and the flag needs its path.
+    #[test]
+    fn the_clock_bound_is_clockbounds_unless_named() -> Result<(), String> {
+        let bare = config(&["--key", "k", "--max-upload", "1MB/s"])?;
+        assert_eq!(bare.clock_bound, tally_wire::clock_bound::SHM);
+        let named = config(&[
+            "--key",
+            "k",
+            "--max-upload",
+            "1MB/s",
+            "--clock-bound",
+            "/run/load/shm0",
+        ])?;
+        assert_eq!(named.clock_bound, "/run/load/shm0");
+        assert!(config(&["--key", "k", "--max-upload", "1MB/s", "--clock-bound"]).is_err());
+        assert!(USAGE.contains("--clock-bound PATH"));
         Ok(())
     }
 }

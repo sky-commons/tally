@@ -10,6 +10,7 @@
 //! own hash, so parity needs no signature: a wrong parity rebuilds nothing.
 
 use tally_wire::batch::Hash;
+use tally_wire::record::MAX_VERSION;
 use tally_wire::sharing::receipt_digest;
 use tally_wire::{Record, Region, Streams};
 
@@ -102,7 +103,7 @@ impl Parity {
         let mut records = Vec::new();
         let mut rest = slice.as_slice();
         while !rest.is_empty() {
-            let (_, used) = Record::decode(rest).ok()?;
+            let (_, used) = Record::decode(rest, MAX_VERSION).ok()?;
             if used == 0 || used > rest.len() {
                 return None;
             }

@@ -4,9 +4,17 @@
 //! The feeders split over processes and hosts by shard (`config::Shard`): every shard simulates the
 //! same world and runs its own slice of it.
 
+// It holds every simulated feeder's key: no `unsafe` code outside its one libc module (`os`).
+// Denied, not forbidden, since `os` needs its allow, and a forbid refuses that too: the build
+// refuses `unsafe` in every other module, and that `os` reaches no key is review's to hold.
+#![deny(unsafe_code)]
+
 pub mod config;
 pub mod feeders;
 pub mod histogram;
+/// The one module that calls libc, and so the one allowed `unsafe`: it reaches no key.
+#[allow(unsafe_code)]
+mod os;
 pub mod relay;
 pub mod subscriber;
 pub mod traffic;
@@ -34,11 +42,7 @@ const FEEDERS_NICE: libc::c_int = 5;
 /// behind starves the feeders it feeds), while a feeder that waits only delays its own batch.
 /// Run on each of the feeders' runtime threads as it starts. Failing, it leaves the thread as it is.
 pub fn lower_priority() {
-    let tid = tally_relay::os::thread_id();
-    // SAFETY: `setpriority` takes and touches no memory of ours.
-    unsafe {
-        let _ = libc::setpriority(libc::PRIO_PROCESS, tid, FEEDERS_NICE);
-    }
+    os::set_thread_nice(tally_relay::os::thread_id(), FEEDERS_NICE);
 }
 
 /// How often a progress line is printed.
@@ -90,11 +94,13 @@ fn check_host(
 /// What the simulation made, a line of the summary.
 fn made_line(made: &traffic::Made, feeders: usize) -> String {
     format!(
-        "{:.0} receptions/s a receiver; {:.0} distinct transmissions/s, each heard by {:.1}; {:.0} \
-         distinct messages/s by their bytes",
+        "{:.0} receptions/s a receiver, {:.0}% wanted; {:.0} distinct transmissions/s, each heard by \
+         {:.1}, {:.0}/s by enough to multilaterate; {:.0} distinct messages/s by their bytes",
         made.per_sec(made.receptions) / feeders.max(1) as f64,
+        100.0 * made.wanted as f64 / made.receptions.max(1) as f64,
         made.per_sec(made.transmissions),
         made.receptions as f64 / made.transmissions.max(1) as f64,
+        made.per_sec(made.multilaterable),
         made.per_sec(made.contents)
     )
 }
@@ -337,6 +343,9 @@ pub async fn run(config: Config) -> Result<String, String> {
     // that and the headroom for it at any sample: (beyond, resident, peak charged).
     let mut peak_charged = 0u64;
     let mut beyond: Option<(i64, u64, u64)> = None;
+    // The sample at which the allocator served the most beyond every store's charge: what the
+    // base holds, held to what was measured idle and its margin (`Charged::within_base`).
+    let mut base_worst: Option<relay::Charged> = None;
     loop {
         let elapsed = begin.elapsed();
         let next = if window.is_none() {
@@ -354,6 +363,11 @@ pub async fn run(config: Config) -> Result<String, String> {
             ));
         }
         let now = watch.moment();
+        if let Some(charged) = now.charged
+            && base_worst.is_none_or(|worst| charged.unplanned() > worst.unplanned())
+        {
+            base_worst = Some(charged);
+        }
         if let (Some(sample), Some(charged)) = (&now.sample, now.charged) {
             peak_charged = peak_charged.max(charged.total());
             let rss = sample.rss_kib * 1024;
@@ -409,6 +423,10 @@ pub async fn run(config: Config) -> Result<String, String> {
         }),
         _ => None,
     };
+    let worked = match watch.stats.as_deref() {
+        Some(stats) => Some(relay::worked(stats)?),
+        None => None,
+    };
     let table = summary(&Summary {
         config: &config,
         local,
@@ -424,6 +442,8 @@ pub async fn run(config: Config) -> Result<String, String> {
         relay_peak_cores,
         fit,
         beyond,
+        base_worst,
+        worked,
     });
     let _ = std::fs::remove_dir_all(config.state_dir.join("feeders"));
     drop(spawned);
@@ -433,6 +453,33 @@ pub async fn run(config: Config) -> Result<String, String> {
     // The relay's peak resident memory is held to its budget and the headroom it
     // keeps below the memory it runs in, whatever the allocator keeps; past them a relay sized
     // for its load is throttled or killed.
+    // The figures are a working relay's only if it did its work: its clock judged, it signed
+    // products, its strike tables filled and, hosting MLAT, it stepped, published and kept
+    // standing within its plan.
+    let multilaterable = traffic.as_deref().map_or(0, |traffic| {
+        traffic.made(0..run_second(begin.elapsed())).multilaterable
+    });
+    if let Some(short) = worked
+        .map(|worked| worked.shortfalls(config.spec.feeders, multilaterable))
+        .filter(|short| !short.is_empty())
+    {
+        return Err(format!(
+            "{table}\nthe relay did not do its work: {}",
+            short.join("; ")
+        ));
+    }
+    // What no store charges stays within the base the plan holds for it.
+    if let Some(worst) = base_worst
+        && !worst.within_base()
+    {
+        return Err(format!(
+            "{table}\nthe allocator served {} MiB beyond every store's charge, past the \
+             measured base and its margin ({} MiB): a table grows that no store charges",
+            worst.unplanned() >> 20,
+            (tally_relay::budget::MEASURED_IDLE_BYTES + tally_relay::budget::BASE_MARGIN_BYTES)
+                >> 20
+        ));
+    }
     if let Some((over, _, _)) = beyond
         && over > 0
     {
@@ -527,6 +574,8 @@ struct Summary<'a> {
     /// The relay's peak resident memory beside its budget and headroom, where it can be read.
     fit: Option<relay::Fit>,
     beyond: Option<(i64, u64, u64)>,
+    base_worst: Option<relay::Charged>,
+    worked: Option<relay::Worked>,
 }
 
 fn summary(summary: &Summary) -> String {
@@ -545,6 +594,8 @@ fn summary(summary: &Summary) -> String {
         relay_peak_cores,
         fit,
         beyond,
+        base_worst,
+        worked,
     } = summary;
     let seconds = seconds.max(1e-3);
     let rate = |count: u64| count as f64 / seconds;
@@ -621,7 +672,7 @@ fn summary(summary: &Summary) -> String {
             "relay: MLAT clock fits",
             format!(
                 "{} tried, {} fitted, {} failed this window ({}), {} clocks dropped as cut off, \
-                 over {} window steps; the last failure: {}",
+                 over {} steps; why a fit failed: {}",
                 now.fits.saturating_sub(before.fits),
                 now.fitted_since(before),
                 now.unfitted.saturating_sub(before.unfitted),
@@ -666,6 +717,75 @@ fn summary(summary: &Summary) -> String {
                 peak >> 20,
                 relay::resident_allowed(*peak) >> 20,
                 if *over <= 0 { "within" } else { "OVER" }
+            ),
+        );
+    }
+    if let Some(worst) = base_worst {
+        row(
+            "relay: base",
+            format!(
+                "at its worst sample the allocator served {} MiB in use and {} MiB mapped, {} MiB \
+                 beyond every store's charge, against {} MiB measured idle and its margin: {}",
+                worst.in_use >> 20,
+                worst.mapped >> 20,
+                worst.unplanned() >> 20,
+                (tally_relay::budget::MEASURED_IDLE_BYTES + tally_relay::budget::BASE_MARGIN_BYTES)
+                    >> 20,
+                if worst.within_base() {
+                    "within"
+                } else {
+                    "OVER"
+                }
+            ),
+        );
+    }
+    if let Some(worked) = worked {
+        row(
+            "relay: worked",
+            format!(
+                "{} unjudged, {} regional signed, own strikes {} KiB{}",
+                worked.unjudged_records,
+                worked.regional_signed,
+                worked.own_strikes_held >> 10,
+                worked.mlat.map_or(String::new(), |mlat| format!(
+                    "; MLAT {} steps, {} batches taken in, {} refused by its pool, {} fits \
+                     tried, {} positions; standing took {}, forgot {}",
+                    mlat.steps,
+                    mlat.ingested,
+                    mlat.batches_refused,
+                    mlat.fits,
+                    mlat.positions,
+                    mlat.standing_taken,
+                    mlat.standing_forgotten
+                ))
+            ),
+        );
+    }
+    if let Some(mlat) = worked.as_ref().and_then(|worked| worked.mlat) {
+        // Its steps and what it published over the window, against the governor's target and the
+        // products' pace a neighbour plans a seat (what its products reach them under,
+        // `budget::Plan::member_products_bytes_per_sec`).
+        let window = match (&end.fits, &start.fits) {
+            (Some(now), Some(before)) if now.steps > before.steps => format!(
+                "; its steps ran {} ms each on average (the governor's target {} ms of {}), and it \
+                 published {:.2} MB/s, {:.0} bytes a seat a second, against the {} a neighbour's \
+                 members are paced a seat",
+                now.ran_ms.saturating_sub(before.ran_ms) / (now.steps - before.steps),
+                tally_relay::mlat_host::STEP_TARGET_MS,
+                tally_relay::mlat_host::STEP_BUDGET_MS,
+                rate(now.published_bytes.saturating_sub(before.published_bytes)) / 1e6,
+                rate(now.published_bytes.saturating_sub(before.published_bytes))
+                    / mlat.seats_taken.max(1) as f64,
+                tally_relay::models::MEMBER_MODEL_BYTES_PER_SEAT_PER_SEC
+                    + tally_relay::consistency::POSITIONS_BYTES_PER_SEAT_PER_SEC
+            ),
+            _ => String::new(),
+        };
+        row(
+            "relay: MLAT seats",
+            format!(
+                "{} settled of {} planned (its own cuts between){window}",
+                mlat.seats_taken, mlat.seat_limit
             ),
         );
     }
@@ -744,8 +864,8 @@ fn summary(summary: &Summary) -> String {
         }
         // A batch's time is when it was made: a feeder's seal for raw, and for the deduplicated
         // stream the end of the epoch the relay signed it for (`tally_relay::deduplicated`).
-        // A provisional solution's time is its transmission's, and its latency is split at the
-        // stamp of the relay's step that solved it (`subscriber::Client::provisional`): what the
+        // An MLAT fix's time is its transmission's, and its latency is split at the stamp of the
+        // relay's step that solved it (`subscriber::Client::fixes`): what the
         // relay's lateness budget does not see (the feeder's batching, ingest, the watermark),
         // then what it does.
         for (name, stream, histogram, span, what) in [
@@ -764,28 +884,28 @@ fn summary(summary: &Summary) -> String {
                 "batches",
             ),
             (
-                "latency: provisional",
-                tally_wire::Streams::PROVISIONAL,
-                &client.provisional_latency,
+                "latency: MLAT fixes",
+                tally_wire::Streams::POSITIONS,
+                &client.fix_latency,
                 "transmitted to read",
-                "solutions",
+                "fixes",
             ),
             (
                 "  to its step's stamp",
-                tally_wire::Streams::PROVISIONAL,
-                &client.provisional_to_stamp,
+                tally_wire::Streams::POSITIONS,
+                &client.fix_to_stamp,
                 "transmitted to the stamp of the relay's step that solved it",
-                "solutions",
+                "fixes",
             ),
             (
                 "  from its step's stamp",
-                tally_wire::Streams::PROVISIONAL,
-                &client.provisional_from_stamp,
+                tally_wire::Streams::POSITIONS,
+                &client.fix_from_stamp,
                 "that stamp to read",
-                "solutions",
+                "fixes",
             ),
         ] {
-            // A stream not asked for has no latency, not an empty one: a row of "0 solutions"
+            // A stream not asked for has no latency, not an empty one: a row of "0 fixes"
             // read as a relay that published none.
             if config.streams.0 & stream.0 == 0 {
                 row(name, "not asked for (--streams)".to_owned());
@@ -813,26 +933,26 @@ fn summary(summary: &Summary) -> String {
                 ),
             );
         }
-        if config.streams.0 & tally_wire::Streams::PROVISIONAL.0 != 0 {
-            // RFC-0174 §2.4: a provisional position must reach the live world before its second
-            // is sealed, `WORLD_SETTLE_MS` after the second ends.
+        if config.streams.0 & tally_wire::Streams::POSITIONS.0 != 0 {
+            // RFC-0174 §2.4: an MLAT fix must reach the world product before its second is
+            // sealed, `WORLD_SETTLE_MS` (`FIX_ARRIVED`) after the second ends.
             let settle = tally_relay::products::WORLD_SETTLE_MS;
             let histogram = client
-                .provisional_latency
+                .fix_latency
                 .lock()
                 .map(|each| each.clone())
                 .unwrap_or_default();
             let delta = end.client - start.client;
             row(
-                "client: provisional",
+                "client: MLAT fixes",
                 format!(
-                    "{} of the {} solutions read more than {settle} ms after their transmission \
-                     (too late for the live world wherever its second ended first); {} dated \
+                    "{} of the {} fixes read more than {settle} ms after their transmission \
+                     (too late for the world product wherever its second ended first); {} dated \
                      after their step's stamp (a free-running gauge dates a transmission by the \
                      seal of the batch that anchored its model, up to a second late)",
                     histogram.over(settle),
                     histogram.total(),
-                    delta.provisional_after_stamp
+                    delta.fixes_after_stamp
                 ),
             );
         }

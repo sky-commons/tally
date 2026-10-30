@@ -36,6 +36,7 @@ rust_test(
     crate = ":mlat",
     edition = "2024",
     lint_config = ":cargo_lints",
+    deps = ["//crates/counting"],
 )
 
 rustfmt_test(

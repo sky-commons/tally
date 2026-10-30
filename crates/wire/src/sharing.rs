@@ -87,7 +87,7 @@ impl Fields for StripeAssignment {
     fn read(reader: &mut Body<'_>) -> Result<Unchecked<Self>, WireError> {
         Ok(Unchecked::new(Self {
             cell: Region::from_u64(reader.u64()?)?,
-            product: Streams::read(reader)?,
+            product: Streams::read_product(reader)?,
             stripes_of: reader.u8()?,
             stripes: reader.u32()?,
         }))
@@ -99,7 +99,10 @@ impl Fields for StripeAssignment {
 pub struct PieceManifestContent {
     pub cell: Region,
     pub product: Streams,
-    /// Unix seconds, by the records' own signed wall clocks.
+    /// Unix seconds, by the origin relay's clock: the second it took the records in and seeded
+    /// them into the group, whatever their own signed times. It says when members owe the records
+    /// (the repair horizon runs from it), never whether a copy is new: each relay decides that by
+    /// the record's own signed time and the hashes it took in (RFC-0171 §3.6).
     pub second: u64,
     /// The records' hashes, ascending, without repeats.
     pub hashes: Vec<Hash>,
@@ -133,7 +136,7 @@ impl Fields for PieceManifestContent {
 
     fn read(reader: &mut Body<'_>) -> Result<Unchecked<Self>, WireError> {
         let cell = Region::from_u64(reader.u64()?)?;
-        let product = Streams::read(reader)?;
+        let product = Streams::read_product(reader)?;
         let second = reader.u64()?;
         let count = read_count(reader, MAX_PIECES)?;
         let hashes = (0..count)
@@ -204,7 +207,7 @@ impl Fields for HaveSummary {
 
     fn read(reader: &mut Body<'_>) -> Result<Unchecked<Self>, WireError> {
         let cell = Region::from_u64(reader.u64()?)?;
-        let product = Streams::read(reader)?;
+        let product = Streams::read_product(reader)?;
         let first_second = reader.u64()?;
         let count = read_count(reader, MAX_HAVE_SECONDS / 8)?;
         Ok(Unchecked::new(Self {
@@ -292,7 +295,7 @@ impl Fields for StripeReceiptContent {
         Ok(Unchecked::new(Self {
             parent: PublicKey::from_slice(reader.bytes(KEY_LEN)?)?,
             cell: Region::from_u64(reader.u64()?)?,
-            product: Streams::read(reader)?,
+            product: Streams::read_product(reader)?,
             stripe: reader.u8()?,
             stripes_of: reader.u8()?,
             first_second: reader.u64()?,
@@ -554,7 +557,7 @@ impl Fields for ParityChunk {
     fn read(reader: &mut Body<'_>) -> Result<Unchecked<Self>, WireError> {
         let manifest = reader.array()?;
         let cell = Region::from_u64(reader.u64()?)?;
-        let product = Streams::read(reader)?;
+        let product = Streams::read_product(reader)?;
         let second = reader.u64()?;
         let count = read_count(reader, usize::from(MAX_STRIPES))?;
         let lens = (0..count)
@@ -629,7 +632,7 @@ impl Fields for BundleIndexContent {
 
     fn read(reader: &mut Body<'_>) -> Result<Unchecked<Self>, WireError> {
         let parent = Region::from_u64(reader.u64()?)?;
-        let product = Streams::read(reader)?;
+        let product = Streams::read_product(reader)?;
         let second = reader.u64()?;
         let count = read_count(reader, MAX_CHILDREN)?;
         let children = (0..count)

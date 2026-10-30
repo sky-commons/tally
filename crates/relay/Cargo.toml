@@ -31,6 +31,8 @@ tally-wire.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
+# The unit tests' counting allocator: test support, outside every production build.
+tally-counting = { path = "../counting" }
 serde_json.workspace = true
 tally-feed = { path = "../feed" }
 # `test-util` pauses time, so a deadline test waits no real seconds.

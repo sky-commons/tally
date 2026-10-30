@@ -14,5 +14,9 @@ libm.workspace = true
 tally-wire.workspace = true
 thiserror.workspace = true
 
+[dev-dependencies]
+# The byte tests' counting allocator: test support, outside every production build.
+tally-counting = { path = "../counting" }
+
 [lints]
 workspace = true

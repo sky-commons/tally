@@ -5,16 +5,18 @@
 //! every aircraft's current fix. The same subscription carries the relays' signed feeder figures
 //! (`crate::feeders`).
 //!
-//! A client holds no raw (wire version 3): a fix's check is its engine's signature, and its
-//! confidence is unconfirmed, since standing is a relay's ledger, not a client's.
+//! A client holds no raw (wire version 4): a fix's check is its engine's signature, and its
+//! confidence is unconfirmed, since standing is a relay's ledger, not a client's. An engine
+//! publishes a fix as soon as it can solve one and a bigger one as more receptions arrive, so
+//! what is served is each aircraft's newest fix, a few seconds after it was heard.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
-use tally_api_types::{Aircraft, Mlat, MlatCheck, MlatConfidence, MlatKind, PositionSource};
-use tally_merge::{Kind, Merge};
-use tally_wire::{ClientRecord, Identity, PublicKey, RelayAddress};
+use tally_api_types::{Aircraft, Mlat, MlatCheck, MlatConfidence, PositionSource};
+use tally_merge::Merge;
+use tally_wire::{ClientRecord, Identity, RelayAddress};
 use tokio::sync::mpsc;
 
 use crate::area::Area;
@@ -34,12 +36,6 @@ pub const VELOCITY_MIN_SPAN_MS: u64 = 1_000;
 pub const VELOCITY_MAX_SPAN_MS: u64 = 60_000;
 /// Metres a second in a knot (an international nautical mile, 1852 m, an hour).
 const KNOTS_PER_M_S: f64 = 3_600.0 / 1_852.0;
-/// How far past the API's own clock a precise world second may be and still be taken: the skew
-/// between a relay's clock and the API's. A precise second is sealed about 90 s after it ends, so
-/// an honest one is never ahead of either clock; one further ahead is a relay's lie, which would
-/// otherwise hold the feed at its second and refuse every honest one after it.
-pub const PRECISE_SKEW_MS: u64 = 10_000;
-
 /// What the operator chose.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Settings {
@@ -70,11 +66,8 @@ pub struct Served {
     pub altitude_ft: Option<i32>,
     pub horizontal_sigma_m: f64,
     pub check: MlatCheck,
-    pub kind: MlatKind,
     pub confidence: MlatConfidence,
     pub contested: bool,
-    /// MLAT, or (in the precise world feed) the aircraft's own broadcast.
-    pub source: PositionSource,
     pub transmitted_ms: u64,
     /// Ground speed and track over the ground from the fix served before this one of the same
     /// aircraft (`velocity`); `None` without one that qualifies.
@@ -102,11 +95,10 @@ impl Served {
             on_ground: false,
             last_heard_at_ms: self.transmitted_ms,
             position_at_ms: self.transmitted_ms,
-            position_source: self.source,
-            mlat: (self.source == PositionSource::Mlat).then_some(Mlat {
+            position_source: PositionSource::Mlat,
+            mlat: Some(Mlat {
                 horizontal_sigma_m: self.horizontal_sigma_m,
                 check: self.check,
-                kind: self.kind,
                 confidence: self.confidence,
                 contested: self.contested,
             }),
@@ -114,13 +106,12 @@ impl Served {
     }
 }
 
-/// Every aircraft's served fix: its latest final one, or a provisional one later than that
-/// (`tally_merge::Track::served`).
+/// Every aircraft's served fix: its latest transmission's (`tally_merge::Track::current`).
 pub fn served(merge: &Merge) -> Vec<Served> {
     merge
         .tracks()
         .into_iter()
-        .filter_map(|track| track.served().map(|fix| (track, fix)))
+        .filter_map(|track| track.current().map(|fix| (track, fix)))
         .map(|(track, fix)| {
             // Contested: a superset of the fix's transmission disagreed with it.
             let contested = track.transmissions.iter().any(|transmission| {
@@ -141,14 +132,9 @@ pub fn served(merge: &Merge) -> Vec<Served> {
                 // A client verifies a fix by its engine's signature: the model and resolved
                 // checks need raw, which is relay-only.
                 check: MlatCheck::Signature,
-                kind: match fix.kind {
-                    Kind::Final => MlatKind::Final,
-                    Kind::Provisional => MlatKind::Provisional,
-                },
                 // Standing is a relay's ledger, kept from raw a client never holds.
                 confidence: MlatConfidence::Unconfirmed,
                 contested,
-                source: PositionSource::Mlat,
                 transmitted_ms: fix.transmitted.unix_ms,
                 gs_kt: None,
                 track_deg: None,
@@ -159,11 +145,10 @@ pub fn served(merge: &Merge) -> Vec<Served> {
 
 /// The ground speed (knots) and track (degrees true) of an aircraft that moved from `before` to
 /// `after`, two fixes of it: along the great circle between them, the speed its length over their
-/// time apart and the track its initial bearing. `None` unless both are MLAT fixes and they are
-/// `VELOCITY_MIN_SPAN_MS` to `VELOCITY_MAX_SPAN_MS` apart; no track when they are at one place.
+/// time apart and the track its initial bearing. `None` unless both are of one aircraft and they
+/// are `VELOCITY_MIN_SPAN_MS` to `VELOCITY_MAX_SPAN_MS` apart; no track when they are at one place.
 pub fn velocity(before: &Served, after: &Served) -> Option<(f64, Option<f64>)> {
-    let mlat = |one: &Served| one.source == PositionSource::Mlat;
-    if !mlat(before) || !mlat(after) || before.address != after.address {
+    if before.address != after.address {
         return None;
     }
     let span_ms = after.transmitted_ms.checked_sub(before.transmitted_ms)?;
@@ -186,32 +171,23 @@ pub fn velocity(before: &Served, after: &Served) -> Option<(f64, Option<f64>)> {
     Some((gs_kt, track))
 }
 
-/// The newest whole second of the precise world product held: the second (Unix seconds) and its
-/// aircraft.
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct Precise {
-    pub second: u64,
-    pub served: Arc<Vec<Served>>,
-}
-
-/// What requests read: the latest snapshot of the live feed (the merge's), each aircraft moving
-/// by its last two served fixes, and the newest whole second of the precise world product, if any
-/// has come.
+/// What requests read: the latest snapshot of the merge's fixes, each aircraft moving by its last
+/// two served fixes.
 #[derive(Default)]
 pub struct Positions {
     served: RwLock<Arc<Vec<Served>>>,
     /// Each aircraft's fix served before its current one, of an earlier transmission: what its
     /// velocity is taken from.
     before: Mutex<HashMap<u32, Served>>,
-    precise: RwLock<Option<Precise>>,
 }
 
 impl Positions {
     /// Serves `served`, the merge's current fixes, each with its velocity from the fix of the same
     /// aircraft served before it: a fix of a later transmission than the one held makes the held
-    /// one the earlier; one of the same transmission (a final replacing a provisional) replaces it
-    /// and keeps the earlier; one of an earlier transmission (a provisional retracted) keeps only an
-    /// earlier fix still before it. An aircraft no longer served is forgotten.
+    /// one the earlier; one of the same transmission (a bigger fix of it, solved as more of its
+    /// receptions arrived) replaces it and keeps the earlier; one of an earlier transmission (the
+    /// later one's fix dropped with a convicted engine) keeps only an earlier fix still before it.
+    /// An aircraft no longer served is forgotten.
     pub fn set(&self, mut served: Vec<Served>) {
         let Ok(mut held) = self.served.write() else {
             return;
@@ -254,40 +230,6 @@ impl Positions {
             .collect()
     }
 
-    pub fn set_precise(&self, second: u64, served: Vec<Served>) {
-        if let Ok(mut held) = self.precise.write() {
-            *held = Some(Precise {
-                second,
-                served: Arc::new(served),
-            });
-        }
-    }
-
-    /// The precise world feed in `area`: its newest second and the aircraft of it there, or
-    /// `None` when there is no precise product to serve (none has come, or the newest is older
-    /// than `max_age` before `now_ms` beyond the feed's own delay of about a minute and a half).
-    /// A product held with no aircraft in `area` is an answer, not an absence.
-    pub fn precise_in_area(
-        &self,
-        area: &Area,
-        now_ms: u64,
-        max_age: Duration,
-    ) -> Option<(u64, Vec<Served>)> {
-        let held = self.precise.read().ok()?.clone()?;
-        let behind = tally_relay::products::WORLD_PRECISE_SETTLE_MS;
-        let oldest = now_ms.saturating_sub(max_age.as_millis() as u64 + behind);
-        if held.second.saturating_add(1).saturating_mul(1_000) < oldest {
-            return None;
-        }
-        let served = held
-            .served
-            .iter()
-            .filter(|one| one.transmitted_ms >= oldest && area.contains(one.lat, one.lon))
-            .cloned()
-            .collect();
-        Some((held.second, served))
-    }
-
     /// The positions in `area` no older than `max_age` before `now_ms`, in address order.
     pub fn in_area(&self, area: &Area, now_ms: u64, max_age: Duration) -> Vec<Served> {
         let Ok(held) = self.served.read() else {
@@ -305,6 +247,7 @@ impl Positions {
 /// the API runs.
 pub fn start(
     settings: &Settings,
+    clock: Clock,
     identity: Identity,
     positions: Arc<Positions>,
     feeders: Arc<Mutex<Ledger>>,
@@ -318,9 +261,10 @@ pub fn start(
         None => tally_merge::link::Vouching::none(),
     };
     let (inbound, mut records) = mpsc::channel::<ClientRecord>(INBOUND);
-    // What the merge reads, the relays' feeder figures among it; and the precise world product,
-    // for the precise feed. No raw: it is relay-only.
-    let streams = tally_merge::link::streams().with(tally_wire::Streams::WORLD_PRECISE);
+    // What the merge reads, the relays' feeder figures among it. No raw: it is relay-only.
+    let streams = tally_merge::link::streams();
+    // The API's key only handshakes: as a subscriber it signs nothing.
+    let identity = tally_wire::NoiseKey::of(identity);
     for relay in &settings.relays {
         tokio::spawn(tally_merge::link::subscribe_vouched(
             relay.clone(),
@@ -335,21 +279,14 @@ pub fn start(
         let mut merge = Merge::new(tally_merge::Settings::default());
         let mut published = std::time::Instant::now();
         let mut dirty = false;
-        let mut precise = PreciseWorld::default();
         while let Some(record) = records.blocking_recv() {
-            let now_ms = wall_ms();
             match &record {
-                ClientRecord::WorldPrecise(world) => {
-                    if precise.take(world, now_ms) {
-                        positions.set_precise(precise.second, precise.served());
-                    }
-                }
                 ClientRecord::FeederFigures(figures) => {
                     if let Ok(mut ledger) = feeders.lock() {
-                        ledger.ingest(figures, now_ms);
+                        ledger.ingest(figures, clock.now());
                     }
                 }
-                _ => match merge.ingest(&record, now_ms) {
+                _ => match merge.ingest(&record) {
                     Ok(_) => dirty = true,
                     Err(error) => eprintln!("tally-api: mlat: {error}"),
                 },
@@ -364,71 +301,109 @@ pub fn start(
     Ok(())
 }
 
-/// The newest second of the precise world product, as its parts arrive: every part of one second
-/// signed by one relay, a newer second replacing it.
-#[derive(Default)]
-struct PreciseWorld {
-    second: u64,
-    signer: Option<PublicKey>,
-    fixes: std::collections::BTreeMap<u32, tally_wire::WorldFix>,
+/// The API host's clock as it judges signed times: its wall clock, and whether the host's
+/// ClockBound says it is synchronised now within `budget::E` (`tally_wire::clock_bound`, the one
+/// reader and the one judgement of its word every end shares), read at each reading. What
+/// `PRODUCT_AHEAD` and `K` are derived from is every judging clock within `E` of true time, so the
+/// API relies on them only by a reading ClockBound vouched for: a host without ClockBound, or one
+/// it says is not synchronised or bounds past `E`, judges nothing, and its reader counts each such
+/// read by why (`tally_wire::clock_bound::Reader::health`). The bound is only as honest as chrony
+/// and ClockBound are (RFC-0171 §3.6).
+#[derive(Clone)]
+pub struct Clock {
+    judged: tally_wire::clocks::JudgedReader,
+    judging: std::sync::Arc<dyn Fn() -> bool + Send + Sync>,
 }
 
-impl PreciseWorld {
-    /// Takes a part, if it verifies, is of a second no later than `now_ms` plus
-    /// `PRECISE_SKEW_MS`, and is of the newest second (from the relay that signed the second's
-    /// first part seen): true when what is held changed.
-    fn take(&mut self, world: &tally_wire::WorldPrecise, now_ms: u64) -> bool {
-        let (Ok(()), Ok(signer), Ok(content)) = (world.verify(), world.signer(), world.content())
-        else {
-            return false;
-        };
-        if content.second.saturating_mul(1_000) > now_ms.saturating_add(PRECISE_SKEW_MS)
-            || content.second < self.second
-            || (content.second == self.second && self.signer.is_some_and(|held| held != signer))
-        {
-            return false;
-        }
-        if content.second > self.second {
-            self.second = content.second;
-            self.signer = Some(signer);
-            self.fixes.clear();
-        }
-        for fix in content.fixes {
-            self.fixes.insert(fix.address, fix);
-        }
-        true
-    }
-
-    fn served(&self) -> Vec<Served> {
-        self.fixes
-            .values()
-            .map(|fix| Served {
-                address: fix.address,
-                lat: f64::from(fix.lat_e7) / 1e7,
-                lon: f64::from(fix.lon_e7) / 1e7,
-                altitude_ft: fix.pressure_altitude_ft,
-                horizontal_sigma_m: tally_merge::horizontal_sigma_m(&fix.covariance),
-                check: MlatCheck::Signature,
-                kind: MlatKind::Final,
-                confidence: MlatConfidence::Unconfirmed,
-                contested: false,
-                source: if fix.mlat {
-                    PositionSource::Mlat
-                } else {
-                    PositionSource::Adsb
-                },
-                transmitted_ms: fix.transmitted.unix_ms,
-                gs_kt: None,
-                track_deg: None,
-            })
-            .collect()
+impl std::fmt::Debug for Clock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Clock").finish_non_exhaustive()
     }
 }
 
-fn wall_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_millis() as u64)
+/// The host's wall clock read as the API's judging clock: the one place a reading of it is made.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "the API's reader of its host's wall clock: a reading is made where the clock is read"
+)]
+fn wall() -> tally_wire::clocks::Judged {
+    tally_wire::clocks::recorded::judged(crate::routes::wall_ms())
+}
+
+/// A test's script read as the API's judging clock.
+#[cfg(test)]
+#[allow(clippy::disallowed_methods, reason = "a test's scripted readings")]
+fn scripted(ms: u64) -> tally_wire::clocks::Judged {
+    tally_wire::clocks::recorded::judged(ms)
+}
+
+impl Clock {
+    /// The host's: its wall clock, judged by its ClockBound's word on it.
+    pub fn system() -> Self {
+        Self {
+            judged: tally_wire::clocks::JudgedReader::of(wall),
+            judging: std::sync::Arc::new(|| tally_wire::clock_bound::Reader::host().read().is_ok()),
+        }
+    }
+
+    /// A test's: the host's clocks, judging as if its ClockBound said synchronised, since no test
+    /// host runs ClockBound. An API's is [`Clock::system`]. Clippy refuses it outside a test
+    /// (`clippy.toml`), so no API judges by it.
+    pub fn host_stated() -> Self {
+        Self {
+            judging: std::sync::Arc::new(|| true),
+            ..Self::system()
+        }
+    }
+
+    /// A test's: it reads `read`, and it judges as `judging` says.
+    #[cfg(test)]
+    pub fn scripted(
+        read: impl Fn() -> u64 + Send + Sync + 'static,
+        judging: impl Fn() -> bool + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            judged: tally_wire::clocks::JudgedReader::of(move || scripted(read())),
+            judging: std::sync::Arc::new(judging),
+        }
+    }
+
+    /// The clock now, with whether it judges.
+    pub fn now(&self) -> Now {
+        Now {
+            judged: self.judged.read(),
+            judging: (self.judging)(),
+        }
+    }
+}
+
+/// A reading of the API's clock and whether it judged as it was read (`Clock::now`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Now {
+    judged: tally_wire::clocks::Judged,
+    judging: bool,
+}
+
+impl Now {
+    /// The reading.
+    pub const fn judged(self) -> tally_wire::clocks::Judged {
+        self.judged
+    }
+
+    /// Whether ClockBound bounded the clock within `E` as it was read.
+    pub const fn judging(self) -> bool {
+        self.judging
+    }
+
+    /// A test's reading `ms`, judging or not.
+    #[cfg(test)]
+    #[allow(clippy::disallowed_methods, reason = "a test's scripted readings")]
+    pub const fn at(ms: u64, judging: bool) -> Self {
+        Self {
+            judged: tally_wire::clocks::recorded::judged(ms),
+            judging,
+        }
+    }
 }
 
 /// The aircraft answer for a viewport: readsb's, each at its ADS-B position, then the MLAT
@@ -457,26 +432,12 @@ mod tests {
             altitude_ft: None,
             horizontal_sigma_m: 30.0,
             check: MlatCheck::Signature,
-            kind: MlatKind::Final,
             confidence: MlatConfidence::Unconfirmed,
             contested: false,
-            source: PositionSource::Mlat,
             transmitted_ms,
             gs_kt: None,
             track_deg: None,
         }
-    }
-
-    #[test]
-    fn a_provisional_position_says_so() -> Result<(), String> {
-        let early = Served {
-            kind: MlatKind::Provisional,
-            ..one(0xc0ffee, 52.0, 1)
-        };
-        let json = serde_json::to_value(early.aircraft()).map_err(|e| e.to_string())?;
-        assert_eq!(json["mlat"]["kind"], "provisional");
-        assert_eq!(json["position_source"], "mlat");
-        Ok(())
     }
 
     #[test]
@@ -492,106 +453,6 @@ mod tests {
         assert_eq!(
             served.iter().map(|one| one.address).collect::<Vec<_>>(),
             [1]
-        );
-        Ok(())
-    }
-
-    /// One part of the precise world at `second`, signed by `signer`, with one fix of `address`.
-    fn precise(
-        signer: &Identity,
-        second: u64,
-        address: u32,
-    ) -> Result<tally_wire::WorldPrecise, String> {
-        let fix = tally_wire::WorldFix {
-            address,
-            transmitted: tally_wire::TransmitTime {
-                unix_ms: second * 1_000 + 100,
-                sub_ms_ps: 0,
-            },
-            lat_e7: 520_000_000,
-            lon_e7: 50_000_000,
-            alt_hae_mm: None,
-            pressure_altitude_ft: None,
-            covariance: tally_wire::EnuCovariance {
-                xx: 100.0,
-                xy: 0.0,
-                xz: 0.0,
-                yy: 100.0,
-                yz: 0.0,
-                zz: 100.0,
-            },
-            provisional: false,
-            mlat: true,
-            input_set: [3; 32],
-            source: signer.public(),
-            origin: [4; 32],
-            origin_index: 0,
-        };
-        tally_wire::WorldPrecise::sign(
-            signer,
-            &tally_wire::WorldPositionsContent {
-                second,
-                part: 0,
-                fixes: vec![fix],
-            },
-        )
-        .map_err(|error| error.to_string())
-    }
-
-    /// A precise second further ahead than the skew is a relay's lie: refused, and it does not
-    /// hold the feed against the honest seconds after it.
-    #[test]
-    fn a_precise_second_from_the_future_is_refused() -> Result<(), String> {
-        let now_ms = 1_791_220_000_000;
-        let liar = Identity::from_seed([1; 32]);
-        let honest = Identity::from_seed([2; 32]);
-        let mut held = PreciseWorld::default();
-        let ahead = (now_ms + PRECISE_SKEW_MS) / 1_000 + 1;
-        assert!(!held.take(&precise(&liar, ahead, 0xbad)?, now_ms));
-        assert!(!held.take(
-            &precise(&liar, now_ms / 1_000 + 10 * 365 * 86_400, 0xbad)?,
-            now_ms
-        ));
-        let second = now_ms / 1_000 - 91;
-        assert!(held.take(&precise(&honest, second, 0xc0ffee)?, now_ms));
-        assert_eq!(held.second, second);
-        assert_eq!(
-            held.served()
-                .iter()
-                .map(|one| one.address)
-                .collect::<Vec<_>>(),
-            [0xc0ffee]
-        );
-        // Within the skew is taken: the relay's clock may be a little ahead of the API's.
-        let skewed = (now_ms + PRECISE_SKEW_MS) / 1_000;
-        assert!(held.take(&precise(&honest, skewed, 0xabc)?, now_ms));
-        Ok(())
-    }
-
-    /// No precise product, or only a stale one, is no answer (the route's `503`); a recent one
-    /// with nobody in the viewport is an empty answer.
-    #[test]
-    fn the_precise_feed_is_unavailable_without_a_recent_product() -> Result<(), String> {
-        let positions = Positions::default();
-        let area = Area::new(4.0, 51.0, 6.0, 53.0)?;
-        let elsewhere = Area::new(-10.0, 30.0, -8.0, 32.0)?;
-        let max_age = Duration::from_secs(60);
-        let now_ms = 1_791_220_000_000;
-        assert_eq!(positions.precise_in_area(&area, now_ms, max_age), None);
-        let second = now_ms / 1_000 - 91;
-        positions.set_precise(second, vec![one(7, 52.0, second * 1_000 + 100)]);
-        let (got, served) = positions
-            .precise_in_area(&area, now_ms, max_age)
-            .ok_or("unavailable")?;
-        assert_eq!((got, served.len()), (second, 1));
-        assert_eq!(
-            positions.precise_in_area(&elsewhere, now_ms, max_age),
-            Some((second, Vec::new()))
-        );
-        // Ten minutes on, nothing newer has come: unavailable.
-        assert_eq!(
-            positions.precise_in_area(&area, now_ms + 600_000, max_age),
-            None
         );
         Ok(())
     }
@@ -619,8 +480,8 @@ mod tests {
         let expected = 0.01_f64.to_radians() * 6_371_008.8 / 10.0 * 3_600.0 / 1_852.0;
         assert!((gs.ok_or("no speed")? - expected).abs() < 1e-6, "{gs:?}");
         assert!(track.ok_or("no track")?.abs() < 1e-6, "{track:?}");
-        // A fix of the same transmission (a final replacing a provisional) replaces it: the
-        // velocity is still taken from the fix before.
+        // A fix of the same transmission (a bigger one of it) replaces it: the velocity is still
+        // taken from the fix before.
         positions.set(vec![one(1, 52.01, 110_000), one(2, 52.0, 110_000)]);
         let (_, track) = moving(&positions, 1).ok_or("not served")?;
         assert!(track.ok_or("no track")?.abs() < 1e-6);
@@ -637,7 +498,7 @@ mod tests {
         Ok(())
     }
 
-    /// Fixes closer than a second or further than a minute apart, or either not MLAT, give no
+    /// Fixes closer than a second or further than a minute apart, or of two aircraft, give no
     /// velocity; nor do two at one place give a track. Standing is not asked: a client holds
     /// none, and every fix it serves is unconfirmed.
     #[test]
@@ -648,18 +509,12 @@ mod tests {
             ..at(52.01, 110_000)
         };
         assert!(velocity(&at(52.0, 100_000), &unconfirmed).is_some());
-        let adsb = Served {
-            source: PositionSource::Adsb,
-            ..at(52.01, 110_000)
-        };
         assert!(velocity(&at(52.0, 100_000), &at(52.01, 101_000)).is_some());
         assert!(velocity(&at(52.0, 100_000), &at(52.01, 160_000)).is_some());
         for (before, after) in [
             (at(52.0, 100_000), at(52.01, 100_999)),
             (at(52.0, 100_000), at(52.01, 160_001)),
             (at(52.01, 110_000), at(52.0, 100_000)),
-            (at(52.0, 100_000), adsb.clone()),
-            (adsb, at(52.0, 120_000)),
             (one(2, 52.0, 100_000), at(52.01, 110_000)),
         ] {
             assert_eq!(velocity(&before, &after), None, "{before:?} {after:?}");

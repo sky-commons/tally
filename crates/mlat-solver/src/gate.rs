@@ -1,23 +1,20 @@
 //! One budget of threads for a host's MLAT work (RFC-0181 §10, "MLAT in the cores"). A relay
-//! hosting MLAT runs three kinds of work apart (seals, window steps and provisional steps), each
-//! spreading over threads of its own; were each given the plan's threads, the three together would
-//! run three times them, more cores than the plan gave MLAT. So a host makes one [`Gate`] of the
-//! plan's threads, and every thread doing MLAT work holds one of its permits while it works: the
-//! thread a step starts on ([`enter`]), and every thread a step spreads its work over
-//! ([`on_threads`], which every parallel pass of the solver and the engine goes through). A thread
-//! waiting on its own workers lends its permit to them while it waits ([`lend`]), so no thread
-//! holds one idle. Provisional work is let in first, and never waits on background work for its
-//! first permit: of a gate of two or more permits, background work holds all but one at most
-//! ([`Gate::reserved`]), so a provisional step that arrives while seals and window steps hold every
-//! permit they may takes the one left at once, and runs on it however long their items are.
-//! Before, every permit could be background's, and a provisional step waited for one until a
-//! [`checkpoint`], which only the window's fits had: a seal or a scope pass held it up whole). A
-//! gate of one permit cannot spare one, so there background work gives its permit up between two
-//! items of its work whenever a provisional thread waits ([`checkpoint`], in every pass of the
-//! seals, the scope and the window, each item a receiver, a message run, an address or a tile),
-//! and a waiting [`Urgency::Prompt`] thread takes the next permit freed: a provisional step then
-//! waits one item at most. Beyond its first, a provisional step's threads take the permits
-//! background gives up at its checkpoints.
+//! hosting MLAT runs two kinds of work apart (its steps: seals, refits and solves; and the
+//! background work beside them: its standing's checks, forgetting receivers), each spreading over
+//! threads of its own; were each given the plan's threads, the two together would run twice them,
+//! more cores than the plan gave MLAT. So a host makes one [`Gate`] of the plan's threads, and
+//! every thread doing MLAT work holds one of its permits while it works: the thread a step starts
+//! on ([`enter`]), and every thread a step spreads its work over ([`on_threads`], which every
+//! parallel pass of the solver and the engine goes through). A thread waiting on its own workers
+//! lends its permit to them while it waits ([`lend`]), so no thread holds one idle. Prompt work is
+//! let in first, and never waits on background work for its first permit: of a gate of two or more
+//! permits, background work holds all but one at most ([`Gate::reserved`]), so a step that arrives
+//! while background work holds every permit it may takes the one left at once, and runs on it
+//! however long background's items are. A gate of one permit cannot spare one, so there background
+//! work gives its permit up between two items of its work whenever a prompt thread waits
+//! ([`checkpoint`], in every pass over receivers, message runs, addresses or areas), and a waiting
+//! [`Urgency::Prompt`] thread takes the next permit freed: a step then waits one item at most.
+//! Beyond its first, a step's threads take the permits background gives up at its checkpoints.
 //!
 //! Work run on no gate (an engine driven in line, a test, a relay's standing) is not bounded here:
 //! every call is then a no-op. Which thread runs what, and when, never changes what is computed.
@@ -26,8 +23,8 @@ use std::cell::RefCell;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
-/// How soon a gate's work is needed: provisional work before background (seals, window steps,
-/// forgetting receivers).
+/// How soon a gate's work is needed: the engine's steps before background work (its standing's
+/// checks, forgetting receivers).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Urgency {
     Prompt,
@@ -55,7 +52,7 @@ pub struct Gate {
 }
 
 impl Gate {
-    /// A gate of `permits` threads, at least one, one of them kept for provisional work when there
+    /// A gate of `permits` threads, at least one, one of them kept for prompt work when there
     /// are two or more ([`Gate::reserved`]).
     pub fn new(permits: usize) -> Arc<Self> {
         let permits = permits.max(1);
@@ -71,7 +68,7 @@ impl Gate {
     }
 
     /// Of a gate of `permits`, the permits background work never holds: one when there are two or
-    /// more, so provisional work always finds one free at once (module docs); none of one, which
+    /// more, so prompt work always finds one free at once (module docs); none of one, which
     /// background work could not do without.
     pub const fn reserved(permits: usize) -> usize {
         if permits >= 2 { 1 } else { 0 }
@@ -318,6 +315,24 @@ pub fn on_threads<I: Send, R: Send>(
     results.into_iter().flatten().collect()
 }
 
+/// Lets go of `items` on `threads` threads ([`on_threads`], a piece each at a time): what a step
+/// built and no longer needs, freed in parallel, so freeing it is not serial work the step waits
+/// on. Before, the step's taken-up sets were freed on the thread that ran it, a tenth of that
+/// thread's time at 2,000 feeders (2026-10-26).
+pub fn drop_on_threads<T: Send>(threads: usize, items: Vec<T>) {
+    let size = piece(items.len(), threads);
+    let mut pieces: Vec<Vec<T>> = Vec::new();
+    let mut items = items.into_iter();
+    loop {
+        let one: Vec<T> = items.by_ref().take(size).collect();
+        if one.is_empty() {
+            break;
+        }
+        pieces.push(one);
+    }
+    on_threads(threads, pieces, drop);
+}
+
 /// Inputs per item a pass over `len` cheap inputs on `threads` threads hands its workers at a time
 /// ([`on_threads`] of chunks this long): about `PIECES_PER_THREAD` pieces a thread, so a thread
 /// that comes late, or one whose pieces run long, costs the pass one piece at most.
@@ -375,9 +390,9 @@ mod tests {
     }
 
     /// Background work never holds a gate's every permit when it has two or more, so
-    /// a provisional step arriving while background work holds all it may starts at once, however
+    /// a prompt step arriving while background work holds all it may starts at once, however
     /// long the background items run and with no checkpoint among them. Before, a background step
-    /// spread over the gate's every permit held a provisional one up until an item ended. Judged
+    /// spread over the gate's every permit held a prompt one up until an item ended. Judged
     /// by order, not by a clock: the background items end only once the prompt
     /// work has run (or after a hang guard, so a failure ends), and the prompt work must have run while
     /// none had ended.

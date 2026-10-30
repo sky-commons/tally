@@ -24,6 +24,13 @@ bytes = "1"
 ed25519-dalek = "2"
 # tally-api's stream (RFC-0184) is a `Stream` of Server-Sent Events: already in the tree under axum.
 futures-util = { version = "0.3", default-features = false }
+# The host clock's error bound, as AWS ClockBound 2.x publishes it in shared memory: its own Rust
+# client (tally-wire's src/clock_bound.rs, RFC-0171 §3.6). Its shm crate, with the `writer` the
+# daemon writes through, and nix's TimeSpec make the tests' fake segment. Exact: the segment's
+# layout is the daemon's, version for version.
+clock-bound-client = "=2.0.3"
+clock-bound-shm = "=2.0.3"
+nix = { version = "0.26", default-features = false }
 # The version snow already uses, so the tree carries one getrandom.
 getrandom = "0.2"
 # H3 cells name regions (RFC-0171 §3.6); pure Rust.

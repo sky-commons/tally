@@ -1,12 +1,16 @@
 //! `tally-mlat-calibrate <subset dir> [options]`: the native MLAT's calibration over a LocaRDS
 //! subset (the crate documentation says what it does and measures).
 
+// It reaches keys (`tally_wire::Identity`): no `unsafe` code at all, forbidden, so no module
+// can allow it.
+#![forbid(unsafe_code)]
+
 use std::path::PathBuf;
 use std::process::ExitCode;
 
 use tally_mlat_calibrate::locards::Subset;
 use tally_mlat_calibrate::mapping::Reply;
-use tally_mlat_calibrate::run::Finals;
+use tally_mlat_calibrate::run::Scores;
 use tally_mlat_calibrate::score::TruthModel;
 use tally_mlat_calibrate::{Outcome, Settings, run};
 
@@ -51,26 +55,27 @@ fn parse() -> Result<(PathBuf, Settings), String> {
     Ok((dir.ok_or(USAGE)?, settings))
 }
 
-fn print_finals(name: &str, finals: &Finals, model: &TruthModel) {
+fn print_scores(name: &str, scores: &Scores, model: &TruthModel) {
     println!("{name}:");
-    println!("  overall: {}", finals.overall.summary(model));
+    println!("  overall: {}", scores.overall.summary(model));
     println!(
         "  LocaRDS-verified aircraft: {}",
-        finals.trusted.summary(model)
+        scores.trusted.summary(model)
     );
     let bands = ["below 6 km", "6 to 9 km", "9 km and up"];
-    for (band, slice) in bands.iter().zip(&finals.bands) {
+    for (band, slice) in bands.iter().zip(&scores.bands) {
         println!("  {band}: {}", slice.summary(model));
     }
     let counts = ["3 receptions", "4", "5 or 6", "7 to 9", "10 or more"];
-    for (count, slice) in counts.iter().zip(&finals.receivers) {
+    for (count, slice) in counts.iter().zip(&scores.receivers) {
         println!("  {count}: {}", slice.summary(model));
     }
-    for (level, slice) in finals.levels.iter().enumerate() {
-        println!("  tile level {level}: {}", slice.summary(model));
+    let areas = ["models of 1 area", "2 areas", "3 areas", "4 or more areas"];
+    for (areas, slice) in areas.iter().zip(&scores.areas) {
+        println!("  {areas}: {}", slice.summary(model));
     }
     let clocks = ["every clock GNSS", "some GNSS", "no GNSS"];
-    for (clock, slice) in clocks.iter().zip(&finals.clocks) {
+    for (clock, slice) in clocks.iter().zip(&scores.clocks) {
         println!("  {clock}: {}", slice.summary(model));
     }
 }
@@ -86,32 +91,33 @@ fn print(settings: &Settings, outcome: &Outcome) {
         outcome.withheld_aircraft,
         outcome.withheld_transmissions
     );
-    let window = &outcome.window;
+    let engine = &outcome.engine;
     println!(
-        "engine: windows {}, fits {}, unfitted {} ({:?}), transmissions {}, solved {}, unsolved \
-         {}, rejected {}, models {}, fit time {:.0} s, solve time {:.0} s",
-        window.windows,
-        window.fits,
-        window.unfitted,
-        window.unfitted_reason,
-        window.transmissions,
-        window.solved,
-        window.unsolved,
-        window.rejected,
+        "engine: due {}, fits {} warm and {} cold, unfitted {} ({:?}), solved {}, unsolved {}, \
+         unpublished {}, unjudged {}, late {}, models {}, fit time {:.0} s, solve time {:.0} s",
+        engine.due,
+        engine.fits_warm,
+        engine.fits_cold,
+        engine.unfitted,
+        engine.unfitted_reason,
+        engine.solved,
+        engine.unsolved,
+        engine.unpublished,
+        engine.unjudged,
+        engine.late,
         outcome.models,
-        window.fit_time.as_secs_f64(),
-        window.solve_time.as_secs_f64()
+        engine.fit_ns as f64 / 1e9,
+        engine.solve_ns as f64 / 1e9
     );
-    println!("provisional engine: {:?}", outcome.provisional);
     println!(
-        "solved: {} of {} eligible (aircraft, bin) pairs ({:.3}); {} finals of at most {} \
-         transmissions ({:.3}); {} solutions of no withheld transmission",
+        "solved: {} of {} eligible (aircraft, slot) pairs ({:.3}); {} fixes of at most {} \
+         transmissions ({:.3}); {} fixes of no withheld transmission",
         outcome.solved_bins,
         outcome.eligible_bins,
         outcome.solved_bins as f64 / outcome.eligible_bins.max(1) as f64,
-        outcome.finals.overall.horizontal.total,
+        outcome.fixes.overall.horizontal.total,
         outcome.eligible_transmissions,
-        outcome.finals.overall.horizontal.total as f64
+        outcome.fixes.overall.horizontal.total as f64
             / outcome.eligible_transmissions.max(1) as f64,
         outcome.unknown_solutions
     );
@@ -130,8 +136,7 @@ fn print(settings: &Settings, outcome: &Outcome) {
         model.samples,
         outcome.reference_against,
     );
-    print_finals("final positions", &outcome.finals, model);
-    print_finals("provisional positions", &outcome.provisionals, model);
+    print_scores("MLAT fixes", &outcome.fixes, model);
 }
 
 fn main() -> ExitCode {

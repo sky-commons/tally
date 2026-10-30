@@ -1,5 +1,9 @@
 //! `tally-load`: one relay, many real feeders, one subscriber, and what it measured.
 
+// It reaches keys (`tally_wire::Identity`): no `unsafe` code at all, forbidden, so no module
+// can allow it.
+#![forbid(unsafe_code)]
+
 fn main() {
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()

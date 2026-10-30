@@ -8,6 +8,7 @@
 use std::collections::{BTreeMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
+use tally_wire::clocks::Judged;
 
 use tally_wire::record::MAX_REGIONS;
 use tally_wire::rendezvous::{self, AREA_RESOLUTION, MLAT_RELAYS_PER_AREA, Weighted};
@@ -195,15 +196,15 @@ impl Selection {
     /// offer is among the first `MLAT_RELAYS_PER_AREA` of the ranking of every live offer for the
     /// area with MLAT cores, weighted by the cores. Every relay holding the same offers computes
     /// the same choice. None before the relay has offered anything (`Directory::own_key`).
-    pub fn mlat_areas(&self, directory: &Directory, now_ms: u64) -> Regions {
-        self.solved(directory, now_ms).1
+    pub fn mlat_areas(&self, directory: &Directory, now: Judged) -> Regions {
+        self.solved(directory, now).1
     }
 
     /// [`Selection::mlat_areas`], shared, with the generation of the computation: computed only
     /// when the regions taken, the relay's key or what the directory answers moved
     /// (`Directory::version`), so a relay that asks every tick pays for it only on a change.
-    pub fn solved(&self, directory: &Directory, now_ms: u64) -> (u64, Regions) {
-        self.with_solved(directory, now_ms, |solved| {
+    pub fn solved(&self, directory: &Directory, now: Judged) -> (u64, Regions) {
+        self.with_solved(directory, now, |solved| {
             (solved.generation, solved.areas.clone())
         })
     }
@@ -212,8 +213,8 @@ impl Selection {
     /// offering the area's raw is asked for it, cut to the area and its border band. One entry per
     /// relay while its regions fit one `Subscribe`, more beyond. Sorted by key, so the set is the
     /// same however the offers arrived. Kept with the MLAT choice it follows.
-    pub fn raw_sources(&self, directory: &Directory, now_ms: u64) -> Vec<RawSource> {
-        self.with_solved(directory, now_ms, |solved| {
+    pub fn raw_sources(&self, directory: &Directory, now: Judged) -> Vec<RawSource> {
+        self.with_solved(directory, now, |solved| {
             if solved.raw.is_none() {
                 solved.raw = Some(raw_sources_of(
                     &solved.coverage,
@@ -228,12 +229,12 @@ impl Selection {
     fn with_solved<T>(
         &self,
         directory: &Directory,
-        now_ms: u64,
+        now: Judged,
         read: impl FnOnce(&mut Solved) -> T,
     ) -> T {
         let taken = self.taken_index();
         let own = directory.own_key();
-        let from = (taken.version, own, directory.version(now_ms));
+        let from = (taken.version, own, directory.version(now));
         let mut held = self
             .solved
             .lock()
@@ -248,9 +249,9 @@ impl Selection {
             None => 1,
         };
         let solved = held.get_or_insert_with(|| {
-            let coverage = directory.coverage(now_ms);
+            let coverage = directory.coverage(now);
             let areas = match own {
-                Some(own) => solving(directory, &coverage, &own, taken.regions(), now_ms),
+                Some(own) => solving(directory, &coverage, &own, taken.regions(), now),
                 None => Regions::default(),
             };
             Solved {
@@ -342,15 +343,9 @@ fn raw_sources_of(coverage: &Coverage, own: Option<PublicKey>, areas: &Regions) 
 /// `MLAT_RELAYS_PER_AREA` of the ranking (`mlat_relays`). What an engine is granted is the band
 /// of these (`subscription::engine_grant`), and this relay's own are the same rule over the areas
 /// it takes ([`Selection::mlat_areas`]).
-pub fn areas_solved_by(directory: &Directory, relay: &PublicKey, now_ms: u64) -> Regions {
-    let cells = directory.cells_of(relay, now_ms);
-    solving(
-        directory,
-        &directory.coverage(now_ms),
-        relay,
-        &cells,
-        now_ms,
-    )
+pub fn areas_solved_by(directory: &Directory, relay: &PublicKey, now: Judged) -> Regions {
+    let cells = directory.cells_of(relay, now);
+    solving(directory, &directory.coverage(now), relay, &cells, now)
 }
 
 /// Of the areas under or around `regions` (`rendezvous::areas_of`), those `relay` is among the
@@ -365,7 +360,7 @@ fn solving(
     coverage: &Coverage,
     relay: &PublicKey,
     regions: &[Region],
-    now_ms: u64,
+    now: Judged,
 ) -> Regions {
     if regions.is_empty() {
         return Regions::default();
@@ -383,7 +378,7 @@ fn solving(
             .filter_map(|resolution| top.ancestor(resolution))
             .flat_map(|cell| coverage.at(cell).iter().cloned())
             .collect();
-        solve_under(directory, coverage, relay, top, inherited, now_ms, &mut out);
+        solve_under(directory, coverage, relay, top, inherited, now, &mut out);
     }
     Regions::new(out)
 }
@@ -395,27 +390,19 @@ fn solve_under(
     relay: &PublicKey,
     cell: Region,
     mut offers: Vec<Checked>,
-    now_ms: u64,
+    now: Judged,
     out: &mut Vec<Region>,
 ) {
     offers.extend(coverage.at(cell).iter().cloned());
     if cell.resolution() >= AREA_RESOLUTION {
-        if choose(cell, &offers, directory, now_ms).contains(relay) {
+        if choose(cell, &offers, directory, now).contains(relay) {
             out.push(cell);
         }
         return;
     }
     if coverage.inside(cell) {
         for child in crate::sharing::bundles::children(cell) {
-            solve_under(
-                directory,
-                coverage,
-                relay,
-                child,
-                offers.clone(),
-                now_ms,
-                out,
-            );
+            solve_under(directory, coverage, relay, child, offers.clone(), now, out);
         }
         return;
     }
@@ -440,7 +427,7 @@ fn solve_under(
         rendezvous::areas_of(cell)
             .unwrap_or_default()
             .into_iter()
-            .filter(|area| choose(*area, &offers, directory, now_ms).contains(relay)),
+            .filter(|area| choose(*area, &offers, directory, now).contains(relay)),
     );
 }
 
@@ -454,13 +441,13 @@ pub const MLAT_CORES_COUNTED: u16 = 64;
 /// rendezvous over MLAT cores, each counted up to `MLAT_CORES_COUNTED`. Where no relay has shown a
 /// witness (a new network) every tier is 0 and the cores decide alone; once relays have, a key
 /// with none (one ground for its hash, naming every core there is) ranks below all of them.
-pub fn mlat_relays(area: Region, directory: &Directory, now_ms: u64) -> Vec<PublicKey> {
-    choose(area, &directory.offers_for(area, now_ms), directory, now_ms)
+pub fn mlat_relays(area: Region, directory: &Directory, now: Judged) -> Vec<PublicKey> {
+    choose(area, &directory.offers_for(area, now), directory, now)
 }
 
 /// [`mlat_relays`] of `area` from `offers`, the live offers covering it (in any order: the
 /// ranking is a function of the set).
-fn choose(area: Region, offers: &[Checked], directory: &Directory, now_ms: u64) -> Vec<PublicKey> {
+fn choose(area: Region, offers: &[Checked], directory: &Directory, now: Judged) -> Vec<PublicKey> {
     let candidates: Vec<Weighted> = offers
         .iter()
         .map(|offer| Weighted {
@@ -478,7 +465,7 @@ fn choose(area: Region, offers: &[Checked], directory: &Directory, now_ms: u64) 
         .collect();
     let tiers: std::collections::HashMap<PublicKey, u32> = ranked
         .iter()
-        .map(|key| (*key, directory.tier_of(key, now_ms)))
+        .map(|key| (*key, directory.tier_of(key, now)))
         .collect();
     crate::directory::by_tier(ranked, |key| tiers.get(key).copied().unwrap_or(0))
         .into_iter()
@@ -488,8 +475,10 @@ fn choose(area: Region, offers: &[Checked], directory: &Directory, now_ms: u64) 
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::disallowed_methods, reason = "a test's scripted readings")]
     use super::*;
     use crate::directory::Group;
+    use tally_wire::clocks::recorded::judged;
     use tally_wire::rendezvous::{AREA_RESOLUTION, area_of};
     use tally_wire::{Identity, Location, ProviderOffer, ProviderOfferContent};
 
@@ -513,8 +502,9 @@ mod tests {
         cell: Region,
         cores: u16,
         products: Streams,
-        now_ms: u64,
+        now: Judged,
     ) -> std::result::Result<ProviderOffer, String> {
+        let now_ms = now.ms();
         ProviderOffer::sign(
             relay,
             &ProviderOfferContent {
@@ -578,20 +568,20 @@ mod tests {
         let offers: Vec<ProviderOffer> = relays
             .iter()
             .zip(0_u16..)
-            .map(|(relay, cores)| offer(relay, area, cores * 4, Streams::RAW, now))
+            .map(|(relay, cores)| offer(relay, area, cores * 4, Streams::RAW, judged(now)))
             .collect::<std::result::Result<_, _>>()?;
         let holding = |offers: &[ProviderOffer]| -> std::result::Result<Directory, String> {
             let directory = Directory::new();
             for (offer, group) in offers.iter().zip(0_u16..) {
-                directory.hold_verified(offer.clone(), Group::V4(group), now)?;
+                directory.hold_verified(offer.clone(), Group::V4(group), judged(now))?;
             }
             Ok(directory)
         };
-        let chosen = mlat_relays(area, &holding(&offers)?, now);
+        let chosen = mlat_relays(area, &holding(&offers)?, judged(now));
         assert_eq!(chosen.len(), MLAT_RELAYS_PER_AREA);
         let mut reversed = offers.clone();
         reversed.reverse();
-        assert_eq!(mlat_relays(area, &holding(&reversed)?, now), chosen);
+        assert_eq!(mlat_relays(area, &holding(&reversed)?, judged(now)), chosen);
         // The relay offering no cores is never chosen.
         assert!(!chosen.contains(&relays[0].public()));
         // Each relay holding the offers solves the area exactly when it is chosen.
@@ -599,11 +589,11 @@ mod tests {
             let directory = Directory::new();
             directory.adopt_own_key(relay.public());
             for (offer, group) in offers.iter().zip(0_u16..) {
-                directory.hold_verified(offer.clone(), Group::V4(group), now)?;
+                directory.hold_verified(offer.clone(), Group::V4(group), judged(now))?;
             }
             let selection = Selection::new();
             selection.set_taken(vec![area]);
-            let solves = selection.mlat_areas(&directory, now);
+            let solves = selection.mlat_areas(&directory, judged(now));
             assert_eq!(
                 solves == Regions::new([area]),
                 chosen.contains(&relay.public()),
@@ -611,7 +601,7 @@ mod tests {
                 relay.public()
             );
             // It asks every other relay offering the area's raw, cut to the area and its band.
-            let sources = selection.raw_sources(&directory, now);
+            let sources = selection.raw_sources(&directory, judged(now));
             if solves.is_empty() {
                 assert!(sources.is_empty());
             } else {

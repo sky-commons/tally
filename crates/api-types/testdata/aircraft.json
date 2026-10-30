@@ -1,6 +1,5 @@
 {
   "now_ms": 1791220000250,
-  "feed": "live",
   "aircraft": [
     {
       "hex": "a1b2c3",
@@ -48,7 +47,6 @@
       "mlat": {
         "horizontal_sigma_m": 42.5,
         "check": "model",
-        "kind": "final",
         "confidence": "standing",
         "contested": false
       }

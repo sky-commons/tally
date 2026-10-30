@@ -13,7 +13,7 @@ use bytes::Bytes;
 use crate::WireError;
 use crate::beast::Frame;
 use crate::decoded::ObsView;
-use crate::key::{Identity, KEY_LEN, PublicKey, SIGNATURE_LEN};
+use crate::key::{KEY_LEN, PublicKey, SIGNATURE_LEN, Signs};
 use crate::record::Body;
 
 /// The batch layout this build writes uncompressed.
@@ -32,9 +32,38 @@ pub const BATCH_FORMAT_DEFLATE: u8 = 2;
 /// client's record. The wire's version is not raised for it: who reads it is decided by the
 /// layout, as a reception format a reader does not know is forwarded untouched.
 pub const BATCH_FORMAT_ACARS: u8 = 3;
+/// Set on a format whose batch carries freshness anchors (RFC-0171 §3.6, [`crate::anchor`]): the
+/// layout of the format it is set on, with `anchors u8 | anchors` after `previous`
+/// ([`ANCHORS_OFFSET`]). What a feeder of this build writes ([`Batch::sign_anchored`]); every hop
+/// uses a feeder's batch only by its anchors, so a batch of a format without them (an older
+/// feeder's) is possessed and passed on, and never used: a required feeder upgrade, after its
+/// relays'. A relay that predates the flag reads none of these formats, and forwards them raw.
+pub const ANCHORED: u8 = 0x80;
+/// Format 1's layout, anchored.
+pub const BATCH_FORMAT_ANCHORED: u8 = ANCHORED | BATCH_FORMAT;
+/// Format 2's layout, anchored.
+pub const BATCH_FORMAT_ANCHORED_DEFLATE: u8 = ANCHORED | BATCH_FORMAT_DEFLATE;
+/// Format 3's layout, anchored.
+pub const BATCH_FORMAT_ANCHORED_ACARS: u8 = ANCHORED | BATCH_FORMAT_ACARS;
 /// Every batch format this build reads: one of them that does not decode is malformed, not a
 /// format of a later build.
-pub const BATCH_FORMATS: [u8; 3] = [BATCH_FORMAT, BATCH_FORMAT_DEFLATE, BATCH_FORMAT_ACARS];
+pub const BATCH_FORMATS: [u8; 6] = [
+    BATCH_FORMAT,
+    BATCH_FORMAT_DEFLATE,
+    BATCH_FORMAT_ACARS,
+    BATCH_FORMAT_ANCHORED,
+    BATCH_FORMAT_ANCHORED_DEFLATE,
+    BATCH_FORMAT_ANCHORED_ACARS,
+];
+/// The most anchors a batch carries: one from each relay its feeder publishes to (a feeder holds
+/// two).
+pub const MAX_ANCHORS: usize = 2;
+/// The most bytes a batch's anchors add to its layout: their count and each anchor.
+pub const ANCHORS_MAX_LEN: usize = 1 + MAX_ANCHORS * crate::anchor::ANCHOR_LEN;
+/// The layout a batch format has, without its anchors flag.
+pub const fn base_format(format: u8) -> u8 {
+    format & !ANCHORED
+}
 /// The most a compressed batch's observations may inflate to: far beyond any record's body, so
 /// no honest batch is refused, and bounded, so no batch is a decompression bomb.
 pub const MAX_PLAIN_LEN: usize = 1 << 20;
@@ -53,6 +82,16 @@ pub const MAX_PLAIN_LEN: usize = 1 << 20;
 /// receptions anyway (`Batch::inflated_len`, `Batch::receptions_at_most`).
 pub const MAX_INFLATION: usize = 8;
 
+/// What one inflation holds beside the observations it writes (`Batch::observations`): its
+/// decompressor's state, boxed, the larger of the two a reader uses (the stream's, with its
+/// window, and the core one). What each thread that decodes holds while it does, apart from what
+/// the decode is charged for (the inflated bytes, `Batch::inflated_len`).
+pub const INFLATER_BYTES: usize = {
+    let stream = std::mem::size_of::<miniz_oxide::inflate::stream::InflateState>();
+    let core = std::mem::size_of::<miniz_oxide::inflate::core::DecompressorOxide>();
+    if stream > core { stream } else { core }
+};
+
 /// The wire's one rule for a compressed batch (`MAX_INFLATION`, `MAX_PLAIN_LEN`): whether
 /// observations of `plain` bytes may be carried in a DEFLATE stream of `compressed` bytes. The
 /// encoder asks it before writing format 2 and every reader before inflating one.
@@ -68,7 +107,7 @@ const DEFLATE_LEVEL: u8 = 6;
 /// its products, whatever its reception format, so a new kind of reception that an older relay
 /// must not serve needs a batch format of its own, held here as this one is.
 pub fn composed(batch: u8, reception: u8) -> Result<(), WireError> {
-    if (batch == BATCH_FORMAT_ACARS) == (reception == format::ACARS_JSON) {
+    if (base_format(batch) == BATCH_FORMAT_ACARS) == (reception == format::ACARS_JSON) {
         Ok(())
     } else {
         Err(WireError::Invalid {
@@ -116,11 +155,30 @@ const BATCH_DOMAIN: &[u8] = b"tally batch";
 const RELAY_BATCH_DOMAIN: &[u8] = b"tally relay batch";
 const RECEIVER_INFO_DOMAIN: &[u8] = b"tally receiver";
 
+// The clocks' error budget and every window derived from it are `crate::budget`'s (RFC-0171
+// §3.6).
+
+/// How long a feeder refused for its clock (`Goodbye{Clock}`) by a relay of an older version
+/// waits before it dials that relay again: a minute. No relay of this version refuses anyone for a
+/// clock (RFC-0171 §3.6); an older one tells it this (`retry_after_secs`), and a feeder never
+/// waits less, whatever a relay says (`tally_feed`'s `relays`), so a relay that says nothing is
+/// never redialled at once.
+pub const CLOCK_RETRY_SECS: u32 = 60;
+
 /// Format, key, boot id, sequence: the part of a batch fixed across every format version.
 const BATCH_PREFIX_LEN: usize = 1 + KEY_LEN + 8 + 8;
 /// The prefix and the rest of format 1's fixed fields: counter epoch, wall clock, dropped,
 /// previous.
 const BATCH_HEADER_LEN: usize = BATCH_PREFIX_LEN + 4 + 8 + 4 + 32;
+/// Where an anchored format's anchors are ([`ANCHORED`]): right after format 1's fixed fields.
+pub const ANCHORS_OFFSET: usize = BATCH_HEADER_LEN;
+/// Where a batch's signed wall clock (`BatchContent::wall_ms`) sits: after the prefix and the
+/// counter epoch, in every format. Protocol, not one layout's accident: a relay judges every batch
+/// by it, a batch of a format it does not read among them (one a later build writes, which it
+/// forwards raw), so every format, those this build reads and any later one, keeps format 1's
+/// fields through `wall_ms` at these offsets. A later format that moved it would be judged by bytes
+/// that are not its clock; one that must is a new wire version.
+pub const WALL_MS_OFFSET: usize = BATCH_PREFIX_LEN + 4;
 const INFO_PREFIX_LEN: usize = 1 + KEY_LEN;
 
 pub type Hash = [u8; 32];
@@ -209,7 +267,13 @@ pub struct BatchContent {
     /// Bumped whenever the receiver's counter may have restarted (readsb restarted, the source
     /// reconnected, the counter went backwards), so counters from before and after never meet.
     pub counter_epoch: u32,
-    /// The feeder's wall clock, Unix milliseconds. Informational: it can be wrong.
+    /// The feeder's wall clock when it sealed the batch, Unix milliseconds, corrected by the clock
+    /// its relays state (`Record::RateLimit`'s `clock_ms`). Every relay judges the batch by it
+    /// (RFC-0171 §3.6) for usability alone: the relay a feeder publishes to uses one no further
+    /// than `F` ahead of its own clock and `crate::budget::FEEDER_BEHIND` behind
+    /// (`crate::budget::Window::FEEDER`), and holds and passes on any other unused, the session
+    /// kept; any relay uses a copy only inside its window of time around it. Nothing is refused
+    /// for it.
     pub wall_ms: u64,
     /// Receptions the feeder's own rate ceiling dropped since the previous batch, so a gap the
     /// feeder chose is never mistaken for one a relay caused.
@@ -274,6 +338,10 @@ pub struct Batch {
     /// Its bytes carry their own charge ([`Batch::owned_by`]): every holder shares them, and none
     /// charges them again.
     owned: bool,
+    /// The length of the one allocation its bytes are a slice of: its own length when they are
+    /// all of it ([`Batch::from_bytes`]), more when they are part of a larger buffer
+    /// ([`Batch::from_shared`]), which lives as long as they do and is what they are charged.
+    backing: usize,
 }
 
 /// A batch's signed bytes with their owner's charge beside them, in the one allocation `Bytes`
@@ -292,6 +360,9 @@ impl AsRef<[u8]> for OwnedBytes {
 /// What `Bytes::from_owner` allocates beside the owner: its reference count.
 pub const OWNED_HEADER: usize =
     std::mem::size_of::<std::sync::atomic::AtomicUsize>() + std::mem::size_of::<OwnedBytes>();
+
+/// What a batch's kept key and hash allocate, once for it and every clone: its `Arc`.
+pub const KEPT_BYTES: usize = crate::footprint::arc::<Kept>();
 
 /// What a batch keeps of its bytes once worked out: its signer's key, and its hash.
 #[derive(Debug)]
@@ -320,38 +391,91 @@ impl Eq for Batch {}
 
 impl Batch {
     /// A receiver's batch of its own receptions.
-    pub fn sign(identity: &Identity, content: &BatchContent) -> Result<Self, WireError> {
+    pub fn sign(identity: &impl Signs, content: &BatchContent) -> Result<Self, WireError> {
         Self::sign_content(BATCH_DOMAIN, identity, content, Codec::Plain)
     }
 
     /// A receiver's batch, its observations written by `codec`.
     pub fn sign_with(
-        identity: &Identity,
+        identity: &impl Signs,
         content: &BatchContent,
         codec: Codec,
     ) -> Result<Self, WireError> {
         Self::sign_content(BATCH_DOMAIN, identity, content, codec)
     }
 
+    /// A receiver's batch carrying `anchors` (at most [`MAX_ANCHORS`], RFC-0171 §3.6): what a
+    /// feeder signs, in the anchored layout of the format its codec and receptions choose
+    /// ([`ANCHORED`]). With no anchors it is still that layout, and no hop uses it.
+    pub fn sign_anchored(
+        identity: &impl Signs,
+        content: &BatchContent,
+        codec: Codec,
+        anchors: &[crate::anchor::Anchor],
+    ) -> Result<Self, WireError> {
+        Self::sign_encoded(
+            identity,
+            &EncodedBatch::encode(content, codec)?,
+            content.previous,
+            anchors,
+        )
+    }
+
+    /// `encoded`, linked to `previous` and carrying `anchors` (at most [`MAX_ANCHORS`]): the bytes
+    /// [`Batch::sign_anchored`] makes of the content it was encoded from with that link, which is
+    /// this with the encoding done first. What a feeder signs a batch it held for an anchor by.
+    pub fn sign_encoded(
+        identity: &impl Signs,
+        encoded: &EncodedBatch,
+        previous: Hash,
+        anchors: &[crate::anchor::Anchor],
+    ) -> Result<Self, WireError> {
+        if anchors.len() > MAX_ANCHORS {
+            return Err(WireError::Invalid {
+                field: "anchors in a batch",
+                value: anchors.len() as u64,
+            });
+        }
+        let header = Header {
+            previous,
+            ..encoded.header
+        };
+        Self::assemble(
+            BATCH_DOMAIN,
+            identity,
+            &header,
+            encoded.layout,
+            &encoded.body,
+            Some(anchors),
+        )
+    }
+
     /// A relay's batch of its deduplicated stream (`Record::RelayBatch`).
-    pub fn sign_as_relay(identity: &Identity, content: &BatchContent) -> Result<Self, WireError> {
+    pub fn sign_as_relay(identity: &impl Signs, content: &BatchContent) -> Result<Self, WireError> {
         Self::sign_content(RELAY_BATCH_DOMAIN, identity, content, Codec::Plain)
     }
 
     fn sign_content(
         label: &[u8],
-        identity: &Identity,
+        identity: &impl Signs,
         content: &BatchContent,
         codec: Codec,
     ) -> Result<Self, WireError> {
         let observations = content.observations.iter().map(ObsView::from);
-        Self::sign_in(label, identity, &content.header(), observations, codec)
+        Self::sign_in(
+            label,
+            identity,
+            &content.header(),
+            observations,
+            codec,
+            None,
+        )
     }
 
     /// As `sign_as_relay`, from receptions borrowed where they are held: the bytes
     /// `sign_as_relay` makes of their owned copies, with no copy made.
     pub fn sign_relay_draft(
-        identity: &Identity,
+        identity: &impl Signs,
         draft: &BatchDraft<'_>,
     ) -> Result<Self, WireError> {
         Self::sign_in(
@@ -360,6 +484,7 @@ impl Batch {
             &draft.header(),
             draft.observations.iter().copied(),
             Codec::Plain,
+            None,
         )
     }
 
@@ -381,66 +506,30 @@ impl Batch {
 
     fn sign_in<'a>(
         label: &[u8],
-        identity: &Identity,
+        identity: &impl Signs,
         header: &Header,
         observations: impl ExactSizeIterator<Item = ObsView<'a>>,
         codec: Codec,
+        anchors: Option<&[crate::anchor::Anchor]>,
     ) -> Result<Self, WireError> {
-        let mut plain = Vec::new();
-        let count = u32::try_from(observations.len())
-            .map_err(|_| WireError::Oversize(observations.len()))?;
-        plain.extend_from_slice(&count.to_be_bytes());
-        let mut acars = None;
-        for observation in observations {
-            let batch = *acars.get_or_insert(observation.format == format::ACARS_JSON);
-            composed(
-                if batch {
-                    BATCH_FORMAT_ACARS
-                } else {
-                    BATCH_FORMAT
-                },
-                observation.format,
-            )?;
-            observation.encode(&mut plain)?;
-        }
-        let acars = acars.unwrap_or(false);
-        let deflated = match codec {
-            _ if acars => {
-                if plain.len() > MAX_PLAIN_LEN {
-                    return Err(WireError::Oversize(plain.len()));
-                }
-                let level = match codec {
-                    Codec::DeflateAt(level) => level.clamp(1, 9),
-                    _ => DEFLATE_LEVEL,
-                };
-                let deflated = miniz_oxide::deflate::compress_to_vec(&plain, level);
-                Some(if inflation_allowed(plain.len(), deflated.len()) {
-                    deflated
-                } else {
-                    miniz_oxide::deflate::compress_to_vec(&plain, 0)
-                })
-            }
-            Codec::Plain => None,
-            Codec::Deflate | Codec::DeflateAt(_) => {
-                if plain.len() > MAX_PLAIN_LEN {
-                    return Err(WireError::Oversize(plain.len()));
-                }
-                let level = match codec {
-                    Codec::DeflateAt(level) => level.clamp(1, 9),
-                    _ => DEFLATE_LEVEL,
-                };
-                let deflated = miniz_oxide::deflate::compress_to_vec(&plain, level);
-                // The length field and the stream must come out smaller, and within the wire's
-                // inflation rule, or the batch is plain.
-                (4 + deflated.len() < plain.len() && inflation_allowed(plain.len(), deflated.len()))
-                    .then_some(deflated)
-            }
-        };
+        let (layout, body) = encode_body(observations, codec)?;
+        Self::assemble(label, identity, header, layout, &body, anchors)
+    }
+
+    /// The signed bytes of a batch whose receptions `encode_body` wrote as `body` in `layout`.
+    fn assemble(
+        label: &[u8],
+        identity: &impl Signs,
+        header: &Header,
+        layout: u8,
+        body: &[u8],
+        anchors: Option<&[crate::anchor::Anchor]>,
+    ) -> Result<Self, WireError> {
         let mut bytes = Vec::new();
-        bytes.push(match (acars, deflated.is_some()) {
-            (true, _) => BATCH_FORMAT_ACARS,
-            (false, true) => BATCH_FORMAT_DEFLATE,
-            (false, false) => BATCH_FORMAT,
+        bytes.push(if anchors.is_some() {
+            ANCHORED | layout
+        } else {
+            layout
         });
         bytes.extend_from_slice(identity.public().as_bytes());
         bytes.extend_from_slice(&header.boot_id.to_be_bytes());
@@ -449,26 +538,45 @@ impl Batch {
         bytes.extend_from_slice(&header.wall_ms.to_be_bytes());
         bytes.extend_from_slice(&header.dropped.to_be_bytes());
         bytes.extend_from_slice(&header.previous);
-        match deflated {
-            None => bytes.extend_from_slice(&plain),
-            Some(deflated) => {
-                // Bounded by `MAX_PLAIN_LEN` above.
-                bytes.extend_from_slice(&(plain.len() as u32).to_be_bytes());
-                bytes.extend_from_slice(&deflated);
+        if let Some(anchors) = anchors {
+            // At most `MAX_ANCHORS` (`sign_anchored`, `sign_encoded`).
+            bytes.push(anchors.len() as u8);
+            for anchor in anchors {
+                anchor.write(&mut bytes);
             }
         }
+        bytes.extend_from_slice(body);
         let signature = identity.sign(&domain(label, &bytes));
         bytes.extend_from_slice(&signature);
         Ok(Self {
-            bytes: Bytes::from(bytes),
-            kept: Kept::new(identity.point()),
+            // Made exact before they are shared: what they allocate is their length, as
+            // `allocated` charges them, never the capacity they grew to.
+            backing: bytes.len(),
+            bytes: Bytes::from(crate::footprint::exact(bytes)),
+            kept: Kept::new(crate::key::key_of(identity).point()),
             owned: false,
         })
     }
 
-    /// Accepts any format whose fixed prefix is well formed. Does not check the signature.
-    pub fn from_bytes(bytes: impl Into<Bytes>) -> Result<Self, WireError> {
-        let bytes = bytes.into();
+    /// Accepts any format whose fixed prefix is well formed. Does not check the signature. The
+    /// bytes are made exact first, so what they allocate is their length, as
+    /// [`Batch::allocated`] charges them, never the capacity they grew to.
+    pub fn from_bytes(bytes: Vec<u8>) -> Result<Self, WireError> {
+        let bytes = crate::footprint::exact(bytes);
+        let backing = bytes.len();
+        Self::read(Bytes::from(bytes), backing)
+    }
+
+    /// As [`Batch::from_bytes`], from a slice of a larger shared allocation of `backing` bytes (a
+    /// record's body read in place, its header beside it): the whole allocation lives as long as
+    /// the slice does, so the batch is charged for all of it ([`Batch::allocated`]), never only
+    /// for its own length. `backing` less than the slice is taken as the slice.
+    pub fn from_shared(bytes: Bytes, backing: usize) -> Result<Self, WireError> {
+        let backing = backing.max(bytes.len());
+        Self::read(bytes, backing)
+    }
+
+    fn read(bytes: Bytes, backing: usize) -> Result<Self, WireError> {
         if bytes.len() < BATCH_PREFIX_LEN + SIGNATURE_LEN {
             return Err(WireError::Truncated {
                 needed: BATCH_PREFIX_LEN + SIGNATURE_LEN,
@@ -481,14 +589,29 @@ impl Batch {
             bytes,
             kept: Kept::new(signer),
             owned: false,
+            backing,
         })
     }
 
     /// What its signed bytes take as an allocation of their own: their bytes and the header of
-    /// the one allocation every holder shares ([`Batch::owned_by`]). What a holder that keeps the
-    /// batch past its decode is charged for them, once (`Decoded::footprint` leaves them out).
+    /// the one allocation every holder shares ([`Batch::owned_by`]), and its kept key and hash,
+    /// which every clone shares as long. What a holder that keeps the batch past its decode is
+    /// charged for them, once (`Decoded::footprint` leaves them out). Before, the kept key was
+    /// charged nowhere.
     pub fn footprint(&self) -> usize {
-        self.bytes.len() + OWNED_HEADER
+        self.bytes.len() + OWNED_HEADER + KEPT_BYTES
+    }
+
+    /// What a holder of it is charged for it beside its own place: nothing when its bytes carry
+    /// their own charge ([`Batch::is_owned`], whose [`Batch::footprint`] covers its kept key too),
+    /// else their shared allocation (`footprint::shared_bytes`) and its kept key's. A clone shares
+    /// both, so it allocates nothing more.
+    pub fn allocated(&self) -> usize {
+        if self.owned {
+            0
+        } else {
+            crate::footprint::shared_bytes(self.backing) + KEPT_BYTES
+        }
     }
 
     /// Whether its bytes carry their own charge ([`Batch::owned_by`]): a holder of it charges
@@ -512,10 +635,12 @@ impl Batch {
             return Err(self);
         };
         let Self { bytes, kept, .. } = self;
-        // Unique and made from a `Vec` (a batch read off a link is): moved, not copied.
+        // Unique and made from a `Vec` (a batch read off a link is): moved, not copied. A slice of
+        // a larger allocation (`from_shared`) is copied out, and the larger let go with it.
         let mut bytes = Vec::from(bytes);
         bytes.shrink_to_fit();
         Ok(Self {
+            backing: bytes.len(),
             bytes: Bytes::from_owner(OwnedBytes {
                 bytes,
                 _owner: charge,
@@ -538,6 +663,37 @@ impl Batch {
         self.bytes[0]
     }
 
+    /// Whether its format carries freshness anchors ([`ANCHORED`]).
+    pub fn is_anchored(&self) -> bool {
+        self.format() & ANCHORED != 0
+    }
+
+    /// The freshness anchors in its signed bytes (RFC-0171 §3.6): none for a format without them,
+    /// for a format this build reads. Not verified: each names its relay, which a reader checks.
+    pub fn anchors(&self) -> Result<Vec<crate::anchor::Anchor>, WireError> {
+        if !BATCH_FORMATS.contains(&self.format()) {
+            return Err(WireError::Invalid {
+                field: "batch format",
+                value: u64::from(self.format()),
+            });
+        }
+        if !self.is_anchored() {
+            return Ok(Vec::new());
+        }
+        let (signed, _) = split_signature(&self.bytes)?;
+        let mut reader = Body::new(signed.get(ANCHORS_OFFSET..).unwrap_or_default());
+        let count = usize::from(reader.u8()?);
+        if count > MAX_ANCHORS {
+            return Err(WireError::Invalid {
+                field: "anchors in a batch",
+                value: count as u64,
+            });
+        }
+        (0..count)
+            .map(|_| crate::anchor::Anchor::read(&mut reader))
+            .collect()
+    }
+
     /// The key that signed it, as kept: never decompressed again. A `Result` for its callers'
     /// sake; it cannot fail, the key was checked when the batch was read.
     pub fn receiver(&self) -> Result<PublicKey, WireError> {
@@ -550,6 +706,13 @@ impl Batch {
 
     pub fn sequence(&self) -> u64 {
         u64_at(&self.bytes, 1 + KEY_LEN + 8)
+    }
+
+    /// Its signed wall clock (`BatchContent::wall_ms`), read at the offset every batch format
+    /// keeps it at ([`WALL_MS_OFFSET`]) without decoding a reception: what a relay's time window
+    /// judges it by.
+    pub fn wall_ms(&self) -> Result<u64, WireError> {
+        u64_from(&self.bytes, WALL_MS_OFFSET)
     }
 
     /// BLAKE2s over the whole signed batch: its identity for deduplication, the chain and the
@@ -661,6 +824,58 @@ impl Batch {
         Ok(u32::from_be_bytes(count) as usize)
     }
 
+    /// The wanted receptions this batch holds (`modes::wanted_reception`): what a receiver's
+    /// reception ceiling counts, read from its signed bytes without decoding it, so a relay charges
+    /// a batch it never decodes (one too old, unjudged or unanchored) exactly as one it decodes,
+    /// and the same batch is kept or dropped alike whichever it is. A plain batch's observations
+    /// are scanned where they are; a compressed one's inflated a piece at a time
+    /// ([`SCAN_PIECE`] bytes) and scanned as they come, never held whole. Exactly the count a
+    /// decode's views give for a batch that decodes; one that does not is refused here as there.
+    pub fn wanted_receptions(&self) -> Result<usize, WireError> {
+        let (_, layout) = self.layout()?;
+        let plain = match &layout {
+            Layout::Plain(range) => range.len(),
+            Layout::Deflate { stated, .. } => *stated,
+        };
+        let mut scan = WantedScan::new(self.format(), plain);
+        match layout {
+            Layout::Plain(range) => scan.feed(&self.bytes[range])?,
+            Layout::Deflate { stated, stream } => {
+                use miniz_oxide::inflate::stream::{InflateState, inflate};
+                use miniz_oxide::{DataFormat, MZFlush, MZStatus};
+                let refused = |written: usize| WireError::Invalid {
+                    field: "compressed batch",
+                    value: written as u64,
+                };
+                let mut state = InflateState::new_boxed(DataFormat::Raw);
+                let mut input = &self.bytes[stream];
+                let mut piece = [0u8; SCAN_PIECE];
+                let mut written = 0;
+                loop {
+                    let result = inflate(&mut state, input, &mut piece, MZFlush::None);
+                    input = input.get(result.bytes_consumed..).unwrap_or(&[]);
+                    written += result.bytes_written;
+                    if written > stated {
+                        return Err(refused(written));
+                    }
+                    scan.feed(&piece[..result.bytes_written])?;
+                    match result.status {
+                        Ok(MZStatus::StreamEnd) => break,
+                        Ok(_) if result.bytes_consumed > 0 || result.bytes_written > 0 => {}
+                        _ => return Err(refused(written)),
+                    }
+                }
+                if written != stated {
+                    return Err(WireError::Invalid {
+                        field: "compressed batch length",
+                        value: written as u64,
+                    });
+                }
+            }
+        }
+        scan.finish()
+    }
+
     /// The fixed fields, and where the observations are, for a format this build reads: a
     /// compressed batch's stated length already held to the wire's rule (`inflation_allowed`).
     fn layout(&self) -> Result<(Header, Layout), WireError> {
@@ -681,8 +896,18 @@ impl Batch {
             dropped: reader.u32()?,
             previous: reader.array()?,
         };
+        if format & ANCHORED != 0 {
+            let count = usize::from(reader.u8()?);
+            if count > MAX_ANCHORS {
+                return Err(WireError::Invalid {
+                    field: "anchors in a batch",
+                    value: count as u64,
+                });
+            }
+            reader.bytes(count * crate::anchor::ANCHOR_LEN)?;
+        }
         let fixed = 1 + KEY_LEN + reader.position();
-        if format == BATCH_FORMAT {
+        if base_format(format) == BATCH_FORMAT {
             return Ok((header, Layout::Plain(fixed..signed.len())));
         }
         let stated = reader.u32()? as usize;
@@ -697,6 +922,18 @@ impl Batch {
             });
         }
         Ok((header, Layout::Deflate { stated, stream }))
+    }
+
+    /// This batch with its observations' plain bytes, inflated once ([`Inflated`]): what a relay
+    /// reads its wanted receptions from ([`Inflated::wanted_receptions`]) and then decodes from
+    /// (`Decoded::from_inflated_owned`). An error where a decode would refuse its bytes.
+    pub fn inflated(&self) -> Result<Inflated, WireError> {
+        let (header, plain) = self.header_and_plain()?;
+        Ok(Inflated {
+            batch: self.clone(),
+            header,
+            plain,
+        })
     }
 
     /// The fixed fields, and the observations' plain bytes (`count u32 | observations`), for a
@@ -732,9 +969,159 @@ impl Batch {
     }
 }
 
+/// A batch and its observations' plain bytes, inflated once ([`Batch::inflated`]): a relay reads
+/// its wanted receptions from them before it decides to decode it, and decodes from them, so a
+/// compressed batch is inflated once. Before (2026-10-27), it was scanned a piece at a time for its
+/// wanted receptions ([`Batch::wanted_receptions`]) and inflated again to decode it: a tenth of an
+/// ingest worker's time at 2,000 feeders. The plain bytes are as long as a decode's own, and go
+/// with it or with this.
+#[derive(Clone, Debug)]
+pub struct Inflated {
+    batch: Batch,
+    header: Header,
+    plain: Bytes,
+}
+
+impl Inflated {
+    /// The batch inflated.
+    pub fn batch(&self) -> &Batch {
+        &self.batch
+    }
+
+    /// Its fixed fields, and its observations' plain bytes (`count u32 | observations`).
+    pub(crate) fn header_and_plain(&self) -> (Header, Bytes) {
+        (self.header, self.plain.clone())
+    }
+
+    /// The wanted receptions it holds, exactly as [`Batch::wanted_receptions`] reads them from its
+    /// signed bytes.
+    pub fn wanted_receptions(&self) -> Result<usize, WireError> {
+        let mut scan = WantedScan::new(self.batch.format(), self.plain.len());
+        scan.feed(&self.plain)?;
+        scan.finish()
+    }
+}
+
+/// The bytes of a compressed batch's observations [`Batch::wanted_receptions`] inflates at a time.
+const SCAN_PIECE: usize = 4096;
+
+/// A batch's plain observations (`count u32 | observations`) read as they come, in pieces of any
+/// size, counting its wanted receptions ([`Batch::wanted_receptions`]): each observation's fixed
+/// part read and held to its batch's format (`composed`), as a decode holds it, and of its
+/// message only what a wanted reception can be (`modes::LONG` bytes).
+struct WantedScan {
+    batch: u8,
+    /// The observations' plain bytes, which a stated count must fit (as a decode refuses one).
+    plain: usize,
+    count: [u8; 4],
+    counted: usize,
+    /// Observations still to read, once the count is.
+    left: usize,
+    fixed: [u8; crate::decoded::OBSERVATION_FIXED],
+    fixed_read: usize,
+    /// The current observation's message: its first bytes, and how many of it are still to come.
+    data: [u8; crate::modes::LONG],
+    data_len: usize,
+    data_left: usize,
+    wanted: usize,
+}
+
+impl WantedScan {
+    fn new(batch: u8, plain: usize) -> Self {
+        Self {
+            batch,
+            plain,
+            count: [0; 4],
+            counted: 0,
+            left: 0,
+            fixed: [0; crate::decoded::OBSERVATION_FIXED],
+            fixed_read: 0,
+            data: [0; crate::modes::LONG],
+            data_len: 0,
+            data_left: 0,
+            wanted: 0,
+        }
+    }
+
+    /// The next piece of the plain bytes. Bytes past the last observation are not read, as a
+    /// decode reads none.
+    fn feed(&mut self, mut bytes: &[u8]) -> Result<(), WireError> {
+        use crate::decoded::OBSERVATION_FIXED;
+        while !bytes.is_empty() {
+            if self.counted < 4 {
+                let n = (4 - self.counted).min(bytes.len());
+                self.count[self.counted..self.counted + n].copy_from_slice(&bytes[..n]);
+                self.counted += n;
+                bytes = &bytes[n..];
+                if self.counted == 4 {
+                    self.left = u32::from_be_bytes(self.count) as usize;
+                    if self.left > self.plain.saturating_sub(4) / OBSERVATION_FIXED {
+                        return Err(WireError::Truncated {
+                            needed: 4 + self.left.saturating_mul(OBSERVATION_FIXED),
+                            had: self.plain,
+                        });
+                    }
+                }
+            } else if self.left == 0 {
+                return Ok(());
+            } else if self.fixed_read < OBSERVATION_FIXED {
+                let n = (OBSERVATION_FIXED - self.fixed_read).min(bytes.len());
+                self.fixed[self.fixed_read..self.fixed_read + n].copy_from_slice(&bytes[..n]);
+                self.fixed_read += n;
+                bytes = &bytes[n..];
+                if self.fixed_read == OBSERVATION_FIXED {
+                    composed(self.batch, self.fixed[0])?;
+                    self.data_len = 0;
+                    self.data_left =
+                        usize::from(u16::from_be_bytes([self.fixed[8], self.fixed[9]]));
+                    self.end_if_read();
+                }
+            } else {
+                let n = self.data_left.min(bytes.len());
+                let keep = n.min(self.data.len() - self.data_len);
+                self.data[self.data_len..self.data_len + keep].copy_from_slice(&bytes[..keep]);
+                self.data_len += keep;
+                self.data_left -= n;
+                bytes = &bytes[n..];
+                self.end_if_read();
+            }
+        }
+        Ok(())
+    }
+
+    /// The current observation counted, once its message is read.
+    fn end_if_read(&mut self) {
+        if self.data_left > 0 {
+            return;
+        }
+        let len = usize::from(u16::from_be_bytes([self.fixed[8], self.fixed[9]]));
+        // A message longer than `LONG` is never a wanted reception, and only its first bytes
+        // were kept.
+        if len <= self.data.len()
+            && crate::modes::wanted_reception(self.fixed[0], &self.data[..len])
+        {
+            self.wanted += 1;
+        }
+        self.left -= 1;
+        self.fixed_read = 0;
+    }
+
+    /// The wanted receptions, once every byte has come: refused, as a decode refuses it, if the
+    /// bytes ended before the observations they state.
+    fn finish(self) -> Result<usize, WireError> {
+        if self.counted < 4 || self.left > 0 {
+            return Err(WireError::Truncated {
+                needed: 4 + self.left.max(1) * crate::decoded::OBSERVATION_FIXED,
+                had: self.plain,
+            });
+        }
+        Ok(self.wanted)
+    }
+}
+
 /// Where a batch's observations are in its signed bytes.
 enum Layout {
-    /// Format 1: these bytes, as they are.
+    /// Format 1 (anchored or not): these bytes, as they are.
     Plain(std::ops::Range<usize>),
     /// Formats 2 and 3: a DEFLATE stream in these bytes, stated to inflate to `stated`.
     Deflate {
@@ -743,7 +1130,122 @@ enum Layout {
     },
 }
 
+/// A batch's receptions as its signed bytes carry them after its anchors, and the layout that
+/// writes them (format 1, 2 or 3, before [`ANCHORED`]): their count and each reception, plain, or
+/// their plain length and its DEFLATE stream as `codec` chooses. Exact, so what it allocates is
+/// its length.
+fn encode_body<'a>(
+    observations: impl ExactSizeIterator<Item = ObsView<'a>>,
+    codec: Codec,
+) -> Result<(u8, Vec<u8>), WireError> {
+    let mut plain = Vec::new();
+    let count =
+        u32::try_from(observations.len()).map_err(|_| WireError::Oversize(observations.len()))?;
+    plain.extend_from_slice(&count.to_be_bytes());
+    let mut acars = None;
+    for observation in observations {
+        let batch = *acars.get_or_insert(observation.format == format::ACARS_JSON);
+        composed(
+            if batch {
+                BATCH_FORMAT_ACARS
+            } else {
+                BATCH_FORMAT
+            },
+            observation.format,
+        )?;
+        observation.encode(&mut plain)?;
+    }
+    let acars = acars.unwrap_or(false);
+    let deflated = match codec {
+        _ if acars => {
+            if plain.len() > MAX_PLAIN_LEN {
+                return Err(WireError::Oversize(plain.len()));
+            }
+            let level = match codec {
+                Codec::DeflateAt(level) => level.clamp(1, 9),
+                _ => DEFLATE_LEVEL,
+            };
+            let deflated = miniz_oxide::deflate::compress_to_vec(&plain, level);
+            Some(if inflation_allowed(plain.len(), deflated.len()) {
+                deflated
+            } else {
+                miniz_oxide::deflate::compress_to_vec(&plain, 0)
+            })
+        }
+        Codec::Plain => None,
+        Codec::Deflate | Codec::DeflateAt(_) => {
+            if plain.len() > MAX_PLAIN_LEN {
+                return Err(WireError::Oversize(plain.len()));
+            }
+            let level = match codec {
+                Codec::DeflateAt(level) => level.clamp(1, 9),
+                _ => DEFLATE_LEVEL,
+            };
+            let deflated = miniz_oxide::deflate::compress_to_vec(&plain, level);
+            // The length field and the stream must come out smaller, and within the wire's
+            // inflation rule, or the batch is plain.
+            (4 + deflated.len() < plain.len() && inflation_allowed(plain.len(), deflated.len()))
+                .then_some(deflated)
+        }
+    };
+    let layout = match (acars, deflated.is_some()) {
+        (true, _) => BATCH_FORMAT_ACARS,
+        (false, true) => BATCH_FORMAT_DEFLATE,
+        (false, false) => BATCH_FORMAT,
+    };
+    let body = match deflated {
+        None => plain,
+        Some(deflated) => {
+            // Bounded by `MAX_PLAIN_LEN` above.
+            let mut body = Vec::with_capacity(4 + deflated.len());
+            body.extend_from_slice(&(plain.len() as u32).to_be_bytes());
+            body.extend_from_slice(&deflated);
+            body
+        }
+    };
+    Ok((layout, crate::footprint::exact(body)))
+}
+
+/// A feeder's batch made and not yet signed: its fixed fields but its chain link, and its
+/// receptions already written as its signed bytes carry them (`encode_body`: counted, encoded and
+/// compressed by its codec). What a feeder holds a batch as while it waits for an anchor
+/// (RFC-0171 §3.6), so the hold costs the batch's wire bytes, never its owned receptions' several
+/// times that, and its receptions are compressed once; signed by [`Batch::sign_encoded`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EncodedBatch {
+    /// Its `previous` is zeros: the link is given as it is signed.
+    header: Header,
+    layout: u8,
+    body: Vec<u8>,
+}
+
+impl EncodedBatch {
+    /// `content`'s receptions written by `codec`, its `previous` left to the signing.
+    pub fn encode(content: &BatchContent, codec: Codec) -> Result<Self, WireError> {
+        let (layout, body) = encode_body(content.observations.iter().map(ObsView::from), codec)?;
+        Ok(Self {
+            header: Header {
+                previous: [0; 32],
+                ..content.header()
+            },
+            layout,
+            body,
+        })
+    }
+
+    /// What its receptions allocate, in bytes: their encoded length, compressed where that is
+    /// smaller.
+    pub fn allocated(&self) -> usize {
+        self.body.capacity()
+    }
+
+    pub fn sequence(&self) -> u64 {
+        self.header.sequence
+    }
+}
+
 /// A batch's fixed fields after its prefix, read without its observations.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Header {
     pub(crate) boot_id: u64,
     pub(crate) sequence: u64,
@@ -937,7 +1439,7 @@ impl ReceiverInfo {
     /// A format 1 description, carrying the site: what an old feeder signs. This build's feeder
     /// signs `sign_public` and a `ReceiverSite`; this stays for tests and for simulating old
     /// feeders.
-    pub fn sign(identity: &Identity, content: &ReceiverInfoContent) -> Result<Self, WireError> {
+    pub fn sign(identity: &impl Signs, content: &ReceiverInfoContent) -> Result<Self, WireError> {
         crate::signed::Check::check(content)?;
         let mut bytes = Vec::new();
         bytes.push(RECEIVER_INFO_FORMAT);
@@ -966,7 +1468,7 @@ impl ReceiverInfo {
 
     /// A format 2 description: the public cell, no site.
     pub fn sign_public(
-        identity: &Identity,
+        identity: &impl Signs,
         content: &PublicInfoContent,
     ) -> Result<Self, WireError> {
         crate::signed::Check::check(content)?;
@@ -1001,6 +1503,11 @@ impl ReceiverInfo {
         }
         PublicKey::from_slice(&bytes[1..1 + KEY_LEN])?;
         Ok(Self { bytes })
+    }
+
+    /// What it allocates of its own: its bytes' capacity.
+    pub fn allocated(&self) -> usize {
+        crate::footprint::vec::<u8>(self.bytes.capacity())
     }
 
     pub fn as_bytes(&self) -> &[u8] {
@@ -1178,6 +1685,17 @@ pub(crate) fn split_signature(bytes: &[u8]) -> Result<(&[u8], [u8; SIGNATURE_LEN
     Ok((&bytes[..at], signature))
 }
 
+/// The big-endian `u64` at `at`, or `Truncated` when the bytes end before it.
+pub(crate) fn u64_from(bytes: &[u8], at: usize) -> Result<u64, WireError> {
+    let field = bytes.get(at..at + 8).ok_or(WireError::Truncated {
+        needed: at + 8,
+        had: bytes.len(),
+    })?;
+    let mut array = [0; 8];
+    array.copy_from_slice(field);
+    Ok(u64::from_be_bytes(array))
+}
+
 pub(crate) fn u64_at(bytes: &[u8], at: usize) -> u64 {
     let mut array = [0; 8];
     array.copy_from_slice(&bytes[at..at + 8]);
@@ -1186,8 +1704,60 @@ pub(crate) fn u64_at(bytes: &[u8], at: usize) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::disallowed_methods, reason = "a test's scripted readings")]
     use super::*;
     use crate::beast::FrameKind;
+    use crate::key::Identity;
+
+    /// Every format this build writes keeps its signed wall clock at [`WALL_MS_OFFSET`]: read
+    /// there, it is the clock its content decodes to, for each of `BATCH_FORMATS`.
+    #[test]
+    fn every_format_keeps_its_wall_clock_at_the_protocols_offset() -> Result<(), WireError> {
+        let feeder = Identity::generate()?;
+        let acars = Observation {
+            format: format::ACARS_JSON,
+            timestamp: 1,
+            signal: 0,
+            data: br#"{"icao":"A1B2C3"}"#.to_vec(),
+        };
+        let mode_s = Observation {
+            format: format::MODE_S_LONG,
+            timestamp: 12_000,
+            signal: 80,
+            data: vec![0x8d; 14],
+        };
+        let relay = Identity::from_seed([8; 32]);
+        let anchors = [crate::anchor::Anchor::sign(&relay, 1_800_000_000_000)];
+        let mut seen = Vec::new();
+        for (anchored, observation, codec) in [
+            (false, mode_s.clone(), Codec::Plain),
+            (false, mode_s.clone(), Codec::Deflate),
+            (false, acars.clone(), Codec::Deflate),
+            (true, mode_s.clone(), Codec::Plain),
+            (true, mode_s, Codec::Deflate),
+            (true, acars, Codec::Deflate),
+        ] {
+            let content = BatchContent {
+                boot_id: 7,
+                sequence: 9,
+                counter_epoch: 0xdead_beef,
+                wall_ms: 1_800_000_000_123,
+                dropped: 3,
+                previous: [5; 32],
+                observations: vec![observation],
+            };
+            let batch = if anchored {
+                Batch::sign_anchored(&feeder, &content, codec, &anchors)?
+            } else {
+                Batch::sign_with(&feeder, &content, codec)?
+            };
+            assert_eq!(batch.wall_ms()?, content.wall_ms);
+            assert_eq!(batch.content()?.wall_ms, content.wall_ms);
+            seen.push(batch.format());
+        }
+        assert_eq!(seen, BATCH_FORMATS);
+        Ok(())
+    }
 
     /// ACARS-family lines ride a batch of their own format, whatever the codec, and read back
     /// byte for byte; a client's view of one is the line. A batch of formats 1 and 2, the only
@@ -1227,8 +1797,12 @@ mod tests {
             assert_eq!(read, lines);
             let view = crate::decoded::ClientObsView::from(ObsView::from(&read.observations[1]));
             assert_eq!(view.to_acars_line().map(str::as_bytes), Some(&line[..]));
-            let decoded = crate::decoded::Decoded::from_verified(batch, 0, 0)
-                .map_err(|undecodable| undecodable.error)?;
+            let decoded = crate::decoded::Decoded::from_verified(
+                batch,
+                crate::clocks::recorded::aligned(0),
+                0,
+            )
+            .map_err(|undecodable| undecodable.error)?;
             assert_eq!(decoded.receptions(), 2);
         }
         // Written beside anything else, refused.
@@ -1268,7 +1842,14 @@ mod tests {
         ] {
             forged.verify()?;
             assert!(forged.content().is_err());
-            assert!(crate::decoded::Decoded::from_verified(forged, 0, 0).is_err());
+            assert!(
+                crate::decoded::Decoded::from_verified(
+                    forged,
+                    crate::clocks::recorded::aligned(0),
+                    0
+                )
+                .is_err()
+            );
         }
         Ok(())
     }
@@ -1441,7 +2022,8 @@ mod tests {
         assert!(refused(
             bomb.content().map(|content| content.observations.len())
         ));
-        let decoded = crate::Decoded::from_verified(bomb, 0, 0).map(|decoded| decoded.receptions());
+        let decoded = crate::Decoded::from_verified(bomb, crate::clocks::recorded::aligned(0), 0)
+            .map(|decoded| decoded.receptions());
         assert!(refused(decoded.map_err(|undecodable| undecodable.error)));
         // Stated within the rule, inflating to far more: stopped at the stated length.
         let stated = MAX_INFLATION * stream.len();
@@ -1454,6 +2036,42 @@ mod tests {
                 ..
             })
         ));
+        Ok(())
+    }
+
+    /// A batch encoded before its chain link and anchors are known (`EncodedBatch`, what a feeder
+    /// holds while it waits for an anchor) allocates no more than its receptions' wire bytes and
+    /// signs into the batch its content signs into with that link, reading back as that content.
+    #[test]
+    fn an_encoded_batch_costs_its_wire_bytes_and_signs_as_its_content() -> Result<(), WireError> {
+        let feeder = Identity::generate()?;
+        let anchors = [crate::anchor::Anchor::sign(
+            &Identity::from_seed([5; 32]),
+            1_791_220_000_000,
+        )];
+        // Receptions alike compress; the content's own do not.
+        let alike = BatchContent {
+            observations: receptions(2_000, format::MODE_S_LONG, 1_000, &[0x8d; 14]),
+            ..content()?
+        };
+        for content in [content()?, alike] {
+            let plain = plain_of(&content.observations)?;
+            for codec in [Codec::Plain, Codec::Deflate] {
+                let encoded = EncodedBatch::encode(
+                    &BatchContent {
+                        previous: [0; 32],
+                        ..content.clone()
+                    },
+                    codec,
+                )?;
+                assert!(encoded.allocated() <= plain.len(), "{codec:?}");
+                assert_eq!(encoded.sequence(), content.sequence);
+                let signed = Batch::sign_encoded(&feeder, &encoded, content.previous, &anchors)?;
+                signed.verify()?;
+                assert_eq!(signed.content()?, content);
+                assert_eq!(signed.anchors()?, anchors.to_vec());
+            }
+        }
         Ok(())
     }
 
@@ -1507,6 +2125,54 @@ mod tests {
         assert_eq!(back.receiver()?, identity.public());
         assert_eq!((back.boot_id(), back.sequence()), (0xfeed, 7));
         assert_eq!(back.hash(), batch.hash());
+        Ok(())
+    }
+
+    /// An anchored batch, plain or deflated, with none, one or two anchors, reads back the same
+    /// content, counts and anchors after its bytes are read again; its anchors are in its signed
+    /// bytes, so a changed anchor fails the batch's signature; and more than two are refused.
+    #[test]
+    fn an_anchored_batch_carries_its_anchors_in_its_signed_bytes() -> Result<(), WireError> {
+        let feeder = Identity::generate()?;
+        let relays = [Identity::from_seed([1; 32]), Identity::from_seed([2; 32])];
+        let all = [
+            crate::anchor::Anchor::sign(&relays[0], 1_800_000_000_000),
+            crate::anchor::Anchor::sign(&relays[1], 1_800_000_000_500),
+        ];
+        for codec in [Codec::Plain, Codec::Deflate] {
+            let plain = Batch::sign_with(&feeder, &content()?, codec)?;
+            assert!(!plain.is_anchored());
+            assert!(plain.anchors()?.is_empty());
+            for count in 0..=MAX_ANCHORS {
+                let anchors = &all[..count];
+                let batch = Batch::sign_anchored(&feeder, &content()?, codec, anchors)?;
+                assert!(batch.is_anchored());
+                assert_eq!(base_format(batch.format()), plain.format());
+                let back = Batch::from_bytes(batch.as_bytes().to_vec())?;
+                back.verify()?;
+                assert_eq!(back.content()?, content()?);
+                assert_eq!(back.anchors()?, anchors);
+                assert_eq!(back.wall_ms()?, content()?.wall_ms);
+                assert_eq!(back.inflated_len()?, plain.inflated_len()?);
+                assert_eq!(back.receptions()?, plain.receptions()?);
+                assert_eq!(
+                    batch.as_bytes().len(),
+                    plain.as_bytes().len() + 1 + count * crate::anchor::ANCHOR_LEN
+                );
+                for anchor in back.anchors()? {
+                    anchor.verify()?;
+                }
+                if count > 0 {
+                    // The anchor's reading, moved by a second: the batch no longer verifies.
+                    let mut bytes = batch.as_bytes().to_vec();
+                    bytes[ANCHORS_OFFSET + 1 + KEY_LEN + 6] ^= 1;
+                    let moved = Batch::from_bytes(bytes);
+                    assert!(moved.is_err() || moved.is_ok_and(|moved| moved.verify().is_err()));
+                }
+            }
+        }
+        let three = [all[0], all[1], all[0]];
+        assert!(Batch::sign_anchored(&feeder, &content()?, Codec::Plain, &three).is_err());
         Ok(())
     }
 
@@ -1711,5 +2377,101 @@ mod tests {
         assert_eq!(Clock::from_name("radarcape_gps"), Some(Clock::RadarcapeGps));
         assert_eq!(Clock::from_name("sdr"), None);
         assert_eq!(Clock::from_byte(77), Clock::Other(77));
+    }
+
+    /// A batch's wanted receptions read from its signed bytes (`Batch::wanted_receptions`) are
+    /// exactly those its decode holds, plain or compressed, whatever its receptions: a
+    /// compressed one's observations several scan pieces long, and messages that straddle a
+    /// piece's end, a message longer than a Mode S one, Mode A/C and identification among
+    /// them. A receiver's ceiling then charges a batch it never decodes as one it does.
+    #[test]
+    fn a_batchs_wanted_receptions_are_read_from_its_bytes_as_its_decode_holds_them()
+    -> Result<(), WireError> {
+        let feeder = Identity::generate()?;
+        let mut observations = Vec::new();
+        for n in 0..600_u32 {
+            let (format, data) = match n % 5 {
+                // An all-call reply (DF11), and a surveillance reply (DF4): wanted.
+                0 => (
+                    format::MODE_S_SHORT,
+                    vec![0x5d, n as u8, 0x1c, 0x2a, 0, 0, 0],
+                ),
+                1 => (format::MODE_S_SHORT, vec![0x20, 0, n as u8, 0x18, 7, 7, 7]),
+                // Mode A/C, never wanted.
+                2 => (format::MODE_AC, vec![n as u8, 2]),
+                // An identification squitter (DF17, type code 4), never wanted.
+                3 => (
+                    format::MODE_S_LONG,
+                    vec![
+                        0x8d, 0x48, 0x40, 0xd6, 0x20, 0x2c, 0xc3, 0x71, 0xc3, 0x2c, 0xe0, 0x57,
+                        0x60, 0x98,
+                    ],
+                ),
+                // Longer than any Mode S message: never wanted, whatever it begins with.
+                _ => (format::MODE_S_LONG, vec![0x5d; 23 + n as usize % 50]),
+            };
+            observations.push(Observation {
+                format,
+                timestamp: u64::from(n),
+                signal: 9,
+                data,
+            });
+        }
+        let content = BatchContent {
+            boot_id: 1,
+            sequence: 2,
+            counter_epoch: 0,
+            wall_ms: 1_800_000_000_000,
+            dropped: 0,
+            previous: [0; 32],
+            observations,
+        };
+        let wanted = content
+            .observations
+            .iter()
+            .filter(|observation| {
+                crate::modes::wanted_reception(observation.format, &observation.data)
+            })
+            .count();
+        assert!(wanted > 0 && wanted < content.observations.len());
+        for codec in [Codec::Plain, Codec::Deflate] {
+            let batch = Batch::sign_with(&feeder, &content, codec)?;
+            assert!(batch.inflated_len()? > 3 * SCAN_PIECE, "{codec:?}");
+            assert_eq!(
+                base_format(batch.format()) == BATCH_FORMAT,
+                matches!(codec, Codec::Plain),
+                "{codec:?}"
+            );
+            assert_eq!(batch.wanted_receptions()?, wanted, "{codec:?}");
+            // Inflated once, the same count, and the decode read from those bytes is the batch's.
+            let inflated = batch.inflated()?;
+            assert_eq!(inflated.wanted_receptions()?, wanted, "{codec:?}");
+            let at = crate::clocks::recorded::aligned(0);
+            let once = crate::decoded::Decoded::from_inflated_owned(
+                batch.clone(),
+                Some(&inflated),
+                (at, true),
+                0,
+                |_| Some(Box::new(()) as crate::decoded::Owner),
+                |_| {},
+            )
+            .ok()
+            .map(|decoded| decoded.observations().to_vec());
+            let again = crate::decoded::Decoded::from_verified(batch.clone(), at, 0)
+                .ok()
+                .map(|decoded| decoded.observations().to_vec());
+            assert!(once.is_some(), "{codec:?}");
+            assert_eq!(once, again, "{codec:?}");
+            let decoded = batch
+                .content()?
+                .observations
+                .iter()
+                .filter(|observation| {
+                    crate::modes::wanted_reception(observation.format, &observation.data)
+                })
+                .count();
+            assert_eq!(decoded, wanted, "{codec:?}");
+        }
+        Ok(())
     }
 }

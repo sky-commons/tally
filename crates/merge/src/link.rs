@@ -18,7 +18,7 @@ use std::time::Duration;
 use tally_wire::backoff::Backoff;
 use tally_wire::noise;
 use tally_wire::{
-    ClientRecord, EvidenceBundle, FirehoseCredential, Identity, PublicKey, Record, RelayAddress,
+    ClientRecord, EvidenceBundle, FirehoseCredential, NoiseKey, PublicKey, Record, RelayAddress,
     Role, Streams, WireError,
 };
 use tokio::net::TcpStream;
@@ -31,13 +31,12 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// A session that stayed up this long worked: the wait after it starts from the shortest again.
 const HEALTHY_SESSION: Duration = Duration::from_secs(60);
 
-/// The streams a consumer merging MLAT asks for: final and provisional positions (a provisional
-/// is served only while it is later than every final one, `Track::served`), clock models (a
-/// client is sent their summaries), and the relays' signed feeder figures, which a client serving
-/// feeders reads beside them (the merge itself ignores them).
+/// The streams a consumer merging MLAT asks for: positions (MLAT fixes, each published as soon as
+/// it can be solved and again as more receptions arrive), clock models (a client is sent their
+/// summaries), and the relays' signed feeder figures, which a client serving feeders reads beside
+/// them (the merge itself ignores them).
 pub fn streams() -> Streams {
     Streams::POSITIONS
-        .with(Streams::PROVISIONAL)
         .with(Streams::CLOCK_MODELS)
         .with(Streams::FEEDER_FIGURES)
 }
@@ -49,11 +48,9 @@ pub fn wanted(record: Record) -> Option<ClientRecord> {
     matches!(
         record,
         ClientRecord::Positions(_)
-            | ClientRecord::Provisional(_)
             | ClientRecord::ClockModel(_)
             | ClientRecord::FaultProof(_)
             | ClientRecord::WorldPositions(_)
-            | ClientRecord::WorldPrecise(_)
             // A relay's signed feeder figures, for a consumer that asks for them (the merge
             // ignores them).
             | ClientRecord::FeederFigures(_)
@@ -140,7 +137,7 @@ impl Vouching {
 /// free tier). Returns when `inbound` closes.
 pub async fn subscribe(
     relay: RelayAddress,
-    identity: Identity,
+    identity: NoiseKey,
     streams: Streams,
     inbound: mpsc::Sender<ClientRecord>,
 ) {
@@ -151,7 +148,7 @@ pub async fn subscribe(
 /// changes), and taking a fresh pair when the relay is the one `vouching` is linked to.
 pub async fn subscribe_vouched(
     relay: RelayAddress,
-    identity: Identity,
+    identity: NoiseKey,
     streams: Streams,
     inbound: mpsc::Sender<ClientRecord>,
     vouching: Vouching,
@@ -177,7 +174,7 @@ pub async fn subscribe_vouched(
 /// One session; `Ok` with the wait the relay asked for when it ended the session itself.
 async fn session(
     relay: &RelayAddress,
-    identity: &Identity,
+    identity: &NoiseKey,
     streams: Streams,
     inbound: &mpsc::Sender<ClientRecord>,
     vouching: &Vouching,
@@ -282,7 +279,7 @@ mod tests {
     use tally_relay::egress::Cap;
     use tally_relay::hub::Hub;
     use tally_wire::batch::{Clock, PublicInfoContent};
-    use tally_wire::{Identity, ReceiverInfo, RelayAddress, Streams};
+    use tally_wire::{Identity, NoiseKey, ReceiverInfo, RelayAddress, Streams};
     use tokio::net::TcpListener;
     use tokio::sync::mpsc;
 
@@ -292,20 +289,22 @@ mod tests {
         error.to_string()
     }
 
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "a test's records signed by its own host clock"
+    )]
     fn now_ms() -> u64 {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |since| since.as_millis() as u64)
     }
 
-    async fn relay(identity: &Identity, hub: Arc<Hub>) -> Result<RelayAddress, String> {
+    async fn relay(identity: Identity, hub: Arc<Hub>) -> Result<RelayAddress, String> {
         let listener = TcpListener::bind("127.0.0.1:0").await.map_err(text)?;
         let address = listener.local_addr().map_err(text)?.to_string();
-        tokio::spawn(tally_relay::serve(listener, vec![identity.clone()], hub));
-        Ok(RelayAddress {
-            key: identity.public(),
-            address,
-        })
+        let key = identity.public();
+        tokio::spawn(tally_relay::serve(listener, vec![identity], hub));
+        Ok(RelayAddress { key, address })
     }
 
     /// Polls `done` every 20 ms until it holds, failing only on a hang (120 s), never on how fast
@@ -321,15 +320,21 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "a stamp a synced relay would have taken, given back"
+    )]
     async fn a_client_its_relay_vouches_for_reads_on_that_relays_credit_and_others_read_free()
     -> Result<(), String> {
         let (linked, serving) = (
             Identity::generate().map_err(text)?,
             Identity::generate().map_err(text)?,
         );
+        let (linked_key, serving_key) = (linked.public(), serving.public());
+        // The clients' keys only handshake: a subscriber signs nothing.
         let (client, stranger) = (
-            Identity::generate().map_err(text)?,
-            Identity::generate().map_err(text)?,
+            NoiseKey::of(Identity::generate().map_err(text)?),
+            NoiseKey::of(Identity::generate().map_err(text)?),
         );
         // The linked relay hosts ten feeders and vouches for the client; the serving relay has
         // corroborated those feeders first-hand, and rations its clients.
@@ -360,20 +365,36 @@ mod tests {
             .map_err(text)?;
             // Evidence cites feeders by reference: the serving relay credits one only when its own
             // copy of the description (gossiped to it in the network) resolves it.
-            serving_hub.network().credit.described(info.clone(), now);
-            linked_hub.network().credit.described(info, now);
+            // Judged as a synced relay judges, whatever this host's kernel says of its clock.
+            let judged = |hub: &Hub| {
+                tally_relay::strikes::Now::from(tally_relay::ingest::Stamp::recorded(
+                    0,
+                    0,
+                    hub.now().ms(),
+                    0,
+                    true,
+                ))
+            };
             serving_hub
                 .network()
                 .credit
-                .corroborate_receiver(feeder.public(), now);
+                .described(info.clone(), judged(&serving_hub));
+            linked_hub
+                .network()
+                .credit
+                .described(info, judged(&linked_hub));
+            serving_hub
+                .network()
+                .credit
+                .corroborate_receiver(feeder.public(), serving_hub.stamp_now());
         }
-        let linked_at = relay(&linked, Arc::clone(&linked_hub)).await?;
-        let serving_at = relay(&serving, Arc::clone(&serving_hub)).await?;
+        let linked_at = relay(linked, Arc::clone(&linked_hub)).await?;
+        let serving_at = relay(serving, Arc::clone(&serving_hub)).await?;
         let (inbound, mut records) = mpsc::channel(1_024);
         tokio::spawn(async move { while records.recv().await.is_some() {} });
         let streams = Streams::POSITIONS;
         // The client reads both relays, linked to the one that vouches for it.
-        let vouching = Vouching::linked_to(linked.public());
+        let vouching = Vouching::linked_to(linked_key);
         for at in [&linked_at, &serving_at] {
             tokio::spawn(subscribe_vouched(
                 at.clone(),
@@ -386,25 +407,27 @@ mod tests {
         until("the linked relay vouched", || vouching.held().is_some()).await?;
         let credit = &serving_hub.network().credit;
         until("the serving relay lifted the client", || {
-            credit.allowance(&client.public(), now_ms()).bytes_per_sec
+            credit
+                .allowance(&client.public(), serving_hub.now())
+                .bytes_per_sec
                 > Allowance::FREE.bytes_per_sec
         })
         .await?;
         // One instant for both: what a relay has earned moves with the clock, so two readings a
         // millisecond apart can differ by a byte a second.
-        let at = now_ms();
+        let at = serving_hub.now();
         let lifted = credit.allowance(&client.public(), at);
-        assert_eq!(lifted.bytes_per_sec, credit.earned(&linked.public(), at));
+        assert_eq!(lifted.bytes_per_sec, credit.earned(&linked_key, at));
         assert!(lifted.world && lifted.regions > Allowance::FREE.regions);
         // A client with no linked relay, and one linked to a relay other than the one that signs
         // for it, read the free tier.
         tokio::spawn(subscribe(
             serving_at.clone(),
-            Identity::generate().map_err(text)?,
+            NoiseKey::of(Identity::generate().map_err(text)?),
             streams,
             inbound.clone(),
         ));
-        let elsewhere = Vouching::linked_to(serving.public());
+        let elsewhere = Vouching::linked_to(serving_key);
         tokio::spawn(subscribe_vouched(
             linked_at,
             stranger.clone(),
@@ -426,7 +449,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(500)).await;
         assert!(elsewhere.held().is_none());
         assert_eq!(
-            credit.allowance(&stranger.public(), now_ms()),
+            credit.allowance(&stranger.public(), serving_hub.now()),
             Allowance::FREE
         );
         Ok(())

@@ -31,6 +31,10 @@
 //! capped, and every request, header read and upstream read has a deadline; a stream instead is
 //! held to a few open at once per client, and lasts as long as its connection.
 
+// It reaches keys (`tally_wire::Identity`): no `unsafe` code at all, forbidden, so no module
+// can allow it.
+#![forbid(unsafe_code)]
+
 pub mod area;
 pub mod config;
 pub mod feeders;
@@ -104,6 +108,9 @@ pub struct Settings {
     /// A checkout of VRS standing data (its `routes/` and `airports/`), which the routes answer
     /// from; none answers them `404`.
     pub routes: Option<PathBuf>,
+    /// The clock signed times are judged by: the host's, bounded by its ClockBound
+    /// (`mlat::Clock::system`); a test's states its bound (`mlat::Clock::host_stated`).
+    pub clock: mlat::Clock,
 }
 
 impl Settings {
@@ -121,6 +128,7 @@ impl Settings {
             stream_heartbeat: stream::HEARTBEAT,
             mlat: mlat::Settings::default(),
             routes: None,
+            clock: mlat::Clock::system(),
         }
     }
 }
@@ -214,7 +222,7 @@ impl App {
         let Ok(mut ledger) = self.feeders.lock() else {
             return;
         };
-        let board = ledger.board(routes::wall_ms());
+        let board = ledger.board(self.settings.clock.now().judged());
         drop(ledger);
         self.snapshot.set_board(board, Instant::now());
     }
@@ -230,6 +238,7 @@ pub async fn serve(listener: TcpListener, settings: Settings, identity: tally_wi
     }
     if let Err(error) = mlat::start(
         &app.settings.mlat,
+        app.settings.clock.clone(),
         identity,
         Arc::clone(&app.mlat),
         Arc::clone(&app.feeders),

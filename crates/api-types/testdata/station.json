@@ -9,6 +9,7 @@
   "messages_per_sec": 42.25,
   "batches": 9001,
   "gaps": 3,
+  "late_batches": 7,
   "location": { "lat": 37.4884, "lon": -122.2529 },
   "software": "tally-feed 0.3.1"
 }
