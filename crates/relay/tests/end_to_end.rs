@@ -1371,32 +1371,35 @@ async fn a_relays_own_mlat_reaches_the_subscribers_of_each_stream() -> Result {
     );
     mlat.publish(records.clone());
 
-    // Every client form, checked; reading until each is in.
-    let heard = every_form(&mut fixes, "every client form", tagged).await?;
-    assert_client_safe(&heard);
+    // The three readers read together: a reader whose queue falls `fanout::BEHIND_MS` behind what
+    // the relay offers is let go, and the relay link read only after both clients had been read
+    // was let go for age on a slow host (CI's runners).
     let mut summaries_heard = 0;
-    let heard = until(&mut models, "every model summary", |record| {
-        summaries_heard += usize::from(matches!(record, Record::ClientClockModel(_)));
-        summaries_heard == summaries
-    })
-    .await?;
-    assert_client_safe(&heard);
+    let mut missing = raw;
+    let (client_forms, model_summaries, relay_link) = tokio::try_join!(
+        // Every client form, checked; reading until each is in.
+        every_form(&mut fixes, "every client form", tagged),
+        until(&mut models, "every model summary", |record| {
+            summaries_heard += usize::from(matches!(record, Record::ClientClockModel(_)));
+            summaries_heard == summaries
+        }),
+        // A relay link is handed the raw fixes and the full models.
+        relay_until(&relays, "every raw fix", |record| {
+            if let Record::Positions(positions) = record {
+                missing.remove(positions.as_bytes());
+            }
+            missing.is_empty()
+        }),
+    )?;
+    assert_client_safe(&client_forms);
+    assert_client_safe(&model_summaries);
     assert!(
-        !heard
+        !model_summaries
             .iter()
             .any(|record| matches!(record, Record::Positions(_)))
     );
-    // A relay link is handed the raw fixes and the full models.
-    let mut missing = raw;
-    let heard = relay_until(&relays, "every raw fix", |record| {
-        if let Record::Positions(positions) = record {
-            missing.remove(positions.as_bytes());
-        }
-        missing.is_empty()
-    })
-    .await?;
     assert!(
-        heard
+        relay_link
             .iter()
             .any(|record| matches!(record, Record::ClockModel(_)))
     );
