@@ -1,178 +1,191 @@
 //! Receiver standing at this relay (RFC-0174 §2.12): a [`Book`] of it, kept by the rule
 //! `tally_mlat_solver::standing` states (the same for every relay and client), from the public
-//! signed records the relay forwards: final and provisional positions ([`Standing::positions`]),
-//! under the clock models the relay's one store holds (`models::Models`). A relay that reads the
-//! same records as a client holds the same standing as it.
+//! signed records the relay forwards: fixes ([`Standing::positions`]), under the clock models the
+//! relay's one store holds (`models::Models`). A relay that reads the same records as a client
+//! holds the same standing as it.
 //!
-//! It holds no raw of its own: it reads the hosted MLAT engine's sealed bins
-//! ([`Standing::read_bins`], one store of raw per relay, RFC-0181 §5), so raw later than the
-//! engine's settling is missing for both alike. It is scoped to the areas this relay holds raw for
-//! (the hosted MLAT's areas and their border band, [`Standing::set_areas`]): a relay cannot hold
-//! the world's raw, and relays are regional. A receiver outside them, or any receiver of a relay
-//! that hosts no MLAT, has no standing here, not a bad one: it is unknown ([`Standing::of`] says
-//! `None`).
+//! It holds no raw of its own: it reads the hosted MLAT engine's arrived raw ([`Standing::read_raw`],
+//! one store of raw per relay, RFC-0181 §5, through [`Raw`]), so a reception the engine does not
+//! hold is missing for both alike. The engine holds raw for `arrived::HELD_MS` (32.5 s) after it
+//! arrived, and a transmission is settled `standing::SETTLE` (`budget::FIX_ARRIVED`, 32.5 s) after
+//! it was sent, so every reception of it that arrived is still held when it is settled. It is
+//! scoped to the areas this relay holds raw for (the hosted MLAT's areas and their border band,
+//! [`Standing::set_areas`]): a relay cannot hold the world's raw, and relays are regional. A
+//! receiver outside them, or any receiver of a relay that hosts no MLAT, has no standing here, not
+//! a bad one: it is unknown ([`Standing::of`] says `None`).
 //!
 //! It holds no model either. Positions are taken as the hub sends them (`Hub::send_positions`),
 //! once every model they cite went out before them and is in the relay's store, or they waited
-//! their longest (`hub::AWAITING_MS`): a solution whose model is not held then is dropped and
-//! counted (`StandingReport::unmodelled`), never waited for again here. Before, standing assembled
-//! and decoded every model a second time, held each in a room of its own, and held solutions in a
-//! waiting room of its own for models the hub had already waited for.
+//! their longest (`hub::AWAITING_MS`): a fix whose model is not held then is dropped and counted
+//! (`StandingReport::unmodelled`), never waited for again here.
 //!
-//! It weighs which of a transmission's solutions stands (`Book::settle`, by `decide`) and which
-//! receivers have standing (`credit` corroborates them). Gating a receiver out of the solver
-//! (`ReceiverStanding::gated`) is not wired: the verifier refuses a solution that omits a
-//! reception that fits (`Failure::Omitted`), so a relay that gated alone would publish solutions
-//! every client refutes. It needs the gate in the specification, on both sides.
+//! It weighs which of a transmission's fixes stands (`Book::settle`, by `decide`) and which
+//! receivers have standing (`credit` corroborates them). A fix that considered more than a
+//! consistent one and disagrees with it supersedes it only when verified against the raw and of
+//! more standing (`Candidate::verified`, RFC-0171 §3.8.1 as amended 2026-10-24, decision D6).
+//! The book asks the hosted engine's verifier over its raw (`Raw::verify`), at most
+//! [`VERIFIES_PER_ENGINE_PER_SEC`] of each publishing engine's fixes a second (decision D6), so an
+//! engine that publishes disagreeing supersets in a flood costs the relay a bounded share of its
+//! verifying, never all of it; one past the cap is not judged, counted, and stays contested, as it
+//! does for a client. Gating a receiver out of the solver
+//! (`ReceiverStanding::gated`) is not wired: the verifier refuses a fix that omits a considered
+//! reception that fits (`Failure::Omitted`), so a relay that gated alone would publish fixes every
+//! client refutes. It needs the gate in the specification, on both sides.
 
-use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
 use std::time::Duration;
 use tally_wire::clocks::Judged;
 
 use tally_mlat::area::Band;
+use tally_mlat_solver::ObservationId;
 use tally_mlat_solver::gate::{self, Gate, Urgency};
-use tally_mlat_solver::held::SealedBins;
-use tally_mlat_solver::standing::{Book, ReceiverStanding, Solved, heard_in};
+use tally_mlat_solver::standing::{Book, ReceiverStanding, Solved};
 use tally_wire::{Positions, PublicKey, Region, Regions};
 
 use crate::budget::{Charge, Gauge};
-use crate::models::{Model, Models};
+use crate::models::{Cited, Models};
 
 /// The work of settling under one hold of the book (`Book::settle_up_to`: each transmission's
-/// receptions weighed under each of its finals, and once more), at least one transmission: what
-/// anyone asking of the book (`Standing::agreeing`, the solutions taken in) waits behind at most,
-/// however many transmissions fall due at once. Some five hundred transmissions of an area's three
-/// engines' finals over four receptions each.
+/// receptions weighed under each of its fixes, and once more), at least one transmission: what
+/// anyone asking of the book (`Standing::agreeing`, the positions the hub hands it) waits behind
+/// at most, however many transmissions fall due at once. Some five hundred transmissions of an
+/// area's three engines' fixes over four receptions each.
 pub const SETTLE_PIECE: usize = 8_192;
-/// Solutions taken from the hand-off into the book under one hold of it.
-pub const ADD_PIECE: usize = 1_024;
 
-// What an honest load can make standing hold at most, for each MLAT seat, derived from the
-// protocol's own bounds (RFC-0181, "Sizing", "What MLAT's tables hold"). Nothing here is a
-// guess at a rate: each figure is a bound the code keeps, and each table is sized from them.
+// What an honest load can make standing hold at most, for each MLAT seat (RFC-0181, "Sizing",
+// "What MLAT's tables hold"). The book is one pool for the relay, as the arrived pool is: it is
+// planned at the kept rate the load test measured (`arrived::Rates::MEASURED`), and every engine is still held to
+// its own share of it (`BookCaps::source_share`), so a receiver at its ceiling for a while takes
+// the room of others below the mean and never another engine's.
 //
-// A seat's raw keeps at most `held::KEPT_CEILING_PER_S` receptions a second, so no engine solves
-// more of them. An aircraft is solved under one tile (`tile::assign`, the same for every engine),
-// fitted by the relays of the area its centre is in (`MLAT_RELAYS_PER_AREA`), each publishing a
-// final and a provisional, and the book keeps one of each kind for each engine (`Book::add`).
-// A solution cites at least `MIN_RECEIVERS_WITH_ALTITUDE` receptions, each a different seat's
-// (standing takes only the solutions of tiles its areas own, whose footprint is in its band,
-// whose receivers' raw it holds: `Standing::set_areas`), so a seat's share of the transmissions
-// solved is its kept receptions over that. The relays of an area hold the same band's raw and
-// seat the same receivers (RFC-0174 §2.3); a peer seating receivers this relay does not would
-// bring more, and is not planned.
+// A transmission is solved by the relays of the area most of its hearers are in
+// (`tally_mlat::area::owner`, `MLAT_RELAYS_PER_AREA` of them), each publishing its fix of each
+// transmission (its complete fix once its raw has come takes its own's place, `Book::add`), under the
+// models of the areas its used hearers are in. Only one transmission an aircraft a slot is solved
+// (`tally_mlat_solver::backoff`), so the book is planned at the fixes published and the receptions
+// they considered for each seat (`backoff::Published::MEASURED`, at world density, the dearest a
+// seat), never at every kept reception (standing takes only the fixes that cite a model of one of
+// its areas and none of an area outside their band, so whose receivers' raw it holds:
+// `Standing::set_areas`). The relays of an area hold the same band's raw and seat the same
+// receivers (RFC-0174 §2.3); a peer seating receivers this relay does not would bring more, and is
+// not planned.
 
-/// The receptions a seat's raw keeps a second at most (`held::KEPT_CEILING_PER_S`).
-pub const KEPT_PER_SEAT_PER_SEC: usize = tally_mlat_solver::held::KEPT_CEILING_PER_S;
-/// The fewest receptions a solution cites (`solve::MIN_RECEIVERS_WITH_ALTITUDE`).
+/// The fewest receptions a fix cites (`solve::MIN_RECEIVERS_WITH_ALTITUDE`).
 pub const CITED_LEAST: usize = tally_mlat_solver::solve::MIN_RECEIVERS_WITH_ALTITUDE;
-/// A seat's share of the transmissions solved a second at most: its kept receptions, each in a
-/// transmission of [`CITED_LEAST`] seats' at least.
-pub const TRANSMISSIONS_PER_SEAT_PER_SEC: usize = KEPT_PER_SEAT_PER_SEC.div_ceil(CITED_LEAST);
-/// The engines that solve a transmission: the relays of the area its tile's centre is in.
+/// What a seat's engines solve and publish, a thousand seconds of the seat's at a time
+/// (`backoff::Published::MEASURED`): what every table sized by the fixes is planned at.
+pub const PUBLISHED: tally_mlat_solver::backoff::Published =
+    tally_mlat_solver::backoff::Published::MEASURED;
+/// The fixes an engine publishes of one transmission, at most: its fast fix when the transmission
+/// is first chosen, and its complete one once its raw has come or its set closes, if it grew
+/// (`tally_mlat::fix::again`, held by
+/// `a_transmission_is_solved_twice_at_most`: no reception is considered by more than two; the
+/// engine's seed 31 runs publish 1.5 to 1.7 a transmission, 2026-10-26). The book holds one fix of
+/// each engine of a transmission (`standing::Book::add`), so the second costs it no room; it costs
+/// what carries and decodes it (`consistency::POSITIONS_BYTES_PER_SEAT_PER_SEC`) and what its
+/// engine remembers it solved (`mlat_host::SOLVED_BYTES_PER_SEAT`). Before, five superseded fixes
+/// were planned for every one that stood, from before one transmission a slot was solved.
+pub const FIXES_PER_TRANSMISSION: usize = 2;
+/// The engines that solve a transmission: the relays of the area most of its hearers are in.
 pub const ENGINES_PER_TRANSMISSION: usize = tally_wire::rendezvous::MLAT_RELAYS_PER_AREA;
-/// The solutions of a transmission the book holds at most: each engine's final and provisional
-/// (`standing::SOLUTIONS_MOST`).
-pub const SOLUTIONS_PER_TRANSMISSION: usize = tally_mlat_solver::standing::SOLUTIONS_MOST;
-/// The longest message a solution carries: a long Mode S reply.
-pub const MESSAGE_BYTES: usize = tally_wire::modes::LONG;
 
-/// How long the book holds a transmission: until it is settled (`standing::SETTLE`), and the
-/// second a solution may come before its transmission's own time is past.
+/// How long the book holds a transmission: until it is settled (`standing::SETTLE`,
+/// `budget::FIX_ARRIVED`: every reader's fix of it has arrived), and the second a fix may come
+/// before its transmission's own time is past. Before, the windowed finals' 110 s.
 pub const PENDING_SECONDS: usize = tally_mlat_solver::standing::SETTLE
     .span::<Judged>()
     .ms()
     .div_ceil(1_000) as usize
     + 1;
-/// A window step: the engine fits each tile's model once a stride of bins
-/// (`scope::STRIDE` of `scope::GRID_MS`), and publishes the step's records together.
-pub const STEP_SECONDS: usize =
-    (tally_mlat_solver::scope::STRIDE as u64 * tally_mlat_solver::scope::GRID_MS / 1_000) as usize;
-/// The seconds of solutions the hand-off holds for standing's thread, of each engine: a window
-/// step's finals, published at once (every engine of an area steps on the same grid), and a second
-/// of provisionals, published as they are solved. Standing's thread takes the hand-off in before
-/// it settles anything (`Standing::work_once`).
-pub const HANDED_SECONDS: usize = STEP_SECONDS + 1;
 /// The seconds of settled receptions the book remembers: the slack past their due time
-/// (`standing::SETTLED_SLACK_MS`), and the grid bin that goes whole.
+/// (`standing::SETTLED_SLACK_MS`), and the bin that goes whole (`standing::SETTLED_BIN_MS`).
 pub const SETTLED_SECONDS: usize = (tally_mlat_solver::standing::SETTLED_SLACK_MS
-    + tally_mlat_solver::scope::GRID_MS)
+    + tally_mlat_solver::standing::SETTLED_BIN_MS)
     .div_ceil(1_000) as usize;
 
 /// What one distinct reception adds to a transmission held (`standing::transmission_bytes_most`):
 /// its entry and its entry of the index.
 pub const RECEPTION_HELD_BYTES: usize =
-    tally_mlat_solver::standing::transmission_bytes_most::<Model>(0, 0, 1)
-        - tally_mlat_solver::standing::transmission_bytes_most::<Model>(0, 0, 0);
-/// What one engine's solutions of a transmission take held beside its receptions, as though it
-/// alone solved it: the transmission's entries, its final and its provisional.
+    tally_mlat_solver::standing::transmission_bytes_most::<Cited>(0, 1)
+        - tally_mlat_solver::standing::transmission_bytes_most::<Cited>(0, 0);
+/// What one engine's fix of a transmission takes held beside its receptions, as though it alone
+/// solved it: the transmission's entries and its fix.
 pub const ENGINE_HELD_BYTES: usize =
-    tally_mlat_solver::standing::transmission_bytes_most::<Model>(1, 1, 0);
-/// What a solution handed to standing's thread takes beside its slot in the hand-off: its message
-/// and its receptions (`Solved::allocated`).
-pub const HANDED_RECEPTION_BYTES: usize = std::mem::size_of::<tally_wire::Reception>();
+    tally_mlat_solver::standing::transmission_bytes_most::<Cited>(1, 0);
 
-/// What the one positions record standing reads at a time takes decoded (`Positions::solutions`),
-/// while its solutions are taken in: some multiples of the largest record body
-/// (`tally_wire::record::MAX_BODY`), held by the counting test (`tests/tables_bytes.rs`). Standing
-/// reads one record at a time (`Standing::positions`, under its own lock).
-pub const DECODED_BYTES: usize = 2 * tally_wire::record::MAX_BODY;
+/// A seat's part of an engine's share of the book: its fix of every transmission held over
+/// [`PENDING_SECONDS`], and every reception they considered, as though it alone solved them (each
+/// transmission's bytes are shared among the engines that solved it, `Book::add`), so an honest
+/// engine fits its share however many of its area's engines solve, and one that floods takes no
+/// other's.
+pub const SHARE_BYTES_PER_SEAT: usize = (PENDING_SECONDS
+    * (PUBLISHED.published_per_ks * ENGINE_HELD_BYTES
+        + PUBLISHED.considered_per_ks * RECEPTION_HELD_BYTES))
+    .div_ceil(1_000);
+/// The settled receptions a seat's fixes leave the book remembering: each reception considered,
+/// over its slack past its due time ([`SETTLED_SECONDS`]).
+pub const SETTLED_PER_SEAT: usize = (PUBLISHED.considered_per_ks * SETTLED_SECONDS).div_ceil(1_000);
 
-/// What one table holds at most: its keys and the bytes their values allocate.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Sized {
-    pub count: usize,
-    pub room: usize,
+/// What the one positions record standing reads at a time takes decoded (`Positions::fixes`),
+/// while its fixes are taken in: some multiples of the largest record body
+/// (`tally_wire::record::MAX_BODY`), held by the counting test (`tests/tables_bytes.rs`): each fix
+/// decoded holds both its sets (what it considered and what it used), each reception decoded
+/// (its receiver's key, epoch and counter) four times its twelve bytes on the wire, so a record of
+/// fixes of many receptions decodes to a little over four times its bytes. Standing reads one
+/// record at a time (`Standing::positions`, under its own lock).
+pub const DECODED_BYTES: usize = 5 * tally_wire::record::MAX_BODY;
+
+/// How many of one publishing engine's fixes the book has verified against the raw in a second of
+/// the judging clock, at most (decision D6): a verify rebuilds the fix's model from the raw it
+/// cites (`Engine::verify`, each model's check over the raw), about a refit's work, so one a
+/// second an engine
+/// keeps an engine that floods disagreeing supersets to one refit's work a second of this relay's.
+pub const VERIFIES_PER_ENGINE_PER_SEC: u32 = 1;
+
+/// The hosted engine's raw as standing reads it (`MlatHost::raw`): what its book needs of the
+/// receptions it weighs, and the verifier over them.
+pub trait Raw: Send + Sync {
+    /// The signed wall clock of the batch that carried reception `id` of a transmission sent at
+    /// `transmitted_ms` (Unix milliseconds), when the engine holds it in its receiver's own signed
+    /// raw (the earliest of copies); `None` when it does not.
+    fn heard(&self, id: &ObservationId, transmitted_ms: u64) -> Option<u64>;
+    /// Whether what a fix states verifies under `models` (the ones it cites) against the raw held
+    /// (`Engine::verify`: each model's check, then the fix's): `None` when the raw does not hold
+    /// every reception it considered, or a model's.
+    fn verify(
+        &self,
+        models: &[Arc<tally_mlat::fix::Held>],
+        stated: &tally_mlat_solver::Stated<'_>,
+    ) -> Option<bool>;
 }
 
 /// What standing holds at most, every table sized from the MLAT seats (`Caps::of`): what its
 /// store is charged whole (`budget::Store::Standing`, [`Caps::planned_bytes`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Caps {
-    /// Solutions handed to standing's thread and not yet in the book: their slots (`count`, the
-    /// hand-off's list made at that length once) and their messages and receptions (`room`).
-    pub handed: Sized,
     pub book: tally_mlat_solver::standing::BookCaps,
 }
 
 impl Caps {
     /// Every table for `seats` seats: each seat's share of what an honest load brings.
     pub const fn of(seats: usize) -> Self {
-        let transmissions = seats * TRANSMISSIONS_PER_SEAT_PER_SEC;
-        let receptions = seats * KEPT_PER_SEAT_PER_SEC;
-        // An engine's share of the book: its final and provisional of every transmission held, and
-        // every reception, as though it alone solved them (each transmission's bytes are shared
-        // among the engines that solved it, `Book::add`), so an honest engine fits its share
-        // however many of its area's engines solve, and one that floods takes no other's.
-        let share = PENDING_SECONDS
-            * (transmissions * ENGINE_HELD_BYTES + receptions * RECEPTION_HELD_BYTES);
+        let share = seats * SHARE_BYTES_PER_SEAT;
         Self {
-            handed: Sized {
-                count: HANDED_SECONDS * transmissions * ENGINES_PER_TRANSMISSION,
-                room: HANDED_SECONDS
-                    * ENGINES_PER_TRANSMISSION
-                    * (transmissions * MESSAGE_BYTES + receptions * HANDED_RECEPTION_BYTES),
-            },
             book: tally_mlat_solver::standing::BookCaps {
                 pending_bytes: ENGINES_PER_TRANSMISSION * share,
                 source_share: share,
-                // Every receiver a held solution cites is a seat's (above).
+                // Every receiver a held fix cites is a seat's (above).
                 receivers: seats,
-                // Each reception settled, remembered its slack past its due time.
-                settled: receptions * SETTLED_SECONDS,
+                settled: seats * SETTLED_PER_SEAT,
             },
         }
     }
 
-    /// What standing allocates at most at these caps: the hand-off's slots and what its solutions
-    /// hold, the book (`BookCaps::planned_bytes`), and the one record decoded in hand.
+    /// What standing allocates at most at these caps: the book (`BookCaps::planned_bytes`) and
+    /// the one record decoded in hand.
     pub const fn planned_bytes(&self) -> usize {
-        tally_wire::footprint::vec::<Solved<Model>>(self.handed.count)
-            + self.handed.room
-            + self.book.planned_bytes::<Model>()
-            + DECODED_BYTES
+        self.book.planned_bytes::<Cited>() + DECODED_BYTES
     }
 }
 
@@ -189,71 +202,89 @@ pub const fn planned_bytes(seats: usize) -> usize {
 }
 
 struct Inner {
-    /// The hosted engine's sealed bins: when a reception was heard. None, nothing is known.
-    sealed: Option<SealedBins>,
-    book: Book<Model>,
+    /// The hosted engine's raw. None, nothing is known.
+    raw: Option<Arc<dyn Raw>>,
+    book: Book<Cited>,
     /// The areas this relay holds raw for, with their border band.
     scope: Option<Band>,
+    /// What the book's verifier was asked this second, by engine ([`VERIFIES_PER_ENGINE_PER_SEC`]).
+    verifying: Verifying,
 }
 
-/// What a solution handed takes beside its slot: its message and receptions.
-fn handed_bytes(solved: &Solved<Model>) -> usize {
-    solved.allocated() - std::mem::size_of::<Solved<Model>>()
-}
-
-/// What waits for standing's thread: the solutions handed, in order, made once at the length
-/// planned (`Caps::handed`) so it never grows; the latest time asked to settle by.
+/// The verifies of the second now, by the engine whose fix was asked: forgotten as the second
+/// passes, so it holds at most the engines of the book's fixes.
 #[derive(Default)]
-struct Handed {
-    solutions: VecDeque<Solved<Model>>,
-    /// What its solutions hold beside their slots ([`handed_bytes`]).
-    bytes: usize,
-    caps: Option<Sized>,
-    /// On the judging clock: transmissions are settled by their signed transmit time. None before
-    /// any was asked, or any settled.
+struct Verifying {
+    second: u64,
+    by_engine: std::collections::BTreeMap<PublicKey, u32>,
+    /// Judged against the raw, and refused past their engine's cap, since the relay started.
+    verified: u64,
+    capped: u64,
+}
+
+impl Verifying {
+    /// Whether one more of `engine`'s fixes may be verified at `now`, counting it if so.
+    fn admit(&mut self, engine: &PublicKey, now: Judged) -> bool {
+        let second = now.ms() / 1_000;
+        if second != self.second {
+            self.second = second;
+            self.by_engine.clear();
+        }
+        let asked = self.by_engine.entry(*engine).or_default();
+        if *asked >= VERIFIES_PER_ENGINE_PER_SEC {
+            self.capped += 1;
+            return false;
+        }
+        *asked += 1;
+        self.verified += 1;
+        true
+    }
+}
+
+/// What standing counts of the fixes it was handed, since the relay started.
+#[derive(Default)]
+struct Counts {
+    /// Taken into the book.
+    taken: AtomicU64,
+    /// Citing a model the relay's store did not hold when the hub sent them.
+    unmodelled: AtomicU64,
+    /// Citing no model of the areas, or one of an area outside their band.
+    outside: AtomicU64,
+    /// Not a fix under the models they cite (`standing::under`), or of another specification.
+    unsolved: AtomicU64,
+}
+
+/// What standing's thread is asked to settle by: the latest judging clock asked, and the latest
+/// settled through. Transmissions are settled by their signed transmit time.
+#[derive(Default)]
+struct Settling {
     settle: Option<Judged>,
     settled: Option<Judged>,
     /// Whether the thread holds a piece it has taken and not finished.
     working: bool,
 }
 
-/// What standing counts of the solutions it was handed, since the relay started.
-#[derive(Default)]
-struct Counts {
-    /// Taken into the book.
-    taken: AtomicU64,
-    /// Refused for want of room in the hand-off.
-    refused: AtomicU64,
-    /// Citing a model the relay's store did not hold when the hub sent them.
-    unmodelled: AtomicU64,
-    /// Under a model of a tile none of the areas owns.
-    outside: AtomicU64,
-    /// Not a solution under the model they cite (`standing::under`), or of another specification.
-    unsolved: AtomicU64,
-}
-
 /// Every receiver's standing as this relay reads the records it forwards.
 ///
-/// A stage of its own. Settling costs the book's work for every transmission (weighing it against
-/// the sealed raw): done where a record was published, that was the timed duties' thread, then on
-/// the async runtime, and the duties stood still and so did every runtime task they had woken. So
-/// a record handed here is decoded and its solutions put in the hand-off at once (bounded,
-/// `Caps::handed`, the rest refused and counted), never waiting on the book, and one thread of
-/// standing's own takes them into the book, in the order handed, and settles, in pieces
-/// (`SETTLE_PIECE`, `ADD_PIECE`), below the stages' priority and on the hosted MLAT's gate as
+/// A fix the hub hands here is taken into the book at once (`Book::add`, a decode and a compact
+/// insert), so the hub waits at most one piece of settling. Settling costs the book's work for
+/// every transmission (weighing it against the raw), so one thread of standing's own settles, in
+/// pieces (`SETTLE_PIECE`), below the stages' priority and on the hosted MLAT's gate as
 /// background work (`Standing::start`): standing is work the hosted MLAT brings, and runs on the
-/// threads the plan gives MLAT, never beside them. A relay that hosts no MLAT keeps no standing,
-/// so takes nothing in.
+/// threads the plan gives MLAT, never beside them. Before, a hand-off held a window step's finals
+/// for standing's thread (41 s of every engine's), because a window step published 40 s of fixes
+/// at once; a step now publishes a second's. A relay that hosts no MLAT keeps no standing, so
+/// takes nothing in.
 pub struct Standing {
     inner: Mutex<Inner>,
-    handed: Mutex<Handed>,
+    settling: Mutex<Settling>,
     wake: Condvar,
     /// Held while a record is read: one decoded at a time ([`DECODED_BYTES`]).
     reading: Mutex<()>,
     /// The relay's one store of decoded models (`Network::clock_models`).
     models: Arc<Models>,
-    /// The areas this relay holds raw for: a solution is taken only under a model of a tile one
-    /// of them owns (`window::owns`).
+    /// The areas this relay holds raw for: a fix is taken only when it cites a model of one of
+    /// them and none of an area outside their band.
     areas: Mutex<Regions>,
     counts: Counts,
     /// The tables' caps now, and what they are charged to their store (`Standing::size_for`).
@@ -287,11 +318,12 @@ impl Standing {
         let caps = Caps::of(0);
         Self {
             inner: Mutex::new(Inner {
-                sealed: None,
+                raw: None,
                 book: Book::new(caps.book),
                 scope: None,
+                verifying: Verifying::default(),
             }),
-            handed: Mutex::new(Handed::default()),
+            settling: Mutex::new(Settling::default()),
             wake: Condvar::new(),
             reading: Mutex::new(()),
             models,
@@ -331,22 +363,6 @@ impl Standing {
             return false;
         }
         self.inner().book.set_caps(caps.book);
-        {
-            let mut handed = self.handed();
-            let mut solutions = VecDeque::with_capacity(caps.handed.count);
-            let mut bytes = 0;
-            for solved in handed.solutions.drain(..) {
-                if solutions.len() < caps.handed.count
-                    && bytes + handed_bytes(&solved) <= caps.handed.room
-                {
-                    bytes += handed_bytes(&solved);
-                    solutions.push_back(solved);
-                }
-            }
-            handed.solutions = solutions;
-            handed.bytes = bytes;
-            handed.caps = Some(caps.handed);
-        }
         *held = (caps, charge, true);
         true
     }
@@ -360,21 +376,13 @@ impl Standing {
 
     /// What standing holds now and has done (`/memory`'s `standing`).
     pub fn report(&self) -> StandingReport {
-        let (handed_bytes, handed_solutions) = {
-            let handed = self.handed();
-            (handed.bytes, handed.solutions.len())
-        };
         let planned = lock(&self.caps).0.planned_bytes();
         let load = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
         let inner = self.inner();
         let book = inner.book.counts();
-        let refused = load(&self.counts.refused);
         StandingReport {
             planned_bytes: planned,
-            handed_bytes,
-            handed_solutions,
             taken: load(&self.counts.taken),
-            refused,
             unmodelled: load(&self.counts.unmodelled),
             outside: load(&self.counts.outside),
             unsolved: load(&self.counts.unsolved),
@@ -387,7 +395,9 @@ impl Standing {
             slots: book.slots,
             share: book.share,
             merged_out: book.merged_out,
-            forgotten: refused + book.room + book.receivers,
+            forgotten: book.room + book.receivers,
+            verified: inner.verifying.verified,
+            verify_capped: inner.verifying.capped,
         }
     }
 
@@ -395,13 +405,13 @@ impl Standing {
         lock(&self.inner)
     }
 
-    fn handed(&self) -> MutexGuard<'_, Handed> {
-        lock(&self.handed)
+    fn settling(&self) -> MutexGuard<'_, Settling> {
+        lock(&self.settling)
     }
 
-    /// The hosted MLAT engine's sealed bins: the raw standing reads (`MlatHost::sealed_bins`).
-    pub fn read_bins(&self, sealed: SealedBins) {
-        self.inner().sealed = Some(sealed);
+    /// The hosted MLAT engine's raw: what standing reads (`MlatHost::raw`).
+    pub fn read_raw(&self, raw: Arc<dyn Raw>) {
+        self.inner().raw = Some(raw);
     }
 
     /// Starts standing's thread, on `gate` (the hosted MLAT's, `MlatHost::gate`) as background
@@ -424,83 +434,50 @@ impl Standing {
             .map_err(|error| format!("the relay's standing did not start: {error}"))
     }
 
-    /// One piece of standing's work, or a wait of a second for some: the solutions handed into the
-    /// book ([`ADD_PIECE`] at most), else a piece of settling, under `gate` if any.
+    /// One piece of settling, or a wait of a second for some, under `gate` if any.
     fn work_once(&self, gate: Option<&Arc<Gate>>) {
         let next = {
-            let mut handed = self.handed();
-            if handed.solutions.is_empty() && handed.settled >= handed.settle {
-                handed = self
+            let mut settling = self.settling();
+            if settling.settled >= settling.settle {
+                settling = self
                     .wake
-                    .wait_timeout(handed, Duration::from_secs(1))
-                    .map_or_else(|poisoned| poisoned.into_inner().0, |(handed, _)| handed);
+                    .wait_timeout(settling, Duration::from_secs(1))
+                    .map_or_else(|poisoned| poisoned.into_inner().0, |(held, _)| held);
             }
-            if !handed.solutions.is_empty() {
-                handed.working = true;
-                Some(None)
-            } else {
-                match handed.settle {
-                    Some(settle) if handed.settled < Some(settle) => {
-                        handed.working = true;
-                        Some(Some(settle))
-                    }
-                    _ => None,
+            match settling.settle {
+                Some(settle) if settling.settled < Some(settle) => {
+                    settling.working = true;
+                    Some(settle)
                 }
+                _ => None,
             }
         };
-        let busy = next.is_some();
-        let work = || match next {
-            Some(None) => self.take_in(),
-            Some(Some(settle)) => {
-                let more = self.inner().settle_piece(settle);
-                if !more {
-                    let mut handed = self.handed();
-                    handed.settled = handed.settled.max(Some(settle));
-                }
+        let Some(settle) = next else {
+            return;
+        };
+        let work = || {
+            let more = self.inner().settle_piece(settle);
+            if !more {
+                let mut settling = self.settling();
+                settling.settled = settling.settled.max(Some(settle));
             }
-            None => {}
         };
         match gate {
-            Some(gate) if busy => gate::enter(gate, Urgency::Background, work),
-            _ => work(),
+            Some(gate) => gate::enter(gate, Urgency::Background, work),
+            None => work(),
         }
-        if busy {
-            self.handed().working = false;
-        }
+        self.settling().working = false;
     }
 
-    /// Takes the oldest solutions handed into the book, [`ADD_PIECE`] at most under one hold.
-    fn take_in(&self) {
-        let mut inner = self.inner();
-        for _ in 0..ADD_PIECE {
-            let next = {
-                let mut handed = self.handed();
-                let next = handed.solutions.pop_front();
-                if let Some(solved) = &next {
-                    handed.bytes -= handed_bytes(solved);
-                }
-                next
-            };
-            let Some(solved) = next else {
-                break;
-            };
-            // A solution the book refuses is counted there (`Settled`).
-            if inner.book.add(solved).is_ok() {
-                self.counts.taken.fetch_add(1, Ordering::Relaxed);
-            }
-        }
-    }
-
-    /// Waits up to `within` until standing's thread has taken in everything handed and settled by
-    /// the latest time asked; false if it had not by then. What a test or tool reads after handing
-    /// records, as the thread would have left them.
+    /// Waits up to `within` until standing's thread has settled by the latest time asked; false
+    /// if it had not by then. What a test or tool reads after handing records, as the thread
+    /// would have left them.
     pub fn wait_idle(&self, within: Duration) -> bool {
         let deadline = std::time::Instant::now() + within;
         loop {
             {
-                let handed = self.handed();
-                if handed.solutions.is_empty() && !handed.working && handed.settled >= handed.settle
-                {
+                let settling = self.settling();
+                if !settling.working && settling.settled >= settling.settle {
                     return true;
                 }
             }
@@ -518,93 +495,89 @@ impl Standing {
         *lock(&self.areas) = areas.clone();
     }
 
-    /// Final or provisional positions the hub sent (raw, verified; `Hub::send_positions`): each
-    /// solution under a model the relay's store holds, of a tile the areas own, and a solution
-    /// under it (`Solved::new`), handed to standing's thread at once, in order, to join its
-    /// transmission until it is settled; past the hand-off's room, refused and counted. A solution
-    /// whose model is not held is dropped and counted: the hub waited for it already.
+    /// Raw fixes the hub sent (format 7, verified; `Hub::send_positions`): each fix under models
+    /// the relay's store holds (`Models::cited`), one of them of the areas and none of an area
+    /// outside their band, and a fix under them (`Solved::new`), taken into the book at once to
+    /// join its transmission until it is settled (the book refuses what is past its room, counted
+    /// there). A fix whose models are not all held is dropped and counted: the hub waited for them
+    /// already.
     pub fn positions(&self, positions: &Positions, now: Judged) {
         if !self.running.load(Ordering::Relaxed) {
             return;
         }
         {
             let _reading = lock(&self.reading);
-            let Ok(content) = positions.solutions() else {
+            let (Ok(content), Ok(engine)) = (positions.fixes(), positions.engine()) else {
                 return;
             };
-            let provisional = positions.is_provisional();
-            let areas = lock(&self.areas);
-            for solution in &content.solutions {
-                let Some(model) = self.models.get(&solution.clock_model) else {
-                    self.counts.unmodelled.fetch_add(1, Ordering::Relaxed);
-                    continue;
+            let areas = lock(&self.areas).clone();
+            let scope = self.inner().scope.clone();
+            let mut taken = Vec::with_capacity(content.fixes.len());
+            for fix in &content.fixes {
+                let cited = match self.models.cited(&fix.models, engine) {
+                    Ok(cited) => cited,
+                    Err(_) => {
+                        self.counts.unmodelled.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
                 };
-                // Only a model of a tile this relay's areas own: its footprint is in the band, so
-                // every receiver its solutions cite is one whose raw this relay holds, and what
+                // Only a fix citing a model of this relay's areas and none of an area outside
+                // their band: every receiver it cites is one whose raw this relay holds, and what
                 // standing holds is a share of its seats (`Caps::of`).
-                if areas.is_empty() || !tally_mlat::window::owns(&areas, model.model().tile) {
+                let placed = cited.as_ref().is_none_or(|cited| {
+                    scope.as_ref().is_some_and(|band| {
+                        cited.models().iter().all(|model| band.holds(model.area()))
+                    }) && cited
+                        .models()
+                        .iter()
+                        .any(|model| areas.contains(model.area()))
+                });
+                if !placed {
                     self.counts.outside.fetch_add(1, Ordering::Relaxed);
                     continue;
                 }
-                let Some(solved) = (model.spec() == content.spec_version)
-                    .then(|| {
-                        Solved::new(
-                            solution,
-                            content.spec_version,
-                            content.issued_ms,
-                            provisional,
-                            model,
-                        )
+                let Some(solved) = cited
+                    .filter(|cited| {
+                        cited
+                            .models()
+                            .iter()
+                            .all(|model| model.spec() == content.spec_version)
                     })
-                    .flatten()
+                    .and_then(|cited| {
+                        Solved::new(fix, content.spec_version, content.issued_ms, cited)
+                    })
                 else {
                     self.counts.unsolved.fetch_add(1, Ordering::Relaxed);
                     continue;
                 };
-                self.hand(solved);
+                taken.push(solved);
+            }
+            let mut inner = self.inner();
+            for solved in taken {
+                // A fix the book refuses is counted there (`Settled`).
+                if inner.book.add(solved).is_ok() {
+                    self.counts.taken.fetch_add(1, Ordering::Relaxed);
+                }
             }
         }
-        self.wake.notify_one();
         self.tick(now);
-    }
-
-    /// One solution into the hand-off, or refused, counted, past its caps.
-    fn hand(&self, solved: Solved<Model>) {
-        let bytes = handed_bytes(&solved);
-        let mut handed = self.handed();
-        let caps = handed.caps.unwrap_or(Caps::of(0).handed);
-        if handed.solutions.len() >= caps.count || handed.bytes + bytes > caps.room {
-            drop(handed);
-            self.counts.refused.fetch_add(1, Ordering::Relaxed);
-            return;
-        }
-        handed.bytes += bytes;
-        handed.solutions.push_back(solved);
-    }
-
-    /// Solutions handed and refused for want of room in the hand-off, since the relay started.
-    pub fn refused(&self) -> u64 {
-        self.counts.refused.load(Ordering::Relaxed)
     }
 
     /// Settles what is due by the judging clock `now`, on standing's thread.
     pub fn tick(&self, now: Judged) {
-        let mut handed = self.handed();
-        if Some(now) > handed.settle {
-            handed.settle = Some(now);
-            drop(handed);
+        let mut settling = self.settling();
+        if Some(now) > settling.settle {
+            settling.settle = Some(now);
+            drop(settling);
             self.wake.notify_one();
         }
     }
 
-    /// Takes in everything handed and settles by the latest time asked, here, ungated: what a test
-    /// reads after handing records, as standing's thread would have left it.
+    /// Settles by the latest time asked, here, ungated: what a test reads after handing records,
+    /// as standing's thread would have left it.
     #[cfg(test)]
     pub fn drain(&self) {
-        while !self.handed().solutions.is_empty() {
-            self.take_in();
-        }
-        let settle = self.handed().settle;
+        let settle = self.settling().settle;
         if let Some(settle) = settle {
             while self.inner().settle_piece(settle) {}
         }
@@ -614,7 +587,7 @@ impl Standing {
     /// outside the areas this relay holds raw for, unknown (`None`).
     pub fn of(&self, receiver: &PublicKey, cell: Option<Region>) -> Option<ReceiverStanding> {
         let inner = self.inner();
-        inner.sealed.as_ref()?;
+        inner.raw.as_ref()?;
         let band = inner.scope.as_ref()?;
         cell.filter(|cell| band.holds(*cell))?;
         Some(inner.book.of(receiver))
@@ -640,13 +613,9 @@ impl Standing {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
 pub struct StandingReport {
     pub planned_bytes: usize,
-    /// What the hand-off's solutions hold beside their slots, and how many wait in it.
-    pub handed_bytes: usize,
-    pub handed_solutions: usize,
-    /// Solutions taken into the book; refused for room in the hand-off; citing a model the store
-    /// did not hold; of a tile outside the areas; not a solution under their model.
+    /// Fixes taken into the book; citing a model the store did not hold; citing no model of the
+    /// areas, or one outside their band; not a fix under their models.
     pub taken: u64,
-    pub refused: u64,
     pub unmodelled: u64,
     pub outside: u64,
     pub unsolved: u64,
@@ -655,28 +624,39 @@ pub struct StandingReport {
     /// The receivers the transmissions held cite.
     pub interned: usize,
     pub settled_remembered: usize,
-    /// The transmissions the book holds now, and solutions it refused as late, past a
-    /// transmission's slots, past their engine's share, or let go as two transmissions joined.
+    /// The transmissions the book holds now, and fixes it refused as late, past a transmission's
+    /// slots, past their engine's share, or let go as two transmissions joined.
     pub transmissions_pending: usize,
     pub late: u64,
     pub slots: u64,
     pub share: u64,
     pub merged_out: u64,
-    /// The solutions refused for room (the hand-off's, the book's, its receivers'): none while
-    /// the plan holds what the relay is sent. Nothing held is ever forgotten for room.
+    /// The fixes refused for room (the book's, its receivers'): none while the plan holds what the
+    /// relay is sent. Nothing held is ever forgotten for room.
     pub forgotten: u64,
+    /// Fixes the book's verifier judged against the raw, and those it did not for their engine's
+    /// cap ([`VERIFIES_PER_ENGINE_PER_SEC`]), since the relay started.
+    pub verified: u64,
+    pub verify_capped: u64,
 }
 
 impl Inner {
     /// Settles a piece of what is due by `now` (`SETTLE_PIECE`); true while any is left.
     fn settle_piece(&mut self, now: Judged) -> bool {
-        let Some(sealed) = &self.sealed else {
+        let Some(raw) = self.raw.clone() else {
             return false;
         };
+        let verifying = std::cell::RefCell::new(&mut self.verifying);
         self.book
             .settle_up_to(
                 now,
-                |id, transmitted_ms| heard_in(sealed, id, transmitted_ms),
+                |id, transmitted_ms| raw.heard(id, transmitted_ms),
+                |asked| {
+                    if !verifying.borrow_mut().admit(asked.engine, now) {
+                        return None;
+                    }
+                    raw.verify(&asked.model.decoded(), &asked.stated())
+                },
                 SETTLE_PIECE,
             )
             .1
@@ -697,44 +677,56 @@ mod tests {
         Identity::from_seed([seed; 32]).public()
     }
 
-    /// A model of nothing, the hosted engine's own, held in `models` for the test's day.
-    fn held_model(models: &Models) -> Result<Model, String> {
-        let model = tally_mlat_solver::ClockModel {
+    /// Raw that holds nothing: every reception unheard, every fix unjudged.
+    struct NoRaw;
+
+    impl Raw for NoRaw {
+        fn heard(&self, _: &ObservationId, _: u64) -> Option<u64> {
+            None
+        }
+
+        fn verify(
+            &self,
+            _: &[Arc<tally_mlat::fix::Held>],
+            _: &tally_mlat_solver::Stated<'_>,
+        ) -> Option<bool> {
+            None
+        }
+    }
+
+    /// A model of nothing of the area at Atlanta, the hosted engine's own, held in `models` for
+    /// the test's day.
+    fn held_model(models: &Models) -> Result<crate::models::Model, String> {
+        let model = tally_mlat_solver::pair::PairModel {
             spec: tally_mlat_solver::SPEC_VERSION,
-            tile: tally_mlat_solver::tile::Tile {
-                level: 0,
-                cube: [0; 3],
-            },
-            // Its window's last bin the one the test's day starts in, so it is neither stale
-            // nor early there (`models::HOLD_MS`).
-            window: tally_mlat_solver::scope::Window {
-                first: (AT_MS / tally_mlat_solver::scope::GRID_MS) as i64,
-                last: (AT_MS / tally_mlat_solver::scope::GRID_MS) as i64,
-            },
+            area: tally_wire::rendezvous::area_at(33.749, -84.388)
+                .map_err(|error| error.to_string())?,
+            // Its edge the test's day, so it is neither stale nor early there (`models::HOLD_MS`).
+            trailing: tally_mlat_solver::Trailing::at(AT_MS),
             scope: Vec::new(),
-            input: tally_mlat_solver::scope::Citation {
+            frontier: Vec::new(),
+            input: tally_mlat_solver::Citation {
                 hash: [7; 32],
                 count: 3,
             },
-            gauge: tally_mlat_solver::clock::ClockKey {
-                receiver: key(1),
-                epoch: 1,
-                piece: 0,
-            },
-            origin_unix_ns: 0,
-            gauge_rate: 0,
-            pieces: Vec::new(),
-            biases: Vec::new(),
-            jumps: Vec::new(),
-            dropped: Vec::new(),
+            kappa: 1.0,
+            clocks: Vec::new(),
+            pairs: Vec::new(),
         };
+        let held = tally_mlat::fix::Held::fitted(model).ok_or("a model of nothing encodes")?;
         models
-            .insert_own([9; 32], Arc::new(model), key(100), judged(AT_MS))
+            .insert_own(Arc::new(held), key(100), judged(AT_MS))
             .map_err(|why| format!("{why:?}"))
     }
 
-    /// A final of transmission `n` heard by three receivers, under `model`.
-    fn solved(n: u8, model: &Model) -> Solved<Model> {
+    /// `model` cited alone by a fix engine `engine` signed.
+    fn cited(model: &crate::models::Model, engine: u8) -> Cited {
+        Cited::new(vec![model.clone()], key(engine))
+            .unwrap_or_else(|| panic!("one model is one fix's"))
+    }
+
+    /// A fix of transmission `n` heard by three receivers, under `model`.
+    fn solved(n: u8, model: &crate::models::Model) -> Solved<Cited> {
         let observations = tally_wire::ObservationSet::new(
             vec![0x58, 0xab, 0xcd, n, 0, 0, 0],
             (0..3)
@@ -747,7 +739,6 @@ mod tests {
         )
         .unwrap_or_else(|error| panic!("{error}"));
         Solved {
-            provisional: false,
             issued_ms: AT_MS + 1_000,
             claimed: tally_mlat_solver::standing::Claimed {
                 lat_e7: 337_000_000,
@@ -768,122 +759,67 @@ mod tests {
             },
             weight: 3,
             identity: [n; 32],
-            observations,
-            model: model.clone(),
-            consistent: None,
+            considered: observations.clone(),
+            used: observations,
+            model: cited(model, 5),
         }
-    }
-
-    /// What standing is handed goes into the hand-off at once, whatever its thread is doing with
-    /// the book (here, the book held), and is taken in by that thread; past the hand-off's caps,
-    /// refused and counted. Before, a record waited for the book on the thread that handed it, and
-    /// a window step's solutions held the relay's timed duties ten seconds.
-    #[test]
-    fn a_solution_handed_returns_at_once_and_is_taken_in_on_standings_thread() -> Result<(), String>
-    {
-        let models = Arc::new(Models::new());
-        let model = held_model(&models)?;
-        let standing = Arc::new(Standing::with_models(Arc::clone(&models)));
-        let gauge = crate::budget::Gauge::new(crate::budget::Store::Standing, usize::MAX);
-        // Three seats: the book keeps the three receivers each solution cites.
-        assert!(standing.size_for(3, &gauge));
-        Standing::start(&standing, None)?;
-        let held = standing.inner();
-        let (done, finished) = std::sync::mpsc::channel();
-        {
-            let standing = Arc::clone(&standing);
-            let solved = solved(1, &model);
-            std::thread::spawn(move || {
-                standing.hand(solved);
-                standing.wake.notify_one();
-                let _ = done.send(());
-            });
-        }
-        // Handed while the book is held: a hand that waited for the book never returns while it
-        // is held, so this waits only on a hang (120 s), never on the machine's speed.
-        finished
-            .recv_timeout(Duration::from_secs(120))
-            .map_err(|_| "handing a solution waited for the book")?;
-        drop(held);
-        assert!(
-            standing.wait_idle(Duration::from_secs(120)),
-            "never taken in"
-        );
-        assert_eq!(standing.inner().book.pending(), 1);
-        assert_eq!(standing.report().taken, 1);
-        // Past its caps, refused, counted.
-        let caps = Caps::of(3).handed;
-        let blocked = standing.inner();
-        for n in 0..caps.count + 2 {
-            standing.hand(solved((n % 200) as u8, &model));
-        }
-        assert!(standing.refused() >= 2);
-        assert!(standing.handed().bytes <= caps.room);
-        assert_eq!(
-            standing.handed().solutions.capacity(),
-            caps.count,
-            "the hand-off never grows"
-        );
-        drop(blocked);
-        Ok(())
     }
 
     /// Positions citing a model the relay's store does not hold when the hub sends them are
     /// dropped and counted: nothing waits for a model here.
     #[test]
-    fn a_solution_whose_model_is_not_held_is_dropped_and_counted() -> Result<(), String> {
+    fn a_fix_whose_model_is_not_held_is_dropped_and_counted() -> Result<(), String> {
         let models = Arc::new(Models::new());
         let model = held_model(&models)?;
         let standing = Arc::new(Standing::with_models(models));
         let gauge = crate::budget::Gauge::new(crate::budget::Store::Standing, usize::MAX);
         assert!(standing.size_for(1, &gauge));
         Standing::start(&standing, None)?;
-        let solution = |clock_model: Hash| {
+        let fix = |model_id: Hash| -> Result<tally_wire::Fix, String> {
             let solved = solved(1, &model);
-            tally_wire::Solution {
+            Ok(tally_wire::Fix {
                 address: 0x00ab_cdef,
                 transmitted: solved.claimed.transmitted,
                 lat_e7: solved.claimed.lat_e7,
                 lon_e7: solved.claimed.lon_e7,
                 alt_hae_mm: solved.claimed.alt_hae_mm,
                 covariance: solved.claimed.covariance,
-                clock_model,
-                addressed: tally_wire::AddressedCitation::default(),
-                observations: solved.observations,
-            }
+                models: vec![model_id],
+                sets: tally_wire::FixSets::new(solved.considered, solved.used)
+                    .map_err(|error| error.to_string())?,
+            })
         };
-        let positions = Positions::sign_solutions(
+        let positions = Positions::sign_fix(
             &Identity::from_seed([5; 32]),
-            &tally_wire::SolutionsContent {
+            &tally_wire::FixesContent {
                 boot_id: 1,
                 sequence: 0,
                 issued_ms: AT_MS,
                 spec_version: tally_mlat_solver::SPEC_VERSION,
-                solutions: vec![solution([1; 32]), solution(model.id())],
+                fixes: vec![fix([1; 32])?, fix(model.id())?],
             },
         )
         .map_err(|error| error.to_string())?;
         standing.positions(&positions, judged(AT_MS));
         let report = standing.report();
         assert_eq!(report.unmodelled, 1);
-        // The held one is of a tile none of the (no) areas owns.
+        // The held one is of an area none of the (no) areas is.
         assert_eq!(report.outside, 1);
         Ok(())
     }
 
     /// A burst of transmissions falling due at once is settled in pieces held to their work
-    /// (`SETTLE_PIECE`): between two pieces the book is free, so the solutions handed meanwhile are
-    /// taken in and anyone asking is answered, however large the burst. Before, a piece was a count
-    /// of transmissions, whatever each cost.
+    /// (`SETTLE_PIECE`): between two pieces the book is free, so the fixes the hub hands meanwhile
+    /// are taken in and anyone asking is answered, however large the burst. Before, a piece was a
+    /// count of transmissions, whatever each cost.
     #[test]
-    fn a_burst_falling_due_at_a_step_is_settled_in_pieces_held_to_their_work() -> Result<(), String>
-    {
+    fn a_burst_falling_due_at_once_is_settled_in_pieces_held_to_their_work() -> Result<(), String> {
         let models = Arc::new(Models::new());
         let model = held_model(&models)?;
         let standing = Standing::with_models(models);
         let gauge = crate::budget::Gauge::new(crate::budget::Store::Standing, usize::MAX);
         assert!(standing.size_for(100, &gauge));
-        standing.read_bins(SealedBins::new());
+        standing.read_raw(Arc::new(NoRaw));
         let burst = 2_000usize;
         {
             let mut inner = standing.inner();
@@ -891,7 +827,7 @@ mod tests {
                 let mut one = solved((n % 250) as u8, &model);
                 // Each its own transmission: its own receivers' counters.
                 let receptions: Vec<tally_wire::Reception> = one
-                    .observations
+                    .considered
                     .receptions()
                     .iter()
                     .map(|reception| tally_wire::Reception {
@@ -899,17 +835,16 @@ mod tests {
                         ..*reception
                     })
                     .collect();
-                one.observations = tally_wire::ObservationSet::new(
-                    one.observations.message().to_vec(),
-                    receptions,
-                )
-                .map_err(|error| error.to_string())?;
+                one.considered =
+                    tally_wire::ObservationSet::new(one.considered.message().to_vec(), receptions)
+                        .map_err(|error| error.to_string())?;
+                one.used = one.considered.clone();
                 inner.book.add(one).map_err(|why| format!("{why:?}"))?;
             }
             assert_eq!(inner.book.pending(), burst);
         }
         // Every one is due; a piece settles what its work allows (three receptions under one
-        // final, and once more, each), and the book is free after it.
+        // fix, and once more, each), and the book is free after it.
         let due = judged(AT_MS + 600_000);
         let work = 3 * 2 + 1;
         let mut pieces = 0;
@@ -926,6 +861,21 @@ mod tests {
         assert!(pieces >= burst * work / SETTLE_PIECE, "{pieces} pieces");
         assert_eq!(standing.inner().book.pending(), 0);
         Ok(())
+    }
+
+    /// The book holds a transmission until every reader's fix of it has arrived and no longer:
+    /// `FIX_ARRIVED` and the second a fix may come before its own time is past, not the windowed
+    /// finals' 110 s; and the raw is still held when it is settled.
+    #[test]
+    fn a_transmission_is_held_until_its_fixes_have_arrived() {
+        assert_eq!(
+            PENDING_SECONDS as u64,
+            tally_wire::budget::FIX_ARRIVED_MS.div_ceil(1_000) + 1
+        );
+        assert!(
+            tally_mlat_solver::HELD_MS >= tally_mlat_solver::standing::SETTLE.span::<Judged>().ms(),
+            "the raw outlives the settling"
+        );
     }
 
     /// Standing's tables are sized from the seats and charged whole to their store; a store that
@@ -949,7 +899,6 @@ mod tests {
         assert!(standing.size_for(100, &gauge));
         assert_eq!(gauge.held(), planned_bytes(100));
         assert!(standing.charged_in_full());
-        assert_eq!(standing.handed().caps, Some(Caps::of(100).handed));
         let short =
             crate::budget::Gauge::new(crate::budget::Store::Standing, planned_bytes(100) - 1);
         assert!(!standing.size_for(100, &short));
@@ -972,7 +921,7 @@ mod tests {
         standing.set_areas(&area.into_iter().collect());
         // No hosted MLAT, no raw: unknown, even in the areas.
         assert_eq!(standing.of(&key, atlanta), None);
-        standing.read_bins(SealedBins::new());
+        standing.read_raw(Arc::new(NoRaw));
         assert_eq!(standing.of(&key, atlanta), Some(ReceiverStanding::NEW));
         standing.tick(judged(u64::MAX / 2));
         standing.drain();

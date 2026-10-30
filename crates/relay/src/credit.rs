@@ -10,8 +10,8 @@
 //!   (`link`'s `Peer::grant`), never this file's; [`Credit::admit`] grants a non-client nothing.
 //!   A relay told no upload cap ([`Credit::set_upload_cap`]) sends nothing billed, so it has
 //!   nothing to ration and serves its clients as they ask.
-//! - **The free tier** ([`Allowance::FREE`]) is final and provisional positions for one area (one
-//!   cell at [`AREA_RESOLUTION`] or finer), at what the busiest area's positions cost. All the
+//! - **The free tier** ([`Allowance::FREE`]) is MLAT positions for one area (one cell at
+//!   [`AREA_RESOLUTION`] or finer), at what the busiest area's positions cost. All the
 //!   clients on the free tier together get at most [`FREE_SHARE_OF_CAP`] of the upload cap; past
 //!   it a new one is served nothing until one leaves.
 //! - **A relay vouches for the clients its operator names** ([`Credit::vouch_for`]): on each of
@@ -87,16 +87,17 @@ pub const FEEDER_CREDIT: u64 = seeded_bytes(FEEDER_BYTES_PER_SEC);
 /// of its life, so a client that misses one renewal still holds a valid credential.
 pub const RENEW_BEFORE_MS: u64 = CREDENTIAL_LIFETIME_MS / 3;
 
-/// One final or provisional fix, as published (RFC-0174 §2.4: about 370 bytes a solution).
+/// One MLAT fix, as published (RFC-0174 §2.4: about 370 bytes a solution).
 const FIX_BYTES: u64 = 370;
 /// Aircraft over the busiest area cell at once (an estimate: a cell of about 12,400 km² over a
 /// metropolitan basin).
 const AREA_AIRCRAFT: u64 = 100;
 /// Aircraft the whole world's MLAT tracks in a window (RFC-0174 §2.3: about 5,400 targets).
 const WORLD_AIRCRAFT: u64 = 5_400;
-/// A world product fix on the wire (measured, `products` tests: 87.5 bytes), and the aircraft
+/// A world product fix on the wire (measured, `products` tests: 87.5 bytes before it carried its
+/// considered count, two bytes more), and the aircraft
 /// the world product carries a second (the measurement's 12,000 ADS-B and 5,400 MLAT aircraft).
-const WORLD_FIX_BYTES: u64 = 88;
+const WORLD_FIX_BYTES: u64 = 90;
 const WORLD_PRODUCT_AIRCRAFT: u64 = 17_400;
 /// Feeders in the busiest area cell (an estimate), and in the world (RFC-0174 §2.3: 20,000).
 const AREA_FEEDERS: u64 = 200;
@@ -120,15 +121,16 @@ pub struct Allowance {
 }
 
 impl Allowance {
-    /// The free small tier: positions for an area, with nothing but a connection. Final and
-    /// provisional positions (cockpit traffic is what the provisional ones are for, §2.4), one
-    /// area cell or finer, at what the busiest area's positions cost.
+    /// The free small tier: positions for an area, with nothing but a connection. MLAT
+    /// positions (cockpit traffic is what they are for, §2.4; there is one kind of fix, solved
+    /// within seconds, RFC-0171 §3.8.1 as amended 2026-10-24), one area cell or finer, at what the
+    /// busiest area's positions cost.
     pub const FREE: Self = Self {
-        products: Streams(Streams::POSITIONS.0 | Streams::PROVISIONAL.0),
+        products: Streams::POSITIONS,
         regions: 1,
         min_resolution: AREA_RESOLUTION,
         world: false,
-        bytes_per_sec: 2 * AREA_AIRCRAFT * FIX_BYTES,
+        bytes_per_sec: AREA_AIRCRAFT * FIX_BYTES,
     };
 
     /// A relay's own client: what its credential names, anywhere.
@@ -156,7 +158,7 @@ impl Allowance {
 
 /// The estimated rate of each product: (one busiest area cell, the whole world), and whether a
 /// subscription's regions cut it. Positions are routed by area as the free tier needs.
-const PRODUCTS: [(Streams, u64, u64, bool); 8] = [
+const PRODUCTS: [(Streams, u64, u64, bool); 6] = [
     (
         Streams::RAW,
         AREA_FEEDERS * FEEDER_BYTES_PER_SEC,
@@ -175,29 +177,17 @@ const PRODUCTS: [(Streams, u64, u64, bool); 8] = [
         WORLD_AIRCRAFT * FIX_BYTES,
         true,
     ),
-    // An estimate: a tile's model is a few receivers' clocks, re-fit once a stride.
+    // An estimate: an area's model is its members' clocks and pairs, refit once a stride.
     (Streams::CLOCK_MODELS, 4 * 1024, 256 * 1024, true),
-    (
-        Streams::PROVISIONAL,
-        AREA_AIRCRAFT * FIX_BYTES,
-        WORLD_AIRCRAFT * FIX_BYTES,
-        true,
-    ),
     (
         Streams::REGIONAL,
         AREA_FEEDERS * FEEDER_BYTES_PER_SEC / RECEIVERS_PER_MESSAGE,
         WORLD_FEEDERS * FEEDER_BYTES_PER_SEC / RECEIVERS_PER_MESSAGE,
         true,
     ),
-    // The live and the precise world products, each one fix an aircraft a second: costed apart.
+    // The world product, one fix an aircraft a second.
     (
         Streams::WORLD,
-        WORLD_PRODUCT_AIRCRAFT * WORLD_FIX_BYTES,
-        WORLD_PRODUCT_AIRCRAFT * WORLD_FIX_BYTES,
-        false,
-    ),
-    (
-        Streams::WORLD_PRECISE,
         WORLD_PRODUCT_AIRCRAFT * WORLD_FIX_BYTES,
         WORLD_PRODUCT_AIRCRAFT * WORLD_FIX_BYTES,
         false,
@@ -210,10 +200,8 @@ const KNOWN_PRODUCTS: Streams = Streams(
         | Streams::DEDUPLICATED.0
         | Streams::POSITIONS.0
         | Streams::CLOCK_MODELS.0
-        | Streams::PROVISIONAL.0
         | Streams::REGIONAL.0
-        | Streams::WORLD.0
-        | Streams::WORLD_PRECISE.0,
+        | Streams::WORLD.0,
 );
 
 /// What a subscription to `streams` over `regions` (none: the world) is estimated to cost a
@@ -2331,10 +2319,7 @@ mod tests {
         let everything = Streams(0x7f);
         assert_eq!(
             judge.admit(&session, sub(everything, cells.clone()), judged(NOW)),
-            sub(
-                Streams::POSITIONS.with(Streams::PROVISIONAL),
-                vec![cells[0]]
-            )
+            sub(Streams::POSITIONS, vec![cells[0]])
         );
         assert_eq!(
             judge.admit(&session, sub(Streams::POSITIONS, Vec::new()), judged(NOW)),
@@ -2403,7 +2388,7 @@ mod tests {
             24 * FEEDER_CREDIT
         );
         let session = asker(AskerRole::Client, client.public(), 1);
-        let positions = Streams::POSITIONS.with(Streams::PROVISIONAL);
+        let positions = Streams::POSITIONS;
         let three = areas(3)?;
         // Free, one area; linked, all three.
         assert_eq!(
@@ -3021,16 +3006,16 @@ mod tests {
         assert_eq!(cost(Streams::POSITIONS, &cell), AREA_AIRCRAFT * FIX_BYTES);
         assert_eq!(cost(Streams::POSITIONS, &[]), WORLD_AIRCRAFT * FIX_BYTES);
         assert_eq!(
-            cost(Streams::POSITIONS.with(Streams::PROVISIONAL), &cell),
+            cost(Streams::POSITIONS, &cell),
             Allowance::FREE.bytes_per_sec
         );
-        // Each world feed is its own product, costed as one, whatever the areas named.
+        // The world feed is costed as one product, whatever the areas named.
         let world = WORLD_PRODUCT_AIRCRAFT * WORLD_FIX_BYTES;
         assert_eq!(cost(Streams::WORLD, &cell), world);
-        assert_eq!(cost(Streams::WORLD_PRECISE, &[]), world);
+        assert_eq!(cost(Streams::WORLD, &[]), world);
         assert_eq!(
-            cost(Streams::WORLD.with(Streams::WORLD_PRECISE), &cell),
-            2 * world
+            cost(Streams::WORLD.with(Streams::POSITIONS), &cell),
+            world + AREA_AIRCRAFT * FIX_BYTES
         );
         Ok(())
     }

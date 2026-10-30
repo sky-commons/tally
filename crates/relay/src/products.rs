@@ -1,10 +1,11 @@
 //! The two products (RFC-0174 §2.11): the regional product (each area's receptions deduplicated
 //! once, as `RegionalBatch` records this relay signs as their origin, beside the area's raw,
-//! positions and clock models) and the world product in its two feeds (one fix per aircraft per
-//! second, by `tally_wire::products::world_choice`, offered at the top of the area tree by a relay
-//! that has gathered every area's positions): live as `WorldPositions`, sealed `WORLD_SETTLE_MS`
-//! after its second with MLAT by provisional fixes, and precise as `WorldPrecise`, sealed
-//! `WORLD_PRECISE_SETTLE_MS` after with MLAT by final fixes only.
+//! positions and clock models) and the world product (one fix per aircraft per second, by
+//! `tally_wire::products::world_choice`, offered at the top of the area tree by a relay that has
+//! gathered every area's positions), as `WorldPositions`, each second sealed `WORLD_SETTLE_MS`
+//! after it ends. There is one kind of MLAT fix, solved within seconds of its transmission
+//! (RFC-0171 §3.8.1 as amended 2026-10-24), so there is one world product: the precise one, which
+//! waited for the windowed finals, is retired with them.
 //!
 //! # Who does what (RFC-0181)
 //!
@@ -84,23 +85,20 @@
 //!   two messages, its covariance the position's type code's containment radius taken as two
 //!   sigma, its altitude the GNSS height when the message carries one (a barometric altitude is
 //!   not a height above the ellipsoid, so the fix states none).
-//! - **MLAT finals and provisionals**, from `Positions` records (final, format 3) and
-//!   `Provisional` ones (format 4), by [`positions_fixes`]: each solution as published, its input
-//!   set the merge rule's (`products::input_set`, over the observation set and the cited model's
-//!   inputs hash), so a solution waits here until its model's manifest has been shown.
+//! - **MLAT fixes**, from `Positions` records (format 7), by [`positions_fixes`]: each fix as
+//!   published, its input set the merge rule's (`products::input_set`, over the receptions it
+//!   considered and the inputs hash of the model it was solved under), so a fix waits here until
+//!   its model's manifest has been shown (its engine sends the model first, so it rarely waits).
 //!
 //! Each fix cites its origin record's hash and its index there, so a reader holding that record
 //! derives the same fix ([`check_fix`]). A second is sealed once, [`WORLD_SETTLE_MS`] after it
-//! ends by this relay's judging clock, once every honest live fix of it has surely arrived
-//! (`tally_wire::budget::LIVE_FIX_ARRIVED`: its receptions signed below their relay's clock, its
-//! way out of a provisional's engine or a regional batch, and that relay's clock `K` from this
-//! one's): its fixes, ascending by address, are signed as `WorldPositions` parts of at most
-//! `MAX_WORLD_FIXES`. A candidate for a sealed second is late, dropped and counted, so no aircraft
-//! has two fixes in one second. A final MLAT fix leaves its engine up to 91.5 s after its
-//! transmission (`FINAL_FIX_LEAVES`), mostly after its live second is sealed, so in the live
-//! product an MLAT target is drawn by its provisional fix, or a final one that came in time; the
-//! precise product waits for the finals (`WORLD_PRECISE_SETTLE_MS`). Two relays shown the same
-//! records before a second's seal publish the same fixes for it, byte for byte, in any order.
+//! ends by this relay's judging clock, once every honest fix of it has surely arrived
+//! (`tally_wire::budget::FIX_ARRIVED`: its receptions signed below their relay's clock, its way
+//! out of its engine or a regional batch, and that relay's clock `K` from this one's): its fixes,
+//! ascending by address, are signed as `WorldPositions` parts of at most `MAX_WORLD_FIXES`. A
+//! candidate for a sealed second is late, dropped and counted, so no aircraft has two fixes in
+//! one second. Two relays shown the same records before a second's seal publish the same fixes
+//! for it, byte for byte, in any order.
 
 use std::collections::hash_map::RandomState;
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -120,7 +118,7 @@ use tally_wire::rendezvous::area_of_public;
 use tally_wire::{
     Batch, ClientRegionalBatch, ClockModel, Location, Positions, PublicKey, ReceiverInfo, Record,
     Region, RegionalBatch, RegionalDraft, Signs, WireError, WorldFix, WorldPositions,
-    WorldPositionsContent, WorldPrecise,
+    WorldPositionsContent,
 };
 
 use crate::bounded::Bounded;
@@ -137,18 +135,14 @@ use crate::strikes::Deliverer;
 
 /// How often each area's copies are signed: a feeder seals once a second, and so does an origin.
 pub const REGIONAL_EVERY_MS: u64 = 1_000;
-/// How long after a second of transmit time ends its live world fixes are sealed: once every honest
-/// fix of it has surely arrived, wherever it was heard (`tally_wire::budget::LIVE_FIX_ARRIVED`,
-/// derived there: its receptions signed up to `E + 2U_m` below the clock of the relay that heard
-/// them, its fix's way out of a provisional's engine or a regional batch, and that relay's clock
-/// up to `K` from this one's). Before, 4 s, a provisional's measured way out alone: a fix whose
-/// receptions were signed 9.5 s below its relay's clock, or heard on a relay `K` from this one,
-/// missed its second, honest and counted late.
-pub const WORLD_SETTLE_MS: u64 = tally_wire::budget::LIVE_FIX_ARRIVED.span::<Judged>().ms();
-/// How long after a second of transmit time ends its precise world fixes are sealed: once every
-/// final fix of it has surely arrived (`tally_wire::products::FINAL_FIX_ARRIVED_MS`, derived
-/// there).
-pub const WORLD_PRECISE_SETTLE_MS: u64 = tally_wire::products::FINAL_FIX_ARRIVED_MS;
+/// How long after a second of transmit time ends its world fixes are sealed: once every honest fix
+/// of it has surely arrived, wherever it was heard (`tally_wire::budget::FIX_ARRIVED`, derived
+/// there: its receptions signed up to `E + 2U_m` below the clock of the relay that heard them, its
+/// fix's way out of its engine or a regional batch, and that relay's clock up to `K` from this
+/// one's). Before, 4 s, a fix's measured way out alone: a fix whose receptions were signed 9.5 s
+/// below its relay's clock, or heard on a relay `K` from this one, missed its second, honest and
+/// counted late.
+pub const WORLD_SETTLE_MS: u64 = tally_wire::budget::FIX_ARRIVED_MS;
 /// How far before the watermark a fix's second may be before the first seal.
 const WORLD_BEHIND_SECONDS: u64 = 240;
 /// The most aircraft held for one second: several times the world's airborne fleet.
@@ -157,7 +151,7 @@ pub const MAX_WORLD_AIRCRAFT: usize = 50_000;
 /// world's airborne fleet, a quarter of [`MAX_WORLD_AIRCRAFT`] (which one second may hold at most).
 pub const WORLD_FLEET: usize = MAX_WORLD_AIRCRAFT / 4;
 
-/// The seconds a world product settling `settle_ms` after a second ends holds open at most: the
+/// The seconds the world product settling `settle_ms` after a second ends holds open at most: the
 /// ones not yet settled, the one under way, and the ones ahead a fix may still be signed in
 /// (`tally_wire::budget::PEER_AHEAD`).
 pub const fn world_seconds_open(settle_ms: u64) -> usize {
@@ -169,10 +163,8 @@ pub const fn world_seconds_open(settle_ms: u64) -> usize {
         + 1) as usize
 }
 
-/// The most fixes a world product settling `settle_ms` after a second ends holds across its open
-/// seconds ([`world_seconds_open`]), each the planned fleet ([`WORLD_FLEET`]): each product's own,
-/// so neither takes the other's room. Before, the live and the precise product shared one 400,000,
-/// which the precise product, open some 135 seconds, filled for both.
+/// The most fixes the world product settling `settle_ms` after a second ends holds across its open
+/// seconds ([`world_seconds_open`]), each the planned fleet ([`WORLD_FLEET`]).
 pub const fn world_held(settle_ms: u64) -> usize {
     world_seconds_open(settle_ms) * WORLD_FLEET
 }
@@ -201,7 +193,7 @@ const fn world_seconds_held(settle_ms: u64) -> usize {
     if settled > behind { settled } else { behind }
 }
 
-/// What a world product settling `settle_ms` after a second ends holds at most: its cap of fixes
+/// What the world product settling `settle_ms` after a second ends holds at most: its cap of fixes
 /// ([`world_held`]) at [`WORLD_FIX_BYTES`] each, its seconds open ([`world_seconds_held`]) at
 /// [`WORLD_SECOND_BYTES`] each, and the seconds' root.
 pub const fn world_product_bytes(settle_ms: u64) -> usize {
@@ -210,18 +202,13 @@ pub const fn world_product_bytes(settle_ms: u64) -> usize {
         + WORLD_SECONDS_ROOT_BYTES
 }
 
-/// What the world products a relay gathers hold at most (`budget::Store::World`): the live one
-/// where it gathers it (`--world`) and the precise one (`--world-precise`), each its own
-/// ([`world_product_bytes`]); nothing on a relay that gathers neither. Before, they were charged to
-/// no store: a world relay's 2.4 million fixes at their caps, over 1 GiB, beside a plan that held
-/// none of it.
-pub const fn world_planned_bytes(live: bool, precise: bool) -> usize {
-    (if live {
+/// What the world product holds at most where a relay gathers it (`--world`,
+/// `budget::Store::World`): [`world_product_bytes`] at its settle; nothing on a relay that does
+/// not. Before, it was charged to no store: a world relay's fixes at their cap beside a plan that
+/// held none of it.
+pub const fn world_planned_bytes(world: bool) -> usize {
+    if world {
         world_product_bytes(WORLD_SETTLE_MS)
-    } else {
-        0
-    }) + if precise {
-        world_product_bytes(WORLD_PRECISE_SETTLE_MS)
     } else {
         0
     }
@@ -259,11 +246,19 @@ pub const fn located_planned_bytes(receivers: usize) -> usize {
 pub const REGIONAL_REMEMBERED: usize = 200_000;
 /// Peers' regional batches waiting for the next tick to be forwarded.
 const FORWARD_HELD: usize = 4_096;
-/// Clock models remembered: their id and inputs hash. A world-scale relay publishes some 3,800
-/// a 40 s stride, and a provisional cites one at most 90 s past the end of the window it was
-/// fitted on (`tally_mlat_solver::clock::MAX_CARRY_PS`, which covers the stride, settling,
-/// ripening and how far a reception runs ahead).
-pub const MODELS_REMEMBERED: usize = 50_000;
+/// The models a world-scale MLAT publishes a second (RFC-0174 §2.3: some 3,800 refits a second;
+/// each area's engines refit it every `tally_wire::budget::REFIT_EVERY`, each refit one model).
+const WORLD_REFITS_PER_SEC: usize = 3_800;
+/// Clock models remembered: their pair model id and inputs hash, for as long as a fix solved under one may
+/// still come after it. An engine sends a model before the fixes solved under it, and a fix is
+/// solved under a model at most `tally_wire::budget::MAX_CARRY` old; the two may reach this relay
+/// by paths up to `K` apart, a repair's transit after: so a model is remembered for
+/// `MAX_CARRY + K + REPAIR_TRANSIT` of a world-scale MLAT's refits.
+pub const MODELS_REMEMBERED: usize = WORLD_REFITS_PER_SEC
+    * ((tally_wire::budget::MAX_CARRY.span::<Judged>().ms()
+        + tally_wire::budget::K.span::<Judged>().ms()
+        + tally_wire::budget::REPAIR_TRANSIT.span::<Judged>().ms())
+    .div_ceil(1_000) as usize);
 /// How long positions records wait for a model they cite: charged while they wait to the records'
 /// share (`budget::Store::Records`), their only bound.
 const WAITING_MS: u64 = 30_000;
@@ -360,14 +355,12 @@ pub struct ProductsReport {
     /// clock was not synced (`signer::Signer::with`, RFC-0171 §3.6).
     #[serde(default)]
     pub unsynced_seals: u64,
-    /// World records signed (live).
+    /// World records signed.
     pub world_signed: u64,
-    /// Fixes of world seconds (live or precise) sealed but not signed: the relay had no key yet,
+    /// Fixes of world seconds sealed but not signed: the relay had no key yet,
     /// or its judging clock stopped judging as they were sealed (`unsynced_seals`).
     #[serde(default)]
     pub world_unsigned: u64,
-    /// Precise world records signed.
-    pub precise_signed: u64,
     /// Fixes offered after their second was sealed.
     pub world_late: u64,
     /// Fixes whose second is too far before or after the watermark to be held.
@@ -375,7 +368,7 @@ pub struct ProductsReport {
     /// Fixes taken in by a stamp read while the relay's clock did not judge: never judged, so
     /// never held (RFC-0171 §3.6).
     pub world_unjudged: u64,
-    /// Fixes not held for want of room (each product's `world_held`, `MAX_WORLD_AIRCRAFT`).
+    /// Fixes not held for want of room (`world_held`, `MAX_WORLD_AIRCRAFT`).
     pub world_skipped: u64,
     /// Peers' world fixes that disagree with the origin they cite.
     pub world_refuted: u64,
@@ -384,7 +377,7 @@ pub struct ProductsReport {
     pub positions_waiting_full: u64,
     /// Positions records whose model never came within `WAITING_MS`.
     pub positions_waiting_expired: u64,
-    /// Positions records whose fixes could not be derived (a malformed solution set).
+    /// Positions records whose fixes could not be derived (a malformed fix set).
     pub positions_underivable: u64,
 }
 
@@ -394,13 +387,11 @@ struct Located {
     relays: Vec<PublicKey>,
 }
 
-/// One world product being gathered: its open seconds, and when they are sealed.
+/// The world product being gathered: its open seconds, and when they are sealed.
 struct Gatherer {
     /// Whether this relay gathers it.
     on: bool,
     settle: Span<Judged>,
-    /// The precise product takes no provisional fix.
-    finals_only: bool,
     /// Open seconds, each aircraft's best fix so far.
     fixes: BTreeMap<u64, BTreeMap<u32, WorldFix>>,
     held: usize,
@@ -415,11 +406,10 @@ struct Gatherer {
 }
 
 impl Gatherer {
-    fn new(settle: Span<Judged>, finals_only: bool) -> Self {
+    fn new(settle: Span<Judged>) -> Self {
         Self {
             on: false,
             settle,
-            finals_only,
             fixes: BTreeMap::new(),
             held: 0,
             cap: world_held(settle.ms()),
@@ -675,8 +665,9 @@ impl Held {
 /// A record that is not an epoch, for the sealer to take in at its stamp.
 enum Input {
     Positions(Positions),
-    ClockModel(ClockModel),
-    World(WorldPositionsContent, bool),
+    /// A model's manifest and the pair model id its fixes cite it by (`publish::pair_model_id`).
+    ClockModel(ClockModel, Hash),
+    World(WorldPositionsContent),
     /// A peer's regional batch, the connection it came in on, and who delivered it; judged usable
     /// by the hub before it came (`Network::take_regional`).
     Regional(u64, Deliverer, RegionalBatch),
@@ -821,8 +812,8 @@ impl Input {
     fn allocated(&self) -> usize {
         match self {
             Self::Positions(positions) => positions.allocated(),
-            Self::ClockModel(model) => model.allocated(),
-            Self::World(content, _) => {
+            Self::ClockModel(model, _) => model.allocated(),
+            Self::World(content) => {
                 crate::footprint::vec::<tally_wire::WorldFix>(content.fixes.capacity())
             }
             Self::Regional(_, _, regional) => regional.allocated(),
@@ -847,9 +838,8 @@ pub struct Sealing {
     /// before they were first said).
     stream_said: (Option<Mono>, u64, u64),
     taken: Vec<Region>,
-    /// The live world product and the precise one.
-    live: Gatherer,
-    precise: Gatherer,
+    /// The world product.
+    world: Gatherer,
     /// Regional batches seen, own and peers', by hash.
     regional_seen: Bounded<Hash, ()>,
     /// A model's id, and the hash of its inputs.
@@ -879,8 +869,7 @@ enum Command {
     Frozen(Frozen),
     Identity(Signer),
     Taken(Vec<Region>),
-    Live(bool),
-    Precise(bool),
+    World(bool),
     Advance(Stamp),
 }
 
@@ -988,8 +977,7 @@ impl Products {
             );
             fresh.stream = std::mem::take(&mut held.stream);
             fresh.taken = std::mem::take(&mut held.taken);
-            fresh.live.on = held.live.on;
-            fresh.precise.on = held.precise.on;
+            fresh.world.on = held.world.on;
             fresh.signer = held.signer.take();
             fresh
         };
@@ -1171,17 +1159,12 @@ impl Products {
         self.control(Command::Taken(areas));
     }
 
-    /// Whether this relay gathers and publishes the live world product: a relay at the top of the
+    /// Whether this relay gathers and publishes the world product: a relay at the top of the
     /// area tree, holding every area's positions and regional data.
     /// Only through `Hub::gathering_world`, so the plan holds its fixes' store whenever it
     /// gathers: a relay told here alone had a store of nothing, and gathered one fix.
     pub(crate) fn set_world(&self, world: bool) {
-        self.control(Command::Live(world));
-    }
-
-    /// Whether this relay gathers and publishes the precise world product.
-    pub(crate) fn set_world_precise(&self, precise: bool) {
-        self.control(Command::Precise(precise));
+        self.control(Command::World(world));
     }
 
     /// A setting: waits for room, never refused.
@@ -1316,17 +1299,22 @@ impl Products {
         }
     }
 
-    /// A clock model's manifest (verified), handed in by session `source`: the inputs hash its
-    /// solutions' input sets are made with. Positions waiting for it are taken now.
-    pub fn clock_model(&self, model: &ClockModel, source: u64, stamp: Stamp) {
+    /// A clock model's manifest (verified), handed in by session `source`, with the pair model id
+    /// `pair` its encoding is (`publish::pair_model_id`, what fixes cite): the inputs hash its
+    /// fixes' input sets are made with. Positions waiting for it are taken now.
+    pub fn clock_model(&self, model: &ClockModel, pair: Hash, source: u64, stamp: Stamp) {
         let Some(from) = self.handed_by(source, model.engine()) else {
             return;
         };
-        self.record(from, stamp, model.id(), Input::ClockModel(model.clone()));
+        self.record(
+            from,
+            stamp,
+            model.id(),
+            Input::ClockModel(model.clone(), pair),
+        );
     }
 
-    /// Final or provisional positions (verified), handed in by session `source`: candidates for
-    /// the world product.
+    /// Positions (verified), handed in by session `source`: candidates for the world product.
     pub fn positions(&self, positions: &Positions, source: u64, stamp: Stamp) {
         let Some(from) = self.handed_by(source, positions.engine()) else {
             return;
@@ -1350,22 +1338,7 @@ impl Products {
                 From::Peer(asker.source),
                 stamp,
                 world.hash(),
-                Input::World(content, false),
-            );
-        }
-    }
-
-    /// A precise world record a peer sent: as `world_from`, into the precise product.
-    pub fn precise_from(&self, asker: &Asker, world: WorldPrecise, stamp: Stamp) {
-        if asker.role != AskerRole::Relay || world.verify().is_err() {
-            return;
-        }
-        if let Ok(content) = world.content() {
-            self.record(
-                From::Peer(asker.source),
-                stamp,
-                world.hash(),
-                Input::World(content, true),
+                Input::World(content),
             );
         }
     }
@@ -1492,8 +1465,7 @@ impl Sealing {
             stream: Stream::new(stream),
             stream_said: (None, 0, 0),
             taken: Vec::new(),
-            live: Gatherer::new(policy::<_, WORLD_SETTLE_MS>(), false),
-            precise: Gatherer::new(policy::<_, WORLD_PRECISE_SETTLE_MS>(), true),
+            world: Gatherer::new(policy::<_, WORLD_SETTLE_MS>()),
             regional_seen: Bounded::new(REGIONAL_REMEMBERED),
             models: Bounded::new(MODELS_REMEMBERED),
             waiting: Tree::new(),
@@ -1529,8 +1501,7 @@ impl Sealing {
             }
             Command::Identity(signer) => self.signer = Some(signer),
             Command::Taken(areas) => self.taken = areas,
-            Command::Live(on) => self.live.on = on,
-            Command::Precise(on) => self.precise.on = on,
+            Command::World(on) => self.world.on = on,
             Command::Advance(at) => {
                 self.judged = self.judged.max(Some(at));
                 self.advance(at.mono());
@@ -1574,8 +1545,8 @@ impl Sealing {
             // parts of whoever handed it in; any other lets it go now.
             match input {
                 Input::Positions(positions) => self.take_positions(positions, stamp, held),
-                Input::ClockModel(model) => self.clock_model(&model, stamp),
-                Input::World(content, precise) => self.take_world(content, precise, stamp),
+                Input::ClockModel(model, pair) => self.clock_model(&model, pair, stamp),
+                Input::World(content) => self.take_world(content, stamp),
                 Input::Regional(source, who, regional) => {
                     self.regional_from((source, who), regional, stamp, held);
                 }
@@ -1711,32 +1682,24 @@ impl Sealing {
             return out;
         };
         let judged = stamp.moment().at(now).judged();
-        let live = self.seal(false, judged);
-        let precise = self.seal(true, judged);
-        if !live.is_empty() || !precise.is_empty() {
+        let sealed = self.seal(judged);
+        if !sealed.is_empty() {
             self.count_unsynced();
         }
-        let unsigned = |sealed: &[(u64, Vec<WorldFix>)]| -> u64 {
-            sealed.iter().map(|(_, fixes)| fixes.len() as u64).sum()
-        };
+        let unsigned: u64 = sealed.iter().map(|(_, fixes)| fixes.len() as u64).sum();
         let Some(signer) = self.signer() else {
-            self.report.world_unsigned += unsigned(&live) + unsigned(&precise);
+            self.report.world_unsigned += unsigned;
             return out;
         };
         crate::signer::with(&signer, stamp, |signing| {
             let Some(identity) = signing else {
-                self.report.world_unsigned += unsigned(&live) + unsigned(&precise);
+                self.report.world_unsigned += unsigned;
                 return;
             };
-            for (second, fixes) in live {
+            for (second, fixes) in sealed {
                 let parts = world_parts(identity, second, fixes);
                 self.report.world_signed += parts.len() as u64;
                 out.extend(parts.into_iter().map(Record::WorldPositions));
-            }
-            for (second, fixes) in precise {
-                let parts = precise_parts(identity, second, fixes);
-                self.report.precise_signed += parts.len() as u64;
-                out.extend(parts.into_iter().map(Record::WorldPrecise));
             }
         });
         out
@@ -1867,11 +1830,10 @@ impl Sealing {
         (streamed, sealed)
     }
 
-    fn clock_model(&mut self, model: &ClockModel, stamp: Stamp) {
+    fn clock_model(&mut self, model: &ClockModel, id: Hash, stamp: Stamp) {
         let Ok(manifest) = model.manifest() else {
             return;
         };
-        let id = model.id();
         self.models.insert(id, manifest.inputs);
         if let Some(mut waiting) = self.waiting.remove(&id) {
             self.waiting_lists -= waiting.bytes();
@@ -1887,23 +1849,18 @@ impl Sealing {
         }
     }
 
-    fn take_world(&mut self, content: WorldPositionsContent, precise: bool, stamp: Stamp) {
-        let on = if precise {
-            self.precise.on
-        } else {
-            self.live.on
-        };
-        if !on {
+    fn take_world(&mut self, content: WorldPositionsContent, stamp: Stamp) {
+        if !self.world.on {
             return;
         }
         for fix in content.fixes {
-            if fix.transmitted.unix_ms / 1_000 != content.second || (precise && fix.provisional) {
+            if fix.transmitted.unix_ms / 1_000 != content.second {
                 continue;
             }
             let derived = self.derived.get(&(fix.origin, fix.origin_index)).copied();
             match derived {
                 Some(digest) if digest != self.digest(&fix) => self.report.world_refuted += 1,
-                _ => self.offer_to(fix, precise, stamp),
+                _ => self.offer_fix(fix, stamp),
             }
         }
     }
@@ -2026,7 +1983,6 @@ impl Sealing {
         for term in fix.covariance.terms() {
             hasher.write_u32(term.to_bits());
         }
-        hasher.write_u8(u8::from(fix.provisional));
         hasher.write_u8(u8::from(fix.mlat));
         hasher.write(&fix.input_set);
         hasher.finish()
@@ -2037,33 +1993,21 @@ impl Sealing {
         self.derived.insert((fix.origin, fix.origin_index), digest);
     }
 
-    /// One candidate, for each world product that takes it.
-    fn offer_fix(&mut self, fix: WorldFix, stamp: Stamp) {
-        self.offer_to(fix, false, stamp);
-        if !fix.provisional {
-            self.offer_to(fix, true, stamp);
-        }
-    }
-
-    /// One candidate for one product, stamped `stamp`: held when its second is open and it ranks
+    /// One candidate for the world, stamped `stamp`: held when its second is open and it ranks
     /// above the aircraft's best so far. Its window is reckoned from its stamp's judging reading
     /// alone, the clock its signed second is compared with, and whether its second is sealed from
     /// the watermarks before its stamp: a record is taken in as the watermark passes its stamp,
     /// before anything is sealed at that watermark, so the seconds already sealed are those the
     /// watermarks before its stamp settled, never those of when it was handled. One stamped while
     /// the clock did not judge is judged by nothing, and not held.
-    fn offer_to(&mut self, fix: WorldFix, precise: bool, stamp: Stamp) {
+    fn offer_fix(&mut self, fix: WorldFix, stamp: Stamp) {
         if !stamp.judging() {
             self.report.world_unjudged += 1;
             return;
         }
         let now = stamp.judged();
-        let gatherer = if precise {
-            &mut self.precise
-        } else {
-            &mut self.live
-        };
-        if !gatherer.on || (gatherer.finals_only && fix.provisional) {
+        let gatherer = &mut self.world;
+        if !gatherer.on {
             return;
         }
         let second = fix.transmitted.unix_ms / 1_000;
@@ -2124,14 +2068,10 @@ impl Sealing {
         gatherer.held += 1;
     }
 
-    /// Every second of one product whose seal has come by the judging clock `now` (at a
-    /// watermark), each with its fixes ascending by address; later candidates for them are late.
-    fn seal(&mut self, precise: bool, now: Judged) -> Vec<(u64, Vec<WorldFix>)> {
-        let gatherer = if precise {
-            &mut self.precise
-        } else {
-            &mut self.live
-        };
+    /// Every second of the world whose seal has come by the judging clock `now` (at a watermark),
+    /// each with its fixes ascending by address; later candidates for them are late.
+    fn seal(&mut self, now: Judged) -> Vec<(u64, Vec<WorldFix>)> {
+        let gatherer = &mut self.world;
         // Second `s` is due once `(s + 1) * 1000 + settle` has passed.
         let Some(due) = (now.earlier(gatherer.settle).ms() / 1_000).checked_sub(1) else {
             return Vec::new();
@@ -2361,30 +2301,6 @@ impl Drop for Pool {
     }
 }
 
-/// One second's final fixes, ascending by address, as signed precise parts of at most
-/// `MAX_WORLD_FIXES`.
-pub fn precise_parts(
-    identity: &impl Signs,
-    second: u64,
-    fixes: Vec<WorldFix>,
-) -> Vec<WorldPrecise> {
-    fixes
-        .chunks(MAX_WORLD_FIXES)
-        .enumerate()
-        .filter_map(|(part, chunk)| {
-            WorldPrecise::sign(
-                identity,
-                &WorldPositionsContent {
-                    second,
-                    part: u16::try_from(part).ok()?,
-                    fixes: chunk.to_vec(),
-                },
-            )
-            .ok()
-        })
-        .collect()
-}
-
 /// One second's fixes, ascending by address, as signed parts of at most `MAX_WORLD_FIXES`.
 pub fn world_parts(
     identity: &impl Signs,
@@ -2411,39 +2327,44 @@ pub fn world_parts(
 /// What a `Positions` record yields for the world product.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Derived {
-    /// One fix per solution, in the record's order.
+    /// One world fix per MLAT fix, in the record's order.
     Fixes(Vec<WorldFix>),
-    /// A solution cites a model whose inputs are not known yet: this one.
+    /// A fix was solved under a model whose inputs are not known yet: this one.
     NeedsModel(Hash),
 }
 
-/// The world fixes of a final (`Positions`) or provisional (`Provisional`) record: each solution
-/// as published, its input set the merge rule's over its observations and the inputs hash of the
-/// model it cites (`inputs_of`, by model id).
+/// The world fixes of a `Positions` record (format 7): each fix as published, its input set the
+/// merge rule's over the receptions it considered and what the models it was solved under are a
+/// function of together (`publish::cited_inputs` over each one's inputs hash, `inputs_of`, by pair
+/// model id, in the order the fix lists them).
 pub fn positions_fixes(
     positions: &Positions,
     inputs_of: impl Fn(&Hash) -> Option<Hash>,
 ) -> Result<Derived, WireError> {
-    let content = positions.solutions()?;
+    let content = positions.fixes()?;
     let origin = positions.hash();
     let source = positions.engine()?;
-    let provisional = positions.is_provisional();
-    let mut fixes = Vec::with_capacity(content.solutions.len());
-    for (index, solution) in content.solutions.iter().enumerate() {
-        let Some(inputs) = inputs_of(&solution.clock_model) else {
-            return Ok(Derived::NeedsModel(solution.clock_model));
-        };
+    let mut fixes = Vec::with_capacity(content.fixes.len());
+    for (index, fix) in content.fixes.iter().enumerate() {
+        let mut cited = Vec::with_capacity(fix.models.len());
+        for id in &fix.models {
+            let Some(inputs) = inputs_of(id) else {
+                return Ok(Derived::NeedsModel(*id));
+            };
+            cited.push(inputs);
+        }
+        let inputs = tally_mlat_solver::publish::cited_inputs(cited);
         fixes.push(WorldFix {
-            address: solution.address,
-            transmitted: solution.transmitted,
-            lat_e7: solution.lat_e7,
-            lon_e7: solution.lon_e7,
-            alt_hae_mm: solution.alt_hae_mm,
-            pressure_altitude_ft: pressure_ft(solution.observations.message()),
-            covariance: solution.covariance,
-            provisional,
+            address: fix.address,
+            transmitted: fix.transmitted,
+            lat_e7: fix.lat_e7,
+            lon_e7: fix.lon_e7,
+            alt_hae_mm: fix.alt_hae_mm,
+            pressure_altitude_ft: pressure_ft(fix.considered().message()),
+            covariance: fix.covariance,
             mlat: true,
-            input_set: input_set(&solution.observations, &inputs),
+            input_set: input_set(fix.considered(), &inputs),
+            considered: u16::try_from(fix.considered().receptions().len()).unwrap_or(u16::MAX),
             source,
             origin,
             origin_index: u16::try_from(index).map_err(|_| WireError::Oversize(index))?,
@@ -2495,9 +2416,9 @@ pub fn regional_fixes(regional: &RegionalBatch) -> Result<Vec<WorldFix>, WireErr
                 alt_hae_mm,
                 pressure_altitude_ft: pressure_ft(&observation.data),
                 covariance,
-                provisional: false,
                 mlat: false,
                 input_set: adsb_input_set(&observation.data, &pair.data),
+                considered: 2,
                 source,
                 origin,
                 origin_index,
@@ -2601,7 +2522,7 @@ pub fn check_fix(
                 .into_iter()
                 .find(|derived| derived.origin_index == fix.origin_index)
         }
-        Record::Positions(positions) | Record::Provisional(positions) => {
+        Record::Positions(positions) => {
             if positions.hash() != fix.origin {
                 return Err(refuted(0));
             }

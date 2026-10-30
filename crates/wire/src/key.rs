@@ -37,6 +37,15 @@ impl PublicKey {
         VerifyingKey::from_bytes(&array).map_err(|error| WireError::Key(error.to_string()))
     }
 
+    /// The key in `bytes`, already checked as a point when these same bytes were read before
+    /// (`positions::Positions`, its receivers): its length alone is checked again.
+    pub(crate) fn checked_before(bytes: &[u8]) -> Result<Self, WireError> {
+        let array: [u8; KEY_LEN] = bytes.try_into().map_err(|_| {
+            WireError::Key(format!("expected {KEY_LEN} bytes, got {}", bytes.len()))
+        })?;
+        Ok(Self(array))
+    }
+
     pub fn from_slice(bytes: &[u8]) -> Result<Self, WireError> {
         let array: [u8; KEY_LEN] = bytes.try_into().map_err(|_| {
             WireError::Key(format!("expected {KEY_LEN} bytes, got {}", bytes.len()))

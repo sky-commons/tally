@@ -10,12 +10,12 @@ use tally_wire::clocks::recorded::aligned;
 
 use tally_mlat_solver::modes::{self, LatLon};
 use tally_wire::batch::{Hash, format};
-use tally_wire::positions::{AddressedCitation, EnuCovariance, Solution, TransmitTime};
+use tally_wire::positions::{EnuCovariance, Fix, FixSets, FixesContent, TransmitTime};
 use tally_wire::rendezvous::area_of;
 use tally_wire::{
     BatchContent, Clock, ClockModel, ClockModelContent, Decoded, Identity, Location, Observation,
     ObservationSet, Positions, PublicKey, ReceiverInfo, Reception, Record, Region, RegionalBatch,
-    RegionalBatchContent, SolutionsContent, Streams, WireError, WorldPositions,
+    RegionalBatchContent, Streams, WireError, WorldPositions,
 };
 
 use super::{
@@ -211,16 +211,20 @@ fn regional(
     .map_err(err)
 }
 
-/// An MLAT engine's model and a record of solutions under it, one per address at `ms`.
+/// An MLAT engine's model and a record of fixes under it, one per address at `ms`.
 struct Mlat {
     engine: Identity,
     model: ClockModel,
+    /// The pair model id its fixes cite, its own (the product never decodes the model, so any id
+    /// stands): its engine's key.
+    pair: Hash,
     receivers: Vec<PublicKey>,
 }
 
 impl Mlat {
     fn new() -> Result<Self> {
         let engine = Identity::generate().map_err(err)?;
+        let pair = *engine.public().as_bytes();
         let model = ClockModel::sign(
             &engine,
             &ClockModelContent {
@@ -241,23 +245,23 @@ impl Mlat {
         Ok(Self {
             engine,
             model,
+            pair,
             receivers,
         })
     }
 
     fn inputs_of(&self) -> impl Fn(&Hash) -> Option<Hash> + '_ {
-        |id| (*id == self.model.id()).then_some([0x5a; 32])
+        |id| (*id == self.pair).then_some([0x5a; 32])
     }
 
-    fn solutions(
+    fn fixes(
         &self,
         addresses: &[u32],
         ms: u64,
         sub_ms_ps: u32,
-        provisional: bool,
         sequence: u64,
     ) -> Result<Positions> {
-        let solutions = addresses
+        let fixes = addresses
             .iter()
             .map(|address| {
                 let receptions = self
@@ -269,7 +273,8 @@ impl Mlat {
                         counter: (ms % 1_000_000) * 12_000 + u64::from(*address),
                     })
                     .collect();
-                Ok(Solution {
+                let considered = ObservationSet::new(all_call(*address), receptions)?;
+                Ok(Fix {
                     address: *address,
                     transmitted: TransmitTime::new(ms, sub_ms_ps)?,
                     lat_e7: 337_000_000 + *address as i32,
@@ -283,33 +288,20 @@ impl Mlat {
                         yz: 0.0,
                         zz: 2_500.0,
                     },
-                    clock_model: self.model.id(),
-                    addressed: if provisional {
-                        AddressedCitation::default()
-                    } else {
-                        AddressedCitation {
-                            hash: [3; 32],
-                            count: 4,
-                        }
-                    },
-                    observations: ObservationSet::new(all_call(*address), receptions)?,
+                    models: vec![self.pair],
+                    sets: FixSets::new(considered.clone(), considered)?,
                 })
             })
             .collect::<std::result::Result<Vec<_>, WireError>>()
             .map_err(err)?;
-        let content = SolutionsContent {
+        let content = FixesContent {
             boot_id: 1,
             sequence,
             issued_ms: ms,
-            spec_version: 3,
-            solutions,
+            spec_version: 7,
+            fixes,
         };
-        if provisional {
-            Positions::sign_provisional(&self.engine, &content)
-        } else {
-            Positions::sign_solutions(&self.engine, &content)
-        }
-        .map_err(err)
+        Positions::sign_fix(&self.engine, &content).map_err(err)
     }
 }
 
@@ -323,7 +315,7 @@ struct Inputs {
 }
 
 /// Two seconds of one area: ADS-B aircraft heard by two origins (each signing its own regional
-/// batches, overlapping), and MLAT targets with a provisional and a final fix each second.
+/// batches, overlapping), and MLAT targets with two fixes each second.
 fn world_inputs(second: u64) -> Result<Inputs> {
     let cell = area_of(&place(33.7, -84.4)).map_err(err)?;
     let adsb: Vec<u32> = (0x00a0_0000..0x00a0_0000 + 60).collect();
@@ -353,10 +345,10 @@ fn world_inputs(second: u64) -> Result<Inputs> {
     let mut positions = Vec::new();
     for offset in 0..2 {
         let ms = (second + offset) * 1_000;
-        positions.push(mlat.solutions(&targets, ms + 100, 5, false, offset * 2)?);
-        positions.push(mlat.solutions(&targets, ms + 900, 7, true, offset * 2 + 1)?);
-        // A second provisional of the first half, earlier in the second: never the newest.
-        positions.push(mlat.solutions(&targets[..6], ms + 50, 0, true, 100 + offset)?);
+        positions.push(mlat.fixes(&targets, ms + 100, 5, offset * 2)?);
+        positions.push(mlat.fixes(&targets, ms + 900, 7, offset * 2 + 1)?);
+        // A third fix of the first half, earlier in the second: never the newest.
+        positions.push(mlat.fixes(&targets[..6], ms + 50, 0, 100 + offset)?);
     }
     Ok(Inputs {
         regional: regional_batches,
@@ -388,7 +380,7 @@ fn gather(inputs: &Inputs, second: u64, reversed: bool) -> Result<(Identity, Vec
         shown.reverse();
     } else {
         // The model first, so nothing waits for it.
-        products.clock_model(&inputs.mlat.model, PEER, stamp(now));
+        products.clock_model(&inputs.mlat.model, inputs.mlat.pair, PEER, stamp(now));
     }
     for record in shown {
         match record {
@@ -400,9 +392,9 @@ fn gather(inputs: &Inputs, second: u64, reversed: bool) -> Result<(Identity, Vec
         }
     }
     if reversed {
-        // The model last (stamped after them, records are taken in by stamp): every solution
-        // waited for it.
-        products.clock_model(&inputs.mlat.model, PEER, stamp(now + 1));
+        // The model last (stamped after them, records are taken in by stamp): every fix waited
+        // for it.
+        products.clock_model(&inputs.mlat.model, inputs.mlat.pair, PEER, stamp(now + 1));
     }
     let mut out = Vec::new();
     for record in tick(&products, Some(&relay), sealed_at(second + 1)) {
@@ -482,14 +474,12 @@ fn every_world_fix_checks_against_the_record_it_cites() -> Result<()> {
         .regional
         .iter()
         .map(|batch| (batch.hash(), Record::RegionalBatch(batch.clone())))
-        .chain(inputs.positions.iter().map(|positions| {
-            let record = if positions.is_provisional() {
-                Record::Provisional(positions.clone())
-            } else {
-                Record::Positions(positions.clone())
-            };
-            (positions.hash(), record)
-        }))
+        .chain(
+            inputs
+                .positions
+                .iter()
+                .map(|positions| (positions.hash(), Record::Positions(positions.clone()))),
+        )
         .collect();
     let mut checked = 0;
     for part in &world {
@@ -539,7 +529,7 @@ fn adsb_and_mlat_aircraft_are_both_in_the_world_and_the_rule_picks_as_the_merge_
     for (at, fixes) in &by_second {
         for address in &inputs.adsb {
             let fix = fixes.get(address).ok_or("an ADS-B aircraft is missing")?;
-            assert!(!fix.provisional);
+            assert!(!fix.mlat);
             // Decoded where it was: within a metre or two of CPR's resolution.
             let truth = position_of(*address, *at);
             assert!((f64::from(fix.lat_e7) / 1e7 - truth.lat_deg).abs() < 1e-4);
@@ -559,8 +549,8 @@ fn adsb_and_mlat_aircraft_are_both_in_the_world_and_the_rule_picks_as_the_merge_
         }
         for address in &inputs.targets {
             let fix = fixes.get(address).ok_or("an MLAT target is missing")?;
-            // The provisional at .900 is later than the final at .100: the merge rule serves it.
-            assert!(fix.provisional);
+            // The fix at .900 is the newest: the merge rule serves it.
+            assert!(fix.mlat);
             assert_eq!(fix.transmitted.unix_ms, at * 1_000 + 900);
         }
     }
@@ -578,12 +568,12 @@ fn no_aircraft_has_two_fixes_in_one_second_and_a_late_fix_is_dropped() -> Result
     let _member = products.member(PEER);
     products.set_world(true);
     let mlat = Mlat::new()?;
-    products.clock_model(&mlat.model, PEER, stamp(BASE_MS));
+    products.clock_model(&mlat.model, mlat.pair, PEER, stamp(BASE_MS));
     let first = BASE_MS / 1_000;
     let addresses: Vec<u32> = (1..=20).collect();
     let mut published = Vec::new();
     let mut sequence = 0;
-    // Ten seconds, each with four regional batches and three provisional records per aircraft,
+    // Ten seconds, each with four regional batches and three MLAT records per aircraft,
     // ticked every 250 ms as the relay is, until the last of them is sealed.
     let steps = 44 + WORLD_SETTLE_MS / 250;
     for step in 0..steps {
@@ -603,11 +593,10 @@ fn no_aircraft_has_two_fixes_in_one_second_and_a_late_fix_is_dropped() -> Result
             );
             sequence += 1;
             for (n, offset) in [10, 400, 800].into_iter().enumerate() {
-                let record = mlat.solutions(
+                let record = mlat.fixes(
                     &[0x00c0_0001, 0x00c0_0002],
                     at * 1_000 + offset,
                     0,
-                    true,
                     sequence * 4 + n as u64,
                 )?;
                 products.positions(&record, PEER, stamp(now));
@@ -633,7 +622,7 @@ fn no_aircraft_has_two_fixes_in_one_second_and_a_late_fix_is_dropped() -> Result
     assert_eq!(seconds, (first..first + 10).collect());
     assert_eq!(seen.len(), 10 * (addresses.len() + 2));
     // A fix for a second already sealed is late, and changes nothing published.
-    let late = mlat.solutions(&[0x00c0_0003], first * 1_000 + 500, 0, false, 9_999)?;
+    let late = mlat.fixes(&[0x00c0_0003], first * 1_000 + 500, 0, 9_999)?;
     products.positions(&late, PEER, stamp(BASE_MS + steps * 250));
     // Taken in once the watermark passes its stamp.
     let after = tick(&products, Some(&relay), BASE_MS + steps * 250 + 250);
@@ -1128,7 +1117,7 @@ fn what_a_busy_area_and_the_world_cost_a_second() -> Result<()> {
     let regional_per_s = wire_bytes(&regional_records)? as f64 / SECONDS as f64;
 
     // The world: 12,000 ADS-B aircraft (regional batches from every area) and 5,400 MLAT targets
-    // (provisional and final records), gathered over five seconds.
+    // (two records of each a second, one of them a minute late), gathered over five seconds.
     const WORLD_ADSB: u32 = 12_000;
     const WORLD_TARGETS: u32 = 5_400;
     let gatherer = Products::new();
@@ -1138,8 +1127,8 @@ fn what_a_busy_area_and_the_world_cost_a_second() -> Result<()> {
     let peer = Identity::generate().map_err(err)?.public();
     let origin = Identity::generate().map_err(err)?;
     let mlat = Mlat::new()?;
-    gatherer.clock_model(&mlat.model, PEER, stamp(BASE_MS));
-    // Running already: what was due before is sealed, so a final fix a minute late is late.
+    gatherer.clock_model(&mlat.model, mlat.pair, PEER, stamp(BASE_MS));
+    // Running already: what was due before is sealed, so a fix a minute late is late.
     tick(&gatherer, Some(&relay), BASE_MS - 500);
     let cell = area_of(&location).map_err(err)?;
     let adsb: Vec<u32> = (0x0040_0000..0x0040_0000 + WORLD_ADSB).collect();
@@ -1158,18 +1147,12 @@ fn what_a_busy_area_and_the_world_cost_a_second() -> Result<()> {
             for (n, chunk) in targets.chunks(100).enumerate() {
                 let n = n as u64;
                 gatherer.positions(
-                    &mlat.solutions(chunk, at * 1_000 + 200, 0, true, sequence * 1_000 + 2 * n)?,
+                    &mlat.fixes(chunk, at * 1_000 + 200, 0, sequence * 1_000 + 2 * n)?,
                     PEER,
                     stamp(now),
                 );
                 gatherer.positions(
-                    &mlat.solutions(
-                        chunk,
-                        at * 1_000 - 60_000,
-                        0,
-                        false,
-                        sequence * 1_000 + 2 * n + 1,
-                    )?,
+                    &mlat.fixes(chunk, at * 1_000 - 60_000, 0, sequence * 1_000 + 2 * n + 1)?,
                     PEER,
                     stamp(now),
                 );
@@ -1214,80 +1197,6 @@ fn what_a_busy_area_and_the_world_cost_a_second() -> Result<()> {
     Ok(())
 }
 
-/// The two world products (RFC-0174 §2.11), each opt-in: the live one seals a second
-/// `WORLD_SETTLE_MS` after it ends and draws an MLAT aircraft by its provisional fix; the precise
-/// one seals `WORLD_PRECISE_SETTLE_MS` after it ends and takes only final fixes, ADS-B as the live
-/// one. Each is its own record, under its own signing domain, and costs what the live one does.
-#[test]
-fn the_precise_world_waits_for_finals_and_takes_no_provisional() -> Result<()> {
-    let second = BASE_MS / 1_000;
-    let inputs = world_inputs(second)?;
-    let relay = Identity::generate().map_err(err)?;
-    let peer = Identity::generate().map_err(err)?.public();
-    let products = Products::new();
-    // The peer that hands these in is a member admitted, as one is on its first data.
-    let _member = products.member(PEER);
-    products.set_world(true);
-    products.set_world_precise(true);
-    let now = second * 1_000 + 1_500;
-    products.clock_model(&inputs.mlat.model, PEER, stamp(now));
-    for batch in &inputs.regional {
-        products.regional_from(&relay_asker(peer), verified(batch.clone())?, stamp(now));
-    }
-    for positions in &inputs.positions {
-        products.positions(positions, PEER, stamp(now));
-    }
-    let live_at = sealed_at(second + 1);
-    let early = tick(&products, Some(&relay), live_at);
-    assert!(early.iter().any(|r| matches!(r, Record::WorldPositions(_))));
-    assert!(!early.iter().any(|r| matches!(r, Record::WorldPrecise(_))));
-    // Not before its seal: (second + 2) * 1000 + WORLD_PRECISE_SETTLE_MS for both seconds.
-    let before = (second + 1) * 1_000 + super::WORLD_PRECISE_SETTLE_MS - 1;
-    assert!(
-        !tick(&products, Some(&relay), before)
-            .iter()
-            .any(|r| matches!(r, Record::WorldPrecise(_)))
-    );
-    let sealed = tick(
-        &products,
-        Some(&relay),
-        (second + 2) * 1_000 + super::WORLD_PRECISE_SETTLE_MS,
-    );
-    let mut precise = Vec::new();
-    let mut bytes = 0;
-    for record in &sealed {
-        if let Record::WorldPrecise(world) = record {
-            world.verify().map_err(err)?;
-            // Its own domain: a precise record is no live one.
-            let as_live = WorldPositions::from_bytes(world.as_bytes().to_vec()).map_err(err)?;
-            assert!(as_live.verify().is_err());
-            bytes += world.as_bytes().len();
-            precise.extend(world.content().map_err(err)?.fixes);
-        }
-    }
-    assert!(!precise.is_empty());
-    assert!(precise.iter().all(|fix| !fix.provisional));
-    for address in &inputs.targets {
-        // The final at .100 of each second, never the later provisional.
-        assert!(
-            precise
-                .iter()
-                .filter(|fix| fix.address == *address)
-                .all(|fix| fix.transmitted.unix_ms % 1_000 == 100)
-        );
-    }
-    let per_fix = bytes as f64 / precise.len() as f64;
-    eprintln!(
-        "precise world: {} fixes in {bytes} bytes, {per_fix:.1} bytes a fix",
-        precise.len()
-    );
-    assert_eq!(
-        crate::credit::cost(tally_wire::Streams::WORLD_PRECISE, &[]),
-        crate::credit::cost(tally_wire::Streams::WORLD, &[])
-    );
-    Ok(())
-}
-
 /// A world fix is judged ahead by the error budget (`tally_wire::budget::PEER_AHEAD`): its
 /// transmit time is the signed time of the receptions it was solved from, which a relay uses up to
 /// `S` ahead of its clock, so a fix 15 s ahead (`K`, another relay's engine's clock) is held and one
@@ -1299,21 +1208,20 @@ fn a_world_fix_is_judged_ahead_by_the_budget() -> Result<()> {
     let _member = products.member(PEER);
     products.set_world(true);
     let mlat = Mlat::new()?;
-    products.clock_model(&mlat.model, PEER, stamp(BASE_MS));
-    let within = mlat.solutions(
+    products.clock_model(&mlat.model, mlat.pair, PEER, stamp(BASE_MS));
+    let within = mlat.fixes(
         &[0x00c0_0001],
         BASE_MS
             + tally_wire::budget::K
                 .span::<tally_wire::clocks::Judged>()
                 .ms(),
         0,
-        true,
         1,
     )?;
     products.positions(&within, PEER, stamp(BASE_MS));
     products.advance(stamp(BASE_MS + 1));
     assert_eq!(products.report().world_out_of_window, 0);
-    let past = mlat.solutions(
+    let past = mlat.fixes(
         &[0x00c0_0002],
         BASE_MS
             + tally_wire::budget::PEER_AHEAD
@@ -1321,7 +1229,6 @@ fn a_world_fix_is_judged_ahead_by_the_budget() -> Result<()> {
                 .ms()
             + 1_000,
         0,
-        true,
         2,
     )?;
     products.positions(&past, PEER, stamp(BASE_MS + 1));
@@ -1368,7 +1275,7 @@ fn a_relay_that_starts_unsynced_and_steps_forward_hours_judges_the_world_by_its_
     products.set_world(true);
     // Unsynced: shown the inputs, it holds none of them.
     let early = second * 1_000 - 60_000;
-    products.clock_model(&inputs.mlat.model, PEER, at(early, false));
+    products.clock_model(&inputs.mlat.model, inputs.mlat.pair, PEER, at(early, false));
     for positions in &inputs.positions {
         products.positions(positions, PEER, at(early, false));
     }
@@ -1413,14 +1320,14 @@ fn every_drop_is_counted_by_why() -> Result<()> {
     products.set_world(true);
     let mlat = Mlat::new()?;
     // A fix a minute ahead of the relay's clock, under a model it holds: outside the window.
-    products.clock_model(&mlat.model, PEER, stamp(BASE_MS));
-    let ahead = mlat.solutions(&[0x00c0_0001], BASE_MS + 60_000, 0, true, 1)?;
+    products.clock_model(&mlat.model, mlat.pair, PEER, stamp(BASE_MS));
+    let ahead = mlat.fixes(&[0x00c0_0001], BASE_MS + 60_000, 0, 1)?;
     products.positions(&ahead, PEER, stamp(BASE_MS));
     products.advance(stamp(BASE_MS + 1));
     assert_eq!(products.report().world_out_of_window, 1);
     // Positions under a model never shown: they wait, then expire, counted.
     let other = Mlat::new()?;
-    let waiting = other.solutions(&[0x00c0_0002], BASE_MS, 0, false, 2)?;
+    let waiting = other.fixes(&[0x00c0_0002], BASE_MS, 0, 2)?;
     products.positions(&waiting, PEER, stamp(BASE_MS));
     // Handed in after the watermark passed `BASE_MS + 1`, it is stamped there, never earlier, so
     // it waits from then: still waiting a full `WAITING_MS` later, expired just after.
@@ -1495,7 +1402,7 @@ fn records_wait_apart_from_the_epochs_and_are_taken_in_by_stamp() -> Result<()> 
         None,
     )?;
     let mlat = Mlat::new()?;
-    let flood = mlat.solutions(&[0x00c0_0001], BASE_MS, 0, true, 1)?;
+    let flood = mlat.fixes(&[0x00c0_0001], BASE_MS, 0, 1)?;
     const HELD: usize = 1_000;
     let len = flood.as_bytes().len();
     let budget = products_budget(1 << 20, HELD * len);
@@ -1554,13 +1461,13 @@ fn records_wait_apart_from_the_epochs_and_are_taken_in_by_stamp() -> Result<()> 
     let mlat = Mlat::new()?;
     let second = BASE_MS / 1_000;
     let seals = sealed_at(second);
-    let in_time = mlat.solutions(&[0x00c0_0001], BASE_MS + 100, 0, true, 1)?;
-    let late = mlat.solutions(&[0x00c0_0002], BASE_MS + 200, 0, true, 2)?;
+    let in_time = mlat.fixes(&[0x00c0_0001], BASE_MS + 100, 0, 1)?;
+    let late = mlat.fixes(&[0x00c0_0002], BASE_MS + 200, 0, 2)?;
     let wanted = mlat.model.as_bytes().len() + in_time.as_bytes().len() + late.as_bytes().len();
     let limit = wanted + HELD * len;
     let budget = products_budget(64 * 1024, limit);
     products.charge_to(&budget);
-    products.clock_model(&mlat.model, PEER, stamp(BASE_MS));
+    products.clock_model(&mlat.model, mlat.pair, PEER, stamp(BASE_MS));
     products.positions(&late, PEER, stamp(seals));
     products.positions(&in_time, PEER, stamp(seals - 1));
     // The flood comes from another member than the engine's records: it fills a part of its
@@ -1609,8 +1516,7 @@ fn own_output_and_each_session_have_a_part_of_the_records_share_whatever_came_fi
     let own = Mlat::new()?;
     let throwaway: Vec<Mlat> = (0..16).map(|_| Mlat::new()).collect::<Result<_>>()?;
     let honest: Vec<Mlat> = (0..HONEST).map(|_| Mlat::new()).collect::<Result<_>>()?;
-    let one =
-        |mlat: &Mlat, sequence: u64| mlat.solutions(&[0x00c0_0001], BASE_MS, 0, true, sequence);
+    let one = |mlat: &Mlat, sequence: u64| mlat.fixes(&[0x00c0_0001], BASE_MS, 0, sequence);
     let len = one(&own, 0)?.as_bytes().len();
     // A share of two hundred records; every record is stamped far ahead, so none is taken in.
     let limit = 200 * len;
@@ -1677,7 +1583,7 @@ fn own_output_and_each_session_have_a_part_of_the_records_share_whatever_came_fi
 #[test]
 fn a_session_leaving_gives_its_part_to_those_open() -> Result<()> {
     let mlat = Mlat::new()?;
-    let one = |sequence: u64| mlat.solutions(&[0x00c0_0001], BASE_MS, 0, true, sequence);
+    let one = |sequence: u64| mlat.fixes(&[0x00c0_0001], BASE_MS, 0, sequence);
     let len = one(0)?.as_bytes().len();
     let limit = 200 * len;
     let ahead = BASE_MS + 1_000_000;
@@ -1716,7 +1622,7 @@ fn only_a_member_admitted_divides_the_records_share() -> Result<()> {
         crate::clock::RelayClock::system(),
     );
     let mlat = Mlat::new()?;
-    let one = |sequence: u64| mlat.solutions(&[0x00c0_0001], BASE_MS, 0, true, sequence);
+    let one = |sequence: u64| mlat.fixes(&[0x00c0_0001], BASE_MS, 0, sequence);
     let len = one(0)?.as_bytes().len();
     let limit = 200 * len;
     let ahead = BASE_MS + 1_000_000;
@@ -2348,7 +2254,7 @@ fn the_records_waiting_for_the_sealer_are_charged_what_they_allocate() -> Result
     let _member = products.member(PEER);
     let mlat = Mlat::new()?;
     let records: Vec<_> = (0..40u32)
-        .map(|n| mlat.solutions(&[0x00c0_0001 + n], BASE_MS, 0, true, u64::from(n) + 1))
+        .map(|n| mlat.fixes(&[0x00c0_0001 + n], BASE_MS, 0, u64::from(n) + 1))
         .collect::<Result<_>>()?;
     let len = records[0].as_bytes().len();
     let budget = products_budget(1 << 20, 400 * len);
@@ -2395,7 +2301,7 @@ fn the_positions_waiting_for_their_models_are_charged_what_their_tree_allocates(
     products.set_world(true);
     let models = (0..30).map(|_| Mlat::new()).collect::<Result<Vec<_>>>()?;
     for (n, mlat) in models.iter().enumerate() {
-        let waiting = mlat.solutions(&[0x00c0_0002 + n as u32], BASE_MS, 0, false, n as u64 + 1)?;
+        let waiting = mlat.fixes(&[0x00c0_0002 + n as u32], BASE_MS, 0, n as u64 + 1)?;
         products.positions(&waiting, PEER, stamp(BASE_MS));
         tick(&products, None, BASE_MS + 1 + n as u64);
         let sealer = products.sealer.read().map_err(|_| "poisoned")?;
@@ -2476,9 +2382,9 @@ fn a_clock_that_stops_judging_while_an_epoch_seals_signs_none_of_it() -> Result<
     Ok(())
 }
 
-/// A provisional or final MLAT fix of `address` transmitted at `transmitted_ms`, as a world
-/// product's gatherer is offered it.
-fn world_fix(address: u32, transmitted_ms: u64, provisional: bool) -> tally_wire::WorldFix {
+/// An MLAT fix of `address` transmitted at `transmitted_ms`, as the world product's gatherer is
+/// offered it.
+fn world_fix(address: u32, transmitted_ms: u64) -> tally_wire::WorldFix {
     tally_wire::WorldFix {
         address,
         transmitted: TransmitTime {
@@ -2497,31 +2403,30 @@ fn world_fix(address: u32, transmitted_ms: u64, provisional: bool) -> tally_wire
             yz: 0.0,
             zz: 2_500.0,
         },
-        provisional,
         mlat: true,
         input_set: [1; 32],
+        considered: 2,
         source: Identity::from_seed([73; 32]).public(),
         origin: [2; 32],
         origin_index: 0,
     }
 }
 
-/// A sealer gathering both world products, signing as a synced relay.
+/// A sealer gathering the world product, signing as a synced relay.
 fn world_sealing() -> crate::products::Sealing {
     let mut sealing =
         crate::products::Sealing::new((1, 2), 1, Arc::new(crate::products::Shared::default()));
     sealing.signer = Some(crate::signer::synced(crate::signer::twin(
         &Identity::from_seed([74; 32]),
     )));
-    sealing.live.on = true;
-    sealing.precise.on = true;
+    sealing.world.on = true;
     sealing
 }
 
 /// A fix of an origin whose receptions were signed up to `E + 2U_m` below its relay's clock, or
-/// heard on a relay `K` from this one, reaches this relay up to the live settle after its second
-/// ends (`tally_wire::budget::LIVE_FIX_ARRIVED`, both paths): it is sealed in its second, never
-/// counted late. Before, the live world sealed a second 4 s after it ended, so this honest fix,
+/// heard on a relay `K` from this one, reaches this relay up to the world's settle after its
+/// second ends (`tally_wire::budget::FIX_ARRIVED`, both paths): it is sealed in its second, never
+/// counted late. Before, the world sealed a second 4 s after it ended, so this honest fix,
 /// arriving 32 s after, was late.
 #[test]
 fn a_fix_of_a_lagging_origin_or_a_peer_k_apart_is_sealed_in_its_second() -> Result<()> {
@@ -2531,15 +2436,15 @@ fn a_fix_of_a_lagging_origin_or_a_peer_k_apart_is_sealed_in_its_second() -> Resu
     products.set_world(true);
     let mlat = Mlat::new()?;
     let second = BASE_MS / 1_000;
-    products.clock_model(&mlat.model, PEER, stamp(BASE_MS));
+    products.clock_model(&mlat.model, mlat.pair, PEER, stamp(BASE_MS));
     let arrives = (second + 1) * 1_000
-        + tally_wire::budget::LIVE_FIX_ARRIVED
+        + tally_wire::budget::FIX_ARRIVED
             .span::<tally_wire::clocks::Judged>()
             .ms()
         - 1;
     // The watermark has reached the moment before it arrives: its second is still open.
     tick(&products, Some(&relay), arrives - 1);
-    let lagging = mlat.solutions(&[0x00c0_0003], BASE_MS + 100, 0, true, 1)?;
+    let lagging = mlat.fixes(&[0x00c0_0003], BASE_MS + 100, 0, 1)?;
     products.positions(&lagging, PEER, stamp(arrives));
     let mut fixes = Vec::new();
     for record in tick(&products, Some(&relay), sealed_at(second)) {
@@ -2552,34 +2457,24 @@ fn a_fix_of_a_lagging_origin_or_a_peer_k_apart_is_sealed_in_its_second() -> Resu
     Ok(())
 }
 
-/// Each world product holds what its own span needs, never the other's room: the precise one
-/// full, the live one still holds a fix, and each cap is its own span's (`world_held`). Before,
-/// both shared one cap, which the precise product, open some 135 seconds, filled for both.
+/// The world holds what its span needs (`world_held`), and a fix past its cap is skipped, counted.
 #[test]
-fn each_world_product_holds_its_own_spans_room() {
+fn the_world_holds_its_spans_room_and_skips_past_it() {
     let mut sealing = world_sealing();
-    assert_eq!(sealing.live.cap, super::world_held(WORLD_SETTLE_MS));
-    assert_eq!(
-        sealing.precise.cap,
-        super::world_held(super::WORLD_PRECISE_SETTLE_MS)
-    );
-    assert!(sealing.live.cap < sealing.precise.cap);
-    sealing.precise.held = sealing.precise.cap;
+    assert_eq!(sealing.world.cap, super::world_held(WORLD_SETTLE_MS));
     sealing.offer_fix(
-        world_fix(0x00c0_0004, BASE_MS + 100, false),
+        world_fix(0x00c0_0004, BASE_MS + 100),
         stamp(BASE_MS + 1_000),
     );
-    assert_eq!(sealing.live.held, 1);
+    assert_eq!(sealing.world.held, 1);
+    assert_eq!(sealing.report.world_skipped, 0);
+    sealing.world.held = sealing.world.cap;
+    sealing.offer_fix(
+        world_fix(0x00c0_0005, BASE_MS + 100),
+        stamp(BASE_MS + 1_000),
+    );
+    assert_eq!(sealing.world.held, sealing.world.cap);
     assert_eq!(sealing.report.world_skipped, 1);
-    // The live one full, it skips its own and the precise one, with room, still holds.
-    sealing.precise.held = 0;
-    sealing.live.held = sealing.live.cap;
-    sealing.offer_fix(
-        world_fix(0x00c0_0005, BASE_MS + 100, false),
-        stamp(BASE_MS + 1_000),
-    );
-    assert_eq!(sealing.precise.held, 1);
-    assert_eq!(sealing.report.world_skipped, 2);
 }
 
 /// Nothing of the world is sealed at a watermark ticked while the relay's clock did not judge
@@ -2590,15 +2485,15 @@ fn a_watermark_ticked_while_the_clock_does_not_judge_seals_no_world_second() {
     let mut sealing = world_sealing();
     let second = BASE_MS / 1_000;
     sealing.offer_fix(
-        world_fix(0x00c0_0006, BASE_MS + 100, true),
+        world_fix(0x00c0_0006, BASE_MS + 100),
         stamp(BASE_MS + 1_000),
     );
-    assert_eq!(sealing.live.held, 1);
+    assert_eq!(sealing.world.held, 1);
     let past = sealed_at(second) + 1_000;
     sealing.judged = Some(Stamp::recorded(past, 0, past, past, false));
     let unjudged = sealing.advance_records(tally_wire::clocks::recorded::mono(past));
     assert!(unjudged.is_empty());
-    assert_eq!(sealing.live.held, 1);
+    assert_eq!(sealing.world.held, 1);
     assert_eq!(sealing.report.world_unsigned, 0);
     sealing.judged = Some(stamp(past + 1));
     let judged = sealing.advance_records(tally_wire::clocks::recorded::mono(past + 1));
@@ -2607,7 +2502,7 @@ fn a_watermark_ticked_while_the_clock_does_not_judge_seals_no_world_second() {
             .iter()
             .any(|record| matches!(record, Record::WorldPositions(_)))
     );
-    assert_eq!(sealing.live.held, 0);
+    assert_eq!(sealing.world.held, 0);
 }
 
 /// Fixes sealed while the relay has no key are counted (`world_unsigned`), never let go silently.
@@ -2616,18 +2511,17 @@ fn world_fixes_sealed_without_a_key_are_counted_unsigned() {
     let mut sealing = world_sealing();
     sealing.signer = None;
     sealing.offer_fix(
-        world_fix(0x00c0_0007, BASE_MS + 100, false),
+        world_fix(0x00c0_0007, BASE_MS + 100),
         stamp(BASE_MS + 1_000),
     );
-    let past = (BASE_MS / 1_000 + 1) * 1_000 + super::WORLD_PRECISE_SETTLE_MS;
+    let past = (BASE_MS / 1_000 + 1) * 1_000 + WORLD_SETTLE_MS;
     sealing.judged = Some(stamp(past));
     assert!(
         sealing
             .advance_records(tally_wire::clocks::recorded::mono(past))
             .is_empty()
     );
-    // The live and the precise product's fix of it.
-    assert_eq!(sealing.report.world_unsigned, 2);
+    assert_eq!(sealing.report.world_unsigned, 1);
 }
 
 /// A world product seals through the furthest second it has reached even while it is not
@@ -2635,12 +2529,12 @@ fn world_fixes_sealed_without_a_key_are_counted_unsigned() {
 #[test]
 fn a_world_product_off_keeps_the_furthest_second_sealed() {
     let mut sealing = world_sealing();
-    sealing.live.on = false;
+    sealing.world.on = false;
     let at = |ms: u64| tally_wire::clocks::recorded::judged(ms);
-    let _ = sealing.seal(false, at(BASE_MS + 60_000));
-    let through = sealing.live.sealed_through;
-    let _ = sealing.seal(false, at(BASE_MS));
-    assert_eq!(sealing.live.sealed_through, through);
+    let _ = sealing.seal(at(BASE_MS + 60_000));
+    let through = sealing.world.sealed_through;
+    let _ = sealing.seal(at(BASE_MS));
+    assert_eq!(sealing.world.sealed_through, through);
 }
 
 /// Positions whose model comes after they waited `WAITING_MS` are counted as expired, as if the
@@ -2651,10 +2545,10 @@ fn positions_whose_model_comes_too_late_are_counted_expired() -> Result<()> {
     let _member = products.member(PEER);
     products.set_world(true);
     let mlat = Mlat::new()?;
-    let waiting = mlat.solutions(&[0x00c0_0008], BASE_MS, 0, false, 1)?;
+    let waiting = mlat.fixes(&[0x00c0_0008], BASE_MS, 0, 1)?;
     products.positions(&waiting, PEER, stamp(BASE_MS));
     let late = BASE_MS + WAITING_MS + 1;
-    products.clock_model(&mlat.model, PEER, stamp(late));
+    products.clock_model(&mlat.model, mlat.pair, PEER, stamp(late));
     products.advance(stamp(late + 1));
     let report = products.report();
     assert_eq!(report.positions_waiting_expired, 1);
@@ -2767,7 +2661,7 @@ fn no_receiver_described_within_the_figure_loses_its_area_whatever_its_raw_shard
     Ok(())
 }
 
-/// A world product's fixes are charged to the world's store (`budget::Store::World`) as each is
+/// The world product's fixes are charged to the world's store (`budget::Store::World`) as each is
 /// held, each fix and each second open at what it takes at most, and a fix past the store is
 /// skipped, counted; sealing gives back what was sealed (the seconds' root kept). Before, the
 /// gatherers' fixes, at their caps some hundreds of MiB, were charged to no store.
@@ -2777,30 +2671,25 @@ fn world_fixes_are_charged_to_the_worlds_store_and_skipped_past_it() {
     let limit = WORLD_SECONDS_ROOT_BYTES + WORLD_SECOND_BYTES + 2 * WORLD_FIX_BYTES;
     let gauge = crate::budget::Gauge::new(crate::budget::Store::World, limit);
     let mut sealing = world_sealing();
-    sealing.precise.on = false;
     if let Ok(mut world) = sealing.shared.world.lock() {
         *world = Arc::clone(&gauge);
     }
     for address in 0x00c0_0010..0x00c0_0013 {
-        sealing.offer_fix(
-            world_fix(address, BASE_MS + 100, false),
-            stamp(BASE_MS + 1_000),
-        );
+        sealing.offer_fix(world_fix(address, BASE_MS + 100), stamp(BASE_MS + 1_000));
     }
-    assert_eq!(sealing.live.held, 2);
+    assert_eq!(sealing.world.held, 2);
     assert_eq!(sealing.report.world_skipped, 1);
     assert_eq!(gauge.held(), limit);
-    // A better fix of one held takes its place and nothing more.
-    let mut better = world_fix(0x00c0_0010, BASE_MS + 100, false);
-    better.provisional = false;
+    // A better fix of one held (a picosecond later) takes its place and nothing more.
+    let mut better = world_fix(0x00c0_0010, BASE_MS + 100);
+    better.transmitted.sub_ms_ps = 1;
     sealing.offer_fix(better, stamp(BASE_MS + 1_000));
     assert_eq!(gauge.held(), limit);
     // Sealed, its fixes and second are given back; the seconds' root is kept.
-    let _ = sealing.seal(
-        false,
-        tally_wire::clocks::recorded::judged(sealed_at(BASE_MS / 1_000) + 1_000),
-    );
-    assert_eq!(sealing.live.held, 0);
+    let _ = sealing.seal(tally_wire::clocks::recorded::judged(
+        sealed_at(BASE_MS / 1_000) + 1_000,
+    ));
+    assert_eq!(sealing.world.held, 0);
     assert_eq!(gauge.held(), WORLD_SECONDS_ROOT_BYTES);
 }
 

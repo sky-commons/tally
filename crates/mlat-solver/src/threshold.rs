@@ -5,16 +5,29 @@
 //! of one over more. A hard cap on what is kept stays, as a refusal by the relay-wide budget,
 //! never as trimming by rank.
 //!
-//! Every threshold below that selects sync events keys on [`sync_key`], so they nest: an event a
-//! smaller threshold keeps is kept by every larger one. Each is stated as an absolute fraction of
-//! every candidate, not of what an earlier threshold kept.
+//! What a holder keeps of one receiver's batch (`arrived::Arrived::admit`) is decided by that
+//! batch alone, so holders of the same batches keep the same receptions whatever order they came
+//! in:
+//!
+//! - **Sync**: every sync event (an airborne position with an altitude) and every operational
+//!   status of a reference aircraft ([`reference`], by its address alone), and nothing of any
+//!   other aircraft. A batch carrying `c` reference events keeps each at the rate
+//!   `min(1, REFERENCE_EVENTS_PER_BATCH / c)` ([`batch_sync_keep`]), by the message alone
+//!   ([`sync_key`]): every receiver of an event keeps it at its own batch's rate, and since the
+//!   key is the message's, a receiver at a lower rate keeps a subset of what one at a higher rate
+//!   keeps. No batch is cut at a cliff: one event more thins a batch by one in `c`.
+//!
+//! - **Replies**: every reply, but those of an aircraft the same batch carries an ADS-B position
+//!   of (it is no MLAT target) unless it is in the calibration sample. Only a batch carrying more
+//!   than [`REPLIES_PER_BATCH`] is thinned, to those [`KEPT_KEEP`] keeps by the message alone
+//!   ([`reply_key`]).
+//!
+//! Each threshold is stated as an absolute fraction of every candidate, not of what an earlier
+//! threshold kept.
 
 use blake2::{Blake2s256, Digest};
 
 use crate::obs::Reception;
-
-/// What a sync event's selection key is hashed under.
-const SYNC_DOMAIN: &[u8] = b"tally sync selection";
 
 /// Keep iff the first eight bytes of a hash, big-endian, are below `self.0`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -39,39 +52,87 @@ impl Threshold {
     }
 }
 
-// The placeholder rates below are today's top-k caps over the rates they bind at; the trailing
-// window sweep (trailing_tests.rs) measures and replaces each.
+/// Reference aircraft: an aircraft's sync events are all kept when its [`reference_key`] is below
+/// this, and none otherwise. It keeps every aircraft heard with ADS-B (ruled 2026-10-24): at about
+/// a quarter of them (the old `SYNC_AIRCRAFT_MAX = 16` of 60) the sweep's tiles had one reference
+/// aircraft at the median and the calibration mix's median error was 46.5 m; with all of them,
+/// 33.8 m. It stays a threshold, so a holder of fewer batches keeps a subset, and a rate below a
+/// million would thin aircraft everywhere. A pair's points are one an event its two clocks
+/// heard, whatever the aircraft (crate docs, § The pairwise path, a pair's points), so no count
+/// of them caps an area's inputs.
+pub const REFERENCE_KEEP: Threshold = Threshold::of_rate(1_000_000);
+/// The reference aircraft's sync events one batch of one receiver keeps whole: a batch carrying
+/// more keeps about this many of them (`batch_sync_keep`). A feeder seals a batch every second, so
+/// a second of 16 reference aircraft at their two airborne positions a second.
+pub const REFERENCE_EVENTS_PER_BATCH: usize = 32;
+/// The threshold a batch carrying `events` reference events keeps each of them at (by
+/// [`sync_key`]): every one up to [`REFERENCE_EVENTS_PER_BATCH`], and
+/// `REFERENCE_EVENTS_PER_BATCH / events` of them beyond, so a busy batch keeps about as many as a
+/// full one and one event more never halves it.
+pub fn batch_sync_keep(events: usize) -> Threshold {
+    if events <= REFERENCE_EVENTS_PER_BATCH {
+        return Threshold::of_rate(1_000_000);
+    }
+    let rate = REFERENCE_EVENTS_PER_BATCH as u64 * 1_000_000 / events as u64;
+    Threshold::of_rate(u32::try_from(rate).unwrap_or(u32::MAX))
+}
 
-/// Sync events a receiver keeps at ingest. Replaces `SYNC_PER_RECEIVER = 32` lowest-hash
-/// candidates a receiver a 5 s bin (6.4 a second). Over a receiver hearing 50 ADS-B aircraft
-/// at their nominal two airborne positions a second (100 candidates a second; assumed, not
-/// measured: no per-receiver sync rate is recorded), 6.4 / 100 = 64,000 a million.
-pub const SYNC_KEEP: Threshold = Threshold::of_rate(64_000);
-/// Sync aircraft a tile takes its events from. Replaces `SYNC_AIRCRAFT_MAX = 16` a tile's window,
-/// over the 60 ADS-B aircraft of the scenario that cap was measured in (100 receivers, 60 ADS-B
-/// and 40 Mode S aircraft): 16 / 60 = 266,667 a million.
-pub const REFERENCE_KEEP: Threshold = Threshold::of_rate(266_667);
-/// Sync events a tile keeps of the candidates. Replaces the greedy `K = 10` a member and `P = 1`
-/// a pair a bin, chosen today among the 32 a receiver keeps at ingest: 10 / 32 of `SYNC_KEEP`'s
-/// rate, 20,000 a million. The pair rule's guarantee (every two members hearing one aircraft
-/// tied in every bin) has no threshold form; the sweep measures whether it is missed.
-pub const PAIR_KEEP: Threshold = Threshold::of_rate(20_000);
-/// Replies a receiver keeps. Replaces `KEPT_PER_RECEIVER_BIN` (`KEPT_CEILING_PER_S = 300` a
-/// second), over the measured 360 wanted receptions a receiver a second (`Rates::MEASURED`):
-/// 300 / 360 = 833,333 a million. Today's ceiling binds only above it; a threshold thins every
-/// receiver, so this is the upper bound of what a receiver at the mean keeps.
+/// The replies one batch of one receiver keeps whole: a batch carrying more keeps of them only
+/// those [`KEPT_KEEP`] keeps. A second at `arrived::KEPT_CEILING_PER_S`, as a feeder seals a batch
+/// every second.
+pub const REPLIES_PER_BATCH: usize = 300;
+/// Replies a batch over [`REPLIES_PER_BATCH`] keeps. Replaces `KEPT_PER_RECEIVER_BIN`
+/// (`KEPT_CEILING_PER_S = 300` a second), over the measured 360 wanted receptions a receiver a
+/// second (`Rates::MEASURED`): 300 / 360 = 833,333 a million.
 pub const KEPT_KEEP: Threshold = Threshold::of_rate(833_333);
 
-const _: () = assert!(PAIR_KEEP.0 <= SYNC_KEEP.0);
+/// What a sync event's selection key is hashed under.
+const SYNC_DOMAIN: &[u8] = b"tally sync selection";
+/// What a reference aircraft's key is hashed under.
+const REFERENCE_DOMAIN: &[u8] = b"tally reference aircraft";
+/// What a reply's selection key is hashed under.
+const REPLY_DOMAIN: &[u8] = b"tally reply selection";
 
 /// A sync event's selection key: BLAKE2s-256 over `"tally sync selection" 0x00` and the hash of
 /// the message bytes. A function of the message alone, so every receiver of one event, and every
 /// holder of any of its receptions, keeps or drops it together.
 pub fn sync_key(r: &Reception) -> [u8; 32] {
+    message_key(SYNC_DOMAIN, &crate::obs::message_hash(&r.message))
+}
+
+/// An aircraft's reference key: BLAKE2s-256 over `"tally reference aircraft" 0x00` and its
+/// address, big-endian. A function of the address alone, so whether an aircraft syncs clocks
+/// never depends on where or when it was heard, nor on what else was.
+pub fn reference_key(address: u32) -> [u8; 32] {
     let mut hasher = Blake2s256::new();
-    hasher.update(SYNC_DOMAIN);
+    hasher.update(REFERENCE_DOMAIN);
     hasher.update([0]);
-    hasher.update(crate::obs::message_hash(&r.observation.data));
+    hasher.update(address.to_be_bytes());
+    hasher.finalize().into()
+}
+
+/// Whether `address` is a reference aircraft, whose sync events and status are kept.
+pub fn reference(address: u32) -> bool {
+    REFERENCE_KEEP.keeps(&reference_key(address))
+}
+
+/// A reply's selection key: BLAKE2s-256 over `"tally reply selection" 0x00` and the hash of the
+/// message bytes (`message_hash`). A function of the message alone, so every receiver of one
+/// transmission keeps or drops it together, and a thinned transmission is still solvable.
+pub fn reply_key(message_hash: &[u8; 32]) -> [u8; 32] {
+    message_key(REPLY_DOMAIN, message_hash)
+}
+
+/// `sync_key` of a message by its hash.
+pub(crate) fn sync_key_of(message_hash: &[u8; 32]) -> [u8; 32] {
+    message_key(SYNC_DOMAIN, message_hash)
+}
+
+fn message_key(domain: &[u8], message_hash: &[u8; 32]) -> [u8; 32] {
+    let mut hasher = Blake2s256::new();
+    hasher.update(domain);
+    hasher.update([0]);
+    hasher.update(message_hash);
     hasher.finalize().into()
 }
 
@@ -119,13 +180,18 @@ mod tests {
             })
             .collect();
         let kept = |threshold: Threshold| keys.iter().filter(|k| threshold.keeps(k)).count();
-        for key in &keys {
-            assert!(!PAIR_KEEP.keeps(key) || SYNC_KEEP.keeps(key));
+        // A busier batch: each keeps a subset of the one before.
+        let ladder = [0, 32, 33, 64, 500, 5_000].map(batch_sync_keep);
+        for pair in ladder.windows(2) {
+            assert!(pair[1] <= pair[0]);
+            for key in &keys {
+                assert!(!pair[1].keeps(key) || pair[0].keeps(key));
+            }
         }
-        // Near its rate over uniform hashes: 64,000 a million of 4096 is about 262.
-        let sync = kept(SYNC_KEEP);
+        assert_eq!(batch_sync_keep(32), REFERENCE_KEEP);
+        // Near its rate over uniform hashes: 32 of 500 is 64,000 a million, of 4096 about 262.
+        let sync = kept(batch_sync_keep(500));
         assert!((200..330).contains(&sync), "{sync}");
-        assert!(kept(PAIR_KEEP) <= sync);
     }
 
     #[test]
@@ -134,12 +200,9 @@ mod tests {
             |receiver: u8, epoch: u32, timestamp: u64, wall_ms: u64, data: &[u8]| Reception {
                 receiver: tally_wire::Identity::from_seed([receiver; 32]).public(),
                 epoch,
-                observation: tally_wire::Observation {
-                    format: tally_wire::batch::format::MODE_S_LONG,
-                    timestamp,
-                    signal: 0,
-                    data: data.to_vec(),
-                },
+                timestamp,
+                message: crate::obs::ModeS::new(data)
+                    .unwrap_or_else(|| panic!("{data:?} is no Mode S")),
                 wall_ms,
             };
         let one = reception(1, 0, 10, 1_000, &[0x8d, 1, 2, 3]);

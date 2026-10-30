@@ -138,7 +138,7 @@ mod tests {
         assert_eq!(cut.content()?, content);
         let mut out = Vec::new();
         Record::MlatCut(cut.clone()).encode(&mut out)?;
-        let (read, used) = Record::decode(&out)?;
+        let (read, used) = Record::decode(&out, crate::record::MAX_VERSION)?;
         assert_eq!(used, out.len());
         assert_eq!(read, Some(Record::MlatCut(cut.clone())));
         // Another key's signature, or one bit flipped, does not verify.
@@ -219,11 +219,14 @@ mod tests {
         Record::MlatCut(cut).encode(&mut out)?;
         Record::Heartbeat.encode(&mut out)?;
         let mut read = Vec::new();
-        let (first, used) =
-            Record::decode_knowing(&out, |kind| kind < crate::record::KIND_MLAT_CUT)?;
+        let (first, used) = Record::decode_knowing(&out, crate::record::MAX_VERSION, |kind| {
+            kind < crate::record::KIND_MLAT_CUT
+        })?;
         assert_eq!(first, None);
         let (second, _) =
-            Record::decode_knowing(&out[used..], |kind| kind < crate::record::KIND_MLAT_CUT)?;
+            Record::decode_knowing(&out[used..], crate::record::MAX_VERSION, |kind| {
+                kind < crate::record::KIND_MLAT_CUT
+            })?;
         read.extend(second);
         assert_eq!(read, vec![Record::Heartbeat]);
         Ok(())

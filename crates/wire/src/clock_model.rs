@@ -1,22 +1,23 @@
-//! An engine's clock model (RFC-0171 §3.8.1): the clocks of one connected group of receivers over
-//! the stretch of a window its solutions use, relative to one reference receiver (the gauge),
-//! published as shared evidence, never kept as private state. Content-addressed: a `Positions`
-//! solution names the model it used by `ClockModel::id`, and is a deterministic function of that
-//! model, its observation set and the solver specification's version. It is never combined with
-//! another.
+//! An engine's clock model (RFC-0171 §3.8.1 as amended 2026-10-24; RFC-0174 §2.4): one area's pair
+//! model at one edge of the refit grid, every pair of nearby receivers' clocks over the trailing
+//! window it was fitted over with every clock's noise and rate, published as shared evidence, never
+//! kept as private state. Content-addressed: a fix (`crate::Fix::models`) names each model it was
+//! solved under by its pair model id (`tally_mlat_solver::publish::pair_model_id`, over the model's
+//! bytes), one for each area of its used hearers, and is a deterministic function of those models,
+//! its used set and the solver specification's version.
 //!
-//! **The model bytes are the solver specification's** (`spec_version`; for version 1 the
-//! `tally-mlat-solver` crate documentation, § Publishing): its clocks, their fixed-point bins,
-//! sites and noise, the gauge, the joint covariance of every offset and rate, and the sync
-//! observations it was fitted from. They are carried here as bytes, not re-described, because a
-//! solution is a function of exactly what the solver reads: a second description of the model in
+//! **The model bytes are the solver specification's** (`spec_version`; the `tally-mlat-solver`
+//! crate documentation, § The pairwise path, the model): its area, trailing window and scope, each
+//! member's frontier and the input citation, the CPR references, its clocks with their noise and
+//! rates, and its pairs. They are carried here as bytes, not re-described, because a
+//! fix is a function of exactly what the solver reads: a second description of the model in
 //! this crate would be a twin that could drift from it. This crate signs, addresses, splits and
 //! frames the model; a reader that does not know `spec_version` keeps it (and its id) intact.
 //!
 //! **A model of any size** travels as one signed manifest (`ClockModel`, kind 0x0d) and, when it
 //! does not fit the manifest, unsigned content-addressed parts (`ClockModelPart`, kind 0x0f). A
-//! model is one aircraft's scope over one window and carries no covariance, a few kilobytes, so
-//! it normally fits its manifest; parts cost nothing until one does not.
+//! model is one area's members over one trailing window, so a large area's may not fit its
+//! manifest; parts cost nothing until one does not.
 //!
 //! ```text
 //! manifest = format u8 = 1 | engine key [32] | boot_id u64 | sequence u64
@@ -38,10 +39,14 @@
 //! of its own. A part names its model's id so it can be held until its manifest arrives.
 //!
 //! **The inputs** are a hash, computed by the specification, of everything the model is a
-//! function of (the aircraft, the window, the scope as its receivers described themselves, and
-//! the raw observations cited). Two models with the same inputs and specification version are
-//! the same model, byte for byte, from any honest engine; two that differ are a fault anyone can
-//! prove with the two manifests alone (`FaultProof::models`).
+//! function of (the area, the trailing window, the scope as its receivers described themselves,
+//! and the raw observations cited, as each member's frontier names them). A model is an optimum
+//! of its inputs within the specification's tolerance, not particular bytes (an engine fits warm
+//! from its last model), so from specification version 3 on two honest models of one inputs may
+//! differ and that is no fault (`fault_proof::MODELS_DIFFER_NOT_A_FAULT_FROM`): each is judged
+//! against the raw it cites, by any holder of it (`tally_mlat_solver::verify_pair_model`). Before
+//! version 3 two that differ were a fault anyone could prove with the two manifests alone
+//! (`FaultProof::models`).
 //!
 //! The prefix (format, engine key, boot id, sequence) is the same as a `Positions` record's and
 //! fixed across every format, so a relay verifies, deduplicates and windows a manifest it cannot
@@ -236,9 +241,10 @@ impl ClockModel {
         crate::batch::u64_from(&self.bytes, 1 + KEY_LEN + 16)
     }
 
-    /// The content address `Positions` solutions and parts cite: BLAKE2s-256 over
-    /// `"tally clock model id" 0x00` and every signed byte but the signature. Defined for any
-    /// format.
+    /// The content address parts cite (a fix cites the model's pair model id instead, over the
+    /// model's bytes alone, so two engines' manifests of one model are one model): BLAKE2s-256
+    /// over `"tally clock model id" 0x00` and every signed byte but the signature. Defined for
+    /// any format.
     pub fn id(&self) -> Hash {
         id_of(&self.bytes[..self.bytes.len().saturating_sub(SIGNATURE_LEN)])
     }
@@ -372,16 +378,21 @@ impl ClockModel {
 /// A clock model as a client receives it (wire version 3): the full model (`ClockModel`, its
 /// sites, `site_mm` and offsets) is relay-only, since sites and offsets with the aircraft's
 /// positions give every receiver's site; a client is sent this summary instead, signed by the same
-/// engine under a domain of its own. It names the full model by the id solutions cite, so a client
-/// joins a solution to its model's summary, and says nothing of which receivers the model is of:
-/// no receiver key, no site reference, no entry per receiver. A tile's members are chosen by
-/// their exact sites (a sphere test about the tile's centre, and the farthest-point choice of
-/// members), so the tiles a receiver is a member of, over time, narrow its site to a fraction of
-/// its public cell; membership is relay-only like the site itself.
+/// engine under a domain of its own. It names the full model by the id fixes cite, so a client
+/// joins a fix to its model's summary, and says nothing of which receivers the model is of: no
+/// receiver key, no site reference, no entry per receiver, and not the model's per-member frontier
+/// (which batches of each member it fitted), which is in the relay-only full model as its sites
+/// are. An area's members are chosen by their exact sites (each area receiver's nearest within the
+/// pair baseline), so the areas a receiver is a member of, over time, narrow its site to a
+/// fraction of its public cell; membership is relay-only like the site itself.
+///
+/// The model is a trailing-window one (RFC-0171 §3.8.1 as amended 2026-10-24), fitted over the
+/// sync raw signed in `[edge_ms - span_ms, edge_ms]`. Format 1, which named a window by its bins,
+/// is retired with wire version 4 (`crate::record::FIXES_VERSION`), and its byte never reused.
 ///
 /// ```text
-/// format u8 = 1 | engine key [32] | boot_id u64 | sequence u64 | issued_ms u64
-/// | spec_version u16 | model id [32] | inputs [32] | window first i64 | window last i64
+/// format u8 = 2 | engine key [32] | boot_id u64 | sequence u64 | issued_ms u64
+/// | spec_version u16 | model id [32] | inputs [32] | edge_ms u64 | span_ms u32
 /// | signature [64]
 /// ```
 ///
@@ -394,96 +405,8 @@ pub struct ClientClockModelContent {
     pub sequence: u64,
     pub issued_ms: u64,
     pub spec_version: u16,
-    /// The full model's `ClockModel::id`: what a solution's `clock_model` names.
-    pub model: Hash,
-    /// The full model's `Manifest::inputs`.
-    pub inputs: Hash,
-    /// The window the model is of, as the solver specification numbers windows.
-    pub window_first: i64,
-    pub window_last: i64,
-}
-
-/// A client model's bytes, signature included: it is of one size.
-pub const CLIENT_MODEL_LEN: usize = 1 + KEY_LEN + 8 + 8 + 8 + 2 + 32 + 32 + 8 + 8 + SIGNATURE_LEN;
-
-impl crate::signed::Check for ClientClockModelContent {
-    /// A window that does not end before it begins.
-    fn check(&self) -> Result<(), WireError> {
-        if self.window_first > self.window_last {
-            return Err(WireError::Invalid {
-                field: "client clock model window",
-                value: 0,
-            });
-        }
-        Ok(())
-    }
-}
-
-impl crate::signed::Fields for ClientClockModelContent {
-    fn write(model: crate::signed::Checked<'_, Self>, out: &mut Vec<u8>) -> Result<(), WireError> {
-        out.extend_from_slice(&model.boot_id.to_be_bytes());
-        out.extend_from_slice(&model.sequence.to_be_bytes());
-        out.extend_from_slice(&model.issued_ms.to_be_bytes());
-        out.extend_from_slice(&model.spec_version.to_be_bytes());
-        out.extend_from_slice(&model.model);
-        out.extend_from_slice(&model.inputs);
-        out.extend_from_slice(&model.window_first.to_be_bytes());
-        out.extend_from_slice(&model.window_last.to_be_bytes());
-        Ok(())
-    }
-
-    fn read(reader: &mut Body<'_>) -> Result<crate::signed::Unchecked<Self>, WireError> {
-        let boot_id = reader.u64()?;
-        let sequence = reader.u64()?;
-        let issued_ms = reader.u64()?;
-        let spec_version = reader.u16()?;
-        let model = reader.array()?;
-        let inputs = reader.array()?;
-        let window_first = reader.u64()? as i64;
-        let window_last = reader.u64()? as i64;
-        Ok(crate::signed::Unchecked::new(Self {
-            boot_id,
-            sequence,
-            issued_ms,
-            spec_version,
-            model,
-            inputs,
-            window_first,
-            window_last,
-        }))
-    }
-}
-
-crate::signed::signed_record!(
-    /// An engine's signed `ClientClockModelContent`: the clock model a client is sent.
-    ClientClockModel,
-    ClientClockModelContent,
-    b"tally client clock model",
-    1,
-    MAX_BODY
-);
-
-/// The client model's format of a trailing-window model (RFC-0171 §3.8.1 as amended 2026-10-24):
-/// format 1's fields with the window as the model's trailing edge and span in place of its bins.
-pub const CLIENT_TRAILING_MODEL_FORMAT: u8 = 2;
-
-/// What a format 2 client model says: format 1's fields (`ClientClockModelContent`), the window a
-/// trailing one, fitted over the sync raw signed in `[edge_ms - span_ms, edge_ms]`. Still nothing
-/// of the scope: the model's per-member frontier (which batches of each member it fitted) is in
-/// the relay-only full model, as its sites are.
-///
-/// ```text
-/// format u8 = 2 | engine key [32] | boot_id u64 | sequence u64 | issued_ms u64
-/// | spec_version u16 | model id [32] | inputs [32] | edge_ms u64 | span_ms u32
-/// | signature [64]
-/// ```
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ClientTrailingModelContent {
-    pub boot_id: u64,
-    pub sequence: u64,
-    pub issued_ms: u64,
-    pub spec_version: u16,
-    /// The full model's `ClockModel::id`: what a fix's `model` names.
+    /// The full model's pair model id (`tally_mlat_solver::publish::pair_model_id`): what a fix's
+    /// `models` name it by.
     pub model: Hash,
     /// The full model's `Manifest::inputs`.
     pub inputs: Hash,
@@ -493,11 +416,10 @@ pub struct ClientTrailingModelContent {
     pub span_ms: u32,
 }
 
-/// A format 2 client model's bytes, signature included: it is of one size.
-pub const CLIENT_TRAILING_MODEL_LEN: usize =
-    1 + KEY_LEN + 8 + 8 + 8 + 2 + 32 + 32 + 8 + 4 + SIGNATURE_LEN;
+/// A client model's bytes, signature included: it is of one size.
+pub const CLIENT_MODEL_LEN: usize = 1 + KEY_LEN + 8 + 8 + 8 + 2 + 32 + 32 + 8 + 4 + SIGNATURE_LEN;
 
-impl crate::signed::Check for ClientTrailingModelContent {
+impl crate::signed::Check for ClientClockModelContent {
     /// A window of some span that begins no earlier than the epoch.
     fn check(&self) -> Result<(), WireError> {
         if self.span_ms == 0 || u64::from(self.span_ms) > self.edge_ms {
@@ -510,7 +432,7 @@ impl crate::signed::Check for ClientTrailingModelContent {
     }
 }
 
-impl crate::signed::Fields for ClientTrailingModelContent {
+impl crate::signed::Fields for ClientClockModelContent {
     fn write(model: crate::signed::Checked<'_, Self>, out: &mut Vec<u8>) -> Result<(), WireError> {
         out.extend_from_slice(&model.boot_id.to_be_bytes());
         out.extend_from_slice(&model.sequence.to_be_bytes());
@@ -537,31 +459,14 @@ impl crate::signed::Fields for ClientTrailingModelContent {
     }
 }
 
-impl ClientClockModel {
-    /// Signs a format 2 client model, under the same domain and record kind as format 1: a
-    /// reader tells them apart by the format byte.
-    pub fn sign_trailing(
-        identity: &impl Signs,
-        content: &ClientTrailingModelContent,
-    ) -> Result<Self, WireError> {
-        let mut body = Vec::new();
-        crate::signed::Fields::encode(content, &mut body)?;
-        crate::signed::Signed::sign(
-            Self::DOMAIN,
-            CLIENT_TRAILING_MODEL_FORMAT,
-            identity,
-            &body,
-            Self::MAX_LEN,
-        )
-        .map(Self)
-    }
-
-    /// The content of a format 2 client model (`content` reads format 1).
-    pub fn trailing_content(&self) -> Result<ClientTrailingModelContent, WireError> {
-        let mut body = self.0.body(CLIENT_TRAILING_MODEL_FORMAT)?;
-        <ClientTrailingModelContent as crate::signed::Fields>::decode(&mut body)
-    }
-}
+crate::signed::signed_record!(
+    /// An engine's signed `ClientClockModelContent`: the clock model a client is sent.
+    ClientClockModel,
+    ClientClockModelContent,
+    b"tally client clock model",
+    2,
+    MAX_BODY
+);
 
 fn id_of(signed: &[u8]) -> Hash {
     Blake2s256::digest(domain(CLOCK_MODEL_ID_DOMAIN, signed)).into()
@@ -923,15 +828,16 @@ mod tests {
             boot_id: 1,
             sequence: 2,
             issued_ms: 3,
-            spec_version: 6,
+            spec_version: 7,
             model: [4; 32],
             inputs: [5; 32],
-            window_first: -7,
-            window_last: 8,
+            edge_ms: 1_791_220_000_000,
+            span_ms: 20_000,
         };
         let signed = ClientClockModel::sign(&engine, &content)?;
         let back = ClientClockModel::from_bytes(signed.as_bytes().to_vec())?;
         back.verify()?;
+        assert_eq!(back.format(), 2);
         assert_eq!(back.content()?, content);
         // One size: no room for a member of any kind.
         assert_eq!(back.as_bytes().len(), CLIENT_MODEL_LEN);
@@ -952,70 +858,26 @@ mod tests {
                 .and_then(|model| model.verify())
                 .is_err()
         );
-        // A window ending before it begins: refused.
-        let inverted = ClientClockModelContent {
-            window_first: 9,
-            ..content
-        };
-        assert!(ClientClockModel::sign(&engine, &inverted).is_err());
-        Ok(())
-    }
-
-    #[test]
-    fn a_trailing_client_model_round_trips_beside_format_1() -> Result<(), WireError> {
-        let engine = Identity::generate()?;
-        let content = ClientTrailingModelContent {
-            boot_id: 1,
-            sequence: 2,
-            issued_ms: 3,
-            spec_version: 7,
-            model: [4; 32],
-            inputs: [5; 32],
-            edge_ms: 1_791_220_000_000,
-            span_ms: 20_000,
-        };
-        let signed = ClientClockModel::sign_trailing(&engine, &content)?;
-        let back = ClientClockModel::from_bytes(signed.as_bytes().to_vec())?;
-        back.verify()?;
-        assert_eq!(back.format(), CLIENT_TRAILING_MODEL_FORMAT);
-        assert_eq!(back.trailing_content()?, content);
-        assert_eq!(back.as_bytes().len(), CLIENT_TRAILING_MODEL_LEN);
-        // Each format reads only itself.
-        assert!(back.content().is_err());
-        let first = ClientClockModel::sign(
-            &engine,
-            &ClientClockModelContent {
-                boot_id: 1,
-                sequence: 2,
-                issued_ms: 3,
-                spec_version: 6,
-                model: [4; 32],
-                inputs: [5; 32],
-                window_first: 0,
-                window_last: 1,
-            },
-        )?;
-        assert!(first.trailing_content().is_err());
-        // Under the client model's kind, as format 1.
+        // Under the client model's kind.
         let mut bytes = Vec::new();
         Record::ClientClockModel(signed.clone()).encode(&mut bytes)?;
         assert_eq!(
-            Record::decode(&bytes)?.0,
+            Record::decode(&bytes, crate::record::MAX_VERSION)?.0,
             Some(Record::ClientClockModel(signed))
         );
         // A window of no span, or one beginning before the epoch: refused.
         for (edge_ms, span_ms) in [(5, 0), (5, 6)] {
-            let bad = ClientTrailingModelContent {
+            let bad = ClientClockModelContent {
                 edge_ms,
                 span_ms,
                 ..content.clone()
             };
-            assert!(ClientClockModel::sign_trailing(&engine, &bad).is_err());
+            assert!(ClientClockModel::sign(&engine, &bad).is_err());
         }
         Ok(())
     }
 
-    /// The id is part of the protocol: it is what every solution and part cites.
+    /// The id is part of the protocol: it is what every fix and part cites.
     #[test]
     fn the_id_is_a_fixed_known_answer() -> Result<(), WireError> {
         let engine = Identity::from_seed([42; 32]);

@@ -291,8 +291,9 @@ impl Peers {
             }
             // The sender is held and never sent on: the link lives while it does.
             let (sender, outgoing) = mpsc::channel(1);
+            // The band's raw, and its areas' models, which the engine's fixes may cite.
             let subscribe = Record::Subscribe {
-                streams: Streams::RAW,
+                streams: Streams::RAW.with(Streams::CLOCK_MODELS),
                 regions: source.regions.clone(),
             };
             let task = tokio::spawn(crate::link::member(

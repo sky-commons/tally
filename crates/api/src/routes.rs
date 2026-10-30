@@ -17,7 +17,7 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use serde::Deserialize;
-use tally_api_types::{Aircraft, AircraftResponse, Feed};
+use tally_api_types::{Aircraft, AircraftResponse};
 use tally_wire::PublicKey;
 
 use crate::area::Area;
@@ -43,10 +43,6 @@ pub const EXPOSE_HEADERS: &str = "retry-after";
 pub const ALLOW_METHODS: &str = "GET, POST";
 /// How long a browser may keep a preflight's answer, in seconds (browsers cap it lower).
 pub const PREFLIGHT_MAX_AGE_SECS: u32 = 86_400;
-
-/// The error a precise-feed request is refused with (`503`) when the API holds no recent precise
-/// world product: a client draws it as the feed being unavailable, not as an empty sky.
-pub const PRECISE_UNAVAILABLE: &str = "precise_unavailable";
 
 /// The path of the asking client's own stations.
 pub const ME: &str = "/v1/me";
@@ -94,24 +90,17 @@ pub struct Viewport {
     south: f64,
     east: f64,
     north: f64,
-    /// `live` (the default) or `precise` (RFC-0174 §2.11): the client's choice.
-    #[serde(default)]
-    feed: Feed,
 }
 
-/// The viewport and feed a query asks for, or why it is refused (`400`).
-pub fn viewport(viewport: Result<Query<Viewport>, QueryRejection>) -> Result<(Area, Feed), String> {
+/// The viewport a query asks for, or why it is refused (`400`).
+pub fn viewport(viewport: Result<Query<Viewport>, QueryRejection>) -> Result<Area, String> {
     let Ok(Query(viewport)) = viewport else {
-        return Err(
-            "west, south, east and north are each a number of degrees, and feed is live or precise"
-                .to_owned(),
-        );
+        return Err("west, south, east and north are each a number of degrees".to_owned());
     };
-    let area = Area::new(viewport.west, viewport.south, viewport.east, viewport.north)?;
-    Ok((area, viewport.feed))
+    Area::new(viewport.west, viewport.south, viewport.east, viewport.north)
 }
 
-/// The live feed's aircraft in `area`: readsb's (`readsb`, from an answer current at
+/// The aircraft in `area`: readsb's (`readsb`, from an answer current at
 /// `readsb_now_ms`), then the MLAT position of every aircraft there readsb gave no position for;
 /// and the instant the data was current, at or after every instant in it (an MLAT position may be
 /// newer than readsb's data).
@@ -134,23 +123,10 @@ async fn aircraft(
     State(app): State<Arc<App>>,
     viewport: Result<Query<Viewport>, QueryRejection>,
 ) -> Response {
-    let (area, feed) = match self::viewport(viewport) {
+    let area = match self::viewport(viewport) {
         Ok(asked) => asked,
         Err(why) => return refuse(StatusCode::BAD_REQUEST, &why),
     };
-    if feed == Feed::Precise {
-        // The precise world product: every aircraft at one second, about a minute and a half
-        // behind, from what the API's relays sign (no readsb: its data is now, not then). None
-        // held, or none recent: the feed is unavailable, never an empty sky.
-        let Some((second, served)) =
-            app.mlat
-                .precise_in_area(&area, wall_ms(), app.settings.mlat.max_age)
-        else {
-            return refuse(StatusCode::SERVICE_UNAVAILABLE, PRECISE_UNAVAILABLE);
-        };
-        let answer = precise_answer(&served, second.saturating_mul(1_000), wall_ms());
-        return axum::Json(answer).into_response();
-    }
     let mut now_ms = 0;
     let mut heard = HashSet::new();
     let mut aircraft = Vec::new();
@@ -182,7 +158,6 @@ async fn aircraft(
     let (now_ms, aircraft) = live_answer(&app, &area, now_ms, aircraft);
     axum::Json(AircraftResponse {
         now_ms,
-        feed: Feed::Live,
         aircraft,
         sent_at_ms: wall_ms(),
     })
@@ -416,27 +391,6 @@ fn client_of(app: &App, request: &Request) -> Client {
 /// The address the proxy's header `name` names, if it is there and parses.
 fn from_header(headers: &HeaderMap, name: &HeaderName) -> Option<IpAddr> {
     headers.get(name)?.to_str().ok()?.trim().parse().ok()
-}
-
-/// The precise feed's answer, sent at `sent_at_ms`, from the precise positions of the product's
-/// second, which starts at `second_ms`. It is as of that second, not the wall clock: a client ages
-/// each aircraft against `now_ms`, so a map draws the precise feed where it was then.
-pub(crate) fn precise_answer(
-    served: &[mlat::Served],
-    second_ms: u64,
-    sent_at_ms: u64,
-) -> AircraftResponse {
-    let aircraft: Vec<_> = served.iter().map(mlat::Served::aircraft).collect();
-    let now_ms = aircraft
-        .iter()
-        .map(|one| one.last_heard_at_ms)
-        .fold(second_ms, u64::max);
-    AircraftResponse {
-        now_ms,
-        feed: Feed::Precise,
-        aircraft,
-        sent_at_ms,
-    }
 }
 
 #[cfg(test)]

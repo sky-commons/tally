@@ -6,8 +6,8 @@
   relay, not regional relays and separate MLAT operators; the relay and its MLAT ship as one program,
   relay duties on by default and not mandatory (sharing is the requirement); a feeder sends to
   the two nearest healthy relays on different networks; MLAT runs where the raw is; the data spreads
-  by area, the way BitTorrent spreads a file; fast provisional MLAT positions are approved for
-  cockpit traffic; honouring LADD and PIA is the displayer's duty, not the network's. The critics'
+  by area, the way BitTorrent spreads a file; fast MLAT positions are approved for
+  cockpit traffic (provisional ones then; since 2026-10-24 every fix is fast, §2.4); honouring LADD and PIA is the displayer's duty, not the network's. The critics'
   corrections the same day (the round-trip band and the per-area capacity-weighted pick, k MLAT
   relays an area, striped sharing trees as a forwarding duty, proofs of possession in the delivery
   check, the agreeing-superset merge rule) are folded into §2.
@@ -22,6 +22,12 @@
   §3.3, §3.6, §3.8.1). Here that changes what credit buys and what evidence carries (§2.1), what a
   member hears first (§2.5), the costs table (§2.8), two records (§2.10), the regional product
   (§2.11) and who can compute standing (§2.12); each place says so.
+- **Amended 2026-10-24 (founder): MLAT in seconds** (RFC-0171 §3.8.1, its amendment of that
+  date). One class of MLAT fix, solved about a second after it is heard under pair clock models
+  refit every two seconds over a trailing window of what had arrived; the provisional positions, the final ones and
+  the precise world product are retired at wire version 4. Here that changes §1, what an area's
+  MLAT costs (§2.3), fast MLAT (§2.4), two records (§2.10), the products (§2.11) and when
+  standing settles and a bigger answer wins (§2.12); each place says so.
 
 **Three words** (founder, 2026-10-06). This RFC, RFC-0171 and the site use exactly three words for
 the network's roles. A **feeder** is a receiver that sends what it hears: a radio receiver at
@@ -60,19 +66,20 @@ which forwarding one's slice is the duty of taking the area, under each relay's 
 - **Every relay carries a required upload speed cap** (`--max-upload`, RFC-0171 §3.6,
   `tally/crates/relay/src/egress.rs`): one token bucket at the cap, strict priority classes
   (control, then positions and clock models, then raw to relay and MLAT links, then forwarded data,
-  then provisional positions, then plain subscribers), and new feeders admitted only while the cap
+  then plain subscribers; a provisional class below forwarded data went with them, 2026-10-24), and new feeders admitted only while the cap
   can carry what they commit the relay to forward. No bill can exceed the cap times the seconds in a
   month, and a relay never goes dark. It replaced the monthly egress budget built earlier the same
   day.
-- **A final MLAT position leaves its engine within 91.5 s of its transmission, and has surely
-  arrived anywhere within 108.5 s** (`tally_wire::budget::FINAL_FIX_LEAVES`, `FINAL_FIX_ARRIVED`).
-  A window step solves eight 5 s bins at once and falls due one bin after the last it solves,
-  once that bin has settled (11.5 s: its batches' way in, the relay's error and two
-  measurements', `MLAT_SETTLE`), then its fits run, some 35 s at world scale (RFC-0171 §3.8.1); a
-  step whose fixes would leave later is refused, counted. The stride is what lets one relay carry
-  the world (§2.3).
-  **Provisional ones arrive a median 1.34 s after the transmission** (95th percentile 1.65 s,
-  in the simulator), built (§2.4).
+- **An MLAT fix leaves its engine within 15.5 s of its transmission, and has surely arrived anywhere
+  within 32.5 s** (`tally_wire::budget::FIX_LEAVES`, `FIX_ARRIVED`; as amended 2026-10-24, RFC-0171
+  §3.8.1). The engine steps once a second: a transmission is solved 1.1 s after its first reception
+  reached its relay (`FIX_SETTLE`), from what had arrived, and leaves within `FIX_SOLVE` (4 s) of
+  that reception; the rest of the bound is the receptions' signed lag (`SIGNED_LAG`, 11.5 s: their
+  batches' way in, the relay's error and two measurements'). A fix is published a median of 0.75 to
+  0.91 s and a 95th percentile of 2.1 s (first fix, 80 and 10 receivers,
+  `a_transmission_is_solved_twice_at_most`) after its transmission in the simulator. Before, a final
+  position left within 91.5 s and arrived within 108.5 s, a window step solving eight 5 s bins at
+  once, and a provisional one covered the wait (a median 1.34 s after the transmission).
 - **A feeder uploads about 8 KB/s** (box-01, near KLAX, 7.9 KB/s measured 2026-10-06), about 21 GB
   a month.
 
@@ -140,7 +147,7 @@ can vouch for several clients.
   linked client is a client like any other (RFC-0171 §3.6): its link is typed so it cannot hold a
   site. It gets no raw feeder batches, no sites, no full clock models and no raw-form positions;
   it gets format 2 descriptions (each receiver's public cell), the regional product without
-  counters, tagged positions, client clock models and the world products, over wider areas and at
+  counters, tagged positions, client clock models and the world product, over wider areas and at
   higher rates than the free tier. Raw and sites are a relay's, and a business that wants them runs
   a relay, as the firehose rule above already asks of it.
 - **Evidence by reference** (amended 2026-10-19, founder). A bundle carrying feeders' descriptions
@@ -235,18 +242,19 @@ can vouch for several clients.
 
 ### §2.3 MLAT runs where the raw is, by two or three relays an area
 
-Each area's MLAT (the RFC-0171 §3.8.1 engine: one shared clock model per canonical tile, the
-reference implementation deterministic, every model and solution verifiable) is done by k relays,
+Each area's MLAT (the RFC-0171 §3.8.1 engine: one shared pair clock model per area and refit,
+the reference implementation deterministic, every model and solution verifiable) is done by k relays,
 two or three: the first of the relays offering MLAT cores for it (in their signed `ProviderOffer`,
 §2.6), ranked first by contribution tier (the same tier the directory ranks offers by, §2.6) and
 within a tier by weighted rendezvous hashing over the area and their keys, weighted by the cores
 they offer (counted up to 64). Where no relay has shown a witness the cores decide alone, and a key
 with no witness never displaces one that has. Every relay computes the same choice from the same
 offers and evidence. A chosen relay takes the area's raw plus a
-border band (as built: every cell within about 573 km of the area, plus the area's own radius;
-the first text said one reception radius, about 400 km, which is a tile's radius alone, and a
-band that narrow would leave every top-level tile unpublished, because a relay publishes a tile
-only when it holds its whole footprint, which reaches half the tile cube's diagonal further; one
+border band (as built: every cell that could hold a receiver within 600 km of a point of the area,
+the pair baseline, `PAIR_BASELINE_MM`, so a relay holds every member of the area's model, its
+receivers and every receiver one of them keeps as a pair's other end; the first text said one
+reception radius, about 400 km, which would leave a boundary receiver's farther pairs out of its
+area's model, and two relays holding different bands would fit different members; one
 definition, `tally_mlat::area::border_band`, serves both the raw a relay asks for and the
 receivers its MLAT lets take part); every other relay holding feeders of the area
 passes their raw to the chosen ones, one hop, over the region-cut raw subscription
@@ -260,61 +268,69 @@ solves by the ranking, never counted against the subscriber cap, and it publishe
 positions travel the sharing groups. It is granted the raw regions it asks for that lie within
 the border band of the areas it is an MLAT relay for, and is held to a feeder's intake ceiling.
 
-- Neighbours that cover a tile's whole footprint and hold the same raw publish the same model and
+- Relays that hold an area's border band and the same raw by an edge publish the same model and
   solutions (byte-identical from the reference implementation; the protocol asks only that each be an
   optimum within the verifier's tolerance, and clients merge by inputs hash), which collapse.
-  A relay publishes a tile only if its area covers the tile's whole footprint. Two or three solve
+  A fix cites one model of each area its used hearers are in, so a relay asks its neighbours for
+  the models of the areas in its band and verifies each over the raw it holds. Two or three solve
   each area so that one failure or one dishonest relay neither stops nor decides its positions;
   overlap costs compute, never correctness.
-- What one relay costs, measured (RFC-0171 §3.8.1, the world-scale benchmark, re-measured at the
-  real reception rate for RFC-0181): the whole world's MLAT, 20,000 receivers clustered as the US
-  and Europe's are, about 320 wanted receptions a second each and about 5,400 targets a window,
-  takes 41 cores to keep up (3,800 tile fits a 40 s stride, 0.35 s each, and the solves, on 32
-  threads) and holds 8.7 GB of raw for a window (30 bytes an observation, index included), about
-  12 GB with the open bins and the bins standing settles in. What a relay reserves for it is a
-  bound, not that mean: `held::Rates::cost` reserves open raw at five times the mean rate, and 25
-  sealed bins (`held::SEALED_BINS_HELD`) of thinned raw at the ceiling every receiver is kept to
-  (`KEPT_CEILING_PER_S`), never its mean; with the rest a hosted receiver holds, a seat's bytes
-  and the receivers a 32 GB, 16-core relay seats are what `tally-relay check` prints
-  (`per-seat` and `mlat-seats` in `tally/crates/relay/tests/world-relay.txt`, held equal to it;
-  RFC-0181 §5, §9), never a copy here. No one relay carries the whole world.
-  (The 27 cores and 1.6 GB first measured were at an eighth of the real rate.)
+- What one relay costs (RFC-0171 §3.8.1, as amended 2026-10-24): each area it owns refit every two
+  seconds, warm, over the trailing window, and each target solved once a 700 ms slot, every fix
+  verified, planned per hosted receiver from the pair sweep's world density (every receiver
+  keeping its full 40 neighbours): 1.941 ms of a core a hosted receiver a second (0.872
+  refitting, 0.387 verifying the neighbours' models its fixes cite, 0.682 solving), so the
+  world's 20,000 receivers would take about 39 cores were one relay to hold them all, and 150
+  kept receptions a hosted receiver a second over the trailing window, `FIT_LAG`, `SIGNED_LAG`
+  and a refit, or standing's 32.5 s where that is longer (about 273 kB a receiver of thinned raw).
+  (The windowed engine took 41 cores for the world on one node, 3,800 tile fits a 40 s stride at
+  0.35 s each, and held 8.7 GB of raw a 100 s window, about 12 GB with its open bins and the bins
+  standing settled in.) What a relay reserves for it is a bound, not that mean: a seat's kept raw
+  at the mean kept rate in one pool for the relay, every receiver still held to its own ceiling
+  (`arrived::Rates::cost`), never every seat at its ceiling at once; with the rest a hosted
+  receiver holds, a seat's bytes and the receivers a 32 GB, 16-core relay seats (and whether its
+  cores or its memory bound them) are what `tally-relay check` prints (`per-seat`, `mlat-seats`
+  and `mlat-seats-bound` in `tally/crates/relay/tests/world-relay.txt`, held equal to it; RFC-0181
+  §5, §9), never a copy here. No one relay carries the whole world.
 - Raw travels at most a hop, never worldwide. Only positions travel far.
 - Why here: clock sync needs every receiver that heard an aircraft in one place, and the raw is
   already at the relay its feeders chose. Moving the computation to the data is cheaper than any
   shape that moves the data or a summary of it (§3).
 
-### §2.4 Fast MLAT: provisional positions now, the verified one after
+### §2.4 Fast MLAT: every fix a second after it is heard
 
-Approved by the founder on 2026-10-06, and built (RFC-0171 §3.8.1, *Provisional positions*).
-Beside the final positions (7 to 47 s late, 32 s on average), a relay publishes provisional
-positions solved against the latest clock model of the transmission's tile carried forward: a
-median 1.34 s after the transmission (1.65 s at the 95th percentile; 1.1 s of that is waiting for
-the receptions, which a feeder's once-a-second batches spread over a second), a wider uncertainty
-that says so (the clock covariance grown by the random-walk prior over the carry, at most 90 s;
-calibrated in the simulator at 0.956, median error 123 m carried up to 20 s and 458 m from 45 to
-90 s), at most one per aircraft per second. The final verified position follows and supersedes
-it.
+Approved by the founder on 2026-10-06 as provisional positions beside the final ones; **amended
+2026-10-24 (founder): MLAT in seconds** (RFC-0171 §3.8.1, its amendment), which makes every fix the
+fast one. A relay's engine steps once a second: it solves each transmission 1.1 s after its first
+reception arrived, from the receptions that had arrived (its considered set), under the pair models
+of the areas its hearers are in, refit every two seconds over a trailing window of what had arrived
+and carried at most 14.6 s past their edge (`MAX_CARRY`), and publishes it at once (a median of 0.75
+to 0.91 s and a 95th percentile of 2.1 s (first fix, 80 and 10 receivers,
+`a_transmission_is_solved_twice_at_most`) after the transmission; calibrated in the simulator at a
+coverage of 0.945 and a median horizontal error of 24.4 m at world density, 0.91 to 0.93 and 59 to
+96 m in the sparse scenes, RFC-0171 §3.8.1), at most one transmission of an aircraft a 700 ms slot
+(mlat-server's `RESOLVE_BACKOFF`). A reception that arrives later makes a bigger considered set,
+solved and published again; the merge rule takes the bigger fix (§2.12). There is no final fix to
+wait for and nothing to supersede by class.
 
-- A provisional position is its own stream, a `Streams` bit (`PROVISIONAL`, 16), in a record kind
-  of its own (`Provisional`, 0x10, a `Positions` of format 4), so a subscriber that does not ask
-  for it pays nothing and a reader that does not know it skips it. Subscribed, it about doubles the positions
-  stream: there are as many provisionals as final solutions (one a target a second each), and a
-  provisional record is no smaller per solution (measured, about 370 bytes); a whole-world relay
-  publishes some 2 MB/s of them.
-- A provisional position names the model it carried; how far is a function of the model and its
-  receptions, so it is checkable against raw like any solution, and the same fault proof holds it.
-  The merge rule ranks it below every final fix: superseded by a final fix of the same
-  transmission, confirmed by a final fix of the aircraft near it in time, and retracted by a
-  deadline rule (108.5 s by the client's clock, `tally_wire::products::FINAL_FIX_ARRIVED_MS`)
-  when neither came; a client needs no message to learn it.
+- Every fix is the one record kind and stream it always was (`Positions`, the `POSITIONS` bit),
+  format 7 raw on relay links and format 8 tagged to a client, so a subscriber pays for each
+  transmission once. Before, a provisional fix was a stream and kind of its own (`PROVISIONAL`,
+  16; `Provisional`, 0x10), as many as the finals and no smaller (about 370 bytes a record), some
+  2 MB/s for a whole-world relay beside the finals; both are retired at wire version 4.
+- A fix names its model, the receptions it considered and which of them it used; it is checkable
+  against raw like any fix, and the same fault proof holds it. Before, a provisional was ranked
+  below every final fix and retracted by a deadline 108.5 s after it arrived when no final came;
+  with one class there is no rank by kind and no retraction.
 - Why: cockpit traffic awareness. At 150 kt an aircraft covers two and a half miles in 32 s; a
-  target drawn where it was half a minute ago is drawn in the wrong place.
+  target drawn where it was half a minute ago is drawn in the wrong place. And why one class:
+  everything that held a final fix or its raw held it 80 to 110 s, and a hosted receiver cost
+  49.4 MB of planned memory for it (RFC-0171 §3.8.1).
 
 ### §2.5 Distribution by area, like BitTorrent: sharing is a forwarding duty
 
-Per area (an H3 cell) there is one sharing group per stream kind (raw; positions; provisional
-positions; clock models): the relays that take that area.
+Per area (an H3 cell) there is one sharing group per stream kind (raw; positions; clock models):
+the relays that take that area.
 
 - **Fixed seeding.** The relays that hold an area's feeders send each stream into the group once,
   cut into its data stripes, each to its stripe's seed, with a parity stripe beside them that
@@ -389,7 +405,7 @@ positions; clock models): the relays that take that area.
   usable 76 s behind and 25 s ahead (a feeder's 10 s, its 64 s backlog and the 17 s its trusted
   reference's low end may lag true time, less the 15 s two relays' clocks may be apart; that 15 s
   and the feeder's 10 s ahead; RFC-0171 §3.6's error budget); a relay-signed record
-  (a regional batch, an engine's record) 43 s behind and 15 s ahead; a fault proof 122 s behind
+  (a regional batch, an engine's record) 32 s behind and 15 s ahead; a fault proof 122 s behind
   (the 14 s horizon, a repaired copy's 2 s in transit, the 15 s apart, and a feeder's 91 s) and
   25 s ahead; feeder figures, the relay-signed window stretched by their hour; a
   duplicate after that while its hash is remembered (not forwarded, but counted had and its
@@ -416,7 +432,7 @@ positions; clock models): the relays that take that area.
   another relay in two ways. A directory link (`--upstream` dials one, `--accept-relay` lets a key
   dial in) carries the directory and nothing else: signed offers and queries, echoes, delivery
   checks and have-summaries; a record of data on it is not taken. Every record of data one relay
-  passes another travels in an area's group (raw, positions, provisional positions, clock models,
+  passes another travels in an area's group (raw, positions, clock models,
   and the regional product's batches; a fault proof with what it is about) over member links, the
   sessions a relay dials to its groups' members, whose offers it verified by a handshake at the
   address each names; and an MLAT relay takes raw over its one-hop raw links (§2.3). So a relay
@@ -536,24 +552,25 @@ relays take areas, they become closer for their feeders and the groups of §2.5 
 
 ### §2.10 New records
 
-Non-critical kinds (RFC-0171 §3.4), all built, transport version 2, which is both `MIN_VERSION`
-and `MAX_VERSION`: version 1 is retired, and a `Hello` whose highest version is 1 is answered with
-`Goodbye{Version}`. Version 2's `Streams` is two bytes. A reader that does not know one of these
-kinds skips it:
+Non-critical kinds (RFC-0171 §3.4), all built, transport version 2, the `MIN_VERSION`: version 1
+is retired, and a `Hello` whose highest version is 1 is answered with `Goodbye{Version}`. Version
+2's `Streams` is two bytes. A reader that does not know one of these kinds skips it. Wire version
+4 (2026-10-24, RFC-0171 §3.3) retires two of them, 0x10 and 0x21, and their stream bits (16 and
+128), never reused:
 
 | Kind | Record | What it is |
 | --- | --- | --- |
-| 0x10 | `Provisional` | A provisional MLAT position (§2.4), with the `PROVISIONAL` bit on `Streams` (16). |
+| 0x10 | retired | `Provisional`, a provisional MLAT position, with the `PROVISIONAL` bit (16). Retired at wire version 4: every fix is a `Positions` (§2.4). |
 | 0x11, 0x12 | `Echo`, `EchoReply` | Round-trip measurement: a nonce; the reply signed, with the relay's spare capacity and network. |
 | 0x13, 0x14 | retired | The first delivery check, a proof of possession over the feeder's nonce. Read as retired and never written; a relay answers an old query with `Goodbye{Retired}` (RFC-0181 §7). |
 | 0x15, 0x16 | `ProviderOffer`, `ProviderQuery` | The directory (§2.6): cells, stripes, MLAT cores, address and network, signed. |
 | 0x17 to 0x1a | `StripeAssignment`, `PieceManifest`, `HaveSummary`, `StripeReceipt` | Sharing groups (§2.5). |
 | 0x1b, 0x1c | `FirehoseCredential`, `EvidenceBundle` | Credit (§2.1): the credential, and feeders' descriptions (by reference since 2026-10-19) and children's receipts. |
-| 0x1d | `WorldPositions` | The live world product (§2.11), the `WORLD` bit (64). |
+| 0x1d | `WorldPositions` | The world product (§2.11), the `WORLD` bit (64). |
 | 0x1e | `RegionalBatch` | The regional product's deduplicated receptions, the `REGIONAL` bit (32). Relay-only since 2026-10-19: a client gets `ClientRegionalBatch` (0x27, no counters, RFC-0171 §3.4). |
 | 0x1f | `Parity` | A stripe's XOR parity slice, chunked under the body limit (§2.5), unsigned. |
 | 0x20 | `BundleIndex` | A parent cell's bundle for one second: its children's digests, signed (§2.6). |
-| 0x21 | `WorldPrecise` | The precise world product (§2.11), the `WORLD_PRECISE` bit (128). |
+| 0x21 | retired | `WorldPrecise`, the precise world product, the `WORLD_PRECISE` bit (128). Retired at wire version 4 (§2.11). |
 | 0x22, 0x23 | `DeliveryQuery`, `DeliveryAnswer` | The feeder's signed grant of tag keys to the member asked, and, in an audit, a nonce and a few batches named by boot and sequence; per batch, the member's tag made on arrival and its key's id, or "not seen", signed, answer format 2 (§2.2, RFC-0181 §7). Kinds of their own, not 0x13 and 0x14 read differently, so no build reads one form as the other. |
 | 0x28 | `FeederFigures` | A relay's signed figures of one area's receivers (§2.12), the `FEEDER_FIGURES` bit (256), on client links. Since 2026-10-19. |
 
@@ -563,71 +580,89 @@ rule, since every version 2 reader inflates it.
 
 ### §2.11 Two products: regional and world
 
-- **Regional:** everything for one area, raw included (raw, positions, provisional positions and
+- **Regional:** everything for one area, raw included (raw, positions and
   clock models), read from the area's sharing group. For researchers, local apps and the relays
   that cover the area. **Amended 2026-10-19 (founder):** that whole product is the relays'. A
   client, researchers and local apps included, gets the area's client forms: its receivers' format
   2 descriptions, its deduplicated receptions without counters (`ClientRegionalBatch`, signed from
-  the same draft as the relay's `RegionalBatch`, wall clock kept), tagged final and provisional
-  positions and client clock models (RFC-0171 §3.6, §3.8.1). A researcher who needs raw runs a
-  relay that takes the area.
+  the same draft as the relay's `RegionalBatch`, wall clock kept), tagged positions and client
+  clock models (RFC-0171 §3.6, §3.8.1). A researcher who needs raw runs a relay that takes the
+  area.
 - **World:** one position per aircraft per second, everywhere, thinned by one deterministic rule
   (`tally_wire::products::world_choice`) and offered at the top of the area tree (§2.6) by any
   relay that has gathered every area's positions (by taking every area: its groups bring it each
-  area's positions and regional batches; a relay with `--world` or `--world-precise` refuses to
-  start unless its areas cover the globe). As built (founder, 2026-10-07), in two feeds, each
-  opt-in on the relay (`--world`, `--world-precise`), each its own record stream and `Streams` bit,
-  shared, priced and served as separate products:
-  - **World live** (`WorldPositions`, `WORLD`): sealed 32.5 s after its second
-    (`products::WORLD_SETTLE_MS`, `LIVE_FIX_ARRIVED`), an MLAT aircraft by its provisional fix
-    until the final one arrives.
-  - **World precise** (`WorldPrecise`, `WORLD_PRECISE`): the same rule sealed 108.5 s after its
-    second (`products::WORLD_PRECISE_SETTLE_MS`, `FINAL_FIX_ARRIVED`), once final fixes have surely
-    arrived, an MLAT aircraft by its final fix only; ADS-B unchanged.
-  - Each fix carries its pressure altitude and its MLAT flag, and names its origin by an index into
+  area's positions and regional batches; a relay with `--world` refuses to start unless its areas
+  cover the globe). As built (founder, 2026-10-07), opt-in on the relay (`--world`), its own
+  record stream and `Streams` bit, shared, priced and served as a product of its own:
+  - **The world** (`WorldPositions`, `WORLD`): sealed 32.5 s after its second
+    (`products::WORLD_SETTLE_MS`, `FIX_ARRIVED`), once every fix of it has surely arrived, an MLAT
+    aircraft by its newest fix; ADS-B unchanged.
+  - Each fix carries its pressure altitude, its MLAT flag and how many receptions it considered,
+    and names its origin by an index into
     a per-record origin table (each entry the origin record's hash and the key that signed it, so
     the choice rule's last ties, by source key and then record hash, are decided from the record
     alone; the measurement below predates the key, which adds 32 bytes an origin, not a fix).
-    `world_choice` is a total order (transmit time, final over provisional, input set, source key,
-    origin hash, index), so the fix chosen is the same in any arrival order. Measured over a synthetic world of 17,400 aircraft: 87.5 bytes a fix
-    live (1.52 MB/s, 3.94 TB a month) and 89.9 bytes a fix precise. A relay rebuilds its world from
-    the positions it receives; the sharing groups carry the areas, not the world records.
-  - tally-api serves both (`/v1/aircraft?...&feed=precise`; its answer names the feed served and,
-    for the precise feed, is as of the product's own second), and the site's map offers the choice
-    (Live, or Precise, delayed), forwarded to the client core's reads. With no recent precise
-    product, tally-api answers `503 {"error":"precise_unavailable"}` and the map says so.
+    `world_choice` is a total order (transmit time, receptions considered, input set, source key,
+    origin hash, index), so the fix chosen is the same in any arrival order, and of one
+    transmission's fixes the bigger set is chosen over a subset an engine published fast (the
+    merge rule's superset preference, by count: a gatherer verifies neither). Measured over a
+    synthetic world of 17,400 aircraft: 87.5 bytes a fix (1.52 MB/s, 3.94 TB a month) before the
+    count, which adds two bytes a fix. A relay rebuilds its world from the
+    positions it receives; the sharing groups carry the areas, not the world records.
+  - **Amended 2026-10-24 (founder): the precise world product is retired** (RFC-0171 §3.8.1). It
+    was the same rule sealed 108.5 s after its second, once the windowed final fixes had surely
+    arrived, an MLAT aircraft by its final fix only (`WorldPrecise`, `WORLD_PRECISE`,
+    `--world-precise`), served by tally-api as `feed=precise` and offered on the map as "Precise,
+    delayed". With one class of fix there is nothing for it to wait for, so the record, its stream
+    bit, the relay's flag, the API's `feed` parameter and its `precise_unavailable` answer, and the
+    map's choice (the client core's reads) are gone, in one release.
 
-### §2.12 Receiver standing, and a bigger answer wins only if it agrees
+### §2.12 Receiver standing, and a bigger answer wins only if it agrees or is verified
 
 - **Receiver standing.** Every relay can compute, from the signed data it holds, how
   well each receiver's receptions agree with the solutions that cite it (its residuals against
-  verified fixes, by tile and over time). A receiver whose receptions keep agreeing gains weight;
+  verified fixes, by area and over time). A receiver whose receptions keep agreeing gains weight;
   one that keeps disagreeing loses it. Standing ranks answers (below); it never decides what a
   solver includes. A solver leaves out only a reception that does not fit, by the specification's
   outlier rule, which the verifier applies the same way (it refuses a solution that omits a
   reception that fits), so a fake receiver either fits and changes nothing or does not and is left
   out. Standing is a function of the signed record, read when a transmission's solutions are
   decided (never fixed when a solution arrives), and a transmission is settled
-  `FINAL_FIX_ARRIVED_MS` after its transmit time; so every party that reads the same record
+  `FIX_ARRIVED_MS` (32.5 s, since 2026-10-24; it was the finals' 108.5 s) after its transmit time,
+  once every fix of it has surely arrived; so every party that reads the same record
   computes the same standing and the same ranking, and a new key starts with none. **Amended
   2026-10-19 (founder):** this read "every client and relay ... from public signed data alone".
   Residuals need each receiver's site and counters, which only relays hold now (RFC-0171 §3.6), so
   standing is a relay's computation, over the raw it holds (RFC-0181 §5 already scopes it so).
-- **A bigger answer wins only if it agrees.** RFC-0171 §3.8.1's merge rule prefers the solution
-  over the larger input set, and that preference holds only when the larger solution agrees with
-  the smaller within the smaller's uncertainty (a chi-square test of the difference). A superset
-  that disagrees is not a better answer but a sign that something in the added inputs is wrong: the
-  smaller fix stands, both are kept as evidence, and the added receptions' standing pays for it. So
-  a relay cannot override an honest fix by padding it with bad receptions.
+- **A bigger answer wins only if it agrees, or is verified and carries more standing.** RFC-0171
+  §3.8.1's merge rule prefers the fix over the larger considered set, and that preference holds
+  when the larger fix agrees with a consistent smaller one within the smaller's uncertainty (a
+  chi-square test of the difference). **Amended 2026-10-24 (founder):** a superset that
+  disagrees supersedes the smaller only when a relay holding its raw verified it and its
+  receivers carry strictly more standing than every disagreeing smaller one's; the smaller is then
+  refused, and its receptions are judged under the superset's fix like any other. Otherwise the
+  superset is contested: a fault, never the answer, kept as evidence, the smaller stands, and the
+  added receptions' standing pays for it (`tally_mlat_solver::standing::decide`). So a relay
+  cannot override an honest fix by padding it with bad receptions (fabricated receptions earn no
+  verification over raw a fabricator does not have, and new keys carry no standing). This read "a
+  superset that disagrees is not a better answer: the smaller fix stands". Since every fix is
+  published a second after it is heard, that rule let the first fast, favourable subset freeze an
+  honest bigger fix out, which a relay that heard more must be able to replace. A relay verifies
+  a disagreeing superset lazily, capped per engine a second (`VERIFY_PER_ENGINE_PER_SEC`, 32),
+  past which it is refused and counted, so the verification is no way to spend a relay's cores. A client holds no raw and no
+  standing, so to it every disagreeing superset is unjudged and stays contested; it relies on its
+  relay's check (below).
 - **A client's positions are checked by the relay that sends them** (amended 2026-10-19). The rule
   above lets only a solution consistent with its own receptions under its own model refuse a
   superset, and a client, sent tagged positions and client clock models, cannot tell which are. So
-  a relay sends a client a tagged positions record only after rematching each solution's tags to
+  a relay sends a client a tagged positions record only after rematching each fix's tags to
   the receptions of its raw twin (each receiver's tag keyed by the site-bearing record the model's
   scope names, by site id, so a site re-signed mid-window still rematches) and finding every one
   under its model and consistent; one that fails is sent to no one, and one it cannot check is
   passed on to relays, who check it for their own clients, and to no client
-  (`tally_relay::consistency`).
+  (`tally_relay::consistency`). Since 2026-10-24 an engine sends each fix record raw and at once
+  tagged on one link, so the twin is the raw record that link brought last: the relay holds one
+  record a link, where it held every raw solution for the hub's wait for a model.
 - **Feeder figures are each relay's own signed claim, and any client serves them** (founder,
   2026-10-19; this replaced "feeder figures and leaderboards are a client's, never the network's",
   2026-10-07). Only relays hold what the figures are computed from: receivers' raw batches, the
@@ -687,6 +722,10 @@ rule, since every version 2 reader inflates it.
     refutes; the outlier rule already leaves out what does not fit (§2.12).
 12. **Delivery answers as credit.** A relay's proofs of possession are its word about itself
     (§2.1).
+13. **Provisional positions beside final ones, and a precise world product** (2026-10-24). Two
+    classes of fix doubled the positions stream, carried an old model up to 90 s, and kept every
+    table that held a final or its raw for 80 to 110 s; one class solved a second after it is
+    heard under a current model replaces both, and the world has one product (§2.4, §2.11).
 
 ## §4 Open questions, for the critics
 
@@ -711,7 +750,8 @@ Steps 1 to 7 are built (2026-10-07); step 8 is adsb.im's. In order:
 3. **One program:** the relay and its MLAT as one binary with relay duties on by default and
    a switch to turn them off, taking areas, the per-area choice of k MLAT relays, and the one-hop
    raw to them over the region-cut subscription.
-4. **Provisional positions** and the `PROVISIONAL` stream bit. Built (RFC-0171 §3.8.1).
+4. **Provisional positions** and the `PROVISIONAL` stream bit. Built (RFC-0171 §3.8.1), and
+   retired 2026-10-24 at wire version 4, when every fix became the fast one (§2.4).
 5. **Sharing groups:** fixed seeding, striped forwarding trees, signed stripe receipts, dropping a
    member that does not forward, under the speed cap.
 6. **The provider directory**, parent bundles and the world product (§2.11).

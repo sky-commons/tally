@@ -158,13 +158,12 @@ resolved by the relay, and the IP it resolved to is what it signs (nothing is si
 first resolves). `--network ASN` declares the autonomous system it is on, so feeders choose two relays on
 different networks. The duties of a full relay are on by default: it accepts feeders, runs MLAT
 for the areas it is chosen to solve (on the cores its other work leaves, below its priority, so
-MLAT that falls behind sheds rather than delaying raw; `--no-mlat` runs none), and seeds its feeders' data into their areas' sharing groups. `--no-relay-duties` turns all
+MLAT that falls behind skips to its newest step rather than delaying raw; `--no-mlat` runs none), and seeds its feeders' data into their areas' sharing groups. `--no-relay-duties` turns all
 three off, for a relay that only shares the areas it takes (a host behind NAT, or one with no
-cores to spare). `--world` gathers the live world product from every area's positions it receives
-(one fix per aircraft per second, sealed 32.5 seconds after the second, MLAT by its provisional
-fix), and `--world-precise` the precise one (the same rule sealed 108.5 seconds after the
-second, once final MLAT fixes have surely arrived, MLAT by its final fix only). A relay receives an area's
-positions by taking it, so a world relay takes every area: with either flag the `--area` cells
+cores to spare). `--world` gathers the world product from every area's positions it receives
+(one fix per aircraft per second, the newest it was shown, sealed 32.5 seconds after the
+second, once every fix of it has surely arrived). A relay receives an area's
+positions by taking it, so a world relay takes every area: with `--world` the `--area` cells
 must cover the globe (the 122 resolution 0 cells do), and a relay told otherwise refuses to start
 rather than sign part of the world as the whole. A client subscribes to each product separately.
 
@@ -239,8 +238,8 @@ is nearly over.
   those bytes never leave the host.
 - What goes first is fixed, highest first: control (handshakes, rate limits, heartbeats, goodbyes,
   which always have a small reserve of their own); positions and clock models; raw batches to
-  relay links and engines; the rest that relay links and engines are sent; provisional positions,
-  when there are any; and last, plain subscribers. A class gets only what the classes above it
+  relay links and engines; the rest that relay links and engines are sent; and last, plain
+  subscribers. A class gets only what the classes above it
   leave, and peers in one class share it fairly.
 - Once a send has waited 2 s for the cap, a waiting peer is dropped every quarter second until
   what is asked for fits: from the lowest class anyone is waiting in, the one asking the most. A
@@ -288,7 +287,7 @@ tally-api --relay-stats http://127.0.0.1:10901 --readsb http://127.0.0.1:30152 \
 once with `git clone --depth 1 --filter=blob:none --sparse https://github.com/vradarserver/standing-data DIR && git -C DIR sparse-checkout set routes airports`.
 Without it the routes answer `404`.
 
-`--relay` (repeatable) is where the API reads the network's MLAT positions, its world products
+`--relay` (repeatable) is where the API reads the network's MLAT positions, their clock models
 and the relays' feeder figures. Without it the aircraft carry readsb's positions alone, and no
 feeder has figures. The API is a client of the relay like any other: it is sent tagged positions
 (each checked by the relay that sent it) and clock models with no receiver sites, and no raw
@@ -298,19 +297,12 @@ hosts or carries, standing and MLAT help among them, and signs them (`FeederFigu
 says have standing.
 
 The API's host runs chrony and ClockBound as a relay's does (RFC-0171 §3.6): it judges the
-relays' signed times (feeder figures, the precise world product) only while ClockBound says the
+relays' signed times (feeder figures) only while ClockBound says the
 clock is `Synchronized` within the error budget. While it does not (no ClockBound, not
-synchronised, or a bound past the budget), the API takes no feeder figures and no precise world
-product, and says nothing of it: the figures and the precise feed simply go empty (`503` for the
-precise feed once its product is too old). A precise part is taken only from a `--relay` the API
-subscribes to.
+synchronised, or a bound past the budget), the API takes no feeder figures, and says nothing of
+it: the figures simply go empty.
 
-- `GET /v1/aircraft?west=&south=&east=&north=` (degrees, at most 60 each way); add `&feed=precise`
-  for the precise world product, 108.5 s behind (each second sealed that long after it ends),
-  with every MLAT position final (the answer's `feed` says which was served, and its `now_ms` is
-  that product's own second). With no recent precise product to serve (none has come from the
-  relays, or the newest is older than the age limit beyond its own delay) it answers
-  `503` with `{"error":"precise_unavailable"}`, never an empty sky. Each aircraft's
+- `GET /v1/aircraft?west=&south=&east=&north=` (degrees, at most 60 each way). Each aircraft's
   `position_at_ms` is when its position was heard (readsb's
   `seen_pos`; for MLAT, the transmission's time), which a client projects from, and
   `last_heard_at_ms` when any message was; `position_source` is `adsb`, `mlat` (Tally MLAT), `adsr`,
@@ -322,7 +314,7 @@ subscribes to.
   aircraft in the box), then at most every 250 ms the aircraft that changed and the `gone`
   addresses, and a comment every 15 s while nothing changes. One read of readsb (every 200 ms,
   while any stream is open) serves every stream; an address holds at most 4 open streams (a fifth
-  is answered `429`). With `&feed=precise` each new second of the precise product is sent whole.
+  is answered `429`).
   Run readsb with `--write-json-every 0.2` so its answer is as fresh as the stream's
 - `GET /v1/network`: receivers, their message rate, and `aircraft` (readsb's positioned aircraft
   and those only Tally MLAT places) with `aircraft_by_source` summing to it

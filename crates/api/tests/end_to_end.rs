@@ -22,7 +22,7 @@ use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 use tally_api::Settings;
 use tally_api_types::{
-    Aircraft, AircraftResponse, AircraftUpdate, Feed, FeederStats, MeResponse, MlatCheck, Network,
+    Aircraft, AircraftResponse, AircraftUpdate, FeederStats, MeResponse, MlatCheck, Network,
     PositionSource, SourceCounts, Station, fixtures,
 };
 use tally_merge::Merge;
@@ -30,7 +30,7 @@ use tally_mlat::intake::SiteRecord;
 use tally_mlat_solver::sim::{self, Scenario, Simulation};
 use tally_relay::hub::Hub;
 use tally_relay::mlat_host::stepping::{self, Hosting};
-use tally_relay::mlat_host::{HostedMlat, MlatHost, MlatReport, SETTLE_MS, WindowClock};
+use tally_relay::mlat_host::{HostedMlat, MlatHost, MlatReport, StepClock};
 use tally_relay::stations::StationReport;
 use tally_wire::batch::PublicInfoContent;
 use tally_wire::noise;
@@ -573,19 +573,6 @@ async fn the_api_serves_aircraft_the_network_and_a_station_from_readsb_and_a_rea
         assert!(queries.contains(&part.to_owned()), "{queries:?}");
     }
 
-    // The precise feed with no precise product held: unavailable, never an empty sky, and not
-    // cached.
-    let (status, headers, body) = get(&format!(
-        "{api}/v1/aircraft?west=-123&south=37&east=-121&north=38&feed=precise"
-    ))
-    .await?;
-    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(header(&headers, &CACHE_CONTROL), "no-store");
-    assert_eq!(
-        json::<serde_json::Value>(&body)?,
-        serde_json::json!({ "error": "precise_unavailable" })
-    );
-
     // Too large a viewport, and one not given.
     for query in ["west=-130&south=0&east=-60&north=10", "west=-123&south=37"] {
         let (status, headers, _) = get(&format!("{api}/v1/aircraft?{query}")).await?;
@@ -929,16 +916,10 @@ async fn a_stream_pushes_every_aircraft_then_what_changed_and_holds_an_address_t
     let url = format!("{api}/v1/aircraft/stream?west=-123&south=37&east=-121&north=38");
 
     // Refused as `/v1/aircraft` refuses, and never cached.
-    for (query, refused) in [
-        (
-            "west=-130&south=0&east=-60&north=10",
-            StatusCode::BAD_REQUEST,
-        ),
-        (
-            "west=-123&south=37&east=-121&north=38&feed=precise",
-            StatusCode::SERVICE_UNAVAILABLE,
-        ),
-    ] {
+    for (query, refused) in [(
+        "west=-130&south=0&east=-60&north=10",
+        StatusCode::BAD_REQUEST,
+    )] {
         let (status, headers, _) = get(&format!("{api}/v1/aircraft/stream?{query}")).await?;
         assert_eq!(status, refused, "{query}");
         assert_eq!(header(&headers, &CACHE_CONTROL), "no-store");
@@ -952,8 +933,8 @@ async fn a_stream_pushes_every_aircraft_then_what_changed_and_holds_an_address_t
     assert_eq!(header(&headers, &ACCESS_CONTROL_ALLOW_ORIGIN), SITE);
     let first = events.update().await?;
     assert_eq!(
-        (first.full, first.feed, first.now_ms, first.gone.len()),
-        (true, Feed::Live, 1_791_220_000_250, 0)
+        (first.full, first.now_ms, first.gone.len()),
+        (true, 1_791_220_000_250, 0)
     );
     assert_eq!(first.aircraft, expected());
     assert!(first.sent_at_ms > 0);
@@ -1033,13 +1014,15 @@ fn wall_ms() -> u64 {
         .map_or(0, |elapsed| elapsed.as_millis() as u64)
 }
 
-/// How long before now the scenario starts: its window bins are past by the time the relays'
-/// clock, walking it from its start (`stepping`), reaches the wall clock (a 30 s scenario, a window
-/// after it and its settling).
-const SCENARIO_AGO_MS: u64 = 150_000;
+/// How long the scenario runs.
+const SCENARIO_S: f64 = 30.0;
+/// How long before now the scenario starts: every fix of it has surely arrived
+/// (`tally_wire::budget::FIX_ARRIVED`) by the time the relays' clock, walking it from its start
+/// (`stepping`), reaches the wall clock.
+const SCENARIO_AGO_MS: u64 = SCENARIO_S as u64 * 1_000 + tally_wire::budget::FIX_ARRIVED_MS;
 
-/// A scenario that began `SCENARIO_AGO_MS` ago, so every window bin of it is past by the time the
-/// relays' clock reaches the wall clock.
+/// A scenario that began `SCENARIO_AGO_MS` ago, so every fix of it has surely arrived by the time
+/// the relays' clock reaches the wall clock.
 fn minutes_ago(scenario: Scenario) -> Scenario {
     let start_ms = wall_ms() - SCENARIO_AGO_MS;
     Scenario {
@@ -1070,16 +1053,16 @@ impl MlatHost for Held {
         self.host.set_areas(self.areas.clone(), descriptions);
     }
 
+    fn raw(&self) -> Option<Arc<dyn tally_relay::standing::Raw>> {
+        self.host.raw()
+    }
+
     fn offer_description(&self, info: &SiteRecord, stamp_ms: u64) {
         self.host.offer_description(info, stamp_ms);
     }
 
     fn offer_batch(&self, batch: &std::sync::Arc<tally_wire::Decoded>, now_ms: u64) {
         self.host.offer_batch(batch, now_ms);
-    }
-
-    fn sealed_bins(&self) -> Option<tally_mlat_solver::held::SealedBins> {
-        self.host.sealed_bins()
     }
 
     fn take_published(&self, watermark: tally_relay::products::Watermark) -> Vec<Record> {
@@ -1146,12 +1129,11 @@ async fn mlat_relay(clock: &Arc<stepping::Clock>) -> Result<(RelayAddress, Arc<H
         1,
         tally_mlat::engine::Settings {
             regions: tally_wire::Regions::default(),
-            settle: tally_wire::budget::policy::<_, SETTLE_MS>(),
             threads: 4,
             capacity: tally_mlat::engine::Capacity::default(),
         },
         // Its clock walks no faster than it keeps up (`stepping`): it is never overloaded.
-        WindowClock::KEEPING_UP,
+        StepClock::KEEPING_UP,
     )?;
     host.set_areas(areas.clone(), Vec::new());
     let held = Arc::new(Held { host, areas });
@@ -1236,7 +1218,7 @@ async fn feed_simulation(
 #[tokio::test(flavor = "multi_thread")]
 async fn the_api_serves_one_merged_mlat_position_per_aircraft_from_two_relays() -> Result {
     let simulation = sim::run(&minutes_ago(Scenario {
-        duration_s: 30.0,
+        duration_s: SCENARIO_S,
         modes_aircraft: 16,
         ..Scenario::new(31)
     }));
@@ -1286,12 +1268,6 @@ async fn the_api_serves_one_merged_mlat_position_per_aircraft_from_two_relays() 
     );
 
     let mut merge = Merge::new(tally_merge::Settings::default());
-    // One reading for every record: this merge never waits out a provisional's deadline.
-    #[allow(
-        clippy::disallowed_methods,
-        reason = "a test's merge, read at one scripted instant"
-    )]
-    let at = tally_wire::clocks::recorded::mono(0);
     let last: Arc<Mutex<String>> = Arc::default();
     let url = format!("{api}/v1/aircraft?west=0&south=49&east=10&north=55");
     // The scenario at the wall clock's pace at most, and a hang guard beyond: the clock walks no
@@ -1300,7 +1276,7 @@ async fn the_api_serves_one_merged_mlat_position_per_aircraft_from_two_relays() 
     let outcome = tokio::time::timeout(Duration::from_secs(180) + WAIT, async {
         loop {
             while let Ok(record) = records.try_recv() {
-                merge.ingest(&record, at).map_err(text)?;
+                merge.ingest(&record).map_err(text)?;
             }
             let expected: Vec<(String, f64, f64, Option<i32>)> = tally_api::mlat::served(&merge)
                 .into_iter()

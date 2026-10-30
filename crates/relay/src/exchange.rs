@@ -17,18 +17,18 @@
 //!   feeder can choose its shard. Admission, station counters and each receiver's place, owned by
 //!   the ingest worker of the receiver's shard (`ingest::Stages`).
 //! - [`Exchange::Address`]: by ICAO address, under the same secret ([`address_shard`]). The
-//!   hosted MLAT's provisional state is held in these shards (`mlat_host`,
-//!   `tally_mlat::provisional::shard_of`); the world candidates arrive per record, not per
-//!   reception, and one sealer owns them whole (`products::Sealer`).
+//!   hosted MLAT's fix state is held in these shards (`mlat_host`, `tally_mlat::fix::shard_of`);
+//!   the world candidates arrive per record, not per reception, and one sealer owns them whole
+//!   (`products::Sealer`).
 //!
 //! What a thread allocates is charged to the relay's budget (`budget`): each open epoch's slices,
 //! their runs and the places its receptions take in the epoch's decisions to [`Store::Epochs`]
-//! ([`Slice::bytes`]), and its [`DEDUP_GENERATIONS`] generations of fingerprints to
+//! ([`Slice::bytes`]), and its table of the window's fingerprints ([`DEDUP_EPOCHS`] epochs) to
 //! [`Store::Dedup`], allocated once at the capacity the plan reserved and held for the thread's
-//! life ([`Generation`]). The decodes the slices share are not charged here: each is charged once, for
+//! life ([`Fingerprints`]). The decodes the slices share are not charged here: each is charged once, for
 //! its life, inside itself, by the ingest stage that made it (`budget::Store::Decoded`), however
 //! many threads, epochs and other stages hold it, and let go with its last holder. An epoch that
-//! would pass the epochs' store, or hold more receptions on a thread than its generation of
+//! would pass the epochs' store, or hold more receptions on a thread than an epoch of its
 //! fingerprints holds, is refused whole: its slices are let go, and the sealer is
 //! told it was refused ([`Frozen::refused`]), so it counts it and makes no product of any part of
 //! it (RFC-0181 §10). The epochs' room is planned for the receptions `R_max` admits over the epochs
@@ -43,7 +43,7 @@
 //!
 //! Whether an epoch is admitted is settled once, for every thread, before any commits it
 //! ([`Admission`]): each thread decides its part against what it remembers and holds the
-//! fingerprints it would add aside (its generation of that epoch), and only when every thread has
+//! fingerprints it would add aside (that epoch's part of its table), and only when every thread has
 //! posted its part, and none refused, are they kept. An epoch refused anywhere is forgotten by
 //! every thread, so a message decided in it is still new in the next, never lost to an epoch that
 //! was never published. A thread decides the epoch after one it posted only once that one is
@@ -91,22 +91,23 @@ pub const SHARDS: usize = 256;
 /// feeder's batches per producer at the RFC's rate, bounded whatever the shard's speed.
 pub const QUEUE_SLICES: usize = 1_024;
 
-/// What a generation allocates for each entry of its capacity ([`Generation`]): a slot and a half
-/// (its table is at most two thirds full, [`DEDUP_SLOTS_PER_ENTRY`]), the entry's place in the list
-/// that clears it, and one link of the areas it was kept for. Allocated once, at the thread's
+/// What the table allocates for each reception of an epoch's capacity ([`Fingerprints`]): its
+/// keys (one for the stream, one for its area, [`KEYS_PER_RECEPTION`]), each a slot and a third
+/// (the table is at most three quarters full, [`DEDUP_SLOTS_PER_ENTRY`]) and its home's place in
+/// its epoch's list (where letting the epoch go looks for it). Allocated once, at the thread's
 /// start, for the relay's life.
-pub const DEDUP_ENTRY_BYTES: usize = DEDUP_SLOT_BYTES * DEDUP_SLOTS_PER_ENTRY.0
-    / DEDUP_SLOTS_PER_ENTRY.1
-    + std::mem::size_of::<u32>()
-    + std::mem::size_of::<Link>();
+pub const DEDUP_ENTRY_BYTES: usize = KEYS_PER_RECEPTION
+    * ((DEDUP_SLOT_BYTES * DEDUP_SLOTS_PER_ENTRY.0).div_ceil(DEDUP_SLOTS_PER_ENTRY.1)
+        + std::mem::size_of::<u32>());
 
-/// A table slot: the fingerprint and its mark ([`Generation`]), five 32-bit words.
-const DEDUP_SLOT_BYTES: usize = SLOT_WORDS * std::mem::size_of::<u32>();
+/// A table slot: a key and the epoch that kept it ([`Fingerprints`]), 16 bytes.
+const DEDUP_SLOT_BYTES: usize = std::mem::size_of::<Slot>();
 
-/// Slots a generation's table holds for each entry of its capacity, as a fraction: at most two
-/// thirds full, so a probe for a fingerprint not held (most of them: each reception looks in
-/// every generation) reads about five slots, two cache lines, before an empty one ends it.
-const DEDUP_SLOTS_PER_ENTRY: (usize, usize) = (3, 2);
+/// Slots the table holds for each key of its capacity, as a fraction: at most three quarters
+/// full, so a probe for a key held (most of them: a message is heard by dozens of receivers, most
+/// in one area) reads two or three slots, one cache line, and one for a key not held about eight,
+/// two lines, before an empty one ends it.
+const DEDUP_SLOTS_PER_ENTRY: (usize, usize) = (4, 3);
 
 /// How far apart two copies of one message may be stamped and still be one message: the
 /// deduplication's window, at least. The relay's deduplication before the stages held two 2 s
@@ -116,49 +117,49 @@ const DEDUP_SLOTS_PER_ENTRY: (usize, usize) = (3, 2);
 /// messages). A copy stamped up to this after the copy kept is never kept again.
 pub const DEDUP_WINDOW_MS: u64 = 2_000;
 
-/// Generations of fingerprints a message shard holds, one an epoch: the epoch being decided and
+/// Epochs of fingerprints a message shard remembers: the epoch being decided and
 /// enough before it that two stamps `DEDUP_WINDOW_MS` apart (whose epochs are at most
 /// `DEDUP_WINDOW_MS / EPOCH_MS` apart) always meet. A message is remembered from the epoch it was
-/// kept in to the end of the epoch `DEDUP_GENERATIONS - 1` after, by stamps alone.
-pub const DEDUP_GENERATIONS: usize = (DEDUP_WINDOW_MS / EPOCH_MS) as usize + 1;
-const _: () = assert!(DEDUP_GENERATIONS >= 2);
+/// kept in to the end of the epoch `DEDUP_EPOCHS - 1` after, by stamps alone.
+pub const DEDUP_EPOCHS: usize = (DEDUP_WINDOW_MS / EPOCH_MS) as usize + 1;
+const _: () = assert!(DEDUP_EPOCHS >= 2);
 
-/// Entries of capacity ([`DEDUP_ENTRY_BYTES`] each) the generations hold for each reception an
-/// epoch at the planned rate, all generations together: each generation holds a third more than
+/// Entries of capacity ([`DEDUP_ENTRY_BYTES`] each) the table holds for each reception an
+/// epoch at the planned rate, every epoch of the window together: each epoch keeps a third more than
 /// a thread's share of an epoch, every reception new. A thread's share is its shards' (the
 /// fingerprint's low byte, uniform under the process's key, which no peer knows), so the
 /// receptions it takes in an epoch at the planned rate pass its share by a third only at many
 /// standard deviations (one at 150 receptions a share, eleven at 10,000). The tables are allocated
 /// at this capacity once and never grow, so no epoch is charged room for a table to double.
 pub const DEDUP_SLOTS_PER_RECEPTION: usize =
-    DEDUP_GENERATIONS * DEDUP_CAPACITY_MARGIN.0 / DEDUP_CAPACITY_MARGIN.1;
+    DEDUP_EPOCHS * DEDUP_CAPACITY_MARGIN.0 / DEDUP_CAPACITY_MARGIN.1;
 const _: () =
-    assert!((DEDUP_GENERATIONS * DEDUP_CAPACITY_MARGIN.0).is_multiple_of(DEDUP_CAPACITY_MARGIN.1));
+    assert!((DEDUP_EPOCHS * DEDUP_CAPACITY_MARGIN.0).is_multiple_of(DEDUP_CAPACITY_MARGIN.1));
 
-/// A generation's capacity over its thread's share of an epoch at the planned rate, as a fraction.
+/// An epoch's capacity over its thread's share of an epoch at the planned rate, as a fraction.
 const DEDUP_CAPACITY_MARGIN: (usize, usize) = (4, 3);
 
-/// What the generations of fingerprints cost, all generations together, for each reception a
+/// What the tables of fingerprints cost, every epoch of the window together, for each reception a
 /// second of the planned rate: the plan's dedup line is this times the rate (`budget`).
 pub const DEDUP_BYTES_PER_RECEPTION_PER_SEC: usize =
     DEDUP_SLOTS_PER_RECEPTION * DEDUP_ENTRY_BYTES * EPOCH_MS as usize / 1_000;
 
-/// Receptions an epoch an exchange made for a test sizes its generations for (`Gauges::unlimited`).
+/// Receptions an epoch an exchange made for a test sizes its tables for (`Gauges::unlimited`).
 pub const TEST_DEDUP_RECEPTIONS: usize = 1 << 16;
 
-/// The gauges the message exchange charges, and the receptions an epoch its generations of
+/// The gauges the message exchange charges, and the receptions an epoch its tables of
 /// fingerprints are sized for.
 #[derive(Clone, Debug)]
 pub struct Gauges {
     pub epochs: Arc<Gauge>,
     pub dedup: Arc<Gauge>,
-    /// Receptions an epoch, relay-wide, the generations are allocated for, once: what the plan
+    /// Receptions an epoch, relay-wide, the tables are allocated for, once: what the plan
     /// reserved for them ([`Gauges::of`]).
     pub dedup_receptions: usize,
 }
 
 impl Gauges {
-    /// The budget's gauges, and the generations sized to what the plan reserved for them: the
+    /// The budget's gauges, and the tables sized to what the plan reserved for them: the
     /// dedup store's limit over what a reception an epoch costs them
     /// ([`DEDUP_SLOTS_PER_RECEPTION`] entries of [`DEDUP_ENTRY_BYTES`]), so what they allocate
     /// is what the plan holds for them. Taken when the exchange is made, so made after the
@@ -173,7 +174,7 @@ impl Gauges {
         }
     }
 
-    /// Never full: for a test's exchange, its generations sized for [`TEST_DEDUP_RECEPTIONS`].
+    /// Never full: for a test's exchange, its tables sized for [`TEST_DEDUP_RECEPTIONS`].
     pub fn unlimited() -> Self {
         Self {
             epochs: Gauge::unlimited(Store::Epochs),
@@ -216,12 +217,12 @@ pub fn raw_shard(receiver: &PublicKey) -> ShardId {
     ShardId((keyed % SHARDS as u128) as u16)
 }
 
-/// The shard of an ICAO address: provisional solving's own (`tally_mlat::provisional::shard_of`),
+/// The shard of an ICAO address: MLAT fix solving's own (`tally_mlat::fix::shard_of`),
 /// one hash for every state kept by aircraft, keyed under the process's secret so a feeder
 /// reporting crafted addresses cannot fill one shard.
 pub fn address_shard(address: u32) -> ShardId {
-    const { assert!(tally_mlat::provisional::SHARDS == SHARDS) };
-    ShardId(tally_mlat::provisional::shard_of(address) as u16)
+    const { assert!(tally_mlat::fix::SHARDS == SHARDS) };
+    ShardId(tally_mlat::fix::shard_of(address) as u16)
 }
 
 /// The thread of `threads` a shard runs on.
@@ -405,178 +406,272 @@ impl Watermark {
     }
 }
 
-/// A table slot's words: the fingerprint's four and its mark.
-const SLOT_WORDS: usize = 5;
-/// A mark's bit for a slot that holds a fingerprint; an empty slot's mark is zero.
-const OCCUPIED: u32 = 1 << 31;
-/// A mark's bit for a message kept for the hub's stream.
-const STREAM: u32 = 1 << 30;
-/// A mark's low bits: the first link of the areas it was kept for, numbered from one (zero: none).
-const HEAD: u32 = STREAM - 1;
-/// The most entries one generation holds: its links are numbered in a mark's low bits.
-const MAX_ENTRIES: usize = HEAD as usize;
+/// A table slot: a key's 126 bits ([`KEY_MASK`]) and, in the two above them, the epoch that kept
+/// it, numbered from one (`TAG_SHIFT`); an empty slot is zero.
+type Slot = u128;
+/// Where a slot's epoch is.
+const TAG_SHIFT: u32 = 126;
+/// A key's bits.
+const KEY_MASK: u128 = (1 << TAG_SHIFT) - 1;
+const _: () = assert!(DEDUP_EPOCHS < 1 << (128 - TAG_SHIFT));
+/// What an area's key is told from the stream's by: an odd multiplier, so each area's number (an
+/// H3 cell's index, never zero) moves the fingerprint by its own nonzero amount.
+const AREA_MIX: u128 = 0x9e37_79b9_7f4a_7c15_f39c_c060_5ced_c835;
+/// Keys an epoch keeps for each reception at most: one for the stream, one for its area.
+const KEYS_PER_RECEPTION: usize = 2;
+/// The most receptions an epoch keeps on one thread: every slot is numbered in a word.
+const MAX_ENTRIES: usize = (u32::MAX as usize - 1) / (DEDUP_EPOCHS * KEYS_PER_RECEPTION * 2);
 
-/// One area a message was kept for, and the next (numbered from one; zero ends the list). The
-/// area's number in two words, so a link is three words, not padded to four.
-#[derive(Clone, Copy, Debug)]
-struct Link {
-    area: [u32; 2],
-    next: u32,
-}
+/// What a message was kept for, as a key: the fingerprint itself for the stream, and for an area
+/// the fingerprint moved by the area's number (`AREA_MIX`), each to its low 126 bits. Two keys of
+/// different messages or of different areas are equal only as two fingerprints collide: the
+/// fingerprint is the relay's own keyed hash (`tally_wire::Decoded`), which no peer can aim, and a
+/// key keeps 126 of its 128 bits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Key(u128);
 
-impl Link {
-    fn area(region: Region) -> [u32; 2] {
-        let number = region.as_u64();
-        [number as u32, (number >> 32) as u32]
+impl Key {
+    fn stream(fp: u128) -> Self {
+        Self(fp & KEY_MASK)
+    }
+
+    fn area(fp: u128, area: Region) -> Self {
+        Self((fp ^ u128::from(area.as_u64()).wrapping_mul(AREA_MIX)) & KEY_MASK)
+    }
+
+    /// Where its probe starts, of `count` slots: its high bits (the fingerprint's low byte chose
+    /// the shard, so it is the same across a shard), scaled onto the slots, uniform, with no power
+    /// of two.
+    fn home(self, count: usize) -> usize {
+        ((u128::from((self.0 >> 62) as u64) * count as u128) >> 64) as usize
     }
 }
 
-/// One generation: the messages one epoch kept, on one thread. A fixed table allocated once at
-/// its capacity, never grown and never shrunk: open addressing over `slots` (each a fingerprint
-/// and its mark: kept for the stream, and the first of the areas it was kept for), probed from the
-/// fingerprint's high half (its low byte chose the shard, so it is the same across a shard), at
-/// most two thirds full. The areas a message was kept for (almost always none or one) are a list
-/// through `links`, one link a reception at most, so an entry is the fingerprint and an index,
-/// never an allocation of its own. Every entry's slot is listed in `filled`, so clearing it costs
-/// what it held, not its capacity: the table's untouched pages are never touched.
+/// The epoch `slot` was kept in, numbered from one; zero for an empty slot.
+fn tag(slot: Slot) -> usize {
+    (slot >> TAG_SHIFT) as usize
+}
+
+/// The messages one thread kept within the window, in one table: each a key of what it was kept
+/// for (the stream, or one area), so whether a reception is new to the stream is one probe and
+/// whether it is new to its area is one more, however many areas heard it. A fixed table allocated
+/// once at its capacity, never grown and never shrunk: linear probing over `slots` of 16 bytes, at
+/// most three quarters full. A key is kept once a window (once kept it is not new until its epoch
+/// is let go), so it belongs to one epoch, which its slot names, and its epoch lists its home (4
+/// bytes): letting the epoch go walks the run from each home listed and removes the epoch's keys
+/// it finds (Knuth's deletion for linear probing, Algorithm R: the keys after one in its run move
+/// back, so no tombstone lengthens a probe). A key moves only towards its home, never past it,
+/// so it is always in the run from its home on; letting an epoch go costs what it kept, never a
+/// walk of the table.
 ///
-/// It holds at most `capacity` entries and links, and an epoch's receptions on its thread are
-/// counted before any is decided ([`MessageThread::close`]): an epoch with more than its
-/// generation holds is refused whole, as any epoch past its room is, never decided in part. Each
-/// reception adds at most one entry and one link, so the table never fills mid-epoch.
-pub struct Generation {
-    slots: Box<[u32]>,
-    filled: Vec<u32>,
-    links: Vec<Link>,
+/// Before (2026-10-27), each epoch had a table of its own keyed by fingerprint alone, its areas a
+/// list through links: every reception probed every epoch's table, and for its area walked the
+/// list of every area that had kept the message, a cache miss a link. A message heard across a
+/// region is heard in hundreds of areas, so at 5,000 feeders that walk was most of the message
+/// threads' time (253 ns a reception). And then, briefly, each epoch listed the keys it kept
+/// whole, 24 bytes each beside 36 of table: 120 bytes a reception, where these slots and homes
+/// take 52, which the plan's memory paid for in connections (13,883 where these carry 15,000); and
+/// a pass over the whole table each epoch instead of the homes (48 bytes) cost the message threads
+/// a third more at 5,000 feeders, the table being sized for the plan's rate, not the load's.
+///
+/// An epoch keeps at most `capacity` keys for the stream and as many for the areas, and its
+/// receptions on its thread are counted before any is decided ([`MessageThread::close`]): an
+/// epoch with more than that is refused whole, as any epoch past its room is, never decided in
+/// part. Each reception keeps at most one of each, so the table, sized for the window's epochs at
+/// capacity, never fills mid-epoch.
+pub struct Fingerprints {
+    slots: Box<[Slot]>,
+    /// The homes of the keys each epoch of the window kept, one a key.
+    kept: Box<[Vec<u32>; DEDUP_EPOCHS]>,
+    /// The epoch being decided.
+    current: usize,
+    /// Keys the epoch being decided kept, for the stream and for areas.
+    streamed: usize,
+    regional: usize,
     capacity: usize,
 }
 
-impl Generation {
-    /// A generation holding up to `capacity` entries, allocated now: the slots zeroed (an empty
-    /// table, from the kernel's zero pages where it is mapped apart), the lists reserved.
+impl Fingerprints {
+    /// A table for [`DEDUP_EPOCHS`] epochs of up to `capacity` receptions each, allocated now: the
+    /// slots zeroed (an empty table, from the kernel's zero pages where it is mapped apart, asked
+    /// to be backed by huge pages, `os::advise_huge_pages`), the lists reserved.
     pub fn with_capacity(capacity: usize) -> Self {
         let capacity = capacity.min(MAX_ENTRIES);
-        // One slot more than the fraction, so a table at capacity always has an empty slot that
-        // ends a probe.
-        let slots = capacity * DEDUP_SLOTS_PER_ENTRY.0 / DEDUP_SLOTS_PER_ENTRY.1 + 1;
+        let mut slots = vec![0 as Slot; table_slots(capacity)].into_boxed_slice();
+        crate::os::advise_huge_pages(&mut slots);
         Self {
-            slots: vec![0u32; slots * SLOT_WORDS].into_boxed_slice(),
-            filled: Vec::with_capacity(capacity),
-            links: Vec::with_capacity(capacity),
+            slots,
+            kept: Box::new(std::array::from_fn(|_| {
+                Vec::with_capacity(KEYS_PER_RECEPTION * capacity)
+            })),
+            current: 0,
+            streamed: 0,
+            regional: 0,
             capacity,
         }
     }
 
     /// The bytes it allocated, for its life.
     pub fn bytes(&self) -> usize {
-        self.slots.len() * std::mem::size_of::<u32>()
-            + self.filled.capacity() * std::mem::size_of::<u32>()
-            + self.links.capacity() * std::mem::size_of::<Link>()
+        std::mem::size_of_val(&*self.slots)
+            + self
+                .kept
+                .iter()
+                .map(|kept| kept.capacity() * std::mem::size_of::<u32>())
+                .sum::<usize>()
     }
 
-    fn key(fp: u128) -> [u32; 4] {
-        [
-            fp as u32,
-            (fp >> 32) as u32,
-            (fp >> 64) as u32,
-            (fp >> 96) as u32,
-        ]
+    fn next(&self, slot: usize) -> usize {
+        if slot + 1 == self.slots.len() {
+            0
+        } else {
+            slot + 1
+        }
     }
 
-    /// The slot holding `fp`, or the empty one where it would go.
-    fn find(&self, fp: u128) -> usize {
-        let key = Self::key(fp);
-        let count = self.slots.len() / SLOT_WORDS;
-        // The high half scaled onto the slots: uniform, with no power of two.
-        let mut slot = ((u128::from((fp >> 64) as u64) * count as u128) >> 64) as usize;
+    /// The slot holding `key`, or the empty one where it would go.
+    fn find(&self, key: Key) -> usize {
+        let mut slot = key.home(self.slots.len());
         loop {
-            let words = &self.slots[slot * SLOT_WORDS..(slot + 1) * SLOT_WORDS];
-            if words[4] == 0 || words[..4] == key {
+            let held = self.slots[slot];
+            if held == 0 || held & KEY_MASK == key.0 {
                 return slot;
             }
-            slot = if slot + 1 == count { 0 } else { slot + 1 };
+            slot = self.next(slot);
         }
     }
 
-    /// The mark of `fp`, zero if it holds none.
-    fn mark(&self, fp: u128) -> u32 {
-        self.slots[self.find(fp) * SLOT_WORDS + 4]
-    }
-
-    /// Whether the areas listed from `mark` hold `area`.
-    fn holds(&self, mark: u32, area: Region) -> bool {
-        let area = Link::area(area);
-        let mut next = mark & HEAD;
-        while let Some(link) = next
-            .checked_sub(1)
-            .and_then(|at| self.links.get(at as usize))
-        {
-            if link.area == area {
-                return true;
-            }
-            next = link.next;
+    /// Asks for the line `key`'s probe starts at, so its probe a few receptions later finds it in
+    /// the cache.
+    fn prefetch(&self, key: Key) {
+        if let Some(slot) = self.slots.get(key.home(self.slots.len())) {
+            crate::os::prefetch(slot);
         }
-        false
     }
 
-    /// Keeps `fp` for the stream if `stream`, and for `area` if one: the caller has found it kept
-    /// for neither here. False, keeping nothing, when it is full (an epoch counted against its
-    /// capacity never finds it so).
-    fn keep(&mut self, fp: u128, stream: bool, area: Option<Region>) -> bool {
-        let slot = self.find(fp);
-        let at = slot * SLOT_WORDS;
-        let mut mark = self.slots[at + 4];
-        if (mark == 0 && self.filled.len() >= self.capacity)
-            || (area.is_some() && self.links.len() >= self.capacity)
-        {
+    /// Asks for what deciding `fp` in `area` will read.
+    fn prefetch_reception(&self, fp: u128, area: Option<Region>) {
+        self.prefetch(Key::stream(fp));
+        if let Some(area) = area {
+            self.prefetch(Key::area(fp, area));
+        }
+    }
+
+    /// Keeps `key` if it is not kept, and its epoch has room for it (`kept` of `capacity`):
+    /// whether it was new.
+    fn first(&mut self, key: Key, kept: usize) -> bool {
+        let slot = self.find(key);
+        if self.slots[slot] != 0 {
             return false;
         }
-        if mark == 0 {
-            self.slots[at..at + 4].copy_from_slice(&Self::key(fp));
-            self.filled.push(slot as u32);
-            mark = OCCUPIED;
+        if kept < self.capacity {
+            self.slots[slot] = key.0 | ((self.current as u128 + 1) << TAG_SHIFT);
+            let home = key.home(self.slots.len());
+            self.kept[self.current].push(u32::try_from(home).unwrap_or(u32::MAX));
         }
-        if stream {
-            mark |= STREAM;
-        }
-        if let Some(area) = area {
-            self.links.push(Link {
-                area: Link::area(area),
-                next: mark & HEAD,
-            });
-            mark = (mark & !HEAD) | self.links.len() as u32;
-        }
-        self.slots[at + 4] = mark;
         true
     }
 
-    /// Forgets every entry, touching only the slots they held.
-    fn clear(&mut self) {
-        for slot in self.filled.drain(..) {
-            let at = slot as usize * SLOT_WORDS;
-            self.slots[at..at + SLOT_WORDS].fill(0);
+    /// Decides one reception of message `fp` by a receiver in `area`, and keeps it for what it is
+    /// new to: a probe for the stream, and one for its area. Kept and not remembered only past
+    /// the epoch's capacity, which an epoch counted against it never reaches.
+    pub fn decide(&mut self, fp: u128, area: Option<Region>) -> Decision {
+        let stream = self.first(Key::stream(fp), self.streamed);
+        if stream {
+            self.streamed += 1;
         }
-        self.links.clear();
+        let regional = area.is_some_and(|area| self.first(Key::area(fp, area), self.regional));
+        if regional {
+            self.regional += 1;
+        }
+        Decision { stream, regional }
+    }
+
+    /// Lets go of every key epoch `index` kept: from each home it listed, the run walked to its
+    /// end and every key of the epoch in it removed. A removal moves later keys of the run back,
+    /// into the slot it emptied, so the walk looks at that slot again.
+    fn let_go(&mut self, index: usize) {
+        self.streamed = 0;
+        self.regional = 0;
+        let tagged = index + 1;
+        let mut homes = std::mem::take(&mut self.kept[index]);
+        for home in homes.drain(..) {
+            let mut slot = home as usize;
+            while self.slots[slot] != 0 {
+                if tag(self.slots[slot]) == tagged {
+                    self.remove(slot);
+                } else {
+                    slot = self.next(slot);
+                }
+            }
+        }
+        self.kept[index] = homes;
+    }
+
+    /// Empties `slot`, moving back each key after it in its run that may take a place before
+    /// (Knuth, Algorithm R), so every key stays reachable from its home with no tombstone.
+    fn remove(&mut self, slot: usize) {
+        let count = self.slots.len();
+        let mut hole = slot;
+        let mut next = self.next(hole);
+        while self.slots[next] != 0 {
+            let home = Key(self.slots[next] & KEY_MASK).home(count);
+            // It stays when its home lies cyclically in (hole, next].
+            let stays = if hole <= next {
+                hole < home && home <= next
+            } else {
+                hole < home || home <= next
+            };
+            if !stays {
+                self.slots[hole] = self.slots[next];
+                hole = next;
+            }
+            next = self.next(next);
+        }
+        self.slots[hole] = 0;
+    }
+
+    /// One epoch begins after the one being decided: the oldest of the window is let go, and its
+    /// number is the new epoch's.
+    fn advance(&mut self) {
+        self.current = (self.current + 1) % DEDUP_EPOCHS;
+        self.let_go(self.current);
+    }
+
+    /// Lets go of what the epoch being decided kept.
+    fn forget_current(&mut self) {
+        self.let_go(self.current);
     }
 
     fn len(&self) -> usize {
-        self.filled.len()
+        self.kept.iter().map(Vec::len).sum()
     }
 }
 
+/// Receptions ahead of the one being decided whose places in the table are asked for
+/// ([`MessageShard::prefetch`]): enough that a probe's memory arrives before it is made, few
+/// enough that what was asked for is still in the cache.
+pub const PREFETCH_AHEAD: usize = 16;
+
+/// The slots a table for [`DEDUP_EPOCHS`] epochs of `capacity` receptions holds: a third more
+/// than the keys they keep at most ([`KEYS_PER_RECEPTION`] each, [`DEDUP_SLOTS_PER_ENTRY`]), and
+/// one, so a table at capacity always has an empty slot that ends a probe.
+const fn table_slots(capacity: usize) -> usize {
+    DEDUP_EPOCHS * KEYS_PER_RECEPTION * capacity * DEDUP_SLOTS_PER_ENTRY.0 / DEDUP_SLOTS_PER_ENTRY.1
+        + 1
+}
+
 /// The message shards one thread owns, together: the messages kept in the epoch being decided and
-/// the `DEDUP_GENERATIONS - 1` before it, one generation an epoch, rotated as the epochs close (so
-/// forgetting costs what was kept, never a walk of the table). A message is new to the stream when
-/// no generation kept it for the stream, and new to an area when none kept it for that area: each
-/// is remembered across `DEDUP_GENERATIONS` epochs, apart, so two copies stamped up to
-/// `DEDUP_WINDOW_MS` apart are one. Its shards share its tables: a fingerprint is in one shard,
-/// so one table keyed by fingerprint holds them all, and a thread's share of an epoch varies less
-/// than a shard's.
+/// the `DEDUP_EPOCHS - 1` before it, in one table ([`Fingerprints`]), each epoch's let go as it
+/// leaves the window (so forgetting costs what was kept, never a walk of the table). A message is
+/// new to the stream when no epoch of the window kept it for the stream, and new to an area when
+/// none kept it for that area: each is remembered across `DEDUP_EPOCHS` epochs, apart, so two
+/// copies stamped up to `DEDUP_WINDOW_MS` apart are one. Its shards share its table: a
+/// fingerprint is in one shard, so one table keyed by fingerprint holds them all, and a thread's
+/// share of an epoch varies less than a shard's.
 pub struct MessageShard {
     /// Boxed, so a thread's state stays small where it is moved.
-    generations: Box<[Generation; DEDUP_GENERATIONS]>,
-    /// The generation of the epoch being decided.
-    current: usize,
+    fingerprints: Box<Fingerprints>,
 }
 
 /// What a message shard decided of one reception.
@@ -589,65 +684,54 @@ pub struct Decision {
 }
 
 impl MessageShard {
-    /// Generations of `capacity` entries each, allocated now and never again.
+    /// A table for epochs of `capacity` receptions each, allocated now and never again.
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
-            generations: Box::new(std::array::from_fn(|_| Generation::with_capacity(capacity))),
-            current: 0,
+            fingerprints: Box::new(Fingerprints::with_capacity(capacity)),
         }
     }
 
-    /// The entries each generation holds at most: an epoch with more receptions on this thread is
+    /// The receptions each epoch keeps at most: an epoch with more receptions on this thread is
     /// refused before any is decided.
     pub fn capacity(&self) -> usize {
-        self.generations[self.current].capacity
+        self.fingerprints.capacity
     }
 
     /// Decides one reception of message `fp` by a receiver in `area`, and remembers it. Kept and
-    /// not remembered only past the generation's capacity, which an epoch counted against it
-    /// never reaches.
+    /// not remembered only past the epoch's capacity, which an epoch counted against it never
+    /// reaches.
     pub fn decide(&mut self, fp: u128, area: Option<Region>) -> Decision {
-        let mut stream = true;
-        let mut regional = area.is_some();
-        for generation in self.generations.iter() {
-            let mark = generation.mark(fp);
-            if mark == 0 {
-                continue;
-            }
-            stream &= mark & STREAM == 0;
-            regional &= area.is_some_and(|area| !generation.holds(mark, area));
-        }
-        if stream || regional {
-            self.generations[self.current].keep(fp, stream, area.filter(|_| regional));
-        }
-        Decision { stream, regional }
+        self.fingerprints.decide(fp, area)
     }
 
-    /// `epochs` epochs begin after the one last decided: each takes the oldest generation, cleared.
-    /// `DEDUP_GENERATIONS` or more forget everything.
+    /// Asks for what deciding `fp` in `area` will read, ahead of it ([`PREFETCH_AHEAD`]).
+    pub fn prefetch(&self, fp: u128, area: Option<Region>) {
+        self.fingerprints.prefetch_reception(fp, area);
+    }
+
+    /// `epochs` epochs begin after the one last decided: each lets the oldest of the window go.
+    /// `DEDUP_EPOCHS` or more forget everything.
     pub fn rotate(&mut self, epochs: u64) {
-        let steps = usize::try_from(epochs)
-            .map_or(DEDUP_GENERATIONS, |epochs| epochs.min(DEDUP_GENERATIONS));
+        let steps = usize::try_from(epochs).map_or(DEDUP_EPOCHS, |epochs| epochs.min(DEDUP_EPOCHS));
         for _ in 0..steps {
-            self.current = (self.current + 1) % DEDUP_GENERATIONS;
-            self.generations[self.current].clear();
+            self.fingerprints.advance();
         }
     }
 
     /// Forgets what the epoch being decided kept: it was refused (`Admission`), so nothing of it
     /// was published, and every message in it is new again.
     pub fn forget_current(&mut self) {
-        self.generations[self.current].clear();
+        self.fingerprints.forget_current();
     }
 
-    /// The bytes every generation allocated, for the thread's life.
+    /// The bytes its table allocated, for the thread's life.
     pub fn bytes(&self) -> usize {
-        self.generations.iter().map(Generation::bytes).sum()
+        self.fingerprints.bytes()
     }
 
-    /// Fingerprints held.
+    /// Keys held: for the stream and for each area.
     pub fn len(&self) -> usize {
-        self.generations.iter().map(Generation::len).sum()
+        self.fingerprints.len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -655,7 +739,7 @@ impl MessageShard {
     }
 }
 
-/// The entries each generation of `thread` of `threads` holds for `receptions` an epoch,
+/// The receptions each epoch of `thread` of `threads` keeps for `receptions` an epoch,
 /// relay-wide: its shards' share ([`SHARDS`], uniform by fingerprint), a third more
 /// ([`DEDUP_SLOTS_PER_RECEPTION`]).
 pub fn dedup_capacity(receptions: usize, thread: usize, threads: usize) -> usize {
@@ -664,29 +748,30 @@ pub fn dedup_capacity(receptions: usize, thread: usize, threads: usize) -> usize
     share.saturating_mul(DEDUP_CAPACITY_MARGIN.0) / DEDUP_CAPACITY_MARGIN.1
 }
 
-/// What every message thread's generations allocate for `receptions` an epoch on `threads`
-/// threads: at most `receptions` times [`DEDUP_SLOTS_PER_RECEPTION`] entries of
-/// [`DEDUP_ENTRY_BYTES`], and [`DEDUP_FIXED_BYTES`].
+/// What every message thread's table allocates for `receptions` an epoch on `threads` threads:
+/// at most `receptions` times [`DEDUP_SLOTS_PER_RECEPTION`] receptions of [`DEDUP_ENTRY_BYTES`],
+/// and [`DEDUP_FIXED_BYTES`].
 pub fn dedup_bytes(receptions: usize, threads: usize) -> usize {
     (0..threads.max(1))
         .map(|thread| {
             let capacity = dedup_capacity(receptions, thread, threads).min(MAX_ENTRIES);
-            DEDUP_GENERATIONS * generation_bytes(capacity)
+            table_bytes(capacity)
         })
         .sum()
 }
 
-/// What one generation of `capacity` entries allocates (`Generation::with_capacity`).
-const fn generation_bytes(capacity: usize) -> usize {
-    let slots = capacity * DEDUP_SLOTS_PER_ENTRY.0 / DEDUP_SLOTS_PER_ENTRY.1 + 1;
-    slots * DEDUP_SLOT_BYTES + capacity * (std::mem::size_of::<u32>() + std::mem::size_of::<Link>())
+/// What one thread's table for epochs of `capacity` receptions allocates
+/// (`Fingerprints::with_capacity`).
+const fn table_bytes(capacity: usize) -> usize {
+    table_slots(capacity) * DEDUP_SLOT_BYTES
+        + DEDUP_EPOCHS * KEYS_PER_RECEPTION * capacity * std::mem::size_of::<u32>()
 }
 
-/// What a thread's generations allocate beyond [`DEDUP_ENTRY_BYTES`] an entry: each table's one
-/// slot more than its fraction (`Generation::with_capacity`).
-const DEDUP_FIXED_BYTES_PER_THREAD: usize = DEDUP_GENERATIONS * DEDUP_SLOT_BYTES;
+/// What a thread's table allocates beyond [`DEDUP_ENTRY_BYTES`] a reception: its one slot more
+/// than its fraction ([`table_slots`]).
+const DEDUP_FIXED_BYTES_PER_THREAD: usize = DEDUP_SLOT_BYTES;
 
-/// What the generations allocate beyond [`DEDUP_ENTRY_BYTES`] an entry, relay-wide, on any number
+/// What the tables allocate beyond [`DEDUP_ENTRY_BYTES`] a reception, relay-wide, on any number
 /// of message threads up to [`SHARDS`] (a thread past it owns no shard): the plan's dedup line is
 /// this beside the rate's ([`DEDUP_BYTES_PER_RECEPTION_PER_SEC`]).
 pub const DEDUP_FIXED_BYTES: usize = SHARDS * DEDUP_FIXED_BYTES_PER_THREAD;
@@ -1509,7 +1594,7 @@ fn settle(epoch: Epoch, settling: Settling, ledger: &mut Ledger, may_admit: bool
 /// The state one message thread owns: its logical shards, its watermark, its open epochs.
 pub struct MessageThread {
     thread: usize,
-    /// Its shards, `thread`, `thread + threads`, ..., their generations in one table each.
+    /// Its shards, `thread`, `thread + threads`, ..., their fingerprints in one table.
     messages: MessageShard,
     watermark: Watermark,
     closer: Closer,
@@ -1517,10 +1602,10 @@ pub struct MessageThread {
     /// admission was charged ([`admission_fixed_bytes`]).
     open: Tree<Epoch, Open>,
     gauges: Gauges,
-    /// What the generations' tables are charged (`Store::Dedup`): all they allocated, from the
+    /// What its table is charged (`Store::Dedup`): all they allocated, from the
     /// thread's start to its end; none if the store could not hold them.
     dedup: Option<Charge>,
-    /// The last epoch decided: its shards' generations are its and the ones before.
+    /// The last epoch decided: its table holds it and the ones before.
     decided: Option<Epoch>,
     /// Every epoch before this is closed by the watermark: no slice of it will be taken.
     closed_to: Option<Epoch>,
@@ -1541,13 +1626,11 @@ impl MessageThread {
         admission: Arc<Admission>,
         gauges: Gauges,
     ) -> Self {
-        // Its generations, allocated once at the capacity the plan reserved and charged for the
-        // thread's life; none when the store cannot hold them (`MessageThread::tables_charged`),
+        // Its table, allocated once at the capacity the plan reserved and charged for the
+        // thread's life; none when the store cannot hold it (`MessageThread::tables_charged`),
         // and then every epoch with a reception is refused here.
         let capacity = dedup_capacity(gauges.dedup_receptions, thread, threads);
-        let dedup = gauges
-            .dedup
-            .try_charge(DEDUP_GENERATIONS * generation_bytes(capacity));
+        let dedup = gauges.dedup.try_charge(table_bytes(capacity));
         let capacity = if dedup.is_some() { capacity } else { 0 };
         Self {
             dedup,
@@ -1700,16 +1783,16 @@ impl MessageThread {
         let Some(open) = self.open.remove(&epoch) else {
             return false;
         };
-        // The generations follow the epochs by number, not by which held anything: the
-        // `DEDUP_GENERATIONS - 1` epochs before this one are remembered, older ones are not.
+        // The table follows the epochs by number, not by which held anything: the
+        // `DEDUP_EPOCHS - 1` epochs before this one are remembered, older ones are not.
         if let Some(last) = self.decided {
             self.messages.rotate(epoch.after(last));
         }
         self.decided = Some(epoch);
-        // Room for every reception of the epoch to be new, before any is decided: the generation
-        // being decided is empty (rotated, or forgotten when refused) and holds its capacity, so
+        // Room for every reception of the epoch to be new, before any is decided: the epoch being
+        // decided has kept nothing yet (rotated, or forgotten when refused) and keeps its capacity, so
         // an epoch with more receptions here than that is refused whole, never decided in part.
-        // Its tables never grow: what they cost was charged when the thread started.
+        // Its table never grows: what they cost was charged when the thread started.
         let receptions: usize = open.slices.iter().map(Slice::receptions).sum();
         let fits = receptions <= self.messages.capacity();
         let Open {
@@ -1750,9 +1833,21 @@ impl MessageThread {
             regional: Vec::with_capacity(in_areas),
             ..Frozen::default()
         };
+        // Each reception's place in the table asked for `PREFETCH_AHEAD` receptions before it is
+        // decided: the table is sized for the plan's rate, far past the caches, so a probe made
+        // cold waits for memory, most of the threads' time at 5,000 feeders (2026-10-27).
+        let mut ahead = slices
+            .iter()
+            .flat_map(|slice| slice.observations().map(|(_, obs)| (obs.fp, slice.area)));
+        for (fp, area) in ahead.by_ref().take(PREFETCH_AHEAD) {
+            self.messages.prefetch(fp, area);
+        }
         for (at, slice) in slices.iter().enumerate() {
             let at = at as u32;
             for (index, obs) in slice.observations() {
+                if let Some((fp, area)) = ahead.next() {
+                    self.messages.prefetch(fp, area);
+                }
                 let decision = self.messages.decide(obs.fp, slice.area);
                 if decision.stream {
                     frozen.stream.push((at, index));
@@ -1764,6 +1859,7 @@ impl MessageThread {
                 }
             }
         }
+        drop(ahead);
         frozen.batches = slices.into_iter().map(|slice| slice.decoded).collect();
         // The lists as decided, and their charge cut to them: the slices are let go.
         frozen.stream.shrink_to_fit();
@@ -1779,7 +1875,7 @@ impl MessageThread {
         self.messages.len()
     }
 
-    /// Whether its generations were allocated: false only when the dedup store could not hold
+    /// Whether its table was allocated: false only when the dedup store could not hold
     /// what the plan sized them for, a relay that must not start (`MessageExchange::threads`).
     pub fn tables_charged(&self) -> bool {
         self.dedup.is_some()
@@ -1869,7 +1965,7 @@ impl MessageExchange {
                 // Dropping `exchange` stops and joins the threads already started.
                 return Err(format!(
                     "message thread {thread} of {threads}: the dedup store cannot hold its \
-                     generations of fingerprints ({} receptions an epoch: {} bytes for every \
+                     table of fingerprints ({} receptions an epoch: {} bytes for every \
                      thread, the store's limit {}, {} already charged)",
                     gauges.dedup_receptions,
                     dedup_bytes(gauges.dedup_receptions, threads),
@@ -2047,15 +2143,15 @@ mod tests {
         assert_eq!(shard.decide(7, Some(a)), new(false, false));
         assert_eq!(shard.decide(7, Some(b)), new(false, true));
         assert_eq!(shard.decide(7, None), new(false, false));
-        // Remembered `DEDUP_GENERATIONS - 1` more epochs, then forgotten.
-        for _ in 1..DEDUP_GENERATIONS {
+        // Remembered `DEDUP_EPOCHS - 1` more epochs, then forgotten.
+        for _ in 1..DEDUP_EPOCHS {
             shard.rotate(1);
             assert_eq!(shard.decide(7, Some(a)), new(false, false));
         }
         shard.rotate(1);
         assert_eq!(shard.decide(7, Some(a)), new(true, true));
         // A gap of the whole window forgets everything at once.
-        shard.rotate(DEDUP_GENERATIONS as u64);
+        shard.rotate(DEDUP_EPOCHS as u64);
         assert!(shard.is_empty());
         Ok(())
     }
@@ -2087,17 +2183,111 @@ mod tests {
             kept += usize::from(decision.stream);
             shard.rotate(1);
         }
-        assert_eq!(kept, 12 / DEDUP_GENERATIONS);
+        assert_eq!(kept, 12 / DEDUP_EPOCHS);
         Ok(())
     }
 
-    /// The generations are allocated once, at their capacity, and never grow or shrink: a
-    /// generation filled to its capacity (half its messages heard in two areas, half for the
+    /// The one table decides as a table an epoch did: every reception, over epochs that rotate by
+    /// one and by gaps, epochs refused and forgotten, messages heard in up to three areas, and
+    /// fingerprints crowded onto a few homes so runs form and every deletion moves entries back.
+    /// The reference is the rule itself: one map an epoch, a message new to the stream when no
+    /// map of the window kept it for the stream, new to an area when none kept it for that area.
+    #[test]
+    fn one_table_decides_as_a_table_an_epoch() -> Result<(), String> {
+        let area = |lat_e7| {
+            Region::containing(
+                &tally_wire::Location {
+                    lat_e7,
+                    lon_e7: -843_880_000,
+                    alt_m: 0,
+                    precision_m: 0,
+                },
+                4,
+            )
+            .map_err(|error| error.to_string())
+        };
+        let areas = [
+            None,
+            Some(area(337_490_000)?),
+            Some(area(407_490_000)?),
+            Some(area(457_490_000)?),
+        ];
+        // A fixed generator: the same run every time.
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let capacity = 64;
+        let mut shard = MessageShard::with_capacity(capacity);
+        type Kept = HashMap<u128, (bool, Vec<Region>)>;
+        let mut window: Vec<Kept> = vec![Kept::new(); DEDUP_EPOCHS];
+        let mut decided = 0;
+        for _epoch in 0..2_000 {
+            let receptions = (next() % capacity as u64) as usize;
+            for _ in 0..receptions {
+                // Forty messages, their high halves on eight homes.
+                let n = next() % 40;
+                let fp = (u128::from(n % 8) << 120) | (u128::from(n) << 8) | 7;
+                let area = areas[(next() % areas.len() as u64) as usize];
+                let stream = !window.iter().any(|kept| kept.get(&fp).is_some_and(|k| k.0));
+                let regional = area.is_some_and(|area| {
+                    !window
+                        .iter()
+                        .any(|kept| kept.get(&fp).is_some_and(|k| k.1.contains(&area)))
+                });
+                if stream || regional {
+                    let entry = window[0].entry(fp).or_default();
+                    entry.0 |= stream;
+                    if let Some(area) = area.filter(|_| regional) {
+                        entry.1.push(area);
+                    }
+                }
+                assert_eq!(shard.decide(fp, area), Decision { stream, regional });
+                decided += 1;
+            }
+            // A key (the stream's, or an area's) is kept once a window, so in one epoch.
+            let held: usize = window
+                .iter()
+                .flat_map(|kept| kept.values())
+                .map(|(stream, areas)| usize::from(*stream) + areas.len())
+                .sum();
+            assert_eq!(shard.len(), held);
+            match next() % 10 {
+                0 => {
+                    shard.forget_current();
+                    window[0].clear();
+                }
+                1 => {
+                    let gap = 2 + next() % (DEDUP_EPOCHS as u64 + 1);
+                    shard.rotate(gap);
+                    for _ in 0..gap.min(DEDUP_EPOCHS as u64) {
+                        window.pop();
+                        window.insert(0, Kept::new());
+                    }
+                }
+                _ => {
+                    shard.rotate(1);
+                    window.pop();
+                    window.insert(0, Kept::new());
+                }
+            }
+        }
+        assert!(decided > 50_000);
+        shard.rotate(DEDUP_EPOCHS as u64);
+        assert!(shard.is_empty());
+        Ok(())
+    }
+
+    /// The table is allocated once, at its capacity, and never grows or shrinks: every epoch
+    /// filled to its capacity (half its messages heard in two areas, half for the
     /// stream alone: every entry and every link it holds), rotated and filled again, allocates
     /// nothing more and holds what it kept. Before, a table doubled as it filled,
     /// mid-epoch, and the plan held room for every table to double.
     #[test]
-    fn a_generation_holds_its_capacity_and_never_grows() -> Result<(), String> {
+    fn the_table_holds_its_capacity_and_never_grows() -> Result<(), String> {
         let area = |lat_e7| {
             Region::containing(
                 &tally_wire::Location {
@@ -2114,11 +2304,11 @@ mod tests {
         let capacity = 1_000;
         let mut shard = MessageShard::with_capacity(capacity);
         let allocated = shard.bytes();
-        assert_eq!(allocated, DEDUP_GENERATIONS * generation_bytes(capacity));
-        assert!(allocated <= DEDUP_GENERATIONS * (capacity * DEDUP_ENTRY_BYTES + DEDUP_SLOT_BYTES));
+        assert_eq!(allocated, table_bytes(capacity));
+        assert!(allocated <= DEDUP_EPOCHS * capacity * DEDUP_ENTRY_BYTES + DEDUP_SLOT_BYTES);
         // Fingerprints spread as the keyed ones are: the low byte any shard, the high half any slot.
         let fp = |n: u64| (u128::from(n.wrapping_mul(0x9e37_79b9_7f4a_7c15)) << 64) | u128::from(n);
-        for round in 0..2 * DEDUP_GENERATIONS as u64 {
+        for round in 0..2 * DEDUP_EPOCHS as u64 {
             for n in 0..capacity as u64 {
                 let message = fp(round * capacity as u64 + n);
                 if n < capacity as u64 / 2 {
@@ -2165,21 +2355,22 @@ mod tests {
             assert_eq!(shard.bytes(), allocated);
             shard.rotate(1);
         }
-        // Past its links, a generation keeps no more and grows no more.
+        // Past its capacity, an epoch keeps no more and the table grows no more: two for the
+        // stream and two for the area.
         let mut full = MessageShard::with_capacity(2);
         for n in 0..4 {
             full.decide(fp(n), Some(a));
         }
-        assert_eq!(full.len(), 2);
-        assert_eq!(full.bytes(), DEDUP_GENERATIONS * generation_bytes(2));
+        assert_eq!(full.len(), 4);
+        assert_eq!(full.bytes(), table_bytes(2));
         Ok(())
     }
 
-    /// An epoch with more receptions on a thread than its generation holds is refused whole,
+    /// An epoch with more receptions on a thread than an epoch keeps is refused whole,
     /// before any is decided, and forgotten: the next epoch, within it, is decided as if the
     /// refused one never was. Which epoch is refused follows its receptions alone.
     #[test]
-    fn an_epoch_past_the_generations_capacity_is_refused_whole() -> Result<(), String> {
+    fn an_epoch_past_its_capacity_is_refused_whole() -> Result<(), String> {
         let words = Arc::new(Mutex::new(Vec::new()));
         let kept = Arc::clone(&words);
         let sink: Sink = Arc::new(move |frozen| match kept.lock() {
@@ -2189,7 +2380,7 @@ mod tests {
             }
             Err(_) => Err(Box::new(frozen)),
         });
-        // Three receptions an epoch planned: a generation of four, on one thread.
+        // Three receptions an epoch planned: an epoch keeps four, on one thread.
         let gauges = Gauges {
             dedup_receptions: 3,
             ..Gauges::unlimited()
@@ -2220,11 +2411,11 @@ mod tests {
         Ok(())
     }
 
-    /// What the plan holds for the generations ([`DEDUP_BYTES_PER_RECEPTION_PER_SEC`] a reception
+    /// What the plan holds for the tables ([`DEDUP_BYTES_PER_RECEPTION_PER_SEC`] a reception
     /// a second, and [`DEDUP_FIXED_BYTES`]) is at least what they allocate on any number of
     /// threads, and a store holding exactly that sizes them to fit it ([`Gauges::of`]'s inverse).
     #[test]
-    fn the_plan_holds_what_the_generations_allocate() {
+    fn the_plan_holds_what_the_tables_allocate() {
         for receptions in [0, 1, 3, 255, 256, 10_000, 1_234_567, 12_470_000] {
             let planned =
                 receptions * DEDUP_SLOTS_PER_RECEPTION * DEDUP_ENTRY_BYTES + DEDUP_FIXED_BYTES;

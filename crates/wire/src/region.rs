@@ -11,9 +11,22 @@ use h3o::{CellIndex, LatLng};
 use crate::WireError;
 use crate::batch::Location;
 
-/// A region: one H3 cell, of any resolution.
+/// A region: one H3 cell, of any resolution. Ordered by its index as a `u64` ([`Region::as_u64`]),
+/// so every party orders regions alike.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Region(CellIndex);
+
+impl Ord for Region {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.as_u64().cmp(&other.as_u64())
+    }
+}
+
+impl PartialOrd for Region {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
 
 impl Region {
     pub fn from_u64(index: u64) -> Result<Self, WireError> {

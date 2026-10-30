@@ -43,8 +43,8 @@ use crate::sharing::{Now, Rebuilt, Sharing};
 use crate::signer::Signer;
 use crate::standing::Standing;
 
-/// How often the timed duties run: often enough for provisional positions, which a hosted MLAT
-/// publishes about a second after a transmission (RFC-0171 §3.8.1).
+/// How often the timed duties run: often enough for MLAT positions, which a hosted MLAT publishes
+/// about a second after a transmission (RFC-0171 §3.8.1, as amended 2026-10-24).
 pub const TICK: Duration = Duration::from_millis(100);
 /// How often receivers with standing are counted as corroborated for credit.
 const CORROBORATE_EVERY_MS: u64 = 10_000;
@@ -52,7 +52,7 @@ const CORROBORATE_EVERY_MS: u64 = 10_000;
 const NEVER_MS: u64 = u64::MAX;
 /// Clock models held for member links, at most: a member link carries a model (its parts, then
 /// its manifest) before the first record citing it (`link`'s `Told`), and a model's first part
-/// names its tile, its group.
+/// names its area, its group.
 const MODELS_HELD: usize = 4_096;
 
 /// One clock model as held: its manifest once seen, and its parts, at most
@@ -61,6 +61,35 @@ struct HeldModel {
     id: [u8; 32],
     manifest: Option<ClockModel>,
     parts: Vec<ClockModelPart>,
+    /// Whether its manifest and every part it lists are held, its encoding joined.
+    whole: bool,
+    /// Its pair model id (`publish::pair_model_id`, what fixes cite) and its area, once it is
+    /// whole and its encoding names an area.
+    pair: Option<([u8; 32], Region)>,
+}
+
+impl HeldModel {
+    /// Reads its pair model id and area once it is whole: its manifest and every part it lists.
+    fn complete(&mut self) {
+        if self.whole {
+            return;
+        }
+        let Some(manifest) = &self.manifest else {
+            return;
+        };
+        let mut parts = self.parts.clone();
+        parts.sort_by_key(|part| part.index().unwrap_or(u16::MAX));
+        let Ok(content) = manifest.content(&parts) else {
+            return;
+        };
+        self.whole = true;
+        if let Ok(area) = tally_mlat_solver::publish::area_of(&content.model) {
+            self.pair = Some((
+                tally_mlat_solver::publish::pair_model_id(&content.model),
+                area,
+            ));
+        }
+    }
 }
 
 impl HeldModel {
@@ -417,8 +446,8 @@ impl Network {
     pub(crate) fn host_mlat(&self, host: Arc<dyn MlatHost>) {
         // Standing reads the engine's raw: one store of raw per relay (RFC-0181 §5), and runs on
         // its threads (`Standing::start`).
-        if let Some(sealed) = host.sealed_bins() {
-            self.standing.read_bins(sealed);
+        if let Some(raw) = host.raw() {
+            self.standing.read_raw(raw);
             if let Err(error) = Standing::start(&self.standing, host.gate()) {
                 eprintln!("tally-relay: {error}");
             }
@@ -540,10 +569,6 @@ impl Network {
             // other input (`on_positions`).
             Record::WorldPositions(world) => {
                 self.products.world_from(asker, world, hub.stamp_now());
-                Vec::new()
-            }
-            Record::WorldPrecise(world) => {
-                self.products.precise_from(asker, world, hub.stamp_now());
                 Vec::new()
             }
             // The regional product, and its client form: the one intake each has
@@ -735,17 +760,16 @@ impl Network {
         }
     }
 
-    /// Final or provisional positions the hub forwarded (new, verified), handed in by the
+    /// Positions the hub forwarded (new, verified), handed in by the
     /// session `source` (the hub's id of its connection, `hub::RELAY_ITSELF` for the relay's own),
     /// at `now_ms` by the relay's clock (the products take them in by it, and charge them to that
     /// session, `products::From`; the figures judge their freshness by it).
     /// The products take them in by the monotonic clock their records are stamped and sealed by;
     /// the figures and standing judge their signed times by the judging clock (`ingest::Stamp`).
     pub fn on_positions(&self, positions: &Positions, source: u64, now: crate::ingest::Stamp) {
-        // A tagged record (a client's form) is its raw twin's solutions again: the products weigh
-        // the raw one. Standing takes the raw one as the hub sends it (`Hub::send_positions`).
-        // Its raw is held for the checks by the hub, which knows who may be sent it
-        // (`Hub::hold_twins`).
+        // A tagged record (a client's form) is its raw twin's fixes again: the products weigh
+        // the raw one. Standing takes the raw one as the hub sends it, and the checks hold it as
+        // its link's twin there (`Hub::send_positions`).
         if positions.is_tagged() {
             return;
         }
@@ -753,34 +777,87 @@ impl Network {
         self.products.positions(positions, source, now);
     }
 
-    /// A clock model manifest or part the hub forwarded (new, verified or checked), handed in by
-    /// the session `source`.
+    /// A clock model manifest the hub forwarded (new, verified), handed in by the session
+    /// `source`, once its pair model id is known (it is whole here, `pair_of`).
     pub fn on_clock_model(&self, record: &Record, source: u64, now: crate::ingest::Stamp) {
-        if let Record::ClockModel(model) = record {
-            self.products.clock_model(model, source, now);
+        if let Record::ClockModel(model) = record
+            && let Some((pair, _)) = self.pair_of(&model.id())
+        {
+            self.products.clock_model(model, pair, source, now);
         }
+    }
+
+    /// Whether the model whose manifest is `id` is held here whole: its manifest and every part it
+    /// lists, its encoding joined (whether or not it names an area).
+    pub fn is_whole(&self, id: &[u8; 32]) -> bool {
+        self.models.lock().is_ok_and(|models| {
+            models
+                .held
+                .iter()
+                .any(|model| model.id == *id && model.whole)
+        })
+    }
+
+    /// The pair model id and area of model `id` (by its manifest id), once it is held whole and
+    /// its encoding names an area.
+    pub fn pair_of(&self, id: &[u8; 32]) -> Option<([u8; 32], Region)> {
+        self.models
+            .lock()
+            .ok()?
+            .held
+            .iter()
+            .find(|model| model.id == *id)?
+            .pair
+    }
+
+    /// Whether a model fixes cite as `pair` (a pair model id) is held here whole: what a fix
+    /// citing it waits for before it goes out (`Hub::forward_positions`).
+    pub fn holds_pair(&self, pair: &[u8; 32]) -> bool {
+        self.clock_models.get(pair).is_some()
+            || self.models.lock().is_ok_and(|models| {
+                models
+                    .held
+                    .iter()
+                    .any(|model| model.pair.is_some_and(|(id, _)| id == *pair))
+            })
+    }
+
+    /// The manifest ids of the models held whole whose pair model id is `pair`: what a member link
+    /// carries before a record citing it (each engine of an area signs its own manifest).
+    pub fn manifests_of(&self, pair: &[u8; 32]) -> Vec<[u8; 32]> {
+        self.models.lock().map_or_else(
+            |_| Vec::new(),
+            |models| {
+                models
+                    .held
+                    .iter()
+                    .filter(|model| model.pair.is_some_and(|(id, _)| id == *pair))
+                    .map(|model| model.id)
+                    .collect()
+            },
+        )
     }
 
     /// A clock model whole as the hub forwards it: its manifest (new, verified) with the parts it
     /// lists that went out ahead of it (`parts::Parts::manifest`), held in the relay's one store of
-    /// decoded models (`models::Models::admit`) when it is of a tile of the relay's areas and
-    /// signed by one of that area's rendezvous MLAT relays (`selection::mlat_relays`, by the
-    /// directory as it stands at the judging clock `now`); else refused there and counted. A
-    /// model whose parts are not all there is refused as unreadable: an engine sends a model's
-    /// parts right before its manifest, and the relay's own are held already.
+    /// decoded models (`models::Models::admit`) when it is of an area of the relay's areas or
+    /// their band and signed by one of that area's rendezvous MLAT relays
+    /// (`selection::mlat_relays`, by the directory as it stands at the judging clock `now`); else
+    /// refused there and counted. A model whose parts are not all there is refused as unreadable:
+    /// an engine sends a model's parts right before its manifest, and the relay's own are held
+    /// already. One held is offered to the hosted MLAT, which holds a neighbouring area's model
+    /// for its own fixes once it is verified or corroborated (`MlatHost::offer_model`).
     pub fn admit_model(
         &self,
         manifest: &ClockModel,
         parts: &[ClockModelPart],
         now: Judged,
     ) -> Option<crate::models::Model> {
-        if let Some(held) = self.clock_models.get(&manifest.id()) {
-            return Some(held);
-        }
         let Ok(content) = manifest.content(parts) else {
             return None;
         };
-        self.clock_models
+        let held = self
+            .clock_models
             .admit(
                 manifest,
                 &content,
@@ -789,7 +866,11 @@ impl Network {
                 },
                 now,
             )
-            .ok()
+            .ok()?;
+        if let Some(mlat) = self.mlat() {
+            mlat.offer_model(held.clone());
+        }
+        Some(held)
     }
 
     /// Model `id` held whole in the store of decoded models from what this relay holds of it for
@@ -798,9 +879,6 @@ impl Network {
     /// as `admit_model` holds one whose parts came first. `None` while a part is still to come,
     /// or when the store refused it (counted there).
     pub fn admit_held(&self, id: &[u8; 32], now: Judged) -> Option<crate::models::Model> {
-        if let Some(held) = self.clock_models.get(id) {
-            return Some(held);
-        }
         let mut records = self.model_records(id)?;
         let Some(Record::ClockModel(manifest)) = records.pop() else {
             return None;
@@ -841,10 +919,12 @@ impl Network {
     }
 
     /// The session `source` closed: whatever it was given ends with it (a client's credit, its
-    /// free-tier place). A member's part of the products' records ends with its [`Membership`].
+    /// free-tier place, the raw record its link held for a twin). A member's part of the products' records ends with its [`Membership`].
     /// Called once for every session, as it ends, whichever side dialled.
     pub fn left(&self, source: u64) {
         self.credit.left(source);
+        // The raw record its link held for a tagged twin (`Consistency::forget`).
+        self.consistency.forget(source);
     }
 
     /// A record this relay is the first relay to hold (its own feeder's batch, an engine's or its
@@ -878,8 +958,7 @@ impl Network {
     /// Where a record's group is reckoned from, when the record does not say: a batch's
     /// receiver's public cell, as described (never its site: the area a batch is grouped, tagged
     /// and answered for is its public cell's, `rendezvous::area_of_public`, as a feeder picks its
-    /// relays by); a clock model's tile centre, from its inline bytes or its first part
-    /// (`hold_part`).
+    /// relays by); a clock model's area, from its inline bytes or its first part (`hold_part`).
     fn point_for(&self, hub: &Hub, record: &Record) -> Option<Region> {
         match record {
             Record::Batch(batch) => batch
@@ -913,6 +992,8 @@ impl Network {
                     id,
                     manifest: None,
                     parts: Vec::new(),
+                    whole: false,
+                    pair: None,
                 });
                 models.held.len() - 1
             }
@@ -924,6 +1005,7 @@ impl Network {
         if !act(model) {
             return;
         }
+        model.complete();
         if !models.settle(&id) {
             if let Some(model) = models.held.iter_mut().find(|model| model.id == id) {
                 model.manifest = before.0;
@@ -939,7 +1021,7 @@ impl Network {
     }
 
     /// Holds a clock model's part (one too large for its manifest has them), for member links and
-    /// for the model's group (its first part names its tile): each index once, and only an index
+    /// for the model's group (its first part names its area): each index once, and only an index
     /// a model can have (`clock_model::MAX_PARTS`).
     pub fn hold_part(&self, part: &ClockModelPart) {
         let (Ok(id), Ok(index)) = (part.model(), part.index()) else {
@@ -1018,33 +1100,45 @@ impl Network {
         Some(records)
     }
 
-    /// The area a client clock model is routed and grouped by: the area its full model's tile
-    /// centre lies in (`ClientClockModelContent::model`), when that is held (an engine publishes the
-    /// full model first, so it is). An area, never the centre: a client is routed nothing finer
-    /// than a public cell, and a client model is for the area's clients.
+    /// The area a client clock model is grouped by: its full model's area
+    /// (`ClientClockModelContent::model`, its pair model id), when that is held (an engine
+    /// publishes the full model first, so it is). An area: a client is routed nothing finer than a
+    /// public cell.
     pub fn client_model_area(&self, model: &tally_wire::ClientClockModel) -> Option<Region> {
-        let id = model.content().ok()?.model;
-        let manifest = self
-            .models
+        let pair = model.content().ok()?.model;
+        if let Some(held) = self.clock_models.get(&pair) {
+            return Some(held.area());
+        }
+        self.models
             .lock()
             .ok()?
             .held
             .iter()
-            .find(|held| held.id == id)?
-            .manifest
-            .clone()?;
-        tally_wire::rendezvous::area_of_cell(self.model_point_of(&manifest)?)
+            .find_map(|held| held.pair.filter(|(id, _)| *id == pair))
+            .map(|(_, area)| area)
     }
 
-    /// A model's tile centre: from its inline bytes, or its first part's when it has parts.
-    fn model_point_of(&self, model: &ClockModel) -> Option<Region> {
+    /// Where a client clock model is routed: its area and every area whose border band holds it
+    /// (`tally_mlat::area::Band`), the areas whose fixes may cite it beside their own, so a client
+    /// of one area is sent the models of its neighbours its fixes cite.
+    pub fn client_model_places(&self, model: &tally_wire::ClientClockModel) -> Option<Vec<Region>> {
+        let area = self.client_model_area(model)?;
+        Some(
+            tally_mlat::area::border_band(&Regions::new([area]))
+                .iter()
+                .collect(),
+        )
+    }
+
+    /// A model's area: from its inline bytes, or its first part's when it has parts.
+    pub fn model_point_of(&self, model: &ClockModel) -> Option<Region> {
         let manifest = model.manifest().ok()?;
         if manifest.parts.is_empty() {
-            return tile_point(&manifest.inline);
+            return model_area(&manifest.inline);
         }
         let first = self.parts_of(&model.id()).into_iter().next()?;
         (first.index().ok()? == 0).then_some(())?;
-        tile_point(first.data())
+        model_area(first.data())
     }
 
     /// A group record a member sent this one: a piece of its group, pushed on down this relay's
@@ -1307,7 +1401,7 @@ impl Network {
             for own in mlat.take_own_models() {
                 let _ = self
                     .clock_models
-                    .insert_own(own.id, own.model, own.engine, now.judged());
+                    .insert_own(own.model, own.engine, now.judged());
             }
             // A model's parts come before its manifest; held first, they place it.
             for record in &published {
@@ -1382,7 +1476,7 @@ impl Network {
 /// they open is spawned on that runtime, `runtime`).
 ///
 /// Never on the async runtime's workers. A pass is synchronous work whose size follows what the
-/// relay holds and was handed (a window step's positions and models published at once, the
+/// relay holds and was handed (an MLAT step's fixes and models published at once, the
 /// sharing groups' manifests and parity, the directory), and a runtime worker held by it holds
 /// every task woken from it there with it: a pass that took ten seconds on a runtime worker held
 /// the subscribers' writers and feeders' readers it woke for those ten seconds, and raw's p99 went
@@ -1447,19 +1541,19 @@ pub(crate) fn pass(hub: &Arc<Hub>, raw_at: &mut Option<std::time::Instant>) {
     hub.network().carry(hub, now.into(), raw_due);
 }
 
-/// The finest cells a positions record or a clock model places aircraft at, for routing by
-/// region: each solution's position; a model's tile centre. `None` for anything else, or a model
-/// whose bytes are not all in its manifest (its parts carry the rest), which goes whole-world.
+/// The cells a positions record or a clock model is routed at, by region: each fix's position, its
+/// finest cell; a model's area. `None` for anything else, or a model whose bytes are not all in
+/// its manifest (its parts carry the rest), which goes whole-world.
 pub fn points_of(record: &Record) -> Option<Arc<[Region]>> {
     let points: Vec<Region> = match record {
-        Record::Positions(positions) | Record::Provisional(positions) => {
+        Record::Positions(positions) => {
             let solved = solved(positions)?;
             let mut points: Vec<Region> = solved
                 .iter()
-                .filter_map(|solution| {
+                .filter_map(|fix| {
                     Region::point(&tally_wire::Location {
-                        lat_e7: solution.lat_e7,
-                        lon_e7: solution.lon_e7,
+                        lat_e7: fix.lat_e7,
+                        lon_e7: fix.lon_e7,
                         alt_m: 0,
                         precision_m: 0,
                     })
@@ -1476,68 +1570,54 @@ pub fn points_of(record: &Record) -> Option<Arc<[Region]>> {
     Some(points.into())
 }
 
-/// Where one solution of a positions record placed its aircraft, and the model it cites: what
-/// routing and sharing read of a record, raw (format 3, 4) or tagged (format 5, 6) alike.
-#[derive(Clone, Copy, Debug)]
+/// Where one fix of a positions record placed its aircraft, and the models it was solved under:
+/// what routing and sharing read of a record, raw (format 7) or tagged (format 8) alike.
+#[derive(Clone, Debug)]
 pub struct Solved {
     pub lat_e7: i32,
     pub lon_e7: i32,
-    pub clock_model: [u8; 32],
+    /// Their pair model ids, ascending (`tally_wire::Fix::models`).
+    pub clock_models: Vec<[u8; 32]>,
 }
 
-/// The solutions of a positions record of either form, as routing reads them (`Solved`).
+/// The fixes of a positions record of either form, as routing reads them (`Solved`).
 pub fn solved(positions: &Positions) -> Option<Vec<Solved>> {
+    fn of<O>(fixes: &[tally_wire::Fix<O>]) -> Vec<Solved> {
+        fixes
+            .iter()
+            .map(|fix| Solved {
+                lat_e7: fix.lat_e7,
+                lon_e7: fix.lon_e7,
+                clock_models: fix.models.clone(),
+            })
+            .collect()
+    }
     if positions.is_tagged() {
-        let content = positions.tagged_solutions().ok()?;
-        Some(
-            content
-                .solutions
-                .iter()
-                .map(|solution| Solved {
-                    lat_e7: solution.lat_e7,
-                    lon_e7: solution.lon_e7,
-                    clock_model: solution.clock_model,
-                })
-                .collect(),
-        )
+        Some(of(&positions.tagged_fixes().ok()?.fixes))
     } else {
-        let content = positions.solutions().ok()?;
-        Some(
-            content
-                .solutions
-                .iter()
-                .map(|solution| Solved {
-                    lat_e7: solution.lat_e7,
-                    lon_e7: solution.lon_e7,
-                    clock_model: solution.clock_model,
-                })
-                .collect(),
-        )
+        Some(of(&positions.fixes().ok()?.fixes))
     }
 }
 
-/// The finest cell of a clock model's tile centre, when the model's bytes are in its manifest.
+/// A clock model's area, when the model's bytes are in its manifest.
 pub fn model_point(model: &tally_wire::ClockModel) -> Option<Region> {
-    tile_point(&model.manifest().ok()?.inline)
+    model_area(&model.manifest().ok()?.inline)
 }
 
-/// The finest cell of the centre of the tile a model's encoding leads with
-/// (`tally_mlat::area::centre`, the one projection, which also decides who fits it).
-fn tile_point(prefix: &[u8]) -> Option<Region> {
-    let tile = tally_mlat_solver::publish::tile_of(prefix).ok()?;
-    Region::point(&tally_mlat::area::centre(tile)).ok()
+/// The area a model's encoding leads with (`publish::area_of`), which also decides who fits it.
+fn model_area(prefix: &[u8]) -> Option<Region> {
+    tally_mlat_solver::publish::area_of(prefix).ok()
 }
 
 #[cfg(test)]
 mod tests {
     #![allow(clippy::disallowed_methods, reason = "a test's scripted readings")]
     use super::*;
-    use tally_mlat_solver::geo::{self, Geodetic};
     use tally_wire::Identity;
 
     /// A hosted MLAT whose every ask lasts until the runtime's task has beaten while it lasted
     /// (`beats` moved past where it stood when the ask began): a pass of the duties as long as
-    /// one that publishes a window step's solutions, held for as long as it takes to see whether
+    /// one that publishes a large MLAT step, held for as long as it takes to see whether
     /// the runtime's tasks go on meanwhile. Seen, it says so in `beat_seen`; a pass that holds the
     /// runtime's only thread can never see one, and gives up at `HANG`.
     struct Slow {
@@ -1551,6 +1631,10 @@ mod tests {
 
     impl MlatHost for Slow {
         fn set_areas(&self, _: Regions, _: Vec<tally_mlat::intake::SiteRecord>) {}
+
+        fn raw(&self) -> Option<Arc<dyn crate::standing::Raw>> {
+            None
+        }
 
         fn offer_description(&self, _: &tally_mlat::intake::SiteRecord, _: u64) {}
 
@@ -1584,10 +1668,6 @@ mod tests {
         // It publishes no model.
         fn take_own_models(&self) -> Vec<crate::mlat_host::OwnModel> {
             Vec::new()
-        }
-
-        fn sealed_bins(&self) -> Option<tally_mlat_solver::held::SealedBins> {
-            None
         }
     }
 
@@ -1627,36 +1707,22 @@ mod tests {
         );
         Ok(())
     }
-    use tally_mlat_solver::tile::{LEVELS, Tile};
-    use tally_wire::rendezvous::area_of_cell;
-
-    /// A model is routed by the area that fits its tile: the region `model_point` places it at is
-    /// in the one area whose MLAT relays own the tile (`tally_mlat::window::owns`), wherever the
-    /// tile is and at every level, because both read the one projection.
+    /// A model is routed by its area: the one its encoding leads with, inline or in its first
+    /// part, wherever the area is.
     #[test]
-    fn a_model_is_routed_to_the_area_whose_relays_fit_its_tile() -> Result<(), String> {
+    fn a_model_is_routed_by_its_area() -> Result<(), String> {
         let mut checked = 0;
         for lat in (-80..=80).step_by(7) {
             for lon in (-179..=179).step_by(11) {
-                let point = geo::to_ecef(Geodetic {
-                    lat_deg: f64::from(lat) + 0.37,
-                    lon_deg: f64::from(lon) + 0.61,
-                    height_m: 10_000.0,
-                });
-                let mm = point.map(|axis| (axis * 1000.0).round() as i64);
-                for level in 0..LEVELS {
-                    let tile = Tile::containing(level, mm);
-                    let routed = tile_point(&tile.bytes()).ok_or("no point")?;
-                    let area = area_of_cell(routed).ok_or("no area")?;
-                    assert!(
-                        tally_mlat::window::owns(&Regions::new([area]), tile),
-                        "{tile:?} routed to {area:?}, which does not fit it"
-                    );
-                    checked += 1;
-                }
+                let area = tally_wire::rendezvous::area_at(f64::from(lat) + 0.37, f64::from(lon))
+                    .map_err(|error| error.to_string())?;
+                let mut prefix = tally_mlat_solver::SPEC_VERSION.to_be_bytes().to_vec();
+                prefix.extend_from_slice(&area.as_u64().to_be_bytes());
+                assert_eq!(model_area(&prefix), Some(area));
+                checked += 1;
             }
         }
-        assert!(checked > 1_000);
+        assert!(checked > 300);
         Ok(())
     }
 
@@ -1668,6 +1734,10 @@ mod tests {
 
     impl MlatHost for Recording {
         fn set_areas(&self, _: Regions, _: Vec<tally_mlat::intake::SiteRecord>) {}
+
+        fn raw(&self) -> Option<Arc<dyn crate::standing::Raw>> {
+            None
+        }
 
         fn offer_description(&self, _: &tally_mlat::intake::SiteRecord, _: u64) {}
 
@@ -1688,10 +1758,6 @@ mod tests {
         // It publishes no model.
         fn take_own_models(&self) -> Vec<crate::mlat_host::OwnModel> {
             Vec::new()
-        }
-
-        fn sealed_bins(&self) -> Option<tally_mlat_solver::held::SealedBins> {
-            None
         }
 
         fn offer_cut(&self, cut: crate::mlat_host::Cut) {

@@ -94,9 +94,10 @@ fn check_host(
 /// What the simulation made, a line of the summary.
 fn made_line(made: &traffic::Made, feeders: usize) -> String {
     format!(
-        "{:.0} receptions/s a receiver; {:.0} distinct transmissions/s, each heard by {:.1}, {:.0}/s \
-         by enough to multilaterate; {:.0} distinct messages/s by their bytes",
+        "{:.0} receptions/s a receiver, {:.0}% wanted; {:.0} distinct transmissions/s, each heard by \
+         {:.1}, {:.0}/s by enough to multilaterate; {:.0} distinct messages/s by their bytes",
         made.per_sec(made.receptions) / feeders.max(1) as f64,
+        100.0 * made.wanted as f64 / made.receptions.max(1) as f64,
         made.per_sec(made.transmissions),
         made.receptions as f64 / made.transmissions.max(1) as f64,
         made.per_sec(made.multilaterable),
@@ -671,7 +672,7 @@ fn summary(summary: &Summary) -> String {
             "relay: MLAT clock fits",
             format!(
                 "{} tried, {} fitted, {} failed this window ({}), {} clocks dropped as cut off, \
-                 over {} window steps; the last failure: {}",
+                 over {} steps; why a fit failed: {}",
                 now.fits.saturating_sub(before.fits),
                 now.fitted_since(before),
                 now.unfitted.saturating_sub(before.unfitted),
@@ -747,9 +748,44 @@ fn summary(summary: &Summary) -> String {
                 worked.regional_signed,
                 worked.own_strikes_held >> 10,
                 worked.mlat.map_or(String::new(), |mlat| format!(
-                    "; MLAT {} steps, {} positions; standing took {}, forgot {}",
-                    mlat.steps, mlat.positions, mlat.standing_taken, mlat.standing_forgotten
+                    "; MLAT {} steps, {} batches taken in, {} refused by its pool, {} fits \
+                     tried, {} positions; standing took {}, forgot {}",
+                    mlat.steps,
+                    mlat.ingested,
+                    mlat.batches_refused,
+                    mlat.fits,
+                    mlat.positions,
+                    mlat.standing_taken,
+                    mlat.standing_forgotten
                 ))
+            ),
+        );
+    }
+    if let Some(mlat) = worked.as_ref().and_then(|worked| worked.mlat) {
+        // Its steps and what it published over the window, against the governor's target and the
+        // products' pace a neighbour plans a seat (what its products reach them under,
+        // `budget::Plan::member_products_bytes_per_sec`).
+        let window = match (&end.fits, &start.fits) {
+            (Some(now), Some(before)) if now.steps > before.steps => format!(
+                "; its steps ran {} ms each on average (the governor's target {} ms of {}), and it \
+                 published {:.2} MB/s, {:.0} bytes a seat a second, against the {} a neighbour's \
+                 members are paced a seat",
+                now.ran_ms.saturating_sub(before.ran_ms) / (now.steps - before.steps),
+                tally_relay::mlat_host::STEP_TARGET_MS,
+                tally_relay::mlat_host::STEP_BUDGET_MS,
+                rate(now.published_bytes.saturating_sub(before.published_bytes)) / 1e6,
+                rate(now.published_bytes.saturating_sub(before.published_bytes))
+                    / mlat.seats_taken.max(1) as f64,
+                tally_relay::models::MEMBER_MODEL_BYTES_PER_SEAT_PER_SEC
+                    + tally_relay::consistency::POSITIONS_BYTES_PER_SEAT_PER_SEC
+            ),
+            _ => String::new(),
+        };
+        row(
+            "relay: MLAT seats",
+            format!(
+                "{} settled of {} planned (its own cuts between){window}",
+                mlat.seats_taken, mlat.seat_limit
             ),
         );
     }
@@ -828,8 +864,8 @@ fn summary(summary: &Summary) -> String {
         }
         // A batch's time is when it was made: a feeder's seal for raw, and for the deduplicated
         // stream the end of the epoch the relay signed it for (`tally_relay::deduplicated`).
-        // A provisional solution's time is its transmission's, and its latency is split at the
-        // stamp of the relay's step that solved it (`subscriber::Client::provisional`): what the
+        // An MLAT fix's time is its transmission's, and its latency is split at the stamp of the
+        // relay's step that solved it (`subscriber::Client::fixes`): what the
         // relay's lateness budget does not see (the feeder's batching, ingest, the watermark),
         // then what it does.
         for (name, stream, histogram, span, what) in [
@@ -848,28 +884,28 @@ fn summary(summary: &Summary) -> String {
                 "batches",
             ),
             (
-                "latency: provisional",
-                tally_wire::Streams::PROVISIONAL,
-                &client.provisional_latency,
+                "latency: MLAT fixes",
+                tally_wire::Streams::POSITIONS,
+                &client.fix_latency,
                 "transmitted to read",
-                "solutions",
+                "fixes",
             ),
             (
                 "  to its step's stamp",
-                tally_wire::Streams::PROVISIONAL,
-                &client.provisional_to_stamp,
+                tally_wire::Streams::POSITIONS,
+                &client.fix_to_stamp,
                 "transmitted to the stamp of the relay's step that solved it",
-                "solutions",
+                "fixes",
             ),
             (
                 "  from its step's stamp",
-                tally_wire::Streams::PROVISIONAL,
-                &client.provisional_from_stamp,
+                tally_wire::Streams::POSITIONS,
+                &client.fix_from_stamp,
                 "that stamp to read",
-                "solutions",
+                "fixes",
             ),
         ] {
-            // A stream not asked for has no latency, not an empty one: a row of "0 solutions"
+            // A stream not asked for has no latency, not an empty one: a row of "0 fixes"
             // read as a relay that published none.
             if config.streams.0 & stream.0 == 0 {
                 row(name, "not asked for (--streams)".to_owned());
@@ -897,26 +933,26 @@ fn summary(summary: &Summary) -> String {
                 ),
             );
         }
-        if config.streams.0 & tally_wire::Streams::PROVISIONAL.0 != 0 {
-            // RFC-0174 §2.4: a provisional position must reach the live world before its second
-            // is sealed, `WORLD_SETTLE_MS` after the second ends.
+        if config.streams.0 & tally_wire::Streams::POSITIONS.0 != 0 {
+            // RFC-0174 §2.4: an MLAT fix must reach the world product before its second is
+            // sealed, `WORLD_SETTLE_MS` (`FIX_ARRIVED`) after the second ends.
             let settle = tally_relay::products::WORLD_SETTLE_MS;
             let histogram = client
-                .provisional_latency
+                .fix_latency
                 .lock()
                 .map(|each| each.clone())
                 .unwrap_or_default();
             let delta = end.client - start.client;
             row(
-                "client: provisional",
+                "client: MLAT fixes",
                 format!(
-                    "{} of the {} solutions read more than {settle} ms after their transmission \
-                     (too late for the live world wherever its second ended first); {} dated \
+                    "{} of the {} fixes read more than {settle} ms after their transmission \
+                     (too late for the world product wherever its second ended first); {} dated \
                      after their step's stamp (a free-running gauge dates a transmission by the \
                      seal of the batch that anchored its model, up to a second late)",
                     histogram.over(settle),
                     histogram.total(),
-                    delta.provisional_after_stamp
+                    delta.fixes_after_stamp
                 ),
             );
         }

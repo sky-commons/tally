@@ -46,7 +46,7 @@ pub mod site;
 
 pub use anchor::Anchor;
 pub use batch::{
-    Batch, BatchContent, BatchDraft, Clock, Codec, Description, EncodedBatch, Location,
+    Batch, BatchContent, BatchDraft, Clock, Codec, Description, EncodedBatch, Inflated, Location,
     Observation, PublicInfoContent, ReceiverInfo,
 };
 pub use beast::{Frame, FrameKind};
@@ -56,9 +56,8 @@ pub use client::{
     ClientEvidence, ClientFaultProof, ClientRecord, PublicReceiverInfo, TaggedPositions,
 };
 pub use clock_model::{
-    Assembler, CLIENT_MODEL_LEN, CLIENT_TRAILING_MODEL_LEN, ClientClockModel,
-    ClientClockModelContent, ClientTrailingModelContent, ClockModel, ClockModelContent,
-    ClockModelPart, Manifest, SignedClockModel,
+    Assembler, CLIENT_MODEL_LEN, ClientClockModel, ClientClockModelContent, ClockModel,
+    ClockModelContent, ClockModelPart, Manifest, SignedClockModel,
 };
 pub use credit::{
     EVIDENCE_FORMAT_REFERENCED, Evidence, EvidenceBundle, EvidenceBundleContent, FeederReference,
@@ -73,7 +72,7 @@ pub use delivery::{
     TagKeys, TagKeysContent, delivery_tag,
 };
 pub use directory::{ProviderOffer, ProviderOfferContent, ProviderQuery};
-pub use fault_proof::{Fault, FaultProof, ModelFault, SolutionFault, Tolerance};
+pub use fault_proof::{Fault, FaultProof, FixFault, ModelFault, Tolerance};
 pub use figures::{
     FIGURES_BUCKET_MS, FIGURES_WINDOW_MS, FeederFigure, FeederFigures, FeederFiguresContent,
     MAX_FEEDER_FIGURES,
@@ -84,19 +83,18 @@ pub use observation_set::{
     Citations, ObservationIdentity, ObservationSet, Reception, Relation, TaggedSet,
 };
 pub use positions::{
-    AddressedCitation, EnuCovariance, Fix, FixSets, FixesContent, Members, Observed, Positions,
-    Solution, SolutionsContent, TaggedFix, TaggedFixesContent, TaggedSolution,
-    TaggedSolutionsContent, TransmitTime,
+    EnuCovariance, Fix, FixSets, FixesContent, MAX_FIX_MODELS, Members, Observed, Positions,
+    TaggedFix, TaggedFixesContent, TransmitTime,
 };
 pub use probe::{Echo, EchoReply, EchoReplyContent, Headroom};
 pub use products::{
     ClientObservation, ClientRegionalBatch, ClientRegionalBatchContent, RegionalBatch,
     RegionalBatchContent, RegionalDraft, WorldCandidate, WorldFix, WorldPositions,
-    WorldPositionsContent, WorldPrecise,
+    WorldPositionsContent,
 };
 pub use record::{
-    HeartbeatTimes, Reason, Record, RelayAddress, Role, SITES_VERSION, Streams, carries_sites,
-    least_version,
+    FIXES_VERSION, HeartbeatTimes, Reason, Record, RelayAddress, Role, SITES_VERSION, Streams,
+    carries_sites, least_version,
 };
 pub use region::{Region, Regions};
 pub use sharing::{
@@ -109,7 +107,8 @@ pub use site::{
     SHARING_AREA_RESOLUTION, SiteId,
 };
 
-/// Everything that can go wrong on the wire. Any of these ends the connection.
+/// Everything that can go wrong on the wire. Any of these ends the connection, but
+/// [`WireError::Retired`], which fails one record alone.
 #[derive(Debug, thiserror::Error)]
 pub enum WireError {
     #[error("i/o: {0}")]
@@ -133,6 +132,15 @@ pub enum WireError {
     Oversize(usize),
     #[error("invalid {field}: {value}")]
     Invalid { field: &'static str, value: u64 },
+    /// A form wire version 4 retired ([`record::FIXES_VERSION`]: the provisional kind, the precise
+    /// world product, positions formats 1 to 6, a client clock model of window bins, a retired
+    /// stream as a record's one product), from a peer that negotiated a version below it, which
+    /// may still send it: the record is dropped and never forwarded, and it is no fault of the
+    /// sender's, so a reader counts it apart from a malformed record and reads on
+    /// (`noise::Message::next` skips it). From a peer of version 4 or later the same form is
+    /// [`WireError::Invalid`], a breach.
+    #[error("retired at wire version 4, from an older peer: {field}: {value}")]
+    Retired { field: &'static str, value: u64 },
     #[error("bad key: {0}")]
     Key(String),
     #[error("signature does not verify")]

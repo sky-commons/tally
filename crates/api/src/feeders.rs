@@ -13,7 +13,7 @@
 //! publishes once an hour, so nothing finer than an hour can be differenced out), per receiver: **uptime** (the
 //! share of minutes with a batch), **messages**, **aircraft** (distinct checked addresses),
 //! **range** (from the public cell's centre), **coverage** and **unique coverage** (coverage cells
-//! no other receiver of that relay heard in), **MLAT help** (distinct final positions citing a
+//! no other receiver of that relay heard in), **MLAT help** (distinct positions citing a
 //! reception of it) and **standing** (the relay's own ledger).
 //!
 //! A figure counts only when its record verifies, is signed by one of the operator's relays

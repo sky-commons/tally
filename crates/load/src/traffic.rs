@@ -53,10 +53,20 @@ pub struct Spec {
     pub seed: u64,
 }
 
-/// RFC-0174's world benchmark (`world_scale_one_node` in tally-mlat-solver): receivers spread over
-/// Europe and over the US, half the run in each, with their own aircraft.
+/// RFC-0174's world shape (20,000 receivers clustered as the US and Europe's are): receivers
+/// spread over Europe and over the US, half the run in each, with their own aircraft, each cluster
+/// over its spread at the benchmark's [`WORLD_FEEDERS`].
 const CLUSTERS: [((f64, f64), f64); 2] =
     [((50.0, 10.0), 1_500_000.0), ((39.0, -95.0), 2_000_000.0)];
+/// The receivers the benchmark's clusters are spread for (`config`'s default run): a run of fewer
+/// keeps their density over a smaller disc at each cluster's centre (its radius by the square root
+/// of the share), under the whole cluster's aircraft, as a relay of a few feeders serves the
+/// feeders of one region and not one each across a continent. Before, every run spread its
+/// receivers over the whole benchmark's discs, so up to some hundreds of feeders were hundreds of
+/// kilometres apart, a transmission was heard by one, and whether a handful were heard by enough
+/// to multilaterate, which a run then asked MLAT to solve with no pair of receivers hearing enough
+/// in common to fit a clock, changed from run to run.
+pub const WORLD_FEEDERS: usize = 20_000;
 
 /// The benchmark's one GNSS-disciplined receiver in fifty.
 const GPS_EVERY: usize = 50;
@@ -126,6 +136,8 @@ pub struct Made {
     pub seconds: u64,
     /// Receptions, by every receiver of the run.
     pub receptions: u64,
+    /// Of them, those MLAT uses (`tally_wire::modes::wanted`): about 60% of a real receiver's.
+    pub wanted: u64,
     /// Distinct transmissions heard, by anyone.
     pub transmissions: u64,
     /// Distinct messages (by their bytes: a reply an aircraft repeats unchanged is one message)
@@ -142,6 +154,7 @@ pub struct Made {
 impl Made {
     fn add(&mut self, other: &Self) {
         self.receptions += other.receptions;
+        self.wanted += other.wanted;
         self.transmissions += other.transmissions;
         self.contents += other.contents;
         self.deduplicated += other.deduplicated;
@@ -156,8 +169,8 @@ impl Made {
 
 /// The receptions a second the relay's deduplicated stream keeps, each second's distinct messages
 /// (by their bytes): the relay's rule (`tally_relay::exchange::MessageShard`), by the second. A
-/// message kept in a second is remembered for that second and the `DEDUP_GENERATIONS - 1` after it,
-/// so one heard every second is kept once every `DEDUP_GENERATIONS` seconds.
+/// message kept in a second is remembered for that second and the `DEDUP_EPOCHS - 1` after it,
+/// so one heard every second is kept once every `DEDUP_EPOCHS` seconds.
 ///
 /// It is the count with each second's receptions stamped in one of the relay's seconds. The relay
 /// stamps by arrival: a feeder holds a reception up to a second before its batch is sealed and its
@@ -166,7 +179,7 @@ impl Made {
 /// the coverage line (`subscriber::Heard`), never this rate.
 #[derive(Default)]
 struct Dedup {
-    /// What each of the last `DEDUP_GENERATIONS - 1` seconds kept, oldest first.
+    /// What each of the last `DEDUP_EPOCHS - 1` seconds kept, oldest first.
     kept_before: VecDeque<HashSet<u64>>,
 }
 
@@ -174,7 +187,7 @@ impl Dedup {
     /// The messages of the next second (by their bytes' hash) the stream keeps.
     fn keep(&mut self, second: &HashSet<u64>) -> u64 {
         const { assert!(tally_relay::seal::EPOCH_MS == 1_000) };
-        let remembered = tally_relay::exchange::DEDUP_GENERATIONS - 1;
+        let remembered = tally_relay::exchange::DEDUP_EPOCHS - 1;
         let kept: HashSet<u64> = second
             .iter()
             .filter(|message| {
@@ -316,6 +329,7 @@ fn layout(feeders: usize) -> [usize; 2] {
 
 fn scenario(spec: &Spec, cluster: usize, receivers: usize, duration_s: f64, p: f64) -> Scenario {
     let ((lat, lon), spread_m) = CLUSTERS[cluster];
+    let share = receivers as f64 / layout(WORLD_FEEDERS)[cluster] as f64;
     let adsb = spec.aircraft * 2 / 3;
     Scenario {
         duration_s,
@@ -324,9 +338,13 @@ fn scenario(spec: &Spec, cluster: usize, receivers: usize, duration_s: f64, p: f
         modes_aircraft: spec.aircraft - adsb,
         centre: (lat, lon),
         spread_m,
+        receiver_spread_m: Some(spread_m * share.sqrt().min(1.0)),
         reception_probability: p,
         named: false,
         gps: (0..receivers).step_by(GPS_EVERY).collect(),
+        // A real receiver's mix: about 60% of what it hears wanted (`Scenario::unwanted`, box-01),
+        // so a simulated feeder sends the plan's mean wanted rate (`arrived::Rates::MEASURED`).
+        unwanted: true,
         // Seed 0 is the benchmark's: clusters 901 and 902.
         ..Scenario::new(901 + spec.seed * 2 + cluster as u64)
     }
@@ -706,6 +724,7 @@ impl Maker<'_> {
             return;
         };
         now.made.receptions += 1;
+        now.made.wanted += u64::from(tally_wire::modes::wanted(data));
         let message = match &mut now.last {
             Some((last, at, hearers)) if *last == source => {
                 *hearers += 1;
@@ -1048,12 +1067,12 @@ mod tests {
     }
 
     /// The deduplicated stream's rule: a message heard every second is kept once every
-    /// `DEDUP_GENERATIONS` seconds.
+    /// `DEDUP_EPOCHS` seconds.
     #[test]
     fn the_dedup_rule_keeps_a_repeated_message_once_a_window() {
         let mut dedup = Dedup::default();
         let every: HashSet<u64> = [7].into_iter().collect();
         let kept: u64 = (0..30).map(|_| dedup.keep(&every)).sum();
-        assert_eq!(kept, 30 / tally_relay::exchange::DEDUP_GENERATIONS as u64);
+        assert_eq!(kept, 30 / tally_relay::exchange::DEDUP_EPOCHS as u64);
     }
 }

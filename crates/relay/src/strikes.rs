@@ -13,7 +13,7 @@
 //!
 //! **What it covers.** Every record a relay uses once by its hash, each judged by the signed time
 //! its kind carries: a feeder's batch by its `wall_ms` (the raw batches of each ingest shard);
-//! positions, provisional positions, clock models and their client form by their engine's
+//! positions, clock models and their client form by their engine's
 //! `issued_ms`; a regional batch, its client form and a bundle index by the time their relay
 //! signed (what is passed on by hash); feeder figures by their `issued_ms` in a window stretched
 //! by the hour they are signed for ([`Usable::figures`]); and a fault proof by the newer of the
@@ -77,12 +77,12 @@
 //! seconds; sixteen, the 2^64 work of the hash itself, would double what every entry costs to buy
 //! nothing a relay can see.
 //!
-//! The message exchange keeps generations of fingerprints too (`exchange::Generation`), and they
-//! are not this table: each of its generations is allocated once at a fixed capacity for an
-//! epoch's receptions on one thread, counted before any is decided, and carries the areas each
-//! message was kept for; a strike generation holds whatever a second's records were taken, grows
-//! as they come, carries nothing but the fingerprint, and is dropped whole. One structure for both
-//! would carry the other's fields for every entry.
+//! The message exchange keeps fingerprints over a window too (`exchange::Fingerprints`), and they
+//! are not this table: its one table a thread is allocated once at a fixed capacity for the
+//! window's epochs on that thread, each epoch counted before any is decided, and carries the epochs
+//! and areas each message was kept for; a strike generation holds whatever a second's records were
+//! taken, grows as they come, carries nothing but the fingerprint, and is dropped whole. One
+//! structure for both would carry the other's fields for every entry.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -96,17 +96,17 @@ use crate::budget::{Charge, Gauge, Store};
 use crate::durable::{Durable, Lease, Log, Prior, StateDir};
 use crate::sharing::Deadlines;
 
-/// How long after its signed `issued_ms` (its window step) an engine may sign a record: a window
-/// step runs for up to `mlat_host::WINDOW_BUDGET_MS` before what it solved is signed. An engine's
-/// deadline, not a clock's error: the windows are `tally_wire::budget`'s.
-pub const ENGINE_LAG_MS: u64 = crate::mlat_host::WINDOW_BUDGET_MS;
+/// How long after its signed `issued_ms` (its step) an engine may sign a record: a step runs for
+/// up to `mlat_host::STEP_BUDGET_MS` before what it solved is signed. An engine's deadline, not a
+/// clock's error: the windows are `tally_wire::budget`'s.
+pub const ENGINE_LAG_MS: u64 = crate::mlat_host::STEP_BUDGET_MS;
 
 /// The windows of time a relay judges signed times by, every one derived in the clocks' error
 /// budget (`tally_wire::budget`, RFC-0171 §3.6), the one place a window can be made.
 pub use tally_wire::budget::Window;
 
 /// A record a relay signs, for a relay whose groups keep `deadlines`
-/// (`tally_wire::budget::Window::relay_signed`): 43 s behind, `K` ahead.
+/// (`tally_wire::budget::Window::relay_signed`): 32 s behind, `K` ahead.
 pub const fn relay_signed(deadlines: Deadlines) -> Window {
     Window::relay_signed(
         tally_wire::budget::policy::<_, ENGINE_LAG_MS>(),
@@ -125,7 +125,7 @@ const _: () = assert!(
         .behind_span()
         .span::<Judged>()
         .ms()
-        == 43_000
+        == 32_000
 );
 const _: () = assert!(proofs(Deadlines::RELAY).behind_span().span::<Judged>().ms() == 122_000);
 
@@ -706,17 +706,18 @@ pub enum Deliverer {
 pub const OWN_PRODUCTS_PER_FEEDER: u64 = 2;
 
 /// The records a second hosted MLAT signs for each planned feeder's worth of load, beside the
-/// engine's own ([`ENGINE_RECORDS_FIXED`]): its solutions as positions, provisional and final,
-/// each plain and tagged (`tally_mlat::provisional`'s step, `tally_mlat::window`'s), packed to a
-/// record's bytes (`Positions::fitting`), and its tiles' clock models with their client form.
-/// A solution needs three receivers at the least, so a feeder's planned notes
-/// (`mlat_host::PLANNED_NOTES_PER_SEC`, 300) make at most 100 a second; a solution of a few
-/// receivers is about 110 bytes, so a record carries some 580; the four forms of 100 are under one
-/// record a second, and a tile's model and its client form, once a window step, a few hundredths.
+/// engine's own ([`ENGINE_RECORDS_FIXED`]): its fixes as positions, each raw and tagged
+/// (`tally_mlat::fix`'s step), packed to a record's bytes (`Positions::fitting`), and its areas'
+/// clock models with their client form. A fix needs three receivers at the least, so a feeder's
+/// planned notes (`mlat_host::PLANNED_NOTES_PER_SEC`, 300) make at most 100 transmissions a
+/// second, each solved twice at most (when it settles, and once more if its set grew); a fix of a
+/// few receivers is about 110 bytes, so a record carries some 580; the two forms of 200 are under
+/// one record a second, and an area's model and its client form, once a refit
+/// (`tally_wire::budget::REFIT_EVERY`), a few hundredths.
 pub const ENGINE_RECORDS_PER_FEEDER: u64 = 1;
 
 /// The records a second hosted MLAT signs whatever its load: the last record of each form a step
-/// packs (two a provisional step, a second apart, and two a window step), each part filled.
+/// packs (raw and tagged, a step a second), each part filled, and the last model's client form.
 pub const ENGINE_RECORDS_FIXED: u64 = 3;
 
 /// The records a second the relay itself delivers for each planned feeder's worth of load, of its
@@ -2293,10 +2294,10 @@ mod tests {
     }
 
     /// RFC-0171 §3.6: the windows and lives the RFC quotes, from the constants alone: a feeder's
-    /// own copy 91 s behind and 10 s ahead, any other 76 s and 25 s, the relay-signed kinds 43 s
+    /// own copy 91 s behind and 10 s ahead, any other 76 s and 25 s, the relay-signed kinds 32 s
     /// and 15 s, fault proofs 122 s and 25 s; a batch's fingerprint held 91 s past its signed
     /// time, so an entry lives 117 s at most (a peer's copy 25 s ahead) and 102 s a feeder's; the
-    /// relay's own records (the relay-signed kinds, held 43 s past their signed time) 44 s.
+    /// relay's own records (the relay-signed kinds, held 32 s past their signed time) 33 s.
     #[test]
     fn the_windows_are_the_figures_the_rfc_quotes() {
         assert_eq!(Deadlines::RELAY.horizon_seconds(), 13);
@@ -2319,7 +2320,7 @@ mod tests {
                     .span::<tally_wire::clocks::Judged>()
                     .ms(),
             ),
-            (15_000, 10_000, 64_000, 12_000, 2_000, 40_000)
+            (15_000, 10_000, 64_000, 1_000, 2_000, 40_000)
         );
         let window = |window: Window| {
             (
@@ -2335,7 +2336,7 @@ mod tests {
         };
         assert_eq!(window(Window::FEEDER), (91_000, 10_000));
         assert_eq!(window(Window::PEER), (76_000, 25_000));
-        assert_eq!(window(relay_signed(Deadlines::RELAY)), (43_000, 15_000));
+        assert_eq!(window(relay_signed(Deadlines::RELAY)), (32_000, 15_000));
         assert_eq!(window(proofs(Deadlines::RELAY)), (122_000, 25_000));
         let batches = Usable::BATCHES;
         assert_eq!(batches.retained_ms(), 91_000);
@@ -2349,7 +2350,7 @@ mod tests {
         );
         assert_eq!(
             Usable::relay_signed(Deadlines::RELAY).own_life_seconds(),
-            44
+            33
         );
         // A member asks for a relay-signed record until the horizon's seconds after the second
         // it was signed in; the answer's way and the clocks apart are inside its window.
@@ -2719,7 +2720,7 @@ mod tests {
                 .behind_span()
                 .span::<tally_wire::clocks::Judged>()
                 .ms(),
-            43_000 + 3_600_000
+            32_000 + 3_600_000
         );
         for (n, signed) in [(1, BASE_MS), (2, BASE_MS + 59_999), (3, BASE_MS + 1)] {
             let gauge = Gauge::new(Store::PeerStrikes, usize::MAX);

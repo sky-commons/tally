@@ -31,15 +31,11 @@
 
 use serde::{Deserialize, Serialize};
 
-/// `GET /v1/aircraft?west=&south=&east=&north=[&feed=live|precise]`: the aircraft in a viewport.
+/// `GET /v1/aircraft?west=&south=&east=&north=`: the aircraft in a viewport.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AircraftResponse {
-    /// When the data was current: Unix milliseconds on the API's clock. For the precise feed,
-    /// the product's own second (about a minute and a half ago), so a client ages each aircraft
-    /// against it and draws the feed where it was then.
+    /// When the data was current: Unix milliseconds on the API's clock.
     pub now_ms: u64,
-    /// Which feed was served: what the client asked for (`live` when it named none).
-    pub feed: Feed,
     pub aircraft: Vec<Aircraft>,
     /// When the API sent this answer: Unix milliseconds on the API's clock. A client that holds the
     /// least of (its receipt time minus `sent_at_ms`) over its answers holds the offset between the
@@ -48,7 +44,7 @@ pub struct AircraftResponse {
     pub sent_at_ms: u64,
 }
 
-/// `GET /v1/aircraft/stream?west=&south=&east=&north=[&feed=live|precise]`: the same viewport's
+/// `GET /v1/aircraft/stream?west=&south=&east=&north=`: the same viewport's
 /// aircraft pushed as Server-Sent Events (RFC-0184), never cached. The first `aircraft` event is
 /// `full` (every aircraft in the box); each later one carries the aircraft whose position or state
 /// changed since the event before it and the addresses that left the box or went silent. A comment
@@ -59,26 +55,12 @@ pub struct AircraftUpdate {
     pub now_ms: u64,
     /// When the API sent this event, as in [`AircraftResponse::sent_at_ms`].
     pub sent_at_ms: u64,
-    pub feed: Feed,
     /// Whether `aircraft` is every aircraft in the box (the client replaces what it holds) or only
     /// those that changed (the client updates them in place).
     pub full: bool,
     pub aircraft: Vec<Aircraft>,
     /// Addresses the client holds that left the box or went silent; empty in a `full` event.
     pub gone: Vec<String>,
-}
-
-/// Which feed of positions a client reads (RFC-0174 §2.11), its choice.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Feed {
-    /// Now: each aircraft at its newest position, an MLAT aircraft by its provisional fix a second
-    /// or two after it was heard until its final fix replaces it.
-    #[default]
-    Live,
-    /// The precise world product, about a minute and a half behind: every aircraft at one second,
-    /// an MLAT aircraft by its final fix only. Each aircraft's `last_heard_at_ms` says how old.
-    Precise,
 }
 
 /// One aircraft with a position: as the API's decoder (readsb) holds it, its position either
@@ -146,8 +128,6 @@ pub struct Mlat {
     /// One standard deviation of the horizontal position, metres, clock error included.
     pub horizontal_sigma_m: f64,
     pub check: MlatCheck,
-    /// Final, or provisional until a final position replaces it.
-    pub kind: MlatKind,
     /// Whether the receivers it was solved from have standing (RFC-0174 §2.12): `unconfirmed` is
     /// drawn, and labelled so. Standing is a relay's ledger, kept from raw a client never holds, so
     /// the API serves `unconfirmed`.
@@ -167,21 +147,7 @@ pub enum MlatConfidence {
     Unconfirmed,
 }
 
-/// Which MLAT position is served: the API serves a provisional one while it is later than every
-/// final one it holds of the aircraft.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum MlatKind {
-    /// Solved under the clock model of the window holding its transmission: published some 7 to
-    /// 47 s after it.
-    Final,
-    /// Solved about a second after its transmission under an older clock model carried forward,
-    /// its uncertainty grown by how far: a final position of the same transmission follows and
-    /// replaces it, and one no final position confirms is retracted.
-    Provisional,
-}
-
-/// How the API checked an MLAT position before serving it. Raw is relay-only (wire version 3), so
+/// How the API checked an MLAT position before serving it. Raw is relay-only (wire version 4), so
 /// the API, a client, checks by `signature`; `model` and `resolved` remain the names of checks a
 /// holder of raw makes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -485,9 +451,6 @@ pub mod fixtures {
     /// `AIRCRAFT`: the aircraft that moved since (one by readsb, one by its next MLAT fix, moving by
     /// its last two) and the address no longer heard.
     pub const AIRCRAFT_UPDATE: &str = include_str!("../testdata/aircraft_update.json");
-    /// `GET /v1/aircraft?...&feed=precise`: one second of the precise world product, an ADS-B
-    /// aircraft and an MLAT one.
-    pub const AIRCRAFT_PRECISE: &str = include_str!("../testdata/aircraft_precise.json");
     /// `GET /v1/network`.
     pub const NETWORK: &str = include_str!("../testdata/network.json");
     /// `GET /v1/stations/{key}`: a located station.
@@ -541,7 +504,6 @@ mod tests {
     #[test]
     fn every_fixture_is_its_type_whole() -> Result<(), String> {
         whole::<AircraftResponse>(fixtures::AIRCRAFT)?;
-        whole::<AircraftResponse>(fixtures::AIRCRAFT_PRECISE)?;
         whole::<AircraftUpdate>(fixtures::AIRCRAFT_UPDATE)?;
         whole::<Network>(fixtures::NETWORK)?;
         whole::<Station>(fixtures::STATION)?;

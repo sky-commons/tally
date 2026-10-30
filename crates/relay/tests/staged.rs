@@ -198,7 +198,7 @@ fn trace() -> Result<Trace> {
         relay,
         feeders,
         batches,
-        // Past the live world's settle after the last second, on the epochs' grid, so every
+        // Past the world's settle after the last second, on the epochs' grid, so every
         // second of it is sealed.
         end_ms: BASE_MS
             + (SECONDS + 3) * 1_000
@@ -297,7 +297,7 @@ fn run(trace: &Trace, threads: Threads, delay: impl Fn(usize) -> Duration) -> Re
         Hub::clocked(8, Arc::new(|| 0), tally_relay::sharing::Deadlines::RELAY)
             .accepting_relays([tally_mlat_solver::sim::anchoring_relay().public()])
             // The trace's world switched on, as `--world` does, its fixes' store planned.
-            .gathering_world(true, false)
+            .gathering_world(true)
             .product_boots(42)
             .staged(threads)?,
     );
@@ -326,7 +326,7 @@ fn run_clocked(trace: &Trace, threads: Threads, pause: Option<Pause>) -> Result<
         )
         .accepting_relays([tally_mlat_solver::sim::anchoring_relay().public()])
         // The trace's world switched on, as `--world` does, its fixes' store planned.
-        .gathering_world(true, false)
+        .gathering_world(true)
         .product_boots(42)
         .staged_pausing(threads, pause)?,
     );
@@ -747,6 +747,18 @@ async fn a_subscriber_that_falls_behind_is_let_go_whole_and_the_stream_refused_w
             refusal: None,
         });
         hub.advance(BASE_MS + second * 1_000);
+        // Each second is taken before the next is stamped, as time passing would take it: fed
+        // faster than its threads read their ticks, one message thread would meet epochs more
+        // than `exchange::EPOCHS_OPEN` past another's and, after `exchange::WINDOW_WAIT_MS` of
+        // the host's time, let them go (`receptions_past_window`), so what was lost would be the
+        // host's load, not the products' budget.
+        let at = BASE_MS + second * 1_000;
+        until_async(
+            at,
+            || hub.network().products.watermark_ms(),
+            |stood| format!("the epochs stood at {stood} of {at}"),
+        )
+        .await?;
     }
     let end = BASE_MS + (seconds + 1) * 1_000;
     hub.advance(end);
@@ -774,7 +786,9 @@ async fn a_subscriber_that_falls_behind_is_let_go_whole_and_the_stream_refused_w
         seconds as usize
     );
     assert_eq!(hub.network().products.report().stream_refused, refused);
-    // And nothing before the products: every batch was decoded and every epoch decided.
+    // And nothing before the products: every batch was decoded and every epoch decided, none let
+    // go past the message threads' window.
+    assert_eq!(hub.network().products.report().receptions_past_window, 0);
     assert_eq!(hub.memory_report().decoded_refused, 0);
     Ok(())
 }

@@ -24,7 +24,7 @@ use std::sync::{Arc, OnceLock};
 use bytes::Bytes;
 
 use crate::WireError;
-use crate::batch::{Batch, Hash, Observation};
+use crate::batch::{Batch, Hash, Inflated, Observation};
 use crate::beast::{Frame, FrameKind};
 use crate::clocks::{Judged, Moment, Mono};
 use crate::key::PublicKey;
@@ -391,8 +391,15 @@ impl Decoded {
         (at, judging): (Moment, bool),
         ingest_seq: u64,
     ) -> Result<Arc<Self>, Box<Undecodable>> {
-        Self::decode_unshared(batch, FingerprintKey::process(), at, judging, ingest_seq)
-            .map(|decoded| Self::shared(decoded, |_| {}))
+        Self::decode_unshared(
+            batch,
+            None,
+            FingerprintKey::process(),
+            at,
+            judging,
+            ingest_seq,
+        )
+        .map(|decoded| Self::shared(decoded, |_| {}))
     }
 
     /// As `from_verified`, the fingerprints under `key`.
@@ -402,7 +409,7 @@ impl Decoded {
         at: Moment,
         ingest_seq: u64,
     ) -> Result<Arc<Self>, Box<Undecodable>> {
-        Self::decode_unshared(batch, key, at, true, ingest_seq)
+        Self::decode_unshared(batch, None, key, at, true, ingest_seq)
             .map(|decoded| Self::shared(decoded, |_| {}))
     }
 
@@ -419,6 +426,20 @@ impl Decoded {
     /// in the same instant as `at`.
     pub fn from_verified_owned(
         batch: Batch,
+        stamp: (Moment, bool),
+        ingest_seq: u64,
+        owner: impl FnOnce(&Self) -> Option<Owner>,
+        held: impl FnOnce(&Arc<Self>),
+    ) -> Result<Arc<Self>, NotDecoded> {
+        Self::from_inflated_owned(batch, None, stamp, ingest_seq, owner, held)
+    }
+
+    /// As [`Decoded::from_verified_owned`], from its plain bytes already inflated
+    /// ([`Batch::inflated`]) when `inflated` is this batch's (its signed bytes the same), so it is
+    /// not inflated again; inflated here otherwise.
+    pub fn from_inflated_owned(
+        batch: Batch,
+        inflated: Option<&Inflated>,
         (at, judging): (Moment, bool),
         ingest_seq: u64,
         owner: impl FnOnce(&Self) -> Option<Owner>,
@@ -426,6 +447,7 @@ impl Decoded {
     ) -> Result<Arc<Self>, NotDecoded> {
         let mut decoded = match Self::decode_unshared(
             batch,
+            inflated,
             FingerprintKey::process(),
             at,
             judging,
@@ -444,12 +466,13 @@ impl Decoded {
     /// The batch decoded, not yet shared nor counted alive.
     fn decode_unshared(
         batch: Batch,
+        inflated: Option<&Inflated>,
         key: &FingerprintKey,
         at: Moment,
         judging: bool,
         ingest_seq: u64,
     ) -> Result<Self, Box<Undecodable>> {
-        match Self::decode(&batch, key) {
+        match Self::decode(&batch, inflated, key) {
             Ok((receiver, header, plain, obs)) => Ok(Self {
                 batch,
                 receiver,
@@ -485,10 +508,15 @@ impl Decoded {
     #[allow(clippy::type_complexity)]
     fn decode(
         batch: &Batch,
+        inflated: Option<&Inflated>,
         key: &FingerprintKey,
     ) -> Result<(PublicKey, crate::batch::Header, Bytes, Box<[ObsRef]>), WireError> {
         let receiver = batch.receiver()?;
-        let (header, plain) = batch.header_and_plain()?;
+        let (header, plain) =
+            match inflated.filter(|one| one.batch().as_bytes() == batch.as_bytes()) {
+                Some(one) => one.header_and_plain(),
+                None => batch.header_and_plain()?,
+            };
         let count = read(&plain, 0, 4)?;
         let count = u32::from_be_bytes([count[0], count[1], count[2], count[3]]) as usize;
         // Every observation takes at least its fixed part, so a count the bytes cannot hold is

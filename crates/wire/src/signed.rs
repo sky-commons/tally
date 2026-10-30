@@ -94,9 +94,16 @@ pub(crate) trait Fields: Check + Sized {
         Ok(out)
     }
 
-    /// Read alone, from an unsigned record's body.
+    /// Read alone, from an unsigned record's body, without a session.
+    #[cfg(test)]
     fn from_body(bytes: &[u8]) -> Result<Self, WireError> {
         Self::decode(&mut Body::new(bytes))
+    }
+
+    /// Read alone, from an unsigned record's body that arrived on a session that negotiated
+    /// `version` (`Record::decode`), which is what a stream bit it names is read by.
+    fn from_session(bytes: &[u8], version: u16) -> Result<Self, WireError> {
+        Self::decode(&mut Body::at(bytes, version))
     }
 }
 

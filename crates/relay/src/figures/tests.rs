@@ -7,8 +7,8 @@ use tally_wire::Identity;
 use tally_wire::clocks::recorded::{aligned, judged};
 use tally_wire::rendezvous::AREA_RESOLUTION;
 use tally_wire::{
-    AddressedCitation, BatchContent, EnuCovariance, Location, Observation, ObservationSet,
-    Reception, Solution, SolutionsContent, TransmitTime,
+    BatchContent, EnuCovariance, Fix, FixSets, FixesContent, Location, Observation, ObservationSet,
+    Reception, TransmitTime,
 };
 
 const T: u64 = 1_791_220_000_000;
@@ -101,7 +101,7 @@ fn acars(who: &Identity, sequence: u64, wall_ms: u64) -> Arc<Decoded> {
         .unwrap_or_else(|error| panic!("{error:?}"))
 }
 
-/// A final position of `address` at `place`, at `at_ms`, citing one reception of each receiver.
+/// An MLAT fix of `address` at `place`, at `at_ms`, citing one reception of each receiver.
 fn position(
     engine: &Identity,
     sequence: u64,
@@ -121,7 +121,7 @@ fn position(
         .collect();
     let observations =
         ObservationSet::new(df11(address), receptions).unwrap_or_else(|error| panic!("{error}"));
-    let solution = Solution {
+    let fix = Fix {
         address,
         transmitted: TransmitTime {
             unix_ms: at_ms,
@@ -138,21 +138,18 @@ fn position(
             yz: 0.0,
             zz: 100.0,
         },
-        clock_model: [1; 32],
-        addressed: AddressedCitation {
-            hash: [2; 32],
-            count: 3,
-        },
-        observations,
+        models: vec![[1; 32]],
+        sets: FixSets::new(observations.clone(), observations)
+            .unwrap_or_else(|error| panic!("{error}")),
     };
-    let content = SolutionsContent {
+    let content = FixesContent {
         boot_id: 9,
         sequence,
         issued_ms: at_ms,
-        spec_version: 3,
-        solutions: vec![solution],
+        spec_version: 7,
+        fixes: vec![fix],
     };
-    Positions::sign_solutions(engine, &content).unwrap_or_else(|error| panic!("{error}"))
+    Positions::sign_fix(engine, &content).unwrap_or_else(|error| panic!("{error}"))
 }
 
 /// A site, exact: what no figure may carry or be measured from.
@@ -505,15 +502,15 @@ fn a_receiver_with_no_cell_is_figured_in_a_record_of_no_area() -> Result<(), Str
     Ok(())
 }
 
-/// The figures judge a batch's and a final position's own signed time by the error budget's
-/// windows (`tally_wire::budget::Window::FIGURES` and `Window::FIGURES_POSITIONS`), never a
-/// tolerance of their own: a batch as old as its origin may use it is counted, one older or
-/// further ahead than any copy may be used is not; a final position as late as a final fix may
-/// arrive is counted, one later is not. Before, one 120 s either way of the relay's clock counted
+/// The figures judge a batch's and an MLAT fix's own signed time by the error budget's windows
+/// (`tally_wire::budget::Window::FIGURES` and `Window::FIGURES_POSITIONS`), never a tolerance of
+/// their own: a batch as old as its origin may use it is counted, one older or further ahead than
+/// any copy may be used is not; a fix as late as a fix may arrive (`FIX_ARRIVED`) is counted, one
+/// later is not. Before, one 120 s either way of the relay's clock counted
 /// both, records no relay could have used.
 #[test]
 fn the_figures_judge_signed_times_by_the_budgets_windows() {
-    use tally_wire::budget::{FEEDER_BEHIND, FINAL_FIX_ARRIVED, PEER_AHEAD};
+    use tally_wire::budget::{FEEDER_BEHIND, FIX_ARRIVED, PEER_AHEAD};
     let now = T + 600_000;
     let figures = Figures::new();
     let rows = |figures: &Figures| figures.rows();
@@ -556,7 +553,7 @@ fn the_figures_judge_signed_times_by_the_budgets_windows() {
             0,
             Z.0,
             Z.1,
-            now - FINAL_FIX_ARRIVED.span::<tally_wire::clocks::Judged>().ms() - 1,
+            now - FIX_ARRIVED.span::<tally_wire::clocks::Judged>().ms() - 1,
             &[&fed],
         ),
         judged(now),
@@ -567,7 +564,7 @@ fn the_figures_judge_signed_times_by_the_budgets_windows() {
             1,
             Z.0 + 1,
             Z.1,
-            now - FINAL_FIX_ARRIVED.span::<tally_wire::clocks::Judged>().ms(),
+            now - FIX_ARRIVED.span::<tally_wire::clocks::Judged>().ms(),
             &[&fed],
         ),
         judged(now),

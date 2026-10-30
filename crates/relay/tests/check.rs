@@ -300,6 +300,8 @@ fn assert_plan_holds(checked: &Checked) -> Result {
                     limit - checked.get("description-tables")?
                 }
                 tally_relay::budget::Store::Located => limit - checked.get("located-tables")?,
+                // The inboxes' spare, whatever they hold.
+                tally_relay::budget::Store::Inbox => limit - checked.get("inbox-spare")?,
                 tally_relay::budget::Store::Consistency => {
                     limit - checked.get("consistency-tables")?
                 }
@@ -326,7 +328,7 @@ fn assert_plan_holds(checked: &Checked) -> Result {
     assert!(checked.get("mlat-seats")? <= connections, "{plan:?}");
     // The tables that grow with what the relay is sent are each held before any feeder: the
     // products' remembered tables always, standing's where MLAT is hosted (among MLAT's tables),
-    // the world's fixes only where they are gathered (`--world`, `--world-precise`).
+    // the world's fixes only where they are gathered (`--world`).
     assert!(checked.get("remembered-tables")? > 0, "{plan:?}");
     assert_eq!(checked.get("mlat-tables")? > 0, hosted, "{plan:?}");
     assert!(checked.get("consistency-tables")? > 0, "{plan:?}");
@@ -357,7 +359,7 @@ fn assert_plan_holds(checked: &Checked) -> Result {
 fn a_configuration_the_relay_takes_is_accepted_with_its_plan() -> Result {
     // A key file that does not exist: check reads no key, which is an operator's secret.
     // Its memory the least round figure that holds what it plans before any feeder (its members'
-    // rate's models over their hold among it, `models::BYTES_PER_MEMBER_FEEDER`) and a
+    // rate's models over their hold among it, `models::BYTES_PER_MEMBER_SEAT`) and a
     // connection with its seat.
     let checked = check(&[
         "--memory-limit",
@@ -428,9 +430,10 @@ fn a_configuration_the_relay_takes_is_accepted_with_its_plan() -> Result {
 
 /// The stages' threads follow the load the relay admits, never the host's cores alone, and its
 /// cores bound what it admits (`tally_relay::cores`): the configuration measured on 2026-10-09
-/// (`TEN_CORES`: 10 cores, memory for 5,000 feeders and more) runs more than one message thread,
-/// the same memory on one core admits what one core carries, and a relay of many cores and little
-/// memory runs the threads its few feeders need.
+/// (`TEN_CORES`: 10 cores, memory for 5,000 feeders and more) runs more than one ingest worker
+/// and the one message thread its rate needs (one table a thread carries 20 M receptions a second,
+/// `cores::MESSAGE_RECEPTIONS_PER_THREAD`), the same memory on one core admits what one core
+/// carries, and a relay of many cores and little memory runs the threads its few feeders need.
 #[test]
 fn the_stages_follow_the_load_admitted_and_the_cores_bound_it() -> Result {
     let on = |cores: &'static str, memory: &'static str| -> Result<Checked> {
@@ -465,7 +468,7 @@ fn the_stages_follow_the_load_admitted_and_the_cores_bound_it() -> Result {
     );
     assert_eq!(threads(&measured)?, expected(&measured)?);
     assert!(
-        threads(&measured)?.message >= 2,
+        threads(&measured)?.ingest >= 2 && threads(&measured)?.message >= 1,
         "{:?}",
         threads(&measured)?
     );
@@ -482,7 +485,9 @@ fn the_stages_follow_the_load_admitted_and_the_cores_bound_it() -> Result {
     );
     assert_eq!(threads(&one)?, expected(&one)?);
     // Many cores and little memory: the memory bounds it, and the threads follow its rate.
-    let small = on("32", "16G")?;
+    // 12G: since the ingest was planned at what the measured mix costs (2026-10-26), ten cores
+    // carry about what 16G holds, so 16G no longer made a relay of few feeders.
+    let small = on("32", "12G")?;
     assert!(
         small.get("connection-limit")? == small.get("connections-by-memory")?
             && Some(small.get("connection-limit")?) < small.bounded("connections-by-cores")?
@@ -492,7 +497,13 @@ fn the_stages_follow_the_load_admitted_and_the_cores_bound_it() -> Result {
         small.plan
     );
     assert_eq!(threads(&small)?, expected(&small)?);
-    assert!(threads(&small)?.message < threads(&measured)?.message);
+    assert!(
+        threads(&small)?.ingest < threads(&measured)?.ingest
+            && threads(&small)?.message <= threads(&measured)?.message,
+        "{:?} {:?}",
+        threads(&small)?,
+        threads(&measured)?
+    );
     Ok(())
 }
 
@@ -578,13 +589,14 @@ fn a_configuration_a_start_refuses_is_refused_and_says_why() -> Result {
     )?;
     // Memory that holds feeders but not the members' pool beside one: the 64 member sessions an
     // area brings under a cap of 64 connections, sharing 16 MiB/s (2,048 feeders' worth), on cores
-    // that carry them and many feeders beside.
+    // that carry them and many feeders beside (their solving among them: sixteen did before it
+    // was measured in seconds' steps, `cores::MLAT_SOLVE_NANOS_PER_KEPT`).
     refused(
         &[
             "--memory-limit",
             "4G",
             "--cores",
-            "16",
+            "64",
             "--key",
             "k",
             "--max-upload",
@@ -996,10 +1008,9 @@ const CORE_LINES: [&str; 20] = [
 /// Ten cores, 24 GB and the harness's two areas, the configuration the 2026-10-09 runs had, with
 /// the connection cap at 2,048. What it measures is how a relay plans ten cores: the stages'
 /// threads, what MLAT is given of what they leave, and the connections both admit
-/// (`tests/cores-10.txt`). It is no seat floor: since the clocks' error budget set the hosted
-/// MLAT's bins (`tally_wire::budget::MLAT_AHEAD` and `MLAT_SETTLE`), a seat's open raw is
-/// reserved over a longer span of its ceiling, and its seats are what its memory leaves. The
-/// floor is the world relay's (`tests/world-relay.txt`). A relay taking a base cell plans a
+/// (`tests/cores-10.txt`). It is no seat floor: a seat's kept raw is planned over
+/// `tally_wire::budget::FIX_ARRIVED` and its seats are what its memory leaves. The floor is the
+/// world relay's (`tests/world-relay.txt`). A relay taking a base cell plans a
 /// member session for every connection the cap allows, and each holds its kernel socket buffers,
 /// a link dialled to it and an engine's place (`budget::Plan::connection_sockets`), and every
 /// connection under the cap may listen to the fan-out: at 5,024 they took some 10 GB before any

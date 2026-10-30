@@ -56,7 +56,7 @@ pub fn area_at(lat_deg: f64, lon_deg: f64) -> Result<Region, WireError> {
 }
 
 /// The area a cell lies in: the cell itself at `AREA_RESOLUTION`, its ancestor there when it is
-/// finer (a receiver's `Region::point`, a clock model tile's centre), and `None` when it is
+/// finer (a receiver's `Region::point`), and `None` when it is
 /// coarser than an area, so it lies in many.
 pub fn area_of_cell(cell: Region) -> Option<Region> {
     cell.ancestor(AREA_RESOLUTION)

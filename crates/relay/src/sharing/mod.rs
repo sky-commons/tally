@@ -81,7 +81,7 @@ pub use self::seeds::{SEED_COPIES, seeded_bytes};
 /// exact group and hash it was rebuilt under, as the member holds it. Made only here, by the tick
 /// that rebuilt it ([`Sharing::tick`]), and handed back with the verdict ([`Sharing::passed_on`],
 /// [`Sharing::refused_rebuilt`], [`Sharing::let_go`]), so the verdict reaches the group that holds
-/// the record and is never reckoned again from the record (a clock model's tile, a receiver's
+/// the record and is never reckoned again from the record (a clock model's area, a receiver's
 /// described cell), which can say no group, or another.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Rebuilt {
@@ -125,13 +125,12 @@ pub struct Ticked {
     pub published: Vec<Record>,
 }
 
-/// The products an area's group shares (§2.5: raw, positions, provisional positions, clock
-/// models, and the regional product's deduplicated batches): every record of data one relay passes
-/// another travels in one of these groups.
-pub const SHARED_PRODUCTS: [Streams; 5] = [
+/// The products an area's group shares (§2.5: raw, positions, clock models, and the regional
+/// product's deduplicated batches): every record of data one relay passes another travels in one
+/// of these groups.
+pub const SHARED_PRODUCTS: [Streams; 4] = [
     Streams::RAW,
     Streams::POSITIONS,
-    Streams::PROVISIONAL,
     Streams::CLOCK_MODELS,
     Streams::REGIONAL,
 ];
@@ -1467,11 +1466,11 @@ impl Sharing {
 ///   `rendezvous::area_of_public`, the cell's parent at `AREA_RESOLUTION`), product `RAW`. Never
 ///   the area its site lies in, which can differ and so says more than the public cell. No
 ///   public cell, no group.
-/// - Final or provisional positions: the area of the record's first solution, product
-///   `POSITIONS` or `PROVISIONAL` (an engine packs a record's solutions in tile order, so a record
-///   is nearly always one area's).
-/// - A clock model manifest: the area of its tile's centre (`point`, from its inline bytes or its
-///   first part), product `CLOCK_MODELS`. Its parts are in no group: every member link carries a
+/// - Positions: the area of the record's first fix, product `POSITIONS` (an engine's fixes are
+///   of the transmissions its own areas' hearers heard most, so a record is nearly always one
+///   area's).
+/// - A clock model manifest: the area its model names (`point`, from its inline bytes or its
+///   first part, `publish::area_of`), product `CLOCK_MODELS`. Its parts are in no group: every member link carries a
 ///   model's parts just before its manifest (`link`'s `Told`).
 /// - A regional batch: its cell's area, product `REGIONAL`; its client form (counters stripped)
 ///   likewise, beside it. A client clock model goes with its full model, positions tagged for
@@ -1484,13 +1483,8 @@ pub fn group_of(record: &Record, point: Option<Region>) -> Option<(Region, Strea
             tally_wire::rendezvous::area_of_public(point?)?,
             Streams::RAW,
         )),
-        Record::Positions(_) | Record::Provisional(_) => {
-            let solved = match record {
-                Record::Positions(positions) | Record::Provisional(positions) => {
-                    crate::network::solved(positions)?
-                }
-                _ => return None,
-            };
+        Record::Positions(positions) => {
+            let solved = crate::network::solved(positions)?;
             let first = solved.first()?;
             let point = Region::point(&tally_wire::Location {
                 lat_e7: first.lat_e7,
@@ -1499,14 +1493,9 @@ pub fn group_of(record: &Record, point: Option<Region>) -> Option<(Region, Strea
                 precision_m: 0,
             })
             .ok()?;
-            let product = if matches!(record, Record::Provisional(_)) {
-                Streams::PROVISIONAL
-            } else {
-                Streams::POSITIONS
-            };
-            Some((area_at(point)?, product))
+            Some((area_at(point)?, Streams::POSITIONS))
         }
-        // A client clock model with its full model: placed by the full model's tile (`point`).
+        // A client clock model with its full model: placed by the full model's area (`point`).
         Record::ClockModel(_) | Record::ClientClockModel(_) => {
             Some((area_at(point?)?, Streams::CLOCK_MODELS))
         }

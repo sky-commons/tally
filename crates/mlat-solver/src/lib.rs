@@ -1,38 +1,64 @@
-//! Tally's native MLAT mathematics (RFC-0171 §3.8, §3.8.1): pure, deterministic, no I/O.
+//! Tally's native MLAT mathematics (RFC-0171 §3.8, §3.8.1 as amended 2026-10-24; RFC-0174 §2.3,
+//! §2.4): pure, deterministic, no I/O.
 //!
-//! An MLAT engine takes a region's raw receptions and, for each window, fits one clock model per
-//! canonical tile (a cube of space and its footprint of receivers) from the ADS-B positions its
-//! members heard, shared by every aircraft assigned the tile; groups each aircraft's receptions
-//! into transmissions, solves them, and publishes models and solutions anyone can verify against
-//! the same raw observations. This crate is that mathematics; `tally-mlat` is the engine around
-//! it.
+//! An MLAT engine holds its region's raw receptions as they arrive and, every `REFIT_EVERY`, fits
+//! each area it owns a pair model over a trailing window of the sync raw its members' batches have
+//! brought (the ADS-B positions they heard): every pair of nearby receivers' clocks, each fitted
+//! in closed form, and every clock's noise and rate at the fixed point of the pairs fitted under
+//! them (§ The pairwise path). A second after a transmission's first reception arrived, it groups
+//! the receptions of it that had arrived (what it considered) under the models of the areas its
+//! hearers are in (§ Areas), puts them on one timeline through the pairs among their hearers,
+//! solves it (§ Solving), and publishes the fix with the id of each model it cites. Any holder of
+//! an area's window verifies its model once a refit, and anyone holding the verified models and a
+//! fix's own receptions verifies the fix. This crate is that mathematics; `tally-mlat` is the
+//! engine around it.
 //!
-//! This documentation is the specification (version [`clock::SPEC_VERSION`]; version 4 trusts no
-//! receiver's declaration of GNSS discipline beyond its timebase, from the calibration over real
-//! receivers, § The least-squares problem; version 5 dates a free-running gauge's origin by every
-//! cited reception of its clock and rejects a sync message any receiver heard twice in the
-//! window). A verifier judges its own version alone ([`verify::judges`]). It is written so an
-//! independent implementation makes the same discrete decisions: holding, windows, tiles,
-//! members and assignment are decided by content in integers (the tile module refuses floating
-//! point at compile time), grouping and the feasibility screen are exact integer arithmetic on raw
-//! counters and the fixed-point model; the floating-point decisions (sync weights, jumps, noise,
-//! the outlier rule) are stated with their constants, and the verifiers allow stated bands.
+//! This documentation is the specification (version [`clock::SPEC_VERSION`]). Versions 1 to 7
+//! were a joint clock model fitted per tile (version 4 stopped trusting a receiver's declaration
+//! of GNSS discipline beyond its timebase; version 5 dated a free-running gauge by every cited
+//! reception of its clock and rejected a sync message a receiver heard twice; version 6 named
+//! each member's site record by its site id; version 7 fitted over a trailing window of what had
+//! arrived, cited by frontiers, and solved every fix a second after it was heard). Version 8 is
+//! the pairwise path alone: one pair model an area at each edge of one refit grid, and fixes that
+//! cite one model for each area of their used hearers. A verifier judges its own version alone
+//! ([`verify::judges`]). It is written so an independent implementation makes the same discrete
+//! decisions: holding, windows, areas, members, the pair network and the models a fix cites are
+//! decided by content in integers and signed site records, and the feasibility screen is exact
+//! integer arithmetic on raw counters; the floating-point decisions (a pair's weights, jumps,
+//! noise, rates, the outlier rule) are stated with their constants, and the verifiers allow
+//! stated bands.
 //!
 //! # What verification means
 //!
-//! The protocol's rule is optimality within tolerance, not bytes (and the same for a provisional
-//! solution, § Provisional solutions): a published model is honest
-//! when, rebuilt from its cited raw, it is an optimum of its own inputs within the model
-//! verifier's tolerance and passes its other checks (§ Verifying a model); a solution is honest
-//! when it is the optimum of its cited receptions under the model it cites and the tile it cites
-//! is the one the assignment rule gives (§ Verifying a solution). A fault is "this signed model
-//! (or solution) fails verification on its cited raw", and two signed models of one inputs hash
-//! that differ are a fault only because the reference engine is deterministic. Byte identity is
-//! a property of the reference implementation (the same raw, in any order and on any threads,
-//! gives the same bytes, and its tests hold it to that), never what a consumer relies on:
-//! consumers merge by inputs hash, not model bytes. This is what lets an engine choose among
-//! optima-within-tolerance (a warm start would be one) without being in fault; the reference
-//! engine fits cold (a warm start was measured, § The clock model, and did not pay).
+//! The protocol's rule is optimality within tolerance, not bytes: a published pair model is honest
+//! when, rebuilt from the raw its frontiers cite, every pair is an optimum of its own inliers and
+//! the noise and rates the fixed point of the pairs fitted under them, each within the model
+//! verifier's tolerance, and its other checks pass (§ The pairwise path, verifying a model); a fix
+//! is honest when it cites exactly one verified model for each area its used hearers are in, is
+//! the optimum of the receptions it used on the timeline those models give, and omits none of what
+//! it considered that the outlier rule would keep (§ Verifying a fix). A fault is "this signed
+//! model (or fix) fails verification on its cited raw". Byte identity is a property of the
+//! reference implementation (the same raw, arriving in the same batches, in any order and on any
+//! threads, gives the same bytes, and its tests hold it to that), never what a consumer relies on:
+//! consumers merge by inputs id, not model bytes. This is what lets an engine choose among
+//! optima-within-tolerance without being in fault: the reference engine seeks each refit's fixed
+//! point from the area's previous model (§ The pairwise path, the fixed point), which a cold fit
+//! would land within tolerance of.
+//!
+//! **Determinism.** The contract between engines and verifiers is "an optimum within tolerance",
+//! exactly as [`verify`] judges it: each pair's Gauss-Newton step at its published knots within
+//! `pair::PAIR_OPTIMALITY_TOLERANCE`, the rates' within `pair::RATE_OPTIMALITY_TOLERANCE`, and
+//! each noise within `verify::NOISE_BAND` of the rule's estimate. Any engine whose models pass is
+//! honest, whatever path it took to them: a warm start, another order of passes, work reused from
+//! an earlier refit. That the same raw in the same batches gives the same bytes is the reference
+//! engine's own property, held by fixed loop orders (every sum over points, pairs and clocks in
+//! one canonical order, no fused multiply-add, no choice of instructions at run time, `libm`'s
+//! transcendental functions); no consumer relies on it.
+//!
+//! What one holder can judge is what it holds. A holder missing a batch at or below a model's
+//! frontier cannot rebuild its inputs and says so ([`verify::PairModelFailure::Unjudged`], never a
+//! failure); a fix is judged only on what it considered, so an engine that solved before a
+//! reception arrived is never convicted for leaving it out.
 //!
 //! # Units and identities
 //!
@@ -46,150 +72,169 @@
 //!   bits and nanoseconds in the lower 30, made linear as nanoseconds of the day (a count is
 //!   1000 ps). `Unknown` and `Other` are never used. Within one fit, a GPS epoch whose stamps span
 //!   more than half a day crossed midnight, and its stamps before noon move forward a day; a
-//!   lookup through a model moves a stamp by whole days to within half a day of the epoch's first
-//!   piece's knot 0.
+//!   lookup through a model moves a stamp by whole days to within half a day of its clock's
+//!   lowest count in the model.
 //! - Receivers: a site whose declared precision is above 30 m, whose clock is unknown, or which is
 //!   described twice takes no part. Its antenna is converted to ECEF (WGS84) and rounded to whole
 //!   millimetres; that rounded position is used by everything after. Its precision `p` adds
 //!   `(p / sqrt 3)^2` to each reception's variance.
 //!
-//! # Holding raw ([`held`])
+//! # Holding raw ([`arrived`])
 //!
-//! - **What is held** is decided by the message alone: the Mode S replies MLAT solves (DF0, 4, 5,
-//!   11, 16, 20, 21 with an address), and of DF17/18 only what syncs clocks (an airborne position
-//!   with an altitude) or gives a sync position its prior (an operational status with a NACp).
-//!   Identification, velocity, surface positions, Mode A/C and UAT are never held.
-//! - An observation is held once per bin, by identity; of copies, the earliest batch wall clock.
-//!   While its bin is open it is 28 bytes in its receiver's own list (the message inline, chunks
-//!   that are never copied), so raw split by receiver has independent owners. Sealed, it is 24
-//!   bytes (counter and milliseconds into its bin in one word, receiver, epoch and message as
-//!   indices into the bin's tables), and a message's bytes and hash are held once per bin.
-//!   Measured at world scale, with the bin's index, 30 to 35 bytes an observation, every byte
-//!   counted as allocated.
-//! - A bin is open until its raw is complete, then sealed: each receiver's raw sorted on its own,
-//!   in parallel, the messages gathered once, the receivers merged in key order, then
-//!   deduplicated, thinned, and indexed once (per address its records; the sync candidates, a
-//!   position with an altitude heard by two or more, by message hash; per receiver its
-//!   candidates and whether it is sync-active; per address its status messages; the aircraft
-//!   heard with ADS-B). Any split of a bin's raw by receiver seals to the same bytes, on any
-//!   number of threads (`Bin::seal_from`). A window is assembled from its sealed bins without a
-//!   copy, and every reader of a holder's raw shares its sealed bins (`SealedBins`).
-//! - **Ingest thinning at sealing**, the same for every holder: each receiver keeps its
-//!   `SYNC_PER_RECEIVER = 32` lowest-hash sync candidates of the bin (more than any tile keeps of
-//!   it there: ten, and one with each partner); a reply of an aircraft heard with ADS-B in the bin
-//!   is dropped (it is no MLAT target), unless the aircraft is in the calibration sample (the
-//!   first byte of BLAKE2s-256 over `"tally calibration sample" 0x00`, address and bin, below
-//!   256 / 16: one in sixteen), whose receptions are all kept; status is kept. And no receiver
-//!   keeps more than `KEPT_PER_RECEIVER_BIN = 1500` records of a bin (`KEPT_CEILING_PER_S = 300`
-//!   a second, twice the measured mean): its sync, status and sample records first, then its
-//!   replies, each lowest message hash first, so a busy receiver loses its highest-hash replies,
-//!   the same ones on every holder.
-//! - Memory is bounded, and refusal is whole: a receiver's raw of a bin beyond its share, or
-//!   beyond the bytes held, is refused entire and counted, never partly by arrival order
-//!   (`Limits`); what one receiver costs is `Rates::cost`, for admission to reserve: its sealed
-//!   raw at the kept ceiling, so a holder sized for its receivers never refuses one whole at a
-//!   seal.
+//! One pool ([`Arrived`]) for every receiver a holder takes raw of, held in one-second slices of
+//! signed wall clock, with each receiver's frontier of batches and the transmissions still
+//! settling. One implementation for every holder (an engine solving, a relay judging a model or a
+//! fix it holds the raw of), so two holders of the same batches hold the same receptions and
+//! rebuild the same inputs.
 //!
-//! # Windows and the stride ([`scope`])
+//! - **What is held** is decided by the message and its own batch alone: the Mode S replies MLAT
+//!   solves (DF0, 4, 5, 11, 16, 20, 21 with an address), and of DF17/18 only what syncs clocks (an
+//!   airborne position with an altitude) or gives a sync position its prior (an operational status
+//!   with a NACp), each by its threshold (§ Thinning). Identification, velocity, surface
+//!   positions, Mode A/C and UAT are never held. A reply of an aircraft its own batch carries an
+//!   ADS-B position of is dropped (it is no MLAT target), unless the aircraft is in the
+//!   calibration sample ([`arrived::sampled`]: the first byte of BLAKE2s-256 over `"tally
+//!   calibration sample" 0x00`, the address and the five-second sample period, below 256 / 16).
+//!   Nothing a later batch, another receiver or the arrival order says changes what one batch
+//!   keeps, so a holder of more batches holds a superset of what a holder of fewer holds.
+//! - An observation is held once, by identity; of copies, the earliest batch wall clock. A
+//!   reception is 16 bytes in its slice, its message an index into the slice's messages, each held
+//!   once with its hash.
+//! - **Frontiers** ([`Frontier`]): per receiver, its newest boot's batches held with no gap from
+//!   the first this holder took of the boot, through the highest sequence so held. A batch above a
+//!   gap is held but cited by no model until the gap fills, or until nothing the gap held could be
+//!   in any window ([`HELD_MS`]), when it is passed.
+//! - **Bounded, whole**: one pool of bytes for every receiver, and a cap on what one receiver
+//!   holds in a slice. A batch beyond either is refused whole and counted, never trimmed by rank;
+//!   it is a gap in its receiver's frontier like any batch that never came. Every byte reported is
+//!   a capacity actually allocated.
+//! - **Never ahead, never late**: a batch signed more than `MLAT_AHEAD` (7.5 s) past its arrival
+//!   is refused; one signed more than [`HELD_MS`] (a trailing window, `SIGNED_LAG` and a step)
+//!   before it is older than every window, refused, and passes its frontier.
 //!
-//! Wall time is cut into 5 s grid bins; an observation's bin is its batch wall clock (milliseconds)
-//! divided by 5000. Nothing about when anything arrived enters any rule. A transmission's bin is
-//! the bin of the lower median of its receptions' wall clocks. Windows are strided: with `s = 8`
-//! (`STRIDE`) and `ks` the least multiple of `s` at or above a bin, the window
-//! `[ks - 11 - (s - 1), ks + 1]` solves bins `ks - (s - 1)` to `ks`, each with at least eleven
-//! bins (55 s) of history and one after, and each tile is fitted once a window. Measured (a
-//! hundred receivers, a hundred aircraft): per solved bin 21.4 fits and 0.86 s at `s = 1`, 11.0
-//! and 0.45 s at 2, 5.7 and 0.24 s at 4, 2.9 and 0.13 s at 8, coverage 0.958 to 0.963 at every
-//! stride; a final position comes on average 14.5 s, 17, 22 and 32 s after its transmission. At
-//! world scale, at an eighth of the real reception rate, `s = 4` needed 34 cores and `s = 8` 26;
-//! at the real rate `s = 8` needs 41 (RFC-0171 §3.8.1): the baseline takes `s = 8`, and the
-//! provisional stream covers the latency. The engine solves a window when its
-//! own clock has passed the end of the window's last bin and a settling time; that decides only
-//! whether late raw makes it in.
+//! # The trailing window ([`scope::Trailing`])
 //!
-//! # Tiles ([`tile`])
+//! An area's model is fitted at a trailing edge `edge`, Unix milliseconds by the signed wall
+//! clocks of its raw: its inputs are its members' held sync receptions with a wall clock in
+//! `[edge - W, edge]`, `W = budget::TRAILING_WINDOW_MS` (15 s), from each member's batches at or
+//! below its frontier at the edge ([`Arrived::area_inputs`]): the newest batch of its contiguous
+//! run holding a reception signed at or before the edge, so nothing that arrived after the edge's
+//! raw is cited. The edges are one grid for every relay: the newest multiple of `REFIT_EVERY`
+//! (2 s) at least `budget::FIT_LAG` (2 s) below the engine's clock ([`Trailing::fitted_at`]), by
+//! when every honest receiver's raw of the edge whose signed clock is on the relay's has arrived.
+//! The engine refits every area it owns at every edge of the grid, warm, and solves each step
+//! (1 s) under the newest edge's models. So a model's inputs are a function of its area, its edge
+//! and the raw alone: two relays holding the same batches fit the same inputs at the same edge,
+//! whatever order or delay they arrived in, and its frontiers say exactly which, so a verifier
+//! holding those batches rebuilds the same inputs whenever it got them ([`Arrived::rebuild`]); and
+//! the models of neighbouring areas, fitted by other relays, share the edges a fix citing several
+//! of them needs. A feeder lagging the relay's clock by more than `FIT_LAG` may be cited
+//! differently by two relays, never wrongly.
 //!
-//! Four levels `l = 0..3` of footprint radius `R` = 50, 100, 200, 400 km. A tile is a level and an
-//! integer ECEF cube of edge `R / 2` (millimetres; its centre is the cube's, whole millimetres);
-//! its footprint is every usable receiver whose millimetre site is within `R` plus half the cube's
-//! diagonal (rounded up by integer square root) of the centre, by exact integer squared distance.
-//! Its members in a window: the footprint's sync-active receivers (a reception of a sync
-//! candidate in a bin of the window), all of them when at most `M = 48`, else `M` by
-//! farthest-point selection on the millimetre sites (the candidate whose squared distance to the
-//! nearest chosen is largest, ties to the lowest key; the first, the lowest key). Members depend
-//! on site descriptions and the window's sync material only, never on one aircraft. The gauge and
-//! the clocks' component are per tile (§ The clock model, the component holding the most
-//! members).
+//! A set of receptions of the same bytes is due `FIX_SETTLE` (1.1 s) after its first arrived, and
+//! again at each seal after more of them arrive (within `arrived::JOIN_MS` of the first), with
+//! every reception of them that had arrived by then ([`Arrived::due`], [`Considered`]); the models
+//! split it into transmissions ([`publish::transmissions`]), of which one an aircraft a slot is
+//! solved (§ Solving, how many), and again only when its considered set grew since its last fix
+//! ([`publish::solve_transmission`]'s `published`): its fix considers all the earlier one did and
+//! supersedes it ([`standing`]), while one that did not grow is not solved again, since a fix of
+//! the same set under newer models supersedes nothing. A reception arriving after a take is not
+//! part of that take's fixes, and none of them is judged on it.
 //!
-//! # Assignment ([`scope::WindowIndex::assign`])
+//! # Areas ([`area`])
 //!
-//! An aircraft's hearers in a window are the usable receivers with a reception of a message
-//! naming it. At each level, its tile is the one whose cube contains the coordinate-wise lower
-//! median of its hearers' millimetre sites; of the four, it is assigned the one with the most
-//! hearers among its members, ties to the lower level. Its scope is its hearers among the tile's
-//! members. Integer only. A verifier recomputes it (§ Verifying a solution): an engine cannot
-//! choose a convenient tile.
+//! The unit of fitting, publishing and citing is the RFC-0174 area: an H3 cell at
+//! `tally_wire::rendezvous::AREA_RESOLUTION` (3). Each rule here is a function of signed site
+//! records and of a fix's own hearers alone, so every holder of the same records decides it the
+//! same.
 //!
-//! # Targets ([`scope::WindowIndex::addresses`], [`scope::chosen`])
+//! - **A receiver's area** ([`area::of`]) is its public cell's area, never the area its site lies
+//!   in (H3 cells do not nest exactly, and the two can differ).
+//! - **An area's members** ([`Sites::members`]) are its usable receivers and every receiver one of
+//!   them keeps as a pair's other end (§ The pairwise path, the network): every receiver within
+//!   `pair::PAIR_BASELINE_MM` (600 km) of the area's own that is among their nearest. Never a
+//!   function of whose raw arrived. A boundary receiver is kept by receivers of each area beside
+//!   it, so it is a member of each, and its clock may be published by two models (or more); its
+//!   area's model is still the one that publishes its pairs to its own area's receivers, and a
+//!   reader takes it from one by the rule below. The 600 km band is the raw band a relay holds
+//!   for an area: every cell that could hold a point within the baseline of a point of the area
+//!   (`tally_mlat::area`), so it holds every member's raw.
+//! - **What a model publishes** ([`pair::Network::of_area`]): only the pairs with an end in its
+//!   area. A pair whose ends are in two areas is published by both models, each fitting it from
+//!   the same raw, and read from one by the rule below.
+//! - **Who solves a transmission**: the relays of the area most of its hearers are in, ties to
+//!   the lowest area (`tally_mlat::area::owner`). It is the engine's division of work, not part of
+//!   what a fix is.
+//! - **The models a fix cites** ([`pair::Models`], `tally_wire::Fix::models`): one verified model
+//!   of each area its used hearers are in, every one at one edge, and no other, listed by id
+//!   strictly ascending. A verifier refuses a fix whose list misses one or has an extra
+//!   ([`verify::Failure::Area`]), or whose models are not the ones it lists
+//!   ([`verify::Failure::Models`]). The engine solves a set under the models of every area its
+//!   hearers are in at the newest edge where it holds all of them (else the owner's newest edge,
+//!   with what it holds there), then again under only its used hearers' areas' models while those
+//!   are fewer, until the areas it used are the areas it was solved by; a fix that used a hearer
+//!   of an area with no model held is not published ([`Unpublished::Unheld`]). A fix is never
+//!   carried further past its models' edge than [`MAX_CARRY_PS`] (`budget::MAX_CARRY`, 14.6 s).
+//! - **Reading several models as one** ([`pair::Models`]): a clock is read from the model that
+//!   best informs its noise (one that identifies it, then the most information, then its own
+//!   area's, then the lowest area), and a pair from the model of its lower end's area when that
+//!   model is cited and publishes it, else its upper end's.
+//! - **Dating** (§ The pairwise path, the adjustment): a fix's timeline is dated by its reference
+//!   clock: a GNSS-disciplined one by its reading on the UTC day its batch's wall clock is in, a
+//!   free-running one by its model's `heard_ns` (the latest its lowest count in the window can
+//!   have been heard, by the wall clocks of the batches that carried it) and its nominal time
+//!   since. So two models publishing one clock date it alike when their windows are alike, and a
+//!   reception's own batch wall clock never moves a free-running fix.
 //!
-//! A window solves an aircraft heard (not by an ADS-B position) in a bin it solves when no ADS-B
-//! position of it is anywhere in the window, or when it is in that bin's calibration sample (one
-//! in sixteen ADS-B aircraft, solved from its replies so the published covariance can be measured
-//! against its own GNSS position). Its ADS-B positions are never solved; they sync the clocks.
-//! Of its transmissions in each solved bin, at most five (about one a second) are solved, the
-//! lowest by rank (BLAKE2s-256 over `"tally transmission rank" 0x00` and the identity of its
-//! lowest-identity reception).
+//! Measured over the sweep's world density (`pair_tests`, 120 receivers in 12 areas, 60 s,
+//! 2026-10-26): a receiver is a member of 5.84 areas' models on average; a published fix cites
+//! 8.04 areas, and its models hold 0.983 of the network's pairs among its used hearers; 714
+//! considered sets had a hearer's area with no model held and were not solved.
 //!
-//! # Thinning ([`scope::WindowIndex::inputs`])
+//! # Thinning ([`threshold`])
 //!
 //! Sync events are massively redundant: a window holds thousands, and what they say about the
-//! clocks saturates long before. A tile keeps a canonical subset, the same for every engine and
-//! verifier holding the same raw:
+//! clocks saturates long before. What is kept is decided by hash thresholds, each a function of
+//! one batch or one message alone, the same for every engine and verifier holding the same
+//! batches, so a holder of more batches keeps a superset (`Threshold::keeps`: the first eight bytes
+//! of a BLAKE2s-256 key, big-endian, below the threshold's rate of 2^64):
 //!
-//! 1. Candidates: per bin, the sealed bin's sync candidates (after ingest thinning) that two or
-//!    more members heard, each with the members' receptions of it. A message any receiver (member
-//!    or not) heard more than once in the window, in one bin or across bins, is no candidate in
-//!    any bin: its bytes were sent more than once (an aircraft repeating a position byte for byte,
-//!    a replay), and which reception is of which transmission cannot be told, so an event of it
-//!    would mix receptions seconds apart. Judged over every receiver's records before any tile
-//!    thins, so every tile and engine rejects the same messages.
-//! 2. Sync aircraft: of the candidates' aircraft, at most `A_max = 16`, the lowest by rank
-//!    (BLAKE2s-256 over `"tally sync aircraft rank" 0x00`, the address and the window's first and
-//!    last bins); only their candidates are kept. Measured (100 receivers, 60 ADS-B and 40 Mode S
-//!    aircraft, before the stride): coverage 0.964 at 8 for a median error of 52.6 m (too few
-//!    aircraft: overstated and imprecise), 0.946 and 36.1 m at 16, 0.949 and 33.6 m at 32, 0.953
-//!    and 36.1 m with no cap, for 20, 31, 45 and 49 s of work. 16 is the least that keeps the
-//!    precision of no cap, at about three fifths of its cost: the cap bounds the fit's dense border
-//!    (three biases per sync aircraft), whatever the traffic.
-//! 3. In each bin, in rank order (ascending message hash), a candidate is kept when one of its
-//!    members has kept fewer than `K = 10` there, or one pair of them fewer than `P = 1`
-//!    together; keeping it counts it for every member and pair in it. (`K` was measured with
-//!    per-aircraft scopes in version 2: with every event a fit took about 1 s, at 10 about 50 ms,
-//!    for coverage within the simulator's sampling noise of every event's.) The pair rule keeps
-//!    every two members that hear one aircraft tied in every bin.
+//! 1. Reference aircraft ([`threshold::reference`]): an aircraft's sync events are all kept when
+//!    its key (over `"tally sync aircraft" 0x00` and its address) is below `REFERENCE_KEEP`, and
+//!    none otherwise. `REFERENCE_KEEP` keeps every aircraft heard with ADS-B. It stays a
+//!    threshold, so a holder of fewer batches keeps a subset.
+//! 2. A batch of one receiver carrying `c` of its reference aircraft's sync receptions keeps each
+//!    at the rate `min(1, REFERENCE_EVENTS_PER_BATCH / c)` by its message's key
+//!    ([`threshold::batch_sync_keep`]), so a busy batch keeps about `REFERENCE_EVENTS_PER_BATCH`
+//!    and never falls off a cliff at one event more; and every reply when it carries at most
+//!    `REPLIES_PER_BATCH`, else those below `KEPT_KEEP`. Status of a reference aircraft is kept.
+//! 3. An area's inputs ([`Arrived::area_inputs`]) are, of its members' kept sync receptions in the
+//!    window, deduplicated by identity, every event two or more members heard, with every member's
+//!    reception of it; and every member reception in the window of an operational status message
+//!    of a kept event's aircraft, which give the events' priors.
 //!
-//! The model's inputs, cited together as a [`scope::Citation`], are the sync material: the
-//! members' receptions of the kept events, and of each distinct ADS-B operational status message
-//! of a kept event's aircraft its lowest-identity member reception in the window, which give the
-//! events' priors. The citation is the count and BLAKE2s-256 over `"tally clock model inputs"
-//! 0x00` and each distinct (identity, wall clock) in order as receiver key, epoch (4), counter (6),
-//! message hash (32) and wall clock (8), big-endian. A solution cites its aircraft's receptions
-//! in the window (every usable receiver's, which chose its tile) the same way.
+//! The inputs are cited together as a [`scope::Citation`]: their count, and BLAKE2s-256 over
+//! `"tally clock model inputs" 0x00` and each part of a cited batch they are read from (its kept
+//! sync and status receptions of one slice of signed wall clock, one with none left out; each
+//! member's in the frontier's order, a member's by sequence, then slice) as receiver key (32),
+//! boot (8), sequence (8), slice (8) and the part's digest (32), big-endian
+//! ([`scope::Part`]). A part's digest is BLAKE2s-256 over `"tally sync part" 0x00` and each of its
+//! receptions as epoch (4), counter (6), message hash (32) and milliseconds into the slice (2),
+//! big-endian, ascending by those bytes: a function of the batch's receptions alone, whatever
+//! order it carries them in, so a holder computes it once, as the batch arrives, however many
+//! windows and areas read it. The inputs are a function of the
+//! cited parts (and the window, the members and the frontiers the model states), so two holders
+//! citing the same hash hold the same inputs.
 //!
-//! **Honesty rests on measured calibration**, not on an argument. A tile's fit leaves out
-//! receivers and events, and it might be thought that a subset only enlarges the posterior, so a
-//! scoped fit is never overconfident. That holds for a fixed model with known noise; here each
-//! clock's noise and the robust weights are estimated from the subset itself, so a subset can
-//! understate them (a noise estimate from a few dozen receptions is low as often as high). What
-//! the published covariance is worth is what the simulator measures (§ The clock model, the noise
-//! margin; the calibration tests: single, by level, by altitude band, at the tile's edge, and
-//! jointly for solutions sharing a tile), and what a calibration against real receivers' truth
-//! shows (RFC-0171 §3.8.1, `tally-mlat-calibrate` over OpenSky's LocaRDS: the truth there, each
-//! aircraft's own ADS-B position, is itself off by tens of metres, so it bounds what can be said).
+//! **Honesty rests on measured calibration**, not on an argument. Each clock's noise and the
+//! robust weights are estimated from the window itself, so they can be understated (a noise
+//! estimate from a few dozen points is low as often as high). What the published covariance is
+//! worth is what the simulator measures (the pairwise sweep's coverage, `pair_tests`), and what a
+//! calibration against real receivers' truth shows (RFC-0171 §3.8.1, `tally-mlat-calibrate` over
+//! OpenSky's LocaRDS: the truth there, each aircraft's own ADS-B position, is itself off by tens
+//! of metres, so it bounds what can be said).
 //!
-//! # The clock model ([`sync::fit`])
-//!
-//! ## Sync events
+//! # Sync events
 //!
 //! 1. The sync material (§ Thinning) is deduplicated by identity.
 //! 2. A sync message is a DF17/18 with an address, a zero CRC residual, an airborne position
@@ -198,200 +243,88 @@
 //!    address, every pair of an even and an odd message whose linear counts are at most 10 s apart
 //!    is a candidate `(even bytes, odd bytes, odd is later)`; candidates are tried in ascending
 //!    lexicographic order and the first that decodes globally ([`modes::cpr_global`]) is the
-//!    reference.
+//!    reference. The reference only picks the zone a local decode lands in: any reference within
+//!    the local decode's reach gives every message the same position to the bit, so which pair the
+//!    window happens to hold changes no prior
+//!    (`sync::tests::the_cpr_reference_chosen_cannot_change_a_decoded_position`).
 //! 4. Each distinct sync message is decoded locally ([`modes::cpr_local`]) against its address's
 //!    reference, and dropped if it lands more than 100 km from it. Its height is the reported
 //!    altitude in metres.
-//! 5. A GNSS position's error is nearly constant over a minute, so a sync aircraft's reported
-//!    positions share one horizontal bias, east and north, one pair of parameters per address
-//!    with the prior `max(EPU(NACp) / 2.448, 5 m)` per axis (NACp being the smallest seen in the
-//!    window in an operational status (TC 31) of the address, else `max(Rc(TC) / 2.448, 5 m)` with
-//!    the containment radius of the type code taken at its worst; of an address's messages, the
-//!    widest). A message whose prior would exceed 100 m is not used. Each message's own
-//!    horizontal prior is 3 m per axis about the decoded position plus the bias (GNSS noise, the
-//!    CPR resolution, latency). Taking the declared accuracy as each message's own independent
-//!    error instead would average a constant error away and understate the clocks' uncertainty.
-//! 6. Its vertical prior is 15 m about the reported altitude plus the aircraft's vertical bias,
-//!    one parameter per address and altitude kind: 100 m for a barometric altitude (pressure
-//!    against height), 1.5 times the horizontal prior for a GNSS height.
-//! 7. An event is a sync message with its receptions; a reception by a receiver more than 600 km
-//!    from the prior is dropped; an event in which one receiver key appears twice is dropped; an
-//!    event needs two receptions.
+//! 5. A message's prior is its decoded position at its reported altitude. It is used only when its
+//!    declared accuracy is good enough: `max(EPU(NACp) / 2.448, 5 m)` per horizontal axis at most
+//!    100 m, NACp being the one in force at the message: of the operational status (TC 31)
+//!    receptions of the address on the clocks that heard the message, the latest at or before one
+//!    of its receptions on the same clock, nearest in that clock's nominal time, else the earliest
+//!    after, nearest, of equals the lower value (each clock's counts are compared with its own
+//!    only, so a message's prior is fixed by what was heard around it, whatever else the window
+//!    holds); with none, the containment radius of its type code taken at its worst. An aircraft's
+//!    GNSS error is nearly constant over a minute, so what its position bias adds to a pair is
+//!    measured, not assumed: each pair's between-aircraft inflation (§ The pairwise path,
+//!    inflation).
+//! 6. An event is a sync message with its receptions; a reception by a receiver more than 600 km
+//!    from the prior is dropped, and an event needs two receptions. A clock that heard the event
+//!    twice (the same bytes again, a repeat or a replay) is left out of it.
 //!
-//! ## Clocks, the gauge and the knots
+//! # Clocks
 //!
-//! A clock ([`clock::ClockKey`]) is (receiver, counter epoch, piece), the piece counting the
-//! declared jumps before it. Clocks are connected when they share an event. The fit takes the
-//! connected component holding the most members of the tile, ties to the component whose lowest
-//! clock key is lowest. Its gauge is its lowest-keyed GNSS-disciplined clock, else its
-//! lowest-keyed clock. The gauge's anchor is its earliest sync reception's linear count.
+//! A clock ([`clock::ClockKey`]) is (receiver, counter epoch): a counter jump inside the epoch is a
+//! jump of the one clock (§ The pairwise path, jumps), never a new clock. A clock's timing noise
+//! starts at its timebase's default (`Timebase::default_noise_s`, 500 ns for any clock, whatever it
+//! declares, until its pairs estimate it), and is held to `Timebase::noise_ceiling_s`
+//! (`sync::GAUGE_NOISE_MOST_S`, 5 µs). A GNSS declaration is the feeder's word, not a measurement:
+//! nothing ties a GNSS-disciplined clock to another's stamps, and its discipline shows only as its
+//! timebase's tighter curvature and rate prior. Over real receivers (LocaRDS, RFC-0171 §3.8.1) a
+//! GRX1090 stamps 120.6 µs after a Radarcape (the end of a long message, not its start), and some
+//! Radarcapes declaring GPS run without a lock (one 0.7 s off and drifting 0.09 ppm, three with
+//! stamps jittering by hundreds of microseconds).
 //!
-//! Every clock's knot 0 (its `base`) is the gauge's anchor mapped into its counts: the gauge's is
-//! the anchor; then, repeatedly, the unmapped clock of lowest key that shares an event with a
-//! mapped one takes it from the mapped one it shares most events with (ties to the lowest key), as
-//! the lower median over their shared events of `x_j - counts_j(elapsed_i(x_i - base_i))` (each
-//! clock's linear count, integers). Knot `k` of a clock sits at `base + k` 5 s of its nominal
-//! counts; its knots run from the interval of its earliest to one past the interval of its
-//! latest sync reception. A clock's offset (from the gauge) is continuous and piecewise linear
-//! between its knots: model time at linear count `x` is `e + o_k + (o_{k+1} - o_k) u / 5 s`,
-//! `e` the nominal picoseconds since knot 0, `k = floor(e / 5 s)`, `u = e - 5 s k`. The gauge's
-//! offsets are zero, and that time `t` (the gauge's nominal time from its anchor) is made model
-//! time by one more parameter, the gauge's rate `r`: model time is `t (1 + r)`. A free-running
-//! gauge's counter is off its nominal frequency (tens of ppm); without `r` every time difference
-//! under the model would carry that error (30 ppm of a 2 ms spread is 60 ns, 18 m). It is seen
-//! through the sync ranges: an event's arrival differences are known distances. Because the
-//! offset is continuous, so is its uncertainty: there is no step at a knot.
+//! **Curvature.** Every clock wanders as an integrated random walk whose second difference over
+//! consecutive knots `KNOT_PS` (5 s) apart has standard deviation
+//! `sqrt((rate noise x 5 s)^2 + 2 phase noise^2)` (rate 0.005 ppm and phase 10 ns per interval for
+//! 12 MHz, 0.0005 ppm and 5 ns for GPS: 28.7 ns and 7.5 ns, `Timebase::curvature_sigma_s`).
 //!
-//! An event is used when its receptions on the component's clocks are at least two and their
-//! intervals are within one of each other, so an event couples knots at most two apart.
+//! # Solving ([`solve`])
 //!
-//! ## The least-squares problem
+//! **How many** ([`backoff`]): mlat-server solves an aircraft at most once every 0.7 s
+//! (`RESOLVE_BACKOFF`), and so does this engine, by a rule of the transmissions alone. A
+//! transmission's slot is its aircraft's address and its heard time
+//! ([`pair::Models::heard_unix_ns`]: the Unix time of its reception by its lowest-keyed
+//! GNSS-disciplined hearer's clock, else its lowest-keyed clock's) in whole `backoff::SLOT_MS`
+//! (700 ms) since the Unix epoch; of a slot's transmissions, the one of most distinct receivers
+//! the models locate is solved, ties to the lower message hash, then the lower lowest reception.
+//! A slot is decided at the first step `SLOT_MS` after its earliest candidate fell due (its set's
+//! first arrival and `FIX_SETTLE`): another of the slot was sent within the slot's length of it
+//! and falls due within as much. A transmission not chosen is never solved or verified, and
+//! counted (`tally_mlat`'s `Report::backed_off`); one chosen is solved again once, bigger, once
+//! its raw has come (`arrived::Considered::come_ms`) or as its set closes (its complete fix). mlat-server's early solve when a group has more degrees of
+//! freedom than its last result less the time since depends on the order its results were reached
+//! in, so it is left out. Which transmission is solved is the engine's division of work: a fix is
+//! judged by the models it cites and its own receptions, never by its slot.
 //!
-//! Unknowns: every non-gauge knot's offset; the gauge's rate; every sync aircraft's biases; every
-//! event's transmit time `T` and position `X`. Rows, each weighted by the inverse of its variance:
-//!
-//! - a reception: `t + r (t - t_e) - T - |X - site| / c`, `t` the clock's time and `t_e` the
-//!   nominal time of the event's first reception (so the rate's column is a time difference
-//!   within the event, and `T` absorbs `r t_e` exactly), with the clock's timing noise plus its
-//!   site variance (a clock's noise starts from its residuals' robust scale, and is 500 ns for any
-//!   clock, whatever it declares, until its receptions estimate it);
-//! - an event's position prior: east and north of the decoded position plus the aircraft's
-//!   horizontal bias, and up about the reported altitude plus its vertical bias;
-//! - curvature: every clock, the gauge too, wanders as an integrated random walk whose second
-//!   difference over consecutive knots has standard deviation
-//!   `sqrt((rate noise x 5 s)^2 + 2 phase noise^2)` (rate 0.005 ppm and phase 10 ns per interval
-//!   for 12 MHz, 0.0005 ppm and 5 ns for GPS: 28.7 ns and 7.5 ns). An offset is from the gauge,
-//!   so at each knot the second differences of the offsets there are jointly normal with
-//!   covariance `diag(sigma_j^2) + sigma_gauge^2 1 1ᵀ`, entered by its exact precision
-//!   (Sherman-Morrison);
-//! - each clock's first interval's rate: 0 with 200 ppm; the gauge's rate: 0 with 200 ppm when it
-//!   runs free, 0.001 ppm when it is GNSS-disciplined;
-//! - each bias: 0 with its prior (§ Sync events).
-//!
-//! Nothing ties a GNSS-disciplined clock to the gauge's stamps: its offset and rate are fitted
-//! from the sync events as any clock's are, and its discipline shows only as its timebase's
-//! tighter curvature. A declaration is the feeder's word, not a measurement. Version 3 held every
-//! disciplined clock to the stamp difference with 100 ns and its rate with 0.001 ppm; over real
-//! receivers (LocaRDS, RFC-0171 §3.8.1) a GRX1090 stamps 120.6 µs after a Radarcape (the end of a
-//! long message, not its start), some Radarcapes declaring GPS run without a lock (one 0.7 s off
-//! and drifting 0.09 ppm, three with stamps jittering by hundreds of microseconds), and holding
-//! them to the gauge made half of all fits there singular; when such a receiver was the gauge,
-//! every honest GNSS clock of the tile was held to it.
-//!
-//! It is solved by Gauss-Newton. Each event's four parameters are eliminated by Schur complement;
-//! the reduced system is block-banded: one block per knot (time slice), every clock's offset at
-//! that knot in key order, coupled to the two knots either side, with the gauge's rate and the
-//! biases (rate first, then by address and kind) as a dense border last ([`banded`]). It is
-//! factored by block Cholesky in that order (slices first to last, then the border; a border
-//! eliminated earlier would fill the band; only the lower triangle a factorisation reads is
-//! formed), and the event parameters
-//! are recovered by back-substitution. Covariances are taken from the selected inverse (Takahashi's
-//! recurrence over the factor's pattern: the band and the border), never the full inverse. Every
-//! loop runs in one fixed order, with no fused multiply-add and no choice of instructions at run
-//! time, and the transcendental functions are `libm`'s, so results are identical to the bit on
-//! every platform (a test holds a model's bytes to a committed golden made on x86).
-//!
-//! ## Robustness, jumps and noise
-//!
-//! A round is one robust step and two Huber steps (`k = 3`). The robust step starts from each
-//! event settled on its own at the starting clocks (as a published model's are), takes each
-//! clock's scale as 1.4826 times the median absolute residual of its receptions there (at least
-//! its nominal noise), and weighs every reception as the final steps do against that scale: one
-//! beyond 10 of them carries no weight, so a reception of another transmission of the same bytes
-//! seconds away costs its event, never the fit. Then each clock's reception
-//! residuals in linear-count order are scanned: at every split with at least 5 receptions on each
-//! side (and distinct counts across it), the step is the median of the 5 after minus the median
-//! of the 5 before, in standard deviations of the clock's own robust noise (1.4826 times the
-//! median absolute consecutive difference of its residuals, over the square root of two: a jump
-//! moves one difference only, so a jump cannot hide itself; floored at 10 ns with its site); the
-//! largest, if above 8, is a jump: the epoch is split at the first reception after it into a new
-//! piece, and the fit starts over. Against the nominal noise instead, a dump1090-class clock's
-//! 500 ns would raise false jumps over a window's hundred splits on 48 clocks nearly surely. A
-//! fit declares at most 4 jumps; a fifth drops the clock with the most (this one counted, ties
-//! to the lowest key) from the tile, its jumps with it, and the fit goes on without it: one bad
-//! receiver costs the tile that receiver, never the tile. Dropped clocks are published.
-//!
-//! The same holds for a clock nothing places: before each system is factored, a clock other than
-//! the gauge none of whose receptions carries weight in an event whose own parameters are
-//! determined (every one beyond the cut-off, or in events left with none) has a free offset, so
-//! the system is singular. Every such clock is dropped from the tile (its whole epoch, as for
-//! jumps), its jumps with it, and the fit starts over; each pass drops at least one, so it ends.
-//! Over real receivers this is a receiver whose stamps agree with nothing (OpenSky's data has
-//! several), or one left with no event usable against the rest.
-//!
-//! And a group: two clocks are joined when both carry weight in one such event (an event's
-//! transmit time absorbs any level its receptions share, so a reception alone with weight in its
-//! event places nothing). When robust weights split the clocks into more than one joined group,
-//! each group but one has its level free against the gauge, and every clock of each such group
-//! is dropped as above (`FitError::Disconnected`, distinct from `FitError::Uninformed`, and never
-//! `FitError::Singular`): the group kept is the one holding the most receivers, ties to the
-//! gauge's, then to the one whose lowest clock key is lowest; when the gauge's group is not kept,
-//! the next pass takes its gauge from what is left.
-//!
-//! Then the noise: each clock starts from its residuals' robust scale (1.4826 times their median
-//! absolute value), then rounds of a final-weighted step and an estimate, at least two, until no
-//! clock's estimate moves by more than 5%, at most three: each clock with at least 20 receptions
-//! of weight above zero (weights 1 to 3 sigma, `3 / z` to 10 sigma, 0 beyond) gets
-//! `sum r^2 / sum (1 - h)` over them, `h` the reception's exact leverage in that step (through
-//! the event's own block and the selected inverse), less its site variance, floored at 10 ns,
-//! and raised by half its standard error (the variance times `1 + 0.5 sqrt(2 / sum (1 - h))`: an
-//! estimate from a few dozen receptions is low as often as high, and a low one makes every
-//! solution through it overconfident; measured, none left coverage at 0.936, a whole standard
-//! error 0.967, half 0.953). Then final steps: at least two, until one moves the estimate by at
-//! most 10^-6 squared standard deviations (its squared Mahalanobis length), at most twelve. The
-//! scan is made again at the final estimate: a jump there is split too and the fit starts over.
-//! The published (rounded) model's events are then settled from their priors as a verifier will
-//! (§ Output), and while the step there is not negligible the final steps go on from it (at most
-//! three times). The scan is made a last time there, at the estimate a verifier scans: a jump only
-//! the settled events show (a clock whose stamps are noise can) is split and the fit starts over.
-//! And where the noise the rule estimates at the published estimate is more than
-//! 12.5% above a clock's published noise, the noise is taken from there and the final steps run
-//! again (at most twice). The step at the published estimate is the model's calibration: its
-//! factor's selected inverse is what solving under it needs, so an engine never forms it again.
-//! Each pass starts from the event priors and zero clocks; each step from where the last ended.
-//!
-//! ## Output
-//!
-//! A [`ClockModel`]: the tile, the window, the members as their receivers signed their sites,
-//! the input citation, the gauge, the origin, per clock its timebase, piece boundaries, site,
-//! noise, knot 0 and knots, each knot's offset rounded to the picosecond; the gauge's rate in
-//! parts per 10^15; each bias rounded to the millimetre; the jumps; the dropped clocks. [`ClockModel::time`] applies the rate in
-//! integers: `t + floor(t r / 10^15)`. No covariance: whoever solves under the model forms the normal
-//! equations once at its estimate from the raw it cites ([`sync::calibrate`]) and takes the
-//! covariance from their factorisation. Each event's transmit time and position there are its own
-//! optimum with the clocks and biases held: from its prior position and the lower median of its
-//! receptions' model times less their ranges, three Huber-weighted and eight final-weighted
-//! Gauss-Newton steps of its four parameters.
-//!
-//! Model time zero is a Unix time (`origin`), from the wall clock of the gauge's anchor: the least,
-//! over the receptions of the gauge's clock (its piece) the inputs cite, of its batch's wall clock (milliseconds,
-//! as nanoseconds) less the gauge's nominal time from the anchor to it (a batch is signed after
-//! what it carries, so this is the latest the anchor can have been heard). For a GNSS-disciplined
-//! gauge, model time zero is its anchor (nanoseconds of the UTC day) on the day that lies within
-//! half a day of that wall clock; for a free-running gauge, that wall clock itself.
-//!
-//! # Grouping ([`group::group`])
-//!
-//! A reception maps to model time ([`ClockModel::time`]), or to nothing outside its clock's knots.
-//! Receptions are partitioned by message bytes, sorted by (model time, identity), and clustered:
-//! a reception joins the open cluster when it is at most 3 ms after the cluster's first. A cluster
-//! in which a receiver appears twice is ambiguous and not solved.
-//!
-//! # Solving ([`solve::solve`])
+//! **The cap**: a transmission heard by more than `pair::HEARERS_MOST` (32) receivers is solved
+//! from that many ([`pair::Models::capped`]), chosen by their sites alone: the lowest-keyed
+//! receiver with a GNSS-disciplined clock heard (else the lowest keyed), then each time the one
+//! whose nearest chosen receiver is farthest (squared integer millimetres, ties to the lowest key).
+//! Its fix considers every reception of the transmission; it is solved, and judged for omission,
+//! over the capped receivers' alone. 32 is the knee of accuracy against cost at world density
+//! (`pairwise_path_sweep`, seed 9000, 60 s, 2026-10-26): from mlat-server's 15 (`MAX_GROUP`, set
+//! for its Python solver's cost) to 24 to 32 to no cap, the horizontal p50 is 35.0, 27.6, 25.1 and
+//! 21.8 m and the fixes cost 2.207, 2.271, 2.285 and 2.451 ms a feeder-second: up to 32 a metre of
+//! p50 costs about 0.008 ms, past it about 0.05, six times as much, while the p95 stops improving
+//! at 32 (149.9 m either way).
 //!
 //! 1. Screen (integer): a pair is feasible when
 //!    `|t_i - t_j| [ps] * 299792458 <= (baseline [mm] + 10^6) * 10^9`, the baseline being the
 //!    floored integer square root of the squared millimetre difference of the stored sites.
 //!    While a pair is infeasible, remove the reception in the most infeasible pairs, ties to the
 //!    lowest identity.
-//! 2. The measurements are `z_i = c * (t_i - t_min)`; their covariance is each clock's noise plus
-//!    site variance on the diagonal plus `c^2 G Σ Gᵀ`, `G_i` the reception's two interpolation
-//!    weights over its interval's knots and `Σ` the model's covariance (from the selected
-//!    inverse, which holds every pair of knots a transmission's receptions touch): the clock error
-//!    is propagated jointly, never as independent variances, the gauge rate's part with its lever
-//!    `t_i - t_min`. Residuals are whitened by its
-//!    Cholesky factor. The message's own altitude (AC13, or a DF17 airborne position's) is a
-//!    pseudo-measurement of height above the ellipsoid with 100 m (barometric) or 15 m (GNSS).
+//! 2. The measurements are `z_i = c * (t_i - t_min)`, each reception's arrival on the timeline
+//!    the models give (§ The pairwise path, the adjustment); their covariance is each clock's
+//!    within noise plus its site's variance on the diagonal plus `c^2` times the adjustment's
+//!    timing covariance: the clock error is propagated jointly, never as independent variances.
+//!    Residuals are whitened by its Cholesky factor. The
+//!    message's own altitude (AC13, or a DF17 airborne position's) is a pseudo-measurement of
+//!    height above the ellipsoid with 100 m (barometric) or 15 m (GNSS).
 //! 3. Levenberg-Marquardt over (X, T): damping starts at 10^-3 and is multiplied by
 //!    `1 + lambda` on the diagonal; a step that does not raise the cost is taken and the damping
 //!    divided by 10, otherwise multiplied by 10; converged when every component of a taken step
@@ -415,150 +348,315 @@
 //!    exactly), widened by what writing the solution to the wire can add, `(sqrt(q) + r)^2`,
 //!    where `r` bounds the whitened residuals' move under the wire's rounding of position and
 //!    transmit time ([`solve::rounding_norm`], [`solve::ROUNDING_M`]). The solver and the
-//!    verifier evaluate this one limit, and a solution leaves the engine only through
-//!    [`publish::solve_published`], which reads it back from its wire bytes and runs the
-//!    verifier on it: nothing is published that a verifier holding the same raw would refuse.
+//!    verifier evaluate this one limit, and a fix leaves the engine only through
+//!    [`publish::solve_transmission`], which reads it back from its wire bytes and runs the
+//!    verifier on it. Each transmission the models group a due set into (identical bytes sent
+//!    again within seconds are several transmissions, which only the timeline separates) is its
+//!    own fix, considering its own transmission's receptions and citing the models of its used
+//!    hearers' areas (§ Areas). Nothing is published that a verifier holding the same raw would
+//!    refuse.
 //! 6. The covariance of (X, T) is the inverse of the whitened `J^T J` at the solution. The
-//!    published position covariance is its 3x3 ECEF block with its standard deviations times
-//!    1.1, plus 5 m squared on each axis (`solve::ERROR_INFLATION`, `ERROR_FLOOR_M`): the
-//!    simulator calibrates the mathematics without them (the calibration tests strip them), but
-//!    real receivers carry what it does not model (tropospheric delay differences of a metre or
-//!    two between sites, antenna phase centres off their declared sites, multipath), so a fix
-//!    claims a little less than the mathematics alone. The calibration over real receivers
-//!    (RFC-0171 §3.8.1, `tally-mlat-calibrate`) finds the mathematics honest where receivers and
-//!    truth are what they say (0.94 to 0.97) and short with unverified crowdsourced receivers
-//!    (0.895), not uniformly, so it leaves these as they are. A fix whose standard deviation on any axis would exceed 1.5 km is
-//!    not published: there the Gaussian no longer describes the error (a transmission with no
+//!    published position covariance is its 3x3 ECEF block with its standard deviations times 1.1,
+//!    plus 5 m squared on each axis (`solve::ERROR_INFLATION`, `ERROR_FLOOR_M`): the simulator
+//!    calibrates the mathematics without them (the calibration tests strip them), but real
+//!    receivers carry what it does not model (tropospheric delay differences of a metre or two
+//!    between sites, antenna phase centres off their declared sites, multipath), so a fix claims a
+//!    little less than the mathematics alone. The calibration over real receivers (RFC-0171 §3.8.1,
+//!    `tally-mlat-calibrate`) finds the mathematics honest where receivers and truth are what they
+//!    say (0.94 to 0.97) and short with unverified crowdsourced receivers (0.895), not uniformly,
+//!    so it leaves these as they are. A fix whose standard deviation on any axis would exceed 1.5
+//!    km is not published: there the Gaussian no longer describes the error (a transmission with no
 //!    altitude over a flat network leaves the height nearly free; measured, a DF11 6 km below its
 //!    aircraft at 58 squared standard deviations).
 //!
-//! # Verifying a model ([`verify::verify_model`])
+//! # Verifying a fix ([`verify::verify_pair_fix`])
 //!
-//! Given the model and the verifier's own raw, rebuilt into the inputs of the model's tile and
-//! window (its members from the footprint, § Tiles): the tile, window, members (keys and signed
-//! sites) and input citation must be exactly the raw's; the clocks, gauge, knot 0s, knot ranges,
-//! sites and origin must be what the rules above derive (with the model's declared jumps and
-//! dropped clocks); at the model's estimate, the Gauss-Newton step
-//! under the final weights the estimate itself gives (the robust weights' fixed point) must have
-//! squared Mahalanobis length at most 10^-4; no clock's noise may be more than 25% below the
-//! rule's estimate there (understated noise makes every solution under the model overconfident;
-//! overstated only makes them conservative, and is not refused); and no clock's residuals may
-//! step by more than 8.05 of its robust standard deviations where no jump is declared. A model
-//! that passes is calibrated by the same factorisation, which solving and verifying solutions
-//! under it use.
-//!
-//! # Verifying a solution ([`verify::verify`])
-//!
-//! Given the claim, every candidate reception of the message, and the calibrated model: the cited
-//! identities must be sorted, known, exactly inside one regrouped transmission, at least the
-//! minimum, and pass the screen; the chi-square at the claimed (X, T) must pass step 5; the
-//! Gauss-Newton step from the claim must have squared Mahalanobis length at most 10^-4; the
-//! claimed covariance must match the recomputed (published) one within 10^-3 relative
-//! (Frobenius); every cited reception must have `z <= 5.05` and every screened omitted one
-//! `z >= 4.95`. And the tile ([`verify::verify_assignment`]): the solution's addressed citation
-//! must be the verifier's raw's (else it does not hold what chose the tile, and cannot say), and
-//! the assignment rule on that raw must give the model's tile.
+//! Given the wire fix, the receptions of its message the verifier holds, and the verified models it
+//! lists: the models must be the ones it lists (`Failure::Models`) and exactly one of each area its
+//! used hearers are in (`Failure::Area`); its considered and used sets must be sorted, every used
+//! reception within the considered set (`Failure::NotConsidered` otherwise) and known; of what the
+//! verifier holds, only the considered receptions are judged, and a reception outside the
+//! considered set is never judged, whatever the verifier holds; the considered receptions must
+//! regroup to exactly one transmission whole, every used reception must be of a receiver the cap
+//! chooses of it (§ Solving, the cap; `Failure::Uncapped`), and the capped receptions must
+//! normalise keeping every reception it used (§ The pairwise path, grouping and the adjustment);
+//! the used ones must be at least the minimum and pass
+//! the screen; the chi-square at the claimed (X, T) must pass step 5; the Gauss-Newton step from
+//! the claim must have squared Mahalanobis length at most 10^-4; the claimed covariance must match
+//! the recomputed (published) one within 10^-3 relative (Frobenius); every used reception must
+//! have `z <= 5.05` and every screened capped one it left out `z >= 4.95`. Nothing but the
+//! models and the fix's own receptions is read. The grouping, the heard time, the cap and the
+//! normalisation are functions of their receptions as a set, the same in any order (a property
+//! test holds it), so the engine's own check of a fix it solved judges the normalisation it solved
+//! on (`verify::verify_solved`), which the regrouping of its sorted considered set rebuilds
+//! exactly.
 //!
 //! # Publishing ([`publish`])
 //!
-//! The encoding, every integer big-endian:
+//! **A model is relay-only; a client is sent its summary.** A pair model's scope, clocks and
+//! pairs, with the aircraft's published positions, narrow every receiver's site, and a receiver's
+//! exact site is never readable by a client. The site id (`tally_wire::SiteId`) names the
+//! site-bearing record the engine placed the receiver by (its `ReceiverSite`, or an old feeder's
+//! format 1 `ReceiverInfo`) without revealing it, and enters only the inputs id. Beside each model
+//! the engine signs a `tally_wire::ClientClockModel` ([`publish::client_model`], format 2): the
+//! model's id, its inputs id and its trailing window (edge and span), and nothing of its scope or
+//! frontiers. A client is sent that and tagged fixes (`tally_wire::TaggedFix`, positions format 8,
+//! each reception its `ReceptionTag` under the receiver's relay-only `ReceptionKey`); a relay keeps
+//! the models and the raw fixes (format 7), and rematches a tagged fix against the raw it holds
+//! ([`publish::rematch`]). The engine sends each of its own models a fix cites first, then the raw
+//! fixes citing them, then their tagged twins, back to back.
 //!
-//! ```text
-//! tile level u8 | tile cube x, y, z i64 | window first i64 | window last i64
-//! | scope count u16 | count x (key [32], clock u8, site id [32], lat_e7 i32, lon_e7 i32,
-//!                              alt_m i32, precision_m u32)             strictly ascending by key
-//! | input citation hash [32] | count u32
-//! | gauge clock | origin unix ns u64 | gauge rate i64 (parts per 10^15)
-//! | piece count u16 | count x piece                                    strictly ascending by clock
-//! | bias count u16 | count x (address u32, kind u8, bias mm i64)       strictly ascending by
-//!                                                                      (address, kind)
+//! A model's inputs id ([`publish::inputs_id`], carried by the manifest) is BLAKE2s-256 over
+//! `"tally pair model inputs id" 0x00`, the specification version (two bytes) and the encoding's
+//! first part (area, trailing window, each scope entry as key, clock, site id, precision and
+//! frontier, and the input citation): no site. Consumers merge by it, never by model bytes.
 //!
-//! kind = 0 east | 1 north | 2 barometric | 3 GNSS height
-//! | jump count u16 | count x (receiver key [32], epoch u32, at i64, step ps i64)   ascending
-//! | dropped count u16 | count x (receiver key [32], epoch u32)                     ascending
+//! A fix on the wire ([`publish::to_wire_at`], `tally_wire::Fix`) carries its considered set and
+//! its used set (a mask over the considered), the ids of the models it cites, strictly ascending,
+//! its transmit time on the timeline's Unix origin, in Unix picoseconds; latitude and longitude
+//! rounded to 10^-7 degree; height above the ellipsoid rounded to the millimetre; the covariance
+//! rotated to east, north, up at the fix, as binary32. Its identity (`tally_wire::Fix::identity`)
+//! is over its models' ids and its considered set. A verifier rebuilds the claim from it
+//! ([`publish::claim_at`]): position and transmit time read back, the covariance rotated back, the
+//! degrees of freedom from the used count and the message's altitude. Those roundings move the
+//! claim far less than the verifier's tolerances; a nanosecond would not (half of one is 15 cm of
+//! light travel, beyond the optimality bound for a well-observed transmission).
 //!
-//! clock = receiver key [32] | epoch u32 | piece u16
-//! piece = clock | timebase u8 (0 12 MHz, 1 GPS nanoseconds)
-//!       | begins i64 | ends i64 (i64::MIN for none) | site x, y, z i64 mm | site sigma i64 mm
-//!       | noise i64 ps | base i64 | first knot i32 | knot count u16 (>= 2) | count x offset i64 ps
-//! ```
+//! # The pairwise path ([`pair`])
 //!
-//! A reader refuses anything not in this one form, so a model read back encodes to the same
-//! bytes. A tile's model is a few kilobytes (about 2 KB at 10 members, under 15 KB at 48): it
-//! fits its manifest.
-//! The model's inputs id ([`publish::inputs_id`], carried by the manifest) is BLAKE2s-256 over
-//! `"tally clock model inputs id" 0x00`, the specification version (two bytes) and the encoding's
-//! first part (tile to input citation) with each scope entry as key, clock, site id and
-//! precision only: no site. Consumers merge by it, never by model bytes; the
-//! reference engine publishes the same bytes for one inputs id, but two models of one inputs id
-//! that differ are no fault (§ What verification means).
+//! mlat-server's shape (one clock pairing for each two receivers that hear the same aircraft, a fix
+//! normalised over the pairings among its hearers), made bounded and verifiable: each refit fits
+//! every pair of an area in closed form from the window's raw alone, publishes them with every
+//! clock's noise and rate as one model ([`pair::PairModel`], [`pair::fit`]), and a fix cites the
+//! models of its used hearers' areas by their ids (§ Areas). A holder of the window verifies a
+//! model once a refit ([`verify::verify_pair_model`]); a verifier holding the verified models and a
+//! fix's own receptions verifies the fix ([`verify::verify_pair_fix`]), reading no other raw.
+//! Nothing is carried from one refit to the next but where the fixed point is sought from.
 //!
-//! **A model is relay-only; a client is sent its summary** (wire version 3). A scope entry's site,
-//! a piece's `site_mm` and its offsets, with the aircraft's published positions, give every
-//! receiver's site, and a receiver's exact site is never readable by a client. The site id
-//! (`tally_wire::SiteId`) names the site-bearing record the engine placed the receiver by (its
-//! `ReceiverSite`, or an old feeder's format 1 `ReceiverInfo`) without revealing it, and enters
-//! only the inputs id. Beside each model the engine signs a `tally_wire::ClientClockModel`
-//! ([`publish::client_model`]): the model's id, its inputs id and its window, and nothing of its
-//! scope, since a tile's members are chosen by their exact sites (the tile's sphere and the
-//! farthest-point choice) and the tiles a receiver is in, over time, narrow its site. A client is sent
-//! that and tagged solutions (`tally_wire::TaggedSolution`, each reception its `ReceptionTag` under
-//! the receiver's relay-only `ReceptionKey`); a relay keeps the model and the raw solutions, and
-//! rematches a tagged solution against the raw it holds ([`publish::rematch`]).
+//! **The network** ([`pair::Network`]). Which pairs of receivers exist is decided by their site
+//! records alone: each usable receiver keeps its `pair::PAIR_NEIGHBOURS` (40) nearest usable
+//! receivers within `pair::PAIR_BASELINE_MM` (600 km), by exact integer squared distance between
+//! millimetre sites, ties to the lower key, and two receivers are a pair when either keeps the
+//! other. A receiver joining or leaving changes only the pairs of the receivers that count it
+//! among their nearest. The reference engine finds the nearest through cubes of a quarter of the
+//! baseline, searched ring by ring until every site nearer than the ring's reach is in hand, so
+//! building the network costs the neighbourhoods, never every two sites.
 //!
-//! A solution on the wire ([`publish::to_wire`]) carries its transmit time as the origin plus its
-//! model time, in Unix picoseconds; latitude and longitude rounded to 10^-7 degree; height above
-//! the ellipsoid rounded to the millimetre; the covariance rotated to east, north, up at the
-//! solution, as binary32. A verifier rebuilds the claim from it ([`publish::claim`]): position
-//! and transmit time read back, the covariance rotated back, the degrees of freedom from the count
-//! and the message's altitude. Those roundings move the claim far less than the verifier's
-//! tolerances; a nanosecond would not (half of one is 15 cm of light travel, beyond the optimality
-//! bound for a well-observed transmission).
+//! **The window** ([`Arrived::area_inputs`]). Every refit reads one trailing window (§ The trailing
+//! window) of the area's members' sync receptions, each receiver cited through its
+//! frontier, read as the clock model reads its inputs (§ Sync events: the events, their priors,
+//! each receiver's linear counts), with one change: the model names each aircraft's CPR reference
+//! (its address, the BLAKE2s-256 message hashes of the even and the odd position that decode
+//! globally to it, and whether the odd is the later), the one the search of § Sync events, 3
+//! finds. Any reference within the local decode's reach gives every message the same position to
+//! the bit, so a verifier checks only that the named pair was heard by one clock within its pair
+//! window in the order named and decodes globally, and that no address it does not name has a
+//! reference the search would find. A clock that heard an event twice is left out of it. A
+//! clock's lowest linear count over its sync receptions in the window is what a fix's raw is
+//! unwrapped near.
 //!
-//! # Provisional solutions ([`clock::Reach`])
+//! **A pair's points.** Each event gives each pair of its hearers `a < b` (by clock key) one point:
+//! `x` is `a`'s nominal nanoseconds from the pair's anchor less its range from the event's prior
+//! in its own nominal time (`(1 + rho_a) * range / c`), `y` the same for `b` less `x`. The anchor
+//! is the kept point with the lowest `a` count (ties: the lowest `b`), so the anchor, and every
+//! point, is the same in any read of the window. A point weighs `2 / (h (sigma_a^2 + sigma_b^2))`,
+//! `h` the event's hearers, from the pair's two clocks and the raw alone: at equal noise it is
+//! `w_a w_b / W` with `w_k = 1 / sigma_k^2` and `W` the sum over the hearers, and by the identity
+//! `sum_k w_k (t_k - T)^2 = sum_{i<j} w_i w_j / W (t_i - t_j)^2` at the weighted mean transmit time
+//! `T` the pairs of an event together carry a joint fit's information with its transmit time
+//! eliminated. A point's own variance is `sigma_a^2 + sigma_b^2`. The points are ordered, and the
+//! knots placed, by `x` at no rate (`a`'s nominal time less its range), so neither moves with the
+//! rates.
 //!
-//! A final solution is published when its window is (7 to 47 s after its transmission at `s = 8`).
-//! A provisional one is solved about a second after the transmission, under an older model of a
-//! tile holding its receivers, carried past its knots, and is superseded by the final one. It is
-//! the same mathematics with one change, so it is a deterministic function of its model, its
-//! receptions and the spec as a final one is, and is verified and proved faulty the same way:
+//! **A pair's fit**, from its points alone: `y` as a function of `x`, linear between knots
+//! `KNOT_PS` apart from the first point (at most `pair::PAIR_KNOTS_MOST`, 5, over the window), the
+//! second difference of consecutive knots held by the curvature prior `sigma_c^2 = curvature_a^2 +
+//! curvature_b^2` (§ Clocks, curvature), scaled by the points' `sum w / sum 1 / var`
+//! so the prior keeps the pair's own strength. The start is the line through the medians of the
+//! two halves of the points; then `pair::HUBER_PASSES` (3) passes Huber-weighted at
+//! `sync::HUBER_K`, then passes with points past `sync::SYNC_CUTOFF` own standard deviations left
+//! out until the inliers at the knots are the inliers the knots were solved with (at most
+//! `pair::CUTOFF_PASSES_MOST`, 8; a pair that does not settle is not valid). So the published knots
+//! are the optimum of their own inliers under the published noise and rates, which is what a
+//! verifier checks: at the knots, the inliers' normal equations hold within
+//! `pair::PAIR_OPTIMALITY_TOLERANCE` (the Gauss-Newton step's squared Mahalanobis length). Its
+//! covariance is the inverse of that normal matrix; its share is `sum w^2 var / sum w` over its
+//! inliers, what its curve's variance is from its own points alone, under their own variances, as
+//! a multiple of that covariance's (exact for a constant; the weights split an event's information
+//! among its hearers' pairs, so the covariance alone is each pair's part of the network's joint
+//! information, not its own variance). A pair with fewer than `sync::SPAN_RECEPTIONS_LEAST` points
+//! is not valid.
 //!
-//! 1. **Mapping** ([`ClockModel::time_reach`] with [`Reach::Carried`]): a count past the last knot
-//!    `L` of its epoch's last piece (a piece that ends at a jump is never carried), by at most
-//!    `MAX_CARRY_PS = 90 s` of nominal time, takes the piece's last interval `k = L - 1`, and
-//!    model time is that interval's line extended: `t = e + o_k + floor((o_L - o_k) u / 5 s)` with
-//!    `u = e - 5 s k` past 5 s, then the gauge's rate as always. Inside the knots it is `time`
-//!    exactly. 90 s covers the longest a tile's newest model is behind a reception it maps: the
-//!    stride and the window's last bins (45 s at `s = 8`), the settling before the window is
-//!    solved (11.5 s), the ripening before its model is used (15 s), how far a reception may run
-//!    ahead (7.5 s) and a bin of rounding (5 s), 84 s in all (asserted in `tally_mlat::engine`).
-//! 2. **Covariance**: the clock covariance of two receptions is the model's (the last interval's
-//!    two knots' weights, now `1 - f` and `f` with `f > 1`, so the line's slope error grows with
-//!    the carry) plus the curvature prior's integrated random walk past the last knot. With `n`
-//!    knot intervals carried (fractional, `carried / 5 s`) and second differences of standard
-//!    deviation `sigma` (§ The least-squares problem: 28.7 ns for 12 MHz, 7.5 ns for GPS), a
-//!    clock's offset `n` intervals on is off the line by `sum_{j <= n} (n - j + 1) d_j`, so two
-//!    receptions of one clock carried `m <= M` covary by
-//!    `sigma^2 (m (m + 1) (2m + 1) / 6 + (M - m) m (m + 1) / 2)`. An offset is from the gauge,
-//!    whose own walk moves every other clock alike: every pair of receptions on clocks other than
-//!    the gauge adds that term with the gauge's `sigma`, a pair on one clock its own as well, and a
-//!    reception on the gauge nothing.
-//! 3. **Grouping, solving, the floor and inflation and the 1.5 km cap** are as for a final one
-//!    ([`group_reach`], [`solve()`]); a fix whose carried covariance passes 1.5 km a side is not
-//!    published.
-//! 4. **Verifying** ([`verify_reach`] with `Reach::Carried`): as a final solution, against the
-//!    receptions it was solved from (a provisional is solved from what had arrived a second after
-//!    the transmission, so omission is judged among those); no assignment is checked (a
-//!    provisional names none: its engine solves it under the newest model holding the most of its
-//!    receivers). Two signed solutions of one observation set, model and spec, provisional or
-//!    final, that disagree beyond tolerance are a fault: where the model reaches every reception
-//!    both map alike.
+//! **The warm start.** A refit seeks each pair's optimum from the pair's knots in the area's
+//! previous model (when neither of its clocks had a jump there or has one now), read at the present
+//! knots in the present anchors' terms (a point's `x` moves by the move of `a`'s anchor in nominal
+//! time, its `y` by that less `b`'s), and goes straight to the cutoff passes; a later pass of the
+//! fixed point starts each pair from its knots of the last. With no such knots, or when the cutoff
+//! passes from them do not settle or end on a jump, the pair takes the closed-form start above. In
+//! the steady state a pair is one cutoff pass and its check, where the closed-form start is the
+//! medians, three Huber passes and two cutoff passes. What is published is unchanged: a refit from
+//! the previous knots publishes the bytes one from the closed-form start does
+//! (`a_warm_refit_publishes_what_a_cold_refit_publishes`). The points are not carried: a pair's
+//! normal equations are of its points under the present noise and rates, at knots placed from the
+//! window's first point, with the inliers the knots choose, so no sum over them survives the slide
+//! of the window, and each refit forms them again.
 //!
-//! Measured over the simulator (six 170 s scenarios, the default clock mix, each window's models
-//! carried over the replies after it, one an aircraft a second): with the floor and inflation
-//! stripped the truth is inside the 95% ellipsoid for 0.940 carried up to 20 s, 0.947 from 20 to
-//! 45 s and 0.975 from 45 to 90 s (0.956 of 5,076 overall; 0.982 published), for median
-//! horizontal errors of 124, 237 and 468 m. The carry costs precision, not honesty.
+//! **Jumps.** A pair's jump is the largest step in its residuals (in point order) between the
+//! medians of the `sync::JUMP_SIDE` before and after a point, scored against the residuals'
+//! consecutive scatter (`1.4826 * median |r_{i+1} - r_i| / sqrt 2`, at least 10 ns, times the
+//! spread of two medians of five), above `sync::JUMP_THRESHOLD`; it lies on each of its clocks
+//! between the counts of the two points either side. A jump is the clock's when its pairs agree on
+//! its time: each refit starts from no jump at all, fits every pair, and gives a clock whose pairs'
+//! intervals (`(last count before, first count after]` on that clock) are contained, at least
+//! `pair::JUMP_AGREE_LEAST` (2) of them, in one place the first count after of the one most others
+//! contain (ties to the earliest), when it is later than the clock's kept segment's start; that
+//! clock's pairs are fitted again from it, at most `pair::JUMP_ROUNDS_MOST` (4) rounds. The model
+//! publishes each clock's kept segment's start (`from`). A pair with a jump no clock is given is
+//! not valid. A verifier replays the rounds over every candidate pair of a clock with a jump and
+//! every candidate the model does not publish, and must find the same starts and the same pairs.
+//!
+//! **Inflation.** Each aircraft's weighted mean residual in the pair, squared over its own
+//! variance (`sum w^2 var / (sum w)^2`), summed over the aircraft, is the pair's between-aircraft
+//! chi-square on one less than its aircraft; the pooled inflation is every valid pair's chi-square
+//! over every valid pair's degrees of freedom, and a pair's is its own shrunk toward the pooled by
+//! `pair::KAPPA_PRIOR_DOF` (20) degrees of freedom, at least one: what an aircraft's position bias
+//! adds that the points' noise does not.
+//!
+//! **Noise.** Each clock's noise estimate is the weighted least-squares split of its valid pairs'
+//! inlier scatter (`sigma_a^2 + sigma_b^2` against a pair's mean squared inlier residual, weighed
+//! by its degrees of freedom over the square of `sigma_a^2 + sigma_b^2` at the estimate itself:
+//! the variance of a variance, read at the noise it is of and never at the pair's own scatter,
+//! which would weigh a pair the more the less it happened to scatter and bias every clock's noise
+//! low; from each timebase's default noise, weighed again at the last estimate until no clock's
+//! variance moves by more than `1e-9` of itself, at most `pair::NOISE_REWEIGHTS_MOST` (50) times,
+//! so it is a function of the pairs alone), with a weak prior at its
+//! timebase's default noise (a thousandth of a pair's weight), held to `[sync::MIN_NOISE_S,
+//! sync::GAUGE_NOISE_MOST_S]`. Where the split is underdetermined (a component of the pair graph
+//! that is a tree or bipartite), the prior's value decides the free direction, and the estimate is
+//! still the rule's. Two scatters: the whole (what weighs the points and bounds the robust tests,
+//! an aircraft's position bias in), and within each aircraft (each aircraft's mean residual
+//! removed: a reception's own noise, what a fix's receptions carry). A scatter's degrees of
+//! freedom are its inliers' less what the fit took of them, as a weighted least-squares fit's
+//! residual degrees of freedom are counted: the trace of the hat matrix of the knots under the
+//! curvature prior (`sum w b^T N^-1 b` over the inliers), and within each aircraft also the
+//! aircraft means, less what of the knots' fit lies in them (`tr(H M)`, `M` the means'
+//! projector). The within estimate is then read as a fix reads it: times `nu / (nu - 2)`, the
+//! variance of Student's t at the estimate's own degrees of freedom, `nu = sigma^4 / [N^-1]_kk`
+//! of the split's normal matrix `N` (each pair's mean square has variance `2 s^2 / dof`, so the
+//! estimates' covariance is `2 N^-1`), at least `pair::WHITE_DOF_LEAST` (4): an error read
+//! against an estimated variance is covered as one read against the true variance would be.
+//! A verifier refuses a clock whose published noise of either kind is more than
+//! `verify::NOISE_BAND` below the rule's estimate from the published pairs.
+//!
+//! **Rates.** Each clock's absolute rate error `rho_k` is the optimum of one system: a prior of
+//! `pair::GNSS_RATE_SIGMA` on a GNSS-disciplined timebase and `pair::FREE_RATE_SIGMA` on a
+//! free-running one, every valid pair's slope over its span (`rho_b - rho_a`, against its variance
+//! times its inflation), and every valid pair's points' ranges: a rate scales a clock's range
+//! correction, so each pair's weighted sum of squares, its knots profiled out, informs its two
+//! rates (the Schur complement `S = dᵀWd - dᵀWΦ N⁻¹ ΦᵀWd` of its ranges' regressors `d`, over its
+//! inflation, and the gradient reduced by the knots'). That is the gauge rule of a group with no
+//! GNSS-disciplined clock: what fixes its common rate is the sync aircraft's ranges and the
+//! free-running prior, never one clock's say. A verifier checks the rates at their published value
+//! by the Newton step's squared length over the system, at most `pair::RATE_OPTIMALITY_TOLERANCE`
+//! a clock. Each clock's published rate variance is the inverse of its row's diagonal, and its
+//! component's common variance the inverse of the component's `1ᵀ H 1`.
+//!
+//! **The fixed point.** The noise and rates are those the pairs fitted under them give, within the
+//! verifier's tolerance; where the search starts (the area's previous model, or each timebase's
+//! default noise and no rate) is a warm start, never part of the result. The first pass fits every
+//! pair under the starting noise and rates; each later pass fits again only the pairs the last one
+//! moved: those of a clock whose whole noise changed (a point's weight reads only its pair's two
+//! clocks) and those the rates have moved from their optimum, since they were fitted, by more than
+//! a tenth of `pair::PAIR_OPTIMALITY_TOLERANCE` (`Δᵀ (dᵀWd - S) Δ`, the knots' own share of the
+//! ranges); a new jump among them settles every pair again. Each pass takes each clock's noise as
+//! its estimate unless the present one is within `verify::NOISE_BAND / 2` of it either way, and the
+//! rates' Newton step, each pair's range gradient carried from the rates it was fitted at to the
+//! present ones (`+ S Δ`, exact for a quadratic). The pass settles when no clock's whole noise
+//! changed and the stepped rates move no pair further than that tenth. What is then published of
+//! each pair is the verifier's own computation: its points assessed at its knots under the
+//! published noise and rates (inflation, covariance, slope, and the rates' variances from those),
+//! and the jumps and drops replayed exactly as the verifier replays them; a pair that assessment
+//! finds off its optimum or with a jump is fitted again, a replayed decision that differs is taken
+//! (the pairs of a clock whose jump changed fitted again), and the pass repeats, at most
+//! `pair::PASSES_MOST` (6), after which none is published.
+//!
+//! **Solving the clocks' systems.** The noise and the rates are sparse systems over the clocks,
+//! one entry a pair: solved by conjugate gradients in one fixed order, preconditioned by their
+//! diagonal plus each connected component's constant (the common rate a component's slopes cannot
+//! see), to a relative residual of `1e-14`.
+//!
+//! **The model** ([`pair::PairModel`], [`publish::encode_pairs`]). Relay-only: the specification
+//! version; the area (H3 index, eight bytes: a relay routes a model by its first ten bytes,
+//! [`publish::area_of`]); the trailing window; the scope, each member as receiver key, clock, site
+//! id, site and precision, with its frontier; the input citation; the references; the pooled
+//! inflation; each clock (its receiver by its index in the scope and its epoch, lowest count,
+//! `heard_ns`, `from` or none, whole and within noise, rate, rate variance, common variance); each
+//! valid pair (its clocks by index, anchors, first knot's `x`, knots, the upper triangle of their
+//! covariance, slope, slope variance, inflation, share).
+//! Counts are four bytes but the scope's, the clocks' and a pair's clock indices (two), floats
+//! their IEEE 754 bits, every list strictly ascending. What a fix or a check reads as a datum (the
+//! noise, the rates, `x`, the knots, the slope) is double precision; what only weighs (the
+//! inflations, the variances and covariance, the share) is single, rounded once when the model is
+//! assembled, so the engine solves under exactly what it publishes and a single's own rounding (a
+//! relative 2⁻²⁴) sits far inside the verifier's tolerances. Its id, which
+//! fixes cite, is the BLAKE2s-256 of `"tally pair model id" 0x00` and its bytes
+//! ([`publish::pair_model_id`]).
+//!
+//! **Grouping** ([`pair::Models::transmissions`]). A considered set's receptions are mapped to one
+//! clock's time through their direct pair with it (the clock with the most pairs to the set's
+//! others, ties to the lowest key), or, with none, through the lowest-keyed clock of the model with
+//! a pair to both; sorted, and cut where consecutive ones are more than `group::GATE_PS` apart.
+//! Each part is split again by the same rule over its own clocks until every part is its own
+//! split, so a fix's considered set is one the rule returns whole, which the verifier checks.
+//!
+//! **The adjustment** ([`pair::Models::normalise`]). A transmission's hearers are the nodes, every
+//! published pair between two of them an edge. When the hearers split, the lowest-keyed clock that
+//! heard nothing but has pairs into the largest part and into a hearer of another joins as a
+//! bridge, at most `pair::BRIDGES_MOST`; hearers outside the largest part are left out. The
+//! unknowns are each node's reading at the reference's arrival less its reading at its own
+//! (`theta`, nominal nanoseconds), the reference the lowest-keyed GNSS-disciplined clock that heard
+//! it, else the lowest-keyed (`theta = 0`). An edge `a < b` at `a`'s reading `x_a` says `theta_b -
+//! (1 + g'(x_a)) theta_a = x_a + g(x_a) - x_b`, with the variance of `g(x_a)` from the pair's
+//! covariance times its inflation, carried past its last knot along its last interval with the two
+//! clocks' process noise. The weighted least-squares solution gives `theta` and its covariance;
+//! while the worst edge's normalised residual is above `pair::LOOP_Z`, the graph has more edges
+//! than unknowns and leaving it out keeps it connected, the edge is left out (at most
+//! `pair::LOOP_REJECTS_MOST`). The edges are not independent: every edge at a clock carries that
+//! clock's own error, so `theta`'s covariance is not the solution's inverse normal matrix (which
+//! reads them as independent and is about twice too large at eight or more hearers). An edge's own
+//! variance is its `g(x_a)` variance from the pair's points alone (the fitted part times the
+//! pair's share, plus what is carried past the last knot); each node's clock variance is the least,
+//! over its used edges, of that edge's own variance times the node's share of the two clocks'
+//! white noise (`sigma_k^2 / (sigma_a^2 + sigma_b^2)`); each used edge's remainder (its own variance
+//! less its two nodes' clock variances, at least zero) is independent across edges. `theta`'s
+//! covariance is the nodes' clock variances on the diagonal plus `N^-1 (sum_e w_e^2 delta_e d_e
+//! d_e^T) N^-1` (`N` the solution's normal matrix, `w_e` an edge's weight, `delta_e` its remainder,
+//! `d_e` its row), all inflated by the residuals' chi-square a degree of freedom when above one.
+//! Each hearer's arrival after the reference's is `tau_k = -theta_k / (1 + rho_k)`; its timing
+//! covariance is `theta`'s, scaled, plus `theta_k theta_l cov(rho_k, rho_l)`
+//! with `cov(rho_k, rho_l)` the rate variance of `k` when `k = l` plus the common variance, and
+//! zero when either clock is GNSS-disciplined (its rate is known to `pair::GNSS_RATE_SIGMA`, which
+//! moves no fix); its noise is the clock's within noise plus its site's variance. That is the
+//! problem `solve` solves (§ Solving), unchanged. The timeline's zero is the reference's arrival:
+//! its reading on the UTC day its batch's wall clock is in for a GNSS-disciplined reference
+//! (`sync::origin_unix_ns`), and for a free-running one the model's `heard_ns` for its lowest count
+//! plus its nominal time from there (§ Areas, dating), which dates the fix's transmit time.
+//!
+//! **Publishing a fix** ([`publish::solve_transmission`]): a format 7 fix whose `models` are the
+//! ids of the models it cites (§ Areas), published only when the verifier passes the claim read
+//! back from its bytes.
+//!
+//! **Verifying a model** ([`verify::verify_pair_model`]), by a holder of the window: its inputs are
+//! the window's; its references stand; every published clock is a clock of the window with its
+//! lowest count; every published pair is a candidate (both clocks a network pair, enough points),
+//! its anchors, first knot and knot count the rule's, its knots optimal under its inliers at them,
+//! no jump in its kept segment, and its covariance, slope and share its own within
+//! `pair::DERIVED_TOLERANCE`, its inflation and the pooled within `pair::KAPPA_TOLERANCE`; the
+//! noise within the band; the rates optimal and their variances the system's; and the jump rounds,
+//! replayed, give the same starts and the same pairs.
+//!
+//! **Verifying a fix**: § Verifying a fix, by a holder of the verified models it cites and the
+//! fix's receptions alone.
 
 // It reaches keys (`tally_wire::Identity`): no `unsafe` code at all, forbidden, so no module
 // can allow it.
@@ -566,16 +664,16 @@
 // Matrix code reads as the algebra it implements: index loops over rows and columns.
 #![allow(clippy::needless_range_loop)]
 
+pub mod area;
 pub mod arrived;
-pub mod banded;
+pub mod backoff;
 pub mod clock;
 pub mod gate;
 pub mod geo;
-pub mod group;
-pub mod held;
 pub mod linalg;
 pub mod modes;
 pub mod obs;
+pub mod pair;
 pub mod publish;
 pub mod scope;
 pub mod sim;
@@ -583,24 +681,21 @@ pub mod solve;
 pub mod standing;
 pub mod sync;
 pub mod threshold;
-pub mod tile;
 pub mod verify;
 
 pub use arrived::{Admitted, Arrived, BatchId, Considered, HELD_MS, TransmissionKey};
-pub use clock::{ClockKey, ClockModel, MAX_CARRY_PS, Reach, SPEC_VERSION, Timebase};
-pub use group::{Grouping, Transmission, group, group_reach};
-pub use obs::{ObservationId, Reception, Site};
-pub use publish::{PublishError, Unpublished, solve_fix, solve_published};
-pub use scope::{
-    Assignment, Citation, Frontier, Inputs, Sites, Trailing, TrailingInputs, Window, WindowIndex,
+pub use clock::{ClockKey, MAX_CARRY_PS, SPEC_VERSION, Timebase};
+pub use obs::{ModeS, ObservationId, Reception, Site};
+pub use pair::{GATE_PS, PairCache, PairModel, Prepared};
+pub use publish::{
+    PublishError, Stated, Transmission, Unpublished, solve_transmission, transmissions,
 };
+pub use scope::{Citation, Frontier, Inputs, Sites, Trailing};
 pub use solve::{Solution, SolveError};
-pub use sync::{Assessment, Calibrated, FitError, calibrate, fit, fit_calibrated, fit_trailing};
-pub use threshold::{KEPT_KEEP, PAIR_KEEP, REFERENCE_KEEP, SYNC_KEEP, Threshold, sync_key};
-pub use tile::Tile;
+pub use threshold::{KEPT_KEEP, REFERENCE_KEEP, Threshold, sync_key};
 pub use verify::{
-    Failure, ModelFailure, ModelVerdict, Verdict, judges, verify, verify_assignment, verify_fix,
-    verify_model, verify_reach, verify_trailing_model,
+    Failure, PairModelFailure, PairModelVerdict, Verdict, judges, verify_pair_fix,
+    verify_pair_model, verify_pair_model_held,
 };
 
 #[cfg(test)]

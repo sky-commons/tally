@@ -704,13 +704,12 @@ fn place(item: &Item) -> Place<'_> {
             // Unplaced: whole-world subscribers only (`Subscription::covers`).
             None => Place::Cells(&[]),
         },
-        Record::Positions(_)
-        | Record::Provisional(_)
-        | Record::ClockModel(_)
-        | Record::ClientClockModel(_) => match &item.points {
-            Some(points) => Place::Cells(points),
-            None => Place::Nowhere,
-        },
+        Record::Positions(_) | Record::ClockModel(_) | Record::ClientClockModel(_) => {
+            match &item.points {
+                Some(points) => Place::Cells(points),
+                None => Place::Nowhere,
+            }
+        }
         _ => Place::Nowhere,
     }
 }
@@ -721,6 +720,7 @@ fn client_place(place: &ClientPlace) -> Place<'_> {
         ClientPlace::World => Place::Nowhere,
         ClientPlace::Unplaced => Place::Cells(&[]),
         ClientPlace::Cell(cell) => Place::Cells(std::slice::from_ref(cell.as_region())),
+        ClientPlace::Cells(cells) => Place::Cells(cells),
         ClientPlace::Aircraft(points) => Place::Cells(points),
     }
 }
@@ -938,21 +938,6 @@ impl Router {
             subscriber,
             router: Arc::clone(self),
         }
-    }
-
-    /// Whether some client's subscription covers one of `cells` (a subscription of no regions
-    /// covers every cell): what a client may be sent of a record placed there. What the positions
-    /// checks hold a raw solution for (`Hub::hold_twins`).
-    pub fn clients_at(&self, cells: &[Region]) -> bool {
-        let Ok(index) = self.index.read() else {
-            return true;
-        };
-        if !index.clients.everywhere.is_empty() {
-            return true;
-        }
-        let mut holding = Vec::new();
-        index.clients.holding(cells, &mut holding);
-        !holding.is_empty()
     }
 
     /// How many listen now.
@@ -1290,18 +1275,19 @@ mod tests {
         assert_eq!(at_site.try_recv_many(&mut out, 10), Ok(0));
         assert_eq!(engine.try_recv_many(&mut out, 10), Ok(1));
         out.clear();
-        // A client clock model: placed by its area, however fine the point it was published at.
+        // A client clock model: placed by its area, however fine the point it was published at
+        // (`Network::client_model_places` places it at its area and its band's).
         let model = tally_wire::ClientClockModel::sign(
             &tally_wire::Identity::from_seed([7; 32]),
             &tally_wire::ClientClockModelContent {
                 boot_id: 1,
                 sequence: 0,
                 issued_ms: 1,
-                spec_version: 6,
+                spec_version: tally_mlat_solver::SPEC_VERSION,
                 model: [1; 32],
                 inputs: [2; 32],
-                window_first: 0,
-                window_last: 0,
+                edge_ms: tally_wire::budget::TRAILING_WINDOW_MS,
+                span_ms: tally_wire::budget::TRAILING_WINDOW_MS as u32,
             },
         )
         .map_err(text)?;
@@ -1317,7 +1303,7 @@ mod tests {
         assert_eq!(inside.try_recv_many(&mut out, 10), Ok(1));
         assert_eq!(
             out[0].client.as_deref().map(ClientItem::place),
-            Some(&ClientPlace::Cell(Coarse::of(atlanta_area)))
+            Some(&ClientPlace::Cells(Arc::from([atlanta_area].as_slice())))
         );
         assert_eq!(next.try_recv_many(&mut out, 10), Ok(0));
         Ok(())

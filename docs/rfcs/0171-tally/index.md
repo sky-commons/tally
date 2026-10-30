@@ -19,6 +19,13 @@
   from someone who runs a relay". It changes §3.1, §3.3 (wire version 3, in one release), §3.4, §3.5, §3.6, §3.8, §3.8.1, §3.8.2, §6, §7 and §8.3, and RFC-0174 §2.1, §2.5,
   §2.8, §2.10, §2.11 and §2.12; each place says so. It was pressure-tested by critics who found ten
   ways a client could read or derive a site from v0.3.0 (§9, item 6).
+- **Amended 2026-10-24 (founder): MLAT in seconds.** One class of MLAT fix, solved about 1.1 s
+  after its transmission's first reception arrives, under a clock model refit every second over a
+  trailing window of what had arrived; the windowed final fixes, the provisional ones and the
+  precise world product are retired at wire version 4. It reverses §3.8.1's "a window is decided
+  by the raw's own signed wall clocks, never by when anything arrived". It changes §3.3, §3.4,
+  §3.6, §3.8.1, §3.8.2, §7 and §10, and RFC-0174 §1, §2.3, §2.4, §2.10, §2.11 and §2.12, and
+  RFC-0181's hosted MLAT and its sizing; each place says so.
 
 ## §0 The answer, in one line
 
@@ -165,6 +172,21 @@ relay and feeders, so it moves at once, in one release:
   receiver, tagged positions, and a model's inputs hash over site ids rather than sites (§3.8.1,
   "What a client is sent of MLAT").
 
+**Wire version 4 means "one MLAT fix class"** (decided 2026-10-24, founder; `tally_wire::record::FIXES_VERSION`,
+§3.8.1 "Amended 2026-10-24 (founder): MLAT in seconds"). A fix is `Positions` format 7 (raw,
+relay-only) or 8 (tagged, a client's), naming the receptions it considered and which it used, and
+nothing is provisional or final. It retires, with their bytes never reused: the `Provisional` kind
+(0x10) and its stream bit (`PROVISIONAL`, 16), the precise world product (`WorldPrecise`, 0x21) and
+its bit (`WORLD_PRECISE`, 128), `Positions` formats 1 to 6, and `ClientClockModel` format 1 (a
+window's bins). How a reader takes a retired form follows the session's version: from a peer of
+version 4 or later it is a breach of the protocol; from one below it is dropped without a fault and
+not forwarded, and a retired stream bit in a `Subscribe` is ignored. The least version a relay or
+engine link may agree stays 3, so a version 3 relay is still linked while the network moves; it
+simply sends nothing of MLAT a version 4 relay keeps. The protocol is pre-release, so this is one
+release, as version 3 was, and the clients that read MLAT (`tally-merge`, `tally-api` and the
+client core's reads) move with it, pinned together. The MLAT specification moves to version 7
+(version 8 since 2026-10-26, §3.8.1).
+
 **The roles** a `Hello` names: feeder, subscriber, relay, engine (another relay's MLAT taking raw
 one hop, RFC-0174 §2.3; it publishes nothing), and **probe**. A probe is a
 measurement session (RFC-0174 §2.2's round-trip probing and delivery check): it may send only
@@ -192,20 +214,22 @@ record is a kind byte, a two-byte length, a body; a Noise message carries whole 
 | 0x09 | `Goodbye`      | the relay is closing, and how long to wait                                      |
 | 0x0a | `Subscribe`    | the streams a subscriber wants, and its regions by receiver location; a client's matched by public cell, clamped to resolution 6 (§3.6) |
 | 0x0b | `RelayBatch`   | a relay's own deduplicated stream, signed under its own domain (§3.6)           |
-| 0x0c | `Positions`    | a relay's signed solutions, each naming its observation set (§3.8.1)          |
-| 0x0d | `ClockModel`   | a relay's signed, content-addressed clock model manifest for one tile and window (§3.8.1) |
+| 0x0c | `Positions`    | a relay's signed MLAT fixes, each naming the receptions it considered and which of them it used (formats 7 and 8 since version 4, §3.8.1) |
+| 0x0d | `ClockModel`   | a relay's signed, content-addressed clock model manifest for one area and trailing window (§3.8.1) |
 | 0x0e | `FaultProof`   | two signed solutions of one inputs that disagree, or two signed models of one inputs that differ; checked before forwarding |
 | 0x0f | `ClockModelPart` | one part of a clock model too large for its manifest, checked against it (§3.8.1) |
-| 0x10 | `Provisional`  | a relay's signed provisional solutions (`Positions` format 4), superseded by final ones; only to subscribers that asked (`PROVISIONAL`, §3.8.1) |
-| 0x11 to 0x23 | RFC-0174's records | echo, delivery check, provider directory, sharing groups, credit, the regional and the two world products, parity and bundle index (RFC-0174 §2.10); transport version 2, the minimum. 0x13 and 0x14 are retired (the first delivery check), read as retired and never written; the delivery check is 0x22 and 0x23 (RFC-0181 §7) |
+| 0x10 | retired        | `Provisional`, provisional MLAT solutions (`Positions` formats 4 and 6), retired at version 4 (2026-10-24, §3.8.1): never written; from a version 3 peer dropped without a fault and not forwarded, from a version 4 peer a breach; the byte is never reused |
+| 0x11 to 0x23 | RFC-0174's records | echo, delivery check, provider directory, sharing groups, credit, the regional and the world products, parity and bundle index (RFC-0174 §2.10); transport version 2, the minimum. 0x13 and 0x14 are retired (the first delivery check), read as retired and never written; the delivery check is 0x22 and 0x23 (RFC-0181 §7). 0x21, the precise world product, is retired at version 4 as 0x10 is |
 | 0x25 | `ReceiverSite` | a receiver's signed exact site (issued time, location with altitude, clock class), under its own signing domain `"tally receiver site"`; relay-only, sent only on version 3 relay and engine links (§3.3, §3.5) |
-| 0x26 | `ClientClockModel` | a relay's signed clock model as a client may hold it, of one fixed size: signer, boot, sequence, issued time, spec version, the full model's id and inputs hash, and the window; no member, no site, no offsets (§3.8.1) |
+| 0x26 | `ClientClockModel` | a relay's signed clock model as a client may hold it, of one fixed size: signer, boot, sequence, issued time, spec version, the full model's id and inputs hash, and its trailing window (edge and span; format 2 since version 4); no member, no site, no offsets (§3.8.1) |
 | 0x27 | `ClientRegionalBatch` | a relay's signed deduplicated receptions for one area as a client may hold them: each reception's format and bytes, the batch's wall clock, and no counters or signal levels (a signal set against public positions ranges a lone receiver; §3.6) |
 
 Kinds 0x25 to 0x27 came with wire version 3 (2026-10-19) and are non-critical, so a version 2 build
-skips them. Two formats came with them: `ReceiverInfo` format 2 (above) and `Positions` formats 5
-and 6, final and provisional, which name each reception by a 16-byte tag in place of its receiver,
-epoch and counter (§3.8.1).
+skips them. Two formats came with them: `ReceiverInfo` format 2 (above) and tagged `Positions`,
+which name each reception by a 16-byte tag in place of its receiver, epoch and counter (§3.8.1).
+Wire version 4 (2026-10-24, §3.3) has one kind of MLAT fix: `Positions` format 7 (raw, relay-only)
+and format 8 (tagged, what a client is sent) replace formats 3 to 6, and `ClientClockModel` format
+2 names its trailing window by its edge and span in place of format 1's bins.
 
 The extension rules, which are what a frozen feeder relies on:
 
@@ -342,7 +366,7 @@ subscription's `wants`.
 | -------------------------------------------- | ------------------------------------------------------ | ----------------------------------- |
 | `ReceiverSite`, `ReceiverInfo` format 1      | the exact site                                         | `ReceiverInfo` format 2             |
 | `Batch`, `RelayBatch`, `RegionalBatch`       | counters: reverse MLAT, ranging by clock line          | `ClientRegionalBatch` (no counters) |
-| `Positions`, `Provisional` formats 3 and 4   | receiver, epoch and counter of every reception         | formats 5 and 6 (tags, §3.8.1)      |
+| `Positions` format 7                         | receiver, epoch and counter of every reception         | format 8 (tags, §3.8.1)             |
 | `ClockModel`, `ClockModelPart`               | every member's site, and the clock offsets             | `ClientClockModel`                  |
 | a `FaultProof` of raw-form records or models | it carries the records above                           | a format 1 proof of tagged records  |
 | an `EvidenceBundle` holding a site           | it carries the site                                    | a bundle by reference (RFC-0174 §2.1) |
@@ -383,8 +407,8 @@ As built (2026-10-07), one `tally-relay` binary does all of it: `--area CELL` (r
 the areas it takes, `--advertise HOST:PORT=KEY` where it answers, `--network ASN` the network it
 is on; MLAT runs in-process (on the threads the cores' plan leaves it, RFC-0181 §10, "The cores";
 `--no-mlat` for none) for the areas it is chosen to solve; `--no-relay-duties` turns off accepting feeders, MLAT and seeding
-for a relay that only shares; `--world` and `--world-precise` gather the two world products
-(RFC-0174 §2.11). A relay whose signed offer it verified may connect to exchange its sharing
+for a relay that only shares; `--world` gathers the world product (RFC-0174 §2.11; the precise
+world product and its `--world-precise` were retired with wire version 4, 2026-10-24, §3.8.1). A relay whose signed offer it verified may connect to exchange its sharing
 group's records without being named by `--accept-relay`.
 
 **The upload cap and its priorities are part of a relay's contract** (decided 2026-10-06, replacing
@@ -413,13 +437,11 @@ hard and never goes dark; it only sends lower-priority traffic slower.
      queued; it is what a socket writes beyond its grants, and it alone may draw the bottom 2% of
      the bucket (at least 4 KiB), so it always gets through.
   2. **Positions** and clock models (with their parts) and fault proofs to a relay link or an
-     MLAT link: what this relay's MLAT originates and the final positions and models it forwards.
+     MLAT link: what this relay's MLAT originates and the positions and models it forwards.
   3. **Raw** batches, with the receiver descriptions they travel with, to a relay link or an
      MLAT link: the border raw MLAT needs.
   4. **Forwarded**: the rest a peer that forwards is sent (the deduplicated stream).
-  5. **Provisional** positions (`Provisional`, §3.8.1) to a relay link: below the final
-     positions and the raw they are solved from, since a final one follows each.
-  6. **Taker**: everything a plain subscriber or a beast-out client is sent.
+  5. **Taker**: everything a plain subscriber or a beast-out client is sent.
 
   A data send waits for a grant from the bucket; a class is granted nothing while a higher one
   waits, so lower classes get what higher ones leave. Within a class, grants go by start-time fair
@@ -452,7 +474,9 @@ What a relay holds is bounded, and what it trusts is narrow, because keys cost n
   directory only); any other key is refused and asked to return after one re-signing of offers
   (60 s). One function decides it (`Hub::relay_trust`), at the session's start and while it runs.
   Intake ceilings are per role, decided by the role the handshake established and never by key:
-  relays are held to `--max-member-bytes-per-sec` (8 MiB/s by default); every other inbound peer,
+  relays are held to `--max-member-bytes-per-sec`, one rate every member shares (1 MiB/s by
+  default, `hub::DEFAULT_MAX_MEMBER_BYTES_PER_SEC`; 8 MiB/s each before 2026-10-08, which planned
+  every member a feeder budget of its own); every other inbound peer,
   an engine included (it publishes nothing), to a feeder's (`--max-feeder-bytes-per-sec`, 256 KiB/s
   by default). Feeders are told theirs as a `RateLimit`. Connections are capped
   (`--max-connections`).
@@ -590,24 +614,29 @@ What a relay holds is bounded, and what it trusts is narrow, because keys cost n
   | `W_a` (`ANCHOR_BEHIND`) = `FEEDER_BEHIND + E + P + δ + 2P` | 102.5 s | a batch's oldest known anchor behind a hop |
   | `ANCHOR_AHEAD` = `LAG + 2E` | 32 s | the same, ahead |
   | `OWN_ANCHOR_OLDEST` = `ANCHOR_AGE + B + δ`, drifted at 500 ppm | 69.035 s | the oldest an honest batch's own anchor is where it is published, by the origin's raw monotonic clock |
-  | `MLAT_BATCHING` | 2 s | a receiver's last raw of a bin, gathered and on its way |
-  | `MLAT_AHEAD` = `E` | 7.5 s | how far past a batch's judging time a hosted MLAT bin may begin |
-  | `MLAT_SETTLE` = `MLAT_BATCHING + E + 2U_m` | 11.5 s | how long after a bin ends the hosted MLAT takes it |
-  | `MLAT_SOLVE` | 80 s | a final fix's way out of its engine after its window settles (the engine's design) |
-  | `FINAL_FIX_ARRIVED` = `MLAT_SOLVE + MLAT_SETTLE + K + REPAIR_TRANSIT` | 108.5 s | when a final fix has surely arrived, wherever it is read |
-  | `PROVISIONAL_SOLVE` | 4 s | a provisional MLAT fix's way out of its engine, its first reception in (the engine's design) |
-  | `LIVE_FIX_LEAVES` = `MLAT_SETTLE + PROVISIONAL_SOLVE` | 15.5 s | when a live world fix has been offered where it was heard: the feeder path |
-  | `LIVE_FIX_ARRIVED` = `LIVE_FIX_LEAVES + K + REPAIR_TRANSIT` | 32.5 s | when a live world fix has surely arrived wherever the world is gathered: the peer path, the live world's settle |
+  | `MLAT_BATCHING` | 2 s | a receiver's raw of a moment, gathered and on its way |
+  | `MLAT_AHEAD` = `E` | 7.5 s | how far above the judging clock it arrives by a reception of the hosted MLAT may be signed and still be held |
+  | `SIGNED_LAG` = `MLAT_BATCHING + E + 2U_m` | 11.5 s | how far below the judging clock an honest receiver's raw of a moment may be signed and still be in when the hosted MLAT looks for it |
+  | `FIX_SETTLE` | 1.1 s | how long after a transmission's first reception arrives the engine weighs it (the engine's design) |
+  | `ARRIVED_SLICE` | 1 s | the slices the engine seals what has arrived in (the engine's design) |
+  | `MODEL_KNOT` | 5 s | a clock model's knot spacing (the solver's design) |
+  | `REFIT_EVERY` | 2 s | how often an area's pair model is refit, at the edges of one grid every relay shares (the engine's design) |
+  | `FIT_LAG` = `MLAT_BATCHING` | 2 s | how far a model's trailing edge trails the clock its refit runs at, so two relays holding the same raw fit the same inputs at the same edge (the engine's design) |
+  | `TRAILING_WINDOW` | 15 s | the sync raw a trailing-window model is fitted over, at least three knots (the solver's design; §3.8.1) |
+  | `FIX_SOLVE` | 4 s | an MLAT fix's way out of its engine, its first reception in (the engine's design) |
+  | `FIX_LEAVES` = `SIGNED_LAG + FIX_SOLVE` | 15.5 s | when a fix has been offered where it was heard: the feeder path |
+  | `FIX_ARRIVED` = `FIX_LEAVES + K + REPAIR_TRANSIT` | 32.5 s | when a fix has surely arrived wherever it is read: the peer path, the world's settle and when a fix's standing settles |
+  | `MAX_CARRY` = `2 REFIT_EVERY + FIT_LAG + MLAT_AHEAD + FIX_SETTLE` | 14.6 s | the most a fix's transmit time may be past the trailing edge of the models it is solved under, a hard bound |
   | `RESTATE_BEYOND` = `F / 2` | 5 s | how far a feeder's signed time may be from its relay's clock before the relay restates its clock |
   | `FALLBACK_FLOOR` = `S + K` | 40 s | a strike table's floor with no state |
   | `RECEIPT_AHEAD` = `K` | 15 s | a credit receipt's issued time ahead of a relay (issued by another judging relay's clock, so at most `K` apart) |
-  | `PRODUCT_AHEAD` = `K` | 15 s | a precise MLAT second's seal (`(s + 1) * 1000 + FINAL_FIX_ARRIVED`) ahead of the API's clock |
+  | `PRODUCT_AHEAD` = `K` | 15 s | a world second's seal (`(s + 1) * 1000 + FIX_ARRIVED`) ahead of the API's clock |
   | `ACARS_MESSAGE_SKEW` | 300 s | exempt: an ACARS message's own time is an aircraft's or a ground station's, set by no clock of ours |
 
   Every comparison of a signed time against a clock goes through the module: a `Tolerance`'s
   `ahead`, `past`, `apart` or `covers`, or a `Window`'s `holds` (`Window::FEEDER`, `PEER`,
-  `ANCHOR`, `FIGURES` for a batch the feeder figures count, `FIGURES_POSITIONS` for a final MLAT
-  position they count, `relay_signed`, `proofs`, `figures`). A regional batch is judged by the
+  `ANCHOR`, `FIGURES` for a batch the feeder figures count, `FIGURES_POSITIONS` for an MLAT
+  fix they count, `relay_signed`, `proofs`, `figures`). A regional batch is judged by the
   relay-signed window alone (it was judged a second way, 10 s ahead at most, after the hub had
   taken it as new, so one `K` ahead was lost); a directory offer, a credit receipt, a feeder
   figure at the API and a world fix by a `Tolerance` (the last by `S`, where a literal 2 s
@@ -778,25 +807,27 @@ What a relay holds is bounded, and what it trusts is narrow, because keys cost n
     clock (in true time, within `W_a + 2E` = 117.5 s).
 
     **What that staleness costs the products.** Neither the live map nor MLAT takes old data for
-    new. The live world product gathers fixes by their own transmit second and seals each second
-    `LIVE_FIX_ARRIVED` after it ends (`WORLD_SETTLE_MS`, once every honest live fix of it has surely
+    new. The world product gathers fixes by their own transmit second and seals each second
+    `FIX_ARRIVED` after it ends (`WORLD_SETTLE_MS`, once every honest fix of it has surely
     arrived, whatever relay heard it): a fix of a second already sealed is late (`world_late`) and
     dropped, counted, never drawn as current, and a fix older than the history before the first
-    seal is out of its window. The hosted MLAT bins raw by its signed time and takes each bin
-    `MLAT_SETTLE` after it ends by the relay's judging clock: raw of a bin already taken is late
-    (`observations_late`), counted and lost to MLAT alone, never solved as current; the solver
-    never sees it. So a batch used up to `W_a + 2E` after it was made can only be late for them:
-    the worst-case staleness costs liveness of those products, never their truth.
+    seal is out of its window. The hosted MLAT holds raw as it arrived (§3.8.1, as amended
+    2026-10-24) and refuses a batch signed more than `SIGNED_LAG`, the trailing window and a step
+    below the relay's judging clock as it arrives (`arrived::HELD_MS`): it is older than every
+    window a model could cite, and late (counted and lost to MLAT alone, never solved as current;
+    the solver never sees it). So a batch used up to `W_a + 2E` after it was made can only be late
+    for them: the worst-case staleness costs liveness of those products, never their truth.
 
-    **The hosted MLAT's bins** are judged by the relay's judging clock (`Stamp::judging`, carried in
-    each decode as `Decoded::judge_ms`), never by its monotonic clock aligned to it once at start:
-    a bin may begin at most `MLAT_AHEAD` = `E` past a batch's judging time (an honest feeder signs
-    at or below true time, the relay at most `E` behind it), and is taken `MLAT_SETTLE` = 11.5 s
-    after it ends by that clock (its batching and way, and an honest feeder whose selection holds
-    this relay signs at most this relay's stated error and twice its measurement below its
-    clock). The steps run on the monotonic clock and settle by the judging time of the step: the
-    products publish one (monotonic, judging) pair with their watermark (`tally_wire::clocks::
-    Moment`), and every step reads both from it, so the same stamped trace gives the same bytes.
+    **The hosted MLAT's clock** is the relay's judging clock (`Stamp::judging`, carried in each
+    decode as `Decoded::judge_ms`), never its monotonic clock aligned to it once at start: a batch
+    may be signed at most `MLAT_AHEAD` = `E` past its arrival by that clock (an honest feeder
+    signs at or below true time, the relay at most `E` behind it), and at most `SIGNED_LAG` =
+    11.5 s below it while it is still in time for the fix it is a reception of (its batching and
+    way, and an honest feeder whose selection holds this relay signs at most this relay's stated
+    error and twice its measurement below its clock). The steps run on the monotonic clock and
+    read the judging time of the step: the products publish one (monotonic, judging) pair with
+    their watermark (`tally_wire::clocks::Moment`), and every step reads both from it, so the same
+    stamped trace gives the same bytes.
     The two are distinct types (`Mono`, `Judged`, and `Raw` beside them): a signed or grid time is
     compared with a clock only through `tally_wire::budget`, whose every comparison takes a
     `Judged`, a span measured on one clock is a `Span` of that clock and moves no other's reading,
@@ -804,21 +835,19 @@ What a relay holds is bounded, and what it trusts is narrow, because keys cost n
     (`recorded`, which Clippy refuses outside replays and tests). So handing a monotonic reading
     to a comparison with a signed or grid time, or moving one clock's reading by another's span,
     does not compile: `tally_wire::clocks`'s and `tally_wire::budget`'s compile-fail examples
-    (`//crates/wire:wire_doc_test`) hold each such line. Each shard's lateness is the batch's own two readings, so a step
-    of the host's clock moves the bins with it and offsets nothing. A window step's final fixes are
-    refused and counted once `FINAL_FIX_LEAVES` (`MLAT_SETTLE + MLAT_SOLVE`) has passed since the
-    start of the earliest bin it solves (the earliest a transmission in it can be), by the judging
-    clock, so `FINAL_FIX_ARRIVED` holds of every fix published; its clock models are published all
-    the same, since provisional solving already carries them, and a step already past that bound
-    when its turn comes is not solved at all (`MlatReport::window_steps_passed`).
+    (`//crates/wire:wire_doc_test`) hold each such line. Each shard's lateness is the batch's own
+    two readings, so a step of the host's clock moves the slices with it and offsets nothing. A
+    step's fixes leave within `FIX_SOLVE` of their transmission's first reception arriving, and a
+    fix that would leave past `FIX_LEAVES` after its transmission is not solved, counted, so
+    `FIX_ARRIVED` holds of every fix published.
     The residual: a feeder whose reference leaves this relay out may sign up to `LAG` and `E` more
-    below it, and its raw past the settling is late for MLAT, counted and blamed on nobody. It is
-    left out for seat cost: covering it would reserve every seat's open raw over a span `LAG + E`
+    below it, and its raw past `SIGNED_LAG` is late for MLAT, counted and blamed on nobody. It is
+    left out for seat cost: covering it would hold every seat's raw over a span `LAG + E`
     longer, and the world relay's seats (`tally/crates/relay/tests/world-relay.txt`, RFC-0181) have
-    no such margin over their 2,000 floor; its raw lands bins away from its peers' receptions of
-    the same transmissions, so MLAT pairs little of it anyway. A seat's open raw is reserved over the bin,
-    the settling, the seals that may fall behind and `MLAT_AHEAD`: 29 s of its ceiling, where it
-    was 13 s before these were derived (RFC-0181's tables). **The residual**, stated exactly and pinned by a test
+    no such margin over their 2,000 floor; its raw lands seconds away from its peers' receptions of
+    the same transmissions, so MLAT pairs little of it anyway. A seat's raw is held over the
+    trailing window, `SIGNED_LAG` and a step (`arrived::HELD_MS`) at the mean kept rate, in one
+    pool for the relay (RFC-0181, "Sizing"). **The residual**, stated exactly and pinned by a test
     built on the feeder's own `RelayClocks`:
     - with a trusted reference, its configured sources lying (operator trust): they set the
       reference, the honest anchors disagree with it and are left out;
@@ -840,7 +869,7 @@ What a relay holds is bounded, and what it trusts is narrow, because keys cost n
   `U_p + K == FEEDER_BEHIND` is asserted at compile time: a copy too old where it was published is too old
   at every relay within `K` of that one, so nothing travels with a copy to say so. The
   relay-signed kinds keep windows derived the same way (`strikes::Window::relay_signed`: an engine's lag, the horizon and a
-  second, the transit and `K`, 43 s behind, `K` ahead; fault proofs, `Window::proofs`, 122 s behind,
+  second, the transit and `K`, 32 s behind, `K` ahead; fault proofs, `Window::proofs`, 122 s behind,
   `S` ahead; feeder figures, the relay-signed window stretched by their hour), and possession
   never uses them. A record whose time cannot be read is malformed (no format leaves it out),
   counted as `unreadable_times` and refused as one that fails its signature is: that is the bytes,
@@ -850,7 +879,7 @@ What a relay holds is bounded, and what it trusts is narrow, because keys cost n
   RFC 9001 §9.2; Kerberos's replay cache, RFC 4120 §3.2.3; `strikes`), never by its place in a
   stream: `t` is its author's signed time (a feeder's `wall_ms`; an engine's `issued_ms`; the time
   a relay signed a regional batch, its client form or bundle index; the newer of a fault proof's
-  two records). Each table (the raw batches of each ingest shard, positions, provisional positions,
+  two records). Each table (the raw batches of each ingest shard, positions,
   clock models, fault proofs, feeder figures, and what is passed on by hash) remembers each record
   it used as an 8-byte fingerprint keyed by the state directory's key (`strike.key`; with no
   state directory, a secret of the process), in a generation for each
@@ -1123,87 +1152,260 @@ this:
   idempotent, is exact only at one linearization point, double counts receiver clocks shared
   across summaries, is larger than raw per transmission (2.5 to 12 times, measured in the
   critique), and is an unverifiable claim by whoever computed it. Proposed and killed (§7).
-- **A position is a cached view, never an input.** Every published solution names the exact
-  observation set it used, the clock model it used, and the solver specification's version, and is
-  a deterministic function of the three; the model is a deterministic function of its own input
-  set. Clients merge solutions of one transmission by their full input set (the observation set
-  and the model's input set together): the same set is a duplicate; a superset wins; incomparable
-  sets are never averaged or fused, and any relay holding both publishes the solution over their
-  union (every relay of the area holds the raw, so the union is always computable there; a client,
+- **A position is a cached view, never an input.** Every published fix names the receptions it
+  considered (every reception of its transmission that had arrived when it was solved) and the
+  subset of them it used (what the deterministic outlier rule keeps of the considered set), the
+  clock model it used, and the solver specification's version, and is a deterministic function of
+  its used set, its model and the version; the model is a deterministic function of its own input
+  set. Clients merge fixes of one transmission by their full input set (the considered set and the
+  model's input set together): the same set is a duplicate; a superset that agrees with the
+  smaller fix wins, and one that disagrees wins only when a relay holding its raw verified it and
+  its receivers carry more standing (RFC-0174 §2.12; since 2026-10-24, below); incomparable sets
+  are never averaged or fused, and any relay holding both publishes the fix over their union
+  (every relay of the area holds the raw, so the union is always computable there; a client,
   which holds no raw since 2026-10-19, compares tag sets, below).
 - **Completeness is local by construction.** Relay regions overlap their neighbours by at least
   one reception radius, so a relay whose region holds an aircraft receives every receiver that
   could have heard it; border solutions from two relays therefore start from the same inputs, and
   the superset rule settles any late arrival.
-- **Clock models are shared evidence, not private state, and belong to a canonical tile.** The
-  world is cut into fixed cubes in integer ECEF millimetres at four levels (edges of 50, 100, 200
-  and 400 km); a tile's footprint is the cube and one reception radius about it, and its members
-  are at most 48 of the receivers inside it, chosen by farthest point from the cube's centre so
-  they spread. An aircraft is assigned the tile containing the lower median of its hearers'
-  sites, at the level whose members hold the most of its hearers, ties to the smaller level.
-  Every choice is integer arithmetic over signed sites and raw, so the assignment is
-  canonical: any relay computes the same tile from the same raw, and a model names
-  its tile. A window is decided by the raw's own signed wall clocks, never by when anything
-  arrived. Clock sync within the tile is a least-squares fit of each member's offset as a
-  continuous piecewise-linear function on 5 s knots aligned to the tile's reference clock (the
-  gauge, chosen by rule: a GNSS-disciplined receiver first, else the lowest key), with an
-  integrated random-walk prior, fed by ADS-B positions as references (at most sixteen aircraft a
-  tile, ranked by hash; each reference aircraft's position a variable; its GNSS error is nearly
-  constant over a minute, so each aircraft has one position bias, east, north and up, with the
-  prior its declared accuracy gives, and each message only a few metres of its own), and the
-  gauge's own rate one parameter more, seen through the sync ranges, so a free-running gauge's
-  frequency error does not scale every time difference under the model. Undeclared clock jumps
-  are found against a robust noise estimate (the median absolute consecutive difference, never
-  the fit's own residual spread, which a jump inflates); a clock that jumps more than the rule
-  allows is dropped from the tile, and the model says so, rather than the fit failing. Its size
-  is bounded by the tile however dense the region, and its normal equations are banded in time,
-  so a fit costs about the same at 100 receivers as at 1,000. A relay publishes each as a
-  signed `ClockModel`: content-addressed, in fixed point, citing its tile and input set by hash
-  and count, and carrying no covariance (whoever solves under it forms that once from the cited
-  raw at the published estimate).
-- **What is solved.** A target is an aircraft with no ADS-B position in the window (what MLAT is
-  for) or one of a hash-chosen sample of the ADS-B aircraft (one in sixteen, so calibration is
-  measured on live traffic); at most five of a target's transmissions a bin are solved, by hash
-  rank, about one a second.
-- **Uncertainty is honest.** A published covariance includes the clock component, computed from
-  the joint clock covariance (not per-receiver variances added as if independent, the defect in
-  mlat-server's clock normalisation), and names its clock model, so a tracker can tell which fixes
-  share clock error. A tile's model is a fit to a canonical subset of the data, and that is not
-  automatically conservative: a fit to less data has a wider posterior only when the model is
-  right, and leaving data out can hide what would have shown the model wrong. What keeps it honest
-  is that the subset is chosen without looking at the residuals (by hash and position, never by
-  fit), and that its coverage is measured, by level, altitude band and hearers outside the tile,
-  never assumed. The published covariance is the fit's, inflated by 1.1 and floored at 5 m a
-  side, for what the simulator cannot show (unmodelled multipath, site survey error, clock
-  behaviour beyond its mix); a fix wider than 1.5 km is not published.
+- **Clock models are shared evidence, not private state, and belong to an area** (specification
+  version 8, 2026-10-26; the crate documentation of `tally/crates/mlat-solver` is the
+  specification). The unit of fitting, publishing and citing is the RFC-0174 area, an H3 cell at
+  resolution 3 (`AREA_RESOLUTION`). Which pairs of receivers exist is decided by their site records
+  alone: each usable receiver keeps its 40 nearest usable receivers within 600 km
+  (`PAIR_NEIGHBOURS`, `PAIR_BASELINE_MM`), by exact integer distance between millimetre sites, and
+  two receivers are a pair when either keeps the other. An area's members are its own receivers and
+  every receiver one of them keeps; its model publishes the pairs with an end in the area, so a pair
+  whose ends lie in two areas is published by both, each fitting it from the same raw. Every choice
+  is integer arithmetic over signed site records, so any relay computes the same areas, members and
+  pairs, and a model names its area. A model's inputs are what had arrived when it was fitted
+  (since 2026-10-24, below): its members' sync raw signed in its trailing window, from the batches
+  each member's frontier names. This is mlat-server's shape (a clock pairing for each two receivers
+  that hear the same aircraft, a fix normalised over the pairings among its hearers), made bounded
+  and verifiable. Each pair's clock difference is fitted from the events both its ends heard, every
+  ADS-B aircraft a reference (`REFERENCE_KEEP`), as a continuous piecewise-linear function on 5 s
+  knots under a curvature prior, robust (Huber passes, then a cutoff until the inliers settle); a
+  jump is a clock's when its pairs agree on its time; and every clock's noise and rate are the
+  fixed point of the pairs fitted under them, the gauge's rate included, so a free-running gauge's
+  frequency error does not scale every time difference. A fit costs a neighbourhood, never a
+  region's joint system: a receiver is in at most its own pairs and its neighbours'. A relay
+  publishes each model as a signed `ClockModel`: content-addressed, in fixed point, citing its
+  area, its trailing window (edge and span) and its input set by hash, count and each member's
+  frontier (the receiver's boot and the last batch sequence it cites). Specification versions 1 to
+  7 fitted one joint model per canonical tile instead; version 8 is the pairs alone.
+- **What is solved.** A target is an aircraft with no ADS-B position heard within the 65 s before
+  (what MLAT is for) or one of a hash-chosen sample of the ADS-B aircraft (one in sixteen, so
+  calibration is measured on live traffic). Of a target, one transmission is solved in each 700 ms
+  slot (mlat-server's `RESOLVE_BACKOFF`, by a rule of the transmissions alone: the slot's
+  transmission heard by the most receivers the models locate), and again only when its considered
+  set grows. A transmission heard by more than 32 receivers is solved from 32 chosen by their sites
+  alone (`HEARERS_MOST`, the knee of accuracy against cost at world density: from mlat-server's 15
+  to 24 to 32 to no cap the median horizontal error is 35.0, 27.6, 25.1 and 21.8 m and the fixes
+  cost 2.207, 2.271, 2.285 and 2.451 ms a feeder-second, the 95th percentile no better past 32).
+  The fix cites one verified model of each area its used hearers are in, all at one edge.
+- **Uncertainty is honest.** A published covariance includes the clock component, propagated
+  jointly through the pairs among the fix's hearers (not per-receiver variances added as if
+  independent, the defect in mlat-server's clock normalisation), and names the models it cites, so
+  a tracker can tell which fixes share clock error. Each clock's noise and the robust weights are
+  estimated from the window itself, so they can be understated; what keeps the covariance honest
+  is that what is kept is chosen without looking at the residuals (by hash threshold and site,
+  never by fit), and that its coverage is measured, never assumed (below). The published
+  covariance is the fit's, inflated by 1.1 and floored at 5 m a side, for what the simulator cannot
+  show (unmodelled multipath, site survey error, clock behaviour beyond its mix); a fix wider than
+  1.5 km is not published. Every fix is solved past its models' trailing edge, by at most
+  `MAX_CARRY` (14.6 s, a hard bound; a fix carried further is not solved, counted), and its clock
+  component grows with the carry by each pair's process noise (a rate and a phase random walk),
+  a stated formula.
 - **Any relay verifies; anyone checks signatures and fault proofs; the rule is optimality, not
   bytes.** (Amended 2026-10-19, founder: this read "anyone can check a relay", which needed raw and
   sites in every client's hands. Verifying against raw needs the sites and the counters, so only a
   relay, which holds both, does it; a client checks signatures, content addresses and format 1
   fault proofs, which need neither.) Verifying a model is
-  rebuilding its tile's members and input set from raw and checking the citation exactly, then
-  forming its normal equations once at its estimate: the Gauss-Newton step there must be within
-  tolerance of zero under the robust weights the estimate itself gives, its noise within
-  tolerance of what its residuals say, and no residual may step where no jump is declared.
-  Verifying a solution is recomputing its canonical assignment from its addressed citation (the
-  aircraft must belong to the cited tile), then residuals and a chi-square test against the cited
-  raw and the model, linear in the observations; omission is checked against the spec's
-  deterministic outlier rule. The chi-square limit is one function on both sides: the statistical
+  rebuilding its area's members and pairs from the site records and its inputs from the batches
+  its frontiers cite, and checking the citation exactly (a holder missing a batch at or below a
+  frontier cannot rebuild them and says so, unjudged, never a failure), then checking each pair
+  at its published knots: its Gauss-Newton step within tolerance of zero over the inliers those
+  knots choose, its jumps the rounds' answer, and every clock's noise and rate within tolerance
+  of the fixed point of the pairs under them. Verifying a fix reads only the verified models it
+  lists and its own receptions: the models must be exactly one of each area its used hearers are
+  in, all at one edge; its considered receptions must regroup to one transmission whole, its used
+  ones be of the receivers the cap chooses, and normalise on the timeline those models give; then
+  residuals and a chi-square test at the claimed position, linear in the observations, and the
+  claimed covariance recomputed; omission is checked against
+  the spec's deterministic outlier rule within the considered set alone, so an engine that solved
+  before a reception arrived is never convicted for leaving it out. The chi-square limit is one
+  function on both sides: the statistical
   quantile (zero with no redundancy) widened by what the wire's rounding of position and time can
-  add, and an engine publishes a solution only after running the verifier on it as published,
+  add, and an engine publishes a fix only after running the verifier on it as published,
   every one (as built 2026-10-07: checking every solution costs 20% more solving time, measured on
-  the 4,000-receiver world benchmark, about half a percent of a stride's compute). A fault is a signed model or solution that fails verification on
+  the 4,000-receiver world benchmark, about half a percent of the windowed engine's compute then). A fault is a signed model or fix that fails verification on
   its own cited raw: any relay holding that raw shows it, and a client drops the relay on its own
-  authority. The one fault provable with no raw at all is two signed solutions of one
-  observation set, model and spec version that disagree beyond tolerance (the fault proof's
-  format 1), final or provisional alike: a provisional solution is verified the same way with
-  its model carried past its knots (below, *Provisional positions*). Byte identity is a property of the reference implementation (two copies holding the same raw
-  publish the same bytes, tested with a golden), not of the protocol: an independent
+  authority. The one fault provable with no raw at all is two signed fixes of one used set, model
+  and spec version that disagree beyond tolerance (the fault proof's format 1). Byte identity is a
+  property of the reference implementation (two copies that hold the same batches when they refit
+  and solve publish the same bytes, tested with a golden), not of the protocol: an independent
   implementation that reaches an optimum within tolerance is honest. Clients merge by the hash
-  of a model's inputs, never its bytes. The discrete decisions (windows, tiles, members,
-  assignment, grouping receptions into a transmission, thinning, outlier gating) are integer
-  arithmetic on raw counters, signed wall clocks and fixed-point models, so independent
-  implementations agree on them exactly.
+  of a model's inputs, never its bytes. The discrete decisions (trailing windows, frontiers,
+  areas, members, the pair network, the models a fix cites, grouping receptions into a
+  transmission, the cap, the thresholds, outlier gating) are integer arithmetic on raw counters, batch sequences, signed wall clocks and
+  fixed-point models, so independent implementations agree on them exactly.
+
+**Amended 2026-10-24 (founder): MLAT in seconds.** There is one class of MLAT fix, solved about
+1.1 s after its transmission's first reception arrives, from the receptions that had arrived, under
+pair clock models refit every two seconds over a trailing window of what had arrived. The windowed final
+fixes and the provisional fixes beside them are gone, and so is the precise world product that
+waited for the finals.
+
+*Why.* A final fix waited for its window: a window step solved eight 5 s bins at once and fell due
+one bin after the last of them, once that bin had settled, so a final fix left its engine within
+91.5 s of its transmission and had surely arrived anywhere within 108.5 s: it reached its readers
+80 to 110 s after it was heard. Everything that held a fix or its raw held it that long: the relay's sealed bins and
+open raw, the provisional queue, its notes and orphans, the engine's published queue, standing's
+hand-off and its 108.5 s settling, the positions checks' twins at twice a transmission's rate (a
+final and a provisional). A hosted MLAT receiver (a seat) cost 49.4 MB of planned memory, and the
+world relay could not seat its 2,000 floor. mlat-server, which every production MLAT network runs
+(wiedehopf's fork at adsb.lol), publishes a position 0.9 s after it is heard (`MLAT_DELAY`) under a
+clock pairing it keeps current, and the provisional path already showed the same here (published a
+median 1.34 s after the transmission, 1.65 s at the 95th percentile, in the simulator) at the cost
+of a model carried up to 90 s (a median horizontal error of 124 m carried up to 20 s, 468 m from
+45 to 90 s). Three critics (estimation, verification, memory) were put to the open question and
+converged on this shape: keep the model current instead of carrying an old one, and give up the
+final.
+
+*What it decides.*
+
+- **One fix class.** A transmission is due `FIX_SETTLE` (1.1 s) after its first reception reached
+  the engine's relay, and is solved from every reception of it that had arrived by then, its
+  considered set. A reception that arrives later makes a bigger considered set, solved again at a
+  later step and published again, once: at the first step after the transmission's raw has come
+  (`MLAT_BATCHING`, 2 s, after its first reception arrived) or as its set closes, whichever is
+  first (amended 2026-10-26: before, only as its set closed, `JOIN_MS` after the set's first
+  arrival, and a Mode S reply's set holds every repeat of its bytes over that, so every
+  transmission of the sets an engine opened together was solved again at one step every 11.5 s);
+  the merge's superset rule takes the bigger one, so nothing waits
+  for the slowest receiver and nothing supersedes a fix by class. A fix leaves its engine within
+  `FIX_SOLVE` (4 s) of its first reception arriving, so within `FIX_LEAVES` (15.5 s) of its
+  transmission by its relay's judging clock, and has surely arrived wherever it is read within
+  `FIX_ARRIVED` (32.5 s) (§3.6's budget).
+- **A trailing-window model, refit every two seconds.** Each area is refit every `REFIT_EVERY`
+  (2 s), at the edges of one grid every relay shares (the newest multiple of `REFIT_EVERY` at least
+  `FIT_LAG`, 2 s, below the engine's clock, by when every honest receiver's raw of the edge has
+  arrived), over its members' sync raw signed in the `TRAILING_WINDOW` (15 s) before the edge,
+  warm from its previous model (each pair sought from its last knots; a cold fit lands on the same
+  bytes). Its fixes are solved every second under the newest edge's models, so neighbouring areas'
+  models, fitted by other relays, share the edge a fix citing several of them needs. A fix is
+  solved at most `MAX_CARRY` (14.6 s) past its models' edge, never 90 s.
+- **What had arrived, cited exactly.** A model's input set is what had arrived by its edge, cited
+  by hash, count and a per-member frontier (its boot and the last batch sequence it cites, each
+  member's batches cited as one contiguous run), never "every reception whose signed wall clock is
+  in the window", which would force every holder to wait out the slowest feeder. Because the edge
+  trails the clock by `FIT_LAG`, two relays holding the same batches fit the same inputs at the
+  same edge whatever their paths' delays; a feeder whose signed clock lags the relay's by more may
+  be cited differently by two relays, never wrongly. Two relays' models of one area may then
+  differ honestly; they are matched by inputs hash, and fixes under different models are
+  incomparable sets, never averaged, as the merge rule already says. A relay holding the cited
+  batches rebuilds the inputs and verifies the model; one missing a batch at or below a frontier
+  answers unjudged, never a failure.
+- **Thresholds, not top-k.** Every canonical selection is a hash threshold: the reference aircraft
+  (`REFERENCE_KEEP`, every aircraft heard with ADS-B), a busy batch's sync receptions (each kept at
+  the rate `min(1, REFERENCE_EVENTS_PER_BATCH / c)`, 32 of `c`) and its replies when over
+  `REPLIES_PER_BATCH` (`KEPT_KEEP`), each a function of one batch or one message alone. So what a
+  holder of a subset of the raw keeps is exactly what a holder of a superset keeps, restricted,
+  and a model over less is a strict subset of one over more. A hard cap on what is held stays, as
+  a refusal by the relay-wide pool, never as trimming by rank. At world density a refit's median
+  area holds 1,248 sync events over 61 clocks (`pairwise_path_sweep`, below).
+- **Considered and used.** A fix names the receptions it considered and the subset it used (the
+  outlier rule applied to the considered set). The verifier's omission check runs only within the
+  considered set, so an honest engine that solved before a reception arrived is never convicted
+  for leaving out what it never had.
+- **The superset rule, with verification and standing.** A superset that agrees with a consistent
+  smaller fix wins, as before. One that disagrees supersedes the smaller only when a relay holding
+  its raw verified it and its receivers carry strictly more standing (RFC-0174 §2.12); the smaller
+  is then refused and counts as evidence against what it used. Otherwise the superset is
+  contested, kept as evidence, and the smaller stands. Before, every disagreeing superset was
+  contested, and with fixes published a second after they are heard, a relay could freeze an
+  honest bigger fix out with a fast, favourable subset. A relay verifies a disagreeing superset
+  lazily, capped per engine a second (`VERIFY_PER_ENGINE_PER_SEC`, 32; past it refused,
+  counted), so asking for verification is no
+  way to spend a relay's cores.
+- **Standing settles at the fix's arrival bound.** A transmission's fixes are settled against
+  their answer `FIX_ARRIVED` (32.5 s) after its signed transmit time, by the keeper's clock, where
+  it was `FINAL_FIX_ARRIVED` (108.5 s). `E` is unchanged.
+- **Twins with no buffer.** An engine publishes each step's records back to back on one link: the
+  models, then each fix record raw (format 7) and at once its tagged twin (format 8). A relay pairs
+  a tagged record with the raw record its own link brought last, one record a link, and checks
+  every fix of it before a client is sent it, where it held every raw solution for the hub's wait
+  for a model.
+- **What a seat costs follows.** A relay holds a seat's raw over the trailing window,
+  `SIGNED_LAG` and a step, at the mean kept rate in one relay-wide pool (every receiver still held
+  to its own ceiling), and nothing waits for a window: the provisional queue, notes, orphans, the
+  engine's published queue and standing's hand-off are gone, and a model's fixed parts are an
+  area's, not a seat's (RFC-0181, "Sizing"). A seat is planned at about 2.6 MB (`per-seat` in
+  `tally/crates/relay/tests/world-relay.txt`, held equal to `tally-relay check`), where it was
+  49.4 MB; the aim was 1 to 3 MB.
+- **Retired at wire version 4** (§3.3): the `Provisional` kind and its stream, the precise world
+  product and its stream, `Positions` formats 1 to 6, and the client clock model's window bins.
+  The API's `feed=precise` and an MLAT position's `kind` go with them: there is one kind of fix.
+  The specification is version 8 (2026-10-26): the pair models of areas above, where version 7
+  (2026-10-24, never released) fitted its trailing window with the joint model per tile.
+
+*What it reverses.* This section read "A window is decided by the raw's own signed wall clocks,
+never by when anything arrived." That rule is reversed: a model's inputs are decided by what had
+arrived by its edge, named exactly by its frontiers, because the rule it replaces could be kept
+only by waiting until every honest receiver's raw of a window had surely come, which is the 80 to
+110 s this amendment exists to remove. What the old rule bought, that every relay holding an area
+fits the same model, is kept for every feeder on its relay's clock by `FIT_LAG`: two holders of the
+same batches, one given them in another order, with copies and up to 200 ms more delay each,
+publish the same model bytes for every area at every edge both fitted
+(`the_same_batches_in_any_order_and_copies_publish_the_same_models`). A feeder lagging by more
+than `FIT_LAG` is where relays part, and the superset rule, the frontiers and the unjudged answer
+are what keep that honest.
+
+*The window* (`TRAILING_WINDOW`, 15 s): long against the fit's time constant (about 12 s) and at
+least three knots (`MODEL_KNOT`, asserted), so a pair fits its rate. What it gives over the pair
+path's scenarios is measured by `tally_mlat_solver`'s `pairwise_path_sweep` (each scenario 120 s,
+the default mix over three seeds, one bad clock jumping, every clock 30 ppm fast with a
+free-running gauge, and world density, 120 receivers in 12 areas, over 60 s), at the window chosen
+and the two longer ones, each run over the same raw:
+
+| W | Scenario | Fixes | Coverage | Horizontal p50, p95 | Refit median: clocks, events | ms a refit, read and fit | Refit cost, ms a feeder-second | Jump found, false jumps |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 15 s | Default mix | 3,053 | 0.944 | 59.0 m, 291.5 m | 10, 245 | 0.3, 0.2 | 0.212 | (none), 0 |
+| 15 s | One clock jumping | 2,660 | 0.952 | 95.8 m, 608.2 m | 10, 245 | 0.3, 0.3 | 0.246 | 41 models, 0 |
+| 15 s | 30 ppm, free gauge | 3,034 | 0.961 | 71.9 m, 467.4 m | 10, 244 | 0.3, 0.2 | 0.220 | (none), 0 |
+| 15 s | World density | 11,270 | 0.948 | 24.4 m, 151.4 m | 61, 1,248 | 3.9, 11.7 | 0.886 | (none), 0 |
+| 20 s | Default mix | 3,052 | 0.901 | 60.0 m, 297.1 m | 10, 324 | 0.4, 0.2 | 0.264 | (none), 0 |
+| 20 s | One clock jumping | 2,667 | 0.931 | 95.2 m, 581.1 m | 10, 326 | 0.4, 0.3 | 0.313 | 53 models, 0 |
+| 20 s | 30 ppm, free gauge | 3,046 | 0.918 | 71.6 m, 472.5 m | 10, 324 | 0.4, 0.3 | 0.275 | (none), 0 |
+| 20 s | World density | 11,282 | 0.946 | 24.3 m, 152.0 m | 61, 1,636 | 5.1, 12.0 | 1.124 | (none), 0 |
+| 25 s | Default mix | 3,049 | 0.908 | 60.0 m, 293.9 m | 10, 403 | 0.5, 0.3 | 0.331 | (none), 0 |
+| 25 s | One clock jumping | 2,675 | 0.916 | 96.7 m, 620.2 m | 10, 405 | 0.5, 0.4 | 0.387 | 65 models, 0 |
+| 25 s | 30 ppm, free gauge | 3,045 | 0.926 | 71.0 m, 463.3 m | 10, 404 | 0.5, 0.3 | 0.345 | (none), 0 |
+| 25 s | World density | 11,275 | 0.948 | 24.3 m, 151.8 m | 61, 2,019 | 7.1, 12.6 | 1.450 | (none), 0 |
+
+Every model passed its verifier and every sampled fix the cold verifier, at every window and in
+every scenario (`pairwise_path_sweep`, release build, 2026-10-26; three seeds of each scene but
+world density, which is one; the default mix's scenes are 10 receivers each, a model's area
+holding a receiver or two). The 15 s rows were measured again once each clock's white noise was
+weighed by its own degrees of freedom (`pair::white_estimate`, below); the 20 and 25 s rows are
+from before it, when the 15 s rows read 0.920, 0.928, 0.912 and 0.945. A longer window buys
+nothing the sweep can see: coverage moves within 0.03 either way and not in one direction, the
+median error within a metre, and no window declares a false jump, while a refit's events grow
+with the window and its cost with them (at world density 1.124 and 1.450 ms a feeder-second at 20
+and 25 s against 0.851 at 15, all before the noise's degrees of freedom). So `TRAILING_WINDOW` is
+15 s, the shortest that holds three knots. Coverage sits inside the 95% band in every scene: 0.944
+to 0.961 in the sparse scenes, where a fix has few hearers and an area's model a receiver or two,
+and 0.948 at world density. Before, the sparse scenes sat at 0.91 to 0.93: a clock's white noise,
+estimated from the scatter of a handful of pairs, was read as if known, and a fix's stated
+covariance understated its error. Each clock's estimate now carries its own degrees of freedom
+(its variance squared over that variance's own variance in the noise system) and is widened by
+`dof / (dof - 2)`, the Student-t predictive rule, with no fewer than `pair::WHITE_DOF_LEAST` (4);
+a clock many pairs inform is left almost as it was, so world density moved by 0.003. By the
+receivers a fix used, every band of 50 fixes or more holds 0.92 to 0.98; the smaller ones (3 to
+41 fixes each) read 0.75 to 1.00, world density's at four and five used 0.895 of 19 and 0.854 of
+41. The per-commit check holds the default mix
+to 0.92 to 0.98 (`pairwise_path_is_calibrated_and_verifies`). The joint tile model's finals had a median error of
+31.5 m over the calibration mix and the carried provisionals 124 to 468 m.
 
 **What a client is sent of MLAT** (amended 2026-10-19, founder). A raw-form solution names each
 reception by receiver, epoch and counter, and a full clock model carries every member's site and
@@ -1217,8 +1419,8 @@ site to metres by reverse MLAT. So both stay on relay links, and a client gets t
 - **A reception key, never sent.** `ReceptionKey` is BLAKE2s-256 over `"tally reception key"
   0x00` and the same signed bytes: a second derivation that no wire ever carries, so a relay holding
   the site record derives it and a client cannot.
-- **Tagged positions** (`Positions` formats 5 and 6, final and provisional; format 6 travels as
-  `Provisional` like format 4). Format 3's and 4's layout with no receiver table, each reception a
+- **Tagged positions** (`Positions` format 8, since wire version 4; formats 5 and 6 before it).
+  Format 7's layout with no receiver table, each considered reception a
   `ReceptionTag`: the first 16 bytes of BLAKE2s-256 over `"tally reception tag" 0x00`, the reception
   key current when the reception was heard, the counter epoch, the 48-bit counter, the message's
   length and the message. Why a key no client can compute, and not the site id first proposed:
@@ -1226,14 +1428,15 @@ site to metres by reverse MLAT. So both stay on relay links, and a client gets t
   over a 48-bit counter is a search of 2^48 (hours on one GPU) from the counter itself. A key that
   no wire carries holds whatever else a client learns. A relay rematches tags against its own raw. A
   client merges by tag sets exactly as by observation sets: the same set is a duplicate, a superset
-  wins, anything else is incomparable.
+  wins by the superset rule (above), anything else is incomparable.
 - **Client clock models** (`ClientClockModel`, kind 0x26), one fixed size: the signer, the full
   model's boot and sequence, issued time, specification version, the full model's id (what
-  solutions cite), its inputs hash (what clients match models by) and the window. It names no
+  solutions cite), its inputs hash (what clients match models by) and its trailing window, by its
+  edge and span (format 2, since wire version 4; format 1 named a window's bins). It names no
   receiver: no key, no site id, no entry per member, no site, no `site_mm`, no offsets. Why not
-  even the members: a tile's members are chosen by their exact sites (a sphere about the tile's
-  centre, then farthest point), so the tiles a receiver belongs to, over time, narrow its site to a
-  fraction of its public cell. Membership is relay-only, like the site. The inputs hash covers site
+  even the members: an area's members are chosen by their exact sites (every receiver among an
+  area receiver's 40 nearest within 600 km, by exact distance), so the models a receiver is a
+  member of, over time, narrow its site to a fraction of its public cell. Membership is relay-only, like the site. The inputs hash covers site
   ids, not sites (specification version 6, §3.3), and a client compares it, never recomputes it.
 - **Fault proofs** of format 1 over two tagged records, which a client checks with nothing else, as
   before. A format 2 proof carries two full models and stays between relays; a tagged record and a
@@ -1256,26 +1459,40 @@ over it. As built:
   site (a `ReceiverSite`, or an older feeder's format 1 description; never a format 2 one, which
   has none) places them in its regions with a clock and location precision the specification
   accepts, and only Mode S receptions.
-- It holds raw compactly and bounded by bytes (48 GiB by default; a held reception is a 24 byte
-  record over an interned message), and refuses at ingest what no rule could use: anything but
-  a Mode S reply or an ADS-B position. Each 5 s bin is thinned canonically when it is sealed (its
-  window's signed wall clocks have passed, plus a settling time): per receiver at most 32 sync
-  events, the targets' receptions all kept, and one aircraft in sixteen kept whole by hash for
-  calibration, so every relay and verifier that seals the same raw keeps the same records.
-- Its work is per (tile, window). Windows run on a stride of eight bins (40 s): a window is
-  eleven bins before its last and one after (65 s), and solves the eight bins since the last
-  stride. Every target heard in the window is assigned its tile, each tile with a target is
-  fitted once (one fit for every aircraft in it) and checked, and its targets' transmissions are
-  solved, each read back from its wire form; one tile in sixteen (by hash) is checked again by the
-  model verifier as any outsider would. A model or a solution that fails is dropped and counted.
-  The work is spread over threads, cut and put back in tile and address order, so any number of
-  threads publishes the same bytes. A relay fits a tile only when its regions cover the tile's
-  whole footprint; it publishes nothing for a tile it covers in part, which a neighbour covers.
-- It publishes, per tile and stride, the model's parts (none when it fits its manifest, the
-  normal case: a model is a few kilobytes, about 6 KB at 30 members), its manifest, then the
-  positions citing it. The manifest frames the specification's bytes rather than restating them,
-  and carries the hash of the model's inputs, which is what a client matches models by.
-- The specification is version 5. Version 5 dates a free-running gauge's origin by the least
+- It holds raw as it arrived, in one pool for every receiver bounded by bytes (relay-wide, sized
+  at the mean kept rate, every receiver still held to its own ceiling), in one-second slices of
+  signed wall clock: a held reception is 16 bytes over its slice's interned messages, each
+  receiver's batches a contiguous frontier. It refuses at ingest what no rule could use (anything
+  but a Mode S reply, an ADS-B airborne position with an altitude, or an operational status with a
+  NACp), and keeps of each batch what its hash thresholds keep: a reference aircraft's sync events
+  (thinned to about `REFERENCE_EVENTS_PER_BATCH` only when the batch carries more), the targets'
+  replies (thinned by `KEPT_KEEP` only over `REPLIES_PER_BATCH`), and one aircraft in sixteen whole by hash for calibration. What
+  one batch keeps is decided by that batch alone, so every relay and verifier holding the same
+  batches keeps the same receptions, in whatever order they came. (Until 2026-10-24 each 5 s bin
+  was thinned when it was sealed, at most 32 sync events a receiver by rank, and raw was held for
+  the windows' 100 s.)
+- Its work is one step a second (as amended 2026-10-24). A step seals what has arrived; refits each
+  area it owns once each `REFIT_EVERY`, at the grid's edge `FIT_LAG` below the step's clock, warm
+  from its previous model (every owned area with a receiver taking part, bounded by its areas and
+  their members, never by demand); takes every transmission whose first reception arrived 1.1 s
+  before (its considered set), when the area most of its hearers are in is one it owns; keeps one
+  an aircraft a 700 ms slot; solves each under the models of the areas its hearers are in (its own
+  and its neighbours', which their relays publish and it verifies over the raw it holds the first
+  time a fix cites one), reads it back from its wire form and verifies it as any outsider would. A
+  model or a fix that fails is dropped and counted. The work is spread over threads, cut and put
+  back in area and address order, so any number of threads publishes the same bytes. A relay
+  holds each owned area's border band (every cell that could hold a receiver within 600 km of the
+  area, `tally_mlat::area`), so it holds every member's raw.
+- It publishes, each step and back to back, each new model's parts (none when it fits its
+  manifest, the normal case) and its manifest, then the fixes citing it, each record raw and at
+  once tagged; a pair model is about 967 bytes a clock. The manifest frames the
+  specification's bytes rather than restating them, and carries the hash of the model's inputs,
+  which is what a client matches models by.
+- The specification is version 8 (2026-10-26): an area's pair model is fitted over a trailing
+  window of what had arrived, cited by frontiers, and every fix names what it considered and what
+  it used and cites one model of each of its used hearers' areas. Version 7 (2026-10-24, never
+  released) fitted the trailing window with version 6's tile model.
+  Version 6 (2026-10-19) named each member's site record by its site id. Version 5 dates a free-running gauge's origin by the least
   bound every cited reception of its clock gives (each was heard at or before its batch's wall
   clock), not by its anchor batch's wall clock alone, which dated every transmission under such a
   gauge up to a second late; rejects a sync message any receiver heard more than once in the
@@ -1297,12 +1514,17 @@ over it. As built:
   refused.
 - A `Positions` transmit time is in Unix picoseconds: model time is whole picoseconds, and
   rounding to the nanosecond moves a well-observed solution past the verifier's optimality bound.
-  Model time zero is UTC when the tile's gauge is GNSS-disciplined, and otherwise the gauge's
-  signed batch wall clock. `Positions` is format 3: each solution carries its addressed citation
-  (the hash and count of what its canonical assignment was computed from).
-- The same raw, delivered in any order and any number of times, and two relays that both cover
-  a tile's footprint, publish byte-identical models and identical solutions for that tile (the
-  reference implementation's property; the protocol asks only optimality within tolerance).
+  A fix's timeline is dated by its reference clock: a GNSS-disciplined one by its reading on the
+  UTC day its batch's wall clock is in, a free-running one by its model's `heard_ns` (the latest
+  its lowest count in the window can have been heard) and its nominal time since, so a
+  reception's own batch wall clock never moves a free-running fix. `Positions` is format 7 (since
+  wire version 4): each fix names the models it cites (by id, ascending), the receptions it considered (two-byte count) and a mask of which it used, so the used set
+  is a subset by construction. Formats 3 to 6 (each fix's addressed citation, and the provisional
+  formats) are retired.
+- The same batches, arriving in any order and any number of times, and two relays that both hold
+  an area's border band and the same batches by an edge, publish byte-identical models and
+  identical fixes for that area (the reference implementation's property; the protocol asks only
+  optimality within tolerance).
 - A model of any size can still be published: one signed manifest and, when the model does not
   fit it, unsigned content-addressed parts (`ClockModelPart`). The model's encoding is cut into
   fixed 60 KiB parts; the manifest carries the relay's header, the spec version, the inputs hash,
@@ -1314,74 +1536,78 @@ over it. As built:
   then forwards those the manifest lists, in index order, ahead of it, and drops the rest; a
   listed part that arrives after its manifest is forwarded once. A client reassembles the
   model, checking every part against the manifest, before it decodes it.
-- A relay's MLAT is held to an intake ceiling of its own (§3.6), told to it as a `RateLimit`, and
-  paces what it publishes to it. The default, 8 MiB/s, is sized from what the MLAT publishes:
-  in the end-to-end tests, 10 receivers and 14 aircraft publish 163 KB of models and 154 KB of
-  positions for 906 solutions over 5 bins, and 30 receivers 6 KB a model and 360 bytes a
-  solution. A model grows with its members (about 270 bytes a receiver at 13 knots, so 13 KB at the
-  48 most), and a solution with the receptions it cites (12 bytes each). A dense region of 300
-  aircraft, each heard by more than 48 receivers, is then about 3.9 MB of models and 2.8 MB of
-  positions (5,100 solutions of some 40 receptions) a 5 s bin, 1.3 MB/s. The whole world on one
-  node is about 1.2 MB/s of models (3,800 a 40 s stride), 1.0 MB/s of final positions (2,800
-  solutions a second) and 2.0 MB/s of provisional ones (one a target a second, 5,400 targets,
-  some 370 bytes each: measured, a provisional record is no smaller per solution than a final
-  one, and there are as many), 4.2 MB/s; the default is about twice that. What an MLAT link at its ceiling costs a relay is bandwidth, not memory: what it sends
-  passes through the fan-out ring and the parts table, both bounded, and goes out again to every
-  subscriber of positions or clock models, a slow one dropped. MLAT links count against the
-  subscriber cap, so an operator sizes that cap and the MLAT ceiling to the host's link.
-- What the whole world costs one relay is set by the tile, the stride, the targets and the
-  reception rate, and measured in release by the simulator at 20,000 receivers (about 5,400
-  targets a window, on 3,800 tiles; `world_scale_one_node`, re-measured 2026-10-08 for RFC-0181).
-  At the real rate, about 320 wanted receptions a second a receiver (a real receiver hears about
-  600 a second, 60% of them wanted; the simulator comes nearest with every receiver in reach
-  hearing every transmission), 41 cores keep up: 1,300 core-seconds of fits (a tile fit 0.35 s a
-  core) and 300 of solving, every solution verified, a 40 s stride, on 32 threads. One window (20
-  bins, 100 s) holds 289 million observations after thinning (145 a receiver a second of the 324
-  wanted), 8.7 GB at 30 bytes an observation with the index, every byte counted as allocated;
-  sealing a bin of the whole world (65 million receptions) takes 2.0 s on 32 threads, at most 13
-  cores more. The first measurement, at a rate an eighth of the real one (39 wanted a receiver a
-  second), gave 29 cores and 1.6 GB a window (46 million observations at 35 bytes; the 70 million
-  it once named were held over the 30 bins of its run, not the 20 of a window), and that figure is
-  superseded: the fits barely change with the rate, since a tile's events are capped, but the
-  solves and the raw grow with it. Indexing a window takes 40 ms and assigning every target 0.8 s
-  on 32 threads. A tile's
-  fit plus its folded calibration takes 71, 95 and 107 ms at 100, 300 and 1,000 receivers, and an
-  outside verifier checks it in 23 to 34 ms. Each choice that sets this was measured, and the
-  trade is stated:
-  - *Stride 8.* Fits a solved bin cost 21.4, 11.0, 5.7 and 2.9 at stride 1, 2, 4 and 8 (0.86,
-    0.45, 0.24 and 0.13 s), at the same coverage (0.958 to 0.963), for a final position 14.5,
-    17, 22 and 32 s late on average; at the first measurement's rate the world needed 34 cores
-    at stride 4 and 27 at 8 (41 at 8 at the real rate). The cost
-    of the eighth is latency: a final MLAT position arrives 7 to 47 s after it was heard.
-  - *Sixteen sync aircraft a tile.* At 8, 16, 32 and every one, coverage is 0.964, 0.946, 0.949
-    and 0.953 and the median error 52.6, 36.1, 33.6 and 36.1 m, for 20, 31, 45 and 49 s of fits
-    over the busy scenario; 16 buys most of the accuracy for two thirds of the cost of 32.
-  - *Warm starts are not used.* Starting a fit from the previous stride's model cut a fit
-    started at the bound from 55 to 8 ms, but from a real previous stride it took 94 ms against
-    62 ms cold, so the relay starts cold.
-- The simulator's calibration holds under a realistic clock mix (a third of receivers at 50 to
-  100 ns, a third at 250 ns, a third dump1090-class at 500 ns) and each aircraft's GNSS error
-  drawn once from its NACp: with the published floor and inflation stripped, the truth is inside
-  the 95% ellipsoid for 0.953 overall and 0.952 for Mode S only over forty scenarios, 0.945,
-  0.961, 0.955 and 0.951 at the four tile levels, 0.959, 0.944 and 0.955 by altitude band, and
-  0.950 for transmissions whose hearers lie outside their tile, for a median horizontal error of
-  31.5 m; the published ellipsoid covers 0.979 (version 3: 0.950, 0.949, 0.938 to 0.957, 0.939
-  to 0.956, 0.948, 31.4 m and 0.979). All clocks at 80, 250 or 500 ns give 0.940 to
-  0.942. Fixes are jointly calibrated: two aircraft under one model cover 0.965 jointly, one
-  aircraft's consecutive fixes 0.956, their clock correlation 0.002 to 0.005; gluing two tiles'
-  fixes as if independent gives 0.87 to 0.90, the overconfidence the model id exists to show. An
-  aircraft crossing from one tile to the next moves its published fix by a median 0.004 and a
-  95th percentile 0.034 squared sigmas. With 500 ns on every receiver and one bad clock stepping
-  5 to 10 µs every 2 s, 77 tiles fit, the bad clock is dropped where the jump rule finds it (7
-  tiles) and coverage is 0.943 with no false jump. Every clock 30 ppm fast with a free-running
-  gauge, the fit measures the gauge's rate (16 of 16 within three sigmas) and covers 0.945
-  against 0.961 with a GNSS gauge. Receivers that declare GNSS and are not what they declare
-  (one stamping 120.6 µs late throughout, one with 300 µs of jitter, beside an honest one) cost
-  no fit and cover 0.953; one that declares GNSS and whose counter is noise at a millisecond
-  costs no fit and no honest clock and covers 0.965. Taking each message's GNSS error as independent, as the first version did, gave 0.933
-  against 0.938 with the bias, and 0.916 against 0.939 when every reference aircraft is NACp 8.
-- **Calibrated over real receivers** (§10, step 7; measured 2026-10-08,
-  `tally/crates/mlat-calibrate`, whose crate documentation states the method). The data is
+- What a relay's MLAT publishes reaches its neighbours over their member sessions (§3.6), so it is
+  held to the rate their members share, `--max-member-bytes-per-sec`: 1 MiB/s by default, planned
+  once as the 128 feeders it is worth (`hub::DEFAULT_MAX_MEMBER_BYTES_PER_SEC`), which an operator
+  hosting MLAT for many seats raises, with the memory to match (amended 2026-10-26: this read 8
+  MiB/s, the per-member default `hub` replaced on 2026-10-08 with one shared rate, so a relay with
+  many members no longer planned each a budget of its own). It is sized from what the MLAT publishes: in the
+  end-to-end tests, 10 receivers and 14 aircraft publish 163 KB of models and 154 KB of positions
+  for 906 solutions over 5 bins, and 30 receivers 6 KB a model and 360 bytes a solution (measured on
+  the windowed engine). A pair model grows with its members and their pairs (about 967 bytes a
+  clock at world density, each clock keeping 40 neighbours), and a fix with the receptions it
+  considers (12 bytes each, and a bit of the used mask). Since 2026-10-24 an area's model is
+  published as often as it is refit, every two seconds, where a tile's was once a 40 s stride, and
+  each transmission is published once as a fix (again only when a bigger considered set is solved),
+  where it was a final and a provisional: at world density a model is 967 bytes a clock and a
+  receiver a member of 5.84 areas' models, refit every 2 s, so about 2.8 KB of models a hosted
+  receiver a second (`pairwise_path_sweep`), some 5.6 MB/s for 2,000 seats before any position
+  (1,309 bytes a clock and 7.6 MB/s before the wire named a clock and a pair's clocks by their
+  index in the model, with two-byte counts, and carried the variances and kappas in single
+  precision, 2026-10-26: the verifier's tolerances are far coarser than single precision's, and
+  the producer derives its rate system from the rounded values, so the model it signs is the one
+  it fitted). Its positions are 2.6 fixes a seat a second at world density, each of about 30
+  receptions considered, planned at most `consistency::POSITIONS_BYTES_PER_SEAT_PER_SEC` a seat
+  (the windowed engine's world on one node was about 1.2 MB/s of models, 1.0 MB/s of final
+  positions and 2.0 MB/s of provisional ones, 4.2 MB/s). Measured by `tally-load` at 2,000 feeders
+  on 16 cores with the measured mix (2026-10-26, 780 seats settled), a seat publishes 5.4 KB of
+  models and 2.05 KB of positions, raw and tagged, a second: 7.5 KB together, so the 1 MiB/s
+  default carries about 140 seats, the world relay's planned seats (`tally-relay check`, RFC-0181
+  "What it admits") about 5 MB/s, and 2,000 seats about 15 MB/s. The members' rate is a resource
+  the operator states, as the memory and the cores are, for the members' raw; their products are
+  paced apart, at what the seats hosted bring, so the seats never wait on a rate an operator sized
+  for raw and raising them plans no more raw ingest (amended 2026-10-27:
+  `budget::Plan::member_products_bytes_per_sec`, `ingest::MemberPace`; before, the products spent
+  the members' rate and the plan bounded the seats by it, `Bound::Members`, 125 at the default). A model is published only once a
+  fix cites it (`Step::models`), and only the models a fix cites are verified. The raw and tagged
+  twins of each fix share no bytes on the wire: each is a record signed whole, forwarded byte for
+  byte, and a fault proof is two records standing alone, so a twin that named the other's bytes
+  would be a new wire version. What an MLAT link at its ceiling costs a
+  relay is bandwidth, not memory: what it sends passes through the fan-out ring and the parts table,
+  both bounded, and goes out again to every subscriber of positions or clock models, a slow one
+  dropped. MLAT links count against the subscriber cap, so an operator sizes that cap and the MLAT
+  ceiling to the host's link.
+- What the whole world costs is set by the receivers' pairs, the refits, the targets and the
+  reception rate, and is planned per seat, never measured on one node: no one relay carries the
+  world (RFC-0174 §2.3). The plan is `tally_relay::cores` and `tally-relay check`, from the pair
+  sweep's world density (`pairwise_path_sweep`, 120 receivers and 180 aircraft over 150 km, every
+  receiver keeping its full 40 neighbours, in 12 areas, 60 s, release build): a refit's median area 61 clocks and 1,248 sync events, 3.9 ms reading its window and 11.7 ms fitting it; refitting 0.872 ms of a core a feeder-second, verifying the neighbours' models a relay's fixes cite 0.387, solving 0.682 (`tally_relay::cores` plans the same; the table's run read 0.886 refitting, as the sweep's timings move by about 2% from run to run), so about 39 cores were the world's 20,000 receivers on one relay; 155 receptions kept a feeder-second, and 2.6 fixes published from 3.2 transmissions solved a feeder-second, each considering 30 receptions (`backoff::Published::MEASURED`, which the sweep fails past). The
+  raw held is the trailing window, `SIGNED_LAG` and a step of thinned raw, in the relay-wide pool
+  at the mean kept rate (150 kept receptions a seat a second over `arrived::HELD_MS`, 32.5 s, about 273 kB a seat of the 0.90 MB its `Arrived` store plans). Measured for the windowed engine (2026-10-08, for RFC-0181),
+  before the amendment: 41 cores kept up with the world on one node, 1,300 core-seconds of joint
+  tile fits and 300 of solving a 40 s stride, and one 100 s window held 8.7 GB of raw. The trades
+  that engine made are superseded: its stride of eight bins bought cores with latency (a final
+  position 7 to 47 s after it was heard), which a refit every two seconds over a short window does
+  not need; its sixteen reference aircraft a tile were a top-k, replaced by the `REFERENCE_KEEP`
+  threshold; and it started every fit cold, where a pair refit two seconds after the last starts
+  from the last knots.
+- The simulator's calibration of the pair path (version 8, 2026-10-26, `pairwise_path_sweep`; the
+  per-commit check is `pairwise_path_is_calibrated_and_verifies`, held to 0.92 to 0.98 over the
+  default mix): at the 15 s window, over three seeds of the default mix (120 s each, 10 receivers a seed),
+  coverage 0.944 of 3,053 fixes, a median horizontal error of 59.0 m and a 95th percentile of
+  291.5 m; with one receiver's counter stepping once and another's every 2 s, 0.952 and 95.8 m
+  (the jump declared in 41 models, no false jump); with every clock 30 ppm fast and a free-running
+  gauge, 0.961 and 71.9 m; at world density (120 receivers in 12 areas, 60 s), 0.948 of 11,270
+  fixes, 24.4 m and 151.4 m, a fix citing 8.04 areas' models whose pairs hold 0.983 of the
+  network's pairs among its used hearers. Every model passed its verifier and every sampled fix
+  the cold verifier. Every scene sits inside the 95% band, each clock's white noise weighed by its
+  own degrees of freedom (0.91 to 0.93 in the sparse scenes before, 2026-10-26). The joint tile model's calibration (version 5, measured before the
+  amendment) is the comparison: with the published floor and inflation stripped, the truth was
+  inside the 95% ellipsoid for 0.953 overall over forty scenarios of a realistic clock mix, for a
+  median horizontal error of 31.5 m, and the published ellipsoid covered 0.979.
+- **Calibrated over real receivers** (§10, step 7; measured 2026-10-08 on the windowed engine,
+  version 4, `tally/crates/mlat-calibrate`, whose crate documentation states the method; the same
+  hour through the version 8 engine: against the truth model, 0.954 overall (0.959 published) and 0.970 over the 45 sensors LocaRDS verified (0.973), a fix for 0.798 of the eligible (aircraft, 0.7 s slot) pairs (311,365 fixes), and a median horizontal error of 85.2 m (80.1 m over the verified sensors), measured 2026-10-26 on four threads, where version 4 gave 0.895, 0.941 and 121 m). The data is
   OpenSky's LocaRDS (Strohmeier et al., Sensors 2021; Zenodo 10.5281/zenodo.4739276, CC BY-SA
   4.0, `fetch.sh` downloads and checks it): one hour of Europe (subset 2, 460 MB zipped), 6.5
   million ADS-B positions heard by 317 crowdsourced sensors with each sensor's own nanosecond
@@ -1440,38 +1666,6 @@ over it. As built:
   roots that both fit perfectly; the solver also starts it from a ring about the receivers, and
   refuses it when a second fit as good lies outside the first's 10^-6 ellipsoid (one such DF4,
   published before this rule, was 52 km out at 101 m sigma).
-- **Provisional positions** (decided 2026-10-06, RFC-0174 §2.4): a final position comes 7 to 47 s
-  after its transmission, so the MLAT also solves each target's transmissions about a second
-  after they are heard and publishes them as `Provisional` records (kind 0x10; `Positions`
-  format 4, format 3's layout with no addressed citation), which only a subscriber that set
-  `Streams::PROVISIONAL` (16) is sent; a relay forwards them in a stream sequenced apart from
-  final positions, below them in its egress classes. As built (`tally/crates/mlat/src/provisional.rs`,
-  the solver's crate documentation § Provisional solutions):
-  - *What and when*: the replies of a target (no ADS-B position heard in the last 65 s, or in its
-    bin's calibration sample), solved once 1.1 s has passed since the first of a transmission's
-    receptions arrived (a feeder seals a batch once a second, so receptions arrive spread over
-    that second by the receivers' phases; mlat-server's 0.9 s is for clients that stream), at
-    most one an aircraft a second.
-  - *Under what*: the newest published model of the tile whose members are the most of the
-    receivers heard, carried past its knots along each clock's last interval, at most 90 s (a
-    spec constant covering the longest a tile's newest model is behind a reception: the stride and
-    the window's last bins, 45 s at stride 8, its settling, 11.5 s, the ripening, 15 s, how far a
-    reception runs ahead, 7.5 s, and a bin of rounding, 84 s in all, asserted at compile time;
-    beyond it the model maps nothing). The clock covariance grows by the curvature prior's integrated random walk over
-    the carry, a stated formula, and the error floor, inflation and 1.5 km cap are a final
-    position's. A provisional is a deterministic function of its model, its receptions and the
-    spec, so it is verified as a final one is (the model carried, against the receptions it was
-    solved from), and the fault proof that holds finals holds it: two signed solutions of one
-    observation set, model and spec, provisional or final, that disagree beyond tolerance.
-  - *Measured* (the simulator, feeders sealing at phases of their own and paths of 40 to 250 ms):
-    published a median 1.34 s after the transmission, 1.65 s at the 95th percentile, 3.0 s at
-    most (an aircraft's first, waiting for a model). Calibration with the floor and inflation
-    stripped: 0.940 carried up to 20 s, 0.947 from 20 to 45 s, 0.975 from 45 to 90 s, 0.956 of
-    5,076 overall (0.982 published), for median horizontal errors of 124, 237 and 468 m. The carry
-    costs precision, not honesty. Over real receivers (above; version 4, the same hour and truth
-    model): 0.929 of 139,600 (0.936 published), 0.962 over the verified sensors alone and 0.959
-    for the verified aircraft, for a median horizontal error of 151 m (version 3: 0.913 of
-    111,955, 174 m).
 - The client merge rule is implemented once, `tally/crates/merge` (`tally-merge`), for every
   client; `tally-api` is the first. It reads positions, clock models (reassembled part by part
   against their manifests), fault proofs and, until 2026-10-19, optionally raw, from any number of
@@ -1480,7 +1674,7 @@ over it. As built:
   per aircraft its latest transmissions (eight), each with the fix kept and up to four
   alternatives:
   - *One transmission, only on evidence*: two solutions are of one transmission when they name
-    one aircraft with the same message bytes and either share a reception, or are tied through a
+    one aircraft with the same message bytes and either their considered sets share a reception, or are tied through a
     clock model: a receiver one cites is a clock of the other's model, which maps that reception
     to its own model time, and less the range from the other's position that is the other's
     transmit time within 2 µs (every such receiver agreeing). A receiver in both with no reception
@@ -1494,71 +1688,68 @@ over it. As built:
     merged; the aircraft's track holds both as separate transmissions and serves the latest.
     Since 2026-10-19 a client joins two solutions only on a shared tag: the tie through a clock
     model needs a reception's counter and the model's offsets, and a client holds neither.
-  - *The full input set* is the observation set and the cited model's inputs hash; its identity is
+  - *The full input set* is the considered set and the cited model's inputs hash; its identity is
     BLAKE2s-256 over `"tally merge input set" 0x00`, the set's hash and the inputs hash. The same
-    set is a duplicate (dropped; its signer joins the fix's relays). Under the same model inputs a
-    superset of observations wins and a subset is dropped. Anything else is incomparable.
-  - *Incomparable, holding the raw* of every cited observation: the client finds the
-    aircraft's canonical tile from its raw, fits that tile's model, solves the transmission and
-    verifies it as a relay would; that fix stands above the ones it was solved from. Since
-    2026-10-19 only a relay holds raw, so a client always takes the tie rule below; a relay that
-    holds both solves their union and publishes it.
-  - *Incomparable, without the raw, the tie rule*: the fix with the greater weight (observations
-    cited plus the model citation's input count, so a superset under one model always ranks
-    first), then the lowest input set hash, is kept; the other is recorded as an alternative.
-    Both are functions of the solution alone, so every client holding the same solutions keeps
-    the same one, in any order.
-  - *Checked before it counts*: the cited model is held, whole and signed, decodes under its spec
-    version, and its manifest's inputs hash is the hash of what the decoded model is a function
-    of; the solution cites only the tile's members and reads back as a claim under it. Without
-    raw that is all (signatures and content addresses only), and the fix says so. When the
-    client's own raw rebuilds the tile's members and inputs and the solution's addressed
-    citation exactly, and the canonical assignment puts the aircraft in the cited tile, the model
-    is verified by the model verifier once and every solution under it by the solution verifier;
-    a failure is dropped. A client whose raw does not reproduce a citation does not hold that
-    model's raw and falls back to the signature check. Since 2026-10-19 no client holds raw, so
-    every client's check is the signature check, and the check against raw is a relay's. Models are matched by the hash of their
-    inputs, never by their bytes, so two honest relays' models of one inputs that differ in the
-    last bits are the same evidence.
+    set is a duplicate (dropped; its signer joins the fix's relays). A fix over a superset of a
+    smaller one's considered set is the ordinary case since 2026-10-24: an engine publishes a fix
+    as soon as it can solve one and again when more receptions of the transmission arrive. One
+    that agrees with the smaller within the smaller's covariance (RFC-0174 §2.12) supersedes it,
+    and under the same model inputs drops it. One that disagrees supersedes only when a holder of
+    its raw verified it and its receivers carry more standing; a client holds neither, so for it a
+    disagreeing superset is unjudged and stays contested, kept as evidence while the smaller
+    stands, and the API says so (`contested`). A client trusts the relay's consistency gate for
+    the rest: a relay forwards no fix that disagrees with its own receptions (§3.8.2). Anything
+    else is incomparable.
+  - *Incomparable*: until 2026-10-19 a client holding the raw of every cited observation solved
+    the transmission itself. Only a relay holds raw now: a relay that holds both solves their
+    union and publishes it, and a client takes the tie rule.
+  - *Incomparable, the tie rule*: the fix with the greater weight (the tags it used), then the
+    lowest input set hash, is kept; the other is recorded as an alternative. Both are functions of
+    the fix alone, so every client holding the same fixes keeps the same one, in any order.
+  - *Checked before it counts*: the record verifies under its engine's key; the model summary it
+    cites is held, signed by the same engine and of the specification the record names; and the
+    fix's message names its aircraft. That is all a client can check (signatures and content
+    addresses), and the fix says so; until 2026-10-19 a client whose own raw rebuilt the tile's
+    members and inputs verified the model and every fix under it, and since then the check
+    against raw is a relay's. Models are matched by the hash of their inputs, never by their
+    bytes, so two honest relays' models of one inputs that differ in the last bits are the same
+    evidence.
   - *Fault proofs*: a checked proof marks the relays it names faulted; what stood on their word
-    alone is dropped (a transmission keeps its best remaining fix), their models are forgotten,
-    and nothing they sign later counts.
-  - *Provisional fixes*: checked as a final solution is without raw (signatures and content
-    addresses: the raw a model was fitted from cannot reach receptions newer than its window),
-    held apart from the final transmissions, at most two a signer an aircraft a second of transmit
-    time and 128 an aircraft. A provisional ranks below every final fix: what is served is the
-    latest final fix, unless a provisional one is later by transmit time. A final fix of the same
-    transmission (the evidence rule above) supersedes it, and one arriving after that final is not
-    held; a final fix of the aircraft within 2 s that puts it inside a 0.999 gate (both horizontal
-    covariances, and 300 m/s of motion over the time between them plus a second for the models'
-    origins) confirms it. Retraction needs no message: a client learns it by the deadline rule,
-    one neither superseded nor confirmed 108.5 s after it arrived (by the client's clock; a final
-    leaves its engine within 91.5 s of its transmission, `tally_wire::budget::FINAL_FIX_LEAVES`,
-    and 108.5 s is the one bound every party waits on, `tally_wire::products::FINAL_FIX_ARRIVED_MS`)
-    is retracted, forgotten, and
-    counted against its signers. Measured over a live MLAT and its own finals, 1,109 provisionals:
-    382 superseded, 726 confirmed, 1 retracted.
-  - *Bounded*: aircraft, models, solutions waiting for their model, faulted keys, resolved fits,
-    provisional fixes and raw are each capped, least recently active forgotten first (the relay's
-    table), raw also by bin as the client's clock moves on.
+    alone is dropped (a transmission keeps its best remaining fix, and a superset the dropped fix
+    refused is judged again without it), their models are forgotten, and nothing they sign later
+    counts. A verdict that comes late moves the answer once and never back.
+  - *Bounded*: tracks, models, fixes waiting for their model and faulted keys are each capped by
+    count, least recently active forgotten first (the relay's table).
 
-  `tally-api` subscribes with `--relay` to final and provisional positions (`--mlat-raw`, which
-  read raw, is gone since 2026-10-19), and serves an aircraft's merged MLAT position when readsb holds no ADS-B position for
-  it, stating `position_source` (`adsb` or `mlat`) and, for MLAT, the horizontal sigma, the check
-  it passed (`model`, `signature` or `resolved`; with no raw, `signature`, §3.8.2) and its `kind`
-  (`final`, or `provisional` while later than every final fix).
+  `tally-api` subscribes with `--relay` to positions and clock models (`--mlat-raw`, which
+  read raw, is gone since 2026-10-19), and serves an aircraft's merged MLAT position when readsb
+  holds no ADS-B position for it, its newest fix, a few seconds after it was heard: it states
+  `position_source` (`adsb` or `mlat`) and, for MLAT, the horizontal sigma, the check it passed
+  (`model`, `signature` or `resolved`; with no raw, `signature`, §3.8.2), its confidence
+  (`unconfirmed` at a client, which holds no standing) and whether a bigger fix contested it. Its
+  `kind` (`final` or `provisional`) is gone with wire version 4.
 
 #### §3.8.2 Who checks a position
 
 Verification is delegated, not universal. No one checks every fix against raw, and nothing here
 needs anyone to; each fix is checked by whoever is placed to, and says which check it passed.
 
-- **The relay that signs it.** A relay's MLAT verifies every solution it signs as any checker
-  would, from the raw it holds (`publish::solve_published`, every one; one that fails is dropped
-  and counted). It does not verify its own clock model: that is for others.
-- **The other relays holding the area.** Every relay that covers an area's tiles holds the same raw
-  (§3.8.1) and computes the same positions to the same bytes. Two signatures over the same inputs
-  that disagree are a fault proof (`FaultProof`), which anyone checks with the two signed records
+- **The relay that signs it.** A relay's MLAT verifies every fix it signs as any checker
+  would, from the raw it considered (`publish::solve_fix`, then the verifier again over what it
+  considered, every one; one that fails is dropped and counted). It does not verify its own clock
+  model: that is for others.
+- **The relays that forward it to a client.** A relay sends a client a tagged fix only after
+  pairing it with its raw twin, the record its engine's link brought just before it, and finding
+  every fix under its model and consistent with its own receptions (`tally_relay::consistency`,
+  RFC-0174 §2.12); one that fails is sent to no one, and one it cannot check goes to relays alone.
+  A disagreeing superset is verified lazily, by a relay holding its raw, capped per engine a
+  second (`VERIFY_PER_ENGINE_PER_SEC`, 32; RFC-0174 §2.12).
+- **The other relays holding the area.** Every relay that holds an area's border band receives the same
+  raw (§3.8.1), and computes the same positions to the same bytes from the batches that had
+  arrived when it refit and solved: since 2026-10-24 two relays agree on a model's inputs only when
+  the same batches had arrived at both, and otherwise publish incomparable models, each verifiable
+  from the batches its frontiers cite. Two signatures over the same inputs that disagree are a
+  fault proof (`FaultProof`), which anyone checks with the two signed records
   alone, no raw needed, and which travels to every reader of positions (to a client, of two tagged
   records, §3.8.1).
 - **A client holding raw** (the API with `--mlat-raw`) checked a fix itself: the model by the model
@@ -1581,8 +1772,13 @@ solutions of one inputs hash within the verifier's tolerance, which merge as one
 signers whose declared networks differ (`ProviderOffer::network`, the same proxy for independence
 the delivery check uses, RFC-0174 §2.2). The API reports, per fix, the count of independent
 agreeing signers beside `MlatCheck`, so a client can require two and a map can mark a fix that has
-one. Nothing is refused for having one: a lone relay's fixes are served, counted as one. The
-directory aims to place at least two relays of different operators on every area (RFC-0174 §2.9),
+one. Nothing is refused for having one: a lone relay's fixes are served, counted as one. Since
+2026-10-24 a model's inputs are what had arrived at its relay by its edge, which trails the clock
+by `FIT_LAG`, so two relays sign one inputs hash whenever the same batches had reached both by
+then: given the same batches in another order, with copies and up to 200 ms more delay each, two
+holders publish the same model bytes for every area at every edge both fitted
+(`tally_mlat_solver`'s `the_same_batches_in_any_order_and_copies_publish_the_same_models`); only a
+feeder lagging its relay's clock by more than `FIT_LAG` parts them. The directory aims to place at least two relays of different operators on every area (RFC-0174 §2.9),
 and the count is how a client sees where it has not yet.
 
 Open, to build: the merge already joins a duplicate's signer to the fix's relays (§3.8.1, "the
@@ -1717,8 +1913,17 @@ roughly $200 to $700 a month on budget hosting; today it is one server.
   branch from a leak; a client's egress is a type that cannot hold a site (§3.6).
 - **Keying reception tags by the site id.** As first designed the site id was public in client
   clock models, so its tags would fall to a 2^48 search; the key is one no wire carries (§3.8.1).
-- **Naming a model's members to clients.** Tile membership is chosen by exact site, so it narrows
+- **Naming a model's members to clients.** An area's membership is chosen by exact site, so it narrows
   a site below its public cell over time (§3.8.1).
+- **Final MLAT fixes over settled windows, and provisional ones beside them** (2026-10-24). A
+  window decided by signed wall clocks had to wait for every honest receiver's raw of it, so a
+  final fix reached its readers 80 to 110 s after it was heard and every table that held it or
+  its raw held it that long (49.4 MB a hosted receiver); the provisional fix that covered the wait
+  was solved under a model carried up to 90 s. One fix class, solved a second after it is heard
+  under a model refit every second over what had arrived, replaces both (§3.8.1).
+- **The precise world product** (2026-10-24). It was the world sealed once the finals had surely
+  arrived, 108.5 s after its second; with no finals there is nothing for it to wait for (RFC-0174
+  §2.11).
 
 ## §8 Founder rulings (2026-10-05)
 
@@ -1766,6 +1971,14 @@ roughly $200 to $700 a month on budget hosting; today it is one server.
    record, wire version 3, a client egress typed so it cannot hold a site, tags, client clock
    models, the public cell as the one cell clients see); the reception key in place of the site
    id as the tags' key was the wire writer's, accepted the same day.
+7. **MLAT in seconds (2026-10-24):** three critics put to why a final fix took 80 to 110 s and a
+   seat 49.4 MB. Estimation: refit a trailing window every second, warm, and solve under the newest
+   model, never a carried one. Verification: a model's inputs are what had arrived, cited by
+   frontiers; every canonical selection a hash threshold; a fix names what it considered and what
+   it used, and omission is judged only inside the considered set; a disagreeing superset wins
+   only verified and with more standing, or an early subset freezes the honest bigger fix out;
+   twins paired back to back. Memory: a model's fixed parts per area, one relay-wide pool of kept
+   raw at the mean, raw charged after thinning, and everything that waited for a window gone.
 
 ## §10 Build steps
 
@@ -1812,3 +2025,16 @@ roughly $200 to $700 a month on budget hosting; today it is one server.
    records and the typed client egress, relay and engine links at version 3 only (the minimum
    for those roles is 3 from this release; relays and feeders move together), feeders that
    publish only to version 3 relays, and the MLAT specification's version 6.
+9. **MLAT in seconds** (2026-10-24), in one release with no migration window (§3.3, §3.8.1): wire
+   version 4 (positions formats 7 and 8, the provisional kind, the precise world product and their
+   streams retired), the MLAT specification's version 8 (an area's pair models over a trailing
+   window, cited by frontiers, thresholds for every canonical selection, considered and used sets,
+   fixes citing one model of each used hearer's area), the engine's one step a second, the relay's
+   hosted MLAT and its stores re-planned, standing settling at `FIX_ARRIVED`, twins paired with no
+   buffer, and the merge, the API and the client core's reads moved together. Measured: the window
+   of 15 s chosen by `pairwise_path_sweep` (refit 0.851 ms a feeder-second at 15 s, coverage within
+   0.03 at 20 and 25 s); a coverage of 0.948 and a median of 24.4 m at world density, 0.944 to
+   0.961 and 59 to 96 m in the sparse scenes (0.91 to 0.93 before each clock's white noise carried
+   its degrees of freedom); LocaRDS 0.954 over the hour (0.970 on its good sensors);
+   `tally-relay check`'s floors pass with about 2.6 MB a seat and 2,022 seats, bound by cores
+   (they fail since the load test's costs were planned: 489 seats, RFC-0181 "MLAT in the cores").

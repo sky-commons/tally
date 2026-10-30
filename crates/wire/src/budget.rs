@@ -23,25 +23,22 @@
 //! | [`K`] | 15 s | two relays' clocks apart: `2E` |
 //! | [`SELECTION_LAG`] | 17 s | a trusted reference's width, so how far below true time its low end, which a feeder signs at, may be: `2(E + U_m)` |
 //! | [`ANCHOR_AGE`] | 4 s | an honest anchor's age as a batch is signed by it: `P + δ + 2P` |
-//! | [`MLAT_BATCHING`] | 2 s | a receiver's last raw of a bin, gathered and on its way |
-//! | [`MLAT_SOLVE`] | 80 s | a final MLAT fix's way out of its engine, its window's last bin settled |
-//! | [`PROVISIONAL_SOLVE`] | 4 s | a provisional MLAT fix's way out of its engine, its first reception in |
+//! | [`MLAT_BATCHING`] | 2 s | a receiver's raw of a moment, gathered and on its way |
 //! | [`FIX_SOLVE`] | 4 s | an MLAT fix's way out of its engine, its first reception in |
 //! | [`FIX_SETTLE`] | 1.1 s | how long the engine waits for a transmission's later receptions after its first |
 //! | [`ARRIVED_SLICE`] | 1 s | the slices the engine seals what has arrived in |
-//! | [`MODEL_KNOT`] | 5 s | a clock model's knot spacing |
-//! | [`REFIT_EVERY`] | 1 s | how often a tile's trailing-window model is refit |
-//! | [`TRAILING_WINDOW`] | 20 s | the sync raw a trailing-window model is fitted over |
+//! | [`MODEL_KNOT`] | 5 s | a pair's knot spacing |
+//! | [`REFIT_EVERY`] | 2 s | how often an area's pair model is refit: the refit grid |
+//! | [`FIT_LAG`] | 2 s | how far a model's trailing edge trails its refit's clock: `MLAT_BATCHING` |
+//! | [`TRAILING_WINDOW`] | 15 s | the sync raw a trailing-window model is fitted over |
 //!
 //! What follows from them is each derived below with the error each term absorbs: the feeder's,
 //! peers' and anchors' windows, [`OWN_ANCHOR_OLDEST`] (blame, measured on the origin's raw
-//! monotonic clock), the hosted MLAT's [`MLAT_AHEAD`] and [`MLAT_SETTLE`], when a final fix has
-//! left its engine ([`FINAL_FIX_LEAVES`]) and surely arrived ([`FINAL_FIX_ARRIVED`]), when a live
-//! world fix has been offered where it was heard ([`LIVE_FIX_LEAVES`]) and surely arrived wherever
-//! the world is gathered ([`LIVE_FIX_ARRIVED`], the live world's settle), the one fix's signed lag
-//! ([`SIGNED_LAG`]), way out ([`FIX_LEAVES`]), arrival ([`FIX_ARRIVED`]) and carry
-//! ([`MAX_CARRY`]) (RFC-0171 §3.8.1 as amended 2026-10-24, which retires the final and
-//! provisional terms in phase 1), the feeder
+//! monotonic clock), the hosted MLAT's [`MLAT_AHEAD`], and of its one class of fix (RFC-0171
+//! §3.8.1 as amended 2026-10-24) the signed lag of the receptions it is solved from
+//! ([`SIGNED_LAG`]), when it has been offered where it was heard ([`FIX_LEAVES`]), when it has
+//! surely arrived wherever it is read ([`FIX_ARRIVED`], the world's settle and a fix's standing's)
+//! and how far its model is carried ([`MAX_CARRY`]), the feeder
 //! figures' [`Window::FIGURES`] and [`Window::FIGURES_POSITIONS`], when a relay restates its clock
 //! to a feeder ([`RESTATE_BEYOND`]), and the strike tables' [`FALLBACK_FLOOR`]. A signed time
 //! compared against a clock is compared through [`Tolerance`]'s methods or a [`Window`], never by
@@ -319,17 +316,10 @@ pub const ANCHOR_WAIT: Tolerance = B.minus(BACKLOG_DRAIN);
 /// allowance, not a measurement.
 pub const REPAIR_TRANSIT: Tolerance = Tolerance(2_000);
 
-/// 2 s: how long after a grid bin ends a receiver's last raw of it reaches its relay, its batch
-/// gathered (a feeder seals one every second) and on its way: the hosted MLAT's own settling
-/// before the clocks' errors (`MLAT_SETTLE`). An allowance, not a measurement.
+/// 2 s: how long after a moment a receiver's raw of it reaches its relay, its batch gathered (a
+/// feeder seals one every second) and on its way: the hosted MLAT's own share of
+/// [`SIGNED_LAG`] before the clocks' errors. An allowance, not a measurement.
 pub const MLAT_BATCHING: Tolerance = Tolerance(2_000);
-
-/// 80 s: the engine's share of a final MLAT fix's way out (RFC-0171 §3.8.1, RFC-0174 §2.3), its
-/// settling apart ([`MLAT_SETTLE`]). Counted from the start of the earliest bin a window step
-/// solves: the step's eight 5 s bins end 40 s after that start, the window falls due one bin (5 s)
-/// after that, once that bin has settled, and at world scale its fits take some 35 s. The engine's
-/// design, not a clock's error.
-pub const MLAT_SOLVE: Tolerance = Tolerance(8 * 5_000 + 5_000 + 35_000);
 
 /// 4 s: the engine's share of an MLAT fix's way out (RFC-0171 §3.8.1, as amended 2026-10-24),
 /// counted from its transmission's first reception reaching the engine's relay (its stamp) to the
@@ -339,9 +329,6 @@ pub const MLAT_SOLVE: Tolerance = Tolerance(8 * 5_000 + 5_000 + 35_000);
 /// `mlat_host`) and refuses a step's records past it, counted. The engine's design, not a clock's
 /// error.
 pub const FIX_SOLVE: Tolerance = Tolerance(4_000);
-
-/// [`FIX_SOLVE`] under its old name. Retired in phase 1.
-pub const PROVISIONAL_SOLVE: Tolerance = FIX_SOLVE;
 
 /// 1.1 s: how long after a transmission's first reception reaches the engine's relay the engine
 /// weighs it (`tally_mlat`'s `SETTLE_MS`, which asserts it is this): long enough for the other
@@ -354,25 +341,42 @@ pub const FIX_SETTLE: Tolerance = Tolerance(1_100);
 /// the clock it runs at. The engine's design, not a clock's error.
 pub const ARRIVED_SLICE: Tolerance = Tolerance(1_000);
 
-/// 5 s: a clock model's knot spacing (`tally_mlat_solver`'s `KNOT_PS`, which asserts it is this):
-/// what a trailing window must hold several of to fit a rate. The solver's design, not a clock's
+/// 5 s: a pair's knot spacing (`tally_mlat_solver`'s `KNOT_PS`, which asserts it is this): what a
+/// trailing window must hold several of to fit a rate. The solver's design, not a clock's
 /// error.
 pub const MODEL_KNOT: Tolerance = Tolerance(5_000);
 
-/// 1 s: how often the engine refits each tile's trailing-window model (RFC-0171 §3.8.1, as
-/// amended 2026-10-24), warm from the last, at the edge its step runs at: one refit a step. The
+/// 2 s: how often the engine refits each area's pair model (RFC-0171 §3.8.1, as amended
+/// 2026-10-24), warm from the last, at the edges of one grid every relay shares (multiples of this
+/// at least [`FIT_LAG`] below its clock, `tally_mlat_solver::Trailing::fitted_at`), so
+/// neighbouring areas' models share the edges a fix citing several needs: one refit every second
+/// step, its fixes solved every step ([`ARRIVED_SLICE`]) under the newest edge's models. The
 /// engine's design, not a clock's error.
-pub const REFIT_EVERY: Tolerance = Tolerance(1_000);
+pub const REFIT_EVERY: Tolerance = Tolerance(2_000);
 
-/// [`REFIT_EVERY`] in milliseconds, for the engine's step.
+/// [`REFIT_EVERY`] in milliseconds, for the engine's refit cadence.
 pub const REFIT_EVERY_MS: u64 = REFIT_EVERY.0;
 
-/// 20 s: the span of sync raw, by its signed wall clocks, a trailing-window model is fitted over,
+/// [`MLAT_BATCHING`], 2 s: how far a model's trailing edge trails the clock its refit runs at
+/// (`tally_mlat_solver`'s `scope::Trailing::fitted_at`): by then an honest receiver's raw of the
+/// edge, its signed clock on the relay's, has arrived, so two relays holding the same raw fit the
+/// same inputs at the same edge, whatever their paths' delays, and a model's inputs are a function
+/// of its edge and not of when a batch happened to arrive. A feeder whose signed clock lags the
+/// relay's by more ([`SIGNED_LAG`] allows it `E + 2U_m`) may be cited differently by two relays.
+/// The engine's design, not a clock's error.
+pub const FIT_LAG: Tolerance = MLAT_BATCHING;
+
+/// [`FIT_LAG`] in milliseconds, for the engine's trailing edge.
+pub const FIT_LAG_MS: u64 = FIT_LAG.0;
+
+/// 15 s: the span of sync raw, by its signed wall clocks, a trailing-window model is fitted over,
 /// ending at its edge (`tally_mlat_solver`'s `Trailing`): long against the fit's time constant
-/// (about 12 s) and at least three knots ([`MODEL_KNOT`], asserted). A placeholder: the trailing
-/// window experiment (`tally_mlat_solver`'s `trailing_window_sweep`, over 15, 20, 25 and 40 s)
-/// chooses it, and this is set to its answer. The solver's design, not a clock's error.
-pub const TRAILING_WINDOW: Tolerance = Tolerance(20_000);
+/// (about 12 s) and at least three knots ([`MODEL_KNOT`], asserted). Chosen by the pair path's
+/// sweep (`tally_mlat_solver`'s `pairwise_path_sweep`, run at 15, 20 and 25 s, RFC-0171 §3.8.1):
+/// a longer window moved coverage within 0.03 either way and the median error within a metre,
+/// declared no false jump at any, and cost more to refit (at world density 0.851, 1.124 and
+/// 1.450 ms a feeder-second), so the shortest. The solver's design, not a clock's error.
+pub const TRAILING_WINDOW: Tolerance = Tolerance(15_000);
 
 /// [`TRAILING_WINDOW`] in milliseconds: a model's `span_ms`, which every party states the same.
 pub const TRAILING_WINDOW_MS: u64 = TRAILING_WINDOW.0;
@@ -415,13 +419,12 @@ pub const EVIDENCE_AWAITED: Tolerance = Tolerance(2 * 3 * 60 * 1000);
 pub const FIGURES_SERVED: Tolerance = Tolerance(2 * 60 * 60 * 1000);
 
 /// An exemption, 65 s: how long after an aircraft's newest ADS-B position (its feeder's signed
-/// time) the hosted provisional solver leaves it alone, and how many seconds back what it solved
-/// of an aircraft is remembered (`tally_mlat::provisional::ADSB_HORIZON_MS`, a window's span,
-/// which asserts it is this). Not a clock's error: a choice of how long one aircraft's own signed
+/// time) the hosted MLAT engine leaves it alone, and how many seconds back what it solved of an
+/// aircraft is remembered (`tally_mlat`'s `ADSB_HORIZON_MS`, which asserts it is this). Not a clock's error: a choice of how long one aircraft's own signed
 /// times say something, stated here because each is compared with the judging clock.
 pub const ADSB_HORIZON: Tolerance = Tolerance(65_000);
 
-/// An exemption, twice [`ADSB_HORIZON`]: how long the provisional solver remembers an aircraft's
+/// An exemption, twice [`ADSB_HORIZON`]: how long the MLAT engine remembers an aircraft's
 /// newest ADS-B position by the judging clock, so one heard within the horizon of a reception is
 /// still known however late that reception's step runs.
 pub const ADSB_REMEMBERED: Tolerance = ADSB_HORIZON.times(2);
@@ -434,8 +437,8 @@ pub const fn expired(expires_ms: u64, now: Judged) -> bool {
 }
 
 /// An exemption, none: whether the judging clock reading `now` has reached `stated_ms`, a time on
-/// its own grid that the one stepping by it states from its own readings (a bin's end, a
-/// window's due time, a deadline it set): exactly, since no other clock stated it. A signed time
+/// its own grid that the one stepping by it states from its own readings (a slice's end, a
+/// refit's due time, a deadline it set): exactly, since no other clock stated it. A signed time
 /// from elsewhere is compared with a tolerance or a [`Window`], never here.
 pub const fn reached(stated_ms: u64, now: Judged) -> bool {
     now.ms() >= stated_ms
@@ -445,11 +448,6 @@ pub const fn reached(stated_ms: u64, now: Judged) -> bool {
 pub const fn passed(stated_ms: u64, now: Judged) -> bool {
     now.ms() > stated_ms
 }
-
-/// [`FINAL_FIX_ARRIVED`] in milliseconds, as a protocol constant every party states the same
-/// (`crate::products::FINAL_FIX_ARRIVED_MS`, a client's provisional deadline): stated, and
-/// compared with a clock only through the tolerance.
-pub const FINAL_FIX_ARRIVED_MS: u64 = FINAL_FIX_ARRIVED.0;
 
 /// chrony's fastest slew (`maxslewrate`), parts per million: the most the tick may be biased by
 /// a chronyd that died mid-slew.
@@ -506,10 +504,10 @@ pub const K: Tolerance = E.times(2);
 /// judged by this one's, each within `E` of true time, so at most `K` apart.
 pub const RECEIPT_AHEAD: Tolerance = K;
 
-/// `K`, 15 s: how far ahead of the API's clock a precise MLAT second's seal may be and still be
-/// served (`tally_api`'s `mlat`): second `s` is sealed no earlier than `(s + 1) * 1000 +
-/// FINAL_FIX_ARRIVED` by its relay's judging clock, and judged by the API's, each within `E` of
-/// true time either way, so they are at most `K` apart.
+/// `K`, 15 s: how far ahead of the API's clock a world second's seal may be and still be served
+/// (`tally_api`'s `mlat`): second `s` is sealed no earlier than `(s + 1) * 1000 + FIX_ARRIVED`
+/// by its relay's judging clock, and judged by the API's, each within `E` of true time either
+/// way, so they are at most `K` apart.
 pub const PRODUCT_AHEAD: Tolerance = K;
 
 /// `2(E + U_m)`, 17 s: the widest trusted reference a feeder signs by, so how far below true time
@@ -593,9 +591,9 @@ pub const ANCHOR_AHEAD: Tolerance = SELECTION_LAG.plus(ANCHOR_ABOVE_REFERENCE).p
 /// (`strikes::OwnAnchor::Absent`).
 pub const OWN_ANCHOR_OLDEST: Tolerance = ANCHOR_AGE.plus(B).plus(TRANSIT).drifted();
 
-/// `E`, 7.5 s: how far past a batch's judging time a bin of the hosted MLAT may begin and its raw
-/// still be held (`tally_mlat_solver`'s `held`): a feeder with a trusted reference signs at or
-/// below true time, and the relay's clock is at most `E` behind it.
+/// `E`, 7.5 s: how far above the judging clock it arrives by a reception of the hosted MLAT may be
+/// signed and still be gathered for a fix: a feeder with a trusted reference signs at or below
+/// true time, and the relay's clock is at most `E` behind it.
 pub const MLAT_AHEAD: Tolerance = E;
 
 /// `MLAT_BATCHING + E + 2U_m`, 11.5 s: how far below a relay's judging clock an honest receiver's
@@ -608,37 +606,12 @@ pub const MLAT_AHEAD: Tolerance = E;
 /// this is late for MLAT, counted and blamed on nobody. Why it is left out is seat cost: covering
 /// it would reserve every seat's open raw over a span `LAG + E` longer, and the world relay's seats
 /// (`mlat-seats` in `tally/crates/relay/tests/world-relay.txt`, held by the relay's `check` test)
-/// have no such margin over their 2,000 floor. What it gives up is small: its raw lands bins away
+/// have no such margin over their 2,000 floor. What it gives up is small: its raw lands seconds away
 /// from its peers' receptions of the same transmissions, so MLAT pairs little of it anyway.
 pub const SIGNED_LAG: Tolerance = MLAT_BATCHING.plus(E).plus(U_M.times(2));
 
 /// [`SIGNED_LAG`] in milliseconds, for the engine's arrival hold.
 pub const SIGNED_LAG_MS: u64 = SIGNED_LAG.0;
-
-/// [`SIGNED_LAG`] under its old name. Retired in phase 1.
-pub const MLAT_SETTLE: Tolerance = SIGNED_LAG;
-
-/// `MLAT_SETTLE + MLAT_SOLVE`, 91.5 s: how long after a transmission its final MLAT fix leaves
-/// its engine, by that relay's judging clock, or never. Counted from the start of the grid bin of
-/// the earliest transmission its window step solves, which no transmission it solves precedes:
-/// the step's bins end 40 s after that start, it falls due a bin later once that bin has settled
-/// ([`MLAT_SETTLE`], 11.5 s), and its fits take the rest of [`MLAT_SOLVE`]. A window step whose earliest solved bin started longer ago than this
-/// when its records would be taken has them refused (`tally_relay`'s `mlat_host`,
-/// `MlatReport::window_steps_late`), so the bound [`FINAL_FIX_ARRIVED`] is derived from holds of
-/// every fix that is published.
-pub const FINAL_FIX_LEAVES: Tolerance = MLAT_SETTLE.plus(MLAT_SOLVE);
-
-/// `MLAT_SOLVE + MLAT_SETTLE + K + REPAIR_TRANSIT`, 108.5 s: how long after a transmission its
-/// final MLAT fix has surely arrived, wherever it is read (`crate::products::FINAL_FIX_ARRIVED_MS`):
-/// the one bound every party waits on before treating a final fix as never coming. The fix leaves
-/// its engine within [`FINAL_FIX_LEAVES`] of the transmission, by its relay's clock; the reader's
-/// clock is at most `K` from that one, and the fix's way through a relay or two is
-/// [`REPAIR_TRANSIT`]. Each party measures from what it sees (a transmit time,
-/// or when a fix arrived, which is later), so waiting this long from either is enough.
-pub const FINAL_FIX_ARRIVED: Tolerance = MLAT_SOLVE.plus(MLAT_SETTLE).plus(K).plus(REPAIR_TRANSIT);
-
-/// [`FIX_LEAVES`] under its old name. Retired in phase 1.
-pub const LIVE_FIX_LEAVES: Tolerance = FIX_LEAVES;
 
 /// `SIGNED_LAG + FIX_SOLVE`, 15.5 s: how long after a transmission its MLAT fix has been offered
 /// by the relay that heard it, by that relay's judging clock (the feeder path), as a live world
@@ -661,26 +634,27 @@ pub const FIX_ARRIVED: Tolerance = FIX_LEAVES.plus(K).plus(REPAIR_TRANSIT);
 /// and compared with a clock only through the tolerance.
 pub const FIX_ARRIVED_MS: u64 = FIX_ARRIVED.0;
 
-/// `REFIT_EVERY + ARRIVED_SLICE + MLAT_AHEAD + FIX_SETTLE`, 10.6 s: the most a fix's transmit
-/// time may be past the trailing edge of the model it is solved under (`tally_mlat_solver`'s
-/// `MAX_CARRY_PS`, which asserts it is this), so how far a model is ever carried. The newest model
-/// of a tile was refit at most [`REFIT_EVERY`] before the step that solves the fix, at an edge at
-/// most [`ARRIVED_SLICE`] below the clock that refit ran at (it fits what was sealed); the fix's
+/// `2 REFIT_EVERY + FIT_LAG + MLAT_AHEAD + FIX_SETTLE`, 14.6 s: the most a fix's transmit time
+/// may be past the trailing edge of the models it is solved under (`tally_mlat_solver`'s
+/// `MAX_CARRY_PS`, which asserts it is this), so how far a model is ever carried. Every area is
+/// refit on one grid of edges, each a multiple of [`REFIT_EVERY`] at least [`FIT_LAG`] below the
+/// clock its refit runs at (`tally_mlat_solver`'s `scope::Trailing::fitted_at`), so the newest
+/// edge at a step is less than `REFIT_EVERY + FIT_LAG` below its clock, whatever the step's phase;
+/// a fix citing a neighbouring area's model may be solved one edge further back, while that area's
+/// relays' model of the newest edge is still on its way (one more [`REFIT_EVERY`]); the fix's
 /// receptions are signed at most [`MLAT_AHEAD`] above the judging clock they arrive by, which is
 /// no later than the step's. [`FIX_SETTLE`] is counted though a due transmission's first reception
 /// has already waited it (which would take it off): so the bound holds of a fix weighed as soon as
 /// its first reception is in, and is a hard bound, not a tight one. A fix carried further is not
 /// solved, counted.
 pub const MAX_CARRY: Tolerance = REFIT_EVERY
-    .plus(ARRIVED_SLICE)
+    .plus(REFIT_EVERY)
+    .plus(FIT_LAG)
     .plus(MLAT_AHEAD)
     .plus(FIX_SETTLE);
 
 /// [`MAX_CARRY`] in milliseconds, for the solver's carry bound.
 pub const MAX_CARRY_MS: u64 = MAX_CARRY.0;
-
-/// [`FIX_ARRIVED`] under its old name. Retired in phase 1.
-pub const LIVE_FIX_ARRIVED: Tolerance = FIX_ARRIVED;
 
 /// `F / 2`, 5 s: how far a feeder's signed time may be from its relay's clock, either way, before
 /// the relay states its clock to it again at its next heartbeat (`tally_relay`'s `hub`,
@@ -758,21 +732,7 @@ const _: () = assert!(
     OWN_ANCHOR_OLDEST.ms() >= ANCHOR_AGE.ms() + B.ms() + TRANSIT.ms()
         && OWN_ANCHOR_OLDEST.ms() <= ANCHOR_AGE.ms() + B.ms() + TRANSIT.ms() + 100
 );
-const _: () = assert!(MLAT_SETTLE.ms() == MLAT_BATCHING.ms() + E.ms() + 2 * U_M.ms());
 const _: () = assert!(ANCHOR_AGE.ms() == 3 * ANCHOR_PERIOD.ms() + TRANSIT.ms());
-const _: () = assert!(
-    FINAL_FIX_ARRIVED.ms() == MLAT_SOLVE.ms() + MLAT_SETTLE.ms() + K.ms() + REPAIR_TRANSIT.ms()
-);
-const _: () = assert!(
-    FINAL_FIX_ARRIVED.ms() == FINAL_FIX_LEAVES.ms() + K.ms() + REPAIR_TRANSIT.ms()
-        && FINAL_FIX_LEAVES.ms() == 91_500
-);
-// The live world's settle covers a fix heard where it is gathered, and one heard `K` away.
-const _: () = assert!(
-    LIVE_FIX_LEAVES.ms() == MLAT_SETTLE.ms() + PROVISIONAL_SOLVE.ms()
-        && LIVE_FIX_ARRIVED.ms() == LIVE_FIX_LEAVES.ms() + K.ms() + REPAIR_TRANSIT.ms()
-        && LIVE_FIX_ARRIVED.ms() >= LIVE_FIX_LEAVES.ms()
-);
 // One fix class (RFC-0171 §3.8.1 as amended 2026-10-24): a fix leaves its engine its signed lag
 // and its solve after its transmission, and has arrived `K` and a repair's way later; a trailing
 // window holds three knots, and a model is carried less than its own window.
@@ -782,15 +742,8 @@ const _: () = assert!(
         && FIX_ARRIVED.ms() == FIX_LEAVES.ms() + K.ms() + REPAIR_TRANSIT.ms()
         && TRAILING_WINDOW.ms() >= 3 * MODEL_KNOT.ms()
         && MAX_CARRY.ms()
-            == REFIT_EVERY.ms() + ARRIVED_SLICE.ms() + MLAT_AHEAD.ms() + FIX_SETTLE.ms()
+            == 2 * REFIT_EVERY.ms() + FIT_LAG.ms() + MLAT_AHEAD.ms() + FIX_SETTLE.ms()
         && MAX_CARRY.ms() < TRAILING_WINDOW.ms()
-);
-// The retired names are the new ones until phase 1 removes them, so neither drifts.
-const _: () = assert!(
-    PROVISIONAL_SOLVE.ms() == FIX_SOLVE.ms()
-        && MLAT_SETTLE.ms() == SIGNED_LAG.ms()
-        && LIVE_FIX_LEAVES.ms() == FIX_LEAVES.ms()
-        && LIVE_FIX_ARRIVED.ms() == FIX_ARRIVED.ms()
 );
 // The figures RFC-0171 quotes.
 const _: () = assert!(
@@ -805,14 +758,10 @@ const _: () = assert!(
         && ANCHOR_AHEAD.ms() == 32_000
         && OWN_ANCHOR_OLDEST.ms() == 69_035
         && MLAT_AHEAD.ms() == 7_500
-        && MLAT_SETTLE.ms() == 11_500
-        && FINAL_FIX_ARRIVED.ms() == 108_500
-        && LIVE_FIX_LEAVES.ms() == 15_500
-        && LIVE_FIX_ARRIVED.ms() == 32_500
         && SIGNED_LAG.ms() == 11_500
         && FIX_LEAVES.ms() == 15_500
         && FIX_ARRIVED.ms() == 32_500
-        && MAX_CARRY.ms() == 10_600
+        && MAX_CARRY.ms() == 14_600
         && RESTATE_BEYOND.ms() == 5_000
         && FALLBACK_FLOOR.ms() == 40_000
         && ANCHOR_WAIT.ms() == 62_000
@@ -887,10 +836,10 @@ impl Window {
     /// used anywhere ([`FEEDER_BEHIND`]), and the most ahead ([`PEER_AHEAD`]).
     pub const FIGURES: Self = Self::of(FEEDER_BEHIND, PEER_AHEAD);
 
-    /// What the feeder figures count of a final MLAT position, by its transmit time: as old as a
-    /// final fix may arrive ([`FINAL_FIX_ARRIVED`]), and no further ahead than any copy of the
-    /// batches it was solved from ([`PEER_AHEAD`]).
-    pub const FIGURES_POSITIONS: Self = Self::of(FINAL_FIX_ARRIVED, PEER_AHEAD);
+    /// What the feeder figures count of an MLAT fix, by its transmit time: as old as a fix may
+    /// arrive ([`FIX_ARRIVED`]), and no further ahead than any copy of the batches it was solved
+    /// from ([`PEER_AHEAD`]).
+    pub const FIGURES_POSITIONS: Self = Self::of(FIX_ARRIVED, PEER_AHEAD);
 
     /// A record a relay signs (an engine's positions, clock models, a regional batch, a bundle
     /// index), for a relay whose groups keep a horizon of `horizon` and whose engine signs

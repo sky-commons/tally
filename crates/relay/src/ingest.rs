@@ -197,20 +197,26 @@ pub const fn member_records_per_sec(member_feeders: usize) -> u64 {
 /// together never pass it.
 ///
 /// Their MLAT records (positions of either form, clock models and their parts, client clock
-/// models) spend the same bytes, their signed bytes each (`Admitted::in_flight`), so what the
-/// stores that hold them (the checks' twins, the ingest pool) are planned from, the members'
-/// rate, bounds what they are sent (`budget::Plan::member_paced_bytes_per_sec`).
+/// models) spend a pace of their own, the products', by their signed bytes each
+/// (`Admitted::in_flight`): one seat's products a second for each seat whose products they bring
+/// (`budget::Plan::member_products_bytes_per_sec`), what the stores that hold them (the models',
+/// the checks' twins, the ingest pool) are planned from, so the products follow the seats and
+/// never spend the raw rate. Before (2026-10-27), they spent the raw rate, and the plan bounded the
+/// seats by it.
 pub struct MemberPace {
     bytes: Arc<FairPace>,
     receptions: Arc<FairPace>,
+    products: Arc<FairPace>,
 }
 
 impl MemberPace {
-    /// The pace for `bytes_per_sec` of signed batches all together: the charged bytes and the
-    /// receptions of the feeders it is worth.
-    pub fn new(bytes_per_sec: u64) -> Self {
+    /// The pace for `bytes_per_sec` of signed batches all together (the charged bytes and the
+    /// receptions of the feeders it is worth), and `products_bytes_per_sec` of signed MLAT
+    /// records beside them.
+    pub fn new(bytes_per_sec: u64, products_bytes_per_sec: u64) -> Self {
         let feeders = crate::budget::feeders_for_rate(bytes_per_sec) as u64;
         Self {
+            products: Arc::new(FairPace::new(products_bytes_per_sec.max(1))),
             bytes: Arc::new(FairPace::new(
                 feeders.saturating_mul(PLANNED_BATCH_CHARGE as u64),
             )),
@@ -225,6 +231,7 @@ impl MemberPace {
         MemberSession {
             bytes: FairSession::new(&self.bytes),
             receptions: FairSession::new(&self.receptions),
+            products: FairSession::new(&self.products),
         }
     }
 
@@ -232,12 +239,18 @@ impl MemberPace {
     pub fn rates(&self) -> (u64, u64) {
         (self.bytes.total.rate(), self.receptions.total.rate())
     }
+
+    /// The products' signed bytes a second, all member sessions together.
+    pub fn products_rate(&self) -> u64 {
+        self.products.total.rate()
+    }
 }
 
 /// One member session's place in the [`MemberPace`].
 pub struct MemberSession {
     bytes: FairSession,
     receptions: FairSession,
+    products: FairSession,
 }
 
 impl MemberSession {
@@ -245,6 +258,12 @@ impl MemberSession {
     /// while it owes more than has refilled.
     pub async fn take(&self, bytes: u64, receptions: u64) {
         tokio::join!(self.bytes.take(bytes), self.receptions.take(receptions));
+    }
+
+    /// Spends `bytes` of an MLAT record of the session's share of the products' pace and its
+    /// total, waiting while it owes more than has refilled.
+    pub async fn take_products(&self, bytes: u64) {
+        self.products.take(bytes).await;
     }
 }
 
@@ -358,8 +377,8 @@ pub const INGEST_NANOS_PER_RECORD: usize = 30_000;
 
 /// The wanted receptions a second (`tally_wire::modes::wanted_reception`) one receiver's feeder may
 /// send, at most (RFC-0181 §10, "The cores", decided 2026-10-09): the one ceiling a receiver is
-/// held to, the same constant MLAT's raw holder sizes a receiver's open bins by
-/// (`tally_mlat_solver::held::Rates::MEASURED`, `ceiling_per_s`, which counts wanted receptions
+/// held to, the same constant MLAT's arrived pool sizes a receiver's share by
+/// (`tally_mlat_solver::arrived::Rates::MEASURED`, `ceiling_per_s`, which counts wanted receptions
 /// too), five times the 360 wanted a planned feeder sends of its 600 (`budget::PLANNED_RECEPTIONS_PER_SEC`).
 /// A feeder is told it with its `RateLimit` (`wanted_per_sec`) and sheds what is past it before it
 /// signs (`tally_feed::source::Batcher`), counted in its batches' `dropped`. The relay holds each
@@ -370,7 +389,7 @@ pub const INGEST_NANOS_PER_RECORD: usize = 30_000;
 /// or not, against a ceiling stated in wanted ones (1,800 wanted is some 3,000 in all), and the
 /// feeder, told nothing, fell behind by seconds while its batches went stale for MLAT.
 pub const FEEDER_RECEPTIONS_PER_SEC: u64 =
-    tally_mlat_solver::held::Rates::MEASURED.ceiling_per_s as u64;
+    tally_mlat_solver::arrived::Rates::MEASURED.ceiling_per_s as u64;
 
 /// The seconds of [`FEEDER_RECEPTIONS_PER_SEC`] a receiver may send at once, by its batches'
 /// stamps: the second a feeder keeping to its ceiling may seal in one batch (its own bucket holds
@@ -2100,6 +2119,19 @@ impl Stages {
         gauge: &Arc<Gauge>,
         covered: &'static crate::budget::Covered,
     ) -> Result<Arc<Decoded>, NotDecoded> {
+        Self::decode_inflated_owned(batch, None, stamp, gauge, covered)
+    }
+
+    /// As [`Stages::decode_owned`], from the batch's plain bytes already inflated
+    /// (`tally_wire::Batch::inflated`, as a feeder's batch is to read its wanted receptions), so a
+    /// compressed batch is inflated once.
+    pub fn decode_inflated_owned(
+        batch: Batch,
+        inflated: Option<&tally_wire::Inflated>,
+        stamp: Stamp,
+        gauge: &Arc<Gauge>,
+        covered: &'static crate::budget::Covered,
+    ) -> Result<Arc<Decoded>, NotDecoded> {
         let batch = batch
             .owned_by(|bytes| {
                 gauge
@@ -2108,8 +2140,9 @@ impl Stages {
             })
             .map_err(NotDecoded::NoRoom)?;
         let charged = std::cell::Cell::new(0);
-        Decoded::from_verified_owned(
+        Decoded::from_inflated_owned(
             batch,
+            inflated,
             (stamp.moment(), stamp.judging()),
             stamp.ingest_seq,
             |decoded| {
@@ -2491,7 +2524,7 @@ mod tests {
     /// batch moved sixty-four times the bytes of a 1 KiB one.)
     #[tokio::test(start_paused = true)]
     async fn member_sessions_share_the_rate_evenly_whatever_their_batch_size() {
-        let pace = Arc::new(MemberPace::new(1 << 20));
+        let pace = Arc::new(MemberPace::new(1 << 20, 1 << 20));
         let moved = Arc::new([AtomicU64::new(0), AtomicU64::new(0)]);
         let started = tokio::time::Instant::now();
         let mut tasks = Vec::new();
@@ -2530,7 +2563,7 @@ mod tests {
     /// bytes cannot bring in more than the plan holds for the members' rate.
     #[tokio::test(start_paused = true)]
     async fn a_members_receptions_are_paced_beside_its_bytes() {
-        let pace = MemberPace::new(1 << 20);
+        let pace = MemberPace::new(1 << 20, 1 << 20);
         let (_, receptions_per_sec) = pace.rates();
         let session = pace.session();
         let started = tokio::time::Instant::now();

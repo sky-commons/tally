@@ -1,17 +1,15 @@
 //! The per-transmission solver (crate docs, § Solving): the integer feasibility screen,
 //! Levenberg-Marquardt over position and transmit time against the joint covariance of the
-//! receptions' timing (noise plus the clock model's covariance), the altitude pseudo-measurement,
-//! and the outlier rule's fixed point.
+//! receptions' timing (noise plus the pair models' timing covariance, `pair::Models::normalise`),
+//! the altitude pseudo-measurement, and the outlier rule's fixed point.
 
 use std::collections::BTreeSet;
 
 use crate::clock::{ModelTime, PS, SPEC_VERSION};
 use crate::geo::{self, C, Geodetic};
-use crate::group::Transmission;
 use crate::linalg::{self, Cholesky, Matrix, Vec3};
 use crate::modes::{self, Altitude, AltitudeKind};
 use crate::obs::ObservationId;
-use crate::sync::Calibrated;
 
 /// Receivers a solve needs without an altitude, and with one.
 pub const MIN_RECEIVERS: usize = 4;
@@ -52,7 +50,7 @@ pub enum SolveError {
     Inconsistent,
     #[error("the timing covariance is not positive definite")]
     Singular,
-    #[error("the receptions' knots are further apart than the clock model's covariance holds")]
+    #[error("no timing covariance was formed for the receptions")]
     Uncovered,
     #[error("two places fit the receptions alike")]
     Ambiguous,
@@ -108,13 +106,16 @@ pub struct Solution {
     /// ECEF metres.
     pub ecef: Vec3,
     pub position: Geodetic,
-    /// Model time of transmission, picoseconds after the gauge's anchor.
+    /// Time of transmission on the timeline the models give, picoseconds from its zero.
     pub transmit_ps: i64,
-    /// The position's covariance, ECEF metres squared, with the clock model's covariance
-    /// propagated jointly.
+    /// The position's covariance, ECEF metres squared, with the timing covariance propagated
+    /// jointly.
     pub covariance: [[f64; 3]; 3],
-    /// The observations used, sorted.
-    pub observations: Vec<ObservationId>,
+    /// Every reception of the transmission it was solved from, sorted: what it considered.
+    pub considered: Vec<ObservationId>,
+    /// The receptions the outlier rule kept of them, sorted: what it used (a subset of
+    /// `considered`).
+    pub used: Vec<ObservationId>,
     /// The altitude pseudo-measurement, if the message carried one.
     pub altitude: Option<Altitude>,
     pub chi2: f64,
@@ -205,14 +206,16 @@ pub(crate) struct Item {
     pub site_mm: [i64; 3],
     /// Model time minus the earliest reception's, metres of light time.
     pub z: f64,
+    /// Its own timing noise plus its site's variance, metres squared: the diagonal its clock's
+    /// covariance is added to.
+    pub noise_m2: f64,
 }
 
-pub(crate) struct Problem<'a> {
-    pub calibrated: &'a Calibrated,
+pub(crate) struct Problem {
     /// Sorted by identity.
     pub items: Vec<Item>,
-    /// The clock part of every pair's timing covariance, metres squared; `None` when the model's
-    /// selected inverse does not hold it (knots further apart than its band).
+    /// The clock part of every pair's timing covariance, metres squared (the adjustment's, crate
+    /// docs § The pairwise path); `None` when none was formed, which no solve accepts.
     pub clock_m2: Option<Vec<Vec<f64>>>,
     pub reference_ps: i128,
     pub altitude: Option<(Altitude, f64, f64)>,
@@ -232,7 +235,12 @@ fn isqrt(value: u128) -> u128 {
     if value < 2 {
         return value;
     }
-    let mut x = (value as f64).sqrt() as u128;
+    // The float guess through 64 bits whenever they hold it: the same nearest float, without
+    // 128-bit conversion's calls.
+    let mut x = match u64::try_from(value) {
+        Ok(small) => u128::from((small as f64).sqrt() as u64),
+        Err(_) => (value as f64).sqrt() as u128,
+    };
     while x * x > value {
         x -= 1;
     }
@@ -242,68 +250,19 @@ fn isqrt(value: u128) -> u128 {
     x
 }
 
-impl<'a> Problem<'a> {
-    pub fn new(calibrated: &'a Calibrated, transmission: &Transmission) -> Self {
-        let model = &calibrated.model;
-        let reference_ps = transmission
-            .receptions
-            .iter()
-            .map(|timed| timed.time.ps)
-            .min()
-            .unwrap_or(0);
-        let items: Vec<Item> = transmission
-            .receptions
-            .iter()
-            .map(|timed| {
-                let site_mm = model
-                    .pieces
-                    .get(timed.time.piece)
-                    .map_or([0; 3], |piece| piece.site_mm);
-                Item {
-                    id: timed.id,
-                    time: timed.time,
-                    site: geo::from_mm(site_mm),
-                    site_mm,
-                    z: (timed.time.ps - reference_ps) as f64 * 1e-12 * C,
-                }
-            })
-            .collect();
-        let altitude = modes::altitude(&transmission.data).map(|altitude| {
-            let sigma = match altitude.kind {
-                AltitudeKind::Barometric => BARO_SIGMA_M,
-                AltitudeKind::Gnss => GNSS_SIGMA_M,
-            };
-            (altitude, altitude.metres(), sigma)
-        });
-        // Each reception's clock weights once, then every pair from them (`clock_weights`).
-        let weights: Vec<_> = items
-            .iter()
-            .map(|item| calibrated.clock_weights(&item.time, reference_ps))
-            .collect();
-        let clock_m2 = items
-            .iter()
-            .zip(&weights)
-            .map(|(a, weights_a): (&Item, _)| {
-                items
-                    .iter()
-                    .zip(&weights)
-                    .map(|(b, weights_b)| {
-                        calibrated
-                            .weighed_covariance((&a.time, weights_a), (&b.time, weights_b))
-                            .map(|value| value * C * C)
-                    })
-                    .collect::<Option<Vec<f64>>>()
-            })
-            .collect::<Option<Vec<_>>>();
-        Self {
-            calibrated,
-            items,
-            clock_m2,
-            reference_ps,
-            altitude,
-        }
-    }
+/// A message's altitude as the pseudo-measurement it gives: the altitude, metres above the
+/// ellipsoid, and its standard deviation (crate docs, § Solving, step 2).
+pub(crate) fn altitude_prior(data: &[u8]) -> Option<(Altitude, f64, f64)> {
+    modes::altitude(data).map(|altitude| {
+        let sigma = match altitude.kind {
+            AltitudeKind::Barometric => BARO_SIGMA_M,
+            AltitudeKind::Gnss => GNSS_SIGMA_M,
+        };
+        (altitude, altitude.metres(), sigma)
+    })
+}
 
+impl Problem {
     pub fn minimum(&self) -> usize {
         if self.altitude.is_some() {
             MIN_RECEIVERS_WITH_ALTITUDE
@@ -361,7 +320,7 @@ impl<'a> Problem<'a> {
             for (b, j) in subset.iter().enumerate().skip(a) {
                 let mut value = self.clock_m2.as_ref().map_or(0.0, |clock| clock[*i][*j]);
                 if a == b {
-                    value += self.calibrated.model.noise_m2(self.items[*i].time.piece);
+                    value += self.items[*i].noise_m2;
                 }
                 sigma.set(a, b, value);
                 sigma.set(b, a, value);
@@ -372,12 +331,11 @@ impl<'a> Problem<'a> {
 
     /// One reception's standard deviation, metres: the root of its diagonal entry.
     pub fn sigma(&self, index: usize) -> f64 {
-        let time = &self.items[index].time;
         let clock = self
             .clock_m2
             .as_ref()
             .map_or(0.0, |clock| clock[index][index]);
-        (clock + self.calibrated.model.noise_m2(time.piece)).sqrt()
+        (clock + self.items[index].noise_m2).sqrt()
     }
 
     /// The raw residual of one reception at `params`, metres.
@@ -697,13 +655,9 @@ impl<'a> Problem<'a> {
     }
 }
 
-/// Solves one transmission (crate docs, § Solving). Crate-private: a solution leaves the crate
-/// only through `publish::solve_published`, which the verifier has passed.
-pub(crate) fn solve(
-    calibrated: &Calibrated,
-    transmission: &Transmission,
-) -> Result<Solution, SolveError> {
-    let problem = Problem::new(calibrated, transmission);
+/// Solves one transmission's problem (crate docs, § Solving), its timing covariance the pairwise
+/// path's network adjustment (`pair::Prepared::normalise`).
+pub(crate) fn solve_problem(problem: &Problem) -> Result<Solution, SolveError> {
     if problem.clock_m2.is_none() {
         return Err(SolveError::Uncovered);
     }
@@ -772,13 +726,13 @@ pub(crate) fn solve(
         if fit.cost > published_chi2_limit(dof, rounding_norm(&jacobian)) {
             return Err(SolveError::Inconsistent);
         }
-        return finish(&problem, &subset, &fit, dof);
+        return finish(problem, &subset, &fit, dof);
     }
     Err(SolveError::NoFixedPoint)
 }
 
 fn finish(
-    problem: &Problem<'_>,
+    problem: &Problem,
     subset: &[usize],
     fit: &Fit,
     dof: u32,
@@ -808,7 +762,8 @@ fn finish(
         position: geo::from_ecef(ecef),
         transmit_ps: i64::try_from(transmit).map_err(|_| SolveError::OutOfRange)?,
         covariance,
-        observations: subset
+        considered: problem.items.iter().map(|item| item.id).collect(),
+        used: subset
             .iter()
             .map(|index| problem.items[*index].id)
             .collect(),

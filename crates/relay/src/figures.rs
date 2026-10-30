@@ -24,12 +24,12 @@
 //!   further than `MAX_RANGE_M`);
 //! - **coverage** and **unique coverage**: the coverage cells holding an aircraft when it heard
 //!   it, and those of them no other receiver this relay holds heard;
-//! - **MLAT help**: distinct final positions (by observation set) citing one of its receptions,
+//! - **MLAT help**: distinct MLAT fixes (by the receptions they used) using one of its receptions,
 //!   counted only for an aircraft its own batches here heard;
 //! - **standing**: from this relay's own ledger (`standing`).
 //!
 //! An aircraft is placed by a global CPR decode of an even and an odd airborne position one
-//! receiver heard within `PAIR_WITHIN_MS`, or by a final MLAT position; a receiver that hears it
+//! receiver heard within `PAIR_WITHIN_MS`, or by an MLAT fix; a receiver that hears it
 //! within `NEAR_MS` of where it was last placed is credited that place.
 //!
 //! Memory is charged: a receiver's row is made only by a batch of its own, and only when the
@@ -98,6 +98,25 @@ const EARTH_RADIUS_M: f64 = 6_371_008.8;
 pub struct LatLon {
     pub lat: f64,
     pub lon: f64,
+}
+
+/// A place and its coverage cell (`COVERAGE_RESOLUTION`), found once where it is placed: every
+/// row credited with it reads the cell. Before (2026-10-27), each credit found the cell again, and
+/// an aircraft's placing credits every row that heard it: H3's cell was a sixth of the ingest
+/// workers' time at 2,000 feeders.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Placed {
+    place: LatLon,
+    cell: Option<u64>,
+}
+
+impl Placed {
+    fn at(place: LatLon) -> Self {
+        Self {
+            place,
+            cell: place.cell(COVERAGE_RESOLUTION).map(u64::from),
+        }
+    }
 }
 
 impl LatLon {
@@ -241,8 +260,11 @@ impl Rows {
 /// One receiver's row: made only by a batch of its own, charged for all it may grow to.
 struct Feeder {
     _charge: Charge,
-    /// Its public cell, as its description names it.
+    /// Its public cell, as its description names it (`set_public`).
     public: Option<Region>,
+    /// The centre of `public`, found once when it is set: each credited position's range is from
+    /// it. Before (2026-10-27), found again for every position, a fifth of `credit`.
+    centre: Option<LatLon>,
     /// Minutes (Unix minutes) with a batch.
     minutes: BTreeSet<u64>,
     /// Counts by Unix hour.
@@ -256,6 +278,14 @@ struct Feeder {
 }
 
 impl Feeder {
+    /// Its public cell, and the centre its ranges are from.
+    fn set_public(&mut self, public: Option<Region>) {
+        if public != self.public {
+            self.public = public;
+            self.centre = public.and_then(LatLon::centre_of);
+        }
+    }
+
     fn hour(&mut self, at_ms: u64) -> &mut Hour {
         self.hours.entry(at_ms / HOUR_MS).or_default()
     }
@@ -293,8 +323,9 @@ impl Feeder {
 
     /// An aircraft placed at `place` when it heard it, at `at_ms`: its coverage cell, and its range
     /// from the public cell's centre.
-    fn credit(&mut self, place: LatLon, at_ms: u64) {
-        if let Some(centre) = self.public.and_then(LatLon::centre_of) {
+    fn credit(&mut self, placed: Placed, at_ms: u64) {
+        let Placed { place, cell } = placed;
+        if let Some(centre) = self.centre {
             let range = centre.distance_m(place);
             if range > MAX_RANGE_M {
                 return;
@@ -302,14 +333,13 @@ impl Feeder {
             let hour = self.hour(at_ms);
             hour.range_m = Some(hour.range_m.map_or(range, |was| was.max(range)));
         }
-        if let Some(cell) = place.cell(COVERAGE_RESOLUTION) {
-            let cell = u64::from(cell);
-            if self.cells.contains_key(&cell) || self.cells.len() < MAX_PER_FEEDER {
-                self.cells
-                    .entry(cell)
-                    .and_modify(|heard| heard.heard(at_ms))
-                    .or_insert(Heard::at(at_ms));
-            }
+        if let Some(cell) = cell
+            && (self.cells.contains_key(&cell) || self.cells.len() < MAX_PER_FEEDER)
+        {
+            self.cells
+                .entry(cell)
+                .and_modify(|heard| heard.heard(at_ms))
+                .or_insert(Heard::at(at_ms));
         }
     }
 
@@ -341,7 +371,7 @@ fn checked_address(message: &[u8]) -> Option<u32> {
 /// What every row shares: where each aircraft was last placed, and the positions already
 /// counted (so one many relays carry counts once).
 struct Shared {
-    placed: Bounded<u32, (LatLon, u64)>,
+    placed: Bounded<u32, (Placed, u64)>,
     cited: Bounded<Hash, ()>,
 }
 
@@ -482,7 +512,7 @@ impl Figures {
         if let Ok(mut shard) = self.shard(receiver).lock()
             && let Some(feeder) = shard.get_mut(receiver)
         {
-            feeder.public = public;
+            feeder.set_public(public);
         }
     }
 
@@ -520,6 +550,7 @@ impl Figures {
                         Feeder {
                             _charge: charge,
                             public,
+                            centre: public.and_then(LatLon::centre_of),
                             minutes: BTreeSet::new(),
                             hours: BTreeMap::new(),
                             aircraft: HashMap::new(),
@@ -537,7 +568,7 @@ impl Figures {
             let Some(feeder) = shard.get_mut(&receiver) else {
                 return;
             };
-            feeder.public = public.or(feeder.public);
+            feeder.set_public(public.or(feeder.public));
             feeder.minutes.insert(at / MINUTE_MS);
             feeder.hour(at).messages += products().count() as u64;
             for observation in products() {
@@ -563,9 +594,34 @@ impl Figures {
             }
         }
         self.observed(at);
+        // Each placing's coverage cell: another feeder's placing of the same aircraft at the same
+        // place found it already (every feeder that heard a message pair decodes it to the same
+        // place), else found here, outside the lock. Before (2026-10-27), every feeder found the
+        // cell of every placing, a tenth of an ingest worker's time at 2,000 feeders.
+        let known: Vec<Option<Placed>> = match self.shared.lock() {
+            Ok(shared) => placed
+                .iter()
+                .map(|(address, place)| {
+                    shared
+                        .placed
+                        .get(address)
+                        .map(|(was, _)| *was)
+                        .filter(|was| was.place == *place)
+                })
+                .collect(),
+            Err(_) => Vec::new(),
+        };
+        let placed: Vec<(u32, Placed)> = placed
+            .into_iter()
+            .enumerate()
+            .map(|(index, (address, place))| {
+                let found = known.get(index).copied().flatten();
+                (address, found.unwrap_or_else(|| Placed::at(place)))
+            })
+            .collect();
         // Where each aircraft it heard was last placed, near enough in time; its own placings
         // first, so they stand for the others too.
-        let mut credits: Vec<LatLon> = placed.iter().map(|(_, place)| *place).collect();
+        let mut credits: Vec<Placed> = placed.iter().map(|(_, placed)| *placed).collect();
         if let Ok(mut shared) = self.shared.lock() {
             let room = self.rows().saturating_mul(SHARED_PER_FEEDER);
             for (address, place) in &placed {
@@ -593,35 +649,34 @@ impl Figures {
         }
     }
 
-    /// Final positions the hub forwarded (new, verified), raw, at `now_ms` by the relay's clock:
-    /// each solution places its aircraft, and credits each receiver it cites that heard that
-    /// aircraft here.
+    /// Positions the hub forwarded (new, verified), raw, at `now_ms` by the relay's clock: each
+    /// fix places its aircraft, and credits each receiver it used that heard that aircraft here.
     pub fn positions(&self, positions: &Positions, now: Judged) {
-        if positions.is_provisional() || positions.is_tagged() {
+        if positions.is_tagged() {
             return;
         }
-        let Ok(content) = positions.solutions() else {
+        let Ok(content) = positions.fixes() else {
             return;
         };
-        for solution in content.solutions {
-            let at = solution.transmitted.unix_ms;
+        for fix in content.fixes {
+            let at = fix.transmitted.unix_ms;
             if !tally_wire::budget::Window::FIGURES_POSITIONS.holds(at, now) {
                 continue;
             }
             self.observed(at);
-            let place = LatLon {
-                lat: f64::from(solution.lat_e7) / 1e7,
-                lon: f64::from(solution.lon_e7) / 1e7,
-            };
+            let place = Placed::at(LatLon {
+                lat: f64::from(fix.lat_e7) / 1e7,
+                lon: f64::from(fix.lon_e7) / 1e7,
+            });
             let new = {
                 let Ok(mut shared) = self.shared.lock() else {
                     return;
                 };
                 let room = self.rows().saturating_mul(SHARED_PER_FEEDER);
-                if shared.placed.get(&solution.address).is_some() || shared.placed.len() < room {
-                    shared.placed.insert_active(solution.address, (place, at));
+                if shared.placed.get(&fix.address).is_some() || shared.placed.len() < room {
+                    shared.placed.insert_active(fix.address, (place, at));
                 }
-                let set = solution.observations.hash();
+                let set = fix.used().hash();
                 let new = shared.cited.get(&set).is_none();
                 if new && shared.cited.len() < room {
                     shared.cited.insert_active(set, ());
@@ -632,8 +687,8 @@ impl Figures {
                 }
                 new
             };
-            let receivers: BTreeSet<PublicKey> = solution
-                .observations
+            let receivers: BTreeSet<PublicKey> = fix
+                .used()
                 .receptions()
                 .iter()
                 .map(|reception| reception.receiver)
@@ -646,7 +701,7 @@ impl Figures {
                 let Some(feeder) = shard.get_mut(&receiver) else {
                     continue;
                 };
-                if !feeder.aircraft.contains_key(&solution.address) {
+                if !feeder.aircraft.contains_key(&fix.address) {
                     continue;
                 }
                 feeder.credit(place, at);

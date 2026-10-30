@@ -115,7 +115,7 @@ pub fn client_form(record: &Record) -> Option<Arc<ClientRecord>> {
         Record::ReceiverInfo(info) => info.carries_site(),
         // A client's positions are made only where they are checked (`consistency`, by
         // `Hub::send_positions`), never by the form alone: a client cannot check them itself.
-        Record::Positions(_) | Record::Provisional(_) => true,
+        Record::Positions(_) => true,
         _ => false,
     };
     if relay_only {

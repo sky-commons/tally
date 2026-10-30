@@ -1,25 +1,15 @@
-//! Receiver clocks: how a raw counter becomes a linear count, and the published clock model that
-//! maps a linear count to model time with integer arithmetic only: per clock, offsets at knots a
-//! fixed nominal spacing apart, linearly interpolated, so model time and its uncertainty are
-//! continuous in time.
+//! Receiver clocks: how a raw counter becomes a linear count, what a clock is (a receiver's
+//! counter within one counter epoch), and the specification's version.
 
 use tally_wire::{Clock, PublicKey};
 
-use crate::scope::{Citation, Window};
-
-/// The version of this crate's specification (the module docs of `lib.rs`). A published solution
-/// or clock model names it; two engines agree exactly only under the same version. Version 2 added
-/// the gauge's rate and the sync aircraft's position biases; version 3 the tile models; version 4
-/// fits a GNSS-disciplined clock as it behaves (no prior ties it to the gauge's stamps) and drops a
-/// clock nothing places; version 5 dates a free-running gauge's origin by the least bound every
-/// cited reception of its clock gives (not its anchor batch's wall clock alone), rejects a sync
-/// message any receiver heard more than once in the window, and starts the fit robustly; version 6
-/// names each scope entry's site-bearing record by its site id (`tally_wire::SiteId`) in the
-/// encoding and hashes the id and the stated precision, never the site, into the inputs id, so the
-/// id a client is sent with the model (`tally_wire::ClientClockModel`) tells nothing of where a
-/// receiver is. The mathematics is version 5's: the same raw fits the same clocks and solves to the
-/// same positions.
-pub const SPEC_VERSION: u16 = 6;
+/// The version of this crate's specification (the module docs of `lib.rs`). A published fix or
+/// pair model names it; two engines agree exactly only under the same version. Versions 1 to 7
+/// were the joint clock model's (the tile models, then their trailing window); version 8 is the
+/// pairwise path (crate docs, § The pairwise path): one pair model per area, fitted at its refit
+/// edge over the trailing window, and every fix normalised by the pairs of the area its used
+/// hearers name.
+pub const SPEC_VERSION: u16 = 8;
 
 // Relays judge fault proofs by the tolerance the wire sets per version: a version the wire does
 // not know would make every proof of it unjudgeable (as bumping to 4 once did in `tally-merge`).
@@ -54,7 +44,8 @@ impl Timebase {
         }
     }
 
-    /// Whether the clock is disciplined to GNSS time, which makes it the gauge by preference.
+    /// Whether the clock is disciplined to GNSS time, which makes it a fix's reference by
+    /// preference (crate docs, § The pairwise path, the adjustment).
     pub fn disciplined(self) -> bool {
         self == Self::GpsNanos
     }
@@ -76,7 +67,14 @@ impl Timebase {
     /// Picoseconds in `counts`, rounded toward negative infinity (12 MHz: 250 000 / 3 ps each).
     pub fn elapsed_ps(self, counts: i128) -> i128 {
         match self {
-            Self::Mhz12 => (counts * 250_000).div_euclid(3),
+            // In 64 bits whenever the product fits them (some 36 days of counts either way): the
+            // same quotient, without 128-bit division's call.
+            Self::Mhz12 => match i64::try_from(counts) {
+                Ok(small) if small.unsigned_abs() <= (i64::MAX / 250_000) as u64 => {
+                    i128::from((small * 250_000).div_euclid(3))
+                }
+                _ => (counts * 250_000).div_euclid(3),
+            },
             Self::GpsNanos => counts * 1000,
         }
     }
@@ -85,8 +83,17 @@ impl Timebase {
     /// to within a count.
     pub fn counts_of_ps(self, ps: i128) -> i64 {
         let counts = match self {
-            Self::Mhz12 => (ps * 3).div_euclid(250_000),
-            Self::GpsNanos => ps.div_euclid(1000),
+            // In 64 bits whenever they hold it, as `elapsed_ps`.
+            Self::Mhz12 => match i64::try_from(ps) {
+                Ok(small) if small.unsigned_abs() <= (i64::MAX / 3) as u64 => {
+                    i128::from((small * 3).div_euclid(250_000))
+                }
+                _ => (ps * 3).div_euclid(250_000),
+            },
+            Self::GpsNanos => match i64::try_from(ps) {
+                Ok(small) => i128::from(small.div_euclid(1000)),
+                Err(_) => ps.div_euclid(1000),
+            },
         };
         i64::try_from(counts).unwrap_or(if counts < 0 { i64::MIN } else { i64::MAX })
     }
@@ -125,16 +132,23 @@ impl Timebase {
         })
     }
 
-    /// The default timing noise before the clock model estimates it, seconds.
+    /// The default timing noise before a pair model estimates it, seconds.
     pub fn default_noise_s(self) -> f64 {
         match self {
             // What any clock is taken as until its own receptions estimate it: the worst common
             // class (a dump1090-class dongle, about 500 ns), so a clock heard too little to
             // estimate is never taken as better than it may be. A GNSS declaration is the
             // feeder's word, not a measurement: version 3 took a GNSS clock at 30 ns, and one
-            // whose counter was noise (OpenSky's data has them) lost a tile's robust start.
+            // whose counter was noise (OpenSky's data has them) lost its tile's robust start.
             Self::Mhz12 | Self::GpsNanos => 500e-9,
         }
+    }
+
+    /// The most a clock's noise is estimated at, seconds (`sync::GAUGE_NOISE_MOST_S`): ten times
+    /// the worst common class. A clock noisier than this is held to it, and its points beyond
+    /// it carry no weight in its pairs, rather than it being taken at its noise.
+    pub fn noise_ceiling_s(self) -> f64 {
+        crate::sync::GAUGE_NOISE_MOST_S
     }
 
     /// Random-walk process noise per knot interval: (phase seconds, rate dimensionless).
@@ -158,289 +172,40 @@ impl Timebase {
 /// The nominal spacing of a clock's knots, picoseconds: 5 s.
 pub const KNOT_PS: i128 = 5_000_000_000_000;
 
-/// One clock: a receiver's counter within one counter epoch, between two jumps.
+const _: () = assert!(
+    KNOT_PS
+        == tally_wire::budget::MODEL_KNOT
+            .span::<tally_wire::clocks::Judged>()
+            .ms() as i128
+            * 1_000_000_000,
+    "tally_wire::budget::MODEL_KNOT is not this knot spacing"
+);
+
+/// One clock: a receiver's counter within one counter epoch. A counter jump inside the epoch
+/// changes the clock's offset only (crate docs, § The pairwise path, jumps), so it stays one
+/// clock, published from the count after its newest jump (`PairClock::from`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ClockKey {
     pub receiver: PublicKey,
     pub epoch: u32,
-    /// 0 for the counter from the epoch's start; one more after each detected jump.
-    pub piece: u16,
 }
 
-/// One clock of a model: its knots and what it was fitted with.
-#[derive(Clone, Debug, PartialEq)]
-pub struct ClockPiece {
-    pub key: ClockKey,
-    pub timebase: Timebase,
-    /// The linear count at which this piece begins (the jump that split it off), or `None` for
-    /// the first piece of an epoch.
-    pub begins: Option<i64>,
-    /// The linear count at which the next piece begins, or `None` for the last.
-    pub ends: Option<i64>,
-    /// The receiver's antenna, ECEF millimetres, as the model was fitted with it.
-    pub site_mm: [i64; 3],
-    /// One standard deviation of the antenna position, millimetres (from its declared precision).
-    pub site_sigma_mm: i64,
-    /// One standard deviation of a reception's timing noise, picoseconds, as estimated.
-    pub noise_ps: i64,
-    /// The linear count of knot 0: the gauge's anchor, mapped into this clock by its coarse
-    /// offset (crate docs, § Knots).
-    pub base: i64,
-    /// The index of the first knot; the knots are `first .. first + offsets_ps.len()`.
-    pub first: i32,
-    /// The offset at each knot, picoseconds; all zero for the gauge.
-    pub offsets_ps: Vec<i64>,
-}
+/// How far past its models' trailing edge a fix may be carried (crate docs, § Areas):
+/// `tally_wire::budget::MAX_CARRY`, 14.6 s, a spec constant. A fix is solved under the models of
+/// the newest edge of the refit grid its areas' models are all held at, at most one edge behind
+/// the newest, and its receptions are signed at most `MLAT_AHEAD` ahead of the clock they arrive
+/// by, so a fix's receptions are never further than this past the models' edge; one further is
+/// past what the models say anything of.
+pub const MAX_CARRY_PS: i128 = tally_wire::budget::MAX_CARRY_MS as i128 * (PS / 1000);
 
-impl ClockPiece {
-    /// The index one past the last knot.
-    pub fn end(&self) -> i32 {
-        self.first + self.offsets_ps.len() as i32
-    }
-}
-
-/// A detected counter jump: the clock was split at `at` (the first reception after it).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct Jump {
-    pub receiver: PublicKey,
-    pub epoch: u32,
-    pub at: i64,
-    /// The step seen in the residuals, picoseconds (the later counter reads late by this much).
-    pub step_ps: i64,
-}
-
-/// What one bias of a sync aircraft's reported position is along (crate docs, § Sync events).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum BiasKind {
-    /// Its GNSS position's error east, near constant over a window.
-    East,
-    /// And north.
-    North,
-    /// Its pressure altitude minus its height above the ellipsoid.
-    Barometric,
-    /// Its GNSS height's error.
-    GnssHeight,
-}
-
-impl BiasKind {
-    pub fn byte(self) -> u8 {
-        match self {
-            Self::East => 0,
-            Self::North => 1,
-            Self::Barometric => 2,
-            Self::GnssHeight => 3,
-        }
-    }
-
-    pub fn from_byte(byte: u8) -> Option<Self> {
-        match byte {
-            0 => Some(Self::East),
-            1 => Some(Self::North),
-            2 => Some(Self::Barometric),
-            3 => Some(Self::GnssHeight),
-            _ => None,
-        }
-    }
-}
-
-/// One bias of one sync aircraft, millimetres.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct Bias {
-    pub address: u32,
-    pub kind: BiasKind,
-    pub mm: i64,
-}
-
-/// The gauge's rate is stated in parts per this: femto, so 30 ppm is 3 x 10^10 and a 65 s window
-/// rounds to well under a picosecond.
-pub const RATE_SCALE: i128 = 1_000_000_000_000_000;
-
-/// A clock model: the clocks of one tile's members over one canonical window, relative to the
-/// tile's gauge (crate docs, § Tiles and § The clock model), shared by every aircraft assigned
-/// the tile.
-#[derive(Clone, Debug, PartialEq)]
-pub struct ClockModel {
-    pub spec: u16,
-    /// The tile the model is shared by (crate docs, § Tiles).
-    pub tile: crate::tile::Tile,
-    pub window: Window,
-    /// The tile's members as their signed descriptions placed them, sorted by key.
-    pub scope: Vec<crate::obs::Site>,
-    /// The input set the model is a function of.
-    pub input: Citation,
-    /// The clock that defines model time.
-    pub gauge: ClockKey,
-    /// Unix nanoseconds at model time zero.
-    pub origin_unix_ns: u64,
-    /// The gauge's rate error, parts per `RATE_SCALE`: model time is the gauge's nominal time
-    /// from its anchor (plus a clock's offset) times `1 + gauge_rate / RATE_SCALE`, so a
-    /// free-running gauge's frequency error does not scale every time difference.
-    pub gauge_rate: i64,
-    /// Sorted by key.
-    pub pieces: Vec<ClockPiece>,
-    /// Every sync aircraft's position biases, sorted by (address, kind).
-    pub biases: Vec<Bias>,
-    /// Sorted.
-    pub jumps: Vec<Jump>,
-    /// Clocks (receiver, counter epoch) dropped from the tile for misbehaving: more jumps than a
-    /// fit declares. Sorted.
-    pub dropped: Vec<(PublicKey, u32)>,
-}
-
-/// How far past a clock's last knot a provisional solution may carry a model (crate docs,
-/// § Provisional solutions): 90 s, a spec constant. It covers the longest a tile's newest model
-/// can be behind a reception it is used for: the stride and the window's last bins
-/// (`(STRIDE + AFTER) * GRID`), the settling before the window is solved
-/// (`tally_wire::budget::MLAT_SETTLE`), the ripening before its model is used
-/// (`tally_mlat::engine::MODELS_RIPEN_MS`), how far a reception may run ahead
-/// (`tally_wire::budget::MLAT_AHEAD`) and a bin of rounding, 84 s in all, which `tally_mlat`
-/// asserts at compile time. Beyond it the model says nothing.
-pub const MAX_CARRY_PS: i128 = 90 * PS;
-
-/// What a model maps: only the counts between its clocks' knots (a final solution), or also up
-/// to `MAX_CARRY_PS` past the last knot of each epoch's last piece, along its last interval
-/// (a provisional solution).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Reach {
-    Window,
-    Carried,
-}
-
-/// A raw counter mapped through the model.
+/// A reception's time on its fix's timeline (crate docs, § The pairwise path, the adjustment).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ModelTime {
-    /// Index into `ClockModel::pieces`.
-    pub piece: usize,
-    /// The knot that starts the interval the count is in.
-    pub knot: i32,
-    /// The linear count.
+    /// Its clock's linear count.
     pub linear: i64,
-    /// Model time, picoseconds after the gauge's anchor.
+    /// Its arrival, picoseconds after the timeline's zero.
     pub ps: i128,
-    /// Nominal picoseconds since the start of the interval, in `[0, KNOT_PS)`; past `KNOT_PS`
-    /// when carried, the interval being the piece's last.
-    pub into_ps: i128,
-    /// Nominal picoseconds past the piece's last knot: zero within the model's knots.
+    /// Nominal picoseconds past the last knot of the pairs it was read through: zero within
+    /// them, and what the carry's process noise grows with past them.
     pub carried_ps: i128,
-}
-
-impl ModelTime {
-    /// How far into its interval, as a fraction (for least squares, never for a decision).
-    pub fn fraction(&self) -> f64 {
-        self.into_ps as f64 / KNOT_PS as f64
-    }
-}
-
-impl ClockModel {
-    /// Every list at exactly its length, as `publish::decode` makes a model it reads: what a
-    /// fitted model is shrunk to before it is shared, so the relay's store of models holds the
-    /// engine's own at what it plans a model to take (`standing::model_bytes_most`).
-    pub fn shrink_to_fit(&mut self) {
-        self.scope.shrink_to_fit();
-        self.pieces.shrink_to_fit();
-        for piece in &mut self.pieces {
-            piece.offsets_ps.shrink_to_fit();
-        }
-        self.biases.shrink_to_fit();
-        self.jumps.shrink_to_fit();
-        self.dropped.shrink_to_fit();
-    }
-
-    /// The pieces of one receiver's epoch, as an index range.
-    pub fn pieces_of(&self, receiver: &PublicKey, epoch: u32) -> std::ops::Range<usize> {
-        let start = self
-            .pieces
-            .partition_point(|piece| (piece.key.receiver, piece.key.epoch) < (*receiver, epoch));
-        let end = self
-            .pieces
-            .partition_point(|piece| (piece.key.receiver, piece.key.epoch) <= (*receiver, epoch));
-        start..end
-    }
-
-    /// Model time of a reception, by integer arithmetic only:
-    ///
-    /// 1. The raw counter becomes a linear count (`Timebase::linear_near`, near the epoch's first
-    ///    piece's `base`).
-    /// 2. The piece is the one whose `[begins, ends)` holds it.
-    /// 3. `e = elapsed_ps(linear - base)` (floored) and the interval is `k = floor(e / KNOT_PS)`;
-    ///    the model says nothing unless knots `k` and `k + 1` are both the piece's.
-    /// 4. With `u = e - k KNOT_PS`, `t = e + o_k + floor((o_{k+1} - o_k) u / KNOT_PS)`.
-    /// 5. Model time is `t + floor(t gauge_rate / RATE_SCALE)`.
-    pub fn time(&self, receiver: &PublicKey, epoch: u32, raw: u64) -> Option<ModelTime> {
-        self.time_reach(receiver, epoch, raw, Reach::Window)
-    }
-
-    /// As `time`, and with `Reach::Carried` also a count past the last knot `L` of its epoch's
-    /// last piece, by at most `MAX_CARRY_PS` of nominal time: step 3 then takes the last interval,
-    /// `k = L - 1`, so `u` runs past `KNOT_PS` and step 4 extends that interval's line. The piece
-    /// needs two knots.
-    pub fn time_reach(
-        &self,
-        receiver: &PublicKey,
-        epoch: u32,
-        raw: u64,
-        reach: Reach,
-    ) -> Option<ModelTime> {
-        let range = self.pieces_of(receiver, epoch);
-        let first = self.pieces.get(range.start)?;
-        let linear = first.timebase.linear_near(raw, first.base)?;
-        let index = range.clone().find(|index| {
-            let piece = &self.pieces[*index];
-            piece.begins.is_none_or(|begins| linear >= begins)
-                && piece.ends.is_none_or(|ends| linear < ends)
-        })?;
-        let piece = &self.pieces[index];
-        let elapsed = piece
-            .timebase
-            .elapsed_ps(i128::from(linear) - i128::from(piece.base));
-        let knot = i32::try_from(elapsed.div_euclid(KNOT_PS)).ok()?;
-        if knot < piece.first {
-            return None;
-        }
-        let (knot, carried) = if knot + 1 < piece.end() {
-            (knot, 0)
-        } else {
-            let last = piece.end() - 1;
-            let carried = elapsed - i128::from(last) * KNOT_PS;
-            let carriable = reach == Reach::Carried
-                && piece.ends.is_none()
-                && piece.offsets_ps.len() >= 2
-                && carried <= MAX_CARRY_PS;
-            if !carriable {
-                return None;
-            }
-            (last - 1, carried)
-        };
-        let into = elapsed - i128::from(knot) * KNOT_PS;
-        let at = (knot - piece.first) as usize;
-        let (left, right) = (
-            i128::from(piece.offsets_ps[at]),
-            i128::from(piece.offsets_ps[at + 1]),
-        );
-        let ps = elapsed + left + ((right - left) * into).div_euclid(KNOT_PS);
-        let ps = ps + (ps * i128::from(self.gauge_rate)).div_euclid(RATE_SCALE);
-        Some(ModelTime {
-            piece: index,
-            knot,
-            linear,
-            ps,
-            into_ps: into,
-            carried_ps: carried,
-        })
-    }
-
-    /// One reception's timing noise variance in metres squared: the receiver's estimated noise
-    /// plus its antenna position uncertainty.
-    pub fn noise_m2(&self, piece: usize) -> f64 {
-        self.pieces.get(piece).map_or(0.0, |piece| {
-            let noise = piece.noise_ps as f64 * 1e-12 * crate::geo::C;
-            let site = piece.site_sigma_mm as f64 / 1000.0;
-            noise * noise + site * site
-        })
-    }
-
-    /// The piece that is the gauge.
-    pub fn gauge_piece(&self) -> Option<&ClockPiece> {
-        self.pieces.iter().find(|piece| piece.key == self.gauge)
-    }
 }

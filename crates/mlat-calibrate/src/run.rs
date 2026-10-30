@@ -5,13 +5,13 @@ use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet};
 use std::io::Write;
 
-use tally_mlat::engine::{Engine, Settings as EngineSettings};
-use tally_mlat_solver::publish;
+use tally_mlat::engine::{Engine, STEP_MS, Settings as EngineSettings};
+use tally_mlat::fix::{Part, Report};
 use tally_wire::batch::format;
 use tally_wire::clocks::recorded::aligned;
 use tally_wire::{
     Batch, BatchContent, Identity, Observation, PublicKey, ReceiverSite, ReceiverSiteContent,
-    Record,
+    Record, Signer,
 };
 
 use crate::locards::{self, Row, Subset};
@@ -19,21 +19,22 @@ use crate::mapping::{self, ClockClass, Receiver, Reply, Survey};
 use crate::reference::Reference;
 use crate::score::{self, Count, Planar, Slice, Truth};
 
-/// What the relay's hosted MLAT waits after a window's last bin (`tally_relay::mlat_host::SETTLE`):
-/// the error budget's `MLAT_SETTLE`, so the engine here settles as a relay's does.
-pub const SETTLE_MS: u64 = tally_wire::budget::MLAT_SETTLE
-    .span::<tally_wire::clocks::Judged>()
-    .ms();
-/// How often the virtual clock ticks: what has arrived is ingested, provisional work solved and a
-/// due window stepped.
-pub const TICK_MS: u64 = 100;
+/// How often the virtual clock ticks: what has arrived is ingested and the engine steps, as a
+/// relay's hosted MLAT steps it (`tally_mlat::engine::STEP_MS`).
+pub const TICK_MS: u64 = STEP_MS;
 /// The most observations a batch carries (the simulator's feeds).
 const MAX_BATCH: usize = 400;
-/// The engine solves nothing before its first window has history: transmissions in the first
-/// this many milliseconds are not counted in the solved fraction.
-const WARM_UP_MS: u64 = 65_000;
-/// How long the clock runs on past the last row, so the last windows are published.
-const RUN_OUT_MS: u64 = 120_000;
+/// The engine fits no model before its trailing window (`tally_wire::budget::TRAILING_WINDOW`)
+/// holds a window's sync history: transmissions in the first this many milliseconds are not
+/// counted in the solved fraction.
+const WARM_UP_MS: u64 = tally_wire::budget::TRAILING_WINDOW_MS;
+/// How long the clock runs on past the last row: every fix of the last rows has surely been
+/// published and arrived by then (`tally_wire::budget::FIX_ARRIVED`).
+const RUN_OUT_MS: u64 = tally_wire::budget::FIX_ARRIVED_MS;
+/// The slot the solved fraction counts by: an aircraft is solved in a slot when any fix of a
+/// withheld transmission of it in the slot (by the lower median of its receptions' wall clocks)
+/// was published.
+const SLOT_MS: u64 = 5_000;
 
 /// What to run.
 #[derive(Clone, Debug)]
@@ -81,16 +82,15 @@ pub struct Outcome {
     pub receptions: u64,
     pub withheld_aircraft: usize,
     pub withheld_transmissions: u64,
-    /// (aircraft, engine bin) with a withheld transmission heard by at least three receivers
-    /// after warm-up, and how many transmissions it could have had solved (at most five).
+    /// (aircraft, slot) with a withheld transmission heard by at least three receivers after
+    /// warm-up, and how many transmissions it could have had solved (at most five).
     pub eligible_bins: u64,
     pub eligible_transmissions: u64,
     pub solved_bins: u64,
-    pub finals: Finals,
-    pub provisionals: Finals,
+    pub fixes: Scores,
     pub models: u64,
-    pub window: tally_mlat::window::Report,
-    pub provisional: tally_mlat::provisional::Report,
+    /// What the engine's steps reported, summed (`tally_mlat::fix::Report`).
+    pub engine: Report,
     pub unknown_solutions: u64,
     /// The truth's own error (`score::TruthModel`), fitted to the reference fixes.
     pub truth_model: score::TruthModel,
@@ -104,9 +104,9 @@ pub struct Outcome {
     pub reference_against: Count,
 }
 
-/// One kind's scoring, overall and sliced.
+/// The fixes' scoring, overall and sliced.
 #[derive(Debug, Default)]
-pub struct Finals {
+pub struct Scores {
     pub overall: Slice,
     /// The aircraft LocaRDS verified.
     pub trusted: Slice,
@@ -114,19 +114,19 @@ pub struct Finals {
     pub bands: [Slice; 3],
     /// Receptions used: 3, 4, 5-6, 7-9, 10 or more.
     pub receivers: [Slice; 5],
-    /// The model's tile level.
-    pub levels: [Slice; 4],
+    /// The areas whose models it cites (one per area of its used hearers): 1, 2, 3, 4 or more.
+    pub areas: [Slice; 4],
     /// Whether every receiver it used is GNSS-disciplined, some are, or none.
     pub clocks: [Slice; 3],
 }
 
-impl Finals {
+impl Scores {
     fn add(
         &mut self,
         scored: &score::Scored,
         truth: &Truth,
         used: usize,
-        level: Option<u8>,
+        areas: usize,
         gnss: usize,
     ) {
         self.overall.add(scored);
@@ -149,8 +149,8 @@ impl Finals {
             _ => 4,
         };
         self.receivers[bucket].add(scored);
-        if let Some(level) = level.filter(|l| *l < 4) {
-            self.levels[usize::from(level)].add(scored);
+        if areas > 0 {
+            self.areas[areas.min(4) - 1].add(scored);
         }
         let clocks = if gnss == used {
             0
@@ -222,7 +222,7 @@ impl Feeding {
 /// A withheld transmission's truth, and what it needs to be counted.
 struct Pending {
     truth: Truth,
-    /// Its bin as the engine decides it: the lower median of its receptions' wall clocks.
+    /// The lower median of its receptions' wall clocks: what its slot is.
     median_wall: u64,
     /// Distinct receivers that heard it.
     hearers: usize,
@@ -351,17 +351,16 @@ pub fn run(
         reference: Vec::new(),
         reference_chi2: Vec::new(),
         engine: Engine::new(
-            tally_wire::Signer::new(
-                Identity::from_seed([0x17; 32]),
-                std::sync::Arc::new(|| true),
-            ),
             1,
             EngineSettings {
                 regions: tally_wire::Regions::default(),
-                settle: tally_wire::budget::policy::<_, SETTLE_MS>(),
                 threads: settings.threads.max(1),
                 capacity: tally_mlat::engine::Capacity::default(),
             },
+        ),
+        signer: Signer::new(
+            Identity::from_seed([0x17; 32]),
+            std::sync::Arc::new(|| true),
         ),
         feeds,
         index_of,
@@ -371,7 +370,6 @@ pub fn run(
         next_flight: 0,
         pending: Vec::new(),
         by_reception: HashMap::new(),
-        levels: HashMap::new(),
         solved_bins: HashSet::new(),
         out,
         samples: match &settings.samples {
@@ -445,14 +443,12 @@ pub fn run(
         }
         if last_report.elapsed().as_secs() >= 30 {
             last_report = std::time::Instant::now();
-            let finals = &replay.out.finals.overall.horizontal;
+            let fixes = &replay.out.fixes.overall.horizontal;
             let line = format!(
-                "{:.0} s of {:.0}: {} finals ({finals}), {} provisionals ({})",
+                "{:.0} s of {:.0}: {} fixes ({fixes})",
                 row.server_s - settings.start_s,
                 settings.duration_s,
-                finals.total,
-                replay.out.provisionals.overall.horizontal.total,
-                replay.out.provisionals.overall.horizontal,
+                fixes.total,
             );
             progress(&line);
         }
@@ -475,12 +471,11 @@ pub fn run(
     Ok(replay.finish(withheld, start_ms + WARM_UP_MS, scored_to))
 }
 
-/// The columns of `Settings::samples`: provisional or not, the aircraft, when it was heard (Unix
-/// ms), receptions used and how many GNSS, the tile level, the truth less the fix (east, north,
+/// The columns of `Settings::samples`: the aircraft, when it was heard (Unix ms), receptions used and how many GNSS, the areas whose models it cites, the truth less the fix (east, north,
 /// up), the stripped ENU covariance (ee, en, nn, eu, nu, uu), the truth's velocity, the error
 /// along the track, the barometric and GNSS altitudes, and LocaRDS's verification.
-const SAMPLE_HEADER: &str = "provisional,aircraft,heard_ms,used,gnss,level,east,north,up,ee,en,nn,\
-                             eu,nu,uu,ve,vn,along,baro,geo,trusted";
+const SAMPLE_HEADER: &str = "aircraft,heard_ms,used,gnss,areas,east,north,up,ee,en,nn,eu,nu,uu,ve,\
+                             vn,along,baro,geo,trusted";
 
 /// What stops the pass over the rows at the end of the duration.
 const END: &str = "end of the duration";
@@ -492,6 +487,8 @@ struct Replay {
     reference: Vec<Planar>,
     reference_chi2: Vec<f64>,
     engine: Engine,
+    /// What the engine signs with.
+    signer: Signer,
     feeds: BTreeMap<u32, Feeding>,
     /// Each receiver's sensor serial.
     index_of: BTreeMap<PublicKey, u32>,
@@ -503,9 +500,7 @@ struct Replay {
     /// Every withheld transmission, and each of its receptions by (sensor, counter).
     pending: Vec<Pending>,
     by_reception: HashMap<(u32, u64), u32>,
-    /// Each published model's tile level, by id.
-    levels: HashMap<[u8; 32], u8>,
-    /// (aircraft, bin) with a final solution.
+    /// (aircraft, slot) with a fix.
     solved_bins: HashSet<(u32, u64)>,
     out: Outcome,
     samples: Option<std::io::BufWriter<std::fs::File>>,
@@ -527,7 +522,7 @@ impl Replay {
             )
             .map_err(|e| e.to_string())?;
             self.engine
-                .ingest(&Record::ReceiverSite(site), aligned(start_ms))?;
+                .ingest_record(&Record::ReceiverSite(site), aligned(start_ms))?;
         }
         Ok(())
     }
@@ -616,8 +611,8 @@ impl Replay {
     }
 
     /// One tick of the virtual clock at `now`: batches due are sealed, what has arrived is
-    /// ingested, and the engine's provisional and window work is run and scored. The virtual clock
-    /// never steps, so an instant reads alike on both.
+    /// ingested, and the engine steps and what it published is scored. The virtual clock never
+    /// steps, so an instant reads alike on both.
     #[allow(clippy::disallowed_methods, reason = "a replay's instants")]
     fn tick(&mut self, now: u64) -> Result<(), String> {
         let mut sealed = Vec::new();
@@ -635,16 +630,13 @@ impl Replay {
             }
             self.arrivals.pop();
             if let Some(batch) = self.in_flight.remove(&id) {
-                self.engine.ingest(&Record::Batch(batch), aligned(at))?;
+                self.engine
+                    .ingest_record(&Record::Batch(batch), aligned(at))?;
             }
         }
-        let mut published = self.engine.provisional_step(aligned(now));
-        let (records, report) = self.engine.step(aligned(now));
-        published.extend(records);
-        add_report(&mut self.out.window, &report);
-        let provisional = self.engine.provisional_report();
-        add_provisional(&mut self.out.provisional, &provisional);
-        for record in published {
+        let step = self.engine.step(aligned(now), &self.signer);
+        add_report(&mut self.out.engine, &step.report);
+        for record in step.records() {
             self.take(&record)?;
         }
         Ok(())
@@ -653,28 +645,12 @@ impl Replay {
     /// Scores one published record.
     fn take(&mut self, record: &Record) -> Result<(), String> {
         match record {
-            Record::ClockModel(model) => {
-                self.out.models += 1;
-                let manifest = model.manifest().map_err(|e| e.to_string())?;
-                if let Ok(tile) = publish::tile_of(&manifest.inline) {
-                    self.levels.insert(model.id(), tile.level);
-                }
-            }
-            Record::ClockModelPart(part) => {
-                if part.index().ok() == Some(0)
-                    && let (Ok(model), Ok(tile)) = (part.model(), publish::tile_of(part.data()))
-                {
-                    self.levels.insert(model, tile.level);
-                }
-            }
-            // The tagged form is the same solutions for clients: scored once, raw.
-            Record::Positions(positions) | Record::Provisional(positions)
-                if !positions.is_tagged() =>
-            {
-                let provisional = matches!(record, Record::Provisional(_));
-                let content = positions.solutions().map_err(|e| e.to_string())?;
-                for solution in &content.solutions {
-                    let receptions = solution.observations.receptions();
+            Record::ClockModel(_) => self.out.models += 1,
+            // The tagged form is the same fixes for clients: scored once, raw.
+            Record::Positions(positions) if !positions.is_tagged() => {
+                let content = positions.fixes().map_err(|e| e.to_string())?;
+                for solution in &content.fixes {
+                    let receptions = solution.used().receptions();
                     let found = receptions.iter().find_map(|reception| {
                         let serial = self.index_of.get(&reception.receiver)?;
                         self.by_reception.get(&(*serial, reception.counter))
@@ -690,28 +666,26 @@ impl Replay {
                         .iter()
                         .filter(|reception| self.gnss_keys.contains(&reception.receiver))
                         .count();
-                    let level = self.levels.get(&solution.clock_model).copied();
-                    let finals = if provisional {
-                        &mut self.out.provisionals
-                    } else {
-                        self.solved_bins
-                            .insert((transmission.truth.aircraft, transmission.median_wall / 5000));
-                        &mut self.out.finals
-                    };
-                    finals.add(&scored, &transmission.truth, used, level, gnss_used);
+                    let areas = solution.models.len();
+                    self.solved_bins.insert((
+                        transmission.truth.aircraft,
+                        transmission.median_wall / SLOT_MS,
+                    ));
+                    self.out
+                        .fixes
+                        .add(&scored, &transmission.truth, used, areas, gnss_used);
                     if let Some(file) = &mut self.samples {
                         let truth = &transmission.truth;
                         let c = scored.stripped;
                         writeln!(
                             file,
-                            "{},{},{},{},{},{},{:.2},{:.2},{},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},\
+                            "{},{},{},{},{},{:.2},{:.2},{},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},\
                              {:.2},{:.2},{:.2},{:.1},{},{}",
-                            u8::from(provisional),
                             truth.aircraft,
                             truth.heard_ms,
                             used,
                             gnss_used,
-                            level.map_or(-1, i32::from),
+                            areas,
                             scored.east_m,
                             scored.north_m,
                             scored.up_m.map_or(String::new(), |up| format!("{up:.2}")),
@@ -737,7 +711,7 @@ impl Replay {
         Ok(())
     }
 
-    /// The solved fraction, over the engine's own bins, of withheld transmissions heard by three
+    /// The solved fraction, over (aircraft, slot) pairs, of withheld transmissions heard by three
     /// or more receivers between `from` and `to` (Unix milliseconds; the last 10 s left out).
     fn finish(mut self, withheld_aircraft: usize, from: u64, to: u64) -> Outcome {
         if let Some(file) = &mut self.samples {
@@ -766,7 +740,7 @@ impl Replay {
                 continue;
             }
             *eligible
-                .entry((transmission.truth.aircraft, median / 5000))
+                .entry((transmission.truth.aircraft, median / SLOT_MS))
                 .or_default() += 1;
         }
         self.out.eligible_bins = eligible.len() as u64;
@@ -779,37 +753,24 @@ impl Replay {
     }
 }
 
-fn add_report(total: &mut tally_mlat::window::Report, step: &tally_mlat::window::Report) {
-    total.windows += step.windows;
-    total.bins += step.bins;
-    total.targets += step.targets;
-    total.tiles += step.tiles;
-    total.uncovered += step.uncovered;
-    total.fits += step.fits;
-    total.unfitted += step.unfitted;
-    if total.unfitted_reason.is_none() {
-        total.unfitted_reason = step.unfitted_reason.clone();
-    }
-    total.transmissions += step.transmissions;
-    total.solved += step.solved;
-    total.unsolved += step.unsolved;
-    total.rejected += step.rejected;
-    total.clock_models += step.clock_models;
+/// Adds one step's report to the run's: what every thread's share adds (`Part::add`), and what a
+/// step reports once.
+fn add_report(total: &mut Report, step: &Report) {
+    total.add(step);
+    total.due += step.due;
+    total.grown += step.grown;
+    total.too_few += step.too_few;
+    total.late += step.late;
+    total.unowned += step.unowned;
+    total.unassigned += step.unassigned;
+    total.unjudged += step.unjudged;
+    total.refits += step.refits;
+    total.models += step.models;
+    total.model_parts += step.model_parts;
+    total.model_bytes += step.model_bytes;
     total.positions += step.positions;
-    total.fit_time += step.fit_time;
-    total.solve_time += step.solve_time;
+    total.positions_bytes += step.positions_bytes;
+    total.tagged_positions += step.tagged_positions;
+    total.tagged_positions_bytes += step.tagged_positions_bytes;
     total.elapsed += step.elapsed;
-}
-
-fn add_provisional(
-    total: &mut tally_mlat::provisional::Report,
-    step: &tally_mlat::provisional::Report,
-) {
-    total.transmissions += step.transmissions;
-    total.solved += step.solved;
-    total.unsolved += step.unsolved;
-    total.rejected += step.rejected;
-    total.unmodelled += step.unmodelled;
-    total.dropped += step.dropped;
-    total.records += step.records;
 }

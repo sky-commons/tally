@@ -38,6 +38,9 @@ For a spawned relay:
                          before-feeders and per-connection (and per-seat, hosting MLAT)), as a deploy sized for them is: the run
                          then fails if the relay's peak resident memory passed that budget and
                          the headroom the relay keeps below the memory it runs in
+  --relay-cores N        run it on this host's first N cores and the harness on the rest, as a
+                         relay in a unit or container of N cores runs (its plan is of the cores
+                         it finds); default: both on every core
 
 The load:
   --feeders N            simulated receivers in the whole run, across every shard (default 20000)
@@ -52,8 +55,9 @@ The load:
   --aircraft A           aircraft in each of the two clusters, a third Mode S-only (default 9000:
                          the clusters are RFC-0174's world benchmark, 20,000 receivers as Europe's
                          and the US's are, but its 4,500 aircraft a cluster give a receiver at most
-                         about 320 receptions a second, since a simulated aircraft sends about
-                         3.4 messages a second; 9,000 reach 600)
+                         about 500 receptions a second, since a simulated aircraft sends about
+                         5.3 messages a second, about 60% of them wanted as box-01's are;
+                         9,000 reach 600)
   --seed S               the simulation's seed (default 0: the world benchmark's clusters)
   --client-sample N      the client decodes one raw batch in N (default 1, all): the rest are
                          counted from their own receptions count and followed by sequence, so
@@ -76,11 +80,11 @@ The load:
   --ramp SECS            start the feeders evenly over this long (default 60)
   --warmup SECS          wait this long after the ramp before measuring (default 30)
   --duration SECS        measure for this long (default 60)
-  --streams LIST         what the subscriber asks for, of raw, dedup and provisional, comma
-                         separated (default raw,dedup). provisional measures how long a
-                         provisional MLAT position takes from its transmission to the subscriber
-                         (the relay must host MLAT: RFC-0174 §2.4's fast MLAT, which must reach
-                         the live world before its second is sealed, 32.5 s after it ends)
+  --streams LIST         what the subscriber asks for, of raw, dedup and positions, comma
+                         separated (default raw,dedup). positions measures how long an MLAT fix
+                         takes from its transmission to the subscriber (the relay must host MLAT:
+                         RFC-0174 §2.4's MLAT in seconds, which must reach the world product
+                         before its second is sealed, 32.5 s after it ends)
   --no-verify            the subscriber does not check signatures
   --decode-threads N     threads the subscriber decodes batches on (default 4)
   --simulate-only        simulate the run's first seconds, print what they came to, and exit
@@ -133,6 +137,9 @@ pub struct Spawn {
     pub mlat: bool,
     /// Whether its `--memory` is exactly what the feeders need (`--relay-fit`).
     pub fit: bool,
+    /// The cores it runs on, the first of this host's, the harness keeping to the rest
+    /// (`--relay-cores`): every core for both when none are named.
+    pub cores: Option<usize>,
 }
 
 /// One slice of the feeders.
@@ -245,7 +252,7 @@ pub struct Config {
 /// `None` when the command was fully handled (usage).
 pub fn parse(args: impl Iterator<Item = String>) -> Result<Option<Config>, String> {
     let mut spec = Spec {
-        feeders: 20_000,
+        feeders: crate::traffic::WORLD_FEEDERS,
         receptions_per_sec: 600.0,
         aircraft: 9_000,
         seconds: 0,
@@ -257,6 +264,7 @@ pub fn parse(args: impl Iterator<Item = String>) -> Result<Option<Config>, Strin
     let mut relay_args = Vec::new();
     let mut relay_mlat = false;
     let mut relay_fit = false;
+    let mut relay_cores = None;
     let mut addresses: Vec<RelayAddress> = Vec::new();
     let mut pid = None;
     let mut stats = None;
@@ -301,6 +309,7 @@ pub fn parse(args: impl Iterator<Item = String>) -> Result<Option<Config>, Strin
             "--relay-arg" => relay_args.push(value()?),
             "--relay-mlat" => relay_mlat = true,
             "--relay-fit" => relay_fit = true,
+            "--relay-cores" => relay_cores = Some(number(&flag, &value()?)?),
             "--feeders" => spec.feeders = number(&flag, &value()?)?,
             "--shard" => config.shard = Shard::parse(&value()?)?,
             "--no-feeders" => config.run_feeders = false,
@@ -357,6 +366,7 @@ pub fn parse(args: impl Iterator<Item = String>) -> Result<Option<Config>, Strin
             args: relay_args,
             mlat: relay_mlat,
             fit: relay_fit,
+            cores: relay_cores,
         }),
         (true, None) => {
             return Err(format!(
@@ -373,10 +383,10 @@ fn streams(text: &str) -> Result<Streams, String> {
         bits |= match part {
             "raw" => Streams::RAW.0,
             "dedup" => Streams::DEDUPLICATED.0,
-            "provisional" => Streams::PROVISIONAL.0,
+            "positions" => Streams::POSITIONS.0,
             other => {
                 return Err(format!(
-                    "--streams: unknown stream {other} (raw, dedup, provisional)"
+                    "--streams: unknown stream {other} (raw, dedup, positions)"
                 ));
             }
         };

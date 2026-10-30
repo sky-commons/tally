@@ -92,11 +92,32 @@ rust_test(
     ]
 ]
 
+# The world relay's planned MLAT seats against what 2,000 feeders settle it at on its 16 cores,
+# within 15% (`tests/plan_seats.rs`, RFC-0181 §10, "MLAT in the cores"): a measurement of this
+# host, minutes long and over 17 cores at least, so `manual` and never in the verdict.
+# `bazel test -c opt //crates/load:plan_seats --test_output=all --test_arg=--nocapture`.
+rust_test(
+    name = "plan_seats",
+    size = "large",
+    srcs = ["tests/plan_seats.rs"],
+    data = ["//crates/relay:tally-relay"],
+    edition = "2024",
+    env = {"TALLY_RELAY": "$(rootpath //crates/relay:tally-relay)"},
+    lint_config = ":cargo_lints",
+    tags = ["manual"],
+    deps = [
+        ":load",
+        "//crates/relay",
+        "@tally_crates//:tokio",
+    ],
+)
+
 rustfmt_test(
     name = "rustfmt",
     targets = [
         ":load",
         ":load_test",
+        ":plan_seats",
         ":public_relay",
         ":public_relay_world",
         ":tally-load",

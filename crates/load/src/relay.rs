@@ -154,8 +154,9 @@ pub fn spawn(
         args: extra,
         mlat,
         fit,
+        cores,
     } = how;
-    let (mlat, fit) = (*mlat, *fit);
+    let (mlat, fit, cores) = (*mlat, *fit, *cores);
     std::fs::create_dir_all(state_dir)
         .map_err(|error| format!("{}: {error}", state_dir.display()))?;
     let identity = Identity::generate().map_err(|error| error.to_string())?;
@@ -221,7 +222,7 @@ pub fn spawn(
         // fitted to the least a relay starts with, one: its base is what is measured. Before, a
         // run of none was fitted to none and the relay refused to start.
         let fitted = feeders.max(1);
-        let memory = fitted_memory(bin, &args, fitted)?;
+        let memory = fitted_memory(bin, &args, fitted, cores)?;
         eprintln!("tally-load: the relay's --memory is {memory} bytes, what {fitted} feeders need");
         args.extend(["--memory".into(), memory.to_string()]);
     }
@@ -233,6 +234,18 @@ pub fn spawn(
     // The relay dies with the harness, however the harness ends (an interrupt included), so no
     // load test leaves a relay behind.
     crate::os::die_with_parent(&mut command);
+    if let Some(cores) = cores {
+        // The relay on the first cores, the harness (its feeders, its simulation, its subscriber)
+        // on the rest, so neither measures the other's work.
+        let all = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+        if cores >= all {
+            return Err(format!(
+                "--relay-cores {cores}: this host has {all}, and the harness needs one"
+            ));
+        }
+        crate::os::run_on(&mut command, 0..cores);
+        crate::os::keep_to(cores..all)?;
+    }
     let child = command
         .args(&args)
         .stdin(Stdio::null())
@@ -276,10 +289,20 @@ pub fn spawn(
 
 /// The least `--memory` that admits `feeders` to the relay `bin` started with `args`: what
 /// `tally-relay check` says it holds before any feeder and reserves for each
-/// (`Budget::memory_for`), as an operator sizing a deploy for them reads it.
-fn fitted_memory(bin: &Path, args: &[String], feeders: usize) -> Result<u64, String> {
-    let output = Command::new(bin)
-        .arg("check")
+/// (`Budget::memory_for`), as an operator sizing a deploy for them reads it: on `cores` cores where
+/// it will run on those (`--relay-cores`), as a deploy's check names its unit's.
+fn fitted_memory(
+    bin: &Path,
+    args: &[String],
+    feeders: usize,
+    cores: Option<usize>,
+) -> Result<u64, String> {
+    let mut command = Command::new(bin);
+    command.arg("check");
+    if let Some(cores) = cores {
+        command.args(["--cores".to_owned(), cores.to_string()]);
+    }
+    let output = command
         .args(args)
         .output()
         .map_err(|error| format!("{} check: {error}", bin.display()))?;
@@ -433,25 +456,49 @@ pub struct Worked {
     pub regional_signed: u64,
     /// What the relay's own strike tables hold (`Store::OwnStrikes`).
     pub own_strikes_held: u64,
-    /// Where MLAT is hosted: its window steps, the positions they published, and the records
-    /// standing took in and forgot for room.
+    /// Where MLAT is hosted: what its plan guarantees (`MlatWorked`) and what it made of the load.
     pub mlat: Option<MlatWorked>,
 }
 
+/// What hosted MLAT did over a run (`GET /mlat`, and standing's part of `GET /memory`): what its
+/// plan guarantees of any load, and what it made of this one. The raw pool is planned at what a
+/// holder keeps of each seat at most (`arrived::Rates::MEASURED`), and what it refuses past its
+/// bytes is counted (`batches_refused`): the positions and the records standing took are reported,
+/// never asserted, since a run's timing moves them.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MlatWorked {
     pub steps: u64,
+    /// Batches the engine took in, and those its pool refused whole past a cap.
+    pub ingested: u64,
+    pub batches_refused: u64,
+    /// Clock fits tried (`steps_total.fits`).
+    pub fits: u64,
+    /// What a host within its plan never does: its tables past the `Arrived` store
+    /// (`arrived_over`), a step's records refused for their stores (`overflowed`), a step not run
+    /// for its working set (`steps_unreserved`).
+    pub arrived_over: u64,
+    pub overflowed: u64,
+    pub steps_unreserved: u64,
     pub positions: u64,
     pub standing_taken: u64,
     pub standing_forgotten: u64,
+    /// The seats its plan gives it (`seat_limit`) and those it held at the end, under its own
+    /// cuts (`seats_taken`): what `//crates/load:plan_seats` holds within 15% of each other.
+    pub seat_limit: u64,
+    pub seats_taken: u64,
 }
 
 impl Worked {
     /// What the run did not do of its work, with feeders sending and, where hosted, MLAT: each
     /// a reason its figures are not a working relay's. None for a run of no feeder but that its
-    /// clock judged. MLAT is asked for positions, and standing for records, only where the
-    /// simulation made `multilaterable` transmissions (heard by enough receivers to solve): a
-    /// few feeders spread over two continents hear nothing in common.
+    /// clock judged. MLAT is held to what its plan guarantees whatever the timing: it stepped and
+    /// took raw in, it tried clock fits wherever the simulation made `multilaterable`
+    /// transmissions (heard by enough receivers to solve; a few feeders stand at the benchmark's
+    /// density at each cluster's centre, `traffic::WORLD_FEEDERS`, so any more than a fix takes
+    /// hear most in common), and no store of it went past its plan (standing forgot nothing for
+    /// room, the engine's tables stayed within `Arrived`, no step's records or working set were
+    /// refused). What it published is not held (`MlatWorked`): before, a run was failed for no
+    /// positions, which a pool refusing its share by arrival order made pass or fail by timing.
     pub fn shortfalls(&self, feeders: usize, multilaterable: u64) -> Vec<String> {
         let mut short = Vec::new();
         if self.unjudged_records > 0 {
@@ -470,15 +517,24 @@ impl Worked {
             short.push("the relay's own strike tables held nothing".to_owned());
         }
         if let Some(mlat) = self.mlat {
-            if mlat.steps == 0 || (multilaterable > 0 && mlat.positions == 0) {
+            if mlat.steps == 0 || mlat.ingested == 0 {
                 short.push(format!(
-                    "MLAT stepped {} windows and published {} positions of {multilaterable} \
-                     transmissions heard by enough receivers to solve",
-                    mlat.steps, mlat.positions
+                    "MLAT stepped {} windows and took in {} batches",
+                    mlat.steps, mlat.ingested
                 ));
             }
-            if multilaterable > 0 && mlat.standing_taken == 0 {
-                short.push("standing took nothing in".to_owned());
+            if multilaterable > 0 && mlat.fits == 0 {
+                short.push(format!(
+                    "MLAT tried no clock fit of {multilaterable} transmissions heard by enough \
+                     receivers to solve"
+                ));
+            }
+            if mlat.arrived_over + mlat.overflowed + mlat.steps_unreserved > 0 {
+                short.push(format!(
+                    "MLAT went past its plan: its tables past the arrived store {} times, {} \
+                     steps' records refused, {} steps not run for their working set",
+                    mlat.arrived_over, mlat.overflowed, mlat.steps_unreserved
+                ));
             }
             if mlat.standing_forgotten > 0 {
                 short.push(format!(
@@ -515,15 +571,20 @@ pub fn worked(stats: &str) -> Result<Worked, String> {
         .unwrap_or(0);
     let mlat = if let Ok(report) = json("/mlat") {
         let standing = memory.get("standing");
+        let total = |name: &str| number(report.get("steps_total").and_then(|t| t.get(name)));
         Some(MlatWorked {
             steps: number(report.get("steps")),
-            positions: number(
-                report
-                    .get("steps_total")
-                    .and_then(|total| total.get("positions")),
-            ),
+            ingested: number(report.get("ingested")),
+            batches_refused: number(report.get("batches_refused")),
+            fits: total("fits"),
+            arrived_over: number(report.get("arrived_over")),
+            overflowed: number(report.get("overflowed")),
+            steps_unreserved: number(report.get("steps_unreserved")),
+            positions: total("positions"),
             standing_taken: number(standing.and_then(|standing| standing.get("taken"))),
             standing_forgotten: number(standing.and_then(|standing| standing.get("forgotten"))),
+            seat_limit: number(report.get("seat_limit")),
+            seats_taken: number(report.get("seats_taken")),
         })
     } else {
         None
@@ -655,7 +716,7 @@ pub fn admission(stats: &str) -> Result<Admission, String> {
     })
 }
 
-/// What a relay hosting MLAT says of its window steps' clock fits (`GET /mlat`, `steps_total`):
+/// What a relay hosting MLAT says of its steps' clock fits (`GET /mlat`, `steps_total`):
 /// the clock fits tried and those of them that failed, since it started, and why the last failed.
 #[derive(Clone, Debug, Default)]
 pub struct Fits {
@@ -665,13 +726,20 @@ pub struct Fits {
     /// Clocks the fits dropped as cut off from their gauge (`disconnected`).
     pub disconnected: u64,
     pub steps: u64,
+    /// Every step's run as the governor judges it, its taking and its stepping, summed
+    /// (`steps_total.ran_ms`), and the bytes MLAT published, its clock models and its positions raw
+    /// and tagged (`clock_model_bytes`, `positions_bytes`, `tagged_positions_bytes`).
+    pub ran_ms: u64,
+    pub published_bytes: u64,
+    /// Why a fit failed: the last step's first failure, else the run's first. The last step's
+    /// alone said "none" whenever its own fits passed, however many had failed before it.
     pub reason: Option<String>,
 }
 
 impl Fits {
     /// The share of the fits tried between `before` and this that failed, if any were tried. The
-    /// relay's `fits` counts every fit tried, those that failed among them (`unfitted`,
-    /// `tally_mlat::window`), so the share is `unfitted / fits`. Before, it was taken over
+    /// relay's `fits` counts every fit tried, those that failed among them (`unfitted`, the
+    /// engine's refits), so the share is `unfitted / fits`. Before, it was taken over
     /// `fits + unfitted`, each failure counted twice in the whole: a window where about 87% of
     /// fits failed read 45%.
     pub fn failed_since(&self, before: &Self) -> Option<f64> {
@@ -701,15 +769,20 @@ pub fn fits(stats: &str) -> Result<Fits, String> {
         fits: number("fits"),
         unfitted: number("unfitted"),
         disconnected: number("disconnected"),
+        ran_ms: number("ran_ms"),
+        published_bytes: number("clock_model_bytes")
+            + number("positions_bytes")
+            + number("tagged_positions_bytes"),
         steps: json
             .get("steps")
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(0),
-        reason: json
-            .get("last_step")
-            .and_then(|last| last.get("unfitted_reason"))
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_owned),
+        reason: ["last_step", "steps_total"].iter().find_map(|step| {
+            json.get(step)
+                .and_then(|step| step.get("unfitted_reason"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        }),
     })
 }
 
@@ -806,8 +879,10 @@ mod tests {
     }
 
     /// A run that did not do its work says what it did not: its clock judged nothing, it signed
-    /// no product, its strike tables held nothing, MLAT stepped nothing, standing took nothing in
-    /// or forgot for room. A run of no feeder is held only to its clock.
+    /// no product, its strike tables held nothing, MLAT stepped or took in nothing, tried no fit of
+    /// a solvable scene, went past its plan, or standing forgot for room. What MLAT published is
+    /// never held: a pool refusing above the mean by arrival order moves it. A run of no feeder is
+    /// held only to its clock.
     #[test]
     fn a_run_that_did_not_work_says_what_it_did_not_do() {
         let working = Worked {
@@ -816,13 +891,17 @@ mod tests {
             own_strikes_held: 4_096,
             mlat: Some(MlatWorked {
                 steps: 2,
+                ingested: 10,
+                batches_refused: 4,
+                fits: 3,
                 positions: 9,
                 standing_taken: 40,
-                standing_forgotten: 0,
+                ..MlatWorked::default()
             }),
         };
         assert!(working.shortfalls(8, 100).is_empty());
         assert!(Worked::default().shortfalls(0, 0).is_empty());
+        let mlat = working.mlat.unwrap_or_default();
         let broken = [
             Worked {
                 unjudged_records: 1,
@@ -837,30 +916,45 @@ mod tests {
                 ..working
             },
             Worked {
+                mlat: Some(MlatWorked { steps: 0, ..mlat }),
+                ..working
+            },
+            Worked {
                 mlat: Some(MlatWorked {
-                    steps: 0,
-                    ..working.mlat.unwrap_or_default()
+                    ingested: 0,
+                    ..mlat
+                }),
+                ..working
+            },
+            Worked {
+                mlat: Some(MlatWorked { fits: 0, ..mlat }),
+                ..working
+            },
+            Worked {
+                mlat: Some(MlatWorked {
+                    arrived_over: 1,
+                    ..mlat
                 }),
                 ..working
             },
             Worked {
                 mlat: Some(MlatWorked {
-                    positions: 0,
-                    ..working.mlat.unwrap_or_default()
+                    overflowed: 1,
+                    ..mlat
                 }),
                 ..working
             },
             Worked {
                 mlat: Some(MlatWorked {
-                    standing_taken: 0,
-                    ..working.mlat.unwrap_or_default()
+                    steps_unreserved: 1,
+                    ..mlat
                 }),
                 ..working
             },
             Worked {
                 mlat: Some(MlatWorked {
                     standing_forgotten: 1,
-                    ..working.mlat.unwrap_or_default()
+                    ..mlat
                 }),
                 ..working
             },
@@ -868,17 +962,23 @@ mod tests {
         for worked in broken {
             assert_eq!(worked.shortfalls(8, 100).len(), 1, "{worked:?}");
         }
-        // With nothing heard by enough receivers to solve, MLAT is asked only to step.
-        let unsolvable = Worked {
+        // No positions, nothing standing took and batches refused by the pool are no shortfall.
+        let refused = Worked {
             mlat: Some(MlatWorked {
                 positions: 0,
                 standing_taken: 0,
-                ..working.mlat.unwrap_or_default()
+                batches_refused: 1_000,
+                ..mlat
             }),
             ..working
         };
+        assert!(refused.shortfalls(8, 100).is_empty());
+        // With nothing heard by enough receivers to solve, MLAT is not asked to fit.
+        let unsolvable = Worked {
+            mlat: Some(MlatWorked { fits: 0, ..mlat }),
+            ..working
+        };
         assert!(unsolvable.shortfalls(8, 0).is_empty());
-        assert_eq!(unsolvable.shortfalls(8, 1).len(), 2);
         assert_eq!(
             Worked {
                 unjudged_records: 1,

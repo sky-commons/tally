@@ -132,6 +132,47 @@ pub fn set_allocator(
     let _ = (arenas, mmap_threshold, trim_threshold);
 }
 
+/// Asks the kernel to back `table` with transparent huge pages where it can (`madvise` with
+/// `MADV_HUGEPAGE`, over the whole 2 MiB pages inside it): a large table probed at random (the
+/// message threads' fingerprints, `exchange::Fingerprints`) then misses the TLB once a 2 MiB page
+/// rather than once a 4 KiB one. Advice only: the table is the same either way, and elsewhere
+/// nothing is asked.
+pub fn advise_huge_pages<T: Copy>(table: &mut [T]) {
+    #[cfg(target_os = "linux")]
+    {
+        const HUGE: usize = 2 << 20;
+        let start = table.as_mut_ptr() as usize;
+        let end = start + std::mem::size_of_val(table);
+        let (from, to) = (start.next_multiple_of(HUGE), end / HUGE * HUGE);
+        if to > from {
+            // SAFETY: `[from, to)` lies inside `table`, which this call borrows mutably, and
+            // `MADV_HUGEPAGE` changes how its pages are backed, never what they hold.
+            unsafe {
+                libc::madvise(from as *mut libc::c_void, to - from, libc::MADV_HUGEPAGE);
+            }
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = table;
+}
+
+/// Asks the cache for the line holding `at` ahead of its use (`prefetcht0`): a probe into a large
+/// table whose place is known before it is made (the message threads', `exchange::Fingerprints`)
+/// then waits for no memory. Advice only, on any address; elsewhere nothing.
+#[inline]
+pub fn prefetch<T>(at: &T) {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: a prefetch reads nothing the program sees and faults on no address; `at` is a
+    // reference besides.
+    unsafe {
+        std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(
+            (at as *const T).cast::<i8>(),
+        );
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = at;
+}
+
 /// Returns every glibc arena's free pages to the kernel (`malloc_trim(0)`). Elsewhere, nothing.
 pub fn trim_allocator() {
     #[cfg(all(target_os = "linux", target_env = "gnu"))]

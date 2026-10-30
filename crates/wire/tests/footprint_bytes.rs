@@ -630,7 +630,7 @@ fn records_allocate_what_they_say() -> Result<(), Box<dyn std::error::Error>> {
     drop(records);
     for bytes in &encoded {
         let base = CountingAll::live();
-        let (record, _) = Record::decode(bytes)?;
+        let (record, _) = Record::decode(bytes, tally_wire::record::MAX_VERSION)?;
         let record = record.ok_or_else(|| "a record this build reads".to_owned())?;
         let kept = since(base);
         match record {

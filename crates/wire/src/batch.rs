@@ -924,6 +924,18 @@ impl Batch {
         Ok((header, Layout::Deflate { stated, stream }))
     }
 
+    /// This batch with its observations' plain bytes, inflated once ([`Inflated`]): what a relay
+    /// reads its wanted receptions from ([`Inflated::wanted_receptions`]) and then decodes from
+    /// (`Decoded::from_inflated_owned`). An error where a decode would refuse its bytes.
+    pub fn inflated(&self) -> Result<Inflated, WireError> {
+        let (header, plain) = self.header_and_plain()?;
+        Ok(Inflated {
+            batch: self.clone(),
+            header,
+            plain,
+        })
+    }
+
     /// The fixed fields, and the observations' plain bytes (`count u32 | observations`), for a
     /// format this build reads: a slice of the signed bytes for format 1 (shared, not copied), and
     /// for formats 2 and 3 inflated once, to its stated length and never past it, so at most
@@ -954,6 +966,39 @@ impl Batch {
             });
         }
         Ok((header, Bytes::from(inflated)))
+    }
+}
+
+/// A batch and its observations' plain bytes, inflated once ([`Batch::inflated`]): a relay reads
+/// its wanted receptions from them before it decides to decode it, and decodes from them, so a
+/// compressed batch is inflated once. Before (2026-10-27), it was scanned a piece at a time for its
+/// wanted receptions ([`Batch::wanted_receptions`]) and inflated again to decode it: a tenth of an
+/// ingest worker's time at 2,000 feeders. The plain bytes are as long as a decode's own, and go
+/// with it or with this.
+#[derive(Clone, Debug)]
+pub struct Inflated {
+    batch: Batch,
+    header: Header,
+    plain: Bytes,
+}
+
+impl Inflated {
+    /// The batch inflated.
+    pub fn batch(&self) -> &Batch {
+        &self.batch
+    }
+
+    /// Its fixed fields, and its observations' plain bytes (`count u32 | observations`).
+    pub(crate) fn header_and_plain(&self) -> (Header, Bytes) {
+        (self.header, self.plain.clone())
+    }
+
+    /// The wanted receptions it holds, exactly as [`Batch::wanted_receptions`] reads them from its
+    /// signed bytes.
+    pub fn wanted_receptions(&self) -> Result<usize, WireError> {
+        let mut scan = WantedScan::new(self.batch.format(), self.plain.len());
+        scan.feed(&self.plain)?;
+        scan.finish()
     }
 }
 
@@ -2398,6 +2443,25 @@ mod tests {
                 "{codec:?}"
             );
             assert_eq!(batch.wanted_receptions()?, wanted, "{codec:?}");
+            // Inflated once, the same count, and the decode read from those bytes is the batch's.
+            let inflated = batch.inflated()?;
+            assert_eq!(inflated.wanted_receptions()?, wanted, "{codec:?}");
+            let at = crate::clocks::recorded::aligned(0);
+            let once = crate::decoded::Decoded::from_inflated_owned(
+                batch.clone(),
+                Some(&inflated),
+                (at, true),
+                0,
+                |_| Some(Box::new(()) as crate::decoded::Owner),
+                |_| {},
+            )
+            .ok()
+            .map(|decoded| decoded.observations().to_vec());
+            let again = crate::decoded::Decoded::from_verified(batch.clone(), at, 0)
+                .ok()
+                .map(|decoded| decoded.observations().to_vec());
+            assert!(once.is_some(), "{codec:?}");
+            assert_eq!(once, again, "{codec:?}");
             let decoded = batch
                 .content()?
                 .observations

@@ -389,13 +389,8 @@ const RESOLVE_AGAIN_MS: u64 = 10 * 1000;
 /// The products the relay offers for each region it takes: what it shares of them (§2.5, §2.11),
 /// with its relay duties on. With them off it hosts no feeders, so it has no raw of its own to seed
 /// or to pass an MLAT relay one hop, and its offers leave raw out (`own_products`).
-const OWN_PRODUCTS: Streams = Streams(
-    Streams::RAW.0
-        | Streams::POSITIONS.0
-        | Streams::CLOCK_MODELS.0
-        | Streams::PROVISIONAL.0
-        | Streams::REGIONAL.0,
-);
+const OWN_PRODUCTS: Streams =
+    Streams(Streams::RAW.0 | Streams::POSITIONS.0 | Streams::CLOCK_MODELS.0 | Streams::REGIONAL.0);
 
 /// What the relay's own offers declare it provides: `OWN_PRODUCTS`, less raw when its relay
 /// duties are off. An offer of raw is what an MLAT relay dials for one-hop raw

@@ -156,6 +156,14 @@ fn check(config: &Config) -> Result<(), String> {
                 0
             }),
         ),
+        (
+            "member-products-bytes-per-sec",
+            number(plan.member_products_bytes_per_sec(if plan.holds_raw {
+                admission.seats
+            } else {
+                0
+            })),
+        ),
         ("mlat-seats-bound", admission.seats_bound.name().into()),
         ("cores", number(config.cores)),
         ("feeder-records", wide(plan.feeder_records_per_sec)),
@@ -268,8 +276,8 @@ fn prepare(
         .memory(config.memory, hosts_mlat)
         // Its areas, which the member sessions are planned from (`budget::members_for`).
         .taking(config.areas.clone())
-        // The world products it gathers, whose fixes the plan holds (`Plan::with_world`).
-        .gathering_world(config.world, config.world_precise)
+        // The world product, if it gathers it, whose fixes the plan holds (`Plan::with_world`).
+        .gathering_world(config.world)
         // Its cores, which bound the connections, the rate and the MLAT seats it admits
         // (`budget::Plan::admit`).
         .cores(config.cores)

@@ -1864,7 +1864,6 @@ fn hold_offer(
             products: Streams(
                 Streams::RAW.0
                     | Streams::POSITIONS.0
-                    | Streams::PROVISIONAL.0
                     | Streams::CLOCK_MODELS.0
                     | Streams::REGIONAL.0,
             ),

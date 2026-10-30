@@ -2,13 +2,15 @@
 //! base"): the relay built beside this test, started with the public relay's deployed arguments
 //! (`infra/kubernetes/tally/relay.yaml` in flightlines: hosting MLAT, listening on every address,
 //! serving beast-out to one client, advertising itself under its own key, vouching for a client
-//! key, the 122 resolution-0 areas and its caps), and again gathering both world products
-//! (`--world --world-precise`), with `--memory` exactly what each load needs
+//! key, the 122 resolution-0 areas and its caps), and again gathering the world product
+//! (`--world`), with `--memory` exactly what each load needs
 //! (`tally-load --relay-fit`), and `N` simulated feeders, for N of 0, 8, 32 and 128. Its judging
 //! clock is bounded by a ClockBound segment the harness keeps synchronised (`--clock-bound`), so
 //! it judges and works. Each run passes only if every feeder is held, the relay did its work
-//! (its clock judged every record, it signed products, its own strike tables filled, MLAT stepped
-//! and published, standing took records in and forgot none for room), what the allocator serves
+//! (its clock judged every record, it signed products, its own strike tables filled, MLAT stepped,
+//! took raw in, tried its clock fits and stayed within its plan, standing forgot none for room;
+//! what MLAT published is reported, not held, since a run's timing moves it,
+//! `tally_load::relay::MlatWorked`), what the allocator serves
 //! beyond every store's charge stays within the measured base and its margin, and its peak
 //! resident memory stays within its plan: the most its base and stores were charged, and the
 //! memory fitted to the load, each with the headroom kept below it (`tally_load::run`).
@@ -92,7 +94,7 @@ fn args(feeders: usize, state: &std::path::Path, world: bool) -> Result<Vec<Stri
         client.as_str(),
     ];
     if world {
-        relay_args.extend(["--world", "--world-precise"]);
+        relay_args.push("--world");
     }
     for relay_arg in relay_args.into_iter().chain([
         "--max-beast-clients",
@@ -125,7 +127,7 @@ fn the_public_relay_is_resident_within_its_plan_at_each_load() -> Result<(), Str
     at_each_load(false)
 }
 
-/// The public relay gathering both world products (`--world --world-precise`) at each load.
+/// The public relay gathering the world product (`--world`) at each load.
 #[test]
 fn the_public_relay_gathering_the_world_is_resident_within_its_plan_at_each_load()
 -> Result<(), String> {

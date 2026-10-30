@@ -196,9 +196,17 @@ pub const DEFAULT_MAX_FEEDER_BYTES_PER_SEC: u64 = 262_144;
 /// What the sharing members may send a second, all of them together, by default: 1 MiB, planned
 /// once as the 128 feeders it is worth (`budget::Plan::with_members`) and held by one pace they
 /// share (`ceiling::Pace`). Any one member may carry all of it (a relay may be another's parent in
-/// every stripe of every area it takes), so it is also each member's own ceiling. A whole-world
-/// MLAT relay sharing its products (clock models, final and provisional positions, about 4.2 MB/s
-/// together, RFC-0171 §3.8.1) raises it, with the memory to match. A member's place is known from
+/// every stripe of every area it takes), so it is also each member's own ceiling. It is their raw:
+/// what a neighbour's MLAT publishes for this relay's seats (measured at 7.5 KB a seat a second,
+/// 5.4 KB of clock models and 2.05 KB of positions, raw and tagged; `tally-load`, 2,000 feeders,
+/// RFC-0171 §3.8.1) comes over the same sessions on a pace of its own that follows the seats the
+/// plan admits (`budget::Plan::member_products_bytes_per_sec`, `ingest::MemberPace`), so no rate
+/// set for raw bounds the seats, and raising the seats plans no more raw ingest. Before
+/// (2026-10-27), the products spent this rate, the plan admitted no more seats than it carried
+/// (125 at this default, where the cores carried 522), and an operator raising it for the
+/// products planned four times the raw ingest beside them. This is the
+/// intended default (since 2026-10-08, when one shared rate replaced 8 MiB/s for each member, which
+/// planned every member a feeder budget of its own). A member's place is known from
 /// its handshake (`Hub::relay_trust`), so it is held to this, and every other connection that
 /// dialled in to the feeders' ceiling, whatever the key. An engine publishes nothing (an MLAT relay
 /// shares its positions through its groups), so it is held to the feeders' ceiling like any
@@ -219,7 +227,7 @@ pub struct Item {
     /// For a regional or bundle record, the cell it was signed for.
     pub cell: Option<Region>,
     /// For positions and clock models: the finest cells of the aircraft they place (a full clock
-    /// model's, its tile's centre; a client clock model's, the area its full model's tile is in),
+    /// model's, its area; a client clock model's, its full model's area),
     /// computed once when published. `None` is unrouted: whole-world.
     pub points: Option<Arc<[Region]>>,
     /// For a receiver's batch of a format this build reads: its one decode (`ingest`), so no
@@ -275,13 +283,18 @@ impl Awaiting {
     }
 }
 
-/// The clock models a positions record cites, each once.
+/// The clock models a positions record cites (their pair model ids), each once.
 fn cited_models(record: &Record) -> Vec<Hash> {
-    let (Record::Positions(positions) | Record::Provisional(positions)) = record else {
+    let Record::Positions(positions) = record else {
         return Vec::new();
     };
     let mut cited: Vec<Hash> = crate::network::solved(positions)
-        .map(|solved| solved.into_iter().map(|one| one.clock_model).collect())
+        .map(|solved| {
+            solved
+                .into_iter()
+                .flat_map(|one| one.clock_models)
+                .collect()
+        })
         .unwrap_or_default();
     cited.sort_unstable();
     cited.dedup();
@@ -893,8 +906,6 @@ pub struct Hub {
     sized: Mutex<Vec<SizedTable>>,
     /// Engines' positions taken in, by hash, each judged by its signed `issued_ms`.
     positions: Mutex<Strikes>,
-    /// Engines' provisional positions taken in, apart from their final positions.
-    provisional: Mutex<Strikes>,
     /// Engines' clock models taken in, by id, each judged by its signed `issued_ms`; what
     /// positions wait for (`Hub::forward_positions`).
     clock_models: Mutex<Strikes>,
@@ -1007,9 +1018,9 @@ pub struct Hub {
     /// its stages' threads follow the load admitted (`cores`). None for a test's hub, whose
     /// feeders only its memory bounds and whose stages' threads it names.
     cores: Option<usize>,
-    /// Whether it gathers the live and the precise world products (`Hub::gathering_world`): their
-    /// fixes' store is planned only then (`Plan::with_world`).
-    world: (bool, bool),
+    /// Whether it gathers the world product (`Hub::gathering_world`): its fixes' store is planned
+    /// only then (`Plan::with_world`).
+    world: bool,
     /// The time the ingest ceilings read.
     ceiling_clock: crate::ceiling::Clock,
     /// The relay's two clocks (`clock::RelayClock`): the judging clock everything compared across
@@ -1148,8 +1159,15 @@ fn proof_time(proof: &FaultProof) -> Option<u64> {
 /// The records a second the members' rate of `bytes_per_sec` brings: the feeders it is worth, by
 /// the budget's one rule (`budget::feeders_for_rate`), each at
 /// `ingest::MEMBER_RECORDS_PER_FEEDER`.
-fn member_records_for(bytes_per_sec: u64) -> u64 {
-    crate::ingest::member_records_per_sec(crate::budget::feeders_for_rate(bytes_per_sec))
+/// The records a second the members bring at `bytes_per_sec` of raw and the products of
+/// `product_seats` (`budget::Plan::product_seats`): each feeder the raw rate is worth, and each seat
+/// whose products they bring beyond those, at a member feeder's records a second
+/// (`ingest::MEMBER_RECORDS_PER_FEEDER`), as each of those feeders was planned as one seat of
+/// another engine, its batches and its products, before the products had a pace of their own.
+fn member_records_for(bytes_per_sec: u64, product_seats: usize) -> u64 {
+    crate::ingest::member_records_per_sec(
+        crate::budget::feeders_for_rate(bytes_per_sec).max(product_seats),
+    )
 }
 
 /// Who a connection counts against: its IPv4 address, or its IPv6 /64. An IPv4 address mapped
@@ -1232,7 +1250,6 @@ impl Hub {
             // Sized to the budget's receiver figure as it is planned (`Hub::size_tables`).
             stations: Mutex::new(Stations::new(1)),
             positions: Mutex::new(table(relay_signed)),
-            provisional: Mutex::new(table(relay_signed)),
             clock_models: Mutex::new(table(relay_signed)),
             parts: Mutex::new(Parts::sized(crate::parts::ONE_MODEL_BYTES)),
             awaiting: Mutex::new(VecDeque::new()),
@@ -1261,9 +1278,11 @@ impl Hub {
             max_member_bytes_per_sec: DEFAULT_MAX_MEMBER_BYTES_PER_SEC,
             member_pace: Arc::new(crate::ingest::MemberPace::new(
                 DEFAULT_MAX_MEMBER_BYTES_PER_SEC,
+                0,
             )),
             member_records: Arc::new(crate::ingest::RecordPace::new(member_records_for(
                 DEFAULT_MAX_MEMBER_BYTES_PER_SEC,
+                0,
             ))),
             directory_records,
             burst_grants,
@@ -1300,7 +1319,7 @@ impl Hub {
             areas: Vec::new(),
             holds_raw: false,
             cores: None,
-            world: (false, false),
+            world: false,
             ceiling_clock: crate::ceiling::system_clock(),
             clock,
             leaving: tokio::sync::watch::Sender::new(false),
@@ -1378,9 +1397,8 @@ impl Hub {
             boot_id.wrapping_add(1),
             1,
         ));
-        // The world products it gathers (`Hub::gathering_world`), whichever was built first.
-        self.network.products.set_world(self.world.0);
-        self.network.products.set_world_precise(self.world.1);
+        // The world product, if it gathers it (`Hub::gathering_world`), whichever was built first.
+        self.network.products.set_world(self.world);
         self.network.charge_to(&self.budget);
         self.size_tables();
         self.stages = Stages::inline(clock, self.network.products.sink(), gauges);
@@ -1407,6 +1425,18 @@ impl Hub {
     pub fn memory(mut self, memory: usize, holds_raw: bool) -> Self {
         self.holds_raw = holds_raw;
         self.budget.resize(memory, self.plan());
+        // The members' paces follow the plan: their raw at the rate the operator set, their
+        // products at the seats the plan admits (`budget::Plan::member_products_bytes_per_sec`),
+        // and their records a second at both.
+        let products = self.budget.member_products_bytes_per_sec() as u64;
+        self.member_pace = Arc::new(crate::ingest::MemberPace::new(
+            self.max_member_bytes_per_sec,
+            products,
+        ));
+        self.member_records = Arc::new(crate::ingest::RecordPace::new(member_records_for(
+            self.max_member_bytes_per_sec,
+            self.budget.plan().product_seats(self.budget.hosted_seats()),
+        )));
         // Each deliverer's share of what is taken follows the records a second the plan carries
         // for it, as the stores are planned.
         self.shares
@@ -1584,15 +1614,14 @@ impl Hub {
                     .saturating_add(self.acars_clients),
             )
             .with_cores(self.cores)
-            .with_world(self.world.0, self.world.1)
+            .with_world(self.world)
     }
 
-    /// Gathers the live (`live`) and the precise (`precise`) world products (`--world`,
-    /// `--world-precise`): the products are told, and the plan holds their fixes' store.
-    pub fn gathering_world(mut self, live: bool, precise: bool) -> Self {
-        self.network.products.set_world(live);
-        self.network.products.set_world_precise(precise);
-        self.world = (live, precise);
+    /// Gathers the world product (`--world`): the products are told, and the plan holds its
+    /// fixes' store.
+    pub fn gathering_world(mut self, world: bool) -> Self {
+        self.network.products.set_world(world);
+        self.world = world;
         self.replanned()
     }
 
@@ -1689,7 +1718,8 @@ impl Hub {
     pub fn taking(mut self, areas: Vec<Region>) -> Self {
         self.network.selection.set_taken(areas.clone());
         self.network.products.set_taken(areas.clone());
-        // Clock models are held for the tiles of the areas it takes, and no other (`models`).
+        // Clock models are held for the areas it takes and their border band, and no other
+        // (`models`).
         self.network
             .clock_models
             .set_areas(&tally_wire::Regions::new(areas.clone()));
@@ -1934,11 +1964,6 @@ impl Hub {
                     self.publish_positions(source, positions);
                 }
             }
-            Record::Provisional(positions) => {
-                if positions.engine().is_ok() {
-                    self.publish_provisional(source, positions);
-                }
-            }
             Record::ClockModel(model) => {
                 if model.engine().is_ok() {
                     self.publish_clock_model(source, model);
@@ -2156,8 +2181,7 @@ impl Hub {
     /// worth: the budget is resized with it.
     pub fn max_member_bytes_per_sec(mut self, rate: u64) -> Self {
         self.max_member_bytes_per_sec = rate;
-        self.member_pace = Arc::new(crate::ingest::MemberPace::new(rate));
-        self.member_records = Arc::new(crate::ingest::RecordPace::new(member_records_for(rate)));
+        // The paces follow the plan (`Hub::memory`).
         self.replanned()
     }
 
@@ -2223,6 +2247,13 @@ impl Hub {
 
     pub fn member_bytes_per_sec(&self) -> u64 {
         self.max_member_bytes_per_sec
+    }
+
+    /// What a member session's socket is read at most (its `Ceiling`): the members' raw rate and
+    /// their products' pace, either of which one member may carry all of.
+    pub fn member_ceiling_bytes_per_sec(&self) -> u64 {
+        self.max_member_bytes_per_sec
+            .saturating_add(self.member_pace.products_rate())
     }
 
     /// The clock the ingest ceilings read, instead of the system's: a test holds it still.
@@ -2636,8 +2667,7 @@ impl Hub {
         self.network.sharing.let_go(rebuilt);
     }
 
-    /// A piece of a group's data other than a batch or a regional batch (positions, provisional
-    /// positions, a clock model, its client form, a fault proof), from session `source` and
+    /// A piece of a group's data other than a batch or a regional batch (positions, a clock model, its client form, a fault proof), from session `source` and
     /// delivered by `who`: the one intake each kind has, whether a member's link brought it
     /// (`link`) or this relay rebuilt it from parity (`take_rebuilt`). Its signature is checked
     /// and it is judged by what this relay took in (`strikes`): `share` takes a new one, a
@@ -2664,12 +2694,6 @@ impl Hub {
                 positions.issued_ms().map_err(|error| error.to_string())?;
                 positions.verify().map_err(|error| error.to_string())?;
                 self.take_positions(source, positions, who, intake);
-            }
-            Record::Provisional(positions) => {
-                positions.engine().map_err(|error| error.to_string())?;
-                positions.issued_ms().map_err(|error| error.to_string())?;
-                positions.verify().map_err(|error| error.to_string())?;
-                self.take_provisional(source, positions, who, intake);
             }
             Record::ClockModel(model) => {
                 model.engine().map_err(|error| error.to_string())?;
@@ -2897,10 +2921,14 @@ impl Hub {
         // depends on this relay's clock. One whose bytes do not hold the receptions they state is
         // charged every reception it states, the most it can want. By the batch's stamp, on the
         // worker that owns the receiver's shard, so the same stamped batches are kept alike on
-        // any threads.
+        // any threads. Read from its plain bytes inflated once, which its decode then reads too
+        // (`Batch::inflated`): before (2026-10-27), a compressed batch was inflated twice.
+        let mut inflated = None;
         if feeder {
-            let wanted = batch
-                .wanted_receptions()
+            inflated = batch.inflated().ok();
+            let wanted = inflated
+                .as_ref()
+                .and_then(|inflated| inflated.wanted_receptions().ok())
                 .map_or(cost.receptions, |wanted| wanted as u64);
             if !self.within_ceiling(shard, receiver, wanted, stamp.mono_ms(), unit, cost) {
                 return false;
@@ -2932,7 +2960,8 @@ impl Hub {
         // has no room for is let go, counted.
         let store = self.budget.gauge(Store::Decoded);
         let covered = crate::budget::Covered::process();
-        let mut decoded = Stages::decode_owned(batch, stamp, &store, covered);
+        let mut decoded =
+            Stages::decode_inflated_owned(batch, inflated.as_ref(), stamp, &store, covered);
         // No room: the subscribers keeping the most alive are let go, as fallen behind, while
         // that makes room (a decode an epoch or MLAT still holds stays), as the fan-out's own
         // gauge lets them go for an item.
@@ -2941,8 +2970,10 @@ impl Hub {
                 decoded = Err(tally_wire::decoded::NotDecoded::NoRoom(batch));
                 break;
             }
-            decoded = Stages::decode_owned(batch, stamp, &store, covered);
+            decoded =
+                Stages::decode_inflated_owned(batch, inflated.as_ref(), stamp, &store, covered);
         }
+        drop(inflated);
         drop(in_flight);
         let (batch, decoded) = match decoded {
             Ok(decoded) => (decoded.batch().clone(), Some(decoded)),
@@ -3747,14 +3778,13 @@ impl Hub {
             let Ok(mut awaiting) = self.awaiting.lock() else {
                 return;
             };
-            let missing: Vec<Hash> = match self.clock_models.lock() {
-                Ok(forwarded) => cited
-                    .into_iter()
-                    .filter(|id| !forwarded.contains_hash(id))
-                    .collect(),
-                Err(_) => cited,
-            };
-            if missing.is_empty() && self.checkable(&record) {
+            // A model is cited by its pair model id, which no table of forwarded manifests
+            // names: it has gone out once it is held here whole (`Network::holds_pair`).
+            let missing: Vec<Hash> = cited
+                .into_iter()
+                .filter(|id| !self.network.holds_pair(id))
+                .collect();
+            if missing.is_empty() && self.checkable(source, &record) {
                 Some(record)
             } else if let Some(charge) = self
                 .budget
@@ -3807,18 +3837,16 @@ impl Hub {
                 let (ready, held): (VecDeque<Awaiting>, VecDeque<Awaiting>) =
                     awaiting.drain(..).partition(|one| {
                         one.since.elapsed() >= AWAITING_MS
-                            || (one.missing.is_empty() && self.checkable(&one.record))
+                            || (one.missing.is_empty() && self.checkable(one.source, &one.record))
                     });
                 *awaiting = held;
                 ready.into_iter().collect()
             };
-            // A raw record sent holds its twins (`hold_twins`): a client's form held beside it
-            // may be checkable now, so the rest are looked at again.
-            let raw = ready.iter().any(|one| {
-                matches!(&one.record,
-                    Record::Positions(positions) | Record::Provisional(positions)
-                        if !positions.is_tagged())
-            });
+            // A raw record sent is held as its link's twin (`Consistency::raw`): a client's form
+            // held beside it may be checkable now, so the rest are looked at again.
+            let raw = ready.iter().any(
+                |one| matches!(&one.record, Record::Positions(positions) if !positions.is_tagged()),
+            );
             for one in ready {
                 self.send_positions(one.source, one.record);
             }
@@ -3828,13 +3856,13 @@ impl Hub {
         }
     }
 
-    /// Whether the relay can check `record` for a client now: a raw record needs no check.
-    fn checkable(&self, record: &Record) -> bool {
+    /// Whether the relay can check `record`, from session `source`, for a client now: a raw
+    /// record needs no check.
+    fn checkable(&self, source: u64, record: &Record) -> bool {
         match record {
-            Record::Positions(positions) | Record::Provisional(positions)
-                if positions.is_tagged() =>
-            {
-                self.network.consistency.check(positions) != crate::consistency::Verdict::Unknown
+            Record::Positions(positions) if positions.is_tagged() => {
+                self.network.consistency.check(positions, source)
+                    != crate::consistency::Verdict::Unknown
             }
             _ => true,
         }
@@ -3850,19 +3878,18 @@ impl Hub {
     /// go without it (`Standing::positions` counts them unmodelled).
     fn send_positions(&self, source: u64, record: Record) {
         let points = crate::network::points_of(&record);
-        if let Record::Positions(positions) | Record::Provisional(positions) = &record
+        if let Record::Positions(positions) = &record
             && !positions.is_tagged()
         {
             self.network
                 .standing
                 .positions(positions, self.judged_now().judged());
-            self.hold_twins(positions, source);
+            // Its link's one record for the tagged twin that follows it (`consistency`).
+            self.network.consistency.raw(positions, source);
         }
         let client = match &record {
-            Record::Positions(positions) | Record::Provisional(positions)
-                if positions.is_tagged() =>
-            {
-                match self.network.consistency.check(positions) {
+            Record::Positions(positions) if positions.is_tagged() => {
+                match self.network.consistency.check(positions, source) {
                     crate::consistency::Verdict::Passes => ClientRecord::try_from(record.clone())
                         .ok()
                         .map(|client| Arc::new(ClientItem::new(Arc::new(client), points.as_ref()))),
@@ -3887,63 +3914,6 @@ impl Hub {
             stamp: self.clock.mono(),
             client,
         });
-    }
-
-    /// A raw positions record going out, from session `source`: each solution the checks may need
-    /// for a client held for its tagged twin (`consistency`), as it goes out after the models it
-    /// cites: one whose place some client's subscription covers (`fanout::Router::clients_at`), of
-    /// the relay's own engine's room when its own key signed it, else the members'.
-    fn hold_twins(&self, positions: &Positions, source: u64) {
-        let own = self.network.signer().map(tally_wire::Signer::public);
-        let class = if own.is_some() && positions.engine().ok() == own {
-            crate::consistency::Class::Own
-        } else {
-            crate::consistency::Class::Members
-        };
-        let fanout = &self.fanout;
-        self.network
-            .consistency
-            .raw(positions, (source, class), self.clock.mono(), |solution| {
-                Region::point(&tally_wire::Location {
-                    lat_e7: solution.lat_e7,
-                    lon_e7: solution.lon_e7,
-                    alt_m: 0,
-                    precision_m: 0,
-                })
-                .is_ok_and(|point| fanout.clients_at(&[point]))
-            });
-    }
-
-    /// Forwards verified provisional positions if they are new, as `publish_positions` does final
-    /// ones but in a table of their own, and only to whoever asked for them
-    /// (`Streams::PROVISIONAL`). True when they were.
-    pub fn publish_provisional(&self, source: u64, positions: Positions) -> bool {
-        self.take_provisional(
-            source,
-            positions,
-            Deliverer::Relay,
-            None::<Intake<fn(&Record), fn()>>,
-        )
-    }
-
-    /// As `publish_provisional`, delivered by `who` and taken into its group by `intake`
-    /// (`take_stream`).
-    fn take_provisional<S: FnOnce(&Record), L: FnOnce()>(
-        &self,
-        source: u64,
-        positions: Positions,
-        who: Deliverer,
-        intake: Option<Intake<S, L>>,
-    ) -> bool {
-        let judged = (positions.hash(), positions.issued_ms().ok());
-        let record = Record::Provisional(positions);
-        let new = self.take_stream(&self.provisional, &record, judged, who, intake);
-        if new && let Record::Provisional(positions) = &record {
-            self.network
-                .on_positions(positions, source, self.stamp_now());
-            self.forward_positions(source, record);
-        }
-        new
     }
 
     /// Forwards a verified clock model manifest if it is new: an id not taken, signed within the
@@ -3996,6 +3966,8 @@ impl Hub {
                 .network
                 .admit_model(&model, &listed, self.judged_now().judged());
             drop(listed);
+            // What fixes cite it by, once it is whole here (its parts may still be to come).
+            let pair = self.network.pair_of(&record_id).map(|(pair, _)| pair);
             for (from, part) in ready {
                 self.fanout.publish(Item {
                     source: from,
@@ -4010,7 +3982,13 @@ impl Hub {
             let record = Record::ClockModel(model);
             self.network
                 .on_clock_model(&record, source, self.stamp_now());
-            let points = crate::network::points_of(&record);
+            let points = match &record {
+                Record::ClockModel(model) => self
+                    .network
+                    .model_point_of(model)
+                    .map(|area| Arc::from([area].as_slice())),
+                _ => None,
+            };
             self.fanout.publish(Item {
                 source,
                 record: Arc::new(record),
@@ -4021,14 +3999,15 @@ impl Hub {
                 client: None,
             });
             // Positions held for this model go out after it.
-            self.release_awaiting(Some(record_id));
+            self.release_awaiting(pair);
         }
         new
     }
 
     /// Forwards a verified client clock model (a full model's summary for clients: no site, no
-    /// offset) if it is new, placed by the area its full model's tile is in
-    /// (`Network::client_model_area`), never the tile's centre. Its boot and sequence are its full
+    /// offset) if it is new, placed by its full model's area and the areas whose band holds it
+    /// (`Network::client_model_places`), the clients whose fixes may cite it. Its boot and
+    /// sequence are its full
     /// model's, so it is told apart by its hash alone, judged by its signed `issued_ms`. True when
     /// it was new.
     pub fn publish_client_clock_model(&self, source: u64, model: ClientClockModel) -> bool {
@@ -4062,8 +4041,8 @@ impl Hub {
         };
         let points = self
             .network
-            .client_model_area(&model)
-            .map(|area| Arc::from([area].as_slice()));
+            .client_model_places(&model)
+            .map(|places| Arc::from(places.as_slice()));
         self.fanout.publish(Item {
             source,
             record: Arc::new(Record::ClientClockModel(model)),
@@ -4090,10 +4069,12 @@ impl Hub {
             return false;
         };
         // Checked by its manifest now: held with it, and the model held whole in the store of
-        // decoded models once this was the last part it lacked (`Network::admit_held`); what
-        // waits to be checked against it may go then.
-        self.network.hold_part(&part);
+        // decoded models once this was the last part it lacked (`Network::admit_held`), its pair
+        // model id known (what fixes cite it by); what waits for it or to be checked against it
+        // may go then.
         let id = part.model().ok();
+        let was_whole = id.is_some_and(|id| self.network.is_whole(&id));
+        self.network.hold_part(&part);
         self.fanout.publish(Item {
             source,
             record: Arc::new(Record::ClockModelPart(part)),
@@ -4104,12 +4085,24 @@ impl Hub {
             client: None,
         });
         if let Some(id) = id
-            && self
-                .network
-                .admit_held(&id, self.judged_now().judged())
-                .is_some()
+            && !was_whole
+            && self.network.is_whole(&id)
         {
-            self.release_awaiting(None);
+            if let Some(Record::ClockModel(manifest)) = self
+                .network
+                .model_records(&id)
+                .and_then(|mut records| records.pop())
+            {
+                self.network.on_clock_model(
+                    &Record::ClockModel(manifest),
+                    source,
+                    self.stamp_now(),
+                );
+            }
+            let _ = self.network.admit_held(&id, self.judged_now().judged());
+            if let Some((pair, _)) = self.network.pair_of(&id) {
+                self.release_awaiting(Some(pair));
+            }
         }
         true
     }
@@ -4261,7 +4254,6 @@ impl Hub {
             }
         }
         self.positions = Mutex::new(table(relay_signed, &start("positions")));
-        self.provisional = Mutex::new(table(relay_signed, &start("provisional")));
         self.clock_models = Mutex::new(table(relay_signed, &start("clock_models")));
         self.passed_on = Mutex::new(table(relay_signed, &start("passed_on")));
         self.fault_proofs = Mutex::new(few(Usable::proofs(self.deadlines), "fault_proofs"));
@@ -4318,8 +4310,7 @@ impl Hub {
     }
 
     /// The tables a stop's dump holds, in its order, each with the lease it is kept by: every
-    /// ingest shard's batches, then positions, provisional positions, clock models and what is
-    /// passed on by hash.
+    /// ingest shard's batches, then positions, clock models and what is passed on by hash.
     fn dumped<T>(&self, mut each: impl FnMut(&str, &mut Strikes) -> T) -> Vec<T> {
         let mut out = Vec::new();
         for shard in &self.raw {
@@ -4329,7 +4320,6 @@ impl Hub {
         }
         for (name, table) in [
             ("positions", &self.positions),
-            ("provisional", &self.provisional),
             ("clock_models", &self.clock_models),
             ("passed_on", &self.passed_on),
         ] {
@@ -4344,13 +4334,7 @@ impl Hub {
     const DUMP: &'static str = "strikes.dump";
 
     /// The leases a dump is written beside, in its order.
-    const DUMP_LEASES: [&'static str; 5] = [
-        "batches",
-        "positions",
-        "provisional",
-        "clock_models",
-        "passed_on",
-    ];
+    const DUMP_LEASES: [&'static str; 4] = ["batches", "positions", "clock_models", "passed_on"];
 
     /// What a dump's header names as its layout: its tables, in order, the ingest shards' count,
     /// and each table's windows (`strikes::Strikes::layout`: how long it keeps a record, its
@@ -7411,7 +7395,7 @@ mod tests {
     }
 
     /// A late copy of an engine's record through `take_piece`, as a member's link or this
-    /// relay's rebuild hands it in: positions, provisional positions and a clock model signed
+    /// relay's rebuild hands it in: positions and a clock model signed
     /// longer ago than the window are each counted late and never published, and each is
     /// delivered into its group all the same (shared, its sender credited, `Hub::late`), never let
     /// go (which would have its group ask for it again for ever); a rebuilt one is passed on in
@@ -7432,21 +7416,9 @@ mod tests {
                 .taking(vec![group.cell]),
         );
         let (engine, _) = key()?;
-        let provisional = Positions::sign_provisional(
-            &engine,
-            &tally_wire::SolutionsContent {
-                boot_id: 1,
-                sequence: 5,
-                issued_ms: BASE_MS,
-                spec_version: 1,
-                solutions: Vec::new(),
-            },
-        )
-        .map_err(|error| error.to_string())?;
         let member = Identity::from_seed([74; 32]).public();
-        let late: [Record; 3] = [
+        let late: [Record; 2] = [
             Record::Positions(signed_positions_at(&engine, 1, 5, BASE_MS)?),
-            Record::Provisional(provisional),
             Record::ClockModel(signed_clock_model_at(&engine, 1, 5, BASE_MS)?),
         ];
         let out = hub.listen(u64::MAX, Filter::Everything);
@@ -7466,7 +7438,7 @@ mod tests {
                 record.kind()
             );
         }
-        assert_eq!(hub.memory_report().late_records, 3);
+        assert_eq!(hub.memory_report().late_records, 2);
         assert!(out.try_recv().is_none(), "a late record was published");
         // Rebuilt from parity: passed on in its group, neither refused nor let go.
         let hash = crate::sharing::member::record_hash(&late[0]).ok_or("no hash")?;
@@ -7479,7 +7451,7 @@ mod tests {
                 report.rebuilt_refused,
                 report.rebuilt_no_room
             ),
-            (4, 0, 0)
+            (3, 0, 0)
         );
         assert!(
             out.try_recv().is_none(),
@@ -9558,43 +9530,17 @@ mod tests {
         sequence: u64,
         issued_ms: u64,
     ) -> Result<Positions, String> {
-        Positions::sign_solutions(
+        Positions::sign_fix(
             engine,
-            &tally_wire::SolutionsContent {
+            &tally_wire::FixesContent {
                 boot_id,
                 sequence,
                 issued_ms,
                 spec_version: 1,
-                solutions: Vec::new(),
+                fixes: Vec::new(),
             },
         )
         .map_err(|error| error.to_string())
-    }
-
-    #[test]
-    fn provisional_positions_are_a_stream_of_their_own() -> Result<(), String> {
-        let hub = stamped_hub(8, crate::sharing::Deadlines::RELAY);
-        let (engine, _) = key()?;
-        let provisional = |sequence: u64| {
-            Positions::sign_provisional(
-                &engine,
-                &tally_wire::SolutionsContent {
-                    boot_id: 1,
-                    sequence,
-                    issued_ms: now_ms(),
-                    spec_version: 1,
-                    solutions: Vec::new(),
-                },
-            )
-            .map_err(|error| error.to_string())
-        };
-        assert!(hub.publish_positions(1, signed_positions(&engine, 1, 0)?));
-        // A table of their own: 0 is new among the engine's provisionals, and only once.
-        let first = provisional(0)?;
-        assert!(hub.publish_provisional(1, first.clone()));
-        assert!(!hub.publish_provisional(1, first));
-        assert!(hub.publish_provisional(1, provisional(1)?));
-        Ok(())
     }
 
     /// An engine's records are judged by their hash and signed time alone: a restarted engine's
@@ -9800,11 +9746,10 @@ mod tests {
                     1,
                     tally_mlat::engine::Settings {
                         regions: tally_wire::Regions::default(),
-                        settle: crate::mlat_host::SETTLE,
                         threads: 1,
                         capacity: tally_mlat::engine::Capacity::default(),
                     },
-                    crate::mlat_host::WindowClock::KEEPING_UP,
+                    crate::mlat_host::StepClock::KEEPING_UP,
                 )
                 .map_err(|error| error.to_string())?,
             ))
@@ -9813,8 +9758,8 @@ mod tests {
         assert!(unplanned.host_mlat(hosted()?).is_err());
         assert!(unplanned.network().mlat().is_none());
         let planned = stamped_hub(8, crate::sharing::Deadlines::RELAY).memory(DEFAULT_MEMORY, true);
-        let own = planned.network().consistency.caps().own;
-        assert!(own.bytes > 0 && own.twins > 0, "{own:?}");
+        let caps = planned.network().consistency.caps();
+        assert!(caps.sites > 0 && caps.links > 0, "{caps:?}");
         planned.host_mlat(hosted()?)?;
         assert!(planned.network().mlat().is_some());
         Ok(())
@@ -9850,9 +9795,41 @@ mod tests {
         let hub = stamped_hub(8, crate::sharing::Deadlines::RELAY);
         let out = hub.listen(u64::MAX, Filter::Everything);
         let (engine, _) = key()?;
-        let model = signed_clock_model(&engine, 1, 0)?;
+        // A real pair model's encoding, of the area the fix is in: what the fix cites is its
+        // pair model id, known once the model is held whole.
+        let (bytes, pair) = crate::models::testing::encoded(&crate::models::testing::pair_model(
+            (33.7, -84.3),
+            30_000,
+            3,
+            1,
+        ));
+        let model = tally_wire::ClockModel::sign(
+            &engine,
+            &tally_wire::ClockModelContent {
+                boot_id: 1,
+                sequence: 0,
+                issued_ms: now_ms(),
+                spec_version: tally_mlat_solver::SPEC_VERSION,
+                inputs: [0; 32],
+                model: bytes,
+            },
+        )
+        .map(|signed| signed.manifest)
+        .map_err(|error| error.to_string())?;
         let receivers: Vec<PublicKey> = throwaways(4);
-        let solution = tally_wire::Solution {
+        let considered = tally_wire::ObservationSet::new(
+            vec![0x5d, 0xab, 0xcd, 0xef, 0, 0, 0],
+            receivers
+                .iter()
+                .map(|receiver| tally_wire::Reception {
+                    receiver: *receiver,
+                    epoch: 0,
+                    counter: 1,
+                })
+                .collect(),
+        )
+        .map_err(|e| e.to_string())?;
+        let fix = tally_wire::Fix {
             address: 0x00ab_cdef,
             transmitted: tally_wire::TransmitTime::new(1_000, 0).map_err(|e| e.to_string())?,
             lat_e7: 337_000_000,
@@ -9866,29 +9843,18 @@ mod tests {
                 yz: 0.0,
                 zz: 900.0,
             },
-            clock_model: model.id(),
-            addressed: tally_wire::AddressedCitation::default(),
-            observations: tally_wire::ObservationSet::new(
-                vec![0x5d, 0xab, 0xcd, 0xef, 0, 0, 0],
-                receivers
-                    .iter()
-                    .map(|receiver| tally_wire::Reception {
-                        receiver: *receiver,
-                        epoch: 0,
-                        counter: 1,
-                    })
-                    .collect(),
-            )
-            .map_err(|e| e.to_string())?,
+            models: vec![pair],
+            sets: tally_wire::FixSets::new(considered.clone(), considered)
+                .map_err(|e| e.to_string())?,
         };
-        let positions = Positions::sign_solutions(
+        let positions = Positions::sign_fix(
             &engine,
-            &tally_wire::SolutionsContent {
+            &tally_wire::FixesContent {
                 boot_id: 1,
                 sequence: 0,
                 issued_ms: now_ms(),
                 spec_version: 1,
-                solutions: vec![solution],
+                fixes: vec![fix],
             },
         )
         .map_err(|e| e.to_string())?;
@@ -9897,16 +9863,17 @@ mod tests {
             out.try_recv().is_none(),
             "positions went out before their model"
         );
-        // While they wait, the model they cite is looked for in the table once, when they came,
-        // however often what is held is released: struck off as it goes out, never looked for
-        // again. Before, every release looked for every held record's models in every
-        // generation.
+        // While they wait, the model they cite is looked for once, when they came, however often
+        // what is held is released: struck off as it goes out, never looked for again. What a
+        // fix cites is a pair model id, looked for among the models held whole
+        // (`Network::holds_pair`), so the stream's table of manifests is never scanned for it.
+        // Before, every release looked for every held record's models in every generation.
         for _ in 0..10 {
             hub.release_awaiting(None);
         }
         assert_eq!(
             hub.clock_models.lock().map_err(|e| e.to_string())?.scans(),
-            1
+            0
         );
         assert!(hub.publish_clock_model(2, model.clone()));
         let mut heard = Vec::new();

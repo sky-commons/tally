@@ -222,7 +222,6 @@ fn signer(record: &Record) -> Option<(&'static str, Result<PublicKey, tally_wire
         Record::ReceiverInfo(info) => Some(("receiver info", info.receiver())),
         Record::ReceiverSite(site) => Some(("a receiver site", site.receiver())),
         Record::Positions(positions) => Some(("positions", positions.engine())),
-        Record::Provisional(positions) => Some(("provisional positions", positions.engine())),
         Record::ClockModel(model) => Some(("a clock model", model.engine())),
         Record::ClientClockModel(model) => Some(("a clock model", model.signer())),
         _ => None,
@@ -736,7 +735,14 @@ where
     // it is told so, unanswered. Any other role's other records are taken once it is admitted.
     let probing = |record: &Record| matches!(record, Record::Echo(_) | Record::DeliveryQuery(_));
     let mut echoed = Vec::new();
-    while let Some(probe) = first.next_if(probing).map_err(|error| error.to_string())? {
+    loop {
+        // A record of a form the peer's version retired is dropped here too (`next_record`).
+        let probe = match first.next_if(probing) {
+            Ok(Some(probe)) => probe,
+            Ok(None) => break,
+            Err(tally_wire::WireError::Retired { .. }) => continue,
+            Err(error) => return Err(error.to_string()),
+        };
         let pace = paces.take(&hub, peer, &asker.key).await;
         echoed.extend(
             hub.network()
@@ -839,7 +845,7 @@ where
     let replies = Replies::new(peer, &link);
     let refusal = Arc::new(Refusal::default());
     loop {
-        let record = match first.next() {
+        let record = match next_record(&mut first) {
             Ok(Some(record)) => record,
             Ok(None) => break,
             Err(error) => return Err(error.to_string()),
@@ -981,7 +987,7 @@ where
             // member's, as it becomes one the moment its offer is verified (`Peer::now`).
             ceiling: match peer {
                 Peer::Relay | Peer::Member => Some(Ceiling::new(
-                    hub.member_bytes_per_sec(),
+                    hub.member_ceiling_bytes_per_sec(),
                     read,
                     hub.ceiling_clock(),
                 )),
@@ -1811,12 +1817,13 @@ impl Admitted {
     /// MLAT pace; `None` for any other record, or a connection with no allowance.
     async fn in_flight(&self, record: &Record) -> Option<InFlight> {
         if let Some(bytes) = mlat_bytes(record) {
-            // A member's spend the members' rate as its batches do, by their signed bytes: the
-            // rate the checks' twins and the ingest pool are planned from
-            // (`budget::Plan::member_paced_bytes_per_sec`).
+            // A member's spend the products' pace by their signed bytes, apart from the raw rate:
+            // the pace the models' store, the checks' twins and the ingest pool are planned from
+            // for the seats (`budget::Plan::member_products_bytes_per_sec`).
             let pace = self.pace.as_ref()?;
             let allowance = self.allowance.as_ref()?;
-            pace.take(u64::try_from(bytes).unwrap_or(u64::MAX), 0).await;
+            pace.take_products(u64::try_from(bytes).unwrap_or(u64::MAX))
+                .await;
             return Some(allowance.acquire(bytes).await);
         }
         let bytes = match record {
@@ -1850,12 +1857,11 @@ impl Admitted {
 }
 
 /// The signed bytes of an MLAT record (positions of either form, a clock model or its part, a
-/// client clock model): what a member's waits for of the members' MLAT pace and is charged in the
+/// client clock model): what a member's waits for of the members' products' pace and is charged in the
 /// ingest pool (`Admitted::in_flight`); `None` for any other record.
 fn mlat_bytes(record: &Record) -> Option<usize> {
     match record {
         Record::Positions(_)
-        | Record::Provisional(_)
         | Record::ClockModel(_)
         | Record::ClockModelPart(_)
         | Record::ClientClockModel(_) => Some(record.encoded_len()),
@@ -1995,6 +2001,24 @@ impl Paces {
     }
 }
 
+/// The next record of a peer's `message` this relay takes. A record of a form wire version 4
+/// retired, from a peer that agreed an older version (`tally_wire::WireError::Retired`: its
+/// provisional positions, its precise world product, positions of formats 3 to 6), is dropped
+/// where it is read: it is no fault of a peer that speaks its version, and it is never taken in,
+/// so it is never forwarded (RFC-0171 §3.8.1 as amended 2026-10-24). The reader decides it by the
+/// session's version (`noise::Message::next`); from a peer of version 4 or later the same form is
+/// a breach, and ends the session as anything else that does not decode does.
+pub(crate) fn next_record(
+    message: &mut tally_wire::noise::Message,
+) -> Result<Option<Record>, tally_wire::WireError> {
+    loop {
+        match message.next() {
+            Err(tally_wire::WireError::Retired { .. }) => {}
+            read => return read,
+        }
+    }
+}
+
 async fn read_loop<S: AsyncRead>(
     reader: &mut Reader<S>,
     hub: &Arc<Hub>,
@@ -2039,7 +2063,7 @@ async fn read_loop<S: AsyncRead>(
         if ceiling.as_mut().is_some_and(|ceiling| !ceiling.within()) {
             return Err(over_ceiling());
         }
-        while let Some(record) = message.next().map_err(|error| error.to_string())? {
+        while let Some(record) = next_record(&mut message).map_err(|error| error.to_string())? {
             // Its place in the connection's records a second: past it, the socket is not
             // read until the pace allows it.
             let pace = paces.take(hub, peer, &asker.key).await;
@@ -2244,7 +2268,6 @@ fn ingest(
         // A piece of a group's data: taken in by the one intake each kind has (`Hub::take_piece`,
         // which a piece this relay rebuilt from parity takes too), shared as its sender's role says.
         record @ (Record::Positions(_)
-        | Record::Provisional(_)
         | Record::ClockModel(_)
         | Record::ClientClockModel(_)
         | Record::FaultProof(_)) => {
@@ -2313,7 +2336,6 @@ fn ingest(
         | Record::FirehoseCredential(_)
         | Record::EvidenceBundle(_)
         | Record::WorldPositions(_)
-        | Record::WorldPrecise(_)
         | Record::RegionalBatch(_)
         | Record::ClientRegionalBatch(_)
         | Record::Parity(_)
@@ -2694,11 +2716,16 @@ impl Told {
                     }
                     Vec::new()
                 }
-                Record::Positions(positions) | Record::Provisional(positions) => {
-                    crate::network::solved(positions)
-                        .map(|solved| solved.into_iter().map(|one| one.clock_model).collect())
-                        .unwrap_or_default()
-                }
+                // Each model it cites by its pair model id: carried as every manifest held of it.
+                Record::Positions(positions) => crate::network::solved(positions)
+                    .map(|solved| {
+                        solved
+                            .into_iter()
+                            .flat_map(|one| one.clock_models)
+                            .flat_map(|pair| network.manifests_of(&pair))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
                 _ => Vec::new(),
             };
             for id in cited {
@@ -4090,14 +4117,14 @@ mod tests {
             wants.wants(&Item {
                 source: 1,
                 record: Arc::new(Record::Positions(
-                    tally_wire::Positions::sign_solutions(
+                    tally_wire::Positions::sign_fix(
                         &Identity::generate().map_err(text)?,
-                        &tally_wire::SolutionsContent {
+                        &tally_wire::FixesContent {
                             boot_id: 1,
                             sequence: 0,
                             issued_ms: 0,
                             spec_version: 1,
-                            solutions: Vec::new(),
+                            fixes: Vec::new(),
                         },
                     )
                     .map_err(text)?
@@ -4616,14 +4643,14 @@ mod tests {
         .map_err(|_| "the engine was never served".to_owned())?;
         assert_eq!(hub.subscribers(), 1);
         // Positions it signs itself end its session: its relay shares them through the groups.
-        let solved = tally_wire::Positions::sign_solutions(
+        let solved = tally_wire::Positions::sign_fix(
             &engine,
-            &tally_wire::SolutionsContent {
+            &tally_wire::FixesContent {
                 boot_id: 1,
                 sequence: 0,
                 issued_ms: 1,
                 spec_version: 3,
-                solutions: Vec::new(),
+                fixes: Vec::new(),
             },
         )
         .map_err(text)?;
@@ -5624,16 +5651,25 @@ mod tests {
         let admitted = admit_member(&hub, 7).map_err(|_| "no member slot".to_owned())?;
         let receiver = Identity::generate().map_err(text)?.public();
         let flood = Record::Positions(
-            tally_wire::Positions::sign_solutions(
+            tally_wire::Positions::sign_fix(
                 &Identity::generate().map_err(text)?,
-                &tally_wire::SolutionsContent {
+                &tally_wire::FixesContent {
                     boot_id: 1,
                     sequence: 0,
                     issued_ms: 1,
                     spec_version: 1,
-                    solutions: (0..200)
+                    fixes: (0..200)
                         .map(|address| {
-                            Ok(tally_wire::Solution {
+                            let considered = tally_wire::ObservationSet::new(
+                                Vec::new(),
+                                vec![tally_wire::Reception {
+                                    receiver,
+                                    epoch: 0,
+                                    counter: u64::from(address),
+                                }],
+                            )
+                            .map_err(text)?;
+                            Ok(tally_wire::Fix {
                                 address,
                                 transmitted: tally_wire::TransmitTime::new(1_000, 0)
                                     .map_err(text)?,
@@ -5648,17 +5684,9 @@ mod tests {
                                     yz: 0.0,
                                     zz: 1.0,
                                 },
-                                clock_model: [1; 32],
-                                addressed: tally_wire::AddressedCitation::default(),
-                                observations: tally_wire::ObservationSet::new(
-                                    Vec::new(),
-                                    vec![tally_wire::Reception {
-                                        receiver,
-                                        epoch: 0,
-                                        counter: u64::from(address),
-                                    }],
-                                )
-                                .map_err(text)?,
+                                models: vec![[1; 32]],
+                                sets: tally_wire::FixSets::new(considered.clone(), considered)
+                                    .map_err(text)?,
                             })
                         })
                         .collect::<Result<Vec<_>, String>>()?,
@@ -5872,12 +5900,10 @@ mod tests {
         verified(&hub, &peer)?;
         let every = Streams::RAW
             .with(Streams::POSITIONS)
-            .with(Streams::PROVISIONAL)
             .with(Streams::CLOCK_MODELS)
             .with(Streams::DEDUPLICATED)
             .with(Streams::REGIONAL)
             .with(Streams::WORLD)
-            .with(Streams::WORLD_PRECISE)
             .with(Streams::FEEDER_FIGURES);
         let subscribe = Record::Subscribe {
             streams: every,
@@ -6191,7 +6217,7 @@ mod tests {
         // The pace is the one ceiling MLAT's raw holder holds a receiver to.
         assert_eq!(
             rate,
-            tally_mlat_solver::held::Rates::MEASURED.ceiling_per_s as u64
+            tally_mlat_solver::arrived::Rates::MEASURED.ceiling_per_s as u64
         );
         assert!(BATCHES * u64::from(EACH) > rate * crate::ingest::FEEDER_RECEPTIONS_BURST_SECS);
         // The ceiling is the batches' stamps' (`ingest::ReceptionCeilings`): every batch stamped at

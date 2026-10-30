@@ -1,81 +1,54 @@
 //! The positions checks' twins cost no more than the store they are charged to (RFC-0181, "The
-//! positions checks"; `consistency::Caps::twins_bytes`, `budget::Store::Twins`): filled past both
-//! rooms by the worst a sender can make of them (raw records of the smallest solutions the wire
-//! carries, so the most entries for their bytes), from the relay's own engine and from two members,
-//! each refused past its room or its share and nothing let go. Measured by an allocator that counts
-//! every byte asked of it, in one test so nothing else in the binary allocates while it measures.
+//! positions checks"; `consistency::Caps::twins_bytes`, `budget::Store::Twins`): one raw record a
+//! link (RFC-0174 §2.4, decision D5), each the largest positions record, filled past the links
+//! planned by more links than that, each sending record after record, so a link's next record
+//! takes the place of its last and a link past the plan lets the least recently active one go,
+//! counted. Measured by an allocator that counts every byte asked of it, in one test so nothing
+//! else in the binary allocates while it measures.
 
 #![allow(clippy::disallowed_methods, reason = "a test's scripted readings")]
 
 use std::sync::Arc;
 
-use tally_mlat::engine::{Capacity, Engine, Settings};
-use tally_mlat::replay::{arrivals, replay, scenario};
-use tally_relay::consistency::{
-    Caps, Class, Consistency, ConsistencyReport, SOLUTION_WIRE_LEAST, Sizing,
-};
+use tally_relay::consistency::{Caps, Consistency, ConsistencyReport, Sizing, WORKING_BYTES};
 use tally_relay::models::Models;
-use tally_wire::clocks::recorded::{judged, mono};
-use tally_wire::{Identity, Positions, Record};
+use tally_wire::{Identity, Positions};
 
 #[global_allocator]
 static GLOBAL: tally_counting::CountingAll = tally_counting::CountingAll;
 
-/// The most the twins' plan may be above what they hold at rest, filled: the table's slots and its
-/// two tables made at an eighth more than its keys, beside the records' bytes themselves.
-const SLACK_PERCENT: usize = 250;
+/// The most the twins' plan may be above what they hold at rest, filled: each record planned at
+/// the largest positions record, held at its own bytes a little below it, and the links' table
+/// made at an eighth more than its keys.
+const SLACK_PERCENT: usize = 125;
 
-/// A model a reference engine published, held in a store of decoded models as the hub holds one.
-fn a_model() -> Result<(Arc<Models>, [u8; 32]), String> {
-    let mut simulation = tally_mlat_solver::sim::run(&scenario(23, 40.0));
-    let delivered = arrivals(&mut simulation, 5)?;
-    let until = delivered.last().map_or(0, |(at, _)| *at) + 60_000;
-    let mut engine = Engine::new(
-        tally_wire::Signer::new(Identity::from_seed([4; 32]), Arc::new(|| true)),
-        0xb007,
-        Settings {
-            regions: tally_wire::Regions::default(),
-            settle: tally_wire::budget::policy::<_, 1_000>(),
-            threads: 2,
-            capacity: Capacity::default(),
-        },
-    );
-    let published = replay(&mut engine, &delivered, 100, until)?;
-    let records: Vec<Record> = published.iter().map(|(_, record)| record.clone()).collect();
-    let models = Arc::new(Models::new());
-    for (at, record) in &published {
-        if let Record::ClockModel(manifest) = record {
-            let parts: Vec<tally_wire::ClockModelPart> = records
-                .iter()
-                .filter_map(|record| match record {
-                    Record::ClockModelPart(part) if part.model().ok() == Some(manifest.id()) => {
-                        Some(part.clone())
-                    }
-                    _ => None,
-                })
-                .collect();
-            let content = manifest.content(&parts).map_err(|e| e.to_string())?;
-            if models
-                .admit(manifest, &content, |_, _| true, judged(*at))
-                .is_ok()
-            {
-                return Ok((models, manifest.id()));
-            }
-        }
-    }
-    Err("the engine published no model".to_owned())
-}
+/// The links the twins are planned for here.
+const LINKS: usize = 4;
 
-/// A raw record of `count` solutions, each under `model`, of aircraft `first..`, each cited by
-/// `receptions` receptions of receivers that are the record's every one, so their keys are in its
-/// table once. At one reception a solution is the smallest the wire carries.
-fn solutions(model: [u8; 32], first: u32, count: u32, receptions: u8) -> Result<Positions, String> {
+/// The records each link sends in turn: its next takes the place of its last.
+const RECORDS_PER_LINK: u64 = 3;
+
+/// A raw record of `count` fixes of `receptions` receptions each, of aircraft `first..`, sent on
+/// link `link` (its sequence), all cited by receivers the record's table holds once.
+fn record(link: u64, sequence: u64, count: u32, receptions: u8) -> Result<Positions, String> {
     let receivers: Vec<_> = (0..receptions)
         .map(|at| Identity::from_seed([at.wrapping_add(100); 32]).public())
         .collect();
-    let solutions = (first..first + count)
+    let fixes = (0..count)
         .map(|address| {
-            Ok(tally_wire::Solution {
+            let set = tally_wire::ObservationSet::new(
+                Vec::new(),
+                receivers
+                    .iter()
+                    .map(|receiver| tally_wire::Reception {
+                        receiver: *receiver,
+                        epoch: 0,
+                        counter: u64::from(address),
+                    })
+                    .collect(),
+            )
+            .map_err(|e| e.to_string())?;
+            Ok(tally_wire::Fix {
                 address,
                 transmitted: tally_wire::TransmitTime::new(1_000, 0).map_err(|e| e.to_string())?,
                 lat_e7: 374_000_000,
@@ -89,78 +62,71 @@ fn solutions(model: [u8; 32], first: u32, count: u32, receptions: u8) -> Result<
                     yz: 0.0,
                     zz: 1.0,
                 },
-                clock_model: model,
-                addressed: tally_wire::AddressedCitation::default(),
-                observations: tally_wire::ObservationSet::new(
-                    Vec::new(),
-                    receivers
-                        .iter()
-                        .map(|receiver| tally_wire::Reception {
-                            receiver: *receiver,
-                            epoch: 0,
-                            counter: u64::from(address),
-                        })
-                        .collect(),
-                )
-                .map_err(|e| e.to_string())?,
+                models: vec![[7; 32]],
+                sets: tally_wire::FixSets::new(set.clone(), set).map_err(|e| e.to_string())?,
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
-    Positions::sign_solutions(
+    Positions::sign_fix(
         &Identity::from_seed([9; 32]),
-        &tally_wire::SolutionsContent {
-            boot_id: 1,
-            sequence: u64::from(first),
+        &tally_wire::FixesContent {
+            boot_id: link,
+            sequence,
             issued_ms: 1,
             spec_version: 1,
-            solutions,
+            fixes,
         },
     )
     .map_err(|e| e.to_string())
 }
 
-/// What filling checks of `caps` with `made`, each source in turn (the relay's own engine, and two
-/// members sharing their room), allocates: at its peak, and held at rest once filled.
+/// The most fixes of `receptions` receptions a record carries inside the largest positions record.
+fn most_fixes(receptions: u8) -> Result<u32, String> {
+    let mut count = 1;
+    while record(0, 0, count + 1, receptions).is_ok_and(|positions| {
+        positions.as_bytes().len() <= tally_wire::positions::MAX_POSITIONS_LEN
+    }) {
+        count += 1;
+    }
+    Ok(count)
+}
+
+/// What `links` links each sending [`RECORDS_PER_LINK`] records of `count` fixes of `receptions`
+/// receptions in turn allocate in checks of `caps`: at their peak, and held at rest once sent.
 fn filled(
-    models: &Arc<Models>,
     caps: Caps,
-    made: &[Positions],
-) -> (usize, usize, ConsistencyReport) {
+    links: usize,
+    count: u32,
+    receptions: u8,
+) -> Result<(usize, usize, ConsistencyReport), String> {
+    let made = (0..RECORDS_PER_LINK)
+        .flat_map(|sequence| (0..links as u64).map(move |link| (link, sequence)))
+        .map(|(link, sequence)| Ok((link, record(link, sequence, count, receptions)?)))
+        .collect::<Result<Vec<_>, String>>()?;
+    let models = Arc::new(Models::new());
     let mark = tally_counting::CountingAll::peak_base();
     let base = tally_counting::CountingAll::live();
     let rest;
     let report;
     {
-        let checks = Consistency::with_caps(Arc::clone(models), caps);
-        for (at, positions) in made.iter().enumerate() {
-            let from = match at % 3 {
-                0 => (0, Class::Own),
-                1 => (1, Class::Members),
-                _ => (2, Class::Members),
-            };
-            checks.raw(positions, from, mono(0), |_| true);
+        let checks = Consistency::with_caps(models, caps);
+        for (link, positions) in &made {
+            checks.raw(positions, *link);
         }
         rest = usize::try_from(tally_counting::CountingAll::since(base)).unwrap_or(usize::MAX);
         report = checks.report();
     }
     let peak = usize::try_from(tally_counting::CountingAll::peak_since(mark)).unwrap_or(0);
-    (peak, rest, report)
+    Ok((peak, rest, report))
 }
 
-/// Holds one fill to the plan of `caps`: every room reached (the members' by their shares too),
-/// the peak within the plan, at rest within its tables, and the tables no looser than the slack.
+/// Holds one fill to the plan of `caps`: the links past the plan let go, counted, the peak within
+/// the plan, at rest within its tables, and the tables no looser than the slack.
 fn within(caps: Caps, (peak, rest, report): (usize, usize, ConsistencyReport), what: &str) {
     let planned = caps.twins_bytes() + caps.sites_bytes();
-    let tables = planned - tally_relay::consistency::WORKING_BYTES;
+    let tables = planned - WORKING_BYTES;
     println!("{what}: {peak} at the peak, {rest} at rest, {planned} planned: {report:?} {caps:?}");
-    assert!(
-        report.full > 0 && report.over_share > 0,
-        "{what}: {report:?}"
-    );
-    assert!(
-        report.held > 0 && report.unwanted == 0,
-        "{what}: {report:?}"
-    );
+    assert!(report.evicted > 0 && report.held > 0, "{what}: {report:?}");
     assert!(
         peak <= planned,
         "{what}: {peak} at the peak, {planned} planned"
@@ -175,61 +141,23 @@ fn within(caps: Caps, (peak, rest, report): (usize, usize, ConsistencyReport), w
     );
 }
 
-/// `per_record` solutions of `receptions` each a record, each source a third more than the larger
-/// room, so the relay's own fills its room and each member passes its share.
-fn made(
-    model: [u8; 32],
-    caps: Caps,
-    per_record: u32,
-    receptions: u8,
-) -> Result<Vec<Positions>, String> {
-    let record = solutions(model, 0, per_record, receptions)?
-        .as_bytes()
-        .len();
-    let records = 3 * caps.own.bytes.max(caps.members.bytes) * 4 / 3 / record;
-    (0..records as u32)
-        .map(|at| solutions(model, at * per_record, per_record, receptions))
-        .collect()
-}
-
 #[test]
 fn the_twins_allocate_no_more_than_they_are_charged() -> Result<(), String> {
-    let (models, model) = a_model()?;
-    // The wire's least is the least a solution takes: one of these is no larger.
-    let one = solutions(model, 0, 1, 1)?.as_bytes().len();
-    let two = solutions(model, 0, 2, 1)?.as_bytes().len();
-    assert_eq!(
-        two - one,
-        SOLUTION_WIRE_LEAST,
-        "a solution's least on the wire"
-    );
     let caps = Caps::of(Sizing {
         receivers: 0,
-        members: 1,
-        members_bytes_per_sec: 20_000,
-        own_bytes_per_sec: 20_000,
+        links: LINKS,
     });
-    // The smallest solutions: the most entries for their bytes, the table at its worst.
-    let smallest = made(model, caps, 200, 1)?;
-    within(caps, filled(&models, caps, &smallest), "the smallest");
-    drop(smallest);
-    // Solutions cited by many receptions, in rooms of as many entries as their bytes bring: the
-    // records' bytes at their worst, the table small, so a plan short of the bytes is seen.
-    let heavy = made(model, caps, 20, 40)?;
-    let per_twin = heavy[0].as_bytes().len() / 20;
-    let rooms = |room: tally_relay::consistency::RoomCaps| tally_relay::consistency::RoomCaps {
-        bytes: room.bytes,
-        twins: room.bytes / per_twin,
-    };
-    let bytes_bound = Caps {
-        own: rooms(caps.own),
-        members: rooms(caps.members),
-        ..caps
-    };
-    within(
-        bytes_bound,
-        filled(&models, bytes_bound, &heavy),
-        "the heaviest",
-    );
+    // Twice the links planned, so the table is full and lets go of the least recently active.
+    let links = 2 * caps.links;
+    // The largest positions records, of fixes cited by one reception (the most fixes) and by
+    // many (the most receptions): a record held is its bytes, whatever it carries.
+    for receptions in [1, 40] {
+        let count = most_fixes(receptions)?;
+        within(
+            caps,
+            filled(caps, links, count, receptions)?,
+            &format!("{count} fixes of {receptions} receptions"),
+        );
+    }
     Ok(())
 }

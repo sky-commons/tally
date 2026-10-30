@@ -31,13 +31,12 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// A session that stayed up this long worked: the wait after it starts from the shortest again.
 const HEALTHY_SESSION: Duration = Duration::from_secs(60);
 
-/// The streams a consumer merging MLAT asks for: final and provisional positions (a provisional
-/// is served only while it is later than every final one, `Track::served`), clock models (a
-/// client is sent their summaries), and the relays' signed feeder figures, which a client serving
-/// feeders reads beside them (the merge itself ignores them).
+/// The streams a consumer merging MLAT asks for: positions (MLAT fixes, each published as soon as
+/// it can be solved and again as more receptions arrive), clock models (a client is sent their
+/// summaries), and the relays' signed feeder figures, which a client serving feeders reads beside
+/// them (the merge itself ignores them).
 pub fn streams() -> Streams {
     Streams::POSITIONS
-        .with(Streams::PROVISIONAL)
         .with(Streams::CLOCK_MODELS)
         .with(Streams::FEEDER_FIGURES)
 }
@@ -49,11 +48,9 @@ pub fn wanted(record: Record) -> Option<ClientRecord> {
     matches!(
         record,
         ClientRecord::Positions(_)
-            | ClientRecord::Provisional(_)
             | ClientRecord::ClockModel(_)
             | ClientRecord::FaultProof(_)
             | ClientRecord::WorldPositions(_)
-            | ClientRecord::WorldPrecise(_)
             // A relay's signed feeder figures, for a consumer that asks for them (the merge
             // ignores them).
             | ClientRecord::FeederFigures(_)

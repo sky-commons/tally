@@ -14,7 +14,7 @@ extract_cargo_lints(
 
 # The solver is numerical code compiled optimised in every build, its tests too, as Cargo does
 # (`[profile.dev.package.tally-mlat-solver]` in //:Cargo.toml; BLAKE2s, on its hot path, is
-# optimised by an annotation in //:tally.MODULE.bazel): unoptimised, the calibration tests'
+# optimised by an annotation in //:tally.MODULE.bazel): unoptimised, the engine tests'
 # thousands of solves take six minutes of CPU where optimised they take thirteen seconds of wall
 # time, and every engine test that solves pays the same. Debug assertions and overflow checks stay
 # as the build has them. The results are the same to the bit at either level (no fused
@@ -37,10 +37,11 @@ rust_library(
     ],
 )
 
+# Every engine test runs the engine as the crate docs specify it (every area refitted every
+# `REFIT_EVERY` over its trailing window, what is due solved every second under its cited area's
+# model). The sweep is an ignored test.
 rust_test(
     name = "mlat-solver_test",
-    # Optimised, the whole suite takes about thirteen seconds of wall time on four cores and under
-    # forty seconds of CPU; the benchmarks are the ignored tests.
     size = "medium",
     crate = ":mlat-solver",
     edition = "2024",
@@ -48,13 +49,14 @@ rust_test(
     rustc_flags = SOLVER_RUSTC_FLAGS,
 )
 
-# The holder's byte accounting against an allocator that counts every byte (RFC-0181 §5): a binary
-# of its own, since a counting allocator is global and nothing else may allocate while it measures.
+# The pool's byte accounting (`arrived::Arrived`) against an allocator that counts every byte
+# (RFC-0181 §5): a binary of its own, since a counting allocator is global and nothing else may
+# allocate while it measures.
 rust_test(
-    name = "held_bytes",
+    name = "arrived_bytes",
     size = "small",
-    srcs = ["tests/held_bytes.rs"],
-    crate_root = "tests/held_bytes.rs",
+    srcs = ["tests/arrived_bytes.rs"],
+    crate_root = "tests/arrived_bytes.rs",
     edition = "2024",
     lint_config = ":cargo_lints",
     rustc_flags = SOLVER_RUSTC_FLAGS,
@@ -68,7 +70,7 @@ rust_test(
 rustfmt_test(
     name = "rustfmt",
     targets = [
-        ":held_bytes",
+        ":arrived_bytes",
         ":mlat-solver",
         ":mlat-solver_test",
     ],

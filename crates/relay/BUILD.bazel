@@ -299,8 +299,9 @@ rust_test(
 )
 
 # The positions checks' twins (RFC-0181, "The positions checks") allocate no more than their
-# store is charged, filled past their rooms by the smallest solutions the wire carries, measured by
-# a counting allocator: its own binary, so nothing else allocates while it measures.
+# store is charged: one raw record a link, each the largest positions record, filled past the
+# links planned, measured by a counting allocator: its own binary, so nothing else allocates while
+# it measures.
 rust_test(
     name = "twins_bytes",
     size = "small",
@@ -310,15 +311,14 @@ rust_test(
     deps = [
         ":relay",
         "//crates/counting",
-        "//crates/mlat",
-        "//crates/mlat-solver",
         "//crates/wire",
     ],
 )
 
 # The same invariants for the hosted MLAT (RFC-0181 §3, §5, §9): the same stamped trace makes the
-# same clock models, positions and provisional positions on any number of threads, and at
-# capacity the same receivers are refused whole whatever the order.
+# same clock models and positions on any number of threads, with delays or none, as the reference
+# engine stepped a second at a time; at capacity the same receivers are refused whole whatever the
+# order; and an overloaded host's cut makes the same bytes on the relay offered it.
 rust_test(
     name = "staged_mlat",
     size = "medium",
@@ -335,18 +335,19 @@ rust_test(
 )
 
 # Each test of the binary is its own target, so each runs alone and declares what it alone needs,
-# measured (2026-10-08, release build, `/usr/bin/time -v`, each test alone): the three
-# single-network tests are a relay or two over a 45 s scenario (60 s: models ripen
-# 15 s after their window step), the relays' clock walking it a step at a time (`TestClock`): at most 25 MiB resident and under a second of CPU each, up to 16 s (the
-# first waits for a window to come due). The three-relay test runs three relays through 2.5 min of
-# scenario: 76 MiB resident, 6 s of CPU in 150 s. The four-relay test waits out a dead relay's
+# measured (2026-10-08, release build, `/usr/bin/time -v`, each test alone, on the window steps
+# the one step a second replaced; not measured again since): the three single-network tests are a
+# relay or two over a 60 s scenario, its first 30 s past, the relays' clock walking it a step a
+# second (`TestClock`): at most 25 MiB resident and under a second of CPU each, up to 16 s. The
+# three-relay test runs three relays through 2.5 min of scenario: 76 MiB resident, 6 s of CPU in
+# 150 s. The four-relay test waits out a dead relay's
 # offers (`directory::OFFER_LIFETIME_MS`, 3 min), its relays idle. Each declared at twice its
 # resident peak or more and a core or two, to the local scheduler and the remote one alike
 # (//build:resources.bzl); the binary's two threads of tokio and the hosts' solver threads
 # run in short bursts.
 _MLAT_HOST_TESTS = {
     "mlat_host_feeders": (
-        "feeders_of_a_relay_hosting_mlat_give_its_clients_verifiable_positions_and_provisionals",
+        "feeders_of_a_relay_hosting_mlat_give_its_clients_verifiable_positions",
         "medium",
         test_size(
             cpu = 2,
@@ -354,7 +355,7 @@ _MLAT_HOST_TESTS = {
         ),
     ),
     "mlat_host_seed_53": (
-        "every_final_a_relay_publishes_passes_the_verifier_seed_53",
+        "every_fix_a_relay_publishes_passes_the_verifier_seed_53",
         "small",
         test_size(
             cpu = 2,
@@ -370,7 +371,7 @@ _MLAT_HOST_TESTS = {
         ),
     ),
     "mlat_host_three_relays": (
-        "three_relays_share_solve_and_serve_verifiable_positions_and_both_world_products",
+        "three_relays_share_solve_and_serve_verifiable_positions_and_the_world_product",
         "large",
         test_size(
             cpu = 2,
@@ -389,8 +390,8 @@ _MLAT_HOST_TESTS = {
 
 # One program: the simulator's receivers feed a relay hosting MLAT (and, apart, a relay that
 # passes their raw one hop to it), and a client verifies what it publishes; then three relays as
-# RFC-0174 runs them, with sharing, selection and both world products (about 3 minutes: the
-# precise world seals a second 108.5 s after it). The relays' clock walks a scenario no faster than
+# RFC-0174 runs them, with sharing, selection and the world product (about 2 minutes: the world
+# seals a second `products::WORLD_SETTLE_MS` after it). The relays' clock walks a scenario no faster than
 # they keep up and no faster than the wall clock, whose pace a debug build cannot keep, so the
 # binary is built optimised (`mlat_host_*`, below) and runs only so.
 rust_test(

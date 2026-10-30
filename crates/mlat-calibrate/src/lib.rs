@@ -48,13 +48,15 @@
 //! - **Feeding.** Each sensor seals a batch once a second at a phase of its own and its batch
 //!   reaches the engine 40 to 250 ms later, as `tally_mlat::replay` does for the simulator; a
 //!   reception's arrival at the feeder is the row's `timeAtServer`. The engine is
-//!   `tally_mlat::engine::Engine` with the relay's settings (settle `MLAT_SETTLE`, 11.5 s), stepped and asked for
-//!   provisional work every 100 ms of a virtual clock: every model and solution it publishes went
-//!   through `publish::solve_published` and the verifier, as on a relay.
+//!   `tally_mlat::engine::Engine` with the relay's settings, stepped every `STEP_MS` of a virtual
+//!   clock as a relay's hosted MLAT steps it: each step refits the trailing-window models
+//!   (`tally_wire::budget::TRAILING_WINDOW`) its due transmissions need and solves them, and every
+//!   model and fix it publishes went through `publish::solve_published` and the verifier, as on a
+//!   relay. The run goes on `FIX_ARRIVED` past the last row, so every fix of it is published.
 //!
 //! ## What it does and does not test
 //!
-//! It tests the clock model, the solver, the covariance and the provisional carry on real
+//! It tests the clock model, the solver, the covariance and the carry past a model's edge on real
 //! receivers: real sites (with their survey errors), real timing noise, real oscillators drifting
 //! and stepping, real multipath, real geometry and real reception patterns, against a truth that
 //! is the aircraft's own GNSS. It does not test decoding real bytes or Mode S replies' own
@@ -81,17 +83,17 @@
 //!
 //! # What is measured (`score`)
 //!
-//! Every final and provisional solution of a withheld transmission is scored against its truth in
+//! Every fix of a withheld transmission is scored against its truth in
 //! its own east-north-up frame: against the truth model (above); and against the raw truth, inside
 //! the 95% ellipse of the east-north block (horizontal, two degrees of freedom), across the track
 //! alone, and inside the 95% ellipsoid (3D, with the GNSS height), each under the mathematics' own
 //! covariance (floor and inflation stripped, what the simulator's calibration measures) and under
 //! the published one; the horizontal error's median and 95th percentile and the along-track
 //! error's median; overall, for the aircraft LocaRDS verified, by altitude band, by receptions
-//! used, by tile level and by how many of the receivers used are GNSS-disciplined. The solved
-//! fraction is over (aircraft, bin) pairs, the bin the engine's own (the lower median of the
-//! receptions' wall clocks), with a transmission heard by three or more receivers after the first
-//! 65 s. `--samples` writes every scored solution for analysis; `--unverified-precision` has the
+//! used, by how many areas' models it cites and by how many of the receivers used are GNSS-disciplined. The solved
+//! fraction is over (aircraft, 5 s slot) pairs, a transmission's slot by the lower median of its
+//! receptions' wall clocks, with a transmission heard by three or more receivers after the first
+//! trailing window (`TRAILING_WINDOW`, 20 s). `--samples` writes every scored fix for analysis; `--unverified-precision` has the
 //! sensors LocaRDS did not verify declare their sites to that precision.
 
 // It reaches keys (`tally_wire::Identity`): no `unsafe` code at all, forbidden, so no module

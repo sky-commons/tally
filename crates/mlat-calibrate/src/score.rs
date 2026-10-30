@@ -1,10 +1,10 @@
-//! Scoring a published solution against the withheld aircraft's own report (crate docs, § What
+//! Scoring a published fix against the withheld aircraft's own report (crate docs, § What
 //! is measured).
 
 use tally_mlat_solver::geo::{self, Geodetic};
 use tally_mlat_solver::linalg::{self, Vec3};
 use tally_mlat_solver::solve::{ERROR_FLOOR_M, ERROR_INFLATION};
-use tally_wire::Solution;
+use tally_wire::Fix;
 
 /// The 95% points of chi-square with one, two and three degrees of freedom.
 pub const CHI2_1_95: f64 = 3.841_459;
@@ -308,7 +308,7 @@ pub fn distance<const N: usize>(error: [f64; N], covariance: [[f64; N]; N]) -> O
 /// A published east-north-up covariance, and the same with the floor and inflation taken off
 /// (`solve::ERROR_INFLATION`, `ERROR_FLOOR_M`): the floor is the same on every axis of any frame,
 /// so it comes off the ENU diagonal as it went on the ECEF one.
-fn covariances(solution: &Solution) -> ([[f64; 3]; 3], [[f64; 3]; 3]) {
+fn covariances(solution: &Fix) -> ([[f64; 3]; 3], [[f64; 3]; 3]) {
     let c = solution.covariance;
     let published = [
         [f64::from(c.xx), f64::from(c.xy), f64::from(c.xz)],
@@ -339,7 +339,7 @@ fn ecef(lat_deg: f64, lon_deg: f64, height_m: f64) -> Vec3 {
 
 /// Scores `solution` against `truth`. The error is taken in the solution's own east-north-up
 /// frame, the frame its covariance is published in.
-pub fn score(solution: &Solution, truth: &Truth) -> Scored {
+pub fn score(solution: &Fix, truth: &Truth) -> Scored {
     let lat = f64::from(solution.lat_e7) * 1e-7;
     let lon = f64::from(solution.lon_e7) * 1e-7;
     let solved_height = solution.alt_hae_mm.map(|mm| f64::from(mm) / 1000.0);

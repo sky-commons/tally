@@ -397,11 +397,10 @@ mod tests {
             1,
             tally_mlat::engine::Settings {
                 regions: tally_wire::Regions::default(),
-                settle: crate::mlat_host::SETTLE,
                 threads: 1,
                 capacity: tally_mlat::engine::Capacity::default(),
             },
-            crate::mlat_host::WindowClock::KEEPING_UP,
+            crate::mlat_host::StepClock::KEEPING_UP,
         )?);
         let hub = Arc::new(
             Hub::new(8, crate::sharing::Deadlines::RELAY).memory(crate::hub::DEFAULT_MEMORY, true),
@@ -431,7 +430,7 @@ mod tests {
             "refused",
             "overflowed",
             "replayed",
-            "orphans_dropped",
+            "descriptions_dropped",
             "steps_discarded",
         ] {
             assert!(body.contains(counter), "{counter} not served: {body}");

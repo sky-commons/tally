@@ -1,11 +1,11 @@
-//! The receiver side of an engine (RFC-0171 §3.8.1, RFC-0181 §5): which receivers take part, the
-//! sequences each has used, their open raw (`tally_mlat_solver::held::Open`) and what each batch
-//! says to provisional solving (`provisional::notes_of`). Everything here belongs to one receiver,
-//! so it splits by receiver: an engine that holds its own raw keeps one [`Intake`] (`Engine::new`),
-//! and a relay keeps one per raw shard, each touched by the ingest worker that owns the shard's
-//! receivers, while the engine it feeds (`Engine::hosted`) holds only the sealed bins. One
-//! receiver's word decides its part whichever intake holds it, so the same raw split any way
-//! seals to the same bins (`held::Bin::seal_from`) and solves to the same bytes.
+//! The receiver side of an engine (RFC-0171 §3.8.1, RFC-0181 §5): which receivers take part and
+//! the sequences each has used. Everything here belongs to one receiver, so it splits by receiver:
+//! an engine that hears its own batches keeps one [`Intake`] (`Engine::new`), and a relay keeps
+//! one per raw shard, each touched by the ingest worker that owns the shard's receivers, and hands
+//! the engine it feeds (`Engine::hosted`) what they took and who takes part. One receiver's word
+//! decides its part whichever intake holds it, so the same raw split any way solves to the same
+//! bytes. What a batch holds that MLAT uses is read where the batch is held ([`receptions_of`]),
+//! and the engine's arrived pool (`tally_mlat_solver::Arrived`) holds it.
 //!
 //! - A receiver takes part on its own signed word only: its newest site-bearing record
 //!   ([`SiteRecord`]: its `ReceiverSite`, or an old feeder's format 1 `ReceiverInfo`) verifies,
@@ -14,17 +14,18 @@
 //!   format 2 `ReceiverInfo` carries no site and places nobody: an engine never takes a site
 //!   from anything a client can read. The record also gives the receiver's site id (what a model
 //!   names it by) and reception key (what its receptions are tagged under for clients), carried
-//!   with its site ([`Sited`]).
-//! - A batch is used once: from a receiver that takes part, with a (boot, sequence) not already used
-//!   and not too far behind that boot's newest (§3.1).
+//!   with its site ([`Sited`]). An area's members are these signed sites alone, never which
+//!   receivers' raw arrived.
+//! - A batch is used once: from a receiver that takes part (or is not described yet, below), with
+//!   a (boot, sequence) not already used and not too far behind that boot's newest (§3.1,
+//!   [`Intake::take`]).
 //! - **Room is shared, refusal is whole, and neither depends on order** (RFC-0181 §9). The
 //!   receivers seated across every intake of one engine are bounded by one count ([`Seats`],
 //!   `Capacity::receivers`), and who is seated is a function of who is described: the best ranked
 //!   (taking part first, then the key-hash rank, [`draw`]), whatever order they came in
 //!   and whichever intake took them. A receiver outranked is refused whole (none of its raw held)
-//!   and counted, and one that loses its seat to a better ranked one is let go whole. A receiver's
-//!   raw of a bin beyond its share is refused whole (`held::Limits`); the holder's bytes are
-//!   checked on each whole bin as it is sealed (`held::Bin::seal_within`), never on arrival.
+//!   and counted, and one that loses its seat to a better ranked one is let go whole. What a
+//!   receiver's raw may hold is the arrived pool's own refusal, whole and counted.
 //! - **The rank is the receiver's own word, the same on every relay** (RFC-0181 §9, §10). Taking
 //!   part is the bar. Among the receivers over it the seat goes by a hash of the receiver's key
 //!   under a fixed fleet-wide seed ([`draw`]), so two relays holding one area seat the same
@@ -36,7 +37,7 @@
 //!   key could not be ground to outrank honest ones; a key is not free here any more than a seat
 //!   is (every feeder is admitted at its connection, per credit and network group, before it can
 //!   describe at all, RFC-0181 §5), so grinding costs an admitted connection a rank, and a relay
-//!   that wants the rank unpredictable gives all its peers one seed ([`Seats::keyed`]). Neither
+//!   that wants the rank unpredictable gives all its peers one seed ([`Seats::keyed`]).
 //!   The seats of one declared place (a cell, [`SEAT_CELL_RESOLUTION`]) are shared out: at most
 //!   [`SEATS_PER_CELL`] of a cell's receivers hold one, the best ranked of them, so a grinder
 //!   holding many connections from one place takes no more than a cell's share (the network group
@@ -47,91 +48,34 @@
 //!   earned only by receptions the seated engine solves, so ranking by it would keep a receiver
 //!   once seated seated forever and one never seated out, and it is a bar the merge applies to
 //!   solutions, not an order of who may be heard.
-//! - **A batch before its receiver's description** waits for it ([`Intake::hold_orphan`]): a batch
-//!   can reach a holder before its receiver's description (a repair, a rebuild from parity, a link
-//!   that died between them, or a description that takes effect at the next step), and is forwarded
-//!   once, so one turned away is lost to MLAT. It is held, within `ORPHANS_PER_RECEIVER` and the
-//!   holder's bytes a receiver (its oldest going first) and its bound on receivers, for
-//!   `ORPHAN_MS` of its holder's steps ([`Intake::expire_orphans`]), and taken when the
-//!   description comes ([`Intake::take_orphans`]), by whichever holder: an engine holding its own
-//!   raw and a relay's raw shards alike ([`Orphans`], one for all of a relay's shards). Who is
-//!   held for room is decided by rank, never by arrival: past the bound on receivers the worst
-//!   drawn ([`Seats::draw_of`]) is let go for a better drawn one, so the receivers held are the
-//!   best drawn of those that came, in any order; and the bounds are the holder's whole room for
-//!   them, so nothing else (a store shared with other holders) ever refuses one by when it came.
-//! - **Late by the stamp** (`held::Closing`): an intake whose raw arrives on threads of its own
-//!   while its holder steps on another ([`Intake::closing`], a relay's raw shards) refuses as late
-//!   the raw stamped at or after the step that takes its bin, so a batch that raced ahead of that
-//!   step is late exactly as one that came after it.
+//! - **A batch before its receiver's description** is held like any other, so what the pool holds
+//!   of a receiver never depends on when its description came. A model cites a member's raw as
+//!   every batch at or below its frontier (`tally_mlat_solver::Frontier`), and the pool cites a
+//!   member only once its batches are whole over the trailing window (`Arrived::inputs`): a
+//!   receiver whose first batches were dropped for coming before its description would be cited
+//!   by no model for a whole window, and a holder that dropped them and one that did not would
+//!   rebuild different raw under one frontier. Room for receivers not described yet is one count
+//!   across the engine's intakes (`Capacity::receivers`, [`Seats`]); one described outside the
+//!   engine's regions, or never described, is let go with what it sent ([`Intake::expire`]).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
-use tally_mlat_solver::held::{Closing, Fragment, Limits, Open};
 use tally_mlat_solver::obs::MAX_SITE_PRECISION_M;
-use tally_mlat_solver::{Site, Timebase};
+use tally_mlat_solver::{BatchId, Reception, Site, Timebase};
 use tally_wire::{
     Clock, Decoded, FingerprintKey, Location, PublicKey, ReceiverInfo, ReceiverSite, ReceptionKey,
     Record, Region, Regions, SiteId, WireError,
 };
 
-use crate::engine::{Dropped, Ingested};
-use crate::provisional::{Note, notes_of};
-use tally_wire::clocks::{Moment, Mono};
-use tally_wire::footprint::{Deque, Tree};
+use crate::engine::Ingested;
 
 /// How far behind a boot's newest sequence a batch may still arrive (two relays, or one relay's
 /// reordering) and be used; anything older is a replay or too late to matter.
 const REORDER: u64 = 64;
 /// Boots remembered per receiver, most recent first. A receiver that restarts more often than
-/// this within one window only weakens its own replay protection.
+/// this often while its batches are still held only weakens its own replay protection.
 const BOOTS_PER_RECEIVER: usize = 8;
-/// Batches held for one receiver not yet described, at most (module docs): the oldest goes first.
-pub const ORPHANS_PER_RECEIVER: usize = 64;
-/// Receivers whose batches an intake holds waiting for a description, at most, unless its holder
-/// says otherwise ([`Orphans::new`]): past it the worst drawn is let go, counted.
-pub const ORPHAN_RECEIVERS: usize = 4_096;
-/// How long, by its holder's steps, a batch waits for its receiver's description: as long as what
-/// it says to provisional solving can still be weighed in time and its raw is not yet late (a bin's
-/// settling and a step). A description later than that is not coming by the same way.
-pub const ORPHAN_MS: u64 = 3_000;
-
-/// A batch waiting for its receiver's description, stamped when it came.
-struct Orphan {
-    batch: Arc<Decoded>,
-}
-
-/// A receiver's batches waiting, oldest first.
-type Waiting = Deque<Orphan>;
-
-/// A receiver's place in what is held, as planned ([`Tree::bytes_per_entry`]).
-const ORPHAN_PLACE_BYTES: usize = Tree::<PublicKey, Waiting>::bytes_per_entry();
-
-/// What a receiver holding `batches` waiting for its description is held to at most within its
-/// bytes ([`Orphans::new`]): their deque, which keeps a quarter again what it holds, and its place.
-/// Not the decodes they keep alive, which a relay charges once for their life, however many hold
-/// them (`tally_relay::budget::Store::Decoded`); the room bounds how many it holds, and
-/// `ORPHAN_MS` how long.
-pub const fn orphans_planned(batches: usize) -> usize {
-    Waiting::bytes_at_most(batches) + ORPHAN_PLACE_BYTES
-}
-
-/// What one more batch waiting adds to [`orphans_planned`], at most: its slot, a quarter again.
-pub const ORPHAN_PLANNED_BYTES: usize = tally_wire::footprint::vec::<Orphan>(1) * 5 / 4;
-
-/// What holding batches for their descriptions allocates whatever it holds, as planned: the root
-/// of its tree.
-pub const ORPHANS_ROOT_BYTES: usize = Tree::<PublicKey, Waiting>::bytes_planned(0);
-
-/// What holding, expiring or taking batches waiting for a description let go.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Orphaned {
-    /// Dropped for room: beyond `ORPHANS_PER_RECEIVER` or the intake's bytes a receiver (its
-    /// oldest), or beyond the intake's receivers (the worst drawn).
-    pub dropped: u64,
-    /// Expired: waited `ORPHAN_MS` and no description came.
-    pub expired: u64,
-}
 
 /// A receiver's site-bearing record: the one thing an engine places a receiver by (module docs).
 /// Relay-only, both kinds (`Record::carries_site`): a new feeder's `ReceiverSite`, or an old
@@ -273,173 +217,6 @@ pub fn signed_order(record: &SiteRecord) -> (u64, &[u8]) {
         record.content().map_or(0, |content| content.issued_ms),
         record.as_bytes(),
     )
-}
-
-/// Batches waiting for their receivers' descriptions (module docs): at most `receivers` receivers,
-/// at most `ORPHANS_PER_RECEIVER` and `bytes_per_receiver` of each. Who is held is decided by rank,
-/// never by arrival: the receivers held are the best drawn ([`Seats::draw_of`]) of those that came,
-/// each its newest that fit, in any order. So its bounds are its holder's whole room for them: no
-/// store shared with anything else ever refuses one by when it came. An engine holding its own raw
-/// keeps one in its [`Intake`]; a holder that splits its receivers over many intakes (a relay's raw
-/// shards) keeps one for all of them, so the rank is decided across all.
-pub struct Orphans {
-    seats: Arc<Seats>,
-    receivers: usize,
-    bytes_per_receiver: usize,
-    held: Tree<PublicKey, Waiting>,
-    /// What the receivers' deques allocate together.
-    lists: usize,
-}
-
-impl Orphans {
-    /// At most `receivers` receivers, each held to `bytes_per_receiver` ([`orphans_planned`]).
-    pub fn new(seats: Arc<Seats>, receivers: usize, bytes_per_receiver: usize) -> Self {
-        Self {
-            seats,
-            receivers,
-            bytes_per_receiver,
-            held: Tree::new(),
-            lists: 0,
-        }
-    }
-
-    /// Its room is now `bytes` in all: its tree's root, and the rest split evenly over its
-    /// receivers. A holder whose room is resized (a relay's `Orphans` store) says so before each
-    /// hold. What it holds past a smaller room is let go as the next batches of each receiver come.
-    pub fn set_room(&mut self, bytes: usize) {
-        self.bytes_per_receiver = bytes.saturating_sub(ORPHANS_ROOT_BYTES) / self.receivers.max(1);
-    }
-
-    /// What it allocates now: its tree and its receivers' deques. Not the decodes the batches keep
-    /// alive. Within its room ([`Orphans::set_room`]) whatever it holds, so a holder charging it
-    /// this, grown before each hold ([`Orphans::hold`]), charges what it allocates.
-    pub fn bytes(&self) -> usize {
-        self.held.bytes() + self.lists
-    }
-
-    /// Holds `batch`, by its own stamp, until its receiver's description comes or `ORPHAN_MS` of
-    /// steps pass on the monotonic clock; `grow` is asked, once room for it is made, whether its holder can charge what
-    /// it then allocates in all ([`Orphans::bytes`] once held, what was let go for it gone): false
-    /// drops it, counted. The receiver's oldest go first beyond
-    /// `ORPHANS_PER_RECEIVER` or its bytes; beyond the receivers the worst drawn is let go whole
-    /// for a better drawn one, and a worse drawn one is not held: each batch counted. So the
-    /// receivers held are the best drawn of those that came, whatever their order, and nothing is
-    /// charged past its room.
-    pub fn hold(&mut self, batch: &Arc<Decoded>, grow: impl FnOnce(usize) -> bool) -> Orphaned {
-        let mut orphaned = Orphaned::default();
-        let key = batch.receiver();
-        let most = self.bytes_per_receiver;
-        if Waiting::new().growth() + ORPHAN_PLACE_BYTES > most || self.receivers == 0 {
-            orphaned.dropped += 1;
-            return orphaned;
-        }
-        if !self.held.contains_key(&key) && self.held.len() >= self.receivers {
-            let worst = self
-                .held
-                .keys()
-                .map(|held| (self.seats.draw_of(held), *held))
-                .max();
-            match worst {
-                Some(worst) if (self.seats.draw_of(&key), key) < worst => {
-                    if let Some(gone) = self.held.remove(&worst.1) {
-                        self.lists -= gone.bytes();
-                        orphaned.dropped += gone.len() as u64;
-                    }
-                }
-                _ => {
-                    orphaned.dropped += 1;
-                    return orphaned;
-                }
-            }
-        }
-        let mut waiting = self.held.remove(&key).unwrap_or_default();
-        self.lists -= waiting.bytes();
-        // Its oldest go first, for its newest: within its count, and within its bytes with the
-        // newest's slot.
-        while waiting.len() >= ORPHANS_PER_RECEIVER
-            || waiting.bytes() + waiting.growth() + ORPHAN_PLACE_BYTES > most
-        {
-            if waiting.pop_front().is_none() {
-                break;
-            }
-            orphaned.dropped += 1;
-        }
-        // What it allocates in all once it holds it, charged by the holder first: what is held
-        // now (after what was let go for it), its slot, and its receiver's place.
-        let total = Tree::<PublicKey, Waiting>::bytes_at(self.held.len() + 1)
-            + self.lists
-            + waiting.bytes()
-            + waiting.growth();
-        if grow(total) {
-            waiting.push_back(Orphan {
-                batch: Arc::clone(batch),
-            });
-        } else {
-            orphaned.dropped += 1;
-        }
-        if !waiting.is_empty() {
-            self.lists += waiting.bytes();
-            self.held.insert(key, waiting);
-        }
-        orphaned
-    }
-
-    /// Lets go every batch that has waited `ORPHAN_MS` by the step at `now` on the monotonic
-    /// clock its stamps are of.
-    pub fn expire(&mut self, now: Mono) -> Orphaned {
-        let mut orphaned = Orphaned::default();
-        let mut lists = 0;
-        self.held.retain(|_, waiting| {
-            let before = waiting.len();
-            waiting.retain(|orphan| {
-                orphan
-                    .batch
-                    .mono()
-                    .later(tally_wire::budget::policy::<_, ORPHAN_MS>())
-                    > now
-            });
-            orphaned.expired += (before - waiting.len()) as u64;
-            if waiting.is_empty() {
-                false
-            } else {
-                lists += waiting.bytes();
-                true
-            }
-        });
-        self.lists = lists;
-        orphaned
-    }
-
-    /// The batches that waited for `receiver`'s description, oldest first, each with its own
-    /// stamp: for their holder to take now that it is described (their holds let go).
-    pub fn take(&mut self, receiver: &PublicKey) -> Vec<Arc<Decoded>> {
-        self.held
-            .remove(receiver)
-            .map(|mut waiting| {
-                self.lists -= waiting.bytes();
-                waiting
-                    .take()
-                    .into_iter()
-                    .map(|orphan| orphan.batch)
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
-
-    /// Batches held.
-    pub fn len(&self) -> usize {
-        self.held.values().map(|waiting| waiting.len()).sum()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.held.is_empty()
-    }
-
-    /// Lets every batch go (the engine they waited for went).
-    pub fn clear(&mut self) {
-        self.held.clear();
-        self.lists = 0;
-    }
 }
 
 /// Where a described receiver stands for room.
@@ -654,6 +431,9 @@ impl Places {
 #[derive(Debug)]
 pub struct Seats {
     limit: usize,
+    /// Receivers not described yet whose batches are held, across every intake of the engine:
+    /// at most `limit` ([`Intake::take`]).
+    undescribed: std::sync::atomic::AtomicUsize,
     /// What the draw is keyed by: this process's secret, or a test's.
     secret: FingerprintKey,
     places: Mutex<Places>,
@@ -690,15 +470,36 @@ impl Seats {
     pub fn keyed(limit: usize, secret: FingerprintKey) -> Arc<Self> {
         Arc::new(Self {
             limit,
+            undescribed: std::sync::atomic::AtomicUsize::new(0),
             secret,
             places: Mutex::new(Places::default()),
         })
     }
 
     /// `key`'s draw under these seats' secret ([`draw_under`]): what ranks it for a seat, and for
-    /// room among the batches waiting for a description ([`Intake::hold_orphan`]).
+    /// room among the receivers not described yet ([`Intake::take`]).
     pub fn draw_of(&self, key: &PublicKey) -> u128 {
         draw_under(&self.secret, key)
+    }
+
+    /// Room for one more receiver not described yet: false when `limit` of them are held.
+    fn hold_undescribed(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        self.undescribed
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |held| {
+                (held < self.limit).then_some(held + 1)
+            })
+            .is_ok()
+    }
+
+    /// A receiver not described yet was described, or let go.
+    fn release_undescribed(&self) {
+        use std::sync::atomic::Ordering;
+        let _ = self
+            .undescribed
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |held| {
+                held.checked_sub(1)
+            });
     }
 
     fn places(&self) -> std::sync::MutexGuard<'_, Places> {
@@ -953,30 +754,36 @@ impl Sequences {
     }
 }
 
-impl Described {
-    /// True when the batch numbered `sequence` in `boot` has not been used.
-    fn admit(&mut self, boot: u64, sequence: u64) -> bool {
-        let found = self
-            .boots
-            .iter()
-            .position(|(id, _)| *id == boot)
-            .and_then(|at| self.boots.remove(at));
-        let (admitted, sequences) = match found {
-            Some((_, mut sequences)) => (sequences.admit(sequence), sequences),
-            None => {
-                self.boots.truncate(BOOTS_PER_RECEIVER - 1);
-                (true, Sequences::new(sequence))
-            }
-        };
-        self.boots.push_front((boot, sequences));
-        admitted
-    }
+/// True when the batch numbered `sequence` in `boot` has not been used, by `boots` (the
+/// sequences used per boot, most recent boot first), which it then marks.
+fn admit_in(boots: &mut VecDeque<(u64, Sequences)>, boot: u64, sequence: u64) -> bool {
+    let found = boots
+        .iter()
+        .position(|(id, _)| *id == boot)
+        .and_then(|at| boots.remove(at));
+    let (admitted, sequences) = match found {
+        Some((_, mut sequences)) => (sequences.admit(sequence), sequences),
+        None => {
+            boots.truncate(BOOTS_PER_RECEIVER - 1);
+            (true, Sequences::new(sequence))
+        }
+    };
+    boots.push_front((boot, sequences));
+    admitted
+}
+
+/// A receiver whose batches came before its description (module docs): the sequences it used,
+/// and the newest signed wall clock of its batches, which says when nothing of it is held any
+/// more ([`Intake::expire`]).
+struct Undescribed {
+    boots: VecDeque<(u64, Sequences)>,
+    newest_wall_ms: u64,
 }
 
 /// What a description or a change of regions did: what it was, the receivers here that stopped
-/// taking part (what they heard is forgotten here, and their holder forgets them in the sealed
-/// bins), and the receivers whose seat changed that this intake does not hold (their own intakes
-/// settle them, [`Intake::settle`]).
+/// taking part (their holder forgets what they heard, `Engine::forget_by`), and the receivers
+/// whose seat changed that this intake does not hold (their own intakes settle them,
+/// [`Intake::settle`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Description {
     pub ingested: Ingested,
@@ -984,19 +791,17 @@ pub struct Description {
     pub moved: Vec<PublicKey>,
 }
 
-/// One holder's receivers and their open raw (module docs).
+/// One holder's receivers (module docs): who takes part and the sequences each has used.
 pub struct Intake {
     seats: Arc<Seats>,
     /// The engine's regions: a receiver inside one takes part (empty: every receiver with a
     /// location). `None`: no engine runs, and no receiver takes part.
     regions: Option<Regions>,
     receivers: BTreeMap<PublicKey, Described>,
-    open: Open,
-    /// How lateness is decided by the stamp, if it is (`closing`); kept across a restart.
-    closing: Option<Closing>,
-    dropped: Dropped,
-    /// Batches of receivers not described yet (module docs).
-    orphans: Orphans,
+    /// Receivers not described yet whose batches are held (module docs).
+    undescribed: BTreeMap<PublicKey, Undescribed>,
+    /// Receivers refused whole for room since the last call ([`Intake::take_refused`]).
+    refused: u64,
 }
 
 impl Described {
@@ -1006,69 +811,15 @@ impl Described {
 }
 
 impl Intake {
-    /// Receivers seated in `seats`, raw bounded by `limits` (its byte bound is the open raw's own;
-    /// a holder whose raw is split checks its whole bound when it seals, `Bin::seal_within`),
-    /// taking part in `regions`.
-    pub fn new(seats: Arc<Seats>, limits: Limits, regions: Option<Regions>) -> Self {
+    /// Receivers seated in `seats`, taking part in `regions`.
+    pub fn new(seats: Arc<Seats>, regions: Option<Regions>) -> Self {
         Self {
             regions,
             receivers: BTreeMap::new(),
-            open: Open::new(limits),
-            closing: None,
-            dropped: Dropped::default(),
-            orphans: Orphans::new(Arc::clone(&seats), ORPHAN_RECEIVERS, usize::MAX),
+            undescribed: BTreeMap::new(),
+            refused: 0,
             seats,
         }
-    }
-
-    /// Holds `batch`, by its own stamp, of a receiver not described here, until its description
-    /// comes or `ORPHAN_MS` of steps pass ([`Orphans::hold`]): for an engine holding its own raw.
-    /// A holder that splits its receivers over many intakes keeps one [`Orphans`] for all of them
-    /// instead, so room among them is decided by rank across all.
-    pub fn hold_orphan(&mut self, batch: &Arc<Decoded>) -> Orphaned {
-        if self.receivers.contains_key(&batch.receiver()) {
-            return Orphaned::default();
-        }
-        self.orphans.hold(batch, |_| true)
-    }
-
-    /// Lets go every batch that has waited `ORPHAN_MS` by the step at `now` on the monotonic clock.
-    pub fn expire_orphans(&mut self, now: Mono) -> Orphaned {
-        self.orphans.expire(now)
-    }
-
-    /// The batches that waited for `receiver`'s description, oldest first, each with its stamp:
-    /// for its holder to take now that it is described.
-    pub fn take_orphans(&mut self, receiver: &PublicKey) -> Vec<Arc<Decoded>> {
-        self.orphans.take(receiver)
-    }
-
-    /// Batches waiting for a description.
-    pub fn orphans(&self) -> usize {
-        self.orphans.len()
-    }
-
-    /// Raw late by its stamp under `closing` (module docs): for an intake whose holder steps on a
-    /// thread of its own, by the stamp watermark.
-    #[must_use]
-    pub fn closing(mut self, closing: Closing) -> Self {
-        self.open = Open::new(self.open.limits()).closing(closing);
-        self.closing = Some(closing);
-        self
-    }
-
-    /// Receptions held open (copies included).
-    pub fn len(&self) -> usize {
-        self.open.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.open.is_empty()
-    }
-
-    /// Bytes of open raw, as allocated.
-    pub fn bytes(&self) -> usize {
-        self.open.bytes()
     }
 
     /// Whether `receiver` is described, and whether it takes part (one waiting for a seat is
@@ -1098,27 +849,15 @@ impl Intake {
             })
     }
 
-    /// What was refused since the last call.
-    pub fn take_dropped(&mut self) -> Dropped {
-        std::mem::take(&mut self.dropped)
+    /// Receivers refused whole for room (outranked, or unseated by a better ranked one) since the
+    /// last call.
+    pub fn take_refused(&mut self) -> u64 {
+        std::mem::take(&mut self.refused)
     }
 
     /// A receiver's site-bearing record (verified here: it is the receiver's own word). An error
     /// is one that does not verify.
     pub fn describe(&mut self, record: &SiteRecord) -> Result<Description, String> {
-        self.describe_after(record, None)
-    }
-
-    /// As `describe`, at a step of a holder whose earlier steps are not all done: what a receiver
-    /// that stops taking part (it, or one whose seat it changed) held in the bins through `kept`
-    /// stays for those steps to take, as they would have had they run in their turn
-    /// (`held::Open::forget_receiver_after`); its holder forgets it in the sealed bins at this
-    /// step. `None`: everything it held here goes now.
-    pub fn describe_after(
-        &mut self,
-        record: &SiteRecord,
-        kept: Option<i64>,
-    ) -> Result<Description, String> {
         let ignored = Description {
             ingested: Ingested::Ignored,
             left: Vec::new(),
@@ -1140,6 +879,14 @@ impl Intake {
         let (id, reception_key) = (record.site_id(), record.reception_key());
         let site = self.site(key, content.location, content.clock, id);
         let fresh = !self.receivers.contains_key(&key);
+        // Batches it sent before it was described are held, and the sequences they used go with
+        // its description.
+        let early = self.undescribed.remove(&key);
+        if early.is_some() {
+            self.seats.release_undescribed();
+        }
+        let held_early = early.is_some();
+        let boots = early.map_or_else(VecDeque::new, |early| early.boots);
         let known = self.receivers.entry(key).or_insert_with(|| Described {
             issued_ms: 0,
             bytes: Vec::new(),
@@ -1149,7 +896,7 @@ impl Intake {
             key: reception_key,
             site: None,
             seated: false,
-            boots: VecDeque::new(),
+            boots,
         });
         let was = known.taking_part();
         known.issued_ms = content.issued_ms;
@@ -1162,14 +909,19 @@ impl Intake {
         let changed = self
             .seats
             .rank(key, site.is_none(), seat_cell(content.location));
-        let mut description = self.settle_all(changed, kept);
-        if self.settle_was(&key, was, kept) {
+        let mut description = self.settle_all(changed);
+        if self.settle_was(&key, was) {
+            description.left.push(key);
+        }
+        let taking_part = self.receivers.get(&key).is_some_and(Described::taking_part);
+        if held_early && !taking_part {
+            // What it sent before its description is let go: it takes no part.
             description.left.push(key);
         }
         let seated = self.receivers.get(&key).is_some_and(|known| known.seated);
         if fresh && !seated {
             // Beyond the seats and outranked: refused whole, and counted.
-            self.dropped.receivers += 1;
+            self.refused += 1;
         }
         description.ingested = if seated {
             Ingested::Described
@@ -1180,7 +932,7 @@ impl Intake {
     }
 
     /// Settles every receiver of `changed` this intake holds; the rest are another intake's.
-    fn settle_all(&mut self, changed: Vec<PublicKey>, kept: Option<i64>) -> Description {
+    fn settle_all(&mut self, changed: Vec<PublicKey>) -> Description {
         let mut description = Description {
             ingested: Ingested::Ignored,
             left: Vec::new(),
@@ -1188,7 +940,7 @@ impl Intake {
         };
         for other in changed {
             if self.receivers.contains_key(&other) {
-                if self.settle_after(&other, kept) {
+                if self.settle(&other) {
                     description.left.push(other);
                 }
             } else {
@@ -1199,31 +951,25 @@ impl Intake {
     }
 
     /// Brings `receiver` to the place the seats give it now: seated or waiting, or forgotten
-    /// with its description. True when it stopped taking part (what it heard is forgotten here,
-    /// and its holder forgets it in the sealed bins). A receiver that loses its seat is refused
-    /// whole from then on, and counted. Settling twice, or late, is settling once: it reads where
-    /// the receiver stands now.
+    /// with its description. True when it stopped taking part (its holder forgets what it heard,
+    /// `Engine::forget_by`). A receiver that loses its seat is refused whole from then on, and
+    /// counted. Settling twice, or late, is settling once: it reads where the receiver stands now.
     pub fn settle(&mut self, receiver: &PublicKey) -> bool {
-        self.settle_after(receiver, None)
-    }
-
-    /// As `settle`, its raw through `kept` left for the steps already due (`describe_after`).
-    pub fn settle_after(&mut self, receiver: &PublicKey, kept: Option<i64>) -> bool {
         let was = self
             .receivers
             .get(receiver)
             .is_some_and(Described::taking_part);
-        self.settle_was(receiver, was, kept)
+        self.settle_was(receiver, was)
     }
 
-    fn settle_was(&mut self, receiver: &PublicKey, was: bool, kept: Option<i64>) -> bool {
+    fn settle_was(&mut self, receiver: &PublicKey, was: bool) -> bool {
         let place = self.seats.place(receiver);
         let Some(known) = self.receivers.get_mut(receiver) else {
             return false;
         };
         let seated = place == Place::Seated;
         if known.seated && !seated {
-            self.dropped.receivers += 1;
+            self.refused += 1;
         }
         known.seated = seated;
         let now = known.taking_part();
@@ -1231,23 +977,17 @@ impl Intake {
             self.receivers.remove(receiver);
         }
         let left = was && !now;
-        if left || place == Place::Gone {
-            // It stopped taking part: what it heard is no longer used.
-            if let Some(known) = self.receivers.get_mut(receiver) {
-                known.boots.clear();
-            }
-            match kept {
-                Some(kept) => self.open.forget_receiver_after(receiver, kept),
-                None => self.open.forget_receiver(receiver),
-            }
+        if left && let Some(known) = self.receivers.get_mut(receiver) {
+            // It stopped taking part: the sequences it used say nothing of its next part.
+            known.boots.clear();
         }
         left
     }
 
     /// The engine's regions are now `regions` (`None`: no engine runs). Every receiver described
     /// is decided again on its own signed word, and ranked again for its seat: the receivers here
-    /// that stopped taking part, whose raw here is forgotten (their holder forgets them in the
-    /// sealed bins), and those of other intakes whose seat changed.
+    /// that stopped taking part (their holder forgets what they heard), and those of other intakes
+    /// whose seat changed.
     pub fn set_scope(&mut self, regions: Option<Regions>) -> Description {
         self.regions = regions;
         let decided: Vec<(PublicKey, Option<Site>, bool)> = self
@@ -1285,25 +1025,23 @@ impl Intake {
             }
         }
         for (key, _, was) in decided {
-            if self.settle_was(&key, was, None) {
+            if self.settle_was(&key, was) {
                 description.left.push(key);
             }
         }
         description
     }
 
-    /// A new engine begins: nothing it holds is the old one's. The descriptions stay (they are the
-    /// receivers' word, not the engine's); the sequences used and the open raw go.
-    pub fn restart(&mut self, limits: Limits) {
+    /// A new engine begins: nothing it used is the old one's. The descriptions stay (they are the
+    /// receivers' word, not the engine's); the sequences used go.
+    pub fn restart(&mut self) {
         for known in self.receivers.values_mut() {
             known.boots.clear();
         }
-        self.open = match self.closing {
-            Some(closing) => Open::new(limits).closing(closing),
-            None => Open::new(limits),
-        };
-        self.dropped = Dropped::default();
-        self.orphans.clear();
+        for early in self.undescribed.values_mut() {
+            early.boots.clear();
+        }
+        self.refused = 0;
     }
 
     /// The site a declared location and clock give, if the receiver takes part, named by its
@@ -1327,75 +1065,92 @@ impl Intake {
         })
     }
 
-    /// Takes a batch whose signature its holder verified and which it decoded once: used once per
-    /// (boot, sequence), held only from a receiver that takes part, within its own share of a bin
-    /// (`Limits::per_receiver_bin`; the holder's whole bound is checked when it seals). What it
-    /// did, and what it says to provisional solving (nothing unless it was taken).
-    pub fn ingest_verified(&mut self, batch: &Decoded) -> (Ingested, Vec<Note>) {
-        self.ingest_verified_taking(batch, None, &mut |_| true)
-    }
-
-    /// As `ingest_verified`, every byte of open raw asked of `take` before it is allocated
-    /// (`held::Open::add_decoded_taking`): for a holder charged for its open raw as it grows. A
-    /// byte refused refuses the batch's raw of its bin, counted with the receiver's raw refused
-    /// for its share; what it says to provisional solving is told all the same. `step`: for a
-    /// holder that closes by the stamp, the step whose interval its stamp is in, whose two clocks
-    /// judge it late (`held::Open::add_decoded_taking`).
-    pub fn ingest_verified_taking(
-        &mut self,
-        batch: &Decoded,
-        step: Option<Moment>,
-        take: &mut dyn FnMut(usize) -> bool,
-    ) -> (Ingested, Vec<Note>) {
-        let key = batch.receiver();
-        let Some(known) = self.receivers.get_mut(&key) else {
-            return (Ingested::Ignored, Vec::new());
-        };
-        if !known.taking_part() {
-            return (Ingested::Ignored, Vec::new());
-        }
-        if !known.admit(batch.boot_id(), batch.sequence()) {
-            return (Ingested::Replayed, Vec::new());
-        }
-        let notes = notes_of(batch);
-        // Judged ahead or late by its own stamp, however late it is taken (a batch that waited for
-        // its receiver's description too), late by the clocks of the step its stamp is in: every
-        // holder judges the same raw the same way.
-        let added = self.open.add_decoded_taking(batch, step, take);
-        self.dropped.late += added.late as u64;
-        self.dropped.refused += added.refused as u64;
-        self.dropped.ahead += added.ahead as u64;
-        (
-            Ingested::Batch {
-                new: added.new,
-                filtered: added.filtered,
-            },
-            notes,
-        )
-    }
-
-    /// A batch of a format this build cannot read: it uses its sequence and holds nothing.
-    pub fn use_sequence(&mut self, receiver: &PublicKey, boot: u64, sequence: u64) -> Ingested {
-        match self.receivers.get_mut(receiver) {
-            Some(known) if known.taking_part() => {
-                if known.admit(boot, sequence) {
-                    Ingested::Ignored
-                } else {
-                    Ingested::Replayed
+    /// Whether the batch `batch`, signed at `wall_ms`, is to be used (module docs): from a
+    /// receiver that takes part or is not described yet (while there is room for it, `Seats`),
+    /// with a (boot, sequence) not already used and not too far behind that boot's newest. `Err`
+    /// says why not: `Ingested::Ignored` (it takes no part, or there is no room for another
+    /// receiver not described) or `Ingested::Replayed`. A batch used is used once, whatever it
+    /// holds.
+    pub fn take(&mut self, batch: &BatchId, wall_ms: u64) -> Result<(), Ingested> {
+        let boots = match self.receivers.get_mut(&batch.receiver) {
+            Some(known) if known.taking_part() => &mut known.boots,
+            Some(_) => return Err(Ingested::Ignored),
+            None => {
+                if !self.undescribed.contains_key(&batch.receiver) {
+                    if !self.seats.hold_undescribed() {
+                        return Err(Ingested::Ignored);
+                    }
+                    self.undescribed.insert(
+                        batch.receiver,
+                        Undescribed {
+                            boots: VecDeque::new(),
+                            newest_wall_ms: wall_ms,
+                        },
+                    );
                 }
+                let Some(early) = self.undescribed.get_mut(&batch.receiver) else {
+                    return Err(Ingested::Ignored);
+                };
+                early.newest_wall_ms = early.newest_wall_ms.max(wall_ms);
+                &mut early.boots
             }
-            _ => Ingested::Ignored,
+        };
+        if !admit_in(boots, batch.boot_id, batch.sequence) {
+            return Err(Ingested::Replayed);
         }
+        Ok(())
     }
 
-    /// Takes every open bin up to `bin` for sealing: from here on raw for them is late.
-    pub fn take_through(&mut self, bin: i64) -> Vec<Fragment> {
-        self.open.take_through(bin)
+    /// Lets go of every receiver not described yet none of whose batches was signed within
+    /// `held_ms` before `now_ms`: nothing of it is held any more. The ones let go.
+    pub fn expire(&mut self, now_ms: u64, held_ms: u64) -> Vec<PublicKey> {
+        let gone: Vec<PublicKey> = self
+            .undescribed
+            .iter()
+            .filter(|(_, early)| early.newest_wall_ms.saturating_add(held_ms) < now_ms)
+            .map(|(key, _)| *key)
+            .collect();
+        for key in &gone {
+            self.undescribed.remove(key);
+            self.seats.release_undescribed();
+        }
+        gone
     }
+}
 
-    /// Forgets every open bin before `bin`.
-    pub fn forget_before(&mut self, bin: i64) {
-        self.open.forget_before(bin);
+/// The receptions of a verified, decoded batch MLAT uses (`tally_wire::modes::wanted_reception`),
+/// each with the batch's receiver, counter epoch and signed wall clock, in the batch's order;
+/// with how many it carried that MLAT never uses. A function of the batch alone, so the thread
+/// that holds the batch reads it (a relay's raw shard, RFC-0181 §5) and the engine only weighs
+/// what it says.
+pub fn receptions_of(batch: &Decoded) -> (Vec<Reception>, usize) {
+    let mut filtered = 0;
+    let receptions = batch
+        .views()
+        .filter_map(|view| {
+            // A wanted reception is a Mode S message, so it is held inline.
+            let message = tally_wire::modes::wanted_reception(view.format, view.data)
+                .then(|| tally_mlat_solver::ModeS::new(view.data))
+                .flatten();
+            filtered += usize::from(message.is_none());
+            Some(Reception {
+                receiver: batch.receiver(),
+                epoch: batch.counter_epoch(),
+                timestamp: view.timestamp,
+                message: message?,
+                wall_ms: batch.wall_ms(),
+            })
+        })
+        .collect();
+    (receptions, filtered)
+}
+
+/// The batch `batch` is: its receiver, boot and sequence.
+pub fn batch_id(batch: &Decoded) -> BatchId {
+    BatchId {
+        receiver: batch.receiver(),
+        boot_id: batch.boot_id(),
+        sequence: batch.sequence(),
     }
 }
 
@@ -1411,7 +1166,6 @@ mod tests {
     #![allow(clippy::disallowed_methods, reason = "a test's scripted readings")]
     use super::*;
     use tally_wire::Identity;
-    use tally_wire::clocks::recorded::aligned;
 
     /// `draw` of `Identity::from_seed([7; 32])`'s key.
     const KNOWN_DRAW: u128 = 0xa152b57161dad4a033a9d8cbfd33dbb0;
@@ -1711,114 +1465,6 @@ mod tests {
         let mut best: Vec<PublicKey> = draws[..LIMIT].iter().map(|(_, key)| *key).collect();
         best.sort_unstable();
         assert_eq!(first, best);
-    }
-
-    /// Who waits for a description, for room, is decided by rank and never by
-    /// arrival. Past the intake's receivers the worst drawn is let go for a better drawn one, and
-    /// past its bytes a receiver's oldest go first, so the same batches in any order leave the
-    /// same batches held, every one let go counted, and the holder is asked for what each batch
-    /// allocates only once room is made: what it charges never passes the room it gave, and is
-    /// what the batches waiting allocate, read from an allocator counting this thread's bytes.
-    #[test]
-    fn who_waits_for_a_description_depends_on_who_came_never_on_the_order() -> Result<(), String> {
-        const EACH: u64 = 6;
-        let senders: Vec<Identity> = (20..26u8)
-            .map(|seed| Identity::from_seed([seed; 32]))
-            .collect();
-        let batch = |sender: usize, sequence: u64| -> Result<Arc<Decoded>, String> {
-            let signed = tally_wire::Batch::sign(
-                &senders[sender],
-                &tally_wire::BatchContent {
-                    boot_id: 1,
-                    sequence,
-                    counter_epoch: 1,
-                    wall_ms: 1_000 + sequence,
-                    dropped: 0,
-                    previous: [0; 32],
-                    observations: Vec::new(),
-                },
-            )
-            .map_err(|error| error.to_string())?;
-            Decoded::from_verified(signed, aligned(1_000 + sequence), sequence)
-                .map_err(|undecodable| undecodable.error.to_string())
-        };
-        let mut batches = Vec::new();
-        for sender in 0..senders.len() {
-            for sequence in 0..EACH {
-                batches.push(batch(sender, sequence)?);
-            }
-        }
-        let held = |order: &[usize]| -> (Vec<(PublicKey, u64)>, u64) {
-            let seats = Seats::keyed(8, secret(4));
-            // Three receivers, four batches each: a full deque of four and its place.
-            let room = ORPHANS_ROOT_BYTES
-                + 3 * (tally_wire::footprint::vec::<Orphan>(4) + ORPHAN_PLACE_BYTES);
-            let mut orphans = Orphans::new(seats, 3, 0);
-            orphans.set_room(room);
-            let base = tally_counting::Counting::live();
-            let mut asked = 0;
-            let mut dropped = 0;
-            for at in order {
-                dropped += orphans
-                    .hold(&batches[*at], |total| {
-                        asked = asked.max(total);
-                        total <= room
-                    })
-                    .dropped;
-                assert!(asked <= room, "asked past the room");
-                // What a holder charges once it settles after each hold.
-                let charged = orphans.bytes();
-                assert!(charged <= room, "charged past the room");
-                let live = tally_counting::Counting::since(base);
-                assert!(
-                    live >= 0 && live as usize <= charged,
-                    "{live} allocated, {charged} charged"
-                );
-            }
-            let mut kept = Vec::new();
-            for sender in &senders {
-                for batch in orphans.take(&sender.public()) {
-                    kept.push((batch.receiver(), batch.sequence()));
-                }
-            }
-            kept.sort_unstable();
-            (kept, dropped)
-        };
-        let mut drawn: Vec<(u128, PublicKey)> = senders
-            .iter()
-            .map(|sender| (draw_under(&secret(4), &sender.public()), sender.public()))
-            .collect();
-        drawn.sort_unstable();
-        // The three best drawn, each its four newest.
-        let mut expected: Vec<(PublicKey, u64)> = drawn[..3]
-            .iter()
-            .flat_map(|(_, key)| (EACH - 4..EACH).map(|sequence| (*key, sequence)))
-            .collect();
-        expected.sort_unstable();
-        let mut order: Vec<usize> = (0..batches.len()).collect();
-        for round in 0..20u64 {
-            for i in (1..order.len()).rev() {
-                let j = ((round + 1) * 2_654_435_761 * (i as u64 + 7) % (i as u64 + 1)) as usize;
-                order.swap(i, j);
-            }
-            // Receivers interleaved anyhow, each one's own batches in its order (one connection,
-            // one worker).
-            let mut by_sender: Vec<usize> = Vec::new();
-            let mut next = vec![0usize; senders.len()];
-            for at in &order {
-                let sender = at / EACH as usize;
-                by_sender.push(sender * EACH as usize + next[sender]);
-                next[sender] += 1;
-            }
-            let (kept, dropped) = held(&by_sender);
-            assert_eq!(kept, expected, "{by_sender:?}");
-            assert_eq!(
-                dropped,
-                (batches.len() - expected.len()) as u64,
-                "{by_sender:?}"
-            );
-        }
-        Ok(())
     }
 
     /// Of a receiver's descriptions taking effect at one step only the newest it

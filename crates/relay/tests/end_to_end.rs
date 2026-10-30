@@ -33,8 +33,7 @@ use tally_wire::{
     Batch, BatchContent, Clock, ClockModel, ClockModelContent, EnuCovariance, FaultProof, Frame,
     FrameKind, Identity, Location, Observation, ObservationSet, Positions, ProviderOffer,
     ProviderOfferContent, PublicInfoContent, PublicKey, ReceiverInfo, ReceiverSite,
-    ReceiverSiteContent, Reception, Record, Region, RelayAddress, Role, Solution, SolutionsContent,
-    Streams, TransmitTime,
+    ReceiverSiteContent, Reception, Record, Region, RelayAddress, Role, Streams, TransmitTime,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -264,7 +263,7 @@ fn relay_only(record: &Record) -> bool {
         | Record::ReceiverSite(_)
         | Record::ClockModel(_)
         | Record::ClockModelPart(_) => true,
-        Record::Positions(positions) | Record::Provisional(positions) => !positions.is_tagged(),
+        Record::Positions(positions) => !positions.is_tagged(),
         _ => false,
     }
 }
@@ -1173,13 +1172,9 @@ impl Scripted {
                     .cloned()
                     .collect();
                 let content = manifest.content(&listed).ok()?;
-                let model =
-                    tally_mlat_solver::publish::decode(&content.model, content.spec_version)
-                        .ok()?;
                 Some(tally_relay::mlat_host::OwnModel {
-                    id: manifest.id(),
                     engine: manifest.engine().ok()?,
-                    model: Arc::new(model),
+                    model: Arc::new(tally_mlat::fix::Held::decoded(content.model)?),
                 })
             })
             .collect();
@@ -1195,13 +1190,13 @@ impl Scripted {
 impl MlatHost for Scripted {
     fn set_areas(&self, _: tally_wire::Regions, _: Vec<tally_mlat::intake::SiteRecord>) {}
 
+    fn raw(&self) -> Option<Arc<dyn tally_relay::standing::Raw>> {
+        None
+    }
+
     fn offer_description(&self, _: &tally_mlat::intake::SiteRecord, _: u64) {}
 
     fn offer_batch(&self, _: &Arc<tally_wire::Decoded>, _: u64) {}
-
-    fn sealed_bins(&self) -> Option<tally_mlat_solver::held::SealedBins> {
-        None
-    }
 
     fn take_published(&self, _: tally_relay::products::Watermark) -> Vec<Record> {
         self.ready
@@ -1238,9 +1233,7 @@ async fn relay_hosting(
     let issued: Vec<u64> = records
         .iter()
         .filter_map(|record| match record {
-            Record::Positions(positions) | Record::Provisional(positions) => {
-                positions.issued_ms().ok()
-            }
+            Record::Positions(positions) => positions.issued_ms().ok(),
             Record::ClockModel(model) => model.issued_ms().ok(),
             _ => None,
         })
@@ -1286,28 +1279,27 @@ async fn relay_hosting(
 fn engine_output(
     identity: &Identity,
 ) -> Result<(Vec<Record>, Vec<tally_mlat::intake::SiteRecord>)> {
-    use tally_mlat::engine::{Capacity, Engine, Settings};
-    use tally_mlat::replay::{arrivals, replay, scenario};
+    use tally_mlat::engine::{Capacity, Engine, STEP_MS, Settings};
+    use tally_mlat::replay::{replay, scenario};
     let mut simulation = tally_mlat_solver::sim::run(&scenario(23, 40.0));
-    let delivered = arrivals(&mut simulation, 5)?;
+    let delivered = tally_mlat_solver::sim::arrived_records(&mut simulation, 5).map_err(text)?;
     let sites = delivered
         .iter()
         .filter_map(|(_, record)| tally_mlat::intake::SiteRecord::of(record))
         .collect();
-    let until = delivered.last().map_or(0, |(at, _)| *at) + 60_000;
+    let until = delivered.last().map_or(0, |(at, _)| *at) + 2 * STEP_MS;
     let mut engine = Engine::new(
-        tally_wire::Signer::new(twin(identity)?, std::sync::Arc::new(|| true)),
         0xb007,
         Settings {
             regions: tally_wire::Regions::default(),
-            settle: tally_wire::budget::policy::<_, 1_000>(),
             threads: 2,
             capacity: Capacity::default(),
         },
     );
-    let records = replay(&mut engine, &delivered, 100, until)?
+    let signer = tally_wire::Signer::new(twin(identity)?, std::sync::Arc::new(|| true));
+    let records = replay(&mut engine, &delivered, &signer, until)?
         .into_iter()
-        .map(|(_, record)| record)
+        .flat_map(|(_, step)| step.records())
         .collect();
     Ok((records, sites))
 }
@@ -1319,7 +1311,7 @@ async fn every_form(
     mut wanted: HashSet<Vec<u8>>,
 ) -> Result<Vec<Record>> {
     until(session, what, |record| {
-        if let Record::Positions(positions) | Record::Provisional(positions) = record {
+        if let Record::Positions(positions) = record {
             wanted.remove(positions.as_bytes());
         }
         wanted.is_empty()
@@ -1328,9 +1320,9 @@ async fn every_form(
 }
 
 /// What a relay's own MLAT signs reaches each reader of its stream. A client is sent the client
-/// forms the relay checked against its own raw (`consistency`): final positions those that asked
-/// for positions, provisional ones only those that asked for them, model summaries those that asked
-/// for models, and never a raw solution or a full model, which are a relay link's. (An engine
+/// forms the relay checked against its own raw (`consistency`): fixes those that asked for
+/// positions, model summaries those that asked for models, and never a raw fix or a full model,
+/// which are a relay link's. (An engine
 /// publishing on its own session is the retired path: refused,
 /// `no_session_but_a_member_publishes_positions_models_or_parts`.)
 #[tokio::test]
@@ -1354,61 +1346,34 @@ async fn a_relays_own_mlat_reaches_the_subscribers_of_each_stream() -> Result {
             beacon.public(),
         )
     };
-    let (mut finals_only, _) = subscriber(Streams::RAW.with(Streams::POSITIONS)).await?;
-    let (mut both, _) = subscriber(
-        Streams::RAW
-            .with(Streams::POSITIONS)
-            .with(Streams::PROVISIONAL),
-    )
-    .await?;
+    let (mut fixes, _) = subscriber(Streams::RAW.with(Streams::POSITIONS)).await?;
     let (mut models, _) = subscriber(Streams::RAW.with(Streams::CLOCK_MODELS)).await?;
-    let relays = relay_view(
-        &relay,
-        Streams::POSITIONS
-            .with(Streams::PROVISIONAL)
-            .with(Streams::CLOCK_MODELS),
-    );
-    let of = |client: bool, provisional: bool| -> HashSet<Vec<u8>> {
+    let relays = relay_view(&relay, Streams::POSITIONS.with(Streams::CLOCK_MODELS));
+    let of = |client: bool| -> HashSet<Vec<u8>> {
         records
             .iter()
             .filter_map(|record| match record {
-                Record::Positions(positions) if !provisional => Some(positions),
-                Record::Provisional(positions) if provisional => Some(positions),
+                Record::Positions(positions) => Some(positions),
                 _ => None,
             })
             .filter(|positions| positions.is_tagged() == client)
             .map(|positions| positions.as_bytes().to_vec())
             .collect()
     };
-    let (finals, provisionals) = (of(true, false), of(true, true));
-    let (raw_finals, summaries) = (
-        of(false, false),
-        records
-            .iter()
-            .filter(|record| matches!(record, Record::ClientClockModel(_)))
-            .count(),
-    );
+    let (tagged, raw) = (of(true), of(false));
+    let summaries = records
+        .iter()
+        .filter(|record| matches!(record, Record::ClientClockModel(_)))
+        .count();
     assert!(
-        !finals.is_empty() && !provisionals.is_empty() && !raw_finals.is_empty() && summaries > 0,
+        !tagged.is_empty() && !raw.is_empty() && summaries > 0,
         "the engine published too little to test"
     );
     mlat.publish(records.clone());
 
     // Every client form, checked; reading until each is in.
-    let heard = every_form(
-        &mut both,
-        "every final and provisional client form",
-        finals.union(&provisionals).cloned().collect(),
-    )
-    .await?;
+    let heard = every_form(&mut fixes, "every client form", tagged).await?;
     assert_client_safe(&heard);
-    let heard = every_form(&mut finals_only, "every final client form", finals.clone()).await?;
-    assert_client_safe(&heard);
-    assert!(
-        !heard
-            .iter()
-            .any(|record| matches!(record, Record::Provisional(_)))
-    );
     let mut summaries_heard = 0;
     let heard = until(&mut models, "every model summary", |record| {
         summaries_heard += usize::from(matches!(record, Record::ClientClockModel(_)));
@@ -1419,11 +1384,11 @@ async fn a_relays_own_mlat_reaches_the_subscribers_of_each_stream() -> Result {
     assert!(
         !heard
             .iter()
-            .any(|record| matches!(record, Record::Positions(_) | Record::Provisional(_)))
+            .any(|record| matches!(record, Record::Positions(_)))
     );
-    // A relay link is handed the raw solutions and the full models.
-    let mut missing = raw_finals;
-    let heard = relay_until(&relays, "every raw final", |record| {
+    // A relay link is handed the raw fixes and the full models.
+    let mut missing = raw;
+    let heard = relay_until(&relays, "every raw fix", |record| {
         if let Record::Positions(positions) = record {
             missing.remove(positions.as_bytes());
         }
@@ -1438,7 +1403,7 @@ async fn a_relays_own_mlat_reaches_the_subscribers_of_each_stream() -> Result {
     Ok(())
 }
 
-/// Positions, provisional positions, clock models and their parts come only from a relay: its own
+/// Positions, clock models and their parts come only from a relay: its own
 /// MLAT, or a verified member. Any other session that publishes one (an engine's, the retired
 /// standalone path; a feeder's; a subscriber's) is cut off, and nothing it sent is forwarded.
 #[tokio::test]
@@ -1453,14 +1418,12 @@ async fn no_session_but_a_member_publishes_positions_models_or_parts() -> Result
         &relay,
         Streams::RAW
             .with(Streams::POSITIONS)
-            .with(Streams::PROVISIONAL)
             .with(Streams::CLOCK_MODELS),
     );
     let engine = Identity::generate().map_err(text)?;
     let refused = [
         Record::Positions(positions(&engine, 0)?),
         Record::Positions(solved_tagged(&engine, 1, 374_100_000)?),
-        Record::Provisional(provisional(&engine, 0, 374_100_000)?),
         Record::ClockModel(clock_model(&engine, 0)?),
         Record::ClockModelPart(tally_wire::ClockModelPart::new([1; 32], 0, b"part")),
     ];
@@ -1488,37 +1451,22 @@ async fn no_session_but_a_member_publishes_positions_models_or_parts() -> Result
     Ok(())
 }
 
-/// A format 3 record of one solution over four receivers' receptions, at `lat_e7`.
+/// A format 7 record of one fix over four receivers' receptions, at `lat_e7`.
 fn solved(engine: &Identity, sequence: u64, lat_e7: i32) -> Result<Positions> {
-    Positions::sign_solutions(
+    Positions::sign_fix(
         engine,
-        &SolutionsContent {
+        &tally_wire::FixesContent {
             boot_id: 1,
             sequence,
             issued_ms: tally_feed::source::wall_ms(),
             spec_version: 1,
-            solutions: vec![solution(lat_e7)?],
+            fixes: vec![fix(lat_e7)?],
         },
     )
     .map_err(text)
 }
 
-/// The same solution as a provisional record.
-fn provisional(engine: &Identity, sequence: u64, lat_e7: i32) -> Result<Positions> {
-    Positions::sign_provisional(
-        engine,
-        &SolutionsContent {
-            boot_id: 1,
-            sequence,
-            issued_ms: tally_feed::source::wall_ms(),
-            spec_version: 1,
-            solutions: vec![solution(lat_e7)?],
-        },
-    )
-    .map_err(text)
-}
-
-/// The same solution as a client's final record: its receptions tagged under each receiver's
+/// The same fix as a client's record (format 8): its receptions tagged under each receiver's
 /// reception key (a site each, signed here).
 fn solved_tagged(engine: &Identity, sequence: u64, lat_e7: i32) -> Result<Positions> {
     let keys: Vec<(PublicKey, tally_wire::ReceptionKey)> = (1..=4u8)
@@ -1527,27 +1475,27 @@ fn solved_tagged(engine: &Identity, sequence: u64, lat_e7: i32) -> Result<Positi
             site(&receiver, here(), 1).map(|site| (receiver.public(), site.reception_key()))
         })
         .collect::<Result<_>>()?;
-    let tagged = solution(lat_e7)?
+    let tagged = fix(lat_e7)?
         .tagged(|receiver| {
             keys.iter()
                 .find(|(key, _)| key == receiver)
                 .map(|(_, reception)| *reception)
         })
         .map_err(text)?;
-    Positions::sign_tagged(
+    Positions::sign_tagged_fix(
         engine,
-        &tally_wire::TaggedSolutionsContent {
+        &tally_wire::TaggedFixesContent {
             boot_id: 1,
             sequence,
             issued_ms: tally_feed::source::wall_ms(),
             spec_version: 1,
-            solutions: vec![tagged],
+            fixes: vec![tagged],
         },
     )
     .map_err(text)
 }
 
-fn solution(lat_e7: i32) -> Result<Solution> {
+fn fix(lat_e7: i32) -> Result<tally_wire::Fix> {
     let receptions = (1..=4u8)
         .map(|seed| Reception {
             receiver: Identity::from_seed([seed; 32]).public(),
@@ -1555,7 +1503,8 @@ fn solution(lat_e7: i32) -> Result<Solution> {
             counter: u64::from(seed),
         })
         .collect();
-    let solution = Solution {
+    let considered = ObservationSet::new(vec![0x8d, 0xa1, 0xb2, 0xc3], receptions).map_err(text)?;
+    let fix = tally_wire::Fix {
         address: 0xa1b2c3,
         transmitted: TransmitTime::new(1_791_219_999_000, 0).map_err(text)?,
         lat_e7,
@@ -1569,12 +1518,10 @@ fn solution(lat_e7: i32) -> Result<Solution> {
             yz: 0.0,
             zz: 400.0,
         },
-        clock_model: [1; 32],
-        addressed: tally_wire::AddressedCitation::default(),
-        observations: ObservationSet::new(vec![0x8d, 0xa1, 0xb2, 0xc3], receptions)
-            .map_err(text)?,
+        models: vec![[1; 32]],
+        sets: tally_wire::FixSets::new(considered.clone(), considered).map_err(text)?,
     };
-    Ok(solution)
+    Ok(fix)
 }
 
 fn clock_model(engine: &Identity, sequence: u64) -> Result<ClockModel> {

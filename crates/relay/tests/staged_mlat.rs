@@ -1,11 +1,11 @@
 //! The hosted MLAT's invariants on the staged relay's own threads (RFC-0181, "Invariants the tests
-//! hold", 1 to 3 and 7): the relay holds MLAT's raw once, in its raw shards, taken there by the
-//! ingest workers and sealed from them, and its provisional state in address shards; the host steps
-//! by the stamp watermark the products seal by, asked as the network task asks it, on a thread of
-//! its own, never waited on step by step, only kept within its limits of the watermark
-//! (`PROVISIONAL_BEHIND` and `WINDOW_STEPS_BEHIND`), past which a host sheds whole steps (`mlat_host`, Behind: what a host that cannot keep up does,
-//! counted, and asserted here never to happen). The same stamped trace makes the same clock models,
-//! positions and provisional positions, byte for byte, on 1, 2 and 8 ingest workers and as many MLAT
+//! hold", 1 to 3 and 7): the relay holds MLAT's raw once, in the engine, its receptions taken out
+//! of each batch by the ingest workers into inboxes a step drains; the host steps once a second by
+//! the stamp watermark the products seal by, asked as the network task asks it, on a thread of its
+//! own, never waited on step by step, only kept within a step of the watermark (past which a host
+//! collapses the steps it passed into the newest, `mlat_host`, Behind: what a host that cannot keep
+//! up does, counted, and asserted here never to happen). The same stamped trace makes the same
+//! clock models and positions, byte for byte, on 1, 2 and 8 ingest workers and as many MLAT
 //! threads, with delays injected inside every stage of the host and between the batches, and they
 //! are what the reference engine, holding all the raw itself and driven in line on the same steps,
 //! makes of it (`tally_mlat::replay`). At capacity the same receivers are refused, whole, whatever
@@ -19,10 +19,7 @@ use tally_wire::clocks::recorded::judged;
 
 use tally_relay::hub::{Description, Hub, Inbound, Origin};
 use tally_relay::ingest::{Stamp, Threads};
-use tally_relay::mlat_host::{
-    Cut, HostedMlat, MlatHost, MlatReport, PROVISIONAL_BEHIND, STEP_MS, Stage, WINDOW_STEPS_BEHIND,
-    WindowClock,
-};
+use tally_relay::mlat_host::{Cut, HostedMlat, MlatHost, MlatReport, STEP_MS, Stage, StepClock};
 use tally_wire::{Identity, Location, PublicKey, ReceiverInfo, Record, Region, Regions};
 
 /// `delivered` with each site that moves its receiver out of the public cell its description
@@ -119,7 +116,6 @@ const MLAT_BOOT: u64 = 0xb007;
 fn mlat_settings(threads: usize) -> tally_mlat::engine::Settings {
     tally_mlat::engine::Settings {
         regions: Regions::default(),
-        settle: tally_relay::mlat_host::SETTLE,
         threads,
         capacity: tally_mlat::engine::Capacity::default(),
     }
@@ -211,23 +207,21 @@ fn pause(seed: u64, n: u64, most: u64) -> Duration {
 }
 
 /// Delays injected inside the host (`HostedMlat::delaying`) and between the batches handed in:
-/// none, pseudorandom ones from a seed, or every window step that solves something held `held_ms`
-/// while the watermark runs up to `behind` steps past the last window step that reported.
+/// none, or pseudorandom ones from a seed.
 #[derive(Clone, Copy, Debug)]
 enum Delays {
     None,
     Seeded(u64),
-    Windows { held_ms: u64, behind: u64 },
 }
 
 /// What a staged relay on `threads` hosting MLAT for `areas` (on `settings`) signs from `arrivals`,
 /// on the real concurrent path: the descriptions handed in as `describing` says, then each step's
 /// batches (each stamped when it arrived) handed to the ingest workers and every worker ticked to
-/// the step, never waiting for them, only for the host to be within its limits of the next
-/// (`PROVISIONAL_BEHIND`, `WINDOW_STEPS_BEHIND`; a host further behind sheds, which a relay's real-time watermark gives it the seconds
-/// not to); meanwhile another thread asks the host with the products' watermark as the network
-/// task does, never waiting for it either. Only at the end is the host waited on, once. Its records, provisional ones apart from the rest, each encoded in order; its
-/// report; and the receivers whose raw it held.
+/// the step, never waiting for them, only for the host to have stepped the step before (a host
+/// further behind collapses the steps it passed, which a relay's real-time watermark gives it the
+/// second not to); meanwhile another thread asks the host with the products' watermark as the
+/// network task does, never waiting for it either. Only at the end is the host waited on, once.
+/// Its records, each encoded in order; its report; and the receivers it seated.
 fn mlat_run_with(
     arrivals: &[(u64, Record)],
     areas: &Regions,
@@ -248,19 +242,19 @@ fn mlat_run_with(
     Ok((run.signed, run.report, run.held))
 }
 
-/// An overloaded host's window steps: each declares it ran 600 ms against a budget of 200, so
-/// every judgment is overload, the same however fast the machine running the test is.
-const OVERLOADED: WindowClock = WindowClock::Declared {
+/// An overloaded host's steps: each declares it ran 600 ms against a budget of 200, so every
+/// judgment is overload, the same however fast the machine running the test is.
+const OVERLOADED: StepClock = StepClock::Declared {
     ran_ms: 600,
     budget_ms: 200,
 };
 
-/// What a run of `mlat_run_cuts` is given to cut by: what its window steps declare they ran
-/// against what budget (none: a host that keeps up, `WindowClock::KEEPING_UP`), and the cuts other
-/// relays published, offered before the first step.
+/// What a run of `mlat_run_cuts` is given to cut by: what its steps declare they ran against what
+/// budget (none: a host that keeps up, `StepClock::KEEPING_UP`), and the cuts other relays
+/// published, offered before the first step.
 #[derive(Clone, Debug, Default)]
 struct Cutting {
-    window_clock: Option<WindowClock>,
+    step_clock: Option<StepClock>,
     offered: Vec<Cut>,
     /// The relays' network: this relay's key and the one other relay holding its areas, and the
     /// records that relay addressed this one, handed to the duties as a link hands them
@@ -312,7 +306,7 @@ fn neighbouring(hub: &Hub, me: &Identity, other: &Identity, areas: &Regions, now
     Ok(())
 }
 
-/// A run's records, report, the receivers whose raw it held, and the cuts it decided.
+/// A run's records, report, the receivers it seated, and the cuts it decided.
 struct Run {
     signed: Signed,
     report: MlatReport,
@@ -351,7 +345,7 @@ fn mlat_run_cuts(
         tally_wire::Signer::new(Identity::from_seed([5; 32]), std::sync::Arc::new(|| true)),
         MLAT_BOOT,
         settings,
-        cutting.window_clock.unwrap_or(WindowClock::KEEPING_UP),
+        cutting.step_clock.unwrap_or(StepClock::KEEPING_UP),
     )?);
     match delays {
         Delays::Seeded(seed) => {
@@ -360,20 +354,12 @@ fn mlat_run_cuts(
                 let n = count.fetch_add(1, Ordering::Relaxed);
                 let most = match stage {
                     // An ingest worker held up on its way to the host (the message exchange
-                    // pushing back on `route`).
-                    Stage::Offer => 400,
-                    // Each address shard a provisional step reads, holding it: many a step.
-                    Stage::Reading => 200,
-                    _ => 30_000,
+                    // pushing back on `route`), and a description on its way to its step.
+                    Stage::Offer | Stage::Describe => 400,
+                    // A step, before the engine steps and before its records are published.
+                    Stage::Step | Stage::Publish => 30_000,
                 };
                 std::thread::sleep(pause(seed, n, most));
-            }));
-        }
-        Delays::Windows { held_ms, .. } => {
-            host.delaying(Arc::new(move |stage: Stage| {
-                if stage == Stage::Window {
-                    std::thread::sleep(Duration::from_millis(held_ms));
-                }
             }));
         }
         Delays::None => {}
@@ -432,7 +418,7 @@ fn mlat_run_cuts(
                 }
                 n += 1;
                 let most = match delays {
-                    Delays::None | Delays::Windows { .. } => 2_000,
+                    Delays::None => 2_000,
                     Delays::Seeded(seed) => 2_000 + pause(seed, n, 8_000).as_micros() as u64,
                 };
                 std::thread::sleep(Duration::from_micros(most));
@@ -440,28 +426,14 @@ fn mlat_run_cuts(
         });
         let mut next = 0;
         let mut step = (first / STEP_MS + 1) * STEP_MS;
-        // The host's tighter limit: its provisional steps' (`PROVISIONAL_BEHIND`, below
-        // `WINDOW_STEPS_BEHIND`). A step handed in once every part of the one this many steps before it
-        // has reported finds at most that many not started behind the one running, so nothing is
-        // shed.
-        let ahead = (PROVISIONAL_BEHIND as u64 + 1) * STEP_MS;
-        // Window steps may fall further behind when a test says so (`Delays::Windows`).
-        let windows_ahead = match delays {
-            Delays::Windows { behind, .. } => behind * STEP_MS,
-            _ => ahead,
-        };
         let base = first / STEP_MS * STEP_MS;
         let since = Instant::now();
         while step <= until {
-            // Within the host's limits (`PROVISIONAL_BEHIND` steps, the tighter, and
-            // `WINDOW_STEPS_BEHIND`), as a real-time watermark keeps it; and what it signed taken by the
-            // asker before the watermark moves on a step, as a real-time watermark moves a tenth
-            // of a step between the network task's asks (a provisional step's records taken past
-            // `PROVISIONAL_PUBLISH_MS` after it are late by the stamps, and refused).
-            while step > host.provisionals_stepped_ms().max(base) + ahead
-                || step > host.windows_stepped_ms().max(base) + windows_ahead
-                || host.untaken() > 0
-            {
+            // Within a step of the host, as a real-time watermark keeps it (a host a step behind
+            // collapses the steps it passed); and what it signed taken by the asker before the
+            // watermark moves on a step, as a real-time watermark moves a tenth of a step between
+            // the network task's asks.
+            while step > host.stepped_ms().max(base) + STEP_MS || host.untaken() > 0 {
                 if since.elapsed() > Duration::from_secs(300) {
                     return Err(format!(
                         "the hosted MLAT stepped to {}, {step} handed in",
@@ -576,15 +548,7 @@ fn mlat_run_cuts(
     })?;
     let mut published = published.into_inner().map_err(text)?;
     published.extend(host.take_signed());
-    // The receivers whose raw the engine held, by the sealed bins it kept.
-    let sealed = host.sealed_bins().ok_or("no sealed bins")?;
-    let mut held: Vec<PublicKey> = sealed
-        .bins(i64::MIN, i64::MAX)
-        .iter()
-        .flat_map(|bin| bin.receivers.clone())
-        .collect();
-    held.sort_unstable();
-    held.dedup();
+    let held = host.seated();
     let cuts = host.take_cuts();
     let mut sent = Vec::new();
     if cutting.network.is_some() {
@@ -610,41 +574,97 @@ fn mlat_run_cuts(
     })
 }
 
-/// Records as bytes, in order: provisional positions, and the rest.
-type Signed = (Vec<Vec<u8>>, Vec<Vec<u8>>);
+/// Records as bytes, in order.
+type Signed = Vec<Vec<u8>>;
 
-/// Each record's bytes, provisional positions apart from the rest, each in order.
+/// Each record's bytes, in order.
 fn encoded(records: &[Record]) -> Signed {
-    let mut provisional = Vec::new();
-    let mut rest = Vec::new();
-    for record in records {
-        let mut bytes = Vec::new();
-        if record.encode(&mut bytes).is_err() {
-            continue;
-        }
-        if matches!(record, Record::Provisional(_)) {
-            provisional.push(bytes);
-        } else {
-            rest.push(bytes);
-        }
-    }
-    (provisional, rest)
+    records
+        .iter()
+        .filter_map(|record| {
+            let mut bytes = Vec::new();
+            record.encode(&mut bytes).ok().map(|()| bytes)
+        })
+        .collect()
 }
 
-/// RFC-0181 §3, §4, §5 and invariants 1 to 3: the same stamped trace makes the same clock models,
-/// positions and provisional positions, byte for byte, on 1, 2 and 8 ingest workers and as many
-/// MLAT threads, with and without delays injected inside every stage of the host (an offer held up
-/// on its way, a provisional step, a seal and a window step each slowed by up to 30 ms) and between
-/// the batches, the host asked by the watermark on a thread of its own and never waited on step by
-/// step (only kept within its limits of it); and they are what the reference engine makes of
-/// the same raw on the same steps (`tally_mlat::replay`). Nothing is refused, shed or let go on the
-/// way.
+/// How many positions records `signed` holds.
+fn positions_in(signed: &Signed) -> usize {
+    signed
+        .iter()
+        .filter_map(|bytes| {
+            Record::decode(bytes, tally_wire::record::MAX_VERSION)
+                .ok()
+                .and_then(|(record, _)| record)
+        })
+        .filter(|record| matches!(record, Record::Positions(_)))
+        .count()
+}
+
+/// What the reference engine, driven in line on the same steps, signs of `delivered` for `areas`
+/// (`tally_mlat::replay`). The descriptions before the first batch come as the host had them
+/// (`describe_all`, before any raw): stamped before the step that takes the first batch, so the
+/// step before it takes them all.
+fn reference(delivered: &[(u64, Record)], areas: &Regions) -> Result<Signed> {
+    let until = delivered.last().map_or(0, |(at, _)| *at) + 60_000;
+    let first_batch = delivered
+        .iter()
+        .find(|(_, record)| matches!(record, Record::Batch(_)))
+        .map(|(at, _)| *at)
+        .ok_or("no raw")?;
+    let described = first_batch / STEP_MS * STEP_MS - 1;
+    let mut seen_batch = false;
+    let delivered: Vec<(u64, Record)> = delivered
+        .iter()
+        .map(|(at, record)| {
+            seen_batch |= matches!(record, Record::Batch(_));
+            (if seen_batch { *at } else { described }, record.clone())
+        })
+        .collect();
+    let mut engine = tally_mlat::engine::Engine::new(MLAT_BOOT, mlat_settings(2));
+    engine.set_scope(tally_mlat::area::border_band(areas), areas.clone());
+    let signer =
+        tally_wire::Signer::new(Identity::from_seed([5; 32]), std::sync::Arc::new(|| true));
+    let records: Vec<Record> = tally_mlat::replay::replay(&mut engine, &delivered, &signer, until)?
+        .iter()
+        .flat_map(|(_, step)| step.records())
+        .collect();
+    Ok(encoded(&records))
+}
+
+/// A simulation's raw as it arrives (`sim::arrived_records`), with the scenario.
+fn traced(seed: u64) -> Result<(tally_mlat_solver::sim::Simulation, Vec<(u64, Record)>)> {
+    let mut simulation = tally_mlat_solver::sim::run(&tally_mlat::replay::scenario(seed, 60.0));
+    let delivered = tally_mlat_solver::sim::arrived_records(&mut simulation, 3).map_err(text)?;
+    Ok((simulation, delivered))
+}
+
+/// What a host lets go that a host keeping up never does: refused or overflowed records, steps
+/// discarded, collapsed, unreserved or unsynced, ingest errors and descriptions dropped.
+fn let_go(report: &MlatReport) -> [u64; 8] {
+    [
+        report.refused,
+        report.overflowed,
+        report.steps_discarded,
+        report.steps_collapsed,
+        report.steps_unreserved,
+        report.steps_unsynced,
+        report.ingest_errors,
+        report.descriptions_dropped,
+    ]
+}
+
+/// RFC-0181 §3, §4, §5 and invariants 1 to 3: the same stamped trace makes the same clock models
+/// and positions, byte for byte, on 1, 2 and 8 ingest workers and as many MLAT threads, with and
+/// without delays injected inside every stage of the host (an offer or a description held up on
+/// its way, a step and its publishing each slowed by up to 30 ms) and between the batches, the
+/// host asked by the watermark on a thread of its own and never waited on step by step (only kept
+/// within a step of it); and they are what the reference engine makes of the same raw on the same
+/// steps (`tally_mlat::replay`). Nothing is refused, collapsed or let go on the way.
 #[test]
 fn hosted_mlat_makes_the_same_bytes_on_any_threads_with_any_delays_and_the_reference_engines()
 -> Result {
-    use tally_mlat::replay::{arrivals, replay, scenario};
-    let mut simulation = tally_mlat_solver::sim::run(&scenario(17, 60.0));
-    let delivered = arrivals(&mut simulation, 3)?;
+    let (_, delivered) = traced(17)?;
     let areas = mlat_areas()?;
     let run = |ingest: usize, message: usize, delays: Delays| -> Result<Signed> {
         let (signed, report, _) = mlat_run_with(
@@ -660,31 +680,14 @@ fn hosted_mlat_makes_the_same_bytes_on_any_threads_with_any_delays_and_the_refer
             delays,
         )?;
         assert_eq!(
-            (
-                report.refused,
-                report.overflowed,
-                report.steps_discarded,
-                report.ingest_errors,
-                report.steps_shed,
-                report.provisional_steps_shed,
-                report.shed,
-                report.provisional_models_late,
-                report.waiting_dropped
-            ),
-            (0, 0, 0, 0, 0, 0, 0, 0, 0),
+            let_go(&report),
+            [0; 8],
             "{ingest} threads, {delays:?}: {report:?}"
         );
         Ok(signed)
     };
     let one = run(1, 1, Delays::None)?;
-    assert!(!one.0.is_empty(), "no provisional positions");
-    let positions = one
-        .1
-        .iter()
-        .filter_map(|bytes| Record::decode(bytes).ok().and_then(|(record, _)| record))
-        .filter(|record| matches!(record, Record::Positions(_)))
-        .count();
-    assert!(positions > 0, "no positions");
+    assert!(positions_in(&one) > 0, "no positions");
     for (ingest, message, delays) in [
         (2, 2, Delays::None),
         (8, 8, Delays::None),
@@ -695,33 +698,15 @@ fn hosted_mlat_makes_the_same_bytes_on_any_threads_with_any_delays_and_the_refer
     ] {
         let many = run(ingest, message, delays)?;
         assert_eq!(
-            one.1, many.1,
+            one, many,
             "{ingest} ingest threads, {delays:?}: models and positions differ"
         );
-        assert_eq!(
-            one.0, many.0,
-            "{ingest} ingest threads, {delays:?}: provisionals differ"
-        );
     }
-    let first = delivered.first().map(|(at, _)| *at).ok_or("no raw")?;
-    let until = delivered.last().map_or(0, |(at, _)| *at) + 60_000;
-    let mut engine = tally_mlat::engine::Engine::new(
-        tally_wire::Signer::new(Identity::from_seed([5; 32]), std::sync::Arc::new(|| true)),
-        MLAT_BOOT,
-        mlat_settings(2),
-    );
-    engine.set_scope(tally_mlat::area::border_band(&areas), areas.clone());
-    let reference: Vec<Record> = replay(&mut engine, &delivered, STEP_MS, until)?
-        .into_iter()
-        .filter(|(at, _)| *at >= first)
-        .map(|(_, record)| record)
-        .collect();
-    let reference = encoded(&reference);
     assert_eq!(
-        one.1, reference.1,
+        one,
+        reference(&delivered, &areas)?,
         "models and positions differ from the reference"
     );
-    assert_eq!(one.0, reference.0, "provisionals differ from the reference");
     Ok(())
 }
 
@@ -733,9 +718,7 @@ fn hosted_mlat_makes_the_same_bytes_on_any_threads_with_any_delays_and_the_refer
 /// refused and counted, and the same records signed byte for byte.
 #[test]
 fn at_capacity_the_same_receivers_are_refused_whatever_the_order_and_the_threads() -> Result {
-    use tally_mlat::replay::{arrivals, scenario};
-    let mut simulation = tally_mlat_solver::sim::run(&scenario(17, 60.0));
-    let delivered = arrivals(&mut simulation, 3)?;
+    let (_, delivered) = traced(17)?;
     let areas = mlat_areas()?;
     let mut keys: Vec<PublicKey> = delivered
         .iter()
@@ -756,7 +739,7 @@ fn at_capacity_the_same_receivers_are_refused_whatever_the_order_and_the_threads
     let settings = |threads: usize| tally_mlat::engine::Settings {
         capacity: tally_mlat::engine::Capacity {
             receivers: seats,
-            rates: tally_mlat_solver::held::Rates::MEASURED,
+            ..tally_mlat::engine::Capacity::default()
         },
         ..mlat_settings(threads)
     };
@@ -787,24 +770,18 @@ fn at_capacity_the_same_receivers_are_refused_whatever_the_order_and_the_threads
             "{ingest} threads, {describing:?}, {delays:?}: {report:?}"
         );
         assert_eq!(
-            (
-                report.steps_shed,
-                report.provisional_steps_shed,
-                report.shed,
-                report.provisional_models_late,
-                report.waiting_dropped
-            ),
-            (0, 0, 0, 0, 0),
+            let_go(&report),
+            [0; 8],
             "{ingest} threads, {describing:?}, {delays:?}: {report:?}"
         );
         assert_eq!(
             held, seated,
-            "{ingest} threads, {describing:?}, {delays:?}: other receivers held"
+            "{ingest} threads, {describing:?}, {delays:?}: other receivers seated"
         );
         runs.push((ingest, describing, delays, signed));
     }
     let (_, _, _, first) = &runs[0];
-    assert!(!first.0.is_empty(), "no provisional positions");
+    assert!(positions_in(first) > 0, "no positions");
     for (ingest, describing, delays, signed) in &runs[1..] {
         assert_eq!(
             first, signed,
@@ -814,20 +791,21 @@ fn at_capacity_the_same_receivers_are_refused_whatever_the_order_and_the_threads
     Ok(())
 }
 
-/// RFC-0181 §4 and invariant 2 for descriptions: a receiver described again
-/// midway (out of the areas, so it stops taking part, and back ten seconds later) and one whose
-/// first description comes halfway in (its batches before it waiting, those that waited too long
-/// let go), each description stamped when it came and taking effect at the step after, make the
-/// same clock models, positions and provisional positions on 1, 2 and 8 ingest workers, with
-/// delays inside every stage of the host and between the batches, as the reference engine driven
-/// in line makes of them (`tally_mlat::replay`); and other bytes than the same trace with no
-/// change.
+/// RFC-0181 §4 and invariant 2 for descriptions: a receiver described again midway (out of the
+/// areas, so it stops taking part, and back ten seconds later; its batches meanwhile not used,
+/// counted) and one whose first description comes halfway in (its batches before it held until
+/// it comes, `tally_mlat::intake`), each description stamped when it
+/// came and taking effect at the step after, make the same clock models and positions on 1, 2 and
+/// 8 ingest workers, with delays inside every stage of the host and between the batches, as the
+/// reference engine driven in line makes of them (`tally_mlat::replay`); and other bytes than the
+/// same trace with no change.
 #[test]
 fn descriptions_midway_make_the_same_bytes_with_any_delays_and_the_reference_engines() -> Result {
-    use tally_mlat::replay::{arrivals, described_midway, replay, scenario};
-    let mut simulation = tally_mlat_solver::sim::run(&scenario(17, 60.0));
-    let plain = arrivals(&mut simulation, 3)?;
-    let delivered = reissued(&simulation, &described_midway(&simulation, &plain)?)?;
+    let (simulation, plain) = traced(17)?;
+    let delivered = reissued(
+        &simulation,
+        &tally_mlat::replay::described_midway(&simulation, &plain)?,
+    )?;
     let areas = mlat_areas()?;
     let run = |delivered: &[(u64, Record)], ingest: usize, delays: Delays| -> Result<Signed> {
         let (signed, report, _) = mlat_run_with(
@@ -843,18 +821,11 @@ fn descriptions_midway_make_the_same_bytes_with_any_delays_and_the_reference_eng
             delays,
         )?;
         assert_eq!(
-            (
-                report.steps_shed,
-                report.provisional_steps_shed,
-                report.shed,
-                report.steps_discarded,
-                report.provisional_models_late,
-                report.waiting_dropped
-            ),
-            (0, 0, 0, 0, 0, 0),
+            let_go(&report),
+            [0; 8],
             "{ingest} threads, {delays:?}: {report:?}"
         );
-        assert!(report.orphans_expired > 0, "{report:?}");
+        assert!(report.unused > 0, "{report:?}");
         Ok(signed)
     };
     let one = run(&delivered, 1, Delays::None)?;
@@ -864,28 +835,16 @@ fn descriptions_midway_make_the_same_bytes_with_any_delays_and_the_reference_eng
         (8, Delays::None),
     ] {
         let many = run(&delivered, ingest, delays)?;
-        assert_eq!(one.1, many.1, "{ingest} threads, {delays:?}: models differ");
         assert_eq!(
-            one.0, many.0,
-            "{ingest} threads, {delays:?}: provisionals differ"
+            one, many,
+            "{ingest} threads, {delays:?}: the records differ"
         );
     }
-    let first = delivered.first().map(|(at, _)| *at).ok_or("no raw")?;
-    let until = delivered.last().map_or(0, |(at, _)| *at) + 60_000;
-    let mut engine = tally_mlat::engine::Engine::new(
-        tally_wire::Signer::new(Identity::from_seed([5; 32]), std::sync::Arc::new(|| true)),
-        MLAT_BOOT,
-        mlat_settings(2),
+    assert_eq!(
+        one,
+        reference(&delivered, &areas)?,
+        "the records differ from the reference"
     );
-    engine.set_scope(tally_mlat::area::border_band(&areas), areas.clone());
-    let reference: Vec<Record> = replay(&mut engine, &delivered, STEP_MS, until)?
-        .into_iter()
-        .filter(|(at, _)| *at >= first)
-        .map(|(_, record)| record)
-        .collect();
-    let reference = encoded(&reference);
-    assert_eq!(one.1, reference.1, "models differ from the reference");
-    assert_eq!(one.0, reference.0, "provisionals differ from the reference");
     let unchanged = mlat_run_with(
         &plain,
         &areas,
@@ -898,86 +857,7 @@ fn descriptions_midway_make_the_same_bytes_with_any_delays_and_the_reference_eng
         Describing::Before { reversed: false },
         Delays::None,
     )?;
-    assert_ne!(
-        one.1, unchanged.0.1,
-        "the descriptions midway changed nothing"
-    );
-    Ok(())
-}
-
-/// A window step that runs long, past the old ripening and past as many steps
-/// as `WINDOW_STEPS_BEHIND` (which sheds none: a window step is queued only at a step a window falls due
-/// at; before, every step it ran past queued as one, and those past the limit were
-/// shed), changes no provisional byte: a provisional step carries exactly the models of the window steps
-/// `MODELS_RIPEN_MS` before it, by their stamp, and the ripening covers a window step on the
-/// planned threads (measured 9 to 11 s: here every window step that solves is held while the
-/// watermark runs ten steps past it). Before, a provisional step five seconds after a window step
-/// still running started without its models and adopted them at whichever step came after they
-/// reported, so the provisional bytes were the thread timing's. They are the reference engine's,
-/// and no provisional step is shed or started late.
-#[test]
-fn a_window_step_that_runs_long_changes_no_provisional_byte() -> Result {
-    use tally_mlat::replay::{arrivals, replay, scenario};
-    let mut simulation = tally_mlat_solver::sim::run(&scenario(17, 60.0));
-    let delivered = arrivals(&mut simulation, 3)?;
-    let areas = mlat_areas()?;
-    const BEHIND: u64 = 10;
-    const {
-        assert!(BEHIND * STEP_MS > (WINDOW_STEPS_BEHIND as u64 + 1) * STEP_MS);
-        assert!(BEHIND * STEP_MS <= tally_mlat::engine::MODELS_RIPEN_MS);
-    }
-    let (signed, report, _) = mlat_run_with(
-        &delivered,
-        &areas,
-        Threads {
-            ingest: 2,
-            message: 2,
-            seal: 2,
-        },
-        mlat_settings(2),
-        Describing::Before { reversed: false },
-        Delays::Windows {
-            held_ms: 1_500,
-            behind: BEHIND,
-        },
-    )?;
-    // The steps it ran past were sealed in their turn, and none was shed.
-    assert_eq!(
-        (
-            report.steps_shed,
-            report.provisional_steps_shed,
-            report.provisional_models_late,
-            report.provisional_steps_late,
-            report.shed,
-            report.steps_discarded,
-            report.waiting_dropped
-        ),
-        (0, 0, 0, 0, 0, 0, 0),
-        "{report:?}"
-    );
-    assert!(!signed.0.is_empty(), "no provisional positions");
-    let first = delivered.first().map(|(at, _)| *at).ok_or("no raw")?;
-    let until = delivered.last().map_or(0, |(at, _)| *at) + 60_000;
-    let mut engine = tally_mlat::engine::Engine::new(
-        tally_wire::Signer::new(Identity::from_seed([5; 32]), std::sync::Arc::new(|| true)),
-        MLAT_BOOT,
-        mlat_settings(2),
-    );
-    engine.set_scope(tally_mlat::area::border_band(&areas), areas.clone());
-    let reference: Vec<Record> = replay(&mut engine, &delivered, STEP_MS, until)?
-        .into_iter()
-        .filter(|(at, _)| *at >= first)
-        .map(|(_, record)| record)
-        .collect();
-    let reference = encoded(&reference);
-    assert_eq!(
-        signed.0, reference.0,
-        "provisionals differ from the reference"
-    );
-    assert_eq!(
-        signed.1, reference.1,
-        "models and positions differ from the reference"
-    );
+    assert_ne!(one, unchanged.0, "the descriptions midway changed nothing");
     Ok(())
 }
 
@@ -990,9 +870,7 @@ type CutTrace = (
 );
 
 fn cut_trace() -> Result<CutTrace> {
-    use tally_mlat::replay::{arrivals, scenario};
-    let mut simulation = tally_mlat_solver::sim::run(&scenario(17, 60.0));
-    let delivered = arrivals(&mut simulation, 3)?;
+    let (_, delivered) = traced(17)?;
     let areas = mlat_areas()?;
     let receivers = delivered
         .iter()
@@ -1001,7 +879,7 @@ fn cut_trace() -> Result<CutTrace> {
     let settings = tally_mlat::engine::Settings {
         capacity: tally_mlat::engine::Capacity {
             receivers: receivers + 2,
-            rates: tally_mlat_solver::held::Rates::MEASURED,
+            ..tally_mlat::engine::Capacity::default()
         },
         ..mlat_settings(2)
     };
@@ -1082,7 +960,7 @@ fn two_relays_offered_one_cut_solve_the_same_receivers_and_make_the_same_bytes()
             describing,
             delays,
             Cutting {
-                window_clock: None,
+                step_clock: None,
                 offered,
                 network: None,
             },
@@ -1121,12 +999,8 @@ fn two_relays_offered_one_cut_solve_the_same_receivers_and_make_the_same_bytes()
         );
         assert_eq!(relay.report.receivers_refused, CUT as u64, "{name}");
         assert_eq!(
-            (
-                relay.report.steps_shed,
-                relay.report.provisional_steps_shed,
-                relay.report.cuts_late
-            ),
-            (0, 0, 0),
+            (let_go(&relay.report), relay.report.cuts_late),
+            ([0; 8], 0),
             "{name}: {:?}",
             relay.report
         );
@@ -1138,15 +1012,15 @@ fn two_relays_offered_one_cut_solve_the_same_receivers_and_make_the_same_bytes()
     }
     assert_eq!(uncut.report.seat_cap, (receivers + 2) as u64);
     assert_eq!(uncut.report.receivers_refused, 0);
-    assert!(!relay_a.signed.0.is_empty(), "no provisional positions");
+    assert!(positions_in(&relay_a.signed) > 0, "no positions");
     assert_eq!(relay_a.signed, relay_b.signed, "relays a and b differ");
     assert_eq!(relay_a.signed, relay_c.signed, "relays a and c differ");
     assert_ne!(relay_a.signed, uncut.signed, "the cut changed nothing");
     Ok(())
 }
 
-/// RFC-0181 §10, overload: a host whose window step runs past its budget cuts its seats to what
-/// that run carries within the budget, from a step a few ahead of its watermark, published for its
+/// RFC-0181 §10, overload: a host whose step runs past its budget cuts its seats to what that run
+/// carries within the budget, from a step a few ahead of its watermark, published for its
 /// peers (`take_cuts`); and a peer that is offered that cut makes the same bytes as the host did,
 /// receiver for receiver, though it never ran long. Before, the host shed the steps it was behind
 /// on, by how far behind it was, and no peer could shed the same.
@@ -1158,20 +1032,16 @@ fn an_overloaded_host_cuts_by_rank_and_a_peer_offered_the_cut_makes_the_same_byt
         message: 2,
         seal: 2,
     };
-    // Every window step is held 600 ms, and declares it ran that long against a budget of 200:
-    // overload at the first.
+    // Every step declares it ran 600 ms against a budget of 200: overload at the first.
     let overloaded = mlat_run_cuts(
         &delivered,
         &areas,
         threads,
         settings.clone(),
         Describing::Before { reversed: false },
-        Delays::Windows {
-            held_ms: 600,
-            behind: 10,
-        },
+        Delays::None,
         Cutting {
-            window_clock: Some(OVERLOADED),
+            step_clock: Some(OVERLOADED),
             offered: Vec::new(),
             network: None,
         },
@@ -1207,14 +1077,10 @@ fn an_overloaded_host_cuts_by_rank_and_a_peer_offered_the_cut_makes_the_same_byt
         })
     });
     assert!(refreshed, "no refresh: {:?}", overloaded.cuts);
-    // Nothing was shed by lateness: the cut came before it was needed.
+    // Nothing was let go: the cut came before it was needed.
     assert_eq!(
-        (
-            overloaded.report.steps_shed,
-            overloaded.report.provisional_steps_shed,
-            overloaded.report.provisional_models_late,
-        ),
-        (0, 0, 0),
+        let_go(&overloaded.report),
+        [0; 8],
         "{:?}",
         overloaded.report
     );
@@ -1231,7 +1097,7 @@ fn an_overloaded_host_cuts_by_rank_and_a_peer_offered_the_cut_makes_the_same_byt
         Describing::Before { reversed: true },
         Delays::Seeded(7),
         Cutting {
-            window_clock: None,
+            step_clock: None,
             offered: overloaded.cuts.clone(),
             network: None,
         },
@@ -1279,12 +1145,9 @@ fn an_overloaded_relays_cut_reaches_the_relay_holding_its_area_and_both_make_the
         threads,
         settings.clone(),
         Describing::Before { reversed: false },
-        Delays::Windows {
-            held_ms: 600,
-            behind: 10,
-        },
+        Delays::None,
         Cutting {
-            window_clock: Some(OVERLOADED),
+            step_clock: Some(OVERLOADED),
             offered: Vec::new(),
             network: Some(Neighbours {
                 me: relay_a.clone(),
@@ -1312,7 +1175,10 @@ fn an_overloaded_relays_cut_reaches_the_relay_holding_its_area_and_both_make_the
         let mut bytes = Vec::new();
         record.encode(&mut bytes).map_err(text)?;
         assert_eq!(
-            Record::decode(&bytes).map_err(text)?.0.as_ref(),
+            Record::decode(&bytes, tally_wire::record::MAX_VERSION)
+                .map_err(text)?
+                .0
+                .as_ref(),
             Some(record)
         );
     }
@@ -1329,7 +1195,7 @@ fn an_overloaded_relays_cut_reaches_the_relay_holding_its_area_and_both_make_the
             Describing::Before { reversed: true },
             delays,
             Cutting {
-                window_clock: None,
+                step_clock: None,
                 offered: Vec::new(),
                 network: Some(Neighbours {
                     me: relay_b.clone(),

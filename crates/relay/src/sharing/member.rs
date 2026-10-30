@@ -71,7 +71,7 @@ use std::sync::Arc;
 use tally_wire::Signs;
 use tally_wire::batch::Hash;
 use tally_wire::clocks::{Judged, Mono, Span};
-use tally_wire::record::{KIND_BATCH, KIND_RELAY_BATCH};
+use tally_wire::record::{KIND_BATCH, KIND_RELAY_BATCH, MAX_VERSION};
 use tally_wire::sharing::{MAX_HAVE_SECONDS, MAX_PIECES, receipt_digest};
 use tally_wire::{
     Batch, Bytes, Check, HaveSummary, ParityChunk, PieceManifest, PieceManifestContent, PublicKey,
@@ -276,7 +276,7 @@ impl Piece {
     /// slice of the record's allocation, which the batch is charged for whole (its header too,
     /// `Batch::from_shared`). `None` for bytes that are not one record.
     pub fn from_encoded(bytes: Vec<u8>) -> Option<Self> {
-        let (_, used) = Record::decode(&bytes).ok()?;
+        let (_, used) = Record::decode(&bytes, MAX_VERSION).ok()?;
         if used != bytes.len() || bytes.len() < HEADER_LEN {
             return None;
         }
@@ -299,7 +299,7 @@ impl Piece {
         match self {
             Self::Batch(batch) => Some(Record::Batch(Batch::clone(batch))),
             Self::RelayBatch(batch) => Some(Record::RelayBatch(Batch::clone(batch))),
-            Self::Encoded(bytes) => Record::decode(bytes).ok()?.0,
+            Self::Encoded(bytes) => Record::decode(bytes, MAX_VERSION).ok()?.0,
         }
     }
 
@@ -416,7 +416,7 @@ impl Message {
 /// The identity of a record a group carries: what its manifests list. `None` for a kind no group
 /// carries or bytes that are not one record.
 pub fn piece_hash(bytes: &[u8]) -> Option<Hash> {
-    let (record, used) = Record::decode(bytes).ok()?;
+    let (record, used) = Record::decode(bytes, MAX_VERSION).ok()?;
     if used != bytes.len() {
         return None;
     }
@@ -427,7 +427,7 @@ pub fn piece_hash(bytes: &[u8]) -> Option<Hash> {
 pub fn record_hash(record: &Record) -> Option<Hash> {
     match record {
         Record::Batch(batch) | Record::RelayBatch(batch) => Some(batch.hash()),
-        Record::Positions(positions) | Record::Provisional(positions) => Some(positions.hash()),
+        Record::Positions(positions) => Some(positions.hash()),
         Record::ClockModel(model) => Some(model.id()),
         Record::ClockModelPart(part) => Some(part.hash()),
         Record::RegionalBatch(regional) => Some(regional.hash()),

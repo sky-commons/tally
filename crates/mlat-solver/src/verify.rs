@@ -1,17 +1,18 @@
-//! Checking a claimed solution against the raw observations and the clock model it cites (crate
-//! docs, § Verifying): regroup, rescreen, residuals and chi-square, optimality, covariance, and
-//! the outlier rule's fixed point. No search, no iteration: one evaluation of the residuals and
-//! one Gauss-Newton step's worth of algebra. And checking the clock model itself against the raw
-//! it cites (§ Verifying a model).
+//! Checking a pair model against the raw it cites, rebuilt from what has arrived (crate docs,
+//! § The pairwise path, verifying a model), and a fix against the verified model it cites and the
+//! receptions it considered (§ The pairwise path, verifying a fix): its cited models, regroup,
+//! normalisation, rescreen, residuals and chi-square, optimality, covariance, and the outlier
+//! rule's fixed point over what it considered. No search, no iteration: one evaluation of the
+//! residuals and one Gauss-Newton step's worth of algebra.
 
 use std::collections::BTreeSet;
 
-use crate::clock::{PS, Reach, SPEC_VERSION};
+use crate::arrived::{Arrived, BatchId};
+use crate::clock::{PS, SPEC_VERSION};
 use crate::geo::{self, C};
-use crate::group;
 use crate::obs::{ObservationId, Reception};
+use crate::scope::{Inputs, Sites};
 use crate::solve::{OUTLIER_Z, Problem, Solution, published_chi2_limit, rounding_norm};
-use crate::sync::Calibrated;
 
 /// How far a claim may sit from the optimum: the squared Mahalanobis length of the Gauss-Newton
 /// step from it (a tenth of a standard deviation in every direction would be 0.01).
@@ -27,12 +28,14 @@ pub const OUTLIER_BAND: f64 = 0.05;
 pub enum Failure {
     /// The claim names another specification version.
     Spec(u16),
-    /// The cited observations are not sorted and distinct.
+    /// Its position or transmit time cannot be read back (no altitude, out of range).
+    Unreadable,
+    /// The considered or used observations are not sorted and distinct.
     Unsorted,
-    /// A cited observation is not among the candidates.
+    /// A considered observation is not among the receptions the verifier holds.
     Unknown(ObservationId),
-    /// The cited observations are not exactly within one transmission of the regrouped
-    /// candidates.
+    /// The considered observations the model maps are not exactly one transmission of their
+    /// regrouping.
     NotOneTransmission,
     /// Fewer than the minimum observations are cited.
     TooFew(usize),
@@ -48,19 +51,26 @@ pub enum Failure {
     NotOptimal { distance: f64 },
     /// The claimed covariance is not the one the observations and clock model imply.
     Covariance { relative: f64 },
-    /// A cited observation is an outlier by the rule.
+    /// A used observation is an outlier by the rule.
     Outlier { id: ObservationId, z: f64 },
-    /// An omitted observation is not an outlier by the rule.
+    /// A considered observation it did not use is not an outlier by the rule. Judged only inside
+    /// the considered set: a reception that had not arrived when the fix was solved is never one.
     Omitted { id: ObservationId, z: f64 },
     /// The timing covariance or the information matrix is not positive definite.
     Singular,
-    /// The solution's addressed citation is not the verifier's raw's, so it cannot recompute the
-    /// tile.
-    Addressed,
-    /// The model it cites is not of the tile the assignment rule gives the aircraft.
-    Tile,
-    /// A used observation is not among the solution's considered set.
+    /// The models it cites are not one of each area its used hearers are in, and no other (crate
+    /// docs, § Areas, the models a fix cites): one is missing, or one is extra.
+    Area,
+    /// The models it was verified under are not the ones it lists (`tally_wire::Fix::models`).
+    Models,
+    /// A used observation is not among the fix's considered set.
     NotConsidered { id: ObservationId },
+    /// A used observation is not of a receiver the cap chooses of its considered set
+    /// (`pair::Models::capped`).
+    Uncapped { id: ObservationId },
+    /// The pair models it cites cannot put its transmission on one timeline (`pair::Models::
+    /// normalise`), or leave out a reception it used.
+    Unnormalised(&'static str),
 }
 
 /// The verifier's answer: pass when there is no failure.
@@ -86,108 +96,21 @@ impl Verdict {
 /// clock and rejects a sync message any receiver heard twice; version 4 did neither), so the same
 /// raw gives each version a different model, and this build implements its own alone: a model or
 /// claim of another version is unjudged, never failed, so a fleet part-way through an upgrade
-/// convicts nobody for the version it runs. The wire's tolerance (`tally_wire::Tolerance::for_spec`)
-/// knows every version, so fault proofs of any are still judged.
+/// convicts nobody for the version it runs. The wire's tolerance
+/// (`tally_wire::Tolerance::for_spec`) knows every version, so fault proofs of any are still
+/// judged.
 pub fn judges(spec: u16) -> bool {
     spec == SPEC_VERSION
 }
 
-/// Verifies `claim` against `candidates` (every reception the verifier holds of the claimed
-/// message, cited or not) under `model`.
-pub fn verify(calibrated: &Calibrated, candidates: &[Reception], claim: &Solution) -> Verdict {
-    verify_reach(calibrated, candidates, claim, Reach::Window)
-}
-
-/// As `verify`, the receptions mapped at `reach`: a provisional solution is verified with the
-/// model carried (`Reach::Carried`), against the receptions it was solved from, which are all the
-/// engine held when it solved (crate docs, § Provisional solutions).
-pub fn verify_reach(
-    calibrated: &Calibrated,
-    candidates: &[Reception],
-    claim: &Solution,
-    reach: Reach,
-) -> Verdict {
-    let model = &calibrated.model;
-    let mut failures = Vec::new();
-    if !judges(claim.spec) {
-        failures.push(Failure::Spec(claim.spec));
-        return Verdict { failures };
-    }
-    if claim.observations.windows(2).any(|pair| pair[0] >= pair[1]) {
-        failures.push(Failure::Unsorted);
-        return Verdict { failures };
-    }
-    let known: BTreeSet<ObservationId> = candidates.iter().map(Reception::id).collect();
-    for id in &claim.observations {
-        if !known.contains(id) {
-            failures.push(Failure::Unknown(*id));
-        }
-    }
-    if !failures.is_empty() {
-        return Verdict { failures };
-    }
-    let grouping = group::group_reach(model, candidates, reach);
-    let cited: BTreeSet<ObservationId> = claim.observations.iter().copied().collect();
-    let Some(transmission) = grouping.transmissions.iter().find(|transmission| {
-        transmission
-            .receptions
-            .iter()
-            .any(|timed| cited.contains(&timed.id))
-    }) else {
-        failures.push(Failure::NotOneTransmission);
-        return Verdict { failures };
-    };
-    verify_in(calibrated, transmission, &cited, claim, failures)
-}
-
-/// As `verify_reach`, for the publisher that grouped the candidates itself (with `group_reach`,
-/// the same function over the same receptions) and solved `transmission`, the group its claim
-/// cites: the regrouping, which would find this very transmission, is not done twice. Every other
-/// check is the verifier's own.
-pub fn verify_grouped(
-    calibrated: &Calibrated,
-    transmission: &group::Transmission,
-    claim: &Solution,
-) -> Verdict {
-    let mut failures = Vec::new();
-    if !judges(claim.spec) {
-        failures.push(Failure::Spec(claim.spec));
-        return Verdict { failures };
-    }
-    if claim.observations.windows(2).any(|pair| pair[0] >= pair[1]) {
-        failures.push(Failure::Unsorted);
-        return Verdict { failures };
-    }
-    let cited: BTreeSet<ObservationId> = claim.observations.iter().copied().collect();
-    for id in &cited {
-        if !transmission.receptions.iter().any(|timed| timed.id == *id) {
-            failures.push(Failure::Unknown(*id));
-        }
-    }
-    if !failures.is_empty() {
-        return Verdict { failures };
-    }
-    verify_in(calibrated, transmission, &cited, claim, failures)
-}
-
-/// The checks of a claim within the one transmission it cites.
-fn verify_in(
-    calibrated: &Calibrated,
-    transmission: &group::Transmission,
+/// The checks of a claim against the problem its transmission is (its timing covariance the
+/// pairwise adjustment's, `pair::Models::normalise`): `cited` its used receptions.
+fn check_problem(
+    problem: &Problem,
     cited: &BTreeSet<ObservationId>,
     claim: &Solution,
     mut failures: Vec<Failure>,
 ) -> Verdict {
-    let in_group = transmission
-        .receptions
-        .iter()
-        .filter(|timed| cited.contains(&timed.id))
-        .count();
-    if in_group != cited.len() {
-        failures.push(Failure::NotOneTransmission);
-        return Verdict { failures };
-    }
-    let problem = Problem::new(calibrated, transmission);
     if problem.clock_m2.is_none() {
         failures.push(Failure::Singular);
         return Verdict { failures };
@@ -279,174 +202,254 @@ fn verify_in(
     Verdict { failures }
 }
 
-/// How far a model's estimate may sit from its optimum: the squared Mahalanobis length of the
-/// Gauss-Newton step from it.
-pub const MODEL_OPTIMALITY_TOLERANCE: f64 = 1e-4;
-/// The band either side of `JUMP_THRESHOLD` within which the verifier accepts either decision.
-pub const JUMP_BAND: f64 = 0.05;
 /// How far, relative, a published noise may sit below the rule's estimate at the published
 /// estimate (the rule was last applied a few steps before the end); above it is conservative and
 /// never refused.
 pub const NOISE_BAND: f64 = 0.25;
 
-/// One reason a model fails.
+/// One reason a pair model fails (crate docs, § The pairwise path, verifying a model).
 #[derive(Clone, Debug, PartialEq)]
-pub enum ModelFailure {
-    /// The model names another specification version.
+pub enum PairModelFailure {
+    /// It names another specification version.
     Spec(u16),
-    /// Its tile, window or members are not what the raw gives.
+    /// Its scope is not its area's members by the verifier's own site records.
     Scope,
-    /// Its input citation is not the raw's.
-    Citation,
-    /// Its clocks, gauge, knots, sites or origin are not what the rules derive.
-    Shape(&'static str),
-    /// Its normal equations cannot be formed or factored at its estimate.
-    Singular,
-    /// Its estimate is not the optimum of its own inputs under its own weights.
-    NotOptimal { distance: f64 },
-    /// A clock's noise is further below the rule's at the estimate than the band allows.
-    Noise {
-        piece: usize,
-        published: i64,
-        estimated: i64,
-    },
-    /// A clock's residuals step by more than the jump threshold where no jump is declared.
-    Jump { score: f64 },
-    /// The verifier lacks batches at or below a cited frontier: neither passed nor failed.
-    Unjudged {
-        missing: Vec<crate::arrived::BatchId>,
-    },
     /// Its frontiers are not one contiguous run a member's boot, or name no member.
     Frontier,
+    /// The verifier lacks batches at or below a cited frontier: neither passed nor failed.
+    Unjudged { missing: Vec<BatchId> },
+    /// Its area, trailing window, scope, frontier or input citation is not the window's.
+    Inputs,
+    /// Its clocks or pairs are not strictly ascending, or a pair names no clock of it.
+    Unordered,
+    /// A clock it publishes is not the window's, or its lowest count is not.
+    Clock(crate::clock::ClockKey),
+    /// A published pair is not its points' fit under the published noise and rates.
+    Pair {
+        a: crate::clock::ClockKey,
+        b: crate::clock::ClockKey,
+        why: &'static str,
+    },
+    /// The pooled inflation is not its pairs'.
+    Kappa,
+    /// A clock's noise is more than `NOISE_BAND` below the rule's estimate from the published
+    /// pairs.
+    Noise(crate::clock::ClockKey),
+    /// The rates are not an optimum of their system within `pair::RATE_OPTIMALITY_TOLERANCE`.
+    Rates { distance: f64 },
+    /// A clock's rate variances are not its system's.
+    RateVariance(crate::clock::ClockKey),
+    /// A pair the rule finds valid is not published, or one it refuses is.
+    Dropped {
+        a: crate::clock::ClockKey,
+        b: crate::clock::ClockKey,
+    },
+    /// A clock's kept segment does not start where the jump rule puts it.
+    Jump(crate::clock::ClockKey),
 }
 
-/// The model verifier's answer: pass when there is no failure.
+/// The pair model verifier's answer: pass when there is no failure.
 #[derive(Clone, Debug, Default, PartialEq)]
-pub struct ModelVerdict {
-    pub failures: Vec<ModelFailure>,
+pub struct PairModelVerdict {
+    pub failures: Vec<PairModelFailure>,
 }
 
-impl ModelVerdict {
+impl PairModelVerdict {
     pub fn passed(&self) -> bool {
         self.failures.is_empty()
     }
 
-    /// False when the model names a specification version this verifier does not implement
-    /// (`judges`), or cites batches it lacks (`ModelFailure::Unjudged`): neither passed nor
-    /// failed, and nothing else was checked.
+    /// False when the model names a specification version this verifier does not implement, or
+    /// cites batches it lacks.
     pub fn judged(&self) -> bool {
         !matches!(
             self.failures.as_slice(),
-            [ModelFailure::Spec(_) | ModelFailure::Unjudged { .. }]
+            [PairModelFailure::Spec(_) | PairModelFailure::Unjudged { .. }]
         )
     }
 }
 
-/// Verifies a published model against `inputs`, rebuilt by the verifier from its own raw for the
-/// model's tile and window (crate docs, § Verifying a model). Returns the calibration too, which
-/// solving and verifying solutions under the model need, when the model passes.
-pub fn verify_model(
-    model: &crate::ClockModel,
-    inputs: &crate::scope::Inputs,
-) -> (ModelVerdict, Option<Calibrated>) {
-    let mut failures = Vec::new();
+/// Verifies a published pair model against the raw it cites, rebuilt from what has arrived at the
+/// verifier (`Arrived::rebuild`): its scope must be its area's members by the verifier's own
+/// `sites` (`Sites::members`), and its inputs what the batches at or below its frontiers hold.
+/// `PairModelFailure::Unjudged` when a cited batch has not arrived, never a failure. `cache` is
+/// the area's (`pair::PairCache`, one per area the verifier checks models of).
+pub fn verify_pair_model_held(
+    sites: &Sites,
+    model: &crate::pair::PairModel,
+    arrived: &Arrived,
+    cache: &mut crate::pair::PairCache,
+) -> PairModelVerdict {
+    let refused = |failure| PairModelVerdict {
+        failures: vec![failure],
+    };
     if !judges(model.spec) {
-        failures.push(ModelFailure::Spec(model.spec));
-        return (ModelVerdict { failures }, None);
+        return refused(PairModelFailure::Spec(model.spec));
     }
-    if model.tile != inputs.tile || model.window != inputs.window || model.scope != inputs.scope {
-        failures.push(ModelFailure::Scope);
+    if *sites.members(model.area) != *model.scope {
+        return refused(PairModelFailure::Scope);
     }
-    if model.input != inputs.citation {
-        failures.push(ModelFailure::Citation);
+    match arrived.rebuild(model) {
+        Ok(inputs) => verify_pair_model(&inputs, model, cache),
+        Err(failure) => refused(failure),
+    }
+}
+
+/// Verifies a pair model against the window it cites (`inputs`, rebuilt from what has arrived;
+/// crate docs, § The pairwise path, verifying a model): once a refit by any holder of the window,
+/// whatever fixes cite the model.
+pub fn verify_pair_model(
+    inputs: &Inputs,
+    model: &crate::pair::PairModel,
+    cache: &mut crate::pair::PairCache,
+) -> PairModelVerdict {
+    if !judges(model.spec) {
+        return PairModelVerdict {
+            failures: vec![PairModelFailure::Spec(model.spec)],
+        };
+    }
+    PairModelVerdict {
+        failures: crate::pair::check_model(inputs, model, cache),
+    }
+}
+
+/// Verifies a fix (what it states, of specification version `spec`) under `models`, the verified
+/// pair models it lists, each looked up by its id, against `held`, the receptions of its message
+/// the verifier holds (crate docs, § The pairwise path, verifying a fix): the models are the ones
+/// it lists (`Failure::Models`) and exactly one of each area its used hearers are in
+/// (`Failure::Area`), its considered set regrouped by them is one transmission, capped to the
+/// receivers it is solved from (`pair::Models::capped`) and normalised by their pairs, and the
+/// claim is the solution of that problem as `check_problem` checks one: what it used among the
+/// capped receivers' receptions, and judged for omission over those alone. Nothing but the models
+/// and the fix's own receptions is read.
+pub fn verify_pair_fix(
+    models: &crate::pair::Models<'_>,
+    stated: &crate::publish::Stated<'_>,
+    spec: u16,
+    held: &[Reception],
+) -> Verdict {
+    let (ids, mut failures) = match read(models, stated, spec) {
+        Ok(read) => read,
+        Err(verdict) => return verdict,
+    };
+    let mut receptions: Vec<Reception> = held
+        .iter()
+        .filter(|reception| ids.considered.binary_search(&reception.id()).is_ok())
+        .cloned()
+        .collect();
+    receptions.sort_by_cached_key(|reception| (reception.id(), reception.wall_ms));
+    receptions.dedup_by_key(|reception| reception.id());
+    for id in &ids.considered {
+        if receptions.binary_search_by_key(id, Reception::id).is_err() {
+            failures.push(Failure::Unknown(*id));
+        }
     }
     if !failures.is_empty() {
-        return (ModelVerdict { failures }, None);
+        return Verdict { failures };
     }
-    if let Some(what) = crate::sync::check_shape(model, inputs) {
-        failures.push(ModelFailure::Shape(what));
-        return (ModelVerdict { failures }, None);
+    let groups = models.transmissions(&receptions);
+    if !matches!(groups.as_slice(), [one] if one.len() == receptions.len()) {
+        failures.push(Failure::NotOneTransmission);
+        return Verdict { failures };
     }
-    let Ok((calibrated, assessment)) = crate::sync::calibrate(model, inputs) else {
-        failures.push(ModelFailure::Singular);
-        return (ModelVerdict { failures }, None);
-    };
-    // Not within the tolerance, NaN included.
-    if assessment.distance.is_nan() || assessment.distance > MODEL_OPTIMALITY_TOLERANCE {
-        failures.push(ModelFailure::NotOptimal {
-            distance: assessment.distance,
+    let capped = models.capped(&groups[0]);
+    for id in &ids.used {
+        if !capped.iter().any(|reception| reception.id() == *id) {
+            failures.push(Failure::Uncapped { id: *id });
+        }
+    }
+    if !failures.is_empty() {
+        return Verdict { failures };
+    }
+    match models.normalise(&capped) {
+        Ok(normalised) => judge(stated, spec, &ids, &normalised, failures),
+        Err(why) => {
+            failures.push(Failure::Unnormalised(why));
+            Verdict { failures }
+        }
+    }
+}
+
+/// The verifier over the normalisation a fix was just solved on (`publish::solve_transmission`):
+/// `verify_pair_fix` but for the regrouping, capping and normalising of its considered set, which
+/// rebuild `normalised` exactly (the grouping returns a transmission whole, and the cap and the
+/// normalisation are functions of their receptions as a set, in any order: § Verifying a fix).
+pub(crate) fn verify_solved(
+    models: &crate::pair::Models<'_>,
+    stated: &crate::publish::Stated<'_>,
+    spec: u16,
+    normalised: &crate::pair::Normalised,
+) -> Verdict {
+    match read(models, stated, spec) {
+        Ok((ids, failures)) => judge(stated, spec, &ids, normalised, failures),
+        Err(verdict) => verdict,
+    }
+}
+
+/// What a fix considered and used, read on a timeline at its own transmit time (the claim proper
+/// once the normalisation gives the timeline's zero), with what its lists and its models' areas
+/// fail; `Err` with the verdict when nothing more can be judged.
+fn read(
+    models: &crate::pair::Models<'_>,
+    stated: &crate::publish::Stated<'_>,
+    spec: u16,
+) -> Result<(Solution, Vec<Failure>), Verdict> {
+    if !judges(spec) {
+        return Err(Verdict {
+            failures: vec![Failure::Spec(spec)],
         });
     }
-    for (index, piece) in model.pieces.iter().enumerate() {
-        let estimated = assessment
-            .noise_ps
-            .get(&piece.key)
-            .copied()
-            .unwrap_or_else(|| (piece.timebase.default_noise_s() * 1e12).round() as i64);
-        // Understated noise makes every solution under the model overconfident; overstated noise
-        // only makes them conservative. So only the first is refused.
-        if (piece.noise_ps as f64) < (1.0 - NOISE_BAND) * estimated as f64 {
-            failures.push(ModelFailure::Noise {
-                piece: index,
-                published: piece.noise_ps,
-                estimated,
-            });
+    let at_ns = u64::try_from(stated.claimed.transmitted.unix_ps() / 1000).unwrap_or(0);
+    let Ok(ids) = crate::publish::claim_at(at_ns, stated, spec) else {
+        return Err(Verdict {
+            failures: vec![Failure::Unreadable],
+        });
+    };
+    let mut failures = Vec::new();
+    let ascending = |ids: &[ObservationId]| ids.windows(2).all(|pair| pair[0] < pair[1]);
+    if !ascending(&ids.considered) || !ascending(&ids.used) {
+        failures.push(Failure::Unsorted);
+        return Err(Verdict { failures });
+    }
+    for id in &ids.used {
+        if ids.considered.binary_search(id).is_err() {
+            failures.push(Failure::NotConsidered { id: *id });
         }
     }
-    if let Some(score) = assessment
-        .jump
-        .filter(|score| *score > crate::sync::JUMP_THRESHOLD + JUMP_BAND)
-    {
-        failures.push(ModelFailure::Jump { score });
+    if *stated.models != *models.ids() {
+        failures.push(Failure::Models);
     }
-    let passed = failures.is_empty();
-    (ModelVerdict { failures }, passed.then_some(calibrated))
+    if models.areas_of(ids.used.iter().map(|id| id.receiver)) != Some(models.areas()) {
+        failures.push(Failure::Area);
+    }
+    Ok((ids, failures))
 }
 
-/// Checks that a solution of `address` under `model` cites the tile the assignment rule gives
-/// (crate docs, § Assignment), recomputed from the verifier's own raw (`window`): an engine
-/// cannot solve an aircraft under a tile of its choosing. The solution's addressed citation must
-/// be the raw's, or the verifier does not hold what chose the tile.
-pub fn verify_assignment(
-    window: &crate::scope::WindowIndex<'_>,
-    address: u32,
-    model: &crate::ClockModel,
-    addressed: &tally_wire::AddressedCitation,
-) -> Result<(), Failure> {
-    let citation = window.addressed_citation(address);
-    if citation.hash != addressed.hash || citation.count != addressed.count {
-        return Err(Failure::Addressed);
+/// The claim against the problem its transmission normalised to: every used reception one of
+/// its items, then `check_problem`.
+fn judge(
+    stated: &crate::publish::Stated<'_>,
+    spec: u16,
+    ids: &Solution,
+    normalised: &crate::pair::Normalised,
+    mut failures: Vec<Failure>,
+) -> Verdict {
+    let cited: BTreeSet<ObservationId> = ids.used.iter().copied().collect();
+    let items: BTreeSet<ObservationId> = normalised
+        .problem
+        .items
+        .iter()
+        .map(|item| item.id)
+        .collect();
+    if !cited.is_subset(&items) {
+        failures.push(Failure::Unnormalised(
+            "a used reception the pairs leave out",
+        ));
+        return Verdict { failures };
     }
-    let mut members = std::collections::BTreeMap::new();
-    match window.assign(address, &mut members) {
-        Some(assignment) if assignment.tile == model.tile && model.window == window.window => {
-            Ok(())
-        }
-        _ => Err(Failure::Tile),
-    }
-}
-
-/// Verifies a solution against `considered`, the receptions of its transmission the verifier
-/// holds, under `model` (crate docs, § Verifying a solution): the omission check runs over the
-/// considered set less the used set alone, so a reception outside the considered set is never
-/// judged. Phase 1 replaces `verify` and `verify_reach` with it.
-pub fn verify_fix(
-    sites: &crate::scope::Sites,
-    model: &crate::ClockModel,
-    solution: &tally_wire::Solution,
-    considered: &[Reception],
-) -> Result<(), Vec<Failure>> {
-    let _ = (sites, model, solution, considered);
-    todo!("phase 1")
-}
-
-/// Verifies a published trailing model against the raw it cites, rebuilt from what has arrived
-/// (`Arrived::rebuild`): `ModelFailure::Unjudged` when a cited batch has not. Phase 1 replaces
-/// `verify_model` with it.
-pub fn verify_trailing_model(
-    model: &crate::ClockModel,
-    arrived: &crate::arrived::Arrived,
-) -> Result<(), ModelFailure> {
-    let _ = (model, arrived);
-    todo!("phase 1")
+    let Ok(claim) = crate::publish::claim_at(normalised.origin_unix_ns, stated, spec) else {
+        failures.push(Failure::Unreadable);
+        return Verdict { failures };
+    };
+    check_problem(&normalised.problem, &cited, &claim, failures)
 }
