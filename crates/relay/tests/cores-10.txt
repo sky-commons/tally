@@ -21,11 +21,11 @@ handshakes-in-flight 2500
 handshakes-per-sec 25000
 # tally-relay check --memory-limit 32G --cores 10 --key k --max-upload 10Gbit/s --memory 24G --max-connections 2048 --max-connections-per-address 2048 --area 801ffffffffffff --area 8027fffffffffff, without MLAT (--no-mlat)
 cores 10
-connection-limit 9418
+connection-limit 9405
 connections-by-cores 11147
 connection-limit-bound memory
-max-receptions-per-sec 5650965
-rate-by-cores 6875148
+max-receptions-per-sec 5643686
+rate-by-cores 6876553
 rate-bound memory
 mlat-seats 0
 mlat-seats-bound not-hosted

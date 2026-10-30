@@ -163,8 +163,8 @@ pub const MEMBER_MODEL_BYTES_PER_SEAT_PER_SEC: usize = OWN_BYTES_PER_SEAT_PER_SE
 /// it is refused as inflated (410 before each pair's curve held its anchors' picoseconds, which
 /// grouping reads a reception's time against; 420 before the wire named a clock by its index and
 /// carried variances in single precision, 2026-10-26, which shrank the wire and left the decode as
-/// it was).
-pub const DECODED_PER_WIRE_PERCENT: usize = 480;
+/// it was; 480 before the pair blocks of 2026-10-27, measured 519 on 2026-10-30).
+pub const DECODED_PER_WIRE_PERCENT: usize = 520;
 /// The seconds of the members' pace the members' room holds: the hold, and the second of burst
 /// the pace allows beside it.
 pub const MEMBER_SECONDS: usize = HOLD_MS.div_ceil(1_000) as usize + 1;

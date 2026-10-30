@@ -81,7 +81,7 @@ _UNIT_TEST_MODULES = {
     "config": "small",  # under 0.1 s
     "consistency": "small",  # 7.8 s
     "cores": "small",  # under 0.1 s
-    "credit": "small",  # 12.9 s
+    "credit": "medium",  # 12.9 s alone; 16 s on a loaded 32-core host, 2026-10-30
     "delivery": "medium",  # 36.1 s
     "directory": "medium",  # 56.9 s
     "durable": "small",  # 0.1 s
@@ -91,7 +91,7 @@ _UNIT_TEST_MODULES = {
     "figures": "small",  # under 0.1 s
     # hub.rs's tests but its error budget end to end, and that test alone
     # (`hub::honest_end_to_end`).
-    "hub::tests": "small",  # 11.8 s
+    "hub::tests": "medium",  # 11.8 s alone; 22 s on a loaded 32-core host, 2026-10-30
     "hub::honest_end_to_end": "medium",  # 27.4 s
     "ingest": "small",  # 0.5 s
     "link": "small",  # 12.0 s
@@ -269,7 +269,7 @@ rust_test(
 # else allocates while it measures.
 rust_test(
     name = "stations_bytes",
-    size = "small",
+    size = "medium",  # 25 s on a loaded 32-core host, 2026-10-30
     srcs = ["tests/stations_bytes.rs"],
     edition = "2024",
     lint_config = ":cargo_lints",
@@ -285,7 +285,7 @@ rust_test(
 # measured by a counting allocator: its own binary, so nothing else allocates while it measures.
 rust_test(
     name = "tables_bytes",
-    size = "small",
+    size = "medium",  # 49 s on a loaded 32-core host, 2026-10-30: the step and the models are measured too
     srcs = ["tests/tables_bytes.rs"],
     edition = "2024",
     lint_config = ":cargo_lints",

@@ -678,8 +678,8 @@ impl<'r> Reader<'r> {
         let mut events = Vec::new();
         let mut indices: Vec<u32> = Vec::new();
         for message in messages {
-            let receptions = &self.by_message
-                [self.starts[message as usize]..self.starts[message as usize + 1]];
+            let receptions =
+                &self.by_message[self.starts[message as usize]..self.starts[message as usize + 1]];
             if receptions
                 .iter()
                 .any(|(wall, _)| *wall >= look_from && *wall < own_from)

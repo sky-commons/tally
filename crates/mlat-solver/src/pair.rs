@@ -295,6 +295,10 @@ struct Window {
     reused: usize,
 }
 
+/// The blocks found for each pair of scope indices (the lower first) across a read: each block
+/// with the second it was held at.
+type FoundBlocks = BTreeMap<(u32, u32), Vec<(u64, Arc<PairBlock>)>>;
+
 impl Window {
     /// The window of `inputs`, its blocks the area's held ones where what they read is unchanged
     /// (`blocks::BlockCache`), and the raw the rest are read from.
@@ -369,7 +373,7 @@ impl Window {
         let mut raw = Raw::new(reader, window_of, above);
         let (built, reused) = blocks.update(&mut raw, &clocks, (first, end));
         let mut events = 0;
-        let mut found: BTreeMap<(u32, u32), Vec<(u64, Arc<PairBlock>)>> = BTreeMap::new();
+        let mut found: FoundBlocks = BTreeMap::new();
         for second in first..end {
             let Some(held) = blocks.second(second) else {
                 continue;
@@ -386,7 +390,9 @@ impl Window {
         }
         // A pair with fewer points than a span needs is never valid.
         found.retain(|_, list| {
-            list.iter().map(|(_, block)| block.points as usize).sum::<usize>()
+            list.iter()
+                .map(|(_, block)| block.points as usize)
+                .sum::<usize>()
                 >= sync::SPAN_RECEPTIONS_LEAST
         });
         let mut keys = Vec::with_capacity(found.len());
@@ -591,7 +597,10 @@ impl PairSums {
         if points < sync::SPAN_RECEPTIONS_LEAST {
             return Err(Invalid::TooFew);
         }
-        let mut knots = blocks.iter().flat_map(|block| &block.units).map(|unit| unit.knot);
+        let mut knots = blocks
+            .iter()
+            .flat_map(|block| &block.units)
+            .map(|unit| unit.knot);
         let Some(first) = knots.next() else {
             return Err(Invalid::Singular);
         };
@@ -660,7 +669,8 @@ impl PairSums {
                     (size + 1, [0.0, 0.0, 0.0, 0.0, 1.0]),
                     (one, [d0, d1, 1.0, 0.0, 0.0]),
                 ];
-                for (target, upper) in [(&mut weighted, &unit.weighted), (&mut plain, &unit.plain)] {
+                for (target, upper) in [(&mut weighted, &unit.weighted), (&mut plain, &unit.plain)]
+                {
                     // `T M`: each row's coefficients against `M`'s columns.
                     let mut tm = [[0.0; 5]; 5];
                     for (row, (_, coefficients)) in rows.iter().enumerate() {
@@ -695,8 +705,9 @@ impl PairSums {
                     for (place, coefficients) in &rows {
                         entry.plain[*place] +=
                             (0..5).map(|q| coefficients[q] * sums.plain[q]).sum::<f64>();
-                        entry.weighted[*place] +=
-                            (0..5).map(|q| coefficients[q] * sums.weighted[q]).sum::<f64>();
+                        entry.weighted[*place] += (0..5)
+                            .map(|q| coefficients[q] * sums.weighted[q])
+                            .sum::<f64>();
                     }
                 }
             }
@@ -1524,10 +1535,7 @@ impl PairCache {
             *held = Some((area, scope.to_vec(), Network::of_area(scope, area)));
             blocks.clear();
         }
-        &held
-            .as_ref()
-            .unwrap_or_else(|| unreachable!("set above"))
-            .2
+        &held.as_ref().unwrap_or_else(|| unreachable!("set above")).2
     }
 }
 

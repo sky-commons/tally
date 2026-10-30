@@ -667,9 +667,10 @@ pub const ENGINE_EDGES: usize =
 /// What an area's memos take for each receiver of it, at most (`tally_mlat_solver::PairCache`: what
 /// its fit read last time and its network): measured with `models::MODEL_BYTES_PER_RECEIVER`
 /// (`tests/tables_bytes.rs`, `an_areas_model_is_within_its_bytes_per_receiver`), the most of
-/// them rounded up. Before, 128,000, when the read's memo hashed message hashes again
+/// them rounded up (212,268 on 2026-10-30, with the pair blocks of 2026-10-27). Before them
+/// 130,048, and 128,000 when the read's memo hashed message hashes again
 /// (`tally_mlat_solver::obs::ByDigest`): the table grows at other points.
-pub const AREA_CACHE_BYTES_PER_RECEIVER: usize = 130_048;
+pub const AREA_CACHE_BYTES_PER_RECEIVER: usize = 212_992;
 /// What a seat's share of the engine's own models takes: its area's model at every edge it holds
 /// ([`ENGINE_EDGES`]), each at most `models::MODEL_BYTES_PER_RECEIVER` for the seat, and its
 /// area's memos ([`AREA_CACHE_BYTES_PER_RECEIVER`]). The models are the allocation the relay's
@@ -700,10 +701,11 @@ pub fn arrived_bytes_per_seat() -> usize {
 /// what the engine held before it, less what it leaves held, for each receiver taking part, the
 /// most measured by the counting allocator over the reference simulation and a dense one whose
 /// every receiver keeps its full 40 neighbours (`tests/tables_bytes.rs`, `step_bytes_per_seat`,
-/// 212,816 bytes, rounded up to the KiB; the reference scene alone 131,981). Before, 192 KiB, an
-/// upper bound from the window steps it replaced (RFC-0181, "Sizing", 2026-10-08), which the
-/// dense scene's step exceeds.
-pub const STEP_BYTES_PER_SEAT: usize = 208 << 10;
+/// 565,702 bytes on 2026-10-30 with the pair blocks of 2026-10-27, rounded up to the KiB; 212,816
+/// before them, the reference scene alone then 131,981). Before, 192 KiB, an upper bound from the
+/// window steps it replaced (RFC-0181, "Sizing", 2026-10-08), which the dense scene's step
+/// exceeds.
+pub const STEP_BYTES_PER_SEAT: usize = 553 << 10;
 /// What one seat makes its own engine publish in positions over a step, at most, which is what of
 /// them may wait untaken (the network task takes them every tick): its fixes raw and tagged
 /// (`consistency::POSITIONS_BYTES_PER_SEAT_PER_SEC`). Charged to `Engine` as they are queued, by

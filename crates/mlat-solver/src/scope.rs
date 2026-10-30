@@ -105,7 +105,8 @@ pub struct Trailing {
 }
 
 const _: () = assert!(TRAILING_WINDOW_MS <= u32::MAX as u64);
-const _: () = assert!(TRAILING_WINDOW_MS % 1000 == 0 && REFIT_EVERY_MS % 1000 == 0);
+const _: () =
+    assert!(TRAILING_WINDOW_MS.is_multiple_of(1000) && REFIT_EVERY_MS.is_multiple_of(1000));
 
 impl Trailing {
     /// The specification's trailing window ending at `edge_ms`.

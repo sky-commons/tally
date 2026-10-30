@@ -2690,7 +2690,19 @@ fn a_rebuilt_records_verdict_reaches_the_group_that_rebuilt_it() -> Outcome {
         .position(|key| *key == me)
         .ok_or("not a member")?;
     let others: Vec<usize> = (0..members.len()).filter(|other| *other != index).collect();
-    let hub = Arc::new(Hub::new(8, Deadlines::RELAY).taking(vec![group.cell]));
+    // The hub judges on the clock the member is ticked by: on the host's own clock its verdicts
+    // were stamped by whatever time the test had taken to get there, and on a slow host that
+    // left the record let go for want of room never rebuilt again.
+    let clock = Arc::new(std::sync::atomic::AtomicU64::new(now));
+    let reading = Arc::clone(&clock);
+    let hub = Arc::new(
+        Hub::clocked(
+            8,
+            Arc::new(move || reading.load(std::sync::atomic::Ordering::Relaxed)),
+            Deadlines::RELAY,
+        )
+        .taking(vec![group.cell]),
+    );
     hub.network().adopt_identity(identity(index));
     let _ = hub.network().tick(&hub, now);
     let sharing = &hub.network().sharing;
@@ -2716,6 +2728,7 @@ fn a_rebuilt_records_verdict_reaches_the_group_that_rebuilt_it() -> Outcome {
         })
         .ok_or("no member")?;
     let rebuild_at = (second + 1) * 1000 + super::member::REBUILD_AFTER_MS;
+    clock.store(rebuild_at, std::sync::atomic::Ordering::Relaxed);
     let rebuilt = sharing.tick_member_for_test(rebuild_at);
     drop(sharing.take_outbox());
     let handle = |at: usize| {
@@ -2767,6 +2780,7 @@ fn a_rebuilt_records_verdict_reaches_the_group_that_rebuilt_it() -> Outcome {
         return Err("a rebuilt record that passed was not pushed down its stripe".into());
     }
     // The next rebuild: only the one let go for want of room is rebuilt again.
+    clock.store(rebuild_at + 250, std::sync::atomic::Ordering::Relaxed);
     let again: Vec<Hash> = sharing
         .tick_member_for_test(rebuild_at + 250)
         .into_iter()
@@ -2774,8 +2788,13 @@ fn a_rebuilt_records_verdict_reaches_the_group_that_rebuilt_it() -> Outcome {
         .collect();
     if again != vec![no_room.0.hash] {
         return Err(format!(
-            "rebuilt again {} records, not the one let go alone",
-            again.len()
+            "rebuilt again {} records, not the one let go alone (held, judging: forged {:?}, \
+             passed {:?}, let go {:?}; stats {:?})",
+            again.len(),
+            state(&forged.0.hash),
+            state(&passed.0.hash),
+            state(&no_room.0.hash),
+            sharing.member_for_test(|member| member.stats())
         ));
     }
     Ok(())

@@ -1190,9 +1190,10 @@ fn a_pair_models_bytes_are_the_committed_golden() -> Result {
 
 /// BLAKE2s-256 of the area model of `fitted_window`, made on the x86 host (version 8; remade when
 /// each clock came to carry `heard_ns`, its transmit-time dating bound, when the inputs came to be
-/// cited by their batches' parts, `scope::Citation`, and when the variances came to be published
-/// single, the clocks by their scope index, and the white noise read at its degrees of freedom).
-const PAIR_GOLDEN: &str = "7e8918442b36ab2b8517e2d402413591061e3befd56bb2ab18d3a46f324b9752";
+/// cited by their batches' parts, `scope::Citation`, when the variances came to be published
+/// single, the clocks by their scope index, and the white noise read at its degrees of freedom,
+/// and last on 2026-10-30 after the pair blocks of 2026-10-27, the same bytes on two runs).
+const PAIR_GOLDEN: &str = "30b808d670df0332bc4c856d753b13cba60e6ff0af84a53be1652688501c8223";
 
 /// Every area's members are its receivers and those they keep (crate docs, § Areas): a pure
 /// function of the sites, the same over the members alone as over every site, and every pair of

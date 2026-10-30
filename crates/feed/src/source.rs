@@ -3601,9 +3601,17 @@ mod tests {
         let all = content(&batcher.seal()?.ok_or("no batch")?)?;
         assert_eq!((all.observations.len(), all.dropped), (500, 0));
         stating.state(Some(100));
+        // All at one instant, so the bucket refills nothing between pushes on a slow host.
+        let at = Instant::now();
         for _ in 0..500 {
-            batcher.push(reception(&wanted, tally_wire::batch::format::MODE_S_SHORT))?;
-            batcher.push(reception(&unwanted, tally_wire::batch::format::MODE_S_LONG))?;
+            batcher.push_at(
+                reception(&wanted, tally_wire::batch::format::MODE_S_SHORT),
+                at,
+            )?;
+            batcher.push_at(
+                reception(&unwanted, tally_wire::batch::format::MODE_S_LONG),
+                at,
+            )?;
         }
         let shed = content(&batcher.seal()?.ok_or("no batch")?)?;
         let kept_wanted = shed
@@ -3614,7 +3622,7 @@ mod tests {
             })
             .count();
         // A second's worth of the ceiling at once, the rest shed and counted; none unwanted shed.
-        assert!((100..=101).contains(&kept_wanted), "{kept_wanted} kept");
+        assert_eq!(kept_wanted, 100, "{kept_wanted} kept");
         assert_eq!(shed.observations.len() - kept_wanted, 500);
         assert_eq!(shed.dropped as usize, 500 - kept_wanted);
         // The session ends: its ceiling goes with it.

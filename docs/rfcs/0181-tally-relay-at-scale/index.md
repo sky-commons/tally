@@ -1142,8 +1142,9 @@ met in a race.
 **What it admits is the relay's to say** (`tally-relay check`, 16 cores and a 32 GB container,
 one base cell, the public relay's caps): `tally/crates/relay/tests/world-relay.txt`, the whole plan
 hosting MLAT and not, which the `check` test (`the_world_relay_prints_what_it_admits`) prints and
-holds equal to what the relay plans. That test also holds its floors: more than 15,000 connections
-without MLAT, and 2,000 seats hosting it. Since the costs were measured in the load test
+holds equal to what the relay plans. That test also holds the connections floor, more than 15,000
+without MLAT, and that the seats hosting MLAT are the cores' to bound; the 2,000-seat floor it held
+until 2026-10-30 stands as the aim, not met (below). Since the costs were measured in the load test
 (2026-10-26, "MLAT in the cores") the plan meets neither: about 9,300 connections without MLAT,
 the ingest workers' cost a reception four times what was planned, and about 490 seats hosting it,
 a seat costing the host three times the solver's work alone, refitting the dearest part of it.
@@ -1159,7 +1160,10 @@ dedup became one table a thread whose epochs are let go by their homes (52 bytes
 reception), the refit's gather and read were cut and the step's intake builds a reception only
 for those it keeps (2026-10-27): 15,085 connections without MLAT, bound by the memory (18,031 by
 the cores), and 614 seats hosting it, bound by the cores (1,505 by the memory), at the default
-members' rate. The floors stand; the costs are what the cores must be given or the code made to cost less. No figure of it is copied here: this section held them in
+members' rate. Measured again on 2026-10-30 with the pair blocks of 2026-10-27 (`tables_bytes`: a
+step's working set 553 KiB a seat, an area's memos 208 KiB a receiver, a model decoded at 520% of
+its wire bytes), 15,070 connections without MLAT, bound by the memory, and 614 seats hosting it,
+bound by the cores (1,334 by the memory). The floors stand; the costs are what the cores must be given or the code made to cost less. No figure of it is copied here: this section held them in
 a table, and by 2026-10-22 its memory before feeders and its rates no longer matched what the relay
 printed, with nothing to say so.
 
@@ -1175,8 +1179,8 @@ book and what is solved were planned at the slots solved, the seats are bound by
 memory holding twice as many; since the load test's costs, twelve times as many). A seat's cost (`per-seat`) is its share of standing's book, its twins, its engine's
 tables, its models and its raw (as amended 2026-10-24, RFC-0171 §3.8.1): its raw is held at the
 mean kept rate over the trailing window, `SIGNED_LAG` and a step (`tally_wire::budget::SIGNED_LAG`
-and `TRAILING_WINDOW`, RFC-0171 §3.6), in one pool for the relay (`per-seat` in `tests/world-relay.txt`, about 5.7 MB: about 1.39 MB of it the arrived pool and what feeds it (`Arrived`; 0.90 MB before
-its seats were planned at the 300 kept a second the load test held, 2026-10-26), 0.88 MB standing's book, 3.13 MB the models (0.46 MB before the room for what the members bring was planned with the seat, `models::BYTES_PER_MEMBER_SEAT`, 2026-10-27), 0.23 MB the engine's step and its published records (`Engine`) and 0.12 MB the records; it was 49.4 MB, mostly
+and `TRAILING_WINDOW`, RFC-0171 §3.6), in one pool for the relay (`per-seat` in `tests/world-relay.txt`, about 6.55 MB since the pair blocks of 2026-10-27 were measured on 2026-10-30, 5.7 MB before: about 1.47 MB of it the arrived pool and what feeds it (`Arrived`, its area's memos 208 KiB of it; 0.90 MB before
+its seats were planned at the 300 kept a second the load test held, 2026-10-26), 0.88 MB standing's book, about 3.5 MB the models (0.46 MB before the room for what the members bring was planned with the seat, `models::BYTES_PER_MEMBER_SEAT`, 2026-10-27; 3.13 MB before a model decoded at 520% of its wire bytes), 0.58 MB the engine's step and its published records (`Engine`; 0.23 MB before the step's working set was measured at 553 KiB a seat) and 0.12 MB the records; it was 49.4 MB, mostly
 standing's book, the twins and the raw over the windows' spans). `max-bytes-per-sec` is in the unit the stores
 charge, `ingest::rate_cost`, "Memory is charged once".
 

@@ -271,7 +271,10 @@ pub(super) fn build(
     } else {
         0.0
     };
-    let residuals: Vec<f64> = read.iter().map(|p| p.y - (myl + slope * (p.x - mxl))).collect();
+    let residuals: Vec<f64> = read
+        .iter()
+        .map(|p| p.y - (myl + slope * (p.x - mxl)))
+        .collect();
     let mut magnitudes: Vec<u64> = residuals.iter().map(|r| r.abs().to_bits()).collect();
     let scale = (1.4826 * median_of_magnitudes(&mut magnitudes)).max(SCALE_FLOOR_NS);
     // Of the steps, the largest located in each second (ties to the earliest).
@@ -542,13 +545,10 @@ impl BlockCache {
         let mut out: BTreeMap<u64, Digest> = BTreeMap::new();
         for rx in &reader.rxs {
             let key = rx.receiver.as_bytes();
-            let word = |at: usize| {
-                u64::from_le_bytes(key[at..at + 8].try_into().unwrap_or([0; 8]))
-            };
+            let word = |at: usize| u64::from_le_bytes(key[at..at + 8].try_into().unwrap_or([0; 8]));
             let hash = reader.hash(rx.message);
-            let hashed = |at: usize| {
-                u64::from_le_bytes(hash[at..at + 8].try_into().unwrap_or([0; 8]))
-            };
+            let hashed =
+                |at: usize| u64::from_le_bytes(hash[at..at + 8].try_into().unwrap_or([0; 8]));
             let words = [
                 word(0),
                 word(8),
@@ -581,7 +581,8 @@ impl BlockCache {
     ) -> (usize, usize) {
         let digests = self.digests(&raw.reader);
         let of = |second: u64| digests.get(&second).copied().unwrap_or(0);
-        self.seconds.retain(|second, _| (first..end).contains(second));
+        self.seconds
+            .retain(|second, _| (first..end).contains(second));
         let (mut built, mut reused) = (0, 0);
         for second in first..end {
             // What it reads: its pooled seconds and theirs, from `READ_BACK_MS` before it to
